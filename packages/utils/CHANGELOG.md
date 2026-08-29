@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `ref` option to `sleepLong()`: `{ ref: false }` arms every chunk unreferenced, so a day-scale deadline does not by itself keep the process alive ([#17400](https://github.com/can1357/oh-my-pi/pull/17400) by [@sjawhar](https://github.com/sjawhar))
+- Added `stderrSharesStdoutTerminal()`, which reports whether stderr is the terminal stdout writes to ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Added `headerRetryAfterMs` to `RetryHintOptions`: `extractRetryHint` merges an already parsed response-header delay with the body's signals, longest first ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.16.0] - 2026-11-02
 
 ### Added

@@ -1,0 +1,10 @@
+# Deliberate drops for .github/sami/carry-check.sh: commits of an earlier sami
+# release that a later release does not carry, each on purpose.
+# One per line: <commit sha, 12+ hex chars>  <reason: what replaced it, or the
+# revert and the decision behind it>. The release notes print the entries that
+# apply since the previous release. Keep old entries; they cost nothing later.
+
+# v18.13.3-sami.20261029-115123 -> v18.16.0-sami.20261103-165105
+a7bb3b28fcaa124994c9e72d61db7cd9d26d93f6  deliberate, 2026-10-31 no-fork-policy narrowing of the #17400 member: reverted by 0d9df66d0f7; repair notch 2026-10-31T17:06:56Z (ledger can1357/oh-my-pi/20261031T170656.706350665Z-3fd4.md): member brought to the PR design, narrowed to the upstream PR's content (no fork policy)
+a797c4eafdbb3eee6d030f73634f79ae7192bcae  deliberate, same 2026-10-31 no-fork-policy narrowing of the #17400 member: reverted by 8dd7585655d; same repair notch
+007f393e03b41b6e96fd09849c57fa40390763f4  superseded: the old #13416 backport member sami-member/feat-session-sql-storage was replaced by the #13416 PR head 0224ecf09563 (drop-sweep note, sami notch 2026-11-03)

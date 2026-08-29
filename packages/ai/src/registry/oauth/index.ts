@@ -75,9 +75,12 @@ export async function refreshOAuthToken(
 			provider,
 		});
 	}
-	const def = getProviderDefinition(provider);
+	// A grant stored under another provider (`store-as`) refreshes through the
+	// login that minted it: its client id and token endpoint own the grant.
+	const loginProvider = credentials.loginProvider ?? provider;
+	const def = getProviderDefinition(loginProvider);
 	if (!def?.login) {
-		throw new AIError.OAuthError(`Unknown OAuth provider: ${provider}`, {
+		throw new AIError.OAuthError(`Unknown OAuth provider: ${loginProvider}`, {
 			kind: "validation",
 			provider,
 		});

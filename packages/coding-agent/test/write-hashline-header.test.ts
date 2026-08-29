@@ -70,23 +70,46 @@ describe("write tool hashline header", () => {
 		expect(snapshot).toBe(content);
 	});
 
-	it("makes the post-write tag usable by the hashline patcher", async () => {
+	it("reveals a line anchored under a write tag before editing it, then applies the identical retry", async () => {
 		const filePath = path.join(tmpDir, "config.ts");
 		const session = createSession(tmpDir);
-		const tool = new WriteTool(session);
-		const content = "export const enabled = false;\n";
+		const content = "export const a = 1;\nexport const enabled = false;\nexport const c = 3;\n";
 
-		const writeResult = await tool.execute("call-1", { path: filePath, content });
+		const writeResult = await new WriteTool(session).execute("call-1", { path: filePath, content });
 		const headerLine = resultText(writeResult).split("\n")[0] ?? "";
 		expect(HASHLINE_HEADER_LINE.test(headerLine)).toBe(true);
 
-		// Apply a hashline patch immediately, using only the tag the write tool
-		// returned — no intervening `read`.
-		const patchInput = `${headerLine}\nPUT 1-1:\n+export const enabled = true;\n`;
-		await new EditTool(session, "hashline").execute("call-2", { input: patchInput });
+		// The write displayed no line numbers, so the first anchored edit under its
+		// tag shows the anchored line instead of trusting a guessed number.
+		const edit = new EditTool(session, "hashline");
+		const patchInput = `${headerLine}\nPUT 2.=2:\n+export const enabled = true;\n`;
+		const refused = await edit.execute("call-2", { input: patchInput });
+		expect(refused.isError).toBe(true);
+		expect(resultText(refused)).toContain("never displayed");
+		expect(resultText(refused)).toContain("2:export const enabled = false;");
+		expect(await fs.readFile(filePath, "utf8")).toBe(content);
 
-		const final = await fs.readFile(filePath, "utf8");
-		expect(final).toBe("export const enabled = true;\n");
+		// The reveal counts as displayed: the same call now applies without a read.
+		const applied = await edit.execute("call-3", { input: patchInput });
+		expect(applied.isError).not.toBe(true);
+		expect(await fs.readFile(filePath, "utf8")).toBe(
+			"export const a = 1;\nexport const enabled = true;\nexport const c = 3;\n",
+		);
+	});
+
+	it("applies head and tail inserts under a write tag without a read", async () => {
+		const filePath = path.join(tmpDir, "list.ts");
+		const session = createSession(tmpDir);
+		const content = "export const a = 1;\nexport const b = 2;\n";
+
+		const writeResult = await new WriteTool(session).execute("call-1", { path: filePath, content });
+		const headerLine = resultText(writeResult).split("\n")[0] ?? "";
+
+		const result = await new EditTool(session, "hashline").execute("call-2", {
+			input: `${headerLine}\nPUT <1:\n+// head\nPUT >$:\n+export const z = 26;\n`,
+		});
+		expect(result.isError).not.toBe(true);
+		expect(await fs.readFile(filePath, "utf8")).toBe(`// head\n${content}export const z = 26;\n`);
 	});
 
 	it("names a local:// write by its URL, and the header round-trips through edit and write", async () => {
@@ -100,9 +123,9 @@ describe("write tool hashline header", () => {
 		expect(writeLine).toBe(`Successfully wrote ${content.length} bytes to local://notes.ts`);
 
 		await new EditTool(session, "hashline").execute("call-2", {
-			input: `${headerLine}\nPUT 1-1:\n+export const enabled = true;\n`,
+			input: `${headerLine}\nPUT <1:\n+// notes\n`,
 		});
-		expect(await fs.readFile(backingPath, "utf8")).toBe("export const enabled = true;\n");
+		expect(await fs.readFile(backingPath, "utf8")).toBe("// notes\nexport const enabled = false;\n");
 
 		// The URL-form header also addresses the same file as a `write` path.
 		await new WriteTool(session).execute("call-3", { path: headerLine, content: "export const v = 2;\n" });

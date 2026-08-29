@@ -9,10 +9,13 @@ import {
 	withAuth,
 } from "@oh-my-pi/pi-ai";
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { holdBeforeDispatch } from "@oh-my-pi/pi-ai/utils/dispatch-hold";
 import { fetchWithRetry } from "@oh-my-pi/pi-utils";
 import { type CompleteOptions, callHostLlm, getHostLlmBackend } from "./llm-backends";
 import { envFlag, envInt, envString } from "../util/env";
+import { fetchBehindHold } from "./remote-dispatch";
 import {
+	activeDispatchHold,
 	getMnemopiRuntimeOptions,
 	isPiAiModel,
 	type MnemopiLlmCompleteOptions,
@@ -166,6 +169,7 @@ export async function callConfiguredCompletion(
 			provider: opts.provider,
 			model: opts.model,
 			task: opts.task,
+			beforeDispatch: activeDispatchHold(),
 		});
 		return typeof raw === "string" ? raw : null;
 	}
@@ -185,6 +189,7 @@ export async function callConfiguredCompletion(
 						apiKey: llmApiKey() || undefined,
 						maxTokens: opts.maxTokens ?? llmMaxTokens(),
 						temperature,
+						beforeDispatch: activeDispatchHold(),
 					},
 				),
 			{ provider: model.provider },
@@ -235,6 +240,7 @@ async function tryHostLlm(prompt: string, maxTokens: number, temperature: number
 		timeout: 15,
 		provider: envString("MNEMOPI_HOST_LLM_PROVIDER").trim() || null,
 		model: envString("MNEMOPI_HOST_LLM_MODEL").trim() || null,
+		beforeDispatch: activeDispatchHold(),
 	});
 	const text = typeof raw === "string" ? raw.trim() : "";
 	return [true, text === "" ? null : text];
@@ -332,12 +338,19 @@ export async function callRemoteLlm(
 		temperature,
 		stop: ["</s>", "<|user|>"],
 	});
-	const fetchImpl = options.fetch ?? fetch;
+	const hold = activeDispatchHold();
+	const fetchImpl = fetchBehindHold(options.fetch ?? fetch, hold);
 	try {
 		// withAuth re-resolves the key on 401 (force-refresh, then sibling
 		// rotation) when the configured key is a resolver. An empty static key
 		// attempts without an Authorization header (local/proxy setups).
 		const response = await withAuth(llmApiKey(), async key => {
+			// The deadline bounds the endpoint, not a wait the host imposes, so
+			// wait the hold out before arming it. This wait does not gate the
+			// send: `fetchImpl` does, reading the hold in the same step as each
+			// attempt's fetch. A hold that closes between retries still parks
+			// the next attempt there, and can expire the deadline.
+			await holdBeforeDispatch(hold);
 			const headers: Record<string, string> = { "Content-Type": "application/json" };
 			if (key !== "") {
 				headers.Authorization = `Bearer ${key}`;
