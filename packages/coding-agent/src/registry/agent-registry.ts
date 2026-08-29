@@ -138,6 +138,16 @@ export class AgentRegistry {
 	}
 
 	readonly #refs = new Map<string, AgentRef>();
+	/**
+	 * Names that resolve to a live agent registered under a different id, with
+	 * the journal that made them one agent. A pane resumed on a subagent's
+	 * transcript (`omp --resume <name>.jsonl`) runs that transcript as its own
+	 * session, registered as `Main`; peers, the Agent Hub and `task` still know
+	 * it as `<name>`, the name the roster scan derives from its file. Binding
+	 * the name to the live ref is what makes those reach the running session
+	 * instead of a transcript-derived ghost of it.
+	 */
+	readonly #aliases = new Map<string, { targetId: string; sessionFile: string }>();
 	readonly #listeners = new Set<RegistryListener>();
 	/** Which of these agents are blocked until others finish. */
 	readonly awaits = new AgentAwaits();
@@ -168,6 +178,9 @@ export class AgentRegistry {
 			lifecycle: input.lifecycle,
 		};
 		this.#refs.set(ref.id, ref);
+		// A real agent under this id shadows any name bound to a live session,
+		// so the binding is stale from here on.
+		this.#aliases.delete(ref.id);
 		this.#emit({ type: "registered", ref });
 		return ref;
 	}
@@ -373,8 +386,37 @@ export class AgentRegistry {
 		return true;
 	}
 
+	/**
+	 * Bind `name` to the live agent `targetId`, which runs the journal at
+	 * `sessionFile`: everything that resolves an agent through {@link get} — a
+	 * peer's `agent://<name>`, Agent Hub focus, a `task` resume,
+	 * `history://<name>` — then reaches the running session under that name.
+	 * Used by the roster scan for the transcript this process is itself
+	 * running, which is a live agent, not a revivable one.
+	 *
+	 * Refused while a real agent holds the name (that agent is the recipient)
+	 * and when the target is not a live session on that journal.
+	 */
+	bindLiveName(name: string, targetId: string, sessionFile: string): boolean {
+		if (name === targetId || this.#refs.has(name)) return false;
+		const target = this.#refs.get(targetId);
+		if (!target?.session || target.sessionFile !== sessionFile) return false;
+		this.#aliases.set(name, { targetId, sessionFile });
+		return true;
+	}
+
 	get(id: string): AgentRef | undefined {
-		return this.#refs.get(id);
+		const ref = this.#refs.get(id);
+		if (ref) return ref;
+		const alias = this.#aliases.get(id);
+		if (!alias) return undefined;
+		// The binding holds only while that agent still runs that journal: a
+		// released ref, or one that switched session file, is no longer the
+		// agent this name meant.
+		const target = this.#refs.get(alias.targetId);
+		if (target?.sessionFile === alias.sessionFile) return target;
+		this.#aliases.delete(id);
+		return undefined;
 	}
 
 	list(): AgentRef[] {
@@ -420,4 +462,55 @@ export class AgentRegistry {
 			}
 		}
 	}
+}
+
+/** Every id transitively reachable from `rootId` by following `AgentRef.parentId` links, plus `rootId` itself. */
+export function collectAgentFamily(registry: AgentRegistry, rootId: string): ReadonlySet<string> {
+	const childrenByParent = new Map<string, string[]>();
+	for (const ref of registry.list()) {
+		if (ref.parentId === undefined) continue;
+		const siblings = childrenByParent.get(ref.parentId);
+		if (siblings) siblings.push(ref.id);
+		else childrenByParent.set(ref.parentId, [ref.id]);
+	}
+	const family = new Set<string>([rootId]);
+	const queue = [rootId];
+	for (let i = 0; i < queue.length; i++) {
+		for (const childId of childrenByParent.get(queue[i]) ?? []) {
+			if (family.has(childId)) continue;
+			family.add(childId);
+			queue.push(childId);
+		}
+	}
+	return family;
+}
+
+/**
+ * Disambiguated registry key for a persisted agent id that collides with an
+ * unrelated owner's identically-named entry. `AgentRegistry` is a flat,
+ * process-global map keyed by the bare id, but a subagent name is only
+ * guaranteed unique within its own owning top-level session's tree
+ * (`AgentOutputManager` allocates names per-session) — a host running several
+ * concurrent top-level sessions (ACP) can otherwise have two unrelated
+ * sessions each persist a child under the same bare filename.
+ */
+export function qualifyPersistedAgentId(ownerId: string, bareId: string): string {
+	return `${ownerId}/${bareId}`;
+}
+
+/**
+ * Inverse of {@link qualifyPersistedAgentId}: recovers the bare, path-safe id
+ * an owner-qualified registry key was built from. Consumers that hand a
+ * revived ref's id onward as a naming basis for FUTURE ids — `parentTaskPrefix`
+ * → `AgentOutputManager` → `runSubprocess`'s `path.join(artifactsDir,
+ * \`${id}.jsonl\`)` — must use this instead of the raw registry key, or a
+ * disambiguated `owner/bareId` id writes its descendants below an unexpected
+ * intermediate directory that the persisted-agent scan never looks inside.
+ * Returns `id` unchanged when it was never qualified against `ownerId` (the
+ * common case, and every case where `ownerId` is undefined).
+ */
+export function bareAgentId(id: string, ownerId: string | undefined): string {
+	if (ownerId === undefined) return id;
+	const prefix = `${ownerId}/`;
+	return id.startsWith(prefix) ? id.slice(prefix.length) : id;
 }

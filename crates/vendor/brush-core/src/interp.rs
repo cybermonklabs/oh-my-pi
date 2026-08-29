@@ -2,7 +2,10 @@ use std::{
 	collections::VecDeque,
 	io::Write,
 	path::{Path, PathBuf},
-	sync::{Arc, atomic::AtomicBool},
+	sync::{
+		Arc,
+		atomic::{AtomicBool, AtomicU32, Ordering},
+	},
 };
 
 use brush_parser::ast::{self, CommandPrefixOrSuffixItem};
@@ -121,6 +124,8 @@ pub struct ExecutionParameters {
 	/// Whether this context's own cancellation goes unreported; see
 	/// [`ExecutionParameters::set_quiet_cancellation`].
 	quiet_cancellation:       bool,
+	/// Loop steps taken under these parameters; see [`loop_checkpoint`].
+	loop_steps:               LoopSteps,
 }
 
 /// A redirection a background external command's child makes itself, after
@@ -431,6 +436,54 @@ fn ensure_not_cancelled(params: &ExecutionParameters) -> Result<(), error::Error
 	Ok(())
 }
 
+/// Loop steps per unit of Tokio's cooperative budget that [`loop_checkpoint`]
+/// spends. Tokio gives a task 128 units per poll, so a loop yields at least
+/// every 4,096 of its steps. A unit on every step made such a loop yield every
+/// 128 steps, and each yield, which wakes an idle worker, cost more than the
+/// steps between them.
+const LOOP_STEPS_PER_BUDGET_UNIT: u32 = 32;
+
+/// The loop steps taken under one [`ExecutionParameters`], counted towards the
+/// next unit of cooperative budget. A clone carries the count on. Relaxed
+/// atomics keep the parameters `Sync` for the price of a plain load and store.
+#[derive(Default)]
+struct LoopSteps(AtomicU32);
+
+impl LoopSteps {
+	/// Counts one step; true on every [`LOOP_STEPS_PER_BUDGET_UNIT`]th.
+	fn advance(&self) -> bool {
+		let steps = self.0.load(Ordering::Relaxed).wrapping_add(1);
+		self.0.store(steps, Ordering::Relaxed);
+		steps.is_multiple_of(LOOP_STEPS_PER_BUDGET_UNIT)
+	}
+}
+
+impl Clone for LoopSteps {
+	fn clone(&self) -> Self {
+		Self(AtomicU32::new(self.0.load(Ordering::Relaxed)))
+	}
+}
+
+/// Spends a unit of Tokio's cooperative budget, then checks for cancellation,
+/// so a loop of builtins returns `Pending` and the run's timer,
+/// `JoinHandle::abort` and the job's cancel token can reach it.
+async fn budget_checkpoint(params: &ExecutionParameters) -> Result<(), error::Error> {
+	tokio::task::coop::consume_budget().await;
+	// After the cooperative yield, so a cancellation raised while this task was
+	// parked is seen on the step that follows it.
+	ensure_not_cancelled(params)
+}
+
+/// A step of a loop whose length the script decides: every
+/// [`LOOP_STEPS_PER_BUDGET_UNIT`]th step under `params` passes
+/// [`budget_checkpoint`], and the others only check for cancellation.
+async fn loop_checkpoint(params: &ExecutionParameters) -> Result<(), error::Error> {
+	if params.loop_steps.advance() {
+		budget_checkpoint(params).await
+	} else {
+		ensure_not_cancelled(params)
+	}
+}
 
 #[derive(Clone, Debug, Default)]
 /// Policy for how to manage spawned external processes.
@@ -471,7 +524,7 @@ impl Execute for ast::Program {
 		let mut result = ExecutionResult::success();
 
 		for command in &self.complete_commands {
-			ensure_not_cancelled(params)?;
+			loop_checkpoint(params).await?;
 			// Execute the command and handle any errors without immediately propagating
 			// them. This allows interactive shells to continue executing subsequent
 			// commands even after errors.
@@ -510,7 +563,7 @@ impl Execute for ast::CompoundList {
 		let mut result = ExecutionResult::success();
 
 		for ast::CompoundListItem(ao_list, sep) in &self.0 {
-			ensure_not_cancelled(params)?;
+			loop_checkpoint(params).await?;
 			let run_async = matches!(sep, ast::SeparatorOperator::Async);
 
 			if run_async {
@@ -744,7 +797,7 @@ fn spawn_async_ao_list_in_task<SE: extensions::ShellExtensions>(
 	params: &ExecutionParameters,
 ) -> jobs::Job {
 	// Clone the inputs.
-	let mut cloned_shell = shell.clone();
+	let mut cloned_shell = shell.clone_for_subshell();
 	let mut cloned_params = params.clone();
 	let cloned_ao_list = ao_list.clone();
 
@@ -764,9 +817,12 @@ fn spawn_async_ao_list_in_task<SE: extensions::ShellExtensions>(
 	cloned_params.set_cancel_token(cancellation.clone());
 
 	let join_handle = tokio::spawn(async move {
-		cloned_ao_list
+		let result = cloned_ao_list
 			.execute(&mut cloned_shell, &cloned_params)
-			.await
+			.await;
+
+		// Ends the job: runs the EXIT trap it set itself, if any.
+		Ok(cloned_shell.end_child_context(&cloned_params, result).await)
 	});
 
 	jobs::Job::new(
@@ -796,7 +852,7 @@ impl Execute for ast::AndOrList {
 		let mut result = self.first.execute(shell, &first_params).await?;
 
 		for (index, next_ao) in self.additional.iter().enumerate() {
-			ensure_not_cancelled(params)?;
+			loop_checkpoint(params).await?;
 			// Check for non-normal control flow.
 			if !result.is_normal_flow() {
 				break;
@@ -961,7 +1017,17 @@ async fn spawn_pipeline_processes(
 	}
 
 	for (current_pipeline_index, command) in pipeline.seq.iter().enumerate() {
-		ensure_not_cancelled(params)?;
+		// A stage of a longer pipeline runs in a task of its own, which costs
+		// far more than a unit of the cooperative budget, so each stage spends
+		// one. As loop steps, the stages would yield only every 4,096, more than
+		// the pipes a default limit of 1,024 descriptors allows. The one stage of
+		// a single-command pipeline repeats nothing, so it only checks for
+		// cancellation.
+		if pipeline_len > 1 {
+			budget_checkpoint(params).await?;
+		} else {
+			ensure_not_cancelled(params)?;
+		}
 		//
 		// We run a command directly in the current shell if either of the following is
 		// true:
@@ -999,7 +1065,7 @@ async fn spawn_pipeline_processes(
 
 			PipelineExecutionContext {
 				shell: commands::ShellForCommand::OwnedShell {
-					target: Box::new(shell.clone()),
+					target: Box::new(shell.clone_for_subshell()),
 					parent: shell,
 				},
 				process_group_id,
@@ -1013,9 +1079,20 @@ async fn spawn_pipeline_processes(
 			}
 		};
 
-		let spawn_result = command
-			.execute_in_pipeline(pipeline_context, cmd_params)
-			.await?;
+		// A stage in its own shell that fails to start reports the error on its own and
+		// fails only that stage, as an error inside it does. A cancelled run is left to
+		// the parent, which reports the interruption once.
+		let spawn_result = match command.execute_in_pipeline(pipeline_context, cmd_params).await {
+			Ok(spawn_result) => spawn_result,
+			Err(error) if !run_in_current_shell && !params.is_cancelled() => {
+				let mut stderr = params.stderr(shell);
+				let _ = shell.display_error(&mut stderr, &error).await;
+				ExecutionSpawnResult::Completed(ExecutionResult::from(
+					error.into_result(shell).exit_code,
+				))
+			},
+			Err(error) => return Err(error),
+		};
 
 		// Update the process group ID if something was spawned.
 		if let ExecutionSpawnResult::StartedProcess(child) = &spawn_result {
@@ -1162,20 +1239,22 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
 						let redirects = redirects.clone();
 						let mut params = params;
 						Ok(ExecutionSpawnResult::StartedTask(tokio::spawn(async move {
-							if let Some(redirects) = &redirects {
-								for redirect in &redirects.0 {
-									setup_redirect(&mut shell, &mut params, redirect).await?;
+							let result = async {
+								if let Some(redirects) = &redirects {
+								setup_redirects(&mut shell, &mut params, redirects).await?;
 								}
+								compound.execute(&mut shell, &params).await
 							}
-							compound.execute(&mut shell, &params).await
+							.await;
+
+							// Ends the stage: runs the EXIT trap it set itself, if any.
+							Ok(shell.end_child_context(&params, result).await)
 						})))
 					},
 					mut shell => {
 						// Set up any additional redirects.
 						if let Some(redirects) = redirects {
-							for redirect in &redirects.0 {
-								setup_redirect(&mut shell, &mut params, redirect).await?;
-							}
+							setup_redirects(&mut shell, &mut params, redirects).await?;
 						}
 
 						Ok(compound.execute(&mut shell, &params).await?.into())
@@ -1192,9 +1271,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
 			Self::ExtendedTest(e, redirects) => {
 				// Set up any additional redirects.
 				if let Some(redirects) = redirects {
-					for redirect in &redirects.0 {
-						setup_redirect(&mut pipeline_context.shell, &mut params, redirect).await?;
-					}
+					setup_redirects(&mut pipeline_context.shell, &mut params, redirects).await?;
 				}
 
 				// Evaluate the extended test expression.
@@ -1233,27 +1310,15 @@ impl Execute for ast::CompoundCommand {
 			Self::Subshell(ast::SubshellCommand { list, .. }) => {
 				// Clone off a new subshell, and run the body of the subshell there.
 				// TODO(source-info): Do we need to reset the line number?
-				let mut subshell = shell.clone();
+				let mut subshell = shell.clone_for_subshell();
 
-				// Handle errors within the subshell context to prevent fatal errors
-				// from propagating to the parent shell.
-				let subshell_result = match list.execute(&mut subshell, params).await {
-					Ok(result) => result,
-					Err(error) => {
-						// Display the error to stderr, but prevent fatal error propagation
-						if params.reports_errors() {
-							let mut stderr = params.stderr(shell);
-							let _ = shell.display_error(&mut stderr, &error).await;
-						}
-
-						// Convert error to result in subshell context
-						error.into_result(&subshell)
-					},
-				};
-
-				// Preserve the subshell's exit code, but don't honor any of its requests to
-				// exit the shell, break out of loops, etc.
-				Ok(ExecutionResult::from(subshell_result.exit_code))
+				// The subshell ends here however its body ended; only its exit code
+				// reaches the parent, never a request to exit the shell, break out of
+				// loops, etc., and a fatal error in it does not end the parent. A
+				// cancelled run prints nothing here; the parent reports the
+				// interruption once.
+				let result = list.execute(&mut subshell, params).await;
+				Ok(subshell.end_child_context(params, result).await)
 			},
 			Self::ForClause(f) => f.execute(shell, params).await,
 			Self::CaseClause(c) => c.execute(shell, params).await,
@@ -1304,7 +1369,7 @@ impl Execute for ast::CoprocessCommand {
 		let stdin_fd = shell.open_files_mut().add(stdin_writer.into())?;
 
 		// Crete a subshell that the coprocess will own and run in.
-		let mut child_shell = shell.clone();
+		let mut child_shell = shell.clone_for_subshell();
 		child_shell.options_mut().interactive = false;
 
 		// Setup redirection for the coprocess's shell's stdin/stdout.
@@ -1325,19 +1390,28 @@ impl Execute for ast::CoprocessCommand {
 			.as_ref()
 			.map_or_else(CancellationToken::new, CancellationToken::child_token);
 		child_params.set_cancel_token(cancellation.clone());
+		// Cloned after the token is set, so the EXIT trap sees the coprocess's
+		// own cancellation.
+		let exit_params = child_params.clone();
 		let join_handle = tokio::spawn(async move {
-			let pipeline_context = PipelineExecutionContext {
-				shell:            commands::ShellForCommand::ParentShell(&mut child_shell),
-				process_group_id: None,
-				in_pipeline:       false,
-			};
-			let spawn_result = body
-				.execute_in_pipeline(pipeline_context, child_params)
-				.await?;
-			match spawn_result.wait_with_cancel(cancel_token).await? {
-				ExecutionWaitResult::Completed(result) => Ok(result),
-				ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
+			let result = async {
+				let pipeline_context = PipelineExecutionContext {
+					shell:            commands::ShellForCommand::ParentShell(&mut child_shell),
+					process_group_id: None,
+					in_pipeline:       false,
+				};
+				let spawn_result = body
+					.execute_in_pipeline(pipeline_context, child_params)
+					.await?;
+				match spawn_result.wait_with_cancel(cancel_token).await? {
+					ExecutionWaitResult::Completed(result) => Ok(result),
+					ExecutionWaitResult::Stopped(_) => Ok(ExecutionResult::stopped()),
+				}
 			}
+			.await;
+
+			// Ends the coprocess: runs the EXIT trap it set itself, if any.
+			Ok(child_shell.end_child_context(&exit_params, result).await)
 		});
 
 		let job = shell.jobs_mut().add_as_current(
@@ -1381,6 +1455,7 @@ impl Execute for ast::ForClauseCommand {
 		let mut expanded_values = vec![];
 		if let Some(unexpanded_values) = &self.values {
 			for value in unexpanded_values {
+				loop_checkpoint(params).await?;
 				let mut expanded = expansion::full_expand_and_split_word(shell, params, value).await?;
 				expanded_values.append(&mut expanded);
 			}
@@ -1390,7 +1465,7 @@ impl Execute for ast::ForClauseCommand {
 		}
 
 		for value in expanded_values {
-			ensure_not_cancelled(params)?;
+			loop_checkpoint(params).await?;
 			if shell.options().print_commands_and_arguments {
 				if let Some(unexpanded_values) = &self.values {
 					shell
@@ -1459,12 +1534,13 @@ impl Execute for ast::CaseClauseCommand {
 		let mut force_execute_next_case = false;
 
 		for case in &self.cases {
-			ensure_not_cancelled(params)?;
+			loop_checkpoint(params).await?;
 			if force_execute_next_case {
 				force_execute_next_case = false;
 			} else {
 				let mut matches = false;
 				for pattern in &case.patterns {
+					loop_checkpoint(params).await?;
 					let expanded_pattern = expansion::basic_expand_pattern(shell, params, pattern)
 						.await?
 						.set_extended_globbing(shell.options().extended_globbing)
@@ -1584,7 +1660,7 @@ impl Execute for (WhileOrUntil, &ast::WhileOrUntilClauseCommand) {
 		condition_params.suppress_errexit = true;
 
 		loop {
-			ensure_not_cancelled(params)?;
+			loop_checkpoint(params).await?;
 			let condition_result = test_condition.execute(shell, &condition_params).await?;
 
 			// Update status for condition
@@ -1657,7 +1733,7 @@ impl Execute for ast::ArithmeticForClauseCommand {
 		}
 
 		loop {
-			ensure_not_cancelled(params)?;
+			loop_checkpoint(params).await?;
 			if let Some(condition) = &self.condition {
 				// An empty condition (e.g., `for (( ; ; ))`) means "always true".
 				if !condition.value.is_empty() && condition.eval(shell, params, true).await? == 0 {
@@ -1752,7 +1828,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
 		let status_change_count_before_expansion = context.shell.last_exit_status_change_count();
 
 		for item in prefix_iter.chain(cmd_name_items.iter()).chain(suffix_iter) {
-			ensure_not_cancelled(&params)?;
+			loop_checkpoint(&params).await?;
 			match item {
 				CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
 					if let Err(e) = setup_redirect(&mut context.shell, &mut params, redirect).await {
@@ -1881,6 +1957,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
 		} else {
 			// No command to run; assignments must be applied to this shell.
 			for assignment in assignments {
+				loop_checkpoint(&params).await?;
 				// Apply the assignment. Don't mark as fatal - let errors be handled
 				// at the program level so multiple complete_commands can execute independently.
 				apply_assignment(
@@ -1927,6 +2004,7 @@ async fn execute_command(
 	let mut guard = crate::env::ScopeGuard::new(&mut context.shell, EnvironmentScope::Command);
 
 	for assignment in &assignments {
+		loop_checkpoint(&params).await?;
 		// Ensure it's tagged as exported and created in the command scope.
 		apply_assignment(
 			assignment,
@@ -2010,6 +2088,7 @@ async fn expand_assignment_value(
 		ast::AssignmentValue::Array(arr) => {
 			let mut expanded_values = vec![];
 			for (key, value) in arr {
+				loop_checkpoint(params).await?;
 				if let Some(k) = key {
 					let expanded_key = expansion::basic_expand_assignment_word(shell, params, k)
 						.await?
@@ -2069,6 +2148,7 @@ async fn apply_assignment(
 		ast::AssignmentValue::Array(unexpanded_values) => {
 			let mut elements = vec![];
 			for (unexpanded_key, unexpanded_value) in unexpanded_values {
+				loop_checkpoint(params).await?;
 				let key = match unexpanded_key {
 					Some(unexpanded_key) => Some(
 						expansion::basic_expand_assignment_word(shell, params, unexpanded_key).await?,
@@ -2185,6 +2265,20 @@ async fn apply_assignment(
 	}
 
 	shell.env_mut().add(variable_name, new_var, creation_scope)
+}
+
+/// Sets up a compound command's redirections in order. A command can carry
+/// any number of them, so each passes a loop checkpoint first.
+async fn setup_redirects(
+	shell: &mut Shell<impl extensions::ShellExtensions>,
+	params: &mut ExecutionParameters,
+	redirects: &ast::RedirectList,
+) -> Result<(), error::Error> {
+	for redirect in &redirects.0 {
+		loop_checkpoint(params).await?;
+		setup_redirect(shell, params, redirect).await?;
+	}
+	Ok(())
 }
 
 #[expect(clippy::too_many_lines)]
@@ -2641,6 +2735,7 @@ pub(crate) async fn materialize_deferred_redirects(
 	params: &mut ExecutionParameters,
 ) -> Result<(), error::Error> {
 	for redirect in std::mem::take(&mut params.deferred_redirects) {
+		loop_checkpoint(params).await?;
 		match redirect {
 			DeferredRedirect::Open { fd, path, options, .. } => {
 				let file = shell.open_file(&options, &path, params).await.map_err(|err| {
@@ -2706,7 +2801,7 @@ fn setup_process_substitution(
 ) -> Result<(ShellFd, OpenFile), error::Error> {
 	// TODO(execute): Don't execute synchronously!
 	// Execute in a subshell.
-	let mut subshell = shell.clone();
+	let mut subshell = shell.clone_for_subshell();
 
 	// Set up execution parameters for the child execution.
 	let mut child_params = params.clone();
@@ -2741,11 +2836,14 @@ fn setup_process_substitution(
 	// completion.
 	let subshell_cmd = subshell_cmd.to_owned();
 	tokio::spawn(async move {
-		// Intentionally ignore the result of the subshell command.
-		let _ = subshell_cmd
+		let result = subshell_cmd
 			.list
 			.execute(&mut subshell, &child_params)
 			.await;
+
+		// Ends the substitution: runs the EXIT trap it set itself, if any. The
+		// result of the subshell command is intentionally ignored.
+		let _ = subshell.end_child_context(&child_params, result).await;
 	});
 
 
@@ -2820,4 +2918,72 @@ fn setup_open_file_with_contents(
 	}
 
 	Ok(reader.into())
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+			mpsc,
+		},
+		time::Duration,
+	};
+
+	use tokio::sync::oneshot;
+	use tokio_util::sync::CancellationToken;
+
+	#[test]
+	fn endless_builtin_loop_yields_to_a_cancellation_task() {
+		let (result_tx, result_rx) = mpsc::sync_channel(1);
+
+		std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_multi_thread()
+				.worker_threads(1)
+				.enable_all()
+				.build()
+				.expect("runtime");
+			let result = runtime.block_on(async {
+				let cancellation = CancellationToken::new();
+				let cancellation_task_ran = Arc::new(AtomicBool::new(false));
+				let (loop_started_tx, loop_started_rx) = oneshot::channel();
+
+				let loop_cancellation = cancellation.clone();
+				let loop_task = tokio::spawn(async move {
+					let mut shell = crate::Shell::builder().build().await.expect("shell");
+					let mut params = shell.default_exec_params();
+					params.set_cancel_token(loop_cancellation);
+					loop_started_tx.send(()).expect("cancellation task waits for loop");
+					shell
+						.run_string(
+							"while ((1)); do ((1)); done",
+							&crate::SourceInfo::default(),
+							&params,
+						)
+						.await
+						.expect("loop parses")
+						.is_success()
+				});
+
+				let cancellation_task_ran_in_task = cancellation_task_ran.clone();
+				let cancellation_task = tokio::spawn(async move {
+					loop_started_rx.await.expect("loop starts");
+					cancellation_task_ran_in_task.store(true, Ordering::Release);
+					cancellation.cancel();
+				});
+
+				let loop_succeeded = loop_task.await.expect("loop task");
+				cancellation_task.await.expect("cancellation task");
+				(!loop_succeeded, cancellation_task_ran.load(Ordering::Acquire))
+			});
+			result_tx.send(result).expect("test waits for runtime");
+		});
+
+		let (interrupted, cancellation_task_ran) = result_rx
+			.recv_timeout(Duration::from_secs(2))
+			.expect("interpreter did not yield to the cancellation task");
+		assert!(cancellation_task_ran, "the cancellation task never ran on the interpreter runtime");
+		assert!(interrupted, "the cancelled loop did not stop");
+	}
 }

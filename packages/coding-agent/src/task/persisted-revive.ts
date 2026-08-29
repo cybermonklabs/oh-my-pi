@@ -17,7 +17,7 @@ import type { Settings } from "../config/settings";
 import { MCPManager } from "../mcp/manager";
 import { initializeExtensions } from "../modes/runtime-init";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, bareAgentId, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import { installRetryFallbackRole } from "../session/retry-fallback-chains";
@@ -28,6 +28,7 @@ import {
 	type PersistedSessionInit,
 	SessionManager,
 } from "../session/session-manager";
+import { defaultSessionStorage, type SessionStorage } from "../session/session-storage";
 import type { EventBus } from "../utils/event-bus";
 import {
 	attachIrcWakeTurnMonitor,
@@ -47,7 +48,7 @@ import {
 	PerCallModelUnavailableError,
 	type PerCallModelGrants,
 } from "./model-approval";
-import { cfgTaskAgentAccountPools, cfgTaskMaxEffort } from "./settings";
+import { cfgTaskAgentAccountPools, cfgTaskAgentIdleTtlMs, cfgTaskMaxEffort } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
 import { seanceIsolationOptions } from "./seance-policy";
 import type { AgentDefinition } from "./types";
@@ -73,6 +74,21 @@ export interface PersistedSubagentReviveContext {
 	eventBus?: EventBus;
 	/** Root-scoped observability bus the revived run's frames also publish to. */
 	subagentEventBus?: EventBus;
+	/**
+	 * MCP manager owned by the top-level session, for a host that keeps MCP per
+	 * session instead of in the process-global {@link MCPManager.instance} (ACP:
+	 * servers come from the client, never from workspace `.mcp.json`). Read on
+	 * every revive because the host connects its servers after this factory is
+	 * built. When supplied, revived agents use exactly this manager and never
+	 * discover MCP config themselves, even when it returns `undefined`.
+	 */
+	mcpManager?: () => MCPManager | undefined;
+	/**
+	 * Storage the top-level session's subagent tree lives in (its session
+	 * manager's); revived transcripts are read and reopened there. Omitted: the
+	 * default session storage.
+	 */
+	storage?: SessionStorage;
 }
 
 /**
@@ -109,10 +125,19 @@ export function createPersistedSubagentReviverFactory(
 	ctx: PersistedSubagentReviveContext,
 ): PersistedSubagentReviverFactory {
 	const registry = AgentRegistry.global();
-	return async ref => {
+	// ACP hosts several concurrent top-level sessions in one process, so it
+	// never installs one process-global `PersistedSubagentReviverFactory`
+	// (see main.ts's non-ACP bootstrap comment) — a cold-revived subagent's
+	// own `api.agents` actions would otherwise have no reviver for ITS OWN
+	// persisted children. Reuse this exact factory (anchored to the same
+	// ambient top-level `ctx` for every generation) so the whole persisted
+	// subtree stays cold-revivable, however deep.
+	const idleTtlMs = Math.trunc(Number(cfgTaskAgentIdleTtlMs.get(ctx.settings)) || 0);
+	const factory: PersistedSubagentReviverFactory = async ref => {
 		const sessionFile = ref.sessionFile;
 		if (!sessionFile) return undefined;
-		const peek = await SessionManager.peekSessionInit(sessionFile);
+		const storage = ctx.storage ?? defaultSessionStorage();
+		const peek = await SessionManager.peekSessionInit(sessionFile, storage);
 		// No persisted contract (pre-session_init file) or the recorded workspace
 		// is gone (isolated/merged worktree, moved dir): leave it transcript-only
 		// (history://) rather than resurrect a wrong or broken session.
@@ -149,19 +174,38 @@ export function createPersistedSubagentReviverFactory(
 		}
 		// taskDepth drives real capability gating (task-spawn allowance, memory
 		// startup, …); derive it from the persisted parent chain rather than
-		// assuming a fixed level.
+		// assuming a fixed level. The chain's root is either the literal
+		// MAIN_AGENT_ID or (ACP) an unregistered top-level session id such as
+		// `acp:<session-id>` — ACP hosts several concurrent top-level sessions,
+		// none of which is ever itself an AgentRef (only subagents/advisors are
+		// registered) — so neither root is itself a subagent generation. Stop at
+		// the owning session's own root (MAIN_AGENT_ID, this ctx's own agent id,
+		// or any id with no registered ref at all) rather than only the literal
+		// "Main" id, or an ACP-rooted direct child is counted at depth 2 instead
+		// of 1 and every subsequent child spawn is rejected by the default
+		// `task.maxRecursionDepth`.
+		const rootAgentId = ctx.session.getAgentId?.() ?? MAIN_AGENT_ID;
 		let taskDepth = 1;
 		let parentId = ref.parentId;
 		const seen = new Set<string>();
-		while (parentId && parentId !== MAIN_AGENT_ID && !seen.has(parentId)) {
+		while (parentId && parentId !== MAIN_AGENT_ID && parentId !== rootAgentId && !seen.has(parentId)) {
 			seen.add(parentId);
 			taskDepth++;
-			parentId = registry.get(parentId)?.parentId;
+			const parentRef = registry.get(parentId);
+			// An unresolved non-root parentId is a real ancestor generation the
+			// persisted scan chose not to register (an incomplete mid-spawn stub
+			// it recursed past without adding — see
+			// registerPersistedSubagentsFromDir's `metadata.incomplete` branch),
+			// not the family root: count it before giving up, or a descendant
+			// beneath that gap undercounts its true depth and can out-spawn
+			// `task.maxRecursionDepth`.
+			if (!parentRef) break;
+			parentId = parentRef.parentId;
 		}
 		return async expectedRef => {
 			// Re-open fresh on every revive: park closes the writer, so this takes
 			// the single-writer lock cleanly and restores the full message history.
-			const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
+			const reopened = await SessionManager.open(sessionFile, undefined, storage, {
 				suppressBreadcrumb: true,
 				throwIfMissing: true,
 			});
@@ -333,7 +377,7 @@ export function createPersistedSubagentReviverFactory(
 			const restrictToolNames = restoredSeance !== undefined || init.restrictToolNames === true;
 			// The spawn's result contract: a session persisted without `yield` returned its final message.
 			const structured = revivedToolNames.includes("yield");
-			const mcpManager = restrictToolNames ? undefined : MCPManager.instance();
+			const mcpManager = restrictToolNames ? undefined : ctx.mcpManager ? ctx.mcpManager() : MCPManager.instance();
 			// Subscribe before minting proxies so a manager change during startup is replayed on bind.
 			const mcpFollower = mcpManager ? followMCPTools(mcpManager) : undefined;
 			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
@@ -373,7 +417,16 @@ export function createPersistedSubagentReviverFactory(
 						init.agent.trim().toLowerCase() !== SUB_AGENT_RULE_NAME
 							? init.agent
 							: ref.displayName,
-					parentTaskPrefix: ref.id,
+					// `ref.id` is the AgentRegistry key, which may be a
+					// `qualifyPersistedAgentId`-disambiguated `owner/bareId` string when
+					// this id collided with an unrelated session's identically-named
+					// agent — never propagate that qualifier into descendant naming:
+					// `AgentOutputManager` nests child ids under this prefix and
+					// `runSubprocess` writes them to `path.join(artifactsDir,
+					// \`${id}.jsonl\`)`, so a slash here would write descendants below an
+					// unexpected intermediate directory that the persisted-agent scan
+					// never looks inside.
+					parentTaskPrefix: bareAgentId(ref.id, ref.parentId),
 					asyncJobManager: ctx.session.asyncJobManager,
 					parentAgentId: ref.parentId,
 					oauthAccountPools,
@@ -400,6 +453,13 @@ export function createPersistedSubagentReviverFactory(
 					outputSchemaMode: init.outputSchemaMode,
 					restrictToolNames: restrictToolNames || undefined,
 					requireYieldTool: structured,
+					// Mirrors the task executor's own internal-spawner opt-in
+					// (executor.ts, `buildSubagentSessionOptions`): `initializeExtensions`
+					// below re-runs `discoverStartupSkillPaths()` once session_start
+					// fires, and without this the merge is a no-op, silently dropping
+					// any resources_discover contribution the revived subagent's own
+					// extensions make (PR #9379 review).
+					mergeDiscoveredSkillPaths: true,
 					systemPrompt: () => [...init.systemPrompt],
 					// Inherit current owner policy, never extension authority from a transcript.
 					extensionRoots: () => ctx.session.effectiveExtensionRoots,
@@ -417,7 +477,7 @@ export function createPersistedSubagentReviverFactory(
 								preloadedCustomToolPaths: [],
 							}
 						: {
-								enableMCP: !mcpManager,
+								enableMCP: !mcpManager && !ctx.mcpManager,
 								mcpManager,
 								mcpTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
 							}),
@@ -425,6 +485,10 @@ export function createPersistedSubagentReviverFactory(
 				}));
 			} catch (error) {
 				mcpFollower?.dispose();
+				// The session claimed this journal as its writer before it failed.
+				// Leaving it claimed would divert the next revive of this
+				// transcript to a sibling file instead of rebuilding it in place.
+				await reopened.close();
 				throw error;
 			}
 			// A per-call worker runs only on its exact saved model, never a similarly named survivor.
@@ -460,10 +524,13 @@ export function createPersistedSubagentReviverFactory(
 			// touches a runtime action trips the fail-closed gate in `emitToolCall`,
 			// blocking every tool — including the hidden `yield` — in the revived
 			// agent. `session_start` also re-runs so extensions restore per-session
-			// state (issue #8824).
+			// state (issue #8824), and its `discoverStartupSkillPaths()` call now
+			// actually merges into this revive's snapshot (see
+			// `mergeDiscoveredSkillPaths` above).
 			await initializeExtensions(session, {
 				reportSendError: (action, err) => logger.error("Extension send failed", { action, error: err.message }),
 				reportRuntimeError: err => logger.error("Extension error", { path: err.extensionPath, error: err.error }),
+				agentActionsScope: { reviverFactory: factory, idleTtlMs },
 			});
 			await replayRevivedAgentStart(session);
 			// Cold revives must drive registry status themselves — createAgentSession
@@ -488,4 +555,5 @@ export function createPersistedSubagentReviverFactory(
 			return session;
 		};
 	};
+	return factory;
 }

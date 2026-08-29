@@ -1,0 +1,91 @@
+name: Build sami branch
+
+on:
+  push:
+    branches:
+      - sami
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Compute version
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      timestamp: ${{ steps.version.outputs.timestamp }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: sjawhar/.github/.github/actions/sami-version@v1
+        id: version
+        with:
+          source: bun
+          manifest_path: packages/coding-agent/package.json
+
+  release_binary:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: linux-x64
+            native_targets: linux-x64-baseline linux-x64-modern
+          - runner: macos-14
+            target: darwin-arm64
+            native_targets: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # Bun version follows package.json "packageManager" (exact pin or floor),
+      # the same way upstream's CI does; a hard pin here lags upstream's floor
+      # and produced a binary that crashed at startup under 18.2.0's bytecode.
+      - uses: ./.github/actions/bun-install
+      - id: bazel
+        uses: ./.github/actions/bazel-cache
+      - name: Build native addons
+        env:
+          OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+        run: |
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          bun scripts/bazel-natives.ts ${{ matrix.native_targets }} --dest packages/natives/native
+      - name: Build binary
+        env:
+          RELEASE_TARGETS: ${{ matrix.target }}
+        run: bun run ci:release:build-binaries
+      - name: Smoke test binary
+        run: |
+          runtime_dir="$(mktemp -d)"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/data" \
+            ./packages/coding-agent/binaries/omp-${{ matrix.target }} --version
+      - name: Package mise asset
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          asset="omp-${TAG}-${TARGET}"
+          mkdir -p "release/${asset}/bin"
+          cp "packages/coding-agent/binaries/omp-${TARGET}" "release/${asset}/bin/omp"
+          tar -C release -czf "release/${asset}.tar.gz" "$asset"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mise-${{ matrix.target }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+
+  release_github:
+    needs: [version, release_binary]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mise-*
+          path: release
+          merge-multiple: true
+      - uses: sjawhar/.github/.github/actions/sami-release@v1
+        with:
+          tag: ${{ needs.version.outputs.tag }}
+          files: release/*.tar.gz

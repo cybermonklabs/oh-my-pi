@@ -79,6 +79,24 @@ function stepRender(scheduler: DeferredRenderScheduler): number | null {
 }
 
 describe("TUI adaptive render backpressure (#4145)", () => {
+	it("applies a 250ms repaint floor when strict reduce motion is active", () => {
+		const term = new VirtualTerminal(20, 4);
+		const scheduler = new DeferredRenderScheduler();
+		const tui = new TUI(term, undefined, { renderScheduler: scheduler });
+		TUI.setMinRenderInterval(250);
+
+		try {
+			tui.start();
+			stepRender(scheduler);
+			scheduler.timers.length = 0;
+			tui.requestRender();
+			expect(stepRender(scheduler)).toBeGreaterThanOrEqual(250);
+		} finally {
+			tui.stop();
+			TUI.setMinRenderInterval(MIN_RENDER_INTERVAL_MS);
+		}
+	});
+
 	it("keeps the plain min-interval cadence when frames are cheap", () => {
 		const term = new VirtualTerminal(20, 4);
 		const scheduler = new DeferredRenderScheduler();
