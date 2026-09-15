@@ -40,14 +40,18 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3"
-      - run: bun install --frozen-lockfile
-      - uses: ./.github/actions/bazel-natives
-        with:
-          targets: ${{ matrix.native_targets }}
-          cache-scope: fork-release-${{ matrix.target }}
+      # Bun version follows package.json "packageManager" (exact pin or floor),
+      # the same way upstream's CI does; a hard pin here lags upstream's floor
+      # and produced a binary that crashed at startup under 18.2.0's bytecode.
+      - uses: ./.github/actions/bun-install
+      - id: bazel
+        uses: ./.github/actions/bazel-cache
+      - name: Build native addons
+        env:
+          OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+        run: |
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          bun scripts/bazel-natives.ts ${{ matrix.native_targets }} --dest packages/natives/native
       - name: Build binary
         env:
           RELEASE_TARGETS: ${{ matrix.target }}
