@@ -16,6 +16,7 @@ import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/p
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { buildBudgetNotice, resolveSoftRequestBudget, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { formatTaskResultSummary } from "@oh-my-pi/pi-coding-agent/task/result-summary";
 import { cfgTaskAgentSoftRequestBudget } from "@oh-my-pi/pi-coding-agent/task/settings";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
@@ -291,10 +292,18 @@ describe("runSubprocess soft request budget", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.abortReason).toBeUndefined();
 		expect(JSON.parse(result.output)).toEqual({ report: "partial findings" });
+		// A "completed" result must still say it crossed budget and how to
+		// resume: the parent otherwise has no signal to continue this agent
+		// instead of spawning a successor that rereads its handoff (INFRA-28).
+		expect(result.budgetCrossed).toBe(true);
+		expect(result.softRequestBudget).toBe(2);
 		// The agent stays a live, adopted peer.
 		expect(AgentRegistry.global().get(id)?.status).toBe("idle");
 		expect(AgentLifecycleManager.global().has(id)).toBe(true);
 		expect(handle.disposeCalls()).toBe(0);
+		const summary = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
+		expect(summary).toContain("crossed its soft request budget");
+		expect(summary).toContain(`write agent://${id}`);
 	});
 
 	it("a budget hard-abort keeps the kept-alive agent adopted and messageable via irc", async () => {

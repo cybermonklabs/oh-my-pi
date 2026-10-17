@@ -58,6 +58,7 @@ import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
+import taskBudgetNoticeTemplate from "../prompts/tools/task-budget-notice.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
@@ -212,7 +213,7 @@ export const BUDGET_STOP_GRACE_REQUESTS = 5;
 
 /** Steering notice injected when a subagent crosses its soft request budget. */
 export function buildBudgetNotice(requests: number, budget: number): string {
-	return `[budget notice] You have used ${requests} requests in this run (soft budget: ${budget}). Wrap up now: finish the current step and deliver your final report. At ${Math.ceil(budget * 1.5)} requests the run is force-stopped and you will be asked to report whatever you have.`;
+	return prompt.render(taskBudgetNoticeTemplate, { requests, budget, stopThreshold: Math.ceil(budget * 1.5) });
 }
 
 /** Flatten whitespace and clip salvage text for the cancelled-child summary line. */
@@ -1287,6 +1288,10 @@ interface SubagentRunMonitor {
 	budgetStopRequested(): boolean;
 	/** Resolves when the budget-stop session abort has settled (immediately when no stop fired). */
 	waitForBudgetStop(): Promise<void>;
+	/** True once the wrap-up steering notice has been delivered to the child at the 1x budget crossing, regardless of what happens afterward. */
+	budgetNoticeDelivered(): boolean;
+	/** The soft assistant-request budget in effect for this run; 0 when the guard is disabled. */
+	readonly softRequestBudget: number;
 	/**
 	 * True when a recorded yield was invalidated by a later async-result
 	 * injection and no fresh yield has landed since: the yield payload
@@ -2316,6 +2321,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			budgetLimitExceeded ||
 			budgetStopRequested,
 		budgetStopRequested: () => budgetStopRequested,
+		budgetNoticeDelivered: () => budgetSteerSent,
+		softRequestBudget,
 		waitForBudgetStop: () => budgetStopAbortPromise ?? Promise.resolve(),
 		yieldInvalidatedByAsync: () => yieldInvalidatedByAsync,
 		yieldTurnStopRequested: () => yieldTurnStopRequested,
@@ -2995,6 +3002,13 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	};
 	emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, settledPayload);
 
+	// A run that crossed its soft request budget — the wrap-up notice was
+	// delivered, or the run was force-stopped into a forced final yield — may
+	// still finish as a normal "completed" result when the child cooperates.
+	// Surface that regardless of final status, so the parent isn't left
+	// thinking a budget-driven wrap-up was an ordinary completion.
+	const budgetCrossed = monitor.budgetNoticeDelivered() || monitor.budgetStopRequested();
+
 	return {
 		index,
 		id,
@@ -3025,6 +3039,8 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
+		budgetCrossed: budgetCrossed ? true : undefined,
+		softRequestBudget: budgetCrossed ? monitor.softRequestBudget : undefined,
 		usage: monitor.hasUsage() ? monitor.accumulatedUsage : undefined,
 		outputPath,
 		extractedToolData: progress.extractedToolData,

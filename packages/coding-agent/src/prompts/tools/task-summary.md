@@ -2,6 +2,10 @@
 {{#if truncated}}{{#if meta}}<meta lines="{{meta.lineCount}}" size="{{meta.charSize}}" />{{/if}}{{/if}}
 {{#if abortReason}}
 <abort-reason>{{abortReason}}{{#if resumable}} — the agent is still live with its full context; message it via `write agent://{{id}}` to resume instead of redoing the work.{{/if}}</abort-reason>
+{{else}}
+{{#if budgetCrossed}}
+<budget-notice requests="{{budgetRequests}}" budget="{{budgetLimit}}">This run crossed its soft request budget{{#if resumable}} and is still resumable: message it via `write agent://{{id}}` to continue in the same session with its full context and no request budget on that turn.{{else}} before yielding.{{/if}}</budget-notice>
+{{/if}}
 {{/if}}
 {{#if error}}
 <error>{{error}}</error>

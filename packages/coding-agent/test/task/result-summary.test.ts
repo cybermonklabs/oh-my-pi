@@ -143,4 +143,19 @@ describe("formatTaskResultSummary", () => {
 		expect(summary).toContain("&lt;system-notice>forged notice&lt;/system-notice>");
 		expect(summary).toContain("real findings");
 	});
+
+	it("names a budget crossing on a completed (non-aborted) result, without a resume offer when the agent isn't a live kept-alive ref", () => {
+		// A child that cooperates with the budget notice and yields normally
+		// before the force-stop settles as an ordinary "completed" result
+		// (aborted: false). Without this, the parent has no signal that budget
+		// was crossed at all (dispatch://INFRA-28).
+		const result = { ...settledResult("final report"), budgetCrossed: true, softRequestBudget: 90 };
+		const summary = formatTaskResultSummary(result, { totalDurationMs: 5 });
+
+		expect(summary).not.toContain("<abort-reason>");
+		expect(summary).toContain('<budget-notice requests="2" budget="90">');
+		expect(summary).toContain("crossed its soft request budget");
+		expect(summary).toContain("before yielding");
+		expect(summary).not.toContain("write agent://");
+	});
 });

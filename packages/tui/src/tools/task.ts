@@ -2521,6 +2521,15 @@ export interface SingleResult {
 	error?: string;
 	aborted?: boolean;
 	abortReason?: string;
+	/**
+	 * True when this run crossed its soft request budget — a wrap-up notice
+	 * was delivered, a budget stop was requested, or the run was force-stopped
+	 * — regardless of the run's final status. A "completed" result with this
+	 * set means the child cooperated and yielded before the hard stop.
+	 */
+	budgetCrossed?: boolean;
+	/** The soft request budget in effect for this run. Present only when {@link budgetCrossed} is true. */
+	softRequestBudget?: number;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
 	usage?: Usage;
 	/** Output path for the task result */

@@ -67,10 +67,15 @@ export function formatTaskResultSummary(
 	// <abort-reason>; an empty output already previews the error itself.
 	const error = result.exitCode !== 0 && !result.aborted && result.output.trim().length > 0 ? result.error : undefined;
 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
-	// A stopped agent stays messageable; tell the parent so it can resume via
-	// irc instead of redoing the work. Isolated runs are parked without a
-	// reviver (their worktree is gone), so they must not read as resumable.
-	const resumable = result.aborted && !result.isolated && isResumable(AgentRegistry.global().get(result.id));
+	// A stopped-but-adopted agent (soft-budget stop, or any other recoverable
+	// abort) stays messageable; tell the parent so it can resume via irc
+	// instead of redoing the work. The same "still live, not isolated" check
+	// also applies to a run that crossed budget but cooperated and completed
+	// normally — it is still the same resumable, kept-alive agent. Isolated
+	// runs are parked without a reviver (their worktree is gone), so they must
+	// not read as resumable.
+	const resumable = !result.isolated && isResumable(AgentRegistry.global().get(result.id));
+	const budgetCrossed = result.budgetCrossed === true;
 	const render = (truncated: boolean): string =>
 		prompt.render(taskSummaryTemplate, {
 			agentName: result.agent,
@@ -80,6 +85,9 @@ export function formatTaskResultSummary(
 			abortReason: result.aborted ? escapeHarnessTags(result.abortReason ?? "") || undefined : undefined,
 			error: error === undefined ? undefined : escapeHarnessTags(error),
 			resumable,
+			budgetCrossed,
+			budgetRequests: result.requests,
+			budgetLimit: result.softRequestBudget,
 			preview: escapeHarnessTags(truncated ? previewHead(output) : output),
 			truncated,
 			meta: result.outputMeta
