@@ -7,6 +7,10 @@
 - Pinned sessions show a pin beside their title in the status line and the band composer's title, and `/unpin [session id]` unpins a session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - Added a fullscreen extension link browser for picking links already in terminal scrollback: press Alt+O again (or Page Up) while link tags are shown, or Alt+O with no extension link on screen ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
 
+### Fixed
+
+- Fixed a hashline edit under the tag a `write` returned applying at any guessed line number without the lines ever being shown; the first line-anchored edit now shows the anchored lines (the identical retry then applies, unless there were more than 40 lines or a line over 512 columns, which need a `read` first), while head and tail inserts still apply at once ([#15666](https://github.com/can1357/oh-my-pi/issues/15666))
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
