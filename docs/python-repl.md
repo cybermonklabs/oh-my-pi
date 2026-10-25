@@ -137,11 +137,14 @@ Cells support top-level `await`, `async for`, and `async with` on a persistent a
 
 ## Environment filtering and runtime resolution
 
-Environment is filtered before launching the runner:
+Environment is filtered before launching the runner, from the shell environment current when the kernel starts:
 
 - Allowlist includes core vars like `PATH`, `HOME`, locale vars, `VIRTUAL_ENV`, `PYTHONPATH`, etc.
 - Allow-prefixes: `LC_`, `XDG_`, `PI_`
-- Denylist strips common API keys (OpenAI/Anthropic/Gemini/etc.)
+- `eval.envPassthrough` adds names and prefixes, e.g. `eval: { envPassthrough: { names: [MY_TOOL_ID], prefixes: [MY_HARNESS_] } }`. A blank prefix is ignored; matching is case-insensitive on Windows.
+- Denylist strips common API keys (OpenAI/Anthropic/Gemini/etc.), including any `eval.envPassthrough` admits
+
+A kernel started after an extension changes its exported environment (for example at a session switch) sees the new values; a running kernel keeps the environment it started with.
 
 Runtime selection order (skipped entirely when the `python.interpreter` setting names an explicit executable):
 

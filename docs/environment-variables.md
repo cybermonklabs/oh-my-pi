@@ -462,7 +462,7 @@ Small typed decisions the app makes about its own state (the `auto` thinking-lev
 | `VIRTUAL_ENV`          | Highest-priority venv path for Python runtime resolution                                            |
 | `CONDA_PREFIX`         | Python environment fallback after `VIRTUAL_ENV`, before local `.venv` / `venv` directories          |
 
-Python subprocess filtering denies common API keys and allows safe base variables plus `LC_`, `XDG_`, and `PI_` prefixes.
+Python subprocess filtering denies common API keys and allows safe base variables plus `LC_`, `XDG_`, and `PI_` prefixes, and the names and prefixes `eval.envPassthrough` adds (the denylist still wins).
 
 Shell subprocess filtering is separate (`packages/utils/src/env.ts`): it strips project-dotenv values rather than applying Python's key allowlist.
 
