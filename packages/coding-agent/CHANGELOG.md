@@ -6,6 +6,8 @@
 
 - Pinned sessions show a pin beside their title in the status line and the band composer's title, and `/unpin [session id]` unpins a session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - Added a fullscreen extension link browser for picking links already in terminal scrollback: press Alt+O again (or Page Up) while link tags are shown, or Alt+O with no extension link on screen ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
+- Extensions can run text as if the user typed it with `pi.sendUserInput(text, { deliverAs?, tag? })`: `/skill:<name>`, headless built-in slash commands, extension and custom commands, file slash commands and prompt templates run as they do in RPC mode, and the call reports how the text was handled (`prompt`, `command` with any output, `skill`, `terminal-only`, or `unavailable`). `tag` is recorded on the message the input submits, so a bridge can match it on `message_start` ([#14323](https://github.com/can1357/oh-my-pi/pull/14323) by [@sjawhar](https://github.com/sjawhar)).
+- Input an extension forwarded with `pi.sendUserInput(text, { tag })` keeps that tag while it waits in the queue: Esc on a busy session (and RPC `abort_and_restore_queue`) records it in the transcript instead of merging it into the editor, and Alt+Up and RPC `remove_queued_message` step over it, so it stays queued (its chip still shows) and is delivered with its tag
 
 ## [18.16.0] - 2026-11-02
 
