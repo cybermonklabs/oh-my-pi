@@ -31,7 +31,7 @@ import {
 	setTuiTight,
 	TERMINAL,
 	Text,
-	type TUI,
+	TUI,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
@@ -78,6 +78,7 @@ import { CollabController } from "../collab/controller";
 import type { CollabHost } from "../collab/host";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey, rawKeyHint } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
+import { reduceMotionLevel } from "@oh-my-pi/pi-tui/reduce-motion";
 import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
 import { isSettingsInitialized, Settings, settings } from "../config/settings";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
@@ -243,6 +244,7 @@ import {
 	setProgramStatusEnabled,
 } from "../utils/run-status";
 import {
+	applyTerminalTitleReduceMotion,
 	disposeTerminalTitleState,
 	initTerminalTitleState,
 	popTerminalTitle,
@@ -386,6 +388,7 @@ import {
 	cfgDisplayCollapseCompacted,
 	cfgDisplayHideToolActivity,
 	cfgDisplayPinnedAgents,
+	cfgDisplayReduceMotion,
 	cfgDisplayShowTokenUsage,
 	cfgDisplayShowTurnTime,
 	cfgDisplaySubagentLivePreview,
@@ -472,6 +475,7 @@ const cfgLiveUiSettings = combine({
 	"tui.vimModeDisplay": cfgTuiVimModeDisplay,
 	"display.pinnedAgents": cfgDisplayPinnedAgents,
 	"display.subagentLivePreview": cfgDisplaySubagentLivePreview,
+	"display.reduceMotion": cfgDisplayReduceMotion,
 	"compaction.idleEnabled": cfgCompactionIdleEnabled,
 	"compaction.idleThresholdTokens": cfgCompactionIdleThresholdTokens,
 	"compaction.idleTimeoutSeconds": cfgCompactionIdleTimeoutSeconds,
@@ -2123,6 +2127,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		setSvgFigureRendering(cfgTuiRenderSvg.get(settings));
 		this.#applyAutoGraphSetting();
 		this.#applyTextSizingSetting();
+		this.#applyReduceMotion();
 		// Keep generic pi-tui renderers aligned with the coding-agent setting.
 		applyFileLinkSetting();
 		applyHyperlinkSetting();
@@ -4116,6 +4121,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		return computeEditorMaxHeight(this.ui.terminal.rows);
 	}
 
+	#applyReduceMotion(): void {
+		TUI.setMinRenderInterval(reduceMotionLevel() === "strict" ? 250 : 1000 / 30);
+		applyTerminalTitleReduceMotion();
+		this.ui.requestRender();
+	}
+
 	#syncEditorMaxHeight(): void {
 		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
 	}
@@ -4196,6 +4207,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#renderSubagentList();
 			this.ui.requestRender();
 		}
+		if (any("display.reduceMotion")) this.#applyReduceMotion();
 		const composerPrediction = this.#eventController.composerPrediction;
 		if (
 			(any("composer.predictions") && !next["composer.predictions"]) ||

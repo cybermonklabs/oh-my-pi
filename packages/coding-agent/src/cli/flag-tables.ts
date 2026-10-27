@@ -187,6 +187,15 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 		}
 		result.serviceTier = value;
 	},
+	"--reduce-motion": (result, value) => {
+		if (value === "off" || value === "on" || value === "strict") {
+			result.reduceMotion = value;
+			return;
+		}
+		throw new CliUsageError(
+			`Invalid --reduce-motion value: ${JSON.stringify(value)}. Expected one of: off, on, strict.`,
+		);
+	},
 	"--api-key": (result, value) => {
 		result.apiKey = value;
 	},

@@ -946,8 +946,13 @@ export class TUI extends Container {
 	 * fire the next frame immediately (see #4145).
 	 */
 	#lastFrameCostMs = 0;
-	static readonly #MIN_RENDER_INTERVAL_MS = 1000 / 30;
-	static readonly #INPUT_RENDER_GRACE_MS = TUI.#MIN_RENDER_INTERVAL_MS;
+	static readonly #DEFAULT_MIN_RENDER_INTERVAL_MS = 1000 / 30;
+	static #minRenderIntervalMs = TUI.#DEFAULT_MIN_RENDER_INTERVAL_MS;
+	static readonly #INPUT_RENDER_GRACE_MS = TUI.#DEFAULT_MIN_RENDER_INTERVAL_MS;
+
+	static setMinRenderInterval(intervalMs: number): void {
+		TUI.#minRenderIntervalMs = intervalMs;
+	}
 	/**
 	 * Cap on the adaptive floor derived from `#lastFrameCostMs`. Bounds the UI
 	 * responsiveness at ~5 fps under sustained heavy renders — anything slower
@@ -1328,7 +1333,8 @@ export class TUI extends Container {
 					this.overlayStack.splice(index, 1);
 					// Overlays opened over this one return focus to where it would have.
 					for (const other of this.overlayStack) {
-						if (other.preFocus && isOverlayFocusTarget(component, other.preFocus)) other.preFocus = entry.preFocus;
+						if (other.preFocus && isOverlayFocusTarget(component, other.preFocus))
+							other.preFocus = entry.preFocus;
 					}
 					// Restore focus if this overlay or one of its owned targets had focus
 					if (isOverlayFocusTarget(component, this.#focusedComponent)) {
@@ -2889,7 +2895,7 @@ export class TUI extends Container {
 		}
 		const now = this.#renderScheduler.now();
 		const elapsed = now - this.#lastRenderAt;
-		const cadenceDelay = Math.max(0, TUI.#MIN_RENDER_INTERVAL_MS - elapsed);
+		const cadenceDelay = Math.max(0, TUI.#minRenderIntervalMs - elapsed);
 		// Adaptive backpressure — target ~50% render duty cycle: the next frame
 		// starts no sooner than `last_frame_end + last_frame_cost`, i.e.
 		// `last_frame_start + 2 × last_frame_cost`. So `elapsed` (which counts

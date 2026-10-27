@@ -25,6 +25,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { roleCandidatePool } from "../config/model-roles";
 import { formatModelStringWithRouting } from "../config/model-resolver";
 import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
+import { isReduceMotion } from "@oh-my-pi/pi-tui/reduce-motion";
 import type { Settings } from "../config/settings";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
@@ -961,6 +962,7 @@ function stopTerminalTitleSpinner(): void {
 function startTerminalTitleSpinner(): void {
 	if (
 		isNativeRendering() ||
+		isReduceMotion() ||
 		isStaticTitleHost() ||
 		terminalTitleRuntime.disposed ||
 		terminalTitleRuntime.timer ||
@@ -1056,6 +1058,12 @@ export function initTerminalTitleState(): void {
 		else if (terminalTitleRuntime.state === "working" && terminalTitleRuntime.enabled) startTerminalTitleSpinner();
 		emitTerminalTitle();
 	});
+}
+
+export function applyTerminalTitleReduceMotion(): void {
+	if (isReduceMotion()) stopTerminalTitleSpinner();
+	else if (terminalTitleRuntime.enabled && terminalTitleRuntime.state === "working") startTerminalTitleSpinner();
+	emitTerminalTitle();
 }
 
 /**
