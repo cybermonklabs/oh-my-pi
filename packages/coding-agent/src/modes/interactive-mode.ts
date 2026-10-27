@@ -160,6 +160,7 @@ import { modelMentionChipLabel, shiftImageMarkers } from "@oh-my-pi/pi-tui/promp
 import { isTranscriptEntry, type SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
 import { loadPinnedSessionIds } from "../session/session-pins";
+import type { RefreshSkillsOptions } from "../session/session-tools";
 import {
 	canAutoCreateWorktree,
 	planWorktreeExit,
@@ -2385,6 +2386,17 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async init(options: InteractiveModeInitOptions = {}): Promise<void> {
 		if (this.isInitialized) return;
+		// A turn a `session_start`/`resources_discover` handler starts must not run
+		// before the TUI observes it: hold extension sends until init has subscribed
+		// to the session, settled its mode, restored the draft and released input.
+		// The turn then starts as init returns, renders live and takes input like
+		// any other turn; init does not wait for it. A failed init discards them.
+		const sends = this.session.extensionRunner?.sends;
+		if (sends) await sends.withHeld(() => this.#init(options));
+		else await this.#init(options);
+	}
+
+	async #init(options: InteractiveModeInitOptions): Promise<void> {
 		this.#idleMaintenanceActivity.scheduledTurn = target =>
 			target === this.session &&
 			(this.#goalContinuationTimer !== undefined ||
@@ -2393,7 +2405,6 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.#pendingLoopIterations > 0);
 		this.#idleMaintenanceActivity.presentRecap = recap => this.#eventController.presentIdleRecap(recap);
 		this.syncIdleMaintenanceView();
-
 		// Fresh dialog lifetime: a previous stop (if this mode is ever
 		// re-initialized) left the old controller aborted, and approvals queued
 		// behind the approval mutex must prompt on a live signal, not a dead one.
@@ -3040,10 +3051,27 @@ export class InteractiveMode implements InteractiveModeContext {
 		return [...builtinCommands, ...hookCommands, ...customCommands, ...skillCommandList];
 	}
 
+	/**
+	 * Rebuilds the pending slash commands, including `/skill:<name>` entries, from
+	 * live session state and re-points the editor's autocomplete provider at the
+	 * result. The provider snapshots `#pendingSlashCommands` when
+	 * `refreshSlashCommandState` builds it, and `init:slashCommands` runs before
+	 * the startup `resources_discover` pass — so without the rebuild, skills an
+	 * extension contributes at startup are invocable but never offered in
+	 * autocomplete until the next reload. Reuses the session's already
+	 * discovered file commands, so this never re-walks the providers.
+	 */
+	#syncSkillSlashCommands(): void {
+		this.#pendingSlashCommands = this.#buildPendingSlashCommands();
+		if (this.#baseAutocompleteProvider) {
+			this.#rebuildSlashCommandAutocomplete(this.sessionManager.getCwd());
+		}
+	}
+
 	/** Reload session skills and the `/skill:<name>` command list. */
-	async refreshSkillState(): Promise<void> {
+	async refreshSkillState(options?: RefreshSkillsOptions): Promise<void> {
 		// The session's command-metadata notification rebuilds the picker.
-		await this.session.refreshSkills();
+		await this.session.refreshSkills(options);
 	}
 
 	/** Reload slash commands and autocomplete for the provided working directory. */
@@ -9676,8 +9704,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	// Hook UI methods
-	initHooksAndCustomTools(): Promise<void> {
-		return this.#extensionUiController.initHooksAndCustomTools();
+	async initHooksAndCustomTools(): Promise<void> {
+		await this.#extensionUiController.initHooksAndCustomTools();
+		// The controller's startup resources_discover pass may have
+		// contributed a new skill directory (session.skills), but the
+		// subscribeCommandMetadataChanged listener that keeps skillCommands
+		// in sync is registered later, in init() — sync once here so a skill
+		// discovered at startup is immediately recognized by `/skill:<name>`
+		// and offered in autocomplete instead of waiting for a later reload.
+		this.#syncSkillSlashCommands();
 	}
 
 	getToolUIContext(): ExtensionUIContext | undefined {

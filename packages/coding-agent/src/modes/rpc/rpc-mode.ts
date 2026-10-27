@@ -1745,6 +1745,17 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	};
 	inputRead.then(rejectStartupDialogs, rejectStartupDialogs);
 
+	// Output all agent events as JSON; prompt results follow the frame that settled them.
+	// Subscribed before extension startup so a turn a `session_start` handler triggers
+	// streams to the client from its first event instead of appearing only once startup returns.
+	session.subscribe(event => {
+		sessionEvents.forward(event);
+		// Before the prompt-result and settle reports: a goal continuation decided at this
+		// agent_end is scheduled (and reported as pending) before either reads settlement.
+		goalController.observe(event);
+		promptResults.observe(event);
+		settleWatcher.observe(event);
+	});
 	// Set up extensions with RPC-based UI context
 	await initializeExtensions(session, {
 		mode: "rpc",
@@ -1789,17 +1800,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		},
 		// Headless hosts get the extension runner's no-op UI: hasUI=false, dialogs resolve to defaults.
 		uiContext: headless ? undefined : rpcUiContext,
+		// Start reading commands while a turn a startup handler triggered still runs:
+		// the client gets `negotiate_protocol`, `get_state` and `abort` answered (and an
+		// extension dialog that turn raises gets its response read) instead of waiting
+		// for the whole turn.
+		drainSends: false,
 	});
 
-	// Output all agent events as JSON; prompt results follow the frame that settled them.
-	session.subscribe(event => {
-		sessionEvents.forward(event);
-		// Before the prompt-result and settle reports: a goal continuation decided at this
-		// agent_end is scheduled (and reported as pending) before either reads settlement.
-		goalController.observe(event);
-		promptResults.observe(event);
-		settleWatcher.observe(event);
-	});
 	await goalController.reconcile();
 	await goalController.settled();
 

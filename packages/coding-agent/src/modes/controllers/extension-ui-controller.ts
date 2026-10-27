@@ -249,6 +249,12 @@ export class ExtensionUiController {
 			return; // No hooks loaded
 		}
 
+		// session_start and resources_discover handlers share this action context, so
+		// a handler calling sendMessage/sendUserMessage starts an async session send
+		// the action itself never exposes a promise for. Every such send dispatches
+		// through the runner, which holds it until startup discovery below has
+		// rebuilt the prompt (PR #9379 review); `InteractiveMode.init()` extends that
+		// hold until the TUI observes the session and accepts input.
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
@@ -392,10 +398,28 @@ export class ExtensionUiController {
 			this.showExtensionError(error.extensionPath, error.error);
 		});
 
-		// Emit session_start event
-		await extensionRunner.emit({
-			type: "session_start",
-		});
+		// A `session_start` or `resources_discover` handler can call
+		// sendMessage/sendUserMessage synchronously; a triggered turn would read
+		// the system prompt before `discoverStartupSkillPaths()` has folded any
+		// extension-contributed skill directories into it. Hold those sends until
+		// discovery has rebuilt the prompt.
+		const startupRound = async (): Promise<void> => {
+			await extensionRunner.emit({
+				type: "session_start",
+			});
+			// resources_discover fires after `session_start` (extensibility/extensions/types.ts) —
+			// only now are runtime actions and the error listener above wired, so
+			// extension-contributed skill directories are folded into the session's
+			// skill snapshot before the first prompt.
+			await this.ctx.session.discoverStartupSkillPaths();
+		};
+		// A runner that queues no sends (a stand-in without `sends`) runs the
+		// round unheld — same guard as `InteractiveMode.init()`.
+		const sends = this.ctx.session.extensionRunner?.sends;
+		if (sends) await sends.withHeld(startupRound);
+		else await startupRound();
+		// A turn those sends start is not awaited here: it runs like any other turn,
+		// rendered live and interruptible.
 	}
 
 	/**
@@ -482,6 +506,8 @@ export class ExtensionUiController {
 			return;
 		}
 
+		// Same runner-routed dispatch as initHooksAndCustomTools: a reload
+		// discovery round (`refreshSkills`) holds these sends until it is applied.
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
@@ -1475,18 +1501,31 @@ export class ExtensionUiController {
 		return true;
 	}
 
-	#sendExtensionMessage: SendMessageHandler = (message, options) => {
-		const startsTurn =
+	#extensionMessageStartsTurn(options: Parameters<SendMessageHandler>[1]): boolean {
+		return (
 			options?.triggerTurn === true ||
 			options?.deliverAs === "steer" ||
 			options?.deliverAs === "followUp" ||
-			options?.deliverAs === "aside";
-		if (startsTurn && this.#rejectGuestExtensionTurn()) return;
+			options?.deliverAs === "aside"
+		);
+	}
+
+	/**
+	 * Extension-originated sends go through {@link ExtensionSendQueue.dispatch} so a
+	 * startup or `/reload-plugins` discovery round can hold them until it has rebuilt
+	 * the system prompt (PR #9379). Without a runner there is nothing holding them.
+	 */
+	#dispatchExtensionSend<T>(send: () => Promise<T>): Promise<T> {
+		const sends = this.ctx.session.extensionRunner?.sends;
+		return sends ? sends.dispatch(send) : send();
+	}
+
+	#sendExtensionMessage: SendMessageHandler = (message, options) => {
+		if (this.#extensionMessageStartsTurn(options) && this.#rejectGuestExtensionTurn()) return;
 		const wasStreaming = this.ctx.session.isStreaming;
 		const messageCountBefore = this.ctx.session.messages.length;
 		const normalized = normalizeCustomMessagePayload(message);
-		this.ctx.session
-			.sendCustomMessage(normalized, options)
+		this.#dispatchExtensionSend(() => this.ctx.session.sendCustomMessage(normalized, options))
 			.then(() => {
 				// `deliverAs: "nextTurn"` without a trigger is the one idle arm that appends
 				// to the session silently (no message_start/message_end), so nothing else
@@ -1502,7 +1541,7 @@ export class ExtensionUiController {
 	/** Every `sendUserMessage` form prompts or queues a user turn (see `AgentSession.sendUserMessage`). */
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {
 		if (this.#rejectGuestExtensionTurn()) return;
-		this.ctx.session.sendUserMessage(content, options).catch((err: unknown) => {
+		this.#dispatchExtensionSend(() => this.ctx.session.sendUserMessage(content, options)).catch((err: unknown) => {
 			this.ctx.showError(`Extension sendUserMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 		});
 	};
