@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Anthropic responses through a custom `baseUrl` (a gateway in front of Anthropic) losing their server-side fallback marker and redacted thinking from the saved turn, so the next request replays that turn's reasoning instead of being refused and retried without it ([#12352](https://github.com/can1357/oh-my-pi/pull/12352) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
