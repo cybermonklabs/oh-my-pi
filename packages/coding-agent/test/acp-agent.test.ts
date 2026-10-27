@@ -136,6 +136,10 @@ class FakeAgentSession {
 	queuedMessageCount = 0;
 	systemPrompt = "system";
 	disposed = false;
+	/** ACP scopes the extension agents API by the session's agent id; a top-level fake has none. */
+	getAgentId(): string | undefined {
+		return undefined;
+	}
 	fastMode = false;
 	clientBridge: ClientBridge | undefined;
 	forcedToolChoice: string | undefined;
