@@ -19,7 +19,7 @@ import { clampThinkingLevelForModel, getSupportedEfforts } from "@oh-my-pi/pi-ca
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { extractTextContent, extractToolCall, parseJsonPayload } from "../commit/utils";
 
-import type { ModelRegistry } from "../config/model-registry";
+import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import {
 	expandRoleAlias,
 	extractExplicitThinkingSelector,
@@ -382,7 +382,7 @@ async function executeCompletion(
 		try {
 			// Forward the session id so session-sticky OAuth credentials
 			// resolve (see #5325); without it a usable fallback looks keyless.
-			const apiKey = await registry.getApiKey(model, session.getSessionId?.() ?? undefined, { signal });
+			const apiKey = await probeModelApiKey(registry, model, session.getSessionId?.() ?? undefined, { signal });
 			if (!apiKey) {
 				attempt.outcome = "no-credentials";
 				lastError = new ToolError(
