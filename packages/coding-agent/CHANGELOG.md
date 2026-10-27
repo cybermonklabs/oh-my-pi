@@ -7,6 +7,10 @@
 - Pinned sessions show a pin beside their title in the status line and the band composer's title, and `/unpin [session id]` unpins a session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - Added a fullscreen extension link browser for picking links already in terminal scrollback: press Alt+O again (or Page Up) while link tags are shown, or Alt+O with no extension link on screen ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
 
+### Fixed
+
+- Fixed agents taking a `grep history://<id>` miss as proof that something never happened: the `history://` description now says the transcript is condensed and where the full record is kept ([#17106](https://github.com/can1357/oh-my-pi/pull/17106) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
