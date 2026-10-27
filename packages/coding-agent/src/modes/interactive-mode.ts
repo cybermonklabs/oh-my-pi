@@ -13,6 +13,7 @@ import type {
 	AutocompleteProvider,
 	Component,
 	EditorTheme,
+	HistoryFlushOptions,
 	KeyId,
 	LoaderMessageColorFn,
 	OverlayHandle,
@@ -21,6 +22,7 @@ import type {
 import {
 	Container,
 	clearRenderCache,
+	EXIT_FLUSH_MAX_ROWS,
 	getComposerStyle,
 	getPaddingX,
 	getWidthConfigEpoch,
@@ -2156,6 +2158,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				if ((this.viewSession.extensionRunner?.getLinkSchemes().length ?? 0) > 0) this.#redrawExtensionLinks();
 			}),
 		);
+		// Every exiting stop (quit, Ctrl+D, a postmortem restore other than a
+		// signal) flushes on this session's condition.
+		this.ui.setExitFlushProvider(() => this.#exitFlush());
 		this.chatContainer = new TranscriptContainer();
 		this.pendingShellContainer = new AnchoredLiveContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
@@ -6637,7 +6642,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		try {
-			this.ui.stop();
+			this.ui.stop({ resuming: true });
 			const result = await openInEditor(editorCmd, currentText, {
 				extension: path.extname(resolvedPath) || ".md",
 				trimTrailingNewline: false,
@@ -6663,7 +6668,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		try {
-			this.ui.stop();
+			this.ui.stop({ resuming: true });
 			const result = await openInEditor(editorCmd, draft, { extension: ".md" });
 			if (result !== null) {
 				commit(result);
@@ -8249,6 +8254,29 @@ export class InteractiveMode implements InteractiveModeContext {
 	#beginClose(): void {
 		this.#isShuttingDown = true;
 		this.showStatus("Closing session…");
+	}
+
+	/**
+	 * How the transcript flushes when this session hands the terminal back at
+	 * exit: capped only when the backing store has confirmed the session file,
+	 * which keeps the messages the cap skips; otherwise native scrollback is the
+	 * transcript's only copy, so it gets the full flush. A remote store with a
+	 * write still in flight does not count, since the exit can abort that write.
+	 * A failed teardown (the escape hatch quits without writing the log) or a
+	 * latched disk failure means the file exists but lacks the newest entries,
+	 * so both flush in full. Notices (errors, warnings) are never persisted, so a
+	 * capped exit does not keep those older than the capped rows.
+	 */
+	#exitFlush(): HistoryFlushOptions {
+		if (
+			this.#teardownFailed ||
+			this.sessionManager.hasPersistenceFailure() ||
+			!this.sessionManager.getSessionId() ||
+			!this.sessionManager.isSessionConfirmedOnDisk()
+		) {
+			return {};
+		}
+		return { maxRows: EXIT_FLUSH_MAX_ROWS };
 	}
 
 	/** Shared `shutdown()`/`restart()` teardown: dispose the session and hand the terminal back. */

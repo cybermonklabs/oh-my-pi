@@ -6,10 +6,21 @@
 
 - `StatusLineComponent.setSessionPinned()` / `setPinnedSessionIds()` / `isSessionPinned()` track pinned sessions; `session_name` prefixes the theme's pin icon for a pinned session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - `LinkBrowserComponent` (`overlays/link-browser`) replays a transcript fullscreen with extension link hint tags that each link keeps while it stays in view; `LinkHints` / `viewportLinkTargets()` (`render/link-hints`) share tag assignment (preferring the letters a label starts with) and painting with `Composer`; `ChatTranscriptBuilder` accepts `textRenderers` ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
+- Added `TUI.setExitFlushProvider()`, which decides how an exiting stop (`stop()` without options, or a postmortem restore other than a signal) flushes history ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
+- Added `TUI.stop(options)` with `TUIStopOptions`: `{ maxRows }` caps an exiting stop's history flush, and `{ resuming: true }` marks a handoff that resumes with `start()` ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
+- Added `HistoryFlushOptions`, the flush shape a frame provider's `beginHistoryFlush()` receives ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
+- Added `EXIT_FLUSH_MAX_ROWS` (2,000), the row cap for an exiting stop's history flush ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
+- Added `TerminalFrameProvider.endHistoryFlush()`, which ends the stop-time flush so frames after `start()` retire by pressure again ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
 
 ### Fixed
 
 - Closing an overlay that others were opened over no longer leaves them returning focus to it once they close ([#16476](https://github.com/can1357/oh-my-pi/pull/16476))
+- Fixed quitting a session with a long un-retired transcript (for example after a fullscreen overlay held the screen) rendering the whole history before exit: `TUI.stop({ maxRows })` writes only the newest whole blocks that fit, or the newest block whole when it alone is taller ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
+- Fixed finished messages moving into terminal scrollback immediately, instead of staying live until the screen fills, after returning from a suspend or an external editor ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar)).
+- Fixed opening the external editor or suspending from a fullscreen view, such as `/annotate`, stalling for many seconds on a long session ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar)).
+- Fixed quitting with more inline images than the image budget allows writing the newest ones to scrollback as text instead of the oldest ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
+- Fixed a long streamed reply being glued to the next message in scrollback ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
+- Fixed a long message that scrolled partly off the screen being glued to the next message in scrollback ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
 
 ## [18.16.0] - 2026-11-02
 
