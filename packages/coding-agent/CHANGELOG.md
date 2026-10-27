@@ -7,6 +7,17 @@
 - Pinned sessions show a pin beside their title in the status line and the band composer's title, and `/unpin [session id]` unpins a session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - Added a fullscreen extension link browser for picking links already in terminal scrollback: press Alt+O again (or Page Up) while link tags are shown, or Alt+O with no extension link on screen ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
 
+### Fixed
+
+- Fixed an extension message sent with `deliverAs: "aside"` and `triggerTurn: true` being folded into the conversation with no turn in plan mode or after an earlier interrupt, when it was sent to an idle session or no run picked it up (a prompt refused before its run, or the message arriving after the run's last check); it now starts a turn unless you interrupt after it was sent ([#17166](https://github.com/can1357/oh-my-pi/pull/17166) by [@sjawhar](https://github.com/sjawhar))
+- Fixed `agent_end` reporting `isTerminal: false` after an interrupt when the messages left over were only folded into the conversation and no turn followed ([#17166](https://github.com/can1357/oh-my-pi/pull/17166) by [@sjawhar](https://github.com/sjawhar))
+- Fixed `agent_end` reporting a final turn while an extension message sent with `triggerTurn: true` during an interrupt still had its turn to come ([#17166](https://github.com/can1357/oh-my-pi/pull/17166) by [@sjawhar](https://github.com/sjawhar))
+- Fixed an extension message sent with `triggerTurn: true` just as a session switch started being folded, or left waiting for an unrelated prompt, after that switch failed and rolled back ([#17166](https://github.com/can1357/oh-my-pi/pull/17166) by [@sjawhar](https://github.com/sjawhar))
+- Fixed a background message whose images fail to load ending the run while a different message was still on its way to the turn it asked for, and a disposed session leaving its last run reported as unfinished ([#17166](https://github.com/can1357/oh-my-pi/pull/17166) by [@sjawhar](https://github.com/sjawhar))
+- Fixed a background message whose images fail to load reporting the previous run as finished while the turn another message had already started was still running ([#17166](https://github.com/can1357/oh-my-pi/pull/17166) by [@sjawhar](https://github.com/sjawhar))
+- Fixed an extension or peer message already waiting behind a running turn losing the turn it asked for when a session switch failed and rolled back ([#17166](https://github.com/can1357/oh-my-pi/pull/17166) by [@sjawhar](https://github.com/sjawhar))
+- Fixed `agent_end` reporting a final turn while you leave a mode, when a message that asked for a turn was parked behind that mode's teardown and still had its turn to come ([#17166](https://github.com/can1357/oh-my-pi/pull/17166) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
