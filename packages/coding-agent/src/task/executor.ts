@@ -2254,6 +2254,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					progress.retryFailure = {
 						attempt,
 						errorMessage: event.finalError ?? "Auto-retry failed",
+						kind: event.kind,
+						resetAtMs: event.resetAtMs,
 					};
 				}
 				scheduleProgress(true);

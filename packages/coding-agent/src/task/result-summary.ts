@@ -65,7 +65,20 @@ export function formatTaskResultSummary(
 	// streaming prose (provider stream error, missing yield) would otherwise
 	// show only the half-written text and no reason. Aborts carry their own
 	// <abort-reason>; an empty output already previews the error itself.
-	const error = result.exitCode !== 0 && !result.aborted && result.output.trim().length > 0 ? result.error : undefined;
+	const failed = result.exitCode !== 0 && !result.aborted;
+	const error = failed && result.output.trim().length > 0 ? result.error : undefined;
+	// The prose error names the provider's wording; the kind and reset time let
+	// the parent decide between waiting for the limit and rerouting the work.
+	const retryFailure =
+		failed && result.retryFailure?.kind
+			? {
+					kind: result.retryFailure.kind,
+					resetAt:
+						result.retryFailure.resetAtMs === undefined
+							? undefined
+							: new Date(result.retryFailure.resetAtMs).toISOString(),
+				}
+			: undefined;
 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
 	// A stopped agent stays messageable; tell the parent so it can resume via
 	// irc instead of redoing the work. Isolated runs are parked without a
@@ -79,6 +92,7 @@ export function formatTaskResultSummary(
 			duration: formatDuration(options.totalDurationMs),
 			abortReason: result.aborted ? escapeHarnessTags(result.abortReason ?? "") || undefined : undefined,
 			error: error === undefined ? undefined : escapeHarnessTags(error),
+			retryFailure,
 			resumable,
 			preview: escapeHarnessTags(truncated ? previewHead(output) : output),
 			truncated,

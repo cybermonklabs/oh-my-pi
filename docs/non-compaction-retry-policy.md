@@ -227,7 +227,7 @@ Client helpers:
 Session-level retry events:
 
 - `auto_retry_start { attempt, maxAttempts, delayMs, errorMessage, errorId? }`
-- `auto_retry_end { success, attempt, finalError?, retryErrors? }`
+- `auto_retry_end { success, attempt, finalError?, kind?, resetAtMs?, retryErrors? }`
 - `retry_fallback_applied { from, to, role, reason? }`
 - `retry_fallback_succeeded { model, role }`
 
@@ -255,6 +255,9 @@ Propagation:
 Final failure surfacing:
 
 - On max-exceeded, max-delay failure, or cancellation, `auto_retry_end.success === false`
+- A failure that ended on a provider error carrying an error id has `kind`: `AIError.stringify` of the final error id, i.e. kind labels joined by `|` (e.g. `usage-limit`, `transient|usage-limit`), or `status:<code>` for an error known only by its HTTP status; test membership, not equality. Cancellation, the empty-stop cap and local continuation failures carry none
+- The max-exceeded and max-delay failures also carry `resetAtMs`, the latest reset the provider stated for the failing credential: a parsed reset hint from the error text, a complete usage-report window, or an earlier provider-timed block on the same credential. It is never the wait recovery computed, so a sibling account's block, a merged heuristic block and the retry backoff do not set it; with no provider-stated reset, or one outside the `Date` range, it is absent. It covers only the account this run used; another stored account may become usable sooner
+- A subagent copies `kind` and `resetAtMs` into its task result's `retryFailure`, and the parent's `<task-result>` shows them as `<retry-failure kind="…" reset-at="…" />`
 - TUI shows: `Retry failed after N attempts: <finalError>`
 - Extensions/hooks receive `auto_retry_end` with same fields
 - RPC consumers receive same event object on stdout stream

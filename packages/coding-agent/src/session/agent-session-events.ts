@@ -75,6 +75,10 @@ export type AgentSessionEvent =
 			success: boolean;
 			attempt: number;
 			finalError?: string;
+			/** `AIError.stringify` of the final error id: kind labels joined by `|` (e.g. `usage-limit`, `transient|usage-limit`), or `status:<code>` for an error known only by its HTTP status; test membership, not equality. */
+			kind?: string;
+			/** Epoch ms when the failing credential's limit resets, as the provider stated it; absent when the provider stated no time. Covers only the account this run used; another stored account may become usable sooner. */
+			resetAtMs?: number;
 			retryErrors?: RetryErrorUpdate[];
 	  }
 	| ({ type: "cache_warming_start" } & CacheWarmingRefreshStart)

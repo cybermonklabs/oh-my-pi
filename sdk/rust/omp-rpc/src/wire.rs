@@ -3795,6 +3795,12 @@ pub struct AutoRetryEndEvent {
 	pub attempt: i64,
 	#[serde(rename = "finalError", default, skip_serializing_if = "Option::is_none")]
 	pub final_error: Option<String>,
+	/// Error kind of the failure that ended the retry: kind labels joined by `|` (e.g. `usage-limit`, `transient|usage-limit`), or `status:<code>` for an error known only by its HTTP status; test membership, not equality.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub kind: Option<String>,
+	/// Epoch ms when the failing credential's limit resets, as the provider stated it; absent when the provider stated no time. Covers only the account this run used; another stored account may become usable sooner.
+	#[serde(rename = "resetAtMs", default, skip_serializing_if = "Option::is_none")]
+	pub reset_at_ms: Option<i64>,
 	/// Persisted retry errors whose presentation changed when the retry settled.
 	#[serde(rename = "retryErrors", default = "default_auto_retry_end_event_retry_errors")]
 	pub retry_errors: Vec<Map<String, Value>>,

@@ -1113,6 +1113,10 @@ class AutoRetryEndEvent:
     success: bool
     attempt: int
     final_error: str | None = None
+    kind: str | None = None
+    """Error kind of the failure that ended the retry: kind labels joined by `|` (e.g. `usage-limit`, `transient|usage-limit`), or `status:<code>` for an error known only by its HTTP status; test membership, not equality."""
+    reset_at_ms: int | None = None
+    """Epoch ms when the failing credential's limit resets, as the provider stated it; absent when the provider stated no time. Covers only the account this run used; another stored account may become usable sooner."""
     retry_errors: tuple[JsonObject, ...] = ()
     """Persisted retry errors whose presentation changed when the retry settled."""
 
@@ -2524,6 +2528,8 @@ def parse_auto_retry_end_event(value: object, path: str = "AutoRetryEndEvent") -
         success=required(payload, "success", decode_bool, path),
         attempt=required(payload, "attempt", decode_int, path),
         final_error=optional(payload, "finalError", decode_str, path),
+        kind=optional(payload, "kind", decode_str, path),
+        reset_at_ms=optional(payload, "resetAtMs", decode_int, path),
         retry_errors=defaulted(payload, "retryErrors", array(decode_json_object), path, ()),
     )
 

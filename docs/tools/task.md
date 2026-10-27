@@ -91,13 +91,13 @@ Background response (`async.enabled=true`):
 
 Settled response (`async.enabled=false`, no job manager, every item's agent `blocking: true`, or async job body):
 
-- `content`: summary rendered from `packages/coding-agent/src/prompts/tools/task-summary.md`; output up to 11500 chars is inline whole, longer output shows a 5000-char preview and `agent://<id>` holds the full output. A sync batch concatenates the per-spawn summaries.
+- `content`: summary rendered from `packages/coding-agent/src/prompts/tools/task-summary.md`; output up to 11500 chars is inline whole, longer output shows a 5000-char preview and `agent://<id>` holds the full output. A sync batch concatenates the per-spawn summaries. A failed run whose auto-retry gave up on an error carrying an error id adds `<retry-failure kind="…" reset-at="…" />`, with `reset-at` (ISO 8601) only when the provider stated when the failing credential's limit resets. `kind` is `AIError.stringify` of the final error id: kind labels joined by `|` (e.g. `usage-limit`, `transient|usage-limit`), or `status:<code>` for an error known only by its HTTP status; test membership, not equality.
 - `details.results`: one `SingleResult` per spawn; `usage`, `outputPaths` populated (aggregated across spawns for a sync batch).
 
 `SingleResult` includes:
 
 - identity: `index`, `id`, `agent`, `agentSource`, `task`, `description`, optional `assignment` (internal payload names; the wire fields are `name`/`agent`/`task`)
-- status: `exitCode`, optional `error`, optional `aborted`, optional `abortReason`, optional `retryFailure`
+- status: `exitCode`, optional `error`, optional `aborted`, optional `abortReason`, optional `retryFailure` (`TaskRetryFailure`: `attempt`, `errorMessage`, optional `kind`, optional `resetAtMs`)
 - output: `output`, `stderr`, `truncated`, `durationMs`, `tokens`, `requests`, optional `contextTokens`/`contextWindow`, `usage`
 - model: optional `modelOverride`, `modelRole`, `resolvedModel`, `resolvedModelIdentity`, `resolvedThinkingLevel`, `resolvedModelIsFallback`, `resolvedModelRoute`, `advisor`
 - structured result: optional `structuredOutput` with schema source/mode, validation status, parsed `data`, and validation `error`

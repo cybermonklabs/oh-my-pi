@@ -151,6 +151,33 @@ function conversationEnd(messages: readonly AgentMessage[]): number {
 	return end;
 }
 
+/** `auto_retry_end.kind` for a failed retry: the error's `AIError` label, absent when the message carries no error id. */
+function retryFailureKind(errorId: number | undefined): string | undefined {
+	return errorId ? AIError.stringify(errorId) : undefined;
+}
+
+/**
+ * `auto_retry_end.resetAtMs`: the latest reset the provider stated for the
+ * failing credential (error-text hint, complete usage-report window, or an
+ * earlier provider-timed block), never the wait recovery computed, which also
+ * folds in sibling blocks, merged heuristic blocks and our own backoff. A value
+ * outside the `Date` range (an absurd provider hint) is dropped; that bound
+ * also keeps it a safe integer and within int64.
+ */
+function providerStatedResetAtMs(
+	parsedRetryAtMs: number | undefined,
+	outcome: UsageLimitOutcome | undefined,
+): number | undefined {
+	const deadlines = [
+		parsedRetryAtMs,
+		outcome?.reportResetAtMs,
+		outcome?.priorBlockedUntilTimed ? outcome.priorBlockedUntilMs : undefined,
+	].filter((deadlineMs): deadlineMs is number => deadlineMs !== undefined);
+	if (deadlines.length === 0) return undefined;
+	const resetAtMs = Math.ceil(Math.max(...deadlines));
+	return Number.isNaN(new Date(resetAtMs).getTime()) ? undefined : resetAtMs;
+}
+
 function syntheticToolResultTailStart(messages: readonly AgentMessage[]): number {
 	let index = conversationEnd(messages);
 	while (index > 0 && isSyntheticToolResultMessage(messages[index - 1])) {
@@ -635,6 +662,7 @@ export class TurnRecovery {
 			success: false,
 			attempt,
 			finalError: message.errorMessage,
+			kind: retryFailureKind(message.errorId),
 		});
 		this.#clearPendingRetryErrors();
 	}
@@ -2712,6 +2740,7 @@ export class TurnRecovery {
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
 		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
+		const parsedRetryAtMs = parsedRetryAfterMs === undefined ? undefined : Date.now() + parsedRetryAfterMs;
 		let delayMs = staleOpenAIResponsesReplayError
 			? 0
 			: calculateRetryBackoffDelayMs(retrySettings.baseDelayMs, this.#retryAttempt);
@@ -2761,10 +2790,9 @@ export class TurnRecovery {
 				this.#retryAbortController?.abort();
 				this.#retryAbortController = resetAbortController;
 				const startedAtMs = Date.now();
-				const unblockAtMs = parsedRetryAfterMs === undefined ? undefined : startedAtMs + parsedRetryAfterMs;
 				try {
 					for (let attempt = 0; ; attempt++) {
-						const result = await this.#host.maybeAutoRedeemReset(unblockAtMs);
+						const result = await this.#host.maybeAutoRedeemReset(parsedRetryAtMs);
 						resetAbortController.signal.throwIfAborted();
 						if (result.restored) {
 							restored = true;
@@ -3043,7 +3071,13 @@ export class TurnRecovery {
 				const attempt = this.#retryAttempt - 1;
 				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
 				await this.#closeRetrySaga(
-					{ success: false, attempt, finalError: errorMessage },
+					{
+						success: false,
+						attempt,
+						finalError: errorMessage,
+						kind: retryFailureKind(id),
+						resetAtMs: providerStatedResetAtMs(parsedRetryAtMs, recordedUsageLimitOutcome),
+					},
 					{ terminalTurn: message, retryErrors: { status: "superseded" } },
 				);
 				return false;
@@ -3063,7 +3097,12 @@ export class TurnRecovery {
 			// an announcement that never resolves.
 			if (this.#retryAttempt > 1) {
 				await this.#closeRetrySaga(
-					{ success: false, attempt: this.#retryAttempt - 1, finalError: errorMessage },
+					{
+						success: false,
+						attempt: this.#retryAttempt - 1,
+						finalError: errorMessage,
+						kind: retryFailureKind(id),
+					},
 					{ terminalTurn: message },
 				);
 			}
@@ -3084,7 +3123,12 @@ export class TurnRecovery {
 			// Same auto_retry_end backstop as the classifier-refusal branch above.
 			if (this.#retryAttempt > 1) {
 				await this.#closeRetrySaga(
-					{ success: false, attempt: this.#retryAttempt - 1, finalError: errorMessage },
+					{
+						success: false,
+						attempt: this.#retryAttempt - 1,
+						finalError: errorMessage,
+						kind: retryFailureKind(id),
+					},
 					{ terminalTurn: message },
 				);
 			}
@@ -3102,6 +3146,8 @@ export class TurnRecovery {
 					success: false,
 					attempt,
 					finalError: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+					kind: retryFailureKind(id),
+					resetAtMs: providerStatedResetAtMs(parsedRetryAtMs, recordedUsageLimitOutcome),
 				},
 				{ terminalTurn: message },
 			);
