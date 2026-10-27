@@ -441,6 +441,10 @@ export class IndexedSessionStorage implements SessionStorage {
 			await this.#enqueuePaths(paths, () => this.#backend.remove(paths), { trackDrain: false });
 			for (const [path] of previous) this.#dropFrame(path, sessionEntry.mtimeMs);
 		} catch (err) {
+			// A failed removal restores every index entry, even when the backend
+			// already deleted the content (the reply was lost): the session
+			// stays present but unconfirmed, and an append extends whatever the
+			// backend holds.
 			for (const [path] of previous) this.#failFrame(path, sessionEntry.mtimeMs);
 			throw toError(err);
 		}

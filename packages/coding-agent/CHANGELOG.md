@@ -7,6 +7,13 @@
 - Pinned sessions show a pin beside their title in the status line and the band composer's title, and `/unpin [session id]` unpins a session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - Added a fullscreen extension link browser for picking links already in terminal scrollback: press Alt+O again (or Page Up) while link tags are shown, or Alt+O with no extension link on screen ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
 
+### Fixed
+
+- Fixed a failed session-maintenance rewrite making every later turn republish its full transcript; turns with durable predecessors now keep appending normally.
+- Fixed agents continuing after a session persistence failure without context about the risk; the next prompt now receives a hidden warning to preserve critical work.
+- Fixed `omp --resume <path>` parsing an unchanged session file twice; large sessions now re-stat for freshness and reparse only after a change.
+- Fixed full rewrites of large file-backed sessions retaining a second transcript-sized serialization; file storage now streams the journal and verifies uncertain publication by an exact streamed comparison.
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
