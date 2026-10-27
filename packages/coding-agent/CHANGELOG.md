@@ -7,6 +7,10 @@
 - Pinned sessions show a pin beside their title in the status line and the band composer's title, and `/unpin [session id]` unpins a session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - Added a fullscreen extension link browser for picking links already in terminal scrollback: press Alt+O again (or Page Up) while link tags are shown, or Alt+O with no extension link on screen ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
 
+### Fixed
+
+- Fixed the status line pinning multiple CPU cores in worktrees created by `jj workspace add`. Their git index carries no file stat data, so every status call re-read and re-hashed the whole worktree (measured 2.2s and 47s of CPU per call on a 94k-file checkout) and leaked a `git-lfs filter-process` per call; the refreshed stat data is now written back, so the first call repairs the index and later calls are ~80x cheaper. Status refreshes also back off to five times the last call's duration, and a status call slower than a second is logged with its repository.
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
