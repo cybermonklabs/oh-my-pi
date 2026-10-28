@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Chat and judgment spans now carry `omp.gen_ai.provider.id` (the provider id before OTel normalization, such as `openai-codex`) and `omp.gen_ai.auth.kind` (`api_key`, `console_oauth`, `subscription_oauth` or `unknown`), so subscription, Console-login and API-key calls can be told apart
+- Chat and judgment spans now split cache writes into `gen_ai.usage.cache_creation.ephemeral_5m_input_tokens` and `gen_ai.usage.cache_creation.ephemeral_1h_input_tokens` when the provider reports cache lifetimes
+
 ## [18.16.0] - 2026-11-02
 
 ### Changed

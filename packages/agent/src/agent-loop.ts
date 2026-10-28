@@ -72,8 +72,10 @@ import {
 	runInActiveSpan,
 	type Span,
 	startChatSpan,
+	classifyTelemetryAuthKind,
 	startExecuteToolSpan,
 	startInvokeAgentSpan,
+	trackTelemetryAuthKind,
 } from "./telemetry";
 import { validateAgentToolArguments } from "./tool-arguments";
 import {
@@ -2088,7 +2090,10 @@ async function streamAssistantResponse(
 			systemPrompt: llmContext.systemPrompt,
 			messages: llmContext.messages,
 		},
+		authKind: classifyTelemetryAuthKind(resolvedCredential ?? resolvedApiKey),
 	});
+	// The provider may rotate credentials mid-request; record the one it sent last.
+	const telemetryApiKey = trackTelemetryAuthKind(chatSpan, apiKey);
 
 	// Wrap the user-supplied onResponse so we always observe response headers
 	// for telemetry (`ChatUsageEvent.headers`, gateway auto-detection) without
@@ -2158,7 +2163,7 @@ async function streamAssistantResponse(
 		return await runInActiveSpan(chatSpan, async () => {
 			let response = await streamFunction(model, llmContext, {
 				...config,
-				apiKey,
+				apiKey: telemetryApiKey,
 				metadata: resolvedMetadata,
 				toolChoice: effectiveToolChoice,
 				reasoning: effectiveReasoning,

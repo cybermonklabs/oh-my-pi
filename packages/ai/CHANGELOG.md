@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added **Anthropic Console** to `/login`: sign in with a Claude Console account to use Claude models billed to your Console organization, without creating an API key. Console logins sit alongside Claude Pro/Max logins for the same organization.
+
 ## [18.16.0] - 2026-11-02
 
 ### Added

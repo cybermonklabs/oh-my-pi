@@ -43,6 +43,13 @@ export interface ResolvedApiKey {
 	/** Durable row id of the credential that supplied this bearer, when known. */
 	credentialId?: number;
 	/**
+	 * Kind of credential that supplied this bearer, when the resolver knows it:
+	 * an OAuth login (subscription or account token) or a static API key.
+	 */
+	credentialType?: "oauth" | "api_key";
+	/** Login that minted an OAuth bearer stored under another provider id (e.g. `anthropic-console`). */
+	loginProvider?: string;
+	/**
 	 * The OAuth access token behind this bearer, when the bearer came from a
 	 * stored OAuth credential. A provider whose API key wraps the token in a
 	 * structured document makes the two differ, so a 401 recovery names this
