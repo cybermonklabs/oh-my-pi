@@ -409,6 +409,17 @@ export class TurnRecovery {
 	#usageReserveApproval: { model: string; sessionId: string } | undefined;
 	#pendingRetryErrors: PendingRetryError[] = [];
 	#usageLimitOutcomes = new WeakMap<AssistantMessage, Promise<UsageLimitOutcome>>();
+	/**
+	 * Credential rows that failed with a usage limit in the current retry saga.
+	 * A claimed credential switch is trusted only when the failure came from a
+	 * row not in this set. Cleared when a saga starts, when a new prompt starts,
+	 * when the retry is cancelled (`abortRetry`), and whenever the model changes:
+	 * a fallback applied by recovery or the usage-aware preflight
+	 * (`applyRetryFallbackCandidate`), the Fireworks Fast-to-base switch, and the
+	 * primary restore after its cooldown. A row whose quota a saved reset
+	 * restores is removed, so a later genuine switch away from it is trusted.
+	 */
+	#usageLimitFailedCredentialIds = new Set<number>();
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#malformedFunctionCallRetryCount = 0;
@@ -553,6 +564,7 @@ export class TurnRecovery {
 		this.#streamStallContinueCount = 0;
 		this.#acceptTerminalEmptyStopForPrompt = false;
 		this.#activeFallbackCreditRedemption = undefined;
+		this.#usageLimitFailedCredentialIds.clear();
 	}
 
 	/** Sets whether one terminal empty stop is accepted for the current prompt. */
@@ -2258,6 +2270,7 @@ export class TurnRecovery {
 			if (this.#activeRetryFallback) this.#activeRetryFallback.served = servedBeforeSwap;
 			return false;
 		}
+		this.#usageLimitFailedCredentialIds.clear();
 		this.#host.sessionManager.appendModelChange(candidateSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true);
 		this.#host.settings.getStorage()?.recordModelUsage(candidateSelector);
 		this.#host.setThinkingLevel(nextThinkingLevel);
@@ -2614,6 +2627,7 @@ export class TurnRecovery {
 		// as fallback-served.
 		this.clearActiveRetryFallback();
 		await this.#host.setModelWithProviderSessionReset(primaryModel);
+		this.#usageLimitFailedCredentialIds.clear();
 		this.#host.sessionManager.appendModelChange(primarySelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(primarySelector);
 		this.#host.setThinkingLevel(thinkingToApply);
@@ -2673,6 +2687,7 @@ export class TurnRecovery {
 
 		const generation = this.#host.promptGeneration();
 		this.#retryAttempt++;
+		if (this.#retryAttempt === 1) this.#usageLimitFailedCredentialIds.clear();
 
 		// Create retry promise on first attempt so waitForRetry() can await it
 		// Ensure only one promise exists (avoid orphaned promises from concurrent calls)
@@ -2754,7 +2769,16 @@ export class TurnRecovery {
 		// hits its quota. Past the budget only a confirmed reset may continue: a
 		// rotation that keeps claiming a usable sibling would otherwise retry forever.
 		if (!staleOpenAIResponsesReplayError && recordedUsageLimitOutcome) {
-			const rotated = recordedUsageLimitOutcome.switchedCredential && !retryBudgetExhausted;
+			// A failure from a row that already failed in this saga means the
+			// previous claimed switch never left that row: selection can refuse a
+			// sibling the rotation check calls free (a per-account model list, a
+			// plan gate) and serve the failed row again. Trusting this claim too
+			// would retry that row with no delay until the budget runs out.
+			const failedCredentialId = message.credentialId;
+			const repeatedCredential =
+				failedCredentialId !== undefined && this.#usageLimitFailedCredentialIds.has(failedCredentialId);
+			if (failedCredentialId !== undefined) this.#usageLimitFailedCredentialIds.add(failedCredentialId);
+			const rotated = recordedUsageLimitOutcome.switchedCredential && !retryBudgetExhausted && !repeatedCredential;
 			let restored = false;
 			if (!rotated) {
 				const resetAbortController = new AbortController();
@@ -2793,6 +2817,8 @@ export class TurnRecovery {
 			if (rotated || restored) {
 				switchedCredential = true;
 				delayMs = 0;
+				if (restored && failedCredentialId !== undefined)
+					this.#usageLimitFailedCredentialIds.delete(failedCredentialId);
 			} else {
 				// No sibling credential is usable right now. Wait for whichever
 				// comes first: the current account's actual unblock deadline, or
@@ -3032,6 +3058,7 @@ export class TurnRecovery {
 				switchedModel = await this.#tryFireworksFastFallback(currentSelector);
 			}
 			if (switchedModel) {
+				this.#usageLimitFailedCredentialIds.clear();
 				delayMs = 0;
 			} else if (usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
 				delayMs = parsedRetryAfterMs;
@@ -3301,6 +3328,7 @@ export class TurnRecovery {
 	 */
 	abortRetry(): void {
 		this.#retryAbortController?.abort();
+		this.#usageLimitFailedCredentialIds.clear();
 		// Note: _retryAttempt is reset in the catch block of _autoRetry
 		this.resolveRetry();
 	}

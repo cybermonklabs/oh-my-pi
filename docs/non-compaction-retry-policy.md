@@ -77,6 +77,7 @@ Retry state is owned by `TurnRecovery`:
 - retry attempt counter (`0` means idle)
 - retry lifecycle promise and resolver
 - retry backoff abort controller
+- stored credentials that already failed with a usage limit in the current retry saga
 
 Flow (`#handleRetryableError`):
 
@@ -84,7 +85,7 @@ Flow (`#handleRetryableError`):
 2. Increment the retry attempt and create the shared retry lifecycle promise on the first attempt.
 3. Calculate whether the current model's retry budget is exhausted.
 4. Classify the error, parse retry timing, and compute capped jittered backoff: `min(retry.baseDelayMs * 2^(attempt-1), 8000ms) * (75–100% jitter)`. Stale OpenAI Responses replay errors reset the provider session and use delay `0`.
-5. For usage limits, apply a successful credential switch or banked Claude/Codex reset immediately when the corresponding reset policy permits it; otherwise wait for the earlier of the provider hint and the next temporarily blocked sibling credential.
+5. For usage limits, apply a successful credential switch or banked Claude/Codex reset immediately when the corresponding reset policy permits it; otherwise wait for the earlier of the provider hint and the next temporarily blocked sibling credential. A claimed credential switch counts only when the failed request's stored credential has not already hit a usage limit in this saga: a repeat means selection served the same account again, so recovery takes the no-sibling path (wait, fail fast, or model fallback). That record starts over when a saga starts, when a user prompt starts, when the retry is cancelled (`abortRetry()`), and when retry machinery changes the model: a fallback applied by recovery or the usage-aware preflight, the Fireworks Fast-to-base switch, or the primary restored after its cooldown. A model change the user makes mid-saga does not reset it. A banked reset removes its credential from the record.
 6. When allowed, consult configured model fallback chains. `retry.fallbackOn` decides whether this error class may (`any`, `usage-limit`, `except-usage-limit`). A switch uses delay `0`; classifier refusals and account-policy denials only continue when a credential or model switch succeeds. Thinking-loop redirects stay on the same model; a temporarily blocked sibling credential within the wait cap is preferred over model fallback.
 7. If the current model's retry budget is exhausted, stop unless a model switch or confirmed credential reset permits continuation. A fallback model receives a fresh retry budget; credential recovery keeps the cumulative count. Known thinking-only stream-close routes have a one-retry cap rather than the full configured budget.
 8. If the final delay exceeds `retry.maxDelayMs` and no credential/model switch happened, emit final failure without sleeping, except an authoritative usage-reset wait explicitly allowed by `retry.waitForUsageReset`.
