@@ -7,6 +7,10 @@
 - Pinned sessions show a pin beside their title in the status line and the band composer's title, and `/unpin [session id]` unpins a session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - Added a fullscreen extension link browser for picking links already in terminal scrollback: press Alt+O again (or Page Up) while link tags are shown, or Alt+O with no extension link on screen ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
 
+### Fixed
+
+- Fixed a transcript a live session is running being offered to peers as a parked, revivable agent: a pane resumed on a subagent's transcript (`omp --resume <name>.jsonl`) started a second agent loop on that same transcript when a peer messaged it by that name, and a second omp process did the same to a sibling pane's. The roster scan now asks the session ownership lease who is running a journal before deriving a ref from it, and binds the transcript's name to the session running it, so `agent://<name>`, Agent Hub focus and a `task` resume all reach that session; a journal another omp process runs, and a copy of a running session's journal, are not offered and say why ([#17257](https://github.com/can1357/oh-my-pi/pull/17257) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
