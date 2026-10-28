@@ -8876,8 +8876,14 @@ export class AgentSession implements SettingsScope {
 			}
 
 			// Validate API key; a provider without one walks the retry fallback chain first.
+			// A `!command` key that produced nothing is left to the turn, whose resolver
+			// fails retryably so auto-retry covers the helper.
 			const apiKey = await logger.time("prompt:apiKey", () => this.#modelRegistry.getApiKey(model, this.sessionId));
-			if (!apiKey && !(await this.#recovery.applyMissingCredentialFallback(setupAbort.signal))) {
+			if (
+				!apiKey &&
+				!this.#modelRegistry.retriesFailedCommandKey(model.provider) &&
+				!(await this.#recovery.applyMissingCredentialFallback(setupAbort.signal))
+			) {
 				if (setupAbort.signal.aborted) return false;
 				throw new PromptPreflightError(
 					`No API key found for ${model.provider}.\n\n` +
