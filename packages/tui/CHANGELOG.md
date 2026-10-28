@@ -10,6 +10,8 @@
 ### Fixed
 
 - Closing an overlay that others were opened over no longer leaves them returning focus to it once they close ([#16476](https://github.com/can1357/oh-my-pi/pull/16476))
+- Space and Enter now dismiss the `/pause` screen on terminals that send keys as xterm `modifyOtherKeys` sequences, such as tmux with extended keys on ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
+- The `/pause` screen now leaves the terminal as soon as you resume, and a failed teardown no longer leaves the session paused with no screen to release it ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 
 ## [18.16.0] - 2026-11-02
 
