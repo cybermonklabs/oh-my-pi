@@ -7,6 +7,10 @@
 - Pinned sessions show a pin beside their title in the status line and the band composer's title, and `/unpin [session id]` unpins a session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - Added a fullscreen extension link browser for picking links already in terminal scrollback: press Alt+O again (or Page Up) while link tags are shown, or Alt+O with no extension link on screen ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
 
+### Fixed
+
+- Fixed a Python or JavaScript eval session leaking its previous runner or worker — tens of gigabytes of resident memory held until the host process exited — whenever its next cell resolved to a different retained-kernel key, such as a new working directory; `reset: true` restarted only the key it was called on and left the old runner alive. The kernel an agent leaves behind under an old key is now shut down after a two-minute idle grace, so a round trip out of a directory and back inside that grace keeps its namespace, unless another agent holds it, a caller is still holding it (an acquiring cell, or a subagent that can call its kernel-defined tools), or a cell is still running in it. `bun scripts/find-stranded-eval-runners.ts` lists runners a host will no longer use.
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
