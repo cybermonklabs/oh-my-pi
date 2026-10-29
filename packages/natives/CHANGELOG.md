@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The bash tool's built-in `df`, `du`, `env`, `fold` and `sort` now honour a locale the shell exports through `LOCPATH` instead of falling back to the C locale, so a German locale there gives `sort -n` and `du -h` a decimal comma and a UTF-8 one stops `fold` splitting characters; whether a locale is UTF-8 now comes from its data rather than its name. `sort`, `du` and `df` were compared with GNU coreutils 9.4 runs; `fold` and `env` model coreutils 9.12, newer than the 9.4 available, so their reference is libc's own answer (`locale charmap`) ([#17401](https://github.com/can1357/oh-my-pi/pull/17401) by [@sjawhar](https://github.com/sjawhar))
+- The bash tool's built-in `df`, `du`, `env`, `fold` and `sort` now run in the C locale when one category the shell's locale names is not installed, as GNU coreutils do when `setlocale(LC_ALL, "")` fails, instead of applying the categories that do load: `sort` compares bytes and `sort --debug` reports `failed to set locale`, `du` and `df` group no digits, and `fold` splits multibyte characters; each prints a warning when it cannot read the shell's locale at all. `sort`, `du` and `df` were compared with GNU coreutils 9.4 runs; `fold` and `env` model coreutils 9.12, newer than the 9.4 available, so their reference is libc's own answer (`setlocale` failing, as bash reports it) ([#17401](https://github.com/can1357/oh-my-pi/pull/17401) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
