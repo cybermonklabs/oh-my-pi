@@ -278,5 +278,9 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 		throw err;
 	}
 
-	return exportSessionData(buildSessionData(sm), inputPath, opts);
+	// Opening an archived (`.jsonl.gz`) session restores it, so the artifact
+	// tree — and the subagent transcripts in it — is at the live path, not
+	// beside the file the caller named.
+	const sessionFile = sm.getSessionFile() ?? inputPath;
+	return exportSessionData(buildSessionData(sm), sessionFile, opts);
 }
