@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `AIError.Flag.Connection` marks a failure that died on the wire with no HTTP status and no capacity signal — a cut stream, a closed socket, a truncated chunked transfer — so callers can tell it apart from a 429, a 529 or an overload
+
+### Fixed
+
+- A wire failure a runtime reports only as an errno on `err.code` (`ECONNRESET`, `EPIPE`, `ECONNABORTED`, undici's `UND_ERR_SOCKET`) while leaving the message generic is now classified as a connection failure instead of going unrecognised
+
 ## [18.16.0] - 2026-11-02
 
 ### Added

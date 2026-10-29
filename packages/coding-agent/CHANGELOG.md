@@ -7,6 +7,10 @@
 - Pinned sessions show a pin beside their title in the status line and the band composer's title, and `/unpin [session id]` unpins a session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))
 - Added a fullscreen extension link browser for picking links already in terminal scrollback: press Alt+O again (or Page Up) while link tags are shown, or Alt+O with no extension link on screen ([#16476](https://github.com/can1357/oh-my-pi/pull/16476) by [@materemias](https://github.com/materemias))
 
+### Fixed
+
+- A stream, socket or chunked transfer that dies on a request no retry layer below has replayed — the model had begun streaming, or the wording is one no provider loop retries — is now retried twice on the same model, with full-jitter backoff, before `retry.fallbackChains` moves the session down; a cut whose wording omp did not recognise no longer walks the chain on its first failure. A 429, a 529, an overload, a usage limit, a timeout, a refusal and a failure a provider loop has already replayed still walk the chain at once
+
 ## [18.16.0] - 2026-11-02
 
 ### Added
