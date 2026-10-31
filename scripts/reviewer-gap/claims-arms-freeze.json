@@ -1,11 +1,11 @@
 {
-	"frozen_at": "2026-10-31T20:10:00Z",
+	"frozen_at": "2026-10-31T18:12:44Z",
 	"question": "The shipped reviewer prompt claims 1.4% of the real defects at the claims lane's heads. The batch's reviewers, who found those defects, ran under per-round briefs. Does a generic prompt built from the elements those briefs share find more real defects, does an instruction to run the code rather than read it do that on its own, and does either raise false claims?",
 	"inherits": {
 		"freeze": "claims-freeze.json, revision 2: cases, scoring, run settings and snapshots unchanged",
 		"cases_sha256": "7ccd5d59694bd7fffb03cd4fbf9e841c8cecdfeb3a034d97cf8086f7445111f1",
 		"scorer_sha256": "ba20299d4fd361aae1d9c54a6ddce13145d185430bbe2ba19a97b2bb258a6ef9",
-		"baseline": "runs/claims-2026-10-31/current/: the `current` arm, run 2026-10-31 14:00Z-18:10Z. Reused, not run again: one declared difference, that the new arms run hours later, so provider drift and box load fall on them alone.",
+		"baseline": "runs/claims-2026-10-31/current/: the `current` arm, run 2026-10-31 13:48Z-18:00Z. Reused, not run again: one declared difference, that the new arms ran after it (from 18:13Z), so provider drift and box load fall on them alone.",
 		"runner_change": "run.ts gains the `brief` and `run` entries in its arm table and nothing else since revision 2."
 	},
 	"arms": [
