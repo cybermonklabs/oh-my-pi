@@ -596,6 +596,10 @@ The root command (interactive, print, RPC and ACP modes, and `omp join`) resolve
 - Refusals (exit 1, message on stderr, never a fallback to files): `sql` with no file named anywhere names both `OMP_SESSION_SQL_DSN_FILE` and `session.sql.dsnFile`; a missing or unreadable file — `<source> names <path>, which could not be read: <reason>`; a blank file — `<source> names <path>, which is empty`; an unreachable database — `<source> names <path>, but the session database could not be opened: <driver error> (<code>)`; any other storage value — `<source> is "<value>"; expected "file" or "sql"`. `<source>` is the variable or setting that supplied the value; the connection string itself is never printed.
 - Tool artifacts and image blobs stay under the agent directory on local disk in either mode; only the transcript moves. `omp gc`'s archive and WAL sweeps keep working on that on-disk tree; the blob sweep also reads a SQL-only session's transcript straight from the table so it never deletes a blob that transcript still references.
 - Joining a collab session (`/join`) needs file storage: the guest's replica of the host session is a local file, so under `sql` the join refuses with an error naming `session.storage` rather than resuming an empty session.
+- These features work only on the JSONL tree:
+   - `omp gc --compress` (or `gc.compress`) and the background `gc.autoCompress` run compress session files in place on disk. They never touch a session in the table.
+   - `omp session pack`, `unpack`, and `moved` work only on session files on disk.
+   - Resume forks a session that `omp session moved` marked as moved away (`forkIfMovedAway`). Only a session file can carry that mark, so a SQL-stored session always resumes in place.
 
 ### SQL session storage
 
