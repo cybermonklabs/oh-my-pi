@@ -1,0 +1,22 @@
+# Fork-only probe: on the demo commit (main plus a generator change whose Go
+# and Rust output does not compile), run main's CI gates that read sdk/ files.
+# Never upstream.
+name: Main's SDK gates probe (fork only)
+on:
+   push:
+      branches: [sdk-ci-demo-main]
+permissions:
+   contents: read
+jobs:
+   main_gates:
+      name: Main's gates that read sdk/ (check:ts, generated.test)
+      runs-on: ubuntu-22.04
+      steps:
+         - uses: actions/checkout@v4
+         - uses: ./.github/actions/bun-install
+         # ci.yml `check` job's type check.
+         - name: Type check workspace
+           run: bun run ci:check:full
+         # The test that compares the committed SDK files with the generator's output.
+         - name: Generated RPC artifacts are current
+           run: bun test packages/coding-agent/test/rpc-wire/generated.test.ts
