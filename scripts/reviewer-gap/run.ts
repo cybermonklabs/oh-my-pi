@@ -500,11 +500,15 @@ export function pruneScratch(dir: string): NonNullable<RunRecord["scratch"]> {
 
 /**
  * A record is complete only after the runner has its identifying fields and
- * terminal result. A partial JSON file must be rerun rather than skipped.
+ * terminal result. A partial JSON file must be rerun rather than skipped, and
+ * so must a session that failed before its first model call (a missing
+ * credential, a locked database at startup): it reviewed nothing, so it is a
+ * harness failure to redo, not an errored review to exclude from n.
  */
 function isCompleteRunRecord(outPath: string, expected: Pick<RunRecord, "runId" | "arm" | "head" | "trial">): boolean {
 	try {
 		const record = JSON.parse(fs.readFileSync(outPath, "utf8")) as Partial<RunRecord>;
+		const neverStarted = record.exitCode !== 0 && record.usage?.calls === 0;
 		return (
 			record.runId === expected.runId &&
 			record.arm === expected.arm &&
@@ -514,7 +518,8 @@ function isCompleteRunRecord(outPath: string, expected: Pick<RunRecord, "runId" 
 			typeof record.report === "string" &&
 			Number.isFinite(record.costUsd) &&
 			Number.isFinite(record.elapsedMs) &&
-			Number.isFinite(record.exitCode)
+			Number.isFinite(record.exitCode) &&
+			!neverStarted
 		);
 	} catch {
 		return false;

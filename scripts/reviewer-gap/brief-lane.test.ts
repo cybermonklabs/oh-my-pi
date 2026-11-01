@@ -294,6 +294,91 @@ printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("redoes a session that failed before its first model call, but keeps an errored review that made calls", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "run-never-started-"));
+		try {
+			const out = path.join(dir, "out");
+			const checkout = path.join(dir, "checkout");
+			const diff = path.join(dir, "change.diff");
+			const cases = path.join(dir, "cases.json");
+			const bin = path.join(dir, "bin");
+			const counter = path.join(dir, "omp-calls");
+			for (const d of [out, checkout, bin]) fs.mkdirSync(d);
+			fs.writeFileSync(diff, "");
+			fs.writeFileSync(
+				cases,
+				JSON.stringify({
+					frozen_at: "test",
+					heads: ["nocall", "errored"].map(id => ({
+						id,
+						pr: 1,
+						round: 1,
+						head_sha: "a".repeat(40),
+						base_sha: "b".repeat(40),
+						checkout,
+						diff,
+						subject: id,
+						packages: [],
+					})),
+					findings: [],
+				}),
+			);
+			const failed = (head: string, calls: number): RunRecord => ({
+				runId: `shipped__${head}__t1`,
+				arm: "shipped",
+				head,
+				trial: 1,
+				model: "anthropic/claude-opus-5-5",
+				report: "",
+				costUsd: 0,
+				elapsedMs: 3000,
+				exitCode: 1,
+				error: "empty report; exit 1",
+				usage: { calls, toolCalls: {}, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			});
+			// What a missing credential leaves: exit 1 before any model call.
+			fs.writeFileSync(path.join(out, "shipped__nocall__t1.json"), JSON.stringify(failed("nocall", 0)));
+			// An errored review that did work, such as one cut at --max-time: a result, excluded from n, never redone.
+			fs.writeFileSync(path.join(out, "shipped__errored__t1.json"), JSON.stringify(failed("errored", 12)));
+			const omp = path.join(bin, "omp");
+			fs.writeFileSync(
+				omp,
+				`#!/bin/sh
+printf x >> "$RUN_COUNTER"
+printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"new output"}],"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}}'
+`,
+			);
+			fs.chmodSync(omp, 0o755);
+			const runner = Bun.spawnSync(
+				[
+					process.execPath,
+					path.join(import.meta.dir, "run.ts"),
+					"--out",
+					out,
+					"--cases",
+					cases,
+					"--arms",
+					"shipped",
+					"--trials",
+					"1",
+					"--concurrency",
+					"1",
+					"--no-repo-gate",
+				],
+				{ env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, RUN_COUNTER: counter } },
+			);
+			expect(runner.exitCode).toBe(0);
+			expect(fs.readFileSync(counter, "utf8")).toBe("x");
+			const read = (head: string) =>
+				JSON.parse(fs.readFileSync(path.join(out, `shipped__${head}__t1.json`), "utf8")) as RunRecord;
+			expect(read("nocall").report).toBe("new output");
+			expect(read("errored").usage?.calls).toBe(12);
+			expect(runner.stdout.toString()).toContain("2 of 2 sessions recorded complete");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("childEnv", () => {
