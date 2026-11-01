@@ -172,8 +172,11 @@ estimator, decision rule and hashes, committed before the first session.
   `static-all`: `prompts/static-*.md` appended to the shipped prompt). On this
   lane every arm gets the same user prompt but for the brief; the shared
   prompt states the scratch directory is writable and drops the replay and
-  measured-output instructions the arms test. Each record carries model
-  requests, tokens, the box's load at start and end, and what its scratch kept.
+  measured-output instructions the arms test. Each child gets its own scratch
+  for both `TMPDIR` and `AGENT_SESSION_SCRATCH`, so the `omp` wrapper cannot
+  substitute the launching agent's shared session directory. Each record
+  carries model requests, tokens, the box's load at start and end, and what
+  its scratch kept.
 - `judge.ts` — `match` (two judges must both name a recorded case for a claim
   to count), `cluster` (claims tied to no case, grouped by defect per head),
   `verify` (an agent with the snapshot and that arm's own probes decides REAL

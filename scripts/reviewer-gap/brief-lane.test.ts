@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { type RunScore, mainEffects } from "./brief-lane.ts";
 import type { HeadCase, RunRecord } from "./grade.ts";
 import { type Bundle, type LabelFile, checkLabels } from "./how-found.ts";
-import { type Claim, representatives } from "./judge.ts";
+import { type Claim, childEnv, representatives } from "./judge.ts";
 import { type BriefFile, armBrief, diskStop, pruneScratch, treeBytes, userPrompt } from "./run.ts";
 
 const head: HeadCase = {
@@ -118,6 +118,11 @@ describe("diskStop", () => {
 	});
 });
 
+// The rule the box's `omp` wrapper applies (dotfiles scripts/agent-session): an
+// inherited AGENT_SESSION_SCRATCH that exists becomes the session's TMPDIR.
+const AGENT_SESSION_TMPDIR_RULE =
+	'if [ -n "${AGENT_SESSION_SCRATCH:-}" ] && [ -d "$AGENT_SESSION_SCRATCH" ]; then TMPDIR="$AGENT_SESSION_SCRATCH"; fi';
+
 describe("run resume", () => {
 	test("preserves a completed paid session and redoes an incomplete session instead of corrupting the estimate", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "run-resume-"));
@@ -210,6 +215,102 @@ printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{
 			expect(fs.existsSync(leftover)).toBe(false);
 			expect(fs.existsSync(path.join(out, "shipped__partial__t1.json.claim"))).toBe(false);
 			expect(runner.stdout.toString()).toContain("2 of 2 sessions recorded complete");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a reviewer's TMPDIR is its own scratch even through a wrapper that takes it from AGENT_SESSION_SCRATCH", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "run-tmpdir-"));
+		try {
+			const out = path.join(dir, "out");
+			const checkout = path.join(dir, "checkout");
+			const diff = path.join(dir, "change.diff");
+			const cases = path.join(dir, "cases.json");
+			const bin = path.join(dir, "bin");
+			const launcherScratch = path.join(dir, "launcher-session");
+			const seen = path.join(dir, "seen-tmpdir");
+			for (const d of [out, checkout, bin, launcherScratch]) fs.mkdirSync(d);
+			fs.writeFileSync(diff, "");
+			fs.writeFileSync(
+				cases,
+				JSON.stringify({
+					frozen_at: "test",
+					heads: [
+						{
+							id: "h",
+							pr: 1,
+							round: 1,
+							head_sha: "a".repeat(40),
+							base_sha: "b".repeat(40),
+							checkout,
+							diff,
+							subject: "h",
+							packages: [],
+						},
+					],
+					findings: [],
+				}),
+			);
+			const omp = path.join(bin, "omp");
+			fs.writeFileSync(
+				omp,
+				`#!/bin/sh
+${AGENT_SESSION_TMPDIR_RULE}
+printf '%s' "$TMPDIR" > "$SEEN_TMPDIR"
+printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"report"}],"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}}'
+`,
+			);
+			fs.chmodSync(omp, 0o755);
+			const runner = Bun.spawnSync(
+				[
+					process.execPath,
+					path.join(import.meta.dir, "run.ts"),
+					"--out",
+					out,
+					"--cases",
+					cases,
+					"--arms",
+					"shipped",
+					"--trials",
+					"1",
+					"--concurrency",
+					"1",
+					"--no-repo-gate",
+				],
+				{
+					env: {
+						...process.env,
+						PATH: `${bin}:${process.env.PATH ?? ""}`,
+						AGENT_SESSION_SCRATCH: launcherScratch,
+						TMPDIR: launcherScratch,
+						SEEN_TMPDIR: seen,
+					},
+				},
+			);
+			expect(runner.exitCode).toBe(0);
+			expect(fs.readFileSync(seen, "utf8")).toBe(path.join(out, "scratch", "shipped__h__t1"));
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("childEnv", () => {
+	test("a judge's or verifier's TMPDIR is its own scratch even through a wrapper that takes it from AGENT_SESSION_SCRATCH", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "judge-tmpdir-"));
+		try {
+			const launcherScratch = path.join(dir, "launcher-session");
+			const scratch = path.join(dir, "verify-scratch");
+			fs.mkdirSync(launcherScratch);
+			fs.mkdirSync(scratch);
+			const env = childEnv(scratch, {
+				PATH: process.env.PATH,
+				AGENT_SESSION_SCRATCH: launcherScratch,
+				TMPDIR: launcherScratch,
+			});
+			const seen = Bun.spawnSync(["sh", "-c", `${AGENT_SESSION_TMPDIR_RULE}; printf '%s' "$TMPDIR"`], { env });
+			expect(seen.stdout.toString()).toBe(scratch);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

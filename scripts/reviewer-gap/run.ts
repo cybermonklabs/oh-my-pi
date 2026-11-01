@@ -296,6 +296,17 @@ export interface SpawnResult {
 	usage: NonNullable<RunRecord["usage"]>;
 }
 
+/**
+ * The variables an `omp` child needs to keep `dir` as its TMPDIR. On this box
+ * `omp` resolves to a wrapper (`scripts/agent-session`) that replaces TMPDIR
+ * with an inherited AGENT_SESSION_SCRATCH, so a child given TMPDIR alone gets
+ * the launching agent's session directory instead: shared with every other
+ * child, and deleted when that agent exits.
+ */
+export function scratchTmp(dir: string): { TMPDIR: string; AGENT_SESSION_SCRATCH: string } {
+	return { TMPDIR: dir, AGENT_SESSION_SCRATCH: dir };
+}
+
 export async function runOmp(
 	args: string[],
 	prompt: string,
@@ -714,7 +725,7 @@ async function main(): Promise<void> {
 			// an empty one makes git fail instead of searching.
 			const env: NodeJS.ProcessEnv = {
 				...process.env,
-				TMPDIR: scratch,
+				...scratchTmp(scratch),
 				BUN_INSTALL_CACHE_DIR: path.join(scratch, "bun-cache"),
 				GIT_CEILING_DIRECTORIES: [job.head.checkout, scratch].join(":"),
 				// The session's own log goes to the home directory, outside the eval's disk budget.

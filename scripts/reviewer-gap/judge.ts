@@ -32,7 +32,7 @@ import { sha256 } from "./briefs.ts";
 import { loadClaimsCorpus } from "./claims-build.ts";
 import { type ClaimsCaseFile, asPatterns, claimedSections } from "./claims.ts";
 import { type HeadCase, type RunRecord, detects, loadRuns } from "./grade.ts";
-import { pruneScratch, runOmp } from "./run.ts";
+import { pruneScratch, runOmp, scratchTmp } from "./run.ts";
 
 export const MATCH_JUDGES = ["openai/gpt-6-astra", "anthropic/claude-opus-5"];
 export const CLUSTER_JUDGE = "openai/gpt-6-astra";
@@ -144,8 +144,9 @@ export function lastJson<T>(report: string): T | undefined {
 	return undefined;
 }
 
-function childEnv(scratch: string): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv = { ...process.env, TMPDIR: scratch, OMP_LOG_LEVEL: "error" };
+/** A judge's or verifier's environment: its own scratch as TMPDIR (`scratchTmp`), no inherited session identity. */
+export function childEnv(scratch: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...base, ...scratchTmp(scratch), OMP_LOG_LEVEL: "error" };
 	for (const k of ["PI_SESSION_FILE", "PI_SESSION_ID", "OMP_SESSION_ID", "PI_COMMIT_TRAILERS", "GIT_DIR"])
 		delete env[k];
 	return env;

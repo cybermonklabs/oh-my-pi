@@ -25,7 +25,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { CaseFile, HeadCase, RunRecord } from "./grade.ts";
-import { runOmp, userPrompt } from "./run.ts";
+import { runOmp, scratchTmp, userPrompt } from "./run.ts";
 
 export interface RoundRecord extends RunRecord {
 	sequence: string;
@@ -249,7 +249,7 @@ async function main(): Promise<void> {
 				// repository encloses it and reads the wrong history.
 				const env: NodeJS.ProcessEnv = {
 					...process.env,
-					TMPDIR: roundScratch,
+					...scratchTmp(roundScratch),
 					BUN_INSTALL_CACHE_DIR: path.join(seqScratch, "bun-cache"),
 					GIT_CEILING_DIRECTORIES: [seq.head.checkout, roundScratch].join(":"),
 				};
