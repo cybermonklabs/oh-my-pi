@@ -24,8 +24,8 @@ import { type Finding, type HeadCase, detects } from "./grade.ts";
 import { readJsonl } from "./rederive.ts";
 import { build } from "./snapshot.ts";
 
-const REPO = "/home/sami/src/oh-my-pi";
-const UPSTREAM_MAIN = "upstream/main";
+export const REPO = "/home/sami/src/oh-my-pi";
+export const UPSTREAM_MAIN = "upstream/main";
 /** Snapshots, patches and earlier-round copies live here, outside any temporary tree. */
 const ROOT = "/mnt/nvme/sami/reviewer-gap-evals";
 /** The batch's review-round directories, which `setup` copies the earlier round from. */
@@ -95,6 +95,8 @@ export interface CorpusDefect {
 	title: string;
 	severity: string;
 	how_found_primary: string;
+	/** The extractor's one-sentence statement of the defect; absent on a few early records. */
+	mechanism_summary?: string;
 	found_by: ClaimFinding["found_by"];
 	finder_sections: { arm: string; report_path: string; lines: string; text: string }[];
 	mechanism: string[][];
@@ -204,7 +206,7 @@ export function anchored(r: Groups, sources: string[]): Groups {
 	return candidates.find(fires) ?? asGiven;
 }
 
-function git(...args: string[]): string {
+export function git(...args: string[]): string {
 	const r = spawnSync("git", ["-C", REPO, ...args], { encoding: "utf8" });
 	if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
 	return r.stdout.trim();

@@ -1,0 +1,74 @@
+{
+	"frozen_at": "2026-11-01T02:10:00Z",
+	"question": "On the diffs where this batch's reviewers found real defects, which of three behaviours of the coordinator's per-round briefs carries the effect on a reviewer under omp's shipped prompt: naming the user-visible loss (loss), naming which earlier finding to re-break (rebreak), or demanding a reproduction rather than a reading (repro)? With false claims beside every recall figure.",
+	"decision": "Stage 2 runs the static form of the behaviour(s) that carry the effect, appended to the shipped prompt, against a fresh shipped arm; that is the prompt change.",
+	"facts_before_launch": {
+		"baseline_reproduced": "claims.ts on runs/claims-2026-10-31/current gives 5 / 364, as reported. 364 is (defect, run) opportunities over 123 defects at 23 heads, not 364 defects.",
+		"grader": "The frozen patterns miss paraphrase. Two judges of different families (judge-match.md) on the 140 claims of the three earlier arms: 28 agreed matches, 1 disputed, 111 none; patterns hit 14, of which the panel agreed 13; all 15 panel-only matches were read by hand and are the recorded defect. Judged, the shipped prompt finds 9 / 369 = 2.4% (Wilson 1.3-4.6%).",
+		"how_found": "corpus/how-found.jsonl: of 274 defects found in their round, the finding brief stated the defect for 60 (both labellers) to 116 (either), named its area for 162-236, named an earlier finding it re-breaks for 111-202, named its user-visible loss for 5-14, nothing for 0-2. Cohen's kappa 0.50.",
+		"coordinator_account": "The coordinator's account was that the briefs repeatedly named the user-visible loss rather than the code area. The corpus disagrees (5-14 of 274 defects; the round's own brief names a loss at 3 of 23 heads); the corpus is what is measured. The loss arm therefore uses every loss sentence the coordinator wrote for the pull request up to the round.",
+		"pilot": "1 session: 199 s, 34 requests, memory.peak 1.09 GiB, max 0. 2 sessions at concurrency 2: 394 s and 448 s, 52 requests each, memory.peak 1.60 GiB, memory.events max 0, scratch kept 0.1-0.2 MiB, load1 298-335."
+	},
+	"design_review": {
+		"by": "Claude Opus 5 subagent DesignReviewBriefLane, 2026-11-01, adversarial, against the requester's words",
+		"stopping_findings_and_answers": {
+			"A1 fix-claims point at their still-open form": "Kept: naming the earlier finding and the fix's claim is the rebreak behaviour. Those defects are classified by both judges (judge-reopen.md, cases-brief.json reopens: 46 at the 19 heads) and recall is reported on them and on the rest separately.",
+			"A2 kept attack spans enumerate defects": "Every kept span of every arm now goes through both judges (judge-leak.md); one flag removes it. Where both judges call a sentence area-level and keep it, it stays; the reviewer's remaining examples are listed in the result as judged-area.",
+			"A3 loss leak check exempted loss sentences": "Exemption removed from judge-leak.md; the same title-writable test for every sentence.",
+			"A4 only the first-started brief de-leaked": "A span stating a case in the round's other brief now removes the same text in the source brief.",
+			"B6 repro carried a re-break clause": "Cut.",
+			"C11 shipped prompt forbids running": "Every arm's user prompt says the scratch directory is writable and runnable; constant across arms.",
+			"C12 control already instructs R and P": "Removed from the brief lane's shared prompt: no shared replay instruction, no 'any output you measured'.",
+			"D13 verifier verdict crossed arms": "One representative per (group, arm), with that arm's own scratch; a verdict applies only to its arm.",
+			"other": "Shipped gets the brief heading with '(none for this round)' (B9); element order rotates by head (B10); disputed matches are verified (D14); patterns are not claimed as a defence (D15); defect-weighted estimates and pull-request-cluster intervals (E16, E17); 4 heads with 1-2 defects dropped (E18); static forms prepared for stage 2 (F20); composition per head recorded (B7, B8)."
+		}
+	},
+	"subject": {
+		"cases": "cases-c.json (claims lane revision 2)",
+		"heads": ["pr17394-r27", "pr17396-r5", "pr17396-r7", "pr17396-r9", "pr17396-r11", "pr17396-r13", "pr17402-r41", "pr17402-r43", "pr17402-r47", "pr17402-r49", "pr17402-r51", "pr17402-r53", "pr17421-r26", "pr17457-r10", "pr17457-r12", "pr17457-r14", "pr17488-r21", "gc-quarantine-r3", "ai-replay-budget-r3"],
+		"dropped_heads": {
+			"heads": ["ai-replay-budget-r2", "pr17488-r19", "pr17488-r23", "pr17488-r25"],
+			"why": "1 or 2 recorded defects each: their recall can only be 0, 0.5 or 1, they add noise and sessions; dropping them raises power (design review E18). 117 of 123 defects kept."
+		},
+		"dropped_cases": "None. The line between pressure and the answer is drawn per sentence: every removed span and loss sentence is in cases-brief.json with its reason."
+	},
+	"arms": {
+		"stage_1": ["shipped", "loss", "rebreak", "repro", "loss-rebreak", "loss-repro", "rebreak-repro", "loss-rebreak-repro", "full-brief"],
+		"stage_2_candidates": ["static-loss", "static-rebreak", "static-repro", "static-all"],
+		"model": "anthropic/claude-opus-5-5, thinking high, 20 minutes, tools read,grep,glob,bash,write,edit, one fresh session per (arm, head, trial)",
+		"trials": 2,
+		"sessions_stage_1": 342
+	},
+	"measures": {
+		"recall": "recorded defects found per diff; a defect is found when both match judges (openai/gpt-6-astra, anthropic/claude-opus-5) name it for one claimed section. Frozen patterns and either-judge reported beside.",
+		"precision": "real / (real + false) over claimed sections: real when tied to a recorded defect or its (group, arm) verified REAL; false when tied to a decoy or verified NOT-REAL; unknown counted beside.",
+		"cost": "model requests, output tokens and wall minutes per diff; load1 and runnable/blocked tasks at each session's start and end; scope memory.peak and memory.events max. No dollar figure is reported."
+	},
+	"analysis": {
+		"estimator": "per head, an arm's recall over its trials; differences per head; mean over heads weighted by the head's number of recorded defects",
+		"interval": "95% percentile bootstrap resampling pull requests (8 clusters), 10,000 draws, seed 20261101; head-level interval shown beside as the optimistic bound",
+		"primary": "the three factorial main effects on recall (loss, rebreak, repro), each with the change in false claims per diff",
+		"secondary": "differences of main effects (which carries more); full-brief minus loss-rebreak-repro (what the rest of the brief adds); recall on re-opened named findings and on the rest; recall not in the earlier round",
+		"carries_the_effect": "a behaviour carries the effect when its main effect's pull-request interval lies above 0 and its change in false claims per diff has an upper bound below +0.5. One behaviour carries more than another only when the interval of their difference excludes 0.",
+		"exclusions": "an errored run is excluded from n and listed; a head missing any of its eight cells is left out of the main effects",
+		"stage_2_rule": "run shipped plus the static form of every behaviour that carries the effect (and static-all when more than one does), 19 heads x 2 trials each; if none carries it, run shipped plus the static form of the largest point estimate and label it exploratory"
+	},
+	"budgets": {
+		"disk": "run directory cap 40 GiB; stop when /mnt/nvme has under 45 GiB free; caches pruned by name per session, every other file kept and files over 8 MiB named",
+		"memory_cpu": "systemd-run --user --scope -p MemoryMax=10G -p CPUQuota=800%, concurrency 2"
+	},
+	"hashes": {
+		"cases-c.json": "7ccd5d59694bd7fffb03cd4fbf9e841c8cecdfeb3a034d97cf8086f7445111f1",
+		"cases-brief.json": "00ac760bb0bc4ec0b355b888db1a90947c0cf8552e9c5a07c61fd0aaa6b6a9b2",
+		"prompts/current.md": "bed756ded5d543ed00da9452a6ec90af1cb53b07c616950129f605d1b4a6ad4e",
+		"prompts/brief-repro.md": "5e36b0bcfe188a0c2853e26ef029d1c4532012d6aeec621c7a7af4053194521e",
+		"prompts/judge-match.md": "e948a05fec97f16866e6a2c5ef09e08b53b43bf1d59eee716855da6aa02268df",
+		"prompts/judge-cluster.md": "3b6f785ee511d7d0a28f0ba6c58cd14f7d078e0c169844b0ddf5c8f7b09eae15",
+		"prompts/judge-verify.md": "93c1b337662b4b70c886fb1121f071587b27974bc7cbdf10fa5cc476eb61e6ba",
+		"prompts/judge-leak.md": "24ad618b373fe0912cc747bee9a362c47b56ad3736ef848cf19a48273fb915fd",
+		"prompts/judge-reopen.md": "571edc0621e9027387c3506105edace5991f976ba51a92e2c703ee8256b1ccc6",
+		"prompts/static-loss.md": "ebfa730af2a2cb42e3194fbdf292afdc74a171dd874a4f4ec496cda6ee1d9797",
+		"prompts/static-rebreak.md": "f066bad5752e3cfd47bbe538bb27b552dd50dc7951e492260e0e9d67dab4d1d2",
+		"prompts/static-repro.md": "63557b29216250b3835314ea1b2db825744fb3dbbb30e05ef7860a9cca9b0e03"
+	}
+}

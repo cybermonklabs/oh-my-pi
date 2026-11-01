@@ -45,6 +45,14 @@ export interface CaseFile {
 	findings: Finding[];
 }
 
+/** What the box was doing when a run started or ended: `/proc/loadavg` and `/proc/stat`. */
+export interface BoxLoad {
+	load1: number;
+	/** Runnable and blocked tasks, as `vmstat` reports `r` and `b`. */
+	procsRunning: number;
+	procsBlocked: number;
+}
+
 export interface RunRecord {
 	runId: string;
 	arm: string;
@@ -56,6 +64,20 @@ export interface RunRecord {
 	elapsedMs: number;
 	exitCode: number;
 	error?: string;
+	/** Model requests (assistant messages), tool calls by tool, and tokens. Absent on runs before 2026-11-01. */
+	usage?: {
+		calls: number;
+		toolCalls: Record<string, number>;
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+	};
+	box?: { start: BoxLoad; end: BoxLoad };
+	/** The brief the run's user prompt carried: which elements had text at this head, and its length. */
+	brief?: { elements: string[]; chars: number };
+	/** What the session's scratch kept after pruning, what pruning removed, and kept files over 8 MiB (`run.ts` `pruneScratch`). */
+	scratch?: { keptBytes: number; removedBytes: number; removed: string[]; large: string[] };
 }
 
 /** Lowercased text and the per-group match offsets of one pattern set. */
