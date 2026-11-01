@@ -130,6 +130,11 @@ MISE_BUN_VERSION=1.4.4 bun scripts/reviewer-gap/run.ts --cases scripts/reviewer-
 bun scripts/reviewer-gap/claims.ts --runs <dir> [--compare candidate:current]
 ```
 
+The harness's own tests are the six `*.test.ts` files at this directory's top
+level: `bun test scripts/reviewer-gap/*.test.ts`. A bare `bun test
+scripts/reviewer-gap/` also collects the reviewers' recorded probes under
+`runs/*/scratch/`, which are evidence, not tests of the harness.
+
 ## The brief lane
 
 The batch's reviewers found their defects under per-round briefs the
