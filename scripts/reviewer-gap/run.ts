@@ -91,7 +91,13 @@ const ARMS: Record<string, Arm> = {
 		model: OPUS,
 		brief: [],
 	},
-	"static-repro": { name: "static-repro", prompt: SHIPPED, extra: ["prompts/static-repro.md"], model: OPUS, brief: [] },
+	"static-repro": {
+		name: "static-repro",
+		prompt: SHIPPED,
+		extra: ["prompts/static-repro.md"],
+		model: OPUS,
+		brief: [],
+	},
 	"static-all": {
 		name: "static-all",
 		prompt: SHIPPED,
@@ -247,7 +253,12 @@ export function userPrompt(
 				]),
 		...(briefLane === null
 			? []
-			: [`Brief for this round, from the coordinator who assigned it:`, ``, briefLane.brief ?? `(none for this round)`, ``]),
+			: [
+					`Brief for this round, from the coordinator who assigned it:`,
+					``,
+					briefLane.brief ?? `(none for this round)`,
+					``,
+				]),
 		`Budget: ${minutes} minutes of wall clock. When it runs out, report what you have.`,
 		``,
 		...report,
@@ -588,7 +599,9 @@ async function main(): Promise<void> {
 			if (promptFile !== null) args.push("--append-system-prompt", promptFile);
 			const started = Date.now();
 			const boxStart = boxLoad();
-			console.log(`start ${job.runId} load1=${boxStart.load1} r=${boxStart.procsRunning} b=${boxStart.procsBlocked}`);
+			console.log(
+				`start ${job.runId} load1=${boxStart.load1} r=${boxStart.procsRunning} b=${boxStart.procsBlocked}`,
+			);
 			// A snapshot is a `git archive` extraction, so it carries no `.git`. A
 			// reviewer that runs `git log` inside one would otherwise climb to the
 			// nearest enclosing repository and read a history that is not the change

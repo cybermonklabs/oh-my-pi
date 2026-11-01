@@ -146,7 +146,8 @@ export function lastJson<T>(report: string): T | undefined {
 
 function childEnv(scratch: string): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env, TMPDIR: scratch, OMP_LOG_LEVEL: "error" };
-	for (const k of ["PI_SESSION_FILE", "PI_SESSION_ID", "OMP_SESSION_ID", "PI_COMMIT_TRAILERS", "GIT_DIR"]) delete env[k];
+	for (const k of ["PI_SESSION_FILE", "PI_SESSION_ID", "OMP_SESSION_ID", "PI_COMMIT_TRAILERS", "GIT_DIR"])
+		delete env[k];
 	return env;
 }
 
@@ -176,14 +177,13 @@ export function matchKey(judge: string, head: string, cases: string, claimSha: s
 	return sha256(["match", sha256(template("judge-match.md")), judge, head, sha256(cases), claimSha].join("\n"));
 }
 
-async function judgeMatch(
-	cases: ClaimsCaseFile,
-	claims: Claim[],
-	out: string,
-	concurrency: number,
-): Promise<void> {
+async function judgeMatch(cases: ClaimsCaseFile, claims: Claim[], out: string, concurrency: number): Promise<void> {
 	const file = path.join(out, "match.jsonl");
-	const done = new Set(readJsonlFile<MatchJudgement>(file).filter(j => j.error === undefined).map(j => j.key));
+	const done = new Set(
+		readJsonlFile<MatchJudgement>(file)
+			.filter(j => j.error === undefined)
+			.map(j => j.key),
+	);
 	const text = new Map<string, string>();
 	for (const h of new Set(claims.map(c => c.head))) text.set(h, caseText(cases, h));
 	// One judgement per (judge, head, distinct claim text): a claim two runs wrote word for word is read once.
@@ -200,7 +200,12 @@ async function judgeMatch(
 		const prompt = template("judge-match.md")
 			.replace("{{cases}}", text.get(claim.head) as string)
 			.replace("{{claim}}", claim.text.slice(0, 6000));
-		const r = await runOmp([...JUDGE_ARGS, "--model", judge, "--thinking", "medium", "--no-tools"], prompt, scratch, childEnv(scratch));
+		const r = await runOmp(
+			[...JUDGE_ARGS, "--model", judge, "--thinking", "medium", "--no-tools"],
+			prompt,
+			scratch,
+			childEnv(scratch),
+		);
 		const parsed = lastJson<{ match?: unknown; why?: unknown }>(r.report);
 		const ids = new Set([
 			...cases.findings.filter(f => f.head === claim.head).map(f => f.id),
@@ -222,7 +227,9 @@ async function judgeMatch(
 					: {}),
 		};
 		fs.appendFileSync(file, `${JSON.stringify(j)}\n`);
-		console.log(`match ${judge} ${claim.head} ${claim.sha.slice(0, 8)} -> ${j.match.join(",") || "-"}${j.error ? ` ERROR ${j.error.slice(0, 80)}` : ""}`);
+		console.log(
+			`match ${judge} ${claim.head} ${claim.sha.slice(0, 8)} -> ${j.match.join(",") || "-"}${j.error ? ` ERROR ${j.error.slice(0, 80)}` : ""}`,
+		);
 	});
 }
 
@@ -280,7 +287,11 @@ export function clusterKey(head: string, shas: string[]): string {
 
 async function judgeCluster(cases: ClaimsCaseFile, claims: Claim[], out: string): Promise<void> {
 	const file = path.join(out, "cluster.jsonl");
-	const done = new Set(readJsonlFile<ClusterJudgement>(file).filter(j => j.error === undefined).map(j => j.key));
+	const done = new Set(
+		readJsonlFile<ClusterJudgement>(file)
+			.filter(j => j.error === undefined)
+			.map(j => j.key),
+	);
 	const o = outcomes(cases, claims, out);
 	const incomplete = claims.filter(c => o.get(c)?.complete !== true).length;
 	if (incomplete > 0) throw new Error(`${incomplete} claims lack a match judgement from both judges; run match first`);
@@ -296,7 +307,9 @@ async function judgeCluster(cases: ClaimsCaseFile, claims: Claim[], out: string)
 		if (shas.length === 0) continue;
 		const key = clusterKey(head, shas);
 		if (done.has(key)) continue;
-		const list = shas.map((s, i) => `## Claim ${i + 1}\n\n${(byText.get(s) as Claim).text.slice(0, 1500)}`).join("\n\n");
+		const list = shas
+			.map((s, i) => `## Claim ${i + 1}\n\n${(byText.get(s) as Claim).text.slice(0, 1500)}`)
+			.join("\n\n");
 		const r = await runOmp(
 			[...JUDGE_ARGS, "--model", CLUSTER_JUDGE, "--thinking", "medium", "--no-tools"],
 			template("judge-cluster.md").replace("{{claims}}", list),
@@ -317,7 +330,9 @@ async function judgeCluster(cases: ClaimsCaseFile, claims: Claim[], out: string)
 			...(ok ? {} : { error: `groups do not partition 1..${shas.length}; each claim kept alone` }),
 		};
 		fs.appendFileSync(file, `${JSON.stringify(j)}\n`);
-		console.log(`cluster ${head}: ${shas.length} claims -> ${j.groups.length} groups${j.error ? ` (${j.error})` : ""}`);
+		console.log(
+			`cluster ${head}: ${shas.length} claims -> ${j.groups.length} groups${j.error ? ` (${j.error})` : ""}`,
+		);
 	}
 }
 
@@ -369,7 +384,11 @@ async function judgeVerify(
 	minutes: number,
 ): Promise<void> {
 	const file = path.join(out, "verify.jsonl");
-	const done = new Set(readJsonlFile<VerifyJudgement>(file).filter(j => j.error === undefined).map(j => j.key));
+	const done = new Set(
+		readJsonlFile<VerifyJudgement>(file)
+			.filter(j => j.error === undefined)
+			.map(j => j.key),
+	);
 	const reps = representatives(claims, out).filter(r => !done.has(verifyKey(r.head, r.rep.sha, r.rep.runId, minutes)));
 	console.log(`verify: ${reps.length} (group, arm) representatives to check`);
 	await pool(reps, concurrency, async ({ head, rep }) => {
@@ -429,7 +448,9 @@ async function judgeVerify(
 		};
 		fs.appendFileSync(file, `${JSON.stringify(j)}\n`);
 		pruneScratch(scratch);
-		console.log(`verify ${head} ${rep.sha.slice(0, 8)} -> ${j.verdict} ${j.reason} ${Math.round(j.elapsedMs / 1000)}s`);
+		console.log(
+			`verify ${head} ${rep.sha.slice(0, 8)} -> ${j.verdict} ${j.reason} ${Math.round(j.elapsedMs / 1000)}s`,
+		);
 	});
 }
 
@@ -475,7 +496,12 @@ async function sentencePanel(
 			const prompt = template(name)
 				.replace("{{sentences}}", sentences.map((s, i) => `${i + 1}. ${s}`).join("\n"))
 				.replace("{{cases}}", text);
-			const r = await runOmp([...JUDGE_ARGS, "--model", judge, "--thinking", "medium", "--no-tools"], prompt, scratch, childEnv(scratch));
+			const r = await runOmp(
+				[...JUDGE_ARGS, "--model", judge, "--thinking", "medium", "--no-tools"],
+				prompt,
+				scratch,
+				childEnv(scratch),
+			);
 			const parsed = lastJson<{ leaks?: unknown; reopens?: unknown }>(r.report);
 			const list = name === "judge-leak.md" ? parsed?.leaks : parsed?.reopens;
 			if (!Array.isArray(list)) continue;
@@ -483,9 +509,19 @@ async function sentencePanel(
 			for (const l of list) {
 				if (l === null || typeof l !== "object") continue;
 				if ("sentence" in l && "entries" in l && Number.isInteger(l.sentence) && Array.isArray(l.entries))
-					links.push({ sentence: Number(l.sentence), entries: l.entries.filter((e): e is string => typeof e === "string" && ids.has(e)) });
-				else if ("entry" in l && "sentences" in l && typeof l.entry === "string" && Array.isArray(l.sentences) && ids.has(l.entry))
-					for (const s of l.sentences) if (Number.isInteger(s)) links.push({ sentence: Number(s), entries: [l.entry] });
+					links.push({
+						sentence: Number(l.sentence),
+						entries: l.entries.filter((e): e is string => typeof e === "string" && ids.has(e)),
+					});
+				else if (
+					"entry" in l &&
+					"sentences" in l &&
+					typeof l.entry === "string" &&
+					Array.isArray(l.sentences) &&
+					ids.has(l.entry)
+				)
+					for (const s of l.sentences)
+						if (Number.isInteger(s)) links.push({ sentence: Number(s), entries: [l.entry] });
 			}
 			j = { key, judge, head, template: name, sentences, links };
 			fs.appendFileSync(file, `${JSON.stringify(j)}\n`);

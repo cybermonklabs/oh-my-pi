@@ -274,7 +274,12 @@ export function summarise(scores: RunScore[], decoysAt: Map<string, number>): Ar
 		const heads = [...new Set(mine.map(s => s.head))].sort();
 		const t = totals(mine, decoysAt);
 		const byHead = (sample: string[], f: (t: Totals) => number): number =>
-			f(totals(sample.flatMap(h => mine.filter(s => s.head === h)), decoysAt));
+			f(
+				totals(
+					sample.flatMap(h => mine.filter(s => s.head === h)),
+					decoysAt,
+				),
+			);
 		const per = (n: number): number => n / Math.max(1, mine.length);
 		const calls = mine.map(s => s.calls).filter((x): x is number => x !== null);
 		const out = mine.map(s => s.outputTokens).filter((x): x is number => x !== null);
@@ -308,8 +313,10 @@ export function summarise(scores: RunScore[], decoysAt: Map<string, number>): Ar
 				boot: bootHeads(heads, s => byHead(s, x => x.real / Math.max(1, x.real + x.false)), laneOf),
 			},
 			decoys: { asserted: t.decoys, opps: t.decoyOpps },
-			callsPerDiff: calls.length === mine.length && calls.length > 0 ? calls.reduce((a, b) => a + b, 0) / calls.length : null,
-			outputTokensPerDiff: out.length === mine.length && out.length > 0 ? out.reduce((a, b) => a + b, 0) / out.length : null,
+			callsPerDiff:
+				calls.length === mine.length && calls.length > 0 ? calls.reduce((a, b) => a + b, 0) / calls.length : null,
+			outputTokensPerDiff:
+				out.length === mine.length && out.length > 0 ? out.reduce((a, b) => a + b, 0) / out.length : null,
 			wallMinutes: {
 				median: median(mine.map(s => s.elapsedMs / 60000)),
 				mean: mine.reduce((a, s) => a + s.elapsedMs, 0) / Math.max(1, mine.length) / 60000,
@@ -352,9 +359,18 @@ function headRates(scores: RunScore[], arm: string, head: string): Rates | null 
 	const sum = (f: (x: RunScore) => number): number => s.reduce((a, x) => a + f(x), 0);
 	const ratio = (hits: number, n: number): number => (n === 0 ? Number.NaN : hits / n);
 	return {
-		recall: ratio(sum(x => x.found.panel.length), sum(x => x.nFindings)),
-		recallNew: ratio(sum(x => x.foundNew.length), sum(x => x.nNew)),
-		recallReopen: ratio(sum(x => x.foundReopen.length), sum(x => x.nReopen)),
+		recall: ratio(
+			sum(x => x.found.panel.length),
+			sum(x => x.nFindings),
+		),
+		recallNew: ratio(
+			sum(x => x.foundNew.length),
+			sum(x => x.nNew),
+		),
+		recallReopen: ratio(
+			sum(x => x.foundReopen.length),
+			sum(x => x.nReopen),
+		),
 		recallOther: ratio(
 			sum(x => x.found.panel.length - x.foundReopen.length),
 			sum(x => x.nFindings - x.nReopen),
@@ -510,16 +526,25 @@ const pct = (x: number): string => (Number.isFinite(x) ? `${(100 * x).toFixed(1)
 const pp = (x: number): string => (Number.isFinite(x) ? `${x >= 0 ? "+" : ""}${(100 * x).toFixed(1)} pp` : "n/a");
 const num = (x: number | null, d = 2): string => (x === null || !Number.isFinite(x) ? "n/a" : x.toFixed(d));
 
-export function markdown(arms: ArmSummary[], vs: Contrast[], effects: Contrast[], differences: Contrast[] = []): string {
+export function markdown(
+	arms: ArmSummary[],
+	vs: Contrast[],
+	effects: Contrast[],
+	differences: Contrast[] = [],
+): string {
 	const lines: string[] = [];
-	lines.push("| arm | runs | recorded defects found per diff | recall (pooled) | 95% Wilson | 95% over pull requests | recall, not in earlier round | frozen patterns | either judge or pattern |");
+	lines.push(
+		"| arm | runs | recorded defects found per diff | recall (pooled) | 95% Wilson | 95% over pull requests | recall, not in earlier round | frozen patterns | either judge or pattern |",
+	);
 	lines.push("|---|---|---|---|---|---|---|---|---|");
 	for (const a of arms)
 		lines.push(
 			`| ${a.arm} | ${a.runs} | ${num(a.foundPerDiff)} | ${a.recall.hits} / ${a.recall.opps} = ${pct(a.recall.rate)} | ${pct(a.recall.wilson[0])}–${pct(a.recall.wilson[1])} | ${pct(a.recall.boot[0])}–${pct(a.recall.boot[1])} | ${a.recallNew.hits} / ${a.recallNew.opps} = ${pct(a.recallNew.rate)} | ${a.recallPatterns.hits} = ${pct(a.recallPatterns.rate)} | ${a.recallEither.hits} = ${pct(a.recallEither.rate)} |`,
 		);
 	lines.push("");
-	lines.push("| arm | claims per diff | real per diff | false per diff | unknown per diff | precision (real / real+false) | 95% over pull requests | decoys asserted | model requests per diff | output tokens per diff | wall minutes median / mean | load1 median / max | runnable median / max |");
+	lines.push(
+		"| arm | claims per diff | real per diff | false per diff | unknown per diff | precision (real / real+false) | 95% over pull requests | decoys asserted | model requests per diff | output tokens per diff | wall minutes median / mean | load1 median / max | runnable median / max |",
+	);
 	lines.push("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
 	for (const a of arms)
 		lines.push(
@@ -574,8 +599,11 @@ function main(): void {
 	const reopens = new Set<string>(
 		fs.existsSync(briefsPath)
 			? Object.values(
-					(JSON.parse(fs.readFileSync(briefsPath, "utf8")) as { heads: Record<string, { reopens?: Record<string, string[]> }> })
-						.heads,
+					(
+						JSON.parse(fs.readFileSync(briefsPath, "utf8")) as {
+							heads: Record<string, { reopens?: Record<string, string[]> }>;
+						}
+					).heads,
 				).flatMap(h => Object.keys(h.reopens ?? {}))
 			: [],
 	);

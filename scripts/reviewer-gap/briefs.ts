@@ -119,7 +119,9 @@ function main(): void {
 	};
 	const session = get("--session");
 	if (session === undefined || (mode !== "list" && mode !== "extract")) {
-		console.error("usage: briefs.ts list --session <dir> [--match <regex>] | extract --session <dir> [--store <dir>]");
+		console.error(
+			"usage: briefs.ts list --session <dir> [--match <regex>] | extract --session <dir> [--store <dir>]",
+		);
 		process.exit(2);
 	}
 	if (mode === "list") {

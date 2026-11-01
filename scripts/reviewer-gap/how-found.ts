@@ -17,16 +17,19 @@
  *             against every brief, every enum holds, adaptations only delete.
  *   merge   - per defect, both labellers' pointers per finding arm, their
  *             agreement, and the merged label; written to `corpus/how-found.jsonl`.
+ *   index   - every defect and decoy with its diff, title and how it was
+ *             found; written to `corpus/cases-index.jsonl`.
  *
  * Usage:
  *   bun scripts/reviewer-gap/how-found.ts inputs --out <dir>
  *   bun scripts/reviewer-gap/how-found.ts check --labels <dir>
  *   bun scripts/reviewer-gap/how-found.ts merge --labels <dirA>,<dirB>
+ *   bun scripts/reviewer-gap/how-found.ts index
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { BRIEF_STORE, type BriefIndex } from "./briefs.ts";
-import { type CorpusRound, headId, loadClaimsCorpus } from "./claims-build.ts";
+import { type CorpusRound, UPSTREAM_MAIN, git, headId, loadClaimsCorpus } from "./claims-build.ts";
 import { readJsonl } from "./rederive.ts";
 
 export const ELEMENTS = ["loss", "rebreak", "reproduction", "attack", "change", "logistics"] as const;
@@ -134,6 +137,8 @@ const words = (s: string): string[] => s.toLowerCase().match(/[a-z0-9]+/g) ?? []
 
 /** Words `adapted` may hold that `text` does not: the one substitution the rule allows. */
 const ALLOWED_NEW: Record<string, true> = { the: true, earlier: true, round: true, s: true };
+/** Share of a brief's letters and digits its spans may leave uncovered: headings and stray punctuation, never a sentence. */
+const MAX_UNCOVERED = 0.02;
 
 /** Every way a label file breaks the labelling rule; empty when it holds. */
 export function checkLabels(bundle: Bundle, labels: LabelFile): string[] {
@@ -157,6 +162,23 @@ export function checkLabels(bundle: Bundle, labels: LabelFile): string[] {
 			const added = words(s.adapted).filter(w => !have.has(w) && !ALLOWED_NEW[w]);
 			if (added.length > 0) out.push(`${b.agent}/${s.id}: adapted adds ${[...new Set(added)].join(", ")}`);
 		}
+		// Every sentence belongs to a span: count the brief's letters and digits no span covers.
+		const covered = new Uint8Array(src.text.length);
+		for (const s of b.spans) {
+			const at = src.text.indexOf(s.text);
+			if (at >= 0) covered.fill(1, at, at + s.text.length);
+		}
+		let wordChars = 0;
+		let missed = 0;
+		for (let i = 0; i < src.text.length; i++) {
+			if (!/[A-Za-z0-9]/.test(src.text[i] as string)) continue;
+			wordChars++;
+			if (covered[i] === 0) missed++;
+		}
+		if (wordChars > 0 && missed / wordChars > MAX_UNCOVERED)
+			out.push(
+				`${b.agent}: spans leave ${((100 * missed) / wordChars).toFixed(1)}% of the brief's letters and digits uncovered`,
+			);
 	}
 	for (const agent of briefs.keys())
 		if (!labels.briefs.some(b => b.agent === agent)) out.push(`brief ${agent} not segmented`);
@@ -287,16 +309,81 @@ export function summary(rows: HowFound[]): string {
 	];
 	for (const p of pointers) {
 		const mine = found.filter(r => r.pointer === p);
-		lines.push(`| ${p} | ${methods.map(m => mine.filter(r => r.method === m).length).join(" | ")} | ${mine.length} |`);
+		lines.push(
+			`| ${p} | ${methods.map(m => mine.filter(r => r.method === m).length).join(" | ")} | ${mine.length} |`,
+		);
 	}
 	lines.push(`| all | ${methods.map(m => found.filter(r => r.method === m).length).join(" | ")} | ${found.length} |`);
 	lines.push("", "| pointer (merged) | found by astra only | by claude only | by both |", "|---|---|---|---|");
 	for (const p of pointers) {
 		const mine = found.filter(r => r.pointer === p);
 		const only = (arm: string): number => mine.filter(r => r.finders.length === 1 && r.finders[0] === arm).length;
-		lines.push(`| ${p} | ${only("astra")} | ${only("claude")} | ${mine.filter(r => r.finders.length === 2).length} |`);
+		lines.push(
+			`| ${p} | ${only("astra")} | ${only("claude")} | ${mine.filter(r => r.finders.length === 2).length} |`,
+		);
 	}
 	return `${lines.join("\n")}\n`;
+}
+
+/** One line of `corpus/cases-index.jsonl`: every case with the diff it sits on, what it is, and how it was found. */
+export interface CaseIndex {
+	id: string;
+	kind: "defect" | "decoy";
+	head: string;
+	head_sha: string;
+	base_sha: string;
+	/** The diff under review: `git diff <base_sha>..<head_sha>` in this repository. */
+	diff: string;
+	title: string;
+	how_found:
+		| { method: string; pointer: string; pointer_by_labeller: Record<string, string>; finders: string[] }
+		| { decoy_class: string; refuted_by: string };
+}
+
+/**
+ * The corpus as the requester reads it: each recorded defect and decoy with
+ * its diff (the round's recorded base, else the head's merge base with
+ * upstream main), its title, and how it was found (method and pointer for a
+ * defect from `corpus/how-found.jsonl`; for a decoy, its class and what
+ * refuted it).
+ */
+export function casesIndex(): CaseIndex[] {
+	const corpus = loadClaimsCorpus(path.join(DIR, "corpus", "claims"));
+	const found = new Map(readJsonl<HowFound>(path.join(DIR, "corpus", "how-found.jsonl")).map(r => [r.id, r]));
+	const base = new Map<string, string>();
+	for (const r of corpus.rounds) base.set(headId(r), r.base_sha ?? git("merge-base", r.head_sha, UPSTREAM_MAIN));
+	const diff = (head: string, sha: string): { base_sha: string; diff: string } => {
+		const b = base.get(head) ?? "";
+		return { base_sha: b, diff: `git diff ${b.slice(0, 12)}..${sha.slice(0, 12)}` };
+	};
+	return [
+		...corpus.defects.map((d): CaseIndex => {
+			const h = found.get(d.id);
+			return {
+				id: d.id,
+				kind: "defect",
+				head: headId(d),
+				head_sha: d.head_sha,
+				...diff(headId(d), d.head_sha),
+				title: d.title,
+				how_found: {
+					method: d.how_found_primary,
+					pointer: h?.pointer ?? "unlabelled",
+					pointer_by_labeller: h?.labels ?? {},
+					finders: h?.finders ?? [],
+				},
+			};
+		}),
+		...corpus.decoys.map((d): CaseIndex => ({
+			id: d.id,
+			kind: "decoy",
+			head: headId(d),
+			head_sha: d.head_sha,
+			...diff(headId(d), d.head_sha),
+			title: d.claim_title,
+			how_found: { decoy_class: d.decoy_class, refuted_by: d.refuted_by.kind },
+		})),
+	];
 }
 
 function main(): void {
@@ -337,14 +424,20 @@ function main(): void {
 		const dirs = (get("--labels") ?? "").split(",");
 		if (dirs.length !== 2) throw new Error("--labels <dirA>,<dirB>");
 		const rows = merge(bundles(), loadLabels(dirs[0] as string), loadLabels(dirs[1] as string));
-		fs.writeFileSync(
-			path.join(DIR, "corpus", "how-found.jsonl"),
-			`${rows.map(r => JSON.stringify(r)).join("\n")}\n`,
-		);
+		fs.writeFileSync(path.join(DIR, "corpus", "how-found.jsonl"), `${rows.map(r => JSON.stringify(r)).join("\n")}\n`);
 		console.log(summary(rows));
 		return;
 	}
-	console.error("usage: how-found.ts inputs --out <dir> | check --labels <dir> | merge --labels <a>,<b>");
+	if (mode === "index") {
+		const rows = casesIndex();
+		fs.writeFileSync(
+			path.join(DIR, "corpus", "cases-index.jsonl"),
+			`${rows.map(r => JSON.stringify(r)).join("\n")}\n`,
+		);
+		console.log(`${rows.length} cases -> corpus/cases-index.jsonl`);
+		return;
+	}
+	console.error("usage: how-found.ts inputs --out <dir> | check --labels <dir> | merge --labels <a>,<b> | index");
 	process.exit(2);
 }
 

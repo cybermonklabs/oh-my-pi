@@ -234,12 +234,15 @@ export async function buildBriefs(
 				Math.min(r.end, o.end) - Math.max(r.start, o.start) > 0;
 			const by = [
 				...(statesBase.get(r.span.id) ?? []).map(i => `${i}@${baseName}`),
-				...otherStating.filter(overlaps).flatMap(o => (statesOther.get(o.span.id) ?? []).map(i => `${i}@${otherName}`)),
+				...otherStating
+					.filter(overlaps)
+					.flatMap(o => (statesOther.get(o.span.id) ?? []).map(i => `${i}@${otherName}`)),
 				...otherBriefStating.filter(overlaps).flatMap(o => o.ids),
 			];
 			if (r.span.element === "logistics" || r.span.adapted.trim() === "")
 				Object.assign(d, { kept: false, removed_because: "logistics" });
-			else if (by.length > 0) Object.assign(d, { kept: false, removed_because: `states:${[...new Set(by)].join(",")}` });
+			else if (by.length > 0)
+				Object.assign(d, { kept: false, removed_because: `states:${[...new Set(by)].join(",")}` });
 			return d;
 		});
 
@@ -275,7 +278,10 @@ export async function buildBriefs(
 			for (const l of [lb, lo]) {
 				const stating = statingSpans(l, c.agent, caseIds);
 				const spans = l.briefs.find(b => b.agent === c.agent)?.spans ?? [];
-				for (const r of ranges(btext, spans.filter(s => stating.has(s.id))))
+				for (const r of ranges(
+					btext,
+					spans.filter(s => stating.has(s.id)),
+				))
 					if (r.start >= 0 && Math.min(start + raw.length, r.end) - Math.max(start, r.start) > 0)
 						by.push(...(stating.get(r.span.id) ?? []).map(i => `${i}@${l.labeler}`));
 			}
@@ -285,7 +291,9 @@ export async function buildBriefs(
 		for (const c of candidates)
 			if (
 				c.kept &&
-				candidates.some(o => o !== c && o.kept && o.text.length > c.text.length && plain(o.text).includes(plain(c.text)))
+				candidates.some(
+					o => o !== c && o.kept && o.text.length > c.text.length && plain(o.text).includes(plain(c.text)),
+				)
 			)
 				Object.assign(c, { kept: false, removed_because: "contained in a longer loss sentence" });
 
@@ -372,7 +380,12 @@ export async function buildBriefs(
 			composition: {
 				loss_this_round: keptLoss.filter(c => c.from === h.id).length,
 				loss_earlier_rounds: keptLoss.filter(c => c.from !== h.id).length,
-				chars: { loss: lossText().length, rebreak: join(isRebreak).length, full: join(() => true).length, repro: repro.length },
+				chars: {
+					loss: lossText().length,
+					rebreak: join(isRebreak).length,
+					full: join(() => true).length,
+					repro: repro.length,
+				},
 			},
 		};
 	}

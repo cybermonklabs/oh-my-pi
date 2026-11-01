@@ -82,6 +82,8 @@ export interface CorpusRound {
 	lane?: string;
 	round: number;
 	head_sha: string;
+	/** The base the round's diff was cut from, where the extractor recorded it; otherwise the merge base with upstream main. */
+	base_sha?: string;
 	arms: Arm[];
 }
 

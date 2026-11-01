@@ -129,3 +129,91 @@ bun scripts/reviewer-gap/claims-build.ts setup
 MISE_BUN_VERSION=1.4.4 bun scripts/reviewer-gap/run.ts --cases scripts/reviewer-gap/cases-c.json --out <dir> --arms current --trials 3 --concurrency 2 --max-time 20m --no-repo-gate
 bun scripts/reviewer-gap/claims.ts --runs <dir> [--compare candidate:current]
 ```
+
+## The brief lane
+
+The batch's reviewers found their defects under per-round briefs the
+coordinator wrote; the shipped prompt finds few of them. This lane asks which
+behaviour of those briefs carries the difference: naming the user-visible
+loss, naming which earlier finding to re-break, or demanding a reproduction.
+`brief-arms-freeze.json` is the pre-registration: question, heads, arms,
+estimator, decision rule and hashes, committed before the first session.
+
+- `briefs.ts` — reads each review round's brief from the coordinator's
+  transcripts: the `§ Context` section the subagent got and its assignment.
+  The verbatim text stays outside the repository (it carries paths and links);
+  `corpus/briefs.jsonl` pins each by sha256.
+- `how-found.ts` and `how-found-labelling.md` — the pointer axis of "how it
+  was found". Two labellers of different model families split every brief into
+  spans (loss, rebreak, reproduction, attack, change, logistics) and say, per
+  defect and decoy, whether the brief stated it, named its area, the earlier
+  finding it re-breaks, or its user-visible loss. `check` enforces the rule
+  (spans verbatim, every case labelled, adaptations only delete); `merge`
+  writes `corpus/how-found.jsonl`; `index` writes `corpus/cases-index.jsonl`,
+  every case with its diff, title and how it was found (method and pointer).
+  The label files live beside the brief store; `corpus/how-found-labels.json`
+  pins them.
+- `brief-build.ts` → `cases-brief.json` — what each arm shows at each head,
+  cut from the real briefs. A sentence is removed when either labeller says it
+  (or the same text in the round's other brief) states a recorded case, when
+  either match judge says someone holding it and the diff could write a case's
+  title (`prompts/judge-leak.md`), or when a frozen pattern fires on it. Every
+  removal is kept with its reason; no case is dropped. `reopens` lists the
+  cases that are the still-open form of an earlier finding the kept re-break
+  text names (`prompts/judge-reopen.md`), scored apart.
+- `run.ts` — the arms: `shipped` and every subset of {`loss`, `rebreak`,
+  `repro`} (a 2x2x2 factorial), `full-brief`, and the static forms for the
+  prompt change (`static-loss`, `static-rebreak`, `static-repro`,
+  `static-all`: `prompts/static-*.md` appended to the shipped prompt). On this
+  lane every arm gets the same user prompt but for the brief; the shared
+  prompt states the scratch directory is writable and drops the replay and
+  measured-output instructions the arms test. Each record carries model
+  requests, tokens, the box's load at start and end, and what its scratch kept.
+- `judge.ts` — `match` (two judges must both name a recorded case for a claim
+  to count), `cluster` (claims tied to no case, grouped by defect per head),
+  `verify` (an agent with the snapshot and that arm's own probes decides REAL
+  or NOT-REAL per group and arm). Every judgement is cached by the hash of
+  what it read.
+- `brief-lane.ts` — recall and precision per arm, requests, tokens and wall
+  time per diff; each arm against `shipped`; the three main effects and their
+  differences, defect-weighted, with 95% intervals that resample pull requests
+  (head-level beside).
+
+```bash
+# once per corpus change
+bun scripts/reviewer-gap/briefs.ts extract --session <coordinator session dir>
+bun scripts/reviewer-gap/how-found.ts inputs --out <inputs>
+#   two labellers of different families follow how-found-labelling.md into <labels>/<name>/
+bun scripts/reviewer-gap/how-found.ts check --labels <labels>/<name>
+bun scripts/reviewer-gap/how-found.ts merge --labels <labels>/gpt,<labels>/claude
+bun scripts/reviewer-gap/how-found.ts index
+bun scripts/reviewer-gap/brief-build.ts --labels <labels>/gpt,<labels>/claude --judgements <judgements>
+# stage 1, then stage 2 with the arms brief-arms-freeze.json's rule picks
+systemd-run --user --scope -p MemoryMax=10G -p CPUQuota=800% -- \
+  bun scripts/reviewer-gap/run.ts --cases scripts/reviewer-gap/cases-c.json --briefs scripts/reviewer-gap/cases-brief.json \
+  --out <runs> --arms shipped,loss,rebreak,repro,loss-rebreak,loss-repro,rebreak-repro,loss-rebreak-repro,full-brief \
+  --trials 2 --heads <frozen heads> --concurrency 2 --max-time 20m --no-repo-gate --min-free-gib 45
+bun scripts/reviewer-gap/judge.ts match   --runs <runs> --out <judgements>
+bun scripts/reviewer-gap/judge.ts cluster --runs <runs> --out <judgements>
+bun scripts/reviewer-gap/judge.ts verify  --runs <runs> --out <judgements>
+bun scripts/reviewer-gap/brief-lane.ts --runs <runs> --judgements <judgements> --heads <frozen heads> --md <report.md>
+```
+
+### Adding a case
+
+A case is a real defect, or a claim shown not to be one, at the head of a
+review round whose brief survives.
+
+1. Add the round, defect and decoy records to `corpus/claims/<pr>.jsonl` in
+   the shape the existing records have: the round names its head, base and
+   arms (each arm's agent id is its transcript's name); a defect quotes the
+   finding reviewer's section, with mechanism and trigger patterns that fire on
+   it and on nothing else at the head. `bun test scripts/reviewer-gap/claims.test.ts`
+   checks both.
+2. `briefs.ts extract` for the new round's agents, then label the round with
+   two labellers (`how-found-labelling.md`), `check`, `merge` and `index`.
+3. `claims-build.ts cases` re-selects heads by its written rule and
+   `claims-build.ts setup` builds the head's snapshot, patch and earlier-round
+   copy; `brief-build.ts` cuts the new head's brief texts.
+4. A new head joins a measurement only through a new freeze: add it to a
+   freeze file's `heads` before any session runs on it, never after results.
