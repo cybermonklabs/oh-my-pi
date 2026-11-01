@@ -70,7 +70,7 @@ func (v *TextContent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "text")
 	d.required("text", &out.Text)
 	d.optional("textSignature", &out.TextSignature)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -106,7 +106,7 @@ func (v *ThinkingContent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("thinkingSignature", &out.ThinkingSignature)
 	d.optional("itemId", &out.ItemID)
 	d.optional("narration", &out.Narration)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -135,7 +135,7 @@ func (v *RedactedThinkingContent) decodeFrom(raw map[string]json.RawMessage) err
 	d := fieldDecoder{raw: raw, owner: "RedactedThinkingContent", open: true}
 	d.constant("type", "redactedThinking")
 	d.required("data", &out.Data)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -174,7 +174,7 @@ func (v *ImageContent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("detail", &out.Detail)
 	d.optional("url", &out.URL)
 	d.optional("providerFile", &out.ProviderFile)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -239,7 +239,7 @@ func (v *ToolCall) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("rawBlock", &out.RawBlock)
 	d.optional("customWireName", &out.CustomWireName)
 	d.optional("providerMetadata", &out.ProviderMetadata)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -271,7 +271,7 @@ func (v *FallbackContent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "fallback")
 	d.required("from", &out.From)
 	d.required("to", &out.To)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -300,7 +300,7 @@ func (v *AnthropicServerToolContent) decodeFrom(raw map[string]json.RawMessage) 
 	d := fieldDecoder{raw: raw, owner: "AnthropicServerToolContent", open: true}
 	d.constant("type", "anthropicServerTool")
 	d.required("block", &out.Block)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -470,7 +470,7 @@ func (v *UsageCost) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("cacheRead", &out.CacheRead)
 	d.required("cacheWrite", &out.CacheWrite)
 	d.required("total", &out.Total)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -522,7 +522,7 @@ func (v *Usage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("cttl", &out.Cttl)
 	d.optional("server", &out.Server)
 	d.optional("credits", &out.Credits)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -565,7 +565,7 @@ func (v *UserMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("historyRewriteAt", &out.HistoryRewriteAt)
 	d.optional("attribution", &out.Attribution)
 	d.optional("providerPayload", &out.ProviderPayload)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -604,7 +604,7 @@ func (v *DeveloperMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("synthetic", &out.Synthetic)
 	d.optional("userInitiated", &out.UserInitiated)
 	d.optional("providerPayload", &out.ProviderPayload)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -665,7 +665,7 @@ func (v *AssistantMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("duration", &out.Duration)
 	d.optional("ttft", &out.Ttft)
 	d.optional("completedAt", &out.CompletedAt)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -710,7 +710,7 @@ func (v *ToolResultMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("attribution", &out.Attribution)
 	d.optional("prunedAt", &out.PrunedAt)
 	d.optional("useless", &out.Useless)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -755,7 +755,7 @@ func (v *BashExecutionMessage) decodeFrom(raw map[string]json.RawMessage) error 
 	d.optional("images", &out.Images)
 	d.optional("meta", &out.Meta)
 	d.optional("excludeFromContext", &out.ExcludeFromContext)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -798,7 +798,7 @@ func (v *PythonExecutionMessage) decodeFrom(raw map[string]json.RawMessage) erro
 	d.optional("exitCode", &out.ExitCode)
 	d.optional("meta", &out.Meta)
 	d.optional("excludeFromContext", &out.ExcludeFromContext)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -837,7 +837,7 @@ func (v *CustomMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("timestamp", &out.Timestamp)
 	d.optional("details", &out.Details)
 	d.optional("attribution", &out.Attribution)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -876,7 +876,7 @@ func (v *HookMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("timestamp", &out.Timestamp)
 	d.optional("details", &out.Details)
 	d.optional("attribution", &out.Attribution)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -909,7 +909,7 @@ func (v *BranchSummaryMessage) decodeFrom(raw map[string]json.RawMessage) error 
 	d.required("summary", &out.Summary)
 	d.required("fromId", &out.FromID)
 	d.required("timestamp", &out.Timestamp)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -950,7 +950,7 @@ func (v *CompactionSummaryMessage) decodeFrom(raw map[string]json.RawMessage) er
 	d.optional("tokensAfter", &out.TokensAfter)
 	d.optional("method", &out.Method)
 	d.optional("providerPayload", &out.ProviderPayload)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -988,7 +988,7 @@ func (v *FileMentionItem) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("byteSize", &out.ByteSize)
 	d.optional("skippedReason", &out.SkippedReason)
 	d.optional("image", &out.Image)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1039,7 +1039,7 @@ func (v *FileMentionMessage) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("role", "fileMention")
 	d.required("files", &out.Files)
 	d.required("timestamp", &out.Timestamp)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1138,7 +1138,7 @@ func (v *AssistantStartEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d := fieldDecoder{raw: raw, owner: "AssistantStartEvent", open: true}
 	d.constant("type", "start")
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1169,7 +1169,7 @@ func (v *AssistantTextStartEvent) decodeFrom(raw map[string]json.RawMessage) err
 	d.constant("type", "text_start")
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1202,7 +1202,7 @@ func (v *AssistantTextDeltaEvent) decodeFrom(raw map[string]json.RawMessage) err
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("delta", &out.Delta)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1235,7 +1235,7 @@ func (v *AssistantTextEndEvent) decodeFrom(raw map[string]json.RawMessage) error
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("content", &out.Content)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1266,7 +1266,7 @@ func (v *AssistantThinkingStartEvent) decodeFrom(raw map[string]json.RawMessage)
 	d.constant("type", "thinking_start")
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1299,7 +1299,7 @@ func (v *AssistantThinkingDeltaEvent) decodeFrom(raw map[string]json.RawMessage)
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("delta", &out.Delta)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1332,7 +1332,7 @@ func (v *AssistantThinkingEndEvent) decodeFrom(raw map[string]json.RawMessage) e
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("content", &out.Content)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1365,7 +1365,7 @@ func (v *AssistantImageEndEvent) decodeFrom(raw map[string]json.RawMessage) erro
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("content", &out.Content)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1396,7 +1396,7 @@ func (v *AssistantToolCallStartEvent) decodeFrom(raw map[string]json.RawMessage)
 	d.constant("type", "toolcall_start")
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1429,7 +1429,7 @@ func (v *AssistantToolCallDeltaEvent) decodeFrom(raw map[string]json.RawMessage)
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("delta", &out.Delta)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1462,7 +1462,7 @@ func (v *AssistantToolCallEndEvent) decodeFrom(raw map[string]json.RawMessage) e
 	d.required("contentIndex", &out.ContentIndex)
 	d.required("toolCall", &out.ToolCall)
 	d.required("partial", &out.Partial)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1493,7 +1493,7 @@ func (v *AssistantDoneEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "done")
 	d.required("reason", &out.Reason)
 	d.required("message", &out.Message)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -1545,7 +1545,7 @@ func (v *AssistantErrorEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "error")
 	d.required("reason", &out.Reason)
 	d.required("error", &out.Error)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}
@@ -5520,7 +5520,7 @@ func (v *SelectOptionDetail) decodeFrom(raw map[string]json.RawMessage) error {
 	var out SelectOptionDetail
 	d := fieldDecoder{raw: raw, owner: "SelectOptionDetail", open: true}
 	d.optional("description", &out.Description)
-	out.Extra = d.rest()
+	out.Extra = d.remaining()
 	if d.err != nil {
 		return d.err
 	}

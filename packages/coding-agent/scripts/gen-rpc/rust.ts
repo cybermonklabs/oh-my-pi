@@ -667,7 +667,7 @@ class RustEmitter {
 			"}",
 			"",
 			"/// Removes `key` and decodes it; a value that does not fit is put back.",
-			"fn take<T: DeserializeOwned>(map: &mut Map<String, Value>, key: &str) -> Option<T> {",
+			"fn take_field<T: DeserializeOwned>(map: &mut Map<String, Value>, key: &str) -> Option<T> {",
 			"\tlet value = map.remove(key)?;",
 			"\tmatch T::deserialize(&value) {",
 			"\t\tOk(decoded) => Some(decoded),",

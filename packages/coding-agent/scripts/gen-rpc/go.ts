@@ -603,7 +603,7 @@ class GoEmitter {
 				`\tvar out ${def.name}\n` +
 				`\td := fieldDecoder{raw: raw, owner: ${goString(def.name)}${def.open ? ", open: true" : ""}}\n` +
 				decode.join("") +
-				(def.open ? "\tout.Extra = d.rest()\n" : "") +
+				(def.open ? "\tout.Extra = d.remaining()\n" : "") +
 				`\tif d.err != nil {\n\t\treturn d.err\n\t}\n\t*v = out\n\treturn nil\n}\n`,
 		);
 		if (constants.length > 0 || def.open) {

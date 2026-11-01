@@ -21,7 +21,7 @@ pub trait Command: Serialize {
 }
 
 /// Removes `key` and decodes it; a value that does not fit is put back.
-fn take<T: DeserializeOwned>(map: &mut Map<String, Value>, key: &str) -> Option<T> {
+fn take_field<T: DeserializeOwned>(map: &mut Map<String, Value>, key: &str) -> Option<T> {
 	let value = map.remove(key)?;
 	match T::deserialize(&value) {
 		Ok(decoded) => Some(decoded),
