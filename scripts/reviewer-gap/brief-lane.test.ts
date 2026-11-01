@@ -1,12 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type RunScore, mainEffects } from "./brief-lane.ts";
-import type { HeadCase } from "./grade.ts";
+import type { HeadCase, RunRecord } from "./grade.ts";
 import { type Bundle, type LabelFile, checkLabels } from "./how-found.ts";
 import { type Claim, representatives } from "./judge.ts";
-import { type BriefFile, armBrief, pruneScratch, userPrompt } from "./run.ts";
+import { type BriefFile, armBrief, diskStop, pruneScratch, treeBytes, userPrompt } from "./run.ts";
 
 const head: HeadCase = {
 	id: "h1",
@@ -75,6 +75,141 @@ describe("pruneScratch", () => {
 			expect(fs.existsSync(path.join(dir, "probe", "probe.test.ts"))).toBe(true);
 			expect(r.large).toEqual(["strace.out (9.0 MiB)"]);
 			expect(r.removedBytes).toBe(1001);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("treeBytes", () => {
+	test("does not abort the measurement when a scratch entry disappears during disk accounting", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tree-bytes-"));
+		const kept = path.join(dir, "kept");
+		const vanished = path.join(dir, "vanished");
+		fs.writeFileSync(kept, "keep");
+		fs.writeFileSync(vanished, "gone");
+		const originalLstat = fs.lstatSync;
+		const lstat = spyOn(fs, "lstatSync").mockImplementation((entry, options) => {
+			if (entry === vanished) fs.rmSync(vanished);
+			return originalLstat(entry, options);
+		});
+		try {
+			expect(treeBytes(dir)).toBe(4);
+		} finally {
+			lstat.mockRestore();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("diskStop", () => {
+	test("a guard that cannot measure lets the run go on and says so in the log", () => {
+		const missing = path.join(os.tmpdir(), `disk-stop-${process.pid}-${Date.now()}`, "run");
+		const logged = spyOn(console, "error").mockImplementation(() => {});
+		try {
+			expect(diskStop(missing, 40, 45)).toBeNull();
+			expect(logged).toHaveBeenCalledTimes(1);
+			const line = String(logged.mock.calls[0]?.[0]);
+			expect(line).toContain("could not measure");
+			expect(line).toContain("ENOENT");
+		} finally {
+			logged.mockRestore();
+		}
+	});
+});
+
+describe("run resume", () => {
+	test("preserves a completed paid session and redoes an incomplete session instead of corrupting the estimate", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "run-resume-"));
+		try {
+			const out = path.join(dir, "out");
+			const checkout = path.join(dir, "checkout");
+			const diff = path.join(dir, "change.diff");
+			const cases = path.join(dir, "cases.json");
+			const bin = path.join(dir, "bin");
+			const counter = path.join(dir, "omp-calls");
+			fs.mkdirSync(out);
+			fs.mkdirSync(checkout);
+			fs.mkdirSync(bin);
+			fs.writeFileSync(diff, "");
+			fs.writeFileSync(
+				cases,
+				JSON.stringify({
+					frozen_at: "test",
+					heads: ["complete", "partial"].map(id => ({
+						id,
+						pr: 1,
+						round: 1,
+						head_sha: "a".repeat(40),
+						base_sha: "b".repeat(40),
+						checkout,
+						diff,
+						subject: id,
+						packages: [],
+					})),
+					findings: [],
+				}),
+			);
+			const complete: RunRecord = {
+				runId: "shipped__complete__t1",
+				arm: "shipped",
+				head: "complete",
+				trial: 1,
+				model: "anthropic/claude-opus-5-5",
+				report: "carried output",
+				costUsd: 1,
+				elapsedMs: 1,
+				exitCode: 0,
+			};
+			fs.writeFileSync(path.join(out, `${complete.runId}.json`), JSON.stringify(complete));
+			// What a killed runner leaves for a session it had started: a truncated
+			// record, an empty claim and the session's scratch.
+			fs.writeFileSync(
+				path.join(out, "shipped__partial__t1.json"),
+				JSON.stringify({ runId: "shipped__partial__t1" }),
+			);
+			fs.writeFileSync(path.join(out, "shipped__partial__t1.json.claim"), "");
+			const leftover = path.join(out, "scratch", "shipped__partial__t1", "dead-session-probe.txt");
+			fs.mkdirSync(path.dirname(leftover), { recursive: true });
+			fs.writeFileSync(leftover, "from the dead session");
+			const omp = path.join(bin, "omp");
+			fs.writeFileSync(
+				omp,
+				`#!/bin/sh
+printf x >> "$RUN_COUNTER"
+printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"new output"}],"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}}'
+`,
+			);
+			fs.chmodSync(omp, 0o755);
+			const runner = Bun.spawnSync(
+				[
+					process.execPath,
+					path.join(import.meta.dir, "run.ts"),
+					"--out",
+					out,
+					"--cases",
+					cases,
+					"--arms",
+					"shipped",
+					"--trials",
+					"1",
+					"--concurrency",
+					"1",
+					"--no-repo-gate",
+				],
+				{ env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, RUN_COUNTER: counter } },
+			);
+			expect(runner.exitCode).toBe(0);
+			expect(fs.readFileSync(counter, "utf8")).toBe("x");
+			expect(
+				(JSON.parse(fs.readFileSync(path.join(out, `${complete.runId}.json`), "utf8")) as RunRecord).report,
+			).toBe("carried output");
+			expect(
+				(JSON.parse(fs.readFileSync(path.join(out, "shipped__partial__t1.json"), "utf8")) as RunRecord).report,
+			).toBe("new output");
+			expect(fs.existsSync(leftover)).toBe(false);
+			expect(fs.existsSync(path.join(out, "shipped__partial__t1.json.claim"))).toBe(false);
+			expect(runner.stdout.toString()).toContain("2 of 2 sessions recorded complete");
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

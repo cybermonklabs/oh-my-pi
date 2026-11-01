@@ -64,6 +64,8 @@ export interface RunRecord {
 	elapsedMs: number;
 	exitCode: number;
 	error?: string;
+	/** The session's stderr tail when it exited non-zero, e.g. `--max-time` ending a background-job wait. Absent on runs recorded before the brief lane's 2026-11-01 stage-1 relaunch. */
+	stderr?: string;
 	/** Model requests (assistant messages), tool calls by tool, and tokens. Absent on runs before 2026-11-01. */
 	usage?: {
 		calls: number;

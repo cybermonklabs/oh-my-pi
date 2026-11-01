@@ -32,6 +32,7 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isEexist, isEnoent } from "@oh-my-pi/pi-utils/fs-error";
 import type { ReportFormat } from "./claims.ts";
 import type { BoxLoad, CaseFile, HeadCase, RunRecord } from "./grade.ts";
 import { danglingLinks, foreignWorkspaceLinks } from "./snapshot.ts";
@@ -398,11 +399,16 @@ const PRUNED_DIRS: Record<string, true> = { "bun-cache": true, node_modules: tru
 /** A kept file over this size is named in the record, so a disk budget can be traced to the evidence that used it. */
 const LARGE_FILE_BYTES = 8 * 2 ** 20;
 
-/** Bytes under a path, counting links as links. */
+/** Bytes under a path, counting links as links. A live session may remove an entry after its parent is read. */
 export function treeBytes(p: string): number {
-	const st = fs.lstatSync(p);
-	if (!st.isDirectory()) return st.size;
-	return fs.readdirSync(p).reduce((n, e) => n + treeBytes(path.join(p, e)), 0);
+	try {
+		const st = fs.lstatSync(p);
+		if (!st.isDirectory()) return st.size;
+		return fs.readdirSync(p).reduce((n, e) => n + treeBytes(path.join(p, e)), 0);
+	} catch (error) {
+		if (isEnoent(error)) return 0;
+		throw error;
+	}
 }
 
 /**
@@ -435,17 +441,105 @@ export function pruneScratch(dir: string): NonNullable<RunRecord["scratch"]> {
 }
 
 /**
+ * A record is complete only after the runner has its identifying fields and
+ * terminal result. A partial JSON file must be rerun rather than skipped.
+ */
+function isCompleteRunRecord(outPath: string, expected: Pick<RunRecord, "runId" | "arm" | "head" | "trial">): boolean {
+	try {
+		const record = JSON.parse(fs.readFileSync(outPath, "utf8")) as Partial<RunRecord>;
+		return (
+			record.runId === expected.runId &&
+			record.arm === expected.arm &&
+			record.head === expected.head &&
+			record.trial === expected.trial &&
+			typeof record.model === "string" &&
+			typeof record.report === "string" &&
+			Number.isFinite(record.costUsd) &&
+			Number.isFinite(record.elapsedMs) &&
+			Number.isFinite(record.exitCode)
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** A claim names the process that owns a job so a later runner can reclaim only a dead owner's work. */
+function claimHasLiveOwner(claim: string): boolean {
+	try {
+		const pid = Number(fs.readFileSync(claim, "utf8").trim());
+		if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code !== "ESRCH";
+		}
+	} catch (error) {
+		return !isEnoent(error);
+	}
+}
+
+/**
+ * Acquire a job claim without stealing a live runner's work. The claim is a
+ * hard link to a file that already names this process, so no runner can read
+ * a claim before its owner is written and take an empty one for a dead one.
+ */
+function acquireJobClaim(claim: string): "claimed" | "reclaimed" | "busy" {
+	const mine = `${claim}.${process.pid}`;
+	fs.writeFileSync(mine, `${process.pid}\n`);
+	try {
+		let reclaimed = false;
+		for (;;) {
+			try {
+				fs.linkSync(mine, claim);
+				return reclaimed ? "reclaimed" : "claimed";
+			} catch (error) {
+				if (!isEexist(error)) throw error;
+			}
+			if (claimHasLiveOwner(claim)) return "busy";
+			const stale = `${claim}.stale-${process.pid}`;
+			try {
+				// Rename is atomic: a competing resumer can only claim after we move
+				// the dead lock out of the way, never remove our newly written lock.
+				fs.renameSync(claim, stale);
+				fs.rmSync(stale, { force: true });
+				reclaimed = true;
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+		}
+	} finally {
+		fs.rmSync(mine, { force: true });
+	}
+}
+
+/** Persist only finished records at their final path; a crash leaves a removable partial file. */
+function writeRunRecord(outPath: string, record: RunRecord): void {
+	const partial = `${outPath}.partial`;
+	fs.writeFileSync(partial, `${JSON.stringify(record, null, 2)}\n`);
+	fs.renameSync(partial, outPath);
+}
+
+/**
  * Why the runner must start no further session, or null: the run directory
  * has reached its cap, or the filesystem it is on is nearly full. Other work
  * shares the filesystem, so the second check protects it, not this run.
  */
 export function diskStop(outDir: string, capGiB: number, minFreeGiB: number): string | null {
-	const usedGiB = treeBytes(outDir) / 2 ** 30;
-	if (usedGiB >= capGiB) return `run directory holds ${usedGiB.toFixed(1)} GiB, at its cap of ${capGiB} GiB`;
-	const fsStat = fs.statfsSync(outDir);
-	const freeGiB = (fsStat.bavail * fsStat.bsize) / 2 ** 30;
-	if (freeGiB < minFreeGiB) return `${freeGiB.toFixed(1)} GiB free on the run's filesystem, under ${minFreeGiB} GiB`;
-	return null;
+	try {
+		const usedGiB = treeBytes(outDir) / 2 ** 30;
+		if (usedGiB >= capGiB) return `run directory holds ${usedGiB.toFixed(1)} GiB, at its cap of ${capGiB} GiB`;
+		const fsStat = fs.statfsSync(outDir);
+		const freeGiB = (fsStat.bavail * fsStat.bsize) / 2 ** 30;
+		if (freeGiB < minFreeGiB)
+			return `${freeGiB.toFixed(1)} GiB free on the run's filesystem, under ${minFreeGiB} GiB`;
+		return null;
+	} catch (error) {
+		console.error(
+			`disk guard could not measure: ${String(error)}; continuing this run and retrying before the next session`,
+		);
+		return null;
+	}
 }
 
 async function main(): Promise<void> {
@@ -553,25 +647,30 @@ async function main(): Promise<void> {
 			const job = jobs[index++];
 			if (job === undefined) return;
 			const outPath = path.join(outDir, `${job.runId}.json`);
-			if (fs.existsSync(outPath)) {
-				console.log(`skip ${job.runId} (already recorded)`);
-				continue;
-			}
-			// A claim lets a second runner on the same directory widen a run that is
-			// already going without repeating a job. The record is written before the
-			// claim is released, so a job claimed after release is found recorded.
+			// A claim lets a second runner on the same directory widen a run without
+			// repeating a job. It also gives a resumer exclusive ownership before it
+			// discards incomplete state left by a dead runner.
 			const claim = `${outPath}.claim`;
-			try {
-				fs.closeSync(fs.openSync(claim, "wx"));
-			} catch {
+			const claimState = acquireJobClaim(claim);
+			if (claimState === "busy") {
 				console.log(`skip ${job.runId} (claimed by another runner)`);
 				continue;
 			}
-			if (fs.existsSync(outPath)) {
+			if (claimState === "reclaimed") console.log(`resume ${job.runId} (reclaimed stale claim)`);
+			const expected = { runId: job.runId, arm: job.arm.name, head: job.head.id, trial: job.trial };
+			if (isCompleteRunRecord(outPath, expected)) {
 				fs.rmSync(claim, { force: true });
+				console.log(`skip ${job.runId} (complete recorded session)`);
 				continue;
 			}
 			const scratch = path.join(outDir, "scratch", job.runId);
+			const partial = `${outPath}.partial`;
+			if (fs.existsSync(outPath) || fs.existsSync(partial) || fs.existsSync(scratch)) {
+				fs.rmSync(outPath, { force: true });
+				fs.rmSync(partial, { force: true });
+				fs.rmSync(scratch, { recursive: true, force: true });
+				console.log(`redo ${job.runId} (discarded incomplete record and scratch)`);
+			}
 			fs.mkdirSync(scratch, { recursive: true });
 			const args = [
 				"-p",
@@ -594,6 +693,11 @@ async function main(): Promise<void> {
 				"--max-cost",
 				maxCost,
 				"--auto-approve",
+				// Without it, print mode cancels the reviewer's background jobs at exit and
+				// records "waiting on bg_2" as its report: a reproduction killed by the
+				// runner scores as a reviewer that found nothing. The wait still ends at
+				// --max-time, with exit 1 and the reason on stderr, both kept in the record.
+				"--wait-async",
 			];
 			const promptFile = armPromptFile(job.arm, outDir);
 			if (promptFile !== null) args.push("--append-system-prompt", promptFile);
@@ -659,12 +763,13 @@ async function main(): Promise<void> {
 				elapsedMs: Date.now() - started,
 				exitCode: result.exitCode,
 				...(failure === undefined ? {} : { error: failure }),
+				...(result.exitCode === 0 ? {} : { stderr: result.stderr }),
 				usage: result.usage,
 				box: { start: boxStart, end: boxEnd },
 				brief: { elements: job.brief?.elements ?? [], chars: job.brief?.text.length ?? 0 },
 				scratch: pruned,
 			};
-			fs.writeFileSync(outPath, `${JSON.stringify(record, null, 2)}\n`);
+			writeRunRecord(outPath, record);
 			fs.rmSync(claim, { force: true });
 			console.log(
 				`done  ${job.runId} exit=${result.exitCode} calls=${result.usage.calls} out_tokens=${result.usage.output} chars=${result.report.length} ${Math.round((Date.now() - started) / 1000)}s load1=${boxEnd.load1} r=${boxEnd.procsRunning} b=${boxEnd.procsBlocked} scratch_kept=${(pruned.keptBytes / 2 ** 20).toFixed(1)}MiB pruned=${(pruned.removedBytes / 2 ** 20).toFixed(1)}MiB`,
@@ -683,7 +788,19 @@ async function main(): Promise<void> {
 			`scope ${mem.cgroup}: memory.peak ${(mem.peakBytes / 2 ** 30).toFixed(2)} GiB; memory.events max=${mem.events.max ?? "?"} oom=${mem.events.oom ?? "?"} oom_kill=${mem.events.oom_kill ?? "?"}`,
 		);
 	}
-	console.log(`all runs recorded in ${outDir}`);
+	// Counted from the records on disk, not from this process's own work, so a
+	// job a resume skipped or a dead runner left behind is named, never assumed.
+	const missing = jobs.filter(
+		j =>
+			!isCompleteRunRecord(path.join(outDir, `${j.runId}.json`), {
+				runId: j.runId,
+				arm: j.arm.name,
+				head: j.head.id,
+				trial: j.trial,
+			}),
+	);
+	console.log(`${jobs.length - missing.length} of ${jobs.length} sessions recorded complete in ${outDir}`);
+	if (missing.length > 0) console.log(`not recorded: ${missing.map(j => j.runId).join(", ")}`);
 }
 
 if (import.meta.main) await main();
