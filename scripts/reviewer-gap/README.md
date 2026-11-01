@@ -129,11 +129,94 @@ bun scripts/reviewer-gap/claims-build.ts setup
 MISE_BUN_VERSION=1.4.4 bun scripts/reviewer-gap/run.ts --cases scripts/reviewer-gap/cases-c.json --out <dir> --arms current --trials 3 --concurrency 2 --max-time 20m --no-repo-gate
 bun scripts/reviewer-gap/claims.ts --runs <dir> [--compare candidate:current]
 ```
-
-The harness's own tests are the six `*.test.ts` files at this directory's top
+The harness's own tests are the seven `*.test.ts` files at this directory's top
 level: `bun test scripts/reviewer-gap/*.test.ts`. A bare `bun test
 scripts/reviewer-gap/` also collects the reviewers' recorded probes under
 `runs/*/scratch/`, which are evidence, not tests of the harness.
+
+## The verdict lane
+
+The claims lane already scores a false blocker, as a decoy a report asserts
+under `## DEFECT:`, and a missed defect. It cannot score a **wrong clearance**:
+a real defect a report vouches for under `## NOT A DEFECT` scores as a plain
+miss, the same as a report that never looked, though a clearance is what a
+merge is taken on. Nor can its heads present what produced two of the batch's
+wrong verdicts: a claim about the merge of two heads, and a working directory
+at another revision than the one under review. Those three wrong verdicts are
+`corpus/verdicts.jsonl`.
+
+This lane is a separate, frozen three-case corpus. A case supplies one claim,
+its exact head, the other read-only artifacts its original reviewer used, and,
+when that was the mistake, its starting working directory. The run ends with
+one unambiguous verdict:
+
+```text
+VERDICT: HOLDS
+VERDICT: DOES NOT HOLD
+```
+
+`verdict.ts` scores four outcomes:
+
+- **wrong-clear** — it says a claim holds when it does not;
+- **wrong-fail** — it says a claim does not hold when it does;
+- **supported** — the verdict is right and the report names the decisive
+  observation; and
+- **unsupported** — the verdict is right but the report does not show that
+  observation, so a guess does not score as a verification.
+
+The cases are one eval axis, **instrument-to-claim binding**, with the three
+coordinates each original reviewer left unbound:
+
+| case | coordinate | original instrument answered | verdict required |
+|---|---|---|---|
+| #17646 at `4ef2e3be` | domain | writable `2>/dev/null` and `2>file` redirections | whether all stderr-in-effect redirections honour the claim |
+| #17394 at `6e5d278` with `subagent-due-by` at `7f4fbe6` | quantity | where headings and strings appear in a grep listing | which heading contains the due-by entry |
+| #17665 at `b31f2fb` | object | what `scripts/run-rs-task.ts` says in stale checkout `acf943d3` | what that file says at the reviewed head |
+
+Three cases on one axis, because each original reviewer bound the other two
+coordinates correctly in the same report. The #17646 reviewer built from its
+own exports of named revisions (object) and, after the coordinator's
+line-number warning, re-checked its changelog clearances by section
+(quantity), and still cleared the redirection claim on writes that succeed
+(domain). The #17394 reviewer read blobs by sha from each pair's own merge
+base (object) and merged both orders (domain), and read the listing's line
+numbers as section membership (quantity); its later sweep counted main's
+released entries as misplaced, a second quantity error. The #17665 reviewer
+built and ran both trees itself (quantity, domain) and read one file through
+its working directory (object). In these three reports a pass on one
+coordinate did not carry to another, so one case would score one coordinate;
+reading its result as the axis's would repeat #17646's generalisation. And the
+instruction that answered the object error ("read every file from the
+revision under review") touches neither of the others. The object error is
+also the only one a program can see (a read outside the trees the session was
+given); the other two need a judgement of what the result established.
+
+`verdict-build.ts setup` creates immutable materials under
+`/mnt/nvme/sami/reviewer-gap-evals/verdict/`. It checks the preserved addon
+from the #17646 reviewer by SHA-256, builds its snapshot only with a
+byte-identical `bun.lock` donor, exports the two #17394 changelog blobs, and
+pins the saved #17665 gate-machine logs before removing the lines that label
+which command is the script's. The reviewer still has to bind each result to
+the claimed head. `preflight` checks every snapshot, patch, material and
+alternate working directory before any session starts.
+
+```bash
+bun scripts/reviewer-gap/verdict-build.ts setup
+bun scripts/reviewer-gap/run.ts --cases scripts/reviewer-gap/cases-verdict.json \
+  --out /mnt/nvme/sami/reviewer-gap-evals/runs/verdict-<date> \
+  --arms current --trials 3 --concurrency 1 --max-time 20m --no-repo-gate
+bun scripts/reviewer-gap/verdict.ts --runs /mnt/nvme/sami/reviewer-gap-evals/runs/verdict-<date>
+```
+
+`cases-verdict.json` froze the three cases at `2026-11-01T11:12:00Z`, before
+any verdict-lane model call. `verdict-freeze.json` pins the same
+case/corpus/scorer hashes, the `current` arm
+(`anthropic/claude-opus-5-5` with `prompts/current.md`), three trials, one
+session at a time, a 20-minute ceiling, and no repository-wide gate.
+`verdict.test.ts` checks the freeze, replays every documented wrong verdict and
+refutation through the scorer, checks that the deciding patterns do not fire
+on the wrong verdict or in a run's prompt, and runs all three prepared cases
+through `preflight`.
 
 ## The brief lane
 

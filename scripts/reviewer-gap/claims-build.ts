@@ -27,9 +27,9 @@ import { build } from "./snapshot.ts";
 export const REPO = "/home/sami/src/oh-my-pi";
 export const UPSTREAM_MAIN = "upstream/main";
 /** Snapshots, patches and earlier-round copies live here, outside any temporary tree. */
-const ROOT = "/mnt/nvme/sami/reviewer-gap-evals";
+export const ROOT = "/mnt/nvme/sami/reviewer-gap-evals";
 /** The batch's review-round directories, which `setup` copies the earlier round from. */
-const BATCH = "/mnt/nvme/tmp-omp-batch";
+export const BATCH = "/mnt/nvme/tmp-omp-batch";
 
 /**
  * One donor per (bun.lock blob, crates tree). A head is usable only when a

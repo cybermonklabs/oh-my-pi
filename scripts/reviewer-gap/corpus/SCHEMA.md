@@ -73,3 +73,50 @@ A claim the fix lane stated and a measurement then disproved.
 ```
 
 `falsified_by` is a finding `id` when one matches, otherwise a short description.
+
+## C. Verdict records — `verdicts.jsonl`
+
+Added 2026-11-01 for a reviewer verdict that was itself wrong. A finding record
+captures a defect and a false-belief record captures a fix lane's claim. Neither
+captures a reviewer who obtains a real result and decides a different question.
+The verdict lane uses each record with `cases-verdict.json` to score that
+decision directly.
+
+```json
+{
+  "id": "V-17646-r3-1",
+  "head": "pr17646-r3",
+  "pr": 17646,
+  "round": 3,
+  "head_sha": "4ef2e3be03abd33bef5c8dc5e4ad64b156617e7a",
+  "coordinate": "object|quantity|domain",
+  "expected": "holds|does-not-hold",
+  "original_verdict": "holds|does-not-hold",
+  "reviewer": {
+    "agent": "the reviewer session id",
+    "model": "provider/model",
+    "transcript": "path to its transcript"
+  },
+  "claim": "the claim the reviewer was deciding",
+  "instrument": "the real tool, command or measurement it used",
+  "nearby_question": "what that instrument established instead",
+  "wrong_verdict": [{ "source": "path and message/line", "text": "verbatim review text" }],
+  "refutations": [{ "source": "path and message/line", "text": "verbatim contrary evidence" }],
+  "diagnosis": { "by": "who diagnosed it", "source": "path and message/line", "text": "verbatim diagnosis" },
+  "reproduced_here": "the current run against the pinned case materials"
+}
+```
+
+`expected` and `original_verdict` MUST differ. `coordinate` is not a
+theoretical label: it states the concrete coordinate that the original
+instrument left unbound:
+
+- `object` — it read or ran an artifact other than the one the claim names;
+- `quantity` — it measured a proxy (such as a string's position) instead of
+  the property claimed (such as a section containing it); or
+- `domain` — it checked only a subset of the inputs covered by the claim.
+
+Every record MUST retain the wrong verdict, a refutation and the diagnosis
+where available. The record's scorer patterns belong in `cases-verdict.json`;
+they MUST fire on every refutation and MUST NOT fire on the wrong verdict or
+the shared prompt.

@@ -36,6 +36,7 @@ import { isEexist, isEnoent } from "@oh-my-pi/pi-utils/fs-error";
 import type { ReportFormat } from "./claims.ts";
 import type { BoxLoad, CaseFile, HeadCase, RunRecord } from "./grade.ts";
 import { danglingLinks, foreignWorkspaceLinks } from "./snapshot.ts";
+import type { VerdictHead } from "./verdict.ts";
 
 /** A part of a round brief an arm adds to the user prompt (`cases-brief.json`). */
 export type BriefElement = "loss" | "rebreak" | "repro";
@@ -172,6 +173,12 @@ export function armBrief(
  * at and cleared under `## NOT A DEFECT`. Without it, a report that names a
  * suspicion in order to clear it cannot be told apart from one that asserts it.
  *
+ * `format: "verdict"` asks the run to verify the head's one claim and end with
+ * a verdict line (`verdict.ts`). It lists the head's other materials and never
+ * says where the claim came from or which coordinate the case tests: the
+ * prompt is the same for every arm, so it must not carry the behaviour an arm
+ * is tested for.
+ *
  * `prior` points the reviewer at a read-only copy of the previous review
  * round's reports, probes and logs, as every round of the batch the claims
  * lane comes from had. Replaying an earlier probe against a head that changed
@@ -189,7 +196,7 @@ export function armBrief(
  * only the demand for a reproduction varies.
  */
 export function userPrompt(
-	head: HeadCase,
+	head: HeadCase & Partial<Pick<VerdictHead, "claim" | "materials">>,
 	scratch: string,
 	minutes: number,
 	repoGate = true,
@@ -197,37 +204,52 @@ export function userPrompt(
 	prior: string | null = null,
 	briefLane: { brief: string | null } | null = null,
 ): string {
+	if (format === "verdict" && head.claim === undefined) throw new Error(`${head.id}: a verdict head needs a claim`);
 	// Earlier lanes keep their exact wording; the brief lane drops "any output you measured" (the reproduction element).
 	const name =
 		briefLane === null
 			? ["mechanism, the trigger another engineer would use to reproduce it, and any", "output you measured."]
 			: ["mechanism and the trigger another engineer would use to reproduce it.", ""];
 	const report =
-		format === "claims"
+		format === "verdict"
 			? [
-					`Write your report to stdout as markdown in this shape:`,
-					`- Each defect you assert gets its own section, worst first, whose heading line starts with \`## DEFECT:\``,
-					`  and a title. In it name the ${name[0]}`,
-					...(name[1] === "" ? [] : [`  ${name[1]}`]),
-					`- Everything you examined and concluded is not a defect of this change (a suspicion you ruled out, a probe`,
-					`  of yours that turned out wrong, a failure you traced to the environment) goes under one heading`,
-					`  \`## NOT A DEFECT\`, never under a \`## DEFECT:\` heading.`,
-					`- If you assert no defect, write the line \`NO DEFECTS\`.`,
-					`Only the \`## DEFECT:\` sections are the defects you assert.`,
+					`Write your report to stdout as markdown: what you did to test the claim and what you observed.`,
+					`Its last line is exactly one of these two:`,
+					`VERDICT: HOLDS`,
+					`VERDICT: DOES NOT HOLD`,
 				]
-			: [
-					`Write your findings to stdout as markdown: one section per defect, worst first, each naming the`,
-					`mechanism, the trigger another engineer would use to reproduce it, and any output you measured.`,
-				];
+			: format === "claims"
+				? [
+						`Write your report to stdout as markdown in this shape:`,
+						`- Each defect you assert gets its own section, worst first, whose heading line starts with \`## DEFECT:\``,
+						`  and a title. In it name the ${name[0]}`,
+						...(name[1] === "" ? [] : [`  ${name[1]}`]),
+						`- Everything you examined and concluded is not a defect of this change (a suspicion you ruled out, a probe`,
+						`  of yours that turned out wrong, a failure you traced to the environment) goes under one heading`,
+						`  \`## NOT A DEFECT\`, never under a \`## DEFECT:\` heading.`,
+						`- If you assert no defect, write the line \`NO DEFECTS\`.`,
+						`Only the \`## DEFECT:\` sections are the defects you assert.`,
+					]
+				: [
+						`Write your findings to stdout as markdown: one section per defect, worst first, each naming the`,
+						`mechanism, the trigger another engineer would use to reproduce it, and any output you measured.`,
+					];
 	return [
-		`Review this change for defects its author must fix before merge.`,
+		format === "verdict"
+			? `Verify one claim about this change.`
+			: `Review this change for defects its author must fix before merge.`,
 		``,
 		`Snapshot under review: ${head.checkout}`,
-		`  A complete working tree at commit ${head.head_sha} with dependencies already installed.`,
+		format === "verdict"
+			? `  A complete working tree at commit ${head.head_sha}.`
+			: `  A complete working tree at commit ${head.head_sha} with dependencies already installed.`,
 		`  It is read-only and shared with other runs: never write inside it and never change its permissions.`,
 		`Patch under review: ${head.diff}`,
 		`  The unified diff of ${head.base_sha.slice(0, 12)}..${head.head_sha.slice(0, 12)}. Subject: ${head.subject}.`,
 		`  Packages it touches: ${head.packages.join(", ")}.`,
+		...(head.materials === undefined || head.materials.length === 0
+			? []
+			: [`Also given, read-only:`, ...head.materials.map(m => `  ${m.path}: ${m.note}`)]),
 		`Scratch directory, yours, writable: ${scratch}`,
 		`  Put any probe, test or fixture here. Run one with \`bun test ${scratch}/<name>.test.ts\` from the`,
 		`  relevant package directory inside the snapshot, e.g. \`cd ${head.checkout}/${head.packages[0]} && bun test ${scratch}/probe.test.ts\`.`,
@@ -260,6 +282,7 @@ export function userPrompt(
 					briefLane.brief ?? `(none for this round)`,
 					``,
 				]),
+		...(format === "verdict" ? [`Claim to verify:`, ``, head.claim as string, ``] : []),
 		`Budget: ${minutes} minutes of wall clock. When it runs out, report what you have.`,
 		``,
 		...report,
@@ -268,11 +291,31 @@ export function userPrompt(
 }
 
 /**
- * Every reason a head cannot give a reviewer a working tree: the snapshot, the
- * patch or the earlier round it names is missing, a dependency link dangles,
- * or a workspace link leaves the snapshot. Empty when the head is usable.
+ * Where a session starts and where git stops climbing. The session starts in
+ * its scratch, unless the head names another tree: a verdict case whose
+ * original reviewer started in a working copy at another revision. A snapshot
+ * is a `git archive` extraction, so it carries no `.git`. A reviewer that runs
+ * `git log` inside one would otherwise climb to the nearest enclosing
+ * repository and read a history that is not the change under review; the
+ * ceiling stops the walk at the snapshot, the scratch and that other tree.
  */
-export function preflight(head: HeadCase & { prior?: string | null }): string[] {
+export function sessionDirs(
+	head: HeadCase & Partial<Pick<VerdictHead, "cwd">>,
+	scratch: string,
+): { cwd: string; ceiling: string } {
+	const cwd = head.cwd ?? scratch;
+	return { cwd, ceiling: [...new Set([head.checkout, scratch, cwd])].join(":") };
+}
+
+/**
+ * Every reason a head cannot give a reviewer a working tree: the snapshot, the
+ * patch, the earlier round, the working directory or a material it names is
+ * missing, a dependency link dangles, or a workspace link leaves the snapshot.
+ * Empty when the head is usable.
+ */
+export function preflight(
+	head: HeadCase & { prior?: string | null } & Partial<Pick<VerdictHead, "cwd" | "materials">>,
+): string[] {
 	const problems: string[] = [];
 	if (!fs.existsSync(head.checkout)) problems.push(`${head.id}: snapshot ${head.checkout} does not exist`);
 	else {
@@ -285,6 +328,10 @@ export function preflight(head: HeadCase & { prior?: string | null }): string[] 
 	if (!fs.existsSync(head.diff)) problems.push(`${head.id}: patch ${head.diff} does not exist`);
 	if (head.prior != null && !fs.existsSync(head.prior))
 		problems.push(`${head.id}: earlier round ${head.prior} does not exist`);
+	if (head.cwd != null && !fs.existsSync(head.cwd))
+		problems.push(`${head.id}: working directory ${head.cwd} does not exist`);
+	for (const m of head.materials ?? [])
+		if (!fs.existsSync(m.path)) problems.push(`${head.id}: material ${m.path} does not exist`);
 	return problems;
 }
 
@@ -717,17 +764,15 @@ async function main(): Promise<void> {
 			console.log(
 				`start ${job.runId} load1=${boxStart.load1} r=${boxStart.procsRunning} b=${boxStart.procsBlocked}`,
 			);
-			// A snapshot is a `git archive` extraction, so it carries no `.git`. A
-			// reviewer that runs `git log` inside one would otherwise climb to the
-			// nearest enclosing repository and read a history that is not the change
-			// under review. The ceiling stops the walk at the snapshot and at the
-			// scratch; an inherited `GIT_DIR` is dropped rather than blanked, since
-			// an empty one makes git fail instead of searching.
+			// The ceiling (`sessionDirs`) keeps git from climbing out of the trees the
+			// session is given; an inherited `GIT_DIR` is dropped rather than blanked,
+			// since an empty one makes git fail instead of searching.
+			const dirs = sessionDirs(job.head, scratch);
 			const env: NodeJS.ProcessEnv = {
 				...process.env,
 				...scratchTmp(scratch),
 				BUN_INSTALL_CACHE_DIR: path.join(scratch, "bun-cache"),
-				GIT_CEILING_DIRECTORIES: [job.head.checkout, scratch].join(":"),
+				GIT_CEILING_DIRECTORIES: dirs.ceiling,
 				// The session's own log goes to the home directory, outside the eval's disk budget.
 				OMP_LOG_LEVEL: "error",
 			};
@@ -748,7 +793,7 @@ async function main(): Promise<void> {
 					prior,
 					briefLane ? { brief: job.brief?.text ?? null } : null,
 				),
-				scratch,
+				dirs.cwd,
 				env,
 			);
 			// `omp -p` exits 3 when --max-cost stops it. The report it leaves is a

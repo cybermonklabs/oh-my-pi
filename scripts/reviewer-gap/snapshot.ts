@@ -34,16 +34,27 @@ function sh(cmd: string, args: string[], opts: { cwd?: string; stdout?: number }
  * so a later clean-up of the source tree cannot leave a snapshot dangling.
  * A hard link cannot cross a filesystem, so a source on another device is
  * copied in full instead.
+ *
+ * `natives` names the addons the donor carries instead of the source tree's,
+ * as file name -> addon file: for a head whose Rust differs from every tree's
+ * that has its dependencies, the addon must be one built from that head.
  */
-export function makeDonor(source: string, donor: string): void {
+export function makeDonor(source: string, donor: string, natives?: Record<string, string>): void {
 	fs.mkdirSync(path.join(donor, "natives"), { recursive: true });
 	const sameDevice = fs.statSync(source).dev === fs.statSync(donor).dev;
 	if (!fs.existsSync(path.join(donor, "node_modules")))
 		sh("cp", [sameDevice ? "-al" : "-a", path.join(source, "node_modules"), path.join(donor, "node_modules")]);
-	for (const name of fs.readdirSync(path.join(source, NATIVE_DIR))) {
-		if (!name.endsWith(".node")) continue;
+	const addons =
+		natives ??
+		Object.fromEntries(
+			fs
+				.readdirSync(path.join(source, NATIVE_DIR))
+				.filter(name => name.endsWith(".node"))
+				.map(name => [name, fs.realpathSync(path.join(source, NATIVE_DIR, name))]),
+		);
+	for (const [name, from] of Object.entries(addons)) {
 		const to = path.join(donor, "natives", name);
-		if (!fs.existsSync(to)) fs.copyFileSync(fs.realpathSync(path.join(source, NATIVE_DIR, name)), to);
+		if (!fs.existsSync(to)) fs.copyFileSync(from, to);
 	}
 }
 
@@ -142,7 +153,12 @@ export function relink(snapshot: string, donor: string): void {
 	}
 }
 
-export function build(repo: string, sha: string, base: string, outRoot: string, donor: string): void {
+/**
+ * `donor` null builds a tree with no `node_modules`: for a case whose claim is
+ * checked by reading and by tools outside the repository, where a dependency
+ * tree would only be another place for a link to dangle.
+ */
+export function build(repo: string, sha: string, base: string, outRoot: string, donor: string | null): void {
 	const snapshot = path.join(outRoot, "heads", sha);
 	const diff = path.join(outRoot, "diffs", `${sha}.diff`);
 	fs.mkdirSync(snapshot, { recursive: true });
@@ -154,7 +170,7 @@ export function build(repo: string, sha: string, base: string, outRoot: string, 
 	} finally {
 		fs.rmSync(archive, { force: true });
 	}
-	linkDeps(snapshot, donor);
+	if (donor !== null) linkDeps(snapshot, donor);
 	const fd = fs.openSync(diff, "w");
 	try {
 		sh("git", ["-C", repo, "diff", `${base}..${sha}`], { stdout: fd });

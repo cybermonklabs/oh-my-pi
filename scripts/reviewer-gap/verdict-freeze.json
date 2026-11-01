@@ -1,0 +1,27 @@
+{
+	"frozen_at": "2026-11-01T11:12:00Z",
+	"question": "When a reviewer verifies one stated claim at a pinned revision, how often does its final verdict follow the result its instrument actually established, rather than a neighbouring object, quantity or input domain?",
+	"why_this_lane": "The claims lane scores a real defect as found or missed and a decoy as asserted or not. It cannot distinguish a reviewer that explicitly clears a real defect from one that never looked, nor reproduce a second merge head or an alternate working directory. This lane scores a single HOLDS/DOES NOT HOLD verdict and requires the decisive observation in a correct report.",
+	"inputs": {
+		"cases": "cases-verdict.json",
+		"cases_sha256": "440bdcce9bf1fbdd43be341c2f6c23592ff87d8258af9e45f956b750b3ab3e9f",
+		"corpus": "corpus/verdicts.jsonl",
+		"corpus_sha256": "92331edcc90af9f1a82f5ac41809b7d01c19c3a130138aea6f3f22d53f632b46",
+		"scorer": "verdict.ts",
+		"scorer_sha256": "9f11acf0de35da232a4e84a8079dd3d3398f8396a57259bdf8f6580ff41c491a"
+	},
+	"arms": [
+		{
+			"name": "current",
+			"model": "anthropic/claude-opus-5-5",
+			"prompt": "prompts/current.md",
+			"prompt_sha256": "bed756ded5d543ed00da9452a6ec90af1cb53b07c616950129f605d1b4a6ad4e"
+		}
+	],
+	"trials": 3,
+	"concurrency": 1,
+	"max_time": "20m",
+	"max_cost": 3,
+	"repo_gate": false,
+	"scoring": "verdict.ts: a run must end VERDICT: HOLDS or VERDICT: DOES NOT HOLD. Wrong-clear and wrong-fail are errors; the same grade.ts detects rule checks the decisive observation before a right verdict is supported. Wilson intervals are over runs and cluster bootstrap resamples cases with all their runs."
+}

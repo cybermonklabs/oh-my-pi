@@ -43,9 +43,9 @@ import {
 /**
  * The report shape the runner asks for. `prose` (the default, and every lane
  * before this one) is one section per defect; `claims` is the shape this file
- * scores.
+ * scores; `verdict` is one claim's verdict, which `verdict.ts` scores.
  */
-export type ReportFormat = "prose" | "claims";
+export type ReportFormat = "prose" | "claims" | "verdict";
 
 export const DECOY_CLASSES = [
 	"probe-defect",

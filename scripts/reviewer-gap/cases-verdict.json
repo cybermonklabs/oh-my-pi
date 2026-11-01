@@ -1,0 +1,193 @@
+{
+	"frozen_at": "2026-11-01T11:12:00Z",
+	"window_chars": 1200,
+	"report_format": "verdict",
+	"heads": [
+		{
+			"id": "pr17646-r3",
+			"pr": 17646,
+			"round": 3,
+			"head_sha": "4ef2e3be03abd33bef5c8dc5e4ad64b156617e7a",
+			"base_sha": "1c291b87e4b889398cc4b8e4ccdfa650b56a0486",
+			"checkout": "/mnt/nvme/sami/reviewer-gap-evals/heads/4ef2e3be03abd33bef5c8dc5e4ad64b156617e7a",
+			"diff": "/mnt/nvme/sami/reviewer-gap-evals/diffs/4ef2e3be03abd33bef5c8dc5e4ad64b156617e7a.diff",
+			"subject": "fix(shell): survive deep function, source and eval nesting",
+			"packages": [
+				"packages/natives",
+				"crates/pi-shell",
+				"crates/vendor/brush-core",
+				"crates/pi-builtins"
+			],
+			"claim": "As in Bash, the refusal is reported where it happens, on the standard error in effect there (after `f 2>/dev/null` nothing is printed, and `f 2>log` writes it into `log`), and a refused function call or eval abandons the rest of the command it is in (the next top-level command runs, with `$?` 1) rather than letting each of the 500 callers carry on as if one command had failed. If that standard error cannot be written (deep nesting under a low descriptor limit, below), the enclosing command reports the refusal instead, so it is not lost.",
+			"claim_source": "The pull request's description at 4ef2e3be03ab, the paragraph under \"A bound, with Bash's errors\" (/mnt/nvme/tmp-omp-batch/funcnest-r2/pr-body-readback.md line 55, read back after the push).",
+			"materials": [
+				{
+					"path": "/mnt/nvme/sami/reviewer-gap-evals/verdict/pr17646-r3/description.md",
+					"note": "the pull request's description at this commit"
+				},
+				{
+					"path": "/mnt/nvme/sami/reviewer-gap-evals/heads/4ef2e3be03abd33bef5c8dc5e4ad64b156617e7a/packages/natives/native/pi_natives.linux-x64-modern.node",
+					"note": "the native addon the snapshot loads, built from this commit; its `Shell.run` is the bash tool's path"
+				},
+				{
+					"path": "/usr/bin/bash",
+					"note": "GNU Bash 5.2.21"
+				}
+			],
+			"cwd": null
+		},
+		{
+			"id": "pr17394-r36",
+			"pr": 17394,
+			"round": 36,
+			"head_sha": "6e5d278712b273219067f20be903b5242ea36502",
+			"base_sha": "7efd77219374ca4e8767979809835e4aa90666ba",
+			"checkout": "/mnt/nvme/sami/reviewer-gap-evals/heads/6e5d278712b273219067f20be903b5242ea36502",
+			"diff": "/mnt/nvme/sami/reviewer-gap-evals/diffs/6e5d278712b273219067f20be903b5242ea36502.diff",
+			"subject": "fix(eval): end the Python runner and JavaScript worker a session leaves behind",
+			"packages": [
+				"packages/coding-agent",
+				"packages/natives",
+				"packages/utils",
+				"crates/pi-natives",
+				"crates/pi-vcs"
+			],
+			"claim": "This commit's `packages/coding-agent/CHANGELOG.md` and the one on the branch `subagent-due-by` at 7f4fbe679f8, merged from their merge base 7efd7721937 with the union driver this repository's `.gitattributes` sets for changelogs, in either landing order: That branch creates `### Added` only. Both orders give ONE `### Added` and ONE `### Fixed`, every entry under the heading it was written for, 261,828 bytes.",
+			"claim_source": "ClaudeReview17394r2's report to the coordinator, 2026-11-01T09:35:34Z (/home/sami/.omp/agent/sessions/-src-oh-my-pi/2026-10-19T03-32-08-771Z_01a15237-75c3-7321-befb-e6e1cc57a948/ClaudeReview17394r2.jsonl, tool call toolu_01CJJgaY3hFgYHDBk3L4PgwE, paragraph \"Pair B\"). The text after the colon is verbatim but for the bold markup; the text before it states the setting the paragraph's own script (17394-r36-claude/section-placement.sh) measured.",
+			"materials": [
+				{
+					"path": "/mnt/nvme/sami/reviewer-gap-evals/verdict/pr17394-r36/7efd7721937-CHANGELOG.md",
+					"note": "packages/coding-agent/CHANGELOG.md at 7efd7721937, the merge base of this commit and 7f4fbe679f8"
+				},
+				{
+					"path": "/mnt/nvme/sami/reviewer-gap-evals/verdict/pr17394-r36/7f4fbe679f8-CHANGELOG.md",
+					"note": "packages/coding-agent/CHANGELOG.md at 7f4fbe679f8, the head of the branch subagent-due-by"
+				}
+			],
+			"cwd": null
+		},
+		{
+			"id": "pr17665-r1",
+			"pr": 17665,
+			"round": 1,
+			"head_sha": "b31f2fb89409371637addf7f1a15b4cf33494394",
+			"base_sha": "1c291b87e4b889398cc4b8e4ccdfa650b56a0486",
+			"checkout": "/mnt/nvme/sami/reviewer-gap-evals/heads/b31f2fb89409371637addf7f1a15b4cf33494394",
+			"diff": "/mnt/nvme/sami/reviewer-gap-evals/diffs/b31f2fb89409371637addf7f1a15b4cf33494394.diff",
+			"subject": "fix(timeout): propagate caller cancellation to operands",
+			"packages": [
+				"packages/coding-agent",
+				"crates/pi-builtins"
+			],
+			"claim": "Because nextest failed, `test:rs` stopped before its doctest pass, so I ran that pass (`cargo test --doc --workspace` with the script's excludes) on this branch: 2 passed, 27 ignored, 0 failed.",
+			"claim_source": "The pull request's description at b31f2fb8940, under \"Testing\" (/mnt/nvme/tmp-omp-batch/fix17665r2/body-before.md line 27, saved by the fix lane before it edited the description).",
+			"materials": [
+				{
+					"path": "/mnt/nvme/sami/reviewer-gap-evals/verdict/pr17665-r1/description.md",
+					"note": "the pull request's description at this commit"
+				},
+				{
+					"path": "/mnt/nvme/sami/reviewer-gap-evals/verdict/pr17665-r1/doctest",
+					"note": "two runs of cargo's doctest pass at this commit on the build machine, each log starting with the command it ran (cargo cannot run here)"
+				}
+			],
+			"cwd": "/mnt/nvme/sami/reviewer-gap-evals/verdict/pr17665-r1/oh-my-pi"
+		}
+	],
+	"verdicts": [
+		{
+			"id": "V-17646-r3-1",
+			"head": "pr17646-r3",
+			"title": "a refusal under a closed or full standard error (`f 2>&-`, `f 2>/dev/full`) is printed on an outer standard error, where Bash prints nothing",
+			"expected": "does-not-hold",
+			"coordinate": "domain",
+			"mechanism": [
+				[
+					"2>&-",
+					"2>\\s*/dev/full",
+					"/dev/full",
+					"closed (standard error|stderr|descriptor|fd ?2)",
+					"(standard error|stderr|fd ?2) (is |was )?closed",
+					"full (device|standard error|stderr)"
+				]
+			],
+			"trigger": [
+				[
+					"nesting level exceeded",
+					"maximum function nesting",
+					"refusal",
+					"error: f:"
+				],
+				[
+					"print",
+					"emit",
+					"escape",
+					"leak",
+					"outer",
+					"enclosing",
+					"appear",
+					"visible",
+					"shown"
+				]
+			]
+		},
+		{
+			"id": "V-17394-r36-1",
+			"head": "pr17394-r36",
+			"title": "merged with this commit as the current side, subagent-due-by's `### Added` entry lands as the fourth entry under `### Fixed`",
+			"expected": "does-not-hold",
+			"coordinate": "quantity",
+			"mechanism": [
+				[
+					"due-by",
+					"due by",
+					"dueMinutes"
+				]
+			],
+			"trigger": [
+				[
+					"### Fixed",
+					"Fixed (section|heading|block)",
+					"under Fixed"
+				],
+				[
+					"misplac",
+					"wrong (heading|section)",
+					"lands? (as|at|under|in|inside)\\b",
+					"ends up",
+					"absorb",
+					"not under",
+					"fourth (line|entry)",
+					"line 14",
+					"instead of",
+					"filed under"
+				]
+			]
+		},
+		{
+			"id": "V-17665-r1-1",
+			"head": "pr17665-r1",
+			"title": "at this commit `scripts/run-rs-task.ts` excludes brush-core, brush-parser, cfg_aliases and napi, and that doctest pass gives 2 passed, 27 ignored, 0 failed",
+			"expected": "holds",
+			"coordinate": "object",
+			"mechanism": [
+				[
+					"run-rs-task",
+					"VENDORED_FORK_EXCLUDES"
+				]
+			],
+			"trigger": [
+				[
+					"brush-parser",
+					"brush_parser",
+					"excludes four",
+					"four crates"
+				],
+				[
+					"napi",
+					"doctest result is 2 passed / 27 ignored / 0 failed"
+				]
+			]
+		}
+	]
+}
