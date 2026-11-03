@@ -18,19 +18,38 @@
  * attached as a cause either), and a database that cannot be opened each
  * refuse in those terms. There is no fallback to file storage: a misconfigured
  * `sql` refuses to start rather than quietly writing sessions somewhere else.
+ *
+ * `session.sql.offboxCheck` (`OMP_SESSION_SQL_OFFBOX_CHECK`, a JSON array)
+ * names a command that decides, per session, whether it may go to the
+ * database; set, the store becomes an {@link OffboxSessionStorage} around
+ * the SQL store, and sessions the command refuses stay in local files. Unset
+ * or empty, `sql` is unchanged. A malformed value refuses to start: read as
+ * unset it would send every session to the database.
  */
 
 import { toError } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { Settings } from "../config/settings";
+import type { SessionStorageBackend } from "./indexed-session-storage";
 import { FileSessionStorage, type SessionStorage, setDefaultSessionStorage } from "./session-storage";
+import type { OffboxCheck } from "./offbox-check";
+import { OffboxSessionStorage } from "./offbox-session-storage";
 import { SqlSessionStorage } from "./sql-session-storage";
-import { cfgSessionSqlDsnFile, cfgSessionStorage } from "./storage-settings";
+import {
+	cfgSessionSqlDsnFile,
+	cfgSessionSqlOffboxCheck,
+	cfgSessionSqlOffboxCheckTimeoutMs,
+	cfgSessionStorage,
+} from "./storage-settings";
 
 const SESSION_STORAGE_ENV = "OMP_SESSION_STORAGE";
 const SESSION_SQL_DSN_FILE_ENV = "OMP_SESSION_SQL_DSN_FILE";
+const SESSION_SQL_OFFBOX_CHECK_ENV = "OMP_SESSION_SQL_OFFBOX_CHECK";
+const SESSION_SQL_OFFBOX_CHECK_TIMEOUT_ENV = "OMP_SESSION_SQL_OFFBOX_CHECK_TIMEOUT_MS";
 const SESSION_STORAGE_SETTING = cfgSessionStorage.id;
 const SESSION_SQL_DSN_FILE_SETTING = cfgSessionSqlDsnFile.id;
+const SESSION_SQL_OFFBOX_CHECK_SETTING = cfgSessionSqlOffboxCheck.id;
+const SESSION_SQL_OFFBOX_CHECK_TIMEOUT_SETTING = cfgSessionSqlOffboxCheckTimeoutMs.id;
 
 // Bun opens every connection in a pool on its first query. Two connections let
 // a separate-path append proceed while a rename holds its transaction, without
@@ -130,7 +149,18 @@ export async function resolveSessionStorage({ settings, env }: ResolveSessionSto
 		throw new SessionStorageConfigError(`${source} is ${JSON.stringify(kind)}; expected "file" or "sql"`);
 	}
 
-	return openSessionSqlStorage(await openSessionSqlClient({ settings, env }));
+	const check = resolveOffboxCheck(settings, env);
+	const connection = await openSessionSqlClient({ settings, env });
+	if (!check) return openSessionSqlStorage(connection);
+	try {
+		return await OffboxSessionStorage.create({
+			check,
+			openDatabase: wrapBackend => openSessionSqlStorage(connection, { wrapBackend }),
+		});
+	} catch (err) {
+		void connection.client.end().catch(() => undefined);
+		throw err;
+	}
 }
 
 /**
@@ -144,12 +174,13 @@ export async function resolveSessionStorage({ settings, env }: ResolveSessionSto
  */
 export async function openSessionSqlStorage(
 	connection: SessionSqlConnection,
-	options: { table?: string } = {},
+	options: { table?: string; wrapBackend?: (backend: SessionStorageBackend) => SessionStorageBackend } = {},
 ): Promise<SqlSessionStorage> {
 	try {
 		return await SqlSessionStorage.create({
 			client: connection.client,
 			table: options.table,
+			wrapBackend: options.wrapBackend,
 			redact: connection.redact,
 		});
 	} catch (err) {
@@ -338,6 +369,45 @@ export function sessionDatabaseError(connection: SessionSqlConnection, err: unkn
 		`${connection.source} names ${connection.dsnFile}, but the session database could not be opened: ` +
 			sessionDatabaseErrorDetail(connection, err),
 	);
+}
+
+/**
+ * The configured off-box check, or `undefined` when none is set. The
+ * environment wins over the settings, as for the other storage settings;
+ * anything but a non-empty array of strings with a non-empty program, or a
+ * timeout that is not a positive number, refuses to start.
+ */
+function resolveOffboxCheck(settings: Settings, env: NodeJS.ProcessEnv): OffboxCheck | undefined {
+	const envCheck = env[SESSION_SQL_OFFBOX_CHECK_ENV]?.trim();
+	let argv: unknown = settings.rawValue(cfgSessionSqlOffboxCheck);
+	let source: string = SESSION_SQL_OFFBOX_CHECK_SETTING;
+	if (envCheck) {
+		source = SESSION_SQL_OFFBOX_CHECK_ENV;
+		try {
+			argv = JSON.parse(envCheck);
+		} catch {
+			throw new SessionStorageConfigError(`${source} is not a JSON array of strings: ${JSON.stringify(envCheck)}`);
+		}
+	}
+	if (argv === undefined || argv === null || (Array.isArray(argv) && argv.length === 0)) return undefined;
+	const command = Array.isArray(argv) ? argv.filter((arg): arg is string => typeof arg === "string") : [];
+	if (!Array.isArray(argv) || command.length !== argv.length || !command[0]) {
+		throw new SessionStorageConfigError(
+			`${source} must be a command as a non-empty array of strings, program first; got ${JSON.stringify(argv)}`,
+		);
+	}
+
+	const envTimeout = env[SESSION_SQL_OFFBOX_CHECK_TIMEOUT_ENV]?.trim();
+	const timeoutSource = envTimeout ? SESSION_SQL_OFFBOX_CHECK_TIMEOUT_ENV : SESSION_SQL_OFFBOX_CHECK_TIMEOUT_SETTING;
+	const timeoutMs: unknown = envTimeout
+		? Number(envTimeout)
+		: (settings.rawValue(cfgSessionSqlOffboxCheckTimeoutMs) ?? cfgSessionSqlOffboxCheckTimeoutMs.default);
+	if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+		throw new SessionStorageConfigError(
+			`${timeoutSource} must be a positive number of milliseconds; got ${JSON.stringify(envTimeout ?? timeoutMs)}`,
+		);
+	}
+	return { argv: command, timeoutMs };
 }
 
 /**

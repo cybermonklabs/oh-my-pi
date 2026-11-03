@@ -120,12 +120,14 @@ import { forgetExternalizedImages, prepareEntryForPersistence } from "./session-
 import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	defaultSessionStorage,
-	FileSessionStorage,
+	defersSyncPublishAt,
+	keepsOnLocalDisk,
 	MemorySessionStorage,
 	refreshSessionIndex,
 	type SessionStorage,
 	type SessionStorageWriter,
 	SessionWriteConflictError,
+	supportsAt,
 } from "./session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
 import {
@@ -247,7 +249,7 @@ export async function copySessionArtifacts(
 			storage,
 			sourceArtifactsDir,
 			destinationArtifactsDir,
-			storage instanceof FileSessionStorage ? "*.jsonl" : "*",
+			keepsOnLocalDisk(storage, sourceSessionFile) ? "*.jsonl" : "*",
 		);
 	} catch (error) {
 		logger.warn("Failed to copy subagent transcripts", {
@@ -1113,7 +1115,7 @@ export class SessionManager {
 		this.#breadcrumbFresh = fresh;
 		if (this.#suppressBreadcrumb) return;
 		writeTerminalBreadcrumb(cwd, sessionFile, fresh, {
-			remoteStorage: !(this.#storage instanceof FileSessionStorage),
+			remoteStorage: !keepsOnLocalDisk(this.#storage, sessionFile),
 		});
 	}
 
@@ -1185,7 +1187,14 @@ export class SessionManager {
 	#claimSession(): void {
 		const sessionId = this.#sessionId;
 		const sessionFile = this.#sessionFile;
-		if (!this.#persist || !sessionFile || !this.#storage.claimSession) return;
+		if (
+			!this.#persist ||
+			!sessionFile ||
+			!this.#storage.claimSession ||
+			!supportsAt(this.#storage, sessionFile, "claimSession")
+		) {
+			return;
+		}
 		const current = this.#sessionClaim;
 		if (current?.sessionId === sessionId && current.release) return;
 		if (current && current.sessionId !== sessionId) current.release?.();
@@ -1227,7 +1236,7 @@ export class SessionManager {
 			!this.#persist ||
 			this.#released ||
 			this.#sessionFileRelocating ||
-			this.#storage.defersSyncPublish
+			defersSyncPublishAt(this.#storage, sessionFile)
 		) {
 			return undefined;
 		}
@@ -1288,7 +1297,7 @@ export class SessionManager {
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
-		if (!this.#storage.readTextSync) return undefined;
+		if (!this.#storage.readTextSync || !supportsAt(this.#storage, contested, "readTextSync")) return undefined;
 		let content: string;
 		try {
 			content = this.#storage.readTextSync(contested);
@@ -1750,7 +1759,7 @@ export class SessionManager {
 				}
 			}
 			this.#clearDiskError();
-			if (this.#storage.defersSyncPublish) {
+			if (defersSyncPublishAt(this.#storage, targetPath)) {
 				this.#fileIsCurrent = false;
 				this.#rewriteRequired = true;
 				// The publish is only queued: record nothing and stay non-current
@@ -1951,6 +1960,7 @@ export class SessionManager {
 		// durable entry exists, later appends cannot satisfy its delete predicate.
 		if (
 			this.#storage.withSessionFileLockSync &&
+			supportsAt(this.#storage, this.#sessionFile, "withSessionFileLockSync") &&
 			this.#draftOnlySessionCleanupArmed &&
 			!isDraftOnlyMetadataEntry(entry) &&
 			this.#entries.every(candidate => candidate === entry || isDraftOnlyMetadataEntry(candidate))
@@ -2005,7 +2015,9 @@ export class SessionManager {
 		try {
 			const writer = this.#appendWriter();
 			const line = this.#lineFor(entry);
-			if (writer.appendSync && !this.#storage.defersSyncPublish) {
+			// #appendWriter throws without a session file.
+			const sessionFile = this.#sessionFile as string;
+			if (writer.appendSync && !defersSyncPublishAt(this.#storage, sessionFile)) {
 				writer.appendSync(line);
 				this.#recordDurableAppend(line);
 			} else {
@@ -2622,7 +2634,7 @@ export class SessionManager {
 			if (this.#storage.renameNoReplace) await this.#storage.renameNoReplace(from, to);
 			else await this.#storage.rename(from, to);
 		} catch (error) {
-			if (!(this.#storage instanceof FileSessionStorage) || !isFsError(error) || error.code !== "EXDEV") throw error;
+			if (!keepsOnLocalDisk(this.#storage, from) || !isFsError(error) || error.code !== "EXDEV") throw error;
 			if (mode === "move" && this.#sessionFileRelocating) this.#sessionFileRelocating.copying = true;
 			await moveFileAcrossDevices(from, to);
 		}
@@ -2667,7 +2679,7 @@ export class SessionManager {
 			// A backend without ownership leases (`session.storage: sql`) cannot
 			// tell whether another process writes the session there, not even a
 			// copy of this session, so it never moves onto a session at all.
-			if (!this.#storage.claimSession) {
+			if (!this.#storage.claimSession || !supportsAt(this.#storage, file, "claimSession")) {
 				throw new SessionMoveRefusedError(
 					id === this.#sessionId
 						? `Cannot move session to "${file}": it already holds a copy of this session. Nothing was moved.`
@@ -2694,7 +2706,12 @@ export class SessionManager {
 				);
 			}
 		};
-		if (this.#persist && this.#sessionFile && this.#storage.claimSession) {
+		if (
+			this.#persist &&
+			this.#sessionFile &&
+			this.#storage.claimSession &&
+			supportsAt(this.#storage, this.#sessionFile, "claimSession")
+		) {
 			// Every persisted move rewrites the journal (at least its header cwd),
 			// even when the path stays the same.
 			await assertSourceIsOurs(this.#sessionFile);
@@ -2776,7 +2793,7 @@ export class SessionManager {
 							this.#storage,
 							oldArtifactsDir,
 							newArtifactsDir,
-							this.#storage instanceof FileSessionStorage ? "*.jsonl" : "*",
+							keepsOnLocalDisk(this.#storage, newSessionFile) ? "*.jsonl" : "*",
 						);
 					}
 				} catch (err) {
@@ -3048,7 +3065,12 @@ export class SessionManager {
 		// while this manager still has a draft-only in-memory view. Backends that
 		// cannot make the final content check and deletion one atomic operation
 		// must skip this opportunistic cleanup rather than risk data loss.
-		if (!this.#storage.deleteSessionWithArtifactsIf) return;
+		if (
+			!this.#storage.deleteSessionWithArtifactsIf ||
+			!supportsAt(this.#storage, sessionFile, "deleteSessionWithArtifactsIf")
+		) {
+			return;
+		}
 		try {
 			const artifactsDir = this.getArtifactsDir();
 			const deleted = await this.#storage.deleteSessionWithArtifactsIf(sessionFile, content => {
@@ -3109,7 +3131,7 @@ export class SessionManager {
 		if (
 			(this.#diskFailure || this.#closeOwesPublish) &&
 			this.#sessionFile &&
-			this.#storage.defersSyncPublish &&
+			defersSyncPublishAt(this.#storage, this.#sessionFile) &&
 			!this.#entriesReleased &&
 			this.#shouldHaveSessionFile()
 		) {
@@ -3379,7 +3401,7 @@ export class SessionManager {
 		if (!sessionFile) return false;
 		const storage = this.#storage;
 		if (storage.existsConfirmedSync) return storage.existsConfirmedSync(sessionFile);
-		return !storage.defersSyncPublish && storage.existsSync(sessionFile);
+		return !defersSyncPublishAt(storage, sessionFile) && storage.existsSync(sessionFile);
 	}
 
 	getArtifactsDir(): string | null {
@@ -3579,7 +3601,7 @@ export class SessionManager {
 		await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp });
 		// Keep the recent-sessions title index current so welcome-screen lookups
 		// never have to content-scan this session's file.
-		if (this.#persist && this.#storage instanceof FileSessionStorage) {
+		if (this.#persist && this.#sessionFile && keepsOnLocalDisk(this.#storage, this.#sessionFile)) {
 			recordSessionTitle(this.#sessionId, title);
 		}
 
@@ -3638,7 +3660,7 @@ export class SessionManager {
 	 * the session file or LLM context; in-memory sessions are not journaled.
 	 */
 	recordRecap(recap: string): void {
-		if (this.#persist && this.#storage instanceof FileSessionStorage) {
+		if (this.#persist && this.#sessionFile && keepsOnLocalDisk(this.#storage, this.#sessionFile)) {
 			recordSessionRecap(this.#sessionId, this.#cwd, recap);
 		}
 	}

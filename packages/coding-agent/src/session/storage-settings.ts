@@ -26,3 +26,22 @@ export const cfgSessionSqlDsnFile = register({
 	default: undefined,
 	env: "OMP_SESSION_SQL_DSN_FILE",
 });
+
+// Off-box check for `sql`: a command run (no shell) before a session's first database write and
+// for every subagent transcript. Exit 0 lets the session go to the database; any other outcome
+// keeps it, and its whole subtree, in local files. Unset (the default) leaves `sql` unchanged.
+// Like the rest of this domain, resolved once at start-up by `session-storage-config.ts`, which
+// refuses a malformed value instead of reading it as unset.
+export const cfgSessionSqlOffboxCheck = register({
+	id: "session.sql.offboxCheck",
+	type: "array",
+	default: [] as readonly string[],
+	env: "OMP_SESSION_SQL_OFFBOX_CHECK",
+});
+
+export const cfgSessionSqlOffboxCheckTimeoutMs = register({
+	id: "session.sql.offboxCheckTimeoutMs",
+	type: "number",
+	default: 60_000,
+	env: "OMP_SESSION_SQL_OFFBOX_CHECK_TIMEOUT_MS",
+});

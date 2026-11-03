@@ -169,6 +169,8 @@ export interface SqlSessionStorageOptions {
 	 * rewriting.
 	 */
 	redact?: (text: string) => string;
+	/** Wrap the backend before indexing or publishing, so the off-box check can route every operation. */
+	wrapBackend?: (backend: SessionStorageBackend) => SessionStorageBackend;
 }
 
 /**
@@ -1016,7 +1018,12 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	 */
 	static async create(options: SqlSessionStorageOptions): Promise<SqlSessionStorage> {
 		const backend = new SqlSessionStorageBackend(options);
-		const storage = new SqlSessionStorage(backend, backend.adapter, backend.table, backend.sessionsRoot);
+		const storage = new SqlSessionStorage(
+			options.wrapBackend ? options.wrapBackend(backend) : backend,
+			backend.adapter,
+			backend.table,
+			backend.sessionsRoot,
+		);
 		await storage.initialize();
 		return storage;
 	}

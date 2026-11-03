@@ -833,6 +833,28 @@ A scope is one or two ranges of row keys compared in byte order, one per key pre
 
 `RedisSessionStorage` reads a scope from Redis alone: a session's exact keys, and a `SCAN … MATCH` of the key prefix for each range, its path glob-escaped, so only the scope's keys and their metadata cross the wire. Only the `all` scope reads both metadata hashes whole.
 
+#### Off-box check
+
+`session.sql.offboxCheck` (or `OMP_SESSION_SQL_OFFBOX_CHECK`, a JSON array, which wins) names a command that decides, per session, whether the session may leave this machine for the session database. Unset or an empty array, `sql` works as described above. Set, `resolveSessionStorage` wraps the SQL store in an `OffboxSessionStorage` (`offbox-session-storage.ts`). A malformed command or a timeout that is not a positive finite number refuses to start rather than send every session to the database.
+
+```yaml
+session:
+  storage: sql
+  sql:
+    dsnFile: /path/to/dsn
+    offboxCheck: ["/path/to/no-offbox", "{cwd}", "{sessionFile}"]
+```
+
+- The command runs without a shell: the program and its arguments as listed, each argument with `{cwd}`, `{sessionId}` and `{sessionFile}` replaced by the session's working directory (from its header), its id, and its local transcript path. A leading `~` in the program path is the home directory. It runs in the session's working directory, with `OMP_SESSION_ID`, `OMP_SESSION_CWD` and `OMP_SESSION_FILE` set.
+- Exit 0 lets the session go to the database. Any other exit, a signal, a command that cannot start (a missing program or working directory), or one still running after `session.sql.offboxCheckTimeoutMs` (`OMP_SESSION_SQL_OFFBOX_CHECK_TIMEOUT_MS`; 60000 by default), which is then killed, refuses the session. A refusal logs one warning naming the session, its transcript and the command's first line of stderr, else of stdout.
+- It runs before a session's first database write in the process, with the header that write carries (a new session), a header the process read, or the stored one (a session the database already holds), and before the first write of every subagent transcript, with that transcript's own id and cwd. Each session is checked once per process. Until it answers, writes wait in the store's write queue, so a slow check delays `flush()` and the drain at exit, not the turn.
+- A refused session and everything under it stays in local files at the paths file storage uses: `<stem>.jsonl`, subagent transcripts and drafts under `<stem>/`, the markers `<stem>.jsonl.tombstone`, `<stem>.continuation` and `<stem>.exported`, and its title. Nothing of it reaches the database: no row, part, title, kind, index, lease or metadata write. Subagents, forks and continuations of a local session, and moved local sessions, stay local without a check of their own. A refused subagent under an allowed parent stays local with its own tree; the parent goes to the database.
+- A session whose transcript is a local file when the process first touches it stays local. The session picker, `--resume`, `--continue`, listing and lookup by id see both database rows and local sessions.
+- Once its queued writes settle, a refused session becomes a file session in this process too: it publishes in-body, takes the file lease, and gets file storage's write-conflict recovery. `SessionStorage.defersSyncPublishAt` and `supportsAt` expose these per-path capabilities. The database index forgets its local-only paths without a statement. Scoped refreshes merge only the gate's local entries within that scope; file storage reads live state and needs no refresh.
+- A session the database already holds is copied down, title included, at its first write after refusal. Its existing rows remain until deletion or movement removes them. No write names a refused session the database did not already hold; before the verdict, an index read may still carry its path in a predicate.
+- A move keeps the source's route. A local session cannot move into a database session's tree, and a database session cannot move into a local tree, except an existing database row already under that local session. Cross-route no-replace moves refuse with `SessionOffboxMoveError`; same-route no-replace moves refuse a taken destination with `EEXIST` and preserve both paths.
+- Local sessions, refused sessions, and new undecided sessions take file storage's ownership lease. A database session takes the database store's lease when available; without one it has the same ownership behavior as SQL storage without the check.
+
 ### Manual storage maintenance
 
 `omp gc` previews maintenance by default; `--apply` is required to sweep unreferenced blobs, archive eligible cold sessions, checkpoint database WALs, or prune stale state. Storage maintenance is separate from model-context compaction.

@@ -177,6 +177,13 @@ export interface SessionStorage {
 	 */
 	readonly defersSyncPublish?: boolean;
 	/**
+	 * {@link defersSyncPublish} for `path`, for a storage that routes sessions
+	 * between backends: `false` for a session it keeps as a local file, which
+	 * then gets file storage's write-conflict recovery. Read it through
+	 * {@link defersSyncPublishAt}.
+	 */
+	defersSyncPublishAt?(path: string): boolean;
+	/**
 	 * Resolve once every write this storage queued for `path` has been confirmed
 	 * by, or rejected by, the backing store. In-body backends never queue, so
 	 * they omit this; {@link defersSyncPublish} marks the backends that provide
@@ -203,6 +210,14 @@ export interface SessionStorage {
 	 * it is treated as never confirmed.
 	 */
 	existsConfirmedSync?(path: string): boolean;
+	/**
+	 * Whether this storage keeps `path` as a plain file on the local disk.
+	 * Only a storage that routes sessions between backends implements it
+	 * (`session.sql.offboxCheck` keeps some sessions in files under `sql`);
+	 * {@link FileSessionStorage} keeps every path there and omits it. Read it
+	 * through {@link keepsOnLocalDisk}.
+	 */
+	keepsOnLocalDisk?(path: string): boolean;
 	writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void;
 	/**
 	 * Streaming {@link writeTextSync}: publishes the concatenation of `lines`
@@ -308,6 +323,15 @@ export interface SessionStorage {
 	 * cross-process conditional-delete primitive must skip opportunistic GC.
 	 */
 	deleteSessionWithArtifactsIf?(sessionPath: string, shouldDelete: (content: string) => boolean): Promise<boolean>;
+	/**
+	 * Whether the optional method `capability` applies to `path`. Only a
+	 * storage that routes sessions between backends implements it
+	 * (`session.sql.offboxCheck`): it has every optional method, but each
+	 * applies only where the backend serving the path has it (a session kept
+	 * in local files takes the file lease; a database session takes none).
+	 * Callers probe through {@link supportsAt}, never by the method's presence.
+	 */
+	supportsAt?(path: string, capability: SessionStorageCapability): boolean;
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter;
 	/**
 	 * Wait for every backing write scheduled by this storage to become durably
@@ -332,6 +356,27 @@ export async function refreshSessionIndex(storage: SessionStorage, scope: Sessio
 	} catch (err) {
 		logger.warn("Session index refresh failed", { scope, error: toError(err).message });
 	}
+}
+
+/** The optional {@link SessionStorage} methods a caller probes before it calls one. */
+export type SessionStorageCapability =
+	| "claimSession"
+	| "withSessionFileLockSync"
+	| "deleteSessionWithArtifactsIf"
+	| "readTextSync";
+
+/**
+ * Whether `storage` offers `capability` for `filePath`: per path under a
+ * routing storage ({@link SessionStorage.supportsAt}), else whether it has
+ * the method at all.
+ */
+export function supportsAt(storage: SessionStorage, filePath: string, capability: SessionStorageCapability): boolean {
+	return storage.supportsAt ? storage.supportsAt(filePath, capability) : storage[capability] !== undefined;
+}
+
+/** Whether `storage`'s synchronous writes to `filePath` only queue their publish ({@link SessionStorage.defersSyncPublish}). */
+export function defersSyncPublishAt(storage: SessionStorage, filePath: string): boolean {
+	return storage.defersSyncPublishAt ? storage.defersSyncPublishAt(filePath) : storage.defersSyncPublish === true;
 }
 
 // FinalizationRegistry to clean up leaked file descriptors
@@ -1553,6 +1598,16 @@ export function defaultSessionStorage(): SessionStorage {
 /** Install the process-wide default storage. Call before any session is opened. */
 export function setDefaultSessionStorage(storage: SessionStorage): void {
 	defaultStorage = storage;
+}
+
+/**
+ * Whether `storage` keeps `filePath` as a plain local file, so a file-only
+ * fallback (a copy across devices) applies to it: always under
+ * {@link FileSessionStorage}, per path under a routing storage
+ * ({@link SessionStorage.keepsOnLocalDisk}), never under a key-indexed one.
+ */
+export function keepsOnLocalDisk(storage: SessionStorage, filePath: string): boolean {
+	return storage instanceof FileSessionStorage || storage.keepsOnLocalDisk?.(filePath) === true;
 }
 
 /**

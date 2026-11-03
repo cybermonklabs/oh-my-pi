@@ -172,7 +172,7 @@ const RESOLVED = Promise.resolve();
 const ALL_SCOPE: SessionIndexScope = { kind: "all" };
 
 /** Whether resolved `key` is one of `keys`' exact paths or starts with one of its prefixes. */
-function holdsKey(keys: SessionIndexScopeKeys, key: string): boolean {
+export function holdsKey(keys: SessionIndexScopeKeys, key: string): boolean {
 	return keys.exact.includes(key) || keys.prefixes.some(prefix => key.startsWith(prefix));
 }
 
@@ -536,6 +536,28 @@ export class IndexedSessionStorage implements SessionStorage {
 	/** Every indexed path: callers refresh the `all` scope first. */
 	listAllSync(): string[] {
 		return [...this.#index.keys()];
+	}
+
+	/** Whether a write this storage queued for one of `keys`' paths has not settled yet. */
+	hasPendingWrites(keys: SessionIndexScopeKeys): boolean {
+		for (const path of this.#pathPending.keys()) {
+			if (holdsKey(keys, path)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Forget the index entries of `keys`' paths without a backend operation:
+	 * another storage serves them from now on. The caller has checked
+	 * {@link hasPendingWrites} first; a later refresh lists again whatever the
+	 * backend still holds there.
+	 */
+	releaseIndexEntries(keys: SessionIndexScopeKeys): void {
+		for (const path of this.#index.keys()) {
+			if (!holdsKey(keys, path)) continue;
+			this.#index.delete(path);
+			this.#touch(path);
+		}
 	}
 
 	async exists(file: string): Promise<boolean> {
