@@ -521,8 +521,7 @@ fn read_input(
 					&& let Some(p) = prompt
 				{
 					ctx.vp
-						.out
-						.push_back(PendingWrite { fd: 2, bytes: p.into(), off: 0 });
+						.queue_output(PendingWrite { fd: 2, bytes: p.into(), off: 0 });
 				}
 				return Err(need);
 			},

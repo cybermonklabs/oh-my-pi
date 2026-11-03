@@ -173,7 +173,7 @@ impl Engine {
 		kind: TextKind,
 		mode: ModeId,
 	) -> Result<Arc<Unit>, TextError> {
-		let key = (kind, mode, BString::from(text));
+		let key = (kind.clone(), mode, BString::from(text));
 		if let Some(u) = self.texts.lock().get(&key) {
 			return Ok(Arc::clone(u));
 		}
@@ -213,6 +213,11 @@ impl Engine {
 					return Err(unsupported("a compound array value that is not one word list"));
 				}
 				ir::lower_compound(&cc, &src, mode, Features::NONE).map_err(unsupported)?
+			},
+			TextKind::Completion(ifs) => {
+				let words = crate::bash::syntax::parse_completion_words(text, &ifs)
+					.map_err(|e| TextError { line: e.line, msg: BString::from(e.bash_msg()) })?;
+				ir::lower_completion_words(&words, text, mode).map_err(unsupported)?
 			},
 		};
 		let unit = Arc::new(unit);

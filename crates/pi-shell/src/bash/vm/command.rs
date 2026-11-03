@@ -72,6 +72,8 @@ impl ExecState {
 			wait_into: None,
 			via_command: false,
 			resume: false,
+			via_builtin: false,
+			force_errexit: false,
 			resumed: 0,
 		}
 	}
@@ -103,6 +105,8 @@ impl ExecState {
 			wait_into,
 			via_command,
 			resume,
+			via_builtin,
+			force_errexit,
 			resumed,
 		} = self;
 		*stage = Stage::Expand;
@@ -128,6 +132,8 @@ impl ExecState {
 		*exec_as = None;
 		*wait_into = None;
 		*via_command = false;
+		*via_builtin = false;
+		*force_errexit = false;
 		*resume = false;
 		*resumed = 0;
 	}
@@ -179,6 +185,16 @@ fn current_exec(vp: &Vproc) -> Option<&ExecState> {
 		.last()
 		.and_then(|f| f.scratch.as_ref())
 		.and_then(|s| s.exec.as_deref())
+}
+
+/// `builtin` invokes its builtin without the outer command's ignore-return
+/// flag.
+pub fn forces_errexit(vp: &Vproc, caller: usize) -> bool {
+	vp.frames
+		.get(caller)
+		.and_then(|frame| frame.scratch.as_ref())
+		.and_then(|scratch| scratch.exec.as_deref())
+		.is_some_and(|exec| exec.force_errexit)
 }
 
 /// Run (or resume) the simple command `op.a` of `unit`.
@@ -248,7 +264,17 @@ pub fn exec(
 					}
 					match res {
 						Ok(()) => {},
-						Err(super::redir::Halt::Flow(f)) => return f,
+						Err(super::redir::Halt::Flow(f)) => {
+							if let Flow::Exit(status) | Flow::Discard(status) = f
+								&& external_redirection(k, vp, cx)
+							{
+								let s = st(vp);
+								s.status = status;
+								s.stage = Stage::Finish;
+								continue;
+							}
+							return f;
+						},
 						Err(super::redir::Halt::Failed) => {
 							// A special builtin's redirection error ends a posix
 							// shell (`exec 9<missing`).
@@ -809,10 +835,8 @@ fn expand(
 	}
 	if xtrace::on(k, cx, vp) {
 		trace(k, vp, cx, unit, &cmd.assigns, line);
-		// Out before the command's redirections move stderr.
-		if let Some(fd) = exec::flush_out(k, vp) {
-			return Some(Flow::Block(WaitKey::Write { fd }));
-		}
+		// Complete PS4 before this command moves stderr with its redirections.
+		return Some(Flow::Call);
 	}
 	None
 }
@@ -1277,6 +1301,60 @@ fn resolve(
 	})
 }
 
+/// Bash performs an external command's redirections after forking; their
+/// expansion errors cannot unwind the parent. Classify without a PATH probe.
+fn external_redirection(k: &mut Kernel, vp: &Vproc, cx: &mut Cx<'_>) -> bool {
+	let mut path = std::mem::take(&mut k.path_buf);
+	path.clear();
+	if let Ok(Some(value)) = state::lookup(&k.root, cx.store, vp, b"PATH") {
+		path.extend_from_slice(value.as_scalar().unwrap_or_default());
+	}
+	let mut via = Via::Plain;
+	let mut args = current_argv(vp);
+	let external = (|| {
+		loop {
+			let Some(name) = args.first() else {
+				return false;
+			};
+			let has_slash = name.contains(&b'/');
+			if via == Via::Plain
+				&& matches!(
+					state::record(cx.store, vp, Key::Func(BStr::new(name))),
+					Ok(Some(Record::Func { .. }))
+				) {
+				return false;
+			}
+			let rctx = ResolveCtx { has_slash, via, path_var: BStr::new(&path) };
+			match resolve(k, cx, vp, name, exec::mode_of(vp), rctx) {
+				Ok(Resolved::Intrinsic(IntrinsicId::Command)) => {
+					args = &args[1..];
+					while args
+						.first()
+						.is_some_and(|arg| matches!(arg.as_slice(), b"--" | b"-p"))
+					{
+						args = &args[1..];
+					}
+					if args.first().is_none_or(|arg| arg.starts_with(b"-")) {
+						return false;
+					}
+					via = Via::Command;
+				},
+				Ok(Resolved::Intrinsic(IntrinsicId::Builtin)) => {
+					args = &args[1..];
+					if args.first().is_some_and(|arg| arg.as_slice() == b"--") {
+						args = &args[1..];
+					}
+					via = Via::Builtin;
+				},
+				Ok(Resolved::Intrinsic(_)) | Err(_) => return false,
+				Ok(_) => return via != Via::Builtin,
+			}
+		}
+	})();
+	k.path_buf = path;
+	external
+}
+
 /// Resolve the command name: `command`/`builtin` prefixes, functions,
 /// the host's table, then a PATH search through the pollable `Fs`.
 fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flow> {
@@ -1383,6 +1461,12 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 					} else {
 						Via::Command
 					};
+					let s = st(vp);
+					if !s.via_builtin {
+						s.via_command = true;
+					} else if !s.via_command {
+						s.force_errexit = true;
+					}
 				},
 				Resolved::Intrinsic(IntrinsicId::Builtin) if argv.len() > 1 => {
 					argv.remove(0);
@@ -1395,7 +1479,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 						let msg = format!("-{}: invalid option", argv[0][1] as char).into();
 						let line = line_of(vp, op.node);
 						k.diag(cx, vp, line, Diag::Usage { msg }.by("builtin"));
-						vp.out.push_back(PendingWrite {
+						vp.queue_output(PendingWrite {
 							fd:    2,
 							bytes: BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
 							off:   0,
@@ -1406,6 +1490,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 						return None;
 					}
 					via = Via::Builtin;
+					st(vp).via_builtin = true;
 				},
 				_ if via == Via::Builtin && !matches!(resolved, Resolved::Intrinsic(_)) => {
 					let name = argv[0].clone();
@@ -1430,7 +1515,12 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 		k.path_buf = path;
 		let s = st(vp);
 		s.target = Some(target);
-		s.via_command = matches!(via, Via::Command | Via::CommandP);
+		s.force_errexit |= s.via_builtin
+			&& !s.via_command
+			&& matches!(
+				s.target,
+				Some(Target::Intrinsic(IntrinsicId::Eval | IntrinsicId::Source | IntrinsicId::Dot))
+			);
 	}
 	if st(vp).target == Some(Target::Search) {
 		// File-system probes: `CmdExpanded` reads the clock after them.
@@ -2618,7 +2708,7 @@ fn run_builtin(
 			return Some(flow);
 		}
 		let log = std::mem::take(&mut sc.logs[Slot::Builtin as usize]);
-		let (res, log) = {
+		let (res, log, mut chunks) = {
 			let e = sc.exec.as_ref().expect("exec");
 			let mut ctx = Ctx::new(k, cx, vp, sc.probes(), line, name);
 			ctx.log = log;
@@ -2629,16 +2719,27 @@ fn run_builtin(
 			// Not through `command`.
 			let fatal = ctx.usage_error && !e.via_command;
 			let log = std::mem::take(&mut ctx.log);
-			(r.map(|o| (o, ctx.chunks, fatal)), log)
+			(r.map(|o| (o, fatal)), log, ctx.chunks)
 		};
 		// The slot still holds the empty `Vec` `take` left there (the
 		// builtin has only `sc.probes()`): no drop of that placeholder.
 		let placeholder = std::mem::replace(&mut sc.logs[Slot::Builtin as usize], log);
 		debug_assert_eq!(placeholder.capacity(), 0, "builtin log placeholder");
 		std::mem::forget(placeholder);
+		if res.is_err() {
+			for chunk in chunks.drain(..) {
+				let (fd, bytes) = match chunk {
+					Chunk::Out(fd, bytes) => (fd, bytes),
+					Chunk::Diag(diag) => (2, k.render_diag(cx, vp, line, &diag)),
+				};
+				vp.queue_output(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+			}
+		}
 		match res {
-			Ok((mut outcome, chunks, fatal)) => {
-				sc.logs[Slot::Builtin as usize].clear();
+			Ok((mut outcome, fatal)) => {
+				if !matches!(outcome.control, Control::Resume) {
+					sc.logs[Slot::Builtin as usize].clear();
+				}
 				// A special builtin's usage error ends a posix shell.
 				if fatal
 					&& outcome.status != 0
@@ -2649,16 +2750,18 @@ fn run_builtin(
 				{
 					outcome.control = Control::Exit;
 				}
+				let calls = matches!(outcome.control, Control::Frame | Control::Resume);
 				for c in chunks {
 					let (fd, bytes) = match c {
 						Chunk::Out(fd, b) => (fd, b),
 						Chunk::Diag(d) => (2, k.render_diag(cx, vp, line, &d)),
 					};
-					sc.exec
-						.as_mut()
-						.expect("exec")
-						.writes
-						.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+					let write = PendingWrite { fd, bytes: bytes.into(), off: 0 };
+					if calls {
+						vp.queue_output(write);
+					} else {
+						sc.exec.as_mut().expect("exec").writes.push_back(write);
+					}
 				}
 				let e = sc.exec.as_mut().expect("exec");
 				e.status = outcome.status;
@@ -2733,6 +2836,11 @@ fn run_builtin(
 				vp.frames.last_mut().expect("frame").scratch = Some(sc);
 				k.fail(err);
 				return Some(Flow::Discard(1));
+			},
+			Err(Need::Command(text)) => {
+				let flow = exec::start_builtin_sub(k, vp, cx, &mut sc, &text, line);
+				vp.frames.last_mut().expect("frame").scratch = Some(sc);
+				return Some(flow);
 			},
 			Err(Need::Sub(stop @ (Stop::ZshSub { .. } | Stop::Probe(_)))) => {
 				if let Some(flow) = builtin_zsh_stop(k, vp, cx, sc, line, stop) {
@@ -3283,7 +3391,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		.and_then(|f| f.scratch.take())
 		.expect("exec scratch");
 	let e = sc.exec.as_ref().expect("exec");
-	let (status, t0, control) = (e.status, e.t0, e.control);
+	let (status, t0, control, force_errexit) = (e.status, e.t0, e.control, e.force_errexit);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
 	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
@@ -3299,6 +3407,13 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		let dur_ns = if t0 > 0 { end.saturating_sub(t0) } else { 0 };
 		let data = EventData::CmdEnd { status, dur_ns, pipestatus: &[] };
 		k.emit_op_at(cx, vp, op.node, data, end);
+	}
+	if force_errexit
+		&& status != 0
+		&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Errexit)
+			.unwrap_or(false)
+	{
+		return Flow::Exit(status);
 	}
 	match control {
 		None => Flow::Next,
@@ -3339,7 +3454,7 @@ fn print_exit_value(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32
 		&& on(k, cx, vp, ZshOpt::Shinstdin)
 	{
 		let bytes = BString::from(format!("zsh: exit {status}\n"));
-		vp.out.push_back(PendingWrite { fd: 2, bytes, off: 0 });
+		vp.queue_output(PendingWrite { fd: 2, bytes, off: 0 });
 	}
 }
 

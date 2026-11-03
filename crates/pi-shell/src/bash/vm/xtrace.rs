@@ -6,12 +6,18 @@ use bstr::BString;
 
 use super::{
 	Cx, Kernel, TextKind,
-	expand::Expander,
+	exec::{self, Flow},
+	expand::{Expander, Stop},
 	locale,
-	proc::{AssignValue, FrameKind, PendingWrite, ScriptKind, Vproc},
+	proc::{
+		AssignValue, Atom, FrameKind, PendingSub, PendingWrite, Scratch, ScriptKind, Slot, Vproc,
+	},
 	quote, state,
 };
-use crate::bash::store::OptId;
+use crate::bash::{
+	fd::FdRef,
+	store::{KeyBuf, OptId, Record, StateStore},
+};
 
 /// bash's `indirection_level` in `vp`: 1 at the top, one more per `eval`,
 /// `.` file and trap action running, plus the level the vproc started at
@@ -122,15 +128,154 @@ pub fn cond(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, terms: &
 	emit(k, cx, vp, line, &body);
 }
 
-/// Queue one trace line: the `PS4` prefix, `body`, a newline. It goes out
-/// with the shell's other diagnostics, before the command's redirections.
+/// A trace line whose prompt may park on command substitutions. It belongs
+/// to one frame depth, so a no-fork prompt substitution can run above it.
+pub struct Pending {
+	pub target:       Option<FdRef>,
+	pub fd:           i32,
+	pub body:         BString,
+	pub ps4:          BString,
+	pub line:         u32,
+	pub depth:        usize,
+	pub level:        u32,
+	pub log:          Vec<Atom>,
+	pub sub:          Option<PendingSub>,
+	pub saved_xtrace: Option<bool>,
+	pub status:       i32,
+}
+
+/// Queue one trace line before the command's redirections. Literal prefixes
+/// stay on the direct path; only a prompt expansion needs scheduler state.
 pub fn emit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, body: &[u8]) {
-	let mut bytes = prefix(k, cx, vp, line);
-	bytes.extend_from_slice(body);
-	bytes.push(b'\n');
+	let ps4 = state::lookup(&k.root, cx.store, vp, b"PS4")
+		.ok()
+		.flatten()
+		.and_then(|v| v.as_scalar().map(BString::from))
+		.unwrap_or_default();
 	let fd = trace_fd(k, cx, vp);
-	vp.out
-		.push_back(PendingWrite { fd, bytes: BString::from(bytes), off: 0 });
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& ps4.iter().any(|c| matches!(c, b'$' | b'`' | b'\\'))
+	{
+		let target = vp.fds.get(fd).cloned();
+		let body = if target.is_some() {
+			BString::from(body)
+		} else {
+			BString::default()
+		};
+		vp.traces.push_back(Pending {
+			target,
+			fd,
+			body,
+			ps4,
+			line,
+			depth: vp.frames.len(),
+			level: level(vp),
+			log: Vec::new(),
+			sub: None,
+			saved_xtrace: None,
+			status: vp.status,
+		});
+		return;
+	}
+	let prefix = if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		zsh_prefix(k, cx, vp, line, &ps4).unwrap_or_else(|| ps4.to_vec())
+	} else {
+		repeated(&ps4, level(vp))
+	};
+	let bytes = trace_line(prefix, body);
+	vp.queue_output(PendingWrite { fd, bytes, off: 0 });
+}
+
+fn trace_line(mut prefix: Vec<u8>, body: &[u8]) -> BString {
+	prefix.extend_from_slice(body);
+	prefix.push(b'\n');
+	BString::from(prefix)
+}
+
+/// Advance a pending prefix, or let a no-fork substitution's newer frame
+/// run. `Call` means retry the scheduler (including its output flush).
+pub fn poll(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<Flow> {
+	let depth = vp.frames.len();
+	let index = vp.traces.iter().position(|p| p.depth == depth)?;
+	let mut p = vp.traces.remove(index).expect("trace index");
+	if p.saved_xtrace.is_none() {
+		p.saved_xtrace = Some(on(k, cx, vp));
+		set_xtrace(k, cx, vp, false);
+	}
+	let mut scratch = Scratch::default();
+	scratch.sub = p.sub.take();
+	scratch.logs[Slot::Words as usize] = std::mem::take(&mut p.log);
+	let flow = if let Some(flow) = exec::settle_sub(k, vp, cx, &mut scratch, Slot::Words) {
+		Some(flow)
+	} else {
+		let mode = exec::mode_of(vp);
+		let result = k
+			.engine
+			.text_unit(b"${PS4@P}", TextKind::HereDoc, mode)
+			.ok()
+			.and_then(|unit| unit.words.last().cloned().map(|word| (unit, word)))
+			.map(|(unit, word)| {
+				let mut ex =
+					Expander::new(k, cx, vp, &mut scratch.logs[Slot::Words as usize], true, p.line);
+				ex.scalar(&unit, &word)
+			});
+		match result {
+			Some(Err(Stop::Sub { unit, entry, form, text })) => {
+				Some(exec::start_sub(k, vp, cx, &mut scratch, exec::Sub {
+					unit,
+					entry,
+					form,
+					text,
+					line: p.line,
+				}))
+			},
+			Some(Err(Stop::Wait(key))) => Some(Flow::Block(key)),
+			result => {
+				let expanded = result.and_then(Result::ok).unwrap_or_else(|| p.ps4.clone());
+				if let Some(target) = p.target {
+					let bytes = trace_line(repeated(&expanded, p.level), &p.body);
+					vp.out
+						.push_back((target, PendingWrite { fd: p.fd, bytes, off: 0 }));
+				}
+				if p.saved_xtrace == Some(true) {
+					set_xtrace(k, cx, vp, true);
+				}
+				vp.status = p.status;
+				return Some(Flow::Call);
+			},
+		}
+	};
+	p.sub = scratch.sub.take();
+	p.log = std::mem::take(&mut scratch.logs[Slot::Words as usize]);
+	vp.traces.insert(index, p);
+	flow
+}
+
+fn set_xtrace(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, enabled: bool) {
+	state::store_record(
+		&mut k.root,
+		cx.store,
+		vp,
+		KeyBuf::Opt(OptId::Xtrace),
+		Some(Record::Opt(enabled)),
+	);
+	if let Err(err) = state::sync_option_vars(&mut k.root, cx.store, vp) {
+		k.fail(err);
+	}
+}
+
+/// Drop prefixes owned by frames that were abandoned. Restoring the flag
+/// here also covers a control transfer out of a no-fork PS4 substitution.
+pub fn unwind(root: &mut state::Root, store: &mut dyn StateStore, vp: &mut Vproc, keep: usize) {
+	while let Some(index) = vp.traces.iter().rposition(|p| p.depth > keep) {
+		let pending = vp.traces.remove(index).expect("trace index");
+		if pending.saved_xtrace == Some(true) {
+			state::store_record(root, store, vp, KeyBuf::Opt(OptId::Xtrace), Some(Record::Opt(true)));
+			if let Err(err) = state::sync_option_vars(root, store, vp) {
+				root.fail(err);
+			}
+		}
+	}
 }
 
 /// `BASH_XTRACEFD` when it names an open descriptor, else 2.
@@ -144,33 +289,15 @@ fn trace_fd(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> i32 {
 		.unwrap_or(2)
 }
 
-/// `PS4` expanded as a prompt (`${PS4@P}`; as it is when the expansion
-/// would need a command substitution), its first character repeated to
-/// the nesting [`level`]. Unset or empty: no prefix.
-fn prefix(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Vec<u8> {
-	let ps4 = state::lookup(&k.root, cx.store, vp, b"PS4")
-		.ok()
-		.flatten()
-		.and_then(|v| v.as_scalar().map(BString::from))
-		.unwrap_or_default();
-	if ps4.is_empty() {
-		return Vec::new();
-	}
-	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
-		return zsh_prefix(k, cx, vp, line, &ps4).unwrap_or_else(|| ps4.to_vec());
-	}
-	let expanded = if ps4.iter().any(|c| matches!(c, b'$' | b'`' | b'\\')) {
-		expand_ps4(k, cx, vp, line).unwrap_or(ps4)
-	} else {
-		ps4
-	};
+/// Repeat the first prompt byte per indirection level.
+fn repeated(expanded: &[u8], level: u32) -> Vec<u8> {
 	let mut out = Vec::with_capacity(expanded.len() + 4);
 	if let Some(&first) = expanded.first() {
-		for _ in 1..level(vp) {
+		for _ in 1..level {
 			out.push(first);
 		}
 	}
-	out.extend_from_slice(&expanded);
+	out.extend_from_slice(expanded);
 	out
 }
 
@@ -199,16 +326,4 @@ fn zsh_prefix(
 	};
 	let env = zsh_print::prompt_env_ex(&mut ex, site, percent, bang).ok()?;
 	Some(crate::bash::vm::builtins::zsh_prompt::promptexpand(&text, &env))
-}
-
-fn expand_ps4(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Option<BString> {
-	let mode = super::exec::mode_of(vp);
-	let tunit = k
-		.engine
-		.text_unit(b"${PS4@P}", TextKind::HereDoc, mode)
-		.ok()?;
-	let w = tunit.words.last().cloned()?;
-	let mut log = Vec::new();
-	let mut ex = Expander::new(k, cx, vp, &mut log, false, line);
-	ex.scalar(&tunit, &w).ok()
 }

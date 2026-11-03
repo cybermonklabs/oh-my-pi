@@ -253,14 +253,10 @@ fn launch(
 		},
 	};
 	if let Some(text) = args.listing_text() {
-		child
-			.out
-			.push_back(PendingWrite { fd: 1, bytes: text.into(), off: 0 });
+		child.queue_output(PendingWrite { fd: 1, bytes: text.into(), off: 0 });
 	}
 	if !notes.is_empty() {
-		child
-			.out
-			.push_back(PendingWrite { fd: 2, bytes: notes.into(), off: 0 });
+		child.queue_output(PendingWrite { fd: 2, bytes: notes.into(), off: 0 });
 	}
 	let mut kind = FrameKind::script(src, crate::bash::syntax::Pos::START, ScriptKind::Run);
 	if let FrameKind::Script { stdin: s, .. } = &mut kind {

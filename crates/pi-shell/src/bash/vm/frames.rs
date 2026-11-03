@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 29;
+pub const FRAMES_VERSION: u32 = 32;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -236,42 +236,44 @@ impl FdRebuild<'_> {
 /// (`state::sync_root`), so the root's image has none.
 #[derive(Serialize, Deserialize)]
 struct ProcImage {
-	vpid:          Vpid,
-	parent:        Option<Vpid>,
-	runs:          Vec<RunImage>,
-	frames:        Vec<FrameImage>,
+	vpid:             Vpid,
+	parent:           Option<Vpid>,
+	runs:             Vec<RunImage>,
+	frames:           Vec<FrameImage>,
 	/// Fd object index of every slot.
-	fds:           Vec<Option<u32>>,
+	fds:              Vec<Option<u32>>,
 	/// A subshell's own state (`None` for the root vproc).
-	fields:        Option<Fields>,
-	out:           Vec<PendingWrite>,
-	pending_traps: SigSet,
-	stopped:       bool,
-	transient:     bool,
-	procsubs:      Vec<(u32, i32)>,
-	coprocs:       Vec<super::proc::Coproc>,
-	restore_opts:  Vec<BString>,
-	trace_base:    u32,
+	fields:           Option<Fields>,
+	out:              Vec<(u32, PendingWrite)>,
+	traces:           Vec<TraceImage>,
+	unwound_children: Vec<Vpid>,
+	pending_traps:    SigSet,
+	stopped:          bool,
+	transient:        bool,
+	procsubs:         Vec<(u32, i32)>,
+	coprocs:          Vec<super::proc::Coproc>,
+	restore_opts:     Vec<BString>,
+	trace_base:       u32,
 	/// `$BASH_SUBSHELL`.
-	subshell:      u32,
+	subshell:         u32,
 	/// `BASH_COMMAND`: the unit (written to the store) and syntax node; a
 	/// trap action that runs after the restore still names the trapped
 	/// command.
-	command:       Option<(UnitId, u32)>,
+	command:          Option<(UnitId, u32)>,
 	/// Pushes onto bash's call-stack arrays.
-	calls:         Vec<super::callstack::Call>,
+	calls:            Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
-	own_traps:     super::proc::OwnTraps,
+	own_traps:        super::proc::OwnTraps,
 	/// Current mode (the root's is also `MiscKey::Mode`).
-	mode:          ModeId,
+	mode:             ModeId,
 	/// zsh state (sticky emulation, frames' restores).
-	zsh:           Option<Box<super::proc::VprocZsh>>,
+	zsh:              Option<Box<super::proc::VprocZsh>>,
 	/// Host lineage (a detached tree stays detached after a restore).
-	lineage:       crate::bash::host::Lineage,
+	lineage:          crate::bash::host::Lineage,
 	/// What the vproc was parked on and the wake count then: a restored
 	/// shell schedules exactly as the externalized one would have (no
 	/// second `Blocked`, same interleaving).
-	blocked:       Option<(WaitKey, u64)>,
+	blocked:          Option<(WaitKey, u64)>,
 }
 
 /// A subshell vproc's state that the root vproc keeps in the store.
@@ -323,6 +325,7 @@ struct FrameImage {
 	return_trap_local: bool,
 	err_reported:      bool,
 	ignore_errexit:    bool,
+	errexit_disabled:  bool,
 	subshell_line:     Option<u32>,
 	getopts:           super::proc::GetoptsState,
 }
@@ -341,6 +344,22 @@ enum SubImage {
 	NoFork { value: bool, capture: u32 },
 }
 
+/// A trace prompt's replay state, including its pinned output and capture.
+#[derive(Serialize, Deserialize)]
+struct TraceImage {
+	target:       Option<u32>,
+	fd:           i32,
+	body:         BString,
+	ps4:          BString,
+	line:         u32,
+	depth:        usize,
+	level:        u32,
+	log:          Vec<Atom>,
+	sub:          Option<SubImage>,
+	saved_xtrace: Option<bool>,
+	status:       i32,
+}
+
 #[derive(Serialize, Deserialize)]
 struct ScratchImage {
 	/// The external the exec waits for was running (reported lost); an
@@ -348,6 +367,7 @@ struct ScratchImage {
 	ext_live:     bool,
 	logs:         [Vec<Atom>; 4],
 	sub:          Option<SubImage>,
+	traced:       bool,
 	exec:         Option<ExecState>,
 	redir_done:   usize,
 	redir_target: Option<BString>,
@@ -419,6 +439,7 @@ fn scratch_image(
 	ScratchImage {
 		ext_live: matches!(sc.live, Live::Ext(_)),
 		logs: sc.logs.clone(),
+		traced: sc.traced,
 		sub: sc.sub.as_ref().map(|s| match s {
 			PendingSub::Fork { vpid, capture } => {
 				SubImage::Fork { vpid: *vpid, capture: fds.capture(capture) }
@@ -529,6 +550,7 @@ impl Shell {
 					return_trap_local: f.return_trap_local,
 					err_reported: f.err_reported,
 					ignore_errexit: f.ignore_errexit,
+					errexit_disabled: f.errexit_disabled,
 					subshell_line: f.subshell_line,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
 				});
@@ -576,7 +598,36 @@ impl Shell {
 				frames,
 				fds: slots,
 				fields,
-				out: p.out.iter().cloned().collect(),
+				out: p
+					.out
+					.iter()
+					.map(|(fd, w)| (fds.fd(fd), w.clone()))
+					.collect(),
+				traces: p
+					.traces
+					.iter()
+					.map(|p| TraceImage {
+						target:       p.target.as_ref().map(|target| fds.fd(target)),
+						fd:           p.fd,
+						body:         p.body.clone(),
+						ps4:          p.ps4.clone(),
+						line:         p.line,
+						depth:        p.depth,
+						level:        p.level,
+						log:          p.log.clone(),
+						sub:          p.sub.as_ref().map(|s| match s {
+							PendingSub::Fork { vpid, capture } => {
+								SubImage::Fork { vpid: *vpid, capture: fds.capture(capture) }
+							},
+							PendingSub::NoFork { value, capture } => {
+								SubImage::NoFork { value: *value, capture: fds.capture(capture) }
+							},
+						}),
+						saved_xtrace: p.saved_xtrace,
+						status:       p.status,
+					})
+					.collect(),
+				unwound_children: p.unwound_children.clone(),
 				pending_traps: p.pending_traps,
 				stopped: p.stopped,
 				transient: p.transient,
@@ -802,7 +853,36 @@ impl Shell {
 				vp.rlimits.clone_from(&loaded.rlimits);
 				vp
 			};
-			vp.out = p.out.into();
+			vp.out = p
+				.out
+				.into_iter()
+				.map(|(fd, w)| (objs.fd(cx.host, fd), w))
+				.collect();
+			vp.traces = p
+				.traces
+				.into_iter()
+				.map(|p| super::xtrace::Pending {
+					target:       p.target.map(|target| objs.fd(cx.host, target)),
+					fd:           p.fd,
+					body:         p.body,
+					ps4:          p.ps4,
+					line:         p.line,
+					depth:        p.depth,
+					level:        p.level,
+					log:          p.log,
+					sub:          p.sub.map(|s| match s {
+						SubImage::Fork { vpid, capture } => {
+							PendingSub::Fork { vpid, capture: objs.capture(capture) }
+						},
+						SubImage::NoFork { value, capture } => {
+							PendingSub::NoFork { value, capture: objs.capture(capture) }
+						},
+					}),
+					saved_xtrace: p.saved_xtrace,
+					status:       p.status,
+				})
+				.collect();
+			vp.unwound_children = p.unwound_children;
 			vp.pending_traps = p.pending_traps;
 			vp.stopped = p.stopped;
 			vp.procsubs = p.procsubs;
@@ -936,6 +1016,7 @@ impl Shell {
 						};
 						Some(Box::new(Scratch {
 							logs: img.logs,
+							traced: img.traced,
 							sub: img.sub.map(|s| match s {
 								SubImage::Fork { vpid, capture } => {
 									PendingSub::Fork { vpid, capture: objs.capture(capture) }
@@ -973,6 +1054,7 @@ impl Shell {
 				frame.return_trap_local = f.return_trap_local;
 				frame.err_reported = f.err_reported;
 				frame.ignore_errexit = f.ignore_errexit;
+				frame.errexit_disabled = f.errexit_disabled;
 				frame.subshell_line = f.subshell_line;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));

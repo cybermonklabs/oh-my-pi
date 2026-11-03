@@ -297,6 +297,8 @@ pub enum TextMode {
 	/// Here-document body with an unquoted delimiter: like
 	/// [`TextMode::DoubleQuote`] except that `\"` stays as written.
 	HereDoc,
+	/// A completion word: unquoted expansion, with shell operators literal.
+	Completion,
 }
 
 /// Parse `src` as one word in `mode`, for expansion by the engine.
@@ -310,6 +312,16 @@ pub fn parse_text(src: &[u8], feat: Features, mode: TextMode) -> Result<Word, Pa
 	let mut word = p.text_word(mode)?;
 	finish::finish_word(&mut word, &p.docs);
 	Ok(word)
+}
+
+/// Split a completion word list on unquoted `ifs` characters, retaining
+/// quotes for expansion and accepting unfinished quotes as Bash does.
+pub fn parse_completion_words(src: &[u8], ifs: &[u8]) -> Result<Vec<Word>, ParseError> {
+	let mut p = Parser::new(src, Features::NONE, NO_ALIASES);
+	p.virt = 0;
+	let mut words = p.completion_words(ifs)?;
+	finish::finish_words(&mut words, &p.docs);
+	Ok(words)
 }
 
 impl<'s> Parser<'s> {

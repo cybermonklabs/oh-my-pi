@@ -82,6 +82,13 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				None => unblock(k, cx, vp),
 			}
 		}
+		if let Some(flow) = super::xtrace::poll(k, cx, vp) {
+			match flow {
+				Flow::Block(key) => return park(k, cx, vp, key, k.ctl.wakes()),
+				Flow::Call => continue,
+				_ => unreachable!("trace expansion only calls or parks"),
+			}
+		}
 		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY && !vp.waiting_foreground() {
 			let pending = vp.pending_traps.iter().find(|sig| {
 				!vp.frames.iter().any(|frame| {
@@ -115,6 +122,13 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			continue;
 		}
 		let Some(top) = vp.frames.last() else {
+			while let Some(&child) = vp.unwound_children.last() {
+				let at = k.ctl.wakes();
+				if k.proc_collect(cx.store, child).is_none() {
+					return park(k, cx, vp, WaitKey::Proc(child), at);
+				}
+				vp.unwound_children.pop();
+			}
 			if !run_boundary(k, vp, cx) {
 				return;
 			}
@@ -197,13 +211,18 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			k.clock_stale();
 		}
 		let flow = dispatch(k, vp, cx, unit, op);
-		let ignore_errexit =
-			op.flags & Op::COND != 0 || vp.frames.get(fi).is_some_and(|frame| frame.ignore_errexit);
+		let ignore_errexit = (op.flags & Op::COND != 0
+			|| vp.frames.get(fi).is_some_and(|frame| frame.ignore_errexit))
+			&& !super::command::forces_errexit(vp, fi);
 		if matches!(flow, Flow::Call) && ignore_errexit {
-			// Frames the op pushed (function, `eval`, `source`, `${ ;}`)
-			// run in its context.
+			// eval/source disable -e; a conditional function only ignores
+			// statuses.
 			for frame in vp.frames.iter_mut().skip(fi + 1) {
 				frame.ignore_errexit = true;
+				frame.errexit_disabled |= matches!(frame.kind, FrameKind::Script {
+					what: ScriptKind::Eval | ScriptKind::Source,
+					..
+				});
 			}
 		}
 		// An `exit N` in the cancel trap is `exit_shell`'s (the EXIT trap, then
@@ -222,7 +241,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				},
 				Opcode::CallAnon => !vp.frames.get(fi).is_some_and(|frame| frame.err_reported),
 				Opcode::Redir => matches!(flow, Flow::Jump(_)),
-				Opcode::Leave | Opcode::Arith | Opcode::CondTest => {
+				Opcode::Leave => unit.nodes.get(op.node as usize).is_some_and(|node| {
+					matches!(node.kind, NodeKind::Cond | NodeKind::Arith | NodeKind::Subshell)
+				}),
+				Opcode::Arith | Opcode::CondTest => {
 					!vp.frames.get(fi).is_some_and(|frame| frame.err_reported)
 				},
 				_ => false,
@@ -339,7 +361,14 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			Flow::Discard(status) if unit.mode.dialect() == Dialect::Zsh => {
 				zsh_discard(k, vp, cx, status);
 			},
+			Flow::Discard(status) if super::nested::in_subshell(cx.store, vp) => {
+				// A subshell's top level catches DISCARD, not an eval/source inside
+				// it.
+				exit_shell(k, vp, cx, status);
+			},
 			Flow::Discard(status) => {
+				finish_times(k, vp, cx);
+				preserve_foreground(vp);
 				vp.status = status;
 				// bash's `parse_and_execute` (the script, `-c`, `eval`, `.`,
 				// a trap action) catches the jump: the innermost script goes
@@ -495,6 +524,9 @@ fn in_function_scope(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 
 /// Whether `set -e` is on for `vp`.
 fn errexit_on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	if vp.frames.iter().any(|frame| frame.errexit_disabled) {
+		return false;
+	}
 	match state::option(&mut k.root, cx.store, vp, OptId::Errexit) {
 		Ok(on) => on,
 		Err(err) => {
@@ -542,6 +574,8 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 		}
 		return;
 	}
+	finish_times(k, vp, cx);
+	preserve_foreground(vp);
 	unwind(&mut k.root, cx.store, vp, 0);
 	if !in_exit_trap && vp.transient && vp.runs.is_empty() {
 		start_trap(k, vp, cx, TrapKey::Exit);
@@ -673,8 +707,8 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 /// on a diagnostic stream are dropped, as bash does.
 pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	let mut cx = Context::from_waker(&k.waker);
-	while let Some(w) = vp.out.front_mut() {
-		match vp.fds.handle(w.fd).poll_write(&mut cx, &w.bytes[w.off..]) {
+	while let Some((target, w)) = vp.out.front_mut() {
+		match target.poll_write(&mut cx, &w.bytes[w.off..]) {
 			Poll::Ready(Ok(n)) if n > 0 => {
 				w.off += n;
 				if w.off >= w.bytes.len() {
@@ -688,6 +722,43 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 		}
 	}
 	None
+}
+
+/// Foreground stages still belong to the run after its lastpipe frame unwinds.
+fn preserve_foreground(vp: &mut Vproc) {
+	for frame in &mut vp.frames {
+		if let Some(sc) = frame.scratch.as_mut() {
+			for (child, status) in sc.children.drain(..) {
+				if status.is_none() {
+					vp.unwound_children.push(child);
+				}
+			}
+		}
+	}
+}
+
+/// Unwinding through time_command still prints its report, on its own stderr.
+fn finish_times(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
+	for index in (0..vp.frames.len()).rev() {
+		let mut after = vp.frames[index].pc as usize;
+		while let Some(start) = vp.frames[index].times.pop() {
+			let Some(unit) = vp.frames[index].unit.clone() else {
+				break;
+			};
+			let Some((pc, &op)) = unit
+				.ops
+				.iter()
+				.enumerate()
+				.skip(after)
+				.find(|(_, op)| op.code == Opcode::TimeEnd)
+			else {
+				break;
+			};
+			after = pc + 1;
+			let line = line_of(vp, op.node);
+			time_end(k, vp, cx, &unit, op, start, line);
+		}
+	}
 }
 
 /// Grammar switches from the current options.
@@ -1080,6 +1151,7 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 		restore(vp, saves);
 	}
 	let keep = vp.frames.len();
+	super::xtrace::unwind(root, store, vp, keep);
 	close_procsubs(vp, keep);
 	super::callstack::truncate(vp, keep);
 	if f.kind == FrameKind::NoFork {
@@ -1350,7 +1422,9 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 		break;
 	}
 	// bash's `check_loop_level` complains only outside posix mode.
-	if !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
+	if vp.parent.is_none()
+		&& !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false)
+	{
 		let line = line_of(vp, op.node);
 		let name = if cont { "continue" } else { "break" };
 		let diag = Diag::Usage { msg: "only meaningful in a `for', `while', or `until' loop".into() };
@@ -1479,6 +1553,27 @@ fn posix_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 		)
 }
 
+/// Bash's report_error exits immediately under -e, even in a conditional
+/// function.
+pub fn report_error(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	diag: Diag,
+) -> Flow {
+	k.diag(cx, vp, line, diag);
+	if errexit_on(k, cx, vp) {
+		// report_error does not unwind through time_command.
+		for frame in &mut vp.frames {
+			frame.times.clear();
+		}
+		Flow::Exit(if vp.status == 0 { 1 } else { vp.status })
+	} else {
+		Flow::Discard(1)
+	}
+}
+
 /// The flow for an expansion error (the diagnostic is printed).
 pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, stop: Stop) -> Flow {
 	match stop {
@@ -1491,6 +1586,9 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			k.diag(cx, vp, line, Diag::Unsupported { what: "`=cmd` in this expansion".into() });
 			Flow::Discard(1)
 		},
+		Stop::Fail(
+			d @ (Diag::InvalidVarName { .. } | Diag::InvalidIndirect { .. } | Diag::NoMatch { .. }),
+		) => report_error(k, vp, cx, line, d),
 		// A non-interactive posix shell exits on an expansion error (bash's
 		// `posixly_correct && !interactive_shell`), as on a fatal one.
 		Stop::Fail(d) if !posix_exits(k, cx, vp) => {
@@ -1502,7 +1600,8 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			// bash exits 127 from a `-c` string (`run_one_command`), 1 from a
 			// script and from a subshell (`execute_in_subshell` keeps the
 			// failure status); a nested shell (depth 0) is its own `-c` shell.
-			let command = super::subshell_depth(vp) == 0
+			let command = !errexit_on(k, cx, vp)
+				&& super::subshell_depth(vp) == 0
 				&& matches!(
 					state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
 					Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
@@ -1699,10 +1798,50 @@ pub fn start_zsh_sub(
 	text: &[u8],
 	line: u32,
 ) -> Flow {
+	start_text_sub(k, vp, cx, sc, text, line, false)
+}
+
+/// A completion command is a command-substitution child, including its -e
+/// policy.
+pub fn start_builtin_sub(
+	k: &mut Kernel,
+	vp: &Vproc,
+	cx: &mut Cx<'_>,
+	sc: &mut Scratch,
+	text: &[u8],
+	line: u32,
+) -> Flow {
+	start_text_sub(k, vp, cx, sc, text, line, true)
+}
+
+fn start_text_sub(
+	k: &mut Kernel,
+	vp: &Vproc,
+	cx: &mut Cx<'_>,
+	sc: &mut Scratch,
+	text: &[u8],
+	line: u32,
+	bash: bool,
+) -> Flow {
 	let capture = Capture::default();
 	let mut fds = vp.fds.clone();
 	fds.set(1, Some(FdRef::mem(capture.clone())));
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	if bash
+		&& !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false)
+		&& !state::option(&mut k.root, cx.store, vp, OptId::InheritErrexit).unwrap_or(false)
+	{
+		state::store_record(
+			&mut k.root,
+			cx.store,
+			&mut child,
+			KeyBuf::Opt(OptId::Errexit),
+			Some(Record::Opt(false)),
+		);
+		if let Err(err) = state::sync_option_vars(&mut k.root, cx.store, &mut child) {
+			k.fail(err);
+		}
+	}
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
@@ -2108,6 +2247,16 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				top_frame(vp).redirs.push(saves);
 				Flow::Next
 			},
+			Err(redir::Halt::Flow(Flow::Exit(status) | Flow::Discard(status)))
+				if unit
+					.nodes
+					.get(op.node as usize)
+					.is_some_and(|node| node.kind == NodeKind::Subshell) =>
+			{
+				clear_scratch(&mut k.root, cx.store, vp);
+				vp.status = status;
+				Flow::Jump(op.b)
+			},
 			Err(redir::Halt::Flow(f)) => f,
 			Err(redir::Halt::Failed) => {
 				// The message goes to stderr as the redirections so far left
@@ -2165,17 +2314,26 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				.nodes
 				.get(op.node as usize)
 				.is_some_and(|n| n.kind == NodeKind::ArithFor);
-			// One inlined pass (each `<[u8]>::contains` is a call).
-			let record = text.iter().any(|&c| c == b'$' || c == b'`');
+			let tracing = super::xtrace::on(k, cx, vp) && !scratch(vp).traced;
+			// Staging the trace replays expansion too, even when the text's
+			// side effects do not themselves need a command substitution.
+			let record = text.iter().any(|&c| c == b'$' || c == b'`') || tracing || scratch(vp).traced;
+			if tracing {
+				let expanded = match expanding(k, vp, cx, Slot::Words, true, line, |ex| {
+					ex.arith_cmd = Some("((");
+					ex.expand_text(text).map(|text| text.into_owned())
+				}) {
+					Ok(text) => text,
+					Err(flow) => return flow,
+				};
+				scratch(vp).traced = true;
+				trace_arith(k, cx, vp, line, &expanded, arith_for);
+				return Flow::Call;
+			}
 			let res = expanding(k, vp, cx, Slot::Words, record, line, |ex| {
 				// Warnings carry the command's name.
 				ex.arith_cmd = Some("((");
 				let expanded = ex.expand_text(text)?;
-				// bash traces the expanded text before evaluating it (a
-				// replay after a parked substitution gets here once).
-				if super::xtrace::on(ex.k, ex.cx, ex.vp) {
-					trace_arith(ex.k, ex.cx, ex.vp, line, &expanded, arith_for);
-				}
 				match ex.arith_eval(&expanded) {
 					Ok(v) => Ok(Ok(v)),
 					// An error in a subscript abandons the line (an expansion
@@ -2199,14 +2357,26 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					};
 					k.diag(cx, vp, line, d);
 					vp.status = 1;
-					// `((…))` continues; an arith-for header error leaves the
-					// loop (approximated by discarding the command).
-					if unit
-						.nodes
-						.get(op.node as usize)
-						.is_some_and(|n| n.kind == NodeKind::ArithFor)
-					{
-						Flow::Discard(1)
+					// Evaluation failure ends this loop, not the rest of the line.
+					if arith_for {
+						let exit = unit
+							.ops
+							.iter()
+							.enumerate()
+							.skip(top_frame(vp).pc as usize)
+							.find(|(_, next)| next.node == op.node && next.code == Opcode::LoopExit)
+							.map(|(pc, _)| pc as u32)
+							.expect("arithmetic loop exit");
+						if let Some(rec) = top_frame(vp)
+							.loops
+							.last_mut()
+							.filter(|rec| rec.exit == exit)
+						{
+							rec.status = 1;
+							Flow::Jump(exit)
+						} else {
+							Flow::Jump(exit + 1)
+						}
 					} else {
 						Flow::Next
 					}
@@ -2398,9 +2568,7 @@ fn time_end(
 		end.sys.saturating_sub(start.sys),
 	];
 	match time_report(&format, times) {
-		Ok(text) => vp
-			.out
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 }),
+		Ok(text) => vp.queue_output(PendingWrite { fd: 2, bytes: text.into(), off: 0 }),
 		Err(c) => {
 			let msg = format!("TIMEFORMAT: `{}': invalid format character", char::from(c));
 			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
@@ -2445,8 +2613,7 @@ fn zsh_time_end(
 		text.extend_from_slice(&zsh_time_report(&format, b"children", children));
 		text
 	};
-	vp.out
-		.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
+	vp.queue_output(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
 }
 
 /// zsh's default `TIMEFMT` (`DEFAULT_TIMEFMT`).
@@ -3704,6 +3871,8 @@ pub fn mark_cancel(vp: &mut Vproc, status: i32) {
 /// the shell; scripts queued behind it end unstarted.
 pub fn finish_cancel(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc, status: i32) {
 	unwind(root, store, vp, 0);
+	vp.traces.clear();
+	vp.unwound_children.clear();
 	vp.status = status;
 	vp.blocked = None;
 	for (i, run) in vp.runs.iter_mut().enumerate() {

@@ -5,7 +5,7 @@ use std::{collections::HashMap, io::Write};
 use bstr::{BStr, BString, ByteSlice};
 
 use super::{
-	Ctx, Need, R, done,
+	Control, Ctx, Need, Outcome, R, done,
 	io::bind_lhs,
 	opts,
 	vars::{Lhs, all_functions},
@@ -15,16 +15,17 @@ use crate::bash::{
 	host::{ResolveCtx, Resolved, Via},
 	ids::IntrinsicId,
 	pattern::PatOpts,
-	store::{Key, KeyBuf, OptId, OptKind, Record, StoreError, Table},
+	store::{Attrs, Key, KeyBuf, OptId, OptKind, Record, StoreError, Table, VarValue},
 	syntax::AliasLookup,
 	vm::{
 		Cx, Kernel,
 		exec::mode_of,
-		expand::DEFAULT_IFS,
+		expand::{DEFAULT_IFS, Expander, Stop},
 		locale,
 		probe::{self, absolute},
-		proc::{AssignValue, Probe, ProbeResult, Vproc},
-		quote, state,
+		proc::{AssignValue, Atom, Probe, ProbeResult, Vproc},
+		quote,
+		state::{self, Level, Var},
 	},
 };
 
@@ -532,106 +533,129 @@ pub fn command_v(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 /// suffix] [-V varname] [word]`: the completions of `word`, one per line
 /// (or into the array `varname`); status 1 when there are none.
 ///
-/// Programmable completion is interactive; scripts use `compgen` for word
-/// lists. Generated: the actions answerable from shell state (alias,
-/// builtin, function, keyword, variable, shopt, setopt), then `-W`'s words
-/// (split on `IFS`, without bash's expansions of the list), filtered by
-/// `-X` (a leading `!` keeps the matches instead) and wrapped in `-P`/`-S`.
-/// Actions that read the system (files, commands, users, jobs, …), `-G`,
-/// `-F` and `-C` generate nothing, so those completions come back empty
-/// instead of failing.
+/// Shell-state actions and `-W` are prefix-filtered. A completion function
+/// runs in this shell, and its `COMPREPLY` and a completion command's output
+/// are used without prefix filtering. Substitutions and callbacks use the
+/// ordinary VM continuations, so errors and control transfers retain their
+/// normal shell semantics and standard streams.
 pub fn compgen(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let o = match opts(ctx, args, b"abcdefgjksuv", b"oAGWFCXPSV", false) {
 		Ok(o) => o,
 		Err(st) => return done(st),
 	};
 	let prefix = o.rest.first().cloned().unwrap_or_default();
-	let mut words: Vec<BString> = Vec::new();
-	let mut actions: Vec<BString> = o
-		.flags
-		.iter()
-		.filter(|&&(c, ..)| c == b'A')
-		.filter_map(|(_, _, a)| a.clone())
-		.collect();
-	for (c, name) in [
-		(b'a', "alias"),
-		(b'b', "builtin"),
-		(b'c', "command"),
-		(b'd', "directory"),
-		(b'e', "export"),
-		(b'f', "file"),
-		(b'g', "group"),
-		(b'j', "job"),
-		(b'k', "keyword"),
-		(b's', "service"),
-		(b'u', "user"),
-		(b'v', "variable"),
-	] {
-		if o.has(c) {
-			actions.push(name.into());
+	let programmable = o.has(b'F') || o.has(b'C');
+	// Reserve two replay slots for the completed action/word-list matches.
+	// A callback can change the state they came from; do not regenerate them
+	// after it returns. Expansion atoms follow until that list is complete.
+	if programmable && ctx.log.is_empty() {
+		ctx.log.push(Atom::Str(None));
+		ctx.log.push(Atom::List(Vec::new()));
+		for c in *b"FC" {
+			if o.has(c) {
+				let msg = format!("warning: -{} option may not work as you expect", char::from(c));
+				ctx.err(Diag::Warning { msg: msg.into() });
+			}
 		}
 	}
-	for c in *b"FC" {
-		if o.has(c) {
-			let msg = format!("warning: -{} option may not work as you expect", char::from(c));
-			ctx.err(Diag::Warning { msg: msg.into() });
+	ctx.log_cursor = if programmable { 2 } else { 0 };
+	let cached = programmable && matches!(ctx.log.first(), Some(Atom::Done));
+	let mut words = match ctx.log.get(1) {
+		Some(Atom::List(words)) if cached => words.clone(),
+		_ => Vec::new(),
+	};
+	if !cached {
+		let mut actions: Vec<BString> = o
+			.flags
+			.iter()
+			.filter(|&&(c, ..)| c == b'A')
+			.filter_map(|(_, _, a)| a.clone())
+			.collect();
+		for (c, name) in [
+			(b'a', "alias"),
+			(b'b', "builtin"),
+			(b'c', "command"),
+			(b'd', "directory"),
+			(b'e', "export"),
+			(b'f', "file"),
+			(b'g', "group"),
+			(b'j', "job"),
+			(b'k', "keyword"),
+			(b's', "service"),
+			(b'u', "user"),
+			(b'v', "variable"),
+		] {
+			if o.has(c) {
+				actions.push(name.into());
+			}
 		}
-	}
-	let dialect = ctx.vp.mode.dialect();
-	for action in &actions {
-		match action.as_slice() {
-			b"function" => words.extend(all_functions(ctx)?.into_iter().map(|(n, ..)| n)),
-			b"variable" => words.extend(
-				state::scan(&ctx.k.root, ctx.cx.store, ctx.vp, Table::Var)?
-					.into_iter()
-					.filter_map(|(k, _)| match k {
-						KeyBuf::Var(n) => Some(n),
-						_ => None,
-					}),
-			),
-			b"alias" => words.extend(all_aliases(ctx)?.into_iter().map(|(n, _)| n)),
-			b"shopt" | b"setopt" => {
-				use strum::IntoEnumIterator;
-				let kind = if action.as_slice() == b"shopt" {
-					OptKind::Shopt
-				} else {
-					OptKind::Set
-				};
-				let mut names: Vec<&'static str> = OptId::iter()
-					.filter(|o| o.kind() == kind)
-					.map(<&'static str>::from)
-					.collect();
-				names.sort_unstable();
-				words.extend(names.into_iter().map(BString::from));
-			},
-			b"keyword" => words.extend(KEYWORDS.iter().map(|k| BString::from(*k))),
-			b"builtin" => {
-				use strum::IntoEnumIterator;
-				for id in crate::bash::ids::IntrinsicId::iter().filter(|id| id.available_in(dialect)) {
-					let name: &'static str = id.into();
-					if super::misc::usable(ctx.k, ctx.cx.store, ctx.vp, name.as_bytes(), Some(id))?
-						.is_some()
+		let dialect = ctx.vp.mode.dialect();
+		for action in &actions {
+			match action.as_slice() {
+				b"function" => words.extend(all_functions(ctx)?.into_iter().map(|(n, ..)| n)),
+				b"variable" => words.extend(
+					state::scan(&ctx.k.root, ctx.cx.store, ctx.vp, Table::Var)?
+						.into_iter()
+						.filter_map(|(k, _)| match k {
+							KeyBuf::Var(n) => Some(n),
+							_ => None,
+						}),
+				),
+				b"alias" => words.extend(all_aliases(ctx)?.into_iter().map(|(n, _)| n)),
+				b"shopt" | b"setopt" => {
+					use strum::IntoEnumIterator;
+					let kind = if action.as_slice() == b"shopt" {
+						OptKind::Shopt
+					} else {
+						OptKind::Set
+					};
+					let mut names: Vec<&'static str> = OptId::iter()
+						.filter(|o| o.kind() == kind)
+						.map(<&'static str>::from)
+						.collect();
+					names.sort_unstable();
+					words.extend(names.into_iter().map(BString::from));
+				},
+				b"keyword" => words.extend(KEYWORDS.iter().map(|k| BString::from(*k))),
+				b"builtin" => {
+					use strum::IntoEnumIterator;
+					for id in crate::bash::ids::IntrinsicId::iter().filter(|id| id.available_in(dialect))
 					{
-						words.push(BString::from(name));
+						let name: &'static str = id.into();
+						if super::misc::usable(ctx.k, ctx.cx.store, ctx.vp, name.as_bytes(), Some(id))?
+							.is_some()
+						{
+							words.push(BString::from(name));
+						}
 					}
-				}
-			},
-			// Read from the system: nothing here.
-			_ => {},
+				},
+				// Read from the system: nothing here.
+				_ => {},
+			}
+		}
+		if let Some(list) = o.arg(b'W') {
+			words.extend(compgen_wordlist(ctx, list)?);
+		}
+		words.retain(|w| w.starts_with(&prefix));
+		if programmable {
+			ctx.log.truncate(2);
+			ctx.log[0] = Atom::Done;
+			ctx.log[1] = Atom::List(words.clone());
+			ctx.log_cursor = 2;
 		}
 	}
-	if let Some(list) = o.arg(b'W') {
-		let ifs = ctx
-			.scalar(b"IFS")?
-			.unwrap_or_else(|| BString::from(DEFAULT_IFS));
-		words.extend(
-			list
-				.split(|c| ifs.contains(c))
-				.filter(|w| !w.is_empty())
-				.map(BString::from),
-		);
+	let mut retry = false;
+	if let Some(function) = o.arg(b'F') {
+		if compgen_function(ctx, function, &prefix, &mut words, &mut retry)? {
+			return Ok(Outcome { status: 0, control: Control::Resume });
+		}
 	}
-	words.retain(|w| w.starts_with(&prefix));
+	if let Some(command) = o.arg(b'C') {
+		words.extend(compgen_command(ctx, command, &prefix)?);
+	}
+	if retry {
+		words.clear();
+	}
 	if let Some(filter) = o.arg(b'X') {
 		let (keep_matches, pattern) = match filter.strip_prefix(b"!") {
 			Some(p) => (true, p),
@@ -672,6 +696,163 @@ pub fn compgen(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	}
 	ctx.out(&out);
 	done(status)
+}
+
+/// Expand `-W` with Bash's shell-expansion set: braces, tilde, parameters,
+/// substitutions, splitting and quote removal, but no pathname expansion.
+fn compgen_wordlist(ctx: &mut Ctx<'_, '_>, list: &[u8]) -> Result<Vec<BString>, Need> {
+	let ifs = ctx.scalar(b"IFS")?.unwrap_or_else(|| DEFAULT_IFS.into());
+	let unit = ctx
+		.k
+		.engine
+		.text_unit(list, crate::bash::vm::TextKind::Completion(ifs), mode_of(ctx.vp))
+		.map_err(|e| Need::Sub(Stop::Fail(Diag::Syntax { msg: e.msg })))?;
+	let mut words = Vec::new();
+	let mut ex = Expander::new(ctx.k, ctx.cx, ctx.vp, &mut ctx.log, true, ctx.line);
+	ex.cursor = ctx.log_cursor;
+	let result = (|| {
+		for &index in unit.lists.last().into_iter().flatten() {
+			ex.fields(&unit, &unit.words[index as usize], &mut words)?;
+		}
+		Ok(())
+	})();
+	ctx.log_cursor = ex.cursor;
+	result.map_err(Need::Sub)?;
+	Ok(words)
+}
+
+/// The variables Bash supplies even for non-interactive `compgen` calls.
+fn compgen_bind(ctx: &mut Ctx<'_, '_>, command: bool) {
+	let attrs = if command { Attrs::EXPORT } else { Attrs::NONE };
+	for (name, value) in [
+		(b"COMP_LINE".as_slice(), b"".as_slice()),
+		(b"COMP_POINT", b"0"),
+		(b"COMP_TYPE", b"0"),
+		(b"COMP_KEY", b"0"),
+	] {
+		ctx.set_var(name, Some(Var::scalar(value, attrs)), Level::Dynamic);
+	}
+	if !command {
+		ctx.set_var(b"COMP_CWORD", Some(Var::scalar("-1", Attrs::NONE)), Level::Dynamic);
+		ctx.set_var(
+			b"COMP_WORDS",
+			Some(Var { attrs: Attrs::NONE, value: VarValue::Indexed(Vec::new()) }),
+			Level::Dynamic,
+		);
+	}
+}
+
+fn compgen_unbind(ctx: &mut Ctx<'_, '_>) {
+	for name in [
+		b"COMP_LINE".as_slice(),
+		b"COMP_POINT",
+		b"COMP_TYPE",
+		b"COMP_KEY",
+		b"COMP_CWORD",
+		b"COMP_WORDS",
+	] {
+		ctx.set_var(name, None, Level::Dynamic);
+	}
+}
+
+/// Call `-F` once, then remember its status and replies while `-C` parks.
+/// `124` requests a restart from interactive completion; `compgen` instead
+/// returns no matches, and `127` ignores just this function's replies.
+fn compgen_function(
+	ctx: &mut Ctx<'_, '_>,
+	name: &BString,
+	prefix: &BString,
+	words: &mut Vec<BString>,
+	retry: &mut bool,
+) -> Result<bool, Need> {
+	let cursor = ctx.log_cursor;
+	if ctx.log.get(cursor).is_none() {
+		if let Some(rec) = ctx.function(name)? {
+			compgen_bind(ctx, false);
+			ctx.log.push(Atom::Str(None));
+			let args = vec![BString::from("compgen"), prefix.clone(), BString::default()];
+			if crate::bash::vm::command::call_record(
+				ctx.k,
+				ctx.vp,
+				ctx.cx,
+				name.clone(),
+				&rec,
+				args,
+				ctx.line,
+			) {
+				return Ok(true);
+			}
+			compgen_unbind(ctx);
+			ctx.log.pop();
+		}
+		ctx.diag(Diag::Usage {
+			msg: format!("completion: function `{}' not found", name.as_bstr()).into(),
+		});
+		ctx.log
+			.push(Atom::Sub { out: BString::default(), status: 127 });
+		ctx.log.push(Atom::List(Vec::new()));
+	} else if matches!(ctx.log[cursor], Atom::Str(None)) {
+		let status = ctx.vp.status;
+		let reply = ctx.var(b"COMPREPLY")?;
+		let reply = reply
+			.filter(|v| !matches!(v.value, VarValue::Assoc(_)))
+			.map_or_else(Vec::new, |v| v.values());
+		compgen_unbind(ctx);
+		ctx.set_var(b"COMPREPLY", None, Level::Dynamic);
+		ctx.log[cursor] = Atom::Sub { out: BString::default(), status };
+		ctx.log.push(Atom::List(reply));
+	}
+	if let Atom::Sub { status, .. } = &ctx.log[cursor] {
+		*retry = *status == 124;
+		if *status != 127
+			&& !*retry
+			&& let Atom::List(reply) = &ctx.log[cursor + 1]
+		{
+			words.extend(reply.iter().cloned());
+		}
+	}
+	ctx.log_cursor += 2;
+	Ok(false)
+}
+
+/// Run `-C` as a command substitution with its three completion arguments.
+/// Its status is not compgen's status: only whether it returned matches is.
+fn compgen_command(
+	ctx: &mut Ctx<'_, '_>,
+	command: &[u8],
+	prefix: &[u8],
+) -> Result<Vec<BString>, Need> {
+	let output = match ctx.log.get(ctx.log_cursor) {
+		Some(Atom::Sub { out, .. }) => out.clone(),
+		_ => {
+			compgen_bind(ctx, true);
+			let mut text = Vec::with_capacity(command.len() + prefix.len() + 24);
+			text.extend_from_slice(command);
+			text.extend_from_slice(b" 'compgen' ");
+			text.extend_from_slice(&quote::sh_single_quote(prefix));
+			text.extend_from_slice(b" ''\n");
+			return Err(Need::Command(text.into()));
+		},
+	};
+	ctx.log_cursor += 1;
+	compgen_unbind(ctx);
+	let mut words = Vec::new();
+	let mut start = 0;
+	while start < output.len() {
+		let mut end = start;
+		while end < output.len() && output[end] != b'\n' {
+			if output[end] == b'\\' && output.get(end + 1) == Some(&b'\n') {
+				end += 1;
+			}
+			end += 1;
+		}
+		words.push(BString::from(&output[start..end]));
+		while output.get(end) == Some(&b'\n') {
+			end += 1;
+		}
+		start = end;
+	}
+	Ok(words)
 }
 
 /// `complete [-abcdefgjksuv] [-pr] [-DEI] [-o option] [-A action] [-G

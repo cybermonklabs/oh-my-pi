@@ -85,7 +85,7 @@ const _: () = {
 
 mod text {
 	/// Kind of text parsed at run time.
-	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+	#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 	pub enum TextKind {
 		/// Arithmetic text.
 		Arith,
@@ -94,6 +94,8 @@ mod text {
 		/// The inside of a compound array value given as a string
 		/// (`declare -a d='($a)'`), parsed as the list of `declare __=(…)`.
 		Compound,
+		/// A completion word list, split using this `IFS` value.
+		Completion(bstr::BString),
 	}
 }
 
@@ -778,8 +780,7 @@ impl Kernel {
 	/// Queue a diagnostic on the vproc's stderr and emit a `Diag` event.
 	pub fn diag(&mut self, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, diag: Diag) {
 		let bytes = self.render_diag(cx, vp, line, &diag);
-		vp.out
-			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+		vp.queue_output(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
 	}
 
 	/// The stderr bytes of a diagnostic; emits the `Diag` event. Builtins
@@ -2366,6 +2367,8 @@ impl Vproc {
 			pipestatus: Vec::new(),
 			overlay,
 			out: VecDeque::new(),
+			traces: VecDeque::new(),
+			unwound_children: Vec::new(),
 			blocked: None,
 			pending_traps: crate::bash::signal::SigSet::EMPTY,
 			stopped: false,

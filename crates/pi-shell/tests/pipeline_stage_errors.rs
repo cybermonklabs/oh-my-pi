@@ -3,11 +3,11 @@
 //! stage exits with the error's status, the other stages run to completion,
 //! and the commands after the pipeline still run. A word that fails to expand
 //! in the current shell ends the command line, inside a function as outside
-//! one. Each row's expected standard output, diagnostic and exit status is
-//! GNU Bash 5.2.21's for the same script read from a file. (`bash -c` reports
-//! 127, not 1, for a stage that ends at `${v:?}`, an unset variable under
-//! `set -u`, or a bad substitution; every other status here is the same in
-//! both.)
+//! one. Goldens record GNU Bash 5.3's stdout, diagnostic presence and exit
+//! status for `bash --noprofile --norc -c` in an empty directory. The bash
+//! tool runs a command string, not a script file: for example, `: "${v:?}"`
+//! exits 127 under `-c`, but 1 from a file. Comments explicitly mark the safe
+//! error results used instead of reproducing Bash's `compgen -F` crashes.
 #![cfg(unix)]
 
 use std::{collections::BTreeSet, fs};
@@ -59,9 +59,9 @@ async fn run_streams(script: &str) -> (String, String, Option<i32>) {
 	(collect(stdout_rx), collect(stderr_rx), result.exit_code)
 }
 
-/// Runs every `(script, Bash's standard output, whether Bash wrote a
-/// diagnostic, Bash's exit status)` row and fails listing each row that
-/// differs.
+/// Runs every `(script, Bash 5.3 bash -c stdout, diagnostic presence, exit
+/// status)` row and lists each difference. Comments mark the safe completion
+/// error results used instead of Bash crashes.
 async fn assert_bash(rows: &[(&str, &str, bool, i32)]) {
 	let mut differing = Vec::new();
 	for &(script, stdout, diagnostic, status) in rows {
@@ -73,7 +73,7 @@ async fn assert_bash(rows: &[(&str, &str, bool, i32)]) {
 	}
 	assert!(
 		differing.is_empty(),
-		"{} of {} rows differ from Bash 5.2.21:\n{}",
+		"{} of {} rows differ from Bash 5.3 bash -c (except documented compgen crashes):\n{}",
 		differing.len(),
 		rows.len(),
 		differing.join("\n")
@@ -89,42 +89,42 @@ async fn an_expansion_error_ends_only_its_stage() {
 		(
 			": \"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
 		(
 			": | : \"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=0 1 0\n",
+			"PARENT=0 PIPESTATUS=0 127 0\n",
 			true,
 			0,
 		),
 		(
 			": | : \"${missing:?BOOM}\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=0 1\n",
+			"PARENT=127 PIPESTATUS=0 127\n",
 			true,
 			0,
 		),
 		(
 			"set -u; : \"$missing\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
 		(
 			"set -u; : | : \"$missing\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=0 1 0\n",
+			"PARENT=0 PIPESTATUS=0 127 0\n",
 			true,
 			0,
 		),
 		(
 			"set -u; : | : \"$missing\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=0 1\n",
+			"PARENT=127 PIPESTATUS=0 127\n",
 			true,
 			0,
 		),
@@ -202,42 +202,42 @@ async fn every_kind_of_stage_ends_alone_at_an_error() {
 		(
 			"/bin/echo \"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
 		(
 			": | /bin/echo \"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \
 			 \"$?\" \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=0 1 0\n",
+			"PARENT=0 PIPESTATUS=0 127 0\n",
 			true,
 			0,
 		),
 		(
 			": | /bin/echo \"${missing:?BOOM}\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=0 1\n",
+			"PARENT=127 PIPESTATUS=0 127\n",
 			true,
 			0,
 		),
 		(
 			"v=\"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
 		(
 			": | v=\"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=0 1 0\n",
+			"PARENT=0 PIPESTATUS=0 127 0\n",
 			true,
 			0,
 		),
 		(
 			": | v=\"${missing:?BOOM}\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=0 1\n",
+			"PARENT=127 PIPESTATUS=0 127\n",
 			true,
 			0,
 		),
@@ -265,21 +265,21 @@ async fn every_kind_of_stage_ends_alone_at_an_error() {
 		(
 			"f() { : \"${missing:?BOOM}\"; }; f | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \
 			 \"$?\" \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
 		(
 			"f() { : \"${missing:?BOOM}\"; }; : | f | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \
 			 \"$?\" \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=0 1 0\n",
+			"PARENT=0 PIPESTATUS=0 127 0\n",
 			true,
 			0,
 		),
 		(
 			"f() { : \"${missing:?BOOM}\"; }; : | f; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=0 1\n",
+			"PARENT=127 PIPESTATUS=0 127\n",
 			true,
 			0,
 		),
@@ -398,21 +398,21 @@ async fn pipeline_options_see_the_failed_stage_status() {
 		(
 			"set -o pipefail; : \"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \
 			 \"$?\" \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=1 0\n",
+			"PARENT=127 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
 		(
 			"set -o pipefail; : | : \"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s \
 			 PIPESTATUS=%s\\n' \"$?\" \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=0 1 0\n",
+			"PARENT=127 PIPESTATUS=0 127 0\n",
 			true,
 			0,
 		),
 		(
 			"set -o pipefail; : | : \"${missing:?BOOM}\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=0 1\n",
+			"PARENT=127 PIPESTATUS=0 127\n",
 			true,
 			0,
 		),
@@ -433,28 +433,28 @@ async fn pipeline_options_see_the_failed_stage_status() {
 		(
 			"! : \"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=1 0\n",
+			"PARENT=1 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
 		(
 			"! : | : \"${missing:?BOOM}\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=0 1\n",
+			"PARENT=0 PIPESTATUS=0 127\n",
 			true,
 			0,
 		),
 		(
 			": | : \"${missing:?BOOM}\" || printf 'OR=%s\\n' \"$?\"; printf 'PARENT=%s \
 			 PIPESTATUS=%s\\n' \"$?\" \"${PIPESTATUS[*]}\"",
-			"OR=1\nPARENT=0 PIPESTATUS=0\n",
+			"OR=127\nPARENT=0 PIPESTATUS=0\n",
 			true,
 			0,
 		),
 		(
 			"trap 'printf \"TRAP=%s\\n\" \"$?\"' ERR; : | : \"${missing:?BOOM}\"; printf \
 			 'PARENT=%s\\n' \"$?\"",
-			"TRAP=1\nPARENT=1\n",
+			"TRAP=127\nPARENT=127\n",
 			true,
 			0,
 		),
@@ -520,14 +520,14 @@ async fn a_stage_reports_its_error_on_its_own_standard_error() {
 		(
 			": \"${missing:?BOOM}\" 2>/dev/null | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \
 			 \"$?\" \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
 		(
 			"2>/dev/null : \"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \
 			 \"$?\" \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
@@ -541,14 +541,14 @@ async fn a_stage_reports_its_error_on_its_own_standard_error() {
 		(
 			"f() { : \"${missing:?BOOM}\"; }; f 2>/dev/null | /bin/cat; printf 'PARENT=%s \
 			 PIPESTATUS=%s\\n' \"$?\" \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			false,
 			0,
 		),
 		(
 			"f() { : \"${missing:?BOOM}\"; } 2>/dev/null; f | /bin/cat; printf 'PARENT=%s \
 			 PIPESTATUS=%s\\n' \"$?\" \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			false,
 			0,
 		),
@@ -587,14 +587,14 @@ async fn the_other_stages_and_the_next_commands_still_run() {
 		(
 			": | : \"${missing:?BOOM}\" | { /bin/cat; printf 'AFTER=ran\\n'; }; printf 'PARENT=%s \
 			 PIPESTATUS=%s\\n' \"$?\" \"${PIPESTATUS[*]}\"",
-			"AFTER=ran\nPARENT=0 PIPESTATUS=0 1 0\n",
+			"AFTER=ran\nPARENT=0 PIPESTATUS=0 127 0\n",
 			true,
 			0,
 		),
 		(
 			"{ sleep 0.3; printf 'UP=done\\n' >up.txt; } | : \"${missing:?BOOM}\" | /bin/cat; printf \
 			 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \"${PIPESTATUS[*]}\"; /bin/cat up.txt",
-			"PARENT=0 PIPESTATUS=0 1 0\nUP=done\n",
+			"PARENT=0 PIPESTATUS=0 127 0\nUP=done\n",
 			true,
 			0,
 		),
@@ -608,7 +608,7 @@ async fn the_other_stages_and_the_next_commands_still_run() {
 		(
 			": \"${missing:?BOOM}\" | /bin/cat\nprintf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
@@ -657,13 +657,13 @@ async fn an_error_outside_a_stage_subshell_still_ends_the_command_line() {
 			": \"${missing:?BOOM}\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \"${PIPESTATUS[*]}\"",
 			"",
 			true,
-			1,
+			127,
 		),
 		(
 			"set -u; : \"$missing\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \"${PIPESTATUS[*]}\"",
 			"",
 			true,
-			1,
+			127,
 		),
 		(
 			": \"$((1/0))\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \"${PIPESTATUS[*]}\"",
@@ -676,14 +676,14 @@ async fn an_error_outside_a_stage_subshell_still_ends_the_command_line() {
 			 \"$?\" \"${PIPESTATUS[*]}\"",
 			"",
 			true,
-			1,
+			127,
 		),
 		(
 			"set -u; shopt -s lastpipe; : | : \"$missing\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \
 			 \"$?\" \"${PIPESTATUS[*]}\"",
 			"",
 			true,
-			1,
+			127,
 		),
 		(
 			"shopt -s lastpipe; : | : \"$((1/0))\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
@@ -744,14 +744,14 @@ async fn an_error_outside_a_stage_subshell_still_ends_the_command_line() {
 		(
 			": >\"${missing:?BOOM}\" | /bin/cat; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			true,
 			0,
 		),
 		(
 			": | : >\"${missing:?BOOM}\"; printf 'PARENT=%s PIPESTATUS=%s\\n' \"$?\" \
 			 \"${PIPESTATUS[*]}\"",
-			"PARENT=1 PIPESTATUS=0 1\n",
+			"PARENT=127 PIPESTATUS=0 127\n",
 			true,
 			0,
 		),
@@ -777,7 +777,8 @@ async fn an_error_outside_a_stage_subshell_still_ends_the_command_line() {
 #[tokio::test]
 async fn an_expansion_error_in_a_function_ends_the_command_line() {
 	let mut rows: Vec<(String, &str, bool, i32)> = Vec::new();
-	for error in ["$((1/0))", "$((1+))", "${!v}", "${missing:?BOOM}"] {
+	for (error, status) in [("$((1/0))", 1), ("$((1+))", 1), ("${!v}", 1), ("${missing:?BOOM}", 127)]
+	{
 		for pipefail in ["", "set -o pipefail; "] {
 			rows.push((
 				format!(
@@ -786,7 +787,7 @@ async fn an_expansion_error_in_a_function_ends_the_command_line() {
 				),
 				"",
 				true,
-				1,
+				status,
 			));
 		}
 	}
@@ -893,11 +894,11 @@ async fn a_failed_lastpipe_stage_returns_after_the_stages_before_it() {
 	let group = format!("{{ /bin/sh -c '{RECORD}; exec /bin/sleep 0.3'; printf done >marker; }}");
 	let external = format!("/bin/sh -c '{RECORD}; /bin/sleep 0.3; printf done >marker'");
 	let mut differing = Vec::new();
-	for (stage, last) in [
-		(&group, ": \"${missing:?BOOM}\""),
-		(&external, ": \"${missing:?BOOM}\""),
-		(&group, ": \"$((1/0))\""),
-		(&group, "f"),
+	for (stage, last, expected_status) in [
+		(&group, ": \"${missing:?BOOM}\"", 127),
+		(&external, ": \"${missing:?BOOM}\"", 127),
+		(&group, ": \"$((1/0))\"", 1),
+		(&group, "f", 1),
 	] {
 		for file in ["marker", "pids", "pipes"] {
 			let _ = fs::remove_file(dir.path().join(file));
@@ -913,7 +914,7 @@ async fn a_failed_lastpipe_stage_returns_after_the_stages_before_it() {
 			!pids.is_empty() && !pids.split_whitespace().any(is_child),
 			!pipes.is_empty() && descriptors_on(&pipes) == 0,
 		);
-		if observed != (Some(1), "done".to_owned(), true, true) {
+		if observed != (Some(expected_status), "done".to_owned(), true, true) {
 			differing.push(format!(
 				"{script}\n  (status, marker, its process gone, its pipe closed): {observed:?}"
 			));
@@ -940,7 +941,9 @@ async fn compgen_runs_its_function_command_and_words_on_its_own_streams() {
 	let errors = count("division");
 	let after = "printf 'AFTER=%s\\n' \"$?\"";
 	let rows: Vec<(String, &str, bool, i32)> = vec![
+		// Bash 5.3 aborts (5.2.21 segfaults); preserve line abandonment, not the crash.
 		(format!("{BAD}\ncompgen -F f -- word 2>diag; printf AFTER\n{errors}"), "N=1\n", false, 0),
+		// Bash 5.3 aborts (5.2.21 segfaults); preserve line abandonment, not the crash.
 		(
 			format!("{BAD}\ncommand compgen -F f -- word 2>diag; printf AFTER\n{errors}"),
 			"N=1\n",
@@ -953,6 +956,7 @@ async fn compgen_runs_its_function_command_and_words_on_its_own_streams() {
 			false,
 			0,
 		),
+		// Bash 5.3 prints AFTER=134 (5.2.21: AFTER=1); preserve the discard, not its abort.
 		(
 			format!("{BAD}\nx=$(compgen -F f -- word 2>diag); {after}\n{errors}"),
 			"AFTER=1\nN=1\n",
@@ -1036,9 +1040,9 @@ async fn an_expansion_error_in_any_word_ends_the_command_line() {
 		(format!("f() {{ for x in $((1/0)); do :; done; printf IN; }}; f; {after}"), "", true, 1),
 		(format!("f() {{ case $((1/0)) in *) ;; esac; printf IN; }}; f; {after}"), "", true, 1),
 		(format!("f() {{ [[ $((1/0)) == a ]]; printf IN; }}; f; {after}"), "", true, 1),
-		(format!("f() {{ [[ -n \"${{missing:?BOOM}}\" ]]; printf IN; }}; f; {after}"), "", true, 1),
+		(format!("f() {{ [[ -n \"${{missing:?BOOM}}\" ]]; printf IN; }}; f; {after}"), "", true, 127),
 		(format!("f() {{ [[ $((1/0)) -eq 1 ]]; printf IN; }}; f; {after}"), "", true, 1),
-		(format!("f() {{ (( ${{missing:?BOOM}} )); printf IN; }}; f; {after}"), "", true, 1),
+		(format!("f() {{ (( ${{missing:?BOOM}} )); printf IN; }}; f; {after}"), "", true, 127),
 		(
 			// `; i<1; i++`, not `;;`: the parser takes `;;` inside `for ((` for
 			// the `case` terminator (a separate defect, on main too).
@@ -1047,12 +1051,17 @@ async fn an_expansion_error_in_any_word_ends_the_command_line() {
 			),
 			"",
 			true,
-			1,
+			127,
 		),
-		(format!("f() {{ {{ :; }} >\"${{missing:?BOOM}}\"; printf IN; }}; f; {after}"), "", true, 1),
-		(format!("f() {{ :; }} >\"${{missing:?BOOM}}\"; f; {after}"), "", true, 1),
-		(format!("{{ cat; }} <<<\"${{missing:?BOOM}}\"; {after}"), "", true, 1),
-		(format!("{{ cat; }} <<EOF\n${{missing:?BOOM}}\nEOF\n{after}"), "", true, 1),
+		(
+			format!("f() {{ {{ :; }} >\"${{missing:?BOOM}}\"; printf IN; }}; f; {after}"),
+			"",
+			true,
+			127,
+		),
+		(format!("f() {{ :; }} >\"${{missing:?BOOM}}\"; f; {after}"), "", true, 127),
+		(format!("{{ cat; }} <<<\"${{missing:?BOOM}}\"; {after}"), "", true, 127),
+		(format!("{{ cat; }} <<EOF\n${{missing:?BOOM}}\nEOF\n{after}"), "", true, 127),
 		(format!("f() {{ for x in $((1/0)); do :; done; }} 2>/dev/null; f; {after}"), "", false, 1),
 		(
 			format!("{{ for x in $((1/0)); do :; done; printf IN; }} | cat; {after}"),
@@ -1062,11 +1071,11 @@ async fn an_expansion_error_in_any_word_ends_the_command_line() {
 		),
 		(
 			format!(": 2>&- >\"${{missing:?BOOM}}\" | cat; {PARENT}"),
-			"PARENT=0 PIPESTATUS=1 0\n",
+			"PARENT=0 PIPESTATUS=127 0\n",
 			false,
 			0,
 		),
-		(format!("/bin/true >\"${{missing:?BOOM}}\"; {after}"), "AFTER=1\n", true, 0),
+		(format!("/bin/true >\"${{missing:?BOOM}}\"; {after}"), "AFTER=127\n", true, 0),
 		(
 			format!("f() {{ /bin/cat <<<\"${{missing:?BOOM}}\"; printf IN; }}; f; {after}"),
 			"INAFTER=0\n",
@@ -1231,16 +1240,16 @@ async fn errexit_ends_the_shell_at_an_error_bash_reports_through_report_error() 
 async fn a_fatal_expansion_error_in_arithmetic_ends_the_shell() {
 	let next = "printf AFTER\nprintf NEXT";
 	let rows: Vec<(String, &str, bool, i32)> = vec![
-		(format!("f() {{ (( ${{missing:?BOOM}} )); printf IN; }}; f; {next}"), "", true, 1),
-		(format!(": $(( ${{missing:?BOOM}} )); {next}"), "", true, 1),
-		(format!("[[ ${{missing:?BOOM}} -eq 1 ]] || printf OR; {next}"), "", true, 1),
-		(format!("for ((i=${{missing:?BOOM}}; i<1; i++)); do :; done; {next}"), "", true, 1),
-		(format!("set -u; f() {{ (( missing )); printf IN; }}; f; {next}"), "", true, 1),
-		(format!("set -u; {{ (( missing )); }} 2>diag; {next}"), "", false, 1),
-		(format!("set -u; if (( missing )); then printf THEN; fi; {next}"), "", true, 1),
-		(format!("set -u; let missing; {next}"), "", true, 1),
-		(format!("set -u; : $(( missing )); {next}"), "", true, 1),
-		(format!("set -u; [[ missing -eq 1 ]]; {next}"), "", true, 1),
+		(format!("f() {{ (( ${{missing:?BOOM}} )); printf IN; }}; f; {next}"), "", true, 127),
+		(format!(": $(( ${{missing:?BOOM}} )); {next}"), "", true, 127),
+		(format!("[[ ${{missing:?BOOM}} -eq 1 ]] || printf OR; {next}"), "", true, 127),
+		(format!("for ((i=${{missing:?BOOM}}; i<1; i++)); do :; done; {next}"), "", true, 127),
+		(format!("set -u; f() {{ (( missing )); printf IN; }}; f; {next}"), "", true, 127),
+		(format!("set -u; {{ (( missing )); }} 2>diag; {next}"), "", false, 127),
+		(format!("set -u; if (( missing )); then printf THEN; fi; {next}"), "", true, 127),
+		(format!("set -u; let missing; {next}"), "", true, 127),
+		(format!("set -u; : $(( missing )); {next}"), "", true, 127),
+		(format!("set -u; [[ missing -eq 1 ]]; {next}"), "", true, 127),
 		("(( $((1/0)) )); printf SAME\nprintf NEXT".to_owned(), "NEXT", true, 0),
 	];
 	let rows: Vec<(&str, &str, bool, i32)> = rows
@@ -1423,14 +1432,14 @@ async fn a_fatal_error_ends_the_shell_through_any_builtin_that_wraps_it() {
 	let required = "compgen -W '${missing:?BOOM}' -- x";
 	let after = "printf 'AFTER=%s\\n' \"$?\"\nprintf 'NEXT=%s\\n' \"$?\"";
 	let rows: Vec<(String, &str, bool, i32)> = vec![
-		(format!("{required} 2>diag; {after}"), "", false, 1),
-		(format!("set -u; compgen -W '$missing' -- x 2>diag; {after}"), "", false, 1),
-		(format!("command {required} 2>diag; {after}"), "", false, 1),
-		(format!("builtin {required} 2>diag; {after}"), "", false, 1),
-		(format!("command builtin {required} 2>diag; {after}"), "", false, 1),
-		(format!("builtin command {required} 2>diag; {after}"), "", false, 1),
-		(format!("g() {{ {required}; printf G; }}; g 2>diag; {after}"), "", false, 1),
-		(format!("eval \"compgen -W '\\${{missing:?BOOM}}' -- x\" 2>diag; {after}"), "", false, 1),
+		(format!("{required} 2>diag; {after}"), "", false, 127),
+		(format!("set -u; compgen -W '$missing' -- x 2>diag; {after}"), "", false, 127),
+		(format!("command {required} 2>diag; {after}"), "", false, 127),
+		(format!("builtin {required} 2>diag; {after}"), "", false, 127),
+		(format!("command builtin {required} 2>diag; {after}"), "", false, 127),
+		(format!("builtin command {required} 2>diag; {after}"), "", false, 127),
+		(format!("g() {{ {required}; printf G; }}; g 2>diag; {after}"), "", false, 127),
+		(format!("eval \"compgen -W '\\${{missing:?BOOM}}' -- x\" 2>diag; {after}"), "", false, 127),
 		(
 			format!(
 				"printf \"compgen -W '\\${{missing:?BOOM}}' -- x; printf IN\\n\" >payload; . \
@@ -1438,12 +1447,12 @@ async fn a_fatal_error_ends_the_shell_through_any_builtin_that_wraps_it() {
 			),
 			"",
 			false,
-			1,
+			127,
 		),
-		(format!("time {required} 2>diag; {after}"), "", true, 1),
-		(format!("shopt -s lastpipe; : | {required} 2>diag; {after}"), "", false, 1),
-		(format!("set -u; command compgen -W '$missing' -- x 2>diag; {after}"), "", false, 1),
-		(format!("set -u; eval \"compgen -W '\\$missing' -- x\" 2>diag; {after}"), "", false, 1),
+		(format!("time {required} 2>diag; {after}"), "", false, 127),
+		(format!("shopt -s lastpipe; : | {required} 2>diag; {after}"), "", false, 127),
+		(format!("set -u; command compgen -W '$missing' -- x 2>diag; {after}"), "", false, 127),
+		(format!("set -u; eval \"compgen -W '\\$missing' -- x\" 2>diag; {after}"), "", false, 127),
 		(format!("set -e; v='a b'; compgen -W '${{!v}}' -- x 2>diag; {after}"), "", false, 1),
 		(
 			format!("set -e; v='a b'; f() {{ : \"${{!v}}\"; }}; compgen -F f -- x 2>diag; {after}"),
@@ -1472,22 +1481,21 @@ async fn a_fatal_error_ends_the_shell_through_any_builtin_that_wraps_it() {
 	assert_bash(&rows).await;
 }
 
-/// `time` reports the time a pipeline took even when an error discards its
-/// line or ends the shell, as Bash's `time_command` does (execute_cmd.c); only
-/// a `set -e` exit at an error Bash reports through `report_error` leaves no
-/// report, since that exits the shell where it is reported. Before, the
-/// report was lost whenever the pipeline ended with an error.
+/// `time` reports a pipeline whose error discards the line. A fatal required
+/// parameter still reports time, but a `set -e` exit at `report_error` leaves
+/// no report. With `bash -c`, a brace group's redirection also captures its
+/// timing report; `compgen -W`'s fatal required parameter skips the report.
 #[tokio::test]
 async fn time_reports_a_pipeline_that_ends_with_an_error() {
 	let next = "printf SAME\nprintf NEXT";
 	let mut differing = Vec::new();
 	for (script, stdout, reports, status) in [
 		(format!("time : $((1/0)); {next}"), "NEXT", 1, Some(0)),
-		(format!("time : ${{missing:?BOOM}}; {next}"), "", 1, Some(1)),
+		(format!("time : ${{missing:?BOOM}}; {next}"), "", 1, Some(127)),
 		(format!("v='a b'; time : \"${{!v}}\"; {next}"), "NEXT", 1, Some(0)),
 		(format!("set -e; v='a b'; time : \"${{!v}}\"; {next}"), "", 0, Some(1)),
 		(format!("f() {{ : $((1/0)); }}; time f; {next}"), "NEXT", 1, Some(0)),
-		(format!("time {{ : $((1/0)); }} 2>diag; {next}"), "NEXT", 1, Some(0)),
+		(format!("time {{ : $((1/0)); }} 2>diag; {next}"), "NEXT", 0, Some(0)),
 		(format!("time : $((1/0)) | cat; {next}"), "SAMENEXT", 1, Some(0)),
 		(format!("time (( 1/0 )); {next}"), "SAMENEXT", 1, Some(0)),
 		(format!("set -e; time false; {next}"), "", 1, Some(1)),
@@ -1635,18 +1643,18 @@ async fn a_command_run_through_builtin_command_keeps_errexit() {
 /// `!` inverts a pipeline's status, not a request to leave the shell or a
 /// function: a fatal error under `!` (`! let missing` under `set -u`, a
 /// required parameter through `eval`, `.`, `command eval` or a function)
-/// still exits with status 1, `! return 3` returns 3 and `( ! exit 3 )` exits
+/// still exits with status 127, `! return 3` returns 3 and `( ! exit 3 )` exits
 /// 3, as in Bash. Before, the run stopped but reported status 0, and `return`
 /// and `exit` under `!` gave 0.
 #[tokio::test]
 async fn negation_keeps_the_status_of_a_fatal_error_return_or_exit() {
 	let next = "printf AFTER\nprintf NEXT";
 	let rows: Vec<(String, &str, bool, i32)> = vec![
-		(format!("set -u; ! let missing; {next}"), "", true, 1),
-		(format!("! eval ': \"${{missing:?BOOM}}\"'; {next}"), "", true, 1),
-		(format!("printf ': \"${{missing:?BOOM}}\"\\n' > p2; ! . ./p2; {next}"), "", true, 1),
-		(format!("set -u; f() {{ let missing; }}; ! f; {next}"), "", true, 1),
-		(format!("! command eval ': \"${{missing:?BOOM}}\"'; {next}"), "", true, 1),
+		(format!("set -u; ! let missing; {next}"), "", true, 127),
+		(format!("! eval ': \"${{missing:?BOOM}}\"'; {next}"), "", true, 127),
+		(format!("printf ': \"${{missing:?BOOM}}\"\\n' > p2; ! . ./p2; {next}"), "", true, 127),
+		(format!("set -u; f() {{ let missing; }}; ! f; {next}"), "", true, 127),
+		(format!("! command eval ': \"${{missing:?BOOM}}\"'; {next}"), "", true, 127),
 		("g() { ! return 3; }; g; printf 'S=%s\\n' \"$?\"".to_owned(), "S=3\n", false, 0),
 		("( ! exit 3 ); printf 'S=%s\\n' \"$?\"".to_owned(), "S=3\n", false, 0),
 	];
@@ -1655,4 +1663,216 @@ async fn negation_keeps_the_status_of_a_fatal_error_return_or_exit() {
 		.map(|(script, stdout, diagnostic, status)| (script.as_str(), *stdout, *diagnostic, *status))
 		.collect();
 	assert_bash(&rows).await;
+}
+
+/// `builtin` does not suppress `-e` inside eval or a sourced file, even under
+/// `||`, `if` or `!`.
+#[tokio::test]
+async fn builtin_wrapped_eval_and_source_keep_errexit_when_their_status_is_ignored() {
+	assert_bash(&[
+		(
+			"set -e; builtin eval '((1/0)); printf BAD' || printf OR; printf AFTER\nprintf NEXT",
+			"",
+			true,
+			1,
+		),
+		(
+			"set -e; builtin eval 'false; printf IN' || printf OR; printf AFTER\nprintf NEXT",
+			"",
+			false,
+			1,
+		),
+		(
+			"printf 'false; printf IN\\n' >s; set -e; builtin . ./s || printf OR; printf \
+			 AFTER\nprintf NEXT",
+			"",
+			false,
+			1,
+		),
+		(
+			"printf 'false; printf IN\\n' >s; set -e; builtin source ./s || printf OR; printf \
+			 AFTER\nprintf NEXT",
+			"",
+			false,
+			1,
+		),
+		(
+			"set -e; if builtin eval false; then printf THEN; else printf ELSE; fi; printf \
+			 AFTER\nprintf NEXT",
+			"",
+			false,
+			1,
+		),
+		("set -e; ! builtin eval false; printf AFTER\nprintf NEXT", "", false, 1),
+		("set -e; builtin builtin eval false || printf OR; printf AFTER\nprintf NEXT", "", false, 1),
+		("set -e; eval false || printf OR; printf AFTER\nprintf NEXT", "ORAFTERNEXT", false, 0),
+		(
+			"printf 'false; printf IN\\n' >s; set -e; . ./s || printf OR; printf AFTER\nprintf NEXT",
+			"INAFTERNEXT",
+			false,
+			0,
+		),
+	])
+	.await;
+}
+
+/// Completion errors and exit requests leave the shell; an ordinary return
+/// only ends the function.
+#[tokio::test]
+async fn compgen_function_errors_and_exit_keep_their_control_flow() {
+	assert_bash(&[
+		// Bash 5.3 segfaults (5.2.21 aborts); use the structured nounset exit, not the crash.
+		("set -u; f() { let missing; }; ! compgen -F f -- x; printf AFTER", "", true, 127),
+		("set -u; f() { let missing; }; compgen -F f -- x || printf OR; printf AFTER", "", true, 127),
+		// Bash 5.3 segfaults (5.2.21 aborts); honor exit 7 instead of reproducing the crash.
+		("f() { exit 7; }; compgen -F f -- x 2>/dev/null; printf AFTER", "", false, 7),
+		// Bash 5.3 segfaults (5.2.21 aborts); honor exit 7 instead of reproducing the crash.
+		("f() { exit 7; }; ! compgen -F f -- x 2>/dev/null; printf AFTER", "", false, 7),
+		(
+			"f() { return 3; }; compgen -F f -- x 2>/dev/null; printf 'S=%s\\n' \"$?\"",
+			"S=1\n",
+			false,
+			0,
+		),
+	])
+	.await;
+}
+
+/// Completion replies, statuses, words and command output follow Bash 5.3,
+/// without filtering function or command results by the prefix.
+#[tokio::test]
+async fn compgen_preserves_reply_status_word_and_command_generation_contracts() {
+	assert_bash(&[
+		(
+			"COMPREPLY=(old); f() { :; }; compgen -F f -- x; printf \"S=%s\\n\" \"$?\"; declare -p \
+			 COMPREPLY 2>/dev/null; :",
+			"old\nS=0\n",
+			true,
+			0,
+		),
+		(
+			"f() { COMPREPLY=(z x); return 3; }; compgen -F f -- x; printf \"S=%s\\n\" \"$?\"",
+			"z\nx\nS=0\n",
+			true,
+			0,
+		),
+		(
+			"f() { echo CALL; COMPREPLY=(z); return 124; }; compgen -W x -F f -- x; printf \
+			 \"S=%s\\n\" \"$?\"",
+			"CALL\nS=1\n",
+			true,
+			0,
+		),
+		(
+			"f() { COMPREPLY=(z); return 127; }; compgen -W x -F f -- x; printf \"S=%s\\n\" \"$?\"",
+			"x\nS=0\n",
+			true,
+			0,
+		),
+		(
+			"compgen -C 'printf \"<%s>\\n\"' -- x; printf \"S=%s\\n\" \"$?\"",
+			"<compgen>\n<x>\n<>\nS=0\n",
+			true,
+			0,
+		),
+		(
+			"compgen -C 'printf \"z\\nx\\na b\\n\\nx\\n\"; :' -- x; printf \"S=%s\\n\" \"$?\"",
+			"z\nx\na b\nx\nS=0\n",
+			true,
+			0,
+		),
+		(
+			"compgen -C 'printf \"z\\n\"; exit 3; :' -- x; printf \"S=%s\\n\" \"$?\"",
+			"z\nS=0\n",
+			true,
+			0,
+		),
+		(
+			"f() { COMPREPLY=(z x); }; compgen -F f -C 'printf \"y\\nx\\n\"; :' -W \"x x2 z\" -P p \
+			 -S s -- x; printf \"S=%s\\n\" \"$?\"",
+			"pxs\npx2s\npzs\npxs\npys\npxs\nS=0\n",
+			true,
+			0,
+		),
+		(
+			"HOME=/home/pi-shell; v=\"x1 x2\"; compgen -W '$v \"x a\" x{1,2} *.none ~ [a]=b a;b a|b \
+			 a(b)'; printf \"S=%s\\n\" \"$?\"",
+			"x1\nx2\nx a\nx1\nx2\n*.none\n/home/pi-shell\n[a]=b\na;b\na|b\na(b)\nS=0\n",
+			false,
+			0,
+		),
+		(
+			"IFS=:; v=\"x:y\"; compgen -W 'a:b \"c:d\" $v'; printf \"S=%s\\n\" \"$?\"",
+			"a\nb c:d x\ny\nS=0\n",
+			false,
+			0,
+		),
+		("compgen -W '\"\" a \"\"'; printf \"S=%s\\n\" \"$?\"", "\na\n\nS=0\n", false, 0),
+		("compgen -W \"'bad\"; printf \"S=%s\\n\" \"$?\"; printf NEXT", "bad\nS=0\nNEXT", false, 0),
+	])
+	.await;
+}
+
+/// External commands and subshells expand redirections in their child;
+/// builtin, function and compound redirections can end the current shell.
+#[tokio::test]
+async fn a_failed_redirection_error_acts_on_the_process_that_performs_it() {
+	assert_bash(&[
+		("/bin/echo EXTERNAL >\"${U:?}\"; printf AFTER", "AFTER", true, 0),
+		("( echo SUBSHELL ) >\"${U:?}\"; printf AFTER", "AFTER", true, 0),
+		(
+			"( : > \"${U:?required}\" || echo WRONG; echo AFTER ) 2>/dev/null; echo \"builtin=$?\"",
+			"builtin=1\n",
+			false,
+			0,
+		),
+		(
+			"( { :; } > \"${U:?required}\" || echo WRONG; echo AFTER ) 2>/dev/null; echo \
+			 \"compound=$?\"",
+			"compound=1\n",
+			false,
+			0,
+		),
+		(
+			"( cat > \"${U:?required}\" || echo EXTERNAL; echo AFTER ) 2>/dev/null; echo \
+			 \"external=$?\"",
+			"EXTERNAL\nAFTER\nexternal=0\n",
+			false,
+			0,
+		),
+		(
+			"( [[ x ]] > \"${U:?required}\" || echo WRONG; echo AFTER ) 2>/dev/null; echo \"test=$?\"",
+			"test=1\n",
+			false,
+			0,
+		),
+		(
+			"( for i in 1; do :; done > \"${U:?required}\" || echo WRONG; echo AFTER ) 2>/dev/null; \
+			 echo \"for=$?\"",
+			"for=1\n",
+			false,
+			0,
+		),
+		(
+			"( ( : ) > \"${U:?required}\" || echo SUBSHELL; echo AFTER ) 2>/dev/null; echo \
+			 \"subshell=$?\"",
+			"SUBSHELL\nAFTER\nsubshell=0\n",
+			false,
+			0,
+		),
+		(
+			"( f() { :; }; f > \"${U:?required}\" || echo WRONG; echo AFTER ) 2>/dev/null; echo \
+			 \"function=$?\"",
+			"function=1\n",
+			false,
+			0,
+		),
+		(
+			"( > \"${U:?required}\" || echo WRONG; echo AFTER ) 2>/dev/null; echo \"null=$?\"",
+			"null=1\n",
+			false,
+			0,
+		),
+	])
+	.await;
 }

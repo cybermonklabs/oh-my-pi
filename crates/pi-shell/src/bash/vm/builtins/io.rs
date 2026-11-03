@@ -508,8 +508,7 @@ fn read_line(
 					&& let Some(p) = prompt
 				{
 					ctx.vp
-						.out
-						.push_back(PendingWrite { fd: 2, bytes: p.into(), off: 0 });
+						.queue_output(PendingWrite { fd: 2, bytes: p.into(), off: 0 });
 				}
 				return Err(need);
 			},
@@ -840,8 +839,7 @@ pub fn select_next(
 				}
 				let ps3 = if zsh { "?# " } else { "#? " };
 				text.extend_from_slice(&scalar_of(k, cx, vp, b"PS3").unwrap_or_else(|| ps3.into()));
-				vp.out
-					.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
+				vp.queue_output(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
 			}
 			match probe::perform(k, cx, vp, &mut sc, &p) {
 				Ok(r) => r,
@@ -862,12 +860,10 @@ pub fn select_next(
 				// loop's status is its last command's.
 				let reply = Some(Var::scalar(BString::default(), crate::bash::store::Attrs::NONE));
 				state::store_var(&mut k.root, cx.store, vp, b"REPLY", reply, Level::Dynamic);
-				vp.out
-					.push_back(PendingWrite { fd: 2, bytes: BString::from("\n"), off: 0 });
+				vp.queue_output(PendingWrite { fd: 2, bytes: BString::from("\n"), off: 0 });
 				break None;
 			}
-			vp.out
-				.push_back(PendingWrite { fd: 1, bytes: BString::from("\n"), off: 0 });
+			vp.queue_output(PendingWrite { fd: 1, bytes: BString::from("\n"), off: 0 });
 			if let Some(rec) = vp.frames.last_mut().and_then(|f| f.loops.last_mut()) {
 				rec.status = 1;
 			}

@@ -106,6 +106,26 @@ pub fn lower_text(
 	Ok(l.unit)
 }
 
+/// Lower runtime completion words with normal brace and tilde expansion,
+/// but without parsing shell operators. The last word list holds the roots.
+pub fn lower_completion_words(
+	words: &[syn::Word],
+	text: &[u8],
+	mode: ModeId,
+) -> Result<Unit, &'static str> {
+	let mut l =
+		Lower::new(Unit::empty(text, mode, syn::Features::NONE.bits()), 0, syn::Features::NONE);
+	l.emit(Opcode::End, 0, 0, 0);
+	let roots = words
+		.iter()
+		.map(|word| l.word(word))
+		.collect::<Result<Vec<_>, _>>()?;
+	l.unit.lists.push(roots);
+	l.emit(Opcode::End, 0, 0, 0);
+	l.unit.seal_from(l.source_hash);
+	Ok(l.unit)
+}
+
 /// Lower the compound value of a declaration argument given as a string
 /// (`declare -a d='($a)'`), parsed at run time as the one command
 /// `declare __=(…)` in `src`: a unit whose last word is a single

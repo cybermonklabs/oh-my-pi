@@ -471,11 +471,11 @@ async fn run_shell_session(
 				let _ = run_task.await;
 			}
 			abort_state.clear().await;
-			// Use try_lock to avoid deadlocking if another task holds the session.
-			// If we can't acquire the lock, the session will be cleaned up when the
-			// holding task finishes.
-			if let Ok(mut guard) = session.try_lock() {
-				*guard = None;
+			// Dropping Session only wakes its detached driver. Await its actual
+			// teardown before reporting cancellation: it owns substitution
+			// captures and files even after the run future is gone.
+			if let Some(mut core) = session.lock().await.take() {
+				core.session.shutdown().await;
 			}
 			return Ok(cancelled_result(reason));
 		}
@@ -487,8 +487,10 @@ async fn run_shell_session(
 	// `exit`, errexit, or a stray top-level `return`/`break` ends this command,
 	// not the session: the next run keeps the variables, functions, and options
 	// built so far. Only a failed run leaves the shell in an unknown state.
-	if res.is_err() {
-		*session.lock().await = None;
+	if res.is_err()
+		&& let Some(mut core) = session.lock().await.take()
+	{
+		core.session.shutdown().await;
 	}
 	Ok(res?.into_run_result())
 }
@@ -499,32 +501,22 @@ async fn run_shell_oneshot(
 	on_chunk: Option<Sender<String>>,
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
-	let tokio_cancel = CancellationToken::new();
-	let mut task = tokio::spawn({
-		let tokio_cancel = tokio_cancel.clone();
-		async move {
-			// The session ends with this task: its background jobs end with it.
-			let mut session = create_session_for_run(&config, Some(&tokio_cancel)).await?;
-			run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel).await
-		}
-	});
-
-	let run_result = tokio::select! {
-		result = &mut task => result,
-		reason = ct.wait() => {
-			tokio_cancel.cancel();
-			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut task).await;
-			if graceful.is_err() {
-				task.abort();
-				let _ = task.await;
-			}
-			return Ok(cancelled_result(reason));
-		},
-	};
-
-	let res = run_result
-		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	Ok(res?.into_run_result())
+	let session = Arc::new(TokioMutex::new(None));
+	let mut ct = ct;
+	let result = run_shell_session(
+		session.clone(),
+		ShellAbortState::default(),
+		ActiveChildren::default(),
+		config,
+		run_config,
+		on_chunk,
+		&mut ct,
+	)
+	.await;
+	if let Some(mut core) = session.lock().await.take() {
+		core.session.shutdown().await;
+	}
+	result
 }
 
 async fn run_shell_oneshot_streams(
@@ -534,11 +526,14 @@ async fn run_shell_oneshot_streams(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
+	let session = Arc::new(TokioMutex::new(None));
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
+		let session = session.clone();
 		async move {
-			let mut session = create_session_for_run(&config, Some(&tokio_cancel)).await?;
-			run_shell_command_streams(&mut session, &run_config, streams, tokio_cancel).await
+			let mut guard = session.lock().await;
+			let core = guard.insert(create_session_for_run(&config, Some(&tokio_cancel)).await?);
+			run_shell_command_streams(core, &run_config, streams, tokio_cancel).await
 		}
 	});
 
@@ -551,9 +546,15 @@ async fn run_shell_oneshot_streams(
 				task.abort();
 				let _ = task.await;
 			}
+			if let Some(mut core) = session.lock().await.take() {
+				core.session.shutdown().await;
+			}
 			return Ok(cancelled_result(reason));
 		},
 	};
+	if let Some(mut core) = session.lock().await.take() {
+		core.session.shutdown().await;
+	}
 
 	let res = run_result
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));

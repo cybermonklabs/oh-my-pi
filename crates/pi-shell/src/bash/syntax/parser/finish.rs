@@ -235,3 +235,11 @@ pub(super) fn finish_word(word: &mut Word, docs: &[Vec<u8>]) {
 	let mut w = Walk { next: 0, ids: true, docs };
 	w.word(word);
 }
+
+/// Number all words of a runtime completion list in one id space.
+pub(super) fn finish_words(words: &mut [Word], docs: &[Vec<u8>]) {
+	let mut walk = Walk { next: 0, ids: true, docs };
+	for word in words {
+		walk.word(word);
+	}
+}
