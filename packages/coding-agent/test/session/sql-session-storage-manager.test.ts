@@ -156,7 +156,7 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		await client.end();
 	});
 
-	it("rejects a stale rewrite after another SQL storage appends", async () => {
+	it("rejects a stale rewrite after a writer without the lease appends", async () => {
 		const client = new SQL("sqlite::memory:");
 		const firstStorage = await SqlSessionStorage.create({ client });
 		const sessionDir = virtualDir("/sessions/shared");
@@ -165,10 +165,17 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		const sessionFile = first.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
 
+		// Another omp's manager is refused by the lease and moves to a sibling
+		// (sql-session-lease-two-writers.test.ts). A writer that takes no lease,
+		// at a key outside the sessions root that falls under none, still lands
+		// its bytes, and the stale rewrite must not overwrite them.
 		const secondStorage = await SqlSessionStorage.create({ client });
-		const second = await SessionManager.open(sessionFile, sessionDir, secondStorage);
-		second.appendMessage({ role: "user", content: "durable SQL peer turn", timestamp: Date.now() });
-		await second.close();
+		await secondStorage.refresh({ kind: "session", file: sessionFile });
+		const peer = secondStorage.openWriter(sessionFile);
+		await peer.append(
+			`${JSON.stringify({ type: "message", id: "peer", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "durable SQL peer turn", timestamp: Date.now() } })}\n`,
+		);
+		await peer.close();
 
 		await expect(first.rewriteEntries()).rejects.toBeInstanceOf(SessionWriteConflictError);
 		expect(await secondStorage.readText(sessionFile)).toContain("durable SQL peer turn");

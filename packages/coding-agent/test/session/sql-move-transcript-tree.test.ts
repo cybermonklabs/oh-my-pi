@@ -8,6 +8,7 @@
 import { SQL } from "bun";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
+import { SESSION_INDEX_REFRESH_COALESCE_MS } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { listTranscriptTree } from "@oh-my-pi/pi-coding-agent/session/session-transcript-tree";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
@@ -113,18 +114,26 @@ describe("moving a SQL-stored session", () => {
 
 describe("a SQL-stored session's tree with another client writing", () => {
 	test("a move carries a child another client committed", async () => {
-		const { manager, artifactsDir, to, peer } = await seed();
+		const { storage, manager, artifactsDir, to, peer } = await seed();
+		const file = manager.getSessionFile()!;
+		// Another client may write under the session only while no process holds
+		// its lease: this one closes it, and reopening claims nothing until it writes.
+		await manager.close();
+		const reopened = await SessionManager.open(file, undefined, storage);
 		const other = await peer();
 		await other.writeText(path.join(artifactsDir, "Late.jsonl"), transcript("late"));
 		await other.drain();
+		// Time passes after the reopen's index read, so the move reads the tree again.
+		const now = performance.now.bind(performance);
+		vi.spyOn(performance, "now").mockImplementation(() => now() + SESSION_INDEX_REFRESH_COALESCE_MS);
 
-		await manager.moveTo(to);
+		await reopened.moveTo(to);
 
-		const moved = manager.getSessionFile()!.slice(0, -".jsonl".length);
-		expect((await listTranscriptTree(manager.getStorage(), moved)).map(file => path.basename(file))).toContain(
+		const moved = reopened.getSessionFile()!.slice(0, -".jsonl".length);
+		expect((await listTranscriptTree(reopened.getStorage(), moved)).map(f => path.basename(f))).toContain(
 			"Late.jsonl",
 		);
-		await manager.close();
+		await reopened.close();
 	});
 
 	test("deleting the session removes a child another client committed", async () => {

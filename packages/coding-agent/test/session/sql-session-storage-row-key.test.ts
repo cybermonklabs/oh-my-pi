@@ -70,6 +70,8 @@ let tableSeq = 0;
 /** One test's tables on one database, dropped when done. */
 class Db implements AsyncDisposable {
 	readonly table = `omp_rowkey_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
+	/** This fixture's own lease table, so concurrent runs on a shared database never meet each other's leases. */
+	readonly leaseTable = `${this.table}_lease`;
 	readonly client: SqlClient;
 
 	constructor(
@@ -80,7 +82,13 @@ class Db implements AsyncDisposable {
 	}
 
 	open(sessionsRoot: string, options: { createTable?: boolean } = {}): Promise<SqlSessionStorage> {
-		return SqlSessionStorage.create({ client: this.client, table: this.table, sessionsRoot, ...options });
+		return SqlSessionStorage.create({
+			client: this.client,
+			table: this.table,
+			leaseTable: this.leaseTable,
+			sessionsRoot,
+			...options,
+		});
 	}
 
 	/** Fixture SQL written with `?` placeholders, on any dialect; the rows as plain objects. */
@@ -113,6 +121,8 @@ class Db implements AsyncDisposable {
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_meta`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.leaseTable}`);
+		if (this.adapter === "postgres") await this.client.unsafe(`DROP FUNCTION IF EXISTS ${this.table}_refuse()`);
 		await this.client.end();
 	}
 }

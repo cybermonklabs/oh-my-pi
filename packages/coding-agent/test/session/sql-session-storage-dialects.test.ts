@@ -79,6 +79,22 @@ function metaSchema(adapter: SqlSessionStorageAdapter, table: string): string {
 	);
 }
 
+/** The lease table DDL that docs/session.md gives `createTable: false` consumers. */
+function leaseSchema(adapter: SqlSessionStorageAdapter, table: string): string {
+	if (adapter === "mysql") {
+		return (
+			`CREATE TABLE ${table} (session_id VARCHAR(191) NOT NULL PRIMARY KEY, holder VARCHAR(64) NOT NULL, ` +
+			"host VARCHAR(255) NOT NULL, pid INT NOT NULL, acquired_at DATETIME(6) NOT NULL, " +
+			"heartbeat_at DATETIME(6) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
+		);
+	}
+	const time = adapter === "postgres" ? "TIMESTAMPTZ" : "INTEGER";
+	return (
+		`CREATE TABLE ${table} (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL, host TEXT NOT NULL, ` +
+		`pid INTEGER NOT NULL, acquired_at ${time} NOT NULL, heartbeat_at ${time} NOT NULL)`
+	);
+}
+
 /** The documented byte_len and row-key checks, each recording itself only when it holds. */
 function recordChecks(adapter: SqlSessionStorageAdapter, table: string): string[] {
 	const legacy = `substr(path, 1, 9) <> 'sessions/' AND substr(path, 1, 4) <> 'abs:'`;
@@ -99,9 +115,10 @@ function recordChecks(adapter: SqlSessionStorageAdapter, table: string): string[
 
 let tableSeq = 0;
 
-/** One test's database: a fresh table name, its clients, and the cleanup that drops both tables. */
+/** One test's database: fresh table names, its clients, and the cleanup that drops the tables. */
 class Db implements AsyncDisposable {
 	readonly table = `omp_test_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
+	readonly leaseTable = `${this.table}_lease`;
 	readonly client: SqlClient;
 	readonly #clients: SqlClient[] = [];
 
@@ -125,6 +142,7 @@ class Db implements AsyncDisposable {
 		return SqlSessionStorage.create({
 			client: options.client ?? this.client,
 			table: this.table,
+			leaseTable: this.leaseTable,
 			createTable: options.createTable,
 		});
 	}
@@ -179,6 +197,7 @@ class Db implements AsyncDisposable {
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_meta`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.leaseTable}`);
 		for (const client of this.#clients) await client.end();
 	}
 }
@@ -509,6 +528,7 @@ for (const { adapter, url } of BACKENDS) {
 			const bothMissing = db.open({ createTable: false });
 			await expect(bothMissing).rejects.toThrow(`column ${db.table}.byte_len`);
 			await expect(bothMissing).rejects.toThrow(`table ${db.table}_parts`);
+			await expect(bothMissing).rejects.toThrow(`table ${db.leaseTable}`);
 
 			await db.sql(`ALTER TABLE ${db.table} ADD COLUMN byte_len ${adapter === "sqlite" ? "INTEGER" : "BIGINT"}`);
 			const partsMissing: unknown = await db.open({ createTable: false }).catch((error: unknown) => error);
@@ -521,8 +541,10 @@ for (const { adapter, url } of BACKENDS) {
 				`ALTER TABLE ${db.table} ADD COLUMN kind ${adapter === "mysql" ? "VARCHAR(16)" : "TEXT"} NOT NULL DEFAULT 'transcript'`,
 			);
 			await db.sql(partsSchema(adapter, db.table));
+			await db.sql(leaseSchema(adapter, db.leaseTable));
 			const metaMissing: unknown = await db.open({ createTable: false }).catch((error: unknown) => error);
 			expect((metaMissing as Error).message).toContain(`table ${db.table}_meta`);
+			expect((metaMissing as Error).message).not.toContain(db.leaseTable);
 
 			await db.sql(metaSchema(adapter, db.table));
 			await expect(db.open({ createTable: false })).rejects.toThrow(legacy);

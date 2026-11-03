@@ -1859,8 +1859,9 @@ export class SelectorController {
 									// a sibling and still report success, leaving the
 									// row here pointing at the old path. Claim the
 									// lease up front and refuse while it is held by
-									// someone else. A storage with no lease (SQL)
-									// has no other owner to refuse for.
+									// someone else. A shared store (SQL) claims
+									// optimistically and never refuses here: its
+									// refusal comes at the title write itself.
 									const storage = this.ctx.sessionManager.getStorage();
 									const claim = storage.claimSession
 										? storage.claimSession(session.id, session.path)

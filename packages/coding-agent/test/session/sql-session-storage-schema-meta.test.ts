@@ -30,6 +30,8 @@ let tableSeq = 0;
 
 class Db implements AsyncDisposable {
 	readonly table = `omp_meta_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
+	/** This fixture's own lease table, so concurrent runs on a shared database never meet each other's leases. */
+	readonly leaseTable = `${this.table}_lease`;
 	readonly client: SqlClient;
 
 	constructor(
@@ -43,6 +45,7 @@ class Db implements AsyncDisposable {
 		return SqlSessionStorage.create({
 			client: options.client ?? this.client,
 			table: this.table,
+			leaseTable: this.leaseTable,
 			sessionsRoot: ROOT,
 			adapter: this.adapter,
 			createTable: options.createTable,
@@ -78,6 +81,7 @@ class Db implements AsyncDisposable {
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_meta`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.leaseTable}`);
 		await this.client.end();
 	}
 }

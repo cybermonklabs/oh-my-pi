@@ -139,6 +139,8 @@ let tableSeq = 0;
 /** One test's tables on one database, dropped when done. */
 class Db implements AsyncDisposable {
 	readonly table = `omp_sc_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
+	/** This fixture's own lease table, so concurrent runs on a shared database never meet each other's leases. */
+	readonly leaseTable = `${this.table}_lease`;
 	readonly client: SqlClient;
 
 	constructor(
@@ -150,7 +152,13 @@ class Db implements AsyncDisposable {
 	}
 
 	open(client: SqlSessionStorageClient = this.client): Promise<SqlSessionStorage> {
-		return SqlSessionStorage.create({ client, table: this.table, sessionsRoot: this.root, adapter: this.adapter });
+		return SqlSessionStorage.create({
+			client,
+			table: this.table,
+			leaseTable: this.leaseTable,
+			sessionsRoot: this.root,
+			adapter: this.adapter,
+		});
 	}
 
 	/** A second store on the same database, as another omp process holds, with `files` written and published. */
@@ -165,6 +173,7 @@ class Db implements AsyncDisposable {
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_meta`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.leaseTable}`);
 		await this.client.end();
 	}
 }
@@ -744,6 +753,16 @@ for (const { adapter, url } of BACKENDS) {
 			await using db = new Db(adapter, url ?? "", root);
 			const reader = await db.open();
 			const manager = SessionManager.create(cwd, path.join(root, "-proj"), reader);
+			const source = manager.getSessionFile() ?? "";
+			const destination = path.join(root, "-dest", path.basename(source));
+			const other = sessionFile(root, "-other", "01a00000-0000-7000-8000-0000000000da");
+			// The destination's name carries this session's id, so it falls under
+			// this session's lease: the other store writes it before this one's
+			// first write takes that lease.
+			await db.peerWrites([
+				[destination, transcript("01a00000-0000-7000-8000-0000000000db", cwd, "someone else's")],
+				[other, transcript("o", cwd, "elsewhere")],
+			]);
 			manager.appendMessage({ role: "user", content: "moving", timestamp: 1 });
 			// The reply materializes the session, so the move has a file to move.
 			manager.appendMessage({
@@ -765,15 +784,8 @@ for (const { adapter, url } of BACKENDS) {
 			});
 			await manager.flush();
 			await reader.drain();
-			const source = manager.getSessionFile() ?? "";
-			const destination = path.join(root, "-dest", path.basename(source));
-			const other = sessionFile(root, "-other", "01a00000-0000-7000-8000-0000000000da");
+			expect(manager.getSessionFile()).toBe(source);
 			try {
-				await db.peerWrites([
-					[destination, transcript("01a00000-0000-7000-8000-0000000000db", cwd, "someone else's")],
-					[other, transcript("o", cwd, "elsewhere")],
-				]);
-
 				await expect(manager.moveTo(tempDir.join("dest"), path.join(root, "-dest"))).rejects.toThrow(
 					"holds another session",
 				);

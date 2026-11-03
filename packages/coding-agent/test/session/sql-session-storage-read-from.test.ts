@@ -40,6 +40,8 @@ let tableSeq = 0;
 /** One test's database: a fresh table name and the cleanup that drops it. */
 class Db implements AsyncDisposable {
 	readonly table = `omp_read_from_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
+	/** This fixture's own lease table, so concurrent runs on a shared database never meet each other's leases. */
+	readonly leaseTable = `${this.table}_lease`;
 	readonly client: SqlClient;
 	readonly #clients: SqlClient[] = [];
 
@@ -60,7 +62,7 @@ class Db implements AsyncDisposable {
 	}
 
 	open(client: SqlSessionStorageClient = this.client): Promise<SqlSessionStorage> {
-		return SqlSessionStorage.create({ client, table: this.table });
+		return SqlSessionStorage.create({ client, table: this.table, leaseTable: this.leaseTable });
 	}
 
 	/** Run fixture SQL written with `?` placeholders on any dialect. */
@@ -74,6 +76,7 @@ class Db implements AsyncDisposable {
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_meta`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.leaseTable}`);
 		for (const client of this.#clients) await client.end();
 	}
 }

@@ -356,6 +356,7 @@ let tableSeq = 0;
  */
 class OwnTable implements AsyncDisposable {
 	readonly table = `omp_cfg_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
+	readonly leaseTable = `${this.table}_lease`;
 	readonly dsn: string;
 	readonly client: SQL;
 	readonly #drops: string[] = [];
@@ -371,6 +372,7 @@ class OwnTable implements AsyncDisposable {
 			`DROP TABLE IF EXISTS ${this.table}_parts`,
 			`DROP TABLE IF EXISTS ${this.table}_meta`,
 			`DROP TABLE IF EXISTS ${this.table}`,
+			`DROP TABLE IF EXISTS ${this.leaseTable}`,
 		);
 	}
 
@@ -515,7 +517,9 @@ for (const { adapter, url } of STORE_BACKENDS) {
 			await using own = new OwnTable(adapter, url ?? "");
 			const setup = await own.connect();
 			try {
-				await (await SqlSessionStorage.create({ client: setup.client, table: own.table })).drain();
+				await (
+					await SqlSessionStorage.create({ client: setup.client, table: own.table, leaseTable: own.leaseTable })
+				).drain();
 			} finally {
 				await setup.client.end();
 			}
@@ -526,7 +530,9 @@ for (const { adapter, url } of STORE_BACKENDS) {
 			await own.refuseWrites(`connect to ${own.dsn}${own.password ? ` as ${own.password}` : ""}`);
 			const connection = await own.connect();
 
-			const error = await failure(openSessionSqlStorage(connection, { table: own.table }));
+			const error = await failure(
+				openSessionSqlStorage(connection, { table: own.table, leaseTable: own.leaseTable }),
+			);
 
 			expect(error).toBeInstanceOf(SessionStorageConfigError);
 			expect(String((error as Error).message)).toStartWith(
@@ -542,7 +548,7 @@ for (const { adapter, url } of STORE_BACKENDS) {
 			const connection = await own.connect();
 			try {
 				setAgentDir(makeTempDir("@pi-session-storage-agent-"));
-				const storage = await openSessionSqlStorage(connection, { table: own.table });
+				const storage = await openSessionSqlStorage(connection, { table: own.table, leaseTable: own.leaseTable });
 				const dir = "/review/root/-p";
 				for (const file of ["kept", "other", "conflict"])
 					await storage.writeText(`${dir}/${file}.jsonl`, `${file}\n`);
@@ -637,7 +643,7 @@ for (const { adapter, url } of STORE_BACKENDS) {
 			await using own = new OwnTable(adapter, url ?? "");
 			const connection = await own.connect();
 			try {
-				const storage = await openSessionSqlStorage(connection, { table: own.table });
+				const storage = await openSessionSqlStorage(connection, { table: own.table, leaseTable: own.leaseTable });
 				const stored = key(own);
 				await own.sql(`INSERT INTO ${own.table} (path, content, mtime_ms, byte_len) VALUES (?, 'safe', 1, ?)`, [
 					stored,
@@ -687,7 +693,12 @@ for (const { adapter, url } of STORE_BACKENDS) {
 				4,
 				async (_storage, connection, own) => {
 					const refusal = await failure(
-						SqlSessionStorage.create({ client: connection.client, table: own.table, redact: connection.redact }),
+						SqlSessionStorage.create({
+							client: connection.client,
+							table: own.table,
+							leaseTable: own.leaseTable,
+							redact: connection.redact,
+						}),
 					);
 					expect(String((refusal as Error).message)).toContain('holds the row key "<redacted>"');
 					return refusal;
@@ -705,7 +716,13 @@ for (const { adapter, url } of STORE_BACKENDS) {
 				const secret = await redactorFor(password);
 				const client = sessionSqlTestClient(own.dsn, { max: 1 });
 				try {
-					const open = () => SqlSessionStorage.create({ client, table: own.table, redact: secret.redact });
+					const open = () =>
+						SqlSessionStorage.create({
+							client,
+							table: own.table,
+							leaseTable: own.leaseTable,
+							redact: secret.redact,
+						});
 					const storage = await open();
 					const warned = vi.spyOn(logger, "warn").mockImplementation(() => {});
 					await own.sql(`INSERT INTO ${own.table} (path, content, mtime_ms, byte_len) VALUES (?, 'safe', 1, 4)`, [

@@ -79,6 +79,7 @@ class Db implements AsyncDisposable {
 		return SqlSessionStorage.create({
 			client: this.client,
 			table: this.table,
+			leaseTable: `${this.table}_lease`,
 			sessionsRoot,
 			createTable: options.createTable,
 		});
@@ -268,6 +269,7 @@ class Db implements AsyncDisposable {
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_meta`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_lease`);
 		if (this.adapter === "postgres") {
 			for (const name of [
 				`${this.table}_refuse`,

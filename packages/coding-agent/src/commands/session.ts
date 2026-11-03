@@ -19,10 +19,10 @@ import { sessionHelp as commandHelp } from "../cli/command-help";
 import { installSessionStorageForCommand, resolveSessionFileArg } from "../cli/session-arg";
 import { runSessionKeysCommand } from "../cli/session-keys-cli";
 import { SessionMoveRefusedError } from "../session/session-manager";
-import { defaultSessionStorage, probeSessionLeases } from "../session/session-storage";
+import { defaultSessionStorage } from "../session/session-storage";
 import {
 	assertSessionsOnDisk,
-	NO_SESSION_LEASE_REASON,
+	probeStorageSessionLeases,
 	SessionStorageUnsupportedError,
 } from "../session/session-storage-config";
 import {
@@ -55,17 +55,18 @@ const UNPACK_NOTE: Record<UnpackMode, string> = {
 	forked: "The local copy of this session diverged; unpacked as a fork",
 };
 
+type DiskOnlyAction = Exclude<FileAction, "lease">;
+
 /**
- * Why each action needs session files on disk. Under `session.storage: sql`
- * a session is a database row: there is no file to pack, place, or mark, and
- * no ownership lease to probe, so each refuses rather than act on files that
- * are not the session.
+ * Why each action but `lease` needs session files on disk. Under
+ * `session.storage: sql` a session is a database row: there is no file to
+ * pack, place, or mark, so each refuses rather than act on files that are
+ * not the session. `lease` reads the store's lease table instead.
  */
-const DISK_ONLY_REASONS: Record<FileAction, string> = {
+const DISK_ONLY_REASONS: Record<DiskOnlyAction, string> = {
 	pack: "it archives a session file and its artifact directory from disk, and this store keeps the transcripts as database rows",
 	unpack: "it places a session file and its artifact directory on disk, where this store would never read them",
 	moved: "it marks the session file on disk as moved away, and this store keeps the session as a database row",
-	lease: NO_SESSION_LEASE_REASON,
 };
 
 function isSessionAction(value: string): value is SessionAction {
@@ -77,12 +78,13 @@ function isKeyAction(action: SessionAction): action is KeyAction {
 }
 
 /**
- * Probe each id's ownership lease without taking it. JSON consumers (omp-web)
- * get `{held, unknown}`; ids in neither list are free, including ids that name
+ * Probe each id's ownership lease without taking it: the file leases, or the
+ * lease table under `session.storage: sql`. JSON consumers (omp-web) get
+ * `{held, unknown}`; ids in neither list are free, including ids that name
  * no session.
  */
-function printSessionLeases(sessionIds: string[], json: boolean): void {
-	const report = probeSessionLeases(sessionIds);
+async function printSessionLeases(sessionIds: string[], json: boolean): Promise<void> {
+	const report = await probeStorageSessionLeases(defaultSessionStorage(), sessionIds, "omp session lease");
 	if (json) {
 		process.stdout.write(`${JSON.stringify(report)}\n`);
 		return;
@@ -161,20 +163,20 @@ export default class Session extends Command {
 		}
 		if (!(await installSessionStorageForCommand())) return;
 		try {
+			if (action === "lease") {
+				if (flags.cwd !== undefined || flags.to !== undefined) {
+					throw new CliUsageError(`--cwd and --to do not apply to lease. Usage: ${usage}`);
+				}
+				const sessionIds = argv.slice(1);
+				if (sessionIds.length === 0) throw new CliUsageError(`Missing session id. Usage: ${usage}`);
+				await printSessionLeases(sessionIds, flags.json === true);
+				return;
+			}
 			assertSessionsOnDisk(defaultSessionStorage(), `omp session ${action}`, DISK_ONLY_REASONS[action]);
 		} catch (error) {
 			if (!(error instanceof SessionStorageUnsupportedError)) throw error;
 			process.stderr.write(`${chalk.red(`error: ${error.message}`)}\n`);
 			process.exitCode = 1;
-			return;
-		}
-		if (action === "lease") {
-			if (flags.cwd !== undefined || flags.to !== undefined) {
-				throw new CliUsageError(`--cwd and --to do not apply to lease. Usage: ${usage}`);
-			}
-			const sessionIds = argv.slice(1);
-			if (sessionIds.length === 0) throw new CliUsageError(`Missing session id. Usage: ${usage}`);
-			printSessionLeases(sessionIds, flags.json === true);
 			return;
 		}
 		if (flags.json) throw new CliUsageError(`--json only applies to lease. Usage: ${usage}`);

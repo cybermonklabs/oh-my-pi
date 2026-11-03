@@ -25,6 +25,8 @@ const SQLITE_SCHEMA = [
 	`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT, byte_len INTEGER, kind TEXT NOT NULL DEFAULT 'transcript')`,
 	`CREATE TABLE omp_session_files_parts (path TEXT NOT NULL, start_offset INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY (path, start_offset))`,
 	`CREATE TABLE omp_session_files_meta (name TEXT PRIMARY KEY, version INTEGER NOT NULL, checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`,
+	`CREATE TABLE omp_session_leases (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL, host TEXT NOT NULL, pid INTEGER NOT NULL, acquired_at INTEGER NOT NULL, heartbeat_at INTEGER NOT NULL)`,
+	"CREATE INDEX omp_session_leases_holder ON omp_session_leases (holder)",
 	`INSERT INTO omp_session_files_meta (name, version) SELECT 'byte-len', 1 WHERE NOT EXISTS (SELECT 1 FROM omp_session_files WHERE byte_len IS NULL) ON CONFLICT (name) DO UPDATE SET version = max(omp_session_files_meta.version, excluded.version), checked_at = CURRENT_TIMESTAMP`,
 	`INSERT INTO omp_session_files_meta (name, version) SELECT 'row-key', 2 WHERE NOT EXISTS (SELECT 1 FROM omp_session_files WHERE path < 'abs:' OR (path >= 'abs;' AND path < 'sessions/') OR path >= 'sessions0') ON CONFLICT (name) DO UPDATE SET version = max(omp_session_files_meta.version, excluded.version), checked_at = CURRENT_TIMESTAMP`,
 ];
@@ -641,7 +643,9 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		await storage.refresh();
 
 		const tables = queries.filter(q => q.sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(3);
+		expect(tables).toHaveLength(4);
+		expect(tables[3]?.sql).toContain("omp_session_leases (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL");
+		expect(tables[3]?.sql).toContain("heartbeat_at TIMESTAMPTZ NOT NULL");
 		expect(tables[2]?.sql).toContain("omp_session_files_meta (name TEXT PRIMARY KEY");
 		expect(tables[0]?.sql).toContain("omp_session_files (path TEXT PRIMARY KEY");
 		expect(tables[0]?.sql).toContain("mtime_ms BIGINT");
@@ -688,7 +692,9 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		await writer.close();
 
 		const tables = queries.filter(q => q.sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(3);
+		expect(tables).toHaveLength(4);
+		expect(tables[3]?.sql).toContain("omp_session_leases (session_id VARCHAR(191) NOT NULL PRIMARY KEY");
+		expect(tables[3]?.sql).toContain("heartbeat_at DATETIME(6) NOT NULL");
 		expect(tables[2]?.sql).toContain("omp_session_files_meta (name VARCHAR(64) NOT NULL PRIMARY KEY");
 		for (const table of tables.slice(0, 2)) {
 			expect(table.sql).toContain("path VARCHAR(512) NOT NULL");

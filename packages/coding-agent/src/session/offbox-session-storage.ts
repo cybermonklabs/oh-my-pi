@@ -46,11 +46,13 @@
  *   `unlink`, `deleteSessionWithArtifacts*`): the same store, falling back
  *   to the database for a file session's path only the database holds (a
  *   row written before the session was refused).
- * - Ownership (`claimSession`, `withSessionFileLockSync`): the lease store —
- *   files for a session kept on this machine (a file session, one the check
- *   refused, a new one not yet decided), else the database store. A method
- *   keyed by session id instead of path (a lease probe) goes to the store
- *   that took that session's claim; one over many ids takes the union.
+ * - Ownership (`claimSession`, `withSessionFileLockSync`, `isSessionClaimLost`,
+ *   `leaseSessionFile`): the lease store — files for a session kept on this
+ *   machine (a file session, one the check refused, a new one not yet
+ *   decided), else the database store's SQL lease. A claim made before its
+ *   session's verdict moves to the lease store the verdict picks, before the
+ *   session's first write: the new lease is taken first, then the old one
+ *   released. A lease probe over session ids takes the union of both stores.
  * - Listing and lookup (`listFilesSync`, `listDirsSync`, `listAllSync`,
  *   `refresh`, `drain`, `confirmWrites`): both stores, or the database store
  *   alone where the file store reads live state (`refresh`) or has nothing
@@ -83,7 +85,9 @@ import { type OffboxCheck, runOffboxCheck } from "./offbox-check";
 import { isAssistantMessageLine } from "./session-entries";
 import {
 	FileSessionStorage,
+	probeSessionLeases,
 	readSessionTextFrom,
+	type SessionLeaseReport,
 	type SessionStorage,
 	type SessionStorageCapability,
 	type SessionStorageStat,
@@ -211,6 +215,12 @@ interface OffboxRoutes {
 	isSession(stem: string): boolean;
 	/** Whether the database store has confirmed `file` (it was in the database before the queued writes). */
 	databaseConfirms(file: string): boolean;
+	/**
+	 * Verdicts settled: move each claim made before its session's verdict to
+	 * the lease store the verdict picks. Runs before the write that waited for
+	 * the verdict, so a database write finds its SQL claim registered.
+	 */
+	verdictsSettled(): void;
 }
 
 /**
@@ -454,6 +464,12 @@ class OffboxBackend implements SessionStorageBackend {
 	 * whose sessions are undecided is a database path.
 	 */
 	async #routeFor(file: string, decide: boolean, content?: string): Promise<GateRoute> {
+		const route = await this.#route(file, decide, content);
+		if (decide) this.#lookup().verdictsSettled();
+		return route;
+	}
+
+	async #route(file: string, decide: boolean, content: string | undefined): Promise<GateRoute> {
 		if (this.#local.has(file)) return "local";
 		const own = transcriptStem(file);
 		if (own !== undefined && content !== undefined && !this.#verdicts.has(own)) {
@@ -652,6 +668,17 @@ export interface OffboxSessionStorageOptions {
 /** Which store serves a session in this process: `file` for a file session, `database` for the rest. */
 type StoreRoute = "file" | "database";
 
+/** A claim made while its session's verdict was pending; {@link OffboxSessionStorage} moves it when the verdict lands. */
+interface PendingClaim {
+	readonly sessionId: string;
+	readonly sessionPath: string;
+	readonly onLost: (() => void) | undefined;
+	/** The store whose lease the claim holds now. */
+	store: SessionStorage;
+	/** That lease's release; unset once released, or when the lease could not be taken. */
+	release: (() => void) | undefined;
+}
+
 /** The storage `session.storage: sql` installs when `session.sql.offboxCheck` is set; see the module doc. */
 export class OffboxSessionStorage implements SessionStorage {
 	/** The database store queues its publishes; file sessions publish in-body and confirm at once. */
@@ -663,6 +690,10 @@ export class OffboxSessionStorage implements SessionStorage {
 	readonly #routes = new Map<string, StoreRoute>();
 	/** Rows the database held for sessions refused and handed over to files here: they go with the session. */
 	readonly #staleRows = new Set<string>();
+	/** Claims made before their session's verdict, until it lands. */
+	readonly #pendingClaims = new Set<PendingClaim>();
+	/** Session paths whose claim could not take the lease its verdict picked: another process holds it. */
+	readonly #unleased = new Set<string>();
 
 	private constructor(database: IndexedSessionStorage, files: FileSessionStorage, gate: OffboxBackend) {
 		this.#database = database;
@@ -673,6 +704,7 @@ export class OffboxSessionStorage implements SessionStorage {
 			keptInFiles: stem => this.#keptInFiles(stem),
 			isSession: stem => this.#isSession(stem),
 			databaseConfirms: file => this.#database.existsConfirmedSync?.(file) ?? this.#database.existsSync(file),
+			verdictsSettled: () => this.#moveClaims(),
 		});
 	}
 
@@ -894,12 +926,61 @@ export class OffboxSessionStorage implements SessionStorage {
 	 * A session kept on this machine takes the file storage's ownership lease,
 	 * as under file storage: a file session, one the check refused, and a new
 	 * one not yet decided (its transcript may yet stay local). A database
-	 * session takes the database store's claim, which this version does not
-	 * have; there the claim guards nothing, and {@link supportsAt} says so.
+	 * session takes the database store's SQL lease, with `onLost`.
+	 *
+	 * A claim made before its session's verdict follows the verdict before
+	 * the session's first write ({@link #moveClaims}): an allowed new session
+	 * trades its file lease for the SQL lease, and a session the database
+	 * held that the check refuses trades its SQL lease for the file lease.
+	 * The release returned releases whichever lease the claim holds then.
 	 */
-	claimSession(sessionId: string, sessionPath: string): (() => void) | null {
+	claimSession(sessionId: string, sessionPath: string, onLost?: () => void): (() => void) | null {
 		const store = this.#leaseStore(sessionPath);
-		return store.claimSession ? store.claimSession(sessionId, sessionPath) : () => {};
+		const release = store.claimSession ? store.claimSession(sessionId, sessionPath, onLost) : () => {};
+		if (release === null || !this.#awaitingVerdict(sessionPath)) return release;
+		const claim: PendingClaim = { sessionId, sessionPath: path.resolve(sessionPath), onLost, store, release };
+		this.#pendingClaims.add(claim);
+		return () => {
+			this.#pendingClaims.delete(claim);
+			const held = claim.release;
+			claim.release = undefined;
+			held?.();
+		};
+	}
+
+	/**
+	 * Whether the claim over `sessionPath` is lost: the SQL lease of a
+	 * database session (another process holds it), or a claim that could not
+	 * take the file lease its verdict picked. A file lease is never lost.
+	 */
+	isSessionClaimLost(sessionPath: string): boolean {
+		if (this.#unleased.has(path.resolve(sessionPath))) return true;
+		const database: SessionStorage = this.#database;
+		return this.#leaseStore(sessionPath) === database && database.isSessionClaimLost?.(sessionPath) === true;
+	}
+
+	/** The session whose SQL lease fences `sessionPath`; none for a path kept on this machine. */
+	leaseSessionFile(sessionPath: string): string | undefined {
+		const database: SessionStorage = this.#database;
+		return this.#leaseStore(sessionPath) === database ? database.leaseSessionFile?.(sessionPath) : undefined;
+	}
+
+	/**
+	 * Which of `sessionIds` a live process holds, by either lease: the file
+	 * lease of a session kept on a machine, or the SQL lease of a database
+	 * session. An id is `unknown` when neither says held and either could
+	 * not be read.
+	 */
+	async probeSessionLeases(sessionIds: readonly string[]): Promise<SessionLeaseReport> {
+		const database: SessionStorage = this.#database;
+		const files = probeSessionLeases(sessionIds);
+		const sql = (await database.probeSessionLeases?.(sessionIds)) ?? { held: [], unknown: [] };
+		const held = new Set([...files.held, ...sql.held]);
+		const unknown = new Set([...files.unknown, ...sql.unknown]);
+		return {
+			held: sessionIds.filter(id => held.has(id)),
+			unknown: sessionIds.filter(id => !held.has(id) && unknown.has(id)),
+		};
 	}
 
 	/** The cross-process lock of the store {@link claimSession} names; none, and `operation` runs, where it has none. */
@@ -931,9 +1012,46 @@ export class OffboxSessionStorage implements SessionStorage {
 
 	/** Whether the store an optional method routes `file` to has that method. */
 	supportsAt(file: string, capability: SessionStorageCapability): boolean {
-		const leased = capability === "claimSession" || capability === "withSessionFileLockSync";
+		const leased =
+			capability === "claimSession" ||
+			capability === "withSessionFileLockSync" ||
+			capability === "isSessionClaimLost";
 		const store = leased ? this.#leaseStore(file) : this.#readStore(file);
 		return store[capability] !== undefined;
+	}
+
+	/** Whether a session governing `file` has no verdict yet and none governing it is kept in files. */
+	#awaitingVerdict(file: string): boolean {
+		const stems = this.#stemsOf(path.resolve(file));
+		if (this.#routedToFiles(stems)) return false;
+		return stems.some(stem => this.#gate.settledVerdict(stem) === undefined);
+	}
+
+	/**
+	 * Move each claim made before its session's verdict to the lease store
+	 * the verdict picked, once every verdict governing it has settled: the new
+	 * lease first, then the old one released, so the session is never
+	 * unleased. When the file lease cannot be taken (another process holds
+	 * it), the claim is lost: its holder is told and moves off.
+	 */
+	#moveClaims(): void {
+		for (const claim of this.#pendingClaims) {
+			if (this.#awaitingVerdict(claim.sessionPath)) continue;
+			this.#pendingClaims.delete(claim);
+			const store = this.#leaseStore(claim.sessionPath);
+			const held = claim.release;
+			if (store === claim.store || !held) continue;
+			const next = store.claimSession
+				? store.claimSession(claim.sessionId, claim.sessionPath, claim.onLost)
+				: () => {};
+			claim.store = store;
+			claim.release = next ?? undefined;
+			held();
+			if (next !== null) continue;
+			logger.warn("Session lease is held by another process", { sessionFile: claim.sessionPath });
+			this.#unleased.add(claim.sessionPath);
+			if (claim.onLost) queueMicrotask(claim.onLost);
+		}
 	}
 
 	openWriter(file: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {

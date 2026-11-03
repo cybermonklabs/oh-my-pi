@@ -55,12 +55,7 @@ import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession, findRecentSessionContinuation } from "../../session/session-listing";
-import { probeSessionLeases } from "../../session/session-storage";
-import {
-	assertSessionsOnDisk,
-	NO_SESSION_LEASE_REASON,
-	SessionStorageUnsupportedError,
-} from "../../session/session-storage-config";
+import { probeStorageSessionLeases, SessionStorageUnsupportedError } from "../../session/session-storage-config";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
@@ -2663,12 +2658,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					return error(id, "get_session_lease", "sessionIds must be an array of strings");
 				}
 				try {
-					assertSessionsOnDisk(session.sessionManager.getStorage(), "get_session_lease", NO_SESSION_LEASE_REASON);
+					const storage = session.sessionManager.getStorage();
+					return success(
+						id,
+						"get_session_lease",
+						await probeStorageSessionLeases(storage, sessionIds, "get_session_lease"),
+					);
 				} catch (err) {
 					if (!(err instanceof SessionStorageUnsupportedError)) throw err;
 					return error(id, "get_session_lease", err.message);
 				}
-				return success(id, "get_session_lease", probeSessionLeases(sessionIds));
 			}
 
 			case "export_html": {

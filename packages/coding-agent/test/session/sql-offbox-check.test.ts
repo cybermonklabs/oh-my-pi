@@ -59,6 +59,8 @@ let tableSeq = 0;
 /** One test's tables on one database, dropped when done. */
 class Db implements AsyncDisposable {
 	readonly table = `omp_offbox_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
+	/** This test's own lease table, so concurrent runs on a shared database never meet each other's leases. */
+	readonly leaseTable = `${this.table}_lease`;
 	readonly client: SqlClient;
 	readonly statements: Array<{ sql: string; values: unknown[] }> = [];
 	readonly recording: SqlSessionStorageClient;
@@ -87,7 +89,12 @@ class Db implements AsyncDisposable {
 
 	/** A plain SQL store, as `sql` without the check opens it. */
 	plain(sessionsRoot: string): Promise<SqlSessionStorage> {
-		return SqlSessionStorage.create({ client: this.recording, table: this.table, sessionsRoot });
+		return SqlSessionStorage.create({
+			client: this.recording,
+			table: this.table,
+			leaseTable: this.leaseTable,
+			sessionsRoot,
+		});
 	}
 
 	/** The storage `sql` with the check installs, over this test's tables. */
@@ -95,7 +102,13 @@ class Db implements AsyncDisposable {
 		return OffboxSessionStorage.create({
 			check,
 			openDatabase: wrapBackend =>
-				SqlSessionStorage.create({ client: this.recording, table: this.table, sessionsRoot, wrapBackend }),
+				SqlSessionStorage.create({
+					client: this.recording,
+					table: this.table,
+					leaseTable: this.leaseTable,
+					sessionsRoot,
+					wrapBackend,
+				}),
 		});
 	}
 
@@ -127,6 +140,7 @@ class Db implements AsyncDisposable {
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_meta`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.leaseTable}`);
 		await this.client.end();
 	}
 }

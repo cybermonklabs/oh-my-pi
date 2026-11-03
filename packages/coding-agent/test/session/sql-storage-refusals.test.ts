@@ -41,7 +41,6 @@ import { getAgentDir, postmortem, setAgentDir, TempDir } from "@oh-my-pi/pi-util
 import type { Component, OverlayHandle, OverlayOptions } from "@oh-my-pi/pi-tui";
 import * as theme from "@oh-my-pi/pi-tui/theme";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
-import { rejectionOf } from "../helpers/rejection";
 
 type Kind = "file" | "sql";
 
@@ -357,22 +356,30 @@ for (const kind of ["file", "sql"] as const) {
 			});
 		}
 
-		test(`omp session lease ${refuses ? "refuses" : "reports the probe"}`, async () => {
-			await openFixture(kind);
-			const stderr = captureStderr();
+		// Not a refusal: under `sql` the probes read the lease table, so a live
+		// writer's session reads as held under both storages alike.
+		test("omp session lease reports a session a live writer holds, and free once it closes", async () => {
+			const fx = await openFixture(kind);
 			const stdout = captureStdout();
+			const writer = await SessionManager.open(fx.sessionFile, undefined, fx.storage);
+			writer.appendMessage({ role: "user", content: "takes the lease", timestamp: Date.now() });
+			await writer.flush();
 
-			await new Session(["lease", "--json", "--", "no-such-session"], TEST_CONFIG).run();
+			await new Session(["lease", "--json", "--", fx.sessionId, "no-such-session"], TEST_CONFIG).run();
+			await writer.close();
+			await new Session(["lease", "--json", "--", fx.sessionId], TEST_CONFIG).run();
 
-			if (refuses) {
-				expect(stderr()).toContain(`omp session lease ${SQL_REFUSAL}: SQL-stored sessions take no ownership lease`);
-				expect(stdout()).toBe("");
-			} else {
-				expect(JSON.parse(stdout())).toEqual({ held: [], unknown: [] });
-			}
+			const reports = stdout()
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(reports).toEqual([
+				{ held: [fx.sessionId], unknown: [] },
+				{ held: [], unknown: [] },
+			]);
 		});
 
-		test(`RPC get_session_lease ${refuses ? "answers with the refusal" : "reports the probe"}`, async () => {
+		test("RPC get_session_lease reports a session a live writer holds, and free once it closes", async () => {
 			const fx = await openFixture(kind);
 			const env: Record<string, string> = {
 				HOME: fx.dir.join("home"),
@@ -385,6 +392,9 @@ for (const kind of ["file", "sql"] as const) {
 				ANTHROPIC_API_KEY: "test-key",
 				OMP_SESSION_STORAGE: kind,
 			};
+			// The RPC process probes the file leases this process takes, in the test-run lease directory.
+			if (process.env.PI_TEST_SESSION_OWNERS_DIR)
+				env.PI_TEST_SESSION_OWNERS_DIR = process.env.PI_TEST_SESSION_OWNERS_DIR;
 			if (fx.dsnFile) env.OMP_SESSION_SQL_DSN_FILE = fx.dsnFile;
 			const client = new RpcClient({
 				command: [process.execPath, CLI_ENTRY],
@@ -394,18 +404,19 @@ for (const kind of ["file", "sql"] as const) {
 				model: "claude-sonnet-4-5",
 				args: ["--no-lsp", "--no-extensions", "--no-tools"],
 			});
+			const writer = await SessionManager.open(fx.sessionFile, undefined, fx.storage);
 			try {
+				writer.appendMessage({ role: "user", content: "takes the lease", timestamp: Date.now() });
+				await writer.flush();
 				await client.start();
-				if (refuses) {
-					expect(await rejectionOf(client.getSessionLease(["no-such-session"]))).toMatchObject({
-						message: expect.stringContaining(
-							`get_session_lease ${SQL_REFUSAL}: SQL-stored sessions take no ownership lease`,
-						),
-					});
-				} else {
-					expect(await client.getSessionLease(["no-such-session"])).toEqual({ held: [], unknown: [] });
-				}
+				expect(await client.getSessionLease([fx.sessionId, "no-such-session"])).toEqual({
+					held: [fx.sessionId],
+					unknown: [],
+				});
+				await writer.close();
+				expect(await client.getSessionLease([fx.sessionId])).toEqual({ held: [], unknown: [] });
 			} finally {
+				await writer.close();
 				await client.stop();
 			}
 		}, 120_000);

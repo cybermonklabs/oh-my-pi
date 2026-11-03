@@ -4,6 +4,7 @@ import { toError } from "@oh-my-pi/pi-utils";
 import {
 	childDirNames,
 	childKeyName,
+	SessionLeaseLostError,
 	SessionWriteConflictError,
 	type SessionStorage,
 	type SessionStorageStat,
@@ -416,6 +417,20 @@ export class IndexedSessionStorage implements SessionStorage {
 		const error = this.#firstDrainError;
 		this.#firstDrainError = undefined;
 		if (error) throw error;
+	}
+
+	/**
+	 * Resolve once every backend publish queued for a path `matches` accepts
+	 * has settled, those queued while waiting included; a failure is the
+	 * publisher's to report. Unlike {@link drain}, publishes to other paths
+	 * are not awaited.
+	 */
+	async settleWrites(matches: (path: string) => boolean): Promise<void> {
+		for (;;) {
+			const pending = [...this.#pathPending].filter(([path]) => matches(path)).map(([, op]) => op);
+			if (pending.length === 0) return;
+			await Promise.allSettled(pending);
+		}
 	}
 
 	ensureDirSync(_dir: string): void {
@@ -1007,7 +1022,11 @@ export class IndexedSessionStorage implements SessionStorage {
 		const operation = Promise.all(previous).then(task);
 		const tracked = operation.catch(err => {
 			const error = toError(err);
-			if (options.trackDrain && !this.#firstDrainError) this.#firstDrainError = error;
+			// A refused write under a lost session lease is the session manager's
+			// to handle: it publishes the whole transcript to a sibling instead.
+			if (options.trackDrain && !this.#firstDrainError && !(error instanceof SessionLeaseLostError)) {
+				this.#firstDrainError = error;
+			}
 			throw error;
 		});
 		const tail = tracked.catch(() => {});

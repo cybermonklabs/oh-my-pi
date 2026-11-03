@@ -137,6 +137,25 @@ export class SessionWriteConflictError extends Error {
 }
 
 /**
+ * A write to a session's key prefix was refused because another process holds
+ * the session's lease: this process's claim on it was lost (another process
+ * took it after it expired), it never got it (another process held it when it
+ * claimed), or it never claimed and the lease is another process's. The write
+ * changed nothing. `sessionId` names the lease (the main session's id).
+ */
+export class SessionLeaseLostError extends Error {
+	readonly path: string;
+	readonly sessionId: string;
+
+	constructor(path: string, sessionId: string) {
+		super(`Cannot change ${path}: another omp process holds the lease of session ${sessionId}.`);
+		this.name = "SessionLeaseLostError";
+		this.path = path;
+		this.sessionId = sessionId;
+	}
+}
+
+/**
  * The file publish lock is held by another live writer, so freshness cannot
  * be established. Fail-closed: the staged rewrite is discarded without
  * publishing.
@@ -315,8 +334,40 @@ export interface SessionStorage {
 	 * then moves its session to a sibling instead of writing that file.
 	 * Optional because only backends with a process-owned lock can tell that
 	 * another process writes a session.
+	 *
+	 * A shared database store (`SqlSessionStorage`) claims optimistically: it
+	 * returns the release at once and runs its claim statement before the
+	 * first write it fences. A refused claim surfaces as
+	 * {@link SessionLeaseLostError} from that write, after which
+	 * {@link isSessionClaimLost} reports it. Such a store calls `onLost`
+	 * (asynchronously, at most once per loss) when it finds the claim lost,
+	 * whether by a refused claim or write or by a heartbeat, until the release
+	 * runs; other storages ignore it.
 	 */
-	claimSession?(sessionId: string, sessionPath: string): (() => void) | null;
+	claimSession?(sessionId: string, sessionPath: string, onLost?: () => void): (() => void) | null;
+	/**
+	 * Whether the claim this storage holds over `sessionPath` (the session's
+	 * own claim, or the claim of the session whose key prefix holds it) is
+	 * lost: another process holds the lease, so every write under it is
+	 * refused. `false` when no claim covers the path. Only storages whose
+	 * {@link claimSession} is optimistic implement it.
+	 */
+	isSessionClaimLost?(sessionPath: string): boolean;
+	/**
+	 * The session file whose lease fences writes to `sessionPath`: the main
+	 * session whose key prefix holds it (`sessionPath` itself for a main
+	 * session; its parent for a subagent transcript `<stem>/<Agent>.jsonl`
+	 * at any depth), or `undefined` when no lease covers it. Implemented by
+	 * the storages that implement {@link isSessionClaimLost}.
+	 */
+	leaseSessionFile?(sessionPath: string): string | undefined;
+	/**
+	 * Which of `sessionIds` a live process holds the lease of, read from the
+	 * storage's own lease records, for `omp session lease` and RPC
+	 * `get_session_lease`. Storages without it use the file leases
+	 * ({@link probeSessionLeases}).
+	 */
+	probeSessionLeases?(sessionIds: readonly string[]): Promise<SessionLeaseReport>;
 	/**
 	 * Atomically delete a session and its artifacts only when `shouldDelete`
 	 * accepts the current session content. Optional because backends without a
@@ -328,7 +379,7 @@ export interface SessionStorage {
 	 * storage that routes sessions between backends implements it
 	 * (`session.sql.offboxCheck`): it has every optional method, but each
 	 * applies only where the backend serving the path has it (a session kept
-	 * in local files takes the file lease; a database session takes none).
+	 * in local files takes the file lease; a database session takes the SQL lease).
 	 * Callers probe through {@link supportsAt}, never by the method's presence.
 	 */
 	supportsAt?(path: string, capability: SessionStorageCapability): boolean;
@@ -358,9 +409,14 @@ export async function refreshSessionIndex(storage: SessionStorage, scope: Sessio
 	}
 }
 
-/** The optional {@link SessionStorage} methods a caller probes before it calls one. */
+/**
+ * The optional {@link SessionStorage} methods a caller probes before it calls
+ * one. `isSessionClaimLost` marks a path whose claim is optimistic: it answers
+ * at the first write it fences, not when it is made.
+ */
 export type SessionStorageCapability =
 	| "claimSession"
+	| "isSessionClaimLost"
 	| "withSessionFileLockSync"
 	| "deleteSessionWithArtifactsIf"
 	| "readTextSync";

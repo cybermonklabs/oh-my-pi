@@ -57,6 +57,7 @@ async function seed(adapter: SqlSessionStorageAdapter, url: string) {
 	tempDir = TempDir.createSync("@omp-sql-move-no-replace-");
 	setAgentDir(tempDir.join("agent"));
 	const table = `omp_mvnr_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
+	const leaseTable = `${table}_lease`;
 	const databaseUrl = adapter === "sqlite" ? `sqlite:${tempDir.join("sessions.db")}` : url;
 	/**
 	 * A client of the shared database, as each omp process holds its own;
@@ -64,12 +65,28 @@ async function seed(adapter: SqlSessionStorageAdapter, url: string) {
 	 */
 	const connect = async (
 		wrap?: (client: SQL) => SqlSessionStorageClient,
-	): Promise<{ client: SQL; storage: SqlSessionStorage }> => {
+	): Promise<{ client: SQL; storage: SqlSessionStorage; commit(file: string, content: string): Promise<void> }> => {
 		const client = sessionSqlTestClient(databaseUrl);
 		clients.push(client);
+		const storage = await SqlSessionStorage.create({
+			client: wrap ? wrap(client) : client,
+			table,
+			leaseTable,
+			adapter,
+		});
 		return {
 			client,
-			storage: await SqlSessionStorage.create({ client: wrap ? wrap(client) : client, table, adapter }),
+			storage,
+			// An external SQL client need not honor omp's lease. Keep exercising
+			// primary-key collision/rollback protection, not the earlier lease fence.
+			async commit(file, content) {
+				const values = adapter === "postgres" ? "$1, $2, 1, $3" : "?, ?, 1, ?";
+				await client.unsafe(`INSERT INTO ${table} (path, content, mtime_ms, byte_len) VALUES (${values})`, [
+					storage.keyFor(file),
+					content,
+					Buffer.byteLength(content),
+				]);
+			},
 		};
 	};
 	const { client, storage } = await connect();
@@ -77,6 +94,7 @@ async function seed(adapter: SqlSessionStorageAdapter, url: string) {
 		await client.unsafe(`DROP TABLE IF EXISTS ${table}_parts`);
 		await client.unsafe(`DROP TABLE IF EXISTS ${table}_meta`);
 		await client.unsafe(`DROP TABLE IF EXISTS ${table}`);
+		await client.unsafe(`DROP TABLE IF EXISTS ${leaseTable}`);
 	});
 	const cwd = tempDir.join("from");
 	const sessionDir = path.join(getSessionsDir(), "--from--");
@@ -121,15 +139,13 @@ async function seed(adapter: SqlSessionStorageAdapter, url: string) {
 }
 
 /**
- * Make `other` commit a session at `key` when `storage` is about to rename
- * `from`: after the move's checks (its refresh and header reads), before the
- * rename. Spies on whichever rename the move uses; the refusing one does not
- * exist before the fix.
+ * Commit a session at `key` after the move's refresh and header checks but
+ * before its rename, through an independent database client.
  */
 function commitBeforeRename(
 	storage: SqlSessionStorage,
 	from: string,
-	other: SqlSessionStorage,
+	publish: (file: string, content: string) => Promise<void>,
 	key: string,
 ): { wrote: boolean } {
 	const commit = { wrote: false };
@@ -139,8 +155,7 @@ function commitBeforeRename(
 		vi.spyOn(storage, method).mockImplementation(async (src: string, dst: string) => {
 			if (!commit.wrote && src === from) {
 				commit.wrote = true;
-				await other.writeText(key, transcript("theirs"));
-				await other.drain();
+				await publish(key, transcript("theirs"));
 			}
 			return original(src, dst);
 		});
@@ -155,8 +170,7 @@ for (const { adapter, url } of BACKENDS) {
 			const sourceBefore = await stored(source);
 			expect(sourceBefore).toContain("question");
 			const other = await connect();
-			await other.storage.writeText(destination, transcript("theirs"));
-			await other.storage.drain();
+			await other.commit(destination, transcript("theirs"));
 
 			const error = await manager.moveTo(to).then(
 				() => undefined,
@@ -177,8 +191,7 @@ for (const { adapter, url } of BACKENDS) {
 			const other = await connect();
 			// A copy of this session's journal: another process may have it open.
 			const copy = `${sourceBefore!}${transcript("appended-by-the-other-client")}`;
-			await other.storage.writeText(destination, copy);
-			await other.storage.drain();
+			await other.commit(destination, copy);
 
 			const error = await manager.moveTo(to).then(
 				() => undefined,
@@ -199,8 +212,7 @@ for (const { adapter, url } of BACKENDS) {
 			const child = path.join(artifactsDir, "A.jsonl");
 			const childDestination = path.join(destination.slice(0, -".jsonl".length), "A.jsonl");
 			const other = await connect();
-			await other.storage.writeText(childDestination, transcript("theirs"));
-			await other.storage.drain();
+			await other.commit(childDestination, transcript("theirs"));
 
 			const error = await manager.moveTo(to).then(
 				() => undefined,
@@ -246,7 +258,7 @@ for (const { adapter, url } of BACKENDS) {
 			const { storage, manager, source, destination, to, connect, stored } = await seed(adapter, url!);
 			const sourceBefore = await stored(source);
 			const other = await connect();
-			const commit = commitBeforeRename(storage, source, other.storage, destination);
+			const commit = commitBeforeRename(storage, source, other.commit, destination);
 
 			const error = await manager.moveTo(to).then(
 				() => undefined,
@@ -268,7 +280,7 @@ for (const { adapter, url } of BACKENDS) {
 			const child = path.join(artifactsDir, "A.jsonl");
 			const childDestination = path.join(destination.slice(0, -".jsonl".length), "A.jsonl");
 			const other = await connect();
-			const commit = commitBeforeRename(storage, child, other.storage, childDestination);
+			const commit = commitBeforeRename(storage, child, other.commit, childDestination);
 
 			const error = await manager.moveTo(to).then(
 				() => undefined,
@@ -299,8 +311,7 @@ for (const { adapter, url } of BACKENDS) {
 			const renameNoReplace = storage.renameNoReplace.bind(storage);
 			vi.spyOn(storage, "renameNoReplace").mockImplementation(async (from: string, dest: string) => {
 				if (from === childB) {
-					await other.storage.writeText(childA, transcript("theirs"));
-					await other.storage.drain();
+					await other.commit(childA, transcript("theirs"));
 					throw new Error("database rejected child B");
 				}
 				return renameNoReplace(from, dest);

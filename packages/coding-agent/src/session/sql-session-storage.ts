@@ -1,4 +1,7 @@
+import { randomBytes } from "node:crypto";
+import * as os from "node:os";
 import * as path from "node:path";
+import { toError } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 import * as logger from "@oh-my-pi/pi-utils/logger";
@@ -9,7 +12,7 @@ import {
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
-import { SessionWriteConflictError } from "./session-storage";
+import { SessionLeaseLostError, type SessionLeaseReport, SessionWriteConflictError } from "./session-storage";
 import { eexist, enoent } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
@@ -171,6 +174,18 @@ export interface SqlSessionStorageOptions {
 	redact?: (text: string) => string;
 	/** Wrap the backend before indexing or publishing, so the off-box check can route every operation. */
 	wrapBackend?: (backend: SessionStorageBackend) => SessionStorageBackend;
+	/**
+	 * Lease table name. Default: `omp_session_leases`. Rows are keyed by
+	 * session id, so every session table of a database may share one. Must
+	 * match `[A-Za-z_][A-Za-z0-9_]{0,55}`: at most 56 characters, so its
+	 * index `<leaseTable>_holder` fits the 63-character identifier limit.
+	 */
+	leaseTable?: string;
+	/**
+	 * Milliseconds between heartbeats of the leases this store holds.
+	 * Default: {@link SESSION_LEASE_HEARTBEAT_MS}.
+	 */
+	leaseHeartbeatMs?: number;
 }
 
 /**
@@ -247,8 +262,8 @@ interface DialectQueries {
 	columns: Statement;
 	/** Whether index `@index` of table `@table` exists, probed so start-up takes no DDL lock once it does. */
 	indexExists: Statement;
-	/** Indexes that serve the scoped index reads and the start-up checks, created after the columns they cover. */
-	indexes: ReadonlyArray<{ name: string; ddl: string }>;
+	/** Indexes that serve the scoped index reads, the start-up checks and the heartbeat, created after the columns they cover. */
+	indexes: ReadonlyArray<{ name: string; table: string; ddl: string }>;
 	/**
 	 * Index snapshots, metadata only: every row; the rows under one key prefix
 	 * (`@lo` up to `@hi`, `@floor` below it), or under two (`@lo2`, `@hi2`,
@@ -300,6 +315,46 @@ interface DialectQueries {
 	readSlices: Statement;
 	/** The session's size and its bytes from an offset: the session row's and those of the parts covering the window. */
 	readFrom: Statement;
+	/** The lease table: one row per leased session (`session_id`, `holder`, `host`, `pid`, `acquired_at`, `heartbeat_at`). */
+	createLeaseTable: string;
+	/**
+	 * Claim `@sid` for `@holder` (PostgreSQL, SQLite): insert the lease, or take
+	 * it over when its heartbeat expired or `@holder` already holds it. Returns
+	 * a row when the claim succeeded.
+	 */
+	claimLease: Statement;
+	/**
+	 * MySQL's claim, one transaction: lock the lease row (`holder`, and
+	 * `stale` 1 when its heartbeat expired), then insert or take it over.
+	 * `takeLease` sets `acquired_at` first, because MySQL assigns left to right.
+	 */
+	lockLease: Statement;
+	insertLease: Statement;
+	takeLease: Statement;
+	/** Refresh every lease `@holder` holds; returns their `session_id` (MySQL reads them back with `leasesOf`). */
+	heartbeat: Statement;
+	leasesOf: Statement;
+	releaseLease: Statement;
+	/** `@holder`'s lease row of `@sid`, share-locked for the rest of the transaction where the dialect can. */
+	heldLease: Statement;
+	/** A lease row of `@sid` that a holder other than `@holder` refreshed within the expiry. */
+	foreignLease: Statement;
+	/** Whether any holder refreshed `@sid`'s lease within the expiry. */
+	freshLease: Statement;
+	/**
+	 * PostgreSQL's fenced appends, one statement each: the append runs only
+	 * when `@holder` holds `@sid`'s lease (`held`, which share-locks the lease
+	 * row) or no other holder's lease of it is fresh (`foreign`), and returns
+	 * `written` 1 when it ran. Other dialects check the lease in the append's
+	 * transaction instead.
+	 */
+	fencedAppend: { held: Statement; foreign: Statement } | undefined;
+}
+
+/** `lockLease` row. */
+interface LeaseLockRow {
+	holder: string;
+	stale: number | bigint | string;
 }
 
 interface IndexRow {
@@ -366,6 +421,12 @@ export function sessionTableName(table: string = DEFAULT_TABLE): string {
 			`${JSON.stringify(`${table}_parts`)} stays a valid identifier (got ${JSON.stringify(table)})`,
 	);
 }
+const DEFAULT_LEASE_TABLE = "omp_session_leases";
+const LEASE_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,55}$/;
+/** A lease whose heartbeat is older than this, by the database's clock, is free to take over. */
+export const SESSION_LEASE_EXPIRY_MS = 90_000;
+/** How often a store refreshes the heartbeat of every lease it holds. */
+export const SESSION_LEASE_HEARTBEAT_MS = 30_000;
 /** Largest part a full write stores; an append stores its line as one part. */
 const PART_BYTES = 1024 * 1024;
 const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
@@ -633,7 +694,7 @@ export function schemaCheckStatements(adapter: SqlSessionStorageAdapter, table?:
 	};
 }
 
-function buildQueries(adapter: SqlSessionStorageAdapter, table: string): DialectQueries {
+function buildQueries(adapter: SqlSessionStorageAdapter, table: string, leases = DEFAULT_LEASE_TABLE): DialectQueries {
 	const parts = `${table}_parts`;
 	const meta = `${table}_meta`;
 	const sql = (template: string): Statement => statement(adapter, template);
@@ -667,23 +728,31 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			: `(${pathComparison} >= ${lo} AND ${pathComparison} < ${hi})`;
 	const quote = (text: string): string => `'${text}'`;
 	const createIndex = mysql ? "CREATE INDEX" : "CREATE INDEX IF NOT EXISTS";
-	const indexes = [{ name: `${table}_km`, ddl: `${createIndex} ${table}_km ON ${table} (kind, mtime_ms)` }];
+	const indexes = [{ name: `${table}_km`, table, ddl: `${createIndex} ${table}_km ON ${table} (kind, mtime_ms)` }];
 	if (adapter === "postgres") {
-		indexes.push({ name: `${table}_kp`, ddl: `${createIndex} ${table}_kp ON ${table} (path COLLATE "C")` });
+		indexes.push({ name: `${table}_kp`, table, ddl: `${createIndex} ${table}_kp ON ${table} (path COLLATE "C")` });
 	}
 	const unmeasured = "byte_len IS NULL";
 	if (mysql) {
 		// MySQL has no partial indexes. This is the equivalent index for its
 		// `WHERE byte_len IS NULL LIMIT 1` start-up probe.
-		indexes.push({ name: `${table}_nolen`, ddl: `${createIndex} ${table}_nolen ON ${table} (byte_len)` });
+		indexes.push({ name: `${table}_nolen`, table, ddl: `${createIndex} ${table}_nolen ON ${table} (byte_len)` });
 	} else {
 		// Empty once every row is measured: a write pays nothing for it, and the
 		// unmeasured-row probe is one lookup in an empty index, not a table scan.
 		indexes.push({
 			name: `${table}_nolen`,
+			table,
 			ddl: `${createIndex} ${table}_nolen ON ${table} (path) WHERE ${unmeasured}`,
 		});
 	}
+	// The heartbeat updates one holder's rows. Without this index MySQL's
+	// UPDATE would lock every lease row it scans, other processes' included.
+	indexes.push({
+		name: `${leases}_holder`,
+		table: leases,
+		ddl: `${createIndex} ${leases}_holder ON ${leases} (holder)`,
+	});
 	// A legacy key is any key outside the `abs:` and `sessions/` prefixes: three
 	// ranges of the key order, so the probe seeks the key index instead of scanning.
 	const absEnd = keyUpperBound(ABSOLUTE_KEY_PREFIX);
@@ -718,6 +787,36 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 	const appendRow = `INSERT INTO ${table} (path, content, mtime_ms, byte_len, kind) VALUES (@path, '', @mtime, @len, @kind) `;
 	// Scalar subqueries rather than a CTE, so MySQL 5.7 runs this too.
 	const tailStart = `(SELECT byte_len FROM ${table} WHERE path = @path) - @suffix`;
+	// Every lease time is the database's clock; no box clock is ever compared.
+	// SQLite stores them as epoch milliseconds.
+	const leaseNow = {
+		postgres: "now()",
+		mysql: "UTC_TIMESTAMP(6)",
+		sqlite: "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+	}[adapter];
+	const leaseExpired = {
+		postgres: `now() - interval '${SESSION_LEASE_EXPIRY_MS / 1000} seconds'`,
+		mysql: `UTC_TIMESTAMP(6) - INTERVAL ${SESSION_LEASE_EXPIRY_MS / 1000} SECOND`,
+		sqlite: `${leaseNow} - ${SESSION_LEASE_EXPIRY_MS}`,
+	}[adapter];
+	const leaseTime = { postgres: "TIMESTAMPTZ", mysql: "DATETIME(6)", sqlite: "INTEGER" }[adapter];
+	const shareLock = { postgres: " FOR SHARE", mysql: " LOCK IN SHARE MODE", sqlite: "" }[adapter];
+	const leaseColumns = "session_id, holder, host, pid, acquired_at, heartbeat_at";
+	const leaseValues = `@sid, @holder, @host, @pid, ${leaseNow}, ${leaseNow}`;
+	const heldLease = `SELECT 1 AS found FROM ${leases} WHERE session_id = @sid AND holder = @holder`;
+	const foreignLease =
+		`SELECT 1 AS found FROM ${leases} WHERE session_id = @sid AND holder <> @holder ` +
+		`AND heartbeat_at >= ${leaseExpired}`;
+	const fencedAppend = (lease: string, guard: "EXISTS" | "NOT EXISTS"): Statement =>
+		sql(
+			`WITH lease AS (${lease}), s AS (INSERT INTO ${table} (path, content, mtime_ms, byte_len, kind) ` +
+				`SELECT @path, '', @mtime, @len, @kind WHERE ${guard} (SELECT 1 FROM lease) ` +
+				`ON CONFLICT (path) DO UPDATE SET byte_len = ${table}.byte_len + excluded.byte_len, ` +
+				`mtime_ms = excluded.mtime_ms RETURNING byte_len), ` +
+				`p AS (INSERT INTO ${parts} (path, start_offset, content) ` +
+				`SELECT @path, s.byte_len - @len, @content FROM s WHERE @len > 0) ` +
+				"SELECT count(*) AS written FROM s",
+		);
 
 	return {
 		createTable: mysql
@@ -919,6 +1018,45 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path ` +
 				`AND start_offset <= ${bigint("@offset")})`,
 		),
+		createLeaseTable:
+			`CREATE TABLE IF NOT EXISTS ${leases} (` +
+			`session_id ${mysql ? "VARCHAR(191) NOT NULL" : "TEXT"} PRIMARY KEY, ` +
+			`holder ${mysql ? "VARCHAR(64)" : "TEXT"} NOT NULL, ` +
+			`host ${mysql ? "VARCHAR(255)" : "TEXT"} NOT NULL, ` +
+			`pid INTEGER NOT NULL, ` +
+			`acquired_at ${leaseTime} NOT NULL, ` +
+			`heartbeat_at ${leaseTime} NOT NULL` +
+			(mysql ? mysqlTable : ")"),
+		claimLease: sql(
+			`INSERT INTO ${leases} (${leaseColumns}) VALUES (${leaseValues}) ` +
+				"ON CONFLICT (session_id) DO UPDATE SET holder = excluded.holder, host = excluded.host, pid = excluded.pid, " +
+				`acquired_at = CASE WHEN ${leases}.holder = excluded.holder THEN ${leases}.acquired_at ` +
+				"ELSE excluded.acquired_at END, heartbeat_at = excluded.heartbeat_at " +
+				`WHERE ${leases}.heartbeat_at < ${leaseExpired} OR ${leases}.holder = excluded.holder RETURNING holder`,
+		),
+		lockLease: sql(
+			`SELECT holder, CASE WHEN heartbeat_at < ${leaseExpired} THEN 1 ELSE 0 END AS stale ` +
+				`FROM ${leases} WHERE session_id = @sid FOR UPDATE`,
+		),
+		insertLease: sql(`INSERT INTO ${leases} (${leaseColumns}) VALUES (${leaseValues})`),
+		takeLease: sql(
+			`UPDATE ${leases} SET acquired_at = CASE WHEN holder = @holder THEN acquired_at ELSE ${leaseNow} END, ` +
+				`holder = @holder, host = @host, pid = @pid, heartbeat_at = ${leaseNow} WHERE session_id = @sid`,
+		),
+		heartbeat: sql(
+			`UPDATE ${leases} SET heartbeat_at = ${leaseNow} WHERE holder = @holder${mysql ? "" : " RETURNING session_id"}`,
+		),
+		leasesOf: sql(`SELECT session_id FROM ${leases} WHERE holder = @holder`),
+		releaseLease: sql(`DELETE FROM ${leases} WHERE session_id = @sid AND holder = @holder`),
+		heldLease: sql(heldLease + shareLock),
+		// A locking read on MySQL: a plain one would fix the transaction's
+		// snapshot before the session row lock (see #deleteParts).
+		foreignLease: sql(foreignLease + (mysql ? shareLock : "")),
+		freshLease: sql(`SELECT 1 AS found FROM ${leases} WHERE session_id = @sid AND heartbeat_at >= ${leaseExpired}`),
+		fencedAppend:
+			adapter === "postgres"
+				? { held: fencedAppend(heldLease + shareLock, "EXISTS"), foreign: fencedAppend(foreignLease, "NOT EXISTS") }
+				: undefined,
 	};
 }
 
@@ -951,16 +1089,67 @@ function isDeadlockError(error: unknown): boolean {
 	const sqlState = "sqlState" in error ? error.sqlState : undefined;
 	return errno === 1213 || errno === "40P01" || errno === "40001" || sqlState === "40001";
 }
-/**
- * A primary-key collision, as each dialect reports it: PostgreSQL
- * `unique_violation` (SQLSTATE 23505), MySQL `ER_DUP_ENTRY` (errno 1062,
- * SQLSTATE 23000), SQLite `SQLITE_CONSTRAINT_PRIMARYKEY` (extended code 1555).
- */
+/** A primary-key collision, as each dialect reports it. */
 function isPrimaryKeyViolation(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	const errno = "errno" in error ? error.errno : undefined;
 	const code = "code" in error ? error.code : undefined;
 	return errno === "23505" || errno === 1062 || code === "SQLITE_CONSTRAINT_PRIMARYKEY";
+}
+
+/** MySQL `ER_DUP_ENTRY` (errno 1062): another claim inserted the lease row first. */
+function isDuplicateKeyError(error: unknown): boolean {
+	return error instanceof Error && "errno" in error && error.errno === 1062;
+}
+
+/**
+ * The lease a row key falls under when no claim of this store covers it: for
+ * `sessions/<cwd>/<stem>.jsonl` and every key under `sessions/<cwd>/<stem>/`,
+ * the part of `<stem>` after its first `_` (session files are named
+ * `<timestamp>_<id>.jsonl`), with the main session's key stem
+ * `sessions/<cwd>/<stem>`. Any other key (`abs:…`, a file that is no session
+ * of the cwd directory) falls under no lease.
+ */
+function derivedLease(key: string): { id: string; stem: string } | undefined {
+	if (!key.startsWith(ROOT_KEY_PREFIX)) return undefined;
+	const [cwd, name, ...below] = key.slice(ROOT_KEY_PREFIX.length).split("/");
+	if (name === undefined) return undefined;
+	if (below.length === 0 && !name.endsWith(".jsonl")) return undefined;
+	const stem = below.length === 0 ? name.slice(0, -".jsonl".length) : name;
+	const separator = stem.indexOf("_");
+	if (separator < 0 || separator === stem.length - 1) return undefined;
+	return { id: stem.slice(separator + 1), stem: `${ROOT_KEY_PREFIX}${cwd}/${stem}` };
+}
+
+/** This store's claim on one session lease, shared by every claim of a key under it. */
+interface LeaseClaim {
+	/** The lease's session id: the main session's id. */
+	readonly leaseId: string;
+	/** Key stems (`<key minus .jsonl>`) of the claimed sessions: a key equal to `<stem>.jsonl` or under `<stem>/` is under this lease. */
+	readonly stems: Set<string>;
+	/** Release callbacks not yet run. */
+	refs: number;
+	/** `lost` once the claim statement, a fenced write or a heartbeat found another holder. */
+	state: "pending" | "held" | "lost";
+	/** The claim statement, in flight or answered; cleared when it failed, so the next fenced write runs it again. */
+	attempt: Promise<boolean> | undefined;
+	/** Heartbeat round current when the claim statement answered: only a later round can find the lease gone. */
+	heldRound: number;
+	/**
+	 * The release of this lease's previous claim, in flight when this one
+	 * was made: its row delete must land before this claim's statement.
+	 */
+	readonly after: Promise<void> | undefined;
+	/** What each live `claimSession` caller under this claim asked to be told when it is found lost. */
+	readonly listeners: Set<() => void>;
+}
+
+/** A lease one write must respect: `claim` when this store claimed it, else another process's lease must not be fresh. */
+interface LeaseFence {
+	readonly leaseId: string;
+	readonly claim: LeaseClaim | undefined;
+	/** The local path written under the lease, which a refusal names. */
+	readonly file: string;
 }
 
 /** Concatenate a window's pieces in byte-offset order; the session row's own bytes come first. */
@@ -994,20 +1183,14 @@ function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number
  * at construction.
  */
 export class SqlSessionStorage extends IndexedSessionStorage {
-	readonly #adapter: SqlSessionStorageAdapter;
-	readonly #table: string;
+	readonly #backend: SqlSessionStorageBackend;
 	readonly #sessionsRoot: string;
 
-	constructor(
-		backend: SessionStorageBackend,
-		adapter: SqlSessionStorageAdapter,
-		table: string,
-		sessionsRoot: string = getSessionsDir(),
-	) {
-		super(backend);
-		this.#adapter = adapter;
-		this.#table = table;
-		this.#sessionsRoot = path.resolve(sessionsRoot);
+	/** `backend` holds the leases; `published`, the backend the store reads and writes through (it may wrap `backend`). */
+	private constructor(backend: SqlSessionStorageBackend, published: SessionStorageBackend) {
+		super(published);
+		this.#backend = backend;
+		this.#sessionsRoot = backend.sessionsRoot;
 	}
 
 	/**
@@ -1018,22 +1201,17 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	 */
 	static async create(options: SqlSessionStorageOptions): Promise<SqlSessionStorage> {
 		const backend = new SqlSessionStorageBackend(options);
-		const storage = new SqlSessionStorage(
-			options.wrapBackend ? options.wrapBackend(backend) : backend,
-			backend.adapter,
-			backend.table,
-			backend.sessionsRoot,
-		);
+		const storage = new SqlSessionStorage(backend, options.wrapBackend ? options.wrapBackend(backend) : backend);
 		await storage.initialize();
 		return storage;
 	}
 
 	get adapter(): SqlSessionStorageAdapter {
-		return this.#adapter;
+		return this.#backend.adapter;
 	}
 
 	get table(): string {
-		return this.#table;
+		return this.#backend.table;
 	}
 
 	/** The row key this store reads and writes for the local path `file` ({@link sessionRowKey}). */
@@ -1045,34 +1223,99 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	pathFor(key: string): string | undefined {
 		return sessionRowPath(key, this.#sessionsRoot);
 	}
+
+	/**
+	 * Claim the lease of the session written to `sessionPath`, optimistically:
+	 * the claim statement starts now and the release returns at once, never
+	 * `null`. Every write under the lease waits for the statement; when
+	 * another holder's lease is fresh, that write throws
+	 * {@link SessionLeaseLostError} and {@link isSessionClaimLost} turns true.
+	 * A path under a session this store already claimed (a subagent
+	 * transcript) shares that claim. `onLost` runs, in a microtask, when the
+	 * claim statement, a fenced write or a heartbeat finds another holder,
+	 * until the release. The last release deletes the lease row once this
+	 * store's queued writes under it have settled.
+	 */
+	claimSession(sessionId: string, sessionPath: string, onLost?: () => void): () => void {
+		const claim = this.#backend.claim(sessionId, this.keyFor(sessionPath), onLost);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (onLost) claim.listeners.delete(onLost);
+			this.#backend.release(claim, covers => this.settleWrites(file => covers(this.keyFor(file))));
+		};
+	}
+
+	isSessionClaimLost(sessionPath: string): boolean {
+		return this.#backend.isClaimLost(this.keyFor(sessionPath));
+	}
+
+	leaseSessionFile(sessionPath: string): string | undefined {
+		const stem = this.#backend.leaseStem(this.keyFor(sessionPath));
+		return stem === undefined ? undefined : this.pathFor(`${stem}.jsonl`);
+	}
+
+	/** `held` for each session whose lease row any holder refreshed within {@link SESSION_LEASE_EXPIRY_MS}. */
+	probeSessionLeases(sessionIds: readonly string[]): Promise<SessionLeaseReport> {
+		return this.#backend.probeLeases(sessionIds);
+	}
+
+	/** {@link IndexedSessionStorage.drain}, then the lease releases in flight, so a closed session's lease row is gone. */
+	override async drain(): Promise<void> {
+		try {
+			await super.drain();
+		} finally {
+			await this.#backend.releasesSettled();
+		}
+	}
 }
 
 class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #client: SqlSessionStorageClient;
 	readonly #adapter: SqlSessionStorageAdapter;
 	readonly #table: string;
+	readonly #leaseTable: string;
 	readonly #q: DialectQueries;
 	readonly #createTable: boolean;
 	/** The shared call queue for this client's SQLite database; unset on other dialects. */
 	readonly #sqliteQueue: SqliteQueue | undefined;
 	readonly #sessionsRoot: string;
 	readonly #redact: ((text: string) => string) | undefined;
+	/** This store's lease holder token: 128 random bits, made once per store. */
+	readonly #holder = randomBytes(16).toString("hex");
+	/** The leases this store claimed, by lease id. */
+	readonly #claims = new Map<string, LeaseClaim>();
+	/** Lease releases in flight, by lease id; a new claim of the id waits for its release. */
+	readonly #releases = new Map<string, Promise<void>>();
+	readonly #heartbeatMs: number;
+	#heartbeat: NodeJS.Timeout | undefined;
+	#heartbeatRound = 0;
+	#beating = false;
 
 	constructor(options: SqlSessionStorageOptions) {
 		this.#client = options.client;
 		this.#adapter = options.adapter ?? detectAdapter(options.client);
 		this.#table = sessionTableName(options.table);
-		this.#q = buildQueries(this.#adapter, this.#table);
+		const leaseTable = options.leaseTable ?? DEFAULT_LEASE_TABLE;
+		if (!LEASE_IDENT_RE.test(leaseTable)) {
+			throw new Error(
+				`SqlSessionStorage: leaseTable must match ${LEASE_IDENT_RE.source}, at most 56 characters so ` +
+					`${JSON.stringify(`${leaseTable}_holder`)} stays a valid identifier (got ${JSON.stringify(leaseTable)})`,
+			);
+		}
+		this.#leaseTable = leaseTable;
+		this.#q = buildQueries(this.#adapter, this.#table, leaseTable);
 		this.#createTable = options.createTable !== false;
 		this.#sqliteQueue = this.#adapter === "sqlite" ? sqliteQueue(options.client) : undefined;
 		this.#sessionsRoot = path.resolve(options.sessionsRoot ?? getSessionsDir());
 		this.#redact = options.redact;
+		this.#heartbeatMs = options.leaseHeartbeatMs ?? SESSION_LEASE_HEARTBEAT_MS;
 	}
 
 	/**
-	 * `err` as it leaves this store. Every driver call runs inside
-	 * {@link #exclusive} or {@link #retryDeadlocks}, and each passes the error
-	 * it throws through here, so no method lets an unredacted one out.
+	 * `err` as it leaves this store. Exclusive operations, write retries and
+	 * MySQL's claim transaction pass terminal driver errors through here.
 	 */
 	#outward(err: unknown): unknown {
 		return this.#redact ? redactDatabaseError(err, this.#redact) : err;
@@ -1117,6 +1360,289 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return this.#table;
 	}
 
+	/**
+	 * Register a claim of the session `sessionId` stored at row key `key`, and
+	 * start its claim statement unless this store already claimed the lease
+	 * the key falls under. Its lease id is the covering claim's, else the one
+	 * the key derives ({@link derivedLease}), else `sessionId`. `onLost` is
+	 * called when the claim is found lost, at once when it already is.
+	 */
+	claim(sessionId: string, key: string, onLost: (() => void) | undefined): LeaseClaim {
+		const covering = this.#coveringClaim(key);
+		const leaseId = covering?.leaseId ?? derivedLease(key)?.id ?? sessionId;
+		let claim = covering ?? this.#claims.get(leaseId);
+		if (!claim) {
+			claim = {
+				leaseId,
+				stems: new Set(),
+				refs: 0,
+				state: "pending",
+				attempt: undefined,
+				heldRound: 0,
+				after: this.#releases.get(leaseId),
+				listeners: new Set(),
+			};
+			this.#claims.set(leaseId, claim);
+			this.#startHeartbeat();
+			const started = claim;
+			void this.#ensureClaimed(started).catch(err => {
+				// The first write under the lease runs the statement again and reports its failure.
+				logger.warn("SqlSessionStorage could not claim a session lease", {
+					sessionId: this.#redactValue(started.leaseId),
+					error: this.#redactValue(toError(err).message),
+				});
+			});
+		}
+		claim.stems.add(key.endsWith(".jsonl") ? key.slice(0, -".jsonl".length) : key);
+		claim.refs++;
+		if (onLost) {
+			claim.listeners.add(onLost);
+			if (claim.state === "lost") queueMicrotask(onLost);
+		}
+		return claim;
+	}
+
+	/**
+	 * Drop one reference to `claim`. The last one waits until `settle` reports
+	 * this store's queued writes under the lease settled, then deletes the
+	 * lease row this store holds, unless a new claim revived it meanwhile.
+	 */
+	release(claim: LeaseClaim, settle: (covers: (key: string) => boolean) => Promise<void>): void {
+		if (--claim.refs > 0) return;
+		const { leaseId } = claim;
+		const previous = this.#releases.get(leaseId) ?? Promise.resolve();
+		const released = previous
+			.then(async () => {
+				await settle(key => this.#covers(claim, key));
+				if (claim.refs > 0 || this.#claims.get(leaseId) !== claim) return;
+				this.#claims.delete(leaseId);
+				this.#stopHeartbeatIfIdle();
+				const held = await (claim.attempt ?? Promise.resolve(false)).catch(() => false);
+				if (!held || claim.state === "lost") return;
+				await this.#exclusive(() =>
+					run(this.#client, this.#q.releaseLease, { sid: leaseId, holder: this.#holder }),
+				);
+			})
+			.catch(err => {
+				// The row expires on its own once its heartbeat stops.
+				logger.warn("SqlSessionStorage could not release a session lease", {
+					sessionId: this.#redactValue(leaseId),
+					error: this.#redactValue(toError(err).message),
+				});
+			});
+		this.#releases.set(leaseId, released);
+		void released.finally(() => {
+			if (this.#releases.get(leaseId) === released) this.#releases.delete(leaseId);
+		});
+	}
+
+	/** Resolve once every lease release in flight has finished. */
+	async releasesSettled(): Promise<void> {
+		while (this.#releases.size > 0) await Promise.allSettled(this.#releases.values());
+	}
+
+	/** Whether the claim covering `key`, or the claim of the lease `key` derives, is lost. */
+	isClaimLost(key: string): boolean {
+		const covering = this.#coveringClaim(key);
+		const leaseId = covering ? undefined : derivedLease(key)?.id;
+		const claim = covering ?? (leaseId === undefined ? undefined : this.#claims.get(leaseId));
+		return claim?.state === "lost";
+	}
+
+	/**
+	 * The key stem of the main session whose lease `key` falls under: the
+	 * derived one for a `sessions/` key whose lease is the derived lease, else
+	 * the shortest stem of the claim covering `key`, else none.
+	 */
+	leaseStem(key: string): string | undefined {
+		const covering = this.#coveringClaim(key);
+		const derived = derivedLease(key);
+		if (derived && (!covering || covering.leaseId === derived.id)) return derived.stem;
+		let shortest: string | undefined;
+		for (const stem of covering?.stems ?? []) {
+			if ((key === `${stem}.jsonl` || key.startsWith(`${stem}/`)) && (!shortest || stem.length < shortest.length)) {
+				shortest = stem;
+			}
+		}
+		return shortest;
+	}
+
+	/** Which of `sessionIds` any holder refreshed within the expiry; ids whose read failed are `unknown`. */
+	async probeLeases(sessionIds: readonly string[]): Promise<SessionLeaseReport> {
+		const report: SessionLeaseReport = { held: [], unknown: [] };
+		for (const sid of sessionIds) {
+			try {
+				const rows = await this.#exclusive(() => run(this.#client, this.#q.freshLease, { sid }));
+				if (rows.length > 0) report.held.push(sid);
+			} catch (err) {
+				logger.warn("SqlSessionStorage could not read a session lease", {
+					sessionId: this.#redactValue(sid),
+					error: this.#redactValue(toError(err).message),
+				});
+				report.unknown.push(sid);
+			}
+		}
+		return report;
+	}
+
+	/** The claim one of whose stems holds `key`. */
+	#coveringClaim(key: string): LeaseClaim | undefined {
+		for (const claim of this.#claims.values()) {
+			for (const stem of claim.stems) {
+				if (key === `${stem}.jsonl` || key.startsWith(`${stem}/`)) return claim;
+			}
+		}
+		return undefined;
+	}
+
+	/** Whether `key` is under `claim`'s lease: below one of its stems, or deriving its lease id. */
+	#covers(claim: LeaseClaim, key: string): boolean {
+		for (const stem of claim.stems) {
+			if (key === `${stem}.jsonl` || key.startsWith(`${stem}/`)) return true;
+		}
+		return derivedLease(key)?.id === claim.leaseId;
+	}
+
+	/** Whether `claim` holds its lease, running its claim statement first when it has not answered. */
+	#ensureClaimed(claim: LeaseClaim): Promise<boolean> {
+		if (claim.state !== "pending") return Promise.resolve(claim.state === "held");
+		claim.attempt ??= this.#runClaim(claim).then(
+			held => {
+				if (claim.state === "pending") {
+					claim.heldRound = this.#heartbeatRound;
+					if (held) claim.state = "held";
+					else this.#markLost(claim, "Session lease is held by another process");
+				}
+				return claim.state === "held";
+			},
+			(err: unknown) => {
+				claim.attempt = undefined;
+				throw err;
+			},
+		);
+		return claim.attempt;
+	}
+
+	/**
+	 * Run the claim statement for `leaseId`: insert the lease row, or take it
+	 * over when its heartbeat expired or this store holds it. `true` when
+	 * claimed. PostgreSQL and SQLite claim in one statement; MySQL locks the
+	 * row in a transaction, since it assigns `ON DUPLICATE KEY UPDATE` values
+	 * left to right and could not test the old holder after replacing it.
+	 */
+	async #runClaim(claim: LeaseClaim): Promise<boolean> {
+		await claim.after;
+		const values = { sid: claim.leaseId, holder: this.#holder, host: os.hostname(), pid: process.pid };
+		if (this.#adapter !== "mysql") {
+			return (await this.#exclusive(() => run(this.#client, this.#q.claimLease, values))).length > 0;
+		}
+		for (let attempt = 1; ; attempt++) {
+			try {
+				let held = false;
+				await this.#client.transaction(async transaction => {
+					const [row] = (await run(transaction, this.#q.lockLease, values)) as LeaseLockRow[];
+					if (row && row.holder !== this.#holder && rowNumber(row.stale) !== 1) return;
+					await run(transaction, row ? this.#q.takeLease : this.#q.insertLease, values);
+					held = true;
+				});
+				return held;
+			} catch (err) {
+				// Two claims of a missing row both insert: one deadlocks or meets the other's row, and runs again.
+				if (attempt >= WRITE_ATTEMPTS || !(isDeadlockError(err) || isDuplicateKeyError(err))) {
+					throw this.#outward(err);
+				}
+				await Bun.sleep(Math.random() * 20 * attempt);
+			}
+		}
+	}
+
+	/** Mark `claim` lost, once, and tell every caller under it. */
+	#markLost(claim: LeaseClaim, message = "Session lease lost to another process"): void {
+		if (claim.state === "lost") return;
+		claim.state = "lost";
+		logger.warn(message, { sessionId: this.#redactValue(claim.leaseId), table: this.#leaseTable });
+		for (const listener of claim.listeners) queueMicrotask(listener);
+	}
+
+	#startHeartbeat(): void {
+		if (this.#heartbeat) return;
+		this.#heartbeat = setInterval(() => void this.#beat(), this.#heartbeatMs);
+		this.#heartbeat.unref();
+	}
+
+	#stopHeartbeatIfIdle(): void {
+		if (this.#claims.size > 0 || !this.#heartbeat) return;
+		clearInterval(this.#heartbeat);
+		this.#heartbeat = undefined;
+	}
+
+	/**
+	 * Refresh every lease row this store holds, in one statement. A claim the
+	 * statement did not refresh lost its lease. A failed heartbeat (database
+	 * unreachable) leaves every claim as it is.
+	 */
+	async #beat(): Promise<void> {
+		if (this.#beating) return;
+		this.#beating = true;
+		const round = ++this.#heartbeatRound;
+		try {
+			const refreshed = await this.#exclusive(async () => {
+				const values = { holder: this.#holder };
+				const rows = (await run(this.#client, this.#q.heartbeat, values)) as Array<{ session_id: string }>;
+				if (this.#adapter !== "mysql") return rows;
+				return (await run(this.#client, this.#q.leasesOf, values)) as Array<{ session_id: string }>;
+			});
+			const alive = new Set(refreshed.map(row => row.session_id));
+			for (const claim of this.#claims.values()) {
+				if (claim.state === "held" && claim.heldRound < round && !alive.has(claim.leaseId)) this.#markLost(claim);
+			}
+		} catch (err) {
+			logger.warn("SqlSessionStorage lease heartbeat failed", { error: this.#redactValue(toError(err).message) });
+		} finally {
+			this.#beating = false;
+		}
+	}
+
+	/** The lease each of `files` falls under, once per lease; markers fall under none. */
+	#fencesOf(files: readonly string[]): LeaseFence[] {
+		const fences: LeaseFence[] = [];
+		for (const file of files) {
+			if (sessionRowKind(file) === "marker") continue;
+			const key = this.#key(file);
+			const covering = this.#coveringClaim(key);
+			const leaseId = covering?.leaseId ?? derivedLease(key)?.id;
+			if (leaseId === undefined || fences.some(fence => fence.leaseId === leaseId)) continue;
+			fences.push({ leaseId, claim: covering ?? this.#claims.get(leaseId), file });
+		}
+		return fences;
+	}
+
+	/** Wait for the claim statement of each lease this store claimed; refuse a lease it does not hold. */
+	async #awaitClaims(fences: readonly LeaseFence[]): Promise<void> {
+		for (const { claim, leaseId, file } of fences) {
+			if (claim && !(await this.#ensureClaimed(claim))) throw new SessionLeaseLostError(file, leaseId);
+		}
+	}
+
+	/**
+	 * Inside a write's transaction, before it changes anything: refuse the
+	 * write unless this store's lease row of each claimed lease is still there
+	 * (share-locked until commit, so a takeover waits for the write) and no
+	 * other holder's lease of each unclaimed one is fresh.
+	 */
+	async #checkFences(transaction: SqlSessionStorageTransaction, fences: readonly LeaseFence[]): Promise<void> {
+		for (const { claim, leaseId, file } of fences) {
+			const values = { sid: leaseId, holder: this.#holder };
+			if (claim) {
+				if ((await run(transaction, this.#q.heldLease, values)).length > 0) continue;
+				this.#markLost(claim);
+			} else if ((await run(transaction, this.#q.foreignLease, values)).length === 0) {
+				continue;
+			}
+			throw new SessionLeaseLostError(file, leaseId);
+		}
+	}
+
 	init(): Promise<void> {
 		return this.#exclusive(async () => {
 			if (this.#adapter === "sqlite") await ensureSqliteBusyTimeout(this.#client);
@@ -1148,10 +1674,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 		await this.#client.unsafe(this.#q.createPartsTable);
 		await this.#client.unsafe(this.#q.createMetaTable);
-		for (const { name, ddl } of this.#q.indexes) {
+		await this.#client.unsafe(this.#q.createLeaseTable);
+		for (const { name, table, ddl } of this.#q.indexes) {
 			// Probe before creating: PostgreSQL's CREATE INDEX IF NOT EXISTS takes
 			// a lock that waits for, and holds up, writes even when the index exists.
-			if ((await run(this.#client, this.#q.indexExists, { table: this.#table, index: name })).length > 0) continue;
+			if ((await run(this.#client, this.#q.indexExists, { table, index: name })).length > 0) continue;
 			try {
 				await this.#client.unsafe(ddl);
 			} catch (err) {
@@ -1259,6 +1786,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 		if ((await this.#columns(partsTable)).size === 0) missing.push(`table ${partsTable}`);
 		if ((await this.#columns(metaTable)).size === 0) missing.push(`table ${metaTable}`);
+		if ((await this.#columns(this.#leaseTable)).size === 0) missing.push(`table ${this.#leaseTable}`);
 		if (missing.length > 0) {
 			throw new Error(
 				`SqlSessionStorage: createTable is false, but the database has no ${missing.join(" and no ")}. ` +
@@ -1478,7 +2006,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			len: bytes.byteLength,
 			kind: sessionRowKind(file),
 		};
+		const fences = this.#fencesOf([file]);
+		await this.#awaitClaims(fences);
 		await this.#transaction(async transaction => {
+			await this.#checkFences(transaction, fences);
 			if (expectedSize === null) {
 				const result = await run(transaction, this.#q.insertRowIfMissing, row);
 				const inserted = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
@@ -1541,12 +2072,34 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			len: Buffer.byteLength(line, "utf8"),
 			kind: sessionRowKind(file),
 		};
-		const [single, ...rest] = this.#q.append;
-		if (rest.length === 0) {
-			await this.#retryDeadlocks(() => run(this.#client, single, values));
-			return;
+		const fences = this.#fencesOf([file]);
+		await this.#awaitClaims(fences);
+		const [fence] = fences;
+		const fenced = this.#q.fencedAppend;
+		if (fenced) {
+			if (!fence) {
+				await this.#retryDeadlocks(() => run(this.#client, this.#q.append[0], values));
+				return;
+			}
+			// One statement: the lease check and the append commit together.
+			const query = fence.claim ? fenced.held : fenced.foreign;
+			let written = 0;
+			await this.#retryDeadlocks(async () => {
+				const [row] = (await run(this.#client, query, {
+					...values,
+					sid: fence.leaseId,
+					holder: this.#holder,
+				})) as Array<{
+					written: number | bigint | string;
+				}>;
+				written = row ? rowNumber(row.written) : 0;
+			});
+			if (written > 0) return;
+			if (fence.claim) this.#markLost(fence.claim);
+			throw new SessionLeaseLostError(file, fence.leaseId);
 		}
 		await this.#transaction(async transaction => {
+			await this.#checkFences(transaction, fences);
 			for (const query of this.#q.append) await run(transaction, query, values);
 		});
 	}
@@ -1563,7 +2116,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			dir,
 			len: [...dir].length,
 		}));
+		const fences = this.#fencesOf(files);
+		await this.#awaitClaims(fences);
 		await this.#transaction(async transaction => {
+			await this.#checkFences(transaction, fences);
 			// Every row first: their locks must all be held before the first parts look (see #deleteParts).
 			for (const path of paths) await run(transaction, this.#q.deleteRow, { path });
 			for (const range of ranges) {
@@ -1581,7 +2137,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			if (rows.length === 0) throw enoent(srcFile);
 			return;
 		}
+		const fences = this.#fencesOf([srcFile, dstFile]);
+		await this.#awaitClaims(fences);
 		await this.#transaction(async transaction => {
+			await this.#checkFences(transaction, fences);
 			if (!noReplace) await run(transaction, this.#q.deleteRow, { path: dst });
 			// One statement renames the row, so the primary key refuses a `dst`
 			// row that exists, or that another client inserts concurrently (the

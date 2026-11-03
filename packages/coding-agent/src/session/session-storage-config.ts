@@ -31,9 +31,15 @@ import { toError } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { Settings } from "../config/settings";
 import type { SessionStorageBackend } from "./indexed-session-storage";
-import { FileSessionStorage, type SessionStorage, setDefaultSessionStorage } from "./session-storage";
 import type { OffboxCheck } from "./offbox-check";
 import { OffboxSessionStorage } from "./offbox-session-storage";
+import {
+	FileSessionStorage,
+	probeSessionLeases,
+	type SessionLeaseReport,
+	type SessionStorage,
+	setDefaultSessionStorage,
+} from "./session-storage";
 import { SqlSessionStorage } from "./sql-session-storage";
 import {
 	cfgSessionSqlDsnFile,
@@ -168,18 +174,22 @@ export async function resolveSessionStorage({ settings, env }: ResolveSessionSto
  * error it raises, and every diagnostic it builds from a row key, has the
  * connection string's secrets redacted ({@link SessionSqlConnection.redact}),
  * because notices, logs and the fatal handler print them. A failure to start
- * closes the client and refuses as {@link sessionDatabaseError}. `table`
- * overrides the default table, for a test that shares its database with
- * other clients.
+ * closes the client and refuses as {@link sessionDatabaseError}. `table` and
+ * `leaseTable` override the defaults for callers sharing a database.
  */
 export async function openSessionSqlStorage(
 	connection: SessionSqlConnection,
-	options: { table?: string; wrapBackend?: (backend: SessionStorageBackend) => SessionStorageBackend } = {},
+	options: {
+		table?: string;
+		leaseTable?: string;
+		wrapBackend?: (backend: SessionStorageBackend) => SessionStorageBackend;
+	} = {},
 ): Promise<SqlSessionStorage> {
 	try {
 		return await SqlSessionStorage.create({
 			client: connection.client,
 			table: options.table,
+			leaseTable: options.leaseTable,
 			wrapBackend: options.wrapBackend,
 			redact: connection.redact,
 		});
@@ -446,9 +456,24 @@ export function assertSessionsOnDisk(storage: SessionStorage, feature: string, r
 	);
 }
 
-/** Why lease probes (`omp session lease`, RPC `get_session_lease`) refuse under `session.storage: sql`. */
-export const NO_SESSION_LEASE_REASON =
-	"SQL-stored sessions take no ownership lease, so every session would read as free";
+/** Why lease probes (`omp session lease`, RPC `get_session_lease`) refuse on a store that keeps no session leases. */
+const NO_SESSION_LEASE_REASON = "this store takes no ownership lease, so every session would read as free";
+
+/**
+ * The lease report `omp session lease` and RPC `get_session_lease` give
+ * (`feature` names which, for the refusal): `storage`'s own lease records
+ * when it keeps them (SQL), else the file leases, which only file storage
+ * takes; any other store refuses with {@link SessionStorageUnsupportedError}.
+ */
+export async function probeStorageSessionLeases(
+	storage: SessionStorage,
+	sessionIds: readonly string[],
+	feature: string,
+): Promise<SessionLeaseReport> {
+	if (storage.probeSessionLeases) return storage.probeSessionLeases(sessionIds);
+	assertSessionsOnDisk(storage, feature, NO_SESSION_LEASE_REASON);
+	return probeSessionLeases(sessionIds);
+}
 
 /** Why `/join` refuses under `session.storage: sql`: guest replicas are local transcript files. */
 export const COLLAB_REPLICA_DISK_ONLY_REASON =

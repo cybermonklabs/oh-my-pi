@@ -1053,6 +1053,11 @@ export interface FindSessionContinuationOptions {
  * A continuation is named `<move time>_<id>.jsonl` and moves only after the
  * session it continues was created, so only files named after that creation
  * time are read: resuming a recent session reads almost nothing.
+ *
+ * A session that lost its lease in a shared store (`session.storage: sql`)
+ * leaves the marker `<stem>.continuation` naming the session it went on in.
+ * When `sessionPath` has one, the marker chain is followed first, to its last
+ * session (see {@link followContinuationMarkers}), whatever turns the copies hold.
  */
 export async function findSessionContinuation(
 	sessionPath: string,
@@ -1061,6 +1066,16 @@ export async function findSessionContinuation(
 ): Promise<SessionContinuation | undefined> {
 	const target = path.resolve(sessionPath);
 	await refreshSessionIndex(storage, { kind: "dir", dir: path.dirname(target) });
+	const marked = await followContinuationMarkers(target, storage);
+	const last = marked.at(-1);
+	if (last) {
+		logger.info("Resuming the session a continuation marker names", {
+			from: target,
+			to: last.path,
+			copies: marked.length + 1,
+		});
+		return { session: last, from: target, copies: marked.length + 1 };
+	}
 	const start = await scanSessionFile(target, storage, false);
 	const named = parseSessionFileName(target);
 	const replaced =
@@ -1114,6 +1129,37 @@ export async function findSessionContinuation(
 		replaced,
 	});
 	return { session: newest, from: target, copies: count };
+}
+
+/**
+ * The sessions the continuation marker chain from `sessionFile` names, in
+ * order: `<stem>.continuation` holds the id of the session the conversation
+ * went on in, in the same directory, whose own marker may name the next.
+ * Stops at a missing marker or session, and at a cycle. Empty when
+ * `sessionFile` has no marker.
+ */
+export async function followContinuationMarkers(sessionFile: string, storage: SessionStorage): Promise<SessionInfo[]> {
+	const chain: SessionInfo[] = [];
+	const seen = new Set([path.resolve(sessionFile)]);
+	let current = path.resolve(sessionFile);
+	while (current.endsWith(".jsonl")) {
+		const marker = `${current.slice(0, -".jsonl".length)}.continuation`;
+		let nextId: string;
+		try {
+			if (!(await storage.exists(marker))) break;
+			nextId = (await storage.readText(marker)).trim();
+		} catch (err) {
+			logger.warn("Could not read a session continuation marker", { marker, error: toError(err).message });
+			break;
+		}
+		if (!nextId) break;
+		const next = await findSessionInDirectory(path.dirname(current), nextId, storage);
+		if (!next || seen.has(path.resolve(next.path))) break;
+		seen.add(path.resolve(next.path));
+		chain.push(next);
+		current = path.resolve(next.path);
+	}
+	return chain;
 }
 
 /** The session a resume key names, and the copy of its conversation to open (see {@link resolveResumeTarget}). */
@@ -1173,9 +1219,11 @@ async function findUnlistedSessionContinuation(
 	await refreshSessionIndex(storage, { kind: "dir", dir: localDir });
 	const globalToo = !sessionDir || options.allowGlobalFallback === true;
 	for (const scope of globalToo ? ["local", "global"] : ["local"]) {
+		// Every transcript, filtered by name below: a key-indexed storage's
+		// listing supports no `*_<prefix>*.jsonl` pattern.
 		const files =
 			scope === "local"
-				? storage.listFilesSync(localDir, `*_${prefix}*.jsonl`)
+				? storage.listFilesSync(localDir, "*.jsonl")
 				: await findSessionFiles(prefix, undefined, storage);
 		for (const file of files) {
 			if (!parseSessionFileName(file)?.id.startsWith(prefix)) continue;
@@ -1199,7 +1247,9 @@ async function findUnlistedSessionContinuation(
  * directions, drops each copy a continuation of it holds entirely (the
  * continuation holds its newest turn), and takes the remaining copy with the
  * newest turn, keeping `sessionPath` on a tie. Two copies that both went on
- * after the move both remain, and the one with the later turn wins.
+ * after the move both remain, and the one with the later turn wins. A
+ * continuation marker chain from the first copy (see
+ * {@link findSessionContinuation}) decides instead, when it leads past `sessionPath`.
  */
 export async function findRecentSessionContinuation(
 	sessionPath: string,
@@ -1217,6 +1267,21 @@ export async function findRecentSessionContinuation(
 		if (!parent || ancestors.has(parent.path)) break;
 		ancestors.add(parent.path);
 		root = parent;
+	}
+	const marked = await followContinuationMarkers(root.path, storage);
+	const last = marked.at(-1);
+	if (last && !ancestors.has(last.path)) {
+		const pickedAt = marked.findIndex(copy => copy.path === picked.path);
+		// Steps from the pick to the copy taken, when the pick is on the chain.
+		const steps = root === picked ? marked.length : pickedAt >= 0 ? marked.length - 1 - pickedAt : undefined;
+		if (steps === 0) return undefined;
+		const relation = steps === undefined ? "other" : undefined;
+		logger.info("Continuing the session a continuation marker names", {
+			from: picked.path,
+			to: last.path,
+			relation: relation ?? "continuation",
+		});
+		return { session: last, from: picked.path, copies: steps === undefined ? 2 : steps + 1, relation };
 	}
 	const continuations = await continuationsAfter(root.path, root.created.getTime(), storage);
 	if (root === picked && !continuations.has(root.id)) return undefined;
@@ -1273,7 +1338,9 @@ export async function findRecentSessionContinuation(
 /**
  * The session with id `id` in directory `dir`. A session file is named
  * `<time>_<id>.jsonl`, except one a session resumed by path keeps writing
- * (`current.jsonl`), so only files with other names are read when that name misses.
+ * (`current.jsonl`), so only files with other names are read when that name
+ * misses. Names are matched here, not by a `*_<id>.jsonl` pattern, which a
+ * key-indexed storage's listing does not support.
  */
 async function findSessionInDirectory(
 	dir: string,
@@ -1281,10 +1348,11 @@ async function findSessionInDirectory(
 	storage: SessionStorage,
 ): Promise<SessionInfo | undefined> {
 	await refreshSessionIndex(storage, { kind: "dir", dir });
-	const [namedFile] = storage.listFilesSync(dir, `*_${id}.jsonl`);
+	const files = storage.listFilesSync(dir, "*.jsonl");
+	const namedFile = files.find(file => parseSessionFileName(file)?.id === id);
 	const named = namedFile ? await scanSessionFile(path.resolve(namedFile), storage, false) : undefined;
 	if (named?.id === id) return named;
-	const otherNames = storage.listFilesSync(dir, "*.jsonl").filter(file => !parseSessionFileName(file));
+	const otherNames = files.filter(file => !parseSessionFileName(file));
 	return (await collectSessionsFromFiles(otherNames, storage, false)).find(session => session.id === id);
 }
 
