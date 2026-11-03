@@ -364,6 +364,7 @@ struct Synced {
 	job_marks:  (Option<u32>, Option<u32>, u32),
 	getopts:    GetoptsState,
 	rlimits:    Vec<(Rlimit, Option<u64>, Option<u64>)>,
+	kept:       Option<Box<Vec<super::proc::KeptStatus>>>,
 }
 
 /// Root scopes the [`Root`] bitmasks track: `0..SCOPE_BITS`. Deeper ones
@@ -2818,6 +2819,32 @@ fn decode_rlimits(words: &[BString]) -> Vec<(Rlimit, Option<u64>, Option<u64>)> 
 		.collect()
 }
 
+/// [`MiscKey::BgPids`] words: `vpid:ospid:status`, `ospid` empty when none.
+fn encode_kept(kept: &[super::proc::KeptStatus]) -> Vec<BString> {
+	kept.iter()
+		.map(|k| {
+			let os = k.os_pid.map_or_else(String::new, |p| p.to_string());
+			BString::from(format!("{}:{os}:{}", k.vpid.0, k.status))
+		})
+		.collect()
+}
+
+/// [`encode_kept`]'s words back; a malformed word is skipped.
+fn decode_kept(words: &[BString]) -> Option<Box<Vec<super::proc::KeptStatus>>> {
+	let kept: Vec<_> = words
+		.iter()
+		.filter_map(|w| {
+			let mut parts = w.split(|&c| c == b':');
+			let vpid = parse(parts.next()?)?;
+			let os = parts.next()?;
+			let os_pid = if os.is_empty() { None } else { Some(parse(os)?) };
+			let status = parse(parts.next()?)?;
+			Some(super::proc::KeptStatus { vpid: Vpid(vpid), os_pid, status })
+		})
+		.collect();
+	(!kept.is_empty()).then(|| Box::new(kept))
+}
+
 /// Write the root job table's changes since the last sync: each job is
 /// compared with its store record (the store holds what was written last,
 /// so the engine keeps no copy of the table), jobs gone from the table are
@@ -2901,6 +2928,11 @@ pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &Vproc) {
 			.then(|| Record::Words(encode_getopts(&vp.getopts)));
 		root.set_record(store, KeyBuf::Misc(MiscKey::Getopts), rec);
 	}
+	if vp.jobs.kept != root.synced.kept {
+		root.synced.kept.clone_from(&vp.jobs.kept);
+		let rec = vp.jobs.kept.as_ref().map(|kept| Record::Words(encode_kept(kept)));
+		root.set_record(store, KeyBuf::Misc(MiscKey::BgPids), rec);
+	}
 	if vp.rlimits != root.synced.rlimits {
 		root.synced.rlimits.clone_from(&vp.rlimits);
 		let rec = (!vp.rlimits.is_empty()).then(|| Record::Words(encode_rlimits(&vp.rlimits)));
@@ -2963,6 +2995,7 @@ pub fn load_root(
 			.and_then(|s| parse(&s))
 			.unwrap_or(0),
 		subshell: false,
+		kept: decode_kept(&words(store, MiscKey::BgPids)?),
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
 	vp.rlimits = decode_rlimits(&words(store, MiscKey::Rlimits)?);
@@ -2974,6 +3007,7 @@ pub fn load_root(
 		job_marks:  (vp.jobs.current, vp.jobs.previous, vp.jobs.chld),
 		getopts:    vp.getopts.clone(),
 		rlimits:    vp.rlimits.clone(),
+		kept:       vp.jobs.kept.clone(),
 	};
 	Ok(())
 }

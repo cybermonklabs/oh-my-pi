@@ -277,6 +277,33 @@ pub struct JobTable {
 	/// it without job control and with an empty job table. A command
 	/// substitution keeps both (it lists its parent's jobs).
 	pub subshell: bool,
+	/// Statuses of jobs that left the table (bash's `bgpids`): `wait PID`
+	/// still reports them, oldest first, at most [`KEPT_MAX`]. Boxed: a
+	/// vproc that starts no job keeps none (idle vproc ≤ 2 KiB).
+	pub kept:     Option<Box<Vec<KeptStatus>>>,
+}
+
+/// How many statuses of jobs that left the table a shell keeps (bash's
+/// `js.c_childmax` ceiling, `MAX_CHILD_MAX`); the oldest goes first.
+pub const KEPT_MAX: usize = 32_768;
+
+/// The status of a job that left the table (bash `struct pidstat`), by the
+/// pids it was known by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptStatus {
+	/// Its vproc's virtual pid.
+	pub vpid:   Vpid,
+	/// Its program's OS pid, if it had one.
+	pub os_pid: Option<u32>,
+	/// Its exit status (0 for a job deleted while it ran, as bash keeps).
+	pub status: i32,
+}
+
+impl KeptStatus {
+	/// `pid` names this status: its virtual pid or its program's OS pid.
+	pub const fn named_by(&self, pid: u32) -> bool {
+		self.vpid.0 == pid || matches!(self.os_pid, Some(os) if os == pid)
+	}
 }
 
 /// What a job spec names (bash `get_job_spec`), without its `%`.
@@ -377,6 +404,48 @@ impl JobTable {
 		});
 		if reset {
 			self.reset_current();
+		}
+	}
+
+	/// Delete job `number` (bash `delete_job`); `keep` puts its status in
+	/// [`Self::kept`] (bash adds every asynchronous job it deletes unless
+	/// `DEL_NOBGPID`; a running job keeps 0). Returns the job.
+	pub fn delete(&mut self, number: u32, keep: bool) -> Option<Job> {
+		let job = self.remove(number)?;
+		if keep && !job.inherited {
+			let status = match job.state {
+				JobState::Done(s) => s,
+				_ => 0,
+			};
+			self.keep(KeptStatus { vpid: job.vpid, os_pid: job.os_pid, status });
+		}
+		Some(job)
+	}
+
+	/// Keep `entry`, replacing an older one for the same child (bash
+	/// `bgp_add`).
+	pub fn keep(&mut self, entry: KeptStatus) {
+		let kept = self.kept.get_or_insert_with(Box::default);
+		kept.retain(|k| k.vpid != entry.vpid);
+		if kept.len() >= KEPT_MAX {
+			kept.remove(0);
+		}
+		kept.push(entry);
+	}
+
+	/// The kept status `pid` names (bash `bgp_search`).
+	pub fn kept_status(&self, pid: u32) -> Option<i32> {
+		self.kept.as_ref()?.iter().rev().find(|k| k.named_by(pid)).map(|k| k.status)
+	}
+
+	/// Forget every kept status but those `keep` selects (bash
+	/// `bgp_clear`, `bgp_delete`).
+	pub fn retain_kept(&mut self, mut keep: impl FnMut(&KeptStatus) -> bool) {
+		if let Some(kept) = &mut self.kept {
+			kept.retain(|k| keep(k));
+			if kept.is_empty() {
+				self.kept = None;
+			}
 		}
 	}
 
@@ -510,6 +579,12 @@ impl LastBg {
 	/// `$!` names `vpid`, by its virtual pid until [`Self::set_os`].
 	pub const fn new(vpid: Vpid) -> Self {
 		Self { vpid: vpid.0, os: 0 }
+	}
+
+	/// `$!` still expands to `pid`, but names no child of this shell: its
+	/// job was deleted (`disown`, or waited for and cleaned up).
+	pub const fn detached(pid: u32) -> Self {
+		Self { vpid: 0, os: pid }
 	}
 
 	/// The child `$!` names.
@@ -1438,14 +1513,26 @@ pub enum Awaited {
 	Frame,
 	/// Background children (`wait id …`); the status is the last one's.
 	/// Without `force` (`wait -f`) a job that stops ends the wait (status
-	/// 128 + the stop signal), as in bash with job control.
+	/// 128 + the stop signal), as in bash with job control. A waited job
+	/// stays in the table, reported, until bash's `cleanup_dead_jobs`;
+	/// `fg` (`foreground`) deletes it at once. `kept`: the pid and status
+	/// of trailing operands that named only kept statuses.
 	Jobs {
-		force: bool,
+		force:      bool,
+		foreground: bool,
+		kept:       Option<(u32, i32)>,
 	},
 	/// Every background child (`wait` without operands); the status is 0.
-	AllJobs,
-	/// The first of the children to finish (`wait -n`); its status.
-	AnyJob,
+	/// Then every status is forgotten except `keep`'s: the pid `$!` names
+	/// when that child had finished before the `wait`.
+	AllJobs {
+		keep: Option<u32>,
+	},
+	/// The first of the children to finish (`wait -n`); its status. `kept`:
+	/// an operand naming a kept status answers at once.
+	AnyJob {
+		kept: Option<(u32, i32)>,
+	},
 }
 
 /// Transient handles; never serialized.

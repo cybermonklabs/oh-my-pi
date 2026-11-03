@@ -1001,6 +1001,10 @@ pub enum MiscKey {
 	/// `ulimit` values set in the root shell (`Record::Words`, one
 	/// `resource:soft:hard` per limit, `-` for unlimited/unset).
 	Rlimits,
+	/// Statuses of jobs that left the root table (bash `bgpids`;
+	/// `Record::Words`, one `vpid:ospid:status` each, `ospid` empty when
+	/// none); absent when there are none.
+	BgPids,
 }
 
 crate::bash::packed_names::packed_names!(MiscKey);
