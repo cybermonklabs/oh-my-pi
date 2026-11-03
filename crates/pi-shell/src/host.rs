@@ -276,14 +276,12 @@ impl Launcher {
 			child = relays.wrap(child);
 		}
 		self.spawns.record(lineage, child.pid());
-		Ok(match &self.observer {
-			Some(observer) => {
-				let pid = child.pid();
-				observer.spawned(pid);
-				Box::new(Observed { child, observer: Arc::clone(observer), released: false })
-			},
-			None => child,
-		})
+		Ok(Box::new(Observed {
+			child,
+			observer: self.observer.clone(),
+			spawns: self.spawns.clone(),
+			released: false,
+		}))
 	}
 }
 
@@ -703,7 +701,8 @@ fn protected_processes() -> Vec<(i32, i32)> {
 /// An external reported to a [`SpawnObserver`].
 struct Observed {
 	child:    Box<dyn ExtProc>,
-	observer: Arc<dyn SpawnObserver>,
+	observer: Option<Arc<dyn SpawnObserver>>,
+	spawns:   SpawnLog,
 	released: bool,
 }
 
@@ -711,7 +710,13 @@ impl Observed {
 	fn release(&mut self) {
 		if !self.released {
 			self.released = true;
-			self.observer.released(self.child.pid());
+			// The engine has not reaped it yet: its pid still holds the
+			// number of the group it led, so the members of that group can
+			// be pinned, and nothing else names them afterwards.
+			self.spawns.pin_members(self.child.pid());
+			if let Some(observer) = self.observer.as_ref() {
+				observer.released(self.child.pid());
+			}
 		}
 	}
 }

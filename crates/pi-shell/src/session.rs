@@ -59,11 +59,12 @@ use std::{
 		atomic::{AtomicBool, AtomicU8, Ordering},
 	},
 	task::{Wake, Waker},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use bstr::{BString, ByteSlice};
 use parking_lot::Mutex;
+use pi_builtins::{PinnedProcess, SpawnLedger};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -89,6 +90,15 @@ const SETTLE_STEPS: u32 = 4;
 /// Longest suspension of the driver: every wake it waits for is delivered by
 /// a waker, so this only bounds the cost of a lost one.
 const MAX_PARK: Duration = Duration::from_secs(1);
+
+/// How long the wave that stops what a cancelled run left behind waits
+/// between its `TERM` and its `KILL`: long enough for a `TERM` trap to run,
+/// short enough that a cancelled run ends promptly.
+const CANCEL_TERM_GRACE: Duration = Duration::from_millis(500);
+
+/// The signals those waves send.
+const TERM_SIGNAL: i32 = 15;
+const KILL_SIGNAL: i32 = 9;
 
 /// Configuration of a new [`Session`].
 pub struct SessionConfig {
@@ -218,8 +228,13 @@ pub enum SessionError {
 	RelativeCwd(BString),
 }
 
-/// The live externals of the run in flight (pi's `Shell::pids()`). Cheap to
-/// clone; clones share the list.
+/// The live externals of the run in flight (pi's `Shell::pids()`), and the
+/// ledger of what that run spawned. Cheap to clone; clones share both.
+///
+/// The ledger pins every external when it is spawned and the members of the
+/// group it leads before the engine reaps it, so a cancelled run can be
+/// stopped whole: by then a pid or a group number says nothing, and only a
+/// pin names the process this run started (see [`SpawnLedger`]).
 #[derive(Clone, Default)]
 pub struct Children(Arc<ChildrenState>);
 
@@ -229,6 +244,8 @@ struct ChildrenState {
 	active: AtomicBool,
 	/// Live pids in spawn order.
 	pids:   Mutex<Vec<u32>>,
+	/// What the run spawned, each pinned at its spawn.
+	ledger: Mutex<SpawnLedger>,
 }
 
 impl Children {
@@ -247,7 +264,43 @@ impl Children {
 			.collect()
 	}
 
+	/// Pins everything the run can still reach: each recorded process, and
+	/// every member of a group one of them leads. Signal 0 reaches them and
+	/// changes nothing, and a wave keeps what it reached, so a process that
+	/// leaves its group afterwards is still named by its pin.
+	pub fn pin_reachable(&self) {
+		self.0.ledger.lock().plan_wave(0, true).deliver();
+	}
+
+	/// Stops everything the run spawned that is still reachable: one wave of
+	/// `TERM` to each recorded process, the group it leads and its live
+	/// descendants, then `KILL` to whatever that did not end. Each wave is
+	/// planned from one reading and delivered under the ledger's lock, so
+	/// the engine cannot reap a leader while its group is being listed.
+	///
+	/// Called when a run was cancelled: the engine's own cancel reaches the
+	/// tree it still holds, and this reaches what that tree left behind —
+	/// a process that left its group, and a child forked by a process whose
+	/// parent the engine already reaped.
+	pub async fn terminate_run(&self) {
+		if !self.0.ledger.lock().reaches_anything() {
+			return;
+		}
+		self.0.ledger.lock().plan_wave(TERM_SIGNAL, true).deliver();
+		let deadline = Instant::now() + CANCEL_TERM_GRACE;
+		while Instant::now() < deadline && self.0.ledger.lock().reaches_anything() {
+			tokio::time::sleep(Duration::from_millis(25)).await;
+		}
+		if self.0.ledger.lock().reaches_anything() {
+			self.0.ledger.lock().plan_wave(KILL_SIGNAL, true).deliver();
+		}
+	}
+
 	fn set_active(&self, active: bool) {
+		if active {
+			*self.0.ledger.lock() = SpawnLedger::default();
+			self.0.pids.lock().clear();
+		}
 		self.0.active.store(active, Ordering::Release);
 	}
 }
@@ -255,12 +308,32 @@ impl Children {
 impl SpawnObserver for Children {
 	fn spawned(&self, pid: u32) {
 		self.0.pids.lock().push(pid);
+		let Ok(pid) = i32::try_from(pid) else {
+			return;
+		};
+		// Pinned now: from here on the pid alone could name another process.
+		// Every external the host starts leads a group of its own whose
+		// number is its pid (see [`SpawnObserver::spawned`]); where it does
+		// not, the group it is in is the host's, which the group primitive
+		// refuses to signal on every path.
+		self
+			.0
+			.ledger
+			.lock()
+			.record(Some(pid), PinnedProcess::from_pid(pid));
 	}
 
 	fn released(&self, pid: u32) {
 		let mut pids = self.0.pids.lock();
 		if let Some(i) = pids.iter().position(|&p| p == pid) {
 			pids.remove(i);
+		}
+		drop(pids);
+		// The engine saw the exit and has not reaped it yet, so its pid still
+		// holds the number of the group it led: the members of that group are
+		// pinned now or never.
+		if let Ok(pid) = i32::try_from(pid) {
+			self.0.ledger.lock().before_reap(pid, true);
 		}
 	}
 }
@@ -582,6 +655,12 @@ impl Driver {
 		let status = loop {
 			let wanted = cancel.get();
 			if wanted > applied {
+				if applied == 0 {
+					// Before the first cancel signal: a process reached by it
+					// may leave its group in its handler, and only a pin taken
+					// while it is still there reaches it afterwards.
+					self.children.pin_reachable();
+				}
 				applied = wanted;
 				let sig = if wanted >= CancelLevel::KILL {
 					Signal::Kill
@@ -615,6 +694,12 @@ impl Driver {
 		}
 		let exited = self.shell.ended_by_exit(run);
 		self.settle().await;
+		if applied > 0 {
+			// The engine's cancel reached the tree it still held. This reaches
+			// what that tree left behind: a process that left its group, and
+			// a child forked by one whose parent is already reaped.
+			self.children.terminate_run().await;
+		}
 		self.children.set_active(false);
 		self.host.streams().clear();
 		self.host.set_pipe_tap(None);

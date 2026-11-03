@@ -15,6 +15,7 @@
 use std::time::Duration;
 
 use bstr::{BString, ByteSlice};
+use pi_builtins::{PinnedProcess, ProcessStatus, host_protected_pids, signalable_descendants};
 
 use super::{Child, Out, Turn, nanos, signal_os};
 use crate::bash::{CallOutcome, Platform, ShellApi, SigTarget, Signal, ToolCall};
@@ -259,6 +260,12 @@ pub(super) struct Timeout {
 	call:             ToolCall,
 	out:              Out,
 	phase:            Phase,
+	/// The externals the command had when the limit expired, and the members
+	/// of the groups they lead, each pinned then. A process reached by the
+	/// first signal may leave its group — one that calls `setsid` in its
+	/// `TERM` handler — and a pid says nothing once its process is reaped, so
+	/// only these pins still name what the command started.
+	pins:             Vec<PinnedProcess>,
 }
 
 impl Timeout {
@@ -275,7 +282,7 @@ impl Timeout {
 				Phase::Exit(EXIT_FAILURE)
 			},
 		};
-		Self { child: Child::default(), call, out, phase }
+		Self { child: Child::default(), call, out, phase, pins: Vec::new() }
 	}
 
 	pub(super) fn deadline(&self) -> Option<u64> {
@@ -289,6 +296,41 @@ impl Timeout {
 		}
 	}
 
+	/// Pins every external the command still has and, unless `--foreground`
+	/// narrows this to the command's own processes, every member of a group
+	/// one of them leads. Taken before the first signal: afterwards a process
+	/// can leave the group, and a reaped pid names nothing. The members the
+	/// host pinned when it reaped an external of this command are taken too:
+	/// a background process of a command that already ended is named by
+	/// nothing else.
+	fn pin_tree(&mut self, turn: &Turn<'_>, groups: bool) {
+		if groups {
+			for member in turn.log.pinned(turn.group) {
+				self.remember(member);
+			}
+		}
+		for pid in turn.log.live(turn.group) {
+			let Ok(pid) = i32::try_from(pid) else {
+				continue;
+			};
+			let Some(pin) = PinnedProcess::from_pid(pid) else {
+				continue;
+			};
+			if groups && pin.group_id() == Some(pid) {
+				for member in pin.members_before_reap() {
+					self.remember(member);
+				}
+			}
+			self.remember(pin);
+		}
+	}
+
+	fn remember(&mut self, pin: PinnedProcess) {
+		if !self.pins.iter().any(|seen| seen.same_identity(&pin)) {
+			self.pins.push(pin);
+		}
+	}
+
 	/// Send `signal` to the command's tree and, for `KILL`, to the
 	/// externals it started.
 	fn send(&mut self, turn: &Turn<'_>, opts: &Options, signal: Signal) {
@@ -298,6 +340,9 @@ impl Timeout {
 			self
 				.out
 				.push(2, format!("timeout: sending signal {name} to command '{command}'\n"));
+		}
+		if self.pins.is_empty() {
+			self.pin_tree(turn, !opts.foreground);
 		}
 		for &label in turn.group {
 			turn.ctl.signal(SigTarget::Label(label), signal);
@@ -309,6 +354,27 @@ impl Timeout {
 			for pid in turn.log.live(turn.group) {
 				signal_os(pid, signal, !opts.foreground);
 			}
+			self.kill_pinned(!opts.foreground);
+		}
+	}
+
+	/// `KILL` every pinned process that still runs, and — where the signal
+	/// covers groups — its live descendants: a child one of them forked
+	/// after its own parent was reaped is in no group listing and in no
+	/// log of the command's externals.
+	fn kill_pinned(&self, descendants: bool) {
+		let protected = host_protected_pids();
+		let kill = i32::from(Signal::Kill.number(Platform::current()));
+		for pin in &self.pins {
+			if pin.status() != ProcessStatus::Running {
+				continue;
+			}
+			if descendants {
+				for child in signalable_descendants(pin, &protected) {
+					child.kill(kill);
+				}
+			}
+			pin.kill(kill);
 		}
 	}
 

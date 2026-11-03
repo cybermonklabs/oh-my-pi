@@ -37,6 +37,7 @@ use std::{collections::VecDeque, sync::Arc, task::Waker, time::Duration};
 
 use bstr::{BStr, BString, ByteSlice};
 use parking_lot::Mutex;
+use pi_builtins::PinnedProcess;
 
 use crate::{
 	bash::{
@@ -141,13 +142,58 @@ impl ToolConfig {
 /// ([`SpawnLog::record`]); `timeout` waits for and escalates on its own. Cheap
 /// to clone; clones share the log.
 #[derive(Clone, Default)]
-pub struct SpawnLog(Arc<Mutex<Vec<(u32, u32)>>>);
+pub struct SpawnLog(Arc<LogState>);
+
+#[derive(Default)]
+struct LogState {
+	/// `(label, pid)` of every labelled spawn.
+	spawns: Mutex<Vec<(u32, u32)>>,
+	/// Members of the group a labelled external led, pinned before the
+	/// engine reaped it: after the reap its pid names nothing, and a member
+	/// that left the group is named by nothing else.
+	pins:   Mutex<Vec<(u32, PinnedProcess)>>,
+}
 
 impl SpawnLog {
 	/// `pid` was spawned with `lineage`.
 	pub fn record(&self, lineage: Lineage, pid: u32) {
 		if lineage.label != 0 {
-			self.0.lock().push((lineage.label, pid));
+			self.0.spawns.lock().push((lineage.label, pid));
+		}
+	}
+
+	/// The engine is about to reap labelled external `pid`: while it holds
+	/// it unreaped its pid is still the number of the group it led, so the
+	/// members of that group are pinned now or never.
+	pub fn pin_members(&self, pid: u32) {
+		let labels: Vec<u32> = self
+			.0
+			.spawns
+			.lock()
+			.iter()
+			.filter(|&&(_, spawned)| spawned == pid)
+			.map(|&(label, _)| label)
+			.collect();
+		if labels.is_empty() {
+			return;
+		}
+		let Some(leader) = i32::try_from(pid).ok().and_then(PinnedProcess::from_pid) else {
+			return;
+		};
+		let members = leader.members_before_reap();
+		if members.is_empty() {
+			return;
+		}
+		let mut pins = self.0.pins.lock();
+		for label in labels {
+			for member in &members {
+				if !pins
+					.iter()
+					.any(|(seen, pin)| *seen == label && pin.same_identity(member))
+				{
+					pins.push((label, member.clone()));
+				}
+			}
 		}
 	}
 
@@ -155,6 +201,7 @@ impl SpawnLog {
 	fn live(&self, labels: &[u32]) -> Vec<u32> {
 		self
 			.0
+			.spawns
 			.lock()
 			.iter()
 			.filter(|&&(label, pid)| labels.contains(&label) && running(pid))
@@ -162,8 +209,23 @@ impl SpawnLog {
 			.collect()
 	}
 
+	/// Everything pinned under `labels` that still runs.
+	fn pinned(&self, labels: &[u32]) -> Vec<PinnedProcess> {
+		self
+			.0
+			.pins
+			.lock()
+			.iter()
+			.filter(|(label, pin)| {
+				labels.contains(label) && pin.status() == pi_builtins::ProcessStatus::Running
+			})
+			.map(|(_, pin)| pin.clone())
+			.collect()
+	}
+
 	fn forget(&self, labels: &[u32]) {
-		self.0.lock().retain(|(label, _)| !labels.contains(label));
+		self.0.spawns.lock().retain(|(label, _)| !labels.contains(label));
+		self.0.pins.lock().retain(|(label, _)| !labels.contains(label));
 	}
 }
 
