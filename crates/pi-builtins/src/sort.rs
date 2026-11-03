@@ -28,8 +28,8 @@ pub struct Compressor {
 }
 
 impl Compressor {
-	/// Spawns the compressor, with `stdin`/`stdout` as given and stderr piped
-	/// back to the command's own standard error.
+	/// Spawns the compressor, with `stdin`/`stdout` as given and stderr sent
+	/// to the command's own standard error, forwarding it only when virtual.
 	fn spawn(
 		&self,
 		stdin: impl Into<Stdio>,
@@ -3459,7 +3459,7 @@ use std::{
 };
 
 use bigdecimal::BigDecimal;
-use brush_core::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
+use crate::openfile::OpenFile;
 use chunks::LineData;
 use clap::{Arg, ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, builder::ValueParser};
 use custom_str_cmp::custom_str_cmp;
@@ -3494,7 +3494,7 @@ use uucore::{
 #[cfg(unix)]
 use crate::locale::locale_loadable;
 use crate::{
-	host::{Host, Utility, format_usage, rayon_global_pool_available, util},
+	host::{Host, Utility, format_usage, rayon_global_pool_available},
 	locale::{numeric_symbols, parse_locale_name, shell_locale},
 	sort::{
 		buffer_hint::automatic_buffer_size,
@@ -6290,11 +6290,6 @@ fn uu_app() -> Command {
 				.value_parser(ValueParser::os_string())
 				.value_hint(clap::ValueHint::FilePath),
 		)
-}
-
-/// Creates the `sort` builtin registration.
-pub(crate) fn sort_builtin<SE: ShellExtensions>() -> Registration<SE> {
-	util::<Sort, SE>()
 }
 
 fn exec(

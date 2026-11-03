@@ -31,9 +31,7 @@
 
 use std::ffi::OsString;
 
-use brush_core::{ShellExtensions, builtins::Registration};
-
-use crate::host::{Host, Utility, util};
+use crate::host::{Host, Utility};
 
 mod acl;
 mod backup;
@@ -115,9 +113,4 @@ impl Utility for Rsync {
 		let code = session::run(host, argv);
 		if host.stderr_write_failed() { crate::rsync::exit::RERR_MESSAGEIO } else { code }
 	}
-}
-
-/// Creates the `rsync` builtin registration.
-pub(crate) fn rsync_builtin<SE: ShellExtensions>() -> Registration<SE> {
-	util::<Rsync, SE>()
 }

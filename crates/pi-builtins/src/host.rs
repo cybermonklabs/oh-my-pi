@@ -11,15 +11,15 @@
 //!
 //! A utility implements [`Utility`]: a `clap` argument model plus a synchronous
 //! [`Utility::run`] body (or [`AsyncUtility`], with an `async` body awaited on
-//! the shell task; see [`async_util`]). [`util`] wraps that into a
-//! [`Registration`] which
+//! the calling task). [`run_utility`] and [`run_async_utility`] drive one from
+//! an [`Invocation`]:
 //!
-//! 1. parses `argv`, rendering `--help`/`--version` on stdout and usage errors
-//!    on stderr with the utility's own exit status,
-//! 2. runs the body on a blocking thread, so a slow utility never stalls the
-//!    async runtime and concurrent pipeline stages stay isolated,
-//! 3. observes the shell's cancellation token (abort/`timeout`), and
-//! 4. contains panics at the builtin boundary instead of taking down the
+//! 1. they parse `argv`, rendering `--help`/`--version` on stdout and usage
+//!    errors on stderr with the utility's own exit status,
+//! 2. run a synchronous body on a blocking thread, so a slow utility never
+//!    stalls the async runtime and concurrent pipeline stages stay isolated,
+//! 3. observe the invocation's cancellation token (abort/`timeout`), and
+//! 4. contain panics at the builtin boundary instead of taking down the
 //!    long-lived host process.
 //!
 //! Paths go through [`ShellPaths`], which also maps descriptor paths
@@ -37,46 +37,39 @@ use std::{
 	ffi::OsString,
 	future::poll_fn,
 	io::{self, BufWriter, LineWriter, Read, Write},
-	marker::PhantomData,
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
 	pin::pin,
-	task::Poll,
-	time::Duration,
 	sync::{
 		Arc, OnceLock,
 		atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering},
 	},
 };
+use std::task::Poll;
 
 use futures::{
 	FutureExt,
+	future::BoxFuture,
 	stream::{FuturesUnordered, StreamExt},
 };
 use parking_lot::Mutex;
 use pi_vfs::{BlockingFs, Metadata, absolute_path};
-
-use brush_core::{
-	CommandArg, Error, ExecutionContext, ExecutionExitCode, ExecutionParameters, ExecutionResult,
-	ExecutionSpawnResult, Shell, ShellExtensions,
-	builtins::{self, Registration},
-	commands::{ShellForCommand, SimpleCommand},
-	openfiles::{self, OpenFile, OpenFiles},
-	processes::ProcessWaitResult,
-};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use crate::stdio_buffer::StdioCall;
+#[cfg(unix)]
+use crate::openfile::DescriptorPath;
 use crate::{
+	openfile::{self, Fd, OpenFile},
 	stdio::{AsyncOut, Source},
-	stdio_buffer::StdioBuffer,
 };
+pub(crate) use crate::stdio_buffer::StdioCall;
+use crate::stdio_buffer::StdioBuffer;
 
 /// A command-line utility implemented as a shell builtin.
 ///
 /// Implementors supply the `clap` argument model (via `derive(Parser)`, or
 /// [`matches_parser!`] for builder-style definitions) and a synchronous body.
-/// Register with [`util`].
+/// Register with a `utility` row of the extras table (`src/extras.rs`).
 pub(crate) trait Utility: clap::Parser + Send + Sync + 'static {
 	/// Program name, used in diagnostics (`sed: -e expression #1: …`).
 	const NAME: &'static str;
@@ -85,10 +78,7 @@ pub(crate) trait Utility: clap::Parser + Send + Sync + 'static {
 	/// `ls`/`grep`/`cmp` families reserve 1 for "differences found" and use 2.
 	const USAGE_ERROR: u8 = 1;
 
-	/// Exit status when the utility's output fails and SIGPIPE does not kill
-	/// it (it is ignored): GNU's `exit_failure`, which `close_stdout` exits
-	/// with (see [`close_stdout`]). The usage-error status for most
-	/// utilities; 4 for `sed`, whose output errors are fatal.
+	/// GNU's `exit_failure` for an output error with SIGPIPE ignored.
 	const OUTPUT_ERROR: u8 = Self::USAGE_ERROR;
 
 	/// Whether the utility runs command lines through [`Host::run_command`] or
@@ -112,30 +102,13 @@ pub(crate) trait Utility: clap::Parser + Send + Sync + 'static {
 	/// handle on stdout's identity; every other utility skips the dup.
 	const CHECKS_STDOUT_PATH: bool = false;
 
-	/// Bytes the program this utility stands in for buffers on standard
-	/// output to a pipe before writing them: a write that finds the pipe's
-	/// reader gone kills it only once its buffer would be written (see
-	/// [`OutputGate::record`]). GNU utilities buffer through stdio, one pipe
-	/// block; one that writes unbuffered (`cat`, `tee`, `yes`) sets 0 and dies
-	/// at its first such write.
+	/// Program stdout's pipe buffer, independent of the live-output buffer.
 	const STDOUT_BUFFER: usize = PIPE_BUFFER;
-
-	/// Whether the program ignores SIGPIPE from its start and handles its own
-	/// output errors, never checking its streams at exit (a Rust program:
-	/// ripgrep, fd): a write that finds a pipe with no reader is an ordinary
-	/// write error, also for its help, version and usage messages.
+	/// Programs such as ripgrep and fd ignore SIGPIPE from startup.
 	const IGNORES_SIGPIPE: bool = false;
-
-	/// With [`Utility::IGNORES_SIGPIPE`], the status the program exits with at
-	/// once when a standard-error write finds a pipe with no reader: ripgrep
-	/// exits 0 (its message macro), a Rust program whose `eprintln!` fails
-	/// panics with 101.
+	/// Immediate exit at a failed diagnostic, for programs handling EPIPE.
 	const STDERR_EXIT: Option<i32> = None;
-
-	/// With [`Utility::IGNORES_SIGPIPE`], the status it exits with when it
-	/// cannot write a usage-error message: ripgrep reports its argument
-	/// errors as its other messages (0); `None` keeps the usage status, as
-	/// fd's argument parser, which ignores the failed write, does.
+	/// An argument parser may use a different failed-diagnostic policy.
 	const USAGE_STDERR_EXIT: Option<i32> = None;
 
 	/// Rewrites raw `argv` before clap parses it.
@@ -157,7 +130,7 @@ pub(crate) trait Utility: clap::Parser + Send + Sync + 'static {
 }
 
 /// A command-line utility whose body is `async`, awaited directly on the
-/// shell task by the adapter [`AsyncUtil`] (no blocking thread).
+/// calling task by [`run_async_utility`] (no blocking thread).
 ///
 /// The constants and [`AsyncUtility::rewrite_argv`] mean what they do for
 /// [`Utility`]. The body is dropped when the shell cancels the utility, so it
@@ -165,8 +138,8 @@ pub(crate) trait Utility: clap::Parser + Send + Sync + 'static {
 /// is memory-backed: writes to [`Host::stdout_writer`] and [`Host::stderr`]
 /// are delivered by [`Host::flush_output`] (called at unit boundaries) and by
 /// the adapter when the body ends, and stdin is read with
-/// [`Host::read_stdin`] or [`Host::read_stdin_to_end`]. Register with
-/// [`async_util`].
+/// [`Host::read_stdin`] or [`Host::read_stdin_to_end`]. Register with an
+/// `async_utility` row of the extras table (`src/extras.rs`).
 pub(crate) trait AsyncUtility: clap::Parser + Send + Sync + 'static {
 	/// Program name, used in diagnostics.
 	const NAME: &'static str;
@@ -186,13 +159,10 @@ pub(crate) trait AsyncUtility: clap::Parser + Send + Sync + 'static {
 
 	/// See [`Utility::STDOUT_BUFFER`].
 	const STDOUT_BUFFER: usize = PIPE_BUFFER;
-
 	/// See [`Utility::IGNORES_SIGPIPE`].
 	const IGNORES_SIGPIPE: bool = false;
-
 	/// See [`Utility::STDERR_EXIT`].
 	const STDERR_EXIT: Option<i32> = None;
-
 	/// See [`Utility::USAGE_STDERR_EXIT`].
 	const USAGE_STDERR_EXIT: Option<i32> = None;
 
@@ -224,11 +194,9 @@ pub(crate) struct Host {
 	/// same serialized writer [`Host::stdout_writer`] returns, so interleaving
 	/// follows write order exactly.
 	pub stderr: StreamWriter,
-	/// The command's standard error as the file itself, outside the SIGPIPE
-	/// guard: what a child the utility starts writes (see
-	/// [`Host::child_env`]), whose failed write is the child's, not the
-	/// utility's.
-	child_stderr:          OpenFile,
+	/// Unguarded stderr inherited by child processes: their writes kill them,
+	/// not the utility that launched them.
+	child_stderr: OpenFile,
 	/// Whether stdout is a regular file, sampled before the SIGPIPE guard hid
 	/// its descriptor; picks [`Host::stdout_writer`]'s buffering.
 	stdout_is_file:        bool,
@@ -246,8 +214,8 @@ pub(crate) struct Host {
 	cancel:                Arc<AtomicBool>,
 	exit_code:             i32,
 	stdin_is_search_input: bool,
-	/// The shared stdout/stderr writer when both fds point at one
-	/// destination; `None` when they diverge.
+	/// The utility's stdout buffer, also used by stderr for merged fds.
+	/// Async utilities instead use `async_out`.
 	merged_out:            Option<Arc<Mutex<StreamWriter>>>,
 	/// Emulated SIGPIPE state shared with every guarded stream handed out by
 	/// this host; see [`Sigpipe`].
@@ -274,8 +242,8 @@ struct AsyncStreams {
 
 fn output_handle(file: &OpenFile) -> Option<OpenFile> {
 	match file {
-		OpenFile::File(_) | OpenFile::Vfs(_) | OpenFile::Stdout(_) => file.try_clone().ok(),
-		_ => None,
+		OpenFile::File(_) | OpenFile::Vfs(_) => file.try_clone().ok(),
+		OpenFile::Stream(_) => None,
 	}
 }
 
@@ -285,26 +253,7 @@ fn output_metadata(file: &OpenFile) -> Option<Metadata> {
 		// drops; without it `path_is_stdout` can never match on Windows.
 		OpenFile::File(file) => Metadata::from_file(file).ok(),
 		OpenFile::Vfs(file) => file.metadata().ok(),
-		OpenFile::Stdout(stdout) => {
-			#[cfg(unix)]
-			{
-				use std::os::fd::AsFd;
-				let handle = stdout.as_fd().try_clone_to_owned().ok()?;
-				Metadata::from_file(&std::fs::File::from(handle)).ok()
-			}
-			#[cfg(windows)]
-			{
-				use std::os::windows::io::AsHandle;
-				let handle = stdout.as_handle().try_clone_to_owned().ok()?;
-				Metadata::from_file(&std::fs::File::from(handle)).ok()
-			}
-			#[cfg(not(any(unix, windows)))]
-			{
-				let _ = stdout;
-				None
-			}
-		},
-		_ => None,
+		OpenFile::Stream(_) => None,
 	}
 }
 
@@ -323,91 +272,35 @@ impl StdoutFile {
 /// Exit status of a process killed by SIGPIPE (128 + 13).
 pub(crate) const SIGPIPE_EXIT_CODE: i32 = 141;
 
-/// Returned by a utility body for its own write that found a pipe with no
-/// reader. [`settle`] turns it into the status the program ends with:
-/// SIGPIPE's ([`SIGPIPE_EXIT_CODE`]), or, with SIGPIPE ignored, the write
-/// error and the utility's error status. It is no exit status (those are
-/// 0..=255), so it never stands for a command's status a utility passes on.
+/// A body-only write failure, distinct from a child's actual exit 141.
 pub(crate) const BROKEN_WRITE: i32 = -SIGPIPE_EXIT_CODE;
-
-/// Bytes a program's standard output holds before they are written to a pipe:
-/// stdio sizes the buffer to the pipe's block size. The default of
-/// [`Utility::STDOUT_BUFFER`].
 const PIPE_BUFFER: usize = 4096;
-
-/// [`Sigpipe::failed_ignored`] bit: a standard-output write failed.
 const FAILED_STDOUT: u8 = 1;
-/// [`Sigpipe::failed_ignored`] bit: a standard-error write failed.
 const FAILED_STDERR: u8 = 2;
-
-/// Emulated SIGPIPE for an in-process utility.
-///
-/// A standalone utility whose reader goes away (`cut big.txt | head`) never
-/// observes `EPIPE`: the kernel delivers SIGPIPE and the process dies silently
-/// with status 141. A builtin runs inside the long-lived shell process, which
-/// must ignore SIGPIPE, so the same write returns `ErrorKind::BrokenPipe` and
-/// every ported error path would report it as a generic write failure.
-///
-/// [`SigpipeGuard`] wraps the host's stdout and stderr: the first broken-pipe
-/// write flips [`Sigpipe::hit`]. A process writes standard error unbuffered,
-/// so a broken stderr write kills the utility at once (see [`Sigpipe::kill`]);
-/// it buffers standard output to a pipe ([`Utility::STDOUT_BUFFER`]), so a
-/// broken stdout write kills it only once its buffer would be written, or
-/// when it starts a command (see [`OutputGate::record`]), and until then its
-/// output is dropped. Writes after the death (from helper threads, or after
-/// the body) see stderr discarded and stdout failing. [`run_caught`] then
-/// reports [`SIGPIPE_EXIT_CODE`] regardless of what the body returned.
-///
-/// [`Sigpipe::ignored`] is the builtin analogue of `signal(SIGPIPE, SIG_IGN)`,
-/// inherited from the shell or set for utilities that must survive a closed
-/// reader (`tee -p`). A write then fails with `EPIPE`, and the failure is
-/// noted in [`Sigpipe::failed_ignored`] for the check a GNU program makes of
-/// its streams at exit (see [`close_stdout`]).
-pub(crate) struct Sigpipe {
-	hit:             AtomicBool,
-	ignored:         AtomicBool,
-	/// [`Utility::STDOUT_BUFFER`] of the utility, 0 once it unbuffered its
-	/// standard output ([`Host::unbuffer_stdout`]).
-	stdout_buffer:   AtomicUsize,
-	/// The program's standard-output buffer, packed (see
-	/// [`StdioBuffer::pack`]): which of its writes reach the descriptor.
-	stdout_stdio:    AtomicUsize,
-	/// The utility reports its standard-output stdio calls itself (see
-	/// [`Host::account_stdout_by_calls`]): bytes written to standard output
-	/// are not counted as calls.
-	calls_accounted: AtomicBool,
-	/// A write found standard output's reader gone: the program dies of it at
-	/// its next write to the descriptor (see [`Sigpipe::program_wrote`]).
-	stdout_broken:   AtomicBool,
-	/// With SIGPIPE ignored, the program wrote to the descriptor since
-	/// [`Sigpipe::stdout_broken`]: its standard-output writes fail.
-	stdout_failing:  AtomicBool,
-	/// [`FAILED_STDOUT`] and [`FAILED_STDERR`]: the streams on which a write
-	/// failed with `EPIPE` while SIGPIPE was ignored.
-	failed_ignored:  AtomicU8,
-	/// The utility handles its own standard-output write errors (GNU `tee`
-	/// clears each one): the check at exit skips them.
-	checks_stdout:   AtomicBool,
-	/// The utility handles its own standard-error write errors too (`rsync`):
-	/// the check at exit skips them.
-	checks_stderr:   AtomicBool,
-	/// A command ran in place of the utility, as `execvp` replaces a program
-	/// (`env`): no check at exit happens.
-	exec_replaced:   AtomicBool,
-	/// SIGPIPE has killed the utility (see [`Sigpipe::kill`]); a hit on
-	/// standard output alone only kills it once its buffer would be written.
-	killed:          AtomicBool,
-	/// The status the program exits with at once when a standard-error write
-	/// finds a pipe with no reader ([`NO_EXIT`] for none): ripgrep exits 0,
-	/// and a Rust program whose `eprintln!` fails panics with 101.
-	stderr_exit:     AtomicI32,
-	/// The status the program exited with at such a write ([`NO_EXIT`]
-	/// before); see [`Sigpipe::exit_at_broken_stderr`].
-	exited:          AtomicI32,
-}
-
-/// No status in [`Sigpipe::stderr_exit`] or [`Sigpipe::exited`].
 const NO_EXIT: i32 = i32::MIN;
+
+/// Per-utility signal and stdio state. Live output can be delivered early,
+/// but a failed write ends the body only where the original program would
+/// write its stdio buffer. Diagnostics and unbuffered output end it at once.
+pub(crate) struct Sigpipe {
+	hit: AtomicBool,
+	ignored: AtomicBool,
+	stdout_buffer: AtomicUsize,
+	stdout_stdio: AtomicUsize,
+	calls_accounted: AtomicBool,
+	stdout_broken: AtomicBool,
+	stdout_failing: AtomicBool,
+	failed_ignored: AtomicU8,
+	checks_stdout: AtomicBool,
+	checks_stderr: AtomicBool,
+	exec_replaced: AtomicBool,
+	killed: AtomicBool,
+	stderr_exit: AtomicI32,
+	exited: AtomicI32,
+	killed_report: OnceLock<Arc<AtomicBool>>,
+	/// Weak to avoid a cycle through the stdout guard's shared signal state.
+	stdout_writer: Mutex<std::sync::Weak<Mutex<StreamWriter>>>,
+}
 
 impl Default for Sigpipe {
 	fn default() -> Self {
@@ -432,6 +325,8 @@ impl Sigpipe {
 			killed: AtomicBool::new(false),
 			stderr_exit: AtomicI32::new(NO_EXIT),
 			exited: AtomicI32::new(NO_EXIT),
+			killed_report: OnceLock::new(),
+			stdout_writer: Mutex::new(std::sync::Weak::new()),
 		}
 	}
 
@@ -445,22 +340,14 @@ impl Sigpipe {
 		self.hit.load(Ordering::Relaxed)
 	}
 
-	/// Whether a standard-output write found a pipe with no reader.
 	fn stdout_broken(&self) -> bool {
 		self.stdout_broken.load(Ordering::Relaxed)
 	}
 
-	/// Whether the program's standard-output writes fail: it wrote to the
-	/// descriptor since the pipe broke, and SIGPIPE killed it or, ignored,
-	/// that write failed.
 	fn stdout_fails(&self) -> bool {
 		self.is_killed() || self.stdout_failing.load(Ordering::Relaxed)
 	}
 
-	/// The program writes to standard output's descriptor now (its buffer
-	/// overflowed, it flushed, or it writes unbuffered): once the pipe's
-	/// reader is gone, SIGPIPE kills it here, or, ignored, this write and
-	/// every later one fail.
 	fn program_wrote(&self) {
 		if self.stdout_broken() {
 			self.stdout_failing.store(true, Ordering::Relaxed);
@@ -468,23 +355,14 @@ impl Sigpipe {
 		}
 	}
 
-	/// The program flushed its standard output (see [`Sigpipe::stdio_call`]).
 	fn flushed_stdout(&self) {
 		self.stdio_call(StdioCall::Flush);
 	}
 
-	/// Counts `n` bytes the port wrote to standard output, as one `printf` of
-	/// the program; nothing when the utility reports its calls itself (see
-	/// [`Host::account_stdout_by_calls`]). Returns whether the program writes
-	/// to the descriptor now.
 	fn wrote_stdout(&self, n: usize) -> bool {
 		!self.calls_accounted.load(Ordering::Relaxed) && self.stdio_call(StdioCall::Printf(n))
 	}
 
-	/// Applies one stdio call of the program to its standard-output buffer
-	/// (see [`StdioBuffer`]); a call that writes to the descriptor is where a
-	/// pipe with no reader kills it (see [`Sigpipe::program_wrote`]). Returns
-	/// whether the call writes to the descriptor.
 	fn stdio_call(&self, call: StdioCall) -> bool {
 		let cap = self.stdout_buffer.load(Ordering::Relaxed);
 		let mut written = 0;
@@ -499,19 +377,13 @@ impl Sigpipe {
 		written > 0
 	}
 
-	/// Ends the utility body at once after a write that killed it, as SIGPIPE
-	/// kills a process at the write that raised it, before it does anything
-	/// more (creates the next directory, removes the next file, starts a
-	/// command).
-	///
-	/// Unwinds to [`run_caught`], which reports [`SIGPIPE_EXIT_CODE`]; only
-	/// inside a utility body, under its `catch_unwind` boundary (see
-	/// [`SigpipeUnwindScope`]), and never while already unwinding. Outside
-	/// one the death is only noted ([`Sigpipe::is_killed`]).
+	/// Unwind only under our own catch boundary, never during a destructor's
+	/// unwind. Helper threads and final drains only record the death.
 	fn kill(&self) {
 		if !self.is_hit() {
 			return;
 		}
+		self.publish_death();
 		self.killed.store(true, Ordering::Relaxed);
 		if SigpipeUnwindScope::active() && !std::thread::panicking() {
 			std::panic::resume_unwind(Box::new(SigpipeDeath));
@@ -522,36 +394,38 @@ impl Sigpipe {
 		self.killed.load(Ordering::Relaxed)
 	}
 
-	/// Ends the utility at once with the status it exits with at a failed
-	/// standard-error write ([`Utility::STDERR_EXIT`]), as [`Sigpipe::kill`]
-	/// ends it; a no-op for a utility without one.
 	fn exit_at_broken_stderr(&self) {
 		let code = self.stderr_exit.load(Ordering::Relaxed);
 		if code == NO_EXIT {
 			return;
 		}
-		let _ = self
-			.exited
-			.compare_exchange(NO_EXIT, code, Ordering::Relaxed, Ordering::Relaxed);
+		let _ = self.exited.compare_exchange(NO_EXIT, code, Ordering::Relaxed, Ordering::Relaxed);
 		self.killed.store(true, Ordering::Relaxed);
 		if SigpipeUnwindScope::active() && !std::thread::panicking() {
 			std::panic::resume_unwind(Box::new(SigpipeDeath));
 		}
 	}
 
-	/// The status the utility exited with at a failed standard-error write.
 	fn exit_code(&self) -> Option<i32> {
 		let code = self.exited.load(Ordering::Relaxed);
 		(code != NO_EXIT).then_some(code)
 	}
+
+	fn publish_death(&self) {
+		if let Some(killed) = self.killed_report.get() { killed.store(true, Ordering::Relaxed); }
+	}
+
+	/// Flush the utility's actual stdout buffer before a diagnostic, as
+	/// gnulib error() does. Do not retain the buffer through our own guard.
+	fn before_diagnostic(&self) {
+		let stdout = self.stdout_writer.lock().upgrade();
+		if let Some(stdout) = stdout { let _ = stdout.lock().flush(); }
+		self.flushed_stdout();
+	}
 }
 
-/// The unwinding payload of a utility body SIGPIPE killed; see
-/// [`Sigpipe::kill`].
 struct SigpipeDeath;
 
-/// Which standard stream a [`SigpipeGuard`] fronts; decides what a write does
-/// once the emulated process is dead.
 #[derive(Clone, Copy)]
 pub(crate) enum GuardedStream {
 	Stdout,
@@ -559,7 +433,6 @@ pub(crate) enum GuardedStream {
 }
 
 impl GuardedStream {
-	/// This stream's [`Sigpipe::failed_ignored`] bit.
 	const fn failed_bit(self) -> u8 {
 		match self {
 			Self::Stdout => FAILED_STDOUT,
@@ -568,14 +441,11 @@ impl GuardedStream {
 	}
 }
 
-/// What the death of the emulated process (SIGPIPE, cancellation) does to one
-/// output stream; shared by [`SigpipeGuard`] and the async utilities'
-/// memory-backed output.
 #[derive(Clone)]
 pub(crate) struct OutputGate {
-	stream:  GuardedStream,
+	stream: GuardedStream,
 	sigpipe: Arc<Sigpipe>,
-	cancel:  CommandCancel,
+	cancel: CommandCancel,
 }
 
 impl OutputGate {
@@ -583,12 +453,6 @@ impl OutputGate {
 		Self { stream, sigpipe: Arc::clone(sigpipe), cancel: cancel.clone() }
 	}
 
-	/// Whether the emulated process is dead to this stream's reader: writes
-	/// are dropped. Standard error is dropped once SIGPIPE killed the
-	/// utility. Standard output is dropped, not failed, between a write that
-	/// found no reader and the program's next write to the descriptor: its
-	/// writes there only fill its buffer, and its diagnostics still reach
-	/// their own destination.
 	pub fn discards(&self) -> bool {
 		(self.cancel.silences && self.cancel.fired())
 			|| match self.stream {
@@ -597,38 +461,18 @@ impl OutputGate {
 			}
 	}
 
-	/// Whether writes to this stream fail: stdout once the program wrote to
-	/// the descriptor after the pipe broke (SIGPIPE ignored), or once SIGPIPE
-	/// killed the utility.
 	pub fn fails(&self) -> bool {
 		matches!(self.stream, GuardedStream::Stdout) && self.sigpipe.stdout_fails()
 	}
 
-	/// Counts `n` bytes the utility wrote to standard output. Returns whether
-	/// the program writes to the descriptor now (see
-	/// [`Sigpipe::wrote_stdout`]).
 	pub fn wrote(&self, n: usize) -> bool {
 		matches!(self.stream, GuardedStream::Stdout) && self.sigpipe.wrote_stdout(n)
 	}
 
-	/// Applies the program's standard-output stdio `call` (see
-	/// [`Host::account_stdout_by_calls`]). Returns whether it writes to the
-	/// descriptor.
 	pub fn stdio_call(&self, call: StdioCall) -> bool {
 		matches!(self.stream, GuardedStream::Stdout) && self.sigpipe.stdio_call(call)
 	}
 
-	/// Notes a failed write, flipping the SIGPIPE state on a closed reader. A
-	/// standard-error write kills the utility at once (see [`Sigpipe::kill`]).
-	/// A standard-output write that was not the program's own write to the
-	/// descriptor (it only filled the program's buffer) marks the pipe
-	/// broken: the program dies at its next write to the descriptor, when its
-	/// buffer overflows, it flushes, it starts a command, or at exit, and
-	/// goes on working until then (see [`Sigpipe::program_wrote`]).
-	///
-	/// With SIGPIPE ignored the write fails with `EPIPE`, which is noted for
-	/// the check at exit (see [`close_stdout`]); on standard output the
-	/// failure, too, comes only at the program's next write.
 	pub fn record(&self, error: &io::Error) {
 		if error.kind() != io::ErrorKind::BrokenPipe {
 			return;
@@ -647,11 +491,6 @@ impl OutputGate {
 		}
 	}
 
-	/// [`OutputGate::record`] for a write the program made to the descriptor
-	/// itself (its unbuffered standard error, an overflowing standard-output
-	/// buffer, a flush), also to a destination its other stream shares
-	/// (`2>&1`): SIGPIPE kills it at once, or, ignored, the write fails at
-	/// once.
 	pub fn record_unbuffered(&self, error: &io::Error) {
 		self.record(error);
 		if matches!(self.stream, GuardedStream::Stdout) && error.kind() == io::ErrorKind::BrokenPipe {
@@ -660,17 +499,12 @@ impl OutputGate {
 		self.sigpipe.kill();
 	}
 
-	/// The program flushed its standard output (see
-	/// [`Sigpipe::flushed_stdout`]).
 	pub fn flushed(&self) {
 		if matches!(self.stream, GuardedStream::Stdout) {
 			self.sigpipe.flushed_stdout();
 		}
 	}
 
-	/// Raises SIGPIPE for a standard-error write to a destination whose
-	/// reader has gone, as an unbuffered write there would: the utility dies
-	/// at once (see [`Sigpipe::kill`]), unless SIGPIPE is ignored.
 	pub fn die_of_closed_reader(&self) {
 		self.sigpipe.record(&io::ErrorKind::BrokenPipe.into());
 		self.sigpipe.exit_at_broken_stderr();
@@ -678,7 +512,7 @@ impl OutputGate {
 	}
 }
 
-/// An [`openfiles::Stream`] wrapper that turns `EPIPE` into emulated SIGPIPE.
+/// An [`openfile::Stream`] wrapper that turns `EPIPE` into emulated SIGPIPE.
 /// Clones share the [`Sigpipe`] state, so `stdout_clone()` handles given to
 /// helper threads participate too.
 ///
@@ -691,11 +525,8 @@ impl OutputGate {
 /// that owns its cancellation ([`Utility::OWNS_CANCELLATION`]) is not
 /// silenced: it reports its own end, like a process that catches the signal.
 struct SigpipeGuard {
-	inner:  OpenFile,
-	gate:   OutputGate,
-	/// Whether writes through this guard are the utility's own (counted
-	/// toward its standard-output buffer, see [`OutputGate::wrote`]), not a
-	/// later delivery of output another writer already counted.
+	inner: OpenFile,
+	gate: OutputGate,
 	counts: bool,
 }
 
@@ -716,7 +547,7 @@ impl SigpipeGuard {
 		cancel: &CommandCancel,
 		counts: bool,
 	) -> OpenFile {
-		OpenFile::Stream(Box::new(Self { inner, gate: OutputGate::new(stream, sigpipe, cancel), counts }))
+		OpenFile::stream(Box::new(Self { inner, gate: OutputGate::new(stream, sigpipe, cancel), counts }))
 	}
 
 	/// Whether the emulated process is dead to this stream's reader.
@@ -733,9 +564,10 @@ impl Read for SigpipeGuard {
 
 impl Write for SigpipeGuard {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		// Whether the program writes to the descriptor with this write (its
-		// buffer overflows, or it writes unbuffered).
 		let program_writes = self.counts && self.gate.wrote(buf.len());
+		if !buf.is_empty() && matches!(self.gate.stream, GuardedStream::Stderr) {
+			self.gate.sigpipe.before_diagnostic();
+		}
 		if self.gate.fails() {
 			return Err(io::ErrorKind::BrokenPipe.into());
 		}
@@ -744,13 +576,7 @@ impl Write for SigpipeGuard {
 		}
 		match self.inner.write(buf) {
 			Err(error) => {
-				if program_writes {
-					self.gate.record_unbuffered(&error);
-				} else {
-					self.gate.record(&error);
-				}
-				// A death SIGPIPE defers (the program's write only filled its
-				// buffer) leaves the write succeeding, as that write does.
+				if program_writes { self.gate.record_unbuffered(&error); } else { self.gate.record(&error); }
 				if self.discards() { Ok(buf.len()) } else { Err(error) }
 			},
 			written => written,
@@ -771,19 +597,16 @@ impl Write for SigpipeGuard {
 	}
 }
 
-impl openfiles::Stream for SigpipeGuard {
-	fn clone_box(&self) -> Box<dyn openfiles::Stream> {
-		Box::new(Self { inner: self.inner.clone(), gate: self.gate.clone(), counts: self.counts })
+impl openfile::Stream for SigpipeGuard {
+	#[cfg(unix)]
+	fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+		self.inner.raw_fd()
 	}
 
-	#[cfg(unix)]
-	fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, Error> {
-		Ok(self.inner.try_borrow_as_fd()?.try_clone_to_owned()?)
-	}
-
-	#[cfg(unix)]
-	fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, Error> {
-		self.inner.try_borrow_as_fd()
+	/// Asks the wrapped file directly: the probe is no write, so it neither
+	/// records SIGPIPE nor depends on whether output is already discarded.
+	fn reader_gone(&self) -> bool {
+		self.inner.reader_gone()
 	}
 }
 
@@ -838,7 +661,7 @@ pub(crate) struct ShellPaths {
 	cwd:         PathBuf,
 	filesystem:  BlockingFs,
 	#[cfg(unix)]
-	descriptors: Arc<[(brush_core::ShellFd, OpenFile)]>,
+	descriptors: Arc<[(i32, OpenFile)]>,
 }
 
 impl std::fmt::Debug for ShellPaths {
@@ -852,24 +675,28 @@ impl std::fmt::Debug for ShellPaths {
 }
 
 impl ShellPaths {
-	/// Captures the working directory and the descriptors visible to the
-	/// command in `context`: usually just 0/1/2, plus any from `exec N>` or
-	/// process substitution.
-	pub fn new<SE: ShellExtensions>(context: &ExecutionContext<'_, SE>) -> Self {
+	/// Captures the working directory `cwd`, the filesystem `fs`, and the
+	/// descriptors visible to the command: usually just 0/1/2, plus any from
+	/// `exec N>` or process substitution.
+	pub fn new(
+		cwd: PathBuf,
+		fs: &pi_vfs::Fs,
+		cancel: Option<CancellationToken>,
+		descriptors: impl IntoIterator<Item = (i32, OpenFile)>,
+	) -> Self {
 		// Scoped to the command's own cancellation (the operand's token under
 		// `timeout`), so a utility reading a host file stops when it fires
 		// instead of draining the file first: `timeout 1 cat /dev/zero` never
 		// returned.
-		let filesystem = context.shell.filesystem().blocking();
-		let filesystem = match context.cancel_token() {
+		let filesystem = fs.blocking();
+		let filesystem = match cancel {
 			Some(token) => filesystem.with_cancellation(token),
 			None => filesystem,
 		};
 		#[cfg(unix)]
-		let descriptors: Arc<[(brush_core::ShellFd, OpenFile)]> = context
-			.open_fds()
-			.map(|(fd, file)| (fd, file.clone()))
-			.collect();
+		let descriptors: Arc<[(i32, OpenFile)]> = descriptors.into_iter().collect();
+		#[cfg(not(unix))]
+		drop(descriptors);
 		#[cfg(unix)]
 		let filesystem = descriptors.iter().fold(filesystem, |filesystem, (fd, file)| {
 			match file.as_vfs().and_then(|file| file.try_clone().ok()) {
@@ -878,15 +705,13 @@ impl ShellPaths {
 			}
 		});
 		Self {
-			cwd: context.shell.working_dir().to_path_buf(),
+			cwd,
 			filesystem,
 			#[cfg(unix)]
 			descriptors,
 		}
 	}
 
-	/// Tells `write_errors` of every failed write to a file opened through
-	/// this resolver's filesystem (see [`pi_vfs::Fs::with_write_errors`]).
 	fn with_write_errors(mut self, write_errors: pi_vfs::WriteErrors) -> Self {
 		self.filesystem = self.filesystem.with_write_errors(write_errors);
 		self
@@ -912,13 +737,13 @@ impl ShellPaths {
 	/// Resolves `path` to what the shell would open.
 	///
 	/// Relative paths join [`ShellPaths::cwd`]. Windows aliases (`/c/...`,
-	/// `/tmp`) become native paths via `brush_core::sys::fs::normalize_shell_path`.
+	/// `/tmp`) become native paths via [`normalize_shell_path`].
 	/// A descriptor path becomes `/dev/fd/<host fd>` for the shell's
 	/// descriptor, or a path that cannot be opened when the shell has none.
 	pub fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
 		let resolved = self.absolute(path.as_ref());
 		#[cfg(unix)]
-		if let Some(descriptor) = openfiles::DescriptorPath::parse(&resolved) {
+		if let Some(descriptor) = DescriptorPath::parse(&resolved) {
 			return self.descriptor_target(descriptor);
 		}
 		resolved
@@ -934,8 +759,8 @@ impl ShellPaths {
 	pub fn resolve_link(&self, path: impl AsRef<Path>) -> PathBuf {
 		let resolved = self.absolute(path.as_ref());
 		#[cfg(unix)]
-		if let Some(descriptor) = openfiles::DescriptorPath::parse(&resolved)
-			&& descriptor != openfiles::DescriptorPath::Terminal
+		if let Some(descriptor) = DescriptorPath::parse(&resolved)
+			&& descriptor != DescriptorPath::Terminal
 			// `/dev/stdin` and friends sit directly under `/dev`.
 			&& resolved.components().count() != 3
 		{
@@ -948,22 +773,21 @@ impl ShellPaths {
 		if pi_vfs::is_virtual_path(path) {
 			return path.to_path_buf();
 		}
-		let normalized_path = brush_core::sys::fs::normalize_shell_path(path);
+		let normalized_path = normalize_shell_path(path);
 		absolute_path(&self.cwd, normalized_path.as_ref())
 	}
 
 	#[cfg(unix)]
-	fn descriptor_target(&self, descriptor: openfiles::DescriptorPath) -> PathBuf {
+	fn descriptor_target(&self, descriptor: DescriptorPath) -> PathBuf {
 		use std::os::fd::AsRawFd as _;
 
 		let fd = match descriptor {
-			openfiles::DescriptorPath::Fd(fd) => fd,
-			// Mirrors `brush_core::commands::child_session_action`: a command
-			// whose stdin is not a terminal runs with no controlling terminal,
-			// like the external commands the shell detaches into their own
-			// session.
-			openfiles::DescriptorPath::Terminal => {
-				return if self.file(OpenFiles::STDIN_FD).is_some_and(OpenFile::is_terminal) {
+			DescriptorPath::Fd(fd) => fd,
+			// A command whose stdin is not a terminal runs with no controlling
+			// terminal, like the external commands the shell detaches into
+			// their own session.
+			DescriptorPath::Terminal => {
+				return if self.file(openfile::STDIN_FD).is_some_and(OpenFile::is_terminal) {
 					PathBuf::from("/dev/tty")
 				} else {
 					PathBuf::from(UNAVAILABLE_DESCRIPTOR)
@@ -980,7 +804,7 @@ impl ShellPaths {
 	}
 
 	#[cfg(unix)]
-	fn file(&self, fd: brush_core::ShellFd) -> Option<&OpenFile> {
+	fn file(&self, fd: i32) -> Option<&OpenFile> {
 		self.descriptors
 			.iter()
 			.find(|(shell_fd, _)| *shell_fd == fd)
@@ -990,38 +814,182 @@ impl ShellPaths {
 
 /// Virtual descriptors cannot share native `/dev/fd` numbers in the overlay.
 #[cfg(unix)]
-fn virtual_descriptor_path(fd: brush_core::ShellFd) -> PathBuf {
+fn virtual_descriptor_path(fd: i32) -> PathBuf {
 	PathBuf::from(format!("omp-descriptor://{fd}"))
 }
 
-/// The host process umask, which builtins must never change: they run on
-/// threads of a process that other shells and the host share.
+/// The native path for a POSIX-style alias the shell accepts on Windows: an
+/// MSYS drive path (`/c/x`, `/mnt/c/x`) becomes `C:\\x`, and the `/tmp` tree
+/// lands in the system temporary directory. Elsewhere every path is native.
+#[allow(clippy::missing_const_for_fn, reason = "Windows implementation allocates")]
+pub(crate) fn normalize_shell_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+	#[cfg(windows)]
+	{
+		match msys::native(path, &std::env::temp_dir) {
+			Some(native) => std::borrow::Cow::Owned(native),
+			None => std::borrow::Cow::Borrowed(path),
+		}
+	}
+	#[cfg(not(windows))]
+	{
+		std::borrow::Cow::Borrowed(path)
+	}
+}
+
+/// MSYS path aliases on Windows; see [`normalize_shell_path`].
+#[cfg(any(windows, test))]
+mod msys {
+	use std::path::PathBuf;
+
+	/// The native spelling of `path`, or `None` when it is no alias.
+	/// `temp_dir` supplies the directory `/tmp` stands for.
+	pub(super) fn native(path: &std::path::Path, temp_dir: &dyn Fn() -> PathBuf) -> Option<PathBuf> {
+		let text = path.to_str()?;
+		let rest = text.strip_prefix('/')?;
+		if let Some(native) = drive(rest) {
+			return Some(native);
+		}
+		tmp(rest, temp_dir)
+	}
+
+	/// `c/x/y` or `mnt/c/x/y` (after the leading `/`) as `C:\\x\\y`.
+	fn drive(rest: &str) -> Option<PathBuf> {
+		let rest = match rest.get(..4) {
+			Some(prefix) if prefix.eq_ignore_ascii_case("mnt/") => &rest[4..],
+			_ => rest,
+		};
+		let mut chars = rest.chars();
+		let letter = chars.next().filter(char::is_ascii_alphabetic)?;
+		let tail = chars.as_str();
+		if !(tail.is_empty() || tail.starts_with('/')) {
+			return None;
+		}
+		let mut native = format!("{}:\\", letter.to_ascii_uppercase());
+		native.extend(tail.trim_start_matches('/').chars().map(|ch| if ch == '/' { '\\' } else { ch }));
+		Some(PathBuf::from(native))
+	}
+
+	/// `tmp/...` (after the leading `/`) under `temp_dir()`, after resolving
+	/// `.` and `..` as POSIX would; `None` when the result leaves `/tmp`.
+	fn tmp(rest: &str, temp_dir: &dyn Fn() -> PathBuf) -> Option<PathBuf> {
+		let mut stack: Vec<&str> = Vec::new();
+		for name in rest.split(['/', '\\']) {
+			match name {
+				"" | "." => {},
+				".." => {
+					stack.pop();
+				},
+				name if name.contains(':') => return None,
+				name => stack.push(name),
+			}
+		}
+		let (first, inner) = stack.split_first()?;
+		if *first != "tmp" {
+			return None;
+		}
+		let mut native = temp_dir();
+		native.extend(inner);
+		Some(native)
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::path::{Path, PathBuf};
+
+		use super::native;
+
+		fn translate(path: &str) -> Option<PathBuf> {
+			native(Path::new(path), &|| PathBuf::from("T"))
+		}
+
+		#[test]
+		fn drive_aliases_become_drive_paths() {
+			assert_eq!(translate("/c/Users/x"), Some(PathBuf::from(r"C:\Users\x")));
+			assert_eq!(translate("/mnt/d/a/b"), Some(PathBuf::from(r"D:\a\b")));
+			assert_eq!(translate("/c"), Some(PathBuf::from(r"C:\")));
+			assert_eq!(translate("/cc/x"), None);
+			assert_eq!(translate("relative/c"), None);
+		}
+
+		#[test]
+		fn tmp_maps_under_the_temp_dir() {
+			assert_eq!(translate("/tmp/f"), Some(PathBuf::from("T").join("f")));
+			assert_eq!(translate("/tmp/../tmp/f"), Some(PathBuf::from("T").join("f")));
+			assert_eq!(translate("/tmp/../etc"), None);
+			assert_eq!(translate("/var/tmp"), None);
+		}
+	}
+}
+
+/// Read the calling process's file-creation mask without changing it.
 ///
-/// Linux reads it race-free from `/proc/self/status`. Elsewhere the only way to
-/// read it is to set it and set it back, which briefly unmasks other threads'
-/// creations, so that happens once per process.
+/// Linux and Android use `/proc/self/status` when available. Other Unix
+/// systems (and an unavailable `/proc`) require a forked probe: the fork has
+/// a cost in a large multithreaded host, but only the child changes its mask.
+/// Returns `None` if the probe cannot be created or read. The result is not
+/// cached, since another host component may change the process mask.
+#[cfg(unix)]
+pub fn read_process_umask() -> Option<u32> {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	if let Some(mask) = std::fs::read_to_string("/proc/self/status")
+		.ok()
+		.and_then(|status| {
+			status
+				.lines()
+				.find_map(|line| line.strip_prefix("Umask:"))
+				.and_then(|mask| u32::from_str_radix(mask.trim(), 8).ok())
+		})
+	{
+		return Some(mask);
+	}
+	probe_process_umask()
+}
+
+/// Fork a short-lived child that can inspect its inherited mask without
+/// exposing another thread to a changed process mask.
+#[cfg(unix)]
+#[allow(clippy::useless_conversion, reason = "mode_t is u16 on some Unix targets")]
+fn probe_process_umask() -> Option<u32> {
+	use std::os::{fd::AsRawFd, unix::net::UnixStream};
+
+	let (mut reader, writer) = UnixStream::pair().ok()?;
+	let read_fd = reader.as_raw_fd();
+	let write_fd = writer.as_raw_fd();
+	// SAFETY: after fork the child calls only async-signal-safe libc
+	// functions on its inherited descriptors and stack data, then _exit.
+	let pid = unsafe { libc::fork() };
+	if pid < 0 {
+		return None;
+	}
+	if pid == 0 {
+		// SAFETY: the descriptors belong to this child. The mask is changed
+		// only in this child, and write uses a valid stack buffer.
+		unsafe {
+			libc::close(read_fd);
+			let bytes = u32::from(libc::umask(0)).to_ne_bytes();
+			let written = libc::write(write_fd, bytes.as_ptr().cast(), bytes.len());
+			libc::_exit(if written == bytes.len() as isize { 0 } else { 1 });
+		}
+	}
+	drop(writer);
+	let mut bytes = [0; 4];
+	let result = reader.read_exact(&mut bytes);
+	loop {
+		// SAFETY: pid is our child; a null status pointer discards its status.
+		if unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) } >= 0 {
+			break;
+		}
+		if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+			break;
+		}
+	}
+	result.ok()?;
+	Some(u32::from_ne_bytes(bytes))
+}
+
 #[cfg(unix)]
 pub(crate) fn process_umask() -> u32 {
-	use std::sync::LazyLock;
-
-	use nix::sys::stat::{Mode, umask};
-
-	#[allow(clippy::useless_conversion, reason = "`mode_t` is u16 on some targets")]
-	static TOGGLED: LazyLock<u32> = LazyLock::new(|| {
-		let mask = umask(Mode::empty());
-		umask(mask);
-		u32::from(mask.bits())
-	});
-	cfg_select! {
-		any(target_os = "linux", target_os = "android") => {
-			procfs::process::Process::myself()
-				.ok()
-				.and_then(|me| me.status().ok())
-				.and_then(|status| status.umask)
-				.unwrap_or_else(|| *TOGGLED)
-		}
-		_ => *TOGGLED,
-	}
+	read_process_umask().unwrap_or(0o022)
 }
 
 impl Host {
@@ -1158,47 +1126,27 @@ impl Host {
 		self.exit_code
 	}
 
-	/// Whether a write to stdout or stderr has hit a closed reader: the
-	/// utility dies of it, at once, or on standard output once its output
-	/// buffer would be written ([`Host::sigpipe_killed`]), and
-	/// [`run_caught`] reports the SIGPIPE status.
+	/// Whether a pipe broke, including a death deferred until stdout's
+	/// program buffer is written. Use `sigpipe_killed` to stop work.
 	pub fn sigpipe_hit(&self) -> bool {
 		self.sigpipe.is_hit()
 	}
 
-	/// Whether SIGPIPE has killed the utility. It is, in process terms,
-	/// already dead: stop work, skip diagnostics, and return.
 	pub fn sigpipe_killed(&self) -> bool {
 		self.sigpipe.is_killed()
 	}
 
-	/// Delivers what the program would already have written (see
-	/// [`AsyncOut::owes_delivery`]) before the utility goes on; a delivery
-	/// that finds a pipe with no reader kills the utility here.
 	pub async fn deliver_owed_output(&self) {
 		if let Some(streams) = &self.async_out {
 			deliver_owed(&streams.stdout, &streams.stderr).await;
 		}
 	}
 
-	/// The program's explicit flush of its standard output (fd's final
-	/// flush): its buffer is written now, so once its output found the pipe's
-	/// reader gone, SIGPIPE kills the utility here, or, SIGPIPE ignored, this
-	/// fails.
-	///
-	/// # Errors
-	///
-	/// `BrokenPipe` when the flush found the pipe's reader gone; any other
-	/// delivery error.
 	pub async fn flush_stdout_now(&mut self) -> io::Result<()> {
 		let Some(streams) = &self.async_out else {
 			self.stdout.flush()?;
-			self.sigpipe.flushed_stdout();
-			return if self.sigpipe.stdout_fails() {
-				Err(io::ErrorKind::BrokenPipe.into())
-			} else {
-				Ok(())
-			};
+			self.sigpipe.before_diagnostic();
+			return if self.sigpipe.stdout_fails() { Err(io::ErrorKind::BrokenPipe.into()) } else { Ok(()) };
 		};
 		let stdout = streams.stdout.clone();
 		stdout.flush_now();
@@ -1206,9 +1154,6 @@ impl Host {
 		if stdout.fails() { Err(io::ErrorKind::BrokenPipe.into()) } else { Ok(()) }
 	}
 
-	/// A handle for the program's explicit flushes of its standard output
-	/// from where it has no `Host` (see [`AsyncOut::flush_now`]); `None` for
-	/// a synchronous utility.
 	pub(crate) fn stdout_flusher(&self) -> Option<AsyncOut> {
 		self.async_out.as_ref().map(|streams| streams.stdout.clone())
 	}
@@ -1220,64 +1165,39 @@ impl Host {
 		self.sigpipe.ignored.store(true, Ordering::Relaxed);
 	}
 
-	/// Takes standard-output write errors as the utility's own to handle, as
-	/// GNU `tee` clears each one: the check at exit (see [`close_stdout`])
-	/// skips them.
 	pub fn checks_own_stdout(&self) {
 		self.sigpipe.checks_stdout.store(true, Ordering::Relaxed);
 	}
 
-	/// Takes every write error on standard output and standard error as the
-	/// utility's own to handle, as a program that does not check its streams
-	/// at exit (`rsync`): the check at exit (see [`close_stdout`]) skips them.
 	pub fn checks_own_output(&self) {
 		self.sigpipe.checks_stdout.store(true, Ordering::Relaxed);
 		self.sigpipe.checks_stderr.store(true, Ordering::Relaxed);
 	}
 
-	/// Whether a standard-error write failed while SIGPIPE was ignored (it
-	/// found a pipe with no reader): rsync ends with RERR_MESSAGEIO then.
 	pub fn stderr_write_failed(&self) -> bool {
 		self.sigpipe.failed_ignored.load(Ordering::Relaxed) & FAILED_STDERR != 0
 	}
 
-	/// Makes standard output unbuffered, for a program that flushes each
-	/// write (`grep --line-buffered`, `sed -u`, `tail -f`): a write that
-	/// finds the pipe's reader gone kills it at once, as with
-	/// [`Utility::STDOUT_BUFFER`] 0. Call before the first write.
 	pub fn unbuffer_stdout(&self) {
 		self.sigpipe.stdout_buffer.store(0, Ordering::Relaxed);
+		if let Some(shared) = &self.merged_out {
+			let mut writer = shared.lock();
+			let file = writer.dup_file();
+			*writer = StreamWriter::program(file, self.stdout_is_file, 0);
+		}
 	}
 
-	/// The utility reports the program's standard-output stdio calls itself
-	/// (`fwrite`, `printf`, `fflush`, through [`AsyncOut::stdio_calls`]),
-	/// so a pipe with no reader kills it at the call glibc would write at
-	/// (GNU find's `-printf` literal of a whole block); the bytes it writes
-	/// are not counted. Call before the first write.
 	pub fn account_stdout_by_calls(&self) {
 		self.sigpipe.calls_accounted.store(true, Ordering::Relaxed);
 	}
 
-	/// Ends the utility as a program does that finds its standard output's
-	/// reader gone without writing to it (GNU `tail -f`'s `die_pipe`, which
-	/// raises SIGPIPE, then exits 1): SIGPIPE kills it (status 141), or, when
-	/// ignored, it fails with status 1. Returns that status.
 	pub fn die_of_closed_stdout(&self) -> i32 {
 		self.sigpipe.record(&io::ErrorKind::BrokenPipe.into());
 		self.sigpipe.kill();
 		if self.sigpipe.is_hit() { SIGPIPE_EXIT_CODE } else { 1 }
 	}
 
-	/// Runs `command` in place of this utility, as `execvp` replaces a program
-	/// (`env`): once it ran, its status is the utility's (a command SIGPIPE
-	/// killed leaves the utility killed by it, as the process it became is),
-	/// and the check a program makes of its streams at exit (see
-	/// [`close_stdout`]) never happens.
-	///
-	/// # Errors
-	///
-	/// As for [`Host::run_command`]; the utility goes on to report the
-	/// failure, as a program does after a failed `execvp`.
+	/// Run in place of the utility, as execvp does: no stream check at exit.
 	pub fn exec_command(&mut self, command: ShellCommand) -> io::Result<CommandStatus> {
 		let status = self.run_command(command)?;
 		self.sigpipe.exec_replaced.store(true, Ordering::Relaxed);
@@ -1285,12 +1205,23 @@ impl Host {
 		if status == CommandStatus::Signaled(libc::SIGPIPE) {
 			self.sigpipe.hit.store(true, Ordering::Relaxed);
 			self.sigpipe.killed.store(true, Ordering::Relaxed);
+			self.sigpipe.publish_death();
 		}
 		Ok(status)
 	}
 
+	fn before_diagnostic(&mut self) {
+		if let Some(streams) = &self.async_out {
+			streams.stdout.flush_now();
+		} else {
+			let _ = self.stdout.flush();
+			self.sigpipe.before_diagnostic();
+		}
+	}
+
 	/// Writes `<name>: <message>` to stderr and records exit status `code`.
 	pub fn error(&mut self, message: impl std::fmt::Display, code: i32) {
+		self.before_diagnostic();
 		let _ = writeln!(self.stderr, "{}: {message}", self.name);
 		self.fail(code);
 	}
@@ -1299,8 +1230,9 @@ impl Host {
 	/// more information.`, records exit status `code`, and returns it.
 	///
 	/// For usage errors found after parsing (operand combinations, invalid
-	/// option values); clap's own errors are rendered by the [`Util`] adapter.
+	/// option values); clap's own errors are rendered by [`run_utility`].
 	pub fn usage_error(&mut self, message: impl std::fmt::Display, code: i32) -> i32 {
+		self.before_diagnostic();
 		let _ = writeln!(self.stderr, "{0}: {message}\nTry '{0} --help' for more information.", self.name);
 		self.fail(code);
 		code
@@ -1310,6 +1242,7 @@ impl Host {
 	/// after diagnostics already printed; records exit status `code` and
 	/// returns it.
 	pub fn try_help(&mut self, code: i32) -> i32 {
+		self.before_diagnostic();
 		let _ = writeln!(self.stderr, "Try '{} --help' for more information.", self.name);
 		self.fail(code);
 		code
@@ -1359,10 +1292,8 @@ impl Host {
 	///
 	/// # Errors
 	///
-	/// The first write failure. A closed reader ends the utility with the
-	/// SIGPIPE status: at once on standard error, and on standard output once
-	/// its output buffer would be written, the delivery succeeding until then
-	/// (see [`OutputGate::record`]).
+	/// The first write failure; a closed reader is [`io::ErrorKind::BrokenPipe`]
+	/// and ends the utility with the SIGPIPE status.
 	pub async fn flush_output(&self) -> io::Result<()> {
 		self.drain_output(false).await
 	}
@@ -1503,15 +1434,8 @@ impl Host {
 		Ok(RunningCommandAsync { response })
 	}
 
-	/// Builds the request for `command`, flushing pending output first so it
-	/// stays in order, as a program flushes its output before it starts a
-	/// command.
-	///
-	/// # Errors
-	///
-	/// [`io::ErrorKind::BrokenPipe`] once a write found a pipe with no reader:
-	/// SIGPIPE killed the program this utility stands in for, so it starts
-	/// nothing more.
+	/// Builds the request for `command`, flushing pending diagnostics first so
+	/// output stays in order.
 	fn enqueue(
 		&mut self,
 		mut command: ShellCommand,
@@ -1522,14 +1446,10 @@ impl Host {
 				format!("{} cannot run commands", self.name),
 			));
 		};
-		// An async utility's output was delivered by `spawn_command_async`; a
-		// synchronous flush of a provider file would block the runtime.
 		if self.async_out.is_none() {
 			let _ = self.stdout.flush();
 		}
 		let _ = self.stderr.flush();
-		// The program flushes its buffered output before it starts a command
-		// (GNU `find`'s launch): there a deferred SIGPIPE kills it.
 		self.sigpipe.flushed_stdout();
 		if self.sigpipe.is_killed() {
 			return Err(io::ErrorKind::BrokenPipe.into());
@@ -1573,6 +1493,19 @@ impl RunningCommand {
 		self.response.recv().map_err(|_| cancelled_command())?
 	}
 
+	/// Removes a finished command without waiting, if one is ready.
+	pub fn try_wait_any(running: &mut Vec<Self>) -> Option<io::Result<CommandStatus>> {
+		let (index, response) = running.iter().enumerate().find_map(|(index, command)| {
+			match command.response.try_recv() {
+				Ok(status) => Some((index, status)),
+				Err(flume::TryRecvError::Disconnected) => Some((index, Err(cancelled_command()))),
+				Err(flume::TryRecvError::Empty) => None,
+			}
+		})?;
+		drop(running.swap_remove(index));
+		Some(response)
+	}
+
 	/// Waits for whichever of `running` finishes first and removes it from
 	/// the list; `None` when `running` is empty.
 	///
@@ -1595,27 +1528,66 @@ impl RunningCommand {
 	}
 }
 
-/// A command line for [`Host::run_command`]: `argv[0]` names the builtin or
-/// program. Stdin defaults to the null device, as GNU `xargs` and `find
-/// -exec` give their children.
-pub(crate) struct ShellCommand {
+/// A command line a utility asks its [`CommandRunner`] to run (`xargs`, `find
+/// -exec`, `env`, `ifne`): `argv[0]` names the builtin or program. Stdin
+/// defaults to the null device, as GNU `xargs` and `find -exec` give their
+/// children; stdout and stderr are the utility's own.
+pub struct ShellCommand {
 	argv:  Vec<OsString>,
 	argv0: Option<OsString>,
 	cwd:   Option<PathBuf>,
-	stdin: Option<OpenFile>,
+	stdin: Option<Fd>,
 	env:   Vec<EnvChange>,
 }
 
-/// One environment change a [`ShellCommand`] makes for its own command.
-enum EnvChange {
+/// One environment change a [`ShellCommand`] makes for its own command,
+/// applied in order on top of the invoking shell's environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnvChange {
+	/// Drop every exported variable (`env -i`).
 	Clear,
+	/// Remove the named variable, exported or not (`env -u`).
 	Remove(String),
+	/// Set and export the variable (`env NAME=VALUE`).
 	Set(String, String),
 }
 
 impl ShellCommand {
+	/// A command running `argv`; `argv[0]` names the builtin or program.
+	#[must_use]
 	pub fn new(argv: Vec<OsString>) -> Self {
 		Self { argv, argv0: None, cwd: None, stdin: None, env: Vec::new() }
+	}
+
+	/// The command line; `argv[0]` names the builtin or program to look up.
+	#[must_use]
+	pub fn args(&self) -> &[OsString] {
+		&self.argv
+	}
+
+	/// The `argv[0]` presented to the command instead of the looked-up name
+	/// (`env -a`); `None` presents `argv[0]` itself.
+	#[must_use]
+	pub fn presented_argv0(&self) -> Option<&std::ffi::OsStr> {
+		self.argv0.as_deref()
+	}
+
+	/// The absolute directory the command runs in; `None` runs it in the
+	/// invocation's working directory.
+	#[must_use]
+	pub fn dir(&self) -> Option<&Path> {
+		self.cwd.as_deref()
+	}
+
+	/// The environment changes for this command, in the order they apply.
+	#[must_use]
+	pub fn env_changes(&self) -> &[EnvChange] {
+		&self.env
+	}
+
+	/// Takes the command's stdin; `None` means the null device.
+	pub fn take_stdin(&mut self) -> Option<Fd> {
+		self.stdin.take()
 	}
 
 	/// Presents `argv0` to the command as its `argv[0]` (`env -a`); the
@@ -1664,7 +1636,7 @@ impl ShellCommand {
 	}
 
 	/// Feeds `stdin` to the command as fd 0.
-	pub fn stdin(mut self, stdin: OpenFile) -> Self {
+	pub fn stdin(mut self, stdin: Fd) -> Self {
 		self.stdin = Some(stdin);
 		self
 	}
@@ -1672,7 +1644,7 @@ impl ShellCommand {
 
 /// How a command run through [`Host::run_command`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CommandStatus {
+pub enum CommandStatus {
 	/// A builtin returned, or a process exited, with this status.
 	Exited(u8),
 	/// A process was killed by this signal.
@@ -1680,11 +1652,14 @@ pub(crate) enum CommandStatus {
 }
 
 impl CommandStatus {
+	/// Whether the command exited with status 0.
+	#[must_use]
 	pub const fn success(self) -> bool {
 		matches!(self, Self::Exited(0))
 	}
 
 	/// The status a shell reports in `$?`: the exit status, or `128 + signal`.
+	#[must_use]
 	pub const fn code(self) -> i32 {
 		match self {
 			Self::Exited(code) => code as i32,
@@ -1719,205 +1694,31 @@ fn cancelled_command() -> io::Error {
 	io::Error::new(io::ErrorKind::Interrupted, "command cancelled")
 }
 
-/// Serves [`Host::spawn_command`] on the async side, where a shell can run.
+/// Runs the command lines of the utilities that set
+/// [`Utility::RUNS_COMMANDS`] (`env`, `ifne`, `xargs`, `find -exec`): the
+/// embedding shell's half of [`Host::spawn_command`].
 ///
-/// Every command runs in a worker subshell copied from one forked off the
-/// invoking shell when the utility started, so commands see its builtins,
-/// exported variables, and filesystem, while side effects on shell state
-/// (`cd`, assignments) stay inside the subshell the way they would inside a
-/// child process. Finished workers are reused; another is forked only when
-/// every existing one is busy, so sequential commands share one.
-struct CommandRunner<SE: ShellExtensions> {
-	template: Shell<SE>,
-	idle:     Vec<Shell<SE>>,
-	params:   Arc<ExecutionParameters>,
-	cwd:      Arc<Path>,
-	requests: flume::Receiver<CommandRequest>,
-}
-
-impl<SE: ShellExtensions> CommandRunner<SE> {
-	fn new(context: &ExecutionContext<'_, SE>, requests: flume::Receiver<CommandRequest>) -> Self {
-		let mut template = context.shell.clone();
-		template.options_mut().interactive = false;
-		let cwd = Arc::from(template.working_dir());
-		Self {
-			template,
-			idle: Vec::new(),
-			params: Arc::new(context.params.clone()),
-			cwd,
-			requests,
-		}
-	}
-
-	/// Starts serving `request` on a worker. The future answers the request —
-	/// a utility that stopped waiting (it was cancelled) simply never reads
-	/// the answer — and yields the worker back for [`CommandRunner::release`].
-	fn start(&mut self, request: CommandRequest) -> impl Future<Output = Shell<SE>> + Send + use<SE> {
-		let mut shell = self.idle.pop().unwrap_or_else(|| self.template.clone());
-		let params = Arc::clone(&self.params);
-		let cwd = Arc::clone(&self.cwd);
-		async move {
-			let status = run_in(&mut shell, &params, &cwd, request.command).await.map_err(|error| {
-				let kind = match ExecutionExitCode::from(&error) {
-					ExecutionExitCode::NotFound => io::ErrorKind::NotFound,
-					ExecutionExitCode::CannotExecute => io::ErrorKind::PermissionDenied,
-					_ => io::ErrorKind::Other,
-				};
-				io::Error::new(kind, error.to_string())
-			});
-			let _ = request.reply.send(status);
-			shell
-		}
-	}
-
-	/// Returns a worker whose command finished to the idle pool.
-	fn release(&mut self, shell: Shell<SE>) {
-		self.idle.push(shell);
-	}
-}
-
-/// Runs `command` in the worker `shell` with the utility's `base` parameters,
-/// from the command's own directory or else `cwd`.
-async fn run_in<SE: ShellExtensions>(
-	shell: &mut Shell<SE>,
-	base: &ExecutionParameters,
-	cwd: &Path,
-	command: ShellCommand,
-) -> Result<CommandStatus, Error> {
-	let dir = command.cwd.as_deref().unwrap_or(cwd);
-	if shell.working_dir() != dir {
-		shell.set_working_dir(dir).await?;
-	}
-	if command.env.is_empty() {
-		return dispatch(shell, base, command, None).await;
-	}
-	// The worker is reused for later commands: run on a scratch environment
-	// and put the worker's own back whatever the outcome.
-	let saved = shell.env().clone();
-	*shell.env_mut() = changed_env(&saved, &command.env)?;
-	let path_dirs = search_path(shell);
-	let status = dispatch(shell, base, command, Some(path_dirs)).await;
-	*shell.env_mut() = saved;
-	status
-}
-
-/// `env` with `changes` applied, flattened into one global scope: a change
-/// must win over every scope, and the command runs no shell functions whose
-/// locals could need the stack.
-fn changed_env(
-	env: &brush_core::env::ShellEnvironment,
-	changes: &[EnvChange],
-) -> Result<brush_core::env::ShellEnvironment, Error> {
-	let mut vars: HashMap<String, brush_core::ShellVariable> =
-		env.iter().map(|(name, var)| (name.clone(), var.clone())).collect();
-	for change in changes {
-		match change {
-			EnvChange::Clear => vars.retain(|_, var| !var.is_exported()),
-			EnvChange::Remove(name) => {
-				vars.remove(name);
-			},
-			EnvChange::Set(name, value) => {
-				let mut var = brush_core::ShellVariable::new(brush_core::ShellValue::String(value.clone()));
-				var.export();
-				vars.insert(name.clone(), var);
-			},
-		}
-	}
-	let mut changed = brush_core::env::ShellEnvironment::new();
-	for (name, var) in vars {
-		changed.set_global(name, var)?;
-	}
-	Ok(changed)
-}
-
-/// The directories `execvp` would search for a command run with `shell`'s
-/// environment: its `PATH`, else the C library's default. Relative and empty
-/// entries name directories under the working directory.
-fn search_path<SE: ShellExtensions>(shell: &Shell<SE>) -> Vec<PathBuf> {
-	const DEFAULT_PATH: &str = if cfg!(any(target_os = "linux", target_os = "android")) {
-		"/bin:/usr/bin"
-	} else {
-		"/usr/bin:/bin"
-	};
-	let path = shell.env().get_str("PATH", shell);
-	let path = path.as_deref().unwrap_or(DEFAULT_PATH);
-	brush_core::sys::fs::split_paths(path)
-		.map(|dir| shell.working_dir().join(dir))
-		.collect()
-}
-
-/// Dispatches `command` in the worker `shell` as a simple command, searching
-/// `path_dirs` for programs when given.
-async fn dispatch<SE: ShellExtensions>(
-	shell: &mut Shell<SE>,
-	base: &ExecutionParameters,
-	command: ShellCommand,
-	path_dirs: Option<Vec<PathBuf>>,
-) -> Result<CommandStatus, Error> {
-	let mut params = base.clone();
-	params.set_fd(OpenFiles::STDIN_FD, or_null(command.stdin)?);
-	let cancel = params.cancel_token();
-	let mut args: Vec<CommandArg> = command
-		.argv
-		.into_iter()
-		.map(|arg| CommandArg::from(arg.to_string_lossy().into_owned()))
-		.collect();
-	let name = args.first().map_or_default(ToString::to_string);
-	let argv0 = command.argv0.map(|argv0| argv0.to_string_lossy().into_owned());
-	if let (Some(argv0), Some(first)) = (&argv0, args.first_mut()) {
-		*first = CommandArg::from(argv0.clone());
-	}
-	let mut simple =
-		SimpleCommand::new(ShellForCommand::ParentShell(shell), params, name, args);
-	simple.use_functions = false;
-	simple.argv0 = argv0;
-	simple.path_dirs = path_dirs;
-	let spawned = match simple.execute().await {
-		Ok(spawned) => spawned,
-		// Nothing ran; the utility reports that in its own words.
-		Err(error)
-			if matches!(
-				ExecutionExitCode::from(&error),
-				ExecutionExitCode::NotFound | ExecutionExitCode::CannotExecute
-			) =>
-		{
-			return Err(error);
-		},
-		// A builtin ran and failed: report it as the shell does after any
-		// command, and hand back the status it would put in `$?`.
-		Err(error) => {
-			let mut stderr = base.stderr(shell);
-			let _ = shell.display_error(&mut stderr, &error).await;
-			return Ok(CommandStatus::Exited(ExecutionExitCode::from(&error).into()));
-		},
-	};
-	wait_status(spawned, cancel).await
-}
-
-/// Waits for a spawned command, keeping the signal that killed a process
-/// (the shell's own result folds it into `128 + signal`). A builtin or worker
-/// shell SIGPIPE killed ([`ExecutionExitCode::BrokenPipe`]) stands in for a
-/// process that signal killed, and is reported so.
-async fn wait_status(
-	spawned: ExecutionSpawnResult,
-	cancel: Option<CancellationToken>,
-) -> Result<CommandStatus, Error> {
-	let mut child = match spawned {
-		ExecutionSpawnResult::StartedProcess(child) => child,
-		spawned => {
-			let result = ExecutionResult::from(spawned.wait_with_cancel(cancel).await?);
-			#[cfg(unix)]
-			if result.exit_code.is_broken_pipe() {
-				return Ok(CommandStatus::Signaled(libc::SIGPIPE));
-			}
-			return Ok(CommandStatus::Exited(result.exit_code.into()));
-		},
-	};
-	Ok(match child.wait(cancel).await? {
-		ProcessWaitResult::Completed(output) => output.status.into(),
-		ProcessWaitResult::Stopped => CommandStatus::Exited(ExecutionResult::stopped().exit_code.into()),
-		ProcessWaitResult::Cancelled => CommandStatus::Exited(ExecutionExitCode::Interrupted.into()),
-	})
+/// [`run`](crate::extras::run) calls [`CommandRunner::start`] from the task
+/// driving the utility, once per request, and polls every returned future
+/// concurrently (`xargs -P`) until it resolves, even after the invocation is
+/// cancelled: a command already started is always awaited, so none keeps
+/// writing to the utility's descriptors. The runner itself is dropped when the
+/// invocation is cancelled or ends.
+///
+/// A command runs with the utility's stdout and stderr, its own
+/// [`ShellCommand::take_stdin`] (else the null device), in
+/// [`ShellCommand::dir`] (else the invocation's working directory), with
+/// [`ShellCommand::env_changes`] applied to that command only. Side effects on
+/// shell state (`cd`, assignments) must not reach the invoking shell.
+pub trait CommandRunner: Send {
+	/// Starts `command`, resolving with how it ended.
+	///
+	/// # Errors
+	///
+	/// The future fails with [`io::ErrorKind::NotFound`] when nothing is named
+	/// `argv[0]`, [`io::ErrorKind::PermissionDenied`] when it cannot be
+	/// executed, and any other kind for other failures to run it.
+	fn start(&mut self, command: ShellCommand) -> BoxFuture<'static, io::Result<CommandStatus>>;
 }
 
 /// Buffered writer for a utility's output streams, with a flush policy
@@ -1944,11 +1745,7 @@ pub(crate) enum StreamWriter {
 	/// A serialized handle onto a writer shared by stdout and stderr, used
 	/// when fd 1 and fd 2 have the same destination (`2>&1`, or the default
 	/// capture pipe): one buffer means diagnostics and output interleave in
-	/// exactly the order they were written. Each handle writes one stream of
-	/// the command's [`Sigpipe`]: standard-output bytes count toward the
-	/// utility's output buffer, while a standard-error write is unbuffered,
-	/// as a process's is, so one that finds no reader kills the utility at
-	/// once (see [`write_shared`]).
+	/// exactly the order they were written.
 	Shared(Arc<Mutex<StreamWriter>>, GuardedStream, Arc<Sigpipe>),
 	/// Memory-backed output of an async utility: writes append to a buffer
 	/// the host delivers asynchronously (see [`Host::flush_output`]).
@@ -1957,7 +1754,7 @@ pub(crate) enum StreamWriter {
 
 impl StreamWriter {
 	const BLOCK_CAPACITY: usize = 64 * 1024;
-	const LINE_CAPACITY: usize = 16 * 1024;
+	const LINE_CAPACITY: usize = PIPE_BUFFER;
 
 	/// Picks the policy for a destination: block for a regular file, line
 	/// otherwise. `regular_file` comes from the stream's [`Destination`],
@@ -1974,6 +1771,12 @@ impl StreamWriter {
 	/// Forces block buffering regardless of destination.
 	pub fn block(file: OpenFile) -> Self {
 		Self::Block(BufWriter::with_capacity(Self::BLOCK_CAPACITY, file))
+	}
+
+	/// Unbuffered programs must not leave a small operand in our live-output
+	/// buffer either: cat's next operand must not run after that write fails.
+	fn program(file: OpenFile, regular_file: bool, stdout_buffer: usize) -> Self {
+		if stdout_buffer == 0 { Self::Block(BufWriter::with_capacity(0, file)) } else { Self::new(file, regular_file) }
 	}
 
 	/// Duplicates the underlying descriptor as a raw [`OpenFile`], for
@@ -2001,15 +1804,8 @@ impl StreamWriter {
 	}
 }
 
-/// Runs `write` on the shared writer for a handle writing `stream` (see
-/// [`StreamWriter::Shared`]).
-///
-/// A standard-output write counts toward the utility's output buffer (see
-/// [`Sigpipe::wrote_stdout`]). A standard-error write is delivered at once:
-/// once the destination's reader has gone it raises SIGPIPE, whatever
-/// standard output's buffer still holds, which kills the utility (see
-/// [`Sigpipe::kill`]), or, ignored, fails the write. The kill comes once the
-/// lock is released.
+/// The common destination still has two stdio streams: stdout buffered,
+/// stderr unbuffered. Release its lock before any signal unwind.
 fn write_shared<T>(
 	shared: &Mutex<StreamWriter>,
 	stream: GuardedStream,
@@ -2024,9 +1820,11 @@ fn write_shared<T>(
 			let written = counting.written;
 			drop(writer);
 			sigpipe.wrote_stdout(written);
-			result
+			if sigpipe.stdout_fails() { Err(io::ErrorKind::BrokenPipe.into()) } else { result }
 		},
 		GuardedStream::Stderr => {
+			{ let _ = shared.lock().flush(); }
+			sigpipe.flushed_stdout();
 			let result = {
 				let mut writer = shared.lock();
 				write(&mut *writer).and_then(|value| writer.flush().map(|()| value))
@@ -2034,7 +1832,6 @@ fn write_shared<T>(
 			if sigpipe.stdout_broken() {
 				sigpipe.exit_at_broken_stderr();
 				sigpipe.kill();
-				// SIGPIPE is ignored: the write fails, for the check at exit too.
 				sigpipe.failed_ignored.fetch_or(FAILED_STDERR, Ordering::Relaxed);
 				return Err(io::ErrorKind::BrokenPipe.into());
 			}
@@ -2043,10 +1840,8 @@ fn write_shared<T>(
 	}
 }
 
-/// A [`StreamWriter::Shared`] standard-output write, counting the bytes it
-/// hands the shared writer.
 struct Counting<'a> {
-	inner:   &'a mut StreamWriter,
+	inner: &'a mut StreamWriter,
 	written: usize,
 }
 
@@ -2097,9 +1892,7 @@ impl Write for StreamWriter {
 		match self {
 			Self::Block(w) => w.write_vectored(bufs),
 			Self::Line(w) => w.write_vectored(bufs),
-			Self::Shared(shared, stream, sigpipe) => {
-				write_shared(shared, *stream, sigpipe, |w| w.write_vectored(bufs))
-			},
+			Self::Shared(shared, stream, sigpipe) => write_shared(shared, *stream, sigpipe, |w| w.write_vectored(bufs)),
 			Self::Async(out) => out.write_vectored(bufs),
 		}
 	}
@@ -2197,29 +1990,20 @@ impl Destination {
 ///
 /// That last one matters more than it looks: the host process's fd 2 belongs to
 /// the TUI, so a child left with inherited stderr writes straight into the
-/// rendered frame. [`ChildEnv::command`] therefore gives the child a duplicate
-/// of the command's standard error when it is a descriptor, as Bash's child
-/// inherits the shell's fd 2 (a write of the child's that finds a pipe with
-/// no reader then fails the child itself), and pipes it otherwise, for
-/// [`ChildEnv::forward_stderr`] to drain to the command's own fd 2.
+/// rendered frame. A native stderr is inherited directly; a provider stderr
+/// is piped and forwarded, with EPIPE signalled to the child, not its parent.
 #[derive(Clone)]
 pub(crate) struct ChildEnv {
 	cwd:    PathBuf,
 	filesystem: BlockingFs,
 	env:    Arc<Vec<(String, String)>>,
 	stderr: OpenFile,
-	/// The utility's SIGPIPE: the disposition its children start with (see
-	/// [`ChildEnv::command`]) and what a write to a child's pipe raises (see
-	/// [`ChildEnv::pipe_writer`]).
 	sigpipe: Arc<Sigpipe>,
 }
 
-/// A writer onto the pipe to a child's standard input, written by the utility
-/// itself (`sort`'s compressor): a write that finds the child gone raises
-/// SIGPIPE in the utility, as the program's own write does (see
-/// [`file_write_errors`]).
+/// The utility's own write into a helper's pipe raises SIGPIPE in the utility.
 pub struct ChildPipe<W> {
-	inner:        W,
+	inner: W,
 	write_errors: pi_vfs::WriteErrors,
 }
 
@@ -2242,15 +2026,8 @@ fn native_working_dir<'a>(filesystem: &BlockingFs, cwd: &'a Path) -> io::Result<
 }
 
 impl ChildEnv {
-	/// Builds a `Command` for `program` with the shell's working directory and
-	/// environment, and with the command's standard error (see
-	/// [`ChildEnv`]).
-	///
-	/// The child starts with the utility's SIGPIPE disposition, as a forked
-	/// child inherits its parent's: ignored under `trap '' PIPE`, and once
-	/// the utility ignores it itself (rsync's remote shell), else the default
-	/// action. (Rust's `Command` resets it to the default otherwise.)
-	///
+	/// Builds a command with the shell's environment and stderr. A child
+	/// inherits an ignored SIGPIPE; caught handlers reset to the default.
 	/// Stdin and stdout are left untouched for the caller to wire; they default
 	/// to inherited, so a caller that leaves them alone MUST redirect them.
 	pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> io::Result<std::process::Command> {
@@ -2264,8 +2041,7 @@ impl ChildEnv {
 		#[cfg(unix)]
 		if self.sigpipe.ignored.load(Ordering::Relaxed) {
 			use std::os::unix::process::CommandExt;
-			// SAFETY: the hook runs in the forked child before `exec` and only
-			// calls `signal`, which is async-signal-safe.
+			// SAFETY: the forked child's hook calls only async-signal-safe signal.
 			unsafe {
 				command.pre_exec(|| {
 					libc::signal(libc::SIGPIPE, libc::SIG_IGN);
@@ -2276,8 +2052,6 @@ impl ChildEnv {
 		Ok(command)
 	}
 
-	/// The child's standard error: a duplicate of the command's when it is a
-	/// descriptor, else a pipe for [`ChildEnv::forward_stderr`].
 	fn child_stderr(&self) -> std::process::Stdio {
 		#[cfg(unix)]
 		if let Ok(fd) = self.stderr.try_borrow_as_fd()
@@ -2288,27 +2062,12 @@ impl ChildEnv {
 		std::process::Stdio::piped()
 	}
 
-	/// Wraps the utility's end of a pipe to a child's standard input (see
-	/// [`ChildPipe`]).
 	pub fn pipe_writer<W: Write>(&self, inner: W) -> ChildPipe<W> {
 		ChildPipe { inner, write_errors: file_write_errors(&self.sigpipe) }
 	}
 
-	/// Drains `child`'s piped stderr (see [`ChildEnv::child_stderr`]) into the
-	/// command's standard error on a helper thread; `None` when the child
-	/// writes the command's standard error itself.
-	///
-	/// A delivery that finds a pipe with no reader is where the child's own
-	/// write would have raised SIGPIPE: the child is sent SIGPIPE then, and
-	/// the pipe is closed so its later writes raise it too. A provider-backed
-	/// standard error gives the child no descriptor to write, so the write
-	/// the delivery fails for has already returned in the child, which may
-	/// have gone on before the signal reaches it.
-	///
-	/// The returned handle should be joined once the child has exited, so the
-	/// diagnostic lands before the utility reports its own result. Dropping the
-	/// handle detaches the thread, which is only correct if nothing downstream
-	/// depends on the ordering.
+	/// Forward provider stderr, signalling the pinned child on EPIPE. Its
+	/// original write may already have returned before delivery fails.
 	pub fn forward_stderr(&self, child: &mut std::process::Child) -> Option<std::thread::JoinHandle<()>> {
 		let mut child_stderr = child.stderr.take()?;
 		let signal = ChildSignal::new(child);
@@ -2326,7 +2085,7 @@ impl ChildEnv {
 					Ok(()) => {},
 					Err(error) => {
 						if error.kind() == io::ErrorKind::BrokenPipe {
-							signal.sigpipe();
+						 signal.sigpipe();
 						}
 						return;
 					},
@@ -2336,13 +2095,12 @@ impl ChildEnv {
 	}
 }
 
-/// A handle to signal a child the utility started, valid until it is reaped
-/// (a pidfd on Linux, so a reaped child's reused pid is never signalled).
+/// Linux pidfds prevent a delayed forwarder from signalling a reused pid.
 struct ChildSignal {
 	#[cfg(target_os = "linux")]
 	pidfd: Option<std::os::fd::OwnedFd>,
 	#[cfg(all(unix, not(target_os = "linux")))]
-	pid:   libc::pid_t,
+	pid: libc::pid_t,
 }
 
 impl ChildSignal {
@@ -2350,10 +2108,9 @@ impl ChildSignal {
 		#[cfg(target_os = "linux")]
 		{
 			use std::os::fd::FromRawFd;
-			// SAFETY: `pidfd_open` takes a pid and flags and returns a new
-			// descriptor or -1; the child is unreaped, so the pid is its own.
+			// SAFETY: the child is unreaped; pidfd_open returns a new fd or -1.
 			let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
-			// SAFETY: a non-negative result is a descriptor this call opened.
+			// SAFETY: a nonnegative result is an owned descriptor.
 			let pidfd = (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) });
 			Self { pidfd }
 		}
@@ -2368,25 +2125,18 @@ impl ChildSignal {
 		}
 	}
 
-	/// Sends the child SIGPIPE.
 	fn sigpipe(&self) {
 		#[cfg(target_os = "linux")]
 		if let Some(pidfd) = &self.pidfd {
 			use std::os::fd::AsRawFd;
-			// SAFETY: `pidfd_send_signal` on a descriptor we own, with no
-			// siginfo and no flags.
+			// SAFETY: owned pidfd, a valid signal, and no siginfo or flags.
 			unsafe {
-				libc::syscall(
-					libc::SYS_pidfd_send_signal,
-					pidfd.as_raw_fd(),
-					libc::SIGPIPE,
-					std::ptr::null::<libc::siginfo_t>(),
-					0,
-				);
+				libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGPIPE,
+					std::ptr::null::<libc::siginfo_t>(), 0);
 			}
 		}
 		#[cfg(all(unix, not(target_os = "linux")))]
-		// SAFETY: `kill` with a pid and a signal number.
+		// SAFETY: kill accepts this process id and signal.
 		unsafe {
 			libc::kill(self.pid, libc::SIGPIPE);
 		}
@@ -2516,9 +2266,6 @@ thread_local! {
 	/// panicking code may hold other borrows, and a `RefCell` borrow there
 	/// would panic again and abort the process.
 	static PANIC_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
-
-	/// Depth of utility bodies on this thread whose `catch_unwind` boundary is
-	/// on the stack, so that [`Sigpipe::kill`] can unwind to it.
 	static SIGPIPE_UNWIND_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -2637,91 +2384,23 @@ pub(crate) fn os_bytes_lossy(value: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u
 	}
 }
 
-/// Parses a GNU-style duration: a decimal number with an optional `s`/`m`/`h`/`d`
-/// suffix, as accepted by `sleep` and `timeout`.
-///
-/// GNU also accepts `inf`/`infinity` (optionally signed `+`, any case);
-/// infinite and overflowing values saturate to [`Duration::MAX`]. Callers
-/// treat such durations as "sleep until cancelled". Sub-millisecond precision
-/// is preserved: GNU `sleep 0.0001` really sleeps 100 microseconds.
-pub(crate) fn parse_duration(input: &str) -> Option<Duration> {
-	let trimmed = input.trim();
-	if trimmed.is_empty() {
-		return None;
-	}
-	let unsigned = trimmed.strip_prefix('+').unwrap_or(trimmed);
-	if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
-		return Some(Duration::MAX);
-	}
-	let (number, multiplier) = match trimmed.chars().last()? {
-		's' => (&trimmed[..trimmed.len() - 1], 1.0),
-		'm' => (&trimmed[..trimmed.len() - 1], 60.0),
-		'h' => (&trimmed[..trimmed.len() - 1], 3600.0),
-		'd' => (&trimmed[..trimmed.len() - 1], 86400.0),
-		ch if ch.is_ascii_alphabetic() => return None,
-		_ => (trimmed, 1.0),
-	};
-	let value = number.parse::<f64>().ok()?;
-	if value.is_nan() || value.is_sign_negative() {
-		return None;
-	}
-	if value.is_infinite() {
-		return Some(Duration::MAX);
-	}
-	// Only overflow remains once NaN and negatives are excluded; saturate.
-	Duration::try_from_secs_f64(value * multiplier).map_or(Some(Duration::MAX), Some)
-}
-
-
-/// Shell-quotes `arg` when rebuilding a command line for a child process.
-///
-/// `timeout` and `nohup` reconstruct the command they were handed so it can be
-/// re-parsed by a shell; anything that could be re-split or re-expanded must be
-/// quoted first.
-pub(crate) fn quote_arg(arg: &str) -> String {
-	if arg.is_empty() {
-		return "''".to_string();
-	}
-	let safe = arg
-		.chars()
-		.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '+'));
-	if safe {
-		return arg.to_string();
-	}
-	let escaped = arg.replace('\'', "'\"'\"'");
-	format!("'{escaped}'")
-}
-
-/// Reads a boolean "disable" flag for the uutils builtins from the session
-/// environment (preferred) then the process environment, mirroring the nohup
-/// builtin gate. Truthy = present and not "", "0", or "false".
-
-/// Returns the [`Registration`] for a [`Utility`].
-pub(crate) fn util<U: Utility, SE: ShellExtensions>() -> Registration<SE> {
-	builtins::builtin::<Util<U>, SE>()
-}
-
-/// Returns the [`Registration`] for an [`AsyncUtility`].
-pub(crate) fn async_util<U: AsyncUtility, SE: ShellExtensions>() -> Registration<SE> {
-	builtins::builtin::<AsyncUtil<U>, SE>().async_io()
-}
-
 /// What the shared adapter needs to know about a utility, whichever trait it
 /// implements.
 #[derive(Clone, Copy)]
 struct Spec {
 	name:               &'static str,
 	usage_error:        u8,
+	output_error: u8,
 	runs_commands:      bool,
 	checks_stdout_path: bool,
 	owns_cancellation:  bool,
 	/// Whether the body is async, so its output is memory-backed (see
 	/// [`AsyncOut`]).
 	async_io:           bool,
-	stdout_buffer:      usize,
-	ignores_sigpipe:    bool,
-	stderr_exit:        Option<i32>,
-	usage_stderr_exit:  Option<i32>,
+	stdout_buffer: usize,
+	ignores_sigpipe: bool,
+	stderr_exit: Option<i32>,
+	usage_stderr_exit: Option<i32>,
 	rewrite_argv:       fn(Vec<OsString>) -> Result<Vec<OsString>, String>,
 }
 
@@ -2730,14 +2409,15 @@ impl Spec {
 		Self {
 			name:               U::NAME,
 			usage_error:        U::USAGE_ERROR,
+			output_error: U::OUTPUT_ERROR,
 			runs_commands:      U::RUNS_COMMANDS,
 			checks_stdout_path: U::CHECKS_STDOUT_PATH,
 			owns_cancellation:  U::OWNS_CANCELLATION,
 			async_io:           false,
-			stdout_buffer:      U::STDOUT_BUFFER,
-			ignores_sigpipe:    U::IGNORES_SIGPIPE,
-			stderr_exit:        U::STDERR_EXIT,
-			usage_stderr_exit:  U::USAGE_STDERR_EXIT,
+			stdout_buffer: U::STDOUT_BUFFER,
+			ignores_sigpipe: U::IGNORES_SIGPIPE,
+			stderr_exit: U::STDERR_EXIT,
+			usage_stderr_exit: U::USAGE_STDERR_EXIT,
 			rewrite_argv:       U::rewrite_argv,
 		}
 	}
@@ -2746,129 +2426,149 @@ impl Spec {
 		Self {
 			name:               U::NAME,
 			usage_error:        U::USAGE_ERROR,
+			output_error: U::OUTPUT_ERROR,
 			runs_commands:      U::RUNS_COMMANDS,
 			checks_stdout_path: U::CHECKS_STDOUT_PATH,
 			owns_cancellation:  false,
 			async_io:           true,
-			stdout_buffer:      U::STDOUT_BUFFER,
-			ignores_sigpipe:    U::IGNORES_SIGPIPE,
-			stderr_exit:        U::STDERR_EXIT,
-			usage_stderr_exit:  U::USAGE_STDERR_EXIT,
+			stdout_buffer: U::STDOUT_BUFFER,
+			ignores_sigpipe: U::IGNORES_SIGPIPE,
+			stderr_exit: U::STDERR_EXIT,
+			usage_stderr_exit: U::USAGE_STDERR_EXIT,
 			rewrite_argv:       U::rewrite_argv,
 		}
 	}
 }
 
-/// Adapter turning an [`AsyncUtility`] into a brush builtin; see [`Util`].
-pub(crate) struct AsyncUtil<U: AsyncUtility> {
-	argv:    Vec<String>,
-	_marker: PhantomData<fn() -> U>,
+/// One run of a pi extra (a utility such as `cat`, or a process builtin such
+/// as `sleep`), carrying everything it sees of the shell it runs in: any host
+/// that can fill these fields runs the extras through
+/// [`run`](crate::extras::run).
+pub struct Invocation {
+	/// The name the extra was invoked as: selects the extra and names it in
+	/// diagnostics (`sg` runs `ast-grep` and still says `sg`).
+	pub name:           String,
+	/// The arguments, `argv[0]` included.
+	pub argv:           Vec<String>,
+	/// The exported environment.
+	pub env:            HashMap<String, String>,
+	/// The shell's working directory, which relative paths resolve against.
+	pub cwd:            PathBuf,
+	/// Descriptors 0, 1, and 2; [`Fd::Closed`] reads as end of input and
+	/// discards writes.
+	pub stdio:          [Fd; 3],
+	/// Further open descriptors (`exec 3<…`, process substitution) by number,
+	/// reachable through `/dev/fd/N` paths.
+	pub fds:            Vec<(i32, Fd)>,
+	/// The filesystem every path goes through.
+	pub fs:             pi_vfs::Fs,
+	/// Fires when the invocation is cancelled (abort, `timeout`): the extra
+	/// stops and reports status 130. `None` is never cancelled.
+	pub cancel:         Option<CancellationToken>,
+	/// Runs the command lines of `env`, `ifne`, `xargs`, and `find -exec`
+	/// (see [`ExtraKind::Utility`](crate::extras::ExtraKind::Utility)); without
+	/// one those utilities report that they cannot run commands.
+	pub commands:       Option<Box<dyn CommandRunner>>,
+	/// Raised when the extra reports an error yet goes on (so a caller
+	/// minimizing output knows to keep it); `None` when nobody asks.
+	pub reported_error: Option<Arc<AtomicBool>>,
+	/// An ignored SIGPIPE is inherited by programs; caught handlers are not.
+	pub sigpipe_ignored: bool,
+	/// Raised only for signal death, never for an ordinary exit status 141.
+	pub killed_by_sigpipe: Option<Arc<AtomicBool>>,
 }
 
-impl<U: AsyncUtility> clap::FromArgMatches for AsyncUtil<U> {
-	fn from_arg_matches(_matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-		Ok(Self { argv: Vec::new(), _marker: PhantomData })
+impl Invocation {
+	/// An invocation of `argv` (named by `argv[0]`) in `cwd` on `fs`, with no
+	/// environment, closed stdio, no cancellation, and no command runner.
+	#[must_use]
+	pub fn new(argv: Vec<String>, cwd: PathBuf, fs: pi_vfs::Fs) -> Self {
+		Self {
+			name: argv.first().cloned().unwrap_or_default(),
+			argv,
+			env: HashMap::new(),
+			cwd,
+			stdio: [Fd::Closed, Fd::Closed, Fd::Closed],
+			fds: Vec::new(),
+			fs,
+			cancel: None,
+			commands: None,
+			reported_error: None,
+			sigpipe_ignored: false,
+			killed_by_sigpipe: None,
+		}
 	}
 
-	fn update_from_arg_matches(&mut self, _matches: &clap::ArgMatches) -> Result<(), clap::Error> {
-		Ok(())
-	}
-}
-
-impl<U: AsyncUtility> clap::CommandFactory for AsyncUtil<U> {
-	fn command() -> clap::Command {
-		U::command()
-	}
-
-	fn command_for_update() -> clap::Command {
-		U::command_for_update()
-	}
-}
-
-impl<U: AsyncUtility> clap::Parser for AsyncUtil<U> {}
-
-impl<U: AsyncUtility> builtins::Command for AsyncUtil<U> {
-	type Error = Error;
-
-	fn new<I>(args: I) -> Result<Self, clap::Error>
-	where
-		I: IntoIterator<Item = String>,
-	{
-		Ok(Self { argv: args.into_iter().collect(), _marker: PhantomData })
-	}
-
-	async fn execute<SE: ShellExtensions>(
-		&self,
-		context: ExecutionContext<'_, SE>,
-	) -> Result<ExecutionResult, Self::Error> {
-		run_async_utility::<U, SE>(context, self.argv.clone()).await
-	}
-}
-
-/// Adapter turning a [`Utility`] into a brush builtin.
-///
-/// Holds the raw argument vector rather than a parsed `U`: parse failures must
-/// be reported on the utility's own terms (help on stdout, usage errors with
-/// the utility's exit status) rather than through brush's generic usage-error
-/// path.
-pub(crate) struct Util<U: Utility> {
-	argv:    Vec<String>,
-	_marker: PhantomData<fn() -> U>,
-}
-
-impl<U: Utility> clap::FromArgMatches for Util<U> {
-	fn from_arg_matches(_matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-		Ok(Self { argv: Vec::new(), _marker: PhantomData })
-	}
-
-	fn update_from_arg_matches(&mut self, _matches: &clap::ArgMatches) -> Result<(), clap::Error> {
-		Ok(())
+	/// Opens the descriptors as shareable [`OpenFile`]s; `default_name` stands
+	/// in for an empty [`Invocation::name`].
+	pub(crate) fn open(self, default_name: &str) -> Opened {
+		let Self { name, argv, env, cwd, stdio, fds, fs, cancel, commands, reported_error, sigpipe_ignored, killed_by_sigpipe } = self;
+		Opened {
+			name: if name.is_empty() { default_name.to_string() } else { name },
+			argv,
+			env,
+			cwd,
+			stdio: stdio.map(OpenFile::from_fd),
+			fds: fds
+				.into_iter()
+				.filter_map(|(number, fd)| Some((number, OpenFile::from_fd(fd)?)))
+				.collect(),
+			fs,
+			cancel,
+			commands,
+			reported_error,
+			sigpipe_ignored,
+			killed_by_sigpipe,
+		}
 	}
 }
 
-impl<U: Utility> clap::CommandFactory for Util<U> {
-	fn command() -> clap::Command {
-		U::command()
-	}
+/// An [`Invocation`] whose descriptors are open as [`OpenFile`]s; `None` is a
+/// closed one.
+pub(crate) struct Opened {
+	pub name:           String,
+	pub argv:           Vec<String>,
+	pub env:            HashMap<String, String>,
+	pub cwd:            PathBuf,
+	pub stdio:          [Option<OpenFile>; 3],
+	pub fds:            Vec<(i32, OpenFile)>,
+	pub fs:             pi_vfs::Fs,
+	pub cancel:         Option<CancellationToken>,
+	pub commands:       Option<Box<dyn CommandRunner>>,
+	pub reported_error: Option<Arc<AtomicBool>>,
+	pub sigpipe_ignored: bool,
+	pub killed_by_sigpipe: Option<Arc<AtomicBool>>,
+}
 
-	fn command_for_update() -> clap::Command {
-		U::command_for_update()
+impl Opened {
+	/// The path resolver for this invocation: its working directory,
+	/// filesystem (scoped to its cancellation), and every open descriptor.
+	fn paths(&self) -> ShellPaths {
+		let stdio = (0..).zip(&self.stdio).filter_map(|(fd, file)| Some((fd, file.as_ref()?.clone())));
+		let fds = self.fds.iter().map(|(fd, file)| (*fd, file.clone()));
+		ShellPaths::new(self.cwd.clone(), &self.fs, self.cancel.clone(), stdio.chain(fds))
 	}
 }
 
-impl<U: Utility> clap::Parser for Util<U> {}
-
-impl<U: Utility> builtins::Command for Util<U> {
-	type Error = Error;
-
-	fn new<I>(args: I) -> Result<Self, clap::Error>
-	where
-		I: IntoIterator<Item = String>,
-	{
-		Ok(Self { argv: args.into_iter().collect(), _marker: PhantomData })
-	}
-
-	async fn execute<SE: ShellExtensions>(
-		&self,
-		context: ExecutionContext<'_, SE>,
-	) -> Result<ExecutionResult, Self::Error> {
-		run_utility::<U, SE>(context, self.argv.clone()).await
+/// Writes `text` to the descriptor `file` when it is open, ignoring failures:
+/// the diagnostics of an invocation that ends before it has a [`Host`].
+fn write_to(file: Option<&OpenFile>, text: std::fmt::Arguments<'_>) {
+	if let Some(file) = file {
+		let _ = file.clone().write_fmt(text);
 	}
 }
 
 /// Drives a utility from raw arguments to an exit status.
-async fn run_utility<U: Utility, SE: ShellExtensions>(
-	context: ExecutionContext<'_, SE>,
-	argv: Vec<String>,
-) -> Result<ExecutionResult, Error> {
+///
+/// Must be awaited on a tokio runtime: the body runs on a blocking worker.
+pub(crate) async fn run_utility<U: Utility>(invocation: Invocation) -> i32 {
 	let spec = Spec::of_sync::<U>();
-	let Prepared { parsed, mut host, runner, cancel, cancel_flag, _cancel_on_drop } =
-		match prepare::<U, SE>(context, argv, spec) {
+	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
+		match prepare::<U>(invocation, spec).await {
 			Ok(prepared) => prepared,
-			Err(done) => return done,
+			Err(code) => return code,
 		};
 
-	let sigpipe = Arc::clone(&host.sigpipe);
 	let handle = tokio::task::spawn_blocking(move || {
 		let code = run_caught::<U>(parsed, &mut host);
 		let closes = host.fs().drain_closes();
@@ -2881,70 +2581,50 @@ async fn run_utility<U: Utility, SE: ShellExtensions>(
 	// (flushing what it already produced) and the blocking task completes.
 	// The blocking thread cannot be dropped, so it is always awaited: no
 	// detached thread keeps writing to the builtin's descriptors.
-	let code = drive(spec, cancel, cancel_flag, runner, async { handle.await.ok() }, false).await;
-	Ok(utility_result(code, &sigpipe))
+	drive(spec, cancel, cancel_flag, commands, async { handle.await.ok() }, false).await
 }
 
 /// Drives an [`AsyncUtility`] from raw arguments to an exit status, awaiting
-/// its body on the shell task.
-async fn run_async_utility<U: AsyncUtility, SE: ShellExtensions>(
-	context: ExecutionContext<'_, SE>,
-	argv: Vec<String>,
-) -> Result<ExecutionResult, Error> {
+/// its body on the calling task.
+pub(crate) async fn run_async_utility<U: AsyncUtility>(invocation: Invocation) -> i32 {
 	let spec = Spec::of_async::<U>();
-	let Prepared { parsed, mut host, runner, cancel, cancel_flag, _cancel_on_drop } =
-		match prepare::<U, SE>(context, argv, spec) {
+	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
+		match prepare::<U>(invocation, spec).await {
 			Ok(prepared) => prepared,
-			Err(done) => return done,
+			Err(code) => return code,
 		};
 
 	// On cancel the body is dropped, which cancels whatever it awaits.
-	let sigpipe = Arc::clone(&host.sigpipe);
 	let body = async { Some(run_caught_async::<U>(parsed, &mut host).await) };
-	let code = drive(spec, cancel, cancel_flag, runner, body, true).await;
-	Ok(utility_result(code, &sigpipe))
+	drive(spec, cancel, cancel_flag, commands, body, true).await
 }
 
-/// The result of a utility that ended with `code`: one SIGPIPE killed
-/// ([`ExecutionExitCode::BrokenPipe`], as for a process the signal killed),
-/// else an exit with that status, 141 included (a command's it passed on).
-fn utility_result(code: i32, sigpipe: &Sigpipe) -> ExecutionResult {
-	if code == SIGPIPE_EXIT_CODE && sigpipe.is_hit() {
-		return ExecutionExitCode::BrokenPipe.into();
-	}
-	ExecutionResult::new((code & 0xff) as u8)
-}
+/// The runner serving a utility's command requests, and the requests.
+type Commands = (Box<dyn CommandRunner>, flume::Receiver<CommandRequest>);
 
 /// A utility ready to run: parsed arguments, its host, and the adapter's
 /// cancellation and command-serving state.
-struct Prepared<P, SE: ShellExtensions> {
+struct Prepared<P> {
 	parsed:           P,
 	host:             Host,
-	runner:           Option<CommandRunner<SE>>,
+	commands:         Option<Commands>,
 	cancel:           Option<CancellationToken>,
 	cancel_flag:      Arc<AtomicBool>,
 	_cancel_on_drop:  CancelOnDrop,
 }
 
-/// Rewrites and parses `argv` and builds the host. `Err` carries the finished
-/// result when the invocation ends early (usage error, `--help`, host failure).
-///
-/// Everything owned is captured here, before the caller's first await, so its
-/// future stays `Send`: the borrowed `ExecutionContext` (and its `&mut Shell`)
-/// is dropped on return.
-fn prepare<P: clap::Parser, SE: ShellExtensions>(
-	mut context: ExecutionContext<'_, SE>,
-	argv: Vec<String>,
-	spec: Spec,
-) -> Result<Prepared<P, SE>, Result<ExecutionResult, Error>> {
-	let argv: Vec<OsString> = argv.into_iter().map(OsString::from).collect();
+/// Rewrites and parses `argv` and builds the host. `Err` carries the exit
+/// status when the invocation ends early (usage error, `--help`, host
+/// failure).
+async fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, i32> {
+	let mut invocation = invocation.open(spec.name);
+	let argv: Vec<OsString> = std::mem::take(&mut invocation.argv).into_iter().map(OsString::from).collect();
 
 	let argv = match (spec.rewrite_argv)(argv) {
 		Ok(argv) => argv,
 		Err(message) => {
-			let written = writeln!(context.stderr(), "{}: {message}", spec.name);
-			let usage = ExecutionResult::new(spec.usage_error);
-			return Err(ended_by_usage_message(&mut context, spec, written, usage, true));
+			return Err(usage_message_status(&mut invocation, spec, true,
+				format!("{}: {message}\n", spec.name), i32::from(spec.usage_error)).await);
 		},
 	};
 
@@ -2953,74 +2633,64 @@ fn prepare<P: clap::Parser, SE: ShellExtensions>(
 		Err(err) => {
 			// clap reports `--help` and `--version` as errors; those belong on
 			// stdout with a success status, everything else on stderr.
-			let rendered = err.to_string();
 			if err.use_stderr() {
-				let written = write!(context.stderr(), "{rendered}");
-				let usage = ExecutionResult::new(spec.usage_error);
-				return Err(ended_by_usage_message(&mut context, spec, written, usage, true));
+				return Err(usage_message_status(&mut invocation, spec, true,
+					err.to_string(), i32::from(spec.usage_error)).await);
 			}
-			let written = write!(context.stdout(), "{rendered}");
-			let success = ExecutionResult::success();
-			return Err(ended_by_usage_message(&mut context, spec, written, success, false));
+			return Err(usage_message_status(&mut invocation, spec, false, err.to_string(), 0).await);
 		},
 	};
 
-	let mut host = build_host(&context, spec).map_err(Err)?;
-	let cancel = context.cancel_token();
+	let runner = invocation.commands.take().filter(|_| spec.runs_commands);
+	let cancel = invocation.cancel.clone();
+	let mut host = build_host(invocation, spec)?;
 	let cancel_flag = host.cancel_flag();
 	let cancel_on_drop = CancelOnDrop(Arc::clone(&cancel_flag));
-	let runner = spec.runs_commands.then(|| {
+	let commands = runner.map(|runner| {
 		let (sender, requests) = flume::unbounded();
 		host.commands = Some(sender);
-		CommandRunner::new(&context, requests)
+		(runner, requests)
 	});
-	Ok(Prepared { parsed, host, runner, cancel, cancel_flag, _cancel_on_drop: cancel_on_drop })
+	Ok(Prepared { parsed, host, commands, cancel, cancel_flag, _cancel_on_drop: cancel_on_drop })
 }
 
-/// [`ended_by_message`] for a utility's help, version or usage message
-/// (`on_stderr` for a usage error): a program that ignores SIGPIPE from its
-/// start ([`Utility::IGNORES_SIGPIPE`]) takes a failed write as an ordinary
-/// error and keeps its status, or exits with
-/// [`Utility::USAGE_STDERR_EXIT`] when it cannot write a usage error.
-fn ended_by_usage_message<SE: ShellExtensions>(
-	context: &mut ExecutionContext<'_, SE>,
-	spec: Spec,
-	written: io::Result<()>,
-	status: ExecutionResult,
-	on_stderr: bool,
-) -> Result<ExecutionResult, Error> {
-	if !spec.ignores_sigpipe {
-		return ended_by_message(context, spec.name, spec.usage_error, written, status);
+/// An invocation can die while printing help or a parser diagnostic, before
+/// it has a Host. Program-specific SIGPIPE policies apply here too.
+async fn usage_message_status(invocation: &mut Opened, spec: Spec, on_stderr: bool,
+	text: String, status: i32) -> i32 {
+	let file = invocation.stdio[if on_stderr { 2 } else { 1 }].clone();
+	let written = write_message(file, text).await;
+	let Err(error) = written else { return status; };
+	if error.kind() == io::ErrorKind::BrokenPipe {
+		if spec.ignores_sigpipe {
+			return if on_stderr { spec.usage_stderr_exit.unwrap_or(status) } else { status };
+		}
+		if !invocation.sigpipe_ignored {
+			if let Some(killed) = &invocation.killed_by_sigpipe { killed.store(true, Ordering::Relaxed); }
+			return SIGPIPE_EXIT_CODE;
+		}
 	}
-	Ok(match (written, spec.usage_stderr_exit) {
-		(Err(error), Some(code)) if on_stderr && error.kind() == io::ErrorKind::BrokenPipe => {
-			ExecutionResult::new((code & 0xff) as u8)
-		},
-		_ => status,
-	})
+	let report = format!("{}: write error: {}\n", spec.name, strip_errno(&error));
+	if write_message(invocation.stdio[2].clone(), report).await
+		.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+		&& !invocation.sigpipe_ignored && !spec.ignores_sigpipe
+	{
+		if let Some(killed) = &invocation.killed_by_sigpipe { killed.store(true, Ordering::Relaxed); }
+		return SIGPIPE_EXIT_CODE;
+	}
+	if status == 0 { i32::from(spec.output_error) } else { status }
 }
 
-/// The result of an invocation of utility `name` that ends after writing a
-/// message (a usage error, `--help`): `status`, unless the write failed. A
-/// write to a pipe with no reader raises SIGPIPE, which ends the utility as
-/// it ends its program (see [`ExecutionContext::keep_broken_pipe`]); a
-/// failed write that leaves the utility alive (SIGPIPE ignored) is reported
-/// as a write error, and turns a success into the utility's `failure`
-/// status, as GNU utilities check their output when they exit.
-pub(crate) fn ended_by_message<SE: ShellExtensions>(
-	context: &mut ExecutionContext<'_, SE>,
-	name: &str,
-	failure: u8,
-	written: io::Result<()>,
-	status: ExecutionResult,
-) -> Result<ExecutionResult, Error> {
-	let Err(error) = written else {
-		return Ok(status);
-	};
-	let message = format!("{name}: write error: {}", strip_errno(&error));
-	context.keep_broken_pipe(Err(error))?;
-	let _ = writeln!(context.stderr(), "{message}");
-	Ok(if status.is_success() { ExecutionResult::new(failure) } else { status })
+/// Early messages have no utility body to unwind. Return the real delivery
+/// error to their caller, without blocking a runtime thread on a pipe/provider.
+async fn write_message(file: Option<OpenFile>, text: String) -> io::Result<()> {
+	let Some(file) = file else { return Ok(()); };
+	let sigpipe = Arc::new(Sigpipe::new(true, 0));
+	let cancel = CommandCancel { flag: Arc::new(AtomicBool::new(false)), token: None, silences: false };
+	let regular_file = Destination::of(&file).regular_file;
+	let mut out = async_out_for(file, GuardedStream::Stdout, regular_file, &sigpipe, &cancel);
+	out.write_all(text.as_bytes())?;
+	out.drain(true).await
 }
 
 /// Awaits `body` (`None` when its task failed) while serving the utility's
@@ -3031,11 +2701,11 @@ pub(crate) fn ended_by_message<SE: ShellExtensions>(
 /// (an async body is cancelled by being dropped). Commands already running
 /// are awaited either way, so none keeps writing to the builtin's (possibly
 /// redirected) descriptors.
-async fn drive<SE: ShellExtensions>(
+async fn drive(
 	spec: Spec,
 	cancel: Option<CancellationToken>,
 	cancel_flag: Arc<AtomicBool>,
-	mut runner: Option<CommandRunner<SE>>,
+	mut commands: Option<Commands>,
 	body: impl Future<Output = Option<i32>>,
 	abandon: bool,
 ) -> i32 {
@@ -3053,7 +2723,7 @@ async fn drive<SE: ShellExtensions>(
 			biased;
 			() = &mut cancelled => {
 				cancel_flag.store(true, Ordering::Relaxed);
-				drop(runner.take());
+				drop(commands.take());
 				if abandon && !spec.owns_cancellation {
 					drain(&mut running).await;
 					break final_status(false, true, None);
@@ -3061,11 +2731,7 @@ async fn drive<SE: ShellExtensions>(
 				let (result, ()) = tokio::join!(&mut body, drain(&mut running));
 				break final_status(spec.owns_cancellation, true, result);
 			},
-			Some(shell) = running.next(), if !running.is_empty() => {
-				if let Some(runner) = runner.as_mut() {
-					runner.release(shell);
-				}
-			},
+			Some(()) = running.next(), if !running.is_empty() => {},
 			result = &mut body => {
 				// Commands the utility started but never waited for.
 				drain(&mut running).await;
@@ -3074,9 +2740,15 @@ async fn drive<SE: ShellExtensions>(
 				let interrupted = cancel.as_ref().is_some_and(CancellationToken::is_cancelled);
 				break final_status(spec.owns_cancellation, interrupted, result);
 			},
-			Some(request) = next_request(runner.as_ref()) => {
-				if let Some(runner) = runner.as_mut() {
-					running.push(runner.start(request));
+			Some(request) = next_request(commands.as_ref().map(|(_, requests)| requests)) => {
+				if let Some((runner, _)) = commands.as_mut() {
+					// The answer goes nowhere once the utility stopped waiting
+					// (it was cancelled); the command still runs to its end.
+					let CommandRequest { command, reply } = request;
+					let started = runner.start(command);
+					running.push(async move {
+						let _ = reply.send(started.await);
+					});
 				}
 			},
 		}
@@ -3086,13 +2758,14 @@ async fn drive<SE: ShellExtensions>(
 /// Reports a failed drain of the files the utility left to close: the first
 /// error is printed and turns a zero `code` into 1.
 fn closes_status(host: &mut Host, closes: io::Result<()>, code: i32) -> i32 {
-	match closes {
+	let code = match closes {
 		Ok(()) => code,
 		Err(error) => {
 			host.error(error, 1);
 			if code == 0 { 1 } else { code }
 		},
-	}
+	};
+	if host.sigpipe_hit() { host.sigpipe.publish_death(); SIGPIPE_EXIT_CODE } else { code }
 }
 
 /// The exit status the adapter reports: 130 for a cancelled utility, unless
@@ -3109,11 +2782,9 @@ async fn drain<F: Future>(running: &mut FuturesUnordered<F>) {
 
 /// The next [`Host::spawn_command`] request, or `None` once the utility has
 /// dropped its host (or never had a runner).
-async fn next_request<SE: ShellExtensions>(
-	runner: Option<&CommandRunner<SE>>,
-) -> Option<CommandRequest> {
-	match runner {
-		Some(runner) => runner.requests.recv_async().await.ok(),
+async fn next_request(requests: Option<&flume::Receiver<CommandRequest>>) -> Option<CommandRequest> {
+	match requests {
+		Some(requests) => requests.recv_async().await.ok(),
 		None => None,
 	}
 }
@@ -3136,6 +2807,9 @@ pub(crate) fn run_caught<U: Utility>(parsed: U, host: &mut Host) -> i32 {
 		let _unwind = SigpipeUnwindScope::enter();
 		parsed.run(host)
 	}));
+	if let Some(stdout) = &host.merged_out { let _ = stdout.lock().flush(); }
+	let _ = host.stdout.flush();
+	host.sigpipe.flushed_stdout();
 	settle(U::NAME, U::OUTPUT_ERROR, outcome, host)
 }
 
@@ -3143,21 +2817,11 @@ pub(crate) fn run_caught<U: Utility>(parsed: U, host: &mut Host) -> i32 {
 /// the body, which may resume on another thread, and the body's closes are
 /// drained afterwards.
 ///
-/// Output the program would already have written (a standard-error write, a
-/// full standard-output buffer, an explicit flush: see
-/// [`AsyncOut::owes_delivery`]) is delivered while the body is suspended,
-/// before it is polled again, as a process does nothing after such a write
-/// before the write is done; when that delivery finds a pipe with no reader,
-/// SIGPIPE kills the utility and the body never resumes.
-///
 /// All output the body left pending is delivered before the status is
 /// settled, so a closed reader still ends it with [`SIGPIPE_EXIT_CODE`]; a
 /// cancelled command delivers nothing more.
 async fn run_caught_async<U: AsyncUtility>(parsed: U, host: &mut Host) -> i32 {
 	let outputs = host.async_out.as_ref().map(|streams| (streams.stdout.clone(), streams.stderr.clone()));
-	let owes = |outputs: &Option<(AsyncOut, AsyncOut)>| {
-		outputs.as_ref().is_some_and(|(out, err)| out.owes_delivery() || err.owes_delivery())
-	};
 	let sigpipe = Arc::clone(&host.sigpipe);
 	let outcome = {
 		let body = AssertUnwindSafe(async { parsed.run(host).await }).catch_unwind();
@@ -3165,30 +2829,20 @@ async fn run_caught_async<U: AsyncUtility>(parsed: U, host: &mut Host) -> i32 {
 		loop {
 			let step = poll_fn(|cx| {
 				let _scope = PanicScope::enter();
-				// `body` catches an unwind out of its own poll.
 				let _unwind = SigpipeUnwindScope::enter();
 				match body.as_mut().poll(cx) {
 					Poll::Ready(outcome) => Poll::Ready(Some(outcome)),
-					Poll::Pending if owes(&outputs) => Poll::Ready(None),
+					Poll::Pending if outputs.as_ref().is_some_and(|(out, err)| out.owes_delivery() || err.owes_delivery()) => Poll::Ready(None),
 					Poll::Pending => Poll::Pending,
 				}
-			})
-			.await;
-			if let Some(outcome) = step {
-				break outcome;
-			}
-			if let Some((out, err)) = &outputs {
-				deliver_owed(out, err).await;
-			}
-			if sigpipe.is_killed() {
-				break Ok(SIGPIPE_EXIT_CODE);
-			}
+			}).await;
+			if let Some(outcome) = step { break outcome; }
+			if let Some((out, err)) = &outputs { deliver_owed(out, err).await; }
+			if sigpipe.is_killed() { break Ok(SIGPIPE_EXIT_CODE); }
 		}
 	};
 	let drained = host.drain_output(true).await;
 	let code = settle(U::NAME, U::OUTPUT_ERROR, outcome, host);
-	// A broken pipe is settled above: SIGPIPE's status, or the check at exit
-	// when SIGPIPE is ignored.
 	let code = match drained {
 		Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
 			host.error(format!("write error: {}", strip_errno(&error)), 1);
@@ -3206,16 +2860,9 @@ async fn run_caught_async<U: AsyncUtility>(parsed: U, host: &mut Host) -> i32 {
 	}
 }
 
-/// Delivers each of an async utility's outputs that owes a delivery (see
-/// [`AsyncOut::owes_delivery`]): standard output first, as the program wrote
-/// it; one buffer once when both streams share a destination.
 async fn deliver_owed(stdout: &AsyncOut, stderr: &AsyncOut) {
-	if stdout.owes_delivery() {
-		let _ = stdout.drain(true).await;
-	}
-	if !stdout.same_as(stderr) && stderr.owes_delivery() {
-		let _ = stderr.drain(true).await;
-	}
+	if stdout.owes_delivery() { let _ = stdout.drain(true).await; }
+	if !stdout.same_as(stderr) && stderr.owes_delivery() { let _ = stderr.drain(true).await; }
 }
 
 /// Marks the current thread as inside a utility body for [`panic_scope_active`].
@@ -3234,8 +2881,6 @@ impl Drop for PanicScope {
 	}
 }
 
-/// Marks the current thread as inside a utility body whose `catch_unwind`
-/// boundary is on the stack (see [`Sigpipe::kill`]).
 struct SigpipeUnwindScope;
 
 impl SigpipeUnwindScope {
@@ -3255,22 +2900,11 @@ impl Drop for SigpipeUnwindScope {
 	}
 }
 
-/// The status of a finished body: [`SIGPIPE_EXIT_CODE`] when a guarded stream
-/// hit a closed reader, 1 with a note after a panic, else the body's own, as
-/// the check at exit leaves it (see [`close_stdout`]).
-///
-/// [`BROKEN_WRITE`], which a body returns for its own write that found a pipe
-/// with no reader, is SIGPIPE's status. With SIGPIPE ignored the program was
-/// not killed: it saw `EPIPE`, so it reports the write error and ends with its
-/// `failure` status ([`Utility::OUTPUT_ERROR`], GNU's `exit_failure`: 1 for
-/// most utilities, 2 for `grep`, `ls`, `sort`, 4 for `sed`).
+/// GNU close_stdout uses exit_failure for ignored broken writes, independently
+/// of the argument/processing error the body may already have reported.
 fn settle(name: &str, failure: u8, outcome: std::thread::Result<i32>, host: &mut Host) -> i32 {
-	if let Some(code) = host.sigpipe.exit_code() {
-		return code;
-	}
-	if host.sigpipe_hit() {
-		return SIGPIPE_EXIT_CODE;
-	}
+	if let Some(code) = host.sigpipe.exit_code() { return code; }
+	if host.sigpipe_hit() { host.sigpipe.publish_death(); return SIGPIPE_EXIT_CODE; }
 	let code = match outcome {
 		Ok(BROKEN_WRITE) if !host.sigpipe.ignored.load(Ordering::Relaxed) => return SIGPIPE_EXIT_CODE,
 		Ok(BROKEN_WRITE) => {
@@ -3286,91 +2920,69 @@ fn settle(name: &str, failure: u8, outcome: std::thread::Result<i32>, host: &mut
 	close_stdout(name, failure, code, host)
 }
 
-/// The status a GNU program ends with once it checked its standard streams at
-/// exit (gnulib's `close_stdout`): a write that failed while SIGPIPE was
-/// ignored (one that found a pipe with no reader) fails the program with its
-/// `failure` status, and a failed standard-output write is reported unless
-/// the program reported a failure of its own. A command that ran in place of
-/// the program ([`Host::exec_command`]) keeps its status, and a program that
-/// handles its own standard-output errors ([`Host::checks_own_stdout`]) is
-/// checked on standard error only.
 fn close_stdout(name: &str, failure: u8, code: i32, host: &mut Host) -> i32 {
 	let sigpipe = &host.sigpipe;
-	if sigpipe.exec_replaced.load(Ordering::Relaxed) {
-		return code;
-	}
+	if sigpipe.exec_replaced.load(Ordering::Relaxed) { return code; }
 	let failed = sigpipe.failed_ignored.load(Ordering::Relaxed);
 	let stdout_failed = failed & FAILED_STDOUT != 0 && !sigpipe.checks_stdout.load(Ordering::Relaxed);
 	let stderr_failed = failed & FAILED_STDERR != 0 && !sigpipe.checks_stderr.load(Ordering::Relaxed);
-	if !stdout_failed && !stderr_failed {
-		return code;
-	}
-	if stdout_failed && code == 0 {
-		let _ = writeln!(host.stderr, "{name}: write error: Broken pipe");
-	}
+	if !stdout_failed && !stderr_failed { return code; }
+	if stdout_failed && code == 0 { let _ = writeln!(host.stderr, "{name}: write error: Broken pipe"); }
 	i32::from(failure)
 }
 
-/// Snapshots the command's streams, working directory, and exported
+/// Turns the invocation's streams, working directory, and exported
 /// environment into an owned [`Host`] that can move to a blocking thread.
-fn build_host<SE: ShellExtensions>(context: &ExecutionContext<'_, SE>, spec: Spec) -> Result<Host, Error> {
-	let Spec { name, checks_stdout_path, owns_cancellation, async_io, .. } = spec;
-	let stdin = context.try_fd(OpenFiles::STDIN_FD);
-	// The `OpenFile` is kept alive by the `Stdin` below, so the fd stays valid.
-	let stdin_fd = stdin.as_ref().and_then(pollable_fd);
-	let stdin_is_search_input = stdin
-		.as_ref()
-		.is_some_and(|file| matches!(file, OpenFile::PipeReader(_) | OpenFile::Stream(_) | OpenFile::Vfs(_)));
-
-	let mut env = HashMap::new();
-	for (key, var) in context.shell.env().iter_exported() {
-		if var.value().is_set() {
-			env.insert(key.clone(), var.value().to_cow_str(context.shell).into_owned());
-		}
-	}
-
-	let invoked = if context.command_name.is_empty() {
-		name.to_string()
-	} else {
-		context.command_name.clone()
+/// `Err` carries the exit status when a closed descriptor cannot be backed by
+/// the null device.
+fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
+	let Spec { checks_stdout_path, owns_cancellation, async_io, .. } = spec;
+	let paths = invocation.paths();
+	let Opened {
+		name: invoked, env, stdio: [stdin, stdout, stderr_file], cancel: token, reported_error, ..
+	} = invocation;
+	let (stdin, stdout, stderr_file) = match (or_null(stdin), or_null(stdout), or_null(stderr_file)) {
+		(Ok(stdin), Ok(stdout), Ok(stderr_file)) => (stdin, stdout, stderr_file),
+		(stdin, stdout, stderr_file) => {
+			if let Ok(stderr_file) = &stderr_file
+				&& let Some(error) = stdin.err().or(stdout.err())
+			{
+				write_to(Some(stderr_file), format_args!("{invoked}: {error}\n"));
+			}
+			return Err(1);
+		},
 	};
+	// The `OpenFile` is kept alive by the `Stdin` below, so the fd stays valid.
+	let stdin_fd = pollable_fd(&stdin);
+	let stdin_is_search_input = openfile::is_piped_input(&stdin);
 
 	// One flag, shared: the adapter flips it on cancellation, and a blocked
 	// `Stdin::read` must observe the very same flag or it never wakes.
 	let cancel = Arc::new(AtomicBool::new(false));
 	let command_cancel = CommandCancel {
-		flag:     Arc::clone(&cancel),
-		token:    context.cancel_token(),
+		flag: Arc::clone(&cancel),
+		token,
 		silences: !owns_cancellation,
 	};
 
-	let stdout = or_null(context.try_fd(OpenFiles::STDOUT_FD))?;
 	let stdout_handle = if checks_stdout_path { output_handle(&stdout) } else { None };
-	let stderr_file = or_null(context.try_fd(OpenFiles::STDERR_FD))?;
 	let child_stderr = stderr_file.clone();
 	// Classified before the SIGPIPE guard wraps them: the guard is an opaque
 	// stream, so a file behind it can no longer be told from a pipe on
 	// Windows, and one sample per stream serves every writer below.
 	let stdout_destination = Destination::of(&stdout);
 	let stderr_destination = Destination::of(&stderr_file);
-	// A shell that ignores SIGPIPE passes that on to the commands it runs; a
-	// program that ignores it from its start also handles its own output
-	// errors (see `Utility::IGNORES_SIGPIPE`).
-	let sigpipe = Arc::new(Sigpipe::new(
-		context.shell.ignores_sigpipe() || spec.ignores_sigpipe,
-		spec.stdout_buffer,
-	));
+	let sigpipe = Arc::new(Sigpipe::new(invocation.sigpipe_ignored || spec.ignores_sigpipe, spec.stdout_buffer));
+	if let Some(killed) = invocation.killed_by_sigpipe { let _ = sigpipe.killed_report.set(killed); }
 	if spec.ignores_sigpipe {
 		sigpipe.checks_stdout.store(true, Ordering::Relaxed);
 		sigpipe.checks_stderr.store(true, Ordering::Relaxed);
-		if let Some(code) = spec.stderr_exit {
-			sigpipe.stderr_exit.store(code, Ordering::Relaxed);
-		}
+		if let Some(code) = spec.stderr_exit { sigpipe.stderr_exit.store(code, Ordering::Relaxed); }
 	}
 	// `2>&1` (and the default capture pipe): one shared writer keeps
 	// diagnostics and output in exact write order. It carries stdout output,
-	// so it takes the stdout guard; each handle onto it counts or delivers its
-	// own stream's writes (see `StreamWriter::Shared`).
+	// so it takes the stdout guard: once the reader is gone every write fails
+	// and nothing is observable either way.
 	//
 	// An async utility's writers never touch a descriptor: they append to
 	// memory-backed `AsyncOut`s that the host drains asynchronously.
@@ -3387,10 +2999,9 @@ fn build_host<SE: ShellExtensions>(context: &ExecutionContext<'_, SE>, spec: Spe
 			async_out = Some(AsyncStreams { stdout: out.clone(), stderr: out.as_stderr() });
 			(None, StreamWriter::Async(out.as_stderr()))
 		} else {
-			let guarded =
-				SigpipeGuard::wrap_counting(stderr_file, GuardedStream::Stdout, &sigpipe, &command_cancel, false);
+			let guarded = SigpipeGuard::wrap_counting(stderr_file, GuardedStream::Stdout, &sigpipe, &command_cancel, false);
 			let shared =
-				Arc::new(Mutex::new(StreamWriter::new(guarded, stderr_destination.regular_file)));
+				Arc::new(Mutex::new(StreamWriter::program(guarded, stderr_destination.regular_file, spec.stdout_buffer)));
 			let stderr = StreamWriter::Shared(Arc::clone(&shared), GuardedStream::Stderr, Arc::clone(&sigpipe));
 			(Some(shared), stderr)
 		}
@@ -3409,19 +3020,27 @@ fn build_host<SE: ShellExtensions>(context: &ExecutionContext<'_, SE>, spec: Spe
 			&sigpipe,
 			&command_cancel,
 		);
-		async_out = Some(AsyncStreams { stdout: stdout_out, stderr: out.as_stderr() });
-		(None, StreamWriter::Async(out.as_stderr()))
+		let stderr = out.as_stderr().after_stdout(&stdout_out);
+		async_out = Some(AsyncStreams { stdout: stdout_out, stderr: stderr.clone() });
+		(None, StreamWriter::Async(stderr))
 	} else {
 		let guarded = SigpipeGuard::wrap(stderr_file, GuardedStream::Stderr, &sigpipe, &command_cancel);
-		// A process writes its standard error unbuffered, also to a regular
-		// file: a diagnostic reaches it before a later death of the utility.
 		(None, StreamWriter::line(guarded))
+	};
+	// Keep the actual buffer reachable by diagnostics on a separate stderr.
+	let merged_out = if async_io || merged_out.is_some() {
+		merged_out
+	} else {
+		let guarded = SigpipeGuard::wrap_counting(stdout.clone(), GuardedStream::Stdout, &sigpipe, &command_cancel, false);
+		let shared = Arc::new(Mutex::new(StreamWriter::program(guarded, stdout_destination.regular_file, spec.stdout_buffer)));
+		*sigpipe.stdout_writer.lock() = Arc::downgrade(&shared);
+		Some(shared)
 	};
 	let stdout = SigpipeGuard::wrap(stdout, GuardedStream::Stdout, &sigpipe, &command_cancel);
 
 	Ok(Host {
 		stdin: Stdin {
-			file:   or_null(stdin)?,
+			file:   stdin,
 			fd:     stdin_fd,
 			cancel: command_cancel,
 		},
@@ -3433,7 +3052,7 @@ fn build_host<SE: ShellExtensions>(context: &ExecutionContext<'_, SE>, spec: Spe
 		stdout_metadata: OnceLock::new(),
 		umask: OnceLock::new(),
 		name: invoked,
-		paths: ShellPaths::new(context).with_write_errors(file_write_errors(&sigpipe)),
+		paths: paths.with_write_errors(file_write_errors(&sigpipe)),
 		env,
 		cancel,
 		exit_code: 0,
@@ -3441,17 +3060,13 @@ fn build_host<SE: ShellExtensions>(context: &ExecutionContext<'_, SE>, spec: Spe
 		merged_out,
 		sigpipe,
 		commands: None,
-		reported_error: context.params.reported_error().cloned(),
+		reported_error,
 		async_out,
 		stdin_source: None,
 	})
 }
 
-/// How a utility's write to a file it opened itself (`tee FILE`, `dd of=`,
-/// `cp SRC DEST`, `sed 'w FILE'`, `find -fprint`) ends at a pipe with no
-/// reader, `/dev/fd/N` or a FIFO: as the program's write would, raising
-/// SIGPIPE, which kills it at once (see [`Sigpipe::kill`]) unless it is
-/// ignored, when the write fails with `EPIPE` for the utility to handle.
+/// Operand files raise SIGPIPE in their writer, just like stdout/stderr.
 fn file_write_errors(sigpipe: &Arc<Sigpipe>) -> pi_vfs::WriteErrors {
 	let sigpipe = Arc::clone(sigpipe);
 	pi_vfs::WriteErrors::new(move |error| {
@@ -3485,11 +3100,300 @@ fn async_out_for(
 
 /// Substitutes the null device for a closed descriptor, so a utility reading
 /// from or writing to it sees EOF / discards output instead of failing.
-fn or_null(file: Option<OpenFile>) -> Result<OpenFile, Error> {
+fn or_null(file: Option<OpenFile>) -> io::Result<OpenFile> {
 	match file {
 		Some(file) => Ok(file),
-		None => openfiles::null(),
+		None => openfile::null(),
 	}
+}
+
+/// Exit status of a process builtin that was cancelled (128 + SIGINT).
+pub(crate) const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+/// Exit status of a process builtin given arguments it cannot parse.
+pub(crate) const INVALID_USAGE_EXIT_CODE: i32 = 2;
+
+/// A process builtin (`ps`, `top`, `sleep`, `pgrep`, `pkill`, `pidwait`): an
+/// async body that needs nothing of the shell beyond a [`ProcContext`].
+pub(crate) trait Process: clap::Parser + Send + Sync + 'static {
+	/// Whether the body resolves paths through [`ProcContext::paths`]; every
+	/// other builtin skips duplicating the descriptors that needs.
+	const USES_PATHS: bool = false;
+	/// procps catches SIGPIPE; ordinary process builtins keep the default.
+	const BROKEN_PIPE_EXIT: Option<i32> = None;
+	const USAGE_ERROR: i32 = INVALID_USAGE_EXIT_CODE;
+	const USAGE_BROKEN_PIPE_EXIT: Option<i32> = Self::BROKEN_PIPE_EXIT;
+	const PRESERVE_STATUS_ON_BROKEN_PIPE: bool = false;
+
+	/// Rewrites raw `argv` (command name included) before clap parses it;
+	/// the identity unless overridden (`top` normalizes its flags).
+	fn rewrite_argv(argv: Vec<String>) -> Vec<String> {
+		argv
+	}
+
+	/// Runs the builtin to completion, returning its exit status. An error
+	/// (a failed write) is reported on stderr by [`run_process`].
+	fn run(&self, context: &ProcContext) -> impl Future<Output = io::Result<i32>> + Send;
+}
+
+/// What a [`Process`] builtin sees of its invocation.
+///
+/// Output is memory-only until [`ProcContext::flush_output`] delivers it
+/// through the same async sinks as an [`AsyncUtility`]'s, so a body never
+/// blocks the runtime on a pipe or provider file. Bodies flush before they
+/// sleep or wait; [`run_process_in`] drains what is left.
+pub(crate) struct ProcContext {
+	/// The name the builtin was invoked as.
+	pub command_name: String,
+	stdio:            [Option<OpenFile>; 3],
+	paths:            ShellPaths,
+	cancel:           Option<CancellationToken>,
+	vfs:              pi_vfs::Fs,
+	stdout:           Option<AsyncOut>,
+	stderr:           Option<AsyncOut>,
+	sigpipe:          Arc<Sigpipe>,
+}
+
+impl ProcContext {
+	/// Takes over an invocation; `with_paths` also captures the path resolver
+	/// ([`Process::USES_PATHS`]).
+	fn from_invocation(invocation: Opened, with_paths: bool, catches_sigpipe: bool) -> Self {
+		let (paths, vfs) = if with_paths {
+			let paths = invocation.paths();
+			let vfs = paths.fs().to_async();
+			(paths, vfs)
+		} else {
+			let blocking = invocation.fs.blocking();
+			let blocking = match invocation.cancel.clone() {
+				Some(token) => blocking.with_cancellation(token),
+				None => blocking,
+			};
+			(ShellPaths::default(), blocking.to_async())
+		};
+		let sigpipe = Arc::new(Sigpipe::new(invocation.sigpipe_ignored || catches_sigpipe, 0));
+		if let Some(killed) = &invocation.killed_by_sigpipe { let _ = sigpipe.killed_report.set(Arc::clone(killed)); }
+		let gate = CommandCancel {
+			flag:     Arc::new(AtomicBool::new(false)),
+			token:    invocation.cancel.clone(),
+			silences: false,
+		};
+		let out = |file: &OpenFile, stream| {
+			async_out_for(file.clone(), stream, Destination::of(file).regular_file, &sigpipe, &gate)
+		};
+		let (stdout, stderr) = match &invocation.stdio {
+			[_, Some(stdout), Some(stderr)]
+				if Destination::of(stdout).shares_with(&Destination::of(stderr)) =>
+			{
+				let merged = out(stderr, GuardedStream::Stdout);
+				(Some(merged.clone()), Some(merged.as_stderr()))
+			},
+			[_, stdout, stderr] => (
+				stdout.as_ref().map(|file| out(file, GuardedStream::Stdout)),
+				stderr.as_ref().map(|file| out(file, GuardedStream::Stderr)),
+			),
+		};
+		let stderr = stderr.map(|err| match &stdout {
+			Some(out) => err.as_stderr().after_stdout(out),
+			None => err.as_stderr(),
+		});
+		Self {
+			command_name: invocation.name,
+			stdio: invocation.stdio,
+			paths,
+			cancel: invocation.cancel,
+			vfs,
+			stdout,
+			stderr,
+			sigpipe,
+		}
+	}
+
+	/// Standard output, buffered in memory until [`ProcContext::flush_output`];
+	/// writes fail when fd 1 is closed.
+	pub fn stdout(&self) -> ProcStream {
+		ProcStream::of(&self.stdout, "standard output not available")
+	}
+
+	/// Standard error, buffered like [`ProcContext::stdout`]; writes fail when
+	/// fd 2 is closed.
+	pub fn stderr(&self) -> ProcStream {
+		ProcStream::of(&self.stderr, "standard error not available")
+	}
+
+	/// Delivers everything written to stdout and stderr so far, in write order
+	/// for outputs sharing a destination.
+	///
+	/// # Errors
+	///
+	/// The first write failure; a closed reader is [`io::ErrorKind::BrokenPipe`].
+	pub async fn flush_output(&self) -> io::Result<()> {
+		let stdout = match &self.stdout {
+			Some(out) => out.drain(true).await,
+			None => Ok(()),
+		};
+		let stderr = match (&self.stdout, &self.stderr) {
+			(Some(out), Some(err)) if out.same_as(err) => Ok(()),
+			(_, Some(err)) => err.drain(true).await,
+			_ => Ok(()),
+		};
+		stdout.and(stderr)
+	}
+
+	/// Standard input as one owned async source; nothing is read yet.
+	///
+	/// # Errors
+	///
+	/// Fd 0 is closed, or duplicating it failed.
+	pub fn stdin_source(&self) -> io::Result<Source> {
+		match &self.stdio[0] {
+			Some(file) => Source::inherited(file),
+			None => Err(io::Error::other("standard input not available")),
+		}
+	}
+
+	/// The invocation's filesystem, scoped to its cancellation, for async
+	/// operand and pidfile reads.
+	pub fn vfs(&self) -> pi_vfs::Fs {
+		self.vfs.clone()
+	}
+
+	/// Standard descriptor `fd` (0, 1, or 2) when it is open.
+	pub fn try_fd(&self, fd: i32) -> Option<OpenFile> {
+		usize::try_from(fd).ok().and_then(|fd| self.stdio.get(fd)?.clone())
+	}
+
+	/// The token that fires when the builtin is cancelled.
+	pub fn cancel_token(&self) -> Option<CancellationToken> {
+		self.cancel.clone()
+	}
+
+	/// Whether the builtin has been cancelled.
+	pub fn is_cancelled(&self) -> bool {
+		self.cancel.as_ref().is_some_and(CancellationToken::is_cancelled)
+	}
+
+	/// The path resolver; resolves against the process working directory
+	/// unless captured for a [`Process::USES_PATHS`] builtin.
+	pub fn paths(&self) -> &ShellPaths {
+		&self.paths
+	}
+}
+
+/// A standard output stream of a [`ProcContext`]: appends to the shared
+/// memory buffer (never touching a descriptor), or fails every write for a
+/// closed one.
+pub(crate) enum ProcStream {
+	Open(AsyncOut),
+	Closed(&'static str),
+}
+
+impl ProcStream {
+	fn of(out: &Option<AsyncOut>, closed: &'static str) -> Self {
+		out.as_ref().map_or(Self::Closed(closed), |out| Self::Open(out.clone()))
+	}
+}
+
+impl Write for ProcStream {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		match self {
+			Self::Open(out) => out.write(buf),
+			Self::Closed(message) => Err(io::Error::other(*message)),
+		}
+	}
+
+	fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+		match self {
+			Self::Open(out) => out.write_all(buf),
+			Self::Closed(message) => Err(io::Error::other(*message)),
+		}
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
+}
+
+/// Runs a [`Process`] builtin: parses `argv` (a usage error is reported on
+/// stderr with status 2) and reports a failure of the body on stderr, with
+/// status 141 for a closed reader and 1 otherwise.
+pub(crate) async fn run_process<P: Process>(invocation: Invocation) -> i32 {
+	let mut invocation = invocation.open("");
+	let argv = P::rewrite_argv(std::mem::take(&mut invocation.argv));
+	let context = ProcContext::from_invocation(invocation, P::USES_PATHS, P::BROKEN_PIPE_EXIT.is_some());
+	run_process_in::<P>(argv, &context).await
+}
+
+/// [`run_process`] against an existing context.
+pub(crate) async fn run_process_in<P: Process>(argv: Vec<String>, context: &ProcContext) -> i32 {
+	let command = match P::try_parse_from(argv) {
+		Ok(command) => command,
+		Err(error) => {
+			if error.use_stderr() {
+				let _ = writeln!(context.stderr(), "{error}");
+				return drained_status(context, P::USAGE_ERROR, P::USAGE_BROKEN_PIPE_EXIT, false).await;
+			}
+			let _ = write!(context.stdout(), "{error}");
+			return drained_status(context, 0, P::BROKEN_PIPE_EXIT, false).await;
+		},
+	};
+	let code = match command.run(context).await {
+		Ok(code) => code,
+		Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+			if let Some(code) = P::BROKEN_PIPE_EXIT { return drained_status(context, code, Some(code), false).await; }
+			if context.sigpipe.is_hit() {
+				context.sigpipe.publish_death();
+				return SIGPIPE_EXIT_CODE;
+			}
+			let _ = writeln!(context.stderr(), "{}: {error}", context.command_name);
+			1
+		},
+		Err(error) => {
+			let _ = writeln!(context.stderr(), "{}: {error}", context.command_name);
+			1
+		},
+	};
+	drained_status(context, code, P::BROKEN_PIPE_EXIT, P::PRESERVE_STATUS_ON_BROKEN_PIPE).await
+}
+
+/// Delivers all output the body left pending, then settles the status: a
+/// closed reader ends the builtin with [`SIGPIPE_EXIT_CODE`], any other
+/// delivery failure is reported on stderr and turns success into 1.
+async fn drained_status(context: &ProcContext, code: i32, broken_exit: Option<i32>, preserve_status: bool) -> i32 {
+	let result = context.flush_output().await;
+	if context.sigpipe.is_hit() {
+		context.sigpipe.publish_death();
+		return SIGPIPE_EXIT_CODE;
+	}
+	let failed = context.sigpipe.failed_ignored.load(Ordering::Relaxed) != 0;
+	if failed && let Some(broken_exit) = broken_exit {
+		return if preserve_status && code != 0 { code } else { broken_exit };
+	}
+	match result {
+		Ok(()) if !failed => code,
+		result => {
+			let error = result.err().unwrap_or_else(|| io::ErrorKind::BrokenPipe.into());
+			let _ = writeln!(context.stderr(), "{}: {error}", context.command_name);
+			let _ = context.flush_output().await;
+			if context.sigpipe.is_hit() {
+				context.sigpipe.publish_death();
+				SIGPIPE_EXIT_CODE
+			} else if code == 0 { 1 } else { code }
+		},
+	}
+}
+
+/// Reports `text` on `file` (when open) through the async output sinks, for
+/// invocations that end before they have a host or context.
+pub(crate) async fn report_async(file: Option<OpenFile>, text: String) {
+	let Some(file) = file else {
+		return;
+	};
+	let sigpipe = Arc::new(Sigpipe::default());
+	let gate = CommandCancel { flag: Arc::new(AtomicBool::new(false)), token: None, silences: false };
+	let regular_file = Destination::of(&file).regular_file;
+	let mut out = async_out_for(file, GuardedStream::Stderr, regular_file, &sigpipe, &gate);
+	let _ = out.write_all(text.as_bytes());
+	let _ = out.drain(true).await;
 }
 
 /// Implements `clap::Parser` for a builder-style utility: `$ty` stores the
@@ -3497,7 +3401,7 @@ fn or_null(file: Option<OpenFile>) -> Result<OpenFile, Error> {
 ///
 /// Ports whose upstream argument model is built with `clap::Command::new(…)`
 /// use this instead of rewriting dozens of arguments into `derive(Parser)`
-/// form. Brush still renders `--help`, usage, and man content from `$app`.
+/// form. `--help` and usage text still come from `$app`.
 #[allow(unused_macros, reason = "used by utility modules, which are feature-gated")]
 macro_rules! matches_parser {
 	($ty:ident, $app:path) => {
@@ -3539,10 +3443,9 @@ mod testing {
 	use parking_lot::Mutex;
 
 	use super::{
-		Arc, AtomicBool, CommandCancel, GuardedStream, HashMap, Host, OpenFile, OpenFiles, OsString,
-		PathBuf, Read, ShellPaths, Sigpipe, SigpipeGuard, Stdin, StreamWriter, Utility, Write, io, openfiles,
-		output_handle, run_caught,
-		AsyncStreams, AsyncUtility, Spec, async_out_for, run_caught_async,
+		Arc, AsyncStreams, AsyncUtility, AtomicBool, CommandCancel, GuardedStream, HashMap, Host, OpenFile,
+		OsString, PathBuf, Read, ShellPaths, Sigpipe, SigpipeGuard, Spec, Stdin, StreamWriter, Utility, Write,
+		async_out_for, io, openfile, output_handle, run_caught, run_caught_async,
 	};
 
 	/// Captured in-memory output from [`Host::for_test`].
@@ -3598,7 +3501,7 @@ mod testing {
 		/// Builds a host backed by an arbitrary in-memory stdin stream.
 		pub(crate) fn for_test_with_stdin(
 			name: &str,
-			stdin: Box<dyn openfiles::Stream>,
+			stdin: Box<dyn openfile::Stream>,
 			cwd: impl Into<PathBuf>,
 		) -> (Self, Capture) {
 			Self::for_test_streams(name, stdin, cwd, false, false)
@@ -3626,7 +3529,7 @@ mod testing {
 
 		fn for_test_streams(
 			name: &str,
-			stdin: Box<dyn openfiles::Stream>,
+			stdin: Box<dyn openfile::Stream>,
 			cwd: impl Into<PathBuf>,
 			owns_cancellation: bool,
 			async_io: bool,
@@ -3639,11 +3542,12 @@ mod testing {
 			let sigpipe = Arc::new(Sigpipe::default());
 			let command_cancel =
 				CommandCancel { flag: Arc::clone(&cancel), token: None, silences: !owns_cancellation };
-			let stdout = OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&capture.stdout))));
-			let stderr = OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&capture.stderr))));
-			let async_out = async_io.then(|| AsyncStreams {
-				stdout: async_out_for(stdout.clone(), GuardedStream::Stdout, false, &sigpipe, &command_cancel),
-				stderr: async_out_for(stderr.clone(), GuardedStream::Stderr, false, &sigpipe, &command_cancel),
+			let stdout = OpenFile::stream(Box::new(MemStream::writer(Arc::clone(&capture.stdout))));
+			let stderr = OpenFile::stream(Box::new(MemStream::writer(Arc::clone(&capture.stderr))));
+			let async_out = async_io.then(|| {
+				let out = async_out_for(stdout.clone(), GuardedStream::Stdout, false, &sigpipe, &command_cancel);
+				let err = async_out_for(stderr.clone(), GuardedStream::Stderr, false, &sigpipe, &command_cancel);
+				AsyncStreams { stderr: err.as_stderr().after_stdout(&out), stdout: out }
 			});
 			let stderr_writer = match &async_out {
 				Some(streams) => StreamWriter::Async(streams.stderr.clone()),
@@ -3654,9 +3558,15 @@ mod testing {
 					&command_cancel,
 				)),
 			};
+			let merged_out = (!async_io).then(|| {
+				let guarded = SigpipeGuard::wrap_counting(stdout.clone(), GuardedStream::Stdout, &sigpipe, &command_cancel, false);
+				let shared = Arc::new(Mutex::new(StreamWriter::line(guarded)));
+				*sigpipe.stdout_writer.lock() = Arc::downgrade(&shared);
+				shared
+			});
 			let host = Self {
 				stdin:                 Stdin {
-					file:   OpenFile::Stream(stdin),
+					file:   OpenFile::stream(stdin),
 					fd:     None,
 					cancel: command_cancel.clone(),
 				},
@@ -3667,7 +3577,7 @@ mod testing {
 					&command_cancel,
 				),
 				stderr:                stderr_writer,
-				child_stderr:          stderr,
+				child_stderr: stderr,
 				stdout_is_file:        false,
 				stdout_handle:         None,
 				stdout_metadata:       Default::default(),
@@ -3678,7 +3588,7 @@ mod testing {
 				cancel,
 				exit_code:             0,
 				stdin_is_search_input: false,
-				merged_out:            None,
+				merged_out,
 				sigpipe,
 				commands:              None,
 				reported_error:        None,
@@ -3705,6 +3615,13 @@ mod testing {
 					&self.sigpipe,
 					&command_cancel,
 				);
+				streams.stderr = streams.stderr.as_stderr().after_stdout(&streams.stdout);
+				self.stderr = StreamWriter::Async(streams.stderr.clone());
+ 			} else {
+				let guarded = SigpipeGuard::wrap_counting(file.clone(), GuardedStream::Stdout, &self.sigpipe, &command_cancel, false);
+				let shared = Arc::new(Mutex::new(StreamWriter::program(guarded, self.stdout_is_file, self.sigpipe.stdout_buffer.load(super::Ordering::Relaxed))));
+				*self.sigpipe.stdout_writer.lock() = Arc::downgrade(&shared);
+				self.merged_out = Some(shared);
 			}
 			self.stdout = SigpipeGuard::wrap(file, GuardedStream::Stdout, &self.sigpipe, &command_cancel);
 		}
@@ -3740,7 +3657,7 @@ mod testing {
 	#[cfg(unix)]
 	#[test]
 	fn stdin_from_the_null_device_is_not_polled() {
-		let null = openfiles::null().unwrap();
+		let null = openfile::null().unwrap();
 		assert_eq!(super::pollable_fd(&null), None);
 		let (reader, _writer) = std::io::pipe().unwrap();
 		assert!(super::pollable_fd(&OpenFile::from(reader)).is_some());
@@ -3791,13 +3708,21 @@ mod testing {
 
 	/// An in-memory host for a utility with `spec`.
 	fn test_host(spec: Spec, stdin: &str, cwd: impl Into<PathBuf>) -> (Host, Capture) {
-		if spec.async_io {
+		let (host, capture) = if spec.async_io {
 			Host::for_test_async(spec.name, stdin.as_bytes().to_vec(), cwd)
 		} else if spec.owns_cancellation {
 			Host::for_test_owning(spec.name, stdin.as_bytes().to_vec(), cwd)
 		} else {
 			Host::for_test(spec.name, stdin.as_bytes().to_vec(), cwd)
+		};
+		host.sigpipe.stdout_buffer.store(spec.stdout_buffer, super::Ordering::Relaxed);
+		if spec.stdout_buffer == 0 { host.unbuffer_stdout(); }
+		host.sigpipe.ignored.store(spec.ignores_sigpipe, super::Ordering::Relaxed);
+		if spec.ignores_sigpipe {
+			host.checks_own_output();
+			if let Some(code) = spec.stderr_exit { host.sigpipe.stderr_exit.store(code, super::Ordering::Relaxed); }
 		}
+		(host, capture)
 	}
 
 	/// Rewrites and parses `argv` as the adapter does; `Err` is the exit status
@@ -3836,47 +3761,46 @@ mod testing {
 		tree
 	}
 
-	/// Runs `script` in a real shell with every builtin registered, from `cwd`
-	/// with `stdin` on fd 0, returning its status, stdout, and stderr.
+	/// Runs the extra `argv` through [`run`](crate::extras::run) from `cwd`
+	/// with `stdin` on fd 0 and the process environment plus `env`, returning
+	/// its status, stdout, and stderr.
 	///
-	/// Utilities that set [`Utility::RUNS_COMMANDS`] need this: an in-memory
-	/// [`Host::for_test`] has no shell to run their commands in.
-	pub(crate) async fn run_script(
-		script: &str,
+	/// Utilities that set [`Utility::RUNS_COMMANDS`] need this: their
+	/// commands are served by a [`TestRunner`].
+	pub(crate) async fn run_extra(
+		argv: &[&str],
 		stdin: &str,
 		cwd: &std::path::Path,
+		env: &[(&str, &str)],
 	) -> (i32, String, String) {
 		use std::io::Seek;
-
-		use brush_core::{ProfileLoadBehavior, RcLoadBehavior, Shell, SourceInfo};
-
-		use crate::factory::{BuiltinSet, default_builtins, utility_builtins};
-
-		let mut shell = Shell::builder()
-			.profile(ProfileLoadBehavior::Skip)
-			.rc(RcLoadBehavior::Skip)
-			.builtins(default_builtins(BuiltinSet::BashMode))
-			.build()
-			.await
-			.expect("test shell");
-		for (name, builtin) in utility_builtins() {
-			shell.register_builtin(name, builtin);
-		}
-		shell.set_working_dir(cwd).await.expect("test working directory");
 
 		let mut input = tempfile::tempfile().expect("stdin file");
 		input.write_all(stdin.as_bytes()).expect("write stdin");
 		input.rewind().expect("rewind stdin");
 		let output = tempfile::tempfile().expect("stdout file");
 		let error = tempfile::tempfile().expect("stderr file");
-		let mut params = shell.default_exec_params();
-		params.set_fd(OpenFiles::STDIN_FD, OpenFile::from(input));
-		params.set_fd(OpenFiles::STDOUT_FD, OpenFile::from(output.try_clone().expect("stdout")));
-		params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(error.try_clone().expect("stderr")));
-		let result = shell
-			.run_string(script, &SourceInfo::from("run-script"), &params)
-			.await
-			.expect("run test script");
+		let mut vars: HashMap<String, String> = std::env::vars().collect();
+		vars.extend(env.iter().map(|(name, value)| ((*name).to_string(), (*value).to_string())));
+		let runner = TestRunner::new(
+			vars.clone(),
+			cwd.to_path_buf(),
+			output.try_clone().expect("stdout"),
+			error.try_clone().expect("stderr"),
+		);
+		let mut invocation = crate::extras::Invocation::new(
+			argv.iter().map(ToString::to_string).collect(),
+			cwd.to_path_buf(),
+			pi_vfs::Fs::native(),
+		);
+		invocation.env = vars;
+		invocation.stdio = [
+			crate::extras::Fd::File(input),
+			crate::extras::Fd::File(output.try_clone().expect("stdout")),
+			crate::extras::Fd::File(error.try_clone().expect("stderr")),
+		];
+		invocation.commands = Some(Box::new(runner));
+		let code = crate::extras::run(invocation).await;
 
 		let read = |mut file: std::fs::File| {
 			let mut text = String::new();
@@ -3884,10 +3808,217 @@ mod testing {
 			file.read_to_string(&mut text).expect("read capture");
 			text
 		};
-		(i32::from(u8::from(result.exit_code)), read(output), read(error))
+		(code, read(output), read(error))
 	}
 
-	/// An in-memory [`openfiles::Stream`]: a cursor over fixed input, or an
+	/// Runs the process builtin `P` with `argv` (`argv[0]` naming it), the
+	/// null device on stdin, and `cancel`, returning its status, stdout, and
+	/// stderr.
+	pub(crate) async fn run_proc<P: super::Process>(
+		argv: &[&str],
+		cancel: Option<tokio_util::sync::CancellationToken>,
+	) -> (i32, String, String) {
+		use std::io::Seek;
+
+		let output = tempfile::tempfile().expect("stdout file");
+		let error = tempfile::tempfile().expect("stderr file");
+		let mut invocation = crate::extras::Invocation::new(
+			argv.iter().map(ToString::to_string).collect(),
+			std::env::current_dir().expect("current dir"),
+			pi_vfs::Fs::native(),
+		);
+		let null = std::fs::File::open(if cfg!(windows) { "NUL" } else { "/dev/null" }).expect("null device");
+		invocation.stdio = [
+			crate::extras::Fd::File(null),
+			crate::extras::Fd::File(output.try_clone().expect("stdout")),
+			crate::extras::Fd::File(error.try_clone().expect("stderr")),
+		];
+		invocation.cancel = cancel;
+		let code = super::run_process::<P>(invocation).await;
+		let read = |mut file: std::fs::File| {
+			let mut text = String::new();
+			file.rewind().expect("rewind capture");
+			file.read_to_string(&mut text).expect("read capture");
+			text
+		};
+		(code, read(output), read(error))
+	}
+
+	/// The [`CommandRunner`](super::CommandRunner) of [`run_extra`]: runs a
+	/// command as an extra when one has its name, else as one of the shell
+	/// builtins `echo`, `true`, `false`, `pwd`, and `cd`, else as a program
+	/// found on its `PATH`, writing to the invoking utility's stdout and
+	/// stderr. Environment changes apply to that command only.
+	pub(crate) struct TestRunner {
+		env:    HashMap<String, String>,
+		cwd:    PathBuf,
+		stdout: std::fs::File,
+		stderr: std::fs::File,
+	}
+
+	impl TestRunner {
+		/// A runner for commands with the base environment `env`, run in
+		/// `cwd`, writing to `stdout` and `stderr`.
+		pub(crate) fn new(
+			env: HashMap<String, String>,
+			cwd: PathBuf,
+			stdout: std::fs::File,
+			stderr: std::fs::File,
+		) -> Self {
+			Self { env, cwd, stdout, stderr }
+		}
+
+		fn dup(&self) -> io::Result<Self> {
+			Ok(Self {
+				env:    self.env.clone(),
+				cwd:    self.cwd.clone(),
+				stdout: self.stdout.try_clone()?,
+				stderr: self.stderr.try_clone()?,
+			})
+		}
+	}
+
+	impl super::CommandRunner for TestRunner {
+		fn start(
+			&mut self,
+			mut command: super::ShellCommand,
+		) -> futures::future::BoxFuture<'static, io::Result<super::CommandStatus>> {
+			use super::{CommandStatus, EnvChange};
+
+			let prepared = (|| {
+				let mut runner = self.dup()?;
+				for change in command.env_changes() {
+					match change {
+						EnvChange::Clear => runner.env.clear(),
+						EnvChange::Remove(name) => {
+							runner.env.remove(name);
+						},
+						EnvChange::Set(name, value) => {
+							runner.env.insert(name.clone(), value.clone());
+						},
+					}
+				}
+				// Like the shell's `cd`, the working directory is logical:
+				// `-execdir` hands over `<root>/./sub`, and `pwd` says `<root>/sub`.
+				if let Some(dir) = command.dir() {
+					runner.cwd = pi_vfs::normalize_lexically(&runner.cwd.join(dir));
+				}
+				let stdin = match command.take_stdin() {
+					Some(stdin) => stdin,
+					None => match openfile::null()? {
+						OpenFile::File(file) => crate::extras::Fd::File(
+							Arc::try_unwrap(file).map_err(|_| io::Error::other("shared null device"))?,
+						),
+						_ => crate::extras::Fd::Closed,
+					},
+				};
+				Ok::<_, io::Error>((runner, stdin))
+			})();
+			let mut argv: Vec<String> =
+				command.args().iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+			let name = argv.first().cloned().unwrap_or_default();
+			let argv0 = command.presented_argv0().map(|argv0| argv0.to_string_lossy().into_owned());
+			Box::pin(async move {
+				let (runner, stdin) = prepared?;
+				if crate::extras::kind(&name).is_some() {
+					if let (Some(argv0), Some(first)) = (argv0, argv.first_mut()) {
+						*first = argv0;
+					}
+					let mut invocation =
+						crate::extras::Invocation::new(argv, runner.cwd.clone(), pi_vfs::Fs::native());
+					invocation.name = name;
+					invocation.env = runner.env.clone();
+					invocation.stdio = [
+						stdin,
+						crate::extras::Fd::File(runner.stdout.try_clone()?),
+						crate::extras::Fd::File(runner.stderr.try_clone()?),
+					];
+					invocation.commands = Some(Box::new(runner));
+					let code = crate::extras::run(invocation).await;
+					return Ok(CommandStatus::Exited((code & 0xff) as u8));
+				}
+				if let Some(status) = builtin(&runner, &argv)? {
+					return Ok(CommandStatus::Exited(status));
+				}
+				let program = locate(&runner, &name)?;
+				let mut child = std::process::Command::new(program);
+				child
+					.args(&argv[1..])
+					.current_dir(&runner.cwd)
+					.env_clear()
+					.envs(&runner.env)
+					.stdin(match stdin {
+						crate::extras::Fd::File(file) => std::process::Stdio::from(file),
+						_ => std::process::Stdio::null(),
+					})
+					.stdout(runner.stdout.try_clone()?)
+					.stderr(runner.stderr.try_clone()?);
+				#[cfg(unix)]
+				if let Some(argv0) = argv0 {
+					std::os::unix::process::CommandExt::arg0(&mut child, argv0);
+				}
+				let mut child = child.spawn()?;
+				let status = tokio::task::spawn_blocking(move || child.wait())
+					.await
+					.map_err(io::Error::other)??;
+				Ok(CommandStatus::from(status))
+			})
+		}
+	}
+
+	/// Runs the shell builtins a test command line may name; `None` for any
+	/// other name.
+	fn builtin(runner: &TestRunner, argv: &[String]) -> io::Result<Option<u8>> {
+		let mut stdout = &runner.stdout;
+		let mut stderr = &runner.stderr;
+		Ok(Some(match argv.first().map(String::as_str) {
+			Some("echo") => {
+				writeln!(stdout, "{}", argv[1..].join(" "))?;
+				0
+			},
+			Some("true") => 0,
+			Some("false") => 1,
+			Some("pwd") => {
+				writeln!(stdout, "{}", runner.cwd.display())?;
+				0
+			},
+			Some("cd") => {
+				let dir = argv.get(1).map_or_else(|| PathBuf::from("/"), |dir| runner.cwd.join(dir));
+				if dir.is_dir() {
+					0
+				} else {
+					writeln!(stderr, "cd: {}: No such file or directory", argv[1..].join(" "))?;
+					1
+				}
+			},
+			_ => return Ok(None),
+		}))
+	}
+
+	/// The program `name` names: a path when it has a separator, else the
+	/// first executable of that name on the command's `PATH`.
+	fn locate(runner: &TestRunner, name: &str) -> io::Result<PathBuf> {
+		let not_found = || io::Error::new(io::ErrorKind::NotFound, format!("{name}: command not found"));
+		if name.is_empty() {
+			return Err(not_found());
+		}
+		if name.contains('/') || (cfg!(windows) && name.contains('\\')) {
+			let path = runner.cwd.join(name);
+			return match std::fs::metadata(&path) {
+				Ok(metadata) if metadata.is_dir() => Err(io::ErrorKind::PermissionDenied.into()),
+				Ok(_) => Ok(path),
+				Err(error) => Err(error),
+			};
+		}
+		let default = if cfg!(windows) { "" } else { "/usr/bin:/bin" };
+		let path = runner.env.get("PATH").map_or(default, String::as_str);
+		std::env::split_paths(path)
+			.map(|dir| runner.cwd.join(dir).join(name))
+			.find(|candidate| candidate.is_file())
+			.ok_or_else(not_found)
+	}
+
+	/// An in-memory [`openfile::Stream`]: a cursor over fixed input, or an
 	/// appending writer over a shared buffer that can also record each
 	/// `write` call separately.
 	#[derive(Clone)]
@@ -3936,21 +4067,7 @@ mod testing {
 		}
 	}
 
-	impl openfiles::Stream for MemStream {
-		fn clone_box(&self) -> Box<dyn openfiles::Stream> {
-			Box::new(self.clone())
-		}
-
-		#[cfg(unix)]
-		fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, super::Error> {
-			Err(brush_core::error::ErrorKind::CannotConvertToNativeFd.into())
-		}
-
-		#[cfg(unix)]
-		fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, super::Error> {
-			Err(brush_core::error::ErrorKind::CannotConvertToNativeFd.into())
-		}
-	}
+	impl openfile::Stream for MemStream {}
 
 	mod stdout_policy {
 		use parking_lot::Mutex;
@@ -3963,7 +4080,7 @@ mod testing {
 		#[test]
 		fn line_policy_flushes_completed_lines_immediately() {
 			let buf = Arc::new(Mutex::new(Vec::new()));
-			let stream = OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&buf))));
+			let stream = OpenFile::stream(Box::new(MemStream::writer(Arc::clone(&buf))));
 			let regular_file = Destination::of(&stream).regular_file;
 			let mut out = StreamWriter::new(stream, regular_file);
 			assert!(matches!(out, StreamWriter::Line(_)));
@@ -3984,7 +4101,7 @@ mod testing {
 		#[test]
 		fn line_policy_writes_a_piecewise_line_once() {
 			let writes = Arc::new(Mutex::new(Vec::new()));
-			let stream = OpenFile::Stream(Box::new(MemStream::recording(Arc::clone(&writes))));
+			let stream = OpenFile::stream(Box::new(MemStream::recording(Arc::clone(&writes))));
 			let mut out = StreamWriter::line(stream);
 			write!(out, "{:>6}\t", 1).unwrap();
 			writeln!(out, "{}", "content").unwrap();
@@ -4001,7 +4118,7 @@ mod testing {
 			let (mut host, _) = Host::for_test("cat", "", ".");
 			host.set_test_stdout(OpenFile::from(file));
 			let mut out = host.stdout_writer();
-			assert!(matches!(out, StreamWriter::Block(_)));
+			assert!(matches!(&out, StreamWriter::Shared(shared, ..) if matches!(*shared.lock(), StreamWriter::Block(_))));
 
 			out.write_all(b"hit\n").unwrap();
 			assert_eq!(std::fs::read(&path).unwrap(), b"");
@@ -4029,7 +4146,7 @@ mod testing {
 		fn shared_handles_preserve_write_order() {
 			let buf = Arc::new(Mutex::new(Vec::new()));
 			let inner =
-				StreamWriter::line(OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&buf)))));
+				StreamWriter::line(OpenFile::stream(Box::new(MemStream::writer(Arc::clone(&buf)))));
 			let shared = Arc::new(Mutex::new(inner));
 			let sigpipe = Arc::new(Sigpipe::default());
 			let mut out = StreamWriter::Shared(Arc::clone(&shared), GuardedStream::Stdout, Arc::clone(&sigpipe));
@@ -4178,7 +4295,7 @@ mod testing {
 			let cancel =
 				CommandCancel { flag: Arc::new(AtomicBool::new(false)), token: None, silences: true };
 			let out = async_out_for(
-				OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&buf)))),
+				OpenFile::stream(Box::new(MemStream::writer(Arc::clone(&buf)))),
 				GuardedStream::Stdout,
 				false,
 				&sigpipe,
@@ -4197,12 +4314,10 @@ mod testing {
 		}
 
 		/// Contract: a reader that is gone by the final drain ends the utility
-		/// with the SIGPIPE status, as a program's exit flush of its buffered
-		/// output raises it; what it wrote to its own, live standard error
-		/// before then is still delivered.
+		/// with the SIGPIPE status, and its stderr output is discarded.
 		#[cfg(unix)]
 		#[tokio::test]
-		async fn closed_reader_in_the_final_drain_yields_141() {
+		async fn closed_reader_in_the_final_drain_yields_141_and_silences_stderr() {
 			let (mut host, capture) = Host::for_test_async("chatty", "", "/");
 			let (reader, writer) = std::io::pipe().unwrap();
 			drop(reader);
@@ -4211,7 +4326,7 @@ mod testing {
 			let code = run_caught_async::<Chatty>(Chatty, &mut host).await;
 
 			assert_eq!(code, crate::host::SIGPIPE_EXIT_CODE);
-			assert_eq!(capture.err(), "chatty: note\n");
+			assert_eq!(capture.err(), "");
 		}
 
 		/// Contract: output written once the command is cancelled is dropped,
@@ -4236,6 +4351,69 @@ mod testing {
 
 			assert_eq!(capture.out(), "before\n");
 			assert_eq!(capture.err(), "");
+		}
+	}
+
+	#[cfg(feature = "util.sleep")]
+	mod proc_provider_output {
+		use std::{io, time::Duration};
+
+		use parking_lot::Mutex;
+
+		use crate::{
+			extras::{Fd, Invocation},
+			host::{Arc, run_process},
+			sleep::SleepCommand,
+		};
+
+		/// A provider sink whose async write suspends before storing, so a
+		/// synchronous facade write from the runtime thread would block or panic.
+		#[derive(Debug)]
+		struct YieldingSink(Arc<Mutex<Vec<u8>>>);
+
+		#[async_trait::async_trait]
+		impl pi_vfs::FileHandle for YieldingSink {
+			async fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+				Ok(0)
+			}
+
+			async fn write(&self, buf: &[u8]) -> io::Result<usize> {
+				tokio::task::yield_now().await;
+				self.0.lock().extend_from_slice(buf);
+				Ok(buf.len())
+			}
+
+			async fn seek(&self, _pos: io::SeekFrom) -> io::Result<u64> {
+				Err(io::Error::other("unseekable"))
+			}
+
+			async fn metadata(&self) -> io::Result<pi_vfs::Metadata> {
+				Err(io::Error::other("no metadata"))
+			}
+		}
+
+		/// Contract: a process builtin's diagnostic reaches a provider-backed
+		/// stderr through its async API on a current-thread runtime, keeping its
+		/// bytes and status.
+		#[tokio::test(flavor = "current_thread")]
+		async fn diagnostics_reach_a_yielding_provider_without_blocking_the_runtime() {
+			let stored = Arc::new(Mutex::new(Vec::new()));
+			let mut invocation = Invocation::new(
+				vec!["sleep".into(), "soon".into()],
+				std::env::temp_dir(),
+				pi_vfs::Fs::native(),
+			);
+			invocation.stdio[2] = Fd::Vfs(pi_vfs::File::from_handle(YieldingSink(Arc::clone(&stored))));
+
+			let code = tokio::time::timeout(Duration::from_secs(10), run_process::<SleepCommand>(invocation))
+				.await
+				.expect("process builtin must not block the runtime");
+
+			assert_eq!(code, 1);
+			assert_eq!(
+				String::from_utf8_lossy(stored.lock().as_slice()),
+				"sleep: invalid time interval 'soon'\n"
+			);
 		}
 	}
 
@@ -4369,7 +4547,7 @@ mod testing {
 
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{Capture, run_async_util, run_script, run_util};
+pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
 

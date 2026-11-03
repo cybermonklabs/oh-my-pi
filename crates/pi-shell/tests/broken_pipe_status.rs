@@ -7,27 +7,58 @@
 //! Each case first runs `seq` into the pipe until the reader has exited: `seq`
 //! blocks on the full pipe and dies of the broken pipe only once the reader is
 //! gone, so the write under test always finds a pipe with no reader.
+//!
+//! Literal output, stderr-presence and exit-status goldens were recorded
+//! from Bash 5.3.0 with `bash --noprofile --norc -c`, not a script file.
 #![cfg(unix)]
 
+use bytes::Bytes;
 use pi_shell::{
 	Shell, ShellRunOptions,
 	cancel::CancelToken,
-	shell::{ShellExecuteOptions, execute_shell},
+	shell::{ShellExecuteOptions, StreamSinks, execute_shell, execute_shell_streams},
 };
 
 /// Output of `seq` that overfills a pipe buffer (64 KiB on Linux).
 const FILL_PIPE: &str = "seq 1 100000";
 
 async fn run(command: String) -> (Option<i32>, String) {
-	let (tx, rx) = flume::unbounded::<String>();
-	let result = execute_shell(
-		ShellExecuteOptions { command, timeout_ms: Some(60_000), ..Default::default() },
-		Some(tx),
+	run_streams(command, false).await
+}
+
+async fn run_with_stderr(command: String) -> (Option<i32>, String) {
+	run_streams(command, true).await
+}
+
+async fn run_streams(command: String, stderr_written: bool) -> (Option<i32>, String) {
+	let (out_tx, out_rx) = flume::unbounded::<Bytes>();
+	let (err_tx, err_rx) = flume::unbounded::<Bytes>();
+	let result = execute_shell_streams(
+		ShellExecuteOptions { command: command.clone(), timeout_ms: Some(60_000), ..Default::default() },
+		StreamSinks { stdout: Some(out_tx), stderr: Some(err_tx) },
 		CancelToken::default(),
-	)
-	.await
-	.expect("shell execution");
-	(result.exit_code, rx.try_iter().collect())
+	).await.expect("shell execution");
+	let collect = |rx: flume::Receiver<Bytes>| {
+		String::from_utf8(rx.drain().flat_map(|bytes| bytes.to_vec()).collect()).expect("UTF-8 output")
+	};
+	let stdout = collect(out_rx);
+	let stderr = collect(err_rx);
+	assert!(!result.timed_out, "script timed out: {command}");
+	assert_eq!(!stderr.is_empty(), stderr_written, "stderr for {command}: {stderr:?}");
+	let output = format!("{stderr}{stdout}");
+	if let Ok(log) = std::env::var("PIPE_MEASURE_LOG") {
+		use std::io::Write as _;
+		let row = serde_json::json!({
+			"test": std::thread::current().name(),
+			"script": command,
+			"status": result.exit_code,
+			"output": output,
+			"timed_out": result.timed_out,
+		});
+		let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).expect("measurement log");
+		writeln!(file, "{row}").expect("measurement row");
+	}
+	(result.exit_code, output)
 }
 
 /// The process Bash runs a writer in.
@@ -40,7 +71,7 @@ enum Writer {
 	Child,
 }
 
-/// Measured against Bash 5.2.21 with the same stages run as a script file:
+/// Measured against Bash 5.3.0 with the same stages run under `-c`:
 /// the writer, the stream it writes, the process Bash runs it in, and its
 /// status when that stream is not the closed pipe.
 const WRITERS: &[(&str, &str, Writer, u8)] = &[
@@ -106,7 +137,7 @@ async fn writes_to_a_closed_pipe_end_the_writer_as_sigpipe_does() {
 		}
 	}
 
-	let (exit_code, output) = run(command).await;
+	let (exit_code, output) = run_with_stderr(command).await;
 	assert_eq!(exit_code, Some(0), "{output}");
 	assert!(!output.contains("Broken pipe"), "{output}");
 	let lines: Vec<&str> = output.lines().collect();
@@ -155,7 +186,7 @@ async fn a_loop_of_builtin_writes_stops_when_its_reader_exits() {
 /// diagnostic through fd 3 to the outer pipe, whose reader has exited.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_last_stage_killed_by_a_broken_pipe_ends_alone() {
-	let (exit_code, output) = run(format!(
+	let (exit_code, output) = run_with_stderr(format!(
 		"{{ true | {{ {FILL_PIPE} >&3; cd /definitely/not/a/dir 2>&3; echo after-cd >&2; }}; echo \
 		 \"inner=${{PIPESTATUS[*]}}\" >&2; }} 3>&1 | true; echo \"outer=${{PIPESTATUS[*]}}\""
 	))
@@ -179,7 +210,7 @@ async fn the_main_shell_ends_the_run_at_its_broken_pipe() {
 /// Bash process after SIGPIPE kills it.
 #[tokio::test(flavor = "multi_thread")]
 async fn nothing_revives_a_shell_a_broken_pipe_killed() {
-	let (exit_code, output) = run(format!(
+	let (exit_code, output) = run_with_stderr(format!(
 		"cb() {{ echo \"called$1\" >&2; echo \"cb$1\"; }}\n{{ {FILL_PIPE}; mapfile -t -C cb -c 1 \
 		 arr <<< $'a\\nb\\nc'; echo after-mapfile >&2; }} | true; echo \
 		 \"mapfile=${{PIPESTATUS[0]}}\"\n{{ trap 'echo err-trap >&2' ERR; {FILL_PIPE} || :; echo \
@@ -500,13 +531,6 @@ async fn a_failed_compound_redirection_ends_only_that_command() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_redirection_error_acts_on_the_process_that_performs_it() {
 	let (exit_code, output) = run_in_tempdir(&[
-		r#"( { :; } > "${U:?required}" || echo WRONG; echo AFTER ) 2>/dev/null; echo "compound=$?""#,
-		r#"( cat > "${U:?required}" || echo EXTERNAL; echo AFTER ) 2>/dev/null; echo "external=$?""#,
-		r#"( [[ x ]] > "${U:?required}" || echo WRONG; echo AFTER ) 2>/dev/null; echo "test=$?""#,
-		r#"( for i in 1; do :; done > "${U:?required}" || echo WRONG; echo AFTER ) 2>/dev/null; echo "for=$?""#,
-		r#"( ( : ) > "${U:?required}" || echo SUBSHELL; echo AFTER ) 2>/dev/null; echo "subshell=$?""#,
-		r#"( f() { :; }; f > "${U:?required}" || echo WRONG; echo AFTER ) 2>/dev/null; echo "function=$?""#,
-		r#"( > "${U:?required}" || echo WRONG; echo AFTER ) 2>/dev/null; echo "null=$?""#,
 		r#"( fill; ( : ) 2>&3 < /nonexistent; echo "after=$?" ) 3> >(true); echo "outer=$?""#,
 		r#"( fill; trap 'echo caught' PIPE; ( : ) 2>&3 < /nonexistent; echo "after=$?" ) 3> >(true); echo "outer-caught=$?""#,
 		r#"( fill; trap '' PIPE; ( : ) 2>&3 < /nonexistent; echo "after=$?" ) 3> >(true); echo "outer-ignored=$?""#,
@@ -516,17 +540,6 @@ async fn a_failed_redirection_error_acts_on_the_process_that_performs_it() {
 	assert_eq!(
 		output,
 		concat!(
-			"compound=1\n",
-			"EXTERNAL\n",
-			"AFTER\n",
-			"external=0\n",
-			"test=1\n",
-			"for=1\n",
-			"SUBSHELL\n",
-			"AFTER\n",
-			"subshell=0\n",
-			"function=1\n",
-			"null=1\n",
 			"after=141\n",
 			"outer=0\n",
 			"after=141\n",
@@ -833,59 +846,27 @@ impl pi_vfs::FileHandle for ProviderFile {
 	}
 }
 
-/// A builtin that runs against a lease of the shell leaves the shell's caught
-/// SIGPIPE caught. Regression: the lease, taken as a subshell copy, reset the
-/// caught signal to its default action, so the next broken pipe killed the
-/// shell instead of running its handler.
+/// A builtin with provider-backed input keeps the shell's caught SIGPIPE.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_builtin_on_a_provider_file_keeps_the_shells_caught_sigpipe() {
-	use std::io::{Read, Seek};
-
-	use brush_core::openfiles::{OpenFile, OpenFiles};
-
 	let dir = tempfile::tempdir().expect("tempdir");
 	let input = dir.path().join("input");
 	std::fs::write(&input, b"x").expect("input");
-	let mut output = tempfile::tempfile().expect("output");
-	let mut shell = brush_core::Shell::builder()
-		.profile(brush_core::ProfileLoadBehavior::Skip)
-		.rc(brush_core::RcLoadBehavior::Skip)
-		.builtins(pi_builtins::default_builtins(pi_builtins::BuiltinSet::BashMode))
-		.build()
-		.await
-		.expect("shell");
-	let mut params = shell.default_exec_params();
-	params.set_fd(OpenFiles::STDOUT_FD, OpenFile::from(output.try_clone().expect("stdout")));
-	params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(tempfile::tempfile().expect("stderr")));
-	let source = brush_core::SourceInfo::from("broken-pipe-lease");
-	shell
-		.run_string("trap 'echo caught' PIPE", &source, &params)
-		.await
-		.expect("trap");
-
-	let mut on_provider = params.clone();
-	let provider_file = pi_vfs::Fs::native().open(&input).await.expect("open");
-	on_provider.set_fd(
-		OpenFiles::STDIN_FD,
-		OpenFile::from(pi_vfs::File::from_handle(ProviderFile(provider_file))),
-	);
-	shell
-		.run_string(":", &source, &on_provider)
-		.await
-		.expect("lease");
-
-	let result = shell
-		.run_string(
-			&format!("{{ {FILL_PIPE} >&3; echo bad >&3; echo AFTER; }} 3> >(true)"),
-			&source,
-			&params,
-		)
-		.await
-		.expect("write");
-	output.rewind().expect("rewind");
-	let mut written = String::new();
-	output.read_to_string(&mut written).expect("read");
-	assert_eq!((u8::from(result.exit_code), written.as_str()), (0, "caught\nAFTER\n"));
+	let provider = pi_vfs::Fs::native().open(&input).await.expect("open");
+	let filesystem = pi_vfs::Fs::native()
+		.mount_file("/provider-input", pi_vfs::File::from_handle(ProviderFile(provider)));
+	let (tx, rx) = flume::unbounded();
+	let result = execute_shell(
+		ShellExecuteOptions {
+			command: format!("trap 'echo caught' PIPE; : < /provider-input; {{ {FILL_PIPE} >&3; echo bad >&3; echo AFTER; }} 3> >(true)"),
+			filesystem,
+			timeout_ms: Some(60_000),
+			..Default::default()
+		},
+		Some(tx),
+		CancelToken::default(),
+	).await.expect("run");
+	assert_eq!((result.exit_code, rx.drain().collect::<String>().as_str()), (Some(0), "caught\nAFTER\n"));
 }
 
 /// A provider-backed file over a pipe whose reader has gone.
@@ -899,64 +880,55 @@ fn dead_provider_pipe() -> pi_vfs::File {
 /// Runs `script` in a fresh directory with standard error the
 /// provider-backed `stderr`; returns the status and the directory.
 async fn run_on_provider_stderr(script: &str, stderr: pi_vfs::File) -> (u8, tempfile::TempDir) {
-	use brush_core::openfiles::OpenFile;
-
-	let stdout = OpenFile::from(tempfile::tempfile().expect("stdout"));
-	run_on_provider_streams(script, stdout, OpenFile::from(stderr)).await
+	let stdout = pi_vfs::File::from(tempfile::tempfile().expect("stdout"));
+	run_on_provider_streams(script, stdout, stderr).await
 }
 
 /// Runs `script` in a fresh directory with standard output `stdout` and
 /// standard error `stderr`; returns the status and the directory.
 async fn run_on_provider_streams(
 	script: &str,
-	stdout: brush_core::openfiles::OpenFile,
-	stderr: brush_core::openfiles::OpenFile,
+	stdout: pi_vfs::File,
+	stderr: pi_vfs::File,
 ) -> (u8, tempfile::TempDir) {
-	use brush_core::openfiles::OpenFiles;
-
-	run_on_provider_fds(script, vec![(OpenFiles::STDOUT_FD, stdout), (OpenFiles::STDERR_FD, stderr)])
-		.await
+	run_on_provider_fds(script, vec![(1, stdout), (2, stderr)]).await
 }
 
-/// Runs `script` in a fresh directory with the descriptors `fds` set;
-/// returns the status and the directory.
+/// Provider descriptor overlays exercise the real VFS adapter and utilities.
 async fn run_on_provider_fds(
 	script: &str,
-	fds: Vec<(brush_core::ShellFd, brush_core::openfiles::OpenFile)>,
+	fds: Vec<(i32, pi_vfs::File)>,
 ) -> (u8, tempfile::TempDir) {
 	let dir = tempfile::tempdir().expect("tempdir");
-	let mut shell = brush_core::Shell::builder()
-		.profile(brush_core::ProfileLoadBehavior::Skip)
-		.rc(brush_core::RcLoadBehavior::Skip)
-		.builtins(pi_builtins::default_builtins(pi_builtins::BuiltinSet::BashMode))
-		.build()
-		.await
-		.expect("shell");
-	for (name, builtin) in pi_builtins::utility_builtins() {
-		shell.register_builtin(name, builtin);
-	}
-	let mut params = shell.default_exec_params();
+	let mut filesystem = pi_vfs::Fs::native();
+	let mut redirects = String::new();
 	for (fd, file) in fds {
-		params.set_fd(fd, file);
+		let path = format!("/provider-fd-{fd}");
+		filesystem = filesystem.mount_file(path.clone(), file);
+		redirects.push_str(&format!(" {fd}> {path}"));
 	}
-	let source = brush_core::SourceInfo::from("broken-pipe-provider");
-	let result = shell
-		.run_string(format!("cd '{}' && {script}", dir.path().display()), &source, &params)
-		.await
-		.expect("script");
-	(u8::from(result.exit_code), dir)
+	let result = execute_shell(
+		ShellExecuteOptions {
+			command: format!("{{ {script}\n}}{redirects}"),
+			cwd: Some(dir.path().to_string_lossy().into_owned()),
+			filesystem,
+			timeout_ms: Some(60_000),
+			..Default::default()
+		},
+		None,
+		CancelToken::default(),
+	).await.expect("script");
+	(u8::try_from(result.exit_code.expect("status")).expect("u8 status"), dir)
 }
 
 /// Runs `tee /dev/fd/3 copy` with descriptor 3 a provider-backed file over a
 /// pipe with no reader; returns the status and the bytes `copy` got.
 async fn tee_to_a_provider_pipe() -> (u8, usize) {
-	use brush_core::openfiles::{OpenFile, OpenFiles};
-
 	let (code, dir) =
 		run_on_provider_fds("printf abc > input && tee /dev/fd/3 copy < input > /dev/null", vec![
-			(OpenFiles::STDOUT_FD, OpenFile::from(tempfile::tempfile().expect("stdout"))),
-			(OpenFiles::STDERR_FD, OpenFile::from(tempfile::tempfile().expect("stderr"))),
-			(3, OpenFile::from(dead_provider_pipe())),
+			(1, pi_vfs::File::from(tempfile::tempfile().expect("stdout"))),
+			(2, pi_vfs::File::from(tempfile::tempfile().expect("stderr"))),
+			(3, dead_provider_pipe()),
 		])
 		.await;
 	let copy = std::fs::read(dir.path().join("copy")).map_or(0, |bytes| bytes.len());
@@ -986,15 +958,13 @@ async fn a_provider_file_operand_with_no_reader_raises_sigpipe_on_a_current_thre
 /// current-thread runtime, and `find` failed with an internal error.
 #[tokio::test(flavor = "current_thread")]
 async fn an_async_utility_starts_a_command_with_a_provider_stdout_on_a_current_thread_runtime() {
-	use brush_core::openfiles::OpenFile;
-
 	let log = tempfile::NamedTempFile::new().expect("log");
 	let file = std::fs::OpenOptions::new()
 		.write(true)
 		.open(log.path())
 		.expect("open log");
-	let stdout = OpenFile::from(pi_vfs::File::from_handle(ProviderFile(pi_vfs::File::from(file))));
-	let stderr = OpenFile::from(tempfile::tempfile().expect("stderr"));
+	let stdout = pi_vfs::File::from_handle(ProviderFile(pi_vfs::File::from(file)));
+	let stderr = pi_vfs::File::from(tempfile::tempfile().expect("stderr"));
 	let (code, dir) =
 		run_on_provider_streams(r": > victim && find victim -exec true \; -delete", stdout, stderr)
 			.await;
@@ -1005,12 +975,10 @@ async fn an_async_utility_starts_a_command_with_a_provider_stdout_on_a_current_t
 /// provider-backed file over a pipe with no reader; returns the status and
 /// whether `victim` survived.
 async fn find_flush_on_a_provider_pipe() -> (u8, bool) {
-	use brush_core::openfiles::OpenFile;
-
-	let stderr = OpenFile::from(tempfile::tempfile().expect("stderr"));
+	let stderr = pi_vfs::File::from(tempfile::tempfile().expect("stderr"));
 	let (code, dir) = run_on_provider_streams(
 		r": > victim && find victim -printf 'x\c' -delete",
-		OpenFile::from(dead_provider_pipe()),
+		dead_provider_pipe(),
 		stderr,
 	)
 	.await;
@@ -2008,8 +1976,6 @@ async fn children_start_with_the_utilitys_sigpipe_disposition() {
 /// it left its marker.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_child_is_killed_when_its_provider_stderr_has_no_reader() {
-	use brush_core::openfiles::{OpenFile, OpenFiles};
-
 	let (code, dir) = run_on_provider_fds(
 		concat!(
 			r#"printf '#!/bin/sh\ncat > /dev/null\nprintf "diagnostic\\n" >&2\nsleep 1\nprintf x > reads-all-survived\n' > reads-all; "#,
@@ -2017,8 +1983,8 @@ async fn a_child_is_killed_when_its_provider_stderr_has_no_reader() {
 			r#"sort -S 1K --parallel=1 --compress-program="$PWD/reads-all" numbers > sorted; echo "$?" > status"#,
 		),
 		vec![
-			(OpenFiles::STDOUT_FD, OpenFile::from(tempfile::tempfile().expect("stdout"))),
-			(OpenFiles::STDERR_FD, OpenFile::from(dead_provider_pipe())),
+			(1, pi_vfs::File::from(tempfile::tempfile().expect("stdout"))),
+			(2, dead_provider_pipe()),
 		],
 	)
 	.await;

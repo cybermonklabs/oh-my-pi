@@ -93,6 +93,7 @@ pub mod matchers {
 					Ok(()) => true,
 					Err(e) => {
 						matcher_io.set_exit_code(1);
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to delete {path_str}: {e}");
 						false
 					},
@@ -131,6 +132,7 @@ pub mod matchers {
 					match file_info.metadata().await {
 						Ok(meta) => meta.len() == 0,
 						Err(err) => {
+							matcher_io.flush_stdout().await;
 							let _ = writeln!(
 								&mut matcher_io.host().stderr,
 								"Error getting size for {}: {}",
@@ -144,6 +146,7 @@ pub mod matchers {
 					match file_info.fs().read_dir(file_info.path()).await {
 						Ok(mut it) => it.next().is_none(),
 						Err(err) => {
+							matcher_io.flush_stdout().await;
 							let _ = writeln!(
 								&mut matcher_io.host().stderr,
 								"Error getting contents of {}: {}",
@@ -599,15 +602,11 @@ pub mod matchers {
 				}
 				// The child writes to the shared fd directly: flush what find
 				// printed so far so its output stays in order.
-				let _ = matcher_io
-					.deps
-					.get_output()
-					.lock()
-					.unwrap_or_else(PoisonError::into_inner)
-					.flush();
+				matcher_io.flush_stdout().await;
 				match matcher_io.host().run_command_async(command).await {
 					Ok(status) => status.success(),
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e);
 						false
 					},
@@ -664,12 +663,7 @@ pub mod matchers {
 				}
 				// The child writes to the shared fd directly: flush what find
 				// printed so far so its output stays in order.
-				let _ = matcher_io
-					.deps
-					.get_output()
-					.lock()
-					.unwrap_or_else(PoisonError::into_inner)
-					.flush();
+				matcher_io.flush_stdout().await;
 				match matcher_io.host().run_command_async(shell_command).await {
 					Ok(status) => {
 						if !status.success() {
@@ -677,7 +671,9 @@ pub mod matchers {
 						}
 					},
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e);
+						matcher_io.host().deliver_owed_output().await;
 						matcher_io.set_exit_code(1);
 					},
 				}
@@ -719,6 +715,7 @@ pub mod matchers {
 							.map_err(|err| err.to_string())
 					};
 					if let Err(e) = fitted {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Cannot fit a single argument {}: {}",
@@ -874,6 +871,7 @@ pub mod matchers {
 				match self.file_system_type(file_info).await {
 					Ok(result) => result == self.fs_text,
 					Err(_) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting filesystem type for {}",
@@ -1166,6 +1164,7 @@ pub mod matchers {
 					// If it's not a symlink, then it's not an error that should be
 					// shown.
 					if err.kind() != std::io::ErrorKind::InvalidInput {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error reading target of {}: {}",
@@ -1723,6 +1722,7 @@ pub mod matchers {
 				let metadata = match file_info.metadata().await {
 					Ok(metadata) => metadata,
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting metadata for {}: {}",
@@ -1770,14 +1770,14 @@ pub mod matchers {
 					last_modified,
 					path,
 				);
-				// GNU's `list_file` writes the line in short `printf`s, `fputs`
-				// and `putc`s and the name in one `printf`, which glibc buffers
-				// as one `printf` of the whole line.
+				// GNU list_file's short formatting calls have the same buffering
+				// boundary as one printf of the completed line.
 				let calls = [StdioCall::Printf(line.len())];
 				match write_output(matcher_io.deps, self.output_file.as_ref(), line.as_bytes(), &calls).await {
 					Ok(()) => {},
 					Err(e) => {
 						if print_error_message {
+							matcher_io.flush_stdout().await;
 							let _ = writeln!(
 								&mut matcher_io.host().stderr,
 								"Error writing {:?} for {}",
@@ -2014,6 +2014,7 @@ pub mod matchers {
 				match file_info.metadata().await {
 					Ok(metadata) => self.check(metadata),
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting permissions for {}: {}",
@@ -2027,6 +2028,7 @@ pub mod matchers {
 
 			#[cfg(not(unix))]
 			async fn matches(&self, _dummy_file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
+				matcher_io.flush_stdout().await;
 				let _ = writeln!(&mut matcher_io.host().stderr, "Permission matching not available on this platform!");
 				return false;
 			}
@@ -2070,17 +2072,16 @@ pub mod matchers {
 
 			async fn print(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO<'_>) {
 				let text = format!("{}{}", file_info.display_path().display(), self.delimiter);
-				// GNU's `-print` is `fprintf ("%s\n")`; `-print0` is `fputs` and
-				// `putc (0)`.
-				let calls = match self.delimiter {
-					PrintDelimiter::Newline => vec![StdioCall::Printf(text.len())],
-					PrintDelimiter::Null => vec![StdioCall::Write(text.len() - 1), StdioCall::Write(1)],
+				// -print uses fprintf; -print0 uses fputs followed by putc(0).
+				let calls: &[StdioCall] = match self.delimiter {
+					PrintDelimiter::Newline => &[StdioCall::Printf(text.len())],
+					PrintDelimiter::Null => &[StdioCall::Write(text.len() - 1), StdioCall::Write(1)],
 				};
-				match write_output(matcher_io.deps, self.output_file.as_ref(), text.as_bytes(), &calls).await
-				{
+				match write_output(matcher_io.deps, self.output_file.as_ref(), text.as_bytes(), calls).await {
 					Ok(()) => {},
 					Err(e) => {
 						if self.output_file.is_some() {
+							matcher_io.flush_stdout().await;
 							let _ = writeln!(
 								&mut matcher_io.host().stderr,
 								"Error writing {:?} for {}",
@@ -2245,12 +2246,9 @@ pub mod matchers {
 		#[derive(Debug, PartialEq, Eq)]
 		enum FormatComponent {
 			Literal(String),
-			/// Literal text that ends one of GNU find's plain segments (an
-			/// escape, `%%`, an unknown directive): GNU writes the segment's
-			/// text up to and with it in one `fwrite`.
+			/// An escape or %% ends a literal segment written with fwrite.
 			SegmentEnd(String),
-			/// `\c`: the text before it is written with one `fwrite`, then
-			/// flushed, and the rest of the format is ignored, as in GNU find.
+			/// Writes the preceding literal, flushes, and discards the remaining format.
 			Flush,
 			Directive { directive: FormatDirective, width: Option<usize>, justify: Justify },
 		}
@@ -2445,7 +2443,6 @@ pub mod matchers {
 						'%' => self.parse_format_specifier()?,
 						_ => panic!("{}", "Stopped at unexpected character: {self.string}"),
 					};
-					// GNU find ignores the format after `\c`.
 					if component == FormatComponent::Flush {
 						components.push(component);
 						return Ok(FormatString { components });
@@ -2710,90 +2707,104 @@ pub mod matchers {
 			fs_cache:    fs::Cache,
 		}
 
-		/// Why [`Printf::print`] stopped a line.
-		enum PrintError {
-			/// A directive could not be rendered.
-			Directive(DynError),
-			/// The output rejected a write.
-			Write(io::Error),
-		}
-
-		impl From<io::Error> for PrintError {
-			fn from(error: io::Error) -> Self {
-				Self::Write(error)
-			}
-		}
-
 		impl Printf {
 			pub fn new(format: &str, output_file: Option<OutputFile>) -> Result<Self, Box<dyn Error>> {
 				Ok(Self { format: FormatString::parse(format)?, output_file, fs_cache: fs::Cache::default() })
 			}
 
-			/// Prints the format for `file_info`; a directive that cannot be
-			/// rendered or a write that fails stops the line and is returned for
-			/// the caller to report.
-			///
-			/// The output goes out as GNU find's stdio calls for the format's
-			/// segments: one `printf` per directive, with the literal text before
-			/// it; one `fwrite` per segment that an escape or `%%` ends, and for
-			/// the text after the last directive; `\c` writes the text before it
-			/// and flushes.
+			/// Checks each GNU stdio call separately. With SIGPIPE ignored, a
+			/// failed segment reports its error and the remaining segments run.
+			async fn print_segment(
+				&self,
+				file_info: &WalkEntry,
+				matcher_io: &mut MatcherIO<'_>,
+				bytes: &[u8],
+				call: StdioCall,
+			) -> bool {
+				let result = write_output(matcher_io.deps, self.output_file.as_ref(), bytes, &[call]).await;
+				matcher_io.host().deliver_owed_output().await;
+				if matcher_io.host().sigpipe_killed() {
+					return false;
+				}
+				let error = result.err().or_else(|| {
+					(self.output_file.is_none()
+						&& (call.len() > 0 || call == StdioCall::Flush)
+						&& matcher_io.deps.stdout_failed())
+					.then(|| io::ErrorKind::BrokenPipe.into())
+				});
+				if let Some(error) = error {
+					matcher_io.flush_stdout().await;
+					let _ = writeln!(
+						matcher_io.host().stderr,
+						"Error writing {:?} for {}",
+						file_info.display_path().to_string_lossy(),
+						error
+					);
+					matcher_io.set_exit_code(1);
+					matcher_io.host().deliver_owed_output().await;
+				}
+				!matcher_io.host().sigpipe_killed()
+			}
+
+			/// Literal segments use fwrite; each directive and its preceding
+			/// literal use printf, preserving their different write boundaries.
 			async fn print(
 				&self,
 				file_info: &WalkEntry,
 				matcher_io: &mut MatcherIO<'_>,
-			) -> Result<(), PrintError> {
-				let deps = matcher_io.deps;
-				let file = self.output_file.as_ref();
-				let mut buffer: Vec<u8> = Vec::new();
-				let mut calls = Vec::new();
-				// Bytes of the current segment's literal text.
-				let mut literal = 0;
-				let end_literal = |calls: &mut Vec<StdioCall>, literal: &mut usize| {
-					if *literal > 0 {
-						calls.push(StdioCall::Write(std::mem::take(literal)));
-					}
-				};
+			) -> Result<(), DynError> {
+				let mut buffer = Vec::new();
 				for component in &self.format.components {
-					match component {
+					let call = match component {
 						FormatComponent::Literal(text) => {
 							buffer.extend_from_slice(text.as_bytes());
-							literal += text.len();
+							continue;
 						},
 						FormatComponent::SegmentEnd(text) => {
 							buffer.extend_from_slice(text.as_bytes());
-							literal += text.len();
-							end_literal(&mut calls, &mut literal);
+							StdioCall::Write(buffer.len())
 						},
 						FormatComponent::Flush => {
-							end_literal(&mut calls, &mut literal);
-							calls.push(StdioCall::Flush);
+							if !buffer.is_empty()
+								&& !self.print_segment(file_info, matcher_io, &buffer, StdioCall::Write(buffer.len())).await
+							{
+								return Ok(());
+							}
+							buffer.clear();
+							StdioCall::Flush
 						},
 						FormatComponent::Directive { directive, width, justify } => {
 							match format_directive(file_info, directive, &self.fs_cache).await {
 								Ok(content) => {
-									let text = if let Some(width) = width {
+									if let Some(width) = width {
 										match justify {
-											Justify::Left => format!("{content:<width$}"),
-											Justify::Right => format!("{content:>width$}"),
+											Justify::Left => write!(buffer, "{content:<width$}").unwrap(),
+											Justify::Right => write!(buffer, "{content:>width$}").unwrap(),
 										}
 									} else {
-										content.into_owned()
-									};
-									buffer.extend_from_slice(text.as_bytes());
-									calls.push(StdioCall::Printf(std::mem::take(&mut literal) + text.len()));
+										buffer.extend_from_slice(content.as_bytes());
+									}
+									StdioCall::Printf(buffer.len())
 								},
-								Err(e) => {
-									end_literal(&mut calls, &mut literal);
-									write_output(deps, file, &buffer, &calls).await?;
-									return Err(PrintError::Directive(e));
+								Err(error) => {
+									if !buffer.is_empty()
+										&& !self.print_segment(file_info, matcher_io, &buffer, StdioCall::Write(buffer.len())).await
+									{
+										return Ok(());
+									}
+									return Err(error);
 								},
 							}
 						},
+					};
+					if !self.print_segment(file_info, matcher_io, &buffer, call).await {
+						return Ok(());
 					}
+					buffer.clear();
 				}
-				end_literal(&mut calls, &mut literal);
-				write_output(deps, file, &buffer, &calls).await?;
+				if !buffer.is_empty() {
+					self.print_segment(file_info, matcher_io, &buffer, StdioCall::Write(buffer.len())).await;
+				}
 				Ok(())
 			}
 		}
@@ -2801,31 +2812,15 @@ pub mod matchers {
 		#[async_trait::async_trait]
 		impl Matcher for Printf {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
-				let printed = self.print(file_info, matcher_io).await;
-				match printed {
-					Ok(()) => {},
-					Err(PrintError::Directive(e)) => {
-						let _ = writeln!(
-							matcher_io.host().stderr,
-							"Error processing '{}': {}",
-							file_info.path().display(),
-							e
-						);
-					},
-					// As with `-print`, a failed stdout write is left to the host's
-					// stream guard (a closed reader stops the walk); a failed
-					// `-fprintf` file is reported and fails the run.
-					Err(PrintError::Write(e)) => {
-						if self.output_file.is_some() {
-							let _ = writeln!(
-								matcher_io.host().stderr,
-								"Error writing {:?} for {}",
-								file_info.display_path().to_string_lossy(),
-								e
-							);
-							matcher_io.set_exit_code(1);
-						}
-					},
+				if let Err(error) = self.print(file_info, matcher_io).await {
+					matcher_io.flush_stdout().await;
+					let _ = writeln!(
+						matcher_io.host().stderr,
+						"Error processing '{}': {}",
+						file_info.path().display(),
+						error
+					);
+					matcher_io.set_exit_code(1);
 				}
 
 				true
@@ -3179,6 +3174,7 @@ pub mod matchers {
 				match file_info.metadata().await {
 					Ok(metadata) => self.check(metadata),
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting file size for {}: {}",
@@ -3329,8 +3325,10 @@ pub mod matchers {
 		#[async_trait::async_trait]
 		impl Matcher for NewerMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
-				match self.matches_impl(file_info).await {
+				let matched = self.matches_impl(file_info).await.map_err(|error| error.to_string());
+				match matched {
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting modification time for {}: {}",
@@ -3416,8 +3414,10 @@ pub mod matchers {
 		#[async_trait::async_trait]
 		impl Matcher for NewerOptionMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
-				match self.matches_impl(file_info).await {
+				let matched = self.matches_impl(file_info).await.map_err(|error| error.to_string());
+				match matched {
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting {:?} time for {}: {}",
@@ -3465,8 +3465,10 @@ pub mod matchers {
 		#[async_trait::async_trait]
 		impl Matcher for NewerTimeMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
-				match self.matches_impl(file_info).await {
+				let matched = self.matches_impl(file_info).await.map_err(|error| error.to_string());
+				match matched {
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting {:?} time for {}: {}",
@@ -3510,8 +3512,10 @@ pub mod matchers {
 		impl Matcher for FileTimeMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				let start_time = get_time(matcher_io, self.today_start);
-				match self.matches_impl(file_info, start_time).await {
+				let matched = self.matches_impl(file_info, start_time).await.map_err(|error| error.to_string());
+				match matched {
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting {:?} time for {}: {}",
@@ -3581,8 +3585,10 @@ pub mod matchers {
 		impl Matcher for FileAgeRangeMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				let start_time = get_time(matcher_io, self.today_start);
-				match self.matches_impl(file_info, start_time).await {
+				let matched = self.matches_impl(file_info, start_time).await.map_err(|error| error.to_string());
+				match matched {
 					Err(e) => {
+						matcher_io.flush_stdout().await;
 						let _ = writeln!(
 							&mut matcher_io.host().stderr,
 							"Error getting {:?} time for {}: {}",
@@ -3961,6 +3967,11 @@ pub mod matchers {
 			self.host
 		}
 
+		/// gnulib error() flushes standard output before writing a diagnostic.
+		pub async fn flush_stdout(&mut self) {
+			super::flush_stdout(self.deps, self.host).await;
+		}
+
 		pub fn mark_current_dir_to_be_skipped(&mut self) {
 			self.should_skip_dir = true;
 		}
@@ -4039,10 +4050,7 @@ pub mod matchers {
 	}
 
 	impl<'a> dyn Matcher + 'a {
-		/// Evaluates the matcher, answering synchronously when it can. A
-		/// diagnostic the matcher wrote is delivered before anything else runs
-		/// (the next matcher may delete or write a file), as an unbuffered
-		/// write is: one that finds a pipe with no reader kills `find` here.
+		/// Delivers a diagnostic before another matcher can perform a side effect.
 		pub async fn eval(&self, entry: &WalkEntry, matcher_io: &mut MatcherIO<'_>) -> bool {
 			let matched = match self.eval_pure(entry, matcher_io) {
 				Some(matched) => matched,
@@ -4080,34 +4088,29 @@ pub mod matchers {
 		}
 	}
 
-	/// An `-fprint`/`-fprintf`/`-fprint0`/`-fls` output file, buffered as GNU
-	/// find's stdio buffers it (see [`StdioBuffer`]), so a pipe with no reader
-	/// there raises SIGPIPE at the call glibc writes at, and when the search
-	/// ends (see [`OutputFile::close`]).
+	/// A shared, stdio-buffered -fprint/-fprintf/-fprint0/-fls destination.
 	#[derive(Clone)]
 	pub struct OutputFile(Arc<OutputFileInner>);
 
 	struct OutputFileInner {
-		file:     File,
-		/// The stdio buffer glibc gives the file (see
-		/// [`crate::stdio_buffer::file_buffer_size`]).
-		cap:      usize,
+		file: File,
+		identity: Option<pi_vfs::FileId>,
+		cap: usize,
 		buffered: Mutex<(StdioBuffer, Vec<u8>)>,
 	}
 
 	impl OutputFile {
-		pub fn new(file: File) -> Self {
+		fn new(file: File, identity: Option<pi_vfs::FileId>) -> Self {
 			let cap = crate::stdio_buffer::file_buffer_size(&file);
 			Self(Arc::new(OutputFileInner {
 				file,
+				identity,
 				cap,
 				buffered: Mutex::new((StdioBuffer::default(), Vec::new())),
 			}))
 		}
 
-		/// Writes `bytes` through the program's stdio `calls` (their lengths add
-		/// up to it): the bytes each call writes to the descriptor go out now,
-		/// the rest stays buffered.
+		/// Delivers only the bytes each GNU stdio call writes to the descriptor.
 		async fn write(&self, bytes: &[u8], calls: &[StdioCall]) -> io::Result<()> {
 			let mut rest = bytes;
 			for &call in calls {
@@ -4118,70 +4121,102 @@ pub mod matchers {
 					let (model, pending) = &mut *guard;
 					pending.extend_from_slice(call_bytes);
 					let written = model.apply(self.0.cap, call).min(pending.len());
-					pending.drain(..written).collect()
+					if written == pending.len() {
+						std::mem::take(pending)
+					} else {
+						pending.drain(..written).collect()
+					}
 				};
 				if !out.is_empty() {
-					self.0.file.write_all_async(&out).await?;
+					self.0.file.write_all_async(&out).await.map_err(|error| self.discard_failed_call(error))?;
 				}
 				if call == StdioCall::Flush {
-					self.0.file.flush_async().await?;
+					self.0.file.flush_async().await.map_err(|error| self.discard_failed_call(error))?;
 				}
 			}
 			Ok(())
 		}
 
-		/// The file's identity (`st_dev`, `st_ino`), when it is a host file.
-		fn identity(&self) -> Option<(u64, u64)> {
-			#[cfg(unix)]
-			{
-				use std::os::unix::fs::MetadataExt;
-				let metadata = self.0.file.native()?.metadata().ok()?;
-				Some((metadata.dev(), metadata.ino()))
-			}
-			#[cfg(not(unix))]
-			None
+		fn discard_failed_call(&self, error: io::Error) -> io::Error {
+			let mut guard = self.0.buffered.lock().unwrap_or_else(PoisonError::into_inner);
+			let (model, pending) = &mut *guard;
+			// A failed descriptor write empties the FILE buffer; bytes after
+			// that write were not accepted by the failed stdio call.
+			model.apply(self.0.cap, StdioCall::Flush);
+			pending.clear();
+			error
 		}
 
-		/// Writes out the buffer and closes the file, once no other handle
-		/// shares it.
+		fn identity(&self) -> Option<(u64, u64)> {
+			self.0.identity.map(|id| (id.dev(), id.ino()))
+		}
+
 		pub async fn close(self) -> io::Result<()> {
-			self.write(&[], &[StdioCall::Flush]).await?;
-			match Arc::try_unwrap(self.0) {
+			let flushed = self.write(&[], &[StdioCall::Flush]).await;
+			let closed = match Arc::try_unwrap(self.0) {
 				Ok(inner) => inner.file.close_async().await,
 				Err(_) => Ok(()),
-			}
+			};
+			flushed.and(closed)
 		}
 	}
 
-	/// The order GNU find closes its output files in at exit: its `sharefile`
-	/// table, a gnulib hash table of 13 buckets keyed by `(st_dev ^ st_ino) %
-	/// 13`, freed bucket by bucket, each bucket's first file first and then
-	/// the others newest first. A file with no identity (not a host file)
-	/// closes after them, in open order. (gnulib grows the table past ten used
-	/// buckets, which would reorder it; find opens that many output files in
-	/// no realistic command.)
+	/// Reproduces sharefile's gnulib hash_free traversal, including rehashes.
+	/// See [GNU find's sharefile table] and [gnulib's hash table].
+	///
+	/// [GNU find's sharefile table]: https://github.com/gnu-mirror-unofficial/findutils/blob/master/find/sharefile.c
+	/// [gnulib's hash table]: https://github.com/coreutils/gnulib/blob/master/lib/hash.c
 	pub fn gnu_close_order(files: &[(String, OutputFile)]) -> Vec<usize> {
-		const BUCKETS: u64 = 13;
-		let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); BUCKETS as usize];
+		let identities: Vec<_> = files.iter().map(|(_, file)| file.identity()).collect();
+		gnu_file_order(&identities)
+	}
+
+	pub(super) fn gnu_file_order(identities: &[Option<(u64, u64)>]) -> Vec<usize> {
+		// sharefile's candidate 11 is divided by 0.8, truncated, then rounded
+		// up to a prime, giving thirteen initial buckets.
+		let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); 13];
+		let mut used = 0;
 		let mut unknown = Vec::new();
-		for (index, (_, file)) in files.iter().enumerate() {
-			match file.identity() {
-				Some((dev, ino)) => {
-					let bucket = &mut buckets[((dev ^ ino) % BUCKETS) as usize];
-					// gnulib puts a new entry right after the bucket's head.
-					let at = bucket.len().min(1);
-					bucket.insert(at, index);
-				},
-				None => unknown.push(index),
+		for (index, identity) in identities.iter().enumerate() {
+			let Some((dev, ino)) = *identity else {
+				unknown.push(index);
+				continue;
+			};
+			// hash_insert_if_absent grows before insertion, based on occupied
+			// buckets, not entries. gnulib does both sizing steps in float.
+			if used as f32 > 0.8_f32 * buckets.len() as f32 {
+				let candidate = (buckets.len() as f32 * 1.414_f32 * 0.8_f32) as usize;
+				let mut size = ((candidate as f32 / 0.8_f32) as usize).max(10) | 1;
+				while (3..)
+					.step_by(2)
+					.take_while(|divisor| *divisor <= size / *divisor)
+					.any(|divisor| size % divisor == 0)
+				{
+					size += 2;
+				}
+				let old = std::mem::replace(&mut buckets, vec![Vec::new(); size]);
+				used = 0;
+				for bucket in old {
+					let mut entries = bucket.into_iter();
+					let head = entries.next();
+					// transfer_entries moves each overflow chain before its head.
+					for entry in entries.chain(head) {
+						let (dev, ino) = identities[entry].unwrap();
+						let destination = &mut buckets[((dev ^ ino) % size as u64) as usize];
+						used += usize::from(destination.is_empty());
+						destination.insert(destination.len().min(1), entry);
+					}
+				}
 			}
+			let size = buckets.len() as u64;
+			let bucket = &mut buckets[((dev ^ ino) % size) as usize];
+			used += usize::from(bucket.is_empty());
+			bucket.insert(bucket.len().min(1), index);
 		}
 		buckets.into_iter().flatten().chain(unknown).collect()
 	}
 
-	/// Writes `bytes` to `file`, or to find's shared stdout when there is no
-	/// file, as the program's stdio `calls` (their lengths add up to `bytes`'s):
-	/// glibc decides which of them write to the descriptor, where a pipe with
-	/// no reader kills find.
+	/// Writes through GNU find's stdio calls, whose lengths sum to bytes.len().
 	async fn write_output(
 		deps: &dyn Dependencies,
 		file: Option<&OutputFile>,
@@ -4193,8 +4228,6 @@ pub mod matchers {
 			None => {
 				let mut out = deps.get_output().lock().unwrap_or_else(PoisonError::into_inner);
 				out.write_all(bytes)?;
-				// The bytes reach find's stdout buffer now, so a call that writes
-				// to the descriptor delivers them (see `AsyncOut::stdio_calls`).
 				out.flush()?;
 				drop(out);
 				deps.stdout_calls(calls);
@@ -4415,7 +4448,20 @@ pub mod matchers {
 		config: &mut Config,
 		host: &Host,
 	) -> Result<OutputFile, Box<dyn Error>> {
-		let file = OutputFile::new(host.vfs().create(host.resolve(path)).await?);
+		// Like sharefile_fopen, open (and truncate) first, then reuse the
+		// existing stream when the descriptor identifies the same file.
+		let file = host.vfs().create(host.resolve(path)).await?;
+		let identity = file.metadata_async().await.ok().and_then(|metadata| metadata.file_id());
+		if let Some(identity) = identity
+			&& let Some((_, existing)) = config
+				.output_files
+				.iter()
+				.find(|(_, output)| output.0.identity == Some(identity))
+		{
+			file.close_async().await?;
+			return Ok(existing.clone());
+		}
+		let file = OutputFile::new(file, identity);
 		config.output_files.push((path.to_string(), file.clone()));
 		Ok(file)
 	}
@@ -4976,10 +5022,12 @@ pub mod matchers {
 			.collect();
 		// empty starting point checker
 		if string_segments.iter().any(|s| s.is_empty()) {
+			if let Some(flusher) = host.stdout_flusher() {
+				flusher.stdio_calls(&[StdioCall::Flush]);
+			}
+			host.deliver_owed_output().await;
 			let _ = writeln!(host.stderr, "find: invalid zero-length file name");
-			// Delivered before `find` goes on, as an unbuffered write is: one
-			// that finds a pipe with no reader kills it here.
-			let _ = host.flush_output().await;
+			host.deliver_owed_output().await;
 			// remove the empty ones so as to avoid file not found error
 			string_segments.retain(|s| !s.is_empty());
 		}
@@ -4997,10 +5045,9 @@ use std::{
 	time::SystemTime,
 };
 
-use brush_core::{ShellExtensions, builtins::Registration};
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::OsStringValueParser};
 
-use crate::host::{AsyncUtility, Host, async_util, matches_parser};
+use crate::host::{AsyncUtility, Host, matches_parser};
 use matchers::{Follow, WalkEntry};
 
 pub struct Config {
@@ -5048,10 +5095,12 @@ impl Default for Config {
 pub trait Dependencies: Send + Sync {
 	fn get_output(&self) -> &Mutex<dyn Write + Send>;
 	fn now(&self) -> SystemTime;
-	/// The program's stdio `calls` on its standard output, made after their
-	/// bytes were written to [`Dependencies::get_output`] and flushed there
-	/// (see `AsyncOut::stdio_calls`).
+	/// Records stdio calls after their bytes reach get_output().
 	fn stdout_calls(&self, _calls: &[matchers::StdioCall]) {}
+	/// Whether accounted stdout has failed at the descriptor.
+	fn stdout_failed(&self) -> bool {
+		false
+	}
 }
 
 /// Struct that holds the dependencies we use when run as the real executable.
@@ -5065,14 +5114,9 @@ impl StandardDependencies {
 	#[must_use]
 	fn new(host: &Host) -> Self {
 		let flusher = host.stdout_flusher();
-		// find reports its stdio calls (see `matchers::write_output`), so a
-		// pipe with no reader kills it at the call GNU find's write fails at.
 		if flusher.is_some() {
 			host.account_stdout_by_calls();
 		}
-		// Line-buffered on pipes (one write per printed path), block-buffered
-		// for files, and shared with stderr under 2>&1 so diagnostics stay in
-		// order.
 		Self { output: Arc::new(Mutex::new(host.stdout_writer())), now: SystemTime::now(), flusher }
 	}
 }
@@ -5089,9 +5133,20 @@ impl Dependencies for StandardDependencies {
 		}
 	}
 
+	fn stdout_failed(&self) -> bool {
+		self.flusher.as_ref().is_some_and(crate::stdio::AsyncOut::fails)
+	}
+
 	fn now(&self) -> SystemTime {
 		self.now
 	}
+}
+
+/// Flushes stdout as gnulib error() does, before the diagnostic is attempted.
+async fn flush_stdout(deps: &dyn Dependencies, host: &Host) {
+	let _ = deps.get_output().lock().unwrap_or_else(PoisonError::into_inner).flush();
+	deps.stdout_calls(&[matchers::StdioCall::Flush]);
+	host.deliver_owed_output().await;
 }
 
 /// The result of parsing the command-line arguments into useful forms.
@@ -5257,10 +5312,9 @@ async fn process_dir_walk_request(
 	match pi_walker::walk::Tree::new(&layer, resolved_root, &tree_options).await {
 		Err(pi_walker::walk::WalkError::Root { path, error }) => {
 			ret = 1;
+			flush_stdout(deps, host).await;
 			let _ = writeln!(host.stderr, "Error: {}: {error}", path.display());
-			// Delivered before the next operand, as an unbuffered write is: one
-			// that finds a pipe with no reader kills `find` here.
-			let _ = host.flush_output().await;
+			host.deliver_owed_output().await;
 		},
 		Ok(mut tree) => {
 			while let Some(event) = tree.next().await {
@@ -5294,6 +5348,7 @@ async fn process_dir_walk_request(
 					},
 					pi_walker::walk::Event::Error(error) => {
 						ret = 1;
+						flush_stdout(deps, host).await;
 						let _ = writeln!(host.stderr, "Error: {}: {}", error.path.display(), error.error);
 						let _ = host.flush_output().await;
 					},
@@ -5330,21 +5385,22 @@ async fn do_find(
 	host: &mut Host,
 ) -> Result<i32, Box<dyn Error>> {
 	let ParsedInfo { matcher, paths, mut config } = parse_args(args, host).await?;
-	let mut ret = run_find(&*matcher, &paths, &config, deps, host).await;
+	let ret = run_find(&*matcher, &paths, &config, deps, host).await;
 	// The matchers hold the other clones of each output file; release them so
 	// closing the kept clone closes the file and reports write-back errors.
 	drop(matcher);
-	// GNU find closes them in its table's order (see `gnu_close_order`),
-	// before its standard output at exit; one SIGPIPE kills ends the rest
-	// unwritten.
+	// sharefile closes named outputs before stdout, in its hash-table order.
 	let order = matchers::gnu_close_order(&config.output_files);
 	let mut files: Vec<_> = config.output_files.drain(..).map(Some).collect();
 	for index in order {
 		let Some((name, file)) = files[index].take() else { continue };
 		if let Err(error) = file.close().await {
+			flush_stdout(deps, host).await;
 			let _ = writeln!(host.stderr, "find: {name}: {error}");
-			let _ = host.flush_output().await;
-			ret = 1;
+			host.deliver_owed_output().await;
+			// fclose failure is fatal in sharefile's entry_free; do not flush
+			// the remaining named outputs after this error.
+			return Ok(1);
 		}
 	}
 	Ok(ret)
@@ -5518,15 +5574,13 @@ impl AsyncUtility for Find {
 			None => raw,
 		};
 		let deps = StandardDependencies::new(host);
-		let code = match do_find(&args, &deps, host).await {
+		let result = do_find(&args, &deps, host).await.map_err(|error| error.to_string());
+		let code = match result {
 			Ok(code) => code,
 			Err(error) => {
-				let _ = deps
-					.get_output()
-					.lock()
-					.unwrap_or_else(PoisonError::into_inner)
-					.flush();
+				flush_stdout(&deps, host).await;
 				let _ = writeln!(host.stderr, "Error: {error}");
+				host.deliver_owed_output().await;
 				1
 			},
 		};
@@ -5540,11 +5594,6 @@ impl AsyncUtility for Find {
 		let _ = host.flush_output().await;
 		code
 	}
-}
-
-/// Creates the `find` builtin registration.
-pub(crate) fn find_builtin<SE: ShellExtensions>() -> Registration<SE> {
-	async_util::<Find, SE>()
 }
 
 #[cfg(test)]
@@ -5566,6 +5615,74 @@ mod tests {
 	async fn run(root: &PathBuf, args: &[String]) -> (i32, crate::host::Capture) {
 		let args: Vec<&str> = args.iter().map(String::as_str).collect();
 		run_async_util::<Find>(&args, "", root).await
+	}
+
+	/// A fixed thirteen-bucket table closes streams in the wrong order after
+	/// growth; if one stream is a dead pipe, later streams lose their output.
+	#[test]
+	fn output_close_order_tracks_gnulib_growth_boundaries() {
+		for (occupied, colliding_key) in [(11, 221), (14, 391), (19, 851)] {
+			let mut identities: Vec<_> = (0..occupied).map(|ino| Some((0, ino))).collect();
+			identities.push(Some((0, colliding_key)));
+			let order = super::matchers::gnu_file_order(&identities);
+			// The final entry hashes to bucket zero only after the respective
+			// growth to 17, 23, or 37 buckets, so it closes immediately after 0.
+			let expected: Vec<_> = [0, occupied as usize]
+				.into_iter()
+				.chain(1..occupied as usize)
+				.collect();
+			assert_eq!(order, expected, "occupied={occupied}");
+		}
+	}
+
+	/// Overflow entries move before the bucket head during rehashing. A
+	/// different transfer order changes which output reaches disk before SIGPIPE.
+	#[test]
+	fn output_close_order_rehashes_overflows_before_bucket_heads() {
+		let identities: Vec<_> = [26, 0, 13, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 39]
+			.into_iter()
+			.map(|ino| Some((0, ino)))
+			.collect();
+		assert_eq!(
+			super::matchers::gnu_file_order(&identities),
+			[1, 3, 4, 5, 6, 7, 13, 8, 9, 10, 0, 11, 12, 2]
+		);
+	}
+
+	/// Many collisions do not grow gnulib's table: growth counts occupied
+	/// buckets rather than files. Preserve the head and newest-first overflow.
+	#[test]
+	fn output_close_order_does_not_grow_for_a_single_used_bucket() {
+		let identities: Vec<_> = (0..20).map(|ino| Some((0, ino * 13))).collect();
+		let expected: Vec<_> = std::iter::once(0).chain((1..20).rev()).collect();
+		assert_eq!(super::matchers::gnu_file_order(&identities), expected);
+	}
+
+	/// Separate buffers for aliases of one file overwrite each other's bytes
+	/// at close rather than retaining the action order of the shared stream.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn fprintf_aliases_share_one_buffer() {
+		let (_dir, root) = fixture();
+		fs::write(root.join("out"), b"old").unwrap();
+		fs::hard_link(root.join("out"), root.join("alias")).unwrap();
+		let (code, capture) = run_async_util::<Find>(
+			&["a.txt", "-fprintf", "out", "A", "-fprintf", "alias", "B", "-fprintf", "out", "C"],
+			"",
+			&root,
+		)
+		.await;
+		assert_eq!(code, 0, "stderr: {}", capture.err());
+		assert_eq!(fs::read(root.join("out")).unwrap(), b"ABC");
+	}
+
+	/// A stop escape ends parsing as well as printing, so invalid directives
+	/// or escapes after it cannot reject the invocation or print more bytes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn printf_stop_ignores_the_remaining_format() {
+		let (_dir, root) = fixture();
+		let (code, capture) = run_async_util::<Find>(&["a.txt", "-printf", r"a\c\invalid%p"], "", &root).await;
+		assert_eq!(code, 0, "stderr: {}", capture.err());
+		assert_eq!(capture.out(), "a");
 	}
 
 	/// A chain as deep as path syscalls reach must be walked, in both visit
@@ -5679,7 +5796,8 @@ mod tests {
 	async fn exec_uses_shell_cwd_and_captures_child_stdout() {
 		let (_dir, root) = fixture();
 		let (code, out, err) =
-			crate::host::run_script("find . -maxdepth 0 -exec /bin/pwd ';'", "", &root).await;
+			crate::host::run_extra(&["find", ".", "-maxdepth", "0", "-exec", "/bin/pwd", ";"], "", &root, &[])
+				.await;
 		assert_eq!(code, 0, "stderr: {err}");
 		assert_eq!(err, "");
 		assert_eq!(out, format!("{}\n", root.display()));
@@ -5693,14 +5811,15 @@ mod tests {
 		let (_dir, root) = fixture();
 		fs::create_dir(root.join("sub")).unwrap();
 		fs::write(root.join("sub/d.txt"), b"x").unwrap();
-		let (code, out, err) = crate::host::run_script(
-			"find . -name d.txt -execdir pwd ';' && find sub -name d.txt -exec wc -c {} +",
-			"",
-			&root,
-		)
-		.await;
+		let (code, out, err) =
+			crate::host::run_extra(&["find", ".", "-name", "d.txt", "-execdir", "pwd", ";"], "", &root, &[]).await;
 		assert_eq!(code, 0, "stderr: {err}");
-		assert_eq!(out, format!("{}\n1 sub/d.txt\n", root.join("sub").display()));
+		assert_eq!(out, format!("{}\n", root.join("sub").display()));
+		let (code, out, err) =
+			crate::host::run_extra(&["find", "sub", "-name", "d.txt", "-exec", "wc", "-c", "{}", "+"], "", &root, &[])
+				.await;
+		assert_eq!(code, 0, "stderr: {err}");
+		assert_eq!(out, "1 sub/d.txt\n");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -5982,7 +6101,7 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn printf_into_closed_pipe_stops_without_panicking() {
-		use brush_core::openfiles::OpenFile;
+		use crate::openfile::OpenFile;
 
 		let (_dir, root) = fixture();
 		let (mut host, capture) = crate::host::Host::for_test("find", "", &root);
@@ -6002,7 +6121,7 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn diagnostic_into_closed_pipe_does_not_panic() {
-		use brush_core::openfiles::OpenFile;
+		use crate::openfile::OpenFile;
 
 		use crate::host::StreamWriter;
 
@@ -6037,5 +6156,41 @@ mod tests {
 		assert_eq!(code, 1);
 		assert!(capture.err().contains("No space left on device"), "stderr: {}", capture.err());
 		assert!(!capture.err().contains("internal error"), "stderr: {}", capture.err());
+	}
+
+	/// fclose of an empty FILE buffer does not repeat a prior fwrite failure;
+	/// the checked write already reported it and failed the invocation.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn fprintf_empty_close_does_not_repeat_a_prior_write_failure() {
+		let (_dir, root) = fixture();
+		let literal = "x".repeat(8192);
+		let (code, capture) = run_async_util::<Find>(
+			&["a.txt", "-fprintf", "/dev/full", &literal, "-fprintf", "/dev/full", ""],
+			"",
+			&root,
+		)
+		.await;
+		assert_eq!(code, 1);
+		let errors = capture.err();
+		assert_eq!(errors.matches("No space left on device").count(), 1, "stderr: {errors}");
+	}
+
+	/// A nonfatal write error must not discard later format segments. Their
+	/// buffered output is attempted at close and reports its own write error.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn fprintf_runs_later_segments_after_a_write_failure() {
+		let (_dir, root) = fixture();
+		let format = format!("{}\\n%p", "x".repeat(8192));
+		let (code, capture) = run_async_util::<Find>(
+			&["a.txt", "-fprintf", "/dev/full", &format],
+			"",
+			&root,
+		)
+		.await;
+		assert_eq!(code, 1);
+		let errors = capture.err();
+		assert_eq!(errors.matches("No space left on device").count(), 2, "stderr: {errors}");
 	}
 }

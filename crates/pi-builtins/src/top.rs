@@ -8,11 +8,13 @@ use std::{
 	time::Duration,
 };
 
-use brush_core::{ExecutionContext, ExecutionExitCode, ExecutionResult, builtins};
 use clap::Parser;
 use tokio::time;
 
-use crate::proc_snapshot::{ProcInfo, sanitize_process_command};
+use crate::{
+	host::{INTERRUPTED_EXIT_CODE, ProcContext, Process},
+	proc_snapshot::{ProcInfo, sanitize_process_command},
+};
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum TopSortKey {
@@ -158,19 +160,6 @@ pub(crate) struct TopCommand {
 	/// Columns to display, in order (comma-separated, macOS `-stats` style).
 	#[arg(long = "stats", value_enum, value_delimiter = ',', ignore_case = true)]
 	stats: Vec<TopStat>,
-
-	/// Help, version or an option error to report instead of running (see
-	/// [`TopCommand::new`]).
-	#[arg(skip)]
-	usage: Option<TopUsage>,
-}
-
-/// What `top` reports instead of running, as procps `top` does: its help or
-/// version on standard output with status 0, an option error on standard
-/// error with status 1.
-struct TopUsage {
-	text:  String,
-	error: bool,
 }
 
 #[derive(Clone)]
@@ -217,35 +206,18 @@ fn normalize_top_flag(arg: String) -> String {
 	arg
 }
 
-impl builtins::Command for TopCommand {
-	type Error = brush_core::Error;
+impl Process for TopCommand {
+	// procps catches SIGPIPE: output stops without changing the usual status.
+	const BROKEN_PIPE_EXIT: Option<i32> = Some(0);
+	const USAGE_ERROR: i32 = 1;
+	const USAGE_BROKEN_PIPE_EXIT: Option<i32> = Some(1);
+	const PRESERVE_STATUS_ON_BROKEN_PIPE: bool = true;
 
-	fn new<I>(args: I) -> Result<Self, clap::Error>
-	where
-		I: IntoIterator<Item = String>,
-	{
-		match Self::try_parse_from(args.into_iter().map(normalize_top_flag)) {
-			Err(error) => {
-				let mut command = Self::try_parse_from(["top"])?;
-				let mut text = error.to_string();
-				if !text.ends_with('\n') {
-					text.push('\n');
-				}
-				let error = !matches!(
-					error.kind(),
-					clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-				);
-				command.usage = Some(TopUsage { text, error });
-				Ok(command)
-			},
-			parsed => parsed,
-		}
+	fn rewrite_argv(argv: Vec<String>) -> Vec<String> {
+		argv.into_iter().map(normalize_top_flag).collect()
 	}
 
-	fn execute<SE: brush_core::ShellExtensions>(
-		&self,
-		context: ExecutionContext<'_, SE>,
-	) -> impl Future<Output = std::result::Result<ExecutionResult, brush_core::Error>> + Send {
+	fn run(&self, context: &ProcContext) -> impl Future<Output = std::io::Result<i32>> + Send {
 		let iterations = self.iterations;
 		let delay = self.delay;
 		let row_limit = self.rows;
@@ -254,36 +226,24 @@ impl builtins::Command for TopCommand {
 		let sort = self.sort;
 		let full_command = self.full_command;
 		let _ = self.batch;
-		let usage = self.usage.as_ref().map(|usage| (usage.text.clone(), usage.error));
 		let stats = if self.stats.is_empty() {
 			DEFAULT_TOP_STATS.to_vec()
 		} else {
 			self.stats.clone()
 		};
-		// procps `top` catches SIGPIPE and goes on to its usual status, so a
-		// write that finds a pipe with no reader changes nothing but ends its
-		// output (measured against procps-ng under Bash 5.2.21).
 		async move {
-			if let Some((text, error)) = usage {
-				if error {
-					let _ = write!(context.stderr(), "{text}");
-					return Ok(ExecutionResult::new(1));
-				}
-				let _ = write!(context.stdout(), "{text}");
-				return Ok(ExecutionResult::success());
-			}
 			if !delay.is_finite() || delay < 0.0 || delay > Duration::MAX.as_secs_f64() {
 				let _ = writeln!(context.stderr(), "top: invalid delay '{delay}'");
-				return Ok(ExecutionResult::new(1));
+				return Ok(1);
 			}
 			if row_limit == Some(0) {
 				let _ = writeln!(context.stderr(), "top: row count must be greater than zero");
-				return Ok(ExecutionResult::new(1));
+				return Ok(1);
 			}
 			#[cfg(target_os = "windows")]
 			if user.is_some() {
 				let _ = writeln!(context.stderr(), "top: user filtering is unavailable on Windows");
-				return Ok(ExecutionResult::new(2));
+				return Ok(2);
 			}
 
 			let delay = Duration::from_secs_f64(delay);
@@ -294,7 +254,7 @@ impl builtins::Command for TopCommand {
 
 			loop {
 				if context.is_cancelled() {
-					return Ok(ExecutionExitCode::Interrupted.into());
+					return Ok(INTERRUPTED_EXIT_CODE);
 				}
 
 				let now = std::time::Instant::now();
@@ -361,14 +321,21 @@ impl builtins::Command for TopCommand {
 
 				sort_top_rows(&mut rows, sort);
 				let output = render_top_snapshot(&rows, row_limit, sample + 1, &stats);
-				match write!(context.stdout(), "{output}") {
-					Err(err) if err.kind() == io::ErrorKind::BrokenPipe => return Ok(ExecutionResult::success()),
-					written => written?,
+				let write_result = context.stdout().write_all(output.as_bytes());
+				let written = match write_result {
+					Ok(()) => context.flush_output().await,
+					Err(err) => Err(err),
+				};
+				if let Err(err) = written {
+					if err.kind() == io::ErrorKind::BrokenPipe {
+						return Ok(0);
+					}
+					return Err(err);
 				}
 
 				sample += 1;
 				if iterations.is_some_and(|count| sample >= count) {
-					return Ok(ExecutionResult::success());
+					return Ok(0);
 				}
 				previous = next_previous;
 				previous_sample = now;
@@ -379,7 +346,7 @@ impl builtins::Command for TopCommand {
 					tokio::select! {
 						() = &mut sleep => {},
 						() = cancel_token.cancelled() => {
-							return Ok(ExecutionExitCode::Interrupted.into());
+							return Ok(INTERRUPTED_EXIT_CODE);
 						},
 					}
 				} else {
@@ -613,13 +580,16 @@ mod tests {
 
 	#[test]
 	fn parses_macos_single_dash_long_options() {
-		use brush_core::builtins::Command as _;
-		let cmd = TopCommand::new(
+		use clap::Parser as _;
+
+		use crate::host::Process as _;
+		let argv = TopCommand::rewrite_argv(
 			["top", "-pid", "56943,101", "-stats", "pid,cpu,th,mem,pstate"]
 				.into_iter()
-				.map(String::from),
-		)
-		.expect("macOS-style flags must parse");
+				.map(String::from)
+				.collect(),
+		);
+		let cmd = TopCommand::try_parse_from(argv).expect("macOS-style flags must parse");
 		assert_eq!(cmd.pids, vec![56943, 101]);
 		assert_eq!(cmd.stats, vec![
 			TopStat::Pid,
