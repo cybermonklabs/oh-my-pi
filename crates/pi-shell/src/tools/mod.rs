@@ -162,10 +162,17 @@ impl SpawnLog {
 		}
 	}
 
-	/// The engine is about to reap labelled external `pid`: while it holds
-	/// it unreaped its pid is still the number of the group it led, so the
-	/// members of that group are pinned now or never.
-	pub fn pin_members(&self, pid: u32) {
+	/// The engine is about to reap external `pid`: while it holds it
+	/// unreaped its pid is still the number of the group it led, so the
+	/// members of that group are pinned now or never. Returns them, so the
+	/// run's ledger keeps the same pins without reading the process table a
+	/// second time; a labelled external's members are kept here as well, for
+	/// the `timeout` whose command it belongs to.
+	pub fn pin_members(&self, pid: u32) -> Vec<PinnedProcess> {
+		let Some(leader) = i32::try_from(pid).ok().and_then(PinnedProcess::from_pid) else {
+			return Vec::new();
+		};
+		let members = leader.members_before_reap();
 		let labels: Vec<u32> = self
 			.0
 			.spawns
@@ -174,15 +181,8 @@ impl SpawnLog {
 			.filter(|&&(_, spawned)| spawned == pid)
 			.map(|&(label, _)| label)
 			.collect();
-		if labels.is_empty() {
-			return;
-		}
-		let Some(leader) = i32::try_from(pid).ok().and_then(PinnedProcess::from_pid) else {
-			return;
-		};
-		let members = leader.members_before_reap();
-		if members.is_empty() {
-			return;
+		if members.is_empty() || labels.is_empty() {
+			return members;
 		}
 		let mut pins = self.0.pins.lock();
 		for label in labels {
@@ -195,6 +195,7 @@ impl SpawnLog {
 				}
 			}
 		}
+		members
 	}
 
 	/// The recorded externals of `labels` that are still running.

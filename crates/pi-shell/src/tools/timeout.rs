@@ -309,15 +309,23 @@ impl Timeout {
 				self.remember(member);
 			}
 		}
-		for pid in turn.log.live(turn.group) {
+		let live = turn.log.live(turn.group);
+		// One reading of the process table for every group of this command,
+		// not one for each: a command with hundreds of externals would
+		// otherwise scan it hundreds of times at its deadline.
+		let table = groups.then(PinnedProcess::process_groups);
+		for pid in live {
 			let Ok(pid) = i32::try_from(pid) else {
 				continue;
 			};
 			let Some(pin) = PinnedProcess::from_pid(pid) else {
 				continue;
 			};
-			if groups && pin.group_id() == Some(pid) {
-				for member in pin.members_before_reap() {
+			if let Some(table) = table.as_ref()
+				&& pin.group_id() == Some(pid)
+				&& let Some(candidates) = table.get(&pid)
+			{
+				for member in PinnedProcess::members_among(pid, candidates) {
 					self.remember(member);
 				}
 			}
@@ -378,6 +386,14 @@ impl Timeout {
 		}
 	}
 
+	/// Whether anything pinned from the command's tree still runs.
+	fn pinned_runs(&self) -> bool {
+		self
+			.pins
+			.iter()
+			.any(|pin| pin.status() == ProcessStatus::Running)
+	}
+
 	pub(super) fn advance(
 		&mut self,
 		api: &mut ShellApi<'_, '_>,
@@ -415,8 +431,15 @@ impl Timeout {
 					give_up = Some(now.saturating_add(nanos(REAP_AFTER_KILL)));
 				}
 				let killed = opts.signal == Signal::Kill || give_up.is_some();
-				let ended =
-					self.child.status.is_some() && !turn.live && turn.log.live(turn.group).is_empty();
+				// What the command left behind counts as the command still
+				// running, until the `KILL` that `-k` promises has gone out:
+				// a process that left its group when the first signal reached
+				// it is in no list of the command's externals. Without `-k`
+				// the tool ends as GNU's does, with the signal sent.
+				let ended = self.child.status.is_some()
+					&& !turn.live
+					&& turn.log.live(turn.group).is_empty()
+					&& (kill_at.is_none() || !self.pinned_runs());
 				if ended || give_up.is_some_and(|at| now >= at) {
 					let platform = Platform::current();
 					Phase::Exit(if opts.preserve {

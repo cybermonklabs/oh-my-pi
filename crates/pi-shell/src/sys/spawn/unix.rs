@@ -345,7 +345,7 @@ impl Scope {
 		if !self.addr.is_group() {
 			return;
 		}
-		let Ok(table) = proc::list() else {
+		let Some(table) = recent_process_table() else {
 			return;
 		};
 		let me = std::process::id() as i32;
@@ -447,6 +447,29 @@ fn unreaped_child(pid: i32) -> bool {
 			libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
 		) == 0
 	}
+}
+
+/// How long one reading of the process table serves the scopes that pin
+/// their members. Ending a run abandons its externals one after another,
+/// and each reading costs a pass over `/proc`; a reading this fresh names
+/// the same members. A process that joins a group inside the window is
+/// still reached by the signal to the group itself, and is pinned by the
+/// next reading; no record is ever dropped on this reading.
+const TABLE_FRESH: Duration = Duration::from_millis(10);
+
+/// The process table, read again only when the last reading is older than
+/// [`TABLE_FRESH`].
+fn recent_process_table() -> Option<Arc<Vec<ProcInfo>>> {
+	static RECENT: Mutex<Option<(Instant, Arc<Vec<ProcInfo>>)>> = Mutex::new(None);
+	let mut recent = RECENT.lock();
+	if let Some((read_at, table)) = recent.as_ref()
+		&& read_at.elapsed() < TABLE_FRESH
+	{
+		return Some(Arc::clone(table));
+	}
+	let table = Arc::new(proc::list().ok()?);
+	*recent = Some((Instant::now(), Arc::clone(&table)));
+	Some(table)
 }
 
 impl State {

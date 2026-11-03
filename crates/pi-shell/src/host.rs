@@ -24,6 +24,8 @@ use std::{
 use bstr::{BStr, BString, ByteSlice};
 use parking_lot::Mutex;
 
+use pi_builtins::PinnedProcess;
+
 use crate::{
 	bash::{
 		Deadline, Event, ExitStatus, ExtProc, FdRef, File, FileKind, Fs, IntrinsicId, Invocation,
@@ -47,11 +49,16 @@ pub const TERM_GRACE: Duration = Duration::from_secs(1);
 /// through it (pi's `Shell::pids()`). Implementations must not block.
 pub trait SpawnObserver: Send + Sync {
 	/// `pid` was spawned; it leads its own session and process group, so
-	/// its process group id is `pid` too (Unix).
-	fn spawned(&self, pid: u32);
+	/// its process group id is `pid` too (Unix). A `detached` external
+	/// ([`crate::bash::Lineage::detached`], `nohup`) is meant to outlive the
+	/// run: a cancel must leave it alone.
+	fn spawned(&self, pid: u32, detached: bool);
 	/// `pid`'s exit was observed, or the engine abandoned it (the spawner
-	/// then terminates it in the background).
-	fn released(&self, pid: u32);
+	/// then terminates it in the background). `members` are the processes
+	/// of the group `pid` led, pinned while the engine still held `pid`
+	/// unreaped: after the reap its pid names nothing, and a member that
+	/// leaves the group is named by nothing else.
+	fn released(&self, pid: u32, members: &[PinnedProcess]);
 }
 
 /// The shell's standard streams, replaced for each run.
@@ -276,6 +283,9 @@ impl Launcher {
 			child = relays.wrap(child);
 		}
 		self.spawns.record(lineage, child.pid());
+		if let Some(observer) = self.observer.as_ref() {
+			observer.spawned(child.pid(), lineage.detached);
+		}
 		Ok(Box::new(Observed {
 			child,
 			observer: self.observer.clone(),
@@ -713,9 +723,9 @@ impl Observed {
 			// The engine has not reaped it yet: its pid still holds the
 			// number of the group it led, so the members of that group can
 			// be pinned, and nothing else names them afterwards.
-			self.spawns.pin_members(self.child.pid());
+			let members = self.spawns.pin_members(self.child.pid());
 			if let Some(observer) = self.observer.as_ref() {
-				observer.released(self.child.pid());
+				observer.released(self.child.pid(), &members);
 			}
 		}
 	}

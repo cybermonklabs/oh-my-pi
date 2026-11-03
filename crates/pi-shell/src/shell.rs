@@ -445,6 +445,7 @@ async fn run_shell_session(
 		let session = session.clone();
 		let abort_state = abort_state.clone();
 		let tokio_cancel = tokio_cancel.clone();
+		let children = children.clone();
 		let at = ct.emplace_abort_token();
 		async move {
 			let mut session_guard = session.lock().await;
@@ -452,9 +453,9 @@ async fn run_shell_session(
 				core
 			} else {
 				let core = create_session_for_run(&config, Some(&tokio_cancel)).await?;
-				*children.lock() = Some(core.session.children());
 				session_guard.insert(core)
 			};
+			*children.lock() = Some(core.session.children());
 			abort_state.set(at).await;
 			run_shell_command(core, &run_config, on_chunk, tokio_cancel).await
 		}
@@ -470,6 +471,7 @@ async fn run_shell_session(
 				run_task.abort();
 				let _ = run_task.await;
 			}
+			stop_what_the_run_left(&children).await;
 			abort_state.clear().await;
 			// Use try_lock to avoid deadlocking if another task holds the session.
 			// If we can't acquire the lock, the session will be cleaned up when the
@@ -493,6 +495,17 @@ async fn run_shell_session(
 	Ok(res?.into_run_result())
 }
 
+/// Stops what a cancelled run left behind: the processes it spawned that the
+/// engine's own cancel did not reach, each through the identity pinned when
+/// it was spawned (see [`Children::terminate_run`]). An aborted run task
+/// never reaches the driver's own wave, so the cancel path runs it here.
+async fn stop_what_the_run_left(children: &ActiveChildren) {
+	let children = children.lock().clone();
+	if let Some(children) = children {
+		children.terminate_run().await;
+	}
+}
+
 async fn run_shell_oneshot(
 	config: ShellConfig,
 	run_config: ShellRunConfig,
@@ -500,11 +513,14 @@ async fn run_shell_oneshot(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
+	let children = ActiveChildren::default();
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
+		let children = children.clone();
 		async move {
 			// The session ends with this task: its background jobs end with it.
 			let mut session = create_session_for_run(&config, Some(&tokio_cancel)).await?;
+			*children.lock() = Some(session.session.children());
 			run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel).await
 		}
 	});
@@ -518,6 +534,7 @@ async fn run_shell_oneshot(
 				task.abort();
 				let _ = task.await;
 			}
+			stop_what_the_run_left(&children).await;
 			return Ok(cancelled_result(reason));
 		},
 	};
@@ -534,10 +551,13 @@ async fn run_shell_oneshot_streams(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
+	let children = ActiveChildren::default();
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
+		let children = children.clone();
 		async move {
 			let mut session = create_session_for_run(&config, Some(&tokio_cancel)).await?;
+			*children.lock() = Some(session.session.children());
 			run_shell_command_streams(&mut session, &run_config, streams, tokio_cancel).await
 		}
 	});
@@ -551,6 +571,7 @@ async fn run_shell_oneshot_streams(
 				task.abort();
 				let _ = task.await;
 			}
+			stop_what_the_run_left(&children).await;
 			return Ok(cancelled_result(reason));
 		},
 	};

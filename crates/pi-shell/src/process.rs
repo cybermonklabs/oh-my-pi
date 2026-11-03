@@ -195,10 +195,15 @@ impl Process {
 	}
 
 	/// Sends one wave of `signal` to this process, its live descendants,
-	/// `earlier` (processes an earlier wave reached) and, with `leader`, the
-	/// group it leads (see [`SignalWave`]). The leader is not reaped by this
-	/// process, so it proves its group only while it runs. Returns what the
-	/// wave reached.
+	/// `earlier` (processes an earlier wave reached) with their live
+	/// descendants, and, with `leader`, the group it leads (see
+	/// [`SignalWave`]). The leader is not reaped by this process, so it
+	/// proves its group only while it runs. Returns what the wave reached.
+	///
+	/// A process an earlier wave reached may have forked a child since, and
+	/// may have left the group it was in — one that calls `setsid` in its
+	/// `TERM` handler does both — so its own descendants are walked here:
+	/// no group listing and no walk from this process reaches them.
 	fn signal_wave(
 		&self,
 		signal: i32,
@@ -214,6 +219,9 @@ impl Process {
 			wave.process(&descendant.inner);
 		}
 		for process in earlier {
+			for descendant in signalable_descendants(process, protected) {
+				wave.process(&descendant);
+			}
 			wave.process(process);
 		}
 		if !protected.contains(&self.pid()) {

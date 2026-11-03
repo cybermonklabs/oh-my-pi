@@ -38,7 +38,9 @@ fn a_session_is_signalled_before_its_leader_ran_setsid() {
 		.spawn()
 		.unwrap();
 	let pid = i32::try_from(child.id()).unwrap();
-	Scope::Session(pid).signal(Signal::Term).unwrap();
+	Scope::of(super::Place::Session, pid)
+		.signal(Signal::Term)
+		.unwrap();
 	let status = child.wait().unwrap();
 	assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(libc::SIGTERM));
 }

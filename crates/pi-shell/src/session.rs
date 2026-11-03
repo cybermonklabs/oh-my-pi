@@ -92,12 +92,11 @@ const SETTLE_STEPS: u32 = 4;
 const MAX_PARK: Duration = Duration::from_secs(1);
 
 /// How long the wave that stops what a cancelled run left behind waits
-/// between its `TERM` and its `KILL`: long enough for a `TERM` trap to run,
-/// short enough that a cancelled run ends promptly.
-const CANCEL_TERM_GRACE: Duration = Duration::from_millis(500);
+/// before its `KILL`: the same grace the engine's own cancel gives a `TERM`
+/// trap, so a trap that writes its output and exits inside that grace is
+/// never cut short. The wait ends as soon as nothing of the run is left.
 
-/// The signals those waves send.
-const TERM_SIGNAL: i32 = 15;
+/// The signal that wave sends.
 const KILL_SIGNAL: i32 = 9;
 
 /// Configuration of a new [`Session`].
@@ -266,34 +265,49 @@ impl Children {
 
 	/// Pins everything the run can still reach: each recorded process, and
 	/// every member of a group one of them leads. Signal 0 reaches them and
-	/// changes nothing, and a wave keeps what it reached, so a process that
+	/// changes nothing; what the wave reached is recorded, so a process that
 	/// leaves its group afterwards is still named by its pin.
 	pub fn pin_reachable(&self) {
-		self.0.ledger.lock().plan_wave(0, true).deliver();
+		let mut ledger = self.0.ledger.lock();
+		let reached = ledger.plan_wave(0, true).deliver();
+		ledger.record_reached(&reached);
 	}
 
 	/// Stops everything the run spawned that is still reachable: one wave of
 	/// `TERM` to each recorded process, the group it leads and its live
 	/// descendants, then `KILL` to whatever that did not end. Each wave is
 	/// planned from one reading and delivered under the ledger's lock, so
-	/// the engine cannot reap a leader while its group is being listed.
+	/// the engine cannot reap a leader while its group is being listed, and
+	/// each wave records what it reached: a member that leaves its group in
+	/// its `TERM` handler is named by its pin in the wave that follows.
 	///
 	/// Called when a run was cancelled: the engine's own cancel reaches the
 	/// tree it still holds, and this reaches what that tree left behind —
 	/// a process that left its group, and a child forked by a process whose
 	/// parent the engine already reaped.
 	pub async fn terminate_run(&self) {
-		if !self.0.ledger.lock().reaches_anything() {
-			return;
-		}
-		self.0.ledger.lock().plan_wave(TERM_SIGNAL, true).deliver();
-		let deadline = Instant::now() + CANCEL_TERM_GRACE;
-		while Instant::now() < deadline && self.0.ledger.lock().reaches_anything() {
+		// The engine's own cancel has sent `TERM` to each tree it holds, and
+		// a trap of one of those runs now: nothing here sends a second
+		// `TERM`, which would run a trap twice. What is left when the grace
+		// ends is what that signal could not reach.
+		let deadline = Instant::now() + TERM_GRACE;
+		loop {
+			if !self.0.ledger.lock().reaches_anything() {
+				return;
+			}
+			if Instant::now() >= deadline {
+				break;
+			}
 			tokio::time::sleep(Duration::from_millis(25)).await;
 		}
-		if self.0.ledger.lock().reaches_anything() {
-			self.0.ledger.lock().plan_wave(KILL_SIGNAL, true).deliver();
-		}
+		self.wave(KILL_SIGNAL);
+	}
+
+	/// One wave of `signal`, keeping what it reached for the wave after it.
+	fn wave(&self, signal: i32) {
+		let mut ledger = self.0.ledger.lock();
+		let reached = ledger.plan_wave(signal, true).deliver();
+		ledger.record_reached(&reached);
 	}
 
 	fn set_active(&self, active: bool) {
@@ -306,11 +320,15 @@ impl Children {
 }
 
 impl SpawnObserver for Children {
-	fn spawned(&self, pid: u32) {
+	fn spawned(&self, pid: u32, detached: bool) {
 		self.0.pids.lock().push(pid);
 		let Ok(pid) = i32::try_from(pid) else {
 			return;
 		};
+		if detached {
+			// Meant to outlive the run; a cancel must leave it alone.
+			return;
+		}
 		// Pinned now: from here on the pid alone could name another process.
 		// Every external the host starts leads a group of its own whose
 		// number is its pid (see [`SpawnObserver::spawned`]); where it does
@@ -323,7 +341,7 @@ impl SpawnObserver for Children {
 			.record(Some(pid), PinnedProcess::from_pid(pid));
 	}
 
-	fn released(&self, pid: u32) {
+	fn released(&self, pid: u32, members: &[PinnedProcess]) {
 		let mut pids = self.0.pids.lock();
 		if let Some(i) = pids.iter().position(|&p| p == pid) {
 			pids.remove(i);
@@ -333,7 +351,13 @@ impl SpawnObserver for Children {
 		// holds the number of the group it led: the members of that group are
 		// pinned now or never.
 		if let Ok(pid) = i32::try_from(pid) {
-			self.0.ledger.lock().before_reap(pid, true);
+			let mut ledger = self.0.ledger.lock();
+			// The members were pinned by the host, with one reading of the
+			// process table shared with the `timeout` tool.
+			ledger.before_reap(pid, false);
+			for member in members {
+				ledger.record_unwatched(Some(pid), Some(member.clone()));
+			}
 		}
 	}
 }

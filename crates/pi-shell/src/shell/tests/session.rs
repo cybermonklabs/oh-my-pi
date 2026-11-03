@@ -2244,3 +2244,134 @@ async fn pipe_tap_forwards_every_byte_and_counts_them() {
 	assert!(read.data.ends_with(format!("\n{LAST}\n").as_bytes()));
 	assert!(!read.open);
 }
+
+/// A background process of a cancelled run that leaves its process group
+/// when the cancel's `TERM` reaches it — one that `exec`s itself into a
+/// session of its own, as a daemon does — is stopped through the identity
+/// pinned before that signal. No listing of the group reports it afterwards,
+/// and its pid alone would name whatever took it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_stops_a_background_process_that_left_its_group_on_term() {
+	let root = tempfile::tempdir().expect("scratch directory");
+	fs::write(
+		root.path().join("worker.sh"),
+		"trap 'exec setsid sleep 600' TERM\n: > ready\nwhile :; do sleep 0.05; done\n",
+	)
+	.expect("worker script");
+	let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+	let shell = Shell::new(None);
+	let mut cancel = CancelToken::default();
+	let abort = cancel.emplace_abort_token();
+	let task = tokio::spawn(async move {
+		shell
+			.run(
+				ShellRunOptions {
+					command: "sh worker.sh & echo \"$!\" > worker.pid; sleep 60".into(),
+					cwd: Some(cwd),
+					..Default::default()
+				},
+				None,
+				cancel,
+			)
+			.await
+	});
+	time::timeout(Duration::from_secs(10), async {
+		while !root.path().join("ready").exists() {
+			time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("worker ready");
+	let worker: i32 = fs::read_to_string(root.path().join("worker.pid"))
+		.expect("worker pid")
+		.trim()
+		.parse()
+		.expect("worker pid is a number");
+	abort.abort(AbortReason::Signal);
+	let result = time::timeout(Duration::from_secs(15), task)
+		.await
+		.expect("cancel finished")
+		.expect("run task")
+		.expect("shell result");
+	assert!(result.cancelled);
+	let gone = time::timeout(Duration::from_secs(10), async {
+		while std::path::Path::new(&format!("/proc/{worker}")).exists() {
+			time::sleep(Duration::from_millis(25)).await;
+		}
+	})
+	.await;
+	// SAFETY: `kill` takes scalar arguments; signal 0 only probes.
+	let running = unsafe { libc::kill(worker, 0) } == 0;
+	if running {
+		// SAFETY: as above; end the escapee before the assertion fails.
+		unsafe { libc::kill(worker, libc::SIGKILL) };
+	}
+	assert!(
+		gone.is_ok() && !running,
+		"a background process that left its group on TERM must be stopped with the run; pid \
+		 {worker} was still there"
+	);
+}
+
+/// The deadline of `timeout` stops a process its command forked after the
+/// command's own external was reaped. Such a process is in no list of the
+/// command's externals, and the group it is in is named by a pid the kernel
+/// may have given away, so only the member pinned before the reap reaches it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deadline_stops_a_child_forked_after_its_parent_was_reaped() {
+	let root = tempfile::tempdir().expect("scratch directory");
+	fs::write(
+		root.path().join("actor.sh"),
+		"sh -c 'sleep 0.3; sleep 600 & echo \"$!\" > grandchild.pid; exec sleep 600' &\n: > \
+		 ready\n",
+	)
+	.expect("actor script");
+	let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+	let shell = Shell::new(None);
+	let result = time::timeout(
+		Duration::from_secs(30),
+		shell.run(
+			ShellRunOptions {
+				command: "f() { sh actor.sh; sleep 60; }; timeout -k .3 1.5 f".into(),
+				cwd: Some(cwd),
+				..Default::default()
+			},
+			None,
+			CancelToken::default(),
+		),
+	)
+	.await
+	.expect("the deadline ended the run")
+	.expect("shell result");
+	// 124 at the deadline, 137 once the `-k` KILL went out: a leftover the
+	// first signal could not reach keeps the command alive until then.
+	assert!(
+		matches!(result.exit_code, Some(124 | 137)),
+		"the command must end on its deadline; got {:?}",
+		result.exit_code
+	);
+	let grandchild: i32 = fs::read_to_string(root.path().join("grandchild.pid"))
+		.expect("grandchild pid")
+		.trim()
+		.parse()
+		.expect("grandchild pid is a number");
+	let gone = time::timeout(Duration::from_secs(10), async {
+		while std::path::Path::new(&format!("/proc/{grandchild}")).exists() {
+			time::sleep(Duration::from_millis(25)).await;
+		}
+	})
+	.await;
+	// SAFETY: `kill` takes scalar arguments; signal 0 only probes.
+	let running = unsafe { libc::kill(grandchild, 0) } == 0;
+	if running {
+		// SAFETY: as above; end the escapee before the assertion fails.
+		unsafe { libc::kill(grandchild, libc::SIGKILL) };
+	}
+	assert!(
+		gone.is_ok() && !running,
+		"a process forked after its parent was reaped must be stopped by the deadline; pid \
+		 {grandchild} was still there"
+	);
+}
