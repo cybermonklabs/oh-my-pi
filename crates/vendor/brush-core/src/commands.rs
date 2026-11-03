@@ -1164,8 +1164,11 @@ pub(crate) async fn invoke_shell_function(
 ///
 /// `backquoted` is whether it was written with backquotes. In POSIX mode Bash
 /// substitutes the aliases in a `$(...)` substitution when it reads the
-/// command around it, so it reads the text again without aliases; backquoted
-/// text is read with aliases when it runs.
+/// command around it, so it reads the text again without aliases. Otherwise
+/// Bash 5.2 keeps a `$(...)` as the text it prints for the command it parsed,
+/// without aliases, and reads that text with aliases when it runs, so the
+/// shell does too while there are aliases to substitute. Backquoted text is
+/// read with aliases, as written, when it runs.
 pub(crate) async fn invoke_command_in_subshell_and_get_output(
 	shell: &mut Shell<impl extensions::ShellExtensions>,
 	params: &ExecutionParameters,
@@ -1186,9 +1189,12 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 	let mut params = params.clone();
 	params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
 	params.disable_command_output_marking();
-	if !backquoted && shell.options().posix_mode {
+	let posix_mode = shell.options().posix_mode;
+	if !backquoted && posix_mode {
 		params.set_aliases_at_read(crate::AliasesAtRead::default());
 	}
+	let read_printed_text =
+		!backquoted && !posix_mode && shell.aliases_for_reading().is_some_and(|aliases| !aliases.is_empty());
 
 	// Set up pipe so we can read the output.
 	let (reader, writer) = ioutils::pipe("command substitution")?;
@@ -1196,7 +1202,7 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
 
 	let mut async_reader = sys::async_pipe::AsyncPipeReader::new(reader)?;
 
-	let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s));
+	let cmd_join_handle = tokio::spawn(run_substitution_command(subshell, params, s, read_printed_text));
 
 	let output_str = async_reader.read_to_string().await?;
 
@@ -1217,17 +1223,37 @@ async fn run_substitution_command(
 	mut shell: Shell<impl extensions::ShellExtensions>,
 	mut params: ExecutionParameters,
 	command: String,
+	read_printed_text: bool,
 ) -> Result<ExecutionResult, error::Error> {
+	let parsed = shell.parse_string(command.as_str());
+
 	// Check for a command that is only an input redirection ("< file").
 	// If detected, emulate `cat file` to stdout and return immediately. Such a
 	// command has no word an alias could replace.
-	if let Ok(program) = shell.parse_string(command.as_str())
-		&& let Some(redir) = try_unwrap_bare_input_redir_program(&program)
+	if let Ok(program) = &parsed
+		&& let Some(redir) = try_unwrap_bare_input_redir_program(program)
 	{
 		interp::setup_redirect(&mut shell, &mut params, redir).await?;
 		openfiles::copy_async(&mut params.stdin(&shell), &mut params.stdout(&shell)).await?;
 		return Ok(ExecutionResult::new(0));
 	}
+
+	// Read the text printed for the parsed command (see
+	// `invoke_command_in_subshell_and_get_output`); one line per complete
+	// command, so a here-document that ends one ends at its delimiter. Text
+	// that parses only with aliases is a syntax error, as in Bash.
+	let command = match parsed {
+		Ok(program) if read_printed_text => program
+			.complete_commands
+			.iter()
+			.map(|complete_command| format!("{complete_command}\n"))
+			.collect(),
+		Err(_) if read_printed_text => {
+			params.set_aliases_at_read(crate::AliasesAtRead::default());
+			command
+		},
+		_ => command,
+	};
 
 	// TODO(source-info): review this
 	let source_info = crate::SourceInfo::from("main");

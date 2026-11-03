@@ -290,11 +290,13 @@ struct PushedAlias {
 }
 
 impl PushedAlias {
-    fn new(name: String, value: &str) -> Self {
+    /// `nested` is whether the value is read inside a `$( )` or `<( )`
+    /// substitution in POSIX mode (see `ends_without_blank`).
+    fn new(name: String, value: &str, nested: bool) -> Self {
         let chars: Vec<char> = value.chars().collect();
         let end_blank = chars.last().is_some_and(|&last| {
             !matches!(last, ' ' | '\t' | '\n' | '(' | ')' | '<' | '>' | ';' | '&' | '|')
-        }) && !ends_without_blank(&chars)
+        }) && !ends_without_blank(&chars, nested)
             && !ends_inside_quotes(&chars);
         Self {
             name: Some(name),
@@ -323,45 +325,68 @@ impl PushedAlias {
 
 /// Whether a value ending in backslashes gets no blank read after it, so its
 /// last backslash escapes the next character of the input: a blank, a newline
-/// (joining the lines), or the end of the input (where it is dropped). Bash
-/// 5.2.21 does so when the value ends in 1, 5, 9, ... backslashes. After 3, 7,
-/// 11, ... it reads the blank and the last backslash escapes it, so the word
-/// ends with a blank; after an even number the backslashes pair up and the
-/// blank only ends the word. Measured with `bash -c` for 1 to 9 backslashes.
-fn ends_without_blank(chars: &[char]) -> bool {
-    chars.iter().rev().take_while(|&&c| c == '\\').count() % 4 == 1
+/// (joining the lines), the end of the input (where it is dropped), or a
+/// substitution's `)`. Bash 5.2.21 decides this with a flag that flips for each
+/// backslash its reader returns, counting a backslash its tokenizer peeked at
+/// and read again (parse.y, `shell_getc`'s `unquoted_backslash`). In a word at
+/// the top level that reading gives no blank after 1, 5, 9, ... backslashes,
+/// and a blank after 3, 7, ... that the last backslash escapes; inside a `$( )`
+/// or `<( )` read in POSIX mode (`nested`) it gives no blank after any odd
+/// number. After an even number the backslashes pair up and the blank only
+/// ends the word. Measured with `bash -c` for 1 to 12 backslashes.
+fn ends_without_blank(chars: &[char], nested: bool) -> bool {
+    let backslashes = chars.iter().rev().take_while(|&&c| c == '\\').count();
+    if nested {
+        backslashes % 2 == 1
+    } else {
+        backslashes % 4 == 1
+    }
 }
 
-/// Whether text ends inside single or double quotes.
+/// Whether text ends inside single, double or ANSI-C (`$'...'`) quotes.
 fn ends_inside_quotes(chars: &[char]) -> bool {
-    let mut quote: Option<char> = None;
+    #[derive(Clone, Copy, PartialEq)]
+    enum Quote {
+        Single,
+        Double,
+        AnsiC,
+    }
+    let mut quote: Option<Quote> = None;
     let mut escaped = false;
+    // Whether the last character outside quotes was an unescaped `$`.
+    let mut dollar = false;
     for &c in chars {
         match quote {
-            Some('\'') => {
+            Some(Quote::Single) => {
                 if c == '\'' {
                     quote = None;
                 }
             }
-            Some(_) => {
+            Some(kind) => {
+                let closing = if kind == Quote::Double { '"' } else { '\'' };
                 if escaped {
                     escaped = false;
                 } else if c == '\\' {
                     escaped = true;
-                } else if c == '"' {
+                } else if c == closing {
                     quote = None;
                 }
             }
             None => {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '\'' || c == '"' {
-                    quote = Some(c);
+                let was_escaped = std::mem::take(&mut escaped);
+                if !was_escaped {
+                    match c {
+                        '\\' => escaped = true,
+                        '\'' => quote = Some(if dollar { Quote::AnsiC } else { Quote::Single }),
+                        '"' => quote = Some(Quote::Double),
+                        _ => {}
+                    }
                 }
+                dollar = !was_escaped && c == '$';
+                continue;
             }
         }
+        dollar = false;
     }
     quote.is_some()
 }
@@ -813,7 +838,12 @@ impl<I: Iterator<Item = std::io::Result<char>>> Tokenizer<I> {
         if let Some(reading) = self.cross_state.reading.as_mut() {
             reading.alias_started(&substitution.name);
         }
-        self.pushed.push(PushedAlias::new(substitution.name, &substitution.value));
+        let nested = self
+            .cross_state
+            .reading
+            .as_ref()
+            .is_some_and(AliasReading::in_nested_commands);
+        self.pushed.push(PushedAlias::new(substitution.name, &substitution.value, nested));
     }
 
     /// Drops alias values read to their end (after their trailing blank).

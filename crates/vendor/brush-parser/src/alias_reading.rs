@@ -433,6 +433,12 @@ impl AliasReading {
         self.sh_mode = options.sh_mode;
     }
 
+    /// Whether words are read inside a `$( )` or `<( )` substitution whose
+    /// aliases are substituted now (POSIX mode), not at the top level.
+    pub(crate) fn in_nested_commands(&self) -> bool {
+        self.frames.len() > 1 && matches!(self.frames.last(), Some(Frame::Commands { .. }))
+    }
+
     /// Whether the input read so far ends outside any construct, so a newline
     /// read now can end a complete command.
     pub(crate) fn at_top_level(&self) -> bool {
