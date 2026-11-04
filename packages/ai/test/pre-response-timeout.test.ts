@@ -74,6 +74,9 @@ describe("armPreResponseTimeout", () => {
 describe("pre-response budget", () => {
 	afterEach(() => {
 		vi.useRealTimers();
+		// The Date.now spy below would otherwise outlive this file and freeze the
+		// clock (and `setSystemTime`) for every test file run after it.
+		vi.restoreAllMocks();
 	});
 
 	it("does not spend the budget while the transport is suspended", () => {
