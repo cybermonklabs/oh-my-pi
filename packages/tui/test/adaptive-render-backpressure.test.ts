@@ -93,7 +93,7 @@ describe("TUI adaptive render backpressure (#4145)", () => {
 			expect(stepRender(scheduler)).toBeGreaterThanOrEqual(250);
 		} finally {
 			tui.stop();
-			TUI.setMinRenderInterval(MIN_RENDER_INTERVAL_MS);
+			TUI.setMinRenderInterval(0);
 		}
 	});
 
