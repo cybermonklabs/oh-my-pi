@@ -15,9 +15,9 @@ use super::{
 	expand::{Expander, Stop},
 	is_ident, probe,
 	proc::{
-		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		AssignValue, Atom, Bang, BangStage, Coproc, Depths, ErrorBoundary, Frame, FrameKind,
+		InlineStage, LastBg, LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe,
+		ProbeResult, Run, Saved, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -381,8 +381,17 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					.rposition(|f| matches!(f.kind, FrameKind::Script { .. }));
 				// `parse_and_execute` rethrows DISCARD in a subshell; its
 				// EXIT trap still runs (`execute_in_subshell`).
-				if vp.jobs.subshell || super::subshell_depth(vp) > 0 {
-					exit_shell(k, vp, cx, if script.is_some() { 1 } else { status });
+				if vp.error_boundary.in_subshell() {
+					if exit_trap_status(vp).is_some() {
+						discard_all(k, vp, cx, status);
+					} else {
+						let status = if script.is_some() {
+							1
+						} else {
+							vp.error_boundary.discard_status(status)
+						};
+						exit_shell(k, vp, cx, status);
+					}
 				} else if let Some(i) = script {
 					vp.status = 1;
 					unwind(&mut k.root, cx.store, vp, i + 1);
@@ -568,24 +577,16 @@ pub fn reported_error_exit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Optio
 		.then_some(if vp.status == 0 { 1 } else { vp.status })
 }
 
-/// Bash `run_one_command` maps FORCE_EOF to 127. Subshells retain 1
-/// (`execute_in_subshell`); an ordinary exit/report_error does not map it.
+/// Only `run_one_command` maps FORCE_EOF to 127; a simple fork can still
+/// inherit it. Subshell/builtin/substitution catchers use 1. An EXIT trap
+/// instead retains its saved status.
 pub fn force_eof(vp: &Vproc, store: &mut dyn StateStore) -> Flow {
 	if let Some(status) = exit_trap_status(vp) {
 		return Flow::Exit(status);
 	}
-	let signal_trap = vp.frames.iter().any(|f| {
-		matches!(f.kind, FrameKind::Script {
-			what: ScriptKind::Trap { key: TrapKey::Signal(_), .. },
-			..
-		})
-	});
-	let command = (super::subshell_depth(vp) == 0 || signal_trap)
-		&& matches!(
-			state::record(store, vp, Key::Misc(MiscKey::RunOrigin)),
-			Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-		);
-	Flow::Exit(if command { 127 } else { 1 })
+	let command = matches!(state::record(store, vp, Key::Misc(MiscKey::RunOrigin)),
+		Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c");
+	Flow::Exit(vp.error_boundary.force_eof_status(command))
 }
 
 /// Bash `executing_command_builtin` also spans eval/source called by it.
@@ -1820,6 +1821,7 @@ pub fn start_sub(
 			// bash keeps job control and the job list in `$( )`: `jobs`
 			// lists the parent's jobs, `fg` finds no current job.
 			child.jobs = inherited_jobs(vp, vp.jobs.subshell);
+			child.error_boundary = ErrorBoundary::Failure;
 			let vpid = child.vpid;
 			k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 			k.spawned.push(Box::new(child));
@@ -1882,6 +1884,7 @@ pub fn start_zsh_sub(
 	fds.set(1, Some(FdRef::mem(capture.clone())));
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
+	child.error_boundary = ErrorBoundary::Failure;
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));
@@ -2068,7 +2071,8 @@ pub fn start_procsub(
 			fds.set(sibling, None);
 		}
 	}
-	let child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	child.error_boundary = ErrorBoundary::Failure;
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));
@@ -3133,11 +3137,11 @@ fn bash_case_hit(
 		.any(|p| k.engine.patterns().get(p, opts).matches(subject)))
 }
 
-/// bash's `subshell_level` step for a pipeline stage or (`background`) an
-/// async command starting at `entry`: a `( … )` counts once, at its own
+/// Bash's `(subshell_level step, simple-command fork)` for a pipeline stage
+/// or (`background`) an async command: `( … )` counts once, at its own
 /// `Spawn`; a simple command in a pipeline expands at the parent's level
 /// (bash's "not for pipes yet"); anything else is one more.
-fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
+fn stage_context(unit: &Unit, entry: u32, background: bool) -> (u32, bool) {
 	let ops = unit.ops.get(entry as usize..).unwrap_or_default();
 	let ops = match ops.first() {
 		Some(op) if op.code == Opcode::Redir => &ops[1..],
@@ -3152,10 +3156,10 @@ fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
 					.get(spawn.a as usize)
 					.is_some_and(|s| s.kind == SpawnKind::Subshell) =>
 		{
-			0
+			(0, false)
 		},
-		[exec, ..] if exec.code == Opcode::Exec && !background => 0,
-		_ => 1,
+		[exec, ..] if exec.code == Opcode::Exec => (u32::from(background), true),
+		_ => (1, false),
 	}
 }
 
@@ -3238,8 +3242,11 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				}
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
 				if info.kind == SpawnKind::Background {
-					let level = stage_level(unit, info.stages[0].entry, true);
+					let (level, simple) = stage_context(unit, info.stages[0].entry, true);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
+					if simple {
+						child.error_boundary = vp.error_boundary.fork_simple();
+					}
 				}
 				children.push(child.vpid);
 				let vpid = child.vpid;
@@ -3314,8 +3321,11 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						stdin = Some(FdRef::mem(r));
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
-					let level = stage_level(unit, stage.entry, false);
+					let (level, simple) = stage_context(unit, stage.entry, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
+					if simple {
+						child.error_boundary = vp.error_boundary.fork_simple();
+					}
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
 					// stage (`jobs -p | xargs kill`).
 					if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {
@@ -4532,6 +4542,22 @@ mod tests {
 		assert_eq!(stdin.host.stdout.bytes(), b"next:1\n");
 		assert_eq!(stdin.host.stderr.bytes(), b"");
 		assert_eq!(status, 0);
+	}
+
+	#[test]
+	fn jump_catchers_keep_distinct_statuses_across_snapshots() {
+		let cases: &[(&[u8], &[u8])] = &[
+			(b"{ set -o posix; readonly x; v=$(x=2); echo s:$?; } 2>/dev/null", b"s:1\n"),
+			(b"{ set -o posix; readonly x; f(){ x=2; }; true | eval 'x=2'; echo eval:$?; true | f; echo function:$?; } 2>/dev/null", b"eval:1\nfunction:127\n"),
+			(b"{ readonly x; true | : \"${x:=v}\"; echo s:$?; } 2>/dev/null", b"s:1\n"),
+			(b"{ readonly x; ( : \"${x:=v}\"; ); echo d:$?; set -o posix; ( x=2; ); echo e:$?; } 2>/dev/null", b"d:2\ne:1\n"),
+		];
+		for &(script, expected) in cases {
+			let result = run_script(FakeHost::new(), script, &[], Fault::Snapshot { every: 1 });
+			assert_eq!(result.stdout, expected);
+			assert_eq!(result.stderr, b"");
+			assert_eq!(result.status, 0);
+		}
 	}
 
 	// Golden: bash 5.3.20 `time -p` and the default format.

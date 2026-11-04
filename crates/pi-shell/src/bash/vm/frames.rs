@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 31;
+pub const FRAMES_VERSION: u32 = 32;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -236,42 +236,43 @@ impl FdRebuild<'_> {
 /// (`state::sync_root`), so the root's image has none.
 #[derive(Serialize, Deserialize)]
 struct ProcImage {
-	vpid:          Vpid,
-	parent:        Option<Vpid>,
-	runs:          Vec<RunImage>,
-	frames:        Vec<FrameImage>,
+	vpid:           Vpid,
+	parent:         Option<Vpid>,
+	runs:           Vec<RunImage>,
+	frames:         Vec<FrameImage>,
 	/// Fd object index of every slot.
-	fds:           Vec<Option<u32>>,
+	fds:            Vec<Option<u32>>,
 	/// A subshell's own state (`None` for the root vproc).
-	fields:        Option<Fields>,
-	out:           Vec<PendingWrite>,
-	pending_traps: SigSet,
-	stopped:       bool,
-	transient:     bool,
-	procsubs:      Vec<(u32, i32)>,
-	coprocs:       Vec<super::proc::Coproc>,
-	restore_opts:  Vec<BString>,
-	trace_base:    u32,
+	fields:         Option<Fields>,
+	out:            Vec<PendingWrite>,
+	pending_traps:  SigSet,
+	stopped:        bool,
+	transient:      bool,
+	procsubs:       Vec<(u32, i32)>,
+	coprocs:        Vec<super::proc::Coproc>,
+	restore_opts:   Vec<BString>,
+	trace_base:     u32,
 	/// `$BASH_SUBSHELL`.
-	subshell:      u32,
+	subshell:       u32,
+	error_boundary: super::proc::ErrorBoundary,
 	/// `BASH_COMMAND`: the unit (written to the store) and syntax node; a
 	/// trap action that runs after the restore still names the trapped
 	/// command.
-	command:       Option<(UnitId, u32)>,
+	command:        Option<(UnitId, u32)>,
 	/// Pushes onto bash's call-stack arrays.
-	calls:         Vec<super::callstack::Call>,
+	calls:          Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
-	own_traps:     super::proc::OwnTraps,
+	own_traps:      super::proc::OwnTraps,
 	/// Current mode (the root's is also `MiscKey::Mode`).
-	mode:          ModeId,
+	mode:           ModeId,
 	/// zsh state (sticky emulation, frames' restores).
-	zsh:           Option<Box<super::proc::VprocZsh>>,
+	zsh:            Option<Box<super::proc::VprocZsh>>,
 	/// Host lineage (a detached tree stays detached after a restore).
-	lineage:       crate::bash::host::Lineage,
+	lineage:        crate::bash::host::Lineage,
 	/// What the vproc was parked on and the wake count then: a restored
 	/// shell schedules exactly as the externalized one would have (no
 	/// second `Blocked`, same interleaving).
-	blocked:       Option<(WaitKey, u64)>,
+	blocked:        Option<(WaitKey, u64)>,
 }
 
 /// A subshell vproc's state that the root vproc keeps in the store.
@@ -587,6 +588,7 @@ impl Shell {
 				restore_opts: p.restore_opts.clone(),
 				trace_base: p.trace_base,
 				subshell: p.subshell,
+				error_boundary: p.error_boundary,
 				command,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
@@ -812,6 +814,7 @@ impl Shell {
 			vp.restore_opts = p.restore_opts;
 			vp.trace_base = p.trace_base;
 			vp.subshell = p.subshell;
+			vp.error_boundary = p.error_boundary;
 			vp.calls = p.calls;
 			vp.own_traps = p.own_traps;
 			vp.mode = p.mode;

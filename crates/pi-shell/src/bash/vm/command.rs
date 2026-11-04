@@ -2677,6 +2677,11 @@ fn run_builtin(
 	line: u32,
 	id: IntrinsicId,
 ) -> Option<Flow> {
+	// The local setjmp is installed after redirections, only for the
+	// outer builtin of a simple fork (`execute_subshell_builtin_or_function`).
+	if vp.frames.len() == 1 {
+		vp.error_boundary = vp.error_boundary.enter_builtin();
+	}
 	if !st(vp).scoped {
 		st(vp).scoped = true;
 		let scope = Scope {
