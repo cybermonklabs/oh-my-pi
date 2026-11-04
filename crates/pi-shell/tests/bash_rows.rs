@@ -775,4 +775,16 @@ bash_rows! {
 	/// is the outermost wrapper and is a plain false when `command` is. The
 	/// rows are the readonly slice's wrapper probe of the #17712 port.
 	a_wrapped_special_builtin_is_no_special_builtin;
+
+	/// An arithmetic error in an assignment (a subscript `a[1/0]`, an integer
+	/// variable's `x=1/0`, a readonly variable in a subscript `a[x++]`) ends
+	/// the `bash -c` shell with status 1, in POSIX mode too, also from inside
+	/// `eval`, a sourced file, and a function tested by `if` under `set -e`
+	/// whose earlier status was 7. In an EXIT trap it ends the trap and the
+	/// shell keeps the status `exit` gave; the EXIT trap of a shell the error
+	/// ended runs at top level, with no function and none of its locals. An
+	/// invalid nameref target in `for` is no such error: the loop fails with
+	/// status 1 and the function and its caller go on. The rows are the
+	/// readonly slice's error-context probe of the #17712 port.
+	an_arithmetic_error_in_an_assignment_ends_the_shell;
 }
