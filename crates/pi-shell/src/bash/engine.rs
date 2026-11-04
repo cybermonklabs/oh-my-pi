@@ -82,6 +82,9 @@ pub struct Engine {
 	patterns:     PatternCache,
 	/// Compiled zsh patterns (bounded; see [`ZshPatternCache`]).
 	zsh_patterns: ZshPatternCache,
+	/// `$functions` bodies regenerated from function sources, by source
+	/// (regenerating means a parse; plugins scan `$functions` on every key).
+	bodies:       Mutex<HashMap<BString, BString>>,
 }
 
 #[derive(Default)]
@@ -101,6 +104,7 @@ impl Engine {
 			arith: ArithCache::default(),
 			patterns: PatternCache::default(),
 			zsh_patterns: ZshPatternCache::default(),
+			bodies: Mutex::new(HashMap::new()),
 		})
 	}
 
@@ -117,6 +121,24 @@ impl Engine {
 	/// The compiled zsh-pattern cache.
 	pub(crate) const fn zsh_patterns(&self) -> &ZshPatternCache {
 		&self.zsh_patterns
+	}
+
+	/// The `$functions` body of the function whose source is `source`,
+	/// made by `make` the first time.
+	pub(crate) fn function_body(
+		&self,
+		source: &[u8],
+		make: impl FnOnce(&[u8]) -> BString,
+	) -> BString {
+		if let Some(body) = self.bodies.lock().get(source) {
+			return body.clone();
+		}
+		let body = make(source);
+		self
+			.bodies
+			.lock()
+			.insert(BString::from(source), body.clone());
+		body
 	}
 
 	/// The configuration.
@@ -148,8 +170,11 @@ impl Engine {
 		self.intern(unit)
 	}
 
-	/// Share `unit` through the cache (an identical cached unit wins).
+	/// Share `unit` through the cache (an identical cached unit wins). The
+	/// cache holds executable units only: a deferred body is lowered
+	/// (`ir::materialize`) first.
 	pub(crate) fn intern(&self, unit: Unit) -> Arc<Unit> {
+		debug_assert!(unit.deferred.is_none(), "deferred unit interned before lowering");
 		let mut cache = self.units.lock();
 		if let Some(hit) = cache.map.get(&unit.id) {
 			return Arc::clone(hit);

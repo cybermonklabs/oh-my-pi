@@ -4,13 +4,23 @@
 
 ### Changed
 
+- Native builds now reuse the shared diff implementation, and macOS display discovery no longer needs a separate capture library
+- Shell spawn benchmarks report median and p99 latency without an additional benchmark framework
+
+- The work-profile flamegraph is now a static SVG (hover titles, no click-to-zoom or search)
+- Sixel image output uses a built-in encoder; images with more than 256 colors may get a slightly different palette
 - Made the bash tool's shell faster on string appends (`s+=x`), sourcing files full of function definitions (each body compiles on first call), quoted `"$var"`/`"$1"` arguments and file redirections
+- Made the bash tool's shell faster on `while read` loops over files (no per-line `lseek`), output sent to `/dev/null`, `(( ))` arithmetic, recursive functions, plain assignments and every simple command
+- Made starting external commands from the bash tool's shell cheaper on Linux (the child no longer resets every signal disposition before `exec`, and the parent reuses its spawn setup and makes about half as many system calls per command)
+- Made the bash tool's shell parse scripts and define functions about a fifth faster, with a function's `declare -f` text now produced on first use
+- Made the bash tool's shell start with about half as many system calls on Linux
 
 ### Fixed
 
 - Fixed recursive `eval`, `source` and command substitutions exhausting memory: nesting bounds now cover inherited depth, utility callbacks and nested shells, including recursion reached through aliases ([#17646](https://github.com/can1357/oh-my-pi/pull/17646) by [@sjawhar](https://github.com/sjawhar))
 - Fixed `FUNCNEST` values that overflow a signed 64-bit decimal or are arrays incorrectly enabling a limit, wrapped limits and inherited function depth in subshells; refusals stop the affected shell as in Bash 5.3, and under an `EXIT` trap exit with the status the latest trap saved ([#17646](https://github.com/can1357/oh-my-pi/pull/17646) by [@sjawhar](https://github.com/sjawhar))
 - Fixed shell API run timeouts being ignored unless repeated in the cancellation token, and cancelling nested functions discarding the session's global state instead of just unwinding their temporary scopes ([#17646](https://github.com/can1357/oh-my-pi/pull/17646) by [@sjawhar](https://github.com/sjawhar))
+- Removed embedded-shell compiler warnings and fixed history saves hanging when a stale lock cannot be removed
 - Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
 ### Fixed
 
