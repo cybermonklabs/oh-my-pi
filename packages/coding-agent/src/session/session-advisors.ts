@@ -1,6 +1,7 @@
 import { scheduler } from "node:timers/promises";
 import {
 	Agent,
+	agentPauseGate,
 	type AgentMessage,
 	type AgentTool,
 	type AgentToolContext,
@@ -1432,6 +1433,9 @@ export class SessionAdvisors {
 				// Not gated on a tool grant: reading what a server advertises is
 				// not the same permission as calling one of its tools.
 				mcpResources: this.#advisorMcpResources,
+				// The advisor's own agent, resolved per frame: this bridge is built before it.
+				// Work a frame starts is the advisor's, never the primary's call of the same id.
+				getExecutionOwner: () => advisorAgent,
 			});
 			const baseAdvisorStreamFn = this.#advisorStreamFn ?? streamSimple;
 			const advisorStreamFn: StreamFn = (requestModel, context, streamOptions) => {
@@ -1585,7 +1589,8 @@ export class SessionAdvisors {
 
 			// Persist this advisor's turns to `<session>/__advisor[.<slug>].jsonl`
 			// (resolved lazily so it follows session switches) for stats attribution
-			// and Agent Hub observability, without registering it as a peer.
+			// and Agent Hub observability, without registering it as a peer. It goes
+			// to the session's own storage, beside the rest of its transcript tree.
 			const recorder = new AdvisorTranscriptRecorder(
 				() => this.#host.sessionManager.getSessionFile(),
 				() => this.#host.sessionManager.getCwd(),
@@ -1595,6 +1600,7 @@ export class SessionAdvisors {
 				this.#advisorCostSnapshotBarrier
 					? Promise.all([this.#advisorRecorderClosed, this.#advisorCostSnapshotBarrier])
 					: this.#advisorRecorderClosed,
+				this.#host.sessionManager.getStorage(),
 			);
 			const runtime = new AdvisorRuntime(advisorAgentFacade, {
 				snapshotMessages: () => this.#host.agent.state.messages,
@@ -2104,6 +2110,7 @@ export class SessionAdvisors {
 					errorId: assistantFailure.errorId,
 					errorMessage: message,
 					errorStatus: assistantFailure.errorStatus,
+					errorRetryAfterMs: assistantFailure.errorRetryAfterMs,
 				})
 			: AIError.classify(error, currentModel.api);
 		if (AIError.is(errorId, AIError.Flag.Abort) || AIError.is(errorId, AIError.Flag.UserInterrupt)) return false;
@@ -2122,15 +2129,19 @@ export class SessionAdvisors {
 			const rotation = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
 				advisor.providerSessionId,
-				{ error: message, modelId: currentModel.id, signal },
+				{ error: message, retryAfterMs: assistantFailure?.errorRetryAfterMs, modelId: currentModel.id, signal },
 			);
 			if (rotation.switched && this.#spendCredentialSwitch(advisor, currentModel.provider)) return true;
 		}
 
-		const retryAfterMs = extractProviderRetryHint(currentModel.provider, message);
+		const retryAfterMs = extractProviderRetryHint(
+			currentModel.provider,
+			message,
+			assistantFailure?.errorRetryAfterMs,
+		);
 		const usageLimit =
 			AIError.is(errorId, AIError.Flag.UsageLimit) ||
-			isUsageLimitOutcome(extractHttpStatusFromError(error), message);
+			isUsageLimitOutcome(extractHttpStatusFromError(error), message, assistantFailure?.errorRetryAfterMs);
 		let usageRetryAtMs: number | undefined;
 		let usageBlockedUntilMs: number | undefined;
 		let usageRequestedBlockedUntilMs: number | undefined;
@@ -2602,6 +2613,9 @@ export class SessionAdvisors {
 						preferWebsockets: this.#host.preferWebsockets(candidate),
 						codexAccessPrograms: cfgProvidersOpenaiCodexDaybreak.get(this.#host.settings),
 						codexCompaction,
+						// The advisor's loop holds its own turns at `/pause`, but this
+						// one-shot bypasses it: hold every request the pass sends.
+						beforeDispatch: agentPauseGate.dispatchHold(signal),
 					},
 				);
 				break;

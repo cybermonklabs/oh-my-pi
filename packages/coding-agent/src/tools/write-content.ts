@@ -4,7 +4,7 @@
  */
 import { formatHashlineHeader, stripHashlinePrefixes } from "@oh-my-pi/pi-tui/tools/hashline-format";
 import { normalizeToLF } from "../edit/normalize";
-import { getEditStore } from "../edit/store";
+import { getEditStore, NO_FULL_LINE } from "../edit/store";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from "./index";
 import { formatPathRelativeToCwd } from "./path-utils";
@@ -88,10 +88,13 @@ export function stripWriteContent(session: ToolSession, content: string): { text
  *
  * Mirrors the post-commit snapshot recording the hashline patcher performs
  * after a successful edit — the model gets a tag without an extra `read` —
- * but with EMPTY seen-line provenance: a write displays no numbered lines,
- * so anchored edits against this tag must first see the anchor content (the
- * patcher rejects them with an inline reveal). Authoring content is not
- * knowing its line numbers.
+ * but with provenance that shows no line: a write displays no numbered lines,
+ * so the first line-anchored edit against this tag gets the seen-line
+ * rejection that reveals the anchor content. When that reveal shows every
+ * anchor line in full (at most 40 lines, each within 512 columns), the
+ * identical retry applies; otherwise the lines need a `read` first. Head and
+ * tail inserts (`PUT <1:`, `PUT >$:`) anchor no line and apply at once.
+ * Authoring content is not knowing its line numbers.
  */
 export function maybeWriteSnapshotHeader(
 	session: ToolSession,
@@ -101,6 +104,6 @@ export function maybeWriteSnapshotHeader(
 ): string | undefined {
 	if (!resolveFileDisplayMode(session).hashLines) return undefined;
 	const normalized = normalizeToLF(content);
-	const tag = getEditStore(session).recordSnapshot(absolutePath, normalized, []);
+	const tag = getEditStore(session).recordSnapshot(absolutePath, normalized, [NO_FULL_LINE]);
 	return formatHashlineHeader(displayPath, tag);
 }

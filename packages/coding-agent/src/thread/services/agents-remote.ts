@@ -12,7 +12,13 @@
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentAwaitsApi } from "../../registry/agent-awaits";
-import type { AdoptOptions, AgentLifecycleApi, PersistedSubagentReviverFactory } from "../../registry/agent-lifecycle";
+import type {
+	AdoptOptions,
+	AgentLifecycleApi,
+	ColdReviveOptions,
+	LiveAgentTarget,
+	PersistedSubagentReviverFactory,
+} from "../../registry/agent-lifecycle";
 import type {
 	AgentHistorySummary,
 	AgentRef,
@@ -146,6 +152,10 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 		return this.#remote.callSync("unregister", id, expected);
 	}
 
+	bindLiveName(name: string, targetId: string, sessionFile: string): boolean {
+		return this.#remote.callSync("bindLiveName", name, targetId, sessionFile);
+	}
+
 	get(id: string): AgentRef | undefined {
 		return this.#remote.callSync("get", id);
 	}
@@ -211,8 +221,12 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.call("park", id);
 	}
 
-	ensureLive(id: string): Promise<AgentSessionHandle> {
-		return this.#remote.call("ensureLive", id);
+	ensureLive(id: string, coldRevive?: ColdReviveOptions): Promise<AgentSessionHandle> {
+		return this.#remote.call("ensureLive", id, coldRevive);
+	}
+
+	ensureLiveTarget(id: string, coldRevive?: ColdReviveOptions): Promise<LiveAgentTarget> {
+		return this.#remote.call("ensureLiveTarget", id, coldRevive);
 	}
 
 	release(id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }): Promise<boolean> {

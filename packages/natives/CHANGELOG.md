@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `TtyWriter.discard()`, which drops terminal output that was queued but not yet written; the chunk already being written still finishes ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+
+### Fixed
+
+- The bash tool's built-in `df`, `du`, `env`, `fold` and `sort` now honour a locale the shell exports through `LOCPATH` instead of falling back to the C locale, so a German locale there gives `sort -n` and `du -h` a decimal comma and a UTF-8 one stops `fold` splitting characters; whether a locale is UTF-8 now comes from its data rather than its name. `sort`, `du` and `df` were compared with GNU coreutils 9.4 runs; `fold` and `env` model coreutils 9.12, newer than the 9.4 available, so their reference is libc's own answer (`locale charmap`) ([#17401](https://github.com/can1357/oh-my-pi/pull/17401) by [@sjawhar](https://github.com/sjawhar))
+- The bash tool's built-in `df`, `du`, `env`, `fold` and `sort` now run in the C locale when one category the shell's locale names is not installed, as GNU coreutils do when `setlocale(LC_ALL, "")` fails, instead of applying the categories that do load: `sort` compares bytes and `sort --debug` reports `failed to set locale`, `du` and `df` group no digits, and `fold` splits multibyte characters; each prints a warning when it cannot read the shell's locale at all. `sort`, `du` and `df` were compared with GNU coreutils 9.4 runs; `fold` and `env` model coreutils 9.12, newer than the 9.4 available, so their reference is libc's own answer (`setlocale` failing, as bash reports it) ([#17401](https://github.com/can1357/oh-my-pi/pull/17401) by [@sjawhar](https://github.com/sjawhar))
+- Fixed `TtyWriter.flushSync()` and `stop()` sometimes waiting out their whole timeout after the queued output had already been written ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Fixed `TtyWriter.stop()` occasionally hanging forever when the queue had already drained ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Fixed a `git status` that exceeded its deadline leaving a stale `.git/index.lock` behind, which made every later git or jj write in that worktree fail until the lock was deleted by hand ([#13405](https://github.com/can1357/oh-my-pi/pull/13405) by [@sjawhar](https://github.com/sjawhar)).
 ### Changed
 
 - Made the bash tool's shell faster on string appends (`s+=x`), sourcing files full of function definitions (each body compiles on first call), quoted `"$var"`/`"$1"` arguments and file redirections

@@ -8,6 +8,7 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { isUsageLimitOutcome } from "@oh-my-pi/pi-ai/error/rate-limit";
 import type { AuthApiKeyOptions, AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
 import type { Api, Model } from "@oh-my-pi/pi-ai/types";
+import { getHeadersFromError, getRetryAfterMsFromHeaders } from "@oh-my-pi/pi-ai/utils/retry-after";
 
 /** Model slice accepted by the model-form `resolver(model, sessionId)` overload. */
 export type ApiKeyResolverModel = Pick<Model<Api>, "provider" | "baseUrl" | "id">;
@@ -19,6 +20,28 @@ export interface ApiKeyResolverOptions {
 	baseUrl?: string;
 	/** Provider model id forwarded to model-scoped usage ranking/backoff. */
 	modelId?: string;
+}
+
+/**
+ * A provider's configured `!command` apiKey ran but produced no key (failed,
+ * timed out, or printed nothing). Transient, so turn auto-retry resolves again;
+ * `retryAfterMs` (the command's remaining failure backoff) rides on the message
+ * as the standard `retry-after-ms` hint, so each retry re-runs the command. The
+ * message never includes the command, which can carry credentials.
+ */
+export class ApiKeyCommandError extends AIError.CredentialUnavailableError {
+	constructor(provider: string, retryAfterMs: number | undefined) {
+		const hint = retryAfterMs ? ` retry-after-ms=${retryAfterMs}` : "";
+		super(`The apiKey command for provider ${provider} produced no key${hint}`);
+		this.name = "ApiKeyCommandError";
+	}
+}
+
+const API_KEY_COMMAND_FAILURE_PATTERN = /\bThe apiKey command for provider \S+ produced no key\b/;
+
+/** Whether a turn's error text is an {@link ApiKeyCommandError}, which turn recovery retries on its own cap. */
+export function isApiKeyCommandFailureMessage(errorMessage: string | undefined): boolean {
+	return errorMessage !== undefined && API_KEY_COMMAND_FAILURE_PATTERN.test(errorMessage);
 }
 
 /**
@@ -104,7 +127,9 @@ export function createApiKeyResolver(
 				// No sibling for an account-quota failure: stop so the outer
 				// whole-turn retry layer can honor the recorded backoff. A hard
 				// auth decline can instead mean a peer refreshed the bearer.
-				if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message)) return undefined;
+				const headerRetryAfterMs = getRetryAfterMsFromHeaders(getHeadersFromError(error));
+				if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message, headerRetryAfterMs))
+					return undefined;
 			}
 			const resolved = await resolveKey(undefined);
 			return rotation.afterSiblingWait ? markAfterSiblingWait(resolved) : resolved;

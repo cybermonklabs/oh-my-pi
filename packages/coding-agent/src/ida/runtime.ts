@@ -4,9 +4,9 @@ import { $ } from "bun";
 import { Settings } from "../config/settings";
 import {
 	enumeratePythonRuntimes,
-	filterEnv,
 	type PythonRuntime,
 	resolveExplicitPythonRuntime,
+	resolvePythonBaseEnv,
 } from "../eval/py/runtime";
 import type { ToolSession } from "../tools";
 import { cfgIdaInstall } from "./install";
@@ -56,7 +56,7 @@ export function resolveIdaRuntime(session: ToolSession): Promise<IdaRuntime> {
 }
 
 async function probeIdaRuntime(python: string | undefined, installDir: string, cwd: string): Promise<IdaRuntime> {
-	const baseEnv = filterEnv((await Settings.init()).getShellConfig().env);
+	const baseEnv = resolvePythonBaseEnv(await Settings.init());
 	const candidates: PythonRuntime[] = python
 		? [resolveExplicitPythonRuntime(python, cwd, baseEnv)]
 		: enumeratePythonRuntimes(cwd, baseEnv);

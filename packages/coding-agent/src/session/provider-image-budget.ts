@@ -305,6 +305,7 @@ const TOOL_DECLARATION_KEYS = Object.keys({
 	customWireName: true,
 	native: true,
 	examples: true,
+	lenientArgValidation: true,
 } satisfies Record<keyof Tool, true>) as (keyof Tool)[];
 
 function declaredTools(tools: readonly Tool[] | undefined): Tool[] | undefined {

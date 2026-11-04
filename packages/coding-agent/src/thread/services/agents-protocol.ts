@@ -3,7 +3,7 @@
  * worker's proxies to the main thread's instances (see `./agents`).
  */
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
-import type { AdoptOptions } from "../../registry/agent-lifecycle";
+import type { AdoptOptions, ColdReviveOptions, LiveAgentTarget } from "../../registry/agent-lifecycle";
 import type {
 	AgentHistorySummary,
 	AgentRef,
@@ -43,6 +43,7 @@ export type AgentRegistryProtocol = {
 	>;
 	detachSession: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
 	unregister: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
+	bindLiveName: RpcMethod<[name: string, targetId: string, sessionFile: string], boolean>;
 	get: RpcMethod<[id: string], AgentRef | undefined>;
 	list: RpcMethod<[], AgentRef[]>;
 	listVisibleTo: RpcMethod<[id: string], AgentRef[]>;
@@ -63,7 +64,9 @@ export type AgentLifecycleProtocol = {
 	manages: RpcMethod<[registry: AgentRegistryApi], boolean>;
 	isParking: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
 	park: RpcMethod<[id: string], void>;
-	ensureLive: RpcMethod<[id: string], AgentSessionHandle>;
+	/** A `coldRevive` factory crosses as a callback into the thread that supplied it. */
+	ensureLive: RpcMethod<[id: string, coldRevive?: ColdReviveOptions], AgentSessionHandle>;
+	ensureLiveTarget: RpcMethod<[id: string, coldRevive?: ColdReviveOptions], LiveAgentTarget>;
 	release: RpcMethod<[id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }], boolean>;
 };
 
