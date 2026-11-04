@@ -3,11 +3,20 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { IrcBus, type IrcBusApi } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { SessionFocusController } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { AgentLifecycleManager, type AgentReviver } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import {
+	type AgentLifecycleApi,
+	AgentLifecycleManager,
+	type AgentReviver,
+} from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import {
+	type AgentRef,
+	AgentRegistry,
+	type AgentRegistryApi,
+	MAIN_AGENT_ID,
+} from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ensurePersistedRoster } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -153,9 +162,9 @@ class HoldingProcess {
 }
 
 describe("a session this process is running is not a revivable transcript", () => {
-	let registry: AgentRegistry;
-	let bus: IrcBus;
-	let lifecycle: AgentLifecycleManager;
+	let registry: AgentRegistryApi;
+	let bus: IrcBusApi;
+	let lifecycle: AgentLifecycleApi;
 	let revived: string[];
 	const openManagers: SessionManager[] = [];
 	const openSessions: AgentSession[] = [];
@@ -723,8 +732,8 @@ describe("a session this process is running is not a revivable transcript", () =
 });
 
 describe("a session another omp process is running is not a revivable transcript", () => {
-	let registry: AgentRegistry;
-	let bus: IrcBus;
+	let registry: AgentRegistryApi;
+	let bus: IrcBusApi;
 	let revived: string[];
 	const openManagers: SessionManager[] = [];
 
