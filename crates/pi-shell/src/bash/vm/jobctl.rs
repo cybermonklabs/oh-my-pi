@@ -810,13 +810,15 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	jf.redirs = redirs;
 	jf.kind = FrameKind::Job { stop_at: end };
 	job.frames.extend(moved);
-	job.trap_frames = u32::try_from(
+	job.trap_frames = u16::try_from(
 		job.frames
 			.iter()
 			.filter(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }))
 			.count(),
 	)
-	.unwrap_or(u32::MAX);
+	.unwrap_or(u16::MAX);
+	// Trap actions that moved keep the status the latest trap saved.
+	job.trap_status = vp.trap_status;
 	let jvpid = job.vpid;
 	for child in children {
 		match k.spawned.iter_mut().find(|p| p.vpid == child) {

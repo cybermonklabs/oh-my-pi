@@ -2128,7 +2128,7 @@ pub fn start_sub(
 					child.status = 0;
 				}
 				// A re-parsed one counts its `eval`-like frame instead.
-				child.trace_base += 1;
+				child.trace_base = child.trace_base.saturating_add(1);
 				child
 			};
 			// With `-e` already off in the parent the child sees it off and

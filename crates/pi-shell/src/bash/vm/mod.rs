@@ -2780,7 +2780,7 @@ impl Vproc {
 			vp.jobs = exec::inherited_jobs(self, true);
 		}
 		vp.calls = callstack::inherited(self);
-		vp.trace_base = xtrace::level(self) - 1;
+		vp.trace_base = u16::try_from(xtrace::level(self) - 1).unwrap_or(u16::MAX);
 		// Started from a context where `set -e` is ignored (the parent's op
 		// is a condition, or its frame runs in one): so is the child.
 		frame.ignore_errexit = self.frames.last().is_some_and(|f| {
@@ -2801,16 +2801,16 @@ impl Vproc {
 
 /// `$BASH_SUBSHELL` of `vp` ([`Vproc::subshell`]); zero for the shell
 /// itself and a nested shell.
-pub const fn subshell_depth(vp: &Vproc) -> u32 {
-	vp.subshell
+pub fn subshell_depth(vp: &Vproc) -> u32 {
+	u32::from(vp.subshell)
 }
 
 /// Set `vp`'s `$BASH_SUBSHELL` (a vproc without an overlay is the shell
 /// itself and stays at zero). Called by `child_running` and by
 /// `exec::spawn` for pipeline stages and background jobs.
-pub const fn set_subshell_depth(vp: &mut Vproc, depth: u32) {
+pub fn set_subshell_depth(vp: &mut Vproc, depth: u32) {
 	if vp.overlay.is_some() {
-		vp.subshell = depth;
+		vp.subshell = u16::try_from(depth).unwrap_or(u16::MAX);
 	}
 }
 

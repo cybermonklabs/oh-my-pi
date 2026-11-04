@@ -251,9 +251,9 @@ struct ProcImage {
 	procsubs:      Vec<(u32, i32)>,
 	coprocs:       Vec<super::proc::Coproc>,
 	restore_opts:  Vec<BString>,
-	trace_base:    u32,
+	trace_base:    u16,
 	/// `$BASH_SUBSHELL`.
-	subshell:      u32,
+	subshell:      u16,
 	/// Engine process nesting (not reset by a nested shell).
 	fork_depth:    u8,
 	/// Runtime script depth retained in ancestor processes.

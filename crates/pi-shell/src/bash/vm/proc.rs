@@ -77,12 +77,14 @@ pub struct Vproc {
 	pub lineage:       crate::bash::host::Lineage,
 	/// `set -x` nesting this vproc starts at, beyond the first level (bash's
 	/// `indirection_level`): its parent's, plus one in a command
-	/// substitution.
-	pub trace_base:    u32,
+	/// substitution. Bounded by the eval/source and process caps, so 16
+	/// bits (saturating) leave room for [`Self::trap_status`].
+	pub trace_base:    u16,
 	/// `$BASH_SUBSHELL`: the subshell nesting (0 for the shell itself and a
 	/// nested shell). A field, not an overlay record: a record would cost
 	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
-	pub subshell:      u32,
+	/// Bounded by the process cap (saturating at 16 bits).
+	pub subshell:      u16,
 	/// Engine process nesting, including nested shells that reset
 	/// `$BASH_SUBSHELL`. Never reset while descending into a child.
 	pub fork_depth:    u8,

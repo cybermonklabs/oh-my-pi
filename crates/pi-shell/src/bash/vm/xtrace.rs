@@ -30,7 +30,7 @@ pub fn level(vp: &Vproc) -> u32 {
 		})
 		.count();
 	1u32
-		.saturating_add(vp.trace_base)
+		.saturating_add(u32::from(vp.trace_base))
 		.saturating_add(u32::try_from(nested).unwrap_or(u32::MAX))
 }
 
