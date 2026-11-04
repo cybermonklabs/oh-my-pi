@@ -2025,8 +2025,15 @@ impl Shell {
 		// Vprocs this signal stopped or continued (job states follow).
 		let mut changed: Vec<(Vpid, Option<Signal>)> = Vec::new();
 		for &i in hits.iter().rev() {
-			if let Some(handler) =
-				awaited_call(&self.procs[i]).and_then(|call| self.k.callout_signals.get_mut(&call))
+			let process_call = tail_command(&self.procs[i])
+				&& self.procs[i].transient
+				&& !self.procs[i]
+					.own_traps
+					.has(crate::bash::store::TrapKey::Exit);
+			if let Some(handler) = process_call
+				.then(|| awaited_call(&self.procs[i]))
+				.flatten()
+				.and_then(|call| self.k.callout_signals.get_mut(&call))
 			{
 				if !matches!(sig, Signal::Kill | Signal::Stop) && handler.ignored.contains(sig) {
 					continue;

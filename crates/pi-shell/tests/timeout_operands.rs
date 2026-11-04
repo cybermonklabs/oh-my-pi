@@ -119,3 +119,13 @@ async fn a_nested_timeout_handles_its_signal_and_kill_deadline() {
 		assert_eq!(output(&format!("{command}; echo status:$?")).await, expected, "{command}");
 	}
 }
+
+#[tokio::test]
+async fn a_shell_waiting_for_timeout_is_still_the_signal_recipient() {
+	for operand in
+		["eval 'timeout 20 /bin/sleep 3; echo late'", "builtin command timeout 20 /bin/sleep 3"]
+	{
+		let source = format!("timeout --preserve-status -s ALRM 1 {operand}; echo status:$?");
+		assert_eq!(output(&source).await, "status:142\n", "{operand}");
+	}
+}

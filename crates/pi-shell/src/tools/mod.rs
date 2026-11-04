@@ -523,7 +523,7 @@ impl ToolCalls {
 			};
 			let (_, tool) = self.active.swap_remove(at);
 			self.orphans.extend(tool.pending());
-			if answer.is_none() && tool.child().label != 0 {
+			if answer.is_none() && tool.child().label != 0 && !matches!(tool, Tool::Nohup(_)) {
 				ctl.signal(
 					crate::bash::SigTarget::Label(tool.child().label),
 					crate::bash::Signal::Kill,
