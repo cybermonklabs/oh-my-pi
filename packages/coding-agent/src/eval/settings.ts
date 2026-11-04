@@ -43,6 +43,36 @@ export const cfgEvalAutoProvision = register({
 	},
 });
 
+const EMPTY_EVAL_ENV_PASSTHROUGH: Readonly<Record<string, readonly string[]>> = {};
+
+/**
+ * Rejects an `eval.envPassthrough` value that is not `{ names?: string[], prefixes?: string[] }`.
+ *
+ * @throws Error naming the malformed field.
+ */
+function validateEvalEnvPassthrough(value: unknown): void {
+	if (value === undefined || value === null) return;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("Invalid eval.envPassthrough: expected { names?: string[], prefixes?: string[] }.");
+	}
+	for (const [key, entries] of Object.entries(value)) {
+		if (key !== "names" && key !== "prefixes") {
+			throw new Error(`Invalid eval.envPassthrough.${key}: only names and prefixes are supported.`);
+		}
+		if (entries === undefined || entries === null) continue;
+		if (!Array.isArray(entries) || entries.some(entry => typeof entry !== "string")) {
+			throw new Error(`Invalid eval.envPassthrough.${key}: expected a list of strings.`);
+		}
+	}
+}
+
+export const cfgEvalEnvPassthrough = register({
+	id: "eval.envPassthrough",
+	type: "record",
+	default: EMPTY_EVAL_ENV_PASSTHROUGH,
+	validate: validateEvalEnvPassthrough,
+});
+
 export const cfgEvalToolsEnabled = register({
 	id: "eval.tools.enabled",
 	type: "boolean",

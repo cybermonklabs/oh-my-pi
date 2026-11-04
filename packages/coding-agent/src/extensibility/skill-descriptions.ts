@@ -1,7 +1,8 @@
 import { Database, type Statement } from "bun:sqlite";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type AgentTelemetry, instrumentedCompleteSimple } from "@oh-my-pi/pi-agent-core";
+import { type AgentTelemetry, agentPauseGate, instrumentedCompleteSimple } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import {
 	getAgentDir,
@@ -12,7 +13,7 @@ import {
 	postmortem,
 	prompt,
 } from "@oh-my-pi/pi-utils";
-import type { ModelRegistry } from "../config/model-registry";
+import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import {
 	resolveConfiguredModelPatterns,
 	resolveProviderModelReference,
@@ -92,8 +93,12 @@ export function createSkillDescriptionCompressor(
 		async compress(_name, _description, request) {
 			const model = select();
 			if (!model) throw new Error("No smol or tiny model available");
-			const apiKey = await registry.getApiKey(model, sessionId);
+			const apiKey = await probeModelApiKey(registry, model, sessionId);
 			if (!apiKey) throw new Error(`No credential for ${model.provider}/${model.id}`);
+			// The 30 s budget bounds the model, not a human's `/pause`: wait a pause
+			// out before arming it.
+			await agentPauseGate.dispatchHold()();
+			const signal = AbortSignal.timeout(30_000);
 			const response = await instrumentedCompleteSimple(
 				model,
 				{
@@ -105,7 +110,11 @@ export function createSkillDescriptionCompressor(
 					maxTokens: 1024,
 					disableReasoning: true,
 					temperature: 0,
-					signal: AbortSignal.timeout(30_000),
+					signal,
+					// Held at the provider boundary too. A pause engaged once the
+					// budget runs can still expire it; that compression fails and
+					// is retried at the next prompt render, like any failed one.
+					beforeDispatch: agentPauseGate.dispatchHold(signal),
 				},
 				{ telemetry: getTelemetry?.(), oneshotKind: "skill_description" },
 			);
@@ -113,7 +122,7 @@ export function createSkillDescriptionCompressor(
 				throw new SkillDescriptionLengthError("Model stopped: length");
 			}
 			if (response.stopReason !== "stop") {
-				throw new Error(`Model stopped: ${response.stopReason} ${response.errorMessage ?? ""}`);
+				throw new Error(`Model stopped: ${response.stopReason} ${errorDisplayText(response) ?? ""}`);
 			}
 			return response.content
 				.filter(block => block.type === "text")

@@ -94,6 +94,13 @@ export interface WorkPoolCreateOptions {
 	policy: EffectiveSubagentPolicy;
 	context?: string;
 	customTools?: CustomTool[];
+	/**
+	 * Run once the pool can no longer start a turn, whether it drained, was
+	 * closed, or its owning session ended. Releases whatever the creating cell
+	 * held for the pool's workers, such as the retained eval kernel their
+	 * kernel-defined tools run on.
+	 */
+	onRelease?: () => void;
 }
 
 interface TurnOutcome {
@@ -128,6 +135,7 @@ export class WorkPool {
 	#lastCardTs = 0;
 	#dispatchChain: Promise<void> = Promise.resolve();
 	#poolJobStarted = false;
+	#onRelease: (() => void) | undefined;
 	readonly #drainWaiters: PromiseWithResolvers<void>[] = [];
 	readonly #freshQueue: WorkPoolItem[] = [];
 
@@ -139,6 +147,7 @@ export class WorkPool {
 		this.#model = options.model;
 		this.context = options.context;
 		this.customTools = options.customTools ?? [];
+		this.#onRelease = options.onRelease;
 		this.freshAgents = cfgEvalWorkpoolFreshAgents.get(session.settings);
 		if (!session.asyncJobManager) {
 			throw new ToolError("workpool() needs the session's async job manager; unavailable here");
@@ -198,6 +207,7 @@ export class WorkPool {
 					manager.consumeJobResults(batchIds);
 					manager.unwatchJobs(batchIds);
 					this.closed = true;
+					this.#release();
 					const summary = `Pool \`${this.name}\` drained: ${this.items.length} item(s), ${this.batches.length} batch(es).`;
 					this.#card(signal.aborted ? "cancelled" : "completed", this.ownerId, summary);
 					return this.#renderAggregateResult();
@@ -592,9 +602,17 @@ export class WorkPool {
 		};
 	}
 
+	/** Run the creator's release exactly once, however the pool ended. */
+	#release(): void {
+		const release = this.#onRelease;
+		this.#onRelease = undefined;
+		release?.();
+	}
+
 	/** Stop accepting work and cancel items not yet assigned to a turn. */
 	close(): { dropped: string[] } {
 		this.closed = true;
+		this.#release();
 		const dropped: string[] = [];
 		for (const item of this.items) {
 			if (item.status !== "queued") continue;

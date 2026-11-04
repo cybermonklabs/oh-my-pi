@@ -259,6 +259,7 @@ function serveRegistry(bridge: MainSessionBridge): RpcServe<AgentRegistry, Agent
 			registry.attachSession(id, session, sessionFile, expected),
 		detachSession: (registry, id, expected) => registry.detachSession(id, expected),
 		unregister: (registry, id, expected) => registry.unregister(id, expected),
+		bindLiveName: (registry, name, targetId, sessionFile) => registry.bindLiveName(name, targetId, sessionFile),
 		get: (registry, id) => registry.get(id),
 		list: registry => registry.list(),
 		listVisibleTo: (registry, id) => registry.listVisibleTo(id),
@@ -279,7 +280,8 @@ function serveLifecycle(bridge: MainSessionBridge): RpcServe<AgentLifecycleManag
 		manages: (lifecycle, registry) => lifecycle.manages(registry),
 		isParking: (lifecycle, id, expected) => lifecycle.isParking(id, expected),
 		park: (lifecycle, id) => lifecycle.park(id),
-		ensureLive: (lifecycle, id) => lifecycle.ensureLive(id),
+		ensureLive: (lifecycle, id, coldRevive) => lifecycle.ensureLive(id, coldRevive),
+		ensureLiveTarget: (lifecycle, id, coldRevive) => lifecycle.ensureLiveTarget(id, coldRevive),
 		release: (lifecycle, id, expected, options) => lifecycle.release(id, expected, options),
 	};
 }

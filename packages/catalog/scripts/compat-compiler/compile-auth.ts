@@ -42,6 +42,7 @@ const CREDENTIAL_FIELDS = {
 	"account-id": "accountId",
 	"org-id": "orgId",
 	"org-name": "orgName",
+	"workspace-id": "workspaceId",
 	"project-id": "projectId",
 	"api-endpoint": "apiEndpoint",
 	"enterprise-url": "enterpriseUrl",

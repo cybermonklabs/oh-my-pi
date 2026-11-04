@@ -469,6 +469,8 @@ const streamOllamaOnce = (
 		const output = createEmptyOutput(model);
 		let rawRequestDump: RawHttpRequestDump | undefined;
 		let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
+		// The rejected endpoint is local configuration: shown, never in `errorMessage`, which decisions read.
+		let rejectedEndpoint: { error: unknown; status: number; url: string } | undefined;
 		let activeThinkingIndex: number | undefined;
 		let activeTextIndex: number | undefined;
 		const activeToolIndices = new Set<number>();
@@ -595,8 +597,13 @@ const streamOllamaOnce = (
 				options.streamFirstEventTimeoutMs ?? getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs);
 			// Cleared the instant headers arrive (below) so the pre-response timer
 			// never aborts the actively streaming body — an absolute
-			// `AbortSignal.timeout` would (issue #2422).
-			const watchdog = armPreResponseTimeout(options.signal, firstEventTimeoutMs);
+			// `AbortSignal.timeout` would (issue #2422). Headers do not renew the
+			// first-event budget: the wait for the first chunk stays on the stream
+			// watchdog `register-builtins` installs, whose first-item deadline runs
+			// from the wire on the same budget. `stream` rides along so that
+			// watchdog skips the same held time the guard does instead of failing
+			// a parked request.
+			const watchdog = armPreResponseTimeout(options.signal, firstEventTimeoutMs, stream);
 			let response: Response;
 			try {
 				response = await fetchWithRetry(`${baseUrl}/api/chat`, {
@@ -619,9 +626,11 @@ const streamOllamaOnce = (
 			}
 			if (!response.ok) {
 				capturedErrorResponse = await captureHttpErrorResponse(response);
-				throw new AIError.OllamaApiError(`HTTP ${response.status} from ${baseUrl}/api/chat`, response.status, {
+				const httpError = new AIError.OllamaApiError(`HTTP ${response.status}`, response.status, {
 					headers: response.headers,
 				});
+				rejectedEndpoint = { error: httpError, status: response.status, url: `${baseUrl}/api/chat` };
+				throw httpError;
 			}
 			if (!response.body) {
 				throw new AIError.OllamaApiError("Ollama returned an empty response body", response.status, {
@@ -785,15 +794,25 @@ const streamOllamaOnce = (
 				rawRequestDump,
 				capturedErrorResponse,
 			});
-			output.stopReason = result.stopReason;
-			output.errorStatus = result.status;
-			output.errorId = result.id;
-			output.errorMessage = result.message;
+			if (rejectedEndpoint !== undefined && rejectedEndpoint.error === error) {
+				const { status, url } = rejectedEndpoint;
+				const shown = result.displayMessage ?? result.message;
+				const prefix = `HTTP ${status}`;
+				AIError.applyFinalizeResult(
+					output,
+					result,
+					shown.startsWith(prefix)
+						? `${prefix} from ${url}${shown.slice(prefix.length)}`
+						: `${shown}\n(${prefix} from ${url})`,
+				);
+			} else {
+				AIError.applyFinalizeResult(output, result);
+			}
 			output.duration = performance.now() - startTime;
 			if (firstTokenTime) {
 				output.ttft = firstTokenTime - startTime;
 			}
-			stream.push({ type: "error", reason: output.stopReason, error: output });
+			stream.push({ type: "error", reason: result.stopReason, error: output });
 			stream.end();
 		}
 	})();

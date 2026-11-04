@@ -13,9 +13,12 @@
  * 94% under 150 lines; smol fixed 99% with one feedback retry, with ~12% of
  * raw candidates being reverts — hence the explicit revert rejection.
  */
+import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import { diffLineRuns, editDiffString, parseCodeStatus } from "@oh-my-pi/pi-natives";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
+import { probeModelApiKey } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { WritethroughCallback } from "../lsp";
 import type { ToolSession } from "../tools";
@@ -350,8 +353,17 @@ export async function attemptEditAutoRepair(options: {
 	const sessionId = session.getSessionId?.() ?? undefined;
 	// Resolve the key eagerly so the session-sticky credential is recorded and
 	// an unauthenticated smol role bails before any region work.
-	const apiKey = await registry.getApiKey(model, sessionId);
+	const apiKey = await probeModelApiKey(registry, model, sessionId);
 	if (!apiKey) return undefined;
+
+	// An edit that started before `/pause` runs to completion, repair included,
+	// but the repair is a new request. Wait the pause out before reading the
+	// file — it may change while held — and before arming the repair budget,
+	// which bounds the model, not the human who paused it.
+	if (agentPauseGate.paused) {
+		await agentPauseGate.waitUntilResumed(options.signal);
+		if (options.signal?.aborted) return undefined;
+	}
 
 	// Repair against the bytes on disk, not the snapshot: a later operation in
 	// the same call or a format-on-write pass may have moved the file since the
@@ -383,13 +395,18 @@ export async function attemptEditAutoRepair(options: {
 						maxTokens: COMPLETION_MAX_TOKENS,
 						disableReasoning: true,
 						signal,
+						// Each attempt holds at the provider boundary too: a pause
+						// engaged once the budget runs still sends nothing, and a
+						// pause that outlasts the budget skips the repair, leaving
+						// the edit with its parse warning, as any slow repair does.
+						beforeDispatch: agentPauseGate.dispatchHold(signal),
 					},
 				),
 			{ signal, provider: model.provider },
 		);
 		session.costGate?.record(response.usage.cost.total);
 		if (response.stopReason === "error") {
-			throw new Error(response.errorMessage ?? "auto-repair completion failed");
+			throw new Error(errorDisplayText(response) ?? "auto-repair completion failed");
 		}
 		// An abort resolves (not rejects) with empty content; treating that as a
 		// candidate would silently burn the retry and hide the stall.
