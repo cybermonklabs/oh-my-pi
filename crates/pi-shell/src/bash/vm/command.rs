@@ -171,7 +171,10 @@ pub(super) fn restore_env(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bo
 	if !current_exec(vp).is_some_and(|e| e.hidden_env.is_some()) {
 		return false;
 	}
-	let scope = st(vp).hidden_env.take().expect("hidden command environment");
+	let scope = st(vp)
+		.hidden_env
+		.take()
+		.expect("hidden command environment");
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	st(vp).scoped = true;
 	true
@@ -228,10 +231,14 @@ pub fn forces_errexit(vp: &Vproc, caller: usize) -> bool {
 /// lookup in Bash prompts (`executing_builtin`), unlike a function alone.
 pub(super) fn builtin_context(vp: &Vproc) -> bool {
 	vp.frames.iter().any(|frame| {
-		frame.scratch.as_ref().and_then(|s| s.exec.as_deref()).is_some_and(|e| {
-			matches!(e.waiting, Some(Awaited::Frame))
-				&& matches!(e.target.as_ref(), Some(Target::Intrinsic(_)))
-		})
+		frame
+			.scratch
+			.as_ref()
+			.and_then(|s| s.exec.as_deref())
+			.is_some_and(|e| {
+				matches!(e.waiting, Some(Awaited::Frame))
+					&& matches!(e.target.as_ref(), Some(Target::Intrinsic(_)))
+			})
 	})
 }
 
@@ -415,8 +422,16 @@ pub fn exec(
 						let done = scratch(vp).io.as_ref().map_or(0, |io| io.redir.done);
 						done < unit.redirs[list as usize].len()
 					}) {
+					// A lone async command already has its own child context.
+					// Keep its program here so the job's real pid and signals
+					// still name the process that opens deferred redirections.
+					let lone_job = k
+						.bangs
+						.iter()
+						.any(|bang| bang.vproc == vp.vpid && bang.stage == BangStage::Lone);
 					let s = st(vp);
 					if s.stage == Stage::Dispatch
+						&& !lone_job
 						&& s.control != Some(Transfer::Exec)
 						&& !matches!(s.target, Some(Target::Function(_) | Target::Intrinsic(_)))
 						&& !(matches!(s.target, Some(Target::NotFound | Target::Search))
@@ -661,9 +676,12 @@ fn expand(
 			}
 			continue;
 		}
-		if !pending_trace && assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+		if !pending_trace
+			&& assign_only
+			&& unit.mode.dialect() == crate::bash::ids::Dialect::Bash
 			&& let Some(a) = cmd.assigns.get(i)
-			&& matches!(a.value, AssignVal::Array(_)) && xtrace::on(k, cx, vp)
+			&& matches!(a.value, AssignVal::Array(_))
+			&& xtrace::on(k, cx, vp)
 		{
 			// Bash traces the parsed compound list before expanding its elements.
 			let utf8 = xtrace::utf8(k, cx, vp);
@@ -683,7 +701,10 @@ fn expand(
 				None => {
 					let word = st(vp).keywords[i - cmd.assigns.len()];
 					let source = exec::word_source(unit, word);
-					let eq = source.iter().position(|&c| c == b'=').unwrap_or(source.len());
+					let eq = source
+						.iter()
+						.position(|&c| c == b'=')
+						.unwrap_or(source.len());
 					(eq > 0 && source[eq - 1] == b'+', unit.words[word as usize].node)
 				},
 			};
@@ -733,15 +754,21 @@ fn expand(
 				Ok(value) => value,
 				Err(flow) => return Some(flow),
 			};
-			trace_value = assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
-				&& matches!(a.value, AssignVal::Scalar(_)) && xtrace::on(k, cx, vp);
-			if assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
-				&& (trace_value || a.index.is_some()) && matches!(a.value, AssignVal::Scalar(_))
+			trace_value = assign_only
+				&& unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& matches!(a.value, AssignVal::Scalar(_))
+				&& xtrace::on(k, cx, vp);
+			if assign_only
+				&& unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& (trace_value || a.index.is_some())
+				&& matches!(a.value, AssignVal::Scalar(_))
 			{
 				let body = if trace_value {
 					let utf8 = xtrace::utf8(k, cx, vp);
 					Some(assignment_trace(unit, Some(a), &a.name, None, a.append, &value, utf8))
-				} else { None };
+				} else {
+					None
+				};
 				let s = st(vp);
 				s.assigns.push((a.name.clone(), BString::default()));
 				s.values.push((None, value));
@@ -774,7 +801,8 @@ fn expand(
 				None => (BString::from(&text[..eq]), false),
 			};
 			let value = BString::from(text.get(eq + 1..).unwrap_or_default());
-			trace_value = assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+			trace_value = assign_only
+				&& unit.mode.dialect() == crate::bash::ids::Dialect::Bash
 				&& xtrace::on(k, cx, vp);
 			(name, append, word.node, None, AssignValue::Scalar(value))
 		};
@@ -782,7 +810,15 @@ fn expand(
 		scratch(vp).logs[Slot::Redirs as usize].clear();
 		if trace_value {
 			let utf8 = xtrace::utf8(k, cx, vp);
-			let body = assignment_trace(unit, cmd.assigns.get(i), &name, index.as_ref().map(|i| i.as_slice()), append, &value, utf8);
+			let body = assignment_trace(
+				unit,
+				cmd.assigns.get(i),
+				&name,
+				index.as_ref().map(|i| i.as_slice()),
+				append,
+				&value,
+				utf8,
+			);
 			let s = st(vp);
 			s.assigns.push((name, BString::default()));
 			s.values.push((index, value));
@@ -878,8 +914,12 @@ fn expand(
 			// Bash traces before binding. Zsh retains
 			// scalars for its existing end-of-list trace; compounds use IR.
 			let kept = match &value {
-				AssignValue::Scalar(s) if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh
-					&& xtrace::on(k, cx, vp) => AssignValue::Scalar(s.clone()),
+				AssignValue::Scalar(s)
+					if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh
+						&& xtrace::on(k, cx, vp) =>
+				{
+					AssignValue::Scalar(s.clone())
+				},
 				AssignValue::Scalar(_) => AssignValue::Scalar(BString::default()),
 				AssignValue::Array(_) => AssignValue::Array(Vec::new()),
 			};
@@ -927,7 +967,8 @@ fn expand(
 		let s = st(vp);
 		s.assigns.push((name.clone(), shown));
 		s.values.push((index, value));
-		if !assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+		if !assign_only
+			&& unit.mode.dialect() == crate::bash::ids::Dialect::Bash
 			&& xtrace::on(k, cx, vp)
 		{
 			let utf8 = xtrace::utf8(k, cx, vp);
@@ -937,11 +978,22 @@ fn expand(
 				a.name.as_slice()
 			} else {
 				let source = exec::word_source(unit, s.keywords[i - cmd.assigns.len()]);
-				let eq = source.iter().position(|&c| c == b'=').unwrap_or(source.len());
+				let eq = source
+					.iter()
+					.position(|&c| c == b'=')
+					.unwrap_or(source.len());
 				&source[..eq - usize::from(eq > 0 && source[eq - 1] == b'+')]
 			};
 			let (index, value) = s.values.last().expect("bound prefix value");
-			let body = assignment_trace(unit, cmd.assigns.get(i), name, index.as_ref().map(|i| i.as_slice()), false, value, utf8);
+			let body = assignment_trace(
+				unit,
+				cmd.assigns.get(i),
+				name,
+				index.as_ref().map(|i| i.as_slice()),
+				false,
+				value,
+				utf8,
+			);
 			xtrace::emit(k, cx, vp, line, &body);
 			// A full trace (or an EPIPE) precedes the next assignment's RHS.
 			return Some(Flow::Call);
@@ -982,7 +1034,9 @@ fn expand(
 			t_ns,
 		);
 	}
-	if (!assign_only || unit.mode.dialect() == crate::bash::ids::Dialect::Zsh) && xtrace::on(k, cx, vp) {
+	if (!assign_only || unit.mode.dialect() == crate::bash::ids::Dialect::Zsh)
+		&& xtrace::on(k, cx, vp)
+	{
 		if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 			trace_zsh(k, vp, cx, unit, &cmd.assigns, line);
 			return Some(Flow::Call);
@@ -1301,8 +1355,12 @@ fn assignment_trace(
 ) -> Vec<u8> {
 	let mut body = Vec::new();
 	let index = if unit.mode.dialect() == crate::bash::ids::Dialect::Bash {
-		assignment.and_then(|a| a.index.map(|w| exec::word_source(unit, w))).or(index)
-	} else { index };
+		assignment
+			.and_then(|a| a.index.map(|w| exec::word_source(unit, w)))
+			.or(index)
+	} else {
+		index
+	};
 	if let Some(AssignVal::Array(elems)) = assignment.map(|a| &a.value) {
 		body.extend_from_slice(name);
 		body.extend_from_slice(if append { b"+=(" } else { b"=(" });
@@ -1343,7 +1401,15 @@ fn trace_zsh(
 			continue;
 		}
 		let append = assigns.get(i).is_some_and(|a| a.append);
-		lines.push(assignment_trace(unit, assigns.get(i), name, index.as_ref().map(|i| i.as_slice()), append, value, utf8));
+		lines.push(assignment_trace(
+			unit,
+			assigns.get(i),
+			name,
+			index.as_ref().map(|i| i.as_slice()),
+			append,
+			value,
+			utf8,
+		));
 	}
 	if !s.argv.is_empty() {
 		let mut body = Vec::new();
@@ -1444,8 +1510,14 @@ fn expand_assign_value(
 		AssignVal::Array(elems) => elems.iter().any(|e| !unit.words[e.value as usize].noglob),
 		AssignVal::Scalar(_) => false,
 	};
-	let value = expanding(k, vp, cx, Slot::Assigns, assign_parks(unit, a) || glob_parks, line, |ex| {
-		match &a.value {
+	let value = expanding(
+		k,
+		vp,
+		cx,
+		Slot::Assigns,
+		assign_parks(unit, a) || glob_parks,
+		line,
+		|ex| match &a.value {
 			AssignVal::Scalar(w) => ex.scalar(unit, &unit.words[*w as usize]).map(Ok),
 			AssignVal::Array(elems) => {
 				let mut out = Vec::with_capacity(elems.len());
@@ -1453,15 +1525,20 @@ fn expand_assign_value(
 				ex.assign_compound(unit, &a.name, elems, &mut out, Some(&mut globs))?;
 				Ok(Err((out, globs)))
 			},
-		}
-	})?;
+		},
+	)?;
 	match value {
 		Ok(scalar) => Ok(AssignValue::Scalar(scalar)),
 		Err((mut elems, globs)) => {
 			if !globs.is_empty() {
 				super::glob::expand_compound_globs(k, vp, cx, &mut elems, &globs, line)?;
 			}
-			Ok(AssignValue::Array(elems.into_iter().map(|e| (e.key, e.append, e.value)).collect()))
+			Ok(AssignValue::Array(
+				elems
+					.into_iter()
+					.map(|e| (e.key, e.append, e.value))
+					.collect(),
+			))
 		},
 	}
 }
@@ -1476,7 +1553,9 @@ fn expand_assign_index(
 	a: &ir::AssignOp,
 	line: u32,
 ) -> Result<Option<BString>, Flow> {
-	let Some(w) = a.index else { return Ok(None); };
+	let Some(w) = a.index else {
+		return Ok(None);
+	};
 	if matches!(a.value, AssignVal::Array(_)) {
 		return Ok(Some(BString::from(exec::word_source(unit, w))));
 	}
@@ -1484,9 +1563,15 @@ fn expand_assign_index(
 		let mut shown = a.name.clone();
 		shown.extend_from_slice(b"[]");
 		k.diag(cx, vp, line, Diag::BadSubscript { shown });
-		return Err(if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false) {
-			Flow::Exit(1)
-		} else { Flow::Discard(1) });
+		return Err(
+			if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+				.unwrap_or(false)
+			{
+				Flow::Exit(1)
+			} else {
+				Flow::Discard(1)
+			},
+		);
 	}
 	expanding(k, vp, cx, Slot::Redirs, unit.words[w as usize].parks, line, |ex| {
 		ex.scalar(unit, &unit.words[w as usize]).map(Some)

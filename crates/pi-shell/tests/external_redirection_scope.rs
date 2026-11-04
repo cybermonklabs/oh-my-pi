@@ -342,19 +342,22 @@ async fn external_children_preserve_prefix_scope_and_subshell_depth() {
 		// Bash 5.3's no-fork substitution must not regain the hidden
 		// prefix environment while its body runs in the redirection child.
 		(
-			"unset x; x=prefix /bin/cat <<<\"${ printf '%s' \"${x-unset}\"; }\"; printf 'outer=[%s]\\n' \"${x-unset}\"",
+			"unset x; x=prefix /bin/cat <<<\"${ printf '%s' \"${x-unset}\"; }\"; printf \
+			 'outer=[%s]\\n' \"${x-unset}\"",
 			"unset\nouter=[unset]\n",
 			false,
 			0,
 		),
 		(
-			"f(){ local x=local; x=prefix /bin/cat <<<\"${ printf '%s' \"$x\"; }\"; printf 'local=[%s]\\n' \"$x\"; }; f",
+			"f(){ local x=local; x=prefix /bin/cat <<<\"${ printf '%s' \"$x\"; }\"; printf \
+			 'local=[%s]\\n' \"$x\"; }; f",
 			"local\nlocal=[local]\n",
 			false,
 			0,
 		),
 		(
-			"unset x; x=prefix read -r got <<<\"${ printf '%s' \"${x-unset}\"; }\"; printf '%s:%s\\n' \"$got\" \"${x-unset}\"",
+			"unset x; x=prefix read -r got <<<\"${ printf '%s' \"${x-unset}\"; }\"; printf \
+			 '%s:%s\\n' \"$got\" \"${x-unset}\"",
 			"unset:unset\n",
 			false,
 			0,

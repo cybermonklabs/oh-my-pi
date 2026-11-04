@@ -626,8 +626,8 @@ impl Shell {
 							},
 						}),
 						saved_xtrace: p.saved_xtrace,
-						restore_env: p.restore_env,
-						resume_env: p.resume_env,
+						restore_env:  p.restore_env,
+						resume_env:   p.resume_env,
 						status:       p.status,
 					})
 					.collect(),
@@ -883,8 +883,8 @@ impl Shell {
 						},
 					}),
 					saved_xtrace: p.saved_xtrace,
-					restore_env: p.restore_env,
-					resume_env: p.resume_env,
+					restore_env:  p.restore_env,
+					resume_env:   p.resume_env,
 					status:       p.status,
 				})
 				.collect();

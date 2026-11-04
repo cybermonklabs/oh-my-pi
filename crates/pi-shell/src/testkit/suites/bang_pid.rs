@@ -389,3 +389,32 @@ fn a_redirection_that_would_wait_is_left_to_the_process() {
 	assert!(is_virtual(out.trim()), "{out}");
 	assert!(world.redirs.lock().iter().all(|(_, r)| r.is_none()));
 }
+
+// Failure mode: a redirection-only child wrapper owns the job's pid but
+// not its program, so `kill $!` ends the wrapper and leaves the program
+// alive instead of returning its signal-trap status.
+#[test]
+fn a_deferred_redirect_keeps_the_lone_programs_signal_status() {
+	let world = World::new();
+	let host = world
+		.host()
+		.with_fs(MemFs::with_latency(7, 1.0, 1))
+		.with_child_opens();
+	let (out, status) = run(
+		host,
+		"unset x; /x/trap42 >\"${x:=/f}\" 2>&1 & pid=$!; echo \"x=${x-unset} pid=$pid\"; \
+		 kill \"$pid\"; wait \"$pid\"; echo \"wait=$?\"",
+	);
+	assert_eq!((out.as_str(), status), ("x=unset pid=5001\nwait=42\n", 0));
+	assert_eq!(world.got(FIRST), [Signal::Term]);
+	let seen = world.redirs.lock();
+	let [(name, Some(redirs))] = seen.as_slice() else {
+		panic!("the lone program did not get its deferred redirections: {seen:?}");
+	};
+	assert_eq!(name, "/x/trap42");
+	assert!(matches!(
+		redirs.list.as_slice(),
+		[ChildRedir::Open { fds, path, .. }, ChildRedir::Dup { fd: 2, src: 1, .. }]
+			if fds.as_slice() == &[1][..] && path.as_slice() == b"/f"
+	));
+}

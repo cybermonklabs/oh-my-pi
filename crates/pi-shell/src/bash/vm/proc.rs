@@ -1556,7 +1556,10 @@ const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 K
 const _: () = assert!(size_of::<Scratch>() <= 224, "Scratch grew (idle vproc ≤ 2 KiB)");
 // Hidden environments move inline instead of allocating a box. Their field
 // is the only new state allowed here; the measured idle budget has 144 B left.
-const _: () = assert!(size_of::<ExecState>() <= 376 + size_of::<Option<Scope>>(), "ExecState grew beyond its hidden environment");
+const _: () = assert!(
+	size_of::<ExecState>() <= 376 + size_of::<Option<Scope>>(),
+	"ExecState grew beyond its hidden environment"
+);
 const _: () = assert!(size_of::<ExecState>() <= 520, "ExecState grew (idle vproc ≤ 2 KiB)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
