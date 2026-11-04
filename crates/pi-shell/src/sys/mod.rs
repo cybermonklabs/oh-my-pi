@@ -47,7 +47,7 @@ pub use crate::sys::{
 	relay::{ByteDecoder, OutputDecoding},
 	spawn::{Exits, Leftover, NativeSpawner, Sessions, SpawnConfig, UnsupportedFd},
 };
-pub(crate) use crate::sys::{pump::End, relay::Relays};
+pub(crate) use crate::sys::{pump::End, relay::Relays, spawn::{NativeSpawnerControl, ReapObserver}};
 
 #[cfg(test)]
 mod suites;

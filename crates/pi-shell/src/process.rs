@@ -3,7 +3,6 @@
 use std::{collections::HashSet, time::Duration};
 
 use anyhow::Result;
-use parking_lot::Mutex;
 /// Current state of a process reference.
 ///
 /// Defined in `pi-builtins` alongside the process-table snapshots its process
@@ -11,7 +10,7 @@ use parking_lot::Mutex;
 /// through it — keeps one status type for both concerns.
 pub use pi_builtins::ProcessStatus;
 use pi_builtins::{
-	GroupProof, PinnedProcess, SignalWave, SpawnLedger, host_protected_pids, kernel_group_runs,
+	GroupProof, PinnedProcess, SignalWave, host_protected_pids, kernel_group_runs,
 	signalable_descendants,
 };
 
@@ -491,94 +490,10 @@ impl TerminationTargets {
 	}
 }
 
-/// Per-run record of the OS processes a single shell command launched,
-/// captured at spawn time via brush's `SpawnObserver` hook.
-///
-/// Replaces the old process-global "new descendants since a baseline" diff,
-/// which could not distinguish the children of concurrent runs sharing one
-/// host process: a run that cancelled would signal *any* descendant spawned
-/// after its baseline, including another run's children. Ownership is now
-/// explicit — only processes this run actually spawned, and the groups they
-/// lead, are ever signalled, each through the identity pinned when it was
-/// spawned (see [`SpawnLedger`]).
-#[derive(Default)]
-pub struct SpawnRegistry {
-	ledger: Mutex<SpawnLedger>,
-}
-
-impl SpawnRegistry {
-	/// Create an empty registry.
-	#[must_use]
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	/// Record a child the shell just spawned into group `pgid`, from the
-	/// spawn-observer hook: the shell has not reaped it yet, so `pid` still
-	/// names it, and it reports the child again through
-	/// [`Self::before_reap`] before it reaps it. A child that cannot be
-	/// pinned (already gone) records nothing.
-	pub fn record_spawn(&self, pid: i32, pgid: Option<i32>) {
-		self
-			.ledger
-			.lock()
-			.record(pgid, PinnedProcess::from_pid(pid));
-	}
-
-	/// Record a process this run's shell does not report before reaping,
-	/// such as a job a previous run started: it proves the group it leads
-	/// only while it runs.
-	pub fn record_job(&self, pid: i32, pgid: Option<i32>) {
-		self
-			.ledger
-			.lock()
-			.record_unwatched(pgid, PinnedProcess::from_pid(pid));
-	}
-
-	/// The shell is about to stop holding child `pid` unreaped (see
-	/// [`SpawnLedger::before_reap`]). Takes the same lock as [`Self::signal`],
-	/// so the shell cannot reap a leader while a wave lists its group.
-	pub fn before_reap(&self, pid: i32, unreaped: bool) {
-		self.ledger.lock().before_reap(pid, unreaped);
-	}
-
-	/// Pids of recorded processes that are still alive, in spawn order.
-	///
-	/// Liveness is probed through each entry's pinned [`Process`] (pidfd on
-	/// Linux, start-time identity on macOS, open handle on Windows), so a
-	/// recycled pid never reports as one of this run's children. The recorded
-	/// set is not mutated.
-	#[must_use]
-	pub fn live_pids(&self) -> Vec<i32> {
-		self.ledger.lock().live_pids()
-	}
-
-	/// Whether a wave could still reach any of this run's processes. Prunes
-	/// the ledger first.
-	#[must_use]
-	pub fn reaches_anything(&self) -> bool {
-		let mut ledger = self.ledger.lock();
-		ledger.prune();
-		ledger.reaches_anything()
-	}
-
-	/// Sends one wave of `signal` to every recorded process, its live
-	/// descendants, and the group each recorded leader leads (see
-	/// [`SpawnLedger::plan_wave`]), then records every process the wave
-	/// reached, so later waves wait for them and reach them. The ledger stays
-	/// locked until then, so the shell cannot reap a leader while the wave
-	/// signals its group by number. Re-read on every wave, so a child spawned
-	/// during a grace window is still reached.
-	pub fn signal(&self, signal: i32) {
-		let mut ledger = self.ledger.lock();
-		ledger.prune();
-		let delivered = ledger.plan_wave(signal, true).deliver();
-		ledger.record_reached(&delivered);
-	}
-}
-
 #[cfg(test)]
 mod tests {
+	use pi_builtins::SpawnLedger;
+
 	use super::*;
 
 	/// Regression test for #7452: a cancellation sweep must never signal the
@@ -926,26 +841,11 @@ while True:
 		);
 	}
 
-	/// Regression test for issue #4605: `SpawnRegistry` MUST pin a stable
-	/// [`Process`] reference at spawn time rather than defer re-opening the
-	/// pid until termination.
-	///
-	/// Before the fix, `SpawnRegistry` stored only the raw pid and called
-	/// `Process::from_pid` at cancellation time. On Windows pids recycle
-	/// aggressively, so a bash-spawned `pwsh.exe` that had already exited could
-	/// see its pid reassigned to an unrelated PowerShell session (e.g. the
-	/// user's other Cursor terminal). `Process::from_pid` at cancel time would
-	/// happily open that unrelated process, and `signal_tree` would then
-	/// enumerate — and `TerminateProcess` — the entire foreign subtree.
-	///
-	/// This test cannot literally trigger Windows pid recycling from a
-	/// cross-platform Rust test, but it can prove the observable defense: a
-	/// recorded process reference survives the original pid's death (so no
-	/// "look it up again" step exists to be raced), and the registry stops
-	/// reaching anything once that process is gone.
+	/// A recorded child keeps its original identity after exit: the ledger
+	/// must not reopen its pid and adopt an unrelated replacement.
 	#[cfg(unix)]
 	#[test]
-	fn spawn_registry_pins_identity_at_record_time() {
+	fn spawn_ledger_pins_identity_at_record_time() {
 		use std::{process::Command, thread, time::Duration};
 
 		let mut long = Command::new("sleep")
@@ -954,8 +854,8 @@ while True:
 			.expect("spawn sleep");
 		let long_pid = i32::try_from(long.id()).expect("child pid fits in i32");
 
-		let registry = SpawnRegistry::new();
-		registry.record_spawn(long_pid, None);
+		let mut registry = SpawnLedger::default();
+		registry.record(None, PinnedProcess::from_pid(long_pid));
 		assert_eq!(
 			registry.live_pids(),
 			vec![long_pid],
@@ -1122,8 +1022,8 @@ while True:
 			thread::sleep(Duration::from_millis(5));
 		}
 
-		let registry = SpawnRegistry::new();
-		registry.record_spawn(leader_pid, Some(leader_pid));
+		let mut registry = SpawnLedger::default();
+		registry.record(Some(leader_pid), PinnedProcess::from_pid(leader_pid));
 		// The leader has exited; the shell reports it before reaping it.
 		let leader_pin = PinnedProcess::from_pid(leader_pid).expect("pin the leader");
 		while leader_pin.status() == ProcessStatus::Running {
@@ -1152,8 +1052,9 @@ while True:
 			thread::sleep(Duration::from_millis(5));
 		}
 
-		registry.signal(TERM_SIGNAL);
-		registry.signal(KILL_SIGNAL);
+		let wave = registry.plan_wave(TERM_SIGNAL, true).deliver();
+		registry.record_reached(&wave);
+		registry.plan_wave(KILL_SIGNAL, true).deliver();
 		let ended = crate::test_support::how_it_ended(&mut unrelated).await;
 		assert!(ended.is_none(), "the run signalled a group it never had: {ended:?}");
 		let deadline = Instant::now() + Duration::from_secs(5);

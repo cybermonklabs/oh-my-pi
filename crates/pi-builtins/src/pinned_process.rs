@@ -292,6 +292,15 @@ mod platform {
 			sys::pidfd_send_group_signal(self.pidfd.as_fd(), signal).is_ok()
 		}
 
+		/// Whether this kernel/filter can address a group through its pinned
+		/// leader. ESRCH proves the flag is understood even if the group ended.
+		pub fn group_signal_supported(&self) -> bool {
+			match sys::pidfd_send_group_signal(self.pidfd.as_fd(), 0) {
+				Ok(()) => true,
+				Err(error) => error.raw_os_error() == Some(libc::ESRCH),
+			}
+		}
+
 		pub fn status(&self) -> ProcessStatus {
 			pidfd_status(self.pidfd.as_fd())
 		}
@@ -1087,9 +1096,16 @@ impl SignalWave {
 					}
 				},
 				GroupProof::Running | GroupProof::KernelOnly => {
-					// Signal 0 checks that the kernel can reach the group this way.
+					// The pinned group must exist throughout the listing. If it
+					// vanished, discard the numeric listing: a replacement may
+					// already hold that number. An emptied group cannot reappear
+					// through the original leader's pin.
 					if leader.signal_group(0) {
-						by_pin.push(leader.clone());
+						let listed = list_group(&mut table, group);
+						if leader.signal_group(0) {
+							self.members.extend(listed);
+							by_pin.push(leader.clone());
+						}
 					}
 				},
 			}
@@ -1405,7 +1421,7 @@ impl SpawnLedger {
 	/// per spawn stays `O(1)` regardless of the live-set size.
 	pub const PRUNE_THRESHOLD: usize = 64;
 
-	/// Records a child the shell spawned into group `pgid`, as brush's spawn
+	/// Records a child the shell spawned into group `pgid`, as its spawn
 	/// observer reports it; the shell reports it again through
 	/// [`Self::before_reap`] before it reaps it. `process` must be pinned
 	/// *immediately* after the child's pid becomes visible, before the child
@@ -1439,14 +1455,23 @@ impl SpawnLedger {
 		else {
 			return;
 		};
+		let members = if unreaped && self.entries[index].leads() {
+			self.entries[index].process.members_before_reap()
+		} else { Vec::new() };
+		self.before_reap_with_members(pid, &members);
+	}
+
+	/// Permit the reap after importing members from a shared batch snapshot.
+	/// The caller holds every listed leader unreaped until all reports finish.
+	/// With kernel group signals, an empty list intentionally defers discovery
+	/// until the first wave; processes that detach before TERM are not tracked.
+	pub fn before_reap_with_members(&mut self, pid: i32, members: &[PinnedProcess]) {
+		let Some(index) = self.entries.iter().rposition(|entry| entry.reap == Reap::Pending && entry.process.pid() == pid) else { return; };
 		self.entries[index].reap = Reap::Allowed;
-		if !unreaped || !self.entries[index].leads() {
-			return;
-		}
-		let leader = self.entries[index].process.clone();
-		for member in leader.members_before_reap() {
-			if member.pid() != pid && !self.entries.iter().any(|entry| entry.process.same_identity(&member)) {
-				self.push(SpawnEntry { process: member, group: Some(pid), reap: Reap::Unwatched });
+		if !self.entries[index].leads() { return; }
+		for member in members {
+			if member.pid() != pid && !self.entries.iter().any(|entry| entry.process.same_identity(member)) {
+				self.push(SpawnEntry { process: member.clone(), group: Some(pid), reap: Reap::Unwatched });
 			}
 		}
 	}

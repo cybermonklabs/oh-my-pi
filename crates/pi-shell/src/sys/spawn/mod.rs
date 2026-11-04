@@ -39,15 +39,18 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
 	fmt, fs, io,
 	sync::{Arc, Weak},
 	task::Context,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use bstr::BString;
 use parking_lot::Mutex;
+use pi_builtins::PinnedProcess;
 
 #[cfg(unix)]
 use self::unix as imp;
@@ -63,6 +66,23 @@ use crate::{
 #[derive(Clone)]
 pub struct NativeSpawner {
 	shared: Arc<Shared>,
+}
+
+/// Reap notifications run while the child's identity and group number are
+/// still reserved. A deferred cohort shares one member snapshot per batch.
+pub(crate) trait ReapObserver: Send + Sync {
+	fn before_reap(&self, pid: u32, members: &[PinnedProcess]);
+}
+
+pub(crate) struct NativeSpawnerControl(Weak<Shared>);
+
+impl NativeSpawnerControl {
+	#[cfg(unix)]
+	pub(crate) fn delegate_termination(&self) {
+		if let Some(shared) = self.0.upgrade() {
+			shared.termination_delegated.store(true, Ordering::Release);
+		}
+	}
 }
 
 /// Configuration of a [`NativeSpawner`].
@@ -170,11 +190,22 @@ pub struct UnsupportedFd {
 
 /// Spawner state shared by clones and by the processes it spawned.
 struct Shared {
-	config: SpawnConfig,
-	state:  imp::State,
+	config:                SpawnConfig,
+	state:                 imp::State,
+	/// The session bridge owns TERM/grace/KILL during run cancellation.
+	#[cfg(unix)]
+	termination_delegated: AtomicBool,
 	/// Engine read ends currently bridged into an OS pipe, alive while an
 	/// external holding the pipe is.
-	feeds:  Mutex<Vec<Weak<Feed>>>,
+	feeds:                 Mutex<Vec<Weak<Feed>>>,
+	reap_observer: Mutex<Option<Arc<dyn ReapObserver>>>,
+}
+
+impl Drop for Shared {
+	fn drop(&mut self) {
+		#[cfg(unix)]
+		imp::flush_reaps(self);
+	}
 }
 
 impl Shared {
@@ -237,6 +268,9 @@ impl NativeSpawner {
 				#[cfg(windows)]
 				state: imp::State::new(),
 				feeds: Mutex::new(Vec::new()),
+				reap_observer: Mutex::new(None),
+				#[cfg(unix)]
+				termination_delegated: AtomicBool::new(false),
 			}),
 		}
 	}
@@ -244,6 +278,32 @@ impl NativeSpawner {
 	/// The configuration.
 	pub fn config(&self) -> SpawnConfig {
 		self.shared.config
+	}
+
+	pub(crate) fn termination_control(&self) -> NativeSpawnerControl {
+		NativeSpawnerControl(Arc::downgrade(&self.shared))
+	}
+
+	pub(crate) fn set_reap_observer(&self, observer: Arc<dyn ReapObserver>) {
+		*self.shared.reap_observer.lock() = Some(observer);
+	}
+
+	/// Reap only completed commands. Exit status and pipe completion have
+	/// already been delivered to the engine before a child enters this queue.
+	pub(crate) fn flush_reaps(&self) {
+		#[cfg(unix)]
+		imp::flush_reaps(&self.shared);
+	}
+
+	pub(crate) fn reap_deadline(&self) -> Option<Instant> {
+		#[cfg(unix)]
+		{ imp::reap_deadline(&self.shared) }
+		#[cfg(not(unix))]
+		{ None }
+	}
+
+	pub(crate) fn flush_due_reaps(&self) {
+		if self.reap_deadline().is_some_and(|deadline| deadline <= Instant::now()) { self.flush_reaps(); }
 	}
 
 	/// The process umask read when the spawner was created (Unix; `None`
@@ -290,6 +350,7 @@ impl NativeSpawner {
 	/// (Windows) this spawner created, excluding zombies and the calling
 	/// process. Empty after a clean case.
 	pub fn leftovers(&self) -> io::Result<Vec<Leftover>> {
+		self.flush_reaps();
 		imp::leftovers(&self.shared)
 	}
 
@@ -299,6 +360,7 @@ impl NativeSpawner {
 	///
 	/// [`leftover`]: NativeSpawner::leftovers
 	pub fn kill_leftovers(&self) -> io::Result<Vec<Leftover>> {
+		self.flush_reaps();
 		imp::kill_leftovers(&self.shared)
 	}
 }

@@ -58,8 +58,14 @@ impl ShellAbortState {
 		*self.0.lock().await = Some(abort_token);
 	}
 
-	async fn clear(&self) {
-		*self.0.lock().await = None;
+	async fn clear(&self, owner: &AbortToken) {
+		let mut current = self.0.lock().await;
+		if current
+			.as_ref()
+			.is_some_and(|token| token.same_token(owner))
+		{
+			*current = None;
+		}
 	}
 
 	async fn abort(&self) {
@@ -375,27 +381,18 @@ pub async fn execute_shell_streams(
 	run_shell_oneshot_streams(config, run_config, streams, cancel_token).await
 }
 
-/// How long a cancelled run waits for its task to wind down before aborting
-/// it (discarding any output still queued in the pipe readers, and stopping
-/// the command with `KILL`).
-///
-/// The session's own cancel sends `TERM`, then `KILL` after its 1 s grace;
-/// a run that ends within these two seconds reports normally. Windows needs a
-/// wider budget: in-process pipeline producers stop on a poll between
-/// writes, so producer exit, pipe EOF, the consumer's final flush and the
-/// reader's last read each need a separate thread wakeup; under heavy load
-/// that chain exceeded 2s (`yes x | tail -5` lost its 5 lines).
+/// Final task-drain budget after cancellation. Unix first completes its
+/// bridge-owned TERM/grace/KILL waves, so aborting a stalled task cannot cut
+/// short a process's cleanup. Windows retains its native spawner's wider
+/// budget for producer exit, pipe EOF, final flush and reader wakeups.
 #[cfg(windows)]
 const CANCEL_RUN_GRACE: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
 const CANCEL_RUN_GRACE: Duration = Duration::from_secs(2);
 
-/// Delay between cancellation and cancelling the output readers. Readers stay
-/// open so pipeline consumers can flush after their producers die, and so a
-/// TERM trap that writes output during the session's TERM grace does not hit
-/// EPIPE and die before finishing its cleanup. Windows needs a wider budget
-/// for the same reason as `CANCEL_RUN_GRACE`. The delayed fallback still
-/// releases readers whose writers never close.
+/// Reader fallback delay after Unix termination completes (after cancellation
+/// on Windows). Readers remain open throughout TERM cleanup and subsequent
+/// pipeline flushing; the fallback releases writers that never close.
 #[cfg(windows)]
 const CANCEL_READER_GRACE: Duration = Duration::from_millis(2000);
 #[cfg(not(windows))]
@@ -431,6 +428,28 @@ const fn cancelled_result(reason: AbortReason) -> ShellRunResult {
 	}
 }
 
+/// Claim OS termination before waking the engine's cancel path. Session
+/// publication takes the same lock, so cancellation during snapshot setup
+/// cannot miss the newly created registry.
+async fn cancel_run(children: &ActiveChildren, cancel: &CancellationToken) {
+	let registry = {
+		let children = children.lock();
+		let registry = children.clone();
+		#[cfg(unix)]
+		if let Some(registry) = registry.as_ref() {
+			registry.begin_termination();
+		}
+		cancel.cancel();
+		registry
+	};
+	#[cfg(unix)]
+	if let Some(registry) = registry {
+		registry.finish_termination().await;
+	}
+	#[cfg(not(unix))]
+	let _ = registry;
+}
+
 async fn run_shell_session(
 	session: Arc<TokioMutex<Option<ShellSessionCore>>>,
 	abort_state: ShellAbortState,
@@ -441,55 +460,66 @@ async fn run_shell_session(
 	ct: &mut CancelToken,
 ) -> Result<ShellRunResult> {
 	let tokio_cancel = CancellationToken::new();
+	// A queued run owns no process until it acquires the session mutex.
+	// Shell::pids' shared monitor must never be its cancellation registry.
+	let run_children = ActiveChildren::default();
+	let at = ct.emplace_abort_token();
 	let mut run_task = tokio::spawn({
 		let session = session.clone();
 		let abort_state = abort_state.clone();
 		let tokio_cancel = tokio_cancel.clone();
-		let at = ct.emplace_abort_token();
+		let children = children.clone();
+		let run_children = run_children.clone();
+		let at = at.clone();
 		async move {
 			let mut session_guard = session.lock().await;
+			if session_guard
+				.as_ref()
+				.is_some_and(|core| core.session.children().termination_started())
+			{
+				*session_guard = None;
+			}
 			let core = if let Some(core) = &mut *session_guard {
+				let mut own = run_children.lock();
+				if tokio_cancel.is_cancelled() {
+					return Err(Error::msg("Shell run was cancelled"));
+				}
+				*own = Some(core.session.children());
 				core
 			} else {
-				let core = create_session_for_run(&config, Some(&tokio_cancel)).await?;
-				*children.lock() = Some(core.session.children());
+				let core =
+					create_session_for_run(&config, Some(&tokio_cancel), &[&run_children, &children])
+						.await?;
 				session_guard.insert(core)
 			};
 			abort_state.set(at).await;
-			run_shell_command(core, &run_config, on_chunk, tokio_cancel).await
+			let cancelled = tokio_cancel.clone();
+			let result = run_shell_command(core, &run_config, on_chunk, tokio_cancel).await;
+			if cancelled.is_cancelled() || result.is_err() {
+				*session_guard = None;
+			}
+			result
 		}
 	});
 
 	let res = tokio::select! {
 		res = &mut run_task => res,
 		reason = ct.wait() => {
-			tokio_cancel.cancel();
+			cancel_run(&run_children, &tokio_cancel).await;
 			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut run_task).await;
 			if graceful.is_err() {
-				// Dropping the run stops the command with `KILL`.
+				// OS termination has completed; only the stalled task remains.
 				run_task.abort();
 				let _ = run_task.await;
 			}
-			abort_state.clear().await;
-			// Use try_lock to avoid deadlocking if another task holds the session.
-			// If we can't acquire the lock, the session will be cleaned up when the
-			// holding task finishes.
-			if let Ok(mut guard) = session.try_lock() {
-				*guard = None;
-			}
+			abort_state.clear(&at).await;
 			return Ok(cancelled_result(reason));
 		}
 	};
 	let res =
 		res.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	abort_state.clear().await;
+	abort_state.clear(&at).await;
 
-	// `exit`, errexit, or a stray top-level `return`/`break` ends this command,
-	// not the session: the next run keeps the variables, functions, and options
-	// built so far. Only a failed run leaves the shell in an unknown state.
-	if res.is_err() {
-		*session.lock().await = None;
-	}
 	Ok(res?.into_run_result())
 }
 
@@ -500,11 +530,14 @@ async fn run_shell_oneshot(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
+	let children = ActiveChildren::default();
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
+		let children = children.clone();
 		async move {
 			// The session ends with this task: its background jobs end with it.
-			let mut session = create_session_for_run(&config, Some(&tokio_cancel)).await?;
+			let mut session =
+				create_session_for_run(&config, Some(&tokio_cancel), &[&children]).await?;
 			run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel).await
 		}
 	});
@@ -512,7 +545,7 @@ async fn run_shell_oneshot(
 	let run_result = tokio::select! {
 		result = &mut task => result,
 		reason = ct.wait() => {
-			tokio_cancel.cancel();
+			cancel_run(&children, &tokio_cancel).await;
 			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut task).await;
 			if graceful.is_err() {
 				task.abort();
@@ -534,10 +567,13 @@ async fn run_shell_oneshot_streams(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
+	let children = ActiveChildren::default();
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
+		let children = children.clone();
 		async move {
-			let mut session = create_session_for_run(&config, Some(&tokio_cancel)).await?;
+			let mut session =
+				create_session_for_run(&config, Some(&tokio_cancel), &[&children]).await?;
 			run_shell_command_streams(&mut session, &run_config, streams, tokio_cancel).await
 		}
 	});
@@ -545,7 +581,7 @@ async fn run_shell_oneshot_streams(
 	let run_result = tokio::select! {
 		result = &mut task => result,
 		reason = ct.wait() => {
-			tokio_cancel.cancel();
+			cancel_run(&children, &tokio_cancel).await;
 			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut task).await;
 			if graceful.is_err() {
 				task.abort();
@@ -690,7 +726,7 @@ fn merge_path_values(_existing: &str, incoming: &str) -> String {
 
 #[cfg(test)]
 async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
-	create_session_for_run(config, None).await
+	create_session_for_run(config, None, &[]).await
 }
 
 /// Copies the host environment into `vars` (the shell's starting
@@ -790,6 +826,7 @@ fn initial_cwd() -> BString {
 async fn create_session_for_run(
 	config: &ShellConfig,
 	cancel_token: Option<&CancellationToken>,
+	children: &[&ActiveChildren],
 ) -> Result<ShellSessionCore> {
 	let cancel = cancel_token.cloned().unwrap_or_default();
 	let runtime = tokio::runtime::Handle::current();
@@ -815,6 +852,13 @@ async fn create_session_for_run(
 	})
 	.map_err(|err| Error::msg(format!("Failed to initialize shell: {err}")))?;
 	let mut core = ShellSessionCore { session, slot, filesystem: config.filesystem.clone(), cwd };
+	for children in children {
+		let mut children = children.lock();
+		if cancel.is_cancelled() {
+			return Err(Error::msg("Shell setup was cancelled"));
+		}
+		*children = Some(core.session.children());
+	}
 
 	if !has_env_var {
 		apply_env_fallback(&mut core, &cancel)
@@ -1347,8 +1391,10 @@ async fn run_shell_command_once(
 	let cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let reader_cancel = reader_cancel.clone();
+		let children = session.session.children();
 		async move {
 			cancel_token.cancelled().await;
+			children.wait_termination().await;
 			time::sleep(CANCEL_READER_GRACE).await;
 			reader_cancel.cancel();
 		}
@@ -1488,8 +1534,10 @@ async fn run_shell_command_streams_in_filesystem(
 	let cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let reader_cancel = reader_cancel.clone();
+		let children = session.session.children();
 		async move {
 			cancel_token.cancelled().await;
+			children.wait_termination().await;
 			time::sleep(CANCEL_READER_GRACE).await;
 			reader_cancel.cancel();
 		}

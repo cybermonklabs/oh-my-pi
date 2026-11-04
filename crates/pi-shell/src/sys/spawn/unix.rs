@@ -41,10 +41,7 @@ use std::{
 
 use bstr::BString;
 use parking_lot::{Condvar, Mutex, MutexGuard};
-use pi_builtins::{
-	PinnedProcess, ProcessStatus, host_protected_pids, read_process_umask as process_umask,
-	signalable_descendants,
-};
+use pi_builtins::{PinnedProcess, ProcessStatus, SpawnLedger, read_process_umask as process_umask};
 
 use super::{Dir, Leftover, Sessions, Shared, child_end};
 use crate::{
@@ -205,83 +202,33 @@ impl Addr {
 			Self::Process { pid, start } => p.pid == pid && p.start == start,
 		}
 	}
-
-	/// Whether anything is left in the scope.
-	fn alive(self) -> bool {
-		match self {
-			Self::Group(id) | Self::Session(id) => group_alive(id),
-			Self::Process { pid, start } => {
-				proc::info(pid).is_some_and(|i| i.start == start && i.state != ProcState::Zombie)
-			},
-		}
-	}
-
-	/// Whether this addresses a group or a session, rather than one process.
-	const fn is_group(self) -> bool {
-		matches!(self, Self::Group(_) | Self::Session(_))
-	}
-
-	/// Send `sig` by number. Only valid while the external is unreaped (its
-	/// pid and group cannot be recycled then); [`Scope::signal`] holds that
-	/// rule.
-	///
-	/// A session's group exists only once its leader ran `setsid`, which
-	/// the child does itself after the fork; until then the leader is the
-	/// only member, so the signal goes to its pid (else it is lost: a
-	/// `kill $!` right after the spawn left the program running).
-	fn signal(self, sig: Signal) -> io::Result<()> {
-		let n = i32::from(sig.number(Platform::current()));
-		let rc = match self {
-			// SAFETY: plain syscall without pointer arguments.
-			Self::Group(id) => unsafe { libc::killpg(id, n) },
-			// SAFETY: as above.
-			Self::Session(id) => match unsafe { libc::killpg(id, n) } {
-				// SAFETY: as above.
-				-1 if errno() == libc::ESRCH => unsafe { libc::kill(id, n) },
-				rc => rc,
-			},
-			// SAFETY: as above.
-			Self::Process { pid, .. } => unsafe { libc::kill(pid, n) },
-		};
-		if rc == 0 {
-			Ok(())
-		} else {
-			Err(io::Error::last_os_error())
-		}
-	}
 }
 
-/// What one external's group-wide operations reach, and the identities they
-/// reach it through.
-///
-/// Addressing a group by its number is only sound while this process holds
-/// the external unreaped: the number is the external's pid, and the kernel
-/// cannot give it to anything else until it is reaped. Once it is reaped,
-/// the number says nothing — another session leader may hold it — so the
-/// group is reached through the leader's own pin, which the kernel resolves
-/// to the group that leader led and to no other (Linux 6.9 and later).
-///
-/// Every member found in the scope is pinned as it is signalled. A member
-/// that leaves the group afterwards — one that calls `setsid` in its TERM
-/// handler, say — is reached through its pin, and a child it forked after
-/// that through the walk of its descendants.
+/// Identity ownership of one external's scope. A reap report and a signal
+/// wave use the same lock; after that report no numeric group signal is
+/// permitted, even when a later process takes the old group's number.
 #[derive(Clone)]
 struct Scope {
-	addr: Addr,
-	pins: Arc<Pins>,
+	addr:  Addr,
+	root:  i32,
+	pin:   Option<PinnedProcess>,
+	state: Arc<Mutex<ScopeState>>,
 }
 
-/// The pinned identities of one scope.
-struct Pins {
-	/// The external itself, pinned at the spawn.
-	leader: Option<PinnedProcess>,
-	/// Every member pinned while it was in the scope.
-	known:  Mutex<Vec<PinnedProcess>>,
+struct ScopeState {
+	ledger:   SpawnLedger,
+	unreaped: bool,
 }
 
 impl PartialEq for Scope {
 	fn eq(&self, other: &Self) -> bool {
-		self.addr == other.addr
+		Arc::ptr_eq(&self.state, &other.state)
+			|| (self.addr == other.addr
+				&& self
+					.pin
+					.as_ref()
+					.zip(other.pin.as_ref())
+					.is_some_and(|(a, b)| a.same_identity(b)))
 	}
 }
 
@@ -294,158 +241,105 @@ impl std::fmt::Debug for Scope {
 }
 
 impl Scope {
-	/// The scope of an external `pid` spawned at `place`.
 	fn of(place: Place, pid: i32) -> Self {
+		let addr = Addr::of(place, pid);
+		let pin = PinnedProcess::from_pid(pid);
+		let mut ledger = SpawnLedger::default();
+		let group = match addr {
+			Addr::Group(id) | Addr::Session(id) => Some(id),
+			Addr::Process { .. } => None,
+		};
+		ledger.record(group, pin.clone());
+		if let Some(group) = group.filter(|&group| group != pid) {
+			// A joined stage does not hold its leader unreaped. Only the
+			// leader's pin, never the stage's pid, proves that group.
+			ledger.record_unwatched(Some(group), PinnedProcess::from_pid(group));
+		}
 		Self {
-			addr: Addr::of(place, pid),
-			pins: Arc::new(Pins {
-				leader: PinnedProcess::from_pid(pid),
-				known:  Mutex::new(Vec::new()),
-			}),
+			addr,
+			root: pid,
+			pin,
+			state: Arc::new(Mutex::new(ScopeState { ledger, unreaped: true })),
 		}
 	}
 
-	/// The id reported in a [`Leftover`].
 	const fn id(&self) -> i32 {
 		self.addr.id()
 	}
 
-	const fn contains(&self, p: &ProcInfo) -> bool {
-		self.addr.contains(p)
+	fn contains(&self, info: &ProcInfo) -> bool {
+		self.addr.contains(info) && self.alive()
 	}
 
-	/// Whether anything is left in the scope, or in anything pinned from it.
 	fn alive(&self) -> bool {
-		self.addr.alive() || self.known_alive()
+		self.state.lock().ledger.reaches_anything()
 	}
 
-	fn known_alive(&self) -> bool {
-		self
-			.pins
-			.known
-			.lock()
-			.iter()
-			.any(|p| p.status() == ProcessStatus::Running)
+	/// Called before releasing the unreaped child. Ordinary collected
+	/// commands need no native sweep; abandoned ones retain their members.
+	fn before_reap(&self, capture: bool) {
+		let mut state = self.state.lock();
+		if capture {
+			self.capture_session(&mut state);
+		}
+		state.ledger.before_reap(self.root, capture);
+		state.unreaped = false;
 	}
 
-	/// Whether the leader is still this process's unreaped child, which is
-	/// what makes the scope's number its own.
-	fn number_is_ours(&self) -> bool {
-		self
-			.pins
-			.leader
-			.as_ref()
-			.is_some_and(|leader| unreaped_child(leader.pid()))
-	}
-
-	/// Pins every member of the scope that runs now, so a later wave reaches
-	/// it even after it leaves the scope. Only called where the number is
-	/// known to be this scope's.
-	fn capture(&self) {
-		if !self.addr.is_group() {
+	/// Other process groups inside an owned session must also survive in
+	/// the identity ledger after their session leader is reaped.
+	fn capture_session(&self, state: &mut ScopeState) {
+		if !matches!(self.addr, Addr::Session(_)) || !state.unreaped {
 			return;
 		}
+		let ledger = &mut state.ledger;
 		let Ok(table) = proc::list() else {
 			return;
 		};
-		let me = std::process::id() as i32;
-		let mut known = self.pins.known.lock();
-		for info in table.iter().filter(|p| p.pid != me && self.addr.contains(p)) {
+		for info in table.iter().filter(|info| self.addr.contains(info)) {
 			let Some(pin) = PinnedProcess::from_pid(info.pid) else {
 				continue;
 			};
 			if pin.status() == ProcessStatus::Running
-				&& !known.iter().any(|seen| seen.same_identity(&pin))
+				&& proc::info(info.pid)
+					.is_some_and(|now| now.start == info.start && self.addr.contains(&now))
+				&& !ledger
+					.entries()
+					.iter()
+					.any(|entry| entry.process.same_identity(&pin))
 			{
-				known.push(pin);
+				ledger.record_unwatched(Some(info.pgid), Some(pin));
 			}
 		}
 	}
 
-	/// Send `sig` to the scope: to its number while this process still holds
-	/// the leader unreaped, else to the group the leader's pin names. Members
-	/// pinned earlier that have since left the scope are signalled through
-	/// their own pins, after the scope itself, so none takes the signal twice.
 	fn signal(&self, sig: Signal) -> io::Result<()> {
-		self.capture();
-		let sent = if self.addr.is_group() && !self.number_is_ours() {
-			self
-				.pins
-				.leader
-				.as_ref()
-				.map_or(Err(io::Error::from_raw_os_error(libc::ESRCH)), |leader| {
-					if leader.signal_group(i32::from(sig.number(Platform::current()))) {
-						Ok(())
-					} else {
-						Err(io::Error::last_os_error())
-					}
-				})
+		let number = i32::from(sig.number(Platform::current()));
+		if matches!(self.addr, Addr::Process { .. }) {
+			// Inherited sessions deliberately signal only the child, not
+			// its descendants or the embedding host's process group.
+			return if self.pin.as_ref().is_some_and(|pin| pin.kill(number)) {
+				Ok(())
+			} else {
+				Err(io::Error::from_raw_os_error(libc::ESRCH))
+			};
+		}
+		let mut state = self.state.lock();
+		self.capture_session(&mut state);
+		let wave = state.ledger.plan_wave(number, true).deliver();
+		let delivered = !wave.reached().is_empty()
+			|| !wave.members().is_empty()
+			|| !wave.kernel_leaders().is_empty();
+		state.ledger.record_reached(&wave);
+		if delivered {
+			Ok(())
 		} else {
-			self.addr.signal(sig)
-		};
-		self.signal_strays(sig);
-		sent
-	}
-
-	/// Signal what was pinned in this scope and has left it: the scope's own
-	/// signal no longer reaches those.
-	fn signal_strays(&self, sig: Signal) {
-		let n = i32::from(sig.number(Platform::current()));
-		for pin in self.pins.known.lock().iter() {
-			if pin.status() != ProcessStatus::Running {
-				continue;
-			}
-			let inside = proc::info(pin.pid()).is_some_and(|info| self.addr.contains(&info));
-			if !inside {
-				pin.kill(n);
-			}
+			Err(io::Error::from_raw_os_error(libc::ESRCH))
 		}
 	}
 
-	/// KILL whatever is left of the scope after the external exited: the
-	/// group through the leader's pin, every member pinned while it was in
-	/// the scope, and the live descendants of those members (a child one of
-	/// them forked after the leader was reaped is in no list of the group).
 	fn sweep(&self) {
-		let kill = i32::from(Signal::Kill.number(Platform::current()));
-		if self.addr.is_group() {
-			if self.number_is_ours() {
-				let _ = match self.addr {
-					Addr::Group(id) => proc::kill_group(id, Signal::Kill),
-					Addr::Session(id) => proc::kill_session(id, Signal::Kill),
-					Addr::Process { .. } => Ok(Vec::new()),
-				};
-			} else if let Some(leader) = self.pins.leader.as_ref() {
-				leader.signal_group(kill);
-			}
-		}
-		let protected = host_protected_pids();
-		for pin in self.pins.known.lock().iter() {
-			if pin.status() != ProcessStatus::Running {
-				continue;
-			}
-			for child in signalable_descendants(pin, &protected) {
-				child.kill(kill);
-			}
-			pin.kill(kill);
-		}
-	}
-}
-
-/// Whether `pid` is a child of this process that it has not reaped: its pid,
-/// and the group number that pid is, are the child's until it is reaped.
-/// Nothing is reaped here (`WNOWAIT`).
-fn unreaped_child(pid: i32) -> bool {
-	// SAFETY: an all-zero `siginfo_t` is valid; `waitid` writes only into it.
-	let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-	// SAFETY: as above; the remaining arguments are scalars.
-	unsafe {
-		libc::waitid(
-			libc::P_PID,
-			pid as libc::id_t,
-			&raw mut info,
-			libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-		) == 0
+		let _ = self.signal(Signal::Kill);
 	}
 }
 
@@ -497,13 +391,6 @@ impl State {
 			.retain(|s| table.iter().any(|p| s.contains(p)) || s.alive());
 		gs.next_sweep = gs.list.len() + SWEEP;
 	}
-}
-
-/// Whether process group `pgid` has a member (`EPERM`: exists, not ours).
-fn group_alive(pgid: i32) -> bool {
-	// SAFETY: plain syscall; signal 0 only checks existence and permission.
-	let alive = unsafe { libc::kill(-pgid, 0) } == 0;
-	alive || io::Error::last_os_error().kind() == io::ErrorKind::PermissionDenied
 }
 
 pub(super) fn dup(h: OsHandle) -> io::Result<fs::File> {
@@ -735,6 +622,7 @@ pub(super) fn spawn(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Box
 		// Without a waiter nobody would observe the exit: undo the spawn
 		// (the child is unreaped, so its scope is still ours).
 		let _ = scope.signal(Signal::Kill);
+		scope.before_reap(true);
 		reap(pid);
 		return Err(e);
 	}
@@ -1497,6 +1385,15 @@ impl ExtProc for UnixProc {
 
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		self.tracker.lock().signalled(sig);
+		if !self.detached
+			&& self
+				.shared
+				.termination_delegated
+				.load(std::sync::atomic::Ordering::Acquire)
+			&& matches!(sig, Signal::Term | Signal::Kill)
+		{
+			return Ok(());
+		}
 		self.scope.signal(sig)
 	}
 
@@ -1521,8 +1418,14 @@ impl Drop for UnixProc {
 		}
 		let grace = self.shared.config.grace;
 		let mut life = self.tracker.lock();
-		if self.detached {
+		if self.detached
+			|| self
+				.shared
+				.termination_delegated
+				.load(std::sync::atomic::Ordering::Acquire)
+		{
 			let exited = life.release();
+			self.scope.before_reap(false);
 			drop(life);
 			if exited {
 				reap(self.pid);
@@ -1535,6 +1438,7 @@ impl Drop for UnixProc {
 		}
 		match life.abandon(Instant::now(), grace) {
 			Abandon::Exited => {
+				self.scope.before_reap(false);
 				drop(life);
 				reap(self.pid);
 			},
@@ -1544,6 +1448,7 @@ impl Drop for UnixProc {
 					let _ = self.scope.signal(Signal::Term);
 				}
 				let _ = self.scope.signal(Signal::Cont);
+				self.scope.before_reap(true);
 				drop(life);
 				reap(self.pid);
 				escalate_at(&self.tracker, self.scope.clone(), sweep_at);
@@ -1556,6 +1461,7 @@ impl Drop for UnixProc {
 				}
 				// A stopped (paused) group acts on TERM only once continued.
 				let _ = self.scope.signal(Signal::Cont);
+				self.scope.before_reap(true);
 				drop(life);
 				escalate_at(&self.tracker, self.scope.clone(), kill_at);
 				// Parked: a waiter observes the exit and reaps.

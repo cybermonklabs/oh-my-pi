@@ -163,6 +163,15 @@ impl CancelToken {
 pub struct AbortToken(Option<Weak<Flag>>);
 
 impl AbortToken {
+	/// Clearing one run's abort handle must not clear a queued or newer run.
+	pub(crate) fn same_token(&self, other: &Self) -> bool {
+		match (&self.0, &other.0) {
+			(Some(a), Some(b)) => Weak::ptr_eq(a, b),
+			(None, None) => true,
+			_ => false,
+		}
+	}
+
 	pub fn abort(&self, reason: AbortReason) {
 		if let Some(flag) = &self.0
 			&& let Some(flag) = flag.upgrade()

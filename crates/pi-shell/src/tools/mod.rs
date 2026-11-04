@@ -33,11 +33,18 @@ mod git;
 mod nohup;
 mod timeout;
 
-use std::{collections::VecDeque, sync::Arc, task::Waker, time::Duration};
+use std::{
+	collections::{HashSet, VecDeque},
+	sync::Arc,
+	task::Waker,
+	time::Duration,
+};
 
 use bstr::{BStr, BString, ByteSlice};
 use parking_lot::Mutex;
-use pi_builtins::PinnedProcess;
+use pi_builtins::{
+	GroupProof, PinnedProcess, SignalWave, SpawnLedger, host_protected_pids, signalable_descendants,
+};
 
 use crate::{
 	bash::{
@@ -142,124 +149,118 @@ impl ToolConfig {
 /// ([`SpawnLog::record`]); `timeout` waits for and escalates on its own. Cheap
 /// to clone; clones share the log.
 #[derive(Clone, Default)]
-pub struct SpawnLog(Arc<LogState>);
+pub struct SpawnLog(Arc<Mutex<Vec<LabelLog>>>);
 
-#[derive(Default)]
-struct LogState {
-	/// `(label, pid)` of every labelled spawn.
-	spawns: Mutex<Vec<(u32, u32)>>,
-	/// Members of the group a labelled external led, pinned before the
-	/// engine reaped it: after the reap its pid names nothing, and a member
-	/// that left the group is named by nothing else.
-	pins:   Mutex<Vec<(u32, PinnedProcess)>>,
+struct LabelLog {
+	label:   u32,
+	ledger:  SpawnLedger,
+	/// External handles not released yet. Only those handles hold their
+	/// child unreaped; a stored pid is never itself a signal target.
+	pending: HashSet<i32>,
 }
 
 impl SpawnLog {
-	/// `pid` was spawned with `lineage`.
 	pub fn record(&self, lineage: Lineage, pid: u32) {
-		if lineage.label != 0 {
-			self.0.spawns.lock().push((lineage.label, pid));
-		}
-	}
-
-	/// The engine is about to reap labelled external `pid`: while it holds
-	/// it unreaped its pid is still the number of the group it led, so the
-	/// members of that group are pinned now or never.
-	pub fn pin_members(&self, pid: u32) {
-		let labels: Vec<u32> = self
-			.0
-			.spawns
-			.lock()
-			.iter()
-			.filter(|&&(_, spawned)| spawned == pid)
-			.map(|&(label, _)| label)
-			.collect();
-		if labels.is_empty() {
+		if lineage.label == 0 || lineage.detached {
 			return;
 		}
-		let Some(leader) = i32::try_from(pid).ok().and_then(PinnedProcess::from_pid) else {
+		let Ok(pid) = i32::try_from(pid) else {
 			return;
 		};
-		let members = leader.members_before_reap();
-		if members.is_empty() {
+		let mut logs = self.0.lock();
+		let at = if let Some(at) = logs.iter().position(|log| log.label == lineage.label) {
+			at
+		} else {
+			logs.push(LabelLog { label: lineage.label, ledger: SpawnLedger::default(), pending: HashSet::new() });
+			logs.len() - 1
+		};
+		logs[at]
+			.ledger
+			.record(Some(pid), PinnedProcess::from_pid(pid));
+		logs[at].pending.insert(pid);
+	}
+
+	/// The wrapper still holds its child unreaped throughout this report.
+	pub fn pin_members(&self, pid: u32) {
+		let Ok(pid) = i32::try_from(pid) else {
 			return;
-		}
-		let mut pins = self.0.pins.lock();
-		for label in labels {
-			for member in &members {
-				if !pins
-					.iter()
-					.any(|(seen, pin)| *seen == label && pin.same_identity(member))
-				{
-					pins.push((label, member.clone()));
-				}
+		};
+		for log in self.0.lock().iter_mut() {
+			if log.pending.remove(&pid) {
+				log.ledger.before_reap(pid, true);
 			}
 		}
 	}
 
-	/// The recorded externals of `labels` that are still running.
-	fn live(&self, labels: &[u32]) -> Vec<u32> {
+	fn reaches_anything(&self, labels: &[u32]) -> bool {
 		self
 			.0
-			.spawns
 			.lock()
 			.iter()
-			.filter(|&&(label, pid)| labels.contains(&label) && running(pid))
-			.map(|&(_, pid)| pid)
-			.collect()
+			.any(|log| labels.contains(&log.label) && log.ledger.reaches_anything())
 	}
 
-	/// Everything pinned under `labels` that still runs.
-	fn pinned(&self, labels: &[u32]) -> Vec<PinnedProcess> {
-		self
+	fn capture(&self, labels: &[u32], groups: bool) {
+		for log in self
 			.0
-			.pins
 			.lock()
-			.iter()
-			.filter(|(label, pin)| {
-				labels.contains(label) && pin.status() == pi_builtins::ProcessStatus::Running
-			})
-			.map(|(_, pin)| pin.clone())
-			.collect()
+			.iter_mut()
+			.filter(|log| labels.contains(&log.label))
+		{
+			let wave = log.ledger.plan_wave(0, groups).deliver();
+			log.ledger.record_reached(&wave);
+		}
+	}
+
+	/// Live handles get catchable signals from the engine exactly once.
+	/// This wave reaches only released externals and their pinned members;
+	/// KILL also covers live handles, since duplicate KILL is unobservable.
+	fn signal(&self, labels: &[u32], signal: crate::bash::Signal, groups: bool) {
+		let number = i32::from(signal.number(crate::bash::Platform::current()));
+		let protected = host_protected_pids();
+		for log in self
+			.0
+			.lock()
+			.iter_mut()
+			.filter(|log| labels.contains(&log.label))
+		{
+			let mut wave = SignalWave::new(number);
+			for entry in log.ledger.entries() {
+				if signal != crate::bash::Signal::Kill
+					&& (log.pending.contains(&entry.process.pid())
+						|| entry
+							.group
+							.is_some_and(|group| log.pending.contains(&group)))
+				{
+					continue;
+				}
+				if !groups && entry.group != Some(entry.process.pid()) {
+					continue;
+				}
+				if groups && entry.group == Some(entry.process.pid()) {
+					let proof = if log.pending.contains(&entry.process.pid()) {
+						GroupProof::Unreaped
+					} else {
+						GroupProof::KernelOnly
+					};
+					wave.group(&entry.process, proof);
+				}
+				wave.process(&entry.process);
+				if groups {
+					for child in signalable_descendants(&entry.process, &protected) {
+						wave.process(&child);
+					}
+				}
+			}
+			wave.deliver();
+			log.ledger.record_reached(&wave);
+		}
 	}
 
 	fn forget(&self, labels: &[u32]) {
-		self.0.spawns.lock().retain(|(label, _)| !labels.contains(label));
-		self.0.pins.lock().retain(|(label, _)| !labels.contains(label));
+		self.0.lock().retain(|log| !labels.contains(&log.label));
 	}
 }
-
-/// Whether `pid` runs (exited but unreaped counts as gone).
-#[cfg(unix)]
-fn running(pid: u32) -> bool {
-	i32::try_from(pid)
-		.ok()
-		.and_then(crate::sys::proc::info)
-		.is_some_and(|p| p.state != crate::sys::proc::ProcState::Zombie)
-}
-
-/// Externals off Unix are not watched: their process tree is the Job
-/// Object's, which the spawner ends with the subshell.
-#[cfg(not(unix))]
-const fn running(_pid: u32) -> bool {
-	false
-}
-
-/// Send `signal` to `pid`'s process group (each external leads its own),
-/// or to `pid` alone.
-#[cfg(unix)]
-fn signal_os(pid: u32, signal: crate::bash::Signal, group: bool) {
-	let Ok(pid) = i32::try_from(pid) else {
-		return;
-	};
-	let number = i32::from(signal.number(crate::bash::Platform::current()));
-	let target = if group { -pid } else { pid };
-	// SAFETY: plain syscall without pointer arguments.
-	unsafe { libc::kill(target, number) };
-}
-
-#[cfg(not(unix))]
-const fn signal_os(_pid: u32, _signal: crate::bash::Signal, _group: bool) {}
 
 /// Lineage labels handed out to tool subshells, and which label each was
 /// started under (a `timeout` inside another one's command).

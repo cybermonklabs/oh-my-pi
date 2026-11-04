@@ -12,6 +12,8 @@ use crate::process;
 
 mod builtins;
 mod env_cwd;
+#[cfg(target_os = "linux")]
+mod ownership;
 mod process_control;
 mod session;
 

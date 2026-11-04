@@ -11,6 +11,7 @@
 
 use std::{
 	cell::OnceCell,
+	collections::HashMap,
 	hash::{BuildHasher, RandomState},
 	io,
 	sync::{
@@ -23,15 +24,16 @@ use std::{
 
 use bstr::{BStr, BString, ByteSlice};
 use parking_lot::Mutex;
+use pi_builtins::PinnedProcess;
 
 use crate::{
 	bash::{
-		Deadline, Event, ExitStatus, ExtProc, FdRef, File, FileKind, Fs, IntrinsicId, Invocation,
+		Deadline, Event, ExtProc, FdRef, File, FileKind, Fs, IntrinsicId, Invocation,
 		ModeId, NativeRef, OsHandle, ResolveCtx, Resolved, Rlimit, Signal, SpawnFuture, SpawnSpec,
 		StdFd, StdioSpec, SystemTimeLike, Task, Timer, TtyInfo, UserInfo, Verdict,
 	},
 	output_decode,
-	sys::{End, Exits, NativeSpawner, OutputDecoding, Relays, Sessions, SpawnConfig, StdFile},
+	sys::{End, Exits, NativeSpawner, OutputDecoding, ReapObserver, Relays, Sessions, SpawnConfig, StdFile},
 	tools::{SpawnLog, ToolConfig},
 };
 
@@ -46,12 +48,17 @@ pub const TERM_GRACE: Duration = Duration::from_secs(1);
 /// The [`Session`](crate::session::Session) lists a run's live children
 /// through it (pi's `Shell::pids()`). Implementations must not block.
 pub trait SpawnObserver: Send + Sync {
+	/// Whether the engine has entered cancellation (new commands can be
+	/// cleanup from a shell trap). Sampled before the native launch.
+	fn cancellation_applied(&self) -> bool {
+		false
+	}
 	/// `pid` was spawned; it leads its own session and process group, so
 	/// its process group id is `pid` too (Unix).
-	fn spawned(&self, pid: u32);
-	/// `pid`'s exit was observed, or the engine abandoned it (the spawner
-	/// then terminates it in the background).
-	fn released(&self, pid: u32);
+	fn spawned(&self, pid: u32, after_cancel: bool);
+	/// The native child is about to be reaped or released; `members` were
+	/// pinned while its group number was still reserved.
+	fn released(&self, pid: u32, members: &[PinnedProcess]);
 }
 
 /// The shell's standard streams, replaced for each run.
@@ -205,6 +212,7 @@ struct Launcher {
 	/// Decodes what externals write into a text sink; `None` where output
 	/// needs none ([`output_decode::external_output_decoding`]).
 	decoding: Option<Arc<dyn OutputDecoding>>,
+	reaps: Arc<ReapRecorder>,
 }
 
 /// A text sink a relay forwards into.
@@ -271,17 +279,26 @@ impl Launcher {
 			self.route_text(&mut spec, relays)?;
 		}
 		let lineage = spec.lineage;
+		let observer = self
+			.observer
+			.as_ref()
+			.filter(|_| !lineage.detached)
+			.cloned();
+		let after_cancel = observer
+			.as_ref()
+			.is_some_and(|observer| observer.cancellation_applied());
 		let mut child = self.spawner.spawn(spec)?;
 		if let Some(relays) = relays {
 			child = relays.wrap(child);
 		}
 		self.spawns.record(lineage, child.pid());
-		Ok(Box::new(Observed {
-			child,
-			observer: self.observer.clone(),
-			spawns: self.spawns.clone(),
-			released: false,
-		}))
+		if let Some(observer) = observer.as_ref() {
+			observer.spawned(child.pid(), after_cancel);
+		}
+		if let Some(observer) = observer {
+			self.reaps.observers.lock().insert(child.pid(), observer);
+		}
+		Ok(child)
 	}
 }
 
@@ -291,21 +308,21 @@ impl PiHost {
 	/// Externals lead their own sessions; one abandoned while running (a
 	/// cancel) gets TERM, then KILL after [`TERM_GRACE`].
 	pub fn new(fs: Box<dyn Fs + Send>, runtime: tokio::runtime::Handle) -> Self {
+		let spawns = SpawnLog::default();
+		let reaps = Arc::new(ReapRecorder { spawns: spawns.clone(), observers: Mutex::new(HashMap::new()) });
+		let spawner = NativeSpawner::new(SpawnConfig {
+			grace: TERM_GRACE, sessions: Sessions::Detach, exits: Exits::Thread, umask: None,
+		});
+		spawner.set_reap_observer(Arc::clone(&reaps) as Arc<dyn ReapObserver>);
 		Self {
 			fs,
 			launcher: Launcher {
-				spawner:  NativeSpawner::new(SpawnConfig {
-					grace:    TERM_GRACE,
-					sessions: Sessions::Detach,
-					// The session driver is an async task: exits wake its waker
-					// from waiter threads.
-					exits:    Exits::Thread,
-					umask:    None,
-				}),
+				spawner,
 				streams:  StdStreams::default(),
 				observer: None,
-				spawns:   SpawnLog::default(),
+				spawns,
 				decoding: output_decode::external_output_decoding(),
+				reaps,
 			},
 			tools: ToolConfig::default(),
 			runtime,
@@ -698,56 +715,19 @@ fn protected_processes() -> Vec<(i32, i32)> {
 	i32::try_from(std::process::id()).map_or_else(|_| Vec::new(), |me| vec![(me, me)])
 }
 
-/// An external reported to a [`SpawnObserver`].
-struct Observed {
-	child:    Box<dyn ExtProc>,
-	observer: Option<Arc<dyn SpawnObserver>>,
-	spawns:   SpawnLog,
-	released: bool,
+/// Per-spawn observer identity is retained until the actual reap, including
+/// a deferred old-kernel cohort. No process wrapper needs to retain pipes.
+struct ReapRecorder {
+	spawns: SpawnLog,
+	observers: Mutex<HashMap<u32, Arc<dyn SpawnObserver>>>,
 }
 
-impl Observed {
-	fn release(&mut self) {
-		if !self.released {
-			self.released = true;
-			// The engine has not reaped it yet: its pid still holds the
-			// number of the group it led, so the members of that group can
-			// be pinned, and nothing else names them afterwards.
-			self.spawns.pin_members(self.child.pid());
-			if let Some(observer) = self.observer.as_ref() {
-				observer.released(self.child.pid());
-			}
+impl ReapObserver for ReapRecorder {
+	fn before_reap(&self, pid: u32, members: &[PinnedProcess]) {
+		self.spawns.released(pid, members);
+		if let Some(observer) = self.observers.lock().remove(&pid) {
+			observer.released(pid, members);
 		}
-	}
-}
-
-impl ExtProc for Observed {
-	fn pid(&self) -> u32 {
-		self.child.pid()
-	}
-
-	fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<ExitStatus> {
-		let status = std::task::ready!(self.child.poll_wait(cx));
-		self.release();
-		Poll::Ready(status)
-	}
-
-	fn signal(&mut self, sig: Signal) -> io::Result<()> {
-		self.child.signal(sig)
-	}
-
-	fn stop(&mut self) -> io::Result<()> {
-		self.child.stop()
-	}
-
-	fn cont(&mut self) -> io::Result<()> {
-		self.child.cont()
-	}
-}
-
-impl Drop for Observed {
-	fn drop(&mut self) {
-		self.release();
 	}
 }
 

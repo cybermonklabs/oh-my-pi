@@ -33,8 +33,10 @@
 //! [`ControlHandle::cancel`](crate::bash::ControlHandle::cancel): first `TERM`
 //! (signal traps run, externals get `TERM`, status 143), then, if the run
 //! has not ended after [`TERM_GRACE`], `KILL` (no traps, status 137).
-//! Unwinding drops the externals the run waits for; the spawner sends their
-//! process groups `TERM` and `KILL` after [`TERM_GRACE`] in the background.
+//! A direct session call lets the native spawner own external termination.
+//! [`crate::Shell`] instead owns TERM/grace/KILL through [`Children`], with
+//! native delivery delegated during that cancellation. Driver teardown and
+//! output readers wait for that owner, including when the driver task stalls.
 //! The cancel request reaches the engine only from the driver, while the run
 //! it targets is still in flight, so a late cancel never leaks into the next
 //! command. What `nohup` started ([`crate::tools`]) is detached: neither a
@@ -64,17 +66,17 @@ use std::{
 
 use bstr::{BString, ByteSlice};
 use parking_lot::Mutex;
-use pi_builtins::{PinnedProcess, SpawnLedger};
+use pi_builtins::{GroupProof, PinnedProcess, SignalWave, SpawnLedger};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
 	bash::{
-		Budget, CallId, Cx, Engine, EngineConfig, EventMask, Fs, MemStore, PipeTap, RunId, Script,
+		Budget, CallId, ControlHandle, Cx, Engine, EngineConfig, EventMask, Fs, MemStore, PipeTap, RunId, Script,
 		Shell, ShellError, ShellInit, Signal, Step, ToolCall, VprocSel,
 		store::{Key, MiscKey, Record},
 	},
 	host::{PiHost, SpawnObserver, TERM_GRACE},
-	sys::OutputDecoding,
+	sys::{NativeSpawner, OutputDecoding},
 	tools::{ToolCalls, ToolConfig},
 	vfs::VfsFs,
 };
@@ -90,11 +92,6 @@ const SETTLE_STEPS: u32 = 4;
 /// Longest suspension of the driver: every wake it waits for is delivered by
 /// a waker, so this only bounds the cost of a lost one.
 const MAX_PARK: Duration = Duration::from_secs(1);
-
-/// How long the wave that stops what a cancelled run left behind waits
-/// between its `TERM` and its `KILL`: long enough for a `TERM` trap to run,
-/// short enough that a cancelled run ends promptly.
-const CANCEL_TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// The signals those waves send.
 const TERM_SIGNAL: i32 = 15;
@@ -235,20 +232,41 @@ pub enum SessionError {
 /// group it leads before the engine reaps it, so a cancelled run can be
 /// stopped whole: by then a pid or a group number says nothing, and only a
 /// pin names the process this run started (see [`SpawnLedger`]).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Children(Arc<ChildrenState>);
 
-#[derive(Default)]
 struct ChildrenState {
-	/// A run is in flight.
-	active: AtomicBool,
-	/// Live pids in spawn order.
-	pids:   Mutex<Vec<u32>>,
-	/// What the run spawned, each pinned at its spawn.
-	ledger: Mutex<SpawnLedger>,
+	active:            AtomicBool,
+	driver_done:       AtomicBool,
+	engine_cancelling: AtomicBool,
+	pids:              Mutex<Vec<u32>>,
+	registry:          Mutex<ChildRegistry>,
+	spawner:           NativeSpawner,
+	terminated:        CancellationToken,
+	control: Mutex<Option<ControlHandle>>,
+}
+
+#[derive(Default)]
+struct ChildRegistry {
+	ledger:  SpawnLedger,
+	/// Last first-delivery of TERM, including a spawn racing cancellation.
+	term_at: Option<Instant>,
 }
 
 impl Children {
+	fn new(spawner: NativeSpawner) -> Self {
+		Self(Arc::new(ChildrenState {
+			active: AtomicBool::new(false),
+			driver_done: AtomicBool::new(true),
+			engine_cancelling: AtomicBool::new(false),
+			pids: Mutex::new(Vec::new()),
+			registry: Mutex::new(ChildRegistry::default()),
+			spawner,
+			terminated: CancellationToken::new(),
+			control: Mutex::new(None),
+		}))
+	}
+
 	/// Pids of the live externals spawned by the run in flight, in spawn
 	/// order; empty while no run is in flight.
 	pub fn pids(&self) -> Vec<i32> {
@@ -264,49 +282,96 @@ impl Children {
 			.collect()
 	}
 
-	/// Pins everything the run can still reach: each recorded process, and
-	/// every member of a group one of them leads. Signal 0 reaches them and
-	/// changes nothing, and a wave keeps what it reached, so a process that
-	/// leaves its group afterwards is still named by its pin.
-	pub fn pin_reachable(&self) {
-		self.0.ledger.lock().plan_wave(0, true).deliver();
+	/// Claim the session's external termination before requesting the engine
+	/// cancel. The engine still unwinds its virtual jobs, but neither its
+	/// signals nor dropped native handles start a second TERM/KILL sequence.
+	#[cfg(unix)]
+	pub fn begin_termination(&self) {
+		self.0.spawner.delegate_termination();
+		let mut registry = self.0.registry.lock();
+		if registry.term_at.is_none() {
+			let wave = registry.ledger.plan_wave(TERM_SIGNAL, true).deliver();
+			registry.ledger.record_reached(&wave);
+			registry.term_at = Some(Instant::now());
+		}
 	}
 
-	/// Stops everything the run spawned that is still reachable: one wave of
-	/// `TERM` to each recorded process, the group it leads and its live
-	/// descendants, then `KILL` to whatever that did not end. Each wave is
-	/// planned from one reading and delivered under the ledger's lock, so
-	/// the engine cannot reap a leader while its group is being listed.
-	///
-	/// Called when a run was cancelled: the engine's own cancel reaches the
-	/// tree it still holds, and this reaches what that tree left behind —
-	/// a process that left its group, and a child forked by a process whose
-	/// parent the engine already reaped.
-	pub async fn terminate_run(&self) {
-		if !self.0.ledger.lock().reaches_anything() {
-			return;
+	/// Finish the bridge-owned waves independently of the driver task. Every
+	/// identity reached by TERM stays in the ledger for KILL, even after it
+	/// leaves its group or its parent exits.
+	#[cfg(unix)]
+	pub async fn finish_termination(&self) {
+		struct Done<'a>(&'a CancellationToken);
+		impl Drop for Done<'_> {
+			fn drop(&mut self) {
+				self.0.cancel();
+			}
 		}
-		self.0.ledger.lock().plan_wave(TERM_SIGNAL, true).deliver();
-		let deadline = Instant::now() + CANCEL_TERM_GRACE;
-		while Instant::now() < deadline && self.0.ledger.lock().reaches_anything() {
-			tokio::time::sleep(Duration::from_millis(25)).await;
+		let _done = Done(&self.0.terminated);
+		loop {
+			{
+				let registry = self.0.registry.lock();
+				if self.0.driver_done.load(Ordering::Acquire) && !registry.ledger.reaches_anything() {
+					self.0.terminated.cancel();
+					return;
+				}
+				if registry.term_at.is_none_or(|at| at.elapsed() >= TERM_GRACE) {
+					break;
+				}
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
 		}
-		if self.0.ledger.lock().reaches_anything() {
-			self.0.ledger.lock().plan_wave(KILL_SIGNAL, true).deliver();
+		let mut registry = self.0.registry.lock();
+		let wave = registry.ledger.plan_wave(KILL_SIGNAL, true).deliver();
+		registry.ledger.record_reached(&wave);
+		if let Some(control) = self.0.control.lock().as_ref() {
+			control.cancel(Signal::Kill);
+		}
+		self.0.terminated.cancel();
+	}
+
+	/// Readers and driver teardown must not close a TERM handler's output
+	/// before the one owner of its termination has completed.
+	pub async fn wait_termination(&self) {
+		#[cfg(unix)]
+		if self.0.spawner.termination_delegated() {
+			self.0.terminated.cancelled().await;
+		}
+	}
+
+	pub(crate) fn termination_started(&self) -> bool {
+		#[cfg(unix)]
+		{
+			self.0.spawner.termination_delegated()
+		}
+		#[cfg(not(unix))]
+		{
+			false
+		}
+	}
+
+	fn engine_cancelled(&self) {
+		if !self.0.engine_cancelling.swap(true, Ordering::AcqRel) {
+			let mut registry = self.0.registry.lock();
+			if let Some(at) = registry.term_at.as_mut() { *at = Instant::now(); }
 		}
 	}
 
 	fn set_active(&self, active: bool) {
 		if active {
-			*self.0.ledger.lock() = SpawnLedger::default();
-			self.0.pids.lock().clear();
+			self.0.driver_done.store(false, Ordering::Release);
+			self.0.engine_cancelling.store(false, Ordering::Release);
 		}
 		self.0.active.store(active, Ordering::Release);
 	}
 }
 
 impl SpawnObserver for Children {
-	fn spawned(&self, pid: u32) {
+	fn cancellation_applied(&self) -> bool {
+		self.0.engine_cancelling.load(Ordering::Acquire)
+	}
+
+	fn spawned(&self, pid: u32, after_cancel: bool) {
 		self.0.pids.lock().push(pid);
 		let Ok(pid) = i32::try_from(pid) else {
 			return;
@@ -316,11 +381,24 @@ impl SpawnObserver for Children {
 		// number is its pid (see [`SpawnObserver::spawned`]); where it does
 		// not, the group it is in is the host's, which the group primitive
 		// refuses to signal on every path.
-		self
-			.0
-			.ledger
-			.lock()
-			.record(Some(pid), PinnedProcess::from_pid(pid));
+		let mut registry = self.0.registry.lock();
+		let process = PinnedProcess::from_pid(pid);
+		registry.ledger.record(Some(pid), process.clone());
+		#[cfg(unix)]
+		if registry.term_at.is_some()
+			&& let Some(process) = process
+		{
+			// A launch already in flight needs its first TERM. A command
+			// started by the engine's TERM trap instead gets time to finish.
+			if !after_cancel {
+				let mut wave = SignalWave::new(TERM_SIGNAL);
+				wave.group(&process, GroupProof::Unreaped);
+				wave.process(&process);
+				wave.deliver();
+				registry.ledger.record_reached(&wave);
+			}
+			registry.term_at = Some(Instant::now());
+		}
 	}
 
 	fn released(&self, pid: u32) {
@@ -333,7 +411,7 @@ impl SpawnObserver for Children {
 		// holds the number of the group it led: the members of that group are
 		// pinned now or never.
 		if let Ok(pid) = i32::try_from(pid) {
-			self.0.ledger.lock().before_reap(pid, true);
+			self.0.registry.lock().ledger.before_reap(pid, true);
 		}
 	}
 }
@@ -377,11 +455,11 @@ impl Session {
 	pub fn new(config: SessionConfig) -> Result<Self, SessionError> {
 		let SessionConfig { env, cwd, fs, vfs, runtime, output_decoding } = config;
 		let (jobs, rx) = flume::unbounded();
-		let children = Children::default();
 		let bell = Arc::new(Bell::default());
 		let waker = Waker::from(Arc::clone(&bell));
 		let tools = ToolConfig::from_env(&env, vfs.clone(), runtime.clone());
 		let mut host = PiHost::new(fs, runtime.clone());
+		let children = Children::new(host.spawner().clone());
 		if output_decoding.is_some() {
 			host.set_output_decoding(output_decoding);
 		}
@@ -396,6 +474,7 @@ impl Session {
 		let init = ShellInit { env, cwd, ..ShellInit::default() };
 		let mut shell = Shell::create(&engine, &mut Cx { host: &mut host, store: &mut store }, init)
 			.map_err(SessionError::Create)?;
+		*children.0.control.lock() = Some(shell.control());
 		// Nothing observes events: skip building them.
 		shell.set_event_mask(EventMask::NONE);
 		let driver = Driver { shell, store, host, bell, jobs: rx, children: children.clone(), tools };
@@ -472,6 +551,11 @@ impl Session {
 		let level = Arc::new(CancelLevel::default());
 		let (reply_tx, reply_rx) = flume::bounded(1);
 		let job = Job { options, stdio, cancel: Arc::clone(&level), reply: reply_tx };
+		{
+			let _registry = self.children.0.registry.lock();
+			if self.children.0.terminated.is_cancelled() { return Err(SessionError::Closed); }
+			self.children.0.driver_done.store(false, Ordering::Release);
+		}
 		jobs
 			.send(Request::Run(job))
 			.map_err(|_| SessionError::Closed)?;
@@ -487,7 +571,9 @@ impl Session {
 			Some(r)
 		} else {
 			guard.raise(CancelLevel::TERM);
-			if let Ok(r) = tokio::time::timeout(TERM_GRACE, &mut reply).await {
+			if self.children.termination_started() {
+				Some(reply.await)
+			} else if let Ok(r) = tokio::time::timeout(TERM_GRACE, &mut reply).await {
 				Some(r)
 			} else {
 				guard.raise(CancelLevel::KILL);
@@ -655,18 +741,17 @@ impl Driver {
 		let status = loop {
 			let wanted = cancel.get();
 			if wanted > applied {
-				if applied == 0 {
-					// Before the first cancel signal: a process reached by it
-					// may leave its group in its handler, and only a pin taken
-					// while it is still there reaches it afterwards.
-					self.children.pin_reachable();
-				}
 				applied = wanted;
 				let sig = if wanted >= CancelLevel::KILL {
 					Signal::Kill
 				} else {
 					Signal::Term
 				};
+				self
+					.children
+					.0
+					.engine_cancelling
+					.store(true, Ordering::Release);
 				self.shell.control().cancel(sig);
 			}
 			self.poll_tools();
@@ -694,11 +779,9 @@ impl Driver {
 		}
 		let exited = self.shell.ended_by_exit(run);
 		self.settle().await;
+		self.children.0.driver_done.store(true, Ordering::Release);
 		if applied > 0 {
-			// The engine's cancel reached the tree it still held. This reaches
-			// what that tree left behind: a process that left its group, and
-			// a child forked by one whose parent is already reaped.
-			self.children.terminate_run().await;
+			self.children.wait_termination().await;
 		}
 		self.children.set_active(false);
 		self.host.streams().clear();
