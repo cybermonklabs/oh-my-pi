@@ -22,6 +22,7 @@ import {
 	createSessionSqlClient,
 	openSessionSqlClient,
 	openSessionSqlStorage,
+	parseSessionSqlDsn,
 	resolveSessionStorage,
 	SESSION_SQL_POOL_MODE_PARAM,
 	type SessionSqlConnection,
@@ -172,6 +173,29 @@ describe("resolveSessionStorage", () => {
 		} finally {
 			await transaction.end();
 			await session.end();
+		}
+	});
+
+	for (const mode of ["transaction=bogus", "session=bogus", "Transaction", "SESSION"]) {
+		it(`refuses the non-exact pool_mode ${JSON.stringify(mode)} without disclosing credentials`, () => {
+			const dsn = `postgres://user:secret@db/sessions?pool_mode=${mode}`;
+			expect(() => parseSessionSqlDsn(dsn)).toThrow('expected "transaction" or "session"');
+			try {
+				parseSessionSqlDsn(dsn);
+			} catch (error) {
+				expect(String(error)).not.toContain("secret");
+				expect(String(error)).not.toContain("postgres://");
+			}
+		});
+	}
+
+	it("redacts a malformed pool_mode value containing the DSN password and an equals sign", () => {
+		try {
+			parseSessionSqlDsn("postgres://user:transaction%3Dbogus@db/sessions?pool_mode=transaction=bogus");
+			throw new Error("expected an invalid pool_mode refusal");
+		} catch (error) {
+			expect(String(error)).toContain('pool_mode of "<redacted>"');
+			expect(String(error)).not.toContain("transaction=bogus");
 		}
 	});
 

@@ -56,10 +56,10 @@ export interface AgentTranscriptStat {
 /** Transcript reads and session parsing supplied by the host. */
 export interface AgentTranscriptSource {
 	/**
-	 * Size and modification time of the transcript at `path`; throws when there
-	 * is none. Every poll calls it, so it must be cheap.
+	 * Size and modification time after refreshing the transcript's metadata;
+	 * rejects when there is none. Every poll calls it; hosts can coalesce refreshes.
 	 */
-	stat(path: string): AgentTranscriptStat;
+	stat(path: string): Promise<AgentTranscriptStat>;
 	/**
 	 * The UTF-8 text of the transcript at `path` from byte `offset` (a character
 	 * boundary) to its end; rejects when there is none.
@@ -210,8 +210,8 @@ export class AgentTranscriptViewer implements Component {
 			this.#editor.onSubmit = text => this.#submit(text);
 		}
 		// The first read starts now; polls re-stat the transcript for growth.
-		this.#refresh();
-		this.#pollTimer = setInterval(() => this.#refresh(), POLL_MS);
+		void this.#refresh();
+		this.#pollTimer = setInterval(() => void this.#refresh(), POLL_MS);
 		this.#pollTimer.unref?.();
 	}
 
@@ -240,7 +240,7 @@ export class AgentTranscriptViewer implements Component {
 	// ========================================================================
 
 	/** Refresh the transcript from local storage or the remote host. */
-	#refresh(): void {
+	async #refresh(): Promise<void> {
 		if (this.#disposed) return;
 		if (this.#deps.remote) {
 			this.#fetchRemote();
@@ -253,12 +253,16 @@ export class AgentTranscriptViewer implements Component {
 			return;
 		}
 		let stat: AgentTranscriptStat;
+		this.#localReadInFlight = true;
 		try {
-			stat = this.#deps.transcript.stat(sessionFile);
+			stat = await this.#deps.transcript.stat(sessionFile);
 		} catch {
-			this.#clearLocal("missing");
+			if (!this.#disposed) this.#clearLocal("missing");
 			return;
+		} finally {
+			this.#localReadInFlight = false;
 		}
+		if (this.#disposed) return;
 		const state = this.#localState;
 		if (!state || state.path !== sessionFile || stat.size < state.offset) {
 			// A new transcript, or one cut below what is rendered: rebuild.

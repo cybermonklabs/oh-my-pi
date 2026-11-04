@@ -1,8 +1,8 @@
 /**
  * `SqlSessionStorage` records each completed schema check in `<table>_meta`,
- * so a start against a checked table reads no row of the session table; with
- * `createTable: false` it still refuses a row that breaks a check, through an
- * indexed probe. These run against SQLite always, and against PostgreSQL and
+ * then checks for newly invalid rows through indexed probes, independent of
+ * planner statistics. With `createTable: false` it still refuses such rows.
+ * These run against SQLite always, and against PostgreSQL and
  * MySQL when `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a
  * throwaway database; every test makes its own tables and drops them.
  */
@@ -84,28 +84,85 @@ class Db implements AsyncDisposable {
 
 for (const { adapter, url } of BACKENDS) {
 	describe.skipIf(!url)(`SqlSessionStorage schema checks (${adapter})`, () => {
-		it("a start against a table whose checks are recorded reads only the two indexed probes of the session table", async () => {
+		it("start-up probes never scan the session table, even without planner statistics", async () => {
 			await using db = new Db(adapter, url ?? "");
-			const first = await db.open();
-			await first.writeText(`${ROOT}/-p/s.jsonl`, "body\n");
-			await first.drain();
+			await db.open();
+			if (adapter === "postgres") {
+				await db.sql(`ALTER TABLE ${db.table} SET (autovacuum_enabled = false)`);
+				await db.sql(`ALTER TABLE ${db.table}_parts SET (autovacuum_enabled = false)`);
+			}
+			const select = "'sessions/p/' || n || '.jsonl'";
+			const numbers = adapter === "postgres" ? "generate_series(1, 150000) AS numbers(n)" : "numbers";
+			// No ANALYZE: PostgreSQL must not depend on statistics to avoid a full scan.
+			if (adapter === "mysql") {
+				const digits =
+					"(SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9)";
+				await db.sql(
+					`INSERT INTO ${db.table} (path, content, mtime_ms, byte_len) SELECT CONCAT('sessions/p/', a.n + 10*b.n + 100*c.n + 1000*d.n + 10000*e.n + 100000*f.n, '.jsonl'), 'x', 1, 1 FROM ${digits} a CROSS JOIN ${digits} b CROSS JOIN ${digits} c CROSS JOIN ${digits} d CROSS JOIN ${digits} e CROSS JOIN ${digits} f WHERE f.n < 2 AND a.n + 10*b.n + 100*c.n + 1000*d.n + 10000*e.n + 100000*f.n < 150000`,
+				);
+			} else {
+				const cte =
+					adapter === "sqlite"
+						? "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM numbers WHERE n < 150000) "
+						: "";
+				await db.sql(
+					`${cte}INSERT INTO ${db.table} (path, content, mtime_ms, byte_len) SELECT ${select}, 'x', 1, 1 FROM ${numbers}`,
+				);
+			}
+			const count = await db.client.unsafe(`SELECT count(*) AS n FROM ${db.table}`);
+			expect(Number(count[0].n)).toBe(150000);
+			await db.sql(
+				`INSERT INTO ${db.table}_parts (path, start_offset, content) SELECT path, 0, 'x' FROM ${db.table}`,
+			);
+			const partsCount = await db.client.unsafe(`SELECT count(*) AS n FROM ${db.table}_parts`);
+			expect(Number(partsCount[0].n)).toBe(150000);
+			if (adapter === "postgres") {
+				const stats = await db.client.unsafe(`SELECT reltuples FROM pg_class WHERE oid = '${db.table}'::regclass`);
+				expect(Number(stats[0].reltuples)).toBe(-1);
+				const partsStats = await db.client.unsafe(
+					`SELECT reltuples FROM pg_class WHERE oid = '${db.table}_parts'::regclass`,
+				);
+				expect(Number(partsStats[0].reltuples)).toBe(-1);
+			}
 
 			const statements: string[] = [];
 			await db.open({ client: db.recording(statements) });
-
-			// `<table>_meta` and `<table>_parts` are other tables: the name ends at a word boundary here.
-			const readsSessionTable = new RegExp(`\\b(?:FROM|UPDATE|INTO|JOIN)\\s+${db.table}\\b`, "i");
-			const reads = statements.filter(sql => readsSessionTable.test(sql));
-			// One probe for a row with no byte_len, one for a legacy key; each stops at the first row.
-			expect(
-				reads.map(sql => [sql.startsWith(`SELECT path FROM ${db.table} WHERE `), sql.endsWith(" LIMIT 1")]),
-			).toEqual([
-				[true, true],
-				[true, true],
-			]);
-			expect(reads.some(sql => sql.includes("byte_len IS NULL"))).toBe(true);
-			expect(statements.some(sql => sql.includes(`${db.table}_meta`))).toBe(true);
-		});
+			const probes = statements.filter(sql =>
+				new RegExp(`^SELECT path FROM ${db.table}(?:_parts)? WHERE `).test(sql),
+			);
+			expect(probes).toHaveLength(3);
+			for (const probe of probes) {
+				const explain =
+					adapter === "postgres"
+						? "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+						: adapter === "sqlite"
+							? "EXPLAIN QUERY PLAN "
+							: "EXPLAIN ";
+				const plan = await db.client.unsafe(explain + probe);
+				expect(plan.length).toBeGreaterThan(0);
+				if (adapter === "postgres") {
+					const text = JSON.stringify(plan);
+					expect(text).toContain('"Node Type":');
+					expect(text).not.toMatch(/"Node Type":"Seq Scan"/);
+					// A full key-index walk can avoid Seq Scan but still discard every canonical key.
+					expect(text).not.toMatch(/"Rows Removed by (?:Filter|Index Recheck)":[1-9]/);
+				} else if (adapter === "sqlite") {
+					for (const row of plan) {
+						expect(typeof row.detail).toBe("string");
+						const detail = String(row.detail);
+						// SQLite calls walking an empty partial index SCAN too; it reads no table rows.
+						if (new RegExp(`\\bSCAN ${db.table}(?:_parts)?\\b`).test(detail)) {
+							expect(detail).toContain(`USING INDEX ${db.table}_nolen`);
+						}
+					}
+				} else {
+					for (const row of plan) {
+						expect(typeof row.type).toBe("string");
+						expect(row.type).not.toBe("ALL");
+					}
+				}
+			}
+		}, 120_000);
 
 		for (const createTable of [true, false]) {
 			it(`createTable: ${createTable} refuses a row an older omp wrote with no byte_len after the check was recorded`, async () => {
@@ -130,6 +187,15 @@ for (const { adapter, url } of BACKENDS) {
 				await expect(db.open({ createTable })).rejects.toThrow(
 					'holds the row key "/home/old/.omp/agent/sessions/-p/legacy.jsonl"',
 				);
+			});
+
+			it(`createTable: ${createTable} refuses a legacy key stored only in parts after the check was recorded`, async () => {
+				await using db = new Db(adapter, url ?? "");
+				await db.open();
+				const key = "/home/old/.omp/agent/sessions/-p/parts-only.jsonl";
+				await db.sql(`INSERT INTO ${db.table}_parts (path, start_offset, content) VALUES (?, 0, 'orphan')`, [key]);
+				expect((await db.client.unsafe(`SELECT path FROM ${db.table}`)).length).toBe(0);
+				await expect(db.open({ createTable })).rejects.toThrow(`holds the row key ${JSON.stringify(key)}`);
 			});
 		}
 

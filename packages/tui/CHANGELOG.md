@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `AgentTranscriptSource.stat()` now returns `Promise<AgentTranscriptStat>`; viewers await it before reading or declaring a transcript missing, so hosts can refresh metadata from shared storage. ([#18023](https://github.com/can1357/oh-my-pi/pull/18023) by [@sjawhar](https://github.com/sjawhar))
+
 ### Added
 
 - `StatusLineComponent.setSessionPinned()` / `setPinnedSessionIds()` / `isSessionPinned()` track pinned sessions; `session_name` prefixes the theme's pin icon for a pinned session ([#17848](https://github.com/can1357/oh-my-pi/pull/17848) by [@SuperUserA](https://github.com/SuperUserA))

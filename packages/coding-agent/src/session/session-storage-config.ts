@@ -78,13 +78,14 @@ export function parseSessionSqlDsn(dsn: string): { url: string; prepare: boolean
 	let poolMode: string | undefined;
 	const kept: string[] = [];
 	for (const pair of dsn.slice(query + 1).split("&")) {
-		const [name = "", value = ""] = pair.split("=", 2);
+		const separator = pair.indexOf("=");
+		const name = separator < 0 ? pair : pair.slice(0, separator);
+		const value = separator < 0 ? "" : pair.slice(separator + 1);
 		if (name === SESSION_SQL_POOL_MODE_PARAM) poolMode = decodeURIComponent(value);
 		else kept.push(pair);
 	}
 	const url = kept.length > 0 ? `${dsn.slice(0, query)}?${kept.join("&")}` : dsn.slice(0, query);
-	const mode = poolMode?.toLowerCase();
-	if (poolMode !== undefined && mode !== "transaction" && mode !== "session") {
+	if (poolMode !== undefined && poolMode !== "transaction" && poolMode !== "session") {
 		// The value can be any text of the file, a password too. Quoting it first
 		// would escape a quote or a backslash in it past the redactor.
 		const shown = connectionStringRedactor(dsn, url)(poolMode);
@@ -92,7 +93,7 @@ export function parseSessionSqlDsn(dsn: string): { url: string; prepare: boolean
 			`a ${SESSION_SQL_POOL_MODE_PARAM} of ${JSON.stringify(shown)}; expected "transaction" or "session"`,
 		);
 	}
-	return { url, prepare: mode !== "transaction" };
+	return { url, prepare: poolMode !== "transaction" };
 }
 
 /**

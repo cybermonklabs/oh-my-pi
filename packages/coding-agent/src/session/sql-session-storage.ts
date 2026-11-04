@@ -237,8 +237,8 @@ interface DialectQueries {
 	backfillByteLen: string;
 	/** Record {@link BYTE_LEN_CHECK}, in the same statement that finds no row lacking `byte_len`. */
 	recordByteLen: string;
-	/** One row key written before root-relative keys (neither `sessions/…` nor `abs:…`); key ranges, read without locking. */
-	findLegacyKey: string;
+	/** One legacy key per table, including parts with no session row; indexed and read without locking. */
+	findLegacyKeys: ReadonlyArray<{ table: string; sql: string }>;
 	/** Record {@link ROW_KEY_CHECK}, in the same statement that finds no such key. */
 	recordRowKeys: string;
 	/** Column names of the table named `@table`; none when it does not exist. */
@@ -529,12 +529,14 @@ function stepLastCharacter(prefix: string, step: 1 | -1): string {
 }
 
 /**
- * The exclusive upper bound of the keys that start with `prefix`: `prefix`
- * with its last character replaced by the next one. UTF-8 orders bytes as
- * code points, so the bound is right in byte order for any last character.
+ * The exclusive upper bound of a row-key prefix in UTF-8 byte order. Carry
+ * past trailing U+10FFFF characters; every row key starts with an ASCII tag,
+ * so even a path component made only of U+10FFFF has a finite upper bound.
  */
 function keyUpperBound(prefix: string): string {
-	return stepLastCharacter(prefix, 1);
+	let end = prefix.length;
+	while (end >= 2 && prefix.codePointAt(end - 2) === 0x10ffff) end -= 2;
+	return stepLastCharacter(end === prefix.length ? prefix : prefix.slice(0, end), 1);
 }
 
 /**
@@ -682,8 +684,7 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			ddl: `${createIndex} ${table}_nolen ON ${table} (path) WHERE ${unmeasured}`,
 		});
 	}
-	// A legacy key is any key outside the `abs:` and `sessions/` prefixes: three
-	// ranges of the key order, so the probe seeks the key index instead of scanning.
+	// A legacy key lies in one of three ranges outside `abs:` and `sessions/`.
 	const absEnd = keyUpperBound(ABSOLUTE_KEY_PREFIX);
 	const rootEnd = keyUpperBound(ROOT_KEY_PREFIX);
 	const legacyKey = [
@@ -695,6 +696,22 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			? `(path > ${quote(padSpaceFloor(rootEnd))} AND ${pathBytes} >= ${quote(rootEnd)})`
 			: `${pathComparison} >= ${quote(rootEnd)}`,
 	].join(" OR ");
+	if (adapter === "postgres") {
+		// Canonical keys occupy neither partial index.
+		indexes.push(
+			{
+				name: `${table}_old`,
+				ddl: `${createIndex} ${table}_old ON ${table} (path COLLATE "C") WHERE ${legacyKey}`,
+			},
+			{
+				name: `${table}_oldp`,
+				ddl: `${createIndex} ${table}_oldp ON ${parts} (path COLLATE "C") WHERE ${legacyKey}`,
+			},
+		);
+	}
+	// LIMIT alone can favour a sequential scan's zero start-up cost without
+	// statistics. Ordering makes the empty partial index beat a scan and sort.
+	const legacyOrder = adapter === "postgres" ? ` ORDER BY ${pathComparison}` : "";
 	// Record a check only in the statement that proves it, and never lower a newer version's record.
 	const recordCheck = (check: SchemaCheck, guard: string): string =>
 		mysql
@@ -774,8 +791,14 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 		findUnmeasured: `SELECT path FROM ${table} WHERE ${unmeasured} LIMIT 1`,
 		backfillByteLen: `UPDATE ${table} SET byte_len = ${contentByteLength} WHERE ${unmeasured}`,
 		recordByteLen: recordCheck(BYTE_LEN_CHECK, `NOT EXISTS (SELECT 1 FROM ${table} WHERE ${unmeasured})`),
-		findLegacyKey: `SELECT path FROM ${table} WHERE ${legacyKey} LIMIT 1`,
-		recordRowKeys: recordCheck(ROW_KEY_CHECK, `NOT EXISTS (SELECT 1 FROM ${table} WHERE ${legacyKey})`),
+		findLegacyKeys: [
+			{ table, sql: `SELECT path FROM ${table} WHERE ${legacyKey}${legacyOrder} LIMIT 1` },
+			{ table: parts, sql: `SELECT path FROM ${parts} WHERE ${legacyKey}${legacyOrder} LIMIT 1` },
+		],
+		recordRowKeys: recordCheck(
+			ROW_KEY_CHECK,
+			`NOT EXISTS (SELECT 1 FROM ${table} WHERE ${legacyKey}) AND NOT EXISTS (SELECT 1 FROM ${parts} WHERE ${legacyKey})`,
+		),
 		columns: sql(
 			{
 				postgres:
@@ -1122,7 +1145,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * Create or migrate the tables, then run and record each schema check
 	 * `<table>_meta` does not record yet: the `byte_len` backfill and the key
 	 * validation run once per table. Every start still looks for one row that
-	 * breaks a check, through an index (`<table>_nolen`, three key ranges),
+	 * breaks a check, through the null-length and legacy-key indexes,
 	 * and refuses on one; it reads no other row of the session table.
 	 */
 	async #applySchema(): Promise<void> {
@@ -1175,13 +1198,15 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * them, and its own writes would start a second row for the same session.
 	 */
 	async #refuseLegacyKey(): Promise<void> {
-		const [legacy] = (await this.#client.unsafe(this.#q.findLegacyKey)) as Array<{ path: string }>;
-		if (!legacy) return;
-		throw new Error(
-			`SqlSessionStorage: ${this.#table} holds the row key ${this.#quote(legacy.path)}, which is neither ` +
-				`"${ROOT_KEY_PREFIX}…" nor "${ABSOLUTE_KEY_PREFIX}…". Stop every older Oh My Pi process that writes ` +
-				`the table, then migrate its keys with ${KEY_MIGRATION_COMMAND}.`,
-		);
+		for (const { table, sql } of this.#q.findLegacyKeys) {
+			const [legacy] = (await this.#client.unsafe(sql)) as Array<{ path: string }>;
+			if (!legacy) continue;
+			throw new Error(
+				`SqlSessionStorage: ${table} holds the row key ${this.#quote(legacy.path)}, which is neither ` +
+					`"${ROOT_KEY_PREFIX}…" nor "${ABSOLUTE_KEY_PREFIX}…". Stop every older Oh My Pi process that writes ` +
+					`the table, then migrate its keys with ${KEY_MIGRATION_COMMAND}.`,
+			);
+		}
 	}
 
 	/**

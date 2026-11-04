@@ -172,12 +172,15 @@ function gutter(line: string): number {
 	return stripped.length - stripped.trimStart().length;
 }
 
+let statReads: { mock: { results: { value: unknown }[] } } | undefined;
+
 /**
- * Await every transcript read `reads` (a spy on `agentTranscriptSource.readFrom`)
- * has started, including reads a landed read chains (a rewrite's rebuild). A
- * read's own continuation registered first, so it has run when the await resumes.
+ * Await the metadata refreshes and transcript reads started by the viewer,
+ * including a rewrite's chained rebuild. Their continuations register before
+ * these awaits, so rendered state has been applied when this returns.
  */
 async function settleReads(reads: { mock: { results: { value: unknown }[] } }): Promise<void> {
+	for (const result of statReads?.mock.results ?? []) await Promise.resolve(result.value).catch(() => {});
 	for (let index = 0; index < reads.mock.results.length; index++) {
 		await Promise.resolve(reads.mock.results[index]!.value).catch(() => {});
 	}
@@ -260,6 +263,7 @@ describe("AgentTranscriptViewer", () => {
 
 	beforeEach(() => {
 		vi.useFakeTimers();
+		statReads = vi.spyOn(agentTranscriptSource, "stat");
 		rowsDesc = Object.getOwnPropertyDescriptor(process.stdout, "rows");
 		Object.defineProperty(process.stdout, "rows", { configurable: true, get: () => 24, set: () => {} });
 	});
@@ -267,6 +271,7 @@ describe("AgentTranscriptViewer", () => {
 	afterEach(() => {
 		// A leaked transcript-source spy would feed the next test's reads stale stubs.
 		vi.restoreAllMocks();
+		statReads = undefined;
 		vi.useRealTimers();
 		if (rowsDesc) {
 			Object.defineProperty(process.stdout, "rows", rowsDesc);
@@ -438,6 +443,7 @@ describe("AgentTranscriptViewer", () => {
 			removeSyncWithRetries(file);
 			// Drive the viewer's own 250ms polling interval without paying wall-clock time.
 			vi.advanceTimersByTime(250);
+			await settleReads(reads);
 			expect(body()).not.toContain("PROMPTMARKER");
 		} finally {
 			viewer.dispose();
@@ -542,8 +548,10 @@ describe("AgentTranscriptViewer", () => {
 			reads.mockClear();
 			fs.writeFileSync(file, `${buildJsonl()}${messageLine("same", "NEWMARKER")}\n`);
 			fs.utimesSync(file, original.atime, original.mtime);
-			vi.advanceTimersByTime(250 * 5);
-			await settleReads(reads);
+			for (let poll = 0; poll < 5; poll++) {
+				vi.advanceTimersByTime(250);
+				await settleReads(reads);
+			}
 			// The changed bytes before the rendered end force exactly one rebuild from the start.
 			expect(reads.mock.calls.filter(([, offset]) => offset === 0)).toHaveLength(1);
 			expect(body()).toContain("NEWMARKER");
@@ -747,7 +755,7 @@ describe("AgentTranscriptViewer", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
 		const file = path.join(dir, "__advisor.jsonl");
 		fs.writeFileSync(file, buildJsonl());
-		const realStat = agentTranscriptSource.stat(file);
+		const realStat = await agentTranscriptSource.stat(file);
 		const reads = vi.spyOn(agentTranscriptSource, "readFrom");
 		const viewer = makeViewer(file);
 		try {
@@ -755,7 +763,7 @@ describe("AgentTranscriptViewer", () => {
 			// The stat reports growth, but the read fails as if the transcript was
 			// removed between the two. The poll must not throw, the rendered rows
 			// must stay, and the next poll must read again.
-			vi.spyOn(agentTranscriptSource, "stat").mockReturnValue({
+			vi.spyOn(agentTranscriptSource, "stat").mockResolvedValue({
 				size: realStat.size + 200,
 				mtimeMs: realStat.mtimeMs + 10,
 			});
@@ -772,8 +780,8 @@ describe("AgentTranscriptViewer", () => {
 					.join("\n"),
 			).toContain("Reviewing step 39.");
 			vi.advanceTimersByTime(250);
-			expect(reads).toHaveBeenCalledTimes(2);
 			await settleReads(reads);
+			expect(reads).toHaveBeenCalledTimes(2);
 		} finally {
 			viewer.dispose();
 			fs.rmSync(dir, { recursive: true, force: true });

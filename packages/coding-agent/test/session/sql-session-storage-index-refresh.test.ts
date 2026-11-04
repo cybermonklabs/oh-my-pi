@@ -9,6 +9,8 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { AgentActivityIndex } from "../../src/activity";
+import { createAgentHubRuntime } from "@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ensurePersistedRoster } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { SESSION_INDEX_REFRESH_COALESCE_MS } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
@@ -177,6 +179,63 @@ for (const { adapter, url } of BACKENDS) {
 			await db.open(recordingClient(db.client, reads));
 
 			expect(reads).toEqual([]);
+		});
+
+		it("refreshes a prefix ending in maximum Unicode code points without including its neighbours", async () => {
+			using tempDir = TempDir.createSync("@omp-index-refresh-");
+			await using db = new Db(adapter, url ?? "", tempDir.join("sessions"));
+			const writer = await db.open();
+			for (const suffix of ["bucket/\u{10FFFF}", "\u{10FFFF}\u{10FFFF}"]) {
+				const prefix = path.join(db.root, suffix);
+				const file = path.join(prefix, "s.jsonl");
+				const beside = path.join(`${prefix.slice(0, -2)}\u{10FFFE}`, "s.jsonl");
+				await writer.writeText(file, "included\n");
+				await writer.writeText(beside, "excluded\n");
+				await writer.drain();
+				const reader = await db.open();
+				await reader.refresh({ kind: "prefix", prefix });
+				expect(reader.existsSync(file)).toBe(true);
+				expect(reader.existsSync(beside)).toBe(false);
+				expect(await reader.readText(file)).toBe("included\n");
+			}
+		});
+
+		it("the activity feed sees a peer's appended messages without an explicit refresh", async () => {
+			using tempDir = TempDir.createSync("@omp-index-refresh-");
+			await using db = new Db(adapter, url ?? "", tempDir.join("sessions"));
+			const clock = fakeClock();
+			const file = path.join(db.root, "-proj", "main", "Worker.jsonl");
+			const line = (id: string, text: string) =>
+				`${JSON.stringify({ type: "message", id, timestamp: 1, message: { role: "assistant", content: text, timestamp: 1 } })}\n`;
+			const writer = await db.open();
+			await writer.writeText(file, line("first", "First peer result"));
+			await writer.drain();
+			const reader = await db.open();
+			await reader.exists(file);
+			const activity = new AgentActivityIndex({ storage: reader });
+			await activity.sync("Worker", file);
+			expect(activity.query().map(row => row.summary)).toEqual(["First peer result"]);
+			const append = writer.openWriter(file, { flags: "a" });
+			await append.append(line("second", "Second peer result"));
+			await append.close();
+			await writer.drain();
+			clock.advance(SESSION_INDEX_REFRESH_COALESCE_MS + 1);
+			await activity.sync("Worker", file);
+			expect(activity.query().map(row => row.summary)).toEqual(["First peer result", "Second peer result"]);
+		});
+
+		it("the Agent Hub transcript source stats newly peer-written transcripts before its first read", async () => {
+			using tempDir = TempDir.createSync("@omp-index-refresh-");
+			await using db = new Db(adapter, url ?? "", tempDir.join("sessions"));
+			const reader = await db.open();
+			const source = createAgentHubRuntime({ registry: new AgentRegistry(), storage: reader }).transcript;
+			const file = path.join(db.root, "-proj", "main", "Worker.jsonl");
+			const content = transcript("Worker", tempDir.path(), "peer transcript");
+			const writer = await db.open();
+			await writer.writeText(file, content);
+			await writer.drain();
+			expect((await source.stat(file)).size).toBe(Buffer.byteLength(content));
+			expect(await source.readFrom(file, 0)).toBe(content);
 		});
 
 		it("shows a session another store creates, retitles and deletes, without a restart", async () => {

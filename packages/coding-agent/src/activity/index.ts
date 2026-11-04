@@ -343,6 +343,7 @@ export class AgentActivityIndex {
 		const storage = this.#storage ?? defaultSessionStorage();
 		let stat: SessionStorageStat;
 		try {
+			await storage.refresh?.({ kind: "session", file: sessionFile });
 			stat = storage.statSync(sessionFile);
 		} catch {
 			return;
