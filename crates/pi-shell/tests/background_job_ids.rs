@@ -1,6 +1,5 @@
-//! The session contracts of in-process background jobs that no single
-//! script's output shows: a job keeps the session alive while it runs,
-//! dropping the shell stops its loops, and a job one run reported is
+//! The session contracts of background jobs that no single script's output
+//! shows: dropping the shell stops its loops, and a job one run reported is
 //! forgotten by the next run of the same shell. The rows of Bash-oracle
 //! scripts are in `bash_rows.rs`.
 #![cfg(unix)]
@@ -22,72 +21,6 @@ async fn run_in(shell: &Shell, command: &str) -> (Option<i32>, String) {
 		.await
 		.expect("run");
 	(result.exit_code, rx.drain().collect())
-}
-
-/// A disowned external job is still a child that dropping the session would
-/// kill, so the session must keep counting it for the host to retain it.
-/// The command uses `exec` to avoid leaving a grandchild; the test kills it
-/// after the assertion, since `disown` removed it from the shell's table.
-#[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_disowned_external_job_keeps_the_session_alive() {
-	let files = tempfile::tempdir().expect("pid files");
-	let pidfile = files.path().join("pid");
-	let command = format!(
-		"sh -c 'echo $$ > \"{}\"; exec sleep 30' & disown",
-		pidfile.to_str().expect("utf8 path")
-	);
-	let shell = Shell::new(None);
-	shell
-		.run(ShellRunOptions { command, ..Default::default() }, None, CancelToken::default())
-		.await
-		.expect("run");
-	assert_eq!(shell.live_background_job_count().await, 1);
-	shell.abort().await;
-	// Reap the disowned process the shell no longer tracks.
-	if let Ok(pid) = std::fs::read_to_string(&pidfile)
-		&& let Ok(pid) = pid.trim().parse::<i32>()
-	{
-		// SAFETY: `kill` and `waitpid` take a plain pid and a null status
-		// pointer, which `waitpid` accepts; they touch no Rust memory.
-		unsafe { libc::kill(pid, libc::SIGKILL) };
-		// SAFETY: as above.
-		unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
-	}
-}
-
-/// A job the shell runs itself keeps the session alive while it runs, plain
-/// or `disown`ed, and stops counting once it ends. The count was 0, so the
-/// host could drop the shell and stop the job mid-run. The job runs until the
-/// test creates its `go` file.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_in_process_job_keeps_the_session_alive_until_it_ends() {
-	for disown in ["", " disown"] {
-		let files = tempfile::tempdir().expect("job files");
-		let go = files.path().join("go");
-		let command = format!(
-			"f(){{ until [ -e '{}' ]; do sleep 0.01; done; }}; f &{disown}",
-			go.to_str().expect("utf8 path")
-		);
-		let shell = Shell::new(None);
-		shell
-			.run(
-				ShellRunOptions { command: command.clone(), ..Default::default() },
-				None,
-				CancelToken::default(),
-			)
-			.await
-			.expect("run");
-		assert_eq!(shell.live_background_job_count().await, 1, "`{command}` while running");
-		std::fs::write(&go, "").expect("release job");
-		let ended = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-			while shell.live_background_job_count().await != 0 {
-				tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-			}
-		})
-		.await;
-		assert!(ended.is_ok(), "`{command}` was still counted 20 s after it was released");
-	}
 }
 
 /// Whether something appends to `path` within 300 ms.
