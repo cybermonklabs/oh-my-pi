@@ -25,7 +25,7 @@ use super::{
 	imported_function, is_ident, probe,
 	proc::{
 		Awaited, ExecState, Frame, FrameKind, PendingWrite, Probe, ProbeResult, ScriptKind, Stage,
-		Vproc,
+		Vproc, WaitChild,
 	},
 	startup_values,
 	state::{self, Overlay, Var},
@@ -274,7 +274,7 @@ fn launch(
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));
 	let s = st(vp);
-	s.wait_for = vec![vpid];
+	s.wait_for = vec![WaitChild::job(vpid)];
 	s.waiting = Some(Awaited::Jobs { force: true });
 	s.stage = Stage::Await;
 	Some(Flow::Block(WaitKey::Proc(vpid)))

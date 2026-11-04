@@ -734,6 +734,48 @@ fn features(
 	Ok(f)
 }
 
+/// Bash cleanup_dead_jobs, excluding a frozen lastpipe list. Foreground
+/// jobs do not contribute statuses to bgpids (delete_job's DEL_NOBGPID).
+pub fn cleanup_reported(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
+	if super::builtins::frozen_job(vp).is_some() {
+		return;
+	}
+	let before = vp.jobs.len();
+	let mut foreground = Vec::new();
+	for job in vp
+		.jobs
+		.iter()
+		.filter(|j| j.notified && matches!(j.state, JobState::Done(_)))
+	{
+		if !job.inherited {
+			k.proc_collect(cx.store, job.vpid);
+		}
+		if job.foreground {
+			foreground.push(job.pid());
+		}
+	}
+	vp.jobs
+		.remove_where(|j| j.notified && matches!(j.state, JobState::Done(_)));
+	for pid in foreground {
+		vp.jobs.forget_pid(pid);
+	}
+	k.native_dirty |= before != vp.jobs.len();
+}
+
+/// A completed foreground child makes older completed foreground jobs
+/// eligible for quiet cleanup; asynchronous statuses remain available.
+pub fn cleanup_foreground(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
+	if super::builtins::frozen_job(vp).is_some() {
+		return;
+	}
+	for job in &mut vp.jobs.list {
+		if job.foreground && matches!(job.state, JobState::Done(_)) {
+			job.notified = true;
+		}
+	}
+	cleanup_reported(k, vp, cx);
+}
+
 /// Parse and compile the next command of the top script frame; pop the
 /// frame at end of input. A script read from stdin first reads lines until
 /// the command is complete; `Some` is the wait key while fd 0 has none.
@@ -743,17 +785,7 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 	// not create extra cleanup points.
 	if matches!(vp.frames.last().map(|f| &f.kind), Some(FrameKind::Script { pos: (offset, _), .. }) if *offset != 0)
 	{
-		let before = vp.jobs.len();
-		for job in vp
-			.jobs
-			.iter()
-			.filter(|j| j.notified && matches!(j.state, JobState::Done(_)))
-		{
-			k.proc_collect(cx.store, job.vpid);
-		}
-		vp.jobs
-			.remove_where(|j| j.notified && matches!(j.state, JobState::Done(_)));
-		k.native_dirty |= before != vp.jobs.len();
+		cleanup_reported(k, vp, cx);
 	}
 	// zsh `parse_string`: a string (`eval`, a trap, `-c`) parses whole
 	// before it runs; its first command takes the snapshot the rest reuse.

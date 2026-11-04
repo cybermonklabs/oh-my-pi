@@ -55,7 +55,7 @@ pub use self::{
 };
 use super::{
 	Cx, Kernel,
-	proc::{Probe, ProbeResult, Vproc},
+	proc::{Probe, ProbeResult, Vproc, WaitChild},
 	state::{self, Level, Var},
 };
 use crate::bash::{
@@ -121,7 +121,7 @@ pub enum Control {
 /// What `wait` waits for.
 pub struct Wait {
 	/// The children, in order.
-	pub children: Vec<Vpid>,
+	pub children: Vec<WaitChild>,
 	/// `wait` without operands: the status stays 0 rather than the last
 	/// child's.
 	pub all:      bool,

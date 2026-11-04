@@ -8,7 +8,7 @@ use std::io::Write as _;
 
 use bstr::{BString, ByteSlice};
 
-use super::{Control, Ctx, Need, Outcome, R, Wait, dirstack, done, number, opts};
+use super::{Control, Ctx, Need, Outcome, R, Wait, WaitChild, dirstack, done, number, opts};
 use crate::bash::{
 	ControlHandle, Platform,
 	diag::Diag,
@@ -192,22 +192,7 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 /// Forget finished jobs whose state was reported (bash
 /// `cleanup_dead_jobs`).
 fn cleanup(ctx: &mut Ctx<'_, '_>) {
-	if frozen_job(ctx.vp).is_some() {
-		return;
-	}
-	let before = ctx.vp.jobs.len();
-	for job in ctx
-		.vp
-		.jobs
-		.iter()
-		.filter(|j| j.notified && matches!(j.state, JobState::Done(_)))
-	{
-		ctx.k.proc_collect(ctx.cx.store, job.vpid);
-	}
-	ctx.vp
-		.jobs
-		.remove_where(|j| j.notified && matches!(j.state, JobState::Done(_)));
-	ctx.k.native_dirty |= before != ctx.vp.jobs.len();
+	crate::bash::vm::exec::cleanup_reported(ctx.k, ctx.vp, ctx.cx);
 }
 
 /// `jobs [-lnprs] [jobspec …]`, `jobs -x command [args]`: list jobs as
@@ -480,7 +465,7 @@ fn foreground(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> R {
 		job.foreground = true;
 	}
 	let wait = Wait {
-		children: vec![vpid],
+		children: vec![WaitChild::job(vpid)],
 		all:      false,
 		any:      false,
 		into:     None,

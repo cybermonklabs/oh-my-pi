@@ -1,6 +1,6 @@
 //! Virtual processes, scripts, frames and per-op scratch.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, num::NonZeroU32, sync::Arc};
 
 use bstr::BString;
 use serde::{Deserialize, Serialize};
@@ -434,6 +434,14 @@ impl JobTable {
 			.rev()
 			.find(|&&(p, _)| p == pid)
 			.map(|&(_, s)| s)
+	}
+
+	/// Forget one saved pid status (bash `bgp_delete`), after a POSIX pid
+	/// wait or deletion of a foreground rather than asynchronous job.
+	pub fn forget_pid(&mut self, pid: u32) {
+		if let Some(saved) = self.saved.as_mut() {
+			saved.retain(|&(p, _)| p != pid);
+		}
 	}
 
 	fn state(&self, number: Option<u32>) -> Option<JobState> {
@@ -1324,6 +1332,27 @@ pub enum ProbeResult {
 	Paths(Vec<BString>),
 }
 
+/// One wait operand, preserving whether it was a pid or a job spec.
+/// POSIX pid waits consume the saved status; jobspec waits do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitChild {
+	pub vpid: Vpid,
+	pub pid:  Option<NonZeroU32>,
+	/// Original argv index, for a jobspec that vanished after an earlier
+	/// operand was waited for. Zero for a synthesized child.
+	pub arg:  usize,
+}
+
+impl WaitChild {
+	pub const fn job(vpid: Vpid) -> Self {
+		Self { vpid, pid: None, arg: 0 }
+	}
+
+	pub const fn operand(vpid: Vpid, pid: Option<NonZeroU32>, arg: usize) -> Self {
+		Self { vpid, pid, arg }
+	}
+}
+
 /// Serializable progress of an `Exec` (survives externalize/restore).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecState {
@@ -1361,7 +1390,7 @@ pub struct ExecState {
 	/// Status of the last command substitution (`$?` of `x=$(…)`).
 	pub sub_status:  Option<i32>,
 	/// Children `wait` waits for.
-	pub wait_for:    Vec<Vpid>,
+	pub wait_for:    Vec<WaitChild>,
 	/// `exec command`: how the command replaces the shell.
 	pub exec_as:     Option<Box<ExecAs>>,
 	/// `wait -p var`: the variable that gets the waited child's pid.

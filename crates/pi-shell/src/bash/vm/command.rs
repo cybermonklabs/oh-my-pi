@@ -3052,29 +3052,92 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 		},
 		Some(Awaited::Jobs { force }) => {
 			let mut last = st(vp).status;
+			let mut last_pid = false;
 			let mut waited = None;
-			while let Some(&v) = st(vp).wait_for.first() {
-				// `wait -p` names the child by the pid the user knows (its
-				// program's OS pid), read before the job is forgotten.
-				let shown = vp.shown_pid(v);
-				if let Some(s) =
-					k.proc_collect(cx.store, v)
-						.or_else(|| match vp.jobs.by_vpid(v).map(|j| j.state) {
-							Some(JobState::Done(s)) => Some(s),
-							_ => None,
-						}) {
+			let foreground = matches!(st(vp).target, Some(Target::Intrinsic(IntrinsicId::Fg)))
+				|| st(vp).argv.first().is_some_and(|a| a.starts_with(b"%"));
+			let posix = vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+					.unwrap_or(false);
+			while let Some(child) = st(vp).wait_for.first().copied() {
+				let mut v = child.vpid;
+				// An earlier POSIX pid operand may have deleted this job.
+				// Resolve a now-stale jobspec against the current table.
+				if child.pid.is_none() && child.arg != 0 && vp.jobs.by_vpid(v).is_none() {
+					let spec = st(vp).argv[child.arg].clone();
+					match vp.jobs.lookup(spec.strip_prefix(b"%").unwrap_or(&spec)) {
+						super::proc::JobLookup::Job(number) => {
+							v = vp.jobs.get(number).expect("looked up job").vpid;
+							st(vp).wait_for[0].vpid = v;
+						},
+						bad => {
+							let msg = if bad == super::proc::JobLookup::Ambiguous {
+								format!(
+									"{}: ambiguous job spec",
+									spec.strip_prefix(b"%").unwrap_or(&spec).as_bstr()
+								)
+							} else {
+								format!("{}: no such job", spec.as_bstr())
+							};
+							k.diag(cx, vp, line, Diag::Usage { msg: msg.into() }.by("wait"));
+							last = 127;
+							last_pid = false;
+							st(vp).wait_for.remove(0);
+							continue;
+						},
+					}
+				}
+				let shown = child.pid.map_or_else(|| vp.shown_pid(v), |p| p.get());
+				let job = vp.jobs.by_vpid(v).map(|j| j.state);
+				let own = matches!(cx.store.get(Key::Proc(v)), Ok(Some(Record::Proc { parent: Some(p), .. })) if *p == vp.vpid);
+				let saved = if job.is_none() {
+					child.pid.and_then(|p| vp.jobs.saved_status(p.get()))
+				} else {
+					None
+				};
+				let done = saved
+					.or_else(|| {
+						if job.is_some() || own {
+							k.proc_collect(cx.store, v)
+						} else {
+							None
+						}
+					})
+					.or_else(|| match job {
+						Some(JobState::Done(s)) => Some(s),
+						_ => None,
+					});
+				if let Some(s) = done {
 					last = s;
-					if matches!(st(vp).target, Some(Target::Intrinsic(IntrinsicId::Fg)))
-						|| st(vp).argv.first().is_some_and(|a| a.starts_with(b"%"))
-					{
+					if foreground {
 						vp.jobs.remove_where(|j| j.vpid == v);
+						vp.jobs.forget_pid(shown);
+					} else if posix && child.pid.is_some() {
+						// Bash wait_for_single_pid: mark the dead job reported,
+						// cleanup_dead_jobs, then bgp_delete of the operand pid.
+						if let Some(job) = vp.jobs.by_vpid_mut(v) {
+							job.notified = true;
+						}
+						exec::cleanup_reported(k, vp, cx);
+						vp.jobs.forget_pid(shown);
 					} else {
 						forget_job(vp, v);
 					}
 					exec::reap_coproc(k, vp, cx, v);
-				} else if let (false, Some(JobState::Stopped(sig))) =
-					(force, vp.jobs.by_vpid(v).map(|j| j.state))
-				{
+				} else if job.is_none() && !own {
+					if child.pid.is_some() {
+						k.diag(
+							cx,
+							vp,
+							line,
+							Diag::Usage {
+								msg: format!("pid {shown} is not a child of this shell").into(),
+							}
+							.by("wait"),
+						);
+					}
+					last = 127;
+				} else if let (false, Some(JobState::Stopped(sig))) = (force, job) {
 					// Bash wait_for still waits for its first process if it
 					// continued while another stage kept the job stopped.
 					if let Some(stages) = vp.jobs.by_vpid(v).and_then(|j| j.stages.as_deref())
@@ -3085,7 +3148,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					{
 						return Some(Flow::Block(WaitKey::Proc(first.vpid)));
 					}
-					// bash `wait_for` applies WSTOPSIG to the first process,
+					// Bash applies WSTOPSIG to the first pipeline process,
 					// including its exit-status byte when that stage exited.
 					last = vp
 						.jobs
@@ -3096,27 +3159,21 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					return Some(Flow::Block(WaitKey::Proc(v)));
 				}
 				waited = Some(shown);
+				last_pid = child.pid.is_some();
 				st(vp).wait_for.remove(0);
 			}
 			k.native_dirty = true;
 			if let Some(pid) = waited {
 				waited_into(k, vp, cx, line, pid);
 			}
-			// Bash `wait.def` treats a pid wait above 256 as a pid error;
-			// jobspec waits pass through execute_cmd.c's `builtin_status`.
-			if last > 256
-				&& st(vp)
-					.argv
-					.last()
-					.is_some_and(|a| a.first().is_some_and(u8::is_ascii_digit))
-			{
+			if last > 256 && last_pid {
 				127
 			} else {
 				builtin_status(last)
 			}
 		},
 		Some(Awaited::AllJobs) => {
-			while let Some(&v) = st(vp).wait_for.first() {
+			while let Some(v) = st(vp).wait_for.first().map(|child| child.vpid) {
 				if k.proc_collect(cx.store, v).is_some() {
 					exec::reap_coproc(k, vp, cx, v);
 					vp.jobs.remove_where(|j| j.vpid == v);
@@ -3160,14 +3217,14 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			st(vp).status
 		},
 		Some(Awaited::AnyJob) => {
-			let finished = st(vp).wait_for.iter().find_map(|v| {
-				k.proc_state(cx.store, *v)
+			let finished = st(vp).wait_for.iter().find_map(|child| {
+				k.proc_state(cx.store, child.vpid)
 					.and_then(super::ProcState::exited)
-					.map(|s| (*v, s))
+					.map(|s| (child.vpid, s))
 			});
 			let Some((v, status)) = finished else {
 				for i in 0..st(vp).wait_for.len() {
-					let v = st(vp).wait_for[i];
+					let v = st(vp).wait_for[i].vpid;
 					if !vp.jobs.by_vpid(v).is_some_and(|j| {
 						matches!(j.state, JobState::Stopped(_))
 							|| (j.notified && matches!(j.state, JobState::Done(_)))
@@ -3184,6 +3241,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			let shown = vp.shown_pid(v);
 			k.proc_collect(cx.store, v);
 			vp.jobs.remove_where(|j| j.vpid == v);
+			if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+				.unwrap_or(false)
+			{
+				vp.jobs.forget_pid(shown);
+			}
 			k.native_dirty = true;
 			st(vp).wait_for.clear();
 			exec::reap_coproc(k, vp, cx, v);
@@ -3263,6 +3325,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			k.stops.remove(&vp.vpid);
 			k.signaled.remove(&vp.vpid);
 		}
+		exec::cleanup_foreground(k, vp, cx);
 		super::owe_chld(k, cx, vp, false);
 	}
 	// Tested first: a function call's wait holds none, and the assignment
