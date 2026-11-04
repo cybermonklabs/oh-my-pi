@@ -1139,7 +1139,7 @@ fn wait_exit(pid: i32, tracker: &Tracker) -> ExitStatus {
 				_ => {
 					// Consume before waking the shell: otherwise a CONT and a
 					// second STOP can replace the event before we consume it.
-					if !tracker.observe_stopped(|| stop_event(pid, false)) {
+					if !tracker.observe_stopped(|| take_stop_event(pid)) {
 						thread::sleep(std::time::Duration::from_millis(10));
 					}
 					continue;
@@ -1154,13 +1154,13 @@ fn wait_exit(pid: i32, tracker: &Tracker) -> ExitStatus {
 	}
 }
 
-/// Peek at or consume one stop/continuation, never an exit. The peek lets
-/// a job-table read observe a stop before the waiter thread is scheduled.
-fn stop_event(pid: i32, peek: bool) -> Option<Option<Signal>> {
+/// Consume one stop/continuation, never an exit. Both observers consume
+/// under the tracker's lock, so a stop already reported to `fg` cannot
+/// be replayed by the waiter after `fg` has continued the process.
+fn take_stop_event(pid: i32) -> Option<Option<Signal>> {
 	// SAFETY: siginfo_t is plain data; waitid writes to it below.
 	let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-	let flags =
-		libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG | if peek { libc::WNOWAIT } else { 0 };
+	let flags = libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG;
 	// SAFETY: info is writable; without WEXITED this cannot reap a child.
 	let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &raw mut info, flags) };
 	// SAFETY: info is zeroed or filled by waitid.
@@ -1317,7 +1317,8 @@ impl ExtProc for UnixProc {
 		// WSTOPPED/WCONTINUED events as well.
 		#[cfg(target_os = "linux")]
 		self.unpark();
-		stop_event(self.pid, true).unwrap_or_else(|| self.tracker.poll_stopped(cx))
+		self.tracker.observe_stopped(|| take_stop_event(self.pid));
+		self.tracker.poll_stopped(cx)
 	}
 
 	fn exit_status(&self) -> Option<ExitStatus> {
