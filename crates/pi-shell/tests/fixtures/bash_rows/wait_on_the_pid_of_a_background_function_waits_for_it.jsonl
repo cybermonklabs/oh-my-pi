@@ -1,0 +1,1 @@
+{"id": "wait_on_the_pid_of_a_background_function_waits_for_it/1", "script": "f(){ sleep 0.2; echo CHILD; }; f & p=$!; case $p in ''|*[!0-9]*) echo P=no;; *) echo P=yes;; esac; wait \"$p\"; echo \"AFTER=$?\"", "exit": 0, "output": "P=yes\nCHILD\nAFTER=0\n"}

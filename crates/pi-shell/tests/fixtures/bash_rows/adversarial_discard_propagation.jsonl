@@ -1,0 +1,16 @@
+{"id": "adversarial_discard_propagation/1", "script": "{ set -o posix; readonly x=old; true && x=new /bin/true; echo same-line; } 2>/dev/null", "exit": 1, "output": ""}
+{"id": "adversarial_discard_propagation/2", "script": "{ set -o posix; readonly x=old; for ((i=0;i<3;i++)); do x=new /bin/true; echo i=$i; done; echo after-for; } 2>/dev/null", "exit": 1, "output": ""}
+{"id": "adversarial_discard_propagation/3", "script": "{ set -o posix; readonly x=old; n=0; until [ $n -ge 2 ]; do n=$((n+1)); x=new /bin/true; echo n=$n; done; echo after-until; } 2>/dev/null", "exit": 1, "output": ""}
+{"id": "adversarial_discard_propagation/4", "script": "{ set -o posix; readonly x=old; false || x=new /bin/true; echo same-line; } 2>/dev/null", "exit": 1, "output": ""}
+{"id": "adversarial_discard_propagation/5", "script": "{ readonly x=old; x=2; y=3; echo same; } 2>/dev/null", "exit": 1, "output": ""}
+{"id": "adversarial_discard_propagation/6", "script": "{ set -o posix; readonly x=old; case a in a) x=new /bin/true; echo in-case;; esac; echo after-case; } 2>/dev/null", "exit": 1, "output": ""}
+{"id": "adversarial_discard_propagation/7", "script": "{ set -o posix; readonly x=old; f(){ { x=new /bin/true; echo in-brace; }; echo after-brace; }; f; echo after-f; } 2>/dev/null", "exit": 1, "output": ""}
+{"id": "adversarial_discard_propagation/8", "script": "{ readonly x=old; eval 'eval \"x=2; echo inner-eval\"; echo outer-eval'; echo after; } 2>/dev/null", "exit": 0, "output": "outer-eval\nafter\n"}
+{"id": "adversarial_discard_propagation/9", "script": "{ set -o posix; readonly x=old; h(){ x=new /bin/true; echo in-h; }; g(){ h; echo in-g; }; f(){ g; echo in-f; }; f; echo after-all; } 2>/dev/null", "exit": 1, "output": ""}
+{"id": "adversarial_discard_propagation/10", "script": "{ set -o posix; readonly x=old; f(){ x=new /bin/true; echo in-bg; }; f & wait $!; echo \"after s=$?\"; } 2>/dev/null", "exit": 0, "output": "after s=1\n"}
+{"id": "adversarial_discard_propagation/11", "script": "{ set -o posix; readonly x=old; x=2; echo same; } 2>/dev/null", "exit": 127, "output": ""}
+{"id": "adversarial_discard_propagation/12", "script": "{ readonly x=old; trap 'f(){ x=2; echo in-trap-f; }; f; echo in-trap' USR1; g(){ kill -USR1 $$; echo after-kill; }; g; echo after-g; } 2>/dev/null", "exit": 0, "output": "after-kill\nafter-g\n"}
+{"id": "adversarial_discard_propagation/13", "script": "{ set -o posix; readonly x=old; f(){ echo in-f; }; x=new f; echo after-f; } 2>/dev/null", "exit": 1, "output": ""}
+{"id": "adversarial_discard_propagation/14", "script": "{ set -o posix; readonly x=old; command eval 'x=2'; echo same; } 2>/dev/null", "exit": 0, "output": "same\n"}
+{"id": "adversarial_discard_propagation/15", "script": "{ readonly x=old; x=new /bin/true; echo same-line; } 2>/dev/null", "exit": 0, "output": "same-line\n"}
+{"id": "adversarial_discard_propagation/16", "script": "{ d=$(mktemp -d); set -o posix; readonly x=old; printf 'x=new /bin/true; echo in-src1\\necho in-src2\\n' >\"$d/s.sh\"; . \"$d/s.sh\"; echo after-src; rm -rf \"$d\"; } 2>/dev/null", "exit": 0, "output": "in-src2\nafter-src\n"}

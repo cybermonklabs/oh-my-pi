@@ -1,0 +1,1 @@
+{"id": "coproc_pid_names_a_waitable_coprocess/1", "script": "coproc C { echo hi; }; read -r l <&\"${C[0]}\"; echo \"$l\"; [ \"$C_PID\" = \"$!\" ] && echo same; wait \"$C_PID\"; echo \"status=$?\"", "exit": 0, "output": "hi\nsame\nstatus=0\n"}

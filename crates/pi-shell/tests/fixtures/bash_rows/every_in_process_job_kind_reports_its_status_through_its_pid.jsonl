@@ -1,0 +1,6 @@
+{"id": "every_in_process_job_kind_reports_its_status_through_its_pid/1", "script": "f(){ return 7; }; f & wait \"$!\"; echo \"status=$?\"", "exit": 0, "output": "status=7\n"}
+{"id": "every_in_process_job_kind_reports_its_status_through_its_pid/2", "script": "( exit 3 ) & wait \"$!\"; echo \"status=$?\"", "exit": 0, "output": "status=3\n"}
+{"id": "every_in_process_job_kind_reports_its_status_through_its_pid/3", "script": "false & wait \"$!\"; echo \"status=$?\"", "exit": 0, "output": "status=1\n"}
+{"id": "every_in_process_job_kind_reports_its_status_through_its_pid/4", "script": "f(){ cat >/dev/null; return 8; }; echo hi | f & wait \"$!\"; echo \"status=$?\"", "exit": 0, "output": "status=8\n"}
+{"id": "every_in_process_job_kind_reports_its_status_through_its_pid/5", "script": "false || ( exit 5 ) & wait \"$!\"; echo \"status=$?\"", "exit": 0, "output": "status=5\n"}
+{"id": "every_in_process_job_kind_reports_its_status_through_its_pid/6", "script": "{ sleep 0.1; ( exit 4 ); } & wait \"$!\"; echo \"status=$?\"", "exit": 0, "output": "status=4\n"}

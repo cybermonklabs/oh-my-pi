@@ -1,0 +1,7 @@
+{"id": "control_flow_in_a_pipeline_stage_ends_only_that_stage/1", "script": "true | exit 3; echo \"after s=$?\"\necho next", "exit": 0, "output": "after s=3\nnext\n"}
+{"id": "control_flow_in_a_pipeline_stage_ends_only_that_stage/2", "script": "shopt -s lastpipe; true | exit 6; echo after", "exit": 6, "output": ""}
+{"id": "control_flow_in_a_pipeline_stage_ends_only_that_stage/3", "script": "shopt -s lastpipe; for i in 1 2; do true | break; echo i=$i; done; echo done", "exit": 0, "output": "done\n"}
+{"id": "control_flow_in_a_pipeline_stage_ends_only_that_stage/4", "script": "for i in 1 2; do true | continue; echo i=$i; done; echo done", "exit": 0, "output": "i=1\ni=2\ndone\n"}
+{"id": "control_flow_in_a_pipeline_stage_ends_only_that_stage/5", "script": "for i in 1 2; do true | break; echo i=$i; done; echo done", "exit": 0, "output": "i=1\ni=2\ndone\n"}
+{"id": "control_flow_in_a_pipeline_stage_ends_only_that_stage/6", "script": "f(){ true | return 4; echo \"in-f s=$?\"; }; f; echo \"after s=$?\"", "exit": 0, "output": "in-f s=4\nafter s=0\n"}
+{"id": "control_flow_in_a_pipeline_stage_ends_only_that_stage/7", "script": "exit 5 | cat; echo \"after s=$?\"\necho next", "exit": 0, "output": "after s=0\nnext\n"}

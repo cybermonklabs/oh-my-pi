@@ -1,0 +1,2 @@
+{"id": "kill_reaches_an_in_process_job_from_a_subshell/1", "script": "f(){ sleep 5; }; f & p=$!; (kill \"$p\"); echo \"kill=$?\"; wait \"$p\"; echo \"status=$?\"", "exit": 0, "output": "kill=0\nstatus=143\n"}
+{"id": "kill_reaches_an_in_process_job_from_a_subshell/2", "script": "d=$(mktemp -d); f(){ /bin/sh -c ': > \"$1/ready\"; while [ -d \"$1\" ]; do sleep 0.01; done' sh \"$d\"; }; f & p=$!; ( until [ -e \"$d/ready\" ]; do sleep 0.01; done; kill \"$p\" ) & wait \"$p\"; echo \"status=$?\"; rm -rf \"$d\"", "exit": 0, "output": "status=143\n"}

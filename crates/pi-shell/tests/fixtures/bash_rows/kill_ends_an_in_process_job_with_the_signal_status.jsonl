@@ -1,0 +1,5 @@
+{"id": "kill_ends_an_in_process_job_with_the_signal_status/1", "script": "exec 2>/dev/null; ( sleep 5 ) & kill -KILL \"$!\"; wait \"$!\"; echo \"status=$?\"", "exit": 0, "output": "status=137\n"}
+{"id": "kill_ends_an_in_process_job_with_the_signal_status/2", "script": "f(){ sleep 5; }; f & p=$!; kill \"$p\"; wait \"$p\"; echo \"status=$?\"", "exit": 0, "output": "status=143\n"}
+{"id": "kill_ends_an_in_process_job_with_the_signal_status/3", "script": "f(){ sleep 5; }; f & kill %1; wait %1; echo \"status=$?\"", "exit": 0, "output": "status=143\n"}
+{"id": "kill_ends_an_in_process_job_with_the_signal_status/4", "script": "f(){ return 5; }; f & p=$!; sleep 0.3; kill \"$p\" 2>/dev/null; echo \"kill=$?\"; wait \"$p\"; echo \"status=$?\"", "exit": 0, "output": "kill=1\nstatus=5\n"}
+{"id": "kill_ends_an_in_process_job_with_the_signal_status/5", "script": "f(){ sleep 0.3; }; f & p=$!; kill -0 \"$p\" && echo alive; wait \"$p\"; kill -0 \"$p\" 2>/dev/null || echo gone", "exit": 0, "output": "alive\ngone\n"}
