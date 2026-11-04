@@ -3118,6 +3118,45 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						stdin = Some(FdRef::mem(r));
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
+					// Bash `execute_simple_command` forks a pipeline builtin without
+					// resetting `loop_level` (`execute_in_subshell` does reset it
+					// for compound stages). Its break/continue target
+					// is only this child, never the parent's loop.
+					// One target represents all inherited
+					// levels: either builtin finishes the stage at its own SubExit.
+					if unit.mode.dialect() == Dialect::Bash
+						&& unit
+							.ops
+							.get(stage.entry as usize)
+							.is_some_and(|op| op.code == Opcode::Exec)
+					{
+						let inherited = vp
+							.frames
+							.iter()
+							.rev()
+							.find(|f| {
+								!f.loops.is_empty()
+									|| !matches!(
+										f.kind,
+										FrameKind::Script { what: ScriptKind::Eval, .. }
+											| FrameKind::NoFork
+											| FrameKind::Stage
+									)
+							})
+							.is_some_and(|f| !f.loops.is_empty());
+						if inherited {
+							let end = info.stages.get(i + 1).map_or(info.end, |next| next.entry) - 1;
+							let frame = top_frame(&mut child);
+							frame.loops.push(LoopRec {
+								kind:       LoopKind::While,
+								status:     0,
+								iterations: 0,
+								exit:       end,
+								cont:       end,
+								depth:      Depths::default(),
+							});
+						}
+					}
 					let level = stage_level(unit, stage.entry, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline

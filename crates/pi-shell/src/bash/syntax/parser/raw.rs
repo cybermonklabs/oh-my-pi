@@ -12,7 +12,7 @@ use crate::bash::syntax::{
 	ast::{ArrayElem, List, Word},
 	features::Features,
 	span::{NodeId, Span},
-	util::{ansi_decode, sh_single_quote},
+	util::{ansi_decode, ansi_decode_bytes, sh_single_quote},
 };
 
 /// `parse_matched_pair` flags.
@@ -24,14 +24,19 @@ impl Flags {
 	pub const ARITH: Self = Self(8);
 	pub const DOLBRACE: Self = Self(4);
 	pub const DQUOTE: Self = Self(2);
+	/// Expansion-time extraction: quotes match, but `$'…'` is already
+	/// translated.
+	pub const EXTRACT: Self = Self(32);
 	pub const FIRSTCLOSE: Self = Self(16);
+	/// Arithmetic text is expanded later: do not recognize a second `$'…'`.
+	pub const LITERAL_ANSI: Self = Self(64);
 	pub const NONE: Self = Self(0);
 
 	const fn has(self, f: Self) -> bool {
 		self.0 & f.0 != 0
 	}
 
-	const fn with(self, f: Self) -> Self {
+	pub(super) const fn with(self, f: Self) -> Self {
 		Self(self.0 | f.0)
 	}
 }
@@ -60,6 +65,107 @@ impl Parser<'_> {
 		};
 		self.raw_into(&mut out, 0, open, close, flags, line)?;
 		Ok(out)
+	}
+
+	/// `extract_heredoc_dolbrace_string`: translate the operand while
+	/// extracting it. The operator state is shared across nesting levels;
+	/// unlike `parse_matched_pair`, returning from `${…}` does not restore it.
+	pub(super) fn heredoc_brace(&mut self, line: u32) -> PResult<Vec<u8>> {
+		enum State {
+			Param,
+			Op,
+			Word,
+			Quote,
+		}
+		let mut state = State::Param;
+		let mut nesting = 1u32;
+		let mut out = Vec::new();
+		let extract = Flags::EXTRACT.with(Flags::DQUOTE);
+		loop {
+			let Some(c) = self.peek() else {
+				return Err(unmatched_error(self.eof_span(), line, "}"));
+			};
+			if c == b'\\' {
+				self.bump();
+				out.push(c);
+				if let Some(next) = self.peek() {
+					self.bump();
+					out.push(next);
+				}
+				continue;
+			}
+			if c == b'$' && self.peek_at(1) == Some(b'\'') {
+				self.bump();
+				self.bump();
+				if self.feat.contains(Features::POSIX) && !matches!(state, State::Quote) {
+					out.extend_from_slice(b"$'");
+					continue;
+				}
+				let mut raw = Vec::new();
+				self.raw_into(&mut raw, b'\'', b'\'', b'\'', Flags::ALLOWESC, line)?;
+				let decoded = ansi_decode(&raw);
+				if matches!(state, State::Quote) {
+					sh_single_quote(&mut out, &decoded);
+				} else {
+					out.extend_from_slice(&decoded);
+				}
+				continue;
+			}
+			if c == b'$'
+				&& self.peek_at(1) == Some(b'{')
+				&& !matches!(self.peek_at(2), Some(b' ' | b'\t' | b'\n' | b'|'))
+			{
+				self.bump();
+				self.bump();
+				out.extend_from_slice(b"${");
+				nesting += 1;
+				if matches!(state, State::Quote | State::Word) {
+					state = State::Param;
+				}
+				continue;
+			}
+			if c == b'}' {
+				self.bump();
+				nesting -= 1;
+				if nesting == 0 {
+					return Ok(out);
+				}
+				out.push(c);
+				continue;
+			}
+			if (c == b'$' && matches!(self.peek_at(1), Some(b'(' | b'[' | b'{')))
+				|| (matches!(c, b'<' | b'>') && self.peek_at(1) == Some(b'('))
+			{
+				self.bump();
+				let open = self.peek().expect("substitution opener");
+				self.bump();
+				out.extend_from_slice(&[c, open]);
+				self.raw_dollar(&mut out, open, extract, line)?;
+				continue;
+			}
+			self.bump();
+			out.push(c);
+			if matches!(c, b'\'' | b'"' | b'`') {
+				if c == b'\'' && self.feat.contains(Features::POSIX) && !matches!(state, State::Quote) {
+					continue;
+				}
+				let mut quoted = Vec::new();
+				self.raw_into(&mut quoted, c, c, c, extract, line)?;
+				out.extend_from_slice(&quoted);
+				out.push(c);
+				continue;
+			}
+			state = match state {
+				State::Param
+					if (b"%#/^,".contains(&c) || (c == b':' && nesting == 1)) && out.len() > 1 =>
+				{
+					State::Quote
+				},
+				State::Param if b"#%^,~:-=?+/".contains(&c) => State::Op,
+				State::Op if !b"#%^,~:-=?+/".contains(&c) => State::Word,
+				state => state,
+			};
+		}
 	}
 
 	/// The scanner proper; `qc` is the enclosing quote (`'`, `"` or 0).
@@ -94,6 +200,16 @@ impl Parser<'_> {
 		let mut gtlt = false;
 		let dq = qc == b'"' || flags.has(Flags::DQUOTE);
 		let rflags = if dq { Flags::DQUOTE } else { Flags::NONE };
+		let rflags = if flags.has(Flags::EXTRACT) {
+			rflags.with(Flags::EXTRACT)
+		} else {
+			rflags
+		};
+		let rflags = if flags.has(Flags::LITERAL_ANSI) {
+			rflags.with(Flags::LITERAL_ANSI)
+		} else {
+			rflags
+		};
 		// `${…}` operator state: whether single quotes quote (`#`, `%`, `/`…).
 		let mut dolbrace_quote = false;
 		let mut dolbrace_op = false;
@@ -172,29 +288,42 @@ impl Parser<'_> {
 			}
 			if open != close {
 				if matches!(ch, b'\'' | b'"' | b'`') {
+					// `parse_matched_pair`: POSIX non-pattern operands keep
+					// single quotes (including `$'…'`) as literal characters.
+					if ch == b'\''
+						&& dq
+						&& flags.has(Flags::DOLBRACE)
+						&& !dolbrace_quote
+						&& self.feat.contains(Features::POSIX)
+					{
+						wasdol = false;
+						continue;
+					}
 					let ansi = wasdol && ch == b'\'';
 					let locale = wasdol && ch == b'"';
 					let mut nested = Vec::new();
-					let nflags = if ansi {
+					let nflags = if ansi && !flags.has(Flags::EXTRACT) {
 						Flags::ALLOWESC.with(rflags)
 					} else {
 						rflags
 					};
 					self.raw_into(&mut nested, ch, ch, ch, nflags, line)?;
-					if ansi {
-						let decoded = ansi_decode(&nested);
+					if ansi && !flags.has(Flags::EXTRACT) {
 						out.truncate(out.len() - 2);
 						if !dq || (flags.has(Flags::DOLBRACE) && dolbrace_quote) {
-							sh_single_quote(out, &decoded);
+							sh_single_quote(out, &ansi_decode(&nested));
 						} else {
-							out.extend_from_slice(&decoded);
+							out.extend_from_slice(&ansi_decode_bytes(&nested));
 						}
-					} else if locale {
+					} else if locale && !flags.has(Flags::EXTRACT) {
 						out.truncate(out.len() - 2);
 						out.push(b'"');
 						out.extend_from_slice(&nested);
 						out.push(b'"');
 					} else {
+						if ansi && flags.has(Flags::LITERAL_ANSI) {
+							out.insert(out.len() - 2, b'\\');
+						}
 						out.extend_from_slice(&nested);
 						out.push(ch);
 					}
@@ -273,7 +402,7 @@ impl Parser<'_> {
 
 	/// Raw text of a `${x:off:len}` field: up to `:` or `}` at nesting
 	/// level 0 (not consumed). Returns the text and whether it stopped at `:`.
-	pub(super) fn raw_until_colon(&mut self, line: u32) -> PResult<(Vec<u8>, bool)> {
+	pub(super) fn raw_until_colon(&mut self, line: u32, dq: bool) -> PResult<(Vec<u8>, bool)> {
 		let mut out = Vec::new();
 		let mut depth = 0u32;
 		// bash `skiparith`: a `:` after a top-level `?` belongs to the
@@ -315,13 +444,27 @@ impl Parser<'_> {
 					out.extend_from_slice(&nested);
 					out.push(c);
 				},
+				// This operand already passed ANSI-C translation. Keep its
+				// generated `$'…'` literal through the later arithmetic parse.
+				b'$' if self.translated && self.peek_at(1) == Some(b'\'') => {
+					self.bump();
+					out.extend_from_slice(b"\\$");
+				},
 				b'$' if matches!(self.peek_at(1), Some(b'(' | b'{' | b'[')) => {
 					self.bump();
 					let d = self.peek().unwrap_or(b'(');
 					self.bump();
 					out.push(b'$');
 					out.push(d);
-					self.raw_dollar(&mut out, d, Flags::NONE, line)?;
+					// `extract_heredoc_dolbrace_string` translates a nested
+					// `${…}` using the enclosing double-quote context too.
+					let flags = if dq { Flags::DQUOTE } else { Flags::NONE };
+					let flags = if self.translated {
+						flags.with(Flags::EXTRACT).with(Flags::LITERAL_ANSI)
+					} else {
+						flags
+					};
+					self.raw_dollar(&mut out, d, flags, line)?;
 				},
 				b'(' | b'[' => {
 					depth += 1;
@@ -359,6 +502,7 @@ impl Parser<'_> {
 		let saved_compound = core::mem::take(&mut self.compound);
 		let saved_pending = core::mem::take(&mut self.pending);
 		let saved_expand = self.expand_aliases;
+		let saved_translated = core::mem::replace(&mut self.translated, false);
 		self.expand_aliases = saved_expand && self.feat.contains(Features::POSIX);
 		let close_tok = if close == b'}' { T::RBrace } else { T::RParen };
 
@@ -383,6 +527,7 @@ impl Parser<'_> {
 		self.compound = saved_compound;
 		self.pending = saved_pending;
 		self.expand_aliases = saved_expand;
+		self.translated = saved_translated;
 
 		let tcmd = crate::bash::syntax::print::comsub_text(&list);
 		let mut text = Vec::with_capacity(tcmd.len() + 4);

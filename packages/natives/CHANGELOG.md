@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Fixed ANSI-C quoting in parameter-expansion operands and `break`/`continue` in pipeline stages to follow Bash ([#17712](https://github.com/can1357/oh-my-pi/pull/17712) by [@sjawhar](https://github.com/sjawhar))
+- Fixed an external command's here-document expansion error ending the enclosing shell instead of only that command ([#17712](https://github.com/can1357/oh-my-pi/pull/17712) by [@sjawhar](https://github.com/sjawhar))
 - Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
 ### Fixed
 

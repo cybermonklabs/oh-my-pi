@@ -249,6 +249,9 @@ pub struct Parser<'s> {
 	last_cond_text: Option<Vec<u8>>,
 	/// Nesting of the raw scanner (`parse_matched_pair`).
 	raw_depth:      u32,
+	/// Parameter text after `parse_matched_pair`'s ANSI-C translation.
+	/// Expansion does not recognize a second `$'…'` produced by that pass.
+	translated:     bool,
 	/// Top-level `;` offsets collected while scanning `for ((…))`.
 	arith_semis:    Option<Vec<usize>>,
 	/// Line of the `[[` being parsed (bash's `lineno` in its messages).
@@ -350,6 +353,7 @@ impl<'s> Parser<'s> {
 			failed: false,
 			last_cond_text: None,
 			raw_depth: 0,
+			translated: false,
 			arith_semis: None,
 			cond_line: 0,
 			cond_eof: false,

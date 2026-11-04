@@ -810,10 +810,17 @@ impl<'s> Parser<'s> {
 						lit_sq = false;
 						continue;
 					}
-					let ansi_ok = !matches!(
-						stop,
-						Stop::DQuote { .. } | Stop::Text(_) | Stop::Brace { doc: true, pat: false, .. }
-					);
+					let ansi_ok = !self.translated
+						&& !lit_sq
+						&& match stop {
+							Stop::DQuote { .. }
+							| Stop::Text(_)
+							| Stop::Brace { doc: true, pat: false, .. } => false,
+							Stop::Brace { dq: true, pat: false, .. } => {
+								!self.feat.contains(crate::bash::syntax::Features::POSIX)
+							},
+							_ => true,
+						};
 					if let Some(part) = self.dollar(stop, !ansi_ok)? {
 						acc.push(part);
 					} else {
@@ -995,6 +1002,8 @@ impl<'s> Parser<'s> {
 	/// `${…}` at the cursor; `doc`: inside an unquoted here-document.
 	fn braced_param(&mut self, dq: bool, doc: bool) -> PResult<WordPart> {
 		let start = self.mark();
+		let buf = self.buf;
+		let lo = self.pos;
 		let line = self.bash_line();
 		self.bump();
 		self.bump();
@@ -1002,11 +1011,96 @@ impl<'s> Parser<'s> {
 			Some(p) => {
 				if self.peek() == Some(b'}') {
 					self.bump();
+					let doc_operand = doc
+						&& matches!(
+							&p.op,
+							ParamOp::Substr { .. }
+								| ParamOp::Trim { .. }
+								| ParamOp::Replace { .. }
+								| ParamOp::Case { .. }
+						);
+					// Bash first translates `$'…'` in `parse_matched_pair`,
+					// then `extract_dollar_brace_string` must still find `}`.
+					// Validate before choosing the operator's arm: even an unused
+					// operand can have lost its closing brace to a quote or NUL.
+					if dq
+						&& (!doc || doc_operand)
+						&& !self.translated
+						&& core::ptr::eq(buf.as_ptr(), self.buf.as_ptr())
+						&& buf[lo..self.pos].windows(2).any(|w| w == b"$'")
+					{
+						let end = self.mark();
+						if self.reset(start) {
+							self.bump();
+							self.bump();
+							let flags = super::raw::Flags::DOLBRACE.with(super::raw::Flags::DQUOTE);
+							let mut text = if doc {
+								self.heredoc_brace(line)?
+							} else {
+								self.raw_matched(b'{', b'}', flags, line)?
+							};
+							text.push(b'}');
+							self.reset(end);
+							return Ok(self.translated_param(&text, lo as u32 + self.base + 2, line, doc));
+						}
+					}
 					return Ok(WordPart::Param(Box::new(p)));
 				}
 				self.bad_subst(start, line)
 			},
 			None => self.bad_subst(start, line),
+		}
+	}
+
+	/// Extract translated text before parsing its operand for expansion.
+	/// `extract_dollar_brace_string` runs even for an unused operand; only
+	/// the chosen operand evaluates substitutions that the translation made.
+	fn translated_param(&self, text: &[u8], base: u32, line: u32, doc: bool) -> WordPart {
+		let n = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+		let text = &text[..n];
+		let bad = || {
+			let mut bad = b"${".to_vec();
+			bad.extend_from_slice(text);
+			WordPart::BadSubst(bad)
+		};
+		let mut parser = Parser::new(text, self.feat, super::NO_ALIASES);
+		parser.virt = 0;
+		parser.base = base;
+		parser.translated = true;
+		let start = parser.mark();
+		let flags = super::raw::Flags::DOLBRACE
+			.with(super::raw::Flags::DQUOTE)
+			.with(super::raw::Flags::EXTRACT);
+		if parser.raw_matched(b'{', b'}', flags, line).is_err() {
+			return bad();
+		}
+		parser.reset(start);
+		parser.docs.clear();
+		let Ok(Some(param)) = parser.param_body(true, doc, line) else {
+			return bad();
+		};
+		if parser.peek() != Some(b'}') {
+			return bad();
+		}
+		parser.bump();
+		let mut word = empty_word(base, base + text.len() as u32);
+		word.parts.push(WordPart::Param(Box::new(param)));
+		if parser.peek().is_some() {
+			let mode = if doc {
+				TextMode::HereDoc
+			} else {
+				TextMode::DoubleQuote
+			};
+			let Ok(suffix) = parser.parts_until(Stop::Text(mode)) else {
+				return bad();
+			};
+			word.parts.extend(suffix);
+		}
+		super::finish::finish_word(&mut word, &parser.docs);
+		if word.parts.len() == 1 {
+			word.parts.pop().expect("parameter part")
+		} else {
+			WordPart::DQuote(word.parts)
 		}
 	}
 
@@ -1212,7 +1306,7 @@ impl<'s> Parser<'s> {
 					let w = self.op_word(brace)?;
 					p.op = word_op(op, true, w);
 				} else {
-					let (offset, len) = self.substr(line)?;
+					let (offset, len) = self.substr(line, dq)?;
 					p.op = ParamOp::Substr { offset, len };
 				}
 			},
@@ -1313,9 +1407,9 @@ impl<'s> Parser<'s> {
 	}
 
 	/// `${x:off[:len]}` after the `:`: arithmetic texts.
-	fn substr(&mut self, line: u32) -> PResult<(ArithText, Option<ArithText>)> {
+	fn substr(&mut self, line: u32, dq: bool) -> PResult<(ArithText, Option<ArithText>)> {
 		let lo = self.off();
-		let (off, at_colon) = self.raw_until_colon(line)?;
+		let (off, at_colon) = self.raw_until_colon(line, dq)?;
 		let hi = self.off();
 		let offset = ArithText { span: Span::new(lo, hi), src: off, bracket: false };
 		if !at_colon {
@@ -1323,7 +1417,7 @@ impl<'s> Parser<'s> {
 		}
 		self.bump();
 		let lo2 = self.off();
-		let (len, _) = self.raw_until_colon(line)?;
+		let (len, _) = self.raw_until_colon(line, dq)?;
 		let hi2 = self.off();
 		Ok((offset, Some(ArithText { span: Span::new(lo2, hi2), src: len, bracket: false })))
 	}
