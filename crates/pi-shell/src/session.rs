@@ -289,6 +289,8 @@ pub struct Session {
 	/// Rings the driver's bell.
 	waker:    Waker,
 	children: Children,
+	/// Owned so cancellation can wait until every in-engine task is dropped.
+	driver:   tokio::task::JoinHandle<()>,
 }
 
 impl Session {
@@ -326,8 +328,8 @@ impl Session {
 		// Nothing observes events: skip building them.
 		shell.set_event_mask(EventMask::NONE);
 		let driver = Driver { shell, store, host, bell, jobs: rx, children: children.clone(), tools };
-		runtime.spawn(driver.serve());
-		Ok(Self { jobs: Some(jobs), waker, children })
+		let driver = runtime.spawn(driver.serve());
+		Ok(Self { jobs: Some(jobs), waker, children, driver })
 	}
 
 	/// The live externals of the run in flight; usable while
@@ -434,6 +436,15 @@ impl Session {
 				Err(SessionError::Unresponsive)
 			},
 		}
+	}
+
+	/// Stop the driver and wait until its shell, captures and descriptor
+	/// references have actually been dropped. Used after a cancelled run's
+	/// grace, not instead of giving its TERM traps time to finish.
+	pub async fn shutdown(&mut self) {
+		self.close();
+		self.driver.abort();
+		let _ = (&mut self.driver).await;
 	}
 
 	/// Stop accepting jobs and let the driver task end (it drops the

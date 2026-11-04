@@ -5,6 +5,13 @@
 ### Fixed
 
 - Fixed shell diagnostics, trace output and built-in utilities continuing after their pipe reader exits; writers now stop with SIGPIPE's status 141, while ignored and caught SIGPIPE dispositions are preserved ([#17827](https://github.com/can1357/oh-my-pi/pull/17827) by [@sjawhar](https://github.com/sjawhar))
+- Fixed expansion errors inside `eval` or sourced files continuing a failed pipeline stage, subshell or background job instead of ending that subshell ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
+- Fixed shell errors losing their redirected stderr, fatal arithmetic errors being treated as ordinary failures, and `builtin` wrappers incorrectly suppressing `set -e` ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
+- Fixed `compgen -F`, `-C` and `-W` not running completion functions, commands and word-list expansions on the command's own streams ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
+- Fixed command substitutions in `PS4` not expanding, and timed-out substitutions retaining open files or writing after the run returned ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
+- Fixed failed `lastpipe` stages returning before earlier stages finished, `time` losing reports on expansion errors, and arithmetic loop errors skipping later commands on the same line ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
+- Fixed external-command and subshell redirection expansions leaking variable assignments into the caller or ending the caller on an expansion error ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
+
 ### Changed
 
 - Made the bash tool's shell faster on string appends (`s+=x`), sourcing files full of function definitions (each body compiles on first call), quoted `"$var"`/`"$1"` arguments and file redirections

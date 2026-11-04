@@ -202,7 +202,8 @@ pub(super) enum Stop {
 
 impl Stop {
 	const fn in_dq(self) -> bool {
-		matches!(self, Self::DQuote { .. } | Self::Brace { dq: true, .. } | Self::Text(_))
+		matches!(self, Self::DQuote { .. } | Self::Brace { dq: true, .. })
+			|| matches!(self, Self::Text(mode) if !matches!(mode, TextMode::Completion))
 	}
 }
 
@@ -639,34 +640,52 @@ impl<'s> Parser<'s> {
 	}
 
 	/// The part loop shared by every quoting context.
-	#[allow(clippy::cognitive_complexity, reason = "one state machine over bash's quoting rules")]
 	fn parts_into(&mut self, acc: &mut Acc, stop: Stop, line: u32) -> PResult<()> {
+		self.parts_into_mode(acc, stop, line, None, false)
+	}
+
+	#[allow(clippy::cognitive_complexity, reason = "one state machine over bash's quoting rules")]
+	fn parts_into_mode(
+		&mut self,
+		acc: &mut Acc,
+		stop: Stop,
+		line: u32,
+		delims: Option<&[u8]>,
+		tolerant: bool,
+	) -> PResult<()> {
 		let dq = stop.in_dq();
 		let mut depth = 0u32;
 		let mut lit_sq = false;
 		let mut sq_line = line;
 		loop {
+			if self
+				.peek()
+				.is_some_and(|c| delims.is_some_and(|d| d.contains(&c)))
+			{
+				return Ok(());
+			}
 			if self.pos < self.buf.len() {
 				let buf: &'s [u8] = self.buf;
 				let rest = &buf[self.pos..];
 				let n = run_len(self.feat, rest, |c| {
-					matches!(
-						c,
-						b'\\'
-							| b'\''
-							| b'"'
-							| b'`'
-							| b'$'
-							| b'<'
-							| b'>'
-							| b'('
-							| b')'
-							| b'['
-							| b']'
-							| b'}'
-							| b'/'
-							| b'\n'
-					)
+					delims.is_some_and(|d| d.contains(&c))
+						|| matches!(
+							c,
+							b'\\'
+								| b'\''
+								| b'"'
+								| b'`'
+								| b'$'
+								| b'<'
+								| b'>'
+								| b'('
+								| b')'
+								| b'['
+								| b']'
+								| b'}'
+								| b'/'
+								| b'\n'
+						)
 				});
 				if n > 0 {
 					acc.lit.extend_from_slice(&rest[..n]);
@@ -679,6 +698,7 @@ impl<'s> Parser<'s> {
 					return Err(unmatched_error(self.eof_span(), sq_line, "'"));
 				}
 				return match stop {
+					Stop::DQuote { .. } if tolerant => Ok(()),
 					Stop::Text(_) => Ok(()),
 					Stop::DQuote { .. } => Err(unmatched_error(self.eof_span(), line, "\"")),
 					Stop::Brace { .. } => Err(unmatched_error(self.eof_span(), line, "}")),
@@ -769,6 +789,30 @@ impl<'s> Parser<'s> {
 						},
 					}
 				},
+				b'\'' if stop == Stop::Text(TextMode::Completion) => {
+					self.bump();
+					let mut text = Vec::new();
+					while let Some(c) = self.peek() {
+						self.bump();
+						if c == b'\'' {
+							break;
+						}
+						text.push(c);
+					}
+					acc.push(WordPart::SQuote(text));
+				},
+				b'"' if stop == Stop::Text(TextMode::Completion) => {
+					self.bump();
+					let mut inner = Acc::new();
+					self.parts_into_mode(
+						&mut inner,
+						Stop::DQuote { all: false },
+						self.bash_line(),
+						None,
+						true,
+					)?;
+					acc.push(WordPart::DQuote(inner.finish()));
+				},
 				b'\'' if !dq || matches!(stop, Stop::Brace { .. }) => {
 					let part = self.quoted_part(c, false)?;
 					acc.push(part);
@@ -812,7 +856,9 @@ impl<'s> Parser<'s> {
 					}
 					let ansi_ok = !matches!(
 						stop,
-						Stop::DQuote { .. } | Stop::Text(_) | Stop::Brace { doc: true, pat: false, .. }
+						Stop::DQuote { .. }
+							| Stop::Text(TextMode::Arith | TextMode::DoubleQuote | TextMode::HereDoc)
+							| Stop::Brace { doc: true, pat: false, .. }
 					);
 					if let Some(part) = self.dollar(stop, !ansi_ok)? {
 						acc.push(part);
@@ -1337,6 +1383,28 @@ impl<'s> Parser<'s> {
 		let mut w = empty_word(lo, hi);
 		w.parts = merge_lits(parts);
 		Ok(w)
+	}
+
+	/// Bash's `split_at_delims`, with the ordinary expansion lexer taking
+	/// care of quoted delimiters and nested substitutions.
+	pub(super) fn completion_words(&mut self, ifs: &[u8]) -> PResult<Vec<Word>> {
+		let mut words = Vec::new();
+		while self.peek().is_some() {
+			while self.peek().is_some_and(|c| ifs.contains(&c)) {
+				self.bump();
+			}
+			if self.peek().is_none() {
+				break;
+			}
+			let lo = self.off();
+			let line = self.bash_line();
+			let mut acc = Acc::new();
+			self.parts_into_mode(&mut acc, Stop::Text(TextMode::Completion), line, Some(ifs), true)?;
+			let mut word = empty_word(lo, self.off());
+			word.parts = merge_lits(acc.finish());
+			words.push(word);
+		}
+		Ok(words)
 	}
 }
 

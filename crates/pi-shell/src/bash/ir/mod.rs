@@ -74,8 +74,8 @@ use serde::{Deserialize, Serialize};
 
 use self::lower::lower;
 pub(crate) use self::lower::{
-	ANON, abort_unit, ansi_c, ansi_c_with, function_from_source, lower_compound, lower_deferred,
-	lower_text, materialize, syntax_unit,
+	ANON, abort_unit, ansi_c, ansi_c_with, function_from_source, lower_completion_words,
+	lower_compound, lower_deferred, lower_text, materialize, syntax_unit,
 };
 use crate::bash::{
 	event::{EventKind, EventMask, NodeKind, RedirKind},
@@ -83,7 +83,7 @@ use crate::bash::{
 };
 
 /// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 14;
+pub const IR_VERSION: u32 = 15;
 
 /// Opcodes.
 #[derive(

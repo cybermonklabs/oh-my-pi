@@ -106,6 +106,26 @@ pub fn lower_text(
 	Ok(l.unit)
 }
 
+/// Lower runtime completion words with normal brace and tilde expansion,
+/// but without parsing shell operators. The last word list holds the roots.
+pub fn lower_completion_words(
+	words: &[syn::Word],
+	text: &[u8],
+	mode: ModeId,
+) -> Result<Unit, &'static str> {
+	let mut l =
+		Lower::new(Unit::empty(text, mode, syn::Features::NONE.bits()), 0, syn::Features::NONE);
+	l.emit(Opcode::End, 0, 0, 0);
+	let roots = words
+		.iter()
+		.map(|word| l.word(word))
+		.collect::<Result<Vec<_>, _>>()?;
+	l.unit.lists.push(roots);
+	l.emit(Opcode::End, 0, 0, 0);
+	l.unit.seal_from(l.source_hash);
+	Ok(l.unit)
+}
+
 /// Lower the compound value of a declaration argument given as a string
 /// (`declare -a d='($a)'`), parsed at run time as the one command
 /// `declare __=(…)` in `src`: a unit whose last word is a single
@@ -515,7 +535,7 @@ impl Lower {
 			self.emit(Opcode::Exec, c, 0, id);
 			return Ok(());
 		}
-		let redir = if cmd.redirs.is_empty() {
+		let redir = if cmd.redirs.is_empty() || matches!(cmd.kind, syn::CommandKind::Subshell(_)) {
 			None
 		} else {
 			let r = self.redir_list(&cmd.redirs)?;
@@ -551,7 +571,21 @@ impl Lower {
 				});
 				self.emit(Opcode::Spawn, spawn, 0, id);
 				let entry = self.here();
+				// A subshell applies its redirections after the child exists.
+				let redir = if cmd.redirs.is_empty() {
+					None
+				} else {
+					let list = self.redir_list(&cmd.redirs)?;
+					Some(self.emit(Opcode::Redir, list, 0, id))
+				};
 				self.list(body)?;
+				if redir.is_some() {
+					self.emit(Opcode::PopRedir, 0, 0, id);
+				}
+				let exit = self.here();
+				if let Some(at) = redir {
+					self.patch_b(at, exit);
+				}
 				self.emit(Opcode::SubExit, 0, 0, id);
 				let end = self.here();
 				let s = &mut self.unit.spawns[spawn as usize];

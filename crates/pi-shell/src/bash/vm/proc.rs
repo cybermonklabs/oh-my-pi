@@ -21,36 +21,40 @@ use crate::bash::{
 
 /// A green thread: its scripts, frames, fds, cwd and state overlay.
 pub struct Vproc {
-	pub vpid:          Vpid,
-	pub parent:        Option<Vpid>,
+	pub vpid:             Vpid,
+	pub parent:           Option<Vpid>,
 	/// Scripts queued on this vproc (root only); the front one runs.
-	pub runs:          VecDeque<Run>,
+	pub runs:             VecDeque<Run>,
 	/// Activation stack.
-	pub frames:        Vec<Frame>,
+	pub frames:           Vec<Frame>,
 	/// Function-local scopes, innermost last.
-	pub scopes:        Vec<Scope>,
-	pub fds:           FdTable,
-	pub cwd:           BString,
+	pub scopes:           Vec<Scope>,
+	pub fds:              FdTable,
+	pub cwd:              BString,
 	/// `$?`.
-	pub status:        i32,
+	pub status:           i32,
 	/// `PIPESTATUS` of the last pipeline.
-	pub pipestatus:    Vec<i32>,
+	pub pipestatus:       Vec<i32>,
 	/// `None` for the root vproc (writes go to the root cache).
-	pub overlay:       Option<Overlay>,
+	pub overlay:          Option<Overlay>,
 	/// Diagnostics waiting to be written to their fds.
-	pub out:           VecDeque<PendingWrite>,
-	pub blocked:       Option<Blocked>,
+	pub out:              VecDeque<(FdRef, PendingWrite)>,
+	/// Trace prefixes waiting for their prompt expansions or substitutions.
+	pub traces:           VecDeque<super::xtrace::Pending>,
+	/// Foreground pipeline stages still awaited after a fatal unwind.
+	pub unwound_children: Vec<Vpid>,
+	pub blocked:          Option<Blocked>,
 	/// Signal traps deferred until the foreground command completes.
-	pub pending_traps: SigSet,
+	pub pending_traps:    SigSet,
 	/// Stopped by a virtual `STOP` (job control).
-	pub stopped:       bool,
+	pub stopped:          bool,
 	/// Exit once its frames are done (subshell vprocs).
-	pub transient:     bool,
+	pub transient:        bool,
 	/// Background jobs not yet waited for or reported, current/previous
 	/// job and the `SIGCHLD` trap runs owed.
-	pub jobs:          JobTable,
+	pub jobs:             JobTable,
 	/// `$!`: the last asynchronous child and the OS pid it is known by.
-	pub last_bg:       LastBg,
+	pub last_bg:          LastBg,
 	/// Cleared scratches kept for the next ops (allocation reuse), at most
 	/// one per nesting level a caller's op parks at (a function call keeps
 	/// its op's scratch while the body needs another); never serialized.
@@ -58,58 +62,71 @@ pub struct Vproc {
 		clippy::vec_box,
 		reason = "the boxes move between frames (`Frame::scratch`) and this pool without copying"
 	)]
-	pub spare:         Vec<Box<Scratch>>,
+	pub spare:            Vec<Box<Scratch>>,
 	/// `getopts` progress between calls.
-	pub getopts:       GetoptsState,
+	pub getopts:          GetoptsState,
 	/// Open process-substitution fds: `(frame depth, fd)`, the depth being
 	/// the frame count when the op that opened it ran.
-	pub procsubs:      Vec<(u32, i32)>,
+	pub procsubs:         Vec<(u32, i32)>,
 	/// Coprocesses not reaped yet.
-	pub coprocs:       Vec<Coproc>,
+	pub coprocs:          Vec<Coproc>,
 	/// `set -o` states saved by `local -` in functions that returned, to
 	/// restore before the next op.
-	pub restore_opts:  Vec<BString>,
+	pub restore_opts:     Vec<BString>,
 	/// Limits `ulimit` set in this vproc or inherited from its parent;
 	/// passed to externals, never applied to the host process.
-	pub rlimits:       Vec<(crate::bash::host::Rlimit, Option<u64>, Option<u64>)>,
+	pub rlimits:          Vec<(crate::bash::host::Rlimit, Option<u64>, Option<u64>)>,
 	/// Host lineage, inherited from the parent (set by
 	/// [`super::ShellApi::run_subshell_in`]) and passed to externals.
-	pub lineage:       crate::bash::host::Lineage,
+	pub lineage:          crate::bash::host::Lineage,
 	/// `set -x` nesting this vproc starts at, beyond the first level (bash's
 	/// `indirection_level`): its parent's, plus one in a command
 	/// substitution.
-	pub trace_base:    u32,
+	pub trace_base:       u32,
 	/// `$BASH_SUBSHELL`: the subshell nesting (0 for the shell itself and a
 	/// nested shell). A field, not an overlay record: a record would cost
 	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
-	pub subshell:      u32,
+	pub subshell:         u32,
+	/// Subshell execution context for fatal expansion status. A lone async
+	/// command (including its function body) keeps the caller's context,
+	/// although its visible `BASH_SUBSHELL` counter increases.
+	pub invocation_depth: u32,
 	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
-	pub command:       Option<(Arc<Unit>, u32)>,
+	pub command:          Option<(Arc<Unit>, u32)>,
 	/// Pushes onto bash's call-stack arrays (`FUNCNAME`, `BASH_SOURCE`,
 	/// `BASH_LINENO`, `BASH_ARGC`, `BASH_ARGV`), oldest first; a subshell
 	/// starts with its parent's.
-	pub calls:         Vec<super::callstack::Call>,
+	pub calls:            Vec<super::callstack::Call>,
 	/// The traps this vproc set itself: a subshell lists its parent's but
 	/// runs only its own (ERR, DEBUG and RETURN also under
 	/// `errtrace`/`functrace`; bash 5.3 keeps listing inherited signal
 	/// traps until the subshell changes one).
-	pub own_traps:     OwnTraps,
+	pub own_traps:        OwnTraps,
 	/// Trap-action frames ([`ScriptKind::Trap`]) on `frames`: zero lets
 	/// the per-op checks (cancellation, `BASH_COMMAND`, a trap inside its
 	/// own action) skip their frame scans. Kept by
 	/// [`super::exec::push_script`], [`super::exec::pop_frame`] and the
 	/// frame restore; never serialized (recounted from the frames).
-	pub trap_frames:   u32,
+	pub trap_frames:      u32,
 	/// Current mode: the emulation its code runs under, set by
 	/// `emulate`, a mode-switching function call (restored on return) and
 	/// a run's explicit mode; inherited by children. The root's is written
 	/// through as `MiscKey::Mode`. Every event reports it.
-	pub mode:          ModeId,
+	pub mode:             ModeId,
 	/// zsh state of a vproc running zsh or mode-switching code (`None` for
 	/// pure bash: nothing to keep, nothing to check).
-	pub zsh:           Option<Box<VprocZsh>>,
+	pub zsh:              Option<Box<VprocZsh>>,
+}
+
+impl Vproc {
+	/// Pin the destination before an error can unwind its redirections.
+	pub fn queue_output(&mut self, write: PendingWrite) {
+		if let Some(target) = self.fds.get(write.fd) {
+			self.out.push_back((target.clone(), write));
+		}
+	}
 }
 
 /// A vproc's zsh state ([`Vproc::zsh`]).
@@ -856,6 +873,8 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
+	/// Plain eval/source in a conditional context disables errexit inside it.
+	pub errexit_disabled:  bool,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -887,6 +906,7 @@ impl Frame {
 			return_trap_local: false,
 			err_reported: false,
 			ignore_errexit: false,
+			errexit_disabled: false,
 			subshell_line: None,
 			getopts: None,
 		}
@@ -1019,6 +1039,8 @@ pub struct Scratch {
 	pub logs:        [Vec<Atom>; 4],
 	/// A command substitution being waited for.
 	pub sub:         Option<PendingSub>,
+	/// This op queued its trace; evaluation resumes after the prefix flush.
+	pub traced:      bool,
 	/// Progress of a staged `Exec` (boxed: it moves to `spare_exec` and
 	/// back once per command; a pointer moves, not the 368-byte state).
 	pub exec:        Option<Box<ExecState>>,
@@ -1051,10 +1073,12 @@ impl Scratch {
 	/// Clear for the next op, keeping allocations: a finished `Exec`'s
 	/// state becomes the spare.
 	pub fn recycle(&mut self) {
-		let Self { logs, sub, exec, io, live, children, inline, spare_exec, spare_words: _ } = self;
+		let Self { logs, sub, traced, exec, io, live, children, inline, spare_exec, spare_words: _ } =
+			self;
 		for log in logs {
 			log.clear();
 		}
+		*traced = false;
 		// Tested first: most ops leave both empty, and an assignment would
 		// run their drop glue (a call each) anyway.
 		if sub.is_some() {
@@ -1266,62 +1290,85 @@ pub enum ProbeResult {
 	Paths(Vec<BString>),
 }
 
+/// Command-entry ERR eligibility and caught PIPE delivery, kept in one byte.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct CommandTraps(u8);
+
+impl CommandTraps {
+	pub const fn new(err_set: bool) -> Self {
+		Self(if err_set { 1 } else { 0 })
+	}
+
+	pub const fn err_set(self) -> bool {
+		self.0 & 1 != 0
+	}
+
+	pub const fn pipe_pending(self) -> bool {
+		self.0 & 2 != 0
+	}
+
+	pub const fn defer_pipe(&mut self) {
+		self.0 |= 2;
+	}
+}
+
 /// Serializable progress of an `Exec` (survives externalize/restore).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecState {
-	pub stage:            Stage,
-	pub tag:              CmdTag,
-	pub t0:               u64,
-	pub argv:             Vec<BString>,
+	pub stage:         Stage,
+	pub tag:           CmdTag,
+	pub t0:            u64,
+	pub argv:          Vec<BString>,
 	/// The words are expanded (`argv`, `compound` are final).
-	pub expanded:         bool,
+	pub expanded:      bool,
 	/// argv indexes of compound-assignment words (`declare a=(…)`).
-	pub compound:         Vec<u32>,
+	pub compound:      Vec<u32>,
 	/// Fields still to pathname-expand: `(argv index, escaped pattern)`.
-	pub globs:            Vec<(u32, BString)>,
+	pub globs:         Vec<(u32, BString)>,
 	/// Prefix assignments as `(name, shown value)` for events.
-	pub assigns:          Vec<(BString, BString)>,
+	pub assigns:       Vec<(BString, BString)>,
 	/// Expanded prefix assignments: subscript and value.
-	pub values:           Vec<(Option<BString>, AssignValue)>,
+	pub values:        Vec<(Option<BString>, AssignValue)>,
 	/// `set -k`: `words` indexes of the assignment words taken out of
 	/// `argv`; their values follow the prefix ones in `values`.
-	pub keywords:         Vec<u32>,
+	pub keywords:      Vec<u32>,
 	/// argv indexes of single fields from words written as array
 	/// references ([`super::builtins::Ctx::arrayref`]).
-	pub arrayref:         Vec<u32>,
-	pub target:           Option<Target>,
-	pub waiting:          Option<Awaited>,
+	pub arrayref:      Vec<u32>,
+	pub target:        Option<Target>,
+	pub waiting:       Option<Awaited>,
 	/// A temporary scope (builtin environment) was pushed for this command.
-	pub scoped:           bool,
+	pub scoped:        bool,
 	/// Control transfer to perform once the output is written.
-	pub control:          Option<Transfer>,
+	pub control:       Option<Transfer>,
 	/// `Task::checkpoint` bytes taken at externalize.
-	pub checkpoint:       Option<Vec<u8>>,
+	pub checkpoint:    Option<Vec<u8>>,
 	/// Command output still to be written.
-	pub writes:           VecDeque<PendingWrite>,
-	pub status:           i32,
+	pub writes:        VecDeque<PendingWrite>,
+	pub status:        i32,
 	/// Status of the last command substitution (`$?` of `x=$(…)`).
-	pub sub_status:       Option<i32>,
+	pub sub_status:    Option<i32>,
 	/// Children `wait` waits for.
-	pub wait_for:         Vec<Vpid>,
+	pub wait_for:      Vec<Vpid>,
 	/// `exec command`: how the command replaces the shell.
-	pub exec_as:          Option<Box<ExecAs>>,
+	pub exec_as:       Option<Box<ExecAs>>,
 	/// `wait -p var`: the variable that gets the waited child's pid.
-	pub wait_into:        Option<Box<BString>>,
+	pub wait_into:     Option<Box<BString>>,
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
-	pub via_command:      bool,
+	pub via_command:   bool,
+	/// The invocation passed through a `builtin` wrapper.
+	pub via_builtin:   bool,
+	/// A builtin wrapper restores errexit judgement of its inner command.
+	pub force_errexit: bool,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
-	pub resume:           bool,
+	pub resume:        bool,
 	/// Times the builtin ran again after a frame it pushed returned.
-	pub resumed:          u32,
-	/// A failed redirection's diagnostic is written in a command child.
-	pub child_diagnostic: bool,
-	/// Whether ERR was in force when this command began.
-	pub err_trap_set:     bool,
-	/// Deliver a caught PIPE only after this command's redirections restore.
-	pub deferred_pipe:    bool,
+	pub resumed:       u32,
+	/// Trap eligibility at entry and any deferred caught write signal.
+	pub traps:         CommandTraps,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -1470,6 +1517,8 @@ pub enum Awaited {
 	AllJobs,
 	/// The first of the children to finish (`wait -n`); its status.
 	AnyJob,
+	/// A simple command forked before expanding its redirections.
+	Command(Vpid),
 }
 
 /// Transient handles; never serialized.
@@ -1534,9 +1583,13 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both.
-const _: () = assert!(size_of::<Vproc>() <= 664, "Vproc grew (idle vproc ≤ 2 KiB)");
+// Deferred trace state and unwound pipeline waits add 56 B to Vproc; staged
+// tracing adds 8 B to Scratch. The memory bench measured 1,896 B per idle
+// vproc with these continuations. The independent invocation context adds
+// another 8 B including padding; the idle benchmark target remains 2,048 B.
+const _: () = assert!(size_of::<Vproc>() <= 728, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
+const _: () = assert!(size_of::<Scratch>() <= 224, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one

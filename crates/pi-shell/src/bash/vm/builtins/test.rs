@@ -225,7 +225,13 @@ fn test_int(arg: &[u8]) -> T<i64> {
 fn binary(ctx: &mut Ctx<'_, '_>, op: &[u8], l: &[u8], r: &[u8], cond: bool) -> T<bool> {
 	let int = |ctx: &mut Ctx<'_, '_>, s: &[u8]| -> T<i64> {
 		if cond {
-			arith_value(ctx.k, ctx.cx, ctx.vp, s).map_err(Fail::Arith)
+			arith_value(ctx.k, ctx.cx, ctx.vp, s).map_err(|d| {
+				if matches!(d, Diag::Unbound { .. }) {
+					Fail::Need(Need::Sub(crate::bash::vm::expand::Stop::Fatal(d)))
+				} else {
+					Fail::Arith(d)
+				}
+			})
 		} else {
 			test_int(s)
 		}
@@ -618,7 +624,9 @@ pub fn cond_test(
 		},
 		CondIr::Word(w) => std::slice::from_ref(w),
 	};
-	let record = words.iter().any(|&w| unit.words[w as usize].parks);
+	let record = words.iter().any(|&w| unit.words[w as usize].parks)
+		|| crate::bash::vm::xtrace::on(k, cx, vp)
+		|| crate::bash::vm::exec::scratch(vp).traced;
 	let rhs_op: &[u8] = match c {
 		CondIr::Binary { op, .. } => op.as_slice(),
 		_ => &[],
@@ -659,7 +667,7 @@ pub fn cond_test(
 	};
 	// `set -x`: bash shows a pattern operand with its quoting as
 	// backslashes (`[[ b == c\* ]]`), which is how it is expanded here.
-	if crate::bash::vm::xtrace::on(k, cx, vp) {
+	if crate::bash::vm::xtrace::on(k, cx, vp) && !crate::bash::vm::exec::scratch(vp).traced {
 		let mut terms: Vec<&[u8]> = match c {
 			CondIr::Unary { op, .. } => vec![op.as_slice(), vals[0].as_slice()],
 			CondIr::Binary { op, .. } => {
@@ -673,6 +681,8 @@ pub fn cond_test(
 			terms.insert(0, b"!");
 		}
 		crate::bash::vm::xtrace::cond(k, cx, vp, line, &terms);
+		crate::bash::vm::exec::scratch(vp).traced = true;
+		return Flow::Call;
 	}
 	loop {
 		let mut sc = vp
@@ -742,11 +752,14 @@ pub fn cond_test(
 			},
 			// Only builtins expand subscripts through `Ctx`; a `[[ ]]`
 			// primary never parks.
-			Err(Fail::Need(Need::Sub(_))) => {
+			Err(Fail::Need(Need::Sub(stop))) => {
 				if let Some(f) = vp.frames.last_mut() {
 					f.scratch = Some(sc);
 				}
-				return Flow::Discard(1);
+				return crate::bash::vm::exec::stop_flow(k, vp, cx, line, stop);
+			},
+			Err(Fail::Need(Need::Command(_))) => {
+				unreachable!("conditional arithmetic does not start completion commands")
 			},
 		}
 	}
@@ -759,8 +772,7 @@ fn report(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, chunks: Ve
 		match chunk {
 			Chunk::Diag(d) => k.diag(cx, vp, line, d),
 			Chunk::Out(fd, bytes) => {
-				vp.out
-					.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+				vp.queue_output(PendingWrite { fd, bytes: bytes.into(), off: 0 });
 			},
 		}
 	}

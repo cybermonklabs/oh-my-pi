@@ -49,7 +49,9 @@ pub use crate::bash::syntax::{
 	ast::*,
 	features::{AliasLookup, Features, NO_ALIASES, NoAliases},
 	json::to_json,
-	parser::{ParseError, ParseErrorKind, Parser, Resume, TextMode, parse_text},
+	parser::{
+		ParseError, ParseErrorKind, Parser, Resume, TextMode, parse_completion_words, parse_text,
+	},
 	print::{PrintStyle, command_string, print, print_list},
 	span::{NodeId, Pos, Span},
 };

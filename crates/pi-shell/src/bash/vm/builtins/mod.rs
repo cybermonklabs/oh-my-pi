@@ -80,6 +80,8 @@ pub enum Need {
 	/// Run this command substitution ([`super::expand::Stop::Sub`]), then
 	/// run the builtin again.
 	Sub(super::expand::Stop),
+	/// Parse and run a raw completion command in a captured child shell.
+	Command(BString),
 }
 
 impl From<StoreError> for Need {
@@ -259,7 +261,7 @@ impl<'a, 'c> Ctx<'a, 'c> {
 			assoc,
 		) {
 			Ok(v) => Ok(Ok(v)),
-			Err(super::expand::Stop::Fail(d) | super::expand::Stop::Fatal(d)) => Ok(Err(d)),
+			Err(super::expand::Stop::Fail(d)) => Ok(Err(d)),
 			Err(super::expand::Stop::Store(e)) => Err(Need::Store(e)),
 			// A substitution or probe to run first.
 			Err(sub) => Err(Need::Sub(sub)),

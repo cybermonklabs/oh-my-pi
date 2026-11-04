@@ -3125,6 +3125,7 @@ pub fn let_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	for a in args {
 		match expand::arith_let(ctx.k, ctx.cx, ctx.vp, a, expanded) {
 			Ok(v) => last = v,
+			Err(d @ Diag::Unbound { .. }) => return Err(super::Need::Sub(expand::Stop::Fatal(d))),
 			// An error in a subscript abandons the rest of the line, under
 			// `bash -c` the whole string (bash's `top_level_cleanup` before
 			// `jump_to_top_level (DISCARD)` in `array_expand_index`).
