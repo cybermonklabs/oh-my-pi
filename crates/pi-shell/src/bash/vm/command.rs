@@ -294,10 +294,6 @@ pub fn exec(
 			seq:  k.next_cmd,
 		};
 		k.next_cmd += 1;
-		if on {
-			let data = EventData::CmdStart { node_kind: NodeKind::Simple };
-			k.emit_op_at(cx, vp, op.node, data, t0);
-		}
 		let sc = scratch(vp);
 		let state = match sc.spare_exec.take() {
 			Some(mut e) => {
@@ -308,6 +304,14 @@ pub fn exec(
 			None => Box::new(ExecState::new(tag, t0)),
 		};
 		sc.exec = Some(state);
+		if on {
+			let data = EventData::CmdStart { node_kind: NodeKind::Simple };
+			k.emit_op_at(cx, vp, op.node, data, t0);
+		}
+	}
+	if k.mask.bits() != 0 {
+		let tag = st(vp).tag;
+		vp.fds.set_command_tag(Some(tag));
 	}
 	let cmd = &unit.cmds[op.a as usize];
 	loop {
@@ -1260,7 +1264,9 @@ fn expand(
 				}
 				return Some(Flow::Discard(1));
 			}
-			if k.mask.contains(crate::bash::event::EventKind::Assign) {
+			if k.mask.contains(crate::bash::event::EventKind::Assign)
+				&& matches!(name.as_slice(), b"BASH_ALIASES" | b"BASH_CMDS" | b"DIRSTACK" | b"RANDOM")
+			{
 				let scope = assign_scope(vp);
 				let cut = &shown[..shown.len().min(256)];
 				k.emit_op(cx, vp, node, EventData::Assign {
@@ -1283,6 +1289,7 @@ fn expand(
 				state::scope_set(&mut k.root, cx.store, vp, top, other, Some(var.clone()));
 			}
 			state::scope_set(&mut k.root, cx.store, vp, top, &name, Some(var));
+			builtins::emit_assignment_at(k, cx, vp, &name, Level::Dynamic, node);
 		}
 		// bash's `sv_path` runs for a temporary `PATH` too.
 		if !assign_only
@@ -3267,7 +3274,7 @@ fn ksh_autoload(
 	// The body runs at once: lower what the definition deferred.
 	let lowered = ir::function_from_source_at(&src, mode, feat, 0).and_then(|f| {
 		if f.body.deferred.is_some() {
-			ir::materialize(&f.body)
+			ir::materialize(&f.body, k.mask.contains(crate::bash::event::EventKind::UnitCompiled))
 		} else {
 			Some(Arc::unwrap_or_clone(f.body))
 		}
@@ -3592,10 +3599,16 @@ fn load_body(
 	mode: crate::bash::ids::ModeId,
 ) -> Result<Option<Arc<Unit>>, StoreError> {
 	if let Some(unit) = k.engine.cached(&unit_id) {
+		exec::announce(k, cx, vp.vpid, vp.runs.front(), &unit, unit.line);
 		return Ok(Some(unit));
 	}
 	k.clock_stale();
-	match super::frames::load_unit(&k.engine, cx.store, unit_id) {
+	match super::frames::load_unit(
+		&k.engine,
+		cx.store,
+		unit_id,
+		k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
+	) {
 		Ok(u) => {
 			exec::announce(k, cx, vp.vpid, vp.runs.front(), &u, u.line);
 			return Ok(Some(u));
@@ -3936,7 +3949,9 @@ pub fn call_anon(
 	let body = if let Some(u) = k.engine.cached(&f.body.id) {
 		u
 	} else if f.body.deferred.is_some() {
-		let Some(b) = ir::materialize(&f.body) else {
+		let Some(b) =
+			ir::materialize(&f.body, k.mask.contains(crate::bash::event::EventKind::UnitCompiled))
+		else {
 			let what = "an anonymous function body that cannot be lowered";
 			k.diag(cx, vp, line, crate::bash::diag::Diag::Unsupported { what: what.into() });
 			return Flow::Discard(1);
@@ -4984,19 +4999,10 @@ fn sigpipe_ignored(store: &mut dyn StateStore, vp: &Vproc) -> bool {
 
 /// Report the command and leave the op (or transfer control).
 fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
-	let sc = vp
-		.frames
-		.last_mut()
-		.and_then(|f| f.scratch.take())
-		.expect("exec scratch");
-	let e = sc.exec.as_ref().expect("exec");
+	let e = st(vp);
 	let (status, t0, control, force_errexit) = (e.status, e.t0, e.control, e.force_errexit);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	let own_command = e.tag.vpid == vp.vpid;
-	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
-	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
-		print_exit_value(k, vp, cx, status);
-	}
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -5007,6 +5013,18 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		let dur_ns = if t0 > 0 { end.saturating_sub(t0) } else { 0 };
 		let data = EventData::CmdEnd { status, dur_ns, pipestatus: &[] };
 		k.emit_op_at(cx, vp, op.node, data, end);
+	}
+	let sc = vp
+		.frames
+		.last_mut()
+		.and_then(|f| f.scratch.take())
+		.expect("exec scratch");
+	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
+	if k.mask.bits() != 0 {
+		vp.fds.set_command_tag(None);
+	}
+	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		print_exit_value(k, vp, cx, status);
 	}
 	if force_errexit
 		&& status != 0

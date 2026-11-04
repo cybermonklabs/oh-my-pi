@@ -721,7 +721,12 @@ fn compgen_wordlist(ctx: &mut Ctx<'_, '_>, list: &[u8]) -> Result<Vec<BString>, 
 	let unit = ctx
 		.k
 		.engine
-		.text_unit(list, crate::bash::vm::TextKind::Completion(ifs), mode_of(ctx.vp))
+		.text_unit(
+			list,
+			crate::bash::vm::TextKind::Completion(ifs),
+			mode_of(ctx.vp),
+			ctx.k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
+		)
 		.map_err(|e| Need::Sub(Stop::Fail(Diag::Syntax { msg: e.msg })))?;
 	let mut words = Vec::new();
 	let mut ex = Expander::new(ctx.k, ctx.cx, ctx.vp, &mut ctx.log, true, ctx.line);

@@ -82,7 +82,7 @@ pub use self::{
 	trap::hard_ignore,
 	vars::{
 		Lhs, assign, assign_loop_var, assign_special_prefix, declare_line, define_function,
-		parse_compound, prefix_value, set_value,
+		emit_assignment, emit_assignment_at, parse_compound, prefix_value, set_value,
 	},
 	zsh_vars::assign_zsh_loop_var,
 };

@@ -244,7 +244,12 @@ pub fn poll(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<Flow> {
 		let mode = exec::mode_of(vp);
 		let result = k
 			.engine
-			.text_unit(b"${PS4@P}", TextKind::HereDoc, mode)
+			.text_unit(
+				b"${PS4@P}",
+				TextKind::HereDoc,
+				mode,
+				k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
+			)
 			.ok()
 			.and_then(|unit| unit.words.last().cloned().map(|word| (unit, word)))
 			.map(|(unit, word)| {
