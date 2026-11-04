@@ -641,9 +641,6 @@ fn release_fifo_after(path: PathBuf, after: Duration) -> impl Drop {
 /// three runs of each: exactly this line, exit 20. Before, the read or the
 /// open did not observe the cancellation: the bash tool gave up on the
 /// command with nothing printed, and `timeout` waited for it indefinitely.
-/// There is no peer here to report before this run, so it reports without
-/// waiting out rsync's 400 ms grace; sleeping it out put the line past the
-/// window of a host that stops collecting output when the command returns.
 #[cfg(unix)]
 #[test]
 fn cancelling_a_batch_on_a_fifo_reports_the_signal() {
@@ -666,25 +663,17 @@ fn cancelling_a_batch_on_a_fifo_reports_the_signal() {
 		let rescue = release_fifo_after(fifo.clone(), Duration::from_secs(10));
 		let (mut host, cap) = crate::host::Host::for_test_owning("rsync", Vec::new(), dir.path());
 		let cancel = host.cancel_flag_for_test();
-		let (sent, cancelled_at) = std::sync::mpsc::channel();
 		let canceller = std::thread::spawn(move || {
 			std::thread::sleep(Duration::from_millis(300));
 			cancel.store(true, Ordering::Relaxed);
-			sent.send(Instant::now()).unwrap();
 		});
 		let parsed = Rsync::try_parse_from(["rsync", "--"].into_iter().chain(args.iter().copied())).unwrap();
 		let started = Instant::now();
 		let code = crate::host::run_caught::<Rsync>(parsed, &mut host);
 		let took = started.elapsed();
-		let ended = Instant::now();
 		canceller.join().unwrap();
-		let after = ended.saturating_duration_since(cancelled_at.recv().unwrap());
 		drop((rescue, held));
 		assert!(took < Duration::from_secs(5), "{case}: {took:?}");
-		// Nothing here reports before this run, so it must not wait out
-		// rsync's grace: a host that stops collecting a cancelled command's
-		// output when the command returns never saw the line below.
-		assert!(after < super::SIGNAL_GRACE, "{case}: the report came {after:?} after the cancellation");
 		assert_eq!(code, RERR_SIGNAL, "{case}: {}", cap.err());
 		assert_eq!(
 			cap.err(),
@@ -692,6 +681,64 @@ fn cancelling_a_batch_on_a_fifo_reports_the_signal() {
 			"{case}"
 		);
 	}
+}
+
+/// A `--read-batch` cancelled while it is streaming a FIFO, mid-transfer and
+/// waiting for the batch's last bytes, reports its trailer inside rsync's
+/// 400 ms grace. Here the run has no peer to report first, so it reports at
+/// once. A review found it sleeping that grace anyway, and a host that stops
+/// collecting a cancelled command's output soon after the cancellation lost
+/// the trailer. rsync 3.5.1 itself (`LC_ALL=C`, a 196,927-byte batch with its
+/// last 16 bytes held back, SIGTERM 0.6 s in, three runs) ends 1.01 s in
+/// with exit 20, printing `... (code 20) at rsync.c(874) [generator=3.5.1]`
+/// and then its receiver child's line, because it does have a child to wait
+/// for.
+#[cfg(unix)]
+#[test]
+fn a_cancelled_streamed_batch_reports_inside_the_grace() {
+	use std::io::Write as _;
+
+	use clap::Parser as _;
+	let dir = tempfile::tempdir().unwrap();
+	let src = dir.path().join("src");
+	fs::create_dir(&src).unwrap();
+	for i in 0..3u8 {
+		fs::write(src.join(format!("f{i}")), (0..65536u32).map(|n| (n.wrapping_mul(31) as u8) ^ i).collect::<Vec<u8>>()).unwrap();
+	}
+	let (code, _, err) = run(&["-a", "--only-write-batch=real", "src/", "d0/"], dir.path());
+	assert_eq!((code, err.as_str()), (0, ""));
+	let batch = fs::read(dir.path().join("real")).unwrap();
+	let fifo = dir.path().join("fifo");
+	assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+	let (release, released) = std::sync::mpsc::channel::<()>();
+	let writer = {
+		let fifo = fifo.clone();
+		std::thread::spawn(move || {
+			let mut file = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+			let _ = file.write_all(&batch[..batch.len() - 16]);
+			// Held open, the batch's last bytes never sent, until the run is over.
+			let _ = released.recv_timeout(Duration::from_secs(10));
+		})
+	};
+	let (mut host, cap) = crate::host::Host::for_test_owning("rsync", Vec::new(), dir.path());
+	let cancel = host.cancel_flag_for_test();
+	let (sent, cancelled_at) = std::sync::mpsc::channel();
+	let canceller = std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(300));
+		cancel.store(true, Ordering::Relaxed);
+		sent.send(Instant::now()).unwrap();
+	});
+	let parsed = Rsync::try_parse_from(["rsync", "--", "-a", "--read-batch=fifo", "dst/"]).unwrap();
+	let code = crate::host::run_caught::<Rsync>(parsed, &mut host);
+	let ended = Instant::now();
+	canceller.join().unwrap();
+	let after = ended.saturating_duration_since(cancelled_at.recv().unwrap());
+	let _ = release.send(());
+	writer.join().unwrap();
+	let err = cap.err();
+	assert!(after < super::SIGNAL_GRACE, "the report came {after:?} after the cancellation: {err}");
+	assert_eq!(code, RERR_SIGNAL, "{err}");
+	assert!(err.contains("received SIGINT, SIGTERM, or SIGHUP (code 20) at rsync.c(874)"), "{err}");
 }
 
 /// A cancelled client stops its remote shell with SIGUSR1, as rsync 3.5.1's
