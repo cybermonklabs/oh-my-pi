@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
-import type { RawSseEvent } from "../types";
+import type { DispatchHold, RawSseEvent } from "../types";
+import { dispatchWhenOpen } from "../utils/dispatch-hold";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { notifyRawSseEvent } from "../utils/sse-debug";
 import {
@@ -46,7 +47,12 @@ export interface ResponsesWebSocketTimeouts {
 	idleTimeoutMs?: number;
 }
 
-export type ResponsesWebSocketExchange = { send: Record<string, unknown> } | { receive: true };
+/**
+ * What {@link ResponsesWebSocketConnection.streamRequest} puts on the wire. `hold`
+ * is the caller's dispatch hold, awaited after the request-debug dump and
+ * immediately before the frame goes out, in the same synchronous step.
+ */
+export type ResponsesWebSocketExchange = { send: Record<string, unknown>; hold?: DispatchHold } | { receive: true };
 
 export interface ResponsesWebSocketControlFrames {
 	consume(frame: Record<string, unknown>): boolean | Error;
@@ -140,6 +146,11 @@ export class ResponsesWebSocketConnection {
 	#lastInboundAt = 0;
 	#lastPingAt = 0;
 	#lastSeenResponseId?: string;
+	/**
+	 * Observer reports for inbound frames that arrived while {@link sendControl}
+	 * was handing a frame to the socket; set only during that call.
+	 */
+	#reportsAfterSend?: (() => void)[];
 
 	constructor(options: ResponsesWebSocketConnectionOptions) {
 		this.#options = options;
@@ -371,11 +382,11 @@ export class ResponsesWebSocketConnection {
 			const payload = typeof data === "string" ? data : "";
 			const raw = [`: ws ← (parse-error: ${reason})`];
 			if (payload) raw.push(`data: ${payload}`);
-			notifyRawSseEvent(this.#streamObserver, { event: "parse_error", data: payload, raw });
+			this.#reportInbound(observer => notifyRawSseEvent(observer, { event: "parse_error", data: payload, raw }));
 			this.#push(new ResponsesWebSocketTransportError("protocol", "stream", String(error), { cause: error }));
 			return;
 		}
-		notifyFrame(this.#streamObserver, parsed, text, "←");
+		this.#reportInbound(observer => notifyFrame(observer, parsed, text, "←"));
 		const control = this.#options.controlFrames?.consume(parsed);
 		if (control instanceof Error) {
 			if (this.#activeRequest) this.#push(control);
@@ -424,7 +435,12 @@ export class ResponsesWebSocketConnection {
 				this.#debugResponseLog = debugSession
 					? await debugSession.openResponseLog("WebSocket 101 Switching Protocols", this.#handshakeHeaders)
 					: undefined;
-				this.sendControl(exchange.send);
+				// The debug dump above outlasts a `/pause` engaged while it runs, and
+				// this frame is what the provider bills. It goes out in the same
+				// synchronous step as the hold's last check, so a pause landing after
+				// the hold answered still stops it.
+				const frame = exchange.send;
+				await dispatchWhenOpen(exchange.hold, signal, () => this.sendControl(frame));
 			}
 			let sawFirstEvent = false;
 			let lastProgressAt = Date.now();
@@ -509,25 +525,52 @@ export class ResponsesWebSocketConnection {
 		}
 	}
 
+	/**
+	 * Hand `frame` to the socket, then tell the raw-stream observer of it.
+	 * Callers run this in the same synchronous step as a dispatch hold's last
+	 * check, and the observer is caller code: told before the send, it could
+	 * close the gate on a frame that goes out anyway, and it would hear of a
+	 * frame the socket then refused. A send that throws tells it nothing.
+	 */
 	sendControl(frame: Record<string, unknown>): void {
 		const payload = JSON.stringify(frame);
-		notifyFrame(this.#streamObserver, frame, payload, "→");
 		const socket = this.#socket;
 		if (!socket || socket.readyState !== WebSocket.OPEN || this.#closedError) {
 			throw new ResponsesWebSocketTransportError("unavailable", "stream", "websocket connection is unavailable", {
 				cause: this.#closedError?.cause,
 			});
 		}
+		const arrived: (() => void)[] = [];
+		this.#reportsAfterSend = arrived;
 		try {
-			socket.send(payload);
-		} catch (error) {
-			throw new ResponsesWebSocketTransportError(
-				"send",
-				"stream",
-				`websocket send failed: ${error instanceof Error ? error.message : String(error)}`,
-				{ cause: error },
-			);
+			try {
+				socket.send(payload);
+			} catch (error) {
+				throw new ResponsesWebSocketTransportError(
+					"send",
+					"stream",
+					`websocket send failed: ${error instanceof Error ? error.message : String(error)}`,
+					{ cause: error },
+				);
+			}
+			notifyFrame(this.#streamObserver, frame, payload, "→");
+		} finally {
+			this.#reportsAfterSend = undefined;
+			for (const report of arrived) report();
 		}
+	}
+
+	/**
+	 * Tell the raw-stream observer of an inbound frame. One that arrives while
+	 * {@link sendControl} is handing a frame to the socket is told right after
+	 * that frame instead: a socket that delivers its reply within `send` must
+	 * not have the reply reported before the frame it answers.
+	 */
+	#reportInbound(notify: (observer: (event: RawSseEvent) => void) => void): void {
+		const observer = this.#streamObserver;
+		if (!observer) return;
+		if (this.#reportsAfterSend) this.#reportsAfterSend.push(() => notify(observer));
+		else notify(observer);
 	}
 
 	#retire(error: ResponsesWebSocketTransportError, reason: string): void {

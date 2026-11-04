@@ -300,8 +300,8 @@ describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 
 		await sessionLoader.visitEntriesFromFileStream(file, () => {}, {
 			maxBytes: 1024 * 1024,
-			onBytesConsumed: bytes => {
-				bytesRead += bytes;
+			onChunk: (chunk: Uint8Array) => {
+				bytesRead += chunk.byteLength;
 			},
 		});
 

@@ -105,6 +105,7 @@ export interface Args {
 	noUi?: boolean;
 	autoApprove?: boolean;
 	approvalMode?: ApprovalMode;
+	reduceMotion?: "off" | "on" | "strict";
 	messages: string[];
 	fileArgs: string[];
 	/** Extension-registered flags this parse recognized — name to value. */

@@ -916,6 +916,16 @@ impl Host {
 		self.fail(code);
 	}
 
+	/// Writes `<name>: <message>` to stderr and leaves the exit status alone:
+	/// a disclosure, not a failure.
+	///
+	/// Written through a duplicate of the stream, so a caller holding the
+	/// host immutably can report something it could not determine.
+	pub fn warn(&self, message: impl std::fmt::Display) {
+		let mut stderr = self.stderr_clone();
+		let _ = writeln!(stderr, "{}: {message}", self.name);
+	}
+
 	/// Writes `<name>: <message>` followed by GNU's `Try '<name> --help' for
 	/// more information.`, records exit status `code`, and returns it.
 	///
@@ -1632,6 +1642,16 @@ impl ChildEnv {
 			.envs(self.env.iter().map(|(k, v)| (k, v)))
 			.stderr(std::process::Stdio::piped());
 		Ok(command)
+	}
+
+	/// The shell's working directory, for something that resolves a relative
+	/// path the way the shell's children do without starting one.
+	///
+	/// `Err` when the shell sits in a virtual directory, which no process can
+	/// enter.
+	#[cfg(unix)]
+	pub fn native_cwd(&self) -> io::Result<&Path> {
+		native_working_dir(&self.filesystem, &self.cwd)
 	}
 
 	/// Drains a child's piped stderr into the command's standard error on a

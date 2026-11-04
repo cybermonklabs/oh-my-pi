@@ -57,6 +57,8 @@ export interface ActiveRetryFallbackState {
 	role: string;
 	originalSelector: string;
 	originalThinkingLevel: ConfiguredThinkingLevel | undefined;
+	/** Picks the primary's level when it is restored (see `InitialRetryFallbackState`). */
+	resolveOriginalThinkingLevel?: (primary: Model) => ConfiguredThinkingLevel | undefined;
 	lastAppliedFallbackThinkingLevel: ConfiguredThinkingLevel | undefined;
 	pinned: boolean;
 	/**
@@ -89,11 +91,39 @@ export interface ServingModel {
 const RETRY_BACKOFF_MAX_DELAY_MS = 8_000;
 const RETRY_BACKOFF_JITTER_RATIO = 0.25;
 
+/** Exponential backoff for `attempt`, capped; the jitter policies below shape it. */
+function cappedRetryBackoffMs(baseDelayMs: number, attempt: number): number {
+	return Math.min(Math.max(0, baseDelayMs) * 2 ** Math.max(0, attempt - 1), RETRY_BACKOFF_MAX_DELAY_MS);
+}
+
 /** Calculates capped exponential retry delay with downward jitter. */
 export function calculateRetryBackoffDelayMs(baseDelayMs: number, attempt: number): number {
-	const cappedDelayMs = Math.min(Math.max(0, baseDelayMs) * 2 ** Math.max(0, attempt - 1), RETRY_BACKOFF_MAX_DELAY_MS);
-	const jitter = 1 - Math.random() * RETRY_BACKOFF_JITTER_RATIO;
-	return cappedDelayMs * jitter;
+	return cappedRetryBackoffMs(baseDelayMs, attempt) * (1 - Math.random() * RETRY_BACKOFF_JITTER_RATIO);
+}
+
+/**
+ * Capped exponential retry delay with **full** jitter: uniform over
+ * `[0, cap)` rather than the narrow `[0.75, 1]` band
+ * {@link calculateRetryBackoffDelayMs} uses.
+ *
+ * For a retry every session of a fleet reaches at the same instant — a shared
+ * gateway restarting drops every open stream in the same millisecond — the
+ * narrow band concentrates the replay into a window a quarter of the delay
+ * wide, which is a wall for the host coming back up. Full jitter spreads the
+ * same requests across the whole window. Only right where the delay is a
+ * plain backoff with no provider-stated timing to honour.
+ */
+export function calculateFullJitterRetryDelayMs(baseDelayMs: number, attempt: number): number {
+	return cappedRetryBackoffMs(baseDelayMs, attempt) * Math.random();
+}
+
+/** Parses a fallback selector, keeping its configured thinking level (`auto` included). */
+function parseSelectorModelString(selector: string, modelLookup?: Pick<RetryFallbackModelLookup, "find">) {
+	return parseModelString(selector, {
+		allowMaxSuffix: true,
+		allowAutoAlias: true,
+		isLiteralModelId: (provider, id) => modelLookup?.find(provider, id) !== undefined,
+	});
 }
 
 /** Parses a configured retry fallback selector. */
@@ -103,11 +133,7 @@ export function parseRetryFallbackSelector(
 ): RetryFallbackSelector | undefined {
 	const trimmed = selector.trim();
 	if (!trimmed) return undefined;
-	const parsed = parseModelString(trimmed, {
-		allowMaxSuffix: true,
-		allowAutoAlias: true,
-		isLiteralModelId: (provider, id) => modelLookup?.find(provider, id) !== undefined,
-	});
+	const parsed = parseSelectorModelString(trimmed, modelLookup);
 	if (!parsed) return undefined;
 	return {
 		raw: trimmed,
@@ -666,4 +692,74 @@ export function findRetryFallbackCandidates(
 		return options?.wrapAround ? [...candidatesAfter, ...chain.slice(0, baseIndex)] : candidatesAfter;
 	}
 	return chain;
+}
+
+/** Outcome of {@link resolveUnavailableModelReplacement} when the requested model's own chain owns it. */
+export type UnavailableModelReplacement =
+	| {
+			kind: "replaced";
+			/** The requested model's own key: exact `provider/id`, else a `provider/*` or prefixed wildcard. */
+			chainKey: string;
+			model: Model;
+			/**
+			 * The candidate's own thinking level, else the requested selector's
+			 * configured level, `auto` included (bare entries inherit it).
+			 */
+			thinkingLevel: ConfiguredThinkingLevel | undefined;
+			/** The requested selector's configured level, restored if the requested model later serves again. */
+			requestedThinkingLevel: ConfiguredThinkingLevel | undefined;
+	  }
+	| {
+			kind: "refused";
+			/** The requested model's own key: exact `provider/id`, else a `provider/*` or prefixed wildcard. */
+			chainKey: string;
+			/** Every candidate the chain named, none usable; empty for an empty chain. */
+			tried: string[];
+	  };
+
+/**
+ * Replace a requested model that cannot serve at startup — absent from the
+ * catalog, or without working credentials — through its own
+ * `retry.fallbackChains` entry: an exact `provider/id` key, else the most
+ * specific `provider/*` or prefixed wildcard key. Wildcard entries in that
+ * chain expand against the requested model, as they do for a runtime failure,
+ * and `resolveCandidate` resolves each entry to a model the way runtime
+ * recovery does (routes, fuzzy ids). The first candidate `isUsable` accepts
+ * replaces it; candidates are tried in chain order and the walk stops there,
+ * so a check that runs a credential lookup runs it only up to the chosen
+ * entry. An empty chain, or one with no usable candidate, refuses it.
+ * Role and `default` chains do not decide startup: `undefined` when no key of
+ * the model's own owns it, so the caller keeps its own default.
+ */
+export async function resolveUnavailableModelReplacement(
+	context: RetryFallbackResolutionContext,
+	requested: { selector: string; model: Model | undefined },
+	resolveCandidate: (selector: RetryFallbackSelector) => Model | undefined,
+	isUsable: (candidate: Model, selector: RetryFallbackSelector) => Promise<boolean>,
+): Promise<UnavailableModelReplacement | undefined> {
+	const chainKey = resolveRetryFallbackChainKey(context, requested.selector, requested.model);
+	if (chainKey === undefined || !isRetryFallbackModelKey(chainKey)) return undefined;
+	const candidates = findRetryFallbackCandidates(context, chainKey, requested.selector, requested.model, {
+		allowMissingPrimary: true,
+	});
+	// The configured level, not the concrete retry selector's: a bare entry
+	// keeps a requested `auto`, as runtime fallback recovery does.
+	const requestedThinkingLevel = parseSelectorModelString(
+		requested.selector.trim(),
+		context.modelLookup,
+	)?.thinkingLevel;
+	for (const candidate of candidates) {
+		const model = resolveCandidate(candidate);
+		if (!model) continue;
+		if (requested.model && model.provider === requested.model.provider && model.id === requested.model.id) continue;
+		if (!(await isUsable(model, candidate))) continue;
+		return {
+			kind: "replaced",
+			chainKey,
+			model,
+			thinkingLevel: candidate.thinkingLevel ?? requestedThinkingLevel,
+			requestedThinkingLevel,
+		};
+	}
+	return { kind: "refused", chainKey, tried: candidates.map(candidate => candidate.raw) };
 }

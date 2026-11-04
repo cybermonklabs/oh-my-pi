@@ -32,6 +32,8 @@ import { AUTO_THINKING, getConfiguredThinkingLevelMetadata, getThinkingLevelMeta
 const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const EMPTY_STRING_ARRAYS_RECORD: Record<string, string[]> = {};
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["wait"];
+/** Mirrors the catalog's `server-side-fallback-models` chain for Fable/Mythos on first-party Anthropic. */
+const DEFAULT_ANTHROPIC_SERVER_SIDE_FALLBACK_MODELS: string[] = ["claude-opus-5"];
 
 /** Scope of the resume picker's current-folder list. */
 export const cfgSessionWorktreeScope = register({
@@ -885,6 +887,27 @@ export const cfgRetryUsageReservePolicy = register({
 	},
 });
 
+export const cfgRetryUsageReserveConfirmTimeout = register({
+	id: "retry.usageReserveConfirmTimeout",
+	type: "number",
+	default: 0,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Reserve Confirm Timeout",
+		description:
+			"Seconds the reserve-reached prompt waits before keeping the current model. 0 waits for a person forever.",
+		condition: "usageAwareFallbackEnabled",
+		options: [
+			{ value: "0", label: "Wait forever", description: "Hold the turn until someone answers" },
+			{ value: "60", label: "60 seconds" },
+			{ value: "300", label: "5 minutes" },
+			{ value: "900", label: "15 minutes" },
+			{ value: "3600", label: "1 hour" },
+		],
+	},
+});
+
 export const cfgRetryFallbackChains = register({
 	id: "retry.fallbackChains",
 	type: "record",
@@ -932,6 +955,7 @@ export const cfgRetry = combine({
 	usageAwareFallback: cfgRetryUsageAwareFallback,
 	usageReservePct: cfgRetryUsageReservePct,
 	usageReservePolicy: cfgRetryUsageReservePolicy,
+	usageReserveConfirmTimeout: cfgRetryUsageReserveConfirmTimeout,
 });
 
 /** Retry/backoff policy ({@link cfgRetry}). */
@@ -947,6 +971,19 @@ export const cfgProvidersAnthropicServerSideFallback = register({
 		label: "Anthropic Server-Side Fallback (Fable 5)",
 		description:
 			"When a Claude Fable 5 / Mythos 5 request is blocked by Anthropic's safety classifier, retry it on Claude Opus 5 server-side (Anthropic `server-side-fallback-2026-06-01` beta). Opt-in — leaving this off preserves the pre-fallback behavior for every request.",
+	},
+});
+
+export const cfgProvidersAnthropicServerSideFallbackModels = register({
+	id: "providers.anthropic.serverSideFallbackModels",
+	type: "array",
+	default: DEFAULT_ANTHROPIC_SERVER_SIDE_FALLBACK_MODELS,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Anthropic Server-Side Fallback Chain",
+		description:
+			'Ordered bare Anthropic model ids forwarded as the server-side `fallbacks` chain when Anthropic Server-Side Fallback is enabled, e.g. ["claude-opus-5", "claude-opus-4-8"]. These are API model ids, not provider/model selectors, and each must be in the requested model\'s allowed fallback models. Unset follows the catalog chain for the model (Claude Opus 5 for Fable/Mythos). An empty list sends no fallbacks even when the toggle is on; the API accepts at most three entries, so longer chains use the first three.',
 	},
 });
 
