@@ -3326,6 +3326,9 @@ pub fn detach_stopped(
 		k.stops.remove(&vp.vpid);
 		k.stops.insert(vpid, signal);
 	}
+	// Bash stop_pipeline makes this newly stopped foreground job current,
+	// even when another stopped job was preferred while it was inserted.
+	vp.jobs.set_current(number);
 	k.spawned.push(Box::new(child));
 }
 
