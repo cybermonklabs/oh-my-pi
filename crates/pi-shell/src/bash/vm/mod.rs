@@ -1196,6 +1196,11 @@ impl Shell {
 		k.root
 			.set_var(cx.store, b"SHLVL", Some(Var::scalar((shlvl + 1).to_string(), Attrs::EXPORT)));
 		startup_vars(&mut k, cx, &init)?;
+		// Interactive Bash expands aliases by default. Explicit startup
+		// options below can still disable it.
+		if init.interactive && !zsh {
+			k.root.set_option(cx.store, OptId::ExpandAliases, true);
+		}
 		// bash's `sv_strict_posix` at import: `POSIXLY_CORRECT` (or
 		// `POSIX_PEDANTIC`) in the environment turns POSIX mode on; explicit
 		// options below still win.

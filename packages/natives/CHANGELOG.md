@@ -4,9 +4,9 @@
 
 ### Fixed
 
+- Fixed interactive shells starting with alias expansion disabled; explicit startup options can still turn it off ([#17825](https://github.com/can1357/oh-my-pi/pull/17825) by [@sjawhar](https://github.com/sjawhar))
 - Fixed the bash tool's shell reading the aliases in a process substitution (`<(…)`, `>(…)`) when the command was read rather than when the substitution runs; as in Bash, its text is read again a command at a time when it runs, so an alias defined on one of its lines applies to the next ([#17825](https://github.com/can1357/oh-my-pi/pull/17825) by [@sjawhar](https://github.com/sjawhar))
 - Fixed the output minimizer letting a command on a `;` or `&&` line change the aliases and parser options of the commands after it on that line; as in Bash, the whole line is read with the aliases it began with ([#17825](https://github.com/can1357/oh-my-pi/pull/17825) by [@sjawhar](https://github.com/sjawhar))
-- Fixed an alias ending in a blank letting the next word expand as an alias when the alias that expanded to it ends in no blank (`alias a=b b='echo '`, then `a w`); as in Bash, the outermost alias decides ([#17825](https://github.com/can1357/oh-my-pi/pull/17825) by [@sjawhar](https://github.com/sjawhar))
 ### Changed
 
 - Made the bash tool's shell faster on string appends (`s+=x`), sourcing files full of function definitions (each body compiles on first call), quoted `"$var"`/`"$1"` arguments and file redirections

@@ -1,10 +1,10 @@
-//! The bash tool's shell substitutes aliases exactly when Bash 5.2.21 does:
+//! The bash tool's shell substitutes aliases with Bash 5.3 read timing:
 //! only while `expand_aliases` is on, and with the alias table and option in
 //! force when each complete command (an input line, or a compound command
 //! spanning lines) is read, after the commands before it have run.
 //!
-//! Each test names the Bash 5.2.21 row it reproduces; the expected output is
-//! what `bash -c` printed for the same text.
+//! Expected output comes from `bash -c`; Bash 5.2.21 agrees except for the
+//! chained trailing-blank alias test, which follows Bash 5.3.
 #![cfg(unix)]
 
 use std::path::Path;
@@ -531,11 +531,12 @@ async fn redirection_after_a_blank_ending_alias_ends_the_check() {
 	assert_eq!(out, "w\n");
 }
 
-/// Y12: when aliases end together, the outermost decides about the next word.
+/// Bash 5.3 keeps a nested alias's trailing-blank check when the outer value
+/// has no blank. Bash 5.2.21 instead prints `w` for this input.
 #[tokio::test]
-async fn outermost_alias_decides_whether_the_next_word_is_looked_up() {
+async fn nested_alias_ending_in_a_blank_keeps_the_next_word_eligible() {
 	let out = run("shopt -s expand_aliases; alias a=b b='echo ' w=word\na w").await;
-	assert_eq!(out, "w\n");
+	assert_eq!(out, "word\n");
 }
 
 /// Y9: after an alias that expands to nothing, the next word is the command
