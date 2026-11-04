@@ -234,6 +234,9 @@ impl Engine {
 							})
 					},
 					TextKind::Compound => crate::bash::trace::syntax::UnitSyntax::restore(u),
+					// Completion roots are word lists, not a command or one word.
+					// Their executable substitutions keep their own IR nodes.
+					TextKind::Completion(_) => None,
 				};
 				if let Some(syntax) = syntax {
 					let _ = u.trace_syntax.set(Arc::new(syntax));
