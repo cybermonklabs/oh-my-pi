@@ -244,6 +244,10 @@ impl ExtProc for CountedExt {
 		self.ext.exit_status()
 	}
 
+	fn signal_pid(&mut self, sig: Signal) -> io::Result<()> {
+		self.ext.signal_pid(sig)
+	}
+
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		self.ext.signal(sig)
 	}

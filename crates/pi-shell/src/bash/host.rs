@@ -535,6 +535,9 @@ pub trait ExtProc: Send {
 	}
 	/// Signal the process group (Unix) or Job Object (Windows).
 	fn signal(&mut self, sig: Signal) -> io::Result<()>;
+	/// Signal this external by pid, without its process group on Unix.
+	/// Windows retains its Job Object signal mapping.
+	fn signal_pid(&mut self, sig: Signal) -> io::Result<()>;
 	/// Stop the process group (job pause).
 	fn stop(&mut self) -> io::Result<()>;
 	/// Continue after [`ExtProc::stop`].

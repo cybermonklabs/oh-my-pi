@@ -136,6 +136,10 @@ impl ExtProc for Sleeper {
 		}
 	}
 
+	fn signal_pid(&mut self, sig: Signal) -> io::Result<()> {
+		self.signal(sig)
+	}
+
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		self.killed = Some(sig);
 		if let Some(waker) = self.waker.take() {
@@ -227,6 +231,10 @@ impl ExtProc for Exited {
 
 	fn poll_wait(&mut self, _cx: &mut Context<'_>) -> Poll<ExitStatus> {
 		Poll::Ready(ExitStatus::Exited(self.0))
+	}
+
+	fn signal_pid(&mut self, sig: Signal) -> io::Result<()> {
+		self.signal(sig)
 	}
 
 	fn signal(&mut self, _sig: Signal) -> io::Result<()> {

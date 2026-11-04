@@ -439,4 +439,7 @@ pub enum SigTarget {
 	/// [`Lineage::label`](crate::bash::Lineage::label) is this (nonzero)
 	/// label: a host callout's child tree, like a process group.
 	Label(u32),
+	/// The external owned by one vproc, with PID-directed (not group)
+	/// delivery on Unix. This does not signal the interpreting vproc.
+	Process(Vpid),
 }

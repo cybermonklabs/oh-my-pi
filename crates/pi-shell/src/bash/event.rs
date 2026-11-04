@@ -614,6 +614,8 @@ pub enum WaitKey {
 	/// it, before the job table is read (bash learns of a child's end from
 	/// `SIGCHLD` at once; here the child's vproc must run).
 	Settle,
+	/// Yield after an already-triggered wake, without awaiting a child end.
+	Yield,
 }
 
 /// Progress or annotation from a host callout

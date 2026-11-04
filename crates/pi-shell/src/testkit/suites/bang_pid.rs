@@ -1,9 +1,9 @@
 //! A background job that is just one external program is known by that
 //! program's OS pid, as in bash (whose subshell `exec`s it): `$!`, `jobs
 //! -l`/`-p`/`-x` show it, and `kill`, `wait`, `wait -n -p` and `disown`
-//! take it. Compound jobs keep their virtual pids. A signal to such a job
-//! (or to a pipeline job's stages) reaches the program, which may trap it,
-//! and the job ends with the program's real status once it exited. A lone
+//! take it. Compound jobs keep virtual pids; pipelines name their last
+//! stage. Signals to such a job or a pipeline stage reach the program,
+//! which may trap them, and the job waits for its real exit status. A lone
 //! external's redirection whose open would wait (a FIFO) is left to the
 //! process when the host allows it (`Host::child_opens`), so `$!` never
 //! waits on that rendezvous. References: bash 5.3.20 (`bash -c`).
@@ -108,6 +108,10 @@ impl ExtProc for Fake {
 		}
 	}
 
+	fn signal_pid(&mut self, sig: Signal) -> io::Result<()> {
+		self.signal(sig)
+	}
+
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		self.signals.lock().push((self.pid, sig));
 		if matches!(sig, Signal::Term | Signal::Kill) && self.status.is_none() {
@@ -179,11 +183,10 @@ fn assignments_redirections_and_exec_keep_the_os_pid() {
 	assert_eq!(out, "5001 5002 5003 5004\n");
 }
 
-// Failure mode: a compound job, a builtin, a function running its external
-// as one command of its own, a pipeline or a subshell group reports the
-// pid of one of the programs it runs.
+// Failure mode: compound/builtin jobs borrow an external's pid, or a
+// pipeline fails to name its last process.
 #[test]
-fn compound_and_builtin_jobs_keep_virtual_pids() {
+fn compound_jobs_stay_virtual_but_pipelines_name_their_last_stage() {
 	let world = World::new();
 	let (out, _) = run(
 		world.host(),
@@ -192,12 +195,13 @@ fn compound_and_builtin_jobs_keep_virtual_pids() {
 	);
 	let pids: Vec<&str> = out.split_whitespace().collect();
 	assert_eq!(pids.len(), 6, "{out}");
-	assert!(pids.iter().all(|p| is_virtual(p)), "{out}");
+	assert!(pids[..3].iter().chain(&pids[4..]).all(|p| is_virtual(p)), "{out}");
+	assert_eq!(pids[3], "5004", "the pipeline names its last external: {out}");
 }
 
 // Failure mode: `wait -n -p` names the virtual pid while `$!` showed the OS
-// pid, `disown` of the OS pid finds no job, or `kill`/`wait` of a disowned
-// job's OS pid no longer reach it.
+// pid, disown of that pid finds no job, or an individual disown fails to
+// preserve the saved status 0 of a job that was running.
 #[test]
 fn wait_p_and_disown_take_the_os_pid() {
 	let world = World::new();
@@ -206,7 +210,8 @@ fn wait_p_and_disown_take_the_os_pid() {
 		"/x/true & p=$!; wait -n -p v; echo \"$v $p\"; /x/sleeper & q=$!; disown \"$q\"; echo \
 		 \"disown=$? jobs=$(jobs -p)\"; kill \"$q\"; wait \"$q\"; echo $?",
 	);
-	assert_eq!(out, "5001 5001\ndisown=0 jobs=\n143\n");
+	assert_eq!(out, "5001 5001\ndisown=0 jobs=\n0\n");
+	assert_eq!(world.got(FIRST + 1), [Signal::Term], "disown leaves the pid signalable");
 }
 
 // Failure mode: a job whose program traps `TERM` is marked done (143) when

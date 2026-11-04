@@ -186,15 +186,33 @@ fn target(ctx: &mut Ctx<'_, '_>, arg: &[u8], send: Send) -> Result<Option<SigTar
 			if stage.status.is_some() {
 				return Err(TargetError::NoSuchProcess);
 			}
-			if let Some(&pid) = ctx.k.external_pids.get(&stage.vpid) {
-				return ctx
-					.cx
-					.host
-					.signal_process(pid as i32, send.signal())
-					.map(|()| None)
-					.map_err(TargetError::Host);
+			if ctx.k.external_pids.contains_key(&stage.vpid) {
+				return Ok(Some(SigTarget::Process(stage.vpid)));
 			}
 			return Ok(Some(SigTarget::Vpid(stage.vpid)));
+		}
+		if let Some(vpid) = ctx
+			.k
+			.external_pids
+			.iter()
+			.find_map(|(&v, &p)| (p == native).then_some(v))
+		{
+			if ctx.k.external_status.contains_key(&vpid)
+				|| matches!(
+					ctx.k.proc_state(ctx.cx.store, vpid),
+					Some(crate::bash::vm::ProcState::Exited(_))
+				) {
+				return Err(TargetError::NoSuchProcess);
+			}
+			return Ok(Some(SigTarget::Process(vpid)));
+		}
+		if ctx
+			.vp
+			.jobs
+			.by_pid(native)
+			.is_some_and(|j| matches!(j.state, JobState::Done(_)))
+		{
+			return Err(TargetError::NoSuchProcess);
 		}
 		if native < base && native != ctx.k.shell_pid {
 			return ctx
@@ -252,25 +270,21 @@ fn signal_job(
 	if !control {
 		if let Some(stages) = job.stages.as_deref() {
 			for stage in stages.iter().filter(|s| s.status.is_none()) {
-				if let Some(&pid) = ctx.k.external_pids.get(&stage.vpid) {
-					ctx.cx
-						.host
-						.signal_process(pid as i32, send.signal())
-						.map_err(TargetError::Host)?;
+				if ctx.k.external_pids.contains_key(&stage.vpid) {
+					if let Some(sig) = send.signal() {
+						ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Process(stage.vpid), sig);
+					}
 				} else if let Some(sig) = send.signal() {
 					ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Vpid(stage.vpid), sig);
 				}
 			}
 			return Ok(None);
 		}
-		if let Some(pid) = job.os_pid {
-			return ctx
-				.cx
-				.host
-				.signal_process(pid as i32, send.signal())
-				.map(|()| None)
-				.map_err(TargetError::Host);
-		}
+		return Ok(Some(if job.os_pid.is_some() {
+			SigTarget::Process(job.vpid)
+		} else {
+			SigTarget::Vpid(job.vpid)
+		}));
 	}
 	if stopped && send == Send::Signal(Signal::Cont) {
 		job.state = JobState::Running;

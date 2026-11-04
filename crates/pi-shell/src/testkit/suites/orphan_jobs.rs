@@ -53,6 +53,10 @@ impl ExtProc for Sleeper {
 		}
 	}
 
+	fn signal_pid(&mut self, sig: Signal) -> io::Result<()> {
+		self.signal(sig)
+	}
+
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		self.signals.lock().push(sig);
 		self.killed = Some(sig);

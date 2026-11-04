@@ -724,6 +724,11 @@ impl ExtProc for WinProc {
 		self.tracker.poll(cx)
 	}
 
+	fn signal_pid(&mut self, sig: Signal) -> io::Result<()> {
+		// Windows retains the existing Job Object signal mapping.
+		self.signal(sig)
+	}
+
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		match sig {
 			Signal::Kill => {

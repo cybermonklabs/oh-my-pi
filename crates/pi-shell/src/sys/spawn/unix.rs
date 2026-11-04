@@ -1326,6 +1326,20 @@ impl ExtProc for UnixProc {
 		self.tracker.exit_status()
 	}
 
+	fn signal_pid(&mut self, sig: Signal) -> io::Result<()> {
+		if sig == Signal::Cont {
+			self.tracker.set_stopped(None);
+		}
+		// The handle keeps the child unreaped, so its pid cannot be recycled.
+		let _life = self.tracker.lock();
+		// SAFETY: the owned child pid and platform signal are valid scalars.
+		if unsafe { libc::kill(self.pid, i32::from(sig.number(Platform::current()))) } == 0 {
+			Ok(())
+		} else {
+			Err(io::Error::last_os_error())
+		}
+	}
+
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		if sig == Signal::Cont {
 			self.tracker.set_stopped(None);

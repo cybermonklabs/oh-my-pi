@@ -735,6 +735,10 @@ impl ExtProc for Observed {
 		self.child.exit_status()
 	}
 
+	fn signal_pid(&mut self, sig: Signal) -> io::Result<()> {
+		self.child.signal_pid(sig)
+	}
+
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		self.child.signal(sig)
 	}

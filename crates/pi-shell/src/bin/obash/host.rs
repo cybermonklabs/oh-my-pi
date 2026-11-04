@@ -413,6 +413,10 @@ impl ExtProc for SignalsOnExit {
 		self.child.exit_status()
 	}
 
+	fn signal_pid(&mut self, sig: pi_shell::bash::Signal) -> io::Result<()> {
+		self.child.signal_pid(sig)
+	}
+
 	fn signal(&mut self, sig: pi_shell::bash::Signal) -> io::Result<()> {
 		self.child.signal(sig)
 	}

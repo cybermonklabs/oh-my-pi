@@ -446,6 +446,9 @@ pub struct Kernel {
 	pub native_dirty:    bool,
 	/// Reused ownership set for pruning native job metadata, not imaged.
 	native_live:         std::collections::HashSet<Vpid>,
+	/// Stopped-stage counts before a native observation batch (waitchld's
+	/// last_stopped_job survives later continuations in that same batch).
+	native_stopped:      Vec<(Vpid, Vpid, usize)>,
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:           Vec<proc::Bang>,
@@ -526,6 +529,7 @@ impl Kernel {
 			detached_jobs: Vec::new(),
 			native_dirty: false,
 			native_live: std::collections::HashSet::new(),
+			native_stopped: Vec::new(),
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			deferrals: Vec::new(),
@@ -680,7 +684,7 @@ impl Kernel {
 		}
 		vp.jobs
 			.iter()
-			.any(|j| !j.inherited && j.state == proc::JobState::Running)
+			.any(|j| !j.inherited && !matches!(j.state, proc::JobState::Done(_)))
 			|| vp
 				.last_bg
 				.vpid()
@@ -1571,7 +1575,6 @@ impl Shell {
 		let start = cx.host.now_ns();
 		let mut ops = 0u32;
 		loop {
-			self.poll_job_stops(cx);
 			if let Some(err) = self.k.root.take_fault() {
 				self.fail_all(cx, &err);
 			}
@@ -1594,6 +1597,8 @@ impl Shell {
 				self.k.ctl.park(self.k.ctl.wakes());
 				return Step::Paused;
 			}
+			// Deliver queued CONT before observing the old native STOP again.
+			self.poll_job_stops(cx);
 			if !self.procs.iter().any(|p| p.has_work()) {
 				return Step::Idle;
 			}
@@ -1779,6 +1784,7 @@ impl Shell {
 		let Some(i) = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v)) else {
 			return;
 		};
+		resume_waiter(&mut self.procs[i]);
 		let job = self.procs[i].jobs.by_vpid_mut(vpid);
 		let background = job.is_some();
 		if let Some(job) = job {
@@ -1838,6 +1844,26 @@ impl Shell {
 		if !monitor {
 			return;
 		}
+		self.k.native_stopped.clear();
+		if self.k.stops.len() > 1 {
+			for p in &self.procs {
+				for job in p
+					.jobs
+					.iter()
+					.filter(|j| matches!(j.state, proc::JobState::Stopped(_)))
+				{
+					let count = job.stages.as_deref().map_or(0, |stages| {
+						stages
+							.iter()
+							.filter(|s| s.status.is_none() && self.k.stops.contains_key(&s.vpid))
+							.count()
+					});
+					if count > 1 {
+						self.k.native_stopped.push((p.vpid, job.vpid, count));
+					}
+				}
+			}
+		}
 		let mut changed = false;
 		let mut tcx = std::task::Context::from_waker(&self.k.waker);
 		for p in &mut self.procs {
@@ -1882,15 +1908,27 @@ impl Shell {
 					}
 				}
 				let stopped = if let Some(stages) = job.stages.as_deref() {
-					if stages
+					let running = stages
 						.iter()
-						.any(|s| s.status.is_none() && !self.k.stops.contains_key(&s.vpid))
-					{
-						None
-					} else {
+						.any(|s| s.status.is_none() && !self.k.stops.contains_key(&s.vpid));
+					let stopped_count = stages
+						.iter()
+						.filter(|s| s.status.is_none() && self.k.stops.contains_key(&s.vpid))
+						.count();
+					if running
+						&& self.k.native_stopped.iter().any(|&(owner, v, old)| {
+							owner == p.vpid && v == job.vpid && old > stopped_count
+						}) {
+						// Bash waitchld saw this pipeline still stopped after its
+						// first continuation, before the rest continued.
+						current = Some(job.number);
+					}
+					if !running || matches!(job.state, proc::JobState::Stopped(_)) {
 						stages
 							.iter()
 							.find_map(|s| self.k.stops.get(&s.vpid).copied())
+					} else {
+						None
 					}
 				} else {
 					self.k.stops.get(&job.vpid).copied()
@@ -1957,6 +1995,7 @@ impl Shell {
 	/// settle; do not wait for a child that is still executing shell code.
 	fn settle_pending(&self, wakes: u64) -> bool {
 		self.procs.iter().any(|p| {
+			if p.stopped { return false; }
 			let Some(b) = p.blocked.as_ref() else { return false; };
 			match b.key {
 				WaitKey::Ext { .. } => b.at != wakes || (p.frames.iter().any(|f|
@@ -2188,6 +2227,29 @@ impl Shell {
 			.k
 			.emit(cx, root, None, EventData::Signal { sig, target });
 		let platform = self.k.engine.config().platform;
+		if let SigTarget::Process(vpid) = target {
+			let mut parent = None;
+			let mut continued = false;
+			if let Some(p) = self.procs.iter_mut().find(|p| p.vpid == vpid) {
+				if transparent(p, false) == Some(true) && matches!(sig, Signal::Kill | Signal::Cont) {
+					p.stopped = false;
+					parent = p.parent;
+					continued = sig == Signal::Cont;
+				}
+				for frame in &mut p.frames {
+					if let Some(Live::Ext(ext)) = frame.scratch.as_mut().map(|sc| &mut sc.live) {
+						let _ = ext.signal_pid(sig);
+					}
+				}
+			}
+			if continued {
+				self.job_changed(cx, vpid, None);
+			}
+			if let Some(p) = parent.and_then(|v| self.procs.iter_mut().find(|p| p.vpid == v)) {
+				resume_waiter(p);
+			}
+			return;
+		}
 		let job_root = match target {
 			SigTarget::Job(id) => self
 				.procs
@@ -2199,7 +2261,7 @@ impl Shell {
 		};
 		let mut hits: Vec<usize> = (0..self.procs.len())
 			.filter(|&i| match target {
-				SigTarget::Vpid(v) => self.procs[i].vpid == v,
+				SigTarget::Vpid(v) | SigTarget::Process(v) => self.procs[i].vpid == v,
 				SigTarget::All => true,
 				SigTarget::Job(_) => job_root.is_some_and(|v| self.in_job(self.procs[i].vpid, v)),
 				SigTarget::Label(l) => l != 0 && self.procs[i].lineage.label == l,
@@ -2225,7 +2287,11 @@ impl Shell {
 			let terminating = trap.is_none() && sig.default_action() == DefaultAction::Terminate;
 			// A signal to the shell PID does not also target its foreground child.
 			// A terminating child is signaled once by `kill`, not here and there.
-			if target != SigTarget::Vpid(root.0) && !terminating && trap.is_none() {
+			if target != SigTarget::Vpid(root.0)
+				&& !terminating
+				&& trap.is_none()
+				&& !matches!(sig.default_action(), DefaultAction::Stop | DefaultAction::Continue)
+			{
 				for frame in &mut self.procs[i].frames {
 					if let Some(sc) = frame.scratch.as_mut() {
 						match &mut sc.live {
@@ -2256,14 +2322,21 @@ impl Shell {
 							}
 						}
 					}
-					if stopped {
-						// Continued so the program can act on the signal (bash
-						// `kill_pid` continues a stopped job it signals).
-						set_stopped(p, false);
-						changed.push((p.vpid, None));
+					if stopped && sig == Signal::Kill {
+						// KILL cannot leave the program stopped. Resume its VM
+						// wait, not its process group; TERM/HUP get CONT only
+						// from Bash kill_pid's explicit continuation.
+						p.stopped = false;
 					}
 					continue;
 				}
+			}
+			if sig.default_action() == DefaultAction::Continue {
+				let p = &mut self.procs[i];
+				if p.stopped {
+					changed.push((p.vpid, None));
+				}
+				set_stopped(p, false);
 			}
 			if let Some(ignored) = trap {
 				if !ignored {
@@ -2281,15 +2354,18 @@ impl Shell {
 				continue;
 			}
 			match sig.default_action() {
-				DefaultAction::Terminate => self.kill(cx, i, sig, sig.exit_status(platform)),
-				DefaultAction::Stop | DefaultAction::Continue => {
-					let stop = sig.default_action() == DefaultAction::Stop;
-					let p = &mut self.procs[i];
-					if p.stopped != stop {
-						changed.push((p.vpid, stop.then_some(sig)));
-					}
-					set_stopped(p, stop);
+				DefaultAction::Terminate => {
+					self.k.signaled.insert(self.procs[i].vpid);
+					self.kill(cx, i, sig, sig.exit_status(platform));
 				},
+				DefaultAction::Stop => {
+					let p = &mut self.procs[i];
+					if !p.stopped {
+						changed.push((p.vpid, Some(sig)));
+					}
+					set_stopped(p, true);
+				},
+				DefaultAction::Continue => {},
 				DefaultAction::Ignore => {},
 			}
 		}
@@ -2539,10 +2615,14 @@ fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	let sc = frame.scratch.as_ref()?;
 	let op = unit.ops.get(frame.pc as usize)?;
 	let code_at = |pc: u32| unit.ops.get(pc as usize).map(|op| op.code);
+	let ends_at = |pc: u32| {
+		code_at(pc) == Some(ir::Opcode::SubExit)
+			|| matches!(frame.kind, FrameKind::StoppedJob { end } if end == pc)
+	};
 	match (&sc.live, op.code) {
 		(Live::Ext(_), ir::Opcode::Exec) => {
 			let exec = sc.exec.as_ref().is_some_and(|e| e.exec_as.is_some());
-			(exec || code_at(frame.pc + 1) == Some(ir::Opcode::SubExit)).then_some(true)
+			(exec || ends_at(frame.pc + 1)).then_some(true)
 		},
 		(_, ir::Opcode::Spawn) if children && !sc.children.is_empty() => {
 			let spawn = unit.spawns.get(op.a as usize)?;
@@ -2552,9 +2632,31 @@ fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 				(ir::SpawnKind::Subshell | ir::SpawnKind::Pipeline, _) => spawn.end,
 				_ => return None,
 			};
-			(code_at(end) == Some(ir::Opcode::SubExit)).then_some(false)
+			ends_at(end).then_some(false)
 		},
 		_ => None,
+	}
+}
+
+/// A pipeline waiter is not another process in Bash's job. Once a stage
+/// resumes or exits, let it collect that stage even if a group STOP had
+/// paused the waiter. Do not resume an interpreting parent shell.
+fn resume_waiter(p: &mut Vproc) {
+	if transparent(p, true) != Some(false) {
+		return;
+	}
+	let frame = &p.frames[0];
+	let pipeline = frame
+		.unit
+		.as_ref()
+		.and_then(|u| {
+			u.ops
+				.get(frame.pc as usize)
+				.and_then(|op| u.spawns.get(op.a as usize))
+		})
+		.is_some_and(|s| s.kind == ir::SpawnKind::Pipeline);
+	if pipeline || matches!(frame.kind, FrameKind::StoppedJob { .. }) {
+		p.stopped = false;
 	}
 }
 

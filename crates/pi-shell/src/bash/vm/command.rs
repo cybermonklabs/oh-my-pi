@@ -1597,9 +1597,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		let exec = st(vp).exec_as.is_some();
 		bang_dispatch(k, vp.vpid, &target, exec);
 		if k.bangs.len() != pending {
-			// The alias wake already happened: let `$!` readers resume before
-			// this virtual command completes, as a forked Bash child can.
-			return Some(Flow::Block(WaitKey::Proc(vp.vpid)));
+			// The alias wake already happened. Unlike a child wait, this
+			// runnable yield must not delay the parent's job-table settle.
+			return Some(Flow::Block(WaitKey::Yield));
 		}
 	}
 	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
@@ -3075,6 +3075,16 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				} else if let (false, Some(JobState::Stopped(sig))) =
 					(force, vp.jobs.by_vpid(v).map(|j| j.state))
 				{
+					// Bash wait_for still waits for its first process if it
+					// continued while another stage kept the job stopped.
+					if let Some(stages) = vp.jobs.by_vpid(v).and_then(|j| j.stages.as_deref())
+						&& stages.iter().any(|s| k.stops.contains_key(&s.vpid))
+						&& let Some(first) = stages.first()
+						&& first.status.is_none()
+						&& !k.stops.contains_key(&first.vpid)
+					{
+						return Some(Flow::Block(WaitKey::Proc(first.vpid)));
+					}
 					// bash `wait_for` applies WSTOPSIG to the first process,
 					// including its exit-status byte when that stage exited.
 					last = vp
@@ -3125,7 +3135,10 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			let done: Vec<crate::bash::ids::Vpid> = vp
 				.jobs
 				.iter()
-				.filter(|j| matches!(j.state, JobState::Done(_)) && !last.is(j.vpid))
+				.filter(|j| {
+					matches!(j.state, JobState::Done(_))
+						&& (!last.is(j.vpid) || k.signaled.contains(&j.vpid))
+				})
 				.map(|j| j.vpid)
 				.collect();
 			for v in done {
@@ -3242,6 +3255,14 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 		None | Some(Awaited::Stopped) => st(vp).status,
 	};
 	if reaped {
+		if vp.transient {
+			k.external_status.insert(vp.vpid, status);
+		} else {
+			k.external_pids.remove(&vp.vpid);
+			k.external_status.remove(&vp.vpid);
+			k.stops.remove(&vp.vpid);
+			k.signaled.remove(&vp.vpid);
+		}
 		super::owe_chld(k, cx, vp, false);
 	}
 	// Tested first: a function call's wait holds none, and the assignment
