@@ -144,6 +144,7 @@ pub fn subscript_value(
 ) -> Result<i64, Diag> {
 	arith_value(k, cx, vp, text).map_err(|d| match d {
 		Diag::Arith { expr, msg, token } => Diag::ArithSubscript { expr, msg, token },
+		Diag::Readonly { name } => Diag::ReadonlySubscript { name },
 		d => d,
 	})
 }
@@ -1795,7 +1796,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			if !in_scope && global {
 				if compound_word {
 					// The array assignment fails first, bare.
-					ctx.diag(Diag::Readonly { name: name.into() });
+					ctx.report(Diag::Readonly { name: name.into() })?;
 				}
 				ctx.err(Diag::Readonly { name: name.into() });
 				status = 1;
@@ -1828,9 +1829,9 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				match func.filter(|_| array_flag) {
 					Some(f) => {
 						let f = String::from_utf8_lossy(&f).into_owned();
-						ctx.diag(d.by(f));
+						ctx.report(d.by(f))?;
 					},
-					None => ctx.diag(d),
+					None => ctx.report(d)?,
 				}
 			} else if value.is_some()
 				&& matches!(kind, DeclareKind::Readonly | DeclareKind::Export)
@@ -1838,7 +1839,10 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			{
 				// A plain value through `readonly`/`export` fails as an
 				// assignment would.
-				ctx.diag(d);
+				ctx.report(d)?;
+				// `set_or_show_attributes` returns EX_BADASSIGN: a POSIX
+				// special builtin exits with 1, not FORCE_EOF's mapped 127.
+				ctx.usage_error = true;
 			} else {
 				ctx.err(d);
 			}
@@ -2270,7 +2274,7 @@ pub fn indexed_array_target(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<Option
 		return Ok(Some(strip));
 	};
 	if var.attrs.contains(Attrs::READONLY) {
-		ctx.diag(Diag::Readonly { name: target });
+		ctx.report(Diag::Readonly { name: target })?;
 		return Ok(None);
 	}
 	if !strip && (matches!(var.value, VarValue::Assoc(_)) || var.attrs.contains(Attrs::ASSOC)) {
@@ -2701,8 +2705,7 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			ctx.err(Diag::Usage {
 				msg: format!("{}: cannot unset: readonly variable", name.as_bstr()).into(),
 			});
-			// Fatal to a posix shell.
-			ctx.usage_error = true;
+			ctx.utility_error = true;
 			status = 1;
 			continue;
 		}
@@ -3134,7 +3137,7 @@ pub fn let_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			},
 			// bash prints a readonly assignment without the `let: ` prefix.
 			Err(d @ Diag::Readonly { .. }) => {
-				ctx.diag(d);
+				ctx.report(d)?;
 				return done(1);
 			},
 			Err(d) => {

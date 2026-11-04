@@ -80,6 +80,8 @@ pub enum Need {
 	/// Run this command substitution ([`super::expand::Stop::Sub`]), then
 	/// run the builtin again.
 	Sub(super::expand::Stop),
+	/// Bash `report_error` exited before the builtin could complete.
+	Reported(i32),
 }
 
 impl From<StoreError> for Need {
@@ -162,36 +164,41 @@ pub const fn done(status: i32) -> R {
 
 /// What a builtin runs against.
 pub struct Ctx<'a, 'c> {
-	pub k:           &'a mut Kernel,
-	pub cx:          &'a mut Cx<'c>,
-	pub vp:          &'a mut Vproc,
-	probes:          &'a [(Probe, ProbeResult)],
+	pub k:                   &'a mut Kernel,
+	pub cx:                  &'a mut Cx<'c>,
+	pub vp:                  &'a mut Vproc,
+	probes:                  &'a [(Probe, ProbeResult)],
 	/// Output and diagnostics in order.
-	pub chunks:      Vec<Chunk>,
+	pub chunks:              Vec<Chunk>,
 	/// Script line (diagnostics, `$LINENO`).
-	pub line:        u32,
+	pub line:                u32,
 	/// The builtin's name (diagnostic prefix).
-	pub name:        &'static str,
+	pub name:                &'static str,
 	/// argv indexes of words written as compound assignments
 	/// (`declare a=(…)`).
-	pub compound:    Vec<u32>,
+	pub compound:            Vec<u32>,
 	/// The builtin failed in a way fatal to a posix shell when it is a
 	/// special builtin not run through `command`: bash's `EX_USAGE` (a bad
 	/// option, a non-numeric argument, an invalid name) or a `.` file that
 	/// cannot be read.
-	pub usage_error: bool,
+	pub usage_error:         bool,
+	/// Bash EX_UTILERROR: a special builtin is fatal only outside a
+	/// tested context (`special_builtin_failed` in execute_command_internal).
+	pub utility_error:       bool,
+	/// `command` called in a tested context (`builtin_ignoring_errexit`).
+	pub ignore_report_error: bool,
 	/// Replay log of the substitutions the builtin ran
 	/// ([`Slot::Builtin`](super::proc::Slot)).
-	pub log:         Vec<super::proc::Atom>,
+	pub log:                 Vec<super::proc::Atom>,
 	/// Replay position in `log` (0 at each run).
-	pub log_cursor:  usize,
+	pub log_cursor:          usize,
 	/// argv indexes (counting argv\[0\]) of fields from words written as
 	/// array references, `d[$k]` (bash's `W_ARRAYREF`): `unset` takes their
 	/// key as is.
-	pub arrayref:    Vec<u32>,
+	pub arrayref:            Vec<u32>,
 	/// Times the builtin ran again after a frame it pushed returned
 	/// ([`Control::Resume`]).
-	pub resumed:     u32,
+	pub resumed:             u32,
 }
 
 impl<'a, 'c> Ctx<'a, 'c> {
@@ -213,6 +220,8 @@ impl<'a, 'c> Ctx<'a, 'c> {
 			name,
 			compound: Vec::new(),
 			usage_error: false,
+			utility_error: false,
+			ignore_report_error: false,
 			log: Vec::new(),
 			log_cursor: 0,
 			arrayref: Vec::new(),
@@ -311,6 +320,18 @@ impl<'a, 'c> Ctx<'a, 'c> {
 	/// Queue a diagnostic without the builtin prefix.
 	pub fn diag(&mut self, d: Diag) {
 		self.chunks.push(Chunk::Diag(d));
+	}
+
+	/// Bash `report_error`, unlike `builtin_error`, exits immediately under
+	/// `set -e`, including in a tested function, before any later binding.
+	pub fn report(&mut self, d: Diag) -> Result<(), Need> {
+		self.diag(d);
+		if !self.ignore_report_error
+			&& let Some(status) = super::exec::reported_error_exit(self.k, self.cx, self.vp)
+		{
+			return Err(Need::Reported(status));
+		}
+		Ok(())
 	}
 
 	/// A variable as this vproc sees it.

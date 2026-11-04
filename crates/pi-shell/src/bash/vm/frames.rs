@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 29;
+pub const FRAMES_VERSION: u32 = 30;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -323,6 +323,7 @@ struct FrameImage {
 	return_trap_local: bool,
 	err_reported:      bool,
 	ignore_errexit:    bool,
+	pending_flow:      Option<super::exec::Flow>,
 	subshell_line:     Option<u32>,
 	getopts:           super::proc::GetoptsState,
 }
@@ -529,6 +530,7 @@ impl Shell {
 					return_trap_local: f.return_trap_local,
 					err_reported: f.err_reported,
 					ignore_errexit: f.ignore_errexit,
+					pending_flow: f.pending_flow.clone(),
 					subshell_line: f.subshell_line,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
 				});
@@ -973,6 +975,7 @@ impl Shell {
 				frame.return_trap_local = f.return_trap_local;
 				frame.err_reported = f.err_reported;
 				frame.ignore_errexit = f.ignore_errexit;
+				frame.pending_flow = f.pending_flow;
 				frame.subshell_line = f.subshell_line;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));

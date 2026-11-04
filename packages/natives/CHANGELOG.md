@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed readonly assignment errors ignoring redirections, continuing past Bash's command-discard boundary, or failing to exit with the correct status under `set -e` and POSIX mode ([#17712](https://github.com/can1357/oh-my-pi/pull/17712) by [@sjawhar](https://github.com/sjawhar))
 - Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
 ### Fixed
 

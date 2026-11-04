@@ -1040,6 +1040,23 @@ pub fn lookup_declared<'a>(
 	var_at(store, vp, name, at)
 }
 
+/// The readonly attribute of a whole-variable assignment target, including
+/// declared-but-unset variables (`do_compound_assignment` in Bash).
+pub fn readonly_target(
+	root: &Root,
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	name: &[u8],
+) -> Result<bool, StoreError> {
+	let target = deref(root, store, vp, name)?;
+	let name = match &target {
+		Deref::To { name, index: None } => name.as_slice(),
+		Deref::Plain => name,
+		Deref::To { index: Some(_), .. } | Deref::Circular => return Ok(false),
+	};
+	Ok(lookup_declared(root, store, vp, name)?.is_some_and(|v| v.attrs.contains(Attrs::READONLY)))
+}
+
 /// A token for a cache of something derived from the locale variables
 /// `names` (each `LANG` or `LC_*`) as `vp` sees them: equal tokens mean
 /// equal values. `None` when one of them is bound in `vp`'s scopes or

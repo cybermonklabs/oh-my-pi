@@ -88,6 +88,9 @@ pub enum Stop {
 	Wait(WaitKey),
 	/// An expansion error: print it, abandon the current command.
 	Fail(Diag),
+	/// `expand_declaration_argument` failed its internal declaration:
+	/// DISCARD in any mode, without report_error's errexit shortcut.
+	Discard(Diag),
 	/// A fatal expansion error (`${x?}`, `set -u`): a non-interactive shell
 	/// exits.
 	Fatal(Diag),
@@ -333,6 +336,31 @@ impl<'e, 'c> Expander<'e, 'c> {
 			return self.fields_into(unit, w, out, None);
 		}
 		self.fields_into(unit, w, out, Some(globs))
+	}
+
+	/// Bash `fix_assignment_words`: a declaration argument after literal
+	/// `command` words in POSIX mode is unsplit, unglobbed and tilde-expanded
+	/// as an assignment, even when POSIX mode changed after parsing.
+	pub fn declaration_fields(
+		&mut self,
+		unit: &Arc<Unit>,
+		w: &Word,
+		out: &mut Vec<BString>,
+	) -> X<()> {
+		if let Some(alts) = &w.braces
+			&& state::option(&mut self.k.root, self.cx.store, self.vp, OptId::Braceexpand)?
+		{
+			for &alt in &**alts {
+				self.declaration_fields(unit, &unit.words[alt as usize], out)?;
+			}
+			return Ok(());
+		}
+		let mut sink = Sink::Scalar(Vec::with_capacity(lit_len(w)));
+		self.word_tilde(unit, w, &mut sink, false, false, Tilde::EqColon)?;
+		if let Sink::Scalar(value) = sink {
+			out.push(BString::from(value));
+		}
+		Ok(())
 	}
 
 	fn fields_into(
@@ -1910,12 +1938,17 @@ impl<'e, 'c> Expander<'e, 'c> {
 		&mut self,
 		unit: &Arc<Unit>,
 		w: &Word,
+		declaration: bool,
 		args: &[BString],
 		prefix: &mut Vec<u8>,
 		out: &mut Vec<CompoundElem>,
 		globs: &mut Vec<(u32, BString)>,
 	) -> X<bool> {
-		let (Some(Part::Compound(elems)), WordKind::DeclArg) = (w.parts.last(), w.kind) else {
+		let Some(Part::Compound(elems)) = w
+			.parts
+			.last()
+			.filter(|_| declaration || w.kind == WordKind::DeclArg)
+		else {
 			return Ok(false);
 		};
 		let mut sink = Sink::Scalar(Vec::new());
@@ -1938,6 +1971,33 @@ impl<'e, 'c> Expander<'e, 'c> {
 			self.kvpair(unit, elems, true, out)?;
 		} else {
 			self.compound(unit, elems, out, Some(globs))?;
+		}
+		// Bash `expand_declaration_argument` calls make_internal_declare
+		// before the public builtin. An array attribute on a readonly global
+		// fails there and jumps with DISCARD even under set -e or POSIX mode.
+		let array_flag = args
+			.iter()
+			.skip(1)
+			.any(|a| a.first() == Some(&b'-') && a[1..].iter().any(|c| matches!(c, b'a' | b'A')));
+		let global_builtin = args
+			.iter()
+			.find(|a| a.as_slice() != b"command")
+			.is_some_and(|a| matches!(a.as_slice(), b"readonly" | b"export"));
+		if unit.mode.dialect() == crate::bash::ids::Dialect::Bash && array_flag && global_builtin {
+			let end = prefix
+				.iter()
+				.position(|&c| c == b'=')
+				.unwrap_or(prefix.len());
+			let name = prefix[..end].strip_suffix(b"+").unwrap_or(&prefix[..end]);
+			let readonly = state::readonly_target(&self.k.root, self.cx.store, self.vp, name)?;
+			if readonly {
+				let diag = Diag::Readonly { name: name.into() };
+				let diag = match state::func_name(&self.k.root, self.cx.store, self.vp)? {
+					Some(f) => diag.by(String::from_utf8_lossy(&f).into_owned()),
+					None => diag,
+				};
+				return Err(Stop::Discard(diag));
+			}
 		}
 		Ok(true)
 	}
@@ -3774,7 +3834,7 @@ impl arith::Env for Vars<'_, '_> {
 			Err(Stop::Fail(Diag::Unbound { name }) | Stop::Fatal(Diag::Unbound { name })) => {
 				return Err(arith::Error::Unbound { name });
 			},
-			Err(Stop::Fail(d) | Stop::Fatal(d)) => d,
+			Err(Stop::Fail(d) | Stop::Fatal(d) | Stop::Discard(d)) => d,
 			Err(Stop::Store(_)) => Diag::StoreFailed,
 			Err(Stop::Sub { .. } | Stop::ZshSub { .. }) => Diag::Unsupported {
 				what: "command substitution in a subscript met during arithmetic evaluation".into(),
@@ -3805,7 +3865,7 @@ impl arith::Env for Vars<'_, '_> {
 			Err(Stop::Fail(Diag::Unbound { name }) | Stop::Fatal(Diag::Unbound { name })) => {
 				return Err(arith::Error::Unbound { name });
 			},
-			Err(Stop::Fail(d) | Stop::Fatal(d)) => d,
+			Err(Stop::Fail(d) | Stop::Fatal(d) | Stop::Discard(d)) => d,
 			Err(Stop::Store(_)) => Diag::StoreFailed,
 			Err(Stop::Sub { .. } | Stop::ZshSub { .. }) => Diag::Unsupported {
 				what: "command substitution in a subscript met during arithmetic evaluation".into(),

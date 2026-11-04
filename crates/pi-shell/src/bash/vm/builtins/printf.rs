@@ -73,7 +73,10 @@ pub fn printf(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		return done(2);
 	};
 	if format.is_empty() {
-		let ok = vname.is_none_or(|name| bind(ctx, name, AssignValue::Scalar(BString::default())));
+		let ok = match vname {
+			Some(name) => bind(ctx, name, AssignValue::Scalar(BString::default()))?,
+			None => true,
+		};
 		return done(i32::from(!ok));
 	}
 	let cs = locale::charset(ctx.k, ctx.cx.store, ctx.vp);
@@ -103,7 +106,7 @@ pub fn printf(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	};
 	let Fmt { ctx, out, flushed, .. } = f;
 	if let Some(name) = vname {
-		let ok = bind(ctx, name, AssignValue::Scalar(out.into()));
+		let ok = bind(ctx, name, AssignValue::Scalar(out.into()))?;
 		done(if ok { status } else { 1 })
 	} else {
 		ctx.out(&out[flushed..]);

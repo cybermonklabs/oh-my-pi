@@ -584,6 +584,10 @@ pub fn cond_test(
 				k.diag(cx, vp, line, d);
 				return Flow::Discard(1);
 			},
+			Err(Need::Reported(status)) => {
+				report(k, cx, vp, line, chunks);
+				return Flow::Exit(status);
+			},
 			Err(Need::Probe(p)) => match probe::perform(k, cx, vp, &mut sc, &p) {
 				Ok(_) => park(vp, sc),
 				Err(key) => {

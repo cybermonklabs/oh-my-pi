@@ -78,19 +78,19 @@ pub fn getopts(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	ctx.vp.getopts.optind = Some(shown.clone());
 	ctx.vp.getopts.next = next;
 	if let Err(d) = assign(ctx.k, ctx.vp, ctx.cx, b"OPTIND", shown, Level::Dynamic) {
-		ctx.diag(d);
+		ctx.report(d)?;
 	}
 	ctx.vp.getopts.at = optind_scope(ctx)?;
 	match found {
 		Found::End => {
 			unset_optarg(ctx)?;
-			bind(ctx, name, b"?");
+			bind(ctx, name, b"?")?;
 			done(1)
 		},
 		Found::Invalid(c) => {
-			let status = bind(ctx, name, b"?");
+			let status = bind(ctx, name, b"?")?;
 			if silent {
-				set_optarg(ctx, BString::from(vec![c]));
+				set_optarg(ctx, BString::from(vec![c]))?;
 			} else {
 				unset_optarg(ctx)?;
 			}
@@ -98,11 +98,11 @@ pub fn getopts(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		},
 		Found::Missing(c) => {
 			let status = if silent {
-				let status = bind(ctx, name, b":");
-				set_optarg(ctx, BString::from(vec![c]));
+				let status = bind(ctx, name, b":")?;
+				set_optarg(ctx, BString::from(vec![c]))?;
 				status
 			} else {
-				let status = bind(ctx, name, b"?");
+				let status = bind(ctx, name, b"?")?;
 				unset_optarg(ctx)?;
 				status
 			};
@@ -110,10 +110,10 @@ pub fn getopts(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		},
 		Found::Opt(c, arg) => {
 			match arg {
-				Some(arg) => set_optarg(ctx, arg),
+				Some(arg) => set_optarg(ctx, arg)?,
 				None => unset_optarg(ctx)?,
 			}
-			done(bind(ctx, name, &[c]))
+			done(bind(ctx, name, &[c])?)
 		},
 	}
 }
@@ -217,12 +217,12 @@ fn message(ctx: &mut Ctx<'_, '_>, msg: &str, c: u8) {
 
 /// bash `getopts_bind_variable`: 0, 1 for an invalid name, 2 for a
 /// readonly one.
-fn bind(ctx: &mut Ctx<'_, '_>, name: &[u8], value: &[u8]) -> i32 {
+fn bind(ctx: &mut Ctx<'_, '_>, name: &[u8], value: &[u8]) -> Result<i32, Need> {
 	if !is_ident(name) {
 		ctx.err(Diag::InvalidIdent { name: name.into() });
-		return 1;
+		return Ok(1);
 	}
-	match assign(ctx.k, ctx.vp, ctx.cx, name, value.into(), Level::Dynamic) {
+	Ok(match assign(ctx.k, ctx.vp, ctx.cx, name, value.into(), Level::Dynamic) {
 		Ok(()) => 0,
 		// A name reference to no valid name (`declare -n r; getopts x r`):
 		// bash's `sh_invalidid` names the builtin.
@@ -231,16 +231,17 @@ fn bind(ctx: &mut Ctx<'_, '_>, name: &[u8], value: &[u8]) -> i32 {
 			2
 		},
 		Err(d) => {
-			ctx.diag(d);
+			ctx.report(d)?;
 			2
 		},
-	}
+	})
 }
 
-fn set_optarg(ctx: &mut Ctx<'_, '_>, value: BString) {
+fn set_optarg(ctx: &mut Ctx<'_, '_>, value: BString) -> Result<(), Need> {
 	if let Err(d) = assign(ctx.k, ctx.vp, ctx.cx, b"OPTARG", value, Level::Dynamic) {
-		ctx.diag(d);
+		ctx.report(d)?;
 	}
+	Ok(())
 }
 
 /// bash `unbind_variable_noref`: a readonly `OPTARG` stays.

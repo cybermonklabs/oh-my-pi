@@ -37,6 +37,7 @@ use crate::bash::{
 };
 
 /// Result of one op.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Flow {
 	Next,
 	Jump(u32),
@@ -82,7 +83,11 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				None => unblock(k, cx, vp),
 			}
 		}
-		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY && !vp.waiting_foreground() {
+		let transferring = vp.frames.last().is_some_and(|f| f.pending_flow.is_some());
+		if !transferring
+			&& vp.pending_traps != crate::bash::signal::SigSet::EMPTY
+			&& !vp.waiting_foreground()
+		{
 			let pending = vp.pending_traps.iter().find(|sig| {
 				!vp.frames.iter().any(|frame| {
 					matches!(frame.kind, FrameKind::Script {
@@ -106,7 +111,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				}
 			}
 		}
-		if !vp.restore_opts.is_empty() {
+		if !transferring && !vp.restore_opts.is_empty() {
 			for saved in std::mem::take(&mut vp.restore_opts) {
 				if let Err(err) = state::restore_set_options(&mut k.root, cx.store, vp, &saved) {
 					k.fail(err);
@@ -150,7 +155,8 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		let fi = vp.frames.len() - 1;
 		let starts = starts_command(unit, op);
 		let fresh = vp.frames[fi].scratch.is_none();
-		if fresh && starts {
+		let resuming = vp.frames[fi].pending_flow.is_some();
+		if fresh && starts && !resuming {
 			note_command(vp, unit, op);
 		}
 		// bash's DEBUG trap: before a simple command, `[[ ]]`, `(( ))`, each
@@ -169,7 +175,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				),
 				_ => false,
 			};
-		if debug_point && vp.frames[fi].debug_pc != Some(vp.frames[fi].pc) {
+		if debug_point && !resuming && vp.frames[fi].debug_pc != Some(vp.frames[fi].pc) {
 			vp.frames[fi].debug_pc = Some(vp.frames[fi].pc);
 			if pseudo_trap_maybe(k, cx, TrapKey::Debug) {
 				let line = line_of(vp, op.node);
@@ -179,7 +185,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				}
 			}
 		}
-		if fresh && starts {
+		if fresh && starts && !resuming {
 			vp.frames[fi].err_reported = false;
 		}
 		// A cancel trap is a trap frame: none on the stack, no scan.
@@ -196,10 +202,35 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		if k.clock.is_some() && !keeps_clock(op.code) {
 			k.clock_stale();
 		}
-		let flow = dispatch(k, vp, cx, unit, op);
+		let flow = vp.frames[fi]
+			.pending_flow
+			.take()
+			.unwrap_or_else(|| dispatch(k, vp, cx, unit, op));
+		if !vp.out.is_empty()
+			&& matches!(
+				flow,
+				Flow::Exit(_)
+					| Flow::Discard(_)
+					| Flow::Abort(_)
+					| Flow::Return(_)
+					| Flow::Break { .. }
+			) {
+			// Bash's report_error writes before jump_to_top_level unwinds
+			// redirections. Preserve the transfer across a blocked write too.
+			vp.frames[fi].pending_flow = Some(flow);
+			continue;
+		}
 		let ignore_errexit =
 			op.flags & Op::COND != 0 || vp.frames.get(fi).is_some_and(|frame| frame.ignore_errexit);
-		if matches!(flow, Flow::Call) && ignore_errexit {
+		if matches!(flow, Flow::Call)
+			&& ignore_errexit
+			&& !vp
+				.frames
+				.get(fi)
+				.and_then(|f| f.scratch.as_ref())
+				.and_then(|s| s.exec.as_ref())
+				.is_some_and(|e| e.via_builtin)
+		{
 			// Frames the op pushed (function, `eval`, `source`, `${ ;}`)
 			// run in its context.
 			for frame in vp.frames.iter_mut().skip(fi + 1) {
@@ -307,14 +338,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				vp.status = status;
 				// `${ ;}` ends like a function; a subshell of a function
 				// (`( return )`, `$( return )`) exits.
-				let target = vp.frames.iter().rposition(|f| {
-					matches!(
-						f.kind,
-						FrameKind::Function { .. }
-							| FrameKind::NoFork
-							| FrameKind::Script { what: ScriptKind::Source, .. }
-					)
-				});
+				let target = bash_return_target(vp);
 				if let Some(i) = target {
 					if vp.frames[i].kind == FrameKind::NoFork || !return_trap(k, vp, cx, i) {
 						unwind(&mut k.root, cx.store, vp, i);
@@ -348,7 +372,12 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					.frames
 					.iter()
 					.rposition(|f| matches!(f.kind, FrameKind::Script { .. }));
-				if let Some(i) = script {
+				// `parse_and_execute` rethrows DISCARD in a subshell; its
+				// EXIT trap still runs (`execute_in_subshell`).
+				if vp.jobs.subshell || super::subshell_depth(vp) > 0 {
+					exit_shell(k, vp, cx, if script.is_some() { 1 } else { status });
+				} else if let Some(i) = script {
+					vp.status = 1;
 					unwind(&mut k.root, cx.store, vp, i + 1);
 					clear_scratch(&mut k.root, cx.store, vp);
 					truncate(vp, Depths::default());
@@ -502,6 +531,102 @@ fn errexit_on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 			false
 		},
 	}
+}
+
+/// Bash `execute_builtin` disables `exit_immediately_on_error` only for
+/// eval/source/command in a tested context, not for a tested function.
+pub fn builtin_ignoring_errexit(vp: &Vproc) -> bool {
+	vp.frames.iter().any(|f| {
+		let script = f.ignore_errexit
+			&& matches!(f.kind, FrameKind::Script { what: ScriptKind::Eval | ScriptKind::Source, .. });
+		let command = f
+			.scratch
+			.as_ref()
+			.and_then(|s| s.exec.as_ref())
+			.is_some_and(|e| e.via_command && !e.via_builtin)
+			&& (f.ignore_errexit
+				|| f
+					.unit
+					.as_ref()
+					.and_then(|u| u.ops.get(f.pc as usize))
+					.is_some_and(|op| op.flags & Op::COND != 0));
+		script || command
+	})
+}
+
+/// Bash `report_error`: exit before the assignment's DISCARD/FORCE_EOF,
+/// with the previous status (or 1), without delivering ERR.
+pub fn reported_error_exit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Option<i32> {
+	(vp.mode.dialect() == Dialect::Bash && errexit_on(k, cx, vp) && !builtin_ignoring_errexit(vp))
+		.then_some(if vp.status == 0 { 1 } else { vp.status })
+}
+
+/// Bash `run_one_command` maps FORCE_EOF to 127. Subshells retain 1
+/// (`execute_in_subshell`); an ordinary exit/report_error does not map it.
+pub fn force_eof(vp: &Vproc, store: &mut dyn StateStore) -> Flow {
+	if let Some(status) = vp.frames.iter().rev().find_map(|f| match f.kind {
+		FrameKind::Script { what: ScriptKind::Trap { key: TrapKey::Exit, status, .. }, .. } => {
+			Some(status)
+		},
+		_ => None,
+	}) {
+		return Flow::Exit(status);
+	}
+	let signal_trap = vp.frames.iter().any(|f| {
+		matches!(f.kind, FrameKind::Script {
+			what: ScriptKind::Trap { key: TrapKey::Signal(_), .. },
+			..
+		})
+	});
+	let command = (super::subshell_depth(vp) == 0 || signal_trap)
+		&& matches!(
+			state::record(store, vp, Key::Misc(MiscKey::RunOrigin)),
+			Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+		);
+	Flow::Exit(if command { 127 } else { 1 })
+}
+
+/// Bash `executing_command_builtin` also spans eval/source called by it.
+pub fn executing_command_builtin(vp: &Vproc) -> bool {
+	vp.frames.iter().any(|f| {
+		f.scratch
+			.as_ref()
+			.and_then(|s| s.exec.as_ref())
+			.is_some_and(|e| e.via_command)
+	})
+}
+
+/// Bash `_evalfile` restores its return catcher before run_return_trap.
+/// The source frame remains here only to restore its scopes and descriptors.
+pub fn bash_return_target(vp: &Vproc) -> Option<usize> {
+	let completed = if vp.trap_frames == 0 {
+		None
+	} else {
+		vp.frames
+			.iter()
+			.rev()
+			.find_map(|f| match f.kind {
+				FrameKind::Script {
+					what: ScriptKind::Trap { key: TrapKey::Return, return_target, .. },
+					..
+				} => return_target,
+				_ => None,
+			})
+			.filter(|&i| {
+				vp.frames.get(i).is_some_and(|f| {
+					matches!(f.kind, FrameKind::Script { what: ScriptKind::Source, .. })
+				})
+			})
+	};
+	vp.frames.iter().enumerate().rposition(|(i, f)| {
+		Some(i) != completed
+			&& matches!(
+				f.kind,
+				FrameKind::Function { .. }
+					| FrameKind::NoFork
+					| FrameKind::Script { what: ScriptKind::Source, .. }
+			)
+	})
 }
 
 /// Leave the shell with `status` (`exit`, `set -e`): unwind every frame;
@@ -1481,6 +1606,7 @@ fn posix_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 
 /// The flow for an expansion error (the diagnostic is printed).
 pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, stop: Stop) -> Flow {
+	let fatal = matches!(stop, Stop::Fatal(_));
 	match stop {
 		Stop::Sub { .. } | Stop::ZshSub { .. } => unreachable!("handled by the caller"),
 		// `$!` of a job still deciding on its pid: the op runs again (and
@@ -1491,23 +1617,26 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			k.diag(cx, vp, line, Diag::Unsupported { what: "`=cmd` in this expansion".into() });
 			Flow::Discard(1)
 		},
-		// A non-interactive posix shell exits on an expansion error (bash's
-		// `posixly_correct && !interactive_shell`), as on a fatal one.
-		Stop::Fail(d) if !posix_exits(k, cx, vp) => {
+		Stop::Discard(d) => {
 			k.diag(cx, vp, line, d);
 			Flow::Discard(1)
 		},
 		Stop::Fail(d) | Stop::Fatal(d) => {
+			let subscript = matches!(d, Diag::ReadonlySubscript { .. });
+			let readonly = subscript || matches!(d, Diag::Readonly { .. });
 			k.diag(cx, vp, line, d);
-			// bash exits 127 from a `-c` string (`run_one_command`), 1 from a
-			// script and from a subshell (`execute_in_subshell` keeps the
-			// failure status); a nested shell (depth 0) is its own `-c` shell.
-			let command = super::subshell_depth(vp) == 0
-				&& matches!(
-					state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
-					Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-				);
-			Flow::Exit(if command { 127 } else { 1 })
+			if readonly && let Some(status) = reported_error_exit(k, cx, vp) {
+				return Flow::Exit(status);
+			}
+			if subscript {
+				return Flow::Exit(1);
+			}
+			if fatal || posix_exits(k, cx, vp) {
+				force_eof(vp, cx.store)
+			} else {
+				// `parse_and_execute` catches DISCARD with status 1.
+				Flow::Discard(if readonly { 2 } else { 1 })
+			}
 		},
 		Stop::Store(err) => {
 			k.fail(err);
@@ -2197,7 +2326,11 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					} else {
 						d
 					};
+					let readonly = matches!(d, Diag::Readonly { .. });
 					k.diag(cx, vp, line, d);
+					if readonly && let Some(status) = reported_error_exit(k, cx, vp) {
+						return Flow::Exit(status);
+					}
 					vp.status = 1;
 					// `((…))` continues; an arith-for header error leaves the
 					// loop (approximated by discarding the command).
@@ -2785,9 +2918,12 @@ fn for_next(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 	};
 	if let Err(d) = assigned {
 		k.diag(cx, vp, line, d);
+		if let Some(status) = reported_error_exit(k, cx, vp) {
+			return Flow::Exit(status);
+		}
 		// An assignment error ends a posix shell.
 		if state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
-			return Flow::Exit(1);
+			return force_eof(vp, cx.store);
 		}
 		if let Some(rec) = top_frame(vp).loops.last_mut() {
 			rec.status = 1;
@@ -4297,6 +4433,20 @@ fn run_func_trap(
 #[cfg(test)]
 mod tests {
 	use super::{BASH_TIMEFORMAT, POSIX_TIMEFORMAT, time_report};
+	use crate::testkit::{FakeHost, Fault, run_script};
+
+	#[test]
+	fn assignment_diagnostic_keeps_redirection_across_blocked_writes_and_snapshots() {
+		let result = run_script(
+			FakeHost::new().with_write_storm(9, 0.5),
+			b"{ readonly x=old; x=new; echo abandoned; } 2>&1\necho next:$?",
+			&[],
+			Fault::Snapshot { every: 1 },
+		);
+		assert_eq!(result.stdout, b"bash: line 1: x: readonly variable\nnext:1\n");
+		assert_eq!(result.stderr, b"");
+		assert_eq!(result.status, 0);
+	}
 
 	// Golden: bash 5.3.20 `time -p` and the default format.
 	#[test]

@@ -9,12 +9,13 @@ use crate::bash::{
 	event::EventData,
 	fs::StatKind,
 	ids::Vpid,
-	store::{Key, KeyBuf, MiscKey, OptId, Record},
+	signal::Signal,
+	store::{Key, KeyBuf, MiscKey, OptId, Record, TrapKey},
 	vm::{
 		exec::push_script,
 		locale,
 		probe::{absolute, candidates},
-		proc::{Probe, ProbeResult, ScriptKind},
+		proc::{FrameKind, Probe, ProbeResult, ScriptKind},
 		quote,
 	},
 };
@@ -328,16 +329,9 @@ fn status_arg(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> Result<Option<i32>, Ba
 /// `return [n]`. Outside a function, `.` file or `${ ;}` (and not in a
 /// subshell of a function) it is an error, fatal to a posix shell.
 pub fn return_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
-	use crate::bash::vm::proc::FrameKind;
-	let target = ctx.vp.frames.iter().any(|f| {
-		matches!(
-			f.kind,
-			FrameKind::Function { .. }
-				| FrameKind::NoFork
-				| FrameKind::Script { what: ScriptKind::Source, .. }
-		)
-	}) || (ctx.vp.parent.is_some()
-		&& crate::bash::vm::state::in_function(&ctx.k.root, ctx.cx.store, ctx.vp)?);
+	let target = crate::bash::vm::exec::bash_return_target(ctx.vp).is_some()
+		|| (ctx.vp.parent.is_some()
+			&& crate::bash::vm::state::in_function(&ctx.k.root, ctx.cx.store, ctx.vp)?);
 	// The arguments are checked first (`return 1 2` anywhere is "too many
 	// arguments").
 	let arg = status_arg(ctx, args);
@@ -389,6 +383,21 @@ pub fn exit(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if let Some(outcome) = bash_logout(ctx, status)? {
 		return Ok(outcome);
 	}
+	// `run_sigchld_trap` restores last_command_exit_value on EXITBLTIN's
+	// unwind; report_error's direct exit and FORCE_EOF do not take it.
+	let status = ctx
+		.vp
+		.frames
+		.iter()
+		.rev()
+		.find_map(|f| match f.kind {
+			FrameKind::Script {
+				what: ScriptKind::Trap { key: TrapKey::Signal(Signal::Chld), status, .. },
+				..
+			} => Some(status),
+			_ => None,
+		})
+		.unwrap_or(status);
 	Ok(Outcome { status, control: Control::Exit })
 }
 

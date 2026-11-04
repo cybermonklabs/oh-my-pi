@@ -607,7 +607,7 @@ pub fn assign_zsh_loop_var(
 	let mut ex = Expander::new(k, cx, vp, &mut log, false, line);
 	match params::assignsparam(&mut ex, name, value, 0) {
 		Ok(()) => Ok(()),
-		Err(Stop::Fail(d) | Stop::Fatal(d)) => Err(d),
+		Err(Stop::Fail(d) | Stop::Fatal(d) | Stop::Discard(d)) => Err(d),
 		Err(Stop::Store(e)) => {
 			k.fail(e);
 			Err(Diag::StoreFailed)

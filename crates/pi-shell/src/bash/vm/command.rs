@@ -71,6 +71,7 @@ impl ExecState {
 			exec_as: None,
 			wait_into: None,
 			via_command: false,
+			via_builtin: false,
 			resume: false,
 			resumed: 0,
 		}
@@ -102,6 +103,7 @@ impl ExecState {
 			exec_as,
 			wait_into,
 			via_command,
+			via_builtin,
 			resume,
 			resumed,
 		} = self;
@@ -128,6 +130,7 @@ impl ExecState {
 		*exec_as = None;
 		*wait_into = None;
 		*via_command = false;
+		*via_builtin = false;
 		*resume = false;
 		*resumed = 0;
 	}
@@ -431,6 +434,10 @@ fn expand(
 		let mut arrayref = std::mem::take(&mut st(vp).arrayref);
 		arrayref.clear();
 		let zsh = unit.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+		let command_declaration = !zsh
+			&& command_declaration(unit, words)
+			&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+				.unwrap_or(false);
 		let res = expanding(k, vp, cx, Slot::Words, record, line, |ex| {
 			keywords.clear();
 			arrayref.clear();
@@ -439,6 +446,7 @@ fn expand(
 			let mut ksh_typeset = None;
 			for &w in words {
 				let word = &unit.words[w as usize];
+				let declaration = command_declaration && word.kind == ir::WordKind::AssignArg;
 				if zsh && zsh_magic_word(ex, unit, word, &mut argv, &mut globs, &mut ksh_typeset)? {
 					continue;
 				}
@@ -449,7 +457,15 @@ fn expand(
 				let mut prefix = Vec::new();
 				let mut elems = Vec::new();
 				let mut elem_globs = Vec::new();
-				if ex.decl_compound(unit, word, &argv, &mut prefix, &mut elems, &mut elem_globs)? {
+				if ex.decl_compound(
+					unit,
+					word,
+					declaration,
+					&argv,
+					&mut prefix,
+					&mut elems,
+					&mut elem_globs,
+				)? {
 					let at = argv.len() as u32;
 					argv.push(BString::default());
 					compound.push(at);
@@ -457,7 +473,11 @@ fn expand(
 					continue;
 				}
 				let before = argv.len();
-				ex.fields_glob(unit, word, &mut argv, &mut globs)?;
+				if declaration {
+					ex.declaration_fields(unit, word, &mut argv)?;
+				} else {
+					ex.fields_glob(unit, word, &mut argv, &mut globs)?;
+				}
 				if argv.len() == before + 1 && is_arrayref(word) {
 					arrayref.push(before as u32);
 				}
@@ -561,12 +581,31 @@ fn expand(
 					.position(|&c| c == b']')
 					.map_or(src.len(), |p| p + 1);
 				k.diag(cx, vp, line, Diag::InvalidIdent { name: BString::from(&src[..close]) });
+				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+					.unwrap_or(false)
+				{
+					return Some(if IntrinsicId::from_name(&st(vp).argv[0]).is_some_and(is_special) {
+						exec::force_eof(vp, cx.store)
+					} else {
+						Flow::Discard(1)
+					});
+				}
 				let s = st(vp);
 				s.assigns.push((a.name.clone(), BString::default()));
 				s.values
 					.push((Some(BString::default()), AssignValue::Scalar(BString::default())));
 				continue;
 			}
+			// Bash `assign_in_env` checks readonly before expanding the RHS.
+			let name = if assign_only {
+				a.name.clone()
+			} else {
+				match prefix_name(k, vp, cx, &a.name, line) {
+					Ok(Some(name)) => name,
+					Ok(None) => continue,
+					Err(flow) => return Some(flow),
+				}
+			};
 			// `b[]=x`: a subscript written empty is a bad one (an expanded
 			// empty one, `b[$e]`, is element 0); bash reports the element
 			// and abandons the line as for any failed assignment.
@@ -582,6 +621,20 @@ fn expand(
 					return Some(Flow::Exit(1));
 				}
 				return Some(Flow::Discard(1));
+			}
+			// Bash `do_compound_assignment` refuses the variable before it
+			// expands any element of a standalone compound assignment.
+			if assign_only && a.index.is_none() && matches!(a.value, AssignVal::Array(_)) {
+				match state::readonly_target(&k.root, cx.store, vp, &name) {
+					Ok(true) => {
+						return Some(assignment_failed(k, vp, cx, line, Diag::Readonly { name }));
+					},
+					Ok(_) => {},
+					Err(err) => {
+						k.fail(err);
+						return Some(Flow::Discard(1));
+					},
+				}
 			}
 			let record = assign_parks(unit, a);
 			let res = expanding(k, vp, cx, Slot::Assigns, record, line, |ex| {
@@ -623,7 +676,7 @@ fn expand(
 					)
 				},
 			};
-			(a.name.clone(), a.append, a.node, index, value)
+			(name, a.append, a.node, index, value)
 		} else {
 			// A `set -k` word: `name=value` (or `name+=value`), expanded as
 			// the word it is.
@@ -640,61 +693,18 @@ fn expand(
 				None => (BString::from(&text[..eq]), false),
 			};
 			let value = BString::from(text.get(eq + 1..).unwrap_or_default());
+			let name = if assign_only {
+				name
+			} else {
+				match prefix_name(k, vp, cx, &name, line) {
+					Ok(Some(name)) => name,
+					Ok(None) => continue,
+					Err(flow) => return Some(flow),
+				}
+			};
 			(name, append, word.node, None, AssignValue::Scalar(value))
 		};
 		scratch(vp).logs[Slot::Assigns as usize].clear();
-		// A prefix assignment through a name reference binds the target in
-		// the temporary scope (bash `assign_in_env`, as ksh93 does); `+=`
-		// appends to the target's value.
-		let name = if !assign_only && index.is_none() {
-			match state::deref(&k.root, cx.store, vp, &name) {
-				Ok(state::Deref::To { name: target, index: None }) => target,
-				Ok(_) => name,
-				Err(err) => {
-					k.fail(err);
-					return Some(Flow::Discard(1));
-				},
-			}
-		} else {
-			name
-		};
-		if !assign_only {
-			let readonly = match state::lookup_declared(&k.root, cx.store, vp, &name) {
-				Ok(v) => v.is_some_and(|v| v.attrs.contains(Attrs::READONLY)),
-				Err(err) => {
-					k.fail(err);
-					return Some(Flow::Discard(1));
-				},
-			};
-			if readonly {
-				// bash reports it and runs the command without the
-				// assignment; in posix mode the command does not run, and a
-				// special builtin's assignment error ends the shell.
-				k.diag(cx, vp, line, Diag::Readonly { name: name.clone() });
-				// zsh: an error (`errflag`); the command does not run.
-				if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
-					return Some(Flow::Discard(1));
-				}
-				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
-					.unwrap_or(false)
-				{
-					if IntrinsicId::from_name(&st(vp).argv[0]).is_some_and(is_special) {
-						return Some(Flow::Exit(1));
-					}
-					let s = st(vp);
-					s.status = 1;
-					s.stage = Stage::Finish;
-					return None;
-				}
-				// A skipped slot: an indexed entry, which neither the
-				// environment nor a function scope takes.
-				let s = st(vp);
-				s.assigns.push((name.clone(), BString::default()));
-				s.values
-					.push((Some(BString::default()), AssignValue::Scalar(BString::default())));
-				continue;
-			}
-		}
 		// A prefix assignment's value takes the visible variable's attributes
 		// (`-i`, case conversion) and `+=`.
 		let value = match (assign_only, &index, value) {
@@ -739,15 +749,7 @@ fn expand(
 			if let Err(d) =
 				assign_now(k, vp, cx, &name, index.as_ref().map(|i| i.as_slice()), append, value)
 			{
-				k.diag(cx, vp, line, d);
-				// bash abandons the rest of the command line after a failed
-				// assignment statement; a posix shell exits.
-				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
-					.unwrap_or(false)
-				{
-					return Some(Flow::Exit(1));
-				}
-				return Some(Flow::Discard(1));
+				return Some(assignment_failed(k, vp, cx, line, d));
 			}
 			if k.mask.contains(crate::bash::event::EventKind::Assign) {
 				let scope = assign_scope(vp);
@@ -1214,6 +1216,99 @@ struct DeclArg {
 	globs:  Vec<(u32, BString)>,
 }
 
+/// Bash `fix_assignment_words` skips only literal `command` words (not
+/// `builtin`, `command -p`, or a command name produced by expansion).
+fn command_declaration(unit: &Unit, words: &[u32]) -> bool {
+	let mut words = words.iter().map(|&w| &unit.words[w as usize]);
+	fn literal(w: &ir::Word) -> Option<&[u8]> {
+		match w.parts.as_slice() {
+			[Part::Lit(n)] => Some(n.as_slice()),
+			_ => None,
+		}
+	}
+	let Some(first) = words.next() else {
+		return false;
+	};
+	if literal(first) != Some(b"command") {
+		return false;
+	}
+	for word in words {
+		match literal(word) {
+			Some(b"command") => {},
+			Some(b"declare" | b"typeset" | b"export" | b"readonly" | b"local") => return true,
+			_ => return false,
+		}
+	}
+	false
+}
+
+/// Bash `assign_in_env` and `do_assignment_statements`: a rejected prefix
+/// skips its RHS, but in POSIX mode jumps out of the whole input command.
+fn prefix_name(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	name: &[u8],
+	line: u32,
+) -> Result<Option<BString>, Flow> {
+	let target = match state::deref(&k.root, cx.store, vp, name) {
+		Ok(state::Deref::To { name, index: None }) => name,
+		Ok(_) => BString::from(name),
+		Err(err) => {
+			k.fail(err);
+			return Err(Flow::Discard(1));
+		},
+	};
+	let readonly = match state::lookup_declared(&k.root, cx.store, vp, &target) {
+		Ok(v) => v.is_some_and(|v| v.attrs.contains(Attrs::READONLY)),
+		Err(err) => {
+			k.fail(err);
+			return Err(Flow::Discard(1));
+		},
+	};
+	if !readonly {
+		return Ok(Some(target));
+	}
+	k.diag(cx, vp, line, Diag::Readonly { name: BString::from(name) });
+	if let Some(status) = exec::reported_error_exit(k, cx, vp) {
+		return Err(Flow::Exit(status));
+	}
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		return Err(Flow::Discard(1));
+	}
+	if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false) {
+		return Err(if IntrinsicId::from_name(&st(vp).argv[0]).is_some_and(is_special) {
+			exec::force_eof(vp, cx.store)
+		} else {
+			Flow::Discard(1)
+		});
+	}
+	let s = st(vp);
+	s.assigns.push((target, BString::default()));
+	s.values
+		.push((Some(BString::default()), AssignValue::Scalar(BString::default())));
+	Ok(None)
+}
+
+/// Bash `do_assignment_statements`: report first, then DISCARD or FORCE_EOF.
+fn assignment_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: Diag) -> Flow {
+	let subscript = matches!(d, Diag::ReadonlySubscript { .. });
+	k.diag(cx, vp, line, d);
+	if let Some(status) = exec::reported_error_exit(k, cx, vp) {
+		return Flow::Exit(status);
+	}
+	if subscript {
+		return Flow::Exit(1);
+	}
+	if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false)
+		&& !exec::executing_command_builtin(vp)
+	{
+		exec::force_eof(vp, cx.store)
+	} else {
+		Flow::Discard(1)
+	}
+}
+
 fn assign_parks(unit: &Unit, a: &ir::AssignOp) -> bool {
 	let word = |w: u32| unit.words[w as usize].parks;
 	a.index.is_some_and(word)
@@ -1312,6 +1407,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 		let posix = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 			.unwrap_or(false);
 		let mut via = Via::Plain;
+		let mut builtin_wrapper = false;
 		let target = loop {
 			// Borrowed (the resolution only reads `vp`): no copy of the
 			// name per command.
@@ -1405,6 +1501,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 						s.stage = Stage::Finish;
 						return None;
 					}
+					builtin_wrapper |= !matches!(via, Via::Command | Via::CommandP);
 					via = Via::Builtin;
 				},
 				_ if via == Via::Builtin && !matches!(resolved, Resolved::Intrinsic(_)) => {
@@ -1431,6 +1528,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 		let s = st(vp);
 		s.target = Some(target);
 		s.via_command = matches!(via, Via::Command | Via::CommandP);
+		s.via_builtin = builtin_wrapper;
 	}
 	if st(vp).target == Some(Target::Search) {
 		// File-system probes: `CmdExpanded` reads the clock after them.
@@ -2621,13 +2719,38 @@ fn run_builtin(
 		let (res, log) = {
 			let e = sc.exec.as_ref().expect("exec");
 			let mut ctx = Ctx::new(k, cx, vp, sc.probes(), line, name);
+			ctx.ignore_report_error = e.via_command
+				&& !e.via_builtin
+				&& ctx.vp.frames.last().is_some_and(|f| {
+					f.ignore_errexit
+						|| f
+							.unit
+							.as_ref()
+							.and_then(|u| u.ops.get(f.pc as usize))
+							.is_some_and(|op| op.flags & Op::COND != 0)
+				});
 			ctx.log = log;
 			ctx.compound.clone_from(&e.compound);
 			ctx.arrayref.clone_from(&e.arrayref);
 			ctx.resumed = e.resumed;
 			let r = builtins::run(id, &mut ctx, &e.argv);
+			let r = match r {
+				Err(Need::Reported(status)) => Ok(builtins::Outcome { status, control: Control::Exit }),
+				other => other,
+			};
 			// Not through `command`.
-			let fatal = ctx.usage_error && !e.via_command;
+			let fatal = !e.via_command
+				&& (ctx.usage_error
+					|| (ctx.utility_error
+						&& !e.via_builtin
+						&& !ctx.vp.frames.last().is_some_and(|f| {
+							f.ignore_errexit
+								|| f
+									.unit
+									.as_ref()
+									.and_then(|u| u.ops.get(f.pc as usize))
+									.is_some_and(|op| op.flags & Op::COND != 0)
+						})));
 			let log = std::mem::take(&mut ctx.log);
 			(r.map(|o| (o, ctx.chunks, fatal)), log)
 		};
@@ -2722,6 +2845,7 @@ fn run_builtin(
 				vp.frames[at].scratch = Some(sc);
 				return flow;
 			},
+			Err(Need::Reported(_)) => unreachable!("converted to an exit outcome above"),
 			Err(Need::Probe(p)) => {
 				let r = probe::perform(k, cx, vp, &mut sc, &p);
 				vp.frames.last_mut().expect("frame").scratch = Some(sc);

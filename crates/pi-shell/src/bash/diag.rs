@@ -104,6 +104,13 @@ pub enum Diag {
 		/// Variable.
 		name: BString,
 	},
+	/// A readonly assignment while evaluating an indexed subscript:
+	/// `array_expand_index` clears the parser context before DISCARD.
+	#[error("{name}: readonly variable")]
+	ReadonlySubscript {
+		/// Variable.
+		name: BString,
+	},
 	/// `set -u` and an unset variable.
 	#[error("{name}: unbound variable")]
 	Unbound {
@@ -471,7 +478,10 @@ pub enum Diag {
 impl Diag {
 	/// `self` reported by builtin `cmd`.
 	pub fn by(self, cmd: impl Into<Cow<'static, str>>) -> Self {
-		if matches!(self, Self::ArithSubscript { .. } | Self::BadSubscript { .. }) {
+		if matches!(
+			self,
+			Self::ArithSubscript { .. } | Self::ReadonlySubscript { .. } | Self::BadSubscript { .. }
+		) {
 			return self;
 		}
 		Self::Prefixed { cmd: cmd.into(), diag: Box::new(self) }
@@ -646,7 +656,9 @@ fn zsh_message(diag: &Diag, out: &mut Vec<u8>) {
 		Diag::NoSuchFile { name } => text(out, b"no such file or directory: ", name),
 		Diag::PermissionDenied { name } => text(out, b"permission denied: ", name),
 		Diag::IsADirectory { name } => text(out, b"is a directory: ", name),
-		Diag::Readonly { name } => text(out, b"read-only variable: ", name),
+		Diag::Readonly { name } | Diag::ReadonlySubscript { name } => {
+			text(out, b"read-only variable: ", name)
+		},
 		Diag::InvalidIdent { name } => text(out, b"not an identifier: ", name),
 		Diag::NoMatch { pattern } => text(out, b"no matches found: ", pattern),
 		Diag::Unbound { name } => {

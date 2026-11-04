@@ -845,6 +845,9 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
+	/// An op that has finished but must drain its diagnostics before its
+	/// control transfer restores the enclosing redirections.
+	pub pending_flow:      Option<super::exec::Flow>,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -876,6 +879,7 @@ impl Frame {
 			return_trap_local: false,
 			err_reported: false,
 			ignore_errexit: false,
+			pending_flow: None,
 			subshell_line: None,
 			getopts: None,
 		}
@@ -1293,6 +1297,8 @@ pub struct ExecState {
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
 	pub via_command: bool,
+	/// `builtin name` does not pass CMD_IGNORE_RETURN to eval/source.
+	pub via_builtin: bool,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
 	pub resume:      bool,
@@ -1508,8 +1514,10 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both.
+// Deferred diagnostic transfers (`Frame::pending_flow`, 256 → 288 B):
+// the memory bench measured 1,864 B per idle vproc, still under 2,048.
 const _: () = assert!(size_of::<Vproc>() <= 664, "Vproc grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
+const _: () = assert!(size_of::<Frame>() <= 288, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
