@@ -4999,10 +4999,11 @@ fn sigpipe_ignored(store: &mut dyn StateStore, vp: &Vproc) -> bool {
 
 /// Report the command and leave the op (or transfer control).
 fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
+	let vpid = vp.vpid;
 	let e = st(vp);
 	let (status, t0, control, force_errexit) = (e.status, e.t0, e.control, e.force_errexit);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
-	let own_command = e.tag.vpid == vp.vpid;
+	let own_command = e.tag.vpid == vpid;
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
