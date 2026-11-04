@@ -1287,6 +1287,10 @@ impl ExtProc for UnixProc {
 		self.pid as u32
 	}
 
+	fn detach(&mut self) {
+		self.detached = true;
+	}
+
 	fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<ExitStatus> {
 		#[cfg(target_os = "linux")]
 		if self.pidfd.is_some() && !self.exited_now() {

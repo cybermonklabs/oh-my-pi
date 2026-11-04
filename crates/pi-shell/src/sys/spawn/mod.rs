@@ -333,6 +333,10 @@ enum Dir {
 /// The child's side of one stream; pumps for engine objects go to `pumps`,
 /// shared input feeds the `ExtProc` must keep go to `held`. `None` for
 /// [`StdioSpec::Null`].
+/// An engine output pipe already without readers becomes a readerless OS
+/// pipe, so the child's write itself fails with EPIPE. Readers that disappear
+/// after this snapshot keep the relay path: the child's original write can
+/// succeed before delivery fails, and the relay signals the writer.
 fn child_end(
 	shared: &Shared,
 	spec: StdioSpec,
@@ -382,6 +386,10 @@ fn child_end(
 /// A pipe between the child and engine object `end`; the child's end.
 fn pipe_end(end: End, child_reads: bool, pumps: &mut Vec<Pump>) -> io::Result<fs::File> {
 	let (ours, theirs) = os::pipe(child_reads)?;
+	if !child_reads && matches!(&end, End::Fd(fd) if fd.reader_gone()) {
+		drop(ours);
+		return Ok(theirs);
+	}
 	pumps.push(if child_reads {
 		Pump::In(end, ours)
 	} else {

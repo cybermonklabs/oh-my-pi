@@ -46,7 +46,7 @@ mod host;
 mod ids;
 pub mod invocation;
 pub mod ir;
-mod mem;
+pub(crate) mod mem;
 mod mem_store;
 mod packed_names;
 pub mod signal;

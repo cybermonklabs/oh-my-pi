@@ -194,6 +194,11 @@ impl ShellApi<'_, '_> {
 	/// (later, the job already settled on its virtual pid).
 	pub fn exec_subshell_in(&mut self, script: Script, lineage: Lineage) -> RunId {
 		let run = self.run_subshell_in(script, lineage);
+		if let Some(child) = self.shell.k.spawned.last_mut()
+			&& let Some(program) = child.runs.iter_mut().find(|r| r.id == run)
+		{
+			program.program = true;
+		}
 		let caller = self.vproc().vpid;
 		let child = self.shell.k.spawned.last().map(|p| p.vpid);
 		if let (Some(child), Some(bang)) = (

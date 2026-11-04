@@ -17,7 +17,7 @@ use super::{
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg, Live,
 		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		Scratch, ScriptKind, Slot, TrapContinuation, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -512,6 +512,10 @@ fn errexit_on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// `exit` inside a function runs the root's trap first, above the
 /// function's frames: bash's trap sees its `FUNCNAME` and locals.
 fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
+	// A terminating trap cannot revive the shell with a signal queued by
+	// one of its own writes (for example the trace of `set +x`).
+	vp.pending_traps = crate::bash::signal::SigSet::EMPTY;
+	k.release_partial_pipeline(vp);
 	let in_exit_trap = vp.frames.iter().any(|f| {
 		matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key: TrapKey::Exit, .. }, .. })
 	});
@@ -686,7 +690,7 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc, store: &mut dyn StateStore) -> Opti
 			},
 			Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
 				vp.out.pop_front();
-				if command::sigpipe_ignored(store, vp) || command::child_output_failed(vp) {
+				if command::sigpipe_ignored(store, vp) || command::child_output_failed(vp) || command::defer_pipe_trap(store, vp) {
 					continue;
 				}
 				k.ctl.signal(crate::bash::SigTarget::Vpid(vp.vpid), crate::bash::Signal::Pipe);
@@ -831,11 +835,11 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		// zsh's `LOOP_EMPTY` do: no command was ever parsed, so the position
 		// never moved. Until a first command runs, `$?` is the caller's.
 		let no_command = pos.0 == 0;
-		let (status, source, cancel, return_target, exit) = match frame.kind {
+		let (status, source, cancel, continuation, exit) = match frame.kind {
 			FrameKind::Script {
-				what: ScriptKind::Trap { status, cancel, return_target, exit, .. },
+				what: ScriptKind::Trap { status, cancel, continuation, exit, .. },
 				..
-			} => (Some(status), false, cancel, return_target, exit),
+			} => (Some(status), false, cancel, continuation, exit),
 			FrameKind::Script { what: ScriptKind::Source, .. } => (None, true, None, None, false),
 			_ => (None, false, None, None, false),
 		};
@@ -863,6 +867,14 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			start_trap(k, vp, cx, TrapKey::Exit);
 			return None;
 		}
+		if let Some(TrapContinuation::ErrorAt(line)) = continuation {
+			vp.status = status.expect("completed write-signal trap");
+			if start_trap(k, vp, cx, TrapKey::Err) {
+				set_trap_line(vp, line);
+				if exit { mark_trap_exit(vp); }
+				return None;
+			}
+		}
 		if let Some(cancel) = cancel {
 			finish_cancel(&mut k.root, cx.store, vp, cancel);
 		} else if let Some(status) = status
@@ -875,7 +887,7 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			zsh_discard(k, vp, cx, trap_status);
 		} else if let Some(status) = status {
 			vp.status = status;
-			if let Some(target) = return_target {
+			if let Some(TrapContinuation::ReturnTo(target)) = continuation {
 				unwind(&mut k.root, cx.store, vp, target);
 			} else if debug
 				&& trap_status != 0
@@ -3626,7 +3638,7 @@ fn push_trap(
 		key,
 		status,
 		cancel: None,
-		return_target: None,
+		continuation: None,
 		exit: false,
 	});
 	if let Some(saved) = restore {
@@ -3733,11 +3745,11 @@ fn return_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, target: usize) -
 
 fn mark_return(vp: &mut Vproc, target: usize) {
 	if let Some(Frame {
-		kind: FrameKind::Script { what: ScriptKind::Trap { return_target, .. }, .. },
+		kind: FrameKind::Script { what: ScriptKind::Trap { continuation, .. }, .. },
 		..
 	}) = vp.frames.last_mut()
 	{
-		*return_target = Some(target);
+		*continuation = Some(TrapContinuation::ReturnTo(target));
 	}
 }
 

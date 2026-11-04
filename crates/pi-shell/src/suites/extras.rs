@@ -121,6 +121,36 @@ async fn extras_compose_with_builtins_and_each_other() {
 	assert_eq!(out(&mut s, "printf 'b\\na\\n' | sort | tr a-z A-Z").await, "A\nB\n");
 }
 
+/// `stat` must report one numeric identity for a memory pipe, not unknown
+/// fields or the identity of whichever duplicated fd reached the extra.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stat_keeps_memory_pipe_identity_across_descriptors_and_commands() {
+	let dir = tempfile::tempdir().unwrap();
+	let mut s = session_in(dir.path(), &[]);
+	let ran = run(
+		&mut s,
+		r#"exec 3> >(true) 4>&3 5> >(true)
+a=$(stat -L -c '%d %i' /dev/fd/3)
+b=$(stat -L -c '%d %i' /dev/fd/4)
+c=$(stat -L -c '%d %i' /dev/fd/3)
+d=$(stat -L -c '%d %i' /dev/fd/5)
+[ "$a" = "$b" ] && echo duplicate
+[ "$a" = "$c" ] && echo repeated
+[ "$a" != "$d" ] && echo separate
+set -- $a
+p=$(( ($1 ^ $2) % 13 ))
+[ "$p" -ge 0 ] && [ "$p" -lt 13 ] && echo arithmetic
+{ exec 6>&1; stat -L -c '%d %i' /dev/fd/6 > writer; } |
+  stat -L -c '%d %i' /dev/stdin > reader
+[ "$(cat writer)" = "$(cat reader)" ] && echo ends
+exec 3>&- 4>&- 5>&-"#,
+	)
+	.await;
+	assert_eq!(ran.status, 0, "stderr: {:?}", ran.stderr);
+	assert_eq!(ran.stderr, "");
+	assert_eq!(ran.stdout, "duplicate\nrepeated\nseparate\narithmetic\nends\n");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_extra_reads_no_input_it_does_not_use() {
 	let mut s = session();

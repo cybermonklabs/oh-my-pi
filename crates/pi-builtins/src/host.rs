@@ -2935,7 +2935,7 @@ fn close_stdout(name: &str, failure: u8, code: i32, host: &mut Host) -> i32 {
 	let stdout_failed = failed & FAILED_STDOUT != 0 && !sigpipe.checks_stdout.load(Ordering::Relaxed);
 	let stderr_failed = failed & FAILED_STDERR != 0 && !sigpipe.checks_stderr.load(Ordering::Relaxed);
 	if !stdout_failed && !stderr_failed { return code; }
-	if stdout_failed && code == 0 { let _ = writeln!(host.stderr, "{name}: write error: Broken pipe"); }
+	if stdout_failed { let _ = writeln!(host.stderr, "{name}: write error: Broken pipe"); }
 	i32::from(failure)
 }
 

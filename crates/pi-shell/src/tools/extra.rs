@@ -138,7 +138,7 @@ impl Extra {
 		let running = self.running.as_ref()?;
 		while let Ok(Request { command, program, reply }) = running.requests.try_recv() {
 			let lineage = Lineage { label: self.child.label, detached: false };
-			let run = api.run_subshell_in(script(command, &program, &running.env_names), lineage);
+			let run = api.exec_subshell_in(script(command, &program, &running.env_names), lineage);
 			self.runs.push((run, reply));
 		}
 		match running.done.poll(&Context::from_waker(turn.waker)) {
@@ -241,7 +241,7 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 	}
 	let mut args: Vec<BString> = command.args().iter().map(|arg| os_bytes(arg)).collect();
 	match program {
-		Program::Builtin => source.extend_from_slice(b"exec -- \"$@\""),
+		Program::Builtin => source.extend_from_slice(b"command -- \"$@\""),
 		Program::Path(path) => {
 			let argv0 = command
 				.presented_argv0()

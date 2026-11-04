@@ -1193,6 +1193,7 @@ async fn an_ignored_sigpipe_fails_a_utility_when_it_exits() {
 	let (exit_code, output) = run_in_tempdir(&[
 		r#"made() { [ -e "$1" ] && echo yes || echo no; }"#,
 		r#"mkdir src e1 e2; : > r1; : > r2; : > src/c1; : > src/c2; : > v1; : > v2"#,
+		r#"printf 'hostname\n' > checksum-input"#,
 		r#"( trap '' PIPE; fill"#,
 		r#"  rm -v r1 r2 >&3; echo "rm=$?""#,
 		r#"  cp -v src/c1 src/c2 . >&3; echo "cp=$?""#,
@@ -1204,8 +1205,8 @@ async fn an_ignored_sigpipe_fails_a_utility_when_it_exits() {
 		r#"  printf 'b\na\n' | sort >&3; echo "sort=$?""#,
 		r#"  date >&3; echo "date=$?""#,
 		r#"  printf 'a\n' | uniq >&3; echo "uniq=$?""#,
-		r#"  md5sum /etc/hostname >&3; echo "md5sum=$?""#,
-		r#"  sed p /etc/hostname >&3; echo "sed=$?""#,
+		r#"  md5sum checksum-input >&3; echo "md5sum=$?""#,
+		r#"  sed p checksum-input >&3; echo "sed=$?""#,
 		r#"  printenv HOME >&3; echo "printenv=$?""#,
 		r#"  which sh >&3; echo "which=$?""#,
 		r#"  : > m5; rm -v nonexist m5 >&3 2>&3; echo "rm-merged=$? $(made m5)""#,

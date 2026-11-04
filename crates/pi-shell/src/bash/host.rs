@@ -541,6 +541,8 @@ pub trait ExtProc: Send {
 	fn broken_pipe_signal(&self) -> Option<Box<dyn Fn() + Send>> {
 		None
 	}
+	/// Leave this already-started process running when its handle drops.
+	fn detach(&mut self) {}
 	/// Stop the process group (job pause).
 	fn stop(&mut self) -> io::Result<()>;
 	/// Continue after [`ExtProc::stop`].

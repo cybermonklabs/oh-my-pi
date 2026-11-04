@@ -430,6 +430,8 @@ pub struct Kernel {
 	pub exec_signals:    HashMap<RunId, i32>,
 	/// Signal death associated with the most recently reported run.
 	pub reported_signal: Option<(RunId, i32)>,
+	/// Pipeline stages whose launching shell exited from DEBUG.
+	pub released_stages: Vec<Vpid>,
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:           Vec<proc::Bang>,
@@ -501,6 +503,7 @@ impl Kernel {
 			exited: None,
 			exec_signals: HashMap::new(),
 			reported_signal: None,
+			released_stages: Vec::new(),
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			deferrals: Vec::new(),
@@ -517,6 +520,17 @@ impl Kernel {
 	pub fn forget_deferral(&mut self, vproc: Vpid) {
 		if !self.deferrals.is_empty() {
 			self.deferrals.retain(|d| d.vproc != vproc);
+		}
+	}
+
+	pub fn release_partial_pipeline(&mut self, vp: &Vproc) {
+		let debug = vp.frames.iter().any(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key: crate::bash::store::TrapKey::Debug, .. }, .. }));
+		let cancelling = vp.frames.iter().any(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { cancel: Some(_), .. }, .. }));
+		if !debug || cancelling { return; }
+		for frame in &vp.frames {
+			if let Some(sc) = &frame.scratch && matches!(sc.live, Live::Pipeline(_)) {
+				self.released_stages.extend(sc.children.iter().map(|&(child, _)| child));
+			}
 		}
 	}
 
@@ -1329,6 +1343,7 @@ impl Shell {
 			env: Vec::new(),
 			started: false,
 			exit_trap_started: false,
+			program: false,
 		};
 		let stdio = match script.vproc {
 			VprocSel::Root => {
@@ -1596,6 +1611,20 @@ impl Shell {
 				.write(cx.store, Change::Put(Key::Proc(p.vpid), rec));
 		}
 		self.procs.append(&mut self.k.spawned);
+		if !self.k.released_stages.is_empty() {
+			let roots = std::mem::take(&mut self.k.released_stages);
+			for i in 0..self.procs.len() {
+				if roots.iter().any(|&root| self.in_job(self.procs[i].vpid, root)) {
+					let p = &mut self.procs[i];
+					p.lineage.detached = true;
+					for frame in &mut p.frames {
+						if let Some(Live::Ext(child)) = frame.scratch.as_mut().map(|sc| &mut sc.live) {
+							child.detach();
+						}
+					}
+				}
+			}
+		}
 		self.apply_settled();
 		let mut i = 0;
 		while i < self.procs.len() {
@@ -1855,6 +1884,7 @@ impl Shell {
 	/// scripts. Transient vprocs are removed.
 	fn kill(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32) {
 		let p = &mut self.procs[i];
+		if sig == Signal::Pipe { self.k.release_partial_pipeline(p); }
 		for f in &mut p.frames {
 			if let Some(sc) = f.scratch.as_mut() {
 				match &mut sc.live {

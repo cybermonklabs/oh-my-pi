@@ -207,6 +207,13 @@ impl FdRef {
 		self.0.state.lock().file_ref().map(File::kind)
 	}
 
+	/// Whether this fd is an engine pipe's write end with no readers left.
+	/// This is a synchronous snapshot of memory-pipe state, not an I/O probe
+	/// of a host or provider file.
+	pub fn reader_gone(&self) -> bool {
+		matches!(&*self.0.state.lock(), FdState::Mem(MemFile::PipeWrite(w)) if w.reader_count() == 0)
+	}
+
 	/// OS handle an external can inherit directly.
 	pub fn os_handle(&self) -> Option<OsHandle> {
 		self.0.state.lock().file_ref().and_then(File::os_handle)

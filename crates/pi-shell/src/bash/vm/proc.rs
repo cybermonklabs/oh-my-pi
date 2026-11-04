@@ -717,6 +717,8 @@ pub struct Run {
 	pub env:               Vec<(BString, BString)>,
 	pub started:           bool,
 	pub exit_trap_started: bool,
+	/// This run stands for one program invoked by a host utility.
+	pub program: bool,
 }
 
 /// What kind of activation a frame is.
@@ -792,11 +794,20 @@ pub enum ScriptKind {
 		key:           crate::bash::store::TrapKey,
 		status:        i32,
 		cancel:        Option<i32>,
-		return_target: Option<usize>,
+		continuation: Option<TrapContinuation>,
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
 		exit:          bool,
 	},
+}
+
+/// Work resumed when a trap returns normally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrapContinuation {
+	/// Unwind to a function/source boundary after RETURN.
+	ReturnTo(usize),
+	/// Judge ERR at this line after a caught PIPE.
+	ErrorAt(u32),
 }
 
 impl FrameKind {
@@ -1309,6 +1320,8 @@ pub struct ExecState {
 	pub child_diagnostic: bool,
 	/// Whether ERR was in force when this command began.
 	pub err_trap_set: bool,
+	/// Deliver a caught PIPE only after this command's redirections restore.
+	pub deferred_pipe: bool,
 }
 
 /// Options of `exec [-cl] [-a name] command`.

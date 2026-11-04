@@ -717,6 +717,10 @@ impl ExtProc for WinProc {
 		self.pid
 	}
 
+	fn detach(&mut self) {
+		self.detached = true;
+	}
+
 	fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<ExitStatus> {
 		self.pumps.poll(cx, &self.tracker);
 		self.tracker.poll(cx)

@@ -107,6 +107,14 @@ impl PipeReader {
 	}
 }
 
+impl PipeWriter {
+	/// Number of live read ends, including duplicated ends. Reading this
+	/// count does not attempt I/O or register a waiter.
+	pub fn reader_count(&self) -> usize {
+		self.0.lock().readers
+	}
+}
+
 impl Drop for PipeReader {
 	fn drop(&mut self) {
 		let mut s = self.0.lock();
@@ -359,6 +367,14 @@ impl MemFile {
 			Self::Buf(b) => (Arc::as_ptr(&b.pos).addr(), MemEnd::Whole),
 			Self::Capture(c) => (c.key(), MemEnd::Whole),
 		}
+	}
+
+	/// Virtual inode of the shared object, equal for both pipe ends and
+	/// every duplicate while it lives. Each key names a `Mutex` allocation,
+	/// so its low alignment bit is zero: removing that bit keeps identities
+	/// distinct and within the signed 64-bit range shell arithmetic accepts.
+	pub fn inode(&self) -> u64 {
+		(self.key().0 as u64) >> 1
 	}
 
 	/// Image of the shared state.

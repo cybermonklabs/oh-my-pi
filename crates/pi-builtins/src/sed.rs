@@ -8284,6 +8284,9 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
 				output.copy_file(context.paths.fs(), path)?;
 			},
 		}
+		if context.unbuffered {
+			output.flush()?;
+		}
 	}
 	context.append_elements.clear();
 	Ok(())

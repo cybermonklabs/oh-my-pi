@@ -41,7 +41,9 @@
 //! file ([`Fd::Vfs`]) whose reads and writes poll the engine object: the
 //! extra's own reads are the only reads, so nothing is taken ahead of it
 //! (`while read -r f; do wc -l "$f"; done` keeps its lines) and output arrives
-//! in the pipe as it is written. A closed engine fd is [`Fd::Closed`].
+//! in the pipe as it is written. Memory objects expose a virtual file identity
+//! shared by both pipe ends and every duplicate, so `stat` and utilities that
+//! compare or hash files agree. A closed engine fd is [`Fd::Closed`].
 
 use std::{
 	fmt, io,
@@ -309,18 +311,23 @@ impl pi_vfs::FileHandle for FdHandle {
 
 	async fn metadata(&self) -> io::Result<pi_vfs::Metadata> {
 		use pi_vfs::FileKind as Vfs;
-		let (kind, mode) = match self.fd()?.kind().ok_or_else(bad_fd)? {
+		let fd = self.fd()?;
+		let (kind, mode) = match fd.kind().ok_or_else(bad_fd)? {
 			FileKind::Regular => (Vfs::File, 0o644),
 			FileKind::Pipe => (Vfs::Fifo, 0o600),
 			FileKind::Tty => (Vfs::CharDevice, 0o620),
 			FileKind::Device => (Vfs::CharDevice, 0o666),
 			FileKind::Socket => (Vfs::Socket, 0o777),
 		};
-		Ok(pi_vfs::Metadata::new(
+		let metadata = pi_vfs::Metadata::new(
 			pi_vfs::FileType::from_kind(kind),
 			0,
 			pi_vfs::Permissions::from_mode(mode),
-		))
+		);
+		Ok(match fd.with_mem(|mem| mem.inode()) {
+			Some(ino) => metadata.with_id(0, ino),
+			None => metadata,
+		})
 	}
 
 	async fn flush(&self) -> io::Result<()> {

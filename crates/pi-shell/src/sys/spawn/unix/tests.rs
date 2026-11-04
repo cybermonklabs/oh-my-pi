@@ -992,6 +992,53 @@ fn external_dies_of_sigpipe_when_the_engine_reader_is_gone() {
 	assert_eq!(wait(&mut p), ExitStatus::Signaled(Signal::Pipe));
 }
 
+/// A short write must fail in the child, before a relay could acknowledge it;
+/// both a direct executable and an exec wrapper report their real wait status.
+#[test]
+fn a_readerless_engine_pipe_rejects_the_childs_first_write() {
+	a_readerless_engine_pipe_does_not_signal_a_child_that_never_writes();
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	for (a, fd) in [
+		(argv(&["/bin/echo", "x"]), 1),
+		(argv(&["/usr/bin/env", "/bin/sh", "-c", "echo data"]), 1),
+		(sh("echo data >&2"), 2),
+		(sh("echo data >&9"), 9),
+	] {
+		for (ignored, expected) in [
+			(false, ExitStatus::Signaled(Signal::Pipe)),
+			(true, ExitStatus::Exited(1)),
+		] {
+			let (reader, writer) = crate::bash::mem::pipe();
+			drop(reader);
+			let out = StdioSpec::Pipe(crate::bash::FdRef::mem(writer));
+			let mut sp = spec(&a, &env, NEW);
+			if fd < 3 {
+				sp.stdio[fd] = out;
+			} else {
+				sp.extra_fds = vec![(fd as i32, out)];
+			}
+			if ignored {
+				sp.sigmask_ign = SigSet::EMPTY.with(Signal::Pipe);
+			}
+			let mut p = s.spawn(sp).unwrap();
+			assert_eq!(wait(&mut p), expected, "{a:?}, fd {fd}, ignored={ignored}");
+		}
+	}
+}
+
+fn a_readerless_engine_pipe_does_not_signal_a_child_that_never_writes() {
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let a = sh("exit 7");
+	let (reader, writer) = crate::bash::mem::pipe();
+	drop(reader);
+	let mut sp = spec(&a, &env, NEW);
+	sp.stdio[1] = StdioSpec::Pipe(crate::bash::FdRef::mem(writer));
+	let mut p = s.spawn(sp).unwrap();
+	assert_eq!(wait(&mut p), ExitStatus::Exited(7));
+}
+
 /// A last write to a virtual destination must kill its writer as soon as
 /// delivery fails, not wait for a later write that may never happen.
 #[test]

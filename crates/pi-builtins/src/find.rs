@@ -5398,8 +5398,11 @@ async fn do_find(
 			flush_stdout(deps, host).await;
 			let _ = writeln!(host.stderr, "find: {name}: {error}");
 			host.deliver_owed_output().await;
-			// fclose failure is fatal in sharefile's entry_free; do not flush
-			// the remaining named outputs after this error.
+			// error(EXIT_FAILURE) still runs libc's exit-time flushes. Only
+			// a signal death skips the buffers that remain in the FILE list.
+			for remaining in files.iter_mut().rev().filter_map(Option::take) {
+				let _ = remaining.1.close().await;
+			}
 			return Ok(1);
 		}
 	}
