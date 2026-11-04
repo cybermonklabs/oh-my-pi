@@ -1661,11 +1661,17 @@ impl Shell {
 	/// for it is done (`jobs`, `wait` see it) and a parent trapping
 	/// `SIGCHLD` owes one more run of the trap.
 	fn reaped(&mut self, cx: &mut Cx<'_>, parent: Option<Vpid>, vpid: Vpid, status: i32) {
+		let parent = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v));
+		self.reaped_at(cx, parent, vpid, status);
+	}
+
+	/// Notify a parent whose scheduler index is already known.
+	fn reaped_at(&mut self, cx: &mut Cx<'_>, parent: Option<usize>, vpid: Vpid, status: i32) {
 		// Its own children are orphans now.
 		if self.k.engine.config().end_orphan_jobs {
 			self.gone.push(vpid);
 		}
-		let Some(i) = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v)) else {
+		let Some(i) = parent else {
 			return;
 		};
 		let job = self.procs[i].jobs.by_vpid_mut(vpid);
@@ -1753,6 +1759,21 @@ impl Shell {
 		if req & CANCEL != 0 {
 			let sig = self.k.ctl.cancel_signal();
 			let status = sig.exit_status(self.k.engine.config().platform);
+			// Each killed child notifies its parent before that parent is
+			// cancelled. Repeated linear parent searches make a deep tree's
+			// cancellation quadratic and hold the async driver past its grace.
+			// Reverse removals preserve earlier indices; validate cached ones
+			// below so restored or otherwise reordered process tables work too.
+			let parents: HashMap<Vpid, usize> = if self.procs.len() > 1 {
+				self
+					.procs
+					.iter()
+					.enumerate()
+					.map(|(i, p)| (p.vpid, i))
+					.collect()
+			} else {
+				HashMap::new()
+			};
 			for i in (0..self.procs.len()).rev() {
 				// A detached tree (`nohup`) outlives the cancellation.
 				if self.procs[i].lineage.detached {
@@ -1791,7 +1812,7 @@ impl Shell {
 						exec::finish_cancel(&mut self.k.root, cx.store, &mut self.procs[i], status);
 					}
 				} else {
-					self.kill(cx, i, sig, status);
+					self.kill_with_parents(cx, i, sig, status, Some(&parents));
 				}
 			}
 			// Calls of the cancelled vprocs are void; a detached tree's go on.
@@ -1853,6 +1874,19 @@ impl Shell {
 	/// Terminate vproc `i` with `status`: signal its task or external, end its
 	/// scripts. Transient vprocs are removed.
 	fn kill(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32) {
+		self.kill_with_parents(cx, i, sig, status, None);
+	}
+
+	/// A cancellation batch supplies its parent index instead of scanning
+	/// the shrinking process table once for every child in the tree.
+	fn kill_with_parents(
+		&mut self,
+		cx: &mut Cx<'_>,
+		i: usize,
+		sig: Signal,
+		status: i32,
+		parents: Option<&HashMap<Vpid, usize>>,
+	) {
 		let p = &mut self.procs[i];
 		for f in &mut p.frames {
 			if let Some(sc) = f.scratch.as_mut() {
@@ -1889,7 +1923,14 @@ impl Shell {
 			self.k.forget_deferral(p.vpid);
 			self.k.proc_exited(cx.store, p.vpid, p.parent, status);
 			self.rr = 0;
-			self.reaped(cx, p.parent, p.vpid, status);
+			let parent = p.parent.and_then(|parent| {
+				parents
+					.and_then(|indices| indices.get(&parent))
+					.copied()
+					.filter(|&index| self.procs.get(index).is_some_and(|p| p.vpid == parent))
+					.or_else(|| self.procs.iter().position(|p| p.vpid == parent))
+			});
+			self.reaped_at(cx, parent, p.vpid, status);
 		}
 	}
 

@@ -48,7 +48,7 @@ async fn run_streams(script: &str) -> (String, String, Option<i32>) {
 			..Default::default()
 		},
 		StreamSinks { stdout: Some(stdout_tx), stderr: Some(stderr_tx) },
-		CancelToken::new(None),
+		CancelToken::new(Some(30_000)),
 	)
 	.await
 	.unwrap_or_else(|error| panic!("{script}: {error}"));
@@ -1820,6 +1820,13 @@ async fn a_failed_redirection_error_acts_on_the_process_that_performs_it() {
 	assert_bash(&[
 		("/bin/echo EXTERNAL >\"${U:?}\"; printf AFTER", "AFTER", true, 0),
 		("( echo SUBSHELL ) >\"${U:?}\"; printf AFTER", "AFTER", true, 0),
+		(
+			"/bin/echo EXTERNAL >\"${U:?}\"; printf 'external=%s\\n' \"$?\"; ( echo SUBSHELL ) \
+			 >\"${U:?}\"; printf 'subshell=%s\\n' \"$?\"",
+			"external=127\nsubshell=127\n",
+			true,
+			0,
+		),
 		(
 			"( : > \"${U:?required}\" || echo WRONG; echo AFTER ) 2>/dev/null; echo \"builtin=$?\"",
 			"builtin=1\n",

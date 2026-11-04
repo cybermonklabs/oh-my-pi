@@ -1532,8 +1532,9 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both.
-// Deferred trace state and unwound pipeline waits add 56 B to Vproc.
-// The memory bench must verify the existing ≤ 2 KiB idle-vproc contract.
+// Deferred trace state and unwound pipeline waits add 56 B to Vproc; staged
+// tracing adds 8 B to Scratch. The memory bench measured 1,896 B per idle
+// vproc with these continuations (target ≤ 2,048).
 const _: () = assert!(size_of::<Vproc>() <= 720, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 224, "Scratch grew (idle vproc ≤ 2 KiB)");

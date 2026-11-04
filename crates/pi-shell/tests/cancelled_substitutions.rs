@@ -83,10 +83,10 @@ fn runtime() -> tokio::runtime::Runtime {
 		.expect("tokio runtime")
 }
 
-async fn warmup(shell: &Shell) {
+async fn warmup(shell: &Shell, command: &str) {
 	let result = shell
 		.run(
-			ShellRunOptions { command: ":".into(), ..Default::default() },
+			ShellRunOptions { command: command.into(), ..Default::default() },
 			None,
 			CancelToken::default(),
 		)
@@ -121,7 +121,7 @@ fn a_timed_out_run_returns_after_its_substitutions_are_gone() {
 	}
 	runtime().block_on(async {
 		let shell = Shell::new(None);
-		warmup(&shell).await;
+		warmup(&shell, ":").await;
 		let baseline = open_descriptors();
 		for repeat in 0..3 {
 			let start = Instant::now();
@@ -193,7 +193,22 @@ fn a_timed_out_substitution_stops_writing_to_a_full_fifo() {
 	let command = format!("x=$(printf '%s' '{}' >fifo); printf BAD >late", "X".repeat(256 * 1024));
 	runtime().block_on(async {
 		let shell = Shell::new(None);
-		warmup(&shell).await;
+		// An empty FIFO read must register with the process-wide readiness
+		// poller before its timer expires. Child-process waits use a different
+		// path and do not initialize this poller's permanent wake pipe.
+		let ready = shell
+			.run(
+				ShellRunOptions {
+					command: "IFS= read -r -t 0.01 warm <fifo || :".into(),
+					cwd: Some(dir.path().to_string_lossy().into_owned()),
+					..Default::default()
+				},
+				None,
+				CancelToken::new(Some(RUN_TIMEOUT_MS)),
+			)
+			.await
+			.expect("initialize FIFO readiness");
+		assert_eq!(ready.exit_code, Some(0));
 		let baseline = open_descriptors();
 		for repeat in 0..5 {
 			let start = Instant::now();

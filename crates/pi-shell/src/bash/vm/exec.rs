@@ -241,9 +241,12 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				},
 				Opcode::CallAnon => !vp.frames.get(fi).is_some_and(|frame| frame.err_reported),
 				Opcode::Redir => matches!(flow, Flow::Jump(_)),
-				Opcode::Leave => unit.nodes.get(op.node as usize).is_some_and(|node| {
-					matches!(node.kind, NodeKind::Cond | NodeKind::Arith | NodeKind::Subshell)
-				}),
+				Opcode::Leave => {
+					!vp.frames.get(fi).is_some_and(|frame| frame.err_reported)
+						&& unit.nodes.get(op.node as usize).is_some_and(|node| {
+							matches!(node.kind, NodeKind::Cond | NodeKind::Arith | NodeKind::Subshell)
+						})
+				},
 				Opcode::Arith | Opcode::CondTest => {
 					!vp.frames.get(fi).is_some_and(|frame| frame.err_reported)
 				},
@@ -287,6 +290,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		}
 		if !matches!(flow, Flow::Block(_)) {
 			unblock(k, cx, vp);
+		}
+		if matches!(flow, Flow::Exit(_) | Flow::Discard(_)) {
+			// A non-local error still has the failing builtin's redirections.
+			finish_times(k, vp, cx);
 		}
 		// The op is over unless it parks or called a frame: drop its scratch
 		// and close its process substitutions.
@@ -524,7 +531,7 @@ fn in_function_scope(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 
 /// Whether `set -e` is on for `vp`.
 fn errexit_on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
-	if vp.frames.iter().any(|frame| frame.errexit_disabled) {
+	if vp.frames.iter().any(|frame| frame.errexit_disabled) || super::command::disables_errexit(vp) {
 		return false;
 	}
 	match state::option(&mut k.root, cx.store, vp, OptId::Errexit) {

@@ -197,6 +197,23 @@ pub fn forces_errexit(vp: &Vproc, caller: usize) -> bool {
 		.is_some_and(|exec| exec.force_errexit)
 }
 
+/// A leading command builtin disables -e while its ignored builtin runs.
+pub fn disables_errexit(vp: &Vproc) -> bool {
+	vp.frames.iter().any(|frame| {
+		frame
+			.scratch
+			.as_ref()
+			.and_then(|scratch| scratch.exec.as_deref())
+			.is_some_and(|exec| exec.via_command)
+			&& (frame.ignore_errexit
+				|| frame
+					.unit
+					.as_ref()
+					.and_then(|unit| unit.ops.get(frame.pc as usize))
+					.is_some_and(|op| op.flags & Op::COND != 0))
+	})
+}
+
 /// Run (or resume) the simple command `op.a` of `unit`.
 pub fn exec(
 	k: &mut Kernel,
