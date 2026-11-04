@@ -1608,7 +1608,7 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			// script and from a subshell (`execute_in_subshell` keeps the
 			// failure status); a nested shell (depth 0) is its own `-c` shell.
 			let command = !errexit_on(k, cx, vp)
-				&& super::subshell_depth(vp) == 0
+				&& super::expansion_failure_depth(vp) == 0
 				&& matches!(
 					state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
 					Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
@@ -2253,16 +2253,6 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				};
 				top_frame(vp).redirs.push(saves);
 				Flow::Next
-			},
-			Err(redir::Halt::Flow(Flow::Exit(status) | Flow::Discard(status)))
-				if unit
-					.nodes
-					.get(op.node as usize)
-					.is_some_and(|node| node.kind == NodeKind::Subshell) =>
-			{
-				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = status;
-				Flow::Jump(op.b)
 			},
 			Err(redir::Halt::Flow(f)) => f,
 			Err(redir::Halt::Failed) => {
@@ -3218,6 +3208,15 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				if info.kind == SpawnKind::Background {
 					let level = stage_level(unit, info.stages[0].entry, true);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
+					// A lone simple command runs in the caller's fatal-error
+					// context, including when it invokes a function. Compound
+					// bodies establish their own context.
+					let context = if unit.mode.dialect() == Dialect::Bash {
+						stage_level(unit, info.stages[0].entry, false)
+					} else {
+						level
+					};
+					child.invocation_depth = super::expansion_failure_depth(vp).saturating_add(context);
 				}
 				children.push(child.vpid);
 				let vpid = child.vpid;
@@ -3294,6 +3293,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
 					let level = stage_level(unit, stage.entry, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
+					child.invocation_depth = super::expansion_failure_depth(vp).saturating_add(level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
 					// stage (`jobs -p | xargs kill`).
 					if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {

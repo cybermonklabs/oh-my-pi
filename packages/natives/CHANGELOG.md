@@ -9,6 +9,7 @@
 - Fixed `compgen -F`, `-C` and `-W` not running completion functions, commands and word-list expansions on the command's own streams ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
 - Fixed command substitutions in `PS4` not expanding, and timed-out substitutions retaining open files or writing after the run returned ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
 - Fixed failed `lastpipe` stages returning before earlier stages finished, `time` losing reports on expansion errors, and arithmetic loop errors skipping later commands on the same line ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
+- Fixed external-command and subshell redirection expansions leaking variable assignments into the caller or ending the caller on an expansion error ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
 
 ### Changed
 

@@ -83,7 +83,7 @@ use crate::bash::{
 };
 
 /// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 14;
+pub const IR_VERSION: u32 = 15;
 
 /// Opcodes.
 #[derive(

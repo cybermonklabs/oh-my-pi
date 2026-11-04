@@ -87,6 +87,10 @@ pub struct Vproc {
 	/// nested shell). A field, not an overlay record: a record would cost
 	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
 	pub subshell:         u32,
+	/// Subshell execution context for fatal expansion status. A lone async
+	/// command (including its function body) keeps the caller's context,
+	/// although its visible `BASH_SUBSHELL` counter increases.
+	pub invocation_depth: u32,
 	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
@@ -1470,6 +1474,8 @@ pub enum Awaited {
 	AllJobs,
 	/// The first of the children to finish (`wait -n`); its status.
 	AnyJob,
+	/// A simple command forked before expanding its redirections.
+	Command(Vpid),
 }
 
 /// Transient handles; never serialized.
@@ -1534,8 +1540,9 @@ impl Live {
 // vproc with both.
 // Deferred trace state and unwound pipeline waits add 56 B to Vproc; staged
 // tracing adds 8 B to Scratch. The memory bench measured 1,896 B per idle
-// vproc with these continuations (target ≤ 2,048).
-const _: () = assert!(size_of::<Vproc>() <= 720, "Vproc grew (idle vproc ≤ 2 KiB)");
+// vproc with these continuations. The independent invocation context adds
+// another 8 B including padding; the idle benchmark target remains 2,048 B.
+const _: () = assert!(size_of::<Vproc>() <= 728, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 224, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");

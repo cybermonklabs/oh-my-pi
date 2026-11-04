@@ -2424,6 +2424,7 @@ impl Vproc {
 			lineage: crate::bash::host::Lineage::default(),
 			trace_base: 0,
 			subshell: 0,
+			invocation_depth: 0,
 			command: None,
 			spare: Vec::new(),
 			calls: Vec::new(),
@@ -2506,6 +2507,7 @@ impl Vproc {
 		// caught-signal traps stay in the overlay: the child lists them but
 		// does not run them (`state::inherited_trap`).
 		set_subshell_depth(&mut vp, subshell_depth(self).saturating_add(1));
+		vp.invocation_depth = expansion_failure_depth(self).saturating_add(1);
 		vp.status = self.status;
 		vp.scopes = state::copy_scopes(&k.root, store, self).unwrap_or_else(|err| {
 			k.fail(err);
@@ -2551,10 +2553,28 @@ impl Vproc {
 	}
 }
 
-/// `$BASH_SUBSHELL` of `vp` ([`Vproc::subshell`]); zero for the shell
-/// itself and a nested shell.
+/// `$BASH_SUBSHELL` of `vp`; zero for the shell itself and a nested shell.
 pub const fn subshell_depth(vp: &Vproc) -> u32 {
 	vp.subshell
+}
+
+/// Fatal expansions use the invocation's execution context, not its visible
+/// counter. Entry redirections still use the caller's context; the base
+/// frame retains this phase across suspended and no-fork substitutions.
+pub fn expansion_failure_depth(vp: &Vproc) -> u32 {
+	let setup = vp.frames.first().is_some_and(|frame| {
+		matches!(frame.kind, FrameKind::Subshell)
+			&& frame.unit.as_ref().is_some_and(|unit| {
+				unit.ops.get(frame.pc as usize).is_some_and(|op| {
+					op.code == ir::Opcode::Redir
+						&& unit
+							.nodes
+							.get(op.node as usize)
+							.is_some_and(|node| node.kind == crate::bash::event::NodeKind::Subshell)
+				})
+			})
+	});
+	vp.invocation_depth.saturating_sub(u32::from(setup))
 }
 
 /// Set `vp`'s `$BASH_SUBSHELL` (a vproc without an overlay is the shell

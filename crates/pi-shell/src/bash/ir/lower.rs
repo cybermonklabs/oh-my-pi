@@ -535,7 +535,7 @@ impl Lower {
 			self.emit(Opcode::Exec, c, 0, id);
 			return Ok(());
 		}
-		let redir = if cmd.redirs.is_empty() {
+		let redir = if cmd.redirs.is_empty() || matches!(cmd.kind, syn::CommandKind::Subshell(_)) {
 			None
 		} else {
 			let r = self.redir_list(&cmd.redirs)?;
@@ -571,7 +571,21 @@ impl Lower {
 				});
 				self.emit(Opcode::Spawn, spawn, 0, id);
 				let entry = self.here();
+				// A subshell applies its redirections after the child exists.
+				let redir = if cmd.redirs.is_empty() {
+					None
+				} else {
+					let list = self.redir_list(&cmd.redirs)?;
+					Some(self.emit(Opcode::Redir, list, 0, id))
+				};
 				self.list(body)?;
+				if redir.is_some() {
+					self.emit(Opcode::PopRedir, 0, 0, id);
+				}
+				let exit = self.here();
+				if let Some(at) = redir {
+					self.patch_b(at, exit);
+				}
 				self.emit(Opcode::SubExit, 0, 0, id);
 				let end = self.here();
 				let s = &mut self.unit.spawns[spawn as usize];

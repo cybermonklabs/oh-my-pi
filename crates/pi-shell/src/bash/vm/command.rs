@@ -1,8 +1,8 @@
-//! The staged simple command (`Exec`): expand the words and
-//! assignment values, apply the redirections, resolve the name, dispatch,
-//! await, write the output, finish. Every stage keeps its results in the
-//! op's scratch, so a park, a wake or a restore resumes the same stage and
-//! nothing earlier re-runs.
+//! The staged simple command (`Exec`): expand the words and assignment
+//! values, resolve the name, apply the redirections, dispatch, await, write
+//! the output, finish. Bash external commands expand their redirections in
+//! a child; builtins and functions keep the caller's context. Every stage
+//! keeps its results in the op's scratch, so a wake resumes without replay.
 
 use std::{
 	borrow::Cow,
@@ -281,23 +281,15 @@ pub fn exec(
 					}
 					match res {
 						Ok(()) => {},
-						Err(super::redir::Halt::Flow(f)) => {
-							if let Flow::Exit(status) | Flow::Discard(status) = f
-								&& external_redirection(k, vp, cx)
-							{
-								let s = st(vp);
-								s.status = status;
-								s.stage = Stage::Finish;
-								continue;
-							}
-							return f;
-						},
+						Err(super::redir::Halt::Flow(f)) => return f,
 						Err(super::redir::Halt::Failed) => {
 							// A special builtin's redirection error ends a posix
 							// shell (`exec 9<missing`).
 							// zsh: under `posixbuiltins`, in a non-interactive
 							// shell (`execcmd_exec`'s `fatal`).
-							let special = !st(vp).argv.is_empty()
+							let special = !st(vp).via_command
+								&& !st(vp).via_builtin
+								&& !st(vp).argv.is_empty()
 								&& IntrinsicId::from_name(&st(vp).argv[0]).is_some_and(is_special);
 							let fatal = special
 								&& if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
@@ -350,24 +342,60 @@ pub fn exec(
 				{
 					return flow;
 				}
-				// The rest of a deferred list ran (or was collected) after the
-				// name resolved: the command dispatches.
-				let resolved = k
-					.deferrals
-					.iter()
-					.any(|d| d.vproc == vp.vpid && d.phase != DeferPhase::Lookup);
+				// A Bash command resolved before the redirections. The old order
+				// remains for zsh and for a command without any words.
 				let s = st(vp);
 				s.stage = if s.argv.is_empty() {
 					Stage::Finish
-				} else if resolved {
+				} else if !s.writes.is_empty() {
+					Stage::Output
+				} else if s.target.is_some() {
 					Stage::Dispatch
 				} else {
 					Stage::Lookup
 				};
+				if k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
+					&& st(vp).stage == Stage::Dispatch
+					&& !k.deferrals.iter().any(|d| {
+						d.vproc == vp.vpid
+							&& (d.phase == DeferPhase::Lookup
+								|| (d.phase == DeferPhase::Resume
+									&& matches!(
+										current_exec(vp).and_then(|e| e.target.as_ref()),
+										Some(Target::External(_))
+									)))
+					}) {
+					emit_expanded(k, vp, cx, op);
+				}
 			},
 			Stage::Lookup => {
 				if let Some(flow) = lookup(k, vp, cx, op) {
 					return flow;
+				}
+				if unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+					&& matches!(st(vp).stage, Stage::Dispatch | Stage::Output)
+					&& cmd.redirs.is_some_and(|list| {
+						let done = scratch(vp).io.as_ref().map_or(0, |io| io.redir.done);
+						done < unit.redirs[list as usize].len()
+					}) {
+					let s = st(vp);
+					if s.stage == Stage::Dispatch
+						&& s.control != Some(Transfer::Exec)
+						&& !matches!(s.target, Some(Target::Function(_) | Target::Intrinsic(_)))
+						&& !(matches!(s.target, Some(Target::NotFound | Target::Search))
+							&& s.exec_as.is_none()
+							&& s.argv[0].starts_with(b"%"))
+					{
+						return fork_redirections(k, vp, cx, unit);
+					}
+					st(vp).stage = Stage::Redirect;
+				} else if st(vp).stage == Stage::Dispatch
+					&& !k
+						.deferrals
+						.iter()
+						.any(|d| d.vproc == vp.vpid && d.phase == DeferPhase::Lookup)
+				{
+					emit_expanded(k, vp, cx, op);
 				}
 			},
 			Stage::Dispatch
@@ -829,7 +857,11 @@ fn expand(
 		// `$?` of `x=$(cmd)` is the status of the last substitution.
 		s.status = s.sub_status.unwrap_or(0);
 	}
-	s.stage = Stage::Redirect;
+	s.stage = if !assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash {
+		Stage::Lookup
+	} else {
+		Stage::Redirect
+	};
 	if assign_only
 		&& k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
 		&& let Some(e) = current_exec(vp)
@@ -1318,58 +1350,51 @@ fn resolve(
 	})
 }
 
-/// Bash performs an external command's redirections after forking; their
-/// expansion errors cannot unwind the parent. Classify without a PATH probe.
-fn external_redirection(k: &mut Kernel, vp: &Vproc, cx: &mut Cx<'_>) -> bool {
-	let mut path = std::mem::take(&mut k.path_buf);
-	path.clear();
-	if let Ok(Some(value)) = state::lookup(&k.root, cx.store, vp, b"PATH") {
-		path.extend_from_slice(value.as_scalar().unwrap_or_default());
+/// Resume this already-expanded command in a child, just before its
+/// redirections. Move the scratch rather than repeating the word or prefix
+/// expansions; the parent retains only the wait and its command-end event.
+fn fork_redirections(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>) -> Flow {
+	let pc = vp.frames.last().expect("command frame").pc;
+	let mut child = vp.child(k, cx.store, Arc::clone(unit), pc, vp.fds.clone());
+	// Bash's external-command fork does not increment BASH_SUBSHELL. A
+	// substitution in a redirect adds its own level, as usual.
+	super::set_subshell_depth(&mut child, super::subshell_depth(vp));
+	child.invocation_depth = super::expansion_failure_depth(vp);
+	let mut sc = exec::take_scratch(vp);
+	let e = sc.exec.as_mut().expect("expanded command");
+	let (tag, t0, scoped, force_errexit) = (e.tag, e.t0, e.scoped, e.force_errexit);
+	e.stage = Stage::Redirect;
+	// Only this command belongs to the child, not the rest of the unit.
+	e.control = Some(Transfer::Exec);
+	let frame = child.frames.last_mut().expect("child command frame");
+	frame.debug_pc = Some(pc);
+	frame.scratch = Some(sc);
+	if scoped {
+		// The child copied this scope; it hides it while expanding redirs.
+		state::drop_scope(&mut k.root, cx.store, vp);
 	}
-	let mut via = Via::Plain;
-	let mut args = current_argv(vp);
-	let external = (|| {
-		loop {
-			let Some(name) = args.first() else {
-				return false;
-			};
-			let has_slash = name.contains(&b'/');
-			if via == Via::Plain
-				&& matches!(
-					state::record(cx.store, vp, Key::Func(BStr::new(name))),
-					Ok(Some(Record::Func { .. }))
-				) {
-				return false;
-			}
-			let rctx = ResolveCtx { has_slash, via, path_var: BStr::new(&path) };
-			match resolve(k, cx, vp, name, exec::mode_of(vp), rctx) {
-				Ok(Resolved::Intrinsic(IntrinsicId::Command)) => {
-					args = &args[1..];
-					while args
-						.first()
-						.is_some_and(|arg| matches!(arg.as_slice(), b"--" | b"-p"))
-					{
-						args = &args[1..];
-					}
-					if args.first().is_none_or(|arg| arg.starts_with(b"-")) {
-						return false;
-					}
-					via = Via::Command;
-				},
-				Ok(Resolved::Intrinsic(IntrinsicId::Builtin)) => {
-					args = &args[1..];
-					if args.first().is_some_and(|arg| arg.as_slice() == b"--") {
-						args = &args[1..];
-					}
-					via = Via::Builtin;
-				},
-				Ok(Resolved::Intrinsic(_)) | Err(_) => return false,
-				Ok(_) => return via != Via::Builtin,
-			}
+	let vpid = child.vpid;
+	for bang in &mut k.bangs {
+		if bang.vproc == vp.vpid {
+			bang.vproc = vpid;
 		}
-	})();
-	k.path_buf = path;
-	external
+	}
+	let mut parent = exec::take_scratch(vp);
+	let mut waiter = match parent.spare_exec.take() {
+		Some(mut e) => {
+			e.reset(tag, t0);
+			e
+		},
+		None => Box::new(ExecState::new(tag, t0)),
+	};
+	waiter.stage = Stage::Await;
+	waiter.waiting = Some(Awaited::Command(vpid));
+	waiter.force_errexit = force_errexit;
+	parent.exec = Some(waiter);
+	parent.children.push((vpid, None));
+	vp.frames.last_mut().expect("command frame").scratch = Some(parent);
+	k.spawned.push(Box::new(child));
+	Flow::Block(WaitKey::Proc(vpid))
 }
 
 /// Resolve the command name: `command`/`builtin` prefixes, functions,
@@ -1495,15 +1520,19 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 						// `builtin` takes no options.
 						let msg = format!("-{}: invalid option", argv[0][1] as char).into();
 						let line = line_of(vp, op.node);
-						k.diag(cx, vp, line, Diag::Usage { msg }.by("builtin"));
-						vp.queue_output(PendingWrite {
+						let bytes = k.render_diag(cx, vp, line, &Diag::Usage { msg }.by("builtin"));
+						k.path_buf = path;
+						let s = st(vp);
+						s.writes
+							.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+						s.writes.push_back(PendingWrite {
 							fd:    2,
 							bytes: BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
 							off:   0,
 						});
-						let s = st(vp);
+						s.target = Some(Target::Intrinsic(IntrinsicId::Builtin));
 						s.status = 2;
-						s.stage = Stage::Finish;
+						s.stage = Stage::Output;
 						return None;
 					}
 					via = Via::Builtin;
@@ -1512,10 +1541,14 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 				_ if via == Via::Builtin && !matches!(resolved, Resolved::Intrinsic(_)) => {
 					let name = argv[0].clone();
 					let line = line_of(vp, op.node);
-					k.diag(cx, vp, line, Diag::NotABuiltin { name }.by("builtin"));
+					let bytes = k.render_diag(cx, vp, line, &Diag::NotABuiltin { name }.by("builtin"));
+					k.path_buf = path;
 					let s = st(vp);
+					s.writes
+						.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+					s.target = Some(Target::Intrinsic(IntrinsicId::Builtin));
 					s.status = 1;
-					s.stage = Stage::Finish;
+					s.stage = Stage::Output;
 					return None;
 				},
 				Resolved::NotFound if has_slash => {
@@ -1642,6 +1675,11 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 		}
 	}
 	st(vp).stage = Stage::Dispatch;
+	None
+}
+
+/// Report expansion only once both the name and redirections are ready.
+fn emit_expanded(k: &mut Kernel, vp: &Vproc, cx: &mut Cx<'_>, op: Op) {
 	if k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
 		&& let Some(e) = current_exec(vp)
 	{
@@ -1656,7 +1694,6 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 			EventData::CmdExpanded { argv: &e.argv, assigns: &e.assigns, redirs: &[], resolved };
 		k.emit_op_at(cx, vp, op.node, data, t_ns);
 	}
-	None
 }
 
 /// Prefix assignments as variables of a temporary or function scope.
@@ -3129,6 +3166,13 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 	// An external this vproc ran finished (a `SIGCHLD` trap owes a run).
 	let mut reaped = false;
 	let status = match waiting {
+		Some(Awaited::Command(vpid)) => {
+			let Some(status) = k.proc_collect(cx.store, vpid) else {
+				return Some(Flow::Block(WaitKey::Proc(vpid)));
+			};
+			scratch(vp).children.clear();
+			status
+		},
 		// Back from a frame the builtin pushed: it runs again
 		// (`Control::Resume`).
 		Some(Awaited::Frame) if st(vp).resume => {
@@ -3410,6 +3454,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = sc.exec.as_ref().expect("exec");
 	let (status, t0, control, force_errexit) = (e.status, e.t0, e.control, e.force_errexit);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
+	let own_command = e.tag.vpid == vp.vpid;
 	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
 	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		print_exit_value(k, vp, cx, status);
@@ -3417,7 +3462,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
-	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
+	if own_command && k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the
 		// next command's `CmdStart` may share it.
 		let end = k.read_clock(cx);
