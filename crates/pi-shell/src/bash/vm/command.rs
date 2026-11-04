@@ -1277,9 +1277,15 @@ fn resolve(
 	})
 }
 
-/// Resolve the command name: `command`/`builtin` prefixes, functions,
-/// the host's table, then a PATH search through the pollable `Fs`.
-fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flow> {
+/// Resolve shell commands without searching PATH. A redirection failure
+/// needs only Bash's fork boundary; `builtin` still runs in this shell.
+fn resolve_target(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	redirection: bool,
+) -> Result<bool, Flow> {
 	// `command -p`: the search uses the standard utilities' path and not the
 	// hash table (decided while the name resolves; the search starts in the
 	// same turn).
@@ -1305,7 +1311,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 			},
 			Err(err) => {
 				k.fail(err);
-				return Some(Flow::Discard(1));
+				return Err(Flow::Discard(1));
 			},
 		}
 		let mode = exec::mode_of(vp);
@@ -1331,7 +1337,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 					Ok(resolved) => matches!(resolved, Resolved::Intrinsic(id) if is_special(id)),
 					Err(err) => {
 						k.fail(err);
-						return Some(Flow::Discard(1));
+						return Err(Flow::Discard(1));
 					},
 				}
 			} else {
@@ -1344,7 +1350,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 					Ok(_) => false,
 					Err(err) => {
 						k.fail(err);
-						return Some(Flow::Discard(1));
+						return Err(Flow::Discard(1));
 					},
 				};
 				if found && (!zsh || !zsh_disabled(cx.store, vp, name)) {
@@ -1356,7 +1362,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 				Ok(resolved) => resolved,
 				Err(err) => {
 					k.fail(err);
-					return Some(Flow::Discard(1));
+					return Err(Flow::Discard(1));
 				},
 			};
 			let ExecState { argv, arrayref, .. } = st(vp);
@@ -1384,7 +1390,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 						Via::Command
 					};
 				},
-				Resolved::Intrinsic(IntrinsicId::Builtin) if argv.len() > 1 => {
+				Resolved::Intrinsic(IntrinsicId::Builtin) if argv.len() > 1 && !redirection => {
 					argv.remove(0);
 					shift_arrayref(arrayref);
 					if argv[0].as_slice() == b"--" && argv.len() > 1 {
@@ -1393,7 +1399,6 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 					} else if argv[0].len() > 1 && argv[0][0] == b'-' && argv[0].as_slice() != b"--" {
 						// `builtin` takes no options.
 						let msg = format!("-{}: invalid option", argv[0][1] as char).into();
-						let line = line_of(vp, op.node);
 						k.diag(cx, vp, line, Diag::Usage { msg }.by("builtin"));
 						vp.out.push_back(PendingWrite {
 							fd:    2,
@@ -1403,18 +1408,17 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 						let s = st(vp);
 						s.status = 2;
 						s.stage = Stage::Finish;
-						return None;
+						return Ok(std_path);
 					}
 					via = Via::Builtin;
 				},
 				_ if via == Via::Builtin && !matches!(resolved, Resolved::Intrinsic(_)) => {
 					let name = argv[0].clone();
-					let line = line_of(vp, op.node);
 					k.diag(cx, vp, line, Diag::NotABuiltin { name }.by("builtin"));
 					let s = st(vp);
 					s.status = 1;
 					s.stage = Stage::Finish;
-					return None;
+					return Ok(std_path);
 				},
 				Resolved::NotFound if has_slash => {
 					let name = argv[0].clone();
@@ -1431,6 +1435,62 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 		let s = st(vp);
 		s.target = Some(target);
 		s.via_command = matches!(via, Via::Command | Via::CommandP);
+	}
+	Ok(std_path)
+}
+
+/// `execute_disk_command` expands redirections in its child. Failure
+/// ends that command, whereas a builtin/function's expansion runs here.
+pub(super) fn heredoc_error(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Unit,
+	line: u32,
+	stop: Stop,
+) -> super::redir::Halt {
+	let forked = if current_exec(vp).is_none() {
+		false
+	} else if current_argv(vp).is_empty() {
+		// Bash 5.3 `execute_null_command` forks stdin redirections too.
+		vp.frames
+			.last()
+			.and_then(|frame| unit.ops.get(frame.pc as usize))
+			.and_then(|op| unit.cmds.get(op.a as usize))
+			.and_then(|cmd| cmd.redirs.and_then(|list| unit.redirs.get(list as usize)))
+			.is_some_and(|redirs| {
+				redirs.iter().any(|r| match r.fd {
+					ir::RedirFdIr::Default => super::redir::default_fd(r.op) == 0,
+					ir::RedirFdIr::Num(fd) => fd == 0,
+					ir::RedirFdIr::Var(_) => true,
+				})
+			})
+	} else {
+		if let Err(flow) = resolve_target(k, vp, cx, line, true) {
+			return super::redir::Halt::Flow(flow);
+		}
+		!matches!(st(vp).target, Some(Target::Intrinsic(_) | Target::Function(_)))
+	};
+	if forked {
+		let (Stop::Fail(diag) | Stop::Fatal(diag)) = stop else {
+			unreachable!("expansion error")
+		};
+		k.diag(cx, vp, line, diag);
+		super::redir::Halt::Failed
+	} else {
+		super::redir::Halt::Flow(exec::stop_flow(k, vp, cx, line, stop))
+	}
+}
+
+/// Resolve the command name, then search PATH through the pollable Fs.
+fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flow> {
+	let line = line_of(vp, op.node);
+	let std_path = match resolve_target(k, vp, cx, line, false) {
+		Ok(std_path) => std_path,
+		Err(flow) => return Some(flow),
+	};
+	if st(vp).stage == Stage::Finish {
+		return None;
 	}
 	if st(vp).target == Some(Target::Search) {
 		// File-system probes: `CmdExpanded` reads the clock after them.

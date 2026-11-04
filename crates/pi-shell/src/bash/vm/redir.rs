@@ -24,7 +24,7 @@ use super::{
 	Cx, Kernel, TextKind,
 	builtins::{self, Lhs},
 	exec::{Flow, expanding},
-	expand::arith_value,
+	expand::{Stop, arith_value},
 	probe::{absolute, dev_fd},
 	proc::{
 		AssignValue, BangStage, DeferPhase, Deferral, FrameKind, Probe, ProbeResult, Saved, Slot,
@@ -194,7 +194,7 @@ const fn word_of(r: &RedirIr) -> usize {
 	}
 }
 
-const fn default_fd(op: RedirKind) -> i32 {
+pub(super) const fn default_fd(op: RedirKind) -> i32 {
 	match op {
 		RedirKind::In
 		| RedirKind::ReadWrite
@@ -252,8 +252,20 @@ fn target_text(
 				},
 			};
 			let w = tunit.words.last().cloned().unwrap_or_default();
-			expanding(k, vp, cx, Slot::Redirs, true, line, |ex| ex.scalar(&tunit, &w))
-				.map_err(Halt::Flow)
+			let mut error = None;
+			let result =
+				expanding(k, vp, cx, Slot::Redirs, true, line, |ex| match ex.scalar(&tunit, &w) {
+					Err(stop @ (Stop::Fail(_) | Stop::Fatal(_))) => {
+						error = Some(stop);
+						Ok(BString::default())
+					},
+					result => result,
+				})
+				.map_err(Halt::Flow)?;
+			if let Some(stop) = error {
+				return Err(super::command::heredoc_error(k, vp, cx, unit, line, stop));
+			}
+			Ok(result)
 		},
 		RedirTargetIr::Word(w) => {
 			let word = &unit.words[*w as usize];

@@ -91,6 +91,16 @@ fn push_code_point(out: &mut Vec<u8>, v: u32) {
 /// Decode the body of a `$'…'` string as bash's `ansiexpand` does (the
 /// result is cut at the first NUL, like the C string bash keeps).
 pub fn ansi_decode(raw: &[u8]) -> Vec<u8> {
+	let mut out = ansi_decode_bytes(raw);
+	if let Some(nul) = out.iter().position(|&byte| byte == 0) {
+		out.truncate(nul);
+	}
+	out
+}
+
+/// `ansicstr`'s length-delimited result, before a C-string consumer cuts
+/// it at NUL. `parse_matched_pair` copies that NUL into the whole word.
+pub(super) fn ansi_decode_bytes(raw: &[u8]) -> Vec<u8> {
 	let mut out = Vec::with_capacity(raw.len());
 	let mut pos = 0;
 	while pos < raw.len() {
@@ -182,9 +192,6 @@ pub fn ansi_decode(raw: &[u8]) -> Vec<u8> {
 				out.push(esc);
 			},
 		}
-	}
-	if let Some(nul) = out.iter().position(|&byte| byte == 0) {
-		out.truncate(nul);
 	}
 	out
 }
