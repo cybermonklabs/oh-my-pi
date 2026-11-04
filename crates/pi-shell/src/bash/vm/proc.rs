@@ -1066,7 +1066,9 @@ impl Scratch {
 		if sub.is_some() {
 			*sub = None;
 		}
-		if let Some(e) = exec.take() {
+		if let Some(mut e) = exec.take() {
+			// An interrupted expansion may still own its hidden environment.
+			e.hidden_env = None;
 			*spare_exec = Some(e);
 		}
 		if let Some(io) = io {
@@ -1299,6 +1301,9 @@ pub struct ExecState {
 	pub waiting:       Option<Awaited>,
 	/// A temporary scope (builtin environment) was pushed for this command.
 	pub scoped:        bool,
+	/// The temporary environment hidden across prompt/redirection expansion.
+	/// Inline: moving a scope here does not allocate for each traced prefix.
+	pub hidden_env:    Option<Scope>,
 	/// Control transfer to perform once the output is written.
 	pub control:       Option<Transfer>,
 	/// `Task::checkpoint` bytes taken at externalize.
@@ -1369,6 +1374,10 @@ pub enum AssignValue {
 pub enum Stage {
 	/// Expand words to fields (side effects, no fs calls).
 	Expand,
+	/// Finish a statement assignment after its value's trace boundary.
+	TraceAssignment,
+	/// Restore the temporary environment after the command trace completes.
+	TraceCommand,
 	/// Apply redirections (`open` through `Fs`).
 	Redirect,
 	/// Resolve the name; PATH search through `Fs`.
@@ -1545,7 +1554,10 @@ impl Live {
 const _: () = assert!(size_of::<Vproc>() <= 728, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 224, "Scratch grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
+// Hidden environments move inline instead of allocating a box. Their field
+// is the only new state allowed here; the measured idle budget has 144 B left.
+const _: () = assert!(size_of::<ExecState>() <= 376 + size_of::<Option<Scope>>(), "ExecState grew beyond its hidden environment");
+const _: () = assert!(size_of::<ExecState>() <= 520, "ExecState grew (idle vproc ≤ 2 KiB)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
 // pointer only; `RedirProgress` not at all).

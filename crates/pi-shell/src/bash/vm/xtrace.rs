@@ -5,7 +5,7 @@
 use bstr::BString;
 
 use super::{
-	Cx, Kernel, TextKind,
+	Cx, Kernel, TextKind, command,
 	exec::{self, Flow},
 	expand::{Expander, Stop},
 	locale,
@@ -14,10 +14,7 @@ use super::{
 	},
 	quote, state,
 };
-use crate::bash::{
-	fd::FdRef,
-	store::{KeyBuf, OptId, Record, StateStore},
-};
+use crate::bash::{ir::ComsubForm, store::{KeyBuf, OptId, Record, StateStore}};
 
 /// bash's `indirection_level` in `vp`: 1 at the top, one more per `eval`,
 /// `.` file and trap action running, plus the level the vproc started at
@@ -131,7 +128,6 @@ pub fn cond(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, terms: &
 /// A trace line whose prompt may park on command substitutions. It belongs
 /// to one frame depth, so a no-fork prompt substitution can run above it.
 pub struct Pending {
-	pub target:       Option<FdRef>,
 	pub fd:           i32,
 	pub body:         BString,
 	pub ps4:          BString,
@@ -141,6 +137,11 @@ pub struct Pending {
 	pub log:          Vec<Atom>,
 	pub sub:          Option<PendingSub>,
 	pub saved_xtrace: Option<bool>,
+	/// A no-fork prompt body hid the command's temporary environment.
+	pub restore_env:  bool,
+	/// An assignment list inside a no-fork body clears Bash's temporary-
+	/// environment lookup phase for the remainder of the outer prompt.
+	pub resume_env:   bool,
 	pub status:       i32,
 }
 
@@ -156,14 +157,8 @@ pub fn emit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, body: &[
 	if vp.mode.dialect() == crate::bash::ids::Dialect::Bash
 		&& ps4.iter().any(|c| matches!(c, b'$' | b'`' | b'\\'))
 	{
-		let target = vp.fds.get(fd).cloned();
-		let body = if target.is_some() {
-			BString::from(body)
-		} else {
-			BString::default()
-		};
+		let body = BString::from(body);
 		vp.traces.push_back(Pending {
-			target,
 			fd,
 			body,
 			ps4,
@@ -173,6 +168,8 @@ pub fn emit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, body: &[
 			log: Vec::new(),
 			sub: None,
 			saved_xtrace: None,
+			restore_env: false,
+			resume_env: true,
 			status: vp.status,
 		});
 		return;
@@ -202,11 +199,18 @@ pub fn poll(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<Flow> {
 		p.saved_xtrace = Some(on(k, cx, vp));
 		set_xtrace(k, cx, vp, false);
 	}
+	let nofork = matches!(p.sub.as_ref(), Some(PendingSub::NoFork { .. }));
 	let mut scratch = Scratch { sub: p.sub.take(), ..Scratch::default() };
 	scratch.logs[Slot::Words as usize] = std::mem::take(&mut p.log);
 	let flow = if let Some(flow) = exec::settle_sub(k, vp, cx, &mut scratch, Slot::Words) {
 		Some(flow)
 	} else {
+		if nofork && p.restore_env
+			&& (p.resume_env || super::nested::in_subshell(cx.store, vp) || command::builtin_context(vp))
+		{
+			command::restore_env(k, vp, cx);
+			p.restore_env = false;
+		}
 		let mode = exec::mode_of(vp);
 		let result = k
 			.engine
@@ -220,22 +224,36 @@ pub fn poll(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<Flow> {
 			});
 		match result {
 			Some(Err(Stop::Sub { unit, entry, form, text })) => {
-				Some(exec::start_sub(k, vp, cx, &mut scratch, exec::Sub {
+				// A fork inherits prefix assignments even when the parent prompt
+				// expands outside them. A no-fork body runs in the outer shell;
+				// its remaining prompt expansion stays outside that environment.
+				let inherited = form == ComsubForm::Fork && command::restore_env(k, vp, cx);
+				if form != ComsubForm::Fork && command::hide_env(k, vp, cx) {
+					p.restore_env = true;
+				}
+				let flow = exec::start_sub(k, vp, cx, &mut scratch, exec::Sub {
 					unit,
 					entry,
 					form,
 					text,
 					line: p.line,
-				}))
+				});
+				if inherited {
+					command::hide_env(k, vp, cx);
+				}
+				Some(flow)
 			},
 			Some(Err(Stop::Wait(key))) => Some(Flow::Block(key)),
 			result => {
 				let expanded = result.and_then(Result::ok).unwrap_or_else(|| p.ps4.clone());
-				if let Some(target) = p.target {
-					let bytes = trace_line(repeated(&expanded, p.level), &p.body);
-					vp.out
-						.push_back((target, PendingWrite { fd: p.fd, bytes, off: 0 }));
+				if p.restore_env {
+					command::restore_env(k, vp, cx);
 				}
+				// PS4 may close or replace this descriptor itself. Resolve and
+				// pin its current object only after those side effects finish,
+				// still before the traced command's own redirections run.
+				let bytes = trace_line(repeated(&expanded, p.level), &p.body);
+				vp.queue_output(PendingWrite { fd: p.fd, bytes, off: 0 });
 				if p.saved_xtrace == Some(true) {
 					set_xtrace(k, cx, vp, true);
 				}
@@ -248,6 +266,18 @@ pub fn poll(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<Flow> {
 	p.log = std::mem::take(&mut scratch.logs[Slot::Words as usize]);
 	vp.traces.insert(index, p);
 	flow
+}
+
+/// Bash's assignment-list executor clears `assigning_in_environment`.
+/// A no-fork prompt body does not save that flag, unlike its environment,
+/// so completing a real assignment list affects the outer prompt's reads.
+pub fn assignment_done(vp: &mut Vproc) {
+	let depth = vp.frames.len();
+	for pending in &mut vp.traces {
+		if pending.restore_env && pending.depth < depth {
+			pending.resume_env = false;
+		}
+	}
 }
 
 fn set_xtrace(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, enabled: bool) {

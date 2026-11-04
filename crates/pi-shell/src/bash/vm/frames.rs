@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 34;
+pub const FRAMES_VERSION: u32 = 36;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -346,10 +346,9 @@ enum SubImage {
 	NoFork { value: bool, capture: u32 },
 }
 
-/// A trace prompt's replay state, including its pinned output and capture.
+/// A trace prompt's replay state and command-substitution capture.
 #[derive(Serialize, Deserialize)]
 struct TraceImage {
-	target:       Option<u32>,
 	fd:           i32,
 	body:         BString,
 	ps4:          BString,
@@ -359,6 +358,8 @@ struct TraceImage {
 	log:          Vec<Atom>,
 	sub:          Option<SubImage>,
 	saved_xtrace: Option<bool>,
+	restore_env:  bool,
+	resume_env:   bool,
 	status:       i32,
 }
 
@@ -609,7 +610,6 @@ impl Shell {
 					.traces
 					.iter()
 					.map(|p| TraceImage {
-						target:       p.target.as_ref().map(|target| fds.fd(target)),
 						fd:           p.fd,
 						body:         p.body.clone(),
 						ps4:          p.ps4.clone(),
@@ -626,6 +626,8 @@ impl Shell {
 							},
 						}),
 						saved_xtrace: p.saved_xtrace,
+						restore_env: p.restore_env,
+						resume_env: p.resume_env,
 						status:       p.status,
 					})
 					.collect(),
@@ -865,7 +867,6 @@ impl Shell {
 				.traces
 				.into_iter()
 				.map(|p| super::xtrace::Pending {
-					target:       p.target.map(|target| objs.fd(cx.host, target)),
 					fd:           p.fd,
 					body:         p.body,
 					ps4:          p.ps4,
@@ -882,6 +883,8 @@ impl Shell {
 						},
 					}),
 					saved_xtrace: p.saved_xtrace,
+					restore_env: p.restore_env,
+					resume_env: p.resume_env,
 					status:       p.status,
 				})
 				.collect();

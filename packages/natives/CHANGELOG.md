@@ -10,6 +10,7 @@
 - Fixed command substitutions in `PS4` not expanding, and timed-out substitutions retaining open files or writing after the run returned ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
 - Fixed failed `lastpipe` stages returning before earlier stages finished, `time` losing reports on expansion errors, and arithmetic loop errors skipping later commands on the same line ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
 - Fixed external-command and subshell redirection expansions leaking variable assignments into the caller or ending the caller on an expansion error ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
+- Fixed `set -x` assignment prefixes seeing later bindings or the wrong temporary environment while `PS4` expands ([#17714](https://github.com/can1357/oh-my-pi/pull/17714) by [@sjawhar](https://github.com/sjawhar))
 
 ### Changed
 

@@ -62,6 +62,7 @@ impl ExecState {
 			target: None,
 			waiting: None,
 			scoped: false,
+			hidden_env: None,
 			control: None,
 			checkpoint: None,
 			writes: VecDeque::new(),
@@ -95,6 +96,7 @@ impl ExecState {
 			target,
 			waiting,
 			scoped,
+			hidden_env,
 			control,
 			checkpoint,
 			writes,
@@ -123,6 +125,7 @@ impl ExecState {
 		*target = None;
 		*waiting = None;
 		*scoped = false;
+		*hidden_env = None;
 		*control = None;
 		*checkpoint = None;
 		writes.clear();
@@ -148,6 +151,30 @@ fn st(vp: &mut Vproc) -> &mut ExecState {
 		.exec
 		.as_deref_mut()
 		.expect("Exec state is created first")
+}
+
+/// Move a command's temporary environment out before an expansion that
+/// must not see it. `scoped` stays false until restoration so an interrupted
+/// command drops its owned scope instead of popping its caller's scope.
+pub(super) fn hide_env(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
+	if !current_exec(vp).is_some_and(|e| e.scoped) {
+		return false;
+	}
+	let scope = state::pop_scope(&mut k.root, cx.store, vp);
+	let s = st(vp);
+	s.hidden_env = scope;
+	s.scoped = false;
+	true
+}
+
+pub(super) fn restore_env(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
+	if !current_exec(vp).is_some_and(|e| e.hidden_env.is_some()) {
+		return false;
+	}
+	let scope = st(vp).hidden_env.take().expect("hidden command environment");
+	state::push_scope(&mut k.root, cx.store, vp, scope);
+	st(vp).scoped = true;
+	true
 }
 
 /// Most word buffers [`Scratch::spare_words`] keeps.
@@ -195,6 +222,17 @@ pub fn forces_errexit(vp: &Vproc, caller: usize) -> bool {
 		.and_then(|frame| frame.scratch.as_ref())
 		.and_then(|scratch| scratch.exec.as_deref())
 		.is_some_and(|exec| exec.force_errexit)
+}
+
+/// A builtin whose body is still running forces temporary-environment
+/// lookup in Bash prompts (`executing_builtin`), unlike a function alone.
+pub(super) fn builtin_context(vp: &Vproc) -> bool {
+	vp.frames.iter().any(|frame| {
+		frame.scratch.as_ref().and_then(|s| s.exec.as_deref()).is_some_and(|e| {
+			matches!(e.waiting, Some(Awaited::Frame))
+				&& matches!(e.target.as_ref(), Some(Target::Intrinsic(_)))
+		})
+	})
 }
 
 /// A leading command builtin disables -e while its ignored builtin runs.
@@ -258,26 +296,25 @@ pub fn exec(
 	loop {
 		let stage = st(vp).stage;
 		match stage {
-			Stage::Expand => {
+			Stage::Expand | Stage::TraceAssignment => {
 				if let Some(flow) = expand(k, vp, cx, unit, op, line) {
 					return flow;
 				}
+			},
+			Stage::TraceCommand => {
+				restore_env(k, vp, cx);
+				st(vp).stage = Stage::Lookup;
 			},
 			Stage::Redirect => {
 				if let Some(list) = cmd.redirs {
 					// Opens: `CmdExpanded` reads the clock after them.
 					k.clock_stale();
-					// Redirections do not see the command's temporary
-					// environment (bash `expanding_redir`).
-					let at = state::scope_count(&k.root, vp).saturating_sub(1);
-					let hidden = if st(vp).scoped && !cmd.assigns.is_empty() {
-						state::pop_scope(&mut k.root, cx.store, vp)
-					} else {
-						None
-					};
+					// Keep the temporary environment hidden while a redirection
+					// parks or runs a no-fork substitution, not only in this call.
+					hide_env(k, vp, cx);
 					let res = super::redir::apply(k, vp, cx, unit, list, line);
-					if let Some(scope) = hidden {
-						state::insert_scope(&mut k.root, cx.store, vp, at, scope);
+					if !matches!(&res, Err(super::redir::Halt::Flow(Flow::Call | Flow::Block(_)))) {
+						restore_env(k, vp, cx);
 					}
 					match res {
 						Ok(()) => {},
@@ -594,7 +631,7 @@ fn expand(
 		zsh_last_arg(k, vp, cx);
 	}
 	let assign_only = st(vp).argv.is_empty();
-	if !assign_only && !cmd.assigns.is_empty() && !st(vp).scoped {
+	if !assign_only && (!cmd.assigns.is_empty() || !st(vp).keywords.is_empty()) && !st(vp).scoped {
 		// The command's temporary scope: each prefix assignment enters it
 		// as it is expanded, so later ones see earlier ones (and a `PATH=`
 		// prefix steers the lookup).
@@ -607,8 +644,14 @@ fn expand(
 		};
 		state::push_scope(&mut k.root, cx.store, vp, scope);
 	}
-	while st(vp).values.len() < cmd.assigns.len() + st(vp).keywords.len() {
-		let i = st(vp).values.len();
+	// At the binding boundary, the last values/assigns slot owns the raw
+	// RHS. Keep it there while PS4 or the subsequent subscript expansion
+	// parks, so neither can repeat the RHS's side effects.
+	while st(vp).stage == Stage::TraceAssignment
+		|| st(vp).values.len() < cmd.assigns.len() + st(vp).keywords.len()
+	{
+		let pending_trace = st(vp).stage == Stage::TraceAssignment;
+		let i = st(vp).values.len() - usize::from(pending_trace);
 		if assign_only
 			&& unit.mode.dialect() == crate::bash::ids::Dialect::Zsh
 			&& let Some(a) = cmd.assigns.get(i)
@@ -618,7 +661,55 @@ fn expand(
 			}
 			continue;
 		}
-		let (name, append, node, index, value) = if let Some(a) = cmd.assigns.get(i) {
+		if !pending_trace && assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+			&& let Some(a) = cmd.assigns.get(i)
+			&& matches!(a.value, AssignVal::Array(_)) && xtrace::on(k, cx, vp)
+		{
+			// Bash traces the parsed compound list before expanding its elements.
+			let utf8 = xtrace::utf8(k, cx, vp);
+			let value = AssignValue::Array(Vec::new());
+			let body = assignment_trace(unit, Some(a), &a.name, None, a.append, &value, utf8);
+			let s = st(vp);
+			s.assigns.push((a.name.clone(), BString::default()));
+			s.values.push((None, value));
+			s.stage = Stage::TraceAssignment;
+			xtrace::emit(k, cx, vp, line, &body);
+			return Some(Flow::Call);
+		}
+		let mut trace_value = false;
+		let (name, append, node, index, value) = if pending_trace {
+			let (append, node) = match cmd.assigns.get(i) {
+				Some(a) => (a.append, a.node),
+				None => {
+					let word = st(vp).keywords[i - cmd.assigns.len()];
+					let source = exec::word_source(unit, word);
+					let eq = source.iter().position(|&c| c == b'=').unwrap_or(source.len());
+					(eq > 0 && source[eq - 1] == b'+', unit.words[word as usize].node)
+				},
+			};
+			let expanded_value = if let Some(a) = cmd.assigns.get(i)
+				&& matches!(a.value, AssignVal::Array(_))
+			{
+				match expand_assign_value(k, vp, cx, unit, a, line) {
+					Ok(value) => Some(value),
+					Err(flow) => return Some(flow),
+				}
+			} else {
+				None
+			};
+			let index = match cmd.assigns.get(i) {
+				Some(a) => match expand_assign_index(k, vp, cx, unit, a, line) {
+					Ok(index) => index,
+					Err(flow) => return Some(flow),
+				},
+				None => None,
+			};
+			let s = st(vp);
+			let (name, _) = s.assigns.pop().expect("pending assignment name");
+			let (_, stored_value) = s.values.pop().expect("pending assignment value");
+			s.stage = Stage::Expand;
+			(name, append, node, index, expanded_value.unwrap_or(stored_value))
+		} else if let Some(a) = cmd.assigns.get(i) {
 			if !assign_only && a.index.is_some() {
 				// `var[0]=X cmd`: bash reports the word as written, sets
 				// nothing (expands nothing) and runs the command.
@@ -638,61 +729,33 @@ fn expand(
 					.push((Some(BString::default()), AssignValue::Scalar(BString::default())));
 				continue;
 			}
-			// `b[]=x`: a subscript written empty is a bad one (an expanded
-			// empty one, `b[$e]`, is element 0); bash reports the element
-			// and abandons the line as for any failed assignment.
-			if let Some(w) = a.index
-				&& unit.words[w as usize].parts.is_empty()
-			{
-				let mut shown = a.name.clone();
-				shown.extend_from_slice(b"[]");
-				k.diag(cx, vp, line, Diag::BadSubscript { shown });
-				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
-					.unwrap_or(false)
-				{
-					return Some(Flow::Exit(1));
-				}
-				return Some(Flow::Discard(1));
-			}
-			let record = assign_parks(unit, a);
-			let res = expanding(k, vp, cx, Slot::Assigns, record, line, |ex| {
-				let index = match a.index {
-					Some(w) => Some(ex.scalar(unit, &unit.words[w as usize])?),
-					None => None,
-				};
-				let value = match &a.value {
-					AssignVal::Scalar(w) => Ok(ex.scalar(unit, &unit.words[*w as usize])?),
-					AssignVal::Array(elems) => {
-						let mut out = Vec::with_capacity(elems.len());
-						let mut globs = Vec::new();
-						ex.assign_compound(unit, &a.name, elems, &mut out, Some(&mut globs))?;
-						Err((out, globs))
-					},
-				};
-				Ok((index, value))
-			});
-			let (index, value) = match res {
-				Ok(v) => v,
+			let value = match expand_assign_value(k, vp, cx, unit, a, line) {
+				Ok(value) => value,
 				Err(flow) => return Some(flow),
 			};
-			let value = match value {
-				Ok(scalar) => AssignValue::Scalar(scalar),
-				Err((mut elems, globs)) => {
-					// `a=(*)`: pathname expansion of the unkeyed words; a park
-					// replays the expansion (its log is kept until here).
-					if !globs.is_empty()
-						&& let Err(flow) =
-							super::glob::expand_compound_globs(k, vp, cx, &mut elems, &globs, line)
-					{
-						return Some(flow);
-					}
-					AssignValue::Array(
-						elems
-							.into_iter()
-							.map(|e| (e.key, e.append, e.value))
-							.collect(),
-					)
-				},
+			trace_value = assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& matches!(a.value, AssignVal::Scalar(_)) && xtrace::on(k, cx, vp);
+			if assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& (trace_value || a.index.is_some()) && matches!(a.value, AssignVal::Scalar(_))
+			{
+				let body = if trace_value {
+					let utf8 = xtrace::utf8(k, cx, vp);
+					Some(assignment_trace(unit, Some(a), &a.name, None, a.append, &value, utf8))
+				} else { None };
+				let s = st(vp);
+				s.assigns.push((a.name.clone(), BString::default()));
+				s.values.push((None, value));
+				s.stage = Stage::TraceAssignment;
+				scratch(vp).logs[Slot::Assigns as usize].clear();
+				if let Some(body) = body {
+					xtrace::emit(k, cx, vp, line, &body);
+					return Some(Flow::Call);
+				}
+				continue;
+			}
+			let index = match expand_assign_index(k, vp, cx, unit, a, line) {
+				Ok(index) => index,
+				Err(flow) => return Some(flow),
 			};
 			(a.name.clone(), a.append, a.node, index, value)
 		} else {
@@ -711,9 +774,22 @@ fn expand(
 				None => (BString::from(&text[..eq]), false),
 			};
 			let value = BString::from(text.get(eq + 1..).unwrap_or_default());
+			trace_value = assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& xtrace::on(k, cx, vp);
 			(name, append, word.node, None, AssignValue::Scalar(value))
 		};
 		scratch(vp).logs[Slot::Assigns as usize].clear();
+		scratch(vp).logs[Slot::Redirs as usize].clear();
+		if trace_value {
+			let utf8 = xtrace::utf8(k, cx, vp);
+			let body = assignment_trace(unit, cmd.assigns.get(i), &name, index.as_ref().map(|i| i.as_slice()), append, &value, utf8);
+			let s = st(vp);
+			s.assigns.push((name, BString::default()));
+			s.values.push((index, value));
+			st(vp).stage = Stage::TraceAssignment;
+			xtrace::emit(k, cx, vp, line, &body);
+			return Some(Flow::Call);
+		}
 		// A prefix assignment through a name reference binds the target in
 		// the temporary scope (bash `assign_in_env`, as ksh93 does); `+=`
 		// appends to the target's value.
@@ -799,11 +875,11 @@ fn expand(
 			BString::default()
 		};
 		let value = if assign_only {
-			// The statement's value goes to the variable. Only `set -x`
-			// reads it back from the command's values (a scalar; a compound
-			// value is traced from the IR), so it is copied only then.
+			// Bash traces before binding. Zsh retains
+			// scalars for its existing end-of-list trace; compounds use IR.
 			let kept = match &value {
-				AssignValue::Scalar(s) if xtrace::on(k, cx, vp) => AssignValue::Scalar(s.clone()),
+				AssignValue::Scalar(s) if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh
+					&& xtrace::on(k, cx, vp) => AssignValue::Scalar(s.clone()),
 				AssignValue::Scalar(_) => AssignValue::Scalar(BString::default()),
 				AssignValue::Array(_) => AssignValue::Array(Vec::new()),
 			};
@@ -851,6 +927,30 @@ fn expand(
 		let s = st(vp);
 		s.assigns.push((name.clone(), shown));
 		s.values.push((index, value));
+		if !assign_only && unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+			&& xtrace::on(k, cx, vp)
+		{
+			let utf8 = xtrace::utf8(k, cx, vp);
+			let s = st(vp);
+			// A nameref binds its target, but Bash traces the source LHS.
+			let name = if let Some(a) = cmd.assigns.get(i) {
+				a.name.as_slice()
+			} else {
+				let source = exec::word_source(unit, s.keywords[i - cmd.assigns.len()]);
+				let eq = source.iter().position(|&c| c == b'=').unwrap_or(source.len());
+				&source[..eq - usize::from(eq > 0 && source[eq - 1] == b'+')]
+			};
+			let (index, value) = s.values.last().expect("bound prefix value");
+			let body = assignment_trace(unit, cmd.assigns.get(i), name, index.as_ref().map(|i| i.as_slice()), false, value, utf8);
+			xtrace::emit(k, cx, vp, line, &body);
+			// A full trace (or an EPIPE) precedes the next assignment's RHS.
+			return Some(Flow::Call);
+		}
+	}
+	if unit.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& (!cmd.assigns.is_empty() || !st(vp).keywords.is_empty())
+	{
+		xtrace::assignment_done(vp);
 	}
 	let s = st(vp);
 	if assign_only {
@@ -882,10 +982,24 @@ fn expand(
 			t_ns,
 		);
 	}
-	if xtrace::on(k, cx, vp) {
-		trace(k, vp, cx, unit, &cmd.assigns, line);
-		// Complete PS4 before this command moves stderr with its redirections.
-		return Some(Flow::Call);
+	if (!assign_only || unit.mode.dialect() == crate::bash::ids::Dialect::Zsh) && xtrace::on(k, cx, vp) {
+		if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+			trace_zsh(k, vp, cx, unit, &cmd.assigns, line);
+			return Some(Flow::Call);
+		}
+		if !assign_only {
+			// The ordinary command prompt hides prefix assignments. Active
+			// builtins and forked shells force that lookup in Bash instead.
+			if !super::nested::in_subshell(cx.store, vp) && !builtin_context(vp) {
+				hide_env(k, vp, cx);
+			}
+			st(vp).stage = Stage::TraceCommand;
+			let utf8 = xtrace::utf8(k, cx, vp);
+			let mut body = Vec::new();
+			xtrace::push_words(&mut body, &st(vp).argv, utf8);
+			xtrace::emit(k, cx, vp, line, &body);
+			return Some(Flow::Call);
+		}
 	}
 	None
 }
@@ -1174,8 +1288,44 @@ fn is_arrayref(word: &ir::Word) -> bool {
 	name > 0 && !first[0].is_ascii_digit() && first.get(name) == Some(&b'[') && last.ends_with(b"]")
 }
 
-/// `set -x`: one line per assignment, then the words.
-fn trace(
+/// Preserve the assignment's spelling while formatting its expanded scalar
+/// value. Compound values use their parsed elements, as Bash's trace does.
+fn assignment_trace(
+	unit: &Unit,
+	assignment: Option<&ir::AssignOp>,
+	name: &[u8],
+	index: Option<&[u8]>,
+	append: bool,
+	value: &AssignValue,
+	utf8: bool,
+) -> Vec<u8> {
+	let mut body = Vec::new();
+	let index = if unit.mode.dialect() == crate::bash::ids::Dialect::Bash {
+		assignment.and_then(|a| a.index.map(|w| exec::word_source(unit, w))).or(index)
+	} else { index };
+	if let Some(AssignVal::Array(elems)) = assignment.map(|a| &a.value) {
+		body.extend_from_slice(name);
+		body.extend_from_slice(if append { b"+=(" } else { b"=(" });
+		for (j, e) in elems.iter().enumerate() {
+			if j > 0 {
+				body.push(b' ');
+			}
+			if let Some(key) = e.key {
+				body.push(b'[');
+				body.extend_from_slice(&parsed_source(exec::word_source(unit, key)));
+				body.extend_from_slice(if e.append { b"]+=" } else { b"]=" });
+			}
+			body.extend_from_slice(&parsed_source(exec::word_source(unit, e.value)));
+		}
+		body.push(b')');
+	} else {
+		xtrace::push_assign(&mut body, name, index, append, value, utf8);
+	}
+	body
+}
+
+/// Zsh's retained end-of-list trace: assignments, then command words.
+fn trace_zsh(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
@@ -1192,32 +1342,8 @@ fn trace(
 		if index.as_ref().is_some_and(|i| i.is_empty()) {
 			continue;
 		}
-		let mut body = Vec::new();
 		let append = assigns.get(i).is_some_and(|a| a.append);
-		// bash traces a compound value as the parser kept it: the
-		// elements as written, `$'…'` already single-quoted
-		// (`metas=(\| ' ' '<TAB>')`, `n=($@)`).
-		if let Some(AssignVal::Array(elems)) = assigns.get(i).map(|a| &a.value) {
-			body.extend_from_slice(name);
-			body.extend_from_slice(if append { b"+=(" } else { b"=(" });
-			for (j, e) in elems.iter().enumerate() {
-				if j > 0 {
-					body.push(b' ');
-				}
-				if let Some(key) = e.key {
-					body.push(b'[');
-					body.extend_from_slice(&parsed_source(exec::word_source(unit, key)));
-					body.extend_from_slice(if e.append { b"]+=" } else { b"]=" });
-				}
-				body.extend_from_slice(&parsed_source(exec::word_source(unit, e.value)));
-			}
-			body.push(b')');
-			lines.push(body);
-			continue;
-		}
-		let index = index.as_ref().map(|i| i.as_slice());
-		xtrace::push_assign(&mut body, name, index, append, value, utf8);
-		lines.push(body);
+		lines.push(assignment_trace(unit, assigns.get(i), name, index.as_ref().map(|i| i.as_slice()), append, value, utf8));
 	}
 	if !s.argv.is_empty() {
 		let mut body = Vec::new();
@@ -1296,6 +1422,75 @@ fn assign_parks(unit: &Unit, a: &ir::AssignOp) -> bool {
 				.iter()
 				.any(|e| e.key.is_some_and(word) || word(e.value)),
 		}
+}
+
+/// Expand the RHS before touching the LHS subscript. Its replay log remains
+/// available until both expansions finish, including a parked subscript.
+fn expand_assign_value(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Arc<Unit>,
+	a: &ir::AssignOp,
+	line: u32,
+) -> Result<AssignValue, Flow> {
+	if a.index.is_some() && matches!(a.value, AssignVal::Array(_)) {
+		// The binder rejects every list assigned to one array member before
+		// evaluating its index or elements. Preserve that error without
+		// running side effects in an RHS that cannot be assigned.
+		return Ok(AssignValue::Array(Vec::new()));
+	}
+	let glob_parks = match &a.value {
+		AssignVal::Array(elems) => elems.iter().any(|e| !unit.words[e.value as usize].noglob),
+		AssignVal::Scalar(_) => false,
+	};
+	let value = expanding(k, vp, cx, Slot::Assigns, assign_parks(unit, a) || glob_parks, line, |ex| {
+		match &a.value {
+			AssignVal::Scalar(w) => ex.scalar(unit, &unit.words[*w as usize]).map(Ok),
+			AssignVal::Array(elems) => {
+				let mut out = Vec::with_capacity(elems.len());
+				let mut globs = Vec::new();
+				ex.assign_compound(unit, &a.name, elems, &mut out, Some(&mut globs))?;
+				Ok(Err((out, globs)))
+			},
+		}
+	})?;
+	match value {
+		Ok(scalar) => Ok(AssignValue::Scalar(scalar)),
+		Err((mut elems, globs)) => {
+			if !globs.is_empty() {
+				super::glob::expand_compound_globs(k, vp, cx, &mut elems, &globs, line)?;
+			}
+			Ok(AssignValue::Array(elems.into_iter().map(|e| (e.key, e.append, e.value)).collect()))
+		},
+	}
+}
+
+/// Subscripts have their own replay site so a blocked index never consumes
+/// the RHS log or changes the trace's already-expanded value.
+fn expand_assign_index(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Arc<Unit>,
+	a: &ir::AssignOp,
+	line: u32,
+) -> Result<Option<BString>, Flow> {
+	let Some(w) = a.index else { return Ok(None); };
+	if matches!(a.value, AssignVal::Array(_)) {
+		return Ok(Some(BString::from(exec::word_source(unit, w))));
+	}
+	if unit.words[w as usize].parts.is_empty() {
+		let mut shown = a.name.clone();
+		shown.extend_from_slice(b"[]");
+		k.diag(cx, vp, line, Diag::BadSubscript { shown });
+		return Err(if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false) {
+			Flow::Exit(1)
+		} else { Flow::Discard(1) });
+	}
+	expanding(k, vp, cx, Slot::Redirs, unit.words[w as usize].parks, line, |ex| {
+		ex.scalar(unit, &unit.words[w as usize]).map(Some)
+	})
 }
 
 /// A shell assignment (`NAME=value` without a command), including the
