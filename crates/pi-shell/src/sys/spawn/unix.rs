@@ -43,7 +43,7 @@ use bstr::BString;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use pi_builtins::{PinnedProcess, ProcessStatus, SpawnLedger, read_process_umask as process_umask};
 
-use super::{Dir, Leftover, Sessions, Shared, child_end};
+use super::{Dir, Leftover, ReapObserver, Sessions, Shared, child_end};
 use crate::{
 	bash::{
 		ChildRedir, ChildRedirs, EnvView, ExitStatus, ExtProc, OpenFlags, OsHandle, PgroupSpec,
@@ -75,8 +75,16 @@ const IDLE_MAX: usize = 8;
 /// How long a parked waiter waits for its next external before it exits.
 const IDLE_FOR: Duration = Duration::from_secs(10);
 
-/// One external to wait for: its pid and its lifecycle.
-type Wait = (i32, Arc<Tracker>);
+/// The waiter retains the scope and observer until actual reaping. Dropping
+/// a live handle does not release the child's numeric-group proof.
+struct Wait {
+	pid: i32,
+	tracker: Arc<Tracker>,
+	scope: Scope,
+	observer: Option<Arc<dyn ReapObserver>>,
+	shared: std::sync::Weak<Shared>,
+	defer: bool,
+}
 
 /// A parked waiter thread's slot for its next external.
 struct Mailbox {
@@ -92,14 +100,14 @@ static IDLE: Mutex<Vec<Arc<Mailbox>>> = Mutex::new(Vec::new());
 /// Wait for the exit of `pid` on a parked waiter, or a new one: it records
 /// the status in `tracker` and reaps the process when nobody holds its
 /// `ExtProc` any more.
-fn watch(pid: i32, tracker: Arc<Tracker>) -> io::Result<()> {
+fn watch(job: Wait) -> io::Result<()> {
 	let parked = IDLE.lock().pop();
 	if let Some(mb) = parked {
-		*mb.job.lock() = Some((pid, tracker));
+		*mb.job.lock() = Some(job);
 		mb.ready.notify_one();
 		return Ok(());
 	}
-	let mb = Arc::new(Mailbox { job: Mutex::new(Some((pid, tracker))), ready: Condvar::new() });
+	let mb = Arc::new(Mailbox { job: Mutex::new(Some(job)), ready: Condvar::new() });
 	thread::Builder::new()
 		.name("obash-wait".into())
 		.stack_size(SMALL_STACK)
@@ -111,12 +119,10 @@ fn watch(pid: i32, tracker: Arc<Tracker>) -> io::Result<()> {
 /// [`IDLE`] in between; exit when the pool is full or after [`IDLE_FOR`]
 /// without work.
 fn waiter(mb: &Arc<Mailbox>) {
-	while let Some((pid, tracker)) = next_wait(mb) {
-		let status = wait_exit(pid);
-		if tracker.exited(status) {
-			reap(pid);
-		}
-		drop(tracker);
+	while let Some(job) = next_wait(mb) {
+		let status = wait_exit(job.pid);
+		job.tracker.exited_with(status, |reap| { if reap { finish_wait_reap(&job); } });
+		drop(job);
 		let mut idle = IDLE.lock();
 		if idle.len() >= IDLE_MAX {
 			return;
@@ -157,6 +163,7 @@ pub(super) struct State {
 	/// set one, so specs asking for another take the fork path.
 	umask:  Option<u32>,
 	groups: Mutex<Groups>,
+	reaps: Mutex<Vec<PendingReap>>,
 }
 
 /// Scopes the spawner created, for leak checks.
@@ -164,6 +171,18 @@ struct Groups {
 	list:       Vec<Scope>,
 	next_sweep: usize,
 }
+
+/// Completed PiHost commands only: no pipes or running-process handles are
+/// retained. Their statuses have already been collected with WNOWAIT.
+struct PendingReap {
+	pid: i32,
+	scope: Scope,
+	observer: Arc<dyn ReapObserver>,
+	queued_at: Instant,
+}
+
+const REAP_COHORT: usize = 64;
+const REAP_IDLE: Duration = Duration::from_millis(250);
 
 /// What group-wide operations of one external address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,69 +287,74 @@ impl Scope {
 	}
 
 	fn contains(&self, info: &ProcInfo) -> bool {
-		self.addr.contains(info) && self.alive()
+		let state = self.state.lock();
+		if state.ledger.entries().iter().any(|entry| entry.process.pid() == info.pid && entry.process.status() == ProcessStatus::Running) {
+			return true;
+		}
+		self.addr.contains(info) && ((state.unreaped && self.root == self.addr.id())
+			|| state.ledger.entries().iter().any(|entry| entry.group == Some(entry.process.pid())
+				&& entry.process.pid() == self.addr.id()
+				&& (entry.process.status() == ProcessStatus::Running || entry.process.signal_group(0))))
 	}
 
 	fn alive(&self) -> bool {
-		self.state.lock().ledger.reaches_anything()
+		let state = self.state.lock();
+		state.unreaped || state.ledger.reaches_anything()
 	}
 
-	/// Called before releasing the unreaped child. Ordinary collected
-	/// commands need no native sweep; abandoned ones retain their members.
+	fn kernel_group_supported(&self) -> bool {
+		#[cfg(target_os = "linux")]
+		{ self.pin.as_ref().is_some_and(|pin| pin.signal_group(0)) }
+		#[cfg(not(target_os = "linux"))]
+		{ false }
+	}
+
 	fn before_reap(&self, capture: bool) {
 		let mut state = self.state.lock();
-		if capture {
-			self.capture_session(&mut state);
-		}
 		state.ledger.before_reap(self.root, capture);
 		state.unreaped = false;
 	}
 
-	/// Other process groups inside an owned session must also survive in
-	/// the identity ledger after their session leader is reaped.
-	fn capture_session(&self, state: &mut ScopeState) {
-		if !matches!(self.addr, Addr::Session(_)) || !state.unreaped {
-			return;
-		}
-		let ledger = &mut state.ledger;
-		let Ok(table) = proc::list() else {
-			return;
-		};
-		for info in table.iter().filter(|info| self.addr.contains(info)) {
-			let Some(pin) = PinnedProcess::from_pid(info.pid) else {
-				continue;
-			};
-			if pin.status() == ProcessStatus::Running
-				&& proc::info(info.pid)
-					.is_some_and(|now| now.start == info.start && self.addr.contains(&now))
-				&& !ledger
-					.entries()
-					.iter()
-					.any(|entry| entry.process.same_identity(&pin))
-			{
-				ledger.record_unwatched(Some(info.pgid), Some(pin));
-			}
-		}
+	fn before_reap_with_members(&self, members: &[PinnedProcess]) {
+		let mut state = self.state.lock();
+		state.ledger.before_reap_with_members(self.root, members);
+		state.unreaped = false;
 	}
 
+	fn known_members(&self) -> Vec<PinnedProcess> {
+		self.state.lock().ledger.entries().iter().filter(|entry| entry.process.pid() != self.root)
+			.map(|entry| entry.process.clone()).collect()
+	}
+
+
 	fn signal(&self, sig: Signal) -> io::Result<()> {
+		self.signal_observed(sig, None)
+	}
+
+	fn signal_observed(&self, sig: Signal, observer: Option<&Arc<dyn ReapObserver>>) -> io::Result<()> {
 		let number = i32::from(sig.number(Platform::current()));
 		if matches!(self.addr, Addr::Process { .. }) {
 			// Inherited sessions deliberately signal only the child, not
 			// its descendants or the embedding host's process group.
+			let started = Instant::now();
 			return if self.pin.as_ref().is_some_and(|pin| pin.kill(number)) {
+				if let Some(observer) = observer { observer.signalled(self.root as u32, sig, pi_builtins::SignalDelivery { started, finished: Instant::now() }); }
 				Ok(())
 			} else {
 				Err(io::Error::from_raw_os_error(libc::ESRCH))
 			};
 		}
 		let mut state = self.state.lock();
-		self.capture_session(&mut state);
 		let wave = state.ledger.plan_wave(number, true).deliver();
 		let delivered = !wave.reached().is_empty()
 			|| !wave.members().is_empty()
 			|| !wave.kernel_leaders().is_empty();
 		state.ledger.record_reached(&wave);
+		let delivery = wave.delivery();
+		drop(state);
+		if delivered && let (Some(observer), Some(delivery)) = (observer, delivery) {
+			observer.signalled(self.root as u32, sig, delivery);
+		}
 		if delivered {
 			Ok(())
 		} else {
@@ -338,9 +362,67 @@ impl Scope {
 		}
 	}
 
-	fn sweep(&self) {
-		let _ = self.signal(Signal::Kill);
+	fn continue_known(&self) {
+		for entry in self.state.lock().ledger.entries() { entry.process.kill(libc::SIGCONT); }
 	}
+
+	fn sweep(&self, observer: Option<&Arc<dyn ReapObserver>>) {
+		let _ = self.signal_observed(Signal::Kill, observer);
+	}
+}
+fn report_reap(pid: i32, scope: &Scope, observer: Option<&Arc<dyn ReapObserver>>) {
+	let mut members = scope.known_members();
+	if !scope.kernel_group_supported() && let Some(root) = scope.pin.as_ref() {
+		for member in root.members_before_reap() {
+			if member.pid() != pid && !members.iter().any(|seen| seen.same_identity(&member)) { members.push(member); }
+		}
+	}
+	if let Some(observer) = observer { observer.before_reap(pid as u32, &members); }
+	scope.before_reap_with_members(&members);
+}
+
+fn finish_wait_reap(job: &Wait) {
+	if job.defer && !job.scope.kernel_group_supported()
+		&& let (Some(observer), Some(shared)) = (job.observer.as_ref(), job.shared.upgrade()) {
+		queue_reap(&shared, PendingReap { pid: job.pid, scope: job.scope.clone(), observer: Arc::clone(observer), queued_at: Instant::now() });
+		return;
+	}
+	report_reap(job.pid, &job.scope, job.observer.as_ref());
+	reap(job.pid);
+}
+
+
+pub(super) fn reap_deadline(shared: &Shared) -> Option<Instant> {
+	shared.state.reaps.lock().first().map(|entry| entry.queued_at + REAP_IDLE)
+}
+
+/// One snapshot for the entire cohort. All leaders remain unreaped until
+/// every ledger has imported its members, preventing numeric-group reuse.
+pub(super) fn flush_reaps(shared: &Shared) {
+	flush_reaps_locked(&mut shared.state.reaps.lock());
+}
+
+fn flush_reaps_locked(pending: &mut Vec<PendingReap>) {
+	if pending.is_empty() { return; }
+	let mut groups = PinnedProcess::process_groups();
+	for entry in pending.iter() {
+		let members = if let Some(pids) = groups.get_mut(&entry.pid) {
+			// Every cohort entry leads its own session. Skip the known zombie
+			// without allocating or reopening its already-pinned identity.
+			pids.retain(|pid| *pid != entry.pid);
+			PinnedProcess::members_among(entry.pid, pids.as_slice())
+		} else { Vec::new() };
+		entry.observer.before_reap(entry.pid as u32, &members);
+		entry.scope.before_reap_with_members(&members);
+	}
+	for entry in pending.iter() { reap(entry.pid); }
+	pending.clear();
+}
+
+fn queue_reap(shared: &Shared, entry: PendingReap) {
+	let mut pending = shared.state.reaps.lock();
+	pending.push(entry);
+	if pending.len() >= REAP_COHORT { flush_reaps_locked(&mut pending); }
 }
 
 impl State {
@@ -350,6 +432,7 @@ impl State {
 		Self {
 			umask:  umask.or_else(process_umask),
 			groups: Mutex::new(Groups { list: Vec::new(), next_sweep: SWEEP }),
+			reaps: Mutex::new(Vec::new()),
 		}
 	}
 
@@ -618,7 +701,9 @@ pub(super) fn spawn(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Box
 	let parked = pidfd.is_some();
 	#[cfg(not(target_os = "linux"))]
 	let parked = false;
-	if !parked && let Err(e) = watch(pid, Arc::clone(&tracker)) {
+	let reap_observer = shared.reap_observer.lock().clone();
+	let job = || Wait { pid, tracker: Arc::clone(&tracker), scope: scope.clone(), observer: reap_observer.clone(), shared: Arc::downgrade(shared), defer: !lineage.detached && shared.config.sessions == Sessions::Detach && reap_observer.is_some() };
+	if !parked && let Err(e) = watch(job()) {
 		// Without a waiter nobody would observe the exit: undo the spawn
 		// (the child is unreaped, so its scope is still ours).
 		let _ = scope.signal(Signal::Kill);
@@ -631,6 +716,7 @@ pub(super) fn spawn(shared: &Arc<Shared>, spec: SpawnSpec<'_>) -> io::Result<Box
 		scope,
 		tracker,
 		shared: Arc::clone(shared),
+		reap_observer,
 		detached: lineage.detached,
 		pumps,
 		#[cfg(target_os = "linux")]
@@ -1316,6 +1402,7 @@ struct UnixProc {
 	scope:    Scope,
 	tracker:  Arc<Tracker>,
 	shared:   Arc<Shared>,
+	reap_observer: Option<Arc<dyn ReapObserver>>,
 	/// [`crate::bash::Lineage::detached`]: dropping it while it runs releases
 	/// the process instead of escalating TERM → KILL.
 	detached: bool,
@@ -1326,6 +1413,20 @@ struct UnixProc {
 	/// on, while no waiter thread watches the process.
 	#[cfg(target_os = "linux")]
 	pidfd:    Option<OwnedFd>,
+}
+
+impl UnixProc {
+	fn termination_owned(&self) -> bool {
+		!self.detached && self.shared.termination_delegated.load(std::sync::atomic::Ordering::Acquire)
+	}
+
+	fn report_reap(&self) {
+		report_reap(self.pid, &self.scope, self.reap_observer.as_ref());
+	}
+
+	fn wait_job(&self) -> Wait {
+		Wait { pid: self.pid, tracker: Arc::clone(&self.tracker), scope: self.scope.clone(), observer: self.reap_observer.clone(), shared: Arc::downgrade(&self.shared), defer: !self.detached && self.shared.config.sessions == Sessions::Detach && self.reap_observer.is_some() }
+	}
 }
 
 #[cfg(target_os = "linux")]
@@ -1360,11 +1461,10 @@ impl UnixProc {
 	/// here when no thread can be started.
 	fn unpark(&mut self) {
 		crate::sys::park::exits::forget(self.pid);
-		if self.pidfd.take().is_some() && watch(self.pid, Arc::clone(&self.tracker)).is_err() {
+		if self.pidfd.take().is_some() && watch(self.wait_job()).is_err() {
 			let status = wait_exit(self.pid);
-			if self.tracker.exited(status) {
-				reap(self.pid);
-			}
+			let job = self.wait_job();
+			self.tracker.exited_with(status, |reap| { if reap { finish_wait_reap(&job); } });
 		}
 	}
 }
@@ -1385,24 +1485,18 @@ impl ExtProc for UnixProc {
 
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		self.tracker.lock().signalled(sig);
-		if !self.detached
-			&& self
-				.shared
-				.termination_delegated
-				.load(std::sync::atomic::Ordering::Acquire)
-			&& matches!(sig, Signal::Term | Signal::Kill)
-		{
+		if self.termination_owned() {
 			return Ok(());
 		}
-		self.scope.signal(sig)
+		self.scope.signal_observed(sig, self.reap_observer.as_ref())
 	}
 
 	fn stop(&mut self) -> io::Result<()> {
-		self.scope.signal(Signal::Stop)
+		if self.termination_owned() { Ok(()) } else { self.scope.signal_observed(Signal::Stop, self.reap_observer.as_ref()) }
 	}
 
 	fn cont(&mut self) -> io::Result<()> {
-		self.scope.signal(Signal::Cont)
+		if self.termination_owned() { Ok(()) } else { self.scope.signal_observed(Signal::Cont, self.reap_observer.as_ref()) }
 	}
 }
 
@@ -1410,6 +1504,7 @@ impl Drop for UnixProc {
 	fn drop(&mut self) {
 		// The pumps (and the feeds, giving back what no child read) stop when
 		// the fields drop, after this.
+		if let Some(observer) = self.reap_observer.as_ref() { observer.handle_released(self.pid as u32); }
 		#[cfg(target_os = "linux")]
 		if self.pidfd.is_some() {
 			// Parked: no waiter knows the exit yet.
@@ -1418,14 +1513,9 @@ impl Drop for UnixProc {
 		}
 		let grace = self.shared.config.grace;
 		let mut life = self.tracker.lock();
-		if self.detached
-			|| self
-				.shared
-				.termination_delegated
-				.load(std::sync::atomic::Ordering::Acquire)
-		{
+		if self.detached || (!life.has_collected() && self.termination_owned()) {
 			let exited = life.release();
-			self.scope.before_reap(false);
+			if exited { self.report_reap(); }
 			drop(life);
 			if exited {
 				reap(self.pid);
@@ -1438,32 +1528,39 @@ impl Drop for UnixProc {
 		}
 		match life.abandon(Instant::now(), grace) {
 			Abandon::Exited => {
-				self.scope.before_reap(false);
+				if self.shared.config.sessions == Sessions::Detach && !self.scope.kernel_group_supported()
+					&& let Some(observer) = self.reap_observer.as_ref() {
+					drop(life);
+					queue_reap(&self.shared, PendingReap { pid: self.pid, scope: self.scope.clone(), observer: Arc::clone(observer), queued_at: Instant::now() });
+					return;
+				}
+				self.report_reap();
 				drop(life);
 				reap(self.pid);
 			},
-			Abandon::Orphaned { term, sweep_at } => {
+			Abandon::Orphaned { term, mut sweep_at } => {
 				// Unreaped (a zombie), so the scope is still ours.
 				if term {
-					let _ = self.scope.signal(Signal::Term);
+					let _ = self.scope.signal_observed(Signal::Term, self.reap_observer.as_ref());
 				}
-				let _ = self.scope.signal(Signal::Cont);
-				self.scope.before_reap(true);
+				self.scope.continue_known();
+				if term { sweep_at = Instant::now() + grace; }
+				self.report_reap();
 				drop(life);
 				reap(self.pid);
-				escalate_at(&self.tracker, self.scope.clone(), sweep_at);
+				escalate_at(&self.tracker, self.scope.clone(), sweep_at, self.reap_observer.as_ref());
 			},
-			Abandon::Escalate { term, kill_at } => {
+			Abandon::Escalate { term, mut kill_at } => {
 				// Under the lock: the waiter cannot record the exit and reap
 				// in between, so the scope is still ours.
 				if term {
-					let _ = self.scope.signal(Signal::Term);
+					let _ = self.scope.signal_observed(Signal::Term, self.reap_observer.as_ref());
 				}
 				// A stopped (paused) group acts on TERM only once continued.
-				let _ = self.scope.signal(Signal::Cont);
-				self.scope.before_reap(true);
+				self.scope.continue_known();
+				if term { kill_at = Instant::now() + grace; life.defer_kill(kill_at); }
 				drop(life);
-				escalate_at(&self.tracker, self.scope.clone(), kill_at);
+				escalate_at(&self.tracker, self.scope.clone(), kill_at, self.reap_observer.as_ref());
 				// Parked: a waiter observes the exit and reaps.
 				#[cfg(target_os = "linux")]
 				self.unpark();
@@ -1474,26 +1571,27 @@ impl Drop for UnixProc {
 
 /// [`escalate`] on a thread of its own; at once when no thread can be
 /// started (KILL now rather than never).
-fn escalate_at(tracker: &Arc<Tracker>, scope: Scope, kill_at: Instant) {
+fn escalate_at(tracker: &Arc<Tracker>, scope: Scope, kill_at: Instant, observer: Option<&Arc<dyn ReapObserver>>) {
 	let waiter = Arc::clone(tracker);
+	let observed = observer.cloned();
 	let started = thread::Builder::new()
 		.name("obash-kill".into())
 		.stack_size(SMALL_STACK)
 		.spawn({
 			let scope = scope.clone();
-			move || escalate(&waiter, scope, kill_at)
+			move || escalate(&waiter, scope, kill_at, observed.as_ref())
 		});
 	if started.is_err() {
 		let now = Instant::now();
 		tracker.lock().schedule_kill(now);
-		escalate(tracker, scope, now);
+		escalate(tracker, scope, now, observer);
 	}
 }
 
 /// After `kill_at`: KILL the scope if its leader is still running (under the
 /// lock, so it is unreaped), then every straggler left in a group or session
 /// (identity-pinned).
-fn escalate(tracker: &Tracker, scope: Scope, kill_at: Instant) {
+fn escalate(tracker: &Tracker, scope: Scope, kill_at: Instant, observer: Option<&Arc<dyn ReapObserver>>) {
 	let now = Instant::now();
 	if kill_at > now {
 		thread::sleep(kill_at - now);
@@ -1501,10 +1599,10 @@ fn escalate(tracker: &Tracker, scope: Scope, kill_at: Instant) {
 	{
 		let mut life = tracker.lock();
 		if life.take_kill(Instant::now().max(kill_at)) {
-			let _ = scope.signal(Signal::Kill);
+			let _ = scope.signal_observed(Signal::Kill, observer);
 		}
 	}
-	scope.sweep();
+	scope.sweep(observer);
 }
 
 fn leftover_procs(shared: &Shared) -> io::Result<Vec<(Scope, ProcInfo)>> {

@@ -72,6 +72,8 @@ pub struct NativeSpawner {
 /// still reserved. A deferred cohort shares one member snapshot per batch.
 pub(crate) trait ReapObserver: Send + Sync {
 	fn before_reap(&self, pid: u32, members: &[PinnedProcess]);
+	fn handle_released(&self, _pid: u32) {}
+	fn signalled(&self, _pid: u32, _signal: crate::bash::Signal, _delivery: pi_builtins::SignalDelivery) {}
 }
 
 pub(crate) struct NativeSpawnerControl(Weak<Shared>);
@@ -82,6 +84,11 @@ impl NativeSpawnerControl {
 		if let Some(shared) = self.0.upgrade() {
 			shared.termination_delegated.store(true, Ordering::Release);
 		}
+	}
+
+	#[cfg(unix)]
+	pub(crate) fn flush_reaps(&self) {
+		if let Some(shared) = self.0.upgrade() { imp::flush_reaps(&shared); }
 	}
 }
 

@@ -1275,6 +1275,11 @@ impl Shell {
 		})
 	}
 
+	/// Non-detached cleanup is complete, including buffered VM output.
+	pub(crate) fn cancellation_idle(&self) -> bool {
+		self.procs.iter().all(|p| p.lineage.detached || (!p.has_work() && p.out.is_empty()))
+	}
+
 	/// Rebind the root's standard streams to the host's current streams,
 	/// including any higher-numbered duplicates of those streams.
 	pub(crate) fn reset_root_stdio(&mut self, host: &mut dyn Host) {

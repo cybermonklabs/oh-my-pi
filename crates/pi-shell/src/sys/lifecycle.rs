@@ -179,6 +179,18 @@ impl Lifecycle {
 		self.status.is_some()
 	}
 
+	#[cfg(unix)]
+	pub const fn has_collected(&self) -> bool { self.collected }
+
+	/// Initial signal delivery can include a snapshot. It must not consume
+	/// the process's grace; extend the abandonment deadline after delivery.
+	#[cfg(unix)]
+	pub fn defer_kill(&mut self, at: Instant) {
+		if self.status.is_none() && !self.kill_sent {
+			self.kill_due = Some(self.kill_due.map_or(at, |old| old.max(at)));
+		}
+	}
+
 	/// Pending KILL deadline; `None` once exited, killed or never scheduled.
 	pub const fn kill_due(&self) -> Option<Instant> {
 		if self.status.is_some() {
@@ -246,11 +258,20 @@ impl Tracker {
 	/// Input pumps stop: nothing reads the child's stdin any more (a
 	/// grandchild still reading it loses the rest, by design).
 	pub fn exited(&self, status: ExitStatus) -> bool {
+		self.exited_with(status, |_| {})
+	}
+
+	/// Publish status immediately, then finish ownership bookkeeping before
+	/// waking the engine, so it can account for a new reap deadline.
+	pub fn exited_with(&self, status: ExitStatus, before_wake: impl FnOnce(bool)) -> bool {
 		self.cancel_pumps();
-		let (waker, reap) = self.life.lock().exited(status);
-		if let Some(w) = waker {
-			w.wake();
-		}
+		let (waker, reap) = {
+			let mut life = self.life.lock();
+			let (waker, reap) = life.exited(status);
+			(waker.or_else(|| if reap { life.waker.clone() } else { None }), reap)
+		};
+		before_wake(reap);
+		if let Some(waker) = waker { waker.wake(); }
 		reap
 	}
 

@@ -43,16 +43,17 @@ mod urls;
 /// unwinds the command that waits for it): pi's `TERM_GRACE`.
 pub const TERM_GRACE: Duration = Duration::from_secs(1);
 
-/// Told about every external a [`PiHost`] spawns, from the engine thread.
-///
-/// The [`Session`](crate::session::Session) lists a run's live children
-/// through it (pi's `Shell::pids()`). Implementations must not block.
+/// Receives external spawn and native reap boundaries. Callbacks are
+/// synchronous and must not wait for the engine to make progress.
 pub trait SpawnObserver: Send + Sync {
 	/// Whether the engine has entered cancellation (new commands can be
 	/// cleanup from a shell trap). Sampled before the native launch.
 	fn cancellation_applied(&self) -> bool {
 		false
 	}
+	/// Reserve an in-flight launch; false rejects work after termination.
+	fn starting(&self) -> bool { true }
+	fn finished(&self) {}
 	/// `pid` was spawned; it leads its own session and process group, so
 	/// its process group id is `pid` too (Unix).
 	fn spawned(&self, pid: u32, after_cancel: bool);
@@ -215,6 +216,21 @@ struct Launcher {
 	reaps: Arc<ReapRecorder>,
 }
 
+struct SpawnAttempt<'a>(&'a Option<Arc<dyn SpawnObserver>>);
+
+impl<'a> SpawnAttempt<'a> {
+	fn new(observer: &'a Option<Arc<dyn SpawnObserver>>) -> io::Result<Self> {
+		if observer.as_ref().is_some_and(|observer| !observer.starting()) {
+			return Err(io::Error::new(io::ErrorKind::Interrupted, "Shell run has terminated"));
+		}
+		Ok(Self(observer))
+	}
+}
+
+impl Drop for SpawnAttempt<'_> {
+	fn drop(&mut self) { if let Some(observer) = self.0.as_ref() { observer.finished(); } }
+}
+
 /// A text sink a relay forwards into.
 enum TextSink {
 	/// The run's text capture.
@@ -284,6 +300,7 @@ impl Launcher {
 			.as_ref()
 			.filter(|_| !lineage.detached)
 			.cloned();
+		let attempt = SpawnAttempt::new(&observer)?;
 		let after_cancel = observer
 			.as_ref()
 			.is_some_and(|observer| observer.cancellation_applied());
@@ -295,6 +312,7 @@ impl Launcher {
 		if let Some(observer) = observer.as_ref() {
 			observer.spawned(child.pid(), after_cancel);
 		}
+		drop(attempt);
 		if let Some(observer) = observer {
 			self.reaps.observers.lock().insert(child.pid(), observer);
 		}
@@ -723,6 +741,9 @@ struct ReapRecorder {
 }
 
 impl ReapObserver for ReapRecorder {
+	fn handle_released(&self, pid: u32) { self.spawns.handle_released(pid); }
+	fn signalled(&self, pid: u32, signal: crate::bash::Signal, delivery: pi_builtins::SignalDelivery) { self.spawns.signalled(pid, signal, delivery); }
+
 	fn before_reap(&self, pid: u32, members: &[PinnedProcess]) {
 		self.spawns.released(pid, members);
 		if let Some(observer) = self.observers.lock().remove(&pid) {

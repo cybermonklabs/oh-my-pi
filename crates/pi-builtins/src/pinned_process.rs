@@ -8,7 +8,7 @@
 //! exited. `pi-shell`'s process references wrap this type, and the `timeout`
 //! builtin records its operand's children with it.
 
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, time::Instant};
 
 use smallvec::SmallVec;
 
@@ -292,14 +292,6 @@ mod platform {
 			sys::pidfd_send_group_signal(self.pidfd.as_fd(), signal).is_ok()
 		}
 
-		/// Whether this kernel/filter can address a group through its pinned
-		/// leader. ESRCH proves the flag is understood even if the group ended.
-		pub fn group_signal_supported(&self) -> bool {
-			match sys::pidfd_send_group_signal(self.pidfd.as_fd(), 0) {
-				Ok(()) => true,
-				Err(error) => error.raw_os_error() == Some(libc::ESRCH),
-			}
-		}
 
 		pub fn status(&self) -> ProcessStatus {
 			pidfd_status(self.pidfd.as_fd())
@@ -986,6 +978,14 @@ pub enum GroupProof {
 	KernelOnly,
 }
 
+/// The interval containing the kernel delivery calls of one wave, excluding
+/// snapshot/planning work. Grace starts no earlier than `finished`.
+#[derive(Clone, Copy, Debug)]
+pub struct SignalDelivery {
+	pub started: Instant,
+	pub finished: Instant,
+}
+
 /// One delivery of a signal to process groups, each through its pinned
 /// leader, and to pinned processes.
 ///
@@ -1026,6 +1026,7 @@ pub struct SignalWave {
 	members: Vec<PinnedProcess>,
 	/// Leaders whose groups the kernel signalled through their pins.
 	kernel:  Vec<PinnedProcess>,
+	delivery: Option<SignalDelivery>,
 }
 
 impl SignalWave {
@@ -1039,6 +1040,7 @@ impl SignalWave {
 			reached: Vec::new(),
 			members: Vec::new(),
 			kernel: Vec::new(),
+			delivery: None,
 		}
 	}
 
@@ -1126,6 +1128,7 @@ impl SignalWave {
 		}
 
 		// Group signals first, then each other target through its own pin.
+		let started = Instant::now();
 		let mut sent = false;
 		for group in by_number {
 			sent |= signal_unreaped_group(group, self.signal);
@@ -1142,6 +1145,7 @@ impl SignalWave {
 				self.reached.push(process);
 			}
 		}
+		self.delivery = Some(SignalDelivery { started, finished: Instant::now() });
 		sent
 	}
 
@@ -1149,6 +1153,19 @@ impl SignalWave {
 	#[must_use]
 	pub fn reached(&self) -> &[PinnedProcess] {
 		&self.reached
+	}
+
+	#[must_use]
+	pub const fn delivery(&self) -> Option<SignalDelivery> { self.delivery }
+
+	/// Allow pending termination handlers of stopped targets to run. These
+	/// identities were already collected before delivery; no second table scan
+	/// is needed, and a continued target cannot retarget a recycled pid.
+	#[cfg(unix)]
+	pub fn resume_reached(&self) {
+		for process in self.members.iter().chain(&self.reached) {
+			process.kill(libc::SIGCONT);
+		}
 	}
 
 	/// The members of the groups [`Self::deliver`] signalled as a whole,
@@ -1315,6 +1332,10 @@ pub struct SpawnEntry {
 }
 
 impl SpawnEntry {
+	/// An external launched by the operand, not a discovered member or descendant.
+	#[must_use]
+	pub const fn was_spawned(&self) -> bool { !matches!(self.reap, Reap::Unwatched) }
+
 	/// Whether this entry leads the group it was recorded in.
 	fn leads(&self) -> bool {
 		self.group == Some(self.process.pid())
@@ -1564,6 +1585,13 @@ impl SpawnLedger {
 	#[must_use]
 	pub fn entries(&self) -> &[SpawnEntry] {
 		&self.entries
+	}
+
+	/// An exited child still needs its native before-reap report. The report
+	/// may be in a deferred cohort; callers must flush it before finishing.
+	#[must_use]
+	pub fn needs_reap_report(&self) -> bool {
+		self.entries.iter().any(|entry| entry.reap == Reap::Pending && entry.process.status() != ProcessStatus::Running)
 	}
 
 	/// Pids of recorded processes that are still alive, in spawn order.

@@ -76,7 +76,7 @@ use crate::{
 		store::{Key, MiscKey, Record},
 	},
 	host::{PiHost, SpawnObserver, TERM_GRACE},
-	sys::{NativeSpawner, OutputDecoding},
+	sys::{NativeSpawner, NativeSpawnerControl, OutputDecoding},
 	tools::{ToolCalls, ToolConfig},
 	vfs::VfsFs,
 };
@@ -237,11 +237,12 @@ pub struct Children(Arc<ChildrenState>);
 
 struct ChildrenState {
 	active:            AtomicBool,
+	vm_idle: AtomicBool,
 	driver_done:       AtomicBool,
 	engine_cancelling: AtomicBool,
 	pids:              Mutex<Vec<u32>>,
 	registry:          Mutex<ChildRegistry>,
-	spawner:           NativeSpawner,
+	spawner: NativeSpawnerControl,
 	terminated:        CancellationToken,
 	control: Mutex<Option<ControlHandle>>,
 }
@@ -251,17 +252,34 @@ struct ChildRegistry {
 	ledger:  SpawnLedger,
 	/// Last first-delivery of TERM, including a spawn racing cancellation.
 	term_at: Option<Instant>,
+	inflight: usize,
+	virtual_kill: bool,
+}
+
+#[cfg(unix)]
+struct TerminationOwner(Children);
+
+#[cfg(unix)]
+impl Drop for TerminationOwner {
+	fn drop(&mut self) {
+		if !self.0.0.terminated.is_cancelled() {
+			// Runtime shutdown/panic must not leave a delegated process ownerless.
+			self.0.kill_remaining();
+			self.0.0.terminated.cancel();
+		}
+	}
 }
 
 impl Children {
-	fn new(spawner: NativeSpawner) -> Self {
+	fn new(spawner: &NativeSpawner) -> Self {
 		Self(Arc::new(ChildrenState {
 			active: AtomicBool::new(false),
 			driver_done: AtomicBool::new(true),
+			vm_idle: AtomicBool::new(true),
 			engine_cancelling: AtomicBool::new(false),
 			pids: Mutex::new(Vec::new()),
 			registry: Mutex::new(ChildRegistry::default()),
-			spawner,
+			spawner: spawner.termination_control(),
 			terminated: CancellationToken::new(),
 			control: Mutex::new(None),
 		}))
@@ -273,13 +291,11 @@ impl Children {
 		if !self.0.active.load(Ordering::Acquire) {
 			return Vec::new();
 		}
-		self
-			.0
-			.pids
-			.lock()
-			.iter()
-			.filter_map(|&pid| i32::try_from(pid).ok())
-			.collect()
+		let pids = self.0.pids.lock();
+		let registry = self.0.registry.lock();
+		pids.iter().filter_map(|&pid| i32::try_from(pid).ok())
+			.filter(|&pid| registry.ledger.entries().iter().any(|entry| entry.process.pid() == pid
+				&& entry.process.status() == pi_builtins::ProcessStatus::Running)).collect()
 	}
 
 	/// Claim the session's external termination before requesting the engine
@@ -292,6 +308,7 @@ impl Children {
 		if registry.term_at.is_none() {
 			let wave = registry.ledger.plan_wave(TERM_SIGNAL, true).deliver();
 			registry.ledger.record_reached(&wave);
+			wave.resume_reached();
 			registry.term_at = Some(Instant::now());
 		}
 	}
@@ -301,40 +318,60 @@ impl Children {
 	/// leaves its group or its parent exits.
 	#[cfg(unix)]
 	pub async fn finish_termination(&self) {
-		struct Done<'a>(&'a CancellationToken);
-		impl Drop for Done<'_> {
-			fn drop(&mut self) {
-				self.0.cancel();
-			}
-		}
-		let _done = Done(&self.0.terminated);
 		loop {
+			self.0.spawner.flush_reaps();
 			{
-				let registry = self.0.registry.lock();
-				if self.0.driver_done.load(Ordering::Acquire) && !registry.ledger.reaches_anything() {
+				let mut registry = self.0.registry.lock();
+				if self.0.driver_done.load(Ordering::Acquire) && self.0.vm_idle.load(Ordering::Acquire)
+					&& registry.inflight == 0 && !registry.ledger.needs_reap_report() && !registry.ledger.reaches_anything() {
+					registry.virtual_kill = true;
+					if let Some(control) = self.0.control.lock().as_ref() { control.cancel(Signal::Kill); }
 					self.0.terminated.cancel();
 					return;
 				}
 				if registry.term_at.is_none_or(|at| at.elapsed() >= TERM_GRACE) {
-					break;
+					if registry.inflight == 0 { break; }
+					if self.0.engine_cancelling.load(Ordering::Acquire) && !registry.virtual_kill {
+						registry.virtual_kill = true;
+						if let Some(control) = self.0.control.lock().as_ref() { control.cancel(Signal::Kill); }
+					}
 				}
 			}
 			tokio::time::sleep(Duration::from_millis(10)).await;
 		}
-		let mut registry = self.0.registry.lock();
-		let wave = registry.ledger.plan_wave(KILL_SIGNAL, true).deliver();
-		registry.ledger.record_reached(&wave);
-		if let Some(control) = self.0.control.lock().as_ref() {
-			control.cancel(Signal::Kill);
+		self.kill_remaining();
+		loop {
+			self.0.spawner.flush_reaps();
+			if !self.0.registry.lock().ledger.needs_reap_report() { break; }
+			tokio::time::sleep(Duration::from_millis(10)).await;
 		}
 		self.0.terminated.cancel();
+	}
+
+	#[cfg(unix)]
+	fn kill_remaining(&self) {
+		let mut registry = self.0.registry.lock();
+		registry.virtual_kill = true;
+		let wave = registry.ledger.plan_wave(KILL_SIGNAL, true).deliver();
+		registry.ledger.record_reached(&wave);
+		if let Some(control) = self.0.control.lock().as_ref() { control.cancel(Signal::Kill); }
+	}
+
+	/// The caller may drop its future; the OS cleanup owner must survive it.
+	#[cfg(unix)]
+	pub fn spawn_termination(&self) -> tokio::task::JoinHandle<()> {
+		let owner = TerminationOwner(self.clone());
+		tokio::spawn(async move {
+			owner.0.finish_termination().await;
+			drop(owner);
+		})
 	}
 
 	/// Readers and driver teardown must not close a TERM handler's output
 	/// before the one owner of its termination has completed.
 	pub async fn wait_termination(&self) {
 		#[cfg(unix)]
-		if self.0.spawner.termination_delegated() {
+		if self.termination_started() {
 			self.0.terminated.cancelled().await;
 		}
 	}
@@ -342,7 +379,7 @@ impl Children {
 	pub(crate) fn termination_started(&self) -> bool {
 		#[cfg(unix)]
 		{
-			self.0.spawner.termination_delegated()
+			self.0.registry.lock().term_at.is_some()
 		}
 		#[cfg(not(unix))]
 		{
@@ -367,6 +404,15 @@ impl Children {
 }
 
 impl SpawnObserver for Children {
+	fn starting(&self) -> bool {
+		let mut registry = self.0.registry.lock();
+		if self.0.terminated.is_cancelled() || registry.virtual_kill { return false; }
+		registry.inflight += 1;
+		true
+	}
+
+	fn finished(&self) { self.0.registry.lock().inflight -= 1; }
+
 	fn cancellation_applied(&self) -> bool {
 		self.0.engine_cancelling.load(Ordering::Acquire)
 	}
@@ -390,28 +436,31 @@ impl SpawnObserver for Children {
 		{
 			// A launch already in flight needs its first TERM. A command
 			// started by the engine's TERM trap instead gets time to finish.
-			if !after_cancel {
+			if registry.virtual_kill || self.0.terminated.is_cancelled() {
+				let mut wave = SignalWave::new(KILL_SIGNAL);
+				wave.group(&process, GroupProof::Unreaped);
+				wave.process(&process);
+				wave.deliver();
+				registry.ledger.record_reached(&wave);
+			} else if !after_cancel {
 				let mut wave = SignalWave::new(TERM_SIGNAL);
 				wave.group(&process, GroupProof::Unreaped);
 				wave.process(&process);
 				wave.deliver();
 				registry.ledger.record_reached(&wave);
+				registry.term_at = Some(Instant::now());
 			}
-			registry.term_at = Some(Instant::now());
 		}
 	}
 
-	fn released(&self, pid: u32) {
+	fn released(&self, pid: u32, members: &[PinnedProcess]) {
 		let mut pids = self.0.pids.lock();
 		if let Some(i) = pids.iter().position(|&p| p == pid) {
 			pids.remove(i);
 		}
 		drop(pids);
-		// The engine saw the exit and has not reaped it yet, so its pid still
-		// holds the number of the group it led: the members of that group are
-		// pinned now or never.
 		if let Ok(pid) = i32::try_from(pid) {
-			self.0.registry.lock().ledger.before_reap(pid, true);
+			self.0.registry.lock().ledger.before_reap_with_members(pid, members);
 		}
 	}
 }
@@ -459,7 +508,7 @@ impl Session {
 		let waker = Waker::from(Arc::clone(&bell));
 		let tools = ToolConfig::from_env(&env, vfs.clone(), runtime.clone());
 		let mut host = PiHost::new(fs, runtime.clone());
-		let children = Children::new(host.spawner().clone());
+		let children = Children::new(host.spawner());
 		if output_decoding.is_some() {
 			host.set_output_decoding(output_decoding);
 		}
@@ -555,6 +604,7 @@ impl Session {
 			let _registry = self.children.0.registry.lock();
 			if self.children.0.terminated.is_cancelled() { return Err(SessionError::Closed); }
 			self.children.0.driver_done.store(false, Ordering::Release);
+			self.children.0.vm_idle.store(false, Ordering::Release);
 		}
 		jobs
 			.send(Request::Run(job))
@@ -703,6 +753,7 @@ impl Driver {
 	/// One step of background work while no command runs, or a suspension
 	/// when there is none to do (a new job's ring ends it).
 	async fn idle_turn(&mut self) {
+		self.host.spawner().flush_reaps();
 		self.poll_tools();
 		match self.step(Budget::default()) {
 			Step::Done { run, status } => self.on_done(run, status),
@@ -739,7 +790,11 @@ impl Driver {
 		});
 		let mut applied = 0;
 		let status = loop {
-			let wanted = cancel.get();
+			let bridge_level = {
+				let registry = self.children.0.registry.lock();
+				if registry.virtual_kill { CancelLevel::KILL } else if registry.term_at.is_some() { CancelLevel::TERM } else { 0 }
+			};
+			let wanted = cancel.get().max(bridge_level);
 			if wanted > applied {
 				applied = wanted;
 				let sig = if wanted >= CancelLevel::KILL {
@@ -747,11 +802,7 @@ impl Driver {
 				} else {
 					Signal::Term
 				};
-				self
-					.children
-					.0
-					.engine_cancelling
-					.store(true, Ordering::Release);
+				self.children.engine_cancelled();
 				self.shell.control().cancel(sig);
 			}
 			self.poll_tools();
@@ -779,9 +830,11 @@ impl Driver {
 		}
 		let exited = self.shell.ended_by_exit(run);
 		self.settle().await;
+		self.host.spawner().flush_reaps();
 		self.children.0.driver_done.store(true, Ordering::Release);
-		if applied > 0 {
+		if applied > 0 || self.children.termination_started() {
 			self.children.wait_termination().await;
+			self.host.spawner().flush_reaps();
 		}
 		self.children.set_active(false);
 		self.host.streams().clear();
@@ -847,9 +900,14 @@ impl Driver {
 	}
 
 	fn step(&mut self, budget: Budget) -> Step {
-		self
-			.shell
-			.step(&mut Cx { host: &mut self.host, store: &mut self.store }, budget)
+		if self.children.termination_started() && !self.children.0.engine_cancelling.load(Ordering::Acquire) {
+			self.children.engine_cancelled();
+			let signal = if self.children.0.registry.lock().virtual_kill { Signal::Kill } else { Signal::Term };
+			self.shell.control().cancel(signal);
+		}
+		let step = self.shell.step(&mut Cx { host: &mut self.host, store: &mut self.store }, budget);
+		self.children.0.vm_idle.store(self.shell.cancellation_idle(), Ordering::Release);
+		step
 	}
 
 	/// Suspend until the shell may make progress, a job or cancel request
@@ -857,13 +915,17 @@ impl Driver {
 	///
 	/// The future owns what it waits on, so it does not hold the driver.
 	fn wait(&self) -> impl Future<Output = ()> + Send + use<> {
+		self.host.spawner().flush_due_reaps();
 		let ctl = self.shell.control();
 		let bell = Arc::clone(&self.bell);
 		let now = crate::bash::Host::now_ns(&self.host);
-		let limit = self
+		let mut limit = self
 			.tools
 			.next_deadline()
 			.map_or(MAX_PARK, |at| Duration::from_nanos(at.saturating_sub(now)).min(MAX_PARK));
+		if let Some(deadline) = self.host.spawner().reap_deadline() {
+			limit = limit.min(deadline.saturating_duration_since(Instant::now()));
+		}
 		async move {
 			tokio::select! {
 				biased;

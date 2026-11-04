@@ -252,7 +252,7 @@ pub use proc_snapshot::sys as proc_sys;
 	any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 pub use pinned_process::{
-	GroupProof, LedgerWave, PinnedProcess, SignalWave, SpawnEntry, SpawnLedger,
+	GroupProof, LedgerWave, PinnedProcess, SignalDelivery, SignalWave, SpawnEntry, SpawnLedger,
 	host_protected_pids, kernel_group_exists, kernel_group_runs, pid_in_protected_subtree,
 	signalable_descendants,
 };

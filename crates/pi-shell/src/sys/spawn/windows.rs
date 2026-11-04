@@ -751,6 +751,9 @@ impl ExtProc for WinProc {
 
 impl Drop for WinProc {
 	fn drop(&mut self) {
+		if let Some(observer) = self.shared.reap_observer.lock().as_ref() {
+			observer.before_reap(self.pid, &[]);
+		}
 		// The pumps (and the feeds) stop when the fields drop, after this.
 		let mut life = self.tracker.lock();
 		if self.detached {

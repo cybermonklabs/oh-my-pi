@@ -12,12 +12,12 @@
 //! the command's own under `--preserve-status`; 125 for timeout's own
 //! errors (bad usage, interval or signal).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bstr::{BString, ByteSlice};
 
 use super::{Child, Out, Turn, nanos};
-use crate::bash::{CallOutcome, Platform, ShellApi, SigTarget, Signal, ToolCall};
+use crate::{bash::{CallOutcome, Platform, ShellApi, SigTarget, Signal, ToolCall}, host::TERM_GRACE};
 
 /// GNU timeout's exit status for its own usage or internal errors.
 const EXIT_FAILURE: i32 = 125;
@@ -248,7 +248,7 @@ enum Phase {
 	/// The command runs; the limit expires at `deadline`.
 	Running { opts: Options, deadline: Option<u64> },
 	/// The signal was sent; waiting for the tree, `KILL` at `kill_at`.
-	Signalled { opts: Options, kill_at: Option<u64>, give_up: Option<u64>, recheck: u64 },
+	Signalled { opts: Options, kill_at: Option<u64>, give_up: Option<u64>, recheck: u64, cleanup_at: u64, killed_running: bool, signal_at: u64, sent_at: Instant },
 	/// The answer, once the output is written.
 	Exit(i32),
 }
@@ -291,7 +291,8 @@ impl Timeout {
 
 	/// Send `signal` to the command's tree and, for `KILL`, to the
 	/// externals it started.
-	fn send(&mut self, turn: &Turn<'_>, opts: &Options, signal: Signal) {
+	fn send(&mut self, turn: &Turn<'_>, opts: &Options, signal: Signal) -> u64 {
+		let started = Instant::now();
 		if opts.verbose {
 			let name: &'static str = signal.into();
 			let command = opts.command[0].to_str_lossy();
@@ -299,11 +300,15 @@ impl Timeout {
 				.out
 				.push(2, format!("timeout: sending signal {name} to command '{command}'\n"));
 		}
-		turn.log.capture(turn.group, !opts.foreground);
-		for &label in turn.group {
-			turn.ctl.signal(SigTarget::Label(label), signal);
-		}
+		// Windows retains its native Job Object signal/CTRL_BREAK path.
+		#[cfg(unix)]
 		turn.log.signal(turn.group, signal, !opts.foreground);
+		// The VM expands a label through its active callout tree. Sending
+		// every descendant label as well would signal the same Ext twice.
+		if self.child.label != 0 {
+			turn.ctl.signal(SigTarget::Label(self.child.label), signal);
+		}
+		turn.now.saturating_add(nanos(started.elapsed()))
 	}
 
 	pub(super) fn advance(
@@ -323,49 +328,65 @@ impl Timeout {
 			Phase::Running { opts, deadline } => match self.child.status {
 				Some(status) => Phase::Exit(status),
 				None if deadline.is_some_and(|at| now >= at) => {
-					self.send(turn, &opts, opts.signal);
 					let killed = opts.signal == Signal::Kill;
+					let killed_running = killed && (turn.live || turn.log.live_processes(turn.group));
+					let signal_at = self.send(turn, &opts, opts.signal);
+					let sent_at = Instant::now();
 					Phase::Signalled {
 						kill_at: (!killed)
-							.then(|| opts.kill_after.map(|d| now.saturating_add(nanos(d))))
+							.then(|| opts.kill_after.map(|d| signal_at.saturating_add(nanos(d))))
 							.flatten(),
-						give_up: killed.then(|| now.saturating_add(nanos(REAP_AFTER_KILL))),
+						give_up: killed.then(|| signal_at.saturating_add(nanos(REAP_AFTER_KILL))),
 						recheck: now.saturating_add(nanos(RECHECK)),
+						cleanup_at: signal_at.saturating_add(nanos(TERM_GRACE)),
+						killed_running,
+						signal_at,
+						sent_at,
 						opts,
 					}
 				},
 				None => Phase::Running { opts, deadline },
 			},
-			Phase::Signalled { opts, mut kill_at, mut give_up, .. } => {
-				if kill_at.is_some_and(|at| now >= at) {
-					self.send(turn, &opts, Signal::Kill);
-					kill_at = None;
-					give_up = Some(now.saturating_add(nanos(REAP_AFTER_KILL)));
+			Phase::Signalled { opts, mut kill_at, mut give_up, mut cleanup_at, mut killed_running, signal_at, sent_at, .. } => {
+				// The VM may reach an external after its control request. A
+				// read-only snapshot must not consume that process's -k grace.
+				#[cfg(unix)]
+				if give_up.is_none() && let Some(delivered) = turn.log.native_delivery(turn.group, opts.signal) {
+					let anchor = signal_at.saturating_add(nanos(delivered.saturating_duration_since(sent_at)));
+					cleanup_at = cleanup_at.max(anchor.saturating_add(nanos(TERM_GRACE)));
+					if let (Some(at), Some(grace)) = (kill_at.as_mut(), opts.kill_after) {
+						*at = (*at).max(anchor.saturating_add(nanos(grace)));
+					}
 				}
-				let killed = opts.signal == Signal::Kill || give_up.is_some();
-				let ended =
-					self.child.status.is_some() && !turn.live && !turn.log.reaches_anything(turn.group);
+				let visible_ended = self.child.status.is_some() && !turn.live && !turn.log.live_processes(turn.group);
+				// A conservative group probe can remain true for unreaped
+				// orphans. Still deliver its hard cleanup wave, but do not turn
+				// an operand already ended by TERM into a SIGKILL exit status.
+				if kill_at.is_some_and(|at| now >= at)
+					|| (visible_ended && give_up.is_none() && now >= cleanup_at && turn.log.reaches_anything(turn.group)) {
+					killed_running |= !visible_ended;
+					let sent_at = self.send(turn, &opts, Signal::Kill);
+					kill_at = None;
+					give_up = Some(sent_at.saturating_add(nanos(REAP_AFTER_KILL)));
+				}
+				let ended = visible_ended && (give_up.is_some() || !turn.log.reaches_anything(turn.group));
 				if ended || give_up.is_some_and(|at| now >= at) {
 					let platform = Platform::current();
-					Phase::Exit(if opts.preserve {
-						self.child.status.unwrap_or_else(|| {
-							if killed {
-								EXIT_KILLED
-							} else {
-								opts.signal.exit_status(platform)
-							}
-						})
-					} else if killed {
+					Phase::Exit(if killed_running {
 						EXIT_KILLED
-					} else {
-						EXIT_TIMED_OUT
-					})
+					} else if opts.preserve {
+						self.child.status.unwrap_or_else(|| opts.signal.exit_status(platform))
+					} else { EXIT_TIMED_OUT })
 				} else {
 					Phase::Signalled {
 						opts,
 						kill_at,
 						give_up,
 						recheck: now.saturating_add(nanos(RECHECK)),
+						cleanup_at,
+						killed_running,
+						signal_at,
+						sent_at,
 					}
 				}
 			},

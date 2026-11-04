@@ -10,6 +10,7 @@ from pathlib import Path
 root, shape = Path(sys.argv[1]), sys.argv[2]
 def record(name):
     (root / (name + '.pid')).write_text(str(os.getpid()))
+    while not (root / (name + '.pinned')).exists(): time.sleep(.005)
 record('leader')
 leader = os.getpid()
 worker = os.fork()
@@ -33,32 +34,41 @@ if shape == 'orphan':
     if os.fork() == 0:
         record('grandchild')
     else:
-        while not (root / 'grandchild.pid').exists(): time.sleep(.005)
+        while not (root / 'grandchild.pinned').exists(): time.sleep(.005)
         (root / 'ready').touch()
 else:
     (root / 'ready').touch()
 while True: time.sleep(1)
 ";
 
-/// End only the processes recorded by this fixture, even when an assertion
-/// fails before the shell's cancellation finishes.
-struct Cleanup(std::path::PathBuf);
+/// Each fixture process waits for its pin before proceeding. Cleanup never
+/// reopens a stored pid after the original process may have exited.
+struct Cleanup {
+	root: std::path::PathBuf,
+	pins: Vec<(String, PinnedProcess)>,
+	abort: AbortToken,
+}
 
 impl Cleanup {
-	fn pins(&self) -> Vec<PinnedProcess> {
-		fs::read_dir(&self.0)
-			.expect("fixture directory")
-			.flatten()
-			.filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pid"))
-			.filter_map(|entry| fs::read_to_string(entry.path()).ok()?.parse().ok())
-			.filter_map(PinnedProcess::from_pid)
-			.collect()
+	fn observe(&mut self) {
+		for entry in fs::read_dir(&self.root).expect("fixture directory").flatten() {
+			let path = entry.path();
+			if path.extension().is_none_or(|ext| ext != "pid") { continue; }
+			let name = path.file_stem().unwrap().to_str().unwrap();
+			if self.pins.iter().any(|(seen, _)| seen == name) { continue; }
+			let Ok(text) = fs::read_to_string(&path) else { continue; };
+			let Ok(pid) = text.parse() else { continue; };
+			let pin = PinnedProcess::from_pid(pid).expect("fixture waits for its pin");
+			self.pins.push((name.to_owned(), pin));
+			fs::write(path.with_extension("pinned"), "").expect("acknowledge fixture pin");
+		}
 	}
 }
 
 impl Drop for Cleanup {
 	fn drop(&mut self) {
-		for pin in self.pins() {
+		self.abort.abort(AbortReason::Signal);
+		for (_, pin) in &self.pins {
 			pin.kill(libc::SIGKILL);
 		}
 	}
@@ -66,7 +76,6 @@ impl Drop for Cleanup {
 
 async fn ownership_case(shape: &str, deadline: bool) {
 	let root = tempfile::tempdir().expect("ownership fixture");
-	let cleanup = Cleanup(root.path().to_path_buf());
 	let script = root.path().join("actor.py");
 	fs::write(&script, ACTOR).expect("write actor");
 	let body = format!(
@@ -81,6 +90,7 @@ async fn ownership_case(shape: &str, deadline: bool) {
 	};
 	let mut cancel = CancelToken::default();
 	let abort = cancel.emplace_abort_token();
+	let mut cleanup = Cleanup { root: root.path().to_path_buf(), pins: Vec::new(), abort: abort.clone() };
 	let shell = Arc::new(Shell::new(None));
 	let running = Arc::clone(&shell);
 	let mut run = tokio::spawn(async move {
@@ -90,14 +100,18 @@ async fn ownership_case(shape: &str, deadline: bool) {
 	});
 	time::timeout(Duration::from_secs(20), async {
 		while !root.path().join("ready").exists() {
+			cleanup.observe();
 			assert!(!run.is_finished(), "{shape}: run ended before fixture readiness");
 			time::sleep(Duration::from_millis(10)).await;
 		}
 	})
 	.await
 	.expect("fixture readiness");
-	let pins = cleanup.pins();
-	assert_eq!(pins.len(), 2, "the two live fixture processes must be pinned before cancellation");
+	cleanup.observe();
+	let pins = &cleanup.pins;
+	assert_eq!(pins.len(), if shape == "orphan" { 3 } else { 2 });
+	assert_eq!(pins.iter().filter(|(_, pin)| pin.status() == ProcessStatus::Running).count(), 2,
+		"the two live fixture processes must be pinned before cancellation");
 	if !deadline {
 		abort.abort(AbortReason::Signal);
 	}
@@ -114,7 +128,7 @@ async fn ownership_case(shape: &str, deadline: bool) {
 	time::timeout(Duration::from_secs(5), async {
 		while pins
 			.iter()
-			.any(|pin| pin.status() == ProcessStatus::Running)
+			.any(|(_, pin)| pin.status() == ProcessStatus::Running)
 		{
 			time::sleep(Duration::from_millis(10)).await;
 		}
@@ -290,4 +304,62 @@ async fn an_engine_term_trap_can_start_its_cleanup_command() {
 		started.elapsed() >= Duration::from_millis(600),
 		"the cleanup sleep was interrupted instead of receiving its grace"
 	);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cohort_reaping_preserves_statuses_and_leaves_no_zombie_after_a_run() {
+	if !crate::test_support::without_kernel_group_signal(
+		module_path!(), "cohort_reaping_preserves_statuses_and_leaves_no_zombie_after_a_run",
+	) { return; }
+	let shell = Shell::new(None);
+	let (tx, rx) = flume::unbounded();
+	let result = shell.run(ShellRunOptions {
+		command: "/bin/false; first=$?; /bin/sh -c 'exit 7' & job=$!; wait \"$job\"; second=$?; for _ in {1..130}; do /bin/true; done; printf '%s:%s\\n' \"$first\" \"$second\"; jobs -p".into(),
+		..Default::default()
+	}, Some(tx), CancelToken::default()).await.expect("cohort run");
+	assert_eq!(result.exit_code, Some(0));
+	assert_eq!(rx.try_iter().collect::<String>(), "1:7\n", "exit statuses, wait and finished-job removal must not wait for the final reap");
+	let mut zombies = Vec::new();
+	for task in fs::read_dir("/proc/self/task").expect("own tasks").flatten() {
+		let Ok(children) = fs::read_to_string(task.path().join("children")) else { continue; };
+		for pid in children.split_whitespace() {
+			let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else { continue; };
+			if stat.rsplit_once(')').is_some_and(|(_, fields)| fields.split_whitespace().next() == Some("Z")) {
+				zombies.push(pid.to_owned());
+			}
+		}
+	}
+	assert!(zombies.is_empty(), "no deferred zombie may outlive the run: {zombies:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_later_run_keeps_a_coprocess_pipe_open_for_term_cleanup() {
+	let root = tempfile::tempdir().expect("coprocess fixture");
+	let script = root.path().join("cleanup.sh");
+	fs::write(&script, "trap 'printf x >> \"$1/count\"; /bin/sleep .65; printf done > \"$1/done\"; exit 0' TERM\nprintf '%s' \"$$\" > \"$1/coprocess.pid\"\n: > \"$1/ready\"\nwhile :; do /bin/sleep 120; done\n").expect("write cleanup");
+	let mut cancel = CancelToken::default();
+	let abort = cancel.emplace_abort_token();
+	let mut cleanup = Cleanup { root: root.path().to_path_buf(), pins: Vec::new(), abort: abort.clone() };
+	let shell = Arc::new(Shell::new(None));
+	let command = format!("coproc {{ /bin/sh {} {}; }}", quote_arg(script.to_str().unwrap()), quote_arg(root.path().to_str().unwrap()));
+	let first = shell.run(ShellRunOptions { command, ..Default::default() }, None, CancelToken::default()).await.expect("start retained coprocess");
+	assert_eq!(first.exit_code, Some(0));
+	time::timeout(Duration::from_secs(20), async {
+		while !root.path().join("ready").exists() { cleanup.observe(); time::sleep(Duration::from_millis(10)).await; }
+	}).await.expect("coprocess ready");
+	cleanup.observe();
+	assert_eq!(cleanup.pins.len(), 1);
+	assert_eq!(cleanup.pins[0].1.status(), ProcessStatus::Running);
+	let second_ready = root.path().join("second");
+	let command = format!(": > {}; /bin/sleep 120", quote_arg(second_ready.to_str().unwrap()));
+	let running = Arc::clone(&shell);
+	let run = tokio::spawn(async move { running.run(ShellRunOptions { command, ..Default::default() }, None, cancel).await });
+	time::timeout(Duration::from_secs(20), async {
+		while !second_ready.exists() { time::sleep(Duration::from_millis(10)).await; }
+	}).await.expect("second run ready");
+	abort.abort(AbortReason::Signal);
+	let result = time::timeout(Duration::from_secs(20), run).await.expect("second run cancelled").expect("run task").expect("run result");
+	assert!(result.cancelled);
+	assert_eq!(fs::read_to_string(root.path().join("count")).expect("TERM handler started"), "x");
+	assert_eq!(fs::read_to_string(root.path().join("done")).expect("TERM handler completed"), "done");
 }

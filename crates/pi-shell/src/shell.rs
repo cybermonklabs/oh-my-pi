@@ -48,6 +48,8 @@ struct ShellSessionCore {
 	filesystem: Fs,
 	/// The shell's working directory after the last command.
 	cwd:        BString,
+	/// Persistent jobs may keep writing after the caller's capture has ended.
+	keep_background_output: bool,
 }
 
 #[derive(Clone, Default)]
@@ -431,7 +433,7 @@ const fn cancelled_result(reason: AbortReason) -> ShellRunResult {
 /// Claim OS termination before waking the engine's cancel path. Session
 /// publication takes the same lock, so cancellation during snapshot setup
 /// cannot miss the newly created registry.
-async fn cancel_run(children: &ActiveChildren, cancel: &CancellationToken) {
+async fn cancel_run(children: &ActiveChildren, cancel: &CancellationToken) -> Result<()> {
 	let registry = {
 		let children = children.lock();
 		let registry = children.clone();
@@ -444,10 +446,11 @@ async fn cancel_run(children: &ActiveChildren, cancel: &CancellationToken) {
 	};
 	#[cfg(unix)]
 	if let Some(registry) = registry {
-		registry.finish_termination().await;
+		registry.spawn_termination().await.map_err(|err| Error::msg(format!("Shell termination failed: {err}")))?;
 	}
 	#[cfg(not(unix))]
 	let _ = registry;
+	Ok(())
 }
 
 async fn run_shell_session(
@@ -488,7 +491,7 @@ async fn run_shell_session(
 				core
 			} else {
 				let core =
-					create_session_for_run(&config, Some(&tokio_cancel), &[&run_children, &children])
+					create_session_for_run(&config, Some(&tokio_cancel), &[&run_children, &children], true)
 						.await?;
 				session_guard.insert(core)
 			};
@@ -505,7 +508,7 @@ async fn run_shell_session(
 	let res = tokio::select! {
 		res = &mut run_task => res,
 		reason = ct.wait() => {
-			cancel_run(&run_children, &tokio_cancel).await;
+			cancel_run(&run_children, &tokio_cancel).await?;
 			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut run_task).await;
 			if graceful.is_err() {
 				// OS termination has completed; only the stalled task remains.
@@ -537,7 +540,7 @@ async fn run_shell_oneshot(
 		async move {
 			// The session ends with this task: its background jobs end with it.
 			let mut session =
-				create_session_for_run(&config, Some(&tokio_cancel), &[&children]).await?;
+				create_session_for_run(&config, Some(&tokio_cancel), &[&children], false).await?;
 			run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel).await
 		}
 	});
@@ -545,7 +548,7 @@ async fn run_shell_oneshot(
 	let run_result = tokio::select! {
 		result = &mut task => result,
 		reason = ct.wait() => {
-			cancel_run(&children, &tokio_cancel).await;
+			cancel_run(&children, &tokio_cancel).await?;
 			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut task).await;
 			if graceful.is_err() {
 				task.abort();
@@ -573,7 +576,7 @@ async fn run_shell_oneshot_streams(
 		let children = children.clone();
 		async move {
 			let mut session =
-				create_session_for_run(&config, Some(&tokio_cancel), &[&children]).await?;
+				create_session_for_run(&config, Some(&tokio_cancel), &[&children], false).await?;
 			run_shell_command_streams(&mut session, &run_config, streams, tokio_cancel).await
 		}
 	});
@@ -581,7 +584,7 @@ async fn run_shell_oneshot_streams(
 	let run_result = tokio::select! {
 		result = &mut task => result,
 		reason = ct.wait() => {
-			cancel_run(&children, &tokio_cancel).await;
+			cancel_run(&children, &tokio_cancel).await?;
 			let graceful = time::timeout(CANCEL_RUN_GRACE, &mut task).await;
 			if graceful.is_err() {
 				task.abort();
@@ -726,7 +729,7 @@ fn merge_path_values(_existing: &str, incoming: &str) -> String {
 
 #[cfg(test)]
 async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
-	create_session_for_run(config, None, &[]).await
+	create_session_for_run(config, None, &[], true).await
 }
 
 /// Copies the host environment into `vars` (the shell's starting
@@ -827,6 +830,7 @@ async fn create_session_for_run(
 	config: &ShellConfig,
 	cancel_token: Option<&CancellationToken>,
 	children: &[&ActiveChildren],
+	keep_background_output: bool,
 ) -> Result<ShellSessionCore> {
 	let cancel = cancel_token.cloned().unwrap_or_default();
 	let runtime = tokio::runtime::Handle::current();
@@ -851,7 +855,7 @@ async fn create_session_for_run(
 		output_decoding: None,
 	})
 	.map_err(|err| Error::msg(format!("Failed to initialize shell: {err}")))?;
-	let mut core = ShellSessionCore { session, slot, filesystem: config.filesystem.clone(), cwd };
+	let mut core = ShellSessionCore { session, slot, filesystem: config.filesystem.clone(), cwd, keep_background_output };
 	for children in children {
 		let mut children = children.lock();
 		if cancel.is_cancelled() {
@@ -1365,6 +1369,7 @@ async fn run_shell_command_once(
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, activity_rx) = flume::bounded::<()>(1);
 	let reader_callback = on_chunk;
+	let keep_background_output = session.keep_background_output;
 	let mut reader_handle = tokio::spawn({
 		let reader_cancel = reader_cancel.clone();
 		async move {
@@ -1376,12 +1381,13 @@ async fn run_shell_command_once(
 						reader_cancel,
 						activity_tx,
 						max_capture_bytes,
+						keep_background_output,
 					)
 					.await;
 					Result::<OutputRead>::Ok(OutputRead::Buffered(output))
 				},
 				CommandCaptureMode::Streaming => {
-					Box::pin(read_output(reader_file, reader_callback, reader_cancel, activity_tx))
+					Box::pin(read_output(reader_file, reader_callback, reader_cancel, activity_tx, keep_background_output))
 						.await;
 					Result::<OutputRead>::Ok(OutputRead::Streaming)
 				},
@@ -1727,36 +1733,30 @@ async fn read_output(
 	on_chunk: Option<Sender<String>>,
 	cancel_token: CancellationToken,
 	activity: Sender<()>,
+	keep_background_output: bool,
 ) {
 	const BUF: usize = 65536;
-	let mut buf = vec![0u8; BUF];
+	let buf = vec![0u8; BUF];
 	let mut decoder = CaptureDecoder::new();
 
 	#[cfg(unix)]
-	let Ok(reader) = register_nonblocking_pipe(reader) else {
+	let Ok(mut reader) = CapturePipe::new(reader, buf, keep_background_output) else {
 		return;
 	};
 	#[cfg(not(unix))]
 	let reader = tokio::fs::File::from_std(reader);
 	#[cfg(not(unix))]
+	let mut buf = buf;
+	#[cfg(not(unix))]
 	tokio::pin!(reader);
+	#[cfg(not(unix))]
+	let _ = keep_background_output;
 
 	loop {
 		#[cfg(unix)]
-		let n = {
-			let Ok(mut readiness) = (tokio::select! {
-				ready = reader.readable() => ready,
-				() = cancel_token.cancelled() => break,
-			}) else {
-				break;
-			};
-			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
-				Ok(Ok(0)) => break,
-				Ok(Ok(n)) => n,
-				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Ok(Err(_)) => break,
-				Err(_would_block) => continue,
-			}
+		let n = match reader.read_some(&cancel_token).await {
+			Ok(Some(n)) if n != 0 => n,
+			_ => break,
 		};
 		#[cfg(not(unix))]
 		let n = {
@@ -1783,7 +1783,11 @@ async fn read_output(
 		};
 		if n > 0 {
 			let _ = activity.try_send(());
-			let text = decoder.push(&buf[..n]);
+			#[cfg(unix)]
+			let bytes = reader.bytes(n);
+			#[cfg(not(unix))]
+			let bytes = &buf[..n];
+			let text = decoder.push(bytes);
 			if !text.is_empty() {
 				emit_chunk(text, on_chunk.as_ref()).await;
 			}
@@ -1802,9 +1806,10 @@ async fn read_output_buffered(
 	cancel_token: CancellationToken,
 	activity: Sender<()>,
 	max_capture_bytes: usize,
+	keep_background_output: bool,
 ) -> BufferedOutput {
 	const BUF: usize = 65536;
-	let mut buf = vec![0u8; BUF];
+	let buf = vec![0u8; BUF];
 	let mut input_bytes = 0usize;
 	// The decoded capture, built from the same decoder output that streams,
 	// so the bytes are decoded once rather than again at the end.
@@ -1814,30 +1819,23 @@ async fn read_output_buffered(
 	let mut decoder = CaptureDecoder::new();
 
 	#[cfg(unix)]
-	let Ok(reader) = register_nonblocking_pipe(reader) else {
+	let Ok(mut reader) = CapturePipe::new(reader, buf, keep_background_output) else {
 		return BufferedOutput { text: String::new(), input_bytes: 0, exceeded: true };
 	};
 	#[cfg(not(unix))]
 	let reader = tokio::fs::File::from_std(reader);
 	#[cfg(not(unix))]
+	let mut buf = buf;
+	#[cfg(not(unix))]
 	tokio::pin!(reader);
+	#[cfg(not(unix))]
+	let _ = keep_background_output;
 
 	loop {
 		#[cfg(unix)]
-		let n = {
-			let Ok(mut readiness) = (tokio::select! {
-				ready = reader.readable() => ready,
-				() = cancel_token.cancelled() => break,
-			}) else {
-				break;
-			};
-			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
-				Ok(Ok(0)) => break,
-				Ok(Ok(n)) => n,
-				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Ok(Err(_)) => break,
-				Err(_would_block) => continue,
-			}
+		let n = match reader.read_some(&cancel_token).await {
+			Ok(Some(n)) if n != 0 => n,
+			_ => break,
 		};
 		#[cfg(not(unix))]
 		let n = {
@@ -1880,7 +1878,11 @@ async fn read_output_buffered(
 		}
 		captured_bytes = captured_bytes.saturating_add(n);
 
-		let text = decoder.push(&buf[..n]);
+		#[cfg(unix)]
+		let bytes = reader.bytes(n);
+		#[cfg(not(unix))]
+		let bytes = &buf[..n];
+		let text = decoder.push(bytes);
 		if !text.is_empty() {
 			if !exceeded {
 				captured.push_str(&text);
@@ -1898,6 +1900,66 @@ async fn read_output_buffered(
 	}
 
 	BufferedOutput { text: captured, input_bytes, exceeded }
+}
+
+/// Ending a persistent call's capture must not close a retained job's pipe:
+/// a shell can write a diagnostic before running its TERM trap. Only its
+/// accepted bytes belong to the completed call; later bytes are discarded.
+#[cfg(unix)]
+struct CapturePipe {
+	inner: Option<tokio::io::unix::AsyncFd<fs::File>>,
+	buf: Vec<u8>,
+	finished: bool,
+	runtime: Option<tokio::runtime::Handle>,
+}
+
+#[cfg(unix)]
+impl CapturePipe {
+	fn new(reader: fs::File, buf: Vec<u8>, keep: bool) -> io::Result<Self> {
+		Ok(Self { inner: Some(register_nonblocking_pipe(reader)?), buf, finished: false,
+			runtime: keep.then(tokio::runtime::Handle::current) })
+	}
+
+	async fn read_some(&mut self, cancel: &CancellationToken) -> io::Result<Option<usize>> {
+		loop {
+			let reader = self.inner.as_ref().expect("capture owns its pipe until drop");
+			let ready = tokio::select! {
+				ready = reader.readable() => ready,
+				() = cancel.cancelled() => return Ok(None),
+			};
+			let mut ready = match ready { Ok(ready) => ready, Err(error) => { self.finished = true; return Err(error); } };
+			let result = ready.try_io(|inner| read_nonblocking(inner.get_ref(), &mut self.buf));
+			drop(ready);
+			match result {
+				Ok(Ok(n)) => { self.finished = n == 0; return Ok(Some(n)); },
+				Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {},
+				Ok(Err(error)) => { self.finished = true; return Err(error); },
+				Err(_would_block) => {},
+			}
+		}
+	}
+
+	fn bytes(&self, n: usize) -> &[u8] { &self.buf[..n] }
+}
+
+#[cfg(unix)]
+impl Drop for CapturePipe {
+	fn drop(&mut self) {
+		if !self.finished && let (Some(runtime), Some(reader)) = (self.runtime.take(), self.inner.take()) {
+			// Reuse the capture buffer; no callback or completed result is kept.
+			let mut buf = std::mem::take(&mut self.buf);
+			runtime.spawn(async move {
+				loop {
+					let Ok(mut ready) = reader.readable().await else { break; };
+					match ready.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
+						Ok(Ok(0)) => break,
+						Ok(Err(error)) if error.kind() != io::ErrorKind::Interrupted => break,
+						_ => {},
+					}
+				}
+			});
+		}
+	}
 }
 
 #[cfg(unix)]

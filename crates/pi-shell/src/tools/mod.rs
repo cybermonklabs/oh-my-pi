@@ -34,17 +34,19 @@ mod nohup;
 mod timeout;
 
 use std::{
-	collections::{HashSet, VecDeque},
+	collections::{HashMap, HashSet, VecDeque},
 	sync::Arc,
 	task::Waker,
 	time::Duration,
 };
 
+#[cfg(unix)]
+use std::time::Instant;
 use bstr::{BStr, BString, ByteSlice};
 use parking_lot::Mutex;
-use pi_builtins::{
-	GroupProof, PinnedProcess, SignalWave, SpawnLedger, host_protected_pids, signalable_descendants,
-};
+use pi_builtins::{PinnedProcess, SpawnLedger};
+#[cfg(unix)]
+use pi_builtins::{GroupProof, SignalWave, host_protected_pids, signalable_descendants};
 
 use crate::{
 	bash::{
@@ -154,9 +156,15 @@ pub struct SpawnLog(Arc<Mutex<Vec<LabelLog>>>);
 struct LabelLog {
 	label:   u32,
 	ledger:  SpawnLedger,
-	/// External handles not released yet. Only those handles hold their
-	/// child unreaped; a stored pid is never itself a signal target.
+	/// A native reap lease reserves the number until its actual report.
 	pending: HashSet<i32>,
+	live_handles: HashSet<i32>,
+	#[cfg(unix)]
+	delivery_signal: Option<crate::bash::Signal>,
+	#[cfg(unix)]
+	awaiting: HashSet<i32>,
+	#[cfg(unix)]
+	delivered_at: Option<Instant>,
 }
 
 impl SpawnLog {
@@ -171,23 +179,28 @@ impl SpawnLog {
 		let at = if let Some(at) = logs.iter().position(|log| log.label == lineage.label) {
 			at
 		} else {
-			logs.push(LabelLog { label: lineage.label, ledger: SpawnLedger::default(), pending: HashSet::new() });
+			logs.push(LabelLog { label: lineage.label, ledger: SpawnLedger::default(), pending: HashSet::new(), live_handles: HashSet::new(), #[cfg(unix)] delivery_signal: None, #[cfg(unix)] awaiting: HashSet::new(), #[cfg(unix)] delivered_at: None });
 			logs.len() - 1
 		};
 		logs[at]
 			.ledger
 			.record(Some(pid), PinnedProcess::from_pid(pid));
 		logs[at].pending.insert(pid);
+		logs[at].live_handles.insert(pid);
 	}
 
-	/// The wrapper still holds its child unreaped throughout this report.
-	pub fn pin_members(&self, pid: u32) {
+	/// Called at the native reap boundary, after a shared cohort snapshot
+	/// on older kernels or with kernel-pinned groups on modern Linux.
+	pub fn released(&self, pid: u32, members: &[PinnedProcess]) {
 		let Ok(pid) = i32::try_from(pid) else {
 			return;
 		};
 		for log in self.0.lock().iter_mut() {
+			log.live_handles.remove(&pid);
+			#[cfg(unix)]
+			log.awaiting.remove(&pid);
 			if log.pending.remove(&pid) {
-				log.ledger.before_reap(pid, true);
+				log.ledger.before_reap_with_members(pid, members);
 			}
 		}
 	}
@@ -200,21 +213,37 @@ impl SpawnLog {
 			.any(|log| labels.contains(&log.label) && log.ledger.reaches_anything())
 	}
 
-	fn capture(&self, labels: &[u32], groups: bool) {
-		for log in self
-			.0
-			.lock()
-			.iter_mut()
-			.filter(|log| labels.contains(&log.label))
-		{
-			let wave = log.ledger.plan_wave(0, groups).deliver();
-			log.ledger.record_reached(&wave);
+	fn live_processes(&self, labels: &[u32]) -> bool {
+		self.0.lock().iter().filter(|log| labels.contains(&log.label))
+			.any(|log| log.ledger.entries().iter().any(|entry| entry.process.status() == pi_builtins::ProcessStatus::Running))
+	}
+
+	pub(crate) fn handle_released(&self, pid: u32) {
+		if let Ok(pid) = i32::try_from(pid) {
+			for log in self.0.lock().iter_mut() { log.live_handles.remove(&pid); }
 		}
 	}
 
-	/// Live handles get catchable signals from the engine exactly once.
-	/// This wave reaches only released externals and their pinned members;
-	/// KILL also covers live handles, since duplicate KILL is unobservable.
+	pub(crate) fn signalled(&self, pid: u32, signal: crate::bash::Signal, delivery: pi_builtins::SignalDelivery) {
+		#[cfg(unix)]
+		if let Ok(pid) = i32::try_from(pid) {
+			for log in self.0.lock().iter_mut() {
+				if log.delivery_signal == Some(signal) && log.awaiting.remove(&pid) { log.delivered_at = Some(delivery.finished); }
+			}
+		}
+		#[cfg(not(unix))]
+		let _ = (pid, signal, delivery);
+	}
+
+	#[cfg(unix)]
+	fn native_delivery(&self, labels: &[u32], signal: crate::bash::Signal) -> Option<Instant> {
+		self.0.lock().iter().filter(|log| labels.contains(&log.label) && log.delivery_signal == Some(signal))
+			.filter_map(|log| log.delivered_at).max()
+	}
+
+	/// Live handles receive their signal from the VM. Retained groups and
+	/// members receive this supplemental wave, without repeating live TERM.
+	#[cfg(unix)]
 	fn signal(&self, labels: &[u32], signal: crate::bash::Signal, groups: bool) {
 		let number = i32::from(signal.number(crate::bash::Platform::current()));
 		let protected = host_protected_pids();
@@ -224,17 +253,14 @@ impl SpawnLog {
 			.iter_mut()
 			.filter(|log| labels.contains(&log.label))
 		{
+			log.delivery_signal = Some(signal);
+			log.awaiting.clone_from(&log.live_handles);
+			log.delivered_at = None;
 			let mut wave = SignalWave::new(number);
 			for entry in log.ledger.entries() {
-				if signal != crate::bash::Signal::Kill
-					&& (log.pending.contains(&entry.process.pid())
-						|| entry
-							.group
-							.is_some_and(|group| log.pending.contains(&group)))
-				{
-					continue;
-				}
-				if !groups && entry.group != Some(entry.process.pid()) {
+				if signal != crate::bash::Signal::Kill && (log.live_handles.contains(&entry.process.pid())
+					|| entry.group.is_some_and(|group| log.live_handles.contains(&group))) { continue; }
+				if !groups && !entry.was_spawned() {
 					continue;
 				}
 				if groups && entry.group == Some(entry.process.pid()) {
@@ -253,12 +279,21 @@ impl SpawnLog {
 				}
 			}
 			wave.deliver();
+			#[cfg(unix)]
+			if groups && number != 0 && number != libc::SIGKILL && number != libc::SIGCONT { wave.resume_reached(); }
 			log.ledger.record_reached(&wave);
 		}
 	}
 
 	fn forget(&self, labels: &[u32]) {
 		self.0.lock().retain(|log| !labels.contains(&log.label));
+	}
+
+	fn prune(&self) -> Vec<u32> {
+		let mut logs = self.0.lock();
+		for log in logs.iter_mut() { log.ledger.prune(); }
+		logs.retain(|log| !log.ledger.entries().is_empty());
+		logs.iter().map(|log| log.label).collect()
 	}
 }
 
@@ -268,6 +303,7 @@ impl SpawnLog {
 struct Labels {
 	last:    u32,
 	parents: Vec<(u32, u32)>,
+	swept_at: u32,
 }
 
 impl Labels {
@@ -297,8 +333,27 @@ impl Labels {
 		group
 	}
 
-	fn release(&mut self, group: &[u32]) {
+	/// A completed inner operand's processes still belong to its ancestors.
+	fn release(&mut self, group: &[u32]) -> bool {
+		if group.first().is_some_and(|root| self.parents.iter().any(|(child, _)| child == root)) { return false; }
 		self.parents.retain(|(child, _)| !group.contains(child));
+		true
+	}
+
+	fn sweep_due(&mut self) -> bool {
+		if self.last.wrapping_sub(self.swept_at) < 64 { return false; }
+		self.swept_at = self.last;
+		true
+	}
+
+	fn prune(&mut self, mut retained: Vec<u32>, active: impl Iterator<Item = u32>) {
+		retained.extend(active);
+		let parents: HashMap<u32, u32> = self.parents.iter().copied().collect();
+		let mut keep: HashSet<u32> = retained.iter().copied().collect();
+		while let Some(child) = retained.pop() {
+			if let Some(&parent) = parents.get(&child) && keep.insert(parent) { retained.push(parent); }
+		}
+		self.parents.retain(|(child, _)| keep.contains(child));
 	}
 }
 
@@ -566,11 +621,13 @@ impl ToolCalls {
 			};
 			let (_, tool) = self.active.swap_remove(at);
 			self.orphans.extend(tool.pending());
-			self.log.forget(&group);
-			self.labels.release(&group);
+			if self.labels.release(&group) { self.log.forget(&group); }
 			if let Some(outcome) = answer {
 				shell.complete(id, outcome);
 			}
+		}
+		if self.labels.sweep_due() {
+			self.labels.prune(self.log.prune(), self.active.iter().map(|(_, tool)| tool.child().label));
 		}
 	}
 
@@ -603,7 +660,9 @@ mod tests {
 		let other = labels.fresh(0);
 		assert_eq!(labels.group(outer), [outer, inner, innermost]);
 		assert_eq!(labels.group(other), [other]);
-		labels.release(&labels.group(inner));
+		assert!(!labels.release(&labels.group(inner)));
+		assert_eq!(labels.group(outer), [outer, inner, innermost]);
+		assert!(labels.release(&labels.group(outer)));
 		assert_eq!(labels.group(outer), [outer]);
 	}
 

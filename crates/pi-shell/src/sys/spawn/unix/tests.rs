@@ -12,8 +12,9 @@ use std::{
 
 use bstr::{BString, ByteSlice};
 use parking_lot::Mutex;
+use pi_builtins::{PinnedProcess, SignalDelivery};
 
-use super::{Place, Scope, State, process_umask};
+use super::{Place, ReapObserver, Scope, State, process_umask};
 use crate::{
 	bash::{
 		ChildRedir, ChildRedirs, CmdTag, EnvView, ExitStatus, ExtProc, File, FileKind, JobId,
@@ -554,6 +555,8 @@ fn inherit_abandon_escalation_spares_the_hosts_group() {
 	let grace = Duration::from_millis(300);
 	let env = EnvView::default();
 	let s = spawner(Sessions::Inherit, grace);
+	let events = Arc::new(SignalTimes::default());
+	s.set_reap_observer(Arc::clone(&events) as Arc<dyn ReapObserver>);
 	let mut bystander = std::process::Command::new("/bin/sleep")
 		.arg("30")
 		.spawn()
@@ -564,12 +567,9 @@ fn inherit_abandon_escalation_spares_the_hosts_group() {
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid() as i32;
 	until("exec'd", || proc::info(pid).is_some_and(|i| i.name == "sleep"));
-	let start = Instant::now();
 	drop(p);
-	thread::sleep(grace / 2);
-	assert!(live(pid), "TERM is ignored, KILL waits for the grace");
 	until("child killed", || gone(pid));
-	assert!(start.elapsed() >= grace);
+	measured_grace(&events, grace);
 	assert!(bystander.try_wait().unwrap().is_none(), "nothing was sent to the host's process group");
 	bystander.kill().unwrap();
 	bystander.wait().unwrap();
@@ -616,25 +616,44 @@ fn stop_and_cont_reach_every_member_of_the_group() {
 	until("group gone", || live_group(group).is_empty());
 }
 
+#[derive(Default)]
+struct SignalTimes(Mutex<Vec<(Signal, SignalDelivery)>>);
+
+impl ReapObserver for SignalTimes {
+	fn before_reap(&self, _pid: u32, _members: &[PinnedProcess]) {}
+	fn signalled(&self, _pid: u32, signal: Signal, delivery: SignalDelivery) {
+		self.0.lock().push((signal, delivery));
+	}
+}
+
+fn measured_grace(events: &SignalTimes, grace: Duration) -> Duration {
+	let events = events.0.lock();
+	let term = events.iter().find(|(signal, _)| *signal == Signal::Term).expect("TERM was delivered").1;
+	let mut first = None;
+	for (_, kill) in events.iter().filter(|(signal, _)| *signal == Signal::Kill) {
+		assert!(kill.started >= term.finished + grace, "KILL before the full grace: TERM {term:?}, KILL {kill:?}, grace {grace:?}");
+		first = Some(first.map_or(kill.started, |old: Instant| old.min(kill.started)));
+	}
+	let measured = first.expect("ignored TERM must escalate to KILL").duration_since(term.finished);
+	eprintln!("TERM→KILL delivery: grace {grace:?}, measured {measured:?}");
+	measured
+}
+
 /// Cancel of a running external: TERM to the group at once, KILL after the
-/// grace. Prints the measured grace for the phase report.
+/// grace. Compare actual delivery windows, not a scheduler-dependent sample.
 fn abandon_escalates(grace: Duration) -> Duration {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Share, grace);
+	let events = Arc::new(SignalTimes::default());
+	s.set_reap_observer(Arc::clone(&events) as Arc<dyn ReapObserver>);
 	// The trap makes sh and the sleep it starts ignore TERM.
 	let a = sh("trap '' TERM; /bin/sleep 30; exit 0");
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
 	until("sleep started", || live_group(group).len() == 2);
-	let start = Instant::now();
 	drop(p);
-	thread::sleep(grace / 2);
-	assert_eq!(live_group(group).len(), 2, "TERM is ignored, KILL waits for the grace");
 	until("group killed", || live_group(group).is_empty());
-	let measured = start.elapsed();
-	eprintln!("TERM→KILL escalation: grace {grace:?}, measured {measured:?}");
-	assert!(measured >= grace, "KILL before the grace: {measured:?}");
-	measured
+	measured_grace(&events, grace)
 }
 
 /// A detached external (`nohup`) dropped while it runs is released, not
