@@ -592,8 +592,15 @@ mod tests {
 		);
 		drop(child_out);
 		let mut cx = Context::from_waker(Waker::noop());
-		pumps.poll(&mut cx, &tracker);
-		pumps.poll(&mut cx, &tracker);
+		// End of file comes once every copy of the write end is closed: a
+		// child another test forks while it is open holds one until it execs
+		// or exits.
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while tracker.lock().draining() == 4 {
+			assert!(std::time::Instant::now() < deadline, "end of file never drained its half");
+			pumps.poll(&mut cx, &tracker);
+			std::thread::yield_now();
+		}
 		assert_eq!(tracker.lock().draining(), 3, "end of file drained one half, once");
 		drop(pumps);
 		orphan::poll(&cx);
