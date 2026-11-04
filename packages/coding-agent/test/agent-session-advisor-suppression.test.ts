@@ -17,7 +17,7 @@
  *     (which converts to `developer`) would send an invalid provider tail, so the
  *     follow-up stays queued for the next explicit resume rather than auto-running.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
@@ -818,17 +818,24 @@ describe("AgentSession advisor auto-resume suppression", () => {
 	});
 
 	it("flushes an accepted IRC aside on dispose instead of dropping it", async () => {
-		const { session, streamStarted } = await createParkedSession();
+		const { session, sessionManager, streamStarted } = await createParkedSession();
+		// The in-memory manager forgets its entries when dispose() closes it, so observe the
+		// transcript writes themselves.
+		const appended: string[] = [];
+		const append = sessionManager.appendCustomMessageEntry.bind(sessionManager);
+		spyOn(sessionManager, "appendCustomMessageEntry").mockImplementation((customType, ...rest) => {
+			appended.push(customType);
+			return append(customType, ...rest);
+		});
 		const running = session.prompt("do the thing");
 		await streamStarted;
 		await session.deliverIrcMessage({ id: "m1", from: "peer", to: "me", body: "ping", ts: Date.now() } as IrcMessage);
-		// Dispose mid-flight persists the accepted aside to the transcript rather than dropping it.
+		// Dispose mid-flight persists the accepted aside to the transcript rather than dropping it:
+		// the final record writes it once, before session_exit.
 		session.beginDispose();
-		const sawIrc = session.agent.state.messages.some(
-			m => m.role === "custom" && (m as { customType?: string }).customType === "irc:incoming",
-		);
-		expect(sawIrc).toBe(true);
 		running.catch(() => {});
+		await session.dispose();
+		expect(appended.filter(customType => customType === "irc:incoming")).toHaveLength(1);
 	});
 
 	it("responds to a stranded IRC aside while keeping a blocked follow-up queued", async () => {

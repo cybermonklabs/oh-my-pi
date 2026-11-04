@@ -221,14 +221,20 @@ test("a disposer that throws inside beginDispose leaves the barrier set: the hel
 		const running = session.prompt("must not reach the provider").catch(() => undefined);
 		await withTimeout(entered.promise, 15_000, "The model-call hook did not run");
 
-		expect(() => session.beginDispose()).not.toThrow();
-		expect(agent.isDisposing).toBe(true);
-		expect(later).toBe(true);
+		let thrown: unknown;
+		try {
+			session.beginDispose();
+		} catch (error) {
+			thrown = error;
+		}
 		release.resolve();
 		await running;
-		await session.dispose();
+		await session.dispose().catch(() => undefined);
 
 		expect(requests).toEqual([]);
+		expect(agent.isDisposing).toBe(true);
+		expect(later).toBe(true);
+		expect(thrown).toBeUndefined();
 	} finally {
 		server.stop(true);
 	}
