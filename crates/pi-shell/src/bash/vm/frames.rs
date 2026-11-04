@@ -361,7 +361,7 @@ struct ScratchImage {
 	saved:        Vec<SavedImage>,
 	children:     Vec<(Vpid, Option<i32>)>,
 	inline:       Option<super::proc::InlineStage>,
-	pipeline: Option<(usize, Option<u32>, bool)>,
+	pipeline: Option<(u32, Option<u32>, bool)>,
 }
 
 fn saved_image(s: &[Saved], fds: &mut FdImager) -> Vec<SavedImage> {
@@ -400,6 +400,7 @@ fn scratch_image(
 			| Live::Dir(_)
 			| Live::Spawn(_)
 			| Live::Timer(_)
+			| Live::Pipeline(_)
 			| Live::None => {},
 		}
 		state
@@ -440,7 +441,10 @@ fn scratch_image(
 		saved: saved_image(io.map_or_default(|io| io.saved.as_slice()), fds),
 		children: sc.children.clone(),
 		inline: sc.inline,
-		pipeline: sc.pipeline.as_ref().map(|p| (p.next, p.stdin.as_ref().map(|fd| fds.fd(fd)), p.traced)),
+		pipeline: match &sc.live {
+			Live::Pipeline(p) => Some((p.next, p.stdin.as_ref().map(|fd| fds.fd(fd)), p.traced)),
+			_ => None,
+		},
 	}
 }
 
@@ -936,6 +940,11 @@ impl Shell {
 								}),
 							}))
 						};
+						let live = img.pipeline.map_or(live, |(next, stdin, traced)| Live::Pipeline(super::proc::PipelineProgress {
+							next,
+							stdin: stdin.map(|fd| objs.fd(cx.host, fd)),
+							traced,
+						}));
 						Some(Box::new(Scratch {
 							logs: img.logs,
 							sub: img.sub.map(|s| match s {
@@ -951,11 +960,6 @@ impl Shell {
 							live,
 							children: img.children,
 							inline: img.inline,
-							pipeline: img.pipeline.map(|(next, stdin, traced)| super::proc::PipelineProgress {
-								next,
-								stdin: stdin.map(|fd| objs.fd(cx.host, fd)),
-								traced,
-							}),
 							..Scratch::default()
 						}))
 					},

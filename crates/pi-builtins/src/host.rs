@@ -1991,7 +1991,8 @@ impl Destination {
 /// That last one matters more than it looks: the host process's fd 2 belongs to
 /// the TUI, so a child left with inherited stderr writes straight into the
 /// rendered frame. A native stderr is inherited directly; a provider stderr
-/// is piped and forwarded, with EPIPE signalled to the child, not its parent.
+/// is piped and forwarded, unless its reader is already gone, in which case
+/// the child inherits a readerless pipe so its own writes fail with EPIPE.
 #[derive(Clone)]
 pub(crate) struct ChildEnv {
 	cwd:    PathBuf,
@@ -2037,7 +2038,7 @@ impl ChildEnv {
 			.current_dir(cwd)
 			.env_clear()
 			.envs(self.env.iter().map(|(k, v)| (k, v)))
-			.stderr(self.child_stderr());
+			.stderr(self.child_stderr()?);
 		#[cfg(unix)]
 		if self.sigpipe.ignored.load(Ordering::Relaxed) {
 			use std::os::unix::process::CommandExt;
@@ -2052,14 +2053,21 @@ impl ChildEnv {
 		Ok(command)
 	}
 
-	fn child_stderr(&self) -> std::process::Stdio {
+	fn child_stderr(&self) -> io::Result<std::process::Stdio> {
 		#[cfg(unix)]
-		if let Ok(fd) = self.stderr.try_borrow_as_fd()
-			&& let Ok(fd) = fd.try_clone_to_owned()
-		{
-			return std::process::Stdio::from(fd);
+		if let Ok(fd) = self.stderr.try_borrow_as_fd() {
+			return fd.try_clone_to_owned().map(std::process::Stdio::from);
 		}
-		std::process::Stdio::piped()
+		#[cfg(any(unix, windows))]
+		if self.stderr.reader_gone() {
+			// A forwarder would acknowledge the child's first write before it
+			// discovers EPIPE. Sending SIGPIPE afterwards cannot reproduce the
+			// failed write when the child ignores the signal.
+			let (reader, writer) = std::io::pipe()?;
+			drop(reader);
+			return Ok(std::process::Stdio::from(writer));
+		}
+		Ok(std::process::Stdio::piped())
 	}
 
 	pub fn pipe_writer<W: Write>(&self, inner: W) -> ChildPipe<W> {

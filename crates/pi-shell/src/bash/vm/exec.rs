@@ -15,7 +15,7 @@ use super::{
 	expand::{Expander, Stop},
 	is_ident, probe,
 	proc::{
-		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
+		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg, Live,
 		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
 		Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
@@ -689,7 +689,7 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc, store: &mut dyn StateStore) -> Opti
 				if command::sigpipe_ignored(store, vp) || command::child_output_failed(vp) {
 					continue;
 				}
-				k.ctl.signal(super::control::SigTarget::Vpid(vp.vpid.0), crate::bash::Signal::Pipe);
+				k.ctl.signal(crate::bash::SigTarget::Vpid(vp.vpid), crate::bash::Signal::Pipe);
 				return Some(Flow::Retry);
 			},
 			Poll::Ready(_) => {
@@ -3016,7 +3016,7 @@ fn stage_text(unit: &Unit, info: &ir::SpawnIr, i: usize) -> BString {
 fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: Op) -> Flow {
 	let info = &unit.spawns[op.a as usize];
 	if info.kind == SpawnKind::Pipeline
-		&& top_frame(vp).scratch.as_ref().is_none_or(|sc| sc.children.is_empty() || sc.pipeline.is_some())
+		&& top_frame(vp).scratch.as_ref().is_none_or(|sc| sc.children.is_empty() || matches!(sc.live, Live::Pipeline(_)))
 		&& let Some(flow) = launch_pipeline(k, vp, cx, unit, op)
 	{
 		return flow;
@@ -3133,36 +3133,37 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 /// Already-started stages remain independent when a later trap exits.
 fn launch_pipeline(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: Op) -> Option<Flow> {
 	let info = &unit.spawns[op.a as usize];
-	if scratch(vp).pipeline.is_none() {
+	if !matches!(scratch(vp).live, Live::Pipeline(_)) {
 		if !k.bangs.is_empty() { k.settle_bang(vp.vpid, None); }
 		let stdin = vp.fds.get(0).cloned();
-		scratch(vp).pipeline = Some(super::proc::PipelineProgress { next: 0, stdin, traced: false });
+		scratch(vp).live = Live::Pipeline(super::proc::PipelineProgress { next: 0, stdin, traced: false });
 	}
 	let n = info.stages.len();
 	let lastpipe = unit.mode.dialect() == Dialect::Zsh
 		|| (state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false) && !job_control(k, cx, vp));
 	let tap = cx.host.pipe_tap();
 	loop {
-		let mut progress = scratch(vp).pipeline.take().expect("pipeline launch");
-		if progress.next == n {
+		let Live::Pipeline(mut progress) = std::mem::take(&mut scratch(vp).live) else { unreachable!("pipeline launch") };
+		if progress.next as usize == n {
 			if k.mask.contains(crate::bash::event::EventKind::Pipeline) {
 				let children: Vec<_> = scratch(vp).children.iter().map(|&(vpid, _)| vpid).collect();
 				k.emit_op(cx, vp, op.node, EventData::Pipeline { stages: &children });
 			}
 			return None;
 		}
-		let i = progress.next;
+		let i = progress.next as usize;
 		let stage = &info.stages[i];
 		let stage_op = unit.ops[stage.entry as usize];
 		if !progress.traced && starts_command(unit, stage_op) {
 			progress.traced = true;
-			scratch(vp).pipeline = Some(progress);
+			scratch(vp).live = Live::Pipeline(progress);
 			note_command(vp, unit, stage_op);
 			if start_trap(k, vp, cx, TrapKey::Debug) {
 				set_trap_line(vp, line_of(vp, stage_op.node));
 				return Some(Flow::Call);
 			}
-			progress = scratch(vp).pipeline.take().expect("pipeline launch");
+			let Live::Pipeline(resumed) = std::mem::take(&mut scratch(vp).live) else { unreachable!("pipeline launch") };
+			progress = resumed;
 		}
 		if lastpipe && i + 1 == n {
 			if k.mask.contains(crate::bash::event::EventKind::Pipeline) {
@@ -3203,7 +3204,7 @@ fn launch_pipeline(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<U
 		k.spawned.push(Box::new(child));
 		progress.next += 1;
 		progress.traced = false;
-		scratch(vp).pipeline = Some(progress);
+		scratch(vp).live = Live::Pipeline(progress);
 	}
 }
 

@@ -72,6 +72,11 @@ impl Ctl {
 		std::mem::take(&mut *self.signals.lock())
 	}
 
+	pub(crate) fn signal(&self, target: SigTarget, sig: Signal) {
+		self.signals.lock().push((target, sig));
+		self.request(SIGNAL, 0);
+	}
+
 	#[inline]
 	pub(crate) fn wakes(&self) -> u64 {
 		self.wakes.load(Ordering::Acquire)
@@ -189,8 +194,7 @@ impl ControlHandle {
 	/// Deliver a signal on the virtual signal bus (the `kill` builtin uses
 	/// the same path).
 	pub fn signal(&self, target: SigTarget, sig: Signal) {
-		self.0.signals.lock().push((target, sig));
-		self.0.request(SIGNAL, 0);
+		self.0.signal(target, sig);
 	}
 
 	/// Ask the next `step` to drain to a global safepoint and return

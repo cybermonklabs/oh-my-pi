@@ -4938,7 +4938,8 @@ impl std::error::Error for SedError {}
 
 impl From<io::Error> for SedError {
 	fn from(error: io::Error) -> Self {
-		Self::new(2, error)
+		// GNU sed uses status 4 for fatal I/O errors. Input-open errors use IoContext.
+		Self::new(4, error)
 	}
 }
 
@@ -9689,6 +9690,26 @@ mod tests {
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "world\n");
 		assert_eq!(capture.err(), "");
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn builtin_reports_stdout_write_and_flush_errors() {
+		for input in ["hello\n", "hello"] {
+			let (mut host, capture) = Host::for_test("sed", input, "/");
+			let full = std::fs::File::options().write(true).open("/dev/full").unwrap();
+			host.set_test_stdout(crate::openfile::OpenFile::from(full));
+			let parsed = Sed { matches: test_matches(&["s/hello/world/"]) };
+			let code = crate::host::run_caught(parsed, &mut host);
+			assert_eq!(code, 4, "input={input:?}: {}", capture.err());
+		}
+	}
+
+	#[test]
+	fn builtin_keeps_input_open_error_status() {
+		let dir = tempfile::tempdir().unwrap();
+		let (code, capture) = crate::host::run_util::<Sed>(&["p", "missing"], "", dir.path());
+		assert_eq!(code, 2, "{}", capture.err());
 	}
 
 	#[test]

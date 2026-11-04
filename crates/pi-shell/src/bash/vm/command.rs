@@ -192,6 +192,7 @@ fn current_exec(vp: &Vproc) -> Option<&ExecState> {
 pub(super) fn child_output_failed(vp: &mut Vproc) -> bool {
 	let child = current_exec(vp).is_some_and(|e| {
 		matches!(e.stage, Stage::Output | Stage::Finish)
+			&& e.exec_as.is_none()
 			&& (e.child_diagnostic || e.target.as_ref().is_some_and(|target| !matches!(target, Target::Intrinsic(_) | Target::Function(_))))
 	});
 	if child {
@@ -3322,10 +3323,17 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 					.err()
 					.unwrap_or_else(|| std::io::ErrorKind::WriteZero.into());
 				if err.kind() == std::io::ErrorKind::BrokenPipe && !sigpipe_ignored(cx.store, vp) {
-					k.ctl.signal(super::control::SigTarget::Vpid(vp.vpid.0), crate::bash::Signal::Pipe);
-					// Leave the command at its output stage until the signal's
-					// disposition has run. A caught PIPE leaves a write error.
-					st(vp).status = 1;
+					if fd != 2 {
+						st(vp).status = 1;
+						let caught = matches!(state::record(cx.store, vp, Key::Trap(crate::bash::store::TrapKey::Signal(crate::bash::Signal::Pipe))), Ok(Some(Record::Trap { action, .. })) if !action.is_empty());
+						if caught {
+							let cmd = Cow::Owned(String::from_utf8_lossy(&st(vp).argv[0]).into_owned());
+							let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
+							vp.out.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+						}
+					}
+					vp.status = st(vp).status;
+					k.ctl.signal(crate::bash::SigTarget::Vpid(vp.vpid), crate::bash::Signal::Pipe);
 					return Some(Flow::Retry);
 				}
 				if fd != 2 {

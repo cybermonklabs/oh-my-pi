@@ -1020,8 +1020,6 @@ pub struct Scratch {
 	pub children:    Vec<(Vpid, Option<i32>)>,
 	/// A `Spawn` running its last stage in this shell (`lastpipe`).
 	pub inline:      Option<InlineStage>,
-	/// Pipeline stages still to start after a parent DEBUG trap.
-	pub pipeline:    Option<PipelineProgress>,
 	/// A finished `Exec`'s state kept so the next command reuses its
 	/// allocations; never serialized.
 	pub spare_exec:  Option<Box<ExecState>>,
@@ -1033,7 +1031,7 @@ pub struct Scratch {
 
 /// A pipeline launch suspended by a DEBUG trap in its parent shell.
 pub struct PipelineProgress {
-	pub next: usize,
+	pub next: u32,
 	pub stdin: Option<FdRef>,
 	pub traced: bool,
 }
@@ -1042,7 +1040,7 @@ impl Scratch {
 	/// Clear for the next op, keeping allocations: a finished `Exec`'s
 	/// state becomes the spare.
 	pub fn recycle(&mut self) {
-		let Self { logs, sub, exec, io, live, children, inline, pipeline, spare_exec, spare_words: _ } = self;
+		let Self { logs, sub, exec, io, live, children, inline, spare_exec, spare_words: _ } = self;
 		for log in logs {
 			log.clear();
 		}
@@ -1062,7 +1060,6 @@ impl Scratch {
 		}
 		children.clear();
 		*inline = None;
-		*pipeline = None;
 	}
 
 	/// The op's I/O progress, created on first use (the first redirection,
@@ -1486,6 +1483,8 @@ pub enum Live {
 	OpenDir(Box<dyn FsPending<Box<dyn crate::bash::fs::DirIter>>>),
 	/// The listing of a glob walk.
 	Dir(Box<dyn crate::bash::fs::DirIter>),
+	/// A pipeline waiting for a DEBUG trap before starting its next stage.
+	Pipeline(PipelineProgress),
 }
 
 impl Live {
@@ -1506,7 +1505,7 @@ impl Live {
 			// A FIFO open is a rendezvous with the other end.
 			Self::Open(open) => open.reissuable(),
 			Self::File(file) => file.kind() == crate::bash::fs::FileKind::Regular,
-			Self::Task(_) | Self::Ext(_) | Self::Timer(_) | Self::None => false,
+			Self::Task(_) | Self::Ext(_) | Self::Timer(_) | Self::Pipeline(_) | Self::None => false,
 		}
 	}
 }

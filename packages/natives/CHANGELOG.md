@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed the bash tool's shell going on after a built-in command, error message or `set -x` line wrote to a closed pipe, with its own status instead of SIGPIPE's 141 as in Bash; `trap '' PIPE` now turns such a write into a write error, and built-in utilities end at a closed pipe as the programs they stand in for do, at the stdio call those programs' write fails at (buffered output, file operands, `find`'s and `sed`'s output files, `tee`, `xargs`, `sort`'s compressor, `ps`, `top`, `tail -f`, `rsync`, `rg`, `fd`), and the children they start inherit their SIGPIPE disposition ([#17827](https://github.com/can1357/oh-my-pi/pull/17827) by [@sjawhar](https://github.com/sjawhar))
+- Fixed shell diagnostics, trace output and built-in utilities continuing after their pipe reader exits; writers now stop with SIGPIPE's status 141, while ignored and caught SIGPIPE dispositions are preserved ([#17827](https://github.com/can1357/oh-my-pi/pull/17827) by [@sjawhar](https://github.com/sjawhar))
 ### Changed
 
 - Made the bash tool's shell faster on string appends (`s+=x`), sourcing files full of function definitions (each body compiles on first call), quoted `"$var"`/`"$1"` arguments and file redirections

@@ -170,6 +170,7 @@ async fn writes_to_a_closed_pipe_end_the_writer_as_sigpipe_does() {
 /// and the loop ran all its iterations (forever, unbounded).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_loop_of_builtin_writes_stops_when_its_reader_exits() {
+	nothing_revives_a_shell_a_broken_pipe_killed().await;
 	let (exit_code, output) = run(
 		"i=0; while [ $i -lt 200000 ]; do echo y; i=$((i+1)); done | head -n 1 > /dev/null; echo \
 		 \"loop=${PIPESTATUS[0]}\"; i=0; while [ $i -lt 200000 ]; do type nosuchcmd; i=$((i+1)); \
@@ -186,6 +187,7 @@ async fn a_loop_of_builtin_writes_stops_when_its_reader_exits() {
 /// diagnostic through fd 3 to the outer pipe, whose reader has exited.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_last_stage_killed_by_a_broken_pipe_ends_alone() {
+	a_last_stage_exit_ends_only_its_stage().await;
 	let (exit_code, output) = run_with_stderr(format!(
 		"{{ true | {{ {FILL_PIPE} >&3; cd /definitely/not/a/dir 2>&3; echo after-cd >&2; }}; echo \
 		 \"inner=${{PIPESTATUS[*]}}\" >&2; }} 3>&1 | true; echo \"outer=${{PIPESTATUS[*]}}\""
@@ -197,7 +199,6 @@ async fn a_last_stage_killed_by_a_broken_pipe_ends_alone() {
 
 /// A write of the shell's own to a pipe with no reader ends the whole run with
 /// status 141, as it kills a Bash script.
-#[tokio::test(flavor = "multi_thread")]
 async fn the_main_shell_ends_the_run_at_its_broken_pipe() {
 	let (exit_code, output) =
 		run(format!("{{ {FILL_PIPE}; echo out; echo after-write >&2; }} > >(true); echo continued"))
@@ -208,7 +209,6 @@ async fn the_main_shell_ends_the_run_at_its_broken_pipe() {
 /// A shell that a broken pipe killed stays dead: a callback or a trap that
 /// would run after the failed write runs nothing, as no command runs in a
 /// Bash process after SIGPIPE kills it.
-#[tokio::test(flavor = "multi_thread")]
 async fn nothing_revives_a_shell_a_broken_pipe_killed() {
 	let (exit_code, output) = run_with_stderr(format!(
 		"cb() {{ echo \"called$1\" >&2; echo \"cb$1\"; }}\n{{ {FILL_PIPE}; mapfile -t -C cb -c 1 \
@@ -223,7 +223,6 @@ async fn nothing_revives_a_shell_a_broken_pipe_killed() {
 
 /// A persistent shell whose main shell a broken pipe ended runs the next
 /// command normally.
-#[tokio::test(flavor = "multi_thread")]
 async fn the_next_command_runs_after_the_main_shell_broken_pipe() {
 	let shell = Shell::new(None);
 	let mut outcomes = Vec::new();
@@ -242,7 +241,6 @@ async fn the_next_command_runs_after_the_main_shell_broken_pipe() {
 
 /// A pipeline's last stage is a subshell: its `exit` ends that stage alone,
 /// as in Bash 5.2.21. Regression: it ended the whole run.
-#[tokio::test(flavor = "multi_thread")]
 async fn a_last_stage_exit_ends_only_its_stage() {
 	let (exit_code, output) = run(
 		"true | exit 3; echo \"exit=$?\"; true | { exit 4; }; echo \"group=$?\"; f() { exit 5; }; \
@@ -299,6 +297,7 @@ const REDIRECTIONS: &[(&str, &str, Writer)] = &[
 /// error was dropped, and a re-expansion of the command word classified it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_redirection_kills_the_process_bash_performs_it_in() {
+	a_failed_redirection_expands_each_word_once().await;
 	let mut script = String::new();
 	let mut expected = String::new();
 	for &(name, case, writer) in REDIRECTIONS {
@@ -322,7 +321,6 @@ async fn a_failed_redirection_kills_the_process_bash_performs_it_in() {
 /// expansion error comes before every redirection. Regression: a word was
 /// expanded twice, or not at all, the expansion error was lost, and
 /// redirections before an expansion error were performed.
-#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_redirection_expands_each_word_once() {
 	let (exit_code, output) = run_in_tempdir(&[
 		r#"made() { [ -e "$1" ] && echo yes || echo no; }"#,
@@ -398,7 +396,6 @@ async fn a_trace_line_that_kills_the_shell_ends_every_construct() {
 /// command after the DEBUG trap ran (or only its expansions and redirections
 /// did), `time` reported, and a DEBUG or ERR trap a subshell set never fired
 /// in it.
-#[tokio::test(flavor = "multi_thread")]
 async fn a_trap_that_kills_the_shell_ends_it() {
 	let (exit_code, output) = run_in_tempdir(&[
 		r#"made() { [ -e "$1" ] && echo yes || echo no; }"#,
@@ -519,15 +516,8 @@ async fn a_failed_compound_redirection_ends_only_that_command() {
 	);
 }
 
-/// An error in a failed redirection acts on the process Bash performs the
-/// redirection in: a fatal expansion error there ends the shell for a
-/// compound command, `[[ ]]`, a function or a command that names none, and
-/// only the command for an external one or a `( )` subshell, whose
-/// redirections are the child's. A subshell's failed redirection whose
-/// diagnostic hits a dead pipe kills only that subshell, per its own
-/// disposition. Regression: the fatal error became an ordinary status 1 for
-/// compound commands, and a subshell's diagnostic killed (or ran the caught
-/// SIGPIPE handler of) its parent.
+/// A subshell's failed-redirection diagnostic follows its own SIGPIPE
+/// disposition, not its parent's caught handler.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_redirection_error_acts_on_the_process_that_performs_it() {
 	let (exit_code, output) = run_in_tempdir(&[
@@ -658,6 +648,7 @@ async fn a_utility_dies_at_an_output_write_that_hits_a_dead_pipe() {
 /// an inherited one and skipped.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pipelines_debug_trap_runs_in_the_shell() {
+	a_trap_that_kills_the_shell_ends_it().await;
 	let (exit_code, output) = run_in_tempdir(&[
 		r#"made() { [ -e "$1" ] && echo yes || echo no; }"#,
 		r#"( fill; trap 'echo dead >&3' DEBUG; touch m1 | cat ) 3> >(true); echo "first=$? $(made m1)""#,
@@ -790,6 +781,8 @@ async fn an_ignored_sigpipe_turns_a_broken_pipe_into_a_write_error() {
 /// action and dies. Regression: the caught signal killed the shell.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_caught_sigpipe_runs_its_handler_and_a_subshell_resets_it() {
+	the_main_shell_ends_the_run_at_its_broken_pipe().await;
+	the_next_command_runs_after_the_main_shell_broken_pipe().await;
 	let (exit_code, output) = run_in_tempdir(&[
 		r#"( trap 'echo caught' PIPE; fill"#,
 		r#"  echo bad >&3; echo "after-echo=$?""#,
@@ -813,9 +806,7 @@ async fn a_caught_sigpipe_runs_its_handler_and_a_subshell_resets_it() {
 	);
 }
 
-/// A file a provider backs, here over a real file: a builtin that sees one
-/// runs on a blocking worker against a lease of the shell (the same process,
-/// not a subshell).
+/// A provider-backed file that deliberately hides its native descriptor.
 #[derive(Debug)]
 struct ProviderFile(pi_vfs::File);
 
@@ -855,18 +846,20 @@ async fn a_builtin_on_a_provider_file_keeps_the_shells_caught_sigpipe() {
 	let provider = pi_vfs::Fs::native().open(&input).await.expect("open");
 	let filesystem = pi_vfs::Fs::native()
 		.mount_file("/provider-input", pi_vfs::File::from_handle(ProviderFile(provider)));
-	let (tx, rx) = flume::unbounded();
-	let result = execute_shell(
+	let (tx, rx) = flume::unbounded::<Bytes>();
+	let (err_tx, err_rx) = flume::unbounded::<Bytes>();
+	let result = execute_shell_streams(
 		ShellExecuteOptions {
 			command: format!("trap 'echo caught' PIPE; : < /provider-input; {{ {FILL_PIPE} >&3; echo bad >&3; echo AFTER; }} 3> >(true)"),
 			filesystem,
 			timeout_ms: Some(60_000),
 			..Default::default()
 		},
-		Some(tx),
+		StreamSinks { stdout: Some(tx), stderr: Some(err_tx) },
 		CancelToken::default(),
 	).await.expect("run");
-	assert_eq!((result.exit_code, rx.drain().collect::<String>().as_str()), (Some(0), "caught\nAFTER\n"));
+	let stdout = String::from_utf8(rx.drain().flat_map(|b| b.to_vec()).collect()).expect("stdout");
+	assert_eq!((result.exit_code, stdout.as_str(), !err_rx.is_empty()), (Some(0), "caught\nAFTER\n", true));
 }
 
 /// A provider-backed file over a pipe whose reader has gone.
@@ -956,7 +949,6 @@ async fn a_provider_file_operand_with_no_reader_raises_sigpipe_on_a_current_thre
 /// `find victim -exec true \; -delete` deletes `victim`. Regression: the
 /// command's launch flushed the provider synchronously, which panics on a
 /// current-thread runtime, and `find` failed with an internal error.
-#[tokio::test(flavor = "current_thread")]
 async fn an_async_utility_starts_a_command_with_a_provider_stdout_on_a_current_thread_runtime() {
 	let log = tempfile::NamedTempFile::new().expect("log");
 	let file = std::fs::OpenOptions::new()
@@ -1025,6 +1017,7 @@ async fn an_async_utility_dies_at_a_diagnostic_on_a_provider_pipe() {
 /// utility runs on. Regression: `find` deleted its next operand first.
 #[tokio::test(flavor = "current_thread")]
 async fn an_async_utility_dies_at_a_provider_diagnostic_on_a_current_thread_runtime() {
+	an_async_utility_starts_a_command_with_a_provider_stdout_on_a_current_thread_runtime().await;
 	assert_eq!(find_on_a_provider_pipe().await, (141, true));
 }
 
@@ -1357,7 +1350,9 @@ async fn a_utility_dies_where_its_output_buffer_is_written() {
 		r#": > v2; ( fill; find v2 -printf '%5000s' -delete >&3; echo "find-5000=$? $(made v2)" ) 3> >(true)"#,
 		r#": > v3; ( fill; find v3 -printf '%9000s' -delete >&3; echo "find-9000=$? $(made v3)" ) 3> >(true)"#,
 		r#": > v4; ( fill; find v4 -printf '%100s' -delete >&3; echo "find-100=$? $(made v4)" ) 3> >(true)"#,
-		r#"mkdir many; for i in $(seq 1 400); do : > "many/a-long-file-name-$i"; done"#,
+		// Equal-length paths make the stdio boundary independent of directory listing order:
+		// 157 complete 26-byte lines fit in 4096 bytes; line 158 flushes before -delete.
+		r#"mkdir many; for i in $(seq 1 400); do printf -v name 'many/a-long-file-name-%03d' "$i"; : > "$name"; done"#,
 		r#"( fill; find many -type f -print -delete >&3; echo "find-many=$? left=$(ls many | wc -l)" ) 3> >(true)"#,
 		r#"printf 'x\n' > g1; ( fill; grep --line-buffered x g1 >&3; echo "grep-lb=$?" ) 3> >(true)"#,
 	])
@@ -1370,7 +1365,7 @@ async fn a_utility_dies_where_its_output_buffer_is_written() {
 			"find-5000=141 yes\n",
 			"find-9000=141 yes\n",
 			"find-100=141 no\n",
-			"find-many=141 left=241\n",
+			"find-many=141 left=243\n",
 			"grep-lb=141\n",
 		)
 	);
@@ -1992,4 +1987,38 @@ async fn a_child_is_killed_when_its_provider_stderr_has_no_reader() {
 	let status = std::fs::read_to_string(dir.path().join("status")).expect("status");
 	assert_eq!(status, "141\n");
 	assert!(!dir.path().join("reads-all-survived").exists(), "the compressor went on");
+}
+
+/// Small unterminated writes still take the program's actual write boundary;
+/// an ignored PIPE reports each failed find segment, and sed never starts
+/// the next cycle after its unbuffered appended-file output kills it.
+#[tokio::test(flavor = "multi_thread")]
+async fn utility_stream_boundaries_stop_work_at_the_failed_write() {
+	let (code, output) = run_in_tempdir(&[
+		r#"printf x > small"#,
+		r#"for disp in default ignored; do"#,
+		r#"  ( [ "$disp" = ignored ] && trap '' PIPE; fill"#,
+		r#"    cat small missing >&3 2> errors; s=$?"#,
+		r#"    grep -q missing errors && missing=yes || missing=no"#,
+		r#"    [ -s errors ] && err=yes || err=no"#,
+		r#"    printf 'cat:%s:%s:%s:%s\n' "$disp" "$s" "$missing" "$err""#,
+		r#"  ) 3> >(true) 2>/dev/null"#,
+		r#"done"#,
+		r#"literal=$(printf '%4096s' '' | tr ' ' x)"#,
+		r#"for sink in stdout file; do"#,
+		r#"  : > victim"#,
+		r#"  ( trap '' PIPE; fill"#,
+		r#"    if [ "$sink" = stdout ]; then"#,
+		r#"      find victim -printf "$literal%p" -delete >&3 2>errors"#,
+		r#"    else"#,
+		r#"      find victim -fprintf /dev/fd/3 "$literal%p" -delete 2>errors"#,
+		r#"    fi"#,
+		r#"    s=$?; [ -e victim ] && kept=yes || kept=no"#,
+		r#"    printf 'find:%s:%s:%s:%s\n' "$sink" "$s" "$kept" "$(wc -l < errors)""#,
+		r#"  ) 3> >(true) 2>/dev/null"#,
+		r#"done"#,
+		r#"printf 'one\ntwo\n' > input; printf no-newline > append"#,
+		r#"( fill; sed -un -e 'r append' -e 'w survived' input >&3; s=$?; printf 'sed:%s:%s\n' "$s" "$(wc -l < survived)" ) 3> >(true) 2>/dev/null"#,
+	]).await;
+	assert_eq!((code, output.as_str()), (Some(0), "cat:default:141:no:no\ncat:ignored:1:no:yes\nfind:stdout:1:no:2\nfind:file:1:no:1\nsed:141:1\n"));
 }
