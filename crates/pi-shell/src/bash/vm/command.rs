@@ -1776,45 +1776,6 @@ fn assignment_trace(
 	body
 }
 
-/// Zsh's retained end-of-list trace: assignments, then command words.
-fn trace_zsh(
-	k: &mut Kernel,
-	vp: &mut Vproc,
-	cx: &mut Cx<'_>,
-	unit: &Unit,
-	assigns: &[ir::AssignOp],
-	line: u32,
-) {
-	let utf8 = xtrace::utf8(k, cx, vp);
-	let mut lines = Vec::new();
-	let s = st(vp);
-	// The prefix assignments, then the `set -k` words.
-	for (i, ((name, _), (index, value))) in s.assigns.iter().zip(&s.values).enumerate() {
-		// A skipped (readonly) prefix assignment.
-		if index.as_ref().is_some_and(|i| i.is_empty()) {
-			continue;
-		}
-		let append = assigns.get(i).is_some_and(|a| a.append);
-		lines.push(assignment_trace(
-			unit,
-			assigns.get(i),
-			name,
-			index.as_ref().map(|i| i.as_slice()),
-			append,
-			value,
-			utf8,
-		));
-	}
-	if !s.argv.is_empty() {
-		let mut body = Vec::new();
-		xtrace::push_words(&mut body, &s.argv, utf8);
-		lines.push(body);
-	}
-	for body in lines {
-		xtrace::emit(k, cx, vp, line, &body);
-	}
-}
-
 /// zsh's `set -x` of a simple command (`addvars`, then `execbuiltin`,
 /// `execshfunc` or `makecline`): `PS4`, the assignments as `name=value `
 /// (an array as `name=( a b ) `); then the words, after another `PS4` for
@@ -2326,7 +2287,6 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 						let msg = format!("-{}: invalid option", argv[0][1] as char).into();
 						let line = line_of(vp, op.node);
 						let bytes = k.render_diag(cx, vp, line, &Diag::Usage { msg }.by("builtin"));
-						k.path_buf = path;
 						let s = st(vp);
 						s.writes
 							.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
@@ -2347,7 +2307,6 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					let name = argv[0].clone();
 					let line = line_of(vp, op.node);
 					let bytes = k.render_diag(cx, vp, line, &Diag::NotABuiltin { name }.by("builtin"));
-					k.path_buf = path;
 					let s = st(vp);
 					s.writes
 						.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });

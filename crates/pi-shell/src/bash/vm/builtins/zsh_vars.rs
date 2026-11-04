@@ -765,7 +765,8 @@ fn read_zle(
 	if !reading_bytes(ctx.vp)
 		&& let Some(p) = prompt
 	{
-		ctx.vp.queue_output(PendingWrite { fd: 2, bytes: p.into(), off: 0 });
+		ctx.vp
+			.queue_output(PendingWrite { fd: 2, bytes: p.into(), off: 0 });
 	}
 	// zsh: the timeout in hundredths of a second, rounded up.
 	let timeout_cs = timeout_ns.map(|ns| {

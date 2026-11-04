@@ -402,8 +402,8 @@ fn a_deferred_redirect_keeps_the_lone_programs_signal_status() {
 		.with_child_opens();
 	let (out, status) = run(
 		host,
-		"unset x; /x/trap42 >\"${x:=/f}\" 2>&1 & pid=$!; echo \"x=${x-unset} pid=$pid\"; \
-		 kill \"$pid\"; wait \"$pid\"; echo \"wait=$?\"",
+		"unset x; /x/trap42 >\"${x:=/f}\" 2>&1 & pid=$!; echo \"x=${x-unset} pid=$pid\"; kill \
+		 \"$pid\"; wait \"$pid\"; echo \"wait=$?\"",
 	);
 	assert_eq!((out.as_str(), status), ("x=unset pid=5001\nwait=42\n", 0));
 	assert_eq!(world.got(FIRST), [Signal::Term]);

@@ -68,8 +68,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	bash::{
-		Budget, CallId, Cx, Engine, EngineConfig, EventMask, Fs, MemStore, PipeTap, RunId, Script,
-		Profile, Shell, ShellError, ShellInit, Signal, Step, ToolCall, VprocSel,
+		Budget, CallId, Cx, Engine, EngineConfig, EventMask, Fs, MemStore, PipeTap, Profile, RunId,
+		Script, Shell, ShellError, ShellInit, Signal, Step, ToolCall, VprocSel,
 		store::{Key, MiscKey, Record},
 	},
 	host::{PiHost, SpawnObserver, TERM_GRACE},
@@ -775,7 +775,7 @@ mod tests {
 		};
 		let (out, err) = (drain(out_r), drain(err_r));
 		let stdio = RunStdio {
-			stdin: Some(std::fs::File::open("/dev/null").unwrap()),
+			stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
 			stdout: Some(std::fs::File::from(std::os::fd::OwnedFd::from(out_w))),
 			stderr: Some(std::fs::File::from(std::os::fd::OwnedFd::from(err_w))),
 		};

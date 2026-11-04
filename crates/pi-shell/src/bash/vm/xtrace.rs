@@ -5,8 +5,9 @@
 use bstr::BString;
 
 use super::{
-	Cx, Kernel, TextKind, command,
+	Cx, Kernel, TextKind,
 	builtins::zsh_quote::{Charset, quotedzputs},
+	command,
 	exec::{self, Flow},
 	expand::{Expander, Stop},
 	locale,
@@ -30,10 +31,14 @@ pub fn level(vp: &Vproc) -> u32 {
 		.frames
 		.iter()
 		.filter(|f| {
-			matches!(f.kind, FrameKind::NoFork | FrameKind::Script {
-				what: ScriptKind::Eval | ScriptKind::Source | ScriptKind::Trap { .. },
-				..
-			})
+			matches!(
+				f.kind,
+				FrameKind::NoFork
+					| FrameKind::Script {
+						what: ScriptKind::Eval | ScriptKind::Source | ScriptKind::Trap { .. },
+						..
+					}
+			)
 		})
 		.count();
 	1u32

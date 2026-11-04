@@ -470,7 +470,9 @@ fn scratch_image(
 				SubImage::NoFork { value: *value, capture: fds.capture(capture) }
 			},
 			PendingSub::Here { status } => SubImage::Here { status: *status },
-			PendingSub::Math { status, slot } => SubImage::Math { status: *status, slot: *slot as u8 },
+			PendingSub::Math { status, slot } => {
+				SubImage::Math { status: *status, slot: *slot as u8 }
+			},
 		}),
 		exec,
 		redir_done: io.map_or(0, |io| io.redir.done),
@@ -648,7 +650,9 @@ impl Shell {
 								SubImage::NoFork { value: *value, capture: fds.capture(capture) }
 							},
 							PendingSub::Here { status } => SubImage::Here { status: *status },
-							PendingSub::Math { status, slot } => SubImage::Math { status: *status, slot: *slot as u8 },
+							PendingSub::Math { status, slot } => {
+								SubImage::Math { status: *status, slot: *slot as u8 }
+							},
 						}),
 						saved_xtrace: p.saved_xtrace,
 						restore_env:  p.restore_env,

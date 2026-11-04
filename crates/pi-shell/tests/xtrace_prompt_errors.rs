@@ -1,4 +1,6 @@
 //! A dynamic PS4 is expanded and written before evaluation reports an error.
+//! Expected trace prefixes and exit statuses were recorded with GNU Bash 5.3
+//! under `bash --noprofile --norc -c`, not a script file.
 
 #![cfg(unix)]
 
