@@ -2185,6 +2185,12 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 						ctx.diag(d);
 						return Ok(super::Outcome { status: 1, control: super::Control::DiscardAll });
 					},
+					Err(d @ (Diag::Arith { .. } | Diag::ReadonlySubscript { .. }))
+						if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash =>
+					{
+						ctx.assignment_error(d)?;
+						return done(1);
+					},
 					Err(d) => {
 						ctx.err(d);
 						status = 1;
@@ -3136,7 +3142,7 @@ pub fn let_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				return Ok(super::Outcome { status: 1, control: super::Control::DiscardAll });
 			},
 			// bash prints a readonly assignment without the `let: ` prefix.
-			Err(d @ Diag::Readonly { .. }) => {
+			Err(d @ (Diag::Readonly { .. } | Diag::ReadonlySubscript { .. })) => {
 				ctx.report(d)?;
 				return done(1);
 			},

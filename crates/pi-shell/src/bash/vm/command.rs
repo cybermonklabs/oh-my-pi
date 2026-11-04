@@ -1293,12 +1293,13 @@ fn prefix_name(
 /// Bash `do_assignment_statements`: report first, then DISCARD or FORCE_EOF.
 fn assignment_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: Diag) -> Flow {
 	let subscript = matches!(d, Diag::ReadonlySubscript { .. });
+	let arithmetic = matches!(d, Diag::Arith { .. } | Diag::ArithSubscript { .. });
 	k.diag(cx, vp, line, d);
-	if let Some(status) = exec::reported_error_exit(k, cx, vp) {
+	if !arithmetic && let Some(status) = exec::reported_error_exit(k, cx, vp) {
 		return Flow::Exit(status);
 	}
-	if subscript {
-		return Flow::Exit(1);
+	if subscript || arithmetic {
+		return Flow::DiscardAll(1);
 	}
 	if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false)
 		&& !exec::executing_command_builtin(vp)
@@ -1408,6 +1409,8 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 			.unwrap_or(false);
 		let mut via = Via::Plain;
 		let mut builtin_wrapper = false;
+		let mut command_wrapper = false;
+		let mut wrapper_seen = false;
 		let target = loop {
 			// Borrowed (the resolution only reads `vp`): no copy of the
 			// name per command.
@@ -1474,6 +1477,8 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 					external_only = zsh
 						&& !state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Posixbuiltins)
 							.unwrap_or(false);
+					command_wrapper = true;
+					wrapper_seen = true;
 					via = if std_path {
 						Via::CommandP
 					} else {
@@ -1501,7 +1506,8 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 						s.stage = Stage::Finish;
 						return None;
 					}
-					builtin_wrapper |= !matches!(via, Via::Command | Via::CommandP);
+					builtin_wrapper |= !wrapper_seen;
+					wrapper_seen = true;
 					via = Via::Builtin;
 				},
 				_ if via == Via::Builtin && !matches!(resolved, Resolved::Intrinsic(_)) => {
@@ -1527,8 +1533,14 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 		k.path_buf = path;
 		let s = st(vp);
 		s.target = Some(target);
-		s.via_command = matches!(via, Via::Command | Via::CommandP);
-		s.via_builtin = builtin_wrapper;
+		// Bash `execute_simple_command` keeps a wrapper non-special;
+		// `builtin_builtin` calls its operand without replacing that context.
+		s.via_command = if zsh {
+			matches!(via, Via::Command | Via::CommandP)
+		} else {
+			command_wrapper
+		};
+		s.via_builtin = !zsh && builtin_wrapper;
 	}
 	if st(vp).target == Some(Target::Search) {
 		// File-system probes: `CmdExpanded` reads the clock after them.
@@ -2687,6 +2699,8 @@ fn run_builtin(
 				&& state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Posixbuiltins).unwrap_or(false)
 		} else {
 			is_special(id)
+				&& !st(vp).via_command
+				&& !st(vp).via_builtin
 				&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 					.unwrap_or(false)
 		} {
@@ -2736,13 +2750,16 @@ fn run_builtin(
 			let r = builtins::run(id, &mut ctx, &e.argv);
 			let r = match r {
 				Err(Need::Reported(status)) => Ok(builtins::Outcome { status, control: Control::Exit }),
+				Err(Need::DiscardAll(status)) => {
+					Ok(builtins::Outcome { status, control: Control::DiscardAll })
+				},
 				other => other,
 			};
 			// Not through `command`.
 			let fatal = !e.via_command
+				&& !e.via_builtin
 				&& (ctx.usage_error
 					|| (ctx.utility_error
-						&& !e.via_builtin
 						&& !ctx.vp.frames.last().is_some_and(|f| {
 							f.ignore_errexit
 								|| f
@@ -2845,7 +2862,9 @@ fn run_builtin(
 				vp.frames[at].scratch = Some(sc);
 				return flow;
 			},
-			Err(Need::Reported(_)) => unreachable!("converted to an exit outcome above"),
+			Err(Need::Reported(_) | Need::DiscardAll(_)) => {
+				unreachable!("converted to a control outcome above")
+			},
 			Err(Need::Probe(p)) => {
 				let r = probe::perform(k, cx, vp, &mut sc, &p);
 				vp.frames.last_mut().expect("frame").scratch = Some(sc);
@@ -3429,6 +3448,9 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		Some(Transfer::Return(n)) => Flow::Return(n),
 		Some(Transfer::Break { n, cont }) => Flow::Break { n, cont },
 		Some(Transfer::Exit(n)) => Flow::Exit(n),
+		Some(Transfer::DiscardAll(n)) if vp.mode.dialect() == crate::bash::ids::Dialect::Bash => {
+			Flow::DiscardAll(n)
+		},
 		Some(Transfer::DiscardAll(n)) => {
 			let command = matches!(
 				state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),

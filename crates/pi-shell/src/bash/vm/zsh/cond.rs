@@ -588,6 +588,10 @@ pub fn cond_test(
 				report(k, cx, vp, line, chunks);
 				return Flow::Exit(status);
 			},
+			Err(Need::DiscardAll(status)) => {
+				report(k, cx, vp, line, chunks);
+				return Flow::DiscardAll(status);
+			},
 			Err(Need::Probe(p)) => match probe::perform(k, cx, vp, &mut sc, &p) {
 				Ok(_) => park(vp, sc),
 				Err(key) => {

@@ -182,8 +182,12 @@ pub fn bind(ctx: &mut Ctx<'_, '_>, name: &[u8], value: AssignValue) -> Result<bo
 pub fn bind_lhs(ctx: &mut Ctx<'_, '_>, lhs: Lhs<'_>, value: AssignValue) -> Result<bool, Need> {
 	Ok(match set_value(ctx.k, ctx.cx, ctx.vp, lhs, value, Level::Dynamic) {
 		Ok(()) => true,
-		Err(d @ Diag::Readonly { .. }) => {
+		Err(d @ (Diag::Readonly { .. } | Diag::ReadonlySubscript { .. })) => {
 			ctx.report(d)?;
+			false
+		},
+		Err(d @ (Diag::Arith { .. } | Diag::ArithSubscript { .. })) => {
+			ctx.assignment_error(d)?;
 			false
 		},
 		Err(d) => {

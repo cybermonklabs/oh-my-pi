@@ -82,6 +82,8 @@ pub enum Need {
 	Sub(super::expand::Stop),
 	/// Bash `report_error` exited before the builtin could complete.
 	Reported(i32),
+	/// An assignment's arithmetic evaluator cleared every reader.
+	DiscardAll(i32),
 }
 
 impl From<StoreError> for Need {
@@ -325,13 +327,31 @@ impl<'a, 'c> Ctx<'a, 'c> {
 	/// Bash `report_error`, unlike `builtin_error`, exits immediately under
 	/// `set -e`, including in a tested function, before any later binding.
 	pub fn report(&mut self, d: Diag) -> Result<(), Need> {
+		let subscript = matches!(d, Diag::ReadonlySubscript { .. });
 		self.diag(d);
 		if !self.ignore_report_error
 			&& let Some(status) = super::exec::reported_error_exit(self.k, self.cx, self.vp)
 		{
 			return Err(Need::Reported(status));
 		}
+		if subscript && self.vp.mode.dialect() == crate::bash::ids::Dialect::Bash {
+			return Err(Need::DiscardAll(1));
+		}
 		Ok(())
+	}
+
+	/// Ordinary binding calls `make_variable_value`/`array_expand_index`:
+	/// arithmetic failures clear readers, unlike a builtin arithmetic test.
+	pub fn assignment_error(&mut self, d: Diag) -> Result<(), Need> {
+		if matches!(d, Diag::Arith { .. } | Diag::ArithSubscript { .. }) {
+			self.err(d);
+			if self.vp.mode.dialect() == crate::bash::ids::Dialect::Bash {
+				return Err(Need::DiscardAll(1));
+			}
+			Ok(())
+		} else {
+			self.report(d)
+		}
 	}
 
 	/// A variable as this vproc sees it.

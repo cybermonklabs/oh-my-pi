@@ -60,6 +60,8 @@ pub enum Flow {
 	Exit(i32),
 	/// An expansion or arithmetic error: abandon the current top-level command.
 	Discard(i32),
+	/// Bash `top_level_cleanup` followed by DISCARD: unwind every reader.
+	DiscardAll(i32),
 }
 
 /// Run vproc `vp` for up to `slice` ops; stops early when it parks, a
@@ -211,6 +213,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				flow,
 				Flow::Exit(_)
 					| Flow::Discard(_)
+					| Flow::DiscardAll(_)
 					| Flow::Abort(_)
 					| Flow::Return(_)
 					| Flow::Break { .. }
@@ -240,7 +243,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		// An `exit N` in the cancel trap is `exit_shell`'s (the EXIT trap, then
 		// status N, as bash).
 		let cancel_transfer = cancellation.is_some()
-			&& matches!(flow, Flow::Return(_) | Flow::Abort(_) | Flow::Discard(_));
+			&& matches!(
+				flow,
+				Flow::Return(_) | Flow::Abort(_) | Flow::Discard(_) | Flow::DiscardAll(_)
+			);
 		let failing = !ignore_errexit && vp.status != 0 && matches!(flow, Flow::Next | Flow::Jump(_));
 		let failed_command = failing
 			&& match op.code {
@@ -360,6 +366,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			Flow::Break { n, cont } => break_loops(k, vp, cx, n, cont, op),
 			Flow::Exit(status) if unit.mode.dialect() == Dialect::Zsh => zsh_exit(k, vp, cx, status),
 			Flow::Exit(status) => exit_shell(k, vp, cx, status),
+			Flow::DiscardAll(status) => discard_all(k, vp, cx, status),
 			Flow::Discard(status) if unit.mode.dialect() == Dialect::Zsh => {
 				zsh_discard(k, vp, cx, status);
 			},
@@ -564,12 +571,7 @@ pub fn reported_error_exit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Optio
 /// Bash `run_one_command` maps FORCE_EOF to 127. Subshells retain 1
 /// (`execute_in_subshell`); an ordinary exit/report_error does not map it.
 pub fn force_eof(vp: &Vproc, store: &mut dyn StateStore) -> Flow {
-	if let Some(status) = vp.frames.iter().rev().find_map(|f| match f.kind {
-		FrameKind::Script { what: ScriptKind::Trap { key: TrapKey::Exit, status, .. }, .. } => {
-			Some(status)
-		},
-		_ => None,
-	}) {
+	if let Some(status) = exit_trap_status(vp) {
 		return Flow::Exit(status);
 	}
 	let signal_trap = vp.frames.iter().any(|f| {
@@ -594,6 +596,53 @@ pub fn executing_command_builtin(vp: &Vproc) -> bool {
 			.and_then(|s| s.exec.as_ref())
 			.is_some_and(|e| e.via_command)
 	})
+}
+
+fn exit_trap_status(vp: &Vproc) -> Option<i32> {
+	vp.frames.iter().rev().find_map(|f| match f.kind {
+		FrameKind::Script { what: ScriptKind::Trap { key: TrapKey::Exit, status, .. }, .. } => {
+			Some(status)
+		},
+		_ => None,
+	})
+}
+
+/// `make_variable_value` and `array_expand_index` call top_level_cleanup
+/// before DISCARD. Eval/source/trap readers cannot catch that jump. The
+/// outer reader continues only for stdin/files, not a `-c` string.
+fn discard_all(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
+	let saved_exit = exit_trap_status(vp);
+	let status = saved_exit.unwrap_or(status);
+	if saved_exit.is_none()
+		&& let Some(i) = vp
+			.frames
+			.iter()
+			.position(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Run, .. }))
+	{
+		let command = match state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)) {
+			Ok(Some(Record::Misc(origin))) => origin.as_slice() == b"c",
+			Ok(_) => false,
+			Err(err) => {
+				k.fail(err);
+				return;
+			},
+		};
+		if !command {
+			unwind(&mut k.root, cx.store, vp, i + 1);
+			clear_scratch(&mut k.root, cx.store, vp);
+			truncate(vp, Depths::default());
+			let f = top_frame(vp);
+			f.unit = None;
+			f.loops.clear();
+			vp.status = status;
+			return;
+		}
+	}
+	unwind(&mut k.root, cx.store, vp, 0);
+	vp.status = status;
+	if saved_exit.is_none() && vp.transient && vp.runs.is_empty() {
+		start_trap(k, vp, cx, TrapKey::Exit);
+	}
 }
 
 /// Bash `_evalfile` restores its return catcher before run_return_trap.
@@ -1629,7 +1678,7 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 				return Flow::Exit(status);
 			}
 			if subscript {
-				return Flow::Exit(1);
+				return Flow::DiscardAll(1);
 			}
 			if fatal || posix_exits(k, cx, vp) {
 				force_eof(vp, cx.store)
@@ -2917,13 +2966,24 @@ fn for_next(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		builtins::assign_loop_var(k, vp, cx, &var, value.clone())
 	};
 	if let Err(d) = assigned {
+		let bash = vp.mode.dialect() == Dialect::Bash;
+		let readonly = matches!(d, Diag::Readonly { .. } | Diag::ReadonlySubscript { .. });
+		let subscript = matches!(d, Diag::ReadonlySubscript { .. });
 		k.diag(cx, vp, line, d);
-		if let Some(status) = reported_error_exit(k, cx, vp) {
+		if readonly && let Some(status) = reported_error_exit(k, cx, vp) {
 			return Flow::Exit(status);
 		}
-		// An assignment error ends a posix shell.
+		if bash && subscript {
+			return Flow::DiscardAll(1);
+		}
+		// `execute_for_command` forces EOF only for a readonly binding.
 		if state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
-			return force_eof(vp, cx.store);
+			if !bash {
+				return Flow::Exit(1);
+			}
+			if readonly {
+				return force_eof(vp, cx.store);
+			}
 		}
 		if let Some(rec) = top_frame(vp).loops.last_mut() {
 			rec.status = 1;
@@ -4433,7 +4493,14 @@ fn run_func_trap(
 #[cfg(test)]
 mod tests {
 	use super::{BASH_TIMEFORMAT, POSIX_TIMEFORMAT, time_report};
-	use crate::testkit::{FakeHost, Fault, run_script};
+	use crate::{
+		bash::{Origin, Script},
+		testkit::{
+			FakeHost, Fault,
+			fault::{Rig, skeleton_init},
+			run_script,
+		},
+	};
 
 	#[test]
 	fn assignment_diagnostic_keeps_redirection_across_blocked_writes_and_snapshots() {
@@ -4446,6 +4513,25 @@ mod tests {
 		assert_eq!(result.stdout, b"bash: line 1: x: readonly variable\nnext:1\n");
 		assert_eq!(result.stderr, b"");
 		assert_eq!(result.status, 0);
+	}
+
+	#[test]
+	fn arithmetic_cleanup_unwinds_eval_and_resumes_only_outer_stdin_reader() {
+		const SCRIPT: &[u8] = b"{ eval 'a[1/0]=7; echo eval-inner\necho eval-next'; echo same; } 2>/dev/null\necho next:$?\n";
+		let command = run_script(FakeHost::new(), SCRIPT, &[], Fault::Snapshot { every: 1 });
+		assert_eq!(command.stdout, b"");
+		assert_eq!(command.stderr, b"");
+		assert_eq!(command.status, 1);
+
+		let mut stdin =
+			Rig::new(FakeHost::new().with_stdin(SCRIPT).with_write_storm(9, 0.5), skeleton_init(&[]));
+		let status = stdin
+			.run(Script { origin: Origin::Stdin, ..Script::command(Vec::new()) }, Fault::Snapshot {
+				every: 1,
+			});
+		assert_eq!(stdin.host.stdout.bytes(), b"next:1\n");
+		assert_eq!(stdin.host.stderr.bytes(), b"");
+		assert_eq!(status, 0);
 	}
 
 	// Golden: bash 5.3.20 `time -p` and the default format.

@@ -727,6 +727,10 @@ pub fn cond_test(
 				report(k, cx, vp, line, chunks);
 				return Flow::Exit(status);
 			},
+			Err(Fail::Need(Need::DiscardAll(status))) => {
+				report(k, cx, vp, line, chunks);
+				return Flow::DiscardAll(status);
+			},
 			Err(Fail::Need(Need::Probe(p))) => match probe::perform(k, cx, vp, &mut sc, &p) {
 				Ok(_) => {
 					if let Some(f) = vp.frames.last_mut() {

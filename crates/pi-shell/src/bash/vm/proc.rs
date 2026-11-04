@@ -1297,7 +1297,8 @@ pub struct ExecState {
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
 	pub via_command: bool,
-	/// `builtin name` does not pass CMD_IGNORE_RETURN to eval/source.
+	/// Outermost Bash wrapper is `builtin`: eval/source called by it do
+	/// not inherit CMD_IGNORE_RETURN.
 	pub via_builtin: bool,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).

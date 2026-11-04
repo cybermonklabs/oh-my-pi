@@ -8,7 +8,8 @@
 
 ### Fixed
 
-- Fixed readonly assignment errors ignoring redirections, continuing past Bash's command-discard boundary, or failing to exit with the correct status under `set -e` and POSIX mode ([#17712](https://github.com/can1357/oh-my-pi/pull/17712) by [@sjawhar](https://github.com/sjawhar))
+- Fixed assignment errors escaping enclosing redirections, returning incorrect `set -e` or POSIX statuses, and discarding too much or too little input inside functions, `eval`, sourced files and traps ([#17712](https://github.com/can1357/oh-my-pi/pull/17712) by [@sjawhar](https://github.com/sjawhar))
+- Fixed `x=one command :` and `x=one builtin :` leaving `x` set after the command completes ([#17712](https://github.com/can1357/oh-my-pi/pull/17712) by [@sjawhar](https://github.com/sjawhar))
 - Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
 ### Fixed
 
