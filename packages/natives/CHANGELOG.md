@@ -19,6 +19,7 @@
 
 - Fixed recursive `eval`, `source` and command substitutions exhausting memory: nesting bounds now cover inherited depth, utility callbacks and nested shells, including recursion reached through aliases ([#17646](https://github.com/can1357/oh-my-pi/pull/17646) by [@sjawhar](https://github.com/sjawhar))
 - Fixed `FUNCNEST` values that overflow a signed 64-bit decimal or are arrays incorrectly enabling a limit, wrapped limits and inherited function depth in subshells; refusals stop the affected shell as in Bash 5.3, and under an `EXIT` trap exit with the status the latest trap saved ([#17646](https://github.com/can1357/oh-my-pi/pull/17646) by [@sjawhar](https://github.com/sjawhar))
+- Fixed `exit` and `return` without an argument inside a trap action using `$?` instead of the status the latest trap saved, as Bash 5.3 does ([#17646](https://github.com/can1357/oh-my-pi/pull/17646) by [@sjawhar](https://github.com/sjawhar))
 - Fixed shell API run timeouts being ignored unless repeated in the cancellation token, and cancelling nested functions discarding the session's global state instead of just unwinding their temporary scopes ([#17646](https://github.com/can1357/oh-my-pi/pull/17646) by [@sjawhar](https://github.com/sjawhar))
 - Removed embedded-shell compiler warnings and fixed history saves hanging when a stale lock cannot be removed
 - Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
