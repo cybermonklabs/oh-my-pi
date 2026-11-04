@@ -1247,35 +1247,41 @@ fn zsh_pop(
 	}
 }
 
-/// A `${| …; }` ends: hand the value of its local `REPLY` to the capture
-/// of the op waiting for it (the scope is popped next).
+/// A `${| …; }` ends: hand its local `REPLY` to the waiting operation or
+/// prompt continuation before the no-fork scope is popped.
 fn pass_reply(root: &mut Root, store: &mut dyn StateStore, vp: &Vproc) {
+	// A prompt owns its replay state outside the caller's scratch. Its
+	// active substitution has the current parent depth and takes priority
+	// over an ordinary operation's pending substitution at that frame.
+	let capture = vp.traces.iter().filter(|p| p.depth == vp.frames.len()).find_map(|p| {
+		match p.sub.as_ref() {
+			Some(PendingSub::NoFork { capture, value: true }) => Some(capture),
+			_ => None,
+		}
+	}).or_else(|| {
+		match vp.frames.last().and_then(|f| f.scratch.as_ref()).and_then(|s| s.sub.as_ref()) {
+			Some(PendingSub::NoFork { capture, value: true }) => Some(capture),
+			_ => None,
+		}
+	});
+	let Some(capture) = capture else { return; };
 	let reply = match state::scope_count(root, vp).checked_sub(1) {
 		Some(top) => match state::scope_var(store, vp, top, b"REPLY") {
-			Ok(var) => var
-				.flatten()
-				.and_then(|v| v.as_scalar().map(<[u8]>::to_vec))
-				.unwrap_or_default(),
+			Ok(var) => var.flatten(),
 			Err(err) => {
 				root.fail(err);
-				Vec::new()
+				None
 			},
 		},
-		None => Vec::new(),
+		None => None,
 	};
-	if let Some(PendingSub::NoFork { capture, value: true }) = vp
-		.frames
-		.last()
-		.and_then(|f| f.scratch.as_ref())
-		.and_then(|s| s.sub.as_ref())
-	{
-		let mut capture = capture.clone();
-		let _ = crate::bash::fs::File::poll_write(
-			&mut capture,
-			&mut Context::from_waker(std::task::Waker::noop()),
-			&reply,
-		);
-	}
+	let reply = reply.as_ref().and_then(|v| v.as_scalar()).unwrap_or_default();
+	let mut capture = capture.clone();
+	let _ = crate::bash::fs::File::poll_write(
+		&mut capture,
+		&mut Context::from_waker(std::task::Waker::noop()),
+		reply,
+	);
 }
 
 /// Abandon an op's scratch: pop the temporary scope of a builtin and

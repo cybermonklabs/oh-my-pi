@@ -2697,34 +2697,6 @@ fn read_scope(store: &mut dyn StateStore, vp: &Vproc, i: usize) -> Result<Scope,
 	})
 }
 
-/// Insert `scope` at index `at` (at most the scope count) of `vp`'s
-/// scopes: the temporary environment a redirection list hid comes back
-/// under the scopes pushed meanwhile.
-pub fn insert_scope(
-	root: &mut Root,
-	store: &mut dyn StateStore,
-	vp: &mut Vproc,
-	at: usize,
-	scope: Scope,
-) {
-	if vp.overlay.is_some() {
-		let at = at.min(vp.scopes.len());
-		vp.scopes.insert(at, scope);
-		return;
-	}
-	let mut above = Vec::new();
-	while (root.depth + root.lazy) as usize > at {
-		match pop_scope(root, store, vp) {
-			Some(s) => above.push(s),
-			None => break,
-		}
-	}
-	push_scope(root, store, vp, scope);
-	for s in above.into_iter().rev() {
-		push_scope(root, store, vp, s);
-	}
-}
-
 /// Every scope of `vp`, copied (a subshell forked from it starts with
 /// them).
 ///
@@ -3640,11 +3612,13 @@ mod tests {
 			copy_scopes(&root, &mut store, &vp).unwrap(),
 			copy_scopes(&root, &mut store, &sub).unwrap()
 		);
-		// The hidden temporary scope comes back under one pushed meanwhile.
+		// A no-fork scope ends before the hidden temporary scope returns.
 		both(&mut root, &mut store, &mut vp, &mut sub, &|r, s, v| {
 			let hidden = pop_scope(r, s, v).unwrap();
 			push_scope(r, s, v, Scope { func: Some(BString::default()), ..Scope::default() });
-			insert_scope(r, s, v, 1, hidden);
+			assert!(drop_scope(r, s, v));
+			push_scope(r, s, v, hidden);
+			push_scope(r, s, v, Scope { func: Some(BString::default()), ..Scope::default() });
 			set_positional(r, s, v, vec!["b".into(), "c".into()]);
 			scope_clear(r, s, v, 1);
 		});

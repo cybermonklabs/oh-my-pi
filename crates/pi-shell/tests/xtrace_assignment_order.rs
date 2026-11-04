@@ -26,7 +26,8 @@ async fn assert_trace(script: &str, stdout: &str, stderr: &str) {
 	.await
 	.expect("shell execution");
 	let collect = |rx: flume::Receiver<Bytes>| {
-		String::from_utf8(rx.drain().flat_map(|chunk| chunk.to_vec()).collect()).expect("UTF-8 output")
+		String::from_utf8(rx.drain().flat_map(|chunk| chunk.to_vec()).collect())
+			.expect("UTF-8 output")
 	};
 	assert_eq!(
 		(collect(out_rx), collect(err_rx), result.exit_code, result.timed_out),
@@ -124,7 +125,8 @@ async fn prefix_assignments_trace_the_bound_environment_but_command_trace_does_n
 		(
 			r#"unset a b; PS4='+${a-unset}:${b-unset} '; set -x; a=one b=$a printf 'ARGS=%s:%s\n' "$a" "$b"; set +x; printf 'AFTER=%s:%s\n' "${a-unset}" "${b-unset}""#,
 			"ARGS=:\nAFTER=unset:unset\n",
-			"+one:unset a=one\n+one:one b=one\n+unset:unset printf 'ARGS=%s:%s\\n' '' ''\n+unset:unset set +x\n",
+			"+one:unset a=one\n+one:one b=one\n+unset:unset printf 'ARGS=%s:%s\\n' '' \
+			 ''\n+unset:unset set +x\n",
 		),
 		(
 			r#"declare -i n=5; PS4='+${n} '; set -x; n+=1+2 :; set +x; printf '%s\n' "$n""#,
@@ -169,7 +171,8 @@ async fn prefix_assignments_trace_the_bound_environment_but_command_trace_does_n
 		(
 			r#"a=old; n=0; PS4='${ n=$((n+1)); a=ps4; printf P; } '; set -x; a=prefix b=$a /bin/sh -c 'printf "child=%s:%s\n" "$a" "$b"'; set +x; printf 'root=%s n=%s\n' "$a" "$n""#,
 			"child=prefix:prefix\nroot=ps4 n=4\n",
-			"P a=prefix\nP b=prefix\nP /bin/sh -c 'printf \"child=%s:%s\\n\" \"$a\" \"$b\"'\nP set +x\n",
+			"P a=prefix\nP b=prefix\nP /bin/sh -c 'printf \"child=%s:%s\\n\" \"$a\" \"$b\"'\nP set \
+			 +x\n",
 		),
 	] {
 		assert_trace(script, stdout, stderr).await;
@@ -273,12 +276,39 @@ async fn prompt_temporary_environment_visibility_uses_execution_context() {
 		(
 			r#"a=old; PS4='${ a=ps4; printf "<%s>" "$a"; }${a} '; set -x; eval 'a=prefix b=$a :'; set +x; printf '%s\n' "$a""#,
 			"ps4\n",
-			"<ps4>ps4 eval 'a=prefix b=$a :'\n<<ps4>prefix a=prefix\n<<ps4>prefix b=prefix\n<<ps4>prefix :\n<ps4>ps4 set +x\n",
+			"<ps4>ps4 eval 'a=prefix b=$a :'\n<<ps4>prefix a=prefix\n<<ps4>prefix \
+			 b=prefix\n<<ps4>prefix :\n<ps4>ps4 set +x\n",
 		),
 		(
 			r#"bash --noprofile --norc -c 'unset a; PS4="+\${a-unset} "; set -x; a=one :; set +x'"#,
 			"",
 			"+one a=one\n+unset :\n+unset set +x\n",
+		),
+	] {
+		assert_trace(script, stdout, stderr).await;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_substitution_replies_reach_their_waiting_prompt() {
+	for (script, stdout, stderr) in [
+		(
+			r#"REPLY=outer; PS4='${| REPLY=P; } '; set -x; :; set +x; printf 'reply=[%s]\n' "$REPLY""#,
+			"reply=[outer]\n",
+			"P :\nP set +x\n",
+		),
+		// An operation and a prompt can both own a pending no-fork value.
+		// Completing the prompt must not fill the operation's capture.
+		(
+			r#"REPLY=outer; PS4='${| REPLY=P; } '; set -x; x=${| REPLY=X; }; set +x; printf 'x=[%s] reply=[%s]\n' "$x" "$REPLY""#,
+			"x=[X] reply=[outer]\n",
+			"PP REPLY=X\nP x=X\nP set +x\n",
+		),
+		// Conversely, a prompt body can contain an ordinary value expansion.
+		(
+			r#"REPLY=outer; PS4='${| REPLY=${| REPLY=P; }; } '; set -x; :; set +x; printf 'reply=[%s]\n' "$REPLY""#,
+			"reply=[outer]\n",
+			"P :\nP set +x\n",
 		),
 	] {
 		assert_trace(script, stdout, stderr).await;
