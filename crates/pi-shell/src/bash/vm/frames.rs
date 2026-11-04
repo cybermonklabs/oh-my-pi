@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 31;
+pub const FRAMES_VERSION: u32 = 34;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -71,29 +71,31 @@ struct Header {
 
 #[derive(Serialize, Deserialize)]
 struct Image {
-	seq:       u64,
-	next_run:  u64,
-	next_call: u64,
-	next_cmd:  u64,
-	paused:    bool,
-	mask:      u64,
-	rr:        u32,
+	seq:         u64,
+	next_run:    u64,
+	next_call:   u64,
+	next_cmd:    u64,
+	paused:      bool,
+	mask:        u64,
+	rr:          u32,
 	/// The scheduler's unfinished slice (vproc, ops left).
-	slice:     Option<(Vpid, u32)>,
+	slice:       Option<(Vpid, u32)>,
 	/// The control's wake count (the `at` marks of blocked vprocs refer
 	/// to it).
-	wakes:     u64,
-	done:      Vec<(RunId, i32)>,
-	results:   Vec<(CallId, CallOutcome)>,
-	procs:     Vec<ProcImage>,
+	wakes:       u64,
+	done:        Vec<(RunId, i32)>,
+	results:     Vec<(CallId, CallOutcome)>,
+	/// Known exec refusals whose resumable runs have not finished yet.
+	exec_errors: Vec<(RunId, i32)>,
+	procs:       Vec<ProcImage>,
 	/// Fd objects, referred to by index.
-	fd_objs:   Vec<FdObjImage>,
+	fd_objs:     Vec<FdObjImage>,
 	/// Engine memory objects, referred to by index.
-	mems:      Vec<MemImage>,
+	mems:        Vec<MemImage>,
 	/// Background jobs still deciding on their pid ([`Kernel::bangs`]).
-	bangs:     Vec<super::proc::Bang>,
+	bangs:       Vec<super::proc::Bang>,
 	/// Their commands' redirections still deciding ([`Kernel::deferrals`]).
-	deferrals: Vec<super::proc::Deferral>,
+	deferrals:   Vec<super::proc::Deferral>,
 }
 
 /// One fd object.
@@ -303,6 +305,8 @@ struct RunImage {
 	env:               Vec<(BString, BString)>,
 	started:           bool,
 	exit_trap_started: bool,
+	report_exec_error: bool,
+	control_source:    bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -321,10 +325,13 @@ struct FrameImage {
 	debug_trap_local:  bool,
 	err_trap_local:    bool,
 	return_trap_local: bool,
+	trace_local:       bool,
+	debug_errexit:     bool,
 	err_reported:      bool,
 	ignore_errexit:    bool,
 	subshell_line:     Option<u32>,
 	getopts:           super::proc::GetoptsState,
+	control_source:    bool,
 }
 
 /// A saved fd: the fd object it held.
@@ -339,6 +346,8 @@ struct SavedImage {
 enum SubImage {
 	Fork { vpid: Vpid, capture: u32 },
 	NoFork { value: bool, capture: u32 },
+	Here { status: i32 },
+	Math { status: i32, slot: u8 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -399,6 +408,9 @@ fn scratch_image(
 			| Live::Dir(_)
 			| Live::Spawn(_)
 			| Live::Timer(_)
+			| Live::Fd(_)
+			| Live::Fs(_)
+			| Live::Zftp(_)
 			| Live::None => {},
 		}
 		state
@@ -413,6 +425,18 @@ fn scratch_image(
 		Live::Open(_) => report
 			.lost
 			.push(Lost::Pending { vpid, kind: FileKind::Pipe }),
+		// An accept or a lock wait holds a socket or file of its own.
+		Live::Fd(_) => report
+			.lost
+			.push(Lost::Pending { vpid, kind: FileKind::Socket }),
+		// A mutation (`mkdir`, a mapfile write) is not asked twice.
+		Live::Fs(_) => report
+			.lost
+			.push(Lost::Pending { vpid, kind: FileKind::Regular }),
+		// zftp's traffic on its sockets.
+		Live::Zftp(_) => report
+			.lost
+			.push(Lost::Pending { vpid, kind: FileKind::Socket }),
 		_ => {},
 	}
 	let io = sc.io.as_deref();
@@ -425,6 +449,10 @@ fn scratch_image(
 			},
 			PendingSub::NoFork { value, capture } => {
 				SubImage::NoFork { value: *value, capture: fds.capture(capture) }
+			},
+			PendingSub::Here { status } => SubImage::Here { status: *status },
+			PendingSub::Math { status, slot } => {
+				SubImage::Math { status: *status, slot: *slot as u8 }
 			},
 		}),
 		exec,
@@ -527,10 +555,13 @@ impl Shell {
 					debug_trap_local: f.debug_trap_local,
 					err_trap_local: f.err_trap_local,
 					return_trap_local: f.return_trap_local,
+					trace_local: f.trace_local,
+					debug_errexit: f.debug_errexit,
 					err_reported: f.err_reported,
 					ignore_errexit: f.ignore_errexit,
 					subshell_line: f.subshell_line,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
+					control_source: f.control_source,
 				});
 			}
 			for (fd, h) in p.fds.iter() {
@@ -614,6 +645,11 @@ impl Shell {
 			wakes: k.ctl.wakes(),
 			done: k.done.iter().copied().collect(),
 			results: k.results.iter().map(|(id, o)| (*id, o.clone())).collect(),
+			exec_errors: k
+				.exec_errors
+				.iter()
+				.map(|(run, code)| (*run, *code))
+				.collect(),
 			procs,
 			fd_objs: fds.objs,
 			mems: fds.mems,
@@ -747,6 +783,7 @@ impl Shell {
 		k.ctl.restore_wakes(img.wakes);
 		k.done = img.done.into();
 		k.results = img.results.into_iter().collect();
+		k.exec_errors = img.exec_errors.into_iter().collect();
 		// Only a restored vproc still decides (a job that never settles
 		// would hold its `$!` readers forever).
 		k.bangs = img
@@ -852,6 +889,8 @@ impl Shell {
 					env:               r.env,
 					started:           r.started,
 					exit_trap_started: r.exit_trap_started,
+					report_exec_error: r.report_exec_error,
+					control_source:    r.control_source,
 				});
 			}
 			report.runs += vp.runs.len() as u32;
@@ -943,6 +982,16 @@ impl Shell {
 								SubImage::NoFork { value, capture } => {
 									PendingSub::NoFork { capture: objs.capture(capture), value }
 								},
+								SubImage::Here { status } => PendingSub::Here { status },
+								SubImage::Math { status, slot } => PendingSub::Math {
+									status,
+									slot: match slot {
+										1 => super::proc::Slot::Redirs,
+										2 => super::proc::Slot::Assigns,
+										3 => super::proc::Slot::Builtin,
+										_ => super::proc::Slot::Words,
+									},
+								},
 							}),
 							exec: exec.map(Box::new),
 							io,
@@ -960,6 +1009,7 @@ impl Shell {
 					.map(|r| objs.saved(cx.host, r))
 					.collect();
 				let mut frame = Frame::new(unit, f.pc, f.kind);
+				frame.control_source = f.control_source;
 				frame.loops = f.loops;
 				frame.enters = f.enters;
 				frame.cases = f.cases;
@@ -971,6 +1021,8 @@ impl Shell {
 				frame.debug_trap_local = f.debug_trap_local;
 				frame.err_trap_local = f.err_trap_local;
 				frame.return_trap_local = f.return_trap_local;
+				frame.trace_local = f.trace_local;
+				frame.debug_errexit = f.debug_errexit;
 				frame.err_reported = f.err_reported;
 				frame.ignore_errexit = f.ignore_errexit;
 				frame.subshell_line = f.subshell_line;
@@ -1073,6 +1125,8 @@ fn run_image(r: &Run) -> RunImage {
 		env:               r.env.clone(),
 		started:           r.started,
 		exit_trap_started: r.exit_trap_started,
+		report_exec_error: r.report_exec_error,
+		control_source:    r.control_source,
 	}
 }
 
@@ -1246,7 +1300,7 @@ fn valid(u: &Unit) -> bool {
 				Opcode::CaseArm => idx(u.pats.len()) && op.b < n,
 				Opcode::Arith => idx(u.ariths.len()),
 				Opcode::CondTest => idx(u.conds.len()),
-				Opcode::FuncDef => idx(u.funcs.len()),
+				Opcode::FuncDef => idx(u.funcs.len()) && (op.b as usize) <= u.lists.len(),
 				Opcode::Warn => idx(u.strs.len()),
 				Opcode::Abort => {
 					idx(u.strs.len())
@@ -1324,5 +1378,44 @@ mod tests {
 		assert!(r.poll_read(&mut cx, &mut buf).is_pending(), "the duplicate writer keeps it open");
 		drop(w2);
 		assert!(matches!(r.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))), "then EOF");
+	}
+
+	/// Version 29 predates the exec-error fields in the positional image.
+	/// It must be rejected before attempting to decode that image.
+	#[test]
+	fn a_pre_exec_error_image_is_incompatible_not_corrupt() {
+		use crate::{
+			bash::{Cx, Engine, EngineConfig, MemStore, RestoreOpts, Shell, ShellInit, StateStore},
+			testkit::FakeHost,
+		};
+		let engine = Engine::new(EngineConfig::default());
+		let mut host = FakeHost::new();
+		let mut store = MemStore::new();
+		let shell = Shell::create(
+			&engine,
+			&mut Cx { host: &mut host, store: &mut store },
+			ShellInit::default(),
+		)
+		.unwrap();
+		drop(shell);
+		let old = super::Header {
+			magic:  super::MAGIC,
+			ir:     super::IR_VERSION,
+			frames: 29,
+			build:  Engine::build_id(),
+			runs:   Vec::new(),
+		};
+		store
+			.put_blob(super::BlobSlot::Frames, &postcard::to_stdvec(&old).unwrap())
+			.unwrap();
+		let restored = Shell::restore(
+			&engine,
+			&mut Cx { host: &mut host, store: &mut store },
+			RestoreOpts::default(),
+		);
+		assert!(matches!(
+			restored,
+			Err(super::RestoreError::Incompatible { why: super::Incompatibility::Build })
+		));
 	}
 }
