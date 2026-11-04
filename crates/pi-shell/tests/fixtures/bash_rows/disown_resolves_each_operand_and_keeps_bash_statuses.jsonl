@@ -1,0 +1,6 @@
+{"id": "disown_resolves_each_operand_and_keeps_bash_statuses/1", "script": "f(){ return 6; }; f & p=$!; wait \"$p\"; disown -r; wait \"$p\" 2>/dev/null; echo \"status=$?\"", "exit": 0, "output": "status=6\n"}
+{"id": "disown_resolves_each_operand_and_keeps_bash_statuses/2", "script": "f(){ return 6; }; f & p=$!; wait \"$p\"; disown -a; wait \"$p\" 2>/dev/null; echo \"status=$?\"", "exit": 0, "output": "status=127\n"}
+{"id": "disown_resolves_each_operand_and_keeps_bash_statuses/3", "script": "f(){ sleep 0.3; }; f & f & disown %% %%; jobs; echo \"status=$?\"", "exit": 0, "output": "status=0\n"}
+{"id": "disown_resolves_each_operand_and_keeps_bash_statuses/4", "script": "f(){ sleep 0.3; return 3; }; f & p=$!; disown -a; wait \"$p\" 2>/dev/null; echo \"status=$?\"", "exit": 0, "output": "status=127\n"}
+{"id": "disown_resolves_each_operand_and_keeps_bash_statuses/5", "script": "f(){ sleep 0.3; }; f & f & disown %1 %1 2>/dev/null; echo \"status=$?\"; wait %2; echo \"second=$?\"", "exit": 0, "output": "status=1\nsecond=0\n"}
+{"id": "disown_resolves_each_operand_and_keeps_bash_statuses/6", "script": "f(){ sleep 0.3; return 3; }; f & p=$!; disown -r; wait \"$p\" 2>/dev/null; echo \"status=$?\"", "exit": 0, "output": "status=127\n"}

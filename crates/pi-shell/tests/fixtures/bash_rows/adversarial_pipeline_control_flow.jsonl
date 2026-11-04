@@ -1,0 +1,12 @@
+{"id": "adversarial_pipeline_control_flow/1", "script": "for i in 1 2; do for j in a b; do true | break 2; echo j=$j; done; echo i=$i; done; echo done", "exit": 0, "output": "j=a\nj=b\ni=1\nj=a\nj=b\ni=2\ndone\n"}
+{"id": "adversarial_pipeline_control_flow/2", "script": "f(){ true | return 9; echo \"in-f s=$?\"; }; f; echo \"after-f s=$?\"", "exit": 0, "output": "in-f s=9\nafter-f s=0\n"}
+{"id": "adversarial_pipeline_control_flow/3", "script": "shopt -s lastpipe; echo a | exit 7; echo should-not-reach", "exit": 7, "output": ""}
+{"id": "adversarial_pipeline_control_flow/4", "script": "shopt -s lastpipe; for i in 1 2; do echo a | break; echo i=$i; done; echo done-lastpipe", "exit": 0, "output": "done-lastpipe\n"}
+{"id": "adversarial_pipeline_control_flow/5", "script": "shopt -s lastpipe; for i in 1 2; do echo a | continue; echo i=$i; done; echo done-lastpipe", "exit": 0, "output": "done-lastpipe\n"}
+{"id": "adversarial_pipeline_control_flow/6", "script": "{ set -o posix; readonly x=old; echo a | x=new /bin/true; echo \"after s=$?\"; } 2>/dev/null", "exit": 0, "output": "after s=1\n"}
+{"id": "adversarial_pipeline_control_flow/7", "script": "echo start | exit 5 | cat; echo \"after s=$?\"", "exit": 0, "output": "after s=0\n"}
+{"id": "adversarial_pipeline_control_flow/8", "script": "for i in 1 2; do break | cat; echo i=$i; done; echo done", "exit": 0, "output": "i=1\ni=2\ndone\n"}
+{"id": "adversarial_pipeline_control_flow/9", "script": "for i in 1 2; do continue | cat; echo i=$i; done; echo done", "exit": 0, "output": "i=1\ni=2\ndone\n"}
+{"id": "adversarial_pipeline_control_flow/10", "script": "f(){ return 42 | cat; echo \"in-f s=$?\"; }; f; echo \"after s=$?\"", "exit": 0, "output": "in-f s=0\nafter s=0\n"}
+{"id": "adversarial_pipeline_control_flow/11", "script": "shopt -s lastpipe; f(){ echo a | return 8; echo \"in-f-after s=$?\"; }; f; echo \"after-f s=$?\"", "exit": 0, "output": "after-f s=8\n"}
+{"id": "adversarial_pipeline_control_flow/12", "script": "{ set -o posix; readonly x=old; echo a | x=new /bin/true | cat; echo \"after s=$?\"; } 2>/dev/null", "exit": 0, "output": "after s=0\n"}

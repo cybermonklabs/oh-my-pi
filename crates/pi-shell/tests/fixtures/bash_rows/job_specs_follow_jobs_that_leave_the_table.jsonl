@@ -1,0 +1,2 @@
+{"id": "job_specs_follow_jobs_that_leave_the_table/1", "script": "f(){ sleep 0.2; return 3; }; g(){ return 4; }; f & g & wait \"$!\"; echo \"g=$?\"\nwait %%; echo \"f=$?\"", "exit": 0, "output": "g=4\nf=3\n"}
+{"id": "job_specs_follow_jobs_that_leave_the_table/2", "script": "g(){ :; }; f(){ sleep 0.3; }; g & f & wait -n; f & wait %3; echo \"status=$?\"", "exit": 0, "output": "status=0\n"}

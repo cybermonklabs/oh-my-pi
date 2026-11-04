@@ -1,0 +1,1 @@
+{"id": "wait_without_operands_forgets_reported_pids/1", "script": "f(){ return 6; }; f & p=$!; wait; wait \"$p\" 2>/dev/null; echo \"status=$?\"", "exit": 0, "output": "status=127\n"}

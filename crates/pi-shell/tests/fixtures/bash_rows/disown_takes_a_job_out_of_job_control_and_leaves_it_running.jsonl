@@ -1,0 +1,8 @@
+{"id": "disown_takes_a_job_out_of_job_control_and_leaves_it_running/1", "script": "msg=$(disown %3 2>&1); echo \"status=$? ${msg#*disown: }\"; msg=$(disown 2>&1); echo \"status=$? ${msg#*disown: }\"", "exit": 0, "output": "status=1 %3: no such job\nstatus=1 current: no such job\n"}
+{"id": "disown_takes_a_job_out_of_job_control_and_leaves_it_running/2", "script": "f(){ sleep 0.2; }; f & p=$!; disown \"$p\"; jobs; echo \"status=$?\"", "exit": 0, "output": "status=0\n"}
+{"id": "disown_takes_a_job_out_of_job_control_and_leaves_it_running/3", "script": "f(){ sleep 0.2; }; f & f & disown %1; wait %1 2>/dev/null; echo \"first=$?\"; wait %2; echo \"second=$?\"", "exit": 0, "output": "first=127\nsecond=0\n"}
+{"id": "disown_takes_a_job_out_of_job_control_and_leaves_it_running/4", "script": "f(){ sleep 0.2; }; f & f & disown -a; jobs; echo \"status=$?\"", "exit": 0, "output": "status=0\n"}
+{"id": "disown_takes_a_job_out_of_job_control_and_leaves_it_running/5", "script": "f(){ sleep 0.2; }; f & disown -h %1; wait %1; echo \"status=$?\"", "exit": 0, "output": "status=0\n"}
+{"id": "disown_takes_a_job_out_of_job_control_and_leaves_it_running/6", "script": "f(){ sleep 0.3; }; f & disown -r; jobs; echo \"status=$?\"", "exit": 0, "output": "status=0\n"}
+{"id": "disown_takes_a_job_out_of_job_control_and_leaves_it_running/7", "script": "f(){ sleep 0.3; return 3; }; f & p=$!; disown; wait \"$p\" 2>/dev/null; echo \"status=$?\"", "exit": 0, "output": "status=0\n"}
+{"id": "disown_takes_a_job_out_of_job_control_and_leaves_it_running/8", "script": "f(){ sleep 0.2; echo survived; }; f & disown; jobs; wait %1 2>/dev/null; echo \"status=$?\"; sleep 0.4", "exit": 0, "output": "status=127\nsurvived\n"}

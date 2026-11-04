@@ -1,0 +1,3 @@
+{"id": "a_reported_pid_keeps_its_status/1", "script": "/bin/sh -c 'exit 6' & p=$!; wait \"$p\"; echo \"first=$?\"; wait \"$p\"; echo \"second=$?\"", "exit": 0, "output": "first=6\nsecond=6\n"}
+{"id": "a_reported_pid_keeps_its_status/2", "script": "f(){ return 4; }; f & p=$!; wait -n; echo \"n=$?\"; wait \"$p\"; echo \"again=$?\"", "exit": 0, "output": "n=4\nagain=4\n"}
+{"id": "a_reported_pid_keeps_its_status/3", "script": "f(){ return 6; }; f & p=$!; sleep 0.3; wait \"$p\"; echo \"first=$?\"; wait \"$p\"; echo \"second=$?\"", "exit": 0, "output": "first=6\nsecond=6\n"}
