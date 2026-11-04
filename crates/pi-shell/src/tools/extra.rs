@@ -17,9 +17,9 @@
 //! default; `env`'s own stdin is the caller's fd 0); stdout and stderr are the
 //! caller's, which the utility writes to as well, so their output interleaves
 //! in order. Each subshell carries the call's lineage label, so a signal to
-//! the utility's job reaches its commands too. Commands replace their
-//! subshell through `exec`, so OS and virtual signal deaths reach the utility
-//! as [`CommandStatus::Signaled`], distinct from an ordinary exit of `128+n`.
+//! the utility's job reaches its commands too. External programs use `exec`;
+//! virtual programs keep the interpreter's builtin lookup. Both report actual
+//! signal deaths as [`CommandStatus::Signaled`], not an inferred `128+n` exit.
 
 use std::{
 	ffi::OsStr,
@@ -72,10 +72,10 @@ enum Program {
 
 /// The utility, once started.
 struct Running {
-	done:      Arc<Done>,
-	cancel:    CancellationToken,
-	requests:  flume::Receiver<Request>,
-	env_names: Vec<BString>,
+	done:              Arc<Done>,
+	cancel:            CancellationToken,
+	requests:          flume::Receiver<Request>,
+	env_names:         Vec<BString>,
 	killed_by_sigpipe: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -133,7 +133,8 @@ impl Extra {
 				.iter()
 				.map(|(name, _)| BString::from(name))
 				.collect();
-			self.running = Some(Running { done, cancel, requests: received, env_names, killed_by_sigpipe });
+			self.running =
+				Some(Running { done, cancel, requests: received, env_names, killed_by_sigpipe });
 		}
 		let running = self.running.as_ref()?;
 		while let Ok(Request { command, program, reply }) = running.requests.try_recv() {
@@ -144,11 +145,16 @@ impl Extra {
 		match running.done.poll(&Context::from_waker(turn.waker)) {
 			// The utility waits for every command it started; one whose
 			// reply nobody awaits any more still ends before the call does.
-			Poll::Ready(code) if self.runs.is_empty() => Some(if running.killed_by_sigpipe.load(std::sync::atomic::Ordering::Relaxed) {
-				CallOutcome::Signaled(crate::bash::Signal::Pipe)
-			} else {
-				CallOutcome::Exit(code)
-			}),
+			Poll::Ready(code) if self.runs.is_empty() => Some(
+				if running
+					.killed_by_sigpipe
+					.load(std::sync::atomic::Ordering::Relaxed)
+				{
+					CallOutcome::Signaled(crate::bash::Signal::Pipe)
+				} else {
+					CallOutcome::Exit(code)
+				},
+			),
 			_ => None,
 		}
 	}

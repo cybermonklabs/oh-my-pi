@@ -196,7 +196,11 @@ pub(super) fn child_output_failed(vp: &mut Vproc) -> bool {
 	let child = current_exec(vp).is_some_and(|e| {
 		matches!(e.stage, Stage::Output | Stage::Finish)
 			&& e.exec_as.is_none()
-			&& (e.child_diagnostic || e.target.as_ref().is_some_and(|target| !matches!(target, Target::Intrinsic(_) | Target::Function(_))))
+			&& (e.child_diagnostic
+				|| e
+					.target
+					.as_ref()
+					.is_some_and(|target| !matches!(target, Target::Intrinsic(_) | Target::Function(_))))
 	});
 	if child {
 		let e = st(vp);
@@ -222,38 +226,77 @@ pub(super) fn defer_pipe_trap(store: &mut dyn StateStore, vp: &mut Vproc) -> boo
 /// Which process writes a failed redirection's diagnostic. Inspect only
 /// already-expanded words: never repeat a substitution or open another file.
 #[cold]
-fn redirection_in_child(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, unit: &Unit, cmd: &ir::Cmd) -> bool {
+fn redirection_in_child(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	unit: &Unit,
+	cmd: &ir::Cmd,
+) -> bool {
 	let mut argv = current_argv(vp);
 	if argv.is_empty() {
-		return cmd.redirs.is_some_and(|list| unit.redirs[list as usize].iter().any(|r| {
-			use crate::bash::{event::RedirKind, ir::RedirFdIr};
-			matches!(r.fd, RedirFdIr::Num(0)) || matches!(r.fd, RedirFdIr::Default)
-				&& matches!(r.op, RedirKind::In | RedirKind::ReadWrite | RedirKind::DupIn | RedirKind::HereDoc | RedirKind::HereString)
-		}));
+		return cmd.redirs.is_some_and(|list| {
+			unit.redirs[list as usize].iter().any(|r| {
+				use crate::bash::{event::RedirKind, ir::RedirFdIr};
+				matches!(r.fd, RedirFdIr::Num(0))
+					|| matches!(r.fd, RedirFdIr::Default)
+						&& matches!(
+							r.op,
+							RedirKind::In
+								| RedirKind::ReadWrite
+								| RedirKind::DupIn
+								| RedirKind::HereDoc
+								| RedirKind::HereString
+						)
+			})
+		});
 	}
 	let path = state::lookup(&k.root, cx.store, vp, b"PATH")
-		.ok().flatten().and_then(|v| v.as_scalar()).map(BString::from).unwrap_or_default();
+		.ok()
+		.flatten()
+		.and_then(|v| v.as_scalar())
+		.map(BString::from)
+		.unwrap_or_default();
 	let mut via = Via::Plain;
 	loop {
 		let name = &argv[0];
 		let has_slash = name.contains(&b'/');
-		let resolved = resolve(k, cx, vp, name, vp.mode, ResolveCtx { has_slash, via, path_var: BStr::new(&path) });
+		let resolved = resolve(k, cx, vp, name, vp.mode, ResolveCtx {
+			has_slash,
+			via,
+			path_var: BStr::new(&path),
+		});
 		let Ok(resolved) = resolved else { return false };
-		let special = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false)
+		let special = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+			.unwrap_or(false)
 			&& matches!(resolved, Resolved::Intrinsic(id) if is_special(id));
-		if via == Via::Plain && !special && matches!(state::record(cx.store, vp, Key::Func(BStr::new(name))), Ok(Some(Record::Func { .. }))) {
+		if via == Via::Plain
+			&& !special
+			&& matches!(
+				state::record(cx.store, vp, Key::Func(BStr::new(name))),
+				Ok(Some(Record::Func { .. }))
+			) {
 			return false;
 		}
 		match resolved {
 			Resolved::Intrinsic(IntrinsicId::Command) => {
 				let mut at = 1;
 				while let Some(arg) = argv.get(at) {
-					if arg.as_slice() == b"--" { at += 1; break }
-					if !arg.starts_with(b"-") { break }
-					if arg.len() == 1 || !arg[1..].iter().all(|&c| c == b'p') { return false }
+					if arg.as_slice() == b"--" {
+						at += 1;
+						break;
+					}
+					if !arg.starts_with(b"-") {
+						break;
+					}
+					if arg.len() == 1 || !arg[1..].iter().all(|&c| c == b'p') {
+						return false;
+					}
 					at += 1;
 				}
-				if at == argv.len() { return false }
+				if at == argv.len() {
+					return false;
+				}
 				argv = &argv[at..];
 				via = Via::Command;
 			},
@@ -1194,12 +1237,22 @@ fn is_arrayref(word: &ir::Word) -> bool {
 }
 
 /// Trace one applied assignment before expanding the next one's value.
-fn trace_assignment(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Unit, assigns: &[ir::AssignOp], i: usize, line: u32) {
+fn trace_assignment(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Unit,
+	assigns: &[ir::AssignOp],
+	i: usize,
+	line: u32,
+) {
 	let utf8 = xtrace::utf8(k, cx, vp);
 	let s = st(vp);
 	let (name, _) = &s.assigns[i];
 	let (index, value) = &s.values[i];
-	if index.as_ref().is_some_and(|i| i.is_empty()) { return; }
+	if index.as_ref().is_some_and(|i| i.is_empty()) {
+		return;
+	}
 	let mut body = Vec::new();
 	let append = assigns.get(i).is_some_and(|a| a.append);
 	// Compound assignments retain the parser's spelling.
@@ -1207,7 +1260,9 @@ fn trace_assignment(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Unit
 		body.extend_from_slice(name);
 		body.extend_from_slice(if append { b"+=(" } else { b"=(" });
 		for (j, e) in elems.iter().enumerate() {
-			if j > 0 { body.push(b' '); }
+			if j > 0 {
+				body.push(b' ');
+			}
 			if let Some(key) = e.key {
 				body.push(b'[');
 				body.extend_from_slice(&parsed_source(exec::word_source(unit, key)));
@@ -1217,7 +1272,14 @@ fn trace_assignment(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Unit
 		}
 		body.push(b')');
 	} else {
-		xtrace::push_assign(&mut body, name, index.as_ref().map(|i| i.as_slice()), append, value, utf8);
+		xtrace::push_assign(
+			&mut body,
+			name,
+			index.as_ref().map(|i| i.as_slice()),
+			append,
+			value,
+			utf8,
+		);
 	}
 	xtrace::emit(k, cx, vp, line, &body);
 }
@@ -3225,7 +3287,10 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			match &mut scratch(vp).live {
 				Live::Task(task) => match task.poll(&mut tcx) {
 					Poll::Ready(status) => {
-						if replacing && let Some(run) = run && let Some(sig) = task.exit_signal() {
+						if replacing
+							&& let Some(run) = run
+							&& let Some(sig) = task.exit_signal()
+						{
 							k.exec_signals.insert(run, i32::from(sig.number(platform)));
 						}
 						status
@@ -3330,24 +3395,27 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 					.unwrap_or_else(|| std::io::ErrorKind::WriteZero.into());
 				if err.kind() == std::io::ErrorKind::BrokenPipe && !sigpipe_ignored(cx.store, vp) {
 					let caught = defer_pipe_trap(cx.store, vp);
-					if fd != 2 && st(vp).target != Some(Target::Intrinsic(IntrinsicId::Help)) {
+					if fd != 2 {
 						st(vp).status = 1;
 						if caught {
 							let cmd = Cow::Owned(String::from_utf8_lossy(&st(vp).argv[0]).into_owned());
 							let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
-							st(vp).writes.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+							st(vp).writes.push_back(PendingWrite {
+								fd:    2,
+								bytes: bytes.into(),
+								off:   0,
+							});
 						}
 					}
-					if caught { continue; }
-					k.ctl.signal(crate::bash::SigTarget::Vpid(vp.vpid), crate::bash::Signal::Pipe);
+					if caught {
+						continue;
+					}
+					k.ctl
+						.signal(crate::bash::SigTarget::Vpid(vp.vpid), crate::bash::Signal::Pipe);
 					return Some(Flow::Retry);
 				}
 				if fd != 2 {
 					let state = st(vp);
-					// bash's `help` does not check its writes.
-					if state.target == Some(Target::Intrinsic(IntrinsicId::Help)) {
-						continue;
-					}
 					let cmd = Cow::Owned(String::from_utf8_lossy(&state.argv[0]).into_owned());
 					state.status = 1;
 					// Through the command's own fd 2 (`2>&1 >&4`), while its
@@ -3408,11 +3476,20 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		let frame = vp.frames.last_mut().expect("command frame");
 		let ignore_error = op.flags & Op::COND != 0 || frame.ignore_errexit;
 		frame.pc += 1;
-		if exec::start_trap(k, vp, cx, crate::bash::store::TrapKey::Signal(crate::bash::Signal::Pipe)) {
-			let exit_after = !ignore_error && state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Errexit).unwrap_or(false)
+		if exec::start_trap(k, vp, cx, crate::bash::store::TrapKey::Signal(crate::bash::Signal::Pipe))
+		{
+			let exit_after = status != 0
+				&& !ignore_error
+				&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Errexit)
+					.unwrap_or(false)
 				|| matches!(control, Some(Transfer::Exit(_) | Transfer::Exec));
-			if let FrameKind::Script { what: super::proc::ScriptKind::Trap { continuation, exit, .. }, .. } = &mut vp.frames.last_mut().expect("PIPE trap").kind {
-				*continuation = (!ignore_error && err_trap_set && status != 0).then_some(super::proc::TrapContinuation::ErrorAt(line));
+			if let FrameKind::Script {
+				what: super::proc::ScriptKind::Trap { continuation, exit, .. },
+				..
+			} = &mut vp.frames.last_mut().expect("PIPE trap").kind
+			{
+				*continuation = (!ignore_error && err_trap_set && status != 0)
+					.then_some(super::proc::TrapContinuation::ErrorAt(line));
 				*exit = exit_after;
 			}
 			return Flow::Call;

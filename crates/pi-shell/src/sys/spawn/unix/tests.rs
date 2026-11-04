@@ -1005,10 +1005,9 @@ fn a_readerless_engine_pipe_rejects_the_childs_first_write() {
 		(sh("echo data >&2"), 2),
 		(sh("echo data >&9"), 9),
 	] {
-		for (ignored, expected) in [
-			(false, ExitStatus::Signaled(Signal::Pipe)),
-			(true, ExitStatus::Exited(1)),
-		] {
+		for (ignored, expected) in
+			[(false, ExitStatus::Signaled(Signal::Pipe)), (true, ExitStatus::Exited(1))]
+		{
 			let (reader, writer) = crate::bash::mem::pipe();
 			drop(reader);
 			let out = StdioSpec::Pipe(crate::bash::FdRef::mem(writer));
@@ -1085,10 +1084,7 @@ fn a_refused_write_spares_other_members_of_the_shared_process_group() {
 fn a_refused_write_preserves_the_childs_caught_or_ignored_sigpipe() {
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
-	for (setup, ignored, expected) in [
-		("trap 'exit 23' PIPE; ", false, 23),
-		("", true, 7),
-	] {
+	for (setup, ignored, expected) in [("trap 'exit 23' PIPE; ", false, 23), ("", true, 7)] {
 		let a = sh(&format!("{setup}printf diagnostic >&2; /bin/sleep 1; exit 7"));
 		let mut sp = spec(&a, &env, NEW);
 		sp.stdio[2] = MemFile::broken().boxed();

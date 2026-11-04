@@ -370,7 +370,8 @@ impl Child {
 			return false;
 		}
 		self.status = Some(status);
-		self.signal = signal.and_then(|n| u8::try_from(n).ok())
+		self.signal = signal
+			.and_then(|n| u8::try_from(n).ok())
 			.and_then(|n| crate::bash::Signal::from_number(n, crate::bash::Platform::current()));
 		true
 	}
@@ -381,7 +382,9 @@ impl Child {
 	}
 
 	fn outcome(&self, code: i32) -> CallOutcome {
-		if self.status == Some(code) && let Some(signal) = self.signal {
+		if self.status == Some(code)
+			&& let Some(signal) = self.signal
+		{
 			CallOutcome::Signaled(signal)
 		} else {
 			CallOutcome::Exit(code)
@@ -413,7 +416,11 @@ impl Out {
 				},
 				IoPoll::Ready(result) => {
 					self.0.pop_front();
-					return Err(result.err().map_or(std::io::ErrorKind::WriteZero, |error| error.kind()));
+					return Err(
+						result
+							.err()
+							.map_or(std::io::ErrorKind::WriteZero, |error| error.kind()),
+					);
 				},
 				IoPoll::WouldBlock(_) => return Ok(false),
 			}

@@ -740,7 +740,9 @@ impl ExtProc for Observed {
 		self.child.broken_pipe_signal()
 	}
 
-	fn detach(&mut self) { self.child.detach(); }
+	fn detach(&mut self) {
+		self.child.detach();
+	}
 
 	fn stop(&mut self) -> io::Result<()> {
 		self.child.stop()

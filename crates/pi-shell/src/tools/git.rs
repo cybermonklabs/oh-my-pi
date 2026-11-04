@@ -91,7 +91,10 @@ impl Git {
 				},
 				Some(Stage::Ready(next)) => {
 					match self.out.flush(api) {
-						Ok(false) => { self.stage = Some(Stage::Ready(next)); return None; },
+						Ok(false) => {
+							self.stage = Some(Stage::Ready(next));
+							return None;
+						},
 						Err(error) => return Some(super::write_failure(&self.call, error, 1)),
 						Ok(true) => {},
 					}
@@ -101,7 +104,9 @@ impl Git {
 							if let Some(git) = git_path(&self.call) {
 								let argv = std::iter::once(git).chain(args).collect();
 								let redirect = if to_stderr { " >&2" } else { "" };
-								self.child.start(api, turn, &self.call, argv, false, redirect);
+								self
+									.child
+									.start(api, turn, &self.call, argv, false, redirect);
 								Stage::Running
 							} else {
 								self.out.push(2, "git: command not found\n");

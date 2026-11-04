@@ -15,9 +15,9 @@ use super::{
 	expand::{Expander, Stop},
 	is_ident, probe,
 	proc::{
-		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg, Live,
-		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TrapContinuation, TryEnd, Vproc,
+		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
+		Live, LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run,
+		Saved, Scratch, ScriptKind, Slot, TrapContinuation, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -690,10 +690,14 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc, store: &mut dyn StateStore) -> Opti
 			},
 			Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
 				vp.out.pop_front();
-				if command::sigpipe_ignored(store, vp) || command::child_output_failed(vp) || command::defer_pipe_trap(store, vp) {
+				if command::sigpipe_ignored(store, vp)
+					|| command::child_output_failed(vp)
+					|| command::defer_pipe_trap(store, vp)
+				{
 					continue;
 				}
-				k.ctl.signal(crate::bash::SigTarget::Vpid(vp.vpid), crate::bash::Signal::Pipe);
+				k.ctl
+					.signal(crate::bash::SigTarget::Vpid(vp.vpid), crate::bash::Signal::Pipe);
 				return Some(Flow::Retry);
 			},
 			Poll::Ready(_) => {
@@ -871,7 +875,9 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			vp.status = status.expect("completed write-signal trap");
 			if start_trap(k, vp, cx, TrapKey::Err) {
 				set_trap_line(vp, line);
-				if exit { mark_trap_exit(vp); }
+				if exit {
+					mark_trap_exit(vp);
+				}
 				return None;
 			}
 		}
@@ -3028,7 +3034,10 @@ fn stage_text(unit: &Unit, info: &ir::SpawnIr, i: usize) -> BString {
 fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: Op) -> Flow {
 	let info = &unit.spawns[op.a as usize];
 	if info.kind == SpawnKind::Pipeline
-		&& top_frame(vp).scratch.as_ref().is_none_or(|sc| sc.children.is_empty() || matches!(sc.live, Live::Pipeline(_)))
+		&& top_frame(vp)
+			.scratch
+			.as_ref()
+			.is_none_or(|sc| sc.children.is_empty() || matches!(sc.live, Live::Pipeline(_)))
 		&& let Some(flow) = launch_pipeline(k, vp, cx, unit, op)
 	{
 		return flow;
@@ -3143,19 +3152,31 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 
 /// Start each pipeline stage only after its parent's DEBUG trap returns.
 /// Already-started stages remain independent when a later trap exits.
-fn launch_pipeline(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: Op) -> Option<Flow> {
+fn launch_pipeline(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Arc<Unit>,
+	op: Op,
+) -> Option<Flow> {
 	let info = &unit.spawns[op.a as usize];
 	if !matches!(scratch(vp).live, Live::Pipeline(_)) {
-		if !k.bangs.is_empty() { k.settle_bang(vp.vpid, None); }
+		if !k.bangs.is_empty() {
+			k.settle_bang(vp.vpid, None);
+		}
 		let stdin = vp.fds.get(0).cloned();
-		scratch(vp).live = Live::Pipeline(super::proc::PipelineProgress { next: 0, stdin, traced: false });
+		scratch(vp).live =
+			Live::Pipeline(super::proc::PipelineProgress { next: 0, stdin, traced: false });
 	}
 	let n = info.stages.len();
 	let lastpipe = unit.mode.dialect() == Dialect::Zsh
-		|| (state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false) && !job_control(k, cx, vp));
+		|| (state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
+			&& !job_control(k, cx, vp));
 	let tap = cx.host.pipe_tap();
 	loop {
-		let Live::Pipeline(mut progress) = std::mem::take(&mut scratch(vp).live) else { unreachable!("pipeline launch") };
+		let Live::Pipeline(mut progress) = std::mem::take(&mut scratch(vp).live) else {
+			unreachable!("pipeline launch")
+		};
 		if progress.next as usize == n {
 			if k.mask.contains(crate::bash::event::EventKind::Pipeline) {
 				let children: Vec<_> = scratch(vp).children.iter().map(|&(vpid, _)| vpid).collect();
@@ -3174,7 +3195,9 @@ fn launch_pipeline(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<U
 				set_trap_line(vp, line_of(vp, stage_op.node));
 				return Some(Flow::Call);
 			}
-			let Live::Pipeline(resumed) = std::mem::take(&mut scratch(vp).live) else { unreachable!("pipeline launch") };
+			let Live::Pipeline(resumed) = std::mem::take(&mut scratch(vp).live) else {
+				unreachable!("pipeline launch")
+			};
 			progress = resumed;
 		}
 		if lastpipe && i + 1 == n {
@@ -3201,17 +3224,26 @@ fn launch_pipeline(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<U
 				let consumer = stage_text(unit, info, i + 1);
 				tap.open(BStr::new(&producer), BStr::new(&consumer))
 			});
-			let (r, w) = match mirror { Some(mirror) => mem::tapped_pipe(mirror), None => mem::pipe() };
+			let (r, w) = match mirror {
+				Some(mirror) => mem::tapped_pipe(mirror),
+				None => mem::pipe(),
+			};
 			let w = FdRef::mem(w);
 			fds.set(1, Some(w.clone()));
-			if stage.pipe_stderr { fds.set(2, Some(w)); }
+			if stage.pipe_stderr {
+				fds.set(2, Some(w));
+			}
 			progress.stdin = Some(FdRef::mem(r));
 		}
 		let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
 		let level = stage_level(unit, stage.entry, false);
 		super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
-		if progress.traced { top_frame(&mut child).debug_pc = Some(stage.entry); }
-		if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) { child.jobs = inherited_jobs(vp, true); }
+		if progress.traced {
+			top_frame(&mut child).debug_pc = Some(stage.entry);
+		}
+		if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {
+			child.jobs = inherited_jobs(vp, true);
+		}
 		scratch(vp).children.push((child.vpid, None));
 		k.spawned.push(Box::new(child));
 		progress.next += 1;

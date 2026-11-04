@@ -407,8 +407,8 @@ const fn cancels(sig: Signal) -> bool {
 /// Dropping it (the engine abandoned the command) cancels the extra, which
 /// then unwinds on the runtime.
 pub struct ExtraTask {
-	done:   Arc<Done>,
-	cancel: CancellationToken,
+	done:              Arc<Done>,
+	cancel:            CancellationToken,
 	killed_by_sigpipe: Arc<AtomicBool>,
 }
 
@@ -429,7 +429,10 @@ impl Task for ExtraTask {
 	}
 
 	fn exit_signal(&self) -> Option<Signal> {
-		self.killed_by_sigpipe.load(std::sync::atomic::Ordering::Relaxed).then_some(Signal::Pipe)
+		self
+			.killed_by_sigpipe
+			.load(std::sync::atomic::Ordering::Relaxed)
+			.then_some(Signal::Pipe)
 	}
 
 	fn signal(&mut self, sig: Signal) {

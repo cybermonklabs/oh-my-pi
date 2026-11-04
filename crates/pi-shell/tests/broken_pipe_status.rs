@@ -34,17 +34,22 @@ async fn run_streams(command: String, stderr_written: bool) -> (Option<i32>, Str
 	let (out_tx, out_rx) = flume::unbounded::<Bytes>();
 	let (err_tx, err_rx) = flume::unbounded::<Bytes>();
 	let result = execute_shell_streams(
-		ShellExecuteOptions { command: command.clone(), timeout_ms: Some(60_000), ..Default::default() },
+		ShellExecuteOptions {
+			command: command.clone(),
+			timeout_ms: Some(60_000),
+			..Default::default()
+		},
 		StreamSinks { stdout: Some(out_tx), stderr: Some(err_tx) },
 		CancelToken::default(),
-	).await.expect("shell execution");
+	)
+	.await
+	.expect("shell execution");
 	let collect = |rx: flume::Receiver<Bytes>| {
-		String::from_utf8(rx.drain().flat_map(|bytes| bytes.to_vec()).collect()).expect("UTF-8 output")
+		String::from_utf8(rx.drain().flat_map(|bytes| bytes.to_vec()).collect())
+			.expect("UTF-8 output")
 	};
 	let stdout = collect(out_rx);
 	let stderr = collect(err_rx);
-	assert!(!result.timed_out, "script timed out: {command}");
-	assert_eq!(!stderr.is_empty(), stderr_written, "stderr for {command}: {stderr:?}");
 	let output = format!("{stderr}{stdout}");
 	if let Ok(log) = std::env::var("PIPE_MEASURE_LOG") {
 		use std::io::Write as _;
@@ -53,11 +58,19 @@ async fn run_streams(command: String, stderr_written: bool) -> (Option<i32>, Str
 			"script": command,
 			"status": result.exit_code,
 			"output": output,
+			"stdout": stdout,
+			"stderr": stderr,
 			"timed_out": result.timed_out,
 		});
-		let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).expect("measurement log");
+		let mut file = std::fs::OpenOptions::new()
+			.create(true)
+			.append(true)
+			.open(log)
+			.expect("measurement log");
 		writeln!(file, "{row}").expect("measurement row");
 	}
+	assert!(!result.timed_out, "script timed out: {command}");
+	assert_eq!(!stderr.is_empty(), stderr_written, "stderr for {command}: {stderr:?}");
 	(result.exit_code, output)
 }
 
@@ -790,6 +803,16 @@ async fn a_caught_sigpipe_runs_its_handler_and_a_subshell_resets_it() {
 		r#") 3> >(true) 2>/dev/null; echo "caught=$?""#,
 		r#"trap 'echo caught' PIPE; ( fill; echo bad >&3; echo "after-echo=$?" ) 3> >(true)"#,
 		r#"echo "inherited=$?"; trap - PIPE"#,
+		r#"( fill; trap 'echo "PIPE:$?"' PIPE; trap 'echo "ERR:$?"' ERR; echo bad >&3; echo "AFTER:$?" ) 3> >(true) 2>/dev/null"#,
+		r#"( fill; trap 'echo "COND-PIPE:$?"' PIPE; trap 'echo BAD-ERR' ERR; echo bad >&3 || echo "RECOVER:$?" ) 3> >(true) 2>/dev/null"#,
+		r#"( fill; set -e; trap 'echo "E-PIPE:$?"' PIPE; trap 'echo "E-ERR:$?"' ERR; echo bad >&3; echo BAD-AFTER ) 3> >(true) 2>/dev/null; echo "errexit=$?""#,
+		r#"( fill; set -e; trap 'set +e; echo DISABLE' PIPE; echo bad >&3; echo BAD-CONTINUED ) 3> >(true) 2>/dev/null; echo "disabled=$?""#,
+		r#"( fill; trap 'set -e; echo ENABLE' PIPE; echo bad >&3; echo ENABLED-CONTINUED ) 3> >(true) 2>/dev/null; echo "enabled=$?""#,
+		r#"made_stderr() { [ -s help-errors ] && echo yes || echo no; }"#,
+		r#"( fill; help true >&3 2>help-errors; echo BAD ) 3> >(true) 2>/dev/null; echo "default=$?""#,
+		r#"( fill; trap 'echo "HELP:$?"' PIPE; help true >&3 2>help-errors; s=$?; echo "caught=$s:$(made_stderr)" ) 3> >(true) 2>/dev/null"#,
+		r#"( trap '' PIPE; fill; help true >&3 2>help-errors; s=$?; echo "ignored=$s:$(made_stderr)" ) 3> >(true) 2>/dev/null"#,
+		r#"( fill; trap 'echo "E-HELP:$?"' PIPE; set -e; help true >&3 2>help-errors; echo BAD ) 3> >(true) 2>/dev/null; echo "help-errexit=$?""#,
 	])
 	.await;
 	assert_eq!(exit_code, Some(0), "{output}");
@@ -802,6 +825,12 @@ async fn a_caught_sigpipe_runs_its_handler_and_a_subshell_resets_it() {
 			"after-cd=1\n",
 			"caught=0\n",
 			"inherited=141\n",
+			"PIPE:1\nERR:1\nAFTER:1\n",
+			"COND-PIPE:1\nRECOVER:1\n",
+			"E-PIPE:1\nE-ERR:1\nerrexit=1\n",
+			"DISABLE\ndisabled=1\n",
+			"ENABLE\nENABLED-CONTINUED\nenabled=0\n",
+			"default=141\nHELP:1\ncaught=1:yes\nignored=1:yes\nE-HELP:1\nhelp-errexit=1\n",
 		)
 	);
 }
@@ -850,16 +879,24 @@ async fn a_builtin_on_a_provider_file_keeps_the_shells_caught_sigpipe() {
 	let (err_tx, err_rx) = flume::unbounded::<Bytes>();
 	let result = execute_shell_streams(
 		ShellExecuteOptions {
-			command: format!("trap 'echo caught' PIPE; : < /provider-input; {{ {FILL_PIPE} >&3; echo bad >&3; echo AFTER; }} 3> >(true)"),
+			command: format!(
+				"trap 'echo caught' PIPE; : < /provider-input; {{ {FILL_PIPE} >&3; echo bad >&3; echo \
+				 AFTER; }} 3> >(true)"
+			),
 			filesystem,
 			timeout_ms: Some(60_000),
 			..Default::default()
 		},
 		StreamSinks { stdout: Some(tx), stderr: Some(err_tx) },
 		CancelToken::default(),
-	).await.expect("run");
+	)
+	.await
+	.expect("run");
 	let stdout = String::from_utf8(rx.drain().flat_map(|b| b.to_vec()).collect()).expect("stdout");
-	assert_eq!((result.exit_code, stdout.as_str(), !err_rx.is_empty()), (Some(0), "caught\nAFTER\n", true));
+	assert_eq!(
+		(result.exit_code, stdout.as_str(), !err_rx.is_empty()),
+		(Some(0), "caught\nAFTER\n", true)
+	);
 }
 
 /// A provider-backed file over a pipe whose reader has gone.
@@ -910,7 +947,9 @@ async fn run_on_provider_fds(
 		},
 		None,
 		CancelToken::default(),
-	).await.expect("script");
+	)
+	.await
+	.expect("script");
 	(u8::try_from(result.exit_code.expect("status")).expect("u8 status"), dir)
 }
 
@@ -2021,5 +2060,12 @@ async fn utility_stream_boundaries_stop_work_at_the_failed_write() {
 		r#"printf 'one\ntwo\n' > input; printf no-newline > append"#,
 		r#"( fill; sed -un -e 'r append' -e 'w survived' input >&3; s=$?; printf 'sed:%s:%s\n' "$s" "$(wc -l < survived)" ) 3> >(true) 2>/dev/null"#,
 	]).await;
-	assert_eq!((code, output.as_str()), (Some(0), "cat:default:141:no:no\ncat:ignored:1:no:yes\nfind:stdout:1:no:2\nfind:file:1:no:1\nsed:141:1\n"));
+	assert_eq!(
+		(code, output.as_str()),
+		(
+			Some(0),
+			"cat:default:141:no:no\ncat:ignored:1:no:yes\nfind:stdout:1:no:2\nfind:file:1:no:1\nsed:\
+			 141:1\n"
+		)
+	);
 }

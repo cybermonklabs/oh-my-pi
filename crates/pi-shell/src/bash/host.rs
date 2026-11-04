@@ -267,21 +267,21 @@ crate::bash::packed_names::packed_names!(Via);
 /// Arguments of [`Host::start`].
 pub struct Invocation<'a> {
 	/// Command name and arguments, after expansion.
-	pub argv:      &'a [BString],
+	pub argv:            &'a [BString],
 	/// Environment of the command.
-	pub env:       &'a EnvView,
+	pub env:             &'a EnvView,
 	/// Working directory.
-	pub cwd:       &'a BStr,
+	pub cwd:             &'a BStr,
 	/// fds 0, 1, 2.
-	pub stdio:     [FdRef; 3],
+	pub stdio:           [FdRef; 3],
 	/// Further fds (`3>file cmd`).
-	pub extra_fds: &'a [(i32, FdRef)],
+	pub extra_fds:       &'a [(i32, FdRef)],
 	/// Output tag of this execution.
-	pub tag:       CmdTag,
+	pub tag:             CmdTag,
 	/// Virtual process running it.
-	pub vpid:      Vpid,
+	pub vpid:            Vpid,
 	/// File-creation mask: the shell's `umask`.
-	pub umask:     u32,
+	pub umask:           u32,
 	/// A child inherits an ignored SIGPIPE, but never its caller's handler.
 	pub sigpipe_ignored: bool,
 }

@@ -280,23 +280,23 @@ pub enum Step {
 #[derive(Clone, Debug)]
 pub struct ToolCall {
 	/// From [`Resolved::Tool`](crate::bash::Resolved::Tool).
-	pub tool:      ToolRef,
+	pub tool:            ToolRef,
 	/// Expanded argv.
-	pub argv:      Vec<BString>,
+	pub argv:            Vec<BString>,
 	/// Calling vproc.
-	pub vpid:      Vpid,
+	pub vpid:            Vpid,
 	/// Output tag of this execution.
-	pub tag:       CmdTag,
+	pub tag:             CmdTag,
 	/// Working directory.
-	pub cwd:       BString,
+	pub cwd:             BString,
 	/// fds 0, 1, 2 (also reachable by number through [`ShellApi`]).
-	pub stdio:     [FdRef; 3],
+	pub stdio:           [FdRef; 3],
 	/// Further open fds.
-	pub extra_fds: Vec<(i32, FdRef)>,
+	pub extra_fds:       Vec<(i32, FdRef)>,
 	/// Environment.
-	pub env:       EnvView,
+	pub env:             EnvView,
 	/// File-creation mask: the shell's `umask`.
-	pub umask:     u32,
+	pub umask:           u32,
 	/// A program inherits an ignored SIGPIPE, but not its caller's handler.
 	pub sigpipe_ignored: bool,
 }
@@ -524,12 +524,25 @@ impl Kernel {
 	}
 
 	pub fn release_partial_pipeline(&mut self, vp: &Vproc) {
-		let debug = vp.frames.iter().any(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key: crate::bash::store::TrapKey::Debug, .. }, .. }));
-		let cancelling = vp.frames.iter().any(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { cancel: Some(_), .. }, .. }));
-		if !debug || cancelling { return; }
+		let debug = vp.frames.iter().any(|f| {
+			matches!(f.kind, FrameKind::Script {
+				what: ScriptKind::Trap { key: crate::bash::store::TrapKey::Debug, .. },
+				..
+			})
+		});
+		let cancelling = vp.frames.iter().any(|f| {
+			matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { cancel: Some(_), .. }, .. })
+		});
+		if !debug || cancelling {
+			return;
+		}
 		for frame in &vp.frames {
-			if let Some(sc) = &frame.scratch && matches!(sc.live, Live::Pipeline(_)) {
-				self.released_stages.extend(sc.children.iter().map(|&(child, _)| child));
+			if let Some(sc) = &frame.scratch
+				&& matches!(sc.live, Live::Pipeline(_))
+			{
+				self
+					.released_stages
+					.extend(sc.children.iter().map(|&(child, _)| child));
 			}
 		}
 	}
@@ -1614,7 +1627,10 @@ impl Shell {
 		if !self.k.released_stages.is_empty() {
 			let roots = std::mem::take(&mut self.k.released_stages);
 			for i in 0..self.procs.len() {
-				if roots.iter().any(|&root| self.in_job(self.procs[i].vpid, root)) {
+				if roots
+					.iter()
+					.any(|&root| self.in_job(self.procs[i].vpid, root))
+				{
 					let p = &mut self.procs[i];
 					p.lineage.detached = true;
 					for frame in &mut p.frames {
@@ -1884,7 +1900,9 @@ impl Shell {
 	/// scripts. Transient vprocs are removed.
 	fn kill(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32) {
 		let p = &mut self.procs[i];
-		if sig == Signal::Pipe { self.k.release_partial_pipeline(p); }
+		if sig == Signal::Pipe {
+			self.k.release_partial_pipeline(p);
+		}
 		for f in &mut p.frames {
 			if let Some(sc) = f.scratch.as_mut() {
 				match &mut sc.live {
@@ -1908,7 +1926,10 @@ impl Shell {
 		for run in &runs {
 			self.k.exec_signals.remove(&run.id);
 			if run.started {
-				self.k.exec_signals.insert(run.id, i32::from(sig.number(self.k.engine.config().platform)));
+				self
+					.k
+					.exec_signals
+					.insert(run.id, i32::from(sig.number(self.k.engine.config().platform)));
 				if p.parent.is_none() {
 					self.k.exited = Some(run.id);
 				}

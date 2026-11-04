@@ -13,11 +13,10 @@
 //!   holder of the pipe's write end (the child and anything it forked) has
 //!   closed it. If the engine side refuses the bytes (`EPIPE`: the reader is
 //!   gone), the pump sends the child `SIGPIPE` and closes the OS read end.
-//!   Waiting for another write is too late: the child may already be doing
-//!   work after the write the pump just accepted. Each output half reports
-//!   its drain to the [`Tracker`] once, at end of file, on refusal, or when
-//!   dropped: the command completes only once its output is delivered and
-//!   flushed. An output
+//!   Waiting for another write is too late: the child may already be doing work
+//!   after the write the pump just accepted. Each output half reports its drain
+//!   to the [`Tracker`] once, at end of file, on refusal, or when dropped: the
+//!   command completes only once its output is delivered and flushed. An output
 //!   pump still running when its `ExtProc` is dropped (a detached or abandoned
 //!   external, or a leftover it forked holding the pipe) goes on to its end of
 //!   file as adopted work ([`orphan`]).
@@ -42,8 +41,12 @@
 //! whereas a direct dead descriptor makes `printf` fail and `set -e` exit.
 //! The ignored signal cannot undo that first write. Closing our read end makes
 //! subsequent writes fail, but matching the first write needs a provider OS
-//! descriptor (or syscall interception, which these pumps do not provide). The same
-//! asynchronous boundary lets a fast child finish before refusal is observed.
+//! descriptor (or syscall interception, which these pumps do not provide).
+//! The same asynchronous boundary lets a fast child finish before refusal is
+//! observed. It also applies to ordinary in-memory and tapped pipeline pipes
+//! whose reader closes after launch: `/bin/sh -c 'sleep 0.1; echo x' | true`
+//! can leave a successful child wait status, where a direct kernel pipe gives
+//! SIGPIPE. An already-readerless engine pipe bypasses the relay at launch.
 
 pub(super) mod orphan;
 pub(super) mod os;
@@ -202,7 +205,11 @@ impl Chunk {
 /// lock pins its pid: a waiter records the exit under this lock before it can
 /// reap, including after the `ExtProc` has handed its output to `orphan`.
 #[cfg(unix)]
-pub(super) fn signal_writer(pid: i32, tracker: &Tracker, sig: crate::bash::Signal) -> io::Result<()> {
+pub(super) fn signal_writer(
+	pid: i32,
+	tracker: &Tracker,
+	sig: crate::bash::Signal,
+) -> io::Result<()> {
 	let life = tracker.lock();
 	if pid <= 0 || life.has_exited() {
 		return Ok(());
@@ -220,15 +227,15 @@ pub(super) fn signal_writer(pid: i32, tracker: &Tracker, sig: crate::bash::Signa
 struct Drained {
 	tracker: Arc<Tracker>,
 	#[cfg(unix)]
-	pid: i32,
+	pid:     i32,
 }
 
 impl Drained {
 	fn new(tracker: &Arc<Tracker>, _pid: u32) -> Self {
 		Self {
-			tracker: Arc::clone(tracker),
+			tracker:          Arc::clone(tracker),
 			#[cfg(unix)]
-			pid: _pid as i32,
+			pid:              _pid as i32,
 		}
 	}
 
@@ -282,10 +289,10 @@ enum Task {
 	Out {
 		/// Our read end; closed before the drain is reported (fields drop in
 		/// order).
-		src:      OsPipe,
-		dst:      End,
-		chunk:    Chunk,
-		drained:  Drained,
+		src:     OsPipe,
+		dst:     End,
+		chunk:   Chunk,
+		drained: Drained,
 	},
 	#[cfg(unix)]
 	Duplex(Box<Duplex>),

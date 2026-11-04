@@ -718,7 +718,7 @@ pub struct Run {
 	pub started:           bool,
 	pub exit_trap_started: bool,
 	/// This run stands for one program invoked by a host utility.
-	pub program: bool,
+	pub program:           bool,
 }
 
 /// What kind of activation a frame is.
@@ -791,13 +791,13 @@ pub enum ScriptKind {
 	Source,
 	/// A trap action, restoring the interrupted status when it finishes.
 	Trap {
-		key:           crate::bash::store::TrapKey,
-		status:        i32,
-		cancel:        Option<i32>,
+		key:          crate::bash::store::TrapKey,
+		status:       i32,
+		cancel:       Option<i32>,
 		continuation: Option<TrapContinuation>,
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
-		exit:          bool,
+		exit:         bool,
 	},
 }
 
@@ -1042,8 +1042,8 @@ pub struct Scratch {
 
 /// A pipeline launch suspended by a DEBUG trap in its parent shell.
 pub struct PipelineProgress {
-	pub next: u32,
-	pub stdin: Option<FdRef>,
+	pub next:   u32,
+	pub stdin:  Option<FdRef>,
 	pub traced: bool,
 }
 
@@ -1269,59 +1269,59 @@ pub enum ProbeResult {
 /// Serializable progress of an `Exec` (survives externalize/restore).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecState {
-	pub stage:       Stage,
-	pub tag:         CmdTag,
-	pub t0:          u64,
-	pub argv:        Vec<BString>,
+	pub stage:            Stage,
+	pub tag:              CmdTag,
+	pub t0:               u64,
+	pub argv:             Vec<BString>,
 	/// The words are expanded (`argv`, `compound` are final).
-	pub expanded:    bool,
+	pub expanded:         bool,
 	/// argv indexes of compound-assignment words (`declare a=(…)`).
-	pub compound:    Vec<u32>,
+	pub compound:         Vec<u32>,
 	/// Fields still to pathname-expand: `(argv index, escaped pattern)`.
-	pub globs:       Vec<(u32, BString)>,
+	pub globs:            Vec<(u32, BString)>,
 	/// Prefix assignments as `(name, shown value)` for events.
-	pub assigns:     Vec<(BString, BString)>,
+	pub assigns:          Vec<(BString, BString)>,
 	/// Expanded prefix assignments: subscript and value.
-	pub values:      Vec<(Option<BString>, AssignValue)>,
+	pub values:           Vec<(Option<BString>, AssignValue)>,
 	/// `set -k`: `words` indexes of the assignment words taken out of
 	/// `argv`; their values follow the prefix ones in `values`.
-	pub keywords:    Vec<u32>,
+	pub keywords:         Vec<u32>,
 	/// argv indexes of single fields from words written as array
 	/// references ([`super::builtins::Ctx::arrayref`]).
-	pub arrayref:    Vec<u32>,
-	pub target:      Option<Target>,
-	pub waiting:     Option<Awaited>,
+	pub arrayref:         Vec<u32>,
+	pub target:           Option<Target>,
+	pub waiting:          Option<Awaited>,
 	/// A temporary scope (builtin environment) was pushed for this command.
-	pub scoped:      bool,
+	pub scoped:           bool,
 	/// Control transfer to perform once the output is written.
-	pub control:     Option<Transfer>,
+	pub control:          Option<Transfer>,
 	/// `Task::checkpoint` bytes taken at externalize.
-	pub checkpoint:  Option<Vec<u8>>,
+	pub checkpoint:       Option<Vec<u8>>,
 	/// Command output still to be written.
-	pub writes:      VecDeque<PendingWrite>,
-	pub status:      i32,
+	pub writes:           VecDeque<PendingWrite>,
+	pub status:           i32,
 	/// Status of the last command substitution (`$?` of `x=$(…)`).
-	pub sub_status:  Option<i32>,
+	pub sub_status:       Option<i32>,
 	/// Children `wait` waits for.
-	pub wait_for:    Vec<Vpid>,
+	pub wait_for:         Vec<Vpid>,
 	/// `exec command`: how the command replaces the shell.
-	pub exec_as:     Option<Box<ExecAs>>,
+	pub exec_as:          Option<Box<ExecAs>>,
 	/// `wait -p var`: the variable that gets the waited child's pid.
-	pub wait_into:   Option<Box<BString>>,
+	pub wait_into:        Option<Box<BString>>,
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
-	pub via_command: bool,
+	pub via_command:      bool,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
-	pub resume:      bool,
+	pub resume:           bool,
 	/// Times the builtin ran again after a frame it pushed returned.
-	pub resumed:     u32,
+	pub resumed:          u32,
 	/// A failed redirection's diagnostic is written in a command child.
 	pub child_diagnostic: bool,
 	/// Whether ERR was in force when this command began.
-	pub err_trap_set: bool,
+	pub err_trap_set:     bool,
 	/// Deliver a caught PIPE only after this command's redirections restore.
-	pub deferred_pipe: bool,
+	pub deferred_pipe:    bool,
 }
 
 /// Options of `exec [-cl] [-a name] command`.

@@ -303,7 +303,7 @@ struct RunImage {
 	env:               Vec<(BString, BString)>,
 	started:           bool,
 	exit_trap_started: bool,
-	program: bool,
+	program:           bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -362,7 +362,7 @@ struct ScratchImage {
 	saved:        Vec<SavedImage>,
 	children:     Vec<(Vpid, Option<i32>)>,
 	inline:       Option<super::proc::InlineStage>,
-	pipeline: Option<(u32, Option<u32>, bool)>,
+	pipeline:     Option<(u32, Option<u32>, bool)>,
 }
 
 fn saved_image(s: &[Saved], fds: &mut FdImager) -> Vec<SavedImage> {
@@ -859,7 +859,7 @@ impl Shell {
 					env:               r.env,
 					started:           r.started,
 					exit_trap_started: r.exit_trap_started,
-					program: r.program,
+					program:           r.program,
 				});
 			}
 			report.runs += vp.runs.len() as u32;
@@ -942,11 +942,13 @@ impl Shell {
 								}),
 							}))
 						};
-						let live = img.pipeline.map_or(live, |(next, stdin, traced)| Live::Pipeline(super::proc::PipelineProgress {
-							next,
-							stdin: stdin.map(|fd| objs.fd(cx.host, fd)),
-							traced,
-						}));
+						let live = img.pipeline.map_or(live, |(next, stdin, traced)| {
+							Live::Pipeline(super::proc::PipelineProgress {
+								next,
+								stdin: stdin.map(|fd| objs.fd(cx.host, fd)),
+								traced,
+							})
+						});
 						Some(Box::new(Scratch {
 							logs: img.logs,
 							sub: img.sub.map(|s| match s {
@@ -1086,7 +1088,7 @@ fn run_image(r: &Run) -> RunImage {
 		env:               r.env.clone(),
 		started:           r.started,
 		exit_trap_started: r.exit_trap_started,
-		program: r.program,
+		program:           r.program,
 	}
 }
 

@@ -354,7 +354,9 @@ impl ExtProc for Relayed {
 		self.child.broken_pipe_signal()
 	}
 
-	fn detach(&mut self) { self.child.detach(); }
+	fn detach(&mut self) {
+		self.child.detach();
+	}
 
 	fn stop(&mut self) -> io::Result<()> {
 		self.child.stop()
@@ -401,7 +403,9 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		bash::{CmdTag, EnvView, JobId, Lineage, PgroupSpec, RunId, SigSet, SpawnSpec, StdioSpec, Vpid},
+		bash::{
+			CmdTag, EnvView, JobId, Lineage, PgroupSpec, RunId, SigSet, SpawnSpec, StdioSpec, Vpid,
+		},
 		session::{RunOptions, RunStdio, Session, SessionConfig},
 		sys::{NativeSpawner, StdFile, StdFs, proc},
 	};
@@ -561,7 +565,7 @@ mod tests {
 		let (reader, writer) = io::pipe().unwrap();
 		drop(reader);
 		let stdio = RunStdio {
-			stdin: Some(fs::File::open("/dev/null").unwrap()),
+			stdin:  Some(fs::File::open("/dev/null").unwrap()),
 			stdout: Some(fs::File::from(OwnedFd::from(writer))),
 			stderr: Some(fs::File::options().write(true).open("/dev/null").unwrap()),
 		};
@@ -602,20 +606,20 @@ mod tests {
 		let spawner = NativeSpawner::default();
 		let child = spawner
 			.spawn(SpawnSpec {
-				path: b"/bin/sh".as_bstr(),
-				argv: &argv,
-				env: &env,
-				cwd: b"/".as_bstr(),
-				stdio: [StdioSpec::Null, StdioSpec::Inherit(output), StdioSpec::Null],
-				extra_fds: Vec::new(),
-				pgroup: PgroupSpec::New(JobId(1)),
-				tag: CmdTag { run: RunId(1), vpid: Vpid(Vpid::BASE), seq: 1 },
-				vpid: Vpid(Vpid::BASE),
-				umask: spawner.umask().unwrap_or(0o022),
+				path:        b"/bin/sh".as_bstr(),
+				argv:        &argv,
+				env:         &env,
+				cwd:         b"/".as_bstr(),
+				stdio:       [StdioSpec::Null, StdioSpec::Inherit(output), StdioSpec::Null],
+				extra_fds:   Vec::new(),
+				pgroup:      PgroupSpec::New(JobId(1)),
+				tag:         CmdTag { run: RunId(1), vpid: Vpid(Vpid::BASE), seq: 1 },
+				vpid:        Vpid(Vpid::BASE),
+				umask:       spawner.umask().unwrap_or(0o022),
 				sigmask_ign: SigSet::EMPTY,
-				rlimits: &[],
-				lineage: Lineage { label: 0, detached: true },
-				redirs: None,
+				rlimits:     &[],
+				lineage:     Lineage { label: 0, detached: true },
+				redirs:      None,
 			})
 			.unwrap();
 		let pid = child.pid() as i32;

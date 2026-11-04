@@ -248,7 +248,9 @@ impl ExtProc for CountedExt {
 		self.ext.broken_pipe_signal()
 	}
 
-	fn detach(&mut self) { self.ext.detach(); }
+	fn detach(&mut self) {
+		self.ext.detach();
+	}
 
 	fn stop(&mut self) -> io::Result<()> {
 		self.ext.stop()
