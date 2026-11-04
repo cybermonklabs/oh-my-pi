@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed Bash job control waits, saved background exit statuses, pipeline job specifications and process-only `kill` operands ([#17712](https://github.com/can1357/oh-my-pi/pull/17712) by [@sjawhar](https://github.com/sjawhar))
 - Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
 ### Fixed
 

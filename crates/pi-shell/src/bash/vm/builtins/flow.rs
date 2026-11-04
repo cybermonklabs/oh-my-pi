@@ -510,6 +510,12 @@ pub fn zsh_exit(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> Outcome {
 /// the first of them to finish; `-p var` gets the waited pid. With job
 /// control a job that stops ends the wait unless `-f`.
 pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
+	// bash knows of each child's end (`SIGCHLD`) when `wait` looks.
+	if ctx.k.needs_settle(ctx.vp) {
+		return Err(super::Need::Sub(crate::bash::vm::expand::Stop::Wait(
+			crate::bash::event::WaitKey::Settle,
+		)));
+	}
 	let o = match opts(ctx, args, b"fn", b"p", false) {
 		Ok(o) => o,
 		Err(st) => return done(st),
@@ -569,8 +575,28 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				status = 1;
 				break;
 			};
-			let child = ctx.vp.vpid_of(pid);
-			if is_child(ctx, child) {
+			let child = ctx
+				.vp
+				.jobs
+				.iter()
+				.find(|j| {
+					j.stages.as_deref().is_some_and(|stages| {
+						stages
+							.iter()
+							.any(|s| s.vpid.0 == pid || ctx.k.external_pids.get(&s.vpid) == Some(&pid))
+					})
+				})
+				.map_or_else(|| ctx.vp.vpid_of(pid), |j| j.vpid);
+			let own_job = ctx.vp.jobs.by_vpid(child).is_some_and(|j| !j.inherited);
+			if own_job {
+				list.push(child);
+			} else if let Some(saved) = ctx.vp.jobs.saved_status(pid) {
+				// bash `wait_for_single_pid`: a background job it forgot
+				// (reported, waited for, disowned) has its status kept
+				// (`bgp_search`), returned at once: 0 for one that ran when
+				// it was forgotten.
+				status = saved;
+			} else if is_child(ctx, child) {
 				list.push(child);
 			} else {
 				ctx.usage(format!("pid {pid} is not a child of this shell"));
@@ -649,6 +675,10 @@ fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
 	if ctx.vp.jobs.by_vpid(pid).is_some_and(|j| !j.inherited) {
 		return true;
 	}
+	if !matches!(ctx.cx.store.get(Key::Proc(pid)), Ok(Some(Record::Proc { parent: Some(parent), .. })) if *parent == ctx.vp.vpid)
+	{
+		return false;
+	}
 	match ctx.k.proc_state(ctx.cx.store, pid) {
 		Some(crate::bash::vm::ProcState::Exited(_)) => true,
 		Some(crate::bash::vm::ProcState::Running) => ctx.vp.last_bg.is(pid),
@@ -702,9 +732,31 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 /// finish (bash `wait_for_any_job`); a finished child that already left the
 /// job table answers at once. 127 when there is nothing to wait for.
 fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R {
+	if super::jobs::frozen_job(ctx.vp).is_some() {
+		return done(127);
+	}
 	let mut list = Vec::new();
 	if args.is_empty() {
-		list.extend(ctx.vp.jobs.iter().filter(|j| !j.inherited).map(|j| j.vpid));
+		list.extend(
+			ctx.vp
+				.jobs
+				.iter()
+				.filter(|j| {
+					!j.inherited
+						&& !j.foreground
+						&& (j.state == crate::bash::vm::proc::JobState::Running
+							|| (!j.notified
+								&& matches!(j.state, crate::bash::vm::proc::JobState::Done(_))))
+				})
+				.map(|j| j.vpid),
+		);
+		if let Some(last) = ctx.vp.last_bg.vpid()
+			&& ctx.vp.jobs.by_vpid(last).is_none()
+			&& ctx.k.proc_state(ctx.cx.store, last).is_some()
+			&& ctx.vp.jobs.saved_status(ctx.vp.shown_pid(last)).is_none()
+		{
+			list.push(last);
+		}
 	} else {
 		// bash `check_nonjobs`: a pid no longer in the job table whose
 		// status is kept.
@@ -730,7 +782,13 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 					.vp
 					.jobs
 					.by_vpid(p)
-					.filter(|j| !j.inherited)
+					.filter(|j| {
+						!j.inherited
+							&& !j.foreground
+							&& (j.state == crate::bash::vm::proc::JobState::Running
+								|| (!j.notified
+									&& matches!(j.state, crate::bash::vm::proc::JobState::Done(_))))
+					})
 					.map(|j| j.vpid)
 					.or_else(|| {
 						(ctx.vp.last_bg.is(p)
@@ -741,6 +799,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 				None => super::jobs::spec(ctx, a)
 					.ok()
 					.and_then(|n| ctx.vp.jobs.get(n))
+					.filter(|j| !j.foreground)
 					.map(|j| j.vpid),
 			};
 			match found {

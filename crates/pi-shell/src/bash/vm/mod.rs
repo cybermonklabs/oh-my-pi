@@ -57,7 +57,7 @@ use crate::bash::{
 	diag::{Diag, DiagSite, render},
 	engine::Engine,
 	error::{RestoreError, ShellError},
-	event::{AssignScope, Event, EventData, EventMask, Origin, OriginChain, OriginLink},
+	event::{AssignScope, Event, EventData, EventMask, Origin, OriginChain, OriginLink, WaitKey},
 	fd::{FdOrigin, FdRef, FdTable},
 	fs::File,
 	host::{EnvView, Host, StdFd, Verdict},
@@ -428,6 +428,24 @@ pub struct Kernel {
 	pub exec_signals:    HashMap<RunId, i32>,
 	/// Signal death associated with the most recently reported run.
 	pub reported_signal: Option<(RunId, i32)>,
+	/// Native processes stopped under job control, by virtual process.
+	pub stops:           HashMap<Vpid, Signal>,
+	/// Native identities retained while a job's stages remain in its table.
+	pub external_pids:   HashMap<Vpid, u32>,
+	/// Exit observations that precede output drain, for stopped pipelines.
+	pub external_status: HashMap<Vpid, i32>,
+	/// Native signal termination, distinct from an ordinary exit with 128+n.
+	pub signaled:        std::collections::HashSet<Vpid>,
+	/// Pipeline processes started this turn, copied into job tables.
+	pub job_stages:      Vec<(Vpid, Vec<crate::bash::store::JobStage>)>,
+	/// The vproc whose settle park the scheduler just granted.
+	pub settle_done:     Option<Vpid>,
+	/// Jobs disown removed: detach their scheduler parent after this turn.
+	pub detached_jobs:   Vec<Vpid>,
+	/// Native job metadata may have lost its final owner this turn.
+	pub native_dirty:    bool,
+	/// Reused ownership set for pruning native job metadata, not imaged.
+	native_live:         std::collections::HashSet<Vpid>,
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:           Vec<proc::Bang>,
@@ -499,6 +517,15 @@ impl Kernel {
 			exited: None,
 			exec_signals: HashMap::new(),
 			reported_signal: None,
+			stops: HashMap::new(),
+			external_pids: HashMap::new(),
+			external_status: HashMap::new(),
+			signaled: std::collections::HashSet::new(),
+			job_stages: Vec::new(),
+			settle_done: None,
+			detached_jobs: Vec::new(),
+			native_dirty: false,
+			native_live: std::collections::HashSet::new(),
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			deferrals: Vec::new(),
@@ -531,7 +558,7 @@ impl Kernel {
 			return;
 		};
 		let bang = self.bangs.swap_remove(i);
-		if let Some(pid) = os {
+		if let Some(pid) = os.or_else(|| (bang.job != bang.vproc).then_some(bang.vproc.0)) {
 			self.settled.push((bang.job, pid));
 		}
 		self.ctl.notify();
@@ -642,6 +669,22 @@ impl Kernel {
 		let status = self.proc_state(store, vpid)?.exited()?;
 		self.root.write(store, Change::Del(Key::Proc(vpid)));
 		Some(status)
+	}
+
+	/// Bash learns of child ends through SIGCHLD before a job-table read.
+	/// A granted settle is consumed once, so the resumed builtin proceeds.
+	pub fn needs_settle(&mut self, vp: &Vproc) -> bool {
+		if self.settle_done == Some(vp.vpid) {
+			self.settle_done = None;
+			return false;
+		}
+		vp.jobs
+			.iter()
+			.any(|j| !j.inherited && j.state == proc::JobState::Running)
+			|| vp
+				.last_bg
+				.vpid()
+				.is_some_and(|v| vp.jobs.by_vpid(v).is_none())
 	}
 
 	/// The clock for an event now: the last reading while it is still
@@ -1528,6 +1571,7 @@ impl Shell {
 		let start = cx.host.now_ns();
 		let mut ops = 0u32;
 		loop {
+			self.poll_job_stops(cx);
 			if let Some(err) = self.k.root.take_fault() {
 				self.fail_all(cx, &err);
 			}
@@ -1586,6 +1630,19 @@ impl Shell {
 	/// Move children created during the turn into the scheduler and reap
 	/// subshell vprocs that finished.
 	fn adopt(&mut self, cx: &mut Cx<'_>) {
+		for vpid in std::mem::take(&mut self.k.detached_jobs) {
+			if let Some(p) = self.procs.iter_mut().find(|p| p.vpid == vpid) {
+				p.parent = None;
+			}
+			let status = self
+				.k
+				.proc_state(cx.store, vpid)
+				.and_then(ProcState::exited);
+			self
+				.k
+				.root
+				.write(cx.store, Change::Put(Key::Proc(vpid), Record::Proc { parent: None, status }));
+		}
 		for p in &self.k.spawned {
 			let rec = Record::Proc { parent: p.parent, status: None };
 			self
@@ -1612,6 +1669,35 @@ impl Shell {
 				i += 1;
 			}
 		}
+		self.prune_native();
+	}
+
+	/// A completed wait or deleted job no longer retains its native ids.
+	/// Keep stages held by an in-flight foreground pipeline as well as jobs.
+	fn prune_native(&mut self) {
+		if !std::mem::take(&mut self.k.native_dirty) {
+			return;
+		}
+		let live = &mut self.k.native_live;
+		live.clear();
+		for p in &self.procs {
+			live.insert(p.vpid);
+			for job in p.jobs.iter() {
+				live.insert(job.vpid);
+				if let Some(stages) = job.stages.as_deref() {
+					live.extend(stages.iter().map(|s| s.vpid));
+				}
+			}
+			for frame in &p.frames {
+				if let Some(sc) = frame.scratch.as_ref() {
+					live.extend(sc.children.iter().map(|(v, _)| *v));
+				}
+			}
+		}
+		self.k.external_pids.retain(|v, _| live.contains(v));
+		self.k.external_status.retain(|v, _| live.contains(v));
+		self.k.signaled.retain(|v| live.contains(v));
+		self.k.stops.retain(|v, _| live.contains(v));
 	}
 
 	/// Write the OS pids jobs settled on during the turn
@@ -1619,6 +1705,18 @@ impl Shell {
 	/// parent's, a command substitution's copies) and every `$!` naming
 	/// them.
 	fn apply_settled(&mut self) {
+		for (job, stages) in std::mem::take(&mut self.k.job_stages) {
+			for stage in &stages {
+				if let Some(p) = self.procs.iter_mut().find(|p| p.vpid == stage.vpid) {
+					p.parent = Some(job);
+				}
+			}
+			for p in &mut self.procs {
+				if let Some(entry) = p.jobs.by_vpid_mut(job) {
+					entry.stages = Some(Box::new(stages.clone()));
+				}
+			}
+		}
 		for (job, pid) in std::mem::take(&mut self.k.settled) {
 			for p in &mut self.procs {
 				if p.last_bg.is(job) {
@@ -1660,9 +1758,23 @@ impl Shell {
 	/// for it is done (`jobs`, `wait` see it) and a parent trapping
 	/// `SIGCHLD` owes one more run of the trap.
 	fn reaped(&mut self, cx: &mut Cx<'_>, parent: Option<Vpid>, vpid: Vpid, status: i32) {
+		self.k.native_dirty = true;
 		// Its own children are orphans now.
 		if self.k.engine.config().end_orphan_jobs {
 			self.gone.push(vpid);
+		}
+		self.k.stops.remove(&vpid);
+		for p in &mut self.procs {
+			for job in &mut p.jobs.list {
+				if let Some(stage) = job
+					.stages
+					.as_mut()
+					.and_then(|s| s.iter_mut().find(|s| s.vpid == vpid))
+				{
+					stage.status = Some(status);
+					job.notified = false;
+				}
+			}
 		}
 		let Some(i) = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v)) else {
 			return;
@@ -1701,6 +1813,7 @@ impl Shell {
 				(_, proc::JobState::Done(_)) => {},
 				(Some(sig), _) => {
 					job.state = proc::JobState::Stopped(sig);
+					job.foreground = false;
 					job.notified = false;
 					p.jobs.set_current(number);
 				},
@@ -1715,9 +1828,113 @@ impl Shell {
 		}
 	}
 
+	/// Observe host stops even while the vproc is blocked on its external.
+	/// Bash `waitchld` sets a job stopped only after all live stages stop.
+	fn poll_job_stops(&mut self, cx: &mut Cx<'_>) {
+		let monitor = self.procs.iter().any(|p| {
+			!p.jobs.subshell
+				&& state::option(&mut self.k.root, cx.store, p, OptId::Monitor).unwrap_or(false)
+		});
+		if !monitor {
+			return;
+		}
+		let mut changed = false;
+		let mut tcx = std::task::Context::from_waker(&self.k.waker);
+		for p in &mut self.procs {
+			for frame in &mut p.frames {
+				if let Some(Live::Ext(ext)) = frame.scratch.as_mut().map(|sc| &mut sc.live) {
+					self.k.external_pids.insert(p.vpid, ext.pid());
+					let stop = ext.poll_stopped(&mut tcx);
+					if let Some(status) = ext.exit_status() {
+						let status = match status {
+							crate::bash::ExitStatus::Exited(n) => n,
+							crate::bash::ExitStatus::Signaled(sig) => {
+								self.k.signaled.insert(p.vpid);
+								sig.exit_status(self.k.engine.config().platform)
+							},
+							crate::bash::ExitStatus::SignaledRaw(n) => {
+								self.k.signaled.insert(p.vpid);
+								128 + n
+							},
+						};
+						changed |= self.k.external_status.insert(p.vpid, status) != Some(status);
+					}
+					let old = match stop {
+						Some(sig) => self.k.stops.insert(p.vpid, sig),
+						None => self.k.stops.remove(&p.vpid),
+					};
+					changed |= old != stop;
+				}
+			}
+		}
+		if !changed && self.k.stops.is_empty() {
+			return;
+		}
+		for p in &mut self.procs {
+			let mut current = None;
+			let mut continued = false;
+			for job in &mut p.jobs.list {
+				if let Some(stages) = job.stages.as_mut() {
+					for stage in stages.iter_mut() {
+						if let Some(&status) = self.k.external_status.get(&stage.vpid) {
+							stage.status = Some(status);
+						}
+					}
+				}
+				let stopped = if let Some(stages) = job.stages.as_deref() {
+					if stages
+						.iter()
+						.any(|s| s.status.is_none() && !self.k.stops.contains_key(&s.vpid))
+					{
+						None
+					} else {
+						stages
+							.iter()
+							.find_map(|s| self.k.stops.get(&s.vpid).copied())
+					}
+				} else {
+					self.k.stops.get(&job.vpid).copied()
+				};
+				if let Some(sig) = stopped {
+					if job.state != proc::JobState::Stopped(sig) {
+						job.state = proc::JobState::Stopped(sig);
+						job.foreground = false;
+						job.notified = false;
+						current = Some(job.number);
+						changed = true;
+					}
+				} else if matches!(job.state, proc::JobState::Stopped(_)) {
+					job.state = proc::JobState::Running;
+					job.notified = false;
+					continued = true;
+				}
+			}
+			if let Some(number) = current {
+				p.jobs.set_current(number);
+			} else if continued {
+				p.jobs.reset_current();
+			}
+		}
+		if changed {
+			self.k.ctl.notify();
+		}
+	}
+
 	/// Next vproc to run, round-robin: has work, not stopped, not parked at
 	/// the current wake count.
-	fn pick(&self, wakes: u64) -> Option<usize> {
+	fn pick(&mut self, wakes: u64) -> Option<usize> {
+		if let Some(i) = self
+			.procs
+			.iter()
+			.position(|p| p.blocked.as_ref().is_some_and(|b| b.key == WaitKey::Settle))
+			&& !self.settle_pending(wakes)
+		{
+			self.k.settle_done = Some(self.procs[i].vpid);
+			if let Some(b) = self.procs[i].blocked.as_mut() {
+				b.at = wakes.wrapping_sub(1);
+			}
+			return Some(i);
+		}
 		let n = self.procs.len();
 		(0..n)
 			.map(|off| (self.rr + off) % n)
@@ -1728,7 +1945,27 @@ impl Shell {
 	/// has not come.
 	fn runnable(&self, i: usize, wakes: u64) -> bool {
 		let p = &self.procs[i];
-		p.has_work() && !p.stopped && p.blocked.as_ref().is_none_or(|b| b.at != wakes)
+		p.has_work()
+			&& !p.stopped
+			&& p
+				.blocked
+				.as_ref()
+				.is_none_or(|b| b.at != wakes && b.key != WaitKey::Settle)
+	}
+
+	/// Let woken child waits consume their native result before granting a
+	/// settle; do not wait for a child that is still executing shell code.
+	fn settle_pending(&self, wakes: u64) -> bool {
+		self.procs.iter().any(|p| {
+			let Some(b) = p.blocked.as_ref() else { return false; };
+			match b.key {
+				WaitKey::Ext { .. } => b.at != wakes || (p.frames.iter().any(|f|
+					matches!(f.scratch.as_ref().map(|s| &s.live), Some(Live::Ext(ext)) if ext.exit_status().is_some()))
+					&& !self.k.external_status.contains_key(&p.vpid)),
+				WaitKey::Task(_) | WaitKey::Proc(_) => b.at != wakes,
+				_ => false,
+			}
+		})
 	}
 
 	/// A finished script or an outgoing callout, if any.
@@ -1988,7 +2225,7 @@ impl Shell {
 			let terminating = trap.is_none() && sig.default_action() == DefaultAction::Terminate;
 			// A signal to the shell PID does not also target its foreground child.
 			// A terminating child is signaled once by `kill`, not here and there.
-			if target != SigTarget::Vpid(root.0) && !terminating {
+			if target != SigTarget::Vpid(root.0) && !terminating && trap.is_none() {
 				for frame in &mut self.procs[i].frames {
 					if let Some(sc) = frame.scratch.as_mut() {
 						match &mut sc.live {

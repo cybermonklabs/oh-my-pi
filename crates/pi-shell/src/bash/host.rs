@@ -523,6 +523,16 @@ pub trait ExtProc: Send {
 	/// child's end of file into its [`FdRef`]: the engine reads a command
 	/// substitution's capture as soon as the exit is observed.
 	fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<ExitStatus>;
+	/// Observe job-control stops and continuations, registering the waker
+	/// for the next change. Hosts without job control report running.
+	fn poll_stopped(&mut self, _cx: &mut Context<'_>) -> Option<Signal> {
+		None
+	}
+	/// The native wait status before output drain completes. Job control
+	/// uses it to distinguish an exited stage from a still-running stage.
+	fn exit_status(&self) -> Option<ExitStatus> {
+		None
+	}
 	/// Signal the process group (Unix) or Job Object (Windows).
 	fn signal(&mut self, sig: Signal) -> io::Result<()>;
 	/// Stop the process group (job pause).

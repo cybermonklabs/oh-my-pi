@@ -112,7 +112,7 @@ fn watch(pid: i32, tracker: Arc<Tracker>) -> io::Result<()> {
 /// without work.
 fn waiter(mb: &Arc<Mailbox>) {
 	while let Some((pid, tracker)) = next_wait(mb) {
-		let status = wait_exit(pid);
+		let status = wait_exit(pid, &tracker);
 		if tracker.exited(status) {
 			reap(pid);
 		}
@@ -1115,19 +1115,20 @@ mod posix {
 	}
 }
 
-/// Block until `pid` exits and return its status, leaving it unreaped.
-///
-/// macOS `waitid(WEXITED)` also reports stops (`CLD_STOPPED`, measured:
-/// `si_status` 17 after `SIGSTOP`), and with `WNOWAIT` the report would
-/// repeat; such a report is consumed with a non-reaping
-/// `waitid(WSTOPPED | WCONTINUED | WNOHANG)` and the wait goes on.
-fn wait_exit(pid: i32) -> ExitStatus {
+/// Block until `pid` exits, leaving it unreaped. Stops and continuations
+/// update the job-control observer without consuming an exit (`waitchld`).
+fn wait_exit(pid: i32, tracker: &Tracker) -> ExitStatus {
 	loop {
 		// SAFETY: siginfo_t is plain data, valid zeroed.
 		let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
 		// SAFETY: `info` is writable; WNOWAIT leaves the child waitable.
 		let rc = unsafe {
-			libc::waitid(libc::P_PID, pid as libc::id_t, &raw mut info, libc::WEXITED | libc::WNOWAIT)
+			libc::waitid(
+				libc::P_PID,
+				pid as libc::id_t,
+				&raw mut info,
+				libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED | libc::WNOWAIT,
+			)
 		};
 		if rc == 0 {
 			// SAFETY: waitid filled `info` for a CLD_* event.
@@ -1136,20 +1137,9 @@ fn wait_exit(pid: i32) -> ExitStatus {
 				libc::CLD_EXITED => return ExitStatus::Exited(status),
 				libc::CLD_KILLED | libc::CLD_DUMPED => return signaled(status),
 				_ => {
-					// SAFETY: as above; without WEXITED this never reaps.
-					let mut seen: libc::siginfo_t = unsafe { std::mem::zeroed() };
-					// SAFETY: `seen` is writable.
-					let rc = unsafe {
-						libc::waitid(
-							libc::P_PID,
-							pid as libc::id_t,
-							&raw mut seen,
-							libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG,
-						)
-					};
-					// SAFETY: `seen` was zeroed and possibly filled by waitid.
-					if rc != 0 || unsafe { seen.si_pid() } == 0 {
-						// Nothing consumed: do not spin on a report that stays.
+					// Consume before waking the shell: otherwise a CONT and a
+					// second STOP can replace the event before we consume it.
+					if !tracker.observe_stopped(|| stop_event(pid, false)) {
 						thread::sleep(std::time::Duration::from_millis(10));
 					}
 					continue;
@@ -1162,6 +1152,29 @@ fn wait_exit(pid: i32) -> ExitStatus {
 			return ExitStatus::Exited(127);
 		}
 	}
+}
+
+/// Peek at or consume one stop/continuation, never an exit. The peek lets
+/// a job-table read observe a stop before the waiter thread is scheduled.
+fn stop_event(pid: i32, peek: bool) -> Option<Option<Signal>> {
+	// SAFETY: siginfo_t is plain data; waitid writes to it below.
+	let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+	let flags =
+		libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG | if peek { libc::WNOWAIT } else { 0 };
+	// SAFETY: info is writable; without WEXITED this cannot reap a child.
+	let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &raw mut info, flags) };
+	// SAFETY: info is zeroed or filled by waitid.
+	if rc != 0 || unsafe { info.si_pid() } == 0 {
+		return None;
+	}
+	Some(if info.si_code == libc::CLD_STOPPED {
+		// SAFETY: waitid filled a stop event.
+		u8::try_from(unsafe { info.si_status() })
+			.ok()
+			.and_then(|n| Signal::from_number(n, Platform::current()))
+	} else {
+		None
+	})
 }
 
 /// A pidfd of child `pid` (close-on-exec; readable once it exited); `None`
@@ -1276,7 +1289,7 @@ impl UnixProc {
 	fn unpark(&mut self) {
 		crate::sys::park::exits::forget(self.pid);
 		if self.pidfd.take().is_some() && watch(self.pid, Arc::clone(&self.tracker)).is_err() {
-			let status = wait_exit(self.pid);
+			let status = wait_exit(self.pid, &self.tracker);
 			if self.tracker.exited(status) {
 				reap(self.pid);
 			}
@@ -1298,7 +1311,25 @@ impl ExtProc for UnixProc {
 		self.tracker.poll(cx)
 	}
 
+	fn poll_stopped(&mut self, cx: &mut Context<'_>) -> Option<Signal> {
+		let _ = self.tracker.poll_stopped(cx);
+		// pidfds report exits only; a job-control observer needs waitid's
+		// WSTOPPED/WCONTINUED events as well.
+		#[cfg(target_os = "linux")]
+		self.unpark();
+		stop_event(self.pid, true).unwrap_or_else(|| self.tracker.poll_stopped(cx))
+	}
+
+	fn exit_status(&self) -> Option<ExitStatus> {
+		#[cfg(target_os = "linux")]
+		self.exited_now();
+		self.tracker.exit_status()
+	}
+
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
+		if sig == Signal::Cont {
+			self.tracker.set_stopped(None);
+		}
 		self.tracker.lock().signalled(sig);
 		self.scope.signal(sig)
 	}
@@ -1308,6 +1339,7 @@ impl ExtProc for UnixProc {
 	}
 
 	fn cont(&mut self) -> io::Result<()> {
+		self.tracker.set_stopped(None);
 		self.scope.signal(Signal::Cont)
 	}
 }

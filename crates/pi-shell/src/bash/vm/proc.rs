@@ -277,7 +277,18 @@ pub struct JobTable {
 	/// it without job control and with an empty job table. A command
 	/// substitution keeps both (it lists its parent's jobs).
 	pub subshell: bool,
+	/// The statuses of background jobs this shell forgot, by the pid `$!`
+	/// named (bash `bgpids`, filled by `delete_job`): `wait PID` returns the
+	/// status of such a job, 0 for one forgotten while it ran (`disown`).
+	/// Oldest first, at most [`SAVED_MAX`].
+	#[serde(default)]
+	pub saved:    Option<Box<Vec<(u32, i32)>>>,
 }
+
+/// How many forgotten jobs' statuses a shell keeps for `wait PID` (bash
+/// keeps `js.c_childmax` of them, the process limit `CHILD_MAX`; the
+/// smallest value POSIX allows is 25, Linux gives the `RLIMIT_NPROC`).
+pub const SAVED_MAX: usize = 1024;
 
 /// What a job spec names (bash `get_job_spec`), without its `%`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,21 +356,25 @@ impl JobTable {
 			text,
 			state: JobState::Running,
 			control,
+			foreground: false,
 			notified: false,
 			nohup: false,
 			inherited: false,
 			wd,
+			stages: None,
 			os_pid: None,
 		});
 		self.reset_current();
 		number
 	}
 
-	/// Remove job `number` (bash `delete_job`); a removed current or
-	/// previous job makes `reset_current` pick new ones.
+	/// Remove job `number` (bash `delete_job`), keeping its status for
+	/// `wait PID` ([`Self::saved`]); a removed current or previous job makes
+	/// `reset_current` pick new ones.
 	pub fn remove(&mut self, number: u32) -> Option<Job> {
 		let i = self.list.iter().position(|j| j.number == number)?;
 		let job = self.list.remove(i);
+		self.save(&job);
 		if self.current == Some(number) || self.previous == Some(number) {
 			self.reset_current();
 		}
@@ -370,14 +385,55 @@ impl JobTable {
 	pub fn remove_where(&mut self, mut pick: impl FnMut(&Job) -> bool) {
 		let mut reset = false;
 		let (current, previous) = (self.current, self.previous);
+		let mut gone_jobs = Vec::new();
 		self.list.retain(|j| {
 			let gone = pick(j);
 			reset |= gone && (current == Some(j.number) || previous == Some(j.number));
+			if gone && !j.inherited {
+				gone_jobs.push((j.pid(), j.state));
+			}
 			!gone
 		});
+		for (pid, state) in gone_jobs {
+			self.save_status(pid, state);
+		}
 		if reset {
 			self.reset_current();
 		}
+	}
+
+	/// Keep the status of `job`, being forgotten (bash `delete_job` adds the
+	/// last process of a background job to `bgpids`). A copy listed in a
+	/// command substitution is not this shell's child.
+	fn save(&mut self, job: &Job) {
+		if !job.inherited {
+			self.save_status(job.pid(), job.state);
+		}
+	}
+
+	fn save_status(&mut self, pid: u32, state: JobState) {
+		// bash `process_exit_status`: 0 for a process still running.
+		let status = match state {
+			JobState::Done(status) => status,
+			JobState::Running | JobState::Stopped(_) => 0,
+		};
+		let saved = self.saved.get_or_insert_with(Box::default);
+		saved.retain(|&(p, _)| p != pid);
+		if saved.len() >= SAVED_MAX {
+			saved.remove(0);
+		}
+		saved.push((pid, status));
+	}
+
+	/// The status of a forgotten job `$!` named `pid` (bash `bgp_search`).
+	pub fn saved_status(&self, pid: u32) -> Option<i32> {
+		self
+			.saved
+			.as_deref()?
+			.iter()
+			.rev()
+			.find(|&&(p, _)| p == pid)
+			.map(|&(_, s)| s)
 	}
 
 	fn state(&self, number: Option<u32>) -> Option<JobState> {
@@ -475,16 +531,29 @@ impl JobTable {
 		};
 		let mut found = JobLookup::None;
 		for job in self.list.iter().rev() {
-			let hit = if substring {
-				name.is_empty()
-					|| job
-						.text
-						.windows(name.len())
-						.any(|w| w.eq_ignore_ascii_case(name))
-			} else {
-				job.text.starts_with(name)
+			let matches = |text: &[u8]| {
+				if substring {
+					name.is_empty()
+						|| text
+							.windows(name.len())
+							.any(|w| w.eq_ignore_ascii_case(name))
+				} else {
+					text.starts_with(name)
+				}
 			};
-			if hit {
+			if let Some(stages) = job.stages.as_deref() {
+				for (i, stage) in stages.iter().enumerate() {
+					if matches(&stage.text) {
+						// Bash 5.3 `get_job_by_name` advances p only on a
+						// non-match: a match after the first process repeats.
+						if found != JobLookup::None || i != 0 {
+							return JobLookup::Ambiguous;
+						}
+						found = JobLookup::Job(job.number);
+						break;
+					}
+				}
+			} else if matches(&job.text) {
 				if found != JobLookup::None {
 					return JobLookup::Ambiguous;
 				}
@@ -641,6 +710,9 @@ pub enum BangStage {
 	/// `nohup`); unless it does, the alias settles virtual when the host
 	/// steps the shell again.
 	Callout,
+	/// The job's body is one pipeline: bash forks each stage itself, so `$!`
+	/// is the last stage's pid, settled when the stages start.
+	Pipeline,
 }
 
 /// A running coprocess: its vproc, the variable naming it and the shell's
@@ -754,6 +826,9 @@ pub enum FrameKind {
 	/// The last stage of a pipeline run in the current shell (`lastpipe`):
 	/// `SubExit` pops, and the `Spawn` op collects its status.
 	Stage,
+	/// A foreground command detached after stopping. Its continuation ends
+	/// before `end`, where the submitting shell resumes.
+	StoppedJob { end: u32 },
 }
 
 /// Parser state a [`FrameKind::Script`] keeps between its commands.
@@ -1155,10 +1230,11 @@ impl ScratchZsh {
 /// Progress of a pipeline's last stage run in the current shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InlineStage {
-	/// Its frame is running above the `Spawn` op's.
-	Running,
-	/// It finished with this status.
-	Done(i32),
+	/// Its frame is running above `Spawn`; the Bash pipeline job number,
+	/// or zero for zsh (which exposes no such job).
+	Running(u32),
+	/// It finished with this status, retaining that pipeline job number.
+	Done(i32, u32),
 }
 
 /// Which replay log of a [`Scratch`] an expansion uses.
@@ -1446,6 +1522,8 @@ pub enum Awaited {
 	AllJobs,
 	/// The first of the children to finish (`wait -n`); its status.
 	AnyJob,
+	/// A foreground external stopped: finish without replacing PIPESTATUS.
+	Stopped,
 }
 
 /// Transient handles; never serialized.
@@ -1508,9 +1586,9 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both.
-const _: () = assert!(size_of::<Vproc>() <= 664, "Vproc grew (idle vproc ≤ 2 KiB)");
+const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
+const _: () = assert!(size_of::<Scratch>() <= 224, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one

@@ -43,6 +43,7 @@ use bstr::{BStr, BString};
 
 pub use self::{
 	io::select_next,
+	jobs::frozen_job,
 	names::{Aliases, alias_table, flush_hash, legal_alias_name},
 	test::cond_test,
 	trap::hard_ignore,

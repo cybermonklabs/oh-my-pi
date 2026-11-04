@@ -217,16 +217,18 @@ impl Lifecycle {
 /// (whose `poll_wait` polls the pumps) and its waiter.
 #[derive(Debug)]
 pub struct Tracker {
-	life:   Mutex<Lifecycle>,
-	cancel: AtomicBool,
+	life:    Mutex<Lifecycle>,
+	cancel:  AtomicBool,
+	stopped: Mutex<(Option<Signal>, Option<Waker>)>,
 }
 
 impl Tracker {
 	/// Tracker of a process with `draining` output pumps.
 	pub fn new(draining: usize) -> Arc<Self> {
 		Arc::new(Self {
-			life:   Mutex::new(Lifecycle::new(draining)),
-			cancel: AtomicBool::new(false),
+			life:    Mutex::new(Lifecycle::new(draining)),
+			cancel:  AtomicBool::new(false),
+			stopped: Mutex::new((None, None)),
 		})
 	}
 
@@ -242,12 +244,49 @@ impl Tracker {
 		self.life.lock().poll(cx)
 	}
 
+	/// Native exit observation, independent of pending output pumps.
+	pub fn exit_status(&self) -> Option<ExitStatus> {
+		self.life.lock().status
+	}
+
+	/// Register the job-control observer before reading the current stop.
+	pub fn poll_stopped(&self, cx: &Context<'_>) -> Option<Signal> {
+		let mut stopped = self.stopped.lock();
+		if stopped.1.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
+			stopped.1 = Some(cx.waker().clone());
+		}
+		stopped.0
+	}
+
+	/// A non-reaping wait observed a stop or continuation (bash `waitchld`).
+	pub fn set_stopped(&self, signal: Option<Signal>) {
+		self.observe_stopped(|| Some(signal));
+	}
+
+	/// Consume and publish a native stop event under one lock. A concurrent
+	/// peek must not see an event consumed before its state is published.
+	pub fn observe_stopped(&self, observe: impl FnOnce() -> Option<Option<Signal>>) -> bool {
+		let wake = {
+			let mut stopped = self.stopped.lock();
+			let Some(signal) = observe() else {
+				return false;
+			};
+			stopped.0 = signal;
+			stopped.1.clone()
+		};
+		if let Some(wake) = wake {
+			wake.wake();
+		}
+		true
+	}
+
 	/// [`Lifecycle::exited`], waking the poller; returns whether to reap.
 	/// Input pumps stop: nothing reads the child's stdin any more (a
 	/// grandchild still reading it loses the rest, by design).
 	pub fn exited(&self, status: ExitStatus) -> bool {
 		self.cancel_pumps();
 		let (waker, reap) = self.life.lock().exited(status);
+		self.set_stopped(None);
 		if let Some(w) = waker {
 			w.wake();
 		}

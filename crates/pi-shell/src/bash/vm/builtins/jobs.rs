@@ -113,14 +113,40 @@ struct Show<'h> {
 	platform: Platform,
 }
 
+/// Bash `jobs_list_frozen`: while lastpipe runs its inline stage, cleanup
+/// is deferred and the foreground pipeline itself is not listed.
+pub fn frozen_job(vp: &crate::bash::vm::proc::Vproc) -> Option<u32> {
+	vp.frames
+		.iter()
+		.rev()
+		.find_map(|frame| match frame.scratch.as_ref()?.inline {
+			Some(crate::bash::vm::proc::InlineStage::Running(number)) if number != 0 => Some(number),
+			_ => None,
+		})
+}
+
 /// One `jobs` line for job `number` (bash `pretty_print_job`), marking the
 /// job reported (`-p` does not).
 fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
+	if frozen_job(ctx.vp) == Some(number) {
+		return;
+	}
 	let Some(job) = ctx.vp.jobs.get(number) else {
 		return;
 	};
 	if form == Form::Pids {
-		let line = format!("{}\n", job.pid());
+		let pid = job
+			.stages
+			.as_deref()
+			.and_then(|s| s.first())
+			.map_or(job.pid(), |s| {
+				ctx.k
+					.external_pids
+					.get(&s.vpid)
+					.copied()
+					.unwrap_or(s.vpid.0)
+			});
+		let line = format!("{pid}\n");
 		ctx.out(line.as_bytes());
 		return;
 	}
@@ -166,14 +192,30 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 /// Forget finished jobs whose state was reported (bash
 /// `cleanup_dead_jobs`).
 fn cleanup(ctx: &mut Ctx<'_, '_>) {
+	if frozen_job(ctx.vp).is_some() {
+		return;
+	}
+	let before = ctx.vp.jobs.len();
+	for job in ctx
+		.vp
+		.jobs
+		.iter()
+		.filter(|j| j.notified && matches!(j.state, JobState::Done(_)))
+	{
+		ctx.k.proc_collect(ctx.cx.store, job.vpid);
+	}
 	ctx.vp
 		.jobs
 		.remove_where(|j| j.notified && matches!(j.state, JobState::Done(_)));
+	ctx.k.native_dirty |= before != ctx.vp.jobs.len();
 }
 
 /// `jobs [-lnprs] [jobspec …]`, `jobs -x command [args]`: list jobs as
 /// `[N]±  Status  command`; finished jobs are listed once, then forgotten.
 pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
+	if ctx.k.needs_settle(ctx.vp) {
+		return Err(Need::Sub(Stop::Wait(WaitKey::Settle)));
+	}
 	let o = match opts(ctx, args, b"lpnxrs", b"", false) {
 		Ok(o) => o,
 		Err(st) => return done(st),
@@ -435,6 +477,7 @@ fn foreground(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> R {
 	resume(ctx, number);
 	if let Some(job) = ctx.vp.jobs.get_mut(number) {
 		job.notified = true;
+		job.foreground = true;
 	}
 	let wait = Wait {
 		children: vec![vpid],
@@ -482,6 +525,7 @@ fn background(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> i32 {
 	resume(ctx, number);
 	if let Some(job) = ctx.vp.jobs.get_mut(number) {
 		job.notified = true;
+		job.foreground = false;
 	}
 	ctx.vp.jobs.reset_current();
 	0
@@ -506,7 +550,13 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			.map(|j| j.number)
 			.collect();
 		for number in picked {
+			let pid = ctx.vp.jobs.get(number).map(Job::pid);
 			drop_job(ctx, number, nohup);
+			// Bash `delete_all_jobs` uses DEL_NOBGPID. A bulk disown
+			// forgets pid statuses, unlike disown of individual operands.
+			if !nohup && let (Some(pid), Some(saved)) = (pid, ctx.vp.jobs.saved.as_mut()) {
+				saved.retain(|&(p, _)| p != pid);
+			}
 		}
 		return done(0);
 	}
@@ -532,11 +582,12 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				.filter(|&n| ctx.vp.jobs.get(n).is_some())
 				.ok_or(Bad::Missing),
 		};
-		if let Ok(number) = found {
-			drop_job(ctx, number, nohup);
-		} else {
-			no_such_job(ctx, word.map_or(&b"current"[..], |w| w.as_slice()));
-			status = 1;
+		match found {
+			Ok(number) => drop_job(ctx, number, nohup),
+			Err(Bad::Missing | Bad::Ambiguous) => {
+				no_such_job(ctx, word.map_or(&b"current"[..], |w| w.as_slice()));
+				status = 1;
+			},
 		}
 	}
 	done(status)
@@ -551,14 +602,17 @@ fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool) {
 		}
 		return;
 	}
-	if let Some(job) = ctx.vp.jobs.remove(number)
-		&& matches!(job.state, JobState::Stopped(_))
-		&& !ctx.vp.jobs.subshell
-	{
-		ctx.diag(Diag::Warning {
-			msg: format!("warning: deleting stopped job {number} with process group {}", job.pid())
-				.into(),
-		});
+	if let Some(job) = ctx.vp.jobs.remove(number) {
+		ctx.k.native_dirty = true;
+		if !job.inherited {
+			ctx.k.detached_jobs.push(job.vpid);
+		}
+		if matches!(job.state, JobState::Stopped(_)) && !ctx.vp.jobs.subshell {
+			ctx.diag(Diag::Warning {
+				msg: format!("warning: deleting stopped job {number} with process group {}", job.pid())
+					.into(),
+			});
+		}
 	}
 }
 

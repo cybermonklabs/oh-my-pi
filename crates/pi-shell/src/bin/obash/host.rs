@@ -405,6 +405,14 @@ impl ExtProc for SignalsOnExit {
 		Poll::Ready(status)
 	}
 
+	fn poll_stopped(&mut self, cx: &mut Context<'_>) -> Option<pi_shell::bash::Signal> {
+		self.child.poll_stopped(cx)
+	}
+
+	fn exit_status(&self) -> Option<ExitStatus> {
+		self.child.exit_status()
+	}
+
 	fn signal(&mut self, sig: pi_shell::bash::Signal) -> io::Result<()> {
 		self.child.signal(sig)
 	}

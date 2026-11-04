@@ -15,9 +15,9 @@ use super::{
 	expand::{Expander, Stop},
 	is_ident, probe,
 	proc::{
-		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, JobState,
+		LastBg, LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run,
+		Saved, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -120,6 +120,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			}
 			continue;
 		};
+		if matches!(top.kind, FrameKind::StoppedJob { end } if top.pc == end) {
+			unwind(&mut k.root, cx.store, vp, 0);
+			continue;
+		}
 		if top.unit.is_none() {
 			// Reading and parsing the next command take time.
 			k.clock_stale();
@@ -734,6 +738,23 @@ fn features(
 /// frame at end of input. A script read from stdin first reads lines until
 /// the command is complete; `Some` is the wait key while fd 0 has none.
 fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitKey> {
+	// Bash `read_command` cleans up jobs reported on the preceding input
+	// line. A compound command is parsed whole, so its inner newlines do
+	// not create extra cleanup points.
+	if matches!(vp.frames.last().map(|f| &f.kind), Some(FrameKind::Script { pos: (offset, _), .. }) if *offset != 0)
+	{
+		let before = vp.jobs.len();
+		for job in vp
+			.jobs
+			.iter()
+			.filter(|j| j.notified && matches!(j.state, JobState::Done(_)))
+		{
+			k.proc_collect(cx.store, job.vpid);
+		}
+		vp.jobs
+			.remove_where(|j| j.notified && matches!(j.state, JobState::Done(_)));
+		k.native_dirty |= before != vp.jobs.len();
+	}
 	// zsh `parse_string`: a string (`eval`, a trap, `-c`) parses whole
 	// before it runs; its first command takes the snapshot the rest reuse.
 	let (snapped, snapshot) = match vp.frames.last().map(|f| &f.kind) {
@@ -1057,7 +1078,7 @@ fn end_unit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 			}
 		},
 		FrameKind::NoFork | FrameKind::Stage => pop_frame(&mut k.root, cx.store, vp),
-		FrameKind::Subshell => {
+		FrameKind::Subshell | FrameKind::StoppedJob { .. } => {
 			unwind(&mut k.root, cx.store, vp, 0);
 			start_trap(k, vp, cx, TrapKey::Exit);
 		},
@@ -2973,6 +2994,16 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	if code(entry) == Some(Opcode::Exec) && code(entry + 1) == Some(Opcode::SubExit) {
 		return Some(BangStage::Lone);
 	}
+	if let Some(op) = unit
+		.ops
+		.get(entry as usize)
+		.filter(|op| op.code == Opcode::Spawn)
+		&& let Some(spawn) = unit.spawns.get(op.a as usize)
+		&& spawn.kind == SpawnKind::Pipeline
+		&& code(spawn.end) == Some(Opcode::SubExit)
+	{
+		return Some(BangStage::Pipeline);
+	}
 	let group = [Opcode::Enter, Opcode::Exec, Opcode::Leave, Opcode::SubExit]
 		.iter()
 		.zip(entry..)
@@ -3009,9 +3040,13 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		.as_ref()
 		.is_some_and(|s| !s.children.is_empty());
 	if !started {
-		// A job that forks (a subshell, pipeline, job or coprocess of its
-		// own) is not just one program: it keeps its virtual pid.
-		if !k.bangs.is_empty() {
+		// A job that is one pipeline settles on its last stage below.
+		let pipeline_bang = info.kind == SpawnKind::Pipeline
+			&& k
+				.bangs
+				.iter()
+				.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline);
+		if !k.bangs.is_empty() && !pipeline_bang {
 			k.settle_bang(vp.vpid, None);
 		}
 		let mut children = Vec::with_capacity(info.stages.len());
@@ -3083,13 +3118,28 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					|| (state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
 						&& !job_control(k, cx, vp));
 				let mut stdin = vp.fds.get(0).cloned();
+				if lastpipe && pipeline_bang {
+					k.settle_bang(vp.vpid, None);
+				}
 				for (i, stage) in info.stages.iter().enumerate() {
 					if lastpipe && i + 1 == n {
 						k.emit_op(cx, vp, op.node, EventData::Pipeline { stages: &children });
+						let number = if unit.mode.dialect() == Dialect::Bash {
+							let id = k.job_id(cx.store);
+							let vpid = k.vpid(cx.store);
+							k.proc_exited(cx.store, vpid, Some(vp.vpid), 0);
+							let text = job_text(k, cx, vp, unit, op.node);
+							let number = vp.jobs.add(id, vpid, text, false, vp.cwd.clone());
+							vp.jobs.get_mut(number).expect("added").state = JobState::Done(0);
+							vp.jobs.get_mut(number).expect("added").foreground = true;
+							number
+						} else {
+							0
+						};
 						let line_shift = top_frame(vp).line_shift;
 						let sc = scratch(vp);
 						sc.children = children.into_iter().map(|v| (v, None)).collect();
-						sc.inline = Some(InlineStage::Running);
+						sc.inline = Some(InlineStage::Running(number));
 						let mut frame = Frame::new(Some(Arc::clone(unit)), stage.entry, FrameKind::Stage);
 						frame.line_shift = line_shift;
 						let prev = vp.fds.get(0).cloned();
@@ -3129,15 +3179,22 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					k.spawned.push(Box::new(child));
 				}
 				k.emit_op(cx, vp, op.node, EventData::Pipeline { stages: &children });
+				if pipeline_bang && let Some(&last) = children.last() {
+					let stages = pipeline_stages(unit, info, &children);
+					k.job_stages.push((vp.vpid, stages));
+					k.bangs.retain(|b| b.vproc != vp.vpid);
+					k.bangs
+						.push(Bang { vproc: last, job: vp.vpid, stage: BangStage::Lone });
+				}
 			},
 		}
 		scratch(vp).children = children.into_iter().map(|v| (v, None)).collect();
 	}
 	let status = vp.status;
 	let sc = scratch(vp);
-	if sc.inline == Some(InlineStage::Running) {
+	if let Some(InlineStage::Running(number)) = sc.inline {
 		// Back from the last stage's frame.
-		sc.inline = Some(InlineStage::Done(status));
+		sc.inline = Some(InlineStage::Done(status, number));
 	}
 	for (vpid, status) in &mut sc.children {
 		if status.is_none() {
@@ -3145,12 +3202,38 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		}
 	}
 	if let Some((vpid, _)) = sc.children.iter().find(|(_, s)| s.is_none()) {
-		return Flow::Block(WaitKey::Proc(*vpid));
+		let waiting = *vpid;
+		if job_control(k, cx, vp) {
+			let sc = scratch(vp);
+			let all_stopped = sc.children.iter().all(|(v, s)| {
+				s.is_some() || k.external_status.contains_key(v) || k.stops.contains_key(v)
+			}) && sc.children.iter().any(|(v, _)| k.stops.contains_key(v));
+			if all_stopped {
+				let children: Vec<_> = sc.children.iter().map(|(v, _)| *v).collect();
+				let mut stages = pipeline_stages(unit, info, &children);
+				for (stage, (v, status)) in stages.iter_mut().zip(&sc.children) {
+					stage.status = status.or_else(|| k.external_status.get(v).copied());
+				}
+				let signal = stages
+					.iter()
+					.find_map(|s| k.stops.get(&s.vpid).copied())
+					.expect("stopped child");
+				let status = stopped_status(k, &stages);
+				detach_stopped(k, vp, cx, op, info.end, signal, Some(stages));
+				vp.status = status;
+				return Flow::Jump(info.end);
+			}
+		}
+		return Flow::Block(WaitKey::Proc(waiting));
 	}
 	let mut statuses: Vec<i32> = sc.children.iter().map(|(_, s)| s.unwrap_or(0)).collect();
-	if let Some(InlineStage::Done(last)) = sc.inline {
+	if let Some(InlineStage::Done(last, _)) = sc.inline {
 		statuses.push(last);
 	}
+	let lastpipe_job = match sc.inline {
+		Some(InlineStage::Done(_, n)) => n,
+		_ => 0,
+	};
 	clear_scratch(&mut k.root, cx.store, vp);
 	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false);
 	vp.status = if pipefail {
@@ -3164,7 +3247,86 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		statuses.last().copied().unwrap_or(0)
 	};
 	vp.pipestatus = statuses;
+	if let Some(job) = vp.jobs.get_mut(lastpipe_job) {
+		job.state = JobState::Done(vp.status);
+	}
+	k.native_dirty = true;
 	Flow::Jump(info.end)
+}
+
+/// Bash `wait_for` uses WSTOPSIG of the first process, even when it exited.
+pub fn stopped_status(k: &Kernel, stages: &[crate::bash::store::JobStage]) -> i32 {
+	stages.first().map_or(128, |s| {
+		if k.signaled.contains(&s.vpid) {
+			128
+		} else {
+			128 + k
+				.stops
+				.get(&s.vpid)
+				.map_or(s.status.unwrap_or(0), |sig| i32::from(sig.number(k.engine.config().platform)))
+		}
+	})
+}
+
+fn pipeline_stages(
+	unit: &Unit,
+	info: &ir::SpawnIr,
+	children: &[Vpid],
+) -> Vec<crate::bash::store::JobStage> {
+	children
+		.iter()
+		.enumerate()
+		.map(|(i, &vpid)| crate::bash::store::JobStage {
+			vpid,
+			text: stage_text(unit, info, i),
+			status: None,
+		})
+		.collect()
+}
+
+/// Bash `stop_pipeline`: a stopped foreground command becomes a job, but
+/// its shell resumes after that command. Move its in-flight wait intact.
+pub fn detach_stopped(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	op: Op,
+	end: u32,
+	signal: crate::bash::Signal,
+	stages: Option<Vec<crate::bash::store::JobStage>>,
+) {
+	let unit = top_frame(vp).unit.as_ref().expect("running unit").clone();
+	let pc = top_frame(vp).pc;
+	let mut child = vp.child(k, cx.store, Arc::clone(&unit), pc, vp.fds.clone());
+	let mut frame = Frame::new(Some(Arc::clone(&unit)), pc, FrameKind::StoppedJob { end });
+	frame.scratch = top_frame(vp).scratch.take();
+	if let Some(sc) = frame.scratch.as_mut() {
+		let mut parent = Scratch::default();
+		parent.exec = sc.exec.clone();
+		if let Some(io) = sc.io.as_mut() {
+			parent.io().saved = std::mem::take(&mut io.saved);
+		}
+		top_frame(vp).scratch = Some(Box::new(parent));
+	}
+	child.frames = vec![frame];
+	let vpid = child.vpid;
+	let id = k.job_id(cx.store);
+	let text = job_text(k, cx, vp, &unit, op.node);
+	let number = vp.jobs.add(id, vpid, text, true, vp.cwd.clone());
+	let job = vp.jobs.get_mut(number).expect("added");
+	job.state = JobState::Stopped(signal);
+	if let Some(stages) = stages {
+		job.stages = Some(Box::new(stages.clone()));
+		k.job_stages.push((vpid, stages));
+	} else {
+		if let Some(pid) = k.external_pids.remove(&vp.vpid) {
+			job.os_pid = Some(pid);
+			k.external_pids.insert(vpid, pid);
+		}
+		k.stops.remove(&vp.vpid);
+		k.stops.insert(vpid, signal);
+	}
+	k.spawned.push(Box::new(child));
 }
 
 /// Source text of syntax node `node`.

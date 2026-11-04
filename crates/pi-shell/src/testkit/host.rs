@@ -236,6 +236,14 @@ impl ExtProc for CountedExt {
 		self.ext.poll_wait(cx)
 	}
 
+	fn poll_stopped(&mut self, cx: &mut Context<'_>) -> Option<Signal> {
+		self.ext.poll_stopped(cx)
+	}
+
+	fn exit_status(&self) -> Option<ExitStatus> {
+		self.ext.exit_status()
+	}
+
 	fn signal(&mut self, sig: Signal) -> io::Result<()> {
 		self.ext.signal(sig)
 	}

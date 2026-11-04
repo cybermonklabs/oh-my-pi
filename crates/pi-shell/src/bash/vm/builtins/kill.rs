@@ -42,6 +42,8 @@ fn parse_signal(spec: &[u8], platform: Platform) -> Option<Send> {
 enum TargetError {
 	/// `%n` names no live job.
 	NoSuchJob,
+	/// The job spec diagnostic was already printed.
+	Ambiguous,
 	/// Neither a number nor a job spec.
 	NotAnId,
 	/// A vpid that is not a child of this shell.
@@ -115,8 +117,13 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			},
 			Ok(None) => {},
 			Err(err) => {
+				if matches!(err, TargetError::Ambiguous) {
+					status = 1;
+					continue;
+				}
 				let msg = match err {
 					TargetError::NoSuchJob => format!("{}: no such job", arg.as_bstr()),
+					TargetError::Ambiguous => unreachable!("handled above"),
 					TargetError::NotAnId => {
 						// bash `sh_badpid`.
 						format!("`{}': not a pid or valid job spec", arg.as_bstr())
@@ -139,28 +146,65 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 /// an error.
 fn target(ctx: &mut Ctx<'_, '_>, arg: &[u8], send: Send) -> Result<Option<SigTarget>, TargetError> {
 	if arg.starts_with(b"%") {
-		let number = super::jobs::spec(ctx, arg).map_err(|_| TargetError::NoSuchJob)?;
-		let job = ctx.vp.jobs.get_mut(number).ok_or(TargetError::NoSuchJob)?;
-		if matches!(job.state, JobState::Done(_))
-			|| matches!(
-				ctx.k.proc_state(ctx.cx.store, job.vpid),
-				Some(crate::bash::vm::ProcState::Exited(_))
-			) {
-			return Err(TargetError::NoSuchJob);
-		}
-		// bash `kill_pid`: continuing a stopped job by `kill` acts like `bg`
-		// (the job runs, the current job stays).
-		if send == Send::Signal(Signal::Cont) && matches!(job.state, JobState::Stopped(_)) {
-			job.state = JobState::Running;
-			job.notified = true;
-		}
-		return Ok(Some(SigTarget::Job(job.id)));
+		let number = super::jobs::spec(ctx, arg).map_err(|bad| match bad {
+			super::jobs::Bad::Missing => TargetError::NoSuchJob,
+			super::jobs::Bad::Ambiguous => TargetError::Ambiguous,
+		})?;
+		return signal_job(ctx, number, send);
 	}
 	let pid = std::str::from_utf8(arg)
 		.ok()
 		.and_then(|s| s.parse::<i32>().ok())
 		.ok_or(TargetError::NotAnId)?;
 	let base = ctx.k.engine.config().vpid_base;
+	if pid < -1 {
+		let native = pid.unsigned_abs();
+		let job = ctx.vp.jobs.iter().find(|job| {
+			job.pid() == native
+				|| job.stages.as_deref().is_some_and(|stages| {
+					stages
+						.iter()
+						.any(|s| s.vpid.0 == native || ctx.k.external_pids.get(&s.vpid) == Some(&native))
+				})
+		});
+		if let Some(job) = job {
+			if !job.control {
+				return Err(TargetError::NoSuchProcess);
+			}
+			return signal_job(ctx, job.number, send);
+		}
+	}
+	if let Ok(native) = u32::try_from(pid) {
+		if let Some(stage) = ctx
+			.vp
+			.jobs
+			.iter()
+			.filter_map(|j| j.stages.as_deref())
+			.flatten()
+			.find(|s| s.vpid.0 == native)
+		{
+			if stage.status.is_some() {
+				return Err(TargetError::NoSuchProcess);
+			}
+			if let Some(&pid) = ctx.k.external_pids.get(&stage.vpid) {
+				return ctx
+					.cx
+					.host
+					.signal_process(pid as i32, send.signal())
+					.map(|()| None)
+					.map_err(TargetError::Host);
+			}
+			return Ok(Some(SigTarget::Vpid(stage.vpid)));
+		}
+		if native < base && native != ctx.k.shell_pid {
+			return ctx
+				.cx
+				.host
+				.signal_process(pid, send.signal())
+				.map(|()| None)
+				.map_err(TargetError::Host);
+		}
+	}
 	// A job's (or `$!`'s) program OS pid names the job's vproc: the signal
 	// reaches the program through it, and the job's state follows.
 	let named = u32::try_from(pid)
@@ -185,6 +229,61 @@ fn target(ctx: &mut Ctx<'_, '_>, arg: &[u8], send: Send) -> Result<Option<SigTar
 			.map(|()| None)
 			.map_err(TargetError::Host),
 	}
+}
+
+/// Bash `kill_pid`: jobs without job control get one signal per process;
+/// controlled jobs get group signals and TERM/HUP continue stopped groups.
+fn signal_job(
+	ctx: &mut Ctx<'_, '_>,
+	number: u32,
+	send: Send,
+) -> Result<Option<SigTarget>, TargetError> {
+	let job = ctx.vp.jobs.get_mut(number).ok_or(TargetError::NoSuchJob)?;
+	if matches!(job.state, JobState::Done(_)) {
+		return if job.control {
+			Err(TargetError::NoSuchJob)
+		} else {
+			Ok(None)
+		};
+	}
+	let stopped = matches!(job.state, JobState::Stopped(_));
+	job.notified = false;
+	let (id, control) = (job.id, job.control);
+	if !control {
+		if let Some(stages) = job.stages.as_deref() {
+			for stage in stages.iter().filter(|s| s.status.is_none()) {
+				if let Some(&pid) = ctx.k.external_pids.get(&stage.vpid) {
+					ctx.cx
+						.host
+						.signal_process(pid as i32, send.signal())
+						.map_err(TargetError::Host)?;
+				} else if let Some(sig) = send.signal() {
+					ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Vpid(stage.vpid), sig);
+				}
+			}
+			return Ok(None);
+		}
+		if let Some(pid) = job.os_pid {
+			return ctx
+				.cx
+				.host
+				.signal_process(pid as i32, send.signal())
+				.map(|()| None)
+				.map_err(TargetError::Host);
+		}
+	}
+	if stopped && send == Send::Signal(Signal::Cont) {
+		job.state = JobState::Running;
+		job.notified = true;
+	}
+	if stopped && control && matches!(send, Send::Signal(Signal::Term | Signal::Hup)) {
+		if let Some(sig) = send.signal() {
+			ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Job(id), sig);
+		}
+		ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Job(id), Signal::Cont);
+		return Ok(None);
+	}
+	Ok(Some(SigTarget::Job(id)))
 }
 
 /// `kill -l [sig …]`: the signal table, or names for numbers (statuses

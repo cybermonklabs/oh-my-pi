@@ -1593,8 +1593,14 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 	let argv0 = |vp: &mut Vproc| st(vp).argv[0].clone();
 	let jobspec = st(vp).exec_as.is_none() && st(vp).argv[0].starts_with(b"%");
 	if !k.bangs.is_empty() {
+		let pending = k.bangs.len();
 		let exec = st(vp).exec_as.is_some();
 		bang_dispatch(k, vp.vpid, &target, exec);
+		if k.bangs.len() != pending {
+			// The alias wake already happened: let `$!` readers resume before
+			// this virtual command completes, as a forked Bash child can.
+			return Some(Flow::Block(WaitKey::Proc(vp.vpid)));
+		}
 	}
 	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
 		&& !matches!(target, Target::Function(_) | Target::Intrinsic(_))
@@ -1904,6 +1910,9 @@ fn spawned_external(
 		Ok(child) => {
 			k.forget_deferral(vp.vpid);
 			let pid = child.pid();
+			k.external_pids.insert(vp.vpid, pid);
+			k.external_status.remove(&vp.vpid);
+			k.signaled.remove(&vp.vpid);
 			// The job this vproc may still settle is known by its program
 			// (`bang_dispatch` let only its lone or `exec`'d external
 			// through).
@@ -3035,7 +3044,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			{
 				st(vp).control = Some(Transfer::Exit(pending));
 			}
-			status
+			if vp.mode.dialect() == crate::bash::ids::Dialect::Bash {
+				builtin_status(status)
+			} else {
+				status
+			}
 		},
 		Some(Awaited::Jobs { force }) => {
 			let mut last = st(vp).status;
@@ -3044,59 +3057,93 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				// `wait -p` names the child by the pid the user knows (its
 				// program's OS pid), read before the job is forgotten.
 				let shown = vp.shown_pid(v);
-				if let Some(s) = k.proc_collect(cx.store, v) {
+				if let Some(s) =
+					k.proc_collect(cx.store, v)
+						.or_else(|| match vp.jobs.by_vpid(v).map(|j| j.state) {
+							Some(JobState::Done(s)) => Some(s),
+							_ => None,
+						}) {
 					last = s;
-					forget_job(vp, v);
+					if matches!(st(vp).target, Some(Target::Intrinsic(IntrinsicId::Fg)))
+						|| st(vp).argv.first().is_some_and(|a| a.starts_with(b"%"))
+					{
+						vp.jobs.remove_where(|j| j.vpid == v);
+					} else {
+						forget_job(vp, v);
+					}
 					exec::reap_coproc(k, vp, cx, v);
 				} else if let (false, Some(JobState::Stopped(sig))) =
 					(force, vp.jobs.by_vpid(v).map(|j| j.state))
 				{
-					// bash with job control: a stop ends the wait for that job.
-					last = sig.exit_status(platform);
+					// bash `wait_for` applies WSTOPSIG to the first process,
+					// including its exit-status byte when that stage exited.
+					last = vp
+						.jobs
+						.by_vpid(v)
+						.and_then(|j| j.stages.as_deref())
+						.map_or(sig.exit_status(platform), |stages| exec::stopped_status(k, stages));
 				} else {
 					return Some(Flow::Block(WaitKey::Proc(v)));
 				}
 				waited = Some(shown);
 				st(vp).wait_for.remove(0);
 			}
+			k.native_dirty = true;
 			if let Some(pid) = waited {
 				waited_into(k, vp, cx, line, pid);
 			}
-			last
+			// Bash `wait.def` treats a pid wait above 256 as a pid error;
+			// jobspec waits pass through execute_cmd.c's `builtin_status`.
+			if last > 256
+				&& st(vp)
+					.argv
+					.last()
+					.is_some_and(|a| a.first().is_some_and(u8::is_ascii_digit))
+			{
+				127
+			} else {
+				builtin_status(last)
+			}
 		},
 		Some(Awaited::AllJobs) => {
 			while let Some(&v) = st(vp).wait_for.first() {
 				if k.proc_collect(cx.store, v).is_some() {
 					exec::reap_coproc(k, vp, cx, v);
+					vp.jobs.remove_where(|j| j.vpid == v);
 				} else if !matches!(vp.jobs.by_vpid(v).map(|j| j.state), Some(JobState::Stopped(_))) {
 					// A job stopped meanwhile is skipped (job control).
 					return Some(Flow::Block(WaitKey::Proc(v)));
 				}
 				st(vp).wait_for.remove(0);
 			}
-			// bash: `wait` forgets every finished job, except the one `$!`
-			// names when it finished before the wait (POSIX keeps the last
-			// async status until it is waited for or reported). A job this
-			// shell just killed is still being reaped when bash's `wait`
-			// looks, so that wait collects it (jobs.tests).
+			// bash: then `wait` forgets every job that had ended before it,
+			// unreported, except the one `$!` names (POSIX keeps the last
+			// async status until it is waited for or reported:
+			// `mark_dead_jobs_as_notified (1)`), and the statuses of the jobs
+			// it forgot earlier (`bgp_clear`).
 			let last = vp.last_bg;
 			let done: Vec<crate::bash::ids::Vpid> = vp
 				.jobs
 				.iter()
-				.filter(|j| match j.state {
-					JobState::Done(status) => {
-						!last.is(j.vpid)
-							|| status > 128
-							|| !matches!(k.proc_state(cx.store, j.vpid), Some(super::ProcState::Exited(_)))
-					},
-					_ => false,
-				})
+				.filter(|j| matches!(j.state, JobState::Done(_)) && !last.is(j.vpid))
 				.map(|j| j.vpid)
 				.collect();
 			for v in done {
 				k.proc_collect(cx.store, v);
-				forget_job(vp, v);
+				vp.jobs.remove_where(|j| j.vpid == v);
 			}
+			if let Some(saved) = vp.jobs.saved.as_deref() {
+				for &(pid, _) in saved.iter() {
+					let v = k
+						.external_pids
+						.iter()
+						.find_map(|(&v, &p)| (p == pid).then_some(v))
+						.unwrap_or(crate::bash::ids::Vpid(pid));
+					k.proc_collect(cx.store, v);
+				}
+			}
+			vp.jobs.saved = None;
+			k.native_dirty = true;
 			st(vp).status
 		},
 		Some(Awaited::AnyJob) => {
@@ -3106,8 +3153,14 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					.map(|s| (*v, s))
 			});
 			let Some((v, status)) = finished else {
-				if let Some(&v) = st(vp).wait_for.first() {
-					return Some(Flow::Block(WaitKey::Proc(v)));
+				for i in 0..st(vp).wait_for.len() {
+					let v = st(vp).wait_for[i];
+					if !vp.jobs.by_vpid(v).is_some_and(|j| {
+						matches!(j.state, JobState::Stopped(_))
+							|| (j.notified && matches!(j.state, JobState::Done(_)))
+					}) {
+						return Some(Flow::Block(WaitKey::Proc(v)));
+					}
 				}
 				let s = st(vp);
 				s.waiting = None;
@@ -3117,7 +3170,8 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			};
 			let shown = vp.shown_pid(v);
 			k.proc_collect(cx.store, v);
-			forget_job(vp, v);
+			vp.jobs.remove_where(|j| j.vpid == v);
+			k.native_dirty = true;
 			st(vp).wait_for.clear();
 			exec::reap_coproc(k, vp, cx, v);
 			waited_into(k, vp, cx, line, shown);
@@ -3146,6 +3200,17 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 		Some(Awaited::Ext { pid }) => {
 			let replacing = matches!(st(vp).control, Some(Transfer::Exec));
 			let run = vp.runs.front().map(|run| run.id);
+			if let Some(sig) = k.stops.get(&vp.vpid).copied()
+				&& exec::job_control(k, cx, vp)
+			{
+				let end = vp.frames.last().expect("running").pc + 1;
+				exec::detach_stopped(k, vp, cx, op, end, sig, None);
+				let s = st(vp);
+				s.status = sig.exit_status(platform);
+				s.waiting = Some(Awaited::Stopped);
+				s.stage = Stage::Output;
+				return None;
+			}
 			let mut tcx = Context::from_waker(&k.waker);
 			match &mut scratch(vp).live {
 				Live::Ext(child) => match child.poll_wait(&mut tcx) {
@@ -3155,6 +3220,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					},
 					Poll::Ready(ExitStatus::Signaled(sig)) => {
 						reaped = true;
+						k.signaled.insert(vp.vpid);
 						if replacing && let Some(run) = run {
 							k.exec_signals.insert(run, i32::from(sig.number(platform)));
 						}
@@ -3162,6 +3228,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					},
 					Poll::Ready(ExitStatus::SignaledRaw(signal)) => {
 						reaped = true;
+						k.signaled.insert(vp.vpid);
 						if replacing && let Some(run) = run {
 							k.exec_signals.insert(run, signal);
 						}
@@ -3172,7 +3239,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				_ => lost(k, vp, cx, op, line, Lost::Ext { vpid: vp.vpid, pid }),
 			}
 		},
-		None => st(vp).status,
+		None | Some(Awaited::Stopped) => st(vp).status,
 	};
 	if reaped {
 		super::owe_chld(k, cx, vp, false);
@@ -3190,11 +3257,27 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 	None
 }
 
-/// Drop the job led by `v` from the table once it was waited for (bash
-/// `wait_for_job` marks it notified; `cleanup_dead_jobs` deletes it).
+/// Bash execute_cmd.c `builtin_status`: stop-status arithmetic can reach
+/// its internal error-number range, unlike ordinary process exits.
+const fn builtin_status(status: i32) -> i32 {
+	match status {
+		257 | 258 => 2,
+		259.. => 1,
+		_ => status,
+	}
+}
+
+/// Bash `wait_for_job` marks the waited job notified after `wait_for`
+/// cleans up: the first wait leaves it, the next wait removes it.
 fn forget_job(vp: &mut Vproc, v: crate::bash::ids::Vpid) {
-	if let Some(number) = vp.jobs.by_vpid(v).map(|j| j.number) {
-		vp.jobs.remove(number);
+	let frozen = builtins::frozen_job(vp).is_some();
+	if let Some(job) = vp.jobs.by_vpid_mut(v) {
+		let number = job.number;
+		if job.notified && !frozen {
+			vp.jobs.remove(number);
+		} else {
+			job.notified = true;
+		}
 	}
 }
 
@@ -3284,14 +3367,17 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		.expect("exec scratch");
 	let e = sc.exec.as_ref().expect("exec");
 	let (status, t0, control) = (e.status, e.t0, e.control);
+	let stopped = e.waiting == Some(Awaited::Stopped);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
 	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		print_exit_value(k, vp, cx, status);
 	}
 	vp.status = status;
-	vp.pipestatus.clear();
-	vp.pipestatus.push(status);
+	if !stopped {
+		vp.pipestatus.clear();
+		vp.pipestatus.push(status);
+	}
 	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the
 		// next command's `CmdStart` may share it.
