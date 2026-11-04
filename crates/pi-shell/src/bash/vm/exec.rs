@@ -746,18 +746,19 @@ fn features(
 const MAX_SCRIPT_DEPTH: usize = 500;
 const MAX_FORK_DEPTH: u32 = 64;
 
-/// A refusal ends this shell, but an active EXIT trap preserves its
-/// interrupted status rather than replacing it with the refusal's 1.
+/// A refusal ends this shell. Under an active EXIT trap, bash 5.3 exits
+/// with `trap_saved_exit_value`: the status the latest trap of any kind
+/// interrupted (a trap nested in the EXIT trap, still running or already
+/// ended, replaces the EXIT trap's own), not the refusal's 1.
 pub fn nesting_status(vp: &Vproc) -> i32 {
-	vp.frames
-		.iter()
-		.find_map(|f| match f.kind {
-			FrameKind::Script {
-				what: ScriptKind::Trap { key: TrapKey::Exit, status, .. }, ..
-			} => Some(status),
-			_ => None,
-		})
-		.unwrap_or(1)
+	let in_exit_trap = vp.trap_frames != 0
+		&& vp.frames.iter().any(|f| {
+			matches!(f.kind, FrameKind::Script {
+				what: ScriptKind::Trap { key: TrapKey::Exit, .. },
+				..
+			})
+		});
+	if in_exit_trap { vp.trap_status } else { 1 }
 }
 
 fn nesting_error(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, kind: &str, max: u32) {
@@ -3622,6 +3623,7 @@ fn push_trap(
 	);
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	let status = vp.status;
+	vp.trap_status = status;
 	vp.blocked = None;
 	push_script(vp, action, 1, ScriptKind::Trap {
 		key,

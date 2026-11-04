@@ -2384,6 +2384,7 @@ impl Vproc {
 			subshell: 0,
 			fork_depth: 0,
 			script_base: 0,
+			trap_status: 0,
 			command: None,
 			spare: Vec::new(),
 			calls: Vec::new(),

@@ -8,13 +8,13 @@ use crate::bash::{
 	diag::Diag,
 	event::EventData,
 	fs::StatKind,
-	ids::Vpid,
-	store::{Key, KeyBuf, MiscKey, OptId, Record},
+	ids::{Dialect, Vpid},
+	store::{Key, KeyBuf, MiscKey, OptId, Record, TrapKey},
 	vm::{
 		exec::push_script,
 		locale,
 		probe::{absolute, candidates},
-		proc::{Probe, ProbeResult, ScriptKind},
+		proc::{FrameKind, Probe, ProbeResult, ScriptKind, Vproc},
 		quote,
 	},
 };
@@ -328,7 +328,7 @@ fn status_arg(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> Result<Option<i32>, Ba
 /// `return [n]`. Outside a function, `.` file or `${ ;}` (and not in a
 /// subshell of a function) it is an error, fatal to a posix shell.
 pub fn return_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
-	use crate::bash::vm::proc::FrameKind;
+	let dialect = ctx.vp.mode.dialect();
 	let target = ctx.vp.frames.iter().any(|f| {
 		matches!(
 			f.kind,
@@ -348,6 +348,7 @@ pub fn return_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	}
 	let status = match arg {
 		Ok(Some(n)) => n,
+		Ok(None) if dialect == Dialect::Bash => trap_saved_status(ctx.vp, false),
 		Ok(None) => ctx
 			.vp
 			.frames
@@ -383,13 +384,45 @@ pub fn exit(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	// A bad argument (`exit status`, too many) is reported and the shell
 	// goes on (status 2), as bash 5.3 does outside posix mode.
 	let status = match status_arg(ctx, args) {
-		Ok(n) => n.unwrap_or(ctx.vp.status),
+		Ok(Some(n)) => n,
+		Ok(None) if ctx.vp.mode.dialect() == Dialect::Bash => trap_saved_status(ctx.vp, true),
+		Ok(None) => ctx.vp.status,
 		Err(_) => return done(2),
 	};
 	if let Some(outcome) = bash_logout(ctx, status)? {
 		return Ok(outcome);
 	}
 	Ok(Outcome { status, control: Control::Exit })
+}
+
+/// bash 5.3's status of `return` or `exit` without an argument (POSIX
+/// interp 1602, `get_exitstat`): inside a trap action other than DEBUG,
+/// with no function call or sourced file started since the trap began,
+/// the status the latest trap of any kind saved
+/// ([`Vproc::trap_status`]); `exit` anywhere in the EXIT trap too (bash's
+/// `running_trap == 1`). Elsewhere `$?`.
+fn trap_saved_status(vp: &Vproc, exit: bool) -> i32 {
+	if vp.trap_frames == 0 {
+		return vp.status;
+	}
+	let mut nested = false;
+	for f in vp.frames.iter().rev() {
+		match f.kind {
+			FrameKind::Script { what: ScriptKind::Trap { key, .. }, .. } => {
+				let saved = match key {
+					TrapKey::Exit => exit || !nested,
+					TrapKey::Debug => false,
+					_ => !nested,
+				};
+				return if saved { vp.trap_status } else { vp.status };
+			},
+			FrameKind::Function { .. } | FrameKind::Script { what: ScriptKind::Source, .. } => {
+				nested = true;
+			},
+			_ => {},
+		}
+	}
+	vp.status
 }
 
 /// bash's `bash_logout`: `exit`/`logout` in a login shell (not a subshell)

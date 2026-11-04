@@ -2016,15 +2016,21 @@ fn call_function(
 		.filter(|c| matches!(c.kind, super::callstack::CallKind::Function { .. }))
 		.count() as u32;
 	// A positive FUNCNEST lowers the engine limit. Inherited calls count
-	// in subshells too; an EXIT trap keeps the status that started it.
+	// in subshells too; under an EXIT trap a refusal exits with the latest
+	// trap's saved status ([`exec::nesting_status`]).
 	let funcnest = match state::lookup(&k.root, cx.store, vp, b"FUNCNEST") {
 		Ok(v) => v
-			.and_then(|v| v.as_scalar())
 			.and_then(|v| {
 				if vp.mode.dialect() == Dialect::Bash {
-					// `legal_number` rejects intmax_t overflow. Only a parsed
-					// value is then narrowed to a signed C int. Bash 5.3 accepts
-					// all six C-locale whitespace bytes around the decimal.
+					// `sv_funcnest` parses the variable's string value; an
+					// indexed or associative array has none and sets no
+					// limit. `legal_number` rejects intmax_t overflow. Only
+					// a parsed value is then narrowed to a signed C int.
+					// Bash 5.3 accepts all six C-locale whitespace bytes
+					// around the decimal.
+					let VarValue::Str(v) = &v.value else {
+						return None;
+					};
 					let n = std::str::from_utf8(v)
 						.ok()?
 						.trim_matches(|c| matches!(c, '\t'..='\r' | ' '))
@@ -2032,7 +2038,7 @@ fn call_function(
 						.ok()?;
 					Some(i64::from(n as i32))
 				} else {
-					builtins::number(v)
+					builtins::number(v.as_scalar()?)
 				}
 			})
 			.filter(|&n| n > 0)

@@ -229,6 +229,109 @@ async fn funcnest_decimal_syntax_matches_bash53() {
 		assert_eq!(capture(&script).await, (out.into(), err, status), "FUNCNEST={value:?}");
 	}
 }
+
+// The arm's 56 forms. Bash's `sv_funcnest` parses the variable's string
+// value; an indexed or associative array has none, so it sets no limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn funcnest_variable_forms_match_bash53() {
+	for (prefix, out, err, status) in [
+		("FUNCNEST='1'", "", true, 1),
+		("FUNCNEST='4294967297'", "", true, 1),
+		("FUNCNEST='-4294967295'", "", true, 1),
+		("FUNCNEST='9223372036854775809'", "BOTTOMAFTER", false, 0),
+		("FUNCNEST='9223372036854775807'", "BOTTOMAFTER", false, 0),
+		("FUNCNEST=' 1 '", "", true, 1),
+		("FUNCNEST='junk'", "BOTTOMAFTER", false, 0),
+		("FUNCNEST=''", "BOTTOMAFTER", false, 0),
+		("export FUNCNEST='1'", "", true, 1),
+		("export FUNCNEST='4294967297'", "", true, 1),
+		("export FUNCNEST='-4294967295'", "", true, 1),
+		("export FUNCNEST='9223372036854775809'", "BOTTOMAFTER", false, 0),
+		("export FUNCNEST='9223372036854775807'", "BOTTOMAFTER", false, 0),
+		("export FUNCNEST=' 1 '", "", true, 1),
+		("export FUNCNEST='junk'", "BOTTOMAFTER", false, 0),
+		("export FUNCNEST=''", "BOTTOMAFTER", false, 0),
+		("declare -r FUNCNEST='1'", "", true, 1),
+		("declare -r FUNCNEST='4294967297'", "", true, 1),
+		("declare -r FUNCNEST='-4294967295'", "", true, 1),
+		("declare -r FUNCNEST='9223372036854775809'", "BOTTOMAFTER", false, 0),
+		("declare -r FUNCNEST='9223372036854775807'", "BOTTOMAFTER", false, 0),
+		("declare -r FUNCNEST=' 1 '", "", true, 1),
+		("declare -r FUNCNEST='junk'", "BOTTOMAFTER", false, 0),
+		("declare -r FUNCNEST=''", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=('1')", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=('4294967297')", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=('-4294967295')", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=('9223372036854775809')", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=('9223372036854775807')", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=(' 1 ')", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=('junk')", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=('')", "BOTTOMAFTER", false, 0),
+		("declare -A FUNCNEST=([0]='1')", "BOTTOMAFTER", false, 0),
+		("declare -A FUNCNEST=([0]='4294967297')", "BOTTOMAFTER", false, 0),
+		("declare -A FUNCNEST=([0]='-4294967295')", "BOTTOMAFTER", false, 0),
+		("declare -A FUNCNEST=([0]='9223372036854775809')", "BOTTOMAFTER", false, 0),
+		("declare -A FUNCNEST=([0]='9223372036854775807')", "BOTTOMAFTER", false, 0),
+		("declare -A FUNCNEST=([0]=' 1 ')", "BOTTOMAFTER", false, 0),
+		("declare -A FUNCNEST=([0]='junk')", "BOTTOMAFTER", false, 0),
+		("declare -A FUNCNEST=([0]='')", "BOTTOMAFTER", false, 0),
+		("lim='1'; declare -n FUNCNEST=lim", "", true, 1),
+		("lim='4294967297'; declare -n FUNCNEST=lim", "", true, 1),
+		("lim='-4294967295'; declare -n FUNCNEST=lim", "", true, 1),
+		("lim='9223372036854775809'; declare -n FUNCNEST=lim", "BOTTOMAFTER", false, 0),
+		("lim='9223372036854775807'; declare -n FUNCNEST=lim", "BOTTOMAFTER", false, 0),
+		("lim=' 1 '; declare -n FUNCNEST=lim", "", true, 1),
+		("lim='junk'; declare -n FUNCNEST=lim", "BOTTOMAFTER", false, 0),
+		("lim=''; declare -n FUNCNEST=lim", "BOTTOMAFTER", false, 0),
+		("declare -i FUNCNEST='1'", "", true, 1),
+		("declare -i FUNCNEST='4294967297'", "", true, 1),
+		("declare -i FUNCNEST='-4294967295'", "", true, 1),
+		("declare -i FUNCNEST='9223372036854775809'", "", true, 1),
+		("declare -i FUNCNEST='9223372036854775807'", "BOTTOMAFTER", false, 0),
+		("declare -i FUNCNEST=' 1 '", "", true, 1),
+		("declare -i FUNCNEST='junk'", "BOTTOMAFTER", false, 0),
+		("declare -i FUNCNEST=''", "BOTTOMAFTER", false, 0),
+	] {
+		let script = format!(
+			"{prefix}; f(){{ if (( $1 )); then f $(($1-1)); else printf BOTTOM; fi; }}; f 8; printf \
+			 AFTER"
+		);
+		assert_eq!(capture(&script).await, (out.into(), err, status), "{prefix}");
+	}
+}
+
+// An array FUNCNEST, however it became one, sets no limit; a scalar again
+// (after `unset`, or outside a function's local array) sets it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn funcnest_array_sets_no_limit() {
+	let f = "f(){ if (( $1 )); then f $(($1-1)); else printf BOTTOM; fi; }";
+	for (prefix, out, err, status) in [
+		("FUNCNEST=(1)", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=(1); FUNCNEST=1", "BOTTOMAFTER", false, 0),
+		("FUNCNEST=1; declare -a FUNCNEST", "BOTTOMAFTER", false, 0),
+		("FUNCNEST=1; declare -A FUNCNEST", "BOTTOMAFTER", false, 0),
+		("FUNCNEST=1; FUNCNEST+=(2)", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=([1]=1)", "BOTTOMAFTER", false, 0),
+		("a=(1); declare -n FUNCNEST=a", "BOTTOMAFTER", false, 0),
+		("declare -A a=([0]=1); declare -n FUNCNEST=a", "BOTTOMAFTER", false, 0),
+		("declare -a FUNCNEST=(1); unset FUNCNEST; FUNCNEST=1", "", true, 1),
+		(
+			"FUNCNEST=1; g(){ local -a FUNCNEST=(1); f 8; }; f(){ if (( $1 )); then f $(($1-1)); \
+			 else printf BOTTOM; fi; }; g; printf MID",
+			"BOTTOMMID",
+			true,
+			1,
+		),
+		("declare -a FUNCNEST=(1); (f 8); printf SUB", "BOTTOMSUBBOTTOMAFTER", false, 0),
+	] {
+		let script = if prefix.contains("(f 8)") {
+			format!("{f}; {prefix}; f 8; printf AFTER")
+		} else {
+			format!("{prefix}; {f}; f 8; printf AFTER")
+		};
+		assert_eq!(capture(&script).await, (out.into(), err, status), "{prefix}");
+	}
+}
 golden!(
 	source_refusal_ends_pipeline_stage,
 	"set -o pipefail; printf 'FUNCNEST=1; f(){ f; }; f\nprintf WRONG_FILE\n' > leaf.sh; { . \
@@ -320,6 +423,144 @@ golden!(
 	true,
 	7
 );
+// Bash 5.3 keeps one saved status for all traps (`trap_saved_exit_value`):
+// each trap that starts, of any kind, replaces it with the `$?` it
+// interrupted, and a refusal under an EXIT trap exits with it. Bash 5.2 lets
+// the EXIT trap go on after a refusal in a nested trap.
+golden!(
+	err_trap_refusal_inside_exit_trap_exits_with_err_status,
+	"FUNCNEST=1; f(){ f; }; trap 'trap f ERR; false' EXIT; exit 0",
+	"",
+	true,
+	1
+);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_trap_refusal_takes_status_of_latest_trap() {
+	for (functrace, script, out, status) in [
+		(false, r"trap 'trap '\''f'\'' DEBUG; :; printf WRONG' EXIT; exit 7", "", 0),
+		(true, r"trap 'trap '\''f'\'' RETURN; g; printf WRONG' EXIT; exit 7", "", 0),
+		(false, r"trap 'trap '\''f'\'' USR1; kill -USR1 $$; printf WRONG' EXIT; exit 7", "", 0),
+		// A nested trap that already ended still set the status.
+		(
+			false,
+			r"trap 'trap '\'':'\'' ERR; (exit 5); false; trap - ERR; true; f; printf WRONG' EXIT; exit 7",
+			"",
+			1,
+		),
+		(
+			false,
+			r"trap 'trap '\'':'\'' DEBUG; (exit 5); :; trap - DEBUG; true; f; printf WRONG' EXIT; exit 7",
+			"",
+			0,
+		),
+		(false, r"h(){ trap 'f' ERR; (exit 4); false; }; trap 'h; printf WRONG' EXIT; exit 7", "", 4),
+		(false, r"trap 'eval '\''trap f ERR; false'\''; printf WRONG' EXIT; exit 7", "", 1),
+		(
+			false,
+			r"printf %s 'trap f ERR; (exit 2); false' > nest.sh; trap '. ./nest.sh; printf WRONG' EXIT; exit 7",
+			"",
+			2,
+		),
+		(
+			false,
+			r"trap 'trap '\''trap f ERR; (exit 3); false'\'' USR1; kill -USR1 $$; printf WRONG' EXIT; exit 7",
+			"",
+			3,
+		),
+		// An EXIT trap started by `exit` inside another trap.
+		(
+			false,
+			r"trap 'f; printf WRONG' EXIT; trap '(exit 3); exit' ERR; (exit 6); false; printf AFTER",
+			"",
+			6,
+		),
+		(
+			false,
+			r"trap 'f; printf WRONG' EXIT; trap '(exit 3); exit' USR1; (exit 6); kill -USR1 $$; printf AFTER",
+			"",
+			0,
+		),
+		// A subshell's refusal ends only the subshell.
+		(false, r#"trap '(trap f ERR; false); printf "S=$?"' EXIT; exit 7"#, "S=1", 7),
+	] {
+		let set = if functrace { "set -T; " } else { "" };
+		let script = format!("{set}FUNCNEST=1; f(){{ f; }}; g(){{ :; }}; {script}");
+		assert_eq!(capture(&script).await, (out.into(), true, status), "{script}");
+	}
+}
+
+// The same saved status: `exit` or `return` without an argument at the top
+// of a trap action other than DEBUG (and `exit` anywhere in the EXIT trap)
+// uses the status the latest trap saved, not `$?`. Wrong at main.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_and_return_without_argument_use_latest_trap_status() {
+	for (script, out, err, status) in [
+		("trap '(exit 4); exit' EXIT; exit 7", "", false, 7),
+		("h(){ (exit 4); exit; }; trap h EXIT; exit 7", "", false, 7),
+		("trap 'trap : ERR; false; true; exit' EXIT; exit 7", "", false, 1),
+		("trap 'trap \"(exit 3)\" DEBUG; (exit 5); trap - DEBUG; exit' EXIT; exit 7", "", false, 5),
+		(
+			"g(){ :; }; trap 'trap : ERR; (exit 5); false; trap - ERR; true; exit' ERR; (exit 6); \
+			 false; printf AFTER",
+			"",
+			false,
+			6,
+		),
+		(
+			"g(){ :; }; trap 'h' EXIT; h(){ (exit 4); exit; }; trap '(exit 3); exit' ERR; (exit 6); \
+			 false; printf AFTER",
+			"",
+			false,
+			6,
+		),
+		// A function called from the trap: its `exit` takes `$?`.
+		(
+			"g(){ :; }; h(){ (exit 4); exit; }; trap 'h' ERR; (exit 6); false; printf AFTER",
+			"",
+			false,
+			4,
+		),
+		// DEBUG keeps `$?`.
+		(
+			"g(){ :; }; f(){ trap '(exit 4); return' DEBUG; (exit 6); :; printf IN=$?; }; f; printf \
+			 R=$?",
+			"R=4",
+			true,
+			0,
+		),
+		(
+			"g(){ :; }; f(){ trap 'trap : ERR; (exit 5); false; trap - ERR; true; return' USR1; \
+			 (exit 6); kill -USR1 $$; printf IN=$?; }; f; printf R=$?",
+			"R=1",
+			false,
+			0,
+		),
+		(
+			"set -T; g(){ :; }; trap 'trap : ERR; (exit 5); false; trap - ERR; true; exit' RETURN; \
+			 (exit 6); g; printf AFTER",
+			"",
+			false,
+			1,
+		),
+		(
+			"set -T; g(){ :; }; trap 'h' EXIT; h(){ (exit 4); exit; }; trap '(exit 3); exit' RETURN; \
+			 (exit 6); g; printf AFTER",
+			"",
+			false,
+			0,
+		),
+		(
+			"g(){ :; }; trap 'h' EXIT; h(){ (exit 4); exit; }; trap '(exit 3); exit' USR1; (exit 6); \
+			 kill -USR1 $$; printf AFTER",
+			"",
+			false,
+			0,
+		),
+	] {
+		assert_eq!(capture(script).await, (out.into(), err, status), "{script}");
+	}
+}
 golden!(
 	funcnest_is_inherited_by_command_substitution,
 	"FUNCNEST=1; f(){ if (( $1 > 0 )); then printf '[%s]' \"$(f $(( $1 - 1 )))\"; else printf \

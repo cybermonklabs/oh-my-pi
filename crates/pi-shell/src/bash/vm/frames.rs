@@ -258,6 +258,8 @@ struct ProcImage {
 	fork_depth:    u8,
 	/// Runtime script depth retained in ancestor processes.
 	script_base:   u16,
+	/// The latest trap's interrupted `$?` (bash's `trap_saved_exit_value`).
+	trap_status:   i32,
 	/// `BASH_COMMAND`: the unit (written to the store) and syntax node; a
 	/// trap action that runs after the restore still names the trapped
 	/// command.
@@ -591,6 +593,7 @@ impl Shell {
 				subshell: p.subshell,
 				fork_depth: p.fork_depth,
 				script_base: p.script_base,
+				trap_status: p.trap_status,
 				command,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
@@ -818,6 +821,7 @@ impl Shell {
 			vp.subshell = p.subshell;
 			vp.fork_depth = p.fork_depth;
 			vp.script_base = p.script_base;
+			vp.trap_status = p.trap_status;
 			vp.calls = p.calls;
 			vp.own_traps = p.own_traps;
 			vp.mode = p.mode;

@@ -89,6 +89,10 @@ pub struct Vproc {
 	/// Active eval/source frames retained in ancestors, including across
 	/// fresh nested shells. The child's own frames are counted separately.
 	pub script_base:   u16,
+	/// bash's `trap_saved_exit_value`: the `$?` the latest trap action of
+	/// any kind interrupted, set when it starts and kept after it ends. A
+	/// nesting refusal under an EXIT trap exits with it.
+	pub trap_status:   i32,
 	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
