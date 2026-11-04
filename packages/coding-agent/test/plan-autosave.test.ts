@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -127,6 +128,24 @@ describe("autosaveApprovedPlan", () => {
 		const settings = Settings.isolated({ "plan.autosave": true });
 		const result = await autosaveApprovedPlan({ settings, cwd, title: "Auth", planContent: "  \n" });
 		expect(result).toBeNull();
+	});
+
+	it("saves into the directory the file system resolves plan.autosaveDir to", async () => {
+		const cwd = makeCwd();
+		fs.mkdirSync(path.join(cwd, "actual", "child"), { recursive: true });
+		fs.mkdirSync(path.join(cwd, "actual", "plans"));
+		fs.mkdirSync(path.join(cwd, "configured"));
+		fs.symlinkSync(path.join(cwd, "actual", "child"), path.join(cwd, "configured", "link"), "dir");
+		// `configured/link -> actual/child`: the kernel resolves `configured/link/../plans` to `actual/plans`.
+		const configured = `${path.join(cwd, "configured")}/link/../plans`;
+		expect(fs.realpathSync.native(configured)).toBe(fs.realpathSync.native(path.join(cwd, "actual", "plans")));
+		const settings = Settings.isolated({ "plan.autosave": true, "plan.autosaveDir": configured });
+
+		await autosaveApprovedPlan({ settings, cwd, title: "Auth", planContent: "# plan\n" });
+
+		expect(fs.readdirSync(path.join(cwd, "actual", "plans"))).toEqual(["AUTH_PLAN.md"]);
+		expect(fs.readFileSync(path.join(cwd, "actual", "plans", "AUTH_PLAN.md"), "utf8")).toBe("# plan\n");
+		expect(fs.existsSync(path.join(cwd, "configured", "plans"))).toBe(false);
 	});
 });
 

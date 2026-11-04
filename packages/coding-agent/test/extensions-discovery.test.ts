@@ -177,6 +177,24 @@ describe("extensions discovery", () => {
 		]);
 	});
 
+	it("loads the cwd-relative --extension file the file system resolves it to", async () => {
+		const base = tempDir.path();
+		fs.mkdirSync(path.join(base, "actual", "child"), { recursive: true });
+		fs.mkdirSync(path.join(base, "configured"));
+		fs.symlinkSync(path.join(base, "actual", "child"), path.join(base, "configured", "link"), "dir");
+		fs.writeFileSync(path.join(base, "actual", "ext.ts"), extensionCodeWithTool("actual-tool"));
+		fs.writeFileSync(path.join(base, "configured", "ext.ts"), extensionCodeWithTool("configured-tool"));
+		// `configured/link -> actual/child`: relative to cwd, the kernel resolves `configured/link/../ext.ts`
+		// to `actual/ext.ts`.
+		const relative = "configured/link/../ext.ts";
+		expect(fs.readFileSync(`${base}/${relative}`, "utf8")).toContain("actual-tool");
+
+		const result = await loadExtensions([relative], base);
+
+		expect(result.errors).toHaveLength(0);
+		expect(result.extensions.flatMap(extension => [...extension.tools.keys()])).toEqual(["actual-tool"]);
+	});
+
 	it("uses inherited roots instead of local extension inputs during cold discovery", async () => {
 		const inherited = tempDir.join("inherited.ts");
 		const configured = tempDir.join("configured.ts");

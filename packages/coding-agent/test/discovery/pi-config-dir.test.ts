@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { type MCPServer, mcpCapability } from "@oh-my-pi/pi-coding-agent/capability/mcp";
 import type { LoadContext } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { getConfigDirs } from "@oh-my-pi/pi-coding-agent/config";
 import { resolveClaudePaths } from "@oh-my-pi/pi-coding-agent/config/claude-paths";
+import { loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
 import { getUserPath } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
-import { getAgentDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("PI_CONFIG_DIR", () => {
 	const original = process.env.PI_CONFIG_DIR;
@@ -42,6 +46,7 @@ describe("PI_CONFIG_DIR", () => {
 describe("CLAUDE_CONFIG_DIR", () => {
 	const original = process.env.CLAUDE_CONFIG_DIR;
 	afterEach(() => {
+		clearFsCache();
 		if (original === undefined) {
 			delete process.env.CLAUDE_CONFIG_DIR;
 		} else {
@@ -74,5 +79,30 @@ describe("CLAUDE_CONFIG_DIR", () => {
 			configDir: path.join("/home/tester", ".claude"),
 			configFile: path.join("/home/tester", ".claude.json"),
 		});
+	});
+
+	test("reads the .claude.json the file system resolves CLAUDE_CONFIG_DIR to", async () => {
+		using tempDir = TempDir.createSync("@pi-claude-config-dir-");
+		const base = tempDir.path();
+		fs.mkdirSync(path.join(base, "actual", "child"), { recursive: true });
+		fs.mkdirSync(path.join(base, "actual", "claude"));
+		fs.mkdirSync(path.join(base, "configured", "claude"), { recursive: true });
+		fs.mkdirSync(path.join(base, "project"));
+		fs.symlinkSync(path.join(base, "actual", "child"), path.join(base, "configured", "link"), "dir");
+		const claudeJson = (command: string) => JSON.stringify({ mcpServers: { who: { command, type: "stdio" } } });
+		fs.writeFileSync(path.join(base, "actual", "claude", ".claude.json"), claudeJson("actual"));
+		fs.writeFileSync(path.join(base, "configured", "claude", ".claude.json"), claudeJson("configured"));
+		// `configured/link -> actual/child`: the kernel resolves `configured/link/../claude` to `actual/claude`.
+		const configured = `${path.join(base, "configured")}/link/../claude`;
+		expect(fs.readFileSync(`${configured}/.claude.json`, "utf8")).toBe(claudeJson("actual"));
+		process.env.CLAUDE_CONFIG_DIR = configured;
+		clearFsCache();
+
+		const result = await loadCapability<MCPServer>(mcpCapability.id, {
+			cwd: path.join(base, "project"),
+			providers: ["claude"],
+		});
+
+		expect(result.items.find(server => server.name === "who")?.command).toBe("actual");
 	});
 });

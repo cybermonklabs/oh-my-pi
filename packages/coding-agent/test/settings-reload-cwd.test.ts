@@ -202,6 +202,27 @@ describe("Settings.reloadForCwd", () => {
 		}
 	});
 
+	it("loads the --config overlay the file system resolves its path to", async () => {
+		const testDir = path.join(os.tmpdir(), "test-config-overlay-link", Snowflake.next());
+		try {
+			resetSettingsForTest();
+			fs.mkdirSync(path.join(testDir, "actual", "child"), { recursive: true });
+			fs.mkdirSync(path.join(testDir, "configured"));
+			fs.symlinkSync(path.join(testDir, "actual", "child"), path.join(testDir, "configured", "link"), "dir");
+			fs.writeFileSync(path.join(testDir, "actual", "extra.yml"), "enabledModels:\n  - model-actual\n");
+			fs.writeFileSync(path.join(testDir, "configured", "extra.yml"), "enabledModels:\n  - model-configured\n");
+			// `configured/link -> actual/child`: the kernel resolves `configured/link/../extra.yml` to `actual/extra.yml`.
+			const overlayPath = `${path.join(testDir, "configured")}/link/../extra.yml`;
+			expect(fs.readFileSync(overlayPath, "utf8")).toContain("model-actual");
+
+			const settings = await Settings.init({ cwd: testDir, inMemory: true, configFiles: [overlayPath] });
+			expect(cfgEnabledModels.get(settings)).toEqual(["model-actual"]);
+		} finally {
+			resetSettingsForTest();
+			if (fs.existsSync(testDir)) removeSyncWithRetries(testDir);
+		}
+	});
+
 	describe("project layer (on disk)", () => {
 		let testDir: string;
 		let agentDir: string;

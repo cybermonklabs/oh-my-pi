@@ -257,6 +257,26 @@ describe("MarketplaceManager", () => {
 		}
 	});
 
+	it("updateMarketplace re-reads the local source the file system resolved at add time", async () => {
+		fs.mkdirSync(path.join(ctx.tmpDir, "actual", "child"), { recursive: true });
+		fs.mkdirSync(path.join(ctx.tmpDir, "configured"));
+		fs.symlinkSync(path.join(ctx.tmpDir, "actual", "child"), path.join(ctx.tmpDir, "configured", "link"), "dir");
+		buildNamedMarketplace(path.join(ctx.tmpDir, "actual", "market"), "linked-market", "actual-plugin");
+		buildNamedMarketplace(path.join(ctx.tmpDir, "configured", "market"), "linked-market", "configured-plugin");
+		// `configured/link -> actual/child`: the kernel resolves `configured/link/../market` to `actual/market`.
+		const source = `${path.join(ctx.tmpDir, "configured")}/link/../market`;
+
+		await ctx.manager.addMarketplace(source);
+		expect((await ctx.manager.listAvailablePlugins("linked-market")).map(plugin => plugin.name)).toEqual([
+			"actual-plugin",
+		]);
+
+		await ctx.manager.updateMarketplace("linked-market");
+		expect((await ctx.manager.listAvailablePlugins("linked-market")).map(plugin => plugin.name)).toEqual([
+			"actual-plugin",
+		]);
+	});
+
 	// ── Plugin discovery ───────────────────────────────────────────────────
 
 	it("listAvailablePlugins → returns catalog entries", async () => {
