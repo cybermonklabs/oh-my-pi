@@ -885,7 +885,8 @@ fn moving_redirections_always_print_the_fd() {
 
 #[test]
 fn here_document_parameter_words_quote_like_bash() {
-	// heredoc6.sub: `$'…'` is ANSI-C quoting in a pattern word …
+	// `extract_heredoc_dolbrace_string` translates ANSI-C pattern words
+	// into quoted text before their operands expand.
 	let w =
 		parse_text(b"1: ${x#$'no\\t'} ${x#n$'o\\t'}\n", Features::NONE, TextMode::HereDoc).unwrap();
 	let pats: Vec<Word> = w
@@ -899,10 +900,10 @@ fn here_document_parameter_words_quote_like_bash() {
 			_ => None,
 		})
 		.collect();
-	assert_eq!(pats[0].parts, vec![WordPart::AnsiC(b"no\\t".to_vec())]);
-	assert_eq!(pats[1].parts, vec![WordPart::Lit(b"n".to_vec()), WordPart::AnsiC(b"o\\t".to_vec())]);
-	// … but literal text in a non-pattern word (`"${u:-$'a'}"` outside a
-	// document is ANSI-C quoting).
+	assert_eq!(pats[0].parts, vec![WordPart::SQuote(b"no\t".to_vec())]);
+	assert_eq!(pats[1].parts, vec![WordPart::Lit(b"n".to_vec()), WordPart::SQuote(b"o\t".to_vec())]);
+	// Non-pattern document operands keep `$'…'` literal. Outside a
+	// document, the double-quoted operand is translated too.
 	let w = parse_text(b"${u:-$'a\\tb'}\n", Features::NONE, TextMode::HereDoc).unwrap();
 	let WordPart::Param(p) = &w.parts[0] else {
 		panic!("{w:?}")
@@ -915,7 +916,7 @@ fn here_document_parameter_words_quote_like_bash() {
 	let ParamOp::Default { word, .. } = first_param(&w).op else {
 		panic!()
 	};
-	assert_eq!(word.parts, vec![WordPart::AnsiC(b"a".to_vec())]);
+	assert_eq!(word.parts, vec![WordPart::Lit(b"a".to_vec())]);
 }
 
 #[test]
