@@ -4,8 +4,8 @@
 //! One `ProcInfo` per platform, each exposing the same accessors so the
 //! builtins above stay platform-agnostic. The platform queries themselves —
 //! procfs parsing, pidfds, libproc, Toolhelp, process handles — live in
-//! [`sys`], which the identity-pinned process references
-//! (`crate::PinnedProcess`) are built on too, so each query has one
+//! [`sys`], which `pi-shell`'s identity-pinned process references
+//! (`pi_shell::process`) are built on too, so each query has one
 //! implementation and a platform fix lands once.
 
 // Consumers (`ps`, `top`, `pgrep`, `pkill`, `pidwait`, `kill`) are each
@@ -143,30 +143,6 @@ pub mod sys {
 		}
 	}
 
-	/// `PIDFD_SIGNAL_PROCESS_GROUP` (Linux 6.9): deliver the signal to the
-	/// process group the pidfd's process leads instead of to the process.
-	const PIDFD_SIGNAL_PROCESS_GROUP: libc::c_uint = 1 << 2;
-
-	/// Sends `signal` to the process group the process behind `pidfd` leads:
-	/// the group whose id is that process's pid, which the kernel finds
-	/// through the pinned process rather than the number, so it is reached
-	/// after the leader exited and a group that took the number since never
-	/// is. Linux before 6.9 rejects the flag with `EINVAL`.
-	pub fn pidfd_send_group_signal(pidfd: BorrowedFd<'_>, signal: i32) -> std::io::Result<()> {
-		// SAFETY: pidfd is open for the call. A null siginfo makes the kernel
-		// fill in what kill(2) would.
-		let sent = unsafe {
-			libc::syscall(
-				libc::SYS_pidfd_send_signal,
-				pidfd.as_raw_fd(),
-				signal,
-				std::ptr::null::<libc::siginfo_t>(),
-				PIDFD_SIGNAL_PROCESS_GROUP,
-			)
-		};
-		if sent == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-	}
-
 	/// The fields of a `/proc/<pid>/stat` line from `state` (field 3) on. The
 	/// command name before them may itself contain spaces and parentheses, so
 	/// the split starts after the *last* `)`.
@@ -190,11 +166,6 @@ pub mod sys {
 	/// The recorded parent pid (`ppid`, field 4).
 	pub fn parent_pid(pid: i32) -> Option<i32> {
 		stat_field(pid, 1)
-	}
-
-	/// The process group (`pgrp`, field 5).
-	pub fn process_group(pid: i32) -> Option<i32> {
-		stat_field(pid, 2)
 	}
 
 	/// The argument vector from `/proc/<pid>/cmdline`; `None` when unreadable.
@@ -1850,7 +1821,7 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
 /// Listing is unaffected: `pgrep` still reports ancestors and `ps` still shows
 /// them. Only signalling consults this.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub(crate) struct HostProcesses {
+pub struct HostProcesses {
 	/// This process and its ancestors, nearest first.
 	pub pids:  smallvec::SmallVec<[i32; 16]>,
 	/// The process groups those processes belong to.
@@ -1874,16 +1845,31 @@ struct ChainNode {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl HostProcesses {
-	/// Walks the parent chain from the current process, taking one process-table
-	/// snapshot.
-	pub fn resolve() -> Self {
-		Self::resolve_in(&ProcInfo::all())
+	/// Whether signalling `target` would reach this process or one of its
+	/// ancestors.
+	///
+	/// `target` follows `kill(2)`: a positive value is a pid, `0` is the caller's
+	/// own process group, `-1` is every process the caller may signal, and any
+	/// other negative value is the process group `-target`. The caller's own
+	/// group needs no special case — it is in [`Self::pgids`] by construction.
+	///
+	/// Reads the already-resolved chain, so a loop over operands walks the
+	/// process table once, not once per operand.
+	#[must_use]
+	pub fn blocks(&self, target: i32) -> bool {
+		if target == -1 || target == 0 {
+			return true;
+		}
+		match target.checked_neg() {
+			Some(pgid) if pgid > 0 => self.pgids.contains(&pgid),
+			_ => self.pids.contains(&target),
+		}
 	}
 
-	/// [`Self::resolve`] against a snapshot the caller already holds.
-	///
-	/// `pkill` snapshots the table to select its targets; this spares it a second.
-	pub fn resolve_in(all: &[ProcInfo]) -> Self {
+	/// Walks the parent chain from the current process through `all`, a
+	/// process-table snapshot the caller already holds (`pkill` snapshots the
+	/// table to select its targets; this spares it a second).
+	pub(crate) fn resolve_in(all: &[ProcInfo]) -> Self {
 		let Ok(self_pid) = i32::try_from(std::process::id()) else {
 			return Self { pids: smallvec::SmallVec::new(), pgids: smallvec::SmallVec::new() };
 		};
@@ -2151,7 +2137,7 @@ mod tests {
 	/// Guards against over-broad protection (a whole session, say).
 	#[test]
 	fn leaves_unrelated_processes_out_of_the_chain() {
-		let host = HostProcesses::resolve();
+		let host = HostProcesses::resolve_in(&ProcInfo::all());
 		assert!(
 			ProcInfo::all()
 				.iter()
@@ -2192,7 +2178,7 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn records_our_own_process_group() {
-		let host = HostProcesses::resolve();
+		let host = HostProcesses::resolve_in(&ProcInfo::all());
 		// SAFETY: getpgrp takes no arguments and touches no memory.
 		let pgid = unsafe { libc::getpgrp() };
 		assert!(host.pgids.contains(&pgid), "own process group {pgid} missing");
@@ -2202,7 +2188,7 @@ mod tests {
 	/// reason this is not a hashed set.
 	#[test]
 	fn chain_stays_in_inline_storage() {
-		let host = HostProcesses::resolve();
+		let host = HostProcesses::resolve_in(&ProcInfo::all());
 		assert!(
 			!host.pids.spilled() && !host.pgids.spilled(),
 			"chain spilled to the heap: {} pids, {} pgids",

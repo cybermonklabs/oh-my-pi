@@ -26,7 +26,6 @@ use std::{
 	io::{self, Read, Write},
 };
 
-use brush_core::{ShellExtensions, builtins::Registration};
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
 use uucore::{
 	display::Quotable,
@@ -35,7 +34,7 @@ use uucore::{
 };
 
 use crate::{
-	host::{Host, ShellCommand, Utility, format_usage, os_bytes_lossy, strip_errno, util},
+	host::{Host, ShellCommand, Utility, format_usage, os_bytes_lossy, strip_errno},
 	locale,
 	quoting_style::quoting_style_by_name,
 };
@@ -271,285 +270,6 @@ fn app() -> Command {
 		)
 }
 
-/// Creates the `env` builtin registration.
-pub(crate) fn env_builtin<SE: ShellExtensions>() -> Registration<SE> {
-	util::<Env, SE>()
-}
-
-/// What `env` does with the environment it receives and which command it
-/// runs, as its own parsing finds them.
-#[cfg(feature = "util.timeout")]
-pub(crate) struct CommandWords {
-	pub command:     Vec<String>,
-	/// `-i` or a leading `-`: start from an empty environment.
-	pub clear_env:   bool,
-	/// `--env0-from`: the file (or `-` for standard input) whose
-	/// NUL-terminated entries `env` reads first, relative to the directory
-	/// `env` runs in.
-	pub env0_from:   Option<String>,
-	pub unset:       Vec<String>,
-	pub assignments: Vec<(String, String)>,
-	/// `-C`: the directory the command runs in.
-	pub chdir:       Option<String>,
-	/// Whether an argument after the command word holds a `${VARNAME}`
-	/// value not known before `env` runs; it stands empty in `command`.
-	pub unknown_arguments: bool,
-}
-
-/// What `env` runs cannot be known before it runs: a `${VARNAME}` value that
-/// an `--env0-from` stream may set decides it, or its `-S` split grows past
-/// what the classifier follows.
-#[cfg(feature = "util.timeout")]
-pub(crate) struct Unknown;
-
-/// The command `env` runs for `argv` (its own name first): `-S` strings
-/// split (`${VARNAME}` from `lookup`, the environment `env` receives), then
-/// the words after the options, a leading `-` and the `NAME=VALUE`
-/// assignments. `Ok(None)` when it runs none: it prints the environment,
-/// refuses its arguments, never stops splitting, or is still splitting at
-/// `deadline` (when GNU `env`, which does at least as much work per round,
-/// would be too, and dies of the limit's signal). [`Unknown`] when a value
-/// `lookup` cannot know reaches an option or the command word, or the
-/// argument list grows past what this follows.
-#[cfg(feature = "util.timeout")]
-pub(crate) fn command_words(
-	argv: &[String],
-	deadline: Option<std::time::Instant>,
-	lookup: impl Fn(&str) -> Result<Option<String>, Unknown>,
-) -> Result<Option<CommandWords>, Unknown> {
-	/// The argument list a split is followed to. It bounds the memory and
-	/// the time a growing split takes here; past it what `env` runs is
-	/// unknown (its own splitting has no bound).
-	const MAX_ARGV_BYTES: usize = 2 * 1024 * 1024;
-
-	/// `env` runs nothing, unless a value not known before it runs could
-	/// change that.
-	fn runs_nothing(unknown: &[bool]) -> Result<Option<CommandWords>, Unknown> {
-		if unknown.contains(&true) { Err(Unknown) } else { Ok(None) }
-	}
-
-	let Ok(argv) = Env::rewrite_argv(argv.iter().map(OsString::from).collect()) else {
-		return Ok(None);
-	};
-	let Ok(env) = <Env as clap::Parser>::try_parse_from(argv) else {
-		return Ok(None);
-	};
-	// Which words of the split argument list hold a value `lookup` cannot
-	// know; it stands empty there, so the word keeps its place.
-	let mut unknown: Vec<bool> = Vec::new();
-	let (matches, split_argv) = match env.parsed {
-		Parsed::Matches(matches) => (matches, Vec::new()),
-		Parsed::SplitString(mut argv) => {
-			// Each round splits one `-S` and splices its words in where it
-			// was, as GNU's `getopt` rescan sees them. The options before it
-			// are already scanned, so what the rounds do next depends only on
-			// the state at that option boundary: the words from there on
-			// (which of them hold unknown values too), and whether `-v` came
-			// before. With the variables fixed the rounds are deterministic,
-			// so a state seen before means they never stop. Brent's algorithm
-			// finds such a repeat exactly, comparing each state with one kept
-			// checkpoint. An unknown value is never scanned as an option
-			// without the result being unknown, so a repeat holds for any
-			// value it takes.
-			unknown = vec![false; argv.len()];
-			let mut bytes: usize = argv.iter().map(|word| word.len()).sum();
-			let (mut start, mut debug) = (1, false);
-			let mut checkpoint: Option<(Vec<OsString>, Vec<bool>, bool)> = None;
-			let (mut power, mut since_checkpoint) = (1_usize, 0_usize);
-			while let Some(found) = scan_options_from(&argv, start, debug) {
-				let Found::SplitString(split) = found else {
-					return runs_nothing(&unknown);
-				};
-				// The options scanned up to this `-S`, its string included.
-				if unknown[start..split.index + split.words].contains(&true) {
-					return Err(Unknown);
-				}
-				if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
-					return Ok(None);
-				}
-				let mut expanded: usize = 0;
-				let split_words = split_string(
-					&split.string,
-					|name| {
-						// Past the bound the round's words are never used.
-						if expanded > MAX_ARGV_BYTES {
-							return Expansion::Unset;
-						}
-						match lookup(name) {
-							Ok(Some(value)) => {
-								expanded += value.len();
-								Expansion::Value(value)
-							},
-							Ok(None) => Expansion::Unset,
-							Err(Unknown) => Expansion::Unknown,
-						}
-					},
-					|_, _| {},
-				);
-				// Up to where an unknown value could decide it, the string
-				// splits alike for every value, so `env` refuses it whatever
-				// the values are.
-				let Ok(Split { args: words, unknown: words_unknown, undecided }) = split_words else {
-					return Ok(None);
-				};
-				if expanded > MAX_ARGV_BYTES || undecided {
-					return Err(Unknown);
-				}
-				let (index, resume_debug) = (split.index, split.debug);
-				let removed: usize = argv[index..index + split.words].iter().map(|word| word.len()).sum();
-				let added = split.prefix.as_ref().map_or(0, |prefix| prefix.len())
-					+ words.iter().map(Vec::len).sum::<usize>();
-				let prefix = split.prefix.is_some().then_some(false);
-				unknown.splice(index..index + split.words, prefix.into_iter().chain(words_unknown));
-				splice_split(&mut argv, split, &words);
-				bytes = bytes - removed + added;
-				if bytes > MAX_ARGV_BYTES {
-					return Err(Unknown);
-				}
-				(start, debug) = (index, resume_debug);
-				let (tail, tail_unknown) = (&argv[index..], &unknown[index..]);
-				if checkpoint.as_ref().is_some_and(|(kept, kept_unknown, kept_debug)| {
-					*kept_debug == debug && kept_unknown.as_slice() == tail_unknown && kept.as_slice() == tail
-				}) {
-					return Ok(None);
-				}
-				since_checkpoint += 1;
-				if since_checkpoint == power {
-					checkpoint = Some((tail.to_vec(), tail_unknown.to_vec(), debug));
-					power *= 2;
-					since_checkpoint = 0;
-				}
-			}
-			let Ok(matches) = app().try_get_matches_from(&argv) else {
-				return runs_nothing(&unknown);
-			};
-			(matches, argv)
-		},
-	};
-	if matches.get_flag(options::NULL) {
-		return runs_nothing(&unknown);
-	}
-	let Some(vars) = matches.get_many::<OsString>(options::VARS) else {
-		return runs_nothing(&unknown);
-	};
-	let mut words: Vec<String> = vars.map(|word| word.to_string_lossy().into_owned()).collect();
-	let mut clear_env = matches.get_flag(options::IGNORE_ENVIRONMENT);
-	if words.first().is_some_and(|word| word == "-") {
-		clear_env = true;
-		words.remove(0);
-	}
-	let assignment_count = words.iter().take_while(|word| word.contains('=')).count();
-	let assignments = words[..assignment_count]
-		.iter()
-		.map(|word| {
-			let (name, value) = word.split_once('=').expect("contains an equals sign");
-			(name.to_owned(), value.to_owned())
-		})
-		.collect();
-	let command = words.split_off(assignment_count);
-	if command.is_empty() {
-		return runs_nothing(&unknown);
-	}
-	// The command ends the argument list. The words up to its name decide
-	// what runs; an unknown value after it is only an argument.
-	let unknown_arguments = unknown.contains(&true);
-	if unknown_arguments {
-		let name_at = split_argv.len().checked_sub(command.len()).filter(|&at| {
-			split_argv[at..]
-				.iter()
-				.zip(&command)
-				.all(|(word, expected)| word.to_string_lossy() == expected.as_str())
-		});
-		match name_at {
-			Some(at) if !unknown[..=at].contains(&true) => {},
-			_ => return Err(Unknown),
-		}
-	}
-	let string = |id: &str| {
-		matches
-			.get_one::<OsString>(id)
-			.map(|value| value.to_string_lossy().into_owned())
-	};
-	Ok(Some(CommandWords {
-		command,
-		clear_env,
-		env0_from: string(options::ENV0_FROM),
-		unset: matches
-			.get_many::<OsString>(options::UNSET)
-			.into_iter()
-			.flatten()
-			.map(|word| word.to_string_lossy().into_owned())
-			.collect(),
-		assignments,
-		chdir: string(options::CHDIR),
-		unknown_arguments,
-	}))
-}
-
-/// The environment `env` gives its command, built as [`Run`] builds it:
-/// `initial` (the environment `env` received), or nothing under `-i`; the
-/// `--env0-from` entries `env0` holds; the unsets; the assignments. `None`
-/// when `env` refuses: an `--env0-from` file without its final NUL, or a
-/// name it cannot unset.
-#[cfg(feature = "util.timeout")]
-pub(crate) fn passed_environment(
-	initial: Vec<Vec<u8>>,
-	command: &CommandWords,
-	env0: Option<&[u8]>,
-) -> Option<Vec<Vec<u8>>> {
-	let mut env = Vec::new();
-	if command.clear_env {
-		if let Some(data) = env0 {
-			env = env0_file_entries(data)?;
-		}
-	} else {
-		env = initial;
-		let entries = match env0 {
-			Some(data) => env0_file_entries(data)?,
-			None => Vec::new(),
-		};
-		for entry in entries {
-			if entry.contains(&b'=') {
-				set_entry(&mut env, entry);
-			} else {
-				env.push(entry);
-			}
-		}
-	}
-	if !command.clear_env || env0.is_some() {
-		for name in &command.unset {
-			if name.is_empty() || name.contains('=') {
-				return None;
-			}
-			env.retain(|entry| entry_name(entry) != Some(name.as_bytes()));
-		}
-	}
-	for (name, value) in &command.assignments {
-		set_entry(&mut env, entry(name, value));
-	}
-	Some(env)
-}
-
-/// The entries of an `--env0-from` file, as `env` reads them: each ends in
-/// NUL. `None` when the file does not end in NUL, which `env` refuses.
-fn env0_file_entries(data: &[u8]) -> Option<Vec<Vec<u8>>> {
-	match data.split_last() {
-		None => Some(Vec::new()),
-		Some((&0, entries)) => Some(entries.split(|&byte| byte == 0).map(<[u8]>::to_vec).collect()),
-		Some(_) => None,
-	}
-}
-
-/// Puts the arguments `words` split from `split` in place of its `-S`
-/// option in `argv`, as GNU's `getopt` rescan sees them.
-fn splice_split(argv: &mut Vec<OsString>, split: SplitString, words: &[Vec<u8>]) {
-	let rest = argv.split_off(split.index + split.words);
-	argv.truncate(split.index);
-	argv.extend(split.prefix);
-	argv.extend(words.iter().map(|word| os_string(word)));
-	argv.extend(rest);
-}
-
 /// The message for a whitespace character used as a short option.
 fn shebang_error(c: u8) -> String {
 	format!(
@@ -615,15 +335,8 @@ fn long_option(name: &[u8]) -> Option<(&'static str, bool)> {
 /// Walks the options of `argv` (they end at the first operand) for the first
 /// `-S` or whitespace short option.
 fn scan_options(argv: &[OsString]) -> Option<Found> {
-	scan_options_from(argv, 1, false)
-}
-
-/// [`scan_options`] resumed at word `start`, with `debug` as the options
-/// before it left it: a `-S` spliced in at `start` leaves the options before
-/// it as they were.
-fn scan_options_from(argv: &[OsString], start: usize, debug: bool) -> Option<Found> {
-	let mut debug = debug;
-	let mut index = start;
+	let mut debug = false;
+	let mut index = 1;
 	while let Some(word) = argv.get(index) {
 		let bytes = os_bytes_lossy(word);
 		if bytes.as_ref() == b"--" || bytes.len() < 2 || bytes[0] != b'-' {
@@ -700,154 +413,6 @@ enum SignalOption {
 	Default,
 	Ignore,
 	Block,
-}
-
-/// What a `${VARNAME}` in a `-S` string expands to.
-enum Expansion {
-	/// The variable's value.
-	Value(String),
-	/// An unset variable: nothing, which starts no argument.
-	Unset,
-	/// A value not known before `env` runs: unset, or any value. It stands
-	/// empty in its argument, which [`Split::unknown`] marks.
-	#[cfg_attr(not(feature = "util.timeout"), allow(dead_code, reason = "only the classifier has unknown values"))]
-	Unknown,
-}
-
-/// The arguments a `-S` string splits into.
-struct Split {
-	args:      Vec<Vec<u8>>,
-	/// Which of `args` hold an [`Expansion::Unknown`].
-	#[cfg_attr(not(feature = "util.timeout"), allow(dead_code, reason = "only the classifier has unknown values"))]
-	unknown:   Vec<bool>,
-	/// Whether an unknown value decides the split's own syntax: when it may
-	/// be all that comes before a `#`, that `#` comments out the rest if the
-	/// variable is unset and is a literal character otherwise. The split
-	/// stops there.
-	#[cfg_attr(not(feature = "util.timeout"), allow(dead_code, reason = "only the classifier has unknown values"))]
-	undecided: bool,
-}
-
-/// Splits a `-S` string into arguments. The variable lookup is explicit so
-/// `env` and callers that must identify its command can use the same parser.
-/// It accepts only `${VARNAME}` expansions, as GNU does. `on_expand` sees
-/// each expansion's name and value (`None` when there is none).
-fn split_string(
-	string: &[u8],
-	mut lookup: impl FnMut(&str) -> Expansion,
-	mut on_expand: impl FnMut(&str, Option<&str>),
-) -> Result<Split, String> {
-	fn start_arg<'a>(args: &'a mut Vec<Vec<u8>>, unknown: &mut Vec<bool>, sep: &mut bool) -> &'a mut Vec<u8> {
-		if *sep {
-			*sep = false;
-			unknown.push(false);
-			return args.push_mut(Vec::new());
-		}
-		args.last_mut().expect("started")
-	}
-
-	let mut args: Vec<Vec<u8>> = Vec::new();
-	let mut unknown: Vec<bool> = Vec::new();
-	let (mut dq, mut sq, mut sep) = (false, false, true);
-	// Whether the current argument holds only unknown values, so it may not
-	// exist (each of them unset).
-	let mut maybe_absent = false;
-	let mut i = 0;
-	while i < string.len() {
-		let mut newc = string[i];
-		match newc {
-			b'\'' if !dq => {
-				sq = !sq;
-				start_arg(&mut args, &mut unknown, &mut sep);
-				maybe_absent = false;
-				i += 1;
-				continue;
-			},
-			b'"' if !sq => {
-				dq = !dq;
-				start_arg(&mut args, &mut unknown, &mut sep);
-				maybe_absent = false;
-				i += 1;
-				continue;
-			},
-			c if C_ISSPACE_CHARS.contains(&c) && !(sq || dq) => {
-				sep = true;
-				maybe_absent = false;
-				while string.get(i).is_some_and(|c| C_ISSPACE_CHARS.contains(c)) {
-					i += 1;
-				}
-				continue;
-			},
-			// '#' starting an argument comments out the rest.
-			b'#' if sep => return Ok(Split { args, unknown, undecided: false }),
-			b'#' if maybe_absent => return Ok(Split { args, unknown, undecided: true }),
-			b'\\' if !(sq && !matches!(string.get(i + 1), Some(b'\\' | b'\''))) => {
-				i += 1;
-				let Some(&escaped) = string.get(i) else {
-					return Err("invalid backslash at end of string in -S".to_owned());
-				};
-				newc = match escaped {
-					b'"' | b'#' | b'$' | b'\'' | b'\\' => escaped,
-					b'_' if !dq => {
-						i += 1;
-						sep = true;
-						maybe_absent = false;
-						continue;
-					},
-					b'_' => b' ',
-					b'c' if dq => {
-						return Err("'\\c' must not appear in double-quoted -S string".to_owned());
-					},
-					b'c' => return Ok(Split { args, unknown, undecided: false }),
-					b'f' => b'\x0c',
-					b'n' => b'\n',
-					b'r' => b'\r',
-					b't' => b'\t',
-					b'v' => b'\x0b',
-					other => {
-						return Err(format!(
-							"invalid sequence '\\{}' in -S",
-							String::from_utf8_lossy(&[other])
-						));
-					},
-				};
-			},
-			b'$' if !sq => {
-				let Some(name) = scan_varname(&string[i..]) else {
-					return Err(format!(
-						"only ${{VARNAME}} expansion is supported, error at: {}",
-						String::from_utf8_lossy(&string[i..])
-					));
-				};
-				let name = String::from_utf8_lossy(name).into_owned();
-				match lookup(&name) {
-					Expansion::Value(value) => {
-						on_expand(&name, Some(&value));
-						start_arg(&mut args, &mut unknown, &mut sep).extend(value.as_bytes());
-						maybe_absent = false;
-					},
-					Expansion::Unset => on_expand(&name, None),
-					Expansion::Unknown => {
-						on_expand(&name, None);
-						maybe_absent |= sep;
-						start_arg(&mut args, &mut unknown, &mut sep);
-						*unknown.last_mut().expect("started") = true;
-					},
-				}
-				// Past "${", the name, and "}".
-				i += name.len() + 3;
-				continue;
-			},
-			_ => {},
-		}
-		start_arg(&mut args, &mut unknown, &mut sep).push(newc);
-		maybe_absent = false;
-		i += 1;
-	}
-	if dq || sq {
-		return Err("no terminating quote in -S string".to_owned());
-	}
-	Ok(Split { args, unknown, undecided: false })
 }
 
 impl Run<'_> {
@@ -970,7 +535,7 @@ impl Run<'_> {
 			// directory updates these.
 			command = keep_directory_variables(command, &env);
 		}
-		if let Ok(stdin) = self.host.stdin.file().try_clone() {
+		if let Ok(stdin) = self.host.stdin.file().to_fd() {
 			command = command.stdin(stdin);
 		}
 		match self.host.run_command(command) {
@@ -1017,7 +582,11 @@ impl Run<'_> {
 					self.debug_quoted("     &     ", word);
 				}
 			}
-			splice_split(&mut argv, split, &words);
+			let rest = argv.split_off(split.index + split.words);
+			argv.truncate(split.index);
+			argv.extend(split.prefix);
+			argv.extend(words.iter().map(|word| os_string(word)));
+			argv.extend(rest);
 		}
 		app().try_get_matches_from(argv).map_err(|error| {
 			// As the shared adapter renders parse results.
@@ -1113,33 +682,106 @@ impl Run<'_> {
 	/// uutils' splitter also expands `$VAR` and `${VAR:-default}` and reports
 	/// positions; GNU accepts neither form, so this follows GNU.
 	fn build_argv(&mut self, string: &[u8]) -> Result<Vec<Vec<u8>>, Exit> {
-		let mut notes = Vec::new();
-		let host = &*self.host;
-		let split = split_string(
-			string,
-			// Once `env` is cancelled it expands nothing more, so even a
-			// split of many large values ends at once, as GNU `env` dies of
-			// the signal mid-split.
-			|name| {
-				if host.is_cancelled() {
-					return Expansion::Unset;
-				}
-				host.var(name).map_or(Expansion::Unset, |value| Expansion::Value(value.to_owned()))
-			},
-			|name, value| {
-				notes.push(match value {
-					Some(value) => format!("expanding ${{{name}}} into {}\n", value.quote()),
-					None => format!("replacing ${{{name}}} with empty string\n"),
-				});
-			},
-		);
-		if self.host.is_cancelled() {
-			return Err(EXIT_INTERRUPTED);
+		fn start_arg<'a>(args: &'a mut Vec<Vec<u8>>, sep: &mut bool) -> &'a mut Vec<u8> {
+			if *sep {
+				*sep = false;
+				return args.push_mut(Vec::new());
+			}
+			args.last_mut().expect("started")
 		}
-		for note in &notes {
-			self.vmsg(note);
+
+		let mut args: Vec<Vec<u8>> = Vec::new();
+		let (mut dq, mut sq, mut sep) = (false, false, true);
+		let mut i = 0;
+		while i < string.len() {
+			if self.host.is_cancelled() {
+				return Err(EXIT_INTERRUPTED);
+			}
+			let mut newc = string[i];
+			match newc {
+				b'\'' if !dq => {
+					sq = !sq;
+					start_arg(&mut args, &mut sep);
+					i += 1;
+					continue;
+				},
+				b'"' if !sq => {
+					dq = !dq;
+					start_arg(&mut args, &mut sep);
+					i += 1;
+					continue;
+				},
+				c if C_ISSPACE_CHARS.contains(&c) && !(sq || dq) => {
+					sep = true;
+					while string.get(i).is_some_and(|c| C_ISSPACE_CHARS.contains(c)) {
+						i += 1;
+					}
+					continue;
+				},
+				// '#' starting an argument comments out the rest.
+				b'#' if sep => return Ok(args),
+				b'\\' if !(sq && !matches!(string.get(i + 1), Some(b'\\' | b'\''))) => {
+					i += 1;
+					let Some(&escaped) = string.get(i) else {
+						return Err(self.die("invalid backslash at end of string in -S"));
+					};
+					newc = match escaped {
+						b'"' | b'#' | b'$' | b'\'' | b'\\' => escaped,
+						b'_' if !dq => {
+							i += 1;
+							sep = true;
+							continue;
+						},
+						b'_' => b' ',
+						b'c' if dq => {
+							return Err(self.die("'\\c' must not appear in double-quoted -S string"));
+						},
+						b'c' => return Ok(args),
+						b'f' => b'\x0c',
+						b'n' => b'\n',
+						b'r' => b'\r',
+						b't' => b'\t',
+						b'v' => b'\x0b',
+						other => {
+							let message =
+								format!("invalid sequence '\\{}' in -S", String::from_utf8_lossy(&[other]));
+							return Err(self.die(&message));
+						},
+					};
+				},
+				b'$' if !sq => {
+					let Some(name) = scan_varname(&string[i..]) else {
+						let message = format!(
+							"only ${{VARNAME}} expansion is supported, error at: {}",
+							String::from_utf8_lossy(&string[i..])
+						);
+						return Err(self.die(&message));
+					};
+					let name = String::from_utf8_lossy(name).into_owned();
+					match self.host.var(&name) {
+						Some(value) => {
+							start_arg(&mut args, &mut sep).extend_from_slice(value.as_bytes());
+							if self.debug {
+								let note = format!("expanding ${{{name}}} into {}\n", value.quote());
+								self.vmsg(&note);
+							}
+						},
+						None if self.debug => self.vmsg(&format!("replacing ${{{name}}} with empty string\n")),
+						None => {},
+					}
+					// Past "${", the name, and "}".
+					i += name.len() + 3;
+					continue;
+				},
+				_ => {},
+			}
+			start_arg(&mut args, &mut sep).push(newc);
+			i += 1;
 		}
-		split.map(|split| split.args).map_err(|message| self.die(&message))
+		if dq || sq {
+			return Err(self.die("no terminating quote in -S string"));
+		}
+		Ok(args)
 	}
 
 	/// Reads `--env0-from` entries: NUL-terminated, from a file or `-`
@@ -1159,10 +801,18 @@ impl Run<'_> {
 				return Err(self.die(&message));
 			},
 		};
-		env0_file_entries(&data).ok_or_else(|| {
-			let message = format!("{}: file must end with a NUL byte", os_string(file).maybe_quote());
-			self.die(&message)
-		})
+		match data.split_last() {
+			None => Ok(Vec::new()),
+			Some((&0, entries)) => Ok(entries
+				.split(|&byte| byte == 0)
+				.map(<[u8]>::to_vec)
+				.collect()),
+			Some(_) => {
+				let message =
+					format!("{}: file must end with a NUL byte", os_string(file).maybe_quote());
+				Err(self.die(&message))
+			},
+		}
 	}
 
 	/// Merges `--env0-from` entries into `env`: an assignment replaces the
@@ -1721,59 +1371,66 @@ mod sig {
 mod tests {
 	use std::{ffi::OsString, io::Write, path::Path};
 
-	use crate::host::{Host, ShellCommand, Utility, run_script};
+	use crate::host::{Host, ShellCommand, Utility, run_extra};
 
-	/// Runs `script` in a real shell from `cwd`, in the C locale unless the
-	/// script sets its own.
-	async fn sh(script: &str) -> (i32, String, String) {
-		sh_in(script, &std::env::temp_dir()).await
+	/// Runs `env ARGS` from the temp directory in the C locale, its commands
+	/// served by the test runner.
+	async fn env(args: &[&str]) -> (i32, String, String) {
+		env_in(&std::env::temp_dir(), args, &[]).await
 	}
 
-	async fn sh_in(script: &str, cwd: &Path) -> (i32, String, String) {
-		run_script(&format!("export LC_ALL=C\n{script}"), "", cwd).await
+	/// Runs `env ARGS` from `cwd` in the C locale with `vars` exported.
+	async fn env_in(cwd: &Path, args: &[&str], vars: &[(&str, &str)]) -> (i32, String, String) {
+		let argv: Vec<&str> = std::iter::once("env").chain(args.iter().copied()).collect();
+		let mut exported = vec![("LC_ALL", "C")];
+		exported.extend_from_slice(vars);
+		run_extra(&argv, "", cwd, &exported).await
 	}
 
 	#[tokio::test]
 	async fn ignore_environment_runs_command_with_only_assignments() {
-		let (code, out, err) = sh("env -i FOO=1 env").await;
+		let (code, out, err) = env(&["-i", "FOO=1", "env"]).await;
 		assert_eq!((code, out.as_str(), err.as_str()), (0, "FOO=1\n", ""));
 		// Printed in environment order: assignments append.
-		let (code, out, _) = sh("env - FOO=1 BAR='x y'").await;
+		let (code, out, _) = env(&["-", "FOO=1", "BAR=x y"]).await;
 		assert_eq!((code, out.as_str()), (0, "FOO=1\nBAR='x y'\n"));
-		let (code, out, _) = sh("env -i -i A=1").await;
+		let (code, out, _) = env(&["-i", "-i", "A=1"]).await;
 		assert_eq!((code, out.as_str()), (0, "A=1\n"));
 	}
 
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn external_command_sees_only_the_changed_environment() {
+		let dir = std::env::temp_dir();
+		let home = [("HOME", "/h")];
 		let (code, out, err) =
-			sh("export HOME=/h; env -i FOO=1 /bin/sh -c 'echo $FOO ${HOME-unset}'").await;
+			env_in(&dir, &["-i", "FOO=1", "/bin/sh", "-c", "echo $FOO ${HOME-unset}"], &home).await;
 		assert_eq!((code, out.as_str(), err.as_str()), (0, "1 unset\n", ""));
-		let (code, out, _) = sh("export HOME=/h; env -u HOME /bin/sh -c 'echo ${HOME-unset}'").await;
+		let (code, out, _) = env_in(&dir, &["-u", "HOME", "/bin/sh", "-c", "echo ${HOME-unset}"], &home).await;
 		assert_eq!((code, out.as_str()), (0, "unset\n"));
 	}
 
 	#[tokio::test]
 	async fn assignments_reach_builtin_commands() {
-		let (code, out, _) = sh("env FOO=bar env | grep '^FOO='").await;
-		assert_eq!((code, out.as_str()), (0, "FOO=bar\n"));
-		let (code, out, _) = sh("export X=1; env -u X env | grep -c '^X=' ; true").await;
-		assert_eq!((code, out.as_str()), (0, "0\n"));
+		let (code, out, _) = env(&["FOO=bar", "env"]).await;
+		assert_eq!(code, 0);
+		assert_eq!(out.lines().filter(|line| line.starts_with("FOO=")).collect::<Vec<_>>(), ["FOO=bar"]);
+		let (code, out, _) = env_in(&std::env::temp_dir(), &["-u", "X", "env"], &[("X", "1")]).await;
+		assert_eq!(code, 0);
+		assert!(!out.lines().any(|line| line.starts_with("X=")), "{out}");
 	}
 
 	/// Options end at the first operand: the rest belongs to the command.
 	#[tokio::test]
 	async fn options_stop_at_the_first_operand() {
-		let (code, _, err) = sh("env -i A=1 env -i B=2 -u A env").await;
+		let (code, _, err) = env(&["-i", "A=1", "env", "-i", "B=2", "-u", "A", "env"]).await;
 		assert_eq!((code, err.as_str()), (127, "env: '-u': No such file or directory\n"));
-		let (code, out, _) = sh("env -i A=1 printf '%s,' -i -u; echo").await;
-		assert_eq!((code, out.as_str()), (0, "-i,-u,\n"));
+		let (code, out, _) = env(&["-i", "A=1", "echo", "-i", "-u"]).await;
+		assert_eq!((code, out.as_str()), (0, "-i -u\n"));
 	}
 
 	/// Runs `env` four times through [`Host::run_command`], alternating
-	/// commands with and without environment changes; sequential commands
-	/// share one reused worker subshell.
+	/// commands with and without environment changes.
 	#[derive(clap::Parser)]
 	struct FourRuns {}
 
@@ -1806,42 +1463,27 @@ mod tests {
 	}
 
 	/// Contract: changes apply to that one command only; the next command
-	/// run by the same reused worker, and the invoking shell, see the
-	/// original environment.
+	/// sees the original environment.
 	#[tokio::test]
 	async fn changes_do_not_leak_into_later_commands() {
 		use std::io::{Read, Seek};
 
-		use brush_core::{
-			ProfileLoadBehavior, RcLoadBehavior, Shell, SourceInfo,
-			openfiles::{OpenFile, OpenFiles},
-		};
+		use crate::extras::{Fd, Invocation};
 
-		use crate::{
-			factory::{BuiltinSet, default_builtins, utility_builtins},
-			host::util,
-		};
-
-		let mut shell = Shell::builder()
-			.profile(ProfileLoadBehavior::Skip)
-			.rc(RcLoadBehavior::Skip)
-			.builtins(default_builtins(BuiltinSet::BashMode))
-			.build()
-			.await
-			.unwrap();
-		for (name, builtin) in utility_builtins() {
-			shell.register_builtin(name, builtin);
-		}
-		shell.register_builtin("four-runs", util::<FourRuns, _>());
 		let mut output = tempfile::tempfile().unwrap();
-		let mut params = shell.default_exec_params();
-		params.set_fd(OpenFiles::STDOUT_FD, OpenFile::from(output.try_clone().unwrap()));
-		let script = "export KEEP=k DROP=d; four-runs; env -u KEEP true; env";
-		let result = shell
-			.run_string(script, &SourceInfo::from("test"), &params)
-			.await
-			.unwrap();
-		assert_eq!(u8::from(result.exit_code), 0);
+		let vars: std::collections::HashMap<String, String> =
+			[("KEEP", "k"), ("DROP", "d")].map(|(name, value)| (name.to_string(), value.to_string())).into();
+		let cwd = std::env::temp_dir();
+		let mut invocation = Invocation::new(vec!["four-runs".into()], cwd.clone(), pi_vfs::Fs::native());
+		invocation.env = vars.clone();
+		invocation.stdio = [Fd::Closed, Fd::File(output.try_clone().unwrap()), Fd::Closed];
+		invocation.commands = Some(Box::new(crate::host::TestRunner::new(
+			vars,
+			cwd,
+			output.try_clone().unwrap(),
+			tempfile::tempfile().unwrap(),
+		)));
+		assert_eq!(crate::host::run_utility::<FourRuns>(invocation).await, 0);
 
 		let mut text = String::new();
 		output.rewind().unwrap();
@@ -1867,16 +1509,14 @@ mod tests {
 			"--",
 			"DROP=d",
 			"KEEP=k",
-			"DROP=d",
-			"KEEP=k",
 		]);
 	}
 
 	#[tokio::test]
 	async fn env_running_env_twice_sees_each_layer() {
-		let (code, out, _) = sh("env -i A=1 env B=2 env").await;
+		let (code, out, _) = env(&["-i", "A=1", "env", "B=2", "env"]).await;
 		assert_eq!((code, out.as_str()), (0, "A=1\nB=2\n"));
-		let (code, out, _) = sh("env -i A=1 env -u A B=2 env").await;
+		let (code, out, _) = env(&["-i", "A=1", "env", "-u", "A", "B=2", "env"]).await;
 		assert_eq!((code, out.as_str()), (0, "B=2\n"));
 	}
 
@@ -1885,28 +1525,32 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let target = dir.path().join("sub");
 		std::fs::create_dir(&target).unwrap();
-		let (code, out, err) = sh_in("env -C sub pwd; pwd", dir.path()).await;
+		let (code, out, err) = env_in(dir.path(), &["-C", "sub", "pwd"], &[]).await;
 		assert_eq!(err, "");
 		assert_eq!(code, 0);
-		assert_eq!(out, format!("{}\n{}\n", target.display(), dir.path().display()));
+		assert_eq!(out, format!("{}\n", target.display()));
 		// As `chdir` does, -C leaves PWD as it was. Literal style: a Windows
 		// path's backslashes would otherwise print shell-quoted.
-		let script = "export QUOTING_STYLE=literal; env -C sub env | grep '^PWD='";
-		let (code, out, _) = sh_in(script, dir.path()).await;
-		assert_eq!((code, out), (0, format!("PWD={}\n", dir.path().display())));
+		let pwd = dir.path().display().to_string();
+		let vars = [("QUOTING_STYLE", "literal"), ("PWD", pwd.as_str())];
+		let (code, out, _) = env_in(dir.path(), &["-C", "sub", "env"], &vars).await;
+		assert_eq!(code, 0);
+		assert_eq!(out.lines().filter(|line| line.starts_with("PWD=")).collect::<Vec<_>>(), [format!(
+			"PWD={pwd}"
+		)]);
 	}
 
 	#[tokio::test]
 	async fn chdir_failures_exit_125() {
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::write(dir.path().join("file"), "").unwrap();
-		let (code, _, err) = sh_in("env -C nonexist true", dir.path()).await;
+		let (code, _, err) = env_in(dir.path(), &["-C", "nonexist", "true"], &[]).await;
 		assert_eq!(code, 125);
 		assert_eq!(err, "env: cannot change directory to 'nonexist': No such file or directory\n");
-		let (code, _, err) = sh_in("env -C file true", dir.path()).await;
+		let (code, _, err) = env_in(dir.path(), &["-C", "file", "true"], &[]).await;
 		assert_eq!(code, 125);
 		assert_eq!(err, "env: cannot change directory to 'file': Not a directory\n");
-		let (code, _, err) = sh_in("env -C sub", dir.path()).await;
+		let (code, _, err) = env_in(dir.path(), &["-C", "sub"], &[]).await;
 		assert_eq!(code, 125);
 		assert_eq!(
 			err,
@@ -1916,44 +1560,54 @@ mod tests {
 
 	#[tokio::test]
 	async fn split_string_splits_quotes_and_expands() {
-		let (code, out, _) = sh("env -S 'echo a  b'").await;
+		let (code, out, _) = env(&["-S", "echo a  b"]).await;
 		assert_eq!((code, out.as_str()), (0, "a b\n"));
-		let (code, out, _) =
-			sh(r#"export V='v w'; env -S "printf %s| 'x y' \"\${V}\"\_z\tq #c" ; echo"#).await;
-		assert_eq!((code, out.as_str()), (0, "x y|v w|z\tq|\n"));
-		let (code, out, _) = sh(r#"env -S"-i A=1 env" ; env -S 'printf [%s] a\cb' ; echo"#).await;
-		assert_eq!((code, out.as_str()), (0, "A=1\n[a]\n"));
+		let (code, out, _) = env_in(
+			&std::env::temp_dir(),
+			&["-S", r#"echo 'x y' "${V}"\_z\tq #c"#],
+			&[("V", "v w")],
+		)
+		.await;
+		assert_eq!((code, out.as_str()), (0, "x y v w z\tq\n"));
+		let (code, out, _) = env(&["-S-i A=1 env"]).await;
+		assert_eq!((code, out.as_str()), (0, "A=1\n"));
+		let (code, out, _) = env(&["-S", r"echo [a]\cb"]).await;
+		assert_eq!((code, out.as_str()), (0, "[a]\n"));
 		// The split replaces only the -S argument; later operands follow.
-		let (code, out, _) = sh("env -S'printf %s,' a b; echo").await;
-		assert_eq!((code, out.as_str()), (0, "a,b,\n"));
+		let (code, out, _) = env(&["-Secho a", "b"]).await;
+		assert_eq!((code, out.as_str()), (0, "a b\n"));
 		// Options the split carries are parsed; an assignment ends them.
-		let (code, out, _) = sh("env -i --split-string='A=1 printf %s,' -i; echo").await;
-		assert_eq!((code, out.as_str()), (0, "-i,\n"));
-		let (code, out, _) = sh("env -iS'B=2 -u' A=1; env -i -vS 'C=3' 2>/dev/null").await;
+		let (code, out, _) = env(&["-i", "--split-string=A=1 echo", "-i"]).await;
+		assert_eq!((code, out.as_str()), (0, "-i\n"));
+		// `B=2` ends the split's options, so `-u` is no option: nothing runs.
+		let (code, out, _) = env(&["-iSB=2 -u", "A=1"]).await;
+		assert_ne!(code, 0);
+		assert_eq!(out, "");
+		let (code, out, _) = env(&["-i", "-vS", "C=3"]).await;
 		assert_eq!((code, out.as_str()), (0, "C=3\n"));
 	}
 
 	#[tokio::test]
 	async fn split_string_errors_exit_125() {
 		let cases = [
-			(r"env -S 'echo a\q'", "env: invalid sequence '\\q' in -S\n"),
-			(r#"env -S 'echo "a\c"'"#, "env: '\\c' must not appear in double-quoted -S string\n"),
-			(r"env -S 'echo a\'", "env: invalid backslash at end of string in -S\n"),
-			(r#"env -S 'echo "a'"#, "env: no terminating quote in -S string\n"),
-			(r"env -S 'echo $HOME'", "env: only ${VARNAME} expansion is supported, error at: $HOME\n"),
+			(r"echo a\q", "env: invalid sequence '\\q' in -S\n"),
+			(r#"echo "a\c""#, "env: '\\c' must not appear in double-quoted -S string\n"),
+			(r"echo a\", "env: invalid backslash at end of string in -S\n"),
+			(r#"echo "a"#, "env: no terminating quote in -S string\n"),
+			(r"echo $HOME", "env: only ${VARNAME} expansion is supported, error at: $HOME\n"),
 		];
-		for (script, want) in cases {
-			let (code, out, err) = sh(script).await;
-			assert_eq!((code, out.as_str(), err.as_str()), (125, "", want), "{script}");
+		for (split, want) in cases {
+			let (code, out, err) = env(&["-S", split]).await;
+			assert_eq!((code, out.as_str(), err.as_str()), (125, "", want), "{split}");
 		}
 	}
 
 	#[tokio::test]
 	async fn missing_and_unrunnable_commands() {
-		let (code, _, err) = sh("env nonexistent-command-xyz").await;
+		let (code, _, err) = env(&["nonexistent-command-xyz"]).await;
 		assert_eq!(code, 127);
 		assert_eq!(err, "env: 'nonexistent-command-xyz': No such file or directory\n");
-		let (code, _, err) = sh("env 'a b'").await;
+		let (code, _, err) = env(&["a b"]).await;
 		assert_eq!(code, 127);
 		assert_eq!(
 			err,
@@ -1961,24 +1615,27 @@ mod tests {
 		);
 		#[cfg(unix)]
 		{
-			let (code, _, err) = sh("env /").await;
+			let (code, _, err) = env(&["/"]).await;
 			assert_eq!((code, err.as_str()), (126, "env: '/': Permission denied\n"));
 		}
 	}
 
 	#[tokio::test]
 	async fn command_status_and_stdin_pass_through() {
-		let (code, ..) = sh("env sh -c 'exit 3'").await;
-		assert_eq!(code, 3);
-		let (code, out, _) = sh("echo piped | env cat").await;
+		#[cfg(unix)]
+		{
+			let (code, ..) = env(&["sh", "-c", "exit 3"]).await;
+			assert_eq!(code, 3);
+		}
+		let (code, out, _) = run_extra(&["env", "cat"], "piped\n", &std::env::temp_dir(), &[]).await;
 		assert_eq!((code, out.as_str()), (0, "piped\n"));
 	}
 
 	#[tokio::test]
 	async fn null_output_and_its_conflict_with_a_command() {
-		let (code, out, _) = sh("env -0 -i A='x y' B=").await;
+		let (code, out, _) = env(&["-0", "-i", "A=x y", "B="]).await;
 		assert_eq!((code, out.as_str()), (0, "A=x y\0B=\0"));
-		let (code, _, err) = sh("env -0 true").await;
+		let (code, _, err) = env(&["-0", "true"]).await;
 		assert_eq!(code, 125);
 		assert_eq!(
 			err,
@@ -1988,13 +1645,14 @@ mod tests {
 
 	#[tokio::test]
 	async fn printed_values_are_shell_quoted_per_quoting_style() {
-		let (code, out, _) = sh("env -i 'A=b c' X= 'S=a#' 'D=$x'").await;
+		let (code, out, _) = env(&["-i", "A=b c", "X=", "S=a#", "D=$x"]).await;
 		assert_eq!((code, out.as_str()), (0, "A='b c'\nX=\nS=a#\nD='$x'\n"));
-		let (_, out, _) = sh("QUOTING_STYLE=literal env -i 'A=b c'").await;
+		let dir = std::env::temp_dir();
+		let (_, out, _) = env_in(&dir, &["-i", "A=b c"], &[("QUOTING_STYLE", "literal")]).await;
 		assert_eq!(out, "A=b c\n");
-		let (_, out, _) = sh("QUOTING_STYLE=c env -i 'A=b c'").await;
+		let (_, out, _) = env_in(&dir, &["-i", "A=b c"], &[("QUOTING_STYLE", "c")]).await;
 		assert_eq!(out, "\"A\"=\"b c\"\n");
-		let (_, out, err) = sh("QUOTING_STYLE=sh env -i 'A=b c'").await;
+		let (_, out, err) = env_in(&dir, &["-i", "A=b c"], &[("QUOTING_STYLE", "sh")]).await;
 		assert_eq!(out, "A='b c'\n");
 		assert_eq!(err, "env: ignoring invalid value of environment variable QUOTING_STYLE: 'sh'\n");
 	}
@@ -2003,48 +1661,59 @@ mod tests {
 	/// short option (a shebang line without -S) also suggests -S.
 	#[tokio::test]
 	async fn usage_errors_exit_125() {
-		for script in ["env -x", "env --foo=bar", "env -u", "env --unset", "env --null=x", "env --de"]
-		{
-			let (code, out, err) = sh(script).await;
-			assert_eq!((code, out.as_str()), (125, ""), "{script}");
-			assert!(err.starts_with("error: "), "{script}: {err}");
+		for args in [
+			&["-x"][..],
+			&["--foo=bar"],
+			&["-u"],
+			&["--unset"],
+			&["--null=x"],
+			&["--de"],
+		] {
+			let (code, out, err) = env(args).await;
+			assert_eq!((code, out.as_str()), (125, ""), "{args:?}");
+			assert!(err.starts_with("error: "), "{args:?}: {err}");
 		}
-		let (code, _, err) = sh("env '-i true'").await;
+		let (code, _, err) = env(&["-i true"]).await;
 		assert_eq!(code, 125);
 		assert_eq!(
 			err,
 			"env: invalid option -- ' '\nenv: use -[v]S to pass options in shebang lines\nTry 'env \
 			 --help' for more information.\n"
 		);
-		for (script, want) in [
-			("env --ignore-signal=FOO true", "env: 'FOO': invalid signal\n"),
-			("env --block-signal=0 true", "env: '0': invalid signal\n"),
+		for (option, want) in [
+			("--ignore-signal=FOO", "env: 'FOO': invalid signal\n"),
+			("--block-signal=0", "env: '0': invalid signal\n"),
 		] {
-			let (code, _, err) = sh(script).await;
-			assert_eq!(code, 125, "{script}");
-			assert_eq!(err, format!("{want}Try 'env --help' for more information.\n"), "{script}");
+			let (code, _, err) = env(&[option, "true"]).await;
+			assert_eq!(code, 125, "{option}");
+			assert_eq!(err, format!("{want}Try 'env --help' for more information.\n"), "{option}");
 		}
 	}
 
 	#[tokio::test]
 	async fn unset_rejects_invalid_names() {
-		let (code, _, err) = sh("env -u A=B true").await;
+		let (code, _, err) = env(&["-u", "A=B", "true"]).await;
 		assert_eq!((code, err.as_str()), (125, "env: cannot unset 'A=B': Invalid argument\n"));
-		let (code, _, err) = sh("env -u '' true").await;
+		let (code, _, err) = env(&["-u", "", "true"]).await;
 		assert_eq!((code, err.as_str()), (125, "env: cannot unset '': Invalid argument\n"));
 	}
 
 	#[tokio::test]
 	async fn double_dash_and_abbreviations() {
-		let (code, out, _) = sh("env --ignore-e -- A=1").await;
+		let (code, out, _) = env(&["--ignore-e", "--", "A=1"]).await;
 		assert_eq!((code, out.as_str()), (0, "A=1\n"));
-		let (code, out, _) = sh("env -i -- -i 2>&1; echo $?").await;
-		assert_eq!((code, out.as_str()), (0, "env: '-i': No such file or directory\n127\n"));
+		let (code, out, err) = env(&["-i", "--", "-i"]).await;
+		assert_eq!((code, out.as_str(), err.as_str()), (127, "", "env: '-i': No such file or directory\n"));
 	}
 
 	#[tokio::test]
 	async fn debug_traces_each_step() {
-		let (code, _, err) = sh("export V=x; env -v -i -a zz -S 'A=1 true ${V} ${NOPE}' y").await;
+		let (code, _, err) = env_in(
+			&std::env::temp_dir(),
+			&["-v", "-i", "-a", "zz", "-S", "A=1 true ${V} ${NOPE}", "y"],
+			&[("V", "x")],
+		)
+		.await;
 		assert_eq!(code, 0);
 		assert_eq!(
 			err,
@@ -2059,14 +1728,14 @@ mod tests {
 	async fn env0_from_file_merges_entries() {
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::write(dir.path().join("vars"), b"A=1\0B=x y\0A=2\0").unwrap();
-		let (code, out, _) = sh_in("env -i --env0-from=vars", dir.path()).await;
+		let (code, out, _) = env_in(dir.path(), &["-i", "--env0-from=vars"], &[]).await;
 		assert_eq!((code, out.as_str()), (0, "A=1\nB='x y'\nA=2\n"));
-		let (code, out, _) = sh_in("env -i --env0-from=vars -u A C=3 env", dir.path()).await;
+		let (code, out, _) = env_in(dir.path(), &["-i", "--env0-from=vars", "-u", "A", "C=3", "env"], &[]).await;
 		assert_eq!((code, out.as_str()), (0, "B='x y'\nC=3\n"));
 		std::fs::write(dir.path().join("bad"), b"A=1").unwrap();
-		let (code, _, err) = sh_in("env --env0-from=bad", dir.path()).await;
+		let (code, _, err) = env_in(dir.path(), &["--env0-from=bad"], &[]).await;
 		assert_eq!((code, err.as_str()), (125, "env: bad: file must end with a NUL byte\n"));
-		let (code, _, err) = sh_in("env --env0-from=missing", dir.path()).await;
+		let (code, _, err) = env_in(dir.path(), &["--env0-from=missing"], &[]).await;
 		assert_eq!(
 			(code, err.as_str()),
 			(125, "env: cannot read 'missing': No such file or directory\n")
@@ -2079,13 +1748,13 @@ mod tests {
 	#[tokio::test]
 	async fn signal_options() {
 		// Only signals the test process itself ignores may be listed.
-		let (code, _, err) = sh("env --default-signal=INT,PIPE --list-signal-handling true").await;
+		let (code, _, err) = env(&["--default-signal=INT,PIPE", "--list-signal-handling", "true"]).await;
 		assert_eq!(code, 0);
 		assert!(err.lines().all(|line| line.ends_with("): IGNORE")), "{err}");
 		assert!(!err.contains("INT ") && !err.contains("PIPE "), "{err}");
-		let (code, _, err) = sh("env --ignore-signal=, --default-signal= true").await;
+		let (code, _, err) = env(&["--ignore-signal=,", "--default-signal=", "true"]).await;
 		assert_eq!((code, err.as_str()), (0, ""));
-		let (code, _, err) = sh("env --ignore-signal=USR1 true").await;
+		let (code, _, err) = env(&["--ignore-signal=USR1", "true"]).await;
 		assert_eq!(code, 125);
 		assert_eq!(
 			err,
@@ -2094,11 +1763,11 @@ mod tests {
 				libc::SIGUSR1
 			)
 		);
-		let (code, _, err) = sh("env --block-signal=HUP true").await;
+		let (code, _, err) = env(&["--block-signal=HUP", "true"]).await;
 		assert_eq!(code, 125);
 		assert_eq!(err, "env: failed to set signal process mask: Operation not supported\n");
 		// Later options win, in command-line order; 143 names TERM as `$?` does.
-		let (code, _, err) = sh("env -v --block-signal=KILL --default-signal=143 true").await;
+		let (code, _, err) = env(&["-v", "--block-signal=KILL", "--default-signal=143", "true"]).await;
 		assert_eq!(code, 0);
 		assert_eq!(
 			err,
@@ -2108,17 +1777,17 @@ mod tests {
 				term = libc::SIGTERM
 			)
 		);
-		let (code, _, err) = sh("env -v --default-signal=HUP --block-signal true").await;
+		let (code, _, err) = env(&["-v", "--default-signal=HUP", "--block-signal", "true"]).await;
 		assert_eq!(code, 125);
 		assert!(err.contains("signal HUP (1) mask set to BLOCK\n"), "{err}");
-		let (code, _, err) = sh("env -v --block-signal --default-signal=HUP true").await;
+		let (code, _, err) = env(&["-v", "--block-signal", "--default-signal=HUP", "true"]).await;
 		assert_eq!(code, 125);
 		assert!(err.contains("signal HUP (1) mask set to UNBLOCK\n"), "{err}");
 	}
 
 	#[tokio::test]
 	async fn help_and_version() {
-		let (code, out, err) = sh("env --help").await;
+		let (code, out, err) = env(&["--help"]).await;
 		assert_eq!((code, err.as_str()), (0, ""));
 		assert!(out.contains("Usage: env [OPTION]... [-] [NAME=VALUE]... [COMMAND [ARG]...]\n"));
 		assert!(out.contains("--split-string"), "{out}");
@@ -2127,11 +1796,11 @@ mod tests {
 				.ends_with("-    the exit status of COMMAND otherwise"),
 			"{out}"
 		);
-		let (code, out, _) = sh("env -i --version").await;
+		let (code, out, _) = env(&["-i", "--version"]).await;
 		assert_eq!(code, 0);
 		assert!(out.starts_with("env "), "{out}");
 		// Through -S as well.
-		let (code, out, _) = sh("env -S--version").await;
+		let (code, out, _) = env(&["-S--version"]).await;
 		assert_eq!(code, 0);
 		assert!(out.starts_with("env "), "{out}");
 	}

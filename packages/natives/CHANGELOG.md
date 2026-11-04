@@ -4,19 +4,62 @@
 
 ### Fixed
 
-- Fixed cancelling a bash tool command that runs under `timeout` (with or without `--foreground`), or the run reaching its own time limit, leaving the command's background processes running ([#17750](https://github.com/can1357/oh-my-pi/pull/17750) by [@sjawhar](https://github.com/sjawhar))
-- Fixed `timeout --preserve-status -k` returning 130 instead of 137 when it had to kill the command ([#17750](https://github.com/can1357/oh-my-pi/pull/17750) by [@sjawhar](https://github.com/sjawhar))
-- Fixed bash tool cancellation, `timeout`, PTY sessions and `Process.terminateTree` sometimes signalling an unrelated process that had taken the process ID or process group number of one that already exited ([#17750](https://github.com/can1357/oh-my-pi/pull/17750) by [@sjawhar](https://github.com/sjawhar))
-- Fixed bash tool cancellation, `timeout`, and `Process.killTree`/`terminateTree` sending the same process TERM twice, which ran a `trap … TERM` cleanup twice and could stop it before its one-second limit ([#17750](https://github.com/can1357/oh-my-pi/pull/17750) by [@sjawhar](https://github.com/sjawhar))
-- Fixed `timeout` around `eval` or a shell function (also one named like a path, such as `f/x`) running the command's next steps after the time limit had killed its current one, and `timeout -s STOP` leaving the command stopped where GNU `timeout` continues it, or with `--foreground` waits for `-k` ([#17793](https://github.com/can1357/oh-my-pi/pull/17793) by [@sjawhar](https://github.com/sjawhar))
-- Fixed `timeout --preserve-status` reporting 143 instead of the program's own status when the program runs through `command`, `env` (also `env -S`), `nohup`, an alias or an inner `timeout`, and an inner `timeout`'s command receiving signals that GNU `timeout` does not pass on ([#17793](https://github.com/can1357/oh-my-pi/pull/17793) by [@sjawhar](https://github.com/sjawhar))
-- Fixed shell aliases expanding only for a command's first word: as in Bash, an alias's replacement now expands in turn, and an alias whose value ends in a space makes the next unquoted word expand too ([#17793](https://github.com/can1357/oh-my-pi/pull/17793) by [@sjawhar](https://github.com/sjawhar))
+- `timeout --preserve-status` now keeps a program's signal-handler status through `command`, `env`, `nohup` and nested `timeout`, including commands named by streamed environment input ([#17793](https://github.com/can1357/oh-my-pi/pull/17793) by [@sjawhar](https://github.com/sjawhar))
+- Fixed nested timeout signal forwarding and kill deadlines, and kept shell operands from starting another command after a terminating signal ([#17793](https://github.com/can1357/oh-my-pi/pull/17793) by [@sjawhar](https://github.com/sjawhar))
+### Changed
+
+- Made the bash tool's shell faster on string appends (`s+=x`), sourcing files full of function definitions (each body compiles on first call), quoted `"$var"`/`"$1"` arguments and file redirections
+
+### Fixed
+
+- Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
+### Fixed
+
+- Fixed `el.type` and `el.press(keys)` on Wayland moving focus inside the element's app (GNOME showed "… is ready") before refusing the call: they are now refused before anything reaches the app ([#17915](https://github.com/can1357/oh-my-pi/pull/17915) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- Fixed Windows background drags in Tk apps (Python's tkinter, IDLE) reporting success while nothing happened; they now follow `computer.backgroundFallback` ([#17913](https://github.com/can1357/oh-my-pi/pull/17913) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- The bash tool's built-in `rsync` now reports a `--log-file` it cannot open as rsync 3.5.1 does: its client names itself `[client]` and a remote server `[server]` in `failed to open log-file …`, and an empty `--log-file=` sends the log to syslog with no message instead of failing on the current directory ([#17980](https://github.com/can1357/oh-my-pi/pull/17980) by [@sjawhar](https://github.com/sjawhar))
+### Fixed
+
+- Fixed X11 takeover and `raise()` failing on a window that background typing had targeted, under window managers such as Openbox ([#17910](https://github.com/can1357/oh-my-pi/pull/17910) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- Fixed X11 background typing, shortcuts and keys held during drags into Qt 5/6 apps reporting success while the app received no keys; the `computer` tool now runs them in takeover, or refuses them when `computer.backgroundFallback` is `refuse` ([#17911](https://github.com/can1357/oh-my-pi/pull/17911) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- Fixed Wayland double and triple clicks (`doubleClick`, `click` with `count`) landing as a single click in Qt apps on KDE Plasma, such as Kate ([#17903](https://github.com/can1357/oh-my-pi/pull/17903) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- Fixed `press()`, `perform()` and `menu.select()` refusing on Linux in Firefox, Chromium, VS Code and LibreOffice, and in apps under a non-English locale, with "AT-SPI action 'press' is unavailable"; `actions()` now lists the actions' untranslated names (`press`, `click`) instead of empty or translated labels, and `press()` toggles toggle buttons and selects radio buttons as it does checkboxes ([#17936](https://github.com/can1357/oh-my-pi/pull/17936) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- Fixed `computer.focusedWindow()` on GNOME and KDE Wayland always naming a shell surface (gnome-shell's "Main stage", an untitled plasma-keyboard frame) instead of the application window that has focus; desktop and display `ax()` and `observe()` now read that application too ([#17922](https://github.com/can1357/oh-my-pi/pull/17922) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- Fixed takeover keys into iPhone Mirroring and Screen Sharing keeping Fn (Globe) held after a Delete, arrow or function key, which dropped Shift and lost later letters ([#17909](https://github.com/can1357/oh-my-pi/pull/17909) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- Fixed a Wayland `computer` run timing out without a reason when the RemoteDesktop permission dialog went unanswered (GNOME can open it behind other windows): the input call now fails with `Timeout` naming the dialog shortly before the run's deadline, and nothing is sent ([#17932](https://github.com/can1357/oh-my-pi/pull/17932) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- Fixed X11 takeover typing and shortcuts stopping with `Cancelled` partway through whenever you had last typed on your own keyboard ([#17912](https://github.com/can1357/oh-my-pi/pull/17912) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed pressing Escape during X11 takeover input ending only that call, so the agent went on, instead of stopping computer use for the rest of the turn ([#17912](https://github.com/can1357/oh-my-pi/pull/17912) by [@will-bogusz](https://github.com/will-bogusz))
+### Fixed
+
+- Fixed X11 background `el.type` and `el.press` bringing the element's window to the front and taking your keyboard; an element that does not already hold a GTK 3 window's focus now runs in takeover instead ([#17921](https://github.com/can1357/oh-my-pi/pull/17921) by [@will-bogusz](https://github.com/will-bogusz))
 
 ## [18.16.0] - 2026-11-02
 
 ### Added
 
 - Added `macOSFrontApp()`, which reads the app macOS has in front and can put it back in front for a while (`keepInFront`) without stopping for the user's typing ([#16284](https://github.com/can1357/oh-my-pi/pull/16284) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Changed
+
+- Replaced the embedded shell interpreter behind `Shell` and `executeShell` with pi's own bash engine, now part of `pi-shell`: bash 5.3 semantics, including alias bodies with pipes, subshells and separators
 
 ### Fixed
 
