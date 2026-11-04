@@ -3101,16 +3101,36 @@ fn bash_case_hit(
 		.any(|p| k.engine.patterns().get(p, opts).matches(subject)))
 }
 
+/// Substitution bodies precede the command that expands them in the flat
+/// unit. Their forward, node-less jumps skip those bodies during execution;
+/// stage classification follows the same path to the command itself.
+fn stage_entry(unit: &Unit, mut entry: u32) -> u32 {
+	while let Some(op) = unit.ops.get(entry as usize)
+		&& op.code == Opcode::Jmp
+		&& op.node == 0
+		&& op.a > entry
+	{
+		entry = op.a;
+	}
+	entry
+}
+
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an
 /// async command starting at `entry`: a `( … )` counts once, at its own
 /// `Spawn`; a simple command in a pipeline expands at the parent's level
 /// (bash's "not for pipes yet"); anything else is one more.
 fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
-	let ops = unit.ops.get(entry as usize..).unwrap_or_default();
-	let ops = match ops.first() {
-		Some(op) if op.code == Opcode::Redir => &ops[1..],
-		_ => ops,
+	let entry = stage_entry(unit, entry);
+	let entry = if unit
+		.ops
+		.get(entry as usize)
+		.is_some_and(|op| op.code == Opcode::Redir)
+	{
+		stage_entry(unit, entry + 1)
+	} else {
+		entry
 	};
+	let ops = unit.ops.get(entry as usize..).unwrap_or_default();
 	match ops {
 		[enter, spawn, ..]
 			if enter.code == Opcode::Enter
@@ -3133,17 +3153,19 @@ fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
 /// [`BangStage::Exec`]). Any other compound job keeps its virtual pid at
 /// once: its readers never wait.
 fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
+	let entry = stage_entry(unit, entry);
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
 	if code(entry) == Some(Opcode::Exec) && code(entry + 1) == Some(Opcode::SubExit) {
 		return Some(BangStage::Lone);
 	}
-	let group = [Opcode::Enter, Opcode::Exec, Opcode::Leave, Opcode::SubExit]
-		.iter()
-		.zip(entry..)
-		.all(|(&want, at)| code(at) == Some(want));
+	let body = stage_entry(unit, entry + 1);
+	let group = code(entry) == Some(Opcode::Enter)
+		&& code(body) == Some(Opcode::Exec)
+		&& code(body + 1) == Some(Opcode::Leave)
+		&& code(body + 2) == Some(Opcode::SubExit);
 	let exec = unit
 		.ops
-		.get(entry as usize + 1)
+		.get(body as usize)
 		.and_then(|op| unit.cmds.get(op.a as usize))
 		.and_then(|cmd| unit.lists.get(cmd.words as usize))
 		.and_then(|words| words.first())
