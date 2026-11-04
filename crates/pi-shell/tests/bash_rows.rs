@@ -5,9 +5,9 @@
 //! `fixtures/bash_rows/<group>.jsonl`, which `fixtures/bash_rows/generate.py`
 //! writes from real Bash: per row the script, Bash 5.3.20's exit status and
 //! output (stdout and stderr merged), and Bash 5.2.21's where it differs.
-//! Regenerate with `python3 crates/pi-shell/tests/fixtures/bash_rows/generate.py`
-//! after changing `scripts.jsonl`; the generator's header says how it runs
-//! Bash.
+//! Regenerate with `python3
+//! crates/pi-shell/tests/fixtures/bash_rows/generate.py` after changing
+//! `scripts.jsonl`; the generator's header says how it runs Bash.
 //!
 //! A background job that runs inside the shell process (a function, a
 //! subshell, a brace group, an `&&`/`||` list, a builtin, a pipeline with
@@ -95,8 +95,8 @@ fn normalize(output: &str, dir: &str) -> String {
 		while index < bytes.len() && bytes[index].is_ascii_digit() {
 			index += 1;
 		}
-		let alone = (start == 0 || !joins(bytes[start - 1]))
-			&& (index == bytes.len() || !joins(bytes[index]));
+		let alone =
+			(start == 0 || !joins(bytes[start - 1])) && (index == bytes.len() || !joins(bytes[index]));
 		if index - start >= 4 && alone {
 			out.push_str(&named[copied..start]);
 			out.push_str("<N>");
@@ -111,7 +111,10 @@ fn normalize(output: &str, dir: &str) -> String {
 /// `TMPDIR`, and returns its exit status (`None` when it ran past
 /// [`ROW_BUDGET_MS`]) and normalized output.
 async fn run_row(script: String) -> (Option<i32>, String) {
-	let dir = tempfile::Builder::new().prefix("bash-row-").tempdir().expect("row directory");
+	let dir = tempfile::Builder::new()
+		.prefix("bash-row-")
+		.tempdir()
+		.expect("row directory");
 	let path = dir.path().canonicalize().expect("row directory path");
 	let path = path.to_str().expect("utf8 row directory").to_owned();
 	let (tx, rx) = flume::unbounded::<String>();
@@ -759,4 +762,17 @@ bash_rows! {
 	/// assignment-only command (`v=1 <<E`), which Bash 5.2.21 ends. The rows
 	/// are the ANSI slice's matrix of the #17712 port.
 	an_expansion_error_in_a_here_document_ends_what_bash_ends;
+
+	/// `builtin`, `command` and chains of them (`command builtin`, `builtin
+	/// command`, `builtin builtin command`, ...) before `:`, `export`,
+	/// `readonly`, `eval` and `printf -v`, in POSIX mode and under `set -e`.
+	/// A prefix assignment before a wrapped `:` does not persist, while a
+	/// wrapped `export` or `readonly` still exports or marks the variable the
+	/// prefix assigned; a readonly error in a wrapped `export` is status 1.
+	/// A readonly error in a wrapped `eval` exits the POSIX shell (127 under
+	/// `bash -c`) only when no `command` wraps it; a `printf -v` to a readonly
+	/// variable in an `if` test exits the `set -e` shell with 1 when `builtin`
+	/// is the outermost wrapper and is a plain false when `command` is. The
+	/// rows are the readonly slice's wrapper probe of the #17712 port.
+	a_wrapped_special_builtin_is_no_special_builtin;
 }
