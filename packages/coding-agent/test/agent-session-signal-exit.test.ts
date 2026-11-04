@@ -30,6 +30,20 @@ const endings = [
 	{ ending: "manual", order: "host-after-session", exitCode: 0, exit: { reason: "manual", kind: "normal" } },
 	{ ending: "manual", order: "host-before-session", exitCode: 0, exit: { reason: "manual", kind: "normal" } },
 	{ ending: "exit", order: "host-after-session", exitCode: 0, exit: { reason: "exit", kind: "process_exit" } },
+	// process.exit() while a manual pass still runs: postmortem does not run that pass's callbacks
+	// again, so the session's synchronous exit finalizer writes the final record.
+	{
+		ending: "exit-during-cleanup",
+		order: "host-after-session",
+		exitCode: 0,
+		exit: { reason: "exit", kind: "process_exit" },
+	},
+	{
+		ending: "exit-during-cleanup",
+		order: "host-before-session",
+		exitCode: 0,
+		exit: { reason: "exit", kind: "process_exit" },
+	},
 ] as const;
 for (const { ending, order, exitCode: expectedExitCode, exit: expectedExit } of endings) {
 	test.skipIf(process.platform === "win32")(
@@ -90,7 +104,7 @@ for (const { ending, order, exitCode: expectedExitCode, exit: expectedExit } of 
 				).toHaveLength(1);
 				// Where the drain ran, the marker also closes the turn it aborted. A process exit runs
 				// no drain, so that turn's partial answer is not written at all.
-				if (ending !== "exit") {
+				if (ending !== "exit" && ending !== "exit-during-cleanup") {
 					expect(
 						before.some(
 							entry =>

@@ -19,7 +19,8 @@ if (!directory) throw new Error("Expected session directory");
 const order = process.argv[3] ?? "host-after-session";
 // How the process ends once ready: "sigterm" waits for the parent's signal; "manual" runs the manual
 // cleanup pass that quit and relaunch run, then exits; "exit" starts the host's teardown and calls
-// process.exit() while its disposal drains.
+// process.exit() while its disposal drains; "exit-during-cleanup" starts the manual pass and calls
+// process.exit() while that pass is still running.
 const ending = process.argv[4] ?? "sigterm";
 const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 if (!model) throw new Error("Expected bundled test model");
@@ -67,6 +68,10 @@ const pending = session.prompt("held second answer").catch(() => undefined);
 await secondRequest.promise;
 await session.followUp("accepted before exit");
 process.stdout.write(`${JSON.stringify({ ready: true, sessionFile: manager.getSessionFile() })}\n`);
+if (ending === "exit-during-cleanup") {
+	void postmortem.cleanup();
+	process.exit(0);
+}
 if (ending === "manual") {
 	await postmortem.cleanup();
 	await pending;

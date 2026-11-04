@@ -171,14 +171,18 @@ export class EvalRunner {
 
 	/**
 	 * Ends user Python at session disposal entry: new executions are rejected,
-	 * the user's running ones are aborted, results already waiting for the
-	 * turn's persistence boundary are dropped, and none is recorded from here
-	 * on. Eval a running agent turn owns is aborted with that turn by `dispose()`.
+	 * the user's running ones are aborted, and none is recorded from here on.
+	 * Results that finished while a turn streamed and wait for that turn's
+	 * persistence boundary are the user's, already shown: they are returned for
+	 * the session's disposal record, which writes them before `session_exit`.
+	 * Eval a running agent turn owns is aborted with that turn by `dispose()`.
 	 */
-	beginDispose(): void {
+	beginDispose(): PythonExecutionMessage[] {
 		this.#disposing = true;
+		const pending = this.#pendingMessages;
 		this.#pendingMessages = [];
 		for (const abortController of this.#userAbortControllers) abortController.abort();
+		return pending;
 	}
 
 	/** Waits for active work and disposes every retained eval kernel owned by the session. */

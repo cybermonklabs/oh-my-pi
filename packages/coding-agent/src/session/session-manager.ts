@@ -2777,6 +2777,18 @@ export class SessionManager {
 		await this.#rewriteAtomically();
 	}
 
+	/**
+	 * {@link ensureOnDisk}, synchronously: crosses the lazy gate and writes every entry now. For a
+	 * closing session whose last entries are input it kept but no assistant turn, which the lazy
+	 * gate would otherwise leave in memory only.
+	 */
+	ensureOnDiskSync(): void {
+		if (!this.#persist || !this.#sessionFile) return;
+		this.#forceFileCreation = true;
+		if (!this.#fileIsCurrent) this.#rewriteRequired = true;
+		this.flushSync();
+	}
+
 	/** Persist this session's transcript as a newly identified OMP session. */
 	async persistCopy(
 		options?: { sessionDir?: string; suppressBreadcrumb?: boolean },

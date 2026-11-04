@@ -43,6 +43,7 @@ import {
 	type Attributes,
 	type AttributeValue,
 	context,
+	type Exception,
 	type Span,
 	SpanKind,
 	SpanStatusCode,
@@ -1193,6 +1194,15 @@ export async function finishChatSpan(
 }
 
 /**
+ * The exception a span records for `error`. OpenTelemetry reports an exception's `code`, when it
+ * has one, as `exception.type`; a DOMException's is a legacy number (20 for an `AbortError`), so
+ * it is recorded by its name instead.
+ */
+function spanException(error: Error): Exception {
+	return error instanceof DOMException ? { name: error.name, message: error.message, stack: error.stack } : error;
+}
+
+/**
  * Record a chat that failed before producing a final `AssistantMessage`
  * (e.g. the provider stream threw mid-iteration). Mirrors `finishChatSpan`'s
  * span-end side effects and pushes a failed `ChatRecord` to the collector so
@@ -1212,7 +1222,7 @@ export function failChatSpan(
 	applyGatewayAttributes(span, options.responseHeaders, options.baseUrl);
 	const err = options.errorObject;
 	if (err instanceof Error) {
-		span.recordException(err);
+		span.recordException(spanException(err));
 		span.setAttribute(GenAIAttr.ErrorType, options.errorType ?? err.name ?? "Error");
 		span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
 	} else {
@@ -2009,7 +2019,7 @@ export function finishExecuteToolSpan(
 		span.setAttribute(EXECUTE_TOOL_STATUS_ATTR, status);
 	}
 	if (options.errorObject instanceof Error) {
-		span.recordException(options.errorObject);
+		span.recordException(spanException(options.errorObject));
 	}
 	telemetry?.collector.endTool(span, { status, errorType });
 	span.end();
@@ -2079,7 +2089,7 @@ export function finishInvokeAgentSpan(
 		fireOnRunEnd(telemetry, snapshot.summary, snapshot.coverage);
 	}
 	if (options.errorObject instanceof Error) {
-		span.recordException(options.errorObject);
+		span.recordException(spanException(options.errorObject));
 		span.setAttribute(GenAIAttr.ErrorType, options.errorObject.name || "Error");
 		span.setStatus({ code: SpanStatusCode.ERROR, message: options.errorObject.message });
 	}

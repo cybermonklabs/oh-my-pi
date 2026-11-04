@@ -5,6 +5,8 @@ import type { AgentEvent, AgentMessage, AgentTool, StreamFn } from "@oh-my-pi/pi
 import type { LiveSteerClaim } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { SpanStatusCode } from "@opentelemetry/api";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { createUserMessage } from "./helpers";
 
 function userText(message: AgentMessage): string {
@@ -348,6 +350,35 @@ describe("Agent.beginDispose", () => {
 			}
 		});
 	}
+
+	it("ends a refused request's chat span as failed with exception type AbortError", async () => {
+		const exporter = new InMemorySpanExporter();
+		const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+		const mock = createMockModel({ responses: [{ content: ["should not be sent"] }] });
+		let calls = 0;
+		const agent = new Agent({
+			initialState: { model: mock.model },
+			telemetry: { tracer: provider.getTracer("agent-dispose") },
+			streamFn: (model, context, options) => {
+				calls++;
+				return mock.stream(model, context, options);
+			},
+		});
+		try {
+			agent.beginDispose();
+			await agent.prompt("refused");
+			await provider.forceFlush();
+
+			expect(calls).toBe(0);
+			const chats = exporter.getFinishedSpans().filter(span => span.name.startsWith("chat "));
+			expect(chats).toHaveLength(1);
+			expect(chats[0]!.status.code).toBe(SpanStatusCode.ERROR);
+			const exception = chats[0]!.events.find(event => event.name === "exception");
+			expect(exception?.attributes?.["exception.type"]).toBe("AbortError");
+		} finally {
+			await provider.shutdown();
+		}
+	});
 });
 
 /** A complete Anthropic Messages event stream that answers `text`. */

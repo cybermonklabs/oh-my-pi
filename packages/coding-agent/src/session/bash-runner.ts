@@ -194,14 +194,22 @@ export class BashRunner {
 	/**
 	 * Ends user Bash at session disposal entry: running commands are aborted, a
 	 * command or `user_bash` hook still pending launches nothing afterwards, and
-	 * no result is appended to the session from here on.
+	 * no result is appended to the session from here on. A result that finished
+	 * while a turn streamed and waits for that turn's end is the user's, already
+	 * shown: it is returned for the disposal record of the current session, which
+	 * writes it before `session_exit`. Results owned by another session are released.
 	 */
-	beginDispose(): void {
+	beginDispose(): BashExecutionMessage[] {
 		this.#disposed = true;
 		this.abort();
 		const pending = this.#pendingMessages;
 		this.#pendingMessages = [];
-		for (const { target } of pending) void this.#releaseSessionTarget(target);
+		const kept: BashExecutionMessage[] = [];
+		for (const { target, message } of pending) {
+			if (target === this.#sessionTarget) kept.push(message);
+			void this.#releaseSessionTarget(target);
+		}
+		return kept;
 	}
 
 	/** Whether a bash command is currently running. */

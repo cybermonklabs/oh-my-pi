@@ -10,6 +10,7 @@
 ### Fixed
 
 - Fixed steering and follow-up queue notifications observing a batch before its preparation claim was installed and missing the transition to delivery, leaving pending-message snapshots stale after asynchronous preparation.
+- Fixed a chat span that ends on an `AbortError` (a cancelled or refused request) recording `exception.type` as `20`, the DOMException's legacy code, instead of `AbortError` ([#17956](https://github.com/can1357/oh-my-pi/pull/17956) by [@sjawhar](https://github.com/sjawhar))
 
 ## [18.16.0] - 2026-11-02
 

@@ -32,6 +32,8 @@ interface CleanupRegistration {
 	deadlineMs: number | undefined;
 	/** Printed to stderr when exit waits on this callback alone; see {@link CleanupRegistrationOptions.waitMessage}. */
 	waitMessage: string | undefined;
+	/** See {@link CleanupRegistrationOptions.onProcessExit}. */
+	onProcessExit: (() => void) | undefined;
 	cancelled: boolean;
 	lastPass: number;
 }
@@ -721,6 +723,18 @@ export async function fatal(error: unknown): Promise<never> {
 // Exit-time cleanup is safe in any host: it neither delays nor triggers an exit. Signal and fatal
 // handlers change the process lifecycle, so only {@link installProcessHandlers} adds them.
 process.on("exit", () => {
+	// Synchronous finalizers run on every exit, also when another pass is already running: that
+	// pass's callbacks may be parked on an await that the exiting process never resumes, and
+	// runCleanup() below returns that running pass without invoking them again.
+	for (const registration of callbackList) {
+		if (registration.cancelled || !registration.onProcessExit) continue;
+		try {
+			registration.onProcessExit();
+		} catch (error) {
+			const err = toError(error);
+			logger.error("Process exit finalizer failed", { err, id: registration.id, stack: err.stack });
+		}
+	}
 	void runCleanup(Reason.EXIT); // fire and forget (exit imminent)
 });
 
@@ -837,6 +851,13 @@ export interface CleanupRegistrationOptions {
 	 * Nothing is printed when the callback finishes first.
 	 */
 	waitMessage?: string;
+	/**
+	 * Synchronous finalization the process runs on its `exit` event, on every exit: also when a
+	 * cleanup pass is already running (the process will not resume that pass's awaits) and when
+	 * this registration already ran in it. It runs before the exit pass's own callbacks, so it
+	 * must be idempotent with `callback`.
+	 */
+	onProcessExit?: () => void;
 }
 
 /**
@@ -864,6 +885,7 @@ export function register(
 		exitOnly: options.exitOnly ?? false,
 		deadlineMs: options.deadlineMs,
 		waitMessage: options.waitMessage,
+		onProcessExit: options.onProcessExit,
 		cancelled: false,
 		lastPass: 0,
 	};
