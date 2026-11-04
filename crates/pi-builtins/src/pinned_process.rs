@@ -266,11 +266,9 @@ mod platform {
 		/// so its pid holds the group's number and every member is the
 		/// operand's.
 		///
-		/// This is the only moment a member that leaves the group later — a
-		/// process that calls `setsid` to detach, for one — can be reached, so
-		/// the scan runs on the reap of every external command. It reads each
-		/// pid's group with one `getpgid` syscall, about a millisecond for a
-		/// thousand processes.
+		/// Older kernels need this snapshot before the leader is reaped.
+		/// With kernel-pinned group signals, discovery can wait for TERM;
+		/// a process that detaches before TERM is outside the operand.
 		pub fn members_before_reap(&self) -> Vec<Self> {
 			if sys::process_group(self.pid) != Some(self.pid) {
 				return Vec::new();
@@ -290,6 +288,15 @@ mod platform {
 				return false;
 			}
 			sys::pidfd_send_group_signal(self.pidfd.as_fd(), signal).is_ok()
+		}
+
+		/// Whether this kernel accepts pidfd group addressing. An empty group
+		/// returns ESRCH on a supported kernel, not an unsupported-operation error.
+		pub fn group_signal_supported(&self) -> bool {
+			match sys::pidfd_send_group_signal(self.pidfd.as_fd(), 0) {
+				Ok(()) => true,
+				Err(error) => error.raw_os_error() == Some(libc::ESRCH),
+			}
 		}
 
 

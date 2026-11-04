@@ -480,7 +480,7 @@ fn run_pty_sync(
 	// `pinned_child`, and the terminal's foreground group only when the child
 	// leads it, through the child's pin, never by the group's number.
 	let mut targets = ps::TerminationTargets::new();
-	let pinned_child = child_pid.and_then(pi_shell::process::Process::from_pid);
+	let pinned_child = child_pid.and_then(pi_shell::proctree::Process::from_pid);
 	#[cfg(unix)]
 	if let Some(pgid) = master.process_group_leader().filter(|pgid| *pgid > 0)
 		&& let Some(child) = pinned_child
