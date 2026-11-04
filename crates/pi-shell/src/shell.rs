@@ -1212,8 +1212,27 @@ async fn run_shell_command_segmented_chain(
 	let mut previous_succeeded = true;
 	let mut last_status = None;
 	let max_capture_bytes = config.max_capture_bytes as usize;
-	for segment in segments {
-		if segment.run_if_previous_succeeded && !previous_succeeded {
+	let mut index = 0;
+	while let Some(segment) = segments.get(index) {
+		let runs_rest_of_input = if segment.starts_line {
+			let end = segments[index + 1..]
+				.iter()
+				.find(|next| next.starts_line)
+				.map_or(options.command.len(), |next| next.source_start);
+			session
+				.session
+				.line_uses_alias(options.command[segment.source_start..end].to_owned())
+				.await?
+		} else {
+			false
+		};
+		let next_index = if runs_rest_of_input {
+			segments.len()
+		} else {
+			index + 1
+		};
+		if !runs_rest_of_input && segment.run_if_previous_succeeded && !previous_succeeded {
+			index = next_index;
 			continue;
 		}
 
@@ -1222,20 +1241,21 @@ async fn run_shell_command_segmented_chain(
 		} else {
 			CommandCaptureMode::Streaming
 		};
-		let source = if segment.suppress_errexit {
+		let source = if runs_rest_of_input {
+			options.command[segment.source_start..].to_owned()
+		} else if segment.suppress_errexit {
 			errexit_suppressed(&segment.command)
 		} else {
 			segment.command.clone()
 		};
 
-		// Only the first segment moves the shell; later ones start wherever
-		// the earlier ones left it. The shell reads a whole input line before
-		// it runs any of it, so each segment is read with the aliases its
-		// line began with.
-		let line = if segment.starts_line {
-			LinePart::First
+		// An alias can introduce a comment, newline, quote or operator, so
+		// execute the remaining original text without segmenting it. Other
+		// segments use the parser state prepared at the start of their line.
+		let line = if runs_rest_of_input {
+			LinePart::Whole
 		} else {
-			LinePart::Rest
+			LinePart::Prepared
 		};
 		let command_run = run_shell_command_once(
 			session,
@@ -1262,7 +1282,7 @@ async fn run_shell_command_segmented_chain(
 				if next_input_bytes > max_capture_bytes {
 					aggregate = None;
 				} else {
-					let minimized = if command_run.reported_error {
+					let minimized = if command_run.reported_error || runs_rest_of_input {
 						minimizer::MinimizerOutput::passthrough(&buffered.text)
 					} else {
 						minimizer::apply(&segment.command, &buffered.text, exit, config)
@@ -1285,6 +1305,7 @@ async fn run_shell_command_segmented_chain(
 		if !keep_running {
 			break;
 		}
+		index = next_index;
 	}
 
 	let Some(status) = last_status else {

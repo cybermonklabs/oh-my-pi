@@ -80,10 +80,6 @@
 
 - Browser: a headless Chrome launched in-process by an SDK embedding or a `bun test` run now exits when that process is killed, instead of running on with its temporary profile on Linux and macOS ([#17908](https://github.com/can1357/oh-my-pi/pull/17908) by [@will-bogusz](https://github.com/will-bogusz))
 
-### Fixed
-
-- The bash tool no longer drops aliases from your shell snapshot whose values hold `(`, `|`, `;`, `&`, `<`, `>` or backquotes, such as Fedora's default `which` alias: they now run as they do in Bash ([#17877](https://github.com/can1357/oh-my-pi/pull/17877) by [@sjawhar](https://github.com/sjawhar), issue [#3234](https://github.com/can1357/oh-my-pi/issues/3234))
-
 ## [18.16.0] - 2026-11-02
 
 ### Added

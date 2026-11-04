@@ -34,11 +34,12 @@ pub(super) struct Skip {
 /// A cursor position to come back to.
 #[derive(Clone, Copy)]
 pub(super) struct Mark<'s> {
-	buf:       &'s [u8],
-	pos:       usize,
-	line:      u32,
-	depth:     usize,
-	virt_done: bool,
+	buf:             &'s [u8],
+	pos:             usize,
+	line:            u32,
+	depth:           usize,
+	virt_done:       bool,
+	alias_backslash: bool,
 }
 
 /// The space bash returns after the last character of an alias expansion
@@ -65,23 +66,26 @@ impl<'s> Parser<'s> {
 			if let Some(&c) = self.buf.get(self.pos) {
 				return Some(c);
 			}
-			let Some(frame) = self.frames.pop() else {
+			let Some(mut frame) = self.frames.pop() else {
 				return if self.virt != 0 && !self.virt_done {
 					Some(self.virt)
 				} else {
 					None
 				};
 			};
+			if core::ptr::eq(frame.buf.as_ptr(), END_ALIAS_SPACE.as_ptr()) {
+				let last = self.buf.last().copied();
+				if matches!(self.alias_delimiter, 1 | b'\'' | b'"')
+					|| self.alias_backslash
+					|| last.is_none_or(|c| super::super::util::is_break(c))
+				{
+					frame.pos = END_ALIAS_SPACE.len();
+				}
+			}
 			self.buf = frame.buf;
 			self.pos = frame.pos;
-			// bash `pop_string`: the end of an alias's text sets or clears the
-			// check of the next word by whether its value ends in a blank, so
-			// when expansions end together the outermost decides. Going on
-			// from the value to the space after it (`END_ALIAS_SPACE`) stays
-			// inside that text.
-			if !frame.alias.is_empty() && !core::ptr::eq(frame.buf.as_ptr(), END_ALIAS_SPACE.as_ptr())
-			{
-				self.lx.alexpnext = frame.expand_next;
+			if frame.expand_next {
+				self.lx.alexpnext = true;
 			}
 		}
 	}
@@ -96,6 +100,9 @@ impl<'s> Parser<'s> {
 	#[inline]
 	pub(super) const fn bump(&mut self) {
 		if self.pos < self.buf.len() {
+			let c = self.buf[self.pos];
+			self.alias_backslash = self.pos != 0 && self.alias_backslash;
+			self.alias_backslash = !self.alias_backslash && c == b'\\';
 			let nl = self.buf[self.pos] == b'\n';
 			self.pos += 1;
 			if nl && self.in_source() {
@@ -123,6 +130,9 @@ impl<'s> Parser<'s> {
 	/// Consume `n` bytes of the current buffer that contain no newline.
 	#[inline]
 	pub(super) const fn advance(&mut self, n: usize) {
+		if n > 0 {
+			self.alias_backslash = false;
+		}
 		self.pos += n;
 	}
 
@@ -199,11 +209,12 @@ impl<'s> Parser<'s> {
 
 	pub(super) const fn mark(&self) -> Mark<'s> {
 		Mark {
-			buf:       self.buf,
-			pos:       self.pos,
-			line:      self.line,
-			depth:     self.frames.len(),
-			virt_done: self.virt_done,
+			buf:             self.buf,
+			pos:             self.pos,
+			line:            self.line,
+			depth:           self.frames.len(),
+			virt_done:       self.virt_done,
+			alias_backslash: self.alias_backslash,
 		}
 	}
 
@@ -216,6 +227,7 @@ impl<'s> Parser<'s> {
 		self.pos = m.pos;
 		self.line = m.line;
 		self.virt_done = m.virt_done;
+		self.alias_backslash = m.alias_backslash;
 		true
 	}
 
@@ -235,6 +247,12 @@ impl<'s> Parser<'s> {
 
 	/// Skip a comment up to (not including) the newline.
 	pub(super) fn skip_comment(&mut self) {
+		let delimiter = core::mem::replace(&mut self.alias_delimiter, 1);
+		self.skip_comment_inner();
+		self.alias_delimiter = delimiter;
+	}
+
+	fn skip_comment_inner(&mut self) {
 		loop {
 			let buf: &'s [u8] = self.buf;
 			let rest = &buf[self.pos.min(buf.len())..];

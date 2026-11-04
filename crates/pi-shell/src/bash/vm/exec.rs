@@ -1596,13 +1596,12 @@ pub fn start_sub(
 	let inherit =
 		posix || state::option(&mut k.root, cx.store, vp, OptId::InheritErrexit).unwrap_or(false);
 	match form {
-		ComsubForm::Fork => {
+		ComsubForm::Fork | ComsubForm::Backtick => {
 			let mut fds = vp.fds.clone();
 			fds.set(1, Some(out));
-			// Outside posix mode bash parses `$( )` without aliases and
-			// re-parses its text with the aliases in effect when it runs,
-			// numbering its lines from the line the shell is at: at top
-			// level, where the whole command ends.
+			// Backquotes are parsed when expanded even in posix mode. A
+			// read-time parse may fail before an alias can supply its quotes.
+			// Outside posix mode `$( )` also re-reads its text with live aliases.
 			let base = top_level_end_line(vp).unwrap_or(line);
 			// `$(< file)` keeps its compiled form ([`ir::Op::CAT`]).
 			let cat = unit
@@ -1610,9 +1609,11 @@ pub fn start_sub(
 				.get(entry as usize)
 				.is_some_and(|op| op.flags & ir::Op::CAT != 0);
 			let reparse = text.and_then(|i| unit.strs.get(i as usize)).filter(|_| {
-				!posix
-					&& !cat
-					&& (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
+				!cat
+					&& (form == ComsubForm::Backtick
+						|| (!posix
+							&& (base != line
+								|| matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))))
 			});
 			let mut child = if let Some(src) = reparse {
 				vp.child_text(k, cx.store, src, base, fds)

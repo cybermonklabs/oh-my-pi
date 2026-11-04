@@ -70,7 +70,8 @@ use crate::{
 	bash::{
 		Budget, CallId, Cx, Engine, EngineConfig, EventMask, Fs, MemStore, ParseSnapshot, PipeTap,
 		RunId, Script, Shell, ShellError, ShellInit, Signal, Step, ToolCall, VprocSel,
-		store::{Key, MiscKey, Record},
+		store::{Key, MiscKey, Record, StoreError},
+		syntax::{Features, Parser},
 	},
 	host::{PiHost, SpawnObserver, TERM_GRACE},
 	sys::OutputDecoding,
@@ -156,12 +157,8 @@ pub enum LinePart {
 	/// The whole line.
 	#[default]
 	Whole,
-	/// Its first part: read as a whole line is, and what it was read with
-	/// is kept for the parts after it.
-	First,
-	/// A later part: read with what the line's [`LinePart::First`] part was
-	/// read with.
-	Rest,
+	/// A part read with the state prepared for its original input line.
+	Prepared,
 }
 
 impl RunOptions {
@@ -239,6 +236,9 @@ pub enum SessionError {
 	/// [`RunOptions::cwd`] is not absolute.
 	#[error("working directory {0} is not absolute")]
 	RelativeCwd(BString),
+	/// The engine could not read the aliases and parser options for a line.
+	#[error("could not read the shell's parser state")]
+	Read(#[source] StoreError),
 }
 
 /// The live externals of the run in flight (pi's `Shell::pids()`). Cheap to
@@ -389,6 +389,22 @@ impl Session {
 			.map_err(|_| SessionError::Closed)
 	}
 
+	/// Freeze the next minimized line's parser state and report whether an
+	/// alias changes its syntax. Its parts use [`LinePart::Prepared`].
+	pub(crate) async fn line_uses_alias(&self, source: String) -> Result<bool, SessionError> {
+		let jobs = self.jobs.as_ref().ok_or(SessionError::Closed)?;
+		let (reply_tx, reply_rx) = flume::bounded(1);
+		jobs
+			.send(Request::ReadLine(source, reply_tx))
+			.map_err(|_| SessionError::Closed)?;
+		self.waker.wake_by_ref();
+		reply_rx
+			.recv_async()
+			.await
+			.map_err(|_| SessionError::Closed)?
+			.map_err(SessionError::Read)
+	}
+
 	/// Run `command` with `stdio`; see [`Session::run_with`].
 	///
 	/// # Errors
@@ -535,6 +551,8 @@ enum Request {
 	Run(Job),
 	/// Count the background jobs running an external.
 	LiveJobs(flume::Sender<usize>),
+	/// Freeze a minimized line's parser state and check alias expansion.
+	ReadLine(String, flume::Sender<Result<bool, StoreError>>),
 }
 
 /// One command for the driver.
@@ -555,8 +573,7 @@ struct Driver {
 	children:  Children,
 	/// The host callouts in flight (`timeout`, `nohup`, `git`).
 	tools:     ToolCalls,
-	/// What the current input line's [`LinePart::First`] part was read
-	/// with, for the parts after it.
+	/// The parser state prepared for the current minimized input line.
 	line_read: Option<ParseSnapshot>,
 }
 
@@ -569,6 +586,26 @@ impl Driver {
 				Ok(Request::Run(job)) => self.run(job).await,
 				Ok(Request::LiveJobs(reply)) => {
 					let _ = reply.send(self.shell.live_external_jobs());
+				},
+				Ok(Request::ReadLine(source, reply)) => {
+					let mut cx = Cx { host: &mut self.host, store: &mut self.store };
+					let result = self.shell.read_state(&mut cx).map(|snapshot| {
+						let expands = snapshot.aliases.as_ref().is_some_and(|aliases| {
+							let mut parser = Parser::new(
+								source.as_bytes(),
+								Features::from_bits(snapshot.features),
+								aliases,
+							);
+							match parser.next_command() {
+								Some(Ok(command)) => !command.aliases.is_empty(),
+								Some(Err(_)) => true,
+								None => false,
+							}
+						});
+						self.line_read = Some(snapshot);
+						expands
+					});
+					let _ = reply.send(result);
 				},
 				Err(flume::TryRecvError::Disconnected) => break,
 				Err(flume::TryRecvError::Empty) => self.idle_turn().await,
@@ -599,14 +636,7 @@ impl Driver {
 				self.line_read = None;
 				None
 			},
-			LinePart::First => {
-				// The shell's state now, before the line's first part runs.
-				// A store failure surfaces when that part is read.
-				let mut cx = Cx { host: &mut self.host, store: &mut self.store };
-				self.line_read = self.shell.read_state(&mut cx).ok();
-				None
-			},
-			LinePart::Rest => self.line_read.clone(),
+			LinePart::Prepared => self.line_read.clone(),
 		};
 		self.host.set_pipe_tap(pipe_tap);
 		self.host.set_reported_error(reported_error);

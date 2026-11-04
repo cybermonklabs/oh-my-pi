@@ -1,11 +1,11 @@
-//! The bash tool's shell reads an alias's value in place of its name, as Bash
-//! 5.2.21 does: the value can hold operators, reserved words, redirections or
-//! the start of a quoted string, and the shell keeps the alias table and the
-//! `BASH_ALIASES` array in step.
+//! The shell reads alias values as Bash 5.3 input, including operators,
+//! reserved words, redirections, open quotes and command substitutions.
 //!
-//! Each test names the Bash 5.2.21 row it reproduces; the expected output is
-//! what `bash -c` printed for the same text.
+//! Expected output comes from `bash -c` under Bash 5.3. Bash 5.2.21 agrees
+//! except for alias-supplied here-documents and `alias -p` operands.
 #![cfg(unix)]
+
+use std::{ffi::OsString, path::Path};
 
 use pi_shell::{
 	cancel::CancelToken,
@@ -14,11 +14,15 @@ use pi_shell::{
 
 async fn run(command: &str) -> String {
 	let dir = tempfile::tempdir().expect("tempdir");
+	run_in(dir.path(), command).await
+}
+
+async fn run_in(cwd: &Path, command: &str) -> String {
 	let (tx, rx) = flume::unbounded::<String>();
 	execute_shell(
 		ShellExecuteOptions {
 			command: command.to_owned(),
-			cwd: Some(dir.path().to_string_lossy().into_owned()),
+			cwd: Some(cwd.to_string_lossy().into_owned()),
 			timeout_ms: Some(30_000),
 			..Default::default()
 		},
@@ -33,15 +37,6 @@ async fn run(command: &str) -> String {
 /// Runs `body` after turning alias expansion on and defining `aliases`.
 async fn with_aliases(aliases: &str, body: &str) -> String {
 	run(&format!("shopt -s expand_aliases\nalias {aliases}\n{body}")).await
-}
-
-/// `out` without the lines the host adds to report a command that failed with
-/// an error; it reports them whatever standard error is redirected to.
-fn without_error_reports(out: &str) -> String {
-	out.lines()
-		.filter(|line| !line.starts_with("error: "))
-		.map(|line| format!("{line}\n"))
-		.collect()
 }
 
 // --- alias values that are shell syntax ---
@@ -463,33 +458,27 @@ async fn process_substitution_alias_begins_a_here_document() {
 	);
 }
 
-/// G40, G41, G42: a here-document whose redirection comes from an alias's
-/// value takes its body from the input; the rest of the value is read after
-/// it.
+/// Bash 5.3 reads a here-document from the remaining alias text before it
+/// resumes the source. Bash 5.2.21 instead executes that text after the body.
 #[tokio::test]
-async fn here_document_body_comes_from_the_input() {
+async fn here_document_body_includes_remaining_alias_text() {
 	assert_eq!(
 		with_aliases("q=$'cat <<EOF\\necho AFTER'", "q\nbody\nEOF\necho DONE").await,
-		"body\nAFTER\nDONE\n"
+		"echo AFTER\nbody\nDONE\n"
 	);
-	// The rest of the value, `from-alias`, then runs and is not found.
 	assert_eq!(
-		without_error_reports(
-			&with_aliases("q=$'cat <<EOF\\nfrom-alias'", "q\nfrom-input\nEOF\necho next").await
-		),
-		"from-input\nnext\n"
+		with_aliases("q=$'cat <<EOF\\nfrom-alias'", "q\nfrom-input\nEOF\necho next").await,
+		"from-alias\nfrom-input\nnext\n"
 	);
 	assert_eq!(
 		with_aliases("q=$'cat <<EOF\\necho AFTER'", "if true; then\nq\nbody\nEOF\nfi\necho DONE")
 			.await,
-		"body\nAFTER\nDONE\n"
+		"echo AFTER\nbody\nDONE\n"
 	);
 }
 
-/// G45, G46, G47: a body begins on the input line after the one the alias
-/// stood on, also when the alias's value ends at the redirection's newline;
-/// the rest of that input line is read after the value. A second
-/// here-document in the value takes the next input lines.
+/// An alias ending at a here-document's newline must not add a blank body
+/// line. Bash 5.3 treats later redirections in the alias as body text.
 #[tokio::test]
 async fn here_document_body_begins_on_the_next_input_line() {
 	assert_eq!(with_aliases("q=$'cat <<EOF\\n'", "q\nBODY\nEOF\necho DONE").await, "BODY\nDONE\n");
@@ -500,10 +489,10 @@ async fn here_document_body_begins_on_the_next_input_line() {
 	assert_eq!(
 		with_aliases(
 			"q=$'cat <<A\\ncat <<B\\necho AFTER'",
-			"q; echo SUFFIX\nONE\nA\nTWO\nB\necho DONE"
+			"TWO() { printf 'TWO-ran\\n'; }\nB() { printf 'B-ran\\n'; }\nq; echo SUFFIX\nONE\nA\nTWO\nB\necho DONE"
 		)
 		.await,
-		"ONE\nTWO\nAFTER\nSUFFIX\nDONE\n"
+		"cat <<B\necho AFTER; echo SUFFIX\nONE\nTWO-ran\nB-ran\nDONE\n"
 	);
 }
 
@@ -549,11 +538,66 @@ async fn trailing_backslashes_follow_bash() {
 	assert_eq!(with_aliases(seven, "q word").await, "<A\\\\\\ >|<word>|");
 }
 
-/// G26: `alias -p` lists the aliases, then handles its operands.
+/// Bash 5.3 `alias -p` lists aliases and ignores the remaining operands.
 #[tokio::test]
-async fn alias_p_lists_then_defines() {
+async fn alias_p_lists_without_defining_operands() {
 	assert_eq!(
 		run("alias a=1; alias -p x=new; echo \"st=$?\"; alias").await,
-		"alias a='1'\nst=0\nalias a='1'\nalias x='new'\n"
+		"alias a='1'\nst=0\nalias a='1'\n"
 	);
+}
+
+/// Alias-end lookahead, unlike an ordinary escaped blank, does not make a
+/// trailing newline part of the pathname in a command substitution.
+#[tokio::test]
+async fn alias_tail_backslashes_preserve_real_command_substitution_filenames() {
+	for (count, expected) in [(1, "F"), (3, "F\\ ")] {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let command = format!(
+			"shopt -s expand_aliases\nalias q='touch F{}'\necho \"[$(q )]\"",
+			"\\".repeat(count)
+		);
+		assert_eq!(run_in(dir.path(), &command).await, "[]\n");
+		let names: Vec<OsString> = std::fs::read_dir(dir.path())
+			.expect("created files")
+			.map(|entry| entry.expect("directory entry").file_name())
+			.collect();
+		assert_eq!(names, [OsString::from(expected)], "backslashes: {count}");
+	}
+}
+
+/// An escaped quote in an ANSI-C alias word does not end that quote. The
+/// original blank after the alias name supplies the pathname's one blank.
+#[tokio::test]
+async fn ansi_c_quote_split_across_an_alias_creates_the_bash_filename() {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let command = r#"shopt -s expand_aliases
+alias q='touch $'"'"'A\'"'"'B\\'
+q '"#;
+	assert_eq!(run_in(dir.path(), command).await, "");
+	let names: Vec<OsString> = std::fs::read_dir(dir.path())
+		.expect("created files")
+		.map(|entry| entry.expect("directory entry").file_name())
+		.collect();
+	assert_eq!(names, [OsString::from("A'B\\ ")]);
+}
+
+/// Backquotes read successive commands with the aliases earlier commands
+/// defined, including when the outer shell's alias table began empty.
+#[tokio::test]
+async fn backquotes_read_later_lines_after_their_alias_definitions() {
+	for mode in ["shopt -s expand_aliases", "set -o posix"] {
+		assert_eq!(run(&format!("{mode}\necho \"[`alias q='echo NEXT'\nq`]\"")).await, "[NEXT]\n");
+	}
+}
+
+#[tokio::test]
+async fn backquotes_report_syntax_errors_after_alias_expansion_is_disabled() {
+	let out = with_aliases(
+		"q='printf Q'",
+		"shopt -u expand_aliases; printf '<%s>\\n' `q \"`\necho DONE",
+	)
+	.await;
+	assert!(out.contains("unexpected EOF"), "{out}");
+	assert!(out.ends_with("<>\nDONE\n"), "{out}");
 }

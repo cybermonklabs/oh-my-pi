@@ -45,6 +45,8 @@ pub mod zsh;
 
 use alloc::vec::Vec;
 
+pub(crate) use util::backquote_text;
+
 pub use crate::bash::syntax::{
 	ast::*,
 	features::{AliasLookup, Features, NO_ALIASES, NoAliases},

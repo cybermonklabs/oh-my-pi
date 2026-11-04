@@ -211,58 +211,64 @@ pub fn doc_placeholder(seq: u32) -> Vec<u8> {
 /// alias substitutions, so re-parsing reproduces it.
 pub struct Parser<'s> {
 	/// The whole source.
-	src:            &'s [u8],
+	src:             &'s [u8],
 	/// Offset added to every span (sub-parsers of backquoted text).
-	base:           u32,
-	feat:           Features,
-	aliases:        &'s dyn AliasLookup,
+	base:            u32,
+	feat:            Features,
+	aliases:         &'s dyn AliasLookup,
 	/// Current input buffer: `src` or an alias value.
-	buf:            &'s [u8],
+	buf:             &'s [u8],
 	/// Cursor in `buf`.
-	pos:            usize,
+	pos:             usize,
 	/// 1 + newlines consumed from `src` (the line of the next byte).
-	line:           u32,
+	line:            u32,
 	/// Saved outer buffers while alias expansions are being read.
-	frames:         Vec<Frame<'s>>,
+	frames:          Vec<Frame<'s>>,
+	/// The active quote delimiter, as the parser reads it (not a rescan of
+	/// an alias value). Here-documents and comments use a nonzero sentinel.
+	alias_delimiter: u8,
+	/// bash `shell_getc`'s unquoted-backslash state, including a byte that
+	/// `read_token_word` looks ahead at and then reads again.
+	alias_backslash: bool,
 	/// Byte bash appends to a final line without a newline (`\n`, or `\`
 	/// after an odd trailing backslash); 0 when the source ends in `\n`.
-	virt:           u8,
-	virt_done:      bool,
+	virt:            u8,
+	virt_done:       bool,
 	/// Here-document bodies read ahead of the current line.
-	skip:           Option<Skip>,
-	lx:             LexState,
+	skip:            Option<Skip>,
+	lx:              LexState,
 	/// One-token lookahead.
-	la:             Option<Tok>,
+	la:              Option<Tok>,
 	/// End offset of the last token taken.
-	last_hi:        u32,
+	last_hi:         u32,
 	/// Gathered here-document texts, by sequence number.
-	docs:           Vec<Vec<u8>>,
+	docs:            Vec<Vec<u8>>,
 	/// Here-documents waiting for the next newline.
-	pending:        Vec<PendingDoc>,
+	pending:         Vec<PendingDoc>,
 	/// Open compound commands and their lines (bash `compoundcmd_lineno`).
-	compound:       Vec<(lex::T, u32)>,
-	warnings:       Vec<ParseWarning>,
-	alias_uses:     Vec<AliasUse>,
-	expand_aliases: bool,
-	failed:         bool,
+	compound:        Vec<(lex::T, u32)>,
+	warnings:        Vec<ParseWarning>,
+	alias_uses:      Vec<AliasUse>,
+	expand_aliases:  bool,
+	failed:          bool,
 	/// Text of the last token read inside `[[ … ]]`, for messages.
-	last_cond_text: Option<Vec<u8>>,
+	last_cond_text:  Option<Vec<u8>>,
 	/// Nesting of the raw scanner (`parse_matched_pair`).
-	raw_depth:      u32,
+	raw_depth:       u32,
 	/// Top-level `;` offsets collected while scanning `for ((…))`.
-	arith_semis:    Option<Vec<usize>>,
+	arith_semis:     Option<Vec<usize>>,
 	/// Line of the `[[` being parsed (bash's `lineno` in its messages).
-	cond_line:      u32,
+	cond_line:       u32,
 	/// Whether the last `[[ … ]]` token read was the end of input.
-	cond_eof:       bool,
+	cond_eof:        bool,
 	/// The zsh grammar under [`Features::ZSH`]: every call goes to it
 	/// (boxed: a bash parser stays as small as it was).
-	zsh:            Option<Box<crate::bash::syntax::zsh::ZshParser<'s>>>,
+	zsh:             Option<Box<crate::bash::syntax::zsh::ZshParser<'s>>>,
 	/// Whether a comment consumed the virtual trailing backslash.
-	virt_comment:   bool,
+	virt_comment:    bool,
 	/// The error being raised is one bash recovers from by dropping the
 	/// rest of the input line.
-	discard_line:   bool,
+	discard_line:    bool,
 }
 
 /// Where the next top-level command starts, alias text included.
@@ -335,6 +341,8 @@ impl<'s> Parser<'s> {
 			pos: 0,
 			line: 1,
 			frames: Vec::new(),
+			alias_delimiter: 0,
+			alias_backslash: false,
 			virt,
 			virt_done: false,
 			skip: None,

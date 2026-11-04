@@ -1239,14 +1239,18 @@ impl Lower {
 			syn::WordPart::Comsub(c) => {
 				let entry = self.block(&c.body)?;
 				let kind = match c.kind {
-					syn::ComsubKind::Dollar | syn::ComsubKind::Backtick => ComsubForm::Fork,
+					syn::ComsubKind::Dollar => ComsubForm::Fork,
+					syn::ComsubKind::Backtick => ComsubForm::Backtick,
 					syn::ComsubKind::NoFork => ComsubForm::NoFork,
 					syn::ComsubKind::ValueSub => ComsubForm::Value,
 				};
-				// `$( )`, `${ ;}` and `${| ;}` are re-parsed from their text when
-				// they run.
-				let text = (c.kind != syn::ComsubKind::Backtick).then(|| self.str(&c.text));
-				if kind == ComsubForm::Fork {
+				let text = if c.kind == syn::ComsubKind::Backtick {
+					self.str(&syn::backquote_text(&c.text, quoted))
+				} else {
+					self.str(&c.text)
+				};
+				let text = Some(text);
+				if matches!(kind, ComsubForm::Fork | ComsubForm::Backtick) {
 					self.mark_cat(entry);
 				}
 				out.push(Part::Comsub { entry, kind, quoted, text });

@@ -295,12 +295,11 @@ impl<'s> Parser<'s> {
 			let Some(c) = self.peek() else { break };
 			match c {
 				b'\\' => {
-					if self.peek_at(1) == Some(b'\n') {
-						self.bump();
+					self.bump();
+					if self.peek() == Some(b'\n') {
 						self.bump();
 						continue;
 					}
-					self.bump();
 					quoted = true;
 					if !matches!(scan, Scan::Found | Scan::LitSub(_)) {
 						scan = Scan::No;
@@ -308,6 +307,11 @@ impl<'s> Parser<'s> {
 					match self.peek() {
 						None => acc.lit.push(b'\\'),
 						Some(d) => {
+							// PST_NOEXPAND in parse_comsub skips Bash's usual
+							// lookahead/ungetc pair, so it reads this byte only once.
+							if self.lx.eof_token == 0 {
+								self.alias_backslash = !self.alias_backslash && d == b'\\';
+							}
 							let bytes = self.take_char(d);
 							acc.push(WordPart::Escaped(bytes));
 						},
@@ -512,6 +516,14 @@ impl<'s> Parser<'s> {
 	/// The quoted construct starting at `c` (`'`, `"` or a backquote).
 	/// `dq`: inside double quotes (single quotes are literal there).
 	fn quoted_part(&mut self, c: u8, dq: bool) -> PResult<WordPart> {
+		let saved = self.alias_delimiter;
+		self.alias_delimiter = c;
+		let result = self.quoted_part_inner(c, dq);
+		self.alias_delimiter = saved;
+		result
+	}
+
+	fn quoted_part_inner(&mut self, c: u8, dq: bool) -> PResult<WordPart> {
 		let line = self.bash_line();
 		match c {
 			b'\'' if !dq => {
@@ -601,20 +613,7 @@ impl<'s> Parser<'s> {
 				},
 			}
 		}
-		let mut code = Vec::with_capacity(text.len());
-		let mut i = 0;
-		while i < text.len() {
-			if text[i] == b'\\'
-				&& i + 1 < text.len()
-				&& (matches!(text[i + 1], b'$' | b'`' | b'\\') || (dq && text[i + 1] == b'"'))
-			{
-				code.push(text[i + 1]);
-				i += 2;
-			} else {
-				code.push(text[i]);
-				i += 1;
-			}
-		}
+		let code = crate::bash::syntax::util::backquote_text(&text, dq);
 		let body = super::sub_parse_list(&code, self.feat, text_lo).unwrap_or_default();
 		Ok(WordPart::Comsub(Box::new(Comsub { kind: ComsubKind::Backtick, body, text })))
 	}
@@ -627,7 +626,13 @@ impl<'s> Parser<'s> {
 
 	fn parts_until_line(&mut self, stop: Stop, line: u32) -> PResult<Vec<WordPart>> {
 		let mut acc = Acc::new();
-		self.parts_into(&mut acc, stop, line)?;
+		let saved = self.alias_delimiter;
+		if matches!(stop, Stop::DQuote { .. }) {
+			self.alias_delimiter = b'"';
+		}
+		let result = self.parts_into(&mut acc, stop, line);
+		self.alias_delimiter = saved;
+		result?;
 		Ok(acc.finish())
 	}
 
@@ -900,6 +905,8 @@ impl<'s> Parser<'s> {
 				self.bump();
 				let line = self.bash_line();
 				self.bump();
+				let saved = self.alias_delimiter;
+				self.alias_delimiter = b'\'';
 				let mut raw = Vec::new();
 				loop {
 					let Some(d) = self.peek() else {
@@ -918,6 +925,7 @@ impl<'s> Parser<'s> {
 						_ => raw.push(d),
 					}
 				}
+				self.alias_delimiter = saved;
 				Ok(Some(WordPart::AnsiC(raw)))
 			},
 			b'"' if !no_quotes => {

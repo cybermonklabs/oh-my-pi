@@ -982,22 +982,17 @@ impl<'s> Parser<'s> {
 			.alias_uses
 			.push(AliasUse { name: text.to_vec(), value: value.to_vec() });
 		let expand_next = matches!(value.last(), Some(b' ' | b'\t'));
-		// Popping this frame ends the alias's text (bash `pop_string`).
-		let outer = Frame { buf: self.buf, pos: self.pos, alias: text.to_vec(), expand_next };
-		self.frames.push(outer);
-		// bash returns a space after the last character of the expansion
-		// (unless it ends in a blank, newline, metacharacter or unquoted
-		// backslash, or inside a quote) so the alias stays marked as in use
-		// while its last word is read. The value goes on to that space inside
-		// the alias's text, so its frame names no alias.
-		if alias_needs_space(value) {
-			self.frames.push(Frame {
-				buf:         &cursor::END_ALIAS_SPACE,
-				pos:         0,
-				alias:       Vec::new(),
-				expand_next: false,
-			});
-		}
+		self
+			.frames
+			.push(Frame { buf: self.buf, pos: self.pos, alias: text.to_vec(), expand_next });
+		// Whether END_ALIAS is a space depends on the parser's live quote
+		// and backslash state when it reaches the end, not on the value alone.
+		self.frames.push(Frame {
+			buf:         &cursor::END_ALIAS_SPACE,
+			pos:         0,
+			alias:       Vec::new(),
+			expand_next: false,
+		});
 		self.buf = value;
 		self.pos = 0;
 		true
@@ -1047,6 +1042,7 @@ impl<'s> Parser<'s> {
 		let saved_pos = self.pos;
 		let saved_line = self.line;
 		let saved_virt = self.virt_done;
+		let saved_backslash = self.alias_backslash;
 		let saved_skip = self.skip.take();
 		let at = saved_skip.map_or(start, |s| s.at);
 		self.pos = start;
@@ -1065,11 +1061,30 @@ impl<'s> Parser<'s> {
 		self.pos = saved_pos;
 		self.line = saved_line;
 		self.virt_done = saved_virt;
+		self.alias_backslash = saved_backslash;
 		self.skip = Some(super::cursor::Skip { at, to, line });
 	}
 
 	/// Read one here-document body (bash `make_here_document`).
 	fn read_doc(&mut self, doc: &PendingDoc, at_line: u32) -> Vec<u8> {
+		let delimiter = core::mem::replace(&mut self.alias_delimiter, 1);
+		// When an alias ends at the redirection's newline, the source line
+		// containing its name was already read. The body starts after it.
+		if !self.in_source() && self.pos == self.buf.len() && self.buf.last() == Some(&b'\n') {
+			let _ = self.peek();
+			if self.in_source() {
+				self.skip_comment();
+				if self.peek() == Some(b'\n') {
+					self.bump();
+				}
+			}
+		}
+		let text = self.read_doc_inner(doc, at_line);
+		self.alias_delimiter = delimiter;
+		text
+	}
+
+	fn read_doc_inner(&mut self, doc: &PendingDoc, at_line: u32) -> Vec<u8> {
 		let mut text = Vec::new();
 		let mut line = Vec::new();
 		let delim = &doc.delim[..];
@@ -1357,32 +1372,4 @@ fn valid_redir_var(name: &[u8]) -> bool {
 		Some(i) => is_identifier(&name[..i]) && name.ends_with(b"]") && name.len() > i + 2,
 		None => false,
 	}
-}
-
-/// Whether bash appends a space after alias `value` (`shell_getc`'s
-/// `END_ALIAS` condition): the last byte is not a blank, newline,
-/// metacharacter or unquoted backslash, and the value does not end inside a
-/// quote.
-fn alias_needs_space(value: &[u8]) -> bool {
-	let Some(&last) = value.last() else {
-		return false;
-	};
-	if matches!(last, b' ' | b'\t' | b'\n') || is_meta(last) || is_break(last) {
-		return false;
-	}
-	let mut quote = 0u8;
-	let mut escaped = false;
-	for &c in value {
-		if escaped {
-			escaped = false;
-			continue;
-		}
-		match (quote, c) {
-			(0 | b'"', b'\\') => escaped = true,
-			(0, b'\'' | b'"') => quote = c,
-			(q, c) if q != 0 && c == q => quote = 0,
-			_ => {},
-		}
-	}
-	quote == 0 && !escaped
 }

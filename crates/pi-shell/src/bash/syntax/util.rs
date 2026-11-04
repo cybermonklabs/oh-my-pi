@@ -1,6 +1,6 @@
 //! Byte helpers shared by the parser, the printer and the JSON writers.
 
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use core::fmt;
 
 /// Append the decimal form of `n`.
@@ -62,6 +62,32 @@ pub fn sh_single_quote(out: &mut Vec<u8>, s: &[u8]) {
 		}
 	}
 	out.push(b'\'');
+}
+
+/// Text executed by a backquoted substitution: remove its backslash quoting
+/// of `$`, backticks, backslashes, and double quotes inside double quotes.
+pub fn backquote_text(text: &[u8], double_quoted: bool) -> Cow<'_, [u8]> {
+	let escaped = |pair: &[u8]| {
+		pair[0] == b'\\'
+			&& (matches!(pair[1], b'$' | b'`' | b'\\') || (double_quoted && pair[1] == b'"'))
+	};
+	let Some(first) = text.windows(2).position(escaped) else {
+		return Cow::Borrowed(text);
+	};
+	let mut code = Vec::with_capacity(text.len() - 1);
+	code.extend_from_slice(&text[..first]);
+	let mut i = first;
+	while i < text.len() {
+		if text[i] == b'\\'
+			&& i + 1 < text.len()
+			&& (matches!(text[i + 1], b'$' | b'`' | b'\\') || (double_quoted && text[i + 1] == b'"'))
+		{
+			i += 1;
+		}
+		code.push(text[i]);
+		i += 1;
+	}
+	Cow::Owned(code)
 }
 
 const fn hex_value(c: u8) -> Option<u32> {

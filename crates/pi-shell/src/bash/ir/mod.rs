@@ -83,7 +83,7 @@ use crate::bash::{
 };
 
 /// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 14;
+pub const IR_VERSION: u32 = 16;
 
 /// Opcodes.
 #[derive(
@@ -517,8 +517,8 @@ pub enum Part {
 		kind:   ComsubForm,
 		/// Inside double quotes.
 		quoted: bool,
-		/// `$( )`: `strs` index of the body's source text, re-parsed with
-		/// the aliases in effect when it runs (outside posix mode).
+		/// `strs` index of the text re-parsed when the substitution runs.
+		/// Dollar forms use their parsed body in POSIX mode, backquotes do not.
 		text:   Option<u32>,
 	},
 	/// `$((…))`: arithmetic text, expanded then evaluated.
@@ -562,12 +562,14 @@ pub enum Part {
 /// Form of a command substitution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ComsubForm {
-	/// `$(…)` and `` `…` ``: a subshell.
+	/// `$(…)`: a subshell, with read-time aliases in POSIX mode.
 	Fork,
 	/// `${ …;}`: in the current shell, capturing stdout.
 	NoFork,
 	/// `${| …;}`: in the current shell, value is `$REPLY`.
 	Value,
+	/// Backquotes: a subshell with execution-time aliases in every mode.
+	Backtick,
 }
 
 /// A parameter expansion.

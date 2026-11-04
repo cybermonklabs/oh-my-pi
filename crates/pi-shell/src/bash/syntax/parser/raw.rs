@@ -73,7 +73,12 @@ impl Parser<'_> {
 		line: u32,
 	) -> PResult<()> {
 		self.raw_depth += 1;
+		let delimiter = self.alias_delimiter;
+		if open == close && matches!(open, b'\'' | b'"' | b'`') {
+			self.alias_delimiter = open;
+		}
 		let res = self.raw_scan(out, qc, open, close, flags, line);
+		self.alias_delimiter = delimiter;
 		self.raw_depth -= 1;
 		res
 	}
@@ -359,6 +364,7 @@ impl Parser<'_> {
 		let saved_compound = core::mem::take(&mut self.compound);
 		let saved_pending = core::mem::take(&mut self.pending);
 		let saved_expand = self.expand_aliases;
+		let saved_delimiter = core::mem::replace(&mut self.alias_delimiter, 0);
 		self.expand_aliases = saved_expand && self.feat.contains(Features::POSIX);
 		let close_tok = if close == b'}' { T::RBrace } else { T::RParen };
 
@@ -383,6 +389,7 @@ impl Parser<'_> {
 		self.compound = saved_compound;
 		self.pending = saved_pending;
 		self.expand_aliases = saved_expand;
+		self.alias_delimiter = saved_delimiter;
 
 		let tcmd = crate::bash::syntax::print::comsub_text(&list);
 		let mut text = Vec::with_capacity(tcmd.len() + 4);

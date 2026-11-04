@@ -1,6 +1,6 @@
 //! Names: aliases, `type`, `command -v`, `compgen`, `hash`.
 
-use std::{collections::HashMap, io::Write};
+use std::{collections::HashMap, io::Write, sync::Arc};
 
 use bstr::{BStr, BString, ByteSlice};
 
@@ -28,10 +28,12 @@ use crate::bash::{
 	},
 };
 
-/// The alias table the parser sees while reading one top-level command
-/// (kept in a zsh string's frame, [`crate::bash::vm::proc::ParseSnapshot`]).
+/// Immutable aliases shared by every parser for one minimized input line.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Aliases {
+pub struct Aliases(Arc<AliasData>);
+
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AliasData {
 	/// Regular aliases (command position).
 	regular:  HashMap<BString, BString>,
 	/// zsh global aliases (`alias -g`, any word position).
@@ -42,7 +44,7 @@ pub struct Aliases {
 	reswords: Vec<BString>,
 }
 
-impl Aliases {
+impl AliasData {
 	fn is_empty(&self) -> bool {
 		self.regular.is_empty()
 			&& self.global.is_empty()
@@ -53,19 +55,19 @@ impl Aliases {
 
 impl AliasLookup for Aliases {
 	fn alias(&self, name: &[u8]) -> Option<&[u8]> {
-		self.regular.get(name).map(|v| v.as_slice())
+		self.0.regular.get(name).map(|v| v.as_slice())
 	}
 
 	fn global_alias(&self, name: &[u8]) -> Option<&[u8]> {
-		self.global.get(name).map(|v| v.as_slice())
+		self.0.global.get(name).map(|v| v.as_slice())
 	}
 
 	fn suffix_alias(&self, suffix: &[u8]) -> Option<&[u8]> {
-		self.suffix.get(suffix).map(|v| v.as_slice())
+		self.0.suffix.get(suffix).map(|v| v.as_slice())
 	}
 
 	fn reserved_disabled(&self, word: &[u8]) -> bool {
-		self.reswords.iter().any(|w| w.as_slice() == word)
+		self.0.reswords.iter().any(|w| w.as_slice() == word)
 	}
 }
 
@@ -91,7 +93,8 @@ pub fn alias_table(
 			_ => None,
 		})
 		.collect();
-	Ok((!regular.is_empty()).then(|| Aliases { regular, ..Aliases::default() }))
+	Ok((!regular.is_empty())
+		.then(|| Aliases(Arc::new(AliasData { regular, ..AliasData::default() }))))
 }
 
 /// [`alias_table`] in the zsh dialect: with the `aliases` option on, the
@@ -110,7 +113,7 @@ fn zsh_alias_table(
 		})
 	}
 	let mut table =
-		Aliases { reswords: words(cx, vp, MiscKey::ZshDisabledReswords)?, ..Aliases::default() };
+		AliasData { reswords: words(cx, vp, MiscKey::ZshDisabledReswords)?, ..AliasData::default() };
 	if state::zsh_option(&mut k.root, cx.store, vp, crate::bash::zshopt::ZshOpt::Aliases)? {
 		let off = words(cx, vp, MiscKey::ZshDisabledAliases)?;
 		let off_suffix = words(cx, vp, MiscKey::ZshDisabledSuffixAliases)?;
@@ -131,7 +134,7 @@ fn zsh_alias_table(
 			}
 		}
 	}
-	Ok((!table.is_empty()).then_some(table))
+	Ok((!table.is_empty()).then(|| Aliases(Arc::new(table))))
 }
 
 /// bash `legal_alias_name`.
@@ -177,10 +180,8 @@ pub fn alias(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		for (name, value) in all_aliases(ctx)? {
 			alias_line(&name, &value, &mut out);
 		}
-		if o.rest.is_empty() {
-			ctx.out(&out);
-			return done(0);
-		}
+		ctx.out(&out);
+		return done(0);
 	}
 	let mut status = 0;
 	for arg in o.rest {
@@ -334,9 +335,15 @@ fn kinds(
 			&& let Some(v) = alias_of(ctx, name)?
 		{
 			found.push(Kind::Alias(v));
+			if !all {
+				return Ok(found);
+			}
 		}
 		if KEYWORDS.contains(&name) {
 			found.push(Kind::Keyword);
+			if !all {
+				return Ok(found);
+			}
 		}
 		let special = ctx.option(OptId::Posix)?
 			&& IntrinsicId::from_name(name).is_some_and(crate::bash::vm::command::is_special);
