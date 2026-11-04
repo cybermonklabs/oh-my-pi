@@ -1899,8 +1899,17 @@ impl Shell {
 		p.status = status;
 		let runs: Vec<Run> = p.runs.drain(..).collect();
 		let vpid = (p.vpid, p.mode);
+		let death = p
+			.transient
+			.then(|| i32::from(sig.number(self.k.engine.config().platform)));
 		for run in &runs {
-			self.k.exec_signals.remove(&run.id);
+			if let Some(signal) = death {
+				// A virtual process killed by a signal is not an ordinary
+				// command returning the same numeric status.
+				self.k.exec_signals.insert(run.id, signal);
+			} else {
+				self.k.exec_signals.remove(&run.id);
+			}
 			if run.started {
 				self
 					.k
@@ -1937,7 +1946,7 @@ impl Shell {
 				let handler = procs
 					.iter()
 					.find(|p| p.vpid == caller)
-					.and_then(awaited_call)
+					.and_then(|p| awaited_call(p))
 					.and_then(|call| self.k.callout_signals.get(&call));
 				if sig != Signal::Kill && handler.is_some_and(|h| !h.same_group) {
 					continue;
