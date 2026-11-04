@@ -14,18 +14,20 @@ use super::{
 	},
 	quote, state,
 };
-use crate::bash::{ir::ComsubForm, store::{KeyBuf, OptId, Record, StateStore}};
+use crate::bash::{
+	ir::ComsubForm,
+	store::{KeyBuf, OptId, Record, StateStore},
+};
 
-/// bash's `indirection_level` in `vp`: 1 at the top, one more per `eval`,
-/// `.` file and trap action running, plus the level the vproc started at
-/// ([`Vproc::trace_base`]: its parent's, and one more in a command
-/// substitution).
+/// Bash's trace indirection: one at the top, one per active eval, source,
+/// trap or no-fork substitution, plus the inherited level of a forked
+/// vproc. No-fork frames affect this count, not `$BASH_SUBSHELL`.
 pub fn level(vp: &Vproc) -> u32 {
 	let nested = vp
 		.frames
 		.iter()
 		.filter(|f| {
-			matches!(f.kind, FrameKind::Script {
+			matches!(f.kind, FrameKind::NoFork | FrameKind::Script {
 				what: ScriptKind::Eval | ScriptKind::Source | ScriptKind::Trap { .. },
 				..
 			})
@@ -205,8 +207,11 @@ pub fn poll(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<Flow> {
 	let flow = if let Some(flow) = exec::settle_sub(k, vp, cx, &mut scratch, Slot::Words) {
 		Some(flow)
 	} else {
-		if nofork && p.restore_env
-			&& (p.resume_env || super::nested::in_subshell(cx.store, vp) || command::builtin_context(vp))
+		if nofork
+			&& p.restore_env
+			&& (p.resume_env
+				|| super::nested::in_subshell(cx.store, vp)
+				|| command::builtin_context(vp))
 		{
 			command::restore_env(k, vp, cx);
 			p.restore_env = false;

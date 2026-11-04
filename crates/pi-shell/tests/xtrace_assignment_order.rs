@@ -314,3 +314,41 @@ async fn value_substitution_replies_reach_their_waiting_prompt() {
 		assert_trace(script, stdout, stderr).await;
 	}
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nofork_trace_indirection_does_not_raise_bash_subshell() {
+	for (script, stdout, stderr) in [
+		(
+			r#"PS4='+ '; set -x; x=${ printf 'sub=%s' "$BASH_SUBSHELL"; }; set +x; printf 'x=[%s] parent=%s\n' "$x" "$BASH_SUBSHELL""#,
+			"x=[sub=0] parent=0\n",
+			"++ printf sub=%s 0\n+ x=sub=0\n+ set +x\n",
+		),
+		(
+			r#"PS4='+ '; set -x; x=${| REPLY=$BASH_SUBSHELL; }; set +x; printf 'x=[%s] parent=%s\n' "$x" "$BASH_SUBSHELL""#,
+			"x=[0] parent=0\n",
+			"++ REPLY=0\n+ x=0\n+ set +x\n",
+		),
+		(
+			r#"PS4='+ '; set -x; x=${| REPLY=${ printf '%s' "$BASH_SUBSHELL"; }; }; set +x; printf 'x=[%s] parent=%s\n' "$x" "$BASH_SUBSHELL""#,
+			"x=[0] parent=0\n",
+			"+++ printf %s 0\n++ REPLY=0\n+ x=0\n+ set +x\n",
+		),
+		(
+			r#"PS4='+ '; set -x; x=${ y=$(printf '%s' "$BASH_SUBSHELL"); printf '%s' "$y"; }; set +x; printf 'x=[%s] parent=%s\n' "$x" "$BASH_SUBSHELL""#,
+			"x=[1] parent=0\n",
+			"+++ printf %s 1\n++ y=1\n++ printf %s 1\n+ x=1\n+ set +x\n",
+		),
+		(
+			r#"PS4='+ '; set -x; eval 'x=${| REPLY=$BASH_SUBSHELL; }'; set +x; printf 'x=[%s] parent=%s\n' "$x" "$BASH_SUBSHELL""#,
+			"x=[0] parent=0\n",
+			"+ eval 'x=${| REPLY=$BASH_SUBSHELL; }'\n+++ REPLY=0\n++ x=0\n+ set +x\n",
+		),
+		(
+			r#"f(){ x=${| REPLY=$BASH_SUBSHELL; }; }; PS4='+ '; set -x; f; set +x; printf 'x=[%s] parent=%s\n' "$x" "$BASH_SUBSHELL""#,
+			"x=[0] parent=0\n",
+			"+ f\n++ REPLY=0\n+ x=0\n+ set +x\n",
+		),
+	] {
+		assert_trace(script, stdout, stderr).await;
+	}
+}
