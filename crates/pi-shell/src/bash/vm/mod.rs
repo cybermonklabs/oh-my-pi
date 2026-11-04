@@ -442,6 +442,11 @@ pub struct Kernel {
 	/// are undone, by vproc: the command's syntax node and the bytes
 	/// ([`notify::defer_report`]).
 	pub fg_reports:      HashMap<Vpid, (u32, Vec<u8>)>,
+	/// The programs this shell's vprocs run, by OS pid, until each is
+	/// collected: which vproc owns a pid the shell published (`$!`,
+	/// `jobs -p`, `jobs -l`, a report), asked when `wait` or `kill` needs it
+	/// rather than kept in each job's record.
+	pub ext_owner:       HashMap<u32, Vpid>,
 	/// The stages of background pipeline jobs that started during the turn,
 	/// by job vproc: written into the job tables listing the job
 	/// ([`Shell::apply_settled`]).
@@ -533,6 +538,7 @@ impl Kernel {
 			deaths: HashMap::new(),
 			settle_done: None,
 			fg_reports: HashMap::new(),
+			ext_owner: HashMap::new(),
 			job_stages: Vec::new(),
 			pipeline_jobs: std::collections::HashSet::new(),
 			async_ignore: std::collections::HashSet::new(),
@@ -663,6 +669,49 @@ impl Kernel {
 	) {
 		let rec = Record::Proc { parent, status: Some(status), death };
 		self.root.write(store, Change::Put(Key::Proc(vpid), rec));
+	}
+
+	/// Record that vproc `vpid` runs the program with OS pid `pid`.
+	pub fn own_ext(&mut self, pid: u32, vpid: Vpid) {
+		let old = self.ext_owner.insert(pid, vpid);
+		// The OS hands a pid out again only once it is reaped, and the index
+		// forgets a program when it is collected: a pid still held means
+		// the index missed a collection.
+		debug_assert!(
+			old.is_none_or(|old| old == vpid),
+			"ext_owner: pid {pid} spawned for {vpid:?} while still held by {old:?}"
+		);
+	}
+
+	/// The vproc running the program with OS pid `pid`, while it is not
+	/// collected (an exited program not yet collected counts: the process is
+	/// a zombie, still there). An entry whose vproc is gone is a missed
+	/// collection, dropped.
+	pub fn ext_vproc(&mut self, store: &mut dyn StateStore, pid: u32) -> Option<Vpid> {
+		let v = *self.ext_owner.get(&pid)?;
+		if !matches!(self.proc_state(store, v), Some(ProcState::Exited(_))) {
+			return Some(v);
+		}
+		debug_assert!(false, "ext_owner: pid {pid} still held by ended {v:?}");
+		self.ext_owner.remove(&pid);
+		None
+	}
+
+	/// The child of `vp` that `pid` belongs to: the vproc whose program has
+	/// that OS pid, or the job, `$!` or stage it names (`Vproc::vpid_of`),
+	/// walked up its parents (`Record::Proc`) to `vp`'s direct child. A
+	/// pipeline stage's pid gives its pipeline's job.
+	pub fn child_of_pid(&mut self, store: &mut dyn StateStore, vp: &Vproc, pid: u32) -> Vpid {
+		let mut v = self.ext_vproc(store, pid).unwrap_or_else(|| vp.vpid_of(pid));
+		for _ in 0..64 {
+			match store.get(Key::Proc(v)) {
+				Ok(Some(Record::Proc { parent: Some(parent), .. })) if *parent != vp.vpid => {
+					v = *parent;
+				},
+				_ => break,
+			}
+		}
+		v
 	}
 
 	/// Whether `vp` must park on [`WaitKey::Settle`] before it reads its job
@@ -1693,6 +1742,7 @@ impl Shell {
 				self.k.forget_deferral(p.vpid);
 				let death = self.k.deaths.remove(&p.vpid);
 				self.k.pipeline_jobs.remove(&p.vpid);
+				self.k.ext_owner.retain(|_, v| *v != p.vpid);
 				self.k.async_ignore.remove(&p.vpid);
 				self.k.stage_vprocs.remove(&p.vpid);
 				self
@@ -1883,17 +1933,20 @@ impl Shell {
 	}
 
 	/// Whether a vproc still has to take note of a child's end before a
-	/// settle ends: one parked on an external that has exited, or on a
-	/// program, task or child vproc and woken since (it re-checks when it
-	/// runs, and parks again if nothing ended). A vproc busy running is no
-	/// such one: bash's `SIGCHLD` handler does not wait for it either.
+	/// settle ends: one that is just its program (`command::standin`),
+	/// parked on it after it exited, which ends from the exit status alone;
+	/// or one parked on a program, task or child vproc and woken since (it
+	/// re-checks when it runs, and parks again if nothing ended). A vproc
+	/// whose program has exited but whose output is still draining, and one
+	/// busy running, are no such ones: bash's `SIGCHLD` handler waits for
+	/// neither, and a descendant holding the output must not hold the line.
 	fn settle_pending(&self, wakes: u64) -> bool {
 		self.procs.iter().any(|p| {
 			let Some(b) = p.blocked.as_ref() else {
 				return false;
 			};
 			match b.key {
-				WaitKey::Ext { .. } => b.at != wakes || ext_exited(p),
+				WaitKey::Ext { .. } => b.at != wakes || (command::standin(p) && ext_exited(p)),
 				WaitKey::Task(_) | WaitKey::Proc(_) => b.at != wakes,
 				_ => false,
 			}
@@ -2040,6 +2093,10 @@ impl Shell {
 				}
 			}
 		}
+		// Its programs are given up with its scripts.
+		let killed = p.vpid;
+		self.k.ext_owner.retain(|_, v| *v != killed);
+		let p = &mut self.procs[i];
 		exec::unwind(&mut self.k.root, cx.store, p, 0);
 		while state::drop_scope(&mut self.k.root, cx.store, p) {}
 		p.out.clear();
@@ -2063,6 +2120,7 @@ impl Shell {
 			self.k.forget_deferral(p.vpid);
 			let death = self.k.deaths.remove(&p.vpid);
 			self.k.pipeline_jobs.remove(&p.vpid);
+			self.k.ext_owner.retain(|_, v| *v != p.vpid);
 			self.k.async_ignore.remove(&p.vpid);
 			self.k.stage_vprocs.remove(&p.vpid);
 			self
@@ -2132,6 +2190,16 @@ impl Shell {
 			.k
 			.emit(cx, root, None, EventData::Signal { sig, target });
 		let platform = self.k.engine.config().platform;
+		if let SigTarget::Process(v) = target {
+			if let Some(p) = self.procs.iter_mut().find(|p| p.vpid == v) {
+				for frame in &mut p.frames {
+					if let Some(Live::Ext(ext)) = frame.scratch.as_mut().map(|sc| &mut sc.live) {
+						let _ = ext.signal(sig);
+					}
+				}
+			}
+			return;
+		}
 		let job = match target {
 			SigTarget::Job(id) => self
 				.procs
@@ -2171,6 +2239,7 @@ impl Shell {
 						|| stages.iter().any(|&s| self.in_job(self.procs[i].vpid, s))
 				},
 				SigTarget::Label(l) => l != 0 && self.procs[i].lineage.label == l,
+				SigTarget::Process(_) => false,
 			})
 			.collect();
 		self.callout_trees(&mut hits);
@@ -2178,11 +2247,21 @@ impl Shell {
 		let mut changed: Vec<(Vpid, Option<Signal>)> = Vec::new();
 		for &i in hits.iter().rev() {
 			// bash starts a background job without job control with `SIGINT`
-			// and `SIGQUIT` ignored; only a trap the job sets runs for them.
+			// and `SIGQUIT` ignored. A real process holds its own disposition
+			// (set ignored at spawn, which the program may restore), so a
+			// vproc that is just its program passes the signal on. The shell
+			// code of the job ignores them until its own `trap` changes that:
+			// any `trap` for `SIGINT` (a reset included), one with an action
+			// for `SIGQUIT`, which the shell itself always ignores.
 			if matches!(sig, Signal::Int | Signal::Quit)
 				&& self.k.async_ignore.contains(&self.procs[i].vpid)
-				&& !own_action_trap(cx.store, &self.procs[i], sig)
-			{
+				&& transparent(&self.procs[i], !matches!(target, SigTarget::Vpid(_))) != Some(true)
+				&& !match sig {
+					Signal::Int => self.procs[i]
+						.own_traps
+						.has(crate::bash::store::TrapKey::Signal(sig)),
+					_ => own_action_trap(cx.store, &self.procs[i], sig),
+				} {
 				continue;
 			}
 			let trap = if matches!(sig, Signal::Kill | Signal::Stop) {
@@ -2508,7 +2587,7 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 			Some(proc::Awaited::Jobs { .. } | proc::Awaited::AllJobs | proc::Awaited::AnyJob)
 		);
 		if waiting && e.target == Some(proc::Target::Intrinsic(crate::bash::ids::IntrinsicId::Wait)) {
-			e.waiting = Some(proc::Awaited::Jobs { force: true });
+			e.waiting = Some(proc::Awaited::Jobs { force: true, last: None });
 			e.wait_for.clear();
 			e.wait_into = None;
 			e.status = status;

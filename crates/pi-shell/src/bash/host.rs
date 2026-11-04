@@ -549,6 +549,15 @@ pub trait ExtProc: Send {
 	fn exited(&self) -> bool {
 		false
 	}
+	/// The exit status once the process has exited, without waiting for its
+	/// output to drain, taking the process as collected: the caller is done
+	/// with it, and output still in flight (a descendant holding the pipe)
+	/// is delivered to its end of file after the `ExtProc` drops. `None`
+	/// while it runs, or where the host cannot tell before
+	/// [`ExtProc::poll_wait`] does.
+	fn exit_status_now(&mut self) -> Option<ExitStatus> {
+		None
+	}
 }
 
 /// Opens a [`PipeMirror`] per pipeline pipe ([`Host::pipe_tap`]).

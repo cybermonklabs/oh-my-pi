@@ -451,6 +451,11 @@ impl SigSet {
 pub enum SigTarget {
 	/// One virtual process.
 	Vpid(Vpid),
+	/// The program a virtual process runs, alone: what `kill PID` of the
+	/// program's OS pid reaches. Nothing virtual stands in front of a real
+	/// process (no ignore, trap or job bookkeeping of the vproc); the vproc
+	/// learns the outcome when the program ends.
+	Process(Vpid),
 	/// Every process of a job (and its externals' process group).
 	Job(JobId),
 	/// Every virtual process of the shell.

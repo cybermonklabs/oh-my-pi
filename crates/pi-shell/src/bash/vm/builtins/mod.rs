@@ -130,6 +130,8 @@ pub struct Wait {
 	pub into:     Option<BString>,
 	/// `wait -f`: a stopped job does not end the wait.
 	pub force:    bool,
+	/// The status of operands after the last child (`Awaited::Jobs`).
+	pub last:     Option<i32>,
 }
 
 /// `name` and the subscript of a `name[subscript]` variable reference.

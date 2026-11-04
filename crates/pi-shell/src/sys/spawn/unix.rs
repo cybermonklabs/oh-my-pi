@@ -1326,6 +1326,14 @@ impl ExtProc for UnixProc {
 		self.tracker.core()
 	}
 
+	fn exit_status_now(&mut self) -> Option<ExitStatus> {
+		#[cfg(target_os = "linux")]
+		if self.pidfd.is_some() {
+			self.exited_now();
+		}
+		self.tracker.lock().take_status()
+	}
+
 	fn exited(&self) -> bool {
 		if self.tracker.lock().has_exited() {
 			return true;

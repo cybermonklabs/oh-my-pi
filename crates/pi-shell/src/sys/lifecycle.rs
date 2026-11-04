@@ -170,6 +170,17 @@ impl Lifecycle {
 		self.status.is_some()
 	}
 
+	/// The exit status, once observed, taken as collected though output may
+	/// still be draining: the caller is done with the process, and its output
+	/// goes on to its end of file as adopted work when the `ExtProc` drops
+	/// ([`Lifecycle::abandon`] then sends nothing).
+	pub const fn take_status(&mut self) -> Option<ExitStatus> {
+		if self.status.is_some() {
+			self.collected = true;
+		}
+		self.status
+	}
+
 	/// Whether the exit has been observed.
 	pub const fn has_exited(&self) -> bool {
 		self.status.is_some()

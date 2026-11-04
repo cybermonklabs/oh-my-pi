@@ -557,8 +557,12 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	}
 	let mut list = Vec::new();
 	let mut status = 0;
+	// The status of operands read after the last child pushed: the last
+	// operand decides `wait`'s status (`Awaited::Jobs::last`).
+	let mut after: Option<i32> = None;
 	let zsh = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 	for a in args {
+		let pushed = list.len();
 		if zsh && !a.iter().all(u8::is_ascii_digit) {
 			// zsh `bin_fg`: any other word is a job spec; a bad one ends
 			// the arguments with status 127.
@@ -567,6 +571,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				continue;
 			}
 			status = 127;
+			after = Some(status);
 			break;
 		}
 		if a.first().is_some_and(u8::is_ascii_digit) {
@@ -577,9 +582,13 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 					return done(1);
 				}
 				status = 1;
+				after = Some(status);
 				break;
 			};
-			let child = ctx.vp.vpid_of(pid);
+			// Whatever the pid names (a job's, `$!`'s or a stage's program, a
+			// vproc), the child of this shell it belongs to: a stage's pid
+			// waits for its pipeline's job, as in bash.
+			let child = ctx.k.child_of_pid(ctx.cx.store, ctx.vp, pid);
 			let own_job = ctx.vp.jobs.by_vpid(child).is_some_and(|j| !j.inherited);
 			if own_job {
 				list.push(child);
@@ -617,11 +626,12 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			ctx.usage(format!("`{}': not a pid or valid job spec", a.as_bstr()));
 			status = 1;
 		}
+		after = if list.len() > pushed { None } else { Some(status) };
 	}
 	if list.is_empty() {
 		return done(status);
 	}
-	let wait = Wait { children: list, all: false, any: false, into, force };
+	let wait = Wait { children: list, all: false, any: false, into, force, last: after };
 	Ok(Outcome { status, control: Control::Wait(wait) })
 }
 
@@ -714,7 +724,7 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	{
 		list.push(last);
 	}
-	let wait = Wait { children: list, all: true, any: false, into: None, force };
+	let wait = Wait { children: list, all: true, any: false, into: None, force, last: None };
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }
 
@@ -745,7 +755,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 			.then_some(pid)
 		});
 		if let Some(pid) = kept {
-			let wait = Wait { children: vec![pid], all: false, any: true, into, force: true };
+			let wait = Wait { children: vec![pid], all: false, any: true, into, force: true, last: None };
 			return Ok(Outcome { status: 0, control: Control::Wait(wait) });
 		}
 		for a in args {
@@ -784,6 +794,6 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 	if list.is_empty() {
 		return done(127);
 	}
-	let wait = Wait { children: list, all: false, any: true, into, force: true };
+	let wait = Wait { children: list, all: false, any: true, into, force: true, last: None };
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }

@@ -1,0 +1,2078 @@
+[
+	{
+		"group": "wait_operands",
+		"name": "LL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.2; exit 11' & o1=$!; /bin/sh -c 'sleep 0.1; exit 12' & o2=$!; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=12\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.2; exit 11' & o1=$!; /bin/sh -c 'exit 22' & o2=$!; dead $o2; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=22\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.2; exit 11' & o1=$!; /bin/sh -c 'exit 32' & o2=$!; wait $o2; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=32\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.2; exit 11' & o1=$!; o2=$$; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'sleep 0.1; exit 12' & o2=$!; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=12\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=22\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=32\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; o2=$$; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'sleep 0.1; exit 12' & o2=$!; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=12\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=22\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=32\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; o2=$$; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'sleep 0.1; exit 12' & o2=$!; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=12\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 22' & o2=$!; dead $o2; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=22\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 32' & o2=$!; wait $o2; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=32\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; o2=$$; wait $o1 $o2 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LLL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LLE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LLF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LLN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LEL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LEE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LEF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LEN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'exit 22' & o2=$!; dead $o2; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LFL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LFE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LFF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LFN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; /bin/sh -c 'exit 32' & o2=$!; wait $o2; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LNL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; o2=$$; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LNE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; o2=$$; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LNF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; o2=$$; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "LNN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'sleep 0.3; exit 11' & o1=$!; o2=$$; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "ELL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "ELE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "ELF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "ELN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EEL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EEE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EEF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EEN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EFL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EFE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EFF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "EFN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "ENL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; o2=$$; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "ENE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; o2=$$; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "ENF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; o2=$$; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "ENN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 21' & o1=$!; dead $o1; o2=$$; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FLL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FLE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FLF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FLN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FEL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FEE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FEF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FEN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 22' & o2=$!; dead $o2; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FFL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FFE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FFF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FFN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; /bin/sh -c 'exit 32' & o2=$!; wait $o2; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FNL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; o2=$$; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FNE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; o2=$$; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FNF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; o2=$$; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "FNN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\n/bin/sh -c 'exit 31' & o1=$!; wait $o1; o2=$$; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NLL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NLE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NLF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NLN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'sleep 0.2; exit 12' & o2=$!; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NEL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NEE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NEF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 22' & o2=$!; dead $o2; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NEN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 22' & o2=$!; dead $o2; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NFL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NFE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NFF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 32' & o2=$!; wait $o2; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NFN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; /bin/sh -c 'exit 32' & o2=$!; wait $o2; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NNL",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; o2=$$; /bin/sh -c 'sleep 0.1; exit 13' & o3=$!; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=13\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NNE",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; o2=$$; /bin/sh -c 'exit 23' & o3=$!; dead $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=23\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NNF",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; o2=$$; /bin/sh -c 'exit 33' & o3=$!; wait $o3; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=33\n"
+	},
+	{
+		"group": "wait_operands",
+		"name": "NNN",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\no1=$$; o2=$$; o3=$$; wait $o1 $o2 $o3 2>/dev/null; echo status=$?",
+		"prefix": "line",
+		"status": 0,
+		"output": "status=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/kill0",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -0 $first 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=0\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/kill0/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -0 $first 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=0\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/disown_kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); disown 2>/dev/null; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/disown_kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); disown 2>/dev/null; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/disown_wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/disown_wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/jobs",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -KILL $first 2>/dev/null; dead $q1 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3'\n     PID Running                    | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' &\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/running/jobs/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -KILL $first 2>/dev/null; dead $q1 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3'\n     PID Running                    | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' &\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; touch r1 r2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; touch r1 r2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/kill0",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; kill -0 $first 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/kill0/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; kill -0 $first 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/disown_kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; disown 2>/dev/null; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/disown_kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; disown 2>/dev/null; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/disown_wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/disown_wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/jobs",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; kill -KILL $first 2>/dev/null; dead $q1 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3'\n     PID Running                    | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' &\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/exited/jobs/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1; dead $q1; kill -KILL $first 2>/dev/null; dead $q1 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3'\n     PID Running                    | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' &\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; touch r1 r2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; touch r1 r2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/kill0",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -0 $first 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/kill0/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -0 $first 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/disown_kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; disown 2>/dev/null; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/disown_kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; disown 2>/dev/null; kill -TERM $first 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/disown_wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/disown_wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $first 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=127\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/jobs",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -KILL $first 2>/dev/null; dead $q1 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/first/forgotten/jobs/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -KILL $first 2>/dev/null; dead $q1 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=143\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=143\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/kill0",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -0 $p 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=0\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/kill0/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -0 $p 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=0\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/disown_kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); disown 2>/dev/null; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=0\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/disown_kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); disown 2>/dev/null; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=0\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/disown_wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=0\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/disown_wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=0\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/jobs",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -KILL $p 2>/dev/null; dead $q2 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3'\n     PID Running                    | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' &\nw=137\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/running/jobs/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); kill -KILL $p 2>/dev/null; dead $q2 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3'\n     PID Running                    | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' &\nw=137\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; touch r1 r2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; touch r1 r2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/kill0",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; kill -0 $p 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/kill0/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; kill -0 $p 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/disown_kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; disown 2>/dev/null; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/disown_kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; disown 2>/dev/null; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/disown_wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/disown_wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/jobs",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; kill -KILL $p 2>/dev/null; dead $q2 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3'\n     PID Running                    | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' &\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/exited/jobs/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r2; dead $q2; kill -KILL $p 2>/dev/null; dead $q2 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3'\n     PID Running                    | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' &\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; touch r1 r2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; touch r1 r2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/kill0",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -0 $p 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/kill0/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -0 $p 2>/dev/null; echo k0=$?; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/disown_kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; disown 2>/dev/null; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/disown_kill/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; disown 2>/dev/null; kill -TERM $p 2>/dev/null; echo k=$?; dead $q2 5; alive $q2 && echo ALIVE || echo DEAD; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/disown_wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/disown_wait/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; disown 2>/dev/null; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/jobs",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -KILL $p 2>/dev/null; dead $q2 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "pipeline/last/forgotten/jobs/pipefail",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; set -o pipefail; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 3' | /bin/sh -c 'echo $$ >q2; until test -e r2; do /bin/sleep 0.01; done; exit 7' & p=$!; until [ -s q1 ] && [ -s q2 ]; do :; done; read q1 <q1; read q2 <q2; first=$(jobs -p); touch r1 r2; wait $p >/dev/null 2>&1; kill -KILL $p 2>/dev/null; dead $q2 5; jobs -l; touch r1 r2; dead $q1; dead $q2; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=7\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/running/wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/running/kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; kill -TERM $p 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=143\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/running/kill0",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; kill -0 $p 2>/dev/null; echo k0=$?; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=0\nw=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/running/disown_kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; disown 2>/dev/null; kill -TERM $p 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=0\nDEAD\nw=0\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/running/disown_wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; disown 2>/dev/null; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=0\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/running/jobs",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; kill -KILL $p 2>/dev/null; dead $q1 5; jobs -l; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Killed                     /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5'\nw=137\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/exited/wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; dead $q1; touch r1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/exited/kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; dead $q1; kill -TERM $p 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/exited/kill0",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; dead $q1; kill -0 $p 2>/dev/null; echo k0=$?; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/exited/disown_kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; dead $q1; disown 2>/dev/null; kill -TERM $p 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/exited/disown_wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; dead $q1; disown 2>/dev/null; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/exited/jobs",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; dead $q1; kill -KILL $p 2>/dev/null; dead $q1 5; jobs -l; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Exit 5                     /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5'\nw=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/forgotten/wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; wait $p >/dev/null 2>&1; touch r1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/forgotten/kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; wait $p >/dev/null 2>&1; kill -TERM $p 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/forgotten/kill0",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; wait $p >/dev/null 2>&1; kill -0 $p 2>/dev/null; echo k0=$?; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k0=1\nw=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/forgotten/disown_kill",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; wait $p >/dev/null 2>&1; disown 2>/dev/null; kill -TERM $p 2>/dev/null; echo k=$?; dead $q1 5; alive $q1 && echo ALIVE || echo DEAD; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "k=1\nDEAD\nw=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/forgotten/disown_wait",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; wait $p >/dev/null 2>&1; disown 2>/dev/null; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=5\n"
+	},
+	{
+		"group": "published_pids",
+		"name": "lone/forgotten/jobs",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >q1; until test -e r1; do /bin/sleep 0.01; done; exit 5' & p=$!; until [ -s q1 ]; do :; done; read q1 <q1; touch r1; wait $p >/dev/null 2>&1; kill -KILL $p 2>/dev/null; dead $q1 5; jobs -l; touch r1; dead $q1; wait $p 2>/dev/null; echo w=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "w=5\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/restores/lone/kill",
+		"script": "d=$(mktemp -d); cd \"$d\"; perl -e '$SIG{INT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/restores/lone/kill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; perl -e '$SIG{INT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/restores/lone/binkill",
+		"script": "d=$(mktemp -d); cd \"$d\"; perl -e '$SIG{INT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/restores/lone/binkill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; perl -e '$SIG{INT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/restores/last/kill",
+		"script": "d=$(mktemp -d); cd \"$d\"; true | perl -e '$SIG{INT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/restores/last/kill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; true | perl -e '$SIG{INT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/restores/last/binkill",
+		"script": "d=$(mktemp -d); cd \"$d\"; true | perl -e '$SIG{INT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/restores/last/binkill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; true | perl -e '$SIG{INT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/keeps/lone/kill",
+		"script": "d=$(mktemp -d); cd \"$d\"; perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nSURVIVED\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/keeps/lone/kill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/keeps/lone/binkill",
+		"script": "d=$(mktemp -d); cd \"$d\"; perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nSURVIVED\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/keeps/lone/binkill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/keeps/last/kill",
+		"script": "d=$(mktemp -d); cd \"$d\"; true | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nSURVIVED\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/keeps/last/kill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; true | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/keeps/last/binkill",
+		"script": "d=$(mktemp -d); cd \"$d\"; true | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nSURVIVED\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "INT/keeps/last/binkill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; true | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/restores/lone/kill",
+		"script": "d=$(mktemp -d); cd \"$d\"; perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Quit                       (core dumped) perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/restores/lone/kill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Quit                       (core dumped) perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/restores/lone/binkill",
+		"script": "d=$(mktemp -d); cd \"$d\"; perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Quit                       (core dumped) perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/restores/lone/binkill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Quit                       (core dumped) perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/restores/last/kill",
+		"script": "d=$(mktemp -d); cd \"$d\"; true | perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Done                       true\n     PID Quit                       (core dumped) | perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/restores/last/kill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; true | perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Done                       true\n     PID Quit                       (core dumped) | perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/restores/last/binkill",
+		"script": "d=$(mktemp -d); cd \"$d\"; true | perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Done                       true\n     PID Quit                       (core dumped) | perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/restores/last/binkill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; true | perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Done                       true\n     PID Quit                       (core dumped) | perl -e '$SIG{QUIT}=\"DEFAULT\"; open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/keeps/lone/kill",
+		"script": "d=$(mktemp -d); cd \"$d\"; perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nSURVIVED\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/keeps/lone/kill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Quit                       perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/keeps/lone/binkill",
+		"script": "d=$(mktemp -d); cd \"$d\"; perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nSURVIVED\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/keeps/lone/binkill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Quit                       (core dumped) perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/keeps/last/kill",
+		"script": "d=$(mktemp -d); cd \"$d\"; true | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nSURVIVED\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/keeps/last/kill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; true | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Done                       true\n     PID Quit                       (core dumped) | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/keeps/last/binkill",
+		"script": "d=$(mktemp -d); cd \"$d\"; true | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nSURVIVED\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "QUIT/keeps/last/binkill/set-m",
+		"script": "d=$(mktemp -d); cd \"$d\"; set -m; true | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"' & p=$!; until [ -e ready ]; do :; done; /bin/kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"host_core": true,
+		"status": 0,
+		"output": "kill=0\nbash: line 1: PID Done                       true\n     PID Quit                       | perl -e 'open my $f,\">\",\"ready\"; close $f; while(!-e \"release\"){select undef,undef,undef,.001;} print \"SURVIVED\\n\"'\nwait=131\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/INT/plain/subshell",
+		"script": "d=$(mktemp -d); cd \"$d\"; ( : > ready; until [ -e release ]; do :; done; echo end ) & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nend\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/INT/plain/group",
+		"script": "d=$(mktemp -d); cd \"$d\"; { : > ready; until [ -e release ]; do :; done; echo end; } & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nend\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/INT/reset/subshell",
+		"script": "d=$(mktemp -d); cd \"$d\"; ( trap - INT; : > ready; until [ -e release ]; do :; done; echo end ) & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/INT/reset/group",
+		"script": "d=$(mktemp -d); cd \"$d\"; { trap - INT; : > ready; until [ -e release ]; do :; done; echo end; } & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nwait=130\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/INT/caught/subshell",
+		"script": "d=$(mktemp -d); cd \"$d\"; ( trap 'echo T' INT; : > ready; until [ -e release ]; do :; done; echo end ) & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nT\nend\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/INT/caught/group",
+		"script": "d=$(mktemp -d); cd \"$d\"; { trap 'echo T' INT; : > ready; until [ -e release ]; do :; done; echo end; } & p=$!; until [ -e ready ]; do :; done; kill -INT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nT\nend\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/QUIT/plain/subshell",
+		"script": "d=$(mktemp -d); cd \"$d\"; ( : > ready; until [ -e release ]; do :; done; echo end ) & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nend\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/QUIT/plain/group",
+		"script": "d=$(mktemp -d); cd \"$d\"; { : > ready; until [ -e release ]; do :; done; echo end; } & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nend\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/QUIT/reset/subshell",
+		"script": "d=$(mktemp -d); cd \"$d\"; ( trap - QUIT; : > ready; until [ -e release ]; do :; done; echo end ) & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nend\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/QUIT/reset/group",
+		"script": "d=$(mktemp -d); cd \"$d\"; { trap - QUIT; : > ready; until [ -e release ]; do :; done; echo end; } & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nend\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/QUIT/caught/subshell",
+		"script": "d=$(mktemp -d); cd \"$d\"; ( trap 'echo T' QUIT; : > ready; until [ -e release ]; do :; done; echo end ) & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nT\nend\nwait=0\n"
+	},
+	{
+		"group": "async_signal_disposition",
+		"name": "shell-code/QUIT/caught/group",
+		"script": "d=$(mktemp -d); cd \"$d\"; { trap 'echo T' QUIT; : > ready; until [ -e release ]; do :; done; echo end; } & p=$!; until [ -e ready ]; do :; done; kill -QUIT \"$p\"; echo kill=$?; touch release; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "kill=0\nT\nend\nwait=0\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "first-stage/exit0/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 0' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "first-stage/exit0/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 0' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "lone/exit0/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 0' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "lone/exit0/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 0' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "last-stage/exit0/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; true | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 0' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "last-stage/exit0/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; true | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 0' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "no-holder/exit0/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; exit 0' | cat & p=$!; until [ -s parent ]; do :; done; read first <parent; dead $first; echo NEXT; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=0\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "no-holder/exit0/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; exit 0' | cat & p=$!; until [ -s parent ]; do :; done; read first <parent; dead $first\necho NEXT; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=0\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "first-stage/exit3/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "first-stage/exit3/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "lone/exit3/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=3\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "lone/exit3/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=3\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "last-stage/exit3/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; true | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=3\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "last-stage/exit3/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; true | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=3\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "no-holder/exit3/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; exit 3' | cat & p=$!; until [ -s parent ]; do :; done; read first <parent; dead $first; echo NEXT; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=0\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "no-holder/exit3/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; exit 3' | cat & p=$!; until [ -s parent ]; do :; done; read first <parent; dead $first\necho NEXT; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=0\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "first-stage/kill/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "first-stage/kill/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "lone/kill/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nbash: line 2: PID Killed                     /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$'\nwait=137\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "lone/kill/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "bash: line 3: PID Killed                     /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$'\nNEXT\nk0=1\nwait=137\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "last-stage/kill/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; true | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nbash: line 2: PID Done                       true\n     PID Killed                     | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$'\nwait=137\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "last-stage/kill/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; true | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "bash: line 3: PID Done                       true\n     PID Killed                     | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$'\nNEXT\nk0=1\nwait=137\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "no-holder/kill/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; kill -KILL $$' | cat & p=$!; until [ -s parent ]; do :; done; read first <parent; dead $first; echo NEXT; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=0\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "no-holder/kill/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; kill -KILL $$' | cat & p=$!; until [ -s parent ]; do :; done; read first <parent; dead $first\necho NEXT; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=0\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "first-stage/term/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -TERM $$' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "first-stage/term/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -TERM $$' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "lone/term/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -TERM $$' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=143\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "lone/term/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -TERM $$' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=143\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "last-stage/term/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; true | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -TERM $$' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; echo NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=143\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "last-stage/term/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; true | /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -TERM $$' & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\necho NEXT; kill -0 $first 2>/dev/null; echo k0=$?; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nk0=1\nwait=143\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "no-holder/term/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; kill -TERM $$' | cat & p=$!; until [ -s parent ]; do :; done; read first <parent; dead $first; echo NEXT; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=0\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "no-holder/term/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; kill -TERM $$' | cat & p=$!; until [ -s parent ]; do :; done; read first <parent; dead $first\necho NEXT; wait \"$p\"; echo wait=$?; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=0\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "listed/exit3/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; jobs -l; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3'\n     PID Running                    | cat &\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "listed/exit3/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\njobs -l; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; exit 3'\n     PID Running                    | cat &\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "listed/kill/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first; jobs -l; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$'\n     PID Running                    | cat &\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "listed/kill/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$' | cat & p=$!; until [ -s parent ] && [ -s hCHILD ]; do :; done; read first <parent; read h <hCHILD; dead $first\njobs -l; touch release; dead $h; wait \"$p\"; echo wait=$?; cat log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "[1]+ PID Running                    /bin/sh -c 'echo $$ >parent; (until test -e release; do /bin/sleep .01; done; echo CHILD >>log) & echo $! >hCHILD; kill -KILL $$'\n     PID Running                    | cat &\nwait=0\nCHILD\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "second-exit/exit0-then-exit3/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; exit 0' | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; exit 3' & p=$!; until [ -s p1 ] && [ -s hC1 ]; do :; done; read a <p1; read ha <hC1; dead $a; touch go2; until [ -s p2 ] && [ -s hC2 ]; do :; done; read b <p2; read hb <hC2; dead $b; echo NEXT; touch release; dead $ha; dead $hb; wait \"$p\"; echo wait=$?; sort log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=3\nC1\nC2\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "second-exit/exit0-then-exit3/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; exit 0' | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; exit 3' & p=$!; until [ -s p1 ] && [ -s hC1 ]; do :; done; read a <p1; read ha <hC1; dead $a; touch go2; until [ -s p2 ] && [ -s hC2 ]; do :; done; read b <p2; read hb <hC2; dead $b\necho NEXT; touch release; dead $ha; dead $hb; wait \"$p\"; echo wait=$?; sort log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=3\nC1\nC2\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "second-exit/exit0-then-kill/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; exit 0' | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; kill -KILL $$' & p=$!; until [ -s p1 ] && [ -s hC1 ]; do :; done; read a <p1; read ha <hC1; dead $a; touch go2; until [ -s p2 ] && [ -s hC2 ]; do :; done; read b <p2; read hb <hC2; dead $b; echo NEXT; touch release; dead $ha; dead $hb; wait \"$p\"; echo wait=$?; sort log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nbash: line 2: PID Done                       /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; exit 0'\n     PID Killed                     | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; kill -KILL $$'\nwait=137\nC1\nC2\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "second-exit/exit0-then-kill/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; exit 0' | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; kill -KILL $$' & p=$!; until [ -s p1 ] && [ -s hC1 ]; do :; done; read a <p1; read ha <hC1; dead $a; touch go2; until [ -s p2 ] && [ -s hC2 ]; do :; done; read b <p2; read hb <hC2; dead $b\necho NEXT; touch release; dead $ha; dead $hb; wait \"$p\"; echo wait=$?; sort log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "bash: line 3: PID Done                       /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; exit 0'\n     PID Killed                     | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; kill -KILL $$'\nNEXT\nwait=137\nC1\nC2\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "second-exit/kill-then-exit3/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; kill -KILL $$' | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; exit 3' & p=$!; until [ -s p1 ] && [ -s hC1 ]; do :; done; read a <p1; read ha <hC1; dead $a; touch go2; until [ -s p2 ] && [ -s hC2 ]; do :; done; read b <p2; read hb <hC2; dead $b; echo NEXT; touch release; dead $ha; dead $hb; wait \"$p\"; echo wait=$?; sort log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=3\nC1\nC2\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "second-exit/kill-then-exit3/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; kill -KILL $$' | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; exit 3' & p=$!; until [ -s p1 ] && [ -s hC1 ]; do :; done; read a <p1; read ha <hC1; dead $a; touch go2; until [ -s p2 ] && [ -s hC2 ]; do :; done; read b <p2; read hb <hC2; dead $b\necho NEXT; touch release; dead $ha; dead $hb; wait \"$p\"; echo wait=$?; sort log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nwait=3\nC1\nC2\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "second-exit/kill-then-kill/same-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; kill -KILL $$' | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; kill -KILL $$' & p=$!; until [ -s p1 ] && [ -s hC1 ]; do :; done; read a <p1; read ha <hC1; dead $a; touch go2; until [ -s p2 ] && [ -s hC2 ]; do :; done; read b <p2; read hb <hC2; dead $b; echo NEXT; touch release; dead $ha; dead $hb; wait \"$p\"; echo wait=$?; sort log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "NEXT\nbash: line 2: PID Killed                     /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; kill -KILL $$'\n     PID                          | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; kill -KILL $$'\nwait=137\nC1\nC2\n"
+	},
+	{
+		"group": "relay_holders",
+		"name": "second-exit/kill-then-kill/next-line",
+		"script": "dead() { local s t=$((SECONDS+${2:-30})); while ((SECONDS < t)); do read -r s 2>/dev/null < /proc/$1/stat || return 0; [[ $s == *\") Z \"* ]] && return 0; done; return 1; }; alive() { local s; read -r s 2>/dev/null < /proc/$1/stat && [[ $s != *\") Z \"* ]]; }\nd=$(mktemp -d); cd \"$d\"; /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; kill -KILL $$' | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; kill -KILL $$' & p=$!; until [ -s p1 ] && [ -s hC1 ]; do :; done; read a <p1; read ha <hC1; dead $a; touch go2; until [ -s p2 ] && [ -s hC2 ]; do :; done; read b <p2; read hb <hC2; dead $b\necho NEXT; touch release; dead $ha; dead $hb; wait \"$p\"; echo wait=$?; sort log; cd /; rm -rf \"$d\"",
+		"prefix": "line",
+		"status": 0,
+		"output": "bash: line 3: PID Killed                     /bin/sh -c 'echo $$ >p1; (until test -e release; do /bin/sleep .01; done; echo C1 >>log) & echo $! >hC1; kill -KILL $$'\n     PID                          | /bin/sh -c 'until test -e go2; do /bin/sleep .01; done; echo $$ >p2; (until test -e release; do /bin/sleep .01; done; echo C2 >>log) & echo $! >hC2; kill -KILL $$'\nNEXT\nwait=137\nC1\nC2\n"
+	}
+]

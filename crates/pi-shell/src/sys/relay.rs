@@ -338,6 +338,10 @@ impl ExtProc for Relayed {
 	fn exited(&self) -> bool {
 		self.child.exited()
 	}
+
+	fn exit_status_now(&mut self) -> Option<ExitStatus> {
+		self.child.exit_status_now()
+	}
 }
 
 impl Drop for Relayed {

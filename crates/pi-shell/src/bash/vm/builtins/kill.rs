@@ -52,6 +52,13 @@ enum TargetError {
 
 /// `kill [-s sig | -n num | -sig] pid|%job …`, `kill -l [sig …]`.
 pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
+	// bash knows of each child's end (`SIGCHLD`, which reaps it) when
+	// `kill` looks: a program that has exited is gone.
+	if ctx.k.needs_settle(ctx.vp) {
+		return Err(super::Need::Sub(crate::bash::vm::expand::Stop::Wait(
+			crate::bash::event::WaitKey::Settle,
+		)));
+	}
 	let platform = ctx.k.engine.config().platform;
 	let mut send = Send::Signal(Signal::Term);
 	let mut i = 0;
@@ -161,6 +168,22 @@ fn target(ctx: &mut Ctx<'_, '_>, arg: &[u8], send: Send) -> Result<Option<SigTar
 		.and_then(|s| s.parse::<i32>().ok())
 		.ok_or(TargetError::NotAnId)?;
 	let base = ctx.k.engine.config().vpid_base;
+	// A program this shell runs (a job's, `$!`'s, a stage's), named by its
+	// OS pid, until it is collected (a zombie included): `kill` reaches
+	// that process, as bash's `kill(2)` does. Job control signals go through
+	// the vproc, whose job state follows them.
+	if let Ok(p) = u32::try_from(pid)
+		&& p > 0
+		&& let Some(owner) = ctx.k.ext_vproc(ctx.cx.store, p)
+	{
+		let job_control = send.signal().is_some_and(|sig| {
+			matches!(
+				sig.default_action(),
+				crate::bash::signal::DefaultAction::Stop | crate::bash::signal::DefaultAction::Continue
+			)
+		});
+		return Ok(Some(if job_control { SigTarget::Vpid(owner) } else { SigTarget::Process(owner) }));
+	}
 	// A stage of a background pipeline is a process of its own: the signal
 	// reaches it alone, and one that ended is gone (bash's stages are
 	// forked processes).

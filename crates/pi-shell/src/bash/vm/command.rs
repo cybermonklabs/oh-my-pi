@@ -1814,9 +1814,11 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			// bash starts a background job without job control with `SIGINT`
 			// and `SIGQUIT` ignored; its programs inherit that unless the job
 			// set a trap with an action for one (reset to default at `exec`).
+			// A `trap` the job ran for one (set, reset or ignored) decides it
+			// instead: a caught or reset signal is default in a program.
 			if k.async_ignore.contains(&vp.vpid) {
 				for sig in [crate::bash::signal::Signal::Int, crate::bash::signal::Signal::Quit] {
-					if !super::own_action_trap(cx.store, vp, sig) {
+					if !vp.own_traps.has(crate::bash::store::TrapKey::Signal(sig)) {
 						sigmask_ign = sigmask_ign.with(sig);
 					}
 				}
@@ -1936,6 +1938,7 @@ fn spawned_external(
 		Ok(child) => {
 			k.forget_deferral(vp.vpid);
 			let pid = child.pid();
+			k.own_ext(pid, vp.vpid);
 			// The job this vproc may still settle is known by its program
 			// (`bang_dispatch` let only its lone or `exec`'d external
 			// through).
@@ -2723,7 +2726,7 @@ fn run_builtin(
 						} else if w.all {
 							Awaited::AllJobs
 						} else {
-							Awaited::Jobs { force: w.force }
+							Awaited::Jobs { force: w.force, last: w.last }
 						});
 						e.stage = Stage::Await;
 						None
@@ -3077,7 +3080,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			}
 			status
 		},
-		Some(Awaited::Jobs { force }) => {
+		Some(Awaited::Jobs { force, last: after }) => {
 			let mut last = st(vp).status;
 			let mut waited = None;
 			while let Some(&v) = st(vp).wait_for.first() {
@@ -3120,7 +3123,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			if let Some(pid) = waited {
 				waited_into(k, vp, cx, line, pid);
 			}
-			last
+			after.unwrap_or(last)
 		},
 		Some(Awaited::AllJobs) => {
 			while let Some(&v) = st(vp).wait_for.first() {
@@ -3209,36 +3212,50 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			let replacing = matches!(st(vp).control, Some(Transfer::Exec));
 			let run = vp.runs.front().map(|run| run.id);
 			let mut tcx = Context::from_waker(&k.waker);
+			// A vproc that is just its program ends when the program does:
+			// output a descendant still holds drains on its own, as from a
+			// process bash forked (a line read never waits for it).
+			let standin = standin(vp);
 			// The signal that ended the program, with its core dump.
 			let mut died: Option<Death> = None;
 			let status = match &mut scratch(vp).live {
-				Live::Ext(child) => match child.poll_wait(&mut tcx) {
-					Poll::Ready(ExitStatus::Exited(code)) => {
-						reaped = true;
-						code
-					},
-					Poll::Ready(ExitStatus::Signaled(sig)) => {
-						reaped = true;
-						if replacing && let Some(run) = run {
-							k.exec_signals.insert(run, i32::from(sig.number(platform)));
-						}
-						died = Some(Death { signal: sig.number(platform), core: child.core_dumped() });
-						sig.exit_status(platform)
-					},
-					Poll::Ready(ExitStatus::SignaledRaw(signal)) => {
-						reaped = true;
-						if replacing && let Some(run) = run {
-							k.exec_signals.insert(run, signal);
-						}
-						died = u8::try_from(signal)
-							.ok()
-							.map(|signal| Death { signal, core: child.core_dumped() });
-						128 + signal
-					},
-					Poll::Pending => return Some(Flow::Block(WaitKey::Ext { pid })),
+				Live::Ext(child) => {
+					let polled = match child.poll_wait(&mut tcx) {
+						Poll::Ready(status) => Some(status),
+						Poll::Pending if standin => child.exit_status_now(),
+						Poll::Pending => None,
+					};
+					match polled {
+						Some(ExitStatus::Exited(code)) => {
+							reaped = true;
+							code
+						},
+						Some(ExitStatus::Signaled(sig)) => {
+							reaped = true;
+							if replacing && let Some(run) = run {
+								k.exec_signals.insert(run, i32::from(sig.number(platform)));
+							}
+							died = Some(Death { signal: sig.number(platform), core: child.core_dumped() });
+							sig.exit_status(platform)
+						},
+						Some(ExitStatus::SignaledRaw(signal)) => {
+							reaped = true;
+							if replacing && let Some(run) = run {
+								k.exec_signals.insert(run, signal);
+							}
+							died = u8::try_from(signal)
+								.ok()
+								.map(|signal| Death { signal, core: child.core_dumped() });
+							128 + signal
+						},
+						None => return Some(Flow::Block(WaitKey::Ext { pid })),
+					}
 				},
 				_ => lost(k, vp, cx, op, line, Lost::Ext { vpid: vp.vpid, pid }),
 			};
+			if reaped {
+				k.ext_owner.remove(&pid);
+			}
 			if let Some(death) = died
 				&& !replacing
 			{
@@ -3262,6 +3279,16 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 	s.status = status;
 	s.stage = Stage::Output;
 	None
+}
+
+/// Whether `vp` is just its program now: a subshell (a job's or a pipeline
+/// stage's) whose current command is its last (`SubExit` follows), as bash
+/// would have `exec`'d it.
+pub(super) fn standin(vp: &Vproc) -> bool {
+	vp.transient
+		&& matches!(vp.frames.as_slice(), [f] if f.unit.as_ref().is_some_and(|u| {
+			u.ops.get(f.pc as usize + 1).is_some_and(|o| o.code == Opcode::SubExit)
+		}))
 }
 
 /// Report the job led by `v`, which `wait` collected, if a signal ended it
@@ -3848,7 +3875,7 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 	k.spawned.push(Box::new(child));
 	let s = st(vp);
 	s.wait_for = vec![vpid];
-	s.waiting = Some(Awaited::Jobs { force: true });
+	s.waiting = Some(Awaited::Jobs { force: true, last: None });
 	s.stage = Stage::Await;
 	Some(Flow::Block(WaitKey::Proc(vpid)))
 }

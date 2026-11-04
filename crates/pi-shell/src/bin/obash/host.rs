@@ -428,6 +428,10 @@ impl ExtProc for SignalsOnExit {
 	fn exited(&self) -> bool {
 		self.child.exited()
 	}
+
+	fn exit_status_now(&mut self) -> Option<ExitStatus> {
+		self.child.exit_status_now()
+	}
 }
 
 /// The signals this process ignores now: call at startup, before any trap,

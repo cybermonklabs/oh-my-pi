@@ -730,10 +730,18 @@ impl Vproc {
 	/// job's or `$!`'s OS pid maps to its vproc; any other number is taken
 	/// as a virtual pid.
 	pub fn vpid_of(&self, pid: u32) -> Vpid {
-		match self.jobs.by_pid(pid) {
-			Some(job) => job.vpid,
-			None => self.last_bg.named_by(pid).unwrap_or(Vpid(pid)),
+		if let Some(job) = self.jobs.by_pid(pid) {
+			return job.vpid;
 		}
+		// A stage of a listed pipeline job, by the pid `jobs -l` shows.
+		if let Some(job) = self
+			.jobs
+			.iter()
+			.find(|j| j.stages.as_deref().is_some_and(|s| s.iter().any(|s| s.pid() == pid)))
+		{
+			return job.vpid;
+		}
+		self.last_bg.named_by(pid).unwrap_or(Vpid(pid))
 	}
 
 	/// The job list is frozen (bash `jobs_list_frozen`): the last command of
@@ -1592,6 +1600,12 @@ pub enum Awaited {
 	/// 128 + the stop signal), as in bash with job control.
 	Jobs {
 		force: bool,
+		/// The status of operands after the last child, known when `wait`
+		/// read them (a forgotten job's kept status, a pid that is no child):
+		/// the last operand's status is `wait`'s, whatever order the children
+		/// end in.
+		#[serde(default)]
+		last:  Option<i32>,
 	},
 	/// Every background child (`wait` without operands); the status is 0.
 	AllJobs,

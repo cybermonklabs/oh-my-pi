@@ -436,6 +436,7 @@ fn foreground(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> R {
 		any:      false,
 		into:     None,
 		force:    false,
+		last:     None,
 	};
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }
@@ -485,6 +486,11 @@ fn background(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> i32 {
 /// with `-h` mark them not to get a `SIGHUP`; no operand means the current
 /// job (all with `-a`, the running ones with `-r`).
 pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
+	// bash knows of each child's end (`SIGCHLD`) when `disown` looks: a job
+	// that ended is forgotten with its real status.
+	if ctx.k.needs_settle(ctx.vp) {
+		return Err(Need::Sub(Stop::Wait(WaitKey::Settle)));
+	}
 	let o = match opts(ctx, args, b"ahr", b"", false) {
 		Ok(o) => o,
 		Err(st) => return done(st),
@@ -516,8 +522,11 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	for word in words {
 		let found = match word {
 			Some(w) if number(w).is_some_and(|n| i32::try_from(n).is_ok()) => {
+				// The job the pid belongs to, a stage's pid included (bash
+				// `get_job_by_pid`).
 				let pid = number(w).and_then(|n| u32::try_from(n).ok());
-				pid.and_then(|p| ctx.vp.jobs.by_pid(p))
+				pid.map(|p| ctx.k.child_of_pid(ctx.cx.store, ctx.vp, p))
+					.and_then(|v| ctx.vp.jobs.by_vpid(v))
 					.map(|j| j.number)
 					.ok_or(Bad::Missing)
 			},

@@ -255,6 +255,10 @@ impl ExtProc for CountedExt {
 	fn exited(&self) -> bool {
 		self.ext.exited()
 	}
+
+	fn exit_status_now(&mut self) -> Option<ExitStatus> {
+		self.ext.exit_status_now()
+	}
 }
 
 impl Drop for CountedExt {
