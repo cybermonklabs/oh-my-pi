@@ -744,7 +744,7 @@ fn preserve_foreground(vp: &mut Vproc) {
 	}
 }
 
-/// Unwinding through time_command still prints its report, on its own stderr.
+/// Unwinding through `time_command` still prints its report, on its own stderr.
 fn finish_times(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 	for index in (0..vp.frames.len()).rev() {
 		let mut after = vp.frames[index].pc as usize;
@@ -1560,7 +1560,7 @@ fn posix_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 		)
 }
 
-/// Bash's report_error exits immediately under -e, even in a conditional
+/// Bash's `report_error` exits immediately under -e, even in a conditional
 /// function.
 pub fn report_error(
 	k: &mut Kernel,

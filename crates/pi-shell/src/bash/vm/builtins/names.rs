@@ -645,10 +645,10 @@ pub fn compgen(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 	}
 	let mut retry = false;
-	if let Some(function) = o.arg(b'F') {
-		if compgen_function(ctx, function, &prefix, &mut words, &mut retry)? {
-			return Ok(Outcome { status: 0, control: Control::Resume });
-		}
+	if let Some(function) = o.arg(b'F')
+		&& compgen_function(ctx, function, &prefix, &mut words, &mut retry)?
+	{
+		return Ok(Outcome { status: 0, control: Control::Resume });
 	}
 	if let Some(command) = o.arg(b'C') {
 		words.extend(compgen_command(ctx, command, &prefix)?);
@@ -822,17 +822,16 @@ fn compgen_command(
 	command: &[u8],
 	prefix: &[u8],
 ) -> Result<Vec<BString>, Need> {
-	let output = match ctx.log.get(ctx.log_cursor) {
-		Some(Atom::Sub { out, .. }) => out.clone(),
-		_ => {
-			compgen_bind(ctx, true);
-			let mut text = Vec::with_capacity(command.len() + prefix.len() + 24);
-			text.extend_from_slice(command);
-			text.extend_from_slice(b" 'compgen' ");
-			text.extend_from_slice(&quote::sh_single_quote(prefix));
-			text.extend_from_slice(b" ''\n");
-			return Err(Need::Command(text.into()));
-		},
+	let output = if let Some(Atom::Sub { out, .. }) = ctx.log.get(ctx.log_cursor) {
+		out.clone()
+	} else {
+		compgen_bind(ctx, true);
+		let mut text = Vec::with_capacity(command.len() + prefix.len() + 24);
+		text.extend_from_slice(command);
+		text.extend_from_slice(b" 'compgen' ");
+		text.extend_from_slice(&quote::sh_single_quote(prefix));
+		text.extend_from_slice(b" ''\n");
+		return Err(Need::Command(text.into()));
 	};
 	ctx.log_cursor += 1;
 	compgen_unbind(ctx);

@@ -2743,8 +2743,8 @@ fn run_builtin(
 		let placeholder = std::mem::replace(&mut sc.logs[Slot::Builtin as usize], log);
 		debug_assert_eq!(placeholder.capacity(), 0, "builtin log placeholder");
 		std::mem::forget(placeholder);
-		if res.is_err() {
-			for chunk in chunks.drain(..) {
+		if matches!(res, Err(Need::Sub(_) | Need::Command(_))) {
+			for chunk in std::mem::take(&mut chunks) {
 				let (fd, bytes) = match chunk {
 					Chunk::Out(fd, bytes) => (fd, bytes),
 					Chunk::Diag(diag) => (2, k.render_diag(cx, vp, line, &diag)),

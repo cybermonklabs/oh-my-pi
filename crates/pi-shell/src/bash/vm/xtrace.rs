@@ -202,8 +202,7 @@ pub fn poll(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<Flow> {
 		p.saved_xtrace = Some(on(k, cx, vp));
 		set_xtrace(k, cx, vp, false);
 	}
-	let mut scratch = Scratch::default();
-	scratch.sub = p.sub.take();
+	let mut scratch = Scratch { sub: p.sub.take(), ..Scratch::default() };
 	scratch.logs[Slot::Words as usize] = std::mem::take(&mut p.log);
 	let flow = if let Some(flow) = exec::settle_sub(k, vp, cx, &mut scratch, Slot::Words) {
 		Some(flow)

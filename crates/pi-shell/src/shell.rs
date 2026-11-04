@@ -474,7 +474,8 @@ async fn run_shell_session(
 			// Dropping Session only wakes its detached driver. Await its actual
 			// teardown before reporting cancellation: it owns substitution
 			// captures and files even after the run future is gone.
-			if let Some(mut core) = session.lock().await.take() {
+			let core = session.lock().await.take();
+			if let Some(mut core) = core {
 				core.session.shutdown().await;
 			}
 			return Ok(cancelled_result(reason));
@@ -513,7 +514,8 @@ async fn run_shell_oneshot(
 		&mut ct,
 	)
 	.await;
-	if let Some(mut core) = session.lock().await.take() {
+	let core = session.lock().await.take();
+	if let Some(mut core) = core {
 		core.session.shutdown().await;
 	}
 	result
@@ -546,13 +548,15 @@ async fn run_shell_oneshot_streams(
 				task.abort();
 				let _ = task.await;
 			}
-			if let Some(mut core) = session.lock().await.take() {
+			let core = session.lock().await.take();
+			if let Some(mut core) = core {
 				core.session.shutdown().await;
 			}
 			return Ok(cancelled_result(reason));
 		},
 	};
-	if let Some(mut core) = session.lock().await.take() {
+	let core = session.lock().await.take();
+	if let Some(mut core) = core {
 		core.session.shutdown().await;
 	}
 
