@@ -454,15 +454,23 @@ fn assignment_statement(
 			Err(stop) => return Some(exec::stop_flow(k, vp, cx, line, stop)),
 		};
 		if let Err(d) = assign_now(k, vp, cx, &a.name, None, a.append, AssignValue::Scalar(value)) {
+			// An arithmetic error in the value (`declare -i I; I=bad!`) is
+			// bash's own jump: no `eval`, `.` or function contains it.
+			let arith = matches!(d, Diag::Arith { .. } | Diag::ArithSubscript { .. });
 			k.diag(cx, vp, line, d);
+			if arith {
+				return Some(exec::assign_jump(vp, cx));
+			}
 			// bash abandons the rest of the command line after a failed
-			// assignment statement; a posix shell exits.
+			// assignment statement; a posix shell exits. The site leaves
+			// `last_command_exit_value` alone, so an `errexit` conversion
+			// answers with the status that stood before it.
 			if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 				.unwrap_or(false)
 			{
-				return Some(Flow::Exit(1));
+				return Some(exec::fatal(k, vp, cx));
 			}
-			return Some(Flow::Discard(1));
+			return Some(Flow::DiscardKeep(1));
 		}
 	}
 	vp.status = 0;
@@ -907,7 +915,7 @@ fn expand(
 				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 					.unwrap_or(false)
 				{
-					return Some(Flow::Exit(1));
+					return Some(exec::fatal(k, vp, cx));
 				}
 				return Some(Flow::Discard(1));
 			}
@@ -1006,8 +1014,10 @@ fn expand(
 				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 					.unwrap_or(false)
 				{
+					// A special builtin's assignment error ends the shell
+					// with the fatal status.
 					if IntrinsicId::from_name(&st(vp).argv[0]).is_some_and(is_special) {
-						return Some(Flow::Exit(1));
+						return Some(exec::fatal(k, vp, cx));
 					}
 					let s = st(vp);
 					s.status = 1;
@@ -1067,15 +1077,24 @@ fn expand(
 			if let Err(d) =
 				assign_now(k, vp, cx, &name, index.as_ref().map(|i| i.as_slice()), append, value)
 			{
+				// An arithmetic error in the subscript or in the value is
+				// bash's own jump: it leaves every `eval`, `.` and
+				// function, and keeps the status of the place it lands.
+				let arith = matches!(d, Diag::Arith { .. } | Diag::ArithSubscript { .. });
 				k.diag(cx, vp, line, d);
+				if arith {
+					return Some(exec::assign_jump(vp, cx));
+				}
 				// bash abandons the rest of the command line after a failed
-				// assignment statement; a posix shell exits.
+				// assignment statement; a posix shell exits. The site
+				// leaves `last_command_exit_value` alone, so an `errexit`
+				// conversion answers with the status that stood before it.
 				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 					.unwrap_or(false)
 				{
-					return Some(Flow::Exit(1));
+					return Some(exec::fatal(k, vp, cx));
 				}
-				return Some(Flow::Discard(1));
+				return Some(Flow::DiscardKeep(1));
 			}
 			if k.mask.contains(crate::bash::event::EventKind::Assign)
 				&& matches!(name.as_slice(), b"BASH_ALIASES" | b"BASH_CMDS" | b"DIRSTACK" | b"RANDOM")
@@ -2194,7 +2213,11 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		return None;
 	}
 	match target {
-		Target::Function(fname) => call_function(k, vp, cx, op, line, fname),
+		Target::Function(fname) => {
+			exec::forked_dispatch(vp, false);
+			call_function(k, vp, cx, op, line, fname)
+		},
+		// A builtin clears the landing itself ([`builtins::run`]).
 		Target::Intrinsic(id) => run_builtin(k, vp, cx, line, id),
 		Target::NotFound | Target::Search if jobspec => {
 			// A jobspec as a command is `fg jobspec` (bash).
@@ -2219,7 +2242,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			let s = st(vp);
 			s.status = status;
 			s.stage = Stage::Output;
-			exec_failed(k, cx, vp);
+			exec_failed(k, cx, vp, false);
 			None
 		},
 		Target::NotFound | Target::Search => {
@@ -2312,7 +2335,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 					let s = st(vp);
 					s.status = 126;
 					s.stage = Stage::Output;
-					exec_failed(k, cx, vp);
+					exec_failed(k, cx, vp, true);
 				},
 			}
 			None
@@ -2574,7 +2597,7 @@ fn spawned_external(
 				127
 			};
 			s.stage = Stage::Output;
-			exec_failed(k, cx, vp);
+			exec_failed(k, cx, vp, true);
 		},
 		Err(err) if err.raw_os_error().is_some() => {
 			// bash's `shell_execve` looks at the file to explain the
@@ -2595,7 +2618,7 @@ fn spawned_external(
 			// Written while the command's redirections are in place
 			// (`exec ./file 2>/dev/null` prints nothing).
 			s.stage = Stage::Output;
-			exec_failed(k, cx, vp);
+			exec_failed(k, cx, vp, true);
 		},
 	}
 	None
@@ -3965,6 +3988,11 @@ fn settle_builtin(
 			e.stage = Stage::Output;
 			None
 		},
+		Control::DiscardArith => {
+			e.control = Some(Transfer::DiscardArith(outcome.status));
+			e.stage = Stage::Output;
+			None
+		},
 		Control::Exit => {
 			e.control = Some(Transfer::Exit(outcome.status));
 			e.stage = Stage::Output;
@@ -4615,6 +4643,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
+	let prior = vp.status;
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -4640,7 +4669,14 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	}
 	match control {
 		None => Flow::Next,
-		Some(Transfer::Return(n)) => Flow::Return(n),
+		// bash's `return` longjmps without touching
+		// `last_command_exit_value`: the RETURN trap's action, and a jump
+		// out of it, see the status the body left, and the return's value
+		// takes effect when the trap ends (`exec::return_trap`).
+		Some(Transfer::Return(n)) => {
+			vp.status = prior;
+			Flow::Return(n)
+		},
 		Some(Transfer::Break { n, cont }) => Flow::Break { n, cont },
 		Some(Transfer::Exit(n)) => Flow::Exit(n),
 		Some(Transfer::DiscardAll(n)) => {
@@ -4663,6 +4699,13 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 				Flow::Discard(n)
 			}
 		},
+		// An arithmetic error leaves `last_command_exit_value` alone at its
+		// site and is never converted by `errexit` (bash raises its
+		// `DISCARD` from `array_expand_index` without setting the status),
+		// which is what `Flow::DiscardArith` carries: `set -e; trap
+		// 'declare "A[bad!]=3"' EXIT; exit 7` is 7 in Bash 5.2.21 and
+		// 5.3.0, not 1.
+		Some(Transfer::DiscardArith(n)) => Flow::DiscardArith(n),
 		Some(Transfer::Exec) => Flow::Exit(status),
 	}
 }
@@ -4736,7 +4779,7 @@ fn run_script_file(
 			let s = st(vp);
 			s.status = 126;
 			s.stage = Stage::Finish;
-			exec_failed(k, cx, vp);
+			exec_failed(k, cx, vp, true);
 			return None;
 		},
 		Ok(_) => BString::default(),
@@ -4747,7 +4790,7 @@ fn run_script_file(
 		let s = st(vp);
 		s.status = 126;
 		s.stage = Stage::Finish;
-		exec_failed(k, cx, vp);
+		exec_failed(k, cx, vp, true);
 		return None;
 	}
 	// The environment the program would have been given (`exec -c`: none).
@@ -4766,6 +4809,10 @@ fn run_script_file(
 	// PATH (or hash table) result.
 	let name = st(vp).argv[0].clone();
 	let file = if name.contains(&b'/') { name } else { path };
+	// The program was tried: this shell replaced itself with the script.
+	if st(vp).exec_as.is_some() {
+		exec_tried(k, cx, vp);
+	}
 	super::nested::start_script(k, vp, cx, &env, &file, &text)
 }
 
@@ -4789,19 +4836,45 @@ pub fn command_probe(
 /// After a failed `exec command`: the shell exits with the failure status
 /// (`Transfer::Exec`), unless it is not a subshell and `execfail` is set or
 /// it is interactive (bash's `no_exit_on_failed_exec`). Then it goes on, and
-/// the command's redirections are undone.
-fn exec_failed(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
-	if st(vp).exec_as.is_none() || super::nested::in_subshell(cx.store, vp) {
+/// the command's redirections are undone. `tried`: the program was found
+/// (or named with a `/`) and its start failed; bash reset the traps before
+/// it tried (`reset_signal_handlers`), so an exiting shell runs no EXIT
+/// trap.
+fn exec_failed(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, tried: bool) {
+	if st(vp).exec_as.is_none() {
 		return;
 	}
-	let execfail = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Execfail)
-		.unwrap_or(false);
-	let interactive = matches!(
-		state::record(cx.store, vp, Key::Misc(MiscKey::Interactive)),
-		Ok(Some(Record::Misc(v))) if v.as_slice() == b"1"
-	);
-	if execfail || interactive {
-		st(vp).control = None;
+	if !super::nested::in_subshell(cx.store, vp) {
+		let execfail = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Execfail)
+			.unwrap_or(false);
+		let interactive = matches!(
+			state::record(cx.store, vp, Key::Misc(MiscKey::Interactive)),
+			Ok(Some(Record::Misc(v))) if v.as_slice() == b"1"
+		);
+		if execfail || interactive {
+			st(vp).control = None;
+			return;
+		}
+	}
+	if tried {
+		exec_tried(k, cx, vp);
+	}
+}
+
+/// bash resets the child's traps (`reset_signal_handlers`) before it calls
+/// `execve`, so once a program was tried the shell that replaced itself
+/// with it runs no EXIT trap, whether the call failed or the file turned
+/// out to be a script this shell runs instead
+/// (`shell_execve`'s `ENOEXEC` path, [`run_script_file`]).
+fn exec_tried(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash {
+		return;
+	}
+	let exit = crate::bash::store::TrapKey::Exit;
+	if vp.parent.is_some() {
+		vp.own_traps = vp.own_traps.without(exit);
+	} else {
+		state::store_record(&mut k.root, cx.store, vp, crate::bash::store::KeyBuf::Trap(exit), None);
 	}
 }
 
@@ -4947,7 +5020,7 @@ fn refused(
 	let s = st(vp);
 	s.status = status;
 	s.stage = Stage::Output;
-	exec_failed(k, cx, vp);
+	exec_failed(k, cx, vp, true);
 	None
 }
 
@@ -5033,7 +5106,7 @@ fn zsh_refused(
 	let s = st(vp);
 	s.status = status;
 	s.stage = Stage::Output;
-	exec_failed(k, cx, vp);
+	exec_failed(k, cx, vp, true);
 	None
 }
 

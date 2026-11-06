@@ -29,7 +29,7 @@ mod printf;
 pub mod strftime;
 mod test;
 pub mod trap;
-mod vars;
+pub(crate) mod vars;
 pub mod zsh_args;
 mod zsh_dir;
 pub mod zsh_jobs;
@@ -146,6 +146,10 @@ pub enum Control {
 	/// subscript), status in [`Outcome::status`]: a `-c` string is abandoned
 	/// whole, a script file goes on with its next command.
 	DiscardAll,
+	/// An arithmetic error in a subscript: the same abandonment, from a
+	/// site that leaves the status alone and that `errexit` never converts
+	/// (bash's `array_expand_index`).
+	DiscardArith,
 	/// A frame was pushed (`eval`, `source`): wait for it to return.
 	Frame,
 	/// A frame was pushed (`mapfile`'s callback): wait for it to return,
@@ -427,6 +431,10 @@ impl<'a, 'c> Ctx<'a, 'c> {
 /// Run builtin `id` with `argv` (`argv[0]` is its name).
 pub fn run(id: IntrinsicId, ctx: &mut Ctx<'_, '_>, argv: &[BString]) -> R {
 	use IntrinsicId as I;
+	// A builtin a forked lone simple command runs gets a jump target of
+	// its own (bash's `execute_subshell_builtin_or_function`), so a fatal
+	// error inside it no longer lands where the fork's parent would have.
+	crate::bash::vm::exec::forked_dispatch(ctx.vp, true);
 	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
 		&& let Some(r) = zsh_args::run(id, ctx, argv)
 	{

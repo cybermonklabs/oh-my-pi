@@ -1335,7 +1335,7 @@ fn has_shell_metas(s: &[u8]) -> bool {
 }
 
 /// Which builtin of the `declare` family runs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, strum::VariantNames)]
 pub enum DeclareKind {
 	/// `declare` / `typeset`.
 	Declare,
@@ -1753,12 +1753,22 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			status = 1;
 			continue;
 		}
-		// `declare -r c[100]` declares an indexed array; `readonly a[5]`
-		// and `export a[5]` are no names.
+		// `declare -r c[100]` declares an indexed array; `readonly a[5]` and
+		// `export a[5]` are no names. bash's `readonly`/`export` reject a
+		// subscripted name whether or not it carries a value, and reject it
+		// *before* evaluating the subscript, so an unevaluable subscript is
+		// still only "not a valid identifier" and the line carries on
+		// (`readonly "A[bad!]=3"; echo O:$?` prints `O:1` and exits 0 in both
+		// bashes, and so does `readonly "A[0]=3"` on a declared array). The
+		// diagnostic names the element, not the whole word.
 		let subscripted = value.is_none() && name.len() < arg.len();
 		let special = matches!(kind, DeclareKind::Readonly | DeclareKind::Export);
-		if subscripted && special {
-			ctx.err(Diag::InvalidIdent { name: arg.clone() });
+		if special && (subscripted || index.is_some()) {
+			let shown = match index {
+				Some(i) => element_text(name, i),
+				None => arg.clone(),
+			};
+			ctx.err(Diag::InvalidIdent { name: shown });
 			// A POSIX shell exits on a special builtin's usage error.
 			ctx.usage_error = true;
 			status = 1;
@@ -2362,7 +2372,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					// the line (bash `jump_to_top_level (DISCARD)`).
 					Err(d @ Diag::ArithSubscript { .. }) => {
 						ctx.diag(d);
-						return Ok(super::Outcome { status: 1, control: super::Control::DiscardAll });
+						return Ok(super::Outcome { status: 1, control: super::Control::DiscardArith });
 					},
 					Err(d) => {
 						ctx.err(d);

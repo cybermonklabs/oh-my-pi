@@ -96,6 +96,12 @@ pub struct Vproc {
 	/// `errtrace`/`functrace`; bash 5.3 keeps listing inherited signal
 	/// traps until the subshell changes one).
 	pub own_traps:     OwnTraps,
+	/// Where a fatal error or a discarded command lands when this vproc is
+	/// a lone simple command forked as a pipeline stage or job: bash forks
+	/// it before it expands anything (`execute_simple_command`), so it has
+	/// no `top_level` of its own and lands where its parent's jump would
+	/// have at the fork. `None` for every other vproc.
+	pub fork_landing:  Option<Landing>,
 	/// Trap-action frames ([`ScriptKind::Trap`]) on `frames`: zero lets
 	/// the per-op checks (cancellation, `BASH_COMMAND`, a trap inside its
 	/// own action) skip their frame scans. Kept by
@@ -322,6 +328,63 @@ impl OwnTraps {
 			_ => Self { pseudo: self.pseudo | Self::bit(key), signals: self.signals },
 		}
 	}
+
+	/// The set without `key`.
+	pub const fn without(self, key: crate::bash::store::TrapKey) -> Self {
+		match key {
+			crate::bash::store::TrapKey::Signal(sig) => {
+				Self { pseudo: self.pseudo, signals: self.signals.without(sig) }
+			},
+			_ => Self { pseudo: self.pseudo & !Self::bit(key), signals: self.signals },
+		}
+	}
+}
+
+/// Where a jump out of a forked lone simple command lands
+/// ([`Vproc::fork_landing`]): the statuses its shell exits with there.
+/// A status is a byte, as bash's is (`$?` is the wait status' low byte),
+/// which keeps the whole landing inside an idle vproc's spare bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Landing {
+	/// What answers a `FORCE_EOF`, a `DISCARD` or an `ERREXIT` out of the
+	/// child: its own catch when it has one (a subshell, a command
+	/// substitution), else the catch around the parent.
+	pub catch:        LandingCatch,
+	/// The status `catch` saved (an EXIT trap's, or that of a trap running
+	/// inside its action); 0 for a shell's or a subshell's own catch.
+	pub saved:        u8,
+	/// What answers an assignment's arithmetic error, which a subshell's
+	/// and a command substitution's own catch does not: the catch around
+	/// them, handed on however deep the nesting goes.
+	pub assign:       LandingCatch,
+	/// The status `assign` saved.
+	pub assign_saved: u8,
+	/// The shell landed in runs the EXIT trap the child inherited: bash
+	/// resets a forked child's traps only once its words are expanded.
+	pub exit_trap:    bool,
+	/// The child is a lone simple command the shell forked before it
+	/// expanded anything, so it has no catch of its own at all
+	/// (`CMD_NO_FORK`). A subshell, a command substitution and a pipeline
+	/// stage that is not one simple command have their own.
+	pub simple:       bool,
+}
+
+/// Which of bash's catches a landing is, each with its own answer to a
+/// jump ([`super::exec`]): `run_exit_trap` (`trap.c`), `run_one_command`
+/// (`shell.c`), `reader_loop` (`eval.c`), `execute_in_subshell`
+/// (`execute_cmd.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::VariantNames)]
+pub enum LandingCatch {
+	/// `run_exit_trap`: the EXIT trap's action.
+	ExitTrap,
+	/// A trap running inside the EXIT trap's action.
+	Trap,
+	/// `run_one_command`: the shell running a `-c` string.
+	ShellCommand,
+	/// `reader_loop`: the shell running a script.
+	ShellScript,
+	/// `execute_in_subshell`: a subshell or a command substitution.
+	Own,
 }
 
 /// `getopts` progress between calls (bash's `sh_optind`, `sh_curopt` and
@@ -892,10 +955,15 @@ pub enum ScriptKind {
 		key:           crate::bash::store::TrapKey,
 		status:        i32,
 		cancel:        Option<i32>,
-		return_target: Option<usize>,
-		/// An ERR trap run by `set -e`: the shell exits with `status` when
-		/// the trap ends.
-		exit:          bool,
+		/// The frame a RETURN trap unwinds to when its action ends, and
+		/// the status to put back there: bash runs the trap *before* the
+		/// `return`'s value takes effect, so its action sees the status
+		/// the function left (`trap 'echo R:$?' RETURN;
+		/// f(){ (exit 5); return 9; }; f; echo A:$?` prints `R:5` then
+		/// `A:9`), and so does a jump out of it.
+		return_target: Option<(u32, i32)>,
+		/// What the end of the action does ([`TrapExit`]).
+		exit:          TrapExit,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -905,6 +973,22 @@ pub enum ScriptKind {
 	/// (recorded in [`crate::bash::store::MiscKey::ZshCodeError`] for the
 	/// builtin, which runs again when the frame returns).
 	Code(CodeKind),
+}
+
+/// What the end of an ERR trap action does to the shell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrapExit {
+	/// Nothing; the interrupted command carries on.
+	#[default]
+	No,
+	/// The shell exits with the frame's saved status, decided when the
+	/// trap started (zsh `ERR_EXIT`/`ERR_RETURN`).
+	Now,
+	/// bash `execute_cmd.c:873-880`: `run_error_trap` runs first and
+	/// `exit_immediately_on_error` is read only after it returns, so a
+	/// `set +e` inside the action cancels the exit and a `set -e` inside
+	/// it causes one.
+	IfErrexit,
 }
 
 /// What a [`ScriptKind::Code`] frame runs (its `zsh_eval_context` word).
@@ -1045,6 +1129,11 @@ pub struct LoopRec {
 	pub kind:       LoopKind,
 	/// Status of the last completed body.
 	pub status:     i32,
+	/// The arithmetic-`for` header's last truth value, which its `BrFail`
+	/// branches on. bash's `execute_arith_for_command` evaluates the three
+	/// header expressions without touching `last_command_exit_value`, so
+	/// the engine keeps their value here instead of in the status.
+	pub cond:       bool,
 	pub iterations: u32,
 	pub exit:       u32,
 	pub cont:       u32,
@@ -1511,6 +1600,9 @@ pub enum Transfer {
 	/// The rest of the line is abandoned with this status (a `-c` string
 	/// whole).
 	DiscardAll(i32),
+	/// The same, from an arithmetic error: the site leaves the status
+	/// alone and `errexit` never converts it.
+	DiscardArith(i32),
 	/// `exec command`: the shell exits with the command's status.
 	Exec,
 }
@@ -1706,7 +1798,16 @@ impl Live {
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
 // that to at most 1,840 B.
-const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
+// This change's own cost, measured with the `memory` bench on one host in
+// one run series, upstream main `b83f8d747c` against this head: **1,840 B
+// per idle vproc on both sides — no cost at all.** At main `Vproc` is
+// 672 B and `Frame` 256 B; here `Vproc` is 680 B (a forked lone simple
+// command's landing, [`Vproc::fork_landing`], a 4-byte `Option<Landing>`
+// in an 8-byte slot, plus the 8 B the rest of the model costs) and
+// `Frame` is 248 B, because the field order packs one word tighter. The
+// two cancel out in the allocation the bench measures, and both are well
+// under the 2,048 B target.
+const _: () = assert!(size_of::<Vproc>() <= 680, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
