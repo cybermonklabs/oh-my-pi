@@ -2082,7 +2082,11 @@ mod tests {
 		for entry in index.entries_mut() {
 			entry.stat = gix::index::entry::Stat::default();
 		}
-		index.write(gix::index::write::Options::default())?;
+		// gix 0.88 reports an index write as `Exn<_>`, which is not a `std::error::Error`,
+		// so it cannot cross `?` into this helper's boxed error on its own.
+		index
+			.write(gix::index::write::Options::default())
+			.map_err(|err| format!("write index: {err}"))?;
 		Ok(())
 	}
 
