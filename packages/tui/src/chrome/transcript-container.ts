@@ -1,9 +1,10 @@
-import { type Component, Container, type HistoryBatch } from "../tui";
+import { type Component, Container, type HistoryBatch, ownDescription } from "../tui";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { popLoopPhase, pushLoopPhase } from "@oh-my-pi/pi-utils";
 import { measureRender, renderForScrollback } from "../components/image";
 import { col } from "../native/describe";
-import type { NativeNode } from "../native/node";
+import type { DescribeContext, NativeNode } from "../native/node";
+import { sameItems } from "../native/memo";
 import { isNativeSettled, settleNative } from "../native/settle";
 import { isUsageRowBlock } from "../overlays/usage-row";
 import { isToolActivityComponent } from "./tool-activity";
@@ -66,6 +67,18 @@ interface FinalizableBlock {
 	isTranscriptBlockPending?(): boolean;
 	/** Render the row that must remain represented under emergency viewport pressure. */
 	renderTranscriptBlockEmergencyRow?(width: number): string | undefined;
+}
+
+/**
+ * Lets a block pack against its neighbors. Two consecutive compact blocks
+ * (blocks that draw nothing between them don't count) have no blank separator
+ * row between them in the terminal, and a native (TSP) surface groups each
+ * such run into one gapless entry. The hook is read every frame, so a block
+ * may change its answer at any time (expanded, collapsed, re-presented).
+ */
+export interface CompactTranscriptBlock {
+	/** Whether the block's current presentation is compact rows. */
+	isTranscriptBlockCompact?(): boolean;
 }
 
 /**
@@ -133,14 +146,22 @@ interface RowSplit {
 
 type RetirementPolicy = "pressure" | "flush";
 type Offered =
-	| { batch: HistoryBatch; kind: "append"; entry: number; emittedEnd: number }
+	/** `lead`: the rows start with the blank history owed the head (see {@link RowsAbove}). */
+	| { batch: HistoryBatch; kind: "append"; entry: number; emittedEnd: number; lead: boolean }
 	/**
 	 * Whole blocks `[start, end)`, then optionally the head rows of block `end`.
 	 * `start` is the frontier unless a capped flush skipped older blocks, whose
-	 * acknowledgement still retires everything from the frontier.
+	 * acknowledgement still retires everything from the frontier. `historyEnd`
+	 * is what history ends with once the batch is acknowledged.
 	 */
-	| { batch: HistoryBatch; kind: "commit"; start: number; end: number; split?: RowSplit }
-	| { batch: HistoryBatch; kind: "replay" };
+	| { batch: HistoryBatch; kind: "commit"; start: number; end: number; split?: RowSplit; historyEnd: RowsAbove }
+	| { batch: HistoryBatch; kind: "replay"; historyEnd: RowsAbove };
+
+/**
+ * Compactness of the last non-empty block above when its separator is still
+ * owed; `undefined` when none is (nothing above, or rows ending in a blank).
+ */
+type RowsAbove = boolean | undefined;
 
 /** Rows a progressive-append retirement offers, and the stable count they bring the head to. */
 interface AppendBatch {
@@ -173,6 +194,31 @@ interface MeasuredBlock {
 function isFinalized(component: Component): boolean {
 	const block = component as Component & FinalizableBlock;
 	return (block.isTranscriptBlockFinalized?.() ?? true) && block.isTranscriptBlockPending?.() !== true;
+}
+
+function isCompact(component: Component): boolean {
+	return (component as Component & CompactTranscriptBlock).isTranscriptBlockCompact?.() === true;
+}
+
+/** Blank rows before a non-empty block: one, unless none is owed or both blocks are compact. */
+function separatorRows(above: RowsAbove, compact: boolean): number {
+	return above === undefined || (above && compact) ? 0 : 1;
+}
+
+/** Whether a native surface lays out nothing of `component` (a hidden node, or a `col`/`row` of such nodes). */
+function describesNothing(component: Component, cx: DescribeContext, depth = 0): boolean {
+	// `null`: the reconciler draws it as rows.
+	const described = ownDescription(component, cx);
+	return described !== null && isVoidNode(described, cx, depth);
+}
+
+function isVoidNode(described: NativeNode, cx: DescribeContext, depth: number): boolean {
+	if ((described.p as { hidden?: boolean } | undefined)?.hidden === true) return true;
+	if ((described.k !== "col" && described.k !== "row") || depth > 16) return false;
+	for (const child of described.c ?? []) {
+		if ("k" in child ? !isVoidNode(child, cx, depth + 1) : !describesNothing(child, cx, depth + 1)) return false;
+	}
+	return true;
 }
 
 function blockMode(component: Component): TranscriptBlockMode {
@@ -255,11 +301,6 @@ export function trimBlankEdges(rows: readonly string[]): readonly string[] {
 	return start === 0 && end === rows.length ? rows : rows.slice(start, end);
 }
 
-/** `rows` opened with the blank a batch owes; a batch that writes no row writes no blank. */
-function withLeadingBlank(rows: readonly string[], lead: boolean): readonly string[] {
-	return lead && rows.length > 0 ? ["", ...rows] : rows;
-}
-
 /** One live block's row span in the last `renderViewport` output (half-open `[start, end)`). */
 export interface TranscriptViewportSpan {
 	component: Component;
@@ -267,17 +308,43 @@ export interface TranscriptViewportSpan {
 	end: number;
 }
 
+/**
+ * One native entry for a run of consecutive compact transcript blocks: a
+ * gapless column whose members stay component children, so each describes
+ * itself, keeps its wire id and receives its own native events.
+ */
+class CompactRun implements Component {
+	#members: readonly Component[] = [];
+	#node: NativeNode | undefined;
+
+	/** Adopt `children[start, end)` as the members; the description holds while they are unchanged. */
+	setMembers(children: readonly Component[], start: number, end: number): void {
+		const members = this.#members;
+		let same = members.length === end - start;
+		for (let index = 0; same && index < members.length; index++) same = members[index] === children[start + index];
+		if (same) return;
+		this.#members = children.slice(start, end);
+		this.#node = undefined;
+	}
+
+	/** Rows for a surface that cannot describe the run: the members' rows, packed. */
+	render(width: number): readonly string[] {
+		return this.#members.flatMap(member => member.render(width));
+	}
+
+	describe(): NativeNode {
+		this.#node ??= col(this.#members, { role: "omp.compact", gap: "none" });
+		return this.#node;
+	}
+}
+
+/** {@link TranscriptContainer.nativeBlocks}' run wrappers while no run has formed. */
+const NO_RUNS: ReadonlyMap<Component, CompactRun> = new Map();
+
 /** Owns transcript order, live capacity, and ordered immutable retirement. */
 export class TranscriptContainer extends Container {
 	#entries: TranscriptEntry[] = [];
 	#frontier = 0;
-	/**
-	 * The entry whose rows end native scrollback without the blank that follows
-	 * a block: a head that a progressive append emitted into, or whose head rows
-	 * a split committed. A batch that writes a row from any other entry opens
-	 * with that blank.
-	 */
-	#openEntry: TranscriptEntry | undefined;
 	#nextBatchId = 1;
 	#offered: Offered | undefined;
 	#replayPending = false;
@@ -315,6 +382,10 @@ export class TranscriptContainer extends Container {
 	/** Block list handed to the native frame provider, reused while the children are unchanged. */
 	#nativeBlocks: readonly Component[] = [];
 	#nativeNode: NativeNode | undefined;
+	/** Compactness of history's last block when its separator is owed; committed rows never change. */
+	#historyEnd: RowsAbove;
+	/** Native wrappers of compact runs keyed by their first member; see {@link nativeBlocks}. */
+	#nativeRuns: ReadonlyMap<Component, CompactRun> = NO_RUNS;
 	override addChild(component: Component): void {
 		if (isToolActivityComponent(component)) component.setToolActivityVisible(this.#toolActivityVisible);
 		super.addChild(component);
@@ -371,13 +442,13 @@ export class TranscriptContainer extends Container {
 		super.clear();
 		this.#entries = [];
 		this.#frontier = 0;
-		this.#openEntry = undefined;
 		this.#offered = undefined;
 		this.#childStartRows.clear();
 		this.#pinnedFrontier = undefined;
 		this.#replayPending = false;
 		this.#replayRequested = false;
 		this.#lastViewportSpans = [];
+		this.#historyEnd = undefined;
 	}
 
 	setToolActivityVisible(visible: boolean): void {
@@ -406,7 +477,7 @@ export class TranscriptContainer extends Container {
 		if (this.#offered?.kind === "append" || (this.#offered?.kind === "commit" && this.#offered.split)) {
 			this.#offered = undefined;
 		}
-		this.#openEntry = undefined;
+		this.#historyEnd = undefined;
 		for (const entry of this.#entries) {
 			entry.emitted = 0;
 			entry.stableRows = EMPTY_STABLE_ROWS;
@@ -534,9 +605,13 @@ export class TranscriptContainer extends Container {
 		this.#syncEntries();
 		this.#settleFinalized();
 		let total = 0;
+		let above = this.#projectedHistoryEnd();
 		for (const { entry, index } of this.#liveEntries()) {
 			const block = this.#liveBlock(entry, index, width).rows;
-			if (block.length > 0) total += block.length + (total > 0 ? 1 : 0);
+			if (block.length === 0) continue;
+			const compact = isCompact(entry.component);
+			total += separatorRows(above, compact) + block.length;
+			above = compact;
 			if (total > limit) break;
 		}
 		return total;
@@ -547,6 +622,25 @@ export class TranscriptContainer extends Container {
 		const measured = this.#measure(entry, width);
 		const emitted = this.#projectedEmittedRowCount(entry, index, width);
 		return emitted === 0 ? measured : { rows: measured.rows.slice(emitted), images: measured.images };
+	}
+
+	/** What native history ends with once the unacknowledged offer, if any, lands. */
+	#projectedHistoryEnd(): RowsAbove {
+		const offered = this.#offered;
+		if (offered === undefined) return this.#historyEnd;
+		return offered.kind === "append" ? undefined : offered.historyEnd;
+	}
+
+	/** Index into `live` of the first non-empty block when history owes it a separator, else -1. */
+	#owedLead(live: readonly { entry: TranscriptEntry; index: number }[], width: number): number {
+		const historyEnd = this.#projectedHistoryEnd();
+		if (historyEnd === undefined) return -1;
+		for (let cursor = 0; cursor < live.length; cursor++) {
+			const { entry, index } = live[cursor]!;
+			if (this.#liveBlock(entry, index, width).rows.length === 0) continue;
+			return separatorRows(historyEnd, isCompact(entry.component)) > 0 ? cursor : -1;
+		}
+		return -1;
 	}
 
 	/**
@@ -674,13 +768,22 @@ export class TranscriptContainer extends Container {
 				this.#projectedEmittedRowCount(entry, index, width),
 			);
 		}
+		// Separator rows above each block; the first one's is owed by history.
+		const gaps: number[] = [];
+		let above = this.#projectedHistoryEnd();
 		let total = 0;
-		for (const block of blocks) total += block.length + (total > 0 ? 1 : 0);
+		for (let blockIndex = 0; blockIndex < shown.length; blockIndex++) {
+			const compact = isCompact(shown[blockIndex]!.entry.component);
+			const gap = separatorRows(above, compact);
+			gaps.push(gap);
+			total += gap + blocks[blockIndex]!.length;
+			above = compact;
+		}
 		if (total <= capacity) {
 			const output: string[] = [];
 			const owners: (Component | undefined)[] = [];
 			for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
-				if (output.length > 0) {
+				if (gaps[blockIndex]! > 0) {
 					output.push("");
 					owners.push(undefined);
 				}
@@ -753,27 +856,29 @@ export class TranscriptContainer extends Container {
 		// The one path that must compose the whole ledger in a single frame; the
 		// phase label attributes any watchdog block here instead of "unknown".
 		pushLoopPhase("ui.transcript-replay");
-		let rows: readonly string[];
+		let replay: { rows: readonly string[]; historyEnd: RowsAbove };
 		try {
-			rows = this.#renderReplay(width);
+			replay = this.#renderReplay(width);
 		} finally {
 			popLoopPhase();
 		}
 		this.#replayPending = false;
-		if (rows.length === 0) {
+		if (replay.rows.length === 0) {
+			// The cleared history holds no transcript rows.
+			this.#historyEnd = undefined;
 			this.#releaseCommittedRenderCaches();
 			return undefined;
 		}
-		const batch: HistoryBatch = { id: this.#nextBatchId++, rows, kind: "replay" };
-		this.#offered = { batch, kind: "replay" };
+		const batch: HistoryBatch = { id: this.#nextBatchId++, rows: replay.rows, kind: "replay" };
+		this.#offered = { batch, kind: "replay", historyEnd: replay.historyEnd };
 		return batch;
 	}
 
 	/**
 	 * Offers the currently eligible prefix for shutdown. With `maxRows`, the
 	 * batch holds only that prefix's newest whole blocks that fit in `maxRows`
-	 * rows, trailing blank included, and never part of a block (see
-	 * #flushTail); acknowledging it still retires the whole prefix, and the
+	 * rows, including any leading or trailing blank, and never part of a block
+	 * (see #flushTail); acknowledging it still retires the whole prefix, and the
 	 * older blocks it skipped never render, apart from the frontier head and the
 	 * one block measured to find it does not fit.
 	 */
@@ -791,9 +896,11 @@ export class TranscriptContainer extends Container {
 			if (entry === undefined) return undefined;
 			const before = this.#renderStablePrefix(entry, entry.emitted, width);
 			const after = this.#renderStablePrefix(entry, offered.emittedEnd, width);
-			rows = withLeadingBlank(after.slice(before.length), this.#opensWithBlank(offered.entry));
+			const added = after.slice(before.length);
+			rows = offered.lead ? ["", ...added] : added;
 		} else if (offered.kind === "commit") {
-			rows = this.#renderRange(offered.start, offered.end, width, true).rows;
+			const retirement = this.#renderRange(offered.start, offered.end, width, this.#historyAbove(offered.start));
+			rows = retirement.rows;
 			const head = offered.split ? this.#entries[offered.end] : undefined;
 			if (head !== undefined && offered.split !== undefined) {
 				// The offer's fingerprint covers bytes of a discarded frame history
@@ -806,11 +913,15 @@ export class TranscriptContainer extends Container {
 					width === offered.split.width ? offered.split.rows : this.#splitRowCount(head, offered.split, width);
 				const end = Math.min(cut, scrollback.length);
 				offered.split = rowSplit(scrollback, end, width);
-				rows = [...rows, ...scrollback.slice(start, end)];
+				if (separatorRows(retirement.above, isCompact(head.component)) > 0) retirement.rows.push("");
+				retirement.rows.push(...scrollback.slice(start, end));
+			} else {
+				offered.historyEnd = this.#closeRange(retirement.rows, retirement.above, offered.end, width);
 			}
-			rows = withLeadingBlank(rows, this.#opensWithBlank(offered.start));
 		} else {
-			rows = this.#renderReplay(width);
+			const replay = this.#renderReplay(width);
+			offered.historyEnd = replay.historyEnd;
+			rows = replay.rows;
 		}
 		offered.batch = { id: offered.batch.id, rows, kind: offered.batch.kind };
 		return offered.batch;
@@ -848,23 +959,38 @@ export class TranscriptContainer extends Container {
 		// region costs one full render per block, which on a resumed session's
 		// first paint is every message it ever had (#12933). The progressive
 		// append path below needs the exact live height to size its emission,
-		// and only runs while a streaming head pins retirement.
+		// and only runs while a streaming head pins retirement. Heights include
+		// the separator below each block, and above the first one if history owes it.
+		const lead = this.#owedLead(live, width);
 		let tailRows = 0;
 		let liveRows = 0;
 		let keep = 0;
 		let fits = true;
+		// Compactness of the nearest non-empty block below the cursor.
+		let below: boolean | undefined;
+		// Separator rows between the first block that does not fit and the tail.
+		let boundaryGap = 0;
+		// The first live block fits; only the blank history owes it does not.
+		let leadOnly = false;
 		for (let cursor = live.length - 1; cursor >= 0; cursor--) {
 			const candidate = live[cursor]!;
-			const height = this.#liveBlock(candidate.entry, candidate.index, width).rows.length;
-			if (height > 0) liveRows += height + (liveRows > 0 ? 1 : 0);
-			if (fits) {
-				const next = height > 0 ? tailRows + height + (tailRows > 0 ? 1 : 0) : tailRows;
-				if (next > room) {
-					fits = false;
-					keep = cursor + 1;
-				} else {
-					tailRows = next;
+			const rows = this.#liveBlock(candidate.entry, candidate.index, width).rows.length;
+			if (rows > 0) {
+				const compact = isCompact(candidate.entry.component);
+				const gap = below === undefined ? 0 : separatorRows(compact, below);
+				const height = rows + gap + (cursor === lead ? 1 : 0);
+				liveRows += height;
+				if (fits) {
+					if (tailRows + height > room) {
+						fits = false;
+						keep = cursor + 1;
+						boundaryGap = gap;
+						leadOnly = cursor === lead && tailRows + height - 1 <= room;
+					} else {
+						tailRows += height;
+					}
 				}
+				below = compact;
 			}
 			if (!fits && appendHead === undefined) break;
 		}
@@ -873,6 +999,13 @@ export class TranscriptContainer extends Container {
 			this.#pinnedFrontier = undefined;
 			return undefined;
 		}
+		if (leadOnly && policy === "pressure" && this.#liveCount() < MAX_LIVE_BLOCKS) {
+			// Retire just that blank: every block's rows are still on screen.
+			const batch: HistoryBatch = { id: this.#nextBatchId++, rows: [""], kind: "append" };
+			this.#offered = { batch, kind: "commit", start: this.#frontier, end: this.#frontier, historyEnd: undefined };
+			this.#pinnedFrontier = undefined;
+			return batch;
+		}
 
 		if (appendHead !== undefined && keep > 0) {
 			// Emit as many finished rows as the overflow needs, in one batch. A
@@ -880,17 +1013,19 @@ export class TranscriptContainer extends Container {
 			// and the live region has to fall back under `room` to stay readable:
 			// rows left behind here are rows dropped from the top of the viewport.
 			// `liveRows` is exact here: the append path measured every live block.
-			const overflow = liveRows - room;
+			// A blank history owes the head goes out first, within the overflow.
+			const leadRows = lead === 0 ? 1 : 0;
+			const overflow = liveRows - room - leadRows;
 			const { rows, emittedEnd } =
 				this.#measuredAppendBatch(appendHead, width, overflow) ??
 				this.#renderedAppendBatch(appendHead, width, overflow);
 			if (emittedEnd > appendHead.emitted) {
 				const batch: HistoryBatch = {
 					id: this.#nextBatchId++,
-					rows: withLeadingBlank(rows, this.#opensWithBlank(this.#frontier)),
+					rows: leadRows > 0 ? ["", ...rows] : rows,
 					kind: "append",
 				};
-				this.#offered = { batch, kind: "append", entry: this.#frontier, emittedEnd };
+				this.#offered = { batch, kind: "append", entry: this.#frontier, emittedEnd, lead: leadRows > 0 };
 				this.#pinnedFrontier = undefined;
 				return batch;
 			}
@@ -914,7 +1049,7 @@ export class TranscriptContainer extends Container {
 		let split: { index: number; rows: readonly string[]; split: RowSplit } | undefined;
 		if (policy === "pressure" && keep > 0 && limit === this.#frontier + keep) {
 			const boundary = live[keep - 1]!;
-			const visible = room - tailRows - (tailRows > 0 ? 1 : 0);
+			const visible = room - tailRows - boundaryGap;
 			if (boundary.entry.state === "settled" && visible > 0) {
 				const offer = this.#splitOffer(boundary.entry, width, visible);
 				if (offer === "whole") {
@@ -935,29 +1070,38 @@ export class TranscriptContainer extends Container {
 		this.#pinnedFrontier = undefined;
 		pushLoopPhase("ui.transcript-retire");
 		let start: number;
-		let retirement: { rows: readonly string[]; end: number };
+		let rows: string[];
+		let historyEnd: RowsAbove;
+		let reached: number;
 		try {
 			// Shutdown hands over the whole eligible prefix, or under a cap its
 			// newest whole blocks; a live frame stops at the budget and offers the
 			// rest on the next frames.
 			start = maxRows === undefined ? this.#frontier : this.#flushTail(end, width, maxRows);
-			retirement = this.#renderRange(start, end, width, true, policy === "flush" ? undefined : RETIREMENT_BUDGET_MS);
+			const retirement = this.#renderRange(
+				start,
+				end,
+				width,
+				this.#historyAbove(start),
+				policy === "flush" ? undefined : RETIREMENT_BUDGET_MS,
+			);
+			rows = retirement.rows;
+			reached = retirement.end;
+			if (split !== undefined && reached !== split.index) split = undefined;
+			if (split === undefined) {
+				historyEnd = this.#closeRange(rows, retirement.above, reached, width);
+			} else {
+				if (separatorRows(retirement.above, isCompact(this.#entries[split.index]!.component)) > 0) rows.push("");
+				rows.push(...split.rows);
+			}
 		} finally {
 			popLoopPhase();
 		}
-		if (split !== undefined && retirement.end !== split.index) split = undefined;
 		if (start > this.#frontier) {
 			logger.debug("Capped history flush skipped older blocks", { skippedBlocks: start - this.#frontier });
 		}
-		const batch: HistoryBatch = {
-			id: this.#nextBatchId++,
-			rows: withLeadingBlank(
-				split === undefined ? retirement.rows : [...retirement.rows, ...split.rows],
-				this.#opensWithBlank(start),
-			),
-			kind: "append",
-		};
-		this.#offered = { batch, kind: "commit", start, end: retirement.end, split: split?.split };
+		const batch: HistoryBatch = { id: this.#nextBatchId++, rows, kind: "append" };
+		this.#offered = { batch, start, end: reached, kind: "commit", split: split?.split, historyEnd };
 		return batch;
 	}
 
@@ -998,7 +1142,7 @@ export class TranscriptContainer extends Container {
 			// zero with the offer still live) must not move it backwards.
 			if (entry === undefined || offered.entry !== this.#frontier || offered.emittedEnd <= entry.emitted) return;
 			entry.emitted = offered.emittedEnd;
-			this.#openEntry = entry;
+			this.#historyEnd = undefined;
 		} else if (offered.kind === "commit") {
 			for (let index = this.#frontier; index < offered.end; index++) {
 				this.#retireEntry(this.#entries[index]!);
@@ -1006,16 +1150,10 @@ export class TranscriptContainer extends Container {
 			this.#frontier = offered.end;
 			const head = offered.split ? this.#entries[offered.end] : undefined;
 			if (head !== undefined) head.split = offered.split;
-			// A batch that wrote a row ends with the blank after its last block,
-			// or inside the block whose head rows it split off.
-			if (head !== undefined) this.#openEntry = head;
-			else if (offered.batch.rows.length > 0) this.#openEntry = undefined;
+			this.#historyEnd = offered.historyEnd;
 		} else {
 			this.#releaseCommittedRenderCaches();
-			// A replay rewrites the committed ledger with every separator, then
-			// the head's committed split or emitted rows.
-			const head = this.#entries[this.#frontier];
-			this.#openEntry = head !== undefined && (head.split !== undefined || head.emitted > 0) ? head : undefined;
+			this.#historyEnd = offered.historyEnd;
 		}
 		this.#offered = undefined;
 		if (this.#replayRequested) this.#startReplay();
@@ -1031,56 +1169,100 @@ export class TranscriptContainer extends Container {
 		const cap = Math.max(0, Math.trunc(maxRows));
 		if (cap === 0) return EMPTY_ROWS;
 		const rows: string[] = [];
+		let below: boolean | undefined;
 		for (let index = this.#entries.length - 1; index >= 0; index--) {
 			const entry = this.#entries[index]!;
 			this.#setAllocation(entry.component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
 			const block = trimBlankEdges(entry.component.render(width));
 			if (entry.state === "committed") this.#releaseRenderCaches(entry);
 			if (block.length === 0) continue;
-			if (rows.length > 0) rows.unshift("");
+			const compact = isCompact(entry.component);
+			if (below !== undefined && separatorRows(compact, below) > 0) rows.unshift("");
 			rows.unshift(...block);
+			below = compact;
 			if (rows.length >= cap) break;
 		}
 		return rows.length > cap ? rows.slice(rows.length - cap) : rows;
 	}
 
 	/**
-	 * The transcript's blocks for a native (TSP) surface, one component per
-	 * `main` child in transcript order; ids follow component identity, so
+	 * The transcript's blocks for a native (TSP) surface, one `main` child
+	 * per block in transcript order; ids follow component identity, so
 	 * inserts, removals (rewind, displacement) and reorders become targeted ops.
 	 * Finalized blocks are settled as a hint; they stay editable, so a later
 	 * expansion, late result or reaction still reaches them wherever they sit.
 	 * A block's {@link Component.nativeTrailers} follow it as blocks of their own.
 	 * No retirement happens on this path: the whole transcript is one document.
-	 * Returns the same array while the block list is unchanged.
+	 *
+	 * Each run of two or more consecutive compact blocks
+	 * ({@link CompactTranscriptBlock}), with any blocks between them that
+	 * describe nothing at `cx`, is one gapless entry whose members stay
+	 * component children, keeping their own description, wire id and native
+	 * events. A compact block's trailers are members of its run; a trailer of
+	 * any other block is not. The entry is the same object while the same block
+	 * leads the run, and it never settles: a member joining later may still be live.
+	 *
+	 * Returns the same array while the entries are unchanged.
 	 */
-	nativeBlocks(): readonly Component[] {
+	nativeBlocks(cx: DescribeContext): readonly Component[] {
 		this.#syncEntries();
 		const children = this.children;
-		// A copy only once some block has trailers.
-		let expanded: Component[] | undefined;
+		// Copies only once some block has trailers; `owners[i]` is the block whose compactness `flat[i]` takes.
+		let flat: Component[] | undefined;
+		let owners: Component[] | undefined;
 		for (let i = 0; i < children.length; i++) {
 			const child = children[i]!;
 			if (!isNativeSettled(child) && isFinalized(child)) settleNative(child);
-			expanded?.push(child);
+			flat?.push(child);
+			owners?.push(child);
 			const trailers = child.nativeTrailers?.();
 			if (!trailers?.length) continue;
-			expanded ??= children.slice(0, i + 1);
-			expanded.push(...trailers);
+			flat ??= children.slice(0, i + 1);
+			owners ??= children.slice(0, i + 1);
+			for (const trailer of trailers) {
+				flat.push(trailer);
+				owners.push(child);
+			}
 		}
-		const blocks: readonly Component[] = expanded ?? children;
-		const previous = this.#nativeBlocks;
-		if (previous.length === blocks.length && previous.every((block, index) => block === blocks[index])) {
-			return previous;
+		const units: readonly Component[] = flat ?? children;
+		const compactAt = (at: number): boolean => isCompact((owners ?? units)[at]!);
+		// Copies only once a run forms.
+		let blocks: Component[] | undefined;
+		let runs: Map<Component, CompactRun> | undefined;
+		let index = 0;
+		while (index < units.length) {
+			const first = units[index]!;
+			let last = index;
+			if (compactAt(index)) {
+				// The run reaches over blocks that describe nothing and ends at its last compact member.
+				for (let probe = index + 1; probe < units.length; probe++) {
+					if (compactAt(probe)) last = probe;
+					else if (!describesNothing(units[probe]!, cx)) break;
+				}
+			}
+			if (last === index) {
+				blocks?.push(first);
+				index++;
+				continue;
+			}
+			const run = this.#nativeRuns.get(first) ?? new CompactRun();
+			run.setMembers(units, index, last + 1);
+			(runs ??= new Map()).set(first, run);
+			(blocks ??= units.slice(0, index)).push(run);
+			index = last + 1;
 		}
-		this.#nativeBlocks = blocks === children ? children.slice() : blocks;
+		this.#nativeRuns = runs ?? NO_RUNS;
+		const next = blocks ?? units;
+		if (sameItems(this.#nativeBlocks, next)) return this.#nativeBlocks;
+		// `children` mutates in place: keep a snapshot.
+		this.#nativeBlocks = next === children ? children.slice() : next;
 		this.#nativeNode = undefined;
 		return this.#nativeBlocks;
 	}
 
 	/** Embedded as a child (transcript viewers): a stack of the {@link nativeBlocks}. */
-	override describe(): NativeNode {
-		const blocks = this.nativeBlocks();
+	override describe(cx: DescribeContext): NativeNode {
+		const blocks = this.nativeBlocks(cx);
 		this.#nativeNode ??= col(blocks, { role: "omp.transcript" });
 		return this.#nativeNode;
 	}
@@ -1090,14 +1272,17 @@ export class TranscriptContainer extends Container {
 		this.#syncEntries();
 		this.#childStartRows.clear();
 		const rows: string[] = [];
+		let above: RowsAbove;
 		for (const entry of this.#entries) {
 			this.#setAllocation(entry.component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
 			const block = this.#renderEntry(entry, width);
 			if (entry.state === "committed") this.#releaseRenderCaches(entry);
 			if (block.length === 0) continue;
-			if (rows.length > 0) rows.push("");
+			const compact = isCompact(entry.component);
+			if (separatorRows(above, compact) > 0) rows.push("");
 			this.#childStartRows.set(entry.component, rows.length);
 			rows.push(...block);
+			above = compact;
 		}
 		return rows;
 	}
@@ -1349,42 +1534,45 @@ export class TranscriptContainer extends Container {
 
 	/**
 	 * Where a capped flush of `[frontier, end)` starts: at the oldest block from
-	 * which every block through `end`, each with the blank after it, fits in
-	 * `maxRows` rows. The batch never starts inside a block, because a block's
-	 * rows may depend on the rows above them: a direct-placement image draws from
-	 * its last row, moving the cursor up over the rows it reserved, and cut off
-	 * from them it would paint over whatever precedes the batch. The newest
-	 * non-empty block stays whole even when it alone passes `maxRows`: dropping
-	 * it would leave scrollback without the last message. The blank the batch
-	 * opens with (see #opensWithBlank) counts against `maxRows`. The walk
-	 * measures newest-first and stops at the first block that does not fit, so
-	 * the only older block it renders is that one.
+	 * which every block through `end`, with its packed separators and any blank
+	 * the batch opens or closes with, fits in `maxRows` rows. The batch never
+	 * starts inside a block: a direct-placement image draws from its last row,
+	 * moving the cursor up over the rows it reserved, and cut off from them it
+	 * would paint over whatever precedes the batch. The newest non-empty block
+	 * stays whole even when it alone passes `maxRows`. The walk measures
+	 * newest-first and stops at the first block that does not fit, so the only
+	 * older block it renders is that one.
 	 */
 	#flushTail(end: number, width: number, maxRows: number): number {
 		let rows = 0;
+		let below: boolean | undefined;
 		for (let index = end - 1; index >= this.#frontier; index--) {
-			const height = this.#liveBlock(this.#entries[index]!, index, width).rows.length;
+			const entry = this.#entries[index]!;
+			const height = this.#liveBlock(entry, index, width).rows.length;
 			if (height === 0) continue;
-			// A block adds its rows and the blank after it; as the oldest block of
-			// the batch it also brings the blank the batch opens with.
-			const lead = this.#opensWithBlank(index) ? 1 : 0;
-			if (rows > 0 && rows + height + 1 + lead > maxRows) return index + 1;
-			rows += height + 1;
+			const compact = isCompact(entry.component);
+			const gap = below === undefined ? this.#closingSeparator(compact, end, width) : separatorRows(compact, below);
+			const lead = separatorRows(this.#historyAbove(index), compact);
+			if (below !== undefined && rows + height + gap + lead > maxRows) return index + 1;
+			rows += height + gap;
+			below = compact;
 		}
 		return this.#frontier;
 	}
 
-	/**
-	 * Whether a batch starting at `index` opens with a blank: native scrollback
-	 * ends inside another entry (a progressive append's emitted rows or a
-	 * pressure row split's committed rows).
-	 */
-	#opensWithBlank(index: number): boolean {
-		return this.#openEntry !== undefined && this.#openEntry !== this.#entries[index];
+	/** Rows above a retirement range, including a partly emitted frontier that a cap skips. */
+	#historyAbove(start: number): RowsAbove {
+		const head = this.#entries[this.#frontier];
+		if (start > this.#frontier && head !== undefined && (head.split !== undefined || head.emitted > 0)) {
+			return isCompact(head.component);
+		}
+		return this.#historyEnd;
 	}
 
 	/**
-	 * Compose entries `[start, end)` as one ordered retirement payload.
+	 * Compose entries `[start, end)` as one ordered retirement payload below
+	 * rows ending as `above` says, without the separator the last block owes
+	 * what follows (see {@link #closeRange}).
 	 *
 	 * `budgetMs` stops the walk after the first block that crosses it — always
 	 * at least one block — and reports the index actually reached, so a single
@@ -1396,9 +1584,9 @@ export class TranscriptContainer extends Container {
 		start: number,
 		end: number,
 		width: number,
-		trailingBlank: boolean,
+		above: RowsAbove,
 		budgetMs?: number,
-	): { rows: readonly string[]; end: number } {
+	): { rows: string[]; end: number; above: RowsAbove } {
 		const rows: string[] = [];
 		const startedAt = budgetMs === undefined ? 0 : performance.now();
 		let reached = start;
@@ -1417,28 +1605,61 @@ export class TranscriptContainer extends Container {
 			const block = rendered.slice(emittedRows);
 			reached = index + 1;
 			if (block.length > 0) {
-				if (rows.length > 0) rows.push("");
+				const compact = isCompact(entry.component);
+				if (separatorRows(above, compact) > 0) rows.push("");
 				rows.push(...block);
+				above = compact;
 			}
 			if (budgetMs !== undefined && performance.now() - startedAt >= budgetMs) break;
 		}
-		if (trailingBlank && rows.length > 0) rows.push("");
-		return { rows, end: reached };
+		return { rows, end: reached, above };
 	}
 
-	#renderReplay(width: number): readonly string[] {
-		const rows = Array.from(this.#renderRange(0, this.#frontier, width, true).rows);
+	/**
+	 * End retired `rows` with the separator their last block owes the first
+	 * non-empty live block from `next`, withheld when both are compact, and
+	 * return what history then ends with. After a compact block with no
+	 * non-empty live block yet, the separator stays owed: the next block's
+	 * lead row (see {@link #owedLead}) draws it unless that block packs.
+	 */
+	#closeRange(rows: string[], above: RowsAbove, next: number, width: number): RowsAbove {
+		if (this.#closingSeparator(above, next, width) === 0) return above;
+		rows.push("");
+		return undefined;
+	}
+
+	/** The closing blank, shared by range rendering and the capped flush's row count. */
+	#closingSeparator(above: RowsAbove, next: number, width: number): number {
+		if (above === undefined) return 0;
+		if (!above) return 1;
+		for (let index = next; index < this.#entries.length; index++) {
+			const entry = this.#entries[index]!;
+			if (this.#liveBlock(entry, index, width).rows.length === 0) continue;
+			return separatorRows(above, isCompact(entry.component));
+		}
+		return 0;
+	}
+
+	/** The committed ledger and the head rows already in history, and what that history ends with. */
+	#renderReplay(width: number): { rows: readonly string[]; historyEnd: RowsAbove } {
+		const range = this.#renderRange(0, this.#frontier, width, undefined);
 		const head = this.#entries[this.#frontier];
+		let headRows: readonly string[] = EMPTY_ROWS;
 		if (head?.split !== undefined) {
 			this.#setAllocation(head.component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
 			const committed = this.#splitRowCount(head, head.split, width);
-			rows.push(...renderForScrollback(() => this.#renderEntry(head, width)).slice(0, committed));
+			headRows = renderForScrollback(() => this.#renderEntry(head, width)).slice(0, committed);
 		} else if (head?.mode === "appendOnly" && head.emitted > 0) {
 			this.#setAllocation(head.component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
 			this.#renderEntry(head, width);
-			rows.push(...this.#renderStablePrefix(head, head.emitted, width));
+			headRows = this.#renderStablePrefix(head, head.emitted, width);
 		}
-		return rows;
+		if (head === undefined || headRows.length === 0) {
+			return { rows: range.rows, historyEnd: this.#closeRange(range.rows, range.above, this.#frontier, width) };
+		}
+		if (separatorRows(range.above, isCompact(head.component)) > 0) range.rows.push("");
+		range.rows.push(...headRows);
+		return { rows: range.rows, historyEnd: undefined };
 	}
 
 	#completeFullyEmittedHeads(width: number): void {
@@ -1453,6 +1674,9 @@ export class TranscriptContainer extends Container {
 				if (entry.emitted !== entry.stableRows.length) return;
 				if (this.#renderStablePrefix(entry, entry.emitted, width).length !== rendered.length) return;
 			}
+			// Advancing a fully emitted head closes that block, but no batch has
+			// written the separator the next block may need yet.
+			if (entry.split !== undefined || entry.emitted > 0) this.#historyEnd = isCompact(entry.component);
 			this.#retireEntry(entry);
 			this.#frontier++;
 		}

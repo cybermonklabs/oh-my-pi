@@ -1231,6 +1231,24 @@ describe("TranscriptContainer", () => {
 		]);
 	});
 
+	it("counts a skipped partly emitted head's separator against the cap on every render", () => {
+		const transcript = new TranscriptContainer();
+		const head = new AppendBlock(["a0", "a1", "a2", "a3"], ["a0", "a1"]);
+		transcript.addChild(head);
+		transcript.renderViewport(80, 2, frame);
+		const emitted = transcript.peekFinalizedBatch(80, 0)!;
+		transcript.acknowledgeFinalizedBatch(emitted.id);
+		head.finalize(Array.from({ length: 10 }, (_, index) => `a${index}`));
+		transcript.addChild(new Block(["b0", "b1", "b2", "b3", "b4", "b5"], true));
+		transcript.addChild(new Block(["c0"], true));
+		// Both tail blocks take nine rows before the blank owed by the skipped head.
+		const batch = transcript.peekFlushBatch(80, 9)!;
+		expect(batch.rows).toEqual(["", "c0", ""]);
+		expect(transcript.rerenderOfferedBatch(80)).toEqual(batch);
+		transcript.acknowledgeFinalizedBatch(batch.id);
+		expect(transcript.blockStates()).toEqual(["committed", "committed", "committed"]);
+	});
+
 	it("an exit flush renders only the one older block it leaves out when the tail ends exactly on the cap", () => {
 		const transcript = new TranscriptContainer();
 		const blocks = Array.from({ length: 4 }, (_, i) => new CountingBlock([`b${i}r0`, `b${i}r1`, `b${i}r2`]));
