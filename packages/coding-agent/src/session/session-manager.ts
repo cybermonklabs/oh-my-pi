@@ -92,6 +92,7 @@ import {
 	listAllSessionsForPicker,
 	listSessions,
 	listSessionsForPicker,
+	movesConversation,
 	type PickerListing,
 	type SessionContinuation,
 	type SessionInfo,
@@ -148,6 +149,8 @@ const ACK_COMPARE_WINDOW_BYTES = 1 << 16;
  */
 export const SESSION_TAIL_APPEND_CHUNK_BYTES = 4 * 1024 * 1024;
 const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
+/** `model_usage` purpose carrying the billed usage of an assistant turn removed by `discardEntryDurably`. */
+const DISCARDED_TURN_USAGE_PURPOSE = "discarded-turn";
 /**
  * Read-back-and-retry passes one full rewrite makes after meeting another
  * writer's entries. Each pass re-reads the file, so only a writer that appends
@@ -565,6 +568,18 @@ export function lastModelChangeRole(
 		return role;
 	}
 	return undefined;
+}
+
+/**
+ * The newest of `entries` that {@link movesConversation}, when `branch` ends at it: where the
+ * conversation stands. `undefined` when there is none, or the branch sits on an older entry or another branch.
+ */
+export function conversationTip(
+	entries: readonly SessionEntry[],
+	branch: readonly SessionEntry[],
+): SessionEntry | undefined {
+	const branchTip = branch.findLast(movesConversation);
+	return branchTip && branchTip === entries.findLast(movesConversation) ? branchTip : undefined;
 }
 
 /**
@@ -4808,6 +4823,11 @@ export class SessionManager {
 		return [...this.#entries];
 	}
 
+	/** {@link conversationTip} of the session at its active leaf. */
+	getConversationTip(): SessionEntry | undefined {
+		return conversationTip(this.#entries, this.#index.branchView());
+	}
+
 	/**
 	 * The session as a tree. A well-formed session has exactly one root; orphaned
 	 * entries (broken parent chain) are returned as roots too.
@@ -4840,6 +4860,10 @@ export class SessionManager {
 	 * off-branch instead. Both paths append a metadata-only branch marker, and
 	 * a removal republishes the journal without the entry.
 	 *
+	 * A removed assistant turn was still billed, so its usage is re-journaled as
+	 * an off-branch `model_usage` entry; session totals and `omp stats` keep
+	 * counting it. A subtree preserved off-branch keeps its own usage.
+	 *
 	 * When that republish fails, the removal is undone: the entry and its
 	 * children return to the journal as storage holds them, and the marker is
 	 * appended under the entry's parent instead, followed by fresh copies of the
@@ -4868,7 +4892,27 @@ export class SessionManager {
 		const removedGeneration = this.#entriesGeneration;
 		this.#index.rebuild(removed);
 		// The durable frontier described the previous array, so recording the
-		// marker republishes the journal without the entry.
+		// usage or marker republishes the journal without the entry.
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			const { api, provider, model, usage, stopReason, errorMessage } = entry.message;
+			// Off-branch like late usage: totals count every entry, and the kept
+			// chain stays made of entries collab guests replicate.
+			this.#recordEntry({
+				type: "model_usage",
+				id: generateId(this.#index),
+				parentId: leafId,
+				timestamp: entry.timestamp,
+				runtime: currentRuntimeIdentity(),
+				activeLeafId: leafId,
+				purpose: DISCARDED_TURN_USAGE_PURPOSE,
+				api,
+				provider,
+				model,
+				usage,
+				stopReason,
+				...(errorMessage === undefined ? {} : { errorMessage }),
+			});
+		}
 		const markerId = this.branchWithSummary(leafId, "", markerDetails);
 		// A deferring backend confirms the republish only once it drains.
 		await this.flush().catch(() => undefined);
