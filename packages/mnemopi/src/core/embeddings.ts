@@ -410,7 +410,10 @@ async function embedApi(texts: readonly string[], signal: AbortSignal | undefine
 	return matrix;
 }
 
-async function embedApiBatch(texts: readonly string[], signal: AbortSignal | undefined): Promise<EmbeddingMatrix | null> {
+async function embedApiBatch(
+	texts: readonly string[],
+	signal: AbortSignal | undefined,
+): Promise<EmbeddingMatrix | null> {
 	const baseUrl = embeddingBaseUrl();
 	const isCustom = !hostMatchesUrl(baseUrl, "openrouter");
 	const apiKey = embeddingApiKey();

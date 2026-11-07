@@ -445,7 +445,10 @@ describe("cache warming under /pause", () => {
 		const loopHold = () => {
 			loopHoldCalls++;
 		};
-		warmer.start({ model: warmModel, context: { messages: [] }, options: { beforeDispatch: loopHold } }, () => undefined);
+		warmer.start(
+			{ model: warmModel, context: { messages: [] }, options: { beforeDispatch: loopHold } },
+			() => undefined,
+		);
 		vi.advanceTimersByTime(4.5 * 60_000);
 		for (let i = 0; i < 100; i++) await Promise.resolve();
 		expect(replays).toHaveLength(1);

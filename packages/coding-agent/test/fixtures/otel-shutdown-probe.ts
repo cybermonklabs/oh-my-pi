@@ -1,7 +1,4 @@
-import {
-	allowTelemetryReceiverForTests,
-	initTelemetryExport,
-} from "@oh-my-pi/pi-coding-agent/telemetry-export";
+import { allowTelemetryReceiverForTests, initTelemetryExport } from "@oh-my-pi/pi-coding-agent/telemetry-export";
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 
 const requested = Promise.withResolvers<void>();
