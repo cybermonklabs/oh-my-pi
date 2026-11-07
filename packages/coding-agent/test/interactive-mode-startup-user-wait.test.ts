@@ -81,7 +81,6 @@ describe("InteractiveMode startup dialogs", () => {
 			undefined,
 			undefined,
 			undefined,
-			undefined,
 			new Composer({ terminal: new VirtualTerminal(200, 60) }),
 		);
 		spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
