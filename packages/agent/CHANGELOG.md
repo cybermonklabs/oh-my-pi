@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Added
+
+- Chat and judgment spans now carry `omp.gen_ai.provider.id` (the provider id before OTel normalization, such as `openai-codex`) and `omp.gen_ai.auth.kind` (`api_key`, `console_oauth`, `subscription_oauth` or `unknown`), so subscription, Console-login and API-key calls can be told apart
+- Chat and judgment spans now split cache writes into `gen_ai.usage.cache_creation.ephemeral_5m_input_tokens` and `gen_ai.usage.cache_creation.ephemeral_1h_input_tokens` when the provider reports cache lifetimes
+- `CustomMessage` has an optional `tag`, a caller correlation id that stays with the message ([#14323](https://github.com/can1357/oh-my-pi/pull/14323) by [@sjawhar](https://github.com/sjawhar))
+- Added `errorDisplayMessage` and `errorRetryAfterMs` to the proxy `error` event, copied onto the failed turn so a proxied failure keeps omp's shown text and the response's header retry delay apart from the provider's `errorMessage` ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
+- Added `PruneResult.pruned`, a list of exported `ToolResultPrune` records (each blanked tool result's entry id, notice, and `prunedAt`), and `blankToolResult()`, which applies one record to a loaded copy of its tool result.
+
+### Fixed
+
+- Steering and follow-ups drained for the next turn now return to their queue when the run is aborted before that turn starts, including while `/pause` holds it, instead of being recorded with no reply ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
+- `AgentPauseGate.dispatchHold` re-parks when the gate closes again while the caller's own hold waits, carries a synchronous `isClosed` probe the transport reads in the same step as the send, and cancels through the whole composed wait with the caller's abort reason ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
+- The main loop's own dispatch hold carries that probe too, and fails an aborted request instead of resolving; the remote compaction requests send inside the same step as their hold check and arm their timeout at the wire, so a transport that holds one again does not spend it ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
+- The placeholder result for a tool call that never ran no longer repeats the provider's error text to the model: its content is a fixed sentence, and the provider's words stay in `details.upstreamError`, which no request carries. Quoting a refusal there got every later turn of the session refused as well
+- A turn that fails with a thrown `CredentialUnavailableError` now carries its transient classification (`errorId`) on the error message, so a host's turn retry can treat it as retryable ([#14031](https://github.com/can1357/oh-my-pi/pull/14031) by [@sjawhar](https://github.com/sjawhar)).
+
+### Breaking Changes
+
+- Removed `PruneResult.undo()` from `pruneToolOutputs` and `pruneSupersededToolResults`; persist `PruneResult.pruned` instead of rolling the prune back when saving it fails.
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

@@ -6,6 +6,7 @@ import * as AIError from "../error";
 import { assertProviderEnabled, providerPauseReason } from "../registry/oauth";
 import { isUsageLimitOutcome } from "../error/rate-limit";
 import { AUTHENTICATED_SENTINEL } from "../registry/types";
+import { getHeadersFromError, getRetryAfterMsFromHeaders } from "../utils/retry-after";
 import type { SessionAffinity } from "./affinity";
 import type { CredentialPool } from "./pool";
 import type { CredentialSelector, OAuthResolutionResult } from "./select";
@@ -19,6 +20,15 @@ import type {
 	LimitsApi,
 	OAuthRequestIdentity,
 } from "./types";
+
+/** Where a resolved bearer came from: its stored row (when any), its kind, and OAuth request scope. */
+interface ResolvedCredentialSource {
+	id?: number;
+	type: NonNullable<ResolvedApiKey["credentialType"]>;
+	identity?: OAuthRequestIdentity;
+	oauthAccess?: string;
+	loginProvider?: string;
+}
 
 /**
  * Default config value resolver that checks env vars and treats as literal.
@@ -335,17 +345,23 @@ export class KeyCascade implements KeysApi {
 	): Promise<ResolvedApiKey | undefined> {
 		assertProviderEnabled(provider);
 		let credentialId: number | undefined;
+		let credentialType: ResolvedApiKey["credentialType"];
+		let loginProvider: string | undefined;
 		let oauthIdentity: OAuthRequestIdentity | undefined;
 		let oauthAccess: string | undefined;
-		const apiKey = await this.#resolve(provider, sessionId, options, (id, identity, access) => {
-			credentialId = id;
-			oauthIdentity = identity;
-			oauthAccess = access;
+		const apiKey = await this.#resolve(provider, sessionId, options, credential => {
+			credentialId = credential.id;
+			credentialType = credential.type;
+			loginProvider = credential.loginProvider;
+			oauthIdentity = credential.identity;
+			oauthAccess = credential.oauthAccess;
 		});
 		if (apiKey === undefined) return undefined;
 		return {
 			apiKey,
 			credentialId,
+			...(credentialType ? { credentialType } : {}),
+			...(loginProvider ? { loginProvider } : {}),
 			...(oauthAccess ? { oauthAccess } : {}),
 			...(oauthIdentity ? { oauthIdentity } : {}),
 		};
@@ -384,7 +400,7 @@ export class KeyCascade implements KeysApi {
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
-		onCredentialId?: (id: number, identity?: OAuthRequestIdentity, oauthAccess?: string) => void,
+		onCredential?: (credential: ResolvedCredentialSource) => void,
 	): Promise<string | undefined> {
 		// A provider turned off in its auth rules is reached by no key source:
 		// runtime, models.yml, stored, env or broker.
@@ -425,10 +441,16 @@ export class KeyCascade implements KeysApi {
 			oauthRefreshFailure = error;
 		}
 		if (oauthResolved) {
-			if (onCredentialId && oauthResolved.credentialId !== undefined) {
-				const { orgId, region, inferenceRegion } = oauthResolved.credential;
-				const identity = { orgId, region, inferenceRegion };
-				onCredentialId(oauthResolved.credentialId, identity, oauthResolved.credential.access);
+			if (onCredential) {
+				const { orgId, region, inferenceRegion, loginProvider } = oauthResolved.credential;
+				const known = oauthResolved.credentialId !== undefined;
+				onCredential({
+					id: oauthResolved.credentialId,
+					type: "oauth",
+					loginProvider,
+					identity: known ? { orgId, region, inferenceRegion } : undefined,
+					oauthAccess: known ? oauthResolved.credential.access : undefined,
+				});
 			}
 			return oauthResolved.apiKey;
 		}
@@ -449,11 +471,11 @@ export class KeyCascade implements KeysApi {
 			if (options?.recordAffinity !== false) {
 				this.#deps.affinity.record(provider, sessionId, "api_key", loginApiKeySelection.index);
 			}
-			const credentialId = onCredentialId
+			const credentialId = onCredential
 				? this.#deps.pool.entries(provider)[loginApiKeySelection.index]?.id
 				: undefined;
 			const apiKey = await this.#deps.overrides.resolve(loginApiKeySelection.credential.key);
-			if (apiKey !== undefined && credentialId !== undefined) onCredentialId?.(credentialId);
+			if (apiKey !== undefined) onCredential?.({ id: credentialId, type: "api_key" });
 			return apiKey;
 		}
 
@@ -466,7 +488,10 @@ export class KeyCascade implements KeysApi {
 		if (fallbackKey !== undefined) return this.#deps.overrides.resolve(fallbackKey);
 
 		const envKey = getEnvApiKey(provider);
-		if (envKey) return envKey;
+		if (envKey) {
+			if (envKey !== AUTHENTICATED_SENTINEL) onCredential?.({ type: this.#envCredentialType(provider, envKey) });
+			return envKey;
+		}
 		const apiKeySelection = await this.#deps.selector.selectApiKey(
 			provider,
 			sessionId,
@@ -477,13 +502,19 @@ export class KeyCascade implements KeysApi {
 			if (options?.recordAffinity !== false) {
 				this.#deps.affinity.record(provider, sessionId, "api_key", apiKeySelection.index);
 			}
-			const credentialId = onCredentialId ? this.#deps.pool.entries(provider)[apiKeySelection.index]?.id : undefined;
+			const credentialId = onCredential ? this.#deps.pool.entries(provider)[apiKeySelection.index]?.id : undefined;
 			const apiKey = await this.#deps.overrides.resolve(apiKeySelection.credential.key);
-			if (apiKey !== undefined && credentialId !== undefined) onCredentialId?.(credentialId);
+			if (apiKey !== undefined) onCredential?.({ id: credentialId, type: "api_key" });
 			return apiKey;
 		}
 		if (oauthRefreshFailure) throw oauthRefreshFailure;
 		return undefined;
+	}
+
+	/** An env bearer is OAuth when it came from one of the provider's OAuth-token env vars. */
+	#envCredentialType(provider: string, envKey: string): "oauth" | "api_key" {
+		const oauthTokenEnv = authPolicyFor(provider)?.oauthTokenEnv;
+		return oauthTokenEnv?.some(name => $env[name]?.trim() === envKey.trim()) ? "oauth" : "api_key";
 	}
 
 	/**
@@ -525,7 +556,10 @@ export class KeyCascade implements KeysApi {
 					// Preserve no-sibling quota backoff instead of re-resolving an
 					// already-blocked fallback. Hard-auth declines still re-resolve
 					// because a peer may have refreshed the failed bearer.
-					if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message)) return undefined;
+					const headerRetryAfterMs = getRetryAfterMsFromHeaders(getHeadersFromError(error));
+					if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message, headerRetryAfterMs)) {
+						return undefined;
+					}
 				}
 				const resolved = await resolve({ signal });
 				return rotation.afterSiblingWait ? markAfterSiblingWait(resolved) : resolved;
