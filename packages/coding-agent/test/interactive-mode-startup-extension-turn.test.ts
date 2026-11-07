@@ -86,7 +86,6 @@ describe("InteractiveMode with a turn started by a session_start handler", () =>
 		mode = new InteractiveMode(
 			session,
 			"test",
-			undefined,
 			() => {},
 			undefined,
 			undefined,
