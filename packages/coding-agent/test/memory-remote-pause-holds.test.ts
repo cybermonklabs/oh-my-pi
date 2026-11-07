@@ -325,7 +325,7 @@ describe("Hindsight model work under /pause", () => {
 		const sent = recordFetches(HINDSIGHT_HOST, hindsightReply);
 		const state = hindsightState(new HindsightApi({ baseUrl: `http://${HINDSIGHT_HOST}` }));
 
-		state.enqueueRetain("A retained fact queued before pause");
+		await state.enqueueRetain("call-paused-flush", [{ content: "A retained fact queued before pause" }]);
 		agentPauseGate.pause();
 		const flushing = state.flushRetainQueue();
 		await untilSentOrIdle(sent);
@@ -384,7 +384,7 @@ describe("Hindsight model work under /pause", () => {
 		const state = session.getHindsightSessionState();
 		if (!state) throw new Error("Expected a Hindsight session state");
 
-		state.enqueueRetain("A retained fact queued before pause");
+		await state.enqueueRetain("call-disposed-flush", [{ content: "A retained fact queued before pause" }]);
 		agentPauseGate.pause();
 		const flushing = state.flushRetainQueue();
 		const isRetain = (request: SentRequest) => request.path.endsWith("/memories");
