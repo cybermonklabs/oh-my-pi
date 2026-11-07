@@ -2,6 +2,7 @@ import { extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
 import type { LimitsApi, OAuthAccess, OAuthApi, OAuthRequestIdentity } from "./auth/types";
 import * as AIError from "./error";
 import { isAuthRetryableError, isInvalidatedOAuthTokenError } from "./error/auth-classify";
+import { getHeadersFromError, getRetryAfterMsFromHeaders } from "./utils/retry-after";
 import { isAccountPolicyError, isUsageLimit } from "./error/flags";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
 
@@ -42,6 +43,13 @@ export interface ResolvedApiKey {
 	apiKey: string;
 	/** Durable row id of the credential that supplied this bearer, when known. */
 	credentialId?: number;
+	/**
+	 * Kind of credential that supplied this bearer, when the resolver knows it:
+	 * an OAuth login (subscription or account token) or a static API key.
+	 */
+	credentialType?: "oauth" | "api_key";
+	/** Login that minted an OAuth bearer stored under another provider id (e.g. `anthropic-console`). */
+	loginProvider?: string;
 	/**
 	 * The OAuth access token behind this bearer, when the bearer came from a
 	 * stored OAuth credential. A provider whose API key wraps the token in a
@@ -187,8 +195,9 @@ function isDirectCredentialRotationError(error: unknown): boolean {
 	const isForbidden =
 		status === 403 ||
 		(status === undefined && message !== undefined && extractHttpStatusFromError({ message }) === 403);
-	if (isForbidden && !isConcurrencyCapExclusion(status, message)) return true;
-	return isUsageLimitOutcome(status, message);
+	const headerRetryAfterMs = getRetryAfterMsFromHeaders(getHeadersFromError(error));
+	if (isForbidden && !isConcurrencyCapExclusion(status, message, headerRetryAfterMs)) return true;
+	return isUsageLimitOutcome(status, message, headerRetryAfterMs);
 }
 
 /** Resolve a single retry step, swallowing resolver failures into `undefined`. */
@@ -211,10 +220,15 @@ export async function resolveRetryKey(
 }
 
 export interface AuthRetryKeyState {
-	/** Bearer strings already sent during this logical operation. */
+	/**
+	 * Bearer strings an attempt of this logical operation sent. A key a
+	 * resolver handed over joins only when an attempt sends it: a request held
+	 * before dispatch may resolve its key again, and the key that replaced was
+	 * never refused by anyone, so a retry must not reject it as a cycle.
+	 */
 	attemptedKeys: Set<string>;
-	/** Bearer used by the most recent failed attempt. */
-	lastKey: string;
+	/** Bearer the most recent attempt sent; `undefined` until one has. */
+	lastKey: string | undefined;
 	/** Whether the current credential already consumed its 401 refresh-same retry. */
 	refreshedCurrent: boolean;
 	/** Whether this operation already replayed once after an explicit token-refresh request. */
@@ -223,14 +237,26 @@ export interface AuthRetryKeyState {
 	attempts: number;
 }
 
-export function createAuthRetryKeyState(initialKey: string): AuthRetryKeyState {
+/** Retry state for an operation whose first attempt is about to start; record its key with {@link recordAuthRetryKeySent}. */
+export function createAuthRetryKeyState(): AuthRetryKeyState {
 	return {
-		attemptedKeys: new Set([initialKey]),
-		lastKey: initialKey,
+		attemptedKeys: new Set(),
+		lastKey: undefined,
 		refreshedCurrent: false,
 		tokenRefreshReplayUsed: false,
 		attempts: 1,
 	};
+}
+
+/**
+ * Record `key` as the one an attempt of this operation took to the wire: the
+ * retry after it names it to the resolver as the failed key and never sends it
+ * again. A driver calls this where the attempt sends the key, not where the
+ * resolver returns it.
+ */
+export function recordAuthRetryKeySent(state: AuthRetryKeyState, key: string): void {
+	state.attemptedKeys.add(key);
+	state.lastKey = key;
 }
 
 function acceptRetryKey(
@@ -242,9 +268,9 @@ function acceptRetryKey(
 	if ((!afterSiblingWait && state.attemptedKeys.has(key)) || state.attempts >= AUTH_RETRY_MAX_ATTEMPTS) {
 		return undefined;
 	}
-	state.attemptedKeys.add(key);
+	// The attempt counts against the ceiling now; its key counts as sent only
+	// once the attempt sends it, which may be with a key resolved later still.
 	state.attempts += 1;
-	state.lastKey = key;
 	state.refreshedCurrent = refreshedCurrent;
 	return key;
 }
@@ -345,6 +371,8 @@ export async function withAuth<T>(
 	try {
 		initialKey = await resolveApiKeyOnce(resolver, signal);
 	} catch (error) {
+		// An abort during the resolve is the caller's cancellation, not a resolver failure.
+		signal?.throwIfAborted();
 		// A resolver that deliberately reports a missing key keeps that type.
 		if (error instanceof AIError.MissingApiKeyError) throw error;
 		// A thrown resolver is a broker/OAuth/network failure, not a missing
@@ -354,10 +382,16 @@ export async function withAuth<T>(
 			{ cause: error },
 		);
 	}
-	if (initialKey === undefined) throw missingKey();
+	if (initialKey === undefined) {
+		// An abort during the resolve is the caller's cancellation, not a missing key.
+		signal?.throwIfAborted();
+		throw missingKey();
+	}
 
-	const state = createAuthRetryKeyState(initialKey);
+	const state = createAuthRetryKeyState();
 	let lastError: unknown;
+	// `attempt` sends the key it is handed, so each is recorded as it starts.
+	recordAuthRetryKeySent(state, initialKey);
 	try {
 		return await attempt(initialKey);
 	} catch (error) {
@@ -368,6 +402,7 @@ export async function withAuth<T>(
 	while (true) {
 		const nextKey = await resolveNextAuthRetryKey(state, resolver, lastError, signal);
 		if (nextKey === undefined) break;
+		recordAuthRetryKeySent(state, nextKey);
 		try {
 			return await attempt(nextKey);
 		} catch (error) {

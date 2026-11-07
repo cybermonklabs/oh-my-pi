@@ -58,8 +58,9 @@ import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlRouter } from "../internal-urls/router";
 import { AgentRegistry, isResumable } from "../registry/agent-registry";
+import { sessionTreeStorage } from "../session/session-storage";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
-import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
+import { borrowEvalToolKernels, createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import {
 	approvedTaskFile,
 	bindTaskFileApproval,
@@ -1027,7 +1028,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	#outputManager(): AgentOutputManager {
 		let manager = this.session.agentOutputManager;
 		if (!manager) {
-			manager = new AgentOutputManager(this.session.getArtifactsDir ?? (() => null));
+			manager = new AgentOutputManager(this.session.getArtifactsDir ?? (() => null), {
+				storage: sessionTreeStorage(this.session),
+			});
 			this.session.agentOutputManager = manager;
 		}
 		return manager;
@@ -1597,7 +1600,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// A queued job launches (or adopts) its run when it starts; until then
 		// its widget has no tool tap to read.
 		let spawnRun: SpawnRun | undefined = run;
-		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
+		const buildFollowUpHint = async (
+			aborted: boolean,
+			budget?: { requests: number; limit: number },
+		): Promise<string> => {
 			// Isolated runs are parked without a reviver once the run ends
 			// (`finalizeSubagentLifecycle`), so "message it" would point the
 			// caller at a follow-up path that no longer exists. The template says
@@ -1611,7 +1617,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				isolated,
 				ircEnabled,
 				resumable: !isolated && isResumable(ref),
-				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
+				transcriptAvailable: aborted
+					? await hasResolvableTranscript(agentId, sessionTreeStorage(this.session))
+					: true,
+				budgetCrossed: budget !== undefined,
+				budgetRequests: budget?.requests,
+				budgetLimit: budget?.limit,
 			})}`;
 		};
 		return manager.register(
@@ -1633,6 +1644,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						progress.resolvedThinkingLevel = nextProgress.resolvedThinkingLevel;
 						progress.resolvedModelIsFallback = nextProgress.resolvedModel
 							? nextProgress.resolvedModelIsFallback
+							: undefined;
+						progress.resolvedModelFallbackReason = nextProgress.resolvedModel
+							? nextProgress.resolvedModelFallbackReason
 							: undefined;
 						progress.advisor = nextProgress.advisor ?? progress.advisor;
 						progress.completionPercent = nextProgress.completionPercent ?? progress.completionPercent;
@@ -1737,18 +1751,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						progress.resolvedModelIdentity = singleResult.resolvedModelIdentity;
 						progress.resolvedThinkingLevel = singleResult.resolvedThinkingLevel;
 						progress.resolvedModelIsFallback = singleResult.resolvedModelIsFallback;
+						progress.resolvedModelFallbackReason = singleResult.resolvedModelFallbackReason;
 					} else {
 						delete progress.resolvedModel;
 						delete progress.resolvedModelIdentity;
 						delete progress.resolvedThinkingLevel;
 						delete progress.resolvedModelIsFallback;
+						delete progress.resolvedModelFallbackReason;
 					}
 					onSettled?.(resultFailed);
 					const statusText = resultFailed
 						? `Background task ${agentId} failed.`
 						: `Background task ${agentId} complete.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
-					const deliveryText = `${finalText}${await buildFollowUpHint(singleResult?.aborted === true)}`;
+					const deliveryText = `${finalText}${await buildFollowUpHint(
+						singleResult?.aborted === true,
+						singleResult?.budgetCrossed
+							? { requests: singleResult.requests, limit: singleResult.softRequestBudget ?? 0 }
+							: undefined,
+					)}`;
 					const structured = singleResult?.structuredOutput;
 					if (resultFailed) {
 						// Mark the job itself failed; the failed agent stays interrogable.
@@ -1951,6 +1972,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			params.taskFile !== undefined ? { taskFile: params.taskFile, taskFileSha256: params.taskFileSha256 } : {};
 		const context = this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined;
 		let latestProgress: AgentProgress | undefined;
+		const evalToolDescriptors = params.tools?.length
+			? await describeEvalTools(this.session, params.tools, signal)
+			: undefined;
+		// Held for the child's whole run: it calls these tools on this session's
+		// kernel, which a later cell of ours in another directory would reclaim.
+		const releaseEvalToolKernels = evalToolDescriptors
+			? borrowEvalToolKernels(this.session, evalToolDescriptors)
+			: () => {};
 		try {
 			const execution = await runStructuredSubagent({
 				session: this.session,
@@ -1963,14 +1992,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				...this.#resultParams(params),
 				...this.#effortParams(params),
 				solutionSpace: params.solutionSpace,
-				...(params.tools?.length
-					? {
-							customTools: createEvalCustomTools(
-								this.session,
-								await describeEvalTools(this.session, params.tools, signal),
-							),
-						}
-					: {}),
+				...(evalToolDescriptors ? { customTools: createEvalCustomTools(this.session, evalToolDescriptors) } : {}),
 				// `name` is the spawn handle: keep it for id allocation when this
 				// path did not pre-reserve one. Do not treat it as a HUD description.
 				identity: { id: preAllocatedId, label: params.name },
@@ -2038,6 +2060,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					...(latestProgress ? { progress: [latestProgress] } : {}),
 				},
 			};
+		} finally {
+			releaseEvalToolKernels();
 		}
 	}
 

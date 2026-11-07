@@ -1,6 +1,8 @@
 import * as fs from "node:fs/promises";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
+import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { completeSimple, Effort, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { prompt, withFileLock } from "@oh-my-pi/pi-utils";
@@ -170,12 +172,15 @@ async function consolidateLocked(
 						maxTokens: 8192,
 						reasoning: clampThinkingLevelForModel(model, Effort.Medium),
 						toolChoice: "required",
+						// The scheduler fires on a timer, outside any agent loop, so
+						// `/pause` holds the request here until the resume.
+						beforeDispatch: agentPauseGate.dispatchHold(),
 					},
 				),
 			{ provider: model.provider },
 		);
 		if (response.stopReason === "error") {
-			throw new Error(response.errorMessage || "sharpshooter consolidation model error");
+			throw new Error(errorDisplayText(response) || "sharpshooter consolidation model error");
 		}
 
 		const files = parseReplacementFiles(response.content, currentFiles);

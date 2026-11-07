@@ -117,6 +117,7 @@ Unknown magic names raise `NameError: UsageError: ...` inside the cell.
 - `session` (default)
    - Reuses kernel sessions keyed by namespaced eval session id plus normalized cwd and interpreter.
    - Multiple owners can share the same retained kernel for that key.
+  - When an owner's next cell resolves to a different key — a new cwd, a different interpreter, or an eval session id that gained its on-disk session file — the kernel it left under the old key is shut down after a two-minute idle grace, so a runner does not outlive the session that started it. The grace keeps the common round trip: an owner that steps out of a directory and comes back inside those two minutes gets the same kernel with its namespace intact, and the timer is cancelled. Four things keep a kernel when the grace expires: another owner registered against it, a caller holding it (a cell that has acquired it, or a subagent that can still call its kernel-defined tools), a cell still running in it including a backgrounded one, and a kernel that is still starting. Each of those is reclaimed at the owner's next cell instead. A caller with no `kernelOwnerId` reclaims nothing, because the registry cannot tell two such callers apart. The JavaScript worker cache does the same, with the same guards.
    - Foreground calls through the tool use exclusive scheduling; background cells and kernel-defined tool requests are separate.
    - A dead retained subprocess is replaced before execution.
    - If the subprocess dies during execution, the cell is not replayed because completion is uncertain. The next call starts a fresh kernel.
@@ -137,11 +138,14 @@ Cells support top-level `await`, `async for`, and `async with` on a persistent a
 
 ## Environment filtering and runtime resolution
 
-Environment is filtered before launching the runner:
+Environment is filtered before launching the runner, from the shell environment current when the kernel starts:
 
 - Allowlist includes core vars like `PATH`, `HOME`, locale vars, `VIRTUAL_ENV`, `PYTHONPATH`, etc.
 - Allow-prefixes: `LC_`, `XDG_`, `PI_`
-- Denylist strips common API keys (OpenAI/Anthropic/Gemini/etc.)
+- `eval.envPassthrough` adds names and prefixes, e.g. `eval: { envPassthrough: { names: [MY_TOOL_ID], prefixes: [MY_HARNESS_] } }`. A blank prefix is ignored; matching is case-insensitive on Windows.
+- Denylist strips common API keys (OpenAI/Anthropic/Gemini/etc.), including any `eval.envPassthrough` admits
+
+A kernel started after an extension changes its exported environment (for example at a session switch) sees the new values; a running kernel keeps the environment it started with.
 
 Runtime selection order (skipped entirely when the `python.interpreter` setting names an explicit executable):
 

@@ -1,7 +1,9 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { toError } from "@oh-my-pi/pi-utils";
 import {
-	directChildKeyName,
+	childDirNames,
+	childKeyName,
 	SessionWriteConflictError,
 	type SessionStorage,
 	type SessionStorageStat,
@@ -9,8 +11,8 @@ import {
 	type SessionStorageWriteOptions,
 	type WriteTextAtomicOptions,
 } from "./session-storage";
-import { isAssistantMessageLine } from "./session-entries";
-import { enoent } from "./session-storage-errors";
+import { isAssistantMessageLine, SESSION_TITLE_SLOT_BYTES } from "./session-entries";
+import { eexist, enoent } from "./session-storage-errors";
 import {
 	overlayTitleSlotContent,
 	overlayTitleSlotPrefix,
@@ -34,6 +36,14 @@ export interface SessionStorageBackend {
 	readFull(path: string): Promise<string | null>;
 	readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
+	 * The UTF-8 text from byte `offset` to the end, or at most `maxBytes` of
+	 * it, and the session's size in bytes, both from one read of the backing
+	 * store; `null` when `path` holds no session. A capped read may end inside
+	 * a character. Optional: without it the storage reads the whole session
+	 * and cuts it.
+	 */
+	readFrom?(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null>;
+	/**
 	 * Replace content, atomically rejecting when the shared backend's current
 	 * UTF-8 byte length differs from `expectedSize`.
 	 */
@@ -47,8 +57,18 @@ export interface SessionStorageBackend {
 	append(path: string, line: string, mtimeMs: number): Promise<void>;
 	updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void>;
 	truncate(path: string, mtimeMs: number): Promise<void>;
-	remove(paths: string[]): Promise<void>;
-	move(src: string, dst: string, mtimeMs: number): Promise<void>;
+	/**
+	 * Remove `paths`, and with `dir` (a key prefix ending in `/`) every key
+	 * under it that the shared store holds when the removal runs, including
+	 * ones another client committed after this store last refreshed.
+	 */
+	remove(paths: string[], dir?: string): Promise<void>;
+	/**
+	 * Move `src` to `dst`, replacing `dst`. With `noReplace` a `dst` the shared
+	 * store holds, including one another client commits while the move runs,
+	 * makes it reject with `EEXIST` naming `dst` and change neither path.
+	 */
+	move(src: string, dst: string, mtimeMs: number, noReplace?: boolean): Promise<void>;
 }
 
 interface IndexEntry {
@@ -87,10 +107,24 @@ interface IndexAppend {
 
 const RESOLVED = Promise.resolve();
 
-function matchesGlob(name: string, pattern: string): boolean {
+function matchesGlobSegment(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
 	if (pattern.startsWith("*.")) return name.endsWith(pattern.slice(1));
 	return name === pattern;
+}
+
+/**
+ * Match a slash-joined index key remainder against a pattern of the same
+ * shape (`"*.jsonl"`, or a wildcard project directory followed by
+ * `"*.jsonl"` for the one-level cross-project case). Segment counts must
+ * agree, so a direct child never matches a two-segment pattern and a
+ * nested key never matches a one-segment one.
+ */
+function matchesGlob(name: string, pattern: string): boolean {
+	const nameParts = name.split("/");
+	const patternParts = pattern.split("/");
+	if (nameParts.length !== patternParts.length) return false;
+	return nameParts.every((part, i) => matchesGlobSegment(part, patternParts[i]));
 }
 
 function byteLength(text: string): number {
@@ -140,6 +174,8 @@ export class IndexedSessionStorage implements SessionStorage {
 	 */
 	readonly #pendingFrames = new Map<string, IndexAppend[]>();
 	#nextMtimeMs = 0;
+	/** Paths changed locally while each in-flight {@link refresh} read the backend. */
+	readonly #refreshWindows = new Set<Set<string>>();
 	#firstDrainError: Error | undefined;
 	#assertExpectedSize(path: string, expectedSize: number | null | undefined): void {
 		if (expectedSize === undefined) return;
@@ -158,16 +194,45 @@ export class IndexedSessionStorage implements SessionStorage {
 		await this.refresh();
 	}
 
+	/**
+	 * Merge the backend's current index into this one, so sessions other
+	 * processes created, changed, or removed since the last load show in
+	 * `existsSync`, `statSync`, and the listings. A path this storage has an
+	 * operation in flight for, or changes while the backend read runs, keeps
+	 * its local entry: the read cannot describe a write it may predate.
+	 */
 	async refresh(): Promise<void> {
-		await this.drain();
-		const rows = await this.#backend.loadIndex();
-		this.#index.clear();
-		for (const row of rows) {
-			const title = row.titleUpdatedAt
-				? { title: row.title, source: row.titleSource, updatedAt: row.titleUpdatedAt }
-				: null;
-			this.#setIndex(row.path, row.size, row.mtimeMs, title);
+		const window = new Set<string>(this.#pendingFrames.keys());
+		this.#refreshWindows.add(window);
+		try {
+			const rows = await this.#backend.loadIndex();
+			const fresh = new Map<string, IndexEntry>();
+			for (const row of rows) {
+				fresh.set(row.path, {
+					size: row.size,
+					mtimeMs: row.mtimeMs,
+					title: row.titleUpdatedAt ? row.title : undefined,
+					titleSource: row.titleUpdatedAt ? row.titleSource : undefined,
+					titleUpdatedAt: row.titleUpdatedAt,
+				});
+			}
+			const settled = (path: string): boolean => !window.has(path) && !this.#pendingFrames.has(path);
+			for (const path of [...this.#index.keys()]) {
+				if (!fresh.has(path) && settled(path)) this.#index.delete(path);
+			}
+			for (const [path, entry] of fresh) {
+				if (!settled(path)) continue;
+				this.#index.set(path, entry);
+				if (entry.mtimeMs > this.#nextMtimeMs) this.#nextMtimeMs = entry.mtimeMs;
+			}
+		} finally {
+			this.#refreshWindows.delete(window);
 		}
+	}
+
+	/** Record a local index change in every refresh whose backend read is in flight. */
+	#touch(path: string): void {
+		for (const window of this.#refreshWindows) window.add(path);
 	}
 
 	async drain(): Promise<void> {
@@ -269,12 +334,21 @@ export class IndexedSessionStorage implements SessionStorage {
 	listFilesSync(dir: string, pattern: string): string[] {
 		const resolvedDir = path.resolve(dir);
 		const out: string[] = [];
+		const segments = pattern.split("/").length;
 		for (const key of this.#index.keys()) {
-			const name = directChildKeyName(resolvedDir, key);
+			const name = childKeyName(resolvedDir, key, segments);
 			if (name === undefined || !matchesGlob(name, pattern)) continue;
 			out.push(key);
 		}
 		return out;
+	}
+
+	listDirsSync(dir: string): string[] {
+		return childDirNames(path.resolve(dir), this.#index.keys());
+	}
+
+	listAllSync(): string[] {
+		return [...this.#index.keys()];
 	}
 
 	exists(path: string): Promise<boolean> {
@@ -301,6 +375,41 @@ export class IndexedSessionStorage implements SessionStorage {
 		const [prefix, suffix] = await this.#backend.readSlices(path, prefixLimit, suffixLimit);
 		const title = titleUpdateForIndex(entry);
 		return [title ? overlayTitleSlotPrefix(prefix, prefixLimit, title) : prefix, suffix];
+	}
+
+	/**
+	 * The text from byte `offset`, at most `maxBytes` of it, and the size the
+	 * read saw. Both come from the backend's read, not this storage's index, so
+	 * an append another process made since the index loaded is read too. The
+	 * title slot is synthesized over the stored head, so a read that starts
+	 * inside it reads from the start and overlays the slot.
+	 */
+	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
+		const entry = this.#index.get(path);
+		if (!entry) throw enoent(path);
+		await this.#awaitPath(path);
+		const title = offset < SESSION_TITLE_SLOT_BYTES ? titleUpdateForIndex(entry) : undefined;
+		const start = title ? 0 : offset;
+		const limit = maxBytes === undefined ? undefined : offset - start + Math.max(0, maxBytes);
+		const read = await this.#readBackendFrom(path, start, limit);
+		if (!read) throw enoent(path);
+		if (!title) return read;
+		const head = overlayTitleSlotPrefix(read.text, byteLength(read.text), title);
+		return { text: Buffer.from(head, "utf-8").subarray(offset).toString("utf-8"), size: read.size };
+	}
+
+	async #readBackendFrom(
+		path: string,
+		offset: number,
+		maxBytes: number | undefined,
+	): Promise<{ text: string; size: number } | null> {
+		if (this.#backend.readFrom) return this.#backend.readFrom(path, offset, maxBytes);
+		const content = await this.#backend.readFull(path);
+		if (content === null) return null;
+		const bytes = Buffer.from(content, "utf-8");
+		if (offset >= bytes.length) return { text: "", size: bytes.length };
+		const end = maxBytes === undefined ? undefined : offset + maxBytes;
+		return { text: bytes.subarray(offset, end).toString("utf-8"), size: bytes.length };
 	}
 
 	async hasAssistantTurn(path: string): Promise<boolean> {
@@ -373,7 +482,20 @@ export class IndexedSessionStorage implements SessionStorage {
 		}
 	}
 
-	async rename(src: string, dst: string): Promise<void> {
+	rename(src: string, dst: string): Promise<void> {
+		return this.#rename(src, dst, false);
+	}
+
+	/**
+	 * {@link rename} that never replaces: a `dst` in this store's view, or one
+	 * another client committed to the shared store, makes it reject with
+	 * `EEXIST` naming `dst`, and neither path changes.
+	 */
+	renameNoReplace(src: string, dst: string): Promise<void> {
+		return this.#rename(src, dst, true);
+	}
+
+	async #rename(src: string, dst: string, noReplace: boolean): Promise<void> {
 		await this.#awaitPath(src);
 		await this.#awaitPath(dst);
 		const entry = this.#index.get(src);
@@ -383,12 +505,15 @@ export class IndexedSessionStorage implements SessionStorage {
 			return;
 		}
 		const dstPrevious = this.#index.get(dst);
+		if (noReplace && dstPrevious) throw eexist(dst);
 		this.#index.delete(src);
 		this.#index.set(dst, { ...entry });
 		this.#pushFrame(src, { mtimeMs: entry.mtimeMs, previous: entry, removal: true });
 		this.#pushFrame(dst, { mtimeMs: entry.mtimeMs, previous: dstPrevious });
 		try {
-			await this.#enqueuePaths([src, dst], () => this.#backend.move(src, dst, entry.mtimeMs), { trackDrain: false });
+			await this.#enqueuePaths([src, dst], () => this.#backend.move(src, dst, entry.mtimeMs, noReplace), {
+				trackDrain: false,
+			});
 			this.#dropFrame(src, entry.mtimeMs);
 			this.#dropFrame(dst, entry.mtimeMs);
 		} catch (err) {
@@ -414,6 +539,12 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		// Rows another client committed under the artifacts directory (a
+		// subagent transcript, a draft) go too: the refresh brings the ones
+		// committed so far into this view, and the backend removes every key
+		// under the directory it holds when the removal runs, so one committed
+		// after the refresh goes as well.
+		await this.refresh();
 		await this.#awaitPath(sessionPath);
 		const sessionEntry = this.#index.get(sessionPath);
 		if (!sessionEntry) throw enoent(sessionPath);
@@ -438,11 +569,26 @@ export class IndexedSessionStorage implements SessionStorage {
 		}
 
 		try {
-			await this.#enqueuePaths(paths, () => this.#backend.remove(paths), { trackDrain: false });
+			await this.#enqueuePaths(paths, () => this.#backend.remove(paths, prefix), { trackDrain: false });
 			for (const [path] of previous) this.#dropFrame(path, sessionEntry.mtimeMs);
 		} catch (err) {
+			// A failed removal restores every index entry, even when the backend
+			// already deleted the content (the reply was lost): the session
+			// stays present but unconfirmed, and an append extends whatever the
+			// backend holds.
 			for (const [path] of previous) this.#failFrame(path, sessionEntry.mtimeMs);
 			throw toError(err);
+		}
+		// Tool artifacts and sidecars stay on local disk whatever holds the
+		// transcripts, so removing the session removes them as the file
+		// backend's delete does.
+		try {
+			await fs.rm(artifactsDir, { recursive: true, force: true });
+		} catch (err) {
+			const error = toError(err);
+			throw new Error(`Session deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`, {
+				cause: error,
+			});
 		}
 	}
 
@@ -502,6 +648,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	#restoreIndex(path: string, entry: IndexEntry | undefined): void {
+		this.#touch(path);
 		if (entry) {
 			this.#index.set(path, entry);
 		} else {
@@ -515,6 +662,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		mtimeMs: number,
 		title: SessionTitleUpdate | null | undefined = undefined,
 	): void {
+		this.#touch(path);
 		const current = title === undefined ? this.#index.get(path) : undefined;
 		this.#index.set(path, {
 			size,
@@ -540,6 +688,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	#pushFrame(path: string, frame: IndexAppend): void {
+		this.#touch(path);
 		const frames = this.#pendingFrames.get(path);
 		if (frames) frames.push(frame);
 		else this.#pendingFrames.set(path, [frame]);

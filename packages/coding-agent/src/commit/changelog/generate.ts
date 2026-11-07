@@ -1,7 +1,8 @@
 import { type } from "@oh-my-pi/omptype";
-import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { agentPauseGate, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, ApiKey, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { completeSimple, retryTransientCompletion, validateToolCall } from "@oh-my-pi/pi-ai";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import { prompt } from "@oh-my-pi/pi-utils";
 import changelogSystemPrompt from "../../commit/prompts/changelog-system.md" with { type: "text" };
 import changelogUserPrompt from "../../commit/prompts/changelog-user.md" with { type: "text" };
@@ -66,13 +67,20 @@ export async function generateChangelogEntries({
 					messages: [{ role: "user", content: userContent, timestamp: Date.now() }],
 					tools: [changelogTool],
 				},
-				{ apiKey, sessionId, maxTokens: 1200, reasoning: toReasoningEffort(thinkingLevel) },
+				{
+					apiKey,
+					sessionId,
+					maxTokens: 1200,
+					reasoning: toReasoningEffort(thinkingLevel),
+					// Like the commit message itself: held in a paused session, free otherwise.
+					beforeDispatch: agentPauseGate.dispatchHold(),
+				},
 			),
 		{ provider: model.provider },
 	);
 
 	if (response.stopReason === "error") {
-		throw new Error(response.errorMessage ?? "provider error");
+		throw new Error(errorDisplayText(response) ?? "provider error");
 	}
 
 	const parsed = parseChangelogResponse(response);

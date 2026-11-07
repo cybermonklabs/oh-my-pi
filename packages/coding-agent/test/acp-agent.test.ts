@@ -2,14 +2,18 @@ import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
+import { Agent, AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import { Database } from "bun:sqlite";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import type { Model } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { ExtensionActions, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { ExtensionSendQueue } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/send-queue";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { buildSkillPromptMessage } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
@@ -21,18 +25,15 @@ import {
 	createAcpExtensionUiContext,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
-import type {
-	AgentSession,
-	AgentSessionEvent,
-	UsageFallbackConfirmation,
-} from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionEvent, UsageFallbackConfirmation } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, removeWithRetries, setAgentDir, withTimeout } from "@oh-my-pi/pi-utils";
 import type {
 	AgentSideConnection,
 	ClientCapabilities,
@@ -52,6 +53,8 @@ import {
 	zSessionNotification,
 } from "@oh-my-pi/pi-utils/acp";
 import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { rejectionOf } from "./helpers/rejection";
 
 import { cfgPlanAutosave, cfgPlanAutosaveDir, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
 
@@ -136,6 +139,10 @@ class FakeAgentSession {
 	queuedMessageCount = 0;
 	systemPrompt = "system";
 	disposed = false;
+	/** ACP scopes the extension agents API by the session's agent id; a top-level fake has none. */
+	getAgentId(): string | undefined {
+		return undefined;
+	}
 	fastMode = false;
 	clientBridge: ClientBridge | undefined;
 	forcedToolChoice: string | undefined;
@@ -178,6 +185,7 @@ class FakeAgentSession {
 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
 	buildUserSkillPrompt = buildSkillPromptMessage;
 	async refreshSkillsAndCommands(): Promise<void> {}
+	async discoverStartupSkillPaths(): Promise<void> {}
 	subscribeCommandMetadataChanged(_listener: () => void): () => void {
 		return () => {};
 	}
@@ -557,6 +565,8 @@ async function createHarness(
 		extensionRunners?: boolean;
 		/** Exposed to each created session's `modelRegistry` for MCP credential round-trips. */
 		authStorage?: AuthStorage;
+		/** Runs on each session the agent's factory creates, before the agent configures it. */
+		decorateSession?: (session: FakeAgentSession) => void;
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -590,8 +600,8 @@ async function createHarness(
 			options.permissionHandler?.(request);
 			return { promise: Promise.resolve({ outcome: { outcome: "cancelled" } }), cancel: () => {} };
 		},
-		unstable_createElicitation: options.elicitationHandler
-			? async (req: CreateElicitationRequest) => options.elicitationHandler!(req)
+		unstable_createElicitationWithCancel: options.elicitationHandler
+			? (req: CreateElicitationRequest) => ({ promise: options.elicitationHandler!(req), cancel: () => {} })
 			: undefined,
 		signal: abortController.signal,
 		closed: Promise.withResolvers<void>().promise,
@@ -611,6 +621,7 @@ async function createHarness(
 				{} as ModelRegistry,
 			);
 		}
+		options.decorateSession?.(session);
 		const setToolUIContext = vi.fn();
 		sessions.push(session);
 		setToolUIContextSpies.push(setToolUIContext);
@@ -2545,6 +2556,140 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("runs a built-in an extension sends through sendUserInput with the hooks ACP gives typed input", async () => {
+		let actions: ExtensionActions | undefined;
+		const bootstrapped = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			sessionUpdateHook: notification => {
+				if (notification.update.sessionUpdate === "session_info_update") bootstrapped.resolve();
+			},
+			decorateSession: session => {
+				Object.assign(session, {
+					titleGenerationSignal: new AbortController().signal,
+					// `/rename` asks the session for the title; a typed one passes through uncarded.
+					renameTitle: async (title?: string) => title || null,
+					extensionRunner: {
+						sends: new ExtensionSendQueue(),
+						initialize: (extensionActions: ExtensionActions) => {
+							actions = extensionActions;
+						},
+						emit: async () => undefined,
+						hasHandlers: () => false,
+						getRegisteredCommands: () => [],
+					},
+				});
+			},
+		});
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		if (!actions?.sendUserInput) throw new Error("expected ACP to wire the extension sendUserInput action");
+		// Once the bootstrap updates have gone out the client has the session id; input sent
+		// before that is the next test's case.
+		await advanceBootstrapGuard();
+		await bootstrapped.promise;
+		vi.useRealTimers();
+
+		const result = await actions.sendUserInput("/rename Bridge title");
+
+		expect(result).toEqual({ handled: "command", output: "Session renamed to Bridge title." });
+		const updates = harness.updates.filter(n => n.sessionId === created.sessionId).map(n => n.update);
+		expect(updates).toContainEqual(
+			expect.objectContaining({ sessionUpdate: "session_info_update", title: "Bridge title" }),
+		);
+		expect(updates).toContainEqual(
+			expect.objectContaining({
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "Session renamed to Bridge title." },
+			}),
+		);
+
+		harness.abortController.abort();
+	});
+
+	it("gives /mcp an extension sends through sendUserInput the session's live MCP manager, as typed input gets it", async () => {
+		// A client-declared server lives only in the session's MCP manager, in no config file. Typed
+		// `/mcp reauth broken` resolves it there (and answers with the stdio guidance); without the
+		// manager the same text sent by an extension would answer "not found".
+		let actions: ExtensionActions | undefined;
+		const harness = await createHarness({
+			decorateSession: session => {
+				Object.assign(session, {
+					extensionRunner: {
+						sends: new ExtensionSendQueue(),
+						initialize: (extensionActions: ExtensionActions) => {
+							actions = extensionActions;
+						},
+						emit: async () => undefined,
+						hasHandlers: () => false,
+						getRegisteredCommands: () => [],
+					},
+				});
+			},
+		});
+		await harness.agent.newSession({
+			cwd: harness.cwdA,
+			mcpServers: [{ name: "broken", command: "/nonexistent/omp-fixture-binary", args: [], env: [] }],
+		});
+		if (!actions?.sendUserInput) throw new Error("expected ACP to wire the extension sendUserInput action");
+
+		const result = await actions.sendUserInput("/mcp reauth broken");
+
+		expect(result).toMatchObject({
+			handled: "command",
+			output: expect.stringContaining("stdio servers manage their own credentials"),
+		});
+
+		harness.abortController.abort();
+	}, 15_000);
+
+	it("reports nothing to the client for a built-in a session_start handler sends before the session/new response", async () => {
+		// A client drops notifications for a session id it has not received yet, which is why
+		// `#scheduleBootstrapUpdates` defers the first ones. `session_start` runs inside
+		// `newSession`, so input an extension sends from it must not report around that guard.
+		let actions: ExtensionActions | undefined;
+		let startResult: unknown;
+		let responded = false;
+		const bootstrapTitle = Promise.withResolvers<string | null | undefined>();
+		const harness = await createHarness({
+			sessionUpdateHook: notification => {
+				if (responded && notification.update.sessionUpdate === "session_info_update") {
+					bootstrapTitle.resolve(notification.update.title);
+				}
+			},
+			decorateSession: session => {
+				Object.assign(session, {
+					titleGenerationSignal: new AbortController().signal,
+					// `/rename` asks the session for the title; a typed one passes through uncarded.
+					renameTitle: async (title?: string) => title || null,
+					extensionRunner: {
+						sends: new ExtensionSendQueue(),
+						initialize: (extensionActions: ExtensionActions) => {
+							actions = extensionActions;
+						},
+						emit: async (event: { type: string }) => {
+							if (event.type === "session_start") {
+								startResult = await actions?.sendUserInput?.("/rename Early title");
+							}
+						},
+						hasHandlers: () => false,
+						getRegisteredCommands: () => [],
+					},
+				});
+			},
+		});
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		responded = true;
+
+		expect(startResult).toEqual({ handled: "command", output: "Session renamed to Early title." });
+		expect(harness.updates.filter(n => n.sessionId === created.sessionId)).toEqual([]);
+		// The rename still reaches the client, in the first updates after the guard.
+		await advanceBootstrapGuard();
+		expect(await bootstrapTitle.promise).toBe("Early title");
+
+		harness.abortController.abort();
+	});
+
 	it("auto-cancels an in-progress turn and queues a new prompt when called mid-flight", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -3614,9 +3759,9 @@ describe("ACP agent", () => {
 		} {
 			const calls: CreateElicitationRequest[] = [];
 			const connection = {
-				unstable_createElicitation: async (req: CreateElicitationRequest) => {
+				unstable_createElicitationWithCancel: (req: CreateElicitationRequest) => {
 					calls.push(req);
-					return handler(req);
+					return { promise: handler(req), cancel: () => {} };
 				},
 			} as unknown as AgentSideConnection;
 			return { connection, calls };
@@ -3628,6 +3773,31 @@ describe("ACP agent", () => {
 		): request is Extract<CreateElicitationRequest, { mode: "form" }> {
 			return request.mode === "form";
 		}
+
+		it("cancels the client dialog when the wait's signal aborts before an answer", async () => {
+			// The reserve-deadline (and user-steering) path aborts the dialog's
+			// signal. A non-cancellable elicitation left the client showing the
+			// form while the caller moved on and a late answer was ignored; the
+			// bridge now cancels the wire request so the client tears the dialog down.
+			let cancelled = false;
+			const connection = {
+				unstable_createElicitationWithCancel: (_req: CreateElicitationRequest) => ({
+					// Nobody at the client answers; only the cancel can settle it.
+					promise: new Promise<CreateElicitationResponse>(() => {}),
+					cancel: () => {
+						cancelled = true;
+					},
+				}),
+			} as unknown as AgentSideConnection;
+			const ctx = createAcpExtensionUiContext(connection, () => "session-abort", FORM_CAPABILITIES);
+			const abort = new AbortController();
+
+			const pending = ctx.confirm!("Trust?", "startup", { signal: abort.signal });
+			abort.abort();
+
+			expect(await pending).toBe(false);
+			expect(cancelled).toBe(true);
+		});
 		it("translates a recommended single-choice ask into one form", async () => {
 			const { connection, calls } = createElicitConnection(async () => ({
 				action: "accept",
@@ -4189,6 +4359,315 @@ describe("ACP agent", () => {
 
 			expect(result).toBeUndefined();
 		});
+	});
+});
+
+describe("ACP extension session_start/resources_discover sends (PR #9379 round-6 review)", () => {
+	afterEach(() => {
+		resetSettingsForTest();
+	});
+
+	it("answers session/new while the turn a session_start send started still runs", async () => {
+		// `#configureExtensions` wires the extension runner directly (not through
+		// `initializeExtensions`/`runtime-init.ts`) — a real `AgentSession` (not the
+		// harness's `FakeAgentSession`) is required to exercise the actual extension
+		// runtime and event pipeline.
+		const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-startup-turn-"));
+		const agentDir = path.join(tempDir, "agent");
+		await fs.promises.mkdir(agentDir, { recursive: true });
+		setAgentDir(agentDir);
+		await Settings.init({ agentDir, inMemory: true });
+
+		const authStorage = createInMemoryAuthStorage();
+		// `AgentSession.prompt` preflights a provider key through the registry; the
+		// extension-triggered turn below must not depend on the developer's env.
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		// The startup turn's model call blocks until the test releases it, so it
+		// is still running when `session/new` should already have answered.
+		const { promise: modelGate, resolve: releaseModelGate } = Promise.withResolvers<void>();
+		let session: AgentSession | undefined;
+		try {
+			// A `session_start` handler that starts a turn (an extension announcing
+			// itself). The client must get its session id without waiting for it.
+			const extensionsDir = path.join(tempDir, "ext");
+			await fs.promises.mkdir(extensionsDir, { recursive: true });
+			const extPath = path.join(extensionsDir, "startup-announce.ts");
+			await fs.promises.writeFile(
+				extPath,
+				`export default function (pi) {
+	pi.on("session_start", () => {
+		pi.sendUserMessage("extension started");
+	});
+}
+`,
+			);
+
+			const loaded = await loadExtensions([extPath], tempDir);
+			expect(loaded.errors).toEqual([]);
+
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+			const modelCallStarted = Promise.withResolvers<void>();
+			let calls = 0;
+			const mock = createMockModel({
+				handler: async () => {
+					if (calls++ === 0) {
+						modelCallStarted.resolve();
+						await modelGate;
+					}
+					return { content: ["ack"] };
+				},
+			});
+			const agentCore = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				streamFn: mock.stream,
+			});
+			const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+			const sessionManager = SessionManager.inMemory(tempDir);
+			const extensionRunner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+
+			session = new AgentSession({
+				agent: agentCore,
+				sessionManager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry,
+				extensionRunner,
+			});
+
+			const connection = {
+				sessionUpdate: async () => {},
+				signal: new AbortController().signal,
+				closed: Promise.withResolvers<void>().promise,
+			} as unknown as AgentSideConnection;
+			const acpSession = session;
+			const agent = new AcpAgent(connection, async () => acpSession);
+
+			const created = await withTimeout(
+				agent.newSession({ cwd: tempDir, mcpServers: [] }),
+				10_000,
+				"session/new waited for the startup turn",
+			);
+			await withTimeout(modelCallStarted.promise, 10_000, "startup turn did not start");
+			expect(session.isStreaming).toBe(true);
+
+			// A prompt during the startup turn is handled as during any turn the
+			// client did not prompt: answered with session_busy, not queued behind it.
+			const busy = await rejectionOf(
+				agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "early" }] } as PromptRequest),
+			);
+			expect(busy).toMatchObject({ message: expect.stringContaining("already processing") });
+
+			releaseModelGate();
+			await session.waitForIdle();
+			const response = await agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "next" }],
+			} as PromptRequest);
+			expect(response.stopReason).toBe("end_turn");
+		} finally {
+			releaseModelGate();
+			await session?.dispose();
+			authStorage.close();
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("lets session/cancel stop the turn a session_start send started", async () => {
+		// session/new answers before that turn ends, and no client prompt owns it;
+		// the client's stop must still reach it.
+		const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-startup-turn-cancel-"));
+		const agentDir = path.join(tempDir, "agent");
+		await fs.promises.mkdir(agentDir, { recursive: true });
+		setAgentDir(agentDir);
+		await Settings.init({ agentDir, inMemory: true });
+
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		let session: AgentSession | undefined;
+		try {
+			const extensionsDir = path.join(tempDir, "ext");
+			await fs.promises.mkdir(extensionsDir, { recursive: true });
+			const extPath = path.join(extensionsDir, "startup-announce.ts");
+			await fs.promises.writeFile(
+				extPath,
+				`export default function (pi) {
+	pi.on("session_start", () => {
+		pi.sendUserMessage("extension started");
+	});
+}
+`,
+			);
+
+			const loaded = await loadExtensions([extPath], tempDir);
+			expect(loaded.errors).toEqual([]);
+
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+			// The startup turn's model call runs until its request is aborted.
+			const modelCallStarted = Promise.withResolvers<void>();
+			const modelCallAborted = Promise.withResolvers<void>();
+			let calls = 0;
+			const mock = createMockModel({
+				handler: async (_context, options) => {
+					if (calls++ === 0) {
+						const signal = options?.signal;
+						if (signal?.aborted) modelCallAborted.resolve();
+						signal?.addEventListener("abort", () => modelCallAborted.resolve(), { once: true });
+						modelCallStarted.resolve();
+						await modelCallAborted.promise;
+					}
+					return { content: ["ack"] };
+				},
+			});
+			const agentCore = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				streamFn: mock.stream,
+			});
+			const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+			const sessionManager = SessionManager.inMemory(tempDir);
+			const extensionRunner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+
+			session = new AgentSession({
+				agent: agentCore,
+				sessionManager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry,
+				extensionRunner,
+			});
+
+			const connection = {
+				sessionUpdate: async () => {},
+				signal: new AbortController().signal,
+				closed: Promise.withResolvers<void>().promise,
+			} as unknown as AgentSideConnection;
+			const acpSession = session;
+			const agent = new AcpAgent(connection, async () => acpSession);
+
+			const created = await withTimeout(
+				agent.newSession({ cwd: tempDir, mcpServers: [] }),
+				10_000,
+				"session/new waited for the startup turn",
+			);
+			await withTimeout(modelCallStarted.promise, 10_000, "startup turn did not start");
+			expect(session.isStreaming).toBe(true);
+
+			await withTimeout(agent.cancel({ sessionId: created.sessionId }), 10_000, "session/cancel did not return");
+			await withTimeout(modelCallAborted.promise, 10_000, "session/cancel did not abort the startup turn");
+			expect(session.isStreaming).toBe(false);
+
+			const response = await agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "next" }],
+			} as PromptRequest);
+			expect(response.stopReason).toBe("end_turn");
+		} finally {
+			await session?.dispose();
+			authStorage.close();
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("gives a session_start-triggered turn visibility into skills a resources_discover handler contributes (regression: PR #9379 review, acp-agent.ts startup sends)", async () => {
+		const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-session-start-turn-discovery-"));
+		const agentDir = path.join(tempDir, "agent");
+		await fs.promises.mkdir(agentDir, { recursive: true });
+		setAgentDir(agentDir);
+		await Settings.init({ agentDir, inMemory: true });
+
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		let session: AgentSession | undefined;
+		try {
+			const skillsDir = path.join(tempDir, "skills");
+			await fs.promises.mkdir(path.join(skillsDir, "acp-startup-skill"), { recursive: true });
+			await fs.promises.writeFile(
+				path.join(skillsDir, "acp-startup-skill", "SKILL.md"),
+				"---\nname: acp-startup-skill\ndescription: Contributed by resources_discover at ACP startup.\n---\n\nbody\n",
+			);
+			const extensionsDir = path.join(tempDir, "ext");
+			await fs.promises.mkdir(extensionsDir, { recursive: true });
+			const extPath = path.join(extensionsDir, "acp-session-start-turn.ts");
+			await fs.promises.writeFile(
+				extPath,
+				`export default function (pi) {
+	pi.on("session_start", () => {
+		pi.sendUserMessage("hello");
+	});
+	pi.on("resources_discover", () => ({ skillPaths: [${JSON.stringify(skillsDir)}] }));
+}
+`,
+			);
+
+			const loaded = await loadExtensions([extPath], tempDir);
+			expect(loaded.errors).toEqual([]);
+
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+			// Recorded inside the model call: the state that turn actually saw.
+			const skillVisibleAtCallTime: boolean[] = [];
+			const modelCalled = Promise.withResolvers<void>();
+			const mock = createMockModel({
+				handler: () => {
+					skillVisibleAtCallTime.push(session?.skills.some(skill => skill.name === "acp-startup-skill") ?? false);
+					modelCalled.resolve();
+					return { content: ["ack"] };
+				},
+			});
+			const agentCore = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				streamFn: mock.stream,
+			});
+			const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+			const sessionManager = SessionManager.inMemory(tempDir);
+			const extensionRunner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+
+			session = new AgentSession({
+				agent: agentCore,
+				sessionManager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry,
+				extensionRunner,
+			});
+
+			const connection = {
+				sessionUpdate: async () => {},
+				signal: new AbortController().signal,
+				closed: Promise.withResolvers<void>().promise,
+			} as unknown as AgentSideConnection;
+			const acpSession = session;
+			const agent = new AcpAgent(connection, async () => acpSession);
+
+			await agent.newSession({ cwd: tempDir, mcpServers: [] });
+			// session/new does not wait for the startup turn; wait for its model call here.
+			await withTimeout(modelCalled.promise, 10_000, "startup turn did not call the model");
+
+			expect(skillVisibleAtCallTime).toEqual([true]);
+		} finally {
+			await session?.dispose();
+			authStorage.close();
+			await removeWithRetries(tempDir);
+		}
 	});
 });
 
