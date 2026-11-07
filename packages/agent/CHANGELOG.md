@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [18.17.0] - 2026-11-06
+
 ### Added
 
 - Chat and judgment spans now carry `omp.gen_ai.provider.id` (the provider id before OTel normalization, such as `openai-codex`) and `omp.gen_ai.auth.kind` (`api_key`, `console_oauth`, `subscription_oauth` or `unknown`), so subscription, Console-login and API-key calls can be told apart
@@ -11,6 +13,8 @@
 ### Fixed
 
 - Fixed steering and follow-up queue notifications observing a batch before its preparation claim was installed and missing the transition to delivery, leaving pending-message snapshots stale after asynchronous preparation.
+- Added `Agent.queuedMessageGate` to filter queued messages before delivery and observe claimed messages returned undelivered.
+- Added `wireToolsFingerprint()`, returning a hash of the tool specs sent with a request.
 
 ## [18.16.0] - 2026-11-02
 
