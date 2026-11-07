@@ -1,4 +1,4 @@
-import { initTelemetryExport } from "@oh-my-pi/pi-coding-agent/telemetry-export";
+import { allowTelemetryReceiverForTests, initTelemetryExport } from "@oh-my-pi/pi-coding-agent/telemetry-export";
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 
 const requested = Promise.withResolvers<void>();
@@ -13,6 +13,7 @@ const server = Bun.serve({
 process.env.OTEL_SDK_DISABLED = "false";
 process.env.OTEL_TRACES_EXPORTER = "none";
 process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = `http://127.0.0.1:${server.port}/v1/logs`;
+using _receiver = allowTelemetryReceiverForTests(process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT);
 await initTelemetryExport(true);
 logger.error("probe export on shutdown");
 

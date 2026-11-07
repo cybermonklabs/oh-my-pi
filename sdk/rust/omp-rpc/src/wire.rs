@@ -987,7 +987,12 @@ pub struct AssistantMessage {
 	pub response_id: Option<String>,
 	pub upstream_provider: Option<String>,
 	pub upstream_model: Option<String>,
+	/// The failure's own text: what the provider sent, or omp's text for a failure it detected itself. Retry and classification decisions read this.
 	pub error_message: Option<String>,
+	/// `errorMessage` as omp shows it, when that differs: with the rejected request's dump path, a provider-specific explanation or the response's retry hint added. Display only; it can name local paths.
+	pub error_display_message: Option<String>,
+	/// The delay, in milliseconds, the failed response's headers asked for before a retry. Retry decisions read this with `errorMessage`.
+	pub error_retry_after_ms: Option<f64>,
 	pub error_status: Option<i64>,
 	pub error_id: Option<f64>,
 	pub provider_payload: Option<Map<String, Value>>,
@@ -1037,6 +1042,12 @@ impl Serialize for AssistantMessage {
 		if let Some(value) = &self.error_message {
 			map.serialize_entry("errorMessage", value)?;
 		}
+		if let Some(value) = &self.error_display_message {
+			map.serialize_entry("errorDisplayMessage", value)?;
+		}
+		if let Some(value) = &self.error_retry_after_ms {
+			map.serialize_entry("errorRetryAfterMs", value)?;
+		}
 		if let Some(value) = &self.error_status {
 			map.serialize_entry("errorStatus", value)?;
 		}
@@ -1069,6 +1080,8 @@ impl Serialize for AssistantMessage {
 				"upstreamProvider" if self.upstream_provider.is_some() => continue,
 				"upstreamModel" if self.upstream_model.is_some() => continue,
 				"errorMessage" if self.error_message.is_some() => continue,
+				"errorDisplayMessage" if self.error_display_message.is_some() => continue,
+				"errorRetryAfterMs" if self.error_retry_after_ms.is_some() => continue,
 				"errorStatus" if self.error_status.is_some() => continue,
 				"errorId" if self.error_id.is_some() => continue,
 				"providerPayload" if self.provider_payload.is_some() => continue,
@@ -1099,6 +1112,8 @@ impl<'de> Deserialize<'de> for AssistantMessage {
 			upstream_provider: take(&mut extra, "upstreamProvider"),
 			upstream_model: take(&mut extra, "upstreamModel"),
 			error_message: take(&mut extra, "errorMessage"),
+			error_display_message: take(&mut extra, "errorDisplayMessage"),
+			error_retry_after_ms: take(&mut extra, "errorRetryAfterMs"),
 			error_status: take(&mut extra, "errorStatus"),
 			error_id: take(&mut extra, "errorId"),
 			provider_payload: take(&mut extra, "providerPayload"),
@@ -3874,6 +3889,12 @@ pub struct AutoRetryEndEvent {
 	pub attempt: i64,
 	#[serde(rename = "finalError", default, skip_serializing_if = "Option::is_none")]
 	pub final_error: Option<String>,
+	/// Error kind of the failure that ended the retry: kind labels joined by `|` (e.g. `usage-limit`, `transient|usage-limit`), or `status:<code>` for an error known only by its HTTP status; test membership, not equality.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub kind: Option<String>,
+	/// Epoch ms when the failing credential's limit resets, as the provider stated it; absent when the provider stated no time. Covers only the account this run used; another stored account may become usable sooner.
+	#[serde(rename = "resetAtMs", default, skip_serializing_if = "Option::is_none")]
+	pub reset_at_ms: Option<i64>,
 	/// Persisted retry errors whose presentation changed when the retry settled.
 	#[serde(rename = "retryErrors", default = "default_auto_retry_end_event_retry_errors")]
 	pub retry_errors: Vec<Map<String, Value>>,
@@ -3992,6 +4013,23 @@ pub struct QueueUpdateEvent {
 	pub live_steered: i64,
 }
 
+/// The session opened a dialog only a person can answer and the turn is held until it settles.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserWaitStartEvent {
+	/// What the session is asking a person to decide.
+	pub prompt: String,
+	/// Whether the dialog approves an operation or asks a question; absent when its opener named no classification.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub kind: Option<UserWaitStartEventKind>,
+	/// Every tool call whose dialog is open, oldest first; absent when no open dialog belongs to one. A call that leaves this list between frames has had its own dialog answered, which is not the same moment as the last dialog settling.
+	#[serde(rename = "toolCalls", default, skip_serializing_if = "Option::is_none")]
+	pub tool_calls: Option<Vec<String>>,
+}
+
+/// The last dialog waiting on a person settled; the turn goes on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserWaitEndEvent {}
+
 /// A session event, discriminated by `type`; `set_event_filter` selects which are sent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RpcAgentEvent {
@@ -4036,6 +4074,10 @@ pub enum RpcAgentEvent {
 	GoalUpdated(GoalUpdatedEvent),
 	/// Coalesced snapshot of the displayable steering/follow-up queue, sent whenever it changes.
 	QueueUpdate(QueueUpdateEvent),
+	/// The session opened a dialog only a person can answer and the turn is held until it settles.
+	UserWaitStart(UserWaitStartEvent),
+	/// The last dialog waiting on a person settled; the turn goes on.
+	UserWaitEnd(UserWaitEndEvent),
 }
 
 impl RpcAgentEvent {
@@ -4075,6 +4117,8 @@ impl RpcAgentEvent {
 			Some("thinking_level_changed") => |value| serde_json::from_value(value).map(Self::ThinkingLevelChanged),
 			Some("goal_updated") => |value| serde_json::from_value(value).map(Self::GoalUpdated),
 			Some("queue_update") => |value| serde_json::from_value(value).map(Self::QueueUpdate),
+			Some("user_wait_start") => |value| serde_json::from_value(value).map(Self::UserWaitStart),
+			Some("user_wait_end") => |value| serde_json::from_value(value).map(Self::UserWaitEnd),
 			other => {
 				return Err(serde_json::Error::custom(format!("unknown RpcAgentEvent type {other:?}")));
 			}
@@ -4119,6 +4163,8 @@ impl Serialize for RpcAgentEvent {
 			Self::ThinkingLevelChanged(member) => serialize_tagged(member, &[("type", "thinking_level_changed")], serializer),
 			Self::GoalUpdated(member) => serialize_tagged(member, &[("type", "goal_updated")], serializer),
 			Self::QueueUpdate(member) => serialize_tagged(member, &[("type", "queue_update")], serializer),
+			Self::UserWaitStart(member) => serialize_tagged(member, &[("type", "user_wait_start")], serializer),
+			Self::UserWaitEnd(member) => serialize_tagged(member, &[("type", "user_wait_end")], serializer),
 		}
 	}
 }
@@ -5127,7 +5173,7 @@ impl RpcNotification {
 			Some("session_info_update") => |value| serde_json::from_value(value).map(Self::SessionInfoUpdate),
 			Some("config_update") => |value| serde_json::from_value(value).map(Self::ConfigUpdate),
 			Some("rpc_frame_error") => |value| serde_json::from_value(value).map(Self::RpcFrameError),
-			Some("agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "manual_compaction_start" | "manual_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcAgentEvent),
+			Some("agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "manual_compaction_start" | "manual_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update" | "user_wait_start" | "user_wait_end") => |value| serde_json::from_value(value).map(Self::RpcAgentEvent),
 			_ => |value| Ok(Self::Unknown(value)),
 		};
 		decode(value)
@@ -5190,7 +5236,7 @@ impl RpcServerFrame {
 		let decode: fn(Value) -> Result<Self, serde_json::Error> = match value.get("type").and_then(Value::as_str) {
 			Some("response") => |value| serde_json::from_value(value).map(Self::Response),
 			Some("host_tool_call" | "host_tool_cancel" | "host_uri_request" | "host_uri_cancel") => |value| serde_json::from_value(value).map(Self::RpcHostRequest),
-			Some("ready" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "dictation_state" | "dictation_transcript" | "dictation_end" | "btw_delta" | "btw_record" | "command_output" | "session_info_update" | "config_update" | "rpc_frame_error" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "manual_compaction_start" | "manual_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcNotification),
+			Some("ready" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "dictation_state" | "dictation_transcript" | "dictation_end" | "btw_delta" | "btw_record" | "command_output" | "session_info_update" | "config_update" | "rpc_frame_error" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "manual_compaction_start" | "manual_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update" | "user_wait_start" | "user_wait_end") => |value| serde_json::from_value(value).map(Self::RpcNotification),
 			_ => |value| Ok(Self::Unknown(value)),
 		};
 		decode(value)
@@ -5974,6 +6020,24 @@ impl LogoutAccountType {
 		match self {
 			Self::ApiKey => "api_key",
 			Self::Oauth => "oauth",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UserWaitStartEventKind {
+	#[serde(rename = "permission")]
+	Permission,
+	#[serde(rename = "question")]
+	Question,
+}
+
+impl UserWaitStartEventKind {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Permission => "permission",
+			Self::Question => "question",
 		}
 	}
 }

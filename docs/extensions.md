@@ -33,7 +33,7 @@ Extensions can combine all of the following in one module:
 - slash commands (`pi.registerCommand(...)`)
 - keyboard shortcuts and flags
 - custom message rendering
-- session/message injection APIs (`sendMessage`, `sendUserMessage`, `appendEntry`)
+- session/message injection APIs (`sendMessage`, `sendUserMessage`, `sendUserInput`, `appendEntry`)
 
 ## Runtime model
 
@@ -120,7 +120,7 @@ Core methods:
 - `registerMessageRenderer`, `registerAssistantThinkingRenderer`, `registerAssistantTextRenderer`, `registerTranscriptPresenter`, `registerLinkScheme`
 - `registerComposerShape`
 - `setLabel`, `getFlag`
-- `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
+- `sendMessage`, `sendUserMessage`, `sendUserInput`, `appendEntry`, `exec`
 - `getActiveTools`, `getAllTools`, `setActiveTools`
 - `getCommands`
 - `getSessionName`, `setSessionName`
@@ -332,7 +332,7 @@ export default function (pi: ExtensionAPI) {
 - `deliverAs: "steer"` (default while streaming) — steers the current run
 - `deliverAs: "followUp"` — queued behind the current run while streaming
 - `deliverAs: "nextTurn"` — kept out of the editable pending-message UI; while streaming it waits for the next turn, and when idle without `triggerTurn` it is appended to context/history without starting a turn
-- `deliverAs: "aside"` — injected at the next agent step boundary without interrupting the current tool batch, except that it ends a running interruptible `wait` (the wait returns "Wait interrupted by message." and its job keeps running); when idle it normally starts a turn regardless of `triggerTurn`. Plan mode or user-interrupt auto-resume suppression folds it into context instead
+- `deliverAs: "aside"` — injected at the next agent step boundary without interrupting the current tool batch, except that it ends a running interruptible `wait` (the wait returns "Wait interrupted by message." and its job keeps running); when idle it normally starts a turn. Plan mode or user-interrupt auto-resume suppression folds it into context instead, unless `triggerTurn` is true: an aside sent with `triggerTurn` that no running turn consumes starts a turn even then, and folds only when a user interrupt came after it was sent
 - `triggerTurn: true` — starts a turn when idle (also honored with `deliverAs: "nextTurn"`: idle prompts immediately; while streaming the queued message schedules an internal continuation)
 
 When idle without `triggerTurn`, ordinary `sendMessage` delivery appends the
@@ -349,6 +349,18 @@ injects at the next step boundary while a run is live and starts a turn when
 idle. The message is recorded with `attribution: "user"` unless you pass
 `attribution: "agent"`; use `"agent"` for text the extension generated or relayed
 from another agent.
+
+`pi.sendUserInput(text, { deliverAs, tag })` runs text as if the user typed it, the way RPC mode runs a `prompt` command, and resolves with how it was handled:
+
+- Extension `input` handlers run first, as for typed input (see "External input interception"), with `source: "extension"`; one that consumes the text, or leaves no text and no images, sends nothing → `{ handled: "command" }`, and text or images it substitutes are what the steps below dispatch.
+- `/skill:<name>` is submitted as the user's skill prompt → `{ handled: "skill" }`.
+- A built-in slash command with a headless handler (the set RPC and ACP run, e.g. `/jobs`, `/compact`, `/retry`) runs → `{ handled: "command", output?, agentInvoked? }`, where `output` is what it printed and `agentInvoked` is `true` when it started a turn without submitting a message, as `/retry` does; one that returns prompt text submits it → `{ handled: "prompt" }`. It reports through the host's own output and notification hooks, so what it prints also shows where typed output does (the TUI status line, an RPC `command_output` frame, an ACP message), and a rename or model change reaches an RPC or ACP client. In ACP, one sent before the client has been told about the session (from `session_start`, which runs before the `session/new` response) reports nothing to the client: the response and the first session updates carry the title, commands and config, and the output comes back only in the result. It finishes before the call resolves, including a provider-backed one such as `/compact` that RPC runs in the background for a typed `prompt`. A built-in only the interactive terminal runs (e.g. `/new`, `/resume`, `/quit`) sends nothing → `{ handled: "terminal-only" }`.
+- Otherwise the text goes through the prompt flow: extension and custom commands run locally → `{ handled: "command" }`; plain text, templates, file slash commands and slash text that names no command (such as `/nosuch` or a path like `/var/log/app.log`) submit a user message, as typing them does → `{ handled: "prompt" }`.
+- A host that does not wire the action answers `{ handled: "unavailable" }`, and so does the interactive TUI while the session is joined to a collab session as a guest, where extension-initiated turns are host-only; nothing is sent or run.
+
+`deliverAs` picks how a submitted message queues while the agent is streaming (default steer, like Enter); an idle session starts a turn either way. `tag` is recorded on the message the input submits (the user message, or the skill prompt message) and so appears on its `message_start`/`message_end` events and in the session file, letting a bridge match the message to the input it forwarded. `listUserInputBuiltinCommands()` (exported from `extensibility/extensions/send-user-input-handler`) lists the built-ins with a `terminalOnly` flag, for completion. SDK embedders that build their own `ExtensionActions` can wire the optional `sendUserInput` action with `sendSessionUserInput(session, text, options, host)` from the same module, where `host` is the `SlashCommandHost` (`slash-commands/types`) their own built-in dispatch uses; without one, a built-in's output only returns to the extension.
+
+Tagged input waiting in the queue is never handed back as editable text, since the editor and RPC clients carry only text and the tag would be lost. It still shows as a queue chip, but Alt+Up steps over it and RPC `remove_queued_message` does not match it, so it stays queued and is delivered with its tag. When the person interrupts (Esc, or RPC `abort_and_restore_queue`), the abort records it in the transcript without starting a turn, tag included, so the bridge can still match it.
 
 Payloads passed to `pi.sendMessage` are normalized before delivery
 (`normalizeCustomMessagePayload` in `packages/tui/src/chat/messages.ts`,
@@ -513,9 +525,13 @@ Canonical event unions and payload types are in `types.ts`.
 - `session_shutdown`
 
 In the interactive TUI, an extension whose factory registers no providers,
-shortcuts, composer shapes, or file fallbacks is loaded after the composer
+shortcuts, composer shapes, file fallbacks, message or assistant reply renderers,
+link schemes, or `resources_discover` handler is loaded after the composer
 accepts input, once a previous launch has recorded that about its current
-source. Its `session_start` still runs (it is delivered when the extension
+source. A `resources_discover` handler keeps an
+extension eager because the startup pass folds its skill, prompt, and theme
+directories into the session before the first prompt. Its `session_start` still
+runs (it is delivered when the extension
 binds), and the first submitted message and every model turn wait until it is
 loaded, so its tools, commands, and `input`/`before_agent_start` hooks apply from
 the first request. Events emitted before it binds are not replayed. Resumed
@@ -582,6 +598,7 @@ prompt-template expansion, and queue insertion:
 | --------------------------------------------------------------------------- | --------------- |
 | Main-session Enter or Ctrl+Enter                                            | `"interactive"` |
 | `prompt`, `steer`, `follow_up`, or `abort_and_prompt` in RPC or RPC UI mode | `"rpc"`         |
+| An extension's `pi.sendUserInput(text)`, in any mode | `"extension"` |
 
 Handlers run in extension/registration order. Returned `text` and `images`
 replacements feed subsequent handlers; omitted fields preserve the current value,
@@ -592,7 +609,9 @@ handler through `sendUserMessage` or `sendMessage` is not discarded.
 
 This is an ingress event, not a user-role message event. Queue delivery and replay
 do not emit it again. Programmatic `sendUserMessage`/`sendMessage` calls and
-synthetic continuations do not automatically emit `input`. Main-session Enter's
+synthetic continuations do not automatically emit `input`; `sendUserInput` does, so
+a handler that forwards input through it sees that call again with
+`source: "extension"`. Main-session Enter's
 `.`/`c` continuation shortcuts retain their synthetic path. Focused-subagent
 input retains its chat-only routing and does not invoke main-session input hooks.
 Print and ACP input are outside this interception contract.
@@ -671,8 +690,17 @@ The runtime handles the JSON-RPC transport and its own list/update refresh first
 
 ### `resources_discover`
 
-`resources_discover` exists in extension types and `ExtensionRunner`.
-Current runtime note: `ExtensionRunner.emitResourcesDiscover(...)` is implemented, but there are no `AgentSession` callsites invoking it in the current codebase.
+Fired once per session, after `session_start`, and again on `/reload-plugins`, on `/move` or any other working-directory change, when a plugin is enabled or disabled, when the configured extension sources change, and when skill or command discovery settings change. Payload: `{ cwd: string; reason: "startup" | "reload" }`. A handler may return `{ skillPaths?: string[]; promptPaths?: string[]; themePaths?: string[] }`; only `skillPaths` currently has a consumer (`promptPaths`/`themePaths` are collected but not yet acted on). Other skill rescans (`manage_skill`, `/skills install`/`update`) reuse the directories the last round returned without firing the event.
+
+A turn that a `session_start` or `resources_discover` handler starts with `sendMessage`/`sendUserMessage` waits until the returned skill directories are in the system prompt, so it sees the same skills as a prompt issued after startup or after the reload. In the TUI it also waits until the session is on screen and accepting input. Only print mode and task subagents wait for that turn to end before their first prompt. Elsewhere startup and reload return at once and the turn runs like any other turn: the TUI and RPC render it live and can steer or abort it, and ACP handles it like any turn the client did not prompt (a `session/prompt` during it is answered with `session_busy`).
+
+Returned `skillPaths` join skill discovery as an explicitly configured source, scanned the same way as `skills.customDirectories`: `ignoredSkills`/`includeSkills` are honored, entries are deduplicated by real path, and a name collision with a `skills.customDirectories` entry loses to the user's custom directory (extension-contributed directories are the lower-priority configured source).
+
+```ts
+pi.on("resources_discover", (event) => {
+  return { skillPaths: [path.join(myExtensionDir, "skills")] };
+});
+```
 
 ## Tool authoring details
 
@@ -937,6 +965,46 @@ before and performs no extra syscalls.
 ## UI integration points
 
 `ctx.ui` implements the `ExtensionUIContext` interface. Support differs by mode.
+
+Every dialog that waits for an answer opens a run-state wait the session publishes
+(`user_wait_start`/`user_wait_end`), named by what the call asks. A dialog whose method does not say
+how to classify it — a `select` a host raises in place of an approval dialog, for one — declares it
+with `ExtensionUIDialogOptions.waitKind` (`"permission"` or `"question"`), or with
+`ExtensionCustomOptions.waitKind` on `custom`; without it the dialog reads as a question, and
+`approve` always reads as a permission. A dialog given a `timeout` opens no wait: it settles on its
+own, so its time stays the agent's. While a wait is open its frame is the whole run-state report, so
+a dialog that gives no words of its own is reported under a generic label rather than under some
+other operation's.
+
+A dialog raised for a tool call names it. A dialog raised while the call executes — `ctx.ui` inside
+a registered tool, a built-in tool's own `ctx.ui`, a host's approval opened through
+`session.waitForUser` — is attributed to that call from the execution itself; a caller that raises a
+dialog for a call it is not executing declares it with `ExtensionUIDialogOptions.toolCallId`. The
+frame the session publishes carries every waiting call in `toolCalls`, so a surface watching one
+call sees its own dialog settle — which is not the moment the last dialog settles, and not something
+another dialog's words can be read to mean. A dialog raised outside any call, and one raised by work
+a finished call left running, name none and own none: nothing retires their caller's record but its
+own end.
+
+Attribution names a run of a call, never the id on its own. Two agents in one process can hold the
+same tool-call id at once and are never confused for each other; an executor bound to no agent
+claims none of theirs; and a call that `retry` runs again is a new run — the earlier one being over
+says nothing about this one, and a dialog left open stops naming its call the moment the run that
+raised it ends, so the next run of that id answers for itself. Within a live run, timers and
+detached promises keep the identity, and a `ui` handed to a call keeps the run it was handed to —
+so a holder that keeps that `ui` past the call names nothing with it, not even while a later run
+of the same call is executing. Some boundaries lose the ambient identity: a `worker` callback, and
+work resumed on an `AsyncResource` created before the run. Pass `toolCallId` explicitly from such a
+callback when the dialog is still that call's.
+
+A host that wraps `trackUserWaits` must forward the whole frame to `session.waitForUser`. An
+adapter that copies only some fields drops the dialog's ownership, and the wait then falls back to
+whatever run is executing around it — which, inside a nested `invokeTool`, is the child rather than
+the parent that raised the dialog.
+
+None of this survives a restart: waits are not persisted, so reopening a session restores no open
+dialog and approves nothing — an unfinished call that was waiting comes back with no wait and no
+answer.
 
 ### Interactive mode (`extension-ui-controller.ts`)
 

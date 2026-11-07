@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import type { ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
+import { resolvedApiKeyBearer } from "@oh-my-pi/pi-ai/auth-retry";
 import { type AuthApiKeyOptions, type AuthPeekOptions, oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
@@ -7,7 +8,7 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oaut
 import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
 import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
-import { OAuthRefreshUnavailableError } from "@oh-my-pi/pi-ai/error";
+import { MissingApiKeyError, OAuthRefreshUnavailableError } from "@oh-my-pi/pi-ai/error";
 import type {
 	Api,
 	Context,
@@ -48,12 +49,17 @@ import {
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { apiServesKind, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
 import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-catalog/wire/codex";
-import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
+import { getAgentDir, isBunTestRuntime, logger, untilAborted, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import { redactUrlForLog } from "../mcp/json-rpc";
 import type { AuthStorage } from "../session/auth-storage";
-import { type ApiKeyResolverModel, type ApiKeyResolverOptions, createApiKeyResolver } from "./api-key-resolver";
+import {
+	ApiKeyCommandError,
+	type ApiKeyResolverModel,
+	type ApiKeyResolverOptions,
+	createApiKeyResolver,
+} from "./api-key-resolver";
 import type { ConfigError, ConfigFile } from "./config-file";
 import {
 	buildCustomModelOverlay,
@@ -65,6 +71,7 @@ import {
 	resolveModelOverrideWithAliases,
 } from "./custom-models";
 import {
+	commandFailureRetryAfterMs,
 	createConfigHeaderResolver,
 	invalidateAllCommandConfigs,
 	invalidateCommandConfig,
@@ -296,6 +303,39 @@ export type ResolvedRequestAuth =
 	| { ok: false; error: string };
 
 /**
+ * Resolve a model's credential for an *availability* check, where an
+ * unavailable credential is an answer rather than a failure.
+ *
+ * A session restricted to an OAuth account pool (`task.agentAccountPools`)
+ * rejects with {@link MissingApiKeyError} — instead of resolving `undefined` —
+ * for a provider that no account the session may use can serve. Every probe
+ * that only asks "can this model serve?" must read that as "no credential" and
+ * move on to its next candidate, exactly as it does for an absent key.
+ */
+export async function probeModelApiKey(
+	registry: Pick<ModelRegistry, "getApiKey">,
+	model: Model<Api>,
+	sessionId?: string,
+	options?: { signal?: AbortSignal },
+): Promise<string | undefined> {
+	try {
+		return await registry.getApiKey(model, sessionId, options);
+	} catch (error) {
+		if (!(error instanceof MissingApiKeyError)) throw error;
+		// The pool's own message names why (no permitted account, or a models.yml
+		// apiKey a pooled session may not send); the caller only reports that the
+		// model has no working credentials.
+		logger.debug("Model unavailable inside the session's account pool", {
+			provider: model.provider,
+			model: model.id,
+			sessionId,
+			error: error.message,
+		});
+		return undefined;
+	}
+}
+
+/**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
 export class ModelRegistry {
@@ -371,6 +411,8 @@ export class ModelRegistry {
 	#warnedCompatKeys = new Set<string>();
 	#configWarnings: string[] = [];
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
+	/** Last models config that loaded, served while a later edit fails to load. */
+	#lastLoadedModelsConfig: ModelsConfig | undefined;
 	#lastStaticLoadMtime: number | null = null;
 	#registeredProviderSources: Set<string> = new Set();
 	#providerDiscoveryStates: Map<string, ProviderDiscoveryState> = new Map();
@@ -2034,20 +2076,9 @@ export class ModelRegistry {
 				found: false,
 			};
 		}
-		const { value, error, status } = this.#modelsConfigFile.tryLoad();
-
-		if (status === "error") {
-			return {
-				models: [],
-				overrides: new Map(),
-				modelOverrides: new Map(),
-				keylessProviders: new Set(),
-				discoverableProviders: [],
-				configuredProviders: new Set(),
-				error,
-				found: true,
-			};
-		} else if (status === "not-found") {
+		const loaded = this.#modelsConfigFile.tryLoad();
+		if (loaded.status === "not-found") {
+			this.#lastLoadedModelsConfig = undefined;
 			return {
 				models: [],
 				overrides: new Map(),
@@ -2056,6 +2087,34 @@ export class ModelRegistry {
 				discoverableProviders: [],
 				configuredProviders: new Set(),
 				found: false,
+			};
+		}
+		let value: ModelsConfig;
+		let error: ConfigError | undefined;
+		if (loaded.status === "ok") {
+			value = loaded.value;
+			this.#lastLoadedModelsConfig = value;
+		} else if (this.#lastLoadedModelsConfig) {
+			// A models config that stops loading mid-session (typically a
+			// half-saved edit) keeps serving the last config that loaded, so its
+			// providers, overrides and API keys survive until the file loads
+			// again. The error is still reported through getError().
+			value = this.#lastLoadedModelsConfig;
+			error = loaded.error;
+			logger.warn("Models config failed to load; keeping the last config that loaded", {
+				path: this.#modelsConfigFile.path(),
+				error: String(loaded.error),
+			});
+		} else {
+			return {
+				models: [],
+				overrides: new Map(),
+				modelOverrides: new Map(),
+				keylessProviders: new Set(),
+				discoverableProviders: [],
+				configuredProviders: new Set(),
+				error: loaded.error,
+				found: true,
 			};
 		}
 
@@ -2178,6 +2237,7 @@ export class ModelRegistry {
 			keylessProviders,
 			discoverableProviders,
 			configuredProviders,
+			error,
 			found: true,
 		};
 	}
@@ -2883,10 +2943,12 @@ export class ModelRegistry {
 			const models = result.models.map(model =>
 				model.provider === options.providerId ? model : { ...model, provider: options.providerId },
 			);
+			// An offline pass only reads the cache: a missing row means "not fetched
+			// yet" (a cold, credential-scoped namespace), not an unreachable provider.
 			const status =
 				result.source === "cache"
 					? "cached"
-					: result.source === "bundled" && result.stale
+					: result.source === "bundled" && result.stale && strategy !== "offline"
 						? "unavailable"
 						: result.source === "bundled"
 							? "idle"
@@ -3363,7 +3425,7 @@ export class ModelRegistry {
 
 	/**
 	 * Get all models (built-in + custom) of one catalog kind.
-	 * If custom config had errors, returns only built-in models. The default
+	 * If models.yml failed to load when the registry was built, custom config is absent; a later reload that fails keeps the last config that loaded. The default
 	 * excludes role-specific runners so existing session callers remain chat-only.
 	 * Pass `"all"` to retrieve the complete catalog.
 	 */
@@ -3507,13 +3569,24 @@ export class ModelRegistry {
 
 	/**
 	 * Whether the provider's configured API key is resolved from a command.
+	 * False for a disabled provider, which gets no credential at all.
 	 *
 	 * Callers use this to distinguish the registry's command-first resolver
 	 * path from lower-priority credentials in {@link authStorage}.
 	 */
 	hasCommandBackedApiKey(provider: string): boolean {
+		if (this.#isProviderDisabled(provider)) return false;
 		const keyConfig = this.#customProviderApiKeys.get(provider);
 		return isCommandConfigValue(keyConfig);
+	}
+
+	/**
+	 * Whether a missing key for the provider means its `!command` apiKey produced
+	 * nothing, which a turn's request reports retryably ({@link turnResolver}).
+	 * False for a provider whose catalog dispatches without a key instead.
+	 */
+	retriesFailedCommandKey(provider: string): boolean {
+		return this.hasCommandBackedApiKey(provider) && !getProviderDefinition(provider)?.allowsMissingApiKey;
 	}
 
 	getDiscoverableProviders(): string[] {
@@ -3755,19 +3828,67 @@ export class ModelRegistry {
 	 * session id (`resolver(model, sessionId)`) which derives `baseUrl`/`modelId`
 	 * from the model. Callers that need the initial key for a guard can call
 	 * `resolveApiKeyOnce(resolver)`.
+	 *
+	 * For a provider whose apiKey is a `!command`, the initial resolve settles as
+	 * soon as the request's signal aborts instead of waiting on the command. Other
+	 * providers resolve as before: a request already scheduled when its signal
+	 * aborts still gets its key.
 	 */
 	resolver(provider: string, options?: ApiKeyResolverOptions): ApiKeyResolver;
 	resolver(model: ApiKeyResolverModel, sessionId?: string): ApiKeyResolver;
 	resolver(target: string | ApiKeyResolverModel, optionsOrSessionId?: ApiKeyResolverOptions | string): ApiKeyResolver {
 		const options = typeof optionsOrSessionId === "string" ? { sessionId: optionsOrSessionId } : optionsOrSessionId;
-		if (typeof target === "string") {
-			return createApiKeyResolver(this, target, options);
-		}
-		return createApiKeyResolver(this, target.provider, {
-			...options,
-			baseUrl: target.baseUrl,
-			modelId: target.id,
-		});
+		const provider = typeof target === "string" ? target : target.provider;
+		const resolve =
+			typeof target === "string"
+				? createApiKeyResolver(this, target, options)
+				: createApiKeyResolver(this, target.provider, { ...options, baseUrl: target.baseUrl, modelId: target.id });
+		return this.settleCommandKeyOnAbort(provider, resolve);
+	}
+
+	/**
+	 * `resolve` with {@link resolver}'s abort handling: for a provider whose apiKey
+	 * is a `!command`, the initial resolve settles as soon as the request's signal
+	 * aborts instead of waiting on the command. Other providers get `resolve`
+	 * itself. A registry view that builds its own resolvers wraps them with this.
+	 */
+	settleCommandKeyOnAbort(provider: string, resolve: ApiKeyResolver): ApiKeyResolver {
+		if (!this.hasCommandBackedApiKey(provider)) return resolve;
+		return async ctx => (ctx.error === undefined ? untilAborted(ctx.signal, async () => resolve(ctx)) : resolve(ctx));
+	}
+
+	/**
+	 * The {@link resolver} for an agent turn's requests. When the provider's
+	 * configured apiKey is a `!command` that produced no key, the initial resolve
+	 * throws {@link ApiKeyCommandError} instead of returning no key, so the turn
+	 * fails retryably and turn recovery runs the command again. Other callers
+	 * keep {@link resolver}, where such a request fails at once as a missing key.
+	 */
+	turnResolver(model: ApiKeyResolverModel, sessionId?: string): ApiKeyResolver {
+		return this.failCommandKeyRetryably(model.provider, this.resolver(model, sessionId));
+	}
+
+	/**
+	 * `resolve` as {@link turnResolver} hands it out: an initial resolve that
+	 * returns no key throws {@link ApiKeyCommandError} when the provider's apiKey
+	 * is a `!command`. A registry view that builds its own resolvers wraps them
+	 * with this.
+	 */
+	failCommandKeyRetryably(provider: string, resolve: ApiKeyResolver): ApiKeyResolver {
+		return async ctx => {
+			const resolved = await resolve(ctx);
+			if (
+				ctx.error === undefined &&
+				resolvedApiKeyBearer(resolved) === undefined &&
+				this.retriesFailedCommandKey(provider)
+			) {
+				throw new ApiKeyCommandError(
+					provider,
+					commandFailureRetryAfterMs(this.#customProviderApiKeys.get(provider)),
+				);
+			}
+			return resolved;
+		};
 	}
 
 	async #peekApiKeyForProvider(provider: string, options?: AuthPeekOptions): Promise<string | undefined> {

@@ -84,6 +84,7 @@ import type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer
 import type { CodeReviewAnnotation, TextReviewAnnotation } from "@oh-my-pi/pi-tui/overlays/annotation-types";
 export type { ComposerShapeDefinition } from "@oh-my-pi/pi-tui/overlays/composer-shape-registry";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { BlockedKind } from "../../utils/run-status";
 import type { EditToolDetails } from "@oh-my-pi/pi-tui/tools/edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
@@ -221,6 +222,18 @@ export function timedOutAskDialogResult(questions: ExtensionAskDialogQuestion[])
 export interface ExtensionUIDialogOptions {
 	signal?: AbortSignal;
 	timeout?: number;
+	/**
+	 * How a surface that reports run state classifies the wait this dialog opens. A dialog's method
+	 * only implies it — an approval a host without an approval dialog raises as a `select` reads as
+	 * a question — so a caller that knows it asks to approve an operation says so here.
+	 */
+	waitKind?: BlockedKind;
+	/**
+	 * The tool call this dialog was raised for, if any. It travels with the wait the dialog opens,
+	 * so a surface tracking that call knows when its own dialog settles instead of inferring it
+	 * from another dialog's words; a host may also use it to place the dialog beside the call.
+	 */
+	toolCallId?: string;
 	/** Invoked when the UI times out while waiting for a selection/input */
 	onTimeout?: () => void;
 	/** Invoked when the UI-managed timeout countdown starts */
@@ -280,6 +293,12 @@ export interface ExtensionCustomOptions {
 	onHandle?: (handle: OverlayHandle) => void;
 	/** Abort the custom UI and reject its promise. */
 	signal?: AbortSignal;
+	/**
+	 * How a surface that reports run state classifies the wait this dialog opens, as on
+	 * {@link ExtensionUIDialogOptions.waitKind}. A custom component carries no title and no method
+	 * that implies one, so a component asking to approve an operation says so here.
+	 */
+	waitKind?: BlockedKind;
 }
 
 /** Wrap the current autocomplete provider with additional behavior (pi-compatible). */
@@ -1409,7 +1428,10 @@ export interface UserPythonEvent {
 // Input Events
 // ============================================================================
 
-/** Fired when the user submits input (interactive mode only). */
+/**
+ * Fired when input is submitted: typed into the interactive TUI (`interactive`), sent as an RPC prompt
+ * (`rpc`), or run by an extension through `sendUserInput` (`extension`).
+ */
 export interface InputEvent {
 	type: "input";
 	text: string;
@@ -1825,6 +1847,56 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
 		? "flex" | "priority"
 		: ServiceTier;
 
+/** An agent registry entry visible to an extension. */
+export interface ExtensionAgentInfo {
+	/**
+	 * Registry id. Usually the agent's name; when that name is already
+	 * registered to another agent (another session's in this process, or this
+	 * session's own from an earlier transcript), the agent is registered under
+	 * a qualified id (`<parent id>/<name>`) instead.
+	 */
+	id: string;
+	status: "running" | "idle" | "parked" | "aborted";
+	kind: "main" | "sub" | "advisor";
+	sessionFile?: string;
+}
+
+/**
+ * Named registry agents available to an extension, scoped to the calling
+ * session: its own agent and that agent's registry descendants, including
+ * persisted children of the session's earlier transcripts (after `/new` or
+ * `ctx.switchSession()`). Agents of other sessions in the same process (ACP
+ * hosts several) are never visible, whatever id is passed.
+ */
+export interface ExtensionAgentsApi {
+	/** Snapshot of the agents visible to this session. */
+	list(): ExtensionAgentInfo[];
+	/**
+	 * Look up a visible agent by registry id or by name. A name resolves to
+	 * this session's own agent even when it is registered under a qualified
+	 * id, preferring the one backed by the session's current transcript over a
+	 * same-named agent from an earlier transcript. Returns `undefined` when no
+	 * visible agent matches.
+	 */
+	get(id: string): ExtensionAgentInfo | undefined;
+	/**
+	 * Revive a parked, idle or killed (`aborted`) agent to a live session, resolving `id` as {@link get}
+	 * does (preferring agents under `parentSessionFile` when that is this
+	 * session's own transcript). When `parentSessionFile` is this session's own
+	 * current transcript and `id` resolves to no visible agent, or only to one
+	 * from an earlier transcript, first rescan the persisted subagent
+	 * transcripts under it. Another session's transcript is never scanned.
+	 * Resolves when the agent is live; rejects when the agent is not visible to
+	 * this session, or with the underlying error if no ref or reviver exists.
+	 */
+	ensureLive(id: string, options?: { parentSessionFile?: string }): Promise<ExtensionAgentInfo>;
+	/**
+	 * Deliver a follow-up turn to a visible live/revivable agent, resolved as
+	 * {@link get} does, without going through the hub UI.
+	 */
+	prompt(id: string, text: string, options?: { deliverAs?: "steer" | "followUp" }): Promise<void>;
+}
+
 /**
  * What holds a keyboard chord, as reported by {@link ExtensionAPI.getShortcutConflict}.
  *
@@ -1863,6 +1935,9 @@ export interface ExtensionAPI {
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
 	pi: typeof PiCodingAgent;
+
+	/** Named registry agents visible to this session. */
+	agents: ExtensionAgentsApi;
 
 	// =========================================================================
 	// Event Subscription
@@ -2131,8 +2206,10 @@ export interface ExtensionAPI {
 	 * an internal continuation that consumes the message on the next turn.
 	 *
 	 * `deliverAs: "aside"` injects the message at the next agent step boundary without interrupting
-	 * the in-flight tool batch; when the session is idle it starts a turn regardless of `triggerTurn`
-	 * (plan mode folds it into context instead).
+	 * the in-flight tool batch; when the session is idle it starts a turn (plan mode, or a user
+	 * interrupt's auto-resume suppression, folds it into context instead). With `triggerTurn: true`,
+	 * an aside no running turn consumes still starts a turn in plan mode and under that suppression;
+	 * only a user interrupt after the send folds it.
 	 */
 	sendMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
@@ -2144,6 +2221,16 @@ export interface ExtensionAPI {
 	 *  batch while streaming, except that it ends a running interruptible `wait`; idle still starts a turn.
 	 *  Rejects with `PromptDroppedError` if the message was not admitted (e.g. abort or cost cap). */
 	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): Promise<void>;
+
+	/**
+	 * Run text as typed input, the way the RPC and ACP modes run a prompt: extension `input` handlers see it
+	 * first (with `source: "extension"`), then `/skill:<name>`, built-in slash commands that run headless,
+	 * extension and custom commands, file slash commands and prompt templates are handled as commands; anything
+	 * else is sent as a user prompt. Resolves once the input is handled or submitted, with how it was handled.
+	 * `tag` is recorded on the message the input submits, so a bridge can match it on
+	 * `message_start`/`message_end`. See {@link SendUserInputResult}.
+	 */
+	sendUserInput(text: string, options?: SendUserInputOptions): Promise<SendUserInputResult>;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
@@ -2373,7 +2460,8 @@ export type SendMessageHandler = <T = unknown>(
 	 * When paired with `triggerTurn: true` during prompt teardown, the session schedules
 	 * an internal continuation without surfacing the message in the editable pending queue.
 	 * `deliverAs: "aside"` injects at the next step boundary without interrupting the in-flight
-	 * tool batch, except that it ends a running interruptible `wait`; idle starts a turn regardless of `triggerTurn` (plan mode folds into context).
+	 * tool batch, except that it ends a running interruptible `wait`; idle starts a turn (plan mode or
+	 * interrupt suppression folds into context unless `triggerTurn` is set and no user interrupt came after the send).
 	 */
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
 ) => void;
@@ -2385,7 +2473,52 @@ export type SendUserMessageHandler = (
 	options?: SendUserMessageOptions,
 ) => Promise<void>;
 
+/** Options for {@link ExtensionAPI.sendUserInput}. */
+export interface SendUserInputOptions {
+	/** How input that submits a message queues while the agent is streaming (default: steer, like Enter). An idle session starts a turn either way. */
+	deliverAs?: "steer" | "followUp" | "aside";
+	/** Caller correlation id recorded as `tag` on the message the input submits. */
+	tag?: string;
+}
+
+/**
+ * How {@link ExtensionAPI.sendUserInput} handled text:
+ * - `prompt`: submitted as a user message (plain text, including slash text that names no command, or a
+ *   template, file slash command, custom command or built-in that produced prompt text); the message carries
+ *   the caller's `tag`.
+ * - `command`: handled locally and submitted nothing itself: a command ran (`output` is what a built-in
+ *   printed), an extension `input` handler consumed the text, or no text was left to send.
+ * - `skill`: `/skill:<name>` was submitted as the user's skill prompt message, carrying the caller's `tag`.
+ * - `terminal-only`: a built-in only the interactive terminal runs (e.g. `/new`, `/resume`); nothing was sent.
+ * - `unavailable`: the host mode does not wire `sendUserInput`, or the interactive session is joined to a collab
+ *   session as a guest, where extension-initiated turns are host-only; nothing was sent or run.
+ */
+export interface SendUserInputResult {
+	handled: "prompt" | "command" | "skill" | "terminal-only" | "unavailable";
+	/** Text a built-in command printed, when it printed any. */
+	output?: string;
+	/** True when a `command` started an agent turn without submitting a message, as `/retry` does. */
+	agentInvoked?: boolean;
+}
+
+export type SendUserInputHandler = (text: string, options?: SendUserInputOptions) => Promise<SendUserInputResult>;
+
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
+
+export type AgentsListHandler = () => ExtensionAgentInfo[];
+
+export type AgentsGetHandler = (id: string) => ExtensionAgentInfo | undefined;
+
+export type AgentsEnsureLiveHandler = (
+	id: string,
+	options?: { parentSessionFile?: string },
+) => Promise<ExtensionAgentInfo>;
+
+export type AgentsPromptHandler = (
+	id: string,
+	text: string,
+	options?: { deliverAs?: "steer" | "followUp" },
+) => Promise<void>;
 
 export type GetActiveToolsHandler = () => string[];
 
@@ -2422,7 +2555,13 @@ export interface ExtensionRuntimeState {
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
 	sendUserMessage: SendUserMessageHandler;
+	/** Optional so SDK embedders that build their own actions keep compiling; unwired, the API answers `unavailable`. */
+	sendUserInput?: SendUserInputHandler;
 	appendEntry: AppendEntryHandler;
+	agentsList?: AgentsListHandler;
+	agentsGet?: AgentsGetHandler;
+	agentsEnsureLive?: AgentsEnsureLiveHandler;
+	agentsPrompt?: AgentsPromptHandler;
 	setLabel: (targetId: string, label: string | undefined) => void;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
@@ -2476,9 +2615,14 @@ export interface ExtensionCommandContextActions {
 	reload: () => Promise<void>;
 }
 
-/** Full runtime = state + actions, including host-compatible service-tier fallbacks. */
+/** Full runtime = state + actions, including host-compatible fallbacks for optional actions. */
 export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {
+	sendUserInput: SendUserInputHandler;
 	getServiceTiers: GetServiceTiersHandler;
+	agentsList: AgentsListHandler;
+	agentsGet: AgentsGetHandler;
+	agentsEnsureLive: AgentsEnsureLiveHandler;
+	agentsPrompt: AgentsPromptHandler;
 	setServiceTier: SetServiceTierHandler;
 }
 

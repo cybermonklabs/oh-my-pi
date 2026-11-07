@@ -220,14 +220,15 @@ describe("registerFileWriteFallback end-to-end (real extension, real session)", 
 
 				// (iii) a subsequent hashline edit on the SAME real path works — this only
 				// holds if the write tool recorded its snapshot under `targetPath` itself
-				// (not a temp path the fallback happened to route through).
+				// (not a temp path the fallback happened to route through). A head insert
+				// anchors no line, so a write tag takes it without a reveal first.
 				const editTool = session.getToolByName("edit") as AgentTool | undefined;
 				expect(editTool).toBeDefined();
-				const editInput = `${headerLine}\nPUT 1-1:\n+export const value = 43;\n`;
+				const editInput = `${headerLine}\nPUT <1:\n+// value\n`;
 				const editResult = await editTool!.execute("call-edit-1", { input: editInput });
 
 				expect(editResult.isError).not.toBe(true);
-				expect(fs.readFileSync(targetPath, "utf8")).toBe("export const value = 43;\n");
+				expect(fs.readFileSync(targetPath, "utf8")).toBe("// value\nexport const value = 42;\n");
 			} finally {
 				fs.chmodSync(lockedDir, 0o700);
 				await session.dispose();

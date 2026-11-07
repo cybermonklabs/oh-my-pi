@@ -29,11 +29,13 @@ import { type SlashCommand, slashCommandCapability } from "../capability/slash-c
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
 import { legacyProviderAllowed } from "./agent-plugin-format";
+import { realpathIfExists, resolveContainedPath } from "./contained-path";
 import {
 	discoverRuleFromMarkdown,
 	createSourceMeta,
 	expandEnvVarsDeep,
 	loadFilesFromDir,
+	parseMcpBooleanField,
 	parseRequestIdFormat,
 	scanSkillsFromDir,
 } from "./helpers";
@@ -45,6 +47,31 @@ const DISPLAY_NAME = "OMP Extension Packages";
 const DESCRIPTION =
 	"Sub-discovery (skills, hooks, tools, commands, rules, prompts, .mcp.json) inside extension packages";
 const PRIORITY = 90;
+
+interface PluginPackage {
+	omp?: unknown;
+	pi?: unknown;
+}
+
+interface PluginSkillDirs {
+	dirs: string[];
+	warnings: string[];
+	/**
+	 * Filesystem-resolved plugin root for containment of manifest-declared
+	 * scans (`null` when the root itself does not resolve; the fallback path
+	 * never containment-scans).
+	 */
+	realRoot: string | null;
+	/**
+	 * True when `dirs` came from the manifest's `skills` field rather than the
+	 * conventional `skills/` fallback. A manifest entry may point directly at a
+	 * skill directory (e.g. `"./skills/foo"` containing `foo/SKILL.md`), not
+	 * only at a collection root — so those entries are scanned with
+	 * `includeSelf`, matching the Claude-manifest loader's handling of the
+	 * same path shape.
+	 */
+	manifestDeclared: boolean;
+}
 
 /**
  * Extension roots this legacy provider may process for a given surface. Roots
@@ -62,22 +89,82 @@ async function allowedRoots(ctx: LoadContext, surface: "skills" | "mcp" | "other
 // Skills
 // =============================================================================
 
+function declaredSkillEntries(manifest: unknown): string[] | null {
+	if (
+		manifest === null ||
+		typeof manifest !== "object" ||
+		Array.isArray(manifest) ||
+		!Object.hasOwn(manifest, "skills")
+	) {
+		return null;
+	}
+	const skills = Object.getOwnPropertyDescriptor(manifest, "skills")?.value;
+	if (!Array.isArray(skills)) return [];
+	return skills.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
+}
+
+async function pluginSkillDirs(root: OmpExtensionRoot): Promise<PluginSkillDirs> {
+	const fallback: PluginSkillDirs = {
+		dirs: [path.join(root.path, "skills")],
+		warnings: [],
+		manifestDeclared: false,
+		realRoot: null,
+	};
+	const realRoot = await realpathIfExists(root.path);
+	if (realRoot === null) return fallback;
+	const packageJson = await resolveContainedPath(realRoot, path.join(realRoot, "package.json"));
+	if (packageJson.status !== "ok") return fallback;
+	const content = await readFile(packageJson.realPath);
+	if (content === null) return fallback;
+	const pluginPkg = tryParseJson<PluginPackage>(content);
+	const entries = declaredSkillEntries(pluginPkg?.omp ?? pluginPkg?.pi);
+	if (entries === null) return fallback;
+
+	const dirs: string[] = [];
+	const warnings: string[] = [];
+	for (const entry of entries) {
+		const resolved = await resolveContainedPath(realRoot, path.resolve(realRoot, entry));
+		if (resolved.status === "ok") {
+			dirs.push(resolved.realPath);
+		} else if (resolved.status === "outside") {
+			warnings.push(`[omp-plugins] Skipping manifest skills directory outside plugin root: ${entry}`);
+		}
+	}
+	return { dirs, warnings, manifestDeclared: true, realRoot };
+}
+
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	const roots = await allowedRoots(ctx, "skills");
-	const results = await Promise.all(
-		roots.map(root =>
-			scanSkillsFromDir(ctx, {
-				dir: path.join(root.path, "skills"),
-				providerId: PROVIDER_ID,
-				level: root.level,
-				requireDescription: true,
-				pluginName: root.name,
-			}),
-		),
+	const perRoot = await Promise.all(
+		roots.map(async root => {
+			const skillDirs = await pluginSkillDirs(root);
+			const results = await Promise.all(
+				skillDirs.dirs.map(dir =>
+					scanSkillsFromDir(ctx, {
+						dir,
+						providerId: PROVIDER_ID,
+						level: root.level,
+						requireDescription: true,
+						pluginName: root.name,
+						// A manifest entry may point directly at a skill directory rather
+						// than a collection root (issue: PR #9379 review) — scan it the
+						// same way the Claude-manifest loader does.
+						includeSelf: skillDirs.manifestDeclared,
+						selfIsBoundary: skillDirs.manifestDeclared,
+						// Manifest-declared directories are containment-checked at the
+						// root; candidates below them (symlinked children included)
+						// must prove the same §4.1 containment before being read.
+						containWithin: skillDirs.manifestDeclared ? (skillDirs.realRoot ?? undefined) : undefined,
+					}),
+				),
+			);
+			return { results, warnings: skillDirs.warnings };
+		}),
 	);
+	const results = perRoot.flatMap(root => root.results);
 	return {
 		items: results.flatMap(r => r.items),
-		warnings: results.flatMap(r => r.warnings ?? []),
+		warnings: [...perRoot.flatMap(root => root.warnings), ...results.flatMap(r => r.warnings ?? [])],
 	};
 }
 
@@ -276,7 +363,8 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 const MCP_FILENAMES = [".mcp.json", "mcp.json"] as const;
 
 interface RawMcpServer {
-	enabled?: boolean;
+	enabled?: boolean | string;
+	lazy?: boolean | string;
 	timeout?: number;
 	requestIdFormat?: unknown;
 	instructions?: unknown;
@@ -346,9 +434,26 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 					`[omp-plugins] MCP server "${serverName}" in ${mcpPath}: invalid instructions ${JSON.stringify(cfg.instructions)}, ignoring`,
 				);
 			}
+			let enabled: boolean | undefined;
+			if (cfg.enabled !== undefined) {
+				enabled = parseMcpBooleanField(cfg.enabled);
+				if (enabled === undefined) {
+					warnings.push(
+						`[omp-plugins] MCP server "${serverName}" in ${mcpPath}: invalid 'enabled' value, ignoring`,
+					);
+				}
+			}
+			let lazy: boolean | undefined;
+			if (cfg.lazy !== undefined) {
+				lazy = parseMcpBooleanField(cfg.lazy);
+				if (lazy === undefined) {
+					warnings.push(`[omp-plugins] MCP server "${serverName}" in ${mcpPath}: invalid 'lazy' value, ignoring`);
+				}
+			}
 			items.push({
 				name: serverName,
-				...(cfg.enabled !== undefined && { enabled: cfg.enabled }),
+				...(enabled !== undefined && { enabled }),
+				...(lazy !== undefined && { lazy }),
 				...(cfg.timeout !== undefined && { timeout: cfg.timeout }),
 				...(requestIdFormat !== undefined && { requestIdFormat }),
 				...(instructions !== undefined && { instructions }),

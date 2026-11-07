@@ -348,6 +348,93 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(await registry.refreshIfStale()).toBe(false);
 	});
 
+	test("refreshIfStale keeps the last models config that parsed while the file is broken", async () => {
+		const gateway = (modelId: string, apiKey: string) => ({
+			gateway: {
+				baseUrl: "http://127.0.0.1:9991",
+				api: "openai-completions",
+				apiKey,
+				models: [{ id: modelId, reasoning: false, input: ["text"] }],
+			},
+		});
+		const bumpMtime = () => {
+			const next = new Date(fs.statSync(modelsJsonPath).mtimeMs + 1_000);
+			fs.utimesSync(modelsJsonPath, next, next);
+		};
+		writeRawModelsJson(gateway("first-model", "first-key"));
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.find("gateway", "first-model")).toBeDefined();
+
+		// A half-saved edit: the file no longer parses.
+		fs.writeFileSync(modelsJsonPath, '{"providers": {"gateway": {"baseUrl": ');
+		bumpMtime();
+		expect(await registry.refreshIfStale()).toBe(true);
+
+		expect(registry.getError()?.message).toContain("Failed to load config file models");
+		expect(registry.find("gateway", "first-model")).toBeDefined();
+		expect(await registry.getApiKeyForProvider("gateway")).toBe("first-key");
+
+		// Fixing the file applies the new config in full, including removals.
+		writeRawModelsJson(gateway("second-model", "second-key"));
+		bumpMtime();
+		expect(await registry.refreshIfStale()).toBe(true);
+
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("gateway", "second-model")).toBeDefined();
+		expect(registry.find("gateway", "first-model")).toBeUndefined();
+		expect(await registry.getApiKeyForProvider("gateway")).toBe("second-key");
+	});
+
+	test("refreshIfStale drops a provider that a valid models config edit removes", async () => {
+		const provider = (baseUrl: string, apiKey: string, modelId: string) => ({
+			baseUrl,
+			api: "openai-completions",
+			apiKey,
+			models: [{ id: modelId, reasoning: false, input: ["text"] }],
+		});
+		writeRawModelsJson({
+			gateway: provider("http://127.0.0.1:9991", "gateway-key", "gateway-model"),
+			other: provider("http://127.0.0.1:9992", "other-key", "other-model"),
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.find("other", "other-model")).toBeDefined();
+
+		writeRawModelsJson({ gateway: provider("http://127.0.0.1:9991", "gateway-key", "gateway-model") });
+		const next = new Date(fs.statSync(modelsJsonPath).mtimeMs + 1_000);
+		fs.utimesSync(modelsJsonPath, next, next);
+		expect(await registry.refreshIfStale()).toBe(true);
+
+		expect(registry.find("other", "other-model")).toBeUndefined();
+		expect(await registry.getApiKeyForProvider("other")).toBeUndefined();
+		expect(registry.find("gateway", "gateway-model")).toBeDefined();
+	});
+
+	test("refreshIfStale does not bring back a deleted models config when a broken one replaces it", async () => {
+		writeRawModelsJson({
+			gateway: {
+				baseUrl: "http://127.0.0.1:9991",
+				api: "openai-completions",
+				apiKey: "first-key",
+				models: [{ id: "first-model", reasoning: false, input: ["text"] }],
+			},
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.find("gateway", "first-model")).toBeDefined();
+
+		fs.rmSync(modelsJsonPath);
+		expect(await registry.refreshIfStale()).toBe(true);
+		expect(registry.find("gateway", "first-model")).toBeUndefined();
+
+		fs.writeFileSync(modelsJsonPath, '{"providers": {"gateway": {"baseUrl": ');
+		const next = new Date(fs.statSync(modelsJsonPath).mtimeMs + 1_000);
+		fs.utimesSync(modelsJsonPath, next, next);
+		expect(await registry.refreshIfStale()).toBe(true);
+
+		expect(registry.getError()?.message).toContain("Failed to load config file models");
+		expect(registry.find("gateway", "first-model")).toBeUndefined();
+		expect(await registry.getApiKeyForProvider("gateway")).toBeUndefined();
+	});
+
 	test("refreshProvider online refreshes expired anthropic OAuth before model discovery", async () => {
 		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
 		await authStorage.credentials.set("anthropic", {
@@ -4159,10 +4246,14 @@ describe("ModelRegistry runtime discovery", () => {
 				supports_vision: false,
 			},
 		];
+		let scopedIds = ["keep-chat-a", "keep-chat-b"];
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "https://catalog.stencil.so/models.json.zstd") {
 				return Response.json({});
+			}
+			if (url === "http://127.0.0.1:4007/v1/models") {
+				return Response.json({ data: scopedIds.map(id => ({ id })) });
 			}
 			if (url === "http://127.0.0.1:4007/model_group/info") {
 				return Response.json({ data: modelGroups });
@@ -4174,7 +4265,7 @@ describe("ModelRegistry runtime discovery", () => {
 			) {
 				return new Response("Not Found", { status: 404 });
 			}
-			throw new Error(`/v1/models must not reintroduce the excluded model: ${url}`);
+			throw new Error(`Unexpected URL: ${url}`);
 		};
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
@@ -4189,6 +4280,7 @@ describe("ModelRegistry runtime discovery", () => {
 		await registry.refreshProvider("litellm", "online");
 		expect(getModelsForProvider(registry, "litellm").map(model => model.id)).toEqual(["keep-chat-a"]);
 
+		scopedIds = ["keep-chat-a"];
 		modelGroups = [{ model_group: "keep-chat-a", mode: "embedding" }];
 		await registry.refreshProvider("litellm", "online");
 		expect(getModelsForProvider(registry, "litellm")).toEqual([]);

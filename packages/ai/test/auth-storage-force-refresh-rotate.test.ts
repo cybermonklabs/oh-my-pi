@@ -251,7 +251,7 @@ describe("AuthStorage forceRefresh + rotateSessionCredential", () => {
 		const row = store.listAuthCredentials(PROVIDER).find(entry => entry.credential.type === "api_key");
 		if (!row) throw new Error("expected stored API key row");
 		const resolved = await authStorage.keys.resolver(PROVIDER)({ lastChance: false, error: undefined });
-		expect(resolved).toEqual({ apiKey: "stored-key", credentialId: row.id });
+		expect(resolved).toEqual({ apiKey: "stored-key", credentialId: row.id, credentialType: "api_key" });
 	});
 
 	test("resolver rotates the credential matching previousKey instead of a stale sticky", async () => {

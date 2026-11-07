@@ -16,6 +16,8 @@ import type {
 	AdoptOptions,
 	AgentLifecycleApi,
 	AgentReleaseOptions,
+	ColdReviveOptions,
+	LiveAgentTarget,
 	PersistedSubagentReviverFactory,
 } from "../../registry/agent-lifecycle";
 import type {
@@ -151,6 +153,10 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 		return this.#remote.callSync("unregister", id, expected);
 	}
 
+	bindLiveName(name: string, targetId: string, sessionFile: string): boolean {
+		return this.#remote.callSync("bindLiveName", name, targetId, sessionFile);
+	}
+
 	get(id: string): AgentRef | undefined {
 		return this.#remote.callSync("get", id);
 	}
@@ -216,8 +222,12 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.call("park", id);
 	}
 
-	ensureLive(id: string): Promise<AgentSessionHandle> {
-		return this.#remote.call("ensureLive", id);
+	ensureLive(id: string, coldRevive?: ColdReviveOptions): Promise<AgentSessionHandle> {
+		return this.#remote.call("ensureLive", id, coldRevive);
+	}
+
+	ensureLiveTarget(id: string, coldRevive?: ColdReviveOptions): Promise<LiveAgentTarget> {
+		return this.#remote.call("ensureLiveTarget", id, coldRevive);
 	}
 
 	release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean> {

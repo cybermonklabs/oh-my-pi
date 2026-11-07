@@ -63,6 +63,9 @@ Current retryable categories include:
 - provider-suggested retry wording, including OpenAI `retry your request` failures
 - network/connection/socket failures, refused/closed connections, upstream connect/reset-before-headers, socket hang up, timeout/timed out, fetch failed, terminated, retry delay wording, and unexpected socket close messages
 - premature upstream WebSocket closure before `response.completed`, including gateway `stream_incomplete` failures delivered inside an HTTP 200 SSE response; terminal HTTP client errors and replay-unsafe output still prevent retry
+- Anthropic's empty-prepaid-balance rejection (`AIError.isCreditBalanceTooLow`): an HTTP 400 whose whole body is the error envelope `{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low…"}}`, or the same rejection as an in-stream `error` event after a 200. The check reads the failed turn's `errorMessage`, the provider's own text; the retry hint and request-dump line omp adds for display live only in `errorDisplayMessage` and never reach it, and nothing is removed from the provider's text to make it parse. No other 400 `invalid_request_error` matches, and neither does a plaintext body, a body with any text after the envelope, nor JSON that sits inside other diagnostic text or lacks the envelope's `type: "error"`
+
+Every retry decision reads the failed turn's `errorMessage` and, for timing, `errorRetryAfterMs` (the delay the response's headers asked for). What omp adds to show a failure — the rejected request's dump path under the logs directory, the `retry-after-ms` suffix, provider-specific explanations — is kept in `errorDisplayMessage` and read only to display it, so text in a HOME or logs path cannot change whether or when a turn is retried.
 
 The normalized classifier recognizes the transient categories above from structured flags/status and provider-aware text patterns. Classifier refusals remain a separate typed `stopDetails` decision.
 
@@ -77,6 +80,7 @@ Retry state is owned by `TurnRecovery`:
 - retry attempt counter (`0` means idle)
 - retry lifecycle promise and resolver
 - retry backoff abort controller
+- stored credentials that already failed with a usage limit in the current retry saga
 
 Flow (`#handleRetryableError`):
 
@@ -84,7 +88,7 @@ Flow (`#handleRetryableError`):
 2. Increment the retry attempt and create the shared retry lifecycle promise on the first attempt.
 3. Calculate whether the current model's retry budget is exhausted.
 4. Classify the error, parse retry timing, and compute capped jittered backoff: `min(retry.baseDelayMs * 2^(attempt-1), 8000ms) * (75–100% jitter)`. Stale OpenAI Responses replay errors reset the provider session and use delay `0`.
-5. For usage limits, apply a successful credential switch or banked Claude/Codex reset immediately when the corresponding reset policy permits it; otherwise wait for the earlier of the provider hint and the next temporarily blocked sibling credential.
+5. For usage limits, apply a successful credential switch or banked Claude/Codex reset immediately when the corresponding reset policy permits it; otherwise wait for the earlier of the provider hint and the next temporarily blocked sibling credential. A claimed credential switch counts only when the failed request's stored credential has not already hit a usage limit in this saga: a repeat means selection served the same account again, so recovery takes the no-sibling path (wait, fail fast, or model fallback). That record starts over when a saga starts, when a user prompt starts, when the retry is cancelled (`abortRetry()`), and when retry machinery changes the model: a fallback applied by recovery or the usage-aware preflight, the Fireworks Fast-to-base switch, or the primary restored after its cooldown. A model change the user makes mid-saga does not reset it. A banked reset removes its credential from the record.
 6. When allowed, consult configured model fallback chains. `retry.fallbackOn` decides whether this error class may (`any`, `usage-limit`, `except-usage-limit`). A switch uses delay `0`; classifier refusals and account-policy denials only continue when a credential or model switch succeeds. Thinking-loop redirects stay on the same model; a temporarily blocked sibling credential within the wait cap is preferred over model fallback.
 7. If the current model's retry budget is exhausted, stop unless a model switch or confirmed credential reset permits continuation. A fallback model receives a fresh retry budget; credential recovery keeps the cumulative count. Known thinking-only stream-close routes have a one-retry cap rather than the full configured budget.
 8. If the final delay exceeds `retry.maxDelayMs` and no credential/model switch happened, emit final failure without sleeping, except an authoritative usage-reset wait explicitly allowed by `retry.waitForUsageReset`.
@@ -130,7 +134,7 @@ Backoff sequence with default settings, before jitter:
 
 The actual local sleep is 75–100% of the nominal value, matching Anthropic-style retry jitter so concurrent sessions do not retry in lockstep.
 
-Delay override inputs can come from parsed retry headers (`retry-after-ms`, `retry-after`, `x-ratelimit-reset-ms`, `x-ratelimit-reset`) or usage-limit backoff. Without provider timing, recognized concurrency/rate-limit reasons can impose their own wait windows. Credential/model fallback switches set delay to `0`; otherwise parsed hints can extend the capped local delay.
+Delay override inputs can come from parsed retry headers (`retry-after-ms`, `retry-after`, `x-ratelimit-reset-ms`, `x-ratelimit-reset`) or usage-limit backoff. Without provider timing, recognized concurrency/rate-limit reasons can impose their own wait windows. An Anthropic credit-balance rejection waits at least 30 seconds, or longer when a provider hint asks for it, then adds up to 7.5 seconds of jitter (`calculateCreditBalanceBackoffMs`). The default budget of 10 retries therefore waits at least 5 minutes in backoff before the error surfaces, and simultaneous failures are spread across a window. If `retry.maxDelayMs` permits the minimum but not the full jitter window, jitter stops at that cap. Those 5 minutes are backoff time, not a limit on elapsed time: request time adds to it, provider-internal retries (for example of a 503) use their own counter, and a model fallback starts a fresh budget. The 30-second floor is a heuristic from two observed outages, not a measured maximum outage length. Credential/model fallback switches set delay to `0`; otherwise parsed hints can extend the capped local delay.
 
 If the delay exceeds `retry.maxDelayMs` and no switch succeeds, retry normally fails immediately. `retry.waitForUsageReset: true` permits a longer usage-limit wait only when timing is authoritative (parsed provider reset timing or a complete usage-report future reset), not a guessed exhaustion backoff. Long waits remain abortable and are chunked to avoid timer overflow; they also hold unattended/subagent runs.
 
@@ -164,6 +168,10 @@ On `auto_retry_start`, EventController (`#handleAutoRetryStart`):
 `Esc` cancellation dispatches on live session state rather than a swapped handler: the input controller checks `viewSession.isRetrying` and calls `viewSession.abortRetry()` (alongside its compaction/handoff abort checks).
 
 On `auto_retry_end` (`#handleAutoRetryEnd`), it stops and clears the `retryLoader` and status container.
+
+Text print mode (`omp -p`) writes the same notice to stderr on `auto_retry_start`, one line per retry, and leaves stdout to the answer: `Retrying (attempt/maxAttempts) in Ns: <reason>`.
+
+A subagent's row in the parent's `task` card shows the same state as `retrying attempt/maxAttempts in Ns: <reason>`, and `auto-retry gave up after N attempts: <reason>` once it stops; the native (Tern) task view and the `omp cleanse` board use the same reason. When the error is a provider's `<status> <JSON body>`, the reason is the status and the body's `error.message`, not the start of the JSON envelope.
 
 ## Streaming and prompt completion behavior
 
@@ -226,8 +234,8 @@ Client helpers:
 
 Session-level retry events:
 
-- `auto_retry_start { attempt, maxAttempts, delayMs, errorMessage, errorId? }`
-- `auto_retry_end { success, attempt, finalError?, retryErrors? }`
+- `auto_retry_start { attempt, maxAttempts, delayMs, errorMessage, errorId? }` (`errorMessage` is the failed turn's own text, without omp's display additions)
+- `auto_retry_end { success, attempt, finalError?, kind?, resetAtMs?, retryErrors? }`
 - `retry_fallback_applied { from, to, role, reason? }`
 - `retry_fallback_succeeded { model, role }`
 
@@ -255,6 +263,9 @@ Propagation:
 Final failure surfacing:
 
 - On max-exceeded, max-delay failure, or cancellation, `auto_retry_end.success === false`
+- A failure that ended on a provider error carrying an error id has `kind`: `AIError.stringify` of the final error id, i.e. kind labels joined by `|` (e.g. `usage-limit`, `transient|usage-limit`), or `status:<code>` for an error known only by its HTTP status; test membership, not equality. Cancellation, the empty-stop cap and local continuation failures carry none
+- The max-exceeded and max-delay failures also carry `resetAtMs`, the latest reset the provider stated for the failing credential: a parsed reset hint from the error text, a complete usage-report window, or an earlier provider-timed block on the same credential. It is never the wait recovery computed, so a sibling account's block, a merged heuristic block and the retry backoff do not set it; with no provider-stated reset, or one outside the `Date` range, it is absent. It covers only the account this run used; another stored account may become usable sooner
+- A subagent copies `kind` and `resetAtMs` into its task result's `retryFailure`, and the parent's `<task-result>` shows them as `<retry-failure kind="…" reset-at="…" />`
 - TUI shows: `Retry failed after N attempts: <finalError>`
 - Extensions/hooks receive `auto_retry_end` with same fields
 - RPC consumers receive same event object on stdout stream

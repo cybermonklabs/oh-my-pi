@@ -840,7 +840,11 @@ describe("openai-codex streaming", () => {
 			const result =
 				transport === "sse" ? (await runCodexSseEvents([failure])).result : await runCodexWebSocketEvent(failure);
 			expect(result.stopReason).toBe("error");
-			expect(extractProviderRetryHint("openai-codex", result.errorMessage)).toBe(expectedDelay);
+			// The response's header timing rides in `errorRetryAfterMs`, not in the
+			// provider's own words, so read it the way turn recovery does.
+			expect(extractProviderRetryHint("openai-codex", result.errorMessage, result.errorRetryAfterMs)).toBe(
+				expectedDelay,
+			);
 		});
 	});
 

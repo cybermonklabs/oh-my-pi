@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import {
 	Agent,
+	agentPauseGate,
 	type AgentEvent,
 	type AgentMessage,
 	type AgentOptions,
@@ -28,7 +29,6 @@ import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import type { DiscoverAuthStorageOptions } from "@oh-my-pi/pi-ai/auth-broker/discover";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { anthropicHostRunsTool } from "@oh-my-pi/pi-ai/providers/anthropic";
-import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
@@ -65,7 +65,7 @@ import type { EffectiveExtensionRoots } from "./capability/types";
 import { type OAuthAccountPools, SessionAccountPoolScope } from "./config/account-pools";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
-import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
+import { isAuthenticated, kNoAuth, ModelRegistry, probeModelApiKey } from "./config/model-registry";
 import {
 	disabledProviderIds,
 	formatModelString,
@@ -79,6 +79,7 @@ import {
 	resolveCliModel,
 	type ResolveCliModelResult,
 	resolveConfiguredModelPatterns,
+	resolveModelOverride,
 	resolveModelRoleValue,
 	resolveSessionModelSelector,
 	sessionModelDiscoveryProviders,
@@ -232,11 +233,14 @@ import {
 import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
+	formatRetryFallbackSelector,
 	installRetryFallbackRole,
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
+	resolveUnavailableModelReplacement,
 } from "./session/retry-fallback-chains";
 import { describeUsageFallback } from "./session/retry-fallback-reason";
+import { kUsageLimitRequestProvider } from "./session/turn-recovery";
 import { getReadableCompactionEntry, getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
 import { SHAPE_RULE } from "./spotlight/shape";
@@ -276,11 +280,14 @@ import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
 	concreteThinkingLevel,
+	modelSupportsEffortCeiling,
 	newSessionThinkingLevel,
 	parseConfiguredThinkingLevel,
 	parseThinkingLevel,
 	resolveConfiguredThinkingLevel,
+	resolveTaskEffortLevel,
 	shouldDisableReasoning,
+	type TaskEffort,
 	toReasoningEffort,
 } from "@oh-my-pi/pi-tui/thinking";
 import {
@@ -431,6 +438,7 @@ import {
 	cfgSnapcompactToolResults,
 	cfgWorkspaceAdditionalDirectories,
 } from "./session/context-settings";
+import { codexPrewarmHold, prewarmUnlessPaused } from "./session/connection-prewarm";
 import {
 	cfgTaskBatch,
 	cfgTaskDisabledAgents,
@@ -660,10 +668,30 @@ export interface CreateAgentSessionOptions {
 	disableModelFallback?: boolean;
 	/** Never opt requests into a provider's optional server-side model fallback. Per-call `model` subagents set it. */
 	disableServerSideFallback?: boolean;
+	/**
+	 * Replace a deferred subagent pattern that cannot serve — absent from the
+	 * catalog, or without working credentials — through its own
+	 * `retry.fallbackChains` key, refusing the session when that chain is empty
+	 * or exhausted, and record any replacement (`modelPatternAuthFallback`
+	 * included) as a fallback. Task spawns set it, and warm revival, which
+	 * rebuilds the session from the spawn's own options, repeats that decision.
+	 * Cold revival leaves it unset and keeps the plain credential fallback to
+	 * the model session_init recorded.
+	 */
+	modelPatternChainFallback?: boolean;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Hard ceiling on the session's thinking effort (e.g. a task spawn's `task.maxEffort`-capped hint); retry-fallback recovery re-clamps to it. */
 	thinkingLevelCeiling?: Effort;
+	/**
+	 * Coarse task-spawn effort mapped onto the effort ladder of the model the
+	 * session settles on, capped by `thinkingLevelCeiling`, for a caller that
+	 * could not resolve the model itself. Takes precedence over `thinkingLevel`
+	 * unless that model has no controllable effort. Session creation throws when
+	 * the model has no effort at or below the ceiling, and a startup fallback
+	 * chain skips such candidates.
+	 */
+	taskEffort?: TaskEffort;
 	/** OpenAI service-tier override for this session. `null` omits `service_tier`. */
 	openAIServiceTier?: ServiceTier | null;
 	/**
@@ -814,6 +842,16 @@ export interface CreateAgentSessionOptions {
 
 	/** Skills. Default: discovered from multiple locations */
 	skills?: Skill[];
+	/**
+	 * Forwarded by a parent session when spawning a subagent so the child
+	 * skips full skill discovery (perf only — not an opt-out request). When
+	 * `skills` is set for this reason, `discoverStartupSkillPaths()` still
+	 * merges directories a subagent's own `resources_discover` handlers
+	 * contribute at its own startup into the inherited snapshot (existing
+	 * names win) instead of leaving them permanently unreachable. Leave unset
+	 * for a caller-supplied fixed snapshot that must stay untouched.
+	 */
+	mergeDiscoveredSkillPaths?: boolean;
 	/** Rules. Default: discovered from multiple locations */
 	rules?: Rule[];
 	/** Context files (AGENTS.md content). Default: discovered walking up from cwd */
@@ -1043,6 +1081,12 @@ export interface CreateAgentSessionResult {
 	mcpManager?: MCPManager;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
+	/**
+	 * Set when startup replaced a requested subagent model (`modelPatternChainFallback`):
+	 * the model that serves instead (provider/id with routing) and the `Fallback:` notice
+	 * saying why. A run's result reports the substitution while that model serves.
+	 */
+	startupModelFallback?: { model: string; reason: string };
 	/** LSP servers detected for startup; warmup may continue in the background */
 	lspServers?: LspStartupServerInfo[];
 	/** Start cache-aware online runtime model discovery after the first UI paint. */
@@ -1080,6 +1124,11 @@ export type * from "./extensibility/extensions";
 export type { Skill } from "./extensibility/skills";
 export type { FileSlashCommand } from "./extensibility/slash-commands";
 export type { MCPManager, MCPServerConfig, MCPServerConnection, MCPToolsLoadResult } from "./mcp";
+// Direct SDK sessions (bypassing every built-in mode) must call this once,
+// after `createAgentSession()` and before the first `session.prompt()`, to
+// get `session_start`/`resources_discover` extension lifecycle events —
+// see docs/sdk.md#extensions.
+export { type InitializeExtensionsOptions, initializeExtensions } from "./modes/runtime-init";
 // Agent registry: pass a private instance per `createAgentSession` when
 // embedding several concurrent top-level sessions in one process (the default
 // global registry admits only one "Main" per process generation).
@@ -1631,6 +1680,8 @@ function createCustomToolsExtension(tools: CustomTool[], sourcePaths?: ReadonlyM
 					success: event.success,
 					attempt: event.attempt,
 					finalError: event.finalError,
+					kind: event.kind,
+					resetAtMs: event.resetAtMs,
 					retryErrors: event.retryErrors,
 				},
 				ctx,
@@ -2260,6 +2311,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	);
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
+	let startupModelFallback: { model: string; reason: string } | undefined;
 	let initialRetryFallback: InitialRetryFallbackState | undefined;
 	let modelPatternRetryFallbackRole: string | undefined;
 	// Identify session model strings to restore in fallback order. We do an
@@ -2307,26 +2359,47 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const taskDepth = options.taskDepth ?? 0;
 
 	// Resolves the session/agent thinking level using the same precedence we
-	// apply at startup: explicit option → persisted session entry → restored
-	// model selector suffix → default role's explicit selector → selected
-	// model's defaultLevel → global settings default. A global `auto` is always
-	// an explicit user choice (the setting defaults to a concrete level), so it
-	// outranks the model's defaultLevel. Run again after extension role reclaim
-	// so the final model's own defaults aren't masked by an earlier fallback
-	// model's.
-	const pickInitialThinkingLevel = (selectedModel: Model | undefined): ConfiguredThinkingLevel | undefined => {
-		let level = options.thinkingLevel;
-		if (level === undefined && hasExistingSession && hasThinkingEntry) {
+	// apply at startup: task effort mapped onto the selected model → explicit
+	// `:level` of the model a deferred pattern settled on → explicit option →
+	// persisted session entry → restored model selector suffix → default role's
+	// explicit selector → selected model's defaultLevel → global settings
+	// default. A global `auto` is always an explicit user choice (the setting
+	// defaults to a concrete level), so it outranks the model's defaultLevel.
+	// Run again after extension role reclaim so the final model's own defaults
+	// aren't masked by an earlier fallback model's. `sessionHistory: false`
+	// picks as a fresh spawn would, ignoring what this session persisted: a
+	// requested model a startup fallback replaced comes back at its own level,
+	// while a revived session's thinking entry records the level of whatever
+	// served last, normally the fallback.
+	let deferredSelectionThinkingLevel: ConfiguredThinkingLevel | undefined;
+	const pickInitialThinkingLevel = (
+		selectedModel: Model | undefined,
+		selectionThinkingLevel: ConfiguredThinkingLevel | undefined,
+		{ sessionHistory = true }: { sessionHistory?: boolean } = {},
+	): ConfiguredThinkingLevel | undefined => {
+		// Throws when the model has nothing at or below the ceiling, exactly as
+		// a spawn whose model was known at dispatch is rejected.
+		// A task spawn passes its agent definition's default as `thinkingLevel`;
+		// the explicit level of the model its deferred pattern settled on
+		// outranks it, as the explicit level of a model resolved at dispatch does.
+		let level =
+			(selectedModel && options.taskEffort !== undefined
+				? resolveTaskEffortLevel(selectedModel, options.taskEffort, options.thinkingLevelCeiling)
+				: undefined) ??
+			selectionThinkingLevel ??
+			options.thinkingLevel;
+		const persistedThinkingEntry = sessionHistory && hasThinkingEntry;
+		if (level === undefined && hasExistingSession && persistedThinkingEntry) {
 			level =
 				parseConfiguredThinkingLevel(existingSession.configuredThinkingLevel) ??
 				parseThinkingLevel(existingSession.thinkingLevel);
 		}
-		if (level === undefined && !hasThinkingEntry && restoredSessionThinkingLevel !== undefined) {
+		if (level === undefined && sessionHistory && !hasThinkingEntry && restoredSessionThinkingLevel !== undefined) {
 			level = restoredSessionThinkingLevel;
 		}
 		if (level !== undefined) return level;
 		const roleLevel =
-			!hasExplicitModel && !hasThinkingEntry && defaultRoleSpec.explicitThinkingLevel
+			!hasExplicitModel && !persistedThinkingEntry && defaultRoleSpec.explicitThinkingLevel
 				? defaultRoleSpec.thinkingLevel
 				: undefined;
 		return newSessionThinkingLevel(
@@ -2335,7 +2408,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			parseConfiguredThinkingLevel(cfgDefaultThinkingLevel.get(settings)),
 		);
 	};
-	let thinkingLevel = pickInitialThinkingLevel(model);
+	let thinkingLevel = pickInitialThinkingLevel(model, deferredSelectionThinkingLevel);
 	let autoThinking = thinkingLevel === AUTO_THINKING;
 	// Concrete level the agent/session start with. With `auto` this is the
 	// provisional level shown until the first per-turn classification resolves;
@@ -2351,7 +2424,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// build). Effective for endpoints known before any request (official
 		// Anthropic); others warm once a request has revealed their real origin.
 		// Every mode benefits (interactive, print, rpc, acp).
-		void prewarmModelConnection(model);
+		prewarmUnlessPaused(model);
 		// Usage-aware credential selection may need a cold remote usage report.
 		// Start only that metadata read while tools/extensions/context are loading;
 		// the selector owns eligibility and still chooses/pins the account at request
@@ -2377,7 +2450,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// model than the one (possibly none) the level above was resolved against,
 	// so the settings default is clamped to the model's actual effort ladder.
 	const adoptThinkingForModel = (selectedModel: Model): void => {
-		thinkingLevel = pickInitialThinkingLevel(selectedModel);
+		thinkingLevel = pickInitialThinkingLevel(selectedModel, deferredSelectionThinkingLevel);
 		autoThinking = thinkingLevel === AUTO_THINKING;
 		effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
 			resolveConfiguredThinkingLevel(selectedModel, thinkingLevel),
@@ -2471,7 +2544,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 	let agent: Agent;
 	const effectiveGetApiKey =
-		options.getApiKey ?? (requestModel => modelRegistry.resolver(requestModel, agent.sessionId));
+		options.getApiKey ?? (requestModel => modelRegistry.turnResolver(requestModel, agent.sessionId));
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
@@ -2485,9 +2558,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// Every root owns its jobs and delivery sinks, even when another root is live.
 	// Children use the exact manager passed by their parent; the singleton remains
 	// only a legacy pointer to whichever root first installed it, never a routing fallback.
+	// `async.maxJobs` caps the running jobs of the root and every subagent under it; 0 lifts the cap.
 	const asyncJobManager = !options.parentTaskPrefix
 		? new AsyncJobManager({
-				maxRunningJobs: () => Math.min(100, cfgAsyncMaxJobs.get(settings)),
+				maxRunningJobs: () => cfgAsyncMaxJobs.get(settings),
 			})
 		: undefined;
 	if (asyncJobManager) {
@@ -2811,10 +2885,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
 		toolSession.localProtocolOptions = localProtocolOptions;
-		toolSession.agentOutputManager = new AgentOutputManager(
-			getArtifactsDir,
-			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,
-		);
+		toolSession.agentOutputManager = new AgentOutputManager(getArtifactsDir, {
+			parentPrefix: options.parentTaskPrefix,
+			storage: sessionManager.getStorage(),
+		});
 
 		// Create built-in tools (already wrapped with meta notice formatting)
 		await logger.time("createAllTools", createTools, toolSession, options.toolNames);
@@ -3146,7 +3220,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						// model: any value derived from the earlier fallback model's
 						// `thinking.defaultLevel` must not become sticky.
 						adoptThinkingForModel(restoredModel);
-						void prewarmModelConnection(restoredModel);
+						prewarmUnlessPaused(restoredModel);
 						return true;
 					}
 				}
@@ -3322,6 +3396,94 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				: allEnabledModels;
 			let usageFallbackTriggered = false;
 			let usageFallbackReason: { from: string; reason: string } | undefined;
+			// A task spawn opts in (`modelPatternChainFallback`): when the model it
+			// requested cannot serve, that model's own retry.fallbackChains entry
+			// decides what replaces it, as it would for a runtime failure, and an
+			// empty or exhausted chain refuses the spawn instead of letting another
+			// model answer as the one requested.
+			const chainFallback = options.modelPatternChainFallback === true;
+			const replaceUnavailableSubagentModel = async (
+				requestedSelector: string,
+				requestedModel: Model | undefined,
+				cause: string,
+			) => {
+				if (!cfgRetryModelFallback.get(settings)) return undefined;
+				const replacement = await resolveUnavailableModelReplacement(
+					{
+						chains: cfgRetryFallbackChains.get(settings),
+						getModelRole: role => settings.getModelRole(role),
+						modelLookup: modelRegistry,
+					},
+					{ selector: requestedSelector, model: requestedModel },
+					// Resolved as runtime fallback recovery resolves an entry, so a
+					// routed (`@upstream`) or fuzzy entry names the same model here.
+					selector =>
+						resolveModelOverride([selector.raw], modelRegistry, settings).model ??
+						modelRegistry.find(selector.provider, selector.id),
+					// The checks runtime fallback recovery makes before it switches to
+					// an entry: a configured credential source, the effort ceiling, then
+					// a key that resolves for this session (a keyless provider passes).
+					// A source that resolves to nothing (an expired token, a failing
+					// `!command`) would fail the first request while a later entry can
+					// serve. Keys resolve in chain order, only up to the chosen entry.
+					async (candidate, selector) => {
+						if (
+							disabledProviders.has(candidate.provider) ||
+							modelRegistry.isSelectorSuppressed(selector.raw) ||
+							!hasModelAuth(candidate) ||
+							(options.thinkingLevelCeiling !== undefined &&
+								!modelSupportsEffortCeiling(candidate, options.thinkingLevelCeiling))
+						) {
+							return false;
+						}
+						try {
+							const key = await modelRegistry.getApiKey(candidate, providerSessionId);
+							return key === kNoAuth || isAuthenticated(key);
+						} catch {
+							return false;
+						}
+					},
+				);
+				if (replacement?.kind !== "refused") return replacement;
+				const chainState =
+					replacement.tried.length === 0 ? "is empty" : `has no usable model (${replacement.tried.join(", ")})`;
+				throw new Error(
+					`Agent "${options.agentName ?? "subagent"}" requested model "${requestedSelector}", which ${cause}, and retry.fallbackChains["${replacement.chainKey}"] ${chainState}, so the subagent was not started.`,
+				);
+			};
+			/**
+			 * Why a subagent's requested model was replaced at startup. A chain
+			 * replacement names the chain (`role`), which becomes the session's
+			 * initial retry fallback; the parent-model fallback names none and arms
+			 * no retry fallback, so a runtime hop away from it restores to it as
+			 * it would for any primary.
+			 */
+			let startupReplacement: { from: string; reason: string; role?: string } | undefined;
+			const describeStartupReplacement = (
+				requestedSelector: string,
+				chainKey: string,
+				cause: string,
+			): { from: string; reason: string; role: string } => ({
+				from: requestedSelector,
+				reason: `${requestedSelector} ${cause}; retry.fallbackChains["${chainKey}"] chose the replacement`,
+				role: chainKey,
+			});
+			// Every deferred selection ends the same way: the session adopts the
+			// model's thinking level, says why a fallback replaced the request,
+			// and warms the model's connection.
+			const settleDeferredModel = (
+				selected: Model,
+				fallback: { from: string; reason: string } | undefined,
+			): void => {
+				adoptThinkingForModel(selected);
+				const target = formatModelSelectorValue(formatModelStringWithRouting(selected), effectiveThinkingLevel);
+				modelFallbackMessage = fallback ? `Fallback: ${fallback.from} -> ${target}\n${fallback.reason}` : undefined;
+				startupModelFallback =
+					fallback && fallback === startupReplacement && modelFallbackMessage
+						? { model: formatModelStringWithRouting(selected), reason: modelFallbackMessage }
+						: undefined;
+				prewarmUnlessPaused(selected);
+			};
 			for (let patternIndex = 0; patternIndex < expandedModelPatterns.length; patternIndex += 1) {
 				const { pattern, retryFallback } = expandedModelPatterns[patternIndex];
 				const primary = parseModelPattern(pattern, resolutionModels, matchPreferences);
@@ -3414,21 +3576,45 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					selectedExplicitThinkingLevel = true;
 				}
 				let authFallbackUsed = false;
-				if (options.modelPatternAuthFallback) {
-					const primaryKey = await modelRegistry.getApiKey(primary.model);
+				// A task spawn checks its requested model's key even without a parent
+				// model to fall back to (a seance passes none), so its own chain still
+				// decides. The session id lets session-sticky OAuth accounts resolve
+				// (#5325): a false "no credentials" here now walks or refuses the chain.
+				// A pool-restricted session rejects instead of resolving nothing, and
+				// that is this model's unavailability, not a startup failure.
+				if (options.modelPatternAuthFallback || chainFallback) {
+					const primaryKey = await probeModelApiKey(modelRegistry, primary.model, providerSessionId);
 					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
-						const fallback = parseModelPattern(
-							options.modelPatternAuthFallback,
-							resolutionModels,
-							matchPreferences,
-						);
-						if (fallback.model) {
-							const fallbackKey = await modelRegistry.getApiKey(fallback.model);
-							if (isAuthenticated(fallbackKey)) {
-								selectedModel = fallback.model;
-								selectedThinkingLevel = fallback.thinkingLevel;
-								selectedExplicitThinkingLevel = fallback.explicitThinkingLevel;
-								authFallbackUsed = true;
+						const cause = "has no working credentials";
+						const replacement = chainFallback
+							? await replaceUnavailableSubagentModel(pattern, primary.model, cause)
+							: undefined;
+						if (replacement) {
+							selectedModel = replacement.model;
+							selectedThinkingLevel = replacement.thinkingLevel;
+							selectedExplicitThinkingLevel = replacement.thinkingLevel !== undefined;
+							authFallbackUsed = true;
+							startupReplacement = describeStartupReplacement(pattern, replacement.chainKey, cause);
+						} else if (options.modelPatternAuthFallback) {
+							const fallback = parseModelPattern(
+								options.modelPatternAuthFallback,
+								resolutionModels,
+								matchPreferences,
+							);
+							if (fallback.model) {
+								const fallbackKey = await probeModelApiKey(modelRegistry, fallback.model, providerSessionId);
+								if (isAuthenticated(fallbackKey)) {
+									selectedModel = fallback.model;
+									selectedThinkingLevel = fallback.thinkingLevel;
+									selectedExplicitThinkingLevel = fallback.explicitThinkingLevel;
+									authFallbackUsed = true;
+									if (chainFallback) {
+										startupReplacement = {
+											from: pattern,
+											reason: `${pattern} ${cause} and ${cfgRetryModelFallback.get(settings) ? "retry.fallbackChains has no key for it" : "retry.modelFallback is off"}, so the parent session's model serves instead`,
+										};
+									}
+								}
 							}
 						}
 					}
@@ -3467,22 +3653,73 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					}
 				}
 				model = selectedModel;
-				initialRetryFallback =
-					retryFallback && usageFallbackTriggered ? { ...retryFallback, pinned: true } : retryFallback;
-				modelFallbackMessage = undefined;
+				// Restoring the requested model reapplies the level the spawn would
+				// have started it at, as restoring a runtime fallback's primary
+				// reapplies the level it ran at; a revived session's persisted level
+				// is the fallback's, so it does not count. A primary with nothing
+				// under the effort ceiling is never restored, and has no such level.
+				const primaryHonorsCeiling =
+					options.thinkingLevelCeiling === undefined ||
+					modelSupportsEffortCeiling(primary.model, options.thinkingLevelCeiling);
+				initialRetryFallback = startupReplacement?.role
+					? {
+							role: startupReplacement.role,
+							// The resolved model, as a runtime fallback records its primary:
+							// the requested spelling (a role value without its provider, or
+							// a fuzzy one) does not parse as a retry fallback selector.
+							originalSelector: formatRetryFallbackSelector(
+								primary.model,
+								primary.explicitThinkingLevel ? concreteThinkingLevel(primary.thinkingLevel) : undefined,
+							),
+							originalThinkingLevel: primaryHonorsCeiling
+								? pickInitialThinkingLevel(
+										primary.model,
+										primary.explicitThinkingLevel ? primary.thinkingLevel : undefined,
+										{ sessionHistory: false },
+									)
+								: primary.thinkingLevel,
+						}
+					: retryFallback && usageFallbackTriggered
+						? { ...retryFallback, pinned: true }
+						: retryFallback;
 				if (selectedExplicitThinkingLevel) {
-					restoredSessionThinkingLevel = selectedThinkingLevel;
+					if (chainFallback) deferredSelectionThinkingLevel = selectedThinkingLevel;
+					else restoredSessionThinkingLevel = selectedThinkingLevel;
 				}
-				adoptThinkingForModel(selectedModel);
-				if (usageFallbackReason) {
-					const target = formatModelSelectorValue(
-						formatModelStringWithRouting(selectedModel),
-						effectiveThinkingLevel,
-					);
-					modelFallbackMessage = `Fallback: ${usageFallbackReason.from} -> ${target}\n${usageFallbackReason.reason}`;
-				}
-				void prewarmModelConnection(selectedModel);
+				settleDeferredModel(selectedModel, startupReplacement ?? usageFallbackReason);
 				break;
+			}
+			if (!model && chainFallback) {
+				const requestedSelector = expandedModelPatterns[0]?.pattern ?? deferredModelPatterns[0];
+				// Every pattern either matched no model or, under usage-aware
+				// fallback, had no usage left.
+				const cause = usageFallbackTriggered ? "has run out of usage" : "matches no available model";
+				const replacement = await replaceUnavailableSubagentModel(requestedSelector, undefined, cause);
+				if (replacement) {
+					const chainReplacement = describeStartupReplacement(requestedSelector, replacement.chainKey, cause);
+					startupReplacement = chainReplacement;
+					model = replacement.model;
+					// No model to pick the spawn's level on yet: restoration picks it
+					// on the model it finds, with a fresh spawn's startup precedence,
+					// as the known-primary branch above does at startup.
+					initialRetryFallback = {
+						role: chainReplacement.role,
+						originalSelector: requestedSelector,
+						originalThinkingLevel: replacement.requestedThinkingLevel,
+						resolveOriginalThinkingLevel: primary =>
+							pickInitialThinkingLevel(primary, replacement.requestedThinkingLevel, { sessionHistory: false }),
+					};
+					if (replacement.thinkingLevel !== undefined) {
+						deferredSelectionThinkingLevel = replacement.thinkingLevel;
+					}
+					settleDeferredModel(replacement.model, startupReplacement);
+				}
+			}
+			if (startupReplacement) {
+				logger.warn("Subagent requested model replaced at startup", {
+					agent: options.agentName,
+					reason: modelFallbackMessage,
+				});
 			}
 			if (!model) {
 				const requested =
@@ -3530,7 +3767,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				// `pickInitialThinkingLevel` closes over `defaultRoleSpec`,
 				// so the role's explicit selector (e.g. `:max`) now applies.
 				adoptThinkingForModel(resolvedDefaultModel);
-				void prewarmModelConnection(resolvedDefaultModel);
+				prewarmUnlessPaused(resolvedDefaultModel);
 				return true;
 			};
 
@@ -3604,7 +3841,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						restoredSessionThinkingLevel = retryFallback.originalThinkingLevel;
 					}
 					adoptThinkingForModel(resolved.model);
-					void prewarmModelConnection(resolved.model);
+					prewarmUnlessPaused(resolved.model);
 					return true;
 				}
 				return false;
@@ -3763,7 +4000,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			createAnnotationsAPI,
 		);
 		// A dialog waits for the user, not the agent: the session lets the display sleep while one is open.
-		const trackUserWait: UserWaitTracker = dialog => (hasSession ? session.waitForUser(dialog) : dialog());
+		const trackUserWait: UserWaitTracker = (dialog, frame) =>
+			hasSession
+				? session.waitForUser(dialog, frame.prompt, {
+						kind: frame.kind,
+						toolCallId: frame.toolCallId,
+						toolCallExecution: frame.toolCallExecution,
+						toolCallOwned: frame.toolCallOwned,
+					})
+				: dialog();
 		extensionRunner.setUserWaitTracker(trackUserWait);
 
 		credentialDisabledTarget = extensionRunner;
@@ -3771,6 +4016,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// Discard return: any handler error is routed through runner.onError listeners.
 			void extensionRunner.emitCredentialDisabled(event);
 		}
+
+		// resources_discover: extensions may contribute skill directories, but the
+		// event's public contract fires it AFTER `session_start` (so handlers that
+		// build state there, or use runtime actions wired by `initialize()`, work
+		// correctly). Session construction happens before any mode calls
+		// `initialize()`/emits `session_start`, so that emission — and the resulting
+		// skill-snapshot refresh — happens later, in `initializeExtensions`
+		// (modes/runtime-init.ts), right after `session_start`.
 
 		// Every tool's result crosses the meta wrapper with this session's tool context, which carries the hook.
 		const spotlightShape: CalledToolShaper | undefined = spotlightExperiment
@@ -4157,6 +4410,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getToolContext: () => toolContextStore.getContext(),
 			mcpResources: cursorMcpResources,
 			emitEvent: event => cursorEventEmitter?.(event),
+			// Cursor resolves calls through its own channel, not the agent loop, so
+			// the bridge binds each execution to this session's agent itself.
+			getExecutionOwner: () => session.agent,
 			getTodoPhases: () => session.getTodoPhases(),
 			commitTodoPhases: phases => session.commitTodoPhases(phases),
 			// `pi_grep` carries its own context width and match cap, which the
@@ -4532,6 +4788,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		}
 
+		// This manager now belongs to a running agent loop, which will write its
+		// journal. The claim is taken here rather than at the first append, and
+		// before the registration below, so the journal is known to be open in
+		// this process from the moment anything can see this agent: a roster scan
+		// must not offer a session running here as a revivable transcript, and a
+		// revive must not reopen it. A resumed pane nobody has typed into yet is
+		// as protected as a busy one.
+		//
+		// A startup that fails from here on (the id collision below, an extension
+		// or model failure, a cancelled launch) has no loop to write anything, so
+		// the claim goes back: left standing, it would outlive this call for the
+		// life of the process and divert the next resume of this very journal to
+		// a sibling file. A manager a running caller already owns keeps its claim.
+		startupCleanup.defer(sessionManager.claimForWriting());
+
 		// Pre-register in the global agent registry BEFORE building the system prompt,
 		// so that subagents launched in the same parallel batch can see each other in
 		// their initial `# IRC Peers` block (rendered inside `rebuildSystemPrompt`).
@@ -4827,6 +5098,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// a session recreate. The single shared host keeps its evidence across
 		// toggles; per-turn coordinator close never touches it.
 		const speculativeToolExecution = createSpeculativeToolExecutionConfig(settings, toolSession, extensionRunner);
+		let mainRequestProvider: string | undefined;
 
 		agent = new Agent({
 			initialState: {
@@ -4857,6 +5129,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getToolContext: tc => toolContextStore.getContext(tc),
 			getApiKey: effectiveGetApiKey,
 			streamFn: (streamModel, context, streamOptions) => {
+				mainRequestProvider = undefined;
 				options.assertDispatchModel?.(streamModel);
 				// The loop checks the cap before each request, but a side request can finish
 				// in between: refuse here, as this run's refusal, before announcing a dispatch.
@@ -4890,6 +5163,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				// The provider calls `onPayload` as it sends, past any wait for an in-flight
 				// slot: the prompt cache entry's lifetime starts there, not here.
 				const onPayload = merged.onPayload;
+				mainRequestProvider = streamModel.provider;
 				const stream = primaryStreamFn(streamModel, context, {
 					...merged,
 					...(fallbackCreditRedemption !== undefined ? { fallbackCreditRedemption } : {}),
@@ -4954,6 +5228,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					: undefined
 				: undefined,
 		});
+		// The main Agent's issued provider is available before AgentSession accounts
+		// for the finalized message, including errors synthesized after a stream throws.
+		agent.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "assistant" && mainRequestProvider !== undefined) {
+				(event.message as typeof event.message & { [kUsageLimitRequestProvider]?: string })[
+					kUsageLimitRequestProvider
+				] = mainRequestProvider;
+			} else if (event.type === "turn_end" || event.type === "agent_end") {
+				mainRequestProvider = undefined;
+			}
+		});
 		// Catalog rows carry the registry settings' extended-window opt-ins; this
 		// session adopts every model with the window its own settings select (a
 		// subagent with a compaction override must not inherit the parent's).
@@ -4964,9 +5249,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// The retry role follows the explicit default entry, as the task executor records it,
 		// so chain lookup prefers the role's chain while resume still restores this model as the default.
 		const retryRole = options.modelRole ?? modelPatternRetryFallbackRole;
-		const recordInitialModelChange = (initialModel: string) => {
-			sessionManager.appendModelChange(initialModel);
-			if (retryRole && retryRole !== "default") sessionManager.appendModelChange(initialModel, retryRole);
+		const recordInitialModelChange = (initialModel: string, resolvedModelIsFallback = false) => {
+			sessionManager.appendModelChange(initialModel, undefined, resolvedModelIsFallback);
+			if (retryRole && retryRole !== "default")
+				sessionManager.appendModelChange(initialModel, retryRole, resolvedModelIsFallback);
 		};
 
 		// Restore messages if session has existing data
@@ -4995,7 +5281,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		} else {
 			// Save initial model, thinking level, and service tier for new sessions so they can be restored on resume.
-			if (model) recordInitialModelChange(`${model.provider}/${model.id}`);
+			if (model) {
+				// A model startup chose in place of the requested one is a fallback,
+				// recorded as such so transcript readers never take it for the request.
+				recordInitialModelChange(
+					`${model.provider}/${model.id}`,
+					initialRetryFallback !== undefined || startupModelFallback !== undefined,
+				);
+			}
 			if (!autoThinking) {
 				// Do not write the `auto` selector before the first turn resolves; auto
 				// classification persists its concrete effort once a real user turn runs.
@@ -5135,6 +5428,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			skillDescriptions,
 			skillWarnings,
 			skillsReloadable: options.skills === undefined,
+			mergeDiscoveredSkillPaths: options.mergeDiscoveredSkillPaths === true,
 			skillsSettings: cfgSkills.get(settings),
 			modelRegistry,
 			allowSessionModelFallback: options.hasUI === true && options.allowSessionModelFallback !== false,
@@ -5524,6 +5818,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			throw new Error(`Agent "${resolvedAgentId}" was replaced during session initialization.`);
 		}
 		hasRegistered = true;
+		// A live agent does not stay on the journal it was built on: `switchSession`
+		// (the resume picker, the extension API, RPC `switch_session`, an ACP load)
+		// hands it another transcript, `newSession` and `/fork` start one, `/move`
+		// relocates it, and a write that finds the file owned elsewhere goes to a
+		// sibling. The ref's `sessionFile` is how the rest of the process tells
+		// which journal this agent runs: the roster scan binds a transcript's name
+		// to the session found on it, and `AgentRegistry.get` keeps that binding
+		// only while the target still runs that file. Left at the file of
+		// construction it would both hide the agent under the name of the
+		// transcript it just adopted and keep the name of the one it left pointing
+		// at it. Follow the manager, which reports every one of those paths.
+		sessionManager.onSessionFileChanged(() => {
+			if (session.isDisposed) return;
+			agentRegistry.attachSession(resolvedAgentId, session, sessionManager.getSessionFile() ?? null, session);
+		});
 		// MCP notification bridge cleanup — assigned when the bridge is wired below,
 		// invoked from the dispose wrapper AND registered as a postmortem so both
 		// explicit-dispose (SDK embedders that reuse the process across sessions) and
@@ -5594,7 +5903,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		if (prewarmModel?.api === "openai-codex-responses") {
 			// `.api` equality doesn't narrow the generic; the guard makes this cast sound.
 			const codexModel = prewarmModel as Model<"openai-codex-responses">;
-			if (isOpenAICodexWebSocketPreferred(codexModel, { preferWebsockets: session.preferWebsockets })) {
+			if (
+				!agentPauseGate.paused &&
+				isOpenAICodexWebSocketPreferred(codexModel, { preferWebsockets: session.preferWebsockets })
+			) {
 				void (async () => {
 					try {
 						const codexPrewarmApiKey = options.getApiKey
@@ -5612,6 +5924,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							preferWebsockets: session.preferWebsockets,
 							providerSessionState: session.providerSessionState,
 							serviceTier: session.effectiveServiceTier(codexModel),
+							beforeDispatch: codexPrewarmHold,
 						});
 					} catch (error) {
 						const errorMessage = error instanceof Error ? error.message : String(error);
@@ -5938,6 +6251,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			setToolUIContext,
 			mcpManager: ownedMcpManager ?? (mcpManager instanceof MCPManager ? mcpManager : undefined),
 			modelFallbackMessage,
+			startupModelFallback,
 			lspServers,
 			startBackgroundModelDiscovery: startRuntimeDiscovery,
 			eventBus,

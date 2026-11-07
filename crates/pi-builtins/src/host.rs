@@ -218,7 +218,12 @@ fn output_handle(file: &OpenFile) -> Option<OpenFile> {
 	}
 }
 
-fn output_metadata(file: &OpenFile) -> Option<Metadata> {
+/// The identity of the file behind a handle, when the handle names one.
+///
+/// The metadata is taken from the handle itself rather than from the path it
+/// was opened by, so two descriptors onto one file compare equal however they
+/// were reached.
+fn handle_metadata(file: &OpenFile) -> Option<Metadata> {
 	match file {
 		// `Metadata::from_file` keeps the handle identity a Windows path stat
 		// drops; without it `path_is_stdout` can never match on Windows.
@@ -237,6 +242,12 @@ impl StdoutFile {
 	/// Whether `path` on `fs` is this file.
 	pub async fn is(&self, fs: &pi_vfs::Fs, path: &Path) -> bool {
 		fs.metadata(path).await.is_ok_and(|candidate| self.0.same_file(&candidate))
+	}
+
+	/// Whether `candidate` — metadata read from an already-open handle — is
+	/// this file.
+	pub fn matches(&self, candidate: &Metadata) -> bool {
+		self.0.same_file(candidate)
 	}
 }
 
@@ -876,10 +887,40 @@ impl Host {
 	/// utility did not set [`Utility::CHECKS_STDOUT_PATH`].
 	pub fn stdout_file(&self) -> Option<StdoutFile> {
 		self.stdout_metadata
-			.get_or_init(|| self.stdout_handle.as_ref().and_then(output_metadata))
+			.get_or_init(|| self.stdout_handle.as_ref().and_then(handle_metadata))
 			.as_ref()
 			.filter(|stdout| stdout.is_file())
 			.map(|stdout| StdoutFile(stdout.clone()))
+	}
+
+	/// Whether the file behind an already-opened handle is the regular file
+	/// currently backing stdout.
+	///
+	/// The handle counterpart of [`Host::path_is_stdout`]: GNU grep's guard
+	/// against reading the file it writes is `SAME_INODE (st, out_stat)` —
+	/// the same inode, not merely the same path — and `st` is what the
+	/// *opened* input descriptor reports, not what the path it was opened by
+	/// reports. Comparing the handle that was opened therefore cannot be
+	/// defeated by a path that is replaced, or a symlink that is retargeted,
+	/// between the check and the open.
+	/// Always `false` unless the utility set [`Utility::CHECKS_STDOUT_PATH`].
+	pub fn opened_is_stdout(&self, opened: &Metadata) -> bool {
+		self.stdout_file().is_some_and(|stdout| stdout.matches(opened))
+	}
+
+	/// Whether standard input is the regular file currently backing stdout.
+	///
+	/// GNU grep's guard against reading the file it writes is `SAME_INODE
+	/// (st, out_stat)` — the same inode, not merely the same path — so the
+	/// comparison is made between the two handles rather than between their
+	/// paths, and a shell redirection (`< file` with `>> file`) is caught
+	/// without ever opening the file again.
+	/// Always `false` unless the utility set [`Utility::CHECKS_STDOUT_PATH`].
+	pub fn stdin_is_stdout(&self) -> bool {
+		let Some(stdout) = self.stdout_file() else {
+			return false;
+		};
+		handle_metadata(self.stdin.file()).is_some_and(|stdin| stdout.matches(&stdin))
 	}
 
 	/// Looks up an exported shell variable.
@@ -961,6 +1002,16 @@ impl Host {
 	pub fn error(&mut self, message: impl std::fmt::Display, code: i32) {
 		let _ = writeln!(self.stderr, "{}: {message}", self.name);
 		self.fail(code);
+	}
+
+	/// Writes `<name>: <message>` to stderr and leaves the exit status alone:
+	/// a disclosure, not a failure.
+	///
+	/// Written through a duplicate of the stream, so a caller holding the
+	/// host immutably can report something it could not determine.
+	pub fn warn(&self, message: impl std::fmt::Display) {
+		let mut stderr = self.stderr_clone();
+		let _ = writeln!(stderr, "{}: {message}", self.name);
 	}
 
 	/// Writes `<name>: <message>` followed by GNU's `Try '<name> --help' for
@@ -1723,6 +1774,16 @@ impl ChildEnv {
 		Ok(command)
 	}
 
+	/// The shell's working directory, for something that resolves a relative
+	/// path the way the shell's children do without starting one.
+	///
+	/// `Err` when the shell sits in a virtual directory, which no process can
+	/// enter.
+	#[cfg(unix)]
+	pub fn native_cwd(&self) -> io::Result<&Path> {
+		native_working_dir(&self.filesystem, &self.cwd)
+	}
+
 	/// Drains a child's piped stderr into the command's standard error on a
 	/// helper thread.
 	///
@@ -2348,7 +2409,7 @@ pub(crate) fn run_caught<U: Utility>(parsed: U, host: &mut Host) -> i32 {
 /// All output the body left pending is delivered before the status is
 /// settled, so a closed reader still ends it with [`SIGPIPE_EXIT_CODE`]; a
 /// cancelled command delivers nothing more.
-async fn run_caught_async<U: AsyncUtility>(parsed: U, host: &mut Host) -> i32 {
+pub(crate) async fn run_caught_async<U: AsyncUtility>(parsed: U, host: &mut Host) -> i32 {
 	let outcome = {
 		let body = AssertUnwindSafe(async { parsed.run(host).await }).catch_unwind();
 		let mut body = pin!(body);
@@ -3074,6 +3135,39 @@ mod testing {
 		assert_eq!(host.resolve("/tmp/probe"), std::env::temp_dir().join("probe"));
 	}
 
+	/// Contract: the identity of the output file is decided on the handle that
+	/// was opened, not on the path it was opened by.
+	///
+	/// GNU grep's guard against reading the file it writes is `SAME_INODE
+	/// (st, out_stat)`, where `st` is what the opened input descriptor
+	/// reports. A path replaced — or a symlink retargeted — between the check
+	/// and the open must therefore not be able to hide that the handle that
+	/// was opened is the output file, so the two checks have to disagree in
+	/// exactly that case.
+	#[tokio::test]
+	async fn an_opened_handle_is_recognised_as_the_output_file_after_its_path_changes() {
+		let tree = tempfile::tempdir().unwrap();
+		let path = tree.path().join("out.txt");
+		std::fs::write(&path, "needle\n").unwrap();
+		let stdout = std::fs::OpenOptions::new()
+			.append(true)
+			.open(&path)
+			.expect("stdout file");
+		let (mut host, _capture) = Host::for_test("grep", "", tree.path());
+		host.set_test_stdout(OpenFile::File(Arc::new(stdout)));
+		// A handle opened on the output file, while the path still names it.
+		let opened = std::fs::File::open(&path).expect("open output file");
+		let opened = pi_vfs::Metadata::from_file(&opened).expect("opened metadata");
+		// A second file, written while the first still exists so the two have
+		// distinct identities, then renamed over the first: the path now names
+		// a different file, while the handle still names the output.
+		let other = tree.path().join("other.txt");
+		std::fs::write(&other, "other\n").unwrap();
+		std::fs::rename(&other, &path).unwrap();
+		assert!(!host.path_is_stdout(&path).await, "the path no longer names the output file");
+		assert!(host.opened_is_stdout(&opened), "the handle still names the output file");
+	}
+
 	/// Parses `argv` and runs `U` against an in-memory host, mirroring what the
 	/// registered builtin does: `argv[0]` is the command name, clap failures are
 	/// reported the same way, and panics are contained.
@@ -3153,6 +3247,63 @@ mod testing {
 		let big = std::fs::File::create(tree.path().join("big")).unwrap();
 		big.set_len(2 * crate::grep::MAX_LINE_BYTES as u64).unwrap();
 		tree
+	}
+
+	/// Runs `script` in a real shell with every builtin registered, from `cwd`
+	/// with `stdin` on fd 0, returning its status, stdout, and stderr.
+	///
+	/// Utilities that set [`Utility::RUNS_COMMANDS`] need this: an in-memory
+	/// [`Host::for_test`] has no shell to run their commands in.
+	pub(crate) async fn run_script(
+		script: &str,
+		stdin: &str,
+		cwd: &std::path::Path,
+	) -> (i32, String, String) {
+		use std::io::Seek;
+
+		use bstr::BString;
+		use pi_shell::{
+			session::{RunStdio, Session, SessionConfig},
+			sys::StdFs,
+		};
+
+		let mut shell = Session::new(SessionConfig {
+			env: std::env::vars_os()
+				.filter(|(name, _)| !name.as_encoded_bytes().starts_with(b"PI_"))
+				.map(|(name, value)| {
+					(BString::from(name.as_encoded_bytes()), BString::from(value.as_encoded_bytes()))
+				})
+				.collect(),
+			cwd: BString::from(cwd.as_os_str().as_encoded_bytes()),
+			fs: Box::new(StdFs::default()),
+			vfs: None,
+			runtime: tokio::runtime::Handle::current(),
+			output_decoding: None,
+		})
+		.expect("test shell");
+
+		let mut input = tempfile::tempfile().expect("stdin file");
+		input.write_all(stdin.as_bytes()).expect("write stdin");
+		input.rewind().expect("rewind stdin");
+		let output = tempfile::tempfile().expect("stdout file");
+		let error = tempfile::tempfile().expect("stderr file");
+		let stdio = RunStdio {
+			stdin: Some(input),
+			stdout: Some(output.try_clone().expect("stdout")),
+			stderr: Some(error.try_clone().expect("stderr")),
+		};
+		let result = shell
+			.run(script, stdio, tokio_util::sync::CancellationToken::new())
+			.await
+			.expect("run test script");
+
+		let read = |mut file: std::fs::File| {
+			let mut text = String::new();
+			file.rewind().expect("rewind capture");
+			file.read_to_string(&mut text).expect("read capture");
+			text
+		};
+		(result.status, read(output), read(error))
 	}
 
 	/// Runs the extra `argv` through [`run`](crate::extras::run) from `cwd`
@@ -3940,7 +4091,7 @@ mod testing {
 
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
+pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_script, run_util};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
 
