@@ -6346,6 +6346,7 @@ dependencies = [
  "pi-ast",
  "pi-diff",
  "pi-iso",
+ "pi-shell",
  "pi-vfs",
  "pi-walker",
  "rand 0.10.3",

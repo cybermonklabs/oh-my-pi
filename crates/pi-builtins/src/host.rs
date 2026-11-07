@@ -3165,6 +3165,63 @@ mod testing {
 		tree
 	}
 
+	/// Runs `script` in a real shell with every builtin registered, from `cwd`
+	/// with `stdin` on fd 0, returning its status, stdout, and stderr.
+	///
+	/// Utilities that set [`Utility::RUNS_COMMANDS`] need this: an in-memory
+	/// [`Host::for_test`] has no shell to run their commands in.
+	pub(crate) async fn run_script(
+		script: &str,
+		stdin: &str,
+		cwd: &std::path::Path,
+	) -> (i32, String, String) {
+		use std::io::Seek;
+
+		use bstr::BString;
+		use pi_shell::{
+			session::{RunStdio, Session, SessionConfig},
+			sys::StdFs,
+		};
+
+		let mut shell = Session::new(SessionConfig {
+			env: std::env::vars_os()
+				.filter(|(name, _)| !name.as_encoded_bytes().starts_with(b"PI_"))
+				.map(|(name, value)| {
+					(BString::from(name.as_encoded_bytes()), BString::from(value.as_encoded_bytes()))
+				})
+				.collect(),
+			cwd: BString::from(cwd.as_os_str().as_encoded_bytes()),
+			fs: Box::new(StdFs::default()),
+			vfs: None,
+			runtime: tokio::runtime::Handle::current(),
+			output_decoding: None,
+		})
+		.expect("test shell");
+
+		let mut input = tempfile::tempfile().expect("stdin file");
+		input.write_all(stdin.as_bytes()).expect("write stdin");
+		input.rewind().expect("rewind stdin");
+		let output = tempfile::tempfile().expect("stdout file");
+		let error = tempfile::tempfile().expect("stderr file");
+		let stdio = RunStdio {
+			stdin: Some(input),
+			stdout: Some(output.try_clone().expect("stdout")),
+			stderr: Some(error.try_clone().expect("stderr")),
+		};
+		let result = shell
+			.run(script, stdio, tokio_util::sync::CancellationToken::new())
+			.await
+			.expect("run test script");
+
+		let read = |mut file: std::fs::File| {
+			let mut text = String::new();
+			file.rewind().expect("rewind capture");
+			file.read_to_string(&mut text).expect("read capture");
+			text
+		};
+		(result.status, read(output), read(error))
+	}
+
 	/// Runs the extra `argv` through [`run`](crate::extras::run) from `cwd`
 	/// with `stdin` on fd 0 and the process environment plus `env`, returning
 	/// its status, stdout, and stderr.
@@ -3950,7 +4007,7 @@ mod testing {
 
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
+pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_script, run_util};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
 
