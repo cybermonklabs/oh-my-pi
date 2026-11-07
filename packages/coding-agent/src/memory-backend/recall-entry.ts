@@ -8,11 +8,17 @@
  * them. Backends that can look memories up again also record which memories
  * the block holds, so a resume can report what changed since as a new message
  * rather than rewriting the block.
+ *
+ * The transcript also keeps the last failed automatic recall, so a session
+ * resumed in a new process waits out the same pause before recalling again.
  */
 import type { SessionEntry } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 
 export const MEMORY_RECALL_ENTRY_TYPE = "memory_recall";
+
+/** Custom entry recording the last failed automatic recall of a scope. */
+export const MEMORY_RECALL_FAILURE_ENTRY_TYPE = "memory_recall_failure";
 
 /**
  * Hidden message reporting what changed in a reused recall's memories. Its details
@@ -37,6 +43,16 @@ export interface PersistedRecall {
 	memories: RecalledMemory[];
 }
 
+/** A failed automatic recall, as last recorded for a scope. */
+export interface RecallFailure {
+	/** When the recall failed, epoch ms. */
+	at: number;
+	/** Consecutive failed recalls up to this one; `0` after a recall answered. */
+	failures: number;
+	/** The failure's cause. */
+	error: string;
+}
+
 /** Details of a {@link MEMORY_RECALL_CHANGES_MESSAGE_TYPE} message. */
 export interface MemoryRecallChangesDetails {
 	scope: string;
@@ -51,6 +67,12 @@ interface MemoryRecallEntryData extends PersistedRecall {
 	 * the same scope, so a backend switch or a cwd move never carries one
 	 * project's memories into another.
 	 */
+	scope: string;
+}
+
+interface MemoryRecallFailureEntryData extends RecallFailure {
+	version: 1;
+	/** Backend and memory banks the recall read, as {@link MemoryRecallEntryData.scope}. */
 	scope: string;
 }
 
@@ -82,6 +104,26 @@ function isMemoryRecallEntryData(data: unknown): data is MemoryRecallEntryData {
 		typeof data.text === "string" &&
 		"memories" in data &&
 		isRecalledMemories(data.memories)
+	);
+}
+
+function isMemoryRecallFailureEntryData(data: unknown): data is MemoryRecallFailureEntryData {
+	return (
+		typeof data === "object" &&
+		data !== null &&
+		"version" in data &&
+		data.version === 1 &&
+		"scope" in data &&
+		typeof data.scope === "string" &&
+		"at" in data &&
+		typeof data.at === "number" &&
+		!Number.isNaN(new Date(data.at).getTime()) &&
+		"failures" in data &&
+		typeof data.failures === "number" &&
+		Number.isInteger(data.failures) &&
+		data.failures >= 0 &&
+		"error" in data &&
+		typeof data.error === "string"
 	);
 }
 
@@ -144,4 +186,45 @@ export function persistRecall(
 		text: recall.text,
 		memories: recall.memories,
 	} satisfies MemoryRecallEntryData);
+}
+
+/**
+ * The latest failed automatic recall recorded for `scope` on the current branch, or
+ * undefined when none was, or a recall of that scope was recorded after it. A context
+ * reset does not end it: the server's health is not conversation state.
+ */
+export function findRecallFailure(
+	sessionManager: Pick<SessionManager, "getBranch">,
+	scope: string,
+): RecallFailure | undefined {
+	const entries: SessionEntry[] = sessionManager.getBranch();
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (entry.type !== "custom") continue;
+		if (entry.customType === MEMORY_RECALL_ENTRY_TYPE) {
+			if (isMemoryRecallEntryData(entry.data) && entry.data.scope === scope) return undefined;
+		} else if (
+			entry.customType === MEMORY_RECALL_FAILURE_ENTRY_TYPE &&
+			isMemoryRecallFailureEntryData(entry.data) &&
+			entry.data.scope === scope
+		) {
+			return { at: entry.data.at, failures: entry.data.failures, error: entry.data.error };
+		}
+	}
+	return undefined;
+}
+
+/** Records the failure state of `scope`'s automatic recall. */
+export function persistRecallFailure(
+	sessionManager: Pick<SessionManager, "appendCustomEntry">,
+	scope: string,
+	failure: RecallFailure,
+): void {
+	sessionManager.appendCustomEntry(MEMORY_RECALL_FAILURE_ENTRY_TYPE, {
+		version: 1,
+		scope,
+		at: failure.at,
+		failures: failure.failures,
+		error: failure.error,
+	} satisfies MemoryRecallFailureEntryData);
 }
