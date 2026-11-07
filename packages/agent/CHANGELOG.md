@@ -7,13 +7,12 @@
 - Steering and follow-ups drained for the next turn now return to their queue when the run is aborted before that turn starts, including while `/pause` holds it, instead of being recorded with no reply ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - `AgentPauseGate.dispatchHold` re-parks when the gate closes again while the caller's own hold waits, carries a synchronous `isClosed` probe the transport reads in the same step as the send, and cancels through the whole composed wait with the caller's abort reason ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - The main loop's own dispatch hold carries that probe too, and fails an aborted request instead of resolving; the remote compaction requests send inside the same step as their hold check and arm their timeout at the wire, so a transport that holds one again does not spend it ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
+## [18.17.0] - 2026-11-06
+
 ### Added
 
-- Added `wireToolsFingerprint()`, a hash of the tool specs a request sends ([#17496](https://github.com/can1357/oh-my-pi/pull/17496) by [@will-bogusz](https://github.com/will-bogusz))
-- Added `Agent.queuedMessageGate`, a synchronous `QueuedMessageGate` consulted before every queued-message delivery batch (it can drop candidates) and told when claimed messages go back undelivered
-### Fixed
-
-- Fixed steering and follow-up queue notifications observing a batch before its preparation claim was installed and missing the transition to delivery, leaving pending-message snapshots stale after asynchronous preparation.
+- Added `Agent.queuedMessageGate` to filter queued messages before delivery and observe claimed messages returned undelivered.
+- Added `wireToolsFingerprint()`, returning a hash of the tool specs sent with a request.
 
 ## [18.16.0] - 2026-11-02
 

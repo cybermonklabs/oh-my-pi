@@ -6,6 +6,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import {
 	buildHeadlessLaunchArgs,
+	closeLaunchedBrowser,
 	DEFAULT_VIEWPORT,
 	ensureChromiumExecutable,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
@@ -110,7 +111,7 @@ async function launchRelayFixture(
 	const browsers: Browser[] = [];
 	async function close() {
 		try {
-			await Promise.all(browsers.map(browser => browser.close()));
+			await Promise.all(browsers.map(browser => closeLaunchedBrowser(browser)));
 		} finally {
 			server.stop();
 			pages.stop(true);

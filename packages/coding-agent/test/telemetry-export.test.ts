@@ -304,6 +304,20 @@ describe("initTelemetryExport with an inherited loopback collector", () => {
 	}, 20_000);
 });
 
+describe("OTLP shutdown", () => {
+	it("releases the process promptly when a collector accepts logs but never responds", async () => {
+		const probe = fileURLToPath(new URL("./fixtures/otel-shutdown-probe.ts", import.meta.url));
+		using home = TempDir.createSync("@omp-otel-probe-home-");
+		const proc = Bun.spawn([process.execPath, probe], {
+			env: probeEnv(home),
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "inherit",
+		});
+		expect(await proc.exited).toBe(0);
+	}, 15_000);
+});
+
 describe("estimateProviderCost", () => {
 	// A Codex subscription request: OTel labels the provider `openai`, and the
 	// response may name a served model rather than the requested one.
