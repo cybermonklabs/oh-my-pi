@@ -613,7 +613,6 @@ describe("Composer prepaint", () => {
 				undefined,
 				undefined,
 				undefined,
-				undefined,
 				lease.composer,
 			);
 			lease.adopt();
@@ -653,7 +652,6 @@ describe("Composer prepaint", () => {
 		const mode = new InteractiveMode(
 			testSession.session,
 			"test",
-			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -714,7 +712,6 @@ describe("Composer prepaint", () => {
 			const mode = new InteractiveMode(
 				testSession.session,
 				"test",
-				undefined,
 				undefined,
 				undefined,
 				undefined,
