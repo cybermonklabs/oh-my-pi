@@ -16,6 +16,7 @@
  * override) declares a lifetime for the retention tier the request used, so
  * providers whose replay behavior is unvalidated are never touched.
  */
+import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import {
 	type Api,
 	type AssistantMessage,
@@ -756,11 +757,16 @@ export class CacheWarmer {
 	async #replay(run: ActiveRun): Promise<AssistantMessage | undefined> {
 		const cutoff = new AbortController();
 		let stream: CacheWarmStream;
+		const replaySignal = AbortSignal.any([run.controller.signal, cutoff.signal]);
 		const onPayload = run.options.onPayload;
 		const replayOptions: SimpleStreamOptions = {
 			...run.options,
 			maxTokens: 1,
-			signal: AbortSignal.any([run.controller.signal, cutoff.signal]),
+			signal: replaySignal,
+			// The armed options carry the agent loop's own hold, bound to a turn
+			// that has ended and to its pause reporting. A refresh is a request of
+			// the warmer's, so `/pause` holds it on the warmer's own lifetime.
+			beforeDispatch: agentPauseGate.dispatchHold(replaySignal),
 			onPayload: (payload, model, signal) => {
 				run.refreshSentAt = Date.now();
 				return onPayload?.(payload, model, signal);

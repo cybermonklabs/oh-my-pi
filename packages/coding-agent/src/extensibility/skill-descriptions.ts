@@ -1,7 +1,8 @@
 import { Database, type Statement } from "bun:sqlite";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type AgentTelemetry, instrumentedCompleteSimple } from "@oh-my-pi/pi-agent-core";
+import { type AgentTelemetry, agentPauseGate, instrumentedCompleteSimple } from "@oh-my-pi/pi-agent-core";
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import {
@@ -13,7 +14,7 @@ import {
 	postmortem,
 	prompt,
 } from "@oh-my-pi/pi-utils";
-import type { ModelRegistry } from "../config/model-registry";
+import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import {
 	resolveConfiguredModelPatterns,
 	resolveProviderModelReference,
@@ -99,8 +100,11 @@ export function createSkillDescriptionCompressor(
 		async compress(_name, _description, request) {
 			const model = select();
 			if (!model) throw new Error("No smol or tiny model available");
-			const apiKey = await registry.getApiKey(model, options.sessionId);
+			const apiKey = await probeModelApiKey(registry, model, options.sessionId);
 			if (!apiKey) throw new Error(`No credential for ${model.provider}/${model.id}`);
+			// The 30 s budget bounds the model, not a human's `/pause`: wait a pause
+			// out before arming it.
+			await agentPauseGate.dispatchHold()();
 			const gate = options.getCostGate?.();
 			gate?.admit();
 			// A refusal inside a provider's retry loop aborts the request, so no retry
@@ -113,6 +117,8 @@ export function createSkillDescriptionCompressor(
 				refused.abort(error);
 				throw error;
 			};
+			const signal = AbortSignal.any([AbortSignal.timeout(30_000), refused.signal]);
+			const beforeDispatch = agentPauseGate.dispatchHold(signal, gate ? refuseAttempt : undefined);
 			let response: AssistantMessage;
 			try {
 				response = await instrumentedCompleteSimple(
@@ -126,9 +132,12 @@ export function createSkillDescriptionCompressor(
 						maxTokens: 1024,
 						disableReasoning: true,
 						temperature: 0,
-						signal: AbortSignal.any([AbortSignal.timeout(30_000), refused.signal]),
-						beforeDispatch: gate ? refuseAttempt : undefined,
-						fetch: gate ? transportFetch(model, undefined, refuseAttempt) : undefined,
+						signal,
+						// Held at the provider boundary too. A pause engaged once the
+						// budget runs can still expire it; that compression fails and
+						// is retried at the next prompt render, like any failed one.
+						beforeDispatch,
+						fetch: gate ? transportFetch(model, undefined, beforeDispatch) : undefined,
 						onAttempt: message => gate?.record(message.usage.cost.total),
 					},
 					{ telemetry: options.getTelemetry?.(), oneshotKind: "skill_description" },
@@ -142,7 +151,7 @@ export function createSkillDescriptionCompressor(
 				throw new SkillDescriptionLengthError("Model stopped: length");
 			}
 			if (response.stopReason !== "stop") {
-				throw new Error(`Model stopped: ${response.stopReason} ${response.errorMessage ?? ""}`);
+				throw new Error(`Model stopped: ${response.stopReason} ${errorDisplayText(response) ?? ""}`);
 			}
 			return response.content
 				.filter(block => block.type === "text")

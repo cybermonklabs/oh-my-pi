@@ -133,6 +133,7 @@ it("keeps the previous process's request as the resumed request prefix", async (
 	await seed.flush();
 	const file = seed.getSessionFile();
 	if (!file) throw new Error("Expected a persisted session");
+	await seed.close();
 
 	/** One `omp -p --continue` process: prompt once, optionally record an eval call. */
 	const runProcess = async (text: string, evalCallId?: string): Promise<Message[]> => {
@@ -140,6 +141,8 @@ it("keeps the previous process's request as the resumed request prefix", async (
 		const request = await promptOnce(proc, text);
 		if (evalCallId) appendEval(proc.manager, evalCallId);
 		await proc.manager.flush();
+		// The process ends here; the next one resumes the file from scratch.
+		await proc.manager.close();
 		return request;
 	};
 
@@ -177,6 +180,9 @@ it("keeps a snapshot appended by an in-process history rewrite across resume", a
 	await seed.flush();
 	const file = seed.getSessionFile();
 	if (!file) throw new Error("Expected a persisted session");
+	// One journal, one writer per process (this member): the seeding manager
+	// ends before the live process opens the same file, as the test above does.
+	await seed.close();
 
 	const live = await openProcess(file, sessionDir, registry, "live");
 	await promptOnce(live, "Reply OK 1.");
