@@ -774,6 +774,7 @@ export function createAcpExtensionUiContext(
 		},
 		onTerminalInput: () => () => {},
 		rerenderMessage: () => {},
+		refreshTranscript: () => {},
 		getLinkClicksAvailable: () => false,
 		setStatus: () => {},
 		setWorkingMessage: () => {},

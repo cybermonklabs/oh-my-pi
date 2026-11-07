@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [18.17.0] - 2026-11-06
+
 ### Added
 
 - Added `errorDisplayMessage` and `errorRetryAfterMs` to the proxy `error` event, copied onto the failed turn so a proxied failure keeps omp's shown text and the response's header retry delay apart from the provider's `errorMessage` ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
@@ -10,6 +12,8 @@
 ### Fixed
 
 - Fixed steering and follow-up queue notifications observing a batch before its preparation claim was installed and missing the transition to delivery, leaving pending-message snapshots stale after asynchronous preparation.
+- Added `Agent.queuedMessageGate` to filter queued messages before delivery and observe claimed messages returned undelivered.
+- Added `wireToolsFingerprint()`, returning a hash of the tool specs sent with a request.
 
 ## [18.16.0] - 2026-11-02
 

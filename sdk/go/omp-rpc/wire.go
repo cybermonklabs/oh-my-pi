@@ -2616,6 +2616,8 @@ type BashResult struct {
 	Minimized     map[string]json.RawMessage `json:"minimized,omitempty"`
 	WorkingDir    *string                    `json:"workingDir,omitempty"`
 	Images        []ImageContent             `json:"images,omitempty"`
+	// The embedded shell's final `ShellTrace` of the run; only when the caller asked for one.
+	Trace map[string]json.RawMessage `json:"trace,omitempty"`
 }
 
 func (v *BashResult) UnmarshalJSON(data []byte) error {
@@ -2646,6 +2648,7 @@ func (v *BashResult) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("minimized", &out.Minimized)
 	d.optional("workingDir", &out.WorkingDir)
 	d.optional("images", &out.Images)
+	d.optional("trace", &out.Trace)
 	if d.err != nil {
 		return d.err
 	}
