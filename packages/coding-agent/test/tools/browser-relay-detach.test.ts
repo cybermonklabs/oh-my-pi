@@ -5,9 +5,10 @@ import * as toolBridge from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import {
+	buildHeadlessLaunchArgs,
 	closeLaunchedBrowser,
+	DEFAULT_VIEWPORT,
 	ensureChromiumExecutable,
-	RENDERER_PRIORITY_ARGS,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { DISCARDED_TABS_PROTOCOL_VERSION } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
@@ -265,10 +266,13 @@ describe("relay tabs Chrome detaches omp from", () => {
 		if (!CHROMIUM_AVAILABLE) return;
 		const executablePath = await ensureChromiumExecutable();
 		if (!executablePath) throw new Error("Chromium executable missing");
+		// The product's own argv, sandbox flags included: on a host that forbids unprivileged
+		// user namespaces Chrome aborts at startup without them, though `chromiumAvailable`
+		// (which launches with `--no-sandbox`) reported it usable.
 		chromium = await puppeteer.launch({
 			executablePath,
 			headless: true,
-			args: ["--no-first-run", ...RENDERER_PRIORITY_ARGS],
+			args: [...buildHeadlessLaunchArgs(DEFAULT_VIEWPORT), "--no-first-run"],
 		});
 		site = Bun.serve({
 			hostname: "127.0.0.1",
@@ -489,6 +493,19 @@ describe("relay tabs Chrome detaches omp from", () => {
 			}
 		},
 		60_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"re-adopts a kept relay tab after release and reads the state left on it",
+		async () => {
+			await openRelayTab();
+			for (let attempt = 0; attempt < 4; attempt++) {
+				await releaseTab(name, { keepPage: true });
+				await invoke({ action: "open", app: { relay: true, target: "case=" }, timeout: 20 });
+				expect((await invoke(readMark)).value).toBe("kept");
+			}
+		},
+		120_000,
 	);
 
 	it.skipIf(!CHROMIUM_AVAILABLE)(

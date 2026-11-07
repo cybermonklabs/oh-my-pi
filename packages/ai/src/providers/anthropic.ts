@@ -88,8 +88,9 @@ import {
 } from "../utils/block-symbols";
 import { withReplaySafeStreamRetry } from "../utils/empty-completion-retry";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
+import { finalizeErrorDisplayMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import {
+	armPreResponseTimeout,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
@@ -153,7 +154,7 @@ import { prepareAnthropicImageContext } from "./anthropic-images";
 import { isAnthropicNarrationSignature, servedModelFromAnthropicSignature } from "./anthropic-signature";
 import { getOpenAIPromptCacheKey } from "./openai-shared";
 import { applyInferenceHeaders } from "./inference-headers";
-import { redactSensitiveCredentials, transformMessages } from "./transform-messages";
+import { hasAnthropicMessageControls, redactSensitiveCredentials, transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 import {
 	injectedClientBaseUrl,
@@ -1833,13 +1834,20 @@ function applyReportedInputTransformations(
  * `compat.replayUnsignedThinking` override). The default is native replay for
  * the 3p reasoning majority (#2005); this hint turns the misconfigured-proxy
  * case into a one-line fix instead of a silent retry loop (#4297).
+ *
+ * The check reads `message`, the provider's text; the hint is prepended to
+ * `display`, the text omp shows for it.
  */
-export function maybeAddReplayUnsignedThinkingHint(model: Model<"anthropic-messages">, message: string): string {
-	if (!isInvalidThinkingSignatureError(message) || isThinkingPrefixBindingError(message)) return message;
-	if (model.compat.officialEndpoint) return message;
-	if (model.compatConfig?.replayUnsignedThinking !== undefined) return message;
+export function maybeAddReplayUnsignedThinkingHint(
+	model: Model<"anthropic-messages">,
+	message: string,
+	display: string = message,
+): string {
+	if (!isInvalidThinkingSignatureError(message) || isThinkingPrefixBindingError(message)) return display;
+	if (model.compat.officialEndpoint) return display;
+	if (model.compatConfig?.replayUnsignedThinking !== undefined) return display;
 	const hint = `Provider "${model.provider}" looks like an Anthropic-compatible signing proxy: it rejected a replayed unsigned thinking block. Set \`compat.replayUnsignedThinking: false\` under \`providers.${model.provider}\` in your models.yml and retry. See https://github.com/can1357/oh-my-pi/issues/4297.`;
-	return `${hint}\n\n${message}`;
+	return `${hint}\n\n${display}`;
 }
 
 /**
@@ -2488,7 +2496,7 @@ const streamAnthropicOnce = (
 				output.model = sourceModel.id;
 				output.responseId = undefined;
 				output.upstreamModel = undefined;
-				output.errorMessage = undefined;
+				AIError.clearErrorText(output);
 				output.stopDetails = undefined;
 				output.inputTransformations = undefined;
 				output.providerPayload = undefined;
@@ -2685,25 +2693,36 @@ const streamAnthropicOnce = (
 							),
 						}
 					: perRequestHeaders;
+				// The provider's own first-byte budget, for every client including a
+				// caller's that ignores `timeout`. A guard rather than a plain timer:
+				// it rides on the request signal, so the transport stops its clock
+				// while the request is prepared and parked on a dispatch hold, and
+				// `stream` (which a stream watchdog may observe) reports that time
+				// as ours rather than the provider's.
+				const requestGuard = armPreResponseTimeout(requestSignal, requestTimeoutMs, stream);
+				const guardedRequestSignal = requestGuard.signal ?? requestSignal;
+				const requestTracker = activeAbortTracker;
+				requestGuard.onAbort(() => {
+					if (!requestSignal.aborted) requestTracker.abortLocally(firstEventTimeoutAbortError);
+				});
 				const requestOptions = {
-					...createSdkStreamRequestOptions(requestSignal, requestTimeoutMs),
+					...createSdkStreamRequestOptions(guardedRequestSignal, requestTimeoutMs),
 					maxRetries: 0,
 					...(requestHeaders ? { headers: requestHeaders } : {}),
 				};
-				const anthropicRequest: unknown =
-					isOAuthToken && client.beta
-						? client.beta.messages.create({ ...wireParams, stream: true }, requestOptions)
-						: client.messages.create({ ...wireParams, stream: true }, requestOptions);
+				let anthropicRequest: unknown;
+				try {
+					anthropicRequest =
+						isOAuthToken && client.beta
+							? client.beta.messages.create({ ...wireParams, stream: true }, requestOptions)
+							: client.messages.create({ ...wireParams, stream: true }, requestOptions);
+				} catch (error) {
+					requestGuard.clear();
+					throw error;
+				}
 				let streamedReplayUnsafeContent = false;
 
 				try {
-					let requestTimeout: NodeJS.Timeout | undefined;
-					if (requestTimeoutMs !== undefined) {
-						requestTimeout = setTimeout(
-							() => activeAbortTracker.abortLocally(firstEventTimeoutAbortError),
-							requestTimeoutMs,
-						);
-					}
 					let anthropicStream: AsyncIterable<AnthropicStreamEvent>;
 					let response: Response;
 					let requestId: string | null;
@@ -2721,8 +2740,12 @@ const streamAnthropicOnce = (
 						}
 						throw error;
 					} finally {
-						if (requestTimeout !== undefined) clearTimeout(requestTimeout);
+						requestGuard.clear();
 					}
+					// One first-event budget runs from the wire to the first event: the
+					// guard spent the part before headers, and the event iterator below
+					// waits on what it left, not on a fresh budget.
+					const firstEventBudgetLeftMs = requestGuard.remaining() ?? firstEventTimeoutMs;
 					await notifyProviderResponse(options, response, sourceModel, requestId);
 					if (slowMode) {
 						const slowSignal = parseAnthropicSlowModeHeaders(response.headers);
@@ -2775,7 +2798,7 @@ const streamAnthropicOnce = (
 							: undefined;
 					const timedAnthropicStream = iterateWithIdleTimeout(anthropicStream, {
 						idleTimeoutMs,
-						firstItemTimeoutMs: firstEventTimeoutMs,
+						firstItemTimeoutMs: firstEventBudgetLeftMs,
 						errorMessage: idleTimeoutAbortError.message,
 						firstItemErrorMessage: firstEventTimeoutAbortError.message,
 						onIdle: () => activeAbortTracker.abortLocally(idleTimeoutAbortError),
@@ -3306,7 +3329,7 @@ const streamAnthropicOnce = (
 						// success (consumers treat its presence as failure).
 						logger.warn("anthropic: strict tools rejected, retrying without strict tools", {
 							model: model.id,
-							error: await finalizeErrorMessage(streamFailure, rawRequestDump),
+							error: await finalizeErrorDisplayMessage(streamFailure, rawRequestDump),
 						});
 						if (providerSessionState) {
 							providerSessionState.strictToolsDisabled = true;
@@ -3392,7 +3415,7 @@ const streamAnthropicOnce = (
 						output.model = sourceModel.id;
 						output.responseId = undefined;
 						output.upstreamModel = undefined;
-						output.errorMessage = undefined;
+						AIError.clearErrorText(output);
 						output.providerPayload = undefined;
 						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
 						output.stopReason = "stop";
@@ -3420,7 +3443,7 @@ const streamAnthropicOnce = (
 						output.model = sourceModel.id;
 						output.responseId = undefined;
 						output.upstreamModel = undefined;
-						output.errorMessage = undefined;
+						AIError.clearErrorText(output);
 						output.inputTransformations = undefined;
 						output.providerPayload = undefined;
 						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
@@ -3463,7 +3486,7 @@ const streamAnthropicOnce = (
 							output.model = sourceModel.id;
 							output.responseId = undefined;
 							output.upstreamModel = undefined;
-							output.errorMessage = undefined;
+							AIError.clearErrorText(output);
 							output.inputTransformations = undefined;
 							output.providerPayload = undefined;
 							output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
@@ -3498,7 +3521,7 @@ const streamAnthropicOnce = (
 						output.model = sourceModel.id;
 						output.responseId = undefined;
 						output.upstreamModel = undefined;
-						output.errorMessage = undefined;
+						AIError.clearErrorText(output);
 						output.providerPayload = undefined;
 						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
 						output.stopReason = "stop";
@@ -3539,7 +3562,7 @@ const streamAnthropicOnce = (
 						output.content.length = 0;
 						output.model = sourceModel.id;
 						output.responseId = undefined;
-						output.errorMessage = undefined;
+						AIError.clearErrorText(output);
 						output.inputTransformations = undefined;
 						output.providerPayload = undefined;
 						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
@@ -3567,7 +3590,7 @@ const streamAnthropicOnce = (
 						output.model = sourceModel.id;
 						output.responseId = undefined;
 						output.upstreamModel = undefined;
-						output.errorMessage = undefined;
+						AIError.clearErrorText(output);
 						output.providerPayload = undefined;
 						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
 						output.stopReason = "stop";
@@ -3607,7 +3630,7 @@ const streamAnthropicOnce = (
 						output.content.length = 0;
 						output.model = sourceModel.id;
 						output.responseId = undefined;
-						output.errorMessage = undefined;
+						AIError.clearErrorText(output);
 						output.providerPayload = undefined;
 						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
 						output.stopReason = "stop";
@@ -3671,7 +3694,7 @@ const streamAnthropicOnce = (
 						output.content.length = 0;
 						output.model = sourceModel.id;
 						output.responseId = undefined;
-						output.errorMessage = undefined;
+						AIError.clearErrorText(output);
 						output.providerPayload = undefined;
 						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
 						output.stopReason = "stop";
@@ -3724,7 +3747,7 @@ const streamAnthropicOnce = (
 					output.content.length = 0;
 					output.model = sourceModel.id;
 					output.responseId = undefined;
-					output.errorMessage = undefined;
+					AIError.clearErrorText(output);
 					output.stopDetails = undefined;
 					output.providerPayload = undefined;
 					output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
@@ -3810,15 +3833,18 @@ const streamAnthropicOnce = (
 				abortTracker: activeAbortTracker,
 				rawRequestDump,
 			});
-			output.stopReason = result.stopReason;
-			output.errorStatus = result.status;
-			output.errorId = result.id;
-			output.errorMessage = transport ? result.message : maybeAddReplayUnsignedThinkingHint(model, result.message);
+			// The replay remediation is omp's text: shown, never classified.
+			const shown = result.displayMessage ?? result.message;
+			AIError.applyFinalizeResult(
+				output,
+				result,
+				transport ? shown : maybeAddReplayUnsignedThinkingHint(model, result.message, shown),
+			);
 			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({
 				type: "error",
-				reason: output.stopReason,
+				reason: result.stopReason,
 				error: retained === output.content ? output : { ...output, content: retained },
 			});
 			stream.end();
@@ -5934,10 +5960,7 @@ export function convertAnthropicMessages(
 				msg.role === "developer" && msg.providerPayload?.type === "anthropicMessage"
 					? msg.providerPayload
 					: undefined;
-			const hasProviderControls =
-				payload?.clearAt !== undefined ||
-				payload?.effort !== undefined ||
-				(payload?.toolChanges !== undefined && payload.toolChanges.length > 0);
+			const hasProviderControls = hasAnthropicMessageControls(msg);
 
 			let content: string | ContentBlockParam[];
 			if (typeof msg.content === "string") {
