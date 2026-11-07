@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { SQL } from "bun";
 import type { SessionData } from "../src/export/html";
 import {
 	buildShareSnapshot,
@@ -12,6 +13,7 @@ import {
 import { SecretObfuscator } from "../src/secrets/obfuscator";
 import type { SessionEntry, SessionHeader } from "../src/session/session-entries";
 import { SessionManager } from "../src/session/session-manager";
+import { SqlSessionStorage } from "../src/session/sql-session-storage";
 
 const IV_LENGTH = 12;
 const TEST_MAX_SEALED_BYTES = 4_000;
@@ -309,6 +311,53 @@ describe("buildShareSnapshot", () => {
 		expect(flat).not.toContain(serverToolSentinel);
 		// Source entries keep the real values; redaction is share-only.
 		expect(JSON.stringify(entries)).toContain(secret);
+	});
+
+	test("redacts omp's display error text and drops the provider text older sessions kept apart", () => {
+		const secret = "share-error-secret";
+		const ts = new Date(0).toISOString();
+		const entries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "a1",
+				parentId: null,
+				timestamp: ts,
+				message: {
+					role: "assistant",
+					content: [],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "test",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "error",
+					errorMessage: `400 key ${secret} rejected`,
+					errorDisplayMessage: `400 key ${secret} rejected\nraw-http-request=/home/${secret}/dump.json`,
+					// An older session file: omp stored the provider's text under this name.
+					errorClassificationMessage: `400 key ${secret} rejected`,
+					timestamp: 1,
+				},
+			} as unknown as SessionEntry,
+		];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "a1",
+		} as unknown as SessionManager;
+
+		const flat = JSON.stringify(
+			buildShareSnapshot(sm, { obfuscator: new SecretObfuscator([{ type: "plain", content: secret }]) }),
+		);
+
+		expect(flat).not.toContain(secret);
+		expect(flat).not.toContain("errorClassificationMessage");
+		expect(flat).toContain("raw-http-request=");
 	});
 
 	test("redacts every title-change field before sharing", () => {
@@ -742,4 +791,65 @@ describe("share command", () => {
 		expect(stderr).toBe(`Session "${sessionArg}" not found.\n`);
 		expect(await Bun.file(missingSession).exists()).toBe(false);
 	});
+
+	test("shares a session the configured SQL storage holds", async () => {
+		using tempDir = TempDir.createSync("@omp-share-sql-");
+		let uploaded: Uint8Array<ArrayBuffer> | null = null;
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				uploaded = new Uint8Array(await req.arrayBuffer());
+				return Response.json({ id: "sqlshareid001" });
+			},
+		});
+		try {
+			const agentDir = path.join(tempDir.path(), "agent");
+			await Bun.write(path.join(agentDir, "config.yml"), `share:\n  serverUrl: http://localhost:${server.port}\n`);
+			// What `session.storage: sql` reads: the database named by the connection-string file.
+			const database = `sqlite://${path.join(tempDir.path(), "sessions.db")}`;
+			const dsnFile = path.join(tempDir.path(), "dsn");
+			await Bun.write(dsnFile, `${database}\n`);
+			const sessionFile = path.join(tempDir.path(), "sessions/--project--/2026-10-04T00-00-00-000Z_sql-share.jsonl");
+			const client = new SQL(database);
+			const storage = await SqlSessionStorage.create({ client });
+			const header = {
+				type: "session",
+				version: 3,
+				id: "sql-share",
+				timestamp: "2026-10-04T00:00:00.000Z",
+				cwd: tempDir.path(),
+			};
+			const entry = messageEntry("u1", null, "only in the table");
+			await storage.writeText(sessionFile, `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`);
+			await client.end();
+
+			const proc = Bun.spawn([process.execPath, CLI_ENTRY, "share", sessionFile], {
+				cwd: tempDir.path(),
+				env: {
+					...process.env,
+					NO_COLOR: "1",
+					PI_CODING_AGENT_DIR: agentDir,
+					OMP_SESSION_STORAGE: "sql",
+					OMP_SESSION_SQL_DSN_FILE: dsnFile,
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [exitCode, stdout, stderr] = await Promise.all([
+				proc.exited,
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+			]);
+
+			expect(exitCode, stderr).toBe(0);
+			const keyText = stdout.match(/#(\S+)/)?.[1] ?? "";
+			const key = await crypto.subtle.importKey("raw", Buffer.from(keyText, "base64url"), "AES-GCM", false, [
+				"decrypt",
+			]);
+			const opened = await open(key, uploaded as unknown as Uint8Array<ArrayBuffer>);
+			expect(JSON.stringify(opened)).toContain("only in the table");
+		} finally {
+			server.stop(true);
+		}
+	}, 30_000);
 });

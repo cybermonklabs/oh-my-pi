@@ -205,9 +205,16 @@ function resolveProviderCredentialIdentityKey(provider: string, identifiers: str
 			identifiers.find(identifier => identifier.startsWith("account:")) ??
 			identifiers.find(identifier => identifier.startsWith("project:"));
 		const orgIdentifier = identifiers.find(identifier => identifier.startsWith("org:"));
-		if (base) return orgIdentifier ? `${base}|${orgIdentifier}` : base;
+		// A workspace-scoped grant (an Anthropic Console login) is a separate
+		// credential from a subscription grant for the same org, so the
+		// workspace further qualifies the org.
+		const workspaceIdentifier = orgIdentifier
+			? identifiers.find(identifier => identifier.startsWith("workspace:"))
+			: undefined;
+		const scope = workspaceIdentifier ? `${orgIdentifier}|${workspaceIdentifier}` : orgIdentifier;
+		if (base) return scope ? `${base}|${scope}` : base;
 		// No base identity at all: the org alone still distinguishes the row.
-		return orgIdentifier ?? null;
+		return scope ?? null;
 	}
 	const accountIdentifier = identifiers.find(identifier => identifier.startsWith("account:"));
 	if (accountIdentifier) return accountIdentifier;
@@ -337,6 +344,8 @@ function extractOAuthCredentialIdentifiers(credential: OAuthCredential): string[
 	if (projectId) identifiers.add(`project:${projectId}`);
 	const orgId = normalizeStoredAccountId(credential.orgId);
 	if (orgId) identifiers.add(`org:${orgId}`);
+	const workspaceId = normalizeStoredAccountId(credential.workspaceId);
+	if (workspaceId) identifiers.add(`workspace:${workspaceId}`);
 	const accessIdentifiers = extractOAuthTokenIdentifiers(credential.access) ?? [];
 	for (const identifier of accessIdentifiers) {
 		identifiers.add(identifier);

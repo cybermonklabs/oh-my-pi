@@ -19,6 +19,7 @@ import {
 	OpenAIAttr,
 	OmpGenAIAttr,
 	recordHandoff,
+	recordJudgmentTelemetry,
 	recordManualChatTelemetry,
 	resolveTelemetry,
 	type TelemetryHookContext,
@@ -31,7 +32,7 @@ import type {
 	AgentTool,
 	StreamFn,
 } from "@oh-my-pi/pi-agent-core/types";
-import type { Message } from "@oh-my-pi/pi-ai";
+import { type ApiKey, type ApiKeyResolver, isApiKeyResolver, type Message } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream, type EventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { context, SpanStatusCode, trace } from "@opentelemetry/api";
@@ -521,6 +522,134 @@ describe("agent-loop OTEL instrumentation", () => {
 		expect(chat?.attributes[OmpGenAIAttr.CostEstimatedUsd]).toBe(1.1);
 		expect(chat?.attributes[OmpGenAIAttr.CostInputUsd]).toBe(0.11);
 		expect(chat?.attributes[OmpGenAIAttr.CostOutputUsd]).toBe(0.22);
+	});
+
+	it("records the raw provider id next to the normalized provider name", async () => {
+		const mock = createMockModel({ id: "gpt-codex", provider: "openai-codex", responses: [{ content: ["ok"] }] });
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, telemetry: {} };
+		const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+
+		const chat = findSpan(exporter.getFinishedSpans(), "chat gpt-codex");
+		expect(chat?.attributes[GenAIAttr.ProviderName]).toBe("openai");
+		expect(chat?.attributes[OmpGenAIAttr.ProviderId]).toBe("openai-codex");
+	});
+
+	it.each<[string, ApiKey | undefined, string]>([
+		["a subscription login", () => ({ apiKey: "access-token", credentialType: "oauth" }), "subscription_oauth"],
+		[
+			"an Anthropic Console login",
+			() => ({ apiKey: "sk-ant-oat01-console", credentialType: "oauth", loginProvider: "anthropic-console" }),
+			"console_oauth",
+		],
+		["a stored API key", () => ({ apiKey: "sk-live", credentialType: "api_key" }), "api_key"],
+		["an Anthropic OAuth token passed as a key", "sk-ant-oat01-abc", "subscription_oauth"],
+		["a bearer with no provenance", "sk-plain", "unknown"],
+		["no credential", undefined, "unknown"],
+	])("classifies the chat span auth kind for %s", async (_label, apiKey, expected) => {
+		const mock = createMockModel({ ...MOCK_IDENT, responses: [{ content: ["ok"] }] });
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			getApiKey: () => apiKey,
+			telemetry: {},
+		};
+		const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+
+		const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+		expect(chat?.attributes[OmpGenAIAttr.AuthKind]).toBe(expected);
+	});
+
+	it("records the credential a provider rotated to mid-request", async () => {
+		const mock = createMockModel({ ...MOCK_IDENT, responses: [{ content: ["ok"] }] });
+		const resolver: ApiKeyResolver = ({ error }) =>
+			error === undefined
+				? { apiKey: "access-token", credentialType: "oauth" }
+				: { apiKey: "sk-fallback", credentialType: "api_key" };
+		// Like a provider's auth retry: the first bearer fails, so it resolves a sibling.
+		const rotatingStream: StreamFn = (model, context, options) => {
+			const relay = new AssistantMessageEventStream();
+			void (async () => {
+				const key = options?.apiKey;
+				if (isApiKeyResolver(key)) {
+					await key({ lastChance: false, error: undefined });
+					await key({ lastChance: true, error: new Error("401") });
+				}
+				for await (const event of mock.stream(model, context, options)) relay.push(event);
+			})();
+			return relay;
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			getApiKey: () => resolver,
+			telemetry: {},
+		};
+		const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, rotatingStream));
+
+		const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+		expect(chat?.attributes[OmpGenAIAttr.AuthKind]).toBe("api_key");
+	});
+
+	it("records raw provider id and auth kind on judgment spans", async () => {
+		const telemetry = resolveTelemetry({}, "conv-1");
+		await recordJudgmentTelemetry(telemetry, {
+			provider: "openai-codex",
+			model: "gpt-judge",
+			purpose: "find",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			startTime: Date.now(),
+			authKind: "subscription_oauth",
+		});
+
+		const judgment = findSpan(exporter.getFinishedSpans(), "judgment gpt-judge");
+		expect(judgment?.attributes[GenAIAttr.ProviderName]).toBe("openai");
+		expect(judgment?.attributes[OmpGenAIAttr.ProviderId]).toBe("openai-codex");
+		expect(judgment?.attributes[OmpGenAIAttr.AuthKind]).toBe("subscription_oauth");
+	});
+
+	it("splits cache writes by lifetime the way the catalog prices them", async () => {
+		const mock = createMockModel({
+			...MOCK_IDENT,
+			responses: [
+				{
+					content: ["ok"],
+					usage: {
+						input: 10,
+						output: 5,
+						cacheRead: 0,
+						cacheWrite: 1000,
+						totalTokens: 1015,
+						cttl: { ephemeral1h: 400 },
+					},
+				},
+				{ content: ["again"], usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 30, totalTokens: 45 } },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, telemetry: {} };
+		const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+		const tiered = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+		// Untiered writes (1000 - 400) bill at the 5-minute rate.
+		expect(tiered?.attributes[GenAIAttr.UsageCacheCreationEphemeral5mInputTokens]).toBe(600);
+		expect(tiered?.attributes[GenAIAttr.UsageCacheCreationEphemeral1hInputTokens]).toBe(400);
+
+		exporter.reset();
+		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+		const untiered = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+		expect(untiered?.attributes[GenAIAttr.UsageCacheCreationInputTokens]).toBe(30);
+		expect(untiered?.attributes[GenAIAttr.UsageCacheCreationEphemeral5mInputTokens]).toBeUndefined();
+		expect(untiered?.attributes[GenAIAttr.UsageCacheCreationEphemeral1hInputTokens]).toBeUndefined();
 	});
 
 	it("applies dynamic attributes, normalization hooks, and cost deltas", async () => {

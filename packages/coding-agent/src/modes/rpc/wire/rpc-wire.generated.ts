@@ -125,7 +125,12 @@ export interface AssistantMessage {
 	responseId?: string;
 	upstreamProvider?: string;
 	upstreamModel?: string;
+	/** The failure's own text: what the provider sent, or omp's text for a failure it detected itself. Retry and classification decisions read this. */
 	errorMessage?: string;
+	/** `errorMessage` as omp shows it, when that differs: with the rejected request's dump path, a provider-specific explanation or the response's retry hint added. Display only; it can name local paths. */
+	errorDisplayMessage?: string;
+	/** The delay, in milliseconds, the failed response's headers asked for before a retry. Retry decisions read this with `errorMessage`. */
+	errorRetryAfterMs?: number;
 	errorStatus?: number;
 	errorId?: number;
 	providerPayload?: Record<string, unknown>;
@@ -940,6 +945,10 @@ export interface AutoRetryEndEvent {
 	success: boolean;
 	attempt: number;
 	finalError?: string;
+	/** Error kind of the failure that ended the retry: kind labels joined by `|` (e.g. `usage-limit`, `transient|usage-limit`), or `status:<code>` for an error known only by its HTTP status; test membership, not equality. */
+	kind?: string;
+	/** Epoch ms when the failing credential's limit resets, as the provider stated it; absent when the provider stated no time. Covers only the account this run used; another stored account may become usable sooner. */
+	resetAtMs?: number;
 	/** Persisted retry errors whose presentation changed when the retry settled. */
 	retryErrors?: Record<string, unknown>[];
 }
@@ -1050,8 +1059,24 @@ export interface QueueUpdateEvent {
 	liveSteered?: number;
 }
 
+/** The session opened a dialog only a person can answer and the turn is held until it settles. */
+export interface UserWaitStartEvent {
+	type: "user_wait_start";
+	/** What the session is asking a person to decide. */
+	prompt: string;
+	/** Whether the dialog approves an operation or asks a question; absent when its opener named no classification. */
+	kind?: "permission" | "question";
+	/** Every tool call whose dialog is open, oldest first; absent when no open dialog belongs to one. A call that leaves this list between frames has had its own dialog answered, which is not the same moment as the last dialog settling. */
+	toolCalls?: string[];
+}
+
+/** The last dialog waiting on a person settled; the turn goes on. */
+export interface UserWaitEndEvent {
+	type: "user_wait_end";
+}
+
 /** A session event, discriminated by `type`; `set_event_filter` selects which are sent. */
-export type RpcAgentEvent = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | ManualCompactionStartEvent | ManualCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent;
+export type RpcAgentEvent = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | ManualCompactionStartEvent | ManualCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent | UserWaitStartEvent | UserWaitEndEvent;
 
 /** First frame after startup; transport fields are absent on servers without protocol v2. */
 export interface ReadyEvent {

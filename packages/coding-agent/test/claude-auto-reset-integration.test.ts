@@ -26,6 +26,7 @@ import {
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
+import { servedByCredential } from "./helpers/served-by-credential";
 
 import { cfgClaudeResetsAutoRedeem } from "@oh-my-pi/pi-coding-agent/session/settings";
 
@@ -140,6 +141,9 @@ describe("Claude saved-reset trigger integration", () => {
 		status: ResetCreditAccountStatus;
 		streamErrorFirst?: boolean;
 		transientFailures?: number;
+		/** Leading requests that fail with the usage limit, each tagged with the stored row that served it. */
+		failuresServedBy?: number[];
+		maxRetries?: number;
 		listFailures?: number;
 		maxDelayMs?: number;
 		quota?: { restored: boolean };
@@ -203,6 +207,11 @@ describe("Claude saved-reset trigger integration", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, streamOptions) => {
 				calls++;
+				const servedBy = options.failuresServedBy?.[calls - 1];
+				if (servedBy !== undefined) {
+					mock.push({ throw: CLAUDE_USAGE_LIMIT_ERROR });
+					return servedByCredential(mock.stream(requestedModel, context, streamOptions), servedBy);
+				}
 				const transientFailures = options.transientFailures ?? 0;
 				if (calls <= transientFailures) mock.push({ throw: "503 Service unavailable" });
 				else if (options.streamErrorFirst && (calls === transientFailures + 1 || !quota.restored)) {
@@ -215,7 +224,7 @@ describe("Claude saved-reset trigger integration", () => {
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxDelayMs": options.maxDelayMs ?? 100,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": options.maxRetries ?? 1,
 			"codexResets.autoRedeem": "no",
 			"claudeResets.autoRedeem": options.autoRedeem ?? "yes",
 			"claudeResets.salvageHorizonHours": options.salvageHorizonHours ?? 12,
@@ -415,6 +424,32 @@ describe("Claude saved-reset trigger integration", () => {
 					),
 			);
 		expect(recovered).toBe(true);
+	});
+
+	it("trusts a later credential switch after a saved reset restores the failing account", async () => {
+		// The row hits the limit with no free sibling and a saved reset restores it.
+		// When the row hits the limit again and the rotation check now finds a free
+		// sibling, that switch is genuine, not a repeat of the restored row.
+		const { session, targets } = buildSession({
+			report: claudeReport(1),
+			status: claudeStatus(true),
+			failuresServedBy: [CREDENTIAL_ID, CREDENTIAL_ID],
+			maxRetries: 3,
+		});
+		vi.spyOn(authStorage.limits, "markReached")
+			.mockResolvedValueOnce({ switched: false })
+			.mockResolvedValue({ switched: true });
+		mockSchedulerWaitWithClock();
+		const retryOutcomes: boolean[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_end") retryOutcomes.push(event.success);
+		});
+
+		await session.prompt("trigger a Claude usage limit twice");
+		await session.waitForIdle();
+
+		expect(targets.map(target => target.credentialId)).toEqual([CREDENTIAL_ID]);
+		expect(retryOutcomes).toEqual([true]);
 	});
 
 	it("continues the task using live reset evidence when broker usage polling is unavailable", async () => {

@@ -1,0 +1,21 @@
+# Deliberate drops for .github/sami/carry-check.sh: commits of an earlier sami
+# release that a later release does not carry, each on purpose.
+# One per line: <commit sha, 12+ hex chars>  <reason: what replaced it, or the
+# revert and the decision behind it>. The release notes print the entries that
+# apply since the previous release. Keep old entries; they cost nothing later.
+
+# v18.13.3-sami.20261029-115123 -> v18.16.0-sami.20261103-165105
+a7bb3b28fcaa124994c9e72d61db7cd9d26d93f6  deliberate, 2026-10-31 no-fork-policy narrowing of the #17400 member: reverted by 0d9df66d0f7; repair notch 2026-10-31T17:06:56Z (ledger can1357/oh-my-pi/20261031T170656.706350665Z-3fd4.md): member brought to the PR design, narrowed to the upstream PR's content (no fork policy)
+a797c4eafdbb3eee6d030f73634f79ae7192bcae  deliberate, same 2026-10-31 no-fork-policy narrowing of the #17400 member: reverted by 8dd7585655d; same repair notch
+007f393e03b41b6e96fd09849c57fa40390763f4  superseded: the old #13416 backport member sami-member/feat-session-sql-storage was replaced by the #13416 PR head 0224ecf09563 (drop-sweep note, sami notch 2026-11-03)
+
+# v18.16.0-sami.20261104-021732 -> first release on upstream main past the shell-engine swap 44711a78c1b
+1948777fe1d17f6ecd5c70220817e34728d4dbe8  #17662 fix/shell-interp-loop-yield is obsolete: upstream 44711a78c1b replaces brush-core with the Bash 5.3 engine and its loop safepoints.
+3231ad609c3eeff168781b7305246205f8bdbc8e  #17662 fix/shell-interp-loop-yield is obsolete: upstream 44711a78c1b replaces brush-core with the Bash 5.3 engine and its loop safepoints.
+394c5e70ad84fc17d6abbf0b8a5dd0993e524cfc  #17662 fix/shell-interp-loop-yield is obsolete: upstream 44711a78c1b replaces brush-core with the Bash 5.3 engine and its loop safepoints.
+4ed36a6549a8ee3cb6e50e7c6e2ad779ae679701  #17662 fix/shell-interp-loop-yield is obsolete: upstream 44711a78c1b replaces brush-core with the Bash 5.3 engine and its loop safepoints.
+721545b401f78a708138cbe1581d97bd6e508588  #17662 fix/shell-interp-loop-yield is obsolete: upstream 44711a78c1b replaces brush-core with the Bash 5.3 engine and its loop safepoints.
+d0227f30e20f03e4465f558cce90e8580315108b  #17662 fix/shell-interp-loop-yield is obsolete: upstream 44711a78c1b replaces brush-core with the Bash 5.3 engine and its loop safepoints.
+dda7ffbb4f642555eff705b7b82b8b3c749bb67d  #17662 fix/shell-interp-loop-yield is obsolete: upstream 44711a78c1b replaces brush-core with the Bash 5.3 engine and its loop safepoints.
+f7a7c0b564ed8bbefe2b112063411a96a6341200  #17662 fix/shell-interp-loop-yield is obsolete: upstream 44711a78c1b replaces brush-core with the Bash 5.3 engine and its loop safepoints.
+2c3e215087ea6c3235763582ed2e20a7a80517da  fix/brush-subshell-exit-trap cannot be ported directly because upstream deleted brush-core. The Bash 5.3 engine passes five of six cases. A fatal expansion inside an EXIT trap still returns the wrong status and needs a separate engine fix.

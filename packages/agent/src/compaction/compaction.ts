@@ -12,6 +12,7 @@ import {
 	type AssistantMessage,
 	type CodexCompactionContext,
 	type Context,
+	type DispatchHold,
 	Effort,
 	type FetchImpl,
 	type Message,
@@ -672,10 +673,12 @@ function resolveCompactionEffort(model: Model, level: ThinkingLevel | undefined)
  * message-based check is still required upstream — see issue #986.
  */
 function createSummarizationError(prefix: string, response: AssistantMessage): Error {
+	// The provider's text, not `errorDisplayText`: callers classify this error (auth,
+	// overflow, retry) from its message, and the display text holds local paths.
 	const text = `${prefix}: ${response.errorMessage || "Unknown error"}`;
 	return response.errorStatus === undefined
 		? new Error(text)
-		: new AIError.ProviderHttpError(text, response.errorStatus);
+		: new AIError.ProviderHttpError(text, response.errorStatus, { headers: AIError.errorRetryHeaders(response) });
 }
 
 function shouldRetryHandoffWithAutoToolChoice(response: AssistantMessage): boolean {
@@ -768,6 +771,16 @@ export interface SummaryOptions {
 		ctx: Context,
 		options: SimpleStreamOptions,
 	) => Promise<AssistantMessage>;
+	/**
+	 * Awaited immediately before every request this compaction puts on the
+	 * wire: each summarization oneshot and the stream layer's own re-dispatches,
+	 * the provider-native request, and each attempt of a remote compaction
+	 * (Responses V1 and V2, and `remoteEndpoint`). Only the oneshots reach
+	 * {@link completeImpl}; the remote requests fetch on their own, so a host
+	 * that gates its requests (omp's `/pause`) must hold them here rather than
+	 * in a completion wrapper. See `StreamOptions.beforeDispatch`.
+	 */
+	beforeDispatch?: DispatchHold;
 	/**
 	 * Transient-failure retry for the summarization oneshots (`generateSummary`,
 	 * `generateShortSummary`, `generateTurnPrefixSummary`).
@@ -1038,7 +1051,7 @@ async function summarizeConversationWindow(
 					endpoint,
 					{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText, maxTokens },
 					signal,
-					{ fetch: options.fetch, model, apiKey: key },
+					{ fetch: options.fetch, model, apiKey: key, beforeDispatch: options.beforeDispatch },
 				),
 			{ signal, missingKeyMessage: "Remote compaction credentials unavailable" },
 		);
@@ -1060,6 +1073,7 @@ async function summarizeConversationWindow(
 			promptCacheKey: options?.promptCacheKey,
 			providerSessionState: options?.providerSessionState,
 			codexCompaction: localCodexCompaction(options),
+			beforeDispatch: options?.beforeDispatch,
 		},
 		{
 			telemetry: options?.telemetry,
@@ -1269,7 +1283,7 @@ async function generateShortSummary(
 						endpoint,
 						{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText, maxTokens },
 						signal,
-						{ fetch: options?.fetch, model, apiKey: key },
+						{ fetch: options?.fetch, model, apiKey: key, beforeDispatch: options?.beforeDispatch },
 					),
 				{ signal, missingKeyMessage: "Remote compaction credentials unavailable" },
 			);
@@ -1293,6 +1307,7 @@ async function generateShortSummary(
 					promptCacheKey: options?.promptCacheKey,
 					providerSessionState: options?.providerSessionState,
 					codexCompaction: localCodexCompaction(options),
+					beforeDispatch: options?.beforeDispatch,
 				},
 				{
 					telemetry: options?.telemetry,
@@ -1777,6 +1792,7 @@ export async function compact(
 		tools: options?.tools,
 		fetch: options?.fetch,
 		completeImpl: options?.completeImpl,
+		beforeDispatch: options?.beforeDispatch,
 		// The caller's opt-out must reach every summarization oneshot, otherwise
 		// an outer retry loop multiplies with the inner one (see SummaryOptions).
 		oneshotRetry: options?.oneshotRetry,
@@ -2010,6 +2026,7 @@ export async function compact(
 						preferWebsockets: summaryOptions.preferWebsockets,
 						codexAccessPrograms: summaryOptions.codexAccessPrograms,
 						codexCompaction: summaryOptions.codexCompaction,
+						beforeDispatch: summaryOptions.beforeDispatch,
 					}),
 				{ signal },
 			);
@@ -2077,6 +2094,7 @@ export async function compact(
 							providerSessionState: summaryOptions.providerSessionState,
 							codexCompaction: summaryOptions.codexCompaction,
 							rewriteOutputs,
+							beforeDispatch: summaryOptions.beforeDispatch,
 						},
 					),
 				{ signal },
@@ -2248,6 +2266,7 @@ export async function compact(
 					promptCacheKey: summaryOptions.promptCacheKey,
 					providerSessionState: summaryOptions.providerSessionState,
 					completeImpl: summaryOptions.completeImpl,
+					beforeDispatch: summaryOptions.beforeDispatch,
 					telemetry: summaryOptions.telemetry,
 					retry: summaryOneshotRetry(summaryOptions),
 				},
@@ -2428,6 +2447,7 @@ async function generateTurnPrefixSummary(
 			promptCacheKey: options?.promptCacheKey,
 			providerSessionState: options?.providerSessionState,
 			codexCompaction: localCodexCompaction(options),
+			beforeDispatch: options?.beforeDispatch,
 		},
 		{
 			telemetry: options?.telemetry,

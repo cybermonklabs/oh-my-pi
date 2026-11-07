@@ -126,6 +126,26 @@ describe("anthropic org-scoped credential identity", () => {
 		]);
 	});
 
+	it("keeps a workspace-scoped Console grant beside the same org's subscription grant", async () => {
+		if (!store) throw new Error("test setup failed");
+		const consoleCredential = (suffix: string): AuthCredential => {
+			const credential = orgCredential({ suffix, orgId: TEAM_ORG });
+			if (credential.type !== "oauth") throw new Error("expected an oauth credential");
+			return { ...credential, workspaceId: "wrkspc_console", loginProvider: "anthropic-console" };
+		};
+
+		await store.upsertAuthCredential("anthropic", orgCredential({ suffix: "team", orgId: TEAM_ORG }));
+		await store.upsertAuthCredential("anthropic", consoleCredential("console"));
+		// Re-logins of either kind update their own row only.
+		await store.upsertAuthCredential("anthropic", orgCredential({ suffix: "team-renewed", orgId: TEAM_ORG }));
+		await store.upsertAuthCredential("anthropic", consoleCredential("console-renewed"));
+
+		expect(readIdentityRows(dbPath)).toEqual([
+			{ identity_key: `email:${EMAIL}|org:${TEAM_ORG}`, disabled_cause: null },
+			{ identity_key: `email:${EMAIL}|org:${TEAM_ORG}|workspace:wrkspc_console`, disabled_cause: null },
+		]);
+	});
+
 	it("never clobbers org-scoped rows with an org-less credential", async () => {
 		if (!store) throw new Error("test setup failed");
 

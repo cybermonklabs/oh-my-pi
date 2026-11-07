@@ -8,6 +8,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $env, $whichAll, getPythonEnvDir } from "@oh-my-pi/pi-utils";
+import type { Settings } from "../../config/settings";
+import { cfgEvalEnvPassthrough } from "../settings";
 
 const DEFAULT_ENV_ALLOWLIST = new Set([
 	"PATH",
@@ -125,11 +127,32 @@ export interface PythonRuntime {
 	venvPath?: string;
 }
 
+/** Extra environment names and prefixes to admit past the allowlist (`eval.envPassthrough`). */
+export interface EnvPassthrough {
+	names?: readonly string[];
+	prefixes?: readonly string[];
+}
+
 /**
  * Filter environment variables to a safe allowlist for Python subprocesses.
- * Removes sensitive API keys and limits to known-safe variables.
+ * Removes sensitive API keys and limits to known-safe variables plus the names and
+ * prefixes `passthrough` admits. The denylist wins over `passthrough`, and a blank
+ * prefix is ignored rather than admitting every variable.
  */
-export function filterEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+export function filterEnv(
+	env: Record<string, string | undefined>,
+	passthrough?: EnvPassthrough,
+): Record<string, string | undefined> {
+	const extraNames = new Set<string>();
+	for (const name of passthrough?.names ?? []) {
+		const trimmed = name.trim();
+		if (trimmed) extraNames.add(normalizeEnvKey(trimmed));
+	}
+	const extraPrefixes: string[] = [];
+	for (const prefix of passthrough?.prefixes ?? []) {
+		const trimmed = prefix.trim();
+		if (trimmed) extraPrefixes.push(normalizeEnvKey(trimmed));
+	}
 	const filtered: Record<string, string | undefined> = {};
 	for (const [key, value] of Object.entries(env)) {
 		if (value === undefined) continue;
@@ -140,11 +163,38 @@ export function filterEnv(env: Record<string, string | undefined>): Record<strin
 			filtered[destKey] = value;
 			continue;
 		}
-		if (NORMALIZED_ALLOW_PREFIXES.some(prefix => normalizedKey.startsWith(prefix))) {
+		if (
+			extraNames.has(normalizedKey) ||
+			NORMALIZED_ALLOW_PREFIXES.some(prefix => normalizedKey.startsWith(prefix)) ||
+			extraPrefixes.some(prefix => normalizedKey.startsWith(prefix))
+		) {
 			filtered[key] = value;
 		}
 	}
 	return filtered;
+}
+
+/**
+ * The environment a Python runtime starts from: the shell config's current environment,
+ * filtered by {@link filterEnv} with the `eval.envPassthrough` names and prefixes.
+ */
+export function resolvePythonBaseEnv(settings: Settings): Record<string, string | undefined> {
+	return filterEnv(settings.getShellConfig().env, cfgEvalEnvPassthrough.get(settings));
+}
+
+/**
+ * `runtime` with its environment rebuilt over `baseEnv`, keeping the interpreter and the
+ * venv layout it was resolved with. Lets a cached interpreter choice start from the current
+ * environment instead of the one in force when it was resolved.
+ */
+export function rebasePythonRuntime(
+	runtime: PythonRuntime,
+	baseEnv: Record<string, string | undefined>,
+): PythonRuntime {
+	const env = runtime.venvPath
+		? applyVenvEnv(baseEnv, runtime.venvPath, path.dirname(runtime.pythonPath))
+		: { ...baseEnv };
+	return { ...runtime, env };
 }
 
 /**

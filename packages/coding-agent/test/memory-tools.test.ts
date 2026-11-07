@@ -210,6 +210,9 @@ function registerMnemopiState(
 				options.listeners?.add(listener);
 				return () => options.listeners?.delete(listener);
 			},
+			// A state the backend installs binds its `/pause` holds to the session's disposal.
+			isDisposed: false,
+			addDisposer: () => {},
 		} as never,
 	});
 	setMnemopiSessionState(registeredMnemopiState.session as never, registeredMnemopiState);
@@ -501,19 +504,23 @@ describe("retain.execute", () => {
 		const [bankId, items, options] = retainBatchSpy.mock.calls[0];
 		expect(bankId).toBe("test-bank");
 		expect(options).toEqual(expect.objectContaining({ async: true }));
-		expect(items).toEqual([
-			expect.objectContaining({
-				content: "fact one",
-				metadata: { session_id: TEST_SESSION_ID },
-				tags: ["project:pi"],
-			}),
-			expect.objectContaining({
-				content: "fact two",
-				context: "user override",
-				metadata: { session_id: TEST_SESSION_ID },
-				tags: ["project:pi"],
-			}),
-		]);
+		// Same-call items share a publication mtime, so their order within the batch is unspecified.
+		expect(items).toHaveLength(2);
+		expect(items).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					content: "fact one",
+					metadata: { session_id: TEST_SESSION_ID },
+					tags: ["project:pi"],
+				}),
+				expect.objectContaining({
+					content: "fact two",
+					context: "user override",
+					metadata: { session_id: TEST_SESSION_ID },
+					tags: ["project:pi"],
+				}),
+			]),
+		);
 		expect(await outboxEvents()).toEqual([]);
 	});
 
@@ -1208,6 +1215,8 @@ describe("Mnemopi backend lifecycle", () => {
 			emitNotice: () => {},
 			getHindsightSessionState: () => undefined,
 			subscribe: () => () => {},
+			isDisposed: false,
+			addDisposer: () => {},
 		} as never;
 		await mnemopiBackend.start({
 			session,

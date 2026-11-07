@@ -392,7 +392,7 @@ providers:
          X-Team-Key: "!bw get password omp-team-key"
 ```
 
-Successful command outputs are cached for the process lifetime, and concurrent requests share an in-flight execution. Failures back off for 30 seconds. Refresh callers that request `refreshCommandCredentials` (including the model hub's explicit refresh) and 401 credential recovery invalidate the relevant cached API keys and headers; an ordinary catalog refresh does not. Runtime API-key overrides, including `--api-key`, take precedence over configured credentials.
+Successful command outputs are cached for the process lifetime, and concurrent requests share an in-flight execution. Failures back off for 30 seconds. When a turn's `apiKey` command produces nothing for a provider that requires a key, the turn fails retryably and auto-retry runs the command again once that backoff has passed, up to 3 times per turn (fewer if `retry.maxRetries` is lower); with `retry.maxDelayMs` below 30 seconds the turn ends without retrying. Other requests, such as title or commit-message generation, still fail at once with a missing key. Refresh callers that request `refreshCommandCredentials` (including the model hub's explicit refresh) and 401 credential recovery invalidate the relevant cached API keys and headers; an ordinary catalog refresh does not. Runtime API-key overrides, including `--api-key`, take precedence over configured credentials.
 
 ## Merge and override order
 
@@ -1320,7 +1320,8 @@ directory's `models.yml` takes precedence over `models.yaml`.
 
 ## Failure mode
 
-If `models.yml` / `models.yaml` fails schema or validation checks:
+If `models.yml` / `models.yaml` fails to parse or fails schema or validation checks:
 
-- registry keeps operating with built-in models
+- at startup, the registry keeps operating with built-in models
+- on a reload in a running session (for example after a half-saved edit), the registry keeps the last config that loaded, including its providers, overrides and API keys, until the file loads again; deleting the file still drops it
 - error is exposed via `ModelRegistry.getError()` and surfaced in UI/notifications

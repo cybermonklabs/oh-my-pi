@@ -167,6 +167,39 @@ describe("resolveLocalEditorTarget", () => {
 		await openLocalFileInEditor(ctx);
 		expect(showStatus).toHaveBeenCalledWith("/local is host-only during a collab session");
 	});
+
+	// `true` stands in for the editor: it exits at once without touching the file.
+	it.skipIf(process.platform === "win32")(
+		"hands the terminal to the editor with a resuming stop, not an exiting one",
+		async () => {
+			using tmp = TempDir.createSync("@omp-local-editor-");
+			await Bun.write(path.join(tmp.path(), "local", "plan.md"), "# plan");
+			const env = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR };
+			delete process.env.VISUAL;
+			process.env.EDITOR = "true";
+			const ui = { stop: vi.fn(), start: vi.fn(), requestRender: vi.fn() };
+			const ctx = {
+				sessionManager: { getArtifactsDir: () => tmp.path(), getSessionId: () => "s" },
+				ui,
+				showError: vi.fn(),
+				showWarning: vi.fn(),
+				showStatus: vi.fn(),
+			} as unknown as InteractiveModeContext;
+			try {
+				await openLocalFileInEditor(ctx, "plan.md");
+			} finally {
+				for (const [name, value] of Object.entries(env)) {
+					if (value === undefined) delete process.env[name];
+					else process.env[name] = value;
+				}
+			}
+
+			// An exiting stop would cap scrollback and hand the transcript to the exit flush.
+			expect(ui.stop).toHaveBeenCalledTimes(1);
+			expect(ui.stop).toHaveBeenCalledWith({ resuming: true });
+			expect(ui.start).toHaveBeenCalledTimes(1);
+		},
+	);
 });
 
 describe("buildLocalFileArgumentCompletions", () => {

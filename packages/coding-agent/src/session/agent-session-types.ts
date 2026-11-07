@@ -164,6 +164,15 @@ export interface InitialRetryFallbackState {
 	originalSelector: string;
 	/** Thinking selector configured for the unavailable primary. */
 	originalThinkingLevel: ConfiguredThinkingLevel | undefined;
+	/**
+	 * Picks the primary's level once restoration finds it, for a primary that
+	 * was not in the catalog at startup: session creation's own precedence for
+	 * a fresh spawn (task effort, `:level`, agent default, the model's own
+	 * default level, settings default) on that model, never the level a revived
+	 * session persisted while the fallback served.
+	 * Replaces `originalThinkingLevel` when set.
+	 */
+	resolveOriginalThinkingLevel?: (primary: Model) => ConfiguredThinkingLevel | undefined;
 	/** Prevent cooldown restoration when startup selected this fallback from live usage health. */
 	pinned?: boolean;
 }
@@ -264,6 +273,13 @@ export interface AgentSessionConfig {
 	skillWarnings?: SkillWarning[];
 	/** Whether runtime reloads may rediscover disk-backed skills. */
 	skillsReloadable?: boolean;
+	/**
+	 * A fixed `skills` snapshot was forwarded for perf (subagent inheriting
+	 * its parent's discovery), not to freeze the set: `discoverStartupSkillPaths`
+	 * still merges directories the subagent's own `resources_discover`
+	 * handlers contribute at its own startup into the inherited snapshot.
+	 */
+	mergeDiscoveredSkillPaths?: boolean;
 	/** Custom TypeScript slash commands. */
 	customCommands?: LoadedCustomCommand[];
 	skillsSettings?: SkillsSettings;
@@ -469,6 +485,8 @@ export interface PromptOptions {
 	userInitiated?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Caller correlation id recorded as `tag` on the user message this prompt submits (see `sendUserInput`). */
+	tag?: string;
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
 	/** Delegator's open-endedness description (task tool `solutionSpace`); replaces the prompt as `auto` thinking classification input. */

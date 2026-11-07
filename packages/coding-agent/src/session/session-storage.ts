@@ -17,6 +17,7 @@ import { peekFileEnds } from "@oh-my-pi/pi-utils/peek-file";
 import { isPidAlive } from "@oh-my-pi/pi-utils/pid";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
+import { inflateArchivedBytes, isArchivedSessionPath } from "./session-archive";
 import { isAssistantMessageLine } from "./session-entries";
 import {
 	overlayTitleSlotContent,
@@ -28,6 +29,11 @@ import {
 /** Shared base flags for the held transcript descriptor; callers add `O_APPEND` or `O_TRUNC`. */
 const SESSION_WRITE_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT;
 const utf8Decoder = new TextDecoder("utf-8");
+
+/** A listing of a directory that does not exist (or is a file): empty, not a fault. */
+function isMissingDirectory(err: unknown): boolean {
+	return isEnoent(err) || hasFsCode(err, "ENOTDIR");
+}
 
 /**
  * Basename of a rewrite staged by {@link sessionStagingPath}; group 1 is the
@@ -65,6 +71,12 @@ export interface SessionStorageStat {
 	size: number;
 	mtimeMs: number;
 	mtime: Date;
+	/**
+	 * Creation time, when the backend records one. File storage reports the
+	 * filesystem's; key-indexed backends store no birth time and omit it, so
+	 * callers fall back to the transcript's own header timestamp.
+	 */
+	birthtimeMs?: number;
 }
 
 export interface SessionStorageWriter {
@@ -153,7 +165,29 @@ export interface WriteTextAtomicOptions extends SessionStorageWriteOptions {
 	commitGuard?: () => boolean;
 }
 
+/** How a caller holds a session's ownership claim; see {@link SessionStorage.claimSession}. */
+export interface SessionClaimOptions {
+	/**
+	 * The caller appends to the journal for as long as it holds the claim, so
+	 * it is the journal's one writer: a second writer in this process is
+	 * refused rather than admitted beside the first.
+	 */
+	writer?: boolean;
+	/**
+	 * Take a writer slot beside the writer that already holds this journal,
+	 * for a manager taking the journal over from it rather than opening the
+	 * session a second time ({@link SessionManager.cloneCurrentSession}).
+	 * Honoured only when the current writer appends to the same file: a second
+	 * writer on another path under one session id is the copy this refuses.
+	 * Each holder releases its own slot, so the journal reads live until the
+	 * last of them lets go.
+	 */
+	handover?: boolean;
+}
+
 export interface SessionStorage {
+	/** A worker may use its own file-storage default for these same transcripts; omitted means keep runs inline. */
+	readonly crossesWorkerBoundary?: boolean;
 	/**
 	 * `true` when synchronous writes ({@link writeTextSync} and a writer's
 	 * {@link SessionStorageWriter.appendSync}) have reached the backing store by
@@ -189,7 +223,7 @@ export interface SessionStorage {
 	 * materializing it as one string. Optional; callers on backends without
 	 * it join the lines and call {@link writeTextSync}.
 	 */
-	writeLinesSync?(path: string, lines: readonly string[], options?: SessionStorageWriteOptions): void;
+	writeLinesSync?(path: string, lines: Iterable<string>, options?: SessionStorageWriteOptions): void;
 	/**
 	 * Update the current session title through the storage backend.
 	 *
@@ -199,7 +233,39 @@ export interface SessionStorage {
 	 */
 	updateSessionTitle(path: string, update: SessionTitleUpdate): Promise<void>;
 	statSync(path: string): SessionStorageStat;
+	/**
+	 * Paths of the files directly inside `dir` (or, for a two-segment pattern
+	 * such as `"*\/*.jsonl"`, one directory below it) whose names match
+	 * `pattern`. A missing `dir` lists as empty; any other fault (EACCES, EIO,
+	 * EMFILE) throws, so a failed scan is never mistaken for an empty one.
+	 */
 	listFilesSync(dir: string, pattern: string): string[];
+	/**
+	 * Names of the directories holding session files directly inside `dir` —
+	 * the directory half of {@link listFilesSync}. A recursive transcript walk
+	 * (a session's subagent tree) needs both, and only the backend knows how
+	 * its keys nest: file backends read the directory, key-indexed backends
+	 * derive the names from the keys below `dir`. A missing `dir` lists as
+	 * empty; any other fault throws, as in {@link listFilesSync}.
+	 */
+	listDirsSync(dir: string): string[];
+	/**
+	 * Bring the synchronous view ({@link existsSync}, {@link statSync}, the
+	 * listings) up to date with writes other processes made to a shared
+	 * backend since this storage loaded it. Listing and lookup entry points
+	 * call it before they read that view. File and memory backends read the
+	 * live state already and omit it.
+	 */
+	refresh?(): Promise<void>;
+	/**
+	 * Every path the store holds, at any depth and under any root (custom
+	 * `--session` paths included). Only key-indexed backends implement it:
+	 * their keys are a finite index, while a file backend's "every path" is
+	 * the whole filesystem. A caller that must see every transcript before it
+	 * deletes something (blob gc) reads these through the storage, because a
+	 * key-indexed store never puts them on the local filesystem.
+	 */
+	listAllSync?(): string[];
 
 	exists(path: string): Promise<boolean>;
 	readText(path: string): Promise<string>;
@@ -209,8 +275,22 @@ export interface SessionStorage {
 	 * them, and reports the conflict instead on backends without it.
 	 */
 	readTextSync?(path: string): string;
+	/**
+	 * Synchronously read the UTF-8 bytes `[start, end)` of the file, or fewer
+	 * when it ends sooner. Optional: `SessionManager` reads back only what
+	 * another writer appended past the bytes it accounts for, and republishes
+	 * instead on backends without it.
+	 */
+	readTextRangeSync?(path: string, start: number, end: number): string;
 	/** Read the requested UTF-8 byte windows from the head and tail of the file. */
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
+	/**
+	 * The UTF-8 text from byte `offset` to the end, and the size in bytes the
+	 * read observed; an offset at or past the end reads as `""`. Optional:
+	 * {@link readSessionTextFrom} falls back to a whole read on backends that
+	 * cannot read from an offset.
+	 */
+	readTextFrom?(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }>;
 	/**
 	 * True when any complete `message` record in the file carries an assistant
 	 * role. Scans line boundaries across the whole file (middle included) so a
@@ -222,8 +302,15 @@ export interface SessionStorage {
 	writeText(path: string, content: string): Promise<void>;
 	writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void>;
 	/** Streaming {@link writeTextAtomic}, optional on the same terms as {@link writeLinesSync}. */
-	writeLinesAtomic?(path: string, lines: readonly string[], options?: WriteTextAtomicOptions): Promise<void>;
+	writeLinesAtomic?(path: string, lines: Iterable<string>, options?: WriteTextAtomicOptions): Promise<void>;
 	rename(path: string, nextPath: string): Promise<void>;
+	/**
+	 * {@link rename} that never replaces: when `nextPath` is taken, including
+	 * by another client of a shared store while the rename runs, it rejects
+	 * with `EEXIST` naming `nextPath` and changes neither path. Optional: only
+	 * key-indexed backends (`session.storage: sql`) implement it.
+	 */
+	renameNoReplace?(path: string, nextPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
 	/**
@@ -239,10 +326,28 @@ export interface SessionStorage {
 	 * holds a different session (another session was moved onto it), so the
 	 * caller's appends would land in that session's journal; `SessionManager`
 	 * then moves its session to a sibling instead of writing that file.
+	 *
+	 * `options.writer` claims as the journal's one writer: it is refused while
+	 * another writer in THIS process holds the session, so two session managers
+	 * can never append to one journal. The one exception is
+	 * {@link SessionClaimOptions.handover}, for a clone taking the same journal
+	 * over from the writer that holds it. Claims without `writer` (a transfer
+	 * guard held across an operation that then opens the session) keep sharing
+	 * the process's lease.
+	 *
 	 * Optional because only backends with a process-owned lock can tell that
 	 * another process writes a session.
 	 */
-	claimSession?(sessionId: string, sessionPath: string): (() => void) | null;
+	claimSession?(sessionId: string, sessionPath: string, options?: SessionClaimOptions): (() => void) | null;
+	/**
+	 * Point this process's writer claim for `sessionId` at the file it appends
+	 * to now, after a move carried the journal to a new path. The claim is kept
+	 * (a move must not give the lease up for an instant), only its path
+	 * changes, so a liveness probe still reads the moved journal as the one a
+	 * session here is running rather than a copy of it. Optional, like
+	 * {@link claimSession}, whose claims it retargets.
+	 */
+	retargetWriterClaim?(sessionId: string, sessionPath: string): void;
 	/**
 	 * Atomically delete a session and its artifacts only when `shouldDelete`
 	 * accepts the current session content. Optional because backends without a
@@ -536,11 +641,23 @@ function publishLockPid(content: string): number | undefined {
 
 /**
  * This process's ownership leases by session id, shared by every
- * `FileSessionStorage` instance: managers in one process share one lease per
- * session and only ever contend with other processes. The OS reclaims a lease
- * when its process exits, so a crashed owner never blocks a later claim.
+ * `FileSessionStorage` instance: one lease per session, so this process only
+ * ever contends with other processes for it. The OS reclaims a lease when its
+ * process exits, so a crashed owner never blocks a later claim.
+ *
+ * `writers` counts the holders that append to the journal while they hold it
+ * (see {@link SessionClaimOptions.writer}), and `writerPath` is the file that
+ * writer appends to. The lease is shared, the writer slot is not: one journal
+ * has one writer in this process, exactly as it has one across processes.
  */
-const sessionLeases = new Map<string, { lease: FileLockHandle; holders: number }>();
+interface SessionLease {
+	lease: FileLockHandle;
+	holders: number;
+	writers: number;
+	writerPath?: string;
+}
+
+const sessionLeases = new Map<string, SessionLease>();
 
 const TEST_SESSION_OWNERS_DIR_ENV = "PI_TEST_SESSION_OWNERS_DIR";
 
@@ -566,27 +683,14 @@ function sessionOwnersDir(): string {
 	return testSessionOwnersDir() ?? getSessionOwnersDir();
 }
 
-/** Bytes read to find a header at claim time: the title slot plus a header line fit well inside. */
-const SESSION_HEADER_PREFIX_BYTES = 64 * 1024;
+/** Bytes read to find a header: the title slot plus a header line fit well inside. */
+export const SESSION_HEADER_PREFIX_BYTES = 64 * 1024;
 
 /**
- * The session id in the header of the file at `sessionPath`, read
- * synchronously from a bounded prefix (past the title slot), or `undefined`
- * when there is no readable file or no header in that prefix.
+ * The session id in the header at the start of `prefix` (past the title
+ * slot), or `undefined` when the prefix holds no complete session header.
  */
-function readSessionHeaderIdSync(sessionPath: string): string | undefined {
-	let prefix: string;
-	try {
-		const fd = fs.openSync(sessionPath, "r");
-		try {
-			const buf = Buffer.alloc(SESSION_HEADER_PREFIX_BYTES);
-			prefix = buf.toString("utf8", 0, fs.readSync(fd, buf, 0, buf.length, 0));
-		} finally {
-			fs.closeSync(fd);
-		}
-	} catch {
-		return undefined;
-	}
+export function sessionHeaderIdInPrefix(prefix: string): string | undefined {
 	if (parseTitleSlotFromContent(prefix)) prefix = prefix.slice(prefix.indexOf("\n") + 1);
 	const end = prefix.indexOf("\n");
 	if (end === -1) return undefined;
@@ -597,6 +701,125 @@ function readSessionHeaderIdSync(sessionPath: string): string | undefined {
 		}
 	} catch {}
 	return undefined;
+}
+
+/**
+ * Bytes read first. The title slot is a fixed 256 and an ordinary header line
+ * is a few hundred more, so this answers every realistic file in one small
+ * read; a header line longer than this falls back to the bound above. The
+ * roster scan asks this of every transcript it meets, so the difference is a
+ * whole scan's worth of decoding.
+ */
+const SESSION_HEADER_FIRST_READ_BYTES = 8 * 1024;
+
+/** Reused across calls: reading a header never yields, so one buffer serves every read. */
+const sessionHeaderBuffer = Buffer.allocUnsafe(SESSION_HEADER_PREFIX_BYTES);
+
+/** The session id in the first header line of `prefix`, past the title slot. */
+function parseSessionHeaderId(prefix: string): string | undefined {
+	const body = parseTitleSlotFromContent(prefix) ? prefix.slice(prefix.indexOf("\n") + 1) : prefix;
+	const end = body.indexOf("\n");
+	if (end === -1) return undefined;
+	try {
+		const entry: unknown = JSON.parse(body.slice(0, end));
+		if (entry && typeof entry === "object" && "type" in entry && entry.type === "session" && "id" in entry) {
+			return typeof entry.id === "string" ? entry.id : undefined;
+		}
+	} catch {}
+	return undefined;
+}
+
+/**
+ * The session id in the header of the file at `sessionPath`, read
+ * synchronously from a bounded prefix (past the title slot), or `undefined`
+ * when there is no readable file or no header in that prefix.
+ */
+function readSessionHeaderIdSync(sessionPath: string): string | undefined {
+	try {
+		const fd = fs.openSync(sessionPath, "r");
+		try {
+			const read = fs.readSync(fd, sessionHeaderBuffer, 0, SESSION_HEADER_FIRST_READ_BYTES, 0);
+			const id = parseSessionHeaderId(sessionHeaderBuffer.toString("utf8", 0, read));
+			// Only a file whose header line did not fit is read again.
+			if (id !== undefined || read < SESSION_HEADER_FIRST_READ_BYTES) return id;
+			const full = fs.readSync(fd, sessionHeaderBuffer, 0, SESSION_HEADER_PREFIX_BYTES, 0);
+			return parseSessionHeaderId(sessionHeaderBuffer.toString("utf8", 0, full));
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Whether both paths name one file: the same journal reached through a
+ * symlinked session directory, a `--session-dir` that points into the same
+ * tree, or a hard link. Path equality answers the usual case, the inode pair
+ * the rest. A copy of a journal is a different file however much content it
+ * shares, so this — not {@link sessionJournalLiveness}, which is keyed by the
+ * session id both copies carry — is the test for "the journal that session is
+ * writing".
+ */
+export function isSameJournalFile(sessionPath: string, otherPath: string): boolean {
+	if (path.resolve(sessionPath) === path.resolve(otherPath)) return true;
+	try {
+		const here = fs.statSync(sessionPath);
+		const there = fs.statSync(otherPath);
+		return here.ino === there.ino && here.dev === there.dev;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Where the agent loop that writes a journal runs: nowhere (`free`), in this
+ * process on this very file (`here`), in this process on another file that
+ * carries the same session id (`copy`), or in another omp process
+ * (`elsewhere`).
+ */
+export type SessionJournalLiveness = "free" | "here" | "copy" | "elsewhere";
+
+/**
+ * Whether a live agent loop writes the session in the journal at
+ * `sessionPath`, and where it runs. A `free` journal is a parked transcript:
+ * it can be reopened, revived, and offered to peers as revivable. Anything
+ * else belongs to a running session, so a registry ref derived from it would
+ * offer a running agent as a revivable transcript.
+ *
+ * Keyed by the session id in the header — the identity the ownership lease
+ * uses — so one journal reached through a symlink, a hard link, or after a
+ * move gives one answer. A plain copy of a live journal carries that same id,
+ * so it reads as live too; `copy` separates it from the journal this process
+ * actually writes, which `here` names, because only the latter is a session
+ * running here. Across processes the lease carries no path, so a copy of a
+ * journal another process runs is `elsewhere` like the original: nothing may
+ * run a second loop under a session id while the first loop holds it.
+ */
+export function sessionJournalLiveness(sessionPath: string): SessionJournalLiveness {
+	const id = readSessionHeaderIdSync(sessionPath);
+	if (id === undefined) return "free";
+	const held = sessionLeases.get(id);
+	// This process holds the lease. Only a writer is an agent loop appending to
+	// the journal — a transfer guard or a collab replica claim is not — and the
+	// lock below answers "held" for this process's own lease anyway.
+	if (held) {
+		if (held.writers === 0) return "free";
+		return held.writerPath !== undefined && isSameJournalFile(held.writerPath, sessionPath) ? "here" : "copy";
+	}
+	let lease: FileLockHandle | null;
+	try {
+		lease = tryAcquireSessionLease(id);
+	} catch (err) {
+		// A lock this process cannot probe says nothing about the journal: keep
+		// the answer every caller had before the probe existed rather than hide
+		// a transcript behind a broken lock directory.
+		logger.debug("Session ownership lease probe failed", { sessionPath, error: toError(err).message });
+		return "free";
+	}
+	if (!lease) return "elsewhere";
+	lease.release();
+	return "free";
 }
 
 /**
@@ -677,11 +900,17 @@ export function probeSessionLeases(sessionIds: readonly string[]): SessionLeaseR
 const LINE_STREAM_CHUNK = 1 << 20;
 
 /** Write `lines` to a new file at `target` in bounded chunks, never holding their full concatenation. */
-function writeLinesToFileSync(target: string, lines: readonly string[]): void {
+function writeLinesToFileSync(target: string, lines: Iterable<string>): void {
 	const fd = fs.openSync(target, "w");
 	try {
 		let chunk = "";
 		for (const line of lines) {
+			if (line.length >= LINE_STREAM_CHUNK) {
+				if (chunk.length > 0) fs.writeFileSync(fd, chunk);
+				chunk = "";
+				fs.writeFileSync(fd, line);
+				continue;
+			}
 			chunk += line;
 			if (chunk.length < LINE_STREAM_CHUNK) continue;
 			fs.writeFileSync(fd, chunk);
@@ -697,7 +926,7 @@ function writeLinesToFileSync(target: string, lines: readonly string[]): void {
  * Async {@link writeLinesToFileSync} through a buffered Bun file sink.
  * `target` must be a fresh path: a sink does not truncate an existing file.
  */
-async function writeLinesToFile(target: string, lines: readonly string[]): Promise<void> {
+async function writeLinesToFile(target: string, lines: Iterable<string>): Promise<void> {
 	const sink = Bun.file(target).writer({ highWaterMark: LINE_STREAM_CHUNK });
 	try {
 		for (const line of lines) {
@@ -719,6 +948,8 @@ async function writeLinesToFile(target: string, lines: readonly string[]): Promi
 }
 
 export class FileSessionStorage implements SessionStorage {
+	readonly crossesWorkerBoundary = true;
+
 	#assertExpectedSize(fpath: string, expectedSize: number | null | undefined): void {
 		if (expectedSize === undefined) return;
 		let actualSize: number | null;
@@ -1001,9 +1232,9 @@ export class FileSessionStorage implements SessionStorage {
 	 * spy that intercepts {@link writeTextSync} still sees every full rewrite:
 	 * the lines are then joined and routed through it.
 	 */
-	writeLinesSync(fpath: string, lines: readonly string[], options?: SessionStorageWriteOptions): void {
+	writeLinesSync(fpath: string, lines: Iterable<string>, options?: SessionStorageWriteOptions): void {
 		if (this.writeTextSync !== FileSessionStorage.prototype.writeTextSync) {
-			this.writeTextSync(fpath, lines.join(""), options);
+			this.writeTextSync(fpath, Array.from(lines).join(""), options);
 			return;
 		}
 		this.#publishSync(fpath, tempPath => writeLinesToFileSync(tempPath, lines), options);
@@ -1068,20 +1299,37 @@ export class FileSessionStorage implements SessionStorage {
 
 	statSync(path: string): SessionStorageStat {
 		const stats = fs.statSync(path);
-		return { size: stats.size, mtimeMs: stats.mtimeMs, mtime: stats.mtime };
+		return { size: stats.size, mtimeMs: stats.mtimeMs, mtime: stats.mtime, birthtimeMs: stats.birthtimeMs };
 	}
 
 	listFilesSync(dir: string, pattern: string): string[] {
 		try {
 			// Bun.Glob walks no symlink unless asked, and a transcript placed in
 			// a session directory as one — a launcher's, a supervisor's — is a
-			// transcript like any other (#15878)
-			return Array.from(new Bun.Glob(pattern).scanSync({ cwd: dir, followSymlinks: true })).map(name =>
+			// transcript like any other (#15878). `dot` likewise: a transcript
+			// whose agent id starts with a dot is a transcript, and a key-indexed
+			// backend lists it, so the two backends must agree.
+			return Array.from(new Bun.Glob(pattern).scanSync({ cwd: dir, followSymlinks: true, dot: true })).map(name =>
 				path.join(dir, name),
 			);
-		} catch {
-			return [];
+		} catch (err) {
+			if (isMissingDirectory(err)) return [];
+			throw err;
 		}
+	}
+
+	listDirsSync(dir: string): string[] {
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch (err) {
+			if (isMissingDirectory(err)) return [];
+			throw err;
+		}
+		// Real directories only: a transcript stem such as "." or ".." would
+		// revisit an ancestor, and a symlinked directory can loop back into the
+		// tree a walk is descending.
+		return entries.filter(entry => entry.isDirectory()).map(entry => entry.name);
 	}
 
 	async exists(path: string): Promise<boolean> {
@@ -1094,7 +1342,9 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
-	readText(path: string): Promise<string> {
+	async readText(path: string): Promise<string> {
+		// A `gc --archive` copy is a single gzip member; nothing can read it end-first.
+		if (isArchivedSessionPath(path)) return utf8Decoder.decode(await inflateArchivedBytes(path));
 		return Bun.file(path).text();
 	}
 
@@ -1102,7 +1352,40 @@ export class FileSessionStorage implements SessionStorage {
 		return fs.readFileSync(path, "utf8");
 	}
 
+	readTextRangeSync(path: string, start: number, end: number): string {
+		const fd = fs.openSync(path, "r");
+		try {
+			const buffer = Buffer.allocUnsafe(Math.max(0, end - start));
+			let read = 0;
+			while (read < buffer.length) {
+				const n = fs.readSync(fd, buffer, read, buffer.length - read, start + read);
+				if (n === 0) break;
+				read += n;
+			}
+			return buffer.toString("utf8", 0, read);
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+
+	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
+		const { size } = await fsp.stat(path);
+		if (offset >= size) return { text: "", size };
+		const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
+		return { text: await Bun.file(path).slice(offset, end).text(), size };
+	}
+
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+		// A gzip member cannot be read end-first, so an archived transcript is
+		// inflated whole and then windowed. Only the listing of an archive hits
+		// this; the live tree keeps the two bounded reads.
+		if (isArchivedSessionPath(path)) {
+			const bytes = await inflateArchivedBytes(path);
+			const head = utf8Decoder.decode(bytes.subarray(0, prefixBytes));
+			const tail =
+				suffixBytes > 0 ? utf8Decoder.decode(bytes.subarray(Math.max(0, bytes.length - suffixBytes))) : "";
+			return [head, tail];
+		}
 		return peekFileEnds(path, prefixBytes, suffixBytes, (head, tail) => [
 			utf8Decoder.decode(head),
 			utf8Decoder.decode(tail),
@@ -1134,9 +1417,9 @@ export class FileSessionStorage implements SessionStorage {
 	 * subclass or spy that intercepts {@link writeTextAtomic} still sees every
 	 * full rewrite: the lines are then joined and routed through it.
 	 */
-	async writeLinesAtomic(fpath: string, lines: readonly string[], options?: WriteTextAtomicOptions): Promise<void> {
+	async writeLinesAtomic(fpath: string, lines: Iterable<string>, options?: WriteTextAtomicOptions): Promise<void> {
 		if (this.writeTextAtomic !== FileSessionStorage.prototype.writeTextAtomic) {
-			return this.writeTextAtomic(fpath, lines.join(""), options);
+			return this.writeTextAtomic(fpath, Array.from(lines).join(""), options);
 		}
 		await this.#publishAtomic(fpath, tempPath => writeLinesToFile(tempPath, lines), options);
 	}
@@ -1330,12 +1613,29 @@ export class FileSessionStorage implements SessionStorage {
 	 * under ~/.omp/run/session-owners), so the kernel drops a dead owner's claim.
 	 * Never throws: a lock that cannot be taken for another reason counts as
 	 * owned, so it never moves a session off its file.
+	 *
+	 * A writer claim is refused while this process already has a writer on the
+	 * journal, so the caller is diverted to a sibling file exactly as a second
+	 * process is, instead of appending into a journal another session here is
+	 * writing.
 	 */
-	claimSession(sessionId: string, sessionPath: string): (() => void) | null {
+	claimSession(sessionId: string, sessionPath: string, options?: SessionClaimOptions): (() => void) | null {
 		const onDisk = readSessionHeaderIdSync(sessionPath);
 		if (onDisk !== undefined && onDisk !== sessionId) return null;
+		const writer = options?.writer === true;
 		let held = sessionLeases.get(sessionId);
-		if (!held) {
+		if (held) {
+			// A handover takes a slot beside the writer of the SAME journal, and
+			// only that: the manager being cloned keeps appending until it moves
+			// on, and each of the two releases its own slot, so the journal reads
+			// live throughout. A writer on any other path under this session id
+			// is the copy the one-writer rule exists to refuse.
+			const handover =
+				options?.handover === true &&
+				held.writerPath !== undefined &&
+				isSameJournalFile(held.writerPath, sessionPath);
+			if (writer && held.writers > 0 && !handover) return null;
+		} else {
 			let lease: FileLockHandle | null;
 			try {
 				lease = tryAcquireSessionLease(sessionId);
@@ -1344,19 +1644,34 @@ export class FileSessionStorage implements SessionStorage {
 				return () => {};
 			}
 			if (!lease) return null;
-			held = { lease, holders: 0 };
+			held = { lease, holders: 0, writers: 0 };
 			sessionLeases.set(sessionId, held);
 		}
 		const claim = held;
 		claim.holders++;
+		if (writer) {
+			claim.writers++;
+			// One writer per journal, so one path: it tells a journal this
+			// process is running from a copy of it that shares the session id.
+			claim.writerPath = sessionPath;
+		}
 		let released = false;
 		return () => {
 			if (released) return;
 			released = true;
+			if (writer) {
+				claim.writers--;
+				if (claim.writers === 0) claim.writerPath = undefined;
+			}
 			if (--claim.holders > 0) return;
 			sessionLeases.delete(sessionId);
 			claim.lease.release();
 		};
+	}
+
+	retargetWriterClaim(sessionId: string, sessionPath: string): void {
+		const held = sessionLeases.get(sessionId);
+		if (held && held.writers > 0) held.writerPath = sessionPath;
 	}
 
 	/**
@@ -1414,7 +1729,17 @@ export class FileSessionStorage implements SessionStorage {
 		// newest stale backup (#11499). Best-effort — a locked file warns
 		// instead of failing the delete the user asked for.
 		const base = path.basename(sessionPath);
-		for (const bak of this.listFilesSync(path.dirname(sessionPath), "*.bak")) {
+		let backups: string[];
+		try {
+			backups = this.listFilesSync(path.dirname(sessionPath), "*.bak");
+		} catch (err) {
+			logger.warn("Failed to list stale session backups during delete", {
+				dir: path.dirname(sessionPath),
+				error: toError(err).message,
+			});
+			return;
+		}
+		for (const bak of backups) {
 			if (!path.basename(bak).startsWith(`${base}.`)) continue;
 			try {
 				await fsp.unlink(bak);
@@ -1428,7 +1753,64 @@ export class FileSessionStorage implements SessionStorage {
 	}
 }
 
-function matchesPattern(name: string, pattern: string): boolean {
+let defaultStorage: SessionStorage | undefined;
+
+/**
+ * The storage every session factory, listing, resume, and maintenance path
+ * falls back to when the caller passes none. Lazily a {@link FileSessionStorage}
+ * (stateless, so one shared instance is safe); {@link setDefaultSessionStorage}
+ * replaces it with the configured storage before the first session is opened,
+ * so `--resume`, the resume picker, `--continue`, and listing all read the same
+ * store the session is written to.
+ */
+export function defaultSessionStorage(): SessionStorage {
+	defaultStorage ??= new FileSessionStorage();
+	return defaultStorage;
+}
+
+/** Install the process-wide default storage. Call before any session is opened. */
+export function setDefaultSessionStorage(storage: SessionStorage): void {
+	defaultStorage = storage;
+}
+
+/**
+ * The storage holding a session's transcript tree: where its subagents' and
+ * advisors' transcripts are written, read, and revived. A session that
+ * persists keeps them in its own manager's storage; one without a session file
+ * (in-memory) hands its children a temporary directory, which the default
+ * session storage holds.
+ */
+export function sessionTreeStorage(session: {
+	getSessionFile(): string | null;
+	sessionManager?: { getStorage?(): SessionStorage };
+}): SessionStorage {
+	return (session.getSessionFile() ? session.sessionManager?.getStorage?.() : undefined) ?? defaultSessionStorage();
+}
+
+/**
+ * The UTF-8 text of `filePath` in `storage` from byte `offset` to the end, or
+ * at most `maxBytes` of it, with the full size the read observed:
+ * {@link SessionStorage.readTextFrom} where the backend has it, else a whole
+ * read cut at `offset`. A caller tailing a transcript (RPC subagent reads,
+ * collab transcript pages) passes back the byte where its last complete line
+ * ended, so the start never splits a character; a capped read may end inside
+ * one (decoded as U+FFFD), so such a caller keeps text only through the last
+ * newline.
+ */
+export async function readSessionTextFrom(
+	storage: SessionStorage,
+	filePath: string,
+	offset: number,
+	maxBytes?: number,
+): Promise<{ text: string; size: number }> {
+	if (storage.readTextFrom) return storage.readTextFrom(filePath, offset, maxBytes);
+	const bytes = Buffer.from(await storage.readText(filePath), "utf8");
+	if (offset >= bytes.length) return { text: "", size: bytes.length };
+	const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
+	return { text: bytes.subarray(offset, end).toString("utf8"), size: bytes.length };
+}
+
+function matchesPatternSegment(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
 	if (pattern.startsWith("*.")) {
 		return name.endsWith(pattern.slice(1));
@@ -1437,15 +1819,62 @@ function matchesPattern(name: string, pattern: string): boolean {
 }
 
 /**
- * Name of `key` when it sits directly inside `resolvedDir` (a `path.resolve`d
- * directory), else `undefined`. Key-indexed storages keep whatever spelling
- * callers wrote, so both sides are resolved: on Windows `/sessions/x` and the
- * `path.join`-built `\sessions\x\…` keys must list as the same directory.
+ * Name of `key` relative to `resolvedDir` (a `path.resolve`d directory),
+ * slash-joined, when it sits exactly `segments` levels inside it; else
+ * `undefined`. Key-indexed storages keep whatever spelling callers wrote, so
+ * both sides are resolved: on Windows `/sessions/x` and the `path.join`-built
+ * `\sessions\x\…` keys must list as the same directory.
  */
-export function directChildKeyName(resolvedDir: string, key: string): string | undefined {
-	const name = path.basename(key);
-	if (!name || name.includes("/") || name.includes("\\")) return undefined;
-	return path.resolve(path.dirname(key)) === resolvedDir ? name : undefined;
+export function childKeyName(resolvedDir: string, key: string, segments: number): string | undefined {
+	const names: string[] = [];
+	let parent = key;
+	for (let i = 0; i < segments; i++) {
+		const name = path.basename(parent);
+		if (!name || name.includes("/") || name.includes("\\")) return undefined;
+		names.unshift(name);
+		parent = path.dirname(parent);
+	}
+	return path.resolve(parent) === resolvedDir ? names.join("/") : undefined;
+}
+
+/**
+ * The directory names that `keys` imply directly inside `resolvedDir` (a
+ * `path.resolve`d directory): the first segment of every key that sits at
+ * least two levels inside it. Key-indexed storages hold no directory entries,
+ * so a directory exists exactly while a key lives below it — which is what
+ * makes a subagent tree walkable on those backends.
+ */
+export function childDirNames(resolvedDir: string, keys: Iterable<string>): string[] {
+	const names = new Set<string>();
+	for (const key of keys) {
+		let child = path.dirname(key);
+		for (;;) {
+			const parent = path.dirname(child);
+			if (parent === child) break;
+			const name = path.basename(child);
+			if (!name || name.includes("/") || name.includes("\\")) break;
+			if (path.resolve(parent) === resolvedDir) {
+				names.add(name);
+				break;
+			}
+			child = parent;
+		}
+	}
+	return [...names];
+}
+
+/**
+ * Match a slash-joined path remainder against a pattern of the same shape
+ * (a single segment such as `"*.jsonl"`, or a wildcard project directory
+ * followed by `"*.jsonl"` for the one-level cross-project case). Segment
+ * counts must agree, so a direct child never matches a two-segment pattern
+ * and a nested key never matches a one-segment one.
+ */
+function matchesPattern(name: string, pattern: string): boolean {
+	const nameParts = name.split("/");
+	const patternParts = pattern.split("/");
+	if (nameParts.length !== patternParts.length) return false;
+	return nameParts.every((part, i) => matchesPatternSegment(part, patternParts[i]));
 }
 
 class MemorySessionStorageWriter implements SessionStorageWriter {
@@ -1704,12 +2133,21 @@ export class MemorySessionStorage implements SessionStorage {
 	listFilesSync(dir: string, pattern: string): string[] {
 		const resolvedDir = path.resolve(dir);
 		const files: string[] = [];
+		const segments = pattern.split("/").length;
 		for (const key of this.#files.keys()) {
-			const name = directChildKeyName(resolvedDir, key);
+			const name = childKeyName(resolvedDir, key, segments);
 			if (name === undefined || !matchesPattern(name, pattern)) continue;
 			files.push(key);
 		}
 		return files;
+	}
+
+	listDirsSync(dir: string): string[] {
+		return childDirNames(path.resolve(dir), this.#files.keys());
+	}
+
+	listAllSync(): string[] {
+		return [...this.#files.keys()];
 	}
 
 	exists(path: string): Promise<boolean> {
@@ -1726,6 +2164,26 @@ export class MemorySessionStorage implements SessionStorage {
 		const entry = this.#files.get(path);
 		if (!entry) throw memoryFileNotFound(path);
 		return materializeMemoryEntry(entry);
+	}
+
+	readTextRangeSync(path: string, start: number, end: number): string {
+		const entry = this.#files.get(path);
+		if (!entry) throw memoryFileNotFound(path);
+		const from = Math.max(0, Math.min(start, entry.size));
+		const to = Math.max(from, Math.min(end, entry.size));
+		let text = "";
+		for (let i = upperBound(entry.cumulativeBytes, from); i < entry.chunks.length; i++) {
+			const chunkStart = i === 0 ? 0 : entry.cumulativeBytes[i - 1];
+			if (chunkStart >= to) break;
+			const chunkEnd = entry.cumulativeBytes[i];
+			text += decodeChunkByteRange(
+				entry.chunks[i],
+				Math.max(from, chunkStart) - chunkStart,
+				Math.min(to, chunkEnd) - chunkStart,
+				chunkEnd - chunkStart,
+			);
+		}
+		return text;
 	}
 
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {

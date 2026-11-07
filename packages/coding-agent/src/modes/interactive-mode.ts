@@ -13,6 +13,7 @@ import type {
 	AutocompleteProvider,
 	Component,
 	EditorTheme,
+	HistoryFlushOptions,
 	KeyId,
 	LoaderMessageColorFn,
 	OverlayHandle,
@@ -22,6 +23,7 @@ import type {
 import {
 	Container,
 	clearRenderCache,
+	EXIT_FLUSH_MAX_ROWS,
 	getComposerStyle,
 	getPaddingX,
 	getWidthConfigEpoch,
@@ -33,11 +35,12 @@ import {
 	setTuiTight,
 	TERMINAL,
 	Text,
-	type TUI,
+	TUI,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import type { TerminalAppearanceRequestToken } from "@oh-my-pi/pi-tui/terminal";
+import { writeStderrBehindTerminal } from "@oh-my-pi/pi-tui/terminal-handoff";
 import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
 import { col, compact, kbd, keyed, node, row, span, text } from "@oh-my-pi/pi-tui/native/describe";
 import {
@@ -65,6 +68,7 @@ import {
 	formatNumber,
 	getActiveProfile,
 	getProjectDir,
+	isBunTestRuntime,
 	isEnoent,
 	logger,
 	postmortem,
@@ -80,6 +84,7 @@ import { CollabController } from "../collab/controller";
 import type { CollabHost } from "../collab/host";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey, rawKeyHint } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
+import { reduceMotionLevel } from "@oh-my-pi/pi-tui/reduce-motion";
 import { formatModelString, type ResolvedModelRoleValue, resolveModelRoleValue } from "../config/model-resolver";
 import { isSettingsInitialized, Settings, settings } from "../config/settings";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
@@ -162,6 +167,7 @@ import { modelMentionChipLabel, shiftImageMarkers } from "@oh-my-pi/pi-tui/promp
 import { isTranscriptEntry, type SessionContext } from "../session/session-context";
 import type { SessionManager } from "../session/session-manager";
 import { loadPinnedSessionIds } from "../session/session-pins";
+import type { RefreshSkillsOptions } from "../session/session-tools";
 import {
 	canAutoCreateWorktree,
 	planWorktreeExit,
@@ -259,6 +265,7 @@ import {
 	setProgramStatusEnabled,
 } from "../utils/run-status";
 import {
+	applyTerminalTitleReduceMotion,
 	disposeTerminalTitleState,
 	initTerminalTitleState,
 	popTerminalTitle,
@@ -408,6 +415,7 @@ import {
 	cfgDisplayCollapseCompacted,
 	cfgDisplayHideToolActivity,
 	cfgDisplayPinnedAgents,
+	cfgDisplayReduceMotion,
 	cfgDisplayShellVisualization,
 	cfgDisplayShowTokenUsage,
 	cfgDisplayShowTurnTime,
@@ -497,6 +505,7 @@ const cfgLiveUiSettings = combine({
 	"tui.vimModeDisplay": cfgTuiVimModeDisplay,
 	"display.pinnedAgents": cfgDisplayPinnedAgents,
 	"display.subagentLivePreview": cfgDisplaySubagentLivePreview,
+	"display.reduceMotion": cfgDisplayReduceMotion,
 	"compaction.idleEnabled": cfgCompactionIdleEnabled,
 	"compaction.idleThresholdTokens": cfgCompactionIdleThresholdTokens,
 	"compaction.idleTimeoutSeconds": cfgCompactionIdleTimeoutSeconds,
@@ -2140,7 +2149,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// An MCP sign-in can wait for the user mid-turn; like the auto-QA and cfg:// prompts below, it runs as a wait for
 		// the user (AgentSession.waitForUser).
 		this.mcpManager?.setAuthHandler((serverName, challenge) =>
-			this.session.waitForUser(() => new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge)),
+			this.session.waitForUser(
+				() => new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge),
+				`an MCP sign-in for ${serverName}`,
+			),
 		);
 		this.#eventBus = eventBus;
 		this.#subagentEventBus = subagentEventBus;
@@ -2170,6 +2182,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		setSvgFigureRendering(cfgTuiRenderSvg.get(settings));
 		this.#applyAutoGraphSetting();
 		this.#applyTextSizingSetting();
+		this.#applyReduceMotion();
 		// Keep generic pi-tui renderers aligned with the coding-agent setting.
 		applyFileLinkSetting();
 		applyHyperlinkSetting();
@@ -2203,6 +2216,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				if ((this.viewSession.extensionRunner?.getLinkSchemes().length ?? 0) > 0) this.#redrawExtensionLinks();
 			}),
 		);
+		// Every exiting stop (quit, Ctrl+D, a postmortem restore other than a
+		// signal) flushes on this session's condition.
+		this.ui.setExitFlushProvider(() => this.#exitFlush());
 		this.chatContainer = new TranscriptContainer();
 		this.pendingShellContainer = new AnchoredLiveContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
@@ -2247,7 +2263,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#syncEditorMaxHeight();
 		};
 		process.stdout.on("resize", this.#resizeHandler);
-		setWordPredictionHost(textPredictionBackend);
+		// The backend is the machine-global text-predict daemon. A test process that
+		// types prose into a real editor would start the developer's broker and daemon
+		// and leave them running, so tests get no host and editors show no ghost text.
+		if (!isBunTestRuntime()) setWordPredictionHost(textPredictionBackend);
 		try {
 			this.historyStorage = HistoryStorage.open();
 			this.editor.setHistoryStorage(this.historyStorage);
@@ -2437,6 +2456,17 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async init(options: InteractiveModeInitOptions = {}): Promise<void> {
 		if (this.isInitialized) return;
+		// A turn a `session_start`/`resources_discover` handler starts must not run
+		// before the TUI observes it: hold extension sends until init has subscribed
+		// to the session, settled its mode, restored the draft and released input.
+		// The turn then starts as init returns, renders live and takes input like
+		// any other turn; init does not wait for it. A failed init discards them.
+		const sends = this.session.extensionRunner?.sends;
+		if (sends) await sends.withHeld(() => this.#init(options));
+		else await this.#init(options);
+	}
+
+	async #init(options: InteractiveModeInitOptions): Promise<void> {
 		this.#idleMaintenanceActivity.scheduledTurn = target =>
 			target === this.session &&
 			(this.#goalContinuationTimer !== undefined ||
@@ -2445,7 +2475,6 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.#pendingLoopIterations > 0);
 		this.#idleMaintenanceActivity.presentRecap = recap => this.#eventController.presentIdleRecap(recap);
 		this.syncIdleMaintenanceView();
-
 		// Fresh dialog lifetime: a previous stop (if this mode is ever
 		// re-initialized) left the old controller aborted, and approvals queued
 		// behind the approval mutex must prompt on a live signal, not a dead one.
@@ -2494,7 +2523,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// `Settings.instance` is the disk-backed singleton; passing it explicitly
 		// guarantees the decision persists even when the prompt is triggered
 		// from a subagent whose own `Settings` is an in-memory snapshot.
-		setAutoQaConsentHandler(() => this.session.waitForUser(() => this.#promptAutoQaConsent()), Settings.instance);
+		setAutoQaConsentHandler(
+			() => this.session.waitForUser(() => this.#promptAutoQaConsent(), "auto-QA consent", { kind: "permission" }),
+			Settings.instance,
+		);
 		// Same wiring for cfg:// writes: every settings change the agent makes is
 		// confirmed here, and `/save` persists to disk. Subagents and headless
 		// sessions are refused by the handler before reaching this host. Changes
@@ -2505,7 +2537,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			// like a timed `ask`.
 			approve: (request, options) =>
 				askTimeoutMs(this.session.settings) === undefined
-					? this.session.waitForUser(() => this.#promptCfgChange(request, options?.signal))
+					? this.session.waitForUser(
+							() => this.#promptCfgChange(request, options?.signal),
+							`a cfg:// write of ${request.path}`,
+							{ kind: "permission" },
+						)
 					: this.#promptCfgChange(request, options?.signal),
 			applied: change => {
 				if (change.settings !== this.session.settings) return;
@@ -2736,7 +2772,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.isInitialized = true;
 		// The startup composer is already visible. Commit the complete runtime
 		// tree before session_start hooks/reconciliation continue; renderNow keeps
-		// TUI's multiplexer, output-backlog, and image safety gates.
+		// TUI's multiplexer and image safety gates. It paints through #doRender
+		// rather than #executeRender, so the output-backlog deferral does not
+		// apply and the frame is written even when the terminal is behind.
 		this.ui.renderNow();
 
 		const streamCwd = this.sessionManager.getCwd();
@@ -2799,6 +2837,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		// The owning caller keeps guest mutations gated through its full outer
 		// startup; early dialog answers do not require that readiness signal.
 		if (options.autoStartCollab === true) this.collabController.autoStart();
+
+		// Subscribe to agent events before the startup hooks run: a `session_start`
+		// hook can raise a dialog only a person can answer, and that dialog holds
+		// init here. Its `user_wait_start`/`user_wait_end` bracket is published
+		// once, when the dialog opens and settles, so a subscription installed
+		// after the hooks returns would miss both and leave the title and the OSC
+		// record reporting an idle session while the dialog stands.
+		this.#subscribeToAgent();
 
 		// Initialize hooks with TUI-based UI context
 		await logger.time("InteractiveMode.init:hooks", () => this.initHooksAndCustomTools());
@@ -2876,9 +2922,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		} catch (err) {
 			logger.warn("Failed to restore session draft", { error: String(err) });
 		}
-
-		// Subscribe to agent events
-		this.#subscribeToAgent();
 
 		// Job widgets refresh in the background; repaint the HUD and status line glance when one changes.
 		this.#syncJobWidgetsListener();
@@ -3098,10 +3141,27 @@ export class InteractiveMode implements InteractiveModeContext {
 		return [...builtinCommands, ...hookCommands, ...customCommands, ...skillCommandList];
 	}
 
+	/**
+	 * Rebuilds the pending slash commands, including `/skill:<name>` entries, from
+	 * live session state and re-points the editor's autocomplete provider at the
+	 * result. The provider snapshots `#pendingSlashCommands` when
+	 * `refreshSlashCommandState` builds it, and `init:slashCommands` runs before
+	 * the startup `resources_discover` pass — so without the rebuild, skills an
+	 * extension contributes at startup are invocable but never offered in
+	 * autocomplete until the next reload. Reuses the session's already
+	 * discovered file commands, so this never re-walks the providers.
+	 */
+	#syncSkillSlashCommands(): void {
+		this.#pendingSlashCommands = this.#buildPendingSlashCommands();
+		if (this.#baseAutocompleteProvider) {
+			this.#rebuildSlashCommandAutocomplete(this.sessionManager.getCwd());
+		}
+	}
+
 	/** Reload session skills and the `/skill:<name>` command list. */
-	async refreshSkillState(): Promise<void> {
+	async refreshSkillState(options?: RefreshSkillsOptions): Promise<void> {
 		// The session's command-metadata notification rebuilds the picker.
-		await this.session.refreshSkills();
+		await this.session.refreshSkills(options);
 	}
 
 	/** Reload slash commands and autocomplete for the provided working directory. */
@@ -4180,6 +4240,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		return computeEditorMaxHeight(this.ui.terminal.rows);
 	}
 
+	#applyReduceMotion(): void {
+		TUI.setMinRenderInterval(reduceMotionLevel() === "strict" ? 250 : 0);
+		applyTerminalTitleReduceMotion();
+		this.ui.requestRender();
+	}
+
 	#syncEditorMaxHeight(): void {
 		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
 	}
@@ -4260,6 +4326,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#renderSubagentList();
 			this.ui.requestRender();
 		}
+		if (any("display.reduceMotion")) this.#applyReduceMotion();
 		const composerPrediction = this.#eventController.composerPrediction;
 		if (
 			(any("composer.predictions") && !next["composer.predictions"]) ||
@@ -4860,6 +4927,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#subagentCostHydratedRoot = rootSessionFile;
 		registerPersistedSubagents(AgentRegistry.global(), rootSessionFile, {
 			shouldContinue: () => this.sessionManager.getSessionFile() === rootSessionFile,
+			storage: this.sessionManager.getStorage(),
 		}).catch(error => {
 			logger.warn("Persisted subagent cost hydration failed", { rootSessionFile, error: String(error) });
 		});
@@ -6773,7 +6841,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		try {
-			this.ui.stop();
+			this.ui.stop({ resuming: true });
 			const result = await openInEditor(editorCmd, currentText, {
 				extension: path.extname(resolvedPath) || ".md",
 				trimTrailingNewline: false,
@@ -6799,7 +6867,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		try {
-			this.ui.stop();
+			this.ui.stop({ resuming: true });
 			const result = await openInEditor(editorCmd, draft, { extension: ".md" });
 			if (result !== null) {
 				commit(result);
@@ -8265,7 +8333,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		const sessionId = this.#resumableSessionId();
 		if (sessionId) {
 			// Command on its own line so triple-click selects just the command (#11001).
-			process.stderr.write(`\n${chalk.dim("Resume this session with")}\n${chalk.dim(resumeCommand(sessionId))}\n`);
+			// A stalled terminal may not have read the restore yet; the hint queues behind it.
+			writeStderrBehindTerminal(
+				`\n${chalk.dim("Resume this session with")}\n${chalk.dim(resumeCommand(sessionId))}\n`,
+			);
 		}
 
 		await this.#quitHostOwned(0);
@@ -8388,6 +8459,29 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.showStatus("Closing session…");
 	}
 
+	/**
+	 * How the transcript flushes when this session hands the terminal back at
+	 * exit: capped only when the backing store has confirmed the session file,
+	 * which keeps the messages the cap skips; otherwise native scrollback is the
+	 * transcript's only copy, so it gets the full flush. A remote store with a
+	 * write still in flight does not count, since the exit can abort that write.
+	 * A failed teardown (the escape hatch quits without writing the log) or a
+	 * latched disk failure means the file exists but lacks the newest entries,
+	 * so both flush in full. Notices (errors, warnings) are never persisted, so a
+	 * capped exit does not keep those older than the capped rows.
+	 */
+	#exitFlush(): HistoryFlushOptions {
+		if (
+			this.#teardownFailed ||
+			this.sessionManager.hasPersistenceFailure() ||
+			!this.sessionManager.getSessionId() ||
+			!this.sessionManager.isSessionConfirmedOnDisk()
+		) {
+			return {};
+		}
+		return { maxRows: EXIT_FLUSH_MAX_ROWS };
+	}
+
 	/** Shared `shutdown()`/`restart()` teardown: dispose the session and hand the terminal back. */
 	async #teardown(): Promise<void> {
 		// An in-flight loop condition (or a deferred auto-submit timer) must not
@@ -8440,15 +8534,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Close the TSP surfaces first so the drain below also swallows what the
 		// terminal still sends them (acks, events) instead of the shell.
 		this.ui.closeNative();
-		// Drain any in-flight Kitty key release events before stopping.
-		// This prevents escape sequences from leaking to the parent shell over slow SSH.
-		await this.ui.terminal.drainInput(1000);
+		// Settle queued output first so the title pop below heads the queue. Queued
+		// behind a backlog, a later settle (drainInput's, then `ui.stop()`'s) could
+		// drop it, and the parent shell would keep omp's title.
+		this.ui.terminal.settleOutput?.();
 		// Stop the run-state spinner interval BEFORE restoring the shell title, so a
 		// pending tick cannot re-emit an OSC title after `popTerminalTitle` hands the
 		// terminal back (which would leave the parent shell with a `π ⠋ …` tab).
 		disposeTerminalTitleState();
 		disposeProgramStatus();
 		popTerminalTitle();
+		// Drain any in-flight Kitty key release events before stopping.
+		// This prevents escape sequences from leaking to the parent shell over slow SSH.
+		await this.ui.terminal.drainInput(1000);
 		this.stop();
 	}
 
@@ -9882,8 +9980,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	// Hook UI methods
-	initHooksAndCustomTools(): Promise<void> {
-		return this.#extensionUiController.initHooksAndCustomTools();
+	async initHooksAndCustomTools(): Promise<void> {
+		await this.#extensionUiController.initHooksAndCustomTools();
+		// The controller's startup resources_discover pass may have
+		// contributed a new skill directory (session.skills), but the
+		// subscribeCommandMetadataChanged listener that keeps skillCommands
+		// in sync is registered later, in init() — sync once here so a skill
+		// discovered at startup is immediately recognized by `/skill:<name>`
+		// and offered in autocomplete instead of waiting for a later reload.
+		this.#syncSkillSlashCommands();
 	}
 
 	getToolUIContext(): ExtensionUIContext | undefined {

@@ -4,6 +4,7 @@ import { OverlayPanel, PanelRows } from "../chrome/overlay-box";
 import { type KeyId, matchesKey } from "../keys";
 import { sliceWithWidth, truncateToWidth, visibleWidth } from "../utils";
 import { sanitizeDisplaySingleLine } from "../overlays/extensions/display-text";
+import { isReduceMotion } from "../reduce-motion";
 import { type ThemeColor, theme } from "../theme/theme";
 import type { TspTone } from "@oh-my-pi/pi-wire";
 import { card, node, row, span, text } from "../native/describe";
@@ -290,9 +291,10 @@ export class LiveVisualizer implements Component {
 		const output = Array.from({ length: rows }, () => "");
 		const energy = this.#phase === "muted" ? 0 : Math.min(1, Math.sqrt(this.#displayLevel * 5));
 		const maxHeight = rows * (SPECTRUM_BLOCKS.length - 1);
+		const frame = isReduceMotion() ? 0 : this.#frame;
 		for (let column = 0; column < width; column += 1) {
-			const carrier = 0.5 + 0.5 * Math.sin(this.#frame * 0.43 + column * 0.71);
-			const shimmer = 0.5 + 0.5 * Math.sin(this.#frame * 0.19 - column * 1.17);
+			const carrier = 0.5 + 0.5 * Math.sin(frame * 0.43 + column * 0.71);
+			const shimmer = 0.5 + 0.5 * Math.sin(frame * 0.19 - column * 1.17);
 			const height = Math.round(energy * (0.3 + carrier * 0.5 + shimmer * 0.2) * maxHeight);
 			for (let row = 0; row < rows; row += 1) {
 				const units = Math.max(0, Math.min(SPECTRUM_BLOCKS.length - 1, height - (rows - row - 1) * 8));

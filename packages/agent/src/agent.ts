@@ -23,6 +23,7 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -1813,13 +1814,13 @@ export class Agent {
 				const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(dequeueSignal);
 				if (this.#abortController !== continuationAbortController) return;
 				if (queuedSteering.length > 0) {
-					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
+					await this.#runLoop([], { dequeued: { queue: "steering", messages: queuedSteering } }, signal, true);
 					return;
 				}
 				const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(dequeueSignal);
 				if (this.#abortController !== continuationAbortController) return;
 				if (queuedFollowUp.length > 0) {
-					await this.#runLoop(queuedFollowUp, undefined, signal, true);
+					await this.#runLoop([], { dequeued: { queue: "followUp", messages: queuedFollowUp } }, signal, true);
 					return;
 				}
 				throw new Error("No messages to continue from");
@@ -1837,14 +1838,14 @@ export class Agent {
 				const queuedSteering = await this.#dequeueSteeringMessagesAfterHooks(dequeueSignal);
 				if (this.#abortController !== continuationAbortController) return;
 				if (queuedSteering.length > 0) {
-					await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true }, signal, true);
+					await this.#runLoop([], { dequeued: { queue: "steering", messages: queuedSteering } }, signal, true);
 					return;
 				}
 
 				const queuedFollowUp = await this.#dequeueFollowUpMessagesAfterHooks(dequeueSignal);
 				if (this.#abortController !== continuationAbortController) return;
 				if (queuedFollowUp.length > 0) {
-					await this.#runLoop(queuedFollowUp, undefined, signal, true);
+					await this.#runLoop([], { dequeued: { queue: "followUp", messages: queuedFollowUp } }, signal, true);
 					return;
 				}
 
@@ -1877,17 +1878,22 @@ export class Agent {
 	 * Run the agent loop.
 	 * If messages are provided, starts a new conversation turn with those messages.
 	 * Otherwise, continues from existing context.
+	 *
+	 * `dequeued` is a batch a continuation already took from its queue. The loop receives it as the
+	 * opening turn's dequeued input rather than as prompts, because dequeued input stays the queue's
+	 * until a turn records it: a run that aborts first (e.g. while paused) leaves it for
+	 * {@link #restoreUndeliveredQueuedMessages} to requeue instead of recording it unanswered.
 	 */
 	async #runLoop(
 		messages?: AgentMessage[],
-		options?: AgentPromptOptions & { skipInitialSteeringPoll?: boolean },
+		options?: AgentPromptOptions & { dequeued?: { queue: QueuedMessageQueue; messages: AgentMessage[] } },
 		continuationSignal?: AbortSignal,
 		runStateClaimed = false,
 	) {
 		const model = this.#state.model;
 		if (!model) throw new Error("No model configured");
 
-		let skipInitialSteeringPoll = options?.skipInitialSteeringPoll === true;
+		let openingBatch = options?.dequeued;
 		if (!runStateClaimed) {
 			const { promise, resolve } = Promise.withResolvers<void>();
 			this.#runningPrompt = promise;
@@ -2090,11 +2096,13 @@ export class Agent {
 			getDisableReasoning: () => this.#state.disableReasoning,
 			getServiceTier: this.#serviceTierResolver,
 			getSteeringMessages: async signal => {
-				if (skipInitialSteeringPoll) {
-					skipInitialSteeringPoll = false;
-					return [];
-				}
-				return this.#dequeueSteeringMessagesAfterHooks(signal ?? loopSignal);
+				const opening = openingBatch;
+				openingBatch = undefined;
+				// The loop's first poll takes the continuation's batch. A steering batch is this
+				// boundary's whole dequeue; a follow-up batch is joined by steering queued after it.
+				if (opening?.queue === "steering") return opening.messages;
+				const steering = await this.#dequeueSteeringMessagesAfterHooks(signal ?? loopSignal);
+				return opening ? [...opening.messages, ...steering] : steering;
 			},
 			isUndeliveredQueuedMessage: message => this.#isUndeliveredQueuedMessage(message),
 			hasSteeringMessages: () =>
@@ -2114,6 +2122,10 @@ export class Agent {
 			onBeforeYield: () => this.#onBeforeYield?.(),
 			onDetachedToolUpdate: event => this.emitExternalEvent(event),
 			telemetry: this.#telemetry,
+			// Whose executions these are: work started inside one of this agent's
+			// tool calls is attributable to it and to no other agent sharing the
+			// process (see `runInToolCall`).
+			owner: this,
 		};
 
 		let partial: AgentMessage | null = null;
@@ -2215,6 +2227,10 @@ export class Agent {
 				: err instanceof Error
 					? err.message
 					: String(err);
+			// A credential source that produced no key keeps its Transient flag so
+			// turn recovery retries it; other thrown errors stay classified by text.
+			const errorId =
+				!stoppedForAbort && err instanceof AIError.CredentialUnavailableError ? AIError.classify(err) : undefined;
 			const shouldEmitVisibleError = !stoppedForAbort;
 			const assistantPartial = partial?.role === "assistant" ? partial : undefined;
 			const hadAssistantStart = assistantPartial !== undefined;
@@ -2242,6 +2258,7 @@ export class Agent {
 							),
 							stopReason: "error",
 							errorMessage,
+							errorId,
 						}
 					: {
 							role: "assistant",
@@ -2259,6 +2276,7 @@ export class Agent {
 							},
 							stopReason: stoppedForAbort ? "aborted" : "error",
 							errorMessage,
+							errorId,
 							timestamp: Date.now(),
 						};
 
@@ -2287,7 +2305,8 @@ export class Agent {
 				for (const block of errorMsg.content) {
 					if (block.type !== "toolCall") continue;
 					if (bufferedCursorToolCallIds.has(block.id)) continue;
-					const toolResult = createSyntheticToolResultMessage(block, "error", errorMessage);
+					// The provider's text, so `details` only — never the model's view.
+					const toolResult = createSyntheticToolResultMessage(block, "error", { upstreamError: errorMessage });
 					this.#emit({
 						type: "tool_execution_start",
 						toolCallId: block.id,

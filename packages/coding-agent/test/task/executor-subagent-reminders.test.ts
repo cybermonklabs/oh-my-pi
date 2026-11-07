@@ -3,6 +3,7 @@ import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@oh-my-p
 import { type AssistantMessage, Effort } from "@oh-my-pi/pi-ai";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionSendQueue } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/send-queue";
 import type { ExtensionActions, LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -17,6 +18,7 @@ import {
 	SUBAGENT_WARNING_EMPTY_MESSAGE,
 	SUBAGENT_WARNING_MISSING_YIELD,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { formatTaskResultSummary } from "@oh-my-pi/pi-coding-agent/task/result-summary";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { YieldTool } from "@oh-my-pi/pi-coding-agent/tools/yield";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -63,9 +65,11 @@ function createMockSession(
 	const session = {
 		...createSessionDefaults(),
 		state,
+		getAgentId: () => undefined,
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
+		discoverStartupSkillPaths: async () => {},
 		sessionManager: {
 			appendSessionInit: () => {},
 		},
@@ -169,6 +173,7 @@ describe("runSubprocess yield reminders", () => {
 				}
 				return undefined;
 			},
+			sends: new ExtensionSendQueue(),
 		} as unknown as NonNullable<AgentSession["extensionRunner"]>;
 
 		mockCreateAgentSession(session);
@@ -179,6 +184,66 @@ describe("runSubprocess yield reminders", () => {
 		});
 
 		expect(sendStarted).toBe(true);
+		expect(result.exitCode).toBe(0);
+		expect(result.error).toBeUndefined();
+	});
+
+	it("waits for session_start extension sendUserInput before prompting the subagent", async () => {
+		let extensionSendUserInput: ExtensionActions["sendUserInput"] | undefined;
+		let inputInFlight = false;
+		let inputStarted = false;
+
+		const session = createMockSession(async ({ text, emit }) => {
+			if (text === "hello from session_start") {
+				inputStarted = true;
+				inputInFlight = true;
+				// Like the sendUserMessage case above: the input must still be in flight when the
+				// executor would prompt its task, a moment the test cannot observe.
+				await Bun.sleep(20);
+				inputInFlight = false;
+				return;
+			}
+			if (inputInFlight) {
+				throw new AgentBusyError();
+			}
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-extension-session-start-input",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const mutableSession = session as unknown as {
+			extensionRunner: NonNullable<AgentSession["extensionRunner"]>;
+		};
+		mutableSession.extensionRunner = {
+			sends: new ExtensionSendQueue(),
+			initialize: (actions: ExtensionActions) => {
+				extensionSendUserInput = actions.sendUserInput;
+			},
+			onError: () => {},
+			// sendUserInput asks the runner for `input` handlers before it dispatches the text.
+			hasHandlers: () => false,
+			emit: async (event: { type: string }) => {
+				if (event.type === "session_start") {
+					void extensionSendUserInput?.("hello from session_start", { deliverAs: "followUp" });
+				}
+				return undefined;
+			},
+		} as unknown as NonNullable<AgentSession["extensionRunner"]>;
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-session-start-extension-input",
+		});
+
+		expect(inputStarted).toBe(true);
 		expect(result.exitCode).toBe(0);
 		expect(result.error).toBeUndefined();
 	});
@@ -562,6 +627,72 @@ describe("runSubprocess yield reminders", () => {
 		expect(result.output).toContain('"done": true');
 		expect(result.output.includes("SYSTEM WARNING")).toBe(false);
 	});
+	it("H1 preserves a structured report when reminder replies only refer to it", async () => {
+		const report = "## Review\n\nThe attestation gate has no blocking findings.";
+		const reminderReply = "See the summary above.";
+		const prompts: string[] = [];
+		const session = createMockSession(({ text, promptIndex, emit, state }) => {
+			prompts.push(text);
+			const assistant = createAssistantStopMessage(promptIndex === 1 ? report : reminderReply);
+			state.messages.push(assistant);
+			emit({ type: "message_end", message: assistant });
+		});
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-h1" });
+		const expected = `${SUBAGENT_WARNING_MISSING_YIELD}\n\n${report}${reminderReply.repeat(3)}`;
+		const summary = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
+
+		expect(prompts).toHaveLength(4);
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toBe(expected);
+		expect(result.stderr).toBe(SUBAGENT_WARNING_MISSING_YIELD);
+		expect(summary).toContain('status="completed"');
+		expect(summary).toContain(`<output>\n${expected}\n</output>`);
+	});
+
+	it("H2 warns when a structured child only says it is writing the report", async () => {
+		const status = "Everything verified; writing the report now.";
+		const reminderReply = "See the summary above.";
+		const prompts: string[] = [];
+		const session = createMockSession(({ text, promptIndex, emit, state }) => {
+			prompts.push(text);
+			const assistant = createAssistantStopMessage(promptIndex === 1 ? status : reminderReply);
+			state.messages.push(assistant);
+			emit({ type: "message_end", message: assistant });
+		});
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-h2" });
+		const expected = `${SUBAGENT_WARNING_MISSING_YIELD}\n\n${status}${reminderReply.repeat(3)}`;
+
+		expect(prompts).toHaveLength(4);
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toBe(expected);
+		expect(result.stderr).toBe(SUBAGENT_WARNING_MISSING_YIELD);
+	});
+	it.each([
+		["line cap", "finding\n".repeat(5001)],
+		["byte cap", "x".repeat(500_001)],
+	])("keeps the missing-yield warning in a %s result", async (_kind, report) => {
+		const session = createMockSession(({ promptIndex, emit, state }) => {
+			const assistant = createAssistantStopMessage(promptIndex === 1 ? report : "See the summary above.");
+			state.messages.push(assistant);
+			emit({ type: "message_end", message: assistant });
+		});
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: `subagent-${_kind}` });
+		const summary = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
+
+		expect(result.exitCode).toBe(0);
+		expect(result.truncated).toBe(true);
+		expect(result.output.startsWith(SUBAGENT_WARNING_MISSING_YIELD)).toBe(true);
+		expect(summary).toContain(SUBAGENT_WARNING_MISSING_YIELD);
+	});
 
 	it("returns the final message verbatim, with no yield tool or reminders, when unstructured", async () => {
 		const report = "## Summary\nAuth lives in `src/auth.ts:10-40`.";
@@ -740,6 +871,51 @@ describe("runSubprocess yield reminders", () => {
 		expect(result.output).toBe(report);
 		expect(result.output).not.toContain("SYSTEM WARNING");
 	});
+	it.each(["yielded", "unstructured"])(
+		"does not infer missing-yield provenance from a warning-looking %s report",
+		async kind => {
+			const report = `${SUBAGENT_WARNING_MISSING_YIELD}\n\n${"x".repeat(500_001)}`;
+			const session = createMockSession(({ promptIndex, emit, state }) => {
+				if (kind === "unstructured" || promptIndex === 1) {
+					const assistant = createAssistantStopMessage(report);
+					state.messages.push(assistant);
+					emit({ type: "message_end", message: assistant });
+					return;
+				}
+				const finalize: AssistantMessage = {
+					...createAssistantStopMessage(""),
+					content: [{ type: "toolCall", id: "tool-finalize", name: "yield", arguments: { type: "result" } }],
+					stopReason: "toolUse",
+				};
+				state.messages.push(finalize);
+				emit({ type: "message_end", message: finalize });
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-finalize",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", type: "result", useLastTurn: true },
+					},
+					isError: false,
+				});
+			});
+
+			mockCreateAgentSession(session);
+
+			const result = await runSubprocess({
+				...baseOptions,
+				id: `warning-looking-${kind}`,
+				...(kind === "unstructured" ? { structured: false } : {}),
+			});
+
+			expect(result.exitCode).toBe(0);
+			expect(result.stderr).toBe("");
+			expect(result.truncated).toBe(true);
+			expect(result.missingYield).toBeUndefined();
+			expect(result.output.startsWith(SUBAGENT_WARNING_MISSING_YIELD)).toBe(false);
+		},
+	);
 
 	it("never harvests mid-work narration as the final result", async () => {
 		// Counterpart to the test above: the report turn is the one that started
@@ -1122,9 +1298,12 @@ describe("runSubprocess yield reminders", () => {
 
 		const createAgentSessionSpy = mockCreateAgentSession(session);
 
+		// Dispatch checks the requested model's key before it hands the model to
+		// the session, as every ModelRegistry can; this one's key works.
 		const modelRegistry = {
 			refresh: async () => {},
 			getAvailable: () => [{ provider: "openai", id: "gpt-4o", name: "GPT-4o" }],
+			getApiKey: async () => "test-key",
 		} as unknown as import("@oh-my-pi/pi-coding-agent/config/model-registry").ModelRegistry;
 
 		await runSubprocess({
@@ -1220,6 +1399,28 @@ describe("runSubprocess yield reminders", () => {
 		expect(result.exitCode).toBe(1);
 		expect(result.error).toBe("[openai/mock] Connect error invalid_argument: Error");
 		expect(result.stderr).toBe("[openai/mock] Connect error invalid_argument: Error");
+	});
+
+	it("reports a failed turn's shown text, with its endpoint and request-dump path", async () => {
+		const session = createMockSession(({ emit, state }) => {
+			const failed: AssistantMessage = {
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: "HTTP 400\nbad parameter",
+				errorDisplayMessage:
+					"HTTP 400 from http://localhost:11434/api/chat\nbad parameter\nraw-http-request=/tmp/omp/1.json",
+			};
+			state.messages.push(failed);
+			emit({ type: "message_end", message: failed });
+		});
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-provider-error-display" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.error).toContain("http://localhost:11434/api/chat");
+		expect(result.error).toContain("raw-http-request=/tmp/omp/1.json");
 	});
 
 	it("surfaces the assistant abort message instead of 'Cancelled by caller' on an internal turn abort", async () => {
