@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- `bun install` on a fresh clone no longer fails with "Export viewer metadata is stale": the committed `viewer.generated.json` is regenerated, so the `prepare` script's freshness check passes again ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
 - Fixed `ask` notes added with `n` right after picking an answer landing on the previous question instead of the one shown; a Tern click then Note still notes the answer just clicked, and the Note button names it ([#18317](https://github.com/can1357/oh-my-pi/pull/18317) by [@DonMikone](https://github.com/DonMikone))
 ### Added
 
