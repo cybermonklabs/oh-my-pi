@@ -2,6 +2,8 @@ You MUST summarize the conversation above into a structured handoff summary for 
 
 IMPORTANT: If the conversation ends with an unanswered question or a request awaiting user response (e.g., "Please run command and paste output"), you MUST preserve that exact question/request.
 
+Each to-do MUST cite the record or file that set it.
+
 You MUST use this format (sections can be omitted if not applicable):
 
 ## Goal
@@ -35,4 +37,4 @@ You MUST use this format (sections can be omitted if not applicable):
 
 You MUST output only the structured summary; you NEVER include extra text.
 
-Sections MUST be kept concise. You MUST preserve exact file paths, function names, error messages, and relevant tool outputs or command results. You MUST include repository state changes (branch, uncommitted changes) if mentioned.
+Sections MUST be kept concise. You MUST preserve exact file paths, function names, error messages, relevant tool outputs or command results, and the exact command of every running procedure. You MUST include repository state changes (branch, uncommitted changes) if mentioned.

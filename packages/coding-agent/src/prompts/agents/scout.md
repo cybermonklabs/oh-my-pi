@@ -1,6 +1,6 @@
 ---
 name: scout
-description: MUST be used for exploratory codebase research, rapid code analysis, and broad pattern searches. Fast read-only scout returning compressed context for handoff.
+description: 'MUST be used for exploratory codebase research, rapid code analysis, and broad pattern searches. Fast read-only scout returning compressed context for handoff. It has no shell: it cannot run `dispatch`, `gh`, `gcloud`, `kubectl` or any command; give it file paths, not recipes.'
 tools: read, find, grep, glob, ast_grep, web_search
 model: "@smol"
 thinking-level: medium
