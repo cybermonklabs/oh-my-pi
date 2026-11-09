@@ -1,7 +1,6 @@
 # Changelog
 
 ## [Unreleased]
-
 ### Breaking Changes
 
 - Removed `PruneResult.undo()` from `pruneToolOutputs` and `pruneSupersededToolResults`; persist `PruneResult.pruned` instead of rolling the prune back when saving it fails.
@@ -9,6 +8,19 @@
 ### Added
 
 - Added `PruneResult.pruned`, a list of exported `ToolResultPrune` records (each blanked tool result's entry id, notice, and `prunedAt`), and `blankToolResult()`, which applies one record to a loaded copy of its tool result.
+
+## [18.18.2] - 2026-11-08
+
+### Added
+
+- Added `canReplayRemoteCompactionFrom()` to determine whether a model can replay provider-native compaction produced by another model.
+
+### Fixed
+
+- Fixed GenAI message-content capture configured in omp's own `.env` files so it continues to apply when those values are no longer exposed through the process environment.
+- Fixed compaction preparation for remote OpenAI compaction that the active model cannot replay, ensuring the content is expanded and remains available for compaction.
+- Fixed generic remote compaction requests to `/chat/completions` so gateway sessions retain the correct per-request model attribution.
+
 ## [18.17.0] - 2026-11-06
 
 ### Added
