@@ -100,7 +100,7 @@ async function loadAgentsApiAcpStyle(cwd: string, scope: ExtensionAgentActionsSc
 
 	const actions: ExtensionActions = {
 		sendMessage: () => {},
-		sendUserMessage: () => {},
+		sendUserMessage: async () => {},
 		appendEntry: () => {},
 		...createExtensionAgentActions(scope),
 		setLabel: () => {},
@@ -637,7 +637,11 @@ describe("ExtensionAPI agents", () => {
 	it("ACP-safe reviver cold-revives a genuinely parked agent through a session-scoped persisted reviver", async () => {
 		using tempDir = TempDir.createSync("@omp-extension-agents-cold-");
 		const cwd = tempDir.path();
-		MCPManager.setInstance({ getTools: () => [], addToolsChangedListener: () => () => {} } as unknown as MCPManager);
+		MCPManager.setInstance({
+			getTools: () => [],
+			addToolsChangedListener: () => () => {},
+			openToolScope: () => {},
+		} as unknown as MCPManager);
 
 		// Real, on-disk parent + child transcripts — exactly what a live spawn
 		// leaves behind — not an in-memory `revive: async () => stub` shortcut.
@@ -840,7 +844,11 @@ describe("ExtensionAPI agents", () => {
 	it("propagates the ACP-safe reviver into a cold-revived subagent's own extension runtime so its persisted children stay cold-revivable", async () => {
 		using tempDir = TempDir.createSync("@omp-extension-agents-nested-cold-");
 		const cwd = tempDir.path();
-		MCPManager.setInstance({ getTools: () => [], addToolsChangedListener: () => () => {} } as unknown as MCPManager);
+		MCPManager.setInstance({
+			getTools: () => [],
+			addToolsChangedListener: () => () => {},
+			openToolScope: () => {},
+		} as unknown as MCPManager);
 
 		const assistantMessage = {
 			role: "assistant" as const,
