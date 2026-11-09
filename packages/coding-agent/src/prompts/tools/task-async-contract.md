@@ -1,9 +1,7 @@
-Agent output/transcripts remain readable at `agent://<id>` / `history://<id>`.{{#if ircEnabled}} `write agent://<id>` messages a live agent.{{/if}}
+Job IDs are process-local; delivered results expire shortly (~30s), unconsumed results within ~5min. Agent output/transcripts remain readable at `agent://<id>` / `history://<id>`; NEVER re-dispatch a finished agent to recover its report.{{#if ircEnabled}} `write agent://<id>` messages a live agent.{{/if}}
 
 Results auto-deliver; NEVER poll.{{#if waitTool}} Completely blocked? Call `wait` to receive the first settled job you started.{{/if}}
 
 `read proc://` lists jobs/services; `read proc://<id>` inspects status/output without consuming delivery. `write proc://<id>/kill` cancels/stops; omit `content`.
-
-Job IDs are process-local; delivered results expire shortly (~30s), unconsumed results within ~5min.
 
 `completed`: subagent yielded successfully; claimed artifacts unverified.

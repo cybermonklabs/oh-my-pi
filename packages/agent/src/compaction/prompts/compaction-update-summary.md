@@ -4,12 +4,13 @@ MUST:
 - preserve all previous-summary information; add new progress, decisions, context.
 - Progress: move completed "In Progress" items to "Done".
 - update "Next Steps" for completed work.
+- cite the record or file that set each to-do.
 - preserve exact file paths, function names, error messages.
 - MAY remove irrelevant content.
 - If new messages end with an unanswered user question/request: add it to Critical Context; replace any previous pending question if answered.
 - output only the structured summary; NEVER extra text.
 - keep sections concise.
-- preserve relevant tool outputs/command results.
+- preserve relevant tool outputs/command results and the exact command of every running procedure.
 - include mentioned repository state changes (branch, uncommitted changes).
 
 Format (omit inapplicable sections):

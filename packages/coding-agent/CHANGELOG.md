@@ -8,7 +8,7 @@
 
 ### Changed
 
-- Task guidance puts readable agent reports before expiring job results ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
+- Task guidance directs callers to read retained reports instead of re-dispatching finished agents to recover expired results ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
 - Scout guidance asks callers for file paths rather than shell commands it cannot run ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
 - Models without a delegation rule (Claude, Gemini, …) no longer get pushed to delegate: the "map unknown code via task" rule and the "Task + scout" nudges in search tool descriptions are replaced by a light suggestion to explore unfamiliar subsystems with a scout
 - In Tern, clicking an `ask` answer and then Note now annotates the answer highlighted on the question shown instead of the one just clicked ([#18551](https://github.com/can1357/oh-my-pi/pull/18551) by [@H4vC](https://github.com/H4vC))
