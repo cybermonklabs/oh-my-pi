@@ -167,8 +167,8 @@ export function getOpenAIStreamFirstEventTimeoutMs(
  * without this an outer budget would keep running through a hold the inner
  * one excludes.
  *
- * Returns the caller signal unchanged, a no-op `clear` and no remainder when
- * no positive timeout is configured.
+ * Returns the caller signal unchanged and no remainder when no positive
+ * timeout is configured; `clear()` then has only `onAbort` to release.
  *
  * `clear()` is the one release point, and it releases the guard's *memory* as
  * well as its timer. `AbortSignal.any` makes the signal it returns a dependent
