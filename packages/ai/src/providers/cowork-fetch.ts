@@ -199,13 +199,17 @@ async function sendCoworkRequest(
 	const abort = (): void => {
 		const reason = signal?.reason;
 		const error = reason instanceof Error ? reason : new DOMException("The operation was aborted.", "AbortError");
-		request?.destroy(error);
+		request.destroy(error);
 	};
-	if (signal?.aborted) {
-		release();
-		signal.throwIfAborted();
-	}
-	signal?.addEventListener("abort", abort, { once: true });
+	signal?.throwIfAborted();
+	// Registered only once `request` exists. `https.request` validates the
+	// header names and values and throws synchronously on a bad one; a listener
+	// added before that call is never removed, because `release()` runs only
+	// from the response's 'close' or from the request's 'error' and a request
+	// that was never created emits neither. On a long-lived caller signal that
+	// left one closure holding the whole request — headers, body and all — per
+	// rejected attempt. Nothing can abort between the two statements: they are
+	// synchronous and `abort` dispatch is not re-entrant here.
 	const request = https.request(
 		{
 			protocol: url.protocol,
@@ -241,6 +245,7 @@ async function sendCoworkRequest(
 			}
 		},
 	);
+	signal?.addEventListener("abort", abort, { once: true });
 	request.once("error", error => {
 		release();
 		result.reject(error);

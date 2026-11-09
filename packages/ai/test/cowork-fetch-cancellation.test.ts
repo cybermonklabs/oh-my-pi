@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as events from "node:events";
+import { getEventListeners } from "node:events";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
@@ -158,5 +160,65 @@ describe("coworkFetch abort before response headers", () => {
 
 		expect(outcome).toBe(reason);
 		expect(request.destroyed).toBe(true);
+	});
+});
+
+// A session keeps one abort signal for a whole turn and sends many requests
+// through it, so a request that registers an abort listener and never removes
+// it leaves a closure holding that request — its headers, its body, and every
+// tool definition in it — for the rest of the session. The observable contract
+// is therefore a count that does not grow with the number of requests.
+describe("coworkFetch abort listener retention", () => {
+	it("holds no listener per completed response on one long-lived signal", async () => {
+		const controller = new AbortController();
+		for (let n = 0; n < 24; n++) {
+			const message = new ManualIncomingMessage(new net.Socket());
+			message.statusCode = 200;
+			message.statusMessage = "OK";
+			message.headers = { "content-type": "text/event-stream" };
+			message.rawHeaders = ["content-type", "text/event-stream"];
+			message.push("event: message_stop\ndata: {}\n\n");
+			message.push(null);
+			vi.spyOn(https, "request").mockImplementation((_options, callback) => {
+				queueMicrotask(() => {
+					if (typeof callback === "function") callback(message);
+				});
+				return new StubClientRequest();
+			});
+			const response = await coworkFetch("https://api.anthropic.com/v1/messages", {
+				method: "POST",
+				headers: { accept: "text/event-stream" },
+				body: "{}",
+				signal: controller.signal,
+			});
+			await response.text();
+			// The removal runs from the message's 'close', which can land a tick
+			// after the body resolves; await the event itself, never a delay.
+			if (!message.closed) await events.once(message, "close");
+		}
+
+		expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+	});
+
+	// `https.request` validates header names and values and throws
+	// synchronously on a bad one, so the request object never exists and
+	// neither its 'error' nor a response 'close' can ever run the removal.
+	// Before the fix this left exactly one listener per rejected attempt.
+	it("holds no listener for a request rejected before it reaches the wire", async () => {
+		const controller = new AbortController();
+		for (let n = 0; n < 5; n++) {
+			const rejected = await coworkFetch("https://api.anthropic.com/v1/messages", {
+				method: "POST",
+				headers: { accept: "text/event-stream", "x-trace": "line\nbreak" },
+				body: "{}",
+				signal: controller.signal,
+			}).then(
+				() => undefined,
+				(reason: unknown) => reason,
+			);
+			expect(rejected).toBeInstanceOf(Error);
+		}
+
+		expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
 	});
 });
