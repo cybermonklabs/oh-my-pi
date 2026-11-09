@@ -719,6 +719,9 @@ function provider(node: KdlNodeView): CompiledAuthProvider {
 			case "org-scoped-identity":
 				result.orgScopedIdentity = singleBool(child);
 				break;
+			case "login-subscription":
+				result.loginSubscription = singleBool(child);
+				break;
 			case "oauth-token-env": {
 				leaf(child, []);
 				const vars = positionalStrings(child);
@@ -738,6 +741,11 @@ function provider(node: KdlNodeView): CompiledAuthProvider {
 				break;
 			case "show-in-login-list":
 				result.showInLoginList = singleBool(child);
+				break;
+			case "disabled":
+				leaf(child, []);
+				result.disabled = singleString(child);
+				if (!result.disabled.trim()) malformed(child);
 				break;
 			case "store-as":
 				leaf(child, []);
