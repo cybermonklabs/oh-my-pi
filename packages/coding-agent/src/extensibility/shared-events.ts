@@ -16,6 +16,7 @@ import { type AgentMessage, isNonBlankContext, joinAdditionalContext } from "@oh
 import type { CompactionPreparation, CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantRetryRecovery, ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
+import type { ProcessSample } from "../debug/memory-sample";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { GoalModeState } from "../goals/state";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry } from "../session/session-entries";
@@ -101,6 +102,14 @@ export interface SessionCompactEvent {
 	fromExtension: boolean;
 }
 
+/** Fired after a memory self-report sample is written to the session journal. */
+export interface ProcessSampleEvent {
+	type: "process_sample";
+	sessionId: string;
+	/** The sample as journalled; see `debug/memory-sample.ts`. */
+	sample: ProcessSample;
+}
+
 /** Fired on process exit (SIGINT/SIGTERM) */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
@@ -171,6 +180,7 @@ export type SessionEvent =
 	| SessionBeforeCompactEvent
 	| SessionCompactingEvent
 	| SessionCompactEvent
+	| ProcessSampleEvent
 	| SessionStopEvent
 	| SessionShutdownEvent
 	| SessionBeforeTreeEvent

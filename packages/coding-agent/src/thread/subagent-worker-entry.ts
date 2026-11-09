@@ -22,6 +22,7 @@ import { MessagePort, parentPort } from "node:worker_threads";
 import { installGlobalProxyFetch } from "@oh-my-pi/pi-ai/utils/proxy";
 import { logger } from "@oh-my-pi/pi-utils";
 import { consumeWorkerInbox } from "@oh-my-pi/pi-utils/worker-host";
+import { readThreadMemory } from "../debug/memory-sample";
 import { loadedModulesChangedSince } from "./code-skew";
 import { isThreadId, setCurrentThreadId } from "./identity";
 import type { SubagentWorkerInit, SubagentWorkerReady, WorkerThreadLink } from "./protocol";
@@ -84,6 +85,7 @@ function start(init: SubagentWorkerInit): void {
 	});
 	link.handle("ping", nonce => link.callSync("ping", nonce));
 	link.handle("warmUp", options => warmUpSubagentWorker(options));
+	link.handle("memorySample", () => readThreadMemory(init.threadId));
 	// Every module the link and its services use is loaded by now, so this covers the thread protocol.
 	const ready: SubagentWorkerReady = {
 		type: "subagent-worker-ready",

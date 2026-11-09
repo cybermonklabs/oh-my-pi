@@ -17,9 +17,11 @@ import { getSessionsDir, isEnoent, readLines } from "@oh-my-pi/pi-utils";
 import type {
 	AgentType,
 	MessageStatsInput,
+	ProcessSampleRow,
 	SessionEntry,
 	SessionMessageEntry,
 	SessionModelUsageEntry,
+	SessionProcessSampleEntry,
 	SessionServiceTierChangeEntry,
 	ToolCallStats,
 	ToolResultLink,
@@ -108,6 +110,80 @@ function isUserMessage(entry: SessionEntry): entry is SessionMessageEntry {
  */
 function isServiceTierChange(entry: SessionEntry): entry is SessionServiceTierChangeEntry {
 	return entry.type === "service_tier_change";
+}
+
+/**
+ * Check if an entry is a process self-measurement sample.
+ */
+function isProcessSample(entry: SessionEntry): entry is SessionProcessSampleEntry {
+	if (entry.type !== "process_sample") return false;
+	const sampleEntry = entry as SessionProcessSampleEntry;
+	return typeof sampleEntry.id === "string" && sampleEntry.id.length > 0 && !!sampleEntry.sample;
+}
+
+/** Flatten a `process_sample` entry into its stored row, or null when it is unusable. */
+function extractProcessSample(
+	sessionPath: string,
+	folder: string,
+	entry: SessionProcessSampleEntry,
+	agentType: AgentType,
+): ProcessSampleRow | null {
+	const timestamp = entry.timestamp ? Date.parse(entry.timestamp) : Number.NaN;
+	if (!Number.isFinite(timestamp)) return null;
+	const { sample } = entry;
+	const work = sample.work;
+	if (!work) return null;
+	// A worker that did not answer carries no heap size; the totals are of those that did.
+	const workers = Array.isArray(sample.workers) ? sample.workers : [];
+	const answering = workers.filter(worker => typeof worker.jscHeapBytes === "number");
+	const cpuWorkers = workers.filter(worker => typeof worker.cpuMs === "number");
+	const identity = sample.identity;
+	return {
+		sessionFile: sessionPath,
+		entryId: entry.id as string,
+		folder,
+		agentType,
+		timestamp,
+		pid: typeof identity?.pid === "number" ? identity.pid : null,
+		startedAtMs: typeof identity?.startedAtMs === "number" ? identity.startedAtMs : null,
+		seq: sample.seq ?? 0,
+		reason: sample.reason ?? "interval",
+		uptimeMs: sample.uptimeMs ?? 0,
+		costMs: sample.costMs ?? 0,
+		cpuUserMs: sample.cpu?.userMs ?? null,
+		cpuSystemMs: sample.cpu?.systemMs ?? null,
+		rssKb: sample.process?.rssKb ?? null,
+		anonKb: sample.process?.anonKb ?? null,
+		threads: sample.process?.threads ?? null,
+		cgroupAnon: sample.cgroup?.anon ?? null,
+		cgroupCurrent: sample.cgroup?.current ?? null,
+		cgroupMax: sample.cgroup?.max ?? null,
+		mainJscHeapBytes: sample.main?.jscHeapBytes ?? null,
+		mainCpuMs: sample.main?.cpuMs ?? null,
+		mainPageFaults: sample.main?.pageFaults ?? null,
+		mainHeapUsedBytes: sample.main?.heapUsedBytes ?? null,
+		workerCount: workers.length,
+		workerJscHeapBytes: answering.length > 0 ? answering.reduce((sum, w) => sum + (w.jscHeapBytes ?? 0), 0) : null,
+		workerCpuMs: cpuWorkers.length > 0 ? cpuWorkers.reduce((sum, w) => sum + (w.cpuMs ?? 0), 0) : null,
+		journalEntries: work.journalEntries ?? 0,
+		toolCalls: work.toolCalls ?? 0,
+		subagentDispatches: work.subagentDispatches ?? 0,
+		fileReads: work.fileReads ?? 0,
+		compactions: work.compactions ?? 0,
+		liveSubagents: work.liveSubagents ?? 0,
+		parkedSubagents: work.parkedSubagents ?? 0,
+		topTools: work.topTools?.length ? JSON.stringify(work.topTools) : null,
+		// Absent on samples written before the sampler counted tokens: null, never 0,
+		// so a missing count cannot be read as a session that sent nothing.
+		tokensInput: typeof work.tokens?.input === "number" ? work.tokens.input : null,
+		tokensOutput: typeof work.tokens?.output === "number" ? work.tokens.output : null,
+		tokensCacheRead: typeof work.tokens?.cacheRead === "number" ? work.tokens.cacheRead : null,
+		tokensCacheWrite: typeof work.tokens?.cacheWrite === "number" ? work.tokens.cacheWrite : null,
+		tokensTotal: typeof work.tokens?.total === "number" ? work.tokens.total : null,
+		tokensIncludeSubagents:
+			typeof work.tokensIncludeSubagents === "boolean" ? (work.tokensIncludeSubagents ? 1 : 0) : null,
+		subagentWorkers: typeof work.subagentWorkers === "number" ? work.subagentWorkers : null,
+	};
 }
 
 /**
@@ -526,6 +602,7 @@ export interface ParseSessionResult {
 	userLinks: UserMessageLink[];
 	toolCalls: ToolCallStats[];
 	toolResults: ToolResultLink[];
+	processSamples: ProcessSampleRow[];
 	spotlight: SpotlightParseRows;
 	newOffset: number;
 	parserState?: SessionParserState;
@@ -572,6 +649,7 @@ export async function parseSessionFile(
 	const userLinks: UserMessageLink[] = [];
 	const toolCalls: ToolCallStats[] = [];
 	const toolResults: ToolResultLink[] = [];
+	const processSamples: ProcessSampleRow[] = [];
 	// First call per id: the row `INSERT OR IGNORE` keeps, so it can be written with its result.
 	const callsById = new Map<string, ToolCallStats>();
 	let spotlight = new SpotlightCollector(sessionPath, folder, emptySpotlightState());
@@ -581,6 +659,11 @@ export async function parseSessionFile(
 		spotlight.visit(entry);
 		if (isServiceTierChange(entry)) {
 			currentServiceTier = coerceServiceTierByFamily(entry.serviceTier);
+			return;
+		}
+		if (isProcessSample(entry)) {
+			const sample = extractProcessSample(sessionPath, folder, entry, agentType);
+			if (sample) processSamples.push(sample);
 			return;
 		}
 		if (isUserMessage(entry)) {
@@ -674,6 +757,7 @@ export async function parseSessionFile(
 				userLinks: [],
 				toolCalls: [],
 				toolResults: [],
+				processSamples: [],
 				spotlight: emptySpotlightRows(),
 				newOffset: fromOffset,
 			};
@@ -688,6 +772,7 @@ export async function parseSessionFile(
 		userLinks,
 		toolCalls,
 		toolResults,
+		processSamples,
 		spotlight: spotlight.rows,
 		newOffset,
 		reset,

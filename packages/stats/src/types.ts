@@ -131,6 +131,78 @@ export interface SessionCustomEntry {
 	data?: Record<string, unknown>;
 }
 
+/**
+ * One `process_sample` journal entry: a session's own memory and work-shape
+ * measurement. Mirrors `ProcessSample` in the coding agent's
+ * `debug/memory-sample.ts` structurally — stats never imports coding-agent.
+ */
+export interface SessionProcessSampleEntry {
+	type: "process_sample";
+	id?: string;
+	parentId?: string | null;
+	timestamp?: string;
+	sample: {
+		/**
+		 * Which process wrote the sample. A change of `(pid, startedAtMs)` between two
+		 * consecutive samples of one journal **is** a restart: the journal itself marks
+		 * none, since its one `session` record is written at creation and survives every
+		 * restart. Absent on samples written before the sampler carried it.
+		 */
+		identity?: { pid: number; startedAtMs: number };
+		seq: number;
+		reason: "start" | "interval" | "turn" | "compaction";
+		uptimeMs: number;
+		/** Cumulative CPU of the whole process. The axis that predicts RSS best. */
+		cpu?: { userMs: number; systemMs: number };
+		process: { rssKb: number; anonKb: number; fileKb: number; threads: number } | null;
+		cgroup: { path: string; anon: number; file: number; current: number; max: number | null } | null;
+		main: SessionThreadMemory;
+		workers: SessionWorkerMemory[];
+		work: {
+			journalEntries: number;
+			toolCalls: number;
+			topTools: Array<[string, number]>;
+			subagentDispatches: number;
+			fileReads: number;
+			compactions: number;
+			liveSubagents: number;
+			parkedSubagents: number;
+			/**
+			 * Cumulative tokens the session has sent and received. Absent on samples
+			 * written before the sampler counted them, which is why every reader must
+			 * tolerate its absence rather than read a missing count as zero.
+			 */
+			tokens?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+			/** Whether {@link tokens} includes text sent by subagents. Currently always false. */
+			tokensIncludeSubagents?: boolean;
+			/** Subagent worker threads living in this process at sample time. */
+			subagentWorkers?: number;
+		};
+		costMs: number;
+	};
+}
+
+/** One JavaScript VM's numbers inside a {@link SessionProcessSampleEntry}. */
+export interface SessionThreadMemory {
+	thread: string;
+	jscHeapBytes: number | null;
+	jscFootprintBytes: number | null;
+	/** `bun:jsc` cumulative page faults: the nearest thing to a churn counter here. */
+	pageFaults?: number | null;
+	/** Diagnostic only — never the memory figure; it understates RSS by up to 15x. */
+	heapUsedBytes: number | null;
+	heapTotalBytes: number | null;
+	externalBytes: number | null;
+	/** Cumulative CPU of this thread, in milliseconds. */
+	cpuMs?: number | null;
+}
+
+/** A subagent worker's VM, or the record of one that could not be reached. */
+export interface SessionWorkerMemory extends SessionThreadMemory {
+	load?: number;
+	missing?: "timeout" | "gone" | "error";
+}
+
 /** Structural variants the trace builder matches on beyond messages. */
 export interface SessionTypedEntry {
 	type: "session_init" | "compaction" | "model_change" | "mode_change" | "reset_boundary";
@@ -146,6 +218,7 @@ export type SessionEntry =
 	| SessionServiceTierChangeEntry
 	| SessionModelUsageEntry
 	| SessionCustomEntry
+	| SessionProcessSampleEntry
 	| SessionTypedEntry
 	| { type: string };
 
@@ -235,6 +308,116 @@ export interface ToolCallStats {
 	resultChars?: number;
 	/** Result error flag, set together with `resultChars` */
 	isError?: boolean;
+}
+
+/**
+ * One `process_sample` journal entry flattened for the `process_samples`
+ * table: only the scalars a memory dashboard plots. The sample's nested
+ * per-worker records are reduced to a count and a heap total, and the whole
+ * sample blob is never stored.
+ */
+export interface ProcessSampleRow {
+	/** Session file path */
+	sessionFile: string;
+	/** Journal entry ID of the sample (unique within a session) */
+	entryId: string;
+	/** Folder/project path (extracted from session filename) */
+	folder: string;
+	/** Which agent produced the sample */
+	agentType: AgentType;
+	/** Entry timestamp (Unix ms) */
+	timestamp: number;
+	/**
+	 * Pid of the process that wrote the sample; null on samples written before the
+	 * sampler carried an identity.
+	 */
+	pid: number | null;
+	/**
+	 * That process's exact start instant, epoch ms. With {@link pid} it names one
+	 * incarnation: a change between consecutive samples is a restart. Pid alone will
+	 * not do, because pids are reused.
+	 */
+	startedAtMs: number | null;
+	/** Sample index within the session's process, from 1; a gap means samples were lost. */
+	seq: number;
+	/** What asked for the sample: `start` | `interval` | `turn` | `compaction`. */
+	reason: string;
+	/** Milliseconds since the sampled process started */
+	uptimeMs: number;
+	/** What taking the sample cost, in milliseconds */
+	costMs: number;
+	/** Cumulative user CPU of the whole process, ms; null when the sample carried none */
+	cpuUserMs: number | null;
+	/** Cumulative system CPU of the whole process, ms; null when the sample carried none */
+	cpuSystemMs: number | null;
+	/** `VmRSS` in KiB, null when /proc was unreadable */
+	rssKb: number | null;
+	/** `RssAnon` in KiB, null when /proc was unreadable */
+	anonKb: number | null;
+	/** OS threads in the process, null when /proc was unreadable */
+	threads: number | null;
+	/** cgroup v2 `memory.stat` `anon`, in bytes; null off cgroup v2 */
+	cgroupAnon: number | null;
+	/** cgroup v2 `memory.current`, in bytes; null off cgroup v2 */
+	cgroupCurrent: number | null;
+	/** cgroup v2 `memory.max`, in bytes; null when unlimited or off cgroup v2 */
+	cgroupMax: number | null;
+	/** Main thread's `bun:jsc` heap size, in bytes */
+	mainJscHeapBytes: number | null;
+	/** Main thread's own cumulative CPU, in milliseconds */
+	mainCpuMs: number | null;
+	/** Main thread's cumulative page faults: the only churn counter this runtime has */
+	mainPageFaults: number | null;
+	/**
+	 * Main thread's `process.memoryUsage().heapUsed`. **Diagnostic only** — never the
+	 * memory figure. It stays flat at 90–108 MiB while RSS climbs to 1.4 GiB; the gap
+	 * between it and {@link rssKb} is the signal worth keeping.
+	 */
+	mainHeapUsedBytes: number | null;
+	/** Subagent worker VMs recorded, answering or not */
+	workerCount: number;
+	/** Sum of the answering workers' JSC heap sizes, in bytes */
+	workerJscHeapBytes: number | null;
+	/** Sum of the answering workers' thread CPU, in milliseconds; null when none reported */
+	workerCpuMs: number | null;
+	/** Journal entries written so far */
+	journalEntries: number;
+	/** Assistant tool calls of every kind so far */
+	toolCalls: number;
+	/** `task` tool calls so far */
+	subagentDispatches: number;
+	/** `read` tool calls so far */
+	fileReads: number;
+	/** Compaction entries on the journal so far */
+	compactions: number;
+	/** Subagents the registry reports running or idle */
+	liveSubagents: number;
+	/** Subagents the registry holds parked */
+	parkedSubagents: number;
+	/** `WorkCounters.topTools` as JSON text, or null when the sample named none */
+	topTools: string | null;
+	/**
+	 * Cumulative prompt tokens sent, null when the sample carried no token counts.
+	 * Null and not zero: a missing count must never read as a real zero, since the
+	 * hypothesis these columns exist to test is a ratio with tokens underneath it.
+	 */
+	tokensInput: number | null;
+	/** Cumulative output tokens received; null when the sample carried none */
+	tokensOutput: number | null;
+	/** Cumulative cache-read tokens; null when the sample carried none */
+	tokensCacheRead: number | null;
+	/** Cumulative cache-write tokens; null when the sample carried none */
+	tokensCacheWrite: number | null;
+	/** Cumulative tokens of every kind; the denominator of bytes-per-token */
+	tokensTotal: number | null;
+	/**
+	 * 1 when the counts include subagents' text, 0 when they are this session's own,
+	 * null when the sample carried no token counts at all. It decides what a
+	 * bytes-per-token figure means, so it travels with the counts.
+	 */
+	tokensIncludeSubagents: number | null;
+	/** Subagent worker threads living in this process at sample time; null when unreported */
+	subagentWorkers: number | null;
 }
 
 /**

@@ -9,6 +9,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import type { ProcessSample } from "../debug/memory-sample";
 import type { CompactionMethod } from "./compaction-methods";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
@@ -160,6 +161,20 @@ export interface ServiceTierChangeEntry extends SessionEntryBase {
 	serviceTier: ServiceTierByFamily | null;
 }
 
+/**
+ * A memory self-report: what this process held, what its box allowed, and what the session had
+ * done, at one moment.
+ *
+ * It lives on the journal rather than in memory because the event it exists to explain destroys
+ * the process. A session killed by its box's cgroup limit takes its container, its cgroup and
+ * anything it was holding with it; only what reached the file survives. The entry is written
+ * off-branch and carries no message, so it never enters the model's context.
+ */
+export interface ProcessSampleEntry extends SessionEntryBase {
+	type: "process_sample";
+	sample: ProcessSample;
+}
+
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	type: "compaction";
 	summary: string;
@@ -245,6 +260,7 @@ declare module "@oh-my-pi/pi-agent-core/compaction/entries" {
 		titleChange: TitleChangeEntry;
 		credentialPin: CredentialPinEntry;
 		modelUsage: ModelUsageEntry;
+		processSample: ProcessSampleEntry;
 	}
 }
 
@@ -368,6 +384,7 @@ export type SessionEntry =
 	| SessionInitEntry
 	| ModeChangeEntry
 	| CredentialPinEntry
+	| ProcessSampleEntry
 	| ResetBoundaryEntry;
 
 /** Leaf selected when replaying one entry; an off-branch entry restores the active leaf captured at append time. */

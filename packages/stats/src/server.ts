@@ -17,7 +17,7 @@ import {
 	getTimeRangeConfig,
 	getToolDashboardStats,
 } from "./aggregator";
-import { initDb } from "./db";
+import { getProcessSampleSeries, initDb } from "./db";
 import { decodeEmbeddedClientArchive, hasEmbeddedClientArchive } from "./embedded-client";
 import embeddedClientArchiveTxt from "./embedded-client.generated.txt";
 import {
@@ -343,6 +343,14 @@ export async function handleApi(req: Request): Promise<Response> {
 		const context = await getSpotlightSessionContext(file);
 		if (!context) return Response.json({ error: "not a Spotlight experiment session" }, { status: 404 });
 		return Response.json(context);
+	}
+
+	if (path === "/api/stats/process-samples") {
+		const file = url.searchParams.get("file");
+		if (!file) return Response.json({ error: "file required" }, { status: 400 });
+		const series = await getProcessSampleSeries(file);
+		if (!series) return Response.json({ error: "session wrote no process samples" }, { status: 404 });
+		return Response.json(series);
 	}
 
 	if (path === "/api/sessions") {

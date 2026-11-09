@@ -29,6 +29,9 @@ import type {
 	FrustrationCounts,
 	MessageStats,
 	MessageStatsInput,
+	ProcessSampleRow,
+	ProcessSampleSegment,
+	ProcessSampleSeries,
 	ToolCallStats,
 	ToolResultLink,
 	UserMessageLink,
@@ -299,6 +302,77 @@ export async function initDb(): Promise<Database> {
 		CREATE INDEX IF NOT EXISTS idx_tool_calls_timestamp_entry ON tool_calls(timestamp, entry_id);
 		CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_timestamp ON tool_calls(tool_name, timestamp);
 
+		-- One process_sample journal entry: a session's own memory and work-shape
+		-- measurement, flattened to scalars. A session writes samples far apart, but
+		-- two can in principle share a millisecond (a turn boundary landing on an
+		-- interval tick), so the entry id carries uniqueness and (session_file,
+		-- timestamp) is only the query index.
+		CREATE TABLE IF NOT EXISTS process_samples (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_file TEXT NOT NULL,
+			entry_id TEXT NOT NULL,
+			folder TEXT NOT NULL,
+			agent_type TEXT NOT NULL DEFAULT 'main',
+			timestamp INTEGER NOT NULL,
+			-- The process that wrote the sample. A change of (pid, started_at_ms)
+			-- between two consecutive samples of one journal IS a restart: the journal
+			-- marks none, because its single session record is written at creation
+			-- and survives every restart. Null on samples written before the sampler
+			-- carried an identity.
+			pid INTEGER,
+			started_at_ms INTEGER,
+			seq INTEGER NOT NULL DEFAULT 0,
+			reason TEXT NOT NULL,
+			uptime_ms INTEGER NOT NULL DEFAULT 0,
+			cost_ms REAL NOT NULL DEFAULT 0,
+			cpu_user_ms INTEGER,
+			cpu_system_ms INTEGER,
+			rss_kb INTEGER,
+			anon_kb INTEGER,
+			threads INTEGER,
+			cgroup_anon INTEGER,
+			cgroup_current INTEGER,
+			cgroup_max INTEGER,
+			main_jsc_heap_bytes INTEGER,
+			main_cpu_ms INTEGER,
+			main_page_faults INTEGER,
+			-- Diagnostic only: the main thread's JS heap stays flat at 90-108 MiB while
+			-- rss_kb climbs past 1.4 GiB. Stored because that gap is the signal, never
+			-- because it is the memory figure.
+			main_heap_used_bytes INTEGER,
+			worker_count INTEGER NOT NULL DEFAULT 0,
+			worker_jsc_heap_bytes INTEGER,
+			worker_cpu_ms INTEGER,
+			journal_entries INTEGER NOT NULL DEFAULT 0,
+			tool_calls INTEGER NOT NULL DEFAULT 0,
+			subagent_dispatches INTEGER NOT NULL DEFAULT 0,
+			file_reads INTEGER NOT NULL DEFAULT 0,
+			compactions INTEGER NOT NULL DEFAULT 0,
+			live_subagents INTEGER NOT NULL DEFAULT 0,
+			parked_subagents INTEGER NOT NULL DEFAULT 0,
+			top_tools TEXT,
+			-- Cumulative tokens at sample time. Null, never zero, when the sample carried
+			-- none: these are the denominator of anon_kb * 1024 / tokens_total, and a
+			-- zero standing in for "unknown" would read as infinite bytes per token.
+			tokens_input INTEGER,
+			tokens_output INTEGER,
+			tokens_cache_read INTEGER,
+			tokens_cache_write INTEGER,
+			tokens_total INTEGER,
+			-- 0/1: whether the counts above include subagents' text. It decides what the
+			-- ratio means, so it is stored beside the counts rather than assumed.
+			tokens_include_subagents INTEGER,
+			-- Subagent worker threads in this process: why a session's text can be absent
+			-- from counts that are nevertheless charged to this address space.
+			subagent_workers INTEGER,
+			UNIQUE(session_file, entry_id)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_process_samples_session_timestamp ON process_samples(session_file, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_process_samples_timestamp ON process_samples(timestamp);
+		-- The (session_file, pid, started_at_ms, timestamp) incarnation index is created
+		-- with the identity-column migration below, since an older table lacks pid.
+
 		CREATE TABLE IF NOT EXISTS meta (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -423,6 +497,37 @@ export async function initDb(): Promise<Database> {
 	if (!spotlightCallColumns.some(column => column.name === "arg_tokens")) {
 		db.run("ALTER TABLE spotlight_calls ADD COLUMN arg_tokens TEXT");
 	}
+	// Samples ingested before the sampler carried a process identity, CPU figures or
+	// token counts have none: null, not zero, so a series drawn over them cannot read
+	// a missing identity as a shared one, nor a missing token count as a real zero.
+	// A re-parse fills them where the journal has them.
+	const sampleColumns = db.query<{ name: string }, []>("PRAGMA table_info(process_samples)").all();
+	for (const column of [
+		"pid",
+		"started_at_ms",
+		"cpu_user_ms",
+		"cpu_system_ms",
+		"main_cpu_ms",
+		"main_page_faults",
+		"main_heap_used_bytes",
+		"worker_cpu_ms",
+		"tokens_input",
+		"tokens_output",
+		"tokens_cache_read",
+		"tokens_cache_write",
+		"tokens_total",
+		"tokens_include_subagents",
+		"subagent_workers",
+	]) {
+		if (!sampleColumns.some(existing => existing.name === column)) {
+			db.run(`ALTER TABLE process_samples ADD COLUMN ${column} INTEGER`);
+		}
+	}
+	// One incarnation of one session in time order: the unit a memory curve may be
+	// drawn over, where (session_file, timestamp) spans every restart of it.
+	db.run(
+		"CREATE INDEX IF NOT EXISTS idx_process_samples_incarnation ON process_samples(session_file, pid, started_at_ms, timestamp)",
+	);
 	const messageColumns = db.query("PRAGMA table_info(messages)").all() as { name: string }[];
 	if (!messageColumns.some(column => column.name === "premium_requests")) {
 		db.run("ALTER TABLE messages ADD COLUMN premium_requests REAL NOT NULL DEFAULT 0");
@@ -1065,6 +1170,9 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 					if (tools.length > 0) {
 						changes += database.query("DELETE FROM tool_calls WHERE session_file = ?").run(sessionFile).changes;
 					}
+					// Unconditional: a rebuilt transcript's samples must not survive it, and the
+					// parse result carries no count of the samples already stored for this file.
+					changes += database.query("DELETE FROM process_samples WHERE session_file = ?").run(sessionFile).changes;
 				}
 			}
 			writes.push(rows);
@@ -1079,6 +1187,7 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 			updateUserMessageLinks(parsedRows(writes, result => result.userLinks)) +
 			insertToolCalls(parsedRows(writes, result => result.toolCalls)) +
 			updateToolResults(parsedRows(writes, result => result.toolResults)) +
+			insertProcessSamples(parsedRows(writes, result => result.processSamples)) +
 			insertSpotlightSessions(parsedRows(writes, result => result.spotlight.sessions)) +
 			updateSpotlightTitles(parsedRows(writes, result => result.spotlight.titles)) +
 			upsertSpotlightShapes(parsedRows(writes, result => result.spotlight.shapes)) +
@@ -1921,6 +2030,270 @@ export function updateToolResults(links: Iterable<ToolResultLink>): number {
 		}
 	});
 	return updated;
+}
+
+/**
+ * Insert process self-measurement rows. Idempotent via
+ * UNIQUE(session_file, entry_id); the fork guard mirrors
+ * {@link insertToolCalls}: a forked transcript deep-copies its parent's
+ * entries under a new file, so first-write-wins on (entry_id, timestamp)
+ * keeps one lineage's memory curve from being counted twice.
+ */
+export function insertProcessSamples(samples: Iterable<ProcessSampleRow>): number {
+	if (!db) return 0;
+	const writer = new ChunkedInsert(db, {
+		verb: "INSERT OR IGNORE",
+		table: "process_samples",
+		columns: [
+			"session_file",
+			"entry_id",
+			"folder",
+			"agent_type",
+			"timestamp",
+			"pid",
+			"started_at_ms",
+			"seq",
+			"reason",
+			"uptime_ms",
+			"cost_ms",
+			"cpu_user_ms",
+			"cpu_system_ms",
+			"rss_kb",
+			"anon_kb",
+			"threads",
+			"cgroup_anon",
+			"cgroup_current",
+			"cgroup_max",
+			"main_jsc_heap_bytes",
+			"main_cpu_ms",
+			"main_page_faults",
+			"main_heap_used_bytes",
+			"worker_count",
+			"worker_jsc_heap_bytes",
+			"worker_cpu_ms",
+			"journal_entries",
+			"tool_calls",
+			"subagent_dispatches",
+			"file_reads",
+			"compactions",
+			"live_subagents",
+			"parked_subagents",
+			"top_tools",
+			"tokens_input",
+			"tokens_output",
+			"tokens_cache_read",
+			"tokens_cache_write",
+			"tokens_total",
+			"tokens_include_subagents",
+			"subagent_workers",
+		],
+		identity: ["entry_id", "timestamp"],
+	});
+	return atomically(db, () => {
+		for (const s of samples) {
+			writer.add(
+				s.sessionFile,
+				[s.entryId, s.timestamp],
+				[
+					s.sessionFile,
+					s.entryId,
+					s.folder,
+					s.agentType,
+					s.timestamp,
+					s.pid,
+					s.startedAtMs,
+					s.seq,
+					s.reason,
+					s.uptimeMs,
+					s.costMs,
+					s.cpuUserMs,
+					s.cpuSystemMs,
+					s.rssKb,
+					s.anonKb,
+					s.threads,
+					s.cgroupAnon,
+					s.cgroupCurrent,
+					s.cgroupMax,
+					s.mainJscHeapBytes,
+					s.mainCpuMs,
+					s.mainPageFaults,
+					s.mainHeapUsedBytes,
+					s.workerCount,
+					s.workerJscHeapBytes,
+					s.workerCpuMs,
+					s.journalEntries,
+					s.toolCalls,
+					s.subagentDispatches,
+					s.fileReads,
+					s.compactions,
+					s.liveSubagents,
+					s.parkedSubagents,
+					s.topTools,
+					s.tokensInput,
+					s.tokensOutput,
+					s.tokensCacheRead,
+					s.tokensCacheWrite,
+					s.tokensTotal,
+					s.tokensIncludeSubagents,
+					s.subagentWorkers,
+				],
+			);
+		}
+		return writer.finish();
+	});
+}
+
+/** Stored `process_samples` shape, as the table spells its columns. */
+interface ProcessSampleDbRow {
+	entry_id: string;
+	folder: string;
+	agent_type: string;
+	timestamp: number;
+	pid: number | null;
+	started_at_ms: number | null;
+	seq: number;
+	reason: string;
+	uptime_ms: number;
+	cost_ms: number;
+	cpu_user_ms: number | null;
+	cpu_system_ms: number | null;
+	rss_kb: number | null;
+	anon_kb: number | null;
+	threads: number | null;
+	cgroup_anon: number | null;
+	cgroup_current: number | null;
+	cgroup_max: number | null;
+	main_jsc_heap_bytes: number | null;
+	main_cpu_ms: number | null;
+	main_page_faults: number | null;
+	main_heap_used_bytes: number | null;
+	worker_count: number;
+	worker_jsc_heap_bytes: number | null;
+	worker_cpu_ms: number | null;
+	journal_entries: number;
+	tool_calls: number;
+	subagent_dispatches: number;
+	file_reads: number;
+	compactions: number;
+	live_subagents: number;
+	parked_subagents: number;
+	top_tools: string | null;
+	tokens_input: number | null;
+	tokens_output: number | null;
+	tokens_cache_read: number | null;
+	tokens_cache_write: number | null;
+	tokens_total: number | null;
+	tokens_include_subagents: number | null;
+	subagent_workers: number | null;
+}
+
+/**
+ * One session's process samples in time order (`GET /api/stats/process-samples?file=`),
+ * or null when the session wrote none. A session's samples are thousands of rows at
+ * most, so the series is returned whole rather than bucketed.
+ *
+ * The points come back grouped into one segment per incarnation — per `(pid,
+ * started_at_ms)` — and never as one flat list. A journal spans every restart of its
+ * session and marks none, so a flat list invites a line from a dead process's last
+ * sample to a new process's first: a memory cliff no process ever experienced. The
+ * grouping is the only shape in which that line cannot be drawn by accident.
+ */
+export async function getProcessSampleSeries(sessionFile: string): Promise<ProcessSampleSeries | null> {
+	const database = await initDb();
+	const rows = database
+		.query<ProcessSampleDbRow, [string]>(
+			`SELECT entry_id, folder, agent_type, timestamp, pid, started_at_ms, seq, reason,
+				uptime_ms, cost_ms, cpu_user_ms, cpu_system_ms,
+				rss_kb, anon_kb, threads, cgroup_anon, cgroup_current, cgroup_max,
+				main_jsc_heap_bytes, main_cpu_ms, main_page_faults, main_heap_used_bytes,
+				worker_count, worker_jsc_heap_bytes, worker_cpu_ms,
+				journal_entries, tool_calls, subagent_dispatches, file_reads, compactions,
+				live_subagents, parked_subagents, top_tools,
+				tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_total,
+				tokens_include_subagents, subagent_workers
+			FROM process_samples WHERE session_file = ? ORDER BY timestamp, seq`,
+		)
+		.all(sessionFile);
+	if (rows.length === 0) return null;
+	const segments: ProcessSampleSegment[] = [];
+	for (const row of rows) {
+		const last = segments.at(-1);
+		// A new incarnation starts a new segment. Samples that carry no identity at all
+		// (written before the sampler had one) stay in one segment of their own rather
+		// than splitting per row, since nothing distinguishes them.
+		if (!last || last.pid !== row.pid || last.startedAtMs !== row.started_at_ms) {
+			segments.push({ pid: row.pid, startedAtMs: row.started_at_ms, points: [] });
+		}
+		(segments.at(-1) as ProcessSampleSegment).points.push({
+			entryId: row.entry_id,
+			timestamp: row.timestamp,
+			seq: row.seq,
+			reason: row.reason,
+			uptimeMs: row.uptime_ms,
+			costMs: row.cost_ms,
+			cpuUserMs: row.cpu_user_ms,
+			cpuSystemMs: row.cpu_system_ms,
+			rssKb: row.rss_kb,
+			anonKb: row.anon_kb,
+			threads: row.threads,
+			cgroupAnon: row.cgroup_anon,
+			cgroupCurrent: row.cgroup_current,
+			cgroupMax: row.cgroup_max,
+			// Share of the cgroup's wall the anonymous charge holds; null when there is no wall.
+			cgroupRatio:
+				row.cgroup_anon !== null && row.cgroup_max !== null && row.cgroup_max > 0
+					? row.cgroup_anon / row.cgroup_max
+					: null,
+			mainJscHeapBytes: row.main_jsc_heap_bytes,
+			mainCpuMs: row.main_cpu_ms,
+			mainPageFaults: row.main_page_faults,
+			mainHeapUsedBytes: row.main_heap_used_bytes,
+			workerCount: row.worker_count,
+			workerJscHeapBytes: row.worker_jsc_heap_bytes,
+			workerCpuMs: row.worker_cpu_ms,
+			journalEntries: row.journal_entries,
+			toolCalls: row.tool_calls,
+			subagentDispatches: row.subagent_dispatches,
+			fileReads: row.file_reads,
+			compactions: row.compactions,
+			liveSubagents: row.live_subagents,
+			parkedSubagents: row.parked_subagents,
+			topTools: parseTopTools(row.top_tools),
+			tokensInput: row.tokens_input,
+			tokensOutput: row.tokens_output,
+			tokensCacheRead: row.tokens_cache_read,
+			tokensCacheWrite: row.tokens_cache_write,
+			tokensTotal: row.tokens_total,
+			tokensIncludeSubagents:
+				row.tokens_include_subagents === null ? null : row.tokens_include_subagents !== 0,
+			subagentWorkers: row.subagent_workers,
+			// Resident anonymous bytes per cumulative token: the number the retention
+			// hypothesis is stated in (8.00 bytes is every character ever sent, kept in
+			// UTF-16). Computed here so every reader shares one definition. Null when
+			// either side is missing or no tokens have been counted yet — a zero
+			// denominator is not a measurement.
+			bytesPerToken:
+				row.anon_kb !== null && row.tokens_total !== null && row.tokens_total > 0
+					? (row.anon_kb * 1024) / row.tokens_total
+					: null,
+		});
+	}
+	return { sessionFile, folder: rows[0].folder, agentType: rows[0].agent_type, segments };
+}
+
+/** `top_tools` as stored, or an empty list when it is absent or not the pairs it should be. */
+function parseTopTools(value: string | null): Array<[string, number]> {
+	if (!value) return [];
+	try {
+		const parsed: unknown = JSON.parse(value);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter(
+			(pair): pair is [string, number] =>
+				Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "number",
+		);
+	} catch {
+		return [];
+	}
 }
 
 /** Tables the parser fills for the Spotlight dashboard, all keyed by `session_file`. */

@@ -52,6 +52,7 @@ import {
 import { AsyncJobManager, type AsyncJobManagerApi } from "./async";
 import { AutoLearnController, buildAutoLearnInstructions } from "./autolearn/controller";
 import { createAutoresearchExtension } from "./autoresearch";
+import { installMemorySampler } from "./debug/memory-sampler";
 import { loadCapability, reset as resetCapabilities } from "./capability";
 import {
 	MAIN_AGENT_RULE_NAME,
@@ -5795,6 +5796,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					capture: content => session.runAutolearnCapture(signal => runAutoLearnCapture(content, signal)),
 				});
 			}
+			// One sampler per top-level session. It journals what this process holds and how close
+			// its box is to killing it, on a timer as well as at turn and compaction boundaries —
+			// the record has to outlive the process, because the event it explains destroys it.
+			if (taskDepth === 0) installMemorySampler(session, settings);
 		}
 
 		// MCP manager wiring has two ownership models:

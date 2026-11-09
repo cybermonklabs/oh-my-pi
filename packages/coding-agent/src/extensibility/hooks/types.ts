@@ -26,6 +26,7 @@ import type {
 	AutoRetryEndEvent,
 	AutoRetryStartEvent,
 	ContextEvent,
+	ProcessSampleEvent,
 	SessionBeforeBranchEvent,
 	SessionBeforeBranchResult,
 	SessionBeforeCompactEvent,
@@ -261,6 +262,7 @@ export interface HookCommandContext extends HookContext {
 
 export type {
 	ContextEvent,
+	ProcessSampleEvent,
 	SessionBeforeBranchEvent,
 	SessionBeforeCompactEvent,
 	SessionBeforeSwitchEvent,
@@ -480,6 +482,7 @@ export interface HookAPI {
 	): void;
 	on(event: "session.compacting", handler: HookHandler<SessionCompactingEvent, SessionCompactingResult>): void;
 	on(event: "session_compact", handler: HookHandler<SessionCompactEvent>): void;
+	on(event: "process_sample", handler: HookHandler<ProcessSampleEvent>): void;
 	on(event: "session_shutdown", handler: HookHandler<SessionShutdownEvent>): void;
 	on(event: "session_before_tree", handler: HookHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: HookHandler<SessionTreeEvent>): void;

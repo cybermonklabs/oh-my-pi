@@ -8,6 +8,7 @@
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
+import type { ThreadMemory } from "../debug/memory-sample";
 import type { AgentRef } from "../registry/agent-registry";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import type { FollowUpTurnOptions, SubagentRunRequest } from "../task/executor";
@@ -66,6 +67,8 @@ export type SubagentWorkerApi = {
 	runFollowUpTurn: RpcMethod<[options: FollowUpTurnOptions], SingleResult>;
 	/** Cold-revive a parked subagent here from its transcript; main receives the session's mirror. */
 	revivePersisted: RpcMethod<[spec: PersistedReviveSpec, expected: AgentRef], AgentSessionHandle>;
+	/** This worker's own JSC VM numbers for a `process_sample`; never forces a GC or an object census. */
+	memorySample: RpcMethod<[], ThreadMemory>;
 };
 
 /** Link held by the main thread for one worker. */

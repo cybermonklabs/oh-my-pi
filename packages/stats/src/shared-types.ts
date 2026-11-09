@@ -817,6 +817,141 @@ export interface SpotlightSessionContext {
 }
 
 /**
+ * One process self-measurement of a session: what the process weighed and what
+ * it had done by then. `cgroupRatio` is computed server-side so the client
+ * plots the headroom curve without re-deriving it.
+ */
+export interface ProcessSamplePoint {
+	/** Journal entry ID of the sample */
+	entryId: string;
+	/** Entry timestamp (Unix ms) */
+	timestamp: number;
+	/** Sample index within the session's process, from 1; a gap means samples were lost. */
+	seq: number;
+	/** `start` | `interval` | `turn` | `compaction` */
+	reason: string;
+	/** Milliseconds since the sampled process started */
+	uptimeMs: number;
+	/** What taking the sample cost, in milliseconds */
+	costMs: number;
+	/** Cumulative user CPU of the whole process, ms; null when the sample carried none */
+	cpuUserMs: number | null;
+	/** Cumulative system CPU of the whole process, ms; null when the sample carried none */
+	cpuSystemMs: number | null;
+	/** `VmRSS` in KiB; null when /proc was unreadable */
+	rssKb: number | null;
+	/** `RssAnon` in KiB; null when /proc was unreadable */
+	anonKb: number | null;
+	/** OS threads in the process; null when /proc was unreadable */
+	threads: number | null;
+	/** cgroup v2 anonymous bytes charged; null off cgroup v2 */
+	cgroupAnon: number | null;
+	/** cgroup v2 `memory.current` in bytes; null off cgroup v2 */
+	cgroupCurrent: number | null;
+	/** cgroup v2 `memory.max` in bytes; null when unlimited or off cgroup v2 */
+	cgroupMax: number | null;
+	/** `cgroupAnon / cgroupMax`: the share of the wall held. Null without a wall. */
+	cgroupRatio: number | null;
+	/** Main thread's JSC heap size, in bytes */
+	mainJscHeapBytes: number | null;
+	/** Main thread's own cumulative CPU, in milliseconds */
+	mainCpuMs: number | null;
+	/** Main thread's cumulative page faults — the only churn counter this runtime has */
+	mainPageFaults: number | null;
+	/**
+	 * Main thread's `process.memoryUsage().heapUsed`. **Diagnostic only; never present
+	 * this as the memory figure.** It stays flat at 90–108 MiB while `rssKb` climbs
+	 * past 1.4 GiB — a 15x understatement. The gap between the two is what it is for.
+	 */
+	mainHeapUsedBytes: number | null;
+	/** Subagent worker VMs recorded, answering or not */
+	workerCount: number;
+	/** Sum of the answering workers' JSC heap sizes, in bytes */
+	workerJscHeapBytes: number | null;
+	/** Sum of the answering workers' thread CPU, in milliseconds; null when none reported */
+	workerCpuMs: number | null;
+	journalEntries: number;
+	toolCalls: number;
+	subagentDispatches: number;
+	fileReads: number;
+	compactions: number;
+	liveSubagents: number;
+	parkedSubagents: number;
+	/** Largest tool kinds by call count at sample time, most-called first. */
+	topTools: Array<[string, number]>;
+	/** Cumulative prompt tokens sent; null when the sample carried no token counts */
+	tokensInput: number | null;
+	/** Cumulative output tokens received; null when the sample carried none */
+	tokensOutput: number | null;
+	/** Cumulative cache-read tokens; null when the sample carried none */
+	tokensCacheRead: number | null;
+	/** Cumulative cache-write tokens; null when the sample carried none */
+	tokensCacheWrite: number | null;
+	/** Cumulative tokens of every kind: the denominator of {@link bytesPerToken} */
+	tokensTotal: number | null;
+	/**
+	 * Whether the token counts include text sent by subagents; null when the sample
+	 * carried no counts.
+	 *
+	 * **This decides what {@link bytesPerToken} means.** When it is false, the counts
+	 * are this session's own text while the resident bytes are the whole process's, so
+	 * a session whose subagents ran in other processes reads far lower than one that
+	 * carried its own text: of the thirteen measured sessions, one sits at 1.50 bytes
+	 * per token against a median of 8.61, most probably for exactly that reason. Never
+	 * compare two sessions' ratios without comparing this flag and
+	 * {@link subagentWorkers} first.
+	 */
+	tokensIncludeSubagents: boolean | null;
+	/** Subagent worker threads living in this process at sample time; null when unreported */
+	subagentWorkers: number | null;
+	/**
+	 * `anonKb * 1024 / tokensTotal`: resident anonymous bytes per cumulative token.
+	 * Null when either side is missing or `tokensTotal` is 0.
+	 *
+	 * The hypothesis this series exists to test is stated in this number. A prompt
+	 * token is about four characters, and keeping every character ever sent in UTF-16
+	 * costs exactly 8.00 bytes per token; thirteen measured processes came in at
+	 * 6.20–11.14 (median 8.61). Live bytes **tracking** cumulative tokens means the
+	 * text is retained; live bytes **flat** while RSS climbs means the allocator is
+	 * holding freed pages instead. Read it only together with
+	 * {@link tokensIncludeSubagents}.
+	 */
+	bytesPerToken: number | null;
+}
+
+/**
+ * The samples one incarnation of the session's process wrote, in time order.
+ *
+ * A curve may be drawn through a segment's points and never between segments: the
+ * next segment is a different process, and a line joining them is a memory cliff no
+ * process experienced.
+ */
+export interface ProcessSampleSegment {
+	/** Pid of the process that wrote these points; null on samples predating identity. */
+	pid: number | null;
+	/** That process's exact start instant, epoch ms; null on samples predating identity. */
+	startedAtMs: number | null;
+	points: ProcessSamplePoint[];
+}
+
+/**
+ * One session's process samples (`GET /api/stats/process-samples?file=`), grouped into
+ * one segment per incarnation and never flattened.
+ *
+ * A session journal spans every restart of that session and marks none of them — its
+ * single `session` record is written at creation and survives every restart — so a
+ * flat list of points is a trap: drawing it joins a dead process's last sample to a
+ * new process's first. The segments are the restart boundaries, read out of the file
+ * itself from the change of `(pid, startedAtMs)`.
+ */
+export interface ProcessSampleSeries {
+	sessionFile: string;
+	folder: string;
+	agentType: string;
+	segments: ProcessSampleSegment[];
+}
+
+/**
  * Aggregated usage for a single tool over the active range.
  *
  * Token/cost fields are the *real* provider usage of the assistant turns that

@@ -99,6 +99,17 @@ describe("SubagentWorker", () => {
 		expect(await worker.link.call("ping", 42)).toBe(42);
 	});
 
+	it("reports its own VM numbers through memorySample", async () => {
+		const worker = startWorker();
+		await worker.ready;
+		const sample = await worker.link.call("memorySample");
+		expect(sample.thread).toBe(worker.threadId);
+		// bun:jsc is present under Bun; under any other runtime the call still resolves with nulls.
+		if (sample.jscHeapBytes === null) expect(sample.jscFootprintBytes).toBeNull();
+		else expect(sample.jscHeapBytes).toBeGreaterThan(0);
+		expect(sample.heapUsedBytes).toBeGreaterThan(0);
+	});
+
 	it("closes the link, rejects pending calls, and reports the exit once when the worker crashes", async () => {
 		const probe = probeService();
 		const exits: string[] = [];

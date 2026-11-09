@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { syncAllSessions } from "@oh-my-pi/omp-stats/aggregator";
-import { closeDb, getFileOffset, getRecentRequests, initDb } from "@oh-my-pi/omp-stats/db";
+import { closeDb, getFileOffset, getProcessSampleSeries, getRecentRequests, initDb } from "@oh-my-pi/omp-stats/db";
 import { getOverallStats } from "@oh-my-pi/omp-stats/rollup";
 import { getSessionsDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
@@ -49,6 +49,47 @@ function assistant(id: string): string {
 
 function tier(value: string | null): string {
 	return `${JSON.stringify({ type: "service_tier_change", serviceTier: value })}\n`;
+}
+
+function sample(id: string, timestamp: string, seq: number): string {
+	return `${JSON.stringify({
+		type: "process_sample",
+		id,
+		parentId: null,
+		timestamp,
+		sample: {
+			// One incarnation across the whole file: the appended sample continues the run.
+			identity: { pid: 7, startedAtMs: Date.parse("2026-11-09T18:59:00.000Z") },
+			seq,
+			reason: seq === 1 ? "start" : "interval",
+			uptimeMs: seq * 60_000,
+			cpu: { userMs: 500 * seq, systemMs: 100 * seq },
+			process: { rssKb: 100_000 * seq, anonKb: 90_000 * seq, fileKb: 10_000, threads: 8 },
+			cgroup: { path: "/sys/fs/cgroup", anon: 1024 ** 3, file: 1024 ** 2, current: 1024 ** 3, max: 4 * 1024 ** 3 },
+			main: {
+				thread: "main",
+				jscHeapBytes: 1_000_000,
+				jscFootprintBytes: 2_000_000,
+				pageFaults: 1_000 * seq,
+				heapUsedBytes: 1,
+				heapTotalBytes: 2,
+				externalBytes: 3,
+				cpuMs: 400 * seq,
+			},
+			workers: [],
+			work: {
+				journalEntries: seq,
+				toolCalls: seq,
+				topTools: [["read", seq]],
+				subagentDispatches: 0,
+				fileReads: seq,
+				compactions: 0,
+				liveSubagents: 0,
+				parkedSubagents: 0,
+			},
+			costMs: 0.5,
+		},
+	})}\n`;
 }
 
 async function session(content: string): Promise<string> {
@@ -267,6 +308,23 @@ describe("incremental stats ingestion", () => {
 		await syncAllSessions({ workers: 1 });
 		expect(getOverallStats().totalRequests).toBe(1);
 		expect(getOverallStats().totalPremiumRequests).toBe(1);
+	});
+
+	it("picks up a process sample appended after the first sync at the stored offset", async () => {
+		const file = await session(assistant("first") + sample("ps-1", "2026-11-09T19:00:00.000Z", 1));
+		await syncAllSessions({ workers: 1 });
+		expect((await getProcessSampleSeries(file))?.segments[0].points.map(point => point.seq)).toEqual([1]);
+		const offset = getFileOffset(file);
+
+		await fs.appendFile(file, sample("ps-2", "2026-11-09T19:01:00.000Z", 2));
+		await syncAllSessions({ workers: 1 });
+
+		const series = await getProcessSampleSeries(file);
+		expect(series?.segments).toHaveLength(1);
+		expect(series?.segments[0].points.map(point => point.seq)).toEqual([1, 2]);
+		expect(series?.segments[0].points.map(point => point.entryId)).toEqual(["ps-1", "ps-2"]);
+		// The tail read resumed rather than replaying: the cursor only moved forward.
+		expect(getFileOffset(file)?.offset).toBeGreaterThan(offset?.offset ?? 0);
 	});
 
 	it("detects a same-inode rewrite that grows past the previous cursor", async () => {

@@ -115,6 +115,7 @@ import type {
 	CacheWarmingDecisionEventResult,
 	ContextEvent,
 	GoalUpdatedEvent,
+	ProcessSampleEvent,
 	RetryFallbackAppliedEvent,
 	RetryFallbackSucceededEvent,
 	SessionBeforeBranchEvent,
@@ -1111,6 +1112,7 @@ export interface ResourcesDiscoverResult {
 // ============================================================================
 
 export type {
+	ProcessSampleEvent,
 	SessionBeforeBranchEvent,
 	SessionBeforeCompactEvent,
 	SessionBeforeSwitchEvent,
@@ -1838,6 +1840,7 @@ export interface ExtensionAPI {
 		handler: ExtensionHandler<CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult>,
 	): void;
 	on(event: "session_compact", handler: ExtensionHandler<SessionCompactEvent>): void;
+	on(event: "process_sample", handler: ExtensionHandler<ProcessSampleEvent>): void;
 	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
 	on(event: "session_before_tree", handler: ExtensionHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: ExtensionHandler<SessionTreeEvent>): void;

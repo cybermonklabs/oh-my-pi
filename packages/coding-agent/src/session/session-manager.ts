@@ -27,6 +27,7 @@ import {
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import type { ProcessSample } from "../debug/memory-sample";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
@@ -67,6 +68,7 @@ import {
 	type ModelUsageEntry,
 	lastSelfSelectedLeafId,
 	type NewSessionOptions,
+	type ProcessSampleEntry,
 	type ResetBoundaryEntry,
 	type ServiceTierChangeEntry,
 	sessionEntryLeafId,
@@ -3757,6 +3759,47 @@ export class SessionManager {
 		const entry: CustomEntry = { type: "custom", customType, data, ...this.#freshEntryFields() };
 		this.#recordEntry(entry);
 		return entry.id;
+	}
+
+	/**
+	 * Journal a memory self-report without disturbing the conversation.
+	 *
+	 * Written off-branch like {@link appendModelUsage}: the entry hangs off the current leaf and
+	 * records that leaf as its `activeLeafId`, so a resume replays to where the session actually
+	 * was rather than landing on a sample. Nothing builds a message from it, so it never reaches
+	 * the model.
+	 */
+	appendProcessSample(sample: ProcessSample): string {
+		const leafId = this.#index.leafId();
+		const entry: ProcessSampleEntry = {
+			type: "process_sample",
+			id: generateId(this.#index),
+			parentId: leafId,
+			timestamp: nowIso(),
+			runtime: currentRuntimeIdentity(),
+			activeLeafId: leafId,
+			sample,
+		};
+		this.#recordEntry(entry);
+		// Through #setLeaf so an in-flight atomic batch rolls back to this leaf, not to the sample.
+		this.#setLeaf(leafId);
+		return entry.id;
+	}
+
+	/** Journal entries written so far. O(1), where {@link getEntries} copies the whole array. */
+	entryCount(): number {
+		return this.#entries.length;
+	}
+
+	/**
+	 * Entries appended at or after `index`, for a reader keeping a cursor.
+	 *
+	 * The memory sampler counts the session's work by walking only what is new since its last
+	 * sample, which keeps its cost proportional to entries written rather than to the journal's
+	 * length — a rescan per sample would be quadratic over a session's life.
+	 */
+	entriesFrom(index: number): readonly SessionEntry[] {
+		return index <= 0 ? this.#entries : this.#entries.slice(index);
 	}
 
 	/**

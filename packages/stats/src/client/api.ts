@@ -9,6 +9,7 @@ import type {
 	MessageStats,
 	ModelDashboardStats,
 	OverviewStats,
+	ProcessSampleSeries,
 	ProviderDashboardStats,
 	ProviderWindowStats,
 	RequestDetails,
@@ -201,6 +202,18 @@ export async function getSpotlightDashboardStats(
 /** One experiment session's context per request, with and without shaping. */
 export async function getSpotlightSessionContext(file: string, signal?: AbortSignal): Promise<SpotlightSessionContext> {
 	return fetchJson<SpotlightSessionContext>(`${API_BASE}/stats/spotlight/session?file=${encodeURIComponent(file)}`, {
+		signal,
+	});
+}
+
+/**
+ * One session's memory and work-shape samples, one segment per process incarnation.
+ *
+ * Plot each segment as its own curve: a line across a segment boundary joins two
+ * different processes and shows a memory cliff that never happened.
+ */
+export async function getProcessSampleSeries(file: string, signal?: AbortSignal): Promise<ProcessSampleSeries> {
+	return fetchJson<ProcessSampleSeries>(`${API_BASE}/stats/process-samples?file=${encodeURIComponent(file)}`, {
 		signal,
 	});
 }

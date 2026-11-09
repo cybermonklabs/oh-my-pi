@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Ingests the session journal's `process_sample` entries into a `process_samples` table through the existing offset-based incremental reader, and serves `GET /api/stats/process-samples?file=` with a session's RSS, cgroup ratio, CPU and work counters over time. The series is split into one segment per process incarnation, since a journal spans every restart of its session and marks none of them — joining across a restart would draw a memory cliff no process experienced ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.16.0] - 2026-11-02
 
 ### Fixed
