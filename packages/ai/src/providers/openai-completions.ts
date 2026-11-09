@@ -975,13 +975,9 @@ const streamOpenAICompletionsOnce = (
 				// may observe) reports that time as ours rather than the provider's.
 				const requestGuard = armPreResponseTimeout(requestSignal, requestTimeoutMs, stream);
 				const guardedRequestSignal = requestGuard.signal ?? requestSignal;
-				guardedRequestSignal.addEventListener(
-					"abort",
-					() => {
-						if (!requestSignal.aborted) abortTracker.abortLocally(firstEventTimeoutAbortError);
-					},
-					{ once: true },
-				);
+				requestGuard.onAbort(() => {
+					if (!requestSignal.aborted) abortTracker.abortLocally(firstEventTimeoutAbortError);
+				});
 				try {
 					const headersWithTimeout = { ...headers };
 					if (requestTimeoutMs !== undefined) {

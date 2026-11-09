@@ -169,14 +169,44 @@ export function getOpenAIStreamFirstEventTimeoutMs(
  *
  * Returns the caller signal unchanged, a no-op `clear` and no remainder when
  * no positive timeout is configured.
+ *
+ * `clear()` is the one release point, and it releases the guard's *memory* as
+ * well as its timer. `AbortSignal.any` makes the signal it returns a dependent
+ * of every source, and a dependent with an abort listener is kept alive by its
+ * sources for as long as they can still abort it. A caller signal that lives
+ * for a session therefore accumulates one guard signal per request — with the
+ * request body, the response queue and the stream behind its listeners'
+ * closures — unless those listeners come off. So `clear()` removes every
+ * listener armed through this guard: its own, and each one a caller registered
+ * with {@link PreResponseTimeout.onAbort}. By then the budget can no longer
+ * fire, so none of them has anything left to do. A caller that registers an
+ * abort listener on `signal` itself, rather than through `onAbort`, keeps that
+ * whole graph alive for the caller signal's life.
  */
 export function armPreResponseTimeout(
 	callerSignal: AbortSignal | undefined,
 	timeoutMs: number | undefined,
 	heldWork?: Pick<EventStream<unknown>, "trackLocalWork">,
 ): PreResponseTimeout {
+	// Removal of every abort listener this guard armed, run by `clear()`.
+	const listenerReleases: Array<() => void> = [];
+	const trackAbort = (target: AbortSignal | undefined, handler: () => void): void => {
+		if (!target) return;
+		target.addEventListener("abort", handler, { once: true });
+		listenerReleases.push(() => target.removeEventListener("abort", handler));
+	};
+	const releaseListeners = (): void => {
+		for (const release of listenerReleases.splice(0)) release();
+	};
 	if (timeoutMs === undefined || timeoutMs <= 0) {
-		return { signal: callerSignal, clear: () => {}, remaining: () => undefined };
+		// No budget: the signal handed back is the caller's own, which may well
+		// outlive the request, so `onAbort` registrations still have to come off.
+		return {
+			signal: callerSignal,
+			clear: releaseListeners,
+			remaining: () => undefined,
+			onAbort: handler => trackAbort(callerSignal, handler),
+		};
 	}
 	const controller = new AbortController();
 	let timer: NodeJS.Timeout | undefined;
@@ -225,14 +255,10 @@ export function armPreResponseTimeout(
 		enclosing?.resume();
 	};
 	if (heldWork || enclosing) {
-		signal.addEventListener(
-			"abort",
-			() => {
-				closeHeld();
-				startEnclosing();
-			},
-			{ once: true },
-		);
+		trackAbort(signal, () => {
+			closeHeld();
+			startEnclosing();
+		});
 	}
 	// The guard is armed where the request is built, but what it bounds is the
 	// provider's latency. Everything between the two — a caller's dispatch hold
@@ -263,8 +289,10 @@ export function armPreResponseTimeout(
 			stop();
 			closeHeld();
 			startEnclosing();
+			releaseListeners();
 		},
 		remaining: () => Math.max(1, timer === undefined ? remainingMs : remainingMs - (Date.now() - startedAt)),
+		onAbort: handler => trackAbort(signal, handler),
 	};
 }
 
@@ -272,7 +300,7 @@ export function armPreResponseTimeout(
 export interface PreResponseTimeout {
 	/** The caller's signal combined with the budget; the caller's own signal when no budget is armed. */
 	signal: AbortSignal | undefined;
-	/** Disarms the guard for good, once the attempt it covers has its headers or has failed. */
+	/** Disarms the guard for good — and releases every listener it armed — once the attempt it covers has its headers or has failed. */
 	clear: () => void;
 	/**
 	 * What is left of the budget for the watchdog that waits for the first
@@ -284,6 +312,15 @@ export interface PreResponseTimeout {
 	 * watchdog at all.
 	 */
 	remaining: () => number | undefined;
+	/**
+	 * Registers `handler` for one abort of {@link signal}, and takes it off
+	 * again at {@link clear}. Providers use it to tell a local abort tracker
+	 * that the budget, not the caller, cancelled the request. Call it rather
+	 * than `signal.addEventListener`: the signal is an `AbortSignal.any`
+	 * composite over the caller's, so a listener left on it after the attempt
+	 * settles pins that request's whole graph for the caller signal's life.
+	 */
+	onAbort: (handler: () => void) => void;
 }
 
 /** Attached by {@link armPreResponseTimeout} to the signal it hands the transport. */
