@@ -25,6 +25,10 @@ export default class Gc extends Command {
 		restore: Flags.string({
 			description: "Bring an archived session back by id prefix or archive path (runs alone)",
 		}),
+		strip: Flags.boolean({
+			description:
+				"Strip provider replay data (signatures, encrypted reasoning, cached responses) from idle sessions",
+		}),
 		"cold-archive-after-days": Flags.integer({ description: "Minimum session age before archiving" }),
 		"retain-newest-global": Flags.integer({ description: "Always keep this many newest sessions active" }),
 		"retain-newest-per-cwd": Flags.integer({ description: "Always keep this many newest sessions per cwd active" }),
@@ -33,6 +37,7 @@ export default class Gc extends Command {
 		}),
 		"stale-retain-days": Flags.integer({ description: "Minimum debug report/collab replica age before pruning" }),
 		"compress-after-days": Flags.integer({ description: "Minimum idle days before compressing a session" }),
+		"strip-after-days": Flags.integer({ description: "Minimum idle days before stripping a session" }),
 	};
 
 	async run(): Promise<void> {
@@ -48,14 +53,20 @@ export default class Gc extends Command {
 				stale: flags.stale,
 				compress: flags.compress,
 				restore: flags.restore,
+				strip: flags.strip,
 				coldArchiveAfterDays: flags["cold-archive-after-days"],
 				retainNewestGlobal: flags["retain-newest-global"],
 				retainNewestPerCwd: flags["retain-newest-per-cwd"],
 				staleRetainNewest: flags["stale-retain-newest"],
 				staleRetainDays: flags["stale-retain-days"],
 				compressAfterDays: flags["compress-after-days"],
+				stripAfterDays: flags["strip-after-days"],
 			},
+			progress: process.stderr,
 		};
+		if (!flags.apply && process.stderr.isTTY) {
+			process.stderr.write("Dry run: nothing will be changed. Pass --apply to apply.\n");
+		}
 		const result = await runGcCommand(cmd);
 		const errors = collectGcErrors(result);
 		if (errors.length > 0) {
