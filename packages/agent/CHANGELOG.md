@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Initial and updated compaction summaries are prompted to retain each to-do's source and every running procedure's exact command ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
+- Initial, updated, and split-turn prefix compaction summaries are prompted to retain each to-do's source and every running procedure's exact command ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
 
 ## [18.18.2] - 2026-11-08
 

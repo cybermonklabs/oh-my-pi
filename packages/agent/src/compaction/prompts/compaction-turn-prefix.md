@@ -1,5 +1,7 @@
 Turn prefix too large; recent-work suffix retained.
 
+Each to-do MUST cite the record or file that set it.
+
 MUST summarize prefix for retained suffix:
 
 ## Original Request
@@ -14,4 +16,4 @@ MUST summarize prefix for retained suffix:
 
 MUST output only the structured summary; NEVER extra text.
 
-MUST concise. MUST preserve exact file paths, function names, error messages, relevant tool outputs, and command results if present. MUST focus on information needed to understand the retained suffix.
+MUST concise. MUST preserve exact file paths, function names, error messages, relevant tool outputs, command results if present, and the exact command of every running procedure. MUST focus on information needed to understand the retained suffix.
