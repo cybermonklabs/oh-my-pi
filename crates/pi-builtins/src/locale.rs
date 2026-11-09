@@ -6,14 +6,22 @@
 //! `LC_ALL=C sort` at the prompt. Nothing here calls `setlocale`, which would
 //! change the C locale of the whole host process.
 //!
-//! Used by `sort` (collation, numerics), `uniq`, `date`, `du`, `df`, `env`, and
-//! `fold`.
+//! Used by `sort` and `comm` (collation), `sort` (numerics), `uniq`, `date`,
+//! `du`, `df`, `env`, and `fold`.
 
 #![allow(dead_code, reason = "each utility uses a subset")]
 
+use std::sync::{Arc, LazyLock};
+
+use foldhash::HashMap;
+use icu_collator::{
+	CollatorBorrowed,
+	options::{AlternateHandling, CollatorOptions, Strength},
+};
 use icu_decimal::provider::{Baked, DecimalSymbolsV1};
 use icu_locale_core::Locale;
 use icu_provider::{DataIdentifierBorrowed, DataLocale, DataProvider, DataRequest};
+use parking_lot::Mutex;
 
 use crate::host::Host;
 
@@ -172,6 +180,56 @@ pub(crate) fn parse_locale_name(name: &str) -> Option<(Locale, bool)> {
 		.ok()
 		.filter(|locale| *locale != Locale::UNKNOWN)?;
 	Some((locale, codeset_is_utf8(name)))
+}
+
+/// Collators built so far, by locale. Building one resolves the locale's
+/// tailoring through ICU's fallback chain, which repeated calls skip. `None`
+/// records a locale ICU could not build a collator for.
+static COLLATORS: LazyLock<Mutex<HashMap<Locale, Option<Arc<CollatorBorrowed<'static>>>>>> =
+	LazyLock::new(Default::default);
+
+/// The collator for the shell's `LC_COLLATE`, or `None` to compare text by
+/// bytes: the locale must be UTF-8 (uucore's rule) and the shell's locale
+/// environment must initialise (GNU falls back to byte order otherwise).
+/// `sort` orders lines with it and `comm` merges with it, so `sort | comm`
+/// agree in every locale.
+pub(crate) fn shell_collator(host: &Host) -> Option<Arc<CollatorBorrowed<'static>>> {
+	let (locale, utf8) = parse_locale_name(shell_locale(host, "LC_COLLATE")?)?;
+	if !utf8 || collation_locale_failed(host) {
+		return None;
+	}
+	COLLATORS
+		.lock()
+		.entry(locale)
+		.or_insert_with_key(|locale| {
+			// Shift punctuation behind letters, but retain its quaternary
+			// distinctions for `-u` and `-c` instead of treating paths as equal.
+			let mut options = CollatorOptions::default();
+			options.alternate_handling = Some(AlternateHandling::Shifted);
+			options.strength = Some(Strength::Quaternary);
+			CollatorBorrowed::try_new(locale.into(), options)
+				.ok()
+				.map(Arc::new)
+		})
+		.clone()
+}
+
+/// Whether a GNU utility's own `setlocale(LC_ALL, "")` would have failed and
+/// left it in the C locale -- GNU's "failed to set locale", after which text
+/// compares by bytes. It fails as a whole when any one category's data is
+/// missing, so asking about `LC_COLLATE` alone answers a different question.
+/// A locale libc could not be asked about is not a failure either: it is
+/// reported where it is read, and the names stand.
+#[cfg(unix)]
+pub(crate) fn collation_locale_failed(host: &Host) -> bool {
+	matches!(shell_locale_initialises(host), ShellLocale::C)
+}
+
+/// Windows has no system locale to load; `LC_ALL=missing` stands in for an
+/// unloadable one.
+#[cfg(not(unix))]
+pub(crate) fn collation_locale_failed(host: &Host) -> bool {
+	host.var("LC_ALL") == Some("missing")
 }
 
 /// Whether the system can load `locale` for the categories in `mask`, in
