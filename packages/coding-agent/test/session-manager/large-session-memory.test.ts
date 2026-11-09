@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { listSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionManager, shareSystemPromptBlocks } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 
@@ -295,5 +295,111 @@ describe("large session memory guards", () => {
 
 		expect(sessions).toHaveLength(1);
 		expect(sessions[0]?.firstMessage).toBe("Plan fork context");
+	});
+
+	it("keeps every session_init prompt revision intact across load and rewrite", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionDir = "/sessions/project";
+		const sessionFile = `${sessionDir}/prompts.jsonl`;
+		const catalogue = `catalogue-${"c".repeat(8192)}`;
+		const skill = `skill-${"s".repeat(4096)}`;
+		const prompts = [
+			[catalogue, skill, "roster A"],
+			[catalogue, skill, "roster B"],
+			[catalogue, `${skill}-edited`, "roster C"],
+		];
+		const records: Record<string, unknown>[] = [
+			{ type: "session", version: 3, id: "prompts", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/work" },
+		];
+		let parentId: string | null = null;
+		prompts.forEach((systemPrompt, index) => {
+			const id = `i${index}`;
+			records.push({
+				type: "session_init",
+				id,
+				parentId,
+				timestamp: `2026-01-01T00:00:0${index + 1}.000Z`,
+				systemPrompt,
+				task: "t",
+				tools: ["read"],
+			});
+			parentId = id;
+		});
+		records.push({
+			type: "message",
+			id: "u1",
+			parentId,
+			timestamp: "2026-01-01T00:00:09.000Z",
+			message: { role: "user", content: "hello", timestamp: 1 },
+		});
+		records.push({
+			type: "compaction",
+			id: "c1",
+			parentId: "u1",
+			timestamp: "2026-01-01T00:00:10.000Z",
+			summary: "compacted",
+			firstKeptEntryId: "u1",
+			tokensBefore: 1000,
+		});
+		storage.writeTextSync(sessionFile, records.map(record => `${JSON.stringify(record)}\n`).join(""));
+
+		const session = await SessionManager.open(sessionFile, sessionDir, storage);
+		expect(
+			session.getEntries().flatMap(entry => (entry.type === "session_init" ? [entry.systemPrompt] : [])),
+		).toEqual(prompts);
+
+		// The whole-file rewrite serializes `#entries`, so a load-time change to
+		// them must survive the round trip byte for byte.
+		await session.rewriteEntries();
+		const reopened = await SessionManager.open(sessionFile, sessionDir, storage);
+		expect(
+			reopened.getEntries().flatMap(entry => (entry.type === "session_init" ? [entry.systemPrompt] : [])),
+		).toEqual(prompts);
+	});
+
+	it("carries a legacy joined-string session_init prompt through load unchanged", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionDir = "/sessions/project";
+		const sessionFile = `${sessionDir}/legacy.jsonl`;
+		const joined = `legacy-${"j".repeat(4096)}`;
+		const records = [
+			{ type: "session", version: 3, id: "legacy", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/work" },
+			{
+				type: "session_init",
+				id: "i0",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:01.000Z",
+				systemPrompt: joined,
+				task: "t",
+				tools: [],
+			},
+			{
+				type: "session_init",
+				id: "i1",
+				parentId: "i0",
+				timestamp: "2026-01-01T00:00:02.000Z",
+				systemPrompt: joined,
+				task: "t",
+				tools: [],
+			},
+		];
+		storage.writeTextSync(sessionFile, records.map(record => `${JSON.stringify(record)}\n`).join(""));
+
+		const session = await SessionManager.open(sessionFile, sessionDir, storage);
+		expect(
+			session.getEntries().flatMap(entry => (entry.type === "session_init" ? [entry.systemPrompt] : [])),
+		).toEqual([joined, joined]);
+	});
+
+	it("shares only byte-identical blocks and leaves the inputs alone", () => {
+		const retained = ["catalogue", "skill", "roster A"];
+		const next = ["catalogue", "skill-edited", "roster B"];
+		const shared = shareSystemPromptBlocks(next, retained);
+
+		expect(shared).toEqual(next);
+		expect(shared).not.toBe(next);
+		expect(shareSystemPromptBlocks(next, [])).toEqual(next);
+		expect(retained).toEqual(["catalogue", "skill", "roster A"]);
+		expect(next).toEqual(["catalogue", "skill-edited", "roster B"]);
 	});
 });

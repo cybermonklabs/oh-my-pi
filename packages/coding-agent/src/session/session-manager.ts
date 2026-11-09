@@ -439,6 +439,56 @@ function normalizeLoadedUsage(entries: SessionEntry[]): number {
 	return repaired;
 }
 
+/**
+ * Point `blocks` at the instances `retained` already holds, for every block
+ * whose text is byte-identical. Returns a fresh array; neither input is
+ * mutated.
+ */
+export function shareSystemPromptBlocks(blocks: readonly string[], retained: readonly string[]): string[] {
+	if (retained.length === 0) return [...blocks];
+	const pool = new Map<string, string>();
+	for (const block of retained) pool.set(block, block);
+	return blocks.map(block => pool.get(block) ?? block);
+}
+
+/**
+ * Collapse the `session_init` system prompts of loaded history onto one
+ * instance per distinct block.
+ *
+ * A session appends a fresh `session_init` whenever its rendered base prompt
+ * changes — a device mount, an MCP refresh, a roster line — and each one
+ * carries the WHOLE prompt, so the blocks the revision did not touch (the
+ * tool catalogue, the skill files) arrive again as new text. Parsing a
+ * resumed journal builds every copy separately, so a long-lived session
+ * retains one backing store per revision of text it already has
+ * (dispatch://INFRA-1876). Sharing the instance changes no entry, no line
+ * written back, and no consumer; only the duplicate strings go.
+ */
+function shareRepeatedSystemPromptBlocks(entries: readonly SessionEntry[]): void {
+	// `===` on strings compares text, not backing store, so the pooled value is
+	// assigned whenever one exists: the write is what drops the duplicate.
+	let pool: Map<string, string> | undefined;
+	for (const entry of entries) {
+		if (entry.type !== "session_init") continue;
+		pool ??= new Map<string, string>();
+		const prompt = entry.systemPrompt;
+		// Files written before blocks were kept store one joined string; those
+		// repeat whole prompt for whole prompt, so pool the single value.
+		if (typeof prompt === "string") {
+			const shared = pool.get(prompt);
+			if (shared === undefined) pool.set(prompt, prompt);
+			else entry.systemPrompt = shared;
+			continue;
+		}
+		for (let index = 0; index < prompt.length; index++) {
+			const block = prompt[index]!;
+			const shared = pool.get(block);
+			if (shared === undefined) pool.set(block, block);
+			else prompt[index] = shared;
+		}
+	}
+}
+
 function addUsage(target: UsageStatistics, usage: Usage | undefined): void {
 	if (!usage) return;
 	target.input += usage.input;
@@ -2118,6 +2168,7 @@ export class SessionManager {
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
 		const repairedUsage = normalizeLoadedUsage(entries);
+		shareRepeatedSystemPromptBlocks(entries);
 		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
 		this.#index.rebuild(entries);
 	}
@@ -4272,6 +4323,7 @@ export class SessionManager {
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
 		normalizeLoadedUsage(history);
+		shareRepeatedSystemPromptBlocks(history);
 		if (options?.resetInheritedCost) SessionManager.#resetInheritedUsageCost(history);
 		manager.#resetToNewSession(
 			{

@@ -498,6 +498,7 @@ import {
 	copySessionArtifacts,
 	extractSessionInit,
 	type PersistedSessionInit,
+	shareSystemPromptBlocks,
 	type SessionManager,
 } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
@@ -7223,7 +7224,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		) {
 			return;
 		}
-		cached.init = { ...init, systemPrompt: base, workPoolYieldItems: items.length > 0 ? [...items] : undefined };
+		// Only some blocks moved; the rest are a fresh copy of text this session
+		// already retains in the previous contract. Point them back at it, so a
+		// session that revises its prompt N times holds one tool catalogue and
+		// one copy of each skill file instead of N (dispatch://INFRA-1876).
+		cached.init = {
+			...init,
+			systemPrompt: shareSystemPromptBlocks(base, init.systemPrompt),
+			workPoolYieldItems: items.length > 0 ? [...items] : undefined,
+		};
 		this.sessionManager.appendSessionInit(cached.init);
 	}
 

@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- A long session no longer holds one copy of its whole system prompt per revision of it. Each device mount, MCP refresh or roster change records a fresh `session_init` carrying the entire prompt, so the blocks the revision did not touch — the tool catalogue, each skill file — were retained again, and a resumed journal parsed every copy separately. Unchanged blocks now share one instance; the entries, the journal and every reader are unchanged ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
 - Long bash output cut in the middle no longer splits a line at the `[…N ln elided…]` marker, and its "Showing lines …" notice now names the lines actually shown, ending at the output's real last line ([#17957](https://github.com/can1357/oh-my-pi/pull/17957) by [@H4vC](https://github.com/H4vC))
 - A bash command that prints nothing and succeeds now returns `(no output, exit code 0)` instead of a bare `(no output)`, so an empty diff or search no longer reads like a failed command ([#17957](https://github.com/can1357/oh-my-pi/pull/17957) by [@H4vC](https://github.com/H4vC))
 - Added `tui.motion` (`full` / `reduced` / `none`, also `--motion` and `PI_MOTION`), one switch over spinners, the thinking pulse, shimmer and the status-line blink/fade for many-pane or reduced-motion use; a `tui.spinnerInterval` you set still wins over the preset ([#14240](https://github.com/can1357/oh-my-pi/pull/14240) by [@mccraigmccraig](https://github.com/mccraigmccraig))
