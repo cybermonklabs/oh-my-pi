@@ -4,7 +4,7 @@
  */
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { IrcWaitFilter } from "../../irc/bus";
-import type { AdoptOptions, LiveAgentTarget } from "../../registry/agent-lifecycle";
+import type { AdoptOptions, AgentReleaseOptions, LiveAgentTarget } from "../../registry/agent-lifecycle";
 import type {
 	AgentHistorySummary,
 	AgentRef,
@@ -67,7 +67,7 @@ export type AgentLifecycleProtocol = {
 	park: RpcMethod<[id: string], void>;
 	ensureLive: RpcMethod<[id: string], AgentSessionHandle>;
 	ensureLiveTarget: RpcMethod<[id: string], LiveAgentTarget>;
-	release: RpcMethod<[id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }], boolean>;
+	release: RpcMethod<[id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions], boolean>;
 };
 
 /** Result row of `IrcBusApi.unansweredSends`. */
