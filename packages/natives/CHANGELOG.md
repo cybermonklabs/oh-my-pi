@@ -9,6 +9,7 @@
 ### Fixed
 
 - Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
+- Fixed the darwin native addons failing to build on a machine without a warm Bazel repository cache: Apple superseded the pinned Command Line Tools SDK on 2026-10-29 and its download now returns 403, so the macOS SDK is taken from the Xcode 27.2 package (`MacOSX27.2.sdk`) ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
 ### Fixed
 
 - Fixed `el.type` and `el.press(keys)` on Wayland moving focus inside the element's app (GNOME showed "… is ready") before refusing the call: they are now refused before anything reaches the app ([#17915](https://github.com/can1357/oh-my-pi/pull/17915) by [@will-bogusz](https://github.com/will-bogusz))
