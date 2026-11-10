@@ -29,10 +29,11 @@ export async function getCurrentAutoresearchBranch(_api: ExtensionAPI, workDir: 
 /**
  * Ensure the working tree is on an `autoresearch/*` branch when possible.
  *
- * If the worktree is dirty and we're not already on an autoresearch branch, this returns
- * `{ ok: true, branchName: null, warning }` rather than failing. The caller surfaces the
- * warning and continues on the current branch — `keep` will skip auto-commits and `discard`
- * will revert only run-modified paths instead of resetting to baseline.
+ * A dirty worktree that is not already on an autoresearch branch fails with
+ * `{ ok: false, error }`: a fresh `autoresearch/*` branch needs a clean baseline, and the
+ * caller surfaces the error and stops. The only `{ ok: true, branchName: null, warning }`
+ * result is "not a git repository at all": the caller surfaces the warning and continues
+ * without branch isolation, baseline reset or auto-commits.
  */
 export async function ensureAutoresearchBranch(
 	api: ExtensionAPI,
