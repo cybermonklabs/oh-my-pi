@@ -3,6 +3,7 @@ import { $env, $envExact, logger } from "@oh-my-pi/pi-utils";
 import { type ApiKeyResolver, createOAuthProvenance, markAfterSiblingWait, type ResolvedApiKey } from "../auth-retry";
 import { getEnvApiKey, getEnvApiKeyName } from "../env-api-key";
 import * as AIError from "../error";
+import { assertProviderEnabled, providerPauseReason } from "../registry/oauth";
 import { isUsageLimitOutcome } from "../error/rate-limit";
 import { AUTHENTICATED_SENTINEL } from "../registry/types";
 import { getHeadersFromError, getRetryAfterMsFromHeaders } from "../utils/retry-after";
@@ -216,6 +217,7 @@ export class KeyCascade implements KeysApi {
 	 * selects dedicated-only, alias-aware, or no environment fallback.
 	 */
 	source(provider: string, { env = "dedicated" }: AuthSourceOptions = {}): AuthSource | undefined {
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		if (this.#deps.overrides.runtimeKey(provider) !== undefined) return { kind: "runtime", concrete: true };
 		if (this.#deps.overrides.configKey(provider) !== undefined) return { kind: "config", concrete: true };
 		const bearing = this.#getAuthBearingCredentials(provider);
@@ -257,6 +259,7 @@ export class KeyCascade implements KeysApi {
 	 * one namespace.
 	 */
 	async peek(provider: string, options?: AuthPeekOptions): Promise<string | undefined> {
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		const runtimeKey = this.#deps.overrides.runtimeKey(provider);
 		if (runtimeKey) {
 			return runtimeKey;
@@ -331,6 +334,7 @@ export class KeyCascade implements KeysApi {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<ResolvedApiKey | undefined> {
+		assertProviderEnabled(provider);
 		let credentialId: number | undefined;
 		let oauthIdentity: OAuthRequestIdentity | undefined;
 		let oauthAccess: string | undefined;
@@ -383,6 +387,9 @@ export class KeyCascade implements KeysApi {
 		options?: AuthApiKeyOptions,
 		onCredentialId?: (id: number, identity?: OAuthRequestIdentity, oauthAccess?: string) => void,
 	): Promise<string | undefined> {
+		// A provider turned off in its auth rules is reached by no key source:
+		// runtime, models.yml, stored, env or broker.
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		const restricted = this.#deps.affinity.isRestricted(provider, sessionId);
 		// Runtime override takes highest priority
 		const runtimeKey = restricted ? undefined : this.#deps.overrides.runtimeKey(provider);
@@ -550,6 +557,7 @@ export class KeyCascade implements KeysApi {
 	 * The string is purely informational; consumers must not parse it.
 	 */
 	describe(provider: string, sessionId?: string): string | undefined {
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		if (this.#deps.overrides.runtimeKey(provider) !== undefined) {
 			return "runtime override (--api-key)";
 		}

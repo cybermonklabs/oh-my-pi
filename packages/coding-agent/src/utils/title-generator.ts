@@ -180,6 +180,12 @@ function getTitleModels(registry: ModelRegistry, settings: Settings, currentMode
 }
 
 /**
+ * Receives each title request the provider billed, for the caller's usage
+ * ledger. Must not throw: accounting never fails a title.
+ */
+export type TitleUsageReporter = (message: AssistantMessage) => void;
+
+/**
  * Generate a title for a session based on the first user message.
  *
  * @param firstMessage The first user message
@@ -195,6 +201,8 @@ function getTitleModels(registry: ModelRegistry, settings: Settings, currentMode
  * @param signal Session-lifecycle cancellation for background title requests
  * @param credentialSourceSessionId Optional foreground session whose selected
  *   OAuth credential should seed an isolated title-request session.
+ * @param onUsage Optional reporter for every title attempt the provider billed,
+ *   so the caller can record its usage on the session's cost ledger.
  */
 export async function generateSessionTitle(
 	firstMessage: string,
@@ -206,6 +214,7 @@ export async function generateSessionTitle(
 	customSystemPrompt?: string,
 	signal?: AbortSignal,
 	credentialSourceSessionId?: string,
+	onUsage?: TitleUsageReporter,
 ): Promise<string | null> {
 	// Defer titling for greetings / acknowledgements / empty input. The default
 	// tiny title model can't reliably decline trivial input, so this happens
@@ -234,6 +243,7 @@ export async function generateSessionTitle(
 			signal,
 			titleSystemPrompt,
 			credentialSourceSessionId,
+			onUsage,
 		);
 	}
 
@@ -284,6 +294,7 @@ export async function generateTitleOnline(
 	signal?: AbortSignal,
 	customSystemPrompt?: string,
 	credentialSourceSessionId?: string,
+	onUsage?: TitleUsageReporter,
 ): Promise<string | null> {
 	const models = getTitleModels(registry, settings, currentModel);
 	if (models.length === 0) {
@@ -299,6 +310,7 @@ export async function generateTitleOnline(
 		signal,
 		customSystemPrompt,
 		credentialSourceSessionId,
+		onUsage,
 	);
 }
 
@@ -311,6 +323,7 @@ async function generateTitleOnlineWithModels(
 	signal?: AbortSignal,
 	customSystemPrompt?: string,
 	credentialSourceSessionId?: string,
+	onUsage?: TitleUsageReporter,
 ): Promise<string | null> {
 	const titleSystemPrompt = customSystemPrompt?.trim() || undefined;
 	// The model is always asked to wrap the title in `<title>...</title>` and
@@ -374,8 +387,8 @@ async function generateTitleOnlineWithModels(
 			if (model.supportsAssistantPrefill) messages.push(titlePrefill(model));
 
 			const response = await retryTransientCompletion(
-				() =>
-					completeSimple(
+				async () => {
+					const message = await completeSimple(
 						model,
 						{
 							systemPrompt,
@@ -394,7 +407,20 @@ async function generateTitleOnlineWithModels(
 							metadata,
 							signal,
 						},
-					),
+					);
+					// Every attempt that reached the provider was billed, failures included,
+					// so a transient retry must not discard the attempt it replaced. Reporting
+					// is best-effort: accounting can never fail the title.
+					try {
+						onUsage?.(message);
+					} catch (err) {
+						logger.debug("title-generator: usage report failed", {
+							...modelContext,
+							error: err instanceof Error ? err.message : String(err),
+						});
+					}
+					return message;
+				},
 				{ signal, provider: model.provider },
 			);
 

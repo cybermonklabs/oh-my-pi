@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `headerRetryAfterMs` to `RetryHintOptions`: `extractRetryHint` merges an already parsed response-header delay with the body's signals, longest first ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
+- Added `expandTilde(path, home?)` (`@oh-my-pi/pi-utils/path`), which expands a leading `~` to the home directory; `@oh-my-pi/pi-coding-agent/tools/path-utils` re-exports it ([#17931](https://github.com/can1357/oh-my-pi/pull/17931) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.18.2] - 2026-11-08
+
+### Added
+
+- Added utilities for reading OpenTelemetry configuration from omp-managed `.env` files, including `$otelEnv` and `withOmpOtelEnv`.
+- Added filesystem path utilities for checking paths through symlinked roots, including paths that do not yet exist, and for optionally propagating filesystem errors in directory checks.
+
+### Fixed
+
+- Fixed relaxed JSON parsing so `__proto__` is preserved as a regular own property rather than modifying the parsed object's prototype.
+- Fixed SIGHUP handling so stopped terminal sessions display recovery hints, including the `--resume` command.
+
 ## [18.18.0] - 2026-11-07
 
 ### Fixed
@@ -12,9 +29,6 @@
 
 ### Added
 
-- Added `headerRetryAfterMs` to `RetryHintOptions`: `extractRetryHint` merges an already parsed response-header delay with the body's signals, longest first ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
-- Added `logger.setLogForwarder(forwarder)` (`LogForwarder { emit, flush }`), which routes a thread's records — `withContext` fields merged, context reduced to clone-safe JSON — to another thread instead of its own file and sinks, and `logger.emitForeign(event)`, which writes such a record with its original timestamp and runs the sinks without the caller's `withContext` fields
-- Added `expandTilde(path, home?)` (`@oh-my-pi/pi-utils/path`), which expands a leading `~` to the home directory; `@oh-my-pi/pi-coding-agent/tools/path-utils` re-exports it ([#17931](https://github.com/can1357/oh-my-pi/pull/17931) by [@will-bogusz](https://github.com/will-bogusz))
 - Added `getUpdateStateDir()`, returning the auto-update state directory (`~/.omp/update`).
 - Added `logger.setLogForwarder()` and `logger.emitForeign()` to forward log records across threads, preserving context and timestamps.
 - Added `expandTilde()` to expand a leading `~` to the home directory.
