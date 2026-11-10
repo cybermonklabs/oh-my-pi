@@ -230,7 +230,7 @@ for (const kind of ["file", "sql"] as const) {
 			const fx = await openFixture(kind);
 			const server = vi
 				.spyOn(stats, "startServer")
-				.mockResolvedValue({ hostname: "127.0.0.1", port: 1, stop: () => {} });
+				.mockResolvedValue({ hostname: "127.0.0.1", port: 1, reused: false, stop: () => {} });
 			const errors: string[] = [];
 			const statuses: string[] = [];
 			const ctx = createInteractiveModeContext({
@@ -261,7 +261,7 @@ for (const kind of ["file", "sql"] as const) {
 			const fx = await openFixture(kind);
 			const server = vi
 				.spyOn(stats, "startServer")
-				.mockResolvedValue({ hostname: "127.0.0.1", port: 1, stop: () => {} });
+				.mockResolvedValue({ hostname: "127.0.0.1", port: 1, reused: false, stop: () => {} });
 			vi.spyOn(ternPage, "openTernPage").mockResolvedValue(null);
 			vi.spyOn(openUtils, "openPath").mockImplementation(() => {});
 			const errors: string[] = [];

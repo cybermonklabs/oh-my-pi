@@ -440,6 +440,7 @@ export async function submitInteractiveInput(
 		| "renderOptimisticSkillMessage"
 		| "clearOptimisticSkillMessage"
 		| "optimisticSkillMessagePending"
+		| "restoreDroppedPrompt"
 	> &
 		Partial<Pick<InteractiveMode, "loopPrompt" | "pauseLoop">>,
 	session: Pick<AgentSession, "buildUserSkillPrompt" | "prompt" | "promptCustomMessage" | "resume" | "isStreaming">,
@@ -473,6 +474,7 @@ export async function submitInteractiveInput(
 			showError: mode.showError.bind(mode),
 			renderOptimisticSkillMessage: mode.renderOptimisticSkillMessage.bind(mode),
 			clearOptimisticSkillMessage: mode.clearOptimisticSkillMessage.bind(mode),
+			restoreDroppedPrompt: mode.restoreDroppedPrompt.bind(mode),
 			get optimisticSkillMessagePending() {
 				return mode.optimisticSkillMessagePending;
 			},
@@ -486,8 +488,7 @@ export async function submitInteractiveInput(
 			};
 			input.dispatched = await session.promptCustomMessage(message, { streamingBehavior });
 		} else if (input.resume) {
-			// No queue intent: the streaming queue only carries user messages, so a
-			// continue shortcut while busy is rejected rather than queued as one.
+			// No queue intent: a continue shortcut interrupts a running turn instead.
 			await session.resume();
 		} else if (isKnownSkillCommand(skillHost, input.text)) {
 			// Resubmitted skill text must dispatch through the skill path, or the
@@ -497,11 +498,16 @@ export async function submitInteractiveInput(
 				imageLinks: input.imageLinks,
 				optimistic: true,
 				propagateErrors: true,
+				followUps: input.followUps,
 			});
 		} else {
 			let forwarded = false;
 			try {
-				forwarded = await session.prompt(input.text, { images: input.images, streamingBehavior });
+				forwarded = await session.prompt(input.text, {
+					images: input.images,
+					streamingBehavior,
+					followUps: input.followUps,
+				});
 			} catch (error: unknown) {
 				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
 			}
@@ -665,7 +671,6 @@ async function runInteractiveMode(
 	startupLease?: ComposerLease,
 	startupGoal?: string,
 	startupRestore?: () => Promise<RestoreOutcome>,
-	refreshScopedModelsAfterLogin?: () => Promise<void>,
 ): Promise<void> {
 	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
@@ -679,7 +684,6 @@ async function runInteractiveMode(
 			eventBus,
 			startupLease?.composer,
 			subagentEventBus,
-			refreshScopedModelsAfterLogin,
 		);
 		startupLease?.adopt();
 	} catch (error) {
@@ -722,12 +726,20 @@ async function runInteractiveMode(
 			await setupWizard.markSetupWizardComplete(settings);
 		}
 		playStartupSplash = showStartupSplash && setupScenes.length === 0;
+		const offersStartupWorktree = !resuming && joinLink === undefined;
 
 		await logger.time("InteractiveMode.init", () =>
 			mode.init({
 				suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
 				clearInitialTerminalHistory: true,
 				autoStartCollab: joinLink === undefined,
+				// Setup scenes and the startup worktree question wait on the user before any
+				// prompt runs, so they keep the boot `idle`. The worktree check runs before its
+				// async git check, so a folder where the question never shows also keeps `idle`.
+				startupRun:
+					setupScenes.length === 0 &&
+					!(offersStartupWorktree && mode.mayAskForStartupWorktree()) &&
+					(startupGoal !== undefined || initialMessage !== undefined || initialMessages.length > 0),
 			}),
 		);
 		startDeferredStartupWork?.(mode);
@@ -785,7 +797,7 @@ async function runInteractiveMode(
 			}
 		}
 
-		if (!resuming && joinLink === undefined) {
+		if (offersStartupWorktree) {
 			await mode.maybeAutoCreateWorktree();
 		}
 
@@ -861,6 +873,7 @@ async function runInteractiveMode(
 			mode.showError(errorMessage);
 		}
 	}
+	mode.settleStartupRun();
 
 	while (true) {
 		const input = await mode.getUserInput();
@@ -1565,6 +1578,7 @@ export async function buildSessionOptions(
 			}
 		} else if (resolved.model) {
 			options.model = resolved.model;
+			if (resolved.configuredRole) options.modelRole = resolved.configuredRole;
 			options.rebindModelAfterDiscovery = true;
 			// The recorded role must carry the effort the session actually starts
 			// at, or the first cycle back into `default` overrides it.
@@ -2778,9 +2792,9 @@ export async function runRootCommand(
 					);
 				}
 			};
-			const refreshScopedModelsAfterLogin = async () => {
+			session.setScopedModelsRefresher(async () => {
 				await rebuildScopedModels(session, parsedArgs, modelRegistry, settingsInstance);
-			};
+			});
 			watchScopedModelSettings(session, parsedArgs, modelRegistry, settingsInstance);
 
 			if (modelFallbackMessage) {
@@ -2923,7 +2937,6 @@ export async function runRootCommand(
 										storage: session.sessionManager.getStorage(),
 									})
 							: undefined,
-						refreshScopedModelsAfterLogin,
 					);
 				} finally {
 					startupLease?.dispose();
