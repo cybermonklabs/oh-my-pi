@@ -42,7 +42,14 @@ import { startServiceWorker } from "./helpers/service-worker";
  *   (mutation: drop the `state.refreshedCurrent` guard in
  *   `resolveNextAuthRetryKey`);
  * - a failed shared re-mint is decisive for every waiter and does not latch
- *   (mutation: keep the settled promise in `commandRemintInFlight`).
+ *   (mutation: keep the settled promise in `commandRemintInFlight`);
+ * - a command apiKey and a sibling command header are both renewed by a 401
+ *   that names a non-authentication class, and a static header is carried
+ *   through (mutation: force-refresh only when the verdict is a credential
+ *   rejection, or stop sweeping `#commandConfigsByProvider`);
+ * - that same sweep preserves the apiKey slot, so a straggling refusal of an
+ *   older generation is answered from the mint already cached (mutation: pass
+ *   `undefined` for `preserveConfig` in `#remintProviderCommandConfigs`).
  */
 const GATEWAY_401_BODY = JSON.stringify({
 	error: {
@@ -418,6 +425,94 @@ describe("a `!command` credential the provider refuses", () => {
 			expect(rig.seen.slice(requestsBefore)).toEqual(["test-renewed-header"]);
 		},
 	);
+
+	// A `!command` apiKey and a `!command` header on one provider, refused by a
+	// 401 that names a non-authentication class. Recovery sweeps both commands
+	// and a static header at once, and it owes each a different fate: the key is
+	// re-minted through its own channel, the sibling header is dropped so the
+	// retry materializes it again, and the static value is not a credential and
+	// is carried through untouched. Consumer-visible regression: the turn ends
+	// on the 401, or its retry repeats the header the provider just refused.
+	test("renews a command apiKey and its sibling command header together after a non-authentication 401", async () => {
+		const apiCounter = path.join(tempDir, "api-mints");
+		const headerCounter = path.join(tempDir, "header-mints");
+		const apiToken = path.join(tempDir, "api-token");
+		const headerToken = path.join(tempDir, "header-token");
+		for (const counter of [apiCounter, headerCounter]) fs.writeFileSync(counter, "");
+		fs.writeFileSync(apiToken, "test-api-old");
+		fs.writeFileSync(headerToken, "test-header-old");
+		const rig = buildRig(
+			mintFromFile(apiCounter, apiToken),
+			apiCounter,
+			bearer => bearer === "test-api-new" && rig.seenHeaders.at(-1)?.get("X-Session") === "test-header-new",
+			{
+				headers: {
+					"X-Session": mintFromFile(headerCounter, headerToken),
+					"X-Static": "test-static-value",
+				},
+			},
+			() =>
+				new Response(
+					JSON.stringify({
+						error: { message: "Identity check refused.", type: "invalid_request_error", code: "401" },
+					}),
+					{ status: 401, headers: { "Content-Type": "application/json" } },
+				),
+		);
+		const send = await rig.prepare();
+		// Both credentials are materialized before the issuer rotates, so the
+		// refused request carries the pair the recovery has to replace.
+		await rig.model.resolveHeaders?.();
+		fs.writeFileSync(apiToken, "test-api-new");
+		fs.writeFileSync(headerToken, "test-header-new");
+		expect((await send()).stopReason).not.toBe("error");
+		expect(rig.seen).toEqual(["test-api-old", "test-api-new"]);
+		expect(rig.seenHeaders.map(headers => headers.get("X-Session"))).toEqual(["test-header-old", "test-header-new"]);
+		// The static header is not a credential: it survives the sweep unchanged.
+		expect(rig.seenHeaders.map(headers => headers.get("X-Static"))).toEqual([
+			"test-static-value",
+			"test-static-value",
+		]);
+		// One mint of each command per request, and no third issuer call for
+		// either: the sweep must not cost the key a mint the retry already has.
+		expect(fs.readFileSync(apiCounter, "utf8").length).toBe(2);
+		expect(fs.readFileSync(headerCounter, "utf8").length).toBe(2);
+	});
+
+	// The same three sources, now with a refusal that straddles the re-mint: a
+	// second operation seeded with generation 1 is refused after generation 2 is
+	// cached. Its recovery sweeps the provider's commands again, and generation 2
+	// has to survive that sweep — it is the credential answering this refusal —
+	// while the sibling header does not. Consumer-visible regression: every
+	// straggling 401 in a wave spends another issuer call for a credential the
+	// session already holds.
+	test("a straggler's recovery keeps the apiKey mint its sweep preserved and still renews the sibling header", async () => {
+		const apiCounter = path.join(tempDir, "api-mints");
+		const headerCounter = path.join(tempDir, "header-mints");
+		const apiToken = path.join(tempDir, "api-token");
+		const headerToken = path.join(tempDir, "header-token");
+		for (const counter of [apiCounter, headerCounter]) fs.writeFileSync(counter, "");
+		fs.writeFileSync(apiToken, "test-api-one");
+		fs.writeFileSync(headerToken, "test-header-one");
+		const rig = buildRig(mintFromFile(apiCounter, apiToken), apiCounter, bearer => bearer === "test-api-two", {
+			headers: { "X-Session": mintFromFile(headerCounter, headerToken) },
+		});
+		// Both operations are seeded before either is sent, so the straggler
+		// carries generation 1 after the first operation has replaced it.
+		const [first, straggler] = await Promise.all([rig.prepare(), rig.prepare()]);
+		fs.writeFileSync(apiToken, "test-api-two");
+		expect((await first()).stopReason).not.toBe("error");
+		const apiMints = fs.readFileSync(apiCounter, "utf8").length;
+		fs.writeFileSync(headerToken, "test-header-two");
+		expect((await straggler()).stopReason).not.toBe("error");
+		expect(rig.seen).toEqual(["test-api-one", "test-api-two", "test-api-one", "test-api-two"]);
+		// The straggler's refusal names generation 1; generation 2 is cached and
+		// unrefused, so it answers without asking the issuer again.
+		expect(fs.readFileSync(apiCounter, "utf8").length - apiMints).toBe(0);
+		// The sibling header has no such watermark: its slot was dropped, so the
+		// straggler's retry carries the value the issuer prints now.
+		expect(rig.seenHeaders.at(-1)?.get("X-Session")).toBe("test-header-two");
+	});
 
 	test.each(["provider", "model"] as const)(
 		"a %s header retains a peer replacement after exhausted recovery",
