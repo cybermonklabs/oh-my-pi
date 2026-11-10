@@ -142,6 +142,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					reportSendError("extension_send_user", toError(e));
 				});
 				runner.sends.track(trackedSend);
+				return sendTask;
 			},
 			appendEntry: (customType, data) => {
 				session.sessionManager.appendCustomEntry(customType, data);
