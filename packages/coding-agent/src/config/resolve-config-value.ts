@@ -181,6 +181,26 @@ export function remintCommandConfig(
 	if (!isCommandConfigValue(valueConfig)) return Promise.resolve(undefined);
 	const command = commandKey(valueConfig);
 	refuseCommandGeneration(valueConfig, rejectedGeneration);
+	// Three short-circuits follow, and they bound minting as a set. Measured at
+	// this head on the wave tests in `test/credential-remint-on-401.test.ts`
+	// ("a same-byte apiKey refusal wave recovers across {boundary,serialized}
+	// settlement"), widened to twelve requests and counting runs of the mint:
+	// twelve requests cost ONE mint with all three present, and TWELVE — one
+	// issuer call per refusal — with all three removed, on every schedule
+	// tried (gated boundary, gated serialized, ungated, ungated behind a
+	// 300 ms mint). Removing all three also reds 15 of that file's 80 tests.
+	//
+	// Taken one at a time they do not weigh the same, which is the part worth
+	// knowing before a simplification pass reaches for them:
+	// - the `commandRemintInFlight` join below is the only one that is
+	//   individually removable with no behavioural change: dropping it alone
+	//   leaves the wave at one mint and the file at 80/80. It is redundant
+	//   only while the `commandInFlight` join stands — dropping both costs 5
+	//   of the 80 tests;
+	// - dropping `settledMintFor` alone reds 10 tests and takes the serialized
+	//   wave from 1 mint to 12;
+	// - dropping the `commandInFlight` join alone reds 1 test ("a refused
+	//   snapshot joins an ordinary replacement already being minted").
 	const joined = commandRemintInFlight.get(command);
 	if (joined) return joined;
 	if (rejectedGeneration !== undefined) {
