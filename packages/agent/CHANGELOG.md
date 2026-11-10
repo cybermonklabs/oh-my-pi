@@ -5,6 +5,19 @@
 ### Fixed
 
 - A turn that fails with a thrown `CredentialUnavailableError` now carries its transient classification (`errorId`) on the error message, so a host's turn retry can treat it as retryable ([#14031](https://github.com/can1357/oh-my-pi/pull/14031) by [@sjawhar](https://github.com/sjawhar)).
+
+## [18.18.2] - 2026-11-08
+
+### Added
+
+- Added `canReplayRemoteCompactionFrom()` to determine whether a model can replay provider-native compaction produced by another model.
+
+### Fixed
+
+- Fixed GenAI message-content capture configured in omp's own `.env` files so it continues to apply when those values are no longer exposed through the process environment.
+- Fixed compaction preparation for remote OpenAI compaction that the active model cannot replay, ensuring the content is expanded and remains available for compaction.
+- Fixed generic remote compaction requests to `/chat/completions` so gateway sessions retain the correct per-request model attribution.
+
 ## [18.17.0] - 2026-11-06
 
 ### Added
