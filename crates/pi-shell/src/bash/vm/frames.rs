@@ -661,9 +661,16 @@ impl Shell {
 		let mut k = Kernel::new(engine, root, argv0, shell_pid);
 		// The counters a shell restored from the store alone continues
 		// (`Shell::create` wrote them; the root vproc took the first vpid).
+		// The restored root takes the CURRENT `vpid_base`, which can be
+		// above the one the store was written with, so a stored counter
+		// at or below it would hand the first child the root's own vpid
+		// (a vproc whose parent is itself). It never goes below base + 1.
 		let base = engine.config().vpid_base;
-		k.next_vpid = parse_misc(cx.store, MiscKey::NextVpid)?.unwrap_or(base + 1);
-		k.written_vpid = k.next_vpid;
+		let stored = parse_misc(cx.store, MiscKey::NextVpid)?;
+		k.next_vpid = stored.unwrap_or(base + 1).max(base + 1);
+		// `written_vpid` is what the store holds, so a counter corrected
+		// upwards here is written through by the `sync_root` below.
+		k.written_vpid = stored.unwrap_or(k.next_vpid);
 		k.next_job = parse_misc(cx.store, MiscKey::NextJob)?.unwrap_or(1);
 		k.rand = state::root_misc(cx.store, MiscKey::Random)?
 			.and_then(state::Random::decode)
@@ -1324,5 +1331,79 @@ mod tests {
 		assert!(r.poll_read(&mut cx, &mut buf).is_pending(), "the duplicate writer keeps it open");
 		drop(w2);
 		assert!(matches!(r.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))), "then EOF");
+	}
+
+	/// `vpid_base` can rise between the shell that wrote a store and the
+	/// shell restored from it with no `Frames` blob: the restored root
+	/// takes the *new* base, while `MiscKey::NextVpid` still holds the
+	/// counter the *old*, lower base left behind. Taken as-is, the first
+	/// child allocated after the restore gets the restored root's own
+	/// vpid, and a child becomes its own parent.
+	#[test]
+	fn a_frameless_restore_at_a_raised_vpid_base_keeps_the_root_vpid_to_itself() {
+		use crate::{
+			bash::{
+				Budget, Cx, Engine, EngineConfig, MemStore, RestoreOpts, Script, Shell, StateStore,
+				ids::Vpid,
+				store::{BlobSlot, Key, MiscKey, Record},
+			},
+			testkit::{
+				FakeHost,
+				fault::skeleton_init,
+				run::{Stop, advance},
+			},
+		};
+
+		let base = Vpid::BASE;
+		let mut store = MemStore::new();
+		let mut host = FakeHost::new();
+		let engine = Engine::new(EngineConfig { vpid_base: base, ..EngineConfig::default() });
+		let shell =
+			Shell::create(&engine, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[]))
+				.expect("create");
+		drop(shell);
+		assert!(
+			store
+				.get_blob(BlobSlot::Frames)
+				.expect("get_blob")
+				.is_none(),
+			"an idle shell leaves no Frames blob: this is the frameless path"
+		);
+		let stored = match store.get(Key::Misc(MiscKey::NextVpid)).expect("get") {
+			Some(Record::Misc(v)) => v.to_string(),
+			other => panic!("the stored NextVpid record: {other:?}"),
+		};
+		assert_eq!(
+			stored,
+			(base + 1).to_string(),
+			"the root took the base, so the stored counter is base + 1"
+		);
+
+		// The next process runs the same store with the base one higher.
+		let raised = base + 1;
+		let engine = Engine::new(EngineConfig { vpid_base: raised, ..EngineConfig::default() });
+		let mut host = FakeHost::new();
+		let (mut shell, _report) = Shell::restore(
+			&engine,
+			&mut Cx { host: &mut host, store: &mut store },
+			RestoreOpts::default(),
+		)
+		.expect("restore");
+		let id = shell.submit(Script::command(&b"{ :; } & echo $!"[..]));
+		for _ in 0..64 {
+			if let Stop::Done(status) =
+				advance(&mut shell, &mut host, &mut store, id, Budget::default())
+			{
+				assert_eq!(status, 0, "the command runs");
+				break;
+			}
+		}
+		let printed = String::from_utf8(host.stdout.bytes().to_vec()).expect("utf-8 stdout");
+		assert_ne!(
+			printed.trim(),
+			raised.to_string(),
+			"a child never takes the restored root's own vpid"
+		);
+		assert_eq!(printed.trim(), (raised + 1).to_string(), "it takes the one above it");
 	}
 }

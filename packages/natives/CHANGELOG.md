@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed a shell restored from its store alone (no frames blob) with a higher `vpid_base` than the one the store was written with giving its first child the root's own vpid, so a virtual process became its own parent ([#TBD](https://github.com/can1357/oh-my-pi/pull/TBD) by [@sjawhar](https://github.com/sjawhar))
 - Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
 ### Fixed
 
