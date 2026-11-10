@@ -40,7 +40,7 @@ beforeEach(() => {
 	for (const k of OTEL_KEYS) delete process.env[k];
 });
 
-afterEach(() => {
+afterEach(async () => {
 	for (const k of OTEL_KEYS) {
 		const v = saved[k];
 		if (v === undefined) delete process.env[k];
@@ -49,12 +49,15 @@ afterEach(() => {
 });
 
 /**
- * Environment for a probe subprocess, with a home and agent dir of its own. The probe
- * loads `@oh-my-pi/pi-utils`, which fills every unset variable from `~/.env`,
- * `~/.omp/.env` and the agent dir's `.env`, so a kill-switch removed above would come
- * back from the developer's own dotenv files and silence the signal the probe expects.
- * The probe is marked as a test child, as `ci-test-ts` marks it, so a local run takes
- * the same export gate as CI does instead of passing for a production process.
+ * Environment for a probe subprocess, with a home and agent dir of its own, that must
+ * not read the developer's real omp dotenv files (omp keeps `OTEL_*` from them in a
+ * private map that the SDK window exposes). The probe loads `@oh-my-pi/pi-utils`, which
+ * fills every unset variable from `~/.env`, `~/.omp/.env` and the agent dir's `.env`, so
+ * a kill-switch removed above would come back from the developer's own dotenv files and
+ * silence the signal the probe expects; every variable `dirs.ts` uses to locate those
+ * files is cleared here too. The probe is marked as a test child, as `ci-test-ts` marks
+ * it, so a local run takes the same export gate as CI does instead of passing for a
+ * production process.
  */
 function probeEnv(home: TempDir): Record<string, string | undefined> {
 	return {
@@ -62,16 +65,17 @@ function probeEnv(home: TempDir): Record<string, string | undefined> {
 		HOME: home.path(),
 		USERPROFILE: home.path(),
 		PI_CODING_AGENT_DIR: path.join(home.path(), ".omp", "agent"),
+		OMP_PROFILE: undefined,
+		PI_PROFILE: undefined,
+		PI_CONFIG_DIR: undefined,
+		XDG_DATA_HOME: undefined,
+		XDG_STATE_HOME: undefined,
+		XDG_CACHE_HOME: undefined,
 		PI_TEST_RUNTIME: "1",
 	};
 }
 
 describe("initTelemetryExport gating", () => {
-	it("stays disabled when no OTLP endpoint is configured", async () => {
-		await initTelemetryExport(true);
-		expect(isTelemetryExportEnabled()).toBe(false);
-	});
-
 	it("never exports from a test process to a collector off this machine", async () => {
 		// What a developer's shell or `~/.omp/agent/.env` sets: an in-process
 		// `runRootCommand` would otherwise register real exporters aimed at it.

@@ -8,11 +8,18 @@
  * broker-backed rotation policy and the same usage ledger.
  */
 import { extractHttpStatusFromError, logger } from "@oh-my-pi/pi-utils";
-import { type ApiKeyResolver, createOAuthProvenance, type ResolvedApiKey, seedApiKeyResolver } from "../auth-retry";
+import {
+	type ApiKeyResolver,
+	createOAuthProvenance,
+	NO_AUTH_SENTINEL,
+	type ResolvedApiKey,
+	seedApiKeyResolver,
+} from "../auth-retry";
 import type { AuthApiKeyOptions, AuthStorage } from "../auth-storage";
 import * as AIError from "../error";
 import { classifyGatewayError, type GatewayErrorClassification } from "../error/gateway";
 import { isUsageLimitOutcome } from "../error/rate-limit";
+import { getProviderDefinition } from "../registry";
 import type { Api, FetchImpl, Model, Usage } from "../types";
 import type { ClientUsageIdentity } from "../usage";
 import { extractProviderRetryHint } from "../utils/retry-after";
@@ -116,7 +123,8 @@ export function gatewayRequestLogFields(
  * stored token before dispatch: the request sends it whole, and when it waited
  * too long to send it, {@link buildGatewayApiKeyResolver} replaces bearer and
  * identity together. Storage failures map through
- * {@link classifyGatewayError}; a provider without any credential is a 401.
+ * {@link classifyGatewayError}; a provider without any credential is a 401
+ * unless its catalog policy allows keyless requests.
  */
 export async function resolveGatewayApiKey(
 	opts: AuthGatewayCredentialOptions,
@@ -138,6 +146,7 @@ export async function resolveGatewayApiKey(
 		return classified;
 	}
 	if (apiKey) return apiKey;
+	if (getProviderDefinition(model.provider)?.allowsMissingApiKey) return { apiKey: NO_AUTH_SENTINEL };
 	return {
 		status: 401,
 		type: "authentication_error",
@@ -265,6 +274,9 @@ export function buildGatewayApiKeyResolver(
 	const provenance = createOAuthProvenance();
 	provenance.record(initialKey);
 	return seedApiKeyResolver(initialKey, async ({ lastChance, error, signal, previousKey }) => {
+		if (initialKey.apiKey === NO_AUTH_SENTINEL && initialKey.credentialId === undefined) {
+			return error === undefined ? initialKey : undefined;
+		}
 		const sig = signal ?? requestSignal;
 		if (error === undefined) {
 			const current = await storage.keys.getWithCredential(

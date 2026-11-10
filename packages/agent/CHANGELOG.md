@@ -7,6 +7,19 @@
 - Steering and follow-ups drained for the next turn now return to their queue when the run is aborted before that turn starts, including while `/pause` holds it, instead of being recorded with no reply ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - `AgentPauseGate.dispatchHold` re-parks when the gate closes again while the caller's own hold waits, carries a synchronous `isClosed` probe the transport reads in the same step as the send, and cancels through the whole composed wait with the caller's abort reason ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - The main loop's own dispatch hold carries that probe too, and fails an aborted request instead of resolving; the remote compaction requests send inside the same step as their hold check and arm their timeout at the wire, so a transport that holds one again does not spend it ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
+
+## [18.18.2] - 2026-11-08
+
+### Added
+
+- Added `canReplayRemoteCompactionFrom()` to determine whether a model can replay provider-native compaction produced by another model.
+
+### Fixed
+
+- Fixed GenAI message-content capture configured in omp's own `.env` files so it continues to apply when those values are no longer exposed through the process environment.
+- Fixed compaction preparation for remote OpenAI compaction that the active model cannot replay, ensuring the content is expanded and remains available for compaction.
+- Fixed generic remote compaction requests to `/chat/completions` so gateway sessions retain the correct per-request model attribution.
+
 ## [18.17.0] - 2026-11-06
 
 ### Added

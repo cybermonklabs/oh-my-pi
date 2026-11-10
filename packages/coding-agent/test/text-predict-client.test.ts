@@ -13,9 +13,7 @@ const cleanups: (() => Promise<void>)[] = [];
 
 // The client is process-wide: a connection another file opened would answer instead of the
 // stand-in daemon each case serves, so every case starts without one.
-beforeEach(() => {
-	closeTextPrediction();
-});
+beforeEach(closeTextPrediction);
 
 afterEach(async () => {
 	closeTextPrediction();

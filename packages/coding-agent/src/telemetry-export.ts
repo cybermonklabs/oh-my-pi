@@ -18,7 +18,7 @@
  * destination this module resolved and checked, never left to read `OTEL_*` again.
  */
 import type { AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
-import { isBunTestRuntime, logger } from "@oh-my-pi/pi-utils";
+import { $otelEnv, isBunTestRuntime, logger } from "@oh-my-pi/pi-utils";
 
 /** Whether the model registered under a provider id and requested model id has known pricing. */
 export type TelemetryModelPricingResolver = (providerId: string, modelId: string) => boolean;
@@ -97,7 +97,7 @@ export function createTelemetryExportConfig(
 export async function initTelemetryExport(exportEnabled: boolean): Promise<void> {
 	if (initPromise) return initPromise;
 
-	if (!exportEnabled || process.env.OTEL_SDK_DISABLED?.trim().toLowerCase() === "true") return;
+	if (!exportEnabled || $otelEnv("OTEL_SDK_DISABLED")?.trim().toLowerCase() === "true") return;
 
 	const testRuntime = isBunTestRuntime();
 	const destinations = resolveDestinations(testRuntime);
@@ -159,30 +159,29 @@ export function allowTelemetryReceiverForTests(receiver: string | URL): Disposab
 }
 
 function resolveDestinations(testRuntime: boolean): TelemetryDestinations {
-	const env = process.env;
 	return {
 		trace: signalDestination(
 			"trace",
-			env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-			env.OTEL_EXPORTER_OTLP_ENDPOINT,
-			env.OTEL_TRACES_EXPORTER,
-			env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL ?? env.OTEL_EXPORTER_OTLP_PROTOCOL,
+			$otelEnv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
+			$otelEnv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+			$otelEnv("OTEL_TRACES_EXPORTER"),
+			$otelEnv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL") ?? $otelEnv("OTEL_EXPORTER_OTLP_PROTOCOL"),
 			testRuntime,
 		),
 		log: signalDestination(
 			"log",
-			env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
-			env.OTEL_EXPORTER_OTLP_ENDPOINT,
-			env.OTEL_LOGS_EXPORTER,
-			env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL ?? env.OTEL_EXPORTER_OTLP_PROTOCOL,
+			$otelEnv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"),
+			$otelEnv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+			$otelEnv("OTEL_LOGS_EXPORTER"),
+			$otelEnv("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL") ?? $otelEnv("OTEL_EXPORTER_OTLP_PROTOCOL"),
 			testRuntime,
 		),
 		metric: signalDestination(
 			"metric",
-			env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
-			env.OTEL_EXPORTER_OTLP_ENDPOINT,
-			env.OTEL_METRICS_EXPORTER,
-			env.OTEL_EXPORTER_OTLP_METRICS_PROTOCOL ?? env.OTEL_EXPORTER_OTLP_PROTOCOL,
+			$otelEnv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"),
+			$otelEnv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+			$otelEnv("OTEL_METRICS_EXPORTER"),
+			$otelEnv("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL") ?? $otelEnv("OTEL_EXPORTER_OTLP_PROTOCOL"),
 			testRuntime,
 		),
 	};

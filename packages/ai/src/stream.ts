@@ -19,6 +19,7 @@ import {
 	type ApiKeyResolution,
 	createAuthRetryKeyState,
 	isApiKeyResolver,
+	preferAuthRetryError,
 	recordAuthRetryKeySent,
 	resolvedApiKeyBearer,
 	resolveNextAuthRetryKey,
@@ -27,6 +28,7 @@ import type { OAuthRequestIdentity } from "./auth/types";
 import { getEnvApiKey } from "./env-api-key";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
+import { assertProviderEnabled } from "./registry/oauth";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import { reachesOfficialEndpoint } from "./providers/anthropic-state";
@@ -987,6 +989,8 @@ function streamDispatch<TApi extends Api>(
 	options: OptionsForApi<TApi> | undefined,
 	limited: boolean,
 ): AssistantMessageEventStream {
+	// A provider turned off in its auth rules is never called, even with a key passed in directly.
+	assertProviderEnabled(model.provider);
 	const requestOptions = withSupportedSamplingParams(
 		model,
 		withTransportFetch(model, (options || {}) as StreamOptions),
@@ -1512,6 +1516,7 @@ function streamSimpleRequest<TApi extends Api>(
 			});
 			let failure = await runAttempt(credentialFor(lastKey, credentialId, oauthIdentity));
 			if (!failure) return;
+			let reportedFailure = failure;
 			while (true) {
 				// Caller aborted between attempts: don't mint a fresh token or fire
 				// another doomed request — emit the captured failure instead.
@@ -1532,9 +1537,13 @@ function streamSimpleRequest<TApi extends Api>(
 				// Any hold the caller supplied runs inside this attempt, at the dispatch chokepoint.
 				const next = await runAttempt(credentialFor(nextKey, nextCredentialId, nextOAuthIdentity));
 				if (!next) return;
+				reportedFailure =
+					preferAuthRetryError(reportedFailure.error, next.error) === reportedFailure.error
+						? reportedFailure
+						: next;
 				failure = next;
 			}
-			emitFailure(failure);
+			emitFailure(reportedFailure);
 		})();
 		return outer;
 	}

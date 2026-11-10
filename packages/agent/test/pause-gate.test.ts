@@ -619,4 +619,28 @@ describe("AgentPauseGate.dispatchHold at the wire", () => {
 		expect(hold.isClosed?.()).toBe(true);
 		await expect(Promise.resolve(hold())).rejects.toBe(reason);
 	});
+
+	it("keeps a parked prompt running when a pause listener throws", async () => {
+		const gateWait = observeGateWait();
+		try {
+			const mock = createMockModel({ responses: [{ content: ["done"] }] });
+			const agent = new Agent({ initialState: { model: mock.model }, streamFn: mock.stream });
+			const transitions: boolean[] = [];
+			agent.onPauseChange(paused => {
+				transitions.push(paused);
+				throw new Error("observer failed");
+			});
+			agentPauseGate.pause();
+			const prompt = agent.prompt("hi");
+			await gateWait.parked;
+			expect(agent.isPaused).toBe(true);
+			agentPauseGate.resume();
+			await prompt;
+			expect(transitions).toEqual([true, false]);
+			expect(agent.state.error).toBeUndefined();
+			expect(mock.calls).toHaveLength(1);
+		} finally {
+			gateWait.restore();
+		}
+	});
 });
