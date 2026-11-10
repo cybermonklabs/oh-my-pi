@@ -148,6 +148,8 @@ function focusHarness(): FocusHarness {
 		subscribe: () => () => {},
 		settleInFlightMessagePersistence: async () => {},
 		activeToolExecutionUpdates: () => [],
+		activeUserWait: () => undefined,
+		toolCallRun: () => undefined,
 	};
 	const focus: { controller?: SessionFocusController } = {};
 	const ctx = {
@@ -164,6 +166,8 @@ function focusHarness(): FocusHarness {
 			},
 			resetTranscriptAnchors() {},
 			restorePendingToolResults() {},
+			adoptApprovalRecords() {},
+			runSerialized: (run: () => Promise<void>) => run(),
 			markViewIdle() {},
 		},
 		statusLine: {

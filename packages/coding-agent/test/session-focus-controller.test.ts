@@ -122,6 +122,7 @@ function makeHarness(
 			},
 			adoptApprovalRecords() {},
 			restorePendingToolResults() {},
+			runSerialized: (run: () => Promise<void>) => run(),
 			markViewIdle() {},
 		},
 		statusLine: {

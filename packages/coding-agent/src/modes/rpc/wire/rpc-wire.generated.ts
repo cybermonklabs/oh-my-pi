@@ -91,10 +91,19 @@ export interface Usage {
 	credits?: Record<string, unknown>;
 }
 
+/** Parent-agent IRC message carried by a steer; render it instead of the model-facing `content` envelope. */
+export interface ParentIrc {
+	/** Sending parent agent id. */
+	from: string;
+	/** Message body as the parent wrote it. */
+	body: string;
+}
+
 export interface UserMessage {
 	role: "user";
 	content: MessageContent;
 	timestamp: number;
+	parentIrc?: ParentIrc;
 	synthetic?: boolean;
 	steering?: boolean;
 	liveSteered?: boolean;
@@ -1076,6 +1085,8 @@ export interface ReadyEvent {
 	supportedProtocolVersions?: number[];
 	maxFrameBytes?: number;
 	maxReassembledFrameBytes?: number;
+	/** `bash` accepts `excludeFromContext`; require exactly true before sending excluded commands. */
+	supportsBashExcludeFromContext?: boolean;
 }
 
 export type PromptStatus = "completed" | "aborted" | "error";
@@ -1787,6 +1798,7 @@ export interface SetAutoRetryParams {
 
 export interface BashParams {
 	command: string;
+	excludeFromContext?: boolean;
 }
 
 export interface GetSessionLeaseParams {
