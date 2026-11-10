@@ -1035,13 +1035,9 @@ const streamOpenAIResponsesOnce = (
 					stream,
 				);
 				const guardedRequestSignal = requestGuard.signal ?? requestSignal;
-				guardedRequestSignal.addEventListener(
-					"abort",
-					() => {
-						if (!requestSignal.aborted) abortTracker.abortLocally(firstEventTimeoutAbortError);
-					},
-					{ once: true },
-				);
+				requestGuard.onAbort(() => {
+					if (!requestSignal.aborted) abortTracker.abortLocally(firstEventTimeoutAbortError);
+				});
 				try {
 					if (useWebSocket) {
 						if (requestParams.previous_response_id != null) {

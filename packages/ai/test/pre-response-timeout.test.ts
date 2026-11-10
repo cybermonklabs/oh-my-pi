@@ -1,3 +1,4 @@
+import { heapStats } from "bun:jsc";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { armPreResponseTimeout, preResponseGuard } from "@oh-my-pi/pi-ai/utils/idle-iterator";
 
@@ -138,5 +139,116 @@ describe("pre-response budget", () => {
 		budget?.resume();
 		vi.advanceTimersByTime(10_000);
 		expect(signal?.aborted).toBe(false);
+	});
+});
+
+/**
+ * The guard hands the transport an `AbortSignal.any` composite over the
+ * caller's signal, and a composite with an abort listener is kept alive by its
+ * sources for as long as they can still abort it. A caller signal that lives
+ * for a whole session therefore accumulates one guard signal per model call —
+ * and behind its listeners' closures that call's request body, response queue
+ * and stream — unless the listeners come off. Measured on omp at a 382 KiB
+ * prompt, that was 8.5 `AbortSignal`s and 447 KiB of live heap retained per
+ * model call, 500 calls into a session (INFRA-1876).
+ *
+ * The contract is a count, not a call: after N cleared guards the number of
+ * signals still live does not grow with N. A test that asserted `clear()`
+ * called `removeEventListener` would pass against a fix that removed the wrong
+ * listener; this one cannot.
+ */
+describe("guard retention on a session-lifetime caller signal", () => {
+	const ARMS = 400;
+	const heldWork = () => ({ trackLocalWork: <T>(work: Promise<T>): Promise<T> => work });
+
+	/** Live `AbortSignal`s after a forced full collection. */
+	const liveSignals = (): number => {
+		Bun.gc(true);
+		return heapStats().objectTypeCounts.AbortSignal ?? 0;
+	};
+
+	/** Signals retained per armed guard, over `ARMS` guards on one caller signal. */
+	const retainedPerArm = (arm: (caller: AbortSignal) => void): number => {
+		const session = new AbortController();
+		const before = liveSignals();
+		for (let i = 0; i < ARMS; i++) arm(session.signal);
+		const after = liveSignals();
+		// Keep the caller signal alive to the end: that is the whole mechanism.
+		expect(session.signal.aborted).toBe(false);
+		return (after - before) / ARMS;
+	};
+
+	it("retains one signal per guard while the guard is never cleared", () => {
+		// The control. Without it, a fix that made the instrument blind would
+		// pass every assertion below.
+		const perArm = retainedPerArm(caller => {
+			const guard = armPreResponseTimeout(caller, 60_000, heldWork());
+			guard.onAbort(() => {});
+		});
+		expect(perArm).toBeGreaterThan(0.9);
+	});
+
+	it("retains nothing once each guard is cleared", () => {
+		const perArm = retainedPerArm(caller => {
+			const guard = armPreResponseTimeout(caller, 60_000, heldWork());
+			guard.onAbort(() => {});
+			guard.clear();
+		});
+		expect(perArm).toBeLessThan(0.05);
+	});
+
+	it("retains nothing when a cleared guard encloses another", () => {
+		// The Anthropic shape: the provider arms one guard over the request
+		// signal and the SDK transport arms a second over the first's signal.
+		const perArm = retainedPerArm(caller => {
+			const outer = armPreResponseTimeout(caller, 60_000, heldWork());
+			const inner = armPreResponseTimeout(outer.signal, 30_000);
+			inner.clear();
+			outer.clear();
+		});
+		expect(perArm).toBeLessThan(0.05);
+	});
+});
+
+/**
+ * `onAbort` exists so a provider never leaves a listener of its own on the
+ * composite. It must behave exactly like the `{ once: true }` listener each
+ * provider used to register, and stop existing at `clear()`.
+ */
+describe("pre-response guard onAbort", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("runs once when the budget expires before the guard is cleared", () => {
+		vi.useFakeTimers();
+		const { onAbort } = armPreResponseTimeout(new AbortController().signal, 50);
+		let fired = 0;
+		onAbort(() => fired++);
+		vi.advanceTimersByTime(50);
+		expect(fired).toBe(1);
+	});
+
+	it("does not run for a caller abort after the guard is cleared", () => {
+		const caller = new AbortController();
+		const { signal, clear, onAbort } = armPreResponseTimeout(caller.signal, 60_000);
+		let fired = 0;
+		onAbort(() => fired++);
+		clear();
+		caller.abort(new Error("caller cancelled"));
+		// The request itself is still cancelled — only the guard's bookkeeping is gone.
+		expect(signal?.aborted).toBe(true);
+		expect(fired).toBe(0);
+	});
+
+	it("does not run after clear when no budget is armed and the signal is the caller's own", () => {
+		const caller = new AbortController();
+		const { signal, clear, onAbort } = armPreResponseTimeout(caller.signal, undefined);
+		expect(signal).toBe(caller.signal);
+		let fired = 0;
+		onAbort(() => fired++);
+		clear();
+		caller.abort();
+		expect(fired).toBe(0);
 	});
 });

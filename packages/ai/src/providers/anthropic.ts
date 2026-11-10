@@ -2695,13 +2695,9 @@ const streamAnthropicOnce = (
 				const requestGuard = armPreResponseTimeout(requestSignal, requestTimeoutMs, stream);
 				const guardedRequestSignal = requestGuard.signal ?? requestSignal;
 				const requestTracker = activeAbortTracker;
-				guardedRequestSignal.addEventListener(
-					"abort",
-					() => {
-						if (!requestSignal.aborted) requestTracker.abortLocally(firstEventTimeoutAbortError);
-					},
-					{ once: true },
-				);
+				requestGuard.onAbort(() => {
+					if (!requestSignal.aborted) requestTracker.abortLocally(firstEventTimeoutAbortError);
+				});
 				const requestOptions = {
 					...createSdkStreamRequestOptions(guardedRequestSignal, requestTimeoutMs),
 					maxRetries: 0,
