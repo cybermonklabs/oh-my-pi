@@ -126,6 +126,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				sendTask.catch(e => {
 					reportSendError("extension_send_user", toError(e));
 				});
+				return sendTask;
 			},
 			sendUserInput: (text, inputOptions) => {
 				const inputTask = sendSessionUserInput(session, text, inputOptions, slashCommandHost);
