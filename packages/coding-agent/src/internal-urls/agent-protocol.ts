@@ -334,6 +334,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		const content = `${prompt.render(agentProgressTemplate, {
 			id: ref.id,
 			status: ref.status,
+			aborted: ref.status === "aborted",
 			sections,
 			lastText,
 			empty: sections.length === 0 && !lastText,
