@@ -158,10 +158,12 @@ describe("RPC startup input dispatch", () => {
 					if (!isRecord(frame)) continue;
 					if (frame.type === "ready") {
 						readyAt = Date.now();
-						// `goal` changes goal state, which `goalController.reconcile()` is still settling
-						// during startup, so it waits; `get_state` changes nothing and is answered at once.
+						// Every `goal` frame waits: the hold reads the command type, because goal commands
+						// change the goal state `goalController.reconcile()` is still settling during
+						// startup. `get` is the op that needs no goal to exist. `get_state` changes
+						// nothing and is answered at once.
 						child.stdin.write(`${JSON.stringify({ type: "get_state", id: "state" })}\n`);
-						child.stdin.write(`${JSON.stringify({ type: "goal", id: "goal", op: "clear" })}\n`);
+						child.stdin.write(`${JSON.stringify({ type: "goal", id: "goal", op: "get" })}\n`);
 						await child.stdin.flush();
 						continue;
 					}
