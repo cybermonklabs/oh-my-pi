@@ -11,28 +11,34 @@ const HANDLER_RETURNED_PREFIX = "startup-handler-returned ";
 /** The line the fixture's `input` handler writes, naming whether it saw that return. */
 const INPUT_HANDLER_PREFIX = "input-handler-ran ";
 
+/**
+ * Spawn the slow-startup RPC agent in `temp`, with a minimal environment: the child must not read
+ * the developer's or the runner's home-rooted plugin and config state, which would make a test
+ * machine-dependent.
+ */
+const spawnSlowStartupAgent = (temp: TempDir) =>
+	Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures", "slow-startup-rpc-agent.ts")], {
+		cwd: temp.path(),
+		env: {
+			PATH: Bun.env.PATH,
+			HOME: temp.join("home"),
+			PI_CODING_AGENT_DIR: temp.join("agent"),
+			XDG_CONFIG_HOME: temp.join("config"),
+			XDG_DATA_HOME: temp.join("data"),
+			XDG_CACHE_HOME: temp.join("cache"),
+			CI: "true",
+			PI_NO_TITLE: "1",
+			OMP_STARTUP_HANDLER_MS: String(HANDLER_MS),
+		},
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+
 describe("RPC startup input dispatch", () => {
 	test("a command sent after the ready frame is answered while a slow startup handler still runs", async () => {
 		const temp = await TempDir.create("@omp-rpc-startup-dispatch-");
-		const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures", "slow-startup-rpc-agent.ts")], {
-			cwd: temp.path(),
-			// A minimal environment: the child must not read the developer's or the runner's
-			// home-rooted plugin and config state, which would make this test machine-dependent.
-			env: {
-				PATH: Bun.env.PATH,
-				HOME: temp.join("home"),
-				PI_CODING_AGENT_DIR: temp.join("agent"),
-				XDG_CONFIG_HOME: temp.join("config"),
-				XDG_DATA_HOME: temp.join("data"),
-				XDG_CACHE_HOME: temp.join("cache"),
-				CI: "true",
-				PI_NO_TITLE: "1",
-				OMP_STARTUP_HANDLER_MS: String(HANDLER_MS),
-			},
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		const child = spawnSlowStartupAgent(temp);
 		try {
 			const decoder = new TextDecoder();
 			// The handler reports its own return on stderr, so both times come from the running agent.
@@ -116,6 +122,70 @@ describe("RPC startup input dispatch", () => {
 				"the input handler never reported what it saw",
 			);
 			expect(inputOrder).toBe("after");
+		} finally {
+			child.kill();
+			await child.exited;
+			await temp.remove();
+		}
+	}, 120_000);
+
+	test("a goal command sent after the ready frame waits for startup, and a get_state sent with it does not", async () => {
+		const temp = await TempDir.create("@omp-rpc-startup-goal-");
+		const child = spawnSlowStartupAgent(temp);
+		try {
+			const decoder = new TextDecoder();
+			const handlerReturned = Promise.withResolvers<{ at: number } | undefined>();
+			void (async () => {
+				for await (const line of readLines(child.stderr as ReadableStream<Uint8Array>)) {
+					const text = decoder.decode(line);
+					if (text.startsWith(HANDLER_RETURNED_PREFIX)) {
+						handlerReturned.resolve({ at: Number(text.slice(HANDLER_RETURNED_PREFIX.length).trim()) });
+					}
+				}
+				handlerReturned.resolve(undefined);
+			})().catch(() => {
+				// As in the case above: a reader that throws when the child is killed must not reject
+				// unobserved, which can fail an unrelated later test file.
+				handlerReturned.resolve(undefined);
+			});
+
+			let readyAt = 0;
+			let stateAt = 0;
+			let goalAt = 0;
+			const bothAnswered = Promise.withResolvers<void>();
+			void (async () => {
+				for await (const frame of readJsonl<unknown>(child.stdout as ReadableStream<Uint8Array>)) {
+					if (!isRecord(frame)) continue;
+					if (frame.type === "ready") {
+						readyAt = Date.now();
+						// `goal` changes goal state, which `goalController.reconcile()` is still settling
+						// during startup, so it waits; `get_state` changes nothing and is answered at once.
+						child.stdin.write(`${JSON.stringify({ type: "get_state", id: "state" })}\n`);
+						child.stdin.write(`${JSON.stringify({ type: "goal", id: "goal", op: "clear" })}\n`);
+						await child.stdin.flush();
+						continue;
+					}
+					if (frame.id === "state") stateAt = Date.now();
+					if (frame.id === "goal") goalAt = Date.now();
+					if (stateAt > 0 && goalAt > 0) bothAnswered.resolve();
+				}
+				bothAnswered.reject(new Error("the agent closed its output before it answered both frames"));
+			})().catch((readError: unknown) => {
+				bothAnswered.reject(readError);
+			});
+			await withTimeout(bothAnswered.promise, HANDLER_MS + 30_000, "the agent answered no frame before the timeout");
+
+			expect(stateAt - readyAt).toBeLessThan(ANSWER_BUDGET_MS);
+			const returned = await withTimeout(
+				handlerReturned.promise,
+				HANDLER_MS + 30_000,
+				"the startup handler never reported its return",
+			);
+			expect(returned).toBeDefined();
+			// The point of the hold: a state-changing command is answered only once startup is over,
+			// whatever its own answer says. Remove `goal` from the hold and this is the assertion that
+			// fails: the answer then arrives in the same milliseconds as the `get_state` above.
+			expect(goalAt).toBeGreaterThan(returned!.at);
 		} finally {
 			child.kill();
 			await child.exited;
