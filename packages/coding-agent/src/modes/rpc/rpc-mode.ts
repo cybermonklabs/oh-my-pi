@@ -523,6 +523,16 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
 	open_session: true,
 };
 
+// Each of these starts a turn, changes the session or changes goal state: `goal` creates, resumes,
+// pauses and clears a goal, `compact` rewrites the message set with a model call, `navigate_tree`
+// opens with a session change, and `handoff` tears the session down and writes a new one.
+const SESSION_MUTATING_TYPES: Record<string, true> = {
+	goal: true,
+	compact: true,
+	navigate_tree: true,
+	handoff: true,
+};
+
 /**
  * Orders user input and decides whether an accepted frame is still wanted.
  *
@@ -1722,26 +1732,17 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const onPromptError = (id: string | undefined, command: string) => (promptError: Error) =>
 		output(error(id, command, promptError.message));
 
-	// Read stdin from now on: `session_start` may be waiting on a dialog only the client can answer. Every frame
-	// dispatches as it arrives, startup included, so a command sent before startup finishes is answered while it
-	// still runs.
-	// Invariant: no `await` may stand at the top level of `runRpcMode` between this statement and the
-	// `new RpcInputDispatcher(...)` below. A frame delivered in such a window would read `inputDispatcher`
-	// before its initialization and throw `ReferenceError`.
-	// A transport error during startup must not be an unhandled rejection; the final await below still throws it.
-	// Input ending while startup still runs means no client is left to answer a dialog it awaits: reject them.
-	const inputRead = readRpcInputFrames(
-		input,
-		parsed => inputDispatcher.dispatch(parsed),
-		message => output(error(undefined, "parse", message)),
-	);
-	let startupComplete = false;
-	// Settles with `startupComplete`: `handleCommand` holds turn-starting and session-changing frames on it.
-	const startupSettled = Promise.withResolvers<void>();
-	const rejectStartupDialogs = (): void => {
-		if (!startupComplete) pendingExtensionRequests.rejectAll("RPC client disconnected during startup");
-	};
-	inputRead.then(rejectStartupDialogs, rejectStartupDialogs);
+	// Output all agent events as JSON; prompt results follow the frame that settled them. Installed
+	// before the stdin reader below starts: a command answered during startup would otherwise lose
+	// every event it emits, to the client and to the three observers here.
+	session.subscribe(event => {
+		sessionEvents.forward(event);
+		// Before the prompt-result and settle reports: a goal continuation decided at this
+		// agent_end is scheduled (and reported as pending) before either reads settlement.
+		goalController.observe(event);
+		promptResults.observe(event);
+		settleWatcher.observe(event);
+	});
 
 	// Discriminates a store failure from any other dispose rejection below.
 	let persistenceFailure: Error | undefined;
@@ -2833,9 +2834,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		// A frame that starts a turn or changes the session waits for startup: an extension's `input`
 		// handler would otherwise run ahead of the `session_start` broadcast, and `reconcile` swaps the
-		// active tool set under a turn already running. Every other command is answered while startup
-		// still runs, which is the point. `command.type` is untrusted input: read both tables with `Object.hasOwn`.
-		if (Object.hasOwn(USER_INPUT_TYPES, command.type) || Object.hasOwn(SESSION_CHANGE_TYPES, command.type)) {
+		// active tool set under a turn already running. The session-mutating frames wait for the same
+		// reason: each of them starts a turn, changes the session or changes the goal state `reconcile`
+		// is still settling. Every other command is answered while startup still runs, which is the
+		// point. `command.type` is untrusted input: read all three tables with `Object.hasOwn`.
+		if (
+			Object.hasOwn(USER_INPUT_TYPES, command.type) ||
+			Object.hasOwn(SESSION_CHANGE_TYPES, command.type) ||
+			Object.hasOwn(SESSION_MUTATING_TYPES, command.type)
+		) {
 			await startupSettled.promise;
 		}
 		if (!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)) return handleCommandImpl(command);
@@ -2873,14 +2880,30 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// remains background-dispatched so abort_bash can overtake it. readRpcInputFrames reads line-by-line so a
 	// single malformed line is reported as an error frame and the loop keeps running instead of throwing out of
 	// the reader and killing the whole process (issue #5194).
-	// Invariant: no `await` may stand at the top level of `runRpcMode` between the stdin read above and this
-	// statement. A frame delivered in such a window would read `inputDispatcher` before its initialization
-	// and throw `ReferenceError`.
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
 		acceptInput: command => inputGate.accept(command),
 	});
+
+	// Read stdin from now on: `session_start` may be waiting on a dialog only the client can answer. Every frame
+	// dispatches as it arrives, startup included, so a command sent before startup finishes is answered while it
+	// still runs.
+	// A transport error during startup must not be an unhandled rejection; the final await below still throws it.
+	// Input ending while startup still runs means no client is left to answer a dialog it awaits: reject them.
+	const inputRead = readRpcInputFrames(
+		input,
+		parsed => inputDispatcher.dispatch(parsed),
+		message => output(error(undefined, "parse", message)),
+	);
+	let startupComplete = false;
+	// Settles with `startupComplete`: `handleCommand` holds turn-starting, session-changing and
+	// session-mutating frames on it.
+	const startupSettled = Promise.withResolvers<void>();
+	const rejectStartupDialogs = (): void => {
+		if (!startupComplete) pendingExtensionRequests.rejectAll("RPC client disconnected during startup");
+	};
+	inputRead.then(rejectStartupDialogs, rejectStartupDialogs);
 
 	// Set up extensions with RPC-based UI context
 	await initializeExtensions(session, {
@@ -2926,16 +2949,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		},
 		// Headless hosts get the extension runner's no-op UI: hasUI=false, dialogs resolve to defaults.
 		uiContext: headless ? undefined : rpcUiContext,
-	});
-
-	// Output all agent events as JSON; prompt results follow the frame that settled them.
-	session.subscribe(event => {
-		sessionEvents.forward(event);
-		// Before the prompt-result and settle reports: a goal continuation decided at this
-		// agent_end is scheduled (and reported as pending) before either reads settlement.
-		goalController.observe(event);
-		promptResults.observe(event);
-		settleWatcher.observe(event);
 	});
 
 	await goalController.reconcile();

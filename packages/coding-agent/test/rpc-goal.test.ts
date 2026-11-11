@@ -432,7 +432,7 @@ describe("RpcGoalController continuation gate", () => {
 		idle.resolve();
 		const journal: string[] = [];
 		let tools: string[] = ["read"];
-		let journaledGoal = false;
+		let journaledGoal: "active" | "paused" | undefined;
 		let resumed = Promise.withResolvers<void>();
 		resumed.resolve();
 		let threadResumes = 0;
@@ -447,12 +447,12 @@ describe("RpcGoalController continuation gate", () => {
 				buildSessionContext: () =>
 					journaledGoal
 						? {
-								mode: "goal_paused",
+								mode: journaledGoal === "active" ? "goal" : "goal_paused",
 								modeData: {
 									goal: {
 										id: "j1",
 										objective: "journaled",
-										status: "paused",
+										status: journaledGoal,
 										tokensUsed: 0,
 										timeUsedSeconds: 0,
 										createdAt: 0,
@@ -519,8 +519,9 @@ describe("RpcGoalController continuation gate", () => {
 			threadResumes: () => threadResumes,
 			/** `preserveActiveGoal` of each `onThreadResumed` call, in order. */
 			preservedActive: () => preservedActive,
-			journalGoal: () => {
-				journaledGoal = true;
+			/** Journal a goal in the transcript the next reattach reads. */
+			journalGoal: (status: "active" | "paused" = "paused") => {
+				journaledGoal = status;
 			},
 			holdResume: () => {
 				resumed = Promise.withResolvers<void>();
@@ -857,6 +858,35 @@ describe("RpcGoalController continuation gate", () => {
 		await f.controller.endSessionChange();
 		await f.controller.settled();
 		expect(f.preservedActive()).toEqual([false, true]);
+	});
+
+	test("a host abort that arrived before the startup reattach stays in force after it", async () => {
+		const admitted: string[] = [];
+		const f = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+		// A host `abort` is answered while startup still runs, so it can land before the startup
+		// reattach. The reattach restores the journaled goal; it must not re-arm the continuation
+		// the abort stopped, or the host's interrupt is undone by startup finishing.
+		f.journalGoal("active");
+		f.controller.stopForHostAbort();
+		await f.controller.reconcile();
+		await f.controller.settled();
+		expect(f.goalState()).toMatchObject({ enabled: true, goal: { status: "active" } });
+
+		// The aborted run's terminal agent_end arrives. Nobody prompted it, so only the host stop
+		// holds the goal: an admitted continuation here is the host's abort being overridden.
+		f.controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		expect(f.controller.continuationPending).toBe(false);
+
+		// Host input is what re-arms it, which also shows the goal was continuable all along.
+		f.controller.observe(hostInput);
+		f.controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
 	});
 
 	test("a change that detached a continuation turn does not count the next turn as a continuation", async () => {
