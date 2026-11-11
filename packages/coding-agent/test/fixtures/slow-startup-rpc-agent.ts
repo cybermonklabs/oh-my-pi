@@ -16,18 +16,26 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 // extension makes startup long without making a turn out of it. The handler blocks for
 // OMP_STARTUP_HANDLER_MS, which is the delay under test rather than a wait for a condition, and
 // reports the time it returned on stderr, so a test can tell a command answered while startup ran
-// from one that waited startup out.
+// from one that waited startup out. The `input` handler reports whether it saw that return, so a
+// test can tell a turn that started after the `session_start` broadcast from one that overtook it.
 const handlerMs = Number(process.env.OMP_STARTUP_HANDLER_MS ?? "8000");
 const authStorage = await AuthStorage.create(path.join(process.cwd(), "auth.db"));
 authStorage.keys.setRuntime("anthropic", "test-key");
 const modelRegistry = new ModelRegistry(authStorage, path.join(process.cwd(), "models.yml"));
 const sessionManager = SessionManager.inMemory(process.cwd());
 const runtime = new ExtensionRuntime();
+let sessionStartReturned = false;
 const extension = await loadExtensionFromFactory(
 	pi => {
 		pi.on("session_start", async () => {
 			await Bun.sleep(handlerMs);
 			process.stderr.write(`startup-handler-returned ${Date.now()}\n`);
+			sessionStartReturned = true;
+			return undefined;
+		});
+		pi.on("input", () => {
+			const order = sessionStartReturned ? "after" : "before";
+			process.stderr.write(`input-handler-ran ${order}-session-start ${Date.now()}\n`);
 			return undefined;
 		});
 	},
