@@ -270,12 +270,13 @@ await runRpcMode(session);
 			}
 		}
 		await child.exited;
-		// The probe's own frames race the later state responses; every other frame's order is fixed.
+		// The prompt's own response races the later state responses; every other frame's order is
+		// fixed. The startup hold covers `prompt`, so the probe runs only once startup finishes and
+		// its notify arrives after the confirm's.
 		expect(
-			seen.filter(entry => entry !== "p:true" && entry !== "askDialog:function"),
+			seen.filter(entry => entry !== "p:true"),
 			await stderr,
-		).toEqual(["ask", "s1:true", "s2:true", "s3:true", "true"]);
-		expect(seen).toContain("askDialog:function");
+		).toEqual(["ask", "s1:true", "s2:true", "s3:true", "true", "askDialog:function"]);
 	}, 30_000);
 
 	it("holds a session change sent while startup waits, and the command behind it, until startup finishes", async () => {
