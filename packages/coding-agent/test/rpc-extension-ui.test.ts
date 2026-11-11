@@ -225,7 +225,7 @@ await runRpcMode(session);
 		});
 	}
 
-	it("answers a dialog session_start awaits, running commands sent meanwhile only after startup, in order", async () => {
+	it("answers a dialog session_start awaits, and answers commands sent meanwhile while it waits, in order", async () => {
 		await using temp = await TempDir.create("@rpc-startup-dialog-");
 		const child = await spawnStartupDialogRuntime(temp);
 		const stderr = new Response(child.stderr).text();
@@ -235,23 +235,30 @@ await runRpcMode(session);
 			if (!isRecord(frame)) continue;
 			if (frame.type === "extension_ui_request" && frame.method === "confirm") {
 				confirmId = frame.id;
-				// Held until startup finishes (had one run at once, its response would precede the confirm's
-				// notify) and then run in arrival order. set_ask_dialog is served during startup and takes effect.
+				// Answered as they arrive, in arrival order, while startup still waits for this dialog.
+				// set_ask_dialog serializes with every other command now, so it goes before the prompt that
+				// needs it. The confirm's `true` notify arrives only once the client answers the confirm below.
+				child.stdin.write(`${JSON.stringify({ id: "ask", type: "set_ask_dialog", enabled: true })}\n`);
 				for (const id of ["s1", "s2"]) child.stdin.write(`${JSON.stringify({ id, type: "get_state" })}\n`);
 				child.stdin.write(`${JSON.stringify({ id: "p", type: "prompt", message: "/probe" })}\n`);
 				child.stdin.write(`${JSON.stringify({ id: "s3", type: "get_state" })}\n`);
-				child.stdin.write(`${JSON.stringify({ id: "ask", type: "set_ask_dialog", enabled: true })}\n`);
 				await child.stdin.flush();
 			} else if (frame.type === "response" && frame.id === "ask") {
 				seen.push("ask");
-				child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: confirmId, confirmed: true })}\n`);
-				await child.stdin.flush();
 			} else if (frame.type === "extension_ui_request" && frame.method === "notify") {
 				seen.push(String(frame.message));
+				// Both notifies seen: nothing is left to answer, so end stdin and drain stdout to its end.
+				// Ending it earlier would reject the dialog startup awaits, which the test below covers.
+				if (seen.includes("true") && seen.includes("askDialog:function")) child.stdin.end();
 			} else if (frame.type === "response" && typeof frame.id === "string" && /^(s\d|p)$/.test(frame.id)) {
 				seen.push(`${frame.id}:${frame.success}`);
-				// Drain stdout to its end: closing the reader early would break the child's output pipe.
-				if (frame.id === "s3") child.stdin.end();
+				// Answer the dialog only now: every frame answered above was answered while startup waited.
+				if (frame.id === "s3") {
+					child.stdin.write(
+						`${JSON.stringify({ type: "extension_ui_response", id: confirmId, confirmed: true })}\n`,
+					);
+					await child.stdin.flush();
+				}
 			}
 		}
 		await child.exited;
@@ -259,7 +266,7 @@ await runRpcMode(session);
 		expect(
 			seen.filter(entry => entry !== "p:true" && entry !== "askDialog:function"),
 			await stderr,
-		).toEqual(["ask", "true", "s1:true", "s2:true", "s3:true"]);
+		).toEqual(["ask", "s1:true", "s2:true", "s3:true", "true"]);
 		expect(seen).toContain("askDialog:function");
 	}, 30_000);
 

@@ -1722,74 +1722,20 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const onPromptError = (id: string | undefined, command: string) => (promptError: Error) =>
 		output(error(id, command, promptError.message));
 
-	// Read stdin from now on: `session_start` may be waiting on a dialog only the client can answer. Until the
-	// command loop below exists, a dialog answer and the ask-dialog opt-in are handled at once and every other
-	// frame is held, in arrival order, for that loop.
-	let heldFrames: unknown[] | undefined = [];
+	// Read stdin from now on: `session_start` may be waiting on a dialog only the client can answer. Every frame
+	// dispatches as it arrives, startup included, so a command sent before startup finishes is answered while it
+	// still runs.
 	const receiveFrame = (parsed: unknown): void => {
-		if (!heldFrames) {
-			inputDispatcher.dispatch(parsed);
-		} else if (isRpcExtensionUIResponse(parsed)) {
-			pendingExtensionRequests.get(parsed.id)?.resolve(parsed);
-		} else if (isRecord(parsed) && parsed.type === "set_ask_dialog") {
-			output(setAskDialog(parsed as RpcCommand & { type: "set_ask_dialog" }));
-		} else {
-			heldFrames.push(parsed);
-		}
+		inputDispatcher.dispatch(parsed);
 	};
 	// A transport error during startup must not be an unhandled rejection; the final await below still throws it.
 	// Input ending while startup still runs means no client is left to answer a dialog it awaits: reject them.
 	const inputRead = readRpcInputFrames(input, receiveFrame, message => output(error(undefined, "parse", message)));
+	let startupComplete = false;
 	const rejectStartupDialogs = (): void => {
-		if (heldFrames) pendingExtensionRequests.rejectAll("RPC client disconnected during startup");
+		if (!startupComplete) pendingExtensionRequests.rejectAll("RPC client disconnected during startup");
 	};
 	inputRead.then(rejectStartupDialogs, rejectStartupDialogs);
-
-	// Set up extensions with RPC-based UI context
-	await initializeExtensions(session, {
-		mode: "rpc",
-		// Extension-initiated session changes get the same goal quiesce/reattach as the commands below.
-		wrapSessionChange: <T extends { cancelled: boolean }>(
-			change: () => Promise<T>,
-			{ detachesRun }: { detachesRun: boolean },
-		): Promise<T> =>
-			withSessionChange(async () => {
-				await stopDictationForSessionChange();
-				await btw.close();
-				await goalController.beginSessionChange();
-				let result: T | undefined;
-				try {
-					result = await change();
-					return result;
-				} finally {
-					// Reattaches only if the session actually changed, then re-checks settlement.
-					// A change that throws may already have detached the run: count it as detached.
-					await goalController.endSessionChange({ detachedRun: detachesRun && result?.cancelled !== true });
-					if (result && !result.cancelled) {
-						// As for the host's new/switch commands: a detached run never yields, so
-						// close the prompts it was answering. Branch and navigation leave a live
-						// run streaming to its normal yield.
-						if (detachesRun) promptResults.abortOpen();
-						void settleWatcher.check();
-					}
-				}
-			}),
-		reportSendError: (action, err) => {
-			output(error(undefined, action, err.message));
-		},
-		reportRuntimeError: err => {
-			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
-		},
-		onShutdown: () => {
-			shutdownState.requested = true;
-			dictationBridge.dispose();
-		},
-		trackAgentInvokingMessage: task => {
-			extensionUserMessageTracker.trackAgentMessageTask(task);
-		},
-		// Headless hosts get the extension runner's no-op UI: hasUI=false, dialogs resolve to defaults.
-		uiContext: headless ? undefined : rpcUiContext,
-	});
 
 	// Output all agent events as JSON; prompt results follow the frame that settled them.
 	session.subscribe(event => {
@@ -1800,8 +1746,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		promptResults.observe(event);
 		settleWatcher.observe(event);
 	});
-	await goalController.reconcile();
-	await goalController.settled();
 
 	// Discriminates a store failure from any other dispose rejection below.
 	let persistenceFailure: Error | undefined;
@@ -1879,7 +1823,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	session.subscribeCommandMetadataChanged(() => {
 		void emitAvailableCommandsUpdate();
 	});
-	await emitAvailableCommandsUpdate();
 
 	const inputGate = new RpcUserInputGate();
 	type OrderedUserInput = Extract<RpcCommand, { type: "prompt" | "steer" | "follow_up" | "abort_and_prompt" }>;
@@ -2932,14 +2875,63 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		acceptInput: command => inputGate.accept(command),
 	});
 
-	// Startup is over: run the frames held back meanwhile, then every later frame, through the dispatcher.
+	// Set up extensions with RPC-based UI context
+	await initializeExtensions(session, {
+		mode: "rpc",
+		// Extension-initiated session changes get the same goal quiesce/reattach as the commands below.
+		wrapSessionChange: <T extends { cancelled: boolean }>(
+			change: () => Promise<T>,
+			{ detachesRun }: { detachesRun: boolean },
+		): Promise<T> =>
+			withSessionChange(async () => {
+				await stopDictationForSessionChange();
+				await btw.close();
+				await goalController.beginSessionChange();
+				let result: T | undefined;
+				try {
+					result = await change();
+					return result;
+				} finally {
+					// Reattaches only if the session actually changed, then re-checks settlement.
+					// A change that throws may already have detached the run: count it as detached.
+					await goalController.endSessionChange({ detachedRun: detachesRun && result?.cancelled !== true });
+					if (result && !result.cancelled) {
+						// As for the host's new/switch commands: a detached run never yields, so
+						// close the prompts it was answering. Branch and navigation leave a live
+						// run streaming to its normal yield.
+						if (detachesRun) promptResults.abortOpen();
+						void settleWatcher.check();
+					}
+				}
+			}),
+		reportSendError: (action, err) => {
+			output(error(undefined, action, err.message));
+		},
+		reportRuntimeError: err => {
+			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
+		},
+		onShutdown: () => {
+			shutdownState.requested = true;
+			dictationBridge.dispose();
+		},
+		trackAgentInvokingMessage: task => {
+			extensionUserMessageTracker.trackAgentMessageTask(task);
+		},
+		// Headless hosts get the extension runner's no-op UI: hasUI=false, dialogs resolve to defaults.
+		uiContext: headless ? undefined : rpcUiContext,
+	});
+
+	await goalController.reconcile();
+	await goalController.settled();
+	await emitAvailableCommandsUpdate();
+	// Startup is over: a client disconnect from here on is handled by the teardown below, not by
+	// rejecting the dialogs startup was awaiting.
+	startupComplete = true;
+
 	// Side-channel frames dispatch immediately, ordinary commands serialize through inputDispatcher, and bash
 	// remains background-dispatched so abort_bash can overtake it. readRpcInputFrames reads line-by-line so a
 	// single malformed line is reported as an error frame and the loop keeps running instead of throwing out of
 	// the reader and killing the whole process (issue #5194).
-	const held = heldFrames;
-	heldFrames = undefined;
-	for (const parsed of held) inputDispatcher.dispatch(parsed);
 	await inputRead;
 
 	// stdin closed — RPC client is gone. Fail pending side-channel requests
