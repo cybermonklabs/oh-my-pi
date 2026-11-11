@@ -333,12 +333,7 @@ export class RpcGoalController {
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
 		await this.#exitTask;
-		// A host abort that arrived before this reattach stays in force across it: `#exit` resets
-		// continuation state, and only host action (a prompt, `goal create`/`resume`) clears a host
-		// stop. A client `abort` is answered while startup runs, so it can precede the startup reattach.
-		const hostStopped = this.#hostStopped;
 		await this.#exit();
-		this.#hostStopped = hostStopped;
 		this.#session.setGoalModeState(undefined);
 		const context = this.#session.sessionManager.buildSessionContext();
 		const runtime = this.#session.goalRuntime;

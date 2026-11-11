@@ -523,15 +523,40 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
 	open_session: true,
 };
 
-// Each of these starts a turn, changes the session or changes goal state: `goal` creates, resumes,
-// pauses and clears a goal, `compact` rewrites the message set with a model call, `navigate_tree`
-// opens with a session change, and `handoff` tears the session down and writes a new one.
-const SESSION_MUTATING_TYPES: Record<string, true> = {
-	goal: true,
-	compact: true,
-	navigate_tree: true,
-	handoff: true,
-};
+/**
+ * Types that always wait for startup, besides the `goal` ops {@link waitsForStartup} adds. A Set,
+ * not a Record: `type` is untrusted input and must not hit prototype keys.
+ */
+const STARTUP_HELD_TYPES: ReadonlySet<string> = new Set<string>([
+	...Object.keys(USER_INPUT_TYPES),
+	...Object.keys(SESSION_CHANGE_TYPES),
+	"compact",
+	"navigate_tree",
+	"handoff",
+	"live_start",
+	"live_connect",
+]);
+
+/**
+ * Whether `command` waits for startup to finish before {@link runRpcMode} runs it. Every other
+ * command is answered while startup still runs, which is the point.
+ *
+ * A frame that starts a turn or changes the session waits because an extension's `input` handler
+ * would otherwise run ahead of the `session_start` broadcast, and `reconcile` swaps the active tool
+ * set under a turn already running. The rest wait for the same reason: `goal` creates, resumes,
+ * pauses and clears the goal state `reconcile` is still settling, `compact` rewrites the message set
+ * with a model call, `navigate_tree` opens with a session change, `handoff` tears the session down
+ * and writes a new one, and `live_start`/`live_connect` open a live session whose first delegation
+ * sends a main-session message with `triggerTurn` (LiveSessionController#handleDelegation).
+ *
+ * `goal` with op `get` only reads the goal, so it is answered during startup like any other read —
+ * and it must be, since it is dispatched on the serial tail and would block every frame behind it.
+ * `command.op` is untrusted input like `command.type`: compared as a string, never used as a key.
+ */
+function waitsForStartup(command: RpcCommand): boolean {
+	if (command.type === "goal") return command.op !== "get";
+	return STARTUP_HELD_TYPES.has(command.type);
+}
 
 /**
  * Orders user input and decides whether an accepted frame is still wanted.
@@ -2832,19 +2857,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	};
 
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
-		// A frame that starts a turn or changes the session waits for startup: an extension's `input`
-		// handler would otherwise run ahead of the `session_start` broadcast, and `reconcile` swaps the
-		// active tool set under a turn already running. The session-mutating frames wait for the same
-		// reason: each of them starts a turn, changes the session or changes the goal state `reconcile`
-		// is still settling. Every other command is answered while startup still runs, which is the
-		// point. `command.type` is untrusted input: read all three tables with `Object.hasOwn`.
-		if (
-			Object.hasOwn(USER_INPUT_TYPES, command.type) ||
-			Object.hasOwn(SESSION_CHANGE_TYPES, command.type) ||
-			Object.hasOwn(SESSION_MUTATING_TYPES, command.type)
-		) {
-			await startupSettled.promise;
-		}
+		if (waitsForStartup(command)) await startupSettled.promise;
 		if (!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)) return handleCommandImpl(command);
 		return withSessionChange(() => handleCommandImpl(command));
 	};
@@ -2877,18 +2890,24 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	};
 
 	// Side-channel frames dispatch immediately, ordinary commands serialize through inputDispatcher, and bash
-	// remains background-dispatched so abort_bash can overtake it. readRpcInputFrames reads line-by-line so a
-	// single malformed line is reported as an error frame and the loop keeps running instead of throwing out of
-	// the reader and killing the whole process (issue #5194).
+	// remains background-dispatched so abort_bash can overtake it.
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
 		acceptInput: command => inputGate.accept(command),
 	});
 
+	let startupComplete = false;
+	// Settles with `startupComplete`: `handleCommand` holds every frame that starts a turn, changes the
+	// session or changes goal state on it. Declared before the reader below, which dispatches into
+	// `handleCommand`.
+	const startupSettled = Promise.withResolvers<void>();
+
 	// Read stdin from now on: `session_start` may be waiting on a dialog only the client can answer. Every frame
 	// dispatches as it arrives, startup included, so a command sent before startup finishes is answered while it
-	// still runs.
+	// still runs. readRpcInputFrames reads line-by-line so a single malformed line is reported as an error frame
+	// and the loop keeps running instead of throwing out of the reader and killing the whole process
+	// (issue #5194).
 	// A transport error during startup must not be an unhandled rejection; the final await below still throws it.
 	// Input ending while startup still runs means no client is left to answer a dialog it awaits: reject them.
 	const inputRead = readRpcInputFrames(
@@ -2896,10 +2915,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		parsed => inputDispatcher.dispatch(parsed),
 		message => output(error(undefined, "parse", message)),
 	);
-	let startupComplete = false;
-	// Settles with `startupComplete`: `handleCommand` holds turn-starting, session-changing and
-	// session-mutating frames on it.
-	const startupSettled = Promise.withResolvers<void>();
 	const rejectStartupDialogs = (): void => {
 		if (!startupComplete) pendingExtensionRequests.rejectAll("RPC client disconnected during startup");
 	};
