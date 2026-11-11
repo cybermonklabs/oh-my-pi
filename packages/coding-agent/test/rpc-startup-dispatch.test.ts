@@ -233,14 +233,17 @@ describe("RPC startup input dispatch", () => {
 	// Five agents, each waiting out one `HELD_HANDLER_MS` startup.
 	test("every command the startup hold covers waits for startup, and a get_state sent with it does not", async () => {
 		const objective = "ship the release";
-		// One frame of each held type, so that dropping any single type from the hold fails this case
-		// and not only dropping the whole set. Whether a frame answers with a success or with an error
-		// is neither asserted nor relevant: the hold sits in `handleCommand` before `handleCommandImpl`,
+		// One frame of each held type. Dropping `compact`, `navigate_tree`, `handoff` or the `goal`
+		// ops from the hold fails this case; the `live_start` row does not separate a held type from
+		// an unheld one and is here as an observation rather than as a lock, because a live start
+		// waits for startup through its own controller as well: measured with `live_start` taken out
+		// of the hold, its answer still came 53 ms after the handler returned, the same side of the
+		// return as when it is held. Whether a frame answers with a success or with an error is
+		// neither asserted nor relevant: the hold sits in `handleCommand` before `handleCommandImpl`,
 		// so a frame waits for startup whatever its payload turns out to mean. That is why the
 		// `navigate_tree` here names an entry no session tree holds, why `compact` and `handoff` run
 		// against a session with nothing in it, and why `live_start` may answer with the machine's
-		// missing audio device. `live_start` is held although it is background-dispatched, so it blocks
-		// nothing behind it; it is held because a live delegation starts a main-session turn.
+		// missing audio device.
 		// One agent at a time, in order: five slow-startup agents at once would measure the machine.
 		const goal = await measureHeldFrame({ type: "goal", op: "create", objective }, { type: "goal", op: "get" });
 		const timings = [
@@ -262,5 +265,13 @@ describe("RPC startup input dispatch", () => {
 		// during startup is active when the host reads it back. The hold puts `goal create` after the
 		// startup reattach (`goalController.reconcile()`), so no part of startup runs over it.
 		expect(goal.after).toMatchObject({ success: true, data: { goal: { objective, status: "active" } } });
+
+		// The other side of the same rule, which no row above can show: `goal` with op `get` only
+		// reads, so it is answered while startup runs. Hold it and this assertion fails — and a held
+		// `goal get` would block every frame the dispatcher serializes behind it for the whole of
+		// startup, which is the defect this issue exists for.
+		const goalGet = await measureHeldFrame({ type: "goal", op: "get" });
+		expect(goalGet.msFromStartupReturnToHeld).toBeLessThan(0);
+		expect(goalGet.msFromReadyToState).toBeLessThan(ANSWER_BUDGET_MS);
 	}, 240_000);
 });
