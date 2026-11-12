@@ -456,9 +456,10 @@ const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
 /**
  * Dispatch a single parsed frame from the RPC input stream.
  *
- * `bash`, `predict_word`, `prompt` and `steer_subagent` are dispatched in the
- * background so the caller can keep reading subsequent frames while one is
- * still settling: a `bash` command can run for a long time, and a `prompt`
+ * Every {@link BACKGROUND_COMMANDS} type, and `prompt`, `steer`, `dictation_start`,
+ * `follow_up` and `steer_subagent`, are dispatched in the background so the caller
+ * can keep reading subsequent frames while one is still settling: a `bash` command
+ * can run for a long time, and a `prompt`
  * command's response is held until the message is admitted, which can span
  * real wall-clock time (image normalization, a vision-model description call).
  * `steer_subagent` likewise holds its response until the subagent accepts the
