@@ -423,22 +423,32 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
 }
 
 /**
- * Commands that skip the serial queue entirely; see {@link dispatchRpcInputFrame}.
- * (`prompt` and `steer_subagent` are also backgrounded there, but start through
- * the serial tail.) `btw_cancel` is synchronous and must overtake a `btw` still
- * starting or a long serial command; `abort_branch_summary` likewise overtakes
- * the `navigate_tree` whose summary it stops. All four live types are here, so
- * each reaches `handleCommand` as it is read and the four start their startup
- * wait in read order (see {@link waitsForStartup}).
+ * The live-session types. All four wait for startup ({@link waitsForStartup}) and all four skip the
+ * serial queue ({@link BACKGROUND_COMMANDS}), which is what keeps the ones read while startup ran in
+ * read order. Both sets spread this one, so neither can lose a live type while the other keeps it.
  * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
  */
-export const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
-	"bash",
-	"predict_word",
+const LIVE_STARTUP_TYPES: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
 	"live_start",
 	"live_connect",
 	"live_stop",
 	"live_mute",
+]);
+
+/**
+ * Commands that skip the serial queue entirely; see {@link dispatchRpcInputFrame}.
+ * (`prompt`, `steer`, `dictation_start`, `follow_up` and `steer_subagent` are also backgrounded
+ * there, but start through the serial tail.) `btw_cancel` is synchronous and must overtake a `btw`
+ * still starting or a long serial command; `abort_branch_summary` likewise overtakes the
+ * `navigate_tree` whose summary it stops. The four {@link LIVE_STARTUP_TYPES} are spread in, so each
+ * reaches `handleCommand` as it is read and the four start their startup wait in read order (see
+ * {@link waitsForStartup}).
+ * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
+ */
+const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
+	"bash",
+	"predict_word",
+	...LIVE_STARTUP_TYPES,
 	"btw_cancel",
 	"abort_branch_summary",
 ]);
@@ -467,7 +477,9 @@ export const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type
  *
  * @returns `undefined` when the frame was routed to a side-channel handler
  *   (extension UI response, host tool/URI frames) or dispatched in the
- *   background (`bash`, `predict_word`, the four `live_*` commands, `dictation_start`, `prompt`, `steer`, `follow_up`, `steer_subagent`). Otherwise a promise that
+ *   background (every {@link BACKGROUND_COMMANDS} type, so `bash`, `predict_word`, the four
+ *   `live_*` commands, `btw_cancel` and `abort_branch_summary`, plus `prompt`, `steer`,
+ *   `dictation_start`, `follow_up` and `steer_subagent`). Otherwise a promise that
  *   resolves once the response for the command has been emitted via `output`.
  *   Errors from `handleCommand` on a command dispatched inline propagate; the
  *   caller is expected to wrap them.
@@ -529,18 +541,6 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
 	fork: true,
 	open_session: true,
 };
-
-/**
- * The live-session types. All four wait for startup, and all four are {@link BACKGROUND_COMMANDS},
- * which is what keeps the ones read while startup ran in read order (see {@link waitsForStartup}).
- * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
- */
-export const LIVE_STARTUP_TYPES: ReadonlySet<string> = new Set<string>([
-	"live_start",
-	"live_connect",
-	"live_stop",
-	"live_mute",
-]);
 
 /**
  * Types that always wait for startup, besides the `goal` ops {@link waitsForStartup} adds. A Set,
@@ -660,10 +660,11 @@ export class RpcUserInputGate {
 	}
 }
 
-/** Starts prompts, steers, follow-ups and `steer_subagent` after earlier ordinary commands, without
- * awaiting admission. Control frames, `bash` and `predict_word` dispatch immediately (see
- * dispatchRpcInputFrame). `acceptInput` runs synchronously in {@link dispatch}, before the
- * handler is queued, so an abort can invalidate a frame that has not started yet. */
+/** Starts prompts, steers, follow-ups, `dictation_start` and `steer_subagent` after earlier
+ * ordinary commands, without awaiting admission. Control frames and every
+ * {@link BACKGROUND_COMMANDS} type dispatch immediately (see {@link dispatchRpcInputFrame}).
+ * `acceptInput` runs synchronously in {@link dispatch}, before the handler is queued, so an abort
+ * can invalidate a frame that has not started yet. */
 export class RpcInputDispatcher {
 	#tail: Promise<void> = Promise.resolve();
 	#tasks = new Set<Promise<void>>();
@@ -687,9 +688,9 @@ export class RpcInputDispatcher {
 			if (dispatchRpcControlFrame(parsed, this.#deps)) return;
 			const command = parsed as RpcCommand;
 			this.#acceptInput?.(command);
-			// Bash and predict_word retain their immediate side channel. Prompts,
-			// steers, follow-ups and steer_subagent start through the serial tail, but
-			// dispatchRpcInputFrame backgrounds their admission.
+			// Every BACKGROUND_COMMANDS type keeps its immediate side channel. Prompts,
+			// steers, follow-ups, dictation_start and steer_subagent start through the
+			// serial tail, but dispatchRpcInputFrame backgrounds their admission.
 			if (BACKGROUND_COMMANDS.has(command.type)) {
 				dispatchRpcInputFrame(command, this.#deps);
 				return;
@@ -734,8 +735,8 @@ export class RpcInputDispatcher {
  * Coordinates deferred shutdown with in-flight background input tasks.
  *
  * `pi.shutdown()` from an extension only *requests* shutdown; the process must
- * not exit while a background-dispatched command (`bash`, `predict_word`,
- * `prompt` or `steer_subagent`, see
+ * not exit while a background-dispatched command (every {@link BACKGROUND_COMMANDS} type, plus
+ * `prompt`, `steer`, `dictation_start`, `follow_up` and `steer_subagent`, see
  * {@link dispatchRpcInputFrame}) still owes the client a response frame. The
  * coordinator tracks those tasks, re-checks the shutdown request whenever one
  * settles (covering a shutdown requested mid-command with no follow-up client
