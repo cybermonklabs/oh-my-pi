@@ -287,9 +287,10 @@ describe("RPC startup input dispatch", () => {
 		// `new_session` through the withdrawal case below, and every other member here,
 		// including the `goal` ops `waitsForStartup` adds to the set. The live rows lock the hold
 		// exactly as the others do: with `live_start` taken out of the hold its answer came 2,424 to
-		// 2,492 ms before the handler returned, measured at `d731a4f9`, the head that gave the
-		// fixture its fake live controller, against that controller and against the real one.
-		// `live_connect` needs its own row because the `live_start` row does not cover it:
+		// 2,492 ms before the handler returned, measured at `37dc7037` by the round 3 reviews, each
+		// with a fake live controller in its own scratch copy of the fixture, and copied into this
+		// file at `d731a4f9`, the commit that added the fixture's own fake. `live_connect` needs its
+		// own row because the `live_start` row does not cover it:
 		// taken alone out of the hold, every other row still passed. Whether a frame answers with a
 		// success or with an error is neither asserted nor relevant: the hold sits in `handleCommand`
 		// before `handleCommandImpl`, so a frame waits for startup whatever its payload turns out to
