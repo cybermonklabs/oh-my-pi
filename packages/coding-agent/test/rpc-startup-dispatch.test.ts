@@ -19,13 +19,25 @@ const ANSWER_BUDGET_MS = 2_000;
 const HANDLER_RETURNED_PREFIX = "startup-handler-returned ";
 /** The line the fixture's `input` handler writes, naming whether it saw that return. */
 const INPUT_HANDLER_PREFIX = "input-handler-ran ";
+/** The line the fixture writes once its `session_start` handler has requested a deferred shutdown. */
+const SHUTDOWN_REQUESTED_PREFIX = "startup-shutdown-requested ";
+/**
+ * How long the fixture's fake live session takes to connect in the three live cases below. Real
+ * time: a connect a `live_stop` can cancel, and that a frame behind the stop must not wait out.
+ */
+const LIVE_CONNECT_MS = 3_000;
+/**
+ * How long a case that waits for the agent to exit allows. Bounded well under the per-test timeout
+ * so a regression fails its case instead of hanging the suite.
+ */
+const EXIT_BUDGET_MS = HELD_HANDLER_MS + 15_000;
 
 /**
  * Spawn the slow-startup RPC agent in `temp`, with a minimal environment: the child must not read
  * the developer's or the runner's home-rooted plugin and config state, which would make a test
  * machine-dependent.
  */
-const spawnSlowStartupAgent = (temp: TempDir, handlerMs: number) =>
+const spawnSlowStartupAgent = (temp: TempDir, handlerMs: number, extraEnv: Record<string, string> = {}) =>
 	Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures", "slow-startup-rpc-agent.ts")], {
 		cwd: temp.path(),
 		env: {
@@ -38,6 +50,7 @@ const spawnSlowStartupAgent = (temp: TempDir, handlerMs: number) =>
 			CI: "true",
 			PI_NO_TITLE: "1",
 			OMP_STARTUP_HANDLER_MS: String(handlerMs),
+			...extraEnv,
 		},
 		stdin: "pipe",
 		stdout: "pipe",
@@ -316,12 +329,13 @@ describe("RPC startup input dispatch", () => {
 		expect(goal.after).toMatchObject({ success: true, data: { goal: { objective, status: "active" } } });
 
 		// Why `live_stop` and `live_mute` are held too: a `live_stop` sent during startup must stop
-		// the `live_start` sent before it. The hold puts both after startup, the chain the live frames
-		// are read into resumes them in the order the host sent them, and the bridge publishes its
-		// controller before its first await, so the stop finds it. Answered during startup instead,
-		// the stop would find no controller, do nothing and report success, and the held start would
-		// then open the microphone after the host asked it to stop. `live_mute`, sent once startup is
-		// over, is how the row reads the outcome: it fails only when no live session is running.
+		// the `live_start` sent before it. The hold puts both after startup, all four live types are
+		// background-dispatched so each starts its startup wait as it is read and the four resume in
+		// the order the host sent them, and the bridge publishes its controller before its first
+		// await, so the stop finds it. Answered during startup instead, the stop would find no
+		// controller, do nothing and report success, and the held start would then open the
+		// microphone after the host asked it to stop. `live_mute`, sent once startup is over, is how
+		// the row reads the outcome: it fails only when no live session is running.
 		const liveStopped = await measureHeldFrame(
 			{ type: "live_start" },
 			{ alongside: [{ type: "live_stop" }], after: { type: "live_mute", muted: true } },
@@ -343,16 +357,16 @@ describe("RPC startup input dispatch", () => {
 		expect(liveMuted.msFromStartupReturnToHeld).toBeGreaterThan(0);
 		expect(liveMuted.after).toMatchObject({ success: true, data: { muted: false } });
 
-		// The hold alone does not keep the four live frames in arrival order, which is what the chain
-		// built as they are read is for. `live_start` and `live_connect` are background commands and
-		// start their startup wait as they are read; `live_stop` and `live_mute` start theirs only at
-		// the head of the serial tail. With the held `compact` ahead of the pair the stop reaches that
-		// head only after startup, by which time the backgrounded start has resumed — so without the
-		// chain the stop is applied to the session the start opened, and the host's last request is
-		// undone. The probe is sent once the start has been answered and runs behind the stop on the
-		// serial tail either way, so it reports which request survived: a mute means the `live_start`
-		// the host sent last is the request that is honoured and its session is running, while "No
-		// live session is active" means the stop was applied after it.
+		// What keeps the four live frames in arrival order: all four are background-dispatched, so
+		// each reaches `handleCommand` as it is read and starts its wait on `startupSettled` there,
+		// and promise reactions run in registration order. Were `live_stop` and `live_mute` serial
+		// instead, they would reach that wait only at the head of the serial tail: with the held
+		// `compact` ahead of the pair the stop would reach it only after startup, by which time the
+		// backgrounded start has resumed, so the stop would be applied to the session the start
+		// opened and the host's last request undone. The probe is sent once the start has been
+		// answered, so it reports which request survived: a mute means the `live_start` the host
+		// sent last is the request that is honoured and its session is running, while "No live
+		// session is active" means the stop was applied after it.
 		const liveStartedAfterStop = await measureHeldFrame(
 			{ type: "compact" },
 			{
@@ -470,6 +484,206 @@ describe("RPC startup input dispatch", () => {
 			expect(typeof sessionBefore).toBe("string");
 			expect(typeof sessionAfter).toBe("string");
 			expect(sessionAfter).not.toBe(sessionBefore);
+		} finally {
+			child.kill();
+			await child.exited;
+			await temp.remove();
+		}
+	}, 120_000);
+
+	/**
+	 * A deferred shutdown the extension requests during startup must still end the process when
+	 * live frames were read during startup. The request is the extension's own `pi.shutdown()`; no
+	 * client frame raises it. `get_state` is answered while startup runs, and its
+	 * `afterSerialCommand` finds the request and drains the background tasks before the process
+	 * exits — so a live frame that waits on something the drain is holding deadlocks that exit. All
+	 * four live types are background-dispatched, so none of them waits on the serial queue.
+	 */
+	test("a shutdown requested during startup still exits with live frames read during startup", async () => {
+		const temp = await TempDir.create("@omp-rpc-startup-shutdown-");
+		const child = spawnSlowStartupAgent(temp, HELD_HANDLER_MS, { OMP_SHUTDOWN_DURING_STARTUP: "1" });
+		try {
+			const decoder = new TextDecoder();
+			const shutdownRequested = Promise.withResolvers<boolean>();
+			void (async () => {
+				for await (const line of readLines(child.stderr as ReadableStream<Uint8Array>)) {
+					if (decoder.decode(line).startsWith(SHUTDOWN_REQUESTED_PREFIX)) shutdownRequested.resolve(true);
+				}
+				shutdownRequested.resolve(false);
+			})().catch(() => {
+				// As in the cases above: a reader that throws when the child is killed must not reject
+				// unobserved, which can fail an unrelated later test file.
+				shutdownRequested.resolve(false);
+			});
+
+			const answers = new Map<string, Record<string, unknown>>();
+			const answered = Promise.withResolvers<void>();
+			void (async () => {
+				for await (const frame of readJsonl<unknown>(child.stdout as ReadableStream<Uint8Array>)) {
+					if (!isRecord(frame) || typeof frame.id !== "string") continue;
+					answers.set(frame.id, frame);
+					if (answers.has("state") && answers.has("stop") && answers.has("start")) answered.resolve();
+				}
+				answered.reject(new Error("the agent closed its output before it answered every frame"));
+			})().catch((readError: unknown) => {
+				answered.reject(readError);
+			});
+
+			// Sent once the request is in place, so the `get_state` below is the serial command whose
+			// shutdown check drains rather than racing the handler for it.
+			const requested = await withTimeout(
+				shutdownRequested.promise,
+				HELD_HANDLER_MS + 30_000,
+				"the fixture never reported the shutdown it requests during startup",
+			);
+			expect(requested).toBe(true);
+			child.stdin.write(
+				`${[
+					JSON.stringify({ type: "get_state", id: "state" }),
+					JSON.stringify({ type: "live_stop", id: "stop" }),
+					JSON.stringify({ type: "live_start", id: "start" }),
+				].join("\n")}\n`,
+			);
+			await child.stdin.flush();
+
+			// Every owed response is written before the process exits, whatever each one says: the
+			// live frames resume when startup ends, and the shutdown drain waits for them.
+			await withTimeout(answered.promise, EXIT_BUDGET_MS, "the agent answered no frame before the timeout");
+			expect(answers.get("state")).toMatchObject({ success: true, command: "get_state" });
+			expect(answers.get("stop")).toMatchObject({ command: "live_stop" });
+			expect(answers.get("start")).toMatchObject({ command: "live_start" });
+			const exitCode = await withTimeout(
+				child.exited,
+				EXIT_BUDGET_MS,
+				"the agent did not exit after the shutdown it requested during startup",
+			);
+			expect(exitCode).toBe(0);
+		} finally {
+			child.kill();
+			await child.exited;
+			await temp.remove();
+		}
+	}, 120_000);
+
+	/**
+	 * A `live_stop` read after a `live_start` during startup cancels the connect instead of waiting
+	 * it out, and takes no place in the serial queue while it does. The fake controller's connect
+	 * takes real time here, which is what makes the difference visible: the start resumes first and
+	 * publishes its controller before its first await, so the stop that resumes next finds it.
+	 */
+	test("a live_stop read after a live_start during startup cancels the connect", async () => {
+		const temp = await TempDir.create("@omp-rpc-startup-live-cancel-");
+		const child = spawnSlowStartupAgent(temp, HELD_HANDLER_MS, { OMP_LIVE_START_MS: String(LIVE_CONNECT_MS) });
+		try {
+			let readyAt = 0;
+			let probeAt = 0;
+			let recording = false;
+			const answers = new Map<string, Record<string, unknown>>();
+			const answered = Promise.withResolvers<void>();
+			void (async () => {
+				for await (const frame of readJsonl<unknown>(child.stdout as ReadableStream<Uint8Array>)) {
+					if (!isRecord(frame)) continue;
+					if (frame.type === "ready") {
+						readyAt = Date.now();
+						child.stdin.write(
+							`${[
+								JSON.stringify({ type: "live_start", id: "start" }),
+								JSON.stringify({ type: "live_stop", id: "stop" }),
+								JSON.stringify({ type: "get_state", id: "probe" }),
+							].join("\n")}\n`,
+						);
+						await child.stdin.flush();
+						continue;
+					}
+					// The phase the controller reaches once the microphone is open.
+					if (frame.type === "live_phase" && frame.phase === "listening") recording = true;
+					if (typeof frame.id !== "string") continue;
+					answers.set(frame.id, frame);
+					if (frame.id === "probe") probeAt = Date.now();
+					if (answers.has("start") && answers.has("stop") && answers.has("probe")) answered.resolve();
+				}
+				answered.reject(new Error("the agent closed its output before it answered every frame"));
+			})().catch((readError: unknown) => {
+				answered.reject(readError);
+			});
+			await withTimeout(
+				answered.promise,
+				HELD_HANDLER_MS + LIVE_CONNECT_MS + 30_000,
+				"the agent answered no frame before the timeout",
+			);
+
+			expect(answers.get("start")).toMatchObject({
+				success: false,
+				command: "live_start",
+				error: "The live session stopped while connecting.",
+			});
+			// Cancelled, not stopped afterwards: the host microphone never opened.
+			expect(recording).toBe(false);
+			expect(answers.get("stop")).toMatchObject({ success: true, command: "live_stop" });
+			// The stop takes no place in the serial queue, so the probe behind it is answered while
+			// startup still runs rather than behind the connect the stop cancels.
+			expect(probeAt - readyAt).toBeLessThan(ANSWER_BUDGET_MS);
+		} finally {
+			child.kill();
+			await child.exited;
+			await temp.remove();
+		}
+	}, 120_000);
+
+	/**
+	 * Stdin closing behind a `live_start` read during startup must leave no live session running:
+	 * the EOF path stops the bridge, and a start that resumes later would open the microphone after
+	 * the client is gone. The `compact` ahead of the pair is what made the difference: with
+	 * `live_stop` on the serial queue the start ran behind it, so it reached the bridge only after
+	 * the EOF stop had already run.
+	 */
+	test("a live_start read during startup leaves no live session running when stdin closes", async () => {
+		const temp = await TempDir.create("@omp-rpc-startup-live-eof-");
+		const child = spawnSlowStartupAgent(temp, HELD_HANDLER_MS, { OMP_LIVE_START_MS: String(LIVE_CONNECT_MS) });
+		try {
+			let recording = false;
+			const answers = new Map<string, Record<string, unknown>>();
+			const outputEnded = Promise.withResolvers<void>();
+			void (async () => {
+				for await (const frame of readJsonl<unknown>(child.stdout as ReadableStream<Uint8Array>)) {
+					if (!isRecord(frame)) continue;
+					if (frame.type === "ready") {
+						child.stdin.write(
+							`${[
+								JSON.stringify({ type: "compact", id: "compact" }),
+								JSON.stringify({ type: "live_stop", id: "stop" }),
+								JSON.stringify({ type: "live_start", id: "start" }),
+							].join("\n")}\n`,
+						);
+						await child.stdin.flush();
+						// Closed behind the three: the agent reads them during startup and runs its EOF
+						// path once startup is over.
+						child.stdin.end();
+						continue;
+					}
+					if (frame.type === "live_phase" && frame.phase === "listening") recording = true;
+					if (typeof frame.id === "string") answers.set(frame.id, frame);
+				}
+				outputEnded.resolve();
+			})().catch((readError: unknown) => {
+				outputEnded.reject(readError);
+			});
+			await withTimeout(
+				outputEnded.promise,
+				EXIT_BUDGET_MS,
+				"the agent did not close its output after stdin closed",
+			);
+			const exitCode = await withTimeout(child.exited, EXIT_BUDGET_MS, "the agent did not exit after stdin closed");
+			expect(exitCode).toBe(0);
+
+			// The EOF path stopped the bridge after the start had published its controller, so the
+			// start was cancelled while connecting and no microphone opened.
+			expect(recording).toBe(false);
+			expect(answers.get("start")).toMatchObject({
+				success: false,
+				command: "live_start",
+				error: "The live session stopped while connecting.",
+			});
 		} finally {
 			child.kill();
 			await child.exited;

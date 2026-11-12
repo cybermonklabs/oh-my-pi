@@ -21,6 +21,20 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 // from one that waited startup out. The `input` handler reports whether it saw that return, so a
 // test can tell a turn that started after the `session_start` broadcast from one that overtook it.
 const handlerMs = Number(process.env.OMP_STARTUP_HANDLER_MS ?? "8000");
+/**
+ * How long the fake live session below takes to connect, as the realtime transport's connect takes
+ * real time. The default of 0 keeps the immediate connect every row written before this switch
+ * existed measured.
+ */
+const liveStartMs = Number(process.env.OMP_LIVE_START_MS ?? "0");
+/**
+ * Whether the `session_start` handler requests a deferred shutdown before it blocks. The request is
+ * the extension's own `pi.shutdown()`, which reaches `runRpcMode` through the extension runner's
+ * `onShutdown` and sets `shutdownState.requested`; no client frame can raise it. Off by default.
+ * The handler reports the request on stderr, so a row can send its frames once the request is in
+ * place instead of racing it.
+ */
+const shutdownDuringStartup = process.env.OMP_SHUTDOWN_DURING_STARTUP === "1";
 const authStorage = await AuthStorage.create(path.join(process.cwd(), "auth.db"));
 authStorage.keys.setRuntime("anthropic", "test-key");
 const modelRegistry = new ModelRegistry(authStorage, path.join(process.cwd(), "models.yml"));
@@ -29,7 +43,11 @@ const runtime = new ExtensionRuntime();
 let sessionStartReturned = false;
 const extension = await loadExtensionFromFactory(
 	pi => {
-		pi.on("session_start", async () => {
+		pi.on("session_start", async (_event, ctx) => {
+			if (shutdownDuringStartup) {
+				ctx.shutdown();
+				process.stderr.write(`startup-shutdown-requested ${Date.now()}\n`);
+			}
 			await Bun.sleep(handlerMs);
 			process.stderr.write(`startup-handler-returned ${Date.now()}\n`);
 			sessionStartReturned = true;
@@ -75,6 +93,14 @@ class FakeLiveSession implements RpcLiveSession {
 	}
 
 	async start(): Promise<void> {
+		if (liveStartMs > 0) {
+			// What the real controller does, so a row can drive a connect that takes time: the phase
+			// goes to `connecting`, the connect runs, and a stop that arrived while it ran cancels it
+			// instead of opening the microphone (LiveSessionController#start).
+			this.options.callbacks.onPhase("connecting");
+			await Bun.sleep(liveStartMs);
+			if (this.#stopped) throw new Error("The live session stopped while connecting.");
+		}
 		this.options.callbacks.onPhase("listening");
 	}
 

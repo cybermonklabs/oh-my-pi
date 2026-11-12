@@ -427,7 +427,9 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
  * (`prompt` and `steer_subagent` are also backgrounded there, but start through
  * the serial tail.) `btw_cancel` is synchronous and must overtake a `btw` still
  * starting or a long serial command; `abort_branch_summary` likewise overtakes
- * the `navigate_tree` whose summary it stops.
+ * the `navigate_tree` whose summary it stops. All four live types are here, so
+ * each reaches `handleCommand` as it is read and the four start their startup
+ * wait in read order (see {@link waitsForStartup}).
  * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
  */
 const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
@@ -435,6 +437,8 @@ const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
 	"predict_word",
 	"live_start",
 	"live_connect",
+	"live_stop",
+	"live_mute",
 	"btw_cancel",
 	"abort_branch_summary",
 ]);
@@ -454,13 +458,16 @@ const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
  * while a `prompt` or `steer_subagent` is still admitting. `predict_word` is
  * backgrounded too, so a cold prediction engine never stalls the command queue
  * behind a keystroke. `live_start`, `live_connect` and `dictation_start` respond only once
- * connected or recording, so they are backgrounded and their stop commands can cancel them.
+ * connected or recording, so they are backgrounded; `live_stop` and `live_mute` are backgrounded
+ * with them so each of the four reaches `handleCommand` as it is read, which is what keeps them in
+ * read order, and so a stop never waits behind the connect it cancels or behind an unrelated
+ * serial command.
  * Response correlation is preserved via each command's `id`; ordering across
  * concurrent commands is not guaranteed and clients MUST match on `id`.
  *
  * @returns `undefined` when the frame was routed to a side-channel handler
  *   (extension UI response, host tool/URI frames) or dispatched in the
- *   background (`bash`, `predict_word`, `live_start`, `live_connect`, `dictation_start`, `prompt`, `steer`, `follow_up`, `steer_subagent`). Otherwise a promise that
+ *   background (`bash`, `predict_word`, the four `live_*` commands, `dictation_start`, `prompt`, `steer`, `follow_up`, `steer_subagent`). Otherwise a promise that
  *   resolves once the response for the command has been emitted via `output`.
  *   Errors from `handleCommand` on a command dispatched inline propagate; the
  *   caller is expected to wrap them.
@@ -524,9 +531,9 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
 };
 
 /**
- * The live-session types. All four wait for startup, and {@link runRpcMode} keeps the ones read
- * while startup ran in read order. A Set, not a Record: `type` is untrusted input and must not hit
- * prototype keys.
+ * The live-session types. All four wait for startup, and all four are {@link BACKGROUND_COMMANDS},
+ * which is what keeps the ones read while startup ran in read order (see {@link waitsForStartup}).
+ * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
  */
 const LIVE_STARTUP_TYPES: ReadonlySet<string> = new Set<string>([
 	"live_start",
@@ -578,16 +585,14 @@ const ABORT_WITHDRAWN_HELD_TYPES: ReadonlySet<string> = new Set<string>([
  * All four live types wait, not only the two that open a session. `live_start` and `live_connect`
  * open a live session whose first delegation sends a main-session message with `triggerTurn`
  * (LiveSessionController#handleDelegation). `live_stop` and `live_mute` wait so that the four keep
- * their arrival order — but the hold alone does not order them: `live_start` and `live_connect` are
- * {@link BACKGROUND_COMMANDS} and reach `handleCommand` as they are read, while `live_stop` and
- * `live_mute` reach it only at the head of the dispatcher's serial tail, so with any serial frame
- * ahead of them a wait on the one `startupSettled` promise starts out of arrival order. What keeps
- * the order is the chain {@link runRpcMode} builds where each live frame is read: a live frame read
- * during startup resumes behind the live frame read before it, and the first of them behind
- * `startupSettled`. `RpcLiveBridge.start` publishes its controller before its first await, so a
- * `live_stop` held behind a `live_start` finds that controller. Run during startup instead, a
- * `live_stop` finds no controller, does nothing and reports success, and the held `live_start` then
- * opens the host microphone after the host asked it to stop.
+ * their arrival order, and the hold orders them because all four are {@link BACKGROUND_COMMANDS}:
+ * each reaches `handleCommand` as it is read and starts its wait on the one `startupSettled`
+ * promise there, and promise reactions run in registration order, so the four resume in read
+ * order. `RpcLiveBridge.start` publishes its controller before its first await, so a `live_stop`
+ * that resumes after a `live_start` finds that controller while it is still connecting and cancels
+ * it. Answered during startup instead, a `live_stop` finds no controller, does nothing and reports
+ * success, and the held `live_start` then opens the host microphone after the host asked it to
+ * stop.
  *
  * `goal` with op `get` only reads the goal, so it is answered during startup like any other read —
  * and it must be, since it is dispatched on the serial tail and would block every frame behind it.
@@ -2905,21 +2910,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	};
 
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
-		const liveTurn = liveStartupOrder.get(command);
-		if (liveTurn) {
-			// A live frame read while startup ran resumes behind the live frame read before it, never
-			// from `startupSettled` itself: `live_start` and `live_connect` reach this point as they
-			// are read while `live_stop` and `live_mute` reach it only at the head of the serial tail,
-			// so a shared wait would resume them out of arrival order. The first link of the chain is
-			// `startupSettled`, so all four still wait for startup. `finally`: a handler that throws
-			// must not strand the live frames chained behind it.
-			try {
-				await liveTurn.predecessor;
-				return await runCommand(command);
-			} finally {
-				liveTurn.resolve();
-			}
-		}
 		if (waitsForStartup(command)) {
 			await startupSettled.promise;
 			// The set is the test, not the promise: `startupSettled` stays resolved for the life of the
@@ -2977,12 +2967,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// The frames read while startup ran, which is exactly what `handleCommand`'s abort withdrawal
 	// covers. Weak: a frame is a one-shot object and nothing here may keep it alive.
 	const framesReadDuringStartup = new WeakSet<object>();
-	// The live frames read while startup ran, chained in read order: each entry holds the promise of
-	// the frame read before it and the resolver the frame read after it waits on. Built where the
-	// frame is read, not where its handler runs, because the four live types do not reach
-	// `handleCommand` in arrival order (see {@link waitsForStartup}).
-	const liveStartupOrder = new WeakMap<object, { predecessor: Promise<void>; resolve: () => void }>();
-	let liveStartupTail: Promise<void> = startupSettled.promise;
 
 	// Side-channel frames dispatch immediately, ordinary commands serialize through inputDispatcher, and bash
 	// remains background-dispatched so abort_bash can overtake it.
@@ -2995,11 +2979,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// collection, and `handleCommandImpl` answers it as an unknown command anyway.
 			if (startupComplete || !isRecord(command)) return;
 			framesReadDuringStartup.add(command);
-			if (!LIVE_STARTUP_TYPES.has(command.type)) return;
-			const predecessor = liveStartupTail;
-			const { promise, resolve } = Promise.withResolvers<void>();
-			liveStartupTail = promise;
-			liveStartupOrder.set(command, { predecessor, resolve });
 		},
 	});
 
