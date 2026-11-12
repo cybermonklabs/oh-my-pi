@@ -544,32 +544,39 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
 };
 
 /**
- * Types that always wait for startup, besides the `goal` ops {@link waitsForStartup} adds. A Set,
- * not a Record: `type` is untrusted input and must not hit prototype keys.
- */
-const STARTUP_HELD_TYPES: ReadonlySet<string> = new Set<string>([
-	...Object.keys(USER_INPUT_TYPES),
-	...Object.keys(SESSION_CHANGE_TYPES),
-	"compact",
-	"navigate_tree",
-	"handoff",
-	...LIVE_STARTUP_TYPES,
-]);
-
-/**
  * Held types an `abort` accepted while they waited withdraws: answered as cancelled instead of run.
  * Only the types whose success answer already carries the `cancelled` flag their hosts read today,
  * so the withdrawal invents no answer shape. `branch` is left out because its answer also carries
  * the selected `text`, and `open_session` because its answer also carries `resumed` and `sessionId`;
  * neither can be satisfied by `{ cancelled: true }` alone. They, and the held types with no
  * cancelled answer at all (`compact`, `goal`, `handoff` and the four live types), run when startup
- * ends whether or not an abort followed them. A Set, not a Record, for the reason above.
+ * ends whether or not an abort followed them. {@link STARTUP_HELD_TYPES} and {@link NUMBERED_TYPES}
+ * both spread this one, so a withdrawn type can lose neither the hold the withdrawal runs inside
+ * nor the number `isCurrent` reads against it. A Set, not a Record: `type` is untrusted input and
+ * must not hit prototype keys.
  */
-const ABORT_WITHDRAWN_HELD_TYPES: ReadonlySet<string> = new Set<string>([
+const ABORT_WITHDRAWN_HELD_TYPES: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
 	"new_session",
 	"switch_session",
 	"fork",
 	"navigate_tree",
+]);
+
+/**
+ * Types that always wait for startup, besides the `goal` ops {@link waitsForStartup} adds. The four
+ * {@link ABORT_WITHDRAWN_HELD_TYPES} are spread in, so the withdrawal set cannot outgrow this one:
+ * the withdrawal runs inside {@link waitsForStartup}, so a withdrawn type this set did not hold
+ * would never wait, and so would never be withdrawn. Three of the four reach this set through
+ * {@link SESSION_CHANGE_TYPES} as well, which is why the spread adds `navigate_tree` alone.
+ * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
+ */
+const STARTUP_HELD_TYPES: ReadonlySet<string> = new Set<RpcCommand["type"]>([
+	...(Object.keys(USER_INPUT_TYPES) as RpcCommand["type"][]),
+	...(Object.keys(SESSION_CHANGE_TYPES) as RpcCommand["type"][]),
+	"compact",
+	...ABORT_WITHDRAWN_HELD_TYPES,
+	"handoff",
+	...LIVE_STARTUP_TYPES,
 ]);
 
 /**
