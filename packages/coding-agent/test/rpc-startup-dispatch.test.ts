@@ -139,17 +139,23 @@ describe("RPC startup input dispatch", () => {
 	}, 120_000);
 
 	/**
-	 * Send `get_state` and one held frame right after the ready frame of an agent of this type's own,
+	 * Send `get_state` and one held frame right after the ready frame of an agent of this row's own,
 	 * and report when each was answered against the time the startup handler reported its return.
-	 * With `after`, one more frame is sent once the held frame has been answered — so after startup —
-	 * and its response is returned, which is how a row proves what the held frame left behind.
+	 * `alongside` frames go out with the held frame, so they too are read while startup runs: that is
+	 * how a row shows what a second frame sent during startup does to the held one. With `after`, one
+	 * more frame is sent once the held frame has been answered — so after startup — and its response
+	 * is returned, which is how a row proves what the held frame left behind.
 	 *
-	 * One agent per held type, not one agent sent every held frame: `RpcInputDispatcher` runs every
+	 * One agent per row, not one agent sent every held frame: `RpcInputDispatcher` runs every
 	 * non-background command on a single serial tail, so a second held frame is dequeued only once the
 	 * first has waited startup out, and its answer would land after the handler returned whether or
 	 * not its own type is held. Only the frame at the head of the tail measures the hold.
 	 */
-	const measureHeldFrame = async (held: Record<string, unknown>, after?: Record<string, unknown>) => {
+	const measureHeldFrame = async (
+		held: Record<string, unknown>,
+		options: { alongside?: Record<string, unknown>[]; after?: Record<string, unknown> } = {},
+	) => {
+		const { alongside, after } = options;
 		const temp = await TempDir.create("@omp-rpc-startup-held-");
 		const child = spawnSlowStartupAgent(temp, HELD_HANDLER_MS);
 		try {
@@ -172,6 +178,8 @@ describe("RPC startup input dispatch", () => {
 			let readyAt = 0;
 			let stateAt = 0;
 			let heldAt = 0;
+			let stateAnswer: Record<string, unknown> | undefined;
+			let heldAnswer: Record<string, unknown> | undefined;
 			let afterAnswer: Record<string, unknown> | undefined;
 			const answered = Promise.withResolvers<void>();
 			void (async () => {
@@ -180,17 +188,25 @@ describe("RPC startup input dispatch", () => {
 					if (frame.type === "ready") {
 						readyAt = Date.now();
 						// The held frame waits: the hold reads the command type, because each held type
-						// starts a turn, changes the session or changes the goal state
-						// `goalController.reconcile()` is still settling during startup. `get_state` changes
+						// starts a turn, changes the session, changes the goal state
+						// `goalController.reconcile()` is still settling during startup, or belongs to a
+						// live session whose frames must keep their arrival order. `get_state` changes
 						// nothing and is answered at once.
 						child.stdin.write(`${JSON.stringify({ type: "get_state", id: "state" })}\n`);
 						child.stdin.write(`${JSON.stringify({ ...held, id: "held" })}\n`);
+						for (const [index, extra] of (alongside ?? []).entries()) {
+							child.stdin.write(`${JSON.stringify({ ...extra, id: `alongside-${index}` })}\n`);
+						}
 						await child.stdin.flush();
 						continue;
 					}
-					if (frame.id === "state") stateAt = Date.now();
+					if (frame.id === "state") {
+						stateAt = Date.now();
+						stateAnswer = frame;
+					}
 					if (frame.id === "held") {
 						heldAt = Date.now();
+						heldAnswer = frame;
 						// Sent only now: the held frame's answer means startup is over, so this reads what
 						// the held frame left behind instead of racing it.
 						if (after) {
@@ -221,6 +237,8 @@ describe("RPC startup input dispatch", () => {
 				type: held.type,
 				msFromReadyToState: stateAt - readyAt,
 				msFromStartupReturnToHeld: heldAt - returned!.at,
+				state: stateAnswer,
+				held: heldAnswer,
 				after: afterAnswer,
 			};
 		} finally {
@@ -230,28 +248,33 @@ describe("RPC startup input dispatch", () => {
 		}
 	};
 
-	// Five agents, each waiting out one `HELD_HANDLER_MS` startup.
+	// Nine agents, each waiting out one `HELD_HANDLER_MS` startup.
 	test("every command the startup hold covers waits for startup, and a get_state sent with it does not", async () => {
 		const objective = "ship the release";
-		// One frame of each held type. Dropping `compact`, `navigate_tree`, `handoff` or the `goal`
-		// ops from the hold fails this case; the `live_start` row does not separate a held type from
-		// an unheld one and is here as an observation rather than as a lock, because a live start
-		// waits for startup through its own controller as well: measured with `live_start` taken out
-		// of the hold, its answer still came 53 ms after the handler returned, the same side of the
-		// return as when it is held. Whether a frame answers with a success or with an error is
-		// neither asserted nor relevant: the hold sits in `handleCommand` before `handleCommandImpl`,
-		// so a frame waits for startup whatever its payload turns out to mean. That is why the
-		// `navigate_tree` here names an entry no session tree holds, why `compact` and `handoff` run
-		// against a session with nothing in it, and why `live_start` may answer with the machine's
-		// missing audio device.
-		// One agent at a time, in order: five slow-startup agents at once would measure the machine.
-		const goal = await measureHeldFrame({ type: "goal", op: "create", objective }, { type: "goal", op: "get" });
+		// One frame of each held type. Dropping `compact`, `navigate_tree`, `handoff`, `live_start`,
+		// `live_connect` or the `goal` ops from the hold fails this case. The live rows lock the hold
+		// exactly as the others do: with `live_start` taken out of the hold its answer came 2,424 to
+		// 2,492 ms before the handler returned, measured both against the fake controller below and
+		// against the real one. `live_connect` needs its own row because the `live_start` row does not
+		// cover it: taken alone out of the hold, every other row still passed. Whether a frame answers
+		// with a success or with an error is neither asserted nor relevant: the hold sits in
+		// `handleCommand` before `handleCommandImpl`, so a frame waits for startup whatever its
+		// payload turns out to mean. That is why the `navigate_tree` here names an entry no session
+		// tree holds, and why `compact` and `handoff` run against a session with nothing in it. The
+		// live rows drive the fixture's fake live controller, so they depend on neither the machine's
+		// audio device nor its realtime credentials.
+		// One agent at a time, in order: nine slow-startup agents at once would measure the machine.
+		const goal = await measureHeldFrame(
+			{ type: "goal", op: "create", objective },
+			{ after: { type: "goal", op: "get" } },
+		);
 		const timings = [
 			goal,
 			await measureHeldFrame({ type: "compact" }),
 			await measureHeldFrame({ type: "navigate_tree", entryId: "no-such-entry" }),
 			await measureHeldFrame({ type: "handoff" }),
 			await measureHeldFrame({ type: "live_start" }),
+			await measureHeldFrame({ type: "live_connect", sdpOffer: "v=0 held-offer" }),
 		];
 
 		// The `get_state` sent with each held frame does not wait for startup, as in the case above.
@@ -266,6 +289,36 @@ describe("RPC startup input dispatch", () => {
 		// startup reattach (`goalController.reconcile()`), so no part of startup runs over it.
 		expect(goal.after).toMatchObject({ success: true, data: { goal: { objective, status: "active" } } });
 
+		// Why `live_stop` and `live_mute` are held too: a `live_stop` sent during startup must stop
+		// the `live_start` sent before it. Both resume from the one `startupSettled` promise in
+		// arrival order, and the bridge publishes its controller before its first await, so the stop
+		// finds it. Answered during startup instead, the stop would find no controller, do nothing and
+		// report success, and the held start would then open the microphone after the host asked it to
+		// stop. `live_mute`, sent once startup is over, is how the row reads the outcome: it fails only
+		// when no live session is running.
+		const liveStopped = await measureHeldFrame(
+			{ type: "live_start" },
+			{ alongside: [{ type: "live_stop" }], after: { type: "live_mute", muted: true } },
+		);
+		expect(liveStopped.msFromStartupReturnToHeld).toBeGreaterThan(0);
+		expect(liveStopped.after).toMatchObject({ success: false, error: "No live session is active" });
+
+		// An `abort` read while a held session change waits withdraws it. Both frames are numbered as
+		// they are read, so the abort is numbered after the `new_session` even though the dispatcher
+		// runs it later, and the `isCurrent` read after the startup wait answers the change as
+		// cancelled instead of starting a session the host no longer wants.
+		const abortedChange = await measureHeldFrame(
+			{ type: "new_session" },
+			{ alongside: [{ type: "abort" }], after: { type: "get_state" } },
+		);
+		expect(abortedChange.msFromStartupReturnToHeld).toBeGreaterThan(0);
+		expect(abortedChange.held).toMatchObject({ success: true, command: "new_session", data: { cancelled: true } });
+		// Withdrawn means not run: the session the host had when it sent the change is still open.
+		const stateData = abortedChange.state?.data;
+		const sessionBefore = isRecord(stateData) ? stateData.sessionId : undefined;
+		expect(typeof sessionBefore).toBe("string");
+		expect(abortedChange.after).toMatchObject({ success: true, data: { sessionId: sessionBefore } });
+
 		// The other side of the same rule, which no row above can show: `goal` with op `get` only
 		// reads, so it is answered while startup runs. Hold it and this assertion fails — and a held
 		// `goal get` would block every frame the dispatcher serializes behind it for the whole of
@@ -273,5 +326,5 @@ describe("RPC startup input dispatch", () => {
 		const goalGet = await measureHeldFrame({ type: "goal", op: "get" });
 		expect(goalGet.msFromStartupReturnToHeld).toBeLessThan(0);
 		expect(goalGet.msFromReadyToState).toBeLessThan(ANSWER_BUDGET_MS);
-	}, 240_000);
+	}, 300_000);
 });

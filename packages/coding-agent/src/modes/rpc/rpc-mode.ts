@@ -535,6 +535,24 @@ const STARTUP_HELD_TYPES: ReadonlySet<string> = new Set<string>([
 	"handoff",
 	"live_start",
 	"live_connect",
+	"live_stop",
+	"live_mute",
+]);
+
+/**
+ * Held types an `abort` accepted while they waited withdraws: answered as cancelled instead of run.
+ * Only the types whose success answer already carries the `cancelled` flag their hosts read today,
+ * so the withdrawal invents no answer shape. `branch` is left out because its answer also carries
+ * the selected `text`, and `open_session` because its answer also carries `resumed` and `sessionId`;
+ * neither can be satisfied by `{ cancelled: true }` alone. They, and the held types with no
+ * cancelled answer at all (`compact`, `goal`, `handoff` and the four live types), run when startup
+ * ends whether or not an abort followed them. A Set, not a Record, for the reason above.
+ */
+const ABORT_WITHDRAWN_HELD_TYPES: ReadonlySet<string> = new Set<string>([
+	"new_session",
+	"switch_session",
+	"fork",
+	"navigate_tree",
 ]);
 
 /**
@@ -545,9 +563,17 @@ const STARTUP_HELD_TYPES: ReadonlySet<string> = new Set<string>([
  * would otherwise run ahead of the `session_start` broadcast, and `reconcile` swaps the active tool
  * set under a turn already running. The rest wait for the same reason: `goal` creates, resumes,
  * pauses and clears the goal state `reconcile` is still settling, `compact` rewrites the message set
- * with a model call, `navigate_tree` opens with a session change, `handoff` tears the session down
- * and writes a new one, and `live_start`/`live_connect` open a live session whose first delegation
- * sends a main-session message with `triggerTurn` (LiveSessionController#handleDelegation).
+ * with a model call, `navigate_tree` opens with a session change, and `handoff` tears the session
+ * down and writes a new one.
+ *
+ * All four live types wait, not only the two that open a session. `live_start` and `live_connect`
+ * open a live session whose first delegation sends a main-session message with `triggerTurn`
+ * (LiveSessionController#handleDelegation). `live_stop` and `live_mute` wait so that the four keep
+ * their arrival order: held frames resume from the one `startupSettled` promise in the order they
+ * arrived, and `RpcLiveBridge.start` publishes its controller before its first await, so a
+ * `live_stop` held behind a `live_start` finds that controller. Run during startup instead, a
+ * `live_stop` finds no controller, does nothing and reports success, and the held `live_start` then
+ * opens the host microphone after the host asked it to stop.
  *
  * `goal` with op `get` only reads the goal, so it is answered during startup like any other read —
  * and it must be, since it is dispatched on the serial tail and would block every frame behind it.
@@ -561,9 +587,9 @@ function waitsForStartup(command: RpcCommand): boolean {
 /**
  * Orders user input and decides whether an accepted frame is still wanted.
  *
- * Every user-input, abort and session-change frame gets a sequence number when it
- * is accepted (read from stdin), not when its handler runs. An abort invalidates
- * input accepted before it immediately. A session change invalidates input accepted
+ * Every user-input, abort, session-change and `navigate_tree` frame gets a sequence
+ * number when it is accepted (read from stdin), not when its handler runs. An abort
+ * invalidates input accepted before it immediately. A session change invalidates input accepted
  * before the change frame, and only once the change succeeds: a vetoed change keeps
  * that input, and input pipelined after the change still runs in the new session.
  */
@@ -580,7 +606,10 @@ export class RpcUserInputGate {
 		if (
 			!isAbort &&
 			!Object.hasOwn(USER_INPUT_TYPES, command.type) &&
-			!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)
+			!Object.hasOwn(SESSION_CHANGE_TYPES, command.type) &&
+			// Numbered for the startup withdrawal in `handleCommand`: it moves the session's leaf
+			// without being one of the session-change commands.
+			command.type !== "navigate_tree"
 		) {
 			return;
 		}
@@ -2857,7 +2886,17 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	};
 
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
-		if (waitsForStartup(command)) await startupSettled.promise;
+		if (waitsForStartup(command)) {
+			await startupSettled.promise;
+			// `inputGate.accept` numbered this frame when it was read, so an `abort` read while it
+			// waited is numbered after it and `isCurrent` is false here: the host withdrew the frame
+			// before it ran. Read only here, never generally: a general read would also withdraw
+			// frames that arrived before a session change that succeeded outside startup, which is a
+			// protocol change this does not make.
+			if (ABORT_WITHDRAWN_HELD_TYPES.has(command.type) && !inputGate.isCurrent(command)) {
+				return success(command.id, command.type, { cancelled: true });
+			}
+		}
 		if (!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)) return handleCommandImpl(command);
 		return withSessionChange(() => handleCommandImpl(command));
 	};

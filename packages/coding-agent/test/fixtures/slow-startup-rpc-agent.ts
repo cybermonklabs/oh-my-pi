@@ -6,6 +6,8 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import type { LiveSessionControllerOptions } from "@oh-my-pi/pi-coding-agent/live/controller";
+import type { RpcLiveSession } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-live";
 import { runRpcMode } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -58,4 +60,36 @@ const session = new AgentSession({
 	modelRegistry,
 	extensionRunner,
 });
-await runRpcMode(session);
+
+/**
+ * The live controller the `live_*` rows drive, as in `live-rpc-agent.ts`: a live row must depend on
+ * neither the machine's audio device nor its realtime credentials.
+ */
+class FakeLiveSession implements RpcLiveSession {
+	muted = false;
+	#stopped: Promise<void> | undefined;
+	constructor(readonly options: LiveSessionControllerOptions) {}
+
+	get sdpAnswer(): string | undefined {
+		return this.options.sdpOffer === undefined ? undefined : `answer to ${this.options.sdpOffer}`;
+	}
+
+	async start(): Promise<void> {
+		this.options.callbacks.onPhase("listening");
+	}
+
+	toggleMute(): void {
+		this.muted = !this.muted;
+	}
+
+	stop(): Promise<void> {
+		// `onTerminal` retires the bridge, which stops the controller again: stop once, as the sibling
+		// fixture does.
+		this.#stopped ??= (async () => {
+			this.options.callbacks.onTerminal();
+		})();
+		return this.#stopped;
+	}
+}
+
+await runRpcMode(session, { createLiveSession: options => new FakeLiveSession(options) });

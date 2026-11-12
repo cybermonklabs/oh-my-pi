@@ -14,6 +14,7 @@
 ### Fixed
 
 - In RPC mode a command sent after the `ready` frame is answered while startup still runs instead of after it finishes; a frame that starts a turn, changes the session or changes goal state still waits for startup
+- In RPC mode an `abort` sent while a `new_session`, `switch_session`, `fork` or `navigate_tree` waits for startup now withdraws it: the frame answers `cancelled` instead of changing the session once startup finishes
 - Long bash output cut in the middle no longer splits a line at the `[…N ln elided…]` marker, and its "Showing lines …" notice now names the lines actually shown, ending at the output's real last line ([#17957](https://github.com/can1357/oh-my-pi/pull/17957) by [@H4vC](https://github.com/H4vC))
 - A bash command that prints nothing and succeeds now returns `(no output, exit code 0)` instead of a bare `(no output)`, so an empty diff or search no longer reads like a failed command ([#17957](https://github.com/can1357/oh-my-pi/pull/17957) by [@H4vC](https://github.com/H4vC))
 - Added `tui.motion` (`full` / `reduced` / `none`, also `--motion` and `PI_MOTION`), one switch over spinners, the thinking pulse, shimmer and the status-line blink/fade for many-pane or reduced-motion use; a `tui.spinnerInterval` you set still wins over the preset ([#14240](https://github.com/can1357/oh-my-pi/pull/14240) by [@mccraigmccraig](https://github.com/mccraigmccraig))
