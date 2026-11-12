@@ -792,11 +792,7 @@ describe("RPC startup input dispatch", () => {
 	 * startup, where the serial tail is free and the mute reaches the connect either way. It reads a
 	 * race the live family had no row for, and what it locks is the bridge publishing its controller
 	 * before its first await; the background move is locked by the shutdown case, the
-	 * stop-during-connect case and the order row of the held-types case. Those three redden on the
-	 * coupled loss too: `BACKGROUND_COMMANDS` and `STARTUP_HELD_TYPES` both spread
-	 * `LIVE_STARTUP_TYPES`, so deleting a live type there takes it out of the background dispatch
-	 * and out of the startup hold at once, and each of the three fails on that pair of losses as it
-	 * does on the background move alone.
+	 * stop-during-connect case and the order row of the held-types case.
 	 */
 	test("a live_mute read while a live_start connects mutes the session that comes up", async () => {
 		let muteSawStart = true;
@@ -837,11 +833,7 @@ describe("RPC startup input dispatch", () => {
 	 * background dispatch of `live_stop` and `live_mute`: with those two taken out of
 	 * `BACKGROUND_COMMANDS` it still passes, because the held `live_start` resumes before the EOF
 	 * path that follows `await inputRead`. The background move is locked by the shutdown case, the
-	 * stop-during-connect case and the order row of the held-types case. Those three redden on the
-	 * coupled loss too: `BACKGROUND_COMMANDS` and `STARTUP_HELD_TYPES` both spread
-	 * `LIVE_STARTUP_TYPES`, so deleting a live type there takes it out of the background dispatch
-	 * and out of the startup hold at once, and each of the three fails on that pair of losses as it
-	 * does on the background move alone.
+	 * stop-during-connect case and the order row of the held-types case.
 	 */
 	test("a live_start read during startup leaves no live session running when stdin closes", async () => {
 		const temp = await TempDir.create("@omp-rpc-startup-live-eof-");
