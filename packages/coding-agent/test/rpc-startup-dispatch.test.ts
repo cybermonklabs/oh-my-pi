@@ -392,11 +392,11 @@ describe("RPC startup input dispatch", () => {
 
 		// `live_mute` is held for the same ordering reason, and its loss is louder than the stop's:
 		// answered during startup it finds no controller and fails, so the live session the host asked
-		// to be muted starts with the microphone open. Measured with `live_mute` out of the hold, the
-		// mute was answered 13 ms after the ready frame with "No live session is active" while the
-		// `live_start` behind it still ran 4 s later. Held, the mute applies to the session the start
-		// opened, so the toggle this row sends once startup is over turns it off again; unheld, the
-		// same toggle turns it on.
+		// to be muted starts with the microphone open. Measured with `live_mute` out of the hold by the
+		// tester at `d731a4f9`, in a scratch worktree of its own: the mute was answered 13 ms after the
+		// ready frame with "No live session is active" while the `live_start` behind it still ran 4 s
+		// later. Held, the mute applies to the session the start opened, so the toggle this row sends
+		// once startup is over turns it off again; unheld, the same toggle turns it on.
 		const liveMuted = await measureHeldFrame(
 			{ type: "live_start" },
 			{ alongside: [{ type: "live_mute", muted: true }], after: { type: "live_mute" } },
@@ -788,9 +788,10 @@ describe("RPC startup input dispatch", () => {
 	 *
 	 * What this row does not guard: no single removal of this change reddens it. Deleting `live_mute`
 	 * from `LIVE_STARTUP_TYPES`, which takes it out of the startup hold and out of
-	 * `BACKGROUND_COMMANDS` at once, leaves this row green — measured — because the row runs after
-	 * startup, where the serial tail is free and the mute reaches the connect either way. It reads a
-	 * race the live family had no row for, and what it locks is the bridge publishing its controller
+	 * `BACKGROUND_COMMANDS` at once, leaves this row green, measured at `00c37bff` in a scratch
+	 * workspace of the implementer's own, because the row runs after startup, where the serial tail
+	 * is free and the mute reaches the connect either way. It reads a race the live family had no row
+	 * for, and what it locks is the bridge publishing its controller
 	 * before its first await; the background move is locked by the shutdown case, the
 	 * stop-during-connect case and the order row of the held-types case.
 	 */

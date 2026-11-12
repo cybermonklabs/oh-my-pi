@@ -565,8 +565,9 @@ const ABORT_WITHDRAWN_HELD_TYPES: ReadonlySet<RpcCommand["type"]> = new Set<RpcC
 /**
  * Types that always wait for startup, besides the `goal` ops {@link waitsForStartup} adds. The four
  * {@link ABORT_WITHDRAWN_HELD_TYPES} are spread in, so the withdrawal set cannot outgrow this one:
- * the withdrawal runs inside {@link waitsForStartup}, so a withdrawn type this set did not hold
- * would never wait, and so would never be withdrawn. Three of the four reach this set through
+ * `handleCommand` withdraws a frame only inside the branch it enters when {@link waitsForStartup}
+ * answers true, so a withdrawn type this set did not hold would never wait, and so would never be
+ * withdrawn. Three of the four reach this set through
  * {@link SESSION_CHANGE_TYPES} as well, which is why the spread adds `navigate_tree` alone.
  * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
  */
