@@ -143,8 +143,10 @@ describe("RPC startup input dispatch", () => {
 	 * and report when each was answered against the time the startup handler reported its return.
 	 * `alongside` frames go out with the held frame, so they too are read while startup runs: that is
 	 * how a row shows what a second frame sent during startup does to the held one. With `after`, one
-	 * more frame is sent once the held frame has been answered — so after startup — and its response
-	 * is returned, which is how a row proves what the held frame left behind.
+	 * more frame is sent once the frame named by `afterFollows` (the held frame by default) has been
+	 * answered — so after startup — and its response is returned, which is how a row proves what the
+	 * frames sent during startup left behind. A row whose outcome is settled by an `alongside` frame
+	 * rather than by the held one names that frame's id, so the probe cannot race it.
 	 *
 	 * One agent per row, not one agent sent every held frame: `RpcInputDispatcher` runs every
 	 * non-background command on a single serial tail, so a second held frame is dequeued only once the
@@ -153,9 +155,13 @@ describe("RPC startup input dispatch", () => {
 	 */
 	const measureHeldFrame = async (
 		held: Record<string, unknown>,
-		options: { alongside?: Record<string, unknown>[]; after?: Record<string, unknown> } = {},
+		options: {
+			alongside?: Record<string, unknown>[];
+			after?: Record<string, unknown>;
+			afterFollows?: string;
+		} = {},
 	) => {
-		const { alongside, after } = options;
+		const { alongside, after, afterFollows = "held" } = options;
 		const temp = await TempDir.create("@omp-rpc-startup-held-");
 		const child = spawnSlowStartupAgent(temp, HELD_HANDLER_MS);
 		try {
@@ -181,6 +187,7 @@ describe("RPC startup input dispatch", () => {
 			let stateAnswer: Record<string, unknown> | undefined;
 			let heldAnswer: Record<string, unknown> | undefined;
 			let afterAnswer: Record<string, unknown> | undefined;
+			let afterSent = false;
 			const answered = Promise.withResolvers<void>();
 			void (async () => {
 				for await (const frame of readJsonl<unknown>(child.stdout as ReadableStream<Uint8Array>)) {
@@ -207,12 +214,13 @@ describe("RPC startup input dispatch", () => {
 					if (frame.id === "held") {
 						heldAt = Date.now();
 						heldAnswer = frame;
-						// Sent only now: the held frame's answer means startup is over, so this reads what
-						// the held frame left behind instead of racing it.
-						if (after) {
-							child.stdin.write(`${JSON.stringify({ ...after, id: "after" })}\n`);
-							await child.stdin.flush();
-						}
+					}
+					// Sent only now: the answer it follows means startup is over, so this reads what the
+					// frames sent during startup left behind instead of racing them.
+					if (after && !afterSent && frame.id === afterFollows) {
+						afterSent = true;
+						child.stdin.write(`${JSON.stringify({ ...after, id: "after" })}\n`);
+						await child.stdin.flush();
 					}
 					if (frame.id === "after") afterAnswer = frame;
 					if (stateAt > 0 && heldAt > 0 && (!after || afterAnswer)) answered.resolve();
@@ -248,7 +256,7 @@ describe("RPC startup input dispatch", () => {
 		}
 	};
 
-	// Seventeen agents, each waiting out one `HELD_HANDLER_MS` startup.
+	// Eighteen agents, each waiting out one `HELD_HANDLER_MS` startup.
 	test("every command the startup hold covers waits for startup, and a get_state sent with it does not", async () => {
 		const objective = "ship the release";
 		// One frame of each held type. Every member of the hold now has a row that fails when that
@@ -265,7 +273,7 @@ describe("RPC startup input dispatch", () => {
 		// row reads its own answer only where the comment above it says what that answer shows. The
 		// live rows drive the fixture's fake live controller, so they depend on neither the
 		// machine's audio device nor its realtime credentials.
-		// One agent at a time, in order: seventeen slow-startup agents at once would measure the
+		// One agent at a time, in order: eighteen slow-startup agents at once would measure the
 		// machine.
 		const goal = await measureHeldFrame(
 			{ type: "goal", op: "create", objective },
@@ -308,12 +316,12 @@ describe("RPC startup input dispatch", () => {
 		expect(goal.after).toMatchObject({ success: true, data: { goal: { objective, status: "active" } } });
 
 		// Why `live_stop` and `live_mute` are held too: a `live_stop` sent during startup must stop
-		// the `live_start` sent before it. Both resume from the one `startupSettled` promise in
-		// arrival order, and the bridge publishes its controller before its first await, so the stop
-		// finds it. Answered during startup instead, the stop would find no controller, do nothing and
-		// report success, and the held start would then open the microphone after the host asked it to
-		// stop. `live_mute`, sent once startup is over, is how the row reads the outcome: it fails only
-		// when no live session is running.
+		// the `live_start` sent before it. The hold puts both after startup, the chain the live frames
+		// are read into resumes them in the order the host sent them, and the bridge publishes its
+		// controller before its first await, so the stop finds it. Answered during startup instead,
+		// the stop would find no controller, do nothing and report success, and the held start would
+		// then open the microphone after the host asked it to stop. `live_mute`, sent once startup is
+		// over, is how the row reads the outcome: it fails only when no live session is running.
 		const liveStopped = await measureHeldFrame(
 			{ type: "live_start" },
 			{ alongside: [{ type: "live_stop" }], after: { type: "live_mute", muted: true } },
@@ -334,6 +342,27 @@ describe("RPC startup input dispatch", () => {
 		);
 		expect(liveMuted.msFromStartupReturnToHeld).toBeGreaterThan(0);
 		expect(liveMuted.after).toMatchObject({ success: true, data: { muted: false } });
+
+		// The hold alone does not keep the four live frames in arrival order, which is what the chain
+		// built as they are read is for. `live_start` and `live_connect` are background commands and
+		// start their startup wait as they are read; `live_stop` and `live_mute` start theirs only at
+		// the head of the serial tail. With the held `compact` ahead of the pair the stop reaches that
+		// head only after startup, by which time the backgrounded start has resumed — so without the
+		// chain the stop is applied to the session the start opened, and the host's last request is
+		// undone. The probe is sent once the start has been answered and runs behind the stop on the
+		// serial tail either way, so it reports which request survived: a mute means the `live_start`
+		// the host sent last is the request that is honoured and its session is running, while "No
+		// live session is active" means the stop was applied after it.
+		const liveStartedAfterStop = await measureHeldFrame(
+			{ type: "compact" },
+			{
+				alongside: [{ type: "live_stop" }, { type: "live_start" }],
+				after: { type: "live_mute", muted: true },
+				afterFollows: "alongside-1",
+			},
+		);
+		expect(liveStartedAfterStop.msFromStartupReturnToHeld).toBeGreaterThan(0);
+		expect(liveStartedAfterStop.after).toMatchObject({ success: true, data: { muted: true } });
 
 		// An `abort` read while a held session change waits withdraws it. Both frames are numbered as
 		// they are read, so the abort is numbered after the `new_session` even though the dispatcher
@@ -358,7 +387,93 @@ describe("RPC startup input dispatch", () => {
 		const goalGet = await measureHeldFrame({ type: "goal", op: "get" });
 		expect(goalGet.msFromStartupReturnToHeld).toBeLessThan(0);
 		expect(goalGet.msFromReadyToState).toBeLessThan(ANSWER_BUDGET_MS);
-		// Seventeen agents of 2.5 s each run this case in about 95 s on an idle machine; the budget
+		// Eighteen agents of 2.5 s each run this case in about 106 s on an idle machine; the budget
 		// keeps four times that, so a loaded runner does not turn a slow machine into a failure.
 	}, 420_000);
+
+	/**
+	 * The withdrawal covers the frames startup held and nothing sent after them. This case needs
+	 * frames the agent reads once startup is over, which `measureHeldFrame` cannot send — every frame
+	 * it sends goes out during startup, and its one `after` frame is answered on its own — so this
+	 * case drives an agent of its own.
+	 *
+	 * The `export_html` ahead of the pair is what makes the frames behind it arrive the way a held
+	 * frame's do: it loads the export module and writes a file, so it is still running when the agent
+	 * reads the `new_session` and the `abort` sent with it, and the abort is numbered after the change
+	 * the dispatcher has not started yet. Read during startup, that pair is answered `cancelled`; read
+	 * after it, the change must run, and a withdrawal that reads `startupSettled` instead of the
+	 * frames startup held cancels it forever.
+	 */
+	test("an abort read after startup does not withdraw a session change read after startup", async () => {
+		const temp = await TempDir.create("@omp-rpc-startup-after-");
+		const child = spawnSlowStartupAgent(temp, HELD_HANDLER_MS);
+		try {
+			const answers = new Map<string, Record<string, unknown>>();
+			const answered = Promise.withResolvers<void>();
+			void (async () => {
+				for await (const frame of readJsonl<unknown>(child.stdout as ReadableStream<Uint8Array>)) {
+					if (!isRecord(frame)) continue;
+					if (frame.type === "ready") {
+						// Held, and its payload names no entry, so its answer is an error that means one
+						// thing only: startup is over, and every frame sent below is read after it.
+						child.stdin.write(
+							`${JSON.stringify({ type: "navigate_tree", entryId: "no-such-entry", id: "startup-over" })}\n`,
+						);
+						await child.stdin.flush();
+						continue;
+					}
+					if (typeof frame.id !== "string") continue;
+					answers.set(frame.id, frame);
+					if (frame.id === "startup-over") {
+						// One write, so the agent reads the four from one chunk while the `export_html` at
+						// their head still runs: the `get_state` reports the session the host is in when it
+						// sends the change, and the `abort` is read before the change leaves the queue.
+						child.stdin.write(
+							`${[
+								JSON.stringify({ type: "export_html", outputPath: "blocker.html", id: "blocker" }),
+								JSON.stringify({ type: "get_state", id: "before" }),
+								JSON.stringify({ type: "new_session", id: "change" }),
+								JSON.stringify({ type: "abort", id: "abort" }),
+							].join("\n")}\n`,
+						);
+						await child.stdin.flush();
+						continue;
+					}
+					if (frame.id === "change") {
+						child.stdin.write(`${JSON.stringify({ type: "get_state", id: "after" })}\n`);
+						await child.stdin.flush();
+						continue;
+					}
+					if (frame.id === "after") answered.resolve();
+				}
+				answered.reject(new Error("the agent closed its output before it answered every frame"));
+			})().catch((readError: unknown) => {
+				answered.reject(readError);
+			});
+			await withTimeout(
+				answered.promise,
+				HELD_HANDLER_MS + 30_000,
+				"the agent answered no frame before the timeout",
+			);
+
+			// The change was not held by startup, so the abort behind it does not withdraw it.
+			expect(answers.get("change")).toMatchObject({
+				success: true,
+				command: "new_session",
+				data: { cancelled: false },
+			});
+			// Run, not withdrawn: the host is in a different session than the one it sent the change from.
+			const beforeData = answers.get("before")?.data;
+			const afterData = answers.get("after")?.data;
+			const sessionBefore = isRecord(beforeData) ? beforeData.sessionId : undefined;
+			const sessionAfter = isRecord(afterData) ? afterData.sessionId : undefined;
+			expect(typeof sessionBefore).toBe("string");
+			expect(typeof sessionAfter).toBe("string");
+			expect(sessionAfter).not.toBe(sessionBefore);
+		} finally {
+			child.kill();
+			await child.exited;
+			await temp.remove();
+		}
+	}, 120_000);
 });

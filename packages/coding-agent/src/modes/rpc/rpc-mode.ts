@@ -524,6 +524,18 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
 };
 
 /**
+ * The live-session types. All four wait for startup, and {@link runRpcMode} keeps the ones read
+ * while startup ran in read order. A Set, not a Record: `type` is untrusted input and must not hit
+ * prototype keys.
+ */
+const LIVE_STARTUP_TYPES: ReadonlySet<string> = new Set<string>([
+	"live_start",
+	"live_connect",
+	"live_stop",
+	"live_mute",
+]);
+
+/**
  * Types that always wait for startup, besides the `goal` ops {@link waitsForStartup} adds. A Set,
  * not a Record: `type` is untrusted input and must not hit prototype keys.
  */
@@ -533,10 +545,7 @@ const STARTUP_HELD_TYPES: ReadonlySet<string> = new Set<string>([
 	"compact",
 	"navigate_tree",
 	"handoff",
-	"live_start",
-	"live_connect",
-	"live_stop",
-	"live_mute",
+	...LIVE_STARTUP_TYPES,
 ]);
 
 /**
@@ -569,8 +578,13 @@ const ABORT_WITHDRAWN_HELD_TYPES: ReadonlySet<string> = new Set<string>([
  * All four live types wait, not only the two that open a session. `live_start` and `live_connect`
  * open a live session whose first delegation sends a main-session message with `triggerTurn`
  * (LiveSessionController#handleDelegation). `live_stop` and `live_mute` wait so that the four keep
- * their arrival order: held frames resume from the one `startupSettled` promise in the order they
- * arrived, and `RpcLiveBridge.start` publishes its controller before its first await, so a
+ * their arrival order — but the hold alone does not order them: `live_start` and `live_connect` are
+ * {@link BACKGROUND_COMMANDS} and reach `handleCommand` as they are read, while `live_stop` and
+ * `live_mute` reach it only at the head of the dispatcher's serial tail, so with any serial frame
+ * ahead of them a wait on the one `startupSettled` promise starts out of arrival order. What keeps
+ * the order is the chain {@link runRpcMode} builds where each live frame is read: a live frame read
+ * during startup resumes behind the live frame read before it, and the first of them behind
+ * `startupSettled`. `RpcLiveBridge.start` publishes its controller before its first await, so a
  * `live_stop` held behind a `live_start` finds that controller. Run during startup instead, a
  * `live_stop` finds no controller, does nothing and reports success, and the held `live_start` then
  * opens the host microphone after the host asked it to stop.
@@ -2885,20 +2899,47 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 	};
 
+	const runCommand = (command: RpcCommand): Promise<RpcResponse> => {
+		if (!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)) return handleCommandImpl(command);
+		return withSessionChange(() => handleCommandImpl(command));
+	};
+
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
+		const liveTurn = liveStartupOrder.get(command);
+		if (liveTurn) {
+			// A live frame read while startup ran resumes behind the live frame read before it, never
+			// from `startupSettled` itself: `live_start` and `live_connect` reach this point as they
+			// are read while `live_stop` and `live_mute` reach it only at the head of the serial tail,
+			// so a shared wait would resume them out of arrival order. The first link of the chain is
+			// `startupSettled`, so all four still wait for startup. `finally`: a handler that throws
+			// must not strand the live frames chained behind it.
+			try {
+				await liveTurn.predecessor;
+				return await runCommand(command);
+			} finally {
+				liveTurn.resolve();
+			}
+		}
 		if (waitsForStartup(command)) {
 			await startupSettled.promise;
-			// `inputGate.accept` numbered this frame when it was read, so an `abort` read while it
-			// waited is numbered after it and `isCurrent` is false here: the host withdrew the frame
-			// before it ran. Read only here, never generally: a general read would also withdraw
-			// frames that arrived before a session change that succeeded outside startup, which is a
-			// protocol change this does not make.
-			if (ABORT_WITHDRAWN_HELD_TYPES.has(command.type) && !inputGate.isCurrent(command)) {
+			// The set is the test, not the promise: `startupSettled` stays resolved for the life of the
+			// process, so reading it here would withdraw every later `new_session`, `switch_session`,
+			// `fork` and `navigate_tree` too. The set holds exactly the frames read while startup ran,
+			// including one that reached this point only afterwards because another held serial frame
+			// was ahead of it. `inputGate.accept` numbered this frame when it was read, so an `abort`
+			// read while it waited is numbered after it and `isCurrent` is false here: the host
+			// withdrew the frame before it ran. Read only for those frames, never generally: a general
+			// read would also withdraw frames that arrived before a session change that succeeded
+			// outside startup, which is a protocol change this does not make.
+			if (
+				framesReadDuringStartup.has(command) &&
+				ABORT_WITHDRAWN_HELD_TYPES.has(command.type) &&
+				!inputGate.isCurrent(command)
+			) {
 				return success(command.id, command.type, { cancelled: true });
 			}
 		}
-		if (!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)) return handleCommandImpl(command);
-		return withSessionChange(() => handleCommandImpl(command));
+		return runCommand(command);
 	};
 
 	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
@@ -2928,19 +2969,39 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		onHostUriResult: frame => hostUriBridge.handleResult(frame),
 	};
 
+	let startupComplete = false;
+	// Settles with `startupComplete`: `handleCommand` holds every frame that starts a turn, changes the
+	// session or changes goal state on it. Declared before the dispatcher below, whose `acceptInput`
+	// reads it, and before the reader, which dispatches into `handleCommand`.
+	const startupSettled = Promise.withResolvers<void>();
+	// The frames read while startup ran, which is exactly what `handleCommand`'s abort withdrawal
+	// covers. Weak: a frame is a one-shot object and nothing here may keep it alive.
+	const framesReadDuringStartup = new WeakSet<object>();
+	// The live frames read while startup ran, chained in read order: each entry holds the promise of
+	// the frame read before it and the resolver the frame read after it waits on. Built where the
+	// frame is read, not where its handler runs, because the four live types do not reach
+	// `handleCommand` in arrival order (see {@link waitsForStartup}).
+	const liveStartupOrder = new WeakMap<object, { predecessor: Promise<void>; resolve: () => void }>();
+	let liveStartupTail: Promise<void> = startupSettled.promise;
+
 	// Side-channel frames dispatch immediately, ordinary commands serialize through inputDispatcher, and bash
 	// remains background-dispatched so abort_bash can overtake it.
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
-		acceptInput: command => inputGate.accept(command),
+		acceptInput: command => {
+			inputGate.accept(command);
+			// `isRecord` because a frame is untrusted input: a primitive one cannot key a weak
+			// collection, and `handleCommandImpl` answers it as an unknown command anyway.
+			if (startupComplete || !isRecord(command)) return;
+			framesReadDuringStartup.add(command);
+			if (!LIVE_STARTUP_TYPES.has(command.type)) return;
+			const predecessor = liveStartupTail;
+			const { promise, resolve } = Promise.withResolvers<void>();
+			liveStartupTail = promise;
+			liveStartupOrder.set(command, { predecessor, resolve });
+		},
 	});
-
-	let startupComplete = false;
-	// Settles with `startupComplete`: `handleCommand` holds every frame that starts a turn, changes the
-	// session or changes goal state on it. Declared before the reader below, which dispatches into
-	// `handleCommand`.
-	const startupSettled = Promise.withResolvers<void>();
 
 	// Read stdin from now on: `session_start` may be waiting on a dialog only the client can answer. Every frame
 	// dispatches as it arrives, startup included, so a command sent before startup finishes is answered while it
