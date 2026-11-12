@@ -22,9 +22,12 @@ const INPUT_HANDLER_PREFIX = "input-handler-ran ";
 /** The line the fixture writes once its `session_start` handler has requested a deferred shutdown. */
 const SHUTDOWN_REQUESTED_PREFIX = "startup-shutdown-requested ";
 /**
- * How long the fixture's fake live session takes to connect in the three live cases below that set
- * it; the fourth, the post-startup serial case, keeps the fixture's instant connect. Real time: a
- * connect a `live_stop` can cancel, and that a frame behind the stop must not wait out.
+ * How long the fixture's fake live session takes to connect. Three cases set it: the stop that
+ * cancels a connect, the mute read while a start connects, and the stdin-close one. The fourth
+ * live case, the stop behind a slow serial command after startup, sets it not at all and keeps the
+ * fixture's instant connect, because what it measures is the serial queue rather than the connect.
+ * Real time: a connect a `live_stop` can cancel, and that a frame behind the stop must not wait
+ * out.
  */
 const LIVE_CONNECT_MS = 3_000;
 /**
