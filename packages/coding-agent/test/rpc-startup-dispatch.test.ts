@@ -22,12 +22,12 @@ const INPUT_HANDLER_PREFIX = "input-handler-ran ";
 /** The line the fixture writes once its `session_start` handler has requested a deferred shutdown. */
 const SHUTDOWN_REQUESTED_PREFIX = "startup-shutdown-requested ";
 /**
- * How long the fixture's fake live session takes to connect. Three cases set it: the stop that
- * cancels a connect, the mute read while a start connects, and the stdin-close one. The fourth
- * live case, the stop behind a slow serial command after startup, sets it not at all and keeps the
- * fixture's instant connect, because what it measures is the serial queue rather than the connect.
- * Real time: a connect a `live_stop` can cancel, and that a frame behind the stop must not wait
- * out.
+ * How long the fixture's fake live session takes to connect. Exactly three cases set it and no
+ * other code in this file does: the stop that cancels a connect, the mute read while a start
+ * connects, and the stdin-close one. Every other agent of this file, the live frames of the
+ * held-types case among them, keeps the fixture's instant connect, which is what those rows want:
+ * they measure the hold, the read order or the serial queue rather than the connect. Real time: a
+ * connect a `live_stop` can cancel, and that a frame behind the stop must not wait out.
  */
 const LIVE_CONNECT_MS = 3_000;
 /**
@@ -779,6 +779,14 @@ describe("RPC startup input dispatch", () => {
 	 * session that came up is the one the mute muted. A bridge that published its controller only
 	 * once connected answers the mute "No live session is active" and opens the microphone unmuted,
 	 * which both `muted` assertions below catch.
+	 *
+	 * What this row does not guard: no single removal of this change reddens it. Deleting `live_mute`
+	 * from `LIVE_STARTUP_TYPES`, which takes it out of the startup hold and out of
+	 * `BACKGROUND_COMMANDS` at once, leaves this row green — measured — because the row runs after
+	 * startup, where the serial tail is free and the mute reaches the connect either way. It reads a
+	 * race the live family had no row for, and what it locks is the bridge publishing its controller
+	 * before its first await; the background move is locked by the shutdown case, the
+	 * stop-during-connect case and the order row of the held-types case.
 	 */
 	test("a live_mute read while a live_start connects mutes the session that comes up", async () => {
 		let muteSawStart = true;
