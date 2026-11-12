@@ -303,6 +303,20 @@ describe("RPC startup input dispatch", () => {
 		expect(liveStopped.msFromStartupReturnToHeld).toBeGreaterThan(0);
 		expect(liveStopped.after).toMatchObject({ success: false, error: "No live session is active" });
 
+		// `live_mute` is held for the same ordering reason, and its loss is louder than the stop's:
+		// answered during startup it finds no controller and fails, so the live session the host asked
+		// to be muted starts with the microphone open. Measured with `live_mute` out of the hold, the
+		// mute was answered 13 ms after the ready frame with "No live session is active" while the
+		// `live_start` behind it still ran 4 s later. Held, the mute applies to the session the start
+		// opened, so the toggle this row sends once startup is over turns it off again; unheld, the
+		// same toggle turns it on.
+		const liveMuted = await measureHeldFrame(
+			{ type: "live_start" },
+			{ alongside: [{ type: "live_mute", muted: true }], after: { type: "live_mute" } },
+		);
+		expect(liveMuted.msFromStartupReturnToHeld).toBeGreaterThan(0);
+		expect(liveMuted.after).toMatchObject({ success: true, data: { muted: false } });
+
 		// An `abort` read while a held session change waits withdraws it. Both frames are numbered as
 		// they are read, so the abort is numbered after the `new_session` even though the dispatcher
 		// runs it later, and the `isCurrent` read after the startup wait answers the change as
