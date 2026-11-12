@@ -633,9 +633,11 @@ describe("RPC startup input dispatch", () => {
 	/**
 	 * Stdin closing behind a `live_start` read during startup must leave no live session running:
 	 * the EOF path stops the bridge, and a start that resumes later would open the microphone after
-	 * the client is gone. The `compact` ahead of the pair is what made the difference: with
-	 * `live_stop` on the serial queue the start ran behind it, so it reached the bridge only after
-	 * the EOF stop had already run.
+	 * the client is gone. What this row guards is that resume order against the EOF path, not the
+	 * background dispatch of `live_stop` and `live_mute`: with those two taken out of
+	 * `BACKGROUND_COMMANDS` it still passes, because the held `live_start` resumes before the EOF
+	 * path that follows `await inputRead`. The background move is locked by the shutdown case, the
+	 * stop-during-connect case and the order row of the held-types case.
 	 */
 	test("a live_start read during startup leaves no live session running when stdin closes", async () => {
 		const temp = await TempDir.create("@omp-rpc-startup-live-eof-");
