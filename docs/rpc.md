@@ -733,6 +733,14 @@ one `select` (plus `editor` for free text) per choice. Builds without the
 command answer with a failed `response`, so hosts should keep the `select`
 fallback when enabling fails.
 
+The `ask` tool reads the setting when it asks, so a `set_ask_dialog` applies to
+every ask that starts after it, including one in a turn already running. The
+frame is ordered with every other command rather than answered out of band, so
+a command queued ahead of it — one still waiting for startup included — delays
+when it takes effect. Send it before the prompt it applies to: a frame still
+queued when that turn reaches its ask leaves that ask with the `select`
+fallback.
+
 ```json
 { "id": "req_ask", "type": "set_ask_dialog", "enabled": true }
 ```
@@ -1228,10 +1236,17 @@ such notice and dropped, and the `btw` or session change proceeds.
 
 Ordinary commands run on a serialized queue. Extension UI responses and host
 tool/URI updates/results bypass that queue, so they can complete a request
-while its command handler is waiting. `bash` also bypasses the serial queue and
-is tracked as background command work; its response may arrive out of order.
-`prompt` and `steer_subagent` start in queue order but await admission in the
-background, so their responses may also arrive after later commands'.
+while its command handler is waiting. `bash`, `predict_word`, `btw_cancel`,
+`abort_branch_summary` and the four live commands (`live_start`,
+`live_connect`, `live_stop` and `live_mute`) also bypass the serial queue and
+are tracked as background command work; their responses may arrive out of
+order. A `live_stop` or `live_mute` therefore takes effect without waiting for
+a command queued ahead of it, or for the connect a `live_start` is still
+running.
+`prompt`, `steer`, `follow_up` and `steer_subagent` start in queue order but
+await admission in the background, and `dictation_start` likewise answers only
+once recording has started, so their responses may also arrive after later
+commands'.
 
 ### Immediate ack vs completion
 

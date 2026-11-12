@@ -432,7 +432,7 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
  * wait in read order (see {@link waitsForStartup}).
  * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
  */
-const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
+export const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
 	"bash",
 	"predict_word",
 	"live_start",
@@ -535,7 +535,7 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
  * which is what keeps the ones read while startup ran in read order (see {@link waitsForStartup}).
  * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
  */
-const LIVE_STARTUP_TYPES: ReadonlySet<string> = new Set<string>([
+export const LIVE_STARTUP_TYPES: ReadonlySet<string> = new Set<string>([
 	"live_start",
 	"live_connect",
 	"live_stop",

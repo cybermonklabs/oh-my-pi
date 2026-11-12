@@ -35,6 +35,13 @@ const liveStartMs = Number(process.env.OMP_LIVE_START_MS ?? "0");
  * place instead of racing it.
  */
 const shutdownDuringStartup = process.env.OMP_SHUTDOWN_DURING_STARTUP === "1";
+/**
+ * How long the `session_before_switch` handler blocks, which is how a row drives a serial command
+ * whose duration it controls: `new_session` awaits that handler before it answers. The default of
+ * 0 registers no handler at all, so `hasHandlers("session_before_switch")` stays false and every
+ * row written before this switch existed keeps the session change it measured.
+ */
+const sessionChangeMs = Number(process.env.OMP_SESSION_CHANGE_MS ?? "0");
 const authStorage = await AuthStorage.create(path.join(process.cwd(), "auth.db"));
 authStorage.keys.setRuntime("anthropic", "test-key");
 const modelRegistry = new ModelRegistry(authStorage, path.join(process.cwd(), "models.yml"));
@@ -58,6 +65,12 @@ const extension = await loadExtensionFromFactory(
 			process.stderr.write(`input-handler-ran ${order}-session-start ${Date.now()}\n`);
 			return undefined;
 		});
+		if (sessionChangeMs > 0) {
+			pi.on("session_before_switch", async () => {
+				await Bun.sleep(sessionChangeMs);
+				return undefined;
+			});
+		}
 	},
 	process.cwd(),
 	new EventBus(),

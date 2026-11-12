@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
+import { BACKGROUND_COMMANDS, LIVE_STARTUP_TYPES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { isRecord, readJsonl, readLines, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 /**
@@ -26,6 +27,12 @@ const SHUTDOWN_REQUESTED_PREFIX = "startup-shutdown-requested ";
  * time: a connect a `live_stop` can cancel, and that a frame behind the stop must not wait out.
  */
 const LIVE_CONNECT_MS = 3_000;
+/**
+ * How long the fixture holds its `session_before_switch` handler in the post-startup live case
+ * below, which is how long that case's `new_session` holds the serial queue. Real time: what the
+ * case measures is that a `live_stop` behind it does not wait it out.
+ */
+const SERIAL_COMMAND_MS = 3_000;
 /**
  * How long a case that waits for the agent to exit allows. Bounded well under the per-test timeout
  * so a regression fails its case instead of hanging the suite.
@@ -58,6 +65,20 @@ const spawnSlowStartupAgent = (temp: TempDir, handlerMs: number, extraEnv: Recor
 	});
 
 describe("RPC startup input dispatch", () => {
+	/**
+	 * The two sets are kept in step by hand, and every live row below rests on that: a live type is
+	 * held so the four keep their arrival order, and the hold only orders them because all four are
+	 * background-dispatched, so each reaches `handleCommand` as it is read. Drop a live type from
+	 * either set and the rows that would catch it cost a slow-startup agent each; this one costs
+	 * nothing and names the set that lost it.
+	 */
+	test("the live types of the startup hold and of the background dispatch are the same set", () => {
+		expect([...LIVE_STARTUP_TYPES].filter(type => !BACKGROUND_COMMANDS.has(type))).toEqual([]);
+		expect([...BACKGROUND_COMMANDS].filter(type => type.startsWith("live_")).sort()).toEqual(
+			[...LIVE_STARTUP_TYPES].sort(),
+		);
+	});
+
 	test("a command sent after the ready frame is answered while a slow startup handler still runs", async () => {
 		const temp = await TempDir.create("@omp-rpc-startup-dispatch-");
 		const child = spawnSlowStartupAgent(temp, HANDLER_MS);
@@ -269,12 +290,12 @@ describe("RPC startup input dispatch", () => {
 		}
 	};
 
-	// Eighteen agents, each waiting out one `HELD_HANDLER_MS` startup.
+	// Seventeen agents, each waiting out one `HELD_HANDLER_MS` startup.
 	test("every command the startup hold covers waits for startup, and a get_state sent with it does not", async () => {
 		const objective = "ship the release";
 		// One frame of each held type. Every member of the hold now has a row that fails when that
 		// member alone leaves `STARTUP_HELD_TYPES`: `prompt` through the first case of this file,
-		// `new_session` through the withdrawal row further down, and every other member here,
+		// `new_session` through the withdrawal case below, and every other member here,
 		// including the `goal` ops `waitsForStartup` adds to the set. The live rows lock the hold
 		// exactly as the others do: with `live_start` taken out of the hold its answer came 2,424 to
 		// 2,492 ms before the handler returned, measured both against the fake controller below and
@@ -286,7 +307,7 @@ describe("RPC startup input dispatch", () => {
 		// row reads its own answer only where the comment above it says what that answer shows. The
 		// live rows drive the fixture's fake live controller, so they depend on neither the
 		// machine's audio device nor its realtime credentials.
-		// One agent at a time, in order: eighteen slow-startup agents at once would measure the
+		// One agent at a time, in order: seventeen slow-startup agents at once would measure the
 		// machine.
 		const goal = await measureHeldFrame(
 			{ type: "goal", op: "create", objective },
@@ -300,7 +321,7 @@ describe("RPC startup input dispatch", () => {
 			await measureHeldFrame({ type: "steer", message: "held steer" }),
 			await measureHeldFrame({ type: "follow_up", message: "held follow up" }),
 			await measureHeldFrame({ type: "abort_and_prompt", message: "held abort and prompt" }),
-			// The session-change types but `new_session`, whose row is the withdrawal one below. Every
+			// The session-change types but `new_session`, whose row is the withdrawal case below. Every
 			// payload here is unusable too: the entry ids name nothing in the session tree, and the
 			// two paths are relative, so the agent resolves them against its cwd, which is the temp
 			// dir of its own run — a session file that is not there and a session directory that is
@@ -378,22 +399,6 @@ describe("RPC startup input dispatch", () => {
 		expect(liveStartedAfterStop.msFromStartupReturnToHeld).toBeGreaterThan(0);
 		expect(liveStartedAfterStop.after).toMatchObject({ success: true, data: { muted: true } });
 
-		// An `abort` read while a held session change waits withdraws it. Both frames are numbered as
-		// they are read, so the abort is numbered after the `new_session` even though the dispatcher
-		// runs it later, and the `isCurrent` read after the startup wait answers the change as
-		// cancelled instead of starting a session the host no longer wants.
-		const abortedChange = await measureHeldFrame(
-			{ type: "new_session" },
-			{ alongside: [{ type: "abort" }], after: { type: "get_state" } },
-		);
-		expect(abortedChange.msFromStartupReturnToHeld).toBeGreaterThan(0);
-		expect(abortedChange.held).toMatchObject({ success: true, command: "new_session", data: { cancelled: true } });
-		// Withdrawn means not run: the session the host had when it sent the change is still open.
-		const stateData = abortedChange.state?.data;
-		const sessionBefore = isRecord(stateData) ? stateData.sessionId : undefined;
-		expect(typeof sessionBefore).toBe("string");
-		expect(abortedChange.after).toMatchObject({ success: true, data: { sessionId: sessionBefore } });
-
 		// The other side of the same rule, which no row above can show: `goal` with op `get` only
 		// reads, so it is answered while startup runs. Hold it and this assertion fails — and a held
 		// `goal get` would block every frame the dispatcher serializes behind it for the whole of
@@ -401,9 +406,44 @@ describe("RPC startup input dispatch", () => {
 		const goalGet = await measureHeldFrame({ type: "goal", op: "get" });
 		expect(goalGet.msFromStartupReturnToHeld).toBeLessThan(0);
 		expect(goalGet.msFromReadyToState).toBeLessThan(ANSWER_BUDGET_MS);
-		// Eighteen agents of 2.5 s each run this case in about 106 s on an idle machine; the budget
+		// Seventeen agents of 2.5 s each run this case in about 100 s on an idle machine; the budget
 		// keeps four times that, so a loaded runner does not turn a slow machine into a failure.
 	}, 420_000);
+
+	/**
+	 * One agent per member of `ABORT_WITHDRAWN_HELD_TYPES`: an `abort` read while the held frame
+	 * waits withdraws it. Both frames are numbered as they are read, so the abort is numbered after
+	 * the frame it withdraws even though the dispatcher runs that frame later, and the `isCurrent`
+	 * read after the startup wait answers it as cancelled instead of running a change the host no
+	 * longer wants.
+	 *
+	 * Parameterised because the set is kept by hand: take any one of the four types out of it and
+	 * that type's row is the one that fails, because the frame then runs — `new_session` opens the
+	 * session the host withdrew, and the other three answer the error their payload earns, since
+	 * none of them names a session file or an entry that exists.
+	 */
+	test.each([
+		["new_session", {}],
+		["switch_session", { sessionPath: "no-such-session.jsonl" }],
+		["fork", { entryId: "no-such-entry" }],
+		["navigate_tree", { entryId: "no-such-entry" }],
+	] as const)(
+		"an abort read while a held %s waits withdraws it",
+		async (type, payload) => {
+			const withdrawn = await measureHeldFrame(
+				{ type, ...payload },
+				{ alongside: [{ type: "abort" }], after: { type: "get_state" } },
+			);
+			expect(withdrawn.msFromStartupReturnToHeld).toBeGreaterThan(0);
+			expect(withdrawn.held).toMatchObject({ success: true, command: type, data: { cancelled: true } });
+			// Withdrawn means not run: the session the host had when it sent the frame is still open.
+			const stateData = withdrawn.state?.data;
+			const sessionBefore = isRecord(stateData) ? stateData.sessionId : undefined;
+			expect(typeof sessionBefore).toBe("string");
+			expect(withdrawn.after).toMatchObject({ success: true, data: { sessionId: sessionBefore } });
+		},
+		120_000,
+	);
 
 	/**
 	 * The withdrawal covers the frames startup held and nothing sent after them. This case needs
@@ -623,6 +663,97 @@ describe("RPC startup input dispatch", () => {
 			// The stop takes no place in the serial queue, so the probe behind it is answered while
 			// startup still runs rather than behind the connect the stop cancels.
 			expect(probeAt - readyAt).toBeLessThan(ANSWER_BUDGET_MS);
+		} finally {
+			child.kill();
+			await child.exited;
+			await temp.remove();
+		}
+	}, 120_000);
+
+	/**
+	 * The same background dispatch after startup, which is where a host spends its session: a
+	 * `live_stop` sent behind a serial command that takes real time must take effect while that
+	 * command still runs, not once it answers. The serial command is a `new_session` whose
+	 * `session_before_switch` handler the fixture holds for `SERIAL_COMMAND_MS`, so the row owns its
+	 * duration; the handler runs before `newSession` touches the session, so the live session the
+	 * `live_start` opened is still running while it blocks.
+	 *
+	 * Read by what the host sees rather than by a latency bound: the stop and the `live_mute` probe
+	 * behind it are both answered before the `new_session` is, and the probe reports no live session,
+	 * so the stop reached the session while the serial command had not yet answered. With `live_stop`
+	 * and `live_mute` taken out of `BACKGROUND_COMMANDS` both answers arrive behind the
+	 * `new_session`, and the two order assertions fail.
+	 */
+	test("a live_stop sent behind a slow serial command stops the live session before it answers", async () => {
+		const temp = await TempDir.create("@omp-rpc-startup-live-serial-");
+		const child = spawnSlowStartupAgent(temp, HELD_HANDLER_MS, {
+			OMP_SESSION_CHANGE_MS: String(SERIAL_COMMAND_MS),
+		});
+		try {
+			let stopSawBlocker = true;
+			let probeSawBlocker = true;
+			const answers = new Map<string, Record<string, unknown>>();
+			const answered = Promise.withResolvers<void>();
+			void (async () => {
+				for await (const frame of readJsonl<unknown>(child.stdout as ReadableStream<Uint8Array>)) {
+					if (!isRecord(frame)) continue;
+					if (frame.type === "ready") {
+						// Held, so its answer means startup is over and every frame below is read after it.
+						child.stdin.write(
+							`${JSON.stringify({ type: "navigate_tree", entryId: "no-such-entry", id: "startup-over" })}\n`,
+						);
+						await child.stdin.flush();
+						continue;
+					}
+					if (typeof frame.id !== "string") continue;
+					answers.set(frame.id, frame);
+					if (frame.id === "startup-over") {
+						child.stdin.write(`${JSON.stringify({ type: "live_start", id: "start" })}\n`);
+						await child.stdin.flush();
+						continue;
+					}
+					if (frame.id === "start") {
+						// One write, so the agent reads the three in this order: the `new_session` takes
+						// the serial tail and blocks it for `SERIAL_COMMAND_MS`, and the two behind it
+						// are dispatched as they are read.
+						child.stdin.write(
+							`${[
+								JSON.stringify({ type: "new_session", id: "blocker" }),
+								JSON.stringify({ type: "live_stop", id: "stop" }),
+								JSON.stringify({ type: "live_mute", muted: true, id: "probe" }),
+							].join("\n")}\n`,
+						);
+						await child.stdin.flush();
+						continue;
+					}
+					if (frame.id === "stop") stopSawBlocker = answers.has("blocker");
+					if (frame.id === "probe") probeSawBlocker = answers.has("blocker");
+					if (answers.has("blocker") && answers.has("stop") && answers.has("probe")) answered.resolve();
+				}
+				answered.reject(new Error("the agent closed its output before it answered every frame"));
+			})().catch((readError: unknown) => {
+				answered.reject(readError);
+			});
+			await withTimeout(
+				answered.promise,
+				HELD_HANDLER_MS + SERIAL_COMMAND_MS + 30_000,
+				"the agent answered no frame before the timeout",
+			);
+
+			// The session the stop has to reach: the start was answered before the three went out.
+			expect(answers.get("start")).toMatchObject({ success: true, command: "live_start" });
+			expect(answers.get("stop")).toMatchObject({ success: true, command: "live_stop" });
+			expect(stopSawBlocker).toBe(false);
+			// What the host sees: the live session is gone while the serial command still has not
+			// answered, so the stop took effect without waiting for it.
+			expect(answers.get("probe")).toMatchObject({
+				success: false,
+				command: "live_mute",
+				error: "No live session is active",
+			});
+			expect(probeSawBlocker).toBe(false);
+			// The serial command still answers: nothing above cancels it.
+			expect(answers.get("blocker")).toMatchObject({ success: true, command: "new_session" });
 		} finally {
 			child.kill();
 			await child.exited;
