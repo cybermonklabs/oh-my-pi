@@ -248,28 +248,46 @@ describe("RPC startup input dispatch", () => {
 		}
 	};
 
-	// Nine agents, each waiting out one `HELD_HANDLER_MS` startup.
+	// Seventeen agents, each waiting out one `HELD_HANDLER_MS` startup.
 	test("every command the startup hold covers waits for startup, and a get_state sent with it does not", async () => {
 		const objective = "ship the release";
-		// One frame of each held type. Dropping `compact`, `navigate_tree`, `handoff`, `live_start`,
-		// `live_connect` or the `goal` ops from the hold fails this case. The live rows lock the hold
+		// One frame of each held type. Every member of the hold now has a row that fails when that
+		// member alone leaves `STARTUP_HELD_TYPES`: `prompt` through the first case of this file,
+		// `new_session` through the withdrawal row further down, and every other member here,
+		// including the `goal` ops `waitsForStartup` adds to the set. The live rows lock the hold
 		// exactly as the others do: with `live_start` taken out of the hold its answer came 2,424 to
 		// 2,492 ms before the handler returned, measured both against the fake controller below and
-		// against the real one. `live_connect` needs its own row because the `live_start` row does not
-		// cover it: taken alone out of the hold, every other row still passed. Whether a frame answers
-		// with a success or with an error is neither asserted nor relevant: the hold sits in
+		// against the real one. `live_connect` needs its own row because the `live_start` row does
+		// not cover it: taken alone out of the hold, every other row still passed. Whether a frame
+		// answers with a success or with an error is neither asserted nor relevant: the hold sits in
 		// `handleCommand` before `handleCommandImpl`, so a frame waits for startup whatever its
-		// payload turns out to mean. That is why the `navigate_tree` here names an entry no session
-		// tree holds, and why `compact` and `handoff` run against a session with nothing in it. The
-		// live rows drive the fixture's fake live controller, so they depend on neither the machine's
-		// audio device nor its realtime credentials.
-		// One agent at a time, in order: nine slow-startup agents at once would measure the machine.
+		// payload turns out to mean. That is why so many payloads here are deliberately unusable; a
+		// row reads its own answer only where the comment above it says what that answer shows. The
+		// live rows drive the fixture's fake live controller, so they depend on neither the
+		// machine's audio device nor its realtime credentials.
+		// One agent at a time, in order: seventeen slow-startup agents at once would measure the
+		// machine.
 		const goal = await measureHeldFrame(
 			{ type: "goal", op: "create", objective },
 			{ after: { type: "goal", op: "get" } },
 		);
 		const timings = [
 			goal,
+			// The user-input types but `prompt`, whose row is the first case of this file. These three
+			// run against a session with no turn to steer and no turn to follow: three more payloads
+			// the hold never reads.
+			await measureHeldFrame({ type: "steer", message: "held steer" }),
+			await measureHeldFrame({ type: "follow_up", message: "held follow up" }),
+			await measureHeldFrame({ type: "abort_and_prompt", message: "held abort and prompt" }),
+			// The session-change types but `new_session`, whose row is the withdrawal one below. Every
+			// payload here is unusable too: the entry ids name nothing in the session tree, and the
+			// two paths are relative, so the agent resolves them against its cwd, which is the temp
+			// dir of its own run — a session file that is not there and a session directory that is
+			// not there either.
+			await measureHeldFrame({ type: "switch_session", sessionPath: "no-such-session.jsonl" }),
+			await measureHeldFrame({ type: "branch", entryId: "no-such-entry" }),
+			await measureHeldFrame({ type: "fork", entryId: "no-such-entry" }),
+			await measureHeldFrame({ type: "open_session", sessionDir: "held-open-session" }),
 			await measureHeldFrame({ type: "compact" }),
 			await measureHeldFrame({ type: "navigate_tree", entryId: "no-such-entry" }),
 			await measureHeldFrame({ type: "handoff" }),
@@ -340,5 +358,7 @@ describe("RPC startup input dispatch", () => {
 		const goalGet = await measureHeldFrame({ type: "goal", op: "get" });
 		expect(goalGet.msFromStartupReturnToHeld).toBeLessThan(0);
 		expect(goalGet.msFromReadyToState).toBeLessThan(ANSWER_BUDGET_MS);
-	}, 300_000);
+		// Seventeen agents of 2.5 s each run this case in about 95 s on an idle machine; the budget
+		// keeps four times that, so a loaded runner does not turn a slow machine into a failure.
+	}, 420_000);
 });
