@@ -573,6 +573,21 @@ const ABORT_WITHDRAWN_HELD_TYPES: ReadonlySet<string> = new Set<string>([
 ]);
 
 /**
+ * Types {@link RpcUserInputGate.accept} numbers, besides the `abort` and `abort_and_restore_queue`
+ * frames it names there; `abort_and_prompt`, the third type it names, is one of the user-input
+ * types spread in here. Spread from the two input records and from
+ * {@link ABORT_WITHDRAWN_HELD_TYPES} so the withdrawal set cannot outgrow it: `isCurrent` answers
+ * false both for a frame an abort invalidated and for a frame that was never numbered, so a
+ * withdrawn type that is not numbered here reads as withdrawn on every startup read, with no abort
+ * behind it. A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
+ */
+const NUMBERED_TYPES: ReadonlySet<string> = new Set<string>([
+	...Object.keys(USER_INPUT_TYPES),
+	...Object.keys(SESSION_CHANGE_TYPES),
+	...ABORT_WITHDRAWN_HELD_TYPES,
+]);
+
+/**
  * Whether `command` waits for startup to finish before {@link runRpcMode} runs it. Every other
  * command is answered while startup still runs, which is the point.
  *
@@ -607,11 +622,11 @@ function waitsForStartup(command: RpcCommand): boolean {
 /**
  * Orders user input and decides whether an accepted frame is still wanted.
  *
- * Every user-input, abort, session-change and `navigate_tree` frame gets a sequence
- * number when it is accepted (read from stdin), not when its handler runs. An abort
- * invalidates input accepted before it immediately. A session change invalidates input accepted
- * before the change frame, and only once the change succeeds: a vetoed change keeps
- * that input, and input pipelined after the change still runs in the new session.
+ * Every {@link NUMBERED_TYPES} frame, and every abort, gets a sequence number when it is accepted
+ * (read from stdin), not when its handler runs. An abort invalidates input accepted before it
+ * immediately. A session change invalidates input accepted before the change frame, and only once
+ * the change succeeds: a vetoed change keeps that input, and input pipelined after the change still
+ * runs in the new session.
  */
 export class RpcUserInputGate {
 	#tail: Promise<void> = Promise.resolve();
@@ -623,16 +638,7 @@ export class RpcUserInputGate {
 	accept(command: RpcCommand): void {
 		const isAbort =
 			command.type === "abort" || command.type === "abort_and_prompt" || command.type === "abort_and_restore_queue";
-		if (
-			!isAbort &&
-			!Object.hasOwn(USER_INPUT_TYPES, command.type) &&
-			!Object.hasOwn(SESSION_CHANGE_TYPES, command.type) &&
-			// Numbered for the startup withdrawal in `handleCommand`: it moves the session's leaf
-			// without being one of the session-change commands.
-			command.type !== "navigate_tree"
-		) {
-			return;
-		}
+		if (!isAbort && !NUMBERED_TYPES.has(command.type)) return;
 		const sequence = ++this.#sequence;
 		this.#acceptedAt.set(command, sequence);
 		if (isAbort) this.#validFrom = sequence;

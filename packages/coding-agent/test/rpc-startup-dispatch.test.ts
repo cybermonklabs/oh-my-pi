@@ -287,15 +287,16 @@ describe("RPC startup input dispatch", () => {
 		// `new_session` through the withdrawal case below, and every other member here,
 		// including the `goal` ops `waitsForStartup` adds to the set. The live rows lock the hold
 		// exactly as the others do: with `live_start` taken out of the hold its answer came 2,424 to
-		// 2,492 ms before the handler returned, measured both against the fake controller below and
-		// against the real one. `live_connect` needs its own row because the `live_start` row does
-		// not cover it: taken alone out of the hold, every other row still passed. Whether a frame
-		// answers with a success or with an error is neither asserted nor relevant: the hold sits in
-		// `handleCommand` before `handleCommandImpl`, so a frame waits for startup whatever its
-		// payload turns out to mean. That is why so many payloads here are deliberately unusable; a
-		// row reads its own answer only where the comment above it says what that answer shows. The
-		// live rows drive the fixture's fake live controller, so they depend on neither the
-		// machine's audio device nor its realtime credentials.
+		// 2,492 ms before the handler returned, measured at `d731a4f9`, the head that gave the
+		// fixture its fake live controller, against that controller and against the real one.
+		// `live_connect` needs its own row because the `live_start` row does not cover it:
+		// taken alone out of the hold, every other row still passed. Whether a frame answers with a
+		// success or with an error is neither asserted nor relevant: the hold sits in `handleCommand`
+		// before `handleCommandImpl`, so a frame waits for startup whatever its payload turns out to
+		// mean. That is why so many payloads here are deliberately unusable; a row reads its own
+		// answer only where the comment above it says what that answer shows. The live rows drive the
+		// fixture's fake live controller, so they depend on neither the machine's audio device nor
+		// its realtime credentials.
 		// One agent at a time, in order: seventeen slow-startup agents at once would measure the
 		// machine.
 		const goal = await measureHeldFrame(
@@ -342,12 +343,16 @@ describe("RPC startup input dispatch", () => {
 		// held session change sent with no abort runs, and only an abort read while it waits
 		// withdraws it. Three of the four withdrawn types went out above with no abort behind them,
 		// and each of the three ran; the rows below send the same three types with the same payloads
-		// and an `abort` alongside, and read `{ cancelled: true }`. Without this half, a source that
-		// answered every held session change as cancelled — or one that numbered no `navigate_tree`,
-		// so its frame is never current — passes every row of this file. Each answer is the one its
-		// own unusable payload earns: the relative `sessionPath` names no session file, so the
-		// switch makes the session it was pointed at and reports a change that was not cancelled,
-		// and the two entry ids name nothing in the session tree.
+		// and an `abort` alongside, and read `{ cancelled: true }`. What these assertions divide is
+		// the abort from the hold, not the numbering: without this half, a source that answered every
+		// held frame of the withdrawal set as cancelled passes every row of this file. A source that
+		// numbered no `navigate_tree` can no longer be written, because `NUMBERED_TYPES` spreads
+		// `ABORT_WITHDRAWN_HELD_TYPES`: unnumbering a withdrawn type now means deleting it from that
+		// set, which stops it being withdrawn at all, and that coupled edit reddens the type's own
+		// withdrawal row in the `test.each` below. Each answer is the one its own unusable payload
+		// earns: the relative `sessionPath` names no session file, so the switch makes the session it
+		// was pointed at and reports a change that was not cancelled, and the two entry ids name
+		// nothing in the session tree.
 		const heldAnswerFor = (type: string) => timings.find(timing => timing.type === type)?.held;
 		expect(heldAnswerFor("switch_session")).toMatchObject({
 			success: true,
@@ -786,7 +791,11 @@ describe("RPC startup input dispatch", () => {
 	 * startup, where the serial tail is free and the mute reaches the connect either way. It reads a
 	 * race the live family had no row for, and what it locks is the bridge publishing its controller
 	 * before its first await; the background move is locked by the shutdown case, the
-	 * stop-during-connect case and the order row of the held-types case.
+	 * stop-during-connect case and the order row of the held-types case. Those three redden on the
+	 * coupled loss too: `BACKGROUND_COMMANDS` and `STARTUP_HELD_TYPES` both spread
+	 * `LIVE_STARTUP_TYPES`, so deleting a live type there takes it out of the background dispatch
+	 * and out of the startup hold at once, and each of the three fails on that pair of losses as it
+	 * does on the background move alone.
 	 */
 	test("a live_mute read while a live_start connects mutes the session that comes up", async () => {
 		let muteSawStart = true;
@@ -827,7 +836,11 @@ describe("RPC startup input dispatch", () => {
 	 * background dispatch of `live_stop` and `live_mute`: with those two taken out of
 	 * `BACKGROUND_COMMANDS` it still passes, because the held `live_start` resumes before the EOF
 	 * path that follows `await inputRead`. The background move is locked by the shutdown case, the
-	 * stop-during-connect case and the order row of the held-types case.
+	 * stop-during-connect case and the order row of the held-types case. Those three redden on the
+	 * coupled loss too: `BACKGROUND_COMMANDS` and `STARTUP_HELD_TYPES` both spread
+	 * `LIVE_STARTUP_TYPES`, so deleting a live type there takes it out of the background dispatch
+	 * and out of the startup hold at once, and each of the three fails on that pair of losses as it
+	 * does on the background move alone.
 	 */
 	test("a live_start read during startup leaves no live session running when stdin closes", async () => {
 		const temp = await TempDir.create("@omp-rpc-startup-live-eof-");
