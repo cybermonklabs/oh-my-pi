@@ -352,6 +352,52 @@ describe("Hindsight automatic recall after a failure", () => {
 		expect(resumed.notices[0].message).toContain("boom");
 	});
 
+	it("a stored failure cause is cleaned before it is shown", async () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		setSystemTime(T0);
+		const firstManager = newSessionManager();
+		const first = start(firstManager, new CountingRecallApi());
+		expect(await first.state.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
+		const sessionFile = await writeTurn(firstManager);
+		await firstManager.close();
+
+		// A damaged or foreign session file can hold what the write side removed from the cause.
+		let rewritten = 0;
+		const lines = (await Bun.file(sessionFile).text()).split("\n").map(line => {
+			if (!line) return line;
+			const entry = JSON.parse(line);
+			if (entry.type !== "custom" || entry.customType !== "memory_recall_failure") return line;
+			entry.data.error = `\x1b]52;c;aGVsbG8=\x07${"x".repeat(5000)}`;
+			rewritten++;
+			return JSON.stringify(entry);
+		});
+		expect(rewritten).toBe(1);
+		await Bun.write(sessionFile, lines.join("\n"));
+
+		setSystemTime(T0 + 10 * 60_000);
+		const resumedManager = await SessionManager.open(sessionFile);
+		managers.push(resumedManager);
+		const client = new CountingRecallApi();
+		const resumed = start(resumedManager, client);
+		expect(await resumed.state.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
+
+		expect(client.calls).toBe(0);
+		expect(resumed.notices).toHaveLength(1);
+		const [notice] = resumed.notices;
+		expect(notice).toMatchObject({ level: "warning", source: HINDSIGHT_NOTICE_SOURCE });
+		expect(notice.message).not.toMatch(/[\x00-\x1f\x7f]/);
+		// The pause text and retry time come before the cause, which is at most 200 characters.
+		expect(notice.message.length).toBeLessThan(300);
+		const skipLines = warn.mock.calls.filter(
+			([message]) => message === "Hindsight: recall skipped after a recent failure",
+		);
+		expect(skipLines).toHaveLength(1);
+		const loggedError = String(skipLines[0][1]?.error);
+		expect(loggedError).not.toMatch(/[\x00-\x1f\x7f]/);
+		expect(loggedError.length).toBeLessThanOrEqual(200);
+		expect(notice.message.endsWith(loggedError)).toBe(true);
+	});
+
 	it("an aborted recall starts no pause", async () => {
 		const client = new CountingRecallApi();
 		const { state } = start(newSessionManager(), client);

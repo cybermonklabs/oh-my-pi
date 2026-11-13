@@ -428,14 +428,16 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		const skip = this.#recallWait.skip(now);
 		if (!skip) return false;
 		if (skip.first) {
+			// The stored cause comes from the session file, which can hold what the write side removed.
+			const cause = noticeErrorText(skip.failure.error);
 			logger.warn("Hindsight: recall skipped after a recent failure", {
 				bankId: this.bankId,
 				failedAt: new Date(skip.failure.at).toISOString(),
 				retryAfter: new Date(skip.retryAt).toISOString(),
 				failures: skip.failure.failures,
-				error: skip.failure.error,
+				error: cause,
 			});
-			this.session.emitNotice("warning", recallSkippedNotice(skip, now), HINDSIGHT_NOTICE_SOURCE);
+			this.session.emitNotice("warning", recallSkippedNotice(skip.retryAt, cause, now), HINDSIGHT_NOTICE_SOURCE);
 		}
 		return true;
 	}

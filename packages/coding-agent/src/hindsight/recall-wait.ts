@@ -58,10 +58,14 @@ function nextFailure(
 	return { at: now, failures: (previous?.failures ?? 0) + 1, error };
 }
 
-/** Notice for the first automatic recall skipped after a failure. */
-export function recallSkippedNotice(skip: RecallSkip, now: number): string {
-	const clock = new Date(skip.retryAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-	return `Memory recall paused until ${clock} (in ${formatDuration(skip.retryAt - now)}) after a failed recall: ${skip.failure.error}`;
+/**
+ * Notice for the first automatic recall skipped after a failure; automatic recall may run
+ * again at `retryAt`, epoch ms. `cause` must already be cleaned for display: the stored one
+ * is read back from the session file.
+ */
+export function recallSkippedNotice(retryAt: number, cause: string, now: number): string {
+	const clock = new Date(retryAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+	return `Memory recall paused until ${clock} (in ${formatDuration(retryAt - now)}) after a failed recall: ${cause}`;
 }
 
 /**
