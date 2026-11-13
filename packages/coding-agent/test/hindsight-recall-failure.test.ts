@@ -76,10 +76,17 @@ class FailingRecallApi extends HindsightApi {
 	}
 }
 
+/** Session dirs and managers {@link setup} made; the notice cases remove them after each test. */
+const setupSessions: { dir: TempDir; manager: SessionManager }[] = [];
+
 function setup(error: Error = new HindsightError("recall request timed out after 30s")) {
 	const notices: Notice[] = [];
+	const dir = TempDir.createSync("@hindsight-recall-failure-");
+	const sessionManager = SessionManager.create(dir.path(), dir.join("sessions"));
+	setupSessions.push({ dir, manager: sessionManager });
 	const session = {
 		sessionId: "s",
+		sessionManager,
 		emitNotice: (level: string, message: string, source?: string) => notices.push({ level, message, source }),
 	} as object as AgentSession;
 	const client = new FailingRecallApi(error);
@@ -95,6 +102,13 @@ function setup(error: Error = new HindsightError("recall request timed out after
 }
 
 describe("Hindsight recall failure notice", () => {
+	afterEach(async () => {
+		for (const { dir, manager } of setupSessions.splice(0)) {
+			await manager.close();
+			await dir.remove();
+		}
+	});
+
 	it("warns once with server text stripped of terminal controls and bounded to one line", async () => {
 		const { notices, client, state } = setup(
 			new HindsightError(`recall failed: \x1b[2Jboom\nline two\t${"x".repeat(5000)}`, 500),
@@ -102,7 +116,9 @@ describe("Hindsight recall failure notice", () => {
 		const outcome = state.recallForContext("query");
 		client.fail();
 
-		expect(await outcome).toEqual({ context: null, ok: false });
+		const result = await outcome;
+		expect(result).toMatchObject({ context: null, ok: false });
+		expect(result.failure?.startsWith("recall failed: boom line two x")).toBe(true);
 		expect(notices).toHaveLength(1);
 		const [notice] = notices;
 		expect(notice.level).toBe("warning");
@@ -110,6 +126,7 @@ describe("Hindsight recall failure notice", () => {
 		expect(notice.message.startsWith("Memory recall failed: recall failed: boom line two x")).toBe(true);
 		expect(notice.message).not.toMatch(/[\x00-\x1f\x7f]/);
 		expect(notice.message.length).toBeLessThan(250);
+		expect(notice.message).toBe(`Memory recall failed: ${result.failure}`);
 	});
 
 	it("stays silent when a superseded compaction aborts its recall", async () => {

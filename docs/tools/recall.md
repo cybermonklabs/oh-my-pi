@@ -108,6 +108,7 @@ When no matches exist:
    - `hindsight.recallMaxTokens = 1024`
    - `hindsight.recallTypes = ["world", "experience"]`
    - `hindsight.recallTimeoutMs = 30_000`
+   - `hindsight.recallCooldownMs = 1_800_000` — after an automatic recall fails, automatic recall (first turn and compaction) waits this long before it tries again; each further consecutive failure doubles the wait, up to 16 times this value (8 hours by default); `0` turns the wait off. The wait is stored in the session file, and this tool does not wait.
 - Mnemopi recall settings:
    - `mnemopi.recallLimit = 8` (runtime-clamped to at least 1)
    - `mnemopi.scoping = "per-project"`
