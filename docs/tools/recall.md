@@ -108,6 +108,7 @@ When no matches exist:
    - `hindsight.recallMaxTokens = 1024`
    - `hindsight.recallTypes = ["world", "experience"]`
    - `hindsight.recallTimeoutMs = 30_000`
+   - `hindsight.recallCooldownMs = 1_800_000` — after an automatic recall fails, automatic recall (first turn and compaction) pauses this long before it tries again; each further consecutive failure doubles the pause, up to 16 times this value (8 hours by default); `0` turns the pause off. The pause is stored in the session file, so a session resumed in a new process pauses too. In one process the pause stays through `/new`, `/resume`, a fork and a context reset, and its notice is not shown again. A subagent's compaction recall keeps a pause of its own. This tool does not pause.
 - Mnemopi recall settings:
    - `mnemopi.recallLimit = 8` (runtime-clamped to at least 1)
    - `mnemopi.scoping = "per-project"`
