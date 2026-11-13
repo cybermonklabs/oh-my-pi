@@ -424,4 +424,33 @@ describe("Hindsight automatic recall after a failure", () => {
 		expect(await promptAt(compacted, T0 + 60_000)).toBeUndefined();
 		expect(afterCompaction.calls).toBe(1);
 	});
+
+	it("a pause longer than a date can hold still holds off the next recall and keeps the failure visible", async () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const client = new CountingRecallApi();
+		// The largest integer the setting holds exactly, as a user sets it to mean "never recall again".
+		const { state, notices } = start(newSessionManager(), client, {
+			...config,
+			recallCooldownMs: Number.MAX_SAFE_INTEGER,
+		});
+
+		await expect(promptAt(state, T0)).resolves.toBeUndefined();
+		await expect(promptAt(state, T0 + 60_000)).resolves.toBeUndefined();
+
+		expect(client.calls).toBe(1);
+		const failureLines = warn.mock.calls.filter(([message]) => message === "Hindsight: recall failed");
+		expect(failureLines).toHaveLength(1);
+		expect(String(failureLines[0][1]?.error)).toContain("boom");
+		const skipLines = warn.mock.calls.filter(
+			([message]) => message === "Hindsight: recall skipped after a recent failure",
+		);
+		expect(skipLines).toHaveLength(1);
+		expect(notices).toHaveLength(2);
+		expect(notices[0]).toEqual({
+			level: "warning",
+			message: "Memory recall failed: recall request failed: boom",
+			source: HINDSIGHT_NOTICE_SOURCE,
+		});
+		expect(notices[1].message).toContain("boom");
+	});
 });
