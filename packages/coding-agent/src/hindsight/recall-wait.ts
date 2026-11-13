@@ -14,6 +14,9 @@ import type { SessionManager } from "../session/session-manager";
 /** The longest wait, as a multiple of the first. */
 const MAX_WAIT_MULTIPLE = 16;
 
+/** Latest epoch ms a date can hold; a later retry cannot be represented, and such a pause never ends anyway. */
+const MAX_DATE_MS = 8.64e15;
+
 /** Where a failure record is read from and appended to. */
 export interface RecallFailureTranscript {
 	sessionManager: Pick<SessionManager, "getBranch" | "appendCustomEntry">;
@@ -32,7 +35,7 @@ export interface RecallSkip {
 
 /** When automatic recall may run again after `failure`, epoch ms. */
 function retryAtAfter(failure: RecallFailure, cooldownMs: number): number {
-	return failure.at + cooldownMs * Math.min(2 ** (failure.failures - 1), MAX_WAIT_MULTIPLE);
+	return Math.min(failure.at + cooldownMs * Math.min(2 ** (failure.failures - 1), MAX_WAIT_MULTIPLE), MAX_DATE_MS);
 }
 
 /** Whether `failure`'s wait still runs at `now`; a clock set back before `failure.at` ends it. */
@@ -74,9 +77,9 @@ export class RecallFailureWait {
 	/** `at` of the failure whose skip was already announced in this process. */
 	#announcedAt: number | undefined;
 
-	/** `cooldownMs` is `hindsight.recallCooldownMs`, the first pause; `0` or less turns the pause off. */
+	/** `cooldownMs` is `hindsight.recallCooldownMs`, the first pause; `0`, less or `NaN` turns the pause off. */
 	constructor(cooldownMs: number, transcript: () => RecallFailureTranscript) {
-		this.#cooldownMs = cooldownMs;
+		this.#cooldownMs = cooldownMs > 0 ? cooldownMs : 0;
 		this.#transcript = transcript;
 	}
 

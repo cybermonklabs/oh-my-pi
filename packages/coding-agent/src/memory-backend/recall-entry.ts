@@ -117,7 +117,7 @@ function isMemoryRecallFailureEntryData(data: unknown): data is MemoryRecallFail
 		typeof data.scope === "string" &&
 		"at" in data &&
 		typeof data.at === "number" &&
-		Number.isFinite(data.at) &&
+		!Number.isNaN(new Date(data.at).getTime()) &&
 		"failures" in data &&
 		typeof data.failures === "number" &&
 		Number.isInteger(data.failures) &&
