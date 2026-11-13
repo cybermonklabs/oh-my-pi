@@ -300,10 +300,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	lastRecallSnippet?: string;
 	#recallGeneration = 0;
 	/** Pause after a failed automatic recall (`hindsight.recallCooldownMs`). */
-	readonly #recallWait = new RecallFailureWait(() => ({
-		sessionManager: this.session.sessionManager,
-		scope: this.#recallScope(),
-	}));
+	readonly #recallWait: RecallFailureWait;
 	/** Cached `<mental_models>` block injected into developer instructions. */
 	mentalModelsSnippet?: string;
 	/** When the current bootstrap/boundary load settled; gates the first-turn race. */
@@ -330,6 +327,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		this.config = options.config;
 		this.session = options.session;
 		this.banksSet = options.banksSet;
+		this.#recallWait = new RecallFailureWait(this.config.recallCooldownMs, () => ({
+			sessionManager: this.session.sessionManager,
+			scope: this.#recallScope(),
+		}));
 		this.lastRetainedTurn = options.lastRetainedTurn ?? 0;
 		this.#lastRetainedMessageIndex = 0;
 		this.#cachedTranscript = "";
@@ -409,11 +410,8 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			const errorText = err instanceof Error ? err.message : String(err);
 			// A conversation reset or session switch since the request makes its failure stale.
 			const failure = this.#recallGeneration === generation ? noticeErrorText(errorText) : undefined;
-			const cooldownMs = this.config.recallCooldownMs;
-			const retryAfter =
-				failure !== undefined && cooldownMs > 0
-					? new Date(this.#recallWait.retryAtAfterFailure(cooldownMs, Date.now())).toISOString()
-					: undefined;
+			const retryAt = failure !== undefined ? this.#recallWait.retryAtAfterFailure(Date.now()) : undefined;
+			const retryAfter = retryAt !== undefined ? new Date(retryAt).toISOString() : undefined;
 			logger.warn("Hindsight: recall failed", { bankId: this.bankId, error: errorText, retryAfter });
 			if (failure === undefined) return { context: null, ok: false };
 			this.session.emitNotice("warning", `Memory recall failed: ${failure}`, HINDSIGHT_NOTICE_SOURCE);
@@ -427,7 +425,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	 */
 	#skipRecallAfterFailure(): boolean {
 		const now = Date.now();
-		const skip = this.#recallWait.skip(this.config.recallCooldownMs, now);
+		const skip = this.#recallWait.skip(now);
 		if (!skip) return false;
 		if (skip.first) {
 			logger.warn("Hindsight: recall skipped after a recent failure", {
@@ -587,7 +585,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
 		const { context, ok, failure } = await this.recallForContext(truncated, signal);
-		this.#recallWait.record(this.config.recallCooldownMs, { ok, failure }, Date.now());
+		this.#recallWait.record({ ok, failure }, Date.now());
 		if (!ok) return undefined;
 
 		return {
@@ -628,7 +626,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
 		const { context, ok, failure } = await this.recallForContext(truncated, signal);
-		this.#recallWait.record(this.config.recallCooldownMs, { ok, failure }, Date.now());
+		this.#recallWait.record({ ok, failure }, Date.now());
 		return context ?? undefined;
 	}
 

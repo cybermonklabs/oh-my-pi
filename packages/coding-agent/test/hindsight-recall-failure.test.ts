@@ -17,6 +17,7 @@ import { HINDSIGHT_NOTICE_SOURCE, HindsightSessionState } from "@oh-my-pi/pi-cod
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 const config = {
 	hindsightApiUrl: "http://localhost:8888",
@@ -76,39 +77,55 @@ class FailingRecallApi extends HindsightApi {
 	}
 }
 
-/** Session dirs and managers {@link setup} made; the notice cases remove them after each test. */
-const setupSessions: { dir: TempDir; manager: SessionManager }[] = [];
+/** What a test made; removed after it. */
+const dirs: TempDir[] = [];
+const managers: SessionManager[] = [];
+const states: HindsightSessionState[] = [];
+const servers: Bun.Server<undefined>[] = [];
 
-function setup(error: Error = new HindsightError("recall request timed out after 30s")) {
-	const notices: Notice[] = [];
+afterEach(async () => {
+	setSystemTime();
+	vi.restoreAllMocks();
+	for (const state of states.splice(0)) state.dispose();
+	for (const server of servers.splice(0)) await server.stop(true);
+	for (const manager of managers.splice(0)) await manager.close();
+	for (const dir of dirs.splice(0)) await dir.remove();
+});
+
+function newSessionManager(): SessionManager {
 	const dir = TempDir.createSync("@hindsight-recall-failure-");
-	const sessionManager = SessionManager.create(dir.path(), dir.join("sessions"));
-	setupSessions.push({ dir, manager: sessionManager });
+	dirs.push(dir);
+	const manager = SessionManager.create(dir.path(), dir.join("sessions"));
+	managers.push(manager);
+	return manager;
+}
+
+/** One process: a Hindsight state over `sessionManager`; its notices land in `notices`. */
+function start(sessionManager: SessionManager, client: HindsightClientApi, stateConfig: HindsightConfig = config) {
+	const notices: Notice[] = [];
 	const session = {
-		sessionId: "s",
+		sessionId: sessionManager.getSessionId(),
 		sessionManager,
 		emitNotice: (level: string, message: string, source?: string) => notices.push({ level, message, source }),
 	} as object as AgentSession;
-	const client = new FailingRecallApi(error);
 	const state = new HindsightSessionState({
-		sessionId: "s",
+		sessionId: session.sessionId,
 		client,
 		bankId: "b",
-		config,
+		config: stateConfig,
 		session,
 		banksSet: new Set(),
 	});
-	return { notices, client, state };
+	states.push(state);
+	return { state, notices };
+}
+
+function setup(error: Error = new HindsightError("recall request timed out after 30s")) {
+	const client = new FailingRecallApi(error);
+	return { client, ...start(newSessionManager(), client) };
 }
 
 describe("Hindsight recall failure notice", () => {
-	afterEach(async () => {
-		for (const { dir, manager } of setupSessions.splice(0)) {
-			await manager.close();
-			await dir.remove();
-		}
-	});
-
 	it("warns once with server text stripped of terminal controls and bounded to one line", async () => {
 		const { notices, client, state } = setup(
 			new HindsightError(`recall failed: \x1b[2Jboom\nline two\t${"x".repeat(5000)}`, 500),
@@ -152,7 +169,7 @@ describe("Hindsight recall failure notice", () => {
 
 const PROMPT = "Where is the deploy host?";
 /** How long a first failed automatic recall holds off the next one. */
-const BOUND_MS = config.recallCooldownMs;
+const COOLDOWN_MS = config.recallCooldownMs;
 const T0 = Date.parse("2026-01-01T00:00:00.000Z");
 
 async function failWithBoom(): Promise<RecallResponse> {
@@ -179,49 +196,6 @@ class CountingRecallApi extends HindsightApi {
 }
 
 describe("Hindsight automatic recall after a failure", () => {
-	const dirs: TempDir[] = [];
-	const managers: SessionManager[] = [];
-	const states: HindsightSessionState[] = [];
-	const servers: Bun.Server<undefined>[] = [];
-
-	afterEach(async () => {
-		setSystemTime();
-		vi.restoreAllMocks();
-		for (const state of states.splice(0)) state.dispose();
-		for (const server of servers.splice(0)) await server.stop(true);
-		for (const manager of managers.splice(0)) await manager.close();
-		for (const dir of dirs.splice(0)) await dir.remove();
-	});
-
-	function newSessionManager(): SessionManager {
-		const dir = TempDir.createSync("@hindsight-recall-failure-");
-		dirs.push(dir);
-		const manager = SessionManager.create(dir.path(), dir.join("sessions"));
-		managers.push(manager);
-		return manager;
-	}
-
-	/** One process: a Hindsight state over `sessionManager`; its notices land in `notices`. */
-	function start(sessionManager: SessionManager, client: HindsightClientApi, stateConfig: HindsightConfig = config) {
-		const notices: Notice[] = [];
-		const session = {
-			sessionId: sessionManager.getSessionId(),
-			sessionManager,
-			subscribe: () => () => {},
-			emitNotice: (level: string, message: string, source?: string) => notices.push({ level, message, source }),
-		} as object as AgentSession;
-		const state = new HindsightSessionState({
-			sessionId: session.sessionId,
-			client,
-			bankId: "b",
-			config: stateConfig,
-			session,
-			banksSet: new Set(),
-		});
-		states.push(state);
-		return { state, notices };
-	}
-
 	function promptAt(state: HindsightSessionState, time: number) {
 		setSystemTime(time);
 		return state.beforeAgentStartPrompt(PROMPT);
@@ -230,30 +204,14 @@ describe("Hindsight automatic recall after a failure", () => {
 	/** Persists the turn the session sent, which puts the transcript on disk; returns its file. */
 	async function writeTurn(sessionManager: SessionManager): Promise<string> {
 		sessionManager.appendMessage({ role: "user", content: PROMPT, timestamp: Date.now() });
-		sessionManager.appendMessage({
-			role: "assistant",
-			content: [{ type: "text", text: "alpha-7" }],
-			api: "anthropic-messages",
-			provider: "anthropic",
-			model: "test",
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "stop",
-			timestamp: Date.now(),
-		});
+		sessionManager.appendMessage(createAssistantMessage("alpha-7"));
 		await sessionManager.flush();
 		const sessionFile = sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("session was not persisted");
 		return sessionFile;
 	}
 
-	it("does not wait for another recall within the bound after a first-turn recall times out", async () => {
+	it("does not wait for another recall during the pause after a first-turn recall times out", async () => {
 		let recallRequests = 0;
 		const server = Bun.serve({
 			hostname: "127.0.0.1",
@@ -336,15 +294,15 @@ describe("Hindsight automatic recall after a failure", () => {
 		const { state } = start(newSessionManager(), client);
 		await promptAt(state, T0);
 		expect(client.calls).toBe(1);
-		await promptAt(state, T0 + BOUND_MS - 1_000);
+		await promptAt(state, T0 + COOLDOWN_MS - 1_000);
 		expect(client.calls).toBe(1);
 
-		const secondFailure = T0 + BOUND_MS + 1_000;
+		const secondFailure = T0 + COOLDOWN_MS + 1_000;
 		await promptAt(state, secondFailure);
 		expect(client.calls).toBe(2);
-		await promptAt(state, secondFailure + BOUND_MS + 1_000);
+		await promptAt(state, secondFailure + COOLDOWN_MS + 1_000);
 		expect(client.calls).toBe(2);
-		await promptAt(state, secondFailure + 2 * BOUND_MS + 1_000);
+		await promptAt(state, secondFailure + 2 * COOLDOWN_MS + 1_000);
 		expect(client.calls).toBe(3);
 	});
 
@@ -354,7 +312,7 @@ describe("Hindsight automatic recall after a failure", () => {
 		await promptAt(state, T0);
 		expect(client.calls).toBe(1);
 
-		const recovered = T0 + BOUND_MS + 1_000;
+		const recovered = T0 + COOLDOWN_MS + 1_000;
 		client.answer = answerWith("The deploy host is alpha-7.");
 		// Left uncommitted, as when the turn never goes out: the next prompt recalls again.
 		expect((await promptAt(state, recovered))?.context).toContain("alpha-7");
@@ -362,13 +320,13 @@ describe("Hindsight automatic recall after a failure", () => {
 		await promptAt(state, recovered);
 		expect(client.calls).toBe(3);
 
-		await promptAt(state, recovered + BOUND_MS - 1_000);
+		await promptAt(state, recovered + COOLDOWN_MS - 1_000);
 		expect(client.calls).toBe(3);
-		await promptAt(state, recovered + BOUND_MS + 1_000);
+		await promptAt(state, recovered + COOLDOWN_MS + 1_000);
 		expect(client.calls).toBe(4);
 	});
 
-	it("a resumed session within the bound does not recall", async () => {
+	it("a resumed session during the pause does not recall", async () => {
 		setSystemTime(T0);
 		const firstManager = newSessionManager();
 		const first = start(firstManager, new CountingRecallApi());
@@ -394,7 +352,7 @@ describe("Hindsight automatic recall after a failure", () => {
 		expect(resumed.notices[0].message).toContain("boom");
 	});
 
-	it("an aborted recall starts no bound", async () => {
+	it("an aborted recall starts no pause", async () => {
 		const client = new CountingRecallApi();
 		const { state } = start(newSessionManager(), client);
 		const called = Promise.withResolvers<void>();
@@ -415,7 +373,7 @@ describe("Hindsight automatic recall after a failure", () => {
 		expect(client.calls).toBe(2);
 	});
 
-	it("a failure after a conversation reset starts no bound", async () => {
+	it("a failure after a conversation reset starts no pause", async () => {
 		const client = new CountingRecallApi();
 		const { state } = start(newSessionManager(), client);
 		const called = Promise.withResolvers<void>();
@@ -449,7 +407,7 @@ describe("Hindsight automatic recall after a failure", () => {
 		expect(failureEntries).toEqual([]);
 	});
 
-	it("the compaction recall waits out the bound, and its failure starts one", async () => {
+	it("the compaction recall waits out the pause, and its failure starts one", async () => {
 		const messages = [{ role: "user", content: "what did we decide?" }];
 		const afterPrompt = new CountingRecallApi();
 		const prompted = start(newSessionManager(), afterPrompt).state;

@@ -47,7 +47,7 @@ export interface PersistedRecall {
 export interface RecallFailure {
 	/** When the recall failed, epoch ms. */
 	at: number;
-	/** Consecutive failed recalls it ends; `0` once a recall answered since. */
+	/** Consecutive failed recalls up to this one; `0` after a recall answered. */
 	failures: number;
 	/** The failure's cause. */
 	error: string;

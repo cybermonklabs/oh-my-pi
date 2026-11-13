@@ -37,7 +37,7 @@ function retryAtAfter(failure: RecallFailure, cooldownMs: number): number {
 
 /** Whether `failure`'s wait still runs at `now`; a clock set back before `failure.at` ends it. */
 function isWaiting(failure: RecallFailure, cooldownMs: number, now: number): boolean {
-	if (cooldownMs <= 0 || failure.failures <= 0) return false;
+	if (failure.failures <= 0) return false;
 	return now >= failure.at && now < retryAtAfter(failure, cooldownMs);
 }
 
@@ -67,50 +67,60 @@ export function recallSkippedNotice(skip: RecallSkip, now: number): string {
  * not conversation state.
  */
 export class RecallFailureWait {
+	readonly #cooldownMs: number;
 	readonly #transcript: () => RecallFailureTranscript;
 	#failure: RecallFailure | undefined;
 	#loaded = false;
 	/** `at` of the failure whose skip was already announced in this process. */
 	#announcedAt: number | undefined;
 
-	constructor(transcript: () => RecallFailureTranscript) {
+	/** `cooldownMs` is `hindsight.recallCooldownMs`, the first pause; `0` or less turns the pause off. */
+	constructor(cooldownMs: number, transcript: () => RecallFailureTranscript) {
+		this.#cooldownMs = cooldownMs;
 		this.#transcript = transcript;
 	}
 
 	#current(): RecallFailure | undefined {
-		if (!this.#failure && !this.#loaded) {
+		if (!this.#loaded) {
 			const { sessionManager, scope } = this.#transcript();
 			this.#failure = findRecallFailure(sessionManager, scope);
+			this.#loaded = true;
 		}
-		this.#loaded = true;
 		return this.#failure;
 	}
 
 	/** The failure that holds off an automatic recall at `now`; undefined when the recall may run. */
-	skip(cooldownMs: number, now: number): RecallSkip | undefined {
-		if (cooldownMs <= 0) return undefined;
+	skip(now: number): RecallSkip | undefined {
+		if (this.#cooldownMs <= 0) return undefined;
 		const failure = this.#current();
-		if (!failure || !isWaiting(failure, cooldownMs, now)) return undefined;
+		if (!failure || !isWaiting(failure, this.#cooldownMs, now)) return undefined;
 		const first = this.#announcedAt !== failure.at;
 		this.#announcedAt = failure.at;
-		return { failure, retryAt: retryAtAfter(failure, cooldownMs), first };
-	}
-
-	/** When automatic recall may run again if a recall fails at `now`, epoch ms. */
-	retryAtAfterFailure(cooldownMs: number, now: number): number {
-		return retryAtAfter(nextFailure(this.#current(), cooldownMs, now, ""), cooldownMs);
+		return { failure, retryAt: retryAtAfter(failure, this.#cooldownMs), first };
 	}
 
 	/**
-	 * Records an automatic recall's outcome: `failure` (its cause) starts or extends the
-	 * pause, `ok` ends it; an aborted or stale recall has neither and records nothing. The
-	 * transcript gets the record only while the pause is on.
+	 * When automatic recall may run again if a recall fails at `now`, epoch ms; undefined
+	 * when `recallCooldownMs` is `0` or less.
 	 */
-	record(cooldownMs: number, outcome: { ok: boolean; failure?: string }, now: number): void {
+	retryAtAfterFailure(now: number): number | undefined {
+		if (this.#cooldownMs <= 0) return undefined;
+		return retryAtAfter(nextFailure(this.#current(), this.#cooldownMs, now, ""), this.#cooldownMs);
+	}
+
+	/**
+	 * Records an automatic recall's outcome. A failure (`failure`, its cause) starts a pause,
+	 * or a doubled one when the previous pause has ended; a failure during a running pause
+	 * changes nothing. An answered recall (`ok`) ends the pause. An aborted or stale recall
+	 * has neither and records nothing. The transcript gets the record only when
+	 * `recallCooldownMs > 0`.
+	 */
+	record(outcome: { ok: boolean; failure?: string }, now: number): void {
+		if (this.#cooldownMs <= 0) return;
 		const previous = this.#current();
 		let next: RecallFailure;
 		if (outcome.failure !== undefined) {
-			next = nextFailure(previous, cooldownMs, now, outcome.failure);
+			next = nextFailure(previous, this.#cooldownMs, now, outcome.failure);
 			if (next === previous) return;
 		} else if (outcome.ok && previous && previous.failures > 0) {
 			next = { at: now, failures: 0, error: "" };
@@ -118,7 +128,6 @@ export class RecallFailureWait {
 			return;
 		}
 		this.#failure = next;
-		if (cooldownMs <= 0) return;
 		const { sessionManager, scope } = this.#transcript();
 		persistRecallFailure(sessionManager, scope, next);
 	}

@@ -324,7 +324,7 @@ describe("queued user delivery policy", () => {
 		expect(recalls).toBe(2);
 	});
 
-	it("skips a failed real hindsight recall on the next turns within the bound", async () => {
+	it("skips a failed real hindsight recall on the next turns during the pause", async () => {
 		let recalls = 0;
 		const { requests } = await setupMemory("hindsight", async () => {
 			if (++recalls === 1) throw new Error("recall unavailable");
