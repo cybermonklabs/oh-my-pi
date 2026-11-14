@@ -746,13 +746,11 @@ one `select` (plus `editor` for free text) per choice. Builds without the
 command answer with a failed `response`, so hosts should keep the `select`
 fallback when enabling fails.
 
-The `ask` tool reads the setting when it asks, so a `set_ask_dialog` applies to
-every ask that starts after it, including one in a turn already running. The
-frame is ordered with every other command rather than answered out of band, so
-a command queued ahead of it — one still waiting for startup included — delays
-when it takes effect. Send it before the prompt it applies to: a frame still
-queued when that turn reaches its ask leaves that ask with the `select`
-fallback.
+The frame is ordered with every other command rather than answered out of band,
+so a command queued ahead of it — one still waiting for startup included —
+delays when it takes effect. Send it before the prompt it applies to: an
+extension dialog raised while the frame is still queued gets the setting from
+before it.
 
 ```json
 { "id": "req_ask", "type": "set_ask_dialog", "enabled": true }
