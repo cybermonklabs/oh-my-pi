@@ -41,14 +41,23 @@ const SERIAL_COMMAND_MS = 3_000;
  * so a regression fails its case instead of hanging the suite.
  */
 const EXIT_BUDGET_MS = HELD_HANDLER_MS + 15_000;
+/**
+ * How long a frame of a type startup holds may take to be answered when a `session_start` handler
+ * started a turn, as the startup-turn fixture's does: that turn streams for 60 s until it is
+ * aborted. Measured, the answer came 0.1 to 0.2 s after the frame was sent; the rest is room for a
+ * slow runner, and the whole stays far under the turn, so a frame that waits the turn out misses
+ * it. The case that uses it bounds every other wait for the agent by it too, the ready frame
+ * included, except the wait for the exit.
+ */
+const STARTUP_TURN_ANSWER_BUDGET_MS = 10_000;
 
 /**
- * Spawn the slow-startup RPC agent in `temp`, with a minimal environment: the child must not read
+ * Spawn the RPC agent `fixture` names in `temp`, with a minimal environment: the child must not read
  * the developer's or the runner's home-rooted plugin and config state, which would make a test
  * machine-dependent.
  */
-const spawnSlowStartupAgent = (temp: TempDir, handlerMs: number, extraEnv: Record<string, string> = {}) =>
-	Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures", "slow-startup-rpc-agent.ts")], {
+const spawnRpcAgent = (temp: TempDir, fixture: string, extraEnv: Record<string, string> = {}) =>
+	Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures", fixture)], {
 		cwd: temp.path(),
 		env: {
 			PATH: Bun.env.PATH,
@@ -59,13 +68,16 @@ const spawnSlowStartupAgent = (temp: TempDir, handlerMs: number, extraEnv: Recor
 			XDG_CACHE_HOME: temp.join("cache"),
 			CI: "true",
 			PI_NO_TITLE: "1",
-			OMP_STARTUP_HANDLER_MS: String(handlerMs),
 			...extraEnv,
 		},
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
 	});
+
+/** Spawn the slow-startup RPC agent in `temp`, its `session_start` handler blocking for `handlerMs`. */
+const spawnSlowStartupAgent = (temp: TempDir, handlerMs: number, extraEnv: Record<string, string> = {}) =>
+	spawnRpcAgent(temp, "slow-startup-rpc-agent.ts", { OMP_STARTUP_HANDLER_MS: String(handlerMs), ...extraEnv });
 
 describe("RPC startup input dispatch", () => {
 	test("a command sent after the ready frame is answered while a slow startup handler still runs", async () => {
@@ -889,4 +901,121 @@ describe("RPC startup input dispatch", () => {
 			await temp.remove();
 		}
 	}, 120_000);
+
+	/**
+	 * Input is read before extension startup whether or not `initializeExtensions` waits for the
+	 * turns its handlers start, so all `drainSends: false` still decides is when a frame of a type
+	 * startup holds runs if a `session_start` handler started a turn: during that turn, as it would
+	 * during any other, or only once that turn ends. This is the case that fails when the option is
+	 * dropped; no other case of this file has a `session_start` handler start a turn.
+	 *
+	 * The fixture's startup turn streams for 60 s until it is aborted. A `steer` and a `prompt` go
+	 * out together right after the ready frame, and each earns the answer a frame sent during any
+	 * turn earns: the steer joins the turn and is answered `success`, and the prompt, sent with no
+	 * `streamingBehavior`, is refused as busy and its `prompt_result` reports the error. The
+	 * `get_state` sent once both are answered shows the turn still streaming, so neither waited it
+	 * out. Measured without the option, the steer was answered only once the 60 s turn had ended,
+	 * and the prompt was then accepted and ran a turn of its own.
+	 */
+	test("frames held for startup run during a turn a session_start handler started: a steer joins it and a prompt is refused as busy", async () => {
+		const temp = await TempDir.create("@omp-rpc-startup-turn-");
+		const child = spawnRpcAgent(temp, "startup-turn-rpc-agent.ts");
+		try {
+			// One waiter per frame this case reads, settled by the first frame of its key: a response or
+			// a `prompt_result` is keyed by its type and id, any other frame by its type alone. The
+			// first frame wins because the agent answers a refused prompt twice: the error, then an
+			// acknowledgement.
+			const frames = new Map<string, PromiseWithResolvers<Record<string, unknown>>>();
+			const frameFor = (key: string) => {
+				let waiter = frames.get(key);
+				if (!waiter) {
+					waiter = Promise.withResolvers<Record<string, unknown>>();
+					frames.set(key, waiter);
+				}
+				return waiter;
+			};
+			const rejectWaiters = (reason: unknown) => {
+				for (const waiter of frames.values()) waiter.reject(reason);
+			};
+			void (async () => {
+				for await (const frame of readJsonl<unknown>(child.stdout as ReadableStream<Uint8Array>)) {
+					if (!isRecord(frame)) continue;
+					const keyedById = frame.type === "response" || frame.type === "prompt_result";
+					frameFor(keyedById ? `${frame.type} ${String(frame.id)}` : String(frame.type)).resolve(frame);
+				}
+				// A no-op for every waiter already settled; the others fail their wait at once.
+				rejectWaiters(new Error("the agent closed its output before it wrote the frame"));
+			})().catch((readError: unknown) => {
+				// As in the cases above: reported through the waits rather than left unobserved.
+				rejectWaiters(readError);
+			});
+			const send = async (...commands: Record<string, unknown>[]) => {
+				child.stdin.write(`${commands.map(command => JSON.stringify(command)).join("\n")}\n`);
+				await child.stdin.flush();
+			};
+
+			await withTimeout(frameFor("ready").promise, STARTUP_TURN_ANSWER_BUDGET_MS, "the agent wrote no ready frame");
+			const sentAt = Date.now();
+			// One write, so the agent reads the prompt right behind the steer.
+			await send(
+				{ type: "steer", message: "steer the startup turn", id: "steer" },
+				{ type: "prompt", message: "a prompt of its own", id: "prompt" },
+			);
+
+			const steered = await withTimeout(
+				frameFor("response steer").promise,
+				STARTUP_TURN_ANSWER_BUDGET_MS,
+				"the steer was not answered during the startup turn: startup waited for the turn its session_start handler started",
+			);
+			expect(steered).toMatchObject({ command: "steer", success: true });
+			const refused = await withTimeout(
+				frameFor("response prompt").promise,
+				STARTUP_TURN_ANSWER_BUDGET_MS,
+				"the prompt was not answered during the startup turn",
+			);
+			expect(refused).toMatchObject({
+				command: "prompt",
+				success: false,
+				error: expect.stringContaining("already processing"),
+			});
+			const promptResult = await withTimeout(
+				frameFor("prompt_result prompt").promise,
+				STARTUP_TURN_ANSWER_BUDGET_MS,
+				"the refused prompt got no prompt_result",
+			);
+			expect(promptResult).toMatchObject({ status: "error" });
+			// All three inside one budget from the send, not one budget each.
+			expect(Date.now() - sentAt).toBeLessThan(STARTUP_TURN_ANSWER_BUDGET_MS);
+
+			// The turn a `session_start` handler started still streams, so both frames above were
+			// answered during it rather than after it.
+			await send({ type: "get_state", id: "state" });
+			const state = await withTimeout(
+				frameFor("response state").promise,
+				STARTUP_TURN_ANSWER_BUDGET_MS,
+				"get_state was not answered",
+			);
+			expect(state).toMatchObject({ command: "get_state", success: true, data: { isStreaming: true } });
+
+			await send({ type: "abort", id: "abort" });
+			await withTimeout(
+				frameFor("agent_end").promise,
+				STARTUP_TURN_ANSWER_BUDGET_MS,
+				"abort did not end the startup turn",
+			);
+			const aborted = await withTimeout(
+				frameFor("response abort").promise,
+				STARTUP_TURN_ANSWER_BUDGET_MS,
+				"abort was not answered",
+			);
+			expect(aborted).toMatchObject({ command: "abort", success: true });
+			child.stdin.end();
+			const exitCode = await withTimeout(child.exited, EXIT_BUDGET_MS, "the agent did not exit after stdin closed");
+			expect(exitCode).toBe(0);
+		} finally {
+			child.kill();
+			await child.exited;
+			await temp.remove();
+		}
+	}, 60_000);
 });
