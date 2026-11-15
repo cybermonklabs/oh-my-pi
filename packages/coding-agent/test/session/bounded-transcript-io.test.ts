@@ -263,12 +263,18 @@ interface LongTranscript {
 
 /**
  * Write a transcript of at least {@link TRANSCRIPT_BYTES} to `sessionDir`,
- * line by line: turns of a user message (an image now and then), an assistant
- * message with thinking, a fenced code block and a `read` call, and its
- * result; three compactions on the current path, the last keeping only the
- * final turns; and a second branch off the middle compaction.
+ * line by line: turns of a user message (an image now and then, unless
+ * `images` is false), an assistant message with thinking, a fenced code block
+ * and a `read` call, and its result; three compactions on the current path,
+ * the last keeping only the final turns; and a second branch off the middle
+ * compaction.
  */
-async function writeLongTranscript(cwd: string, sessionDir: string): Promise<LongTranscript> {
+async function writeLongTranscript(
+	cwd: string,
+	sessionDir: string,
+	options: { images?: boolean } = {},
+): Promise<LongTranscript> {
+	const images = options.images !== false;
 	const sessionId = crypto.randomUUID();
 	const file = path.join(sessionDir, `2026-01-01T00-00-00-000Z_${sessionId}.jsonl`);
 	fs.mkdirSync(sessionDir, { recursive: true });
@@ -331,13 +337,13 @@ async function writeLongTranscript(cwd: string, sessionDir: string): Promise<Lon
 	let index = 0;
 	const turnBytes = (() => {
 		const before = bytes;
-		turn(index++, true);
+		turn(index++, images);
 		return bytes - before;
 	})();
 	const turns = Math.ceil(TRANSCRIPT_BYTES / turnBytes) + 8;
 	const userIds = ["u0"];
 	for (; index < turns; index++) {
-		userIds.push(turn(index, index % 100 === 0 || index === turns - 1));
+		userIds.push(turn(index, images && (index % 100 === 0 || index === turns - 1)));
 		if (index === Math.floor(turns / 4)) compaction("c1", userIds[index - 2]!);
 		if (index === Math.floor(turns / 2)) {
 			const mainParent = compaction("c2", userIds[index - 2]!);
@@ -365,12 +371,14 @@ describe("a running session's reads and writes of a 64 MiB transcript on file st
 		vi.restoreAllMocks();
 	});
 
-	async function setUp(): Promise<{ transcript: LongTranscript; storage: RecordingFileStorage }> {
+	async function setUp(
+		options: { images?: boolean } = {},
+	): Promise<{ transcript: LongTranscript; storage: RecordingFileStorage }> {
 		const dir = TempDir.createSync("@omp-bounded-io-");
 		cleanups.push(() => dir.removeSync());
 		const cwd = dir.join("project");
 		fs.mkdirSync(cwd, { recursive: true });
-		const transcript = await writeLongTranscript(cwd, dir.join("sessions"));
+		const transcript = await writeLongTranscript(cwd, dir.join("sessions"), options);
 		return { transcript, storage: new RecordingFileStorage() };
 	}
 
@@ -801,7 +809,8 @@ describe("a running session's reads and writes of a 64 MiB transcript on file st
 			const patchRecords = (manager: SessionManager) =>
 				manager.getEntries().filter(entry => entry.type === "custom" && entry.customType === ENTRY_PATCH_TYPE)
 					.length;
-			const { transcript, storage } = await setUp();
+			// Without images, a dead-end rescue has none to drop: `dropImages`, a full write by design, keeps its own case.
+			const { transcript, storage } = await setUp({ images: false });
 
 			const retrying = await recoveringSession(transcript, storage);
 			storage.fullWrites = 0;
@@ -810,7 +819,7 @@ describe("a running session's reads and writes of a 64 MiB transcript on file st
 			expect([storage.fullWrites, patchRecords(retrying.sessionManager)]).toEqual([0, 1]);
 
 			const compacting = await deadEndCompactionSession(
-				await writeLongTranscript(transcript.cwd, transcript.sessionDir),
+				await writeLongTranscript(transcript.cwd, transcript.sessionDir, { images: false }),
 				storage,
 			);
 			storage.fullWrites = 0;
@@ -819,7 +828,10 @@ describe("a running session's reads and writes of a 64 MiB transcript on file st
 			expect(patchRecords(compacting.sessionManager)).toBeGreaterThanOrEqual(1);
 
 			const shaking = await startSession(
-				await open((await writeLongTranscript(transcript.cwd, transcript.sessionDir)).file, storage),
+				await open(
+					(await writeLongTranscript(transcript.cwd, transcript.sessionDir, { images: false })).file,
+					storage,
+				),
 				{
 					settings: { "compaction.enabled": true },
 				},
