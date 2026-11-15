@@ -1002,7 +1002,8 @@ LATE_PROMPT_FAILURE_SERVER = textwrap.dedent(
 )
 
 # The late failure of a prompt the server already acknowledged, as omp sends it when the prompt
-# waited for the agent and another run still held it: the failure response carries a code.
+# waited for the agent and another run still held it: the failure response and the prompt_result
+# carry a code. The test reads the code of the late failure response.
 LATE_BUSY_PROMPT_FAILURE_SERVER = LATE_PROMPT_FAILURE_SERVER.replace(
     '"success": False,', '"success": False, "code": "session_busy",'
 ).replace(
@@ -2097,7 +2098,6 @@ class RpcClientTests(unittest.TestCase):
     def test_prompt_and_wait_keeps_the_code_of_a_late_prompt_failure(self) -> None:
         # A host tells a busy agent from a failed prompt by the code, so the error raised for a
         # late failure must carry it, as the error raised for an immediate refusal does.
-        self.assertIn('"code": "session_busy"', LATE_BUSY_PROMPT_FAILURE_SERVER)
         client = self.make_client(server=LATE_BUSY_PROMPT_FAILURE_SERVER)
 
         try:
