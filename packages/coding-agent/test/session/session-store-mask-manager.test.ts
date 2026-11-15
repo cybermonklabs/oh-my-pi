@@ -28,6 +28,7 @@ import {
 	listSessionRecaps,
 	lookupSessionTitle,
 } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import { maskSessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entry-mask";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
@@ -3217,3 +3218,90 @@ for (const backend of backends) {
 		});
 	});
 }
+
+describe("keep rules hold only in the shape the list names", () => {
+	const at = (type: string, fields: Record<string, unknown>) => ({
+		type,
+		id: "shape-entry",
+		parentId: null,
+		timestamp: "2026-01-01T00:00:00.000Z",
+		...fields,
+	});
+	const inMessage = (message: Record<string, unknown>) => at("message", { message });
+	const replay = (fields: Record<string, unknown>) =>
+		inMessage({ ...assistant([]), ...fields } as unknown as Record<string, unknown>);
+	const serverTool = (element: Record<string, unknown>) =>
+		replay({
+			content: [
+				{
+					type: "anthropicServerTool",
+					block: { type: "web_search_tool_result", tool_use_id: "srvtoolu_1", content: [element] },
+				},
+			],
+		});
+	// Each record puts a held value where the list keeps a field, but in another shape or on
+	// another element type than the one the list names; the stored copy must not hold the value.
+	const cases: Array<[string, unknown]> = [
+		["a kept string field written as an array (label id)", at("label", { targetId: "t", id: [ENV_VALUE] })],
+		[
+			"a kept string field written as an array (tool call name)",
+			replay({ content: [{ type: "toolCall", id: "call-s", name: [ENV_VALUE], arguments: {} }] }),
+		],
+		[
+			"an object position written as an array (runtime)",
+			at("label", { targetId: "t", runtime: [{ version: ENV_VALUE }] }),
+		],
+		[
+			"an array-item position written as one object (user content)",
+			inMessage({ role: "user", timestamp: 1, content: { type: "image", data: ENV_VALUE, mimeType: "image/png" } }),
+		],
+		[
+			"a carrier's kept string field written as an array (Responses call_id)",
+			replay({
+				providerPayload: {
+					type: "openaiResponsesHistory",
+					provider: "openai",
+					items: [{ type: "function_call", call_id: [ENV_VALUE] }],
+				},
+			}),
+		],
+		[
+			"encrypted_content on a server-tool error element",
+			serverTool({ type: "web_search_tool_result_error", encrypted_content: ENV_VALUE }),
+		],
+		["error_code on a server-tool result element", serverTool({ type: "web_search_result", error_code: ENV_VALUE })],
+	];
+	for (const [name, record] of cases) {
+		it(`masks ${name}`, () => {
+			expect({ name, held: JSON.stringify(maskSessionEntry(record, mask)).includes(ENV_VALUE) }).toEqual({
+				name,
+				held: false,
+			});
+		});
+	}
+
+	it("masks a held value in a tool result detail that is a URL object, as the session file stores it", async () => {
+		maskWrites();
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(cwd, tmp.join("sessions"), storage);
+		await manager.ensureOnDisk();
+		manager.appendMessage(
+			assistant([{ type: "toolCall", id: "call-u", name: "fetch", arguments: {} }], { stopReason: "toolUse" }),
+		);
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-u",
+			toolName: "fetch",
+			content: [{ type: "text", text: "fetched" }],
+			details: { link: new URL(`https://example.invalid/page?ref=${ENV_VALUE}`) },
+			isError: false,
+			timestamp: NOW,
+		});
+		await manager.flush();
+		await storage.drain();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected a session file");
+		expect((await storage.readText(file)).includes(ENV_VALUE)).toBe(false);
+		await manager.close();
+	});
+});
