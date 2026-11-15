@@ -267,6 +267,29 @@ export function getReadableCompactionEntry(
 	return null;
 }
 
+/**
+ * Index on `path` of the first entry the context keeps from `compaction`, which
+ * sits at `compactionIndex`: its `firstKeptEntryId`, or the entry after
+ * `providerReplayThroughEntryId` when `firstKeptEntryId` is empty; the
+ * compaction itself when neither lies before it. Entries before this index
+ * reach the context only through the compaction's summary.
+ */
+export function compactionKeptStart(
+	path: readonly SessionEntry[],
+	compaction: CompactionEntry,
+	compactionIndex: number,
+): number {
+	const firstKeptIndex = path.findIndex(
+		(entry, index) => index < compactionIndex && entry.id === compaction.firstKeptEntryId,
+	);
+	if (firstKeptIndex >= 0) return firstKeptIndex;
+	if (compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId) {
+		const replayThroughIndex = path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId);
+		if (replayThroughIndex >= 0 && replayThroughIndex + 1 < compactionIndex) return replayThroughIndex + 1;
+	}
+	return compactionIndex;
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -554,15 +577,8 @@ export function buildSessionContext(
 		// still retires the tail's pre-compaction usage reports.
 		let historyRewriteAt: number | undefined;
 		if (anthropicPayload !== undefined) {
-			const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
-			const snapshotIdx =
-				compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
-					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
-					: -1;
-			const firstRetained =
-				(firstKeptIdx >= 0 && firstKeptIdx < compactionIdx ? path[firstKeptIdx] : undefined) ??
-				(snapshotIdx >= 0 && snapshotIdx < compactionIdx - 1 ? path[snapshotIdx + 1] : undefined) ??
-				path[compactionIdx + 1];
+			const keptStart = compactionKeptStart(path, compaction, compactionIdx);
+			const firstRetained = keptStart < compactionIdx ? path[keptStart] : path[compactionIdx + 1];
 			// The message's own time, not the entry's: an assistant message is
 			// stamped when its stream starts and saved after it ends, so a marker
 			// derived from the entry would postdate that turn and strip its thinking.
@@ -630,15 +646,12 @@ export function buildSessionContext(
 		// turns visible instead of showing only the summary and post-compaction.
 		if (!remoteReplacementHistory || options?.transcript) {
 			// Emit kept messages (before compaction, starting from firstKeptEntryId).
-			const firstKeptIdx = path.findIndex(
-				(entry, index) => index < compactionIdx && entry.id === compaction.firstKeptEntryId,
-			);
-			const snapshotIdx =
-				anthropicPayload && compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
-					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
-					: -1;
-			const retainedStart = firstKeptIdx >= 0 ? firstKeptIdx : snapshotIdx >= 0 ? snapshotIdx + 1 : -1;
-			if (retainedStart >= 0 && retainedStart < compactionIdx) {
+			// A replay-through boundary bounds the kept region only for a native Anthropic summary.
+			const retainedStart =
+				compaction.firstKeptEntryId === "" && !anthropicPayload
+					? compactionIdx
+					: compactionKeptStart(path, compaction, compactionIdx);
+			if (retainedStart < compactionIdx) {
 				let displayStartIdx = retainedStart;
 				if (options?.transcript) {
 					// `findCutPoint` may leave the collapsed display's kept region

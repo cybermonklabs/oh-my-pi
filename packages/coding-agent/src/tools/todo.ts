@@ -13,7 +13,7 @@ import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
-import type { SessionEntry } from "../session/session-entries";
+import { type SessionEntry, todoResultPhases } from "../session/session-entries";
 
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
 
@@ -187,17 +187,8 @@ function canonicalTodoPhases(entry: SessionEntry): TodoPhase[] | undefined {
 		const phases = (entry.data as { phases?: unknown } | undefined)?.phases;
 		return Array.isArray(phases) ? (phases as TodoPhase[]) : undefined;
 	}
-	if (entry.type !== "message") return undefined;
-	const message = entry.message as {
-		role?: string;
-		toolName?: string;
-		details?: { op?: unknown; phases?: unknown };
-		isError?: boolean;
-	};
-	if (message.role !== "toolResult" || message.toolName !== "todo" || message.isError) return undefined;
-	if (message.details?.op === "view") return undefined;
-	const phases = message.details?.phases;
-	return Array.isArray(phases) ? (phases as TodoPhase[]) : undefined;
+	const phases = todoResultPhases(entry);
+	return phases ? (phases as TodoPhase[]) : undefined;
 }
 
 /** Identify the latest durable canonical todo snapshot on the active branch. */

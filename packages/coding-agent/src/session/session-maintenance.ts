@@ -100,6 +100,7 @@ import {
 import {
 	assistantTurnDelivered,
 	convertToLlm,
+	countStrippableImages,
 	invalidateConvertToLlmArrayCache,
 	isUserAuthoredMessage,
 	stripImagesFromMessage,
@@ -885,10 +886,16 @@ export class SessionMaintenance {
 			// hides everything before its cutoff from the wire.
 			const anchored = index < anchorIndex && (!hasRemoteReplacementHistory || index > compactionIndex);
 			if (entry.type === "message") {
-				const before = this.#tokenizer.countMessage(entry.message, countOptions);
-				const dropped = stripImagesFromMessage(entry.message);
+				// A body read back from the cold store is frozen: only an entry that
+				// carries images is made whole and rewritten.
+				if (countStrippableImages(entry.message) === 0) continue;
+				const { dropped, saved } = this.#host.sessionManager.updateEntryBody(entry.id, () => {
+					const before = this.#tokenizer.countMessage(entry.message, countOptions);
+					const strippedCount = stripImagesFromMessage(entry.message);
+					const after = this.#tokenizer.countMessage(entry.message, countOptions);
+					return { dropped: strippedCount, saved: Math.max(0, before - after) };
+				});
 				if (dropped === 0) continue;
-				const saved = Math.max(0, before - this.#tokenizer.countMessage(entry.message, countOptions));
 				removed += dropped;
 				tokensFreed += saved;
 				if (anchored) anchoredTokensRemoved += saved;
@@ -913,7 +920,9 @@ export class SessionMaintenance {
 			if (kept.length === 0) {
 				kept.push({ type: "text", text: "[image removed]" });
 			}
-			entry.content = kept;
+			this.#host.sessionManager.updateEntryBody(entry.id, () => {
+				entry.content = kept;
+			});
 			// A spread keeps the second count off the projected message's memoized identity.
 			const saved = Math.max(
 				0,
@@ -1012,10 +1021,13 @@ export class SessionMaintenance {
 				// Match the stored-context floor: opaque signatures and encrypted
 				// reasoning bytes do not have a reliable provider-token equivalent.
 				const before = this.#tokenizer.countMessage(message, countOptions);
-				// Provider serializers omit empty assistant turns, so don't invent model-authored text.
-				message.content = kept;
-				invalidateMessageCache(message);
-				const saved = Math.max(0, before - this.#tokenizer.countMessage(message, countOptions));
+				// A cold body is made whole for the write and goes back to the store with it.
+				const saved = this.#host.sessionManager.updateEntryBody(entry.id, () => {
+					// Provider serializers omit empty assistant turns, so don't invent model-authored text.
+					message.content = kept;
+					invalidateMessageCache(message);
+					return Math.max(0, before - this.#tokenizer.countMessage(message, countOptions));
+				});
 				tokensFreed += saved;
 				if (index < anchorIndex && (!hasRemoteReplacementHistory || index > compactionIndex)) {
 					anchoredTokensRemoved += saved;

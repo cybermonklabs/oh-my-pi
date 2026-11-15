@@ -1,0 +1,711 @@
+/**
+ * Older entry bodies on disk instead of in memory.
+ *
+ * The model context only needs the entries from the latest compaction's cut on
+ * (see {@link coldCutIndex}). An entry before the cut becomes *cold*: the same
+ * object, converted in place, whose small values stay data properties and whose
+ * large values become enumerable accessors that read the entry's record back
+ * from a {@link ColdEntryStore}. `JSON.stringify`, spread and `structuredClone`
+ * still see every field. A read returns a deep-frozen value, so a place that
+ * writes into a nested value of a cold body fails with a `TypeError` instead of
+ * losing the write; assigning a field (`entry.message = …`,
+ * `message.content = …`) first makes the whole entry whole again
+ * ({@link hydrateColdEntry}).
+ *
+ * Accessor functions are shared per field name and find their entry's record
+ * through a symbol-keyed property, so a cold entry costs no closure.
+ */
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { Model } from "@oh-my-pi/pi-ai";
+import { logger, stringifyJson } from "@oh-my-pi/pi-utils";
+import { type BlobStore, isBlobRef } from "./blob-store";
+import { compactionKeptStart, getReadableCompactionEntry } from "./session-context";
+import { type SessionEntry, TITLE_CHANGE_ENTRY_TYPE, todoResultPhases } from "./session-entries";
+import { resolveBlobRefsInEntriesSync } from "./session-loader";
+import { entryRecordText } from "./session-persistence";
+
+/**
+ * A string value of a cold entry stays in memory up to this many UTF-16 units:
+ * ids, roles, providers, models, stop reasons, tool names and call ids fit.
+ */
+export const COLD_STRING_MAX_UNITS = 64;
+/**
+ * An object or array value of a cold entry stays in memory while its JSON
+ * text fits in this many bytes: a message's `usage` (at most 279 bytes in a
+ * long measured session) fits, as do small tool and card details.
+ */
+export const COLD_JSON_MAX_BYTES = 320;
+/** Materialized records kept for the next field read of the same entries. */
+const CACHE_ENTRIES = 8;
+const CACHE_BYTES = 16 * 1024 * 1024;
+/** Records are written in batches of about this size. */
+const WRITE_BATCH_BYTES = 1024 * 1024;
+
+/**
+ * Entry types that stay whole before the cut: extension and feature state, and
+ * the selections a resume restores (model of each role, thinking level,
+ * service tier, mode, TTSR rules, labels, credential pins, `/clear` boundaries,
+ * usage, titles). {@link entriesKeptWholeOnPath} adds two entries by position.
+ */
+export const ENTRY_TYPES_KEPT_WHOLE: ReadonlySet<string> = new Set<SessionEntry["type"]>([
+	"custom",
+	"model_change",
+	"thinking_level_change",
+	"service_tier_change",
+	"mode_change",
+	"ttsr_injection",
+	"label",
+	"credential_pin",
+	"reset_boundary",
+	"model_usage",
+	TITLE_CHANGE_ENTRY_TYPE,
+]);
+
+/** Fields that always stay data: the tree structure every walk reads. */
+const ENTRY_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["type", "id", "parentId", "timestamp", "activeLeafId"]);
+const MESSAGE_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["role"]);
+
+/**
+ * Entries of `path` kept whole before the cut although their type is not:
+ * the newest `session_init` (the contract a revived subagent rebuilds from)
+ * and the newest `todo` result that records the list (what the to-do list
+ * restores from).
+ */
+export function entriesKeptWholeOnPath(path: readonly SessionEntry[]): Set<SessionEntry> {
+	const kept = new Set<SessionEntry>();
+	let sessionInit = false;
+	let todo = false;
+	for (let index = path.length - 1; index >= 0 && !(sessionInit && todo); index--) {
+		const entry = path[index]!;
+		if (entry.type === "session_init") {
+			if (!sessionInit) kept.add(entry);
+			sessionInit = true;
+		} else if (!todo && todoResultPhases(entry)) {
+			kept.add(entry);
+			todo = true;
+		}
+	}
+	return kept;
+}
+
+/**
+ * Index in `entries` (file order) of the cut for the leaf that `path` ends at:
+ * the first entry the context keeps ({@link compactionKeptStart}) of the newest
+ * compaction on the path and, with `model`, of the newest compaction `model`
+ * can replay, whichever comes first. 0 (nothing cold) when the context uses
+ * no compaction.
+ */
+export function coldCutIndex(
+	entries: readonly SessionEntry[],
+	path: readonly SessionEntry[],
+	model: Model | undefined,
+): number {
+	const compactions = [getReadableCompactionEntry(path, undefined)];
+	if (model) compactions.push(getReadableCompactionEntry(path, model));
+	let start = path.length;
+	for (const compaction of compactions) {
+		if (!compaction) return 0;
+		start = Math.min(start, compactionKeptStart(path, compaction, path.indexOf(compaction)));
+	}
+	const cutEntry = path[start];
+	const index = cutEntry ? entries.indexOf(cutEntry) : -1;
+	return index < 0 ? 0 : index;
+}
+
+/** Short strings shared across a load's entries; longer ones are mostly unique. */
+const INTERNED_STRING_MAX_UNITS = 64;
+/** Distinct values one load shares at most, so unique values cannot grow the tables without bound. */
+const INTERNED_VALUES_MAX = 16_384;
+
+/**
+ * Shares equal values among the entries one load parses, which the parser
+ * gives each its own copy of: short strings of the entry and of its message
+ * (a string's identity is not observable), each `parentId` with its parent's
+ * `id`, and the `runtime` identity, the same for every entry one build wrote,
+ * which is frozen once shared. Memory per entry is what a long session's
+ * older entries keep in memory, so the copies add up.
+ */
+export class LoadedValueInterner {
+	readonly #strings = new Map<string, string>();
+	readonly #runtimes = new Map<string, object>();
+
+	/** Share `entry`'s values with the entries already interned; `parent` is its parent entry, if loaded. */
+	intern(entry: SessionEntry, parent: SessionEntry | undefined): void {
+		const holder = entry as unknown as Record<string, unknown>;
+		this.#internStrings(holder);
+		if (parent && entry.parentId === parent.id) holder.parentId = parent.id;
+		const runtime = holder.runtime;
+		if (typeof runtime === "object" && runtime !== null) holder.runtime = this.#internRuntime(runtime);
+		const message = entry.type === "message" ? holder.message : undefined;
+		if (typeof message === "object" && message !== null && !Array.isArray(message)) {
+			this.#internStrings(message as Record<string, unknown>);
+		}
+	}
+
+	#internStrings(holder: Record<string, unknown>): void {
+		for (const key of Object.keys(holder)) {
+			if (key === "id" || key === "parentId" || key === "timestamp") continue;
+			const value = holder[key];
+			if (typeof value !== "string" || value.length > INTERNED_STRING_MAX_UNITS) continue;
+			const shared = this.#strings.get(value);
+			if (shared !== undefined) holder[key] = shared;
+			else if (this.#strings.size < INTERNED_VALUES_MAX) this.#strings.set(value, value);
+		}
+	}
+
+	#internRuntime(runtime: object): object {
+		const key = stringifyJson(runtime);
+		if (key === undefined || key.length > INTERNED_STRING_MAX_UNITS) return runtime;
+		const shared = this.#runtimes.get(key);
+		if (shared) return shared;
+		if (this.#runtimes.size >= INTERNED_VALUES_MAX) return runtime;
+		this.#runtimes.set(key, Object.freeze(runtime));
+		return runtime;
+	}
+}
+
+/** Which entries are cold for one leaf and model. */
+export interface ColdBoundary {
+	/** Index in file order of the first entry from which every entry is whole. */
+	readonly cutIndex: number;
+	/** Entries before the cut kept whole by position ({@link entriesKeptWholeOnPath}). */
+	readonly keptOnPath: ReadonlySet<SessionEntry>;
+}
+
+export function coldBoundary(
+	entries: readonly SessionEntry[],
+	path: readonly SessionEntry[],
+	model: Model | undefined,
+): ColdBoundary {
+	const cutIndex = coldCutIndex(entries, path, model);
+	return { cutIndex, keptOnPath: cutIndex > 0 ? entriesKeptWholeOnPath(path) : new Set() };
+}
+
+/** Whether the entry at file index `index` belongs in the store under `boundary`. */
+export function belongsCold(entry: SessionEntry, index: number, boundary: ColdBoundary): boolean {
+	return index < boundary.cutIndex && !ENTRY_TYPES_KEPT_WHOLE.has(entry.type) && !boundary.keptOnPath.has(entry);
+}
+
+/** Where one entry's record lives, read from the entry's hidden slots. */
+interface ColdRecord {
+	readonly store: ColdEntryStore;
+	readonly offset: number;
+	readonly length: number;
+}
+
+// A record's location is kept as three hidden values on the entry (no object
+// per entry); copies of a cold entry carry the same three.
+const COLD_STORE = Symbol("omp.coldStore");
+const COLD_OFFSET = Symbol("omp.coldOffset");
+const COLD_LENGTH = Symbol("omp.coldLength");
+const COLD_MESSAGE = Symbol("omp.coldMessage");
+const COLD_OWNER = Symbol("omp.coldOwner");
+
+interface ColdEntrySlots {
+	[COLD_STORE]?: ColdEntryStore;
+	[COLD_OFFSET]?: number;
+	[COLD_LENGTH]?: number;
+	[COLD_MESSAGE]?: object;
+}
+
+interface ColdMessageSlots {
+	[COLD_OWNER]?: object;
+}
+
+function recordOf(entry: object): ColdRecord | undefined {
+	const slots: ColdEntrySlots = entry;
+	const store = slots[COLD_STORE];
+	if (!store) return undefined;
+	return { store, offset: slots[COLD_OFFSET] ?? 0, length: slots[COLD_LENGTH] ?? 0 };
+}
+
+function setHiddenSlot(target: object, key: symbol, value: unknown): void {
+	Object.defineProperty(target, key, { value, writable: true, enumerable: false, configurable: true });
+}
+
+function setRecordSlots(target: object, record: ColdRecord): void {
+	setHiddenSlot(target, COLD_STORE, record.store);
+	setHiddenSlot(target, COLD_OFFSET, record.offset);
+	setHiddenSlot(target, COLD_LENGTH, record.length);
+}
+
+/** Whether `entry` keeps values in a {@link ColdEntryStore}. */
+export function isColdEntry(entry: object): boolean {
+	const slots: ColdEntrySlots = entry;
+	return slots[COLD_STORE] !== undefined;
+}
+
+/** The materialized record of cold `entry`, shared and frozen. */
+function materializedRecordOf(entry: object): Readonly<Record<string, unknown>> {
+	const record = recordOf(entry);
+	if (!record) throw new Error("A cold session entry lost its record.");
+	return record.store.materialize(record);
+}
+
+function ownerOf(message: object): object {
+	const slots: ColdMessageSlots = message;
+	const owner = slots[COLD_OWNER];
+	if (!owner) throw new Error("A cold session message lost its entry.");
+	return owner;
+}
+
+const entryFieldAccessors = new Map<string, PropertyDescriptor>();
+const messageFieldAccessors = new Map<string, PropertyDescriptor>();
+
+function entryFieldAccessor(key: string): PropertyDescriptor {
+	let accessor = entryFieldAccessors.get(key);
+	if (!accessor) {
+		accessor = {
+			get(this: object): unknown {
+				return materializedRecordOf(this)[key];
+			},
+			set(this: object, value: unknown): void {
+				hydrateColdEntry(this);
+				Reflect.set(this, key, value);
+			},
+			enumerable: true,
+			configurable: true,
+		};
+		entryFieldAccessors.set(key, accessor);
+	}
+	return accessor;
+}
+
+function messageFieldAccessor(key: string): PropertyDescriptor {
+	let accessor = messageFieldAccessors.get(key);
+	if (!accessor) {
+		accessor = {
+			get(this: object): unknown {
+				const message = materializedRecordOf(ownerOf(this)).message;
+				return typeof message === "object" && message !== null ? Reflect.get(message, key) : undefined;
+			},
+			set(this: object, value: unknown): void {
+				hydrateColdEntry(ownerOf(this));
+				Reflect.set(this, key, value);
+			},
+			enumerable: true,
+			configurable: true,
+		};
+		messageFieldAccessors.set(key, accessor);
+	}
+	return accessor;
+}
+
+/** `entry.message` of a cold entry: the same message object, whose own large values are accessors. */
+const entryMessageAccessor: PropertyDescriptor = {
+	get(this: object): unknown {
+		const slots: ColdEntrySlots = this;
+		return slots[COLD_MESSAGE];
+	},
+	set(this: object, value: unknown): void {
+		hydrateColdEntry(this);
+		Reflect.set(this, "message", value);
+	},
+	enumerable: true,
+	configurable: true,
+};
+
+function isAccessorFrom(target: object, key: string, accessors: ReadonlyMap<string, PropertyDescriptor>): boolean {
+	const getter = Object.getOwnPropertyDescriptor(target, key)?.get;
+	return getter !== undefined && getter === accessors.get(key)?.get;
+}
+
+/** Fields of `holder` too large to keep in memory, in key order. */
+function largeFields(holder: Record<string, unknown>, inMemory: ReadonlySet<string>): string[] {
+	const keys: string[] = [];
+	for (const key of Object.keys(holder)) {
+		if (inMemory.has(key)) continue;
+		if (!staysInMemory(holder[key])) keys.push(key);
+	}
+	return keys;
+}
+
+/**
+ * Whether a value of a cold entry stays a data property. A value holding a
+ * blob reference never does: only a read through the store resolves it.
+ */
+function staysInMemory(value: unknown): boolean {
+	if (typeof value === "string") return value.length <= COLD_STRING_MAX_UNITS && !isBlobRef(value);
+	if (typeof value !== "object" || value === null) return true;
+	return jsonFits(value, COLD_JSON_MAX_BYTES);
+}
+
+/**
+ * Whether `value`'s JSON text fits in `limit` UTF-8 bytes and holds no blob
+ * reference. A walk that counts each UTF-16 unit as one byte bounds the text
+ * from below and stops as soon as it passes the limit, so a large value is
+ * rejected without serializing it.
+ */
+function jsonFits(value: object, limit: number): boolean {
+	let lowerBound = 0;
+	const pending: unknown[] = [value];
+	while (pending.length > 0) {
+		const item = pending.pop();
+		if (typeof item === "string") {
+			if (isBlobRef(item)) return false;
+			lowerBound += item.length + 2;
+		} else if (typeof item === "number" || typeof item === "boolean" || item === null) lowerBound += 1;
+		else if (Array.isArray(item)) {
+			lowerBound += item.length + 1;
+			if (lowerBound > limit) return false;
+			for (const element of item) pending.push(element);
+		} else if (typeof item === "object") {
+			lowerBound += 1;
+			for (const key in item) {
+				if (!Object.hasOwn(item, key)) continue;
+				const child: unknown = Reflect.get(item, key);
+				if (child === undefined || typeof child === "function") continue;
+				lowerBound += key.length + 3;
+				pending.push(child);
+			}
+		}
+		if (lowerBound > limit) return false;
+	}
+	const text = stringifyJson(value);
+	return text === undefined || Buffer.byteLength(text, "utf8") <= limit;
+}
+
+function deepFreeze(value: unknown): void {
+	const pending: unknown[] = [value];
+	while (pending.length > 0) {
+		const item = pending.pop();
+		if (typeof item !== "object" || item === null || Object.isFrozen(item)) continue;
+		Object.freeze(item);
+		if (Array.isArray(item)) {
+			for (const element of item) pending.push(element);
+		} else {
+			for (const key of Object.keys(item)) pending.push(Reflect.get(item, key));
+		}
+	}
+}
+
+/** What the finalizer needs to release a store; must not refer to the store. */
+interface StoreHandle {
+	fd: number;
+	/** Set on Windows, where an open file cannot be unlinked: deleted when the store goes. */
+	path: string | undefined;
+}
+
+const windowsStoreHandles = new Set<StoreHandle>();
+let windowsExitHookInstalled = false;
+
+function releaseStoreHandle(handle: StoreHandle): void {
+	try {
+		fs.closeSync(handle.fd);
+	} catch {
+		// Already closed.
+	}
+	if (handle.path === undefined) return;
+	windowsStoreHandles.delete(handle);
+	try {
+		fs.unlinkSync(handle.path);
+	} catch {
+		// Already gone.
+	}
+}
+
+/** Closes a store's descriptor once no manager and no cold entry refers to the store. */
+const storeRegistry = new FinalizationRegistry<StoreHandle>(releaseStoreHandle);
+
+function trackWindowsStore(handle: StoreHandle): void {
+	windowsStoreHandles.add(handle);
+	if (windowsExitHookInstalled) return;
+	windowsExitHookInstalled = true;
+	process.once("exit", () => {
+		for (const pending of windowsStoreHandles) releaseStoreHandle(pending);
+	});
+}
+
+/**
+ * One loaded manager's records of cold entries: a file under
+ * `os.tmpdir()/omp-cold/`, unlinked as soon as it is open on POSIX (its disk
+ * is freed when the descriptor closes, and a killed process leaves nothing;
+ * on Windows it is deleted when the store is collected and at exit). A record
+ * is the entry exactly as the manager held it, with image data replaced by
+ * blob references. Every cold entry refers to its store, so a clone sharing
+ * the entries keeps it open as long as it needs it.
+ */
+export class ColdEntryStore {
+	readonly #blobs: BlobStore;
+	readonly #handle: StoreHandle;
+	/** Bytes handed out to records, written or pending. */
+	#bytes = 0;
+	/** Bytes on disk; every later byte is in `#pending`. */
+	#written = 0;
+	#pending: Buffer[] = [];
+	#pendingBytes = 0;
+	#writeFailureLogged = false;
+	/** Materialized records by offset, most recent last. */
+	readonly #cache = new Map<number, { entry: Readonly<Record<string, unknown>>; bytes: number }>();
+	#cacheBytes = 0;
+	#materializations = 0;
+	#hydrations = 0;
+
+	constructor(blobs: BlobStore) {
+		this.#blobs = blobs;
+		const dir = path.join(os.tmpdir(), "omp-cold");
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
+		const fd = fs.openSync(file, "wx+", 0o600);
+		this.#handle = { fd, path: undefined };
+		if (process.platform === "win32") {
+			this.#handle.path = file;
+			trackWindowsStore(this.#handle);
+		} else {
+			fs.unlinkSync(file);
+		}
+		storeRegistry.register(this, this.#handle, this);
+	}
+
+	/** Bytes of records written to the store. */
+	get bytes(): number {
+		return this.#bytes;
+	}
+
+	/** Records read and parsed to serve an accessor read (cache misses). */
+	get materializations(): number {
+		return this.#materializations;
+	}
+
+	/** Cold entries made whole again. */
+	get hydrations(): number {
+		return this.#hydrations;
+	}
+
+	/** The blob store image data of this store's records live in. */
+	get blobs(): BlobStore {
+		return this.#blobs;
+	}
+
+	/** The record parsed fresh and unfrozen, its blob references resolved when `resolveBlobs`. */
+	parse(record: ColdRecord, resolveBlobs: boolean): Record<string, unknown> {
+		const entry = JSON.parse(this.#read(record).toString("utf8")) as Record<string, unknown>;
+		if (resolveBlobs) resolveBlobRefsInEntriesSync([entry as unknown as SessionEntry], this.#blobs);
+		return entry;
+	}
+
+	/** The record parsed, its blob references resolved and deep-frozen; the 8 most recent are cached. */
+	materialize(record: ColdRecord): Readonly<Record<string, unknown>> {
+		const cached = this.#cache.get(record.offset);
+		if (cached) {
+			this.#cache.delete(record.offset);
+			this.#cache.set(record.offset, cached);
+			return cached.entry;
+		}
+		const entry = this.parse(record, true);
+		deepFreeze(entry);
+		this.#materializations++;
+		if (record.length <= CACHE_BYTES) {
+			this.#cache.set(record.offset, { entry, bytes: record.length });
+			this.#cacheBytes += record.length;
+			for (const [key, value] of this.#cache) {
+				if (this.#cache.size <= CACHE_ENTRIES && this.#cacheBytes <= CACHE_BYTES) break;
+				this.#cache.delete(key);
+				this.#cacheBytes -= value.bytes;
+			}
+		}
+		return entry;
+	}
+
+	/** Count a hydration of one of this store's entries. */
+	noteHydration(): void {
+		this.#hydrations++;
+	}
+
+	/** Close the store now. Only for a store no cold entry refers to. */
+	close(): void {
+		storeRegistry.unregister(this);
+		this.#cache.clear();
+		this.#pending = [];
+		releaseStoreHandle(this.#handle);
+	}
+
+	/** Write one record; its entry becomes cold through {@link convertToColdEntry}. */
+	append(text: string): ColdRecord {
+		const data = Buffer.from(text, "utf8");
+		const record: ColdRecord = { store: this, offset: this.#bytes, length: data.length };
+		this.#pending.push(data);
+		this.#pendingBytes += data.length;
+		this.#bytes += data.length;
+		if (this.#pendingBytes >= WRITE_BATCH_BYTES) this.#flush();
+		return record;
+	}
+
+	/**
+	 * Write the pending records. A failed write keeps them in memory, where
+	 * reads still find them, and the next flush tries again.
+	 */
+	#flush(): boolean {
+		if (this.#pendingBytes === 0) return true;
+		const data = this.#pending.length === 1 ? this.#pending[0]! : Buffer.concat(this.#pending, this.#pendingBytes);
+		this.#pending = [data];
+		try {
+			let done = 0;
+			while (done < data.length) {
+				done += fs.writeSync(this.#handle.fd, data, done, data.length - done, this.#written + done);
+			}
+		} catch (error) {
+			if (!this.#writeFailureLogged) {
+				this.#writeFailureLogged = true;
+				logger.warn("Cold session entries stay in memory: writing their store failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return false;
+		}
+		this.#written += data.length;
+		this.#pending = [];
+		this.#pendingBytes = 0;
+		return true;
+	}
+
+	#read(record: ColdRecord): Buffer {
+		if (record.offset >= this.#written && !this.#flush()) {
+			const pending = this.#pending.length === 1 ? this.#pending[0]! : Buffer.concat(this.#pending);
+			const start = record.offset - this.#written;
+			return pending.subarray(start, start + record.length);
+		}
+		const data = Buffer.allocUnsafe(record.length);
+		let done = 0;
+		while (done < record.length) {
+			const read = fs.readSync(this.#handle.fd, data, done, record.length - done, record.offset + done);
+			if (read === 0) throw new Error("A cold session entry's record is truncated.");
+			done += read;
+		}
+		return data;
+	}
+}
+
+/**
+ * Make a cold `entry` whole again, in place: parse its record unfrozen and turn
+ * every accessor back into a data property, `entry.message` staying the same
+ * object. Without `resolveBlobs: false` image data are read back from the blob
+ * store. Returns false when `entry` is not cold.
+ */
+export function hydrateColdEntry(entry: object, options?: { resolveBlobs?: boolean }): boolean {
+	const record = recordOf(entry);
+	if (!record) return false;
+	const parsed = record.store.parse(record, options?.resolveBlobs !== false);
+	const slots: ColdEntrySlots = entry;
+	const shell = slots[COLD_MESSAGE];
+	if (shell) {
+		const parsedMessage = parsed.message;
+		if (typeof parsedMessage === "object" && parsedMessage !== null) {
+			restoreFields(shell, parsedMessage as Record<string, unknown>, messageFieldAccessors);
+		}
+		const shellSlots: ColdMessageSlots = shell;
+		delete shellSlots[COLD_OWNER];
+		Object.defineProperty(entry, "message", { value: shell, writable: true, enumerable: true, configurable: true });
+		delete slots[COLD_MESSAGE];
+	}
+	restoreFields(entry, parsed, entryFieldAccessors);
+	delete slots[COLD_STORE];
+	delete slots[COLD_OFFSET];
+	delete slots[COLD_LENGTH];
+	record.store.noteHydration();
+	return true;
+}
+
+function restoreFields(
+	target: object,
+	source: Record<string, unknown>,
+	accessors: ReadonlyMap<string, PropertyDescriptor>,
+): void {
+	for (const key of Object.keys(target)) {
+		if (!isAccessorFrom(target, key, accessors)) continue;
+		Object.defineProperty(target, key, { value: source[key], writable: true, enumerable: true, configurable: true });
+	}
+}
+
+/**
+ * Copy `source`'s fields onto `target` in key order: accessors shared, data
+ * copied so the two share nothing mutable (data values are small), and
+ * `define` given the first say over each key.
+ */
+function copyFields(
+	source: object,
+	target: Record<string, unknown>,
+	accessors: ReadonlyMap<string, PropertyDescriptor>,
+	define?: (key: string) => boolean,
+): void {
+	for (const key of Object.keys(source)) {
+		if (define?.(key)) continue;
+		if (isAccessorFrom(source, key, accessors)) {
+			Object.defineProperty(target, key, accessors.get(key)!);
+			continue;
+		}
+		const value: unknown = Reflect.get(source, key);
+		target[key] = typeof value === "object" && value !== null ? structuredClone(value) : value;
+	}
+}
+
+/**
+ * A new cold entry over the same record as cold `entry`: the same fields in
+ * the same order, with its own message object, and `overrides` applied as
+ * data. The copy shares no mutable value with `entry`.
+ */
+export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<string, unknown>>): SessionEntry {
+	const record = recordOf(entry);
+	if (!record) throw new Error("Only a cold session entry can be copied over its record.");
+	const copy: Record<string, unknown> = {};
+	const slots: ColdEntrySlots = entry as object;
+	const shell = slots[COLD_MESSAGE];
+	copyFields(entry, copy, entryFieldAccessors, key => {
+		if (overrides && Object.hasOwn(overrides, key)) {
+			copy[key] = overrides[key];
+			return true;
+		}
+		if (key !== "message" || !shell) return false;
+		const messageCopy: Record<string, unknown> = {};
+		copyFields(shell, messageCopy, messageFieldAccessors);
+		setHiddenSlot(messageCopy, COLD_OWNER, copy);
+		setHiddenSlot(copy, COLD_MESSAGE, messageCopy);
+		Object.defineProperty(copy, "message", entryMessageAccessor);
+		return true;
+	});
+	for (const key of Object.keys(overrides ?? {})) {
+		if (!Object.hasOwn(copy, key)) copy[key] = overrides?.[key];
+	}
+	setRecordSlots(copy, record);
+	return copy as unknown as SessionEntry;
+}
+
+/**
+ * Make `entry` cold, in place: write its record to the store `openStore`
+ * returns (called only when a record is written) and turn each value of the
+ * entry and of its `message` too large to keep ({@link COLD_STRING_MAX_UNITS},
+ * {@link COLD_JSON_MAX_BYTES}) into an accessor. Pass `imagesExternalized`
+ * for an entry parsed from a session file, whose image data are blob
+ * references already. Returns false, changing nothing, when every value is
+ * small or `entry` is cold already.
+ */
+export function convertToColdEntry(
+	entry: SessionEntry,
+	openStore: () => ColdEntryStore,
+	options?: { imagesExternalized?: boolean },
+): boolean {
+	if (isColdEntry(entry) || !Object.isExtensible(entry)) return false;
+	const holder = entry as unknown as Record<string, unknown>;
+	const message = entry.type === "message" ? holder.message : undefined;
+	const shell =
+		typeof message === "object" && message !== null && !Array.isArray(message) && Object.isExtensible(message)
+			? (message as Record<string, unknown>)
+			: undefined;
+	const messageKeys = shell ? largeFields(shell, MESSAGE_FIELDS_IN_MEMORY) : [];
+	const entryKeys = largeFields(holder, ENTRY_FIELDS_IN_MEMORY).filter(key => key !== "message" || !shell);
+	if (entryKeys.length === 0 && messageKeys.length === 0) return false;
+
+	const store = openStore();
+	const text = options?.imagesExternalized ? (stringifyJson(entry) ?? "null") : entryRecordText(entry, store.blobs);
+	setRecordSlots(entry, store.append(text));
+	for (const key of entryKeys) Object.defineProperty(entry, key, entryFieldAccessor(key));
+	if (shell && messageKeys.length > 0) {
+		setHiddenSlot(shell, COLD_OWNER, entry);
+		for (const key of messageKeys) Object.defineProperty(shell, key, messageFieldAccessor(key));
+		setHiddenSlot(entry, COLD_MESSAGE, shell);
+		Object.defineProperty(entry, "message", entryMessageAccessor);
+	}
+	return true;
+}
