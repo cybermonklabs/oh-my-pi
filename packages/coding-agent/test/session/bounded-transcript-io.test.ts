@@ -9,7 +9,7 @@
  * SQL storage cases run where `IndexedSessionStorage` reads in chunks; without
  * that capability its reads are whole by design, and the cases skip.
  */
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent, type StreamFn } from "@oh-my-pi/pi-agent-core";
@@ -29,6 +29,7 @@ import {
 	type SessionEntry,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { resolveResumableSession, resolveResumeTarget } from "@oh-my-pi/pi-coding-agent/session/session-listing";
+import { transcriptByteChunks } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	FileSessionStorage,
@@ -93,14 +94,32 @@ class ValueWatch {
 class RecordingFileStorage extends FileSessionStorage {
 	watch: ValueWatch | undefined;
 	fullWrites = 0;
+	/** The `expectedSize` each atomic full write was given, in order. */
+	readonly atomicExpectedSizes: Array<number | null | undefined> = [];
 	/** Park the next atomic full write until {@link releaseAtomic}, then let it land anyway. */
 	parkNextAtomic = false;
 	readonly atomicParked = Promise.withResolvers<void>();
 	readonly releaseAtomic = Promise.withResolvers<void>();
 
-	#lines(label: string, lines: readonly string[]): void {
+	/**
+	 * Count a full write, and hand its lines on to the base class noting each
+	 * one as the base class reads it, so lines built on demand are built once.
+	 */
+	#counted<T extends Iterable<string> & object>(label: string, lines: T): T {
 		this.fullWrites++;
-		for (const line of lines) this.watch?.noteValue(label, line);
+		const watch = this.watch;
+		if (!watch) return lines;
+		return new Proxy(lines, {
+			get(target, key, receiver) {
+				if (key !== Symbol.iterator) return Reflect.get(target, key, receiver);
+				return function* () {
+					for (const line of target) {
+						watch.noteValue(label, line);
+						yield line;
+					}
+				};
+			},
+		});
 	}
 
 	override async readText(filePath: string): Promise<string> {
@@ -138,8 +157,7 @@ class RecordingFileStorage extends FileSessionStorage {
 	}
 
 	override writeLinesSync(fpath: string, lines: readonly string[], options?: SessionStorageWriteOptions): void {
-		this.#lines("storage.writeLinesSync", lines);
-		super.writeLinesSync(fpath, lines, options);
+		super.writeLinesSync(fpath, this.#counted("storage.writeLinesSync", lines), options);
 	}
 
 	override async writeLinesAtomic(
@@ -147,13 +165,14 @@ class RecordingFileStorage extends FileSessionStorage {
 		lines: readonly string[],
 		options?: WriteTextAtomicOptions,
 	): Promise<void> {
-		this.#lines("storage.writeLinesAtomic", lines);
-		if (!this.parkNextAtomic) return super.writeLinesAtomic(fpath, lines, options);
+		this.atomicExpectedSizes.push(options?.expectedSize);
+		const counted = this.#counted("storage.writeLinesAtomic", lines);
+		if (!this.parkNextAtomic) return super.writeLinesAtomic(fpath, counted, options);
 		this.parkNextAtomic = false;
 		this.atomicParked.resolve();
 		await this.releaseAtomic.promise;
 		// A store that committed before it noticed it was superseded.
-		super.writeLinesSync(fpath, lines);
+		super.writeLinesSync(fpath, counted);
 	}
 }
 
@@ -243,6 +262,28 @@ async function watched<T>(
 	}
 }
 
+/** Byte length and SHA-256 of `chunks`, whole or from the line after the first on. */
+async function digest(
+	chunks: AsyncIterable<Uint8Array>,
+	options: { afterFirstLine?: boolean } = {},
+): Promise<{ bytes: number; sha256: string }> {
+	const hasher = new Bun.CryptoHasher("sha256");
+	let bytes = 0;
+	let inFirstLine = options.afterFirstLine === true;
+	for await (const chunk of chunks) {
+		let rest = chunk;
+		if (inFirstLine) {
+			const newline = chunk.indexOf(0x0a);
+			if (newline === -1) continue;
+			inFirstLine = false;
+			rest = chunk.subarray(newline + 1);
+		}
+		bytes += rest.byteLength;
+		hasher.update(rest);
+	}
+	return { bytes, sha256: hasher.digest("hex") };
+}
+
 function usage() {
 	return {
 		input: 100,
@@ -259,33 +300,57 @@ interface LongTranscript {
 	sessionId: string;
 	cwd: string;
 	sessionDir: string;
+	/** Entries after the header. */
+	entries: number;
 }
 
+/** The lines after the header of a long transcript, which each case's transcript copies. */
+interface TranscriptBody {
+	file: string;
+	entries: number;
+}
+
+/** Holds the file's transcript bodies, one per `images` variant; see {@link transcriptBody}. */
+let bodyDir: TempDir | undefined;
+const transcriptBodies = new Map<boolean, Promise<TranscriptBody>>();
+
+beforeAll(() => {
+	bodyDir = TempDir.createSync("@omp-bounded-io-body-");
+});
+
+afterAll(() => {
+	bodyDir?.removeSync();
+});
+
 /**
- * Write a transcript of at least {@link TRANSCRIPT_BYTES} to `sessionDir`,
- * line by line: turns of a user message (an image now and then, unless
- * `images` is false), an assistant message with thinking, a fenced code block
- * and a `read` call, and its result; three compactions on the current path,
- * the last keeping only the final turns; and a second branch off the middle
- * compaction.
+ * The body of a transcript of at least {@link TRANSCRIPT_BYTES}, written the
+ * first time a case asks for its `images` variant: turns of a user message
+ * (an image now and then, when `images` is true), an assistant message with
+ * thinking, a fenced code block and a `read` call, and its result; three
+ * compactions on the current path, the last keeping only the final turns; and
+ * a second branch off the middle compaction.
  */
-async function writeLongTranscript(
-	cwd: string,
-	sessionDir: string,
-	options: { images?: boolean } = {},
-): Promise<LongTranscript> {
-	const images = options.images !== false;
-	const sessionId = crypto.randomUUID();
-	const file = path.join(sessionDir, `2026-01-01T00-00-00-000Z_${sessionId}.jsonl`);
-	fs.mkdirSync(sessionDir, { recursive: true });
+function transcriptBody(images: boolean): Promise<TranscriptBody> {
+	let body = transcriptBodies.get(images);
+	if (!body) {
+		body = writeTranscriptBody(images);
+		transcriptBodies.set(images, body);
+	}
+	return body;
+}
+
+async function writeTranscriptBody(images: boolean): Promise<TranscriptBody> {
+	if (!bodyDir) throw new Error("Transcript bodies are written once the file's tests run");
+	const file = bodyDir.join(images ? "body-images.jsonl" : "body-text.jsonl");
 	const writer = Bun.file(file).writer();
 	let bytes = 0;
+	let entries = 0;
 	const write = (entry: object): void => {
 		const line = `${JSON.stringify(entry)}\n`;
 		bytes += Buffer.byteLength(line);
+		entries++;
 		writer.write(line);
 	};
-	write({ type: "session", version: CURRENT_SESSION_VERSION, id: sessionId, timestamp: TIMESTAMP, cwd });
 	let parentId: string | null = null;
 	const add = (type: string, id: string, fields: object, parent = parentId): string => {
 		write({ type, id, parentId: parent, timestamp: TIMESTAMP, ...fields });
@@ -360,7 +425,29 @@ async function writeLongTranscript(
 	}
 	await writer.end();
 	expect(bytes).toBeGreaterThanOrEqual(TRANSCRIPT_BYTES);
-	return { file, sessionId, cwd, sessionDir };
+	return { file, entries };
+}
+
+/**
+ * Write a transcript of its own to `sessionDir`: the header of a new session
+ * in `cwd`, then a copy of the {@link transcriptBody} of the `images` variant
+ * (with images unless `images` is false).
+ */
+async function writeLongTranscript(
+	cwd: string,
+	sessionDir: string,
+	options: { images?: boolean } = {},
+): Promise<LongTranscript> {
+	const body = await transcriptBody(options.images !== false);
+	const sessionId = crypto.randomUUID();
+	const file = path.join(sessionDir, `2026-01-01T00-00-00-000Z_${sessionId}.jsonl`);
+	fs.mkdirSync(sessionDir, { recursive: true });
+	const writer = Bun.file(file).writer();
+	const header = { type: "session", version: CURRENT_SESSION_VERSION, id: sessionId, timestamp: TIMESTAMP, cwd };
+	writer.write(`${JSON.stringify(header)}\n`);
+	for await (const chunk of Bun.file(body.file).stream()) writer.write(chunk);
+	await writer.end();
+	return { file, sessionId, cwd, sessionDir, entries: body.entries };
 }
 
 describe("a running session's reads and writes of a 64 MiB transcript on file storage", () => {
@@ -584,19 +671,28 @@ describe("a running session's reads and writes of a 64 MiB transcript on file st
 		async () => {
 			const { transcript, storage } = await setUp();
 			const manager = await open(transcript.file, storage);
+			let rewrittenSize = 0;
 			const { oversized } = await watched([storage], async () => {
 				storage.parkNextAtomic = true;
 				const rewrite = manager.rewriteEntries();
 				await storage.atomicParked.promise;
 				manager.appendCustomEntry("during_rewrite", { data: "x" });
 				manager.flushSync();
+				rewrittenSize = fs.statSync(transcript.file).size;
 				storage.releaseAtomic.resolve();
 				await rewrite;
 			});
 			expect(oversized).toEqual({});
-			// The read-back recorded the size that landed, so the next publish succeeds.
+			// The superseded publish landed over the synchronous rewrite, without the entry appended during it.
+			const landedSize = fs.statSync(transcript.file).size;
+			expect(landedSize).toBeLessThan(rewrittenSize);
+			// The read-back recorded the size that landed: the next publish expects it and needs no recovery.
+			const fullWrites = storage.fullWrites;
+			const publishes = storage.atomicExpectedSizes.length;
 			await manager.rewriteEntries();
 			await manager.flush();
+			expect(storage.atomicExpectedSizes.slice(publishes)).toEqual([landedSize]);
+			expect(storage.fullWrites).toBe(fullWrites + 1);
 		},
 		CASE_TIMEOUT_MS,
 	);
@@ -901,7 +997,11 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 		"resumes it by id",
 		async () => {
 			const { transcript, storage, client } = await stored();
-			const { oversized } = await watched([client], async () => {
+			const {
+				result: manager,
+				oversized,
+				watched: points,
+			} = await watched([client], async () => {
 				const match = await resolveResumableSession(
 					transcript.sessionId.slice(0, 8),
 					transcript.cwd,
@@ -912,6 +1012,9 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 				return open(match.session.path, storage);
 			});
 			expect(oversized).toEqual({});
+			expect(points).toBeGreaterThan(0);
+			expect(manager.getSessionFile()).toBe(transcript.file);
+			expect(manager.getEntries().length).toBe(transcript.entries);
 		},
 		CASE_TIMEOUT_MS,
 	);
@@ -921,12 +1024,17 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 		async () => {
 			const { transcript, storage, client } = await stored();
 			const manager = await open(transcript.file, storage);
-			const { oversized } = await watched([client], async () => {
+			const { oversized, watched: points } = await watched([client], async () => {
 				await manager.rewriteEntries();
 				await manager.flush();
 				await storage.drain();
 			});
 			expect(oversized).toEqual({});
+			expect(points).toBeGreaterThan(0);
+			// A full write puts the title slot in front of the transcript it read, which the store was given from this file.
+			expect(await digest(transcriptByteChunks(transcript.file, storage), { afterFirstLine: true })).toEqual(
+				await digest(Bun.file(transcript.file).stream()),
+			);
 		},
 		CASE_TIMEOUT_MS,
 	);
