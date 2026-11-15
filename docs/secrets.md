@@ -180,6 +180,17 @@ The agent reads the sources at its first session write. Then, at most once a min
 
 A provider checks some blocks byte for byte when it replays a session. When masking changes a signed thinking, text or tool-call block, the stored copy has no signature. When masking changes provider replay state (`providerPayload`, an Anthropic compaction or server-tool block, Cursor history, Gemini native content), the stored copy does not keep it. Only a turn that held a secret changes. On resume, an Anthropic model gets such a thinking block as text, and a Gemini model on Vertex can refuse to resume such a turn.
 
+### Cost
+
+With the setting off, a session write checks one flag and does nothing more. With it on, `packages/coding-agent/bench/session-store-mask.bench.ts` measured these wall-clock times on 2026-11-15, at commit `42287d5c7d76` of the fork's release line: Bun 1.4.4, a 4-CPU container in a gVisor sandbox, the median of five runs. The typical masker holds nine values from environment variables and `_FILE` files. The heavy masker holds 59 values and five regex entries. The rewritten session has 5,000 entries, 104 MiB of serialized text, and a held value in one entry of ten.
+
+| Case                                   | Typical masker: off → on | Heavy masker: off → on |
+| -------------------------------------- | ------------------------ | ---------------------- |
+| Build the masker at the first write    | 0.30 ms                  | 0.62 ms                |
+| Append a 2 KB message                  | 0.05 → 0.11 ms           | 0.03 → 0.09 ms         |
+| Append a 500,000-character tool result | 0.53 → 1.97 ms           | 0.50 → 9.33 ms         |
+| Rewrite the 5,000-entry session        | 144 → 467 ms             | 142 → 1,016 ms         |
+
 ### What masking does not catch
 
 Masking finds a value only where it appears exactly as the agent holds it. It does not catch:
