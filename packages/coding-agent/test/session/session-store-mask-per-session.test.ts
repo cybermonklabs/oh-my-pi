@@ -19,6 +19,8 @@ import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 
 const HELD_VALUE = "zq9-synthetic-service-4821";
 const MARKER = "[REDACTED:env:SERVICE_API_KEY]";
+/** Listed only in the secrets.yml of one session's own agent dir (`createAgentSession`'s `agentDir`). */
+const AGENT_DIR_VALUE = "kx7-synthetic-agent-dir-3958";
 const NOW = 1_700_000_000_000;
 /** The first `createAgentSession` in a process loads most of the agent, and each case opens two sessions. */
 const CASE_TIMEOUT_MS = 30_000;
@@ -133,4 +135,29 @@ describe("secrets.maskSessionStore per session", () => {
 			CASE_TIMEOUT_MS,
 		);
 	}
+});
+
+describe("secrets.maskSessionStore with a session's own agent dir", () => {
+	it(
+		"masks a value that only the secrets.yml of the session's agent dir lists",
+		async () => {
+			// The real process masker: the session's agent dir is not the process agent dir.
+			vi.restoreAllMocks();
+			await Bun.write(tmp.join("own", "agent", "secrets.yml"), `- type: plain\n  content: "${AGENT_DIR_VALUE}"\n`);
+			const { session, storage } = await openSession("own", true);
+			const manager = session.sessionManager;
+			await manager.ensureOnDisk();
+			manager.appendMessage({ role: "user", content: `deploy with ${AGENT_DIR_VALUE}`, timestamp: NOW });
+			await manager.flush();
+			await storage.drain();
+			const file = manager.getSessionFile();
+			if (!file) throw new Error("Expected a session file");
+			const stored = await storage.readText(file);
+			expect({
+				value: stored.includes(AGENT_DIR_VALUE),
+				marker: stored.includes("[REDACTED:secrets.yml:"),
+			}).toEqual({ value: false, marker: true });
+		},
+		CASE_TIMEOUT_MS,
+	);
 });
