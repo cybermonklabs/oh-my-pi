@@ -20,6 +20,7 @@ import { bindEffects } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
 	closeSessionIndex,
 	listSessionRecaps,
@@ -316,6 +317,51 @@ function storedOfType(records: StoredRecord[], type: string): StoredRecord {
 	return found;
 }
 
+/** `record`'s fields among `keys` that hold a value, as a JSON line would keep them. */
+function fieldsOf(record: StoredRecord, keys: readonly string[]): StoredRecord {
+	return Object.fromEntries(keys.filter(key => record[key] !== undefined).map(key => [key, record[key]]));
+}
+
+/**
+ * The fields that link or classify records, where the session format puts them: the entry's (and
+ * the header's), its message's, and the `type` and `id` of each content block of either.
+ */
+function structuralFieldsOf(entry: unknown): StoredRecord {
+	if (!isRecord(entry)) throw new Error("Expected an entry record");
+	const entryKeys = ["type", "id", "parentId", "timestamp"];
+	if (entry.type === "session") entryKeys.push("cwd", "parentSession", "version");
+	const message = isRecord(entry.message) ? entry.message : undefined;
+	return {
+		entry: fieldsOf(entry, entryKeys),
+		message: message && fieldsOf(message, ["role", "timestamp", "toolCallId"]),
+		// A string `content` has no blocks.
+		blocks: [entry.content, message?.content].map(content =>
+			Array.isArray(content) ? content.filter(isRecord).map(block => fieldsOf(block, ["type", "id"])) : undefined,
+		),
+	};
+}
+
+/**
+ * For each tool result in file order, the id of the entry whose assistant message holds the tool
+ * call with the result's `toolCallId`, or null when no earlier entry does.
+ */
+function toolCallPairs(entries: readonly SessionEntry[]): (string | null)[] {
+	const callEntryIds = new Map<string, string>();
+	const pairs: (string | null)[] = [];
+	for (const entry of entries) {
+		if (entry.type !== "message") continue;
+		const { message } = entry;
+		if (message.role === "assistant") {
+			for (const block of message.content) {
+				if (block.type === "toolCall") callEntryIds.set(block.id, entry.id);
+			}
+		} else if (message.role === "toolResult") {
+			pairs.push(callEntryIds.get(message.toolCallId) ?? null);
+		}
+	}
+	return pairs;
+}
+
 /** A title whose 256-byte slot cut, unmasked, would keep the first half of ENV_VALUE. */
 function titleCutInsideValue(): { title: string; filler: string } {
 	const updatedAt = new Date(NOW).toISOString();
@@ -458,6 +504,33 @@ for (const backend of backends) {
 			const text = await store.storage.readText(sessionFileOf(manager));
 			expect(leakedFields(text)).toEqual([]);
 			await manager.close();
+		});
+
+		it("keeps every structural field as written, so a reloaded session pairs each tool result with its call", async () => {
+			// Held values sit in text, tool calls, tool results, custom data, a compaction and a branch
+			// summary, and in a tool call's `id` and the `toolCallId` of the result that answers it.
+			maskWrites();
+			const manager = await onDisk();
+			appendEveryEntryKind(manager);
+			appendReplayState(manager);
+			await settle(manager, store.storage);
+			const file = sessionFileOf(manager);
+
+			const text = await store.storage.readText(file);
+			// Masking ran on this session, so the comparison below is against masked records.
+			expect(text).toContain(said(ENV_MARKER));
+			// The header and every entry, after the title slot, as the store holds them.
+			const stored = Bun.JSONL.parse(text).filter(isRecord).slice(1);
+			const live = [manager.getHeader(), ...manager.getEntries()];
+			expect(stored.map(structuralFieldsOf)).toEqual(live.map(structuralFieldsOf));
+			const livePairs = toolCallPairs(manager.getEntries());
+			expect(livePairs).not.toContain(null);
+			await manager.close();
+
+			const reopenedStorage = await store.reopen();
+			const reopened = await SessionManager.open(file, store.sessionDir, reopenedStorage);
+			expect(toolCallPairs(reopened.getEntries())).toEqual(livePairs);
+			await reopened.close();
 		});
 
 		it("drops a changed block's signature and changed replay carriers, keeping ciphertext, images and ids", async () => {

@@ -161,7 +161,7 @@ When two sources hold the same value, the source the agent read first names it. 
 The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, the replica that a collab guest writes, and, under file storage, the title and the recaps that it records in `history.db`. It masks every string of an entry except these, which it keeps as written:
 
 - object keys, numbers and booleans
-- the fields `type`, `role`, `id`, `parentId`, `timestamp` and `toolCallId`
+- the structural fields: the entry's `type`, `id`, `parentId` and `timestamp`, its message's `role`, `timestamp` and `toolCallId`, and the `type` and `id` of each content block (under any other field, such as tool call arguments, tool result details and custom data, these names are masked like any other string)
 - the header's `cwd`, `parentSession` and `version`
 - blob references and image data
 - provider ciphertext: `redactedThinking` data and `encrypted_content`
