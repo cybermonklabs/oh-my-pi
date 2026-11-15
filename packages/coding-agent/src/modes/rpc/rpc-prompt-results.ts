@@ -16,6 +16,7 @@ import { toError } from "@oh-my-pi/pi-utils";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { CostCapRefusal } from "../../session/cost-gate";
 import { isSessionSettled, type SessionSettleState } from "../../session/session-settle";
+import { rpcBusyCode } from "./rpc-busy-code";
 import type { RpcScheduledTurnProbe } from "./rpc-session-settle";
 import type { RpcPromptError, RpcPromptResultFrame, RpcPromptStatus } from "./rpc-types";
 
@@ -125,9 +126,11 @@ export class RpcPromptResults {
 		this.#report(ticket, false, { status: "completed" });
 	}
 
-	/** The prompt failed before reaching the agent. */
-	fail(ticket: RpcPromptTicket, message: string): void {
-		this.#report(ticket, false, { status: "error", error: { message, retryable: false } });
+	/** The prompt failed before reaching the agent; `code` classifies the failure when one applies. */
+	fail(ticket: RpcPromptTicket, message: string, code?: RpcPromptError["code"]): void {
+		const error: RpcPromptError = { message, retryable: false };
+		if (code) error.code = code;
+		this.#report(ticket, false, { status: "error", error });
 	}
 
 	/**
@@ -321,7 +324,7 @@ export function reportPromptResult(input: {
 		.catch(cause => {
 			const error = toError(cause);
 			input.onError(error);
-			input.results.fail(input.ticket, error.message);
+			input.results.fail(input.ticket, error.message, rpcBusyCode(error));
 		});
 }
 

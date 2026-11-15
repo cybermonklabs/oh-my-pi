@@ -384,6 +384,14 @@ type UsageLimitOutcome = {
 	reportResetAtMs: number | undefined;
 };
 
+/** The busy failure of a prompt that waited 30 s for another run to release the agent. */
+export class PromptIdleWaitTimeoutError extends Error {
+	constructor() {
+		super("Timed out waiting for prior agent run to finish before prompting.");
+		this.name = "PromptIdleWaitTimeoutError";
+	}
+}
+
 /** Owns terminal-stop recovery, automatic retries, and fallback routing. */
 export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
@@ -3349,7 +3357,7 @@ export class TurnRecovery {
 					throw err;
 				}
 				if (Date.now() >= deadline) {
-					throw new Error("Timed out waiting for prior agent run to finish before prompting.");
+					throw new PromptIdleWaitTimeoutError();
 				}
 				await this.#host.agent.waitForIdle();
 			}

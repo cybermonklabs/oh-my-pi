@@ -247,8 +247,11 @@ export interface RpcPromptError {
 	httpStatus?: number;
 	/** The failure is classified transient: resubmitting later may succeed. OMP's own retries are already exhausted. */
 	retryable: boolean;
-	/** `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. */
-	code?: "cost_cap";
+	/**
+	 * `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request.
+	 * `session_busy`: the agent was busy: the prompt was refused, or it waited 30 s and another run still held the agent.
+	 */
+	code?: "cost_cap" | "session_busy";
 }
 
 /**

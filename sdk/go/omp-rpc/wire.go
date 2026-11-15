@@ -4750,7 +4750,7 @@ type PromptError struct {
 	Provider   *string `json:"provider,omitempty"`
 	Model      *string `json:"model,omitempty"`
 	HTTPStatus *int64  `json:"httpStatus,omitempty"`
-	// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request.
+	// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited 30 s and another run still held the agent.
 	Code *PromptErrorCode `json:"code,omitempty"`
 }
 
@@ -4777,7 +4777,8 @@ func (v *PromptError) decodeFrom(raw map[string]json.RawMessage) error {
 type PromptErrorCode string
 
 const (
-	PromptErrorCodeCostCap PromptErrorCode = "cost_cap"
+	PromptErrorCodeCostCap     PromptErrorCode = "cost_cap"
+	PromptErrorCodeSessionBusy PromptErrorCode = "session_busy"
 )
 
 func (v *PromptErrorCode) UnmarshalJSON(data []byte) error {
@@ -4786,7 +4787,7 @@ func (v *PromptErrorCode) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch value := PromptErrorCode(s); value {
-	case PromptErrorCodeCostCap:
+	case PromptErrorCodeCostCap, PromptErrorCodeSessionBusy:
 		*v = value
 		return nil
 	}

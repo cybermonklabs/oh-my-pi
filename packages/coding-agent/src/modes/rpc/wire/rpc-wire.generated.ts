@@ -1070,8 +1070,8 @@ export interface PromptError {
 	provider?: string;
 	model?: string;
 	httpStatus?: number;
-	/** `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. */
-	code?: "cost_cap";
+	/** `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited 30 s and another run still held the agent. */
+	code?: "cost_cap" | "session_busy";
 }
 
 /** Terminal outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`. */
