@@ -4290,6 +4290,10 @@ export class SessionManager {
 	 * workspace roots are dropped, and the source's `session_init` contracts
 	 * become inert `source_session_init` custom entries so revival never
 	 * mistakes them for the fork's own.
+	 *
+	 * `storeMasking` is the binding of the session that owns the fork ({@link setStoreMasking}).
+	 * The fork is written here, before any session binds the new manager, so it masks by its
+	 * owner's `secrets.maskSessionStore` and agent dir; without it, as an unbound manager does.
 	 */
 	static async forkFrom(
 		sourcePath: string,
@@ -4303,11 +4307,13 @@ export class SessionManager {
 			resetInheritedCost?: boolean;
 			repairInterruptedTail?: boolean;
 			seance?: boolean;
+			storeMasking?: StoreMaskingBinding;
 		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
+		manager.#storeMasking = options?.storeMasking;
 
 		// A missing source must fail instead of forking an empty parentless session:
 		// the loader swallows ENOENT by default for fresh-session opens, so fork opts out.

@@ -4818,6 +4818,11 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 						sessionFile: subtaskSessionFile,
 						resetInheritedCost: true,
 						repairInterruptedTail: true,
+						// Written before the subagent's session binds it: masked by the parent's setting and agent dir.
+						storeMasking: {
+							enabled: () => cfgSecretsMaskSessionStore.get(settings),
+							agentDir: settings.getAgentDir(),
+						},
 					})
 				: sessionFile
 					? SessionManager.open(sessionFile, undefined, undefined, {
