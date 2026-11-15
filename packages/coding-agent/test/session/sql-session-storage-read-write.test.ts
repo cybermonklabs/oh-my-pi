@@ -8,9 +8,10 @@
  * through the store and through a second client, and checks the connection's
  * default is still read-only. A read-only default the connection's start
  * parameters set, as a database or role default would, is honoured instead:
- * the store refuses every write there and writes nothing. A last test starts
- * several stores at once on new tables, with the server's default left as it
- * is. Runs only when `OMP_TEST_SQL_POSTGRES_URL` names a throwaway database.
+ * the store refuses every write there and writes nothing. A session that turns
+ * that default off again writes there, as older releases did. A last test
+ * starts several stores at once on new tables, with the server's default left
+ * as it is. Runs only when `OMP_TEST_SQL_POSTGRES_URL` names a throwaway database.
  * That URL must be a direct connection, not one through a transaction-mode
  * pooler, because the read-only tests set that default at session level.
  * Every test uses its own tables and drops them when done.
@@ -400,6 +401,67 @@ describe.skipIf(!url)("a read-only default the connection's start sets is honour
 		);
 
 		expect(await storedCounts(db)).toEqual({ sessions: 0, parts: 0 });
+	});
+});
+
+/** What a session that turned off a read-only default it started with reads. */
+const TURNED_OFF = { setting: "off", reset_val: "on" };
+
+/**
+ * A store's connection whose transactions default to read-only from its start
+ * parameters (see {@link connectReadOnlyAtStart}), and whose session then
+ * turns that default off.
+ */
+async function connectTurnedOff(): Promise<Db> {
+	const db = await connectReadOnlyAtStart();
+	await db.client.unsafe("SET default_transaction_read_only = off");
+	expect(await readOnlyDefault(db)).toEqual(TURNED_OFF);
+	return db;
+}
+
+/**
+ * A session that turns such a default off keeps `reset_val` on, but its own
+ * `setting` is off. That session made the decision, and older releases wrote
+ * there, so the store writes.
+ */
+describe.skipIf(!url)("a session that turns such a default off writes", () => {
+	it("creates its tables", async () => {
+		const db = await connectTurnedOff();
+
+		await open(db);
+
+		expect(await columns(db, db.table)).toEqual(SESSION_COLUMNS);
+		expect(await columns(db, `${db.table}_parts`)).toEqual(["content", "path", "start_offset"]);
+		expect(await readOnlyDefault(db)).toEqual(TURNED_OFF);
+	});
+
+	it("appends through a writer", async () => {
+		const db = await connectTurnedOff();
+		const storage = await open(db);
+		const path = "/sessions/p/appended.jsonl";
+
+		const writer = storage.openWriter(path);
+		await writer.append("one\n");
+		await writer.append("two ✓\n");
+		await writer.close();
+
+		expect(await storage.readText(path)).toBe("one\ntwo ✓\n");
+		expect(await stored(db, path)).toBe("one\ntwo ✓\n");
+		expect(await storedParts(db, path)).toEqual(["one\n", "two ✓\n"]);
+		expect(await readOnlyDefault(db)).toEqual(TURNED_OFF);
+	});
+
+	it("writes a session whole", async () => {
+		const db = await connectTurnedOff();
+		const storage = await open(db);
+		const path = "/sessions/p/written.jsonl";
+
+		await storage.writeText(path, "whole ✓\n");
+
+		expect(await storage.readText(path)).toBe("whole ✓\n");
+		expect(await stored(db, path)).toBe("whole ✓\n");
+		expect(await storedParts(db, path)).toEqual(["whole ✓\n"]);
+		expect(await readOnlyDefault(db)).toEqual(TURNED_OFF);
 	});
 });
 

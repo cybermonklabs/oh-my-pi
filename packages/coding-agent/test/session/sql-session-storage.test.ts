@@ -612,21 +612,23 @@ interface CapturedQuery {
 	transaction: number | null;
 }
 
-/** What the stub answers inside a transaction to the store's read of the read-only default. */
+/** What the stub answers inside a transaction to the store's read of `default_transaction_read_only`. */
 interface FakeServer {
-	/** `reset_val` of `default_transaction_read_only`; no row when unset. */
+	/** The session's own value; no row unless `resetVal` is set too. */
+	setting?: string;
+	/** The default the session started from; no row unless `setting` is set too. */
 	resetVal?: string;
 }
 
 const READ_WRITE = "SET TRANSACTION READ WRITE";
-const RESET_VAL_READ = "SELECT reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'";
+const READ_ONLY_READ = "SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'";
 /** What every PostgreSQL write transaction sends before its work. */
-const WRITE_OPENING = [READ_WRITE, RESET_VAL_READ];
+const WRITE_OPENING = [READ_WRITE, READ_ONLY_READ];
 /** What every PostgreSQL start-up transaction sends before its one statement. */
 const START_UP_OPENING = [
 	READ_WRITE,
 	"SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-	RESET_VAL_READ,
+	READ_ONLY_READ,
 	expect.stringMatching(/^SELECT pg_advisory_xact_lock\(\d+\)$/),
 ];
 
@@ -642,8 +644,8 @@ function capturingClient(
 	const handle = (transaction: number | null): SqlSessionStorageTransaction => ({
 		async unsafe(sql, values) {
 			queries.push({ sql, values, transaction });
-			if (transaction !== null && sql === RESET_VAL_READ && server.resetVal !== undefined) {
-				return [{ reset_val: server.resetVal }];
+			if (transaction !== null && sql === READ_ONLY_READ && server.setting && server.resetVal) {
+				return [{ setting: server.setting, reset_val: server.resetVal }];
 			}
 			return [];
 		},
@@ -727,8 +729,8 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		expect(storage.adapter).toBe("postgres");
 	});
 
-	it("PostgreSQL refuses to write when the connection's own read-only default is on", async () => {
-		const server: FakeServer = { resetVal: "on" };
+	it("PostgreSQL refuses to write when the session keeps a read-only default it started with", async () => {
+		const server: FakeServer = { setting: "on", resetVal: "on" };
 		const { client, queries } = capturingClient("postgres", server);
 		// Start-up refuses before it waits for the start-up lock or makes a table.
 		await expect(SqlSessionStorage.create({ client })).rejects.toThrow("default_transaction_read_only");
@@ -748,6 +750,47 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		await expect(writer.close()).rejects.toThrow("default_transaction_read_only");
 		expect(inOneTransaction(queries.slice(appendStart))).toEqual(WRITE_OPENING);
 	});
+
+	// Neither answer is a read-only default the session keeps, so the store
+	// writes. The first is a session that turned such a default off: older
+	// releases wrote there too. The second is a session `SET` over a default
+	// that is off, which the store overrides.
+	for (const server of [
+		{ setting: "off", resetVal: "on" },
+		{ setting: "on", resetVal: "off" },
+	] satisfies FakeServer[]) {
+		it(`PostgreSQL writes when setting is ${server.setting} and reset_val is ${server.resetVal}`, async () => {
+			const { client, queries } = capturingClient("postgres", server);
+			const storage = await SqlSessionStorage.create({ client });
+
+			const tables = queries.filter(q => q.sql.startsWith("CREATE TABLE"));
+			expect(tables).toHaveLength(2);
+			for (const table of tables) {
+				expect(inOneTransaction(queries.filter(query => query.transaction === table.transaction))).toEqual([
+					...START_UP_OPENING,
+					table.sql,
+				]);
+			}
+
+			const writeStart = queries.length;
+			await storage.writeText("/s/written.jsonl", "body\n");
+			expect(inOneTransaction(queries.slice(writeStart))).toEqual([
+				...WRITE_OPENING,
+				expect.stringMatching(/^INSERT INTO omp_session_files /),
+				expect.stringMatching(/^DELETE FROM omp_session_files_parts /),
+				expect.stringMatching(/^INSERT INTO omp_session_files_parts /),
+			]);
+
+			const appendStart = queries.length;
+			const writer = storage.openWriter("/s/appended.jsonl");
+			await writer.append("chunk\n");
+			await writer.close();
+			expect(inOneTransaction(queries.slice(appendStart))).toEqual([
+				...WRITE_OPENING,
+				expect.stringContaining("INSERT INTO omp_session_files_parts"),
+			]);
+		});
+	}
 
 	it("MySQL binds one value per `?` and no `VALUES(col)` in upserts", async () => {
 		const { client, queries } = capturingClient("mysql");
