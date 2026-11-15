@@ -585,25 +585,27 @@ describe("session store masking of the history.db title and recaps", () => {
 		await manager.setSessionName(said(ENV_VALUE), "user");
 		manager.recordRecap(said(FILE_VALUE));
 
-		const title = lookupSessionTitle(manager.getSessionId());
-		expect(title?.includes(ENV_MARKER)).toBe(true);
-		expect(title?.includes(ENV_VALUE)).toBe(false);
-		const recaps = listSessionRecaps({ sessionIds: [manager.getSessionId()] }).map(entry => entry.recap);
-		expect(recaps.length).toBe(1);
-		expect(recaps[0]?.includes(FILE_MARKER)).toBe(true);
-		expect(recaps[0]?.includes(FILE_VALUE)).toBe(false);
+		const id = manager.getSessionId();
+		expect(lookupSessionTitle(id)).toBe(said(ENV_MARKER));
+		expect(listSessionRecaps({ sessionIds: [id] }).map(entry => entry.recap)).toEqual([said(FILE_MARKER)]);
+		expect(manager.getSessionName()).toBe(said(ENV_VALUE));
 		await manager.close();
 	});
 
-	it("records the title and the recap as written while the setting is at its default", async () => {
-		const manager = await fileSession();
-		await manager.setSessionName(said(ENV_VALUE), "user");
-		manager.recordRecap(said(FILE_VALUE));
+	it("records the title and the recap as written while the setting is off", async () => {
+		const release = bindEffects(Settings.isolated({ "secrets.maskSessionStore": false }));
+		try {
+			const manager = await fileSession();
+			await manager.setSessionName(said(ENV_VALUE), "user");
+			manager.recordRecap(said(FILE_VALUE));
 
-		expect(lookupSessionTitle(manager.getSessionId())?.includes(ENV_VALUE)).toBe(true);
-		const recaps = listSessionRecaps({ sessionIds: [manager.getSessionId()] });
-		expect(recaps.some(entry => entry.recap.includes(FILE_VALUE))).toBe(true);
-		await manager.close();
+			const id = manager.getSessionId();
+			expect(lookupSessionTitle(id)).toBe(said(ENV_VALUE));
+			expect(listSessionRecaps({ sessionIds: [id] }).map(entry => entry.recap)).toEqual([said(FILE_VALUE)]);
+			await manager.close();
+		} finally {
+			release();
+		}
 	});
 });
 

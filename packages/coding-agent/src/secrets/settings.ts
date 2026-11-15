@@ -35,7 +35,7 @@ export const cfgSecretsMaskSessionStore = register({
 		group: "Privacy",
 		label: "Mask Secrets in Stored Sessions",
 		description:
-			"Replace known secret values (secret-named environment variables, files named by *_FILE variables, secrets.yml) with a marker before a session entry is written to the session store",
+			"Replace known secret values (secret-named environment variables, files named by *_FILE variables, secrets.yml) with a marker before a session entry, its title or a recap is written to the session store or history.db",
 	},
 });
 effect(cfgSecretsMaskSessionStore, setSessionStoreMasking);

@@ -203,7 +203,7 @@ Masking finds a value only where it appears exactly as the agent holds it. It do
 - a `secrets.yml` entry the parser refuses (see [Invalid entries and files](#invalid-entries-and-files))
 - part of a multi-line file printed alone, because the content of a file is one value
 - object keys, numbers, the working directory, ids and images
-- entries written before the setting was on, and the copies of stored text that fork, move, render, `session unpack`, archive restore, `gc strip`, the title backfill into `history.db` and the `history.db` repair make (an entry written while the setting was on is masked already)
+- entries, and the `history.db` titles and recaps, written before the setting was on, and the copies of stored text that fork, move, render, `session unpack`, archive restore, `gc strip`, the title backfill into `history.db` and the `history.db` repair make (an entry written while the setting was on is masked already)
 - files outside the session store: artifact files with full command output, blobs, prompt history, and logs
 - text sent to the model provider, which is the work of `secrets.enabled`
 
