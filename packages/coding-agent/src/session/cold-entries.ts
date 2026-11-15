@@ -42,6 +42,27 @@ const CACHE_ENTRIES = 8;
 const CACHE_BYTES = 16 * 1024 * 1024;
 /** Records are written in batches of about this size. */
 const WRITE_BATCH_BYTES = 1024 * 1024;
+/**
+ * Record bytes read back, or written by a load, between two full collections.
+ * One synchronous loop over many cold entries (an extension reading every
+ * message's content at a session start) would otherwise pile up the parse
+ * garbage of every record it reads before the engine collects any of it, and
+ * a load the values of every entry it converts. Loading a 344 MiB transcript
+ * and then running such a loop peaked at 1,227 MiB resident unpaced and at
+ * about 620 MiB with this value, the loop about a second slower and the load
+ * about two; 32 and 64 MiB peaked higher.
+ */
+const COLLECT_AFTER_RECORD_BYTES = 16 * 1024 * 1024;
+/** Record bytes counted since the last collection the pacing ran, across stores. */
+let recordBytesSinceCollection = 0;
+
+/** Count `bytes` of records; past {@link COLLECT_AFTER_RECORD_BYTES}, run a full collection and count again. */
+function paceCollection(bytes: number): void {
+	recordBytesSinceCollection += bytes;
+	if (recordBytesSinceCollection < COLLECT_AFTER_RECORD_BYTES) return;
+	recordBytesSinceCollection = 0;
+	Bun.gc(true);
+}
 
 /**
  * Entry types that stay whole before the cut: extension and feature state, and
@@ -483,10 +504,15 @@ export class ColdEntryStore {
 		return this.#blobs;
 	}
 
-	/** The record parsed fresh and unfrozen, its blob references resolved when `resolveBlobs`. */
+	/**
+	 * The record parsed fresh and unfrozen, its blob references resolved when
+	 * `resolveBlobs`. Its bytes count toward the next full collection
+	 * ({@link COLLECT_AFTER_RECORD_BYTES}).
+	 */
 	parse(record: ColdRecord, resolveBlobs: boolean): Record<string, unknown> {
 		const entry = JSON.parse(this.#read(record).toString("utf8")) as Record<string, unknown>;
 		if (resolveBlobs) resolveBlobRefsInEntriesSync([entry as unknown as SessionEntry], this.#blobs);
+		paceCollection(record.length);
 		return entry;
 	}
 
@@ -682,13 +708,16 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
  * entry and of its `message` too large to keep ({@link COLD_STRING_MAX_UNITS},
  * {@link COLD_JSON_MAX_BYTES}) into an accessor. Pass `imagesExternalized`
  * for an entry parsed from a session file, whose image data are blob
- * references already. Returns false, changing nothing, when every value is
- * small or `entry` is cold already.
+ * references already, and `paced` from a load, which converts a whole
+ * transcript in one burst: the record's bytes count toward the next full
+ * collection ({@link COLLECT_AFTER_RECORD_BYTES}), as a read's do. Returns
+ * false, changing nothing, when every value is small or `entry` is cold
+ * already.
  */
 export function convertToColdEntry(
 	entry: SessionEntry,
 	openStore: () => ColdEntryStore,
-	options?: { imagesExternalized?: boolean },
+	options?: { imagesExternalized?: boolean; paced?: boolean },
 ): boolean {
 	if (isColdEntry(entry) || !Object.isExtensible(entry)) return false;
 	const holder = entry as unknown as Record<string, unknown>;
@@ -703,7 +732,8 @@ export function convertToColdEntry(
 
 	const store = openStore();
 	const text = options?.imagesExternalized ? (stringifyJson(entry) ?? "null") : entryRecordText(entry, store.blobs);
-	setRecordSlots(entry, store.append(text));
+	const record = store.append(text);
+	setRecordSlots(entry, record);
 	for (const key of entryKeys) Object.defineProperty(entry, key, entryFieldAccessor(key));
 	if (shell && messageKeys.length > 0) {
 		setHiddenSlot(shell, COLD_OWNER, entry);
@@ -711,5 +741,6 @@ export function convertToColdEntry(
 		setHiddenSlot(entry, COLD_MESSAGE, shell);
 		Object.defineProperty(entry, "message", entryMessageAccessor);
 	}
+	if (options?.paced) paceCollection(record.length);
 	return true;
 }

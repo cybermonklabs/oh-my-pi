@@ -335,12 +335,16 @@ function readBodiesAgain(entries: readonly SessionEntry[]): number {
 }
 
 /**
- * Full collections, each in a later task than the last read: a `WeakRef`
- * keeps its target alive until the task that made or read it ends, and
- * `Bun.sleep(0)` ends the task without waiting for a clock.
+ * Full collections, each in a later task than the last read, until `done`
+ * holds or `rounds` pass: a `WeakRef` keeps its target alive until the task
+ * that made or read it ends, and `Bun.sleep(0)` ends the task without waiting
+ * for a clock. The engine scans the stack conservatively, so a collection can
+ * still find a stale copy of a pointer that the reads left there and keep a
+ * released body; four rounds with no check between them failed under load. A
+ * body something still holds survives every round.
  */
-async function collectGarbage(rounds = 4): Promise<void> {
-	for (let round = 0; round < rounds; round++) {
+async function collectGarbage(done: () => boolean, rounds = 20): Promise<void> {
+	for (let round = 0; round < rounds && !done(); round++) {
 		await Bun.sleep(0);
 		Bun.gc(true);
 	}
@@ -360,7 +364,7 @@ async function expectOnlyResidentBodiesSurvive(manager: SessionManager): Promise
 	const entries = manager.getEntries();
 	const refs = refsToBodies(entries, residentIds(manager));
 	expect(readBodiesAgain(entries)).toBeGreaterThan(0);
-	await collectGarbage();
+	await collectGarbage(() => alive(refs.released).length === 0);
 	expect(refs.notStable).toEqual([]);
 	expect({
 		releasedAlive: alive(refs.released),
@@ -483,6 +487,7 @@ describe.each(storages)("a resumed session on $name", ({ available, store }) => 
 					"u9",
 					"a9",
 				]);
+				await collectGarbage(() => alive(whole).length === 0);
 				expect(alive(whole)).toEqual([]);
 			} finally {
 				await manager.close();
