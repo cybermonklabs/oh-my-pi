@@ -218,7 +218,11 @@ describe("readers of the recent turns read no older body", () => {
 	it("records the pending call at exit without reading an older body", async () => {
 		using dir = TempDir.createSync("@omp-cold-readers-");
 		const exitRecord = async (coldStore: boolean): Promise<unknown> => {
-			const sessionDir = path.join(dir.path(), coldStore ? "cold" : "whole");
+			// The session's id is its directory's name, which must be unique: test
+			// processes share session ownership leases, and a session another process
+			// owns (this file run in parallel) moves to a new file at its next write,
+			// a full write that reads every older body.
+			const sessionDir = path.join(dir.path(), `${path.basename(dir.path())}-${coldStore ? "cold" : "whole"}`);
 			const file = await interruptedSession(sessionDir);
 			const session = await startSession(await open(file, coldStore), sessionDir);
 			const materialize = vi.spyOn(ColdEntryStore.prototype, "materialize");

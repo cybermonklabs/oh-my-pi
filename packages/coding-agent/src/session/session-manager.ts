@@ -2887,7 +2887,7 @@ export class SessionManager {
 				intake.entries.push(entry);
 				intake.index.insert(entry);
 				if (this.#coldStoreEnabled && !ENTRY_TYPES_KEPT_WHOLE.has(entry.type)) {
-					convertToColdEntry(entry, openStore, { imagesExternalized: true });
+					convertToColdEntry(entry, openStore, { imagesExternalized: true, paced: true });
 				}
 			});
 			if (needsIndexCheck) {
