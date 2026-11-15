@@ -2074,8 +2074,13 @@ class RpcClient(WireClient):
             protocol_error.command in _ASYNC_COMMANDS
             and protocol_error.remote_error is not None
         ):
+            raw_code = payload.get("code")
             self._append_async_error(
-                RpcCommandError(protocol_error.command, protocol_error.remote_error)
+                RpcCommandError(
+                    command=protocol_error.command,
+                    error=protocol_error.remote_error,
+                    code=raw_code if isinstance(raw_code, str) else None,
+                )
             )
 
         self._record_protocol_error(protocol_error)
