@@ -272,6 +272,27 @@ function storedRecords(text: string): StoredRecord[] {
 	return Bun.JSONL.parse(text).filter(isRecord).slice(2);
 }
 
+/**
+ * Every stored string field that holds a held value, as `<record type>#<line>.<path>`, so a
+ * failure names where a value leaked without printing it.
+ */
+function leakedFields(text: string): string[] {
+	const leaks: string[] = [];
+	const visit = (value: unknown, at: string): void => {
+		if (typeof value === "string") {
+			if (value.includes(ENV_VALUE) || value.includes(FILE_VALUE)) leaks.push(at);
+		} else if (Array.isArray(value)) {
+			value.forEach((item, index) => visit(item, `${at}[${index}]`));
+		} else if (isRecord(value)) {
+			for (const [key, child] of Object.entries(value)) visit(child, `${at}.${key}`);
+		}
+	};
+	Bun.JSONL.parse(text).forEach((record, line) =>
+		visit(record, `${isRecord(record) && typeof record.type === "string" ? record.type : "?"}#${line}`),
+	);
+	return leaks;
+}
+
 function messageOf(record: StoredRecord | undefined): StoredRecord {
 	const message = record?.message;
 	if (!isRecord(message)) throw new Error("Expected a stored message entry");
@@ -329,6 +350,7 @@ for (const backend of backends) {
 			await settle(manager, store.storage);
 
 			const text = await store.storage.readText(sessionFileOf(manager));
+			expect(leakedFields(text)).toEqual([]);
 			expect(text.includes(ENV_VALUE)).toBe(false);
 			expect(text.includes(FILE_VALUE)).toBe(false);
 			const records = storedRecords(text);
