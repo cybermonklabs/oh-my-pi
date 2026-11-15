@@ -85,7 +85,7 @@ describe("session store masking of signed thinking on replay", () => {
 		const storage = new FileSessionStorage();
 		const manager = SessionManager.create(cwd, sessionDir, storage);
 		// The session's setting is on.
-		manager.setStoreMasking(() => true, tmp.join("agent"));
+		manager.setStoreMasking({ enabled: () => true, agentDir: tmp.join("agent") });
 		await manager.ensureOnDisk();
 		manager.appendMessage({ role: "user", content: "configure the service", timestamp: NOW });
 		manager.appendMessage(signedTurn());

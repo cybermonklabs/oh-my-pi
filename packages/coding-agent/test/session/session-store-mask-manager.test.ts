@@ -145,7 +145,7 @@ function maskWrites(): void {
  * `createAgentSession` binds a session's manager.
  */
 function bindSetting(manager: SessionManager, settings: Settings): void {
-	manager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings), tmp.join("agent"));
+	manager.setStoreMasking({ enabled: () => cfgSecretsMaskSessionStore.get(settings), agentDir: tmp.join("agent") });
 }
 
 function assistant(content: AssistantMessage["content"], extra: Partial<AssistantMessage> = {}): AssistantMessage {
@@ -1568,6 +1568,28 @@ const MCP_MESSAGE: StoredRecord = messageEntry(
 		},
 	}),
 );
+/** Responses items whose `output`, `content` and `summary` are objects, not arrays of parts. */
+const RESPONSES_OBJECT_SHAPES_MESSAGE: StoredRecord = messageEntry(
+	assistantRecord([{ type: "text", text: "plain answer" }], {
+		providerPayload: {
+			type: "openaiResponsesHistory",
+			items: [
+				{
+					type: "custom_tool_call_output",
+					call_id: "keep-object-output-call",
+					output: { type: "keep-object-output-type", text: "plain output" },
+				},
+				{
+					type: "message",
+					id: "keep-object-content-item",
+					role: "user",
+					content: { note: "plain content" },
+					summary: { note: "plain summary" },
+				},
+			],
+		},
+	}),
+);
 const CURSOR_MESSAGE: StoredRecord = messageEntry(
 	assistantRecord([{ type: "text", text: "plain" }], {
 		providerPayload: {
@@ -2234,6 +2256,13 @@ const KEEP_ROWS: readonly KeepRow[] = [
 	},
 	{
 		rule: "KR8",
+		position: "the object output, content and summary of Responses items",
+		record: RESPONSES_OBJECT_SHAPES_MESSAGE,
+		shape: "message.providerPayload",
+		kept: ["items.0.type", "items.0.call_id", "items.0.output.type", "items.1.type", "items.1.id", "items.1.role"],
+	},
+	{
+		rule: "KR8",
 		position: "the MCP items of an openaiResponsesHistory payload",
 		record: MCP_MESSAGE,
 		shape: "message.providerPayload",
@@ -2759,6 +2788,38 @@ const SCANNED_CARRIER_FIELDS: readonly { readonly name: string; readonly message
 			},
 		]),
 	},
+	// A Responses item keeps an image part's fields only in an element of its `content[]`, `summary[]`
+	// or `output[]`, and only `type` on an object `output`; all of an object `content` or `summary` is masked.
+	...(
+		[
+			["function_call_output", "output", "image_url"],
+			["function_call_output", "output", "detail"],
+			["function_call_output", "output", "file_id"],
+			["message", "content", "type"],
+			["message", "content", "image_url"],
+			["message", "content", "detail"],
+			["message", "content", "file_id"],
+			["reasoning", "summary", "type"],
+			["reasoning", "summary", "image_url"],
+			["reasoning", "summary", "detail"],
+			["reasoning", "summary", "file_id"],
+		] as const
+	).map(([type, key, field]) => ({
+		name: `Responses ${type} item's object ${key}.${field}`,
+		message: responsesCarrierMessage([
+			{
+				type,
+				call_id: "call_plain",
+				[key]: {
+					type: "input_image",
+					image_url: "plain-url",
+					detail: "auto",
+					file_id: "plain-file",
+					[field]: HELD,
+				},
+			},
+		]),
+	})),
 ];
 
 /** A drop rule's case: the entry a session appends, and the field its stored copy leaves out. */

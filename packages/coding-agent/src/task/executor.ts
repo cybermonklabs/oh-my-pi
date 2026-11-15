@@ -83,8 +83,7 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 } from "../sdk";
-import { sessionStoreMaskFor } from "../secrets/session-store-mask";
-import { cfgSecretsMaskSessionStore } from "../secrets/settings";
+import { settingsStoreMask, storeMaskingOf } from "../secrets/session-store-mask";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -2943,11 +2942,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
 		// `agent://<id>` serves these files: they hold markers, the returned result keeps the values.
-		const mask = sessionStoreMaskFor(
-			cfgSecretsMaskSessionStore.get(args.storeMaskSettings),
-			args.storeMaskCwd,
-			args.storeMaskSettings.getAgentDir(),
-		);
+		const mask = settingsStoreMask(args.storeMaskSettings, args.storeMaskCwd);
 		try {
 			const storedOutput = mask?.maskText(rawOutput) ?? rawOutput;
 			await writeArtifact(candidatePath, storedOutput);
@@ -4819,10 +4814,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 						resetInheritedCost: true,
 						repairInterruptedTail: true,
 						// Written before the subagent's session binds it: masked by the parent's setting and agent dir.
-						storeMasking: {
-							enabled: () => cfgSecretsMaskSessionStore.get(settings),
-							agentDir: settings.getAgentDir(),
-						},
+						storeMasking: storeMaskingOf(settings),
 					})
 				: sessionFile
 					? SessionManager.open(sessionFile, undefined, undefined, {

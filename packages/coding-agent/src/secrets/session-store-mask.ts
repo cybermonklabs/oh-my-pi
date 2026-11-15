@@ -1,11 +1,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { isEnoent, isEnotdir, isFsError, logger } from "@oh-my-pi/pi-utils";
+import type { Settings } from "../config/settings";
 import { collectEnvSecretValues, connectionUrlPasswords, type Env, MIN_ENV_VALUE_LENGTH } from "./env-secrets";
 import type { SecretEntry } from "./obfuscator";
 import { MIN_OBFUSCATE_SECRET_LEN, sanitizeSecretFriendlyName } from "./placeholder";
 import { compileSecretRegex, literalAlternationSource } from "./regex";
 import { globalSecretsFilePath, loadSecretsFileSync, projectSecretsFilePath } from "./secrets-file";
+import { cfgSecretsMaskSessionStore } from "./settings";
 
 export type SessionStoreMaskSourceKind = "env" | "file" | "secrets.yml";
 
@@ -425,4 +427,22 @@ export function processSessionStoreMasker(agentDir: string): SessionStoreMasker 
  */
 export function sessionStoreMaskFor(enabled: boolean, cwd: string, agentDir: string): SessionStoreMask | null {
 	return enabled ? processSessionStoreMasker(agentDir).snapshot(cwd) : null;
+}
+
+/** What a session binds its session manager's store masking to (`SessionManager.setStoreMasking`). */
+export interface StoreMaskingBinding {
+	/** The session's `secrets.maskSessionStore`, read at each write. */
+	readonly enabled: () => boolean;
+	/** The session's agent dir, whose secrets.yml the mask holds. */
+	readonly agentDir: string;
+}
+
+/** The store masking binding of the session whose settings are `settings`: its setting and its agent dir. */
+export function storeMaskingOf(settings: Settings): StoreMaskingBinding {
+	return { enabled: () => cfgSecretsMaskSessionStore.get(settings), agentDir: settings.getAgentDir() };
+}
+
+/** The mask a writer for `cwd` applies under `settings` now, or `null` while their `secrets.maskSessionStore` is off. */
+export function settingsStoreMask(settings: Settings, cwd: string): SessionStoreMask | null {
+	return sessionStoreMaskFor(cfgSecretsMaskSessionStore.get(settings), cwd, settings.getAgentDir());
 }

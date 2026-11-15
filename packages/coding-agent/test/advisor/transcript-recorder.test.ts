@@ -408,7 +408,7 @@ describe("AdvisorTranscriptRecorder", () => {
 			);
 			try {
 				const host = SessionManager.inMemory(dir);
-				host.setStoreMasking(() => true, agentDir);
+				host.setStoreMasking({ enabled: () => true, agentDir });
 				const sessionFile = path.join(dir, "sess.jsonl");
 				const recorder = new AdvisorTranscriptRecorder(
 					() => sessionFile,

@@ -120,7 +120,7 @@ let masking = false;
 
 /** `manager`, bound to {@link masking} and `agentDir`. */
 function bound(manager: SessionManager, agentDir: string): SessionManager {
-	manager.setStoreMasking(() => masking, agentDir);
+	manager.setStoreMasking({ enabled: () => masking, agentDir });
 	return manager;
 }
 

@@ -7,7 +7,7 @@ import { IrcBus } from "../irc/bus";
 import { holdSharedLsp } from "../lsp/client";
 import { cfgLspShared } from "../lsp/settings";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
-import { cfgSecretsMaskSessionStore } from "../secrets/settings";
+import { storeMaskingOf } from "../secrets/session-store-mask";
 import { discoverAuthStorage } from "../sdk";
 import { SessionManager } from "../session/session-manager";
 import { reserveStructuredSubagentId, runStructuredSubagent } from "../task/structured-subagent";
@@ -82,7 +82,7 @@ export async function createCleanseAgentRuntime(options: {
 	const modelSelector = resolved.selector ?? formatModelString(resolved.model);
 	const modelDisplay = formatModelString(resolved.model);
 	const sessionManager = SessionManager.create(cwd);
-	sessionManager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings), settings.getAgentDir());
+	sessionManager.setStoreMasking(storeMaskingOf(settings));
 	await sessionManager.setSessionName("Cleanse", "auto");
 	sessionManager.appendCustomEntry("cleanse", {
 		status: "running",

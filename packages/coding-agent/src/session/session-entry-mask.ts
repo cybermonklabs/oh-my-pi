@@ -6,8 +6,24 @@
  * does not name, every string is masked whatever its key or shape. Object keys, numbers, booleans
  * and `null` are never masked (KR13). An entry with nothing to mask comes back as the same object;
  * a masked one shares every untouched subtree with the live entry.
+ *
+ * The `KRn` tags on the table's rows name the keep rules:
+ * - KR1: every entry: its `type`, `id`, `parentId`, `timestamp`, `activeLeafId` and the build that wrote it.
+ * - KR2: the session header: its working directories, the links to other sessions and the cache keys.
+ * - KR3: the fields of each entry `type`.
+ * - KR4: an entry's `message`, by `role`.
+ * - KR5: a content block of an entry, of its message or of `compactionSummary.blocks`.
+ * - KR6: a block's signature, kept unscanned except an OpenAI Responses reasoning item's summary and content texts.
+ * - KR7: image data outside a content array.
+ * - KR8: a provider replay carrier: its protocol keys and ciphertext, each at its own place in it.
+ * - KR9: the snapcompact slot of a compaction: its frames.
+ * - KR10: the drop rules: a changed signed block loses its signature; a changed carrier, server-tool
+ *   group or snapcompact slot is left out of the stored copy.
+ * - KR11: the `/btw` history record.
+ * - KR12: outside this walk, `SessionStoreMask.maskText` leaves a range that equals one of its own markers as it is.
+ * - KR13: object keys, numbers, booleans and `null`, never masked.
  */
-import { countNewlines, isRecord } from "@oh-my-pi/pi-utils";
+import { countNewlines, isRecord, tryParseJson } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
@@ -78,8 +94,10 @@ type PositionName =
 interface Position {
 	/** Fields kept as written here: a string value, or each string item of an array value. */
 	readonly keep?: readonly string[];
-	/** Fields whose object value, or each object item of whose array value, sits at the named position. */
+	/** Fields whose object value, or each object item of whose array value `items` does not name, sits at the named position. */
 	readonly children?: Readonly<Record<string, PositionName>>;
+	/** Fields whose array value's object items sit at the named position; an object value under the same key reads `children` only. */
+	readonly items?: Readonly<Record<string, PositionName>>;
 	/** More rules for an object here, chosen by the string under `key`: a row of its own, or a named position's. */
 	readonly variants?: {
 		readonly key: "type" | "role";
@@ -344,19 +362,18 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 	},
 	/**
 	 * KR8: an OpenAI Responses item of a carrier. `arguments`, `input`, text and the other fields of
-	 * `action`, `output` and `operation` are masked.
+	 * `action`, `output` and `operation` are masked, and so is all of an object `content` or `summary`.
 	 */
 	responsesItem: {
 		keep: ["type", "id", "call_id", "status", "role", "phase", "name", "namespace", "encrypted_content"],
 		children: {
 			action: "responsesTyped",
-			output: "responsesPart",
+			output: "responsesTyped",
 			operation: "responsesTyped",
-			content: "responsesPart",
-			summary: "responsesPart",
 			pending_safety_checks: "safetyCheck",
 			acknowledged_safety_checks: "safetyCheck",
 		},
+		items: { content: "responsesPart", summary: "responsesPart", output: "responsesPart" },
 		variants: {
 			key: "type",
 			by: {
@@ -377,12 +394,12 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 			},
 		},
 	},
-	/** KR8: an element of a Responses item's `content`, `summary` or `output`. `text` is masked. */
+	/** KR8: an element of a Responses item's `content[]`, `summary[]` or `output[]`. `text` is masked. */
 	responsesPart: {
 		keep: ["type"],
 		variants: { key: "type", by: { input_image: { keep: ["image_url", "detail", "file_id"] } } },
 	},
-	/** KR8: a Responses item's `action` or `operation`. */
+	/** KR8: a Responses item's `action`, `operation` or object `output`. */
 	responsesTyped: { keep: ["type"] },
 	/** KR8: a `computer_call_output` item's `output`. */
 	computerOutput: { keep: ["type", "image_url", "file_id"] },
@@ -545,9 +562,7 @@ function maskObject(
 ): Record<string, unknown> {
 	const variant = at?.variants === undefined ? undefined : variantOf(obj, at.variants);
 	const signatureKey = signatureKeyOf(obj, variant);
-	// A Responses reasoning signature whose texts hold a value is left out even when nothing else changes.
-	let copy: Record<string, unknown> | undefined =
-		signatureKey !== undefined && variant?.reasoning && reasoningHoldsValue(obj[signatureKey], mask) ? {} : undefined;
+	let copy: Record<string, unknown> | undefined;
 	let maskedContent: string | undefined;
 	for (const key in obj) {
 		if (!Object.hasOwn(obj, key)) continue;
@@ -562,7 +577,12 @@ function maskObject(
 		setOwn(copy, key, next);
 		if (key === "content" && typeof next === "string" && next !== value) maskedContent = next;
 	}
-	if (copy === undefined) return obj;
+	if (copy === undefined) {
+		// Nothing else changed: a Responses reasoning signature whose texts hold a value is still left out.
+		if (signatureKey === undefined || !variant?.reasoning || !reasoningHoldsValue(obj[signatureKey], mask))
+			return obj;
+		return copyBefore(obj, undefined, signatureKey);
+	}
 	if (maskedContent !== undefined && typeof copy.lineCount === "number") {
 		copy.lineCount = countNewlines(maskedContent) + 1;
 	}
@@ -577,17 +597,25 @@ function maskField(
 	variant: Position | undefined,
 	key: string,
 ): unknown {
-	if (isRecord(value)) return maskChild(value, mask, childPosition(at, variant, key));
+	if (isRecord(value)) return maskChild(value, mask, childPosition(at, variant, key, false));
 	if (typeof value !== "string" && !Array.isArray(value)) return value;
 	// Kept as written: a string the table names here, or each string of an array it names.
 	const kept = at !== undefined && (at.keep?.includes(key) === true || variant?.keep?.includes(key) === true);
 	if (typeof value === "string") return kept ? value : mask.maskText(value);
-	return maskArray(value, mask, childPosition(at, variant, key), kept);
+	return maskArray(value, mask, childPosition(at, variant, key, true), kept);
 }
 
-/** The position of the object under `key` of an object at `at`, or `undefined` for free data. */
-function childPosition(at: Position | undefined, variant: Position | undefined, key: string): Position | undefined {
-	const name = ownValue(variant?.children, key) ?? ownValue(at?.children, key);
+/** The position of the object under `key`, or of each object item of an array there (`element`), or `undefined` for free data. */
+function childPosition(
+	at: Position | undefined,
+	variant: Position | undefined,
+	key: string,
+	element: boolean,
+): Position | undefined {
+	const name =
+		(element ? (ownValue(variant?.items, key) ?? ownValue(at?.items, key)) : undefined) ??
+		ownValue(variant?.children, key) ??
+		ownValue(at?.children, key);
 	return name === undefined ? undefined : POSITIONS[name];
 }
 
@@ -616,12 +644,7 @@ function signatureKeyOf(obj: Record<string, unknown>, variant: Position | undefi
  */
 function reasoningHoldsValue(signature: unknown, mask: SessionStoreMask): boolean {
 	if (typeof signature !== "string" || !/^\s*\{/.test(signature)) return false;
-	let item: unknown;
-	try {
-		item = JSON.parse(signature);
-	} catch {
-		return false;
-	}
+	const item = tryParseJson(signature);
 	return (
 		isRecord(item) &&
 		item.type === "reasoning" &&
@@ -637,8 +660,12 @@ function textsHoldValue(parts: unknown, mask: SessionStoreMask): boolean {
 	return false;
 }
 
-/** A copy of `obj`'s own keys that come before `stop`, leaving out `skip`. */
-function copyBefore(obj: Record<string, unknown>, stop: string, skip: string | undefined): Record<string, unknown> {
+/** A copy of `obj`'s own keys that come before `stop` (all of them when `stop` is `undefined`), leaving out `skip`. */
+function copyBefore(
+	obj: Record<string, unknown>,
+	stop: string | undefined,
+	skip: string | undefined,
+): Record<string, unknown> {
 	const copy: Record<string, unknown> = {};
 	for (const key in obj) {
 		if (key === stop) break;

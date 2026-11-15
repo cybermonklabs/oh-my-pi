@@ -3,8 +3,9 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import type { StoreMaskingBinding } from "../secrets/session-store-mask";
 import { visitEntriesFromFileStream } from "../session/session-loader";
-import { SessionManager, type StoreMaskingBinding } from "../session/session-manager";
+import { SessionManager } from "../session/session-manager";
 import { fingerprintMessage } from "./message-fingerprint";
 
 /**
@@ -277,9 +278,7 @@ export class AdvisorTranscriptRecorder {
 					initialCwd: cwd,
 					suppressBreadcrumb: true,
 				});
-				if (this.storeMasking) {
-					this.#manager.setStoreMasking(this.storeMasking.enabled, this.storeMasking.agentDir);
-				}
+				if (this.storeMasking) this.#manager.setStoreMasking(this.storeMasking);
 				this.#file = file;
 			}
 			this.#manager?.appendMessage(persisted);
