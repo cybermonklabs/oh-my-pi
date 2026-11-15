@@ -425,6 +425,41 @@ for (const backend of backends) {
 			await manager.close();
 		});
 
+		it("masks held values in tool and extension fields named like record identity keys", async () => {
+			// `type`, `id`, `role` and `timestamp` link or classify records only at record and block level.
+			// Inside tool call arguments, tool result details and custom entry data they are free text.
+			maskWrites();
+			const manager = await onDisk();
+			manager.appendMessage(
+				assistant(
+					[
+						{
+							type: "toolCall",
+							id: "call-b",
+							name: "lookup",
+							arguments: { id: said(ENV_VALUE), type: said(FILE_VALUE), role: said(ENV_VALUE) },
+						},
+					],
+					{ stopReason: "toolUse" },
+				),
+			);
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "call-b",
+				toolName: "lookup",
+				content: [{ type: "text", text: "found" }],
+				details: { id: said(FILE_VALUE), timestamp: said(ENV_VALUE) },
+				isError: false,
+				timestamp: NOW,
+			});
+			manager.appendCustomEntry("ext-state", { id: said(ENV_VALUE), type: said(FILE_VALUE) });
+			await settle(manager, store.storage);
+
+			const text = await store.storage.readText(sessionFileOf(manager));
+			expect(leakedFields(text)).toEqual([]);
+			await manager.close();
+		});
+
 		it("drops a changed block's signature and changed replay carriers, keeping ciphertext, images and ids", async () => {
 			maskWrites();
 			const manager = await onDisk();
