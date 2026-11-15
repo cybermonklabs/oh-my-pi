@@ -27,7 +27,9 @@ import type { AgentHubRemote, AgentHubRemoteTranscript } from "@oh-my-pi/pi-tui/
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
+import { sessionStoreMaskFor } from "../secrets/session-store-mask";
 import type { SessionEntry } from "../session/session-entries";
+import { maskSessionEntry } from "../session/session-entry-mask";
 import { mintSessionId, SessionManager } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
@@ -520,7 +522,10 @@ export class CollabGuestLink {
 			parentSession: pending.header.id,
 			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(pending.header),
 		};
-		const lines = [header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
+		const mask = sessionStoreMaskFor(this.#ctx.sessionManager.getCwd());
+		const lines = [header, ...pending.entries]
+			.map(entry => JSON.stringify(mask ? maskSessionEntry(entry, mask) : entry))
+			.join("\n");
 		const storage = new FileSessionStorage();
 		this.#replicaLease ??= storage.claimSession(this.#replicaId, replicaPath) ?? undefined;
 		// Published atomically: `omp gc` reads the replica's header to find its

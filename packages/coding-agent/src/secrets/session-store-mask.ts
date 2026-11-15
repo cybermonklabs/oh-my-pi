@@ -400,3 +400,19 @@ export function processSessionStoreMasker(agentDir: string = getAgentDir()): Ses
 	}
 	return masker;
 }
+
+let sessionStoreMasking = false;
+
+/** Turn masking of stored session entries on or off for this process (`secrets.maskSessionStore`). */
+export function setSessionStoreMasking(enabled: boolean): void {
+	sessionStoreMasking = enabled;
+}
+
+/**
+ * The mask every session store writer applies for `cwd`, or `null` while masking is off.
+ * `null`, not `undefined`, so a writer that took one mask for a whole body can pass "no mask"
+ * on without a default parameter asking again.
+ */
+export function sessionStoreMaskFor(cwd: string): SessionStoreMask | null {
+	return sessionStoreMasking ? processSessionStoreMasker().snapshot(cwd) : null;
+}
