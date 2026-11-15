@@ -26,7 +26,7 @@
  * the masker no source, so the self-check must fail: the negative control.
  *
  * Run: cd packages/coding-agent && bun bench/session-store-mask.bench.ts [--no-sources]
- * The commit shown is `BENCH_COMMIT` when set, else the checkout's HEAD.
+ * The commit shown is `BENCH_COMMIT` when set, else "unknown".
  */
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -34,7 +34,6 @@ import * as path from "node:path";
 import type { AssistantMessage, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai";
 import { setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { type SessionStoreMask, sessionStoreMaskFor, setSessionStoreMasking } from "../src/secrets/session-store-mask";
-import { currentRuntimeIdentity, loadRuntimeIdentity } from "../src/session/runtime-identity";
 import { SessionManager } from "../src/session/session-manager";
 import { MemorySessionStorage } from "../src/session/session-storage";
 
@@ -523,9 +522,7 @@ function formatTable(rows: readonly string[][]): string {
 
 async function main(root: string, noSources: boolean, commitOverride: string | undefined): Promise<void> {
 	const started = Bun.nanoseconds();
-	// Session entry points settle the build identity before writing; so does the bench.
-	await loadRuntimeIdentity();
-	const commit = commitOverride || currentRuntimeIdentity().commit || "unknown";
+	const commit = commitOverride || "unknown";
 	const random = seededRandom(0x5eed);
 	const typical = await writeTypicalSources(root, random);
 	const heavy = heavySecretsFile(random);
