@@ -5,7 +5,7 @@ import { type BtwHistoryRecord, type BtwHistoryTurn, getBtwLatestTurn } from "@o
 import { acquireFileLock, type FileLockHandle, isEnoent, logger, toError } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
 import { writeFileAtomically } from "../utils/atomic-file";
-import { maskSessionEntry } from "./session-entry-mask";
+import { maskBtwRecord } from "./session-entry-mask";
 
 export {
 	type BtwHistoryRecord,
@@ -205,7 +205,7 @@ export class BtwHistoryStore {
 		const directory = this.#directory;
 		// Disk gets the masked copy, the live record keeps the value; the conflict check hashes the bytes written.
 		const mask = this.#storeMask?.() ?? null;
-		const content = `${JSON.stringify(maskSessionEntry(saved, mask))}\n`;
+		const content = `${JSON.stringify(maskBtwRecord(saved, mask))}\n`;
 		const write = this.#pending.then(async () => {
 			// Reset only at this queue boundary: earlier attempts and their error
 			// handlers must settle before an explicit retry can recover the store.
