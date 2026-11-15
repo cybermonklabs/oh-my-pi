@@ -3486,7 +3486,7 @@ export class SessionManager {
 		// Keep the recent-sessions title index current so welcome-screen lookups
 		// never have to content-scan this session's file.
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			recordSessionTitle(this.#sessionId, title);
+			recordSessionTitle(this.#sessionId, sessionStoreMaskFor(this.#cwd)?.maskText(title) ?? title);
 		}
 
 		this.#notifySessionNameListeners();
@@ -3543,7 +3543,7 @@ export class SessionManager {
 	 */
 	recordRecap(recap: string): void {
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			recordSessionRecap(this.#sessionId, this.#cwd, recap);
+			recordSessionRecap(this.#sessionId, this.#cwd, sessionStoreMaskFor(this.#cwd)?.maskText(recap) ?? recap);
 		}
 	}
 
