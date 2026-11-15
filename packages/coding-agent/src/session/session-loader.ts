@@ -165,7 +165,7 @@ function splitTitleSlot(content: string): { body: string; slot: SessionTitleUpda
 	return { body: content.slice(newlineIndex + 1), slot };
 }
 
-function isValidSessionHeader(entry: FileEntry | undefined): entry is SessionHeader {
+export function isValidSessionHeader(entry: FileEntry | undefined): entry is SessionHeader {
 	return entry?.type === "session" && typeof entry.id === "string";
 }
 
@@ -757,6 +757,23 @@ export interface SessionFileVisit {
 }
 
 /**
+ * The visit of a session whose path could not be read, following
+ * {@link loadSessionFile}: none for a missing path, unless `throwIfMissing`
+ * asks for its error; any other error is thrown.
+ */
+async function missingSessionVisit(
+	caught: unknown,
+	filePath: string,
+	storage: SessionStorage,
+	options: LoadSessionOptions,
+): Promise<SessionFileVisit> {
+	const err = await restorePathComponentError(caught, filePath, storage);
+	if (options.throwIfMissing && (isEnoent(err) || isEnotdir(err))) throw err;
+	if (isEnoent(err)) return { titleSlot: undefined, malformedRecords: 0, sourceSize: null, invalidHeader: false };
+	throw err;
+}
+
+/**
  * Whether a transcript of `size` bytes streams from `storage` instead of being
  * read whole. An archived (gzipped) transcript is read whole, as
  * {@link shouldStreamEntries} reads it.
@@ -804,10 +821,7 @@ export async function visitSessionFile(
 	try {
 		size = storage.statSync(filePath).size;
 	} catch (caught) {
-		const err = await restorePathComponentError(caught, filePath, storage);
-		if (options.throwIfMissing && (isEnoent(err) || isEnotdir(err))) throw err;
-		if (isEnoent(err)) return { titleSlot: undefined, malformedRecords: 0, sourceSize: null, invalidHeader: false };
-		throw err;
+		return missingSessionVisit(caught, filePath, storage, options);
 	}
 	if (!streamsTranscript(storage, filePath, size))
 		return visitLoadedSession(await loadSessionFile(filePath, storage, options), visit);
@@ -854,10 +868,7 @@ export async function visitSessionFile(
 		};
 	} catch (caught) {
 		if (visitorError) throw visitorError.error;
-		const err = await restorePathComponentError(caught, filePath, storage);
-		if (options.throwIfMissing && (isEnoent(err) || isEnotdir(err))) throw err;
-		if (isEnoent(err)) return { titleSlot: undefined, malformedRecords: 0, sourceSize: null, invalidHeader: false };
-		throw err;
+		return missingSessionVisit(caught, filePath, storage, options);
 	}
 }
 
@@ -1006,7 +1017,7 @@ function containsBlobRef(value: unknown): boolean {
  * those archives from their retained source text so an already-wedged session
  * resumes as text instead of sending malformed image data to the provider.
  */
-function repairTruncatedSnapcompactFrames(entry: FileEntry): void {
+export function repairTruncatedSnapcompactFrames(entry: FileEntry): void {
 	if (entry.type !== "compaction") return;
 	const archive = snapcompact.getPreservedArchive(entry.preserveData);
 	if (!archive?.frames.some(frame => isPersistenceTruncatedString(frame.data))) return;

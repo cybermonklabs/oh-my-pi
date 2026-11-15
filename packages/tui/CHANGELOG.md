@@ -6,7 +6,7 @@
 
 - The status line's git-status polling interval now widens automatically for a repository whose `git status` stays slow across consecutive calls, instead of holding a fixed 10-second refresh regardless of cost ([#13405](https://github.com/can1357/oh-my-pi/pull/13405) by [@sjawhar](https://github.com/sjawhar)).
 - A tmux pane whose session has no attached client now animates at one frame a second instead of thirty; a keystroke, a resize or an attach restores the full rate, and a terminal whose audience cannot be established keeps it. `Terminal.hasAudience` reports the state ([#17404](https://github.com/can1357/oh-my-pi/pull/17404) by [@sjawhar](https://github.com/sjawhar))
-- `AgentTranscriptSource.readFrom` may return a window of a long transcript that holds at least one complete line; the agent transcript viewer reads on from it at the next poll instead of waiting for the transcript to change
+- `AgentTranscriptSource.readFrom` may return a window of 8 MiB or more of a long transcript whose last newline lies in its second half; the agent transcript viewer reads on from it at the next poll instead of waiting for the transcript to change
 
 ### Fixed
 

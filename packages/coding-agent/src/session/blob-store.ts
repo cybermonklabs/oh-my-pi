@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { isEexist, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { LazyFrameData } from "@oh-my-pi/snapcompact";
 
-const BLOB_PREFIX = "blob:sha256:";
+export const BLOB_PREFIX = "blob:sha256:";
 
 /** Canonical blob hash shape: exactly 64 lowercase hex chars (a SHA-256 digest). */
 export const BLOB_HASH_RE = /^[a-f0-9]{64}$/;
@@ -277,6 +277,11 @@ export class BlobStore {
 			if (isEnoent(err)) return null;
 			throw err;
 		}
+	}
+
+	/** Where the blob `hash` is stored, whether or not it exists. */
+	blobPath(hash: string): string {
+		return path.join(this.dir, hash);
 	}
 
 	/** Check if a blob exists. */

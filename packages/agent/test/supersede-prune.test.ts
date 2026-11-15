@@ -855,6 +855,65 @@ describe("tool calls before the compaction boundary", () => {
 		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
 		expect(prefixReads.reads).toBe(readsAfterFirstPass);
 	});
+
+	test("hold only the latest compaction's prefix index, and still pair each result with its call", async () => {
+		/** Every tool-call block a read of a prefix assistant's content handed out, by call id. */
+		const handedOut: Array<[id: string, block: WeakRef<object>]> = [];
+		/** Give `entry` fresh content on every read, as a body read back from disk has. */
+		const readFresh = (entry: SessionMessageEntry): void => {
+			const message = entry.message as { content: AssistantMessage["content"] };
+			const content = message.content;
+			Object.defineProperty(message, "content", {
+				get: () =>
+					content.map(block => {
+						const copy = { ...block };
+						if (copy.type === "toolCall") handedOut.push([copy.id, new WeakRef(copy)]);
+						return copy;
+					}),
+				enumerable: true,
+				configurable: true,
+			});
+		};
+		const calls: SessionMessageEntry[] = [];
+		const results: SessionMessageEntry[] = [];
+		for (let compaction = 0; compaction < 3; compaction++) {
+			const [call, result] = readPair(`src/file-${compaction}.ts`, FILE_CONTENT, T0 + compaction);
+			readFresh(call);
+			calls.push(call);
+			results.push(result);
+		}
+
+		// Each compaction keeps a result whose call lies before its boundary, and a newer read that supersedes it.
+		const entries: SessionEntry[] = [...calls];
+		let config = cfg();
+		for (let compaction = 0; compaction < 3; compaction++) {
+			const at = T0 + 100 * (compaction + 1);
+			const boundary = textEntry(`kept from compaction ${compaction + 1}`, at);
+			const [newerCall, newerResult] = readPair(`src/file-${compaction}.ts`, FILE_CONTENT, at);
+			entries.push(boundary, results[compaction], newerCall, newerResult);
+			config = cfg({ keepBoundaryId: boundary.id, now: at + 1_000 });
+			expect(pruneSupersededToolResults([...entries], tokenizer, config).prunedCount).toBe(1);
+			expect(resultText(results[compaction])).toBe(SUPERSEDED_NOTICE);
+		}
+
+		// A call resolved from a prefix lives only in that prefix's index; only the newest compaction's stays.
+		// A WeakRef keeps its target to the end of the job that made or read it, so each round yields first.
+		let alive: string[] = [];
+		for (let round = 0; round < 20; round++) {
+			await Bun.sleep(0);
+			Bun.gc(true);
+			alive = handedOut.filter(([, block]) => block.deref() !== undefined).map(([id]) => id);
+			if (alive.length <= 1) break;
+		}
+		expect(alive).toEqual([resultMessage(results[2]).toolCallId]);
+
+		// The session's entries are all still there, and the newest index still serves its next pass:
+		// a result whose call is nowhere misses without reading the prefix again.
+		const handedOutBefore = handedOut.length;
+		entries.push(messageEntry(toolResultMessage("read", "call-missing", FILE_CONTENT, T0 + 400), T0 + 400));
+		expect(pruneSupersededToolResults([...entries], tokenizer, config).prunedCount).toBe(0);
+		expect(handedOut.length).toBe(handedOutBefore);
+	});
 });
 
 /** `count` small, unkeyed bash call/result pairs: many content blocks, few tokens. */

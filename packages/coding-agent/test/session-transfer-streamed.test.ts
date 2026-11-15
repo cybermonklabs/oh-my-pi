@@ -325,4 +325,27 @@ describe("omp session pack/unpack of a long session", () => {
 		expect(memberReads).not.toHaveBeenCalled();
 		expect(await findSessionFiles(SESSION_ID)).toEqual([]);
 	});
+
+	it("refuses a blob member whose bytes do not match its name, before anything reaches the blob store or a session directory", async () => {
+		const named = Buffer.from("the image the member's name promises");
+		const carried = Buffer.from("other bytes in its place");
+		const namedHash = new Bun.CryptoHasher("sha256").update(named).digest("hex");
+		const carriedHash = new Bun.CryptoHasher("sha256").update(carried).digest("hex");
+		const archive = path.join(root, "bad-blob.tar");
+		const manifest = { version: SESSION_ARCHIVE_VERSION, id: SESSION_ID, cwd: cwdA, omp: VERSION };
+		await writeArchive(archive, "tar", [
+			["manifest.json", `${JSON.stringify(manifest, null, 2)}\n`],
+			["session.jsonl", `${JSON.stringify(header(cwdA))}\n`],
+			[`blobs/${namedHash}`, carried],
+		]);
+
+		setAgentDir(agentB);
+		await expect(unpackSession(archive, { cwd: cwdB })).rejects.toThrow(
+			`Bad session archive ${archive}: blob ${namedHash} fails its sha256 check (content hashes to ${carriedHash}). Nothing was unpacked.`,
+		);
+		const blobs = new BlobStore(getBlobsDir());
+		expect(await blobs.has(namedHash)).toBe(false);
+		expect(await blobs.has(carriedHash)).toBe(false);
+		expect(await findSessionFiles(SESSION_ID)).toEqual([]);
+	});
 });

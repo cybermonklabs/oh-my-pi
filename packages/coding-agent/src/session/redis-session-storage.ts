@@ -73,6 +73,19 @@ redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
 redis.call("HSET", KEYS[2], ARGV[1], ARGV[3])
 return 1`;
 
+// One script, so the size and the bytes come from one read: no client's write
+// lands between them. ARGV[1] is the first byte, ARGV[2] the last ("-1" for
+// the end, "" for none); a missing key returns nil.
+const READ_FROM_SCRIPT = `-- OMP_READ_FROM
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return false
+end
+local text = ""
+if ARGV[2] ~= "" then
+	text = redis.call("GETRANGE", KEYS[1], ARGV[1], ARGV[2])
+end
+return {redis.call("STRLEN", KEYS[1]), text}`;
+
 // One script, so the key, its mtime and its title move together: no client's
 // write to either path can land between them. With ARGV[4] == "1" a taken
 // destination leaves everything as it was (returns 0).
@@ -220,6 +233,20 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		const head = prefixBytes > 0 ? this.#client.getrange(key, 0, prefixBytes - 1) : Promise.resolve("");
 		const tail = suffixBytes > 0 ? this.#client.getrange(key, -suffixBytes, -1) : Promise.resolve("");
 		return Promise.all([head, tail]);
+	}
+
+	async readFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null> {
+		const take = maxBytes === undefined ? undefined : Math.max(0, Math.trunc(maxBytes));
+		const last = take === undefined ? "-1" : take === 0 ? "" : String(offset + take - 1);
+		const result = await this.#client.send("EVAL", [
+			READ_FROM_SCRIPT,
+			"1",
+			this.#fileKey(path),
+			String(offset),
+			last,
+		]);
+		if (!Array.isArray(result)) return null;
+		return { text: String(result[1]), size: Number(result[0]) };
 	}
 
 	async writeFull(

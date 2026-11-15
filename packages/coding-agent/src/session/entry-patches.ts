@@ -7,12 +7,13 @@
  * `warning` and corrects `tokensAfter`, snapcompact stores its archive without
  * reasoning (`preserveData`), and an elide pass replaces heavy content with
  * placeholders. `SessionManager.patchEntries` sets those fields on the live
- * entries and appends one record listing them ({@link toEntryPatchData}),
- * instead of rewriting the whole transcript. The original lines stay in the
- * file, so every reader that loads a whole session file calls
- * {@link applyEntryPatches} after migration and after `applyToolResultPrunes`:
- * `SessionManager` resume and `forkFrom`, `loadSessionMessagesReadOnly`
- * (`history://` for parked agents), and the HTML sub-session export.
+ * entries and appends one record listing them ({@link toEntryPatchData}), so
+ * the write's size follows the patched fields, not the transcript. The
+ * original lines stay in the file, so every reader that loads a whole session
+ * file calls {@link applyEntryPatches} after migration and after
+ * `applyToolResultPrunes`: `SessionManager` resume and `forkFrom`,
+ * `loadSessionMessagesReadOnly` (`history://` for parked agents), and the HTML
+ * sub-session export.
  *
  * Byte-offset tail readers (the Agent Hub transcript viewer, the collab agent
  * drawer, RPC subagent streaming) parse each line once as it lands and cannot
@@ -114,7 +115,7 @@ export function toEntryPatchData(patches: readonly EntryPatch[]): EntryPatchData
 }
 
 /** Message roles whose `content` an elide pass shortens. */
-const CONTENT_ROLES: Record<string, true> = { user: true, developer: true, assistant: true, toolResult: true };
+const CONTENT_ROLES: Record<Message["role"], true> = { user: true, developer: true, assistant: true, toolResult: true };
 
 /** Whether every field `patch` names exists on `entry`'s kind. */
 export function entryAcceptsPatch(entry: SessionEntry, patch: EntryPatch): boolean {
@@ -135,7 +136,7 @@ export function entryAcceptsPatch(entry: SessionEntry, patch: EntryPatch): boole
 		message.elidedOutputTokens !== undefined;
 	if (assistantFields && role !== "assistant") return false;
 	if (message.prunedAt !== undefined && role !== "toolResult") return false;
-	return message.content === undefined || CONTENT_ROLES[role] === true;
+	return message.content === undefined || Object.hasOwn(CONTENT_ROLES, role);
 }
 
 /** Set `patch`'s fields on `entry`, which {@link entryAcceptsPatch} accepted. */

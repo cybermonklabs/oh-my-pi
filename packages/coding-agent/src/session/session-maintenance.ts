@@ -103,7 +103,7 @@ import type { EntryPatch } from "./entry-patches";
 import {
 	assistantTurnDelivered,
 	convertToLlm,
-	countStrippableImages,
+	hasStrippableImages,
 	invalidateConvertToLlmArrayCache,
 	isUserAuthoredMessage,
 	stripImagesFromMessage,
@@ -916,7 +916,7 @@ export class SessionMaintenance {
 			if (entry.type === "message") {
 				// A body read back from the cold store is frozen: only an entry that
 				// carries images is made whole and rewritten.
-				if (countStrippableImages(entry.message) === 0) continue;
+				if (!hasStrippableImages(entry.message)) continue;
 				const { dropped, saved } = this.#host.sessionManager.updateEntryBody(entry.id, () => {
 					const before = this.#tokenizer.countMessage(entry.message, countOptions);
 					const strippedCount = stripImagesFromMessage(entry.message);
@@ -1201,8 +1201,8 @@ export class SessionMaintenance {
 				patches.push({ entryId: anchor.id, message: { contextSnapshot: anchor.message.contextSnapshot } });
 			}
 		}
-		// One appended record instead of a whole-file rewrite. A failed write
-		// keeps the pass live; the next successful write lands it.
+		// Persists the pass as one appended `entry_patch` record; a failed write
+		// keeps it live and the next successful write lands it.
 		await this.#host.sessionManager.patchEntries(patches);
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.replaceMessagesFromSessionContext(sessionContext.messages);

@@ -10,6 +10,9 @@
 - Added `headerRetryAfterMs` to `RetryHintOptions`: `extractRetryHint` merges an already parsed response-header delay with the body's signals, longest first ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
 - Added `writeTarArchive` to write a plain tar member by member, streaming `Blob` members such as `Bun.file`, with the same bytes as `writeArchive`
 - Added `ArchiveReader.readFileChunks` to read an archive member in bounded chunks; plain tar files on disk yield reads of at most 1 MiB
+- Added `readByteSourceChunks` to read a byte range of a `ByteSource` as reads of at most 1 MiB
+- Added the optional `MemberSource.chunks` so a format can serve a member in bounded chunks, and `chunksOrWhole` to read a source through it or, without it, as one chunk
+- Added `writeChunksToFile` to write an async iterable of byte chunks to a file one awaited write at a time
 
 ## [18.18.2] - 2026-11-08
 

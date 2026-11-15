@@ -7,6 +7,7 @@ import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import { isCompressScratchPath } from "@oh-my-pi/omp-stats/parser";
 import {
+	ConcatSink,
 	formatBytes,
 	getAgentDir,
 	getBlobsDir,
@@ -44,6 +45,7 @@ import { readSessionHeaderId, transcriptByteChunks } from "../session/session-lo
 import {
 	FileSessionStorage,
 	SESSION_STAGING_RE,
+	SessionReadConflictError,
 	type SessionStorage,
 	tryAcquireSessionLease,
 } from "../session/session-storage";
@@ -90,6 +92,12 @@ const DAY_MS = 86_400_000;
 const GC_WRITE_GRACE_MS = 5 * 60_000;
 const SESSION_SUFFIX = ".jsonl";
 const COMPRESSED_SESSION_SUFFIX = ".jsonl.gz";
+/**
+ * Times the blob scan reads a stored transcript again after a concurrent
+ * rewrite raced its read. It never skips one: the blobs only that transcript
+ * references would then be deleted.
+ */
+const RACED_READ_RETRIES = 3;
 /** Bytes sampled to rule out a session header before streaming an artifact. */
 const HEADER_SNIFF_BYTES = 4096;
 /**
@@ -589,21 +597,18 @@ function collectBlobHashesFromText(text: string, hashes: Set<string>): void {
 }
 
 /**
- * {@link collectBlobHashesFromText} over the bytes `chunks` yields, holding one
- * chunk and the line it ends inside at a time. A reference never spans lines,
- * so each scan stops at the chunk's last newline and carries the cut line,
- * with any reference it holds, into the next.
+ * {@link collectBlobHashesFromText} over the bytes `chunks` yields, a line at
+ * a time, holding one chunk and the line it ends inside. A reference never
+ * spans lines.
  */
 async function collectBlobHashesFromChunks(chunks: AsyncIterable<Uint8Array>, hashes: Set<string>): Promise<void> {
 	const decoder = new TextDecoder();
-	let tail = "";
+	const lines = new ConcatSink();
 	for await (const chunk of chunks) {
-		const text = tail + decoder.decode(chunk, { stream: true });
-		const end = text.lastIndexOf("\n") + 1;
-		collectBlobHashesFromText(text.slice(0, end), hashes);
-		tail = text.slice(end);
+		for (const line of lines.appendAndFlushLines(chunk)) collectBlobHashesFromText(decoder.decode(line), hashes);
 	}
-	collectBlobHashesFromText(tail + decoder.decode(), hashes);
+	const tail = lines.flush();
+	if (tail) collectBlobHashesFromText(decoder.decode(tail), hashes);
 }
 
 /** The first way `after` differs from `before`, or undefined when it does not. */
@@ -992,12 +997,16 @@ async function runBlobGc(
 				);
 			}
 			for (const file of stored) {
-				try {
-					await collectBlobHashesFromChunks(transcriptByteChunks(file, storage), referenced.hashes);
-				} catch (error) {
-					// Removed since the listing: it references nothing anymore.
-					if (codeOf(error) === "ENOENT") continue;
-					throw error;
+				for (let retries = 0; ; retries++) {
+					try {
+						await collectBlobHashesFromChunks(transcriptByteChunks(file, storage), referenced.hashes);
+						break;
+					} catch (error) {
+						// Removed since the listing: it references nothing anymore.
+						if (codeOf(error) === "ENOENT") break;
+						if (error instanceof SessionReadConflictError && retries < RACED_READ_RETRIES) continue;
+						throw error;
+					}
 				}
 			}
 		}

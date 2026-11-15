@@ -1109,7 +1109,7 @@ message entries. Only complete newline-terminated records are consumed; reuse
 `nextByte` on the next request. A missing transcript returns empty arrays.
 If `fromByte` exceeds the current file size, reading restarts at byte zero and
 reports `reset: true`.
-One response reads at most 8 MiB of the transcript (more only when a single
+One response returns at most 8 MiB of the transcript (more only when a single
 record is longer than 4 MiB), so a client reading a long transcript repeats
 the request from `nextByte` until `nextByte` stops advancing.
 

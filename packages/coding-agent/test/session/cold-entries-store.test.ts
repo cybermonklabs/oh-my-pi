@@ -1,8 +1,10 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { TextContent } from "@oh-my-pi/pi-ai";
+import { BlobStore } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import type { RuntimeIdentity } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
 import {
 	CURRENT_SESSION_VERSION,
 	type SessionEntry,
@@ -10,11 +12,16 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 /** Larger than any value a cold entry keeps in memory. */
 const BODY = "x".repeat(4096);
-const COLD_DIR = path.join(os.tmpdir(), "omp-cold");
+/** This account's store directory under `tmp`. */
+function coldDirIn(tmp: string): string {
+	const uid = process.getuid?.();
+	return path.join(tmp, uid === undefined ? "omp-cold" : `omp-cold-${uid}`);
+}
+const COLD_DIR = coldDirIn(os.tmpdir());
 
 function usage() {
 	return {
@@ -46,7 +53,7 @@ function assistant(text: string) {
  * directory's name, so no two tests share a session (a manager another test
  * left open keeps its writer claim on its session).
  */
-async function writeSession(dir: string): Promise<string> {
+async function writeSession(dir: string, runtime?: RuntimeIdentity): Promise<string> {
 	const file = path.join(dir, "session.jsonl");
 	const timestamp = "2026-01-01T00:00:00.000Z";
 	const id = path.basename(dir);
@@ -80,7 +87,8 @@ async function writeSession(dir: string): Promise<string> {
 		},
 		{ type: "message", id: "a2", parentId: "c1", timestamp, message: assistant(`a2 ${BODY}`) },
 	];
-	await Bun.write(file, entries.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+	const lines = entries.map(record => JSON.stringify(runtime && record !== header ? { ...record, runtime } : record));
+	await Bun.write(file, lines.map(line => `${line}\n`).join(""));
 	return file;
 }
 
@@ -112,8 +120,8 @@ function textOf(found: SessionEntry): string {
 	return content.map(block => block.text).join("");
 }
 
-/** Descriptors of this process open on a cold store file, by fd number. */
-function coldStoreDescriptors(): Map<string, string> {
+/** Descriptors of this process open on a cold store file in `dir`, by fd number. */
+function coldStoreDescriptors(dir = COLD_DIR): Map<string, string> {
 	const found = new Map<string, string>();
 	for (const fd of fs.readdirSync("/proc/self/fd")) {
 		let target: string;
@@ -122,7 +130,7 @@ function coldStoreDescriptors(): Map<string, string> {
 		} catch {
 			continue;
 		}
-		if (target.startsWith(`${COLD_DIR}${path.sep}`)) found.set(fd, target);
+		if (target.startsWith(`${dir}${path.sep}`)) found.set(fd, target);
 	}
 	return found;
 }
@@ -139,7 +147,111 @@ async function collectGarbage(done: () => boolean, rounds = 20): Promise<void> {
 	}
 }
 
+/** Text longer than a persisted line keeps: a full write cuts it. */
+const UNCUT_TEXT = "y".repeat(600_000);
+const TRUNCATION_NOTICE = "[Session persistence truncated large content]";
+
+interface StoredImage {
+	bytes: Buffer;
+	hash: string;
+	ref: string;
+}
+
+/** Two images, larger than a persisted line keeps inline, in the current agent's blob store. */
+function storeImages(): [StoredImage, StoredImage] {
+	const blobs = new BlobStore(getBlobsDir());
+	const store = (fill: number): StoredImage => {
+		const bytes = Buffer.alloc(3000, fill);
+		const { hash, ref } = blobs.putSync(bytes, { extension: "png" });
+		return { bytes, hash, ref };
+	};
+	return [store(1), store(2)];
+}
+
+/** An image a signed block carries: a persisted line keeps the block, and so the image, verbatim. */
+const SIGNED_IMAGE = Buffer.alloc(3000, 3).toString("base64");
+
+/**
+ * A session whose compaction `c1` keeps `u2` on, so `u1` and `a1` load cold.
+ * `u1` and `u3` hold an image each, as blob references the way a written
+ * session holds them, and `a2` a signed tool call with {@link SIGNED_IMAGE};
+ * `a1` and `a3` hold text a full write cuts. Ends at `u4`.
+ */
+async function writeImageSession(dir: string, images: [StoredImage, StoredImage]): Promise<string> {
+	const file = path.join(dir, "session.jsonl");
+	const timestamp = "2026-01-01T00:00:00.000Z";
+	const header: SessionHeader = {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id: path.basename(dir),
+		timestamp,
+		cwd: dir,
+	};
+	const user = (id: string, parentId: string | null, image?: StoredImage) => ({
+		type: "message",
+		id,
+		parentId,
+		timestamp,
+		message: {
+			role: "user",
+			content: [
+				{ type: "text", text: `${id} ${BODY}` },
+				...(image ? [{ type: "image", data: image.ref, mimeType: "image/png" }] : []),
+			],
+			timestamp: 1,
+		},
+	});
+	const reply = (id: string, parentId: string, text = BODY) => ({
+		type: "message",
+		id,
+		parentId,
+		timestamp,
+		message: assistant(`${id} ${text}`),
+	});
+	const compaction = (id: string, parentId: string, firstKeptEntryId: string) => ({
+		type: "compaction",
+		id,
+		parentId,
+		timestamp,
+		summary: `${id} ${BODY}`,
+		firstKeptEntryId,
+		tokensBefore: 1000,
+	});
+	const entries = [
+		header,
+		user("u1", null, images[0]),
+		reply("a1", "u1", UNCUT_TEXT),
+		user("u2", "a1"),
+		compaction("c1", "u2", "u2"),
+		{
+			...reply("a2", "c1"),
+			message: {
+				...assistant(`a2 ${BODY}`),
+				content: [
+					{ type: "text", text: `a2 ${BODY}` },
+					{
+						type: "toolCall",
+						id: "call-a2",
+						name: "inspect",
+						arguments: { images: [{ data: SIGNED_IMAGE, mimeType: "image/png" }] },
+						thoughtSignature: "signature-a2",
+					},
+				],
+			},
+		},
+		user("u3", "a2", images[1]),
+		reply("a3", "u3", UNCUT_TEXT),
+		user("u4", "a3"),
+	];
+	await Bun.write(file, entries.map(record => `${JSON.stringify(record)}\n`).join(""));
+	return file;
+}
+
 describe("cold entry store", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	it("keeps entries before the cut cold except the kinds kept whole, and serves a read from the record once", async () => {
 		using dir = TempDir.createSync("@omp-cold-entries-");
 		const manager = await open(await writeSession(dir.path()));
@@ -304,4 +416,122 @@ describe("cold entry store", () => {
 			expect(stillOpen()).toBe(false);
 		},
 	);
+
+	it.skipIf(!fs.existsSync("/proc/self/fd"))(
+		"opens its store in a directory of the account's own that no other account can enter",
+		async () => {
+			using dir = TempDir.createSync("@omp-cold-entries-");
+			using tmp = TempDir.createSync("@omp-cold-tmpdir-");
+			const file = await writeSession(dir.path());
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
+			const coldDir = coldDirIn(tmp.path());
+
+			const manager = await open(file);
+			expect(manager.coldStoreStats().coldEntries).toBe(2);
+			expect(coldStoreDescriptors(coldDir).size).toBe(1);
+			expect(fs.statSync(coldDir).mode & 0o777).toBe(0o700);
+			expect(textOf(entry(manager, "u1"))).toBe(`u1 ${BODY}`);
+		},
+	);
+
+	it("shares one runtime object among the loaded entries a source checkout wrote", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const runtime: RuntimeIdentity = {
+			version: "18.18.6",
+			commit: "0123456789abcdef0123456789abcdef01234567",
+			branch: "feature/session-memory",
+		};
+		const manager = await open(await writeSession(dir.path(), runtime));
+
+		// u1 and a1 are cold, u2 and a2 whole.
+		const runtimes = ["u1", "a1", "u2", "a2"].map(id => entry(manager, id).runtime);
+		expect(runtimes[0]).toEqual(runtime);
+		for (const shared of runtimes) expect(shared).toBe(runtimes[0]);
+	});
+
+	describe("full rewrites of entries with images", () => {
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		let agentDir: TempDir;
+
+		beforeEach(() => {
+			agentDir = TempDir.createSync("@omp-cold-agent-");
+			setAgentDir(agentDir.path());
+		});
+
+		afterEach(() => {
+			if (originalAgentDir) {
+				setAgentDir(originalAgentDir);
+			} else {
+				setAgentDir(path.join(getConfigRootDir(), "agent"));
+				delete process.env.PI_CODING_AGENT_DIR;
+			}
+			agentDir.removeSync();
+		});
+
+		/**
+		 * Compact after a new reply, with ids and clock fixed so two runs append the
+		 * same entries: the cut moves to that reply, and `u2` to `u4`, whole in
+		 * memory until now, go cold, `u1` and `a1` already being so.
+		 */
+		function compactDuringSession(manager: SessionManager): void {
+			let uuids = 0;
+			vi.spyOn(crypto, "randomUUID").mockImplementation(
+				() => `00000000-0000-4000-8000-${(++uuids).toString(16).padStart(12, "0")}`,
+			);
+			setSystemTime(new Date("2026-01-02T00:00:00.000Z"));
+			try {
+				const a4 = manager.appendMessage(assistant(`a4 ${BODY}`));
+				manager.appendCompaction(`c2 ${BODY}`, undefined, a4, 2000);
+				manager.buildSessionContext();
+			} finally {
+				setSystemTime();
+				vi.restoreAllMocks();
+			}
+		}
+
+		it("write the bytes a manager holding every entry writes, images and cut text included", async () => {
+			using dir = TempDir.createSync("@omp-cold-entries-");
+			const images = storeImages();
+			const file = await writeImageSession(dir.path(), images);
+			const original = await Bun.file(file).bytes();
+			const rewrite = async (coldStore: boolean): Promise<{ coldEntries: number; text: string }> => {
+				await Bun.write(file, original);
+				const manager = await open(file, coldStore);
+				compactDuringSession(manager);
+				const { coldEntries } = manager.coldStoreStats();
+				await manager.rewriteEntries();
+				await manager.close();
+				return { coldEntries, text: await Bun.file(file).text() };
+			};
+
+			const withStore = await rewrite(true);
+			const withoutStore = await rewrite(false);
+			expect(withStore.coldEntries).toBe(8);
+			expect(withoutStore.coldEntries).toBe(0);
+			expect(withStore.text).toBe(withoutStore.text);
+			for (const image of images) expect(withStore.text).toContain(image.ref);
+			expect(withStore.text).toContain(SIGNED_IMAGE);
+			expect(withStore.text.split(TRUNCATION_NOTICE)).toHaveLength(3);
+		});
+
+		it("leave the images of cold entries as blob references, reading and storing none of them again", async () => {
+			using dir = TempDir.createSync("@omp-cold-entries-");
+			const images = storeImages();
+			const manager = await open(await writeImageSession(dir.path(), images));
+			compactDuringSession(manager);
+			expect(manager.coldStoreStats().coldEntries).toBe(8);
+
+			const reads = vi.spyOn(BlobStore.prototype, "getSync");
+			const stores = vi.spyOn(BlobStore.prototype, "putSync");
+			await manager.rewriteEntries();
+			const hashes = new Set(images.map(image => image.hash));
+			expect(reads.mock.calls.filter(([hash]) => hashes.has(hash))).toEqual([]);
+			expect(stores.mock.calls.filter(([data]) => images.some(image => data.equals(image.bytes)))).toEqual([]);
+			const file = manager.getSessionFile();
+			if (!file) throw new Error("Expected a session file");
+			const text = await Bun.file(file).text();
+			for (const image of images) expect(text).toContain(image.ref);
+			await manager.close();
+		});
+	});
 });

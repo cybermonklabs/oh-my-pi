@@ -9,12 +9,15 @@
 
 import { describe, expect, it } from "bun:test";
 import { listAllSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
-import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { SessionReadConflictError, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { copyTranscriptTree } from "@oh-my-pi/pi-coding-agent/session/session-transcript-tree";
 import { SqlSessionStorage, type SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
-import { readStoredSession, readStoredSessions } from "../helpers/sql-session-storage";
+import { readStoredParts, readStoredSession, readStoredSessions } from "../helpers/sql-session-storage";
+
+const MiB = 1024 * 1024;
 
 /** The SQLite schema docs/session.md gives `createTable: false` consumers. */
 const SQLITE_SCHEMA = [
@@ -376,24 +379,158 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
+	it("readChunks reads many small appended parts in a few queries, not one per few parts", async () => {
+		const raw = new SQL("sqlite::memory:");
+		const { client, queries } = recordQueries(raw);
+		const storage = await SqlSessionStorage.create({ client });
+		const path = "/sessions/p/appended.jsonl";
+		// About 4 MiB in 4,000 parts.
+		const lines = Array.from({ length: 4000 }, (_, n) => `${JSON.stringify({ n, pad: "x".repeat(1000) })}\n`);
+		const writer = storage.openWriter(path);
+		for (const line of lines) await writer.append(line);
+		await writer.close();
+
+		queries.length = 0;
+		const read = Buffer.concat(await Array.fromAsync(storage.readChunks(path)));
+		expect(read.toString("utf-8")).toBe(lines.join(""));
+		// The session's size, then pages spanning 1, 2 and 4 MiB: together past the 4 MiB stored.
+		expect(queries.length).toBeLessThanOrEqual(4);
+		await raw.end();
+	});
+
+	it("readChunks fetches about the window a reader stops after, not a whole page of 12 MiB", async () => {
+		const raw = new SQL("sqlite::memory:");
+		let paged = 0;
+		let pages = 0;
+		const client: SqlSessionStorageClient = {
+			options: raw.options,
+			async unsafe(query, values) {
+				const rows = await raw.unsafe(query, values);
+				if (query.startsWith("SELECT start_offset, content FROM")) {
+					pages++;
+					for (const row of rows as Array<{ content: string }>) paged += Buffer.byteLength(row.content);
+				}
+				return rows;
+			},
+			transaction(callback) {
+				return raw.transaction(async transaction =>
+					callback({ unsafe: (query, values) => transaction.unsafe(query, values) }),
+				);
+			},
+		};
+		const storage = await SqlSessionStorage.create({ client });
+		const path = "/sessions/p/windowed.jsonl";
+		const part = 100 * 1024;
+		const writer = storage.openWriter(path);
+		// 8 MiB in parts of 100 KiB.
+		for (let n = 0; n < 82; n++) await writer.append(`${String(n).padStart(2, "0")}:${"x".repeat(part - 4)}\n`);
+		await writer.close();
+
+		// Windows of 1 MiB as memories stage 1 reads them: from the start, and from inside a part.
+		for (const offset of [0, 4 * MiB]) {
+			paged = 0;
+			pages = 0;
+			let read = 0;
+			for await (const chunk of storage.readChunks(path, offset)) {
+				read += chunk.byteLength;
+				if (read >= MiB) break;
+			}
+			// One page: the window, the part it ends in, and the head of the part it starts in.
+			const bound = MiB + part + (offset % part);
+			expect({ offset, pages, withinBound: paged <= bound }).toEqual({ offset, pages: 1, withinBound: true });
+		}
+		await raw.end();
+	});
+
+	it("readChunks from inside a row an older version wrote fetches only the row's bytes from there on", async () => {
+		const raw = new SQL("sqlite::memory:");
+		const path = "/sessions/p/legacy.jsonl";
+		const legacy = `${"€".repeat(50_000)}\n`;
+		await SqlSessionStorage.create({ client: raw });
+		await raw.unsafe(`INSERT INTO omp_session_files (path, content, mtime_ms, byte_len) VALUES (?, ?, ?, ?)`, [
+			path,
+			legacy,
+			1,
+			Buffer.byteLength(legacy),
+		]);
+		let fetched = 0;
+		const count = (rows: unknown[]): void => {
+			for (const row of rows as Array<Record<string, unknown>>) {
+				for (const value of Object.values(row)) {
+					if (typeof value === "string") fetched += Buffer.byteLength(value);
+					else if (value instanceof Uint8Array) fetched += value.byteLength;
+				}
+			}
+		};
+		const client: SqlSessionStorageClient = {
+			options: raw.options,
+			async unsafe(query, values) {
+				const rows = await raw.unsafe(query, values);
+				count(rows);
+				return rows;
+			},
+			transaction(callback) {
+				return raw.transaction(async transaction =>
+					callback({ unsafe: (query, values) => transaction.unsafe(query, values) }),
+				);
+			},
+		};
+		const storage = await SqlSessionStorage.create({ client });
+		const writer = storage.openWriter(path);
+		await writer.append("tail\n");
+		await writer.close();
+		const expected = Buffer.from(`${legacy}tail\n`);
+
+		for (const offset of [0, 1, 100_000, Buffer.byteLength(legacy) - 1]) {
+			fetched = 0;
+			const read = Buffer.concat(await Array.fromAsync(storage.readChunks(path, offset)));
+			expect({ offset, equal: read.equals(expected.subarray(offset)), fetched }).toEqual({
+				offset,
+				equal: true,
+				fetched: expected.length - offset,
+			});
+		}
+		await raw.end();
+	});
+
 	it("readChunks fails rather than mix two bodies when a full write replaces the session between pages", async () => {
 		const client = new SQL("sqlite::memory:");
 		const reader = await SqlSessionStorage.create({ client });
 		const rewriter = await SqlSessionStorage.create({ client });
 		const path = "/sessions/p/replaced.jsonl";
 		const writer = reader.openWriter(path);
-		for (let n = 0; n < 8; n++) await writer.append(`{"n":${n}}\n`);
+		// Parts of 2 MiB: the first page, which spans 1 MiB, holds only the first.
+		for (let n = 0; n < 3; n++) await writer.append(`${n}:${"x".repeat(2 * MiB - 3)}\n`);
 		await writer.close();
 
 		const chunks = reader.readChunks(path)[Symbol.asyncIterator]();
-		// One page of parts arrives before the rewrite.
-		for (let n = 0; n < 4; n++) expect((await chunks.next()).done).toBe(false);
+		expect((await chunks.next()).done).toBe(false);
 		await rewriter.writeText(path, '{"n":"replaced"}\n');
 		const rest = (async () => {
 			let chunk = await chunks.next();
 			while (!chunk.done) chunk = await chunks.next();
 		})();
-		await expect(rest).rejects.toThrow(/replaced or removed while it was read/);
+		await expect(rest).rejects.toBeInstanceOf(SessionReadConflictError);
+		await client.end();
+	});
+
+	it("copies a transcript of many parts with an append per MiB, not one per part", async () => {
+		const client = new SQL("sqlite::memory:");
+		const storage = await SqlSessionStorage.create({ client });
+		const from = "/sessions/p/source/Child.jsonl";
+		const to = "/sessions/p/copy/Child.jsonl";
+		const lines = Array.from({ length: 3000 }, (_, n) => `${JSON.stringify({ n, pad: "x".repeat(1000) })}\n`);
+		const writer = storage.openWriter(from);
+		for (const line of lines) await writer.append(line);
+		await writer.close();
+
+		expect(await copyTranscriptTree(storage, "/sessions/p/source", "/sessions/p/copy")).toEqual([{ from, to }]);
+		const body = lines.join("");
+		expect(await readStoredSession(client, "omp_session_files", to)).toBe(body);
+		// Each append stores one part.
+		expect((await readStoredParts(client, "omp_session_files", to)).length).toBeLessThanOrEqual(
+			Math.ceil(Buffer.byteLength(body) / MiB),
+		);
 		await client.end();
 	});
 
