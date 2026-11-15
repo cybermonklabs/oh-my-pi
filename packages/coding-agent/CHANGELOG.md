@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
-- In RPC mode, a `prompt` or `abort_and_prompt` that is refused or fails because the agent is busy now carries `code: "session_busy"` on its error response and `error.code: "session_busy"` on its `prompt_result`, as `fork` and `navigate_tree` already do. A client built from an older generated Go, Rust or Python SDK reports a parse failure for such a `prompt_result`, and the Rust SDK's `PromptError.code` field is now a `PromptErrorCode` enum
+- In RPC mode, a `prompt` or `abort_and_prompt` that is refused or fails because the agent is busy now carries `code: "session_busy"` on its error response and `error.code: "session_busy"` on its `prompt_result`, as `fork` and `navigate_tree` already do. The Python SDK client keeps that code on the `RpcCommandError` it raises for a late failure. A client built from an older generated Go, Rust or Python SDK reports a parse failure for such a `prompt_result`, and the Rust SDK's `PromptError.code` field is now a `PromptErrorCode` enum
 
 - In RPC mode a command sent after the `ready` frame is answered while startup still runs instead of after it finishes; a frame that starts a turn, changes the session or changes goal state still waits for startup ([#19126](https://github.com/can1357/oh-my-pi/pull/19126) by [@sjawhar](https://github.com/sjawhar))
 - In RPC mode an `abort` sent while a `new_session`, `switch_session`, `fork` or `navigate_tree` waits for startup now withdraws it: the frame answers `cancelled` instead of changing the session once startup finishes ([#19126](https://github.com/can1357/oh-my-pi/pull/19126) by [@sjawhar](https://github.com/sjawhar))
