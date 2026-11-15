@@ -3,7 +3,9 @@ import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { type BtwHistoryRecord, type BtwHistoryTurn, getBtwLatestTurn } from "@oh-my-pi/pi-tui/overlays/btw-history";
 import { acquireFileLock, type FileLockHandle, isEnoent, logger, toError } from "@oh-my-pi/pi-utils";
+import type { SessionStoreMask } from "../secrets/session-store-mask";
 import { writeFileAtomically } from "../utils/atomic-file";
+import { maskSessionEntry } from "./session-entry-mask";
 
 export {
 	type BtwHistoryRecord,
@@ -120,6 +122,7 @@ export class BtwHistoryConflictError extends Error {
 /** Session-local sidecar storage; never reads or writes the main session journal. */
 export class BtwHistoryStore {
 	readonly #directory: string | undefined;
+	readonly #storeMask: (() => SessionStoreMask | null) | undefined;
 	readonly #records = new Map<string, BtwHistoryRecord>();
 	readonly #revisions = new Map<string, string>();
 	readonly #leases = new Map<string, FileLockHandle>();
@@ -127,17 +130,26 @@ export class BtwHistoryStore {
 	#pending: Promise<void> = Promise.resolve();
 	#writeError: Error | undefined;
 
-	constructor(directory: string | undefined) {
+	constructor(directory: string | undefined, storeMask?: () => SessionStoreMask | null) {
 		this.#directory = directory;
+		this.#storeMask = storeMask;
 	}
 
 	/**
 	 * Open the BTW history for an artifacts directory. Subagents share their
 	 * parent's artifacts directory, so a `scope` (the owning session id) keeps
 	 * each focused agent's side conversations apart from main and its siblings.
+	 * `storeMask` is the owning session's mask (`SessionManager.storeMask`), read
+	 * at each write: the files hold its markers, the live records keep the values.
 	 */
-	static async open(artifactsDir: string | undefined, scope?: string): Promise<BtwHistoryStore> {
-		const store = new BtwHistoryStore(artifactsDir === undefined ? undefined : historyDirectory(artifactsDir, scope));
+	static async open(
+		artifactsDir: string | undefined,
+		options?: { scope?: string; storeMask?: () => SessionStoreMask | null },
+	): Promise<BtwHistoryStore> {
+		const store = new BtwHistoryStore(
+			artifactsDir === undefined ? undefined : historyDirectory(artifactsDir, options?.scope),
+			options?.storeMask,
+		);
 		if (store.#directory === undefined) return store;
 		let names: string[];
 		try {
@@ -191,7 +203,9 @@ export class BtwHistoryStore {
 			return;
 		}
 		const directory = this.#directory;
-		const content = `${JSON.stringify(saved)}\n`;
+		// Disk gets the masked copy, the live record keeps the value; the conflict check hashes the bytes written.
+		const mask = this.#storeMask?.() ?? null;
+		const content = `${JSON.stringify(maskSessionEntry(saved, mask))}\n`;
 		const write = this.#pending.then(async () => {
 			// Reset only at this queue boundary: earlier attempts and their error
 			// handlers must settle before an explicit retry can recover the store.
@@ -216,7 +230,7 @@ export class BtwHistoryStore {
 				// visible; a stale sidecar from a vanished record must not title a new one.
 				const titlePath = path.join(directory, titleFileName(snapshot.id));
 				if (title === undefined) await fs.rm(titlePath, { force: true });
-				else await writeFileAtomically(titlePath, title);
+				else await writeFileAtomically(titlePath, mask?.maskText(title) ?? title);
 			}
 			await writeFileAtomically(filePath, content);
 			this.#revisions.set(snapshot.id, new Bun.CryptoHasher("sha256").update(content).digest("hex"));

@@ -383,6 +383,14 @@ export class SessionStoreMasker {
 		}
 		const values = new Map<string, string>();
 		for (const [value, source] of this.#values) values.set(value, markers.get(source)!);
+		// JSON text (a structured yield's `<id>.md`, a printed JSON document) holds a value with a
+		// quote, a backslash or a control character only escaped, so the escaped form is held too,
+		// with the same marker; a held value of that text keeps its own. A marker needs no escape:
+		// masked JSON stays valid.
+		for (const [value, source] of this.#values) {
+			const escaped = JSON.stringify(value).slice(1, -1);
+			if (!values.has(escaped)) values.set(escaped, markers.get(source)!);
+		}
 		const regexes = Array.from(this.#regexes.values(), ({ regex, source }) => ({
 			regex,
 			marker: markers.get(source)!,
@@ -396,7 +404,11 @@ export class SessionStoreMasker {
 
 const processMaskers = new Map<string, SessionStoreMasker>();
 
-/** The process-wide masker for the active agent dir (`getAgentDir()`), shared by every session writer. */
+/**
+ * The process-wide masker for the active agent dir (`getAgentDir()`), shared by every session
+ * writer. Whether a writer masks is up to its session's `secrets.maskSessionStore`
+ * (`SessionManager.storeMask`).
+ */
 export function processSessionStoreMasker(): SessionStoreMasker {
 	const agentDir = getAgentDir();
 	let masker = processMaskers.get(agentDir);
@@ -407,18 +419,10 @@ export function processSessionStoreMasker(): SessionStoreMasker {
 	return masker;
 }
 
-let sessionStoreMasking = false;
-
-/** Turn masking of stored session entries on or off for this process (`secrets.maskSessionStore`). */
-export function setSessionStoreMasking(enabled: boolean): void {
-	sessionStoreMasking = enabled;
-}
-
 /**
- * The mask every session store writer applies for `cwd`, or `null` while masking is off.
- * `null`, not `undefined`, so a writer that took one mask for a whole body can pass "no mask"
- * on without a default parameter asking again.
+ * The mask a session's stored writes apply for `cwd`, or `null` while its setting is off; off, no
+ * masker is built. `null`, not `undefined`, as `SessionManager.storeMask` documents.
  */
-export function sessionStoreMaskFor(cwd: string): SessionStoreMask | null {
-	return sessionStoreMasking ? processSessionStoreMasker().snapshot(cwd) : null;
+export function sessionStoreMaskFor(enabled: boolean, cwd: string): SessionStoreMask | null {
+	return enabled ? processSessionStoreMasker().snapshot(cwd) : null;
 }

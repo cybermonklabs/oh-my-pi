@@ -4,7 +4,6 @@
  */
 import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { effect, register } from "../config/registry";
-import { setSessionStoreMasking } from "./session-store-mask";
 
 // ────────────────────────────────────────────────────────────────────────
 // Providers
@@ -35,7 +34,8 @@ export const cfgSecretsMaskSessionStore = register({
 		group: "Privacy",
 		label: "Mask Secrets in Stored Sessions",
 		description:
-			"Replace known secret values (secret-named environment variables, files named by *_FILE variables, secrets.yml) with a marker before a session entry, its title or a recap is written to the session store or history.db",
+			"Replace known secret values (secret-named environment variables, files named by *_FILE variables, secrets.yml) with a marker before this session writes them to the session store, history.db, the /btw history or a subagent's output file",
 	},
 });
-effect(cfgSecretsMaskSessionStore, setSessionStoreMasking);
+// No effect: each session's writers read the setting from that session's settings
+// (`SessionManager.setStoreMasking`), so one session's project never decides masking for another.

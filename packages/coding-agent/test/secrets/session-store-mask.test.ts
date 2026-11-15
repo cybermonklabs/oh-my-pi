@@ -251,6 +251,18 @@ describe("SessionStoreMask matching", () => {
 		);
 	});
 
+	it("masks a multi-line _FILE value as written and inside JSON text, where it is escaped", async () => {
+		const value = 'first line of the "held" file\nsecond line of the held file';
+		const escaped = JSON.stringify(value).slice(1, -1);
+		const marker = "[REDACTED:file:EXAMPLE_KEY_FILE]";
+		const mask = maskerFor({ EXAMPLE_KEY_FILE: await writeFile("key.txt", `${value}\n`) }).snapshot(cwd);
+		expect(mask.maskText(`key: ${value}.`)).toBe(`key: ${marker}.`);
+
+		const json = mask.maskText(JSON.stringify({ report: `deploy with ${value}`, lines: [value] }, null, 2));
+		expect(JSON.parse(json)).toEqual({ report: `deploy with ${marker}`, lines: [marker] });
+		expect([json.includes(value), json.includes(escaped)]).toEqual([false, false]);
+	});
+
 	it("is idempotent with a broad secrets.yml regex over text that holds markers and values", async () => {
 		await Bun.write(projectYml, ["- type: regex", "  content: '[A-Za-z0-9_]{8,}'"].join("\n"));
 		const mask = maskerFor({ SERVICE_API_KEY: ENV_VALUE }).snapshot(cwd);

@@ -216,6 +216,8 @@ export class AdvisorTranscriptRecorder {
 	 *   recorder's `close` and the two never hold the same file at once.
 	 * @param storage Storage of the owning session, which holds its transcript
 	 *   tree; {@link loadAdvisorTranscriptCosts} reads the spend back from it.
+	 * @param storeMasking The owning session's `secrets.maskSessionStore`, bound to
+	 *   every transcript manager the recorder opens (see `SessionManager.setStoreMasking`).
 	 */
 	constructor(
 		private readonly resolveSessionFile: () => string | undefined,
@@ -223,6 +225,7 @@ export class AdvisorTranscriptRecorder {
 		filename: string = ADVISOR_TRANSCRIPT_FILENAME,
 		after?: Promise<unknown>,
 		storage?: SessionStorage,
+		private readonly storeMasking?: () => boolean,
 	) {
 		this.#filename = filename;
 		this.#storage = storage;
@@ -296,6 +299,7 @@ export class AdvisorTranscriptRecorder {
 					initialCwd: cwd,
 					suppressBreadcrumb: true,
 				});
+				if (this.storeMasking) this.#manager.setStoreMasking(this.storeMasking);
 				this.#file = file;
 			}
 			this.#manager?.appendMessage(persisted);

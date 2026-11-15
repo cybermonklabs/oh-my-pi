@@ -1,8 +1,9 @@
 /**
  * Copy-on-write masking of a session entry or header before it reaches the
- * session store (`secrets.maskSessionStore`). Rules go by field name and
- * `type` string only. An entry with nothing to mask comes back as the same
- * object; a masked one shares every untouched subtree with the live entry.
+ * session store (`secrets.maskSessionStore`). Rules go by field name, `type`
+ * string and the place of a field in the session format only. An entry with
+ * nothing to mask comes back as the same object; a masked one shares every
+ * untouched subtree with the live entry.
  */
 import { countNewlines, isRecord } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
@@ -13,8 +14,24 @@ import type { SessionTitleUpdate } from "./session-title-slot";
 /** A child the parent copy leaves out: an object key omitted, an array item removed. */
 const DROP: unique symbol = Symbol("drop");
 
-/** Keys whose string values link or classify records; never rewritten, at any depth. */
-const IDENTITY_KEYS = new Set(["type", "role", "id", "parentId", "timestamp", "toolCallId"]);
+/**
+ * Where an object sits in the session format: an entry or the header, an entry's
+ * `message`, a `content` array of either, an item of that array, or anywhere else.
+ */
+type Position = "entry" | "message" | "content" | "block" | "free";
+
+/**
+ * Per position, the keys whose string values link or classify records, kept as written
+ * there only. Under any other field (tool call arguments, tool result details, custom
+ * data) these names are data a model, a tool or an extension wrote, and are masked.
+ */
+const STRUCTURAL_KEYS: Readonly<Record<Position, ReadonlySet<string>>> = {
+	entry: new Set(["type", "id", "parentId", "timestamp"]),
+	message: new Set(["role", "timestamp", "toolCallId"]),
+	content: new Set(),
+	block: new Set(["type", "id"]),
+	free: new Set(),
+};
 /** Header (`type: "session"`) fields kept as written. */
 const HEADER_KEYS = new Set(["cwd", "parentSession", "version"]);
 /** Keys holding provider ciphertext, never scanned. */
@@ -45,8 +62,16 @@ const SERVER_TOOL_TYPE = "anthropicServerTool";
  */
 export function maskSessionEntry<T>(entry: T, mask: SessionStoreMask | null): T {
 	if (mask === null || mask.empty) return entry;
-	if (!isRecord(entry)) return maskValue(entry, mask) as T;
-	return maskObject(entry, mask, entry.type === "session") as T;
+	if (!isRecord(entry)) return maskValue(entry, mask, "free") as T;
+	return maskObject(entry, mask, "entry") as T;
+}
+
+/**
+ * `value` with every held secret replaced by its marker, for a stored copy of free data, such as a
+ * subagent's yield data: no field in it is structural. The value itself is masked, never dropped.
+ */
+export function maskStoredData<T>(value: T, mask: SessionStoreMask | null): T {
+	return mask === null || mask.empty ? value : (maskValue(value, mask, "free") as T);
 }
 
 /** `update` with its title masked, so the store's title field holds what the title slot holds. */
@@ -56,28 +81,29 @@ export function maskTitleUpdate(update: SessionTitleUpdate, mask: SessionStoreMa
 	return title === update.title ? update : { ...update, title };
 }
 
-function maskValue(value: unknown, mask: SessionStoreMask): unknown {
+function maskValue(value: unknown, mask: SessionStoreMask, position: Position): unknown {
 	if (typeof value === "string") return isBlobRef(value) || isImageDataUrl(value) ? value : mask.maskText(value);
-	if (Array.isArray(value)) return maskArray(value, mask);
+	if (Array.isArray(value)) return maskArray(value, mask, position === "content" ? "block" : "free");
 	if (!isRecord(value)) return value;
-	return maskObject(value, mask, false);
+	return maskObject(value, mask, position);
 }
 
 /** `value` masked, or {@link DROP} when it is provider replay state that masking changed. */
-function maskChild(value: unknown, mask: SessionStoreMask, key?: string): unknown {
-	const next = maskValue(value, mask);
+function maskChild(value: unknown, mask: SessionStoreMask, position: Position, key?: string): unknown {
+	const next = maskValue(value, mask, position);
 	if (next === value) return value;
 	if (key !== undefined && CARRIER_KEYS.has(key)) return DROP;
 	if (isRecord(value) && typeof value.type === "string" && CARRIER_TYPES.has(value.type)) return DROP;
 	return next;
 }
 
-function maskArray(items: unknown[], mask: SessionStoreMask): unknown[] {
+/** `items` masked, each at `itemPosition`. */
+function maskArray(items: unknown[], mask: SessionStoreMask, itemPosition: Position): unknown[] {
 	let copy: unknown[] | undefined;
 	let serverToolChanged = false;
 	for (let i = 0; i < items.length; i++) {
 		const item = items[i];
-		const next = maskChild(item, mask);
+		const next = maskChild(item, mask, itemPosition);
 		if (copy === undefined) {
 			if (next === item) continue;
 			copy = items.slice(0, i);
@@ -90,18 +116,21 @@ function maskArray(items: unknown[], mask: SessionStoreMask): unknown[] {
 	return serverToolChanged ? copy.filter(item => !isRecord(item) || item.type !== SERVER_TOOL_TYPE) : copy;
 }
 
-function maskObject(obj: Record<string, unknown>, mask: SessionStoreMask, header: boolean): Record<string, unknown> {
+function maskObject(obj: Record<string, unknown>, mask: SessionStoreMask, position: Position): Record<string, unknown> {
 	// Image and binary payloads are kept whole: masking base64 would corrupt it.
 	if (isImageDataPayload(obj)) return obj;
 	const type = typeof obj.type === "string" ? obj.type : undefined;
 	const opaqueKey = type === undefined ? undefined : OPAQUE_KEY_BY_TYPE.get(type);
 	const signatureKey = signatureKeyOf(obj, type);
+	const header = position === "entry" && type === "session";
 	let copy: Record<string, unknown> | undefined;
 	let maskedContent: string | undefined;
 	for (const key in obj) {
 		if (!Object.hasOwn(obj, key)) continue;
 		const value = obj[key];
-		const next = keptAsWritten(key, value, opaqueKey, header) ? value : maskChild(value, mask, key);
+		const next = keptAsWritten(key, value, opaqueKey, position, header)
+			? value
+			: maskChild(value, mask, childPosition(position, key), key);
 		if (copy === undefined) {
 			if (next === value) continue;
 			copy = copyBefore(obj, key, signatureKey);
@@ -118,9 +147,22 @@ function maskObject(obj: Record<string, unknown>, mask: SessionStoreMask, header
 	return copy;
 }
 
-function keptAsWritten(key: string, value: unknown, opaqueKey: string | undefined, header: boolean): boolean {
+function keptAsWritten(
+	key: string,
+	value: unknown,
+	opaqueKey: string | undefined,
+	position: Position,
+	header: boolean,
+): boolean {
 	if (key === opaqueKey || (header && HEADER_KEYS.has(key))) return true;
-	return typeof value === "string" && (IDENTITY_KEYS.has(key) || CIPHERTEXT_KEYS.has(key));
+	return typeof value === "string" && (STRUCTURAL_KEYS[position].has(key) || CIPHERTEXT_KEYS.has(key));
+}
+
+/** The position of the value under `key` of an object at `position`. */
+function childPosition(position: Position, key: string): Position {
+	if (position === "entry" && key === "message") return "message";
+	if ((position === "entry" || position === "message") && key === "content") return "content";
+	return "free";
 }
 
 /** The signature key of a signed `thinking`/`text`/`toolCall` block, or `undefined` when it is unsigned. */
