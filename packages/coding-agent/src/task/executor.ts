@@ -74,6 +74,8 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 } from "../sdk";
+import { processSessionStoreMasker } from "../secrets/session-store-mask";
+import { cfgSecretsMaskSessionStore } from "../secrets/settings";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -88,6 +90,7 @@ import type { AuthStorage } from "../session/auth-storage";
 import type { CostGateApi } from "../session/cost-gate";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
+import { maskSessionEntry } from "../session/session-entry-mask";
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import {
 	AUTO_THINKING,
@@ -2840,6 +2843,13 @@ interface FinalizeRunArgs {
 	publishMessageResult?: boolean;
 	sessionFile?: string;
 	startTime: number;
+	/**
+	 * Settings whose `secrets.maskSessionStore` masks the `<id>.md` and `<id>.json` written here:
+	 * the run's settings on the first run, the live subagent session's on a later turn.
+	 */
+	storeMaskSettings: Settings;
+	/** The parent session's cwd, whose project secrets the mask holds. */
+	storeMaskCwd: string;
 }
 
 /**
@@ -2922,12 +2932,17 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		rawOutput.trim().length > 0;
 	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
+		// `agent://<id>` serves these files: they hold markers, the returned result keeps the values.
+		const mask = cfgSecretsMaskSessionStore.get(args.storeMaskSettings)
+			? processSessionStoreMasker().snapshot(args.storeMaskCwd)
+			: null;
 		try {
-			await writeArtifact(candidatePath, rawOutput);
+			const storedOutput = mask?.maskText(rawOutput) ?? rawOutput;
+			await writeArtifact(candidatePath, storedOutput);
 			outputPath = candidatePath;
 			outputMeta = {
-				lineCount: rawOutput.split("\n").length,
-				charCount: rawOutput.length,
+				lineCount: storedOutput.split("\n").length,
+				charCount: storedOutput.length,
 			};
 		} catch (error) {
 			logger.warn("Failed to persist subagent output artifact", {
@@ -2940,7 +2955,8 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		const sidecarPath = path.join(args.artifactsDir, `${id}.json`);
 		if (outputPath && structured && Object.hasOwn(structured, "data")) {
 			try {
-				const serialized = JSON.stringify(structured.data, null, 2);
+				// Free data, masked as a custom entry's `data` is: identity-like keys too.
+				const serialized = JSON.stringify(maskSessionEntry({ data: structured.data }, mask).data, null, 2);
 				// `structured.data === undefined` (an own "data" key holding
 				// `undefined`) makes JSON.stringify return `undefined` too —
 				// neither a write nor a removal, which would leave a stale
@@ -3089,6 +3105,8 @@ export interface IrcWakeTurnMonitorOptions {
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	outputSchemaSource?: StructuredSubagentSchemaSource;
 	artifactsDir?: string;
+	/** The parent session's cwd, whose secrets mask the `<id>.md` and `<id>.json` a turn rewrites. */
+	storeMaskCwd: string;
 }
 
 /** Sender + message id of one `irc:incoming` record that woke a turn. */
@@ -3487,6 +3505,9 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					signal: jobCancel.signal,
 					sessionFile,
 					startTime: turnStartTime,
+					// The live session's settings read through to the parent's.
+					storeMaskSettings: session.settings,
+					storeMaskCwd: options.storeMaskCwd,
 				});
 			} catch (caught) {
 				finalizeError = caught;
@@ -3738,6 +3759,8 @@ export interface FollowUpTurnOptions {
 	 * existing artifact intact.
 	 */
 	artifactsDir?: string;
+	/** The parent session's cwd, whose secrets mask the `<id>.md` and `<id>.json` a turn rewrites. */
+	storeMaskCwd: string;
 	/** Wall-clock cap in ms for this turn; 0 disables. */
 	maxRuntimeMs?: number;
 	/** Periodically ask for a completion estimate during this turn; see {@link isCompletionProbeEnabled}. */
@@ -3975,6 +3998,9 @@ async function driveFollowUpTurn(
 			publishMessageResult: true,
 			sessionFile,
 			startTime,
+			// The live session's settings read through to the parent's.
+			storeMaskSettings: session.settings,
+			storeMaskCwd: options.storeMaskCwd,
 		});
 	} finally {
 		releaseIrcWakes();
@@ -4428,6 +4454,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 	}
 
 	const settings = options.settings ?? Settings.isolated();
+	// The output files go to the parent's artifacts directory, so the parent's secrets mask them.
+	const storeMaskCwd = options.settings?.getCwd() ?? cwd;
 	// Per-agent advisor: the agent definition's `advisor` frontmatter or the
 	// `task.agentAdvisor` settings override (agent name → "on"/"off"/model
 	// pattern) pairs the spawned session with an advisor. Subagents default to
@@ -4580,6 +4608,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 		outputSchemaMode: options.outputSchemaMode,
 		outputSchemaSource: options.outputSchemaSource,
 		artifactsDir: options.artifactsDir,
+		storeMaskCwd,
 	};
 
 	const runSubagent = async (): Promise<{
@@ -5467,6 +5496,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			detached: options.detached,
 			sessionFile: subtaskSessionFile,
 			startTime,
+			storeMaskSettings: settings,
+			storeMaskCwd,
 		});
 		AgentRegistry.global().setHistory(id, { outputPath: result.outputPath });
 		return result;

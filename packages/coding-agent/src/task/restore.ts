@@ -99,6 +99,7 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 					eventBus: options.eventBus,
 					subagentEventBus: options.subagentEventBus,
 					artifactsDir: path.dirname(sessionFileOfRef),
+					storeMaskCwd: session.settings.getCwd(),
 					maxRuntimeMs: cfgTaskMaxRuntimeMs.get(session.settings),
 					...softRequestBudgetFor(ref.displayName, session.settings),
 				});

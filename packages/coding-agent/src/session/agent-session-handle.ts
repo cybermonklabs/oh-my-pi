@@ -22,6 +22,7 @@ import type { ExtensionRunner } from "../extensibility/extensions";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState } from "../goals/state";
+import type { SessionStoreMask } from "../secrets/session-store-mask";
 import type { ApprovalGrantStore } from "../tools/approval-cache";
 import type { TokenRateMeter } from "../utils/token-rate";
 import type { AgentDefinition } from "../task/types";
@@ -191,6 +192,8 @@ export interface AgentViewSessionManager extends AgentSessionManagerHandle {
 	getArtifactPath(id: string): Promise<string | null>;
 	/** In-memory content of a session artifact (non-persistent sessions), or null; a worker-homed session answers asynchronously. */
 	getArtifactContent(id: string): string | null | Promise<string | null>;
+	/** The mask the session's stored writes apply now (the /btw history too), or `null` while its `secrets.maskSessionStore` is off. */
+	storeMask(): SessionStoreMask | null;
 }
 
 /** TTSR rule source the TUI's link resolver reads. */

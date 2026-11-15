@@ -359,6 +359,7 @@ describe("BtwController", () => {
 					getSessionId: () => "worker-session",
 					getArtifactsDir: () => artifacts,
 					ensureOnDisk: async () => {},
+					storeMask: () => null,
 				},
 			} as unknown as InteractiveModeContext["session"];
 			Object.assign(ctx, { focusedAgentId: "Worker", viewSession: focusedSession });

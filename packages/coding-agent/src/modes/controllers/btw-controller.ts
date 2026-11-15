@@ -519,7 +519,8 @@ export class BtwController {
 			this.#storeArtifactsDir = artifactsDir;
 			this.#storeScope = scope;
 		}
-		this.#storePromise ??= BtwHistoryStore.open(artifactsDir, scope);
+		const manager = this.#sessionManager;
+		this.#storePromise ??= BtwHistoryStore.open(artifactsDir, scope, () => manager.storeMask());
 		const pending = this.#storePromise;
 		try {
 			const store = await pending;
