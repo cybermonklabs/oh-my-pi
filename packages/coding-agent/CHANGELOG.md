@@ -126,9 +126,11 @@
 
 - Sessions can now be stored in PostgreSQL, MySQL, or SQLite instead of JSONL files: set `session.storage: sql` and point `session.sql.dsnFile` at a file holding the connection string (or set `OMP_SESSION_STORAGE=sql` and `OMP_SESSION_SQL_DSN_FILE`); `--resume`, `--continue`, the session picker, and listing follow the same store, and joining a collab session needs file storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - `omp gc --restore <session id or archive path>` brings an archived session back to its own path with its artifacts, and names what restoring cannot bring back
+- Added `secrets.maskSessionStore` (off by default): when it is on, the secret values the agent holds (secret-named environment variables, the files that `*_FILE` variables name, and `secrets.yml` entries) are replaced with a `[REDACTED:<source>:<name>]` marker before a session entry, the title, the draft or a collab replica is written to the session store, while the live session keeps the values. See [Secrets in stored sessions](../../docs/secrets.md#secrets-in-stored-sessions)
 
 ### Changed
 
+- Secret obfuscation no longer takes `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS` from the environment: they hold git configuration key names and an askpass program path, not secrets, so text that holds those common strings reaches the model provider unchanged
 - Merging a task's changes back (three-way patch apply, cherry-picking its branch, and restoring stashed edits) now reports a conflict when both sides edit adjacent lines, as git does, instead of merging both edits ([#16410](https://github.com/can1357/oh-my-pi/pull/16410) by [@sjawhar](https://github.com/sjawhar))
 - `async.maxJobs` now sets the cap on background jobs running at once in a session and its subagents without the fixed 100 ceiling, and `0` means no limit; the default stays 100
 - A session left working in a detached tmux pane no longer spends a slice of a core animating a screen nobody can see: the status line drops to one frame a second and the terminal-title spinner pauses until a client is watching again ([#17404](https://github.com/can1357/oh-my-pi/pull/17404) by [@sjawhar](https://github.com/sjawhar))

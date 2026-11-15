@@ -29,6 +29,7 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
+import { sessionStoreMaskFor } from "../secrets/session-store-mask";
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
@@ -119,6 +120,7 @@ import {
 	worktreeSessionDirs,
 	writeTerminalBreadcrumb,
 } from "./session-paths";
+import { maskSessionEntry, maskTitleUpdate } from "./session-entry-mask";
 import { forgetExternalizedImages, prepareEntryForPersistence } from "./session-persistence";
 import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
@@ -2115,8 +2117,8 @@ export class SessionManager {
 		return this.#writer;
 	}
 
-	#lineFor(entry: FileEntry): string {
-		return `${stringifyJson(prepareEntryForPersistence(entry, this.#blobs)) ?? "null"}\n`;
+	#lineFor(entry: FileEntry, mask = sessionStoreMaskFor(this.#cwd)): string {
+		return `${stringifyJson(prepareEntryForPersistence(mask ? maskSessionEntry(entry, mask) : entry, this.#blobs)) ?? "null"}\n`;
 	}
 
 	/**
@@ -2205,9 +2207,9 @@ export class SessionManager {
 			});
 	}
 
-	#titleSlotLine(): string {
+	#titleSlotLine(mask = sessionStoreMaskFor(this.#cwd)): string {
 		return serializeTitleSlot({
-			title: this.#sessionName,
+			title: mask && this.#sessionName ? mask.maskText(this.#sessionName) : this.#sessionName,
 			source: this.#titleSource,
 			updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
 		});
@@ -2215,8 +2217,9 @@ export class SessionManager {
 
 	/** Serialize the whole file lazily, retaining only one JSONL record at a time. */
 	#serializeBody(): SessionFileBody {
-		const titleLine = this.#titleSlotLine();
-		const headerLine = this.#lineFor(this.#header);
+		const mask = sessionStoreMaskFor(this.#cwd);
+		const titleLine = this.#titleSlotLine(mask);
+		const headerLine = this.#lineFor(this.#header, mask);
 		const entries = this.#entries;
 		const entryCount = entries.length;
 		const manager = this;
@@ -2232,7 +2235,7 @@ export class SessionManager {
 					yield line;
 				}
 				for (let index = 0; index < entryCount; index++) {
-					const line = manager.#lineFor(entries[index]!);
+					const line = manager.#lineFor(entries[index]!, mask);
 					const lineBytes = Buffer.byteLength(line, "utf8");
 					bytes += lineBytes;
 					bytesSinceGc += lineBytes;
@@ -2746,7 +2749,10 @@ export class SessionManager {
 					return;
 				}
 				try {
-					await this.#storage.updateSessionTitle(sessionFile, update);
+					await this.#storage.updateSessionTitle(
+						sessionFile,
+						maskTitleUpdate(update, sessionStoreMaskFor(this.#cwd)),
+					);
 				} catch {
 					this.#rewriteRequired = true;
 					if (!(await this.#runFencedAtomicRewrite(epoch))) return;
@@ -4497,7 +4503,7 @@ export class SessionManager {
 			await this.#writeDraftOnlySessionMarker();
 			this.#draftOnlySessionCleanupArmed = true;
 		}
-		await this.#storage.writeText(draftPath, text);
+		await this.#storage.writeText(draftPath, sessionStoreMaskFor(this.#cwd)?.maskText(text) ?? text);
 	}
 
 	async consumeDraft(): Promise<string | null> {
