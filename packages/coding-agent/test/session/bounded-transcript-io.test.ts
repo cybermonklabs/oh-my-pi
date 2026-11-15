@@ -6,8 +6,8 @@
  * `JSON.parse` and `Bun.JSONL.parseChunk` that record the longest text parsed,
  * watch; none may exceed 16 MiB. Full writes that remain name why in their case.
  *
- * SQL storage cases run where `IndexedSessionStorage` reads in chunks; without
- * that capability its reads are whole by design, and the cases skip.
+ * SQL storage cases run where SQL storage reads in chunks; without that
+ * capability its reads are whole by design, and the cases skip.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -21,7 +21,6 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { IndexedSessionStorage } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	type CompactionEntry,
@@ -60,7 +59,15 @@ const FENCE = `\`\`\`ts\n${"const value = compute(a, b, c, d, e);\n".repeat(200)
 /** The custom entry type of an appended patch record, where the build has them. */
 const ENTRY_PATCH_TYPE = "entry_patch";
 const hasEntryPatchRecords = fs.existsSync(path.join(import.meta.dir, "../../src/session/entry-patches.ts"));
-const indexedStorageReadsChunks = typeof (IndexedSessionStorage.prototype as SessionStorage).readChunks === "function";
+/** Whether SQL storage reads in chunks: a storage has `readChunks` when its backend reads in pieces. */
+const sqlStorageReadsChunks = await (async () => {
+	const client = new SQL("sqlite::memory:");
+	try {
+		return typeof ((await SqlSessionStorage.create({ client })) as SessionStorage).readChunks === "function";
+	} finally {
+		await client.end();
+	}
+})();
 const POSTGRES_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
 
 /** The longest value each watched entry point handled. */
@@ -982,7 +989,7 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 		return manager;
 	}
 
-	it.skipIf(!indexedStorageReadsChunks)(
+	it.skipIf(!sqlStorageReadsChunks)(
 		"resumes it by path",
 		async () => {
 			const { transcript, storage, client } = await stored();
@@ -993,7 +1000,7 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 		CASE_TIMEOUT_MS,
 	);
 
-	it.skipIf(!indexedStorageReadsChunks)(
+	it.skipIf(!sqlStorageReadsChunks)(
 		"resumes it by id",
 		async () => {
 			const { transcript, storage, client } = await stored();
@@ -1019,7 +1026,7 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 		CASE_TIMEOUT_MS,
 	);
 
-	it.skipIf(!indexedStorageReadsChunks)(
+	it.skipIf(!sqlStorageReadsChunks)(
 		"rewrites it whole, streamed (rewriteEntries)",
 		async () => {
 			const { transcript, storage, client } = await stored();
