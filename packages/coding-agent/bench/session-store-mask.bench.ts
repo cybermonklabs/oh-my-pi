@@ -2,11 +2,11 @@
  * Benchmark: what masking held secrets (`secrets.maskSessionStore`) costs a session writer.
  *
  * Each case runs with masking off and on in one process: every session manager here is bound
- * (`SessionManager.setStoreMasking`) to one switch the runs flip, as a session binds its manager to
- * its `secrets.maskSessionStore`, and every write takes its mask from the manager's `storeMask()`.
- * The process masker reads only what this bench makes: `process.env` is emptied and refilled
- * with synthetic variables, and the agent dir points into a scratch directory. Sessions live in
- * `MemorySessionStorage`, so no disk I/O is timed.
+ * (`SessionManager.setStoreMasking`) to one switch the runs flip and to a scratch agent dir, as a
+ * session binds its manager to its `secrets.maskSessionStore` and agent dir, and every write takes
+ * its mask from the manager's `storeMask()`. The process masker reads only what this bench makes:
+ * `process.env` is emptied and refilled with synthetic variables, and each agent dir is a scratch
+ * directory. Sessions live in `MemorySessionStorage`, so no disk I/O is timed.
  *
  * Maskers:
  * - typical: nine held values, as on a pod: three `*_TOKEN_FILE` variables (each path, by the name
@@ -33,7 +33,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai";
-import { setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../src/secrets/session-store-mask";
 import { SessionManager } from "../src/session/session-manager";
 import { MemorySessionStorage } from "../src/session/session-storage";
@@ -118,9 +118,9 @@ class SelfCheckFailure extends Error {}
 /** The setting every bench manager is bound to; {@link measure} turns it on for each masked run. */
 let masking = false;
 
-/** `manager`, bound to {@link masking}. */
-function bound(manager: SessionManager): SessionManager {
-	manager.setStoreMasking(() => masking);
+/** `manager`, bound to {@link masking} and `agentDir`. */
+function bound(manager: SessionManager, agentDir: string): SessionManager {
+	manager.setStoreMasking(() => masking, agentDir);
 	return manager;
 }
 
@@ -386,10 +386,11 @@ async function measure(run: (on: boolean, warm: boolean) => number | Promise<num
 function buildLargeSession(
 	cwd: string,
 	sessionsDir: string,
+	agentDir: string,
 	secrets: readonly string[],
 ): { manager: SessionManager; storage: MemorySessionStorage; file: string } {
 	const storage = new MemorySessionStorage();
-	const manager = bound(SessionManager.create(cwd, sessionsDir, storage));
+	const manager = bound(SessionManager.create(cwd, sessionsDir, storage), agentDir);
 	for (let i = 0; i < ENTRIES; i++) {
 		// One string in each block of ten holds a secret, at a position that moves through the block.
 		const block = Math.floor(i / SECRET_EVERY);
@@ -426,9 +427,9 @@ async function benchMasker(spec: MaskerSpec, root: string, cwd: string, sessions
 	const cases: CaseResult[] = [];
 
 	// Case 1 times a manager's `storeMask()`, the call each of its writes makes, on a fresh process masker.
-	const probe = bound(SessionManager.create(cwd, sessionsDir, new MemorySessionStorage()));
+	const probe = bound(SessionManager.create(cwd, sessionsDir, new MemorySessionStorage()), await freshAgentDir());
 	const build = await measure(async on => {
-		if (on) setAgentDir(await freshAgentDir());
+		if (on) bound(probe, await freshAgentDir());
 		const start = Bun.nanoseconds();
 		const mask = probe.storeMask();
 		const elapsed = (Bun.nanoseconds() - start) / 1e6;
@@ -438,13 +439,14 @@ async function benchMasker(spec: MaskerSpec, root: string, cwd: string, sessions
 	cases.push({ label: "1 build masker (first snapshot)", masker: spec.name, ...build });
 
 	// Cases 2-4 share one process masker, built here.
-	setAgentDir(await freshAgentDir());
+	const agentDir = await freshAgentDir();
+	bound(probe, agentDir);
 	masking = true;
 	expectMask(probe.storeMask(), true, spec);
 	masking = false;
 
 	const appendStorage = new MemorySessionStorage();
-	const appendManager = bound(SessionManager.create(cwd, sessionsDir, appendStorage));
+	const appendManager = bound(SessionManager.create(cwd, sessionsDir, appendStorage), agentDir);
 	appendManager.appendMessage(userMessage(textOf(MESSAGE_CHARS, 1)));
 	// The first assistant message writes the session file; later appends take the append path.
 	appendManager.appendMessage(assistantMessage(textOf(MESSAGE_CHARS, 2)));
@@ -464,7 +466,7 @@ async function benchMasker(spec: MaskerSpec, root: string, cwd: string, sessions
 	cases.push({ label: "3 append 500,000-char tool result", masker: spec.name, ...appendResult });
 
 	const planting = plant(spec.values, ENTRIES / SECRET_EVERY);
-	const large = buildLargeSession(cwd, sessionsDir, planting.secrets);
+	const large = buildLargeSession(cwd, sessionsDir, agentDir, planting.secrets);
 	let unmaskedBytes = 0;
 	let maskedBytes = 0;
 	let markers = 0;

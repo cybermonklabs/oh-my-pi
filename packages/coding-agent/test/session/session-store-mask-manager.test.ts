@@ -139,9 +139,12 @@ function maskWrites(): void {
 	spyOn(SessionManager.prototype, "storeMask").mockReturnValue(mask);
 }
 
-/** Binds `manager` to `secrets.maskSessionStore` in `settings`, as `createAgentSession` binds a session's manager. */
+/**
+ * Binds `manager` to `secrets.maskSessionStore` in `settings` and to the test's agent dir, as
+ * `createAgentSession` binds a session's manager.
+ */
 function bindSetting(manager: SessionManager, settings: Settings): void {
-	manager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings));
+	manager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings), tmp.join("agent"));
 }
 
 function assistant(content: AssistantMessage["content"], extra: Partial<AssistantMessage> = {}): AssistantMessage {
@@ -842,13 +845,12 @@ function hostContext(manager: SessionManager): InteractiveModeContext {
 
 function guestContext(switchSession: (replicaPath: string) => Promise<boolean>): InteractiveModeContext {
 	const ctx = {
-		settings: Settings.isolated(),
+		// The guest's own session has the setting on.
+		settings: Settings.isolated({ "secrets.maskSessionStore": true }),
 		sessionManager: {
 			getSessionFile: () => null,
 			getSessionName: () => undefined,
 			getCwd: () => cwd,
-			// The guest's own session has the setting on.
-			storeMask: () => mask,
 		},
 		session: {
 			switchSession,
@@ -903,6 +905,13 @@ describe("session store masking of the collab replica", () => {
 	it("writes the guest's replica of the host transcript with markers", async () => {
 		// The guest writes its replica under the config root; keep it in the test's temp dir.
 		spyOn(utils, "getConfigRootDir").mockReturnValue(tmp.path());
+		// The process masker holds the test's variable and file, never this machine's environment.
+		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+			new storeMask.SessionStoreMasker({
+				env: () => ({ SERVICE_API_KEY: ENV_VALUE, EXAMPLE_TOKEN_FILE: tmp.join("token.txt") }),
+				agentDir: tmp.join("agent"),
+			}),
+		);
 		const hostManager = SessionManager.inMemory(cwd);
 		hostManager.appendMessage({ role: "user", content: said(ENV_VALUE), timestamp: NOW });
 		hostManager.appendCustomMessageEntry("note", said(FILE_VALUE), true, { why: said(FILE_VALUE) });

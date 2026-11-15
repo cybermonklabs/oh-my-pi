@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getAgentDir, isEnoent, isEnotdir, isFsError, logger } from "@oh-my-pi/pi-utils";
+import { isEnoent, isEnotdir, isFsError, logger } from "@oh-my-pi/pi-utils";
 import { collectEnvSecretValues, connectionUrlPasswords, type Env, MIN_ENV_VALUE_LENGTH } from "./env-secrets";
 import type { SecretEntry } from "./obfuscator";
 import { MIN_OBFUSCATE_SECRET_LEN, sanitizeSecretFriendlyName } from "./placeholder";
@@ -18,8 +18,8 @@ export interface SessionStoreMaskSource {
 export interface SessionStoreMaskerOptions {
 	/** Environment to read secrets and `_FILE` paths from (default: `process.env`). */
 	env?: () => Env;
-	/** Directory of the global secrets.yml (default: `getAgentDir()`). */
-	agentDir?: string;
+	/** Directory of the global secrets.yml. */
+	agentDir: string;
 	/** Clock for the refresh interval (default: `Date.now`). */
 	now?: () => number;
 }
@@ -203,9 +203,9 @@ export class SessionStoreMasker {
 	/** Last logged skip reason, by `_FILE` variable name. */
 	readonly #skipReasons = new Map<string, string>();
 
-	constructor(options: SessionStoreMaskerOptions = {}) {
+	constructor(options: SessionStoreMaskerOptions) {
 		this.#env = options.env ?? (() => process.env);
-		this.#agentDir = options.agentDir ?? getAgentDir();
+		this.#agentDir = options.agentDir;
 		this.#now = options.now ?? Date.now;
 	}
 
@@ -405,12 +405,11 @@ export class SessionStoreMasker {
 const processMaskers = new Map<string, SessionStoreMasker>();
 
 /**
- * The process-wide masker for the active agent dir (`getAgentDir()`), shared by every session
- * writer. Whether a writer masks is up to its session's `secrets.maskSessionStore`
- * (`SessionManager.storeMask`).
+ * The process-wide masker for `agentDir`, shared by every session writer of that agent dir: one
+ * masker per agent dir, a snapshot per `cwd`. Whether a writer masks is up to its session's
+ * `secrets.maskSessionStore` (`SessionManager.storeMask`).
  */
-export function processSessionStoreMasker(): SessionStoreMasker {
-	const agentDir = getAgentDir();
+export function processSessionStoreMasker(agentDir: string): SessionStoreMasker {
 	let masker = processMaskers.get(agentDir);
 	if (masker === undefined) {
 		masker = new SessionStoreMasker({ agentDir });
@@ -421,8 +420,9 @@ export function processSessionStoreMasker(): SessionStoreMasker {
 
 /**
  * The mask a session's stored writes apply for `cwd`, or `null` while its setting is off; off, no
- * masker is built. `null`, not `undefined`, as `SessionManager.storeMask` documents.
+ * masker is built. `agentDir` is the session's own, whose secrets.yml its provider obfuscator reads.
+ * `null`, not `undefined`, as `SessionManager.storeMask` documents.
  */
-export function sessionStoreMaskFor(enabled: boolean, cwd: string): SessionStoreMask | null {
-	return enabled ? processSessionStoreMasker().snapshot(cwd) : null;
+export function sessionStoreMaskFor(enabled: boolean, cwd: string, agentDir: string): SessionStoreMask | null {
+	return enabled ? processSessionStoreMasker(agentDir).snapshot(cwd) : null;
 }

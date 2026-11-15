@@ -33,7 +33,6 @@ function makeGuestContext(eventBus: EventBus): InteractiveModeContext {
 			getSessionFile: () => null,
 			getSessionName: () => "local session",
 			getCwd: () => "/local",
-			storeMask: () => null,
 		},
 		session: {
 			messages: [],

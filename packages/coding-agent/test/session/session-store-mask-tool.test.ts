@@ -100,7 +100,7 @@ async function runSession(maskSessionStore: boolean): Promise<Run> {
 	const storage = new FileSessionStorage();
 	const sessionDir = tmp.join("sessions");
 	const sessionManager = SessionManager.create(cwd, sessionDir, storage);
-	sessionManager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings));
+	sessionManager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings), tmp.join("agent"));
 	await sessionManager.ensureOnDisk();
 	const toolSession: ToolSession = {
 		cwd,

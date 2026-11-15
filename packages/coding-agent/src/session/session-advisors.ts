@@ -91,7 +91,6 @@ import type { PlanModeState } from "../plan-mode/state";
 import advisorBoundaryGuidance from "../prompts/advisor/boundary-guidance.md" with { type: "text" };
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
 import type { SecretObfuscator } from "../secrets/obfuscator";
-import { cfgSecretsMaskSessionStore } from "../secrets/settings";
 import {
 	AUTO_THINKING,
 	concreteThinkingLevel,
@@ -1596,7 +1595,8 @@ export class SessionAdvisors {
 				this.#advisorCostSnapshotBarrier
 					? Promise.all([this.#advisorRecorderClosed, this.#advisorCostSnapshotBarrier])
 					: this.#advisorRecorderClosed,
-				() => cfgSecretsMaskSessionStore.get(this.#host.settings),
+				// Masks the transcript exactly as the session's own manager masks the session file.
+				this.#host.sessionManager.storeMasking,
 			);
 			const runtime = new AdvisorRuntime(advisorAgentFacade, {
 				snapshotMessages: () => this.#host.agent.state.messages,

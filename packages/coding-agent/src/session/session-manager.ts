@@ -901,6 +901,14 @@ export class ForkSourceNotFoundError extends Error {
 	}
 }
 
+/** What a session binds its manager's store masking to ({@link SessionManager.setStoreMasking}). */
+export interface StoreMaskingBinding {
+	/** The session's `secrets.maskSessionStore`, read at each write. */
+	readonly enabled: () => boolean;
+	/** The session's agent dir, whose secrets.yml the mask holds. */
+	readonly agentDir: string;
+}
+
 /**
  * Stores and navigates an append-only conversation journal.
  *
@@ -1033,8 +1041,8 @@ export class SessionManager {
 	#inMemoryArtifactCounter = 0;
 
 	#suppressBreadcrumb = false;
-	/** Reads `secrets.maskSessionStore` of the session this manager writes for ({@link setStoreMasking}). */
-	#storeMasking: (() => boolean) | undefined;
+	/** `secrets.maskSessionStore` and agent dir of the session this manager writes for ({@link setStoreMasking}). */
+	#storeMasking: StoreMaskingBinding | undefined;
 	/**
 	 * The last breadcrumb this manager wrote marked a lazy fresh session whose
 	 * JSONL is not yet on disk. Cleared (and the crumb re-stamped non-fresh) once
@@ -1568,26 +1576,33 @@ export class SessionManager {
 	}
 
 	/**
-	 * Bind this manager's writes to its session's `secrets.maskSessionStore`: `enabled` is read at
-	 * each write, so a change reaches the next one. The code that gives the manager to a session
-	 * binds it.
+	 * Bind this manager's writes to its session's `secrets.maskSessionStore` and agent dir: `enabled`
+	 * is read at each write, so a change reaches the next one, and the mask holds the secrets.yml of
+	 * `agentDir`, the one the session's provider obfuscator reads. The code that gives the manager to
+	 * a session binds it.
 	 */
-	setStoreMasking(enabled: () => boolean): void {
-		this.#storeMasking = enabled;
+	setStoreMasking(enabled: () => boolean, agentDir: string): void {
+		this.#storeMasking = { enabled, agentDir };
+	}
+
+	/** This manager's store masking binding, or `undefined` while no session bound it ({@link setStoreMasking}). */
+	get storeMasking(): StoreMaskingBinding | undefined {
+		return this.#storeMasking;
 	}
 
 	/**
 	 * The mask this manager's writes apply now, or `null` while the setting is off. Off, no source
-	 * is read and no masker is built. A manager no session bound reads this thread's global settings
-	 * (the instance `Settings.init` made, or a worker's mirror) and masks nothing without them.
-	 * `null`, not `undefined`, so a writer that took one mask for a whole body can pass "no mask" on
-	 * without a default parameter asking again.
+	 * is read and no masker is built. A manager no session bound reads the setting and the agent dir
+	 * of this thread's global settings (the instance `Settings.init` made, or a worker's mirror) and
+	 * masks nothing without them. `null`, not `undefined`, so a writer that took one mask for a whole
+	 * body can pass "no mask" on without a default parameter asking again.
 	 */
 	storeMask(): SessionStoreMask | null {
-		const enabled = this.#storeMasking
-			? this.#storeMasking()
-			: isSettingsInitialized() && cfgSecretsMaskSessionStore.get(Settings.instance);
-		return sessionStoreMaskFor(enabled, this.#cwd);
+		const bound = this.#storeMasking;
+		if (bound) return sessionStoreMaskFor(bound.enabled(), this.#cwd, bound.agentDir);
+		if (!isSettingsInitialized()) return null;
+		const settings = Settings.instance;
+		return sessionStoreMaskFor(cfgSecretsMaskSessionStore.get(settings), this.#cwd, settings.getAgentDir());
 	}
 
 	#lineFor(entry: FileEntry, mask = this.storeMask()): string {

@@ -197,7 +197,6 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 			getSessionFile: () => null,
 			getSessionName: () => "local session",
 			getCwd: () => "/local",
-			storeMask: () => null,
 		},
 		session: {
 			messages: [],

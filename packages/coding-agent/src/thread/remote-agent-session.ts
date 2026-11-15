@@ -353,7 +353,12 @@ export class RemoteAgentSession implements AgentViewSession {
 			getArtifactPath: id => this.#command("getArtifactPath", id),
 			getArtifactContent: id => this.#command("getArtifactContent", id),
 			// Built here from the main-side settings: a mask is compiled regexes and never crosses threads.
-			storeMask: () => sessionStoreMaskFor(cfgSecretsMaskSessionStore.get(this.settings), this.#state.cwd),
+			storeMask: () =>
+				sessionStoreMaskFor(
+					cfgSecretsMaskSessionStore.get(this.settings),
+					this.#state.cwd,
+					this.settings.getAgentDir(),
+				),
 		};
 	}
 

@@ -95,8 +95,6 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 			getSessionFile: () => null,
 			getCwd: () => process.cwd(),
 			switchSession: () => Promise.reject(failure),
-			// The guest's session has session store masking off.
-			storeMask: () => null,
 		},
 		session: {
 			newSession: () => Promise.resolve(),
@@ -144,8 +142,6 @@ function makeCancelledSwitchGuestContext(
 			getSessionFile: () => null,
 			getSessionName: () => undefined,
 			getCwd: () => process.cwd(),
-			// The guest's session has session store masking off.
-			storeMask: () => null,
 		},
 		session: {
 			switchSession,

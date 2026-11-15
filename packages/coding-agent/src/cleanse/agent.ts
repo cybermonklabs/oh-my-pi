@@ -82,7 +82,7 @@ export async function createCleanseAgentRuntime(options: {
 	const modelSelector = resolved.selector ?? formatModelString(resolved.model);
 	const modelDisplay = formatModelString(resolved.model);
 	const sessionManager = SessionManager.create(cwd);
-	sessionManager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings));
+	sessionManager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings), settings.getAgentDir());
 	await sessionManager.setSessionName("Cleanse", "auto");
 	sessionManager.appendCustomEntry("cleanse", {
 		status: "running",

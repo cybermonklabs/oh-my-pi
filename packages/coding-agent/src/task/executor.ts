@@ -2853,8 +2853,9 @@ interface FinalizeRunArgs {
 	sessionFile?: string;
 	startTime: number;
 	/**
-	 * Settings whose `secrets.maskSessionStore` masks the `<id>.md` and `<id>.json` written here:
-	 * the run's settings on the first run, the live subagent session's on a later turn.
+	 * Settings whose `secrets.maskSessionStore` masks the `<id>.md` and `<id>.json` written here, and
+	 * whose agent dir's secrets.yml the mask holds: the run's settings on the first run, the live
+	 * subagent session's on a later turn.
 	 */
 	storeMaskSettings: Settings;
 	/** The parent session's cwd, whose project secrets the mask holds. */
@@ -2942,7 +2943,11 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
 		// `agent://<id>` serves these files: they hold markers, the returned result keeps the values.
-		const mask = sessionStoreMaskFor(cfgSecretsMaskSessionStore.get(args.storeMaskSettings), args.storeMaskCwd);
+		const mask = sessionStoreMaskFor(
+			cfgSecretsMaskSessionStore.get(args.storeMaskSettings),
+			args.storeMaskCwd,
+			args.storeMaskSettings.getAgentDir(),
+		);
 		try {
 			const storedOutput = mask?.maskText(rawOutput) ?? rawOutput;
 			await writeArtifact(candidatePath, storedOutput);

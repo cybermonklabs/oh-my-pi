@@ -26,6 +26,8 @@ import { getConfigRootDir, logger, toError } from "@oh-my-pi/pi-utils";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
+import { sessionStoreMaskFor } from "../secrets/session-store-mask";
+import { cfgSecretsMaskSessionStore } from "../secrets/settings";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import { maskSessionEntry } from "../session/session-entry-mask";
@@ -521,7 +523,14 @@ export class CollabGuestLink {
 			parentSession: pending.header.id,
 			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(pending.header),
 		};
-		const mask = this.#ctx.sessionManager.storeMask();
+		// The replica is this guest's session store, so its own session's setting and agent dir mask it,
+		// as `createAgentSession` binds that session's manager.
+		const settings = this.#ctx.settings;
+		const mask = sessionStoreMaskFor(
+			cfgSecretsMaskSessionStore.get(settings),
+			this.#ctx.sessionManager.getCwd(),
+			settings.getAgentDir(),
+		);
 		const lines = [header, ...pending.entries].map(entry => JSON.stringify(maskSessionEntry(entry, mask))).join("\n");
 		const storage = new FileSessionStorage();
 		this.#replicaLease ??= storage.claimSession(this.#replicaId, replicaPath) ?? undefined;

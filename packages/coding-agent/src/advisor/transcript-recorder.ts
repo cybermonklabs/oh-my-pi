@@ -4,7 +4,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import { visitEntriesFromFileStream } from "../session/session-loader";
-import { SessionManager } from "../session/session-manager";
+import { SessionManager, type StoreMaskingBinding } from "../session/session-manager";
 import { fingerprintMessage } from "./message-fingerprint";
 
 /**
@@ -195,15 +195,16 @@ export class AdvisorTranscriptRecorder {
 	 * @param after Optional barrier the queue starts behind — used on the advisor
 	 *   on→off→on toggle so a fresh recorder's first `open` waits for the prior
 	 *   recorder's `close` and the two never hold the same file at once.
-	 * @param storeMasking The owning session's `secrets.maskSessionStore`, bound to
-	 *   every transcript manager the recorder opens (see `SessionManager.setStoreMasking`).
+	 * @param storeMasking The owning session manager's store masking binding, bound to every
+	 *   transcript manager the recorder opens (see `SessionManager.setStoreMasking`); `undefined`
+	 *   leaves them unbound, as the owning manager is.
 	 */
 	constructor(
 		private readonly resolveSessionFile: () => string | undefined,
 		private readonly resolveCwd: () => string,
 		filename: string = ADVISOR_TRANSCRIPT_FILENAME,
 		after?: Promise<unknown>,
-		private readonly storeMasking?: () => boolean,
+		private readonly storeMasking?: StoreMaskingBinding,
 	) {
 		this.#filename = filename;
 		this.#queue = after
@@ -276,7 +277,9 @@ export class AdvisorTranscriptRecorder {
 					initialCwd: cwd,
 					suppressBreadcrumb: true,
 				});
-				if (this.storeMasking) this.#manager.setStoreMasking(this.storeMasking);
+				if (this.storeMasking) {
+					this.#manager.setStoreMasking(this.storeMasking.enabled, this.storeMasking.agentDir);
+				}
 				this.#file = file;
 			}
 			this.#manager?.appendMessage(persisted);
