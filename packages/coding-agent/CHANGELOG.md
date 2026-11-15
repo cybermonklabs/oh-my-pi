@@ -7,6 +7,7 @@
 - A resumed session keeps in memory only the entries since its latest compaction: older message bodies, tool results and summaries wait in a temporary file and are read back when something asks for them, so long sessions take far less memory
 - Hindsight auto-retain, the pending-tool-call warning on resume and the exit record read only recent messages on each turn instead of the whole history
 - `.jsonl.gz` subagent transcripts in exports are decompressed as they are read instead of all at once
+- `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory
 
 ## [18.18.6] - 2026-11-09
 

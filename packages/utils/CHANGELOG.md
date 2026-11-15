@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `writeTarArchive` to write a plain tar member by member, streaming `Blob` members such as `Bun.file`, with the same bytes as `writeArchive`
+- Added `ArchiveReader.readFileChunks` to read an archive member in bounded chunks; plain tar files on disk yield reads of at most 1 MiB
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

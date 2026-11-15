@@ -2,9 +2,11 @@ import { encodeAsar } from "./asar";
 import { gzipCompress } from "./codecs/gzip";
 import { zstdCompress } from "./codecs/zstd";
 import { memberContentToBytes } from "./open";
-import { encodeTar } from "./tar";
+import { encodeTar, writeTarFile } from "./tar";
 import type { ArchiveFormat, ArchiveMemberContent, WritableArchiveFormat } from "./types";
 import { encodeZip } from "./zip";
+
+const TEXT_ENCODER = new TextEncoder();
 
 const WRITABLE_FORMATS: Record<WritableArchiveFormat, true> = {
 	zip: true,
@@ -52,4 +54,21 @@ export async function writeArchive(
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,
 ): Promise<void> {
 	await Bun.write(destPath, await encodeArchive(format, entries));
+}
+
+/**
+ * {@link writeArchive} for a plain tar, written member by member: the same
+ * bytes, but a `Blob` member (e.g. `Bun.file`) streams from its source, so the
+ * archive is never built in memory. Parent directories are auto-created.
+ */
+export async function writeTarArchive(
+	destPath: string,
+	entries: Iterable<readonly [string, ArchiveMemberContent]>,
+): Promise<void> {
+	const members = Array.from(
+		entries,
+		([name, content]) =>
+			[name.replace(/\\/g, "/"), typeof content === "string" ? TEXT_ENCODER.encode(content) : content] as const,
+	);
+	await writeTarFile(destPath, members);
 }
