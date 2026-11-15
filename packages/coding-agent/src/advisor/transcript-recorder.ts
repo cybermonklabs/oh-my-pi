@@ -195,12 +195,15 @@ export class AdvisorTranscriptRecorder {
 	 * @param after Optional barrier the queue starts behind — used on the advisor
 	 *   on→off→on toggle so a fresh recorder's first `open` waits for the prior
 	 *   recorder's `close` and the two never hold the same file at once.
+	 * @param storeMasking The owning session's `secrets.maskSessionStore`, bound to
+	 *   every transcript manager the recorder opens (see `SessionManager.setStoreMasking`).
 	 */
 	constructor(
 		private readonly resolveSessionFile: () => string | undefined,
 		private readonly resolveCwd: () => string,
 		filename: string = ADVISOR_TRANSCRIPT_FILENAME,
 		after?: Promise<unknown>,
+		private readonly storeMasking?: () => boolean,
 	) {
 		this.#filename = filename;
 		this.#queue = after
@@ -273,6 +276,7 @@ export class AdvisorTranscriptRecorder {
 					initialCwd: cwd,
 					suppressBreadcrumb: true,
 				});
+				if (this.storeMasking) this.#manager.setStoreMasking(this.storeMasking);
 				this.#file = file;
 			}
 			this.#manager?.appendMessage(persisted);

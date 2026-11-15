@@ -396,7 +396,11 @@ export class SessionStoreMasker {
 
 const processMaskers = new Map<string, SessionStoreMasker>();
 
-/** The process-wide masker for the active agent dir (`getAgentDir()`), shared by every session writer. */
+/**
+ * The process-wide masker for the active agent dir (`getAgentDir()`), shared by every session
+ * writer. Whether a writer masks is up to its session's `secrets.maskSessionStore`
+ * (`SessionManager.storeMask`).
+ */
 export function processSessionStoreMasker(): SessionStoreMasker {
 	const agentDir = getAgentDir();
 	let masker = processMaskers.get(agentDir);
@@ -405,20 +409,4 @@ export function processSessionStoreMasker(): SessionStoreMasker {
 		processMaskers.set(agentDir, masker);
 	}
 	return masker;
-}
-
-let sessionStoreMasking = false;
-
-/** Turn masking of stored session entries on or off for this process (`secrets.maskSessionStore`). */
-export function setSessionStoreMasking(enabled: boolean): void {
-	sessionStoreMasking = enabled;
-}
-
-/**
- * The mask every session store writer applies for `cwd`, or `null` while masking is off.
- * `null`, not `undefined`, so a writer that took one mask for a whole body can pass "no mask"
- * on without a default parameter asking again.
- */
-export function sessionStoreMaskFor(cwd: string): SessionStoreMask | null {
-	return sessionStoreMasking ? processSessionStoreMasker().snapshot(cwd) : null;
 }

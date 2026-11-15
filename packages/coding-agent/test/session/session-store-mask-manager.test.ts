@@ -7,7 +7,8 @@
  * changed signed block loses its signature, a changed carrier is dropped, and
  * ciphertext, images and ids are kept byte for byte. Each session file case
  * runs against every session store backend; history.db is written for file
- * storage only.
+ * storage only. Whether a manager masks is the setting of the session it is
+ * bound to, read at each write.
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fsSync from "node:fs";
@@ -16,10 +17,10 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
-import { bindEffects } from "@oh-my-pi/pi-coding-agent/config/registry";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import { cfgSecretsMaskSessionStore } from "@oh-my-pi/pi-coding-agent/secrets/settings";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
 	closeSessionIndex,
@@ -130,13 +131,17 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	vi.restoreAllMocks();
-	storeMask.setSessionStoreMasking(false);
 	await tmp.remove();
 });
 
-/** Every session writer gets the test's mask, as when the setting is on. */
+/** Every session manager's writes get the test's mask, as when its session's setting is on. */
 function maskWrites(): void {
-	spyOn(storeMask, "sessionStoreMaskFor").mockReturnValue(mask);
+	spyOn(SessionManager.prototype, "storeMask").mockReturnValue(mask);
+}
+
+/** Binds `manager` to `secrets.maskSessionStore` in `settings`, as `createAgentSession` binds a session's manager. */
+function bindSetting(manager: SessionManager, settings: Settings): void {
+	manager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings));
 }
 
 function assistant(content: AssistantMessage["content"], extra: Partial<AssistantMessage> = {}): AssistantMessage {
@@ -650,8 +655,9 @@ for (const backend of backends) {
 			await reopened.close();
 		});
 
-		it("stores values as written while the setting is at its default", async () => {
+		it("stores values as written while the session's setting is off", async () => {
 			const manager = await onDisk();
+			bindSetting(manager, Settings.isolated({ "secrets.maskSessionStore": false }));
 			manager.appendMessage({ role: "user", content: said(ENV_VALUE), timestamp: NOW });
 			await settle(manager, store.storage);
 			expect((await store.storage.readText(sessionFileOf(manager))).includes(ENV_VALUE)).toBe(true);
@@ -700,41 +706,45 @@ describe("session store masking of the history.db title and recaps", () => {
 		await manager.close();
 	});
 
-	it("records the title and the recap as written while the setting is off", async () => {
-		const release = bindEffects(Settings.isolated({ "secrets.maskSessionStore": false }));
-		try {
-			const manager = await fileSession();
-			await manager.setSessionName(said(ENV_VALUE), "user");
-			manager.recordRecap(said(FILE_VALUE));
+	it("records the title and the recap as written while the session's setting is off", async () => {
+		const manager = await fileSession();
+		bindSetting(manager, Settings.isolated({ "secrets.maskSessionStore": false }));
+		await manager.setSessionName(said(ENV_VALUE), "user");
+		manager.recordRecap(said(FILE_VALUE));
 
-			const id = manager.getSessionId();
-			expect(lookupSessionTitle(id)).toBe(said(ENV_VALUE));
-			expect(listSessionRecaps({ sessionIds: [id] }).map(entry => entry.recap)).toEqual([said(FILE_VALUE)]);
-			await manager.close();
-		} finally {
-			release();
-		}
+		const id = manager.getSessionId();
+		expect(lookupSessionTitle(id)).toBe(said(ENV_VALUE));
+		expect(listSessionRecaps({ sessionIds: [id] }).map(entry => entry.recap)).toEqual([said(FILE_VALUE)]);
+		await manager.close();
 	});
 });
 
-describe("session store masking switch", () => {
-	it("hands writers a mask only while masking is on, driven by secrets.maskSessionStore", () => {
-		// The process masker reads only the test's directories, never this machine's environment.
-		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
-			new storeMask.SessionStoreMasker({ env: () => ({}), agentDir: tmp.join("agent") }),
-		);
-		expect(storeMask.sessionStoreMaskFor(cwd)).toBeNull();
-		storeMask.setSessionStoreMasking(true);
-		expect(storeMask.sessionStoreMaskFor(cwd)).toBeInstanceOf(storeMask.SessionStoreMask);
-		storeMask.setSessionStoreMasking(false);
-		expect(storeMask.sessionStoreMaskFor(cwd)).toBeNull();
+describe("session store masking by the setting each manager is bound to", () => {
+	/** The content of each stored message of `manager`'s session, in file order. */
+	async function storedContents(manager: SessionManager, storage: SessionStorage): Promise<unknown[]> {
+		return storedRecords(await storage.readText(sessionFileOf(manager))).map(record => messageOf(record).content);
+	}
 
-		const release = bindEffects(Settings.isolated({ "secrets.maskSessionStore": true }));
-		try {
-			expect(storeMask.sessionStoreMaskFor(cwd)).toBeInstanceOf(storeMask.SessionStoreMask);
-		} finally {
-			release();
+	it("masks the writes of a manager bound to the setting on and not those of one bound to it off", async () => {
+		// The process masker reads only the test's variable, never this machine's environment.
+		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+			new storeMask.SessionStoreMasker({ env: () => ({ SERVICE_API_KEY: ENV_VALUE }), agentDir: tmp.join("agent") }),
+		);
+		const storage = new FileSessionStorage();
+		const on = SessionManager.create(cwd, tmp.join("sessions"), storage);
+		bindSetting(on, Settings.isolated({ "secrets.maskSessionStore": true }));
+		const off = SessionManager.create(cwd, tmp.join("sessions"), storage);
+		bindSetting(off, Settings.isolated({ "secrets.maskSessionStore": false }));
+		for (const manager of [on, off]) {
+			await manager.ensureOnDisk();
+			manager.appendMessage({ role: "user", content: said(ENV_VALUE), timestamp: NOW });
+			await settle(manager, storage);
 		}
+
+		expect(await storedContents(on, storage)).toEqual([said(ENV_MARKER)]);
+		expect(await storedContents(off, storage)).toEqual([said(ENV_VALUE)]);
+		await on.close();
+		await off.close();
 	});
 
 	it("builds no masker and reads no _FILE path on a write while the setting is off, and does both once it is on", async () => {
@@ -749,7 +759,9 @@ describe("session store masking switch", () => {
 		const stat = spyOn(fsSync, "statSync");
 		const open = spyOn(fsSync, "openSync");
 		const storage = new FileSessionStorage();
+		const settings = Settings.isolated({ "secrets.maskSessionStore": false });
 		const manager = SessionManager.create(cwd, tmp.join("sessions"), storage);
+		bindSetting(manager, settings);
 		await manager.ensureOnDisk();
 
 		manager.appendMessage({ role: "user", content: said(FILE_VALUE), timestamp: NOW });
@@ -759,16 +771,43 @@ describe("session store masking switch", () => {
 		expect(open).not.toHaveBeenCalledWith(tokenFile, expect.anything());
 
 		// Turned on mid-session: the same manager's next write builds the masker, reads the file and masks.
-		storeMask.setSessionStoreMasking(true);
+		cfgSecretsMaskSessionStore.override(settings, true);
 		manager.appendMessage({ role: "user", content: said(FILE_VALUE), timestamp: NOW });
 		await settle(manager, storage);
 		expect(build).toHaveBeenCalled();
 		expect(stat).toHaveBeenCalledWith(tokenFile, expect.anything());
 		expect(open).toHaveBeenCalledWith(tokenFile, expect.anything());
-		const stored = storedRecords(await storage.readText(sessionFileOf(manager))).map(
-			record => messageOf(record).content,
+		expect(await storedContents(manager, storage)).toEqual([said(FILE_VALUE), said(FILE_MARKER)]);
+		await manager.close();
+	});
+
+	it("masks nothing for a manager no session bound while there are no global settings, and follows them once there are", async () => {
+		resetSettingsForTest();
+		// The process masker reads only the test's variable, never this machine's environment.
+		const build = spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+			new storeMask.SessionStoreMasker({ env: () => ({ SERVICE_API_KEY: ENV_VALUE }), agentDir: tmp.join("agent") }),
 		);
-		expect(stored).toEqual([said(FILE_VALUE), said(FILE_MARKER)]);
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(cwd, tmp.join("sessions"), storage);
+		await manager.ensureOnDisk();
+
+		manager.appendMessage({ role: "user", content: said(ENV_VALUE), timestamp: NOW });
+		await settle(manager, storage);
+		expect(build).not.toHaveBeenCalled();
+
+		try {
+			await Settings.init({
+				inMemory: true,
+				cwd,
+				agentDir: tmp.join("agent"),
+				overrides: { "secrets.maskSessionStore": true },
+			});
+			manager.appendMessage({ role: "user", content: said(ENV_VALUE), timestamp: NOW });
+			await settle(manager, storage);
+		} finally {
+			resetSettingsForTest();
+		}
+		expect(await storedContents(manager, storage)).toEqual([said(ENV_VALUE), said(ENV_MARKER)]);
 		await manager.close();
 	});
 });
@@ -808,6 +847,8 @@ function guestContext(switchSession: (replicaPath: string) => Promise<boolean>):
 			getSessionFile: () => null,
 			getSessionName: () => undefined,
 			getCwd: () => cwd,
+			// The guest's own session has the setting on.
+			storeMask: () => mask,
 		},
 		session: {
 			switchSession,
@@ -860,7 +901,6 @@ function guestContext(switchSession: (replicaPath: string) => Promise<boolean>):
 
 describe("session store masking of the collab replica", () => {
 	it("writes the guest's replica of the host transcript with markers", async () => {
-		maskWrites();
 		// The guest writes its replica under the config root; keep it in the test's temp dir.
 		spyOn(utils, "getConfigRootDir").mockReturnValue(tmp.path());
 		const hostManager = SessionManager.inMemory(cwd);

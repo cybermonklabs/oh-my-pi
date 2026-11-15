@@ -29,7 +29,9 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
-import { sessionStoreMaskFor } from "../secrets/session-store-mask";
+import { isSettingsInitialized, Settings } from "../config/settings";
+import { processSessionStoreMasker, type SessionStoreMask } from "../secrets/session-store-mask";
+import { cfgSecretsMaskSessionStore } from "../secrets/settings";
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
@@ -1031,6 +1033,8 @@ export class SessionManager {
 	#inMemoryArtifactCounter = 0;
 
 	#suppressBreadcrumb = false;
+	/** Reads `secrets.maskSessionStore` of the session this manager writes for ({@link setStoreMasking}). */
+	#storeMasking: (() => boolean) | undefined;
 	/**
 	 * The last breadcrumb this manager wrote marked a lazy fresh session whose
 	 * JSONL is not yet on disk. Cleared (and the crumb re-stamped non-fresh) once
@@ -1563,7 +1567,30 @@ export class SessionManager {
 		return this.#writer;
 	}
 
-	#lineFor(entry: FileEntry, mask = sessionStoreMaskFor(this.#cwd)): string {
+	/**
+	 * Bind this manager's writes to its session's `secrets.maskSessionStore`: `enabled` is read at
+	 * each write, so a change reaches the next one. The code that gives the manager to a session
+	 * binds it.
+	 */
+	setStoreMasking(enabled: () => boolean): void {
+		this.#storeMasking = enabled;
+	}
+
+	/**
+	 * The mask this manager's writes apply now, or `null` while the setting is off. Off, no source
+	 * is read and no masker is built. A manager no session bound reads this thread's global settings
+	 * (the instance `Settings.init` made, or a worker's mirror) and masks nothing without them.
+	 * `null`, not `undefined`, so a writer that took one mask for a whole body can pass "no mask" on
+	 * without a default parameter asking again.
+	 */
+	storeMask(): SessionStoreMask | null {
+		const enabled = this.#storeMasking
+			? this.#storeMasking()
+			: isSettingsInitialized() && cfgSecretsMaskSessionStore.get(Settings.instance);
+		return enabled ? processSessionStoreMasker().snapshot(this.#cwd) : null;
+	}
+
+	#lineFor(entry: FileEntry, mask = this.storeMask()): string {
 		return `${stringifyJson(prepareEntryForPersistence(maskSessionEntry(entry, mask), this.#blobs)) ?? "null"}\n`;
 	}
 	#recordDurableAppend(line: string): void {
@@ -1612,7 +1639,7 @@ export class SessionManager {
 			});
 	}
 
-	#titleSlotLine(mask = sessionStoreMaskFor(this.#cwd)): string {
+	#titleSlotLine(mask = this.storeMask()): string {
 		return serializeTitleSlot(
 			maskTitleUpdate(
 				{
@@ -1627,7 +1654,7 @@ export class SessionManager {
 
 	/** Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from. */
 	#serializeBody(): SessionFileBody {
-		const mask = sessionStoreMaskFor(this.#cwd);
+		const mask = this.storeMask();
 		const titleLine = this.#titleSlotLine(mask);
 		const headerLine = this.#lineFor(this.#header, mask);
 		const entries = this.#entries;
@@ -2027,10 +2054,7 @@ export class SessionManager {
 				try {
 					await this.#appendWriter().append(line);
 					this.#recordDurableAppend(line);
-					await this.#storage.updateSessionTitle(
-						sessionFile,
-						maskTitleUpdate(update, sessionStoreMaskFor(this.#cwd)),
-					);
+					await this.#storage.updateSessionTitle(sessionFile, maskTitleUpdate(update, this.storeMask()));
 					if (this.#diskEpoch === epoch) this.#fileIsCurrent = true;
 				} catch {
 					if (!(await this.#runFencedAtomicRewrite(epoch))) return;
@@ -2310,6 +2334,7 @@ export class SessionManager {
 	cloneCurrentSession(options?: { persist?: boolean }): SessionManager {
 		const persist = options?.persist ?? this.#persist;
 		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage);
+		clone.#storeMasking = this.#storeMasking;
 		clone.#suppressBreadcrumb = true;
 		clone.restoreState(this.captureState());
 		if (!persist) {
@@ -2795,6 +2820,7 @@ export class SessionManager {
 	): Promise<SessionManager> {
 		const sessionDir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage);
 		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
+		manager.#storeMasking = this.#storeMasking;
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		manager.#resetToNewSession({ taskPromptCacheKey: this.#header.taskPromptCacheKey });
 		manager.#sessionName = this.#sessionName;
@@ -3355,7 +3381,7 @@ export class SessionManager {
 			await this.#writeDraftOnlySessionMarker();
 			this.#draftOnlySessionCleanupArmed = true;
 		}
-		await this.#storage.writeText(draftPath, sessionStoreMaskFor(this.#cwd)?.maskText(text) ?? text);
+		await this.#storage.writeText(draftPath, this.storeMask()?.maskText(text) ?? text);
 	}
 
 	async consumeDraft(): Promise<string | null> {
@@ -3486,7 +3512,7 @@ export class SessionManager {
 		// Keep the recent-sessions title index current so welcome-screen lookups
 		// never have to content-scan this session's file.
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			recordSessionTitle(this.#sessionId, sessionStoreMaskFor(this.#cwd)?.maskText(title) ?? title);
+			recordSessionTitle(this.#sessionId, this.storeMask()?.maskText(title) ?? title);
 		}
 
 		this.#notifySessionNameListeners();
@@ -3543,7 +3569,7 @@ export class SessionManager {
 	 */
 	recordRecap(recap: string): void {
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			recordSessionRecap(this.#sessionId, this.#cwd, sessionStoreMaskFor(this.#cwd)?.maskText(recap) ?? recap);
+			recordSessionRecap(this.#sessionId, this.#cwd, this.storeMask()?.maskText(recap) ?? recap);
 		}
 	}
 

@@ -77,14 +77,15 @@ function signedTurn(): AssistantMessage {
 
 describe("session store masking of signed thinking on replay", () => {
 	it("sends the resumed turn's thinking as text holding the marker, with no unsigned thinking block", async () => {
-		const mask = new storeMask.SessionStoreMasker({
-			env: () => ({ SERVICE_API_KEY: ENV_VALUE }),
-			agentDir: tmp.join("agent"),
-		}).snapshot(cwd);
-		spyOn(storeMask, "sessionStoreMaskFor").mockReturnValue(mask);
+		// The process masker holds the test's variable, never this machine's environment.
+		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+			new storeMask.SessionStoreMasker({ env: () => ({ SERVICE_API_KEY: ENV_VALUE }), agentDir: tmp.join("agent") }),
+		);
 		const sessionDir = tmp.join("sessions");
 		const storage = new FileSessionStorage();
 		const manager = SessionManager.create(cwd, sessionDir, storage);
+		// The session's setting is on.
+		manager.setStoreMasking(() => true);
 		await manager.ensureOnDisk();
 		manager.appendMessage({ role: "user", content: "configure the service", timestamp: NOW });
 		manager.appendMessage(signedTurn());

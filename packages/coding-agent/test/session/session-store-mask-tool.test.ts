@@ -14,6 +14,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import { cfgSecretsMaskSessionStore } from "@oh-my-pi/pi-coding-agent/secrets/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -52,6 +53,10 @@ beforeEach(async () => {
 		const config = shellConfig.call(this);
 		return { ...config, env: { ...config.env, EXAMPLE_TOKEN_FILE: tokenFile } };
 	});
+	// The process masker holds the test's file, never this machine's environment.
+	spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+		new storeMask.SessionStoreMasker({ env: () => ({ EXAMPLE_TOKEN_FILE: tokenFile }), agentDir: tmp.join("agent") }),
+	);
 });
 
 afterEach(async () => {
@@ -80,19 +85,23 @@ interface Run {
 /**
  * One prompt: the model reads the secret with `cat "$EXAMPLE_TOKEN_FILE"`, then
  * passes the value it read to a second bash call that checks it against the file.
+ * The session's manager is bound to the session's `secrets.maskSessionStore`, as
+ * `createAgentSession` binds it.
  */
-async function runSession(): Promise<Run> {
-	const storage = new FileSessionStorage();
-	const sessionDir = tmp.join("sessions");
-	const sessionManager = SessionManager.create(cwd, sessionDir, storage);
-	await sessionManager.ensureOnDisk();
+async function runSession(maskSessionStore: boolean): Promise<Run> {
 	const settings = Settings.isolated({
 		"compaction.enabled": false,
 		"todo.enabled": false,
 		"todo.reminders": false,
 		"async.enabled": false,
 		"bash.autoBackground.enabled": false,
+		"secrets.maskSessionStore": maskSessionStore,
 	});
+	const storage = new FileSessionStorage();
+	const sessionDir = tmp.join("sessions");
+	const sessionManager = SessionManager.create(cwd, sessionDir, storage);
+	sessionManager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings));
+	await sessionManager.ensureOnDisk();
 	const toolSession: ToolSession = {
 		cwd,
 		hasUI: false,
@@ -159,13 +168,7 @@ function storedMessages(text: string): Record<string, unknown>[] {
 
 describe("session store masking of a tool-read secret", () => {
 	it("runs the tools with the real value and stores, and resumes, its marker", async () => {
-		const mask = new storeMask.SessionStoreMasker({
-			env: () => ({ EXAMPLE_TOKEN_FILE: tokenFile }),
-			agentDir: tmp.join("agent"),
-		}).snapshot(cwd);
-		spyOn(storeMask, "sessionStoreMaskFor").mockReturnValue(mask);
-
-		const run = await runSession();
+		const run = await runSession(true);
 
 		// Live: the tool read the real value, and the call that received it from the model ran with it.
 		const liveRead = toolResultText(run.live, READ_CALL).trim();
@@ -193,10 +196,8 @@ describe("session store masking of a tool-read secret", () => {
 		expect(toolResultText(history, READ_CALL)).toBe(FILE_MARKER);
 	});
 
-	it("stores the real value when writers get no mask", async () => {
-		spyOn(storeMask, "sessionStoreMaskFor").mockReturnValue(null);
-
-		const run = await runSession();
+	it("stores the real value while the session's setting is off", async () => {
+		const run = await runSession(false);
 
 		const storedRead = storedMessages(run.stored).find(
 			message => message.role === "toolResult" && message.toolCallId === READ_CALL,

@@ -422,7 +422,7 @@ import {
 	cfgMcpStartupTimeoutMs,
 } from "./mcp/settings";
 import { cfgPlanEnabled } from "./plan-mode/settings";
-import { cfgSecretsEnabled } from "./secrets/settings";
+import { cfgSecretsEnabled, cfgSecretsMaskSessionStore } from "./secrets/settings";
 import {
 	cfgSnapcompactShape,
 	cfgSnapcompactSystemPrompt,
@@ -2111,6 +2111,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		logger.time("sessionManager", () =>
 			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
 		);
+	// Every write through the manager masks by this session's settings, whatever any other session in
+	// the process set, so bind before the first write below.
+	sessionManager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings));
 	const configuredDirs = options.additionalDirectories
 		? options.additionalDirectories
 		: cfgWorkspaceAdditionalDirectories.get(settings);
