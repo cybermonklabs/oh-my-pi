@@ -32,7 +32,7 @@ import {
 	trailingOutsidePreservedPlaceholderChunk,
 	transformOutsidePlaceholdersTracked,
 } from "./placeholder-scan";
-import { compileSecretRegex } from "./regex";
+import { compileSecretRegex, literalAlternationSource } from "./regex";
 import { RegistryRevision, TrackedMap, TrackedSet } from "./registry-revision";
 import {
 	ensureDistinctReplacement,
@@ -120,8 +120,7 @@ interface RegexScanMemo {
  */
 function buildLiteralDetector(literals: readonly string[], flags?: string): RegExp | undefined {
 	if (literals.length === 0) return undefined;
-	const sorted = [...new Set(literals)].sort((a, b) => b.length - a.length);
-	return new RegExp(sorted.map(literal => RegExp.escape(literal)).join("|"), flags);
+	return new RegExp(literalAlternationSource(literals), flags);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

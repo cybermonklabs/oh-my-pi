@@ -5,10 +5,13 @@ export const MIN_ENV_VALUE_LENGTH = 8;
 const SECRET_ENV_PATTERNS = /(?:KEY|SECRET|TOKEN|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|OAUTH)(?:_|$)/i;
 
 /** Variables that hold configuration rather than secrets, though `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS` match the name rule. */
-const NON_SECRET_ENV_NAMES = /^(?:GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|SSH_ASKPASS)$/;
+const NON_SECRET_ENV_NAMES = /^(?:GIT_CONFIG_KEY_\d+|SSH_ASKPASS)$/;
 
 /** Extracts the password group from a connection URL that carries a user and password before its host. */
 const CONNECTION_URL_PASSWORD_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/:@?#\s]*:([^/?#\s]+)@/i;
+
+/** A read-only view of environment variables, such as `process.env`. */
+export type Env = Readonly<Record<string, string | undefined>>;
 
 /** A secret-looking environment value and the variable that holds it. */
 export interface EnvSecretValue {
@@ -36,7 +39,7 @@ export function connectionUrlPasswords(value: string): string[] {
 }
 
 /** Collect environment values that look like secrets, deduplicated by value (the first variable wins). */
-export function collectEnvSecretValues(env: Readonly<Record<string, string | undefined>>): EnvSecretValue[] {
+export function collectEnvSecretValues(env: Env): EnvSecretValue[] {
 	const values: EnvSecretValue[] = [];
 	const seen = new Set<string>();
 	const add = (name: string, value: string): void => {

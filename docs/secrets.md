@@ -14,7 +14,7 @@ secrets:
 ## How it works
 
 1. On session startup, secrets are collected from:
-   - **Environment variables** whose names match common secret patterns (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASS`, `AUTH`, `CREDENTIAL`, `PRIVATE`, `OAUTH`) with values at least 8 characters long. `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS` are left out: they hold git configuration key names and the path of a program, not secrets.
+   - **Environment variables** whose names match common secret patterns (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASS`, `AUTH`, `CREDENTIAL`, `PRIVATE`, `OAUTH`) with values at least 8 characters long. `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS` are left out: they hold git configuration key names and the path of a program, not secrets.
    - **`secrets.yml` files** (see below)
    - Built-in reversible regexes for common credential shapes that appear only in session content or tool results: GitHub, GitLab, OpenAI, and Anthropic tokens, AWS access keys, Google API keys, Slack tokens, npm tokens, Stripe secret and restricted keys and webhook secrets, Hugging Face tokens, SendGrid keys, JWTs, Bearer header tokens, and PEM private key blocks
    - Passwords embedded in connection-URL environment values — any variable holding a `scheme://user:password@host`-style value (for example `DATABASE_URL`) has its password registered regardless of the variable name when it is at least 8 characters long. Both raw and percent-decoded forms are collected when they meet that limit.
@@ -147,7 +147,7 @@ The session store keeps every session entry as the agent wrote it, with `file` a
 
 ```yaml
 secrets:
-  maskSessionStore: true
+   maskSessionStore: true
 ```
 
 The setting is off by default and does not depend on `secrets.enabled`. When it is on, the agent replaces each value it holds with a marker that names where the value came from. A marker never holds the value.
@@ -156,7 +156,7 @@ The setting is off by default and does not depend on `secrets.enabled`. When it 
 2. `[REDACTED:file:<NAME>]`: the content of the file that an environment variable ending in `_FILE` names, and the password of a connection URL on a line of that file. `<NAME>` is the `_FILE` variable.
 3. `[REDACTED:secrets.yml:<label>]`: a `secrets.yml` entry, project or global. That is a replace-mode plain value of any length, an obfuscate-mode plain value of 8 characters or more, and every match of a regex entry. `<label>` is the sanitized `friendlyName`, else `project#<n>` or `global#<n>` for the entry's position in its file.
 
-When two sources hold the same value, the first source in this list names it. When a name or a `friendlyName` contains a held value, or a regex entry matches it, the marker uses the index form instead (`#<n>`, `project#<n>`, `global#<n>`). The agent never changes its own markers, so masking a stored text again gives the same text.
+When two sources hold the same value, the source the agent read first names it. At the first write, that is the first source in this list. When a name or a `friendlyName` contains a held value, or a regex entry matches it, the marker uses the index form instead (`#<n>`, `project#<n>`, `global#<n>`). The agent never changes its own markers, so masking a stored text again gives the same text.
 
 The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, and the replica that a collab guest writes. It masks every string of an entry except these, which it keeps as written:
 
@@ -185,7 +185,7 @@ A provider checks some blocks byte for byte when it replays a session. When mask
 Masking finds a value only where it appears exactly as the agent holds it. It does not catch:
 
 - a value that an agent transforms: encoded (for example in base64), cut into parts, or with characters added
-- a value shorter than 8 characters, except a replace-mode plain `secrets.yml` value
+- a value shorter than 8 characters, except a replace-mode plain `secrets.yml` value and a match of a `secrets.yml` regex entry
 - a value in no source, for example a variable set only in a child shell
 - a credential in a git configuration value set through the environment (`GIT_CONFIG_VALUE_<n>`)
 - the content of a `_FILE` file that is not a regular file, that the agent cannot read, that is larger than 1 MiB, or whose trimmed content is shorter than 8 characters

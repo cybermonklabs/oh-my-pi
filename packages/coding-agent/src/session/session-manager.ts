@@ -1564,7 +1564,7 @@ export class SessionManager {
 	}
 
 	#lineFor(entry: FileEntry, mask = sessionStoreMaskFor(this.#cwd)): string {
-		return `${stringifyJson(prepareEntryForPersistence(mask ? maskSessionEntry(entry, mask) : entry, this.#blobs)) ?? "null"}\n`;
+		return `${stringifyJson(prepareEntryForPersistence(maskSessionEntry(entry, mask), this.#blobs)) ?? "null"}\n`;
 	}
 	#recordDurableAppend(line: string): void {
 		this.#expectedDiskSize = (this.#expectedDiskSize ?? 0) + Buffer.byteLength(line, "utf8");
@@ -1613,11 +1613,16 @@ export class SessionManager {
 	}
 
 	#titleSlotLine(mask = sessionStoreMaskFor(this.#cwd)): string {
-		return serializeTitleSlot({
-			title: mask && this.#sessionName ? mask.maskText(this.#sessionName) : this.#sessionName,
-			source: this.#titleSource,
-			updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
-		});
+		return serializeTitleSlot(
+			maskTitleUpdate(
+				{
+					title: this.#sessionName,
+					source: this.#titleSource,
+					updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
+				},
+				mask,
+			),
+		);
 	}
 
 	/** Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from. */
