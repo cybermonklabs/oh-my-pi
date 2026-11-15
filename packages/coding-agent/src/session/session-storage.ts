@@ -208,6 +208,13 @@ export interface SessionStorage {
 	 * them, and reports the conflict instead on backends without it.
 	 */
 	readTextSync?(path: string): string;
+	/**
+	 * Synchronously read the UTF-8 bytes `[start, end)` of the file, or fewer
+	 * when it ends sooner. Optional: `SessionManager` reads back only what
+	 * another writer appended past the bytes it accounts for, and republishes
+	 * instead on backends without it.
+	 */
+	readTextRangeSync?(path: string, start: number, end: number): string;
 	/** Read the requested UTF-8 byte windows from the head and tail of the file. */
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**

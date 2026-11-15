@@ -3548,6 +3548,9 @@ export class SessionMaintenance {
 		const supersedeResult = this.#usesExperimentalContextManagement()
 			? undefined
 			: await this.#pruneStaleToolResults();
+		// A pass that blanked a result before the cut made that entry whole; it
+		// goes back to the store holding the blanked value.
+		if (supersedeResult) this.#host.sessionManager.recoolEntriesBeforeCut();
 
 		const compactionSettings = this.#compactionSettings;
 		if (
@@ -3560,6 +3563,7 @@ export class SessionMaintenance {
 		// Skip if this was an error (non-overflow errors don't have usage data)
 		if (assistantMessage.stopReason === "error") return COMPACTION_CHECK_NONE;
 		const pruneResult = this.#usesExperimentalContextManagement() ? undefined : await this.#pruneToolOutputs();
+		if (pruneResult) this.#host.sessionManager.recoolEntriesBeforeCut();
 		const maintenanceTokensFreed = (supersedeResult?.tokensSaved ?? 0) + (pruneResult?.tokensSaved ?? 0);
 		// `errorIsFromBeforeCompaction` (computed above) is the general
 		// "this assistant message predates the latest compaction" predicate here,

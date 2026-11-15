@@ -9,6 +9,10 @@
 - `.jsonl.gz` subagent transcripts in exports are decompressed as they are read instead of all at once
 - `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory
 
+### Fixed
+
+- A session that finds another writer's entries in its file while rewriting it reads the file back in pieces instead of all at once, so keeping those entries no longer holds a whole long transcript in memory
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

@@ -115,6 +115,52 @@ function interruptedSession(dir: string): Promise<string> {
 	]);
 }
 
+/** The custom entry type a manager that persists prune passes as appended records writes. */
+const PRUNE_RECORD_TYPE = "tool_result_prune";
+const PRUNABLE_RESULT_TEXT = `match line\n${BODY}`;
+
+/**
+ * A `grep` result flagged useless lies before the cut: a compaction that names
+ * no kept entry cuts at itself, and the prune boundary it gives resolves
+ * nowhere, so the next prune pass blanks the result. Blanking replaces only
+ * its content; its large `details` stay. `now` dates the turn.
+ */
+function prunableResultSession(dir: string, now: number): Promise<string> {
+	const message = (id: string, parentId: string | null, body: unknown) => ({
+		type: "message",
+		id,
+		parentId,
+		timestamp: TIMESTAMP,
+		message: body,
+	});
+	return writeEntries(dir, [
+		message("u1", null, { role: "user", content: "Investigate every module.", timestamp: now - 200 }),
+		message("a1", "u1", {
+			...assistant([{ type: "toolCall", id: "call_grep", name: "grep", arguments: { pattern: "TODO" } }], "toolUse"),
+			timestamp: now - 180,
+		}),
+		message("r1", "a1", {
+			role: "toolResult",
+			toolCallId: "call_grep",
+			toolName: "grep",
+			content: [{ type: "text", text: PRUNABLE_RESULT_TEXT }],
+			details: { matches: Array.from({ length: 64 }, (_, line) => `src/module-${line}.ts:1: // TODO`) },
+			isError: false,
+			useless: true,
+			timestamp: now - 170,
+		}),
+		{
+			type: "compaction",
+			id: "c1",
+			parentId: "r1",
+			timestamp: TIMESTAMP,
+			summary: `c1 ${BODY}`,
+			firstKeptEntryId: "",
+			tokensBefore: 1000,
+		},
+	]);
+}
+
 function open(file: string, coldStore: boolean): Promise<SessionManager> {
 	return SessionManager.open(file, undefined, new FileSessionStorage(), { suppressBreadcrumb: true, coldStore });
 }
@@ -253,64 +299,66 @@ describe("readers of the recent turns read no older body", () => {
 		expect(text(persistedA1)).toBe(text(a1));
 	});
 
-	it("returns a result before the cut to the store with its previous values when persisting its prune fails", async () => {
-		using dir = TempDir.createSync("@omp-cold-readers-");
-		const now = Date.now();
-		const message = (id: string, parentId: string | null, body: unknown) => ({
-			type: "message",
-			id,
-			parentId,
-			timestamp: TIMESTAMP,
-			message: body,
-		});
-		const resultText = `match line\n${BODY}`;
-		// A compaction that names no kept entry cuts at itself, and the prune boundary it gives resolves nowhere.
-		const file = await writeEntries(dir.path(), [
-			message("u1", null, { role: "user", content: "Investigate every module.", timestamp: now - 200 }),
-			message("a1", "u1", {
-				...assistant(
-					[{ type: "toolCall", id: "call_grep", name: "grep", arguments: { pattern: "TODO" } }],
-					"toolUse",
-				),
-				timestamp: now - 180,
-			}),
-			message("r1", "a1", {
-				role: "toolResult",
-				toolCallId: "call_grep",
-				toolName: "grep",
-				content: [{ type: "text", text: resultText }],
-				isError: false,
-				useless: true,
-				timestamp: now - 170,
-			}),
-			{
-				type: "compaction",
-				id: "c1",
-				parentId: "r1",
-				timestamp: TIMESTAMP,
-				summary: `c1 ${BODY}`,
-				firstKeptEntryId: "",
-				tokensBefore: 1000,
-			},
-		]);
-		const sessionManager = await open(file, true);
-		const r1 = sessionManager.getEntry("r1");
-		if (!r1) throw new Error("r1 missing");
-		expect(isColdEntry(r1)).toBe(true);
-		const session = await startSession(sessionManager, dir.path(), false, { "compaction.dropUseless": true });
-		const rewriteEntries = vi
-			.spyOn(sessionManager, "rewriteEntries")
-			.mockRejectedValueOnce(new Error("injected rewrite failure"));
-
+	/**
+	 * Run one finished turn, whose post-turn maintenance runs the prune passes
+	 * with `compaction.dropUseless`. The context was built for the session's
+	 * model before, as by the turns after a resume, so the cut is settled and
+	 * the pass's own context rebuild moves no entry.
+	 */
+	async function finishTurnWithPrunePass(sessionManager: SessionManager, dir: string, now: number): Promise<void> {
+		const session = await startSession(sessionManager, dir, false, { "compaction.dropUseless": true });
+		session.buildDisplaySessionContext();
 		const finalAssistant = { ...assistant([{ type: "text", text: "Continuing." }], "stop"), timestamp: now };
 		session.agent.emitExternalEvent({ type: "message_end", message: finalAssistant });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [finalAssistant] });
 		await session.waitForIdle();
+	}
 
-		expect(rewriteEntries).toHaveBeenCalledTimes(1);
+	it("puts a result before the cut that a prune pass blanks back in the store, holding the blanked value", async () => {
+		using dir = TempDir.createSync("@omp-cold-readers-");
+		const now = Date.now();
+		const file = await prunableResultSession(dir.path(), now);
+		const sessionManager = await open(file, true);
+		const r1 = sessionManager.getEntry("r1");
+		if (r1?.type !== "message") throw new Error("r1 missing");
 		expect(isColdEntry(r1)).toBe(true);
-		expect(r1.type === "message" ? r1.message : undefined).toMatchObject({
-			content: [{ type: "text", text: resultText }],
+
+		await finishTurnWithPrunePass(sessionManager, dir.path(), now);
+
+		expect(isColdEntry(r1)).toBe(true);
+		if (r1.message.role !== "toolResult") throw new Error("r1 is not a tool result");
+		expect(r1.message.prunedAt).toBeNumber();
+		expect(JSON.stringify(r1.message)).not.toContain(PRUNABLE_RESULT_TEXT);
+		// Whatever way the prune was persisted, a resume reads the same blanked result.
+		await sessionManager.flush();
+		const persisted = await open(file, false);
+		const persistedR1 = persisted.getEntry("r1");
+		await persisted.close();
+		if (persistedR1?.type !== "message") throw new Error("persisted r1 missing");
+		expect(JSON.parse(JSON.stringify(persistedR1.message))).toEqual(JSON.parse(JSON.stringify(r1.message)));
+	});
+
+	it("returns a result before the cut to the store with its previous values when persisting its prune fails", async () => {
+		using dir = TempDir.createSync("@omp-cold-readers-");
+		const now = Date.now();
+		const sessionManager = await open(await prunableResultSession(dir.path(), now), true);
+		const r1 = sessionManager.getEntry("r1");
+		if (r1?.type !== "message") throw new Error("r1 missing");
+		const rewriteEntries = vi
+			.spyOn(sessionManager, "rewriteEntries")
+			.mockRejectedValueOnce(new Error("injected rewrite failure"));
+
+		await finishTurnWithPrunePass(sessionManager, dir.path(), now);
+
+		expect(isColdEntry(r1)).toBe(true);
+		// A pass persisted as an appended prune record has no failed rewrite to undo.
+		const prunesAsRecords = sessionManager
+			.getEntries()
+			.some(entry => entry.type === "custom" && entry.customType === PRUNE_RECORD_TYPE);
+		if (prunesAsRecords) return;
+		expect(rewriteEntries).toHaveBeenCalledTimes(1);
+		expect(r1.message).toMatchObject({
+			content: [{ type: "text", text: PRUNABLE_RESULT_TEXT }],
 			prunedAt: undefined,
 		});
 	});

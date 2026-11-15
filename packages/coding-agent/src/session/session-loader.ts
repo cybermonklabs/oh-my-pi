@@ -265,53 +265,74 @@ export async function* transcriptByteChunks(filePath: string, storage: SessionSt
 	yield new TextEncoder().encode(await storage.readText(filePath));
 }
 
-/** Parse session JSONL and visit each entry without retaining prior entries. */
-export async function visitEntriesFromFileStream(
-	filePath: string,
-	visit: (entry: FileEntry) => void | boolean,
-	options: VisitEntriesFromFileStreamOptions = {},
-): Promise<SessionTitleUpdate | undefined> {
-	let titleSlot: SessionTitleUpdate | undefined;
-	let sawFirstLine = false;
-	let sawFirstEntry = false;
-	let bytesSinceYield = 0;
-	let entriesSinceYield = 0;
-	let recordsSeen = 0;
-	const maxRecords = Math.max(0, options.maxRecords ?? Number.POSITIVE_INFINITY);
-	let stopped = false;
-	let visitorThrew = false;
-	const yieldEveryBytes = Math.max(0, options.yieldEveryBytes ?? STREAM_YIELD_BYTES);
-	const yieldEveryEntries = Math.max(0, options.yieldEveryEntries ?? STREAM_YIELD_ENTRIES);
-	const maxBytes = Math.max(0, options.maxBytes ?? Number.POSITIVE_INFINITY);
-	// Bytes, not text: a multibyte UTF-8 sequence straddling a chunk boundary
-	// stays intact, and Bun.JSONL.parseChunk takes typed arrays directly. Only
-	// the unconsumed remainder is held (≤ one record + a chunk), so the ≥8MiB
-	// memory guard holds — the file is never fully loaded.
-	const sink = new ConcatSink();
-	const decoder = new TextDecoder();
+function hasPayload(bytes: Uint8Array, start: number, end: number): boolean {
+	for (let index = start; index < end; index++) {
+		const byte = bytes[index];
+		if (byte !== 0x09 && byte !== 0x0a && byte !== 0x0d && byte !== 0x20) return true;
+	}
+	return false;
+}
 
-	const yieldToMacrotask = async (): Promise<void> => {
-		if (yieldEveryBytes === 0 && yieldEveryEntries === 0) return;
-		const bytesReady = yieldEveryBytes === 0 || bytesSinceYield < yieldEveryBytes;
-		const entriesReady = yieldEveryEntries === 0 || entriesSinceYield < yieldEveryEntries;
-		if (bytesReady && entriesReady) {
-			return;
-		}
-		bytesSinceYield = 0;
-		entriesSinceYield = 0;
-		await Bun.sleep(0);
-	};
+/**
+ * The lenient JSONL parse of a transcript's bytes behind
+ * {@link visitEntriesFromFileStream} and {@link visitEntriesFromChunksSync}.
+ * Bytes, not text: a multibyte UTF-8 sequence straddling a chunk boundary
+ * stays intact, and Bun.JSONL.parseChunk takes typed arrays directly. Only the
+ * unconsumed remainder is held (≤ one record + a chunk), so the ≥8MiB memory
+ * guard holds — the file is never fully loaded.
+ */
+class TranscriptRecordParser {
+	titleSlot: SessionTitleUpdate | undefined;
+	/** Valid and malformed records consumed; the visitor counts the valid ones it accepts. */
+	recordsSeen = 0;
+	/** Set to stop the parse: the visitor declined an entry, or the record cap was reached. */
+	stopped = false;
+	readonly #maxRecords: number;
+	readonly #onMalformedRecord: (() => void) | undefined;
+	readonly #sink = new ConcatSink();
+	readonly #decoder = new TextDecoder();
+	#sawFirstLine = false;
+	#sawFirstEntry = false;
 
-	const hasPayload = (bytes: Uint8Array, start: number, end: number): boolean => {
-		for (let index = start; index < end; index++) {
-			const byte = bytes[index];
-			if (byte !== 0x09 && byte !== 0x0a && byte !== 0x0d && byte !== 0x20) return true;
-		}
-		return false;
-	};
+	constructor(maxRecords: number, onMalformedRecord: (() => void) | undefined) {
+		this.#maxRecords = maxRecords;
+		this.#onMalformedRecord = onMalformedRecord;
+	}
 
-	const drain = async (endOfInput = false): Promise<void> => {
-		const view = sink.flush();
+	append(chunk: Uint8Array): void {
+		this.#sink.append(chunk);
+	}
+
+	/**
+	 * Peel the optional fixed-width title slot, a physical first line that is
+	 * NOT JSON, before the parser would (correctly) reject it. Call once a held
+	 * chunk ends a line: the first line ends at a '\n' byte, so it is a complete
+	 * UTF-8 sequence and safe to decode. A non-slot first line is a real entry
+	 * and is left for the parser; a blank first line is left for the parser to skip.
+	 */
+	peelTitleSlot(): void {
+		if (this.#sawFirstLine) return;
+		const buffered = this.#sink.flush()!;
+		const newline = buffered.indexOf(0x0a);
+		if (newline === -1) return;
+		this.#sawFirstLine = true;
+		const firstLine = this.#decoder.decode(buffered.subarray(0, newline)).trim();
+		if (!firstLine) return;
+		const slot = parseTitleSlotLine(firstLine);
+		if (!slot) return;
+		this.titleSlot = titleUpdateFromSlot(slot);
+		this.#sink.consume(newline + 1);
+	}
+
+	/**
+	 * Yield each entry the held newline-terminated bytes complete, the parse
+	 * waiting at each until the visitor took it (or set {@link stopped}).
+	 * parseChunk can leave a value unfinished even after a newline; the
+	 * remainder stays held for the next chunk, unless `endOfInput`, when it is
+	 * a truncated record.
+	 */
+	*drain(endOfInput = false): Generator<FileEntry> {
+		const view = this.#sink.flush();
 		if (!view) return;
 		// Only newline-terminated bytes may reach the parser: a trailing fragment
 		// in the same call turns an end-of-input `done` into a syntax error at the
@@ -329,88 +350,136 @@ export async function visitEntriesFromFileStream(
 		// quadratic. After a malformed record, parse a newline-cut window that grows
 		// while the input keeps parsing and resets on the next error.
 		let window = Number.POSITIVE_INFINITY;
-		while (buffer.length > 0 && !stopped) {
-			if (recordsSeen >= maxRecords) {
-				stopped = true;
-				break;
-			}
-			let input = buffer;
-			if (window < buffer.length) {
-				const cut = buffer.indexOf(0x0a, window - 1);
-				if (cut !== -1) input = buffer.subarray(0, cut + 1);
-			}
-			const partial = input.length < buffer.length;
-			const { values, error, read, done } = Bun.JSONL.parseChunk(input);
-			for (const value of values) {
-				if (recordsSeen >= maxRecords) {
-					stopped = true;
+		try {
+			while (buffer.length > 0 && !this.stopped) {
+				if (this.recordsSeen >= this.#maxRecords) {
+					this.stopped = true;
 					break;
 				}
-				if (options.shouldContinue && !options.shouldContinue()) {
-					stopped = true;
-					break;
+				let input = buffer;
+				if (window < buffer.length) {
+					const cut = buffer.indexOf(0x0a, window - 1);
+					if (cut !== -1) input = buffer.subarray(0, cut + 1);
 				}
-				const entry = value as FileEntry;
-				if (!sawFirstEntry) {
-					sawFirstEntry = true;
-					applyTitleSlot(entry, titleSlot);
-				}
-				try {
-					if (visit(entry) === false) {
-						stopped = true;
+				const partial = input.length < buffer.length;
+				const { values, error, read, done } = Bun.JSONL.parseChunk(input);
+				for (const value of values) {
+					if (this.recordsSeen >= this.#maxRecords) {
+						this.stopped = true;
 						break;
 					}
-					recordsSeen++;
-					entriesSinceYield++;
-					if (recordsSeen >= maxRecords) {
-						stopped = true;
+					const entry = value as FileEntry;
+					if (!this.#sawFirstEntry) {
+						this.#sawFirstEntry = true;
+						applyTitleSlot(entry, this.titleSlot);
+					}
+					yield entry;
+					if (this.stopped) break;
+				}
+				if (this.stopped) break;
+				if (error) {
+					// Malformed record: skip past the next newline and continue.
+					const nextNewline = buffer.indexOf(0x0a, read);
+					if (nextNewline === -1) break; // rest of the bad line not yet received
+					if (hasPayload(buffer, read, nextNewline)) this.#onMalformedRecord?.();
+					this.recordsSeen++;
+					advance(nextNewline + 1);
+					window = RECOVERY_PARSE_WINDOW;
+					if (this.recordsSeen >= this.#maxRecords) {
+						this.stopped = true;
 						break;
 					}
-				} catch (err) {
-					visitorThrew = true;
-					throw err;
-				}
-				await yieldToMacrotask();
-			}
-			if (stopped) break;
-			if (error) {
-				// Malformed record: skip past the next newline and continue.
-				const nextNewline = buffer.indexOf(0x0a, read);
-				if (nextNewline === -1) break; // rest of the bad line not yet received
-				if (hasPayload(buffer, read, nextNewline)) options.onMalformedRecord?.();
-				recordsSeen++;
-				advance(nextNewline + 1);
-				window = RECOVERY_PARSE_WINDOW;
-				if (recordsSeen >= maxRecords) {
-					stopped = true;
-					break;
-				}
-				continue;
-			}
-			if (read === 0) {
-				if (partial) {
-					// The record runs past the window, not past the buffered input.
-					window *= 2;
 					continue;
 				}
-				// Incomplete value awaiting more bytes. Once the input has ended nothing more
-				// is coming, so it is a truncated record (parseJsonlLenient counts it too).
-				if (endOfInput) {
-					if (hasPayload(buffer, 0, buffer.length)) options.onMalformedRecord?.();
-					recordsSeen++;
-					advance(buffer.length);
+				if (read === 0) {
+					if (partial) {
+						// The record runs past the window, not past the buffered input.
+						window *= 2;
+						continue;
+					}
+					// Incomplete value awaiting more bytes. Once the input has ended nothing more
+					// is coming, so it is a truncated record (parseJsonlLenient counts it too).
+					if (endOfInput) {
+						if (hasPayload(buffer, 0, buffer.length)) this.#onMalformedRecord?.();
+						this.recordsSeen++;
+						advance(buffer.length);
+					}
+					break;
 				}
+				advance(read);
+				if (done) {
+					// The parser reached the end of its input; whatever trails the last value is whitespace.
+					advance(input.length - read);
+					if (!partial) break;
+				}
+				if (partial) window *= 2;
+			}
+		} finally {
+			this.#sink.consume(consumed);
+		}
+	}
+
+	/**
+	 * A trailing record without a final newline: terminate it so the parser
+	 * can complete it (readline yielded it; parseChunk needs the delimiter).
+	 */
+	*finish(): Generator<FileEntry> {
+		if (this.stopped || this.#sink.isEmpty) return;
+		this.#sink.append(LF);
+		yield* this.drain(true);
+	}
+}
+
+/** Parse session JSONL and visit each entry without retaining prior entries. */
+export async function visitEntriesFromFileStream(
+	filePath: string,
+	visit: (entry: FileEntry) => void | boolean,
+	options: VisitEntriesFromFileStreamOptions = {},
+): Promise<SessionTitleUpdate | undefined> {
+	let bytesSinceYield = 0;
+	let entriesSinceYield = 0;
+	const maxRecords = Math.max(0, options.maxRecords ?? Number.POSITIVE_INFINITY);
+	let visitorThrew = false;
+	const yieldEveryBytes = Math.max(0, options.yieldEveryBytes ?? STREAM_YIELD_BYTES);
+	const yieldEveryEntries = Math.max(0, options.yieldEveryEntries ?? STREAM_YIELD_ENTRIES);
+	const maxBytes = Math.max(0, options.maxBytes ?? Number.POSITIVE_INFINITY);
+	const parser = new TranscriptRecordParser(maxRecords, options.onMalformedRecord);
+
+	const yieldToMacrotask = async (): Promise<void> => {
+		if (yieldEveryBytes === 0 && yieldEveryEntries === 0) return;
+		const bytesReady = yieldEveryBytes === 0 || bytesSinceYield < yieldEveryBytes;
+		const entriesReady = yieldEveryEntries === 0 || entriesSinceYield < yieldEveryEntries;
+		if (bytesReady && entriesReady) {
+			return;
+		}
+		bytesSinceYield = 0;
+		entriesSinceYield = 0;
+		await Bun.sleep(0);
+	};
+
+	const visitParsed = async (entries: Iterable<FileEntry>): Promise<void> => {
+		for (const entry of entries) {
+			if (options.shouldContinue && !options.shouldContinue()) {
+				parser.stopped = true;
 				break;
 			}
-			advance(read);
-			if (done) {
-				// The parser reached the end of its input; whatever trails the last value is whitespace.
-				advance(input.length - read);
-				if (!partial) break;
+			try {
+				if (visit(entry) === false) {
+					parser.stopped = true;
+					break;
+				}
+				parser.recordsSeen++;
+				entriesSinceYield++;
+				if (parser.recordsSeen >= maxRecords) {
+					parser.stopped = true;
+					break;
+				}
+			} catch (err) {
+				visitorThrew = true;
+				throw err;
 			}
-			if (partial) window *= 2;
+			await yieldToMacrotask();
 		}
-		sink.consume(consumed);
 	};
 
 	try {
@@ -423,7 +492,7 @@ export async function visitEntriesFromFileStream(
 			options.chunks ??
 			(options.storage ? transcriptByteChunks(filePath, options.storage) : Bun.file(filePath).stream());
 		for await (const streamed of chunks) {
-			if (stopped) break;
+			if (parser.stopped) break;
 			const chunk = streamed.byteLength > unread ? streamed.subarray(0, unread) : streamed;
 			unread -= chunk.byteLength;
 			bytesSinceYield += chunk.byteLength;
@@ -431,51 +500,25 @@ export async function visitEntriesFromFileStream(
 			// Parsing before the chunk closes a line re-scans the unfinished record
 			// on every chunk, which is quadratic for large records.
 			if (chunk.lastIndexOf(0x0a) === -1) {
-				// Skipping drain() also skips the only enforcement of the record cap,
+				// Skipping the parse also skips the only enforcement of the record cap,
 				// so re-check it here: a delimiter-free file would otherwise be read
 				// and buffered in full despite an exhausted budget.
-				if (recordsSeen >= maxRecords) {
-					stopped = true;
+				if (parser.recordsSeen >= maxRecords) {
+					parser.stopped = true;
 					break;
 				}
-				sink.append(chunk);
+				parser.append(chunk);
 				await yieldToMacrotask();
 				if (unread === 0) break;
 				continue;
 			}
-			sink.append(chunk);
-			// The optional fixed-width title slot is a physical first line that is
-			// NOT JSON; peel it before the parser would (correctly) reject it. The
-			// first line ends at a '\n' byte, so it is a complete UTF-8 sequence and
-			// safe to decode. A non-slot first line is a real entry and is left for
-			// the parser; a blank first line is left for the parser to skip.
-			if (!sawFirstLine) {
-				const buffered = sink.flush()!;
-				const newline = buffered.indexOf(0x0a);
-				if (newline !== -1) {
-					sawFirstLine = true;
-					const firstLine = decoder.decode(buffered.subarray(0, newline)).trim();
-					if (firstLine) {
-						const slot = parseTitleSlotLine(firstLine);
-						if (slot) {
-							titleSlot = titleUpdateFromSlot(slot);
-							sink.consume(newline + 1);
-						}
-					}
-				}
-			}
-			// parseChunk can leave a value unfinished even after a newline; the
-			// sink keeps that remainder for the next chunk.
-			await drain();
+			parser.append(chunk);
+			parser.peelTitleSlot();
+			await visitParsed(parser.drain());
 			await yieldToMacrotask();
 			if (unread === 0) break;
 		}
-		// A trailing record without a final newline: terminate it so the parser
-		// can complete it (readline yielded it; parseChunk needs the delimiter).
-		if (!stopped && !sink.isEmpty) {
-			sink.append(LF);
-			await drain(true);
-		}
+		await visitParsed(parser.finish());
 	} catch (err) {
 		if (visitorThrew) throw err;
 		if (options.throwIfMissing && (isEnoent(err) || isEnotdir(err))) {
@@ -487,8 +530,42 @@ export async function visitEntriesFromFileStream(
 		throw err;
 	}
 
-	return titleSlot;
+	return parser.titleSlot;
 }
+
+/**
+ * {@link visitEntriesFromFileStream} for a caller that cannot wait: visit the
+ * entries of the transcript bytes `chunks` yields, holding one chunk and the
+ * unfinished record at a time. Returns the title slot, if the first line is one.
+ */
+export function visitEntriesFromChunksSync(
+	chunks: Iterable<Uint8Array>,
+	visit: (entry: FileEntry) => void | boolean,
+	options: Pick<VisitEntriesFromFileStreamOptions, "onMalformedRecord" | "onBytesConsumed"> = {},
+): SessionTitleUpdate | undefined {
+	const parser = new TranscriptRecordParser(Number.POSITIVE_INFINITY, options.onMalformedRecord);
+	const visitParsed = (entries: Iterable<FileEntry>): void => {
+		for (const entry of entries) {
+			if (visit(entry) === false) {
+				parser.stopped = true;
+				return;
+			}
+			parser.recordsSeen++;
+		}
+	};
+	for (const chunk of chunks) {
+		if (parser.stopped) break;
+		options.onBytesConsumed?.(chunk.byteLength);
+		parser.append(chunk);
+		// Parsing before the chunk closes a line re-scans the unfinished record.
+		if (chunk.lastIndexOf(0x0a) === -1) continue;
+		parser.peelTitleSlot();
+		visitParsed(parser.drain());
+	}
+	visitParsed(parser.finish());
+	return parser.titleSlot;
+}
+
 /** The ≥8MiB streaming load (works on any size), of `filePath` or of `options.chunks`. */
 export async function loadEntriesFromFileStream(
 	filePath: string,
