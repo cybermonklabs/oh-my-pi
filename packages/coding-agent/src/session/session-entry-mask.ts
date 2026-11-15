@@ -7,15 +7,24 @@
  * and `null` are never masked (KR13). An entry with nothing to mask comes back as the same object;
  * a masked one shares every untouched subtree with the live entry.
  *
+ * The walk reads each value as `stringifyJson` writes it to the session line: through its `toJSON`,
+ * a `bigint` as its decimal string, a boxed primitive as its primitive, an object as its own
+ * enumerable keys. A position keeps a value only in the shape the table declares for it, judged on
+ * the live value: a string field a primitive string, a `[]` field a real array of strings, an object
+ * or array-element position a plain object; any other shape there is free content, every string masked.
+ *
  * The `KRn` tags on the table's rows name the keep rules:
  * - KR1: every entry: its `type`, `id`, `parentId`, `timestamp`, `activeLeafId` and the build that wrote it.
- * - KR2: the session header: its working directories, the links to other sessions and the cache keys.
- * - KR3: the fields of each entry `type`.
+ * - KR2: the session header, which is not an entry: its working directories, the links to other
+ *   sessions and the cache keys.
+ * - KR3: the fields of each entry `type`; a `service_tier_change` keeps only the tier of each provider family.
  * - KR4: an entry's `message`, by `role`.
  * - KR5: a content block of an entry, of its message or of `compactionSummary.blocks`.
  * - KR6: a block's signature, kept unscanned except an OpenAI Responses reasoning item's summary and content texts.
- * - KR7: image data outside a content array.
- * - KR8: a provider replay carrier: its protocol keys and ciphertext, each at its own place in it.
+ * - KR7: image data outside a content array, each image keeping what KR5's image block keeps.
+ * - KR8: a provider replay carrier: its protocol keys and ciphertext, each at its own place in it; an
+ *   `anthropicCompaction` tool change keeps its `type`, its `tool`'s `type` and `name` and its whole
+ *   `opaque` object, and a server tool's result content keeps fields by element type only.
  * - KR9: the snapcompact slot of a compaction: its frames.
  * - KR10: the drop rules: a changed signed block loses its signature; a changed carrier, server-tool
  *   group or snapcompact slot is left out of the stored copy.
@@ -33,8 +42,9 @@ const DROP: unique symbol = Symbol("drop");
 /** A place in the session format where the table keeps fields. */
 type PositionName =
 	| "entry"
+	| "header"
 	| "runtime"
-	| "serviceTierByFamily"
+	| "serviceTier"
 	| "retryFallback"
 	| "preserveData"
 	| "message"
@@ -69,8 +79,10 @@ type PositionName =
 	| "mcpItem"
 	| "mcpListTools"
 	| "mcpTool"
-	| "toolChange"
+	| "messageToolChange"
 	| "anthropicCompaction"
+	| "compactionToolChange"
+	| "compactionTool"
 	| "geminiContent"
 	| "geminiPart"
 	| "geminiFunction"
@@ -81,7 +93,9 @@ type PositionName =
 	| "openaiRemoteCompaction"
 	| "serverToolBlock"
 	| "cacheControl"
-	| "serverToolContent"
+	| "webSearchResult"
+	| "webSearchError"
+	| "toolSearchContent"
 	| "toolReference"
 	| "snapcompact"
 	| "snapcompactFrame"
@@ -90,14 +104,21 @@ type PositionName =
 	| "btwTurn"
 	| "btwImage";
 
-/** What the masker keeps at one position, and where the objects under it sit. */
+/**
+ * What the masker keeps in a plain object at one position, each field by the shape it declares.
+ * A field's value in any other shape is free content.
+ */
 interface Position {
-	/** Fields kept as written here: a string value, or each string item of an array value. */
-	readonly keep?: readonly string[];
-	/** Fields whose object value, or each object item of whose array value `items` does not name, sits at the named position. */
-	readonly children?: Readonly<Record<string, PositionName>>;
-	/** Fields whose array value's object items sit at the named position; an object value under the same key reads `children` only. */
-	readonly items?: Readonly<Record<string, PositionName>>;
+	/** Fields kept as written when their value is a primitive string. */
+	readonly strings?: readonly string[];
+	/** Fields whose value, when a real array, has each primitive-string element kept as written. */
+	readonly stringArrays?: readonly string[];
+	/** Fields whose value, when a plain object, is kept whole and unscanned. */
+	readonly wholeObjects?: readonly string[];
+	/** Fields whose value, when a plain object, sits at the named position. */
+	readonly objects?: Readonly<Record<string, PositionName>>;
+	/** Fields whose value, when a real array, has each plain-object element at the named position. */
+	readonly elements?: Readonly<Record<string, PositionName>>;
 	/** More rules for an object here, chosen by the string under `key`: a row of its own, or a named position's. */
 	readonly variants?: {
 		readonly key: "type" | "role";
@@ -113,64 +134,51 @@ interface Position {
 	readonly pair?: true;
 }
 
+/** The fields of a position that list names. */
+type ListedField = "strings" | "stringArrays" | "wholeObjects";
+
 /**
- * The keep rules, one row per position. A field is kept as written only where its row names it;
- * anywhere else the same name holds free data and is masked.
+ * The keep rules, one row per position. A field is kept as written only where its row names it,
+ * and only in the shape the row declares; anywhere else the same name holds free data and is masked.
  */
 const POSITIONS: Readonly<Record<PositionName, Position>> = {
-	/** KR1: every entry, the header included; KR2 and KR3 add the fields of each entry `type`. */
+	/** KR1: every entry; KR3 adds the fields of each entry `type`. */
 	entry: {
-		keep: ["type", "id", "parentId", "timestamp", "activeLeafId"],
-		children: { runtime: "runtime" },
+		strings: ["type", "id", "parentId", "timestamp", "activeLeafId"],
+		objects: { runtime: "runtime" },
 		variants: {
 			key: "type",
 			by: {
-				/** KR2: the header. Its `title` is masked. */
-				session: {
-					keep: [
-						"titleSource",
-						"cwd",
-						"additionalDirectories",
-						"parentSession",
-						"continuationOf",
-						"previousSessionFiles",
-						"seanceSource",
-						"providerPromptCacheKey",
-						"taskPromptCacheKey",
-					],
-				},
 				/** KR3. `errorMessage` is masked. */
-				model_usage: { keep: ["purpose", "role", "api", "provider", "model", "stopReason"] },
+				model_usage: { strings: ["purpose", "role", "api", "provider", "model", "stopReason"] },
 				/** KR3. */
-				thinking_level_change: { keep: ["thinkingLevel", "configured"] },
+				thinking_level_change: { strings: ["thinkingLevel", "configured"] },
 				/** KR3. */
-				model_change: { keep: ["model", "role"] },
-				/** KR3: a legacy single tier, or a tier per provider family. */
-				service_tier_change: { keep: ["serviceTier"], children: { serviceTier: "serviceTierByFamily" } },
+				model_change: { strings: ["model", "role"] },
+				/** KR3: a tier per provider family; a scalar `serviceTier` is masked. */
+				service_tier_change: { objects: { serviceTier: "serviceTier" } },
 				/** KR3. `summary`, `shortSummary`, `warning` and `details` are masked. */
 				compaction: {
-					keep: ["firstKeptEntryId", "method", "providerReplayThroughEntryId"],
-					children: { preserveData: "preserveData" },
+					strings: ["firstKeptEntryId", "method", "providerReplayThroughEntryId"],
+					objects: { preserveData: "preserveData" },
 				},
 				/** KR3. `summary` and `details` are masked. */
-				branch_summary: { keep: ["fromId"] },
+				branch_summary: { strings: ["fromId"] },
 				/** KR3. `data` is masked. */
-				custom: { keep: ["customType"] },
+				custom: { strings: ["customType"] },
 				/** KR3, KR5: its `content` blocks. `details` is masked. */
-				custom_message: { keep: ["customType", "attribution", "tag"], children: { content: "block" } },
+				custom_message: { strings: ["customType", "attribution", "tag"], elements: { content: "block" } },
 				/** KR3. `label` is masked. */
-				label: { keep: ["targetId"] },
+				label: { strings: ["targetId"] },
 				/** KR3. `title`, `previousTitle` and `trigger` are masked. */
-				title_change: { keep: ["source"] },
+				title_change: { strings: ["source"] },
 				/** KR3. */
-				ttsr_injection: { keep: ["injectedRules"] },
+				ttsr_injection: { stringArrays: ["injectedRules"] },
 				/** KR3. */
-				credential_pin: { keep: ["provider", "hash"] },
+				credential_pin: { strings: ["provider", "hash"] },
 				/** KR3. `systemPrompt`, `task`, `outputSchema` and `workPoolYieldItems` are masked. */
 				session_init: {
-					keep: [
-						"tools",
-						"mountedTools",
+					strings: [
 						"agent",
 						"modelRole",
 						"resolvedModel",
@@ -180,24 +188,41 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 						"spawns",
 						"advisor",
 					],
-					children: { retryFallback: "retryFallback" },
+					stringArrays: ["tools", "mountedTools"],
+					objects: { retryFallback: "retryFallback" },
 				},
 				/** KR3. `data` is masked. */
-				mode_change: { keep: ["mode"] },
+				mode_change: { strings: ["mode"] },
 				/** KR4: the entry's message. */
-				message: { children: { message: "message" } },
+				message: { objects: { message: "message" } },
 			},
 		},
 	},
+	/** KR2: the session header (`type: "session"`). Its `title` is masked. */
+	header: {
+		strings: [
+			"type",
+			"id",
+			"timestamp",
+			"titleSource",
+			"cwd",
+			"parentSession",
+			"continuationOf",
+			"seanceSource",
+			"providerPromptCacheKey",
+			"taskPromptCacheKey",
+		],
+		stringArrays: ["additionalDirectories", "previousSessionFiles"],
+	},
 	/** KR1: the build that wrote an entry. `label` is masked. */
-	runtime: { keep: ["version", "commit", "branch", "diff"] },
-	/** KR3: `service_tier_change.serviceTier`, each family's tier. */
-	serviceTierByFamily: { keep: ["openai", "anthropic", "google"] },
+	runtime: { strings: ["version", "commit", "branch", "diff"] },
+	/** KR3: `service_tier_change.serviceTier`, each `ServiceTierFamily`'s tier. */
+	serviceTier: { strings: ["openai", "anthropic", "google"] },
 	/** KR3: `session_init.retryFallback`. */
-	retryFallback: { keep: ["primary", "chain"] },
+	retryFallback: { strings: ["primary"], stringArrays: ["chain"] },
 	/** KR8, KR9: the slots of `compaction.preserveData` that replay provider state; any other slot is masked. */
 	preserveData: {
-		children: {
+		objects: {
 			openaiRemoteCompaction: "openaiRemoteCompaction",
 			anthropicCompaction: "anthropicCompaction",
 			snapcompact: "snapcompact",
@@ -205,18 +230,19 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 	},
 	/** KR4: an entry's message, by `role`; KR5 its `content` blocks; KR8 its `providerPayload`. */
 	message: {
-		keep: ["role", "timestamp"],
-		children: { content: "block", providerPayload: "providerPayload" },
+		strings: ["role", "timestamp"],
+		objects: { providerPayload: "providerPayload" },
+		elements: { content: "block" },
 		variants: {
 			key: "role",
 			by: {
 				/** KR4. `parentIrc` is masked. */
-				user: { keep: ["attribution", "tag"] },
+				user: { strings: ["attribution", "tag"] },
 				/** KR4. */
-				developer: { keep: ["attribution"] },
+				developer: { strings: ["attribution"] },
 				/** KR4. `errorMessage`, `errorDisplayMessage`, `toolCallAbortMessages` and the like are masked. */
 				assistant: {
-					keep: [
+					strings: [
 						"api",
 						"provider",
 						"model",
@@ -225,164 +251,172 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 						"upstreamModel",
 						"serviceTier",
 						"stopReason",
-						"disabledFeatures",
 					],
-					children: {
+					stringArrays: ["disabledFeatures"],
+					objects: {
 						stopDetails: "stopDetails",
 						retryRecovery: "retryRecovery",
-						inputTransformations: "inputTransformation",
 						requestControls: "requestControls",
 					},
+					elements: { inputTransformations: "inputTransformation" },
 				},
 				/** KR4, KR7. `details` is masked. */
 				toolResult: {
-					keep: ["toolCallId", "toolName", "attribution"],
-					children: { providerMetadata: "toolResultMetadata" },
+					strings: ["toolCallId", "toolName", "attribution"],
+					objects: { providerMetadata: "toolResultMetadata" },
 				},
 				/** KR4. `details` is masked. */
-				custom: { keep: ["customType", "attribution", "tag"] },
+				custom: { strings: ["customType", "attribution", "tag"] },
 				/** KR4. `details` is masked. */
-				hookMessage: { keep: ["customType", "attribution", "tag"] },
+				hookMessage: { strings: ["customType", "attribution", "tag"] },
 				/** KR4. `summary` is masked. */
-				branchSummary: { keep: ["fromId"] },
+				branchSummary: { strings: ["fromId"] },
 				/** KR4, KR5: its `blocks`; KR7: its `images`. `summary`, `shortSummary` and `warning` are masked. */
-				compactionSummary: { keep: ["method"], children: { blocks: "block", images: "image" } },
+				compactionSummary: { strings: ["method"], elements: { blocks: "block", images: "image" } },
 				/** KR4, KR7. `command` and `output` are masked. */
-				bashExecution: { children: { meta: "outputMeta", images: "image" } },
+				bashExecution: { objects: { meta: "outputMeta" }, elements: { images: "image" } },
 				/** KR4. `code` and `output` are masked. */
-				pythonExecution: { children: { meta: "outputMeta" } },
+				pythonExecution: { objects: { meta: "outputMeta" } },
 				/** KR4. */
-				fileMention: { children: { files: "fileMentionFile" } },
+				fileMention: { elements: { files: "fileMentionFile" } },
 			},
 		},
 	},
 	/** KR4: an assistant message's `stopDetails`. `explanation` is masked. */
-	stopDetails: { keep: ["type", "category"] },
+	stopDetails: { strings: ["type", "category"] },
 	/** KR4: an assistant message's `retryRecovery`. `note` is masked. */
-	retryRecovery: { keep: ["kind", "status", "recovery", "recoveredAt"], children: { supersededBy: "supersededBy" } },
+	retryRecovery: {
+		strings: ["kind", "status", "recovery", "recoveredAt"],
+		objects: { supersededBy: "supersededBy" },
+	},
 	/** KR4. */
-	supersededBy: { keep: ["responseId", "provider", "model"] },
-	/** KR4: an item of an assistant message's `inputTransformations`; its other keys are masked. */
-	inputTransformation: { keep: ["type", "path", "reason"] },
+	supersededBy: { strings: ["responseId", "provider", "model"] },
+	/** KR4: an element of an assistant message's `inputTransformations[]`; its other keys are masked. */
+	inputTransformation: { strings: ["type", "path", "reason"] },
 	/** KR4: an assistant message's `requestControls`. */
-	requestControls: { children: { tools: "requestControlTools", effort: "requestControlEffort" } },
+	requestControls: { objects: { tools: "requestControlTools", effort: "requestControlEffort" } },
 	/** KR4. */
-	requestControlTools: { keep: ["declared", "deferred", "active"] },
+	requestControlTools: { stringArrays: ["declared", "deferred", "active"] },
 	/** KR4. */
-	requestControlEffort: { keep: ["topLevel", "tail"] },
+	requestControlEffort: { strings: ["topLevel", "tail"] },
 	/** KR4: a tool result's `providerMetadata`. */
 	toolResultMetadata: {
-		keep: ["type"],
-		children: { screenshot: "screenshot", acknowledgedSafetyChecks: "safetyCheck" },
+		strings: ["type"],
+		objects: { screenshot: "screenshot" },
+		elements: { acknowledgedSafetyChecks: "safetyCheck" },
 	},
 	/** KR4; KR7: its `image_url`. */
-	screenshot: { keep: ["type", "file_id", "image_url"] },
-	/** KR4, KR5, KR8: a computer-use safety check. `message` is masked. */
-	safetyCheck: { keep: ["id", "code"] },
+	screenshot: { strings: ["type", "file_id", "image_url"] },
+	/** KR4, KR5, KR8: an element of a computer-use safety check list. `message` is masked. */
+	safetyCheck: { strings: ["id", "code"] },
 	/** KR4: a `bashExecution` or `pythonExecution` message's `meta`. `diagnostics` is masked. */
 	outputMeta: {
-		keep: ["artifactError"],
-		children: { truncation: "truncation", source: "outputSource", limits: "limits", minimized: "minimized" },
+		strings: ["artifactError"],
+		objects: { truncation: "truncation", source: "outputSource", limits: "limits", minimized: "minimized" },
 	},
 	/** KR4. */
-	truncation: { keep: ["direction", "truncatedBy", "artifactId"] },
+	truncation: { strings: ["direction", "truncatedBy", "artifactId"] },
 	/** KR4. `value` is masked. */
-	outputSource: { keep: ["type"] },
+	outputSource: { strings: ["type"] },
 	/** KR4. */
-	limits: { children: { columnTruncated: "columnTruncated" } },
+	limits: { objects: { columnTruncated: "columnTruncated" } },
 	/** KR4. */
-	columnTruncated: { keep: ["unit", "artifactId", "selectorBase"] },
+	columnTruncated: { strings: ["unit", "artifactId", "selectorBase"] },
 	/** KR4. `filter` is masked. */
-	minimized: { keep: ["artifactId"] },
-	/** KR4; KR7: its `image`. `path` and `content` are masked. */
-	fileMentionFile: { keep: ["skippedReason"], children: { image: "image" } },
-	/** KR5: an item of a `content` array of an entry or its message, or of `compactionSummary.blocks`. */
+	minimized: { strings: ["artifactId"] },
+	/** KR4: an element of a `fileMention` message's `files[]`; KR7: its `image`. `path` and `content` are masked. */
+	fileMentionFile: { strings: ["skippedReason"], objects: { image: "image" } },
+	/** KR5: an element of a `content[]` of an entry or its message, or of `compactionSummary.blocks[]`. */
 	block: {
-		keep: ["type"],
+		strings: ["type"],
 		variants: {
 			key: "type",
 			by: {
 				/** KR5, KR6. `thinking` is masked. */
 				thinking: {
-					keep: ["itemId", "thinkingSignature"],
+					strings: ["itemId", "thinkingSignature"],
 					signature: "thinkingSignature",
 					reasoning: true,
 				},
 				/** KR6. `text` is masked. */
-				text: { keep: ["textSignature"], signature: "textSignature" },
+				text: { strings: ["textSignature"], signature: "textSignature" },
 				/** KR5, KR6. `intent` and `rawBlock` are masked; `arguments` is free data. */
 				toolCall: {
-					keep: ["id", "name", "customWireName", "namespace", "thoughtSignature"],
-					children: { providerMetadata: "toolCallMetadata" },
+					strings: ["id", "name", "customWireName", "namespace", "thoughtSignature"],
+					objects: { providerMetadata: "toolCallMetadata" },
 					signature: "thoughtSignature",
 				},
 				/** KR5. */
-				redactedThinking: { keep: ["data"] },
+				redactedThinking: { strings: ["data"] },
 				/** KR5. */
-				fallback: { children: { from: "fallbackModel", to: "fallbackModel" } },
+				fallback: { objects: { from: "fallbackModel", to: "fallbackModel" } },
 				/** KR5. */
 				image: "image",
 				/** KR5, KR8, KR10: its `block` is a carrier, and a changed one goes with its server-tool siblings. */
-				anthropicServerTool: { children: { block: "serverToolBlock" }, pair: true },
+				anthropicServerTool: { objects: { block: "serverToolBlock" }, pair: true },
 			},
 		},
 	},
 	/** KR5: a tool call's `providerMetadata`. */
 	toolCallMetadata: {
-		keep: ["type", "providerItemId"],
-		children: { actions: "computerAction", pendingSafetyChecks: "safetyCheck" },
+		strings: ["type", "providerItemId"],
+		elements: { actions: "computerAction", pendingSafetyChecks: "safetyCheck" },
 	},
 	/** KR5, KR8: a computer-use action. `text` is masked. */
-	computerAction: { keep: ["type", "button", "keys"] },
+	computerAction: { strings: ["type", "button"], stringArrays: ["keys"] },
 	/** KR5: a `fallback` block's `from` and `to`. */
-	fallbackModel: { keep: ["model"] },
+	fallbackModel: { strings: ["model"] },
 	/** KR5: an `image` block; KR7: an image outside a content array. */
-	image: { keep: ["type", "data", "mimeType", "detail", "url"], children: { providerFile: "providerFile" } },
-	/** KR5. */
-	providerFile: { keep: ["provider", "id", "uri"] },
+	image: {
+		strings: ["type", "data", "mimeType", "detail", "url"],
+		objects: { providerFile: "providerFile" },
+	},
+	/** KR5, KR7. */
+	providerFile: { strings: ["provider", "id", "uri"] },
 	/** KR8: a message's or `compactionSummary`'s `providerPayload`, by `type`. */
 	providerPayload: {
 		carrier: true,
-		keep: ["type"],
+		strings: ["type"],
 		variants: {
 			key: "type",
 			by: {
 				/** KR8. */
-				openaiResponsesHistory: { keep: ["provider"], children: { items: "responsesItem" } },
+				openaiResponsesHistory: { strings: ["provider"], elements: { items: "responsesItem" } },
 				/** KR8. */
-				anthropicMessage: { keep: ["clearAt", "effort"], children: { toolChanges: "toolChange" } },
+				anthropicMessage: { strings: ["clearAt", "effort"], elements: { toolChanges: "messageToolChange" } },
 				/** KR8. */
 				anthropicCompaction: "anthropicCompaction",
 				/** KR8. `records` is masked. */
-				cursorHistory: { keep: ["wireRoute", "digest"] },
+				cursorHistory: { strings: ["wireRoute", "digest"] },
 				/** KR8. */
-				geminiNativeContent: { keep: ["digest"], children: { content: "geminiContent" } },
+				geminiNativeContent: { strings: ["digest"], objects: { content: "geminiContent" } },
 			},
 		},
 	},
 	/**
-	 * KR8: an OpenAI Responses item of a carrier. `arguments`, `input`, text and the other fields of
-	 * `action`, `output` and `operation` are masked, and so is all of an object `content` or `summary`.
+	 * KR8: an OpenAI Responses item of a carrier: an element of `items[]` or `replacementHistory[]`, or
+	 * the `compactionItem`. `arguments`, `input`, text and the other fields of `action`, `output` and
+	 * `operation` are masked, and so is all of an object `content` or `summary`.
 	 */
 	responsesItem: {
-		keep: ["type", "id", "call_id", "status", "role", "phase", "name", "namespace", "encrypted_content"],
-		children: {
-			action: "responsesTyped",
-			output: "responsesTyped",
-			operation: "responsesTyped",
+		strings: ["type", "id", "call_id", "status", "role", "phase", "name", "namespace", "encrypted_content"],
+		objects: { action: "responsesTyped", output: "responsesTyped", operation: "responsesTyped" },
+		elements: {
+			content: "responsesPart",
+			summary: "responsesPart",
+			output: "responsesPart",
 			pending_safety_checks: "safetyCheck",
 			acknowledged_safety_checks: "safetyCheck",
 		},
-		items: { content: "responsesPart", summary: "responsesPart", output: "responsesPart" },
 		variants: {
 			key: "type",
 			by: {
 				/** KR8. */
-				image_generation_call: { keep: ["result"] },
+				image_generation_call: { strings: ["result"] },
 				/** KR8: the fields KR5 keeps on the block copy of the same call. */
-				computer_call: { children: { action: "computerAction", actions: "computerAction" } },
+				computer_call: { objects: { action: "computerAction" }, elements: { actions: "computerAction" } },
 				/** KR8. */
-				computer_call_output: { children: { output: "computerOutput" } },
+				computer_call_output: { objects: { output: "computerOutput" } },
 				/** KR8. */
 				mcp_list_tools: "mcpListTools",
 				/** KR8. */
@@ -396,36 +430,43 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 	},
 	/** KR8: an element of a Responses item's `content[]`, `summary[]` or `output[]`. `text` is masked. */
 	responsesPart: {
-		keep: ["type"],
-		variants: { key: "type", by: { input_image: { keep: ["image_url", "detail", "file_id"] } } },
+		strings: ["type"],
+		variants: { key: "type", by: { input_image: { strings: ["image_url", "detail", "file_id"] } } },
 	},
 	/** KR8: a Responses item's `action`, `operation` or object `output`. */
-	responsesTyped: { keep: ["type"] },
-	/** KR8: a `computer_call_output` item's `output`. */
-	computerOutput: { keep: ["type", "image_url", "file_id"] },
+	responsesTyped: { strings: ["type"] },
+	/** KR8: a `computer_call_output` item's object `output`. */
+	computerOutput: { strings: ["type", "image_url", "file_id"] },
 	/** KR8: an `mcp_call`, `mcp_approval_request` or `mcp_approval_response` item. `arguments`, `output`, `error` and `reason` are masked. */
-	mcpItem: { keep: ["server_label", "approval_request_id"] },
+	mcpItem: { strings: ["server_label", "approval_request_id"] },
 	/** KR8: an `mcp_list_tools` item. `error` is masked. */
-	mcpListTools: { keep: ["server_label", "approval_request_id"], children: { tools: "mcpTool" } },
-	/** KR8: a tool an `mcp_list_tools` item lists. `description` and `input_schema` are masked. */
-	mcpTool: { keep: ["name"] },
-	/** KR8: a tool change of an Anthropic message or compaction. */
-	toolChange: { keep: ["type", "name"] },
+	mcpListTools: { strings: ["server_label", "approval_request_id"], elements: { tools: "mcpTool" } },
+	/** KR8: an element of an `mcp_list_tools` item's `tools[]`. `description` and `input_schema` are masked. */
+	mcpTool: { strings: ["name"] },
+	/** KR8: an element of an `anthropicMessage` payload's `toolChanges[]`. */
+	messageToolChange: { strings: ["type", "name"] },
 	/**
 	 * KR8: `compaction.preserveData.anthropicCompaction`, and an `anthropicCompaction` payload.
 	 * `content`, `filesText` and `retainedFiles` are masked.
 	 */
 	anthropicCompaction: {
 		carrier: true,
-		keep: ["type", "provider", "model", "signature", "encryptedContent"],
-		children: { toolChanges: "toolChange" },
+		strings: ["type", "provider", "model", "signature", "encryptedContent"],
+		elements: { toolChanges: "compactionToolChange" },
 	},
+	/**
+	 * KR8: an element of an `anthropicCompaction`'s `toolChanges[]`, the API's raw `tool_changes`,
+	 * which its signature covers: `opaque` is kept whole, unscanned. Its own `name` is masked.
+	 */
+	compactionToolChange: { strings: ["type"], objects: { tool: "compactionTool" }, wholeObjects: ["opaque"] },
+	/** KR8: an `anthropicCompaction` tool change's `tool`. */
+	compactionTool: { strings: ["type", "name"] },
 	/** KR8: a `geminiNativeContent` payload's `content`. */
-	geminiContent: { keep: ["role"], children: { parts: "geminiPart" } },
-	/** KR8: an element of a `geminiNativeContent` payload's `content.parts`, a Gemini `Part`. `text` is masked. */
+	geminiContent: { strings: ["role"], elements: { parts: "geminiPart" } },
+	/** KR8: an element of a `geminiNativeContent` payload's `content.parts[]`, a Gemini `Part`. `text` is masked. */
 	geminiPart: {
-		keep: ["thoughtSignature"],
-		children: {
+		strings: ["thoughtSignature"],
+		objects: {
 			functionCall: "geminiFunction",
 			functionResponse: "geminiFunction",
 			inlineData: "geminiInlineData",
@@ -435,51 +476,83 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 		},
 	},
 	/** KR8: a Gemini part's `functionCall` or `functionResponse`. `args` and `response` are masked. */
-	geminiFunction: { keep: ["id", "name"] },
+	geminiFunction: { strings: ["id", "name"] },
 	/** KR8. */
-	geminiInlineData: { keep: ["mimeType", "data"] },
+	geminiInlineData: { strings: ["mimeType", "data"] },
 	/** KR8. */
-	geminiFileData: { keep: ["mimeType", "fileUri"] },
+	geminiFileData: { strings: ["mimeType", "fileUri"] },
 	/** KR8. `code` is masked. */
-	geminiExecutableCode: { keep: ["language"] },
+	geminiExecutableCode: { strings: ["language"] },
 	/** KR8. `output` is masked. */
-	geminiCodeResult: { keep: ["outcome"] },
+	geminiCodeResult: { strings: ["outcome"] },
 	/** KR8: `compaction.preserveData.openaiRemoteCompaction`, classic or `version: "v2"`. */
 	openaiRemoteCompaction: {
 		carrier: true,
-		keep: ["type", "provider", "version"],
-		children: { replacementHistory: "responsesItem", compactionItem: "responsesItem" },
+		strings: ["type", "provider", "version"],
+		objects: { compactionItem: "responsesItem" },
+		elements: { replacementHistory: "responsesItem" },
 	},
-	/** KR8: an `anthropicServerTool` block's `block`. `input` is masked. */
+	/** KR8: an `anthropicServerTool` block's `block`, by its `type` for its `content`. `input` is masked. */
 	serverToolBlock: {
 		carrier: true,
-		keep: ["type", "id", "name", "tool_use_id"],
-		children: { cache_control: "cacheControl", content: "serverToolContent" },
+		strings: ["type", "id", "name", "tool_use_id"],
+		objects: { cache_control: "cacheControl" },
+		variants: {
+			key: "type",
+			by: {
+				/** KR8: its results, or its error object. */
+				web_search_tool_result: {
+					objects: { content: "webSearchError" },
+					elements: { content: "webSearchResult" },
+				},
+				/** KR8: its search result or error object. */
+				tool_search_tool_result: { objects: { content: "toolSearchContent" } },
+			},
+		},
 	},
 	/** KR8: an `anthropicServerTool` block's `block.cache_control`. */
-	cacheControl: { keep: ["type", "ttl", "scope"] },
-	/** KR8: a server-tool result, error or tool search result. `url`, `title` and `page_age` are masked. */
-	serverToolContent: {
-		keep: ["type", "encrypted_content", "error_code"],
-		children: { tool_references: "toolReference" },
+	cacheControl: { strings: ["type", "ttl", "scope"] },
+	/** KR8: an element of a `web_search_tool_result`'s `content[]`: only a `web_search_result` keeps fields. `url`, `title` and `page_age` are masked. */
+	webSearchResult: {
+		variants: { key: "type", by: { web_search_result: { strings: ["type", "encrypted_content"] } } },
 	},
-	/** KR8. */
-	toolReference: { keep: ["type", "tool_name"] },
+	/** KR8: a `web_search_tool_result`'s object `content`: only a `web_search_tool_result_error` keeps fields. */
+	webSearchError: {
+		variants: { key: "type", by: { web_search_tool_result_error: { strings: ["type", "error_code"] } } },
+	},
+	/** KR8: a `tool_search_tool_result`'s object `content`: only its search result and its error keep fields. */
+	toolSearchContent: {
+		variants: {
+			key: "type",
+			by: {
+				/** KR8. */
+				tool_search_tool_search_result: { strings: ["type"], elements: { tool_references: "toolReference" } },
+				/** KR8. */
+				tool_search_tool_result_error: { strings: ["type", "error_code"] },
+			},
+		},
+	},
+	/** KR8: an element of a tool search result's `tool_references[]`: only a `tool_reference` keeps fields. */
+	toolReference: { variants: { key: "type", by: { tool_reference: { strings: ["type", "tool_name"] } } } },
 	/**
 	 * KR9: `compaction.preserveData.snapcompact`, and the archive of its `withoutThinking`. `text`,
 	 * `textHead`, `textTail` and `withoutThinking.summary` are masked.
 	 */
-	snapcompact: { carrier: true, children: { frames: "snapcompactFrame", withoutThinking: "snapcompactView" } },
+	snapcompact: {
+		carrier: true,
+		objects: { withoutThinking: "snapcompactView" },
+		elements: { frames: "snapcompactFrame" },
+	},
+	/** KR9: an element of a snapcompact archive's `frames[]`. */
+	snapcompactFrame: { strings: ["data", "mimeType", "detail", "font", "variant"] },
 	/** KR9. */
-	snapcompactFrame: { keep: ["data", "mimeType", "detail", "font", "variant"] },
-	/** KR9. */
-	snapcompactView: { children: { archive: "snapcompact" } },
+	snapcompactView: { objects: { archive: "snapcompact" } },
 	/** KR11: a `/btw` record. `question`, `answer` and `error` are masked. */
-	btwRecord: { keep: ["id", "leafId", "status"], children: { images: "btwImage", followUps: "btwTurn" } },
-	/** KR11: a `/btw` follow-up. `question`, `answer` and `error` are masked. */
-	btwTurn: { keep: ["status"], children: { images: "btwImage" } },
-	/** KR7, KR11: an image of a `/btw` record or follow-up. */
-	btwImage: { keep: ["type", "data", "mimeType"] },
+	btwRecord: { strings: ["id", "leafId", "status"], elements: { images: "btwImage", followUps: "btwTurn" } },
+	/** KR11: an element of a `/btw` record's `followUps[]`. `question`, `answer` and `error` are masked. */
+	btwTurn: { strings: ["status"], elements: { images: "btwImage" } },
+	/** KR7, KR11: an element of a `/btw` record's or follow-up's `images[]`. */
+	btwImage: { strings: ["type", "data", "mimeType"] },
 };
 
 /**
@@ -489,12 +562,15 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
  * provider replay state that changes is dropped whole.
  */
 export function maskSessionEntry<T>(entry: T, mask: SessionStoreMask | null): T {
-	return mask === null || mask.empty ? entry : (maskValue(entry, mask, POSITIONS.entry) as T);
+	if (mask === null || mask.empty) return entry;
+	if (!isPlainObject(entry)) return maskFree(entry, "", mask) as T;
+	return maskObject(entry, mask, entry.type === "session" ? POSITIONS.header : POSITIONS.entry) as T;
 }
 
 /** `record`, a `/btw` history record, with every held secret replaced by its marker, for the stored copy only. */
 export function maskBtwRecord<T>(record: T, mask: SessionStoreMask | null): T {
-	return mask === null || mask.empty ? record : (maskValue(record, mask, POSITIONS.btwRecord) as T);
+	if (mask === null || mask.empty) return record;
+	return (isPlainObject(record) ? maskObject(record, mask, POSITIONS.btwRecord) : maskFree(record, "", mask)) as T;
 }
 
 /**
@@ -502,7 +578,7 @@ export function maskBtwRecord<T>(record: T, mask: SessionStoreMask | null): T {
  * subagent's yield data: no field in it is kept. The value itself is masked, never dropped.
  */
 export function maskStoredData<T>(value: T, mask: SessionStoreMask | null): T {
-	return mask === null || mask.empty ? value : (maskValue(value, mask, undefined) as T);
+	return mask === null || mask.empty ? value : (maskFree(value, "", mask) as T);
 }
 
 /** `update` with its title masked, so the store's title field holds what the title slot holds. */
@@ -512,20 +588,94 @@ export function maskTitleUpdate(update: SessionTitleUpdate, mask: SessionStoreMa
 	return title === update.title ? update : { ...update, title };
 }
 
-/** `value` masked at `at`; `undefined` is free data, where every string is masked. */
-function maskValue(value: unknown, mask: SessionStoreMask, at: Position | undefined): unknown {
+/**
+ * `value`, free content under `key` of its holder (an array index as a number), masked in the form
+ * `stringifyJson` writes it; `value` itself when masking leaves that form unchanged.
+ */
+function maskFree(value: unknown, key: string | number, mask: SessionStoreMask): unknown {
 	if (typeof value === "string") return mask.maskText(value);
-	if (Array.isArray(value)) return maskArray(value, mask, at, false);
-	return isRecord(value) ? maskObject(value, mask, at) : value;
+	if (typeof value !== "object" && typeof value !== "function" && typeof value !== "bigint") return value;
+	if (value === null) return value;
+	const form = storedForm(value, key);
+	let next: unknown;
+	if (typeof form === "string") next = mask.maskText(form);
+	else if (Array.isArray(form)) next = maskArray(form, mask, undefined, false);
+	// A number, a boolean or `null` is written as it is; a function, a symbol or `undefined` not at all.
+	else next = isRecord(form) ? maskObject(form, mask, undefined) : form;
+	return Object.is(next, form) ? value : next;
 }
 
-/** `value` masked at `at`, or {@link DROP} when `at` is a carrier that masking changed. */
-function maskChild(value: unknown, mask: SessionStoreMask, at: Position | undefined): unknown {
-	const next = maskValue(value, mask, at);
-	return next !== value && at?.carrier ? DROP : next;
+/**
+ * What `stringifyJson` writes for `value` under `key` before it reads any key of it: the result of
+ * its callable `toJSON`, not read through `toJSON` again; then a `bigint` as its decimal string and a
+ * boxed `String`, `Number` or `Boolean` as its primitive.
+ */
+function storedForm(value: object | bigint, key: string | number): unknown {
+	const toJSON: unknown =
+		typeof value === "bigint" ? Reflect.get(BigInt.prototype, "toJSON", value) : Reflect.get(value, "toJSON");
+	const form: unknown = typeof toJSON === "function" ? toJSON.call(value, String(key)) : value;
+	if (typeof form === "bigint") return form.toString();
+	return typeof form === "object" && form !== null ? (boxedPrimitive(form) ?? form) : form;
 }
 
-/** `items` masked: each object at `at`, each string kept when `keepStrings`, every nested array as free data. */
+const objectToString = Object.prototype.toString;
+
+/** The primitive a boxed `String`, `Number` or `Boolean` holds, read as `JSON.stringify` reads it; `undefined` for any other object. */
+function boxedPrimitive(value: object): string | number | boolean | undefined {
+	// Without a `Symbol.toStringTag`, the tag names the object's internal slot; with one, each slot is tried.
+	if (!(Symbol.toStringTag in value)) {
+		switch (objectToString.call(value)) {
+			case "[object String]":
+				return String(value);
+			case "[object Number]":
+				return Number(value);
+			case "[object Boolean]":
+				return Boolean.prototype.valueOf.call(value);
+			default:
+				return undefined;
+		}
+	}
+	if (holdsSlot(String.prototype.valueOf, value)) return String(value);
+	if (holdsSlot(Number.prototype.valueOf, value)) return Number(value);
+	return holdsSlot(Boolean.prototype.valueOf, value) ? Boolean.prototype.valueOf.call(value) : undefined;
+}
+
+/** Whether `value` has the internal slot the built-in `valueOf` reads, which throws on any other object. */
+function holdsSlot(valueOf: () => unknown, value: object): boolean {
+	try {
+		valueOf.call(value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Whether `value` is a plain object: an `Object` or `null` prototype, no callable `toJSON`, no boxed primitive. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const prototype: unknown = Object.getPrototypeOf(value);
+	return (
+		(prototype === Object.prototype || prototype === null) &&
+		typeof Reflect.get(value, "toJSON") !== "function" &&
+		boxedPrimitive(value) === undefined
+	);
+}
+
+/** Whether `value` is a real array, written as its elements: no callable `toJSON`. */
+function isRealArray(value: unknown): value is unknown[] {
+	return Array.isArray(value) && typeof Reflect.get(value, "toJSON") !== "function";
+}
+
+/** `value`, a plain object, masked at `at`, or {@link DROP} when `at` is a carrier that masking changed. */
+function maskChild(value: Record<string, unknown>, mask: SessionStoreMask, at: Position): unknown {
+	const next = maskObject(value, mask, at);
+	return next !== value && at.carrier ? DROP : next;
+}
+
+/**
+ * `items`, an array in its stored form, masked: with `at`, each plain-object element at `at`; with
+ * `keepStrings`, each primitive-string element kept; every other element free content.
+ */
 function maskArray(
 	items: unknown[],
 	mask: SessionStoreMask,
@@ -537,15 +687,20 @@ function maskArray(
 	for (let i = 0; i < items.length; i++) {
 		const item = items[i];
 		let next: unknown;
-		if (typeof item === "string") next = keepStrings ? item : mask.maskText(item);
-		else if (Array.isArray(item)) next = maskArray(item, mask, undefined, false);
-		else next = maskChild(item, mask, at);
-		if (copy === undefined) {
-			if (next === item) continue;
-			copy = items.slice(0, i);
+		if (typeof item === "string") {
+			next = keepStrings ? item : mask.maskText(item);
+		} else if (at !== undefined && isPlainObject(item)) {
+			next = maskChild(item, mask, at);
+			if (next !== item && at.variants !== undefined && variantOf(item, at.variants)?.pair) {
+				droppedPair = item[at.variants.key];
+			}
+		} else {
+			next = maskFree(item, i, mask);
 		}
-		if (next !== item && at?.variants && isRecord(item) && variantOf(item, at.variants)?.pair) {
-			droppedPair = item[at.variants.key];
+		if (copy === undefined) {
+			// `Object.is`: a `NaN` left as it is is unchanged.
+			if (Object.is(next, item)) continue;
+			copy = items.slice(0, i);
 		}
 		if (next !== DROP) copy.push(next);
 	}
@@ -555,6 +710,7 @@ function maskArray(
 	return copy.filter(item => !isRecord(item) || item[key] !== droppedPair);
 }
 
+/** `obj`, an object in its stored form, masked at `at`, a listed position of a plain object, or as free content without one. */
 function maskObject(
 	obj: Record<string, unknown>,
 	mask: SessionStoreMask,
@@ -567,9 +723,9 @@ function maskObject(
 	for (const key in obj) {
 		if (!Object.hasOwn(obj, key)) continue;
 		const value = obj[key];
-		const next = maskField(value, mask, at, variant, key);
+		const next = at === undefined ? maskFree(value, key, mask) : maskField(value, mask, at, variant, key);
 		if (copy === undefined) {
-			if (next === value) continue;
+			if (Object.is(next, value)) continue;
 			copy = copyBefore(obj, key, signatureKey);
 		}
 		// A signed block that changed no longer matches its signature: store it unsigned.
@@ -589,33 +745,43 @@ function maskObject(
 	return copy;
 }
 
-/** The value under `key` of an object at `at` (with its `variant`), masked. */
+/**
+ * The value under `key` of a plain object at `at` (with its `variant`), masked by the shape `at`
+ * declares for `key`, judged on the live value; a value of any other shape is free content.
+ */
 function maskField(
 	value: unknown,
 	mask: SessionStoreMask,
-	at: Position | undefined,
+	at: Position,
 	variant: Position | undefined,
 	key: string,
 ): unknown {
-	if (isRecord(value)) return maskChild(value, mask, childPosition(at, variant, key, false));
-	if (typeof value !== "string" && !Array.isArray(value)) return value;
-	// Kept as written: a string the table names here, or each string of an array it names.
-	const kept = at !== undefined && (at.keep?.includes(key) === true || variant?.keep?.includes(key) === true);
-	if (typeof value === "string") return kept ? value : mask.maskText(value);
-	return maskArray(value, mask, childPosition(at, variant, key, true), kept);
+	if (typeof value === "string") return listed(at, variant, "strings", key) ? value : mask.maskText(value);
+	if (isPlainObject(value)) {
+		if (listed(at, variant, "wholeObjects", key)) return value;
+		const child = placed(at, variant, "objects", key);
+		return child === undefined ? maskObject(value, mask, undefined) : maskChild(value, mask, child);
+	}
+	if (isRealArray(value)) {
+		if (listed(at, variant, "stringArrays", key)) return maskArray(value, mask, undefined, true);
+		return maskArray(value, mask, placed(at, variant, "elements", key), false);
+	}
+	return maskFree(value, key, mask);
 }
 
-/** The position of the object under `key`, or of each object item of an array there (`element`), or `undefined` for free data. */
-function childPosition(
-	at: Position | undefined,
+/** Whether `at`'s `field` list, or its variant's, names `key`. */
+function listed(at: Position, variant: Position | undefined, field: ListedField, key: string): boolean {
+	return at[field]?.includes(key) === true || variant?.[field]?.includes(key) === true;
+}
+
+/** The position `at`'s `field` map, or its variant's, places `key` at, or `undefined` for free data. */
+function placed(
+	at: Position,
 	variant: Position | undefined,
+	field: "objects" | "elements",
 	key: string,
-	element: boolean,
 ): Position | undefined {
-	const name =
-		(element ? (ownValue(variant?.items, key) ?? ownValue(at?.items, key)) : undefined) ??
-		ownValue(variant?.children, key) ??
-		ownValue(at?.children, key);
+	const name = ownValue(variant?.[field], key) ?? ownValue(at[field], key);
 	return name === undefined ? undefined : POSITIONS[name];
 }
 
