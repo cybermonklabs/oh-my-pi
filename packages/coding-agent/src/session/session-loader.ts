@@ -120,11 +120,10 @@ export interface VisitEntriesFromFileStreamOptions {
 	 */
 	onBytesConsumed?: (bytes: number) => void;
 	/**
-	 * Storage holding the transcript. Only a file backend streams; a
-	 * key-indexed one (`session.storage: sql`) has no stream to open, so its
-	 * record is read whole and fed through the same parser. Defaults to the
-	 * configured storage, which is what a resumed session's own transcripts
-	 * live in.
+	 * Storage holding the transcript. A storage with `readChunks` (file and
+	 * key-indexed ones such as `session.storage: sql`) streams it; any other is
+	 * read whole and fed through the same parser. Defaults to the configured
+	 * storage, which is what a resumed session's own transcripts live in.
 	 */
 	storage?: SessionStorage;
 }
@@ -261,14 +260,16 @@ function sessionHeaderIdFromPrefix(prefix: Uint8Array, final: boolean): string |
 }
 
 /**
- * The transcript's bytes, as chunks. A file backend streams them, so a
- * multi-megabyte transcript is never held whole; a key-indexed backend
- * (`session.storage: sql`) stores the transcript as one record with no stream
- * to open, so its content arrives as a single chunk — the same read
- * {@link loadSessionFile} already performs on those backends. A missing
- * transcript raises ENOENT from either source, which the caller tolerates.
+ * The transcript's bytes, as chunks: the storage's own chunks where it has
+ * `readChunks`, a file stream for file storage, and otherwise its whole text
+ * as one chunk. A missing transcript raises ENOENT from any source, which the
+ * caller tolerates.
  */
-async function* transcriptByteChunks(filePath: string, storage: SessionStorage): AsyncGenerator<Uint8Array> {
+export async function* transcriptByteChunks(filePath: string, storage: SessionStorage): AsyncGenerator<Uint8Array> {
+	if (storage.readChunks) {
+		yield* storage.readChunks(filePath);
+		return;
+	}
 	if (storage instanceof FileSessionStorage) {
 		yield* Bun.file(filePath).stream();
 		return;
@@ -533,8 +534,9 @@ export async function loadEntriesFromFileStream(
 export function parseSessionEntries(content: string): FileEntry[] {
 	return parseSessionContent(content).entries;
 }
+/** A transcript of {@link STREAM_LOAD_THRESHOLD_BYTES} or more is streamed from any storage that can stream it. */
 function shouldStreamEntries(storage: SessionStorage, size: number): boolean {
-	return storage instanceof FileSessionStorage && size >= STREAM_LOAD_THRESHOLD_BYTES;
+	return storage.readChunks !== undefined && size >= STREAM_LOAD_THRESHOLD_BYTES;
 }
 
 async function loadWithKnownSize(
@@ -626,8 +628,8 @@ export async function loadEntriesFromFile(
 }
 
 /**
- * Visit session entries, using bounded streaming for large file-backed journals.
- * Small files and non-file backends keep the existing full-load path.
+ * Visit session entries, streaming large journals from any storage that has
+ * `readChunks`. Small files and other storages keep the full-load path.
  */
 export async function visitEntriesFromFile(
 	filePath: string,

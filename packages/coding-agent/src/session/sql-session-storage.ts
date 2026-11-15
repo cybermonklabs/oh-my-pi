@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { Snowflake } from "@oh-my-pi/pi-utils";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
@@ -124,13 +125,26 @@ interface DialectQueries {
 	 * Delete every session row whose path starts with `@dir` (its first `@len`
 	 * characters equal it; a character comparison, not `LIKE`, so `%` and `_`
 	 * stay literal and SQLite's ASCII-insensitive `LIKE` cannot match another
-	 * case) and exactly those rows' parts. PostgreSQL and MySQL do both in one
-	 * statement, so the parts deleted are those of the rows deleted: a row
-	 * another client commits between two statements would otherwise keep its
-	 * row and lose its parts under READ COMMITTED. SQLite runs the two
-	 * statements inside `BEGIN IMMEDIATE`, where no other writer runs.
+	 * case) and exactly those rows' parts, then the parts under `@dir` that have
+	 * no row: the staging parts of a full write. PostgreSQL and MySQL delete the
+	 * rows and their parts in one statement, so the parts deleted are those of
+	 * the rows deleted: a row another client commits between two statements
+	 * would otherwise keep its row and lose its parts under READ COMMITTED; the
+	 * second statement deletes only parts whose row it does not see. SQLite runs
+	 * its statements inside `BEGIN IMMEDIATE`, where no other writer runs.
 	 */
 	deleteUnder: Statement[];
+	/**
+	 * Delete the staging parts named from `@low` (`<path>#staging-`) up to, not
+	 * including, `@high`: a primary-key range, and the prefix compared by
+	 * characters too, so a collation that orders the range otherwise can never
+	 * reach another path's parts.
+	 */
+	deleteStaging: Statement;
+	/** Whether {@link deleteStaging} would find any part, read without locking. */
+	hasStaging: Statement;
+	/** The byte length of each staging part of `@path`, row-locked where the dialect can, so no peer deletes one before the swap. */
+	stagedBytes: Statement;
 	insertPart: Statement;
 	renameRow: Statement;
 	renameParts: Statement;
@@ -143,6 +157,10 @@ interface DialectQueries {
 	readSlices: Statement;
 	/** The session's size and its bytes from an offset: the session row's and those of the parts covering the window. */
 	readFrom: Statement;
+	/** The session's size, its row's own content, and the start of the last part at or before `@offset`. */
+	readChunksStart: Statement;
+	/** The next parts from `@next`, in `start_offset` order: one keyset page. */
+	readParts: Statement;
 }
 
 interface IndexRow {
@@ -195,10 +213,38 @@ interface ReadFromRow {
 	bytes: Uint8Array | null;
 }
 
+/** `readChunksStart` row: `first_part` is the start of the last part at or before the offset, -1 when none is. */
+interface ChunksStartRow {
+	byte_len: number | bigint | string | null;
+	content: string;
+	first_part: number | bigint | string;
+}
+
+/** `readParts` row. */
+interface PartRow {
+	start_offset: number | bigint | string;
+	content: string;
+}
+
+/** `stagedBytes` row. */
+interface StagedPartRow {
+	len: number | bigint | string;
+}
+
 const DEFAULT_TABLE = "omp_session_files";
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,56}$/;
 /** Largest part a full write stores; an append stores its line as one part. */
 const PART_BYTES = 1024 * 1024;
+/** Parts one `readChunks` query fetches: four appended parts of up to 4 MiB each keep a page within 16 MiB. */
+const PARTS_PER_PAGE = 4;
+/** Staging parts one transaction of a streamed full write inserts. */
+const STAGING_PARTS_PER_TRANSACTION = 16;
+/** Starts a staging path's suffix: `<path>#staging-<epoch ms, STAGING_EPOCH_DIGITS wide>-<id>`. */
+const STAGING_MARK = "#staging-";
+/** Digits of the epoch in a staging path, fixed so that the names of one path sort by age. */
+const STAGING_EPOCH_DIGITS = 13;
+/** Age at which a staging set is a dead writer's: a live full write finishes far sooner. */
+const STALE_STAGING_MS = 60 * 60 * 1000;
 const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
 /** How long a SQLite connection waits for another process's write lock, when the client sets no wait itself. */
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
@@ -455,11 +501,19 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 					`WITH gone AS (DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir RETURNING path) ` +
 						`DELETE FROM ${parts} WHERE path IN (SELECT path FROM gone)`,
 				),
+				sql(
+					`DELETE FROM ${parts} AS p WHERE substr(p.path, 1, @len) = @dir ` +
+						`AND NOT EXISTS (SELECT 1 FROM ${table} AS r WHERE r.path = p.path)`,
+				),
 			],
 			mysql: [
 				sql(
 					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
 						`WHERE substr(r.path, 1, @len) = @dir`,
+				),
+				sql(
+					`DELETE p FROM ${parts} AS p LEFT JOIN ${table} AS r ON r.path = p.path ` +
+						`WHERE substr(p.path, 1, @len) = @dir AND r.path IS NULL`,
 				),
 			],
 			sqlite: [
@@ -467,6 +521,13 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 				sql(`DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir`),
 			],
 		}[adapter],
+		deleteStaging: sql(`DELETE FROM ${parts} WHERE path >= @low AND path < @high AND substr(path, 1, @len) = @low`),
+		hasStaging: sql(
+			`SELECT 1 AS found FROM ${parts} WHERE path >= @low AND path < @high AND substr(path, 1, @len) = @low LIMIT 1`,
+		),
+		stagedBytes: sql(
+			`SELECT ${contentByteLength} AS len FROM ${parts} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`,
+		),
 		insertPart: sql(`INSERT INTO ${parts} (path, start_offset, content) VALUES (@path, @offset, @content)`),
 		renameRow: sql(
 			`UPDATE ${table} SET path = @dst, mtime_ms = @mtime WHERE path = @src${mysql ? "" : " RETURNING path"}`,
@@ -516,6 +577,14 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 				`AND start_offset + ${contentByteLength} > ${bigint("@offset")} AND start_offset >= (` +
 				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path ` +
 				`AND start_offset <= ${bigint("@offset")})`,
+		),
+		readChunksStart: sql(
+			`SELECT byte_len, content, (SELECT coalesce(max(start_offset), -1) FROM ${parts} ` +
+				`WHERE path = @path AND start_offset <= ${bigint("@offset")}) AS first_part FROM ${table} WHERE path = @path`,
+		),
+		readParts: sql(
+			`SELECT start_offset, content FROM ${parts} WHERE path = @path AND start_offset >= ${bigint("@next")} ` +
+				`ORDER BY start_offset LIMIT ${PARTS_PER_PAGE}`,
 		),
 	};
 }
@@ -567,15 +636,49 @@ function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number
 }
 
 /**
+ * Cut the UTF-8 bytes `chunks` yields into parts of at most `maxBytes`, each
+ * ending on a character boundary, also where a character straddles two
+ * chunks: a cut is made only once the byte after it has arrived.
+ */
+async function* utf8Parts(
+	chunks: AsyncIterable<Uint8Array>,
+	maxBytes: number,
+): AsyncGenerator<{ text: string; byteLength: number }> {
+	let pending: Uint8Array[] = [];
+	let pendingBytes = 0;
+	for await (const chunk of chunks) {
+		pending.push(chunk);
+		pendingBytes += chunk.byteLength;
+		if (pendingBytes <= maxBytes) continue;
+		const bytes = Buffer.concat(pending, pendingBytes);
+		let start = 0;
+		while (bytes.byteLength - start > maxBytes) {
+			let end = start + maxBytes;
+			// Back off continuation bytes (0b10xxxxxx) so no character straddles two parts.
+			while (end > start && (bytes[end] & 0xc0) === 0x80) end--;
+			if (end === start) end = start + maxBytes;
+			yield { text: bytes.toString("utf8", start, end), byteLength: end - start };
+			start = end;
+		}
+		pending = [bytes.subarray(start)];
+		pendingBytes = bytes.byteLength - start;
+	}
+	if (pendingBytes > 0)
+		yield { text: Buffer.concat(pending, pendingBytes).toString("utf8"), byteLength: pendingBytes };
+}
+
+/**
  * SQL-backed implementation of {@link SessionStorage} using `bun:sql`. Each
  * session JSONL file is a row of the session table keyed by `path`, holding
  * its metadata (`byte_len`, `mtime_ms`, title fields), plus rows of
  * `<table>_parts` keyed by (`path`, `start_offset`): an append inserts one
- * part, a full write replaces them with parts of at most 1 MiB. A session's
- * content is the row's `content` (non-empty only for rows an older version
- * wrote) followed by its parts in offset order. This process keeps only a
- * metadata index (`size`, `mtimeMs`) in memory for synchronous `existsSync` /
- * `statSync` / `listFilesSync` calls.
+ * part, a full write replaces them with parts of at most 1 MiB (a streamed
+ * one stages them under `<path>#staging-…` first and swaps them in). A
+ * session's content is the row's `content` (non-empty only for rows an older
+ * version wrote) followed by its parts in offset order, which reads stream a
+ * few parts at a time. This process keeps only a metadata index (`size`,
+ * `mtimeMs`) in memory for synchronous `existsSync` / `statSync` /
+ * `listFilesSync` calls.
  *
  * Works against PostgreSQL, MySQL/MariaDB, and SQLite by selecting the
  * dialect-correct DDL, upsert, row-lock, byte-length, and byte-slice syntax
@@ -869,12 +972,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	async loadIndex(): Promise<SessionStorageIndexEntry[]> {
 		const rows = (await this.#exclusive(() => this.#client.unsafe(this.#q.loadIndex))) as IndexRow[];
 		return rows.map(row => {
-			if (row.byte_len === null) {
-				throw new Error(
-					`SqlSessionStorage: ${this.#table} row ${JSON.stringify(row.path)} has no byte_len; ` +
-						`run the byte_len backfill in ${SCHEMA_DOCS}.`,
-				);
-			}
+			if (row.byte_len === null) throw this.#unmeasured(row.path);
 			return {
 				path: row.path,
 				size: rowNumber(row.byte_len),
@@ -941,12 +1039,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				pieces.push({ offset: rowNumber(row.start_offset), bytes: row.bytes });
 				continue;
 			}
-			if (row.byte_len === null) {
-				throw new Error(
-					`SqlSessionStorage: ${this.#table} row ${JSON.stringify(path)} has no byte_len; ` +
-						`run the byte_len backfill in ${SCHEMA_DOCS}.`,
-				);
-			}
+			if (row.byte_len === null) throw this.#unmeasured(path);
 			size = rowNumber(row.byte_len);
 			head = row.bytes;
 		}
@@ -954,6 +1047,61 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const bytes = joinSliceBytes(head, pieces);
 		// Each piece is capped on its own; the window is capped as a whole.
 		return { text: utf8Decoder.decode(maxBytes === undefined ? bytes : bytes.subarray(0, take)), size };
+	}
+
+	/**
+	 * The stored bytes from `fromByte`: the row's own content when it holds
+	 * any, then the parts in `start_offset` order, {@link PARTS_PER_PAGE} per
+	 * query, each part a chunk of its own. The read stops at the size its first
+	 * query saw, so an append made meanwhile is left out. A part that does not
+	 * start where the previous one ended, or parts that end short of that size,
+	 * mean a full write or a delete replaced the parts during the read; it then
+	 * fails instead of yielding a mix of two bodies.
+	 */
+	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
+		const [row] = (await this.#exclusive(() =>
+			run(this.#client, this.#q.readChunksStart, { path, offset: fromByte }),
+		)) as ChunksStartRow[];
+		if (!row) throw enoent(path);
+		if (row.byte_len === null) throw this.#unmeasured(path);
+		const size = rowNumber(row.byte_len);
+		const head = Buffer.from(row.content, "utf8");
+		if (fromByte < head.byteLength) yield head.subarray(fromByte);
+		if (fromByte >= size) return;
+		const firstPart = rowNumber(row.first_part);
+		let next = firstPart < 0 ? head.byteLength : firstPart;
+		let skip = Math.max(0, fromByte - next);
+		while (next < size) {
+			const parts = (await this.#exclusive(() => run(this.#client, this.#q.readParts, { path, next }))) as PartRow[];
+			for (const part of parts) {
+				const start = rowNumber(part.start_offset);
+				if (start !== next) throw this.#replacedDuringRead(path);
+				if (start >= size) break;
+				const bytes = Buffer.from(part.content, "utf8");
+				next = start + bytes.byteLength;
+				if (skip >= bytes.byteLength) {
+					skip -= bytes.byteLength;
+					continue;
+				}
+				yield skip > 0 ? bytes.subarray(skip) : bytes;
+				skip = 0;
+			}
+			if (parts.length < PARTS_PER_PAGE) break;
+		}
+		if (next !== size) throw this.#replacedDuringRead(path);
+	}
+
+	#unmeasured(path: string): Error {
+		return new Error(
+			`SqlSessionStorage: ${this.#table} row ${JSON.stringify(path)} has no byte_len; ` +
+				`run the byte_len backfill in ${SCHEMA_DOCS}.`,
+		);
+	}
+
+	#replacedDuringRead(path: string): Error {
+		return new Error(
+			`SqlSessionStorage: ${JSON.stringify(path)} was replaced or removed while it was read; read it again.`,
+		);
 	}
 
 	async writeFull(
@@ -964,33 +1112,111 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		expectedSize?: number | null,
 	): Promise<void> {
 		const bytes = Buffer.from(content, "utf8");
+		await this.#transaction(async transaction => {
+			await this.#replaceRow(transaction, path, mtimeMs, title, bytes.byteLength, expectedSize);
+			// A created session also drops parts orphaned under its path.
+			await this.#deleteParts(transaction, path);
+			await this.#insertParts(transaction, path, bytes);
+		});
+	}
+
+	/**
+	 * {@link writeFull} from a stream. The parts go in under a staging path,
+	 * `<path>#staging-<epoch ms>-<id>`, {@link STAGING_PARTS_PER_TRANSACTION}
+	 * per transaction; then one transaction checks the session's size, checks
+	 * that every staged byte is still there (a staging set another writer
+	 * removed is a conflict), and swaps the staged parts in for the session's.
+	 * Staging parts have no row, so no listing or index sees them. Before it
+	 * writes, the path's staging sets older than {@link STALE_STAGING_MS} go:
+	 * they are a dead writer's. On failure it removes its own.
+	 */
+	async writeFullStream(
+		path: string,
+		chunks: AsyncIterable<Uint8Array>,
+		byteLength: number,
+		mtimeMs: number,
+		title?: SessionTitleUpdate,
+		expectedSize?: number | null,
+	): Promise<void> {
+		const now = Date.now();
+		const prefix = `${path}${STAGING_MARK}`;
+		const stagingAt = (epochMs: number): string => `${prefix}${String(epochMs).padStart(STAGING_EPOCH_DIGITS, "0")}`;
+		await this.#transaction(transaction =>
+			this.#deleteStaging(transaction, prefix, stagingAt(now - STALE_STAGING_MS)),
+		);
+		const staging = `${stagingAt(now)}-${Snowflake.next()}`;
+		try {
+			let staged = 0;
+			let batch: Array<{ offset: number; content: string }> = [];
+			const insertBatch = async (): Promise<void> => {
+				const parts = batch;
+				batch = [];
+				await this.#transaction(async transaction => {
+					for (const part of parts) await run(transaction, this.#q.insertPart, { path: staging, ...part });
+				});
+			};
+			for await (const part of utf8Parts(chunks, PART_BYTES)) {
+				batch.push({ offset: staged, content: part.text });
+				staged += part.byteLength;
+				if (batch.length === STAGING_PARTS_PER_TRANSACTION) await insertBatch();
+			}
+			if (batch.length > 0) await insertBatch();
+			if (staged !== byteLength) {
+				throw new Error(`SqlSessionStorage: a full write of ${path} streamed ${staged} bytes, not ${byteLength}`);
+			}
+			await this.#transaction(async transaction => {
+				await this.#replaceRow(transaction, path, mtimeMs, title, byteLength, expectedSize);
+				const stagedParts = (await run(transaction, this.#q.stagedBytes, { path: staging })) as StagedPartRow[];
+				const found = stagedParts.reduce((total, part) => total + rowNumber(part.len), 0);
+				if (found !== byteLength) throw new SessionWriteConflictError(path, byteLength, found);
+				await this.#deleteParts(transaction, path);
+				await run(transaction, this.#q.renameParts, { src: staging, dst: path });
+			});
+		} catch (err) {
+			try {
+				await this.#transaction(transaction => this.#deleteParts(transaction, staging));
+			} catch {
+				// The write's own failure is the one to report; the path's next full write removes this set once it is stale.
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Lock `path`'s row for a full write and give it the new metadata: insert
+	 * it when `expectedSize` is null (a conflict when it exists), otherwise
+	 * check its `byte_len` against `expectedSize` when given, then upsert it.
+	 */
+	async #replaceRow(
+		transaction: SqlSessionStorageTransaction,
+		path: string,
+		mtimeMs: number,
+		title: SessionTitleUpdate | undefined,
+		byteLength: number,
+		expectedSize: number | null | undefined,
+	): Promise<void> {
 		const row = {
 			path,
 			mtime: mtimeMs,
 			title: title?.title ?? null,
 			title_source: title?.source ?? null,
 			title_updated_at: title?.updatedAt ?? null,
-			len: bytes.byteLength,
+			len: byteLength,
 		};
-		await this.#transaction(async transaction => {
-			if (expectedSize === null) {
-				const result = await run(transaction, this.#q.insertRowIfMissing, row);
-				const inserted = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
-				if (!inserted) throw new SessionWriteConflictError(path, null, await this.#lockSize(transaction, path));
-			} else {
-				// The size check reads `byte_len` under the row lock rather than
-				// trusting a conditional UPDATE's row count, which MySQL reports
-				// as 0 for a matched row whose values did not change.
-				if (expectedSize !== undefined) {
-					const actualSize = await this.#lockSize(transaction, path);
-					if (actualSize !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
-				}
-				await run(transaction, this.#q.upsertRow, row);
-			}
-			// A created session also drops parts orphaned under its path.
-			await this.#deleteParts(transaction, path);
-			await this.#insertParts(transaction, path, bytes);
-		});
+		if (expectedSize === null) {
+			const result = await run(transaction, this.#q.insertRowIfMissing, row);
+			const inserted = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
+			if (!inserted) throw new SessionWriteConflictError(path, null, await this.#lockSize(transaction, path));
+			return;
+		}
+		// The size check reads `byte_len` under the row lock rather than
+		// trusting a conditional UPDATE's row count, which MySQL reports
+		// as 0 for a matched row whose values did not change.
+		if (expectedSize !== undefined) {
+			const actualSize = await this.#lockSize(transaction, path);
+			if (actualSize !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
+		}
+		await run(transaction, this.#q.upsertRow, row);
 	}
 
 	async #lockSize(transaction: SqlSessionStorageTransaction, path: string): Promise<number | null> {
@@ -1045,7 +1271,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// Every row first: their locks must all be held before the first parts look (see #deleteParts).
 			for (const path of paths) await run(transaction, this.#q.deleteRow, { path });
 			if (under) for (const query of this.#q.deleteUnder) await run(transaction, query, under);
-			for (const path of paths) await this.#deleteParts(transaction, path);
+			for (const path of paths) {
+				await this.#deleteParts(transaction, path);
+				await this.#deleteStagingOf(transaction, path);
+			}
 		});
 	}
 
@@ -1074,6 +1303,27 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// parts orphaned under `dst` go, then `src`'s follow its row.
 			await this.#deleteParts(transaction, dst);
 			await run(transaction, this.#q.renameParts, { src, dst });
+			// Staging sets stay under the name their writer staged them for: the
+			// source's are left with no session, and so are a replaced destination's.
+			await this.#deleteStagingOf(transaction, src);
+			if (!noReplace) await this.#deleteStagingOf(transaction, dst);
 		});
+	}
+
+	/** Delete every staging set of `path`, whatever its age: a path that goes takes its unfinished full writes with it. */
+	#deleteStagingOf(transaction: SqlSessionStorageTransaction, path: string): Promise<void> {
+		const prefix = `${path}${STAGING_MARK}`;
+		// The largest epoch bounds every name: code-point and locale collations alike order
+		// staging names by their epoch digits, while a punctuation bound sorts before digits
+		// in some (ICU puts ":" before "0").
+		return this.#deleteStaging(transaction, prefix, `${prefix}${"9".repeat(STAGING_EPOCH_DIGITS)}`);
+	}
+
+	/** Delete the staging parts whose names run from `low` (a path's staging prefix) up to, not including, `high`. */
+	async #deleteStaging(transaction: SqlSessionStorageTransaction, low: string, high: string): Promise<void> {
+		const range = { low, high, len: [...low].length };
+		// As in #deleteParts: on MySQL a DELETE that matches nothing still takes a gap lock.
+		if (this.#adapter === "mysql" && (await run(transaction, this.#q.hasStaging, range)).length === 0) return;
+		await run(transaction, this.#q.deleteStaging, range);
 	}
 }

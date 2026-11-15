@@ -263,6 +263,13 @@ export interface SessionStorage {
 	 */
 	readTextFrom?(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }>;
 	/**
+	 * The file's bytes from byte `fromByte` (default 0) to its end, as chunks in
+	 * order, so a reader never holds the whole transcript. Iterating a missing
+	 * file rejects with ENOENT. Optional: callers on backends without it read the
+	 * whole text.
+	 */
+	readChunks?(path: string, fromByte?: number): AsyncIterable<Uint8Array>;
+	/**
 	 * Feed each line of the file to `visit`, in order, until it returns true or
 	 * the file ends. Lets callers find records that fall between the bounded
 	 * {@link readTextSlices} windows. Optional: backends without cheap full scans
@@ -730,21 +737,39 @@ export function probeSessionLeases(sessionIds: readonly string[]): SessionLeaseR
 	return report;
 }
 
-/** Approximate size (UTF-16 units synchronously, bytes through a sink) buffered per staging-file write when streaming a body. */
-const LINE_STREAM_CHUNK = 1 << 20;
+/** Approximate size (UTF-16 units synchronously, bytes through a sink or a spool read) buffered per write or read when streaming a body. */
+export const LINE_STREAM_CHUNK = 1 << 20;
+
+/**
+ * Write `lines` at `fd`'s position in chunks of about {@link LINE_STREAM_CHUNK}
+ * UTF-16 units, never holding their full concatenation. Returns the UTF-8 bytes
+ * written and the text of the first chunk, which holds the first line unless
+ * that line alone is longer than a chunk.
+ */
+export function writeLinesToDescriptorSync(fd: number, lines: readonly string[]): { bytes: number; head: string } {
+	let bytes = 0;
+	let head: string | undefined;
+	let chunk = "";
+	const flush = (): void => {
+		const encoded = Buffer.from(chunk, "utf8");
+		fs.writeFileSync(fd, encoded);
+		bytes += encoded.byteLength;
+		head ??= chunk;
+		chunk = "";
+	};
+	for (const line of lines) {
+		chunk += line;
+		if (chunk.length >= LINE_STREAM_CHUNK) flush();
+	}
+	if (chunk.length > 0) flush();
+	return { bytes, head: head ?? "" };
+}
 
 /** Write `lines` to a new file at `target` in bounded chunks, never holding their full concatenation. */
 function writeLinesToFileSync(target: string, lines: readonly string[]): void {
 	const fd = fs.openSync(target, "w");
 	try {
-		let chunk = "";
-		for (const line of lines) {
-			chunk += line;
-			if (chunk.length < LINE_STREAM_CHUNK) continue;
-			fs.writeFileSync(fd, chunk);
-			chunk = "";
-		}
-		if (chunk.length > 0) fs.writeFileSync(fd, chunk);
+		writeLinesToDescriptorSync(fd, lines);
 	} finally {
 		fs.closeSync(fd);
 	}
@@ -1183,6 +1208,12 @@ export class FileSessionStorage implements SessionStorage {
 		if (offset >= size) return { text: "", size };
 		const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
 		return { text: await Bun.file(path).slice(offset, end).text(), size };
+	}
+
+	readChunks(path: string, fromByte?: number): AsyncIterable<Uint8Array> {
+		const file = Bun.file(path);
+		// A read from the start streams the file itself, as every whole-file stream here does.
+		return (fromByte ? file.slice(fromByte) : file).stream();
 	}
 
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
