@@ -8,6 +8,7 @@
  * kept byte for byte. Each case runs against every session store backend.
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
@@ -524,6 +525,10 @@ for (const backend of backends) {
 
 describe("session store masking switch", () => {
 	it("hands writers a mask only while masking is on, driven by secrets.maskSessionStore", () => {
+		// The process masker reads only the test's directories, never this machine's environment.
+		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+			new storeMask.SessionStoreMasker({ env: () => ({}), agentDir: tmp.join("agent") }),
+		);
 		expect(storeMask.sessionStoreMaskFor(cwd)).toBeNull();
 		storeMask.setSessionStoreMasking(true);
 		expect(storeMask.sessionStoreMaskFor(cwd)).toBeInstanceOf(storeMask.SessionStoreMask);
@@ -536,6 +541,41 @@ describe("session store masking switch", () => {
 		} finally {
 			release();
 		}
+	});
+
+	it("builds no masker and reads no _FILE path on a write while the setting is off, and does both once it is on", async () => {
+		const tokenFile = tmp.join("token.txt");
+		// The process masker reads only the test's file, never this machine's environment.
+		const build = spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+			new storeMask.SessionStoreMasker({
+				env: () => ({ EXAMPLE_TOKEN_FILE: tokenFile }),
+				agentDir: tmp.join("agent"),
+			}),
+		);
+		const stat = spyOn(fsSync, "statSync");
+		const open = spyOn(fsSync, "openSync");
+		const storage = new FileSessionStorage();
+		const manager = SessionManager.create(cwd, tmp.join("sessions"), storage);
+		await manager.ensureOnDisk();
+
+		manager.appendMessage({ role: "user", content: said(FILE_VALUE), timestamp: NOW });
+		await settle(manager, storage);
+		expect(build).not.toHaveBeenCalled();
+		expect(stat).not.toHaveBeenCalledWith(tokenFile, expect.anything());
+		expect(open).not.toHaveBeenCalledWith(tokenFile, expect.anything());
+
+		// Turned on mid-session: the same manager's next write builds the masker, reads the file and masks.
+		storeMask.setSessionStoreMasking(true);
+		manager.appendMessage({ role: "user", content: said(FILE_VALUE), timestamp: NOW });
+		await settle(manager, storage);
+		expect(build).toHaveBeenCalled();
+		expect(stat).toHaveBeenCalledWith(tokenFile, expect.anything());
+		expect(open).toHaveBeenCalledWith(tokenFile, expect.anything());
+		const stored = storedRecords(await storage.readText(sessionFileOf(manager))).map(
+			record => messageOf(record).content,
+		);
+		expect(stored).toEqual([said(FILE_VALUE), said(FILE_MARKER)]);
+		await manager.close();
 	});
 });
 
