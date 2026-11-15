@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- RPC `prompt_result.error.code` can now be `"session_busy"`: a client built from an older generated Go, Rust or Python SDK reports a parse failure for a busy `prompt_result`, and the Rust SDK's `PromptError.code` field is now the `PromptErrorCode` enum, so Rust code that names `LitCostCap` must use `PromptErrorCode`
+
 ### Added
 
 - Added the default-off `providers.openaiResponsesWebsockets` setting for catalog-supported standard Responses models, independently of Codex; model/request `false` always disables it ([#17354](https://github.com/can1357/oh-my-pi/pull/17354) by [@TatsukiMeng](https://github.com/TatsukiMeng))
@@ -12,7 +16,7 @@
 - RPC `bash` results now say when the output was cut: `elidedBytes`/`elidedLines` for a dropped middle, and `columnTruncatedLines`, `columnTruncatedRange`, `columnDroppedBytes` and `columnMax` for lines cut to the column cap. The Go, Python and Rust SDKs decode them ([#17957](https://github.com/can1357/oh-my-pi/pull/17957) by [@H4vC](https://github.com/H4vC))
 
 ### Fixed
-- In RPC mode, a `prompt` or `abort_and_prompt` that is refused or fails because the agent is busy now carries `code: "session_busy"` on its error response and `error.code: "session_busy"` on its `prompt_result`, as `fork` and `navigate_tree` already do. The Python SDK client keeps that code on the `RpcCommandError` it raises for a late failure. A client built from an older generated Go, Rust or Python SDK reports a parse failure for such a `prompt_result`, and the Rust SDK's `PromptError.code` field is now a `PromptErrorCode` enum
+- In RPC mode, a `prompt` or `abort_and_prompt` that is refused or fails because the agent is busy now carries `code: "session_busy"` on its error response and `error.code: "session_busy"` on its `prompt_result`, as `fork` and `navigate_tree` already do. The Python SDK client keeps that code on the `RpcCommandError` it raises for a late failure
 
 - Long bash output cut in the middle no longer splits a line at the `[…N ln elided…]` marker, and its "Showing lines …" notice now names the lines actually shown, ending at the output's real last line ([#17957](https://github.com/can1357/oh-my-pi/pull/17957) by [@H4vC](https://github.com/H4vC))
 - A bash command that prints nothing and succeeds now returns `(no output, exit code 0)` instead of a bare `(no output)`, so an empty diff or search no longer reads like a failed command ([#17957](https://github.com/can1357/oh-my-pi/pull/17957) by [@H4vC](https://github.com/H4vC))
