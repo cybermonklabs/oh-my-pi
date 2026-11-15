@@ -63,8 +63,11 @@ export interface AgentTranscriptSource {
 	/**
 	 * The UTF-8 text of the transcript at `path` from byte `offset` (a character
 	 * boundary) to its end, or, for a transcript too long to read at once, a
-	 * window of it holding at least one complete line, which the viewer reads on
-	 * from at the next poll; rejects when there is none.
+	 * window of 8 MiB or more from `offset` whose last newline lies in its
+	 * second half; rejects when there is none. The viewer reads from up to 4096
+	 * characters before the end of what it rendered and reads on from the
+	 * window's last complete line at the next poll, so such a window always
+	 * brings it a line it has not rendered.
 	 */
 	readFrom(path: string, offset: number): Promise<string>;
 	parseEntries(text: string): AgentTranscriptEntry[];

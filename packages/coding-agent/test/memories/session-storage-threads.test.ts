@@ -12,6 +12,11 @@ import * as path from "node:path";
 import { buildStage1RolloutItems, collectThreads } from "@oh-my-pi/pi-coding-agent/memories";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import {
+	IndexedSessionStorage,
+	type SessionStorageBackend,
+	type SessionStorageIndexEntry,
+} from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
+import {
 	defaultSessionStorage,
 	FileSessionStorage,
 	type SessionStorage,
@@ -78,6 +83,48 @@ function messageLine(index: number, body: string): string {
 	return JSON.stringify({ type: "message", id: `m${index}`, message });
 }
 
+/** Sessions in a map, read only whole as Redis and SDK backends read them (no `readChunks`), counting the reads. */
+class WholeReadBackend implements SessionStorageBackend {
+	readonly sessions = new Map<string, string>();
+	fullReads = 0;
+
+	init(): Promise<void> {
+		return Promise.resolve();
+	}
+	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
+		return Promise.resolve([]);
+	}
+	readFull(path: string): Promise<string | null> {
+		this.fullReads++;
+		return Promise.resolve(this.sessions.get(path) ?? null);
+	}
+	readSlices(): Promise<[string, string]> {
+		return Promise.reject(new Error("stage 1 reads no slices"));
+	}
+	writeFull(path: string, content: string): Promise<void> {
+		this.sessions.set(path, content);
+		return Promise.resolve();
+	}
+	append(path: string, line: string): Promise<void> {
+		this.sessions.set(path, (this.sessions.get(path) ?? "") + line);
+		return Promise.resolve();
+	}
+	updateSessionTitle(): Promise<void> {
+		return Promise.resolve();
+	}
+	truncate(path: string): Promise<void> {
+		this.sessions.set(path, "");
+		return Promise.resolve();
+	}
+	remove(paths: string[]): Promise<void> {
+		for (const path of paths) this.sessions.delete(path);
+		return Promise.resolve();
+	}
+	move(): Promise<void> {
+		return Promise.reject(new Error("stage 1 moves nothing"));
+	}
+}
+
 describe("memories over the session storage", () => {
 	it.each(backends)("collects the sibling sessions the %s storage holds", async (_name, open) => {
 		using tmp = TempDir.createSync("@omp-memories-storage-");
@@ -126,6 +173,29 @@ describe("memories over the session storage", () => {
 
 		for (const limit of [1, 4000, 100_000, 10_000_000]) {
 			expect(await buildStage1RolloutItems(rollout, limit, storage)).toBe(referenceItems(raw, limit));
+		}
+	});
+
+	it("reads a rollout whole once, not once per window, from an indexed backend without chunked reads", async () => {
+		const backend = new WholeReadBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		const lines = ['{"type":"session","id":"s"}'];
+		let size = 0;
+		// Several 1 MiB windows from either end.
+		for (let i = 0; size < 5_000_000; i++) {
+			const line = messageLine(i, `${i}:${"é".repeat(20_000)}`);
+			lines.push(line);
+			size += line.length + 1;
+		}
+		const raw = `${lines.join("\n")}\n`;
+		const rollout = "/sessions/project/rollout.jsonl";
+		await storage.writeText(rollout, raw);
+
+		for (const limit of [100_000, 10_000_000]) {
+			backend.fullReads = 0;
+			expect(await buildStage1RolloutItems(rollout, limit, storage)).toBe(referenceItems(raw, limit));
+			expect({ limit, fullReads: backend.fullReads }).toEqual({ limit, fullReads: 1 });
 		}
 	});
 });
