@@ -99,7 +99,7 @@ interface DialectQueries {
 	/**
 	 * One append: grow the session row's `byte_len` (taking its row lock), then
 	 * insert the line as a part at the old length. PostgreSQL does both in one
-	 * statement; the other dialects run these in one transaction.
+	 * statement; every dialect runs its list in one transaction.
 	 */
 	append: readonly Statement[];
 	/** The session's `byte_len`, row-locked for the rest of the transaction where the dialect can. */
@@ -618,14 +618,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				await this.#assertSchema();
 				return;
 			}
-			await this.#client.unsafe(this.#q.createTable);
+			await this.#writeAlone(executor => executor.unsafe(this.#q.createTable));
 			// Probe before altering: PostgreSQL's ALTER TABLE waits for every open
 			// transaction on the table even when the column exists.
 			const columns = await this.#columns(this.#table);
 			for (const { column, ddl } of this.#q.addColumns) {
 				if (columns.has(column)) continue;
 				try {
-					await this.#client.unsafe(ddl);
+					await this.#writeAlone(executor => executor.unsafe(ddl));
 				} catch (err) {
 					// Another process starting at the same moment added it first.
 					if (!isDuplicateColumnError(err)) throw err;
@@ -634,9 +634,31 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// MySQL's UPDATE locks every row it scans, so a no-op backfill would
 			// still wait for, and block, every write in flight.
 			if ((await this.#client.unsafe(this.#q.findUnmeasured)).length > 0) {
-				await this.#client.unsafe(this.#q.backfillByteLen);
+				await this.#writeAlone(executor => executor.unsafe(this.#q.backfillByteLen));
 			}
-			await this.#client.unsafe(this.#q.createPartsTable);
+			await this.#writeAlone(executor => executor.unsafe(this.#q.createPartsTable));
+		});
+	}
+
+	/** Run one write alone: on PostgreSQL in its own read-write transaction (see `#readWrite`), else on the client. */
+	#writeAlone(write: (executor: SqlSessionStorageTransaction) => Promise<unknown>): Promise<unknown> {
+		return this.#adapter === "postgres" ? this.#readWrite(write) : write(this.#client);
+	}
+
+	/**
+	 * Run `work` in one PostgreSQL transaction whose first statement is
+	 * `SET TRANSACTION READ WRITE`. A pooled connection can carry another
+	 * client's session-level `default_transaction_read_only = on` (a
+	 * transaction-mode pooler hands one backend to many clients, and a session
+	 * `SET` stays on it); PostgreSQL then refuses every write, even
+	 * `CREATE TABLE IF NOT EXISTS` on a table that exists (SQLSTATE 25006),
+	 * but honours `READ WRITE` set as a transaction's first statement whatever
+	 * that default is. Used on PostgreSQL only.
+	 */
+	#readWrite(work: (transaction: SqlSessionStorageTransaction) => Promise<unknown>): Promise<void> {
+		return this.#client.transaction(async transaction => {
+			await transaction.unsafe("SET TRANSACTION READ WRITE");
+			await work(transaction);
 		});
 	}
 
@@ -661,12 +683,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * Run `work` in one transaction. On SQLite it opens with `BEGIN IMMEDIATE`,
 	 * taking the write lock up front, so a writer in another process makes it
-	 * wait (busy timeout) or fail before anything ran. On PostgreSQL and MySQL
-	 * a transaction the database aborts as a deadlock victim runs again; each
-	 * one recomputes everything under its own locks.
+	 * wait (busy timeout) or fail before anything ran. On PostgreSQL it opens
+	 * read-write (see `#readWrite`). On PostgreSQL and MySQL a transaction the
+	 * database aborts as a deadlock victim runs again; each one recomputes
+	 * everything under its own locks.
 	 */
 	#transaction(work: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void> {
-		if (this.#adapter !== "sqlite") return this.#retryDeadlocks(() => this.#client.transaction(work));
+		if (this.#adapter === "postgres") return this.#retryDeadlocks(() => this.#readWrite(work));
+		if (this.#adapter === "mysql") return this.#retryDeadlocks(() => this.#client.transaction(work));
 		return this.#exclusive(async () => {
 			await this.#client.unsafe("BEGIN IMMEDIATE");
 			try {
@@ -891,23 +915,20 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
 		await this.#exclusive(() =>
-			run(this.#client, this.#q.updateTitle, {
-				path,
-				title: title.title ?? null,
-				title_source: title.source ?? null,
-				title_updated_at: title.updatedAt,
-				mtime: mtimeMs,
-			}),
+			this.#writeAlone(executor =>
+				run(executor, this.#q.updateTitle, {
+					path,
+					title: title.title ?? null,
+					title_source: title.source ?? null,
+					title_updated_at: title.updatedAt,
+					mtime: mtimeMs,
+				}),
+			),
 		);
 	}
 
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {
 		const values = { path, content: line, mtime: mtimeMs, len: Buffer.byteLength(line, "utf8") };
-		const [single, ...rest] = this.#q.append;
-		if (rest.length === 0) {
-			await this.#retryDeadlocks(() => run(this.#client, single, values));
-			return;
-		}
 		await this.#transaction(async transaction => {
 			for (const query of this.#q.append) await run(transaction, query, values);
 		});

@@ -644,12 +644,15 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		const writer = storage.openWriter("/s/p.jsonl");
 		await writer.append("chunk\n");
 		await writer.close();
-		// The append binds only the appended line and never concatenates onto stored content.
+		// The append opens its transaction read-write, then grows the row and
+		// inserts the part in one statement that binds only the appended line
+		// and never concatenates onto stored content.
 		const appended = queries.slice(appendStart);
-		expect(appended).toHaveLength(1);
-		expect(appended[0]?.sql).toContain("INSERT INTO omp_session_files_parts");
-		expect(appended[0]?.sql).not.toContain("||");
-		expect(appended[0]?.values).toEqual(["/s/p.jsonl", expect.any(Number), 6, "chunk\n"]);
+		expect(appended).toHaveLength(2);
+		expect(appended[0]).toEqual({ sql: "SET TRANSACTION READ WRITE", values: undefined });
+		expect(appended[1]?.sql).toContain("INSERT INTO omp_session_files_parts");
+		expect(appended[1]?.sql).not.toContain("||");
+		expect(appended[1]?.values).toEqual(["/s/p.jsonl", expect.any(Number), 6, "chunk\n"]);
 
 		for (const query of queries) {
 			const numbers = [...query.sql.matchAll(/\$(\d+)/g)].map(match => Number(match[1]));
