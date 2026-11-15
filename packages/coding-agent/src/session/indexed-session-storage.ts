@@ -1,15 +1,18 @@
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { toError } from "@oh-my-pi/pi-utils";
+import { Snowflake, toError } from "@oh-my-pi/pi-utils";
 import {
 	childDirNames,
 	childKeyName,
+	LINE_STREAM_CHUNK,
 	SessionWriteConflictError,
 	type SessionStorage,
 	type SessionStorageStat,
 	type SessionStorageWriter,
 	type SessionStorageWriteOptions,
 	type WriteTextAtomicOptions,
+	writeLinesToDescriptorSync,
 } from "./session-storage";
 import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
 import { eexist, enoent } from "./session-storage-errors";
@@ -18,6 +21,7 @@ import {
 	overlayTitleSlotPrefix,
 	parseTitleSlotFromContent,
 	type SessionTitleUpdate,
+	serializeTitleSlot,
 	titleUpdateFromSlot,
 } from "./session-title-slot";
 
@@ -44,12 +48,33 @@ export interface SessionStorageBackend {
 	 */
 	readFrom?(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null>;
 	/**
+	 * The stored bytes from byte `fromByte` to the end, as chunks in order:
+	 * what {@link readFull} returns from that offset, without holding it whole.
+	 * Iterating rejects with ENOENT when `path` holds no session. Optional:
+	 * without it the storage reads the whole session and cuts it.
+	 */
+	readChunks?(path: string, fromByte: number): AsyncIterable<Uint8Array>;
+	/**
 	 * Replace content, atomically rejecting when the shared backend's current
 	 * UTF-8 byte length differs from `expectedSize`.
 	 */
 	writeFull(
 		path: string,
 		content: string,
+		mtimeMs: number,
+		title?: SessionTitleUpdate,
+		expectedSize?: number | null,
+	): Promise<void>;
+	/**
+	 * {@link writeFull} of the UTF-8 bytes `chunks` yields, `byteLength` in all,
+	 * without holding them whole; the same size check, and the content replaced
+	 * all at once. Optional: without it the storage reads the spooled body back
+	 * whole and calls {@link writeFull}.
+	 */
+	writeFullStream?(
+		path: string,
+		chunks: AsyncIterable<Uint8Array>,
+		byteLength: number,
 		mtimeMs: number,
 		title?: SessionTitleUpdate,
 		expectedSize?: number | null,
@@ -149,6 +174,178 @@ function uniquePaths(paths: readonly string[]): string[] {
 function titleUpdateForIndex(entry: IndexEntry): SessionTitleUpdate | undefined {
 	if (!entry.titleUpdatedAt) return undefined;
 	return { title: entry.title, source: entry.titleSource, updatedAt: entry.titleUpdatedAt };
+}
+
+/** Directory under the OS temp directory holding full-write bodies until their backend publish settles. */
+const SPOOL_DIR = "omp-spool";
+/**
+ * Age at which a spool file is a dead process's. Only Windows leaves one
+ * behind: POSIX unlinks a spool file as soon as it is open, while Windows
+ * removes it after the publish, so a killed process's file is swept at the
+ * next start.
+ */
+const STALE_SPOOL_MS = 60 * 60 * 1000;
+let staleSpoolsSwept = false;
+
+/** One full write: its size and title slot, its backend publish, and the read-back after a failed publish. */
+interface FullBody {
+	byteLength: number;
+	title: SessionTitleUpdate | undefined;
+	publish(mtimeMs: number, expectedSize: number | null | undefined): Promise<void>;
+	/** Whether the backend holds exactly this body. */
+	isStored(): Promise<boolean>;
+	/** Free what the body holds, once its publish (and any read-back) has settled. */
+	release?: () => void;
+}
+
+/**
+ * A full-write body written to a temporary file, so the lines a caller hands
+ * over are not held a second time while the publish waits in the path queue.
+ * It is read back through its descriptor.
+ */
+class BodySpool {
+	readonly #fd: number;
+	/** The file to remove on close; unset on POSIX, where it was unlinked once open. */
+	readonly #file: string | undefined;
+	#closed = false;
+
+	constructor(
+		fd: number,
+		file: string | undefined,
+		readonly byteLength: number,
+		readonly title: SessionTitleUpdate | undefined,
+	) {
+		this.#fd = fd;
+		this.#file = file;
+	}
+
+	/** The body in reads of {@link LINE_STREAM_CHUNK} bytes, each a buffer of its own. */
+	async *chunks(): AsyncGenerator<Uint8Array> {
+		for (let position = 0; position < this.byteLength;) {
+			const buffer = Buffer.allocUnsafe(Math.min(LINE_STREAM_CHUNK, this.byteLength - position));
+			const read = await readAt(this.#fd, buffer, position);
+			if (read === 0) throw new Error(`Session body spool ended at byte ${position} of ${this.byteLength}`);
+			position += read;
+			yield read === buffer.byteLength ? buffer : buffer.subarray(0, read);
+		}
+	}
+
+	/** The whole body as one string, for a backend that has no streamed full write. */
+	text(): string {
+		const bytes = Buffer.allocUnsafe(this.byteLength);
+		for (let position = 0; position < bytes.byteLength;) {
+			const read = fs.readSync(this.#fd, bytes, position, bytes.byteLength - position, position);
+			if (read === 0) throw new Error(`Session body spool ended at byte ${position} of ${this.byteLength}`);
+			position += read;
+		}
+		return bytes.toString("utf-8");
+	}
+
+	close(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		try {
+			fs.closeSync(this.#fd);
+			if (this.#file) fs.rmSync(this.#file, { force: true });
+		} catch {
+			// A Windows file still in use is swept at the next start.
+		}
+	}
+}
+
+function readAt(fd: number, buffer: Uint8Array, position: number): Promise<number> {
+	const { promise, resolve, reject } = Promise.withResolvers<number>();
+	fs.read(fd, buffer, 0, buffer.byteLength, position, (err, bytesRead) => {
+		if (err) reject(err);
+		else resolve(bytesRead);
+	});
+	return promise;
+}
+
+/** Remove spool files a killed process left behind; Windows only, once per process. */
+function sweepStaleSpools(dir: string): void {
+	if (staleSpoolsSwept) return;
+	staleSpoolsSwept = true;
+	const cutoff = Date.now() - STALE_SPOOL_MS;
+	for (const name of fs.readdirSync(dir)) {
+		const file = path.join(dir, name);
+		try {
+			if (fs.statSync(file).mtimeMs < cutoff) fs.rmSync(file, { force: true });
+		} catch {
+			// Removed by another process meanwhile, or still open in one.
+		}
+	}
+}
+
+/**
+ * Spool `lines` to a new file under `<os temp>/omp-spool`, counting its bytes
+ * and reading the title slot from its first line.
+ */
+function spoolLines(lines: readonly string[]): BodySpool {
+	const dir = path.join(os.tmpdir(), SPOOL_DIR);
+	fs.mkdirSync(dir, { recursive: true });
+	const windows = process.platform === "win32";
+	if (windows) sweepStaleSpools(dir);
+	const file = path.join(dir, `${process.pid}-${Snowflake.next()}.spool`);
+	const fd = fs.openSync(file, "wx+", 0o600);
+	try {
+		if (!windows) fs.unlinkSync(file);
+		const { bytes, head } = writeLinesToDescriptorSync(fd, lines);
+		return new BodySpool(fd, windows ? file : undefined, bytes, titleUpdateFromSlot(parseTitleSlotFromContent(head)));
+	} catch (err) {
+		new BodySpool(fd, file, 0, undefined).close();
+		throw err;
+	}
+}
+
+/** The SHA-256 of `chunks` and their byte count. */
+async function digestChunks(chunks: AsyncIterable<Uint8Array>): Promise<{ byteLength: number; digest: string }> {
+	const hasher = new Bun.CryptoHasher("sha256");
+	let total = 0;
+	for await (const chunk of chunks) {
+		hasher.update(chunk);
+		total += chunk.byteLength;
+	}
+	return { byteLength: total, digest: hasher.digest("hex") };
+}
+
+/**
+ * `chunks` with the title slot laid over their first
+ * {@link SESSION_TITLE_SLOT_BYTES} bytes, as {@link overlayTitleSlotPrefix}
+ * lays it over a head window, from byte `fromByte` on.
+ */
+async function* overlayTitleSlotChunks(
+	chunks: AsyncIterable<Uint8Array>,
+	title: SessionTitleUpdate,
+	fromByte: number,
+): AsyncGenerator<Uint8Array> {
+	const slot = Buffer.from(serializeTitleSlot(title), "utf-8");
+	let head: Uint8Array[] | undefined = [];
+	let headBytes = 0;
+	let skip = fromByte;
+	const overlaid = (): Buffer => {
+		// A fresh buffer: the slot never writes into a chunk the backend handed out.
+		const bytes = Buffer.concat(head ?? [], headBytes);
+		slot.copy(bytes, 0, 0, Math.min(slot.byteLength, bytes.byteLength));
+		head = undefined;
+		return bytes;
+	};
+	for await (const chunk of chunks) {
+		let out = chunk;
+		if (head) {
+			head.push(chunk);
+			headBytes += chunk.byteLength;
+			if (headBytes < slot.byteLength) continue;
+			out = overlaid();
+		}
+		if (skip >= out.byteLength) {
+			skip -= out.byteLength;
+			continue;
+		}
+		yield skip > 0 ? out.subarray(skip) : out;
+		skip = 0;
+	}
+	if (head && headBytes > skip) yield overlaid().subarray(skip);
 }
 
 export class IndexedSessionStorage implements SessionStorage {
@@ -283,17 +480,68 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void {
 		this.#assertExpectedSize(path, options?.expectedSize);
+		this.#queueFullWrite(path, this.#textBody(path, content), options?.expectedSize);
+	}
+
+	/**
+	 * Streaming {@link writeTextSync}: spools `lines` to a temporary file and
+	 * publishes it from there, so the body is never one string. A subclass or
+	 * spy that intercepts {@link writeTextSync} still sees every full rewrite:
+	 * the lines are then joined and routed through it.
+	 */
+	writeLinesSync(path: string, lines: readonly string[], options?: SessionStorageWriteOptions): void {
+		if (this.writeTextSync !== IndexedSessionStorage.prototype.writeTextSync) {
+			this.writeTextSync(path, lines.join(""), options);
+			return;
+		}
+		this.#assertExpectedSize(path, options?.expectedSize);
+		this.#queueFullWrite(path, this.#spoolBody(path, spoolLines(lines)), options?.expectedSize);
+	}
+
+	/** Install `body` in the index and queue its publish, tracked by {@link drain}. */
+	#queueFullWrite(path: string, body: FullBody, expectedSize: number | null | undefined): void {
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
-		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
-		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
+		this.#setIndex(path, body.byteLength, mtimeMs, body.title ?? null);
 		this.#pushFrame(path, { mtimeMs, previous });
-		const write = this.#enqueuePath(
-			path,
-			() => this.#backend.writeFull(path, content, mtimeMs, title, options?.expectedSize),
-			{ trackDrain: true },
-		);
+		const write = this.#enqueuePath(path, () => body.publish(mtimeMs, expectedSize), { trackDrain: true });
 		this.#trackFrame(path, mtimeMs, write);
+		if (body.release) void write.then(body.release, body.release);
+	}
+
+	#textBody(path: string, content: string): FullBody {
+		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
+		return {
+			byteLength: byteLength(content),
+			title,
+			publish: (mtimeMs, expectedSize) => this.#backend.writeFull(path, content, mtimeMs, title, expectedSize),
+			isStored: async () => (await this.#backend.readFull(path)) === content,
+		};
+	}
+
+	#spoolBody(path: string, spool: BodySpool): FullBody {
+		return {
+			byteLength: spool.byteLength,
+			title: spool.title,
+			publish: (mtimeMs, expectedSize) =>
+				this.#backend.writeFullStream
+					? this.#backend.writeFullStream(
+							path,
+							spool.chunks(),
+							spool.byteLength,
+							mtimeMs,
+							spool.title,
+							expectedSize,
+						)
+					: this.#backend.writeFull(path, spool.text(), mtimeMs, spool.title, expectedSize),
+			// Compared by size and SHA-256, so neither side is read whole.
+			isStored: async () => {
+				const stored = await digestChunks(this.#backendChunks(path, 0));
+				if (stored.byteLength !== spool.byteLength) return false;
+				return stored.digest === (await digestChunks(spool.chunks())).digest;
+			},
+			release: () => spool.close(),
+		};
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
@@ -412,10 +660,50 @@ export class IndexedSessionStorage implements SessionStorage {
 		return { text: bytes.subarray(offset, end).toString("utf-8"), size: bytes.length };
 	}
 
-	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
-		for (const line of (await this.readText(path)).split("\n")) {
-			if (visit(line)) return;
+	/**
+	 * The bytes from byte `fromByte`, read from the backend in chunks. As in
+	 * {@link readTextFrom}, the title slot is synthesized over the stored head,
+	 * so a read that starts inside it reads from the start and overlays it.
+	 */
+	async *readChunks(path: string, fromByte = 0): AsyncGenerator<Uint8Array> {
+		const entry = this.#index.get(path);
+		if (!entry) throw enoent(path);
+		await this.#awaitPath(path);
+		const start = Math.max(0, fromByte);
+		const title = start < SESSION_TITLE_SLOT_BYTES ? titleUpdateForIndex(entry) : undefined;
+		if (title) yield* overlayTitleSlotChunks(this.#backendChunks(path, 0), title, start);
+		else yield* this.#backendChunks(path, start);
+	}
+
+	/** The stored bytes from `fromByte`: the backend's chunks, or its whole read cut there. */
+	async *#backendChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
+		if (this.#backend.readChunks) {
+			yield* this.#backend.readChunks(path, fromByte);
+			return;
 		}
+		const content = await this.#backend.readFull(path);
+		if (content === null) throw enoent(path);
+		const bytes = Buffer.from(content, "utf-8");
+		if (fromByte < bytes.byteLength) yield bytes.subarray(fromByte);
+	}
+
+	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
+		const decoder = new TextDecoder();
+		let pending = "";
+		for await (const chunk of this.readChunks(path)) {
+			let searchFrom = pending.length;
+			pending += decoder.decode(chunk, { stream: true });
+			let start = 0;
+			for (let newline = pending.indexOf("\n", searchFrom); newline !== -1;) {
+				if (visit(pending.slice(start, newline))) return;
+				start = newline + 1;
+				searchFrom = start;
+				newline = pending.indexOf("\n", searchFrom);
+			}
+			pending = pending.slice(start);
+		}
+		// The text after the last newline, "" when the file ends with one, as `split("\n")` yields it.
+		visit(pending + decoder.decode());
 	}
 
 	async writeText(path: string, content: string): Promise<void> {
@@ -433,6 +721,33 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		await this.#publishAtomic(path, options, () => this.#textBody(path, content));
+	}
+
+	/**
+	 * Streaming {@link writeTextAtomic}: spools `lines` to a temporary file and
+	 * publishes it from there, and after a failed publish compares the stored
+	 * bytes with the spool by size and SHA-256. A subclass or spy that
+	 * intercepts {@link writeTextAtomic} still sees every full rewrite: the
+	 * lines are then joined and routed through it.
+	 */
+	async writeLinesAtomic(path: string, lines: readonly string[], options?: WriteTextAtomicOptions): Promise<void> {
+		if (this.writeTextAtomic !== IndexedSessionStorage.prototype.writeTextAtomic) {
+			return this.writeTextAtomic(path, lines.join(""), options);
+		}
+		await this.#publishAtomic(path, options, () => this.#spoolBody(path, spoolLines(lines)));
+	}
+
+	/**
+	 * Publish the body `prepare` makes once the guards pass, then settle the
+	 * optimistic index frame: a failed publish whose body the backend holds
+	 * anyway counts as landed.
+	 */
+	async #publishAtomic(
+		path: string,
+		options: WriteTextAtomicOptions | undefined,
+		prepare: () => FullBody,
+	): Promise<void> {
 		const commitGuard = options?.commitGuard;
 		if (commitGuard && !commitGuard()) return;
 		await this.#awaitPath(path);
@@ -441,43 +756,47 @@ export class IndexedSessionStorage implements SessionStorage {
 		// index or enqueueing the backend publish.
 		if (commitGuard && !commitGuard()) return;
 		this.#assertExpectedSize(path, options?.expectedSize);
-		const previous = this.#index.get(path);
-		const mtimeMs = this.#allocMtimeMs();
-		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
-		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
-		this.#pushFrame(path, { mtimeMs, previous });
+		const body = prepare();
 		try {
-			await this.#enqueuePath(
-				path,
-				async () => {
-					// Final guard immediately before the backend actually publishes.
-					// If a concurrent writer has advanced the index past our
-					// optimistic entry, leave that newer state alone; otherwise
-					// restore the pre-write snapshot so readers do not observe a
-					// body we never wrote.
-					if (commitGuard && !commitGuard()) {
-						const current = this.#index.get(path);
-						if (current?.mtimeMs === mtimeMs) this.#restoreIndex(path, previous);
-						this.#abandonFrame(path, mtimeMs);
+			const previous = this.#index.get(path);
+			const mtimeMs = this.#allocMtimeMs();
+			this.#setIndex(path, body.byteLength, mtimeMs, body.title ?? null);
+			this.#pushFrame(path, { mtimeMs, previous });
+			try {
+				await this.#enqueuePath(
+					path,
+					async () => {
+						// Final guard immediately before the backend actually publishes.
+						// If a concurrent writer has advanced the index past our
+						// optimistic entry, leave that newer state alone; otherwise
+						// restore the pre-write snapshot so readers do not observe a
+						// body we never wrote.
+						if (commitGuard && !commitGuard()) {
+							const current = this.#index.get(path);
+							if (current?.mtimeMs === mtimeMs) this.#restoreIndex(path, previous);
+							this.#abandonFrame(path, mtimeMs);
+							return;
+						}
+						await body.publish(mtimeMs, options?.expectedSize);
+					},
+					{ trackDrain: false },
+				);
+				this.#dropFrame(path, mtimeMs);
+			} catch (err) {
+				const error = toError(err);
+				try {
+					if (await body.isStored()) {
+						this.#dropFrame(path, mtimeMs);
 						return;
 					}
-					await this.#backend.writeFull(path, content, mtimeMs, title, options?.expectedSize);
-				},
-				{ trackDrain: false },
-			);
-			this.#dropFrame(path, mtimeMs);
-		} catch (err) {
-			const error = toError(err);
-			try {
-				if ((await this.#backend.readFull(path)) === content) {
-					this.#dropFrame(path, mtimeMs);
-					return;
+				} catch {
+					// Preserve the original write failure; verification was unavailable.
 				}
-			} catch {
-				// Preserve the original write failure; verification was unavailable.
+				this.#failFrame(path, mtimeMs);
+				throw error;
 			}
-			this.#failFrame(path, mtimeMs);
-			throw error;
+		} finally {
+			body.release?.();
 		}
 	}
 
@@ -582,7 +901,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		// transcripts, so removing the session removes them as the file
 		// backend's delete does.
 		try {
-			await fs.rm(artifactsDir, { recursive: true, force: true });
+			await fs.promises.rm(artifactsDir, { recursive: true, force: true });
 		} catch (err) {
 			const error = toError(err);
 			throw new Error(`Session deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`, {

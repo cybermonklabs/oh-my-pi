@@ -313,6 +313,90 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
+	it("readChunks streams the parts in start_offset order, a part per chunk, from any offset", async () => {
+		const { client, storage } = await createSqlite();
+		const path = "/sessions/p/parts.jsonl";
+		// Three-byte characters put the full write's 1 MiB cut one byte early; each append is a part of its own size.
+		const body = `${"€".repeat(400_000)}\n`;
+		const appends = Array.from({ length: 10 }, (_, n) => `${n}:${"😀".repeat(n * 30_000)}€\n`);
+		await storage.writeText(path, body);
+		const writer = storage.openWriter(path);
+		for (const line of appends) await writer.append(line);
+		await writer.close();
+		const expected = Buffer.from(body + appends.join(""));
+		const partSizes = (
+			(await client.unsafe(
+				`SELECT length(cast(content AS blob)) AS len FROM omp_session_files_parts WHERE path = ? ORDER BY start_offset`,
+				[path],
+			)) as Array<{ len: number }>
+		).map(part => part.len);
+
+		const chunks = await Array.fromAsync(storage.readChunks(path));
+		expect(chunks.map(chunk => chunk.byteLength)).toEqual(partSizes);
+		expect(Buffer.concat(chunks).equals(expected)).toBe(true);
+
+		const bodyBytes = Buffer.byteLength(body);
+		const firstPart = partSizes[0] ?? 0;
+		for (const offset of [
+			1,
+			firstPart - 1,
+			firstPart,
+			firstPart + 1,
+			bodyBytes,
+			bodyBytes + 3,
+			expected.length - 1,
+		]) {
+			const read = Buffer.concat(await Array.fromAsync(storage.readChunks(path, offset)));
+			expect({ offset, equal: read.equals(expected.subarray(offset)) }).toEqual({ offset, equal: true });
+		}
+		expect(await Array.fromAsync(storage.readChunks(path, expected.length))).toEqual([]);
+		expect(await Array.fromAsync(storage.readChunks(path, expected.length + 5))).toEqual([]);
+		await client.end();
+	});
+
+	it("readChunks lays the indexed title over the head as readTextFrom does, across small parts", async () => {
+		const { client, storage } = await createSqlite();
+		const path = "/sessions/p/titled-parts.jsonl";
+		const slot = serializeTitleSlot({ title: "Old", source: "auto", updatedAt: "t1" });
+		const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+		const writer = storage.openWriter(path);
+		// The slot arrives as three parts, so the overlay spans chunks.
+		for (const piece of [slot.slice(0, 100), slot.slice(100, 200), slot.slice(200), header, "tail\n"]) {
+			await writer.append(piece);
+		}
+		await writer.close();
+		await storage.updateSessionTitle(path, { title: "New", source: "user", updatedAt: "t2" });
+
+		for (const offset of [0, 10, 150, 255, 256, 300]) {
+			const chunks = Buffer.concat(await Array.fromAsync(storage.readChunks(path, offset))).toString("utf-8");
+			expect({ offset, chunks }).toEqual({ offset, chunks: (await storage.readTextFrom(path, offset)).text });
+		}
+		const head = Buffer.concat(await Array.fromAsync(storage.readChunks(path))).toString("utf-8");
+		expect(JSON.parse(head.split("\n")[0] ?? "")).toMatchObject({ title: "New", source: "user" });
+		await client.end();
+	});
+
+	it("readChunks fails rather than mix two bodies when a full write replaces the session between pages", async () => {
+		const client = new SQL("sqlite::memory:");
+		const reader = await SqlSessionStorage.create({ client });
+		const rewriter = await SqlSessionStorage.create({ client });
+		const path = "/sessions/p/replaced.jsonl";
+		const writer = reader.openWriter(path);
+		for (let n = 0; n < 8; n++) await writer.append(`{"n":${n}}\n`);
+		await writer.close();
+
+		const chunks = reader.readChunks(path)[Symbol.asyncIterator]();
+		// One page of parts arrives before the rewrite.
+		for (let n = 0; n < 4; n++) expect((await chunks.next()).done).toBe(false);
+		await rewriter.writeText(path, '{"n":"replaced"}\n');
+		const rest = (async () => {
+			let chunk = await chunks.next();
+			while (!chunk.done) chunk = await chunks.next();
+		})();
+		await expect(rest).rejects.toThrow(/replaced or removed while it was read/);
+		await client.end();
+	});
+
 	it("persists title updates as indexed fields across storage reloads", async () => {
 		const client = new SQL("sqlite::memory:");
 		const storage = await SqlSessionStorage.create({ client });

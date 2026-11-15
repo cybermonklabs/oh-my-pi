@@ -36,13 +36,13 @@ import {
 	type SessionTitleUpdate,
 	titleUpdateFromSlot,
 } from "./session-title-slot";
+import { applyEntryPatches } from "./entry-patches";
 import { applyToolResultPrunes } from "./tool-result-prunes";
 
 const LF = new Uint8Array([0x0a]);
 
 const STREAM_LOAD_THRESHOLD_BYTES = 8 * 1024 * 1024;
 const STREAM_YIELD_BYTES = 1 * 1024 * 1024;
-const DIGEST_READ_BYTES = 1 * 1024 * 1024;
 const STREAM_YIELD_ENTRIES = 8_192;
 /** Initial parse window after a malformed record; see the recovery note in visitEntriesFromFileStream. */
 const RECOVERY_PARSE_WINDOW = 64 * 1024;
@@ -125,11 +125,10 @@ export interface VisitEntriesFromFileStreamOptions {
 	 */
 	onChunk?: (chunk: Uint8Array) => void;
 	/**
-	 * Storage holding the transcript. Only a file backend streams; a
-	 * key-indexed one (`session.storage: sql`) has no stream to open, so its
-	 * record is read whole and fed through the same parser. Defaults to the
-	 * configured storage, which is what a resumed session's own transcripts
-	 * live in.
+	 * Storage holding the transcript. A storage with `readChunks` (file and
+	 * key-indexed ones such as `session.storage: sql`) streams it; any other is
+	 * read whole and fed through the same parser. Defaults to the configured
+	 * storage, which is what a resumed session's own transcripts live in.
 	 */
 	storage?: SessionStorage;
 }
@@ -272,14 +271,16 @@ function sessionHeaderIdFromPrefix(prefix: Uint8Array, final: boolean): string |
 }
 
 /**
- * The transcript's bytes, as chunks. A file backend streams them, so a
- * multi-megabyte transcript is never held whole; a key-indexed backend
- * (`session.storage: sql`) stores the transcript as one record with no stream
- * to open, so its content arrives as a single chunk — the same read
- * {@link loadSessionFile} already performs on those backends. A missing
- * transcript raises ENOENT from either source, which the caller tolerates.
+ * The transcript's bytes, as chunks: the storage's own chunks where it has
+ * `readChunks`, a file stream for file storage, and otherwise its whole text
+ * as one chunk. A missing transcript raises ENOENT from any source, which the
+ * caller tolerates.
  */
-async function* transcriptByteChunks(filePath: string, storage: SessionStorage): AsyncGenerator<Uint8Array> {
+export async function* transcriptByteChunks(filePath: string, storage: SessionStorage): AsyncGenerator<Uint8Array> {
+	if (storage.readChunks) {
+		yield* storage.readChunks(filePath);
+		return;
+	}
 	if (storage instanceof FileSessionStorage) {
 		yield* Bun.file(filePath).stream();
 		return;
@@ -548,41 +549,34 @@ export function parseSessionEntries(content: string): FileEntry[] {
 	return parseSessionContent(content).entries;
 }
 /**
+ * A transcript of {@link STREAM_LOAD_THRESHOLD_BYTES} or more is streamed from any storage that can stream it.
  * The streaming path reads raw bytes straight off the file, so an archived
  * (gzipped) transcript always takes the whole-text path, which inflates it.
  */
 function shouldStreamEntries(storage: SessionStorage, filePath: string, size: number): boolean {
-	return (
-		storage instanceof FileSessionStorage && size >= STREAM_LOAD_THRESHOLD_BYTES && !isArchivedSessionPath(filePath)
-	);
+	return storage.readChunks !== undefined && size >= STREAM_LOAD_THRESHOLD_BYTES && !isArchivedSessionPath(filePath);
 }
 
 /**
- * Digest of `filePath`'s current content, read the way {@link loadSessionFile}
- * reads a file of its size: raw bytes for a large file-backed journal, the
- * storage's text otherwise. Equal to a load's
+ * Digest of `filePath`'s current bytes, hashed chunk by chunk as
+ * {@link transcriptByteChunks} yields them, so a transcript the storage
+ * streams is never held whole. Equal to a load's
  * {@link SessionLoadResult.sourceDigest} only when the content is unchanged, so
  * it is a freshness check that trusts no size, mtime, or inode. Throws ENOENT
  * when the session is gone, including a row an indexed backend no longer holds.
- * A large journal is hashed through one reused buffer, so the check adds no
- * memory proportional to the file on top of the parse it follows.
+ *
+ * A file transcript under the 8 MiB streaming threshold is digested at load
+ * from the text `readText` decodes, which differs from the file's bytes only
+ * when the file has a byte-order mark or invalid UTF-8. Such a file reads as
+ * changed here and costs one extra parse, never a wrong answer.
  */
 export async function sessionContentDigest(filePath: string, storage: SessionStorage): Promise<string> {
 	const hasher = new Bun.CryptoHasher(SNAPSHOT_DIGEST_ALGORITHM);
-	if (shouldStreamEntries(storage, filePath, storage.statSync(filePath).size)) {
-		const handle = await fs.open(filePath, "r");
-		try {
-			const buffer = Buffer.allocUnsafe(DIGEST_READ_BYTES);
-			for (;;) {
-				const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, null);
-				if (bytesRead === 0) break;
-				hasher.update(buffer.subarray(0, bytesRead));
-			}
-		} finally {
-			await handle.close();
-		}
-	} else {
+	if (isArchivedSessionPath(filePath)) {
+		// An archived (gzipped) transcript loads through `readText`, which inflates it.
 		hasher.update(await storage.readText(filePath));
+	} else {
+		for await (const chunk of transcriptByteChunks(filePath, storage)) hasher.update(chunk);
 	}
 	return hasher.digest("hex");
 }
@@ -639,16 +633,7 @@ export async function loadSessionFile(
 		const { loaded, sourceSize } = await loadWithKnownSize(filePath, storage, statSize, options);
 		return { ...loaded, sourceSize };
 	} catch (caught) {
-		// Windows reports ENOENT where POSIX reports ENOTDIR for a path running
-		// through a regular file; restore ENOTDIR so that path error is never
-		// masked as a missing session.
-		const err =
-			isEnoent(caught) &&
-			process.platform === "win32" &&
-			storage instanceof FileSessionStorage &&
-			(await hasFileAsPathComponent(filePath))
-				? enotdir(filePath)
-				: caught;
+		const err = await restorePathComponentError(caught, filePath, storage);
 		if (options?.throwIfMissing && (isEnoent(err) || isEnotdir(err))) {
 			throw err;
 		}
@@ -666,6 +651,170 @@ export async function loadSessionFile(
 }
 
 /**
+ * Windows reports ENOENT where POSIX reports ENOTDIR for a path running
+ * through a regular file; restore ENOTDIR so that path error is never masked
+ * as a missing session.
+ */
+async function restorePathComponentError(caught: unknown, filePath: string, storage: SessionStorage): Promise<unknown> {
+	return isEnoent(caught) &&
+		process.platform === "win32" &&
+		storage instanceof FileSessionStorage &&
+		(await hasFileAsPathComponent(filePath))
+		? enotdir(filePath)
+		: caught;
+}
+
+/** What {@link visitSessionFile} read besides the entries it visited. */
+export interface SessionFileVisit {
+	titleSlot: SessionTitleUpdate | undefined;
+	malformedRecords: number;
+	/** Bytes read, or `null` when the path did not exist. */
+	sourceSize: number | null;
+	/** Non-empty session data without a valid leading session header: nothing was visited. */
+	invalidHeader: boolean;
+}
+
+/**
+ * Whether a transcript of `size` bytes streams from `storage` instead of being
+ * read whole. An archived (gzipped) transcript is read whole, as
+ * {@link shouldStreamEntries} reads it.
+ */
+function streamsTranscript(storage: SessionStorage, filePath: string, size: number): boolean {
+	return (
+		size >= STREAM_LOAD_THRESHOLD_BYTES &&
+		(storage.readChunks !== undefined || storage instanceof FileSessionStorage) &&
+		!isArchivedSessionPath(filePath)
+	);
+}
+
+/** Visit the entries of a session read whole, as {@link visitSessionFile} visits a streamed one. */
+export function visitLoadedSession(
+	loaded: SessionLoadResult,
+	visit: (entry: FileEntry) => void | boolean,
+): SessionFileVisit {
+	for (const entry of loaded.invalidHeader ? [] : loaded.entries) {
+		if (visit(entry) === false) break;
+	}
+	return {
+		titleSlot: loaded.titleSlot,
+		malformedRecords: loaded.malformedRecords,
+		sourceSize: loaded.sourceSize ?? null,
+		invalidHeader: loaded.invalidHeader,
+	};
+}
+
+/**
+ * Visit a session's entries in file order, the header first, from any
+ * storage. A transcript of 8 MiB or more streams from file storage or a
+ * storage with `readChunks`, so it is never held whole; a smaller one is read
+ * whole, as {@link loadSessionFile} reads it. Missing files and headers follow
+ * {@link loadSessionFile}: a missing path visits nothing (or throws with
+ * `throwIfMissing`), and a file whose first record is not a valid header
+ * visits nothing. `visit` returning `false` stops the visit.
+ */
+export async function visitSessionFile(
+	filePath: string,
+	storage: SessionStorage,
+	visit: (entry: FileEntry) => void | boolean,
+	options: LoadSessionOptions = {},
+): Promise<SessionFileVisit> {
+	let size: number;
+	try {
+		size = storage.statSync(filePath).size;
+	} catch (caught) {
+		const err = await restorePathComponentError(caught, filePath, storage);
+		if (options.throwIfMissing && (isEnoent(err) || isEnotdir(err))) throw err;
+		if (isEnoent(err)) return { titleSlot: undefined, malformedRecords: 0, sourceSize: null, invalidHeader: false };
+		throw err;
+	}
+	if (!streamsTranscript(storage, filePath, size))
+		return visitLoadedSession(await loadSessionFile(filePath, storage, options), visit);
+
+	let malformedRecords = 0;
+	let sourceSize = 0;
+	let sawEntry = false;
+	let invalidHeader = false;
+	let visitorError: { error: unknown } | undefined;
+	try {
+		const titleSlot = await visitEntriesFromFileStream(
+			filePath,
+			entry => {
+				if (!sawEntry) {
+					sawEntry = true;
+					if (!isValidSessionHeader(entry)) {
+						invalidHeader = true;
+						return false;
+					}
+				}
+				try {
+					return visit(entry);
+				} catch (error) {
+					visitorError = { error };
+					throw error;
+				}
+			},
+			{
+				storage,
+				throwIfMissing: true,
+				onMalformedRecord: () => {
+					malformedRecords++;
+				},
+				onChunk: chunk => {
+					sourceSize += chunk.byteLength;
+				},
+			},
+		);
+		return {
+			titleSlot,
+			malformedRecords,
+			sourceSize,
+			invalidHeader: invalidHeader || (!sawEntry && malformedRecords > 0),
+		};
+	} catch (caught) {
+		if (visitorError) throw visitorError.error;
+		const err = await restorePathComponentError(caught, filePath, storage);
+		if (options.throwIfMissing && (isEnoent(err) || isEnotdir(err))) throw err;
+		if (isEnoent(err)) return { titleSlot: undefined, malformedRecords: 0, sourceSize: null, invalidHeader: false };
+		throw err;
+	}
+}
+
+/**
+ * The header of the session at `filePath`, read the cheapest way: a
+ * transcript {@link visitSessionFile} would read whole is loaded and returned
+ * too, so a caller need not read it twice; a streamed one yields its header
+ * alone. Missing files follow {@link loadSessionFile}.
+ */
+export async function probeSessionFile(
+	filePath: string,
+	storage: SessionStorage,
+	options: LoadSessionOptions = {},
+): Promise<{ header: SessionHeader | undefined; loaded: SessionLoadResult | undefined }> {
+	let streamed = false;
+	try {
+		streamed = streamsTranscript(storage, filePath, storage.statSync(filePath).size);
+	} catch {
+		// A missing or unreadable path: the read below applies loadSessionFile's rules.
+	}
+	if (!streamed) {
+		const loaded = await loadSessionFile(filePath, storage, options);
+		const first = loaded.entries[0];
+		return { header: isValidSessionHeader(first) ? first : undefined, loaded };
+	}
+	const probe: { header?: SessionHeader } = {};
+	await visitSessionFile(
+		filePath,
+		storage,
+		entry => {
+			probe.header = entry as SessionHeader;
+			return false;
+		},
+		options,
+	);
+	return { header: probe.header, loaded: undefined };
+}
+
+/**
  * Load the valid entries from a session file, skipping malformed records.
  * Each call returns freshly parsed entries owned by the caller.
  */
@@ -678,8 +827,8 @@ export async function loadEntriesFromFile(
 }
 
 /**
- * Visit session entries, using bounded streaming for large file-backed journals.
- * Small files and non-file backends keep the existing full-load path.
+ * Visit session entries, streaming large journals from any storage that has
+ * `readChunks`. Small files and other storages keep the full-load path.
  */
 export async function visitEntriesFromFile(
 	filePath: string,
@@ -858,12 +1007,12 @@ export function resolveBlobRefsInEntriesSync(entries: FileEntry[], blobStore: Bl
 
 /**
  * Read-only transcript view of a session file: load entries, migrate to the
- * current version, apply prune records, resolve blob refs, and build the
- * display transcript along the persisted leaf path (last entry). Uses
- * transcript mode (collapsed to the latest compaction) so failed/aborted tail
- * turns stay visible, unlike the provider-context builder which drops them.
- * Does NOT create a writer or take the session lock — safe to call against a
- * file another session is writing.
+ * current version, apply prune and entry patch records, resolve blob refs,
+ * and build the display transcript along the persisted leaf path (last
+ * entry). Uses transcript mode (collapsed to the latest compaction) so
+ * failed/aborted tail turns stay visible, unlike the provider-context builder
+ * which drops them. Does NOT create a writer or take the session lock — safe
+ * to call against a file another session is writing.
  * Reads through `storage`, the storage holding the transcript.
  */
 export async function loadSessionMessagesReadOnly(
@@ -874,6 +1023,7 @@ export async function loadSessionMessagesReadOnly(
 	if (entries.length === 0) return [];
 	migrateToCurrentVersion(entries);
 	applyToolResultPrunes(entries);
+	applyEntryPatches(entries);
 	for (const entry of entries) repairTruncatedSnapcompactFrames(entry);
 	const blobs = new BlobStore(getBlobsDir());
 	const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");

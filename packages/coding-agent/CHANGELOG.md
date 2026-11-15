@@ -44,6 +44,7 @@
 - Fixed agents continuing after a session persistence failure without context about the risk; the next prompt now receives a hidden warning to preserve critical work.
 - Fixed `omp --resume <path>` parsing an unchanged session file twice; large sessions now re-stat for freshness and reparse only after a change.
 - Fixed full rewrites of large file-backed sessions retaining a second transcript-sized serialization; file storage now streams the journal and verifies uncertain publication by an exact streamed comparison.
+- Fixed `omp --resume <path>` reading a session's whole transcript into one string to confirm it is unchanged when its storage can stream it; the check now hashes the transcript as it streams.
 - Fixed subagents whose declared model has no working credentials silently running on the parent session's model: that model's own `retry.fallbackChains` key (`provider/id` or `provider/*`) now decides, as it also does for a declared model missing from the catalog (an empty chain refuses the spawn with an error naming the agent and model, a non-empty chain is walked), and any replacement is marked as a fallback in the session and task result ([#16028](https://github.com/can1357/oh-my-pi/pull/16028) by [@sjawhar](https://github.com/sjawhar))
 - Fixed task results not saying which fallback model answered for a subagent: the `<task-result>` now carries a `<model served=… requested=… fallback="true">` line, with the reason when the model was replaced at spawn ([#16028](https://github.com/can1357/oh-my-pi/pull/16028) by [@sjawhar](https://github.com/sjawhar))
 - Fixed a subagent with a `task.agentAccountPools` entry failing with a raw "restricted to its OAuth account pool" error when no account it may use can serve its declared model: that model's own `retry.fallbackChains` key now decides at spawn, as it does for any other model that cannot serve ([#16028](https://github.com/can1357/oh-my-pi/pull/16028) by [@sjawhar](https://github.com/sjawhar))
@@ -51,6 +52,7 @@
 - Input an extension forwarded with `pi.sendUserInput(text, { tag })` keeps that tag while it waits in the queue: Esc on a busy session (and RPC `abort_and_restore_queue`) records it in the transcript instead of merging it into the editor, and Alt+Up and RPC `remove_queued_message` step over it, so it stays queued (its chip still shows) and is delivered with its tag
 - Fixed fresh interactive sessions losing every skill, prompt and theme directory an extension contributes through `resources_discover` from the second launch on, when startup deferral bound that extension after the startup pass; such an extension now always loads before the session starts ([#9379](https://github.com/can1357/oh-my-pi/pull/9379) by [@sjawhar](https://github.com/sjawhar)).
 - Extension API: `api.agents` — list/get/ensureLive/prompt for named registry agents ([#9543](https://github.com/can1357/oh-my-pi/pull/9543) by [@sjawhar](https://github.com/sjawhar)).
+- Resuming a long session from SQL session storage, and rewriting it in full, no longer holds the whole transcript in memory
 - Fixed the debug menu's "Clear artifact cache" deleting whole project directories, session transcripts included; it now removes only tool output files older than 30 days and keeps transcripts, subagent outputs, `/btw` conversations and drafts. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - A failed `/tan` dispatch no longer leaves its clone's transcript behind or keeps the clone's ownership lease, under file and SQL session storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - Under `session.storage: sql`, `omp stats`, `/stats`, `/trace`, `omp session pack/unpack/moved/lease`, RPC `get_session_lease` and `gc.autoCompress` refuse with a message naming the setting instead of acting on an empty file tree, and the `/usage` heatmap says why it is empty while quotas still show. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
@@ -125,6 +127,7 @@
 ### Added
 
 - Sessions can now be stored in PostgreSQL, MySQL, or SQLite instead of JSONL files: set `session.storage: sql` and point `session.sql.dsnFile` at a file holding the connection string (or set `OMP_SESSION_STORAGE=sql` and `OMP_SESSION_SQL_DSN_FILE`); `--resume`, `--continue`, the session picker, and listing follow the same store, and joining a collab session needs file storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
+- Session storages can implement an optional `readChunks(path, fromByte?)` that streams a transcript's bytes, and an `IndexedSessionStorage` backend (`SessionStorageBackend`, which SDK stores may implement) optional `readChunks` and `writeFullStream` methods, so long sessions resume and rewrite without holding the whole transcript in memory
 - `omp gc --restore <session id or archive path>` brings an archived session back to its own path with its artifacts, and names what restoring cannot bring back
 
 ### Changed
@@ -133,6 +136,7 @@
 - `async.maxJobs` now sets the cap on background jobs running at once in a session and its subagents without the fixed 100 ceiling, and `0` means no limit; the default stays 100
 - A session left working in a detached tmux pane no longer spends a slice of a core animating a screen nobody can see: the status line drops to one frame a second and the terminal-title spinner pauses until a client is watching again ([#17404](https://github.com/can1357/oh-my-pi/pull/17404) by [@sjawhar](https://github.com/sjawhar))
 - When saving pruned tool output fails, the pruning now stays applied in the live context, and the session file catches up on the next successful save.
+- A recovered retry and the stamps written after a compaction (its dead-end warning, its corrected context size, and content an elide pass shortened) now append a small record to the session file instead of rewriting the whole file, so those writes no longer grow with session length.
 
 ## [18.18.6] - 2026-11-09
 

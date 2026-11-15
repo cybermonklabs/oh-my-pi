@@ -218,6 +218,8 @@ Including `shake` in `compaction.methodOrder` performs an inline, local reductio
 
 Threshold, incomplete-output, and overflow recovery advance to the next configured method when shake cannot reclaim enough context to get below the recovery band; this prevents repeated no-op shake loops. Idle shake does not use that fallback because the idle timer rechecks usage before running again. Manual `/shake` is a separate, more aggressive command that can target all eligible history.
 
+A shake elide pass persists the entries it shortened, and the usage anchor's `contextSnapshot`, as one appended `entry_patch` record (see [session format](./session.md)) instead of rewriting the session file. Whole-file loads replay it; byte-offset tail readers and older binaries do not.
+
 ### Snapcompact method
 
 Including `snapcompact` in `compaction.methodOrder` replaces the LLM summarization call with a local, deterministic archival pass (`compact` from `@oh-my-pi/snapcompact`):
@@ -234,6 +236,8 @@ The archive is sized from the room under the compaction trigger, not from the wi
 ### Maintenance progress guard
 
 Automatic maintenance checks that the rewritten context creates real headroom (normally at or below 80% of the resolved threshold) before scheduling continuation. No-progress passes can try local rescue: re-render an existing snapcompact archive with a smaller frame budget, elide heavy blocks to recoverable artifacts, or drop attached images. Archive rescue can truncate the oldest carried source text; image dropping is destructive. If maintenance still cannot create headroom, it emits a warning and blocks automatic continuation instead of looping on the same oversized context.
+
+The dead-end `warning` stamped on the compaction entry, the `tokensAfter` projected again after the rescue tiers ran, and the snapcompact archive view without reasoning stored in `preserveData` are appended as `entry_patch` records (see [session format](./session.md)) instead of rewriting the session file; the image-drop tier still rewrites it.
 
 ### Display transcript
 

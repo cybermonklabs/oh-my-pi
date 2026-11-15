@@ -99,9 +99,11 @@ import {
 	resolveMethodSettings,
 	resolveSpeculationMethod,
 } from "./compaction-methods";
+import type { EntryPatch } from "./entry-patches";
 import {
 	assistantTurnDelivered,
 	convertToLlm,
+	countStrippableImages,
 	invalidateConvertToLlmArrayCache,
 	isUserAuthoredMessage,
 	stripImagesFromMessage,
@@ -281,6 +283,38 @@ function findUsageAnchorIndex(branchEntries: readonly SessionEntry[], compaction
 		return index;
 	}
 	return -1;
+}
+
+/**
+ * One patch per entry an elide pass rewrote, read from the entry after the
+ * pass: its shortened content and the `prunedAt` or `elidedOutputTokens` the
+ * pass stamped on it.
+ */
+function elidePatches(items: readonly { region: ShakeRegion }[]): EntryPatch[] {
+	const patches = new Map<string, EntryPatch>();
+	for (const { region } of items) {
+		const entry = region.entry;
+		if (patches.has(entry.id)) continue;
+		if (entry.type === "custom_message") {
+			patches.set(entry.id, { entryId: entry.id, entry: { content: entry.content } });
+			continue;
+		}
+		const message = entry.message;
+		if (message.role === "toolResult") {
+			patches.set(entry.id, {
+				entryId: entry.id,
+				message: { content: message.content, prunedAt: message.prunedAt },
+			});
+		} else if (message.role === "assistant") {
+			patches.set(entry.id, {
+				entryId: entry.id,
+				message: { content: message.content, elidedOutputTokens: message.elidedOutputTokens },
+			});
+		} else if (message.role === "user" || message.role === "developer") {
+			patches.set(entry.id, { entryId: entry.id, message: { content: message.content } });
+		}
+	}
+	return [...patches.values()];
 }
 
 /** A terminal payload rejection may be byte-sized history or irreducible media, not necessarily token overflow. */
@@ -880,10 +914,16 @@ export class SessionMaintenance {
 			// hides everything before its cutoff from the wire.
 			const anchored = index < anchorIndex && (!hasRemoteReplacementHistory || index > compactionIndex);
 			if (entry.type === "message") {
-				const before = this.#tokenizer.countMessage(entry.message, countOptions);
-				const dropped = stripImagesFromMessage(entry.message);
+				// A body read back from the cold store is frozen: only an entry that
+				// carries images is made whole and rewritten.
+				if (countStrippableImages(entry.message) === 0) continue;
+				const { dropped, saved } = this.#host.sessionManager.updateEntryBody(entry.id, () => {
+					const before = this.#tokenizer.countMessage(entry.message, countOptions);
+					const strippedCount = stripImagesFromMessage(entry.message);
+					const after = this.#tokenizer.countMessage(entry.message, countOptions);
+					return { dropped: strippedCount, saved: Math.max(0, before - after) };
+				});
 				if (dropped === 0) continue;
-				const saved = Math.max(0, before - this.#tokenizer.countMessage(entry.message, countOptions));
 				removed += dropped;
 				tokensFreed += saved;
 				if (anchored) anchoredTokensRemoved += saved;
@@ -908,7 +948,9 @@ export class SessionMaintenance {
 			if (kept.length === 0) {
 				kept.push({ type: "text", text: "[image removed]" });
 			}
-			entry.content = kept;
+			this.#host.sessionManager.updateEntryBody(entry.id, () => {
+				entry.content = kept;
+			});
 			// A spread keeps the second count off the projected message's memoized identity.
 			const saved = Math.max(
 				0,
@@ -953,7 +995,9 @@ export class SessionMaintenance {
 	 * - `elide` replaces whole tool-call results and large fenced/XML blocks
 	 *   with short placeholders that embed an `artifact://` recovery link.
 	 *
-	 * Mutates the branch in place, persists via `rewriteEntries`, replays the
+	 * Mutates the branch in place, persists it (`images` and `thinking` by
+	 * rewriting the session file through `rewriteEntries`; `elide` as one
+	 * appended `entry_patch` record through `patchEntries`), replays the
 	 * rebuilt context through the agent, and tears down provider sessions that
 	 * cache message identity — same rewrite contract as {@link dropImages}.
 	 *
@@ -1007,10 +1051,13 @@ export class SessionMaintenance {
 				// Match the stored-context floor: opaque signatures and encrypted
 				// reasoning bytes do not have a reliable provider-token equivalent.
 				const before = this.#tokenizer.countMessage(message, countOptions);
-				// Provider serializers omit empty assistant turns, so don't invent model-authored text.
-				message.content = kept;
-				invalidateMessageCache(message);
-				const saved = Math.max(0, before - this.#tokenizer.countMessage(message, countOptions));
+				// A cold body is made whole for the write and goes back to the store with it.
+				const saved = this.#host.sessionManager.updateEntryBody(entry.id, () => {
+					// Provider serializers omit empty assistant turns, so don't invent model-authored text.
+					message.content = kept;
+					invalidateMessageCache(message);
+					return Math.max(0, before - this.#tokenizer.countMessage(message, countOptions));
+				});
 				tokensFreed += saved;
 				if (index < anchorIndex && (!hasRemoteReplacementHistory || index > compactionIndex)) {
 					anchoredTokensRemoved += saved;
@@ -1135,23 +1182,24 @@ export class SessionMaintenance {
 			return { region, replacement, replacementTokens: replacementTokenCount };
 		});
 
-		const entrySnapshots = new Map<SessionEntry, SessionEntry>();
-		for (const { region } of items) {
-			if (!entrySnapshots.has(region.entry)) entrySnapshots.set(region.entry, structuredClone(region.entry));
-		}
-		const anchorEntry = anchorIndex >= 0 ? branchEntries[anchorIndex] : undefined;
-		if (anchorEntry && !entrySnapshots.has(anchorEntry))
-			entrySnapshots.set(anchorEntry, structuredClone(anchorEntry));
 		applyShakeRegions(items);
-		try {
-			this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
-			await this.#host.sessionManager.rewriteEntries();
-		} catch (error) {
-			for (const [entry, snapshot] of entrySnapshots) Object.assign(entry, snapshot);
-			// The rewrite just failed, so restore the live history without writing to the session.
-			this.#host.agent.replaceMessages(this.#host.buildDisplaySessionContext().messages);
-			throw error;
+		this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
+		const patches = elidePatches(items);
+		if (anchoredTokensRemoved > 0) {
+			// The usage anchor now carries the removed tokens. Find it on the live
+			// branch, as `recordAnchoredHistoryRewrite` did: turns may have landed
+			// while the artifact was written.
+			const liveBranch = this.#host.sessionManager.getBranchView();
+			const liveCompaction = getLatestCompactionEntry(liveBranch);
+			const anchor =
+				liveBranch[findUsageAnchorIndex(liveBranch, liveCompaction ? liveBranch.lastIndexOf(liveCompaction) : -1)];
+			if (anchor?.type === "message" && anchor.message.role === "assistant" && anchor.message.contextSnapshot) {
+				patches.push({ entryId: anchor.id, message: { contextSnapshot: anchor.message.contextSnapshot } });
+			}
 		}
+		// One appended record instead of a whole-file rewrite. A failed write
+		// keeps the pass live; the next successful write lands it.
+		await this.#host.sessionManager.patchEntries(patches);
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.replaceMessagesFromSessionContext(sessionContext.messages);
 		this.#host.resetAdvisorRuntimes("shake");
@@ -2037,8 +2085,7 @@ export class SessionMaintenance {
 				const warning = this.#compactionDeadEndWarning("clear large tool output");
 				const entry = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
 				if (entry) {
-					entry.warning = warning;
-					await this.#host.sessionManager.rewriteEntries();
+					await this.#host.sessionManager.patchEntries([{ entryId: entry.id, entry: { warning } }]);
 				}
 				this.#host.emitNotice("warning", warning, "compaction");
 				return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
@@ -5152,14 +5199,20 @@ export class SessionMaintenance {
 		}
 		const preserveData = entry.preserveData;
 		const slot = preserveData?.[snapcompact.PRESERVE_KEY];
-		entry.preserveData = {
-			...preserveData,
-			[snapcompact.PRESERVE_KEY]: { ...(isRecord(slot) ? slot : {}), withoutThinking: view },
-		};
 		try {
-			await this.#host.sessionManager.rewriteEntries();
+			// Rejects, changing nothing, when the session no longer holds the entry.
+			await this.#host.sessionManager.patchEntries([
+				{
+					entryId: entry.id,
+					entry: {
+						preserveData: {
+							...preserveData,
+							[snapcompact.PRESERVE_KEY]: { ...(isRecord(slot) ? slot : {}), withoutThinking: view },
+						},
+					},
+				},
+			]);
 		} catch (error) {
-			entry.preserveData = preserveData;
 			logger.warn("Persisting the snapcompact archive without reasoning failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
@@ -5511,8 +5564,9 @@ export class SessionMaintenance {
 					if (deadEndWarning && frameRescueResult) {
 						const stampEntry = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
 						if (stampEntry) {
-							stampEntry.warning = deadEndWarning;
-							await this.#host.sessionManager.rewriteEntries();
+							await this.#host.sessionManager.patchEntries([
+								{ entryId: stampEntry.id, entry: { warning: deadEndWarning } },
+							]);
 						}
 					}
 					// A successful frame rescue rewrote history and activated a new
@@ -6419,8 +6473,9 @@ export class SessionMaintenance {
 					? this.#projectExperimentalContextRolloverTokens(args)
 					: this.#projectCompactedContextTokens(args);
 			if (savedCompactionEntry.tokensAfter !== postRescueTokensAfter) {
-				savedCompactionEntry.tokensAfter = postRescueTokensAfter;
-				await this.#host.sessionManager.rewriteEntries();
+				await this.#host.sessionManager.patchEntries([
+					{ entryId: savedCompactionEntry.id, entry: { tokensAfter: postRescueTokensAfter } },
+				]);
 			}
 		}
 		const deadEndWarning = noProgressDeadEnd ? this.#compactionDeadEndWarning("clear large tool output") : undefined;
@@ -6433,8 +6488,9 @@ export class SessionMaintenance {
 			// collapsed transcript badges only the active entry.
 			const stampEntry = getLatestCompactionEntry(this.#host.sessionManager.getBranch()) ?? savedCompactionEntry;
 			if (stampEntry) {
-				stampEntry.warning = deadEndWarning;
-				await this.#host.sessionManager.rewriteEntries();
+				await this.#host.sessionManager.patchEntries([
+					{ entryId: stampEntry.id, entry: { warning: deadEndWarning } },
+				]);
 			}
 		}
 

@@ -398,6 +398,21 @@ export function resolveSessionLeafId(entries: readonly SessionEntry[]): string |
 	return lastSelfSelectedLeafId(entries);
 }
 
+/**
+ * The phases a successful `todo` tool result records, or undefined: the
+ * snapshot the to-do list restores from. A `view` changes nothing and
+ * records none.
+ */
+export function todoResultPhases(entry: SessionEntry): unknown[] | undefined {
+	if (entry.type !== "message") return undefined;
+	const message = entry.message;
+	if (message.role !== "toolResult" || message.toolName !== "todo" || message.isError) return undefined;
+	const details: unknown = message.details;
+	if (typeof details !== "object" || details === null) return undefined;
+	if ("op" in details && details.op === "view") return undefined;
+	return "phases" in details && Array.isArray(details.phases) ? details.phases : undefined;
+}
+
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
 export type FileEntry = SessionHeader | SessionEntry;
 

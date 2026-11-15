@@ -1128,7 +1128,6 @@ export class TurnRecovery {
 					note: pending.note,
 				};
 			}
-			entry.message.retryRecovery = retryRecovery;
 			retryErrors.push({
 				entryId: entry.id,
 				persistenceKey: pending.persistenceKey,
@@ -1136,9 +1135,10 @@ export class TurnRecovery {
 				retryRecovery,
 			});
 		}
-		if (retryErrors.length > 0) {
-			await this.#host.sessionManager.rewriteEntries();
-		}
+		// One appended record marks every attempt; the transcript is not rewritten.
+		await this.#host.sessionManager.patchEntries(
+			retryErrors.map(({ entryId, retryRecovery }) => ({ entryId, message: { retryRecovery } })),
+		);
 		return retryErrors;
 	}
 

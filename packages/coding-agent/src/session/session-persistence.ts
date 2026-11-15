@@ -595,3 +595,70 @@ export function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStor
 		}
 	}
 }
+
+/**
+ * `value` with each image payload a persisted line externalizes (content image
+ * blocks, `images[]`, snapcompact frames, image data URLs, generated images)
+ * replaced by its blob reference, and nothing else changed. Untouched subtrees
+ * are shared.
+ */
+function externalizeImagesOnly(value: unknown, blobStore: BlobStore, key?: string): unknown {
+	if (typeof value === "string") {
+		return key === "image_url" && isImageDataUrl(value) ? externalizeImageDataUrlSync(blobStore, value) : value;
+	}
+	if (typeof value !== "object" || value === null) return value;
+	if (
+		"type" in value &&
+		value.type === "image_generation_call" &&
+		"result" in value &&
+		typeof value.result === "string" &&
+		!isBlobRef(value.result) &&
+		value.result.length >= BLOB_EXTERNALIZE_THRESHOLD
+	) {
+		return { ...value, result: externalizeImagePayloadSync(blobStore, value, value.result, undefined) };
+	}
+	if (shouldExternalizeImagePayload(value, key)) {
+		return { ...value, data: externalizeImagePayloadSync(blobStore, value, value.data, value.mimeType) };
+	}
+	if (Array.isArray(value)) {
+		let changed: unknown[] | undefined;
+		for (let index = 0; index < value.length; index++) {
+			const item: unknown = value[index];
+			const next = externalizeImagesOnly(item, blobStore, key);
+			if (next === item) continue;
+			changed ??= value.slice();
+			changed[index] = next;
+		}
+		return changed ?? value;
+	}
+	let changed: Record<string, unknown> | undefined;
+	for (const childKey in value) {
+		if (!Object.hasOwn(value, childKey)) continue;
+		const child: unknown = Reflect.get(value, childKey);
+		const next = externalizeImagesOnly(child, blobStore, childKey);
+		if (next === child) continue;
+		changed ??= { ...value };
+		changed[childKey] = next;
+	}
+	return changed ?? value;
+}
+
+/**
+ * The JSON text of `entry` as the manager holds it, with image payloads
+ * replaced by blob references (the blob store keeps their bytes). Unlike
+ * {@link prepareEntryForPersistence} nothing is truncated, stripped or masked:
+ * parsing the text and resolving its blob references gives the entry back.
+ */
+export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string {
+	let externalized: unknown;
+	try {
+		externalized = externalizeImagesOnly(entry, blobStore);
+	} catch (error) {
+		// A library object in `details` can carry a getter that throws when the
+		// walk probes it (see prepareEntryForPersistence); its plain JSON has none.
+		const json = stringifyJson(entry);
+		if (json === undefined) throw error;
+		externalized = externalizeImagesOnly(JSON.parse(json), blobStore);
+	}
+	return stringifyJson(externalized) ?? "null";
+}
