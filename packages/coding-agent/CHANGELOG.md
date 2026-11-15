@@ -46,6 +46,7 @@
 - Fixed full rewrites of large file-backed sessions retaining a second transcript-sized serialization; file storage now streams the journal and verifies uncertain publication by an exact streamed comparison.
 - Fixed `omp --resume <path>` reading a session's whole transcript into one string to confirm it is unchanged when its storage can stream it; the check now hashes the transcript as it streams.
 - Fixed confirming a session rewrite whose acknowledgement failed by reading the whole stored transcript into one string when its storage can stream it; the stored bytes are now compared by size and SHA-256 as they stream.
+- A session that finds another writer's entries in its file while rewriting it reads the file back in pieces instead of all at once, so keeping those entries no longer holds a whole long transcript in memory
 - Fixed subagents whose declared model has no working credentials silently running on the parent session's model: that model's own `retry.fallbackChains` key (`provider/id` or `provider/*`) now decides, as it also does for a declared model missing from the catalog (an empty chain refuses the spawn with an error naming the agent and model, a non-empty chain is walked), and any replacement is marked as a fallback in the session and task result ([#16028](https://github.com/can1357/oh-my-pi/pull/16028) by [@sjawhar](https://github.com/sjawhar))
 - Fixed task results not saying which fallback model answered for a subagent: the `<task-result>` now carries a `<model served=… requested=… fallback="true">` line, with the reason when the model was replaced at spawn ([#16028](https://github.com/can1357/oh-my-pi/pull/16028) by [@sjawhar](https://github.com/sjawhar))
 - Fixed a subagent with a `task.agentAccountPools` entry failing with a raw "restricted to its OAuth account pool" error when no account it may use can serve its declared model: that model's own `retry.fallbackChains` key now decides at spawn, as it does for any other model that cannot serve ([#16028](https://github.com/can1357/oh-my-pi/pull/16028) by [@sjawhar](https://github.com/sjawhar))
@@ -143,6 +144,7 @@
 - A resumed session keeps in memory only the entries since its latest compaction: older message bodies, tool results and summaries wait in a temporary file and are read back when something asks for them, so long sessions take far less memory
 - Hindsight auto-retain, the pending-tool-call warning on resume and the exit record read only recent messages on each turn instead of the whole history
 - `.jsonl.gz` subagent transcripts in exports are decompressed as they are read instead of all at once
+- `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory
 
 ## [18.18.6] - 2026-11-09
 

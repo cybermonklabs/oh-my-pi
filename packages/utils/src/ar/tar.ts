@@ -16,7 +16,7 @@ import {
 	normalizeArchiveEntryPath,
 	normalizeArchiveLookupPath,
 } from "./paths";
-import type { ByteSource } from "./source";
+import { type ByteSource, readByteSourceChunks, STREAM_CHUNK_SIZE } from "./source";
 import type { ArchiveIndexEntry, FormatReader, FormatReadOptions, MemberSource } from "./types";
 
 const BLOCK_SIZE = 512;
@@ -153,6 +153,13 @@ class TarByteStream implements TarCursor {
 /** Where an indexed tar's member bytes come from, by offset into the tar stream. */
 interface TarPayload {
 	read(offset: number, size: number, memberPath: string): Promise<Uint8Array>;
+	/** {@link read}'s bytes in bounded reads, where the payload can serve them without reading the member whole. */
+	chunks?(offset: number, size: number, memberPath: string): AsyncIterable<Uint8Array>;
+}
+
+function tarMemberReadError(error: unknown): ArchiveError {
+	if (error instanceof ArchiveError) return error;
+	return new ArchiveError(error instanceof Error ? error.message : "Failed to read tar member");
 }
 
 class TarSourcePayload implements TarPayload {
@@ -170,8 +177,23 @@ class TarSourcePayload implements TarPayload {
 			}
 			return bytes;
 		} catch (error) {
-			if (error instanceof ArchiveError) throw error;
-			throw new ArchiveError(error instanceof Error ? error.message : "Failed to read tar member");
+			throw tarMemberReadError(error);
+		}
+	}
+
+	/** {@link read} as reads of at most {@link STREAM_CHUNK_SIZE} bytes, with the same checks. */
+	async *chunks(offset: number, size: number, memberPath: string): AsyncGenerator<Uint8Array> {
+		let remaining = size;
+		try {
+			for await (const bytes of readByteSourceChunks(this.#source, offset, offset + size)) {
+				if (bytes.byteLength !== Math.min(remaining, STREAM_CHUNK_SIZE)) {
+					throw new ArchiveError(`Archive member '${formatArchivePathForError(memberPath)}' is truncated`);
+				}
+				remaining -= bytes.byteLength;
+				yield bytes;
+			}
+		} catch (error) {
+			throw tarMemberReadError(error);
 		}
 	}
 }
@@ -250,12 +272,22 @@ class TarMemberSource implements MemberSource {
 	}
 
 	async read(size: number, memberPath: string): Promise<Uint8Array> {
+		this.#refuseSparse(memberPath);
+		return this.#payload.read(this.#dataOffset, size, memberPath);
+	}
+
+	async *chunks(size: number, memberPath: string): AsyncGenerator<Uint8Array> {
+		this.#refuseSparse(memberPath);
+		if (this.#payload.chunks) yield* this.#payload.chunks(this.#dataOffset, size, memberPath);
+		else yield await this.#payload.read(this.#dataOffset, size, memberPath);
+	}
+
+	#refuseSparse(memberPath: string): void {
 		if (this.#sparse) {
 			throw new ArchiveError(
 				`Archive member '${formatArchivePathForError(memberPath)}' is a sparse file and cannot be read`,
 			);
 		}
-		return this.#payload.read(this.#dataOffset, size, memberPath);
 	}
 }
 
@@ -901,22 +933,32 @@ function makeHeader(
 	return header;
 }
 
-function appendPayload(parts: Uint8Array[], payload: Uint8Array): void {
-	parts.push(payload);
-	const padding = paddedSize(payload.byteLength) - payload.byteLength;
-	if (padding > 0) parts.push(new Uint8Array(padding));
+/** A member's bytes for {@link encodeTar} and {@link writeTarFile}: in memory, or a `Blob` (e.g. `Bun.file`) read as it is written. */
+export type TarMemberPayload = Uint8Array | Blob;
+
+const EMPTY_PAYLOAD = new Uint8Array(0);
+
+function payloadSize(payload: TarMemberPayload): number {
+	return payload instanceof Uint8Array ? payload.byteLength : payload.size;
 }
 
-function appendTarEntry(
-	parts: Uint8Array[],
+/** `payload`, then the zero padding that fills its last block. */
+function* payloadBlocks<P extends TarMemberPayload>(payload: P): Generator<Uint8Array | P> {
+	yield payload;
+	const size = payloadSize(payload);
+	const padding = paddedSize(size) - size;
+	if (padding > 0) yield new Uint8Array(padding);
+}
+
+function* tarEntryBlocks<P extends TarMemberPayload>(
 	archivePath: string,
-	payload: Uint8Array,
+	payload: P,
 	directory: boolean,
 	sequence: number,
-): void {
+): Generator<Uint8Array | P> {
 	const pathBytes = TEXT_ENCODER.encode(directory ? `${archivePath}/` : archivePath);
 	const split = splitUstarPath(pathBytes);
-	const size = directory ? 0 : payload.byteLength;
+	const size = directory ? 0 : payloadSize(payload);
 	const mtime = 0;
 	const paxRecords: Uint8Array[] = [];
 	if (!split) paxRecords.push(makePaxRecord("path", directory ? `${archivePath}/` : archivePath));
@@ -925,58 +967,117 @@ function appendTarEntry(
 	if (paxRecords.length > 0) {
 		const paxPayload = concatBytes(paxRecords);
 		const paxName = TEXT_ENCODER.encode(`PaxHeaders/${String(sequence).padStart(8, "0")}`);
-		parts.push(makeHeader(paxName, new Uint8Array(0), paxPayload.byteLength, 0, 0o644, 0x78));
-		appendPayload(parts, paxPayload);
+		yield makeHeader(paxName, new Uint8Array(0), paxPayload.byteLength, 0, 0o644, 0x78);
+		yield* payloadBlocks(paxPayload);
 	}
 	const effectiveSplit = split ?? [
 		TEXT_ENCODER.encode(`PaxFile/${String(sequence).padStart(8, "0")}`),
 		new Uint8Array(0),
 	];
-	parts.push(
-		makeHeader(
-			effectiveSplit[0],
-			effectiveSplit[1],
-			size <= MAX_OCTAL_SIZE ? size : 0,
-			mtime,
-			directory ? 0o755 : 0o644,
-			directory ? 0x35 : 0x30,
-		),
+	yield makeHeader(
+		effectiveSplit[0],
+		effectiveSplit[1],
+		size <= MAX_OCTAL_SIZE ? size : 0,
+		mtime,
+		directory ? 0o755 : 0o644,
+		directory ? 0x35 : 0x30,
 	);
-	if (!directory) appendPayload(parts, payload);
+	if (!directory) yield* payloadBlocks(payload);
 }
 
-/** Encode files as a deterministic ustar archive, using PAX records for overflow paths. */
-export async function encodeTar(members: Iterable<readonly [string, Uint8Array]>): Promise<Uint8Array> {
-	const parts: Uint8Array[] = [];
-	const kinds = new Map<string, "directory" | "file">();
-	let sequence = 0;
-	for (const [rawPath, bytes] of members) {
+/** Turns tar members, one at a time, into their blocks; remembers the paths so far to add parent directories once. */
+class TarEncoder {
+	readonly #kinds = new Map<string, "directory" | "file">();
+	#sequence = 0;
+
+	/** The blocks of one member, after those of any parent directory not yet written; the payload is yielded as given. */
+	*member<P extends TarMemberPayload>(rawPath: string, payload: P): Generator<Uint8Array | P> {
 		const directory = rawPath.endsWith("/") || rawPath.endsWith("\\");
 		const normalized = normalizeArchiveEntryPath(rawPath);
 		if (!normalized) throw new ArchiveError(`Invalid tar member path '${formatArchivePathForError(rawPath)}'`);
 		const pathBytes = TEXT_ENCODER.encode(normalized);
 		if (pathBytes.byteLength === 0) throw new ArchiveError("Invalid empty tar member path");
-		if (directory && bytes.byteLength !== 0) {
+		if (directory && payloadSize(payload) !== 0) {
 			throw new ArchiveError(`Tar directory '${formatArchivePathForError(normalized)}' cannot contain file data`);
 		}
 		const segments = normalized.split("/");
 		for (let index = 1; index < segments.length; index++) {
 			const parent = segments.slice(0, index).join("/");
-			const kind = kinds.get(parent);
+			const kind = this.#kinds.get(parent);
 			if (kind === "file")
 				throw new ArchiveError(`Tar member '${formatArchivePathForError(parent)}' is not a directory`);
 			if (kind === "directory") continue;
-			kinds.set(parent, "directory");
-			appendTarEntry(parts, parent, new Uint8Array(0), true, sequence++);
+			this.#kinds.set(parent, "directory");
+			yield* tarEntryBlocks(parent, EMPTY_PAYLOAD, true, this.#sequence++);
 		}
-		const existing = kinds.get(normalized);
+		const existing = this.#kinds.get(normalized);
 		if (existing) {
-			if (directory && existing === "directory") continue;
+			if (directory && existing === "directory") return;
 			throw new ArchiveError(`Duplicate tar member path '${formatArchivePathForError(normalized)}'`);
 		}
-		kinds.set(normalized, directory ? "directory" : "file");
-		appendTarEntry(parts, normalized, bytes, directory, sequence++);
+		this.#kinds.set(normalized, directory ? "directory" : "file");
+		yield* tarEntryBlocks(normalized, payload, directory, this.#sequence++);
+	}
+}
+
+/** Encode files as a deterministic ustar archive, using PAX records for overflow paths. */
+export async function encodeTar(members: Iterable<readonly [string, Uint8Array]>): Promise<Uint8Array> {
+	const encoder = new TarEncoder();
+	const parts: Uint8Array[] = [];
+	for (const [rawPath, bytes] of members) {
+		for (const block of encoder.member(rawPath, bytes)) parts.push(block);
 	}
 	parts.push(new Uint8Array(BLOCK_SIZE * 2));
 	return concatBytes(parts);
+}
+
+/**
+ * Write {@link encodeTar}'s archive of `members` to `destPath` (parent
+ * directories created, an existing file replaced) member by member, so the
+ * archive is never held in memory: a `Blob` payload streams from its source.
+ * A `Blob` whose stream does not yield exactly its `size` bytes fails the write.
+ */
+export async function writeTarFile(
+	destPath: string,
+	members: Iterable<readonly [string, TarMemberPayload]>,
+): Promise<void> {
+	// Bun.write creates the parent directories and truncates an existing file; a file sink does neither.
+	await Bun.write(destPath, "");
+	const sink = Bun.file(destPath).writer();
+	const write = async (bytes: Uint8Array): Promise<void> => {
+		const written = sink.write(bytes);
+		if (typeof written !== "number") await written;
+	};
+	try {
+		const encoder = new TarEncoder();
+		for (const [rawPath, payload] of members) {
+			for (const block of encoder.member(rawPath, payload)) {
+				if (block instanceof Uint8Array) {
+					await write(block);
+					continue;
+				}
+				let streamed = 0;
+				for await (const chunk of block.stream()) {
+					streamed += chunk.byteLength;
+					if (streamed > block.size) break;
+					await write(chunk);
+				}
+				if (streamed !== block.size) {
+					throw new ArchiveError(
+						`Tar member '${formatArchivePathForError(rawPath)}' changed size while it was written`,
+					);
+				}
+			}
+		}
+		await write(new Uint8Array(BLOCK_SIZE * 2));
+	} catch (error) {
+		try {
+			// Release the descriptor so the caller can remove the partial file.
+			await sink.end();
+		} catch {
+			// The write failure is the error worth reporting.
+		}
+		throw error;
+	}
+	await sink.end();
 }

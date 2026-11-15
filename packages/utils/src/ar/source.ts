@@ -67,9 +67,14 @@ export async function readAllBytes(source: ByteSource): Promise<Uint8Array> {
 /** Chunk size for streamed decompression, on both the compressed and the decompressed side. */
 export const STREAM_CHUNK_SIZE = 1024 * 1024;
 
-async function* readChunks(source: ByteSource): AsyncGenerator<Uint8Array> {
-	for (let start = 0; start < source.size; start += STREAM_CHUNK_SIZE) {
-		yield await source.read(start, Math.min(source.size, start + STREAM_CHUNK_SIZE));
+/** Bytes `[start, end)` of `source` (all of it by default) as reads of at most {@link STREAM_CHUNK_SIZE} bytes. */
+export async function* readByteSourceChunks(
+	source: ByteSource,
+	start = 0,
+	end = source.size,
+): AsyncGenerator<Uint8Array> {
+	for (let offset = start; offset < end; offset += STREAM_CHUNK_SIZE) {
+		yield await source.read(offset, Math.min(end, offset + STREAM_CHUNK_SIZE));
 	}
 }
 
@@ -83,7 +88,7 @@ export async function* decodeByteSource(
 	decoder: Transform,
 	maxOutput: number,
 ): AsyncGenerator<Uint8Array> {
-	const input = Readable.from(readChunks(source));
+	const input = Readable.from(readByteSourceChunks(source));
 	input.once("error", error => decoder.destroy(error));
 	let output = 0;
 	try {

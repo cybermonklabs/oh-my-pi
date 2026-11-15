@@ -123,7 +123,9 @@ import {
 	type SessionLoadResult,
 	sessionContentDigest,
 	transcriptByteChunks,
+	visitEntriesFromChunksSync,
 	visitEntriesFromFile,
+	visitEntriesFromFileStream,
 	visitLoadedSession,
 	visitSessionFile,
 } from "./session-loader";
@@ -1035,7 +1037,7 @@ function durableFrontier(generation: number, count: number, size: number): Durab
 	};
 }
 
-/** Entries another writer added to the session file, and where they sit in it (see `#foreignEntriesIn`). */
+/** Entries another writer added to the session file, and where they sit in it (see `#foreignEntryScan`). */
 interface ForeignEntries {
 	foreign: SessionEntry[];
 	at: number;
@@ -1127,6 +1129,64 @@ async function chunksMatchBody(chunks: AsyncIterable<Uint8Array>, body: SessionF
 		stored.update(chunk);
 	}
 	return storedBytes === expectedBytes && stored.digest("hex") === expected.digest("hex");
+}
+
+/** Bytes of one synchronous read of a stored transcript; see {@link transcriptByteChunksSync}. */
+const SYNC_READ_WINDOW_BYTES = 1024 * 1024;
+
+/**
+ * The stored transcript at `filePath` as synchronous chunks: windows of at most
+ * {@link SYNC_READ_WINDOW_BYTES} through `readTextRangeSync` where the storage
+ * has it, or of the file for file storage, and otherwise its whole
+ * `readTextSync` text as one chunk; `undefined` when the storage reads nothing
+ * synchronously. A missing transcript throws ENOENT once iterated.
+ */
+function transcriptByteChunksSync(filePath: string, storage: SessionStorage): Iterable<Uint8Array> | undefined {
+	const readRange = storage.readTextRangeSync;
+	if (readRange) return textRangeWindows((start, end) => readRange.call(storage, filePath, start, end));
+	if (storage instanceof FileSessionStorage) return fileWindows(filePath);
+	const readText = storage.readTextSync;
+	if (readText) return wholeText(() => readText.call(storage, filePath));
+	return undefined;
+}
+
+/**
+ * Successive windows of a transcript `readRange` decodes. A window that ends
+ * inside a multibyte character decodes its first bytes as U+FFFD, so trailing
+ * U+FFFD characters are read again at the head of the next window.
+ */
+function* textRangeWindows(readRange: (start: number, end: number) => string): Generator<Uint8Array> {
+	let position = 0;
+	for (;;) {
+		const text = readRange(position, position + SYNC_READ_WINDOW_BYTES);
+		if (text.length === 0) return;
+		let end = text.length;
+		while (end > 0 && text.charCodeAt(end - 1) === 0xfffd) end--;
+		const window = Buffer.from(end > 0 ? text.slice(0, end) : text, "utf8");
+		position += window.byteLength;
+		yield window;
+	}
+}
+
+/** Successive windows of the file at `filePath`, each valid until the next is read. */
+function* fileWindows(filePath: string): Generator<Uint8Array> {
+	const fd = fs.openSync(filePath, "r");
+	try {
+		const window = Buffer.allocUnsafe(SYNC_READ_WINDOW_BYTES);
+		let position = 0;
+		for (;;) {
+			const read = fs.readSync(fd, window, 0, window.length, position);
+			if (read === 0) return;
+			position += read;
+			yield window.subarray(0, read);
+		}
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+function* wholeText(readText: () => string): Generator<Uint8Array> {
+	yield Buffer.from(readText(), "utf8");
 }
 
 /**
@@ -1703,8 +1763,10 @@ export class SessionManager {
 	}
 
 	/**
-	 * The entries `content` holds that this manager does not, or `undefined`
-	 * when it is not this session's journal. `at` is where they go in
+	 * A visitor of the stored transcript, entry by entry, that finds the entries
+	 * it holds that this manager does not; `found()` is `undefined` when the
+	 * transcript is not this session's journal (its first entry is not this
+	 * session's header), and the visit stops there. `at` is where they go in
 	 * `#entries` to keep the file's order: after the last entry both hold, so
 	 * this manager's entries the file lacks still follow them.
 	 * `extendsFrontier` reports that the file is this manager's first
@@ -1712,37 +1774,55 @@ export class SessionManager {
 	 * them: another writer (a clone's original healing a missed entry) may
 	 * have appended this manager's own next entries before them.
 	 */
-	#foreignEntriesIn(content: string): ForeignEntries | undefined {
-		const { entries, invalidHeader, malformedRecords } = parseSessionContent(content);
-		const header = entries[0];
-		if (invalidHeader || header?.type !== "session" || header.id !== this.#sessionId) return undefined;
-		const durable = this.#durable;
-		let extendsFrontier =
-			malformedRecords === 0 &&
-			durable?.generation === this.#entriesGeneration &&
-			durable.issued === durable.confirmed;
+	#foreignEntryScan(): {
+		visit: (entry: FileEntry) => boolean;
+		onMalformedRecord: () => void;
+		found: () => ForeignEntries | undefined;
+	} {
+		let ownJournal: boolean | undefined;
+		let malformedRecords = 0;
+		let sharedInOrder = true;
 		const foreign: SessionEntry[] = [];
 		const shared = new Set<string>();
-		for (let i = 1; i < entries.length; i++) {
-			const entry = entries[i] as SessionEntry;
-			if (!this.#index.has(entry.id)) {
-				foreign.push(entry);
-				continue;
-			}
-			shared.add(entry.id);
-			const sharedEntry = this.#index.get(entry.id);
-			if (
-				foreign.length > 0 ||
-				this.#entries[shared.size - 1]?.id !== entry.id ||
-				sharedEntry?.parentId !== entry.parentId
-			) {
-				extendsFrontier = false;
-			}
-		}
-		if (durable === undefined || shared.size < durable.confirmed) extendsFrontier = false;
-		let at = this.#entries.length;
-		while (at > 0 && !shared.has(this.#entries[at - 1]!.id)) at--;
-		return { foreign, at, shared: shared.size, extendsFrontier };
+		return {
+			visit: raw => {
+				if (ownJournal === undefined) {
+					ownJournal = raw.type === "session" && raw.id === this.#sessionId;
+					return ownJournal;
+				}
+				const entry = raw as SessionEntry;
+				if (!this.#index.has(entry.id)) {
+					foreign.push(entry);
+					return true;
+				}
+				shared.add(entry.id);
+				const sharedEntry = this.#index.get(entry.id);
+				if (
+					foreign.length > 0 ||
+					this.#entries[shared.size - 1]?.id !== entry.id ||
+					sharedEntry?.parentId !== entry.parentId
+				) {
+					sharedInOrder = false;
+				}
+				return true;
+			},
+			onMalformedRecord: () => {
+				malformedRecords++;
+			},
+			found: () => {
+				if (!ownJournal) return undefined;
+				const durable = this.#durable;
+				const extendsFrontier =
+					sharedInOrder &&
+					malformedRecords === 0 &&
+					durable?.generation === this.#entriesGeneration &&
+					durable.issued === durable.confirmed &&
+					shared.size >= durable.confirmed;
+				let at = this.#entries.length;
+				while (at > 0 && !shared.has(this.#entries[at - 1]!.id)) at--;
+				return { foreign, at, shared: shared.size, extendsFrontier };
+			},
+		};
 	}
 
 	/**
@@ -1868,8 +1948,10 @@ export class SessionManager {
 	 * an external tool) appending to the file this process owns. Overwriting
 	 * would erase those entries and retrying blindly can never succeed, so read
 	 * the file back, keep its new entries, and retry against the size just read.
-	 * A deleted file is recreated; a file that no longer reads as this session
-	 * is left untouched and the session moves to a sibling.
+	 * The file is read in bounded windows and parsed as they arrive, so the
+	 * transcript is never held whole. A deleted file is recreated; a file that
+	 * no longer reads as this session is left untouched and the session moves
+	 * to a sibling.
 	 *
 	 * After {@link MAX_WRITE_CONFLICT_RECOVERIES} passes (`recoveries`) the
 	 * other writer is still racing every read-to-publish window: leave the file
@@ -1881,32 +1963,47 @@ export class SessionManager {
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
-		if (!this.#storage.readTextSync) return undefined;
-		let content: string;
+		const chunks = transcriptByteChunksSync(contested, this.#storage);
+		if (!chunks) return undefined;
+		const scan = this.#foreignEntryScan();
+		let diskSize = 0;
 		try {
-			content = this.#storage.readTextSync(contested);
+			visitEntriesFromChunksSync(chunks, scan.visit, {
+				onMalformedRecord: scan.onMalformedRecord,
+				onChunk: chunk => {
+					diskSize += chunk.byteLength;
+				},
+			});
 		} catch (readError) {
 			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
 			this.#expectedDiskSize = null;
 			this.#durable = undefined;
 			return contested;
 		}
-		const found = this.#foreignEntriesIn(content);
+		const found = scan.found();
 		if (!found) return this.#moveOffSessionFile("replaced");
 		resolveBlobRefsInEntriesSync(found.foreign, this.#blobs);
-		this.#adoptForeignEntries(found, Buffer.byteLength(content, "utf8"));
+		this.#adoptForeignEntries(found, diskSize);
 		return contested;
 	}
 
-	/** Asynchronous {@link #recoverFromWriteConflictSync}. */
+	/** Asynchronous {@link #recoverFromWriteConflictSync}, reading the storage's chunk stream. */
 	async #recoverFromWriteConflict(error: unknown, recoveries: number): Promise<string | undefined> {
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
 		const epoch = this.#diskEpoch;
-		let content: string;
+		const scan = this.#foreignEntryScan();
+		let diskSize = 0;
 		try {
-			content = await this.#storage.readText(contested);
+			await visitEntriesFromFileStream(contested, scan.visit, {
+				storage: this.#storage,
+				throwIfMissing: true,
+				onMalformedRecord: scan.onMalformedRecord,
+				onChunk: chunk => {
+					diskSize += chunk.byteLength;
+				},
+			});
 		} catch (readError) {
 			// A synchronous rewrite during the read already recovered; retry against its result.
 			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
@@ -1916,12 +2013,12 @@ export class SessionManager {
 			return contested;
 		}
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-		const found = this.#foreignEntriesIn(content);
+		const found = scan.found();
 		if (!found) return this.#moveOffSessionFile("replaced");
 		await resolveBlobRefsInEntries(found.foreign, this.#blobs);
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 		// An append during the await may have moved the frontier past what was read; the retry republishes.
-		this.#adoptForeignEntries({ ...found, extendsFrontier: false }, Buffer.byteLength(content, "utf8"));
+		this.#adoptForeignEntries({ ...found, extendsFrontier: false }, diskSize);
 		return contested;
 	}
 
@@ -5679,8 +5776,8 @@ export class SessionManager {
 	/**
 	 * Put back in the store, with the values they hold now, the entries before
 	 * the cut that a write made whole. A write to a field of a cold entry makes
-	 * it whole; when the write is undone (a failed persist restoring the
-	 * previous values), this returns the entry to the store.
+	 * it whole: a prune pass blanking a result before the cut, or a failed
+	 * persist restoring the previous values; this returns the entry to the store.
 	 */
 	recoolEntriesBeforeCut(): void {
 		if (!this.#coldStoreEnabled) return;
