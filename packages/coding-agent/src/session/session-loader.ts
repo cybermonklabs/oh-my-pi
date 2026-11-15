@@ -40,7 +40,6 @@ const LF = new Uint8Array([0x0a]);
 
 const STREAM_LOAD_THRESHOLD_BYTES = 8 * 1024 * 1024;
 const STREAM_YIELD_BYTES = 1 * 1024 * 1024;
-const DIGEST_READ_BYTES = 1 * 1024 * 1024;
 const STREAM_YIELD_ENTRIES = 8_192;
 /** Initial parse window after a malformed record; see the recovery note in visitEntriesFromFileStream. */
 const RECOVERY_PARSE_WINDOW = 64 * 1024;
@@ -248,6 +247,24 @@ function sessionHeaderIdFromPrefix(prefix: Uint8Array, final: boolean): string |
 	if (end === -1) return final ? undefined : HEADER_INCOMPLETE;
 	const entry = tryParseJson<FileEntry>(text.slice(0, end)) ?? undefined;
 	return isValidSessionHeader(entry) ? entry.id : undefined;
+}
+
+/**
+ * The transcript's bytes, as chunks: the storage's own chunks where it has
+ * `readChunks`, a file stream for file storage, and otherwise its whole text
+ * as one chunk. A missing transcript raises ENOENT from any source, which the
+ * caller tolerates.
+ */
+export async function* transcriptByteChunks(filePath: string, storage: SessionStorage): AsyncGenerator<Uint8Array> {
+	if (storage.readChunks) {
+		yield* storage.readChunks(filePath);
+		return;
+	}
+	if (storage instanceof FileSessionStorage) {
+		yield* Bun.file(filePath).stream();
+		return;
+	}
+	yield new TextEncoder().encode(await storage.readText(filePath));
 }
 
 /** Parse session JSONL and visit each entry without retaining prior entries. */
@@ -514,32 +531,21 @@ function shouldStreamEntries(storage: SessionStorage, size: number): boolean {
 }
 
 /**
- * Digest of `filePath`'s current content, read the way {@link loadSessionFile}
- * reads a file of its size: raw bytes for a large file-backed journal, the
- * storage's text otherwise. Equal to a load's
+ * Digest of `filePath`'s current bytes, hashed chunk by chunk as
+ * {@link transcriptByteChunks} yields them, so a transcript the storage
+ * streams is never held whole. Equal to a load's
  * {@link SessionLoadResult.sourceDigest} only when the content is unchanged, so
  * it is a freshness check that trusts no size, mtime, or inode. Throws ENOENT
  * when the session is gone, including a row an indexed backend no longer holds.
- * A large journal is hashed through one reused buffer, so the check adds no
- * memory proportional to the file on top of the parse it follows.
+ *
+ * A file transcript under the 8 MiB streaming threshold is digested at load
+ * from the text `readText` decodes, which differs from the file's bytes only
+ * when the file has a byte-order mark or invalid UTF-8. Such a file reads as
+ * changed here and costs one extra parse, never a wrong answer.
  */
 export async function sessionContentDigest(filePath: string, storage: SessionStorage): Promise<string> {
 	const hasher = new Bun.CryptoHasher(SNAPSHOT_DIGEST_ALGORITHM);
-	if (shouldStreamEntries(storage, storage.statSync(filePath).size)) {
-		const handle = await fs.open(filePath, "r");
-		try {
-			const buffer = Buffer.allocUnsafe(DIGEST_READ_BYTES);
-			for (;;) {
-				const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, null);
-				if (bytesRead === 0) break;
-				hasher.update(buffer.subarray(0, bytesRead));
-			}
-		} finally {
-			await handle.close();
-		}
-	} else {
-		hasher.update(await storage.readText(filePath));
-	}
+	for await (const chunk of transcriptByteChunks(filePath, storage)) hasher.update(chunk);
 	return hasher.digest("hex");
 }
 

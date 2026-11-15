@@ -218,6 +218,13 @@ export interface SessionStorage {
 	/** Read the requested UTF-8 byte windows from the head and tail of the file. */
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
+	 * The file's bytes from byte `fromByte` (default 0) to its end, as chunks in
+	 * order, so a reader never holds the whole transcript. Iterating a missing
+	 * file rejects with ENOENT. Optional: callers on backends without it read the
+	 * whole text.
+	 */
+	readChunks?(path: string, fromByte?: number): AsyncIterable<Uint8Array>;
+	/**
 	 * Feed each line of the file to `visit`, in order, until it returns true or
 	 * the file ends. Lets callers find records that fall between the bounded
 	 * {@link readTextSlices} windows. Optional: backends without cheap full scans

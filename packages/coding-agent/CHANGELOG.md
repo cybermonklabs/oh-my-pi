@@ -8,6 +8,7 @@
 - Fixed agents continuing after a session persistence failure without context about the risk; the next prompt now receives a hidden warning to preserve critical work.
 - Fixed `omp --resume <path>` parsing an unchanged session file twice; large sessions now re-stat for freshness and reparse only after a change.
 - Fixed full rewrites of large file-backed sessions retaining a second transcript-sized serialization; file storage now streams the journal and verifies uncertain publication by an exact streamed comparison.
+- Fixed `omp --resume <path>` reading a session's whole transcript into one string to confirm it is unchanged when its storage can stream it; the check now hashes the transcript as it streams.
 
 ## [18.18.6] - 2026-11-09
 
