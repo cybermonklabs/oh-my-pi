@@ -4,7 +4,7 @@
  * `type` string only. An entry with nothing to mask comes back as the same
  * object; a masked one shares every untouched subtree with the live entry.
  */
-import { countNewlines } from "@oh-my-pi/pi-utils";
+import { countNewlines, isRecord } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
 import { isBlobRef, isImageDataUrl } from "./blob-store";
 import { isImageDataPayload } from "./session-persistence";
@@ -40,12 +40,12 @@ const SERVER_TOOL_TYPE = "anthropicServerTool";
 /**
  * `entry` with every held secret replaced by its marker, for the stored copy
  * only: the live entry is never mutated. Returns `entry` itself when nothing
- * changes. Signed blocks that change lose their signature; provider replay
- * state that changes is dropped whole.
+ * changes or `mask` is `null`. Signed blocks that change lose their signature;
+ * provider replay state that changes is dropped whole.
  */
-export function maskSessionEntry<T>(entry: T, mask: SessionStoreMask): T {
-	if (mask.empty) return entry;
-	if (!isObject(entry) || Array.isArray(entry)) return maskValue(entry, mask) as T;
+export function maskSessionEntry<T>(entry: T, mask: SessionStoreMask | null): T {
+	if (mask === null || mask.empty) return entry;
+	if (!isRecord(entry)) return maskValue(entry, mask) as T;
 	return maskObject(entry, mask, entry.type === "session") as T;
 }
 
@@ -56,14 +56,10 @@ export function maskTitleUpdate(update: SessionTitleUpdate, mask: SessionStoreMa
 	return title === update.title ? update : { ...update, title };
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
 function maskValue(value: unknown, mask: SessionStoreMask): unknown {
 	if (typeof value === "string") return isBlobRef(value) || isImageDataUrl(value) ? value : mask.maskText(value);
-	if (!isObject(value)) return value;
 	if (Array.isArray(value)) return maskArray(value, mask);
+	if (!isRecord(value)) return value;
 	return maskObject(value, mask, false);
 }
 
@@ -72,7 +68,7 @@ function maskChild(value: unknown, mask: SessionStoreMask, key?: string): unknow
 	const next = maskValue(value, mask);
 	if (next === value) return value;
 	if (key !== undefined && CARRIER_KEYS.has(key)) return DROP;
-	if (isObject(value) && typeof value.type === "string" && CARRIER_TYPES.has(value.type)) return DROP;
+	if (isRecord(value) && typeof value.type === "string" && CARRIER_TYPES.has(value.type)) return DROP;
 	return next;
 }
 
@@ -87,11 +83,11 @@ function maskArray(items: unknown[], mask: SessionStoreMask): unknown[] {
 			copy = items.slice(0, i);
 		}
 		if (next === DROP) continue;
-		if (next !== item && isObject(item) && item.type === SERVER_TOOL_TYPE) serverToolChanged = true;
+		if (next !== item && isRecord(item) && item.type === SERVER_TOOL_TYPE) serverToolChanged = true;
 		copy.push(next);
 	}
 	if (copy === undefined) return items;
-	return serverToolChanged ? copy.filter(item => !isObject(item) || item.type !== SERVER_TOOL_TYPE) : copy;
+	return serverToolChanged ? copy.filter(item => !isRecord(item) || item.type !== SERVER_TOOL_TYPE) : copy;
 }
 
 function maskObject(obj: Record<string, unknown>, mask: SessionStoreMask, header: boolean): Record<string, unknown> {

@@ -2118,7 +2118,7 @@ export class SessionManager {
 	}
 
 	#lineFor(entry: FileEntry, mask = sessionStoreMaskFor(this.#cwd)): string {
-		return `${stringifyJson(prepareEntryForPersistence(mask ? maskSessionEntry(entry, mask) : entry, this.#blobs)) ?? "null"}\n`;
+		return `${stringifyJson(prepareEntryForPersistence(maskSessionEntry(entry, mask), this.#blobs)) ?? "null"}\n`;
 	}
 
 	/**
@@ -2208,11 +2208,16 @@ export class SessionManager {
 	}
 
 	#titleSlotLine(mask = sessionStoreMaskFor(this.#cwd)): string {
-		return serializeTitleSlot({
-			title: mask && this.#sessionName ? mask.maskText(this.#sessionName) : this.#sessionName,
-			source: this.#titleSource,
-			updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
-		});
+		return serializeTitleSlot(
+			maskTitleUpdate(
+				{
+					title: this.#sessionName,
+					source: this.#titleSource,
+					updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
+				},
+				mask,
+			),
+		);
 	}
 
 	/** Serialize the whole file lazily, retaining only one JSONL record at a time. */

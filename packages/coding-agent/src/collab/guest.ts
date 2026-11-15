@@ -535,9 +535,7 @@ export class CollabGuestLink {
 			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(pending.header),
 		};
 		const mask = sessionStoreMaskFor(this.#ctx.sessionManager.getCwd());
-		const lines = [header, ...pending.entries]
-			.map(entry => JSON.stringify(mask ? maskSessionEntry(entry, mask) : entry))
-			.join("\n");
+		const lines = [header, ...pending.entries].map(entry => JSON.stringify(maskSessionEntry(entry, mask))).join("\n");
 		const storage = new FileSessionStorage();
 		this.#replicaLease ??= storage.claimSession(this.#replicaId, replicaPath) ?? undefined;
 		// Published atomically: `omp gc` reads the replica's header to find its

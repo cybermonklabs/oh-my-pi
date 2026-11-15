@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { collectEnvSecrets } from "@oh-my-pi/pi-coding-agent/secrets";
 import { SessionStoreMasker } from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import { restoreEnvValue } from "../helpers/settings-test-state";
 
 const MODULE_PATH = path.join(import.meta.dir, "../../src/secrets/session-store-mask.ts");
 const ENV_VALUE = "alpha-bravo-charlie-1234";
@@ -108,10 +109,7 @@ describe("SessionStoreMasker sources", () => {
 			expect(collected.has(urlPart)).toBe(false);
 			expect(collected.has(ENV_VALUE)).toBe(true);
 		} finally {
-			for (const [name, value] of saved) {
-				if (value === undefined) delete process.env[name];
-				else process.env[name] = value;
-			}
+			for (const [name, value] of saved) restoreEnvValue(name, value);
 		}
 	});
 
@@ -203,6 +201,25 @@ describe("SessionStoreMasker refresh", () => {
 			"[REDACTED:file:EXAMPLE_TOKEN_FILE] [REDACTED:file:EXAMPLE_TOKEN_FILE]",
 		);
 	});
+
+	it.skipIf(process.getuid?.() === 0)(
+		"reads a secrets.yml again at the next refresh once a permission fix makes it readable",
+		async () => {
+			const value = "project-plain-value-90";
+			await Bun.write(projectYml, ["- type: plain", `  content: ${value}`].join("\n"));
+			fs.chmodSync(projectYml, 0o000);
+			const masker = maskerFor({});
+			expect(masker.snapshot(cwd).maskText(value)).toBe(value);
+			// The ctime moves in clock ticks: repeat the fix until it shows there, as a later fix would.
+			const lockedCtime = fs.statSync(projectYml, { bigint: true }).ctimeNs;
+			do {
+				fs.chmodSync(projectYml, 0o600);
+			} while (fs.statSync(projectYml, { bigint: true }).ctimeNs === lockedCtime);
+			await nextRun();
+			clock += MINUTE;
+			expect(masker.snapshot(cwd).maskText(value)).toBe("[REDACTED:secrets.yml:project#1]");
+		},
+	);
 
 	it("picks up a variable set after the build at the first refresh a minute later, outside the current run", async () => {
 		const late = "late-secret-value-333";

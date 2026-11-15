@@ -1,10 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getAgentDir, hasFsCode, isEnoent, isFsError, logger } from "@oh-my-pi/pi-utils";
-import { collectEnvSecretValues, connectionUrlPasswords, MIN_ENV_VALUE_LENGTH } from "./env-secrets";
+import { getAgentDir, isEnoent, isEnotdir, isFsError, logger } from "@oh-my-pi/pi-utils";
+import { collectEnvSecretValues, connectionUrlPasswords, type Env, MIN_ENV_VALUE_LENGTH } from "./env-secrets";
 import type { SecretEntry } from "./obfuscator";
 import { MIN_OBFUSCATE_SECRET_LEN, sanitizeSecretFriendlyName } from "./placeholder";
-import { compileSecretRegex } from "./regex";
+import { compileSecretRegex, literalAlternationSource } from "./regex";
 import { globalSecretsFilePath, loadSecretsFileSync, projectSecretsFilePath } from "./secrets-file";
 
 export type SessionStoreMaskSourceKind = "env" | "file" | "secrets.yml";
@@ -17,7 +17,7 @@ export interface SessionStoreMaskSource {
 
 export interface SessionStoreMaskerOptions {
 	/** Environment to read secrets and `_FILE` paths from (default: `process.env`). */
-	env?: () => Readonly<Record<string, string | undefined>>;
+	env?: () => Env;
 	/** Directory of the global secrets.yml (default: `getAgentDir()`). */
 	agentDir?: string;
 	/** Clock for the refresh interval (default: `Date.now`). */
@@ -42,19 +42,11 @@ interface HeldRegex {
 	readonly source: HeldSource;
 }
 
-type Env = Readonly<Record<string, string | undefined>>;
-
 const REFRESH_INTERVAL_MS = 60_000;
 const MAX_SECRET_FILE_BYTES = 1024 * 1024;
 const UNSAFE_NAME_CHARS = /[^A-Za-z0-9_.-]/g;
-
-/** Regex source matching any of `literals`, longest first (ties in code-unit order) so a value containing another wins. */
-function alternation(literals: Iterable<string>): string {
-	return [...literals]
-		.sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0))
-		.map(literal => RegExp.escape(literal))
-		.join("|");
-}
+/** The start of every marker. */
+const MARKER_PREFIX = "[REDACTED:";
 
 /**
  * An immutable set of secret values and regexes, each mapped to a marker that
@@ -70,8 +62,8 @@ export class SessionStoreMask {
 	readonly #literal: RegExp | undefined;
 	/** Any held value; the no-hit fast path. */
 	readonly #valueProbe: RegExp | undefined;
-	/** Splits text on the exact markers, keeping them at the odd indexes. */
-	readonly #markerSplit: RegExp;
+	/** Splits text on the exact markers, keeping them at the odd indexes; set only when regexes are held. */
+	readonly #markerSplit: RegExp | undefined;
 
 	constructor(
 		valueMarkers: ReadonlyMap<string, string>,
@@ -82,10 +74,10 @@ export class SessionStoreMask {
 		this.#regexes = regexes;
 		this.sources = sources;
 		this.empty = valueMarkers.size === 0 && regexes.length === 0;
-		const markers = alternation(new Set([...valueMarkers.values(), ...regexes.map(({ marker }) => marker)]));
-		this.#markerSplit = new RegExp(`(${markers})`);
+		const markers = literalAlternationSource([...valueMarkers.values(), ...regexes.map(({ marker }) => marker)]);
+		if (regexes.length > 0) this.#markerSplit = new RegExp(`(${markers})`);
 		if (valueMarkers.size > 0) {
-			const values = alternation(valueMarkers.keys());
+			const values = literalAlternationSource(valueMarkers.keys());
 			this.#literal = new RegExp(`(${markers})|${values}`, "g");
 			this.#valueProbe = new RegExp(values);
 		}
@@ -118,9 +110,15 @@ export class SessionStoreMask {
 	#step(text: string): string {
 		let next = this.#literal ? text.replace(this.#literal, this.#maskLiteral) : text;
 		for (const { regex, marker } of this.#regexes) {
-			const parts = next.split(this.#markerSplit);
+			const replaceMatch = (match: string): string => (match === "" ? match : marker);
+			// Text without a marker is all outside the markers: no split needed.
+			if (!next.includes(MARKER_PREFIX)) {
+				next = next.replace(regex, replaceMatch);
+				continue;
+			}
+			const parts = next.split(this.#markerSplit!);
 			for (let i = 0; i < parts.length; i += 2) {
-				parts[i] = parts[i].replace(regex, match => (match === "" ? match : marker));
+				parts[i] = parts[i].replace(regex, replaceMatch);
 			}
 			next = parts.join("");
 		}
@@ -130,14 +128,17 @@ export class SessionStoreMask {
 	#maskLiteral = (match: string, marker: string | undefined): string => marker ?? this.#valueMarkers.get(match)!;
 }
 
-/** Identity of the file at `filePath` for change checks; throws when it cannot be stat'ed. */
+/**
+ * Identity of the file at `filePath` for change checks; throws when it cannot be stat'ed.
+ * The ctime is part of it, so a file fixed by `chmod` or `chown` is read again.
+ */
 function statStamp(filePath: string): string {
 	const stat = fs.statSync(filePath, { bigint: true });
-	return `${filePath}\0${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}`;
+	return `${filePath}\0${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 }
 
 function fileErrorReason(err: unknown): string {
-	if (isEnoent(err) || hasFsCode(err, "ENOTDIR")) return "missing";
+	if (isEnoent(err) || isEnotdir(err)) return "missing";
 	return `unreadable (${isFsError(err) ? err.code : "error"})`;
 }
 
@@ -191,8 +192,10 @@ export class SessionStoreMasker {
 	readonly #sources: HeldSource[] = [];
 	readonly #namedSources = new Map<string, HeldSource>();
 	readonly #values = new Map<string, HeldSource>();
-	readonly #regexes: HeldRegex[] = [];
-	readonly #regexKeys = new Set<string>();
+	/** By `<source>/<flags>`, in the order they were added. */
+	readonly #regexes = new Map<string, HeldRegex>();
+	/** Env and file sources held so far, by kind: the last `#<n>` position given. */
+	readonly #namedCounts = { env: 0, file: 0 };
 	/** Stamp of each `_FILE` variable's file at its last read, by variable name. */
 	readonly #fileStamps = new Map<string, string>();
 	/** Stamp of each secrets.yml at its last read, by path. */
@@ -269,7 +272,7 @@ export class SessionStoreMasker {
 			if (this.#fileStamps.get(name) === stamp) return;
 			read = readSecretFile(filePath);
 		} catch (err) {
-			// Not stamped: a permission fix leaves the stamp unchanged, so retry next time.
+			// Not stamped, so the next refresh tries again even when the file has not changed.
 			this.#skipFile(name, fileErrorReason(err));
 			return;
 		}
@@ -322,9 +325,8 @@ export class SessionStoreMasker {
 		}
 		const regex = compileSecretRegex(entry.content, entry.flags);
 		const key = `${regex.source}/${regex.flags}`;
-		if (this.#regexKeys.has(key)) return;
-		this.#regexKeys.add(key);
-		this.#regexes.push({ regex, source: source() });
+		if (this.#regexes.has(key)) return;
+		this.#regexes.set(key, { regex, source: source() });
 		this.#grew = true;
 	}
 
@@ -333,7 +335,7 @@ export class SessionStoreMasker {
 			const key = `${kind}:${name}`;
 			let source = this.#namedSources.get(key);
 			if (source === undefined) {
-				const position = this.#sources.filter(held => held.kind === kind).length + 1;
+				const position = ++this.#namedCounts[kind];
 				source = this.#addSource({ kind, name: name.replace(UNSAFE_NAME_CHARS, "_"), fallback: `#${position}` });
 				this.#namedSources.set(key, source);
 			}
@@ -357,7 +359,7 @@ export class SessionStoreMasker {
 		for (const value of this.#values.keys()) {
 			if (label.includes(value)) return true;
 		}
-		for (const { regex } of this.#regexes) {
+		for (const { regex } of this.#regexes.values()) {
 			regex.lastIndex = 0;
 			for (const match of label.matchAll(regex)) {
 				if (match[0] !== "") return true;
@@ -373,7 +375,7 @@ export class SessionStoreMasker {
 		for (const source of this.#sources) {
 			// Labels are recomputed over every held secret, so a value added later still never shows in a marker.
 			const name = this.#exposesSecret(source.name) ? source.fallback : source.name;
-			markers.set(source, `[REDACTED:${source.kind}:${name}]`);
+			markers.set(source, `${MARKER_PREFIX}${source.kind}:${name}]`);
 			const id = `${source.kind}:${name}`;
 			if (listed.has(id)) continue;
 			listed.add(id);
@@ -381,7 +383,10 @@ export class SessionStoreMasker {
 		}
 		const values = new Map<string, string>();
 		for (const [value, source] of this.#values) values.set(value, markers.get(source)!);
-		const regexes = this.#regexes.map(({ regex, source }) => ({ regex, marker: markers.get(source)! }));
+		const regexes = Array.from(this.#regexes.values(), ({ regex, source }) => ({
+			regex,
+			marker: markers.get(source)!,
+		}));
 		logger.info("Session store masking sources", { sources: [...listed] });
 		this.#grew = false;
 		this.#snapshot = new SessionStoreMask(values, regexes, sources);
@@ -391,8 +396,9 @@ export class SessionStoreMasker {
 
 const processMaskers = new Map<string, SessionStoreMasker>();
 
-/** The process-wide masker for `agentDir` (default: the active agent dir), shared by every session writer. */
-export function processSessionStoreMasker(agentDir: string = getAgentDir()): SessionStoreMasker {
+/** The process-wide masker for the active agent dir (`getAgentDir()`), shared by every session writer. */
+export function processSessionStoreMasker(): SessionStoreMasker {
+	const agentDir = getAgentDir();
 	let masker = processMaskers.get(agentDir);
 	if (masker === undefined) {
 		masker = new SessionStoreMasker({ agentDir });

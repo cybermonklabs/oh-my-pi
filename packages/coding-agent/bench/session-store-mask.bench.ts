@@ -36,6 +36,7 @@ import { setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { type SessionStoreMask, sessionStoreMaskFor, setSessionStoreMasking } from "../src/secrets/session-store-mask";
 import { SessionManager } from "../src/session/session-manager";
 import { MemorySessionStorage } from "../src/session/session-storage";
+import { countOccurrences } from "../src/tools/jfind/text";
 
 const RUNS = 5;
 const ENTRIES = 5_000;
@@ -190,12 +191,6 @@ function textOf(chars: number, seed: number, secret?: string): string {
 	return [CORPUS.slice(offset, offset + head), secret, CORPUS.slice(offset + head, offset + filler)].join(" ");
 }
 
-function occurrences(text: string, needle: string): number {
-	let count = 0;
-	for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + needle.length)) count++;
-	return count;
-}
-
 function userMessage(text: string): UserMessage {
 	return { role: "user", content: text, timestamp: NOW };
 }
@@ -307,7 +302,7 @@ function plant(values: readonly string[], count: number): Planting {
 	for (const value of values) {
 		counts.set(
 			value,
-			secrets.reduce((sum, secret) => sum + occurrences(secret, value), 0),
+			secrets.reduce((sum, secret) => sum + countOccurrences(secret, value), 0),
 		);
 	}
 	return { secrets, occurrences: counts };
@@ -332,7 +327,7 @@ function expectMask(mask: SessionStoreMask | null, on: boolean, spec: MaskerSpec
 
 /** Fails unless the rewrite masked every planted secret (on) or kept every one (off); returns the marker count. */
 function checkRewrite(spec: MaskerSpec, planting: Planting, output: string, on: boolean): number {
-	const markers = occurrences(output, MARKER_PREFIX);
+	const markers = countOccurrences(output, MARKER_PREFIX);
 	if (on) {
 		const leaked = [...planting.occurrences.keys()].filter(value => output.includes(value)).length;
 		if (markers !== planting.secrets.length || leaked > 0) {
@@ -342,7 +337,9 @@ function checkRewrite(spec: MaskerSpec, planting: Planting, output: string, on: 
 		}
 		return markers;
 	}
-	const misplanted = [...planting.occurrences].filter(([value, count]) => occurrences(output, value) !== count).length;
+	const misplanted = [...planting.occurrences].filter(
+		([value, count]) => countOccurrences(output, value) !== count,
+	).length;
 	if (markers > 0 || misplanted > 0) {
 		throw new SelfCheckFailure(
 			`${spec.name}: the unmasked rewrite holds ${markers} markers, and ${misplanted} of ${planting.occurrences.size} secret values not as often as planted`,
@@ -483,8 +480,8 @@ async function benchMasker(spec: MaskerSpec, root: string, cwd: string, sessions
 	// Each masked append stored a marker in place of the secret, each unmasked one the secret itself.
 	const appended = appendStorage.readTextSync(appendManager.getSessionFile()!);
 	const appendsPerMode = 2 * (RUNS + 1);
-	const appendMarkers = occurrences(appended, MARKER_PREFIX);
-	const appendSecrets = occurrences(appended, secret);
+	const appendMarkers = countOccurrences(appended, MARKER_PREFIX);
+	const appendSecrets = countOccurrences(appended, secret);
 	if (appendMarkers !== appendsPerMode || appendSecrets !== appendsPerMode) {
 		throw new SelfCheckFailure(
 			`${spec.name}: ${appendsPerMode} masked and ${appendsPerMode} unmasked appends stored ${appendMarkers} markers and ${appendSecrets} secrets`,
