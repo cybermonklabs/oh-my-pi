@@ -11,6 +11,7 @@ import {
 import {
 	FileSessionStorage,
 	SessionLockError,
+	type SessionStorageWriteOptions,
 	SessionWriteConflictError,
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
@@ -794,5 +795,104 @@ describe("IndexedSessionStorage.writeTextAtomic commitGuard", () => {
 		await write;
 		expect(drained).toBe(true);
 		expect(backend.writeFullCalls.map(call => call.content)).toEqual(["pre-seal body"]);
+	});
+});
+
+/** A backend that keeps each session's text in memory and stores a full write as it is given. */
+class MemoryBackend implements SessionStorageBackend {
+	readonly sessions = new Map<string, string>();
+
+	init(): Promise<void> {
+		return Promise.resolve();
+	}
+	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
+		return Promise.resolve([]);
+	}
+	readFull(path: string): Promise<string | null> {
+		return Promise.resolve(this.sessions.get(path) ?? null);
+	}
+	readSlices(): Promise<[string, string]> {
+		return Promise.resolve(["", ""]);
+	}
+	writeFull(path: string, content: string): Promise<void> {
+		this.sessions.set(path, content);
+		return Promise.resolve();
+	}
+	append(path: string, line: string): Promise<void> {
+		this.sessions.set(path, (this.sessions.get(path) ?? "") + line);
+		return Promise.resolve();
+	}
+	updateSessionTitle(): Promise<void> {
+		return Promise.resolve();
+	}
+	truncate(path: string): Promise<void> {
+		this.sessions.set(path, "");
+		return Promise.resolve();
+	}
+	remove(paths: string[]): Promise<void> {
+		for (const path of paths) this.sessions.delete(path);
+		return Promise.resolve();
+	}
+	move(): Promise<void> {
+		return Promise.resolve();
+	}
+}
+
+/** An indexed storage that records the whole text each full rewrite hands its own text writers. */
+class InterceptingIndexedStorage extends IndexedSessionStorage {
+	readonly intercepted: string[] = [];
+
+	override writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void {
+		this.intercepted.push(content);
+		super.writeTextSync(path, content, options);
+	}
+
+	override async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		this.intercepted.push(content);
+		await super.writeTextAtomic(path, content, options);
+	}
+}
+
+describe("IndexedSessionStorage full writes of lines a generator yields", () => {
+	// `SessionManager` hands a full rewrite its serialized lines as a lazy iterable, which can be read only once.
+	const lines = [
+		`${JSON.stringify({ type: "session", version: 3, id: "lazy", timestamp: "t0", cwd: "/cwd" })}\n`,
+		`${JSON.stringify({ type: "custom", customType: "n", id: "a", parentId: null, timestamp: "t1" })}\n`,
+		`${JSON.stringify({ type: "custom", customType: "n", id: "b", parentId: "a", timestamp: "t2" })}\n`,
+	];
+	const body = lines.join("");
+	function* serialized(): Generator<string> {
+		yield* lines;
+	}
+
+	it("spools the lines and stores their bytes through writeLinesAtomic and writeLinesSync", async () => {
+		const backend = new MemoryBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+
+		await storage.writeLinesAtomic("/sessions/atomic.jsonl", serialized(), { expectedSize: null });
+		storage.writeLinesSync("/sessions/sync.jsonl", serialized(), { expectedSize: null });
+		await storage.drain();
+
+		expect(Object.fromEntries(backend.sessions)).toEqual({
+			"/sessions/atomic.jsonl": body,
+			"/sessions/sync.jsonl": body,
+		});
+	});
+
+	it("hands a subclass that intercepts writeTextAtomic and writeTextSync the joined lines, and stores them", async () => {
+		const backend = new MemoryBackend();
+		const storage = new InterceptingIndexedStorage(backend);
+		await storage.initialize();
+
+		await storage.writeLinesAtomic("/sessions/atomic.jsonl", serialized(), { expectedSize: null });
+		storage.writeLinesSync("/sessions/sync.jsonl", serialized(), { expectedSize: null });
+		await storage.drain();
+
+		expect(storage.intercepted).toEqual([body, body]);
+		expect(Object.fromEntries(backend.sessions)).toEqual({
+			"/sessions/atomic.jsonl": body,
+			"/sessions/sync.jsonl": body,
+		});
 	});
 });

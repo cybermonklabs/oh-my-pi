@@ -29,6 +29,7 @@
 ### Fixed
 
 - Resuming a long session from SQL session storage, and rewriting it in full, no longer holds the whole transcript in memory
+- Debug reports, `omp gc --blobs` and memories stage 1 read long transcripts from SQL session storage chunk by chunk instead of whole, and RPC `get_subagent_messages` and the Agent Hub transcript viewer read at most 8 MiB of a transcript at a time (an RPC client repeats the request from `nextByte` to read on)
 - Fixed the debug menu's "Clear artifact cache" deleting whole project directories, session transcripts included; it now removes only tool output files older than 30 days and keeps transcripts, subagent outputs, `/btw` conversations and drafts. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - A failed `/tan` dispatch no longer leaves its clone's transcript behind or keeps the clone's ownership lease, under file and SQL session storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - Under `session.storage: sql`, `omp stats`, `/stats`, `/trace`, `omp session pack/unpack/moved/lease`, RPC `get_session_lease` and `gc.autoCompress` refuse with a message naming the setting instead of acting on an empty file tree, and the `/usage` heatmap says why it is empty while quotas still show. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))

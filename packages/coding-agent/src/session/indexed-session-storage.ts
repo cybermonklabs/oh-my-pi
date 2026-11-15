@@ -286,10 +286,10 @@ function sweepStaleSpools(dir: string): void {
 }
 
 /**
- * Spool `lines` to a new file under `<os temp>/omp-spool`, counting its bytes
- * and reading the title slot from its first line.
+ * Spool `lines` to a new file under `<os temp>/omp-spool`, iterating them
+ * once, counting its bytes and reading the title slot from its first line.
  */
-function spoolLines(lines: readonly string[]): BodySpool {
+function spoolLines(lines: Iterable<string>): BodySpool {
 	const dir = path.join(os.tmpdir(), SPOOL_DIR);
 	fs.mkdirSync(dir, { recursive: true });
 	const windows = process.platform === "win32";
@@ -492,14 +492,14 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Streaming {@link writeTextSync}: spools `lines` to a temporary file and
-	 * publishes it from there, so the body is never one string. A subclass or
-	 * spy that intercepts {@link writeTextSync} still sees every full rewrite:
-	 * the lines are then joined and routed through it.
+	 * Streaming {@link writeTextSync}: spools `lines`, iterated once, to a
+	 * temporary file and publishes it from there, so the body is never one
+	 * string. A subclass or spy that intercepts {@link writeTextSync} still sees
+	 * every full rewrite: the lines are then joined and routed through it.
 	 */
-	writeLinesSync(path: string, lines: readonly string[], options?: SessionStorageWriteOptions): void {
+	writeLinesSync(path: string, lines: Iterable<string>, options?: SessionStorageWriteOptions): void {
 		if (this.writeTextSync !== IndexedSessionStorage.prototype.writeTextSync) {
-			this.writeTextSync(path, lines.join(""), options);
+			this.writeTextSync(path, Array.from(lines).join(""), options);
 			return;
 		}
 		this.#assertExpectedSize(path, options?.expectedSize);
@@ -733,15 +733,15 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Streaming {@link writeTextAtomic}: spools `lines` to a temporary file and
-	 * publishes it from there, and after a failed publish compares the stored
-	 * bytes with the spool by size and SHA-256. A subclass or spy that
-	 * intercepts {@link writeTextAtomic} still sees every full rewrite: the
-	 * lines are then joined and routed through it.
+	 * Streaming {@link writeTextAtomic}: spools `lines`, iterated once, to a
+	 * temporary file and publishes it from there, and after a failed publish
+	 * compares the stored bytes with the spool by size and SHA-256. A subclass or
+	 * spy that intercepts {@link writeTextAtomic} still sees every full rewrite:
+	 * the lines are then joined and routed through it.
 	 */
-	async writeLinesAtomic(path: string, lines: readonly string[], options?: WriteTextAtomicOptions): Promise<void> {
+	async writeLinesAtomic(path: string, lines: Iterable<string>, options?: WriteTextAtomicOptions): Promise<void> {
 		if (this.writeTextAtomic !== IndexedSessionStorage.prototype.writeTextAtomic) {
-			return this.writeTextAtomic(path, lines.join(""), options);
+			return this.writeTextAtomic(path, Array.from(lines).join(""), options);
 		}
 		await this.#publishAtomic(path, options, () => this.#spoolBody(path, spoolLines(lines)));
 	}
