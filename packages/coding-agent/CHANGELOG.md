@@ -4,6 +4,7 @@
 ### Changed
 
 - When saving pruned tool output fails, the pruning now stays applied in the live context, and the session file catches up on the next successful save.
+- A recovered retry and the stamps written after a compaction (its dead-end warning, its corrected context size, and content an elide pass shortened) now append a small record to the session file instead of rewriting the whole file, so those writes no longer grow with session length.
 
 ### Fixed
 

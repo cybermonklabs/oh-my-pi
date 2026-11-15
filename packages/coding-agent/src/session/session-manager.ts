@@ -133,6 +133,15 @@ import {
 	normalizeWorkspaceDirectory,
 } from "./session-workspace";
 import { recordSessionRecap, recordSessionTitle } from "./session-index";
+import {
+	applyEntryPatches,
+	ENTRY_PATCH_CUSTOM_TYPE,
+	type EntryPatch,
+	entryAcceptsPatch,
+	setPatchedFields,
+	toEntryPatchData,
+	withoutEntryPatches,
+} from "./entry-patches";
 import { applyToolResultPrunes } from "./tool-result-prunes";
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
@@ -829,8 +838,9 @@ interface AtomicEntryBatch {
 /**
  * The state a full-file body was serialized from, cheap to compare against
  * the live state. Entries change only by append, array replacement, or an
- * in-place update announced through `rewriteEntries()` (which bumps the
- * revision); the title slot and header are small and compared by value.
+ * in-place update announced through `rewriteEntries()` or `patchEntries()`
+ * (which bump the revision); the title slot and header are small and compared
+ * by value.
  */
 interface SessionBodyStamp {
 	entries: readonly SessionEntry[];
@@ -1642,7 +1652,7 @@ export class SessionManager {
 		const lines = [titleLine, headerLine];
 		let bytes = Buffer.byteLength(titleLine, "utf8") + Buffer.byteLength(headerLine, "utf8");
 		for (const entry of entries) {
-			const line = this.#lineFor(entry);
+			const line = this.#lineFor(withoutEntryPatches(entry));
 			bytes += Buffer.byteLength(line, "utf8");
 			lines.push(line);
 		}
@@ -2449,6 +2459,7 @@ export class SessionManager {
 
 		const migrated = migrateToCurrentVersion(fileEntries);
 		applyToolResultPrunes(fileEntries);
+		applyEntryPatches(fileEntries);
 		await resolveBlobRefsInEntries(fileEntries, this.#blobs);
 		// loadEntriesFromFile guarantees entries[0] is a valid session header.
 		const header = fileEntries[0] as SessionHeader;
@@ -3392,7 +3403,7 @@ export class SessionManager {
 		return this.#titleSource;
 	}
 
-	/** Bumped when entries are rewritten in place (`rewriteEntries`, replay sanitizing); appends do not bump it. */
+	/** Bumped when entries change in place (`rewriteEntries`, `patchEntries`, replay sanitizing); appends do not bump it. */
 	get bodyRevision(): number {
 		return this.#bodyRevision;
 	}
@@ -3779,11 +3790,45 @@ export class SessionManager {
 	/**
 	 * Rewrite the whole session file after in-place entry updates that have no
 	 * append-only record. Costs the full transcript in bytes; use sparingly.
+	 * Field updates that {@link patchEntries} can describe go through it instead.
 	 */
 	async rewriteEntries(): Promise<void> {
 		this.#bodyRevision++;
 		if (!this.#persist || !this.#sessionFile) return;
 		await this.#rewriteAtomically();
+	}
+
+	/**
+	 * Set fields on entries this session holds and persist them as one appended
+	 * `entry_patch` record, whose size follows the patched fields rather than
+	 * the transcript; whole-file readers replay it on load (`entry-patches.ts`).
+	 * Bumps the body revision, as {@link rewriteEntries} does, so observers of
+	 * in-place updates (the thread publisher) republish the entries.
+	 *
+	 * Rejects before changing anything when a patch names an entry this
+	 * session lacks or a field that entry's kind does not have. A failed write
+	 * does not reject: like every append, it reaches the persistence-error
+	 * observers, the fields stay set, and the next successful write lands them.
+	 * Resolves once pending writes, the record's included, have settled.
+	 */
+	async patchEntries(patches: readonly EntryPatch[]): Promise<void> {
+		if (patches.length === 0) return;
+		const data = toEntryPatchData(patches);
+		const changes = data.patches.map(patch => {
+			const target = this.#index.get(patch.entryId);
+			if (!target || !entryAcceptsPatch(target, patch)) {
+				throw new Error(`Entry patch does not fit session entry ${patch.entryId}`);
+			}
+			return { target, patch };
+		});
+		for (const { target, patch } of changes) setPatchedFields(target, patch);
+		this.#bodyRevision++;
+		this.appendCustomEntry(ENTRY_PATCH_CUSTOM_TYPE, data);
+		try {
+			await this.flush();
+		} catch (error) {
+			this.#noteDiskFailure(error);
+		}
 	}
 
 	/**
@@ -4314,6 +4359,7 @@ export class SessionManager {
 		}
 		migrateToCurrentVersion(sourceEntries);
 		applyToolResultPrunes(sourceEntries);
+		applyEntryPatches(sourceEntries);
 		await resolveBlobRefsInEntries(sourceEntries, manager.#blobs);
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;

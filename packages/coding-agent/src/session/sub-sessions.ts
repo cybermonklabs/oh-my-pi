@@ -13,6 +13,7 @@ import { isAdvisorTranscriptName } from "../advisor/transcript-recorder";
 import { getAgentTombstonePath } from "../registry/agent-tombstone";
 import { resolveSessionLeafId, type SessionEntry, type SessionHeader } from "./session-entries";
 import { loadSessionFile, parseSessionContent, type SessionLoadResult } from "./session-loader";
+import { applyEntryPatches } from "./entry-patches";
 import { applyToolResultPrunes } from "./tool-result-prunes";
 
 const utf8Decoder = new TextDecoder();
@@ -116,6 +117,7 @@ async function collectSubSessionsFromDir(
 		// not look complete while omitting the transcript.
 		if (!invalidHeader && fileEntries.length > 0) {
 			applyToolResultPrunes(fileEntries);
+			applyEntryPatches(fileEntries);
 			const header = (fileEntries.find(e => e.type === "session") as SessionHeader | undefined) ?? null;
 			const entries = fileEntries.filter((e): e is SessionEntry => e.type !== "session");
 			out[key] = {
