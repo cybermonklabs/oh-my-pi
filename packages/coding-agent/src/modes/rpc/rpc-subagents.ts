@@ -3,7 +3,7 @@ import { type AgentRef, AgentRegistry } from "../../registry/agent-registry";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
-import { defaultSessionStorage, readSessionTextFrom, type SessionStorage } from "../../session/session-storage";
+import { defaultSessionStorage, readSessionLinesFrom, type SessionStorage } from "../../session/session-storage";
 import { type AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import {
 	type SubagentEventPayload,
@@ -67,6 +67,11 @@ function addPruned(set: Set<string>, value: string, maxSize: number): void {
 	}
 }
 
+/**
+ * The complete entries of `sessionFile` from byte `fromByte`, read in a window
+ * of at most 8 MiB (more only for a line longer than 4 MiB), so a long
+ * transcript is never held whole; a caller reads on from `nextByte`.
+ */
 export async function readRpcSubagentTranscript(
 	sessionFile: string,
 	fromByte = 0,
@@ -75,7 +80,7 @@ export async function readRpcSubagentTranscript(
 	let startByte = Number.isFinite(fromByte) ? Math.max(0, Math.trunc(fromByte)) : 0;
 	let read: { text: string; size: number };
 	try {
-		read = await readSessionTextFrom(storage, sessionFile, startByte);
+		read = await readSessionLinesFrom(storage, sessionFile, startByte);
 	} catch (err) {
 		if (!isEnoent(err)) throw err;
 		return {
@@ -92,7 +97,7 @@ export async function readRpcSubagentTranscript(
 		// The transcript was rewritten shorter: read it again from the start.
 		startByte = 0;
 		reset = true;
-		read = await readSessionTextFrom(storage, sessionFile, 0);
+		read = await readSessionLinesFrom(storage, sessionFile, 0);
 	}
 
 	const text = read.text;

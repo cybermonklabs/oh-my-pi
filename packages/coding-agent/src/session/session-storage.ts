@@ -742,11 +742,11 @@ export const LINE_STREAM_CHUNK = 1 << 20;
 
 /**
  * Write `lines` at `fd`'s position in chunks of about {@link LINE_STREAM_CHUNK}
- * UTF-16 units, never holding their full concatenation. Returns the UTF-8 bytes
- * written and the text of the first chunk, which holds the first line unless
- * that line alone is longer than a chunk.
+ * UTF-16 units, never holding their full concatenation, iterating them once.
+ * Returns the UTF-8 bytes written and the text of the first chunk, which holds
+ * the first line unless that line alone is longer than a chunk.
  */
-export function writeLinesToDescriptorSync(fd: number, lines: readonly string[]): { bytes: number; head: string } {
+export function writeLinesToDescriptorSync(fd: number, lines: Iterable<string>): { bytes: number; head: string } {
 	let bytes = 0;
 	let head: string | undefined;
 	let chunk = "";
@@ -1606,6 +1606,34 @@ export async function readSessionTextFrom(
 	if (offset >= bytes.length) return { text: "", size: bytes.length };
 	const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
 	return { text: bytes.subarray(offset, end).toString("utf8"), size: bytes.length };
+}
+
+/**
+ * Bytes {@link readSessionLinesFrom} reads at once. A key-indexed backend may
+ * fetch the rest of the stored part a window ends in (up to 4 MiB on SQL), so
+ * a read stays within 16 MiB.
+ */
+const TRANSCRIPT_WINDOW_BYTES = 8 * 1024 * 1024;
+
+/**
+ * {@link readSessionTextFrom} of a window of at most 8 MiB from `offset`, for
+ * a caller that tails a transcript: it keeps the complete lines and reads on
+ * from where they end, so a long transcript is never held whole. A window that
+ * stops short of the end with no newline in its second half is doubled until
+ * it has one, so the caller moves forward even when it starts up to half a
+ * window before the lines it has not seen (the Agent Hub viewer re-reads the
+ * end of what it rendered); only a line longer than half a window makes a
+ * window larger.
+ */
+export async function readSessionLinesFrom(
+	storage: SessionStorage,
+	filePath: string,
+	offset: number,
+): Promise<{ text: string; size: number }> {
+	for (let window = TRANSCRIPT_WINDOW_BYTES; ; window *= 2) {
+		const read = await readSessionTextFrom(storage, filePath, offset, window);
+		if (offset + window >= read.size || read.text.lastIndexOf("\n") >= read.text.length / 2) return read;
+	}
 }
 
 function matchesPatternSegment(name: string, pattern: string): boolean {
