@@ -957,16 +957,17 @@ async function chunksMatchBody(chunks: AsyncIterable<Uint8Array>, body: SessionF
 const SYNC_READ_WINDOW_BYTES = 1024 * 1024;
 
 /**
- * The stored transcript at `filePath` as synchronous chunks: windows of at most
- * {@link SYNC_READ_WINDOW_BYTES} through `readTextRangeSync` where the storage
- * has it, or of the file for file storage, and otherwise its whole
- * `readTextSync` text as one chunk; `undefined` when the storage reads nothing
- * synchronously. A missing transcript throws ENOENT once iterated.
+ * The stored transcript at `filePath` as synchronous chunks of at most
+ * {@link SYNC_READ_WINDOW_BYTES}: windows of the file itself for file storage,
+ * whatever its other range readers do; windows through `readTextRangeSync` for
+ * another storage that has it; otherwise its whole `readTextSync` text as one
+ * chunk; `undefined` when the storage reads nothing synchronously. A missing
+ * transcript throws ENOENT once iterated.
  */
 function transcriptByteChunksSync(filePath: string, storage: SessionStorage): Iterable<Uint8Array> | undefined {
+	if (storage instanceof FileSessionStorage) return fileWindows(filePath);
 	const readRange = storage.readTextRangeSync;
 	if (readRange) return textRangeWindows((start, end) => readRange.call(storage, filePath, start, end));
-	if (storage instanceof FileSessionStorage) return fileWindows(filePath);
 	const readText = storage.readTextSync;
 	if (readText) return wholeText(() => readText.call(storage, filePath));
 	return undefined;
