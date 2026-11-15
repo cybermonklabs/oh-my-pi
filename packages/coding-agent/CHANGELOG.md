@@ -126,7 +126,7 @@
 
 - Sessions can now be stored in PostgreSQL, MySQL, or SQLite instead of JSONL files: set `session.storage: sql` and point `session.sql.dsnFile` at a file holding the connection string (or set `OMP_SESSION_STORAGE=sql` and `OMP_SESSION_SQL_DSN_FILE`); `--resume`, `--continue`, the session picker, and listing follow the same store, and joining a collab session needs file storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - `omp gc --restore <session id or archive path>` brings an archived session back to its own path with its artifacts, and names what restoring cannot bring back
-- Added `secrets.maskSessionStore` (off by default): when it is on, the secret values the agent holds (secret-named environment variables, the files that `*_FILE` variables name, and `secrets.yml` entries) are replaced with a `[REDACTED:<source>:<name>]` marker before a session entry, the title, the draft or a collab replica is written to the session store, while the live session keeps the values. See [Secrets in stored sessions](../../docs/secrets.md#secrets-in-stored-sessions)
+- Added `secrets.maskSessionStore` (off by default): when it is on, the secret values the agent holds (secret-named environment variables, the files that `*_FILE` variables name, and `secrets.yml` entries) are replaced with a `[REDACTED:<source>:<name>]` marker before a session entry, the title, the draft or a collab replica is written to the session store, and before the title and the recaps are kept in `history.db`, while the live session keeps the values. See [Secrets in stored sessions](../../docs/secrets.md#secrets-in-stored-sessions)
 
 ### Changed
 

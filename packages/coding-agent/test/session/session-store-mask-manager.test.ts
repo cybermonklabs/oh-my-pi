@@ -1,11 +1,13 @@
 /**
  * Contract: with session store masking on, every write `SessionManager` and the
  * collab guest make to a session store holds a marker in place of each held
- * secret value — entries, header, title slot, title field, draft, replica —
- * while the live in-memory session keeps the real values. Provider replay
- * state is never stored half-masked: a changed signed block loses its
- * signature, a changed carrier is dropped, and ciphertext, images and ids are
- * kept byte for byte. Each case runs against every session store backend.
+ * secret value — entries, header, title slot, title field, draft, replica,
+ * the title and recaps in history.db — while the live in-memory session keeps
+ * the real values. Provider replay state is never stored half-masked: a
+ * changed signed block loses its signature, a changed carrier is dropped, and
+ * ciphertext, images and ids are kept byte for byte. Each session file case
+ * runs against every session store backend; history.db is written for file
+ * storage only.
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fsSync from "node:fs";
@@ -18,12 +20,17 @@ import { bindEffects } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import {
+	closeSessionIndex,
+	listSessionRecaps,
+	lookupSessionTitle,
+} from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import * as utils from "@oh-my-pi/pi-utils";
-import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, isRecord, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "../collab/helpers/in-memory-relay";
 
@@ -544,6 +551,61 @@ for (const backend of backends) {
 		});
 	});
 }
+
+describe("session store masking of the history.db title and recaps", () => {
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+
+	beforeEach(() => {
+		// Under the test runner, history.db opens only in an agent dir the test chose.
+		setAgentDir(tmp.join("agent"));
+		closeSessionIndex();
+	});
+
+	afterEach(() => {
+		closeSessionIndex();
+		if (originalAgentDir) {
+			setAgentDir(originalAgentDir);
+		} else {
+			setAgentDir(fallbackAgentDir);
+			delete process.env.PI_CODING_AGENT_DIR;
+		}
+	});
+
+	/** history.db is written only for file-backed sessions. */
+	async function fileSession(): Promise<SessionManager> {
+		const manager = SessionManager.create(cwd, tmp.join("sessions"), new FileSessionStorage());
+		await manager.ensureOnDisk();
+		return manager;
+	}
+
+	it("records the title and the recap with markers", async () => {
+		maskWrites();
+		const manager = await fileSession();
+		await manager.setSessionName(said(ENV_VALUE), "user");
+		manager.recordRecap(said(FILE_VALUE));
+
+		const title = lookupSessionTitle(manager.getSessionId());
+		expect(title?.includes(ENV_MARKER)).toBe(true);
+		expect(title?.includes(ENV_VALUE)).toBe(false);
+		const recaps = listSessionRecaps({ sessionIds: [manager.getSessionId()] }).map(entry => entry.recap);
+		expect(recaps.length).toBe(1);
+		expect(recaps[0]?.includes(FILE_MARKER)).toBe(true);
+		expect(recaps[0]?.includes(FILE_VALUE)).toBe(false);
+		await manager.close();
+	});
+
+	it("records the title and the recap as written while the setting is at its default", async () => {
+		const manager = await fileSession();
+		await manager.setSessionName(said(ENV_VALUE), "user");
+		manager.recordRecap(said(FILE_VALUE));
+
+		expect(lookupSessionTitle(manager.getSessionId())?.includes(ENV_VALUE)).toBe(true);
+		const recaps = listSessionRecaps({ sessionIds: [manager.getSessionId()] });
+		expect(recaps.some(entry => entry.recap.includes(FILE_VALUE))).toBe(true);
+		await manager.close();
+	});
+});
 
 describe("session store masking switch", () => {
 	it("hands writers a mask only while masking is on, driven by secrets.maskSessionStore", () => {
