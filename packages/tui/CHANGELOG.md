@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `AgentTranscriptSource.readFrom` may return a window of a long transcript that holds at least one complete line; the agent transcript viewer reads on from it at the next poll instead of waiting for the transcript to change
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

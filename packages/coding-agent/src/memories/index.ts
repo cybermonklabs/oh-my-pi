@@ -791,11 +791,12 @@ interface RolloutBytes {
 }
 
 /**
- * Open a rollout in `storage` for windowed reads. A file backend reads each
- * window from disk, so a rollout of hundreds of MB is never held whole. A
- * key-indexed backend (`session.storage: sql`) keeps the rollout as one record
- * with no byte range to read, so it is read once and windowed in memory, the
- * same read `loadSessionFile` performs there. A missing rollout throws either way.
+ * Open a rollout in `storage` for windowed reads, so a rollout of hundreds of
+ * MB is never held whole: a file backend reads each window from disk, and a
+ * storage with `readChunks` (`session.storage: sql`) streams each window from
+ * its first byte and stops at its last. Any other storage is read once and
+ * windowed in memory, the same read `loadSessionFile` performs there. A
+ * missing rollout throws either way.
  */
 async function openRollout(rolloutPath: string, storage: SessionStorage): Promise<RolloutBytes> {
 	if (storage instanceof FileSessionStorage) {
@@ -803,8 +804,28 @@ async function openRollout(rolloutPath: string, storage: SessionStorage): Promis
 		const { size } = await file.stat();
 		return { size, read: (start, end) => file.slice(start, end).bytes() };
 	}
+	if (storage.readChunks) {
+		const readChunks = storage.readChunks.bind(storage);
+		const { size } = storage.statSync(rolloutPath);
+		return { size, read: (start, end) => readPrefix(readChunks(rolloutPath, start), end - start) };
+	}
 	const bytes = new TextEncoder().encode(await storage.readText(rolloutPath));
 	return { size: bytes.length, read: async (start, end) => bytes.subarray(start, end) };
+}
+
+/** The first `length` bytes `chunks` yields, reading no further. */
+async function readPrefix(chunks: AsyncIterable<Uint8Array>, length: number): Promise<Uint8Array> {
+	const parts: Uint8Array[] = [];
+	let wanted = length;
+	if (wanted > 0) {
+		for await (const chunk of chunks) {
+			const part = chunk.byteLength > wanted ? chunk.subarray(0, wanted) : chunk;
+			parts.push(part);
+			wanted -= part.byteLength;
+			if (wanted === 0) break;
+		}
+	}
+	return Buffer.concat(parts);
 }
 
 /** Persistable messages from the start of the rollout, in file order, read window by window. */
@@ -851,10 +872,10 @@ async function* persistableMessagesFromBack(rollout: RolloutBytes): AsyncGenerat
  *
  * Equivalent to `truncateByApproxTokens(JSON.stringify(persistableMessages), tokenLimit)`, but
  * streams the rollout in byte windows and serializes messages from the front and back only until
- * the head/tail budgets fill. On a file backend peak memory is bounded by the window size plus the
- * largest single JSONL record (a record spanning windows is carried until its newline), not by
- * rollout size. The rollout is read through `storage`, where {@link collectThreads} found it
- * (the current session's).
+ * the head/tail budgets fill. On a file backend or a storage with `readChunks`, peak memory is
+ * bounded by the window size plus the largest single JSONL record (a record spanning windows is
+ * carried until its newline), not by rollout size. The rollout is read through `storage`, where
+ * {@link collectThreads} found it (the current session's).
  */
 export async function buildStage1RolloutItems(
 	rolloutPath: string,

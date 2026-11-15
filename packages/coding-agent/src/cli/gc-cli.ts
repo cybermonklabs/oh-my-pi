@@ -30,7 +30,7 @@ import type { Setting } from "../config/registry";
 import { BLOB_HASH_RE, BLOB_STAGING_RE, blobStagingPath } from "../session/blob-store";
 import { listSessionsReadOnly, type SessionInfo, type SessionStatus } from "../session/session-listing";
 import { parseTerminalBreadcrumb } from "../session/session-paths";
-import { readSessionHeaderId } from "../session/session-loader";
+import { readSessionHeaderId, transcriptByteChunks } from "../session/session-loader";
 import {
 	FileSessionStorage,
 	SESSION_STAGING_RE,
@@ -514,6 +514,24 @@ function collectBlobHashesFromText(text: string, hashes: Set<string>): void {
 	}
 }
 
+/**
+ * {@link collectBlobHashesFromText} over the bytes `chunks` yields, holding one
+ * chunk and the line it ends inside at a time. A reference never spans lines,
+ * so each scan stops at the chunk's last newline and carries the cut line,
+ * with any reference it holds, into the next.
+ */
+async function collectBlobHashesFromChunks(chunks: AsyncIterable<Uint8Array>, hashes: Set<string>): Promise<void> {
+	const decoder = new TextDecoder();
+	let tail = "";
+	for await (const chunk of chunks) {
+		const text = tail + decoder.decode(chunk, { stream: true });
+		const end = text.lastIndexOf("\n") + 1;
+		collectBlobHashesFromText(text.slice(0, end), hashes);
+		tail = text.slice(end);
+	}
+	collectBlobHashesFromText(tail + decoder.decode(), hashes);
+}
+
 async function collectReferencedBlobHashes(
 	sessionRoots: string[],
 	exactSessionFiles: string[],
@@ -554,15 +572,13 @@ async function collectReferencedBlobHashes(
 			);
 		}
 		for (const file of stored) {
-			let text: string;
 			try {
-				text = await storage.readText(file);
+				await collectBlobHashesFromChunks(transcriptByteChunks(file, storage), hashes);
 			} catch (error) {
 				// Removed since the listing: it references nothing anymore.
 				if (codeOf(error) === "ENOENT") continue;
 				throw error;
 			}
-			collectBlobHashesFromText(text, hashes);
 		}
 	}
 	return hashes;
