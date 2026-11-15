@@ -383,6 +383,14 @@ export class SessionStoreMasker {
 		}
 		const values = new Map<string, string>();
 		for (const [value, source] of this.#values) values.set(value, markers.get(source)!);
+		// JSON text (a structured yield's `<id>.md`, a printed JSON document) holds a value with a
+		// quote, a backslash or a control character only escaped, so the escaped form is held too,
+		// with the same marker; a held value of that text keeps its own. A marker needs no escape:
+		// masked JSON stays valid.
+		for (const [value, source] of this.#values) {
+			const escaped = JSON.stringify(value).slice(1, -1);
+			if (!values.has(escaped)) values.set(escaped, markers.get(source)!);
+		}
 		const regexes = Array.from(this.#regexes.values(), ({ regex, source }) => ({
 			regex,
 			marker: markers.get(source)!,

@@ -4,7 +4,9 @@
  * follow-up) and its title sidecar, and the subagent output files `agent://<id>` serves
  * (`<id>.md` and `<id>.json`, after the first run and after a later turn rewrites them), hold
  * the marker and no held value, while the live `/btw` record keeps the value and the store's
- * next write raises no conflict. With the setting off, every file holds the value.
+ * next write raises no conflict. The output files hold a multi-line held value as JSON text,
+ * escaped: with the setting on they hold its marker and neither the value nor its escaped form.
+ * With the setting off, every file holds the value.
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -29,6 +31,10 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const HELD_VALUE = "zq9-synthetic-service-4821";
 const MARKER = "[REDACTED:env:SERVICE_API_KEY]";
+/** A `_FILE` value with an inner newline and a quote: JSON text holds it only escaped. */
+const MULTI_LINE_VALUE = 'first line of the "held" file\nsecond line of the held file';
+const ESCAPED_MULTI_LINE_VALUE = JSON.stringify(MULTI_LINE_VALUE).slice(1, -1);
+const FILE_MARKER = "[REDACTED:file:SERVICE_KEY_FILE]";
 const NOW = 1_700_000_000_000;
 const AGENT_ID = "Reporter";
 const AGENT: AgentDefinition = {
@@ -75,9 +81,12 @@ beforeEach(async () => {
 	AgentRegistry.resetGlobalForTests();
 	AgentLifecycleManager.resetGlobalForTests();
 	registerMockApi(MOCK_API_SOURCE);
-	// The process masker holds the test's variable in a fresh agent dir, never this machine's environment.
+	// The process masker holds the test's variable and file in a fresh agent dir, never this machine's environment.
+	const keyFile = tmp.join("held-key.txt");
+	await Bun.write(keyFile, `${MULTI_LINE_VALUE}\n`);
+	const env = { SERVICE_API_KEY: HELD_VALUE, SERVICE_KEY_FILE: keyFile };
 	spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
-		new storeMask.SessionStoreMasker({ env: () => ({ SERVICE_API_KEY: HELD_VALUE }), agentDir: tmp.join("agent") }),
+		new storeMask.SessionStoreMasker({ env: () => env, agentDir: tmp.join("agent") }),
 	);
 });
 
@@ -108,6 +117,28 @@ function holds(file: string, text: string | undefined): Holds {
 /** A masked text holds the marker and no value; an unmasked one the value and no marker. */
 function stored(file: string, masked: boolean): Holds {
 	return { file, marker: masked, value: !masked };
+}
+
+interface MultiLineHolds {
+	file: string;
+	marker: boolean;
+	value: boolean;
+	escaped: boolean;
+}
+
+/** What a JSON text holds of the multi-line value: its marker, the value as written, its escaped form. */
+function holdsMultiLine(file: string, text: string): MultiLineHolds {
+	return {
+		file,
+		marker: text.includes(FILE_MARKER),
+		value: text.includes(MULTI_LINE_VALUE),
+		escaped: text.includes(ESCAPED_MULTI_LINE_VALUE),
+	};
+}
+
+/** A masked JSON text holds the marker alone; an unmasked one the escaped form alone. */
+function storedMultiLine(file: string, masked: boolean): MultiLineHolds {
+	return { file, marker: masked, value: false, escaped: !masked };
 }
 
 /**
@@ -166,12 +197,12 @@ async function readOutputFiles(artifactsDir: string): Promise<OutputFiles> {
 	};
 }
 
-/** Yields `{ id, report }`, both holding the held value, the report naming the turn. */
+/** Yields `{ id, report }`, both holding the held value; the report names the turn and holds the multi-line value. */
 function respond(context: Context): MockResponse {
 	if (context.messages.at(-1)?.role === "toolResult") return { content: ["ok"] };
 	const label = JSON.stringify(context.messages).includes(LATER_MESSAGE) ? LATER_TURN : "FIRST_RUN_REPORT";
 	// `id` is kept as written only on a session entry; in yield data it is the model's text.
-	const data = { id: HELD_VALUE, report: `${label}: deploy with ${HELD_VALUE}` };
+	const data = { id: HELD_VALUE, report: `${label}: deploy with ${HELD_VALUE} after ${MULTI_LINE_VALUE}` };
 	return { content: [{ type: "toolCall", id: `yield-${label}`, name: "yield", arguments: { type: "result", data } }] };
 }
 
@@ -292,6 +323,17 @@ describe("secrets.maskSessionStore on the files outside the session store", () =
 				]).toEqual([
 					stored("<id>.md after the later turn", maskOn),
 					stored("<id>.json after the later turn", maskOn),
+				]);
+				expect([
+					holdsMultiLine("<id>.md after the run", afterRun.md),
+					holdsMultiLine("<id>.json after the run", afterRun.json),
+					holdsMultiLine("<id>.md after the later turn", afterLaterTurn.md),
+					holdsMultiLine("<id>.json after the later turn", afterLaterTurn.json),
+				]).toEqual([
+					storedMultiLine("<id>.md after the run", maskOn),
+					storedMultiLine("<id>.json after the run", maskOn),
+					storedMultiLine("<id>.md after the later turn", maskOn),
+					storedMultiLine("<id>.json after the later turn", maskOn),
 				]);
 			},
 			CASE_TIMEOUT_MS,
