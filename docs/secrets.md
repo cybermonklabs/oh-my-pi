@@ -14,7 +14,7 @@ secrets:
 ## How it works
 
 1. On session startup, secrets are collected from:
-   - **Environment variables** whose names match common secret patterns (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASS`, `AUTH`, `CREDENTIAL`, `PRIVATE`, `OAUTH`) with values at least 8 characters long
+   - **Environment variables** whose names match common secret patterns (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASS`, `AUTH`, `CREDENTIAL`, `PRIVATE`, `OAUTH`) with values at least 8 characters long. `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS` are left out: they hold git configuration key names and the path of a program, not secrets.
    - **`secrets.yml` files** (see below)
    - Built-in reversible regexes for common credential shapes that appear only in session content or tool results: GitHub, GitLab, OpenAI, and Anthropic tokens, AWS access keys, Google API keys, Slack tokens, npm tokens, Stripe secret and restricted keys and webhook secrets, Hugging Face tokens, SendGrid keys, JWTs, Bearer header tokens, and PEM private key blocks
    - Passwords embedded in connection-URL environment values — any variable holding a `scheme://user:password@host`-style value (for example `DATABASE_URL`) has its password registered regardless of the variable name when it is at least 8 characters long. Both raw and percent-decoded forms are collected when they meet that limit.
@@ -31,6 +31,8 @@ Two modes control what happens to each secret:
 | `replace`             | Replaced with the configured `replacement`, or a deterministic same-length value when omitted | No         |
 
 Obfuscate-mode plain values and regex matches shorter than 8 characters are ignored to avoid redacting ordinary short words. Replace mode can handle short values; a replace-mode regex with no custom replacement is rejected only when every possible 1–2 character match would be impossible to redact to a distinct stable value.
+
+This obfuscation changes only the text sent to the model provider. The session store keeps the text the agent wrote. To mask secret values in the session store as well, see [Secrets in stored sessions](#secrets-in-stored-sessions).
 
 ## secrets.yml
 
@@ -139,14 +141,77 @@ Regex entries always scan globally (the `g` flag is enforced automatically). The
 
 Environment variables are collected first, file-defined entries follow, and the built-in credential regex runs last so configured entries see matching content before the generic detector. Duplicate environment values are collapsed within the environment scan. Environment and file entries are not deduplicated against each other, so a plain value present in both is registered twice; both placeholders restore to the same secret, so deobfuscation is unaffected.
 
+## Secrets in stored sessions
+
+The session store keeps every session entry as the agent wrote it, with `file` and `sql` storage alike. A secret that a command prints is in the stored session, and `secrets.enabled` does not change that. Set `secrets.maskSessionStore` to mask the secret values the agent holds before they reach the session store:
+
+```yaml
+secrets:
+  maskSessionStore: true
+```
+
+The setting is off by default and does not depend on `secrets.enabled`. When it is on, the agent replaces each value it holds with a marker that names where the value came from. A marker never holds the value.
+
+1. `[REDACTED:env:<NAME>]`: the value of an environment variable that the name rule above takes, and the password of a connection URL in any variable.
+2. `[REDACTED:file:<NAME>]`: the content of the file that an environment variable ending in `_FILE` names, and the password of a connection URL on a line of that file. `<NAME>` is the `_FILE` variable.
+3. `[REDACTED:secrets.yml:<label>]`: a `secrets.yml` entry, project or global. That is a replace-mode plain value of any length, an obfuscate-mode plain value of 8 characters or more, and every match of a regex entry. `<label>` is the sanitized `friendlyName`, else `project#<n>` or `global#<n>` for the entry's position in its file.
+
+When two sources hold the same value, the first source in this list names it. When a name or a `friendlyName` contains a held value, or a regex entry matches it, the marker uses the index form instead (`#<n>`, `project#<n>`, `global#<n>`). The agent never changes its own markers, so masking a stored text again gives the same text.
+
+The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, and the replica that a collab guest writes. It masks every string of an entry except these, which it keeps as written:
+
+- object keys, numbers and booleans
+- the fields `type`, `role`, `id`, `parentId`, `timestamp` and `toolCallId`
+- the header's `cwd`, `parentSession` and `version`
+- blob references and image data
+- provider ciphertext: `redactedThinking` data and `encrypted_content`
+
+The masking changes only the stored copy. The live session keeps the real values, so tools, the model provider and the screen get what they got before. A resumed session, a revived subagent and every reader of the stored transcript get the markers.
+
+### How the values are read
+
+- **Environment variables**: the same name rule as the obfuscator, with values of at least 8 characters.
+- **`_FILE` variables**: the agent follows symbolic links and reads only a regular file of at most 1 MiB. It opens the file without blocking, so a FIFO cannot stop a write. It trims the content and keeps it when it has at least 8 characters. It matches the content of a file as one value.
+- **`secrets.yml`**: the global file and the project file of each working directory the agent writes sessions for, through the same parser as the obfuscator.
+
+The agent reads the sources at its first session write. Then, at most once a minute, it reads the environment again and checks each `_FILE` file and each `secrets.yml` for a change. It adds new values and never removes a value, so the old value of a rotated token stays masked. A source that fails (a bad `secrets.yml`, a file it cannot read) is skipped and logged. The log gives the kind and the name of each source the agent holds (`Session store masking sources`), never a value.
+
+### Replay of a masked turn
+
+A provider checks some blocks byte for byte when it replays a session. When masking changes a signed thinking, text or tool-call block, the stored copy has no signature. When masking changes provider replay state (`providerPayload`, an Anthropic compaction or server-tool block, Cursor history, Gemini native content), the stored copy does not keep it. Only a turn that held a secret changes. On resume, an Anthropic model gets such a thinking block as text, and a Gemini model on Vertex can refuse to resume such a turn.
+
+### What masking does not catch
+
+Masking finds a value only where it appears exactly as the agent holds it. It does not catch:
+
+- a value that an agent transforms: encoded (for example in base64), cut into parts, or with characters added
+- a value shorter than 8 characters, except a replace-mode plain `secrets.yml` value
+- a value in no source, for example a variable set only in a child shell
+- a credential in a git configuration value set through the environment (`GIT_CONFIG_VALUE_<n>`)
+- the content of a `_FILE` file that is not a regular file, that the agent cannot read, that is larger than 1 MiB, or whose trimmed content is shorter than 8 characters
+- a `secrets.yml` entry the parser refuses (see [Invalid entries and files](#invalid-entries-and-files))
+- part of a multi-line file printed alone, because the content of a file is one value
+- object keys, numbers, the working directory, ids and images
+- entries written before the setting was on, and the copies of stored text that fork, move, render, `session unpack`, archive restore and `gc strip` make (an entry written while the setting was on is masked already)
+- files outside the session store: artifact files with full command output, blobs, prompt history, the title and recap index, and logs
+- text sent to the model provider, which is the work of `secrets.enabled`
+
+A collab guest masks its replica with its own sources only.
+
+Masking reduces the exposure of a secret. It does not remove it. To remove it, hold no long-lived secret at all, for example short-lived credentials from workload identity federation.
+
 ## Key files
 
-- `packages/coding-agent/src/secrets/index.ts` -- loading, merging, env var collection
+- `packages/coding-agent/src/secrets/index.ts` -- loading, merging, the obfuscator build
+- `packages/coding-agent/src/secrets/env-secrets.ts` -- environment variable collection
+- `packages/coding-agent/src/secrets/secrets-file.ts` -- the `secrets.yml` parser and its readers
 - `packages/coding-agent/src/secrets/obfuscator.ts` -- `SecretObfuscator` class, placeholder generation, message obfuscation
 - `packages/coding-agent/src/secrets/regex.ts` -- regex literal parsing and compilation
 - `packages/coding-agent/src/secrets/message-transform.ts` -- provider-context and local-context transforms
 - `packages/coding-agent/src/secrets/patterns.ts` -- built-in credential patterns
-- `packages/coding-agent/src/secrets/settings.ts` -- `secrets.enabled` setting definition
+- `packages/coding-agent/src/secrets/session-store-mask.ts` -- the values and markers of stored-session masking
+- `packages/coding-agent/src/session/session-entry-mask.ts` -- which fields of a session entry are masked
+- `packages/coding-agent/src/secrets/settings.ts` -- `secrets.enabled` and `secrets.maskSessionStore` setting definitions
 
 ## See also
 
