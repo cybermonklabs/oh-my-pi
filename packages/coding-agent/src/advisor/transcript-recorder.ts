@@ -188,6 +188,8 @@ export class AdvisorTranscriptRecorder {
 	#replayCursor = 0;
 	/** Target file {@link #replayWindow} belongs to; a switch starts a fresh window. */
 	#windowFile: string | undefined;
+	/** Store masking binding every transcript manager the recorder opens is bound with ({@link setStoreMasking}). */
+	#storeMasking: StoreMaskingBinding | undefined;
 
 	/**
 	 * @param filename Transcript filename within the session dir. Defaults to
@@ -196,16 +198,12 @@ export class AdvisorTranscriptRecorder {
 	 * @param after Optional barrier the queue starts behind — used on the advisor
 	 *   on→off→on toggle so a fresh recorder's first `open` waits for the prior
 	 *   recorder's `close` and the two never hold the same file at once.
-	 * @param storeMasking The owning session manager's store masking binding, bound to every
-	 *   transcript manager the recorder opens (see `SessionManager.setStoreMasking`); `undefined`
-	 *   leaves them unbound, as the owning manager is.
 	 */
 	constructor(
 		private readonly resolveSessionFile: () => string | undefined,
 		private readonly resolveCwd: () => string,
 		filename: string = ADVISOR_TRANSCRIPT_FILENAME,
 		after?: Promise<unknown>,
-		private readonly storeMasking?: StoreMaskingBinding,
 	) {
 		this.#filename = filename;
 		this.#queue = after
@@ -214,6 +212,14 @@ export class AdvisorTranscriptRecorder {
 					() => {},
 				)
 			: Promise.resolve();
+	}
+
+	/**
+	 * Bind the owning session manager's store masking binding (see `SessionManager.setStoreMasking`)
+	 * to every transcript manager the recorder opens; call it before the first record.
+	 */
+	setStoreMasking(binding: StoreMaskingBinding | undefined): void {
+		this.#storeMasking = binding;
 	}
 
 	/**
@@ -278,7 +284,7 @@ export class AdvisorTranscriptRecorder {
 					initialCwd: cwd,
 					suppressBreadcrumb: true,
 				});
-				if (this.storeMasking) this.#manager.setStoreMasking(this.storeMasking);
+				if (this.#storeMasking) this.#manager.setStoreMasking(this.#storeMasking);
 				this.#file = file;
 			}
 			this.#manager?.appendMessage(persisted);

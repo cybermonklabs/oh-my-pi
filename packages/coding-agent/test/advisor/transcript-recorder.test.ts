@@ -413,10 +413,8 @@ describe("AdvisorTranscriptRecorder", () => {
 				const recorder = new AdvisorTranscriptRecorder(
 					() => sessionFile,
 					() => dir,
-					undefined,
-					undefined,
-					host.storeMasking,
 				);
+				recorder.setStoreMasking(host.storeMasking);
 				recorder.record(assistantMessage(`deploy with ${AGENT_DIR_VALUE}`, 1));
 				await recorder.close();
 

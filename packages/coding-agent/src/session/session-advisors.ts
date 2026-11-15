@@ -1595,9 +1595,9 @@ export class SessionAdvisors {
 				this.#advisorCostSnapshotBarrier
 					? Promise.all([this.#advisorRecorderClosed, this.#advisorCostSnapshotBarrier])
 					: this.#advisorRecorderClosed,
-				// Masks the transcript exactly as the session's own manager masks the session file.
-				this.#host.sessionManager.storeMasking,
 			);
+			// Masks the transcript exactly as the session's own manager masks the session file.
+			recorder.setStoreMasking(this.#host.sessionManager.storeMasking);
 			const runtime = new AdvisorRuntime(advisorAgentFacade, {
 				snapshotMessages: () => this.#host.agent.state.messages,
 				maintainContext: (incoming, signal) => this.#maintainAdvisorContext(advisorRef, incoming, signal),
