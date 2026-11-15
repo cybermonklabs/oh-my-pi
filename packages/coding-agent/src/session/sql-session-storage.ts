@@ -12,6 +12,7 @@ import {
 	type SessionAcquireOptions,
 	type SessionClaimHolder,
 	SessionLeaseLostError,
+	SessionReadConflictError,
 	type SessionStorage,
 	SessionWriteConflictError,
 	sessionLeaseId,
@@ -207,9 +208,12 @@ interface DialectQueries {
 	readSlices: Statement;
 	/** The session's size and its bytes from an offset: the session row's and those of the parts covering the window. */
 	readFrom: Statement;
-	/** The session's size, its row's own content, and the start of the last part at or before `@offset`. */
+	/**
+	 * The session's size, the byte length of the row's own content and its bytes
+	 * from `@offset` on, and the start of the last part at or before `@offset`.
+	 */
 	readChunksStart: Statement;
-	/** The next parts from `@next`, in `start_offset` order: one keyset page. */
+	/** The parts that start from `@next` up to, not including, `@end`, in `start_offset` order: one page. */
 	readParts: Statement;
 	/** The lease table's statements: PostgreSQL and MySQL only; a SQLite claim is an OS lock. */
 	lease: LeaseQueries | undefined;
@@ -392,10 +396,14 @@ interface ReadFromRow {
 	bytes: Uint8Array | null;
 }
 
-/** `readChunksStart` row: `first_part` is the start of the last part at or before the offset, -1 when none is. */
+/**
+ * `readChunksStart` row: `head` is the row's own content from the offset on,
+ * `first_part` the start of the last part at or before the offset, -1 when none is.
+ */
 interface ChunksStartRow {
 	byte_len: number | bigint | string | null;
-	content: string;
+	content_len: number | bigint | string;
+	head: Uint8Array | null;
 	first_part: number | bigint | string;
 }
 
@@ -532,8 +540,27 @@ const LEASE_WAIT_POLL_MS = 1000;
 const LAPSE_POLL_MS = 50;
 /** Largest part a full write stores; an append stores its line as one part. */
 const PART_BYTES = 1024 * 1024;
-/** Parts one `readChunks` query fetches: four appended parts of up to 4 MiB each keep a page within 16 MiB. */
-const PARTS_PER_PAGE = 4;
+/**
+ * Bytes the first page of a `readChunks` read spans, from the byte it starts
+ * at. A reader that stops after a window this long (memories stage 1 reads
+ * 1 MiB windows) fetches about this much plus the part the window ends in,
+ * and the head of the part it starts in; each next page spans twice the last,
+ * up to {@link PAGE_SPAN_BYTES}, so a whole read takes only a few more queries.
+ */
+const FIRST_PAGE_SPAN_BYTES = 1024 * 1024;
+/**
+ * Most bytes one `readChunks` page spans: a later page holds the parts that
+ * start within its span of where the read is, so at most this much plus the
+ * part that starts last. A full write's parts are at most {@link PART_BYTES};
+ * an appended line is one part of its own length, so a page stays within
+ * 16 MiB while no appended line is longer than 4 MiB.
+ */
+const PAGE_SPAN_BYTES = 12 * 1024 * 1024;
+/**
+ * Characters MySQL's `path` columns hold (`VARCHAR(512)` in both tables).
+ * PostgreSQL and SQLite store `path` as `TEXT`, with no such limit.
+ */
+const MYSQL_PATH_CHARS = 512;
 /** Staging parts one transaction of a streamed full write inserts. */
 const STAGING_PARTS_PER_TRANSACTION = 16;
 /** Starts a staging path's suffix: `<path>#staging-<epoch ms, STAGING_EPOCH_DIGITS wide>-<id>`. */
@@ -1115,13 +1142,19 @@ function buildQueries(
 				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path ` +
 				`AND start_offset <= ${bigint("@offset")})`,
 		),
+		// Only the row's own bytes from `@offset` on (`@row_from` is the 1-based
+		// `@offset + 1`, clamped as in readFrom), so a read from inside the content
+		// of a row an older version wrote never fetches what precedes it.
 		readChunksStart: sql(
-			`SELECT byte_len, content, (SELECT coalesce(max(start_offset), -1) FROM ${parts} ` +
+			`SELECT byte_len, ${contentByteLength} AS content_len, ` +
+				`CASE WHEN ${bigint("@offset")} < ${contentByteLength} ` +
+				`THEN substr(${contentBytes}, ${position("@row_from")}) ELSE ${emptyBytes} END AS head, ` +
+				`(SELECT coalesce(max(start_offset), -1) FROM ${parts} ` +
 				`WHERE path = @path AND start_offset <= ${bigint("@offset")}) AS first_part FROM ${table} WHERE path = @path`,
 		),
 		readParts: sql(
 			`SELECT start_offset, content FROM ${parts} WHERE path = @path AND start_offset >= ${bigint("@next")} ` +
-				`ORDER BY start_offset LIMIT ${PARTS_PER_PAGE}`,
+				`AND start_offset < ${bigint("@end")} ORDER BY start_offset`,
 		),
 		lease:
 			adapter === "sqlite"
@@ -1318,6 +1351,21 @@ function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number
 }
 
 /**
+ * Where a part of `bytes` that starts at `start` and holds at most `maxBytes`
+ * ends: at the end of `bytes` when it is that close, otherwise `maxBytes` on,
+ * backed off continuation bytes (0b10xxxxxx) so no character straddles two
+ * parts. A run of continuation bytes that long, never in valid UTF-8, is cut
+ * at `maxBytes`.
+ */
+function utf8PartEnd(bytes: Uint8Array, start: number, maxBytes: number): number {
+	const limit = start + maxBytes;
+	if (limit >= bytes.byteLength) return bytes.byteLength;
+	let end = limit;
+	while (end > start && (bytes[end] & 0xc0) === 0x80) end--;
+	return end === start ? limit : end;
+}
+
+/**
  * Cut the UTF-8 bytes `chunks` yields into parts of at most `maxBytes`, each
  * ending on a character boundary, also where a character straddles two
  * chunks: a cut is made only once the byte after it has arrived.
@@ -1335,10 +1383,7 @@ async function* utf8Parts(
 		const bytes = Buffer.concat(pending, pendingBytes);
 		let start = 0;
 		while (bytes.byteLength - start > maxBytes) {
-			let end = start + maxBytes;
-			// Back off continuation bytes (0b10xxxxxx) so no character straddles two parts.
-			while (end > start && (bytes[end] & 0xc0) === 0x80) end--;
-			if (end === start) end = start + maxBytes;
+			const end = utf8PartEnd(bytes, start, maxBytes);
 			yield { text: bytes.toString("utf8", start, end), byteLength: end - start };
 			start = end;
 		}
@@ -1349,6 +1394,19 @@ async function* utf8Parts(
 		yield { text: Buffer.concat(pending, pendingBytes).toString("utf8"), byteLength: pendingBytes };
 }
 
+/** The UTF-8 text `chunks` yields, decoded as it arrives, and its byte count. */
+async function decodeChunks(chunks: AsyncIterable<Uint8Array>): Promise<{ text: string; bytes: number }> {
+	// A leading byte order mark is content here, as Buffer#toString keeps it.
+	const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+	let text = "";
+	let bytes = 0;
+	for await (const chunk of chunks) {
+		text += decoder.decode(chunk, { stream: true });
+		bytes += chunk.byteLength;
+	}
+	return { text: text + decoder.decode(), bytes };
+}
+
 /**
  * SQL-backed implementation of {@link SessionStorage} using `bun:sql`. Each
  * session JSONL file is a row of the session table keyed by `path`, holding
@@ -1357,8 +1415,8 @@ async function* utf8Parts(
  * part, a full write replaces them with parts of at most 1 MiB (a streamed
  * one stages them under `<path>#staging-…` first and swaps them in). A
  * session's content is the row's `content` (non-empty only for rows an older
- * version wrote) followed by its parts in offset order, which reads stream a
- * few parts at a time. This process keeps only a metadata index (`size`,
+ * version wrote) followed by its parts in offset order, which reads stream in
+ * pages of parts. This process keeps only a metadata index (`size`,
  * `mtimeMs`) in memory for synchronous `existsSync` / `statSync` /
  * `listFilesSync` calls.
  *
@@ -1367,6 +1425,8 @@ async function* utf8Parts(
  * at construction.
  */
 export class SqlSessionStorage extends IndexedSessionStorage {
+	/** Always set: the SQL backend reads a session part by part. */
+	declare readonly readChunks: (path: string, fromByte?: number) => AsyncIterable<Uint8Array>;
 	readonly #backend: SqlSessionStorageBackend;
 	/**
 	 * Set only when the store claims sessions (`claims` on a database other
@@ -1556,6 +1616,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	#mysqlLocks: MysqlLockForm | undefined;
 	/** The version a MySQL-family server reported at start-up, as a refusal names it. */
 	#mysqlVersion = "";
+	/** Longest path, staging paths included, the dialect's `path` columns hold, in characters. */
+	readonly #pathChars: number;
 
 	constructor(options: SqlSessionStorageOptions) {
 		this.#client = options.client;
@@ -1598,6 +1660,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// An in-memory database is this process's alone: nobody else can open its sessions.
 			else if (this.#sqliteFile) this.#gate = "lock";
 		}
+		this.#pathChars = this.#adapter === "mysql" ? MYSQL_PATH_CHARS : Number.POSITIVE_INFINITY;
 	}
 
 	get adapter(): SqlSessionStorageAdapter {
@@ -2834,32 +2897,45 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * The stored bytes from `fromByte`: the row's own content when it holds
-	 * any, then the parts in `start_offset` order, {@link PARTS_PER_PAGE} per
-	 * query, each part a chunk of its own. The read stops at the size its first
-	 * query saw, so an append made meanwhile is left out. A part that does not
-	 * start where the previous one ended, or parts that end short of that size,
-	 * mean a full write or a delete replaced the parts during the read; it then
-	 * fails instead of yielding a mix of two bodies.
+	 * The stored bytes from `fromByte`: the row's own content from there when
+	 * it holds any, then the parts in `start_offset` order, one page per query:
+	 * the parts that start within the page's span of where the read is, each
+	 * part a chunk of its own. The first page spans
+	 * {@link FIRST_PAGE_SPAN_BYTES} from `fromByte` and each next one twice the
+	 * last, up to {@link PAGE_SPAN_BYTES}, so a reader that stops early fetches
+	 * little past where it stopped. The read stops at the size its first query
+	 * saw, so an append made meanwhile is left out. A page with no part where
+	 * the read is, a part that does not start where the previous one ended, or
+	 * parts that end short of that size, mean a full write or a delete replaced
+	 * the parts during the read; it then fails with
+	 * {@link SessionReadConflictError} instead of yielding a mix of two bodies.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const [row] = (await this.#exclusive(() =>
-			this.#readOne(this.#q.readChunksStart, { path, offset: fromByte }),
+			this.#readOne(this.#q.readChunksStart, {
+				path,
+				offset: fromByte,
+				row_from: Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1,
+			}),
 		)) as ChunksStartRow[];
 		if (!row) throw enoent(path);
 		if (row.byte_len === null) throw this.#unmeasured(path);
 		const size = rowNumber(row.byte_len);
-		const head = Buffer.from(row.content, "utf8");
-		if (fromByte < head.byteLength) yield head.subarray(fromByte);
+		if (row.head && row.head.byteLength > 0) yield row.head;
 		if (fromByte >= size) return;
 		const firstPart = rowNumber(row.first_part);
-		let next = firstPart < 0 ? head.byteLength : firstPart;
+		let next = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
 		let skip = Math.max(0, fromByte - next);
-		while (next < size) {
-			const parts = (await this.#exclusive(() => this.#readOne(this.#q.readParts, { path, next }))) as PartRow[];
+		for (let span = FIRST_PAGE_SPAN_BYTES; next < size; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
+			// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
+			const end = Math.max(next, fromByte) + span;
+			const parts = (await this.#exclusive(() =>
+				this.#readOne(this.#q.readParts, { path, next, end }),
+			)) as PartRow[];
+			if (parts.length === 0) throw new SessionReadConflictError(path);
 			for (const part of parts) {
 				const start = rowNumber(part.start_offset);
-				if (start !== next) throw this.#replacedDuringRead(path);
+				if (start !== next) throw new SessionReadConflictError(path);
 				if (start >= size) break;
 				const bytes = Buffer.from(part.content, "utf8");
 				next = start + bytes.byteLength;
@@ -2870,21 +2946,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				yield skip > 0 ? bytes.subarray(skip) : bytes;
 				skip = 0;
 			}
-			if (parts.length < PARTS_PER_PAGE) break;
 		}
-		if (next !== size) throw this.#replacedDuringRead(path);
+		if (next !== size) throw new SessionReadConflictError(path);
 	}
 
 	#unmeasured(path: string): Error {
 		return new Error(
 			`SqlSessionStorage: ${this.#table} row ${JSON.stringify(path)} has no byte_len; ` +
 				`run the byte_len backfill in ${SCHEMA_DOCS}.`,
-		);
-	}
-
-	#replacedDuringRead(path: string): Error {
-		return new Error(
-			`SqlSessionStorage: ${JSON.stringify(path)} was replaced or removed while it was read; read it again.`,
 		);
 	}
 
@@ -2909,15 +2978,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * {@link writeFull} from a stream. The parts go in under a staging path,
 	 * `<path>#staging-<epoch ms>-<id>`, {@link STAGING_PARTS_PER_TRANSACTION}
-	 * per transaction; then one transaction checks the session's size, checks
-	 * that every staged byte is still there (a staging set another writer
-	 * removed is a conflict), and swaps the staged parts in for the session's.
-	 * Staging parts have no row, so no listing or index sees them. Before it
-	 * writes, the path's staging sets older than {@link STALE_STAGING_MS} go:
-	 * they are a dead writer's. On failure it removes its own. Each of these
-	 * transactions writes under `path`'s lease, as {@link writeFull}'s one
-	 * transaction does: behind the claim fence, so the swap commits only while
-	 * this store may write the session.
+	 * per transaction; then one transaction checks the session's size, deletes
+	 * the path's staging sets older than {@link STALE_STAGING_MS} (a dead
+	 * writer's), checks that every staged byte is still there (a staging set
+	 * another writer removed is a conflict), and swaps the staged parts in for
+	 * the session's. Staging parts have no row, so no listing or index sees
+	 * them. On failure it removes its own. Each of these transactions writes
+	 * under `path`'s lease, as {@link writeFull}'s one transaction does:
+	 * behind the claim fence, so the swap commits only while this store may
+	 * write the session. A path whose staging path would not fit the
+	 * dialect's path column (MySQL's 512 characters) is written whole through
+	 * {@link writeFull} instead.
 	 */
 	async writeFullStream(
 		path: string,
@@ -2935,8 +3006,15 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			await this.#awaitClaims(fences);
 			await this.#fencedTransaction(fences, work);
 		};
-		await fenced(transaction => this.#deleteStaging(transaction, prefix, stagingAt(now - STALE_STAGING_MS)));
 		const staging = `${stagingAt(now)}-${Snowflake.next()}`;
+		if ([...staging].length > this.#pathChars) {
+			const { text, bytes } = await decodeChunks(chunks);
+			if (bytes !== byteLength) {
+				throw new Error(`SqlSessionStorage: a full write of ${path} streamed ${bytes} bytes, not ${byteLength}`);
+			}
+			await this.writeFull(path, text, mtimeMs, title, expectedSize);
+			return;
+		}
 		try {
 			let staged = 0;
 			let batch: Array<{ offset: number; content: string }> = [];
@@ -2957,10 +3035,15 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				throw new Error(`SqlSessionStorage: a full write of ${path} streamed ${staged} bytes, not ${byteLength}`);
 			}
 			await fenced(async transaction => {
+				// The session's size as this write finds it under the row lock: the
+				// size check's, or, for a write without one, read here.
+				const sessionSize = expectedSize === undefined ? await this.#lockSize(transaction, path) : expectedSize;
 				await this.#replaceRow(transaction, path, mtimeMs, title, byteLength, expectedSize);
+				await this.#deleteStaging(transaction, prefix, stagingAt(now - STALE_STAGING_MS));
 				const stagedParts = (await run(transaction, this.#q.stagedBytes, { path: staging })) as StagedPartRow[];
 				const found = stagedParts.reduce((total, part) => total + rowNumber(part.len), 0);
-				if (found !== byteLength) throw new SessionWriteConflictError(path, byteLength, found);
+				// A delete or rename of the session deleted this write's staging parts after they were written.
+				if (found !== byteLength) throw new SessionWriteConflictError(path, sessionSize, sessionSize);
 				await this.#deleteParts(transaction, path);
 				await run(transaction, this.#q.renameParts, { src: staging, dst: path });
 			});
@@ -3020,9 +3103,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/** Store `bytes` as parts of at most {@link PART_BYTES}, each ending on a UTF-8 character boundary. */
 	async #insertParts(transaction: SqlSessionStorageTransaction, path: string, bytes: Buffer): Promise<void> {
 		for (let start = 0; start < bytes.byteLength;) {
-			let end = Math.min(start + PART_BYTES, bytes.byteLength);
-			// Back off continuation bytes (0b10xxxxxx) so no character straddles two parts.
-			while (end < bytes.byteLength && (bytes[end] & 0xc0) === 0x80) end--;
+			const end = utf8PartEnd(bytes, start, PART_BYTES);
 			await run(transaction, this.#q.insertPart, {
 				path,
 				offset: start,

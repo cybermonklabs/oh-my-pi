@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { ConcatSink, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { digestStream } from "../utils/file-hash";
 import {
 	childDirNames,
 	childKeyName,
@@ -184,8 +185,17 @@ function titleUpdateForIndex(entry: IndexEntry): SessionTitleUpdate | undefined 
 	return { title: entry.title, source: entry.titleSource, updatedAt: entry.titleUpdatedAt };
 }
 
-/** Directory under the OS temp directory holding full-write bodies until their backend publish settles. */
-const SPOOL_DIR = "omp-spool";
+/**
+ * Directory under the OS temp directory holding full-write bodies until their
+ * backend publish settles: one per account, private to it, as the OS temp
+ * directory is shared between accounts and a directory another account made
+ * first would refuse this one's files.
+ */
+function spoolDir(): string {
+	const uid = process.getuid?.();
+	return path.join(os.tmpdir(), uid === undefined ? "omp-spool" : `omp-spool-${uid}`);
+}
+
 /**
  * Age at which a spool file is a dead process's. Only Windows leaves one
  * behind: POSIX unlinks a spool file as soon as it is open, while Windows
@@ -286,12 +296,12 @@ function sweepStaleSpools(dir: string): void {
 }
 
 /**
- * Spool `lines` to a new file under `<os temp>/omp-spool`, iterating them
- * once, counting its bytes and reading the title slot from its first line.
+ * Spool `lines` to a new file under {@link spoolDir}, iterating them once,
+ * counting its bytes and reading the title slot from its first line.
  */
 function spoolLines(lines: Iterable<string>): BodySpool {
-	const dir = path.join(os.tmpdir(), SPOOL_DIR);
-	fs.mkdirSync(dir, { recursive: true });
+	const dir = spoolDir();
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 	const windows = process.platform === "win32";
 	if (windows) sweepStaleSpools(dir);
 	const file = path.join(dir, `${process.pid}-${Snowflake.next()}.spool`);
@@ -304,17 +314,6 @@ function spoolLines(lines: Iterable<string>): BodySpool {
 		new BodySpool(fd, file, 0, undefined).close();
 		throw err;
 	}
-}
-
-/** The SHA-256 of `chunks` and their byte count. */
-async function digestChunks(chunks: AsyncIterable<Uint8Array>): Promise<{ byteLength: number; digest: string }> {
-	const hasher = new Bun.CryptoHasher("sha256");
-	let total = 0;
-	for await (const chunk of chunks) {
-		hasher.update(chunk);
-		total += chunk.byteLength;
-	}
-	return { byteLength: total, digest: hasher.digest("hex") };
 }
 
 /**
@@ -362,6 +361,15 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * caller tracking a durable byte size must wait for {@link drain}.
 	 */
 	readonly defersSyncPublish = true;
+	/**
+	 * The bytes from byte `fromByte`, read from the backend in chunks. Set only
+	 * when the backend has its own {@link SessionStorageBackend.readChunks}, so a
+	 * caller that finds it reads in bounded pieces; a caller that does not
+	 * reads the session whole once. As in {@link readTextFrom}, the title slot
+	 * is synthesized over the stored head, so a read that starts inside it
+	 * reads from the start and overlays it.
+	 */
+	readonly readChunks?: (path: string, fromByte?: number) => AsyncIterable<Uint8Array>;
 	readonly #backend: SessionStorageBackend;
 	readonly #index = new Map<string, IndexEntry>();
 	readonly #writers = new Set<IndexedSessionStorageWriter>();
@@ -392,6 +400,7 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	constructor(backend: SessionStorageBackend) {
 		this.#backend = backend;
+		if (backend.readChunks) this.readChunks = (path, fromByte = 0) => this.#readChunks(path, fromByte);
 	}
 
 	async initialize(): Promise<void> {
@@ -542,11 +551,12 @@ export class IndexedSessionStorage implements SessionStorage {
 							expectedSize,
 						)
 					: this.#backend.writeFull(path, spool.text(), mtimeMs, spool.title, expectedSize),
-			// Compared by size and SHA-256, so neither side is read whole.
+			// Compared by size and SHA-256, chunk by chunk: only a backend without
+			// `readChunks` reads the stored side whole.
 			isStored: async () => {
-				const stored = await digestChunks(this.#backendChunks(path, 0));
-				if (stored.byteLength !== spool.byteLength) return false;
-				return stored.digest === (await digestChunks(spool.chunks())).digest;
+				const stored = await digestStream(this.#backendChunks(path, 0));
+				if (stored.bytes !== spool.byteLength) return false;
+				return stored.hash === (await digestStream(spool.chunks())).hash;
 			},
 			release: () => spool.close(),
 		};
@@ -668,12 +678,8 @@ export class IndexedSessionStorage implements SessionStorage {
 		return { text: bytes.subarray(offset, end).toString("utf-8"), size: bytes.length };
 	}
 
-	/**
-	 * The bytes from byte `fromByte`, read from the backend in chunks. As in
-	 * {@link readTextFrom}, the title slot is synthesized over the stored head,
-	 * so a read that starts inside it reads from the start and overlays it.
-	 */
-	async *readChunks(path: string, fromByte = 0): AsyncGenerator<Uint8Array> {
+	/** {@link readChunks}, also on a backend without its own: then one whole read, cut at `fromByte`. */
+	async *#readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
 		await this.#awaitPath(path);
@@ -696,22 +702,18 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
-		const decoder = new TextDecoder();
-		let pending = "";
-		for await (const chunk of this.readChunks(path)) {
-			let searchFrom = pending.length;
-			pending += decoder.decode(chunk, { stream: true });
-			let start = 0;
-			for (let newline = pending.indexOf("\n", searchFrom); newline !== -1;) {
-				if (visit(pending.slice(start, newline))) return;
-				start = newline + 1;
-				searchFrom = start;
-				newline = pending.indexOf("\n", searchFrom);
+		// Each line decodes on its own; only the first, the start of the text, drops a byte order mark.
+		const rest = new TextDecoder("utf-8", { ignoreBOM: true });
+		let decoder = new TextDecoder();
+		const lines = new ConcatSink();
+		for await (const chunk of this.#readChunks(path, 0)) {
+			for (const line of lines.appendAndFlushLines(chunk)) {
+				if (visit(decoder.decode(line))) return;
+				decoder = rest;
 			}
-			pending = pending.slice(start);
 		}
 		// The text after the last newline, "" when the file ends with one, as `split("\n")` yields it.
-		visit(pending + decoder.decode());
+		visit(decoder.decode(lines.flush()));
 	}
 
 	async writeText(path: string, content: string): Promise<void> {

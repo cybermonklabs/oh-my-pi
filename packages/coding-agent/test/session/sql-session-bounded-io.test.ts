@@ -1,6 +1,6 @@
 /**
  * SQL session storage reads and rewrites a long transcript without holding it
- * whole: a read streams the session's parts a few at a time, and a full
+ * whole: a read streams the session's parts a page at a time, and a full
  * rewrite spools its lines to a temporary file and swaps staged parts in. The
  * other readers of a stored transcript (the debug report, memories stage 1,
  * blob gc, the RPC subagent read and the Agent Hub viewer) read it in chunks
@@ -57,7 +57,15 @@ const TIMESTAMP = "2026-11-01T00:00:00.000Z";
 const STAGING = "#staging-";
 const HOUR_MS = 60 * 60 * 1000;
 
-const streamsReads = typeof SqlSessionStorage.prototype.readChunks === "function";
+/** Whether SQL storage reads in chunks: a storage has `readChunks` when its backend reads in pieces. */
+const streamsReads = await (async () => {
+	const client = new SQL("sqlite::memory:");
+	try {
+		return typeof (await SqlSessionStorage.create({ client })).readChunks === "function";
+	} finally {
+		await client.end();
+	}
+})();
 const streamsWrites =
 	typeof SqlSessionStorage.prototype.writeLinesAtomic === "function" &&
 	typeof SqlSessionStorage.prototype.writeLinesSync === "function";
@@ -719,7 +727,17 @@ for (const { adapter, url } of BACKENDS) {
 				const rewrite = storage.writeLinesAtomic(path, transcriptLines(cwd.path(), 2 * MiB), {
 					expectedSize: Buffer.byteLength("kept\n"),
 				});
-				await expect(rewrite).rejects.toBeInstanceOf(SessionWriteConflictError);
+				const error = await rewrite.then(
+					() => undefined,
+					(err: unknown) => err,
+				);
+				expect(error).toBeInstanceOf(SessionWriteConflictError);
+				// The session still has the size the write expected; what changed under it is its staging parts.
+				expect(error).toMatchObject({
+					path,
+					expectedSize: Buffer.byteLength("kept\n"),
+					actualSize: Buffer.byteLength("kept\n"),
+				});
 				expect(swept).toBe(true);
 				expect(await db.stored(path)).toBe("kept\n");
 				expect(await db.stagingPaths()).toEqual([]);
