@@ -36,6 +36,9 @@ export interface SqlSessionStorageTransaction {
  * effect only as the first statement of a real transaction block, so a
  * wrapper's `transaction()` must open a real transaction before it calls the
  * callback (one that only calls the callback silently loses `READ WRITE`).
+ * Such a wrapper also loses the start-up lock: in autocommit,
+ * `pg_advisory_xact_lock` is released when its own statement ends, so stores
+ * that start together race on `CREATE TABLE` again, and no error shows it.
  */
 export interface SqlSessionStorageClient extends SqlSessionStorageTransaction {
 	transaction(callback: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void>;
@@ -163,8 +166,9 @@ interface BusyTimeoutRow {
 	timeout: number | bigint | string;
 }
 
-/** {@link READ_ONLY_DEFAULT} row. */
-interface ReadOnlyDefaultRow {
+/** {@link READ_ONLY_SETTINGS} row. */
+interface ReadOnlySettingsRow {
+	setting: string;
 	reset_val: string;
 }
 
@@ -207,15 +211,26 @@ const WRITE_ATTEMPTS = 5;
  */
 const SETUP_LOCK_KEY = 0x6f6d705f73657373n;
 /**
- * The read-only default this PostgreSQL connection's sessions start from:
- * what the database, the role, the server or the connection's start
- * parameters set, never what a session `SET` changed (see `#readWrite`).
+ * `default_transaction_read_only` of this PostgreSQL connection, read inside
+ * each store transaction (see `#readWrite`). `setting` is the session's own
+ * value; `SET TRANSACTION READ WRITE` does not change it. `reset_val` is the
+ * default the backend session started from: what the database, the role, the
+ * server or the backend connection's start parameters set. Three cases:
+ * - `setting` on, `reset_val` off: a session set read-only over a default
+ *   that is off. The store overrides it and writes.
+ * - both on: the session keeps a read-only default. The store honours it and
+ *   refuses with {@link READ_ONLY_REFUSAL}.
+ * - `setting` off, `reset_val` on: a session turned such a default off. The
+ *   store writes, as it did before it read this setting.
+ * A transaction-mode pooler applies a client's start parameters and its
+ * `connect_query` to the backend with `SET`, so they show as a session value,
+ * which the store overrides.
  */
-const READ_ONLY_DEFAULT = "SELECT reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'";
+const READ_ONLY_SETTINGS = "SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'";
 const READ_ONLY_REFUSAL =
-	"SqlSessionStorage: a database, role, server or connection-start default " +
-	"(default_transaction_read_only = on) makes this connection read-only; the store overrides only " +
-	"a read-only default that a session set, so nothing was written.";
+	"SqlSessionStorage: this session keeps a read-only default (default_transaction_read_only = on) " +
+	"that a database, role, server or connection-start setting gives it; the store overrides only " +
+	"a read-only value that a session set over a default that is off, so nothing was written.";
 const utf8Decoder = new TextDecoder("utf-8");
 /**
  * Most bytes one `readFrom` piece asks for: PostgreSQL's substr takes integer
@@ -703,19 +718,29 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * Run `work` in one PostgreSQL transaction that starts with `opening`.
 	 * Used on PostgreSQL only.
 	 *
-	 * The write opening is `SET TRANSACTION READ WRITE`, then a read of the
-	 * connection's read-only default. A pooled connection can carry another
+	 * The write opening is `SET TRANSACTION READ WRITE`, then a read of
+	 * `setting` and `reset_val` of `default_transaction_read_only` (see
+	 * {@link READ_ONLY_SETTINGS}). A pooled connection can carry another
 	 * client's session-level `default_transaction_read_only = on` (a
 	 * transaction-mode pooler hands one backend to many clients, and a session
 	 * `SET` stays on it); PostgreSQL then refuses every write, even
 	 * `CREATE TABLE IF NOT EXISTS` on a table that exists (SQLSTATE 25006),
 	 * but honours `READ WRITE` set as a transaction's first statement whatever
-	 * that default is. A read-only default that the database, the role, the
-	 * server or the connection's start parameters set is an operator's or a
-	 * provider's decision instead (a provider can make a database read-only
-	 * when its disk is nearly full), so the store honours it. `reset_val`
-	 * shows that default and never a session's `SET`; when it is `on`, the
-	 * transaction fails before `work` runs, with nothing written.
+	 * that default is. The read gives three cases:
+	 * - A session value over a default that is off (`setting` on, `reset_val`
+	 *   off): the store overrides it, and `work` runs.
+	 * - A read-only default that the backend session keeps (both on): the
+	 *   store honours it. The database, the role, the server or the backend
+	 *   connection's start parameters set it, so it is an operator's or a
+	 *   provider's decision (a provider can make a database read-only when its
+	 *   disk is nearly full). The transaction fails before `work` runs, with
+	 *   nothing written.
+	 * - A session that turned such a default off (`setting` off, `reset_val`
+	 *   on): `work` runs, as it did before the store read this setting.
+	 * A transaction-mode pooler applies a client's start parameters and its
+	 * `connect_query` to the backend with `SET`, so the store overrides them
+	 * like any session value. Any other answer, no row included, lets `work`
+	 * run.
 	 *
 	 * The start-up opening (see `#setup`) adds `READ COMMITTED` before the
 	 * read and the start-up advisory lock after it. Under a `repeatable read`
@@ -730,8 +755,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return this.#client.transaction(async transaction => {
 			await transaction.unsafe("SET TRANSACTION READ WRITE");
 			if (opening === "start-up") await transaction.unsafe("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
-			const [setting] = (await transaction.unsafe(READ_ONLY_DEFAULT)) as ReadOnlyDefaultRow[];
-			if (setting?.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
+			const [readOnly] = (await transaction.unsafe(READ_ONLY_SETTINGS)) as ReadOnlySettingsRow[];
+			if (readOnly?.setting === "on" && readOnly.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
 			if (opening === "start-up") await transaction.unsafe(`SELECT pg_advisory_xact_lock(${SETUP_LOCK_KEY})`);
 			await work(transaction);
 		});
