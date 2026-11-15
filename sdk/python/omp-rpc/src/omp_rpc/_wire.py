@@ -1312,8 +1312,8 @@ class PromptError:
     provider: str | None = None
     model: str | None = None
     http_status: int | None = None
-    code: Literal["cost_cap"] | None = None
-    """`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request."""
+    code: Literal["cost_cap", "session_busy"] | None = None
+    """`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2783,7 +2783,7 @@ def parse_prompt_error(value: object, path: str = "PromptError") -> PromptError:
         provider=optional(payload, "provider", decode_str, path),
         model=optional(payload, "model", decode_str, path),
         http_status=optional(payload, "httpStatus", decode_int, path),
-        code=optional(payload, "code", cast('Decoder[Literal["cost_cap"]]', literal(frozenset({"cost_cap"}))), path),
+        code=optional(payload, "code", cast('Decoder[Literal["cost_cap", "session_busy"]]', literal(frozenset({"cost_cap", "session_busy"}))), path),
     )
 
 

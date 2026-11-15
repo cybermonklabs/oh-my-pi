@@ -121,6 +121,7 @@ Important edge behavior from runtime:
 - Malformed JSON and synchronous dispatch failures emit `command: "parse"` without an `id`. Exceptions while handling a recognized command emit a failure with that command's `type` and `id`.
 - Ordinary `prompt` handling acknowledges after the message is admitted (queued, given an idle turn slot, or routed to an extension command), not before native `input` handlers or image preparation finish, and without waiting for the agent run. `abort_and_prompt` first awaits the abort, then acknowledges. A failure before admission is the command's error response. A failure after admission can still emit a later error response with the same `id`.
 - An accepted `prompt` or `abort_and_prompt` completes exactly once: either its success response carries `data.agentInvoked: false` (finished locally), or a later `prompt_result` frame with the same `id` reports how its work ended. `prompt_result` is always written after the response for that `id`.
+- A `prompt` or `abort_and_prompt` that is refused or fails because the agent is busy carries `code: "session_busy"` on its error response and `error.code: "session_busy"` on its `prompt_result`. No other `prompt` or `abort_and_prompt` failure carries that code. A builtin slash command that declines to run while the agent streams (such as `/handoff`, `/retry` or `/move`) is not refused: it answers `success: true` with `data.agentInvoked: false` and no `code`.
 
 ## Command Schema (canonical)
 
@@ -340,6 +341,8 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 
 `prompt` is acknowledged once the message is admitted — an idle turn has started for it, it has been pushed onto the steer/follow-up/aside queue while the agent is busy, or it has been routed to a registered extension command (before that command's handler runs) — not after a model turn finishes. Admission runs any image normalization first (and, for a text-only model with vision description enabled, the vision-description call), so those complete before the acknowledgement. The vision-description call is capped at 20 seconds, which keeps the acknowledgement inside the bundled clients' 30-second request timeout; past the cap the image is still saved and the model is told its description is unavailable. The same applies to a `/skill:` invocation sent through `prompt`. A prompt that settles without ever being admitted (dropped by an `abort`, or failing first) is acknowledged once it settles. Gating the acknowledgement does not change completion: the prompt still completes exactly once, through `data.agentInvoked: false` or its `prompt_result` (below).
 
+A `prompt` with no `streamingBehavior` whose text goes to the agent as a new turn (ordinary text, or a builtin slash command that passes a prompt on, such as `/force:<tool> <prompt>`), sent while the agent streams or while another prompt is still being set up, is refused: its error response has `success: false` and `code: "session_busy"`, a response with `success: true` and the same `id` follows it, and its `prompt_result` has `agentInvoked: false`, `status: "error"` and `error.code: "session_busy"`. A `/skill:` prompt that names a skill the session can run as a command (skill commands on, and a skill of that name) is queued as a steer, and any other `/skill:` text is ordinary text. An extension command runs while the agent streams.
+
 `prompt` starts after previously received ordinary commands, such as `new_session` or `set_model`, have completed. Its admission then runs in the background: the RPC server keeps handling later commands — `abort`, `steer`, `follow_up`, `get_state`, and so on — without waiting for slow image normalization or vision description. An `abort` that lands while a prompt's images are still being prepared cancels the vision-description call and drops the prompt, whether it would have started an idle turn or been queued with `streamingBehavior`.
 
 ```json
@@ -363,6 +366,7 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 - `status`: `"completed"`, `"aborted"` (interrupted by `abort`, `abort_and_prompt`, or a session transition, or dropped by an abort before dispatch), or `"error"`.
 - `error` (only with `status: "error"`): `{ message, provider?, model?, httpStatus?, retryable, code? }`. `message` is the failed turn's `errorMessage`: the provider's error text, which never carries OMP-local diagnostics such as saved request-dump paths. `retryable` marks a transient failure; OMP's own automatic retries have already been exhausted. `code: "cost_cap"` means the session reached `session.maxCost` and OMP did not send the next request; the server keeps running, and later prompts end the same way until the cap is raised. A prompt that fails before reaching the agent also gets the legacy error response with the same `id` before its `prompt_result`.
 - `sessionSettled`: whether the session is already done when the result is written — see [Yield vs settled](#yield-vs-settled). `false` means background work can still wake the agent; a `session_settled` frame follows once it has.
+- `error.code: "session_busy"` means that the agent was busy: the prompt was refused as described above, or it waited at least 30 seconds for the agent to become idle and another run still held the agent. With this code `retryable` stays `false`: read `code`, not `retryable`, to tell a busy agent from a failed prompt. A client built from an older generated Go, Rust or Python SDK reports a parse failure for a `prompt_result` with this code, and Rust code that names the type of this field must use the `PromptErrorCode` enum.
 
 A failed provider turn is not a failed command: the prompt response is still `success: true`, and the turn ends with a normal terminal `agent_end` whose last assistant message has `stopReason: "error"`. Use `prompt_result.status` rather than parsing that message.
 
@@ -1286,7 +1290,7 @@ That means:
 - `"steer"` => queued steering message (interrupt path)
 - `"followUp"` => queued follow-up message (post-turn path)
 
-If omitted during streaming, prompt fails.
+If omitted during streaming, an ordinary prompt fails with `code: "session_busy"`.
 
 Providers supporting live steering may consume queued steering during the
 streaming response; otherwise it is delivered at a turn/tool-batch boundary.
