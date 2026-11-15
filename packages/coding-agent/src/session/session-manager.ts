@@ -38,6 +38,7 @@ import {
 	ColdEntryStore,
 	coldBoundary,
 	coldCutPathIndex,
+	coldEntryForPersistence,
 	convertToColdEntry,
 	copyColdEntry,
 	ENTRY_TYPES_KEPT_WHOLE,
@@ -1772,7 +1773,8 @@ export class SessionManager {
 	}
 
 	#lineFor(entry: FileEntry): string {
-		return `${stringifyJson(prepareEntryForPersistence(entry, this.#blobs)) ?? "null"}\n`;
+		const source = coldEntryForPersistence(entry) ?? entry;
+		return `${stringifyJson(prepareEntryForPersistence(source, this.#blobs)) ?? "null"}\n`;
 	}
 	#recordDurableAppend(line: string): void {
 		this.#expectedDiskSize = (this.#expectedDiskSize ?? 0) + Buffer.byteLength(line, "utf8");

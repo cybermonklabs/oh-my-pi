@@ -317,22 +317,24 @@ function resolveBoundaryIndex(entries: readonly SessionEntry[], keepBoundaryId: 
  */
 interface PrefixToolCalls {
 	readonly length: number;
-	readonly first: SessionEntry;
+	readonly boundary: SessionEntry;
 	readonly entryById: Map<string, SessionEntry>;
 	readonly resolved: Map<string, AgentToolCall>;
 }
 
 /**
- * Prefix indexes by the entry that ends the prefix (the boundary). A branch
- * prefix is the path from the root to its boundary, so one index serves every
- * pass while the cut and the branch stay, and goes with the boundary entry.
+ * The latest prefix index by the first entry of its branch. A branch prefix is
+ * the path from the root to its boundary, so one index serves every pass while
+ * the cut and the branch stay; a new cut or another branch replaces it, so an
+ * older compaction's index never outlives the next one built for the session.
  */
 const prefixToolCalls = new WeakMap<SessionEntry, PrefixToolCalls>();
 
 function prefixToolCallIndex(entries: readonly SessionEntry[], length: number): PrefixToolCalls {
+	const first = entries[0];
 	const boundary = entries[length];
-	const cached = prefixToolCalls.get(boundary);
-	if (cached && cached.length === length && cached.first === entries[0]) return cached;
+	const cached = prefixToolCalls.get(first);
+	if (cached && cached.length === length && cached.boundary === boundary) return cached;
 	const entryById = new Map<string, SessionEntry>();
 	for (let i = 0; i < length; i++) {
 		const entry = entries[i];
@@ -341,8 +343,8 @@ function prefixToolCallIndex(entries: readonly SessionEntry[], length: number): 
 			if (block.type === "toolCall") entryById.set(block.id, entry);
 		}
 	}
-	const index: PrefixToolCalls = { length, first: entries[0], entryById, resolved: new Map() };
-	prefixToolCalls.set(boundary, index);
+	const index: PrefixToolCalls = { length, boundary, entryById, resolved: new Map() };
+	prefixToolCalls.set(first, index);
 	return index;
 }
 

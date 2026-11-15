@@ -19,11 +19,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { logger, stringifyJson } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { type BlobStore, isBlobRef } from "./blob-store";
 import { compactionKeptStart, getReadableCompactionEntry } from "./session-context";
-import { type SessionEntry, TITLE_CHANGE_ENTRY_TYPE, todoResultPhases } from "./session-entries";
-import { resolveBlobRefsInEntriesSync } from "./session-loader";
+import { type FileEntry, type SessionEntry, TITLE_CHANGE_ENTRY_TYPE, todoResultPhases } from "./session-entries";
+import { repairTruncatedSnapcompactFrames, resolveBlobRefsInEntriesSync } from "./session-loader";
 import { entryRecordText } from "./session-persistence";
 
 /**
@@ -141,6 +142,8 @@ export function coldCutIndex(
 
 /** Short strings shared across a load's entries; longer ones are mostly unique. */
 const INTERNED_STRING_MAX_UNITS = 64;
+/** Runtimes are shared up to this JSON length: a source checkout's, with commit and branch, runs past 64. */
+const INTERNED_RUNTIME_MAX_UNITS = 256;
 /** Distinct values one load shares at most, so unique values cannot grow the tables without bound. */
 const INTERNED_VALUES_MAX = 16_384;
 
@@ -182,7 +185,7 @@ export class LoadedValueInterner {
 
 	#internRuntime(runtime: object): object {
 		const key = stringifyJson(runtime);
-		if (key === undefined || key.length > INTERNED_STRING_MAX_UNITS) return runtime;
+		if (key === undefined || key.length > INTERNED_RUNTIME_MAX_UNITS) return runtime;
 		const shared = this.#runtimes.get(key);
 		if (shared) return shared;
 		if (this.#runtimes.size >= INTERNED_VALUES_MAX) return runtime;
@@ -443,9 +446,14 @@ function trackWindowsStore(handle: StoreHandle): void {
 	});
 }
 
+interface CachedRecord {
+	readonly entry: Readonly<Record<string, unknown>>;
+	readonly bytes: number;
+}
+
 /**
  * One loaded manager's records of cold entries: a file under
- * `os.tmpdir()/omp-cold/`, unlinked as soon as it is open on POSIX (its disk
+ * `os.tmpdir()/omp-cold-<uid>/`, unlinked as soon as it is open on POSIX (its disk
  * is freed when the descriptor closes, and a killed process leaves nothing;
  * on Windows it is deleted when the store is collected and at exit). A record
  * is the entry exactly as the manager held it, with image data replaced by
@@ -462,15 +470,22 @@ export class ColdEntryStore {
 	#pending: Buffer[] = [];
 	#pendingBytes = 0;
 	#writeFailureLogged = false;
-	/** Materialized records by offset, most recent last. */
-	readonly #cache = new Map<number, { entry: Readonly<Record<string, unknown>>; bytes: number }>();
-	#cacheBytes = 0;
+	/** Materialized records by offset; a record larger than {@link CACHE_BYTES} is not kept. */
+	readonly #cache = new LRUCache<number, CachedRecord>({
+		max: CACHE_ENTRIES,
+		maxSize: CACHE_BYTES,
+		sizeCalculation: cached => cached.bytes,
+	});
 	#materializations = 0;
 	#hydrations = 0;
 
 	constructor(blobs: BlobStore) {
 		this.#blobs = blobs;
-		const dir = path.join(os.tmpdir(), "omp-cold");
+		// One directory per account: `os.tmpdir()` is shared between accounts on
+		// Linux and the directory is 0700, so under one shared name the first
+		// account would own it and every other account's open would fail.
+		const uid = process.getuid?.();
+		const dir = path.join(os.tmpdir(), uid === undefined ? "omp-cold" : `omp-cold-${uid}`);
 		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
 		const fd = fs.openSync(file, "wx+", 0o600);
@@ -519,23 +534,11 @@ export class ColdEntryStore {
 	/** The record parsed, its blob references resolved and deep-frozen; the 8 most recent are cached. */
 	materialize(record: ColdRecord): Readonly<Record<string, unknown>> {
 		const cached = this.#cache.get(record.offset);
-		if (cached) {
-			this.#cache.delete(record.offset);
-			this.#cache.set(record.offset, cached);
-			return cached.entry;
-		}
+		if (cached) return cached.entry;
 		const entry = this.parse(record, true);
 		deepFreeze(entry);
 		this.#materializations++;
-		if (record.length <= CACHE_BYTES) {
-			this.#cache.set(record.offset, { entry, bytes: record.length });
-			this.#cacheBytes += record.length;
-			for (const [key, value] of this.#cache) {
-				if (this.#cache.size <= CACHE_ENTRIES && this.#cacheBytes <= CACHE_BYTES) break;
-				this.#cache.delete(key);
-				this.#cacheBytes -= value.bytes;
-			}
-		}
+		this.#cache.set(record.offset, { entry, bytes: record.length });
 		return entry;
 	}
 
@@ -593,9 +596,9 @@ export class ColdEntryStore {
 
 	#read(record: ColdRecord): Buffer {
 		if (record.offset >= this.#written && !this.#flush()) {
-			const pending = this.#pending.length === 1 ? this.#pending[0]! : Buffer.concat(this.#pending);
+			// A failed flush leaves every pending record joined in its one buffer.
 			const start = record.offset - this.#written;
-			return pending.subarray(start, start + record.length);
+			return this.#pending[0]!.subarray(start, start + record.length);
 		}
 		const data = Buffer.allocUnsafe(record.length);
 		let done = 0;
@@ -647,6 +650,40 @@ function restoreFields(
 		if (!isAccessorFrom(target, key, accessors)) continue;
 		Object.defineProperty(target, key, { value: source[key], writable: true, enumerable: true, configurable: true });
 	}
+}
+
+/**
+ * Cold `entry` as a plain object with the same fields in the same order, for
+ * `prepareEntryForPersistence`: its record parsed with image data left as blob
+ * references (every record holds them so) and with legacy truncated snapcompact
+ * frames repaired, as resolving the record would, each value the entry keeps
+ * in memory taken from the entry. The persisted line is the one the whole entry
+ * gives, but a full write neither reads nor hashes nor stores its images again.
+ * `undefined` when `entry` is not cold.
+ */
+export function coldEntryForPersistence(entry: FileEntry): FileEntry | undefined {
+	const record = recordOf(entry);
+	if (!record) return undefined;
+	const parsed = record.store.parse(record, false);
+	repairTruncatedSnapcompactFrames(parsed as unknown as FileEntry);
+	const view = fieldsOver(entry, parsed, entryFieldAccessors);
+	const slots: ColdEntrySlots = entry as object;
+	const shell = slots[COLD_MESSAGE];
+	if (shell) view.message = fieldsOver(shell, isRecord(parsed.message) ? parsed.message : {}, messageFieldAccessors);
+	return view as unknown as FileEntry;
+}
+
+/** `holder`'s fields in key order: the value of each of its accessors from `record`, each data value its own. */
+function fieldsOver(
+	holder: object,
+	record: Readonly<Record<string, unknown>>,
+	accessors: ReadonlyMap<string, PropertyDescriptor>,
+): Record<string, unknown> {
+	const fields: Record<string, unknown> = {};
+	for (const key of Object.keys(holder)) {
+		fields[key] = isAccessorFrom(holder, key, accessors) ? record[key] : Reflect.get(holder, key);
+	}
+	return fields;
 }
 
 /**

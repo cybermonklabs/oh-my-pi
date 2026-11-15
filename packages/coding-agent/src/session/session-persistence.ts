@@ -599,8 +599,9 @@ export function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStor
 /**
  * `value` with each image payload a persisted line externalizes (content image
  * blocks, `images[]`, snapcompact frames, image data URLs, generated images)
- * replaced by its blob reference, and nothing else changed. Untouched subtrees
- * are shared.
+ * replaced by its blob reference, and nothing else changed. A block a persisted
+ * line keeps verbatim ({@link isAtomicPersistenceNode}) keeps its images inline,
+ * as the line does. Untouched subtrees are shared.
  */
 function externalizeImagesOnly(value: unknown, blobStore: BlobStore, key?: string): unknown {
 	if (typeof value === "string") {
@@ -620,6 +621,7 @@ function externalizeImagesOnly(value: unknown, blobStore: BlobStore, key?: strin
 	if (shouldExternalizeImagePayload(value, key)) {
 		return { ...value, data: externalizeImagePayloadSync(blobStore, value, value.data, value.mimeType) };
 	}
+	if (isAtomicPersistenceNode(value, key)) return value;
 	if (Array.isArray(value)) {
 		let changed: unknown[] | undefined;
 		for (let index = 0; index < value.length; index++) {

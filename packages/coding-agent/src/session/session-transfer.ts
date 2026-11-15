@@ -41,7 +41,12 @@ import { replaceFileAtomically } from "../utils/atomic-file";
 import { BLOB_HASH_RE, BlobStore } from "./blob-store";
 import type { FileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { findSessionFiles } from "./session-listing";
-import { readSessionHeaderId, visitEntriesFromFileStream, visitSessionFile } from "./session-loader";
+import {
+	isValidSessionHeader,
+	readSessionHeaderId,
+	visitEntriesFromFileStream,
+	visitSessionFile,
+} from "./session-loader";
 import { SessionManager } from "./session-manager";
 import { FileSessionStorage } from "./session-storage";
 
@@ -214,10 +219,14 @@ async function requireSessionId(file: string): Promise<string> {
 /** The first record of the journal at `file` (title slot folded in), read from its first lines only. */
 async function firstJournalRecord(file: string): Promise<FileEntry | undefined> {
 	const first: { entry?: FileEntry } = {};
-	await visitEntriesFromFileStream(file, entry => {
-		first.entry = entry;
-		return false;
-	});
+	await visitEntriesFromFileStream(
+		file,
+		entry => {
+			first.entry = entry;
+			return false;
+		},
+		{ storage: new FileSessionStorage() },
+	);
 	return first.entry;
 }
 
@@ -268,11 +277,12 @@ async function collectBlobHashes(chunks: AsyncIterable<Uint8Array>, into: Set<st
 	scan(carried + decoder.decode(), true);
 }
 
-/** Stream `chunks` into the new file `file`. */
-async function writeChunksToFile(file: string, chunks: AsyncIterable<Uint8Array>): Promise<void> {
+/** Stream `chunks` into the new file `file`, each chunk also fed to `digest` when given. */
+async function writeChunksToFile(file: string, chunks: AsyncIterable<Uint8Array>, digest?: Bun.SHA256): Promise<void> {
 	const sink = Bun.file(file).writer();
 	try {
 		for await (const chunk of chunks) {
+			digest?.update(chunk);
 			const written = sink.write(chunk);
 			if (typeof written !== "number") await written;
 		}
@@ -445,11 +455,19 @@ function parseManifest(bytes: Uint8Array, archive: string): SessionArchiveManife
 	return { version, id, cwd, omp };
 }
 
+/** The hash a `blobs/<sha256>` member is named for; `undefined` for any other member. */
+function blobMemberHash(name: string): string | undefined {
+	if (!name.startsWith(BLOBS_PREFIX)) return undefined;
+	const hash = name.slice(BLOBS_PREFIX.length);
+	return BLOB_HASH_RE.test(hash) ? hash : undefined;
+}
+
 /**
  * Read and validate the whole archive before anything is written outside
  * `staging`: member layout, manifest version, journal header, and every
  * blob's sha256. The members are read one after another, each streamed to its
- * own file in `staging`, so no member is held in memory.
+ * own file in `staging`, so no member is held in memory; a blob is hashed as
+ * it streams and refused there when its bytes do not match its name.
  */
 async function readSessionArchive(archive: string, staging: TempDir): Promise<SessionArchiveContents> {
 	await requireFile(archive, "Archive");
@@ -459,8 +477,9 @@ async function readSessionArchive(archive: string, staging: TempDir): Promise<Se
 			{ path: archive, format: "tar" },
 			{ limits: { maxInMemorySize: ARCHIVE_SIZE_LIMIT, maxMemberSize: ARCHIVE_SIZE_LIMIT } },
 		);
-		// The members' total keeps the cap it had when the archive was read into
-		// memory; their sizes come from the headers, before any member is staged.
+		// Invariant: the members' sizes in the tar headers total at most
+		// ARCHIVE_SIZE_LIMIT (2 GiB), checked here before any member is staged.
+		// `assertInMemorySize` words the refusal as users already see it.
 		let total = 0;
 		for (const entry of reader.indexEntries()) {
 			if (entry.isDirectory) continue;
@@ -470,7 +489,15 @@ async function readSessionArchive(archive: string, staging: TempDir): Promise<Se
 		for (const entry of reader.indexEntries()) {
 			if (entry.isDirectory) continue;
 			const file = staging.join(`member-${members.length}`);
-			await writeChunksToFile(file, reader.readFileChunks(entry.path));
+			const hash = blobMemberHash(entry.path);
+			const digest = hash === undefined ? undefined : new Bun.SHA256();
+			await writeChunksToFile(file, reader.readFileChunks(entry.path), digest);
+			const actual = digest?.digest("hex");
+			if (actual !== hash) {
+				throw new SessionTransferError(
+					`Bad session archive ${archive}: blob ${hash} fails its sha256 check (content hashes to ${actual}). Nothing was unpacked.`,
+				);
+			}
 			members.push([entry.path, file]);
 		}
 	} catch (error) {
@@ -485,14 +512,15 @@ async function readSessionArchive(archive: string, staging: TempDir): Promise<Se
 	const artifacts: [string, string][] = [];
 	const blobs: [string, string][] = [];
 	for (const [name, file] of members) {
+		const blobHash = blobMemberHash(name);
 		if (name === MANIFEST_MEMBER) {
 			manifestFile = file;
 		} else if (name === SESSION_MEMBER) {
 			journal = file;
 		} else if (name.startsWith(ARTIFACTS_PREFIX) && isSafeRelativePath(name.slice(ARTIFACTS_PREFIX.length))) {
 			artifacts.push([name.slice(ARTIFACTS_PREFIX.length), file]);
-		} else if (name.startsWith(BLOBS_PREFIX) && BLOB_HASH_RE.test(name.slice(BLOBS_PREFIX.length))) {
-			blobs.push([name.slice(BLOBS_PREFIX.length), file]);
+		} else if (blobHash !== undefined) {
+			blobs.push([blobHash, file]);
 		} else {
 			throw new SessionTransferError(
 				`Bad session archive ${archive}: unexpected member "${formatArchivePathForError(name)}".`,
@@ -504,7 +532,7 @@ async function readSessionArchive(archive: string, staging: TempDir): Promise<Se
 	if (!journal) throw new SessionTransferError(`Bad session archive ${archive}: no session.jsonl.`);
 
 	const header = await firstJournalRecord(journal);
-	if (header?.type !== "session" || typeof header.id !== "string") {
+	if (!isValidSessionHeader(header)) {
 		throw new SessionTransferError(`Bad session archive ${archive}: session.jsonl has no session header.`);
 	}
 	if (header.id !== manifest.id) {
@@ -514,16 +542,6 @@ async function readSessionArchive(archive: string, staging: TempDir): Promise<Se
 	}
 	if (!SESSION_ID_RE.test(header.id)) {
 		throw new SessionTransferError(`Bad session archive ${archive}: invalid session id.`);
-	}
-	for (const [hash, file] of blobs) {
-		const digest = new Bun.SHA256();
-		for await (const chunk of Bun.file(file).stream()) digest.update(chunk);
-		const actual = digest.digest("hex");
-		if (actual !== hash) {
-			throw new SessionTransferError(
-				`Bad session archive ${archive}: blob ${hash} fails its sha256 check (content hashes to ${actual}). Nothing was unpacked.`,
-			);
-		}
 	}
 	return { manifest, journal, header, artifacts, blobs };
 }

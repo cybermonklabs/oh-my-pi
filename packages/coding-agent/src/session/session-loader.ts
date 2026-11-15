@@ -149,7 +149,7 @@ function splitTitleSlot(content: string): { body: string; slot: SessionTitleUpda
 	return { body: content.slice(newlineIndex + 1), slot };
 }
 
-function isValidSessionHeader(entry: FileEntry | undefined): entry is SessionHeader {
+export function isValidSessionHeader(entry: FileEntry | undefined): entry is SessionHeader {
 	return entry?.type === "session" && typeof entry.id === "string";
 }
 
@@ -937,7 +937,7 @@ function containsBlobRef(value: unknown): boolean {
  * those archives from their retained source text so an already-wedged session
  * resumes as text instead of sending malformed image data to the provider.
  */
-function repairTruncatedSnapcompactFrames(entry: FileEntry): void {
+export function repairTruncatedSnapcompactFrames(entry: FileEntry): void {
 	if (entry.type !== "compaction") return;
 	const archive = snapcompact.getPreservedArchive(entry.preserveData);
 	if (!archive?.frames.some(frame => isPersistenceTruncatedString(frame.data))) return;
