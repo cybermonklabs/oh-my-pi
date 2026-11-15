@@ -279,9 +279,9 @@ describe("AgentSession entry patch persistence", () => {
 			const long = await recoverRetry(LONG_HISTORY);
 			expect(long.transcriptBytes - short.transcriptBytes).toBeGreaterThan(2 * 1024 * 1024);
 
-			// Regression: marking the recovered attempt rewrote the whole session
-			// file, so every recovered retry on a long session wrote the transcript
-			// again. The turn now writes its own entries and one small record.
+			// Marking the recovered attempt never rewrites the whole session file:
+			// the turn writes its own entries and one small record, so a recovered
+			// retry on a long session does not write the transcript again.
 			expect([short.fullWrites, long.fullWrites]).toEqual([0, 0]);
 			expect(Math.abs(long.bytesWritten - short.bytesWritten)).toBeLessThan(1024);
 
@@ -362,8 +362,8 @@ describe("AgentSession entry patch persistence", () => {
 			const long = await stampDeadEnd(LONG_HISTORY);
 			expect(long.transcriptBytes - short.transcriptBytes).toBeGreaterThan(2 * 1024 * 1024);
 
-			// Regression: the stamp rewrote the whole session file after every
-			// compaction that dead-ended.
+			// The stamp never rewrites the whole session file, so a compaction that
+			// dead-ends does not write the transcript again.
 			expect([short.fullWrites, long.fullWrites]).toEqual([0, 0]);
 			expect(Math.abs(long.bytesWritten - short.bytesWritten)).toBeLessThan(1024);
 
@@ -456,8 +456,8 @@ describe("AgentSession entry patch persistence", () => {
 			const [short, long] = runs;
 			expect(long.transcriptBytes - short.transcriptBytes).toBeGreaterThan(2 * 1024 * 1024);
 
-			// Regression: each elide pass, which runs on its own after compactions,
-			// rewrote the whole session file.
+			// An elide pass, which runs on its own after compactions, never rewrites
+			// the whole session file.
 			expect([short.fullWrites, long.fullWrites]).toEqual([0, 0]);
 			expect(Math.abs(long.bytesWritten - short.bytesWritten)).toBeLessThan(1024);
 

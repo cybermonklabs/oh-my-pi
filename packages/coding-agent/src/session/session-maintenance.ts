@@ -1182,8 +1182,8 @@ export class SessionMaintenance {
 				patches.push({ entryId: anchor.id, message: { contextSnapshot: anchor.message.contextSnapshot } });
 			}
 		}
-		// One appended record instead of a whole-file rewrite. A failed write
-		// keeps the pass live; the next successful write lands it.
+		// Persists the pass as one appended `entry_patch` record; a failed write
+		// keeps it live and the next successful write lands it.
 		await this.#host.sessionManager.patchEntries(patches);
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.replaceMessagesFromSessionContext(sessionContext.messages);

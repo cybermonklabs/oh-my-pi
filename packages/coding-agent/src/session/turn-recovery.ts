@@ -1074,7 +1074,7 @@ export class TurnRecovery {
 				retryRecovery,
 			});
 		}
-		// One appended record marks every attempt; the transcript is not rewritten.
+		// Every marked attempt's `retryRecovery` persists in one appended `entry_patch` record.
 		await this.#host.sessionManager.patchEntries(
 			retryErrors.map(({ entryId, retryRecovery }) => ({ entryId, message: { retryRecovery } })),
 		);
