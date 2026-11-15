@@ -31,6 +31,11 @@ export interface SqlSessionStorageTransaction {
  * so a session row and its parts change together; on SQLite the store issues
  * `BEGIN IMMEDIATE` / `COMMIT` through `unsafe()` itself and runs one call at a
  * time per client, because Bun's SQLite adapter has a single connection.
+ * On PostgreSQL every write, a single statement included, runs in
+ * `transaction()` and starts with `SET TRANSACTION READ WRITE`, which takes
+ * effect only as the first statement of a real transaction block, so a
+ * wrapper's `transaction()` must open a real transaction before it calls the
+ * callback (one that only calls the callback silently loses `READ WRITE`).
  */
 export interface SqlSessionStorageClient extends SqlSessionStorageTransaction {
 	transaction(callback: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void>;
@@ -158,6 +163,11 @@ interface BusyTimeoutRow {
 	timeout: number | bigint | string;
 }
 
+/** {@link READ_ONLY_DEFAULT} row. */
+interface ReadOnlyDefaultRow {
+	reset_val: string;
+}
+
 /** `readFull` row: kind 0 is the session row's own content, kind 1 a part. */
 interface ContentRow {
 	kind: number | string;
@@ -190,6 +200,22 @@ const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
 /** Attempts per write when PostgreSQL or MySQL picks it as a deadlock victim. */
 const WRITE_ATTEMPTS = 5;
+/**
+ * Key of the PostgreSQL advisory lock every start-up statement takes (see
+ * `#setup`): the ASCII bytes of "omp_sess" read as one big-endian 64-bit
+ * integer, a value other users of advisory locks are unlikely to pick.
+ */
+const SETUP_LOCK_KEY = 0x6f6d705f73657373n;
+/**
+ * The read-only default this PostgreSQL connection's sessions start from:
+ * what the database, the role, the server or the connection's start
+ * parameters set, never what a session `SET` changed (see `#readWrite`).
+ */
+const READ_ONLY_DEFAULT = "SELECT reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'";
+const READ_ONLY_REFUSAL =
+	"SqlSessionStorage: a database, role, server or connection-start default " +
+	"(default_transaction_read_only = on) makes this connection read-only; the store overrides only " +
+	"a read-only default that a session set, so nothing was written.";
 const utf8Decoder = new TextDecoder("utf-8");
 /**
  * Most bytes one `readFrom` piece asks for: PostgreSQL's substr takes integer
@@ -618,14 +644,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				await this.#assertSchema();
 				return;
 			}
-			await this.#writeAlone(executor => executor.unsafe(this.#q.createTable));
+			await this.#setup(this.#q.createTable);
 			// Probe before altering: PostgreSQL's ALTER TABLE waits for every open
 			// transaction on the table even when the column exists.
 			const columns = await this.#columns(this.#table);
 			for (const { column, ddl } of this.#q.addColumns) {
 				if (columns.has(column)) continue;
 				try {
-					await this.#writeAlone(executor => executor.unsafe(ddl));
+					await this.#setup(ddl);
 				} catch (err) {
 					// Another process starting at the same moment added it first.
 					if (!isDuplicateColumnError(err)) throw err;
@@ -634,30 +660,79 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// MySQL's UPDATE locks every row it scans, so a no-op backfill would
 			// still wait for, and block, every write in flight.
 			if ((await this.#client.unsafe(this.#q.findUnmeasured)).length > 0) {
-				await this.#writeAlone(executor => executor.unsafe(this.#q.backfillByteLen));
+				await this.#setup(this.#q.backfillByteLen);
 			}
-			await this.#writeAlone(executor => executor.unsafe(this.#q.createPartsTable));
+			await this.#setup(this.#q.createPartsTable);
 		});
 	}
 
-	/** Run one write alone: on PostgreSQL in its own read-write transaction (see `#readWrite`), else on the client. */
-	#writeAlone(write: (executor: SqlSessionStorageTransaction) => Promise<unknown>): Promise<unknown> {
-		return this.#adapter === "postgres" ? this.#readWrite(write) : write(this.#client);
+	/**
+	 * Run one start-up statement of `init`. Stores that start at the same
+	 * moment on a PostgreSQL database without the tables would race: two
+	 * `CREATE TABLE IF NOT EXISTS` of one name both find no table, and one
+	 * fails (SQLSTATE 23505, 42P07 or 42710). So there every start-up
+	 * statement runs in its own transaction behind the start-up opening of
+	 * `#readWrite`, which takes one transaction-scoped advisory lock; they run
+	 * one after another, and the lock ends with the transaction. Each
+	 * statement keeps its own transaction, so a duplicate-column error still
+	 * fails only its own ALTER. On MySQL and SQLite the statement runs
+	 * straight on the client.
+	 */
+	async #setup(query: string): Promise<void> {
+		if (this.#adapter !== "postgres") {
+			await this.#writeAlone(executor => executor.unsafe(query));
+			return;
+		}
+		await this.#readWrite(transaction => transaction.unsafe(query), "start-up");
 	}
 
 	/**
-	 * Run `work` in one PostgreSQL transaction whose first statement is
-	 * `SET TRANSACTION READ WRITE`. A pooled connection can carry another
+	 * Run one write outside any store transaction: on PostgreSQL in a
+	 * read-write transaction of its own (see `#readWrite`), elsewhere straight
+	 * on the client. On SQLite it does not use the call queue, so the caller
+	 * must already hold `#exclusive` (`init` and `updateSessionTitle` do), or
+	 * the statement can join another call's `BEGIN IMMEDIATE` on SQLite's one
+	 * connection.
+	 */
+	async #writeAlone(write: (executor: SqlSessionStorageTransaction) => Promise<unknown>): Promise<void> {
+		if (this.#adapter === "postgres") await this.#readWrite(write);
+		else await write(this.#client);
+	}
+
+	/**
+	 * Run `work` in one PostgreSQL transaction that starts with `opening`.
+	 * Used on PostgreSQL only.
+	 *
+	 * The write opening is `SET TRANSACTION READ WRITE`, then a read of the
+	 * connection's read-only default. A pooled connection can carry another
 	 * client's session-level `default_transaction_read_only = on` (a
 	 * transaction-mode pooler hands one backend to many clients, and a session
 	 * `SET` stays on it); PostgreSQL then refuses every write, even
 	 * `CREATE TABLE IF NOT EXISTS` on a table that exists (SQLSTATE 25006),
 	 * but honours `READ WRITE` set as a transaction's first statement whatever
-	 * that default is. Used on PostgreSQL only.
+	 * that default is. A read-only default that the database, the role, the
+	 * server or the connection's start parameters set is an operator's or a
+	 * provider's decision instead (a provider can make a database read-only
+	 * when its disk is nearly full), so the store honours it. `reset_val`
+	 * shows that default and never a session's `SET`; when it is `on`, the
+	 * transaction fails before `work` runs, with nothing written.
+	 *
+	 * The start-up opening (see `#setup`) adds `READ COMMITTED` before the
+	 * read and the start-up advisory lock after it. Under a `repeatable read`
+	 * default the snapshot would be taken before the lock wait, and a
+	 * backfill would then fail with SQLSTATE 40001. The lock comes after the
+	 * read, so an honoured default refuses before any wait.
 	 */
-	#readWrite(work: (transaction: SqlSessionStorageTransaction) => Promise<unknown>): Promise<void> {
+	#readWrite(
+		work: (transaction: SqlSessionStorageTransaction) => Promise<unknown>,
+		opening: "write" | "start-up" = "write",
+	): Promise<void> {
 		return this.#client.transaction(async transaction => {
 			await transaction.unsafe("SET TRANSACTION READ WRITE");
+			if (opening === "start-up") await transaction.unsafe("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+			const [setting] = (await transaction.unsafe(READ_ONLY_DEFAULT)) as ReadOnlyDefaultRow[];
+			if (setting?.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
+			if (opening === "start-up") await transaction.unsafe(`SELECT pg_advisory_xact_lock(${SETUP_LOCK_KEY})`);
 			await work(transaction);
 		});
 	}
@@ -683,10 +758,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * Run `work` in one transaction. On SQLite it opens with `BEGIN IMMEDIATE`,
 	 * taking the write lock up front, so a writer in another process makes it
-	 * wait (busy timeout) or fail before anything ran. On PostgreSQL it opens
-	 * read-write (see `#readWrite`). On PostgreSQL and MySQL a transaction the
-	 * database aborts as a deadlock victim runs again; each one recomputes
-	 * everything under its own locks.
+	 * wait (busy timeout) or fail before anything ran. On PostgreSQL it starts
+	 * with the write opening of `#readWrite`. On PostgreSQL and MySQL a
+	 * transaction the database aborts as a deadlock victim runs again; each
+	 * one recomputes everything under its own locks. A refused read-only
+	 * default is no deadlock and does not run again.
 	 */
 	#transaction(work: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void> {
 		if (this.#adapter === "postgres") return this.#retryDeadlocks(() => this.#readWrite(work));
