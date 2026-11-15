@@ -4472,7 +4472,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
 		if (this.#exitRecorded) return;
 		this.#exitRecorded = true;
-		const pendingToolCalls = collectPendingToolCalls(this.sessionManager.getBranch());
+		// A pending call is always in the interrupted tail, after the cut: older bodies stay unread.
+		const pendingToolCalls = collectPendingToolCalls(this.sessionManager.getBranchFromCut());
 		if (
 			pendingToolCalls.length === 0 &&
 			!this.sessionManager.getEntries().some(entry => entry.type === "message" && entry.message.role === "assistant")

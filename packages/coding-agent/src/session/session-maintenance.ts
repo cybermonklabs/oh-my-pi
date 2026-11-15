@@ -1182,7 +1182,11 @@ export class SessionMaintenance {
 			return { region, replacement, replacementTokens: replacementTokenCount };
 		});
 
-		applyShakeRegions(items);
+		// A body read back from the cold store is frozen: each entry is made whole
+		// for its rewrite and goes back to the store with it.
+		for (const [entry, entryItems] of Map.groupBy(items, item => item.region.entry)) {
+			this.#host.sessionManager.updateEntryBody(entry.id, () => applyShakeRegions(entryItems));
+		}
 		this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
 		const patches = elidePatches(items);
 		if (anchoredTokensRemoved > 0) {

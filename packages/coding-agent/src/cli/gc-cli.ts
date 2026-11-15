@@ -40,7 +40,7 @@ import {
 	restoreArchivedSessionLocked,
 } from "../session/session-archive";
 import { codeOf, statIfPresent, withGcLock } from "../session/gc-lock";
-import { readSessionHeaderId } from "../session/session-loader";
+import { readSessionHeaderId, transcriptByteChunks } from "../session/session-loader";
 import {
 	FileSessionStorage,
 	SESSION_STAGING_RE,
@@ -588,6 +588,24 @@ function collectBlobHashesFromText(text: string, hashes: Set<string>): void {
 	}
 }
 
+/**
+ * {@link collectBlobHashesFromText} over the bytes `chunks` yields, holding one
+ * chunk and the line it ends inside at a time. A reference never spans lines,
+ * so each scan stops at the chunk's last newline and carries the cut line,
+ * with any reference it holds, into the next.
+ */
+async function collectBlobHashesFromChunks(chunks: AsyncIterable<Uint8Array>, hashes: Set<string>): Promise<void> {
+	const decoder = new TextDecoder();
+	let tail = "";
+	for await (const chunk of chunks) {
+		const text = tail + decoder.decode(chunk, { stream: true });
+		const end = text.lastIndexOf("\n") + 1;
+		collectBlobHashesFromText(text.slice(0, end), hashes);
+		tail = text.slice(end);
+	}
+	collectBlobHashesFromText(tail + decoder.decode(), hashes);
+}
+
 /** The first way `after` differs from `before`, or undefined when it does not. */
 function censusChange(before: Map<string, string>, after: Map<string, string>): string | undefined {
 	for (const [name, standing] of after) {
@@ -974,15 +992,13 @@ async function runBlobGc(
 				);
 			}
 			for (const file of stored) {
-				let text: string;
 				try {
-					text = await storage.readText(file);
+					await collectBlobHashesFromChunks(transcriptByteChunks(file, storage), referenced.hashes);
 				} catch (error) {
 					// Removed since the listing: it references nothing anymore.
 					if (codeOf(error) === "ENOENT") continue;
 					throw error;
 				}
-				collectBlobHashesFromText(text, referenced.hashes);
 			}
 		}
 		const { candidates, staging } = await collectBlobCandidates(blobDir, options.track);

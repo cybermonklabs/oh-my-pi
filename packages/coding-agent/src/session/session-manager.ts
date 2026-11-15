@@ -37,6 +37,7 @@ import {
 	type ColdBoundary,
 	ColdEntryStore,
 	coldBoundary,
+	coldCutPathIndex,
 	convertToColdEntry,
 	copyColdEntry,
 	ENTRY_TYPES_KEPT_WHOLE,
@@ -121,6 +122,7 @@ import {
 	type SessionFileVisit,
 	type SessionLoadResult,
 	sessionContentDigest,
+	transcriptByteChunks,
 	visitEntriesFromFile,
 	visitLoadedSession,
 	visitSessionFile,
@@ -183,8 +185,6 @@ const ACK_COMPARE_WINDOW_BYTES = 1 << 16;
  */
 export const SESSION_TAIL_APPEND_CHUNK_BYTES = 4 * 1024 * 1024;
 const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
-/** `model_usage` purpose carrying the billed usage of an assistant turn removed by `discardEntryDurably`. */
-const DISCARDED_TURN_USAGE_PURPOSE = "discarded-turn";
 /**
  * Read-back-and-retry passes one full rewrite makes after meeting another
  * writer's entries. Each pass re-reads the file, so only a writer that appends
@@ -1055,16 +1055,6 @@ interface SessionFileBody {
 	stamp: SessionBodyStamp;
 }
 
-/** Whether `text` is exactly the concatenation of `lines`, compared without building it. */
-function textMatchesLines(text: string, lines: Iterable<string>): boolean {
-	let offset = 0;
-	for (const line of lines) {
-		if (!text.startsWith(line, offset)) return false;
-		offset += line.length;
-	}
-	return offset === text.length;
-}
-
 /**
  * Compare the UTF-8 encoding of a generated JSONL body to the durable file's raw
  * bytes without materializing either transcript. Nothing is decoded, so no decoder
@@ -1117,6 +1107,26 @@ async function fileMatchesLines(filePath: string, lines: Iterable<string>): Prom
 		return false;
 	}
 	return expectedOffset === expectedLength && !encodeNextWindow();
+}
+
+/**
+ * Whether stored chunks are exactly the UTF-8 encoding of `body`, compared by
+ * byte length and SHA-256 while holding one line of the body and one stored
+ * chunk at a time.
+ */
+async function chunksMatchBody(chunks: AsyncIterable<Uint8Array>, body: SessionFileBody): Promise<boolean> {
+	const expected = new Bun.CryptoHasher("sha256");
+	for (const line of body.lines) expected.update(line);
+	// Iterating `lines` counted the body's bytes again.
+	const expectedBytes = body.bytes;
+	const stored = new Bun.CryptoHasher("sha256");
+	let storedBytes = 0;
+	for await (const chunk of chunks) {
+		storedBytes += chunk.byteLength;
+		if (storedBytes > expectedBytes) return false;
+		stored.update(chunk);
+	}
+	return storedBytes === expectedBytes && stored.digest("hex") === expected.digest("hex");
 }
 
 /**
@@ -2251,10 +2261,10 @@ export class SessionManager {
 		return !this.#allEntriesHandedToStorage() && this.#shouldHaveSessionFile();
 	}
 
-	/** Verify a failed acknowledgement without materializing a file-backed transcript. */
+	/** Verify a failed acknowledgement chunk by chunk: file bytes exactly, other storage by size and SHA-256. */
 	async #bodyMatchesStorage(sessionFile: string, body: SessionFileBody): Promise<boolean> {
 		if (this.#storage instanceof FileSessionStorage) return fileMatchesLines(sessionFile, body.lines);
-		return textMatchesLines(await this.#storage.readText(sessionFile), body.lines);
+		return chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body);
 	}
 
 	/**
@@ -2567,7 +2577,7 @@ export class SessionManager {
 				}
 				if (this.#diskEpoch !== epoch) {
 					try {
-						if (textMatchesLines(await this.#storage.readText(sessionFile), body.lines)) {
+						if (await chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body)) {
 							this.#recordPublish(body.stamp, body.bytes);
 						}
 					} catch {
@@ -3459,11 +3469,13 @@ export class SessionManager {
 	/**
 	 * Stream the session at `filePath` into memory one entry at a time, so the
 	 * transcript is never held whole: each entry is migrated, its usage
-	 * completed, adapted for a fork, stripped of stale replay metadata and
-	 * indexed; every entry whose type is not kept whole is written to a new cold
-	 * store as it arrives. After the stream the cut is computed, the entries
-	 * from it on (and those kept whole by position) are made whole again, and
-	 * the whole entries' blob references are resolved.
+	 * completed, adapted for a fork and indexed; every entry whose type is not
+	 * kept whole is written to a new cold store as it arrives. After the stream
+	 * the cut is computed, the entries from it on (and those kept whole by
+	 * position) are made whole again, stale replay metadata is stripped (after
+	 * any load-time pass, so from what the passes left), an entry before the cut
+	 * that a pass or the stripping made whole goes back to the store, and the
+	 * whole entries' blob references are resolved.
 	 */
 	async #loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
 		// A current-version file whose first entry has no id may predate ids
@@ -3520,10 +3532,17 @@ export class SessionManager {
 		// engine call-site cache holding the last visitor) can keep alive, and
 		// that scope must not keep the transcript alive once the manager lets go.
 		const interner = new LoadedValueInterner();
-		const intake: { entries: SessionEntry[]; index: SessionEntryIndex; store: ColdEntryStore | undefined } = {
+		const intake: {
+			entries: SessionEntry[];
+			index: SessionEntryIndex;
+			store: ColdEntryStore | undefined;
+			/** Entries carrying replay metadata a resume strips, sanitized once the load-time passes ran. */
+			unsanitized: SessionEntry[];
+		} = {
 			entries: [],
 			index: new SessionEntryIndex(),
 			store: undefined,
+			unsanitized: [],
 		};
 		const openStore = () => {
 			intake.store ??= new ColdEntryStore(this.#blobs);
@@ -3563,7 +3582,13 @@ export class SessionManager {
 				}
 				if (fork?.resetInheritedCost) SessionManager.#resetInheritedUsageCost(entry);
 				if (fork?.seance && entry.type === "session_init") entry = SessionManager.#neutralizedSessionInit(entry);
-				if (SessionManager.#sanitizeLoadedEntry(entry)) sanitized = true;
+				if (
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message) !== entry.message
+				) {
+					intake.unsanitized.push(entry);
+				}
 				interner.intern(entry, entry.parentId === null ? undefined : intake.index.get(entry.parentId));
 				intake.entries.push(entry);
 				intake.index.insert(entry);
@@ -3577,17 +3602,31 @@ export class SessionManager {
 			}
 			if (header && !migration) migration = startMigration(header);
 			intake.index.settleLeaf(intake.entries);
-			if (intake.store) {
-				const boundary = coldBoundary(intake.entries, intake.index.branchView(), undefined);
+			const boundary = intake.store ? coldBoundary(intake.entries, intake.index.branchView(), undefined) : undefined;
+			let hydratedFromCut = 0;
+			if (boundary) {
 				for (let position = 0; position < intake.entries.length; position++) {
 					const entry = intake.entries[position]!;
-					if (!belongsCold(entry, position, boundary)) hydrateColdEntry(entry, { resolveBlobs: false });
+					if (belongsCold(entry, position, boundary)) continue;
+					if (hydrateColdEntry(entry, { resolveBlobs: false })) hydratedFromCut++;
 				}
 			}
 			// Prune records, then patch records, apply after migration; a record
-			// whose target is cold writes through its accessor, which makes it whole.
+			// whose target is cold writes through its accessor, which makes it
+			// whole until #recoolLoadWrites below returns it to the store.
 			applyToolResultPrunes(intake.entries);
 			applyEntryPatches(intake.entries);
+			// Sanitize after the load-time passes, as a load of the whole transcript
+			// does, since a pass can change what an entry replays: every whole entry,
+			// and each entry the stream found replay metadata on, made whole for it.
+			for (const entry of intake.unsanitized) hydrateColdEntry(entry);
+			intake.unsanitized = [];
+			for (const entry of intake.entries) {
+				if (!isColdEntry(entry) && SessionManager.#sanitizeLoadedEntry(entry)) sanitized = true;
+			}
+			if (boundary && intake.store) {
+				SessionManager.#recoolLoadWrites(intake.entries, boundary, intake.store, hydratedFromCut);
+			}
 			await resolveBlobRefsInEntries(
 				intake.entries.filter(entry => !isColdEntry(entry)),
 				this.#blobs,
@@ -3613,6 +3652,26 @@ export class SessionManager {
 		} catch (error) {
 			intake.store?.close();
 			throw error;
+		}
+	}
+
+	/**
+	 * Put back in `store`, with the values it now holds, every entry before the
+	 * cut that the load made whole after the stream other than by the cut: a
+	 * load-time pass writing it through an accessor, or the replay-metadata
+	 * stripping (the store counts more hydrations than the `hydratedFromCut`
+	 * the cut made), so the targets of records before the cut stay cold.
+	 */
+	static #recoolLoadWrites(
+		entries: readonly SessionEntry[],
+		boundary: ColdBoundary,
+		store: ColdEntryStore,
+		hydratedFromCut: number,
+	): void {
+		if (store.hydrations <= hydratedFromCut) return;
+		for (let position = 0; position < boundary.cutIndex; position++) {
+			const entry = entries[position]!;
+			if (belongsCold(entry, position, boundary)) convertToColdEntry(entry, () => store);
 		}
 	}
 
@@ -5482,6 +5541,17 @@ export class SessionManager {
 	}
 
 	/**
+	 * The active-leaf branch from the cut on: the first entry the model context
+	 * keeps of the latest compaction (see `coldCutPathIndex`) to the leaf. Their
+	 * bodies stay in memory, so a reader of the recent turns reads no older body.
+	 * The whole branch when the context uses no compaction.
+	 */
+	getBranchFromCut(): SessionEntry[] {
+		const branch = this.#index.branchView();
+		return branch.slice(coldCutPathIndex(branch, this.#coldCutModel));
+	}
+
+	/**
 	 * Build the session context (LLM messages), or — with `{ transcript: true }` —
 	 * the full-history display transcript, from the current leaf path.
 	 */
@@ -5606,6 +5676,17 @@ export class SessionManager {
 		return result;
 	}
 
+	/**
+	 * Put back in the store, with the values they hold now, the entries before
+	 * the cut that a write made whole. A write to a field of a cold entry makes
+	 * it whole; when the write is undone (a failed persist restoring the
+	 * previous values), this returns the entry to the store.
+	 */
+	recoolEntriesBeforeCut(): void {
+		if (!this.#coldStoreEnabled) return;
+		this.#applyColdBoundary(coldBoundary(this.#entries, this.#index.branchView(), this.#coldCutModel), "convert");
+	}
+
 	/** {@link conversationTip} of the session at its active leaf. */
 	getConversationTip(): SessionEntry | undefined {
 		return conversationTip(this.#entries, this.#index.branchView());
@@ -5639,101 +5720,25 @@ export class SessionManager {
 	 * Durably move the active branch past a discarded entry.
 	 *
 	 * The loader reconstructs the active branch from the last physical journal
-	 * entry, so changing the in-memory leaf alone is lost on reload. Known
-	 * metadata children are chained onto the discarded entry's parent before the
-	 * entry is removed. If any child may carry content, the subtree is preserved
-	 * off-branch instead. Both paths append a metadata-only branch marker, and
-	 * a removal republishes the journal without the entry.
+	 * entry, so changing the in-memory leaf alone is lost on reload. A
+	 * metadata-only branch marker under the discarded entry's parent moves the
+	 * leaf, followed by fresh copies of the entry's children when they are all
+	 * `service_tier_change` entries; a subtree that may carry content stays
+	 * off-branch as it is. The discard only appends, so it survives a restart
+	 * while full rewrites fail.
 	 *
-	 * A removed assistant turn was still billed, so its usage is re-journaled as
-	 * an off-branch `model_usage` entry; session totals and `omp stats` keep
-	 * counting it. A subtree preserved off-branch keeps its own usage.
-	 *
-	 * When that republish fails, the removal is undone: the entry and its
-	 * children return to the journal as storage holds them, and the marker is
-	 * appended under the entry's parent instead, followed by fresh copies of the
-	 * `service_tier_change` children, so the discard survives a restart while
-	 * full rewrites keep failing and later turns keep appending.
+	 * The discarded entry stays in the journal off-branch, so a discarded
+	 * assistant turn keeps its billed usage: session totals and `omp stats`
+	 * count every entry.
 	 */
 	async discardEntryDurably(entryId: string): Promise<void> {
 		const entry = this.#index.get(entryId);
 		if (!entry) return;
 		const children = this.#index.childrenOf(entryId);
-		const markerDetails = { kind: DISCARDED_ENTRY_BRANCH_MARKER, discardedEntryId: entryId };
-		if (!children.every(child => child.type === "service_tier_change")) {
-			this.branchWithSummary(entry.parentId, "", markerDetails);
-			await this.flush();
-			return;
+		this.branchWithSummary(entry.parentId, "", { kind: DISCARDED_ENTRY_BRANCH_MARKER, discardedEntryId: entryId });
+		if (children.every((child): child is ServiceTierChangeEntry => child.type === "service_tier_change")) {
+			for (const child of children) this.appendServiceTierChange(child.serviceTier);
 		}
-		const original = this.#entries;
-		let leafId = entry.parentId;
-		for (const child of children) {
-			child.parentId = leafId;
-			leafId = child.id;
-		}
-		const originalGeneration = this.#entriesGeneration;
-		const removed = original.filter(candidate => candidate !== entry);
-		this.#entries = removed;
-		const removedGeneration = this.#entriesGeneration;
-		this.#index.rebuild(removed);
-		// The durable frontier described the previous array, so recording the
-		// usage or marker republishes the journal without the entry.
-		if (entry.type === "message" && entry.message.role === "assistant") {
-			const { api, provider, model, usage, stopReason, errorMessage } = entry.message;
-			// Off-branch like late usage: totals count every entry, and the kept
-			// chain stays made of entries collab guests replicate.
-			this.#recordEntry({
-				type: "model_usage",
-				id: generateId(this.#index),
-				parentId: leafId,
-				timestamp: entry.timestamp,
-				runtime: currentRuntimeIdentity(),
-				activeLeafId: leafId,
-				purpose: DISCARDED_TURN_USAGE_PURPOSE,
-				api,
-				provider,
-				model,
-				usage,
-				stopReason,
-				...(errorMessage === undefined ? {} : { errorMessage }),
-			});
-		}
-		const markerId = this.branchWithSummary(leafId, "", markerDetails);
-		// A deferring backend confirms the republish only once it drains.
-		await this.flush().catch(() => undefined);
-		const published =
-			!this.#persist ||
-			!this.#sessionFile ||
-			!this.#shouldHaveSessionFile() ||
-			this.#durable?.generation === removedGeneration;
-		const marker = this.#index.get(markerId);
-		if (published || this.#entries !== removed || marker?.type !== "branch_summary") {
-			await this.flush();
-			return;
-		}
-		const appendedSince = removed.slice(removed.indexOf(marker) + 1);
-		const leafAfter = this.#index.leafId();
-		for (const child of children) child.parentId = entryId;
-		this.#entries = original;
-		// Storage still holds the original entries, so the frontier over them holds again.
-		const durable = this.#durable;
-		if (durable?.generation === originalGeneration) durable.generation = this.#entriesGeneration;
-		this.#index.rebuild(original);
-		// Neither the marker nor anything recorded after it reached storage, so
-		// their parents can still change before they are appended.
-		marker.parentId = entry.parentId;
-		marker.fromId = entry.parentId ?? "root";
-		original.push(marker);
-		this.#index.insert(marker);
-		for (const child of children as ServiceTierChangeEntry[]) this.appendServiceTierChange(child.serviceTier);
-		const tip = this.#index.leafId();
-		for (const later of appendedSince) {
-			if (later.parentId === markerId) later.parentId = tip;
-			original.push(later);
-			this.#index.insert(later);
-		}
-		this.#index.setLeaf(leafAfter === markerId ? tip : leafAfter);
-		this.#appendToSessionFile(marker);
 		await this.flush();
 	}
 

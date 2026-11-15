@@ -12,12 +12,10 @@ import { isEnoent } from "@oh-my-pi/pi-utils";
 import { isAdvisorTranscriptName } from "../advisor/transcript-recorder";
 import { getAgentTombstonePath } from "../registry/agent-tombstone";
 import { resolveSessionLeafId, type SessionEntry, type SessionHeader } from "./session-entries";
-import { loadSessionFile, parseSessionContent, type SessionLoadResult } from "./session-loader";
+import { loadEntriesFromFileStream, loadSessionFile, type SessionLoadResult } from "./session-loader";
 import { applyEntryPatches } from "./entry-patches";
 import { applyToolResultPrunes } from "./tool-result-prunes";
 import { defaultSessionStorage, FileSessionStorage, type SessionStorage } from "./session-storage";
-
-const utf8Decoder = new TextDecoder();
 
 /** Persisted child transcript (subagent or opted-in advisor), keyed by slash-joined path. */
 export interface SubSession {
@@ -69,7 +67,7 @@ export async function collectSubSessions(
 	return result;
 }
 
-/** Decompress archives before handing their JSONL to the central session parser. */
+/** Decompress archives as the central session parser reads them: neither the archive nor its JSONL is held whole. */
 async function loadCollectedSession(
 	file: string,
 	compressed: boolean,
@@ -77,7 +75,10 @@ async function loadCollectedSession(
 ): Promise<SessionLoadResult | null> {
 	if (!compressed) return loadSessionFile(file, storage);
 	try {
-		return parseSessionContent(utf8Decoder.decode(Bun.gunzipSync(await Bun.file(file).bytes())));
+		return await loadEntriesFromFileStream(file, {
+			throwIfMissing: true,
+			chunks: Bun.file(file).stream().pipeThrough(new DecompressionStream("gzip")),
+		});
 	} catch (err) {
 		// Match the plain loader when gc removes a transcript after discovery.
 		if (isEnoent(err)) return null;

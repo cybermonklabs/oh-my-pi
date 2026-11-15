@@ -129,6 +129,45 @@ class UnreadableAfterFailedPublishStorage extends MemorySessionStorage {
 	}
 }
 
+/** Bytes per chunk the streaming storage below serves; not a multiple of any UTF-8 sequence length. */
+const STORED_CHUNK_BYTES = 65_537;
+
+/**
+ * In-memory storage that serves stored bytes in chunks and can lose a publish's
+ * acknowledgement after the body landed, optionally landing a different body of
+ * the same length.
+ */
+class StreamingAcknowledgementLossStorage extends MemorySessionStorage {
+	failNextPublish = false;
+	corruptNextPublishedBody = false;
+	readTextCalls = 0;
+	chunksServed = 0;
+
+	override async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		await super.writeTextAtomic(path, content, options);
+		if (!this.failNextPublish) return;
+		if (this.corruptNextPublishedBody) {
+			const index = content.lastIndexOf("a");
+			await super.writeText(path, `${content.slice(0, index)}b${content.slice(index + 1)}`);
+		}
+		throw new Error("simulated acknowledgement loss");
+	}
+
+	override readText(path: string): Promise<string> {
+		this.readTextCalls++;
+		if (this.failNextPublish) return Promise.reject(new Error("full read would materialize the session"));
+		return super.readText(path);
+	}
+
+	async *readChunks(path: string, fromByte = 0): AsyncGenerator<Uint8Array> {
+		const bytes = new TextEncoder().encode(super.readTextSync(path)).subarray(fromByte);
+		for (let offset = 0; offset < bytes.length; offset += STORED_CHUNK_BYTES) {
+			this.chunksServed++;
+			yield bytes.subarray(offset, offset + STORED_CHUNK_BYTES);
+		}
+	}
+}
+
 function makeAssistantMessage(text: string) {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected built-in anthropic model to exist");
@@ -228,6 +267,34 @@ describe("large session memory guards", () => {
 
 		storage.failNextPublish = true;
 		await expect(session.rewriteEntries()).rejects.toThrow("simulated publish failure");
+	});
+
+	it("keeps a published rewrite durable when its acknowledgment is lost on a storage that streams, without reading its whole text", async () => {
+		const storage = new StreamingAcknowledgementLossStorage();
+		const session = SessionManager.create("/work", "/sessions", storage);
+		await session.ensureOnDisk();
+		session.appendMessage(makeAssistantMessage(`a${"aé中😀".repeat(20_000)}`));
+
+		storage.failNextPublish = true;
+		await expect(session.rewriteEntries()).resolves.toBeUndefined();
+
+		expect(storage.chunksServed).toBeGreaterThan(1);
+		expect(storage.readTextCalls).toBe(0);
+		expect(session.captureState().onDisk).toBe(true);
+		await session.close();
+	});
+
+	it("rejects a different body of the same length after an acknowledgement loss on a storage that streams", async () => {
+		const storage = new StreamingAcknowledgementLossStorage();
+		const session = SessionManager.create("/work", "/sessions", storage);
+		await session.ensureOnDisk();
+		session.appendMessage(makeAssistantMessage("persisted before acknowledgement loss"));
+
+		storage.failNextPublish = true;
+		storage.corruptNextPublishedBody = true;
+		await expect(session.rewriteEntries()).rejects.toThrow("simulated acknowledgement loss");
+
+		expect(storage.readTextCalls).toBe(0);
 	});
 
 	it("elides superseded compactions only in the forward transcript", async () => {

@@ -820,6 +820,43 @@ describe("cache-stable boundary — warm prefix protection", () => {
 	});
 });
 
+describe("tool calls before the compaction boundary", () => {
+	/** Count reads of `entry`'s message content, as a body read back from disk would be counted. */
+	function countContentReads(entry: SessionMessageEntry): { reads: number } {
+		const counter = { reads: 0 };
+		const message = entry.message as { content: unknown };
+		const content = message.content;
+		Object.defineProperty(message, "content", {
+			get: () => {
+				counter.reads++;
+				return content;
+			},
+			enumerable: true,
+			configurable: true,
+		});
+		return counter;
+	}
+
+	test("pair a sent result with its call before the boundary and read that prefix once across passes", () => {
+		const [call1, result1] = readPair("src/foo.ts", FILE_CONTENT, T0);
+		const boundary = textEntry("kept from here", T0 + 500);
+		const [call2, result2] = readPair("src/foo.ts", FILE_CONTENT, T0 + 1_000);
+		const orphan = messageEntry(toolResultMessage("read", "call-missing", FILE_CONTENT, T0 + 1_500), T0 + 1_500);
+		const entries: SessionEntry[] = [call1, boundary, result1, call2, result2, orphan];
+		const prefixReads = countContentReads(call1);
+		const config = cfg({ keepBoundaryId: boundary.id, now: T0 + 2_000 });
+
+		// result1's call sits before the boundary: found there, it keys result1, which result2 supersedes.
+		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(1);
+		expect(resultText(result1)).toBe(SUPERSEDED_NOTICE);
+		const readsAfterFirstPass = prefixReads.reads;
+
+		// The orphan misses again on the next pass; the prefix is not walked again for it.
+		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
+		expect(prefixReads.reads).toBe(readsAfterFirstPass);
+	});
+});
+
 /** `count` small, unkeyed bash call/result pairs: many content blocks, few tokens. */
 function smallTurns(count: number, timestamp: number): SessionMessageEntry[] {
 	const turns: SessionMessageEntry[] = [];

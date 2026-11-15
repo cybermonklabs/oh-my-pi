@@ -1,9 +1,11 @@
 /**
  * SQL session storage reads and rewrites a long transcript without holding it
  * whole: a read streams the session's parts a few at a time, and a full
- * rewrite spools its lines to a temporary file and swaps staged parts in. A
- * regression shows as a string or buffer as long as the transcript handed to,
- * or returned by, the SQL client or the storage.
+ * rewrite spools its lines to a temporary file and swaps staged parts in. The
+ * other readers of a stored transcript (the debug report, memories stage 1,
+ * blob gc, the RPC subagent read and the Agent Hub viewer) read it in chunks
+ * or windows. A regression shows as a string or buffer as long as the
+ * transcript handed to, or returned by, the SQL client or the storage.
  *
  * Runs on SQLite always, and on PostgreSQL when `OMP_TEST_SQL_POSTGRES_URL`
  * names a throwaway database. Cases that call the streamed storage methods
@@ -11,14 +13,22 @@
  * only APIs that predate them, so on a storage that reads and writes whole
  * they fail by recording a value as long as the transcript.
  */
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import { runGcCommand } from "@oh-my-pi/pi-coding-agent/cli/gc-cli";
+import { createReportBundle } from "@oh-my-pi/pi-coding-agent/debug/report-bundle";
+import { buildStage1RolloutItems } from "@oh-my-pi/pi-coding-agent/memories";
+import { createAgentHubRuntime } from "@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime";
+import { readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import {
 	loadSessionFile,
 	loadSessionMessagesReadOnly,
 	parseSessionContent,
 } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { FileSessionStorage, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import * as sessionStorageConfig from "@oh-my-pi/pi-coding-agent/session/session-storage-config";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { copyTranscriptTree } from "@oh-my-pi/pi-coding-agent/session/session-transcript-tree";
 import {
@@ -28,7 +38,8 @@ import {
 	type SqlSessionStorageResult,
 	type SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import * as piUtils from "@oh-my-pi/pi-utils";
+import { getBlobsDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { readStoredSession } from "../helpers/sql-session-storage";
 
@@ -181,13 +192,16 @@ async function* noteChunks(chunks: AsyncIterable<unknown>, longest: Longest, nam
 
 /**
  * `storage` behind a proxy that notes every string handed to or returned by
- * its methods, each element of an array argument (a full write's lines), and
- * each chunk a returned stream yields. Methods run on the storage itself.
+ * its methods, each element of an array argument (a full write's lines), the
+ * text of a `{ text, size }` result (a ranged read), and each chunk a returned
+ * stream yields. Methods run on the storage itself.
  */
 function recordStorage(storage: SqlSessionStorage, longest: Longest): SqlSessionStorage {
 	const noteValue = (value: unknown, what: string): void => {
 		if (Array.isArray(value)) for (const item of value) longest.note(byteSize(item), `an element of ${what}`);
-		else longest.note(byteSize(value), what);
+		else if (typeof value === "object" && value !== null && "text" in value) {
+			longest.note(byteSize(value.text), `the text of ${what}`);
+		} else longest.note(byteSize(value), what);
 	};
 	return new Proxy(storage, {
 		get(target, key) {
@@ -299,6 +313,25 @@ async function storeTranscript(storage: SqlSessionStorage, path: string, lines: 
 	if (chunk) await writer.append(chunk);
 	await writer.close();
 	await storage.drain();
+}
+
+/** Bytes of a reference {@link blobRefTranscript} puts before the end of its first part. */
+const REF_CUT_AT = 30;
+
+/**
+ * A transcript of more than 2 MiB of one-byte characters, so a full write's
+ * 1 MiB parts end at exact multiples of 1 MiB: the first part ends
+ * {@link REF_CUT_AT} bytes into a reference to the blob `cut`, and the second
+ * part holds a whole reference to the blob `whole`.
+ */
+function blobRefTranscript(cwd: string, cut: string, whole: string): string {
+	const header = `${JSON.stringify({ type: "session", version: 3, id: "blob-refs", timestamp: TIMESTAMP, cwd })}\n`;
+	const line = (id: string, content: string): string =>
+		`${JSON.stringify({ type: "message", id, parentId: null, timestamp: TIMESTAMP, message: { role: "user", content, timestamp: 0 } })}\n`;
+	const textAt = header.length + line("b1", "TEXT").indexOf("TEXT");
+	const first = line("b1", `${"x".repeat(MiB - REF_CUT_AT - textAt - 1)} blob:sha256:${cut} ${"y".repeat(1000)}`);
+	const second = line("b2", ` blob:sha256:${whole} ${"z".repeat(MiB + MiB / 2)}`);
+	return header + first + second;
 }
 
 for (const { adapter, url } of BACKENDS) {
@@ -460,6 +493,126 @@ for (const { adapter, url } of BACKENDS) {
 					id: "bounded-io",
 					taskPromptCacheKey: "bounded-io-cache-key",
 				});
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"bundles the transcript into a debug report without a whole read",
+			async () => {
+				const reports = TempDir.createSync("@omp-sql-bounded-io-reports-");
+				const reportsDir = spyOn(piUtils, "getReportsDir").mockReturnValue(reports.path());
+				try {
+					const longest = new Longest();
+					const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+					const bundle = await createReportBundle({ sessionFile: readPath, storage });
+					expectBounded(longest);
+					const members = await new Bun.Archive(await Bun.file(bundle.path).bytes()).files();
+					const session = await members.get("session.jsonl")?.bytes();
+					expect(sha256(session ?? "")).toBe(sha256(readContent));
+				} finally {
+					reportsDir.mockRestore();
+					reports.removeSync();
+				}
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"pages an RPC subagent transcript read in windows that reach every entry",
+			async () => {
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				let fromByte = 0;
+				let messages = 0;
+				for (;;) {
+					const page = await readRpcSubagentTranscript(readPath, fromByte, storage);
+					messages += page.messages.length;
+					if (page.nextByte === fromByte) break;
+					fromByte = page.nextByte;
+				}
+				expectBounded(longest);
+				expect({ fromByte, messages }).toEqual({
+					fromByte: Buffer.byteLength(readContent),
+					messages: readLines.length - 2,
+				});
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"reads an Agent Hub transcript in windows that reach every entry",
+			async () => {
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const { transcript } = createAgentHubRuntime({ storage, registry: new AgentRegistry() });
+				let offset = 0;
+				let messages = 0;
+				for (;;) {
+					const text = await transcript.readFrom(readPath, offset);
+					const complete = text.slice(0, text.lastIndexOf("\n") + 1);
+					if (!complete) break;
+					messages += transcript.parseEntries(complete).length;
+					offset += Buffer.byteLength(complete);
+				}
+				expectBounded(longest);
+				expect({ offset, messages }).toEqual({
+					offset: Buffer.byteLength(readContent),
+					messages: readLines.length - 2,
+				});
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"builds memories stage 1 input from a long rollout without a whole read",
+			async () => {
+				const local = cwd.join("rollout.jsonl");
+				await Bun.write(local, readContent);
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				// A payload of a few head and tail windows, then one of most of the rollout.
+				for (const tokenLimit of [4_000, 4_000_000]) {
+					const built = await buildStage1RolloutItems(readPath, tokenLimit, storage);
+					const fromFile = await buildStage1RolloutItems(local, tokenLimit, new FileSessionStorage());
+					expect({ tokenLimit, digest: sha256(built) }).toEqual({ tokenLimit, digest: sha256(fromFile) });
+				}
+				expectBounded(longest);
+				await fs.rm(local, { force: true });
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"finds the blob references of every stored transcript, one cut by a chunk edge included, without a whole read",
+			async () => {
+				const agentDir = TempDir.createSync("@omp-sql-bounded-io-gc-");
+				const refsPath = "/sessions/p/blob-refs.jsonl";
+				const blobs = { cut: sha256("cut"), whole: sha256("whole"), orphan: sha256("orphan") };
+				const content = blobRefTranscript(cwd.path(), blobs.cut, blobs.whole);
+				expect(content.indexOf(`blob:sha256:${blobs.cut}`)).toBe(MiB - REF_CUT_AT);
+				await (await db.open()).writeText(refsPath, content);
+				const aged = new Date(Date.now() - 86_400_000);
+				for (const [label, hash] of Object.entries(blobs)) {
+					const blob = `${getBlobsDir(agentDir.path())}/${hash}`;
+					await Bun.write(blob, label);
+					await fs.utimes(blob, aged, aged);
+				}
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const resolve = spyOn(sessionStorageConfig, "resolveSessionStorage").mockResolvedValue(storage);
+				const stdout = spyOn(process.stdout, "write").mockImplementation(() => true);
+				try {
+					const result = await runGcCommand({ flags: { agentDir: agentDir.path(), blobs: true } });
+					expectBounded(longest);
+					// The cut reference keeps its blob as the whole one does: only the orphan would go.
+					expect(result.blobs).toMatchObject({ referenced: 2, candidates: 3, wouldDelete: 1 });
+				} finally {
+					stdout.mockRestore();
+					resolve.mockRestore();
+					await (await db.open()).unlink(refsPath);
+					agentDir.removeSync();
+				}
 			},
 			TIMEOUT,
 		);

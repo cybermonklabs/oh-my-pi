@@ -62,7 +62,9 @@ export interface AgentTranscriptSource {
 	stat(path: string): AgentTranscriptStat;
 	/**
 	 * The UTF-8 text of the transcript at `path` from byte `offset` (a character
-	 * boundary) to its end; rejects when there is none.
+	 * boundary) to its end, or, for a transcript too long to read at once, a
+	 * window of it holding at least one complete line, which the viewer reads on
+	 * from at the next poll; rejects when there is none.
 	 */
 	readFrom(path: string, offset: number): Promise<string>;
 	parseEntries(text: string): AgentTranscriptEntry[];
@@ -299,9 +301,16 @@ export class AgentTranscriptViewer implements Component {
 			.then(text => {
 				this.#localReadInFlight = false;
 				if (this.#disposed) return;
-				if (state && text.startsWith(state.anchor)) this.#appendLocal(state, stat, text.slice(state.anchor.length));
+				// A window that stops short of the size the stat saw answers only for
+				// the bytes it read, so the next poll reads on instead of idling.
+				const answered = {
+					size: Math.min(stat.size, from + Buffer.byteLength(text, "utf-8")),
+					mtimeMs: stat.mtimeMs,
+				};
+				if (state && text.startsWith(state.anchor))
+					this.#appendLocal(state, answered, text.slice(state.anchor.length));
 				else if (from > 0) this.#readLocal(sessionFile, stat, undefined);
-				else this.#applyLocalFull(sessionFile, stat, text);
+				else this.#applyLocalFull(sessionFile, answered, text);
 			})
 			.catch((err: unknown) => {
 				// Leave #localState unchanged so a transient read error retries next poll.
