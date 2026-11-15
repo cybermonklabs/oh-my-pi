@@ -418,3 +418,11 @@ export function processSessionStoreMasker(): SessionStoreMasker {
 	}
 	return masker;
 }
+
+/**
+ * The mask a session's stored writes apply for `cwd`, or `null` while its setting is off; off, no
+ * masker is built. `null`, not `undefined`, as `SessionManager.storeMask` documents.
+ */
+export function sessionStoreMaskFor(enabled: boolean, cwd: string): SessionStoreMask | null {
+	return enabled ? processSessionStoreMasker().snapshot(cwd) : null;
+}

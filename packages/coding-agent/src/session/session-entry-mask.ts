@@ -66,6 +66,14 @@ export function maskSessionEntry<T>(entry: T, mask: SessionStoreMask | null): T 
 	return maskObject(entry, mask, "entry") as T;
 }
 
+/**
+ * `value` with every held secret replaced by its marker, for a stored copy of free data, such as a
+ * subagent's yield data: no field in it is structural. The value itself is masked, never dropped.
+ */
+export function maskStoredData<T>(value: T, mask: SessionStoreMask | null): T {
+	return mask === null || mask.empty ? value : (maskValue(value, mask, "free") as T);
+}
+
 /** `update` with its title masked, so the store's title field holds what the title slot holds. */
 export function maskTitleUpdate(update: SessionTitleUpdate, mask: SessionStoreMask | null): SessionTitleUpdate {
 	if (mask === null || update.title === undefined) return update;

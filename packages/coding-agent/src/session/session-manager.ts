@@ -30,7 +30,7 @@ import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
 import { isSettingsInitialized, Settings } from "../config/settings";
-import { processSessionStoreMasker, type SessionStoreMask } from "../secrets/session-store-mask";
+import { type SessionStoreMask, sessionStoreMaskFor } from "../secrets/session-store-mask";
 import { cfgSecretsMaskSessionStore } from "../secrets/settings";
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
@@ -1587,7 +1587,7 @@ export class SessionManager {
 		const enabled = this.#storeMasking
 			? this.#storeMasking()
 			: isSettingsInitialized() && cfgSecretsMaskSessionStore.get(Settings.instance);
-		return enabled ? processSessionStoreMasker().snapshot(this.#cwd) : null;
+		return sessionStoreMaskFor(enabled, this.#cwd);
 	}
 
 	#lineFor(entry: FileEntry, mask = this.storeMask()): string {

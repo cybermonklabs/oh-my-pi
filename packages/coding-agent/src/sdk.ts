@@ -2111,8 +2111,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		logger.time("sessionManager", () =>
 			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
 		);
-	// Every write through the manager masks by this session's settings, whatever any other session in
-	// the process set, so bind before the first write below.
+	// Bind before the first write below: every write masks by this session's settings.
 	sessionManager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings));
 	const configuredDirs = options.additionalDirectories
 		? options.additionalDirectories

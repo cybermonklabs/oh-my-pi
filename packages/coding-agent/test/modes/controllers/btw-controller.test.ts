@@ -376,7 +376,9 @@ describe("BtwController", () => {
 				"Main question?",
 			]);
 			expect(
-				(await BtwHistoryStore.open(artifacts, "worker-session")).getRecords().map(record => record.question),
+				(await BtwHistoryStore.open(artifacts, { scope: "worker-session" }))
+					.getRecords()
+					.map(record => record.question),
 			).toEqual(["Worker question?"]);
 		} finally {
 			await controller.dispose();

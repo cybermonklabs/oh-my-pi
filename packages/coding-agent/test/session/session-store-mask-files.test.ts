@@ -28,6 +28,7 @@ import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agen
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { restoreEnvValue } from "../helpers/settings-test-state";
 
 const HELD_VALUE = "zq9-synthetic-service-4821";
 const MARKER = "[REDACTED:env:SERVICE_API_KEY]";
@@ -59,16 +60,6 @@ const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as
 
 let tmp: TempDir;
 let savedEnv: Record<string, string | undefined> = {};
-
-function restoreEnvValue(key: string, value: string | undefined): void {
-	if (value === undefined) {
-		delete process.env[key];
-		delete Bun.env[key];
-		return;
-	}
-	process.env[key] = value;
-	Bun.env[key] = value;
-}
 
 beforeEach(async () => {
 	tmp = TempDir.createSync("@omp-session-store-masking-files-");
@@ -153,7 +144,7 @@ async function writeBtwTopic(maskOn: boolean): Promise<{ store: BtwHistoryStore;
 	await manager.ensureOnDisk();
 	const artifactsDir = manager.getArtifactsDir();
 	if (!artifactsDir) throw new Error("Expected a persisted session");
-	const store = await BtwHistoryStore.open(artifactsDir, undefined, () => manager.storeMask());
+	const store = await BtwHistoryStore.open(artifactsDir, { storeMask: () => manager.storeMask() });
 	const running: BtwHistoryRecord = {
 		id: "topic",
 		leafId: manager.getLeafId(),

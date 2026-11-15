@@ -520,7 +520,7 @@ export class BtwController {
 			this.#storeScope = scope;
 		}
 		const manager = this.#sessionManager;
-		this.#storePromise ??= BtwHistoryStore.open(artifactsDir, scope, () => manager.storeMask());
+		this.#storePromise ??= BtwHistoryStore.open(artifactsDir, { scope, storeMask: () => manager.storeMask() });
 		const pending = this.#storePromise;
 		try {
 			const store = await pending;

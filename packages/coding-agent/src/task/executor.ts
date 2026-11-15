@@ -12,7 +12,16 @@ import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } fr
 import { AgentBusyError, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
-import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	countNewlines,
+	isRecord,
+	logger,
+	popLoopPhase,
+	prompt,
+	pushLoopPhase,
+	sanitizeText,
+	untilAborted,
+} from "@oh-my-pi/pi-utils";
 import {
 	ASYNC_JOB_MANAGER_SHUTDOWN_REASON,
 	AsyncJobError,
@@ -74,7 +83,7 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 } from "../sdk";
-import { processSessionStoreMasker } from "../secrets/session-store-mask";
+import { sessionStoreMaskFor } from "../secrets/session-store-mask";
 import { cfgSecretsMaskSessionStore } from "../secrets/settings";
 import {
 	type AgentSession,
@@ -90,7 +99,7 @@ import type { AuthStorage } from "../session/auth-storage";
 import type { CostGateApi } from "../session/cost-gate";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
-import { maskSessionEntry } from "../session/session-entry-mask";
+import { maskStoredData } from "../session/session-entry-mask";
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import {
 	AUTO_THINKING,
@@ -2933,15 +2942,13 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
 		// `agent://<id>` serves these files: they hold markers, the returned result keeps the values.
-		const mask = cfgSecretsMaskSessionStore.get(args.storeMaskSettings)
-			? processSessionStoreMasker().snapshot(args.storeMaskCwd)
-			: null;
+		const mask = sessionStoreMaskFor(cfgSecretsMaskSessionStore.get(args.storeMaskSettings), args.storeMaskCwd);
 		try {
 			const storedOutput = mask?.maskText(rawOutput) ?? rawOutput;
 			await writeArtifact(candidatePath, storedOutput);
 			outputPath = candidatePath;
 			outputMeta = {
-				lineCount: storedOutput.split("\n").length,
+				lineCount: countNewlines(storedOutput) + 1,
 				charCount: storedOutput.length,
 			};
 		} catch (error) {
@@ -2955,8 +2962,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		const sidecarPath = path.join(args.artifactsDir, `${id}.json`);
 		if (outputPath && structured && Object.hasOwn(structured, "data")) {
 			try {
-				// Free data, masked as a custom entry's `data` is: identity-like keys too.
-				const serialized = JSON.stringify(maskSessionEntry({ data: structured.data }, mask).data, null, 2);
+				const serialized = JSON.stringify(maskStoredData(structured.data, mask), null, 2);
 				// `structured.data === undefined` (an own "data" key holding
 				// `undefined`) makes JSON.stringify return `undefined` too —
 				// neither a write nor a removal, which would leave a stale

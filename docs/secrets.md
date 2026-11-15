@@ -150,7 +150,7 @@ secrets:
    maskSessionStore: true
 ```
 
-The setting is off by default and does not depend on `secrets.enabled`. Each session reads it from its own settings at each write, so a change takes effect at the next write. The sessions of one process can differ: for example, two sessions of an ACP host in different projects each follow the settings of their own project. A writer that belongs to no session follows the global settings of the process.
+The setting is off by default and does not depend on `secrets.enabled`. Each session reads it from its own settings at each write, so a change takes effect at the next write. The sessions of one process can differ: for example, two sessions of an ACP host in different projects each follow the settings of their own project. A writer that belongs to no session follows the settings that the process itself runs with, from every layer, the project config included.
 
 When the setting is on, the agent replaces each value it holds with a marker that names where the value came from. A marker never holds the value.
 
@@ -163,12 +163,14 @@ When two sources hold the same value, the source the agent read first names it. 
 The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, the replica that a collab guest writes, and, under file storage, the title and the recaps that it records in `history.db`. It also masks the `/btw` history records and their title files, in `btw-history/` under the artifacts directory of the session. It masks the output files `<id>.md` and `<id>.json` of a subagent, in the artifacts directory of the parent session; `agent://<id>` serves these files. It masks every string of an entry except these, which it keeps as written:
 
 - object keys, numbers and booleans
-- the structural fields: the entry's `type`, `id`, `parentId` and `timestamp`, its message's `role`, `timestamp` and `toolCallId`, and the `type` and `id` of each content block (under any other field, such as tool call arguments, tool result details and custom data, these names are masked like any other string)
+- the structural fields: the entry's `type`, `id`, `parentId` and `timestamp`, its message's `role`, `timestamp` and `toolCallId`, and the `type` and `id` of each content block (under any other field, such as tool call arguments, tool result details and custom data, the string value of a field with one of these names is masked like any other string)
 - the header's `cwd`, `parentSession` and `version`
 - blob references and image data
 - provider ciphertext: `redactedThinking` data and `encrypted_content`
 
-The masking changes only the stored copy. The live session keeps the real values, so tools, the model provider and the screen get what they got before. The `/btw` overlay of the running session and the result that a subagent returns keep the values too. A resumed session, a revived subagent, the `/btw` history after a restart, `agent://<id>` and every reader of the stored transcript get the markers. While a subagent runs and has no output file yet, `agent://<id>` shows its progress from the live subagent session, so it shows the values.
+The masking changes only the stored copy. The live session keeps the real values, so tools, the model provider and the screen get what they got before. The result that a subagent returns keeps the values too. A resumed session, a revived subagent, `agent://<id>` and every reader of the stored transcript get the markers. While a subagent runs and has no output file yet, `agent://<id>` shows its progress from the live subagent session, so it shows the values.
+
+The `/btw` records that this process wrote keep the values until the history is opened again: after a change of the focused agent or of the session, after a restart, or, in RPC mode, at each command that reads the history from disk again (`btw`, and `get_btw_history` while no question runs). From then on the records show the markers, and a follow-up in that topic sends the markers to the model as history, as a resumed session does.
 
 ### How the values are read
 

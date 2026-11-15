@@ -144,12 +144,11 @@ export class BtwHistoryStore {
 	 */
 	static async open(
 		artifactsDir: string | undefined,
-		scope?: string,
-		storeMask?: () => SessionStoreMask | null,
+		options?: { scope?: string; storeMask?: () => SessionStoreMask | null },
 	): Promise<BtwHistoryStore> {
 		const store = new BtwHistoryStore(
-			artifactsDir === undefined ? undefined : historyDirectory(artifactsDir, scope),
-			storeMask,
+			artifactsDir === undefined ? undefined : historyDirectory(artifactsDir, options?.scope),
+			options?.storeMask,
 		);
 		if (store.#directory === undefined) return store;
 		let names: string[];
