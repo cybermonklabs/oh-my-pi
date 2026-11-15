@@ -30,8 +30,12 @@ import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
 import { isSettingsInitialized, Settings } from "../config/settings";
-import { type SessionStoreMask, sessionStoreMaskFor } from "../secrets/session-store-mask";
-import { cfgSecretsMaskSessionStore } from "../secrets/settings";
+import {
+	type SessionStoreMask,
+	type StoreMaskingBinding,
+	sessionStoreMaskFor,
+	settingsStoreMask,
+} from "../secrets/session-store-mask";
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
@@ -1301,8 +1305,8 @@ export class SessionManager {
 	#inMemoryArtifactCounter = 0;
 
 	#suppressBreadcrumb = false;
-	/** Reads `secrets.maskSessionStore` of the session this manager writes for ({@link setStoreMasking}). */
-	#storeMasking: (() => boolean) | undefined;
+	/** `secrets.maskSessionStore` and agent dir of the session this manager writes for ({@link setStoreMasking}). */
+	#storeMasking: StoreMaskingBinding | undefined;
 	/**
 	 * The last breadcrumb this manager wrote marked a lazy fresh session whose
 	 * JSONL is not yet on disk. Cleared (and the crumb re-stamped non-fresh) once
@@ -2122,26 +2126,32 @@ export class SessionManager {
 	}
 
 	/**
-	 * Bind this manager's writes to its session's `secrets.maskSessionStore`: `enabled` is read at
-	 * each write, so a change reaches the next one. The code that gives the manager to a session
-	 * binds it.
+	 * Bind this manager's writes to its session's `secrets.maskSessionStore` and agent dir: the
+	 * binding's `enabled` is read at each write, so a change reaches the next one, and the mask holds
+	 * the secrets.yml of its `agentDir`, the one the session's provider obfuscator reads
+	 * (`storeMaskingOf`). The code that gives the manager to a session binds it.
 	 */
-	setStoreMasking(enabled: () => boolean): void {
-		this.#storeMasking = enabled;
+	setStoreMasking(binding: StoreMaskingBinding): void {
+		this.#storeMasking = binding;
+	}
+
+	/** This manager's store masking binding, or `undefined` while no session bound it ({@link setStoreMasking}). */
+	get storeMasking(): StoreMaskingBinding | undefined {
+		return this.#storeMasking;
 	}
 
 	/**
 	 * The mask this manager's writes apply now, or `null` while the setting is off. Off, no source
-	 * is read and no masker is built. A manager no session bound reads this thread's global settings
-	 * (the instance `Settings.init` made, or a worker's mirror) and masks nothing without them.
-	 * `null`, not `undefined`, so a writer that took one mask for a whole body can pass "no mask" on
-	 * without a default parameter asking again.
+	 * is read and no masker is built. A manager no session bound reads the setting and the agent dir
+	 * of this thread's global settings (the instance `Settings.init` made, or a worker's mirror) and
+	 * masks nothing without them. `null`, not `undefined`, so a writer that took one mask for a whole
+	 * body can pass "no mask" on without a default parameter asking again.
 	 */
 	storeMask(): SessionStoreMask | null {
-		const enabled = this.#storeMasking
-			? this.#storeMasking()
-			: isSettingsInitialized() && cfgSecretsMaskSessionStore.get(Settings.instance);
-		return sessionStoreMaskFor(enabled, this.#cwd);
+		const bound = this.#storeMasking;
+		if (bound) return sessionStoreMaskFor(bound.enabled(), this.#cwd, bound.agentDir);
+		if (!isSettingsInitialized()) return null;
+		return settingsStoreMask(Settings.instance, this.#cwd);
 	}
 
 	#lineFor(entry: FileEntry, mask = this.storeMask()): string {
@@ -5525,6 +5535,10 @@ export class SessionManager {
 	 * workspace roots are dropped, and the source's `session_init` contracts
 	 * become inert `source_session_init` custom entries so revival never
 	 * mistakes them for the fork's own.
+	 *
+	 * `storeMasking` is the binding of the session that owns the fork ({@link setStoreMasking}).
+	 * The fork is written here, before any session binds the new manager, so it masks by its
+	 * owner's `secrets.maskSessionStore` and agent dir; without it, as an unbound manager does.
 	 */
 	static async forkFrom(
 		sourcePath: string,
@@ -5538,11 +5552,13 @@ export class SessionManager {
 			resetInheritedCost?: boolean;
 			repairInterruptedTail?: boolean;
 			seance?: boolean;
+			storeMasking?: StoreMaskingBinding;
 		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
+		if (options?.storeMasking) manager.setStoreMasking(options.storeMasking);
 
 		// A missing source must fail instead of forking an empty parentless session:
 		// the loader swallows ENOENT by default for fresh-session opens, so fork opts out.

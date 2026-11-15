@@ -110,7 +110,6 @@ async function makeHarness(
 			getSessionFile: () => null,
 			getSessionName: () => "local session",
 			getCwd: () => "/local",
-			storeMask: () => null,
 		},
 		session: {
 			messages: [],

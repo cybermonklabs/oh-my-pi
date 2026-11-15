@@ -12,7 +12,9 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession, discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import { cfgSecretsMaskSessionStore } from "@oh-my-pi/pi-coding-agent/secrets/settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
@@ -21,6 +23,8 @@ const HELD_VALUE = "zq9-synthetic-service-4821";
 const MARKER = "[REDACTED:env:SERVICE_API_KEY]";
 /** Listed only in the secrets.yml of one session's own agent dir (`createAgentSession`'s `agentDir`). */
 const AGENT_DIR_VALUE = "kx7-synthetic-agent-dir-3958";
+/** Listed only in the secrets.yml of the agent dir of the session that owns a seance fork. */
+const OWNER_AGENT_DIR_VALUE = "mv4-synthetic-owner-dir-6172";
 const NOW = 1_700_000_000_000;
 /** The first `createAgentSession` in a process loads most of the agent, and each case opens two sessions. */
 const CASE_TIMEOUT_MS = 30_000;
@@ -160,4 +164,76 @@ describe("secrets.maskSessionStore with a session's own agent dir", () => {
 		},
 		CASE_TIMEOUT_MS,
 	);
+});
+
+/** A source session holding `value` in its title and its user message, as a session with the setting off stores it. */
+async function writeSourceSession(value: string): Promise<string> {
+	const timestamp = new Date(NOW).toISOString();
+	const header = {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id: "source-session",
+		timestamp,
+		cwd: tmp.join("source", "project"),
+		title: `deploy ${value}`,
+	};
+	const request = {
+		type: "message",
+		id: "source-request",
+		parentId: null,
+		timestamp,
+		message: { role: "user", content: `deploy with ${value}`, timestamp: NOW },
+	};
+	const file = tmp.join("source", "sessions", "source.jsonl");
+	await Bun.write(file, `${JSON.stringify(header)}\n${JSON.stringify(request)}\n`);
+	return file;
+}
+
+describe("secrets.maskSessionStore in a seance fork", () => {
+	// `forkFrom` writes the consult's transcript before the subagent's session exists, so only the
+	// binding of the session that starts the consult can mask it: without it the transcript stores
+	// the value as written while that session masks.
+	for (const ownerMasks of [true, false]) {
+		it(
+			`stores the forked session's lines ${ownerMasks ? "masked" : "as they are"} with the owner's setting ${ownerMasks ? "on" : "off"}`,
+			async () => {
+				// Each masker reads only the secrets.yml of the agent dir it is built for, so the value
+				// is masked only when the fork masks with the owner's agent dir.
+				vi.restoreAllMocks();
+				spyOn(storeMask, "processSessionStoreMasker").mockImplementation(
+					agentDir => new storeMask.SessionStoreMasker({ env: () => ({}), agentDir }),
+				);
+				const ownerAgentDir = tmp.join("owner", "agent");
+				await Bun.write(
+					tmp.join("owner", "agent", "secrets.yml"),
+					`- type: plain\n  content: "${OWNER_AGENT_DIR_VALUE}"\n`,
+				);
+				const cwd = tmp.join("owner", "project");
+				await fs.mkdir(cwd, { recursive: true });
+				const sourceFile = await writeSourceSession(OWNER_AGENT_DIR_VALUE);
+				// The owner's binding as the task executor builds it from the run settings.
+				const owner = Settings.isolated({ "secrets.maskSessionStore": ownerMasks });
+				const storage = new FileSessionStorage();
+				const forkFile = tmp.join("owner", "sessions", "Consult.jsonl");
+				const fork = await SessionManager.forkFrom(sourceFile, cwd, tmp.join("owner", "sessions"), storage, {
+					seance: true,
+					suppressBreadcrumb: true,
+					sessionFile: forkFile,
+					resetInheritedCost: true,
+					repairInterruptedTail: true,
+					storeMasking: { enabled: () => cfgSecretsMaskSessionStore.get(owner), agentDir: ownerAgentDir },
+				});
+				try {
+					const stored = await storage.readText(forkFile);
+					expect({
+						value: stored.includes(OWNER_AGENT_DIR_VALUE),
+						marker: stored.includes("[REDACTED:secrets.yml:"),
+					}).toEqual(ownerMasks ? { value: false, marker: true } : { value: true, marker: false });
+				} finally {
+					await fork.close();
+				}
+			},
+			CASE_TIMEOUT_MS,
+		);
+	}
 });

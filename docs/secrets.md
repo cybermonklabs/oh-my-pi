@@ -150,7 +150,7 @@ secrets:
    maskSessionStore: true
 ```
 
-The setting is off by default and does not depend on `secrets.enabled`. Each session reads it from its own settings at each write, so a change takes effect at the next write. The sessions of one process can differ: for example, two sessions of an ACP host in different projects each follow the settings of their own project. A writer that belongs to no session follows the settings that the process itself runs with, from every layer, the project config included.
+The setting is off by default and does not depend on `secrets.enabled`. Each session reads it from its own settings at each write, so a change takes effect at the next write. The sessions of one process can differ: for example, two sessions of an ACP host in different projects each follow the settings of their own project. A writer that belongs to no session follows the settings that the process itself runs with, from every layer, the project config included. A seance consult (`/seance`, or the `seance` agent of the task tool) starts from a fork of its source session, which the agent writes before the consult's own session exists: the fork follows the setting and the agent directory of the session that started the consult, not those of the source session.
 
 When the setting is on, the agent replaces each value it holds with a marker that names where the value came from. A marker never holds the value.
 
@@ -160,13 +160,11 @@ When the setting is on, the agent replaces each value it holds with a marker tha
 
 When two sources hold the same value, the source the agent read first names it. At the first write, that is the first source in this list. When a name or a `friendlyName` contains a held value, or a regex entry matches it, the marker uses the index form instead (`#<n>`, `project#<n>`, `global#<n>`). The agent never changes its own markers, so masking a stored text again gives the same text.
 
-The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, the replica that a collab guest writes, and, under file storage, the title and the recaps that it records in `history.db`. It also masks the `/btw` history records and their title files, in `btw-history/` under the artifacts directory of the session. It masks the output files `<id>.md` and `<id>.json` of a subagent, in the artifacts directory of the parent session; `agent://<id>` serves these files. It masks every string of an entry except these, which it keeps as written:
+The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, the replica that a collab guest writes, and, under file storage, the title and the recaps that it records in `history.db`. It also masks the `/btw` history records and their title files, in `btw-history/` under the artifacts directory of the session. It masks the output files `<id>.md` and `<id>.json` of a subagent, in the artifacts directory of the parent session; `agent://<id>` serves these files.
 
-- object keys, numbers and booleans
-- the structural fields: the entry's `type`, `id`, `parentId` and `timestamp`, its message's `role`, `timestamp` and `toolCallId`, and the `type` and `id` of each content block (under any other field, such as tool call arguments, tool result details and custom data, the string value of a field with one of these names is masked like any other string)
-- the header's `cwd`, `parentSession` and `version`
-- blob references and image data
-- provider ciphertext: `redactedThinking` data and `encrypted_content`
+In an entry, the agent keeps a value as written only where the session format needs it byte for byte: ids and links, the working directories, provider, model, tool and agent identities, values of closed sets, timestamps, hashes, signatures and ciphertext, and image data. It keeps each of these only in its own place in the format, such as the `id` of a tool call or the `encrypted_content` of an OpenAI reasoning item. It masks everything else, whatever its key or its shape: a value under a name such as `id` or `encrypted_content`, or in an image-shaped object, is masked when it is inside tool call arguments, tool result details or custom data. Object keys, numbers and booleans are never masked.
+
+Some parts of an entry must stay exactly as the provider wrote them, so the agent leaves such a part out of the stored copy when masking would change it: a provider replay record (`providerPayload`, such as Cursor history or Gemini native content, and an OpenAI or Anthropic compaction record), the server-tool blocks of a message (tools that the provider ran, with their results) when masking changes one of them, and a snapcompact slot (the history that snapcompact compaction keeps as images). The agent also drops an OpenAI reasoning signature when its summary or its reasoning text holds a value.
 
 The masking changes only the stored copy. The live session keeps the real values, so tools, the model provider and the screen get what they got before. The result that a subagent returns keeps the values too. A resumed session, a revived subagent, `agent://<id>` and every reader of the stored transcript get the markers. While a subagent runs and has no output file yet, `agent://<id>` shows its progress from the live subagent session, so it shows the values.
 
@@ -176,13 +174,13 @@ The `/btw` records that this process wrote keep the values until the history is 
 
 - **Environment variables**: the same name rule as the obfuscator, with values of at least 8 characters.
 - **`_FILE` variables**: the agent follows symbolic links and reads only a regular file of at most 1 MiB. It opens the file without blocking, so a FIFO cannot stop a write. It trims the content and keeps it when it has at least 8 characters. It matches the content of a file as one value.
-- **`secrets.yml`**: the global file and the project file of each working directory the agent writes sessions for, through the same parser as the obfuscator.
+- **`secrets.yml`**: the file in the session's own agent directory, the one the session was created with (normally `~/.omp/agent/secrets.yml`), and the project file of each working directory the agent writes sessions for, through the same parser as the obfuscator.
 
 The agent reads the sources at its first session write. Then, at most once a minute, it reads the environment again and checks each `_FILE` file and each `secrets.yml` for a change. It adds new values and never removes a value, so the old value of a rotated token stays masked. A source that fails (a bad `secrets.yml`, a file it cannot read) is skipped and logged. The log gives the kind and the name of each source the agent holds (`Session store masking sources`), never a value.
 
 ### Replay of a masked turn
 
-A provider checks some blocks byte for byte when it replays a session. When masking changes a signed thinking, text or tool-call block, the stored copy has no signature. When masking changes provider replay state (`providerPayload`, an Anthropic compaction or server-tool block, Cursor history, Gemini native content), the stored copy does not keep it. Only a turn that held a secret changes. On resume, an Anthropic model gets such a thinking block as text, and a Gemini model on Vertex can refuse to resume such a turn.
+A provider checks some blocks byte for byte when it replays a session. When masking changes a signed thinking, text or tool-call block, the stored copy has no signature. Only a turn that held a secret loses a signature or one of the parts left out above. On resume, an Anthropic model gets such a thinking block as text, and a Gemini model on Vertex can refuse to resume such a turn.
 
 ### Cost
 
@@ -206,8 +204,11 @@ Masking finds a value where it appears exactly as the agent holds it. It also fi
 - the content of a `_FILE` file that is not a regular file, that the agent cannot read, that is larger than 1 MiB, or whose trimmed content is shorter than 8 characters
 - a `secrets.yml` entry the parser refuses (see [Invalid entries and files](#invalid-entries-and-files))
 - part of a multi-line file printed alone, because the content of a file is one value
-- object keys, numbers, the working directory, ids and images
-- entries, and the `history.db` titles and recaps, written before the setting was on, and the copies of stored text that fork, move, render, `session unpack`, archive restore, `gc strip`, the title backfill into `history.db` and the `history.db` repair make (an entry written while the setting was on is masked already)
+- object keys and numbers, so a value used as the id of a work pool item stays in the keys of the output schema that the agent builds from those ids
+- the working directory, and the ids and image data that the session format keeps in their own places
+- entries, and the `history.db` titles and recaps, written before the setting was on
+- the artifacts directory of a session, which a fork or a move takes to the new session as it is. A fork (`/fork`, a branch into a new session, `SessionManager.forkFrom`) and a move (`moveTo`, or the continuation of a session in a new file when it cannot keep writing its own) write every entry again through the mask of the session, but a fork or a continuation copies the artifacts directory as it is (`copySessionArtifacts`; a seance fork does not copy it), and `moveTo` moves it as it is. So its subagent transcripts and output files, editor draft and `/btw` history keep the text they were written with, masked only when the setting was on at that write, and its tool artifact files were never masked
+- the copies of stored text that render, `session unpack`, archive restore, `gc strip`, the title backfill into `history.db` and the `history.db` repair make (an entry written while the setting was on is masked already)
 - every other local file outside the session store, which the agent writes as it is. For example:
    - artifact files with the full output of a command or a tool
    - blobs

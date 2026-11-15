@@ -2175,8 +2175,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		logger.time("sessionManager", () =>
 			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
 		);
-	// Bind before the first write below: every write masks by this session's settings.
-	sessionManager.setStoreMasking(() => cfgSecretsMaskSessionStore.get(settings));
+	// Bind before the first write below: every write masks by this session's settings, with the
+	// secrets.yml of the agent dir the provider obfuscator reads.
+	sessionManager.setStoreMasking({ enabled: () => cfgSecretsMaskSessionStore.get(settings), agentDir });
 	const configuredDirs = options.additionalDirectories
 		? options.additionalDirectories
 		: cfgWorkspaceAdditionalDirectories.get(settings);

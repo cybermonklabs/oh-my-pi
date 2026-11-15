@@ -140,7 +140,7 @@ async function writeBtwTopic(maskOn: boolean): Promise<{ store: BtwHistoryStore;
 	const cwd = tmp.join("btw", "project");
 	await fs.mkdir(cwd, { recursive: true });
 	const manager = SessionManager.create(cwd, tmp.join("btw", "sessions"));
-	manager.setStoreMasking(() => maskOn);
+	manager.setStoreMasking({ enabled: () => maskOn, agentDir: tmp.join("agent") });
 	await manager.ensureOnDisk();
 	const artifactsDir = manager.getArtifactsDir();
 	if (!artifactsDir) throw new Error("Expected a persisted session");

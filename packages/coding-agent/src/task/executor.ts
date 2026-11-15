@@ -87,8 +87,7 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 } from "../sdk";
-import { sessionStoreMaskFor } from "../secrets/session-store-mask";
-import { cfgSecretsMaskSessionStore } from "../secrets/settings";
+import { settingsStoreMask, storeMaskingOf } from "../secrets/session-store-mask";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -3020,8 +3019,9 @@ interface FinalizeRunArgs {
 	sessionFile?: string;
 	startTime: number;
 	/**
-	 * Settings whose `secrets.maskSessionStore` masks the `<id>.md` and `<id>.json` written here:
-	 * the run's settings on the first run, the live subagent session's on a later turn.
+	 * Settings whose `secrets.maskSessionStore` masks the `<id>.md` and `<id>.json` written here, and
+	 * whose agent dir's secrets.yml the mask holds: the run's settings on the first run, the live
+	 * subagent session's on a later turn.
 	 */
 	storeMaskSettings: Settings;
 	/** The parent session's cwd, whose project secrets the mask holds. */
@@ -3107,7 +3107,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
 		// `agent://<id>` serves these files: they hold markers, the returned result keeps the values.
-		const mask = sessionStoreMaskFor(cfgSecretsMaskSessionStore.get(args.storeMaskSettings), args.storeMaskCwd);
+		const mask = settingsStoreMask(args.storeMaskSettings, args.storeMaskCwd);
 		try {
 			const storedOutput = mask?.maskText(rawOutput) ?? rawOutput;
 			await writeArtifact(candidatePath, storedOutput);
@@ -5037,6 +5037,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 						sessionFile: subtaskSessionFile,
 						resetInheritedCost: true,
 						repairInterruptedTail: true,
+						// Written before the subagent's session binds it: masked by the parent's setting and agent dir.
+						storeMasking: storeMaskingOf(settings),
 					})
 				: sessionFile
 					? SessionManager.open(sessionFile, undefined, sessionStorage, {
