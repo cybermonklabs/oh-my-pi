@@ -204,8 +204,11 @@ Masking finds a value where it appears exactly as the agent holds it. It also fi
 - the content of a `_FILE` file that is not a regular file, that the agent cannot read, that is larger than 1 MiB, or whose trimmed content is shorter than 8 characters
 - a `secrets.yml` entry the parser refuses (see [Invalid entries and files](#invalid-entries-and-files))
 - part of a multi-line file printed alone, because the content of a file is one value
-- object keys, numbers, the working directory, ids and images
-- entries, and the `history.db` titles and recaps, written before the setting was on, and the copies of stored text that fork, move, render, `session unpack`, archive restore, `gc strip`, the title backfill into `history.db` and the `history.db` repair make (an entry written while the setting was on is masked already)
+- object keys and numbers, so a value used as the id of a work pool item stays in the keys of the output schema that the agent builds from those ids
+- the working directory, ids and images
+- entries, and the `history.db` titles and recaps, written before the setting was on
+- the files in the artifacts directory of a session that a fork or a move takes to the new session as they are. A fork (`/fork`, a branch into a new session, `SessionManager.forkFrom`) and a move (`moveTo`, or the continuation of a session in a new file when it cannot keep writing its own) write every entry of the session again through the mask of the session. When a fork or a continuation copies the artifacts directory (`copySessionArtifacts`; a seance fork does not copy it), it copies the files as they are, and `moveTo` moves them as they are. The subagent transcripts and output files, the editor draft and the `/btw` history there keep the text they were written with, which is masked only when the setting was on at that write, and the tool artifact files there were never masked
+- the copies of stored text that render, `session unpack`, archive restore, `gc strip`, the title backfill into `history.db` and the `history.db` repair make (an entry written while the setting was on is masked already)
 - every other local file outside the session store, which the agent writes as it is. For example:
    - artifact files with the full output of a command or a tool
    - blobs

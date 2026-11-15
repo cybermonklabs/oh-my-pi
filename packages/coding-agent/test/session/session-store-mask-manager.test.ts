@@ -1406,7 +1406,13 @@ const SERVER_TOOL_MESSAGE: StoredRecord = messageEntry(
 	assistantRecord([
 		{
 			type: "anthropicServerTool",
-			block: { type: "server_tool_use", id: "keep-server-use", name: "web_search", input: { query: "plain words" } },
+			block: {
+				type: "server_tool_use",
+				id: "keep-server-use",
+				name: "web_search",
+				input: { query: "plain words" },
+				cache_control: { type: "ephemeral", ttl: "1h", scope: "keep-cache-scope" },
+			},
 		},
 		{
 			type: "anthropicServerTool",
@@ -1422,6 +1428,7 @@ const SERVER_TOOL_MESSAGE: StoredRecord = messageEntry(
 						page_age: "plain age",
 					},
 				],
+				cache_control: { type: "ephemeral", ttl: "5m", scope: "keep-result-cache-scope" },
 			},
 		},
 		{
@@ -1515,6 +1522,52 @@ const RESPONSES_MESSAGE: StoredRecord = messageEntry(
 		},
 	}),
 );
+const MCP_MESSAGE: StoredRecord = messageEntry(
+	assistantRecord([{ type: "text", text: "plain answer" }], {
+		providerPayload: {
+			type: "openaiResponsesHistory",
+			items: [
+				{
+					type: "mcp_list_tools",
+					id: "keep-mcp-list-item",
+					server_label: "keep-mcp-list-server",
+					tools: [
+						{
+							name: "keep-mcp-listed-tool",
+							description: "plain description",
+							input_schema: { type: "object", properties: { query: { description: "plain field" } } },
+						},
+					],
+				},
+				{
+					type: "mcp_call",
+					id: "keep-mcp-call-item",
+					server_label: "keep-mcp-call-server",
+					name: "keep-mcp-call-name",
+					approval_request_id: "keep-mcp-call-approval",
+					arguments: '{"query":"plain"}',
+					output: "plain output",
+					error: "plain error",
+					status: "completed",
+				},
+				{
+					type: "mcp_approval_request",
+					id: "keep-mcp-request-item",
+					server_label: "keep-mcp-request-server",
+					name: "keep-mcp-request-name",
+					arguments: '{"query":"plain"}',
+				},
+				{
+					type: "mcp_approval_response",
+					id: "keep-mcp-response-item",
+					approval_request_id: "keep-mcp-response-approval",
+					approve: true,
+					reason: "plain reason",
+				},
+			],
+		},
+	}),
+);
 const CURSOR_MESSAGE: StoredRecord = messageEntry(
 	assistantRecord([{ type: "text", text: "plain" }], {
 		providerPayload: {
@@ -1535,6 +1588,17 @@ const GEMINI_MESSAGE: StoredRecord = messageEntry(
 				parts: [
 					{ text: "plain text", thoughtSignature: "keep-gemini-thought" },
 					{ functionCall: { id: "keep-gemini-call", name: "keep-gemini-function", args: { query: "plain" } } },
+					{
+						functionResponse: {
+							id: "keep-gemini-response",
+							name: "keep-gemini-response-name",
+							response: { result: "plain result" },
+						},
+					},
+					{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgoKeepGemini" } },
+					{ fileData: { mimeType: "application/pdf", fileUri: "https://example.invalid/keep-gemini.pdf" } },
+					{ executableCode: { language: "PYTHON", code: "print('plain')" } },
+					{ codeExecutionResult: { outcome: "OUTCOME_OK", output: "plain output" } },
 				],
 			},
 		},
@@ -2158,6 +2222,39 @@ const KEEP_ROWS: readonly KeepRow[] = [
 			"content.parts.0.thoughtSignature",
 			"content.parts.1.functionCall.id",
 			"content.parts.1.functionCall.name",
+			"content.parts.2.functionResponse.id",
+			"content.parts.2.functionResponse.name",
+			"content.parts.3.inlineData.mimeType",
+			"content.parts.3.inlineData.data",
+			"content.parts.4.fileData.mimeType",
+			"content.parts.4.fileData.fileUri",
+			"content.parts.5.executableCode.language",
+			"content.parts.6.codeExecutionResult.outcome",
+		],
+	},
+	{
+		rule: "KR8",
+		position: "the MCP items of an openaiResponsesHistory payload",
+		record: MCP_MESSAGE,
+		shape: "message.providerPayload",
+		kept: [
+			"items.0.type",
+			"items.0.id",
+			"items.0.server_label",
+			"items.0.tools.0.name",
+			"items.1.type",
+			"items.1.id",
+			"items.1.server_label",
+			"items.1.name",
+			"items.1.approval_request_id",
+			"items.1.status",
+			"items.2.type",
+			"items.2.id",
+			"items.2.server_label",
+			"items.2.name",
+			"items.3.type",
+			"items.3.id",
+			"items.3.approval_request_id",
 		],
 	},
 	{
@@ -2205,14 +2302,22 @@ const KEEP_ROWS: readonly KeepRow[] = [
 		position: "a server_tool_use block",
 		record: SERVER_TOOL_MESSAGE,
 		shape: "message.content.0.block",
-		kept: ["type", "id", "name"],
+		kept: ["type", "id", "name", "cache_control.type", "cache_control.ttl", "cache_control.scope"],
 	},
 	{
 		rule: "KR8",
 		position: "a web search result block",
 		record: SERVER_TOOL_MESSAGE,
 		shape: "message.content.1.block",
-		kept: ["type", "tool_use_id", "content.0.type", "content.0.encrypted_content"],
+		kept: [
+			"type",
+			"tool_use_id",
+			"content.0.type",
+			"content.0.encrypted_content",
+			"cache_control.type",
+			"cache_control.ttl",
+			"cache_control.scope",
+		],
 	},
 	{
 		rule: "KR8",
@@ -2556,6 +2661,106 @@ const SIGNATURE_CASES: readonly {
 	},
 ];
 
+/** An assistant message whose `providerPayload` is a `geminiNativeContent` carrier holding `parts`. */
+function geminiCarrierMessage(parts: unknown[]): StoredRecord {
+	return assistantRecord([{ type: "text", text: "plain" }], {
+		providerPayload: { type: "geminiNativeContent", digest: "plain-digest", content: { role: "model", parts } },
+	});
+}
+
+/** An assistant message whose `providerPayload` is an `openaiResponsesHistory` carrier holding `items`. */
+function responsesCarrierMessage(items: unknown[]): StoredRecord {
+	return assistantRecord([{ type: "text", text: "plain" }], {
+		providerPayload: { type: "openaiResponsesHistory", items },
+	});
+}
+
+/** A Gemini part, or an MCP item, whose one still-scanned field holds a value, beside the fields its row keeps. */
+const SCANNED_CARRIER_FIELDS: readonly { readonly name: string; readonly message: StoredRecord }[] = [
+	{
+		name: "a geminiNativeContent part's text",
+		message: geminiCarrierMessage([{ text: HELD, thoughtSignature: "plain-thought" }]),
+	},
+	{
+		name: "a geminiNativeContent functionResponse.response",
+		message: geminiCarrierMessage([
+			{ functionResponse: { id: "call_plain", name: "lookup", response: { result: HELD } } },
+		]),
+	},
+	{
+		name: "a geminiNativeContent executableCode.code",
+		message: geminiCarrierMessage([{ executableCode: { language: "PYTHON", code: HELD } }]),
+	},
+	{
+		name: "a geminiNativeContent codeExecutionResult.output",
+		message: geminiCarrierMessage([{ codeExecutionResult: { outcome: "OUTCOME_OK", output: HELD } }]),
+	},
+	{
+		name: "an mcp_call item's arguments",
+		message: responsesCarrierMessage([
+			{
+				type: "mcp_call",
+				id: "mcp_plain",
+				server_label: "plain-server",
+				name: "lookup",
+				arguments: JSON.stringify({ query: HELD }),
+			},
+		]),
+	},
+	{
+		name: "an mcp_call item's output",
+		message: responsesCarrierMessage([
+			{
+				type: "mcp_call",
+				id: "mcp_plain",
+				server_label: "plain-server",
+				name: "lookup",
+				arguments: "{}",
+				output: HELD,
+			},
+		]),
+	},
+	{
+		name: "an mcp_call item's error",
+		message: responsesCarrierMessage([
+			{
+				type: "mcp_call",
+				id: "mcp_plain",
+				server_label: "plain-server",
+				name: "lookup",
+				arguments: "{}",
+				error: HELD,
+			},
+		]),
+	},
+	{
+		name: "an mcp_approval_response item's reason",
+		message: responsesCarrierMessage([
+			{ type: "mcp_approval_response", approval_request_id: "mcpr_plain", approve: false, reason: HELD },
+		]),
+	},
+	{
+		name: "an mcp_list_tools tool's description",
+		message: responsesCarrierMessage([
+			{
+				type: "mcp_list_tools",
+				server_label: "plain-server",
+				tools: [{ name: "lookup", description: HELD, input_schema: {} }],
+			},
+		]),
+	},
+	{
+		name: "an mcp_list_tools tool's input_schema",
+		message: responsesCarrierMessage([
+			{
+				type: "mcp_list_tools",
+				server_label: "plain-server",
+				tools: [{ name: "lookup", input_schema: { type: "object", properties: { query: { description: HELD } } } }],
+			},
+		]),
+	},
+];
+
 /** A drop rule's case: the entry a session appends, and the field its stored copy leaves out. */
 type DropCase = { readonly rule: string; readonly name: string; readonly dropped: FieldPath } & (
 	| { readonly message: StoredRecord }
@@ -2652,6 +2857,12 @@ const DROP_CASES: readonly DropCase[] = [
 		}),
 		dropped: "message.providerPayload",
 	},
+	...SCANNED_CARRIER_FIELDS.map(({ name, message }): DropCase => ({
+		rule: "KR8",
+		name: `a carrier whose ${name} holds a value leaves no copy`,
+		message,
+		dropped: "message.providerPayload",
+	})),
 	{
 		rule: "KR10",
 		name: "a cursorHistory payload whose records hold a value is left out",
@@ -2735,6 +2946,49 @@ const DROP_CASES: readonly DropCase[] = [
 	},
 ];
 
+/** The still-scanned fields of an `anthropicServerTool` group: its call's `input` and its results' `url`, `title` and `page_age`. */
+const SERVER_TOOL_SCANNED_FIELDS = ["input", "url", "title", "page_age"] as const;
+
+/**
+ * A text block, an `anthropicServerTool` call and its result, and a text block. Both server-tool
+ * blocks carry every `cache_control` field; only the field `held` names holds a value.
+ */
+function serverToolGroup(held: (typeof SERVER_TOOL_SCANNED_FIELDS)[number]): unknown[] {
+	const text = (field: string): string => (field === held ? HELD : `plain ${field}`);
+	const cacheControl = { type: "ephemeral", ttl: "1h", scope: "plain-scope" };
+	return [
+		{ type: "text", text: "plain before" },
+		{
+			type: "anthropicServerTool",
+			block: {
+				type: "server_tool_use",
+				id: "srvtoolu_plain",
+				name: "web_search",
+				input: { query: text("input") },
+				cache_control: cacheControl,
+			},
+		},
+		{
+			type: "anthropicServerTool",
+			block: {
+				type: "web_search_tool_result",
+				tool_use_id: "srvtoolu_plain",
+				content: [
+					{
+						type: "web_search_result",
+						url: text("url"),
+						title: text("title"),
+						page_age: text("page_age"),
+						encrypted_content: "plain-cipher",
+					},
+				],
+				cache_control: cacheControl,
+			},
+		},
+		{ type: "text", text: "plain after" },
+	];
+}
+
 for (const backend of backends) {
 	describe(`keep rules for signatures, carriers and values by type with ${backend.name}`, () => {
 		let store: StoreHarness;
@@ -2800,45 +3054,24 @@ for (const backend of backends) {
 			});
 		}
 
-		it("KR10: drops a changed anthropicServerTool block with its server-tool siblings, while the live entry keeps them", async () => {
-			const manager = await maskedSession(mask);
-			manager.appendMessage(
-				assistantRecord([
-					{ type: "text", text: "plain before" },
-					{
-						type: "anthropicServerTool",
-						block: { type: "server_tool_use", id: "srvtoolu_plain", name: "web_search", input: { query: HELD } },
-					},
-					{
-						type: "anthropicServerTool",
-						block: {
-							type: "web_search_tool_result",
-							tool_use_id: "srvtoolu_plain",
-							content: [
-								{
-									type: "web_search_result",
-									url: "plain-url",
-									title: "plain title",
-									encrypted_content: "plain-cipher",
-								},
-							],
-						},
-					},
-					{ type: "text", text: "plain after" },
-				]) as unknown as AssistantMessage,
-			);
-			const text = await storedText(manager);
-			const content = valueAt(storedRecords(text).at(-1), "message.content");
-			const liveContent = valueAt(manager.getEntries().at(-1), "message.content");
-			expect({
-				leaked: leakedFields(text),
-				storedBlocks: Array.isArray(content) ? content.length : -1,
-				serverToolLeft:
-					Array.isArray(content) && content.some(block => isRecord(block) && block.type === "anthropicServerTool"),
-				liveBlocks: Array.isArray(liveContent) ? liveContent.length : -1,
-			}).toEqual({ leaked: [], storedBlocks: 2, serverToolLeft: false, liveBlocks: 4 });
-			await manager.close();
-		});
+		for (const field of SERVER_TOOL_SCANNED_FIELDS) {
+			it(`KR10: drops an anthropicServerTool group whose ${field} holds a value with its siblings, while the live entry keeps them`, async () => {
+				const manager = await maskedSession(mask);
+				manager.appendMessage(assistantRecord(serverToolGroup(field)) as unknown as AssistantMessage);
+				const text = await storedText(manager);
+				const content = valueAt(storedRecords(text).at(-1), "message.content");
+				const liveContent = valueAt(manager.getEntries().at(-1), "message.content");
+				expect({
+					leaked: leakedFields(text),
+					storedBlocks: Array.isArray(content) ? content.length : -1,
+					serverToolLeft:
+						Array.isArray(content) &&
+						content.some(block => isRecord(block) && block.type === "anthropicServerTool"),
+					liveBlocks: Array.isArray(liveContent) ? liveContent.length : -1,
+				}).toEqual({ leaked: [], storedBlocks: 2, serverToolLeft: false, liveBlocks: 4 });
+				await manager.close();
+			});
+		}
 
 		it("KR9: resumes a session whose snapcompact slot was left out from its compaction summary", async () => {
 			const manager = await maskedSession(mask);

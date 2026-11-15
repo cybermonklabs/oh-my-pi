@@ -50,13 +50,21 @@ type PositionName =
 	| "responsesPart"
 	| "responsesTyped"
 	| "computerOutput"
+	| "mcpItem"
+	| "mcpListTools"
+	| "mcpTool"
 	| "toolChange"
 	| "anthropicCompaction"
 	| "geminiContent"
 	| "geminiPart"
-	| "geminiFunctionCall"
+	| "geminiFunction"
+	| "geminiInlineData"
+	| "geminiFileData"
+	| "geminiExecutableCode"
+	| "geminiCodeResult"
 	| "openaiRemoteCompaction"
 	| "serverToolBlock"
+	| "cacheControl"
 	| "serverToolContent"
 	| "toolReference"
 	| "snapcompact"
@@ -358,6 +366,14 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 				computer_call: { children: { action: "computerAction", actions: "computerAction" } },
 				/** KR8. */
 				computer_call_output: { children: { output: "computerOutput" } },
+				/** KR8. */
+				mcp_list_tools: "mcpListTools",
+				/** KR8. */
+				mcp_call: "mcpItem",
+				/** KR8. */
+				mcp_approval_request: "mcpItem",
+				/** KR8. */
+				mcp_approval_response: "mcpItem",
 			},
 		},
 	},
@@ -370,6 +386,12 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 	responsesTyped: { keep: ["type"] },
 	/** KR8: a `computer_call_output` item's `output`. */
 	computerOutput: { keep: ["type", "image_url", "file_id"] },
+	/** KR8: an `mcp_call`, `mcp_approval_request` or `mcp_approval_response` item. `arguments`, `output`, `error` and `reason` are masked. */
+	mcpItem: { keep: ["server_label", "approval_request_id"] },
+	/** KR8: an `mcp_list_tools` item. `error` is masked. */
+	mcpListTools: { keep: ["server_label", "approval_request_id"], children: { tools: "mcpTool" } },
+	/** KR8: a tool an `mcp_list_tools` item lists. `description` and `input_schema` are masked. */
+	mcpTool: { keep: ["name"] },
 	/** KR8: a tool change of an Anthropic message or compaction. */
 	toolChange: { keep: ["type", "name"] },
 	/**
@@ -383,10 +405,28 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 	},
 	/** KR8: a `geminiNativeContent` payload's `content`. */
 	geminiContent: { keep: ["role"], children: { parts: "geminiPart" } },
-	/** KR8. `text` is masked. */
-	geminiPart: { keep: ["thoughtSignature"], children: { functionCall: "geminiFunctionCall" } },
-	/** KR8. `args` is masked. */
-	geminiFunctionCall: { keep: ["id", "name"] },
+	/** KR8: an element of a `geminiNativeContent` payload's `content.parts`, a Gemini `Part`. `text` is masked. */
+	geminiPart: {
+		keep: ["thoughtSignature"],
+		children: {
+			functionCall: "geminiFunction",
+			functionResponse: "geminiFunction",
+			inlineData: "geminiInlineData",
+			fileData: "geminiFileData",
+			executableCode: "geminiExecutableCode",
+			codeExecutionResult: "geminiCodeResult",
+		},
+	},
+	/** KR8: a Gemini part's `functionCall` or `functionResponse`. `args` and `response` are masked. */
+	geminiFunction: { keep: ["id", "name"] },
+	/** KR8. */
+	geminiInlineData: { keep: ["mimeType", "data"] },
+	/** KR8. */
+	geminiFileData: { keep: ["mimeType", "fileUri"] },
+	/** KR8. `code` is masked. */
+	geminiExecutableCode: { keep: ["language"] },
+	/** KR8. `output` is masked. */
+	geminiCodeResult: { keep: ["outcome"] },
 	/** KR8: `compaction.preserveData.openaiRemoteCompaction`, classic or `version: "v2"`. */
 	openaiRemoteCompaction: {
 		carrier: true,
@@ -397,8 +437,10 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 	serverToolBlock: {
 		carrier: true,
 		keep: ["type", "id", "name", "tool_use_id"],
-		children: { content: "serverToolContent" },
+		children: { cache_control: "cacheControl", content: "serverToolContent" },
 	},
+	/** KR8: an `anthropicServerTool` block's `block.cache_control`. */
+	cacheControl: { keep: ["type", "ttl", "scope"] },
 	/** KR8: a server-tool result, error or tool search result. `url`, `title` and `page_age` are masked. */
 	serverToolContent: {
 		keep: ["type", "encrypted_content", "error_code"],
