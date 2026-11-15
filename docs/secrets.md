@@ -150,7 +150,9 @@ secrets:
    maskSessionStore: true
 ```
 
-The setting is off by default and does not depend on `secrets.enabled`. When it is on, the agent replaces each value it holds with a marker that names where the value came from. A marker never holds the value.
+The setting is off by default and does not depend on `secrets.enabled`. Each session reads it from its own settings at each write, so a change takes effect at the next write. The sessions of one process can differ: for example, two sessions of an ACP host in different projects each follow the settings of their own project. A writer that belongs to no session follows the global settings of the process.
+
+When the setting is on, the agent replaces each value it holds with a marker that names where the value came from. A marker never holds the value.
 
 1. `[REDACTED:env:<NAME>]`: the value of an environment variable that the name rule above takes, and the password of a connection URL in any variable.
 2. `[REDACTED:file:<NAME>]`: the content of the file that an environment variable ending in `_FILE` names, and the password of a connection URL on a line of that file. `<NAME>` is the `_FILE` variable.
@@ -158,7 +160,7 @@ The setting is off by default and does not depend on `secrets.enabled`. When it 
 
 When two sources hold the same value, the source the agent read first names it. At the first write, that is the first source in this list. When a name or a `friendlyName` contains a held value, or a regex entry matches it, the marker uses the index form instead (`#<n>`, `project#<n>`, `global#<n>`). The agent never changes its own markers, so masking a stored text again gives the same text.
 
-The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, the replica that a collab guest writes, and, under file storage, the title and the recaps that it records in `history.db`. It masks every string of an entry except these, which it keeps as written:
+The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, the replica that a collab guest writes, and, under file storage, the title and the recaps that it records in `history.db`. It also masks the `/btw` history records and their title files, in `btw-history/` under the artifacts directory of the session. It masks the output files `<id>.md` and `<id>.json` of a subagent, in the artifacts directory of the parent session; `agent://<id>` serves these files. It masks every string of an entry except these, which it keeps as written:
 
 - object keys, numbers and booleans
 - the structural fields: the entry's `type`, `id`, `parentId` and `timestamp`, its message's `role`, `timestamp` and `toolCallId`, and the `type` and `id` of each content block (under any other field, such as tool call arguments, tool result details and custom data, these names are masked like any other string)
@@ -166,7 +168,7 @@ The agent masks every session entry and the session header, the title slot and t
 - blob references and image data
 - provider ciphertext: `redactedThinking` data and `encrypted_content`
 
-The masking changes only the stored copy. The live session keeps the real values, so tools, the model provider and the screen get what they got before. A resumed session, a revived subagent and every reader of the stored transcript get the markers.
+The masking changes only the stored copy. The live session keeps the real values, so tools, the model provider and the screen get what they got before. The `/btw` overlay of the running session and the result that a subagent returns keep the values too. A resumed session, a revived subagent, the `/btw` history after a restart, `agent://<id>` and every reader of the stored transcript get the markers. While a subagent runs and has no output file yet, `agent://<id>` shows its progress from the live subagent session, so it shows the values.
 
 ### How the values are read
 
@@ -193,9 +195,9 @@ With the setting off, a session write checks one flag and does nothing more. Wit
 
 ### What masking does not catch
 
-Masking finds a value only where it appears exactly as the agent holds it. It does not catch:
+Masking finds a value where it appears exactly as the agent holds it. It also finds the JSON-escaped form of a value. JSON text, such as a printed JSON document, writes a quote, a backslash or a control character such as a newline as an escape (`\"`, `\\`, `\n`). It does not catch:
 
-- a value that an agent transforms: encoded (for example in base64), cut into parts, or with characters added
+- a value that an agent transforms in any other way: encoded (for example in base64), cut into parts, or with characters added
 - a value shorter than 8 characters, except a replace-mode plain `secrets.yml` value and a match of a `secrets.yml` regex entry
 - a value in no source, for example a variable set only in a child shell
 - a credential in a git configuration value set through the environment (`GIT_CONFIG_VALUE_<n>`)
@@ -204,7 +206,16 @@ Masking finds a value only where it appears exactly as the agent holds it. It do
 - part of a multi-line file printed alone, because the content of a file is one value
 - object keys, numbers, the working directory, ids and images
 - entries, and the `history.db` titles and recaps, written before the setting was on, and the copies of stored text that fork, move, render, `session unpack`, archive restore, `gc strip`, the title backfill into `history.db` and the `history.db` repair make (an entry written while the setting was on is masked already)
-- files outside the session store: artifact files with full command output, blobs, prompt history, and logs
+- every other local file outside the session store, which the agent writes as it is. For example:
+   - artifact files with the full output of a command or a tool
+   - blobs
+   - prompt history, in the same `history.db` as the masked titles and recaps
+   - logs
+   - `local://` pastes
+   - the handoff document that `compaction.handoffSaveToDisk` saves
+   - the memory stores, whose own filter removes only some credential-shaped tokens
+   - the edit log `edit-blackbox.jsonl`, which the agent writes only when `edit.blackbox.enabled` is on
+   - annotation drafts: the agent finds a draft again by a hash of the source that it reviews, so a masked draft would not match the hash and its notes would be lost
 - text sent to the model provider, which is the work of `secrets.enabled`
 
 A collab guest masks its replica with its own sources only.
