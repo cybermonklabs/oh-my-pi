@@ -107,6 +107,7 @@ import {
 	resolveBlobRefsInEntriesSync,
 	type SessionLoadResult,
 	sessionContentDigest,
+	transcriptByteChunks,
 	visitEntriesFromFile,
 } from "./session-loader";
 import { generateId, migrateToCurrentVersion } from "./session-migrations";
@@ -149,8 +150,6 @@ const ACK_COMPARE_WINDOW_BYTES = 1 << 16;
  */
 export const SESSION_TAIL_APPEND_CHUNK_BYTES = 4 * 1024 * 1024;
 const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
-/** `model_usage` purpose carrying the billed usage of an assistant turn removed by `discardEntryDurably`. */
-const DISCARDED_TURN_USAGE_PURPOSE = "discarded-turn";
 /**
  * Read-back-and-retry passes one full rewrite makes after meeting another
  * writer's entries. Each pass re-reads the file, so only a writer that appends
@@ -990,6 +989,26 @@ async function fileMatchesLines(filePath: string, lines: Iterable<string>): Prom
 		return false;
 	}
 	return expectedOffset === expectedLength && !encodeNextWindow();
+}
+
+/**
+ * Whether stored chunks are exactly the UTF-8 encoding of `body`, compared by
+ * byte length and SHA-256 while holding one line of the body and one stored
+ * chunk at a time.
+ */
+async function chunksMatchBody(chunks: AsyncIterable<Uint8Array>, body: SessionFileBody): Promise<boolean> {
+	const expected = new Bun.CryptoHasher("sha256");
+	for (const line of body.lines) expected.update(line);
+	// Iterating `lines` counted the body's bytes again.
+	const expectedBytes = body.bytes;
+	const stored = new Bun.CryptoHasher("sha256");
+	let storedBytes = 0;
+	for await (const chunk of chunks) {
+		storedBytes += chunk.byteLength;
+		if (storedBytes > expectedBytes) return false;
+		stored.update(chunk);
+	}
+	return storedBytes === expectedBytes && stored.digest("hex") === expected.digest("hex");
 }
 
 /**
@@ -1958,10 +1977,10 @@ export class SessionManager {
 		return !this.#allEntriesHandedToStorage() && this.#shouldHaveSessionFile();
 	}
 
-	/** Verify a failed acknowledgement without materializing a file-backed transcript. */
+	/** Verify a failed acknowledgement chunk by chunk: file bytes exactly, other storage by size and SHA-256. */
 	async #bodyMatchesStorage(sessionFile: string, body: SessionFileBody): Promise<boolean> {
 		if (this.#storage instanceof FileSessionStorage) return fileMatchesLines(sessionFile, body.lines);
-		return textMatchesLines(await this.#storage.readText(sessionFile), body.lines);
+		return chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body);
 	}
 
 	/**
@@ -4854,101 +4873,25 @@ export class SessionManager {
 	 * Durably move the active branch past a discarded entry.
 	 *
 	 * The loader reconstructs the active branch from the last physical journal
-	 * entry, so changing the in-memory leaf alone is lost on reload. Known
-	 * metadata children are chained onto the discarded entry's parent before the
-	 * entry is removed. If any child may carry content, the subtree is preserved
-	 * off-branch instead. Both paths append a metadata-only branch marker, and
-	 * a removal republishes the journal without the entry.
+	 * entry, so changing the in-memory leaf alone is lost on reload. A
+	 * metadata-only branch marker under the discarded entry's parent moves the
+	 * leaf, followed by fresh copies of the entry's children when they are all
+	 * `service_tier_change` entries; a subtree that may carry content stays
+	 * off-branch as it is. The discard only appends, so it survives a restart
+	 * while full rewrites fail.
 	 *
-	 * A removed assistant turn was still billed, so its usage is re-journaled as
-	 * an off-branch `model_usage` entry; session totals and `omp stats` keep
-	 * counting it. A subtree preserved off-branch keeps its own usage.
-	 *
-	 * When that republish fails, the removal is undone: the entry and its
-	 * children return to the journal as storage holds them, and the marker is
-	 * appended under the entry's parent instead, followed by fresh copies of the
-	 * `service_tier_change` children, so the discard survives a restart while
-	 * full rewrites keep failing and later turns keep appending.
+	 * The discarded entry stays in the journal off-branch, so a discarded
+	 * assistant turn keeps its billed usage: session totals and `omp stats`
+	 * count every entry.
 	 */
 	async discardEntryDurably(entryId: string): Promise<void> {
 		const entry = this.#index.get(entryId);
 		if (!entry) return;
 		const children = this.#index.childrenOf(entryId);
-		const markerDetails = { kind: DISCARDED_ENTRY_BRANCH_MARKER, discardedEntryId: entryId };
-		if (!children.every(child => child.type === "service_tier_change")) {
-			this.branchWithSummary(entry.parentId, "", markerDetails);
-			await this.flush();
-			return;
+		this.branchWithSummary(entry.parentId, "", { kind: DISCARDED_ENTRY_BRANCH_MARKER, discardedEntryId: entryId });
+		if (children.every((child): child is ServiceTierChangeEntry => child.type === "service_tier_change")) {
+			for (const child of children) this.appendServiceTierChange(child.serviceTier);
 		}
-		const original = this.#entries;
-		let leafId = entry.parentId;
-		for (const child of children) {
-			child.parentId = leafId;
-			leafId = child.id;
-		}
-		const originalGeneration = this.#entriesGeneration;
-		const removed = original.filter(candidate => candidate !== entry);
-		this.#entries = removed;
-		const removedGeneration = this.#entriesGeneration;
-		this.#index.rebuild(removed);
-		// The durable frontier described the previous array, so recording the
-		// usage or marker republishes the journal without the entry.
-		if (entry.type === "message" && entry.message.role === "assistant") {
-			const { api, provider, model, usage, stopReason, errorMessage } = entry.message;
-			// Off-branch like late usage: totals count every entry, and the kept
-			// chain stays made of entries collab guests replicate.
-			this.#recordEntry({
-				type: "model_usage",
-				id: generateId(this.#index),
-				parentId: leafId,
-				timestamp: entry.timestamp,
-				runtime: currentRuntimeIdentity(),
-				activeLeafId: leafId,
-				purpose: DISCARDED_TURN_USAGE_PURPOSE,
-				api,
-				provider,
-				model,
-				usage,
-				stopReason,
-				...(errorMessage === undefined ? {} : { errorMessage }),
-			});
-		}
-		const markerId = this.branchWithSummary(leafId, "", markerDetails);
-		// A deferring backend confirms the republish only once it drains.
-		await this.flush().catch(() => undefined);
-		const published =
-			!this.#persist ||
-			!this.#sessionFile ||
-			!this.#shouldHaveSessionFile() ||
-			this.#durable?.generation === removedGeneration;
-		const marker = this.#index.get(markerId);
-		if (published || this.#entries !== removed || marker?.type !== "branch_summary") {
-			await this.flush();
-			return;
-		}
-		const appendedSince = removed.slice(removed.indexOf(marker) + 1);
-		const leafAfter = this.#index.leafId();
-		for (const child of children) child.parentId = entryId;
-		this.#entries = original;
-		// Storage still holds the original entries, so the frontier over them holds again.
-		const durable = this.#durable;
-		if (durable?.generation === originalGeneration) durable.generation = this.#entriesGeneration;
-		this.#index.rebuild(original);
-		// Neither the marker nor anything recorded after it reached storage, so
-		// their parents can still change before they are appended.
-		marker.parentId = entry.parentId;
-		marker.fromId = entry.parentId ?? "root";
-		original.push(marker);
-		this.#index.insert(marker);
-		for (const child of children as ServiceTierChangeEntry[]) this.appendServiceTierChange(child.serviceTier);
-		const tip = this.#index.leafId();
-		for (const later of appendedSince) {
-			if (later.parentId === markerId) later.parentId = tip;
-			original.push(later);
-			this.#index.insert(later);
-		}
-		this.#index.setLeaf(leafAfter === markerId ? tip : leafAfter);
-		this.#appendToSessionFile(marker);
 		await this.flush();
 	}
 

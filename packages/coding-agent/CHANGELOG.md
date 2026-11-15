@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Discarding a failed assistant turn now appends a branch marker instead of rewriting the session file; the discarded turn stays in the file off the active branch and keeps counting toward usage totals.
+
 ### Fixed
 
 - Fixed a failed session-maintenance rewrite making every later turn republish its full transcript; turns with durable predecessors now keep appending normally.
@@ -9,6 +13,7 @@
 - Fixed `omp --resume <path>` parsing an unchanged session file twice; large sessions now re-stat for freshness and reparse only after a change.
 - Fixed full rewrites of large file-backed sessions retaining a second transcript-sized serialization; file storage now streams the journal and verifies uncertain publication by an exact streamed comparison.
 - Fixed `omp --resume <path>` reading a session's whole transcript into one string to confirm it is unchanged when its storage can stream it; the check now hashes the transcript as it streams.
+- Fixed confirming a session rewrite whose acknowledgement failed by reading the whole stored transcript into one string when its storage can stream it; the stored bytes are now compared by size and SHA-256 as they stream.
 
 ## [18.18.6] - 2026-11-09
 
