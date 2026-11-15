@@ -19,6 +19,7 @@ Does not cover `/tree` UI rendering behavior beyond semantics that affect sessio
 
 - [`src/session/session-manager.ts`](../packages/coding-agent/src/session/session-manager.ts) — orchestration: tree/leaf, appends, persistence, blobs, lifecycle factories
 - [`src/session/session-entries.ts`](../packages/coding-agent/src/session/session-entries.ts) — entry/header types, `SessionEntry` union, `CURRENT_SESSION_VERSION`
+- [`src/session/cold-entries.ts`](../packages/coding-agent/src/session/cold-entries.ts) — the store of older entry bodies, cold entries and the cut
 - [`src/session/session-migrations.ts`](../packages/coding-agent/src/session/session-migrations.ts) — version migrations
 - [`src/session/session-loader.ts`](../packages/coding-agent/src/session/session-loader.ts) — file load + blob-ref resolution
 - [`src/session/session-context.ts`](../packages/coding-agent/src/session/session-context.ts) — `buildSessionContext`
@@ -583,6 +584,22 @@ Before persisting entries:
 - Spilled MCP tool results omit duplicate `details.structuredContent` when the rendered structured output already lives in their truncation artifact.
 
 These projections leave the live entries unchanged. On load, ordinary persisted image references are resolved back to inline payloads. Snapcompact frames stay lazy until context reconstruction selects them. Archives with frames truncated by older persistence code fall back to their retained text or undamaged frames.
+
+## Older Entry Bodies (the Cold Store)
+
+A persisted `SessionManager` keeps whole only the entries the model context reads: those from the **cut** on. The cut is the first entry the context keeps of the newest compaction on the current branch (`firstKeptEntryId`, or the entry after `providerReplayThroughEntryId` when `firstKeptEntryId` is empty) and, for the current model, of the newest compaction that model can replay, whichever comes first. With no compaction on the branch, nothing leaves memory. The cut is computed again after a load, after a compaction (once the context is rebuilt from it), after the leaf moves to another branch, and after a model change; entries that cross it are converted or made whole again.
+
+**Where the store lives.** Each loaded manager writes one file under `os.tmpdir()/omp-cold/` (`<pid>-<uuid>.jsonl`). On POSIX the file is unlinked as soon as it is open, so its disk is freed when the descriptor closes and a killed process leaves nothing behind; on Windows it is deleted when the store is collected and at process exit. A record is the entry exactly as the manager holds it, with image data replaced by blob references. A clone that shares entry objects (`cloneCurrentSession`, `captureState`/`restoreState`) keeps the store open as long as it needs it.
+
+**What stays in memory before the cut, by kind.** These entries stay whole: every `custom` entry (extension and feature state); `model_change`, `thinking_level_change`, `service_tier_change`, `mode_change`, `ttsr_injection`, `label`, `credential_pin`, `reset_boundary`, `model_usage` and `title_change` entries; the newest `session_init` on the current path; and the newest `todo` tool result that records the list on the current path. Every other entry before the cut is **cold**.
+
+**Cold entries.** A cold entry is the same object as before. Its `type`, `id`, `parentId`, `timestamp` and `activeLeafId`, its message's `role`, and every value that is small (a number, boolean, `null`, a string of at most 64 UTF-16 units, or an object or array whose JSON text is at most 320 bytes) stay ordinary properties. Larger values (message content, tool `details`, summaries, provider payloads) become enumerable accessors that read the entry's record back from the store on access, so `JSON.stringify`, spread and `structuredClone` still see every field. The eight most recently read records (at most 16 MiB together) are kept parsed for the next field read.
+
+**Values read from a cold entry are frozen.** Writing into one throws a `TypeError` instead of losing the change. Assigning a field (`entry.message = …`, `message.content = …`) makes the whole entry whole again, and the assignment applies. To change nested values, call `sessionManager.updateEntryBody(id, entry => { … })`: it makes the entry whole, runs the update and returns the entry to the store with its new values; persist with `rewriteEntries()` as for any in-place update. A reader of the recent turns can use `getBranchFromCut()`, the branch from the cut to the leaf, whose bodies are all in memory.
+
+**Load.** Resume, switch, reload, `continueRecent` and `forkFrom` stream the transcript: each entry is migrated, completed and written to the store as it arrives, unless its kind stays whole. After the stream the entries from the cut on are made whole, stale replay metadata is stripped from what any load-time pass left, an entry before the cut that a pass or the stripping made whole goes back to the store, and blob references of whole entries are resolved. A full write reads each cold entry's fields one entry at a time.
+
+**Diagnostics.** `sessionManager.coldStoreStats()` returns `{ coldEntries, storeBytes, materializations, hydrations }`: the entries whose large values are in the store, the bytes of records written, the records read back to serve a field read, and the cold entries made whole again. `SessionManager.inMemory()` holds every entry.
 
 ## Storage Abstractions
 

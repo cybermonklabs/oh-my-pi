@@ -42,12 +42,15 @@ function assistant(text: string) {
 
 /**
  * A session whose compaction keeps `u2` on: `u1` and `a1` lie before the cut,
- * and so does `m1`, a model change, which stays whole by kind.
+ * and so does `m1`, a model change, which stays whole by kind. Its id is the
+ * directory's name, so no two tests share a session (a manager another test
+ * left open keeps its writer claim on its session).
  */
 async function writeSession(dir: string): Promise<string> {
 	const file = path.join(dir, "session.jsonl");
 	const timestamp = "2026-01-01T00:00:00.000Z";
-	const header: SessionHeader = { type: "session", version: CURRENT_SESSION_VERSION, id: "cold", timestamp, cwd: dir };
+	const id = path.basename(dir);
+	const header: SessionHeader = { type: "session", version: CURRENT_SESSION_VERSION, id, timestamp, cwd: dir };
 	const entries = [
 		header,
 		{

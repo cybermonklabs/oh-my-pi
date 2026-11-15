@@ -2340,7 +2340,8 @@ export async function runRootCommand(
 			else process.stderr.write(`${chalk.yellow(notice)}\n`);
 		}
 		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {
-			const pendingToolWarning = describePendingToolCalls(sessionManager.getBranch());
+			// A pending call is always in the interrupted tail, after the cut: older bodies stay unread.
+			const pendingToolWarning = describePendingToolCalls(sessionManager.getBranchFromCut());
 			if (pendingToolWarning) {
 				logger.warn("Resumed session has pending tool calls", {
 					sessionId: sessionManager.getSessionId(),

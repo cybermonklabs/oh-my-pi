@@ -121,6 +121,8 @@ export interface VisitEntriesFromFileStreamOptions {
 	onBytesConsumed?: (bytes: number) => void;
 	/** Storage to read the transcript from; the file at `filePath` when omitted. */
 	storage?: SessionStorage;
+	/** The transcript's bytes, e.g. a decompressed archive, read instead of `filePath`. */
+	chunks?: AsyncIterable<Uint8Array>;
 }
 
 /** Controls how a missing session file is handled. */
@@ -417,7 +419,9 @@ export async function visitEntriesFromFileStream(
 		// delivering its bytes (macOS) or ignores the bound and streams the whole
 		// file (Windows).
 		let unread = maxBytes;
-		const chunks = options.storage ? transcriptByteChunks(filePath, options.storage) : Bun.file(filePath).stream();
+		const chunks =
+			options.chunks ??
+			(options.storage ? transcriptByteChunks(filePath, options.storage) : Bun.file(filePath).stream());
 		for await (const streamed of chunks) {
 			if (stopped) break;
 			const chunk = streamed.byteLength > unread ? streamed.subarray(0, unread) : streamed;
@@ -485,10 +489,10 @@ export async function visitEntriesFromFileStream(
 
 	return titleSlot;
 }
-/** Exported for testing — the ≥8MiB streaming path (works on any file size). */
+/** The ≥8MiB streaming load (works on any size), of `filePath` or of `options.chunks`. */
 export async function loadEntriesFromFileStream(
 	filePath: string,
-	options?: Pick<VisitEntriesFromFileStreamOptions, "throwIfMissing">,
+	options?: Pick<VisitEntriesFromFileStreamOptions, "throwIfMissing" | "chunks">,
 ): Promise<SessionLoadResult> {
 	const entries: FileEntry[] = [];
 	let malformedRecords = 0;
@@ -503,6 +507,7 @@ export async function loadEntriesFromFileStream(
 				malformedRecords++;
 			},
 			throwIfMissing: options?.throwIfMissing,
+			chunks: options?.chunks,
 			onBytesConsumed: bytes => {
 				bytesConsumed += bytes;
 			},

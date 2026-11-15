@@ -766,6 +766,8 @@ export class SessionMaintenance {
 			await this.#host.sessionManager.rewriteEntries();
 		} catch (error) {
 			result.undo();
+			// A blanked result before the cut was made whole by the write; its restored values go back to the store.
+			this.#host.sessionManager.recoolEntriesBeforeCut();
 			throw error;
 		}
 	}
@@ -1159,12 +1161,18 @@ export class SessionMaintenance {
 		const anchorEntry = anchorIndex >= 0 ? branchEntries[anchorIndex] : undefined;
 		if (anchorEntry && !entrySnapshots.has(anchorEntry))
 			entrySnapshots.set(anchorEntry, structuredClone(anchorEntry));
-		applyShakeRegions(items);
+		// A body read back from the cold store is frozen: each entry is made whole
+		// for its rewrite and goes back to the store with it.
+		for (const [entry, entryItems] of Map.groupBy(items, item => item.region.entry)) {
+			this.#host.sessionManager.updateEntryBody(entry.id, () => applyShakeRegions(entryItems));
+		}
 		try {
 			this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
 			await this.#host.sessionManager.rewriteEntries();
 		} catch (error) {
-			for (const [entry, snapshot] of entrySnapshots) Object.assign(entry, snapshot);
+			for (const [entry, snapshot] of entrySnapshots) {
+				this.#host.sessionManager.updateEntryBody(entry.id, () => Object.assign(entry, snapshot));
+			}
 			// The rewrite just failed, so restore the live history without writing to the session.
 			this.#host.agent.replaceMessages(this.#host.buildDisplaySessionContext().messages);
 			throw error;

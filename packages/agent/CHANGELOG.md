@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Prune passes look up tool calls before the compaction boundary in an index built once per boundary and branch, instead of re-reading that history on every pass that misses a call
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

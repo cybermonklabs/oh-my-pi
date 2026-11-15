@@ -91,17 +91,12 @@ export function entriesKeptWholeOnPath(path: readonly SessionEntry[]): Set<Sessi
 }
 
 /**
- * Index in `entries` (file order) of the cut for the leaf that `path` ends at:
- * the first entry the context keeps ({@link compactionKeptStart}) of the newest
- * compaction on the path and, with `model`, of the newest compaction `model`
- * can replay, whichever comes first. 0 (nothing cold) when the context uses
- * no compaction.
+ * Index in `path` of the cut for the leaf that `path` ends at: the first entry
+ * the context keeps ({@link compactionKeptStart}) of the newest compaction on
+ * the path and, with `model`, of the newest compaction `model` can replay,
+ * whichever comes first. 0 (nothing cold) when the context uses no compaction.
  */
-export function coldCutIndex(
-	entries: readonly SessionEntry[],
-	path: readonly SessionEntry[],
-	model: Model | undefined,
-): number {
+export function coldCutPathIndex(path: readonly SessionEntry[], model: Model | undefined): number {
 	const compactions = [getReadableCompactionEntry(path, undefined)];
 	if (model) compactions.push(getReadableCompactionEntry(path, model));
 	let start = path.length;
@@ -109,7 +104,16 @@ export function coldCutIndex(
 		if (!compaction) return 0;
 		start = Math.min(start, compactionKeptStart(path, compaction, path.indexOf(compaction)));
 	}
-	const cutEntry = path[start];
+	return start;
+}
+
+/** Index in `entries` (file order) of the cut {@link coldCutPathIndex} finds on `path`. */
+export function coldCutIndex(
+	entries: readonly SessionEntry[],
+	path: readonly SessionEntry[],
+	model: Model | undefined,
+): number {
+	const cutEntry = path[coldCutPathIndex(path, model)];
 	const index = cutEntry ? entries.indexOf(cutEntry) : -1;
 	return index < 0 ? 0 : index;
 }

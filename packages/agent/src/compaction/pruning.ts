@@ -311,16 +311,65 @@ function resolveBoundaryIndex(entries: readonly SessionEntry[], keepBoundaryId: 
 }
 
 /**
+ * Tool calls of a summarized-away prefix `entries[0, length)` by call id: the
+ * assistant entry holding each call, the call itself read from it only when it
+ * is looked up, so the index keeps no history body in memory.
+ */
+interface PrefixToolCalls {
+	readonly length: number;
+	readonly first: SessionEntry;
+	readonly entryById: Map<string, SessionEntry>;
+	readonly resolved: Map<string, AgentToolCall>;
+}
+
+/**
+ * Prefix indexes by the entry that ends the prefix (the boundary). A branch
+ * prefix is the path from the root to its boundary, so one index serves every
+ * pass while the cut and the branch stay, and goes with the boundary entry.
+ */
+const prefixToolCalls = new WeakMap<SessionEntry, PrefixToolCalls>();
+
+function prefixToolCallIndex(entries: readonly SessionEntry[], length: number): PrefixToolCalls {
+	const boundary = entries[length];
+	const cached = prefixToolCalls.get(boundary);
+	if (cached && cached.length === length && cached.first === entries[0]) return cached;
+	const entryById = new Map<string, SessionEntry>();
+	for (let i = 0; i < length; i++) {
+		const entry = entries[i];
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		for (const block of entry.message.content) {
+			if (block.type === "toolCall") entryById.set(block.id, entry);
+		}
+	}
+	const index: PrefixToolCalls = { length, first: entries[0], entryById, resolved: new Map() };
+	prefixToolCalls.set(boundary, index);
+	return index;
+}
+
+function prefixToolCall(index: PrefixToolCalls, id: string): AgentToolCall | undefined {
+	const resolved = index.resolved.get(id);
+	if (resolved !== undefined) return resolved;
+	const entry = index.entryById.get(id);
+	if (entry?.type !== "message" || entry.message.role !== "assistant") return undefined;
+	const call = entry.message.content.findLast(
+		(block): block is AgentToolCall => block.type === "toolCall" && block.id === id,
+	);
+	if (call !== undefined) index.resolved.set(id, call);
+	return call;
+}
+
+/**
  * Tool-call lookup for results in the sent region `entries[start, end)`.
  * Calls there are indexed eagerly; the summarized-away prefix is indexed only
- * on the first miss, so lookups match a whole-branch scan while the common
- * case never walks history the boundary already excludes.
+ * on the first miss, once per cut position and branch (see
+ * {@link prefixToolCallIndex}), so lookups match a whole-branch scan while
+ * repeated passes never walk history the boundary already excludes.
  */
 class SentToolCalls {
 	readonly #entries: readonly SessionEntry[];
 	readonly #start: number;
 	readonly #sent: Map<string, AgentToolCall>;
-	#prefix: Map<string, AgentToolCall> | undefined;
+	#prefix: PrefixToolCalls | undefined;
 
 	constructor(entries: readonly SessionEntry[], start: number) {
 		this.#entries = entries;
@@ -331,8 +380,8 @@ class SentToolCalls {
 	get(id: string): AgentToolCall | undefined {
 		const call = this.#sent.get(id);
 		if (call !== undefined || this.#start === 0) return call;
-		this.#prefix ??= collectToolCallsById(this.#entries, 0, this.#start);
-		return this.#prefix.get(id);
+		this.#prefix ??= prefixToolCallIndex(this.#entries, this.#start);
+		return prefixToolCall(this.#prefix, id);
 	}
 }
 

@@ -1,9 +1,11 @@
+import { messageEstimateVersion } from "@oh-my-pi/pi-agent-core/compaction";
 import { logger, sanitizeText, truncate } from "@oh-my-pi/pi-utils";
 import { getAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { findPersistedRecall, persistRecall } from "../memory-backend/recall-entry";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import type { AgentSession } from "../session/agent-session";
+import type { SessionEntry } from "../session/session-entries";
 import { type BankScope, ensureBankExists, type HindsightBankSet } from "./bank";
 import type { HindsightClientApi } from "./client";
 import type { HindsightConfig } from "./config";
@@ -21,7 +23,13 @@ import {
 	resolveSeedsForScope,
 	tryLoadMentalModelsBlock,
 } from "./mental-models";
-import { countUserTurns, extractMessages } from "./transcript";
+import {
+	countUserTurns,
+	extractLastTurns,
+	extractMessages,
+	extractMessagesFrom,
+	type ReadonlySessionManagerLike,
+} from "./transcript";
 import { type DrainResult, HindsightOutbox, type RetainInput } from "./outbox";
 
 /** `notice` source of Hindsight recall/retain failures; print mode writes these to stderr. */
@@ -240,6 +248,37 @@ function extendRetentionPrefixKey(key: string, messages: HindsightMessage[], fro
 	return key;
 }
 
+/**
+ * The session entries the full-session transcript cache covers,
+ * `getEntries()[0, lastIndex]`. A retain extends the cache while they are the
+ * same objects and none of their user or assistant messages was rewritten in
+ * place: every in-place rewrite bumps its message's estimate version.
+ */
+interface RetainedEntries {
+	first: SessionEntry;
+	last: SessionEntry;
+	lastIndex: number;
+	versions: number;
+}
+
+/** Sum of the estimate versions of the user and assistant messages in `entries[0, through]`; reads no body. */
+function retainedMessageVersions(entries: readonly SessionEntry[], through: number): number {
+	let versions = 0;
+	for (let index = 0; index <= through; index++) {
+		const entry = entries[index]!;
+		if (entry.type !== "message") continue;
+		const role = entry.message.role;
+		if (role === "user" || role === "assistant") versions += messageEstimateVersion(entry.message);
+	}
+	return versions;
+}
+
+/** A retain an `agent_end` owes, and how many messages it read for it. */
+interface PendingRetain {
+	retain(): Promise<void>;
+	messages: number;
+}
+
 /** Per-session Hindsight runtime state owned by its AgentSession. */
 export class HindsightSessionState implements HindsightSessionStateApi {
 	/** Session id used for retain-queue metadata. */
@@ -266,6 +305,8 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	// or silently retaining nothing forever. Hashing is orders of magnitude
 	// cheaper than the re-formatting this cache avoids.
 	#lastRetainedPrefixKey: string = "";
+	/** The entries `#cachedTranscript` was built from by an auto-retain; unset after a retain of given messages. */
+	#retainedEntries: RetainedEntries | undefined;
 	hasRecalledForFirstTurn: boolean;
 	lastRecallSnippet?: string;
 	#recallGeneration = 0;
@@ -307,9 +348,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	setSessionId(sessionId: string): void {
 		if (this.sessionId !== sessionId) this.#recallGeneration++;
 		this.sessionId = sessionId;
-		this.#lastRetainedMessageIndex = 0;
-		this.#cachedTranscript = "";
-		this.#lastRetainedPrefixKey = "";
+		this.#resetRetentionCache();
 	}
 
 	resetConversationTracking(): void {
@@ -317,9 +356,14 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		this.lastRetainedTurn = 0;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
+		this.#resetRetentionCache();
+	}
+
+	#resetRetentionCache(): void {
 		this.#lastRetainedMessageIndex = 0;
 		this.#cachedTranscript = "";
 		this.#lastRetainedPrefixKey = "";
+		this.#retainedEntries = undefined;
 	}
 
 	/**
@@ -396,6 +440,8 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	}
 
 	async retainSession(messages: HindsightMessage[]): Promise<void> {
+		// The cache now follows `messages`, not the session's entries.
+		this.#retainedEntries = undefined;
 		const retainedAt = new Date();
 		const sourceTimestamp = this.#sessionSourceTimestamp() ?? retainedAt;
 		const retainFullWindow = this.config.retainMode === "full-session";
@@ -410,9 +456,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			const boundary = this.#lastRetainedMessageIndex;
 			if (boundary <= messages.length) prefixKey = extendRetentionPrefixKey("", messages, 0, boundary);
 			if (boundary > messages.length || prefixKey !== this.#lastRetainedPrefixKey) {
-				this.#lastRetainedMessageIndex = 0;
-				this.#cachedTranscript = "";
-				this.#lastRetainedPrefixKey = "";
+				this.#resetRetentionCache();
 				prefixKey = "";
 			}
 			hashedThrough = this.#lastRetainedMessageIndex;
@@ -425,14 +469,22 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			const windowTurns = this.config.retainEveryNTurns + this.config.retainOverlapTurns;
 			const target = sliceLastTurnsByUserBoundary(messages, windowTurns);
 			documentId = `${this.sessionId}-${retainedAt.getTime()}`;
-			this.#lastRetainedMessageIndex = 0;
-			this.#cachedTranscript = "";
-			this.#lastRetainedPrefixKey = "";
+			this.#resetRetentionCache();
 			const { transcript: windowTranscript } = prepareRetentionTranscript(target, true, { includeTimestamps: true });
 			if (!windowTranscript) return;
 			transcript = windowTranscript;
 		}
 
+		await this.#sendRetain(documentId, transcript, sourceTimestamp);
+		if (nextCachedTranscript !== undefined) {
+			this.#cachedTranscript = nextCachedTranscript;
+			// prefixKey hashes [0, hashedThrough) of this same snapshot; extend it instead of rehashing from 0.
+			this.#lastRetainedPrefixKey = extendRetentionPrefixKey(prefixKey, messages, hashedThrough, messages.length);
+			this.#lastRetainedMessageIndex = messages.length;
+		}
+	}
+
+	async #sendRetain(documentId: string, transcript: string, sourceTimestamp: Date): Promise<void> {
 		await ensureBankExists(this.client, this.bankId, this.config, this.banksSet);
 		await this.client.retain(this.bankId, transcript, {
 			documentId,
@@ -442,31 +494,83 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			timestamp: sourceTimestamp,
 			async: true,
 		});
-		if (nextCachedTranscript !== undefined) {
-			this.#cachedTranscript = nextCachedTranscript;
-			// prefixKey hashes [0, hashedThrough) of this same snapshot; extend it instead of rehashing from 0.
-			this.#lastRetainedPrefixKey = extendRetentionPrefixKey(prefixKey, messages, hashedThrough, messages.length);
-			this.#lastRetainedMessageIndex = messages.length;
+	}
+
+	/**
+	 * The retain an `agent_end` owes, reading only the messages it sends: the
+	 * turns a `last-turn` chunk covers, or in `full-session` mode the messages
+	 * after the entries the transcript cache covers (all of them again once
+	 * those entries changed). Undefined when the session holds no message.
+	 */
+	#pendingRetain(sessionManager: ReadonlySessionManagerLike): PendingRetain | undefined {
+		if (this.config.retainMode !== "full-session") {
+			const windowTurns = this.config.retainEveryNTurns + this.config.retainOverlapTurns;
+			// A window of no turns retains nothing; `retainSession` decides that from every message.
+			const messages =
+				windowTurns > 0 ? extractLastTurns(sessionManager, windowTurns) : extractMessages(sessionManager);
+			if (messages.length === 0) return undefined;
+			return { retain: () => this.retainSession(messages), messages: messages.length };
 		}
+		const entries = sessionManager.getEntries();
+		const covered = this.#retainedEntries;
+		let from = 0;
+		if (
+			covered &&
+			entries[0] === covered.first &&
+			entries[covered.lastIndex] === covered.last &&
+			retainedMessageVersions(entries, covered.lastIndex) === covered.versions
+		) {
+			from = covered.lastIndex + 1;
+		} else {
+			this.#resetRetentionCache();
+		}
+		const messages = extractMessagesFrom(entries, from);
+		if (from === 0 && messages.length === 0) return undefined;
+		const lastIndex = entries.length - 1;
+		const covers: RetainedEntries = {
+			first: entries[0]!,
+			last: entries[lastIndex]!,
+			lastIndex,
+			versions: retainedMessageVersions(entries, lastIndex),
+		};
+		return { retain: () => this.#retainEntryMessages(covers, messages), messages: messages.length };
+	}
+
+	/**
+	 * Full-session retain of the cached transcript followed by `messages`, those
+	 * of the entries after the ones the cache covers; the cache then covers
+	 * `covers`.
+	 */
+	async #retainEntryMessages(covers: RetainedEntries, messages: HindsightMessage[]): Promise<void> {
+		const sourceTimestamp = this.#sessionSourceTimestamp() ?? new Date();
+		const { transcript: newPart } = prepareRetentionTranscript(messages, true, { includeTimestamps: true });
+		if (!newPart) return;
+		const transcript = this.#cachedTranscript ? `${this.#cachedTranscript}\n\n${newPart}` : newPart;
+		await this.#sendRetain(this.sessionId, transcript, sourceTimestamp);
+		this.#cachedTranscript = transcript;
+		this.#lastRetainedPrefixKey = extendRetentionPrefixKey(this.#lastRetainedPrefixKey, messages, 0, messages.length);
+		this.#lastRetainedMessageIndex += messages.length;
+		this.#retainedEntries = covers;
 	}
 
 	async maybeRetainOnAgentEnd(): Promise<void> {
 		if (!this.config.autoRetain) return;
+		const sessionManager = this.session.sessionManager;
 		// Cheap gate first: most agent_end events are not retain turns, so skip text extraction.
-		const userTurns = countUserTurns(this.session.sessionManager);
+		const userTurns = countUserTurns(sessionManager);
 		if (userTurns - this.lastRetainedTurn < this.config.retainEveryNTurns) return;
-		const messages = extractMessages(this.session.sessionManager);
-		if (messages.length === 0) return;
+		const pending = this.#pendingRetain(sessionManager);
+		if (!pending) return;
 
 		try {
-			await this.retainSession(messages);
+			await pending.retain();
 			this.lastRetainedTurn = userTurns;
 			if (this.config.debug) {
 				logger.debug("Hindsight: auto-retain succeeded", {
 					providerSessionId: this.sessionId,
 					bankId: this.bankId,
 					userTurns,
-					messages: messages.length,
+					messages: pending.messages,
 				});
 			}
 		} catch (err) {
@@ -486,9 +590,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		// when no new messages arrived since the last auto-retain — otherwise a
 		// rebuild could never recover an upstream document that was deleted or a
 		// previous async retain that never materialized.
-		this.#lastRetainedMessageIndex = 0;
-		this.#cachedTranscript = "";
-		this.#lastRetainedPrefixKey = "";
+		this.#resetRetentionCache();
 		try {
 			await this.retainSession(messages);
 			this.lastRetainedTurn = messages.filter(m => m.role === "user").length;
