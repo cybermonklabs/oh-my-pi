@@ -158,7 +158,7 @@ The setting is off by default and does not depend on `secrets.enabled`. When it 
 
 When two sources hold the same value, the source the agent read first names it. At the first write, that is the first source in this list. When a name or a `friendlyName` contains a held value, or a regex entry matches it, the marker uses the index form instead (`#<n>`, `project#<n>`, `global#<n>`). The agent never changes its own markers, so masking a stored text again gives the same text.
 
-The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, the replica that a collab guest writes, and the title and the recaps that it records in `history.db`. It masks every string of an entry except these, which it keeps as written:
+The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, the replica that a collab guest writes, and, under file storage, the title and the recaps that it records in `history.db`. It masks every string of an entry except these, which it keeps as written:
 
 - object keys, numbers and booleans
 - the fields `type`, `role`, `id`, `parentId`, `timestamp` and `toolCallId`
@@ -203,7 +203,7 @@ Masking finds a value only where it appears exactly as the agent holds it. It do
 - a `secrets.yml` entry the parser refuses (see [Invalid entries and files](#invalid-entries-and-files))
 - part of a multi-line file printed alone, because the content of a file is one value
 - object keys, numbers, the working directory, ids and images
-- entries written before the setting was on, and the copies of stored text that fork, move, render, `session unpack`, archive restore and `gc strip` make (an entry written while the setting was on is masked already)
+- entries written before the setting was on, and the copies of stored text that fork, move, render, `session unpack`, archive restore, `gc strip`, the title backfill into `history.db` and the `history.db` repair make (an entry written while the setting was on is masked already)
 - files outside the session store: artifact files with full command output, blobs, prompt history, and logs
 - text sent to the model provider, which is the work of `secrets.enabled`
 
