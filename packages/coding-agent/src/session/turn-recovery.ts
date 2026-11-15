@@ -285,7 +285,7 @@ function toolReplayStart(messages: readonly AgentMessage[]): number | undefined 
 	return start;
 }
 
-/** The busy failure of a prompt that waited 30 s for another run to release the agent. */
+/** The busy failure of a prompt that waited at least 30 s for another run to release the agent. */
 export class PromptIdleWaitTimeoutError extends Error {
 	constructor() {
 		super("Timed out waiting for prior agent run to finish before prompting.");

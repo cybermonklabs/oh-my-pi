@@ -123,7 +123,7 @@ describe("RPC prompt failures carry session_busy only when the agent was busy", 
 		expect(result).toMatchObject({ error: { code: "session_busy" } });
 	}, 30_000);
 
-	test("a prompt still blocked by another run after its 30 s wait fails with session_busy", async () => {
+	test("a prompt still blocked by another run after waiting at least 30 s fails with session_busy", async () => {
 		agent = await startAgent("idle-retry-rpc-agent.ts");
 		agent.send({ id: "two-runs", type: "prompt", message: "two-runs-first" });
 		const result = await promptResult(agent, "two-runs", 75_000);

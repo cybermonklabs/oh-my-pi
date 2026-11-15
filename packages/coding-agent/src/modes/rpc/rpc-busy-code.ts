@@ -4,7 +4,7 @@ import { PromptIdleWaitTimeoutError } from "../../session/turn-recovery";
 
 /**
  * The RPC failure code of a prompt error: `session_busy` when the agent was busy
- * (refused at once, or still held by another run after the 30 s wait), else none.
+ * (refused at once, or still held by another run after waiting at least 30 s), else none.
  */
 export function rpcBusyCode(error: unknown): "session_busy" | undefined {
 	if (

@@ -13,8 +13,8 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 // Real RPC dispatch, session and prompt wait for idle; only model replies are scripted.
-// A prompt holding "two-runs-first" finds the agent held by other runs for longer than its
-// 30 s wait for idle: its before_agent_start handler starts run A on the agent (answered after
+// A prompt holding "two-runs-first" finds the agent held by other runs past its 30 s
+// idle-wait deadline: its before_agent_start handler starts run A on the agent (answered after
 // 35 s) and, the moment A ends, run B (streams until aborted). Both claim the agent directly,
 // as a run the prompt does not own would, and B's start is registered on A's end before the
 // prompt's own wait, so B holds the agent when that wait resumes.
@@ -45,7 +45,7 @@ const extension = await loadExtensionFromFactory(
 );
 const extensionRunner = new ExtensionRunner([extension], runtime, cwd, sessionManager, modelRegistry);
 const mock = createMockModel({
-	// The delays are real: run A outlasts the prompt's 30 s wait; run B only bounds a leaked process.
+	// The delays are real: run A outlasts the prompt's 30 s idle-wait deadline; run B only bounds a leaked process.
 	handler: context => {
 		const last = JSON.stringify(context.messages.at(-1)?.content);
 		if (last.includes("run-a")) return { content: ["Done"], delayMs: 35_000 };

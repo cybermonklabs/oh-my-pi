@@ -249,7 +249,7 @@ export interface RpcPromptError {
 	retryable: boolean;
 	/**
 	 * `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request.
-	 * `session_busy`: the agent was busy: the prompt was refused, or it waited 30 s and another run still held the agent.
+	 * `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent.
 	 */
 	code?: "cost_cap" | "session_busy";
 }

@@ -4224,7 +4224,7 @@ pub struct PromptError {
 	pub model: Option<String>,
 	#[serde(rename = "httpStatus", default, skip_serializing_if = "Option::is_none")]
 	pub http_status: Option<i64>,
-	/// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited 30 s and another run still held the agent.
+	/// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub code: Option<PromptErrorCode>,
 }
