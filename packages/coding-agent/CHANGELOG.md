@@ -11,9 +11,11 @@
 ### Added
 
 - Sessions can now be stored in PostgreSQL, MySQL, or SQLite instead of JSONL files: set `session.storage: sql` and point `session.sql.dsnFile` at a file holding the connection string (or set `OMP_SESSION_STORAGE=sql` and `OMP_SESSION_SQL_DSN_FILE`); `--resume`, `--continue`, the session picker, and listing follow the same store, and joining a collab session needs file storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
+- Session storages can implement an optional `readChunks(path, fromByte?)` that streams a transcript's bytes, and an `IndexedSessionStorage` backend (`SessionStorageBackend`, which SDK stores may implement) optional `readChunks` and `writeFullStream` methods, so long sessions resume and rewrite without holding the whole transcript in memory
 
 ### Fixed
 
+- Resuming a long session from SQL session storage, and rewriting it in full, no longer holds the whole transcript in memory
 - Fixed the debug menu's "Clear artifact cache" deleting whole project directories, session transcripts included; it now removes only tool output files older than 30 days and keeps transcripts, subagent outputs, `/btw` conversations and drafts. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - A failed `/tan` dispatch no longer leaves its clone's transcript behind or keeps the clone's ownership lease, under file and SQL session storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - Under `session.storage: sql`, `omp stats`, `/stats`, `/trace`, `omp session pack/unpack/moved/lease`, RPC `get_session_lease` and `gc.autoCompress` refuse with a message naming the setting instead of acting on an empty file tree, and the `/usage` heatmap says why it is empty while quotas still show. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))

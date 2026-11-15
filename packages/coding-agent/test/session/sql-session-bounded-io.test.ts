@@ -1,0 +1,643 @@
+/**
+ * SQL session storage reads and rewrites a long transcript without holding it
+ * whole: a read streams the session's parts a few at a time, and a full
+ * rewrite spools its lines to a temporary file and swaps staged parts in. A
+ * regression shows as a string or buffer as long as the transcript handed to,
+ * or returned by, the SQL client or the storage.
+ *
+ * Runs on SQLite always, and on PostgreSQL when `OMP_TEST_SQL_POSTGRES_URL`
+ * names a throwaway database. Cases that call the streamed storage methods
+ * skip where the storage lacks them; the reader and `SessionManager` cases use
+ * only APIs that predate them, so on a storage that reads and writes whole
+ * they fail by recording a value as long as the transcript.
+ */
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import {
+	loadSessionFile,
+	loadSessionMessagesReadOnly,
+	parseSessionContent,
+} from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { copyTranscriptTree } from "@oh-my-pi/pi-coding-agent/session/session-transcript-tree";
+import {
+	SqlSessionStorage,
+	type SqlSessionStorageAdapter,
+	type SqlSessionStorageClient,
+	type SqlSessionStorageResult,
+	type SqlSessionStorageTransaction,
+} from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { SQL } from "bun";
+import { readStoredSession } from "../helpers/sql-session-storage";
+
+type SqlClient = InstanceType<typeof SQL>;
+
+const MiB = 1024 * 1024;
+/** No value, and no query's returned values together, may reach past this. */
+const BOUND = 16 * MiB;
+/** Size of the transcript the readers stream. */
+const READ_BYTES = 64 * MiB;
+/** Size of a rewritten transcript: past {@link BOUND}, and more than 16 parts of 1 MiB. */
+const WRITE_BYTES = 20 * MiB;
+const TIMEOUT = 300_000;
+const TIMESTAMP = "2026-11-01T00:00:00.000Z";
+const STAGING = "#staging-";
+const HOUR_MS = 60 * 60 * 1000;
+
+const streamsReads = typeof SqlSessionStorage.prototype.readChunks === "function";
+const streamsWrites =
+	typeof SqlSessionStorage.prototype.writeLinesAtomic === "function" &&
+	typeof SqlSessionStorage.prototype.writeLinesSync === "function";
+
+const BACKENDS: ReadonlyArray<{ adapter: SqlSessionStorageAdapter; url: string | undefined }> = [
+	{ adapter: "sqlite", url: "sqlite" },
+	{ adapter: "postgres", url: process.env.OMP_TEST_SQL_POSTGRES_URL },
+];
+
+const USAGE = {
+	input: 1,
+	output: 1,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 2,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+/**
+ * A current-version transcript of at least `bytes` UTF-8 bytes, as lines: a
+ * title slot, a header, then alternating user and assistant messages of about
+ * 100 KiB of one-, three- and four-byte characters, each a little longer than
+ * the one before, so 1 MiB cuts fall inside lines and inside characters.
+ */
+function transcriptLines(cwd: string, bytes: number): string[] {
+	const lines = [
+		serializeTitleSlot({ title: "Bounded transcript", source: "user", updatedAt: TIMESTAMP }),
+		`${JSON.stringify({ type: "session", version: 3, id: "bounded-io", timestamp: TIMESTAMP, cwd })}\n`,
+	];
+	let total = Buffer.byteLength(lines.join(""));
+	let parentId: string | null = null;
+	for (let n = 0; total < bytes; n++) {
+		const text = `${n} ${"a€😀b".repeat(11_000 + n)}`;
+		const message =
+			n % 2 === 0
+				? { role: "user", content: text, timestamp: n }
+				: {
+						role: "assistant",
+						content: [{ type: "text", text }],
+						api: "anthropic-messages",
+						provider: "anthropic",
+						model: "test-model",
+						usage: USAGE,
+						stopReason: "stop",
+						timestamp: n,
+					};
+		const line = `${JSON.stringify({ type: "message", id: `m${n}`, parentId, timestamp: TIMESTAMP, message })}\n`;
+		lines.push(line);
+		total += Buffer.byteLength(line);
+		parentId = `m${n}`;
+	}
+	return lines;
+}
+
+function sha256(data: string | Uint8Array): string {
+	return new Bun.CryptoHasher("sha256").update(data).digest("hex");
+}
+
+function byteSize(value: unknown): number {
+	if (typeof value === "string") return Buffer.byteLength(value);
+	if (value instanceof Uint8Array) return value.byteLength;
+	return 0;
+}
+
+/** The largest string or buffer an instrumented path saw, in UTF-8 bytes, and what it was. */
+class Longest {
+	bytes = 0;
+	what = "nothing";
+
+	note(bytes: number, what: string): void {
+		if (bytes <= this.bytes) return;
+		this.bytes = bytes;
+		this.what = what;
+	}
+
+	reset(): void {
+		this.bytes = 0;
+		this.what = "nothing";
+	}
+}
+
+function expectBounded(longest: Longest): void {
+	expect({ largest: longest.what, bytes: longest.bytes, bounded: longest.bytes <= BOUND }).toMatchObject({
+		bounded: true,
+	});
+}
+
+/**
+ * `client` behind a wrapper that notes every bound value, every returned value,
+ * and every query's returned values together; `before` runs ahead of each
+ * statement, inside its transaction.
+ */
+function instrument(
+	client: SqlClient,
+	longest: Longest,
+	before?: (query: string, values: unknown[] | undefined) => Promise<void>,
+): SqlSessionStorageClient {
+	const exec = async (
+		executor: SqlSessionStorageTransaction,
+		query: string,
+		values: unknown[] | undefined,
+	): Promise<SqlSessionStorageResult> => {
+		await before?.(query, values);
+		for (const value of values ?? []) longest.note(byteSize(value), "a value bound to a statement");
+		const rows = await executor.unsafe(query, values);
+		let returned = 0;
+		for (const row of rows as Array<Record<string, unknown>>) {
+			for (const value of Object.values(row)) {
+				longest.note(byteSize(value), "a value a statement returned");
+				returned += byteSize(value);
+			}
+		}
+		longest.note(returned, "the values one statement returned");
+		return rows;
+	};
+	return {
+		options: client.options,
+		unsafe: (query, values) => exec(client, query, values),
+		transaction: callback =>
+			client.transaction(async transaction =>
+				callback({ unsafe: (query, values) => exec(transaction, query, values) }),
+			),
+	};
+}
+
+async function* noteChunks(chunks: AsyncIterable<unknown>, longest: Longest, name: string): AsyncGenerator<unknown> {
+	for await (const chunk of chunks) {
+		longest.note(byteSize(chunk), `a chunk ${name} yielded`);
+		yield chunk;
+	}
+}
+
+/**
+ * `storage` behind a proxy that notes every string handed to or returned by
+ * its methods, each element of an array argument (a full write's lines), and
+ * each chunk a returned stream yields. Methods run on the storage itself.
+ */
+function recordStorage(storage: SqlSessionStorage, longest: Longest): SqlSessionStorage {
+	const noteValue = (value: unknown, what: string): void => {
+		if (Array.isArray(value)) for (const item of value) longest.note(byteSize(item), `an element of ${what}`);
+		else longest.note(byteSize(value), what);
+	};
+	return new Proxy(storage, {
+		get(target, key) {
+			const member: unknown = Reflect.get(target, key, target);
+			if (typeof member !== "function") return member;
+			const name = String(key);
+			return (...args: unknown[]) => {
+				for (const arg of args) noteValue(arg, `an argument of ${name}`);
+				const result: unknown = member.apply(target, args);
+				if (result instanceof Promise) {
+					return result.then((value: unknown) => {
+						noteValue(value, `the result of ${name}`);
+						return value;
+					});
+				}
+				if (typeof result === "object" && result !== null && Symbol.asyncIterator in result) {
+					return noteChunks(result as AsyncIterable<unknown>, longest, name);
+				}
+				noteValue(result, `the result of ${name}`);
+				return result;
+			};
+		},
+	});
+}
+
+let tableSeq = 0;
+
+/** One backend's database: a fresh table name, and the cleanup that drops it. */
+class Db {
+	readonly table = `omp_bounded_io_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
+	readonly client: SqlClient;
+	readonly #dir: TempDir | undefined;
+
+	constructor(
+		readonly adapter: SqlSessionStorageAdapter,
+		url: string,
+	) {
+		if (adapter === "sqlite") {
+			this.#dir = TempDir.createSync("@omp-sql-bounded-io-");
+			this.client = new SQL(`sqlite:${this.#dir.join("sessions.sqlite")}`);
+		} else {
+			this.client = new SQL(url);
+		}
+	}
+
+	open(client: SqlSessionStorageClient = this.client): Promise<SqlSessionStorage> {
+		return SqlSessionStorage.create({ client, table: this.table });
+	}
+
+	/** Run fixture SQL written with `?` placeholders on either dialect. */
+	async sql<Row>(query: string, values: unknown[] = []): Promise<Row[]> {
+		let n = 0;
+		const text = this.adapter === "postgres" ? query.replace(/\?/g, () => `$${++n}`) : query;
+		return (await this.client.unsafe(text, values)) as Row[];
+	}
+
+	stored(path: string): Promise<string | null> {
+		return readStoredSession(this.client, this.table, path, this.adapter);
+	}
+
+	/** Every staging path that holds parts, sorted. */
+	async stagingPaths(): Promise<string[]> {
+		const rows = await this.sql<{ path: string }>(`SELECT DISTINCT path FROM ${this.table}_parts`);
+		return rows
+			.map(row => row.path)
+			.filter(path => path.includes(STAGING))
+			.sort();
+	}
+
+	/** Insert a staging set by hand, as a writer killed between its staging writes and its swap leaves one. */
+	async stage(path: string, epochMs: number, id: string): Promise<string> {
+		const staging = `${path}${STAGING}${String(epochMs).padStart(13, "0")}-${id}`;
+		await this.sql(`INSERT INTO ${this.table}_parts (path, start_offset, content) VALUES (?, 0, ?), (?, 6, ?)`, [
+			staging,
+			"stale\n",
+			staging,
+			"bytes\n",
+		]);
+		return staging;
+	}
+
+	async close(): Promise<void> {
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await this.client.end();
+		this.#dir?.removeSync();
+	}
+}
+
+/**
+ * Store `lines` as a long session stores them: most as one full write, cut
+ * into 1 MiB parts at character boundaries rather than line ends, and the
+ * rest as appends of about 3 MiB, so the parts differ in size.
+ */
+async function storeTranscript(storage: SqlSessionStorage, path: string, lines: readonly string[]): Promise<void> {
+	const split = Math.floor((lines.length * 3) / 4);
+	await storage.writeText(path, lines.slice(0, split).join(""));
+	const writer = storage.openWriter(path);
+	let chunk = "";
+	let chunkBytes = 0;
+	for (const line of lines.slice(split)) {
+		chunk += line;
+		chunkBytes += Buffer.byteLength(line);
+		if (chunkBytes < 3 * MiB) continue;
+		await writer.append(chunk);
+		chunk = "";
+		chunkBytes = 0;
+	}
+	if (chunk) await writer.append(chunk);
+	await writer.close();
+	await storage.drain();
+}
+
+for (const { adapter, url } of BACKENDS) {
+	describe.skipIf(!url)(`SQL session storage keeps a long transcript out of memory (${adapter})`, () => {
+		const artifactsDir = "/sessions/p/long";
+		const readPath = `${artifactsDir}/Child.jsonl`;
+		let cwd: TempDir;
+		let db: Db;
+		let readLines: string[];
+		let readContent: string;
+
+		beforeAll(async () => {
+			cwd = TempDir.createSync("@omp-sql-bounded-io-cwd-");
+			db = new Db(adapter, url ?? "");
+			readLines = transcriptLines(cwd.path(), READ_BYTES);
+			readContent = readLines.join("");
+			await storeTranscript(await db.open(), readPath, readLines);
+		}, TIMEOUT);
+
+		afterAll(async () => {
+			await db?.close();
+			cwd?.removeSync();
+		});
+
+		it.skipIf(!streamsReads)(
+			"reads a transcript stored as parts not cut at line ends back byte for byte, a part at a time",
+			async () => {
+				const longest = new Longest();
+				const storage = await db.open(instrument(db.client, longest));
+				const hasher = new Bun.CryptoHasher("sha256");
+				let bytes = 0;
+				let largestChunk = 0;
+				for await (const chunk of storage.readChunks(readPath)) {
+					hasher.update(chunk);
+					bytes += chunk.byteLength;
+					largestChunk = Math.max(largestChunk, chunk.byteLength);
+				}
+				expect({ bytes, digest: hasher.digest("hex") }).toEqual({
+					bytes: Buffer.byteLength(readContent),
+					digest: sha256(readContent),
+				});
+				expect(largestChunk).toBeLessThanOrEqual(BOUND);
+				expectBounded(longest);
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"loads the entries a parse of the whole text gives, without a whole read",
+			async () => {
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const loaded = await loadSessionFile(readPath, storage);
+				expectBounded(longest);
+				expect(loaded.entries).toEqual(parseSessionContent(readContent).entries);
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"scans every line without a whole read",
+			async () => {
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const hasher = new Bun.CryptoHasher("sha256");
+				let lines = 0;
+				await storage.scanLines(readPath, line => {
+					if (lines > 0) hasher.update("\n");
+					hasher.update(line);
+					lines++;
+					return false;
+				});
+				expectBounded(longest);
+				// The lines `split("\n")` gives: one per newline, and the empty text after the last.
+				expect({ lines, digest: hasher.digest("hex") }).toEqual({
+					lines: readLines.length + 1,
+					digest: sha256(readContent),
+				});
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"builds the read-only transcript without a whole read",
+			async () => {
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const messages = await loadSessionMessagesReadOnly(readPath, storage);
+				expectBounded(longest);
+				expect(messages).toHaveLength(readLines.length - 2);
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"peeks a subagent's recorded directory without a whole read",
+			async () => {
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const peek = await SessionManager.peekSessionInit(readPath, storage);
+				expectBounded(longest);
+				expect(peek).toMatchObject({ cwd: cwd.path(), init: null });
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"copies a subagent transcript tree byte for byte, title included, without a whole read",
+			async () => {
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const copyDir = "/sessions/p/long-copy";
+				const copied = await copyTranscriptTree(storage, artifactsDir, copyDir);
+				expectBounded(longest);
+				const copy = `${copyDir}/Child.jsonl`;
+				expect(copied).toEqual([{ from: readPath, to: copy }]);
+				expect(sha256((await db.stored(copy)) ?? "")).toBe(sha256(readContent));
+				expect(await db.sql(`SELECT title, title_source FROM ${db.table} WHERE path = ?`, [copy])).toEqual([
+					{ title: "Bounded transcript", title_source: "user" },
+				]);
+				await storage.unlink(copy);
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"resumes through SessionManager.open without a value as long as the transcript",
+			async () => {
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const manager = await SessionManager.open(readPath, undefined, storage, { suppressBreadcrumb: true });
+				try {
+					expectBounded(longest);
+					expect(manager.getEntries()).toHaveLength(readLines.length - 2);
+				} finally {
+					await manager.close();
+				}
+			},
+			TIMEOUT,
+		);
+
+		it(
+			"rewrites a resumed session for a header change without a value as long as the transcript",
+			async () => {
+				const path = "/sessions/p/rewritten.jsonl";
+				await (await db.open()).writeText(path, transcriptLines(cwd.path(), WRITE_BYTES).join(""));
+				const longest = new Longest();
+				const storage = recordStorage(await db.open(instrument(db.client, longest)), longest);
+				const manager = await SessionManager.open(path, undefined, storage, { suppressBreadcrumb: true });
+				try {
+					longest.reset();
+					await manager.setTaskPromptCacheKey("bounded-io-cache-key");
+					expectBounded(longest);
+				} finally {
+					await manager.close();
+				}
+				const [head] = await (await db.open()).readTextSlices(path, 64 * 1024, 0);
+				expect(JSON.parse(head.split("\n")[1] ?? "null")).toMatchObject({
+					id: "bounded-io",
+					taskPromptCacheKey: "bounded-io-cache-key",
+				});
+			},
+			TIMEOUT,
+		);
+
+		for (const variant of ["writeLinesAtomic", "writeLinesSync"] as const) {
+			it.skipIf(!streamsWrites)(
+				`${variant} stores the bytes a whole write of the joined lines stores, with no value over 16 MiB`,
+				async () => {
+					const lines = transcriptLines(cwd.path(), WRITE_BYTES);
+					const reference = `/sessions/p/${variant}-whole.jsonl`;
+					const streamed = `/sessions/p/${variant}-streamed.jsonl`;
+					await (await db.open()).writeText(reference, lines.join(""));
+					const longest = new Longest();
+					const storage = await db.open(instrument(db.client, longest));
+					if (variant === "writeLinesAtomic") {
+						await storage.writeLinesAtomic(streamed, lines, { expectedSize: null });
+					} else {
+						storage.writeLinesSync(streamed, lines, { expectedSize: null });
+						await storage.drain();
+					}
+					expectBounded(longest);
+					expect(sha256((await db.stored(streamed)) ?? "")).toBe(sha256((await db.stored(reference)) ?? ""));
+					const rows = await db.sql<Record<string, unknown>>(
+						`SELECT path, byte_len, title, title_source, title_updated_at FROM ${db.table} WHERE path IN (?, ?)`,
+						[reference, streamed],
+					);
+					const row = (path: string) => {
+						const { path: _path, ...rest } = rows.find(found => found.path === path) ?? {};
+						return rest;
+					};
+					expect(row(streamed)).toEqual(row(reference));
+					expect(await db.stagingPaths()).toEqual([]);
+				},
+				TIMEOUT,
+			);
+		}
+
+		it.skipIf(!streamsWrites)(
+			"refuses a full write whose expected size no longer matches, leaving the bytes and no staging parts",
+			async () => {
+				const path = "/sessions/p/conflict.jsonl";
+				const base = transcriptLines(cwd.path(), 2 * MiB).join("");
+				const writer = await db.open();
+				await writer.writeText(path, base);
+				const stale = await db.open();
+				const appended = `${JSON.stringify({ type: "custom", customType: "other-writer", id: "x1", parentId: null, timestamp: TIMESTAMP })}\n`;
+				const append = writer.openWriter(path);
+				await append.append(appended);
+				await append.close();
+				await writer.drain();
+
+				const rewrite = stale.writeLinesAtomic(path, transcriptLines(cwd.path(), WRITE_BYTES), {
+					expectedSize: Buffer.byteLength(base),
+				});
+				await expect(rewrite).rejects.toBeInstanceOf(SessionWriteConflictError);
+				expect(sha256((await db.stored(path)) ?? "")).toBe(sha256(base + appended));
+				expect(await db.stagingPaths()).toEqual([]);
+			},
+			TIMEOUT,
+		);
+
+		it.skipIf(!streamsWrites)(
+			"deletes a killed writer's staging set over an hour old at the next full write, and never lists one",
+			async () => {
+				const path = "/sessions/p/staged.jsonl";
+				const other = "/sessions/p/other.jsonl";
+				const writer = await db.open();
+				await writer.writeText(path, "before\n");
+				await writer.writeText(other, "other\n");
+				const dead = await db.stage(path, Date.now() - 2 * HOUR_MS, "dead");
+				const live = await db.stage(path, Date.now(), "live");
+				const othersDead = await db.stage(other, Date.now() - 2 * HOUR_MS, "dead");
+
+				const storage = await db.open();
+				expect(storage.listAllSync().sort()).not.toContain(dead);
+				expect(storage.listFilesSync("/sessions/p", "*").filter(listed => listed.includes(STAGING))).toEqual([]);
+				expect(storage.existsSync(dead)).toBe(false);
+
+				const lines = transcriptLines(cwd.path(), 2 * MiB);
+				await storage.writeLinesAtomic(path, lines, { expectedSize: Buffer.byteLength("before\n") });
+				expect(sha256((await db.stored(path)) ?? "")).toBe(sha256(lines.join("")));
+				// A younger set may be a live writer's, and another path's sets are its own writer's to clear.
+				expect(await db.stagingPaths()).toEqual([live, othersDead].sort());
+				await db.sql(`DELETE FROM ${db.table}_parts WHERE path IN (?, ?)`, [live, othersDead]);
+			},
+			TIMEOUT,
+		);
+
+		it.skipIf(!streamsWrites)(
+			"refuses, as a conflict, a swap whose staging parts were deleted after they were written",
+			async () => {
+				const path = "/sessions/p/swept.jsonl";
+				await (await db.open()).writeText(path, "kept\n");
+				let swept = false;
+				// The swap's first statement naming the staging path reads it back; delete the set just before.
+				const sweepStaging = async (query: string, values: unknown[] | undefined): Promise<void> => {
+					if (swept || !query.trimStart().toUpperCase().startsWith("SELECT")) return;
+					const staging = values?.find(value => typeof value === "string" && /#staging-\d{13}-./.test(value));
+					if (typeof staging !== "string") return;
+					swept = true;
+					await db.sql(`DELETE FROM ${db.table}_parts WHERE path = ?`, [staging]);
+				};
+				const storage = await db.open(instrument(db.client, new Longest(), sweepStaging));
+				const rewrite = storage.writeLinesAtomic(path, transcriptLines(cwd.path(), 2 * MiB), {
+					expectedSize: Buffer.byteLength("kept\n"),
+				});
+				await expect(rewrite).rejects.toBeInstanceOf(SessionWriteConflictError);
+				expect(swept).toBe(true);
+				expect(await db.stored(path)).toBe("kept\n");
+				expect(await db.stagingPaths()).toEqual([]);
+			},
+			TIMEOUT,
+		);
+
+		it("deletes the staging parts under a session's artifacts directory with the session", async () => {
+			const session = "/sessions/p/doomed.jsonl";
+			const storage = await db.open();
+			await storage.writeText(session, "session\n");
+			await storage.writeText("/sessions/p/doomed/Sub.jsonl", "sub\n");
+			const own = await db.stage(session, Date.now(), "own");
+			const unfinished = await db.stage("/sessions/p/doomed/Sub.jsonl", Date.now(), "unfinished");
+			const neighbour = await db.stage("/sessions/p/doomed-not/Sub.jsonl", Date.now(), "neighbour");
+
+			await storage.deleteSessionWithArtifacts(session);
+
+			const remaining = await db.stagingPaths();
+			expect(remaining).not.toContain(own);
+			expect(remaining).not.toContain(unfinished);
+			expect(remaining).toContain(neighbour);
+			await db.sql(`DELETE FROM ${db.table}_parts WHERE path = ?`, [neighbour]);
+		});
+
+		it("deletes every staging set of a path, whatever its age, when the path is deleted", async () => {
+			const path = "/sessions/p/unlinked.jsonl";
+			const storage = await db.open();
+			await storage.writeText(path, "session\n");
+			await db.stage(path, Date.now() - 2 * HOUR_MS, "dead");
+			await db.stage(path, Date.now(), "live");
+			// A longer path that starts with this one names another session.
+			const neighbour = await db.stage(`${path}x`, Date.now(), "neighbour");
+
+			await storage.unlink(path);
+
+			const remaining = await db.stagingPaths();
+			expect(remaining.filter(staged => staged.startsWith(`${path}${STAGING}`))).toEqual([]);
+			expect(remaining).toContain(neighbour);
+			await db.sql(`DELETE FROM ${db.table}_parts WHERE path = ?`, [neighbour]);
+		});
+
+		it("deletes the staging sets of a renamed path and of the destination the rename replaces", async () => {
+			const src = "/sessions/p/renamed-from.jsonl";
+			const dst = "/sessions/p/renamed-to.jsonl";
+			const storage = await db.open();
+			await storage.writeText(src, "source\n");
+			await storage.writeText(dst, "replaced\n");
+			await db.stage(src, Date.now() - 2 * HOUR_MS, "dead");
+			await db.stage(src, Date.now(), "live");
+			await db.stage(dst, Date.now(), "replaced");
+
+			await storage.rename(src, dst);
+
+			const remaining = await db.stagingPaths();
+			expect(remaining.filter(staged => staged.startsWith(`${src}${STAGING}`))).toEqual([]);
+			expect(remaining.filter(staged => staged.startsWith(`${dst}${STAGING}`))).toEqual([]);
+			expect(await db.stored(dst)).toBe("source\n");
+		});
+
+		it("deletes the staging sets of a path renamed without replacing", async () => {
+			const src = "/sessions/p/moved-from.jsonl";
+			const dst = "/sessions/p/moved-to.jsonl";
+			const storage = await db.open();
+			await storage.writeText(src, "source\n");
+			await db.stage(src, Date.now(), "live");
+
+			await storage.renameNoReplace(src, dst);
+
+			expect((await db.stagingPaths()).filter(staged => staged.startsWith(`${src}${STAGING}`))).toEqual([]);
+			expect(await db.stored(dst)).toBe("source\n");
+		});
+	});
+}
