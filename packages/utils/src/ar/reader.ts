@@ -19,6 +19,21 @@ export function throwUnreadableArchiveLink(targetPath: string, memberPath: strin
 }
 
 /**
+ * `source.chunks(...args)`, or for a source without bounded reads the one
+ * `source.read(...args)` as a single chunk (see {@link MemberSource.chunks}).
+ */
+export async function* chunksOrWhole<Args extends unknown[]>(
+	source: {
+		read(...args: Args): Promise<Uint8Array>;
+		chunks?(...args: Args): AsyncIterable<Uint8Array>;
+	},
+	...args: Args
+): AsyncGenerator<Uint8Array> {
+	if (source.chunks) yield* source.chunks(...args);
+	else yield await source.read(...args);
+}
+
+/**
  * An indexed, read-only view over a single archive. Member payloads stay
  * lazy behind their format's `MemberSource`; symlink aliases are traversed
  * lazily so N files behind M directory aliases never inflate the index to
@@ -145,8 +160,7 @@ export class ArchiveReader {
 	 */
 	async *readFileChunks(subPath: string): AsyncGenerator<Uint8Array> {
 		const { path, entry, source } = this.#fileMember(subPath);
-		if (source.chunks) yield* source.chunks(entry.size, path);
-		else yield await source.read(entry.size, path);
+		yield* chunksOrWhole(source, entry.size, path);
 	}
 
 	/** The file member `subPath` names, following symlink aliases; throws when it is not a readable file. */

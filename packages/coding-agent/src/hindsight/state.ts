@@ -261,10 +261,10 @@ interface RetainedEntries {
 	versions: number;
 }
 
-/** Sum of the estimate versions of the user and assistant messages in `entries[0, through]`; reads no body. */
-function retainedMessageVersions(entries: readonly SessionEntry[], through: number): number {
+/** Sum of the estimate versions of the user and assistant messages in `entries[from, through]`; reads no body. */
+function retainedMessageVersions(entries: readonly SessionEntry[], from: number, through: number): number {
 	let versions = 0;
-	for (let index = 0; index <= through; index++) {
+	for (let index = from; index <= through; index++) {
 		const entry = entries[index]!;
 		if (entry.type !== "message") continue;
 		const role = entry.message.role;
@@ -514,13 +514,15 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		const entries = sessionManager.getEntries();
 		const covered = this.#retainedEntries;
 		let from = 0;
+		let coveredVersions = 0;
 		if (
 			covered &&
 			entries[0] === covered.first &&
 			entries[covered.lastIndex] === covered.last &&
-			retainedMessageVersions(entries, covered.lastIndex) === covered.versions
+			retainedMessageVersions(entries, 0, covered.lastIndex) === covered.versions
 		) {
 			from = covered.lastIndex + 1;
+			coveredVersions = covered.versions;
 		} else {
 			this.#resetRetentionCache();
 		}
@@ -531,7 +533,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			first: entries[0]!,
 			last: entries[lastIndex]!,
 			lastIndex,
-			versions: retainedMessageVersions(entries, lastIndex),
+			versions: coveredVersions + retainedMessageVersions(entries, from, lastIndex),
 		};
 		return { retain: () => this.#retainEntryMessages(covers, messages), messages: messages.length };
 	}

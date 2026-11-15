@@ -88,6 +88,33 @@ function shouldExternalizeImagePayload(
 	return true;
 }
 
+/**
+ * The node a persisted line holds for `value` when `value` is an image payload
+ * it externalizes (an `image_url` data URL, a generated image, a positioned
+ * image payload; see {@link isExternalizableImagePosition}), with the payload
+ * replaced by its blob reference; undefined for any other value.
+ */
+function externalizeImageNode(value: unknown, blobStore: BlobStore, key: string | undefined): unknown {
+	if (typeof value === "string") {
+		return key === "image_url" && isImageDataUrl(value) ? externalizeImageDataUrlSync(blobStore, value) : undefined;
+	}
+	if (typeof value !== "object" || value === null) return undefined;
+	if (
+		"type" in value &&
+		value.type === "image_generation_call" &&
+		"result" in value &&
+		typeof value.result === "string" &&
+		!isBlobRef(value.result) &&
+		value.result.length >= BLOB_EXTERNALIZE_THRESHOLD
+	) {
+		return { ...value, result: externalizeImagePayloadSync(blobStore, value, value.result, undefined) };
+	}
+	if (shouldExternalizeImagePayload(value, key)) {
+		return { ...value, data: externalizeImagePayloadSync(blobStore, value, value.data, value.mimeType) };
+	}
+	return undefined;
+}
+
 /** True for a non-empty string — marks signature/encrypted fields whose block must persist verbatim. */
 function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
@@ -184,20 +211,8 @@ function snapcompactArchiveNeedsRewrite(archive: Record<string, unknown>): boole
  */
 function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): unknown {
 	if (obj === null || obj === undefined) return obj;
-	if (
-		typeof obj === "object" &&
-		"type" in obj &&
-		obj.type === "image_generation_call" &&
-		"result" in obj &&
-		typeof obj.result === "string" &&
-		!isBlobRef(obj.result) &&
-		obj.result.length >= BLOB_EXTERNALIZE_THRESHOLD
-	) {
-		return { ...obj, result: externalizeImagePayloadSync(blobStore, obj, obj.result, undefined) };
-	}
-	if (shouldExternalizeImagePayload(obj, key)) {
-		return { ...obj, data: externalizeImagePayloadSync(blobStore, obj, obj.data, obj.mimeType) };
-	}
+	const image = externalizeImageNode(obj, blobStore, key);
+	if (image !== undefined) return image;
 	// Signed content is bound to its exact bytes: a truncated `thinking`/`text`/
 	// `arguments` no longer matches its signature and a truncated
 	// `redacted_thinking` blob is undecryptable, so the provider 400s the replay.
@@ -250,9 +265,6 @@ function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string
 	}
 
 	if (typeof obj === "string") {
-		if (key === "image_url" && isImageDataUrl(obj)) {
-			return externalizeImageDataUrlSync(blobStore, obj);
-		}
 		if (obj.length > MAX_PERSIST_CHARS) {
 			// Defensive: signature keys normally sit on blocks the guard above returns
 			// verbatim, but if one is reached here (unknown carrier shape), preserve it —
@@ -604,23 +616,9 @@ export function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStor
  * as the line does. Untouched subtrees are shared.
  */
 function externalizeImagesOnly(value: unknown, blobStore: BlobStore, key?: string): unknown {
-	if (typeof value === "string") {
-		return key === "image_url" && isImageDataUrl(value) ? externalizeImageDataUrlSync(blobStore, value) : value;
-	}
+	const image = externalizeImageNode(value, blobStore, key);
+	if (image !== undefined) return image;
 	if (typeof value !== "object" || value === null) return value;
-	if (
-		"type" in value &&
-		value.type === "image_generation_call" &&
-		"result" in value &&
-		typeof value.result === "string" &&
-		!isBlobRef(value.result) &&
-		value.result.length >= BLOB_EXTERNALIZE_THRESHOLD
-	) {
-		return { ...value, result: externalizeImagePayloadSync(blobStore, value, value.result, undefined) };
-	}
-	if (shouldExternalizeImagePayload(value, key)) {
-		return { ...value, data: externalizeImagePayloadSync(blobStore, value, value.data, value.mimeType) };
-	}
 	if (isAtomicPersistenceNode(value, key)) return value;
 	if (Array.isArray(value)) {
 		let changed: unknown[] | undefined;
@@ -658,9 +656,19 @@ export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string 
 	} catch (error) {
 		// A library object in `details` can carry a getter that throws when the
 		// walk probes it (see prepareEntryForPersistence); its plain JSON has none.
-		const json = stringifyJson(entry);
+		// A cause the clone does not remove fails again: the first error is kept.
+		let json: string | undefined;
+		try {
+			json = stringifyJson(entry);
+		} catch {
+			throw error;
+		}
 		if (json === undefined) throw error;
-		externalized = externalizeImagesOnly(JSON.parse(json), blobStore);
+		try {
+			externalized = externalizeImagesOnly(JSON.parse(json), blobStore);
+		} catch {
+			throw error;
+		}
 	}
 	return stringifyJson(externalized) ?? "null";
 }

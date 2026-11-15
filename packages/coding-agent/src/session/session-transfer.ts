@@ -32,13 +32,14 @@ import {
 	assertInMemorySize,
 	formatArchivePathForError,
 	openArchive,
+	writeChunksToFile,
 	writeTarArchive,
 } from "@oh-my-pi/pi-utils/ar";
 import transferArrivedTemplate from "../prompts/session/transfer-arrived.md" with { type: "text" };
 import transferDepartedTemplate from "../prompts/session/transfer-departed.md" with { type: "text" };
 import transferStaleForkTemplate from "../prompts/session/transfer-stale-fork.md" with { type: "text" };
 import { replaceFileAtomically } from "../utils/atomic-file";
-import { BLOB_HASH_RE, BlobStore } from "./blob-store";
+import { BLOB_HASH_RE, BLOB_PREFIX, BlobStore } from "./blob-store";
 import type { FileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { findSessionFiles } from "./session-listing";
 import {
@@ -129,7 +130,7 @@ const ARTIFACTS_PREFIX = "artifacts/";
 const BLOBS_PREFIX = "blobs/";
 const BLOB_REF_RE = /\bblob:sha256:([a-f0-9]{64})\b/g;
 /** Characters one {@link BLOB_REF_RE} match spans, plus the one before it that its leading `\b` reads. */
-const BLOB_REF_SPAN = "blob:sha256:".length + 64 + 1;
+const BLOB_REF_SPAN = BLOB_PREFIX.length + 64 + 1;
 /** Ids name files and leases; anything else in an archive header is refused. */
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const ARCHIVE_SIZE_LIMIT = 2 * 1024 * 1024 * 1024;
@@ -277,25 +278,12 @@ async function collectBlobHashes(chunks: AsyncIterable<Uint8Array>, into: Set<st
 	scan(carried + decoder.decode(), true);
 }
 
-/** Stream `chunks` into the new file `file`, each chunk also fed to `digest` when given. */
-async function writeChunksToFile(file: string, chunks: AsyncIterable<Uint8Array>, digest?: Bun.SHA256): Promise<void> {
-	const sink = Bun.file(file).writer();
-	try {
-		for await (const chunk of chunks) {
-			digest?.update(chunk);
-			const written = sink.write(chunk);
-			if (typeof written !== "number") await written;
-		}
-	} catch (error) {
-		try {
-			// Release the descriptor so the staging directory can be removed.
-			await sink.end();
-		} catch {
-			// The read or write failure is the error worth reporting.
-		}
-		throw error;
+/** `chunks`, each fed to `digest` as it passes. */
+async function* digestedChunks(chunks: AsyncIterable<Uint8Array>, digest: Bun.SHA256): AsyncGenerator<Uint8Array> {
+	for await (const chunk of chunks) {
+		digest.update(chunk);
+		yield chunk;
 	}
-	await sink.end();
 }
 
 /** Files under `dir` as `/`-separated relative paths, sorted; empty when `dir` does not exist. Symlinks are skipped. */
@@ -390,18 +378,14 @@ export async function packSession(sessionFile: string, outPath: string): Promise
 			}
 		}
 
-		const blobsDir = getBlobsDir();
+		const blobs = new BlobStore(getBlobsDir());
 		const missingBlobs: string[] = [];
 		for (const hash of [...hashes].sort()) {
-			const blobPath = path.join(blobsDir, hash);
-			try {
-				await fs.promises.stat(blobPath);
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
+			if (blobs.sizeSync(hash) === null) {
 				missingBlobs.push(hash);
 				continue;
 			}
-			members.push([`${BLOBS_PREFIX}${hash}`, Bun.file(blobPath)]);
+			members.push([`${BLOBS_PREFIX}${hash}`, Bun.file(blobs.blobPath(hash))]);
 		}
 		if (missingBlobs.length > 0) {
 			logger.warn("Packing session without blobs missing from the local store", { id, missingBlobs });
@@ -491,7 +475,8 @@ async function readSessionArchive(archive: string, staging: TempDir): Promise<Se
 			const file = staging.join(`member-${members.length}`);
 			const hash = blobMemberHash(entry.path);
 			const digest = hash === undefined ? undefined : new Bun.SHA256();
-			await writeChunksToFile(file, reader.readFileChunks(entry.path), digest);
+			const chunks = reader.readFileChunks(entry.path);
+			await writeChunksToFile(file, digest ? digestedChunks(chunks, digest) : chunks);
 			const actual = digest?.digest("hex");
 			if (actual !== hash) {
 				throw new SessionTransferError(

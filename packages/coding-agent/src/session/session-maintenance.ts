@@ -100,7 +100,7 @@ import {
 import {
 	assistantTurnDelivered,
 	convertToLlm,
-	countStrippableImages,
+	hasStrippableImages,
 	invalidateConvertToLlmArrayCache,
 	isUserAuthoredMessage,
 	stripImagesFromMessage,
@@ -890,7 +890,7 @@ export class SessionMaintenance {
 			if (entry.type === "message") {
 				// A body read back from the cold store is frozen: only an entry that
 				// carries images is made whole and rewritten.
-				if (countStrippableImages(entry.message) === 0) continue;
+				if (!hasStrippableImages(entry.message)) continue;
 				const { dropped, saved } = this.#host.sessionManager.updateEntryBody(entry.id, () => {
 					const before = this.#tokenizer.countMessage(entry.message, countOptions);
 					const strippedCount = stripImagesFromMessage(entry.message);

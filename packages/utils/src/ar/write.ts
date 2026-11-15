@@ -2,7 +2,7 @@ import { encodeAsar } from "./asar";
 import { gzipCompress } from "./codecs/gzip";
 import { zstdCompress } from "./codecs/zstd";
 import { memberContentToBytes } from "./open";
-import { encodeTar, writeTarFile } from "./tar";
+import { encodeTar, type TarMemberPayload, writeTarFile } from "./tar";
 import type { ArchiveFormat, ArchiveMemberContent, WritableArchiveFormat } from "./types";
 import { encodeZip } from "./zip";
 
@@ -22,6 +22,18 @@ export function isWritableArchiveFormat(format: ArchiveFormat): format is Writab
 }
 
 /**
+ * `entries` as they are packed, one at a time: member names normalized to
+ * forward slashes, string members encoded as UTF-8, a `Blob` left unread.
+ */
+function* packedMembers(
+	entries: Iterable<readonly [string, ArchiveMemberContent]>,
+): Generator<readonly [string, TarMemberPayload]> {
+	for (const [name, content] of entries) {
+		yield [name.replace(/\\/g, "/"), typeof content === "string" ? TEXT_ENCODER.encode(content) : content];
+	}
+}
+
+/**
  * Serialize `entries` into an archive of `format` in memory. String members
  * are encoded as UTF-8; member names are normalized to forward slashes.
  */
@@ -30,8 +42,8 @@ export async function encodeArchive(
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,
 ): Promise<Uint8Array> {
 	const members: (readonly [string, Uint8Array])[] = [];
-	for (const [name, content] of entries) {
-		members.push([name.replace(/\\/g, "/"), await memberContentToBytes(content)] as const);
+	for (const [name, payload] of packedMembers(entries)) {
+		members.push([name, await memberContentToBytes(payload)] as const);
 	}
 	switch (format) {
 		case "zip":
@@ -65,10 +77,5 @@ export async function writeTarArchive(
 	destPath: string,
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,
 ): Promise<void> {
-	const members = Array.from(
-		entries,
-		([name, content]) =>
-			[name.replace(/\\/g, "/"), typeof content === "string" ? TEXT_ENCODER.encode(content) : content] as const,
-	);
-	await writeTarFile(destPath, members);
+	await writeTarFile(destPath, packedMembers(entries));
 }

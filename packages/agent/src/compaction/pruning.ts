@@ -312,8 +312,8 @@ function resolveBoundaryIndex(entries: readonly SessionEntry[], keepBoundaryId: 
 
 /**
  * Tool calls of a summarized-away prefix `entries[0, length)` by call id: the
- * assistant entry holding each call, the call itself read from it only when it
- * is looked up, so the index keeps no history body in memory.
+ * assistant entry holding each call, and in `resolved` the calls lookups have
+ * read from those entries, arguments included.
  */
 interface PrefixToolCalls {
 	readonly length: number;
@@ -325,8 +325,9 @@ interface PrefixToolCalls {
 /**
  * The latest prefix index by the first entry of its branch. A branch prefix is
  * the path from the root to its boundary, so one index serves every pass while
- * the cut and the branch stay; a new cut or another branch replaces it, so an
- * older compaction's index never outlives the next one built for the session.
+ * the boundary and the branch stay; a new boundary or another branch replaces
+ * it, so an older compaction's index never outlives the next one built for the
+ * session.
  */
 const prefixToolCalls = new WeakMap<SessionEntry, PrefixToolCalls>();
 
@@ -363,7 +364,7 @@ function prefixToolCall(index: PrefixToolCalls, id: string): AgentToolCall | und
 /**
  * Tool-call lookup for results in the sent region `entries[start, end)`.
  * Calls there are indexed eagerly; the summarized-away prefix is indexed only
- * on the first miss, once per cut position and branch (see
+ * on the first miss, once per boundary and branch (see
  * {@link prefixToolCallIndex}), so lookups match a whole-branch scan while
  * repeated passes never walk history the boundary already excludes.
  */

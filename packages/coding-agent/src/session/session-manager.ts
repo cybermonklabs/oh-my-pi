@@ -462,6 +462,11 @@ function normalizeLoadedUsage(entries: SessionEntry[]): number {
 	return repaired;
 }
 
+/** Report the assistant messages a load completed the usage of. */
+function warnRepairedUsage(count: number): void {
+	if (count > 0) logger.warn("Loaded assistant messages with incomplete usage", { count });
+}
+
 function addUsage(target: UsageStatistics, usage: Usage | undefined): void {
 	if (!usage) return;
 	target.input += usage.input;
@@ -1126,7 +1131,6 @@ export class SessionManager {
 	#coldStore: ColdEntryStore | undefined;
 	/** The model the cut was last computed for (see `coldCutIndex`); unset until a context build names one. */
 	#coldCutModel: Model | undefined;
-	#coldCutModelKey: string | undefined;
 	/** The leaf, the entries or the newest compaction changed since the cut was last applied. */
 	#coldCutStale = false;
 
@@ -2324,23 +2328,32 @@ export class SessionManager {
 	}
 
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
-		this.#header = header;
+		this.#adoptHeader(header);
 		this.#entries = entries;
+		warnRepairedUsage(normalizeLoadedUsage(entries));
+		this.#index.rebuild(entries);
+	}
+
+	/** Take the session's identity and title from a loaded `header`. */
+	#adoptHeader(header: SessionHeader): void {
+		this.#header = header;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
-		const repairedUsage = normalizeLoadedUsage(entries);
-		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
-		this.#index.rebuild(entries);
 	}
 
 	/** Start over with `store` as the cold store: the cut is computed again, for no model yet. */
 	#resetColdCut(store: ColdEntryStore | undefined): void {
 		this.#coldStore = store;
 		this.#coldCutModel = undefined;
-		this.#coldCutModelKey = undefined;
 		this.#coldCutStale = false;
+	}
+
+	/** The store new cold entries go to, created on first use. */
+	#openColdStore(): ColdEntryStore {
+		this.#coldStore ??= new ColdEntryStore(this.#blobs);
+		return this.#coldStore;
 	}
 
 	/**
@@ -2350,10 +2363,7 @@ export class SessionManager {
 	 */
 	#applyColdBoundary(boundary: ColdBoundary, phase: "hydrate" | "convert"): void {
 		const entries = this.#entries;
-		const openStore = () => {
-			this.#coldStore ??= new ColdEntryStore(this.#blobs);
-			return this.#coldStore;
-		};
+		const openStore = () => this.#openColdStore();
 		for (let index = 0; index < entries.length; index++) {
 			const entry = entries[index]!;
 			const cold = belongsCold(entry, index, boundary);
@@ -2375,11 +2385,11 @@ export class SessionManager {
 	#staleColdBoundary(options: BuildSessionContextOptions | undefined): ColdBoundary | undefined {
 		if (!this.#coldStoreEnabled) return undefined;
 		const model = options?.transcript ? undefined : options?.model;
-		if (model && (this.#coldCutStale || this.#coldCutModelKey === undefined)) {
+		const current = this.#coldCutModel;
+		if (model && (this.#coldCutStale || current === undefined)) {
 			const key = `${model.provider}\u0000${model.api}`;
-			if (key !== this.#coldCutModelKey) {
+			if (current === undefined || key !== `${current.provider}\u0000${current.api}`) {
 				this.#coldCutModel = model;
-				this.#coldCutModelKey = key;
 				this.#coldCutStale = true;
 			}
 		}
@@ -2737,17 +2747,11 @@ export class SessionManager {
 
 	/** Make a {@link LoadedTranscript} this manager's entries, under `header`. */
 	#adoptLoadedTranscript(header: SessionHeader, loaded: LoadedTranscript): void {
-		this.#header = header;
+		this.#adoptHeader(header);
 		this.#entries = loaded.entries;
 		this.#index = loaded.index;
 		this.#resetColdCut(loaded.coldStore);
-		this.#sessionId = header.id;
-		this.#sessionName = header.title;
-		this.#titleSource = header.titleSource;
-		this.#titleUpdatedAt = header.timestamp;
-		if (loaded.repairedUsage > 0) {
-			logger.warn("Loaded assistant messages with incomplete usage", { count: loaded.repairedUsage });
-		}
+		warnRepairedUsage(loaded.repairedUsage);
 		SessionManager.#releaseLoadedTranscript(loaded);
 	}
 
@@ -4565,12 +4569,7 @@ export class SessionManager {
 		if (!entry) throw new Error(`Entry ${id} not found`);
 		const wasCold = hydrateColdEntry(entry);
 		const result = update(entry);
-		if (wasCold) {
-			convertToColdEntry(entry, () => {
-				this.#coldStore ??= new ColdEntryStore(this.#blobs);
-				return this.#coldStore;
-			});
-		}
+		if (wasCold) convertToColdEntry(entry, () => this.#openColdStore());
 		return result;
 	}
 

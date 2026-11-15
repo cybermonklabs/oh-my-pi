@@ -851,24 +851,62 @@ function stripImagesFromArrayContent(content: (TextContent | ImageContent)[]): S
  * pure local mutation and intentionally does neither.
  */
 export function stripImagesFromMessage(message: AgentMessage): number {
-	const removed = stripImagesFromMessageContent(message, true);
+	const removed = stripImagesFromMessageContent(message);
 	// The mutated message keeps its identity across context rebuilds, so drop its
 	// cached estimate/convert before the next pass counts/converts the new shape.
 	if (removed > 0) invalidateMessageCache(message);
 	return removed;
 }
 
-/** How many images {@link stripImagesFromMessage} would remove from `message`, which stays unchanged. */
-export function countStrippableImages(message: AgentMessage): number {
-	return stripImagesFromMessageContent(message, false);
+/** Whether {@link stripImagesFromMessage} would remove an image from `message`, which stays unchanged. */
+export function hasStrippableImages(message: AgentMessage): boolean {
+	switch (message.role) {
+		case "bashExecution":
+			return (message.images?.length ?? 0) > 0;
+		case "user":
+		case "developer":
+		case "custom":
+		case "hookMessage":
+			if (typeof message.content === "string") return false;
+			return hasImageBlock(message.content);
+		case "toolResult": {
+			if (hasImageBlock(message.content)) return true;
+			const details = message.details as { images?: unknown } | null | undefined;
+			if (!details || !Array.isArray(details.images)) return false;
+			for (const candidate of details.images as unknown[]) {
+				if (
+					typeof candidate === "object" &&
+					candidate !== null &&
+					"type" in candidate &&
+					candidate.type === "image"
+				) {
+					return true;
+				}
+			}
+			return false;
+		}
+		case "fileMention":
+			for (const file of message.files) {
+				if (file.image) return true;
+			}
+			return false;
+		default:
+			return false;
+	}
 }
 
-/** Count the images of `message` and, when `apply`, remove them in place. */
-function stripImagesFromMessageContent(message: AgentMessage, apply: boolean): number {
+function hasImageBlock(content: readonly (TextContent | ImageContent)[]): boolean {
+	for (const part of content) {
+		if (part.type === "image") return true;
+	}
+	return false;
+}
+
+function stripImagesFromMessageContent(message: AgentMessage): number {
 	switch (message.role) {
 		case "bashExecution": {
 			const removed = message.images?.length ?? 0;
-			if (removed > 0 && apply) message.images = undefined;
+			if (removed > 0) message.images = undefined;
 			return removed;
 		}
 		case "user":
@@ -877,7 +915,7 @@ function stripImagesFromMessageContent(message: AgentMessage, apply: boolean): n
 		case "hookMessage": {
 			if (typeof message.content === "string") return 0;
 			const { content, removed } = stripImagesFromArrayContent(message.content);
-			if (removed > 0 && apply) {
+			if (removed > 0) {
 				// All four roles type `content` as `string | (TextContent | ImageContent)[]`;
 				// TypeScript can't narrow the assignment across the union, so cast once.
 				(message as { content: typeof content }).content = content;
@@ -888,7 +926,7 @@ function stripImagesFromMessageContent(message: AgentMessage, apply: boolean): n
 			let removed = 0;
 			const { content, removed: contentRemoved } = stripImagesFromArrayContent(message.content);
 			if (contentRemoved > 0) {
-				if (apply) message.content = content;
+				message.content = content;
 				removed += contentRemoved;
 			}
 			const details = message.details as { images?: unknown } | null | undefined;
@@ -904,7 +942,7 @@ function stripImagesFromMessageContent(message: AgentMessage, apply: boolean): n
 						kept.push(candidate);
 					}
 				}
-				if (apply && kept.length !== original.length) {
+				if (kept.length !== original.length) {
 					details.images = kept;
 				}
 			}
@@ -914,7 +952,7 @@ function stripImagesFromMessageContent(message: AgentMessage, apply: boolean): n
 			let removed = 0;
 			for (const file of message.files) {
 				if (file.image) {
-					if (apply) file.image = undefined;
+					file.image = undefined;
 					removed++;
 				}
 			}

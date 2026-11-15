@@ -1,11 +1,5 @@
 import { Snowflake } from "@oh-my-pi/pi-utils";
-import {
-	type CompactionEntry,
-	CURRENT_SESSION_VERSION,
-	type FileEntry,
-	type SessionEntry,
-	type SessionHeader,
-} from "./session-entries";
+import { type CompactionEntry, CURRENT_SESSION_VERSION, type FileEntry, type SessionHeader } from "./session-entries";
 
 /** Generate a unique short ID (8 hex chars, collision-checked) */
 export function generateId(byId: { has(id: string): boolean }): string {
@@ -16,8 +10,11 @@ export function generateId(byId: { has(id: string): boolean }): string {
 	return Snowflake.next(); // fallback to full snowflake id
 }
 
-/** The part of an entry the v1 → v2 migration reads back when it maps `firstKeptEntryIndex`. */
-type MigratedEntryRef = Pick<SessionHeader, "type"> | Pick<SessionEntry, "type" | "id">;
+/** A compaction as a v1 file holds it: the entry it keeps from is named by file index. */
+type V1Compaction = Omit<CompactionEntry, "firstKeptEntryId"> & {
+	firstKeptEntryId?: string;
+	firstKeptEntryIndex?: number;
+};
 
 /** Ids the v1 → v2 migration has assigned so far, in file order. */
 interface V1ToV2State {
@@ -27,13 +24,14 @@ interface V1ToV2State {
 
 /**
  * v1 → v2 for one entry, in file order: assign its id and parent, and turn a
- * compaction's `firstKeptEntryIndex` into the id of the entry `entryAt` finds
- * at that file index. Mutates in place.
+ * compaction's `firstKeptEntryIndex` into the `firstKeptEntryId` that
+ * `keptEntryId` gives for that file index, or leave `firstKeptEntryId` as it
+ * is when that is `null`. Mutates in place.
  */
 function migrateEntryV1ToV2(
 	entry: FileEntry,
 	state: V1ToV2State,
-	entryAt: (index: number) => MigratedEntryRef | undefined,
+	keptEntryId: (index: number) => string | undefined | null,
 ): void {
 	if (entry.type === "session") {
 		entry.version = 2;
@@ -47,12 +45,10 @@ function migrateEntryV1ToV2(
 
 	// Convert firstKeptEntryIndex to firstKeptEntryId for compaction
 	if (entry.type === "compaction") {
-		const comp = entry as CompactionEntry & { firstKeptEntryIndex?: number };
+		const comp = entry as V1Compaction;
 		if (typeof comp.firstKeptEntryIndex === "number") {
-			const targetEntry = entryAt(comp.firstKeptEntryIndex);
-			if (targetEntry && targetEntry.type !== "session") {
-				comp.firstKeptEntryId = targetEntry.id;
-			}
+			const id = keptEntryId(comp.firstKeptEntryIndex);
+			if (id !== null) comp.firstKeptEntryId = id;
 			delete comp.firstKeptEntryIndex;
 		}
 	}
@@ -79,20 +75,24 @@ export function lacksEntryId(entry: FileEntry): boolean {
 }
 
 /**
- * The migrations a session needs, applied one entry at a time in file order,
- * so a streamed load migrates each entry as it arrives. `unindexed` is
+ * The migrations a session needs, applied one entry at a time in file order:
+ * a streamed load migrates each entry as it arrives, and
+ * {@link migrateToCurrentVersion} migrates a whole file's entries the same
+ * way. `header` is the file's first header, if it has one; `unindexed` is
  * whether the file has non-header entries and none of them has an id (see
  * {@link lacksEntryId}); a current-version file needs it to decide.
  */
 export class SessionEntryMigration {
+	readonly #header: SessionHeader | undefined;
 	readonly #v1ToV2: boolean;
 	readonly #v2ToV3: boolean;
 	readonly #state: V1ToV2State = { ids: new Set(), prevId: null };
-	/** What each entry seen so far left for a later compaction's `firstKeptEntryIndex`, by file index. */
-	readonly #seen: MigratedEntryRef[] = [];
+	/** The id each entry seen so far was given, `null` for a header, by file index. */
+	readonly #seenIds: (string | null)[] = [];
 
-	constructor(header: SessionHeader, unindexed: boolean) {
-		const version = header.version ?? 1;
+	constructor(header: SessionHeader | undefined, unindexed: boolean) {
+		this.#header = header;
+		const version = header?.version ?? 1;
 		this.#v1ToV2 = version < 2 || unindexed;
 		this.#v2ToV3 = version < 3;
 		this.needed = version < CURRENT_SESSION_VERSION || unindexed;
@@ -105,11 +105,20 @@ export class SessionEntryMigration {
 	migrate(entry: FileEntry): void {
 		if (!this.needed) return;
 		if (this.#v1ToV2) {
-			migrateEntryV1ToV2(entry, this.#state, index => this.#seen[index]);
-			this.#seen.push(entry.type === "session" ? { type: entry.type } : { type: entry.type, id: entry.id });
+			const position = this.#seenIds.length;
+			migrateEntryV1ToV2(entry, this.#state, index => {
+				// The compaction itself, which holds its new id by now.
+				if (index === position) return entry.id;
+				// An entry not read yet. A v1 entry carries no id, and an id it does
+				// carry names no entry once the migration has given each one a new id.
+				if (index > position && Number.isInteger(index)) return undefined;
+				return this.#seenIds[index] ?? null;
+			});
+			this.#seenIds.push(entry.type === "session" ? null : entry.id);
 		}
 		if (this.#v2ToV3) migrateEntryV2ToV3(entry);
-		else if (entry.type === "session") entry.version = CURRENT_SESSION_VERSION;
+		// Only the file's first header: v1 → v2 leaves any later one at version 2.
+		else if (entry === this.#header) entry.version = CURRENT_SESSION_VERSION;
 	}
 }
 
@@ -119,19 +128,11 @@ export class SessionEntryMigration {
  */
 export function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 	const header = entries.find(e => e.type === "session") as SessionHeader | undefined;
-	const version = header?.version ?? 1;
 	const hasNonHeaderEntries = entries.some(e => e.type !== "session");
 	const unindexed = hasNonHeaderEntries && entries.every(e => e.type === "session" || lacksEntryId(e));
-
-	if (version >= CURRENT_SESSION_VERSION && !unindexed) return false;
-
-	if (version < 2 || unindexed) {
-		const state: V1ToV2State = { ids: new Set(), prevId: null };
-		for (const entry of entries) migrateEntryV1ToV2(entry, state, index => entries[index]);
-	}
-	if (version < 3) {
-		for (const entry of entries) migrateEntryV2ToV3(entry);
-	} else if (header) header.version = CURRENT_SESSION_VERSION;
+	const migration = new SessionEntryMigration(header, unindexed);
+	if (!migration.needed) return false;
+	for (const entry of entries) migration.migrate(entry);
 	return true;
 }
 

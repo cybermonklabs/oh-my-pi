@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { bytesMatchAscii, indexOfAscii } from "./bytes";
 import { resolveArchiveLinkPath, upsertArchiveEntry } from "./entries";
 import { ArchiveError } from "./error";
+import { writeChunksToFile } from "./file-sink";
 import {
 	type ArchiveLimits,
 	assertArchiveMemberSize,
@@ -16,7 +17,8 @@ import {
 	normalizeArchiveEntryPath,
 	normalizeArchiveLookupPath,
 } from "./paths";
-import { type ByteSource, readByteSourceChunks, STREAM_CHUNK_SIZE } from "./source";
+import { chunksOrWhole } from "./reader";
+import { type ByteSource, readByteSourceChunks } from "./source";
 import type { ArchiveIndexEntry, FormatReader, FormatReadOptions, MemberSource } from "./types";
 
 const BLOCK_SIZE = 512;
@@ -181,16 +183,17 @@ class TarSourcePayload implements TarPayload {
 		}
 	}
 
-	/** {@link read} as reads of at most {@link STREAM_CHUNK_SIZE} bytes, with the same checks. */
+	/** {@link read} as the bounded reads of {@link readByteSourceChunks}, with the same checks. */
 	async *chunks(offset: number, size: number, memberPath: string): AsyncGenerator<Uint8Array> {
 		let remaining = size;
 		try {
 			for await (const bytes of readByteSourceChunks(this.#source, offset, offset + size)) {
-				if (bytes.byteLength !== Math.min(remaining, STREAM_CHUNK_SIZE)) {
-					throw new ArchiveError(`Archive member '${formatArchivePathForError(memberPath)}' is truncated`);
-				}
 				remaining -= bytes.byteLength;
+				if (remaining < 0) break;
 				yield bytes;
+			}
+			if (remaining !== 0) {
+				throw new ArchiveError(`Archive member '${formatArchivePathForError(memberPath)}' is truncated`);
 			}
 		} catch (error) {
 			throw tarMemberReadError(error);
@@ -278,8 +281,7 @@ class TarMemberSource implements MemberSource {
 
 	async *chunks(size: number, memberPath: string): AsyncGenerator<Uint8Array> {
 		this.#refuseSparse(memberPath);
-		if (this.#payload.chunks) yield* this.#payload.chunks(this.#dataOffset, size, memberPath);
-		else yield await this.#payload.read(this.#dataOffset, size, memberPath);
+		yield* chunksOrWhole(this.#payload, this.#dataOffset, size, memberPath);
 	}
 
 	#refuseSparse(memberPath: string): void {
@@ -1043,41 +1045,30 @@ export async function writeTarFile(
 ): Promise<void> {
 	// Bun.write creates the parent directories and truncates an existing file; a file sink does neither.
 	await Bun.write(destPath, "");
-	const sink = Bun.file(destPath).writer();
-	const write = async (bytes: Uint8Array): Promise<void> => {
-		const written = sink.write(bytes);
-		if (typeof written !== "number") await written;
-	};
-	try {
-		const encoder = new TarEncoder();
-		for (const [rawPath, payload] of members) {
-			for (const block of encoder.member(rawPath, payload)) {
-				if (block instanceof Uint8Array) {
-					await write(block);
-					continue;
-				}
-				let streamed = 0;
-				for await (const chunk of block.stream()) {
-					streamed += chunk.byteLength;
-					if (streamed > block.size) break;
-					await write(chunk);
-				}
-				if (streamed !== block.size) {
-					throw new ArchiveError(
-						`Tar member '${formatArchivePathForError(rawPath)}' changed size while it was written`,
-					);
-				}
+	await writeChunksToFile(destPath, tarFileChunks(members));
+}
+
+/** The bytes of {@link writeTarFile}'s archive in order, a `Blob` payload as its stream yields them. */
+async function* tarFileChunks(members: Iterable<readonly [string, TarMemberPayload]>): AsyncGenerator<Uint8Array> {
+	const encoder = new TarEncoder();
+	for (const [rawPath, payload] of members) {
+		for (const block of encoder.member(rawPath, payload)) {
+			if (block instanceof Uint8Array) {
+				yield block;
+				continue;
+			}
+			let streamed = 0;
+			for await (const chunk of block.stream()) {
+				streamed += chunk.byteLength;
+				if (streamed > block.size) break;
+				yield chunk;
+			}
+			if (streamed !== block.size) {
+				throw new ArchiveError(
+					`Tar member '${formatArchivePathForError(rawPath)}' changed size while it was written`,
+				);
 			}
 		}
-		await write(new Uint8Array(BLOCK_SIZE * 2));
-	} catch (error) {
-		try {
-			// Release the descriptor so the caller can remove the partial file.
-			await sink.end();
-		} catch {
-			// The write failure is the error worth reporting.
-		}
-		throw error;
 	}
-	await sink.end();
+	yield new Uint8Array(BLOCK_SIZE * 2);
 }
