@@ -1277,7 +1277,7 @@ class PromptError:
     model: str | None = None
     http_status: int | None = None
     code: Literal["cost_cap", "session_busy"] | None = None
-    """`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited 30 s and another run still held the agent."""
+    """`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `session_busy`: the agent was busy: the prompt was refused, or it waited at least 30 s and another run still held the agent."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
