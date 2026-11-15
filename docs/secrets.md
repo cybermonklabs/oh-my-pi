@@ -184,14 +184,14 @@ A provider checks some blocks byte for byte when it replays a session. When mask
 
 ### Cost
 
-With the setting off, a session write checks one flag and does nothing more. With it on, `packages/coding-agent/bench/session-store-mask.bench.ts` measured these wall-clock times on 2026-11-15, at commit `2e4cc1f6cb7c` of the fork's release line: Bun 1.4.4, a 4-CPU container in a gVisor sandbox, the median of five runs. The typical masker holds nine values from environment variables and `_FILE` files. The heavy masker holds 59 values and five regex entries. The rewritten session has 5,000 entries, 104 MiB of serialized text, and a held value in one entry of ten.
+With the setting off, a session write checks one flag and does nothing more. With it on, `packages/coding-agent/bench/session-store-mask.bench.ts` measured these wall-clock times on 2026-11-15, at commit `80672a04fcf0` of the fork's release line: Bun 1.4.4, a 4-CPU container in a gVisor sandbox, the median of five runs. The typical masker holds nine values from environment variables and `_FILE` files. The heavy masker holds 59 values and five regex entries. The rewritten session has 5,000 entries, 104 MiB of serialized text, and a held value in one entry of ten.
 
 | Case                                   | Typical masker: off → on | Heavy masker: off → on |
 | -------------------------------------- | ------------------------ | ---------------------- |
-| Build the masker at the first write    | 0.43 ms                  | 0.84 ms                |
-| Append a 2 KB message                  | 0.06 → 0.13 ms           | 0.03 → 0.11 ms         |
-| Append a 500,000-character tool result | 0.97 → 2.46 ms           | 0.98 → 11.05 ms        |
-| Rewrite the 5,000-entry session        | 241 → 595 ms             | 238 → 1,221 ms         |
+| Build the masker at the first write    | 0.39 ms                  | 0.79 ms                |
+| Append a 2 KB message                  | 0.07 → 0.15 ms           | 0.03 → 0.12 ms         |
+| Append a 500,000-character tool result | 0.64 → 1.19 ms           | 0.74 → 9.27 ms         |
+| Rewrite the 5,000-entry session        | 137 → 168 ms             | 138 → 934 ms           |
 
 ### What masking does not catch
 
