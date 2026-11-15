@@ -793,8 +793,9 @@ interface RolloutBytes {
 /**
  * Open a rollout in `storage` for windowed reads, so a rollout of hundreds of
  * MB is never held whole: a file backend reads each window from disk, and a
- * storage with `readChunks` (`session.storage: sql`) streams each window from
- * its first byte and stops at its last. Any other storage is read once and
+ * storage with `readChunks`, which reads in bounded pieces (`session.storage:
+ * sql`), streams each window from its first byte and stops at its last. Any
+ * other storage (Redis, an SDK backend without chunked reads) is read once and
  * windowed in memory, the same read `loadSessionFile` performs there. A
  * missing rollout throws either way.
  */

@@ -135,6 +135,22 @@ export class SessionWriteConflictError extends Error {
 }
 
 /**
+ * A chunked read ({@link SessionStorage.readChunks}) met a session that a full
+ * write or a delete replaced after the read began, so the bytes it had yielded
+ * and the rest would mix two bodies. Reading the session again from its start
+ * sees one body.
+ */
+export class SessionReadConflictError extends Error {
+	readonly path: string;
+
+	constructor(path: string) {
+		super(`Session file ${JSON.stringify(path)} was replaced or removed while it was read; read it again.`);
+		this.name = "SessionReadConflictError";
+		this.path = path;
+	}
+}
+
+/**
  * The file publish lock is held by another live writer, so freshness cannot
  * be established. Fail-closed: the staged rewrite is discarded without
  * publishing.
@@ -744,7 +760,7 @@ export const LINE_STREAM_CHUNK = 1 << 20;
  * Write `lines` at `fd`'s position in chunks of about {@link LINE_STREAM_CHUNK}
  * UTF-16 units, never holding their full concatenation, iterating them once.
  * Returns the UTF-8 bytes written and the text of the first chunk, which holds
- * the first line unless that line alone is longer than a chunk.
+ * at least the whole first line.
  */
 export function writeLinesToDescriptorSync(fd: number, lines: Iterable<string>): { bytes: number; head: string } {
 	let bytes = 0;
@@ -1610,8 +1626,9 @@ export async function readSessionTextFrom(
 
 /**
  * Bytes {@link readSessionLinesFrom} reads at once. A key-indexed backend may
- * fetch the rest of the stored part a window ends in (up to 4 MiB on SQL), so
- * a read stays within 16 MiB.
+ * fetch more than the window: SQL fetches the rest of the stored part the
+ * window ends in, at most the window's length again (an appended line is one
+ * part of its own length).
  */
 const TRANSCRIPT_WINDOW_BYTES = 8 * 1024 * 1024;
 

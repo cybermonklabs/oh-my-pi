@@ -880,6 +880,27 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 		});
 	});
 
+	it.skipIf(process.getuid === undefined)(
+		"spools into a directory of this account's own under the OS temp directory, private to it",
+		async () => {
+			// Another account on the machine that ran omp first owns any shared name there.
+			const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-spool-dir-"));
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp);
+			try {
+				const storage = new IndexedSessionStorage(new MemoryBackend());
+				await storage.initialize();
+				await storage.writeLinesAtomic("/sessions/atomic.jsonl", serialized(), { expectedSize: null });
+
+				const spools = fs.readdirSync(tmp);
+				expect(spools).toEqual([`omp-spool-${process.getuid?.()}`]);
+				expect(fs.statSync(path.join(tmp, spools[0] ?? "")).mode & 0o777).toBe(0o700);
+			} finally {
+				vi.restoreAllMocks();
+				await fsp.rm(tmp, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("hands a subclass that intercepts writeTextAtomic and writeTextSync the joined lines, and stores them", async () => {
 		const backend = new MemoryBackend();
 		const storage = new InterceptingIndexedStorage(backend);

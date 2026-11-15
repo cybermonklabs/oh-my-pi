@@ -35,6 +35,15 @@ interface FakeRedis extends RedisSessionStorageClient {
 	failNext(method: string, error: Error): void;
 }
 
+/** What GETRANGE returns for `bytes` from `start` to `end`, both inclusive, a negative one counted from the end. */
+function byteRange(bytes: Buffer, start: number, end: number): string {
+	if (bytes.length === 0) return "";
+	const from = Math.max(0, start < 0 ? bytes.length + start : start);
+	const to = Math.min(bytes.length - 1, end < 0 ? bytes.length + end : end);
+	if (to < from) return "";
+	return bytes.subarray(from, to + 1).toString("utf-8");
+}
+
 function createFakeRedis(): FakeRedis {
 	const strings = new Map<string, string>();
 	const hashes = new Map<string, Map<string, string>>();
@@ -141,6 +150,15 @@ function createFakeRedis(): FakeRedis {
 				}
 				return paths.length;
 			}
+			if (script.includes("OMP_READ_FROM")) {
+				checkFailure("getrange");
+				const [fileKey] = keys;
+				const [first, last] = argv;
+				const value = strings.get(fileKey);
+				if (value === undefined) return null;
+				const bytes = Buffer.from(value, "utf-8");
+				return [bytes.length, last === "" ? "" : byteRange(bytes, Number(first), Number(last))];
+			}
 			throw new Error("Unsupported Redis script");
 		},
 		async get(key) {
@@ -151,12 +169,7 @@ function createFakeRedis(): FakeRedis {
 		async getrange(key, start, end) {
 			record("getrange", [key, start, end]);
 			checkFailure("getrange");
-			const bytes = Buffer.from(strings.get(key) ?? "", "utf-8");
-			if (bytes.length === 0) return "";
-			const from = Math.max(0, start < 0 ? bytes.length + start : start);
-			const to = Math.min(bytes.length - 1, end < 0 ? bytes.length + end : end);
-			if (to < from) return "";
-			return bytes.subarray(from, to + 1).toString("utf-8");
+			return byteRange(Buffer.from(strings.get(key) ?? "", "utf-8"), start, end);
 		},
 		async strlen(key) {
 			record("strlen", [key]);
@@ -501,6 +514,31 @@ describe("RedisSessionStorage", () => {
 		expect(redis.calls[1].args).toEqual(["omp:sessions:file:/sessions/p/big.jsonl", -3, -1]);
 	});
 
+	it("readTextFrom reads a byte window and the size in one script, never the whole value", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const path = "/sessions/p/window.jsonl";
+		const body = "line one\nline two €\nline three\n";
+		const bytes = Buffer.from(body);
+		await storage.writeText(path, body);
+
+		redis.calls.length = 0;
+		expect(await storage.readTextFrom(path, 9, 13)).toEqual({ text: "line two €\n", size: bytes.length });
+		expect(await storage.readTextFrom(path, 9)).toEqual({ text: bytes.subarray(9).toString(), size: bytes.length });
+		expect(await storage.readTextFrom(path, 9, 0)).toEqual({ text: "", size: bytes.length });
+		expect(await storage.readTextFrom(path, bytes.length + 4, 8)).toEqual({ text: "", size: bytes.length });
+		expect(redis.calls.map(call => [call.method, String((call.args[1] as string[])[0]).split("\n")[0]])).toEqual(
+			Array.from({ length: 4 }, () => ["send", "-- OMP_READ_FROM"]),
+		);
+	});
+
+	it("readTextFrom rejects with ENOENT for a key another client deleted", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		await storage.writeText("/sessions/p/gone.jsonl", "gone\n");
+		redis.strings.delete("omp:sessions:file:/sessions/p/gone.jsonl");
+
+		await expect(storage.readTextFrom("/sessions/p/gone.jsonl", 0, 4)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("custom prefix isolates keyspaces", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis, prefix: "proj-a:" });
 		await storage.writeText("/sessions/x.jsonl", "hello\n");
@@ -592,5 +630,21 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(await client.exists(`${prefix}file:/s/p/Late*[x].jsonl`)).toBe(false);
 		expect(await hget(client, "meta", "/s/p/Late*[x].jsonl")).toBeNull();
 		expect(await client.get(`${prefix}file:/s/p-sibling.jsonl`)).toBe("sibling\n");
+	});
+
+	it("reads a byte window and the size in one script, and nothing of a deleted key", async () => {
+		const { client, storage } = await open();
+		const body = "line one\nline two €\nline three\n";
+		const bytes = Buffer.from(body);
+		await storage.writeText("/s/w.jsonl", body);
+
+		expect(await storage.readTextFrom("/s/w.jsonl", 9, 13)).toEqual({ text: "line two €\n", size: bytes.length });
+		expect(await storage.readTextFrom("/s/w.jsonl", 9)).toEqual({
+			text: bytes.subarray(9).toString(),
+			size: bytes.length,
+		});
+		expect(await storage.readTextFrom("/s/w.jsonl", 9, 0)).toEqual({ text: "", size: bytes.length });
+		await client.send("DEL", [`${prefix}file:/s/w.jsonl`]);
+		await expect(storage.readTextFrom("/s/w.jsonl", 0, 4)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });
