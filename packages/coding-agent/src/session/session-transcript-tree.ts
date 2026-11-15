@@ -9,7 +9,10 @@
  */
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import type { SessionStorage } from "./session-storage";
+import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
+import { transcriptByteChunks } from "./session-loader";
+import type { SessionStorage, SessionStorageWriter } from "./session-storage";
+import { parseTitleSlotFromContent, titleUpdateFromSlot } from "./session-title-slot";
 
 /**
  * Every file `storage` holds under `dir` whose name matches `pattern`
@@ -56,18 +59,45 @@ export async function copyTranscriptTree(
 	for (const from of listTranscriptTree(storage, fromDir, pattern)) {
 		const to = path.join(toDir, path.relative(fromDir, from));
 		if (await storage.exists(to)) continue;
-		let content: string;
-		try {
-			content = await storage.readText(from);
-		} catch (err) {
-			// Removed since the listing: nothing left to copy.
-			if (isEnoent(err)) continue;
-			throw err;
-		}
-		await storage.writeText(to, content);
+		// Removed since the listing: nothing left to copy.
+		if (!(await copyTranscript(storage, from, to))) continue;
 		copied.push({ from, to });
 	}
 	return copied;
+}
+
+/**
+ * Copy `from` to `to` chunk by chunk, appending each through a writer, so a
+ * transcript is never held whole; a title slot at its head is set on `to` as
+ * a whole write would set it. Returns false, leaving nothing at `to`, when
+ * `from` is gone; any other failure removes the partial copy and throws.
+ */
+async function copyTranscript(storage: SessionStorage, from: string, to: string): Promise<boolean> {
+	const decoder = new TextDecoder();
+	let writer: SessionStorageWriter | undefined;
+	let head = "";
+	try {
+		for await (const chunk of transcriptByteChunks(from, storage)) {
+			writer ??= storage.openWriter(to, { flags: "w" });
+			const text = decoder.decode(chunk, { stream: true });
+			if (head.length < SESSION_TITLE_SLOT_BYTES) head += text.slice(0, SESSION_TITLE_SLOT_BYTES - head.length);
+			if (text) await writer.append(text);
+		}
+		writer ??= storage.openWriter(to, { flags: "w" });
+		const rest = decoder.decode();
+		if (rest) await writer.append(rest);
+		await writer.close();
+	} catch (err) {
+		if (writer) {
+			await writer.close().catch(() => {});
+			await storage.unlink(to).catch(() => {});
+		}
+		if (isEnoent(err)) return false;
+		throw err;
+	}
+	const title = titleUpdateFromSlot(parseTitleSlotFromContent(head));
+	if (title) await storage.updateSessionTitle(to, title);
+	return true;
 }
 
 /**
