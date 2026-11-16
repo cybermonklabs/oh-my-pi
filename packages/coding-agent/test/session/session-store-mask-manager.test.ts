@@ -28,13 +28,13 @@ import {
 	listSessionRecaps,
 	lookupSessionTitle,
 } from "@oh-my-pi/pi-coding-agent/session/session-index";
-import { maskSessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entry-mask";
+import { maskBtwRecord, maskSessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entry-mask";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import * as utils from "@oh-my-pi/pi-utils";
-import { getConfigRootDir, isRecord, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, isRecord, setAgentDir, stringifyJson, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "../collab/helpers/in-memory-relay";
 
@@ -985,6 +985,11 @@ function messageEntry(message: StoredRecord): StoredRecord {
 	return { type: "message", message };
 }
 
+/** A message entry with its own `id`, as the walk sees one the session appended. */
+function storedMessageEntry(id: string, message: StoredRecord): StoredRecord {
+	return { id, parentId: null, timestamp: KEEP_TIMESTAMP, ...messageEntry(message) };
+}
+
 /** An assistant message written as a plain object, so it can carry fields a newer format has. */
 function assistantRecord(content: unknown[], fields: StoredRecord = {}): StoredRecord {
 	return { ...assistant([]), content, ...fields };
@@ -994,6 +999,18 @@ function assistantRecord(content: unknown[], fields: StoredRecord = {}): StoredR
 async function regexMask(agentDir: string, maskCwd: string, source: string): Promise<storeMask.SessionStoreMask> {
 	await Bun.write(path.join(agentDir, "secrets.yml"), JSON.stringify([{ type: "regex", content: source }]));
 	return new storeMask.SessionStoreMasker({ env: () => ({ SERVICE_API_KEY: ENV_VALUE }), agentDir }).snapshot(maskCwd);
+}
+
+/** A digit-only held value, under a secret-named variable of {@link numberMask}. */
+const NUMBER_VALUE = "73190428865";
+const NUMBER_MARKER = "[REDACTED:env:SERVICE_NUMBER_TOKEN]";
+
+/** A mask holding SERVICE_API_KEY's value and {@link NUMBER_VALUE}, so a `bigint` can hold a value. */
+function numberMask(): storeMask.SessionStoreMask {
+	return new storeMask.SessionStoreMasker({
+		env: () => ({ SERVICE_API_KEY: ENV_VALUE, SERVICE_NUMBER_TOKEN: NUMBER_VALUE }),
+		agentDir: tmp.join("agent"),
+	}).snapshot(cwd);
 }
 
 const KEEP_HEADER: StoredRecord = {
@@ -1043,7 +1060,8 @@ const SERVICE_TIER_ENTRY: StoredRecord = {
 	type: "service_tier_change",
 	serviceTier: { openai: "priority", anthropic: "flex", google: "scale" },
 };
-const LEGACY_SERVICE_TIER_ENTRY: StoredRecord = { type: "service_tier_change", serviceTier: "openai-only" };
+/** A scalar tier, as written before tiers per provider family: KR3 keeps only the three family keys. */
+const LEGACY_SERVICE_TIER_ENTRY: StoredRecord = { type: "service_tier_change", serviceTier: HELD };
 const REMOTE_COMPACTION_SLOT: StoredRecord = {
 	provider: "keep-remote-provider",
 	replacementHistory: [{ type: "message", role: "user", content: [{ type: "input_text", text: "plain words" }] }],
@@ -1055,7 +1073,13 @@ const ANTHROPIC_COMPACTION_SLOT: StoredRecord = {
 	content: "plain summary text",
 	signature: "keep-compaction-signature",
 	encryptedContent: "keep-compaction-cipher",
-	toolChanges: [{ type: "tool_addition", name: "keep-added-tool" }],
+	toolChanges: [
+		{
+			type: "tool_addition",
+			tool: { type: "tool_reference", name: "keep-added-tool" },
+			opaque: { state: "keep-added-opaque", steps: ["keep-added-step"] },
+		},
+	],
 	filesText: "plain files",
 	retainedFiles: [{ text: "plain retained", after: 1 }],
 	usedTokens: 1,
@@ -1280,6 +1304,28 @@ const BRANCH_SUMMARY_MESSAGE: StoredRecord = messageEntry({
 	fromId: "keep-summary-from",
 	timestamp: NOW,
 });
+/** An image outside a content array (KR7), with every field KR5's image row keeps. */
+function keptImage(data: string, name: string): StoredRecord {
+	return {
+		type: "image",
+		data,
+		mimeType: "image/png",
+		detail: "original",
+		providerFile: { provider: "openai", id: `keep-${name}-file`, uri: `keep-${name}-uri`, expiresAt: 1 },
+		url: `https://example.invalid/keep-${name}.png`,
+	};
+}
+/** The fields {@link keptImage} gives an image, each kept where KR7 names the image. */
+const KEPT_IMAGE_FIELDS = [
+	"type",
+	"data",
+	"mimeType",
+	"detail",
+	"providerFile.provider",
+	"providerFile.id",
+	"providerFile.uri",
+	"url",
+] as const;
 const COMPACTION_SUMMARY_MESSAGE: StoredRecord = messageEntry({
 	role: "compactionSummary",
 	summary: HELD,
@@ -1288,14 +1334,20 @@ const COMPACTION_SUMMARY_MESSAGE: StoredRecord = messageEntry({
 	method: "keep-summary-method",
 	warning: HELD,
 	blocks: [{ type: "text", text: HELD }],
-	images: [{ type: "image", data: blobRef("d4"), mimeType: "image/png" }],
+	images: [keptImage(blobRef("d4"), "summary-image")],
 	providerPayload: {
 		type: "anthropicCompaction",
 		provider: "keep-payload-provider",
 		content: "plain summary text",
 		signature: "keep-payload-signature",
 		encryptedContent: "keep-payload-cipher",
-		toolChanges: [{ type: "tool_addition", name: "keep-payload-tool" }],
+		toolChanges: [
+			{
+				type: "tool_addition",
+				tool: { type: "tool_reference", name: "keep-payload-tool" },
+				opaque: { state: "keep-payload-opaque" },
+			},
+		],
 		filesText: "plain files",
 	},
 	timestamp: NOW,
@@ -1330,7 +1382,7 @@ const BASH_MESSAGE: StoredRecord = messageEntry({
 	exitCode: 0,
 	cancelled: false,
 	truncated: true,
-	images: [{ type: "image", data: blobRef("e5"), mimeType: "image/png" }],
+	images: [keptImage(blobRef("e5"), "bash-image")],
 	meta: OUTPUT_META,
 	timestamp: NOW,
 });
@@ -1351,7 +1403,7 @@ const FILE_MENTION_MESSAGE: StoredRecord = messageEntry({
 		{
 			path: "plain/picture.png",
 			content: "",
-			image: { type: "image", data: "iVBORw0KGgoKeepMention", mimeType: "image/png" },
+			image: keptImage("iVBORw0KGgoKeepMention", "mention-image"),
 		},
 	],
 	timestamp: NOW,
@@ -1449,6 +1501,14 @@ const SERVER_TOOL_MESSAGE: StoredRecord = messageEntry(
 				type: "web_search_tool_result",
 				tool_use_id: "keep-error-use",
 				content: { type: "web_search_tool_result_error", error_code: "keep-error-code" },
+			},
+		},
+		{
+			type: "anthropicServerTool",
+			block: {
+				type: "tool_search_tool_result",
+				tool_use_id: "keep-search-error-use",
+				content: { type: "tool_search_tool_result_error", error_code: "keep-search-error-code" },
 			},
 		},
 	]),
@@ -1661,6 +1721,13 @@ interface KeepRow {
 	readonly shape: FieldPath;
 	/** Fields below `shape` kept as written. */
 	readonly kept: readonly FieldPath[];
+	/** Plain objects below `shape` kept whole and unscanned; `kept` lists the strings in them. */
+	readonly whole?: readonly FieldPath[];
+	/**
+	 * Fields below `shape` the list declares both as a plain object and as an array of plain objects
+	 * (a Responses item's `output`, a `web_search_tool_result`'s `content`): neither shape is wrong there.
+	 */
+	readonly objectOrArray?: readonly FieldPath[];
 	/** Fields below `shape` that hold {@link HELD} and are masked. */
 	readonly masked?: readonly FieldPath[];
 }
@@ -1737,10 +1804,11 @@ const KEEP_ROWS: readonly KeepRow[] = [
 	},
 	{
 		rule: "KR3",
-		position: "a legacy service_tier_change entry",
+		position: "a service_tier_change entry whose serviceTier is a string",
 		record: LEGACY_SERVICE_TIER_ENTRY,
 		shape: "",
-		kept: ["serviceTier"],
+		kept: [],
+		masked: ["serviceTier"],
 	},
 	{
 		rule: "KR3",
@@ -2111,21 +2179,21 @@ const KEEP_ROWS: readonly KeepRow[] = [
 		position: "an image of a bashExecution message",
 		record: BASH_MESSAGE,
 		shape: "message.images.0",
-		kept: ["type", "data", "mimeType"],
+		kept: KEPT_IMAGE_FIELDS,
 	},
 	{
 		rule: "KR7",
 		position: "an image of a compactionSummary message",
 		record: COMPACTION_SUMMARY_MESSAGE,
 		shape: "message.images.0",
-		kept: ["type", "data", "mimeType"],
+		kept: KEPT_IMAGE_FIELDS,
 	},
 	{
 		rule: "KR7",
 		position: "the image of a fileMention file",
 		record: FILE_MENTION_MESSAGE,
 		shape: "message.files.1.image",
-		kept: ["type", "data", "mimeType"],
+		kept: KEPT_IMAGE_FIELDS,
 	},
 	{
 		rule: "KR7",
@@ -2211,6 +2279,7 @@ const KEEP_ROWS: readonly KeepRow[] = [
 			"items.8.status",
 			"items.8.operation.type",
 		],
+		objectOrArray: ["items.3.output", "items.5.output"],
 	},
 	{
 		rule: "KR8",
@@ -2224,7 +2293,17 @@ const KEEP_ROWS: readonly KeepRow[] = [
 		position: "an anthropicCompaction payload",
 		record: COMPACTION_SUMMARY_MESSAGE,
 		shape: "message.providerPayload",
-		kept: ["type", "provider", "signature", "encryptedContent", "toolChanges.0.type", "toolChanges.0.name"],
+		kept: [
+			"type",
+			"provider",
+			"signature",
+			"encryptedContent",
+			"toolChanges.0.type",
+			"toolChanges.0.tool.type",
+			"toolChanges.0.tool.name",
+			"toolChanges.0.opaque.state",
+		],
+		whole: ["toolChanges.0.opaque"],
 	},
 	{
 		rule: "KR8",
@@ -2261,6 +2340,7 @@ const KEEP_ROWS: readonly KeepRow[] = [
 		record: RESPONSES_OBJECT_SHAPES_MESSAGE,
 		shape: "message.providerPayload",
 		kept: ["items.0.type", "items.0.call_id", "items.0.output.type", "items.1.type", "items.1.id", "items.1.role"],
+		objectOrArray: ["items.0.output"],
 	},
 	{
 		rule: "KR8",
@@ -2325,7 +2405,18 @@ const KEEP_ROWS: readonly KeepRow[] = [
 		position: "an anthropicCompaction slot",
 		record: COMPACTION_ENTRY,
 		shape: "preserveData.anthropicCompaction",
-		kept: ["provider", "model", "signature", "encryptedContent", "toolChanges.0.type", "toolChanges.0.name"],
+		kept: [
+			"provider",
+			"model",
+			"signature",
+			"encryptedContent",
+			"toolChanges.0.type",
+			"toolChanges.0.tool.type",
+			"toolChanges.0.tool.name",
+			"toolChanges.0.opaque.state",
+			"toolChanges.0.opaque.steps.0",
+		],
+		whole: ["toolChanges.0.opaque"],
 	},
 	{
 		rule: "KR8",
@@ -2348,6 +2439,7 @@ const KEEP_ROWS: readonly KeepRow[] = [
 			"cache_control.ttl",
 			"cache_control.scope",
 		],
+		objectOrArray: ["content"],
 	},
 	{
 		rule: "KR8",
@@ -2367,6 +2459,14 @@ const KEEP_ROWS: readonly KeepRow[] = [
 		position: "a server-tool error block",
 		record: SERVER_TOOL_MESSAGE,
 		shape: "message.content.3.block",
+		kept: ["type", "tool_use_id", "content.type", "content.error_code"],
+		objectOrArray: ["content"],
+	},
+	{
+		rule: "KR8",
+		position: "a tool search error block",
+		record: SERVER_TOOL_MESSAGE,
+		shape: "message.content.4.block",
 		kept: ["type", "tool_use_id", "content.type", "content.error_code"],
 	},
 	{
@@ -3051,6 +3151,318 @@ function serverToolGroup(held: (typeof SERVER_TOOL_SCANNED_FIELDS)[number]): unk
 	];
 }
 
+/**
+ * A tool result detail whose `toJSON` leaves out an own field that holds a value, beside a string
+ * long enough that persistence truncates it and rebuilds the object from its own fields.
+ */
+class TruncatedReport {
+	note = HELD;
+	body = "a".repeat(600_000);
+	toJSON(): string {
+		return "plain report";
+	}
+}
+
+/**
+ * A tool result detail that the session line stores in another form than its own keys: through its
+ * `toJSON`, as the primitive a boxed `String` holds, or as a `bigint`'s decimal string. Each holds
+ * a value in that form only.
+ */
+const STORED_FORM_DETAILS: readonly {
+	readonly name: string;
+	readonly detail: () => unknown;
+	readonly value: string;
+	/** The stored form of the detail once masked. */
+	readonly masked: unknown;
+}[] = [
+	{
+		name: "an object with toJSON",
+		detail: () => ({ toJSON: () => ({ note: HELD }) }),
+		value: ENV_VALUE,
+		masked: { note: HELD_MARKER },
+	},
+	{ name: "a boxed String", detail: () => new String(HELD), value: ENV_VALUE, masked: HELD_MARKER },
+	{ name: "a bigint", detail: () => BigInt(NUMBER_VALUE), value: NUMBER_VALUE, masked: NUMBER_MARKER },
+	{
+		name: "a class instance whose toJSON leaves out an own field, beside a string persistence truncates",
+		detail: () => new TruncatedReport(),
+		value: ENV_VALUE,
+		masked: "plain report",
+	},
+];
+
+/** A tool name the regex of the `anthropicCompaction` tool-change cases matches. */
+const CHANGED_TOOL = "lookup_ledger_records";
+const CHANGED_TOOL_REGEX = "lookup_[a-z]+_records";
+
+/** An `anthropicCompaction` carrier holding `toolChanges`, at each place KR8 names one. */
+const COMPACTION_TOOL_CHANGE_PLACES: readonly {
+	readonly place: string;
+	readonly append: (manager: SessionManager, toolChanges: unknown[]) => void;
+	readonly toolChanges: FieldPath;
+}[] = [
+	{
+		place: "compaction.preserveData.anthropicCompaction",
+		append(manager, toolChanges) {
+			const userId = manager.appendMessage({ role: "user", content: "plain question", timestamp: NOW });
+			manager.appendCompaction("plain summary", undefined, userId, 1, {
+				preserveData: {
+					anthropicCompaction: {
+						provider: "anthropic",
+						model: "plain-model",
+						content: "plain summary",
+						signature: "plain-signature",
+						toolChanges,
+					},
+				},
+			});
+		},
+		toolChanges: "preserveData.anthropicCompaction.toolChanges",
+	},
+	{
+		place: "a compactionSummary message's providerPayload",
+		append(manager, toolChanges) {
+			manager.appendMessage({
+				role: "compactionSummary",
+				summary: "plain summary",
+				tokensBefore: 1,
+				providerPayload: {
+					type: "anthropicCompaction",
+					provider: "anthropic",
+					content: "plain summary",
+					signature: "plain-signature",
+					toolChanges,
+				},
+				timestamp: NOW,
+			} as unknown as AssistantMessage);
+		},
+		toolChanges: "message.providerPayload.toolChanges",
+	},
+];
+
+/** `toolChanges` elements an `anthropicCompaction` keeps nothing of: each holds {@link CHANGED_TOOL} out of its declared shape. */
+const UNKEPT_TOOL_CHANGES: readonly { readonly name: string; readonly element: StoredRecord }[] = [
+	{ name: "the element's own name", element: { type: "tool_addition", name: CHANGED_TOOL } },
+	{
+		name: "an opaque written as a string",
+		element: { type: "tool_addition", tool: { type: "tool_reference", name: "plain-tool" }, opaque: CHANGED_TOOL },
+	},
+	{
+		name: "a tool written as an array",
+		element: { type: "tool_removal", tool: [{ type: "tool_reference", name: CHANGED_TOOL }] },
+	},
+];
+
+/** Ciphertext the regex of the server-tool element cases matches. */
+const SERVER_CIPHER = "sealedserver01";
+
+/**
+ * `anthropicServerTool` result blocks holding {@link SERVER_CIPHER} in a field KR8 keeps on one
+ * element type of one block type: kept there, and nowhere else.
+ */
+const SERVER_TOOL_ELEMENT_CASES: readonly {
+	readonly name: string;
+	readonly block: StoredRecord;
+	readonly keeps: boolean;
+}[] = [
+	{
+		name: "a web_search_result element of a web_search_tool_result",
+		block: {
+			type: "web_search_tool_result",
+			tool_use_id: "srvtoolu_plain",
+			content: [{ type: "web_search_result", encrypted_content: SERVER_CIPHER }],
+		},
+		keeps: true,
+	},
+	{
+		name: "an element of another type in a web_search_tool_result",
+		block: {
+			type: "web_search_tool_result",
+			tool_use_id: "srvtoolu_plain",
+			content: [{ type: "plain_other_result", encrypted_content: SERVER_CIPHER }],
+		},
+		keeps: false,
+	},
+	{
+		name: "a web_search_tool_result_error written as an element of a web_search_tool_result",
+		block: {
+			type: "web_search_tool_result",
+			tool_use_id: "srvtoolu_plain",
+			content: [{ type: "web_search_tool_result_error", error_code: SERVER_CIPHER }],
+		},
+		keeps: false,
+	},
+	{
+		name: "a web_search_result written as a web_search_tool_result's object content",
+		block: {
+			type: "web_search_tool_result",
+			tool_use_id: "srvtoolu_plain",
+			content: { type: "web_search_result", encrypted_content: SERVER_CIPHER },
+		},
+		keeps: false,
+	},
+	{
+		name: "a web_search_tool_result_error under a tool_search_tool_result",
+		block: {
+			type: "tool_search_tool_result",
+			tool_use_id: "srvtoolu_plain",
+			content: { type: "web_search_tool_result_error", error_code: SERVER_CIPHER },
+		},
+		keeps: false,
+	},
+	{
+		name: "a tool_references element of another type",
+		block: {
+			type: "tool_search_tool_result",
+			tool_use_id: "srvtoolu_plain",
+			content: {
+				type: "tool_search_tool_search_result",
+				tool_references: [{ type: "plain_other_reference", tool_name: SERVER_CIPHER }],
+			},
+		},
+		keeps: false,
+	},
+	{
+		name: "a tool_search_tool_search_result under a web_search_tool_result",
+		block: {
+			type: "web_search_tool_result",
+			tool_use_id: "srvtoolu_plain",
+			content: {
+				type: "tool_search_tool_search_result",
+				tool_references: [{ type: "tool_reference", tool_name: SERVER_CIPHER }],
+			},
+		},
+		keeps: false,
+	},
+	{
+		name: "a web_search_result element under a server_tool_use",
+		block: {
+			type: "server_tool_use",
+			id: "srvtoolu_other",
+			name: "web_search",
+			content: [{ type: "web_search_result", encrypted_content: SERVER_CIPHER }],
+		},
+		keeps: false,
+	},
+];
+
+/** A `Date`, a `URL` and a `bigint`, none holding a value: the session line stores each in another form than its own keys. */
+function nonPlainNodes(): StoredRecord {
+	return { at: new Date(NOW), link: new URL("https://example.invalid/plain-page"), count: 12n };
+}
+
+/**
+ * Signed blocks and replay carriers whose free fields hold non-plain nodes, with {@link HELD} in one
+ * free field beside them when `held`. Only a held value drops a signature, a carrier or a server-tool
+ * group (KR6, KR8-KR10): a non-plain node alone is stored in the same bytes as the live entry.
+ */
+const NON_PLAIN_BINDINGS: readonly {
+	readonly name: string;
+	readonly message: (held: boolean) => StoredRecord;
+	/** What the drop rules leave out of the stored copy when the message holds a value. */
+	readonly bound: FieldPath;
+}[] = [
+	{
+		name: "a signed thinking block",
+		// `extra` is a key the list does not name: free content.
+		message: held =>
+			assistantRecord([
+				{
+					type: "thinking",
+					thinking: held ? HELD : "plain thought",
+					thinkingSignature: "opaque-thinking-signature",
+					extra: nonPlainNodes(),
+				},
+			]),
+		bound: "message.content.0.thinkingSignature",
+	},
+	{
+		name: "a signed text block",
+		message: held =>
+			assistantRecord([
+				{
+					type: "text",
+					text: held ? HELD : "plain answer",
+					textSignature: "opaque-text-signature",
+					extra: nonPlainNodes(),
+				},
+			]),
+		bound: "message.content.0.textSignature",
+	},
+	{
+		name: "a signed toolCall block",
+		message: held =>
+			assistantRecord([
+				{
+					type: "toolCall",
+					id: "call-bound",
+					name: "lookup",
+					arguments: { ...nonPlainNodes(), query: held ? HELD : "plain" },
+					thoughtSignature: "opaque-thought-signature",
+				},
+			]),
+		bound: "message.content.0.thoughtSignature",
+	},
+	{
+		name: "a cursorHistory carrier",
+		message: held =>
+			assistantRecord([{ type: "text", text: "plain" }], {
+				providerPayload: {
+					type: "cursorHistory",
+					wireRoute: "plain-route",
+					digest: "plain-digest",
+					records: [new Date(NOW), 12n, held ? HELD : "plain record"],
+				},
+			}),
+		bound: "message.providerPayload",
+	},
+	{
+		name: "an openaiResponsesHistory carrier",
+		message: held =>
+			assistantRecord([{ type: "text", text: "plain" }], {
+				providerPayload: {
+					type: "openaiResponsesHistory",
+					items: [
+						{
+							type: "function_call",
+							id: "fc_plain",
+							call_id: "call_plain",
+							name: "lookup",
+							arguments: held ? JSON.stringify({ query: HELD }) : "{}",
+							createdAt: new Date(NOW),
+							sequence: 12n,
+						},
+					],
+				},
+			}),
+		bound: "message.providerPayload",
+	},
+	{
+		name: "an anthropicServerTool group",
+		message: held =>
+			assistantRecord([
+				{
+					type: "anthropicServerTool",
+					block: {
+						type: "server_tool_use",
+						id: "srvtoolu_bound",
+						name: "web_search",
+						input: { ...nonPlainNodes(), query: held ? HELD : "plain" },
+					},
+				},
+				{
+					type: "anthropicServerTool",
+					block: {
+						type: "web_search_tool_result",
+						tool_use_id: "srvtoolu_bound",
+						content: [{ type: "web_search_result", url: "plain-url", encrypted_content: "plain-cipher" }],
+					},
+				},
+			]),
+		bound: "message.content.0",
+	},
+];
+
 for (const backend of backends) {
 	describe(`keep rules for signatures, carriers and values by type with ${backend.name}`, () => {
 		let store: StoreHarness;
@@ -3131,6 +3543,140 @@ for (const backend of backends) {
 						content.some(block => isRecord(block) && block.type === "anthropicServerTool"),
 					liveBlocks: Array.isArray(liveContent) ? liveContent.length : -1,
 				}).toEqual({ leaked: [], storedBlocks: 2, serverToolLeft: false, liveBlocks: 4 });
+				await manager.close();
+			});
+		}
+
+		for (const form of STORED_FORM_DETAILS) {
+			it(`masks a value a tool result's details hold as ${form.name}, in the form the session line stores it`, async () => {
+				const manager = await maskedSession(numberMask());
+				const detail = form.detail();
+				manager.appendMessage(
+					assistant([{ type: "toolCall", id: "call-form", name: "lookup", arguments: {} }], {
+						stopReason: "toolUse",
+					}),
+				);
+				manager.appendMessage({
+					role: "toolResult",
+					toolCallId: "call-form",
+					toolName: "lookup",
+					content: [{ type: "text", text: "plain" }],
+					details: { report: detail },
+					isError: false,
+					timestamp: NOW,
+				});
+				const text = await storedText(manager);
+				const stored = valueAt(storedRecords(text).at(-1), "message.details.report");
+				expect({
+					form: form.name,
+					held: text.includes(form.value),
+					storedMasked: JSON.stringify(stored) === JSON.stringify(form.masked),
+					liveKeepsIt: valueAt(manager.getEntries().at(-1), "message.details.report") === detail,
+				}).toEqual({ form: form.name, held: false, storedMasked: true, liveKeepsIt: true });
+				await manager.close();
+			});
+		}
+
+		it("keeps the signature and the carrier of a turn whose free fields hold a Date, a URL or a bigint but no held value", async () => {
+			const manager = await maskedSession(mask);
+			manager.appendMessage(
+				assistantRecord(
+					[
+						{
+							type: "toolCall",
+							id: "call-bound",
+							name: "lookup",
+							arguments: nonPlainNodes(),
+							thoughtSignature: "opaque-thought-signature",
+						},
+					],
+					{
+						stopReason: "toolUse",
+						providerPayload: {
+							type: "cursorHistory",
+							wireRoute: "plain-route",
+							digest: "plain-digest",
+							records: [new Date(NOW), 12n, "plain record"],
+						},
+					},
+				) as unknown as AssistantMessage,
+			);
+			const lines = (await storedText(manager)).split("\n").filter(line => line.length > 0);
+			const stored = lines.at(-1) ?? "";
+			const record: unknown = JSON.parse(stored);
+			expect({
+				signed: valueAt(record, "message.content.0.thoughtSignature") !== undefined,
+				carrierKept: valueAt(record, "message.providerPayload") !== undefined,
+				asLive: stored === stringifyJson(manager.getEntries().at(-1)),
+			}).toEqual({ signed: true, carrierKept: true, asLive: true });
+			await manager.close();
+		});
+
+		for (const { place, append, toolChanges } of COMPACTION_TOOL_CHANGE_PLACES) {
+			it(`KR8: keeps the raw toolChanges of ${place} byte-identical, opaque whole, under a regex that matches a tool name`, async () => {
+				const manager = await maskedSession(await regexMask(tmp.join("agent"), cwd, CHANGED_TOOL_REGEX));
+				const changes = [
+					{
+						type: "tool_addition",
+						tool: { type: "tool_reference", name: CHANGED_TOOL },
+						opaque: { cursor: CHANGED_TOOL, after: [CHANGED_TOOL], depth: 2 },
+					},
+					{ type: "tool_removal", tool: { type: "tool_reference", name: "plain-removed-tool" }, opaque: {} },
+				];
+				append(manager, changes);
+				const stored = valueAt(storedRecords(await storedText(manager)).at(-1), toolChanges);
+				expect({ place, asWritten: JSON.stringify(stored) === JSON.stringify(changes) }).toEqual({
+					place,
+					asWritten: true,
+				});
+				await manager.close();
+			});
+
+			for (const { name, element } of UNKEPT_TOOL_CHANGES) {
+				it(`KR8: leaves out ${place} whose toolChanges element holds a tool name in ${name}`, async () => {
+					const manager = await maskedSession(await regexMask(tmp.join("agent"), cwd, CHANGED_TOOL_REGEX));
+					append(manager, [element]);
+					const text = await storedText(manager);
+					const carrier = toolChanges.split(".").slice(0, -1);
+					const key = carrier.pop() ?? "";
+					const parent = valueAt(storedRecords(text).at(-1), carrier.join("."));
+					expect({
+						place,
+						name,
+						leftOut: isRecord(parent) && !Object.hasOwn(parent, key),
+						stored: text.includes(CHANGED_TOOL),
+					}).toEqual({ place, name, leftOut: true, stored: false });
+					await manager.close();
+				});
+			}
+		}
+
+		for (const { name, block, keeps } of SERVER_TOOL_ELEMENT_CASES) {
+			it(`KR8: ${name} ${keeps ? "keeps its field as written" : "keeps nothing"}`, async () => {
+				const manager = await maskedSession(await regexMask(tmp.join("agent"), cwd, SERVER_CIPHER));
+				manager.appendMessage(
+					assistantRecord([
+						{ type: "text", text: "plain before" },
+						{
+							type: "anthropicServerTool",
+							block: {
+								type: "server_tool_use",
+								id: "srvtoolu_plain",
+								name: "web_search",
+								input: { query: "plain" },
+							},
+						},
+						{ type: "anthropicServerTool", block },
+					]) as unknown as AssistantMessage,
+				);
+				const text = await storedText(manager);
+				const content = valueAt(storedRecords(text).at(-1), "message.content");
+				expect({
+					name,
+					serverToolLeft:
+						Array.isArray(content) && content.some(item => isRecord(item) && item.type === "anthropicServerTool"),
+					cipherStored: text.includes(SERVER_CIPHER),
+				}).toEqual({ name, serverToolLeft: keeps, cipherStored: keeps });
 				await manager.close();
 			});
 		}
@@ -3218,6 +3764,283 @@ for (const backend of backends) {
 		});
 	});
 }
+
+describe("copy-on-write of the stored copy", () => {
+	it("returns an entry of plain data with nothing to mask as itself, and copies any other node as its plain stored form", () => {
+		const content = [{ type: "text", text: "plain" }];
+		const plainData = { list: [1, Number.NaN, null, "plain", [true]], nested: { flag: false }, absent: undefined };
+		const entryWith = (id: string, details: unknown): StoredRecord =>
+			storedMessageEntry(id, {
+				role: "toolResult",
+				toolCallId: "cow-call",
+				toolName: "lookup",
+				content,
+				details,
+				isError: false,
+				timestamp: NOW,
+			});
+		const plain = entryWith("cow-plain", plainData);
+		const withNodes = entryWith("cow-nodes", { plainData, at: new Date(0), count: 12n, boxed: new String("plain") });
+		const copy = maskSessionEntry(withNodes, mask);
+		const details = valueAt(copy, "message.details");
+		expect({
+			plainSame: maskSessionEntry(plain, mask) === plain,
+			nodesCopied: copy !== withNodes,
+			nodesAsStored:
+				isRecord(details) &&
+				details.at === new Date(0).toJSON() &&
+				details.count === "12" &&
+				details.boxed === "plain",
+			untouchedShared:
+				valueAt(copy, "message.content") === content && isRecord(details) && details.plainData === plainData,
+		}).toEqual({ plainSame: true, nodesCopied: true, nodesAsStored: true, untouchedShared: true });
+	});
+
+	it("leaves a boxed BigInt, which the session line cannot store, as it is, so the write fails as with masking off", () => {
+		const entry = storedMessageEntry("boxed-bigint", {
+			role: "toolResult",
+			toolCallId: "boxed-call",
+			toolName: "lookup",
+			content: [{ type: "text", text: "plain" }],
+			details: { count: Object(12n) },
+			isError: false,
+			timestamp: NOW,
+		});
+		const outcome = (record: unknown): string => {
+			try {
+				return `stored ${stringifyJson(record)}`;
+			} catch (error) {
+				return error instanceof TypeError ? "TypeError" : "another error";
+			}
+		};
+		const masked = maskSessionEntry(entry, mask);
+		expect({ unmasked: outcome(entry), masked: outcome(masked) }).toEqual({
+			unmasked: "TypeError",
+			masked: "TypeError",
+		});
+	});
+
+	for (const { name, message, bound } of NON_PLAIN_BINDINGS) {
+		it(`keeps ${name} whose free fields hold a Date, a URL or a bigint and no held value`, () => {
+			const entry = storedMessageEntry("bound-entry", message(false));
+			const stored = stringifyJson(maskSessionEntry(entry, mask)) ?? "";
+			expect({
+				name,
+				boundKept: valueAt(JSON.parse(stored), bound) !== undefined,
+				asLive: stored === stringifyJson(entry),
+			}).toEqual({ name, boundKept: true, asLive: true });
+		});
+
+		it(`leaves out the binding of ${name} whose free fields hold a value beside them`, () => {
+			const entry = storedMessageEntry("bound-entry", message(true));
+			const stored = stringifyJson(maskSessionEntry(entry, mask)) ?? "";
+			expect({
+				name,
+				boundLeftOut: valueAt(JSON.parse(stored), bound) === undefined,
+				held: stored.includes(ENV_VALUE),
+			}).toEqual({ name, boundLeftOut: true, held: false });
+		});
+	}
+});
+
+/**
+ * Generated cases: each listed position on the path of a kept field of {@link KEEP_ROWS}, written in
+ * every shape but the one it declares and holding a held value, is stored without one; a number or
+ * `null` there is stored as it is (KR13). The positions come from the rows' own fixtures, not from
+ * the walk's table, so the test does not depend on the table it checks.
+ */
+describe("generated: every listed position in every wrong shape", () => {
+	type Kind = "string field" | "array field" | "container" | "element";
+	type Shape =
+		| "a string"
+		| "a number"
+		| "an array"
+		| "a plain object"
+		| "null"
+		| "a URL"
+		| "a toJSON object"
+		| "a bigint";
+	interface GeneratedPosition {
+		readonly row: KeepRow;
+		readonly path: FieldPath;
+		readonly kind: Kind;
+	}
+	const SHAPES: readonly Shape[] = [
+		"a string",
+		"a number",
+		"an array",
+		"a plain object",
+		"null",
+		"a URL",
+		"a toJSON object",
+		"a bigint",
+	];
+	/** The shape each kind declares. An element takes all eight: its plain object is the array under it written as one object. */
+	const DECLARED: Readonly<Record<Kind, Shape | undefined>> = {
+		"string field": "a string",
+		"array field": "an array",
+		container: "a plain object",
+		element: undefined,
+	};
+
+	/** A deep copy of `value` whose strings holding a value are neutral words, so only a case's shape holds one. */
+	const neutral = (value: unknown): unknown => {
+		if (typeof value === "string") return value.includes(ENV_VALUE) ? "plain neutral" : value;
+		if (Array.isArray(value)) return value.map(neutral);
+		return isRecord(value)
+			? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, neutral(item)]))
+			: value;
+	};
+	const parentOf = (path: FieldPath): FieldPath => path.split(".").slice(0, -1).join(".");
+	/** Writes `value` at `path` below `root`, a neutral copy of a fixture. */
+	const setAt = (root: unknown, path: FieldPath, value: unknown): void => {
+		const parent = valueAt(root, parentOf(path));
+		const last = path.split(".").at(-1) ?? "";
+		if (Array.isArray(parent)) parent[Number(last)] = value;
+		else if (isRecord(parent)) parent[last] = value;
+	};
+
+	/** Every kept path of every row, and every path declared both an object and an array, by the record that holds it. */
+	const keptOf = new Map<StoredRecord, FieldPath[]>();
+	const objectOrArrayOf = new Map<StoredRecord, FieldPath[]>();
+	for (const row of KEEP_ROWS) {
+		keptOf.set(row.record, [...(keptOf.get(row.record) ?? []), ...row.kept.map(field => joinPath(row.shape, field))]);
+		objectOrArrayOf.set(row.record, [
+			...(objectOrArrayOf.get(row.record) ?? []),
+			...(row.objectOrArray ?? []).map(field => joinPath(row.shape, field)),
+		]);
+	}
+	/** Whether the list declares `shape` at `position`: its kind's own shape, or the other one of a field declared both ways. */
+	const declares = ({ row, path, kind }: GeneratedPosition, shape: Shape): boolean => {
+		const both = objectOrArrayOf.get(row.record) ?? [];
+		if (kind === "container" && shape === "an array") return both.includes(path);
+		if (kind === "element" && shape === "a plain object") return both.includes(parentOf(path));
+		return shape === DECLARED[kind];
+	};
+
+	/** The listed positions, each once per record: the first row that names it labels it. */
+	const positions: GeneratedPosition[] = [];
+	const seen = new Map<StoredRecord, Set<string>>();
+	const add = (row: KeepRow, path: FieldPath, kind: Kind): void => {
+		const keys = seen.get(row.record) ?? new Set<string>();
+		seen.set(row.record, keys);
+		if (keys.has(`${kind} ${path}`)) return;
+		keys.add(`${kind} ${path}`);
+		positions.push({ row, path, kind });
+	};
+	for (const row of KEEP_ROWS) {
+		const wholes = (row.whole ?? []).map(field => joinPath(row.shape, field));
+		for (const field of row.kept) {
+			const full = joinPath(row.shape, field);
+			// An object kept whole is one position: the strings in it are not positions of their own.
+			const parts = (wholes.find(whole => full.startsWith(`${whole}.`)) ?? full).split(".");
+			for (let i = 1; i <= parts.length; i++) {
+				const path = parts.slice(0, i).join(".");
+				const value = valueAt(row.record, path);
+				const inArray = Array.isArray(valueAt(row.record, parts.slice(0, i - 1).join(".")));
+				if (isRecord(value)) {
+					add(row, path, "container");
+					if (inArray) add(row, path, "element");
+				} else if (i === parts.length && typeof value === "string") {
+					add(row, inArray ? parentOf(path) : path, inArray ? "array field" : "string field");
+				}
+			}
+		}
+	}
+
+	/** What the position's declared shape holds with {@link HELD} at its kept fields. */
+	const heldForm = ({ row, path, kind }: GeneratedPosition): unknown => {
+		if (kind === "string field") return HELD;
+		if (kind === "array field") return [HELD];
+		const form = neutral(valueAt(row.record, path));
+		for (const kept of keptOf.get(row.record) ?? []) {
+			if (kept.startsWith(`${path}.`)) setAt(form, kept.slice(path.length + 1), HELD);
+		}
+		return form;
+	};
+	/** Where a case writes its shape, and the value it writes there. */
+	const written = (position: GeneratedPosition, shape: Shape): { readonly at: FieldPath; readonly value: unknown } => {
+		const { path, kind } = position;
+		switch (shape) {
+			case "a string":
+				return { at: path, value: HELD };
+			case "a number":
+				return { at: path, value: 7 };
+			case "null":
+				return { at: path, value: null };
+			case "an array":
+				return { at: path, value: kind === "string field" ? [HELD] : [heldForm(position)] };
+			case "a plain object":
+				return kind === "element"
+					? { at: parentOf(path), value: heldForm(position) }
+					: { at: path, value: { note: HELD } };
+			case "a URL":
+				return { at: path, value: new URL(`https://example.invalid/${ENV_VALUE}`) };
+			case "a toJSON object": {
+				const form = heldForm(position);
+				return { at: path, value: { toJSON: () => form } };
+			}
+			case "a bigint":
+				return { at: path, value: BigInt(NUMBER_VALUE) };
+		}
+	};
+
+	for (const position of positions) {
+		const { row, path, kind } = position;
+		for (const shape of SHAPES) {
+			if (declares(position, shape)) continue;
+			it(`generated: ${row.rule} ${row.position} ${path} (${kind}) as ${shape}`, () => {
+				const { at, value } = written(position, shape);
+				const record = neutral(row.record);
+				setAt(record, at, value);
+				const generatedMask = numberMask();
+				const masked =
+					row.kind === "btw" ? maskBtwRecord(record, generatedMask) : maskSessionEntry(record, generatedMask);
+				const stored = stringifyJson(masked) ?? "";
+				const byType = typeof value === "number" || value === null;
+				expect({
+					path,
+					shape,
+					held: stored.includes(ENV_VALUE) || stored.includes(NUMBER_VALUE),
+					asWritten: !byType || valueAt(JSON.parse(stored), at) === value,
+				}).toEqual({ path, shape, held: false, asWritten: true });
+			});
+		}
+	}
+
+	/** An `anthropicServerTool` block's `block` whose content is of another type than the one a rule keeps fields on. */
+	const SERVER_TOOL_RULES: readonly { readonly name: string; readonly block: StoredRecord }[] = [
+		{
+			name: "a web_search_tool_result's content element of another type than web_search_result, holding a value in encrypted_content and in type",
+			block: {
+				type: "web_search_tool_result",
+				tool_use_id: "srvtoolu_generated",
+				content: [{ type: HELD, encrypted_content: HELD }],
+			},
+		},
+		{
+			name: "a tool_search_tool_result's object of another type, holding a value in tool_references[].tool_name",
+			block: {
+				type: "tool_search_tool_result",
+				tool_use_id: "srvtoolu_generated",
+				content: {
+					type: "plain_other_search_result",
+					tool_references: [{ type: "tool_reference", tool_name: HELD }],
+				},
+			},
+		},
+	];
+	for (const { name, block } of SERVER_TOOL_RULES) {
+		it(`server-tool element rule: ${name}, stores no held value`, () => {
+			const entry = storedMessageEntry(
+				"generated-server-tool",
+				assistantRecord([{ type: "anthropicServerTool", block }]),
+			);
+			const stored = stringifyJson(maskSessionEntry(entry, mask)) ?? "";
+			expect({ name, held: stored.includes(ENV_VALUE) }).toEqual({ name, held: false });
+		});
+	}
+});
 
 describe("keep rules hold only in the shape the list names", () => {
 	const at = (type: string, fields: Record<string, unknown>) => ({
