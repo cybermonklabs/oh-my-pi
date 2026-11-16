@@ -29,6 +29,8 @@ import { AuthStorage, SqliteAuthCredentialStore } from "../session/auth-storage"
 import { resolveSessionFileArg } from "./session-arg";
 import { SessionManager } from "../session/session-manager";
 import { defaultSessionStorage, FileSessionStorage } from "../session/session-storage";
+import { enoent } from "../session/session-storage-errors";
+import { copyTranscript } from "../session/session-transcript-tree";
 
 export interface RenderCommandArgs {
 	/** Session file path or id prefix; default: most recent session for cwd. */
@@ -160,9 +162,10 @@ export async function runRenderCommand(args: RenderCommandArgs): Promise<number>
 	let mode: InteractiveMode | undefined;
 	try {
 		// The copy goes into the same storage the original came from, because
-		// that is where `SessionManager.open` below reads it.
+		// that is where `SessionManager.open` below reads it; any other storage
+		// copies it chunk by chunk, never holding the transcript whole.
 		if (storage instanceof FileSessionStorage) await fs.copyFile(sourcePath, workingCopy);
-		else await storage.writeText(workingCopy, await storage.readText(sourcePath));
+		else if (!(await copyTranscript(storage, sourcePath, workingCopy))) throw enoent(sourcePath);
 		const openStart = performance.now();
 		const sessionManager = await SessionManager.open(workingCopy, undefined, undefined, {
 			suppressBreadcrumb: true,
