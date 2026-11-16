@@ -8,6 +8,7 @@ import * as storeMatcher from "@oh-my-pi/pi-coding-agent/secrets/session-store-m
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { failNextReads, plainYml, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 
 const MODULE_PATH = path.join(import.meta.dir, "../../src/secrets/session-store-mask.ts");
@@ -55,13 +56,7 @@ async function nextRun(): Promise<void> {
 
 const ENV_MARKER = "[REDACTED:env:SERVICE_API_KEY]";
 const FILE_MARKER = "[REDACTED:file:EXAMPLE_TOKEN_FILE]";
-const YML_MARKER = "[REDACTED:secrets.yml:project#1]";
 const NOW = 1_700_000_000_000;
-
-/** A secrets.yml whose one entry is the plain value `value`. */
-function plainYml(value: string): string {
-	return ["- type: plain", `  content: ${value}`].join("\n");
-}
 
 /** `text` as JSON text holds it. */
 function jsonEscaped(text: string): string {
@@ -137,7 +132,7 @@ describe("SessionStoreMasker sources", () => {
 				"  content: 'order-[0-9]{6}'",
 			].join("\n"),
 		);
-		await Bun.write(globalYml, ["- type: plain", "  content: global-plain-value-12"].join("\n"));
+		await Bun.write(globalYml, plainYml("global-plain-value-12"));
 		const mask = maskerFor({ SERVICE_API_KEY: ENV_VALUE, EXAMPLE_TOKEN_FILE: tokenFile }).snapshot(cwd);
 
 		const text = [ENV_VALUE, FILE_VALUE, "project-plain-value-90", "order-123456", "global-plain-value-12"].join(" ");
@@ -282,7 +277,7 @@ describe("SessionStoreMasker refresh", () => {
 		"reads a secrets.yml again at the next refresh once a permission fix makes it readable",
 		async () => {
 			const value = "project-plain-value-90";
-			await Bun.write(projectYml, ["- type: plain", `  content: ${value}`].join("\n"));
+			await Bun.write(projectYml, plainYml(value));
 			fs.chmodSync(projectYml, 0o000);
 			const masker = maskerFor({});
 			expect(masker.snapshot(cwd).maskText(value)).toBe(value);
@@ -478,22 +473,8 @@ describe("K23: a refresh whose read of a source fails", () => {
 		// Both rotate, and the next read of each fails in a way that leaves the file's stat as it is.
 		await Bun.write(projectYml, plainYml(ymlAfter));
 		await Bun.write(tokenFile, fileAfter);
-		const ioError = (): Error => Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
-		const pending = new Set([projectYml, tokenFile]);
-		const realReadFileSync = fs.readFileSync;
-		const realOpenSync = fs.openSync;
-		spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
-			if (file === projectYml && pending.delete(file)) throw ioError();
-			return (realReadFileSync as (target: fs.PathOrFileDescriptor, opts?: unknown) => string | Buffer)(
-				file,
-				options,
-			);
-		}) as typeof fs.readFileSync);
-		spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
-			if (file === tokenFile && pending.delete(file)) throw ioError();
-			return realOpenSync(file, flags, mode);
-		});
-		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const pending = failNextReads([projectYml, tokenFile]);
+		const warnings = sourceReadWarnings();
 		await nextRun();
 		clock += MINUTE;
 		// The write goes on under what the masker held.
@@ -504,7 +485,7 @@ describe("K23: a refresh whose read of a source fails", () => {
 		await nextRun();
 		clock += MINUTE;
 		expect(masker.snapshot(cwd).maskText(text)).toBe([YML_MARKER, FILE_MARKER, YML_MARKER, FILE_MARKER].join(" "));
-		expect(loggedDetails(warn, "Session store masking could not read a source")).toEqual([
+		expect(warnings()).toEqual([
 			{ kind: "file", source: "EXAMPLE_TOKEN_FILE", cause: "EIO" },
 			{ kind: "secrets.yml", source: projectYml, cause: "EIO" },
 		]);
@@ -521,6 +502,9 @@ describe("K24: matches that overlap", () => {
 	const HELD_MARKER = "[REDACTED:env:X_TOKEN]";
 	const WRAPPED = `wrap ${HELD_MARKER} wrap`;
 	const EDGE = "X_TOKEN]-edge-value";
+	const SHORT = "prefix-value-01";
+	const LONG = `${SHORT}-and-a-longer-tail-of-the-value-99`;
+	const REPEATING = "xyzw-xyzw";
 	const CASES: readonly {
 		readonly name: string;
 		readonly env: Record<string, string>;
@@ -559,6 +543,18 @@ describe("K24: matches that overlap", () => {
 			env: { X_TOKEN: HELD, EDGE_TOKEN: EDGE },
 			text: `see ${HELD_MARKER}-edge-value end`,
 			masked: "see [REDACTED:env:EDGE_TOKEN] end",
+		},
+		{
+			name: "(f) a short value that starts where a longer value's start occurs, though the longer value does not",
+			env: { A_TOKEN: SHORT, B_TOKEN: LONG },
+			text: `see ${SHORT}-and-a-longer-tail-of-the-XXXX end`,
+			masked: "see [REDACTED:env:A_TOKEN]-and-a-longer-tail-of-the-XXXX end",
+		},
+		{
+			name: "(g) a value that occurs twice, the second starting inside the first",
+			env: { X_TOKEN: REPEATING },
+			text: `a ${REPEATING}-xyzw b`,
+			masked: "a [REDACTED:env:X_TOKEN] b",
 		},
 	];
 

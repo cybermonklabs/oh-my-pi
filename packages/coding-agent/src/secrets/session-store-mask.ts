@@ -46,6 +46,15 @@ interface HeldRegex {
 	readonly source: HeldSource;
 }
 
+interface HeldValue {
+	readonly source: HeldSource;
+	/**
+	 * The value as JSON text holds it: a quote, a backslash or a control character escaped. The
+	 * value itself when it holds none, so a value without an escape is not kept twice.
+	 */
+	readonly escaped: string;
+}
+
 const REFRESH_INTERVAL_MS = 60_000;
 const MAX_SECRET_FILE_BYTES = 1024 * 1024;
 const UNSAFE_NAME_CHARS = /[^A-Za-z0-9_.-]/g;
@@ -80,7 +89,7 @@ class HeldSet {
 	/** Counts what was added, so a snapshot knows whether it holds all of it. */
 	additions = 0;
 	readonly sources: HeldSource[] = [];
-	readonly values = new Map<string, HeldSource>();
+	readonly values = new Map<string, HeldValue>();
 	/** By `<source>/<flags>`, in the order they were added. */
 	readonly regexes = new Map<string, HeldRegex>();
 
@@ -91,7 +100,8 @@ class HeldSet {
 
 	holdValue(value: string, source: () => HeldSource): void {
 		if (this.values.has(value)) return;
-		this.values.set(value, source());
+		const escaped = JSON.stringify(value).slice(1, -1);
+		this.values.set(value, { source: source(), escaped: escaped === value ? value : escaped });
 		this.additions++;
 	}
 
@@ -109,7 +119,9 @@ interface ProjectState {
 	readonly held: HeldSet;
 	/** The refresh that last checked that file. */
 	round: number;
-	/** The cwd's last snapshot. */
+	/** A mask was handed out for the cwd. */
+	served: boolean;
+	/** The cwd's own last snapshot, once its project secrets.yml holds something. */
 	mask?: SessionStoreMask;
 	/** The additions of the held sets that snapshot was built from. */
 	additions: number;
@@ -165,7 +177,7 @@ function collectSafely(kind: SessionStoreMaskSourceKind, collect: () => void): v
 /** Whether `label` contains a held plain value or a non-empty match of a held regex. */
 function exposesSecret(
 	label: string,
-	values: ReadonlyMap<string, HeldSource>,
+	values: ReadonlyMap<string, HeldValue>,
 	regexes: ReadonlyMap<string, HeldRegex>,
 ): boolean {
 	for (const value of values.keys()) {
@@ -183,8 +195,9 @@ function exposesSecret(
 /**
  * Holds every secret value Oh My Pi knows — secret-named environment variables,
  * the files `_FILE` variables name, and the project and global secrets.yml — and
- * hands out {@link SessionStoreMask} snapshots of them, one per cwd. Values are
- * only ever added: a rotated secret's old value stays masked.
+ * hands out {@link SessionStoreMask} snapshots of them for each cwd: its own for a
+ * cwd whose project secrets.yml holds something, one shared by every other cwd.
+ * Values are only ever added: a rotated secret's old value stays masked.
  */
 export class SessionStoreMasker {
 	readonly #env: () => Env;
@@ -199,8 +212,11 @@ export class SessionStoreMasker {
 	readonly #named = new HeldSet();
 	/** What the global secrets.yml holds. */
 	readonly #global = new HeldSet();
-	/** Each cwd's project secrets.yml and last snapshot, by resolved cwd. */
+	/** Each cwd's project secrets.yml, by resolved cwd. */
 	readonly #projects = new Map<string, ProjectState>();
+	/** The mask of every cwd whose project secrets.yml holds nothing, and the additions it was built from. */
+	#shared: SessionStoreMask | undefined;
+	#sharedAdditions = 0;
 	readonly #namedSources = new Map<string, HeldSource>();
 	/** Env and file sources held so far, by kind: the last `#<n>` position given. */
 	readonly #namedCounts = { env: 0, file: 0 };
@@ -208,7 +224,7 @@ export class SessionStoreMasker {
 	readonly #fileStamps = new Map<string, string>();
 	/** Stamp of each secrets.yml at its last read, by path. */
 	readonly #secretsFileStamps = new Map<string, string>();
-	/** Last logged reason a file gave no value, by `<kind>:<variable name or path>`. */
+	/** Last logged reason a source gave no value, by {@link #reasonKey}. */
 	readonly #loggedReasons = new Map<string, string>();
 
 	constructor(options: SessionStoreMaskerOptions) {
@@ -219,9 +235,10 @@ export class SessionStoreMasker {
 
 	/**
 	 * The mask for a writer in `cwd`: the environment values, the `_FILE` values, the global
-	 * secrets.yml and the project secrets.yml of `cwd`, never that of another cwd. Built at the
-	 * first call for a cwd and again once a source it holds has given a new value; the sources are
-	 * read again at most once a minute, never twice in one synchronous run.
+	 * secrets.yml and the project secrets.yml of `cwd`, never that of another cwd. Every cwd whose
+	 * project secrets.yml holds nothing shares one mask. A mask is built at the first call that
+	 * needs it and again once a source it holds has given a new value; the sources are read again
+	 * at most once a minute, never twice in one synchronous run.
 	 *
 	 * Throws when the mask cannot be built, so the write fails rather than store a value raw: a
 	 * mask that lacks a value the masker has taken in is never returned, and the next call builds
@@ -236,7 +253,7 @@ export class SessionStoreMasker {
 		}
 		let project = this.#projects.get(dir);
 		if (project === undefined) {
-			project = { held: new HeldSet(), round: 0, additions: 0 };
+			project = { held: new HeldSet(), round: 0, served: false, additions: 0 };
 			this.#projects.set(dir, project);
 		}
 		const { held } = project;
@@ -245,23 +262,33 @@ export class SessionStoreMasker {
 			project.round = this.#round;
 			collectSafely("secrets.yml", () => this.#collectSecretsFile(projectSecretsFilePath(dir), "project", held));
 		}
-		const additions = this.#named.additions + held.additions + this.#global.additions;
-		if (project.mask === undefined || project.additions !== additions) {
-			// Built whole before it replaces the last snapshot: after a build that throws, the
-			// additions still count as not built, so the next call builds again.
-			project.mask = this.#build(
-				[this.#named, held, this.#global],
-				project.mask === undefined ? "build" : "refresh",
-			);
-			project.additions = additions;
+		// Each mask is built whole before it replaces the last one: after a build that throws, the
+		// additions still count as not built, so the next call builds again.
+		const stage = project.served ? "refresh" : "build";
+		let mask: SessionStoreMask;
+		if (held.additions === 0) {
+			const additions = this.#named.additions + this.#global.additions;
+			if (this.#shared === undefined || this.#sharedAdditions !== additions) {
+				this.#shared = this.#build([this.#named, this.#global], stage);
+				this.#sharedAdditions = additions;
+			}
+			mask = this.#shared;
+		} else {
+			const additions = this.#named.additions + held.additions + this.#global.additions;
+			if (project.mask === undefined || project.additions !== additions) {
+				project.mask = this.#build([this.#named, held, this.#global], stage);
+				project.additions = additions;
+			}
+			mask = project.mask;
 		}
+		project.served = true;
 		if (!this.#handedOut) {
 			this.#handedOut = true;
 			queueMicrotask(() => {
 				this.#handedOut = false;
 			});
 		}
-		return project.mask;
+		return mask;
 	}
 
 	/** Reads the sources every cwd shares: the environment, the `_FILE` files and the global secrets.yml. */
@@ -310,7 +337,7 @@ export class SessionStoreMasker {
 			this.#skipFile(name, `shorter than ${MIN_ENV_VALUE_LENGTH} characters`);
 			return;
 		}
-		this.#loggedReasons.delete(`file:${name}`);
+		this.#loggedReasons.delete(this.#reasonKey("file", name));
 		this.#holdNamed("file", name, content);
 		for (const line of content.split("\n")) {
 			for (const password of connectionUrlPasswords(line.trim())) this.#holdNamed("file", name, password);
@@ -318,7 +345,7 @@ export class SessionStoreMasker {
 	}
 
 	#skipFile(name: string, reason: string): void {
-		if (this.#isNews(`file:${name}`, reason)) {
+		if (this.#isNews(this.#reasonKey("file", name), reason)) {
 			logger.debug("Session store masking skipped a file", { variable: name, reason });
 		}
 	}
@@ -327,15 +354,20 @@ export class SessionStoreMasker {
 	#failedRead(kind: "file" | "secrets.yml", source: string, err: unknown): void {
 		// The error code of a filesystem error, which names no path.
 		const cause = isFsError(err) ? err.code : String(err);
-		if (this.#isNews(`${kind}:${source}`, `unreadable (${cause})`)) {
+		if (this.#isNews(this.#reasonKey(kind, source), `unreadable (${cause})`)) {
 			logger.warn("Session store masking could not read a source", { kind, source, cause });
 		}
 	}
 
-	/** Whether `reason` differs from the last one logged for `source`: each is logged once. */
-	#isNews(source: string, reason: string): boolean {
-		if (this.#loggedReasons.get(source) === reason) return false;
-		this.#loggedReasons.set(source, reason);
+	/** The key of `source`'s last logged reason: a `_FILE` variable's name, or a secrets.yml's path. */
+	#reasonKey(kind: "file" | "secrets.yml", source: string): string {
+		return `${kind}:${source}`;
+	}
+
+	/** Whether `reason` differs from the last one logged under `key`: each is logged once. */
+	#isNews(key: string, reason: string): boolean {
+		if (this.#loggedReasons.get(key) === reason) return false;
+		this.#loggedReasons.set(key, reason);
 		return true;
 	}
 
@@ -347,13 +379,15 @@ export class SessionStoreMasker {
 			if (this.#secretsFileStamps.get(filePath) === stamp) return;
 			text = fs.readFileSync(filePath, "utf8");
 		} catch (err) {
-			// Not stamped, so the next refresh reads the file again even when it has not changed.
-			if (!isEnoent(err) && !isEnotdir(err)) this.#failedRead("secrets.yml", filePath, err);
+			// Not stamped, so the next refresh reads the file again even when it has not changed. A
+			// missing file clears the last reason, so a read that fails after it is logged again.
+			if (isEnoent(err) || isEnotdir(err)) this.#loggedReasons.delete(this.#reasonKey("secrets.yml", filePath));
+			else this.#failedRead("secrets.yml", filePath, err);
 			return;
 		}
 		// Stamped now that its text is read: a text that does not parse gives the same result next time.
 		this.#secretsFileStamps.set(filePath, stamp);
-		this.#loggedReasons.delete(`secrets.yml:${filePath}`);
+		this.#loggedReasons.delete(this.#reasonKey("secrets.yml", filePath));
 		for (const { entry, position } of parseSecretsFileText(text, filePath)) {
 			this.#holdEntry(held, entry, `${scope}#${position}`);
 		}
@@ -411,17 +445,18 @@ export class SessionStoreMasker {
 
 	#assemble(sets: readonly HeldSet[]): SessionStoreMask {
 		// The first set that holds a value or a regex names it; a source that names none is not listed.
-		const values = new Map<string, HeldSource>();
+		const values = new Map<string, HeldValue>();
 		const regexes = new Map<string, HeldRegex>();
 		for (const set of sets) {
-			for (const [value, source] of set.values) {
-				if (!values.has(value)) values.set(value, source);
+			for (const [value, held] of set.values) {
+				if (!values.has(value)) values.set(value, held);
 			}
 			for (const [key, held] of set.regexes) {
 				if (!regexes.has(key)) regexes.set(key, held);
 			}
 		}
-		const naming = new Set(values.values());
+		const naming = new Set<HeldSource>();
+		for (const { source } of values.values()) naming.add(source);
 		for (const { source } of regexes.values()) naming.add(source);
 		const markers = new Map<HeldSource, string>();
 		const sources: SessionStoreMaskSource[] = [];
@@ -439,13 +474,12 @@ export class SessionStoreMasker {
 			}
 		}
 		const literals = new Map<string, string>();
-		for (const [value, source] of values) literals.set(value, markers.get(source)!);
+		for (const [value, { source }] of values) literals.set(value, markers.get(source)!);
 		// JSON text (a structured yield's `<id>.md`, a printed JSON document) holds a value with a
 		// quote, a backslash or a control character only escaped, so the escaped form is held too,
 		// with the same marker; a held value of that text keeps its own. A marker needs no escape:
 		// masked JSON stays valid.
-		for (const [value, source] of values) {
-			const escaped = JSON.stringify(value).slice(1, -1);
+		for (const { source, escaped } of values.values()) {
 			if (!literals.has(escaped)) literals.set(escaped, markers.get(source)!);
 		}
 		const matcher = buildSessionStoreMatcher(

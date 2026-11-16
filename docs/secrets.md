@@ -158,7 +158,7 @@ When the setting is on, the agent replaces each value it holds with a marker tha
 2. `[REDACTED:file:<NAME>]`: the content of the file that an environment variable ending in `_FILE` names, other than `PI_SESSION_FILE`, and the password of a connection URL on a line of that file. `<NAME>` is the `_FILE` variable.
 3. `[REDACTED:secrets.yml:<label>]`: a `secrets.yml` entry, project or global. That is a replace-mode plain value of any length, an obfuscate-mode plain value of 8 characters or more, and every match of a regex entry. `<label>` is the sanitized `friendlyName`, else `project#<n>` or `global#<n>` for the entry's position in its file.
 
-When two sources hold the same value, an environment variable or a `_FILE` file names it before a `secrets.yml` entry, and the project `secrets.yml` names it before the global one. Among environment variables and `_FILE` files, the one the agent read first names it; at the first write, the agent reads the environment before the files. When a name or a `friendlyName` contains a held value, or a regex entry matches it, the marker uses the index form instead (`#<n>`, `project#<n>`, `global#<n>`). The agent never changes its own markers, so masking a stored text again gives the same text.
+When two sources hold the same value, an environment variable or a `_FILE` file names it before a `secrets.yml` entry, and the project `secrets.yml` names it before the global one. Among environment variables and `_FILE` files, the one the agent read first names it; at the first write, the agent reads the environment before the files. When a name or a `friendlyName` contains a held value, or a regex entry matches it, the marker uses the index form instead (`#<n>`, `project#<n>`, `global#<n>`). The agent never cuts a marker: a held value that overlaps one replaces it whole. Masking a stored text again gives the same text.
 
 The agent masks any number of held values, of any size; it reads a `_FILE` file only up to 1 MiB. Where two held values, or a held value and a match of a regex entry, overlap or touch, one marker replaces all the text they cover: the marker of the one that starts first. So no part of either value stays in the stored text.
 
@@ -242,6 +242,7 @@ Masking reduces the exposure of a secret. It does not remove it. To remove it, h
 - `packages/coding-agent/src/secrets/message-transform.ts` -- provider-context and local-context transforms
 - `packages/coding-agent/src/secrets/patterns.ts` -- built-in credential patterns
 - `packages/coding-agent/src/secrets/session-store-mask.ts` -- the values and markers of stored-session masking
+- `packages/coding-agent/src/secrets/session-store-matcher.ts` -- the matcher that finds held values in a text and replaces them with markers
 - `packages/coding-agent/src/session/session-entry-mask.ts` -- which fields of a session entry are masked
 - `packages/coding-agent/src/secrets/settings.ts` -- `secrets.enabled` and `secrets.maskSessionStore` setting definitions
 

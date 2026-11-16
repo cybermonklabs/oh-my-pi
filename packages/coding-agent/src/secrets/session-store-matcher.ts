@@ -14,12 +14,15 @@
  *
  * `mask` repeats the pass until the text no longer changes, so its result is a fixed point and
  * masking is idempotent. One changing pass is enough unless a regex depends on what surrounds its
- * match (an anchor, a lookaround) or a held literal holds marker text.
+ * match (an anchor, a lookaround) or a held literal holds marker text. With no regex and no literal
+ * that holds a bracket, `mask` runs one pass only: its result is the fixed point.
  *
  * No pattern grows with the size of a held value. A literal is found with `indexOf`; the only
  * patterns are alternations of keys, a key being a literal's first {@link KEY_CHARS} characters,
  * which say in one scan each which literals a text can hold at all.
  */
+
+import { literalAlternationSource } from "./regex";
 
 /** The start of every marker. */
 export const MARKER_PREFIX = "[REDACTED:";
@@ -69,11 +72,6 @@ interface MatchRange {
 interface Reach {
 	first: number;
 	last: number;
-}
-
-interface ScanRegex extends MarkedRegex {
-	/** Whether an empty match is stepped over by a code point rather than a code unit. */
-	readonly unicode: boolean;
 }
 
 const NO_SPANS: readonly Span[] = [];
@@ -177,18 +175,17 @@ function addOccurrences(
 class UnionMatcher implements SessionStoreMatcher {
 	readonly #markers = new Set<string>();
 	readonly #longestMarker: number;
-	/** Each held literal's marker. */
-	readonly #literals: ReadonlyMap<string, string>;
-	/** The held literals that start with each key. */
-	readonly #byKey = new Map<string, string[]>();
+	/** Each held literal, with its marker, by its key. */
+	readonly #byKey = new Map<string, [literal: string, marker: string][]>();
 	/** The lengths of the keys shorter than {@link KEY_CHARS}, ascending. */
 	readonly #shortKeyLengths: number[];
-	/** Alternations of the keys, longest first, each within {@link CHUNK_PATTERN_CHARS}. */
+	/** Alternations of the keys, each within {@link CHUNK_PATTERN_CHARS}. */
 	readonly #keyChunks: RegExp[] = [];
-	readonly #regexes: readonly ScanRegex[];
+	readonly #regexes: readonly MarkedRegex[];
+	/** No regex is held and no held literal holds a bracket, so one pass reaches the fixed point. */
+	readonly #onePass: boolean;
 
 	constructor(literals: ReadonlyMap<string, string>, regexes: readonly MarkedRegex[]) {
-		this.#literals = literals;
 		for (const marker of literals.values()) this.#markers.add(marker);
 		for (const { marker } of regexes) this.#markers.add(marker);
 		let longestMarker = 0;
@@ -199,40 +196,45 @@ class UnionMatcher implements SessionStoreMatcher {
 		}
 		this.#longestMarker = longestMarker;
 
-		for (const literal of literals.keys()) {
+		let bracketed = false;
+		for (const [literal, marker] of literals) {
 			if (literal === "") continue;
+			bracketed ||= literal.includes("[") || literal.includes("]");
 			const key = literal.slice(0, KEY_CHARS);
 			const sharing = this.#byKey.get(key);
-			if (sharing === undefined) this.#byKey.set(key, [literal]);
-			else sharing.push(literal);
+			if (sharing === undefined) this.#byKey.set(key, [[literal, marker]]);
+			else sharing.push([literal, marker]);
 		}
-		// Longest first, so the key an alternation matches at a position is the longest that starts there.
-		const keys = [...this.#byKey.keys()].sort((a, b) => b.length - a.length || (a < b ? -1 : 1));
 		const shortKeyLengths = new Set<number>();
-		let sources: string[] = [];
+		let chunk: string[] = [];
 		let chars = 0;
-		for (const key of keys) {
+		for (const key of this.#byKey.keys()) {
 			if (key.length < KEY_CHARS) shortKeyLengths.add(key.length);
-			const source = RegExp.escape(key);
-			if (sources.length > 0 && chars + source.length + 1 > CHUNK_PATTERN_CHARS) {
-				this.#keyChunks.push(compiledAlternation(sources));
-				sources = [];
+			const size = RegExp.escape(key).length + 1;
+			if (chunk.length > 0 && chars + size > CHUNK_PATTERN_CHARS) {
+				this.#keyChunks.push(compiledAlternation(chunk));
+				chunk = [];
 				chars = 0;
 			}
-			sources.push(source);
-			chars += source.length + 1;
+			chunk.push(key);
+			chars += size;
 		}
-		if (sources.length > 0) this.#keyChunks.push(compiledAlternation(sources));
+		if (chunk.length > 0) this.#keyChunks.push(compiledAlternation(chunk));
 		this.#shortKeyLengths = [...shortKeyLengths].sort((a, b) => a - b);
 
-		this.#regexes = regexes.map(({ regex, marker }) => {
-			// Without the global flag, `exec` would give the first match again and again.
+		for (const { regex } of regexes) {
+			// `matchAll` refuses a regex without the global flag: refused here, the build fails, not a write.
 			if (!regex.global) throw new Error("A held session store regex is not global");
-			return { regex, marker, unicode: regex.unicode || regex.unicodeSets };
-		});
+		}
+		this.#regexes = regexes;
+		this.#onePass = regexes.length === 0 && !bracketed;
 	}
 
 	mask(text: string): string {
+		// A bracket-free literal cannot partly overlap a marker, so an occurrence in the first pass's
+		// result lies wholly inside a marker, which is no value, or in text the pass left as it was,
+		// where the pass would have found it: with no regex, that result is the fixed point.
+		if (this.#onePass) return this.#pass(text);
 		// A range is whole exact markers and characters outside them, and one marker replaces it. So a
 		// pass that changes the text leaves fewer characters outside the exact markers, or as many and
 		// fewer markers: the text settles within `text.length` changing passes. Should it not, the
@@ -303,10 +305,10 @@ class UnionMatcher implements SessionStoreMatcher {
 		markers: readonly Span[],
 		ranges: MatchRange[],
 	): void {
+		// Every key found is one of `#byKey`'s: the alternations hold no other.
 		for (const [key, reach] of keys) {
-			for (const literal of this.#byKey.get(key) ?? []) {
-				const marker = this.#literals.get(literal);
-				if (marker !== undefined) addOccurrences(text, literal, reach, marker, markers, ranges);
+			for (const [literal, marker] of this.#byKey.get(key)!) {
+				addOccurrences(text, literal, reach, marker, markers, ranges);
 			}
 		}
 	}
@@ -366,30 +368,26 @@ class UnionMatcher implements SessionStoreMatcher {
 
 	/** Adds each non-empty regex match in `segment`, the text that starts at `offset` between two markers. */
 	#addRegexMatches(segment: string, offset: number, ranges: MatchRange[]): void {
-		for (const { regex, marker, unicode } of this.#regexes) {
+		for (const { regex, marker } of this.#regexes) {
+			// `matchAll` starts at the regex's `lastIndex` and steps over an empty match, as `replace` does.
 			regex.lastIndex = 0;
-			for (let match = regex.exec(segment); match !== null; match = regex.exec(segment)) {
-				const start = match.index;
+			for (const match of segment.matchAll(regex)) {
 				const length = match[0].length;
-				if (length > 0) {
-					const at = offset + start;
-					ranges.push({ at, length, start: at, end: at + length, marker });
-					continue;
-				}
-				// An empty match masks nothing; step over one character, as `String.prototype.replace` does.
-				const pair = unicode && (segment.codePointAt(start) ?? 0) > 0xffff;
-				regex.lastIndex = start + (pair ? 2 : 1);
+				// An empty match masks nothing.
+				if (length === 0) continue;
+				const at = offset + match.index;
+				ranges.push({ at, length, start: at, end: at + length, marker });
 			}
 		}
 	}
 }
 
 /**
- * The alternation of `sources`, matched once: JavaScriptCore compiles a pattern at its first match,
+ * The alternation of `keys`, matched once: JavaScriptCore compiles a pattern at its first match,
  * so a pattern it refuses fails here, where the matcher is built, and not in a write.
  */
-function compiledAlternation(sources: readonly string[]): RegExp {
-	const alternation = new RegExp(sources.join("|"), "g");
+function compiledAlternation(keys: readonly string[]): RegExp {
+	const alternation = new RegExp(literalAlternationSource(keys), "g");
 	alternation.test("");
 	alternation.lastIndex = 0;
 	return alternation;

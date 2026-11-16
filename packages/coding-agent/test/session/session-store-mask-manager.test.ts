@@ -38,6 +38,7 @@ import * as utils from "@oh-my-pi/pi-utils";
 import { getConfigRootDir, isRecord, setAgentDir, stringifyJson, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "../collab/helpers/in-memory-relay";
+import { failNextReads, plainYml, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
 
 const ENV_VALUE = "zq9-synthetic-service-4821";
 const FILE_VALUE = "file-held-token-7310";
@@ -920,13 +921,6 @@ describe("session store masking as the masker's sources change", () => {
 		return manager;
 	}
 
-	/** A secrets.yml whose one entry is the plain value `value`. */
-	function plainYml(value: string): string {
-		return ["- type: plain", `  content: ${value}`].join("\n");
-	}
-
-	const YML_MARKER = "[REDACTED:secrets.yml:project#1]";
-
 	it("K23: goes on writing under the values it holds when a refresh cannot read a source, and masks the rotated values once it can", async () => {
 		const [ymlBefore, ymlAfter] = ["yml-held-value-A1", "yml-held-value-A2"];
 		const [fileBefore, fileAfter] = ["file-held-value-B1", "file-held-value-B2"];
@@ -952,22 +946,8 @@ describe("session store masking as the masker's sources change", () => {
 		// Both rotate, and the next read of each fails in a way that leaves the file's stat as it is.
 		await Bun.write(yml, plainYml(ymlAfter));
 		await Bun.write(rotatingFile, fileAfter);
-		const ioError = (): Error => Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
-		const pending = new Set([yml, rotatingFile]);
-		const realReadFileSync = fsSync.readFileSync;
-		const realOpenSync = fsSync.openSync;
-		spyOn(fsSync, "readFileSync").mockImplementation(((file: fsSync.PathOrFileDescriptor, options?: unknown) => {
-			if (file === yml && pending.delete(file)) throw ioError();
-			return (realReadFileSync as (target: fsSync.PathOrFileDescriptor, opts?: unknown) => string | Buffer)(
-				file,
-				options,
-			);
-		}) as typeof fsSync.readFileSync);
-		spyOn(fsSync, "openSync").mockImplementation((file, flags, mode) => {
-			if (file === rotatingFile && pending.delete(file)) throw ioError();
-			return realOpenSync(file, flags, mode);
-		});
-		const warn = spyOn(utils.logger, "warn").mockImplementation(() => {});
+		const pending = failNextReads([yml, rotatingFile]);
+		const warnings = sourceReadWarnings();
 		now += 60_000;
 		// The write goes on: the values held before stay masked, the rotated ones are not held yet.
 		expect(await write()).toEqual([beforeRotation, beforeRotation]);
@@ -980,11 +960,7 @@ describe("session store masking as the masker's sources change", () => {
 		expect(errors).toEqual([]);
 		const stored = await storage.readText(sessionFileOf(manager));
 		expect([stored.includes(ymlBefore), stored.includes(fileBefore)]).toEqual([false, false]);
-		expect(
-			warn.mock.calls
-				.filter(call => call[0] === "Session store masking could not read a source")
-				.map(call => call[1]),
-		).toEqual([
+		expect(warnings()).toEqual([
 			{ kind: "file", source: "ROTATING_FILE", cause: "EIO" },
 			{ kind: "secrets.yml", source: yml, cause: "EIO" },
 		]);

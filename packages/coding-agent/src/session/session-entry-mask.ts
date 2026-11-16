@@ -32,7 +32,8 @@
  *   copy holds as its plain stored form: a signed block whose text a value changed loses its
  *   signature; such a carrier, server-tool group or snapcompact slot is left out of the stored copy.
  * - KR11: the `/btw` history record.
- * - KR12: outside this walk, `SessionStoreMask.maskText` leaves a range that equals one of its own markers as it is.
+ * - KR12: outside this walk, `SessionStoreMask.maskText` never cuts one of its own markers: a held value that
+ *   overlaps one replaces it whole, and a marker no held value overlaps stays as it is.
  * - KR13: object keys, numbers, booleans and `null`, never masked.
  */
 import { isBoxedPrimitive } from "node:util/types";
