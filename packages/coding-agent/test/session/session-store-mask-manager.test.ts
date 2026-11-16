@@ -20,6 +20,7 @@ import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import * as storeMatcher from "@oh-my-pi/pi-coding-agent/secrets/session-store-matcher";
 import { cfgSecretsMaskSessionStore } from "@oh-my-pi/pi-coding-agent/secrets/settings";
 import { type BtwHistoryRecord, BtwHistoryStore } from "@oh-my-pi/pi-coding-agent/session/btw-history";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -37,6 +38,7 @@ import * as utils from "@oh-my-pi/pi-utils";
 import { getConfigRootDir, isRecord, setAgentDir, stringifyJson, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "../collab/helpers/in-memory-relay";
+import { failNextReads, plainYml, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
 
 const ENV_VALUE = "zq9-synthetic-service-4821";
 const FILE_VALUE = "file-held-token-7310";
@@ -668,6 +670,86 @@ for (const backend of backends) {
 			expect((await store.storage.readText(sessionFileOf(manager))).includes(ENV_VALUE)).toBe(true);
 			await manager.close();
 		});
+
+		it("K31: fails the write whose masker build throws, and stores that line masked at the next write", async () => {
+			const [before, after] = ["first-rotating-value-1111", "second-rotating-value-2222"];
+			const marker = "[REDACTED:file:ROTATING_FILE]";
+			/**
+			 * One session's writes around a rotation of its `_FILE` value, with the masker build at the
+			 * refresh after the rotation throwing or not: what the store holds after each write, and
+			 * the errors the session reported.
+			 */
+			const writesAroundRotation = async (failBuild: boolean) => {
+				const rotatingFile = tmp.join(`rotating-${failBuild}.txt`);
+				await Bun.write(rotatingFile, before);
+				let now = NOW;
+				// The process masker reads only the test's file, never this machine's environment.
+				spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+					new storeMask.SessionStoreMasker({
+						env: () => ({ ROTATING_FILE: rotatingFile }),
+						agentDir: tmp.join("agent"),
+						now: () => now,
+					}),
+				);
+				const manager = await onDisk();
+				bindSetting(manager, Settings.isolated({ "secrets.maskSessionStore": true }));
+				const errors: string[] = [];
+				manager.onPersistenceError(error => errors.push(error.message));
+				const stored = async (): Promise<{ contents: unknown[]; raw: boolean }> => {
+					await manager.flush().catch(() => {});
+					await store.storage.drain();
+					const text = await store.storage.readText(sessionFileOf(manager));
+					return {
+						contents: storedRecords(text).map(record => messageOf(record).content),
+						raw: text.includes(before) || text.includes(after),
+					};
+				};
+
+				manager.appendMessage({ role: "user", content: said(before), timestamp: NOW });
+				const first = await stored();
+
+				await Bun.write(rotatingFile, after);
+				now += 60_000;
+				if (failBuild) {
+					spyOn(storeMatcher, "buildSessionStoreMatcher").mockImplementationOnce(() => {
+						throw new Error("injected matcher failure");
+					});
+				}
+				manager.appendMessage({ role: "user", content: said(after), timestamp: NOW });
+				const second = await stored();
+				const reported = [...errors];
+
+				manager.appendMessage({ role: "user", content: said(`${before} ${after}`), timestamp: NOW });
+				await settle(manager, store.storage);
+				const third = await stored();
+				await manager.close();
+				return { first, second, reported, third, errors };
+			};
+			const one = { contents: [said(marker)], raw: false };
+			const two = { contents: [said(marker), said(marker)], raw: false };
+			const three = { contents: [said(marker), said(marker), said(`${marker} ${marker}`)], raw: false };
+
+			// With no build failure the same steps store the markers and report no error.
+			expect(await writesAroundRotation(false)).toEqual({
+				first: one,
+				second: two,
+				reported: [],
+				third: three,
+				errors: [],
+			});
+
+			// The build at the refresh throws: that write fails, the error names the failure, and no
+			// line goes out under the mask that lacks the rotated value. The next write builds again
+			// and stores the failed line and its own, both masked.
+			const buildFailure = expect.stringMatching(/masking refresh failed.*injected matcher failure/);
+			expect(await writesAroundRotation(true)).toEqual({
+				first: one,
+				second: one,
+				reported: [buildFailure],
+				third: three,
+				errors: [buildFailure],
+			});
+		});
 	});
 }
 
@@ -724,12 +806,12 @@ describe("session store masking of the history.db title and recaps", () => {
 	});
 });
 
-describe("session store masking by the setting each manager is bound to", () => {
-	/** The content of each stored message of `manager`'s session, in file order. */
-	async function storedContents(manager: SessionManager, storage: SessionStorage): Promise<unknown[]> {
-		return storedRecords(await storage.readText(sessionFileOf(manager))).map(record => messageOf(record).content);
-	}
+/** The content of each stored message of `manager`'s session, in file order. */
+async function storedContents(manager: SessionManager, storage: SessionStorage): Promise<unknown[]> {
+	return storedRecords(await storage.readText(sessionFileOf(manager))).map(record => messageOf(record).content);
+}
 
+describe("session store masking by the setting each manager is bound to", () => {
 	it("masks the writes of a manager bound to the setting on and not those of one bound to it off", async () => {
 		// The process masker reads only the test's variable, never this machine's environment.
 		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
@@ -814,6 +896,97 @@ describe("session store masking by the setting each manager is bound to", () => 
 		}
 		expect(await storedContents(manager, storage)).toEqual([said(ENV_VALUE), said(ENV_MARKER)]);
 		await manager.close();
+	});
+});
+
+describe("session store masking as the masker's sources change", () => {
+	let now: number;
+
+	beforeEach(() => {
+		now = NOW;
+	});
+
+	/** Makes the process masker one that reads only `env` and the test's agent dir, on the test's clock. */
+	function useProcessMasker(env: Record<string, string>): void {
+		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+			new storeMask.SessionStoreMasker({ env: () => env, agentDir: tmp.join("agent"), now: () => now }),
+		);
+	}
+
+	/** A file-backed session in `dir` whose setting is on. */
+	async function maskedSession(dir: string, storage: SessionStorage): Promise<SessionManager> {
+		const manager = SessionManager.create(dir, tmp.join("sessions"), storage);
+		bindSetting(manager, Settings.isolated({ "secrets.maskSessionStore": true }));
+		await manager.ensureOnDisk();
+		return manager;
+	}
+
+	it("K23: goes on writing under the values it holds when a refresh cannot read a source, and masks the rotated values once it can", async () => {
+		const [ymlBefore, ymlAfter] = ["yml-held-value-A1", "yml-held-value-A2"];
+		const [fileBefore, fileAfter] = ["file-held-value-B1", "file-held-value-B2"];
+		const fileMarker = "[REDACTED:file:ROTATING_FILE]";
+		const yml = path.join(cwd, ".omp", "secrets.yml");
+		const rotatingFile = tmp.join("rotating.txt");
+		await Bun.write(yml, plainYml(ymlBefore));
+		await Bun.write(rotatingFile, fileBefore);
+		useProcessMasker({ ROTATING_FILE: rotatingFile });
+		const storage = new FileSessionStorage();
+		const manager = await maskedSession(cwd, storage);
+		const errors: Error[] = [];
+		manager.onPersistenceError(error => errors.push(error));
+		const text = [ymlBefore, fileBefore, ymlAfter, fileAfter].join(" ");
+		const write = async (): Promise<unknown[]> => {
+			manager.appendMessage({ role: "user", content: text, timestamp: NOW });
+			await settle(manager, storage);
+			return storedContents(manager, storage);
+		};
+		const beforeRotation = [YML_MARKER, fileMarker, ymlAfter, fileAfter].join(" ");
+		expect(await write()).toEqual([beforeRotation]);
+
+		// Both rotate, and the next read of each fails in a way that leaves the file's stat as it is.
+		await Bun.write(yml, plainYml(ymlAfter));
+		await Bun.write(rotatingFile, fileAfter);
+		const pending = failNextReads([yml, rotatingFile]);
+		const warnings = sourceReadWarnings();
+		now += 60_000;
+		// The write goes on: the values held before stay masked, the rotated ones are not held yet.
+		expect(await write()).toEqual([beforeRotation, beforeRotation]);
+		expect(pending.size).toBe(0);
+
+		// Neither file has changed since the rotation: each is read again because its read had failed.
+		now += 60_000;
+		const afterRotation = [YML_MARKER, fileMarker, YML_MARKER, fileMarker].join(" ");
+		expect(await write()).toEqual([beforeRotation, beforeRotation, afterRotation]);
+		expect(errors).toEqual([]);
+		const stored = await storage.readText(sessionFileOf(manager));
+		expect([stored.includes(ymlBefore), stored.includes(fileBefore)]).toEqual([false, false]);
+		expect(warnings()).toEqual([
+			{ kind: "file", source: "ROTATING_FILE", cause: "EIO" },
+			{ kind: "secrets.yml", source: yml, cause: "EIO" },
+		]);
+		await manager.close();
+	});
+
+	it("K27: masks a project's secrets.yml value in the sessions of that project only", async () => {
+		const [ownValue, otherValue] = ["project-a-plain-value-1", "project-b-plain-value-2"];
+		const other = tmp.join("other");
+		await Bun.write(path.join(cwd, ".omp", "secrets.yml"), plainYml(ownValue));
+		await Bun.write(path.join(other, ".omp", "secrets.yml"), plainYml(otherValue));
+		useProcessMasker({});
+		const storage = new FileSessionStorage();
+		const own = await maskedSession(cwd, storage);
+		const others = await maskedSession(other, storage);
+		// One process masker serves both: a write in the other project comes between two in this one.
+		for (const manager of [own, others, own]) {
+			manager.appendMessage({ role: "user", content: `${ownValue} ${otherValue}`, timestamp: NOW });
+			await settle(manager, storage);
+		}
+
+		const ownLine = `${YML_MARKER} ${otherValue}`;
+		expect(await storedContents(own, storage)).toEqual([ownLine, ownLine]);
+		expect(await storedContents(others, storage)).toEqual([`${ownValue} ${YML_MARKER}`]);
+		await own.close();
+		await others.close();
 	});
 });
 
@@ -3765,6 +3938,93 @@ for (const backend of backends) {
 	});
 }
 
+/** A class whose `toJSON` gives a `URL` holding {@link ENV_VALUE}; the session line stores that `URL` as its own keys: none. */
+class LinkReport {
+	toJSON(): URL {
+		return new URL(`https://example.invalid/page?ref=${ENV_VALUE}`);
+	}
+}
+
+/**
+ * K26: nodes whose `toJSON` result has a callable `toJSON` of its own. `stringifyJson` calls the
+ * `toJSON` of a node once, so the session line stores such a result as its own keys, without what
+ * its `toJSON` gives; an array element it reads through the element's own `toJSON`.
+ */
+const NESTED_TO_JSON_NODES: readonly { readonly name: string; readonly node: () => unknown }[] = [
+	{
+		name: "a toJSON result whose own toJSON returns the held value",
+		node: () => ({ toJSON: () => ({ inner: "plain", toJSON: () => HELD }) }),
+	},
+	{
+		name: "a toJSON result whose own toJSON returns an object holding it",
+		node: () => ({ toJSON: () => ({ inner: "plain", toJSON: () => ({ note: HELD }) }) }),
+	},
+	{
+		name: "an array toJSON result with such an element",
+		node: () => ({
+			toJSON: () => [
+				{ toJSON: () => ({ inner: "plain", toJSON: () => HELD }) },
+				{ inner: "plain", toJSON: () => HELD },
+			],
+		}),
+	},
+	{ name: "a class whose toJSON returns a URL holding it", node: () => new LinkReport() },
+];
+
+describe("K26: a toJSON result with a toJSON of its own, under file storage", () => {
+	/** `line`, stored for a parsed entry, with the id, the parent and the time of the entry `live` stores. */
+	const withIdentityOf = (line: string, live: string): string => {
+		const { id, parentId, timestamp } = JSON.parse(live);
+		return stringifyJson({ ...JSON.parse(line), id, parentId, timestamp }) ?? "";
+	};
+
+	for (const { name, node } of NESTED_TO_JSON_NODES) {
+		it(`K26: stores ${name} in tool result details and in custom data as the entry passed through JSON`, async () => {
+			maskWrites();
+			const storage = new FileSessionStorage();
+			const manager = SessionManager.create(cwd, tmp.join("sessions"), storage);
+			await manager.ensureOnDisk();
+			manager.appendMessage(
+				assistant([{ type: "toolCall", id: "call-k26", name: "lookup", arguments: {} }], { stopReason: "toolUse" }),
+			);
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "call-k26",
+				toolName: "lookup",
+				content: [{ type: "text", text: "plain" }],
+				details: { report: node() },
+				isError: false,
+				timestamp: NOW,
+			});
+			manager.appendCustomEntry("k26-data", { report: node() });
+			// The same two entries passed first through `JSON.parse(stringifyJson(entry))`, appended after them.
+			const [parsedResult, parsedCustom]: (SessionEntry | undefined)[] = manager
+				.getEntries()
+				.slice(-2)
+				.map(entry => JSON.parse(stringifyJson(entry) ?? "null"));
+			if (
+				parsedResult?.type !== "message" ||
+				parsedResult.message.role !== "toolResult" ||
+				parsedCustom?.type !== "custom"
+			) {
+				throw new Error("Expected the tool result and the custom entry");
+			}
+			manager.appendMessage(parsedResult.message);
+			manager.appendCustomEntry(parsedCustom.customType, parsedCustom.data);
+			await settle(manager, storage);
+			const lines = (await storage.readText(sessionFileOf(manager))).split("\n").filter(line => line.length > 0);
+			const [liveResultLine, liveCustomLine, parsedResultLine, parsedCustomLine] = lines.slice(-4);
+			expect({
+				name,
+				held: lines.some(line => line.includes(ENV_VALUE)),
+				detailsAsParsed: liveResultLine === withIdentityOf(parsedResultLine, liveResultLine),
+				dataAsParsed: liveCustomLine === withIdentityOf(parsedCustomLine, liveCustomLine),
+			}).toEqual({ name, held: false, detailsAsParsed: true, dataAsParsed: true });
+			await manager.close();
+		});
+	}
+});
+
 describe("copy-on-write of the stored copy", () => {
 	it("returns an entry of plain data with nothing to mask as itself, and copies any other node as its plain stored form", () => {
 		const content = [{ type: "text", text: "plain" }];
@@ -3796,7 +4056,7 @@ describe("copy-on-write of the stored copy", () => {
 		}).toEqual({ plainSame: true, nodesCopied: true, nodesAsStored: true, untouchedShared: true });
 	});
 
-	it("leaves a boxed BigInt, which the session line cannot store, as it is, so the write fails as with masking off", () => {
+	it("fails the masked write of a boxed BigInt, which the session line cannot store, as with masking off", () => {
 		const entry = storedMessageEntry("boxed-bigint", {
 			role: "toolResult",
 			toolCallId: "boxed-call",
@@ -3806,18 +4066,17 @@ describe("copy-on-write of the stored copy", () => {
 			isError: false,
 			timestamp: NOW,
 		});
-		const outcome = (record: unknown): string => {
+		const outcome = (write: () => string | undefined): string => {
 			try {
-				return `stored ${stringifyJson(record)}`;
+				return `stored ${write()}`;
 			} catch (error) {
 				return error instanceof TypeError ? "TypeError" : "another error";
 			}
 		};
-		const masked = maskSessionEntry(entry, mask);
-		expect({ unmasked: outcome(entry), masked: outcome(masked) }).toEqual({
-			unmasked: "TypeError",
-			masked: "TypeError",
-		});
+		expect({
+			unmasked: outcome(() => stringifyJson(entry)),
+			masked: outcome(() => stringifyJson(maskSessionEntry(entry, mask))),
+		}).toEqual({ unmasked: "TypeError", masked: "TypeError" });
 	});
 
 	for (const { name, message, bound } of NON_PLAIN_BINDINGS) {
