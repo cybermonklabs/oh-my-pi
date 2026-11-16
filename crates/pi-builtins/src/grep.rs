@@ -2113,13 +2113,8 @@ mod tests {
 		assert_eq!((code, out.as_str()), (0, "x --canary\n"), "{err}");
 		let (code, out, err) = run(&["-ne", "->", "--regexp", "-z"], input).await;
 		assert_eq!((code, out.as_str()), (0, "2:-> y\n"), "{err}");
-	}
-
-	/// The measured `-e` cases, which agree with GNU grep 3.11: its count,
-	/// `-o` output and `-n` output for each. clap used to refuse `-e '- x'`
-	/// with "unexpected argument" and `-e -v` with "a value is required".
-	#[tokio::test(flavor = "multi_thread")]
-	async fn regexp_operands_starting_with_a_dash_match_what_gnu_grep_matches() {
+		// These agree with GNU grep 3.11: its count, `-o` output and `-n`
+		// output for each.
 		for (args, line) in [
 			(&["-e", "- x"][..], "- x\n"),
 			(&["-F", "-e", "- x"][..], "- x\n"),

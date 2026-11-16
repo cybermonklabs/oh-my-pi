@@ -39,6 +39,7 @@ import {
 	coldBoundary,
 	coldCutPathIndex,
 	coldEntryForPersistence,
+	convertColdEntries,
 	convertToColdEntry,
 	copyColdEntry,
 	hydrateColdEntry,
@@ -2375,21 +2376,28 @@ export class SessionManager {
 	}
 
 	/**
+	 * Whether a convert pass can make an entry cold, as `#openColdStore`
+	 * answers: false while no store can be opened before the next load, or
+	 * once the store takes no new record (a write to it failed, or it closed).
+	 * {@link convertToColdEntry} then keeps every entry whole.
+	 */
+	#coldStoreTakesRecords(): boolean {
+		return this.#coldStore ? this.#coldStore.writable : !this.#coldStoreUnavailable;
+	}
+
+	/**
 	 * Bring every entry in line with `boundary`: in the `hydrate` phase the
 	 * entries it keeps whole become whole again, in the `convert` phase the
 	 * others become cold.
 	 */
 	#applyColdBoundary(boundary: ColdBoundary, phase: "hydrate" | "convert"): void {
 		const entries = this.#entries;
-		const openStore = () => this.#openColdStore();
+		if (phase === "convert") {
+			convertColdEntries(entries, boundary, () => this.#openColdStore());
+			return;
+		}
 		for (let index = 0; index < entries.length; index++) {
-			const entry = entries[index]!;
-			const cold = belongsCold(boundary, index);
-			if (phase === "hydrate") {
-				if (!cold) hydrateColdEntry(entry);
-			} else if (cold) {
-				convertToColdEntry(entry, openStore);
-			}
+			if (!belongsCold(boundary, index)) hydrateColdEntry(entries[index]!);
 		}
 	}
 
@@ -2791,12 +2799,12 @@ export class SessionManager {
 	 * compaction, the entries before its kept start that are not kept whole by
 	 * kind are written to a new cold store; the entries since stay whole until
 	 * a later compaction or the end of the stream decides, so a session with no
-	 * compaction writes nothing. After the stream the cut is computed for the
-	 * leaf, the entries it keeps whole are made whole again, stale replay
-	 * metadata is stripped (after any load-time pass, so from what the passes
-	 * left), every other entry still whole goes to the store (an entry off the
-	 * leaf's path, or one a pass or the stripping made whole), and the whole
-	 * entries' blob references are resolved.
+	 * compaction and no other branch writes nothing. After the stream the cut
+	 * is computed for the leaf, the entries it keeps whole are made whole
+	 * again, stale replay metadata is stripped (after any load-time pass, so
+	 * from what the passes left), every other entry still whole goes to the
+	 * store (an entry off the leaf's path, or one a pass or the stripping made
+	 * whole), and the whole entries' blob references are resolved.
 	 */
 	async #loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
 		// A current-version file whose first entry has no id may predate ids
@@ -2954,7 +2962,12 @@ export class SessionManager {
 			for (const entry of intake.entries) {
 				if (!isColdEntry(entry) && SessionManager.#sanitizeLoadedEntry(entry)) sanitized = true;
 			}
-			if (boundary) SessionManager.#coolLoadedEntries(intake.entries, boundary, openStore);
+			// Put in the store every entry the boundary leaves cold that the load
+			// holds whole: one the stream kept whole after the newest compaction's
+			// kept start that the leaf's path leaves, and one a load-time pass
+			// (writing through an accessor) or the replay-metadata stripping made
+			// whole, which goes back with the values it now holds.
+			if (boundary) convertColdEntries(intake.entries, boundary, openStore, { paced: true });
 			await resolveBlobRefsInEntries(
 				intake.entries.filter(entry => !isColdEntry(entry)),
 				this.#blobs,
@@ -2980,23 +2993,6 @@ export class SessionManager {
 		} catch (error) {
 			intake.store?.close();
 			throw error;
-		}
-	}
-
-	/**
-	 * Put in the store every entry `boundary` leaves cold that the load holds
-	 * whole: one the stream kept whole after the newest compaction's kept start
-	 * that the leaf's path leaves, and one a load-time pass (writing through an
-	 * accessor) or the replay-metadata stripping made whole, which goes back
-	 * with the values it now holds.
-	 */
-	static #coolLoadedEntries(
-		entries: readonly SessionEntry[],
-		boundary: ColdBoundary,
-		openStore: () => ColdEntryStore | undefined,
-	): void {
-		for (let position = 0; position < entries.length; position++) {
-			if (belongsCold(boundary, position)) convertToColdEntry(entries[position]!, openStore, { paced: true });
 		}
 	}
 
@@ -4504,7 +4500,7 @@ export class SessionManager {
 			resolveFrameData: data => this.resolveFrameData(data),
 			...options,
 		});
-		if (boundary) this.#applyColdBoundary(boundary, "convert");
+		if (boundary && this.#coldStoreTakesRecords()) this.#applyColdBoundary(boundary, "convert");
 		return context;
 	}
 
@@ -4519,8 +4515,7 @@ export class SessionManager {
 		const branch = this.#index.branchView();
 		const start = branch.findLastIndex(entry => entry.type === "compaction");
 		if (start < 0) return this.buildSessionContext({ transcript: true }).messages;
-		const tail = branch.slice(start);
-		return buildSessionContext(tail, this.#index.leafId(), new Map(tail.map(entry => [entry.id, entry])), {
+		return buildSessionContext(branch.slice(start), this.#index.leafId(), undefined, {
 			transcript: true,
 			resolveFrameData: data => this.resolveFrameData(data),
 		}).messages;
@@ -4637,8 +4632,8 @@ export class SessionManager {
 	 * returns the entry to the store, to its former record when the values are
 	 * unchanged.
 	 */
-	recoolEntriesBeforeCut(): void {
-		if (!this.#coldStoreEnabled) return;
+	recoolEntries(): void {
+		if (!this.#coldStoreEnabled || !this.#coldStoreTakesRecords()) return;
 		this.#applyColdBoundary(coldBoundary(this.#entries, this.#index.branchView(), this.#coldCutModel), "convert");
 	}
 
