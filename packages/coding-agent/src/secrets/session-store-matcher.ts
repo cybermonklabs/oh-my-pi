@@ -272,6 +272,8 @@ class KeyedLiteralIndex implements LiteralIndex {
 		return false;
 	}
 
+	// The same scan as `test`, kept apart: a shared visitor would cost a closure, and here a map, at
+	// every text the matcher passes, most of which hold no key.
 	reachesIn(text: string): Iterable<KeyReach> | undefined {
 		let reaches: Map<string, KeyReach> | undefined;
 		for (const chunk of this.#keyChunks) {
@@ -326,7 +328,7 @@ class UnionMatcher implements SessionStoreMatcher {
 	readonly #markers = new Set<string>();
 	readonly #longestMarker: number;
 	/** The marker of each held literal. */
-	readonly #markerOf = new Map<string, string>();
+	readonly #markerOf: ReadonlyMap<string, string>;
 	readonly #literals: LiteralIndex;
 	readonly #regexes: readonly MarkedRegex[];
 	/** No regex is held and no held literal holds a bracket, so one pass reaches the fixed point. */
@@ -344,12 +346,10 @@ class UnionMatcher implements SessionStoreMatcher {
 		this.#longestMarker = longestMarker;
 
 		let bracketed = false;
-		for (const [literal, marker] of literals) {
-			if (literal === "") continue;
-			bracketed ||= literal.includes("[") || literal.includes("]");
-			this.#markerOf.set(literal, marker);
-		}
-		this.#literals = buildLiteralIndex(this.#markerOf.keys());
+		for (const literal of literals.keys()) bracketed ||= literal.includes("[") || literal.includes("]");
+		this.#markerOf = literals;
+		// The index leaves out an empty literal.
+		this.#literals = buildLiteralIndex(literals.keys());
 
 		for (const { regex } of regexes) {
 			// `matchAll` refuses a regex without the global flag: refused here, the build fails, not a write.

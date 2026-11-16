@@ -46,7 +46,7 @@ export interface SecretFileReadOptions {
 	 * Sees the stat the read took of the path, before anything else: when it answers true, the read
 	 * opens nothing and gives {@link UnchangedSecretFile}.
 	 */
-	readonly unchanged?: (stat: fs.BigIntStats) => boolean;
+	readonly unchanged: (stat: fs.BigIntStats) => boolean;
 }
 
 const UNCHANGED: UnchangedSecretFile = { unchanged: true };
@@ -79,15 +79,8 @@ export async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> 
 	}
 }
 
-/**
- * What a read of the path whose stat is `stat` gives without opening it: unchanged, as the caller's
- * `unchanged` says, or a skip when it is not a regular file, which neither reader opens.
- */
-function beforeOpen(
-	stat: fs.BigIntStats,
-	options: SecretFileReadOptions | undefined,
-): SecretFileRead | UnchangedSecretFile | undefined {
-	if (options?.unchanged?.(stat)) return UNCHANGED;
+/** The skip of a path whose stat is `stat` when it is not a regular file, which neither reader opens. */
+function notRegularFile(stat: fs.BigIntStats): SecretFileRead | undefined {
 	return stat.isFile() ? undefined : { skip: "not a regular file", oversized: false, stat };
 }
 
@@ -121,18 +114,14 @@ function readFileText(stat: fs.BigIntStats, buffer: Buffer, length: number): Sec
  * and the file is read only when it holds at most 1 MiB and did not grow while it was read.
  * {@link readSecretFile} is the same read for an async caller.
  */
-export function readSecretFileSync(filePath: string): SecretFileRead;
 export function readSecretFileSync(
 	filePath: string,
 	options: SecretFileReadOptions,
-): SecretFileRead | UnchangedSecretFile;
-export function readSecretFileSync(
-	filePath: string,
-	options?: SecretFileReadOptions,
 ): SecretFileRead | UnchangedSecretFile {
 	const stat = fs.statSync(filePath, { bigint: true });
-	const unopened = beforeOpen(stat, options);
-	if (unopened !== undefined) return unopened;
+	if (options.unchanged(stat)) return UNCHANGED;
+	const notFile = notRegularFile(stat);
+	if (notFile !== undefined) return notFile;
 	const fd = fs.openSync(filePath, SECRET_FILE_OPEN_FLAGS);
 	try {
 		const opened = fs.fstatSync(fd, { bigint: true });
@@ -152,18 +141,10 @@ export function readSecretFileSync(
 }
 
 /** {@link readSecretFileSync} for an async caller: the same checks, the same bound, the same decoding. */
-async function readSecretFile(filePath: string): Promise<SecretFileRead>;
-async function readSecretFile(
-	filePath: string,
-	options: SecretFileReadOptions,
-): Promise<SecretFileRead | UnchangedSecretFile>;
-async function readSecretFile(
-	filePath: string,
-	options?: SecretFileReadOptions,
-): Promise<SecretFileRead | UnchangedSecretFile> {
+async function readSecretFile(filePath: string): Promise<SecretFileRead> {
 	const stat = await fs.promises.stat(filePath, { bigint: true });
-	const unopened = beforeOpen(stat, options);
-	if (unopened !== undefined) return unopened;
+	const notFile = notRegularFile(stat);
+	if (notFile !== undefined) return notFile;
 	const handle = await fs.promises.open(filePath, SECRET_FILE_OPEN_FLAGS);
 	try {
 		const opened = await handle.stat({ bigint: true });
