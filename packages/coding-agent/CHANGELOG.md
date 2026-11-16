@@ -13,6 +13,7 @@
 ### Fixed
 
 - A session that finds another writer's entries in its file while rewriting it reads the file back in pieces instead of all at once, so keeping those entries no longer holds a whole long transcript in memory
+- A `task` call whose `taskFile` names a FIFO is refused without opening the FIFO, so a program waiting to write to it stays blocked instead of losing its write or being killed by SIGPIPE
 
 ## [18.18.6] - 2026-11-09
 

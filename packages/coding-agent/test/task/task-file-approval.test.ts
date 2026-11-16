@@ -370,6 +370,43 @@ describe("taskFile approval binding", () => {
 		expect(executions).toHaveLength(0);
 	});
 
+	// Windows has no FIFOs.
+	it.skipIf(process.platform === "win32")(
+		"refuses a FIFO task file without releasing a writer blocked in its open",
+		async () => {
+			const taskFile = path.join(directory, "task.fifo");
+			expect(Bun.spawnSync(["mkfifo", taskFile]).exitCode).toBe(0);
+			const { wrapper, context, tool } = await createWrapper(async () => "Approve");
+			// The shell reports that it started, then blocks in its open of the FIFO until a reader opens it.
+			const writer = Bun.spawn(["sh", "-c", 'echo started && printf x > "$1"', "sh", taskFile], {
+				stdout: "pipe",
+				stderr: "ignore",
+			});
+			try {
+				await (writer.stdout as ReadableStream<Uint8Array>).getReader().read();
+				const approved = await wrapper.execute("fifo-approved", { taskFile }, undefined, undefined, context);
+				const unapproved = await tool.execute("fifo-unapproved", { taskFile });
+
+				for (const result of [approved, unapproved]) {
+					expect(result.isError).toBe(true);
+					expect(result.content).toEqual([
+						expect.objectContaining({ text: expect.stringContaining("must resolve to a regular file") }),
+					]);
+				}
+				// A reader's open would let the writer go on: it exits, or dies of SIGPIPE when that reader closes.
+				// Real clock on purpose: the passing outcome is another process not exiting, which no event signals
+				// and fake timers cannot advance; the wait bounds how long a late exit can go unseen.
+				const outcome = await Promise.race([writer.exited, Bun.sleep(2_000).then(() => "still blocked")]);
+				expect(outcome).toBe("still blocked");
+				expect(executions).toHaveLength(0);
+			} finally {
+				writer.kill();
+				await writer.exited;
+			}
+		},
+		10_000,
+	);
+
 	it("restores the outer file binding after a nested wrapper invocation", async () => {
 		const { taskFile, restricted } = await linkedFiles();
 		let prompts = 0;
