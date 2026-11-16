@@ -243,7 +243,7 @@ Masking reduces the exposure of a secret. It does not remove it. To remove it, h
 - `packages/coding-agent/src/secrets/regex.ts` -- regex literal parsing and compilation
 - `packages/coding-agent/src/secrets/message-transform.ts` -- provider-context and local-context transforms
 - `packages/coding-agent/src/secrets/patterns.ts` -- built-in credential patterns
-- `packages/coding-agent/src/secrets/session-store-mask.ts` -- the values and markers of stored-session masking
+- `packages/coding-agent/src/secrets/session-store-mask.ts` -- the values and markers of stored-session masking, and the masked `history.db` write
 - `packages/coding-agent/src/secrets/session-store-matcher.ts` -- the matcher that finds held values in a text and replaces them with markers
 - `packages/coding-agent/src/session/session-entry-mask.ts` -- which fields of a session entry are masked
 - `packages/coding-agent/src/secrets/settings.ts` -- `secrets.enabled` and `secrets.maskSessionStore` setting definitions

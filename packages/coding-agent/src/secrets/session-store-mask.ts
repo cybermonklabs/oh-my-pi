@@ -14,6 +14,7 @@ import { MIN_OBFUSCATE_SECRET_LEN, sanitizeSecretFriendlyName } from "./placehol
 import { compileSecretRegex } from "./regex";
 import {
 	globalSecretsFilePath,
+	MIB,
 	parseSecretsFileText,
 	projectSecretsFilePath,
 	readSecretFileSync,
@@ -64,7 +65,7 @@ interface HeldValue {
 
 const REFRESH_INTERVAL_MS = 60_000;
 /** The most the file a `_FILE` variable names may hold: a larger one gives no value. A secrets.yml has no bound. */
-const MAX_FILE_SOURCE_BYTES = 1024 * 1024;
+const MAX_FILE_SOURCE_BYTES = MIB;
 const UNSAFE_NAME_CHARS = /[^A-Za-z0-9_.-]/g;
 
 /**
@@ -360,8 +361,7 @@ export class SessionStoreMasker {
 	#collectSecretsFile(filePath: string, scope: "project" | "global", held: HeldSet): void {
 		let read: SecretFileRead | UnchangedSecretFile;
 		try {
-			// A file whose stamp has not changed is neither opened nor read: what it gave still holds. A
-			// secrets.yml of any size is read: only a `_FILE` content is bounded.
+			// A file whose stamp has not changed is neither opened nor read: what it gave still holds.
 			read = readSecretFileSync(filePath, {
 				unchanged: stat => this.#secretsFileStamps.get(filePath) === stampOf(filePath, stat),
 			});

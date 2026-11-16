@@ -15,7 +15,8 @@ export interface PositionedSecretEntry {
 
 type RawSecretEntry = Omit<SecretEntry, "friendlyName"> & { friendlyName?: unknown };
 
-const MIB = 1024 * 1024;
+/** One mebibyte: a caller's size bound is a whole number of them. */
+export const MIB = 1024 * 1024;
 /** Non-blocking: by the open, the path may name a FIFO. */
 const SECRET_FILE_OPEN_FLAGS = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
 /** UTF-8, as both readers decode: a leading byte-order mark is dropped, a malformed sequence becomes U+FFFD. */
@@ -67,7 +68,6 @@ export function globalSecretsFilePath(agentDir: string): string {
  */
 export async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> {
 	try {
-		// No bound: only the file a `_FILE` variable names is bounded, by the masker that reads it.
 		const read = await readSecretFile(filePath);
 		if ("skip" in read) {
 			if (read.oversized) logger.warn("Skipped secrets.yml", { path: filePath, reason: read.skip });
