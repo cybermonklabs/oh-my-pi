@@ -1,8 +1,9 @@
 /**
  * Older entry bodies on disk instead of in memory.
  *
- * The model context only needs the entries from the latest compaction's cut on
- * (see {@link coldCutIndex}). An entry before the cut becomes *cold*: the same
+ * The model context only needs the entries of the current branch from the
+ * latest compaction's cut on (see {@link coldBoundary}). An entry before the
+ * cut, or off the current branch, becomes *cold*: the same
  * object, converted in place, whose small values stay data properties and whose
  * large values become enumerable accessors that read the entry's record back
  * from a {@link ColdEntryStore}. `JSON.stringify`, spread and `structuredClone`
@@ -23,7 +24,13 @@ import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { type BlobStore, isBlobRef } from "./blob-store";
 import { compactionKeptStart, getReadableCompactionEntry } from "./session-context";
-import { type FileEntry, type SessionEntry, TITLE_CHANGE_ENTRY_TYPE, todoResultPhases } from "./session-entries";
+import {
+	type CompactionEntry,
+	type FileEntry,
+	type SessionEntry,
+	TITLE_CHANGE_ENTRY_TYPE,
+	todoResultPhases,
+} from "./session-entries";
 import { repairTruncatedSnapcompactFrames, resolveBlobRefsInEntriesSync } from "./session-loader";
 import { entryRecordText } from "./session-persistence";
 
@@ -71,7 +78,7 @@ function paceCollection(bytes: number): void {
  * service tier, mode, TTSR rules, labels, credential pins, `/clear` boundaries,
  * usage, titles). {@link entriesKeptWholeOnPath} adds two entries by position.
  */
-export const ENTRY_TYPES_KEPT_WHOLE: ReadonlySet<string> = new Set<SessionEntry["type"]>([
+const ENTRY_TYPES_KEPT_WHOLE: ReadonlySet<string> = new Set<SessionEntry["type"]>([
 	"custom",
 	"model_change",
 	"thinking_level_change",
@@ -84,6 +91,19 @@ export const ENTRY_TYPES_KEPT_WHOLE: ReadonlySet<string> = new Set<SessionEntry[
 	"model_usage",
 	TITLE_CHANGE_ENTRY_TYPE,
 ]);
+
+/**
+ * The one `custom` type that goes cold like a message: the patch records a
+ * shake pass appends hold the new bodies of the entries they patch, which a
+ * load applies to those entries; no turn reads the records themselves.
+ */
+const PATCH_RECORD_CUSTOM_TYPE = "entry_patch";
+
+/** Whether `entry` stays whole wherever it lies, by its type ({@link ENTRY_TYPES_KEPT_WHOLE}). */
+export function keptWholeByKind(entry: SessionEntry): boolean {
+	if (entry.type === "custom") return entry.customType !== PATCH_RECORD_CUSTOM_TYPE;
+	return ENTRY_TYPES_KEPT_WHOLE.has(entry.type);
+}
 
 /** Fields that always stay data: the tree structure every walk reads. */
 const ENTRY_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["type", "id", "parentId", "timestamp", "activeLeafId"]);
@@ -129,15 +149,28 @@ export function coldCutPathIndex(path: readonly SessionEntry[], model: Model | u
 	return start;
 }
 
-/** Index in `entries` (file order) of the cut {@link coldCutPathIndex} finds on `path`. */
-export function coldCutIndex(
+/**
+ * Index in `entries` of the first entry kept by the compaction that is the last
+ * of `entries`, for a load that has read the transcript up to that compaction:
+ * the entry {@link compactionKeptStart} would find, searched only from `from`
+ * on. A kept start before `from` gives `from`; a compaction whose kept entry
+ * was not loaded keeps only itself.
+ */
+export function streamedKeptStart(
 	entries: readonly SessionEntry[],
-	path: readonly SessionEntry[],
-	model: Model | undefined,
+	compaction: CompactionEntry,
+	from: number,
+	isLoaded: (id: string) => boolean,
 ): number {
-	const cutEntry = path[coldCutPathIndex(path, model)];
-	const index = cutEntry ? entries.indexOf(cutEntry) : -1;
-	return index < 0 ? 0 : index;
+	const at = entries.length - 1;
+	const { firstKeptEntryId, providerReplayThroughEntryId } = compaction;
+	const keptId = firstKeptEntryId === "" ? providerReplayThroughEntryId : firstKeptEntryId;
+	if (!keptId) return at;
+	for (let index = at - 1; index >= from; index--) {
+		if (entries[index]!.id !== keptId) continue;
+		return keptId === firstKeptEntryId ? index : Math.min(index + 1, at);
+	}
+	return isLoaded(keptId) ? from : at;
 }
 
 /** Short strings shared across a load's entries; longer ones are mostly unique. */
@@ -196,24 +229,36 @@ export class LoadedValueInterner {
 
 /** Which entries are cold for one leaf and model. */
 export interface ColdBoundary {
-	/** Index in file order of the first entry from which every entry is whole. */
-	readonly cutIndex: number;
-	/** Entries before the cut kept whole by position ({@link entriesKeptWholeOnPath}). */
-	readonly keptOnPath: ReadonlySet<SessionEntry>;
+	/** By index in the entries it was computed for: 1 where the entry belongs in the store. */
+	readonly cold: Uint8Array;
 }
 
+/**
+ * Which of `entries` (file order) belong in the store while the leaf ends
+ * `path`: every entry except those the context reads (the current path from
+ * the cut on), those kept whole by kind ({@link keptWholeByKind}) and those
+ * kept whole by position on the path ({@link entriesKeptWholeOnPath}). An
+ * entry off the current path is cold wherever it lies.
+ */
 export function coldBoundary(
 	entries: readonly SessionEntry[],
 	path: readonly SessionEntry[],
 	model: Model | undefined,
 ): ColdBoundary {
-	const cutIndex = coldCutIndex(entries, path, model);
-	return { cutIndex, keptOnPath: cutIndex > 0 ? entriesKeptWholeOnPath(path) : new Set() };
+	const cut = coldCutPathIndex(path, model);
+	const whole = cut > 0 ? entriesKeptWholeOnPath(path) : new Set<SessionEntry>();
+	for (let index = cut; index < path.length; index++) whole.add(path[index]!);
+	const cold = new Uint8Array(entries.length);
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index]!;
+		if (!whole.has(entry) && !keptWholeByKind(entry)) cold[index] = 1;
+	}
+	return { cold };
 }
 
-/** Whether the entry at file index `index` belongs in the store under `boundary`. */
-export function belongsCold(entry: SessionEntry, index: number, boundary: ColdBoundary): boolean {
-	return index < boundary.cutIndex && !ENTRY_TYPES_KEPT_WHOLE.has(entry.type) && !boundary.keptOnPath.has(entry);
+/** Whether the entry at index `index` belongs in the store under `boundary`; an entry added since is whole. */
+export function belongsCold(boundary: ColdBoundary, index: number): boolean {
+	return boundary.cold[index] === 1;
 }
 
 /** Where one entry's record lives, read from the entry's hidden slots. */
@@ -230,12 +275,15 @@ const COLD_OFFSET = Symbol("omp.coldOffset");
 const COLD_LENGTH = Symbol("omp.coldLength");
 const COLD_MESSAGE = Symbol("omp.coldMessage");
 const COLD_OWNER = Symbol("omp.coldOwner");
+/** On an entry made whole again: the record it had, which it takes back if it goes cold unchanged. */
+const COLD_FORMER = Symbol("omp.coldFormer");
 
 interface ColdEntrySlots {
 	[COLD_STORE]?: ColdEntryStore;
 	[COLD_OFFSET]?: number;
 	[COLD_LENGTH]?: number;
 	[COLD_MESSAGE]?: object;
+	[COLD_FORMER]?: ColdRecord;
 }
 
 interface ColdMessageSlots {
@@ -414,12 +462,18 @@ interface StoreHandle {
 	fd: number;
 	/** Set on Windows, where an open file cannot be unlinked: deleted when the store goes. */
 	path: string | undefined;
+	/** Set once `fd` is closed: the number may belong to another file since. */
+	closed: boolean;
 }
 
 const windowsStoreHandles = new Set<StoreHandle>();
 let windowsExitHookInstalled = false;
+/** Whether a store that could not be opened was reported; the cause is the host's, so once is enough. */
+let openFailureLogged = false;
 
 function releaseStoreHandle(handle: StoreHandle): void {
+	if (handle.closed) return;
+	handle.closed = true;
 	try {
 		fs.closeSync(handle.fd);
 	} catch {
@@ -458,7 +512,8 @@ interface CachedRecord {
  * on Windows it is deleted when the store is collected and at exit). A record
  * is the entry exactly as the manager held it, with image data replaced by
  * blob references. Every cold entry refers to its store, so a clone sharing
- * the entries keeps it open as long as it needs it.
+ * the entries keeps it open as long as it needs it; the last manager holding
+ * it closes it when that manager closes ({@link release}).
  */
 export class ColdEntryStore {
 	readonly #blobs: BlobStore;
@@ -469,7 +524,10 @@ export class ColdEntryStore {
 	#written = 0;
 	#pending: Buffer[] = [];
 	#pendingBytes = 0;
-	#writeFailureLogged = false;
+	/** Set when a write failed: the pending records stay in memory and the store takes no new one. */
+	#writeFailed = false;
+	/** Managers holding the store ({@link retain}). */
+	#holders = 0;
 	/** Materialized records by offset; a record larger than {@link CACHE_BYTES} is not kept. */
 	readonly #cache = new LRUCache<number, CachedRecord>({
 		max: CACHE_ENTRIES,
@@ -479,6 +537,26 @@ export class ColdEntryStore {
 	#materializations = 0;
 	#hydrations = 0;
 
+	/**
+	 * A new store, or undefined when its file cannot be made (`os.tmpdir()`
+	 * read-only, missing and impossible to create, out of descriptors): the
+	 * caller then keeps its entries whole, as a session without a store does.
+	 */
+	static open(blobs: BlobStore): ColdEntryStore | undefined {
+		try {
+			return new ColdEntryStore(blobs);
+		} catch (error) {
+			if (!openFailureLogged) {
+				openFailureLogged = true;
+				logger.warn("Older session entries stay in memory: their store cannot be opened", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return undefined;
+		}
+	}
+
+	/** Throws when the file cannot be made; {@link open} returns undefined instead. */
 	constructor(blobs: BlobStore) {
 		this.#blobs = blobs;
 		// One directory per account: `os.tmpdir()` is shared between accounts on
@@ -489,14 +567,24 @@ export class ColdEntryStore {
 		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
 		const fd = fs.openSync(file, "wx+", 0o600);
-		this.#handle = { fd, path: undefined };
+		this.#handle = { fd, path: undefined, closed: false };
 		if (process.platform === "win32") {
 			this.#handle.path = file;
 			trackWindowsStore(this.#handle);
 		} else {
-			fs.unlinkSync(file);
+			try {
+				fs.unlinkSync(file);
+			} catch (error) {
+				fs.closeSync(fd);
+				throw error;
+			}
 		}
 		storeRegistry.register(this, this.#handle, this);
+	}
+
+	/** Whether the store takes new records: it is open and no write to it failed. */
+	get writable(): boolean {
+		return !this.#writeFailed && !this.#handle.closed;
 	}
 
 	/** Bytes of records written to the store. */
@@ -547,7 +635,23 @@ export class ColdEntryStore {
 		this.#hydrations++;
 	}
 
-	/** Close the store now. Only for a store no cold entry refers to. */
+	/** Count one more manager holding the store. */
+	retain(): void {
+		this.#holders++;
+	}
+
+	/**
+	 * Drop one manager's hold. With `close` (the manager closes) the store
+	 * closes at once when no other manager holds it; a store a manager let go
+	 * of otherwise (a switch to another session) closes once it is collected,
+	 * since a snapshot taken to roll that switch back can still read it.
+	 */
+	release(close: boolean): void {
+		this.#holders = Math.max(0, this.#holders - 1);
+		if (close && this.#holders === 0) this.close();
+	}
+
+	/** Close the store now; a later read of one of its records throws. */
 	close(): void {
 		storeRegistry.unregister(this);
 		this.#cache.clear();
@@ -555,9 +659,9 @@ export class ColdEntryStore {
 		releaseStoreHandle(this.#handle);
 	}
 
-	/** Write one record; its entry becomes cold through {@link convertToColdEntry}. */
-	append(text: string): ColdRecord {
-		const data = Buffer.from(text, "utf8");
+	/** Write one record; its entry becomes cold through {@link convertToColdEntry}. Only while {@link writable}. */
+	append(data: Buffer): ColdRecord {
+		if (!this.writable) throw new Error("A cold entry store that failed or closed cannot take a record.");
 		const record: ColdRecord = { store: this, offset: this.#bytes, length: data.length };
 		this.#pending.push(data);
 		this.#pendingBytes += data.length;
@@ -566,12 +670,19 @@ export class ColdEntryStore {
 		return record;
 	}
 
+	/** Whether `record` of this store holds exactly `data`, so an entry that goes cold unchanged can take it back. */
+	holds(record: ColdRecord, data: Buffer): boolean {
+		return record.store === this && record.length === data.length && this.#read(record).equals(data);
+	}
+
 	/**
-	 * Write the pending records. A failed write keeps them in memory, where
-	 * reads still find them, and the next flush tries again.
+	 * Write the pending records. A failed write keeps them in memory, joined in
+	 * one buffer, where reads still find them; the store then takes no new
+	 * record and tries no write again, so a full disk costs one attempt.
 	 */
 	#flush(): boolean {
 		if (this.#pendingBytes === 0) return true;
+		if (this.#writeFailed) return false;
 		const data = this.#pending.length === 1 ? this.#pending[0]! : Buffer.concat(this.#pending, this.#pendingBytes);
 		this.#pending = [data];
 		try {
@@ -580,12 +691,10 @@ export class ColdEntryStore {
 				done += fs.writeSync(this.#handle.fd, data, done, data.length - done, this.#written + done);
 			}
 		} catch (error) {
-			if (!this.#writeFailureLogged) {
-				this.#writeFailureLogged = true;
-				logger.warn("Cold session entries stay in memory: writing their store failed", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
+			this.#writeFailed = true;
+			logger.warn("Older session entries stay in memory: writing their store failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 			return false;
 		}
 		this.#written += data.length;
@@ -595,8 +704,8 @@ export class ColdEntryStore {
 	}
 
 	#read(record: ColdRecord): Buffer {
+		if (this.#handle.closed) throw new Error("An older session entry was read after its session closed.");
 		if (record.offset >= this.#written && !this.#flush()) {
-			// A failed flush leaves every pending record joined in its one buffer.
 			const start = record.offset - this.#written;
 			return this.#pending[0]!.subarray(start, start + record.length);
 		}
@@ -615,7 +724,9 @@ export class ColdEntryStore {
  * Make a cold `entry` whole again, in place: parse its record unfrozen and turn
  * every accessor back into a data property, `entry.message` staying the same
  * object. Without `resolveBlobs: false` image data are read back from the blob
- * store. Returns false when `entry` is not cold.
+ * store. The entry remembers its record, which it takes back when it goes cold
+ * again unchanged ({@link convertToColdEntry}). Returns false when `entry` is
+ * not cold.
  */
 export function hydrateColdEntry(entry: object, options?: { resolveBlobs?: boolean }): boolean {
 	const record = recordOf(entry);
@@ -637,6 +748,7 @@ export function hydrateColdEntry(entry: object, options?: { resolveBlobs?: boole
 	delete slots[COLD_STORE];
 	delete slots[COLD_OFFSET];
 	delete slots[COLD_LENGTH];
+	setHiddenSlot(entry, COLD_FORMER, record);
 	record.store.noteHydration();
 	return true;
 }
@@ -673,6 +785,11 @@ export function coldEntryForPersistence(entry: FileEntry): FileEntry | undefined
 	return view as unknown as FileEntry;
 }
 
+/** Set `target[key]` as an own data property, even for a key such as `__proto__` that assignment treats apart. */
+function setOwnField(target: object, key: string, value: unknown): void {
+	Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
+}
+
 /** `holder`'s fields in key order: the value of each of its accessors from `record`, each data value its own. */
 function fieldsOver(
 	holder: object,
@@ -681,7 +798,7 @@ function fieldsOver(
 ): Record<string, unknown> {
 	const fields: Record<string, unknown> = {};
 	for (const key of Object.keys(holder)) {
-		fields[key] = isAccessorFrom(holder, key, accessors) ? record[key] : Reflect.get(holder, key);
+		setOwnField(fields, key, isAccessorFrom(holder, key, accessors) ? record[key] : Reflect.get(holder, key));
 	}
 	return fields;
 }
@@ -704,7 +821,7 @@ function copyFields(
 			continue;
 		}
 		const value: unknown = Reflect.get(source, key);
-		target[key] = typeof value === "object" && value !== null ? structuredClone(value) : value;
+		setOwnField(target, key, typeof value === "object" && value !== null ? structuredClone(value) : value);
 	}
 }
 
@@ -721,7 +838,7 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
 	const shell = slots[COLD_MESSAGE];
 	copyFields(entry, copy, entryFieldAccessors, key => {
 		if (overrides && Object.hasOwn(overrides, key)) {
-			copy[key] = overrides[key];
+			setOwnField(copy, key, overrides[key]);
 			return true;
 		}
 		if (key !== "message" || !shell) return false;
@@ -733,7 +850,7 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
 		return true;
 	});
 	for (const key of Object.keys(overrides ?? {})) {
-		if (!Object.hasOwn(copy, key)) copy[key] = overrides?.[key];
+		if (!Object.hasOwn(copy, key)) setOwnField(copy, key, overrides?.[key]);
 	}
 	setRecordSlots(copy, record);
 	return copy as unknown as SessionEntry;
@@ -743,17 +860,20 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
  * Make `entry` cold, in place: write its record to the store `openStore`
  * returns (called only when a record is written) and turn each value of the
  * entry and of its `message` too large to keep ({@link COLD_STRING_MAX_UNITS},
- * {@link COLD_JSON_MAX_BYTES}) into an accessor. Pass `imagesExternalized`
- * for an entry parsed from a session file, whose image data are blob
- * references already, and `paced` from a load, which converts a whole
- * transcript in one burst: the record's bytes count toward the next full
- * collection ({@link COLLECT_AFTER_RECORD_BYTES}), as a read's do. Returns
- * false, changing nothing, when every value is small or `entry` is cold
- * already.
+ * {@link COLD_JSON_MAX_BYTES}) into an accessor. An entry made whole from this
+ * store whose values are unchanged takes its former record back instead of
+ * writing a new one. Pass `imagesExternalized` for an entry parsed from a
+ * session file, whose image data are blob references already, and `paced`
+ * from a load, which converts a whole transcript in one burst: the record's
+ * bytes count toward the next full collection
+ * ({@link COLLECT_AFTER_RECORD_BYTES}), as a read's do. Returns false,
+ * changing nothing, when every value is small, `entry` is cold already, or
+ * there is no store that takes records (`openStore` returns undefined, or a
+ * write to the store failed): the entry then stays whole.
  */
 export function convertToColdEntry(
 	entry: SessionEntry,
-	openStore: () => ColdEntryStore,
+	openStore: () => ColdEntryStore | undefined,
 	options?: { imagesExternalized?: boolean; paced?: boolean },
 ): boolean {
 	if (isColdEntry(entry) || !Object.isExtensible(entry)) return false;
@@ -768,8 +888,13 @@ export function convertToColdEntry(
 	if (entryKeys.length === 0 && messageKeys.length === 0) return false;
 
 	const store = openStore();
+	if (!store?.writable) return false;
 	const text = options?.imagesExternalized ? (stringifyJson(entry) ?? "null") : entryRecordText(entry, store.blobs);
-	const record = store.append(text);
+	const data = Buffer.from(text, "utf8");
+	const slots: ColdEntrySlots = entry as object;
+	const former = slots[COLD_FORMER];
+	const record = former && store.holds(former, data) ? former : store.append(data);
+	delete slots[COLD_FORMER];
 	setRecordSlots(entry, record);
 	for (const key of entryKeys) Object.defineProperty(entry, key, entryFieldAccessor(key));
 	if (shell && messageKeys.length > 0) {
@@ -778,6 +903,6 @@ export function convertToColdEntry(
 		setHiddenSlot(entry, COLD_MESSAGE, shell);
 		Object.defineProperty(entry, "message", entryMessageAccessor);
 	}
-	if (options?.paced) paceCollection(record.length);
+	if (options?.paced) paceCollection(data.length);
 	return true;
 }

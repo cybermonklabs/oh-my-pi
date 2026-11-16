@@ -3439,8 +3439,9 @@ export class TurnRecovery {
 		if (active[conversationEnd(active) - 1]?.role === "assistant") return false;
 		// A restored session omits the failed turn (and its synthetic results)
 		// from provider context, so — mirroring retry() — the persisted display
-		// transcript decides whether a retryable tool-call tail exists.
-		return abortedToolCallTail(this.#host.sessionManager.buildSessionContext({ transcript: true }).messages);
+		// transcript decides whether a retryable tool-call tail exists. Its end
+		// is all that decides, so no entry before the newest compaction is read.
+		return abortedToolCallTail(this.#host.sessionManager.buildTranscriptSinceCompaction());
 	}
 	/**
 	 * Manually retry the last failed assistant turn.
@@ -3491,7 +3492,7 @@ export class TurnRecovery {
 			// A restored session already dropped the failed assistant turn (and its
 			// paired synthetic tool results) from provider context, so the persisted
 			// display transcript is the source of truth for a retryable failed tail.
-			const transcriptMessages = this.#host.sessionManager.buildSessionContext({ transcript: true }).messages;
+			const transcriptMessages = this.#host.sessionManager.buildTranscriptSinceCompaction();
 			if (retryableAssistantTurnEnd(transcriptMessages) === undefined) return false;
 			// The boundary is already gone from active context; when the intact
 			// failed batch is still the tail, replay the tools directly.
