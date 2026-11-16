@@ -4,14 +4,16 @@
  * {@link POSITIONS} keeps, and a field is kept only at the position the table names for it: under
  * a tool call's `arguments`, a tool result's `details`, custom data or any other key the table
  * does not name, every string is masked whatever its key or shape. Object keys, numbers, booleans
- * and `null` are never masked (KR13). An entry with nothing to mask comes back as the same object;
- * a masked one shares every untouched subtree with the live entry.
+ * and `null` are never masked (KR13). An entry made of primitives, plain objects and real arrays
+ * with nothing to mask comes back as the same object; a masked one shares every untouched such
+ * subtree with the live entry.
  *
  * The walk reads each value as `stringifyJson` writes it to the session line: through its `toJSON`,
  * a `bigint` as its decimal string, a boxed primitive as its primitive, an object as its own
- * enumerable keys. A position keeps a value only in the shape the table declares for it, judged on
- * the live value: a string field a primitive string, a `[]` field a real array of strings, an object
- * or array-element position a plain object; any other shape there is free content, every string masked.
+ * enumerable keys; the copy holds any node of another kind as that stored form, in plain data.
+ * A position keeps a value only in the shape the table declares for it, judged on the live value:
+ * a string field a primitive string, a `[]` field a real array of strings, an object or
+ * array-element position a plain object; any other shape there is free content, every string masked.
  *
  * The `KRn` tags on the table's rows name the keep rules:
  * - KR1: every entry: its `type`, `id`, `parentId`, `timestamp`, `activeLeafId` and the build that wrote it.
@@ -590,19 +592,57 @@ export function maskTitleUpdate(update: SessionTitleUpdate, mask: SessionStoreMa
 
 /**
  * `value`, free content under `key` of its holder (an array index as a number), masked in the form
- * `stringifyJson` writes it; `value` itself when masking leaves that form unchanged.
+ * `stringifyJson` writes it. A primitive, a plain object or a real array is returned as itself when
+ * masking changes nothing in it. Any other node (a `bigint`, a boxed primitive, a node with `toJSON`,
+ * a class instance) comes back as its stored form in plain data, never as itself: the copy's later
+ * readers, `prepareEntryForPersistence` (which rebuilds an object from its own keys) and
+ * `stringifyJson`, then read the same form the walk masked.
  */
 function maskFree(value: unknown, key: string | number, mask: SessionStoreMask): unknown {
-	if (typeof value === "string") return mask.maskText(value);
-	if (typeof value !== "object" && typeof value !== "function" && typeof value !== "bigint") return value;
-	if (value === null) return value;
-	const form = storedForm(value, key);
-	let next: unknown;
-	if (typeof form === "string") next = mask.maskText(form);
-	else if (Array.isArray(form)) next = maskArray(form, mask, undefined, false);
+	switch (typeof value) {
+		case "string":
+			return mask.maskText(value);
+		case "bigint":
+			return maskPlainForm(storedForm(value, key), mask);
+		case "function":
+			// A function is not written unless its `toJSON` gives a value.
+			return typeof Reflect.get(value, "toJSON") === "function"
+				? maskPlainForm(storedForm(value, key), mask)
+				: value;
+		case "object":
+			if (value === null) return value;
+			if (isPlainObject(value)) return maskObject(value, mask, undefined);
+			if (isRealArray(value)) return maskArray(value, mask, undefined, false);
+			return maskPlainForm(storedForm(value, key), mask);
+		default:
+			// A number or a boolean is written as it is; `undefined` or a symbol not at all.
+			return value;
+	}
+}
+
+/**
+ * `form`, a node's stored form read through {@link storedForm}, masked as free content into plain
+ * data. It is not read through `toJSON` again, so an object or array that still has one is copied
+ * as its own enumerable keys or its items.
+ */
+function maskPlainForm(form: unknown, mask: SessionStoreMask): unknown {
+	if (typeof form === "string") return mask.maskText(form);
+	if (isRealArray(form)) return maskArray(form, mask, undefined, false);
+	if (Array.isArray(form)) {
+		const copy: unknown[] = [];
+		for (let i = 0; i < form.length; i++) copy.push(maskFree(form[i], i, mask));
+		return copy;
+	}
+	if (typeof form === "object" && form !== null) {
+		if (isPlainObject(form)) return maskObject(form, mask, undefined);
+		const copy: Record<string, unknown> = {};
+		for (const key in form) {
+			if (Object.hasOwn(form, key)) setOwn(copy, key, maskFree(Reflect.get(form, key), key, mask));
+		}
+		return copy;
+	}
 	// A number, a boolean or `null` is written as it is; a function, a symbol or `undefined` not at all.
-	else next = isRecord(form) ? maskObject(form, mask, undefined) : form;
-	return Object.is(next, form) ? value : next;
+	return typeof form === "function" || typeof form === "symbol" ? undefined : form;
 }
 
 /**

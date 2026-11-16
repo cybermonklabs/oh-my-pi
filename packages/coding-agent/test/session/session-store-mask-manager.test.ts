@@ -28,13 +28,13 @@ import {
 	listSessionRecaps,
 	lookupSessionTitle,
 } from "@oh-my-pi/pi-coding-agent/session/session-index";
-import { maskSessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entry-mask";
+import { maskBtwRecord, maskSessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entry-mask";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import * as utils from "@oh-my-pi/pi-utils";
-import { getConfigRootDir, isRecord, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, isRecord, setAgentDir, stringifyJson, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "../collab/helpers/in-memory-relay";
 
@@ -1704,6 +1704,13 @@ interface KeepRow {
 	readonly shape: FieldPath;
 	/** Fields below `shape` kept as written. */
 	readonly kept: readonly FieldPath[];
+	/** Plain objects below `shape` kept whole and unscanned; `kept` lists the strings in them. */
+	readonly whole?: readonly FieldPath[];
+	/**
+	 * Fields below `shape` the list declares both as a plain object and as an array of plain objects
+	 * (a Responses item's `output`, a `web_search_tool_result`'s `content`): neither shape is wrong there.
+	 */
+	readonly objectOrArray?: readonly FieldPath[];
 	/** Fields below `shape` that hold {@link HELD} and are masked. */
 	readonly masked?: readonly FieldPath[];
 }
@@ -2255,6 +2262,7 @@ const KEEP_ROWS: readonly KeepRow[] = [
 			"items.8.status",
 			"items.8.operation.type",
 		],
+		objectOrArray: ["items.3.output", "items.5.output"],
 	},
 	{
 		rule: "KR8",
@@ -2278,6 +2286,7 @@ const KEEP_ROWS: readonly KeepRow[] = [
 			"toolChanges.0.tool.name",
 			"toolChanges.0.opaque.state",
 		],
+		whole: ["toolChanges.0.opaque"],
 	},
 	{
 		rule: "KR8",
@@ -2314,6 +2323,7 @@ const KEEP_ROWS: readonly KeepRow[] = [
 		record: RESPONSES_OBJECT_SHAPES_MESSAGE,
 		shape: "message.providerPayload",
 		kept: ["items.0.type", "items.0.call_id", "items.0.output.type", "items.1.type", "items.1.id", "items.1.role"],
+		objectOrArray: ["items.0.output"],
 	},
 	{
 		rule: "KR8",
@@ -2389,6 +2399,7 @@ const KEEP_ROWS: readonly KeepRow[] = [
 			"toolChanges.0.opaque.state",
 			"toolChanges.0.opaque.steps.0",
 		],
+		whole: ["toolChanges.0.opaque"],
 	},
 	{
 		rule: "KR8",
@@ -2411,6 +2422,7 @@ const KEEP_ROWS: readonly KeepRow[] = [
 			"cache_control.ttl",
 			"cache_control.scope",
 		],
+		objectOrArray: ["content"],
 	},
 	{
 		rule: "KR8",
@@ -2431,6 +2443,7 @@ const KEEP_ROWS: readonly KeepRow[] = [
 		record: SERVER_TOOL_MESSAGE,
 		shape: "message.content.3.block",
 		kept: ["type", "tool_use_id", "content.type", "content.error_code"],
+		objectOrArray: ["content"],
 	},
 	{
 		rule: "KR8",
@@ -3126,6 +3139,18 @@ const NUMBER_VALUE = "73190428865";
 const NUMBER_MARKER = "[REDACTED:env:SERVICE_NUMBER_TOKEN]";
 
 /**
+ * A tool result detail whose `toJSON` leaves out an own field that holds a value, beside a string
+ * long enough that persistence truncates it and rebuilds the object from its own fields.
+ */
+class TruncatedReport {
+	note = HELD;
+	body = "a".repeat(600_000);
+	toJSON(): string {
+		return "plain report";
+	}
+}
+
+/**
  * A tool result detail that the session line stores in another form than its own keys: through its
  * `toJSON`, as the primitive a boxed `String` holds, or as a `bigint`'s decimal string. Each holds
  * a value in that form only.
@@ -3145,6 +3170,12 @@ const STORED_FORM_DETAILS: readonly {
 	},
 	{ name: "a boxed String", detail: () => new String(HELD), value: ENV_VALUE, masked: HELD_MARKER },
 	{ name: "a bigint", detail: () => BigInt(NUMBER_VALUE), value: NUMBER_VALUE, masked: NUMBER_MARKER },
+	{
+		name: "a class instance whose toJSON leaves out an own field, beside a string persistence truncates",
+		detail: () => new TruncatedReport(),
+		value: ENV_VALUE,
+		masked: "plain report",
+	},
 ];
 
 /** A tool name the regex of the `anthropicCompaction` tool-change cases matches. */
@@ -3572,6 +3603,246 @@ for (const backend of backends) {
 		});
 	});
 }
+
+describe("copy-on-write of the stored copy", () => {
+	it("returns an entry of plain data with nothing to mask as itself, and copies any other node as its plain stored form", () => {
+		const content = [{ type: "text", text: "plain" }];
+		const plainData = { list: [1, Number.NaN, null, "plain", [true]], nested: { flag: false }, absent: undefined };
+		const entryWith = (id: string, details: unknown): StoredRecord => ({
+			id,
+			parentId: null,
+			timestamp: KEEP_TIMESTAMP,
+			...messageEntry({
+				role: "toolResult",
+				toolCallId: "cow-call",
+				toolName: "lookup",
+				content,
+				details,
+				isError: false,
+				timestamp: NOW,
+			}),
+		});
+		const plain = entryWith("cow-plain", plainData);
+		const withNodes = entryWith("cow-nodes", { plainData, at: new Date(0), count: 12n, boxed: new String("plain") });
+		const copy = maskSessionEntry(withNodes, mask);
+		const details = valueAt(copy, "message.details");
+		expect({
+			plainSame: maskSessionEntry(plain, mask) === plain,
+			nodesCopied: copy !== withNodes,
+			nodesAsStored:
+				isRecord(details) &&
+				details.at === new Date(0).toJSON() &&
+				details.count === "12" &&
+				details.boxed === "plain",
+			untouchedShared:
+				valueAt(copy, "message.content") === content && isRecord(details) && details.plainData === plainData,
+		}).toEqual({ plainSame: true, nodesCopied: true, nodesAsStored: true, untouchedShared: true });
+	});
+});
+
+/**
+ * T4's generated cases: each listed position on the path of a kept field of {@link KEEP_ROWS}, read
+ * from the rows' own fixtures, written in every shape but the one it declares and holding a held
+ * value, is stored without one; a number or `null` there is stored as it is (KR13). The positions
+ * are derived here, not read from the walk's table, so the describe also runs on an older head.
+ */
+describe("generated: every listed position in every wrong shape", () => {
+	type Kind = "string field" | "array field" | "container" | "element";
+	type Shape =
+		| "a string"
+		| "a number"
+		| "an array"
+		| "a plain object"
+		| "null"
+		| "a URL"
+		| "a toJSON object"
+		| "a bigint";
+	interface GeneratedPosition {
+		readonly row: KeepRow;
+		readonly path: FieldPath;
+		readonly kind: Kind;
+	}
+	const SHAPES: readonly Shape[] = [
+		"a string",
+		"a number",
+		"an array",
+		"a plain object",
+		"null",
+		"a URL",
+		"a toJSON object",
+		"a bigint",
+	];
+	/** The shape each kind declares. An element takes all eight: its plain object is the array under it written as one object. */
+	const DECLARED: Readonly<Record<Kind, Shape | undefined>> = {
+		"string field": "a string",
+		"array field": "an array",
+		container: "a plain object",
+		element: undefined,
+	};
+
+	/** A deep copy of `value` whose strings holding a value are neutral words, so only a case's shape holds one. */
+	const neutral = (value: unknown): unknown => {
+		if (typeof value === "string") return value.includes(ENV_VALUE) ? "plain neutral" : value;
+		if (Array.isArray(value)) return value.map(neutral);
+		return isRecord(value)
+			? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, neutral(item)]))
+			: value;
+	};
+	const parentOf = (path: FieldPath): FieldPath => path.split(".").slice(0, -1).join(".");
+	/** Writes `value` at `path` below `root`, a neutral copy of a fixture. */
+	const setAt = (root: unknown, path: FieldPath, value: unknown): void => {
+		const parent = valueAt(root, parentOf(path));
+		const last = path.split(".").at(-1) ?? "";
+		if (Array.isArray(parent)) parent[Number(last)] = value;
+		else if (isRecord(parent)) parent[last] = value;
+	};
+
+	/** Every kept path of every row, and every path declared both an object and an array, by the record that holds it. */
+	const keptOf = new Map<StoredRecord, FieldPath[]>();
+	const objectOrArrayOf = new Map<StoredRecord, FieldPath[]>();
+	for (const row of KEEP_ROWS) {
+		keptOf.set(row.record, [...(keptOf.get(row.record) ?? []), ...row.kept.map(field => joinPath(row.shape, field))]);
+		objectOrArrayOf.set(row.record, [
+			...(objectOrArrayOf.get(row.record) ?? []),
+			...(row.objectOrArray ?? []).map(field => joinPath(row.shape, field)),
+		]);
+	}
+	/** Whether the list declares `shape` at `position`: its kind's own shape, or the other one of a field declared both ways. */
+	const declares = ({ row, path, kind }: GeneratedPosition, shape: Shape): boolean => {
+		const both = objectOrArrayOf.get(row.record) ?? [];
+		if (kind === "container" && shape === "an array") return both.includes(path);
+		if (kind === "element" && shape === "a plain object") return both.includes(parentOf(path));
+		return shape === DECLARED[kind];
+	};
+
+	/** The listed positions, each once per record: the first row that names it labels it. */
+	const positions: GeneratedPosition[] = [];
+	const seen = new Map<StoredRecord, Set<string>>();
+	const add = (row: KeepRow, path: FieldPath, kind: Kind): void => {
+		const keys = seen.get(row.record) ?? new Set<string>();
+		seen.set(row.record, keys);
+		if (keys.has(`${kind} ${path}`)) return;
+		keys.add(`${kind} ${path}`);
+		positions.push({ row, path, kind });
+	};
+	for (const row of KEEP_ROWS) {
+		const wholes = (row.whole ?? []).map(field => joinPath(row.shape, field));
+		for (const field of row.kept) {
+			const full = joinPath(row.shape, field);
+			// An object kept whole is one position: the strings in it are not positions of their own.
+			const parts = (wholes.find(whole => full.startsWith(`${whole}.`)) ?? full).split(".");
+			for (let i = 1; i <= parts.length; i++) {
+				const path = parts.slice(0, i).join(".");
+				const value = valueAt(row.record, path);
+				const inArray = Array.isArray(valueAt(row.record, parts.slice(0, i - 1).join(".")));
+				if (isRecord(value)) {
+					add(row, path, "container");
+					if (inArray) add(row, path, "element");
+				} else if (i === parts.length && typeof value === "string") {
+					add(row, inArray ? parentOf(path) : path, inArray ? "array field" : "string field");
+				}
+			}
+		}
+	}
+
+	/** What the position's declared shape holds with {@link HELD} at its kept fields. */
+	const heldForm = ({ row, path, kind }: GeneratedPosition): unknown => {
+		if (kind === "string field") return HELD;
+		if (kind === "array field") return [HELD];
+		const form = neutral(valueAt(row.record, path));
+		for (const kept of keptOf.get(row.record) ?? []) {
+			if (kept.startsWith(`${path}.`)) setAt(form, kept.slice(path.length + 1), HELD);
+		}
+		return form;
+	};
+	/** Where a case writes its shape, and the value it writes there. */
+	const written = (position: GeneratedPosition, shape: Shape): { readonly at: FieldPath; readonly value: unknown } => {
+		const { path, kind } = position;
+		switch (shape) {
+			case "a string":
+				return { at: path, value: HELD };
+			case "a number":
+				return { at: path, value: 7 };
+			case "null":
+				return { at: path, value: null };
+			case "an array":
+				return { at: path, value: kind === "string field" ? [HELD] : [heldForm(position)] };
+			case "a plain object":
+				return kind === "element"
+					? { at: parentOf(path), value: heldForm(position) }
+					: { at: path, value: { note: HELD } };
+			case "a URL":
+				return { at: path, value: new URL(`https://example.invalid/${ENV_VALUE}`) };
+			case "a toJSON object": {
+				const form = heldForm(position);
+				return { at: path, value: { toJSON: () => form } };
+			}
+			case "a bigint":
+				return { at: path, value: BigInt(NUMBER_VALUE) };
+		}
+	};
+
+	for (const position of positions) {
+		const { row, path, kind } = position;
+		for (const shape of SHAPES) {
+			if (declares(position, shape)) continue;
+			it(`generated: ${row.rule} ${row.position} ${path} (${kind}) as ${shape}`, () => {
+				const { at, value } = written(position, shape);
+				const record = neutral(row.record);
+				setAt(record, at, value);
+				const generatedMask = new storeMask.SessionStoreMasker({
+					env: () => ({ SERVICE_API_KEY: ENV_VALUE, SERVICE_NUMBER_TOKEN: NUMBER_VALUE }),
+					agentDir: tmp.join("agent"),
+				}).snapshot(cwd);
+				const masked =
+					row.kind === "btw" ? maskBtwRecord(record, generatedMask) : maskSessionEntry(record, generatedMask);
+				const stored = stringifyJson(masked) ?? "";
+				const byType = typeof value === "number" || value === null;
+				expect({
+					path,
+					shape,
+					held: stored.includes(ENV_VALUE) || stored.includes(NUMBER_VALUE),
+					asWritten: !byType || valueAt(JSON.parse(stored), at) === value,
+				}).toEqual({ path, shape, held: false, asWritten: true });
+			});
+		}
+	}
+
+	/** An `anthropicServerTool` block's `block` whose content is of another type than the one a rule keeps fields on. */
+	const SERVER_TOOL_RULES: readonly { readonly name: string; readonly block: StoredRecord }[] = [
+		{
+			name: "a web_search_tool_result's content element of another type than web_search_result, holding a value in encrypted_content and in type",
+			block: {
+				type: "web_search_tool_result",
+				tool_use_id: "srvtoolu_generated",
+				content: [{ type: HELD, encrypted_content: HELD }],
+			},
+		},
+		{
+			name: "a tool_search_tool_result's object of another type, holding a value in tool_references[].tool_name",
+			block: {
+				type: "tool_search_tool_result",
+				tool_use_id: "srvtoolu_generated",
+				content: {
+					type: "plain_other_search_result",
+					tool_references: [{ type: "tool_reference", tool_name: HELD }],
+				},
+			},
+		},
+	];
+	for (const { name, block } of SERVER_TOOL_RULES) {
+		it(`server-tool element rule: ${name}, stores no held value`, () => {
+			const entry = {
+				id: "generated-server-tool",
+				parentId: null,
+				timestamp: KEEP_TIMESTAMP,
+				...messageEntry(assistantRecord([{ type: "anthropicServerTool", block }])),
+			};
+			const stored = stringifyJson(maskSessionEntry(entry, mask)) ?? "";
+			expect({ name, held: stored.includes(ENV_VALUE) }).toEqual({ name, held: false });
+		});
+	}
+});
 
 describe("keep rules hold only in the shape the list names", () => {
 	const at = (type: string, fields: Record<string, unknown>) => ({
