@@ -34,17 +34,25 @@ describe("rewriteGitWorktreeAdd", () => {
 			"bun '/opt/omp cli.ts' worktree add --lock -- ../wt",
 		);
 		expect(rewriteGitWorktreeAdd("git worktree add --lock --reason 'in use' -b feat ../wt", OMP)).toBe(
-			"bun '/opt/omp cli.ts' worktree add -b feat --lock --reason 'in use' -- ../wt",
+			"bun '/opt/omp cli.ts' worktree add -b feat --lock '--reason=in use' -- ../wt",
 		);
 		expect(rewriteGitWorktreeAdd("git worktree add --reason= --lock ../wt", OMP)).toBe(
-			"bun '/opt/omp cli.ts' worktree add --lock --reason '' -- ../wt",
+			"bun '/opt/omp cli.ts' worktree add --lock --reason= -- ../wt",
+		);
+		// An empty quoted value stays the option's, not the next argument's.
+		expect(rewriteGitWorktreeAdd("git worktree add --lock --reason '' ../wt HEAD", OMP)).toBe(
+			"bun '/opt/omp cli.ts' worktree add --lock --reason= -- ../wt HEAD",
+		);
+		// A reason that starts with `-` stays the option's value.
+		expect(rewriteGitWorktreeAdd("git worktree add --lock --reason=-busy ../wt HEAD", OMP)).toBe(
+			"bun '/opt/omp cli.ts' worktree add --lock --reason=-busy -- ../wt HEAD",
 		);
 	});
 
 	it("locks a rewritten add with the configured reason, as a git wrapper that locks every add would", () => {
 		const lockReason = "agent session: locked on add (AGENTC-431)";
 		expect(rewriteGitWorktreeAdd("git worktree add --detach ../wt HEAD", OMP, { lockReason })).toBe(
-			"bun '/opt/omp cli.ts' worktree add --detach --lock --reason 'agent session: locked on add (AGENTC-431)' -- ../wt HEAD",
+			"bun '/opt/omp cli.ts' worktree add --detach --lock '--reason=agent session: locked on add (AGENTC-431)' -- ../wt HEAD",
 		);
 		// An explicit lock is the caller's own and keeps git's default reason.
 		expect(rewriteGitWorktreeAdd("git worktree add --lock ../wt", OMP, { lockReason })).toBe(

@@ -826,10 +826,10 @@ impl GitRepo {
 					{
 						continue;
 					}
-					if entry.mode == gix::index::entry::Mode::COMMIT {
-						fs::create_dir_all(path.join(relative.to_path_lossy()))?;
-					} else {
+					if entry.mode != gix::index::entry::Mode::COMMIT {
 						copy_worktree_path(self.root(), path, relative)?;
+					} else if !behind_link(path, &relative.to_path_lossy())? {
+						fs::create_dir_all(path.join(relative.to_path_lossy()))?;
 					}
 				}
 			}
@@ -1900,12 +1900,22 @@ fn prune_nonrelocatable_clone_dirs(root: &Path) -> Result<BTreeSet<PathBuf>> {
 
 /// Carry one live source path without following symlinks, including a
 /// deletion. Used both by ordinary-checkout seeding and by tracked files
-/// restored after clone exclusions.
+/// restored after clone exclusions. Git does not see a path beyond a
+/// symlinked or non-directory ancestor, so in the source such a path is
+/// deleted, and in the new tree nothing is written or removed through one.
 fn copy_worktree_path(source: &Path, target: &Path, relative: &gix::bstr::BStr) -> Result<()> {
 	let relative = relative.to_path_lossy();
+	if behind_link(target, &relative)? {
+		return Ok(());
+	}
 	let src = source.join(&relative);
 	let dst = target.join(&relative);
-	match fs::symlink_metadata(&src) {
+	let found = if behind_link(source, &relative)? {
+		Err(std::io::ErrorKind::NotFound.into())
+	} else {
+		fs::symlink_metadata(&src)
+	};
+	match found {
 		Ok(meta) if meta.file_type().is_symlink() => {
 			remove_existing(&dst)?;
 			if let Some(parent) = dst.parent() {
@@ -1930,6 +1940,27 @@ fn copy_worktree_path(source: &Path, target: &Path, relative: &gix::bstr::BStr) 
 	Ok(())
 }
 
+/// Whether a directory between `root` and the last component of `relative`
+/// is a symlink or not a directory, so `relative` cannot be reached below
+/// `root` without leaving it. A missing ancestor ends the check: nothing
+/// lies beyond it.
+fn behind_link(root: &Path, relative: &Path) -> std::io::Result<bool> {
+	let Some(parent) = relative.parent() else {
+		return Ok(false);
+	};
+	let mut current = root.to_path_buf();
+	for component in parent.components() {
+		current.push(component);
+		match fs::symlink_metadata(&current) {
+			Ok(meta) if meta.is_dir() => {},
+			Ok(_) => return Ok(true),
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+			Err(err) => return Err(err),
+		}
+	}
+	Ok(false)
+}
+
 fn git_metadata_path(path: &Path) -> Cow<'_, str> {
 	let display = path.to_string_lossy();
 	if cfg!(windows) {
@@ -1942,8 +1973,8 @@ fn git_metadata_path(path: &Path) -> Cow<'_, str> {
 /// Registers `path` as a linked worktree of `common` at `head`. With `lock`,
 /// the registration is locked from the moment it exists, as
 /// `git worktree add --lock --reason <lock>` locks it: git's `write_file`
-/// ends non-empty content with a newline and writes an empty reason as an
-/// empty file.
+/// completes non-empty content that lacks a final newline with one, and
+/// writes an empty reason as an empty file.
 fn register_worktree(
 	path: &Path,
 	common: &Path,
@@ -1955,11 +1986,10 @@ fn register_worktree(
 	let admin = common.join("worktrees").join(name);
 	fs::create_dir_all(&admin)?;
 	if let Some(reason) = lock {
-		let content = if reason.is_empty() {
-			String::new()
-		} else {
-			format!("{reason}\n")
-		};
+		let mut content = reason.to_owned();
+		if !content.is_empty() && !content.ends_with('\n') {
+			content.push('\n');
+		}
 		fs::write(admin.join("locked"), content)?;
 	}
 	fs::write(path.join(".git"), format!("gitdir: {}\n", git_metadata_path(&admin)))?;

@@ -122,7 +122,6 @@ impl CloneExclusions {
 
 	/// Whether a path strictly below `relative` is left out. A path's
 	/// descendants sort directly after it, component by component.
-	#[cfg(any(target_os = "macos", test))]
 	pub(crate) fn excludes_below(&self, relative: &Path) -> bool {
 		use std::ops::Bound;
 		self
@@ -149,6 +148,18 @@ pub trait TreeCopy {
 	fn file(&self, src: &Path, dst: &Path, file_type: FileType) -> IsoResult<()>;
 	/// Runs after the directory `dst` has been filled from `src`.
 	fn finish_dir(&self, src: &Path, dst: &Path) -> IsoResult<()>;
+	/// Whether [`whole_dir`](Self::whole_dir) copies a directory with
+	/// everything below it in one step (APFS `clonefile`). The walk then
+	/// calls it for each directory with nothing below to leave out, and
+	/// enters only the others.
+	fn copies_whole_dirs(&self) -> bool {
+		false
+	}
+	/// Copies the directory `src`, with everything below it, to `dst`.
+	fn whole_dir(&self, src: &Path, dst: &Path) -> IsoResult<()> {
+		let _ = dst;
+		Err(IsoError::other(format!("{} cannot be copied whole by this backend", src.display())))
+	}
 }
 
 /// Copies the entries of the directory `src` into the existing directory
@@ -166,13 +177,30 @@ pub fn copy_dir_contents(
 	// Both sides resolved, so a destination inside the source is recognized
 	// however either path was spelled.
 	let src = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
-	let mut walk = Walk {
-		exclusions,
-		copy,
-		destination: fs::canonicalize(dst).ok(),
-		relative: PathBuf::new(),
-		marked: Vec::new(),
+	let destination = fs::canonicalize(dst).ok();
+	let mut marked = Vec::new();
+	let named;
+	let exclusions = if copy.copies_whole_dirs() {
+		// A whole-directory copy cannot leave out what lies below it, so the
+		// marked directories and the destination are found first and named
+		// by path, which `excludes_below` sees.
+		marked = marked_dirs(&src, exclusions, destination.as_deref())?;
+		let mut all = exclusions.clone();
+		for dir in &marked {
+			all.path(dir.clone());
+		}
+		if let Some(inside) = destination
+			.as_deref()
+			.and_then(|destination| destination.strip_prefix(&src).ok())
+		{
+			all.path(inside.to_path_buf());
+		}
+		named = all;
+		&named
+	} else {
+		exclusions
 	};
+	let mut walk = Walk { exclusions, copy, destination, relative: PathBuf::new(), marked };
 	walk.dir(&src, dst)?;
 	Ok(walk.marked)
 }
@@ -229,6 +257,10 @@ impl<C: TreeCopy> Walk<'_, C> {
 				self.marked.push(self.relative.clone());
 				return Ok(false);
 			}
+			if self.copy.copies_whole_dirs() && !self.exclusions.excludes_below(&self.relative) {
+				self.copy.whole_dir(&src_path, &dst_path)?;
+				return Ok(true);
+			}
 			fs::create_dir_all(&dst_path)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", dst_path.display())))?;
 			if !self.dir(&src_path, &dst_path)? {
@@ -248,10 +280,9 @@ impl<C: TreeCopy> Walk<'_, C> {
 /// The directories below `src`, relative to it, that a marker of
 /// `exclusions` leaves out. Only directory listings are read; nothing below a
 /// path `exclusions` leaves out, a marked directory, `destination` or a
-/// symlink is entered. For backends that clone a whole subtree at once and so
-/// must know beforehand which subtrees hold something to leave out.
-#[cfg(any(target_os = "macos", test))]
-pub fn marked_dirs(
+/// symlink is entered. A walk whose backend copies whole directories needs
+/// them before it starts, to know which subtrees hold something to leave out.
+fn marked_dirs(
 	src: &Path,
 	exclusions: &CloneExclusions,
 	destination: Option<&Path>,
@@ -413,6 +444,51 @@ mod tests {
 		copy_dir_contents(&src, &dst, &CloneExclusions::default(), &PlainCopy).unwrap();
 		assert!(fs::symlink_metadata(dst.join("deep/inner")).is_err(), "copied into itself");
 		assert!(dst.join("deep/a/left-out.txt").is_file());
+	}
+
+	/// Copies a whole directory at once where allowed, recording each one.
+	struct WholeCopy(std::cell::RefCell<Vec<PathBuf>>);
+
+	impl TreeCopy for WholeCopy {
+		fn symlink(&self, src: &Path, dst: &Path, file_type: FileType) -> IsoResult<()> {
+			PlainCopy.symlink(src, dst, file_type)
+		}
+
+		fn file(&self, src: &Path, dst: &Path, file_type: FileType) -> IsoResult<()> {
+			PlainCopy.file(src, dst, file_type)
+		}
+
+		fn finish_dir(&self, _src: &Path, _dst: &Path) -> IsoResult<()> {
+			Ok(())
+		}
+
+		fn copies_whole_dirs(&self) -> bool {
+			true
+		}
+
+		fn whole_dir(&self, src: &Path, dst: &Path) -> IsoResult<()> {
+			self.0.borrow_mut().push(src.file_name().unwrap().into());
+			fs::create_dir(dst).unwrap();
+			copy_dir_contents(src, dst, &CloneExclusions::default(), &PlainCopy).map(drop)
+		}
+	}
+
+	/// A backend that copies whole directories gets the same result: it is
+	/// asked to copy only directories with nothing below them to leave out.
+	#[test]
+	fn whole_directory_copies_leave_out_the_same_entries() {
+		let scratch = source();
+		let src = scratch.path().join("src");
+		let dst = src.join("deep/inner");
+		fs::create_dir(&dst).unwrap();
+		let copy = WholeCopy(std::cell::RefCell::new(Vec::new()));
+		let mut marked = copy_dir_contents(&src, &dst, &exclusions(), &copy).unwrap();
+		marked.sort();
+		assert_eq!(files(&dst), ["cache/other/index.js", "deep/a/kept.txt", "kept.txt"]);
+		assert_eq!(marked, [PathBuf::from("cache/pkg"), PathBuf::from("checkout")]);
+		let mut whole = copy.0.into_inner();
+		whole.sort();
+		assert_eq!(whole, [PathBuf::from("other")], "copied whole: {whole:?}");
 	}
 
 	#[test]

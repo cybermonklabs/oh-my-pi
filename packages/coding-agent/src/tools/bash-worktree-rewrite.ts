@@ -1,4 +1,4 @@
-import { extractFlatShellCommandSegments, tokenizeShellSegments } from "./shell-tokenize";
+import { extractFlatShellCommandSegments, lexShellCommand, tokenizeShellSegments } from "./shell-tokenize";
 
 const SHELL_EXPANSION = /[$`~*?[\]{}<>]/;
 const BARE_SAFE = /^[A-Za-z0-9_./:@%+=,-]+$/;
@@ -23,9 +23,10 @@ function rewriteSegment(
 	options: RewriteGitWorktreeAddOptions,
 ): string | undefined {
 	if (SHELL_EXPANSION.test(text)) return undefined;
-	const tokenLists = tokenizeShellSegments(text);
-	if (tokenLists.length !== 1) return undefined;
-	const tokens = tokenLists[0];
+	if (tokenizeShellSegments(text).length !== 1) return undefined;
+	// Every word, an empty quoted one (`--reason ''`) included, so a value
+	// never shifts onto the next argument.
+	const tokens = lexShellCommand(text).flatMap(token => (token.kind === "word" ? [token.value] : []));
 	if (tokens[0] !== "git") return undefined;
 
 	let index = 1;
@@ -94,11 +95,13 @@ function rewriteSegment(
 	if (branchFlag && branch) argv.push(branchFlag, branch);
 	if (detach) argv.push("--detach");
 	if (quiet) argv.push("-q");
+	// One `--reason=<value>` argument, so a reason that starts with `-` is
+	// never read as an option.
 	if (lock) {
 		argv.push("--lock");
-		if (reason !== undefined) argv.push("--reason", reason);
+		if (reason !== undefined) argv.push(`--reason=${reason}`);
 	} else if (options.lockReason?.trim()) {
-		argv.push("--lock", "--reason", options.lockReason);
+		argv.push("--lock", `--reason=${options.lockReason}`);
 	}
 	argv.push("--", ...positionals);
 	return argv.map(shellQuote).join(" ");

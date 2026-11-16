@@ -81,6 +81,10 @@ describe.skipIf(process.platform === "win32")("worktree add locks", () => {
 		{ name: "--lock", args: ["--lock"] },
 		{ name: "--lock --reason ''", args: ["--lock", "--reason", ""] },
 		{ name: "--lock --reason 'in use'", args: ["--lock", "--reason", "in use"] },
+		// The forms the bash rewrite emits.
+		{ name: "--lock --reason=", args: ["--lock", "--reason="] },
+		{ name: "--lock --reason=-busy", args: ["--lock", "--reason=-busy"] },
+		{ name: "--lock '--reason=in use'", args: ["--lock", "--reason=in use"] },
 	])("`omp worktree add $name` writes the lock git writes", async ({ args }) => {
 		const { worktree, result } = await ompAdd(args);
 

@@ -59,12 +59,13 @@ fn options(clone: WorktreeClone, lock: Option<&str>) -> WorktreeAddOptions {
 	WorktreeAddOptions { detach: true, clone, keep_changes: false, lock: lock.map(str::to_owned) }
 }
 
-/// The `locked` file holds exactly the bytes git writes for the same reason,
-/// including an empty reason, and `git worktree list` reports it.
+/// The `locked` file holds exactly the bytes git writes for the same reason
+/// (an empty reason, and one that already ends in a newline, included), and
+/// `git worktree list` reports it as it reports git's own.
 #[test]
 fn worktree_add_writes_the_lock_git_writes() {
 	for clone in [WorktreeClone::Off, WorktreeClone::Auto] {
-		for reason in ["agent session: locked on add (AGENTC-431)", ""] {
+		for reason in ["agent session: locked on add (AGENTC-431)", "", "in use\n"] {
 			let (temp, source, repo) = fixture();
 			let by_git = temp.path().join("by-git");
 			git(&source, &[
@@ -88,22 +89,22 @@ fn worktree_add_writes_the_lock_git_writes() {
 				"{clone:?} {reason:?}"
 			);
 			let listed = git(&source, &["worktree", "list", "--porcelain"]);
-			let block = listed
-				.split("\n\n")
-				.find(|block| {
-					block.starts_with(&format!("worktree {}\n", target.display()))
-						|| block.starts_with(&format!(
-							"worktree {}\n",
-							fs::canonicalize(&target).unwrap().display()
-						))
-				})
-				.unwrap_or_else(|| panic!("{} is not listed:\n{listed}", target.display()));
-			let expected = if reason.is_empty() {
-				"locked".to_owned()
-			} else {
-				format!("locked {reason}")
+			let lock_line = |worktree: &Path| {
+				let canonical = fs::canonicalize(worktree).unwrap();
+				listed
+					.split("\n\n")
+					.find(|block| {
+						block.starts_with(&format!("worktree {}\n", worktree.display()))
+							|| block.starts_with(&format!("worktree {}\n", canonical.display()))
+					})
+					.unwrap_or_else(|| panic!("{} is not listed:\n{listed}", worktree.display()))
+					.lines()
+					.find(|line| line.starts_with("locked"))
+					.map(str::to_owned)
 			};
-			assert!(block.lines().any(|line| line == expected), "{clone:?} {reason:?}:\n{block}");
+			let ours = lock_line(&target);
+			assert!(ours.is_some(), "{clone:?} {reason:?}: listed unlocked:\n{listed}");
+			assert_eq!(ours, lock_line(&by_git), "{clone:?} {reason:?}");
 		}
 	}
 }

@@ -580,3 +580,64 @@ fn clone_inside_the_source_leaves_out_its_own_destination() {
 	);
 	assert_eq!(git(&target, &["status", "--porcelain", "--untracked-files=all"]), "");
 }
+
+/// Keeping changes never reads a tracked path through a symlink that
+/// replaced its directory: git sees that path as deleted, and so does the new
+/// tree, on the clone path (where the directory sits in a left-out checkout)
+/// and on the ordinary-checkout path alike.
+#[cfg(unix)]
+#[test]
+fn keeping_changes_never_reads_a_tracked_path_through_a_symlink() {
+	for clone in [WorktreeClone::Auto, WorktreeClone::Off] {
+		let (temp, source, repo) = fixture();
+		if clone == WorktreeClone::Auto && !clone_works_on(temp.path()) {
+			eprintln!("SKIP: no working clone backend on this filesystem");
+			continue;
+		}
+		write(&source, "nested/dir/tracked.txt", "committed\n");
+		git(&source, &["add", "nested"]);
+		git(&source, &["commit", "-qm", "track nested/dir"]);
+		let outside = temp.path().join("outside");
+		write(&outside, "tracked.txt", "outside the checkout\n");
+		fs::remove_dir_all(source.join("nested/dir")).unwrap();
+		std::os::unix::fs::symlink(&outside, source.join("nested/dir")).unwrap();
+		git(&source.join("nested"), &["init", "-q", "-b", "main"]);
+		assert_eq!(
+			git(&source, &["status", "--porcelain", "--", "nested/dir/tracked.txt"]),
+			" D nested/dir/tracked.txt",
+			"git sees the path behind the symlink as deleted"
+		);
+		let outside_before = snapshot(&outside);
+		let target = temp.path().join("target");
+		let result = repo
+			.worktree_add(&target, "HEAD", WorktreeAddOptions {
+				detach: true,
+				clone,
+				keep_changes: true,
+				lock: None,
+			})
+			.unwrap();
+		assert_eq!(
+			result.cloned_with.is_some(),
+			clone == WorktreeClone::Auto,
+			"{:?}",
+			result.clone_error
+		);
+		// The clone path leaves the checkout out, symlink included; the
+		// ordinary path carries the untracked symlink as a symlink. Neither
+		// makes it a directory holding a copy of what it points at.
+		let carried = fs::symlink_metadata(target.join("nested/dir"));
+		assert!(
+			carried
+				.as_ref()
+				.map_or(true, |meta| meta.file_type().is_symlink()),
+			"{clone:?}: nested/dir became {carried:?}, not the source's symlink"
+		);
+		assert_eq!(
+			git(&target, &["status", "--porcelain", "--", "nested/dir/tracked.txt"]),
+			" D nested/dir/tracked.txt",
+			"{clone:?}"
+		);
+		assert_eq!(snapshot(&outside), outside_before, "{clone:?}");
+	}
+}

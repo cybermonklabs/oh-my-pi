@@ -83,14 +83,14 @@ impl IsolationBackend for ApfsBackend {
 #[cfg(target_os = "macos")]
 mod imp {
 	use std::{
-		fs,
+		fs::{self, FileType},
 		path::{Path, PathBuf},
 	};
 
 	use crate::{
 		CloneExclusions, IsoError, IsoResult,
 		cow::{self, CLONE_NOFOLLOW},
-		tree,
+		tree::{self, TreeCopy},
 	};
 
 	/// Classifies a failed `clonefile` of `src` to `dst`.
@@ -150,99 +150,47 @@ mod imp {
 				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
 		}
 
-		let result = (|| {
-			// `clonefile` copies a directory whole, so what lies below one and
-			// must be left out is found first: the marked directories, and the
-			// destination when it lies inside the source.
-			let destination = fs::canonicalize(merged).ok();
-			let marked = tree::marked_dirs(&lower, exclusions, destination.as_deref())?;
-			let mut skipped = exclusions.clone();
-			for dir in &marked {
-				skipped.path(dir.clone());
-			}
-			if let Some(inside) = destination
-				.as_deref()
-				.and_then(|destination| destination.strip_prefix(&lower).ok())
-			{
-				skipped.path(inside.to_path_buf());
-			}
-			clone_dir(&lower, merged, &mut PathBuf::new(), &skipped)?;
-			Ok(marked)
-		})();
+		let result = tree::copy_dir_contents(&lower, merged, exclusions, &Clonefile);
 		if result.is_err() {
 			let _ = fs::remove_dir_all(merged);
 		}
 		result
 	}
 
-	/// Clones the entries of `src` into the existing directory `dst`, each in
-	/// one `clonefile` call, except a directory with something below it to
-	/// leave out, which is made and cloned entry by entry. `relative` names
-	/// `src` below the clone's root. Returns `false` when `src` had entries
-	/// and every one was left out.
-	fn clone_dir(
-		src: &Path,
-		dst: &Path,
-		relative: &mut PathBuf,
-		skipped: &CloneExclusions,
-	) -> IsoResult<bool> {
-		let (mut seen, mut cloned) = (false, false);
-		for entry in fs::read_dir(src)
-			.map_err(|err| IsoError::other(format!("read_dir {}: {err}", src.display())))?
-		{
-			let entry = entry
-				.map_err(|err| IsoError::other(format!("dir entry in {}: {err}", src.display())))?;
-			let name = entry.file_name();
-			relative.push(&name);
-			let entry_cloned = clone_entry(&entry, &dst.join(&name), relative, skipped);
-			relative.pop();
-			seen = true;
-			cloned |= entry_cloned?;
-		}
-		Ok(cloned || !seen)
-	}
+	/// `clonefile` for each entry, and for a whole directory with nothing
+	/// below it to leave out.
+	struct Clonefile;
 
-	/// Clones `entry`, which `relative` names, to `dst`. Returns whether
-	/// anything of it was cloned.
-	fn clone_entry(
-		entry: &fs::DirEntry,
-		dst: &Path,
-		relative: &mut PathBuf,
-		skipped: &CloneExclusions,
-	) -> IsoResult<bool> {
-		if skipped.excludes(relative) {
-			return Ok(false);
+	impl TreeCopy for Clonefile {
+		fn symlink(&self, src: &Path, dst: &Path, _file_type: FileType) -> IsoResult<()> {
+			cow::clonefile(src, dst, CLONE_NOFOLLOW).map_err(|err| clone_error(src, dst, &err))
 		}
-		// `clonefile` only accepts regular files, directories, and symlinks
-		// as a source (EINVAL otherwise). Sockets, fifos, and devices are
-		// process-owned ephemera — skip them, as the recursive walkers on other
-		// platforms do.
-		let src = entry.path();
-		let file_type = entry
-			.file_type()
-			.map_err(|err| IsoError::other(format!("file_type {}: {err}", src.display())))?;
-		if !(file_type.is_file() || file_type.is_dir() || file_type.is_symlink()) {
-			return Ok(false);
-		}
-		if file_type.is_dir() && skipped.excludes_below(relative) {
-			fs::create_dir(dst)
-				.map_err(|err| IsoError::other(format!("create {}: {err}", dst.display())))?;
-			if !clone_dir(&src, dst, relative, skipped)? {
-				// Everything in it was left out, so the directory is too.
-				fs::remove_dir(dst)
-					.map_err(|err| IsoError::other(format!("remove {}: {err}", dst.display())))?;
-				return Ok(false);
+
+		/// `clonefile` accepts only regular files, directories, and symlinks
+		/// (EINVAL otherwise). Sockets, fifos, and devices are process-owned
+		/// ephemera, so they are skipped, as on the other platforms.
+		fn file(&self, src: &Path, dst: &Path, file_type: FileType) -> IsoResult<()> {
+			if !file_type.is_file() {
+				return Ok(());
 			}
-			let permissions = fs::symlink_metadata(&src)
+			cow::clonefile(src, dst, CLONE_NOFOLLOW).map_err(|err| clone_error(src, dst, &err))
+		}
+
+		fn finish_dir(&self, src: &Path, dst: &Path) -> IsoResult<()> {
+			let permissions = fs::symlink_metadata(src)
 				.map_err(|err| IsoError::other(format!("symlink_metadata {}: {err}", src.display())))?
 				.permissions();
-			fs::set_permissions(dst, permissions).map_err(|err| {
-				IsoError::other(format!("set permissions on {}: {err}", dst.display()))
-			})?;
-			return Ok(true);
+			fs::set_permissions(dst, permissions)
+				.map_err(|err| IsoError::other(format!("set permissions on {}: {err}", dst.display())))
 		}
-		cow::clonefile(&src, dst, CLONE_NOFOLLOW).map_err(|err| clone_error(&src, dst, &err))?;
-		Ok(true)
+
+		fn copies_whole_dirs(&self) -> bool {
+			true
+		}
+
+		fn whole_dir(&self, src: &Path, dst: &Path) -> IsoResult<()> {
+			cow::clonefile(src, dst, CLONE_NOFOLLOW).map_err(|err| clone_error(src, dst, &err))
+		}
 	}
 
 	pub fn stop(merged: &Path) -> IsoResult<()> {
