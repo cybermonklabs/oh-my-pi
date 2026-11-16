@@ -183,7 +183,7 @@ The `/btw` records that this process wrote keep the values until the history is 
 
 The agent reads the sources at its first session write, and the project file of a working directory at the first write there. Then, at most once a minute, it reads the environment again and checks each `_FILE` file and each `secrets.yml` for a change. It adds new values and never removes a value, so the old value of a rotated token stays masked. A source that fails (a bad `secrets.yml`, a file it cannot read) is skipped and logged, and the agent reads a file that it could not read again at the next check. The log gives the kind and the name of each source the agent holds (`Session store masking sources`), never a value.
 
-If the agent cannot build its mask, at the first write or after a check that found a new value, that write fails, so no value is written raw. The log names the cause, and the next write tries again.
+If the agent cannot build its mask, at the first write or after a check that found a new value, that write fails, so no value is written raw. The log names the cause, and the next write tries again. Only that write fails: when it is the `history.db` record of a title or a recap, or the output files of a subagent, the agent skips it, and the rename, the recap and the subagent's result go on.
 
 ### Replay of a masked turn
 

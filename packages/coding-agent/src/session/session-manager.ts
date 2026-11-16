@@ -3522,7 +3522,8 @@ export class SessionManager {
 		// Keep the recent-sessions title index current so welcome-screen lookups
 		// never have to content-scan this session's file.
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			recordSessionTitle(this.#sessionId, this.storeMask()?.maskText(title) ?? title);
+			const stored = this.#historyDbText(title, "title");
+			if (stored !== undefined) recordSessionTitle(this.#sessionId, stored);
 		}
 
 		this.#notifySessionNameListeners();
@@ -3579,7 +3580,26 @@ export class SessionManager {
 	 */
 	recordRecap(recap: string): void {
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			recordSessionRecap(this.#sessionId, this.#cwd, this.storeMask()?.maskText(recap) ?? recap);
+			const stored = this.#historyDbText(recap, "recap");
+			if (stored !== undefined) recordSessionRecap(this.#sessionId, this.#cwd, stored);
+		}
+	}
+
+	/**
+	 * `text` as the history.db `record` of this session stores it, through the mask, or `undefined`
+	 * when masking it fails: that write is then skipped, never made with the value unmasked, and a
+	 * history.db write never fails the rename or the recap it serves.
+	 */
+	#historyDbText(text: string, record: "title" | "recap"): string | undefined {
+		try {
+			return this.storeMask()?.maskText(text) ?? text;
+		} catch (err) {
+			logger.warn("Session store masking failed; skipped a history.db write", {
+				sessionId: this.#sessionId,
+				record,
+				error: toError(err).message,
+			});
+			return undefined;
 		}
 	}
 
