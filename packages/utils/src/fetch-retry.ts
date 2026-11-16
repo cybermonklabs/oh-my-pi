@@ -201,13 +201,7 @@ export function extractRetryHint(
 
 	for (const pattern of [PLEASE_RETRY_PATTERN, RETRY_DELAY_FIELD_PATTERN]) {
 		const match = pattern.exec(body);
-		if (match?.[1]) {
-			const value = Number.parseFloat(match[1]);
-			if (Number.isFinite(value) && value > 0) {
-				const unitMs = unitToMs(match[2]!);
-				if (unitMs !== undefined) consider(value * unitMs);
-			}
-		}
+		if (match?.[1]) consider(waitPartsMs(`${match[1]}${match[2]}`));
 	}
 	const tryAgainMatch = TRY_AGAIN_PATTERN.exec(body);
 	if (tryAgainMatch?.[1]) consider(waitPartsMs(tryAgainMatch[1]));

@@ -42,12 +42,11 @@ fn memory_lock_name(path: &str) -> String {
 /// Process-owned cross-platform advisory lock.
 ///
 /// `tryAcquire()` never waits for a holder to release the lock, but on Linux
-/// it retries a refused claim, blocking the calling thread: for at most
-/// 200 ms, and for about 50 ms while another process holds the lock. A claim
-/// of a lock this process holds answers at once, and `isHeld()` answers
-/// without that wait. The handle `tryAcquire()` returns reports whether it
-/// won through `acquired`. Ownership ends on `release()`, garbage collection,
-/// or process exit; `release()` is idempotent.
+/// it retries a refused claim, blocking the calling thread (see `tryAcquire()`
+/// for how long). A claim of a lock this process holds answers at once, and
+/// `isHeld()` answers without that wait. The handle `tryAcquire()` returns
+/// reports whether it won through `acquired`. Ownership ends on `release()`,
+/// garbage collection, or process exit; `release()` is idempotent.
 #[napi(js_name = "FileLock")]
 pub struct FileLock {
 	inner: Option<platform::PlatformFileLock>,

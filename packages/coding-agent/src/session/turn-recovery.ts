@@ -3051,11 +3051,11 @@ export class TurnRecovery {
 			// limit on this model, which the next attempt re-hits.
 			const deferToSameModel = sameModelRetryAvailable && !sourceRateLimited;
 			// The rate-limit wait (see `rateLimited`), measured on the context the
-			// turn sends as the session's context usage reports it: the newest usage
-			// after the latest compaction plus the estimate of the messages after it.
-			// So a large prompt no request has answered yet counts, and a usage from
-			// before a compaction that shrank the context does not.
-			const rateLimitHoldsModel =
+			// turn sends (see `TurnRecoveryHost.getContextUsage`): a large prompt no
+			// request has answered yet counts, and a usage from before a compaction
+			// that shrank the context does not. A function, so the `if` below reads
+			// the usage only once its earlier terms hold.
+			const rateLimitHoldsModel = (): boolean =>
 				rateLimited &&
 				(deferToSameModel ||
 					(this.#host.getContextUsage()?.tokens ?? 0) > retrySettings.rateLimitFallbackMaxContextTokens);
@@ -3068,7 +3068,7 @@ export class TurnRecovery {
 				!sameModelSteerReplay &&
 				!waitForSiblingCredential &&
 				!refusalWalkRepeats &&
-				!rateLimitHoldsModel &&
+				!rateLimitHoldsModel() &&
 				!this.#isFirstAttemptMidStreamSocketDrop(message, id, retryBudgetExhausted)
 			) {
 				if (classifierRefusal) {

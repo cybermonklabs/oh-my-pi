@@ -92,17 +92,22 @@ export class IrcBus implements IrcBusApi {
 
 	/** Install the process-global bus. Worker bootstrap only. */
 	static installGlobal(api: IrcBusApi): void {
-		const previous = IrcBus.#global;
-		// The bus it replaces stops following its registry; a worker's proxy follows none.
-		if (previous instanceof IrcBus && previous !== api) previous.#unsubscribe();
-		IrcBus.#global = api;
+		IrcBus.#replaceGlobal(api);
 	}
 
 	/** Reset the global bus. Test-only. */
 	static resetGlobalForTests(): void {
+		IrcBus.#replaceGlobal(undefined);
+	}
+
+	/**
+	 * Make `next` the global bus. The bus it replaces stops following its
+	 * registry; a worker's proxy follows none.
+	 */
+	static #replaceGlobal(next: IrcBusApi | undefined): void {
 		const previous = IrcBus.#global;
-		if (previous instanceof IrcBus) previous.#unsubscribe();
-		IrcBus.#global = undefined;
+		if (previous instanceof IrcBus && previous !== next) previous.#unsubscribe();
+		IrcBus.#global = next;
 	}
 
 	/**

@@ -178,11 +178,10 @@ pub(crate) fn bre_to_ere(pattern: &str, backrefs: Backrefs) -> Result<String, Br
 					// through it turned `[\(]` into a group opener and broke
 					// compilation, so the whole expression is read as bracket
 					// syntax and written out in the engine's.
-					// An unterminated one is refused, as in an ERE. Passed on as
-					// a plain `[`, it reached `grep`'s literal fallback or read
-					// as a nested class: `a[b` selected the lines holding `a[b`
-					// and `[[:alpha]]` those holding any of `:alph`, where GNU
-					// grep answers "Unmatched [, [^, [:, [., or [=".
+					// An unterminated one is refused, as in an ERE and as GNU grep
+					// refuses it ("Unmatched [, [^, [:, [., or [="): passed on as a
+					// plain `[`, `grep` would match `a[b` as typed and read
+					// `[[:alpha]]` as a nested class.
 					take_bracket_expression(&mut chars, &mut result)?;
 					has_atom = true;
 				},

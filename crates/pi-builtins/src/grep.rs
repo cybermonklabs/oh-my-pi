@@ -699,9 +699,8 @@ fn option_takes_next_value(arg: &str) -> bool {
 	}
 	let Some(group) = arg.strip_prefix('-') else { return false };
 	group
-		.char_indices()
-		.find(|&(_, option)| matches!(option, 'e' | 'f' | 'm' | 'A' | 'B' | 'C' | 'D' | 'd'))
-		.is_some_and(|(index, _)| index + 1 == group.len())
+		.find(|option: char| matches!(option, 'e' | 'f' | 'm' | 'A' | 'B' | 'C' | 'D' | 'd'))
+		.is_some_and(|index| index + 1 == group.len())
 }
 
 fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
@@ -1907,11 +1906,28 @@ impl AsyncUtility for Grep {
 			return 2;
 		},
 	};
+	// A search that selects no record: an empty pattern file leaves nothing to
+	// match, and an inverted empty pattern matches every record and so selects
+	// none. `-x` and `-w` constrain the empty pattern, so they can still select
+	// records. GNU grep answers it without reading its input, so it prints no
+	// count and reports no unreadable file: it exits 1, unless `-L` is to list
+	// every file.
+	let zero_patterns = patterns.is_empty();
+	let inverted_empty_pattern = cli.invert
+		&& !cli.line_regexp
+		&& !cli.word
+		&& !zero_patterns
+		&& patterns.iter().all(|pattern| pattern.is_empty());
+	let selects_no_record = (zero_patterns && !cli.invert) || inverted_empty_pattern;
+	let (files_with_matches, files_without_match) = resolve_file_list_modes(&matches);
+	if selects_no_record && (cli.quiet || !files_without_match) {
+		return 1;
+	}
 	// `-o` prints the match found at each position, and the engines take the
 	// first pattern that matches there. An empty pattern matches at every
-	// position and prints nothing, so first it hid the other patterns'
-	// matches; GNU grep prints them (`-o -e '' -e zz` prints `zz`). Last, it
-	// still selects every line.
+	// position and prints nothing, so placed first it hides the other
+	// patterns' matches, which GNU grep prints (`-o -e '' -e zz` prints `zz`);
+	// placed last it still selects every line.
 	if cli.only_matching {
 		patterns.sort_by_key(String::is_empty);
 	}
@@ -1928,25 +1944,8 @@ impl AsyncUtility for Grep {
 			return 2;
 		},
 	};
-	// A search that selects no record: an empty pattern file leaves nothing to
-	// match, and an inverted empty pattern matches every record and so selects
-	// none. `-x` and `-w` constrain the empty pattern, so they can still select
-	// records. GNU grep answers it without reading its input, so it prints no
-	// count and reports no unreadable file: it exits 1, unless `-L` is to list
-	// every file.
-	let zero_patterns = patterns.is_empty();
-	let inverted_empty_pattern = cli.invert
-		&& !cli.line_regexp
-		&& !cli.word
-		&& !zero_patterns
-		&& patterns.iter().all(|pattern| pattern.is_empty());
-	let selects_no_record = (zero_patterns && !cli.invert) || inverted_empty_pattern;
 	patterns.clear();
 
-	let (files_with_matches, files_without_match) = resolve_file_list_modes(&matches);
-	if selects_no_record && (cli.quiet || !files_without_match) {
-		return 1;
-	}
 	let suppress_context =
 		cli.count || files_with_matches || files_without_match || cli.quiet || cli.only_matching;
 	let (before, after) = if suppress_context {

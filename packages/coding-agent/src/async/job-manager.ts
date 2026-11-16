@@ -1008,12 +1008,12 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		const jobsSettled = await this.#waitForAllUntil(deadline);
 		const drained = await this.drainDeliveries({ timeoutMs: Math.max(deadline - Date.now(), 0) });
 		this.#clearEvictionTimers();
+		const agentIds = new Set<string>();
 		// Bypass the grace-period sleep: dispose has already drained/cancelled
 		// deliveries above, so there is nothing left for the model to read via
 		// `agent://<id>` — sleeping the retention window here would only leak
 		// temp dirs for up to `retainedArtifactsCleanupGraceMs` (or past
 		// process exit, since dispose does not await these cleanups).
-		const agentIds = new Set<string>();
 		for (const job of this.#jobs.values()) {
 			this.#runRetainedArtifactsCleanup(job, { bypassGrace: true });
 			if (job.agentId !== undefined) agentIds.add(job.agentId);

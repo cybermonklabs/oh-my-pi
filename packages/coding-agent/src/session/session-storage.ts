@@ -644,18 +644,21 @@ function sessionLeasePath(sessionId: string, createDir: boolean): string {
 
 /**
  * Take a session's ownership lease without waiting, or `null` while a process,
- * this one included, holds it. It probes the lease first (`isFileLockHeld`)
- * and answers `null` at once when the probe finds a holder; it claims only a
- * lease the probe finds free, so the claim waits only for the moment a probe
- * can make a free lease look taken (see `tryAcquireFileLock`), or about 50 ms
- * when another process claims the lease between the probe and the claim.
- * `omp gc` takes it to delete a session no running process owns; a lease
- * released while it is probed can read as held, which leaves that session for
- * gc's next run. Throws when the lock cannot be probed or taken.
+ * this one included, holds it. On Linux it probes the lease first
+ * (`isFileLockHeld`) and answers `null` at once when the probe finds a holder;
+ * it claims only a lease the probe finds free, so the claim waits only for the
+ * moment a probe can make a free lease look taken, or when another process
+ * claims the lease between the probe and the claim (see `tryAcquireFileLock`
+ * for how long a refused claim waits). Elsewhere the claim alone answers at
+ * once. `omp gc` takes it to delete a session no running process owns; on
+ * Linux a lease released while it is probed can read as held, which leaves
+ * that session for gc's next run. Throws when the lock cannot be probed or
+ * taken.
  */
 export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null {
 	const lockPath = sessionLeasePath(sessionId, true);
-	if (isFileLockHeld(lockPath)) return null;
+	// Only Linux's claim waits on a refusal; elsewhere the claim alone answers at once.
+	if (process.platform === "linux" && isFileLockHeld(lockPath)) return null;
 	return tryAcquireFileLock(lockPath);
 }
 
@@ -663,11 +666,12 @@ export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null
  * Claim a session's ownership lease to write the session, or `null` while a
  * process, this one included, holds it. A process writing the session holds
  * it (see `FileSessionStorage.claimSession`) until it exits. It claims without
- * probing first, and the claim retries a refusal (see `tryAcquireFileLock`),
- * so a concurrent probe never makes it fail; a lease another process holds is
- * refused after about 50 ms. Throws when the lock cannot be taken.
+ * probing first, and the claim retries a refusal, so a concurrent probe never
+ * makes it fail; a lease another process holds is refused (see
+ * `tryAcquireFileLock` for how long a refused claim waits). Throws when the
+ * lock cannot be taken.
  */
-export function claimSessionLease(sessionId: string): FileLockHandle | null {
+function claimSessionLease(sessionId: string): FileLockHandle | null {
 	return tryAcquireFileLock(sessionLeasePath(sessionId, true));
 }
 
