@@ -31,6 +31,7 @@ import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
 import { isSettingsInitialized, Settings } from "../config/settings";
 import {
+	recordMaskedHistory,
 	type SessionStoreMask,
 	type StoreMaskingBinding,
 	sessionStoreMaskFor,
@@ -3522,8 +3523,9 @@ export class SessionManager {
 		// Keep the recent-sessions title index current so welcome-screen lookups
 		// never have to content-scan this session's file.
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			const stored = this.#historyDbText(title, "title");
-			if (stored !== undefined) recordSessionTitle(this.#sessionId, stored);
+			recordMaskedHistory(this, title, this.#sessionId, "title", stored =>
+				recordSessionTitle(this.#sessionId, stored),
+			);
 		}
 
 		this.#notifySessionNameListeners();
@@ -3580,26 +3582,9 @@ export class SessionManager {
 	 */
 	recordRecap(recap: string): void {
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			const stored = this.#historyDbText(recap, "recap");
-			if (stored !== undefined) recordSessionRecap(this.#sessionId, this.#cwd, stored);
-		}
-	}
-
-	/**
-	 * `text` as the history.db `record` of this session stores it, through the mask, or `undefined`
-	 * when masking it fails: that write is then skipped, never made with the value unmasked, and a
-	 * history.db write never fails the rename or the recap it serves.
-	 */
-	#historyDbText(text: string, record: "title" | "recap"): string | undefined {
-		try {
-			return this.storeMask()?.maskText(text) ?? text;
-		} catch (err) {
-			logger.warn("Session store masking failed; skipped a history.db write", {
-				sessionId: this.#sessionId,
-				record,
-				error: toError(err).message,
-			});
-			return undefined;
+			recordMaskedHistory(this, recap, this.#sessionId, "recap", stored =>
+				recordSessionRecap(this.#sessionId, this.#cwd, stored),
+			);
 		}
 	}
 
