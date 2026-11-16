@@ -803,6 +803,43 @@ describe("session store masking of the history.db title and recaps", () => {
 		expect(listSessionRecaps({ sessionIds: [id] }).map(entry => entry.recap)).toEqual([said(FILE_VALUE)]);
 		await manager.close();
 	});
+
+	it("K31: a masker build that throws skips only the history.db title and recap, and logs each skip; the rename resolves and tells its listeners", async () => {
+		// The process masker reads only the test's variable, never this machine's environment.
+		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+			new storeMask.SessionStoreMasker({ env: () => ({ SERVICE_API_KEY: ENV_VALUE }), agentDir: tmp.join("agent") }),
+		);
+		spyOn(storeMatcher, "buildSessionStoreMatcher").mockImplementation(() => {
+			throw new Error("injected matcher failure");
+		});
+		const warn = spyOn(utils.logger, "warn").mockImplementation(() => {});
+		// Not on disk yet: the title entry waits for the session file, so each build is a history.db write's.
+		const manager = SessionManager.create(cwd, tmp.join("sessions"), new FileSessionStorage());
+		bindSetting(manager, Settings.isolated({ "secrets.maskSessionStore": true }));
+		let told = 0;
+		manager.onSessionNameChanged(() => told++);
+
+		const renamed = await manager.setSessionName(said(ENV_VALUE), "user");
+		manager.recordRecap(said(ENV_VALUE));
+
+		const id = manager.getSessionId();
+		expect({
+			renamed,
+			told,
+			title: lookupSessionTitle(id) !== undefined,
+			recaps: listSessionRecaps({ sessionIds: [id] }).length,
+		}).toEqual({ renamed: true, told: 1, title: false, recaps: 0 });
+		const skip = (record: string) => ({
+			sessionId: id,
+			record,
+			error: expect.stringContaining("injected matcher failure"),
+		});
+		const skips = warn.mock.calls
+			.filter(call => call[0] === "Session store masking failed; skipped a history.db write")
+			.map(call => call[1]);
+		expect(skips).toEqual([skip("title"), skip("recap")]);
+		await manager.close();
+	});
 });
 
 /** The content of each stored message of `manager`'s session, in file order. */
