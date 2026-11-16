@@ -739,16 +739,15 @@ for (const backend of backends) {
 			});
 
 			// The build at the refresh throws: that write fails, the error names the failure, and no
-			// line goes out under the mask that lacks the rotated value. The next write builds again
-			// and stores the failed line and its own, both masked.
+			// line goes out under the mask that lacks the rotated value. A session manager that heals a
+			// failed line at its flush stores it masked then, with a build that succeeds; one that does
+			// not leaves it out. The next write builds again and stores both lines masked.
 			const buildFailure = expect.stringMatching(/masking refresh failed.*injected matcher failure/);
-			expect(await writesAroundRotation(true)).toEqual({
-				first: one,
-				second: one,
-				reported: [buildFailure],
-				third: three,
-				errors: [buildFailure],
-			});
+			const { second, ...rest } = await writesAroundRotation(true);
+			expect(rest).toEqual({ first: one, reported: [buildFailure], third: three, errors: [buildFailure] });
+			// After the failed write: the first line, and at most the failed line as its marker.
+			expect({ raw: second.raw, firstKept: second.contents.length >= 1 }).toEqual({ raw: false, firstKept: true });
+			expect(second.contents).toEqual(two.contents.slice(0, second.contents.length));
 		});
 	});
 }
