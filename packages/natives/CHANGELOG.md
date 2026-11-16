@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Checking a session's lease (`omp session lease`, RPC `get_session_lease`) no longer makes a session starting at that moment fail to claim it and move to a sibling file on Linux kernels such as gVisor
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
