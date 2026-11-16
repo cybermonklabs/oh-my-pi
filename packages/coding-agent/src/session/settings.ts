@@ -816,7 +816,20 @@ export const cfgRetryRateLimitWalksChain = register({
 		group: "Retry & Fallback",
 		label: "Rate Limit Walks Chain",
 		description:
-			"On a rate limit, do not hold the retry.fallbackChains walk for a turn whose thinking is signed by the failing model. Off (the default), such a turn keeps retrying the rate-limited model until retry.maxRetries is spent before the chain is reached.",
+			"On a rate limit, walk retry.fallbackChains at once. Off (the default), a rate limit retries the rate-limited model after the wait the provider states, and reaches the chain only once retry.maxRetries is spent or the stated wait is past retry.maxDelayMs. retry.rateLimitFallbackMaxContextTokens applies either way.",
+	},
+});
+
+export const cfgRetryRateLimitFallbackMaxContextTokens = register({
+	id: "retry.rateLimitFallbackMaxContextTokens",
+	type: "number",
+	default: 100_000,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Rate Limit Fallback Context Cap",
+		description:
+			"A rate limit never moves a session whose context is larger than this many tokens down retry.fallbackChains: the turn keeps retrying the rate-limited model and, once retry.maxRetries is spent, ends with the provider's error. The new model would have to write the whole context to its prompt cache.",
 	},
 });
 
@@ -929,6 +942,7 @@ export const cfgRetry = combine({
 	modelFallback: cfgRetryModelFallback,
 	fallbackOn: cfgRetryFallbackOn,
 	rateLimitWalksChain: cfgRetryRateLimitWalksChain,
+	rateLimitFallbackMaxContextTokens: cfgRetryRateLimitFallbackMaxContextTokens,
 	usageAwareFallback: cfgRetryUsageAwareFallback,
 	usageReservePct: cfgRetryUsageReservePct,
 	usageReservePolicy: cfgRetryUsageReservePolicy,

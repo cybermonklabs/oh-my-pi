@@ -8,6 +8,7 @@
 - Hindsight auto-retain, the pending-tool-call warning on resume and the exit record read only recent messages on each turn instead of the whole history
 - `.jsonl.gz` subagent transcripts in exports are decompressed as they are read instead of all at once
 - `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory
+- A rate limit now waits on the same model, retrying it after the wait the provider states, before it walks `retry.fallbackChains`, and never moves a session whose context is larger than the new `retry.rateLimitFallbackMaxContextTokens` (default 100,000 tokens); overloads and server errors still walk the chain at once
 
 ### Fixed
 
