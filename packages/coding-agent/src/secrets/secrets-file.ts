@@ -74,7 +74,7 @@ export async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> 
 			logger.warn("Skipped secrets.yml", { path: filePath, reason: read.skip });
 			return [];
 		}
-		return parseSecretsFile(read.text, filePath).map(({ entry }) => entry);
+		return parseSecretsFile({ path: filePath, text: read.text }).map(({ entry }) => entry);
 	} catch (err) {
 		return secretsFileFailure(err, filePath);
 	}
@@ -168,16 +168,22 @@ async function readSecretFile(filePath: string): Promise<SecretFileRead> {
 	}
 }
 
+/** The text of the secrets.yml at `path`. */
+export interface SecretsFileText {
+	readonly path: string;
+	readonly text: string;
+}
+
 /**
- * The valid entries of a secrets.yml's `text`, each with its position; a text that does not parse, or
- * is not a YAML array, yields nothing. The caller reads the text, so it knows a read that failed
- * from a file that holds no entry.
+ * The valid entries of `file.text`, each with its position; a text that does not parse, or is not a
+ * YAML array, yields nothing. The caller reads the text, so it knows a read that failed from a file
+ * that holds no entry.
  */
-export function parseSecretsFileText(text: string, filePath: string): PositionedSecretEntry[] {
+export function parseSecretsFileText(file: SecretsFileText): PositionedSecretEntry[] {
 	try {
-		return parseSecretsFile(text, filePath);
+		return parseSecretsFile(file);
 	} catch (err) {
-		return secretsFileFailure(err, filePath);
+		return secretsFileFailure(err, file.path);
 	}
 }
 
@@ -186,7 +192,7 @@ function secretsFileFailure(err: unknown, filePath: string): [] {
 	return [];
 }
 
-function parseSecretsFile(text: string, filePath: string): PositionedSecretEntry[] {
+function parseSecretsFile({ path: filePath, text }: SecretsFileText): PositionedSecretEntry[] {
 	const raw = YAML.parse(text);
 	if (!Array.isArray(raw)) {
 		logger.warn("secrets.yml must be a YAML array", { path: filePath });
