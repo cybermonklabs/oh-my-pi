@@ -657,12 +657,9 @@ export class IndexedSessionStorage implements SessionStorage {
 		if (!title) return read;
 		const size = Math.max(read.size, SESSION_TITLE_SLOT_BYTES);
 		if (start > 0) return { text: read.text, size };
-		// The window's bytes of the overlaid head: within the slot as many as
-		// over a body at least as long as the slot, so a shorter body reads as it.
-		const windowBytes = Math.min(limit ?? SESSION_TITLE_SLOT_BYTES, SESSION_TITLE_SLOT_BYTES);
-		const shown = Math.max(byteLength(read.text), windowBytes);
-		const head = overlayTitleSlotPrefix(read.text, shown, title);
-		return { text: Buffer.from(head, "utf-8").subarray(offset).toString("utf-8"), size };
+		// The window of the overlaid head, cut as readText's bytes would be.
+		const head = Buffer.from(overlayTitleSlotContent(read.text, title), "utf-8");
+		return { text: head.subarray(offset, limit).toString("utf-8"), size };
 	}
 
 	async #readBackendFrom(
