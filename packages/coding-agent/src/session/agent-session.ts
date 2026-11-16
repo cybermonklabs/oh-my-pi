@@ -468,6 +468,7 @@ import {
 	type CacheWarmingMode,
 	type CacheWarmingStatus,
 	observedPromptCacheTier,
+	observedPromptCacheTtlMs,
 	type PromptCacheChange,
 	type PromptCacheEntry,
 	promptTokensOf,
@@ -766,6 +767,11 @@ interface BranchPromptCacheObservation {
 	compacted: boolean;
 	/** Digest of the base prompt the reply was produced under; undefined when none is recorded. */
 	promptDigest: string | undefined;
+	/**
+	 * Lifetime the provider named for the entry, from the newest reply of the same model that reported its
+	 * cache-write split (a reply that only read the entry reports none); undefined when no reply named one.
+	 */
+	reportedTtlMs: number | undefined;
 }
 
 /**
@@ -779,6 +785,8 @@ interface BranchPromptCacheScan {
 	/** Newest system prompt digest recorded in the scanned entries. */
 	digest: string | undefined;
 	observation: BranchPromptCacheObservation | undefined;
+	/** The newest reply's model and the lifetime it named for the entry it wrote; see `reportedTtlMs`. */
+	reported: { provider: string; model: string; ttlMs: number } | undefined;
 }
 
 /** Folds `scan.branch`'s unscanned entries into what the newest reply that read or wrote the prompt cache left. */
@@ -799,6 +807,7 @@ function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
 		// `/clear` starts a new transcript: nothing before the boundary is a prefix of the next request.
 		if (entry.type === "reset_boundary") {
 			scan.observation = undefined;
+			scan.reported = undefined;
 			continue;
 		}
 		// Failed, replaced and outdated refreshes carry no outcome: they say nothing about this entry.
@@ -814,7 +823,18 @@ function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 		const reply = entry.message;
 		if (reply.stopReason === "error" || reply.usage.cacheRead + reply.usage.cacheWrite <= 0) continue;
-		scan.observation = { reply, warmedAt: 0, refreshMissed: false, compacted: false, promptDigest: scan.digest };
+		const ttlMs = observedPromptCacheTtlMs(reply.usage);
+		if (ttlMs !== undefined) scan.reported = { provider: reply.provider, model: reply.model, ttlMs };
+		const reported = scan.reported;
+		scan.observation = {
+			reply,
+			warmedAt: 0,
+			refreshMissed: false,
+			compacted: false,
+			promptDigest: scan.digest,
+			reportedTtlMs:
+				reported?.provider === reply.provider && reported.model === reply.model ? reported.ttlMs : undefined,
+		};
 	}
 	scan.scanned = branch.length;
 }
@@ -1435,6 +1455,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#promptCacheArmSessionId: string | undefined;
 	/** Each armed main-loop request's dispatch hook, keyed by the context it was armed with. */
 	readonly #promptCacheDispatch = new WeakMap<Context, () => void>();
+	/**
+	 * The newest main-loop request's shape, messages and transcript, recorded with or without a warmer: a
+	 * side request repeats that request's prefix only while none of them changed (see {@link promptCacheExpiresAt}).
+	 */
+	#lastRequestArm: { sessionId: string; shape: PromptCacheShape; messages: readonly AgentMessage[] } | undefined;
 	/** {@link #promptCacheShape} for the inputs it was last built from. */
 	#promptCacheShapeMemo:
 		| {
@@ -5987,23 +6012,25 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * session streamFn with its raw request options; retention settings are
 	 * resolved here to match the settings-aware stream wrapper.
 	 * {@link markPromptCacheDispatched} starts the armed entry's lifetime once the request is sent.
+	 * Also records the request's shape for {@link promptCacheExpiresAt}, in a session with no warmer too.
 	 */
 	startCacheWarming(model: Model, context: Context, options: SimpleStreamOptions): void {
+		const sessionId = this.sessionManager.getSessionId();
+		// A copy: `/clear` truncates the live array in place, which an alias would follow.
+		const armMessages = this.messages.slice();
+		const armShape = this.#promptCacheShape(model);
+		this.#lastRequestArm = { sessionId, shape: armShape, messages: armMessages };
 		const warmer = this.#cacheWarmer;
 		if (!warmer) return;
 		// The warmer keeps its confirmed entry across requests until a response
 		// replaces it; another transcript's entry says nothing about this one.
-		const sessionId = this.sessionManager.getSessionId();
 		if (this.#promptCacheArmSessionId !== sessionId) warmer.cancel();
 		this.#promptCacheArmSessionId = sessionId;
-		// A copy: `/clear` truncates the live array in place, which an alias would follow.
-		const armMessages = this.messages.slice();
 		const retentionSetting = cfgProvidersCacheRetention.get(this.settings);
 		const warmingOptions = {
 			...options,
 			cacheRetention: options.cacheRetention ?? (retentionSetting === "auto" ? undefined : retentionSetting),
 		};
-		const armShape = this.#promptCacheShape(model);
 		const dispatched = warmer.start({ model, context, options: warmingOptions }, () =>
 			this.#promptCacheChange(armShape, armMessages),
 		);
@@ -6117,6 +6144,35 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
+	 * When the prompt cache entry the branch's newest cached reply left stops answering a
+	 * request that repeats its prefix. Undefined when the cache cannot answer such a request
+	 * at all: no reply read or wrote the cache (a provider that keeps none), the next request
+	 * sends something else first (another model or retention tier, a compaction, a new system
+	 * prompt; or, since this process's newest request, other tools, another thinking level or
+	 * rewritten history), the latest warm refresh missed, or no lifetime is known. The lifetime
+	 * is the shorter of the one the model declares for the tier (`promptCache`) and the one the
+	 * provider named for the entry it wrote (see {@link observedPromptCacheTtlMs}): the prefix
+	 * lives only as long as its shortest part.
+	 */
+	promptCacheExpiresAt(): number | undefined {
+		const entry = this.#inferredPromptCacheEntry();
+		if (!entry || entry.change !== undefined || entry.refreshMissed) return undefined;
+		const arm = this.#lastRequestArm;
+		if (
+			arm?.sessionId === this.sessionManager.getSessionId() &&
+			this.#promptCacheChange(arm.shape, arm.messages) !== undefined
+		) {
+			return undefined;
+		}
+		const reportedTtlMs = this.#branchPromptCacheObservation()?.reportedTtlMs;
+		const ttlMs =
+			entry.ttlMs === undefined || reportedTtlMs === undefined
+				? (entry.ttlMs ?? reportedTtlMs)
+				: Math.min(entry.ttlMs, reportedTtlMs);
+		return ttlMs === undefined ? undefined : entry.touchedAt + ttlMs;
+	}
+
+	/**
 	 * The entry the branch's newest cached reply left, for a transcript this
 	 * process has not sent yet (a reopened or switched session): touched at the
 	 * reply's send time or a later warm refresh that hit, under the lifetime its
@@ -6181,7 +6237,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const branch = this.sessionManager.getBranchView();
 		let scan = this.#branchPromptCacheScan;
 		if (scan?.branch !== branch) {
-			scan = { branch, scanned: 0, digest: undefined, observation: undefined };
+			scan = { branch, scanned: 0, digest: undefined, observation: undefined, reported: undefined };
 			this.#branchPromptCacheScan = scan;
 		}
 		if (scan.scanned < branch.length) scanBranchPromptCache(scan);

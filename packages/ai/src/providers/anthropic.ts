@@ -152,7 +152,7 @@ import {
 import { prepareAnthropicImageContext } from "./anthropic-images";
 import { isAnthropicNarrationSignature, servedModelFromAnthropicSignature } from "./anthropic-signature";
 import { getOpenAIPromptCacheKey } from "./openai-shared";
-import { applyInferenceHeaders } from "./inference-headers";
+import { applyInferenceHeaders, conversationSessionId } from "./inference-headers";
 import { redactSensitiveCredentials, transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 import {
@@ -2227,8 +2227,10 @@ const streamAnthropicOnce = (
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					copilotCacheKey,
 					copilotCacheSnapshot: copilotCached ?? null,
+					// A side request presents its parent conversation: gateways and providers route a
+					// conversation's requests to its prompt cache by this id (`conversationSessionId`).
 					sessionId:
-						options?.sessionId ??
+						conversationSessionId(options) ??
 						extractClaudeMetadataSessionId(options?.metadata?.user_id) ??
 						options?.promptCacheKey,
 					disableStrictTools,
@@ -5226,7 +5228,7 @@ function buildParams(
 			// Deliberately share the normalized affinity identity across Kimi's two transports.
 			(model.provider === "kimi-code" ? getOpenAIPromptCacheKey(options) : undefined),
 		isOAuthToken,
-		options?.sessionId,
+		conversationSessionId(options),
 		metadataAccountId,
 	);
 	const metadata = metadataUserId ? { user_id: metadataUserId } : undefined;

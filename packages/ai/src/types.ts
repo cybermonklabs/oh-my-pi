@@ -629,10 +629,13 @@ export interface StreamOptions {
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/**
 	 * Session a side request branches from, so it can read the parent's cached
-	 * prefix. Providers that keep per-conversation request controls (OpenAI
+	 * prefix. The request presents this id wherever a conversation id routes it
+	 * to a prompt cache: session headers, Claude `metadata.user_id`, and the
+	 * prompt-cache key and OpenRouter `session_id` when no explicit key is set.
+	 * Its own `sessionId` keeps only its provider state and per-request ids.
+	 * Providers that keep per-conversation request controls (OpenAI
 	 * `configuration_update` effort baselines) plan the request against a copy
-	 * of that session's controls, never changing the parent's state; the Codex
-	 * backend also routes it with the parent's cache affinity (session headers).
+	 * of that session's controls, never changing the parent's state.
 	 */
 	parentSessionId?: string;
 	/**

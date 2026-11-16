@@ -41,6 +41,7 @@ import { createProviderErrorMessage } from "./error-message";
 import droidIdentity from "./factory-droid/droid-identity.md" with { type: "text" };
 import { streamFactoryDroidGemini } from "./factory-droid/gemini";
 import { factoryDroidToolNamesByWire, encodeFactoryDroidCompletionsToolName } from "./factory-droid/tool-names";
+import { conversationSessionId } from "./inference-headers";
 import { streamAnthropic, streamOpenAICompletions, streamOpenAIResponses } from "./register-builtins";
 
 /**
@@ -399,7 +400,10 @@ interface Attempt {
 	orgId: string | undefined;
 	effort: Effort | undefined;
 	disabled: boolean;
+	/** Provider-state identity of this request (its own `sessionId`). */
 	sessionUuid: string;
+	/** Conversation identity on the wire: a side request's parent (`conversationSessionId`). */
+	affinityUuid: string;
 	context: Context;
 	options: FactoryDroidOptions | undefined;
 	forwarded: ForwardedOptions;
@@ -535,13 +539,14 @@ function servedByAnotherModel(requestedId: string, servedId: string, baseVariant
 
 function streamResponsesWire(a: Attempt, inner: Model<"openai-responses">): AssistantMessageEventStream {
 	const { policy } = a.route;
-	const { effort, disabled, options, sessionUuid } = a;
+	const { effort, disabled, options, sessionUuid, affinityUuid } = a;
 	const verbosity = options?.textVerbosity ?? policy.responsesVerbosity;
 	// Native declares every function tool non-strict; OpenAI treats an absent flag as strict.
 	const tools = a.context.tools?.map(tool => ({ ...tool, strict: false }));
 	return streamOpenAIResponses(inner, tools ? { ...a.context, tools } : a.context, {
 		...a.forwarded,
 		sessionId: sessionUuid,
+		parentSessionId: affinityUuid,
 		reasoning: effort,
 		// Hosts without reasoning-summary support (xai-routed models) get the
 		// shared resolver's explicit null instead of the "auto" default.
@@ -557,7 +562,7 @@ function streamResponsesWire(a: Attempt, inner: Model<"openai-responses">): Assi
 		// family defaults tool_choice to auto; the transport emits it only with tools.
 		toolChoice: options?.toolChoice ?? (policy.responsesToolChoiceAuto ? "auto" : undefined),
 		extraBody: {
-			prompt_cache_key: sessionUuid,
+			prompt_cache_key: affinityUuid,
 			...(policy.responsesCacheRetention ? { prompt_cache_retention: "24h" } : {}),
 			// Native always states parallel tool calls when tools ride the request.
 			...(a.context.tools?.length ? { parallel_tool_calls: policy.responsesParallelToolCalls !== false } : {}),
@@ -565,7 +570,7 @@ function streamResponsesWire(a: Attempt, inner: Model<"openai-responses">): Assi
 			...(verbosity ? { text: { verbosity } } : {}),
 			// Native computes userId ?? sessionId and never passes userId, so the
 			// wire value is the session id rather than the stable WorkOS user id.
-			...(policy.responsesSafetyIdentifier ? { safety_identifier: sessionUuid } : {}),
+			...(policy.responsesSafetyIdentifier ? { safety_identifier: affinityUuid } : {}),
 		},
 	});
 }
@@ -607,6 +612,7 @@ function streamCompletionsWire(a: Attempt, inner: Model<"openai-completions">): 
 		{
 			...a.forwarded,
 			sessionId: a.sessionUuid,
+			parentSessionId: a.affinityUuid,
 			temperature: options?.temperature ?? FACTORY_DROID_COMPLETIONS_TEMPERATURE,
 			topP: options?.topP,
 			topK: options?.topK,
@@ -750,6 +756,8 @@ export const streamFactoryDroid: StreamFunction<"factory-droid-agent"> = (
 			// stable per session.
 			const requestId = crypto.randomUUID();
 			const sessionUuid = options?.sessionId ? deterministicUuid(options.sessionId) : requestId;
+			const conversation = conversationSessionId(options);
+			const affinityUuid = conversation ? deterministicUuid(conversation) : requestId;
 			const systemPrompt = context.systemPrompt ?? [];
 			const route = resolveRoute(model, scope, wire);
 			const attempt: Attempt = {
@@ -760,6 +768,7 @@ export const streamFactoryDroid: StreamFunction<"factory-droid-agent"> = (
 				baseUrl: scope.baseUrl,
 				...selectEffort(scope.model, registry, options),
 				sessionUuid,
+				affinityUuid,
 				context: {
 					...context,
 					systemPrompt: [DROID_SYSTEM_PREFIX, ...systemPrompt],
@@ -791,7 +800,7 @@ export const streamFactoryDroid: StreamFunction<"factory-droid-agent"> = (
 								context.messages.some(message => message.role === "assistant")
 									? "session_lock"
 									: (scope.model.factoryDroidRoutingSource ?? "registry_default"),
-							sessionUuid,
+							sessionUuid: affinityUuid,
 							requestId,
 							orgId: scope.orgId,
 							wire,

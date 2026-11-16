@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Fixed side requests (`parentSessionId`, such as `/btw` and subagent progress probes) reading their parent's prompt cache cold through gateways that route a conversation to its cache by session id: the session headers, Claude `metadata.user_id`, the default prompt-cache key and OpenRouter `session_id`, and Factory Droid's `x-session-id`, `prompt_cache_key` and `safety_identifier` now carry the parent's id, while per-request ids keep the side request's own; the auth gateway's pi-native wire now forwards `parentSessionId`
 - Fixed xAI speech requests failing with `422 missing field language`: `xai-tts` now sends `language`, which xAI's `/v1/tts` requires, defaulting to `auto` (automatic detection) when the caller passes none, as the auth gateway's `/v1/audio/speech` does ([#17992](https://github.com/can1357/oh-my-pi/pull/17992) by [@Mirceone](https://github.com/Mirceone))
 - Fixed Codex WebSocket turns sending a delta `input` after a pooled socket reconnected (closed, idle eviction, token refresh, or prewarm routing-hint change) or when `onPayload` deleted `previous_response_id` (including when it also rewrote the input), and skipped late prewarm while a socket is busy or holding accepted steering ([#17809](https://github.com/can1357/oh-my-pi/pull/17809) by [@xiangnan0811](https://github.com/xiangnan0811)).
 

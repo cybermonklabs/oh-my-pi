@@ -785,6 +785,7 @@ const streamOpenAIResponsesOnce = (
 					initiatorOverride: options?.initiatorOverride,
 					messages: context.messages,
 					sessionId: options?.sessionId ?? routingSessionId,
+					parentSessionId: options?.parentSessionId,
 					promptCacheSessionId,
 					// The family affinity key rides only an explicit prompt-cache
 					// identity; the sessionId-derived cache-id fallback never does.

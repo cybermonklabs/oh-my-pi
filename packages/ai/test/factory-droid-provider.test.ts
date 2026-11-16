@@ -256,6 +256,25 @@ describe("Factory Droid completions wire (Droid Core)", () => {
 		expect(request.body.parallel_tool_calls).toBeUndefined();
 	});
 
+	it("sends a side request under its parent conversation's session id and cache key", async () => {
+		// Factory routes and caches a conversation by x-session-id and prompt_cache_key; a side
+		// request that sent its own id read its parent's prefix cold.
+		const send = async (options: { sessionId: string; parentSessionId?: string }) => {
+			const captured: CapturedRequest[] = [];
+			await streamFactoryDroid(
+				gptTerra(),
+				{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+				{ apiKey: WORKOS_TOKEN, fetch: captureFetch(captured, [...responsesChunks("OK")]), ...options },
+			).result();
+			return captured[0];
+		};
+		const parent = await send({ sessionId: "019fd-test-session" });
+		const side = await send({ sessionId: "019fd-test-session:side:1", parentSessionId: "019fd-test-session" });
+
+		expect(side.headers["x-session-id"]).toBe(parent.headers["x-session-id"]);
+		expect(side.body.prompt_cache_key).toBe(parent.body.prompt_cache_key);
+	});
+
 	it("forwards payload replacement, response metadata and raw SSE observation through the wrapper", async () => {
 		const captured: CapturedRequest[] = [];
 		const observed = { status: 0, chunks: [] as string[] };
