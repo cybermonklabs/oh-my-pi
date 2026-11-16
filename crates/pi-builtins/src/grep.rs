@@ -685,12 +685,23 @@ fn resolve_max_count(cli: &GrepArgs) -> Result<Option<u64>, String> {
 	}
 }
 
+/// Whether the argument after `arg` is `arg`'s value: `arg` is a long option
+/// that takes one, or a group of short options whose first option that takes
+/// one ends the group. As getopt reads a group, that option takes the rest of
+/// it when anything follows (`-ve-5`), else the next argument whatever its
+/// first character (`-ve -5`).
 fn option_takes_next_value(arg: &str) -> bool {
-	matches!(arg, "-e" | "-f" | "-m" | "-A" | "-B" | "-C" | "-D" | "-d"
-		| "--regexp" | "--file" | "--max-count" | "--after-context" | "--before-context"
-		| "--context" | "--label" | "--group-separator" | "--binary-files" | "--devices"
-		| "--directories" | "--include" | "--exclude" | "--exclude-from" | "--exclude-dir"
-		| "--include-dir")
+	if let Some(long) = arg.strip_prefix("--") {
+		return matches!(long, "regexp" | "file" | "max-count" | "after-context" | "before-context"
+			| "context" | "label" | "group-separator" | "binary-files" | "devices"
+			| "directories" | "include" | "exclude" | "exclude-from" | "exclude-dir"
+			| "include-dir");
+	}
+	let Some(group) = arg.strip_prefix('-') else { return false };
+	group
+		.char_indices()
+		.find(|&(_, option)| matches!(option, 'e' | 'f' | 'm' | 'A' | 'B' | 'C' | 'D' | 'd'))
+		.is_some_and(|(index, _)| index + 1 == group.len())
 }
 
 fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
@@ -777,9 +788,13 @@ fn build_matcher(
 			.map_err(|error| error.to_string());
 	}
 
+	// With no pattern (`-f` of an empty file) no line matches. To fold case,
+	// `grep-regex` parses the patterns joined by `|`, and with none that is
+	// the empty regex, which matches every line; without folding it builds an
+	// alternation of nothing, which matches none.
 	let mut builder = RegexMatcherBuilder::new();
 	builder
-		.case_insensitive(ignore_case)
+		.case_insensitive(ignore_case && !patterns.is_empty())
 		.word(cli.word && !cli.line_regexp)
 		.whole_line(cli.line_regexp);
 	if cli.null_data {
@@ -1892,6 +1907,14 @@ impl AsyncUtility for Grep {
 			return 2;
 		},
 	};
+	// `-o` prints the match found at each position, and the engines take the
+	// first pattern that matches there. An empty pattern matches at every
+	// position and prints nothing, so first it hid the other patterns'
+	// matches; GNU grep prints them (`-o -e '' -e zz` prints `zz`). Last, it
+	// still selects every line.
+	if cli.only_matching {
+		patterns.sort_by_key(String::is_empty);
+	}
 	let matcher = match build_matcher(
 		host,
 		&patterns,
@@ -1905,11 +1928,12 @@ impl AsyncUtility for Grep {
 			return 2;
 		},
 	};
-	// A search that selects no record never writes to the file it reads, so
-	// that file is not its own output and the refusal below must stay off. An
-	// empty pattern file leaves nothing to match, and an inverted empty
-	// pattern matches every record and so selects none. `-x` and `-w`
-	// constrain the empty pattern, so they can still select records.
+	// A search that selects no record: an empty pattern file leaves nothing to
+	// match, and an inverted empty pattern matches every record and so selects
+	// none. `-x` and `-w` constrain the empty pattern, so they can still select
+	// records. GNU grep answers it without reading its input, so it prints no
+	// count and reports no unreadable file: it exits 1, unless `-L` is to list
+	// every file.
 	let zero_patterns = patterns.is_empty();
 	let inverted_empty_pattern = cli.invert
 		&& !cli.line_regexp
@@ -1920,6 +1944,9 @@ impl AsyncUtility for Grep {
 	patterns.clear();
 
 	let (files_with_matches, files_without_match) = resolve_file_list_modes(&matches);
+	if selects_no_record && (cli.quiet || !files_without_match) {
+		return 1;
+	}
 	let suppress_context =
 		cli.count || files_with_matches || files_without_match || cli.quiet || cli.only_matching;
 	let (before, after) = if suppress_context {
@@ -1933,14 +1960,12 @@ impl AsyncUtility for Grep {
 	// it writes would be read back and matched again, so the file grows
 	// without bound. It exempts the modes that write at most one line per file
 	// (`-q`, `-c`, `-l`, `-L`) and the bounded `-m1`, which stop before their
-	// output can feed back into the search, and the searches that select no
-	// record at all.
+	// output can feed back into the search.
 	let refuse_output_file = !cli.quiet
 		&& !cli.count
 		&& !files_with_matches
 		&& !files_without_match
-		&& max_count.is_none_or(|count| count > 1)
-		&& !selects_no_record;
+		&& max_count.is_none_or(|count| count > 1);
 	let opts = Options {
 		line_number: cli.line_number,
 		byte_offset: cli.byte_offset,
@@ -2151,6 +2176,31 @@ mod tests {
 			(&["-c", "-f", "-pats", "haystack"][..], "1\n"),
 			(&["-o", "-f", "-pats", "haystack"][..], "b\n"),
 			(&["-n", "--file", "-pats", "haystack"][..], "2:b\n"),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;
+			assert_eq!((code, capture.out().as_str()), (0, want), "{args:?}: {}", capture.err());
+		}
+	}
+
+	/// GNU grep 3.11 reads a group of short options as getopt does: the first
+	/// option in it that takes a value takes the rest of the group, or the next
+	/// argument whatever its first character when the group ends there. Only
+	/// a lone `-e` or `-f` took the next argument, so after `-ve` a `-5` was
+	/// rewritten to `--context=5`, which clap then took as the pattern.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_option_ending_a_group_takes_the_next_argument_as_its_value() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("in"), "-5\n-1\nx\nzz\nb\n").unwrap();
+		std::fs::write(tree.path().join("-1"), "-5\n").unwrap();
+		for (args, want) in [
+			(&["-ve", "-5", "in"][..], "-1\nx\nzz\nb\n"),
+			(&["-ce", "-5", "in"][..], "1\n"),
+			(&["-ne", "-1", "in"][..], "2:-1\n"),
+			(&["-cf", "-1", "in"][..], "1\n"),
+			(&["-cm", "-1", "x", "in"][..], "1\n"),
+			// A value inside the group, and an option alone, as before.
+			(&["-ve-5", "in"][..], "-1\nx\nzz\nb\n"),
+			(&["-c", "-e", "-5", "in"][..], "1\n"),
 		] {
 			let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;
 			assert_eq!((code, capture.out().as_str()), (0, want), "{args:?}: {}", capture.err());
@@ -2434,9 +2484,9 @@ mod tests {
 	/// Contract: a search with no pattern at all is not reading its own
 	/// output.
 	///
-	/// GNU grep reads a file whose pattern file is empty, reports that no line
-	/// matched, and leaves the file alone: the search selects no record, so it
-	/// writes nothing that could be read back.
+	/// GNU grep answers a search whose pattern file is empty without reading
+	/// the file: it reports that no line matched and leaves the file alone. The
+	/// search selects no record, so it writes nothing that could be read back.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn a_search_with_no_patterns_is_not_refused_as_the_output_file() {
 		let tree = tempfile::tempdir().unwrap();
@@ -2447,7 +2497,7 @@ mod tests {
 			run_with_stdout_file(&["-f", "patterns", "out.txt"], tree.path(), &path).await;
 		assert_eq!(code, 1, "{err}");
 		assert!(!err.contains("input file is also the output"), "{err}");
-		// The file is read, and left exactly as it was.
+		// The file is left exactly as it was.
 		assert_eq!(std::fs::read(&path).unwrap(), b"needle\n");
 	}
 
@@ -2471,9 +2521,9 @@ mod tests {
 
 	/// Contract: an inverted empty pattern is not reading its own output.
 	///
-	/// GNU grep searches a file with `grep -v ''` and writes nothing: the empty
-	/// pattern matches every record, so the inverted search selects none of
-	/// them and the file it reads is not its own output.
+	/// GNU grep answers `grep -v ''` without reading the file, and writes
+	/// nothing: the empty pattern matches every record, so the inverted search
+	/// selects none of them and the file is not its own output.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn an_inverted_empty_pattern_is_not_refused_as_the_output_file() {
 		let tree = tempfile::tempdir().unwrap();
@@ -2766,14 +2816,10 @@ mod tests {
 		}
 
 		// An unterminated bracket expression is not silently swallowed as an
-		// empty class: the engine refuses it. In `grep` it then reaches the
-		// pre-existing literal fallback - the same path back-references take -
-		// so it matches the typed text rather than erroring the way real grep
-		// does. That divergence predates this change and is unchanged by it;
-		// `sed`, which has no such fallback, reports the error.
+		// empty class, nor matched as the text typed: GNU grep 3.11 refuses it.
 		let (code, out, err) = run(&["-c", "a[d"], "a[d\nplain\n").await;
-		assert_eq!(code, 0, "{err}");
-		assert_eq!(out, "1\n", "falls back to the literal text the user typed");
+		assert_eq!((code, out.as_str()), (2, ""), "{err}");
+		assert!(err.contains("grep: Unmatched [, [^, [:, [., or [="), "{err}");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2859,7 +2905,7 @@ mod tests {
 	/// GNU grep 3.11 refuses these bracket expressions with these words and
 	/// exit 2, in BRE and in ERE, where the `regex` crate read them as a nested
 	/// class, a class only it knows, or a list of characters. An unterminated
-	/// one is refused in an ERE; in a BRE it still reaches the literal fallback.
+	/// one is refused too; see the next test.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn invalid_bracket_expressions_are_refused_as_gnu_grep_refuses_them() {
 		for (pattern, message) in [
@@ -2881,6 +2927,33 @@ mod tests {
 		assert!(err.contains("Unmatched [, [^, [:, [., or [="), "{err}");
 	}
 
+	/// GNU grep 3.11 refuses each of these BRE patterns with "Unmatched [, [^,
+	/// [:, [., or [=" and exit 2, as `-E` already did here, and the whole
+	/// command when one of its patterns is one. A BRE passed the `[` on as a
+	/// plain one, so grep matched the text typed or a nested class with exit
+	/// 0, or found nothing with exit 1.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn unterminated_bracket_expressions_are_refused_in_a_bre() {
+		let input = "a\n:\nb]\n^\na[b\nx[]\nx\n[x\n";
+		for args in [
+			&["[[:alpha]]"][..],
+			&["[[.a]b]"][..],
+			&["[[=a]b]"][..],
+			&["[a[:]b]"][..],
+			&["a[b"][..],
+			&["x[]"][..],
+			&["[]"][..],
+			&["[^]"][..],
+			&["[[:alpha:]"][..],
+			&["-e", "[x", "-e", "x"][..],
+		] {
+			let argv: Vec<&str> = std::iter::once("-n").chain(args.iter().copied()).collect();
+			let (code, out, err) = run(&argv, input).await;
+			assert_eq!((code, out.as_str()), (2, ""), "{argv:?}: {err}");
+			assert!(err.contains("grep: Unmatched [, [^, [:, [., or [="), "{argv:?}: {err}");
+		}
+	}
+
 	/// `-o` matches within the line's text, as GNU grep 3.11 does: a class that
 	/// takes in the newline printed it as one more, empty-looking match.
 	#[tokio::test(flavor = "multi_thread")]
@@ -2891,6 +2964,47 @@ mod tests {
 		assert_eq!((code, out.as_str()), (0, " \n"), "{err}");
 		let (code, out, err) = run(&["-zo", "[^x]"], "ab\0x\0").await;
 		assert_eq!((code, out.as_str()), (0, "a\0b\0"), "{err}");
+	}
+
+	/// `-o` prints the matches of the non-empty patterns beside an empty one,
+	/// as GNU grep 3.11 does. The empty pattern, earlier in the alternation,
+	/// matched at every position, and its empty match hid the others'.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn only_matching_prints_the_matches_beside_an_empty_pattern() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("in"), "-5\n-1\nx\nzz\nb\n").unwrap();
+		std::fs::write(tree.path().join("pats"), "zz\n\nb\n").unwrap();
+		for mode in ["-G", "-E", "-F"] {
+			for (args, want) in [
+				(&[mode, "-o", "-e", "", "-e", "zz", "in"][..], "zz\n"),
+				(&[mode, "-on", "-e", "", "-e", "zz", "in"][..], "4:zz\n"),
+				(&[mode, "-o", "-f", "pats", "in"][..], "zz\nb\n"),
+			] {
+				let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;
+				assert_eq!((code, capture.out().as_str()), (0, want), "{args:?}: {}", capture.err());
+			}
+		}
+	}
+
+	/// With no pattern, as from an empty `-f` file, GNU grep 3.11 selects no
+	/// line, with `-i` as without: it exits 1 without reading its input, so it
+	/// prints no count and reports no missing file, and only `-L` reads it, to
+	/// list every file. Folding case turned no pattern into the empty regex,
+	/// which selected every line.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn no_pattern_selects_no_line_when_ignoring_case() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("in"), "-5\n-1\nx\nzz\nb\n").unwrap();
+		std::fs::write(tree.path().join("empty"), "").unwrap();
+		for mode in ["-G", "-E", "-F", "-P"] {
+			for flags in ["-i", "-ic", "-in", "-io"] {
+				let args = [mode, flags, "-f", "empty", "in", "missing"];
+				let (code, capture) = run_async_util::<Grep>(&args, "", tree.path()).await;
+				assert_eq!((code, capture.out(), capture.err()), (1, String::new(), String::new()), "{args:?}");
+			}
+		}
+		let (code, capture) = run_async_util::<Grep>(&["-iL", "-f", "empty", "in"], "", tree.path()).await;
+		assert_eq!((code, capture.out().as_str()), (1, "in\n"), "{}", capture.err());
 	}
 }
 

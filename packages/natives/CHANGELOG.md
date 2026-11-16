@@ -5,7 +5,7 @@
 ### Fixed
 
 - Checking a session's lease (`omp session lease`, RPC `get_session_lease`) no longer makes a session starting at that moment fail to claim it and move to a sibling file on Linux kernels such as gVisor
-- `grep` matches bracket expressions such as `[[]`, `[a&&b]`, `[~~]` and `[!--]` as GNU grep does, with and without `-E`, refuses invalid ones (`[[:foo:]]`, `[z-a]`) with GNU grep's messages, no longer prints the newline as an `-o` match of a class such as `[^x]`, and `-f` accepts a file name that starts with `-`
+- `grep` matches bracket expressions such as `[[]`, `[a&&b]`, `[~~]` and `[!--]` as GNU grep does, with and without `-E`, refuses invalid or unterminated ones (`[[:foo:]]`, `[z-a]`, `a[b`, `[[:alpha]]`) with GNU grep's messages, no longer prints the newline as an `-o` match of a class such as `[^x]`, reads the argument after `-e` or `-f` as the pattern or file whatever its first character, also after a group such as `-ve`, selects no line and prints no count with an empty `-f` file, `-i` included, and prints with `-o` the matches of the other patterns beside an empty one
 
 ## [18.18.6] - 2026-11-09
 

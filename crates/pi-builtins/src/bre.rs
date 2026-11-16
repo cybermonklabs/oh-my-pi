@@ -178,14 +178,12 @@ pub(crate) fn bre_to_ere(pattern: &str, backrefs: Backrefs) -> Result<String, Br
 					// through it turned `[\(]` into a group opener and broke
 					// compilation, so the whole expression is read as bracket
 					// syntax and written out in the engine's.
-					match take_bracket_expression(&mut chars, &mut result) {
-						Ok(()) => {},
-						// Unterminated. Measured, both tools reject it -
-						// "brackets ([ ]) not balanced" - so the half-open
-						// `[` is passed through for the engine to refuse.
-						Err(BreError::BracketUnmatched) => result.push('['),
-						Err(error) => return Err(error),
-					}
+					// An unterminated one is refused, as in an ERE. Passed on as
+					// a plain `[`, it reached `grep`'s literal fallback or read
+					// as a nested class: `a[b` selected the lines holding `a[b`
+					// and `[[:alpha]]` those holding any of `:alph`, where GNU
+					// grep answers "Unmatched [, [^, [:, [., or [=".
+					take_bracket_expression(&mut chars, &mut result)?;
 					has_atom = true;
 				},
 				'+' | '?' | '{' | '}' | '|' | '(' | ')' => {
@@ -303,27 +301,8 @@ enum BracketMember {
 /// class name POSIX does not define, a collating symbol or equivalence class
 /// of other than one character, and a range that runs backwards or has a
 /// class for an end, or a `-` after a range or class that does not close the
-/// list. On error `chars` and `out` are left as they were.
+/// list.
 fn take_bracket_expression(
-	chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-	out: &mut String,
-) -> Result<(), BreError> {
-	let mark = out.len();
-	let mut probe = chars.clone();
-	match write_bracket_expression(&mut probe, out) {
-		Ok(()) => {
-			*chars = probe;
-			Ok(())
-		},
-		Err(error) => {
-			out.truncate(mark);
-			Err(error)
-		},
-	}
-}
-
-/// [`take_bracket_expression`]'s reading, on a copy of the input it may drop.
-fn write_bracket_expression(
 	chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 	out: &mut String,
 ) -> Result<(), BreError> {
@@ -862,12 +841,25 @@ mod tests {
 		}
 	}
 
+	/// GNU grep 3.11 refuses each with "Unmatched [, [^, [:, [., or [=", as an
+	/// ERE already did here. A BRE passed the `[` on as a plain one, and
+	/// `grep` matched it literally or read a nested class.
 	#[test]
-	fn unterminated_bracket_expression_is_left_for_the_engine_in_a_bre() {
-		// `grep` then reaches its literal fallback, as it did before.
-		assert_eq!(ere("a[d"), "a[d");
-		assert_eq!(ere("[]"), "[]");
-		assert_eq!(ere("[[:alpha:"), "[[:alpha:");
+	fn unterminated_bracket_expressions_are_refused_in_a_bre() {
+		for pattern in [
+			"[[:alpha]]",
+			"[[.a]b]",
+			"[[=a]b]",
+			"[a[:]b]",
+			"a[b",
+			"x[]",
+			"[]",
+			"[^]",
+			"[[:alpha:]",
+			r"\([a\)",
+		] {
+			assert_eq!(ere_err(pattern), Some(BreError::BracketUnmatched), "{pattern}");
+		}
 	}
 
 	#[cfg(feature = "util.grep")]
