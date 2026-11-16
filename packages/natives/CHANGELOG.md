@@ -9,6 +9,7 @@
 - The bash tool's built-in `df`, `du`, `env`, `fold` and `sort` now run in the C locale when one category the shell's locale names is not installed, as GNU coreutils do when `setlocale(LC_ALL, "")` fails, instead of applying the categories that do load: `sort` compares bytes and `sort --debug` reports `failed to set locale`, `du` and `df` group no digits, and `fold` splits multibyte characters; each prints a warning when it cannot read the shell's locale at all. `sort`, `du` and `df` were compared with GNU coreutils 9.4 runs; `fold` and `env` model coreutils 9.12, newer than the 9.4 available, so their reference is libc's own answer (`setlocale` failing, as bash reports it) ([#17401](https://github.com/can1357/oh-my-pi/pull/17401) by [@sjawhar](https://github.com/sjawhar))
 - Fixed `TtyWriter.flushSync()` and `stop()` sometimes waiting out their whole timeout after the queued output had already been written ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
 - Fixed `TtyWriter.stop()` occasionally hanging forever when the queue had already drained ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Checking a session's lease (`omp session lease`, RPC `get_session_lease`) no longer makes a session starting at that moment fail to claim it and move to a sibling file on Linux kernels such as gVisor
 
 ### Added
 

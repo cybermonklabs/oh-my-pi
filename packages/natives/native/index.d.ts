@@ -261,9 +261,12 @@ export declare class FileLock {
   /**
    * Whether any handle, in any process including this one, holds `path`.
    *
-   * Observes without locking or opening the lock: a `connect(2)` probe on
-   * Linux, an `F_GETLK` query on other Unix platforms, a `\BaseNamedObjects`
-   * directory listing on Windows. A concurrent `tryAcquire()` never meets it.
+   * Observes without locking or opening the lock: a `/proc/net/unix` lookup
+   * on Linux, an `F_GETLK` query on other Unix platforms, a
+   * `\BaseNamedObjects` directory listing on Windows. A concurrent
+   * `tryAcquire()` never meets it. Where `/proc/net/unix` cannot be read,
+   * Linux falls back to a `connect(2)` probe, which under gVisor can make a
+   * racing `tryAcquire()` find the lock taken.
    */
   static isHeld(path: string): boolean
   /** Whether this handle owns the requested lock. */
