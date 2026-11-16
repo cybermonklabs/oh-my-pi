@@ -3005,8 +3005,8 @@ export class TurnRecovery {
 		if (!staleOpenAIResponsesReplayError && recordedUsageLimitOutcome) {
 			// A failure from a row that already failed in this saga means the
 			// previous claimed switch never left that row: selection can refuse a
-			// sibling the rotation check calls free (a per-account model list, a
-			// plan gate) and serve the failed row again. Trusting this claim too
+			// sibling the rotation check calls free (a plan gate, which writes no
+			// block) and serve the failed row again. Trusting this claim too
 			// would retry that row with no delay until the budget runs out.
 			const failedCredentialId = message.credentialId;
 			const repeatedCredential =
