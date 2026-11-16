@@ -72,6 +72,12 @@ export interface Args {
 	mode?: Mode;
 	noSession?: boolean;
 	sessionDir?: string;
+	/**
+	 * `--session-id`: start a new session under this id (a canonical UUID) instead of a
+	 * minted one. Refused when a stored session already holds it, and beside any other
+	 * session selector.
+	 */
+	sessionId?: string;
 	providerSessionId?: string;
 	providerPromptCacheKey?: string;
 	fork?: string;
@@ -164,6 +170,33 @@ export function validateRestoreLaunch(args: Args, interactive: boolean): void {
 			"--restore resumes one existing session (no continue, fork, import, goal, or --no-session).",
 		);
 	}
+}
+
+/**
+ * Reject a `--session-id` launch that also names another session selector:
+ * `--session-id` starts a new session, and every other selector opens, forks,
+ * imports or drops one. ACP mode is refused too: it starts a session for each
+ * client request, so the id would name none of them. Judged on the startup
+ * parse, before session resolution, like {@link validateGoalLaunch}. `-r` and
+ * `--session` are spellings of `--resume`, and `-c` of `--continue`.
+ */
+export function validateSessionIdLaunch(args: Args): void {
+	if (args.sessionId === undefined) return;
+	const selectors: ReadonlyArray<readonly [boolean, string]> = [
+		[args.restore === true, "--restore"],
+		[args.resume !== undefined, "--resume"],
+		[args.continue === true, "--continue"],
+		[args.fork !== undefined, "--fork"],
+		[args.noSession === true, "--no-session"],
+		[args.fromClaude === true, "--from-claude"],
+		[args.fromCodex === true, "--from-codex"],
+		[args.mode === "acp", "--mode acp"],
+	];
+	const other = selectors.find(([given]) => given)?.[1];
+	if (other === undefined) return;
+	throw new CliUsageError(
+		`--session-id cannot be combined with ${other}: --session-id starts a new session under that id.`,
+	);
 }
 
 /**
@@ -331,6 +364,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 				const consumed = consumeBuiltInStringValue(arg, args, i + 1);
 				i = consumed.index;
 				STRING_SETTERS[arg](result, consumed.value, parseDeps);
+			} else if (arg === "--session-id") {
+				// Dropping the flag would start a session under a minted id the launcher never recorded.
+				throw new CliUsageError("--session-id requires a UUID.");
 			}
 		} else if (OPTIONAL_VALUE_FLAGS.has(arg)) {
 			const config = OPTIONAL_FLAGS[arg];

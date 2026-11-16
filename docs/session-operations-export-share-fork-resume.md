@@ -453,7 +453,7 @@ With an argument:
 2. Else `resolveResumableSession(...)` searches:
    - current scope (`SessionManager.list(cwd, sessionDir)`)
    - global sessions (`SessionManager.listAll()`) only when no explicit `sessionDir` was provided
-3. Matching accepts case-insensitive session id prefixes, full JSONL filename prefixes, and the id suffix after the timestamp in `<timestamp>_<sessionId>.jsonl`.
+3. Matching accepts case-insensitive session id prefixes, full JSONL filename prefixes, and the id suffix after the timestamp in `<timestamp>_<sessionId>.jsonl`. In each scope a session whose id is exactly the value wins over one whose id or file name only starts with it. A value that is a full session id (a lowercase UUID) matches only exactly, in every scope, so it never opens another session whose id extends it.
 4. When nothing matches, the resolver (`resolveResumeTarget`) looks in the same scopes for a `<timestamp>_<sessionId>.jsonl` file whose name matches but which no longer reads as a session (the listing skips it), and takes the copy that continues it (see below). Otherwise resolution fails with `Session "<value>" not found.`
 
 Both forms then follow the session's continuations (`findSessionContinuation`, through `resolveResumeTarget` for a key): when its conversation went on in another file of the same directory (a sibling whose header names it in `continuationOf`), the copy with the newest turn opens instead, unless the named file has turns of its own that copy lacks, and a notice names both files. A file that no longer holds the session its generated `<timestamp>_<sessionId>.jsonl` name records was replaced under that session (conflict recovery leaves it as it found it); resume then opens the copy that continues the named session, when one exists. That applies to a path whose file no longer parses, and to a key that matched only the file name (the file holds another session) or found an unlisted file in step 4. A path whose file holds another session opens that session; a file without a generated name records no session id and is never taken as replaced.
@@ -473,6 +473,34 @@ The same enterability policy applies to picker selections. A missing direct path
 fails with `Session "<path>" not found.`; an existing empty file or malformed
 non-empty headers fail closed without modifying the file, unless the file was
 replaced under a session that went on in a sibling (see above).
+
+## CLI `--session-id`
+
+`--session-id <uuid>` starts a new session whose header and file name carry that
+id instead of a generated one, for a launcher that records the id before the
+session starts. The value must be a lowercase UUID (`8-4-4-4-12` hex digits).
+Any other value, or the flag with no value, is a usage error raised while the
+arguments are parsed, so no other session flag acts first.
+
+`createSessionManager()` calls `SessionManager.createWithSessionId()`. It creates
+the session object without touching the terminal's last-session record, claims the
+id's ownership lease for this process, and then asks whether a stored session
+already holds the id, the way `--resume <id>` would find it (`resolveResumeTarget`
+with `exactId`: the same scopes and storage, matched by the exact id rather than a
+prefix, the unlisted-file probe included). If another live process owns the id, or
+a stored session holds it, startup fails with
+`Session "<id>" already exists; resume it with --resume <id>.` and exit status 1,
+before any model call. A refused launch writes nothing: no session file, and no
+change to the terminal's record that `--continue` reads. Otherwise the session's
+header is written at once, rather than with its first entry, so a later launch
+under the same id finds it taken, and only then is the terminal's record updated.
+
+`--session-id` starts a new session, so it is refused beside every other session
+selector: `--resume`/`-r`/`--session`, `--restore`, `--continue`/`-c`, `--fork`,
+`--no-session`, `--from-claude` and `--from-codex`. It is also refused in ACP mode
+(`--mode acp`, `omp acp`), which starts a session for each client request. A
+launcher starts a session with `--session-id <id>` and later resumes it with
+`--resume <id>`.
 
 ## CLI `--restore`
 
@@ -528,7 +556,7 @@ This is startup-only behavior; there is no interactive `/continue` slash command
 Interactive `/restart` performs normal teardown, flushes postmortem cleanup and
 stdout, then relaunches the CLI. `restartArgv()` preserves launch configuration
 flags but strips original prompts/`@file` positionals and one-shot session
-selectors (`--session`, `--resume`, `--continue`, `--fork`, and foreign imports).
+selectors (`--session`, `--resume`, `--continue`, `--fork`, `--session-id`, and foreign imports).
 It adds `--resume <current-id>` only when the session actually exists on disk;
 an in-memory or never-materialized session restarts fresh.
 

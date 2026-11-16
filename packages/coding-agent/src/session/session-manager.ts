@@ -2053,7 +2053,7 @@ export class SessionManager {
 			this.#sessionDir = path.resolve(options.sessionDir);
 			this.#storage.ensureDirSync(this.#sessionDir);
 		}
-		this.#sessionId = mintSessionId();
+		this.#sessionId = options?.sessionId ?? mintSessionId();
 		this.#taskSiblingCandidate = undefined;
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
@@ -4194,11 +4194,42 @@ export class SessionManager {
 	 * Create a new session.
 	 * @param cwd Working directory (stored in the session header)
 	 * @param sessionDir Optional session directory; defaults to the cwd-derived dir.
+	 * @param options New-session options; `sessionId` names the session instead of a minted id, and
+	 *   `suppressBreadcrumb` keeps the terminal's last-session record untouched.
 	 */
-	static create(cwd: string, sessionDir?: string, storage: SessionStorage = new FileSessionStorage()): SessionManager {
+	static create(
+		cwd: string,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+		options?: NewSessionOptions & { suppressBreadcrumb?: boolean },
+	): SessionManager {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
-		manager.#resetToNewSession();
+		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
+		manager.#resetToNewSession(options);
+		return manager;
+	}
+
+	/**
+	 * Create a new session under a launcher-chosen id, reserved for this process. The session claims
+	 * the id's ownership lease first, then asks `isHeld` whether a stored session already holds it,
+	 * and only then writes its header and records itself as the terminal's last session. So a second
+	 * launch under the id, in this process or another live one, finds it taken. Returns `undefined`,
+	 * having written nothing, when another live process owns the id or `isHeld` answers `true`.
+	 */
+	static async createWithSessionId(
+		cwd: string,
+		sessionDir: string | undefined,
+		sessionId: string,
+		isHeld: () => Promise<boolean>,
+	): Promise<SessionManager | undefined> {
+		const manager = SessionManager.create(cwd, sessionDir, undefined, { sessionId, suppressBreadcrumb: true });
+		if (manager.#sessionOwnedElsewhere() || (await isHeld())) {
+			await manager.close();
+			return undefined;
+		}
+		manager.#suppressBreadcrumb = false;
+		await manager.ensureOnDisk();
 		return manager;
 	}
 
