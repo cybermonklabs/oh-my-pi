@@ -12,6 +12,7 @@ import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
 import { findArchivedSessionFiles } from "./session-archive";
+import { CANONICAL_SESSION_ID_RE } from "./session-id-format";
 import { visitEntriesFromFile } from "./session-loader";
 import { computeDefaultSessionDir } from "./session-paths";
 import {
@@ -1226,7 +1227,9 @@ async function findUnlistedSessionContinuation(
 				? storage.listFilesSync(localDir, `*_${prefix}*.jsonl`)
 				: await findSessionFiles(prefix, undefined, storage);
 		for (const file of files) {
-			if (!parseSessionFileName(file)?.id.startsWith(prefix)) continue;
+			const id = parseSessionFileName(file)?.id;
+			const exactOnly = options.exactId === true || CANONICAL_SESSION_ID_RE.test(prefix);
+			if (!(exactOnly ? id === prefix : id?.startsWith(prefix))) continue;
 			const continuation = await findSessionContinuation(file, storage, { matchedByFileName: true });
 			if (continuation) return continuation;
 		}
@@ -1687,10 +1690,25 @@ function sessionMatchesResumeArg(session: SessionInfo, sessionArg: string): bool
 	return fileSessionId.startsWith(normalizedArg);
 }
 
+/**
+ * The session a resume key selects in one scope's listing: the one whose id is the key,
+ * else (unless `exactId`) the first whose id or file name starts with it. An exact id
+ * wins over a prefix match, and a key that is a full session id matches only exactly,
+ * so it never opens another session whose id extends it.
+ */
+function findResumeMatch(sessions: SessionInfo[], sessionArg: string, exactId: boolean): SessionInfo | undefined {
+	const normalizedArg = sessionArg.toLowerCase();
+	const exact = sessions.find(session => session.id.toLowerCase() === normalizedArg);
+	if (exact || exactId || CANONICAL_SESSION_ID_RE.test(normalizedArg)) return exact;
+	return sessions.find(session => sessionMatchesResumeArg(session, sessionArg));
+}
+
 /** Controls cross-directory fallback for resumable session lookup. */
 export interface ResolveResumableSessionOptions {
 	/** Search default global session buckets after the active/custom session directory misses. */
 	allowGlobalFallback?: boolean;
+	/** Match only a session whose id is the key, never one whose id or file name starts with it. */
+	exactId?: boolean;
 }
 
 function isSessionStorage(value: SessionStorage | ResolveResumableSessionOptions): value is SessionStorage {
@@ -1708,7 +1726,7 @@ export async function resolveResumableSession(
 	const resolvedOptions = isSessionStorage(storageOrOptions) ? options : storageOrOptions;
 	const localSessionDir = sessionDir ?? computeDefaultSessionDir(cwd, storage);
 	const localSessions = await listSessions(localSessionDir, storage);
-	const localMatch = localSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
+	const localMatch = findResumeMatch(localSessions, sessionArg, resolvedOptions.exactId === true);
 	if (localMatch) {
 		return { session: localMatch, scope: "local" };
 	}
@@ -1718,14 +1736,14 @@ export async function resolveResumableSession(
 	}
 
 	const globalSessions = await listAllSessions(storage);
-	const globalMatch = globalSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
+	const globalMatch = findResumeMatch(globalSessions, sessionArg, resolvedOptions.exactId === true);
 	if (globalMatch) {
 		return { session: globalMatch, scope: "global" };
 	}
 
 	// `gc --archive` moves cold transcripts out of the sessions tree. They stay
 	// resumable: the match is restored to its original path when it is opened.
-	const [archiveFile] = await findArchivedSessionFiles(sessionArg);
+	const [archiveFile] = await findArchivedSessionFiles(sessionArg, undefined, resolvedOptions.exactId === true);
 	if (!archiveFile) return undefined;
 	const [archived] = await collectSessionsFromFiles([archiveFile], storage, true);
 	// A damaged archive must not read as "no such session": the file is right

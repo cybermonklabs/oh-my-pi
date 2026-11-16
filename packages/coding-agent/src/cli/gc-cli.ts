@@ -118,7 +118,7 @@ export interface GcCommandFlags {
 	wal?: boolean;
 	stale?: boolean;
 	compress?: boolean;
-	/** Session id prefix or archive path to bring back out of the archive. */
+	/** Session id prefix (a full id matches only exactly) or archive path to bring back out of the archive. */
 	restore?: string;
 	strip?: boolean;
 	coldArchiveAfterDays?: number;
@@ -168,7 +168,7 @@ export interface ArchiveGcResult {
 }
 
 export interface RestoreGcResult {
-	/** What the caller asked for: a session id prefix or an archive path. */
+	/** What the caller asked for: a session id prefix (a full id matches only exactly) or an archive path. */
 	query: string;
 	archivePath?: string;
 	sessionPath?: string;

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- `--resume <id>` and `omp gc --restore <id>` with a full session id now open only the session whose id is exactly `<id>`, archived sessions included, never another session whose id only starts with it; a shorter prefix still selects by prefix
 - After a Hindsight auto-recall fails, later prompts no longer each wait out the recall timeout: automatic recall pauses for `hindsight.recallCooldownMs` (also `HINDSIGHT_RECALL_COOLDOWN_MS`, default 30 minutes), doubling with each further failure, and a notice says when it tries again; `0` turns the pause off
 - In RPC mode a command sent after the `ready` frame is answered while startup still runs instead of after it finishes; a frame that starts a turn, changes the session or changes goal state still waits for startup ([#19126](https://github.com/can1357/oh-my-pi/pull/19126) by [@sjawhar](https://github.com/sjawhar))
 - In RPC mode an `abort` sent while a `new_session`, `switch_session`, `fork` or `navigate_tree` waits for startup now withdraws it: the frame answers `cancelled` instead of changing the session once startup finishes ([#19126](https://github.com/can1357/oh-my-pi/pull/19126) by [@sjawhar](https://github.com/sjawhar))
@@ -127,6 +128,7 @@
 
 - Sessions can now be stored in PostgreSQL, MySQL, or SQLite instead of JSONL files: set `session.storage: sql` and point `session.sql.dsnFile` at a file holding the connection string (or set `OMP_SESSION_STORAGE=sql` and `OMP_SESSION_SQL_DSN_FILE`); `--resume`, `--continue`, the session picker, and listing follow the same store, and joining a collab session needs file storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - `omp gc --restore <session id or archive path>` brings an archived session back to its own path with its artifacts, and names what restoring cannot bring back
+- Added `--session-id <uuid>` to start a new session under an id you choose, for launchers that record the id before the session starts; it is refused before any model call when a stored session or another running omp already holds the id (resume that one with `--resume <id>`), and beside `--resume`, `--restore`, `--continue`, `--fork`, `--no-session`, `--from-claude`, `--from-codex` or `--mode acp`
 
 ### Changed
 
