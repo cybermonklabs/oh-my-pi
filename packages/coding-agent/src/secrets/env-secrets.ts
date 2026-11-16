@@ -7,6 +7,12 @@ const SECRET_ENV_PATTERNS = /(?:KEY|SECRET|TOKEN|PASSWORD|PASS|AUTH|CREDENTIAL|P
 /** Variables that hold configuration rather than secrets, though `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS` match the name rule. */
 const NON_SECRET_ENV_NAMES = /^(?:GIT_CONFIG_KEY_\d+|SSH_ASKPASS)$/;
 
+/**
+ * `_FILE` variables whose file holds no credential. Under file storage `PI_SESSION_FILE` names the
+ * session transcript: it changes every minute, and a whole transcript never occurs verbatim in a row.
+ */
+const NON_SECRET_FILE_ENV_NAMES = /^PI_SESSION_FILE$/;
+
 /** Extracts the password group from a connection URL that carries a user and password before its host. */
 const CONNECTION_URL_PASSWORD_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/:@?#\s]*:([^/?#\s]+)@/i;
 
@@ -36,6 +42,11 @@ export function connectionUrlPasswords(value: string): string[] {
 		// Malformed percent-encoding — only the raw password applies.
 	}
 	return passwords;
+}
+
+/** Whether `name` is a `_FILE` variable whose file may hold a secret. */
+export function isSecretFileEnvName(name: string): boolean {
+	return name.endsWith("_FILE") && !NON_SECRET_FILE_ENV_NAMES.test(name);
 }
 
 /** Collect environment values that look like secrets, deduplicated by value (the first variable wins). */

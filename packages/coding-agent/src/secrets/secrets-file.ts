@@ -1,4 +1,3 @@
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
@@ -34,10 +33,14 @@ export async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> 
 	}
 }
 
-/** Synchronous {@link loadSecretsFile} that keeps each entry's position. */
-export function loadSecretsFileSync(filePath: string): PositionedSecretEntry[] {
+/**
+ * The valid entries of a secrets.yml's `text`, each with its position; a text that does not parse, or
+ * is not a YAML array, yields nothing. The caller reads the text, so it knows a read that failed
+ * from a file that holds no entry.
+ */
+export function parseSecretsFileText(text: string, filePath: string): PositionedSecretEntry[] {
 	try {
-		return parseSecretsFile(fs.readFileSync(filePath, "utf8"), filePath);
+		return parseSecretsFile(text, filePath);
 	} catch (err) {
 		return secretsFileFailure(err, filePath);
 	}

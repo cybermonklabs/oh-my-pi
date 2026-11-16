@@ -20,6 +20,7 @@ import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import * as storeMatcher from "@oh-my-pi/pi-coding-agent/secrets/session-store-matcher";
 import { cfgSecretsMaskSessionStore } from "@oh-my-pi/pi-coding-agent/secrets/settings";
 import { type BtwHistoryRecord, BtwHistoryStore } from "@oh-my-pi/pi-coding-agent/session/btw-history";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -668,6 +669,86 @@ for (const backend of backends) {
 			expect((await store.storage.readText(sessionFileOf(manager))).includes(ENV_VALUE)).toBe(true);
 			await manager.close();
 		});
+
+		it("K31: fails the write whose masker build throws, and stores that line masked at the next write", async () => {
+			const [before, after] = ["first-rotating-value-1111", "second-rotating-value-2222"];
+			const marker = "[REDACTED:file:ROTATING_FILE]";
+			/**
+			 * One session's writes around a rotation of its `_FILE` value, with the masker build at the
+			 * refresh after the rotation throwing or not: what the store holds after each write, and
+			 * the errors the session reported.
+			 */
+			const writesAroundRotation = async (failBuild: boolean) => {
+				const rotatingFile = tmp.join(`rotating-${failBuild}.txt`);
+				await Bun.write(rotatingFile, before);
+				let now = NOW;
+				// The process masker reads only the test's file, never this machine's environment.
+				spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+					new storeMask.SessionStoreMasker({
+						env: () => ({ ROTATING_FILE: rotatingFile }),
+						agentDir: tmp.join("agent"),
+						now: () => now,
+					}),
+				);
+				const manager = await onDisk();
+				bindSetting(manager, Settings.isolated({ "secrets.maskSessionStore": true }));
+				const errors: string[] = [];
+				manager.onPersistenceError(error => errors.push(error.message));
+				const stored = async (): Promise<{ contents: unknown[]; raw: boolean }> => {
+					await manager.flush().catch(() => {});
+					await store.storage.drain();
+					const text = await store.storage.readText(sessionFileOf(manager));
+					return {
+						contents: storedRecords(text).map(record => messageOf(record).content),
+						raw: text.includes(before) || text.includes(after),
+					};
+				};
+
+				manager.appendMessage({ role: "user", content: said(before), timestamp: NOW });
+				const first = await stored();
+
+				await Bun.write(rotatingFile, after);
+				now += 60_000;
+				if (failBuild) {
+					spyOn(storeMatcher, "buildSessionStoreMatcher").mockImplementationOnce(() => {
+						throw new Error("injected matcher failure");
+					});
+				}
+				manager.appendMessage({ role: "user", content: said(after), timestamp: NOW });
+				const second = await stored();
+				const reported = [...errors];
+
+				manager.appendMessage({ role: "user", content: said(`${before} ${after}`), timestamp: NOW });
+				await settle(manager, store.storage);
+				const third = await stored();
+				await manager.close();
+				return { first, second, reported, third, errors };
+			};
+			const one = { contents: [said(marker)], raw: false };
+			const two = { contents: [said(marker), said(marker)], raw: false };
+			const three = { contents: [said(marker), said(marker), said(`${marker} ${marker}`)], raw: false };
+
+			// With no build failure the same steps store the markers and report no error.
+			expect(await writesAroundRotation(false)).toEqual({
+				first: one,
+				second: two,
+				reported: [],
+				third: three,
+				errors: [],
+			});
+
+			// The build at the refresh throws: that write fails, the error names the failure, and no
+			// line goes out under the mask that lacks the rotated value. The next write builds again
+			// and stores the failed line and its own, both masked.
+			const buildFailure = expect.stringMatching(/masking refresh failed.*injected matcher failure/);
+			expect(await writesAroundRotation(true)).toEqual({
+				first: one,
+				second: one,
+				reported: [buildFailure],
+				third: three,
+				errors: [buildFailure],
+			});
+		});
 	});
 }
 
@@ -724,12 +805,12 @@ describe("session store masking of the history.db title and recaps", () => {
 	});
 });
 
-describe("session store masking by the setting each manager is bound to", () => {
-	/** The content of each stored message of `manager`'s session, in file order. */
-	async function storedContents(manager: SessionManager, storage: SessionStorage): Promise<unknown[]> {
-		return storedRecords(await storage.readText(sessionFileOf(manager))).map(record => messageOf(record).content);
-	}
+/** The content of each stored message of `manager`'s session, in file order. */
+async function storedContents(manager: SessionManager, storage: SessionStorage): Promise<unknown[]> {
+	return storedRecords(await storage.readText(sessionFileOf(manager))).map(record => messageOf(record).content);
+}
 
+describe("session store masking by the setting each manager is bound to", () => {
 	it("masks the writes of a manager bound to the setting on and not those of one bound to it off", async () => {
 		// The process masker reads only the test's variable, never this machine's environment.
 		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
@@ -814,6 +895,122 @@ describe("session store masking by the setting each manager is bound to", () => 
 		}
 		expect(await storedContents(manager, storage)).toEqual([said(ENV_VALUE), said(ENV_MARKER)]);
 		await manager.close();
+	});
+});
+
+describe("session store masking as the masker's sources change", () => {
+	let now: number;
+
+	beforeEach(() => {
+		now = NOW;
+	});
+
+	/** Makes the process masker one that reads only `env` and the test's agent dir, on the test's clock. */
+	function useProcessMasker(env: Record<string, string>): void {
+		spyOn(storeMask, "processSessionStoreMasker").mockReturnValue(
+			new storeMask.SessionStoreMasker({ env: () => env, agentDir: tmp.join("agent"), now: () => now }),
+		);
+	}
+
+	/** A file-backed session in `dir` whose setting is on. */
+	async function maskedSession(dir: string, storage: SessionStorage): Promise<SessionManager> {
+		const manager = SessionManager.create(dir, tmp.join("sessions"), storage);
+		bindSetting(manager, Settings.isolated({ "secrets.maskSessionStore": true }));
+		await manager.ensureOnDisk();
+		return manager;
+	}
+
+	/** A secrets.yml whose one entry is the plain value `value`. */
+	function plainYml(value: string): string {
+		return ["- type: plain", `  content: ${value}`].join("\n");
+	}
+
+	const YML_MARKER = "[REDACTED:secrets.yml:project#1]";
+
+	it("K23: goes on writing under the values it holds when a refresh cannot read a source, and masks the rotated values once it can", async () => {
+		const [ymlBefore, ymlAfter] = ["yml-held-value-A1", "yml-held-value-A2"];
+		const [fileBefore, fileAfter] = ["file-held-value-B1", "file-held-value-B2"];
+		const fileMarker = "[REDACTED:file:ROTATING_FILE]";
+		const yml = path.join(cwd, ".omp", "secrets.yml");
+		const rotatingFile = tmp.join("rotating.txt");
+		await Bun.write(yml, plainYml(ymlBefore));
+		await Bun.write(rotatingFile, fileBefore);
+		useProcessMasker({ ROTATING_FILE: rotatingFile });
+		const storage = new FileSessionStorage();
+		const manager = await maskedSession(cwd, storage);
+		const errors: Error[] = [];
+		manager.onPersistenceError(error => errors.push(error));
+		const text = [ymlBefore, fileBefore, ymlAfter, fileAfter].join(" ");
+		const write = async (): Promise<unknown[]> => {
+			manager.appendMessage({ role: "user", content: text, timestamp: NOW });
+			await settle(manager, storage);
+			return storedContents(manager, storage);
+		};
+		const beforeRotation = [YML_MARKER, fileMarker, ymlAfter, fileAfter].join(" ");
+		expect(await write()).toEqual([beforeRotation]);
+
+		// Both rotate, and the next read of each fails in a way that leaves the file's stat as it is.
+		await Bun.write(yml, plainYml(ymlAfter));
+		await Bun.write(rotatingFile, fileAfter);
+		const ioError = (): Error => Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+		const pending = new Set([yml, rotatingFile]);
+		const realReadFileSync = fsSync.readFileSync;
+		const realOpenSync = fsSync.openSync;
+		spyOn(fsSync, "readFileSync").mockImplementation(((file: fsSync.PathOrFileDescriptor, options?: unknown) => {
+			if (file === yml && pending.delete(file)) throw ioError();
+			return (realReadFileSync as (target: fsSync.PathOrFileDescriptor, opts?: unknown) => string | Buffer)(
+				file,
+				options,
+			);
+		}) as typeof fsSync.readFileSync);
+		spyOn(fsSync, "openSync").mockImplementation((file, flags, mode) => {
+			if (file === rotatingFile && pending.delete(file)) throw ioError();
+			return realOpenSync(file, flags, mode);
+		});
+		const warn = spyOn(utils.logger, "warn").mockImplementation(() => {});
+		now += 60_000;
+		// The write goes on: the values held before stay masked, the rotated ones are not held yet.
+		expect(await write()).toEqual([beforeRotation, beforeRotation]);
+		expect(pending.size).toBe(0);
+
+		// Neither file has changed since the rotation: each is read again because its read had failed.
+		now += 60_000;
+		const afterRotation = [YML_MARKER, fileMarker, YML_MARKER, fileMarker].join(" ");
+		expect(await write()).toEqual([beforeRotation, beforeRotation, afterRotation]);
+		expect(errors).toEqual([]);
+		const stored = await storage.readText(sessionFileOf(manager));
+		expect([stored.includes(ymlBefore), stored.includes(fileBefore)]).toEqual([false, false]);
+		expect(
+			warn.mock.calls
+				.filter(call => call[0] === "Session store masking could not read a source")
+				.map(call => call[1]),
+		).toEqual([
+			{ kind: "file", source: "ROTATING_FILE", cause: "EIO" },
+			{ kind: "secrets.yml", source: yml, cause: "EIO" },
+		]);
+		await manager.close();
+	});
+
+	it("K27: masks a project's secrets.yml value in the sessions of that project only", async () => {
+		const [ownValue, otherValue] = ["project-a-plain-value-1", "project-b-plain-value-2"];
+		const other = tmp.join("other");
+		await Bun.write(path.join(cwd, ".omp", "secrets.yml"), plainYml(ownValue));
+		await Bun.write(path.join(other, ".omp", "secrets.yml"), plainYml(otherValue));
+		useProcessMasker({});
+		const storage = new FileSessionStorage();
+		const own = await maskedSession(cwd, storage);
+		const others = await maskedSession(other, storage);
+		// One process masker serves both: a write in the other project comes between two in this one.
+		for (const manager of [own, others, own]) {
+			manager.appendMessage({ role: "user", content: `${ownValue} ${otherValue}`, timestamp: NOW });
+			await settle(manager, storage);
+		}
+
+		const ownLine = `${YML_MARKER} ${otherValue}`;
+		expect(await storedContents(own, storage)).toEqual([ownLine, ownLine]);
+		expect(await storedContents(others, storage)).toEqual([`${ownValue} ${YML_MARKER}`]);
+		await own.close();
+		await others.close();
 	});
 });
 
