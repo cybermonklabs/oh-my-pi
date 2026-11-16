@@ -12,18 +12,13 @@ export function plainYml(value: string): string {
 
 /**
  * Makes the next read of each of `paths` throw `EIO`, a failure that leaves the file's stat as it
- * is: the `readFileSync` of a secrets.yml, the `openSync` of a `_FILE`. Returns the paths whose read
- * has not failed yet. The spies last until the test restores its mocks.
+ * is: the `openSync` that reads a `_FILE` and a secrets.yml alike. Returns the paths whose read has
+ * not failed yet. The spy lasts until the test restores its mocks.
  */
 export function failNextReads(paths: readonly string[]): ReadonlySet<string> {
 	const pending = new Set(paths);
 	const ioError = (): Error => Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
-	const realReadFileSync = fs.readFileSync;
 	const realOpenSync = fs.openSync;
-	spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
-		if (typeof file === "string" && pending.delete(file)) throw ioError();
-		return (realReadFileSync as (target: fs.PathOrFileDescriptor, opts?: unknown) => string | Buffer)(file, options);
-	}) as typeof fs.readFileSync);
 	spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
 		if (typeof file === "string" && pending.delete(file)) throw ioError();
 		return realOpenSync(file, flags, mode);

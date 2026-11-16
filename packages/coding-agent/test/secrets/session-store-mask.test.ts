@@ -571,71 +571,100 @@ describe("K24: matches that overlap", () => {
 	});
 });
 
-describe("K25: a _FILE that names a FIFO whose writer waits in its own open", () => {
-	// As the FIFO case above, the masker runs in a child the spawn timeout kills, so a masker that
-	// blocks fails here instead of hanging the suite.
-	it.skipIf(process.platform === "win32")(
-		"K25: neither blocks on the FIFO nor opens it, at the build and at a refresh, so the writer still delivers",
-		async () => {
-			const fifo = path.join(root, "pipe");
-			expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
-			const word = "fifo-carried-value-64";
-			// Says it is about to open, then waits in its open until a reader opens the FIFO, and writes.
-			// A masker that opens the FIFO lets it go on: its write then finds the reader gone, or lands
-			// in a pipe the masker's close empties, and the test's own read below gets nothing.
-			const writer = Bun.spawn(["sh", "-c", 'echo ready; exec 3>"$1" && printf %s "$2" >&3', "sh", fifo, word], {
-				stdout: "pipe",
-				stderr: "ignore",
-				timeout: 20_000,
-				killSignal: "SIGKILL",
-			});
-			let reader: number | undefined;
-			try {
-				// The writer opens right after this line; the masker's child takes far longer to start.
-				await (writer.stdout as ReadableStream<Uint8Array>).getReader().read();
-				const probe = await writeFile(
-					"fifo-probe.ts",
-					[
-						`import { SessionStoreMasker } from ${JSON.stringify(MODULE_PATH)};`,
-						"const [fifo, dir, word] = process.argv.slice(2);",
-						"let now = 1_000_000;",
-						"const masker = new SessionStoreMasker({ env: () => ({ PIPE_FILE: fifo }), agentDir: dir, now: () => now });",
-						"const rounds = [];",
-						"for (let round = 0; round < 2; round++) {",
-						"	const started = performance.now();",
-						"	const mask = masker.snapshot(dir);",
-						"	const withinASecond = performance.now() - started < 1_000;",
-						"	rounds.push({ withinASecond, sources: mask.sources.length, kept: mask.maskText(word) === word });",
-						"	now += 60_000;",
-						"	await Promise.resolve();",
-						"}",
-						"process.stdout.write(JSON.stringify(rounds));",
-					].join("\n"),
-				);
-				const child = Bun.spawn([process.execPath, probe, fifo, root, word], {
+describe("K25: a FIFO whose writer waits in its own open", () => {
+	const word = "fifo-carried-value-64";
+
+	/**
+	 * Makes `fifo` a FIFO whose writer waits in its own open to write `content`, and while it waits
+	 * builds a masker of `env` and `agentDir` in a child, masks for `cwd` and refreshes once a minute
+	 * later. Expects each round to end within a second holding no source, and the writer, still
+	 * waiting after the child, to deliver `content` to the test's own open.
+	 *
+	 * As the FIFO case above, the masker runs in a child the spawn timeout kills, so a masker that
+	 * blocks fails here instead of hanging the suite.
+	 */
+	async function expectWriterStillDelivers(
+		fifo: string,
+		content: string,
+		masker: { env: Record<string, string>; agentDir: string; cwd: string },
+	): Promise<void> {
+		expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+		// Says it is about to open, then waits in its open until a reader opens the FIFO, and writes.
+		// A masker that opens the FIFO lets it go on: its write then finds the reader gone, or lands
+		// in a pipe the masker's close empties, and the test's own read below gets nothing.
+		const writer = Bun.spawn(["sh", "-c", 'echo ready; exec 3>"$1" && printf %s "$2" >&3', "sh", fifo, content], {
+			stdout: "pipe",
+			stderr: "ignore",
+			timeout: 20_000,
+			killSignal: "SIGKILL",
+		});
+		let reader: number | undefined;
+		try {
+			// The writer opens right after this line; the masker's child takes far longer to start.
+			await (writer.stdout as ReadableStream<Uint8Array>).getReader().read();
+			const probe = await writeFile(
+				"fifo-probe.ts",
+				[
+					`import { SessionStoreMasker } from ${JSON.stringify(MODULE_PATH)};`,
+					"const [envText, agentDir, cwd, word] = process.argv.slice(2);",
+					"const env = JSON.parse(envText);",
+					"let now = 1_000_000;",
+					"const masker = new SessionStoreMasker({ env: () => env, agentDir, now: () => now });",
+					"const rounds = [];",
+					"for (let round = 0; round < 2; round++) {",
+					"	const started = performance.now();",
+					"	const mask = masker.snapshot(cwd);",
+					"	const withinASecond = performance.now() - started < 1_000;",
+					"	rounds.push({ withinASecond, sources: mask.sources.length, kept: mask.maskText(word) === word });",
+					"	now += 60_000;",
+					"	await Promise.resolve();",
+					"}",
+					"process.stdout.write(JSON.stringify(rounds));",
+				].join("\n"),
+			);
+			const child = Bun.spawn(
+				[process.execPath, probe, JSON.stringify(masker.env), masker.agentDir, masker.cwd, word],
+				{
 					stdout: "pipe",
 					stderr: "ignore",
 					env: { ...process.env, PI_TEST_RUNTIME: "1", PI_CODING_AGENT_DIR: agentDir },
 					timeout: 15_000,
 					killSignal: "SIGKILL",
-				});
-				const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-				expect(exitCode).toBe(0);
-				const round = { withinASecond: true, sources: 0, kept: true };
-				expect(JSON.parse(stdout)).toEqual([round, round]);
+				},
+			);
+			const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+			expect(exitCode).toBe(0);
+			const round = { withinASecond: true, sources: 0, kept: true };
+			expect(JSON.parse(stdout)).toEqual([round, round]);
 
-				// The masker opened nothing, so the writer still waits.
-				expect(writer.exitCode).toBeNull();
-				// Non-blocking, so a writer that is gone fails the test instead of hanging it.
-				reader = fs.openSync(fifo, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
-				expect(await writer.exited).toBe(0);
-				const buffer = Buffer.alloc(64);
-				const length = fs.readSync(reader, buffer, 0, buffer.length, null);
-				expect(buffer.toString("utf8", 0, length)).toBe(word);
-			} finally {
-				if (reader !== undefined) fs.closeSync(reader);
-				writer.kill("SIGKILL");
-			}
+			// The masker opened nothing, so the writer still waits.
+			expect(writer.exitCode).toBeNull();
+			// Non-blocking, so a writer that is gone fails the test instead of hanging it.
+			reader = fs.openSync(fifo, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+			expect(await writer.exited).toBe(0);
+			const buffer = Buffer.alloc(256);
+			const length = fs.readSync(reader, buffer, 0, buffer.length, null);
+			expect(buffer.toString("utf8", 0, length)).toBe(content);
+		} finally {
+			if (reader !== undefined) fs.closeSync(reader);
+			writer.kill("SIGKILL");
+		}
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"K25: as a _FILE, neither blocks on the FIFO nor opens it, at the build and at a refresh, so the writer still delivers",
+		async () => {
+			const fifo = path.join(root, "pipe");
+			await expectWriterStillDelivers(fifo, word, { env: { PIPE_FILE: fifo }, agentDir: root, cwd: root });
+		},
+		40_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"K25: as the project secrets.yml, neither blocks on the FIFO nor opens it, at the build and at a refresh, so the writer still delivers",
+		async () => {
+			// A secrets.yml whose entry the masker would hold, had it read the FIFO.
+			await expectWriterStillDelivers(projectYml, plainYml(word), { env: {}, agentDir, cwd });
 		},
 		40_000,
 	);
