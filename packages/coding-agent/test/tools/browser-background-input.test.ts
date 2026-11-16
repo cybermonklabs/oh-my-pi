@@ -21,7 +21,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import puppeteer, { type Browser, type Page, type WebWorker } from "puppeteer-core";
-import { chromiumAvailable } from "./chromium-probe";
+import { chromiumAvailable, TEST_CHROMIUM_ARGS } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const ASSETS = path.resolve(import.meta.dir, "../../src/tools/browser/relay/extension-assets");
@@ -113,9 +113,11 @@ async function withRelay(run: (fixture: RelayFixture) => Promise<void>): Promise
 		browser = await puppeteer.launch({
 			executablePath: await ensureChromiumExecutable(),
 			headless: true,
+			// No launch limit of its own: Chromium's start or exit decides, and the test's timeout bounds a hang.
+			timeout: 0,
 			pipe: true,
 			enableExtensions: [extensionDir],
-			args: ["--no-first-run", "--no-default-browser-check", "--use-mock-keychain"],
+			args: [...TEST_CHROMIUM_ARGS, "--no-first-run", "--no-default-browser-check", "--use-mock-keychain"],
 		});
 		const extension = await (
 			await browser.waitForTarget(target => target.type() === "service_worker", { timeout: 15_000 })
@@ -196,7 +198,9 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("background tab input", () => {
 		const browser = await puppeteer.launch({
 			executablePath: await ensureChromiumExecutable(),
 			headless: true,
+			timeout: 0,
 			args: [
+				...TEST_CHROMIUM_ARGS,
 				"--no-first-run",
 				"--no-default-browser-check",
 				"--use-mock-keychain",

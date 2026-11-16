@@ -11,12 +11,14 @@
 import * as path from "node:path";
 import { $env, $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
+import { withTimeoutSignal } from "../../utils/fetch-timeout";
 import {
 	BaseKernel,
 	getRemainingTimeMs,
 	type KernelExecuteOptions,
 	type KernelExecuteResult,
 	type KernelStartOptions,
+	throwIfAborted,
 } from "../kernel-base";
 import { type BackendProbeOptions, probeCandidates } from "../probe";
 import { stageRunnerScript } from "../runner-cache";
@@ -29,7 +31,6 @@ import {
 	rebasePythonRuntime,
 	resolveExplicitPythonRuntime,
 	resolvePythonBaseEnv,
-	resolvePythonRuntime,
 } from "./runtime";
 import { hostHasInheritableConsole, shouldDetachKernel, shouldHideKernelWindow } from "./spawn-options";
 import type { PythonToolRequest } from "./executor";
@@ -150,6 +151,15 @@ export async function checkPythonKernelAvailability(
 	if (!options?.forceProbe && (isBunTestRuntime() || $flag("PI_PYTHON_SKIP_CHECK"))) {
 		return { ok: true };
 	}
+	return probePythonKernelAvailabilityCached(cwd, interpreter, options);
+}
+
+/** {@link probePythonKernelAvailability} through the availability cache; `forceProbe` bypasses the cache read. */
+async function probePythonKernelAvailabilityCached(
+	cwd: string,
+	interpreter?: string,
+	options?: { forceProbe?: boolean } & BackendProbeOptions,
+): Promise<PythonKernelAvailability> {
 	const resolvedCwd = path.resolve(cwd);
 	const key = availabilityKey(resolvedCwd, interpreter);
 	const cached = availabilityCache.get(key);
@@ -159,6 +169,12 @@ export async function checkPythonKernelAvailability(
 	const result = await probePythonKernelAvailability(resolvedCwd, interpreter, options);
 	if (!result.transient && !options?.signal?.aborted) availabilityCache.set(key, result);
 	return result;
+}
+
+/** Aborts on the caller's signal or at its deadline, whichever comes first; undefined when it gives neither. */
+function startAbortSignal(options: KernelStartOptions): AbortSignal | undefined {
+	const remainingMs = getRemainingTimeMs(options.deadlineMs);
+	return remainingMs === undefined ? options.signal : withTimeoutSignal(Math.max(1, remainingMs), options.signal);
 }
 
 async function probePythonKernelAvailability(
@@ -330,11 +346,29 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		// The probe may be cached from before a shell-config refresh (a session switch, an
 		// extension exporting session-scoped variables): start from the current environment.
 		const baseEnv = resolvePythonBaseEnv(await Settings.init());
-		const runtime = availability.runtime
-			? rebasePythonRuntime(availability.runtime, baseEnv)
-			: options.interpreter
-				? resolveExplicitPythonRuntime(options.interpreter, options.cwd, baseEnv)
-				: resolvePythonRuntime(options.cwd, baseEnv);
+		let runtime: PythonRuntime;
+		if (availability.runtime) {
+			runtime = rebasePythonRuntime(availability.runtime, baseEnv);
+		} else if (options.interpreter) {
+			runtime = resolveExplicitPythonRuntime(options.interpreter, options.cwd, baseEnv);
+		} else {
+			const found = enumeratePythonRuntimes(options.cwd, baseEnv);
+			if (found.length === 0) throw new Error("Python executable not found on PATH");
+			if (found.length === 1) {
+				// Nothing to choose between: the kernel's own exit reports a broken interpreter.
+				runtime = found[0];
+			} else {
+				// The availability check was skipped (test runtime, PI_PYTHON_SKIP_CHECK). Start the first
+				// candidate that runs, as a checked start does, not merely the first one found: a
+				// version-manager shim with no version selected must not shadow a working interpreter.
+				// The probe stops at the caller's signal or deadline, as the rest of the start does.
+				const signal = startAbortSignal(options);
+				const probed = await probePythonKernelAvailabilityCached(options.cwd, undefined, { signal });
+				throwIfAborted(signal, "Python kernel start");
+				if (!probed.ok || !probed.runtime) throw new Error(probed.reason ?? "Python kernel unavailable");
+				runtime = rebasePythonRuntime(probed.runtime, baseEnv);
+			}
+		}
 		const spawnEnv: Record<string, string> = {};
 		for (const [key, value] of Object.entries(runtime.env)) {
 			if (typeof value === "string") spawnEnv[key] = value;
