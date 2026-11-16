@@ -151,11 +151,29 @@ interface DialectQueries {
 	readFrom: Statement;
 	/**
 	 * The session's size, the byte length of the row's own content and its bytes
-	 * from `@offset` on, and the start of the last part at or before `@offset`.
+	 * from `@offset` on, and the part the read starts at: its start
+	 * (`first_part`, -1 when there is none) and its row identity (`first_id`,
+	 * see {@link partRowids}; null on MySQL, which has none). That part is the
+	 * last one starting at or before `@offset`, or, for a read from inside the
+	 * row's own content, the first one.
 	 */
 	readChunksStart: Statement;
-	/** The parts that start from `@next` up to, not including, `@end`, in `start_offset` order: one page. */
+	/**
+	 * The parts that start from `@next` up to, not including, `@end`, in
+	 * `start_offset` order: one page. On PostgreSQL and SQLite the page is
+	 * empty unless the part at `@anchor` still has the row identity
+	 * `@anchor_id`, checked in the same statement; MySQL does not check it.
+	 */
 	readParts: Statement;
+	/**
+	 * SQLite only: the largest rowid of the parts table, and an insert that
+	 * sets a part's rowid. A part's row identity, which a chunked read checks,
+	 * is its `xmin` on PostgreSQL (the transaction that wrote it) and its
+	 * `rowid` on SQLite; SQLite hands the rowid of a deleted last row out
+	 * again, so a full write gives its parts rowids above every existing one,
+	 * the replaced parts' included.
+	 */
+	partRowids: { last: Statement; insert: Statement } | undefined;
 }
 
 interface IndexRow {
@@ -204,13 +222,16 @@ interface ReadFromRow {
 
 /**
  * `readChunksStart` row: `head` is the row's own content from the offset on,
- * `first_part` the start of the last part at or before the offset, -1 when none is.
+ * `first_part` the start of the part the read starts at, -1 when there is none,
+ * and `first_id` that part's row identity (a rowid on SQLite, `xmin` as text
+ * on PostgreSQL), null on MySQL or when there is no such part.
  */
 interface ChunksStartRow {
 	byte_len: number | bigint | string | null;
 	content_len: number | bigint | string;
 	head: Uint8Array | null;
 	first_part: number | bigint | string;
+	first_id: number | string | null;
 }
 
 /** `readParts` row. */
@@ -222,6 +243,11 @@ interface PartRow {
 /** `stagedBytes` row. */
 interface StagedPartRow {
 	len: number | bigint | string;
+}
+
+/** `partRowids.last` row. */
+interface RowidRow {
+	last_rowid: number | bigint | string;
 }
 
 const DEFAULT_TABLE = "omp_session_files";
@@ -362,11 +388,15 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 		mysql: "cast(content AS binary)",
 		sqlite: "cast(content AS blob)",
 	}[adapter];
-	const contentByteLength = {
-		postgres: "octet_length(content)",
-		mysql: "length(content)",
-		sqlite: "length(cast(content AS blob))",
-	}[adapter];
+	const byteLengthOf = (column: string): string =>
+		({
+			postgres: `octet_length(${column})`,
+			mysql: `length(${column})`,
+			sqlite: `length(cast(${column} AS blob))`,
+		})[adapter];
+	const contentByteLength = byteLengthOf("content");
+	// A part's row identity (see DialectQueries.partRowids); MySQL has none.
+	const partId = { postgres: "CAST(p.xmin AS text)", mysql: undefined, sqlite: "p.rowid" }[adapter];
 	const emptyBytes = { postgres: "''::bytea", mysql: "cast('' AS binary)", sqlite: "x''" }[adapter];
 	const greatest = adapter === "sqlite" ? "max" : "greatest";
 	// PostgreSQL's substr takes integer positions; offsets within one value always fit.
@@ -378,6 +408,11 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 	const appendRow = `INSERT INTO ${table} (path, content, mtime_ms, byte_len) VALUES (@path, '', @mtime, @len) `;
 	// Scalar subqueries rather than a CTE, so MySQL 5.7 runs this too.
 	const tailStart = `(SELECT byte_len FROM ${table} WHERE path = @path) - @suffix`;
+	// The parts of `r`'s session that start at or before where a chunked read
+	// starts, or, when that is inside `r`'s own content, where that content ends.
+	const startPart =
+		`FROM ${parts} AS p WHERE p.path = @path ` +
+		`AND p.start_offset <= ${greatest}(${bigint("@offset")}, ${byteLengthOf("r.content")})`;
 
 	return {
 		createTable: mysql
@@ -565,18 +600,36 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 		),
 		// Only the row's own bytes from `@offset` on (`@row_from` is the 1-based
 		// `@offset + 1`, clamped as in readFrom), so a read from inside the content
-		// of a row an older version wrote never fetches what precedes it.
+		// of a row an older version wrote never fetches what precedes it. The part
+		// the read starts at is the last one starting at or before `@offset`, or,
+		// when `@offset` is inside the row's own content, the one starting where
+		// that content ends.
 		readChunksStart: sql(
 			`SELECT byte_len, ${contentByteLength} AS content_len, ` +
 				`CASE WHEN ${bigint("@offset")} < ${contentByteLength} ` +
 				`THEN substr(${contentBytes}, ${position("@row_from")}) ELSE ${emptyBytes} END AS head, ` +
-				`(SELECT coalesce(max(start_offset), -1) FROM ${parts} ` +
-				`WHERE path = @path AND start_offset <= ${bigint("@offset")}) AS first_part FROM ${table} WHERE path = @path`,
+				`(SELECT coalesce(max(p.start_offset), -1) ${startPart}) AS first_part, ` +
+				`${partId ? `(SELECT ${partId} ${startPart} ORDER BY p.start_offset DESC LIMIT 1)` : "NULL"} AS first_id ` +
+				`FROM ${table} AS r WHERE r.path = @path`,
 		),
 		readParts: sql(
 			`SELECT start_offset, content FROM ${parts} WHERE path = @path AND start_offset >= ${bigint("@next")} ` +
-				`AND start_offset < ${bigint("@end")} ORDER BY start_offset`,
+				`AND start_offset < ${bigint("@end")} ` +
+				(partId
+					? `AND EXISTS (SELECT 1 FROM ${parts} AS p WHERE p.path = @path ` +
+						`AND p.start_offset = ${bigint("@anchor")} AND ${partId} = @anchor_id) `
+					: "") +
+				"ORDER BY start_offset",
 		),
+		partRowids:
+			adapter === "sqlite"
+				? {
+						last: sql(`SELECT coalesce(max(rowid), 0) AS last_rowid FROM ${parts}`),
+						insert: sql(
+							`INSERT INTO ${parts} (rowid, path, start_offset, content) VALUES (@rowid, @path, @offset, @content)`,
+						),
+					}
+				: undefined,
 	};
 }
 
@@ -994,11 +1047,22 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * {@link FIRST_PAGE_SPAN_BYTES} from `fromByte` and each next one twice the
 	 * last, up to {@link PAGE_SPAN_BYTES}, so a reader that stops early fetches
 	 * little past where it stopped. The read stops at the size its first query
-	 * saw, so an append made meanwhile is left out. A page with no part where
-	 * the read is, a part that does not start where the previous one ended, or
-	 * parts that end short of that size, mean a full write or a delete replaced
-	 * the parts during the read; it then fails with
-	 * {@link SessionReadConflictError} instead of yielding a mix of two bodies.
+	 * saw, so an append made meanwhile, which only adds parts past it, is left
+	 * out.
+	 *
+	 * A full write or a delete replaces every part of the session, the one the
+	 * read starts at included. So on PostgreSQL and SQLite the query of each
+	 * page also checks, in the same statement, that this part still has the row
+	 * identity the first query saw (its `xmin`; or its rowid, which a full
+	 * write never hands to a new part, see `DialectQueries.partRowids`), and
+	 * finds no parts when it does not: every page yielded is of the body the
+	 * read began on. A page with no part where the read is, a part that does
+	 * not start where the previous one ended, or parts that end short of the
+	 * size mean a full write or a delete replaced the parts during the read;
+	 * it then fails with {@link SessionReadConflictError} instead of yielding a
+	 * mix of two bodies. MySQL has no row identity, so there only those checks
+	 * apply, and a full write that keeps the size and every part's start, made
+	 * between two pages, goes unseen.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const [row] = (await this.#exclusive(() =>
@@ -1014,13 +1078,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (row.head && row.head.byteLength > 0) yield row.head;
 		if (fromByte >= size) return;
 		const firstPart = rowNumber(row.first_part);
+		const anchor = { anchor: firstPart, anchor_id: row.first_id };
 		let next = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
 		let skip = Math.max(0, fromByte - next);
 		for (let span = FIRST_PAGE_SPAN_BYTES; next < size; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
 			// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
 			const end = Math.max(next, fromByte) + span;
 			const parts = (await this.#exclusive(() =>
-				run(this.#client, this.#q.readParts, { path, next, end }),
+				run(this.#client, this.#q.readParts, { path, next, end, ...anchor }),
 			)) as PartRow[];
 			if (parts.length === 0) throw new SessionReadConflictError(path);
 			for (const part of parts) {
@@ -1058,8 +1123,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await this.#transaction(async transaction => {
 			await this.#replaceRow(transaction, path, mtimeMs, title, bytes.byteLength, expectedSize);
 			// A created session also drops parts orphaned under its path.
-			await this.#deleteParts(transaction, path);
-			await this.#insertParts(transaction, path, bytes);
+			await this.#replaceParts(transaction, path, bytes);
 		});
 	}
 
@@ -1180,14 +1244,25 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return row ? rowNumber(row.byte_len) : null;
 	}
 
-	/** Store `bytes` as parts of at most {@link PART_BYTES}, each ending on a UTF-8 character boundary. */
-	async #insertParts(transaction: SqlSessionStorageTransaction, path: string, bytes: Buffer): Promise<void> {
+	/**
+	 * Replace `path`'s parts with `bytes`, as parts of at most
+	 * {@link PART_BYTES}, each ending on a UTF-8 character boundary. On SQLite
+	 * the new parts take rowids above every part's, read before the old ones
+	 * go, so none takes the rowid of a part it replaces (see
+	 * {@link readChunks}).
+	 */
+	async #replaceParts(transaction: SqlSessionStorageTransaction, path: string, bytes: Buffer): Promise<void> {
+		const rowids = this.#q.partRowids;
+		const [last] = rowids ? ((await run(transaction, rowids.last, {})) as RowidRow[]) : [];
+		let rowid = last ? rowNumber(last.last_rowid) : 0;
+		await this.#deleteParts(transaction, path);
 		for (let start = 0; start < bytes.byteLength;) {
 			const end = utf8PartEnd(bytes, start, PART_BYTES);
-			await run(transaction, this.#q.insertPart, {
+			await run(transaction, rowids ? rowids.insert : this.#q.insertPart, {
 				path,
 				offset: start,
 				content: bytes.toString("utf8", start, end),
+				rowid: ++rowid,
 			});
 			start = end;
 		}

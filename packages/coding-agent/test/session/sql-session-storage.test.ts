@@ -514,6 +514,54 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
+	// SQLite gives the next insert one more than the largest rowid left, so a
+	// full write that deleted the table's last parts would hand their rowids to
+	// its own parts, and a reader checking the part it started at by rowid
+	// would take the new body's parts for the old one's.
+	it("readChunks fails rather than mix two bodies of one size when a full write replaces the table's last parts", async () => {
+		const client = new SQL("sqlite::memory:");
+		const reader = await SqlSessionStorage.create({ client });
+		const rewriter = await SqlSessionStorage.create({ client });
+		const path = "/sessions/p/same-size.jsonl";
+		// Three parts of 1 MiB: the first page, which spans 1 MiB, holds only the first.
+		const body = (fill: string): string => `${fill.repeat(3 * MiB - 1)}\n`;
+		await reader.writeText(path, body("a"));
+
+		const chunks = reader.readChunks(path)[Symbol.asyncIterator]();
+		expect((await chunks.next()).done).toBe(false);
+		await rewriter.writeText(path, body("b"));
+		const rest = (async () => {
+			let chunk = await chunks.next();
+			while (!chunk.done) chunk = await chunks.next();
+		})();
+		await expect(rest).rejects.toBeInstanceOf(SessionReadConflictError);
+		await client.end();
+	});
+
+	// The windowed readers (RPC subagent reads, the Agent Hub viewer) read
+	// through readTextFrom and read on from where its text ends; a size short
+	// of that end reads as a rewrite to a shorter transcript and starts over.
+	it("readTextFrom reads a titled session shorter than its title slot as readText reads it", async () => {
+		const { client, storage } = await createSqlite();
+		const path = "/sessions/p/short-titled.jsonl";
+		await storage.writeText(path, "short header\n");
+		await storage.updateSessionTitle(path, { title: "Renamed", source: "user", updatedAt: "t1" });
+		const text = Buffer.from(await storage.readText(path), "utf-8");
+		// From the start whole, a capped window inside the slot, and from where the slot ends.
+		for (const [offset, maxBytes] of [
+			[0, undefined],
+			[5, 100],
+			[text.length, undefined],
+		] as const) {
+			const end = maxBytes === undefined ? undefined : offset + maxBytes;
+			expect({ offset, read: await storage.readTextFrom(path, offset, maxBytes) }).toEqual({
+				offset,
+				read: { text: text.subarray(offset, end).toString("utf-8"), size: text.length },
+			});
+		}
+		await client.end();
+	});
+
 	it("copies a transcript of many parts with an append per MiB, not one per part", async () => {
 		const client = new SQL("sqlite::memory:");
 		const storage = await SqlSessionStorage.create({ client });

@@ -74,7 +74,7 @@ export async function copyTranscriptTree(
  * whole write would set it. Returns false, leaving nothing at `to`, when
  * `from` is gone; any other failure removes the partial copy and throws.
  */
-async function copyTranscript(storage: SessionStorage, from: string, to: string): Promise<boolean> {
+export async function copyTranscript(storage: SessionStorage, from: string, to: string): Promise<boolean> {
 	const decoder = new TextDecoder();
 	let writer: SessionStorageWriter | undefined;
 	let head = "";
