@@ -497,25 +497,44 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await raw.end();
 	});
 
-	it("readChunks fails rather than mix two bodies when a full write replaces the session between pages", async () => {
+	/**
+	 * Seeds `path` through one storage, takes the first chunk of its read,
+	 * replaces the session with `replacement` through a second storage on the
+	 * same database, and expects the rest of the read to fail.
+	 */
+	async function expectReadToFailWhenReplaced(
+		path: string,
+		seed: (reader: SqlSessionStorage) => Promise<void>,
+		replacement: string,
+	): Promise<void> {
 		const client = new SQL("sqlite::memory:");
 		const reader = await SqlSessionStorage.create({ client });
 		const rewriter = await SqlSessionStorage.create({ client });
-		const path = "/sessions/p/replaced.jsonl";
-		const writer = reader.openWriter(path);
-		// Parts of 2 MiB: the first page, which spans 1 MiB, holds only the first.
-		for (let n = 0; n < 3; n++) await writer.append(`${n}:${"x".repeat(2 * MiB - 3)}\n`);
-		await writer.close();
+		await seed(reader);
 
 		const chunks = reader.readChunks(path)[Symbol.asyncIterator]();
 		expect((await chunks.next()).done).toBe(false);
-		await rewriter.writeText(path, '{"n":"replaced"}\n');
+		await rewriter.writeText(path, replacement);
 		const rest = (async () => {
 			let chunk = await chunks.next();
 			while (!chunk.done) chunk = await chunks.next();
 		})();
 		await expect(rest).rejects.toBeInstanceOf(SessionReadConflictError);
 		await client.end();
+	}
+
+	it("readChunks fails rather than mix two bodies when a full write replaces the session between pages", async () => {
+		const path = "/sessions/p/replaced.jsonl";
+		await expectReadToFailWhenReplaced(
+			path,
+			async reader => {
+				const writer = reader.openWriter(path);
+				// Parts of 2 MiB: the first page, which spans 1 MiB, holds only the first.
+				for (let n = 0; n < 3; n++) await writer.append(`${n}:${"x".repeat(2 * MiB - 3)}\n`);
+				await writer.close();
+			},
+			'{"n":"replaced"}\n',
+		);
 	});
 
 	// SQLite gives the next insert one more than the largest rowid left, so a
@@ -523,23 +542,10 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 	// its own parts, and a reader checking the part it started at by rowid
 	// would take the new body's parts for the old one's.
 	it("readChunks fails rather than mix two bodies of one size when a full write replaces the table's last parts", async () => {
-		const client = new SQL("sqlite::memory:");
-		const reader = await SqlSessionStorage.create({ client });
-		const rewriter = await SqlSessionStorage.create({ client });
 		const path = "/sessions/p/same-size.jsonl";
 		// Three parts of 1 MiB: the first page, which spans 1 MiB, holds only the first.
 		const body = (fill: string): string => `${fill.repeat(3 * MiB - 1)}\n`;
-		await reader.writeText(path, body("a"));
-
-		const chunks = reader.readChunks(path)[Symbol.asyncIterator]();
-		expect((await chunks.next()).done).toBe(false);
-		await rewriter.writeText(path, body("b"));
-		const rest = (async () => {
-			let chunk = await chunks.next();
-			while (!chunk.done) chunk = await chunks.next();
-		})();
-		await expect(rest).rejects.toBeInstanceOf(SessionReadConflictError);
-		await client.end();
+		await expectReadToFailWhenReplaced(path, reader => reader.writeText(path, body("a")), body("b"));
 	});
 
 	// The windowed readers (RPC subagent reads, the Agent Hub viewer) read

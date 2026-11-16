@@ -2965,14 +2965,18 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * page also checks, in the same statement, that this part still has the row
 	 * identity the first query saw (its `xmin`; or its rowid, which a full
 	 * write never hands to a new part, see `DialectQueries.partRowids`), and
-	 * finds no parts when it does not: every page yielded is of the body the
-	 * read began on. A page with no part where the read is, a part that does
-	 * not start where the previous one ended, or parts that end short of the
-	 * size mean a full write or a delete replaced the parts during the read;
-	 * it then fails with {@link SessionReadConflictError} instead of yielding a
-	 * mix of two bodies. MySQL has no row identity, so there only those checks
-	 * apply, and a full write that keeps the size and every part's start, made
-	 * between two pages, goes unseen.
+	 * finds no parts when it does not. A page with no part where the read is,
+	 * a part that does not start where the previous one ended, or parts that
+	 * end short of the size mean a full write or a delete replaced the parts
+	 * during the read; it then fails with {@link SessionReadConflictError}
+	 * instead of yielding a mix of two bodies. MySQL has no row identity, so
+	 * there only those checks apply, and a full write that keeps the size and
+	 * every part's start, made between two pages, goes unseen. SQLite gives a
+	 * new row the largest rowid plus one, so a delete followed by a re-create
+	 * at the same path, made between two pages, can give the new parts the
+	 * rowids of the deleted ones when those were the table's newest; then only
+	 * those checks apply there too, and a re-created body that keeps the size
+	 * and every part's start goes unseen.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const [row] = (await this.#exclusive(() =>
