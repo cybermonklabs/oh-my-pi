@@ -56,7 +56,9 @@ interface HeldValue {
 }
 
 const REFRESH_INTERVAL_MS = 60_000;
-const MAX_SECRET_FILE_BYTES = 1024 * 1024;
+const MIB = 1024 * 1024;
+/** The most a `_FILE` file may hold; a secrets.yml has no such limit. */
+const MAX_SECRET_FILE_BYTES = MIB;
 const UNSAFE_NAME_CHARS = /[^A-Za-z0-9_.-]/g;
 
 /**
@@ -137,11 +139,11 @@ function stampOf(filePath: string, stat: fs.BigIntStats): string {
 
 /**
  * Read the regular file that `stat`, the caller's stat of `filePath`, describes, when it holds at
- * most 1 MiB; throws on filesystem errors. The caller opens nothing but a regular file: an open of
- * a FIFO, even a non-blocking one, lets a writer that waits in its own open go on, and the close
- * then leaves that writer with no reader.
+ * most `maxBytes`; throws on filesystem errors. The caller opens nothing but a regular file: an
+ * open of a FIFO, even a non-blocking one, lets a writer that waits in its own open go on, and the
+ * close then leaves that writer with no reader.
  */
-function readSecretFile(filePath: string, stat: fs.BigIntStats): { text: string } | { skip: string } {
+function readSecretFile(filePath: string, stat: fs.BigIntStats, maxBytes: number): { text: string } | { skip: string } {
 	// Non-blocking, and checked again on the descriptor: by now the path may name another file.
 	const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
 	try {
@@ -149,7 +151,7 @@ function readSecretFile(filePath: string, stat: fs.BigIntStats): { text: string 
 		if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
 			return { skip: "replaced before it was opened" };
 		}
-		if (opened.size > MAX_SECRET_FILE_BYTES) return { skip: "larger than 1 MiB" };
+		if (opened.size > maxBytes) return { skip: `larger than ${maxBytes / MIB} MiB` };
 		const size = Number(opened.size);
 		// One byte past the reported size reveals a file that grew after fstat.
 		const buffer = Buffer.allocUnsafe(size + 1);
@@ -320,7 +322,7 @@ export class SessionStoreMasker {
 			const stat = fs.statSync(filePath, { bigint: true });
 			stamp = stampOf(filePath, stat);
 			if (this.#fileStamps.get(name) === stamp) return;
-			read = stat.isFile() ? readSecretFile(filePath, stat) : { skip: "not a regular file" };
+			read = stat.isFile() ? readSecretFile(filePath, stat, MAX_SECRET_FILE_BYTES) : { skip: "not a regular file" };
 		} catch (err) {
 			// Not stamped, so the next refresh tries again even when the file has not changed.
 			if (isEnoent(err) || isEnotdir(err)) this.#skipFile(name, "missing");
@@ -350,6 +352,12 @@ export class SessionStoreMasker {
 		}
 	}
 
+	#skipSecretsFile(filePath: string, reason: string): void {
+		if (this.#isNews(this.#reasonKey("secrets.yml", filePath), reason)) {
+			logger.debug("Session store masking skipped a secrets.yml", { path: filePath, reason });
+		}
+	}
+
 	/** Logs a read that failed, with its source and its cause; the values held so far stay masked. */
 	#failedRead(kind: "file" | "secrets.yml", source: string, err: unknown): void {
 		// The error code of a filesystem error, which names no path.
@@ -373,22 +381,30 @@ export class SessionStoreMasker {
 
 	#collectSecretsFile(filePath: string, scope: "project" | "global", held: HeldSet): void {
 		let stamp: string;
-		let text: string;
+		let read: { text: string } | { skip: string };
 		try {
-			stamp = stampOf(filePath, fs.statSync(filePath, { bigint: true }));
+			const stat = fs.statSync(filePath, { bigint: true });
+			stamp = stampOf(filePath, stat);
 			if (this.#secretsFileStamps.get(filePath) === stamp) return;
-			text = fs.readFileSync(filePath, "utf8");
+			read = stat.isFile()
+				? readSecretFile(filePath, stat, Number.POSITIVE_INFINITY)
+				: { skip: "not a regular file" };
 		} catch (err) {
 			// Not stamped, so the next refresh reads the file again even when it has not changed. A
-			// missing file clears the last reason, so a read that fails after it is logged again.
+			// missing file clears the last reason, so a reason given after it is logged again.
 			if (isEnoent(err) || isEnotdir(err)) this.#loggedReasons.delete(this.#reasonKey("secrets.yml", filePath));
 			else this.#failedRead("secrets.yml", filePath, err);
 			return;
 		}
-		// Stamped now that its text is read: a text that does not parse gives the same result next time.
+		// Stamped now that it is read or skipped: the same file gives the same result next time, a
+		// text that does not parse included.
 		this.#secretsFileStamps.set(filePath, stamp);
+		if ("skip" in read) {
+			this.#skipSecretsFile(filePath, read.skip);
+			return;
+		}
 		this.#loggedReasons.delete(this.#reasonKey("secrets.yml", filePath));
-		for (const { entry, position } of parseSecretsFileText(text, filePath)) {
+		for (const { entry, position } of parseSecretsFileText(read.text, filePath)) {
 			this.#holdEntry(held, entry, `${scope}#${position}`);
 		}
 	}
