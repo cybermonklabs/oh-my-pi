@@ -49,6 +49,58 @@ function createHarness(initialStreaming: boolean) {
 	};
 }
 
+type SettlementPath = "idle commit" | "idle discard" | "lazy commit";
+
+/**
+ * Delivers one receipt-tracked entry through `path`, keeping the built message in `transcript` the
+ * way an agent's context keeps a delivered message, and returns a weak ref to the entry's value.
+ * Kept out of the test body so no strong local binding to the value survives.
+ */
+async function settleOneEntry(path: SettlementPath, transcript: AgentMessage[]): Promise<WeakRef<object>> {
+	const scheduledFlushes: Array<() => Promise<void>> = [];
+	const queue = new YieldQueue({
+		isStreaming: () => path === "lazy commit",
+		injectIdle: async messages => {
+			transcript.push(...messages);
+			if (path === "idle discard") throw new Error("turn ended before insertion");
+		},
+		scheduleIdleFlush: run => scheduledFlushes.push(run),
+	});
+	queue.register<Entry>("items", {
+		build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+	});
+	const value: Entry = { id: `entry-${transcript.length}` };
+	const receipt = queue.enqueueWithReceipt("items", value).catch(() => {});
+	if (path === "lazy commit") {
+		const message = queue.drainLazy()[0]!();
+		if (!message) throw new Error("lazy thunk built no message");
+		transcript.push(message);
+		(message as AgentMessage & { [ASIDE_MESSAGE_COMMIT]?: () => void })[ASIDE_MESSAGE_COMMIT]?.();
+	} else {
+		await scheduledFlushes[0]!();
+	}
+	await receipt;
+	return new WeakRef(value);
+}
+
+/**
+ * Collects across a few event-loop turns and returns how many targets are still reachable. Bun's
+ * conservative stack scan can pin the most recently dropped object in a stale native stack slot,
+ * so callers settle several entries and tolerate one survivor.
+ */
+async function liveAfterGc(refs: WeakRef<object>[]): Promise<number> {
+	let live = refs.length;
+	for (let turn = 0; turn < 20; turn++) {
+		Bun.gc(true);
+		live = refs.filter(ref => ref.deref() !== undefined).length;
+		if (live === 0) break;
+		// A WeakRef target stays alive until the current task ends: a zero-length sleep yields one
+		// task so the next collection can clear it (no wall-clock wait; fake timers cannot end a task).
+		await Bun.sleep(0);
+	}
+	return live;
+}
+
 describe("YieldQueue", () => {
 	test("enqueue while streaming defers until streaming flush", async () => {
 		const harness = createHarness(true);
@@ -286,4 +338,18 @@ describe("YieldQueue", () => {
 
 		expect(thunks[0]!()).toBeNull();
 	});
+
+	// A delivered message stays in the session's context for the session's life. If its settlement
+	// hooks kept the entries reachable, every delivered value (a finished background job and all its
+	// widget inputs hold, such as a subagent's tool output) would stay in memory with it.
+	test.each<SettlementPath>(["idle commit", "idle discard", "lazy commit"])(
+		"a message settled by %s keeps none of its entries reachable",
+		async path => {
+			const transcript: AgentMessage[] = [];
+			const refs: WeakRef<object>[] = [];
+			for (let i = 0; i < 8; i++) refs.push(await settleOneEntry(path, transcript));
+			expect(transcript).toHaveLength(8);
+			expect(await liveAfterGc(refs)).toBeLessThanOrEqual(1);
+		},
+	);
 });
