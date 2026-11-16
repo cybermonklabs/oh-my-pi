@@ -573,25 +573,57 @@ describe("K24: matches that overlap", () => {
 
 describe("K25: a FIFO whose writer waits in its own open", () => {
 	const word = "fifo-carried-value-64";
+	const secretsFileModule = path.join(import.meta.dir, "../../src/secrets/secrets-file.ts");
+
+	/** What a child runs while the writer waits: its code, its arguments, and what its stdout must parse to. */
+	interface Probe {
+		lines: readonly string[];
+		args: readonly string[];
+		output: unknown;
+	}
+
+	/**
+	 * A child that builds a masker of `env` and `agentDir`, masks for `cwd` and refreshes once a
+	 * minute later; each round must end within a second holding no source.
+	 */
+	function maskerProbe(masker: { env: Record<string, string>; agentDir: string; cwd: string }): Probe {
+		const round = { withinASecond: true, sources: 0, kept: true };
+		return {
+			lines: [
+				`import { SessionStoreMasker } from ${JSON.stringify(MODULE_PATH)};`,
+				"const [envText, agentDir, cwd, word] = process.argv.slice(2);",
+				"const env = JSON.parse(envText);",
+				"let now = 1_000_000;",
+				"const masker = new SessionStoreMasker({ env: () => env, agentDir, now: () => now });",
+				"const rounds = [];",
+				"for (let round = 0; round < 2; round++) {",
+				"	const started = performance.now();",
+				"	const mask = masker.snapshot(cwd);",
+				"	const withinASecond = performance.now() - started < 1_000;",
+				"	rounds.push({ withinASecond, sources: mask.sources.length, kept: mask.maskText(word) === word });",
+				"	now += 60_000;",
+				"	await Promise.resolve();",
+				"}",
+				"process.stdout.write(JSON.stringify(rounds));",
+			],
+			args: [JSON.stringify(masker.env), masker.agentDir, masker.cwd, word],
+			output: [round, round],
+		};
+	}
 
 	/**
 	 * Makes `fifo` a FIFO whose writer waits in its own open to write `content`, and while it waits
-	 * builds a masker of `env` and `agentDir` in a child, masks for `cwd` and refreshes once a minute
-	 * later. Expects each round to end within a second holding no source, and the writer, still
+	 * runs `probe` in a child. Expects the child to print the probe's output, and the writer, still
 	 * waiting after the child, to deliver `content` to the test's own open.
 	 *
-	 * As the FIFO case above, the masker runs in a child the spawn timeout kills, so a masker that
-	 * blocks fails here instead of hanging the suite.
+	 * As the FIFO case above, the probe runs in a child the spawn timeout kills, so code that blocks
+	 * fails here instead of hanging the suite.
 	 */
-	async function expectWriterStillDelivers(
-		fifo: string,
-		content: string,
-		masker: { env: Record<string, string>; agentDir: string; cwd: string },
-	): Promise<void> {
+	async function expectWriterStillDelivers(fifo: string, content: string, probe: Probe): Promise<void> {
 		expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
 		// Says it is about to open, then waits in its open until a reader opens the FIFO, and writes.
-		// A masker that opens the FIFO lets it go on: its write then finds the reader gone, or lands
-		// in a pipe the masker's close empties, and the test's own read below gets nothing.
+		// A child that opens the FIFO lets it go on: its write then finds the reader gone, or lands
+		// in a pipe the child's close empties, and the test's own read below gets nothing.
 		const writer = Bun.spawn(["sh", "-c", 'echo ready; exec 3>"$1" && printf %s "$2" >&3', "sh", fifo, content], {
 			stdout: "pipe",
 			stderr: "ignore",
@@ -600,44 +632,21 @@ describe("K25: a FIFO whose writer waits in its own open", () => {
 		});
 		let reader: number | undefined;
 		try {
-			// The writer opens right after this line; the masker's child takes far longer to start.
+			// The writer opens right after this line; the child takes far longer to start.
 			await (writer.stdout as ReadableStream<Uint8Array>).getReader().read();
-			const probe = await writeFile(
-				"fifo-probe.ts",
-				[
-					`import { SessionStoreMasker } from ${JSON.stringify(MODULE_PATH)};`,
-					"const [envText, agentDir, cwd, word] = process.argv.slice(2);",
-					"const env = JSON.parse(envText);",
-					"let now = 1_000_000;",
-					"const masker = new SessionStoreMasker({ env: () => env, agentDir, now: () => now });",
-					"const rounds = [];",
-					"for (let round = 0; round < 2; round++) {",
-					"	const started = performance.now();",
-					"	const mask = masker.snapshot(cwd);",
-					"	const withinASecond = performance.now() - started < 1_000;",
-					"	rounds.push({ withinASecond, sources: mask.sources.length, kept: mask.maskText(word) === word });",
-					"	now += 60_000;",
-					"	await Promise.resolve();",
-					"}",
-					"process.stdout.write(JSON.stringify(rounds));",
-				].join("\n"),
-			);
-			const child = Bun.spawn(
-				[process.execPath, probe, JSON.stringify(masker.env), masker.agentDir, masker.cwd, word],
-				{
-					stdout: "pipe",
-					stderr: "ignore",
-					env: { ...process.env, PI_TEST_RUNTIME: "1", PI_CODING_AGENT_DIR: agentDir },
-					timeout: 15_000,
-					killSignal: "SIGKILL",
-				},
-			);
+			const probeFile = await writeFile("fifo-probe.ts", probe.lines.join("\n"));
+			const child = Bun.spawn([process.execPath, probeFile, ...probe.args], {
+				stdout: "pipe",
+				stderr: "ignore",
+				env: { ...process.env, PI_TEST_RUNTIME: "1", PI_CODING_AGENT_DIR: agentDir },
+				timeout: 15_000,
+				killSignal: "SIGKILL",
+			});
 			const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
 			expect(exitCode).toBe(0);
-			const round = { withinASecond: true, sources: 0, kept: true };
-			expect(JSON.parse(stdout)).toEqual([round, round]);
+			expect(JSON.parse(stdout)).toEqual(probe.output);
 
-			// The masker opened nothing, so the writer still waits.
+			// The child opened nothing, so the writer still waits.
 			expect(writer.exitCode).toBeNull();
 			// Non-blocking, so a writer that is gone fails the test instead of hanging it.
 			reader = fs.openSync(fifo, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
@@ -655,7 +664,11 @@ describe("K25: a FIFO whose writer waits in its own open", () => {
 		"K25: as a _FILE, neither blocks on the FIFO nor opens it, at the build and at a refresh, so the writer still delivers",
 		async () => {
 			const fifo = path.join(root, "pipe");
-			await expectWriterStillDelivers(fifo, word, { env: { PIPE_FILE: fifo }, agentDir: root, cwd: root });
+			await expectWriterStillDelivers(
+				fifo,
+				word,
+				maskerProbe({ env: { PIPE_FILE: fifo }, agentDir: root, cwd: root }),
+			);
 		},
 		40_000,
 	);
@@ -664,7 +677,26 @@ describe("K25: a FIFO whose writer waits in its own open", () => {
 		"K25: as the project secrets.yml, neither blocks on the FIFO nor opens it, at the build and at a refresh, so the writer still delivers",
 		async () => {
 			// A secrets.yml whose entry the masker would hold, had it read the FIFO.
-			await expectWriterStillDelivers(projectYml, plainYml(word), { env: {}, agentDir, cwd });
+			await expectWriterStillDelivers(projectYml, plainYml(word), maskerProbe({ env: {}, agentDir, cwd }));
+		},
+		40_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"K25: the provider obfuscator's load of the project secrets.yml neither blocks on the FIFO nor opens it, so the writer still delivers",
+		async () => {
+			// A secrets.yml whose entry the load would return, had it read the FIFO.
+			await expectWriterStillDelivers(projectYml, plainYml(word), {
+				lines: [
+					`import { loadSecretsFile } from ${JSON.stringify(secretsFileModule)};`,
+					"const started = performance.now();",
+					"const entries = await loadSecretsFile(process.argv[2]);",
+					"const withinASecond = performance.now() - started < 1_000;",
+					"process.stdout.write(JSON.stringify({ withinASecond, entries: entries.length }));",
+				],
+				args: [projectYml],
+				output: { withinASecond: true, entries: 0 },
+			});
 		},
 		40_000,
 	);

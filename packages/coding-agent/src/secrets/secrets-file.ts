@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
@@ -24,12 +25,41 @@ export function globalSecretsFilePath(agentDir: string): string {
 	return path.join(agentDir, "secrets.yml");
 }
 
-/** Read one secrets.yml; a missing file, a file that is not a YAML array, and invalid entries yield nothing. */
+/**
+ * Read one secrets.yml; a missing file, a path that is not a regular file, a file that is not a YAML
+ * array, and invalid entries yield nothing.
+ */
 export async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> {
 	try {
-		return parseSecretsFile(await Bun.file(filePath).text(), filePath).map(({ entry }) => entry);
+		const read = await readRegularFile(filePath);
+		if ("skip" in read) {
+			logger.debug("Skipped secrets.yml", { path: filePath, reason: read.skip });
+			return [];
+		}
+		return parseSecretsFile(read.text, filePath).map(({ entry }) => entry);
 	} catch (err) {
 		return secretsFileFailure(err, filePath);
+	}
+}
+
+/**
+ * The text of the regular file at `filePath`, or why it was not read; throws on filesystem errors.
+ * Nothing but a regular file is opened: an open of a FIFO, even a non-blocking one, lets a writer
+ * that waits in its own open go on, and the close then leaves that writer with no reader.
+ */
+async function readRegularFile(filePath: string): Promise<{ text: string } | { skip: string }> {
+	const stat = await fs.stat(filePath, { bigint: true });
+	if (!stat.isFile()) return { skip: "not a regular file" };
+	// Non-blocking, and checked again on the handle: by now the path may name another file.
+	const handle = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+	try {
+		const opened = await handle.stat({ bigint: true });
+		if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+			return { skip: "replaced before it was opened" };
+		}
+		return { text: await Bun.file(handle.fd).text() };
+	} finally {
+		await handle.close();
 	}
 }
 
