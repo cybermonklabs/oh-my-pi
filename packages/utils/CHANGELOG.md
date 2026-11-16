@@ -13,6 +13,7 @@
 ### Fixed
 
 - Fixed test processes (`PI_TEST_RUNTIME=1` or a Bun test entrypoint) loading `~/.env` and the config root's `.env` (`~/.omp/.env`), which put the developer's auth broker, tokens and provider keys back into a test's environment; the agent directory's and project's `.env` files still load
+- `getNativesDir()` and `getNativeGrammarsDir()` now name one directory per machine, the one the addon loader uses, instead of a per-profile directory
 
 ## [18.18.2] - 2026-11-08
 

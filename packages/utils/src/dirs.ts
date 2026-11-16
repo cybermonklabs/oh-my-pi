@@ -17,6 +17,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getNativesDir } from "@oh-my-pi/pi-natives/natives-dir";
 import { expandWindowsLongPath } from "@oh-my-pi/pi-natives/path";
 import { engines, version } from "../package.json" with { type: "json" };
 import { isEnoent, isEnotdir } from "./fs-error";
@@ -764,12 +765,13 @@ export function getRemoteDir(): string {
  * Expand a leading `~` and require an absolute result. Returns `undefined` for
  * empty/whitespace input or a path that is still relative after expansion.
  *
- * Worktree bases and the natives directory are process-global: a worktree base
- * is consumed by both creation (PR checkout, task isolation) and cleanup
- * (`omp worktree`), and every launch extracts or loads the native addon from
- * the same natives directory. A relative value would resolve against whatever
- * cwd happened to launch `omp`, so those readers could disagree — we refuse it
- * rather than silently bind it to cwd.
+ * Worktree bases and the config and download roots are process-global: a
+ * worktree base is consumed by both creation (PR checkout, task isolation) and
+ * cleanup (`omp worktree`), and every omp process must name the same roots. A
+ * relative value would resolve against whatever cwd happened to launch `omp`,
+ * so those readers could disagree — we refuse it rather than silently bind it
+ * to cwd. (The natives directory applies the same rule in
+ * `@oh-my-pi/pi-natives/natives-dir`.)
  */
 function resolveAbsoluteDir(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
@@ -949,14 +951,10 @@ export function getNativeGrammarsDir(): string {
 }
 
 /**
- * Get the natives directory. PI_NATIVES_DIR overrides it, then `OMP_DOWNLOAD_ROOT`, then the
- * usual cache root; relative values are ignored.
+ * The natives directory, one per machine. The addon loader resolves it with the same
+ * function, so the addon and the agent never name different directories.
  */
-export function getNativesDir(): string {
-	return (
-		resolveAbsoluteDir(process.env.PI_NATIVES_DIR) ?? downloadSubdir("natives") ?? dirs.rootSubdir("natives", "cache")
-	);
-}
+export { getNativesDir };
 
 /** Get the stats database path (~/.omp/stats.db). */
 export function getStatsDbPath(): string {

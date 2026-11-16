@@ -21,10 +21,11 @@ There is no `NativeBindings` declaration-merging lifecycle or `packages/natives/
 | `@oh-my-pi/pi-natives/desktop`   | `createDesktopSession(options): DesktopSession`; addon load is deferred until invocation.                                       |
 | `@oh-my-pi/pi-natives/clipboard` | `copyToClipboard(text)` and `readImageFromClipboard()` plus the `ClipboardImage` type; addon load is deferred until invocation. |
 
-Two additional public subpaths are lazy:
+Three additional public subpaths are lazy:
 
 - `@oh-my-pi/pi-natives/path`: `expandWindowsLongPath(path)` and `getWindowsShortPath(path)`; native loading occurs only on Windows, while other platforms return the input unchanged.
 - `@oh-my-pi/pi-natives/vcs`: repository discovery/requirements (`git`, `repo`, `repoForDisplay`, `require`, `requireGit`, `gitInfo`, `jj`, `isPureJj`), clone/detach/patch helpers, VCS error predicates, and `watch`. Native-backed calls load and memoize the addon. `repoForDisplay` prefers Jujutsu on equal-root ties; `repo` retains Git-safe discovery precedence.
+- `@oh-my-pi/pi-natives/natives-dir`: `getNativesDir()`, the one natives directory the addon loader and pi-utils both use (`PI_NATIVES_DIR`, then `OMP_DOWNLOAD_ROOT`, then `$XDG_CACHE_HOME/omp` on Linux and macOS, then the config root). It loads no addon.
 
 Do not import unexported `native/*` implementation paths from package consumers.
 

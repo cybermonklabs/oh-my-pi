@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { embeddedAddon } from "./embedded-addon.js";
+import { getNativesDir } from "./natives-dir.js";
 import { bindingsHaveReleaseIdentity, bindingsReleaseVersion, containsVersionStamp } from "./version-sentinel.js";
 
 /**
@@ -53,33 +54,6 @@ function startupMarker(text) {
 	} catch {
 		// stderr unavailable; markers are best-effort
 	}
-}
-
-/**
- * An absolute directory from an override variable (`~` expanded), or null for a relative/empty value.
- * @param {string | undefined} value
- * @returns {string | null}
- */
-function resolveAbsoluteDir(value) {
-	let dir = value?.trim();
-	if (!dir) return null;
-	if (dir === "~") dir = os.homedir();
-	else if (dir.startsWith("~/") || dir.startsWith("~\\")) dir = os.homedir() + dir.slice(1);
-	return path.isAbsolute(dir) ? path.normalize(dir) : null;
-}
-
-function getNativesDir() {
-	// Match pi-utils directory overrides without depending on pi-utils:
-	// PI_NATIVES_DIR, then the download root, then XDG, then the config root.
-	const override = resolveAbsoluteDir(process.env.PI_NATIVES_DIR);
-	if (override) return override;
-	const downloadRoot = resolveAbsoluteDir(process.env.OMP_DOWNLOAD_ROOT);
-	if (downloadRoot) return path.join(downloadRoot, "natives");
-	const xdgDataHome = process.env.XDG_DATA_HOME;
-	if (xdgDataHome && fs.existsSync(path.join(xdgDataHome, "omp"))) {
-		return path.join(xdgDataHome, "omp", "natives");
-	}
-	return path.join(resolveAbsoluteDir(process.env.OMP_CONFIG_ROOT) ?? path.join(os.homedir(), ".omp"), "natives");
 }
 
 function resolveLeafPackageDir(platformTag) {

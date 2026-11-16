@@ -17,7 +17,7 @@ A successful call is not memoized by JS. Repeated calls rely on the runtime's `r
 - `platformTag`: `${platform}-${process.arch}`;
 - package version (the expected addon release, subject to the pre-sentinel compatibility exception below);
 - package-local `nativeDir` and the directory of `process.execPath`;
-- `nativesDir`: `PI_NATIVES_DIR` first (trimmed, `~`-expanded, and normalized; empty or relative values are ignored), then `$XDG_DATA_HOME/omp/natives` only when `$XDG_DATA_HOME/omp` exists, otherwise `~/.omp/natives`;
+- `nativesDir`: `getNativesDir()` from `native/natives-dir.js` (`@oh-my-pi/pi-natives/natives-dir`), the function pi-utils' `getNativesDir()` also calls, so the grammar directory the addon loads from is the one the agent installs into. In order: `PI_NATIVES_DIR` (trimmed, `~`-expanded, and normalized; empty or relative values are ignored), `<OMP_DOWNLOAD_ROOT>/natives`, on Linux and macOS `$XDG_CACHE_HOME/omp/natives` when `$XDG_CACHE_HOME/omp` exists, otherwise `<OMP_CONFIG_ROOT or ~/<PI_CONFIG_DIR or .omp>>/natives`. It never depends on the profile: the loader fixes the addon's grammar directory once, at load, and the profile can change later;
 - `versionedDir`: `<nativesDir>/<packageVersion>`;
 - legacy compiled-binary directory: `%LOCALAPPDATA%/omp` (or `~/AppData/Local/omp`) on Windows, `~/.local/bin` elsewhere;
 - workspace/install/compiled mode, optional leaf directory, Windows staging policy, CPU variant, filenames, and ordered candidates.
