@@ -649,6 +649,18 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
+	 * Once no job of agent `agentId` is left here, the IRC bus forgets the
+	 * agent (see {@link IrcBus.forgetAgent}); a job of it still registered
+	 * keeps its marks, since that job still carries the agent's outcome.
+	 */
+	#forgetAgentWithoutJobs(agentId: string): void {
+		for (const job of this.#jobs.values()) {
+			if (job.agentId === agentId) return;
+		}
+		IrcBus.forgetAgent(agentId);
+	}
+
+	/**
 	 * Cancel a single job by id. When a filter is given and its owner does not
 	 * match the job's owner, the call is treated as not-found (returns false)
 	 * so cross-agent cancellation is rejected at the manager level.
@@ -1002,13 +1014,18 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		const jobsSettled = await this.#waitForAllUntil(deadline);
 		const drained = await this.drainDeliveries({ timeoutMs: Math.max(deadline - Date.now(), 0) });
 		this.#clearEvictionTimers();
+		const agentIds = new Set<string>();
 		// Bypass the grace-period sleep: dispose has already drained/cancelled
 		// deliveries above, so there is nothing left for the model to read via
 		// `agent://<id>` — sleeping the retention window here would only leak
 		// temp dirs for up to `retainedArtifactsCleanupGraceMs` (or past
 		// process exit, since dispose does not await these cleanups).
-		for (const job of this.#jobs.values()) this.#runRetainedArtifactsCleanup(job, { bypassGrace: true });
+		for (const job of this.#jobs.values()) {
+			this.#runRetainedArtifactsCleanup(job, { bypassGrace: true });
+			if (job.agentId !== undefined) agentIds.add(job.agentId);
+		}
 		this.#jobs.clear();
+		for (const agentId of agentIds) IrcBus.forgetAgent(agentId);
 		this.#deliveries.length = 0;
 		this.#notifyDeliveryQueueChanged();
 		this.#inFlightDeliveries.length = 0;
@@ -1196,7 +1213,9 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		const job = this.#jobs.get(jobId);
 		if (job) this.#runRetainedArtifactsCleanup(job);
 		this.widgets?.forget(jobId);
-		return this.#jobs.delete(jobId);
+		const evicted = this.#jobs.delete(jobId);
+		if (job?.agentId !== undefined) this.#forgetAgentWithoutJobs(job.agentId);
+		return evicted;
 	}
 
 	/**

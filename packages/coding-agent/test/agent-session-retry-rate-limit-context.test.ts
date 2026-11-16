@@ -101,7 +101,8 @@ function refusedStream(model: Model<Api>, failure: AIError.FinalizeResult): Assi
 			errorId: failure.id,
 			timestamp: Date.now(),
 		};
-		if (failure.retryAfterMs !== undefined) partial.errorRetryAfterMs = failure.retryAfterMs;
+		const { retryAfterMs } = failure as { retryAfterMs?: number };
+		if (retryAfterMs !== undefined) Object.assign(partial, { errorRetryAfterMs: retryAfterMs });
 		stream.push({ type: "error", reason: "error", error: partial });
 	});
 	return stream;

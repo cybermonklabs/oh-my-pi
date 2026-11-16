@@ -91,6 +91,8 @@ export interface IrcBusApi {
 	unreadCount(agentId: string): number;
 	/** Count a settled job of agent `from` owned by `to` as `from`'s reply to `to`. */
 	recordReply(from: string, to: string): void;
+	/** Drop every send mark from or to `agentId` unless it is live; see {@link IrcBus.forgetAgent}. */
+	forgetAgent(agentId: string): void;
 }
 
 export class IrcBus implements IrcBusApi {
@@ -106,12 +108,22 @@ export class IrcBus implements IrcBusApi {
 
 	/** Install the process-global bus. Worker bootstrap only. */
 	static installGlobal(api: IrcBusApi): void {
-		IrcBus.#global = api;
+		IrcBus.#replaceGlobal(api);
 	}
 
 	/** Reset the global bus. Test-only. */
 	static resetGlobalForTests(): void {
-		IrcBus.#global = undefined;
+		IrcBus.#replaceGlobal(undefined);
+	}
+
+	/**
+	 * Make `next` the global bus. The bus it replaces stops following its
+	 * registry; a worker's proxy follows none.
+	 */
+	static #replaceGlobal(next: IrcBusApi | undefined): void {
+		const previous = IrcBus.#global;
+		if (previous instanceof IrcBus && previous !== next) previous.#unsubscribe();
+		IrcBus.#global = next;
 	}
 
 	/**
@@ -122,6 +134,17 @@ export class IrcBus implements IrcBusApi {
 	 */
 	static recordReply(from: string, to: string): void {
 		IrcBus.#global?.recordReply(from, to);
+	}
+
+	/**
+	 * Forget agent `agentId` once a job manager evicted the last job that ran
+	 * it: the marks of what it sent and of what was sent to it answer nothing
+	 * any more, and a later message to it (a revived agent) records fresh ones.
+	 * An agent still live keeps them until it is parked, killed or unregistered.
+	 * With no bus yet nothing was recorded.
+	 */
+	static forgetAgent(agentId: string): void {
+		IrcBus.#global?.forgetAgent(agentId);
 	}
 
 	readonly #registry: AgentRegistryApi;
@@ -138,12 +161,19 @@ export class IrcBus implements IrcBusApi {
 	readonly #lastJobReply = new Map<string, Map<string, SendMark>>();
 	/** Last {@link SendMark.seq} handed out, taken when a send starts. */
 	#sendSeq = 0;
+	readonly #unsubscribe: () => void;
 
 	constructor(registry: AgentRegistryApi = AgentRegistry.global(), lifecycle?: AgentLifecycleApi) {
 		this.#registry = registry;
 		// Lazy: the lifecycle global self-constructs against the global registry,
 		// so only touch it when a parked recipient actually needs reviving.
 		this.#lifecycle = () => lifecycle ?? AgentLifecycleManager.global();
+		// An agent that stops being live (parked, killed, unregistered) keeps no
+		// marks, so a parked agent keeps only its registry record. Every status
+		// change asks; forgetAgent skips an agent that is still live.
+		this.#unsubscribe = registry.onChange(event => {
+			if (event.type !== "metadata_changed") this.forgetAgent(event.ref.id);
+		});
 	}
 
 	/**
@@ -198,6 +228,26 @@ export class IrcBus implements IrcBusApi {
 	/** Instance half of {@link IrcBus.recordReply}: records the job-carried reply on this bus. */
 	recordReply(from: string, to: string): void {
 		this.#record(this.#lastJobReply, from, to, { ts: Date.now(), seq: ++this.#sendSeq });
+	}
+
+	/**
+	 * Instance half of {@link IrcBus.forgetAgent}: drops the agent's row and its
+	 * entry in every other agent's row from each mark table, and each row left
+	 * empty. Both sides go at once, so {@link unansweredSends} never meets a
+	 * send whose answer was dropped. A live agent (`running` or `idle`: it has a
+	 * session) keeps its marks, as a turn of it may still read them: the
+	 * wake-turn relay asks {@link sentSince} after the turn has gone idle. They
+	 * go once this bus's registry reports it parked, aborted or gone.
+	 */
+	forgetAgent(agentId: string): void {
+		const status = this.#registry.get(agentId)?.status;
+		if (status === "running" || status === "idle") return;
+		for (const table of [this.#lastSent, this.#lastDirect, this.#lastProgress, this.#lastJobReply]) {
+			table.delete(agentId);
+			for (const [from, marks] of table) {
+				if (marks.delete(agentId) && marks.size === 0) table.delete(from);
+			}
+		}
 	}
 
 	/**

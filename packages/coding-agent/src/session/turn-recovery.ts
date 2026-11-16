@@ -5,7 +5,6 @@ import {
 	isSyntheticToolResultMessage,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
-import { findTranscriptUsageAnchor } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	AssistantMessage,
 	AssistantRetryRecovery,
@@ -37,6 +36,7 @@ import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
 
 import type { Settings } from "../config/settings";
+import type { ContextUsage } from "../extensibility/extensions/types";
 import type { RetryErrorUpdate } from "../extensibility/shared-events";
 import { isEvalStateContext } from "../eval/state";
 import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
@@ -310,6 +310,12 @@ export interface TurnRecoveryHost {
 	 * `SessionMaintenance.contextFitsModel`.
 	 */
 	contextFitsModel(model: Model, excludedMessage?: AssistantMessage): boolean;
+	/**
+	 * Size of the live context, as the status line reports it: the newest usage
+	 * after the latest compaction plus the estimate of the messages after it.
+	 * See `AgentSession.getContextUsage`.
+	 */
+	getContextUsage(): ContextUsage | undefined;
 	/** Whether streamed text has already been committed to the active output sink. */
 	textOutputCommitted(): boolean;
 	thinkingLevel(): ThinkingLevel | undefined;
@@ -3289,12 +3295,14 @@ export class TurnRecovery {
 			// limit on this model, which the next attempt re-hits.
 			const deferToSameModel = sameModelRetryAvailable && !sourceRateLimited;
 			// The rate-limit wait (see `rateLimited`), measured on the context the
-			// provider reported for the newest answered request.
-			const rateLimitHoldsModel =
+			// turn sends (see `TurnRecoveryHost.getContextUsage`): a large prompt no
+			// request has answered yet counts, and a usage from before a compaction
+			// that shrank the context does not. A function, so the `if` below reads
+			// the usage only once its earlier terms hold.
+			const rateLimitHoldsModel = (): boolean =>
 				rateLimited &&
 				(deferToSameModel ||
-					(findTranscriptUsageAnchor(this.#host.agent.state.messages)?.tokens ?? 0) >
-						retrySettings.rateLimitFallbackMaxContextTokens);
+					(this.#host.getContextUsage()?.tokens ?? 0) > retrySettings.rateLimitFallbackMaxContextTokens);
 			if (
 				allowModelFallback &&
 				retrySettings.modelFallback &&
@@ -3304,7 +3312,7 @@ export class TurnRecovery {
 				!sameModelSteerReplay &&
 				!waitForSiblingCredential &&
 				!refusalWalkRepeats &&
-				!rateLimitHoldsModel &&
+				!rateLimitHoldsModel() &&
 				!connectionHold
 			) {
 				if (classifierRefusal) {

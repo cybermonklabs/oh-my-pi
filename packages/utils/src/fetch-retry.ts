@@ -6,15 +6,20 @@ const QUOTA_RESET_PATTERN = /reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/
 const PLEASE_RETRY_PATTERN = /Please retry in ([0-9.]+)(ms|s)/i;
 // JSON field: "retryDelay": "34.074824224s"
 const RETRY_DELAY_FIELD_PATTERN = /"retryDelay":\s*"([0-9.]+)(ms|s)"/i;
+// One number and unit of a stated wait: "250ms" / "12sec" / "5 min" / "2h" / "3 days".
+const WAIT_PART_PATTERN = /([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)/gi;
+// A stated wait of one or more parts, which add up: a Go duration such as
+// "6m0s" or "1h2m3.5s" is one wait, read with `waitPartsMs`.
+const WAIT_SOURCE = `((?:${WAIT_PART_PATTERN.source})+)\\b`;
 // "try again in 250ms" / "try again in 12s" / "try again in 12sec" /
 // "try again in 5 min" / "try again in ~158 min." / "try again in 2h" /
-// "try again in 90 minutes" / "try again in 1 hour"
-const TRY_AGAIN_PATTERN = /try again in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h)\b/i;
-// "Your limit will reset in 13 minutes" / "reset in 13 minutes" / "will reset in 2h"
+// "try again in 90 minutes" / "try again in 1 hour" / "try again in 6m0s"
+const TRY_AGAIN_PATTERN = new RegExp(`try again in\\s+~?\\s*${WAIT_SOURCE}`, "i");
+// "Your limit will reset in 13 minutes" / "reset in 13 minutes" / "will reset in 2h" /
+// "will reset in 6m0s" / "resets in 1h30m"
 // OpenCode Go quota errors use "Resets in …" with day units and compound
 // remainders ("Resets in 3 days", "Resets in 2hr 15min", "Resets in 45min").
-const WILL_RESET_IN_PATTERN =
-	/(?:will\s+)?resets?\s+in\s+~?\s*([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\b/i;
+const WILL_RESET_IN_PATTERN = new RegExp(`(?:will\\s+)?resets?\\s+in\\s+~?\\s*${WAIT_SOURCE}`, "i");
 // OpenCode Go compound remainder: "Resets in 2hr 15min".
 const RESET_IN_HR_MIN_PATTERN = /resets?\s+in\s+~?\s*(\d+(?:\.\d+)?)\s*hr\s*(\d+(?:\.\d+)?)\s*min\b/i;
 // "Your limit will reset at 2026-09-01 09:44:51" / "reset at 2026-09-01T09:44:51Z"
@@ -64,7 +69,10 @@ export interface RetryHintOptions {
  *  - `Your quota will reset after 18h31m10s` / `10m15s` / `39s`
  *  - `Please retry in 250ms` / `Please retry in 12s`
  *  - `"retryDelay": "34.074824224s"` (JSON error detail field)
- *  - `try again in 250ms` / `try again in 12s` / `try again in 5 min` / `try again in ~158 min`
+ *  - `try again in 250ms` / `try again in 12s` / `try again in 5 min` / `try again in ~158 min` /
+ *    `try again in 6m0s` (a Go duration's parts add up)
+ *  - `Your limit will reset in 13 minutes` / `Resets in 3 days` / `Resets in 2hr 15min` /
+ *    `resets in 1h30m` (a Go duration's parts add up)
  *  - `retry-after-ms=98497000` / `retry-after-ms: 7200000` / `retry-after-ms = 7200000`
  *  - `Your limit will reset at 2026-09-01 09:44:51` / `将在 2026-09-01 09:44:51 重置`
  *    (a provider offset makes a naive wall clock authoritative; otherwise it
@@ -190,13 +198,7 @@ export function extractRetryHint(
 		}
 	}
 	const accountResetMatch = WILL_RESET_IN_PATTERN.exec(body);
-	if (accountResetMatch?.[1]) {
-		const value = Number.parseFloat(accountResetMatch[1]);
-		if (Number.isFinite(value) && value > 0) {
-			const unitMs = unitToMs(accountResetMatch[2]!);
-			if (unitMs !== undefined) consider(value * unitMs);
-		}
-	}
+	if (accountResetMatch?.[1]) consider(waitPartsMs(accountResetMatch[1]));
 
 	const retryAfterMsMatch = RETRY_AFTER_MS_BODY_PATTERN.exec(body);
 	if (retryAfterMsMatch?.[1]) {
@@ -204,16 +206,12 @@ export function extractRetryHint(
 		if (Number.isFinite(ms)) considerClamped(ms);
 	}
 
-	for (const pattern of [PLEASE_RETRY_PATTERN, RETRY_DELAY_FIELD_PATTERN, TRY_AGAIN_PATTERN]) {
+	for (const pattern of [PLEASE_RETRY_PATTERN, RETRY_DELAY_FIELD_PATTERN]) {
 		const match = pattern.exec(body);
-		if (match?.[1]) {
-			const value = Number.parseFloat(match[1]);
-			if (Number.isFinite(value) && value > 0) {
-				const unitMs = unitToMs(match[2]!);
-				if (unitMs !== undefined) consider(value * unitMs);
-			}
-		}
+		if (match?.[1]) consider(waitPartsMs(`${match[1]}${match[2]}`));
 	}
+	const tryAgainMatch = TRY_AGAIN_PATTERN.exec(body);
+	if (tryAgainMatch?.[1]) consider(waitPartsMs(tryAgainMatch[1]));
 
 	// Legacy text forms (also honored by older local parsers): a plain
 	// `retry-after` delta in seconds or as an HTTP date, and
@@ -251,6 +249,18 @@ export function extractRetryHint(
 	// Elapsed naive stamps were ignored before this change and stay ignored:
 	// only an explicit zero/expired relative signal is authoritative retry-now.
 	return longestMs ?? longestNaiveMs ?? (retryNow ? 0 : undefined);
+}
+
+/** Adds the parts of a stated wait ("6m0s" is 360 s); `undefined` when a part has no number. */
+function waitPartsMs(wait: string): number | undefined {
+	let totalMs = 0;
+	for (const part of wait.matchAll(WAIT_PART_PATTERN)) {
+		const value = Number.parseFloat(part[1]!);
+		const unitMs = unitToMs(part[2]!);
+		if (!Number.isFinite(value) || unitMs === undefined) return undefined;
+		totalMs += value * unitMs;
+	}
+	return totalMs;
 }
 
 function unitToMs(unit: string): number | undefined {

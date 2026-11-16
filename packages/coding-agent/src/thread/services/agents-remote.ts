@@ -4,10 +4,10 @@
  *
  * The APIs are synchronous wherever the main classes are, so those calls are
  * `callSync` round trips; async APIs use `call`, and results nobody reads
- * (`setActivity`, `recordReply`, `adopt`) are ordered notifications. Change
- * listeners share one main-side forwarding subscription per proxy, which is
- * dropped once the last local listener unsubscribes; events arrive
- * asynchronously after the main-side change.
+ * (`setActivity`, `recordReply`, `forgetAgent`, `adopt`) are ordered
+ * notifications. Change listeners share one main-side forwarding
+ * subscription per proxy, which is dropped once the last local listener
+ * unsubscribes; events arrive asynchronously after the main-side change.
  */
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -279,5 +279,9 @@ export class RemoteIrcBus implements IrcBusApi {
 
 	recordReply(from: string, to: string): void {
 		this.#remote.notify("recordReply", from, to);
+	}
+
+	forgetAgent(agentId: string): void {
+		this.#remote.notify("forgetAgent", agentId);
 	}
 }

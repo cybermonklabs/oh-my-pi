@@ -49,6 +49,8 @@
 - A session that finds another writer's entries in its file while rewriting it reads the file back in pieces instead of all at once, so keeping those entries no longer holds a whole long transcript in memory
 - A `task` call whose `taskFile` names a FIFO is refused without opening the FIFO, so a program waiting to write to it stays blocked instead of losing its write or being killed by SIGPIPE
 - A session that ran background tasks no longer keeps each delivered job, such as a finished subagent's recent tool output, in memory for the rest of its life once the job's result is in its context
+- Checking whether another omp process runs a session, as `omp gc` does, no longer blocks about 50 ms for each session another omp process runs
+- A session that runs many subagents with IRC on no longer keeps IRC state in memory for each subagent once it is parked, killed or released
 - Fixed subagents whose declared model has no working credentials silently running on the parent session's model: that model's own `retry.fallbackChains` key (`provider/id` or `provider/*`) now decides, as it also does for a declared model missing from the catalog (an empty chain refuses the spawn with an error naming the agent and model, a non-empty chain is walked), and any replacement is marked as a fallback in the session and task result ([#16028](https://github.com/can1357/oh-my-pi/pull/16028) by [@sjawhar](https://github.com/sjawhar))
 - Fixed task results not saying which fallback model answered for a subagent: the `<task-result>` now carries a `<model served=… requested=… fallback="true">` line, with the reason when the model was replaced at spawn ([#16028](https://github.com/can1357/oh-my-pi/pull/16028) by [@sjawhar](https://github.com/sjawhar))
 - Fixed a subagent with a `task.agentAccountPools` entry failing with a raw "restricted to its OAuth account pool" error when no account it may use can serve its declared model: that model's own `retry.fallbackChains` key now decides at spawn, as it does for any other model that cannot serve ([#16028](https://github.com/can1357/oh-my-pi/pull/16028) by [@sjawhar](https://github.com/sjawhar))
@@ -154,7 +156,7 @@
 - Hindsight auto-retain, the pending-tool-call warning on resume and the exit record read only recent messages on each turn instead of the whole history
 - `.jsonl.gz` subagent transcripts in exports are decompressed as they are read instead of all at once
 - `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory
-- A rate limit now waits on the same model, retrying it after the wait the provider states, before it walks `retry.fallbackChains`, and never moves a session whose context is larger than the new `retry.rateLimitFallbackMaxContextTokens` (default 100,000 tokens); overloads and server errors still walk the chain at once
+- A rate limit now waits on the same model, retrying it after the wait the provider states, before it walks `retry.fallbackChains`, and never moves a session whose context, as the status line shows it (a prompt no request has answered yet included), is larger than the new `retry.rateLimitFallbackMaxContextTokens` (default 100,000 tokens); overloads and server errors still walk the chain at once
 
 ## [18.18.6] - 2026-11-09
 

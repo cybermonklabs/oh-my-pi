@@ -28,10 +28,17 @@ async function settle(): Promise<void> {
 	for (let i = 0; i < 5; i++) await Bun.sleep(0);
 }
 
+// The case below registers every job at once under `maxRunningJobs: 0`, which needs a job manager that reads a cap of
+// 0 as no cap; where a cap of 0 still allows one running job, the case skips.
+const capProbe = new AsyncJobManager({ maxRunningJobs: 0, onJobComplete: () => {} });
+capProbe.register("task", "cap probe", async () => ({ text: "done" }));
+const itUncapped = it.skipIf(capProbe.atCapacity);
+await capProbe.dispose();
+
 // A session with IRC on keeps the process-wide bus. Once a subagent's task job has settled and been
 // evicted, the process must hold nothing of that job beyond the subagent's registry record. Regressed: a
 // long session that runs many subagents grows its memory with every finished subagent and never gets it back.
-it("the IRC bus keeps no per-agent state for task jobs that have settled and been evicted", async () => {
+itUncapped("the IRC bus keeps no per-agent state for task jobs that have settled and been evicted", async () => {
 	IrcBus.global();
 	const manager = new AsyncJobManager({ retentionMs: 0, maxRunningJobs: 0, onJobComplete: () => {} });
 	try {

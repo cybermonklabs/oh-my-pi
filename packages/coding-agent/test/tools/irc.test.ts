@@ -522,6 +522,195 @@ describe("IRC", () => {
 			// Failed revival never enqueues: the message is lost, not buffered.
 			expect(bus.take("0-Parked")).toBeUndefined();
 		});
+
+		describe("forgetting an agent's send marks", () => {
+			const managers: AsyncJobManager[] = [];
+			afterEach(async () => {
+				for (const manager of managers.splice(0)) await manager.dispose();
+			});
+
+			/** Registers live fake agents, `0-Main` and the others as its subagents; each starts `running`. */
+			function registerAgents(...ids: string[]): void {
+				for (const id of ids) {
+					const session = makeFakeSession().session;
+					session.dispose = (async () => {}) as AgentSession["dispose"];
+					const parentId = id === "0-Main" ? undefined : "0-Main";
+					registry.register({ id, displayName: id, kind: parentId ? "sub" : "main", parentId, session });
+				}
+			}
+
+			function jobManager(): AsyncJobManager {
+				const manager = new AsyncJobManager({});
+				manager.registerDeliverySink("0-Main", () => {});
+				managers.push(manager);
+				return manager;
+			}
+
+			/** A task job of `0-Sub` owned by `0-Main`; `finish` ends the run (a registered agent goes idle) and settles the job. */
+			function startSubJob(manager: AsyncJobManager): { finish: () => Promise<void> } {
+				const run = Promise.withResolvers<string>();
+				const id = manager.register("task", "0-Sub", async () => run.promise, {
+					id: "0-Sub",
+					agentId: "0-Sub",
+					ownerId: "0-Main",
+				});
+				return {
+					finish: async () => {
+						const settled = manager.getJob(id)?.promise;
+						if (registry.get("0-Sub")) registry.setStatus("0-Sub", "idle");
+						run.resolve("done");
+						await settled;
+					},
+				};
+			}
+
+			/** `0-Peer` wakes `0-Sub` for a turn that runs no job of its own, and `0-Sub` answers it. */
+			async function peerWakeTurn(): Promise<number> {
+				const turnStartTime = Date.now();
+				registry.setStatus("0-Sub", "running");
+				await bus.send({ from: "0-Peer", to: "0-Sub", body: "is auth.ts yours?" });
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "yes, leave it to me" });
+				return turnStartTime;
+			}
+
+			// Regressed: a session keeps IRC state for every finished subagent the registry does not know.
+			it("forgets an agent the registry does not know once its last job is evicted", async () => {
+				registerAgents("0-Main", "0-Peer");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				await job.finish();
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(true);
+
+				expect(manager.evictCompletedJobs()).toBe(1);
+
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Sub", 0)).toEqual([]);
+			});
+
+			// Regressed: evicting one finished job drops the marks a still-registered job of the
+			// same agent relies on.
+			it("keeps the marks while another job of the same agent is registered", async () => {
+				registerAgents("0-Main", "0-Peer");
+				const manager = jobManager();
+				const first = startSubJob(manager);
+				const second = startSubJob(manager);
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				await first.finish();
+				expect(manager.evictCompletedJobs()).toBe(1);
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(true);
+
+				await second.finish();
+				expect(manager.evictCompletedJobs()).toBe(1);
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+			});
+
+			// Regressed: a session torn down with finished subagent jobs still listed keeps their IRC state.
+			it("forgets the agents of the jobs a disposed manager still held", async () => {
+				registerAgents("0-Main", "0-Peer");
+				const manager = new AsyncJobManager({});
+				manager.registerDeliverySink("0-Main", () => {});
+				const job = startSubJob(manager);
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				await job.finish();
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(true);
+
+				await manager.dispose();
+
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+			});
+
+			// Regressed: a subagent answers the peer that woke it, its earlier job is evicted after the
+			// turn went idle, and the wake relay sends the peer that answer a second time; or a parked
+			// subagent keeps its IRC state, or its owner's question outlives the answer to it.
+			it("keeps an idle agent's marks when its last job is evicted, and forgets both sides once it parks", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				await job.finish();
+				const turnStartTime = await peerWakeTurn();
+				// The turn settles idle before the wake relay asks whether it already answered the peer.
+				registry.setStatus("0-Sub", "idle");
+
+				expect(manager.evictCompletedJobs()).toBe(1);
+				expect(bus.sentSince("0-Sub", "0-Peer", turnStartTime)).toBe(true);
+
+				const lifecycle = AgentLifecycleManager.global();
+				lifecycle.adopt("0-Sub", { idleTtlMs: 0 });
+				await lifecycle.park("0-Sub");
+
+				expect(registry.get("0-Sub")?.status).toBe("parked");
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
+				expect(bus.unansweredSends("0-Peer", 0)).toEqual([]);
+			});
+
+			// Regressed: the eviction of a subagent's earlier job drops the marks of the turn it is running.
+			it("keeps a running agent's marks when its last job is evicted", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await job.finish();
+				const turnStartTime = await peerWakeTurn();
+
+				expect(manager.evictCompletedJobs()).toBe(1);
+
+				expect(bus.sentSince("0-Sub", "0-Peer", turnStartTime)).toBe(true);
+			});
+
+			// Regressed: an owner waiting on a subagent across its park misses its reply, or a question
+			// to the revived subagent is never counted as owed.
+			it("ends the owner's open wait on the revived agent's reply, and a later question records fresh marks", async () => {
+				registerAgents("0-Main", "0-Sub");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				const waiting = bus.wait("0-Main", { from: "0-Sub" }, 0);
+				await job.finish();
+				const revived = makeFakeSession();
+				const lifecycle = AgentLifecycleManager.global();
+				lifecycle.adopt("0-Sub", { idleTtlMs: 0, revive: async () => revived.session });
+				await lifecycle.park("0-Sub");
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+
+				const question = await bus.send({ from: "0-Main", to: "0-Sub", body: "and the second word?" });
+				expect(question.outcome).toBe("revived");
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([
+					{ to: "0-Sub", sentAt: expect.any(Number), promised: false },
+				]);
+				await bus.send({ from: "0-Sub", to: "0-Main", body: "vermilion" });
+				expect((await waiting)?.body).toBe("vermilion");
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
+			});
+
+			// Regressed: a released subagent keeps its IRC state for the rest of the session.
+			it("forgets an agent once it is released", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+
+				expect(await AgentLifecycleManager.global().release("0-Sub")).toBe(true);
+
+				expect(registry.get("0-Sub")).toBeUndefined();
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+			});
+
+			// Regressed: a killed subagent keeps its IRC state for the rest of the session.
+			it("forgets an agent once it is killed", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+
+				expect(await AgentLifecycleManager.global().release("0-Sub", undefined, { tombstone: true })).toBe(true);
+
+				expect(registry.get("0-Sub")?.status).toBe("aborted");
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+			});
+		});
 	});
 
 	describe("wake-turn replies to broadcasts", () => {
