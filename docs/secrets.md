@@ -239,11 +239,12 @@ Masking reduces the exposure of a secret. It does not remove it. To remove it, h
 - `packages/coding-agent/src/secrets/env-secrets.ts` -- environment variable collection
 - `packages/coding-agent/src/secrets/secrets-file.ts` -- the `secrets.yml` parser and the one reader of a secret file (`_FILE` and `secrets.yml`), in a sync and an async form
 - `packages/coding-agent/src/secrets/obfuscator.ts` -- `SecretObfuscator` class, placeholder generation, message obfuscation
+- `packages/coding-agent/src/secrets/literal-index.ts` -- `LiteralIndex`, which finds which of many literals a text holds with no pattern that grows with a literal; the obfuscator's literal detectors and the stored-session matcher search with it
 - `packages/coding-agent/src/secrets/regex.ts` -- regex literal parsing and compilation
 - `packages/coding-agent/src/secrets/message-transform.ts` -- provider-context and local-context transforms
 - `packages/coding-agent/src/secrets/patterns.ts` -- built-in credential patterns
 - `packages/coding-agent/src/secrets/session-store-mask.ts` -- the values and markers of stored-session masking
-- `packages/coding-agent/src/secrets/session-store-matcher.ts` -- the matcher that finds held values in a text and replaces them with markers, and the literal index it and the obfuscator's literal detectors search with
+- `packages/coding-agent/src/secrets/session-store-matcher.ts` -- the matcher that finds held values in a text and replaces them with markers
 - `packages/coding-agent/src/session/session-entry-mask.ts` -- which fields of a session entry are masked
 - `packages/coding-agent/src/secrets/settings.ts` -- `secrets.enabled` and `secrets.maskSessionStore` setting definitions
 

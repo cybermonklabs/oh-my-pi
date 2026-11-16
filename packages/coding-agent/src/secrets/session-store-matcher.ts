@@ -17,29 +17,17 @@
  * match (an anchor, a lookaround) or a held literal holds marker text. With no regex and no literal
  * that holds a bracket, `mask` runs one pass only: its result is the fixed point.
  *
- * No pattern grows with the size of a held value. A literal is found with `indexOf`; the only
- * patterns are alternations of keys, a key being a literal's first {@link KEY_CHARS} characters,
- * which say in one scan each which literals a text can hold at all. That search is a
- * {@link LiteralIndex}, which the provider obfuscator's literal detectors use as well.
+ * No pattern grows with the size of a held value: a literal is found with `indexOf`, starting only
+ * within the reach of its key that the {@link LiteralIndex} of the held literals gives.
  */
 
-import { literalAlternationSource } from "./regex";
+import { type KeyReach, LiteralIndex } from "./literal-index";
 
 /** The start of every marker. */
 export const MARKER_PREFIX = "[REDACTED:";
 
 /** A marker: the prefix, a label that holds no bracket, and the closing bracket. */
 const MARKER_SHAPE = /^\[REDACTED:[^[\]]*\]$/;
-
-/** The characters of a literal's start that its key holds. */
-const KEY_CHARS = 32;
-
-/**
- * The pattern characters one alternation of keys may hold: a quarter of the 1,048,576 past which
- * JavaScriptCore refuses a pattern. An escaped key takes at most 6 × {@link KEY_CHARS} characters,
- * so every key fits, and a set of keys past this size is split over more alternations.
- */
-const CHUNK_PATTERN_CHARS = 256 * 1024;
 
 /** A held regex, compiled with the global flag, and the marker its matches become. */
 export interface MarkedRegex {
@@ -67,24 +55,6 @@ interface MatchRange {
 	readonly start: number;
 	end: number;
 	readonly marker: string;
-}
-
-/** Where a key occurs in a text: the literals that start with it, and the indexes of its first and of its last occurrence. */
-export interface KeyReach {
-	readonly literals: readonly string[];
-	first: number;
-	last: number;
-}
-
-/** Finds held literals in a text, with no pattern that grows with a literal. */
-export interface LiteralIndex {
-	/** Whether some literal occurs in `text`. */
-	test(text: string): boolean;
-	/**
-	 * The reach of each key that occurs in `text`, or `undefined` when none does: only a literal of
-	 * such a key can occur in the text, and only starting within that reach.
-	 */
-	reachesIn(text: string): Iterable<KeyReach> | undefined;
 }
 
 const NO_SPANS: readonly Span[] = [];
@@ -185,145 +155,6 @@ function addOccurrences(
 	}
 }
 
-/**
- * Whether `literal`, which is in lower case, starts at `at` in `text` up to ASCII case: an ASCII
- * capital of the text compares as its small letter, every other character as it is.
- */
-function startsAtIgnoringAsciiCase(text: string, literal: string, at: number): boolean {
-	if (at + literal.length > text.length) return false;
-	for (let offset = 0; offset < literal.length; offset++) {
-		const code = text.charCodeAt(at + offset);
-		if ((code >= 0x41 && code <= 0x5a ? code + 0x20 : code) !== literal.charCodeAt(offset)) return false;
-	}
-	return true;
-}
-
-/**
- * Each literal by its key, and alternations of the keys within {@link CHUNK_PATTERN_CHARS} each.
- * Under `ignoreCase` the literals and keys are held in lower case and the alternations carry the
- * `i` flag, without `u`: for an ASCII key, that finds the key up to ASCII case and no other.
- */
-class KeyedLiteralIndex implements LiteralIndex {
-	readonly #ignoreCase: boolean;
-	/** The literals of each key. */
-	readonly #byKey = new Map<string, string[]>();
-	/** The keys that occur only where a literal does: a key that is a literal, or that starts with a shorter key. */
-	readonly #wholeKeys = new Set<string>();
-	/** The lengths of the keys shorter than {@link KEY_CHARS}, ascending: each such key is a whole literal. */
-	readonly #shortKeyLengths: number[];
-	readonly #keyChunks: RegExp[] = [];
-
-	constructor(literals: Iterable<string>, ignoreCase: boolean) {
-		this.#ignoreCase = ignoreCase;
-		const held = new Set<string>();
-		for (const literal of literals) {
-			if (literal !== "") held.add(ignoreCase ? literal.toLowerCase() : literal);
-		}
-		for (const literal of held) {
-			const key = literal.slice(0, KEY_CHARS);
-			const sharing = this.#byKey.get(key);
-			if (sharing === undefined) this.#byKey.set(key, [literal]);
-			else sharing.push(literal);
-		}
-		const flags = ignoreCase ? "gi" : "g";
-		const shortKeyLengths = new Set<number>();
-		let chunk: string[] = [];
-		let chars = 0;
-		for (const key of this.#byKey.keys()) {
-			if (key.length < KEY_CHARS) shortKeyLengths.add(key.length);
-			const size = RegExp.escape(key).length + 1;
-			if (chunk.length > 0 && chars + size > CHUNK_PATTERN_CHARS) {
-				this.#keyChunks.push(compiledAlternation(chunk, flags));
-				chunk = [];
-				chars = 0;
-			}
-			chunk.push(key);
-			chars += size;
-		}
-		if (chunk.length > 0) this.#keyChunks.push(compiledAlternation(chunk, flags));
-		this.#shortKeyLengths = [...shortKeyLengths].sort((a, b) => a - b);
-		for (const [key, sharing] of this.#byKey) {
-			if (
-				sharing.includes(key) ||
-				this.#shortKeyLengths.some(length => length < key.length && this.#byKey.has(key.slice(0, length)))
-			) {
-				this.#wholeKeys.add(key);
-			}
-		}
-	}
-
-	test(text: string): boolean {
-		for (const chunk of this.#keyChunks) {
-			chunk.lastIndex = 0;
-			for (let match = chunk.exec(text); match !== null; match = chunk.exec(text)) {
-				const at = match.index;
-				// Resume one character on, so a key that starts inside this one is found too.
-				chunk.lastIndex = at + 1;
-				const key = this.#ignoreCase ? match[0].toLowerCase() : match[0];
-				if (this.#wholeKeys.has(key)) return true;
-				// Every key found is one of `#byKey`'s: the alternations hold no other.
-				for (const literal of this.#byKey.get(key)!) {
-					if (this.#ignoreCase ? startsAtIgnoringAsciiCase(text, literal, at) : text.startsWith(literal, at)) {
-						return true;
-					}
-				}
-			}
-		}
-		return false;
-	}
-
-	// The same scan as `test`, kept apart: a shared visitor would cost a closure, and here a map, at
-	// every text the matcher passes, most of which hold no key.
-	reachesIn(text: string): Iterable<KeyReach> | undefined {
-		let reaches: Map<string, KeyReach> | undefined;
-		for (const chunk of this.#keyChunks) {
-			chunk.lastIndex = 0;
-			for (let match = chunk.exec(text); match !== null; match = chunk.exec(text)) {
-				const { index } = match;
-				// Resume one character on, so a key that starts inside this one is found too.
-				chunk.lastIndex = index + 1;
-				const key = this.#ignoreCase ? match[0].toLowerCase() : match[0];
-				reaches ??= new Map();
-				const reach = reaches.get(key);
-				if (reach === undefined) reaches.set(key, { literals: this.#byKey.get(key)!, first: index, last: index });
-				else reach.last = index;
-			}
-		}
-		if (reaches === undefined || this.#shortKeyLengths.length === 0) return reaches?.values();
-		// An alternation names the longest key that starts at a character. A shorter key that starts
-		// there is a prefix of it, so it occurs wherever the longer one does. A key added here is
-		// visited in turn; its prefixes are prefixes of the longer key too, so the result is the same.
-		for (const [key, reach] of reaches) {
-			for (const length of this.#shortKeyLengths) {
-				if (length >= key.length) break;
-				const shorter = key.slice(0, length);
-				const literals = this.#byKey.get(shorter);
-				if (literals === undefined) continue;
-				const known = reaches.get(shorter);
-				if (known === undefined) {
-					reaches.set(shorter, { literals, first: reach.first, last: reach.last });
-				} else {
-					known.first = Math.min(known.first, reach.first);
-					known.last = Math.max(known.last, reach.last);
-				}
-			}
-		}
-		return reaches.values();
-	}
-}
-
-/**
- * Builds the index of `literals`, an empty one left out. Under `ignoreCase` it finds each literal up
- * to ASCII case, as a case-insensitive regex without the `u` flag finds an ASCII literal: every
- * literal must then be ASCII. Throws when it cannot build one.
- */
-export function buildLiteralIndex(
-	literals: Iterable<string>,
-	options: { readonly ignoreCase?: boolean } = {},
-): LiteralIndex {
-	return new KeyedLiteralIndex(literals, options.ignoreCase ?? false);
-}
-
 class UnionMatcher implements SessionStoreMatcher {
 	readonly #markers = new Set<string>();
 	readonly #longestMarker: number;
@@ -349,7 +180,7 @@ class UnionMatcher implements SessionStoreMatcher {
 		for (const literal of literals.keys()) bracketed ||= literal.includes("[") || literal.includes("]");
 		this.#markerOf = literals;
 		// The index leaves out an empty literal.
-		this.#literals = buildLiteralIndex(literals.keys());
+		this.#literals = new LiteralIndex(literals.keys());
 
 		for (const { regex } of regexes) {
 			// `matchAll` refuses a regex without the global flag: refused here, the build fails, not a write.
@@ -465,17 +296,6 @@ class UnionMatcher implements SessionStoreMatcher {
 			}
 		}
 	}
-}
-
-/**
- * The alternation of `keys` with `flags`, matched once: JavaScriptCore compiles a pattern at its
- * first match, so a pattern it refuses fails here, where the index is built, and not in a write.
- */
-function compiledAlternation(keys: readonly string[], flags: string): RegExp {
-	const alternation = new RegExp(literalAlternationSource(keys), flags);
-	alternation.test("");
-	alternation.lastIndex = 0;
-	return alternation;
 }
 
 /**
