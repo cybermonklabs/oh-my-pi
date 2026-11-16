@@ -218,7 +218,7 @@ Including `shake` in `compaction.methodOrder` performs an inline, local reductio
 
 Threshold, incomplete-output, and overflow recovery advance to the next configured method when shake cannot reclaim enough context to get below the recovery band; this prevents repeated no-op shake loops. Idle shake does not use that fallback because the idle timer rechecks usage before running again. Manual `/shake` is a separate, more aggressive command that can target all eligible history.
 
-A shake elide pass persists the entries it shortened, and the usage anchor's `contextSnapshot`, as one appended `entry_patch` record (see [session format](./session.md)) instead of rewriting the session file. Whole-file loads replay it; byte-offset tail readers and older binaries do not.
+A shake elide pass persists the entries it shortened, and the usage anchor's `contextSnapshot`, as one appended `entry_patch` record (see [session format](./session.md)) instead of rewriting the session file. Whole-file loads, the RPC subagent transcript and the Agent Hub transcript viewer replay it; older binaries do not.
 
 ### Snapcompact method
 

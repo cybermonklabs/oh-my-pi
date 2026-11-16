@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { type AgentRef, AgentRegistry } from "../../registry/agent-registry";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
+import { applyEntryPatchesInWindow } from "../../session/entry-patches";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import { type AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
@@ -94,6 +95,7 @@ export async function readRpcSubagentTranscript(sessionFile: string, fromByte = 
 	const lastNewline = text.lastIndexOf("\n");
 	const completeText = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : "";
 	const entries = completeText.length > 0 ? parseSessionEntries(completeText) : [];
+	applyEntryPatchesInWindow(entries);
 	const nextByte = startByte + Buffer.byteLength(completeText, "utf8");
 
 	return {

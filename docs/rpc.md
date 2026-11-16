@@ -1097,7 +1097,10 @@ non-negative integer. Non-finite values fail. The result contains `sessionFile`,
 message entries. Only complete newline-terminated records are consumed; reuse
 `nextByte` on the next request. A missing transcript returns empty arrays.
 If `fromByte` exceeds the current file size, reading restarts at byte zero and
-reports `reset: true`.
+reports `reset: true`. Entries and messages carry the fields that the
+`entry_patch` records among the entries read set (see
+[session format](./session.md)); a record that names an entry before
+`fromByte` is listed in `entries` as written, for the client to apply.
 
 ### Cancelling subagents
 

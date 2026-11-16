@@ -1234,22 +1234,28 @@ export class SessionManager {
 	 * Keep the entries another writer added to `#sessionFile`, whose bytes now
 	 * measure `diskSize`. They join this session's tree as a side branch (their
 	 * parents are entries both writers loaded), the active leaf stays this
-	 * session's, and the retried rewrite republishes them with the rest.
+	 * session's, and the retried rewrite republishes them with the rest. An
+	 * `entry_patch` record among them sets its fields on the entries it names,
+	 * as a load does: the rewrite writes those fields inline and the record empty.
 	 */
 	#adoptForeignEntries(foreign: readonly SessionEntry[], diskSize: number): void {
 		const leaf = this.#index.leafId();
-		let adopted = 0;
+		const adopted: SessionEntry[] = [];
 		for (const entry of foreign) {
 			// A recovery that raced this one may already have kept it.
 			if (this.#index.has(entry.id)) continue;
 			this.#entries.push(entry);
 			this.#index.insert(entry);
-			adopted++;
+			adopted.push(entry);
 		}
 		this.#index.setLeaf(leaf);
 		this.#expectedDiskSize = diskSize;
-		if (adopted > 0)
-			logger.warn("Kept session entries another writer added", { sessionFile: this.#sessionFile, adopted });
+		if (applyEntryPatches(adopted, this.#index)) this.#bodyRevision++;
+		if (adopted.length > 0)
+			logger.warn("Kept session entries another writer added", {
+				sessionFile: this.#sessionFile,
+				adopted: adopted.length,
+			});
 	}
 
 	/**
@@ -3803,7 +3809,10 @@ export class SessionManager {
 	 * `entry_patch` record, whose size follows the patched fields rather than
 	 * the transcript; whole-file readers replay it on load (`entry-patches.ts`).
 	 * Bumps the body revision, as {@link rewriteEntries} does, so observers of
-	 * in-place updates (the thread publisher) republish the entries.
+	 * in-place updates (the thread publisher) republish the entries. The record
+	 * holds its own copy of each value, and an entry keeps a value it already
+	 * holds (an elide pass passes a message's own `content`), so no entry
+	 * shares an object with the record.
 	 *
 	 * Rejects before changing anything when a patch names an entry this
 	 * session lacks or a field that entry's kind does not have. A failed write
@@ -3814,7 +3823,7 @@ export class SessionManager {
 	async patchEntries(patches: readonly EntryPatch[]): Promise<void> {
 		if (patches.length === 0) return;
 		const data = toEntryPatchData(patches);
-		const changes = data.patches.map(patch => {
+		const changes = patches.map(patch => {
 			const target = this.#index.get(patch.entryId);
 			if (!target || !entryAcceptsPatch(target, patch)) {
 				throw new Error(`Entry patch does not fit session entry ${patch.entryId}`);
