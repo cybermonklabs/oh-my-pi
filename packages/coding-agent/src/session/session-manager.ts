@@ -1596,7 +1596,7 @@ export class SessionManager {
 	 */
 	storeMask(): SessionStoreMask | null {
 		const bound = this.#storeMasking;
-		if (bound) return sessionStoreMaskFor(bound.enabled(), this.#cwd, bound.agentDir);
+		if (bound) return sessionStoreMaskFor(bound.enabled(), { cwd: this.#cwd, agentDir: bound.agentDir });
 		if (!isSettingsInitialized()) return null;
 		return settingsStoreMask(Settings.instance, this.#cwd);
 	}

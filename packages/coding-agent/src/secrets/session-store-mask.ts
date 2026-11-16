@@ -381,7 +381,7 @@ export class SessionStoreMasker {
 			return;
 		}
 		this.#loggedReasons.delete(this.#reasonKey("secrets.yml", filePath));
-		for (const { entry, position } of parseSecretsFileText(read.text, filePath)) {
+		for (const { entry, position } of parseSecretsFileText({ path: filePath, text: read.text })) {
 			this.#holdEntry(held, entry, `${scope}#${position}`);
 		}
 	}
@@ -501,12 +501,15 @@ export function processSessionStoreMasker(agentDir: string): SessionStoreMasker 
 }
 
 /**
- * The mask a session's stored writes apply for `cwd`, or `null` while its setting is off; off, no
- * masker is built. `agentDir` is the session's own, whose secrets.yml its provider obfuscator reads.
- * `null`, not `undefined`, as `SessionManager.storeMask` documents.
+ * The mask a session's stored writes apply for `where.cwd`, or `null` while its setting is off; off,
+ * no masker is built. `where.agentDir` is the session's own, whose secrets.yml its provider obfuscator
+ * reads. `null`, not `undefined`, as `SessionManager.storeMask` documents.
  */
-export function sessionStoreMaskFor(enabled: boolean, cwd: string, agentDir: string): SessionStoreMask | null {
-	return enabled ? processSessionStoreMasker(agentDir).snapshot(cwd) : null;
+export function sessionStoreMaskFor(
+	enabled: boolean,
+	where: { readonly cwd: string; readonly agentDir: string },
+): SessionStoreMask | null {
+	return enabled ? processSessionStoreMasker(where.agentDir).snapshot(where.cwd) : null;
 }
 
 /**
@@ -550,5 +553,5 @@ export function storeMaskingOf(settings: Settings): StoreMaskingBinding {
 
 /** The mask a writer for `cwd` applies under `settings` now, or `null` while their `secrets.maskSessionStore` is off. */
 export function settingsStoreMask(settings: Settings, cwd: string): SessionStoreMask | null {
-	return sessionStoreMaskFor(cfgSecretsMaskSessionStore.get(settings), cwd, settings.getAgentDir());
+	return sessionStoreMaskFor(cfgSecretsMaskSessionStore.get(settings), { cwd, agentDir: settings.getAgentDir() });
 }
