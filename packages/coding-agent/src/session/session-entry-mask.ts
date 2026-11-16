@@ -35,6 +35,7 @@
  * - KR12: outside this walk, `SessionStoreMask.maskText` leaves a range that equals one of its own markers as it is.
  * - KR13: object keys, numbers, booleans and `null`, never masked.
  */
+import { isBigIntObject, isBooleanObject, isBoxedPrimitive, isNumberObject, isStringObject } from "node:util/types";
 import { countNewlines, isRecord, tryParseJson } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
 import type { SessionTitleUpdate } from "./session-title-slot";
@@ -587,9 +588,10 @@ class MaskWalk {
 
 /**
  * `entry` with every held secret replaced by its marker, for the stored copy
- * only: the live entry is never mutated. Returns `entry` itself when nothing
- * changes or `mask` is `null`. Signed blocks whose text changed lose their
- * signature; provider replay state whose text changed is dropped whole.
+ * only: the live entry is never mutated. Returns `entry` itself when it is
+ * plain data with nothing to mask, or when `mask` is `null` or empty. Signed
+ * blocks whose text changed lose their signature; provider replay state whose
+ * text changed is dropped whole.
  */
 export function maskSessionEntry<T>(entry: T, mask: SessionStoreMask | null): T {
 	if (mask === null || mask.empty) return entry;
@@ -633,17 +635,15 @@ function maskFree(value: unknown, key: string | number, walk: MaskWalk): unknown
 		case "string":
 			return walk.text(value);
 		case "bigint":
-			return maskPlainForm(storedForm(value, key), walk);
+			return maskStoredForm(value, key, walk);
 		case "function":
 			// A function is not written unless its `toJSON` gives a value.
-			return typeof Reflect.get(value, "toJSON") === "function"
-				? maskPlainForm(storedForm(value, key), walk)
-				: value;
+			return typeof Reflect.get(value, "toJSON") === "function" ? maskStoredForm(value, key, walk) : value;
 		case "object":
 			if (value === null) return value;
 			if (isPlainObject(value)) return maskObject(value, walk, undefined);
 			if (isRealArray(value)) return maskArray(value, walk, undefined, false);
-			return maskPlainForm(storedForm(value, key), walk);
+			return maskStoredForm(value, key, walk);
 		default:
 			// A number or a boolean is written as it is; `undefined` or a symbol not at all.
 			return value;
@@ -651,12 +651,15 @@ function maskFree(value: unknown, key: string | number, walk: MaskWalk): unknown
 }
 
 /**
- * `form`, a node's stored form read through {@link storedForm}, masked as free content into plain
- * data. It is not read through `toJSON` again, so an object or array that still has one is copied
- * as its own enumerable keys or its items.
+ * `value`, a node `stringifyJson` does not write as itself, masked as its {@link storedForm} in plain
+ * data. The form is not read through `toJSON` again, so an object or array that still has one is
+ * copied as its own enumerable keys or its items. A boxed `BigInt` there, which `stringifyJson`
+ * cannot write, leaves `value` itself, so the write fails as it does with masking off.
  */
-function maskPlainForm(form: unknown, walk: MaskWalk): unknown {
+function maskStoredForm(value: object | bigint, key: string | number, walk: MaskWalk): unknown {
+	const form = storedForm(value, key);
 	if (typeof form === "string") return walk.text(form);
+	if (isBigIntObject(form)) return value;
 	if (isRealArray(form)) return maskArray(form, walk, undefined, false);
 	if (Array.isArray(form)) {
 		const copy: unknown[] = [];
@@ -666,8 +669,8 @@ function maskPlainForm(form: unknown, walk: MaskWalk): unknown {
 	if (typeof form === "object" && form !== null) {
 		if (isPlainObject(form)) return maskObject(form, walk, undefined);
 		const copy: Record<string, unknown> = {};
-		for (const key in form) {
-			if (Object.hasOwn(form, key)) setOwn(copy, key, maskFree(Reflect.get(form, key), key, walk));
+		for (const formKey in form) {
+			if (Object.hasOwn(form, formKey)) setOwn(copy, formKey, maskFree(Reflect.get(form, formKey), formKey, walk));
 		}
 		return copy;
 	}
@@ -688,36 +691,12 @@ function storedForm(value: object | bigint, key: string | number): unknown {
 	return typeof form === "object" && form !== null ? (boxedPrimitive(form) ?? form) : form;
 }
 
-const objectToString = Object.prototype.toString;
-
 /** The primitive a boxed `String`, `Number` or `Boolean` holds, read as `JSON.stringify` reads it; `undefined` for any other object. */
 function boxedPrimitive(value: object): string | number | boolean | undefined {
-	// Without a `Symbol.toStringTag`, the tag names the object's internal slot; with one, each slot is tried.
-	if (!(Symbol.toStringTag in value)) {
-		switch (objectToString.call(value)) {
-			case "[object String]":
-				return String(value);
-			case "[object Number]":
-				return Number(value);
-			case "[object Boolean]":
-				return Boolean.prototype.valueOf.call(value);
-			default:
-				return undefined;
-		}
-	}
-	if (holdsSlot(String.prototype.valueOf, value)) return String(value);
-	if (holdsSlot(Number.prototype.valueOf, value)) return Number(value);
-	return holdsSlot(Boolean.prototype.valueOf, value) ? Boolean.prototype.valueOf.call(value) : undefined;
-}
-
-/** Whether `value` has the internal slot the built-in `valueOf` reads, which throws on any other object. */
-function holdsSlot(valueOf: () => unknown, value: object): boolean {
-	try {
-		valueOf.call(value);
-		return true;
-	} catch {
-		return false;
-	}
+	if (!isBoxedPrimitive(value)) return undefined;
+	if (isStringObject(value)) return String(value);
+	if (isNumberObject(value)) return Number(value);
+	return isBooleanObject(value) ? Boolean.prototype.valueOf.call(value) : undefined;
 }
 
 /** Whether `value` is a plain object: an `Object` or `null` prototype, no callable `toJSON`, no boxed primitive. */
@@ -791,24 +770,24 @@ function maskObject(obj: Record<string, unknown>, walk: MaskWalk, at: Position |
 		const next = at === undefined ? maskFree(value, key, walk) : maskField(value, walk, at, variant, key);
 		if (copy === undefined) {
 			if (Object.is(next, value)) continue;
-			copy = copyBefore(obj, key, undefined);
+			copy = copyBefore(obj, key);
 		}
 		if (next === DROP) continue;
 		setOwn(copy, key, next);
 		if (key === "content" && typeof next === "string" && next !== value) maskedContent = next;
 	}
 	// KR6, KR10: a signed block whose text a value changed no longer matches its signature.
-	let unsigned = signatureKey !== undefined && walk.replacements > before;
-	if (!unsigned && signatureKey !== undefined && variant?.reasoning && reasoningHoldsValue(obj[signatureKey], walk)) {
-		// The value is in the signature's own texts, so the turn held one: the rules around it read that too.
-		walk.replacements++;
-		unsigned = true;
+	const unsigned =
+		signatureKey !== undefined &&
+		(walk.replacements > before || (variant?.reasoning === true && reasoningHoldsValue(obj[signatureKey], walk)));
+	if (copy === undefined) {
+		if (!unsigned) return obj;
+		copy = copyBefore(obj, undefined);
 	}
-	if (copy === undefined) return unsigned ? copyBefore(obj, undefined, signatureKey) : obj;
 	if (maskedContent !== undefined && typeof copy.lineCount === "number") {
 		copy.lineCount = countNewlines(maskedContent) + 1;
 	}
-	if (unsigned && signatureKey !== undefined) Reflect.deleteProperty(copy, signatureKey);
+	if (unsigned) Reflect.deleteProperty(copy, signatureKey);
 	return copy;
 }
 
@@ -887,16 +866,12 @@ function textsHoldValue(parts: unknown, walk: MaskWalk): boolean {
 	return false;
 }
 
-/** A copy of `obj`'s own keys that come before `stop` (all of them when `stop` is `undefined`), leaving out `skip`. */
-function copyBefore(
-	obj: Record<string, unknown>,
-	stop: string | undefined,
-	skip: string | undefined,
-): Record<string, unknown> {
+/** A copy of `obj`'s own keys that come before `stop` (all of them when `stop` is `undefined`). */
+function copyBefore(obj: Record<string, unknown>, stop: string | undefined): Record<string, unknown> {
 	const copy: Record<string, unknown> = {};
 	for (const key in obj) {
 		if (key === stop) break;
-		if (Object.hasOwn(obj, key) && key !== skip) setOwn(copy, key, obj[key]);
+		if (Object.hasOwn(obj, key)) setOwn(copy, key, obj[key]);
 	}
 	return copy;
 }

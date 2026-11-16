@@ -985,6 +985,11 @@ function messageEntry(message: StoredRecord): StoredRecord {
 	return { type: "message", message };
 }
 
+/** A message entry with its own `id`, as the walk sees one the session appended. */
+function storedMessageEntry(id: string, message: StoredRecord): StoredRecord {
+	return { id, parentId: null, timestamp: KEEP_TIMESTAMP, ...messageEntry(message) };
+}
+
 /** An assistant message written as a plain object, so it can carry fields a newer format has. */
 function assistantRecord(content: unknown[], fields: StoredRecord = {}): StoredRecord {
 	return { ...assistant([]), content, ...fields };
@@ -994,6 +999,18 @@ function assistantRecord(content: unknown[], fields: StoredRecord = {}): StoredR
 async function regexMask(agentDir: string, maskCwd: string, source: string): Promise<storeMask.SessionStoreMask> {
 	await Bun.write(path.join(agentDir, "secrets.yml"), JSON.stringify([{ type: "regex", content: source }]));
 	return new storeMask.SessionStoreMasker({ env: () => ({ SERVICE_API_KEY: ENV_VALUE }), agentDir }).snapshot(maskCwd);
+}
+
+/** A digit-only held value, under a secret-named variable of {@link numberMask}. */
+const NUMBER_VALUE = "73190428865";
+const NUMBER_MARKER = "[REDACTED:env:SERVICE_NUMBER_TOKEN]";
+
+/** A mask holding SERVICE_API_KEY's value and {@link NUMBER_VALUE}, so a `bigint` can hold a value. */
+function numberMask(): storeMask.SessionStoreMask {
+	return new storeMask.SessionStoreMasker({
+		env: () => ({ SERVICE_API_KEY: ENV_VALUE, SERVICE_NUMBER_TOKEN: NUMBER_VALUE }),
+		agentDir: tmp.join("agent"),
+	}).snapshot(cwd);
 }
 
 const KEEP_HEADER: StoredRecord = {
@@ -3134,10 +3151,6 @@ function serverToolGroup(held: (typeof SERVER_TOOL_SCANNED_FIELDS)[number]): unk
 	];
 }
 
-/** A digit-only held value, under a secret-named variable of the stored-form cases' own mask. */
-const NUMBER_VALUE = "73190428865";
-const NUMBER_MARKER = "[REDACTED:env:SERVICE_NUMBER_TOKEN]";
-
 /**
  * A tool result detail whose `toJSON` leaves out an own field that holds a value, beside a string
  * long enough that persistence truncates it and rebuilds the object from its own fields.
@@ -3536,11 +3549,7 @@ for (const backend of backends) {
 
 		for (const form of STORED_FORM_DETAILS) {
 			it(`masks a value a tool result's details hold as ${form.name}, in the form the session line stores it`, async () => {
-				const formMask = new storeMask.SessionStoreMasker({
-					env: () => ({ SERVICE_API_KEY: ENV_VALUE, SERVICE_NUMBER_TOKEN: NUMBER_VALUE }),
-					agentDir: tmp.join("agent"),
-				}).snapshot(cwd);
-				const manager = await maskedSession(formMask);
+				const manager = await maskedSession(numberMask());
 				const detail = form.detail();
 				manager.appendMessage(
 					assistant([{ type: "toolCall", id: "call-form", name: "lookup", arguments: {} }], {
@@ -3760,11 +3769,8 @@ describe("copy-on-write of the stored copy", () => {
 	it("returns an entry of plain data with nothing to mask as itself, and copies any other node as its plain stored form", () => {
 		const content = [{ type: "text", text: "plain" }];
 		const plainData = { list: [1, Number.NaN, null, "plain", [true]], nested: { flag: false }, absent: undefined };
-		const entryWith = (id: string, details: unknown): StoredRecord => ({
-			id,
-			parentId: null,
-			timestamp: KEEP_TIMESTAMP,
-			...messageEntry({
+		const entryWith = (id: string, details: unknown): StoredRecord =>
+			storedMessageEntry(id, {
 				role: "toolResult",
 				toolCallId: "cow-call",
 				toolName: "lookup",
@@ -3772,8 +3778,7 @@ describe("copy-on-write of the stored copy", () => {
 				details,
 				isError: false,
 				timestamp: NOW,
-			}),
-		});
+			});
 		const plain = entryWith("cow-plain", plainData);
 		const withNodes = entryWith("cow-nodes", { plainData, at: new Date(0), count: 12n, boxed: new String("plain") });
 		const copy = maskSessionEntry(withNodes, mask);
@@ -3791,15 +3796,33 @@ describe("copy-on-write of the stored copy", () => {
 		}).toEqual({ plainSame: true, nodesCopied: true, nodesAsStored: true, untouchedShared: true });
 	});
 
-	const boundEntry = (message: StoredRecord): StoredRecord => ({
-		id: "bound-entry",
-		parentId: null,
-		timestamp: KEEP_TIMESTAMP,
-		...messageEntry(message),
+	it("leaves a boxed BigInt, which the session line cannot store, as it is, so the write fails as with masking off", () => {
+		const entry = storedMessageEntry("boxed-bigint", {
+			role: "toolResult",
+			toolCallId: "boxed-call",
+			toolName: "lookup",
+			content: [{ type: "text", text: "plain" }],
+			details: { count: Object(12n) },
+			isError: false,
+			timestamp: NOW,
+		});
+		const outcome = (record: unknown): string => {
+			try {
+				return `stored ${stringifyJson(record)}`;
+			} catch (error) {
+				return error instanceof TypeError ? "TypeError" : "another error";
+			}
+		};
+		const masked = maskSessionEntry(entry, mask);
+		expect({ unmasked: outcome(entry), masked: outcome(masked) }).toEqual({
+			unmasked: "TypeError",
+			masked: "TypeError",
+		});
 	});
+
 	for (const { name, message, bound } of NON_PLAIN_BINDINGS) {
 		it(`keeps ${name} whose free fields hold a Date, a URL or a bigint and no held value`, () => {
-			const entry = boundEntry(message(false));
+			const entry = storedMessageEntry("bound-entry", message(false));
 			const stored = stringifyJson(maskSessionEntry(entry, mask)) ?? "";
 			expect({
 				name,
@@ -3809,7 +3832,7 @@ describe("copy-on-write of the stored copy", () => {
 		});
 
 		it(`leaves out the binding of ${name} whose free fields hold a value beside them`, () => {
-			const entry = boundEntry(message(true));
+			const entry = storedMessageEntry("bound-entry", message(true));
 			const stored = stringifyJson(maskSessionEntry(entry, mask)) ?? "";
 			expect({
 				name,
@@ -3821,10 +3844,10 @@ describe("copy-on-write of the stored copy", () => {
 });
 
 /**
- * T4's generated cases: each listed position on the path of a kept field of {@link KEEP_ROWS}, read
- * from the rows' own fixtures, written in every shape but the one it declares and holding a held
- * value, is stored without one; a number or `null` there is stored as it is (KR13). The positions
- * are derived here, not read from the walk's table, so the describe also runs on an older head.
+ * Generated cases: each listed position on the path of a kept field of {@link KEEP_ROWS}, written in
+ * every shape but the one it declares and holding a held value, is stored without one; a number or
+ * `null` there is stored as it is (KR13). The positions come from the rows' own fixtures, not from
+ * the walk's table, so the test does not depend on the table it checks.
  */
 describe("generated: every listed position in every wrong shape", () => {
 	type Kind = "string field" | "array field" | "container" | "element";
@@ -3970,10 +3993,7 @@ describe("generated: every listed position in every wrong shape", () => {
 				const { at, value } = written(position, shape);
 				const record = neutral(row.record);
 				setAt(record, at, value);
-				const generatedMask = new storeMask.SessionStoreMasker({
-					env: () => ({ SERVICE_API_KEY: ENV_VALUE, SERVICE_NUMBER_TOKEN: NUMBER_VALUE }),
-					agentDir: tmp.join("agent"),
-				}).snapshot(cwd);
+				const generatedMask = numberMask();
 				const masked =
 					row.kind === "btw" ? maskBtwRecord(record, generatedMask) : maskSessionEntry(record, generatedMask);
 				const stored = stringifyJson(masked) ?? "";
@@ -4012,12 +4032,10 @@ describe("generated: every listed position in every wrong shape", () => {
 	];
 	for (const { name, block } of SERVER_TOOL_RULES) {
 		it(`server-tool element rule: ${name}, stores no held value`, () => {
-			const entry = {
-				id: "generated-server-tool",
-				parentId: null,
-				timestamp: KEEP_TIMESTAMP,
-				...messageEntry(assistantRecord([{ type: "anthropicServerTool", block }])),
-			};
+			const entry = storedMessageEntry(
+				"generated-server-tool",
+				assistantRecord([{ type: "anthropicServerTool", block }]),
+			);
 			const stored = stringifyJson(maskSessionEntry(entry, mask)) ?? "";
 			expect({ name, held: stored.includes(ENV_VALUE) }).toEqual({ name, held: false });
 		});
