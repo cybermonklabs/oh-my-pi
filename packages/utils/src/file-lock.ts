@@ -39,7 +39,15 @@ function tryAcquireLock(lockPath: string): NativeFileLock | null {
 	return null;
 }
 
-/** Acquire an exclusive lease without waiting for its holder to release it; `null` while another holder owns it. */
+/**
+ * Acquire an exclusive lease without waiting for its holder to release it;
+ * `null` while another holder owns it. On Linux a refused claim is retried,
+ * because under gVisor a probe can make a free lease look taken for a few
+ * milliseconds: for at most 200 ms, and for about 50 ms while another process
+ * holds the lease, blocking the calling thread meanwhile. A claim of a lease
+ * this process holds answers `null` at once. `isFileLockHeld` tells whether a
+ * lease is held without that wait.
+ */
 export function tryAcquireFileLock(filePath: string): FileLockHandle | null {
 	return tryAcquireLock(getLockPath(filePath));
 }

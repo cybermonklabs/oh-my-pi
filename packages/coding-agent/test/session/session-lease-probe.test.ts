@@ -1,10 +1,22 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { FileSessionStorage, isSessionLeaseHeld } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	FileSessionStorage,
+	isSessionLeaseHeld,
+	tryAcquireSessionLease,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const SESSION_STORAGE_MODULE = path.join(import.meta.dir, "../../src/session/session-storage.ts");
 const CLI = path.join(import.meta.dir, "../../src/cli.ts");
+/** Sessions another process writes while this one asks for their leases. */
+const HELD_ELSEWHERE = 20;
+/**
+ * Asking for one lease another process holds is one probe of the kernel, well
+ * under a millisecond; the bound leaves room for a loaded host. A claim waits
+ * about 50 ms on each lease another process holds: over 1,000 ms for the 20.
+ */
+const HELD_ELSEWHERE_BOUND_MS = 250;
 
 function uniqueId(label: string): string {
 	return `lease-probe-${label}-${process.pid}-${Bun.nanoseconds()}`;
@@ -29,17 +41,19 @@ function spawnScript(tempDir: TempDir, name: string, body: string[], args: strin
 	);
 }
 
-/** Another process that claims `sessionId` like a writing omp, reports `claimed`, and holds it until stdin closes. */
-async function spawnOwner(tempDir: TempDir, sessionId: string) {
+/** Another process that claims each of `sessionIds` like a writing omp, reports `claimed`, and holds them until stdin closes. */
+async function spawnOwner(tempDir: TempDir, ...sessionIds: string[]) {
 	const child = await spawnScript(
 		tempDir,
 		"owner.ts",
 		[
-			"const release = new FileSessionStorage().claimSession(process.argv[2], process.argv[3]);",
-			'process.stdout.write(release ? "claimed\\n" : "refused\\n");',
+			"const [sessionPath, ...ids] = process.argv.slice(2);",
+			"const storage = new FileSessionStorage();",
+			"const releases = ids.map(id => storage.claimSession(id, sessionPath));",
+			'process.stdout.write(releases.every(Boolean) ? "claimed\\n" : "refused\\n");',
 			"for await (const _ of console) {}",
 		],
-		[sessionId, tempDir.join("owner-session.jsonl")],
+		[tempDir.join("owner-session.jsonl"), ...sessionIds],
 	);
 	const reader = child.stdout.getReader();
 	const { value } = await reader.read();
@@ -103,6 +117,34 @@ describe("session lease probe", () => {
 		owner.stdin.end();
 		await owner.exited;
 		expect(isSessionLeaseHeld(sessionId)).toBe(false);
+	}, 30_000);
+
+	it("refuses at once each of 20 leases another process holds, and grants them once it exits", async () => {
+		// `omp gc` and the checks of whether a journal is running ask for the
+		// lease of every session they meet. Answering a lease held elsewhere
+		// after a claim's wait blocks them about 50 ms for each session another
+		// omp runs: about a second beside 20 of them.
+		using tempDir = TempDir.createSync("@omp-lease-elsewhere-");
+		const sessionIds = Array.from({ length: HELD_ELSEWHERE }, (_, index) => uniqueId(`elsewhere-${index}`));
+		const owner = await spawnOwner(tempDir, ...sessionIds);
+		try {
+			// The quickest of three passes, so one stall of the host does not decide it.
+			let quickestMs = Number.POSITIVE_INFINITY;
+			for (let pass = 0; pass < 3; pass++) {
+				const start = Bun.nanoseconds();
+				const leases = sessionIds.map(id => tryAcquireSessionLease(id));
+				quickestMs = Math.min(quickestMs, (Bun.nanoseconds() - start) / 1e6);
+				for (const lease of leases) lease?.release();
+				expect(leases).toEqual(sessionIds.map(() => null));
+			}
+			expect(quickestMs).toBeLessThanOrEqual(HELD_ELSEWHERE_BOUND_MS);
+		} finally {
+			owner.stdin.end();
+			await owner.exited;
+		}
+		const leases = sessionIds.map(id => tryAcquireSessionLease(id));
+		for (const lease of leases) lease?.release();
+		expect(leases.map(lease => lease !== null)).toEqual(sessionIds.map(() => true));
 	}, 30_000);
 
 	it("counts a lease this process holds as held", () => {
