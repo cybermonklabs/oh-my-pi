@@ -131,6 +131,7 @@
 ### Changed
 
 - Secret obfuscation and the stream redaction of `omp stream` and `/record` no longer take `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS` from the environment: they hold git configuration key names and an askpass program path, not secrets, so text that holds those common strings reaches the model provider, stream viewers and recordings unchanged
+- Secret obfuscation no longer reads a `secrets.yml` larger than 1 MiB, or one that grows while it is read: it skips the file and logs a warning, as stored-session masking does
 - Merging a task's changes back (three-way patch apply, cherry-picking its branch, and restoring stashed edits) now reports a conflict when both sides edit adjacent lines, as git does, instead of merging both edits ([#16410](https://github.com/can1357/oh-my-pi/pull/16410) by [@sjawhar](https://github.com/sjawhar))
 - `async.maxJobs` now sets the cap on background jobs running at once in a session and its subagents without the fixed 100 ceiling, and `0` means no limit; the default stays 100
 - A session left working in a detached tmux pane no longer spends a slice of a core animating a screen nobody can see: the status line drops to one frame a second and the terminal-title spinner pauses until a client is watching again ([#17404](https://github.com/can1357/oh-my-pi/pull/17404) by [@sjawhar](https://github.com/sjawhar))

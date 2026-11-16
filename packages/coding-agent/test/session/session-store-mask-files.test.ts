@@ -6,7 +6,8 @@
  * the marker and no held value, while the live `/btw` record keeps the value and the store's
  * next write raises no conflict. The output files hold a multi-line held value as JSON text,
  * escaped: with the setting on they hold its marker and neither the value nor its escaped form.
- * With the setting off, every file holds the value.
+ * With the setting off, every file holds the value. A mask build that throws for the output files
+ * fails only their writes: the run and a later turn still return their results.
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -21,13 +22,16 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import * as storeMatcher from "@oh-my-pi/pi-coding-agent/secrets/session-store-matcher";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { type BtwHistoryRecord, BtwHistoryStore } from "@oh-my-pi/pi-coding-agent/session/btw-history";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
-import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, logger, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { plainYml } from "../helpers/masker-sources";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 
 const HELD_VALUE = "zq9-synthetic-service-4821";
@@ -197,8 +201,22 @@ function respond(context: Context): MockResponse {
 	return { content: [{ type: "toolCall", id: `yield-${label}`, name: "yield", arguments: { type: "result", data } }] };
 }
 
-/** A structured subagent run on pi-ai's mock model, then a later turn that yields again. */
-async function runSubagentTwice(maskOn: boolean): Promise<{ afterRun: OutputFiles; afterLaterTurn: OutputFiles }> {
+/** The run's result and the later turn's, and what `look` found in the artifacts directory after each. */
+interface SubagentTurns<T> {
+	first: SingleResult;
+	afterRun: T;
+	later: SingleResult;
+	afterLaterTurn: T;
+}
+
+/**
+ * A structured subagent run on pi-ai's mock model, then a later turn that yields again; `look` reads
+ * the artifacts directory after each.
+ */
+async function runSubagentTwice<T>(
+	maskOn: boolean,
+	look: (artifactsDir: string) => Promise<T>,
+): Promise<SubagentTurns<T>> {
 	const cwd = tmp.join("home", "work");
 	const artifactsDir = tmp.join("artifacts");
 	await fs.mkdir(cwd, { recursive: true });
@@ -237,7 +255,7 @@ async function runSubagentTwice(maskOn: boolean): Promise<{ afterRun: OutputFile
 			outputSchema: OUTPUT_SCHEMA,
 		});
 		if (first.exitCode !== 0) throw new Error("The subagent's run failed");
-		const afterRun = await readOutputFiles(artifactsDir);
+		const afterRun = await look(artifactsDir);
 		// No settings of its own: the turn reads the live subagent session's, which read through to the run's.
 		const later = await runSubagentFollowUpTurn({
 			id: AGENT_ID,
@@ -248,7 +266,7 @@ async function runSubagentTwice(maskOn: boolean): Promise<{ afterRun: OutputFile
 			storeMaskCwd: settings.getCwd(),
 		});
 		if (later.exitCode !== 0) throw new Error("The subagent's later turn failed");
-		return { afterRun, afterLaterTurn: await readOutputFiles(artifactsDir) };
+		return { first, afterRun, later, afterLaterTurn: await look(artifactsDir) };
 	} finally {
 		authStorage.close();
 	}
@@ -297,7 +315,7 @@ describe("secrets.maskSessionStore on the files outside the session store", () =
 		it(
 			`stores the subagent's <id>.md and <id>.json with ${outcome}, after the run and after a later turn`,
 			async () => {
-				const { afterRun, afterLaterTurn } = await runSubagentTwice(maskOn);
+				const { afterRun, afterLaterTurn } = await runSubagentTwice(maskOn, readOutputFiles);
 
 				expect([
 					holds("<id>.md after the run", afterRun.md),
@@ -330,4 +348,42 @@ describe("secrets.maskSessionStore on the files outside the session store", () =
 			CASE_TIMEOUT_MS,
 		);
 	}
+
+	it(
+		"K31: a mask build that throws for <id>.md and <id>.json fails only their writes and logs it; the run and a later turn still return their results",
+		async () => {
+			// The subagent's session writes in its own cwd (`runSubagentTwice`'s `home/work`), whose project
+			// secrets.yml gives that mask a value of its own. The output files are masked for the parent's
+			// cwd, whose mask lacks that value: only the builds for the output files throw.
+			const ownValue = "work-project-plain-value-17";
+			await Bun.write(tmp.join("home", "work", ".omp", "secrets.yml"), plainYml(ownValue));
+			const build = storeMatcher.buildSessionStoreMatcher;
+			spyOn(storeMatcher, "buildSessionStoreMatcher").mockImplementation((literals, regexes) => {
+				if (!literals.has(ownValue)) throw new Error("injected output-file mask failure");
+				return build(literals, regexes);
+			});
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const written = async (artifactsDir: string): Promise<{ md: boolean; json: boolean }> => ({
+				md: await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).exists(),
+				json: await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).exists(),
+			});
+
+			const { first, afterRun, later, afterLaterTurn } = await runSubagentTwice(true, written);
+			expect([first.output.includes("FIRST_RUN_REPORT"), later.output.includes(LATER_TURN)]).toEqual([true, true]);
+			expect([afterRun, afterLaterTurn]).toEqual([
+				{ md: false, json: false },
+				{ md: false, json: false },
+			]);
+			const failure = {
+				agentId: AGENT_ID,
+				path: tmp.join("artifacts", `${AGENT_ID}.md`),
+				error: expect.stringContaining("injected output-file mask failure"),
+			};
+			const logged = warn.mock.calls
+				.filter(call => call[0] === "Failed to persist subagent output artifact")
+				.map(call => call[1]);
+			expect(logged).toEqual([failure, failure]);
+		},
+		CASE_TIMEOUT_MS,
+	);
 });
