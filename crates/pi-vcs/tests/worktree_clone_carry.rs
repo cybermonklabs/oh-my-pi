@@ -641,3 +641,55 @@ fn keeping_changes_never_reads_a_tracked_path_through_a_symlink() {
 		assert_eq!(snapshot(&outside), outside_before, "{clone:?}");
 	}
 }
+
+/// A tracked file the source replaced with a directory comes across as that
+/// directory with its contents, staged or not, on both paths: the file the
+/// new tree checked out is replaced, and nothing is skipped.
+#[test]
+fn keeping_changes_carries_a_directory_that_replaced_a_tracked_file() {
+	for clone in [WorktreeClone::Auto, WorktreeClone::Off] {
+		for staged in [false, true] {
+			let (temp, source, repo) = fixture();
+			if clone == WorktreeClone::Auto && !clone_works_on(temp.path()) {
+				eprintln!("SKIP: no working clone backend on this filesystem");
+				continue;
+			}
+			write(&source, "item", "committed file\n");
+			git(&source, &["add", "item"]);
+			git(&source, &["commit", "-qm", "track item"]);
+			fs::remove_file(source.join("item")).unwrap();
+			write(&source, "item/child", "uncommitted work\n");
+			if staged {
+				git(&source, &["add", "-A", "item"]);
+			}
+			let source_status = git(&source, &["status", "--porcelain", "--untracked-files=all"]);
+			let target = temp.path().join("target");
+			let result = repo
+				.worktree_add(&target, "HEAD", WorktreeAddOptions {
+					detach: true,
+					clone,
+					keep_changes: true,
+					lock: None,
+				})
+				.unwrap();
+			assert_eq!(
+				result.cloned_with.is_some(),
+				clone == WorktreeClone::Auto,
+				"{:?}",
+				result.clone_error
+			);
+			assert_eq!(
+				fs::read_to_string(target.join("item/child"))
+					.ok()
+					.as_deref(),
+				Some("uncommitted work\n"),
+				"{clone:?} staged {staged}"
+			);
+			assert_eq!(
+				git(&target, &["status", "--porcelain", "--untracked-files=all"]),
+				source_status,
+				"{clone:?} staged {staged}"
+			);
+		}
+	}
+}

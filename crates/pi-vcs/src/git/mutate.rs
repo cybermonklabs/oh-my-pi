@@ -1900,20 +1900,20 @@ fn prune_nonrelocatable_clone_dirs(root: &Path) -> Result<BTreeSet<PathBuf>> {
 
 /// Carry one live source path without following symlinks, including a
 /// deletion. Used both by ordinary-checkout seeding and by tracked files
-/// restored after clone exclusions. Git does not see a path beyond a
+/// restored after clone exclusions. Git does not see a path behind a
 /// symlinked or non-directory ancestor, so in the source such a path is
-/// deleted, and in the new tree nothing is written or removed through one.
+/// deleted. In the new tree, an ancestor that is not a real directory where
+/// the source has one (a tracked file or symlink the source replaced with a
+/// directory) is replaced, never followed, and a path the source turned into
+/// a directory loses the file or symlink it was.
 fn copy_worktree_path(source: &Path, target: &Path, relative: &gix::bstr::BStr) -> Result<()> {
 	let relative = relative.to_path_lossy();
-	if behind_link(target, &relative)? {
-		return Ok(());
-	}
 	let src = source.join(&relative);
 	let dst = target.join(&relative);
-	let found = if behind_link(source, &relative)? {
-		Err(std::io::ErrorKind::NotFound.into())
-	} else {
+	let found = if replace_target_ancestors(source, target, &relative)? {
 		fs::symlink_metadata(&src)
+	} else {
+		Err(std::io::ErrorKind::NotFound.into())
 	};
 	match found {
 		Ok(meta) if meta.file_type().is_symlink() => {
@@ -1930,14 +1930,60 @@ fn copy_worktree_path(source: &Path, target: &Path, relative: &gix::bstr::BStr) 
 			}
 			fs::copy(&src, &dst)?;
 		},
+		// The entries below it are carried one by one; what the path was in
+		// the new tree, if not a directory, goes.
+		Ok(meta) if meta.is_dir() => {
+			if fs::symlink_metadata(&dst).is_ok_and(|meta| !meta.is_dir()) {
+				remove_existing(&dst)?;
+			}
+		},
 		Ok(_) => {},
 		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-			remove_existing(&dst)?;
-			prune_empty_parents(target, dst.parent(), &BTreeSet::new())?;
+			if !behind_link(target, &relative)? {
+				remove_existing(&dst)?;
+				prune_empty_parents(target, dst.parent(), &BTreeSet::new())?;
+			}
 		},
 		Err(err) => return Err(err.into()),
 	}
 	Ok(())
+}
+
+/// Walks the directories between each root and the last component of
+/// `relative`. Returns `false` when one of the source's is a symlink, not a
+/// directory, or missing, so git sees the path as deleted. Until then, each
+/// target ancestor that is a file or symlink where the source has a real
+/// directory is removed, so the path is written below a real directory and
+/// never through a link.
+fn replace_target_ancestors(source: &Path, target: &Path, relative: &Path) -> Result<bool> {
+	let Some(parent) = relative.parent() else {
+		return Ok(true);
+	};
+	let (mut src_dir, mut dst_dir) = (source.to_path_buf(), target.to_path_buf());
+	let mut dst_present = true;
+	for component in parent.components() {
+		src_dir.push(component);
+		match fs::symlink_metadata(&src_dir) {
+			Ok(meta) if meta.is_dir() => {},
+			Ok(_) => return Ok(false),
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+			Err(err) => return Err(err.into()),
+		}
+		if !dst_present {
+			continue;
+		}
+		dst_dir.push(component);
+		match fs::symlink_metadata(&dst_dir) {
+			Ok(meta) if meta.is_dir() => {},
+			Ok(_) => {
+				remove_existing(&dst_dir)?;
+				dst_present = false;
+			},
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => dst_present = false,
+			Err(err) => return Err(err.into()),
+		}
+	}
+	Ok(true)
 }
 
 /// Whether a directory between `root` and the last component of `relative`
