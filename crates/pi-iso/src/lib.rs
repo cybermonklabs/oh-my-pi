@@ -25,7 +25,10 @@
 	allow(unused_imports, dead_code, reason = "platform without an isolation backend")
 )]
 
-use std::{fmt, path::Path};
+use std::{
+	fmt,
+	path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
 
@@ -42,6 +45,7 @@ mod windows_block_clone;
 mod zfs;
 
 pub use diff::{ChangeKind, Diff, FileChange};
+pub use tree::CloneExclusions;
 
 /// Stable identifier for which backend a build was compiled with.
 ///
@@ -271,14 +275,16 @@ pub trait IsolationBackend: Send + Sync {
 
 	fn start(&self, lower: &Path, merged: &Path) -> IsoResult<()>;
 
-	/// Clone `lower` into `merged` copy-on-write, omitting named top-level
-	/// entries.
+	/// Clone `lower` into `merged` copy-on-write, leaving out what
+	/// `exclusions` names, its paths taken relative to `lower`. A `merged`
+	/// inside `lower` is not cloned into itself. Returns the directories,
+	/// relative to `lower`, that a marker of `exclusions` left out.
 	fn clone_tree(
 		&self,
 		_lower: &Path,
 		_merged: &Path,
-		_skip: &[&std::ffi::OsStr],
-	) -> IsoResult<()> {
+		_exclusions: &CloneExclusions,
+	) -> IsoResult<Vec<PathBuf>> {
 		Err(IsoError::unavailable(format!("{} cannot clone a directory tree in place", self.kind())))
 	}
 

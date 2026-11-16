@@ -8,13 +8,13 @@
 //! is no mount or kernel state to undo, so [`stop`](IsolationBackend::stop) is
 //! a recursive remove.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
 #[cfg(not(target_os = "linux"))]
 use crate::IsoError;
-use crate::{BackendKind, IsoResult, IsolationBackend, ProbeResult};
+use crate::{BackendKind, CloneExclusions, IsoResult, IsolationBackend, ProbeResult};
 
 pub struct LinuxReflinkBackend;
 
@@ -51,14 +51,19 @@ impl IsolationBackend for LinuxReflinkBackend {
 		}
 	}
 
-	fn clone_tree(&self, lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	fn clone_tree(
+		&self,
+		lower: &Path,
+		merged: &Path,
+		exclusions: &CloneExclusions,
+	) -> IsoResult<Vec<PathBuf>> {
 		#[cfg(target_os = "linux")]
 		{
-			imp::clone_tree(lower, merged, skip)
+			imp::clone_tree(lower, merged, exclusions)
 		}
 		#[cfg(not(target_os = "linux"))]
 		{
-			let _ = (lower, merged, skip);
+			let _ = (lower, merged, exclusions);
 			Err(IsoError::unavailable("Linux FICLONE reflink isolation is only available on Linux"))
 		}
 	}
@@ -81,26 +86,31 @@ mod imp {
 	use std::{
 		fs::{self, FileTimes, FileType},
 		os::unix::fs::PermissionsExt,
-		path::Path,
+		path::{Path, PathBuf},
 	};
 
 	use crate::{
-		IsoError, IsoResult, cow,
+		CloneExclusions, IsoError, IsoResult, cow,
 		tree::{self, TreeCopy},
 	};
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
-		clone_tree(lower, merged, &[])
+		clone_tree(lower, merged, &CloneExclusions::default()).map(drop)
 	}
 
-	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	pub fn clone_tree(
+		lower: &Path,
+		merged: &Path,
+		exclusions: &CloneExclusions,
+	) -> IsoResult<Vec<PathBuf>> {
 		let lower = tree::canonical_existing_dir(lower, "reflink source", IsoError::other)?;
 		tree::prepare_destination(merged, "reflink clone", tree::remove_existing)?;
 		let result = (|| {
 			fs::create_dir(merged)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-			tree::copy_dir_contents(&lower, merged, skip, &Reflink)?;
-			Reflink.finish_dir(&lower, merged)
+			let marked = tree::copy_dir_contents(&lower, merged, exclusions, &Reflink)?;
+			Reflink.finish_dir(&lower, merged)?;
+			Ok(marked)
 		})();
 		if result.is_err() {
 			let _ = fs::remove_dir_all(merged);

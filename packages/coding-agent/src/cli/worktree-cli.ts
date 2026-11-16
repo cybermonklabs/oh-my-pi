@@ -53,7 +53,14 @@ export interface AddWorktreeOptions {
 	forceBranch?: string;
 	detach: boolean;
 	quiet: boolean;
+	/** Lock the new worktree, as `git worktree add --lock`. */
+	lock: boolean;
+	/** The lock's reason, as `git worktree add --reason`; requires {@link lock}. */
+	reason?: string;
 }
+
+/** The reason git records for `git worktree add --lock` without `--reason`. */
+const GIT_DEFAULT_LOCK_REASON = "added with --lock";
 
 export interface ListWorktreesOptions {
 	json: boolean;
@@ -99,6 +106,9 @@ export async function stopRetainedMount(dir: string): Promise<boolean> {
 export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (options.branch && options.forceBranch) {
 		throw new Error("fatal: options '-b' and '-B' cannot be used together");
+	}
+	if (options.reason !== undefined && !options.lock) {
+		throw new Error("fatal: the option '--reason' requires '--lock'");
 	}
 	const cwd = path.resolve(options.cwd ?? process.cwd());
 	const repository = vcs.requireGit(cwd);
@@ -151,6 +161,7 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 		detach,
 		clone: cfgWorktreeClone.get(settings),
 		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
+		lock: options.lock ? (options.reason ?? GIT_DEFAULT_LOCK_REASON) : undefined,
 	});
 	if (!options.quiet) {
 		console.log(`HEAD is now at ${shortSha} ${subject}`);

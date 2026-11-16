@@ -8,13 +8,13 @@
 //! file. There is no mount/session state to undo, so
 //! [`stop`](IsolationBackend::stop) is a recursive remove.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
 #[cfg(not(windows))]
 use crate::IsoError;
-use crate::{BackendKind, IsoResult, IsolationBackend, ProbeResult};
+use crate::{BackendKind, CloneExclusions, IsoResult, IsolationBackend, ProbeResult};
 
 pub struct WindowsBlockCloneBackend;
 
@@ -51,14 +51,19 @@ impl IsolationBackend for WindowsBlockCloneBackend {
 		}
 	}
 
-	fn clone_tree(&self, lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	fn clone_tree(
+		&self,
+		lower: &Path,
+		merged: &Path,
+		exclusions: &CloneExclusions,
+	) -> IsoResult<Vec<PathBuf>> {
 		#[cfg(windows)]
 		{
-			imp::clone_tree(lower, merged, skip)
+			imp::clone_tree(lower, merged, exclusions)
 		}
 		#[cfg(not(windows))]
 		{
-			let _ = (lower, merged, skip);
+			let _ = (lower, merged, exclusions);
 			Err(IsoError::unavailable("Windows block-clone isolation is only available on Windows"))
 		}
 	}
@@ -82,7 +87,7 @@ mod imp {
 		fs::{self, File, FileTimes, FileType, OpenOptions},
 		io,
 		os::windows::fs::{FileTimesExt, OpenOptionsExt},
-		path::Path,
+		path::{Path, PathBuf},
 	};
 
 	use windows_sys::Win32::Storage::FileSystem::{
@@ -90,22 +95,27 @@ mod imp {
 	};
 
 	use crate::{
-		IsoError, IsoResult, cow,
+		CloneExclusions, IsoError, IsoResult, cow,
 		tree::{self, TreeCopy},
 	};
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
-		clone_tree(lower, merged, &[])
+		clone_tree(lower, merged, &CloneExclusions::default()).map(drop)
 	}
 
-	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	pub fn clone_tree(
+		lower: &Path,
+		merged: &Path,
+		exclusions: &CloneExclusions,
+	) -> IsoResult<Vec<PathBuf>> {
 		let lower = tree::canonical_existing_dir(lower, "block-clone source", IsoError::other)?;
 		tree::prepare_destination(merged, "block clone", remove_path)?;
 		let result = (|| {
 			fs::create_dir_all(merged)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-			tree::copy_dir_contents(&lower, merged, skip, &BlockClone)?;
-			BlockClone.finish_dir(&lower, merged)
+			let marked = tree::copy_dir_contents(&lower, merged, exclusions, &BlockClone)?;
+			BlockClone.finish_dir(&lower, merged)?;
+			Ok(marked)
 		})();
 		if result.is_err() {
 			let _ = remove_path(merged);

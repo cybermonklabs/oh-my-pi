@@ -16,7 +16,8 @@ use std::{fs::FileType, path::Path};
 use async_trait::async_trait;
 
 use crate::{
-	BackendKind, IsoError, IsoResult, IsolationBackend, ProbeResult, command_failed,
+	BackendKind, CloneExclusions, IsoError, IsoResult, IsolationBackend, ProbeResult,
+	command_failed,
 	tree::{self, TreeCopy},
 };
 
@@ -268,7 +269,7 @@ fn copy_path(src: &Path, dst: &Path) -> IsoResult<()> {
 	} else if meta.file_type().is_dir() {
 		std::fs::create_dir_all(dst)
 			.map_err(|err| IsoError::other(format!("create {}: {err}", dst.display())))?;
-		tree::copy_dir_contents(src, dst, &[], &Rcopy)?;
+		tree::copy_dir_contents(src, dst, &CloneExclusions::default(), &Rcopy)?;
 		Rcopy.finish_dir(src, dst)
 	} else {
 		Rcopy.file(src, dst, meta.file_type())
@@ -282,7 +283,7 @@ fn copy_path(src: &Path, dst: &Path) -> IsoResult<()> {
 fn recursive_copy(lower: &Path, merged: &Path) -> IsoResult<()> {
 	std::fs::create_dir_all(merged)
 		.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-	tree::copy_dir_contents(lower, merged, &[], &Rcopy)
+	tree::copy_dir_contents(lower, merged, &CloneExclusions::default(), &Rcopy).map(drop)
 }
 
 struct Rcopy;

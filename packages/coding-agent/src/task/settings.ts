@@ -88,6 +88,19 @@ export const cfgWorktreeClone = register({
 	},
 });
 
+export const cfgWorktreeLockReason = register({
+	id: "worktree.lockReason",
+	type: "string",
+	default: undefined,
+	ui: {
+		tab: "tasks",
+		group: "Isolation",
+		label: "Lock Worktrees Added in Bash",
+		description:
+			"Lock each worktree a `git worktree add` in bash creates through the clone rewrite, with this reason, as `git worktree add --lock --reason` does, so `git worktree prune` keeps its registration while the tree is out of reach. A command's own `--lock` keeps its own reason. Unset leaves them unlocked",
+	},
+});
+
 export const cfgWorktreeCleanSource = register({
 	id: "worktree.cleanSource",
 	protocolDefault: ["rpc", "acp"],

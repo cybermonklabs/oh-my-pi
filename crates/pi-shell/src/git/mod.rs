@@ -478,7 +478,7 @@ struct Plan {
 }
 
 impl Plan {
-	/// Creates and optionally locks the worktree.
+	/// Creates the worktree, locked when the request asked for it.
 	fn add(self) -> pi_vcs::Result<Created> {
 		self
 			.repo
@@ -486,17 +486,9 @@ impl Plan {
 				detach:       self.detach,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				lock:         self.lock,
 			})?;
 		let linked = GitRepo::require(&self.path)?;
-		if let Some(reason) = &self.lock {
-			// git's `write_file` terminates non-empty content with a newline.
-			let content = if reason.is_empty() {
-				String::new()
-			} else {
-				format!("{reason}\n")
-			};
-			std::fs::write(linked.info().git_dir.join("locked"), content)?;
-		}
 		Ok(Created {
 			head:      linked.head_sha()?.unwrap_or_default(),
 			oneline:   linked.log_onelines(1)?.pop().unwrap_or_default(),

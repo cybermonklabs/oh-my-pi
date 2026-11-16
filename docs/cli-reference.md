@@ -332,8 +332,22 @@ CMake build trees in the new worktree so their absolute paths name the new
 checkout. Tracked files inside excluded directories are restored from Git;
 when keeping changes, their live source contents and staged state are preserved.
 
+A clone carries only what the source tracks or ignores. A path the source
+neither tracks nor ignores is uncommitted work, carried only when keeping the
+source's changes. A directory below the root that holds a `.git` entry is
+another checkout (a submodule, a linked worktree, a cloned dependency) and is
+never carried, even inside an ignored directory: a submodule's directory is
+left empty, as `git worktree add` leaves it. A destination inside the source is
+not copied into itself.
+
 Clean clones also discard carried files that are untracked under the target
-commit's own ignore rules, after its tree and index have been written. Caches
-ignored by the target remain, even if the source did not ignore them. Nested
-repositories are preserved and symlinks are not followed. This target-ignore
+commit's own ignore rules, after its tree and index have been written; caches
+the target ignores remain. Symlinks are not followed. This target-ignore
 cleanup is skipped when keeping the source's uncommitted changes.
+
+`omp worktree add --lock [--reason <reason>]` locks the new worktree as
+`git worktree add --lock` does, so `git worktree prune` keeps its registration
+while the tree is out of reach. `worktree.lockReason` locks every worktree a
+`git worktree add` in bash creates through the clone rewrite with that reason,
+for setups whose `git` wrapper locks every add, since the rewrite runs omp in
+place of `git`; a command's own `--lock` keeps its own reason.

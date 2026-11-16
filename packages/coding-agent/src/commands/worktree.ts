@@ -55,6 +55,13 @@ export default class Worktree extends Command {
 			description: "Suppress add output",
 			default: false,
 		}),
+		lock: Flags.boolean({
+			description: "Lock the new worktree, as git worktree add --lock (add)",
+			default: false,
+		}),
+		reason: Flags.string({
+			description: "Reason recorded for --lock (add)",
+		}),
 		all: Flags.boolean({
 			description: "Clear every entry, including live PR-checkout worktrees (clear)",
 			default: false,
@@ -73,6 +80,7 @@ export default class Worktree extends Command {
 		"omp worktree add ../feature",
 		"omp worktree add -b feature ../feature origin/main",
 		"omp worktree add --detach ../review HEAD~2",
+		"omp worktree add --lock --reason 'on a removable disk' ../portable",
 		"omp worktree clear",
 		"omp worktree clear --dry-run",
 		"omp worktree clear --all",
@@ -98,6 +106,8 @@ export default class Worktree extends Command {
 					forceBranch: flags["force-branch"],
 					detach: flags.detach ?? false,
 					quiet: flags.quiet ?? false,
+					lock: flags.lock ?? false,
+					reason: flags.reason,
 				});
 			} catch (error) {
 				console.error(error instanceof Error ? error.message : String(error));

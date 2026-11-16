@@ -119,7 +119,7 @@ pub enum WorktreeClone {
 }
 
 /// Options for linked-worktree creation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeAddOptions {
 	pub detach:       bool,
 	pub clone:        WorktreeClone,
@@ -127,6 +127,12 @@ pub struct WorktreeAddOptions {
 	/// into the new worktree instead of starting from a clean tree. Requires
 	/// the target ref to resolve to the source `HEAD` commit.
 	pub keep_changes: bool,
+	/// Lock the new worktree with this reason, as
+	/// `git worktree add --lock --reason <reason>` does, so `git worktree
+	/// prune` keeps its registration while the tree is out of reach. Git
+	/// records `added with --lock` for a bare `--lock`; callers pass that
+	/// text themselves. `None` leaves the worktree unlocked.
+	pub lock:         Option<String>,
 }
 
 /// Outcome of linked-worktree creation.

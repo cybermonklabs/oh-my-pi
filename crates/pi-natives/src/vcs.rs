@@ -132,6 +132,10 @@ pub struct VcsWorktreeAddOptions {
 	/// Carry the source checkout's uncommitted changes into the new worktree
 	/// (target must be the source `HEAD`).
 	pub keep_changes: Option<bool>,
+	/// Lock the new worktree with this reason, written as
+	/// `git worktree add --lock --reason <reason>` writes it. Absent leaves
+	/// it unlocked.
+	pub lock:         Option<String>,
 }
 /// Worktree creation outcome.
 #[napi(object)]
@@ -895,6 +899,7 @@ impl VcsGitRepo {
 				detach: options.detach,
 				clone,
 				keep_changes: options.keep_changes.unwrap_or(false),
+				lock: options.lock,
 			})
 			.map(|result| VcsWorktreeAddResult {
 				cloned_with: result.cloned_with.map(to_napi_kind),

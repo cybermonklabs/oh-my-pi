@@ -680,10 +680,11 @@ impl GitRepo {
 			WorktreeClone::Auto => Some(None),
 			WorktreeClone::Prefer(kind) => Some(Some(kind)),
 		};
+		let lock = options.lock.as_deref();
 		let mut clone_error = None;
 		if let Some(preferred) = preferred {
 			for kind in pi_iso::clone_candidates(preferred) {
-				match self.worktree_add_cloned(path, id, &head, kind, options.keep_changes) {
+				match self.worktree_add_cloned(path, id, &head, kind, options.keep_changes, lock) {
 					Ok(()) => {
 						return Ok(WorktreeAddResult { cloned_with: Some(kind), clone_error });
 					},
@@ -696,7 +697,7 @@ impl GitRepo {
 		}
 
 		fs::create_dir_all(path)?;
-		let admin = register_worktree(path, &self.info().common_dir, &head)?;
+		let admin = register_worktree(path, &self.info().common_dir, &head, lock)?;
 		let linked = Self::require(path)?;
 		let linked_repo = linked.gix()?;
 		checkout_tree(&linked, &linked_repo, id, true)?;
@@ -763,6 +764,7 @@ impl GitRepo {
 		head: &str,
 		kind: pi_iso::BackendKind,
 		keep_changes: bool,
+		lock: Option<&str>,
 	) -> Result<()> {
 		let repo = self.gix()?;
 		for key in ["core.sparseCheckout", "core.splitIndex"] {
@@ -777,31 +779,56 @@ impl GitRepo {
 			return Err(Error::backend("git worktree add", "source index is missing"));
 		}
 
-		pi_iso::backend(kind)
-			.clone_tree(self.root(), path, &[OsStr::new(".git")])
+		// One status of the source decides what the clone leaves out and how
+		// the copy is reconciled. A path the source neither tracks nor ignores
+		// is the user's uncommitted work, which only a kept-changes add
+		// carries. A directory below the root holding a `.git` entry is another
+		// checkout (a submodule, a linked worktree, a cloned dependency), which
+		// no add carries: its `.git` names an administrative directory of its
+		// own source, or a relative one that means nothing in the new tree.
+		let (dirty_tracked, untracked) = collect_clone_reconciliation_paths(&repo)?;
+		let mut exclusions = pi_iso::CloneExclusions::default();
+		exclusions.path(".git").marker(".git");
+		if !keep_changes {
+			for relative in &untracked {
+				exclusions.path(relative.to_path_lossy().into_owned());
+			}
+		}
+		let left_out = pi_iso::backend(kind)
+			.clone_tree(self.root(), path, &exclusions)
 			.map_err(|err| Error::backend("git worktree add", err))?;
-		let admin = register_worktree(path, &self.info().common_dir, head)?;
+		let admin = register_worktree(path, &self.info().common_dir, head, lock)?;
 		fs::copy(&source_index, admin.join("index"))?;
 
-		let (dirty_tracked, _) = collect_clone_reconciliation_paths(&repo)?;
 		// Backends may clone entire subtrees atomically. Apply the same
 		// nonrelocatable-directory policy to every backend's disposable copy,
 		// independently of Git's ignore rules.
-		let excluded = prune_nonrelocatable_clone_dirs(path)?;
+		let mut excluded = prune_nonrelocatable_clone_dirs(path)?;
+		// What the target tracks below a checkout the clone left out (a
+		// submodule's gitlink, files tracked beside a nested `.git`) is
+		// restored like a nonrelocatable directory's tracked files.
+		excluded.extend(left_out);
 		let linked = Self::require(path)?;
 		let linked_repo = linked.gix()?;
 		let mut current = load_index_or_empty(&linked_repo, "git worktree add")?;
 		if keep_changes {
-			// Environment artifacts are never portable, but tracked edits
-			// beneath an excluded directory still belong to the user.
+			// Environment artifacts and other checkouts are never carried,
+			// but tracked edits beneath an excluded directory still belong to
+			// the user. A gitlink is left an empty directory, as git's own
+			// checkout leaves a submodule.
 			if !excluded.is_empty() {
 				for entry in current.entries() {
 					let relative = entry.path(&current);
-					if relative
+					if !relative
 						.to_path_lossy()
 						.ancestors()
 						.any(|parent| excluded.contains(parent))
 					{
+						continue;
+					}
+					if entry.mode == gix::index::entry::Mode::COMMIT {
+						fs::create_dir_all(path.join(relative.to_path_lossy()))?;
+					} else {
 						copy_worktree_path(self.root(), path, relative)?;
 					}
 				}
@@ -916,10 +943,11 @@ impl GitRepo {
 		target
 			.write(INDEX_WRITE)
 			.map_err(|err| Error::backend("git worktree add", err))?;
-		// The source can ignore paths that the target does not, and vice
-		// versa. Only now are the target's ignore files and index in place.
-		// Clean this fresh clone through the existing repository-safe walk;
-		// keep target-ignored caches and never enter nested repositories.
+		// The clone carried only what the source tracks or ignores, and the
+		// target can leave unignored a path the source ignores. Only now are
+		// the target's ignore files and index in place. Clean this fresh
+		// clone through the existing repository-safe walk; keep
+		// target-ignored caches.
 		linked.clean(&CleanOptions::default())
 	}
 
@@ -1911,11 +1939,29 @@ fn git_metadata_path(path: &Path) -> Cow<'_, str> {
 	}
 }
 
-fn register_worktree(path: &Path, common: &Path, head: &str) -> Result<PathBuf> {
+/// Registers `path` as a linked worktree of `common` at `head`. With `lock`,
+/// the registration is locked from the moment it exists, as
+/// `git worktree add --lock --reason <lock>` locks it: git's `write_file`
+/// ends non-empty content with a newline and writes an empty reason as an
+/// empty file.
+fn register_worktree(
+	path: &Path,
+	common: &Path,
+	head: &str,
+	lock: Option<&str>,
+) -> Result<PathBuf> {
 	fs::create_dir_all(path)?;
 	let name = worktree_admin_name(common, path);
 	let admin = common.join("worktrees").join(name);
 	fs::create_dir_all(&admin)?;
+	if let Some(reason) = lock {
+		let content = if reason.is_empty() {
+			String::new()
+		} else {
+			format!("{reason}\n")
+		};
+		fs::write(admin.join("locked"), content)?;
+	}
 	fs::write(path.join(".git"), format!("gitdir: {}\n", git_metadata_path(&admin)))?;
 	fs::write(admin.join("gitdir"), format!("{}\n", git_metadata_path(&path.join(".git"))))?;
 	fs::write(admin.join("commondir"), "../..\n")?;
@@ -2639,6 +2685,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				lock:         None,
 			})
 			.unwrap();
 		assert_eq!(fs::read_to_string(linked.join("a")).unwrap(), "main\r\n");
@@ -2889,6 +2936,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				lock:         None,
 			})
 			.unwrap();
 		let common = fs::canonicalize(repo.info().common_dir.clone()).unwrap();
@@ -2919,6 +2967,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				lock:         None,
 			})
 			.unwrap();
 
@@ -2963,6 +3012,7 @@ mod tests {
 				detach:       false,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				lock:         None,
 			})
 			.unwrap();
 
@@ -3012,7 +3062,7 @@ mod tests {
 		let works = pi_iso::clone_candidates(None).into_iter().any(|kind| {
 			let _ = fs::remove_dir_all(&target);
 			pi_iso::backend(kind)
-				.clone_tree(&source, &target, &[])
+				.clone_tree(&source, &target, &pi_iso::CloneExclusions::default())
 				.is_ok()
 		});
 		let _ = fs::remove_dir_all(&source);
@@ -3032,6 +3082,7 @@ mod tests {
 				detach:       false,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				lock:         None,
 			})
 			.unwrap();
 		if clone_works {
@@ -3075,6 +3126,7 @@ mod tests {
 					detach: false,
 					clone,
 					keep_changes: true,
+					lock: None,
 				})
 				.unwrap();
 			if clone == WorktreeClone::Off {
@@ -3102,7 +3154,7 @@ mod tests {
 			let rejected = repo.worktree_add(
 				&temp.path().join("../linked-keep-rejected"),
 				"HEAD~1",
-				WorktreeAddOptions { detach: true, clone, keep_changes: true },
+				WorktreeAddOptions { detach: true, clone, keep_changes: true, lock: None },
 			);
 			assert!(rejected.is_err(), "keep_changes must require the source HEAD as target");
 			let _ = repo.worktree_remove(&linked, true);
@@ -3135,6 +3187,7 @@ mod tests {
 					detach: false,
 					clone,
 					keep_changes: true,
+					lock: None,
 				})
 				.unwrap();
 			if clone == WorktreeClone::Off {
@@ -3163,6 +3216,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				lock:         None,
 			})
 			.unwrap();
 		assert!(
@@ -3178,6 +3232,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				lock:         None,
 			})
 			.unwrap();
 		let common = fs::canonicalize(repo.info().common_dir.clone()).unwrap();

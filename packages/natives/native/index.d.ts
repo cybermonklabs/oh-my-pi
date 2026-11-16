@@ -3415,7 +3415,10 @@ export interface SearchResult {
 
 export declare function setHangulCompatJamoWidthOverride(value: number): void
 
-/** Options for executing a shell command via the embedded bash engine (pi-shell). */
+/**
+ * Options for executing a shell command via the embedded bash engine
+ * (pi-shell).
+ */
 export interface ShellExecuteOptions {
   /** Command string to execute in the shell. */
   command: string
@@ -4177,6 +4180,12 @@ export interface VcsWorktreeAddOptions {
    * (target must be the source `HEAD`).
    */
   keepChanges?: boolean
+  /**
+   * Lock the new worktree with this reason, written as
+   * `git worktree add --lock --reason <reason>` writes it. Absent leaves
+   * it unlocked.
+   */
+  lock?: string
 }
 
 /** Worktree creation outcome. */

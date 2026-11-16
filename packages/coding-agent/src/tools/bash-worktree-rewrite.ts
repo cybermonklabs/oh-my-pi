@@ -7,7 +7,21 @@ function shellQuote(value: string): string {
 	return BARE_SAFE.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-function rewriteSegment(text: string, ompCmd: readonly string[]): string | undefined {
+export interface RewriteGitWorktreeAddOptions {
+	/**
+	 * Lock every rewritten add that names no `--lock` of its own with this
+	 * reason, as a git wrapper that locks every add would. The rewrite runs omp
+	 * in place of `git`, so no such wrapper sees the call. Empty or absent
+	 * leaves the worktree unlocked.
+	 */
+	lockReason?: string;
+}
+
+function rewriteSegment(
+	text: string,
+	ompCmd: readonly string[],
+	options: RewriteGitWorktreeAddOptions,
+): string | undefined {
 	if (SHELL_EXPANSION.test(text)) return undefined;
 	const tokenLists = tokenizeShellSegments(text);
 	if (tokenLists.length !== 1) return undefined;
@@ -28,6 +42,8 @@ function rewriteSegment(text: string, ompCmd: readonly string[]): string | undef
 	let branch: string | undefined;
 	let detach = false;
 	let quiet = false;
+	let lock = false;
+	let reason: string | undefined;
 	let flagsEnded = false;
 	const positionals: string[] = [];
 	while (index < tokens.length) {
@@ -52,16 +68,38 @@ function rewriteSegment(text: string, ompCmd: readonly string[]): string | undef
 			quiet = true;
 			continue;
 		}
+		if (!flagsEnded && token === "--lock") {
+			lock = true;
+			continue;
+		}
+		if (!flagsEnded && token === "--reason") {
+			const value = tokens[index++];
+			if (value === undefined) return undefined;
+			reason = value;
+			continue;
+		}
+		if (!flagsEnded && token.startsWith("--reason=")) {
+			reason = token.slice("--reason=".length);
+			continue;
+		}
 		if (!flagsEnded && token.startsWith("-")) return undefined;
 		positionals.push(token);
 	}
 	if (positionals.length < 1 || positionals.length > 2) return undefined;
+	// git refuses a reason without a lock; let it say so.
+	if (reason !== undefined && !lock) return undefined;
 
 	const argv = [...ompCmd, "worktree", "add"];
 	if (cwd) argv.push("-C", cwd);
 	if (branchFlag && branch) argv.push(branchFlag, branch);
 	if (detach) argv.push("--detach");
 	if (quiet) argv.push("-q");
+	if (lock) {
+		argv.push("--lock");
+		if (reason !== undefined) argv.push("--reason", reason);
+	} else if (options.lockReason?.trim()) {
+		argv.push("--lock", "--reason", options.lockReason);
+	}
 	argv.push("--", ...positionals);
 	return argv.map(shellQuote).join(" ");
 }
@@ -71,7 +109,11 @@ function rewriteSegment(text: string, ompCmd: readonly string[]): string | undef
  * creation uses clone-first materialization. Unsupported shell syntax and git
  * flags are deliberately left for git to handle unchanged.
  */
-export function rewriteGitWorktreeAdd(command: string, ompCmd: readonly string[]): string {
+export function rewriteGitWorktreeAdd(
+	command: string,
+	ompCmd: readonly string[],
+	options: RewriteGitWorktreeAddOptions = {},
+): string {
 	const segments = extractFlatShellCommandSegments(command);
 	if (segments.length === 0 || segments.some(segment => segment.pipedStdin)) return command;
 
@@ -81,7 +123,7 @@ export function rewriteGitWorktreeAdd(command: string, ompCmd: readonly string[]
 		const start = command.indexOf(segment.text, cursor);
 		if (start < 0) return command;
 		result += command.slice(cursor, start);
-		result += rewriteSegment(segment.text, ompCmd) ?? segment.text;
+		result += rewriteSegment(segment.text, ompCmd, options) ?? segment.text;
 		cursor = start + segment.text.length;
 	}
 	return result + command.slice(cursor);
