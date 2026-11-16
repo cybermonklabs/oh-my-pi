@@ -28,8 +28,9 @@
  *   `anthropicCompaction` tool change keeps its `type`, its `tool`'s `type` and `name` and its whole
  *   `opaque` object, and a server tool's result content keeps fields by element type only.
  * - KR9: the snapcompact slot of a compaction: its frames.
- * - KR10: the drop rules: a changed signed block loses its signature; a changed carrier, server-tool
- *   group or snapcompact slot is left out of the stored copy.
+ * - KR10: the drop rules, each read on the text this walk replaced, never on a non-plain node the
+ *   copy holds as its plain stored form: a signed block whose text a value changed loses its
+ *   signature; such a carrier, server-tool group or snapcompact slot is left out of the stored copy.
  * - KR11: the `/btw` history record.
  * - KR12: outside this walk, `SessionStoreMask.maskText` leaves a range that equals one of its own markers as it is.
  * - KR13: object keys, numbers, booleans and `null`, never masked.
@@ -558,21 +559,50 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 };
 
 /**
+ * One masking walk: its mask, and how many strings it replaced a held value in. The drop rules
+ * (KR6, KR8-KR10) read that count over a subtree, so a block or carrier loses its signature or its
+ * place only when masking changed text in it, never because the copy holds a non-plain node of it
+ * (a `Date`, a `URL`, a `bigint`) as the plain form the session line stores.
+ */
+class MaskWalk {
+	replacements = 0;
+	readonly #mask: SessionStoreMask;
+
+	constructor(mask: SessionStoreMask) {
+		this.#mask = mask;
+	}
+
+	/** `text` with every held value replaced by its marker, counted. */
+	text(text: string): string {
+		const masked = this.#mask.maskText(text);
+		if (masked !== text) this.replacements++;
+		return masked;
+	}
+
+	/** Whether masking would change `text`, without counting it. */
+	holdsValue(text: string): boolean {
+		return this.#mask.maskText(text) !== text;
+	}
+}
+
+/**
  * `entry` with every held secret replaced by its marker, for the stored copy
  * only: the live entry is never mutated. Returns `entry` itself when nothing
- * changes or `mask` is `null`. Signed blocks that change lose their signature;
- * provider replay state that changes is dropped whole.
+ * changes or `mask` is `null`. Signed blocks whose text changed lose their
+ * signature; provider replay state whose text changed is dropped whole.
  */
 export function maskSessionEntry<T>(entry: T, mask: SessionStoreMask | null): T {
 	if (mask === null || mask.empty) return entry;
-	if (!isPlainObject(entry)) return maskFree(entry, "", mask) as T;
-	return maskObject(entry, mask, entry.type === "session" ? POSITIONS.header : POSITIONS.entry) as T;
+	const walk = new MaskWalk(mask);
+	if (!isPlainObject(entry)) return maskFree(entry, "", walk) as T;
+	return maskObject(entry, walk, entry.type === "session" ? POSITIONS.header : POSITIONS.entry) as T;
 }
 
 /** `record`, a `/btw` history record, with every held secret replaced by its marker, for the stored copy only. */
 export function maskBtwRecord<T>(record: T, mask: SessionStoreMask | null): T {
 	if (mask === null || mask.empty) return record;
-	return (isPlainObject(record) ? maskObject(record, mask, POSITIONS.btwRecord) : maskFree(record, "", mask)) as T;
+	const walk = new MaskWalk(mask);
+	return (isPlainObject(record) ? maskObject(record, walk, POSITIONS.btwRecord) : maskFree(record, "", walk)) as T;
 }
 
 /**
@@ -580,7 +610,7 @@ export function maskBtwRecord<T>(record: T, mask: SessionStoreMask | null): T {
  * subagent's yield data: no field in it is kept. The value itself is masked, never dropped.
  */
 export function maskStoredData<T>(value: T, mask: SessionStoreMask | null): T {
-	return mask === null || mask.empty ? value : (maskFree(value, "", mask) as T);
+	return mask === null || mask.empty ? value : (maskFree(value, "", new MaskWalk(mask)) as T);
 }
 
 /** `update` with its title masked, so the store's title field holds what the title slot holds. */
@@ -598,22 +628,22 @@ export function maskTitleUpdate(update: SessionTitleUpdate, mask: SessionStoreMa
  * readers, `prepareEntryForPersistence` (which rebuilds an object from its own keys) and
  * `stringifyJson`, then read the same form the walk masked.
  */
-function maskFree(value: unknown, key: string | number, mask: SessionStoreMask): unknown {
+function maskFree(value: unknown, key: string | number, walk: MaskWalk): unknown {
 	switch (typeof value) {
 		case "string":
-			return mask.maskText(value);
+			return walk.text(value);
 		case "bigint":
-			return maskPlainForm(storedForm(value, key), mask);
+			return maskPlainForm(storedForm(value, key), walk);
 		case "function":
 			// A function is not written unless its `toJSON` gives a value.
 			return typeof Reflect.get(value, "toJSON") === "function"
-				? maskPlainForm(storedForm(value, key), mask)
+				? maskPlainForm(storedForm(value, key), walk)
 				: value;
 		case "object":
 			if (value === null) return value;
-			if (isPlainObject(value)) return maskObject(value, mask, undefined);
-			if (isRealArray(value)) return maskArray(value, mask, undefined, false);
-			return maskPlainForm(storedForm(value, key), mask);
+			if (isPlainObject(value)) return maskObject(value, walk, undefined);
+			if (isRealArray(value)) return maskArray(value, walk, undefined, false);
+			return maskPlainForm(storedForm(value, key), walk);
 		default:
 			// A number or a boolean is written as it is; `undefined` or a symbol not at all.
 			return value;
@@ -625,19 +655,19 @@ function maskFree(value: unknown, key: string | number, mask: SessionStoreMask):
  * data. It is not read through `toJSON` again, so an object or array that still has one is copied
  * as its own enumerable keys or its items.
  */
-function maskPlainForm(form: unknown, mask: SessionStoreMask): unknown {
-	if (typeof form === "string") return mask.maskText(form);
-	if (isRealArray(form)) return maskArray(form, mask, undefined, false);
+function maskPlainForm(form: unknown, walk: MaskWalk): unknown {
+	if (typeof form === "string") return walk.text(form);
+	if (isRealArray(form)) return maskArray(form, walk, undefined, false);
 	if (Array.isArray(form)) {
 		const copy: unknown[] = [];
-		for (let i = 0; i < form.length; i++) copy.push(maskFree(form[i], i, mask));
+		for (let i = 0; i < form.length; i++) copy.push(maskFree(form[i], i, walk));
 		return copy;
 	}
 	if (typeof form === "object" && form !== null) {
-		if (isPlainObject(form)) return maskObject(form, mask, undefined);
+		if (isPlainObject(form)) return maskObject(form, walk, undefined);
 		const copy: Record<string, unknown> = {};
 		for (const key in form) {
-			if (Object.hasOwn(form, key)) setOwn(copy, key, maskFree(Reflect.get(form, key), key, mask));
+			if (Object.hasOwn(form, key)) setOwn(copy, key, maskFree(Reflect.get(form, key), key, walk));
 		}
 		return copy;
 	}
@@ -706,36 +736,34 @@ function isRealArray(value: unknown): value is unknown[] {
 	return Array.isArray(value) && typeof Reflect.get(value, "toJSON") !== "function";
 }
 
-/** `value`, a plain object, masked at `at`, or {@link DROP} when `at` is a carrier that masking changed. */
-function maskChild(value: Record<string, unknown>, mask: SessionStoreMask, at: Position): unknown {
-	const next = maskObject(value, mask, at);
-	return next !== value && at.carrier ? DROP : next;
+/** `value`, a plain object, masked at `at`, or {@link DROP} when `at` is a carrier whose text masking changed. */
+function maskChild(value: Record<string, unknown>, walk: MaskWalk, at: Position): unknown {
+	const before = walk.replacements;
+	const next = maskObject(value, walk, at);
+	return at.carrier && walk.replacements > before ? DROP : next;
 }
 
 /**
  * `items`, an array in its stored form, masked: with `at`, each plain-object element at `at`; with
  * `keepStrings`, each primitive-string element kept; every other element free content.
  */
-function maskArray(
-	items: unknown[],
-	mask: SessionStoreMask,
-	at: Position | undefined,
-	keepStrings: boolean,
-): unknown[] {
+function maskArray(items: unknown[], walk: MaskWalk, at: Position | undefined, keepStrings: boolean): unknown[] {
 	let copy: unknown[] | undefined;
 	let droppedPair: unknown;
 	for (let i = 0; i < items.length; i++) {
 		const item = items[i];
 		let next: unknown;
 		if (typeof item === "string") {
-			next = keepStrings ? item : mask.maskText(item);
+			next = keepStrings ? item : walk.text(item);
 		} else if (at !== undefined && isPlainObject(item)) {
-			next = maskChild(item, mask, at);
-			if (next !== item && at.variants !== undefined && variantOf(item, at.variants)?.pair) {
+			const before = walk.replacements;
+			next = maskChild(item, walk, at);
+			// KR10: the siblings of a server-tool block go with it only when masking changed text in it.
+			if (walk.replacements > before && at.variants !== undefined && variantOf(item, at.variants)?.pair) {
 				droppedPair = item[at.variants.key];
 			}
 		} else {
-			next = maskFree(item, i, mask);
+			next = maskFree(item, i, walk);
 		}
 		if (copy === undefined) {
 			// `Object.is`: a `NaN` left as it is is unchanged.
@@ -751,37 +779,36 @@ function maskArray(
 }
 
 /** `obj`, an object in its stored form, masked at `at`, a listed position of a plain object, or as free content without one. */
-function maskObject(
-	obj: Record<string, unknown>,
-	mask: SessionStoreMask,
-	at: Position | undefined,
-): Record<string, unknown> {
+function maskObject(obj: Record<string, unknown>, walk: MaskWalk, at: Position | undefined): Record<string, unknown> {
 	const variant = at?.variants === undefined ? undefined : variantOf(obj, at.variants);
 	const signatureKey = signatureKeyOf(obj, variant);
+	const before = walk.replacements;
 	let copy: Record<string, unknown> | undefined;
 	let maskedContent: string | undefined;
 	for (const key in obj) {
 		if (!Object.hasOwn(obj, key)) continue;
 		const value = obj[key];
-		const next = at === undefined ? maskFree(value, key, mask) : maskField(value, mask, at, variant, key);
+		const next = at === undefined ? maskFree(value, key, walk) : maskField(value, walk, at, variant, key);
 		if (copy === undefined) {
 			if (Object.is(next, value)) continue;
-			copy = copyBefore(obj, key, signatureKey);
+			copy = copyBefore(obj, key, undefined);
 		}
-		// A signed block that changed no longer matches its signature: store it unsigned.
-		if (next === DROP || key === signatureKey) continue;
+		if (next === DROP) continue;
 		setOwn(copy, key, next);
 		if (key === "content" && typeof next === "string" && next !== value) maskedContent = next;
 	}
-	if (copy === undefined) {
-		// Nothing else changed: a Responses reasoning signature whose texts hold a value is still left out.
-		if (signatureKey === undefined || !variant?.reasoning || !reasoningHoldsValue(obj[signatureKey], mask))
-			return obj;
-		return copyBefore(obj, undefined, signatureKey);
+	// KR6, KR10: a signed block whose text a value changed no longer matches its signature.
+	let unsigned = signatureKey !== undefined && walk.replacements > before;
+	if (!unsigned && signatureKey !== undefined && variant?.reasoning && reasoningHoldsValue(obj[signatureKey], walk)) {
+		// The value is in the signature's own texts, so the turn held one: the rules around it read that too.
+		walk.replacements++;
+		unsigned = true;
 	}
+	if (copy === undefined) return unsigned ? copyBefore(obj, undefined, signatureKey) : obj;
 	if (maskedContent !== undefined && typeof copy.lineCount === "number") {
 		copy.lineCount = countNewlines(maskedContent) + 1;
 	}
+	if (unsigned && signatureKey !== undefined) Reflect.deleteProperty(copy, signatureKey);
 	return copy;
 }
 
@@ -789,24 +816,18 @@ function maskObject(
  * The value under `key` of a plain object at `at` (with its `variant`), masked by the shape `at`
  * declares for `key`, judged on the live value; a value of any other shape is free content.
  */
-function maskField(
-	value: unknown,
-	mask: SessionStoreMask,
-	at: Position,
-	variant: Position | undefined,
-	key: string,
-): unknown {
-	if (typeof value === "string") return listed(at, variant, "strings", key) ? value : mask.maskText(value);
+function maskField(value: unknown, walk: MaskWalk, at: Position, variant: Position | undefined, key: string): unknown {
+	if (typeof value === "string") return listed(at, variant, "strings", key) ? value : walk.text(value);
 	if (isPlainObject(value)) {
 		if (listed(at, variant, "wholeObjects", key)) return value;
 		const child = placed(at, variant, "objects", key);
-		return child === undefined ? maskObject(value, mask, undefined) : maskChild(value, mask, child);
+		return child === undefined ? maskObject(value, walk, undefined) : maskChild(value, walk, child);
 	}
 	if (isRealArray(value)) {
-		if (listed(at, variant, "stringArrays", key)) return maskArray(value, mask, undefined, true);
-		return maskArray(value, mask, placed(at, variant, "elements", key), false);
+		if (listed(at, variant, "stringArrays", key)) return maskArray(value, walk, undefined, true);
+		return maskArray(value, walk, placed(at, variant, "elements", key), false);
 	}
-	return maskFree(value, key, mask);
+	return maskFree(value, key, walk);
 }
 
 /** Whether `at`'s `field` list, or its variant's, names `key`. */
@@ -848,20 +869,20 @@ function signatureKeyOf(obj: Record<string, unknown>, variant: Position | undefi
  * Whether `signature` is an OpenAI Responses reasoning item (JSON with `type: "reasoning"`) whose
  * `summary[].text` or `content[].text` holds a value. Its `encrypted_content` is never scanned.
  */
-function reasoningHoldsValue(signature: unknown, mask: SessionStoreMask): boolean {
+function reasoningHoldsValue(signature: unknown, walk: MaskWalk): boolean {
 	if (typeof signature !== "string" || !/^\s*\{/.test(signature)) return false;
 	const item = tryParseJson(signature);
 	return (
 		isRecord(item) &&
 		item.type === "reasoning" &&
-		(textsHoldValue(item.summary, mask) || textsHoldValue(item.content, mask))
+		(textsHoldValue(item.summary, walk) || textsHoldValue(item.content, walk))
 	);
 }
 
-function textsHoldValue(parts: unknown, mask: SessionStoreMask): boolean {
+function textsHoldValue(parts: unknown, walk: MaskWalk): boolean {
 	if (!Array.isArray(parts)) return false;
 	for (const part of parts) {
-		if (isRecord(part) && typeof part.text === "string" && mask.maskText(part.text) !== part.text) return true;
+		if (isRecord(part) && typeof part.text === "string" && walk.holdsValue(part.text)) return true;
 	}
 	return false;
 }

@@ -3333,6 +3333,123 @@ const SERVER_TOOL_ELEMENT_CASES: readonly {
 	},
 ];
 
+/** A `Date`, a `URL` and a `bigint`, none holding a value: the session line stores each in another form than its own keys. */
+function nonPlainNodes(): StoredRecord {
+	return { at: new Date(NOW), link: new URL("https://example.invalid/plain-page"), count: 12n };
+}
+
+/**
+ * Signed blocks and replay carriers whose free fields hold non-plain nodes, with {@link HELD} in one
+ * free field beside them when `held`. Only a held value drops a signature, a carrier or a server-tool
+ * group (KR6, KR8-KR10): a non-plain node alone is stored in the same bytes as the live entry.
+ */
+const NON_PLAIN_BINDINGS: readonly {
+	readonly name: string;
+	readonly message: (held: boolean) => StoredRecord;
+	/** What the drop rules leave out of the stored copy when the message holds a value. */
+	readonly bound: FieldPath;
+}[] = [
+	{
+		name: "a signed thinking block",
+		// `extra` is a key the list does not name: free content.
+		message: held =>
+			assistantRecord([
+				{
+					type: "thinking",
+					thinking: held ? HELD : "plain thought",
+					thinkingSignature: "opaque-thinking-signature",
+					extra: nonPlainNodes(),
+				},
+			]),
+		bound: "message.content.0.thinkingSignature",
+	},
+	{
+		name: "a signed text block",
+		message: held =>
+			assistantRecord([
+				{
+					type: "text",
+					text: held ? HELD : "plain answer",
+					textSignature: "opaque-text-signature",
+					extra: nonPlainNodes(),
+				},
+			]),
+		bound: "message.content.0.textSignature",
+	},
+	{
+		name: "a signed toolCall block",
+		message: held =>
+			assistantRecord([
+				{
+					type: "toolCall",
+					id: "call-bound",
+					name: "lookup",
+					arguments: { ...nonPlainNodes(), query: held ? HELD : "plain" },
+					thoughtSignature: "opaque-thought-signature",
+				},
+			]),
+		bound: "message.content.0.thoughtSignature",
+	},
+	{
+		name: "a cursorHistory carrier",
+		message: held =>
+			assistantRecord([{ type: "text", text: "plain" }], {
+				providerPayload: {
+					type: "cursorHistory",
+					wireRoute: "plain-route",
+					digest: "plain-digest",
+					records: [new Date(NOW), 12n, held ? HELD : "plain record"],
+				},
+			}),
+		bound: "message.providerPayload",
+	},
+	{
+		name: "an openaiResponsesHistory carrier",
+		message: held =>
+			assistantRecord([{ type: "text", text: "plain" }], {
+				providerPayload: {
+					type: "openaiResponsesHistory",
+					items: [
+						{
+							type: "function_call",
+							id: "fc_plain",
+							call_id: "call_plain",
+							name: "lookup",
+							arguments: held ? JSON.stringify({ query: HELD }) : "{}",
+							createdAt: new Date(NOW),
+							sequence: 12n,
+						},
+					],
+				},
+			}),
+		bound: "message.providerPayload",
+	},
+	{
+		name: "an anthropicServerTool group",
+		message: held =>
+			assistantRecord([
+				{
+					type: "anthropicServerTool",
+					block: {
+						type: "server_tool_use",
+						id: "srvtoolu_bound",
+						name: "web_search",
+						input: { ...nonPlainNodes(), query: held ? HELD : "plain" },
+					},
+				},
+				{
+					type: "anthropicServerTool",
+					block: {
+						type: "web_search_tool_result",
+						tool_use_id: "srvtoolu_bound",
+						content: [{ type: "web_search_result", url: "plain-url", encrypted_content: "plain-cipher" }],
+					},
+				},
+			]),
+		bound: "message.content.0",
+	},
+];
+
 for (const backend of backends) {
 	describe(`keep rules for signatures, carriers and values by type with ${backend.name}`, () => {
 		let store: StoreHarness;
@@ -3450,6 +3567,41 @@ for (const backend of backends) {
 				await manager.close();
 			});
 		}
+
+		it("keeps the signature and the carrier of a turn whose free fields hold a Date, a URL or a bigint but no held value", async () => {
+			const manager = await maskedSession(mask);
+			manager.appendMessage(
+				assistantRecord(
+					[
+						{
+							type: "toolCall",
+							id: "call-bound",
+							name: "lookup",
+							arguments: nonPlainNodes(),
+							thoughtSignature: "opaque-thought-signature",
+						},
+					],
+					{
+						stopReason: "toolUse",
+						providerPayload: {
+							type: "cursorHistory",
+							wireRoute: "plain-route",
+							digest: "plain-digest",
+							records: [new Date(NOW), 12n, "plain record"],
+						},
+					},
+				) as unknown as AssistantMessage,
+			);
+			const lines = (await storedText(manager)).split("\n").filter(line => line.length > 0);
+			const stored = lines.at(-1) ?? "";
+			const record: unknown = JSON.parse(stored);
+			expect({
+				signed: valueAt(record, "message.content.0.thoughtSignature") !== undefined,
+				carrierKept: valueAt(record, "message.providerPayload") !== undefined,
+				asLive: stored === stringifyJson(manager.getEntries().at(-1)),
+			}).toEqual({ signed: true, carrierKept: true, asLive: true });
+			await manager.close();
+		});
 
 		for (const { place, append, toolChanges } of COMPACTION_TOOL_CHANGE_PLACES) {
 			it(`KR8: keeps the raw toolChanges of ${place} byte-identical, opaque whole, under a regex that matches a tool name`, async () => {
@@ -3638,6 +3790,34 @@ describe("copy-on-write of the stored copy", () => {
 				valueAt(copy, "message.content") === content && isRecord(details) && details.plainData === plainData,
 		}).toEqual({ plainSame: true, nodesCopied: true, nodesAsStored: true, untouchedShared: true });
 	});
+
+	const boundEntry = (message: StoredRecord): StoredRecord => ({
+		id: "bound-entry",
+		parentId: null,
+		timestamp: KEEP_TIMESTAMP,
+		...messageEntry(message),
+	});
+	for (const { name, message, bound } of NON_PLAIN_BINDINGS) {
+		it(`keeps ${name} whose free fields hold a Date, a URL or a bigint and no held value`, () => {
+			const entry = boundEntry(message(false));
+			const stored = stringifyJson(maskSessionEntry(entry, mask)) ?? "";
+			expect({
+				name,
+				boundKept: valueAt(JSON.parse(stored), bound) !== undefined,
+				asLive: stored === stringifyJson(entry),
+			}).toEqual({ name, boundKept: true, asLive: true });
+		});
+
+		it(`leaves out the binding of ${name} whose free fields hold a value beside them`, () => {
+			const entry = boundEntry(message(true));
+			const stored = stringifyJson(maskSessionEntry(entry, mask)) ?? "";
+			expect({
+				name,
+				boundLeftOut: valueAt(JSON.parse(stored), bound) === undefined,
+				held: stored.includes(ENV_VALUE),
+			}).toEqual({ name, boundLeftOut: true, held: false });
+		});
+	}
 });
 
 /**
