@@ -133,7 +133,7 @@ Regex entries always scan globally (the `g` flag is enforced automatically). The
 ## Invalid entries and files
 
 - A missing `secrets.yml` is treated as no entries.
-- A `secrets.yml` larger than 1 MiB, or one that grows while it is read, is skipped with a warning. A path that is not a regular file, such as a directory or a FIFO, is skipped without being opened.
+- A `secrets.yml` of any size is read. One that grows while it is read is skipped with a warning. A path that is not a regular file, such as a directory or a FIFO, is skipped without being opened.
 - A parse failure or non-array document is ignored with a warning.
 - Invalid entries are skipped individually with a warning. `type` must be `plain` or `regex`; `content` must be a non-empty string; `mode`, `replacement`, `flags`, and regex syntax are validated as shown above.
 - Invalid optional `friendlyName` metadata is dropped without dropping an otherwise valid entry.
@@ -161,7 +161,7 @@ When the setting is on, the agent replaces each value it holds with a marker tha
 
 When two sources hold the same value, an environment variable or a `_FILE` file names it before a `secrets.yml` entry, and the project `secrets.yml` names it before the global one. Among environment variables and `_FILE` files, the one the agent read first names it; at the first write, the agent reads the environment before the files. When a name or a `friendlyName` contains a held value, or a regex entry matches it, the marker uses the index form instead (`#<n>`, `project#<n>`, `global#<n>`). The agent never cuts a marker: a held value that overlaps one replaces it whole. Masking a stored text again gives the same text.
 
-The agent masks any number of held values, of any size; it reads a `_FILE` file and a `secrets.yml` only up to 1 MiB. Where two held values, or a held value and a match of a regex entry, overlap or touch, one marker replaces all the text they cover: the marker of the one that starts first. So no part of either value stays in the stored text.
+The agent masks any number of held values, of any size; it reads a `_FILE` file only up to 1 MiB, and a `secrets.yml` of any size. Where two held values, or a held value and a match of a regex entry, overlap or touch, one marker replaces all the text they cover: the marker of the one that starts first. So no part of either value stays in the stored text.
 
 The agent masks every session entry and the session header, the title slot and the title the store keeps beside it, the editor draft, the replica that a collab guest writes, and, under file storage, the title and the recaps that it records in `history.db`. It also masks the `/btw` history records and their title files, in `btw-history/` under the artifacts directory of the session. It masks the output files `<id>.md` and `<id>.json` of a subagent, in the artifacts directory of the parent session; `agent://<id>` serves these files.
 
@@ -179,7 +179,7 @@ The `/btw` records that this process wrote keep the values until the history is 
 
 - **Environment variables**: the same name rule as the obfuscator, with values of at least 8 characters.
 - **`_FILE` variables**: each environment variable whose name ends in `_FILE`, except `PI_SESSION_FILE`: under `file` storage it names the session transcript, not a credential. The agent follows symbolic links and reads only a regular file of at most 1 MiB. It skips a path that is not a regular file without opening it, so a FIFO cannot stop a write or take the data of a program that writes to it. It skips a file over 1 MiB, or one that grows while it reads it, with a warning. It trims the content and keeps it when it has at least 8 characters. It matches the content of a file as one value.
-- **`secrets.yml`**: the file in the session's own agent directory, the one the session was created with (normally `~/.omp/agent/secrets.yml`), and the project file of the session's own working directory (`<cwd>/.omp/secrets.yml`), through the same reader and parser as the obfuscator. The mask of each working directory holds only its own project file, plus the global one, so a session never masks with the entries of another project's file. As for a `_FILE`, the agent reads only a regular file of at most 1 MiB: it skips a path that is not a regular file without opening it, and a file over 1 MiB, or one that grows while it reads it, with a warning.
+- **`secrets.yml`**: the file in the session's own agent directory, the one the session was created with (normally `~/.omp/agent/secrets.yml`), and the project file of the session's own working directory (`<cwd>/.omp/secrets.yml`), through the same reader and parser as the obfuscator. The mask of each working directory holds only its own project file, plus the global one, so a session never masks with the entries of another project's file. As for a `_FILE`, the agent reads only a regular file, but of any size: it skips a path that is not a regular file without opening it, and a file that grows while it reads it, with a warning.
 
 The agent reads the sources at its first session write, and the project file of a working directory at the first write there. Then, at most once a minute, it reads the environment again and checks each `_FILE` file and each `secrets.yml` for a change. It adds new values and never removes a value, so the old value of a rotated token stays masked. A source that fails (a bad `secrets.yml`, a file it cannot read) is skipped and logged, and the agent reads a file that it could not read again at the next check. The log gives the kind and the name of each source the agent holds (`Session store masking sources`), never a value.
 
@@ -210,7 +210,7 @@ Masking finds a value where it appears exactly as the agent holds it. It also fi
 - a value that appears or rotates between two checks: it is stored raw until the next check, at most a minute later, and the lines appended before then stay raw until a full rewrite of the session
 - a credential in a git configuration value set through the environment (`GIT_CONFIG_VALUE_<n>`)
 - the content of a `_FILE` file that is not a regular file, that the agent cannot read, that is larger than 1 MiB, or whose trimmed content is shorter than 8 characters
-- a `secrets.yml` that is not a regular file or that is larger than 1 MiB, and a `secrets.yml` entry the parser refuses (see [Invalid entries and files](#invalid-entries-and-files))
+- a `secrets.yml` that is not a regular file or that grows while the agent reads it, and a `secrets.yml` entry the parser refuses (see [Invalid entries and files](#invalid-entries-and-files))
 - part of a multi-line file printed alone, because the content of a file is one value
 - object keys and numbers, so a value used as the id of a work pool item stays in the keys of the output schema that the agent builds from those ids
 - the working directory, and the ids and image data that the session format keeps in their own places
@@ -239,11 +239,12 @@ Masking reduces the exposure of a secret. It does not remove it. To remove it, h
 - `packages/coding-agent/src/secrets/env-secrets.ts` -- environment variable collection
 - `packages/coding-agent/src/secrets/secrets-file.ts` -- the `secrets.yml` parser and the one reader of a secret file (`_FILE` and `secrets.yml`), in a sync and an async form
 - `packages/coding-agent/src/secrets/obfuscator.ts` -- `SecretObfuscator` class, placeholder generation, message obfuscation
+- `packages/coding-agent/src/secrets/literal-index.ts` -- `LiteralIndex`, which finds which of many literals a text holds with no pattern that grows with a literal; the obfuscator's literal detectors and the stored-session matcher search with it
 - `packages/coding-agent/src/secrets/regex.ts` -- regex literal parsing and compilation
 - `packages/coding-agent/src/secrets/message-transform.ts` -- provider-context and local-context transforms
 - `packages/coding-agent/src/secrets/patterns.ts` -- built-in credential patterns
-- `packages/coding-agent/src/secrets/session-store-mask.ts` -- the values and markers of stored-session masking
-- `packages/coding-agent/src/secrets/session-store-matcher.ts` -- the matcher that finds held values in a text and replaces them with markers, and the literal index it and the obfuscator's literal detectors search with
+- `packages/coding-agent/src/secrets/session-store-mask.ts` -- the values and markers of stored-session masking, and the masked `history.db` write
+- `packages/coding-agent/src/secrets/session-store-matcher.ts` -- the matcher that finds held values in a text and replaces them with markers
 - `packages/coding-agent/src/session/session-entry-mask.ts` -- which fields of a session entry are masked
 - `packages/coding-agent/src/secrets/settings.ts` -- `secrets.enabled` and `secrets.maskSessionStore` setting definitions
 

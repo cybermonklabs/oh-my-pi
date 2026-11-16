@@ -9,7 +9,8 @@ import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask
 import * as storeMatcher from "@oh-my-pi/pi-coding-agent/secrets/session-store-matcher";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { StreamRedactor } from "@oh-my-pi/pi-coding-agent/stream/redactor";
+import { getAgentDir, isRecord, logger, setAgentDir } from "@oh-my-pi/pi-utils";
 import { failNextReads, plainYml, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 
@@ -735,19 +736,40 @@ describe("K25: a FIFO whose writer waits in its own open", () => {
 		40_000,
 	);
 
-	it("K25: a secrets.yml over 1 MiB is read neither by the masker nor by the provider obfuscator's load, and each logs why", async () => {
+	it("K25: a secrets.yml over 1 MiB is read by the masker, the provider obfuscator's load and the stream redactor, while a _FILE over 1 MiB is left out and logged", async () => {
 		const value = "oversized-yml-held-value-07";
 		// The entry first, then comment lines past 1 MiB: read whole, the file parses to that entry.
 		await Bun.write(projectYml, `${plainYml(value)}\n${"# a comment line that pads the file\n".repeat(32 * 1024)}`);
+		const fileContent = "b".repeat(1024 * 1024 + 1);
+		const oversizedFile = await writeFile("oversized.txt", fileContent);
 		const warn = spyOn(logger, "warn").mockImplementation(() => {});
-
-		const mask = maskerFor({}).snapshot(cwd);
-		const entries = await loadSecretsFile(projectYml);
-		const held = { masked: mask.maskText(value) !== value, sources: mask.sources.length, entries: entries.length };
-		expect(held).toEqual({ masked: false, sources: 0, entries: 0 });
-		const skip = { path: projectYml, reason: "larger than 1 MiB" };
-		expect(loggedDetails(warn, "Session store masking skipped a secrets.yml")).toEqual([skip]);
-		expect(loggedDetails(warn, "Skipped secrets.yml")).toEqual([skip]);
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		// The stream redactor reads the global secrets.yml of the process's agent dir: this test's own.
+		const previousAgentDir = getAgentDir();
+		const previousAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+		setAgentDir(agentDir);
+		try {
+			const mask = maskerFor({ OVERSIZED_FILE: oversizedFile }).snapshot(cwd);
+			const entries = await loadSecretsFile(projectYml);
+			const obfuscated = new SecretObfuscator(entries).obfuscate(`sent ${value}`);
+			const redactor = await StreamRedactor.load(cwd, []);
+			// Booleans only, so a failure prints no value.
+			const read = {
+				masked: mask.maskText(value) === YML_MARKER,
+				loaded: entries.some(entry => entry.content === value),
+				obfuscated: !obfuscated.includes(value),
+				redacted: redactor.redactRow(`streamed ${value}`) === "streamed ••••••",
+				fileLeftOut: mask.maskText(fileContent) === fileContent,
+			};
+			expect(read).toEqual({ masked: true, loaded: true, obfuscated: true, redacted: true, fileLeftOut: true });
+			expect(loggedDetails(warn, "Session store masking skipped a file")).toEqual([
+				{ variable: "OVERSIZED_FILE", reason: "larger than 1 MiB" },
+			]);
+			expect(loggedDetails(info, "Session store masking sources")).toEqual([{ sources: ["secrets.yml:project#1"] }]);
+		} finally {
+			setAgentDir(previousAgentDir);
+			restoreEnvValue("PI_CODING_AGENT_DIR", previousAgentDirEnv);
+		}
 	});
 });
 

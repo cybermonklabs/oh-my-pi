@@ -14,6 +14,7 @@ import { MIN_OBFUSCATE_SECRET_LEN, sanitizeSecretFriendlyName } from "./placehol
 import { compileSecretRegex } from "./regex";
 import {
 	globalSecretsFilePath,
+	MIB,
 	parseSecretsFileText,
 	projectSecretsFilePath,
 	readSecretFileSync,
@@ -63,6 +64,8 @@ interface HeldValue {
 }
 
 const REFRESH_INTERVAL_MS = 60_000;
+/** The most the file a `_FILE` variable names may hold: a larger one gives no value. A secrets.yml has no bound. */
+const MAX_FILE_SOURCE_BYTES = MIB;
 const UNSAFE_NAME_CHARS = /[^A-Za-z0-9_.-]/g;
 
 /**
@@ -293,6 +296,7 @@ export class SessionStoreMasker {
 		try {
 			// A file whose stamp has not changed is neither opened nor read: what it gave still holds.
 			read = readSecretFileSync(filePath, {
+				maxBytes: MAX_FILE_SOURCE_BYTES,
 				unchanged: stat => this.#fileStamps.get(name) === stampOf(filePath, stat),
 			});
 		} catch (err) {
@@ -326,7 +330,7 @@ export class SessionStoreMasker {
 		else logger.debug("Session store masking skipped a file", { variable: name, reason });
 	}
 
-	/** Logs once why a secrets.yml gives no value: as a warning when it was skipped for its size. */
+	/** Logs once why a secrets.yml gives no value: as a warning when it grew while it was read. */
 	#skipSecretsFile(filePath: string, reason: string, oversized: boolean): void {
 		if (!this.#isNews(this.#reasonKey("secrets.yml", filePath), reason)) return;
 		if (oversized) logger.warn("Session store masking skipped a secrets.yml", { path: filePath, reason });
@@ -503,6 +507,33 @@ export function processSessionStoreMasker(agentDir: string): SessionStoreMasker 
  */
 export function sessionStoreMaskFor(enabled: boolean, cwd: string, agentDir: string): SessionStoreMask | null {
 	return enabled ? processSessionStoreMasker(agentDir).snapshot(cwd) : null;
+}
+
+/**
+ * Makes the history.db `record` write of session `sessionId`: `write` gets `text` through the mask
+ * `owner.storeMask()` gives (`text` itself while masking is off). A mask that cannot be built, or
+ * that fails on `text`, skips that write and logs it: it is never made with the value unmasked,
+ * and a history.db write never fails the rename or the recap it serves.
+ */
+export function recordMaskedHistory(
+	owner: { storeMask(): SessionStoreMask | null },
+	text: string,
+	sessionId: string,
+	record: "title" | "recap",
+	write: (stored: string) => void,
+): void {
+	let stored: string;
+	try {
+		stored = owner.storeMask()?.maskText(text) ?? text;
+	} catch (err) {
+		logger.warn("Session store masking failed; skipped a history.db write", {
+			sessionId,
+			record,
+			error: toError(err).message,
+		});
+		return;
+	}
+	write(stored);
 }
 
 /** What a session binds its session manager's store masking to (`SessionManager.setStoreMasking`). */

@@ -15,9 +15,8 @@ export interface PositionedSecretEntry {
 
 type RawSecretEntry = Omit<SecretEntry, "friendlyName"> & { friendlyName?: unknown };
 
-const MIB = 1024 * 1024;
-/** The most a secret file may hold: a `_FILE` file and a secrets.yml, in the store and in the obfuscator. */
-const MAX_SECRET_FILE_BYTES = MIB;
+/** One mebibyte: a caller's size bound is a whole number of them. */
+export const MIB = 1024 * 1024;
 /** Non-blocking: by the open, the path may name a FIFO. */
 const SECRET_FILE_OPEN_FLAGS = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
 /** UTF-8, as both readers decode: a leading byte-order mark is dropped, a malformed sequence becomes U+FFFD. */
@@ -31,7 +30,7 @@ export type SecretFileRead =
 	| { readonly text: string; readonly stat: fs.BigIntStats }
 	| {
 			readonly skip: string;
-			/** Skipped for its size: over 1 MiB, or grown past what its stat reported while it was read. */
+			/** Skipped for its size: over the caller's bound, or grown past what its stat reported while it was read. */
 			readonly oversized: boolean;
 			readonly stat: fs.BigIntStats;
 	  };
@@ -47,6 +46,8 @@ export interface SecretFileReadOptions {
 	 * opens nothing and gives {@link UnchangedSecretFile}.
 	 */
 	readonly unchanged: (stat: fs.BigIntStats) => boolean;
+	/** The most bytes the file may hold: a larger one is skipped unread. No bound when absent. */
+	readonly maxBytes?: number;
 }
 
 const UNCHANGED: UnchangedSecretFile = { unchanged: true };
@@ -62,8 +63,8 @@ export function globalSecretsFilePath(agentDir: string): string {
 }
 
 /**
- * Read one secrets.yml; a missing file, a path that is not a regular file, a file over 1 MiB or one
- * that grew while it was read, a file that is not a YAML array, and invalid entries yield nothing.
+ * Read one secrets.yml, of any size; a missing file, a path that is not a regular file, one that grew
+ * while it was read, a file that is not a YAML array, and invalid entries yield nothing.
  */
 export async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> {
 	try {
@@ -86,14 +87,18 @@ function notRegularFile(stat: fs.BigIntStats): SecretFileRead | undefined {
 
 /**
  * The skip of the descriptor opened for the path whose stat is `stat`, when the descriptor's own stat,
- * `opened`, shows another file than `stat` does, or one over the bound.
+ * `opened`, shows another file than `stat` does, or one over `maxBytes` when the caller gave a bound.
  */
-function openedFileSkip(stat: fs.BigIntStats, opened: fs.BigIntStats): SecretFileRead | undefined {
+function openedFileSkip(
+	stat: fs.BigIntStats,
+	opened: fs.BigIntStats,
+	maxBytes: number | undefined,
+): SecretFileRead | undefined {
 	if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
 		return { skip: "replaced before it was opened", oversized: false, stat };
 	}
-	if (opened.size > MAX_SECRET_FILE_BYTES) {
-		return { skip: `larger than ${MAX_SECRET_FILE_BYTES / MIB} MiB`, oversized: true, stat };
+	if (maxBytes !== undefined && opened.size > maxBytes) {
+		return { skip: `larger than ${maxBytes / MIB} MiB`, oversized: true, stat };
 	}
 	return undefined;
 }
@@ -111,8 +116,8 @@ function readFileText(stat: fs.BigIntStats, buffer: Buffer, length: number): Sec
  * true, leaves the file unopened. Nothing but a regular file is opened: an open of a FIFO, even a
  * non-blocking one, lets a writer that waits in its own open go on, and the close then leaves that
  * writer with no reader. The descriptor is checked again, as by then the path may name another file,
- * and the file is read only when it holds at most 1 MiB and did not grow while it was read.
- * {@link readSecretFile} is the same read for an async caller.
+ * and the file is read only when it did not grow while it was read and, when `options.maxBytes` is
+ * given, holds at most that many bytes. {@link readSecretFile} is the same read for an async caller.
  */
 export function readSecretFileSync(
 	filePath: string,
@@ -125,7 +130,7 @@ export function readSecretFileSync(
 	const fd = fs.openSync(filePath, SECRET_FILE_OPEN_FLAGS);
 	try {
 		const opened = fs.fstatSync(fd, { bigint: true });
-		const refused = openedFileSkip(stat, opened);
+		const refused = openedFileSkip(stat, opened, options.maxBytes);
 		if (refused !== undefined) return refused;
 		const buffer = Buffer.allocUnsafe(Number(opened.size) + 1);
 		let length = 0;
@@ -140,7 +145,7 @@ export function readSecretFileSync(
 	}
 }
 
-/** {@link readSecretFileSync} for an async caller: the same checks, the same bound, the same decoding. */
+/** {@link readSecretFileSync} for an async caller, a secrets.yml's: the same checks and decoding, with no size bound. */
 async function readSecretFile(filePath: string): Promise<SecretFileRead> {
 	const stat = await fs.promises.stat(filePath, { bigint: true });
 	const notFile = notRegularFile(stat);
@@ -148,7 +153,7 @@ async function readSecretFile(filePath: string): Promise<SecretFileRead> {
 	const handle = await fs.promises.open(filePath, SECRET_FILE_OPEN_FLAGS);
 	try {
 		const opened = await handle.stat({ bigint: true });
-		const refused = openedFileSkip(stat, opened);
+		const refused = openedFileSkip(stat, opened, undefined);
 		if (refused !== undefined) return refused;
 		const buffer = Buffer.allocUnsafe(Number(opened.size) + 1);
 		let length = 0;

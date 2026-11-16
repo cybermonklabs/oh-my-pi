@@ -112,6 +112,7 @@
 - Mnemopi's `per-project`/`per-project-tagged` memory banks now derive from the repository's primary checkout root, so every linked git worktree and Jujutsu workspace of one repository shares the same bank instead of each getting its own isolated one ([#9424](https://github.com/can1357/oh-my-pi/pull/9424) by [@sjawhar](https://github.com/sjawhar)).
 - `providers.anthropic.serverSideFallbackModels` makes the Anthropic server-side fallback chain configurable (e.g. `fable-5 -> opus-5 -> opus-4-8`) instead of the catalog's single-hop Opus 5 chain; the setting caps at the wire's three-entry limit and, when unset, follows the catalog chain ([#9376](https://github.com/can1357/oh-my-pi/pull/9376) by [@sjawhar](https://github.com/sjawhar)).
 - Added `lazy: true` for MCP servers in `mcp.json`: the server is not spawned at session startup — its tools are served from the tool cache and the first invocation (or `/mcp reconnect`) connects on demand. Useful for servers whose launch has side effects, such as credential prompts or approval flows. ([#9793](https://github.com/can1357/oh-my-pi/pull/9793) by [@sjawhar](https://github.com/sjawhar))
+- Secret obfuscation no longer fails every model request when a `secrets.yml` entry or a secret environment variable is very long
 
 ### Breaking Changes
 
@@ -131,7 +132,7 @@
 ### Changed
 
 - Secret obfuscation and the stream redaction of `omp stream` and `/record` no longer take `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS` from the environment: they hold git configuration key names and an askpass program path, not secrets, so text that holds those common strings reaches the model provider, stream viewers and recordings unchanged
-- Secret obfuscation no longer reads a `secrets.yml` larger than 1 MiB, or one that grows while it is read: it skips the file and logs a warning, as stored-session masking does
+- Secret obfuscation and the stream redaction of `omp stream` and `/record` skip a `secrets.yml` that is not a regular file, such as a FIFO, without opening it, and one that grows while it is read, with a warning
 - Merging a task's changes back (three-way patch apply, cherry-picking its branch, and restoring stashed edits) now reports a conflict when both sides edit adjacent lines, as git does, instead of merging both edits ([#16410](https://github.com/can1357/oh-my-pi/pull/16410) by [@sjawhar](https://github.com/sjawhar))
 - `async.maxJobs` now sets the cap on background jobs running at once in a session and its subagents without the fixed 100 ceiling, and `0` means no limit; the default stays 100
 - A session left working in a detached tmux pane no longer spends a slice of a core animating a screen nobody can see: the status line drops to one frame a second and the terminal-title spinner pauses until a client is watching again ([#17404](https://github.com/can1357/oh-my-pi/pull/17404) by [@sjawhar](https://github.com/sjawhar))

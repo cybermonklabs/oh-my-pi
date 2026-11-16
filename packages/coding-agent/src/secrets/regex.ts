@@ -19,14 +19,3 @@ export function compileSecretRegex(pattern: string, flags?: string): RegExp {
 
 	return new RegExp(resolvedPattern, enforceGlobalFlag(resolvedFlags));
 }
-
-/**
- * Regex source matching any of `literals`, deduplicated and longest first (ties
- * in code-unit order), so a literal that contains another wins.
- */
-export function literalAlternationSource(literals: Iterable<string>): string {
-	return Array.from(new Set(literals))
-		.sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0))
-		.map(literal => RegExp.escape(literal))
-		.join("|");
-}

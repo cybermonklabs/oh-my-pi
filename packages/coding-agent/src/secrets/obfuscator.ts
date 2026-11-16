@@ -1,3 +1,4 @@
+import { LiteralIndex } from "./literal-index";
 import {
 	buildHashBase,
 	buildKeyedReplacementRun,
@@ -42,7 +43,6 @@ import {
 	regexHasUnresolvableShortMatchFallback,
 	regexRematchesInContext,
 } from "./replacement";
-import { buildLiteralIndex, type LiteralIndex } from "./session-store-matcher";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
@@ -122,7 +122,7 @@ interface RegexScanMemo {
  */
 function buildLiteralDetector(literals: readonly string[], ignoreCase = false): LiteralIndex | undefined {
 	if (literals.length === 0) return undefined;
-	return buildLiteralIndex(literals, { ignoreCase });
+	return new LiteralIndex(literals, { ignoreCase });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
