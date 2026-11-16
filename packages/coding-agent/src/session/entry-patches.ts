@@ -160,9 +160,13 @@ export function entryAcceptsPatch(entry: SessionEntry, patch: EntryPatch): boole
 	return isContentRole(role) && (CONTENT_TAKES_STRING[role] || typeof message.content !== "string");
 }
 
-/** `value` for an entry that holds `current`: `current` itself when it is that value, else a copy. */
-function ownCopy<T>(current: T | undefined, value: T): T {
-	return current === value ? value : cloneJsonTree(value);
+/**
+ * `value` for `holder[key]`: `value` itself when `holder` already holds it
+ * there, else a copy. Reads `key`'s own data descriptor, so no accessor runs
+ * to answer the identity check.
+ */
+function ownCopy<H extends object, K extends keyof H>(holder: H, key: K, value: H[K]): H[K] {
+	return Object.getOwnPropertyDescriptor(holder, key)?.value === value ? value : cloneJsonTree(value);
 }
 
 /**
@@ -178,25 +182,29 @@ export function setPatchedFields(entry: SessionEntry, patch: EntryPatch): void {
 	if (fields && entry.type === "compaction") {
 		if (fields.warning !== undefined) entry.warning = fields.warning;
 		if (fields.tokensAfter !== undefined) entry.tokensAfter = fields.tokensAfter;
-		if (fields.preserveData !== undefined) entry.preserveData = ownCopy(entry.preserveData, fields.preserveData);
+		if (fields.preserveData !== undefined) entry.preserveData = ownCopy(entry, "preserveData", fields.preserveData);
 	}
 	if (fields?.content !== undefined && entry.type === "custom_message") {
-		entry.content = ownCopy(entry.content, fields.content);
+		entry.content = ownCopy(entry, "content", fields.content);
 	}
 	const patched = patch.message;
 	if (!patched || entry.type !== "message") return;
 	const message = entry.message;
 	if (message.role === "assistant") {
 		if (patched.retryRecovery !== undefined) {
-			message.retryRecovery = ownCopy(message.retryRecovery, patched.retryRecovery);
+			message.retryRecovery = ownCopy(message, "retryRecovery", patched.retryRecovery);
 		}
 		if (patched.contextSnapshot !== undefined) {
-			message.contextSnapshot = ownCopy(message.contextSnapshot, patched.contextSnapshot);
+			message.contextSnapshot = ownCopy(message, "contextSnapshot", patched.contextSnapshot);
 		}
 		if (patched.elidedOutputTokens !== undefined) message.elidedOutputTokens = patched.elidedOutputTokens;
 	}
 	if (patched.prunedAt !== undefined && message.role === "toolResult") message.prunedAt = patched.prunedAt;
-	if (patched.content !== undefined && "content" in message && message.content !== patched.content) {
+	if (
+		patched.content !== undefined &&
+		"content" in message &&
+		Object.getOwnPropertyDescriptor(message, "content")?.value !== patched.content
+	) {
 		// `entryAcceptsPatch` admits only roles whose `content` is one member of
 		// `Message["content"]`; TypeScript cannot narrow the assignment across the union.
 		const target: { content: Message["content"] } = message;
@@ -267,12 +275,13 @@ function applyRecords(
 	let changed = false;
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== ENTRY_PATCH_CUSTOM_TYPE) continue;
-		if (!isEntryPatchData(entry.data)) {
+		const data = entry.data;
+		if (!isEntryPatchData(data)) {
 			logger.warn("Skipping malformed entry patch record", { id: entry.id });
 			continue;
 		}
 		lookup ??= entriesById(entries);
-		for (const patch of entry.data.patches) {
+		for (const patch of data.patches) {
 			const target = lookup.get(patch.entryId);
 			if (!target) {
 				if (warnMissingTarget) {
