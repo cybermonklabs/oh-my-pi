@@ -63,6 +63,8 @@ interface HeldValue {
 }
 
 const REFRESH_INTERVAL_MS = 60_000;
+/** The most the file a `_FILE` variable names may hold: a larger one gives no value. A secrets.yml has no bound. */
+const MAX_FILE_SOURCE_BYTES = 1024 * 1024;
 const UNSAFE_NAME_CHARS = /[^A-Za-z0-9_.-]/g;
 
 /**
@@ -293,6 +295,7 @@ export class SessionStoreMasker {
 		try {
 			// A file whose stamp has not changed is neither opened nor read: what it gave still holds.
 			read = readSecretFileSync(filePath, {
+				maxBytes: MAX_FILE_SOURCE_BYTES,
 				unchanged: stat => this.#fileStamps.get(name) === stampOf(filePath, stat),
 			});
 		} catch (err) {
@@ -326,7 +329,7 @@ export class SessionStoreMasker {
 		else logger.debug("Session store masking skipped a file", { variable: name, reason });
 	}
 
-	/** Logs once why a secrets.yml gives no value: as a warning when it was skipped for its size. */
+	/** Logs once why a secrets.yml gives no value: as a warning when it grew while it was read. */
 	#skipSecretsFile(filePath: string, reason: string, oversized: boolean): void {
 		if (!this.#isNews(this.#reasonKey("secrets.yml", filePath), reason)) return;
 		if (oversized) logger.warn("Session store masking skipped a secrets.yml", { path: filePath, reason });
@@ -357,7 +360,8 @@ export class SessionStoreMasker {
 	#collectSecretsFile(filePath: string, scope: "project" | "global", held: HeldSet): void {
 		let read: SecretFileRead | UnchangedSecretFile;
 		try {
-			// A file whose stamp has not changed is neither opened nor read: what it gave still holds.
+			// A file whose stamp has not changed is neither opened nor read: what it gave still holds. A
+			// secrets.yml of any size is read: only a `_FILE` content is bounded.
 			read = readSecretFileSync(filePath, {
 				unchanged: stat => this.#secretsFileStamps.get(filePath) === stampOf(filePath, stat),
 			});
