@@ -83,7 +83,7 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 } from "../sdk";
-import { settingsStoreMask, storeMaskingOf } from "../secrets/session-store-mask";
+import { type SessionStoreMask, settingsStoreMask, storeMaskingOf } from "../secrets/session-store-mask";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -2941,9 +2941,11 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		rawOutput.trim().length > 0;
 	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
 		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
-		// `agent://<id>` serves these files: they hold markers, the returned result keeps the values.
-		const mask = settingsStoreMask(args.storeMaskSettings, args.storeMaskCwd);
+		// `agent://<id>` serves these files: they hold markers, the returned result keeps the values. A
+		// mask that cannot be built fails this write, and so the sidecar's, and nothing else.
+		let mask: SessionStoreMask | null = null;
 		try {
+			mask = settingsStoreMask(args.storeMaskSettings, args.storeMaskCwd);
 			const storedOutput = mask?.maskText(rawOutput) ?? rawOutput;
 			await writeArtifact(candidatePath, storedOutput);
 			outputPath = candidatePath;

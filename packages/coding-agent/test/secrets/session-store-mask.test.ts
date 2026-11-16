@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { collectEnvSecrets } from "@oh-my-pi/pi-coding-agent/secrets";
+import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
+import { loadSecretsFile } from "@oh-my-pi/pi-coding-agent/secrets/secrets-file";
 import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
 import * as storeMatcher from "@oh-my-pi/pi-coding-agent/secrets/session-store-matcher";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -457,6 +459,38 @@ describe("K22: a held value set past the pattern size the engine accepts", () =>
 		const expected = [FILE_MARKER, FILE_MARKER, FILE_MARKER].join("\n");
 		expect(await maskedAs(masker, text, expected)).toEqual({ direct: true, stored: true, errors: 0 });
 	}, 60_000);
+
+	it("K22 (obfuscator): obfuscates and restores a plain literal of 700,000 characters beside env values, a replace literal and a case-insensitive probed regex", () => {
+		// 43,750 runs of a counted word and eight dashes: 700,000 characters, half of them dashes,
+		// which an escape writes as four pattern characters each.
+		const long = Array.from({ length: 43_750 }, (_, n) => `fern${n.toString(36).padStart(4, "0")}--------`).join("");
+		const envValues = ["meadow-lantern-orchard-0001", "harbor-quill-saddle-0002", "copper-thistle-ember-0003"];
+		const replaced = "saddle-copper-ember-0004";
+		const replacement = "<replaced value>";
+		// A probe whose escape passes the size the engine accepts, so a pattern built of it would too;
+		// the text holds its match in upper case, which only the case-insensitive probe finds.
+		const probe = `zq${"-".repeat(300_000)}`;
+		const match = `ZQ${"-".repeat(300_000)}LANTERN12345`;
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: long, mode: "obfuscate" },
+			// As `collectEnvSecrets` gives env values.
+			...envValues.map(value => ({ type: "plain" as const, content: value, mode: "obfuscate" as const })),
+			{ type: "plain", content: replaced, mode: "replace", replacement },
+			{ type: "regex", content: `${probe}[a-z0-9]{12}`, flags: "i", literalPrefixes: [probe] },
+		]);
+		// The match comes first: the engine's `includes`, which the obfuscator's per-entry probe check
+		// runs, takes minutes to find a probe this long behind the dashed literal; that search builds
+		// no pattern, and no probe from a secrets.yml or the environment is ever this long.
+		const values = [match, long, ...envValues, replaced];
+		const text = values.join(" ");
+
+		// On ASCII text the case-insensitive probe check alone lets the regex collect its match.
+		expect(obfuscator.collectRegexSecretValuesForObfuscation(text).has(match)).toBe(true);
+		const obfuscated = obfuscator.obfuscate(text);
+		// Booleans, so a failure prints no value.
+		expect(values.map(value => obfuscated.includes(value))).toEqual(values.map(() => false));
+		expect(obfuscator.deobfuscate(obfuscated) === text.replace(replaced, replacement)).toBe(true);
+	}, 60_000);
 });
 
 describe("K23: a refresh whose read of a source fails", () => {
@@ -700,6 +734,21 @@ describe("K25: a FIFO whose writer waits in its own open", () => {
 		},
 		40_000,
 	);
+
+	it("K25: a secrets.yml over 1 MiB is read neither by the masker nor by the provider obfuscator's load, and each logs why", async () => {
+		const value = "oversized-yml-held-value-07";
+		// The entry first, then comment lines past 1 MiB: read whole, the file parses to that entry.
+		await Bun.write(projectYml, `${plainYml(value)}\n${"# a comment line that pads the file\n".repeat(32 * 1024)}`);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+
+		const mask = maskerFor({}).snapshot(cwd);
+		const entries = await loadSecretsFile(projectYml);
+		const held = { masked: mask.maskText(value) !== value, sources: mask.sources.length, entries: entries.length };
+		expect(held).toEqual({ masked: false, sources: 0, entries: 0 });
+		const skip = { path: projectYml, reason: "larger than 1 MiB" };
+		expect(loggedDetails(warn, "Session store masking skipped a secrets.yml")).toEqual([skip]);
+		expect(loggedDetails(warn, "Skipped secrets.yml")).toEqual([skip]);
+	});
 });
 
 describe("K27: the project secrets.yml of each cwd", () => {

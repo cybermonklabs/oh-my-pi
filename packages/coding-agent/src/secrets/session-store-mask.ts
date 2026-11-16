@@ -1,4 +1,4 @@
-import * as fs from "node:fs";
+import type * as fs from "node:fs";
 import * as path from "node:path";
 import { isEnoent, isEnotdir, isFsError, logger, toError } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
@@ -12,7 +12,14 @@ import {
 import type { SecretEntry } from "./obfuscator";
 import { MIN_OBFUSCATE_SECRET_LEN, sanitizeSecretFriendlyName } from "./placeholder";
 import { compileSecretRegex } from "./regex";
-import { globalSecretsFilePath, parseSecretsFileText, projectSecretsFilePath } from "./secrets-file";
+import {
+	globalSecretsFilePath,
+	parseSecretsFileText,
+	projectSecretsFilePath,
+	readSecretFileSync,
+	type SecretFileRead,
+	type UnchangedSecretFile,
+} from "./secrets-file";
 import { buildSessionStoreMatcher, MARKER_PREFIX, type SessionStoreMatcher } from "./session-store-matcher";
 import { cfgSecretsMaskSessionStore } from "./settings";
 
@@ -56,9 +63,6 @@ interface HeldValue {
 }
 
 const REFRESH_INTERVAL_MS = 60_000;
-const MIB = 1024 * 1024;
-/** The most a `_FILE` file may hold; a secrets.yml has no such limit. */
-const MAX_SECRET_FILE_BYTES = MIB;
 const UNSAFE_NAME_CHARS = /[^A-Za-z0-9_.-]/g;
 
 /**
@@ -135,37 +139,6 @@ interface ProjectState {
  */
 function stampOf(filePath: string, stat: fs.BigIntStats): string {
 	return `${filePath}\0${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-}
-
-/**
- * Read the regular file that `stat`, the caller's stat of `filePath`, describes, when it holds at
- * most `maxBytes`; throws on filesystem errors. The caller opens nothing but a regular file: an
- * open of a FIFO, even a non-blocking one, lets a writer that waits in its own open go on, and the
- * close then leaves that writer with no reader.
- */
-function readSecretFile(filePath: string, stat: fs.BigIntStats, maxBytes: number): { text: string } | { skip: string } {
-	// Non-blocking, and checked again on the descriptor: by now the path may name another file.
-	const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
-	try {
-		const opened = fs.fstatSync(fd, { bigint: true });
-		if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
-			return { skip: "replaced before it was opened" };
-		}
-		if (opened.size > maxBytes) return { skip: `larger than ${maxBytes / MIB} MiB` };
-		const size = Number(opened.size);
-		// One byte past the reported size reveals a file that grew after fstat.
-		const buffer = Buffer.allocUnsafe(size + 1);
-		let length = 0;
-		while (length < buffer.length) {
-			const read = fs.readSync(fd, buffer, length, buffer.length - length, length);
-			if (read === 0) break;
-			length += read;
-		}
-		if (length > size) return { skip: "grew past its reported size" };
-		return { text: buffer.toString("utf8", 0, length) };
-	} finally {
-		fs.closeSync(fd);
-	}
 }
 
 function collectSafely(kind: SessionStoreMaskSourceKind, collect: () => void): void {
@@ -316,22 +289,22 @@ export class SessionStoreMasker {
 
 	#collectFile(name: string, value: string): void {
 		const filePath = path.resolve(value);
-		let stamp: string;
-		let read: { text: string } | { skip: string };
+		let read: SecretFileRead | UnchangedSecretFile;
 		try {
-			const stat = fs.statSync(filePath, { bigint: true });
-			stamp = stampOf(filePath, stat);
-			if (this.#fileStamps.get(name) === stamp) return;
-			read = stat.isFile() ? readSecretFile(filePath, stat, MAX_SECRET_FILE_BYTES) : { skip: "not a regular file" };
+			// A file whose stamp has not changed is neither opened nor read: what it gave still holds.
+			read = readSecretFileSync(filePath, {
+				unchanged: stat => this.#fileStamps.get(name) === stampOf(filePath, stat),
+			});
 		} catch (err) {
 			// Not stamped, so the next refresh tries again even when the file has not changed.
 			if (isEnoent(err) || isEnotdir(err)) this.#skipFile(name, "missing");
 			else this.#failedRead("file", name, err);
 			return;
 		}
-		this.#fileStamps.set(name, stamp);
+		if ("unchanged" in read) return;
+		this.#fileStamps.set(name, stampOf(filePath, read.stat));
 		if ("skip" in read) {
-			this.#skipFile(name, read.skip);
+			this.#skipFile(name, read.skip, read.oversized);
 			return;
 		}
 		const content = read.text.trim();
@@ -346,16 +319,18 @@ export class SessionStoreMasker {
 		}
 	}
 
-	#skipFile(name: string, reason: string): void {
-		if (this.#isNews(this.#reasonKey("file", name), reason)) {
-			logger.debug("Session store masking skipped a file", { variable: name, reason });
-		}
+	/** Logs once why the file of `name` gives no value: as a warning when it was skipped for its size. */
+	#skipFile(name: string, reason: string, oversized = false): void {
+		if (!this.#isNews(this.#reasonKey("file", name), reason)) return;
+		if (oversized) logger.warn("Session store masking skipped a file", { variable: name, reason });
+		else logger.debug("Session store masking skipped a file", { variable: name, reason });
 	}
 
-	#skipSecretsFile(filePath: string, reason: string): void {
-		if (this.#isNews(this.#reasonKey("secrets.yml", filePath), reason)) {
-			logger.debug("Session store masking skipped a secrets.yml", { path: filePath, reason });
-		}
+	/** Logs once why a secrets.yml gives no value: as a warning when it was skipped for its size. */
+	#skipSecretsFile(filePath: string, reason: string, oversized: boolean): void {
+		if (!this.#isNews(this.#reasonKey("secrets.yml", filePath), reason)) return;
+		if (oversized) logger.warn("Session store masking skipped a secrets.yml", { path: filePath, reason });
+		else logger.debug("Session store masking skipped a secrets.yml", { path: filePath, reason });
 	}
 
 	/** Logs a read that failed, with its source and its cause; the values held so far stay masked. */
@@ -380,15 +355,12 @@ export class SessionStoreMasker {
 	}
 
 	#collectSecretsFile(filePath: string, scope: "project" | "global", held: HeldSet): void {
-		let stamp: string;
-		let read: { text: string } | { skip: string };
+		let read: SecretFileRead | UnchangedSecretFile;
 		try {
-			const stat = fs.statSync(filePath, { bigint: true });
-			stamp = stampOf(filePath, stat);
-			if (this.#secretsFileStamps.get(filePath) === stamp) return;
-			read = stat.isFile()
-				? readSecretFile(filePath, stat, Number.POSITIVE_INFINITY)
-				: { skip: "not a regular file" };
+			// A file whose stamp has not changed is neither opened nor read: what it gave still holds.
+			read = readSecretFileSync(filePath, {
+				unchanged: stat => this.#secretsFileStamps.get(filePath) === stampOf(filePath, stat),
+			});
 		} catch (err) {
 			// Not stamped, so the next refresh reads the file again even when it has not changed. A
 			// missing file clears the last reason, so a reason given after it is logged again.
@@ -396,11 +368,12 @@ export class SessionStoreMasker {
 			else this.#failedRead("secrets.yml", filePath, err);
 			return;
 		}
+		if ("unchanged" in read) return;
 		// Stamped now that it is read or skipped: the same file gives the same result next time, a
 		// text that does not parse included.
-		this.#secretsFileStamps.set(filePath, stamp);
+		this.#secretsFileStamps.set(filePath, stampOf(filePath, read.stat));
 		if ("skip" in read) {
-			this.#skipSecretsFile(filePath, read.skip);
+			this.#skipSecretsFile(filePath, read.skip, read.oversized);
 			return;
 		}
 		this.#loggedReasons.delete(this.#reasonKey("secrets.yml", filePath));

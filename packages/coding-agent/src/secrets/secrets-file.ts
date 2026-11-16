@@ -1,4 +1,4 @@
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
@@ -15,6 +15,42 @@ export interface PositionedSecretEntry {
 
 type RawSecretEntry = Omit<SecretEntry, "friendlyName"> & { friendlyName?: unknown };
 
+const MIB = 1024 * 1024;
+/** The most a secret file may hold: a `_FILE` file and a secrets.yml, in the store and in the obfuscator. */
+const MAX_SECRET_FILE_BYTES = MIB;
+/** Non-blocking: by the open, the path may name a FIFO. */
+const SECRET_FILE_OPEN_FLAGS = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
+/** UTF-8, as both readers decode: a leading byte-order mark is dropped, a malformed sequence becomes U+FFFD. */
+const UTF8 = new TextDecoder();
+
+/**
+ * A read of a secret file: its text, or why it was not read. Either way the stat of the path the read
+ * went by, which the session-store masker stamps the file with.
+ */
+export type SecretFileRead =
+	| { readonly text: string; readonly stat: fs.BigIntStats }
+	| {
+			readonly skip: string;
+			/** Skipped for its size: over 1 MiB, or grown past what its stat reported while it was read. */
+			readonly oversized: boolean;
+			readonly stat: fs.BigIntStats;
+	  };
+
+/** What a read gives when the caller's `unchanged` answered true: it opened nothing. */
+export interface UnchangedSecretFile {
+	readonly unchanged: true;
+}
+
+export interface SecretFileReadOptions {
+	/**
+	 * Sees the stat the read took of the path, before anything else: when it answers true, the read
+	 * opens nothing and gives {@link UnchangedSecretFile}.
+	 */
+	readonly unchanged?: (stat: fs.BigIntStats) => boolean;
+}
+
+const UNCHANGED: UnchangedSecretFile = { unchanged: true };
+
 /** The project-local secrets.yml of `cwd`. */
 export function projectSecretsFilePath(cwd: string): string {
 	return path.join(cwd, ".omp", "secrets.yml");
@@ -26,14 +62,15 @@ export function globalSecretsFilePath(agentDir: string): string {
 }
 
 /**
- * Read one secrets.yml; a missing file, a path that is not a regular file, a file that is not a YAML
- * array, and invalid entries yield nothing.
+ * Read one secrets.yml; a missing file, a path that is not a regular file, a file over 1 MiB or one
+ * that grew while it was read, a file that is not a YAML array, and invalid entries yield nothing.
  */
 export async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> {
 	try {
-		const read = await readRegularFile(filePath);
+		const read = await readSecretFile(filePath);
 		if ("skip" in read) {
-			logger.debug("Skipped secrets.yml", { path: filePath, reason: read.skip });
+			if (read.oversized) logger.warn("Skipped secrets.yml", { path: filePath, reason: read.skip });
+			else logger.debug("Skipped secrets.yml", { path: filePath, reason: read.skip });
 			return [];
 		}
 		return parseSecretsFile(read.text, filePath).map(({ entry }) => entry);
@@ -43,21 +80,103 @@ export async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> 
 }
 
 /**
- * The text of the regular file at `filePath`, or why it was not read; throws on filesystem errors.
- * Nothing but a regular file is opened: an open of a FIFO, even a non-blocking one, lets a writer
- * that waits in its own open go on, and the close then leaves that writer with no reader.
+ * What a read of the path whose stat is `stat` gives without opening it: unchanged, as the caller's
+ * `unchanged` says, or a skip when it is not a regular file, which neither reader opens.
  */
-async function readRegularFile(filePath: string): Promise<{ text: string } | { skip: string }> {
-	const stat = await fs.stat(filePath, { bigint: true });
-	if (!stat.isFile()) return { skip: "not a regular file" };
-	// Non-blocking, and checked again on the handle: by now the path may name another file.
-	const handle = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+function beforeOpen(
+	stat: fs.BigIntStats,
+	options: SecretFileReadOptions | undefined,
+): SecretFileRead | UnchangedSecretFile | undefined {
+	if (options?.unchanged?.(stat)) return UNCHANGED;
+	return stat.isFile() ? undefined : { skip: "not a regular file", oversized: false, stat };
+}
+
+/**
+ * The skip of the descriptor opened for the path whose stat is `stat`, when the descriptor's own stat,
+ * `opened`, shows another file than `stat` does, or one over the bound.
+ */
+function openedFileSkip(stat: fs.BigIntStats, opened: fs.BigIntStats): SecretFileRead | undefined {
+	if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+		return { skip: "replaced before it was opened", oversized: false, stat };
+	}
+	if (opened.size > MAX_SECRET_FILE_BYTES) {
+		return { skip: `larger than ${MAX_SECRET_FILE_BYTES / MIB} MiB`, oversized: true, stat };
+	}
+	return undefined;
+}
+
+/** The text of the `length` bytes read into `buffer`, which is one byte longer than the size the descriptor reported. */
+function readFileText(stat: fs.BigIntStats, buffer: Buffer, length: number): SecretFileRead {
+	// The byte past the reported size was read: the file grew after its stat.
+	if (length === buffer.length) return { skip: "grew past its reported size", oversized: true, stat };
+	return { text: UTF8.decode(buffer.subarray(0, length)), stat };
+}
+
+/**
+ * Reads the secret file at `filePath`, a `_FILE` file or a secrets.yml, following links; throws on a
+ * filesystem error, a missing path included. `options.unchanged` sees the stat first and, answering
+ * true, leaves the file unopened. Nothing but a regular file is opened: an open of a FIFO, even a
+ * non-blocking one, lets a writer that waits in its own open go on, and the close then leaves that
+ * writer with no reader. The descriptor is checked again, as by then the path may name another file,
+ * and the file is read only when it holds at most 1 MiB and did not grow while it was read.
+ * {@link readSecretFile} is the same read for an async caller.
+ */
+export function readSecretFileSync(filePath: string): SecretFileRead;
+export function readSecretFileSync(
+	filePath: string,
+	options: SecretFileReadOptions,
+): SecretFileRead | UnchangedSecretFile;
+export function readSecretFileSync(
+	filePath: string,
+	options?: SecretFileReadOptions,
+): SecretFileRead | UnchangedSecretFile {
+	const stat = fs.statSync(filePath, { bigint: true });
+	const unopened = beforeOpen(stat, options);
+	if (unopened !== undefined) return unopened;
+	const fd = fs.openSync(filePath, SECRET_FILE_OPEN_FLAGS);
+	try {
+		const opened = fs.fstatSync(fd, { bigint: true });
+		const refused = openedFileSkip(stat, opened);
+		if (refused !== undefined) return refused;
+		const buffer = Buffer.allocUnsafe(Number(opened.size) + 1);
+		let length = 0;
+		while (length < buffer.length) {
+			const read = fs.readSync(fd, buffer, length, buffer.length - length, length);
+			if (read === 0) break;
+			length += read;
+		}
+		return readFileText(stat, buffer, length);
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+/** {@link readSecretFileSync} for an async caller: the same checks, the same bound, the same decoding. */
+async function readSecretFile(filePath: string): Promise<SecretFileRead>;
+async function readSecretFile(
+	filePath: string,
+	options: SecretFileReadOptions,
+): Promise<SecretFileRead | UnchangedSecretFile>;
+async function readSecretFile(
+	filePath: string,
+	options?: SecretFileReadOptions,
+): Promise<SecretFileRead | UnchangedSecretFile> {
+	const stat = await fs.promises.stat(filePath, { bigint: true });
+	const unopened = beforeOpen(stat, options);
+	if (unopened !== undefined) return unopened;
+	const handle = await fs.promises.open(filePath, SECRET_FILE_OPEN_FLAGS);
 	try {
 		const opened = await handle.stat({ bigint: true });
-		if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
-			return { skip: "replaced before it was opened" };
+		const refused = openedFileSkip(stat, opened);
+		if (refused !== undefined) return refused;
+		const buffer = Buffer.allocUnsafe(Number(opened.size) + 1);
+		let length = 0;
+		while (length < buffer.length) {
+			const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+			if (bytesRead === 0) break;
+			length += bytesRead;
 		}
-		return { text: await Bun.file(handle.fd).text() };
+		return readFileText(stat, buffer, length);
 	} finally {
 		await handle.close();
 	}
