@@ -133,7 +133,7 @@ Regex entries always scan globally (the `g` flag is enforced automatically). The
 ## Invalid entries and files
 
 - A missing `secrets.yml` is treated as no entries.
-- A `secrets.yml` of any size is read. One that grows while it is read is skipped with a warning. A path that is not a regular file, such as a directory or a FIFO, is skipped without being opened.
+- A `secrets.yml` of any size is read. One that grows while it is read is skipped with a warning. A path that is not a regular file, such as a directory or a FIFO, is skipped without being opened, with a warning.
 - A parse failure or non-array document is ignored with a warning.
 - Invalid entries are skipped individually with a warning. `type` must be `plain` or `regex`; `content` must be a non-empty string; `mode`, `replacement`, `flags`, and regex syntax are validated as shown above.
 - Invalid optional `friendlyName` metadata is dropped without dropping an otherwise valid entry.

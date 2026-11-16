@@ -736,6 +736,14 @@ describe("K25: a FIFO whose writer waits in its own open", () => {
 		40_000,
 	);
 
+	it("K25: the provider obfuscator's load of a project secrets.yml that is a directory returns no entry and logs the skip as a warning", async () => {
+		// A log that keeps warnings only must still show that the file's entries are not used.
+		await fs.promises.mkdir(projectYml);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		expect(await loadSecretsFile(projectYml)).toEqual([]);
+		expect(loggedDetails(warn, "Skipped secrets.yml")).toEqual([{ path: projectYml, reason: "not a regular file" }]);
+	});
+
 	it("K25: a secrets.yml over 1 MiB is read by the masker, the provider obfuscator's load and the stream redactor, while a _FILE over 1 MiB is left out and logged", async () => {
 		const value = "oversized-yml-held-value-07";
 		// The entry first, then comment lines past 1 MiB: read whole, the file parses to that entry.

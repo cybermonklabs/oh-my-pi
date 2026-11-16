@@ -64,14 +64,14 @@ export function globalSecretsFilePath(agentDir: string): string {
 
 /**
  * Read one secrets.yml, of any size; a missing file, a path that is not a regular file, one that grew
- * while it was read, a file that is not a YAML array, and invalid entries yield nothing.
+ * while it was read, a file that is not a YAML array, and invalid entries yield nothing. Each but a
+ * missing file is logged as a warning.
  */
 export async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> {
 	try {
 		const read = await readSecretFile(filePath);
 		if ("skip" in read) {
-			if (read.oversized) logger.warn("Skipped secrets.yml", { path: filePath, reason: read.skip });
-			else logger.debug("Skipped secrets.yml", { path: filePath, reason: read.skip });
+			logger.warn("Skipped secrets.yml", { path: filePath, reason: read.skip });
 			return [];
 		}
 		return parseSecretsFile(read.text, filePath).map(({ entry }) => entry);

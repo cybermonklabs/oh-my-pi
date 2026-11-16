@@ -510,15 +510,14 @@ export function sessionStoreMaskFor(enabled: boolean, cwd: string, agentDir: str
 }
 
 /**
- * Makes the history.db `record` write of session `sessionId`: `write` gets `text` through the mask
- * `owner.storeMask()` gives (`text` itself while masking is off). A mask that cannot be built, or
- * that fails on `text`, skips that write and logs it: it is never made with the value unmasked,
- * and a history.db write never fails the rename or the recap it serves.
+ * Makes the history.db `record` write of session `owner.getSessionId()`: `write` gets `text` through
+ * the mask `owner.storeMask()` gives (`text` itself while masking is off). A mask that cannot be
+ * built, or that fails on `text`, skips that write and logs it: it is never made with the value
+ * unmasked, and a history.db write never fails the rename or the recap it serves.
  */
 export function recordMaskedHistory(
-	owner: { storeMask(): SessionStoreMask | null },
+	owner: { storeMask(): SessionStoreMask | null; getSessionId(): string },
 	text: string,
-	sessionId: string,
 	record: "title" | "recap",
 	write: (stored: string) => void,
 ): void {
@@ -527,7 +526,7 @@ export function recordMaskedHistory(
 		stored = owner.storeMask()?.maskText(text) ?? text;
 	} catch (err) {
 		logger.warn("Session store masking failed; skipped a history.db write", {
-			sessionId,
+			sessionId: owner.getSessionId(),
 			record,
 			error: toError(err).message,
 		});

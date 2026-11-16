@@ -18,6 +18,14 @@ const CHUNK_PATTERN_CHARS = 256 * 1024;
 
 const NON_ASCII_RE = /[^\x00-\x7F]/;
 
+/**
+ * Whether every character of `text` is ASCII: the rule a case-insensitive index holds its literals to,
+ * which a caller that must not see the constructor throw checks first.
+ */
+export function isAscii(text: string): boolean {
+	return !NON_ASCII_RE.test(text);
+}
+
 /** Where a key occurs in a text: the literals that start with it, and the indexes of its first and of its last occurrence. */
 export interface KeyReach {
 	readonly literals: readonly string[];
@@ -88,7 +96,7 @@ export class LiteralIndex {
 		for (const literal of literals) {
 			if (literal === "") continue;
 			// The error names the rule, never the literal, which may be a secret.
-			if (ignoreCase && NON_ASCII_RE.test(literal)) {
+			if (ignoreCase && !isAscii(literal)) {
 				throw new Error("A case-insensitive literal index holds only ASCII literals");
 			}
 			held.add(ignoreCase ? literal.toLowerCase() : literal);
