@@ -318,8 +318,9 @@ function spoolLines(lines: Iterable<string>): BodySpool {
 
 /**
  * `chunks` with the title slot laid over their first
- * {@link SESSION_TITLE_SLOT_BYTES} bytes, as {@link overlayTitleSlotPrefix}
- * lays it over a head window, from byte `fromByte` on.
+ * {@link SESSION_TITLE_SLOT_BYTES} bytes, as {@link overlayTitleSlotContent}
+ * lays it over a whole body (a body shorter than the slot reads as the slot
+ * alone), from byte `fromByte` on.
  */
 async function* overlayTitleSlotChunks(
 	chunks: AsyncIterable<Uint8Array>,
@@ -352,7 +353,7 @@ async function* overlayTitleSlotChunks(
 		yield skip > 0 ? out.subarray(skip) : out;
 		skip = 0;
 	}
-	if (head && headBytes > skip) yield overlaid().subarray(skip);
+	if (head && slot.byteLength > skip) yield slot.subarray(skip);
 }
 
 export class IndexedSessionStorage implements SessionStorage {
@@ -365,9 +366,9 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * The bytes from byte `fromByte`, read from the backend in chunks. Set only
 	 * when the backend has its own {@link SessionStorageBackend.readChunks}, so a
 	 * caller that finds it reads in bounded pieces; a caller that does not
-	 * reads the session whole once. As in {@link readTextFrom}, the title slot
-	 * is synthesized over the stored head, so a read that starts inside it
-	 * reads from the start and overlays it.
+	 * reads the session whole once. The bytes are those {@link readText} reads
+	 * from there: the title slot is synthesized over the stored head, so a read
+	 * that starts inside it reads from the start and overlays it.
 	 */
 	readonly readChunks?: (path: string, fromByte?: number) => AsyncIterable<Uint8Array>;
 	readonly #backend: SessionStorageBackend;
@@ -645,23 +646,31 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	/**
 	 * The text from byte `offset`, at most `maxBytes` of it, and the size the
-	 * read saw. Both come from the backend's read, not this storage's index, so
-	 * an append another process made since the index loaded is read too. The
-	 * title slot is synthesized over the stored head, so a read that starts
-	 * inside it reads from the start and overlays the slot.
+	 * read saw: the bytes and the size of what {@link readText} reads. Both come
+	 * from the backend's read, not this storage's index, so an append another
+	 * process made since the index loaded is read too. The title slot is
+	 * synthesized over the stored head, so a read that starts inside it reads
+	 * from the start and overlays the slot; a stored body shorter than the slot
+	 * reads as the slot alone, so the size is never less than the slot's.
 	 */
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
 		await this.#awaitPath(path);
-		const title = offset < SESSION_TITLE_SLOT_BYTES ? titleUpdateForIndex(entry) : undefined;
-		const start = title ? 0 : offset;
+		const title = titleUpdateForIndex(entry);
+		const start = title && offset < SESSION_TITLE_SLOT_BYTES ? 0 : offset;
 		const limit = maxBytes === undefined ? undefined : offset - start + Math.max(0, maxBytes);
 		const read = await this.#readBackendFrom(path, start, limit);
 		if (!read) throw enoent(path);
 		if (!title) return read;
-		const head = overlayTitleSlotPrefix(read.text, byteLength(read.text), title);
-		return { text: Buffer.from(head, "utf-8").subarray(offset).toString("utf-8"), size: read.size };
+		const size = Math.max(read.size, SESSION_TITLE_SLOT_BYTES);
+		if (start > 0) return { text: read.text, size };
+		// The window's bytes of the overlaid head: within the slot as many as
+		// over a body at least as long as the slot, so a shorter body reads as it.
+		const windowBytes = Math.min(limit ?? SESSION_TITLE_SLOT_BYTES, SESSION_TITLE_SLOT_BYTES);
+		const shown = Math.max(byteLength(read.text), windowBytes);
+		const head = overlayTitleSlotPrefix(read.text, shown, title);
+		return { text: Buffer.from(head, "utf-8").subarray(offset).toString("utf-8"), size };
 	}
 
 	async #readBackendFrom(

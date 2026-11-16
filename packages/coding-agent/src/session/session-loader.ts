@@ -126,6 +126,8 @@ export interface VisitEntriesFromFileStreamOptions {
 	 * storage, which is what a resumed session's own transcripts live in.
 	 */
 	storage?: SessionStorage;
+	/** The transcript's bytes, e.g. a decompressed archive, read instead of `filePath`. */
+	chunks?: AsyncIterable<Uint8Array>;
 }
 
 /** Controls how a missing session file is handled. */
@@ -431,7 +433,8 @@ export async function visitEntriesFromFileStream(
 		// delivering its bytes (macOS) or ignores the bound and streams the whole
 		// file (Windows).
 		let unread = maxBytes;
-		for await (const streamed of transcriptByteChunks(filePath, options.storage ?? defaultSessionStorage())) {
+		const chunks = options.chunks ?? transcriptByteChunks(filePath, options.storage ?? defaultSessionStorage());
+		for await (const streamed of chunks) {
 			if (stopped) break;
 			const chunk = streamed.byteLength > unread ? streamed.subarray(0, unread) : streamed;
 			unread -= chunk.byteLength;
@@ -501,7 +504,7 @@ export async function visitEntriesFromFileStream(
 /** Exported for testing — the ≥8MiB streaming path (works on any file size). */
 export async function loadEntriesFromFileStream(
 	filePath: string,
-	options?: Pick<VisitEntriesFromFileStreamOptions, "throwIfMissing" | "storage">,
+	options?: Pick<VisitEntriesFromFileStreamOptions, "throwIfMissing" | "storage" | "chunks">,
 ): Promise<SessionLoadResult> {
 	const entries: FileEntry[] = [];
 	let malformedRecords = 0;
@@ -516,6 +519,7 @@ export async function loadEntriesFromFileStream(
 				malformedRecords++;
 			},
 			throwIfMissing: options?.throwIfMissing,
+			chunks: options?.chunks,
 			onBytesConsumed: bytes => {
 				bytesConsumed += bytes;
 			},
