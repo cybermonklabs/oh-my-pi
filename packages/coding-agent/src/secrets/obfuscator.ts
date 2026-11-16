@@ -1,4 +1,4 @@
-import { LiteralIndex } from "./literal-index";
+import { isAscii, LiteralIndex } from "./literal-index";
 import {
 	buildHashBase,
 	buildKeyedReplacementRun,
@@ -86,7 +86,6 @@ export type JsonRecord = { [key: string]: JsonValue | undefined };
 
 const EMPTY_SECRET_VALUES: ReadonlySet<string> = new Set();
 const NO_VALUES: readonly string[] = [];
-const NON_ASCII_RE = /[^\x00-\x7F]/;
 
 /** Distinct placeholder prefixes whose regex verdict is memoized; forged prefixes beyond this are just re-tested. */
 const MAX_PREFIX_REGEX_MEMO = 4096;
@@ -300,7 +299,7 @@ export class SecretObfuscator {
 		this.#rawProbeDetector = buildLiteralDetector(this.#rawProbes);
 		const foldedProbes = regexEntries.flatMap(entry => (entry.ignoreCase ? (entry.probes ?? []) : []));
 		this.#foldedProbeDetector = buildLiteralDetector(foldedProbes);
-		if (!foldedProbes.some(probe => NON_ASCII_RE.test(probe))) {
+		if (foldedProbes.every(probe => isAscii(probe))) {
 			this.#asciiFoldedProbeDetector = buildLiteralDetector(foldedProbes, true);
 		}
 		let index = 0;
@@ -425,7 +424,7 @@ export class SecretObfuscator {
 	 */
 	#foldedProbeHit(text: string, folded: () => string): boolean {
 		if (this.#foldedProbeDetector === undefined) return false;
-		if (this.#asciiFoldedProbeDetector !== undefined && !NON_ASCII_RE.test(text)) {
+		if (this.#asciiFoldedProbeDetector !== undefined && isAscii(text)) {
 			return this.#asciiFoldedProbeDetector.test(text);
 		}
 		return this.#foldedProbeDetector.test(folded());
