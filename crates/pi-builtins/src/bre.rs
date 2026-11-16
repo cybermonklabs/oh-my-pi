@@ -18,19 +18,33 @@ pub(crate) enum Backrefs {
 	Unsupported,
 }
 
-/// A pattern the BRE dialect cannot express.
+/// A pattern the BRE and ERE dialects cannot express.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BreError {
 	/// A repetition operator with nothing to repeat, where the tools error
 	/// rather than treating the character as a literal.
 	RepetitionOperandMissing,
+	/// A bracket expression with no closing `]`.
+	BracketUnmatched,
+	/// A `[:name:]` naming no POSIX character class.
+	ClassNameInvalid,
+	/// A `[.c.]` or `[=c=]` holding other than one character.
+	CollationInvalid,
+	/// A range that runs backwards or has a class for an end, or a `-` after a
+	/// range or class in a bracket expression that is not its last member.
+	RangeEndInvalid,
 }
 
 impl BreError {
-	/// The message GNU and BSD grep both use for this condition.
+	/// The message the real tools print for this condition: GNU's and BSD's
+	/// alike for a missing operand, GNU's for a bracket expression.
 	pub(crate) fn message(self) -> &'static str {
 		match self {
 			Self::RepetitionOperandMissing => "repetition-operator operand invalid",
+			Self::BracketUnmatched => "Unmatched [, [^, [:, [., or [=",
+			Self::ClassNameInvalid => "Invalid character class name",
+			Self::CollationInvalid => "Invalid collation character",
+			Self::RangeEndInvalid => "Invalid range end",
 		}
 	}
 }
@@ -162,17 +176,15 @@ pub(crate) fn bre_to_ere(pattern: &str, backrefs: Backrefs) -> Result<String, Br
 					// A bracket expression is NOT BRE syntax: inside it, `\`,
 					// `(`, `|` and `*` are ordinary characters. Translating
 					// through it turned `[\(]` into a group opener and broke
-					// compilation, so the whole expression is scanned as
-					// bracket syntax and copied across.
-					match take_bracket_expression(&mut chars, true) {
-						Some(body) => {
-							result.push('[');
-							result.push_str(&body);
-						},
+					// compilation, so the whole expression is read as bracket
+					// syntax and written out in the engine's.
+					match take_bracket_expression(&mut chars, &mut result) {
+						Ok(()) => {},
 						// Unterminated. Measured, both tools reject it -
 						// "brackets ([ ]) not balanced" - so the half-open
 						// `[` is passed through for the engine to refuse.
-						None => result.push('['),
+						Err(BreError::BracketUnmatched) => result.push('['),
+						Err(error) => return Err(error),
 					}
 					has_atom = true;
 				},
@@ -254,69 +266,177 @@ fn ends_branch(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
 	}
 }
 
-/// Consume a bracket expression's body, returning it without the outer `[]`.
-///
-/// The opening `[` is already consumed. Returns `None` - advancing nothing -
-/// when the expression is unterminated.
-///
-/// With `normalize`, the body is rewritten so the engine reads it the way
-/// POSIX does: `\` has no special meaning inside a bracket expression, so it
-/// is doubled to stay a literal, and a leading `]` is escaped rather than
-/// closing the expression. Measured, `grep -c '[\(]'` selects lines holding a
-/// backslash OR a parenthesis, and `grep -c '[]x]'` selects lines holding a
-/// bracket or an `x`.
-///
-/// Without it the body is copied verbatim, which is what an already-extended
-/// pattern needs: the caller is only locating the expression so it can skip
-/// over it, and must not change how it matches.
-fn take_bracket_expression(
-	chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-	normalize: bool,
-) -> Option<String> {
-	let mut probe = chars.clone();
-	let mut body = String::new();
+/// The character classes POSIX defines in every locale: the names GNU grep
+/// accepts in `[:name:]`.
+const POSIX_CLASSES: [&str; 12] = [
+	"alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
+	"upper", "xdigit",
+];
 
-	// A leading `^` negates, and a `]` immediately after that is the literal
-	// `]` rather than the terminator.
-	if probe.peek() == Some(&'^') {
-		body.push(probe.next()?);
-	}
-	if probe.peek() == Some(&']') {
-		body.push_str(if normalize { r"\]" } else { "]" });
-		probe.next();
-	}
-
-	while let Some(c) = probe.next() {
-		match c {
-			']' => {
-				*chars = probe;
-				return Some(body + "]");
-			},
-			// `\` is an ordinary character here; keep it one.
-			'\\' => body.push_str(if normalize { r"\\" } else { "\\" }),
-			// `[:alpha:]`, `[.x.]` and `[=x=]` carry their own terminators, so
-			// the `]` that closes them does not close the bracket expression.
-			'[' if matches!(probe.peek(), Some(':' | '.' | '=')) => {
-				let kind = probe.next()?;
-				body.push('[');
-				body.push(kind);
-				let mut previous = None;
-				loop {
-					let next = probe.next()?;
-					body.push(next);
-					if previous == Some(kind) && next == ']' {
-						break;
-					}
-					previous = Some(next);
-				}
-			},
-			_ => body.push(c),
-		}
-	}
-	None
+/// One member of a bracket expression.
+#[derive(Clone, Copy)]
+enum BracketMember {
+	/// A character, written plainly or as the collating symbol `[.c.]`.
+	Char(char),
+	/// The equivalence class `[=c=]`, which holds `c` alone, as in GNU grep's
+	/// C locale. Unlike a character it neither starts nor ends a range.
+	Equivalence(char),
+	/// `[:name:]`, one of `POSIX_CLASSES`.
+	Class(&'static str),
 }
 
-/// Make an ERE's non-interval `{` the literal both real tools treat it as.
+/// Consume a bracket expression whose `[` is already consumed, and append it
+/// to `out` in the form the `regex` crate reads with the meaning POSIX gives
+/// it.
+///
+/// Inside a bracket expression `\` is an ordinary character, a `]` first in
+/// the list (after a negating `^`) is a member, `-` is a member first or last
+/// in the list or as a range's end, and `[` opens something only as
+/// `[:name:]`, `[.c.]` or `[=c=]`. The `regex` crate reads `\` as an escape,
+/// `[` as a nested class and `&&`, `--` and `~~` as set operations, so each
+/// member is written with the escape that keeps it a plain member. Measured
+/// against GNU grep: `[\(]` selects a backslash or a parenthesis, `[]x]` a
+/// bracket or an `x`, `[[]` a `[`, `[a&&b]` an `a`, `&` or `b`, `[~~]` a `~`,
+/// and `[!--]` any character from `!` to `-`.
+///
+/// The errors are GNU's, met in its order: a list with no closing `]`, a
+/// class name POSIX does not define, a collating symbol or equivalence class
+/// of other than one character, and a range that runs backwards or has a
+/// class for an end, or a `-` after a range or class that does not close the
+/// list. On error `chars` and `out` are left as they were.
+fn take_bracket_expression(
+	chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+	out: &mut String,
+) -> Result<(), BreError> {
+	let mark = out.len();
+	let mut probe = chars.clone();
+	match write_bracket_expression(&mut probe, out) {
+		Ok(()) => {
+			*chars = probe;
+			Ok(())
+		},
+		Err(error) => {
+			out.truncate(mark);
+			Err(error)
+		},
+	}
+}
+
+/// [`take_bracket_expression`]'s reading, on a copy of the input it may drop.
+fn write_bracket_expression(
+	chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+	out: &mut String,
+) -> Result<(), BreError> {
+	out.push('[');
+	if chars.next_if_eq(&'^').is_some() {
+		out.push('^');
+	}
+	// A `-` first in the list is a member.
+	let mut first = true;
+	loop {
+		let member = take_bracket_member(chars, first)?;
+		first = false;
+		match member {
+			BracketMember::Char(start) if opens_range(chars) => {
+				chars.next();
+				// A `-` right after the range's own is its end, as in `[!--]`.
+				let BracketMember::Char(end) = take_bracket_member(chars, true)? else {
+					return Err(BreError::RangeEndInvalid);
+				};
+				if end < start {
+					return Err(BreError::RangeEndInvalid);
+				}
+				push_bracket_char(out, start);
+				out.push('-');
+				push_bracket_char(out, end);
+			},
+			BracketMember::Char(c) | BracketMember::Equivalence(c) => push_bracket_char(out, c),
+			BracketMember::Class(name) => {
+				out.push_str("[:");
+				out.push_str(name);
+				out.push_str(":]");
+			},
+		}
+		match chars.peek() {
+			None => return Err(BreError::BracketUnmatched),
+			Some(']') => {
+				chars.next();
+				out.push(']');
+				return Ok(());
+			},
+			Some(_) => {},
+		}
+	}
+}
+
+/// Consume one member of a bracket expression. A `-` is a member first in
+/// the list or as a range's end (`accept_hyphen`); anywhere else it follows a
+/// range or a class, and GNU refuses it unless it is the last member.
+fn take_bracket_member(
+	chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+	accept_hyphen: bool,
+) -> Result<BracketMember, BreError> {
+	match chars.next().ok_or(BreError::BracketUnmatched)? {
+		'[' => match chars.next_if(|&c| matches!(c, ':' | '.' | '=')) {
+			Some(delimiter) => take_bracket_symbol(chars, delimiter),
+			None => Ok(BracketMember::Char('[')),
+		},
+		'-' if !accept_hyphen && chars.peek() != Some(&']') => Err(BreError::RangeEndInvalid),
+		c => Ok(BracketMember::Char(c)),
+	}
+}
+
+/// Consume the rest of `[:name:]`, `[.c.]` or `[=c=]` after its `delimiter`.
+/// As in GNU's regex, the name ends at the first `delimiter` that a `]`
+/// follows, so it may start with `]` (`[.].]`) or be empty (`[..]`).
+fn take_bracket_symbol(
+	chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+	delimiter: char,
+) -> Result<BracketMember, BreError> {
+	let name_start = chars.clone();
+	let mut length = 0;
+	loop {
+		let c = chars.next().ok_or(BreError::BracketUnmatched)?;
+		if c == delimiter && chars.next_if_eq(&']').is_some() {
+			break;
+		}
+		length += 1;
+	}
+	let mut name = name_start.take(length);
+	if delimiter == ':' {
+		return POSIX_CLASSES
+			.into_iter()
+			.find(|class| class.chars().eq(name.clone()))
+			.map(BracketMember::Class)
+			.ok_or(BreError::ClassNameInvalid);
+	}
+	match (name.next(), name.next()) {
+		(Some(c), None) if delimiter == '.' => Ok(BracketMember::Char(c)),
+		(Some(c), None) => Ok(BracketMember::Equivalence(c)),
+		_ => Err(BreError::CollationInvalid),
+	}
+}
+
+/// Whether a `-` comes next and opens a range: one right before the closing
+/// `]` is the last member instead.
+fn opens_range(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+	let mut ahead = chars.clone();
+	ahead.next() == Some('-') && ahead.peek() != Some(&']')
+}
+
+/// Append `c` as a member of a `regex` crate class, escaped where that crate
+/// would read it as syntax: an escape, a nested class or its end, a negation,
+/// a range, or the `&&`, `--` and `~~` set operations.
+fn push_bracket_char(out: &mut String, c: char) {
+	if matches!(c, '\\' | '[' | ']' | '^' | '-' | '&' | '~') {
+		out.push('\\');
+	}
+	out.push(c);
+}
+
+/// Rewrite an ERE into the form the `regex` crate reads with the meaning GNU
+/// grep gives it: each bracket expression as [`take_bracket_expression`]
+/// writes it, and each `{` that opens no interval escaped.
 ///
 /// POSIX leaves a `{` that opens no interval undefined, and both GNU and BSD
 /// grep take it literally, while the `regex` crate rejects the pattern
@@ -335,14 +455,13 @@ fn take_bracket_expression(
 /// A digit after `{` is what separates the two - it marks an attempted
 /// interval, which is left for the engine to accept or reject.
 #[cfg(feature = "util.grep")]
-pub(crate) fn ere_literalize_braces(pattern: &str) -> std::borrow::Cow<'_, str> {
-	if !pattern.contains('{') {
-		return std::borrow::Cow::Borrowed(pattern);
+pub(crate) fn ere_to_regex(pattern: &str) -> Result<std::borrow::Cow<'_, str>, BreError> {
+	if !pattern.contains(['{', '[']) {
+		return Ok(std::borrow::Cow::Borrowed(pattern));
 	}
 
 	let mut result = String::with_capacity(pattern.len());
 	let mut chars = pattern.chars().peekable();
-	let mut rewrote = false;
 
 	while let Some(c) = chars.next() {
 		match c {
@@ -354,22 +473,13 @@ pub(crate) fn ere_literalize_braces(pattern: &str) -> std::borrow::Cow<'_, str> 
 				}
 			},
 			// A brace inside a bracket expression is already a literal.
-			'[' => match take_bracket_expression(&mut chars, false) {
-				Some(body) => {
-					result.push('[');
-					result.push_str(&body);
-				},
-				None => result.push('['),
-			},
-			'{' if !chars.peek().is_some_and(char::is_ascii_digit) => {
-				result.push_str(r"\{");
-				rewrote = true;
-			},
+			'[' => take_bracket_expression(&mut chars, &mut result)?,
+			'{' if !chars.peek().is_some_and(char::is_ascii_digit) => result.push_str(r"\{"),
 			_ => result.push(c),
 		}
 	}
 
-	if rewrote { std::borrow::Cow::Owned(result) } else { std::borrow::Cow::Borrowed(pattern) }
+	Ok(std::borrow::Cow::Owned(result))
 }
 
 /// True when an ERE contains a repetition operator with nothing to repeat.
@@ -383,6 +493,8 @@ pub(crate) fn ere_literalize_braces(pattern: &str) -> std::borrow::Cow<'_, str> 
 pub(crate) fn ere_repetition_operand_missing(pattern: &str) -> bool {
 	let mut chars = pattern.chars().peekable();
 	let mut has_atom = false;
+	// Holds the translation of each bracket expression, read to find its end.
+	let mut bracket = String::new();
 	while let Some(c) = chars.next() {
 		match c {
 			// An escaped character is a literal, and therefore an atom.
@@ -392,19 +504,12 @@ pub(crate) fn ere_repetition_operand_missing(pattern: &str) -> bool {
 				}
 				has_atom = true;
 			},
-			// A bracket expression is one atom. `]` immediately after the
-			// opening bracket (or its negation) is a literal, not the close.
+			// A bracket expression is one atom. One the translation refuses
+			// is reported there.
 			'[' => {
-				if chars.peek() == Some(&'^') {
-					chars.next();
-				}
-				if chars.peek() == Some(&']') {
-					chars.next();
-				}
-				for inner in chars.by_ref() {
-					if inner == ']' {
-						break;
-					}
+				bracket.clear();
+				if take_bracket_expression(&mut chars, &mut bracket).is_err() {
+					return false;
 				}
 				has_atom = true;
 			},
@@ -679,5 +784,137 @@ mod tests {
 		for pattern in ["{1}", "^{2}", "{3,}", "{4,5}", "(|{6})"] {
 			assert!(ere_repetition_operand_missing(pattern), "should reject {pattern}");
 		}
+	}
+
+	// ── Bracket expressions ──────────────────────────────────────────────────
+	// POSIX has no nested class and no set operation inside `[...]`; the
+	// `regex` crate has both, so a member it would read as syntax is written
+	// escaped. Each pattern's meaning below is GNU grep 3.11's.
+
+	#[test]
+	fn bracket_members_the_regex_crate_reads_as_syntax_are_escaped() {
+		// `[` is a member: `[[]` selects `[`, and `[[:space:]*?[]` a space,
+		// `*`, `?` or `[`.
+		assert_eq!(ere("[[]"), r"[\[]");
+		assert_eq!(ere("[[:space:]*?[]"), r"[[:space:]*?\[]");
+		// `&&` and `~~` are two members each, not set operations.
+		assert_eq!(ere("[a&&b]"), r"[a\&\&b]");
+		assert_eq!(ere("[~~]"), r"[\~\~]");
+		// A `-` right after a range's own is the range's end; first or last in
+		// the list a `-` is a member.
+		assert_eq!(ere("[!--]"), r"[!-\-]");
+		assert_eq!(ere("[--/]"), r"[\--/]");
+		assert_eq!(ere("[%--a]"), r"[%-\-a]");
+		assert_eq!(ere("[-a]"), r"[\-a]");
+		assert_eq!(ere("[a-]"), r"[a\-]");
+		assert_eq!(ere("[--]"), r"[\-\-]");
+		assert_eq!(ere("[a-z-]"), r"[a-z\-]");
+		// A `^` that does not negate.
+		assert_eq!(ere("[a^]"), r"[a\^]");
+	}
+
+	#[test]
+	fn common_bracket_expressions_keep_their_meaning() {
+		assert_eq!(ere("[a-z]"), "[a-z]");
+		assert_eq!(ere("[^x]"), "[^x]");
+		// `]` first in the list, or first after `^`, is a member.
+		assert_eq!(ere("[]a]"), r"[\]a]");
+		assert_eq!(ere("[^]a]"), r"[^\]a]");
+		assert_eq!(ere("[]-a]"), r"[\]-a]");
+		assert_eq!(ere("[[:alpha:]]"), "[[:alpha:]]");
+		assert_eq!(ere("[[:digit:][:alpha:]-]"), r"[[:digit:][:alpha:]\-]");
+		// `\` is a member, so `[\]]` is a backslash and then a `]`. Outside a
+		// bracket expression `\]` is still an escaped `]`.
+		assert_eq!(ere(r"[\]]"), r"[\\]]");
+		assert_eq!(ere(r"a\]"), r"a\]");
+	}
+
+	#[test]
+	fn collating_symbols_and_equivalence_classes_are_their_character() {
+		assert_eq!(ere("[[.-.]]"), r"[\-]");
+		assert_eq!(ere("[[.].]]"), r"[\]]");
+		assert_eq!(ere("[[...]]"), "[.]");
+		assert_eq!(ere("[[=a=]]"), "[a]");
+		assert_eq!(ere("[[.a.]-b]"), "[a-b]");
+		assert_eq!(ere("[a-[.z.]]"), "[a-z]");
+	}
+
+	#[test]
+	fn invalid_bracket_expressions_are_refused_as_gnu_grep_refuses_them() {
+		for (pattern, error) in [
+			("[[:foo:]]", BreError::ClassNameInvalid),
+			// Names the `regex` crate knows and POSIX does not.
+			("[[:ascii:]]", BreError::ClassNameInvalid),
+			("[[:^alpha:]]", BreError::ClassNameInvalid),
+			("[[::]]", BreError::ClassNameInvalid),
+			("[[.ab.]]", BreError::CollationInvalid),
+			("[[..]]", BreError::CollationInvalid),
+			("[[==]]", BreError::CollationInvalid),
+			("[z-a]", BreError::RangeEndInvalid),
+			("[a--]", BreError::RangeEndInvalid),
+			("[a-b-z]", BreError::RangeEndInvalid),
+			("[[:alpha:]-z]", BreError::RangeEndInvalid),
+			("[[=a=]-z]", BreError::RangeEndInvalid),
+			("[a-[:alpha:]]", BreError::RangeEndInvalid),
+			("[a-[=z=]]", BreError::RangeEndInvalid),
+		] {
+			assert_eq!(ere_err(pattern), Some(error), "{pattern}");
+		}
+	}
+
+	#[test]
+	fn unterminated_bracket_expression_is_left_for_the_engine_in_a_bre() {
+		// `grep` then reaches its literal fallback, as it did before.
+		assert_eq!(ere("a[d"), "a[d");
+		assert_eq!(ere("[]"), "[]");
+		assert_eq!(ere("[[:alpha:"), "[[:alpha:");
+	}
+
+	#[cfg(feature = "util.grep")]
+	fn ere_regex(pattern: &str) -> String {
+		ere_to_regex(pattern).expect("translatable").into_owned()
+	}
+
+	#[cfg(feature = "util.grep")]
+	#[test]
+	fn ere_bracket_expressions_are_read_as_in_a_bre() {
+		assert_eq!(ere_regex("[[]"), r"[\[]");
+		assert_eq!(ere_regex("[[:space:]*?[]"), r"[[:space:]*?\[]");
+		assert_eq!(ere_regex("[a&&b]+"), r"[a\&\&b]+");
+		assert_eq!(ere_regex("[~~]"), r"[\~\~]");
+		assert_eq!(ere_regex("[!--]"), r"[!-\-]");
+		// `\` is a member inside a bracket expression and an escape outside.
+		assert_eq!(ere_regex(r"[\(]|\("), r"[\\(]|\(");
+		assert_eq!(ere_regex(r"[\]]"), r"[\\]]");
+		// A brace is a literal inside a bracket expression, and outside one
+		// unless it opens an interval.
+		assert_eq!(ere_regex("[{]{a}a{2}"), r"[{]\{a}a{2}");
+		// With neither, the pattern itself.
+		assert!(matches!(ere_to_regex("a|b"), Ok(std::borrow::Cow::Borrowed("a|b"))));
+	}
+
+	#[cfg(feature = "util.grep")]
+	#[test]
+	fn ere_invalid_bracket_expressions_are_refused() {
+		for (pattern, error) in [
+			("a[", BreError::BracketUnmatched),
+			("[]", BreError::BracketUnmatched),
+			("[[:alpha:]", BreError::BracketUnmatched),
+			("[[:foo:]]", BreError::ClassNameInvalid),
+			("[[.ab.]]", BreError::CollationInvalid),
+			("[z-a]", BreError::RangeEndInvalid),
+		] {
+			assert_eq!(ere_to_regex(pattern).err(), Some(error), "{pattern}");
+		}
+	}
+
+	#[cfg(feature = "util.grep")]
+	#[test]
+	fn ere_operand_check_reads_a_bracket_expression_whole() {
+		// The `(` and `+` are members, so nothing repeats a missing operand.
+		for pattern in ["[[:alpha:](+]", "[](+]*", "[[.].](+]"] {
+			assert!(!ere_repetition_operand_missing(pattern), "should accept {pattern}");
+		}
+		assert!(ere_repetition_operand_missing("[a](+)"), "should reject [a](+)");
 	}
 }
