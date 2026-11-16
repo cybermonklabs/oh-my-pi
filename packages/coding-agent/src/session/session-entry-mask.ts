@@ -8,9 +8,9 @@
  * with nothing to mask comes back as the same object; a masked one shares every untouched such
  * subtree with the live entry.
  *
- * The walk reads each value as `stringifyJson` writes it to the session line: through its `toJSON`,
- * a `bigint` as its decimal string, a boxed primitive as its primitive, an object as its own
- * enumerable keys; the copy holds any node of another kind as that stored form, in plain data.
+ * The walk reads a primitive, a plain object or a real array as itself. Any other node (a `bigint`,
+ * a boxed primitive, a node with a callable `toJSON`, a class instance) it reads as the plain data
+ * `stringifyJson` itself writes for that node under the same key, and the copy holds that data.
  * A position keeps a value only in the shape the table declares for it, judged on the live value:
  * a string field a primitive string, a `[]` field a real array of strings, an object or
  * array-element position a plain object; any other shape there is free content, every string masked.
@@ -35,8 +35,8 @@
  * - KR12: outside this walk, `SessionStoreMask.maskText` leaves a range that equals one of its own markers as it is.
  * - KR13: object keys, numbers, booleans and `null`, never masked.
  */
-import { isBigIntObject, isBooleanObject, isBoxedPrimitive, isNumberObject, isStringObject } from "node:util/types";
-import { countNewlines, isRecord, tryParseJson } from "@oh-my-pi/pi-utils";
+import { isBoxedPrimitive } from "node:util/types";
+import { countNewlines, isRecord, stringifyJson, tryParseJson } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
@@ -651,62 +651,28 @@ function maskFree(value: unknown, key: string | number, walk: MaskWalk): unknown
 }
 
 /**
- * `value`, a node `stringifyJson` does not write as itself, masked as its {@link storedForm} in plain
- * data. The form is not read through `toJSON` again, so an object or array that still has one is
- * copied as its own enumerable keys or its items. A boxed `BigInt` there, which `stringifyJson`
- * cannot write, leaves `value` itself, so the write fails as it does with masking off.
+ * `value`, a node `stringifyJson` does not write as itself, masked as the plain data `stringifyJson`
+ * writes for it under `key`, read back as free content: that data holds no `toJSON` and no
+ * function, and is `undefined` when nothing is written. A node `stringifyJson` cannot write (a
+ * boxed `BigInt`, a cycle) throws here, so the write fails as it does with masking off.
  */
 function maskStoredForm(value: object | bigint, key: string | number, walk: MaskWalk): unknown {
-	const form = storedForm(value, key);
-	if (typeof form === "string") return walk.text(form);
-	if (isBigIntObject(form)) return value;
-	if (isRealArray(form)) return maskArray(form, walk, undefined, false);
-	if (Array.isArray(form)) {
-		const copy: unknown[] = [];
-		for (let i = 0; i < form.length; i++) copy.push(maskFree(form[i], i, walk));
-		return copy;
-	}
-	if (typeof form === "object" && form !== null) {
-		if (isPlainObject(form)) return maskObject(form, walk, undefined);
-		const copy: Record<string, unknown> = {};
-		for (const formKey in form) {
-			if (Object.hasOwn(form, formKey)) setOwn(copy, formKey, maskFree(Reflect.get(form, formKey), formKey, walk));
-		}
-		return copy;
-	}
-	// A number, a boolean or `null` is written as it is; a function, a symbol or `undefined` not at all.
-	return typeof form === "function" || typeof form === "symbol" ? undefined : form;
+	// Under the same key, so a `toJSON` gets the key it gets when the session line is written. A
+	// plain object always serializes; `ownValue`, so a key nothing is written under reads no
+	// `Object.prototype` member.
+	const name = String(key);
+	const holder: Record<string, unknown> = JSON.parse(stringifyJson({ [name]: value })!);
+	return maskFree(ownValue(holder, name), name, walk);
 }
 
-/**
- * What `stringifyJson` writes for `value` under `key` before it reads any key of it: the result of
- * its callable `toJSON`, not read through `toJSON` again; then a `bigint` as its decimal string and a
- * boxed `String`, `Number` or `Boolean` as its primitive.
- */
-function storedForm(value: object | bigint, key: string | number): unknown {
-	const toJSON: unknown =
-		typeof value === "bigint" ? Reflect.get(BigInt.prototype, "toJSON", value) : Reflect.get(value, "toJSON");
-	const form: unknown = typeof toJSON === "function" ? toJSON.call(value, String(key)) : value;
-	if (typeof form === "bigint") return form.toString();
-	return typeof form === "object" && form !== null ? (boxedPrimitive(form) ?? form) : form;
-}
-
-/** The primitive a boxed `String`, `Number` or `Boolean` holds, read as `JSON.stringify` reads it; `undefined` for any other object. */
-function boxedPrimitive(value: object): string | number | boolean | undefined {
-	if (!isBoxedPrimitive(value)) return undefined;
-	if (isStringObject(value)) return String(value);
-	if (isNumberObject(value)) return Number(value);
-	return isBooleanObject(value) ? Boolean.prototype.valueOf.call(value) : undefined;
-}
-
-/** Whether `value` is a plain object: an `Object` or `null` prototype, no callable `toJSON`, no boxed primitive. */
+/** Whether `value` is a plain object: an `Object` or `null` prototype, no callable `toJSON`, not a boxed primitive. */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const prototype: unknown = Object.getPrototypeOf(value);
 	return (
 		(prototype === Object.prototype || prototype === null) &&
 		typeof Reflect.get(value, "toJSON") !== "function" &&
-		boxedPrimitive(value) === undefined
+		!isBoxedPrimitive(value)
 	);
 }
 

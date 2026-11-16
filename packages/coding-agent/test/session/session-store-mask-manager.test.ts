@@ -3962,6 +3962,93 @@ for (const backend of backends) {
 	});
 }
 
+/** A class whose `toJSON` gives a `URL` holding {@link ENV_VALUE}; the session line stores that `URL` as its own keys: none. */
+class LinkReport {
+	toJSON(): URL {
+		return new URL(`https://example.invalid/page?ref=${ENV_VALUE}`);
+	}
+}
+
+/**
+ * K26: nodes whose `toJSON` result has a callable `toJSON` of its own. `stringifyJson` calls the
+ * `toJSON` of a node once, so the session line stores such a result as its own keys, without what
+ * its `toJSON` gives; an array element it reads through the element's own `toJSON`.
+ */
+const NESTED_TO_JSON_NODES: readonly { readonly name: string; readonly node: () => unknown }[] = [
+	{
+		name: "a toJSON result whose own toJSON returns the held value",
+		node: () => ({ toJSON: () => ({ inner: "plain", toJSON: () => HELD }) }),
+	},
+	{
+		name: "a toJSON result whose own toJSON returns an object holding it",
+		node: () => ({ toJSON: () => ({ inner: "plain", toJSON: () => ({ note: HELD }) }) }),
+	},
+	{
+		name: "an array toJSON result with such an element",
+		node: () => ({
+			toJSON: () => [
+				{ toJSON: () => ({ inner: "plain", toJSON: () => HELD }) },
+				{ inner: "plain", toJSON: () => HELD },
+			],
+		}),
+	},
+	{ name: "a class whose toJSON returns a URL holding it", node: () => new LinkReport() },
+];
+
+describe("K26: a toJSON result with a toJSON of its own, under file storage", () => {
+	/** `line`, stored for a parsed entry, with the id, the parent and the time of the entry `live` stores. */
+	const withIdentityOf = (line: string, live: string): string => {
+		const { id, parentId, timestamp } = JSON.parse(live);
+		return stringifyJson({ ...JSON.parse(line), id, parentId, timestamp }) ?? "";
+	};
+
+	for (const { name, node } of NESTED_TO_JSON_NODES) {
+		it(`K26: stores ${name} in tool result details and in custom data as the entry passed through JSON`, async () => {
+			maskWrites();
+			const storage = new FileSessionStorage();
+			const manager = SessionManager.create(cwd, tmp.join("sessions"), storage);
+			await manager.ensureOnDisk();
+			manager.appendMessage(
+				assistant([{ type: "toolCall", id: "call-k26", name: "lookup", arguments: {} }], { stopReason: "toolUse" }),
+			);
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "call-k26",
+				toolName: "lookup",
+				content: [{ type: "text", text: "plain" }],
+				details: { report: node() },
+				isError: false,
+				timestamp: NOW,
+			});
+			manager.appendCustomEntry("k26-data", { report: node() });
+			// The same two entries passed first through `JSON.parse(stringifyJson(entry))`, appended after them.
+			const [parsedResult, parsedCustom]: (SessionEntry | undefined)[] = manager
+				.getEntries()
+				.slice(-2)
+				.map(entry => JSON.parse(stringifyJson(entry) ?? "null"));
+			if (
+				parsedResult?.type !== "message" ||
+				parsedResult.message.role !== "toolResult" ||
+				parsedCustom?.type !== "custom"
+			) {
+				throw new Error("Expected the tool result and the custom entry");
+			}
+			manager.appendMessage(parsedResult.message);
+			manager.appendCustomEntry(parsedCustom.customType, parsedCustom.data);
+			await settle(manager, storage);
+			const lines = (await storage.readText(sessionFileOf(manager))).split("\n").filter(line => line.length > 0);
+			const [liveResultLine, liveCustomLine, parsedResultLine, parsedCustomLine] = lines.slice(-4);
+			expect({
+				name,
+				held: lines.some(line => line.includes(ENV_VALUE)),
+				detailsAsParsed: liveResultLine === withIdentityOf(parsedResultLine, liveResultLine),
+				dataAsParsed: liveCustomLine === withIdentityOf(parsedCustomLine, liveCustomLine),
+			}).toEqual({ name, held: false, detailsAsParsed: true, dataAsParsed: true });
+			await manager.close();
+		});
+	}
+});
+
 describe("copy-on-write of the stored copy", () => {
 	it("returns an entry of plain data with nothing to mask as itself, and copies any other node as its plain stored form", () => {
 		const content = [{ type: "text", text: "plain" }];
@@ -3993,7 +4080,7 @@ describe("copy-on-write of the stored copy", () => {
 		}).toEqual({ plainSame: true, nodesCopied: true, nodesAsStored: true, untouchedShared: true });
 	});
 
-	it("leaves a boxed BigInt, which the session line cannot store, as it is, so the write fails as with masking off", () => {
+	it("fails the masked write of a boxed BigInt, which the session line cannot store, as with masking off", () => {
 		const entry = storedMessageEntry("boxed-bigint", {
 			role: "toolResult",
 			toolCallId: "boxed-call",
@@ -4003,18 +4090,17 @@ describe("copy-on-write of the stored copy", () => {
 			isError: false,
 			timestamp: NOW,
 		});
-		const outcome = (record: unknown): string => {
+		const outcome = (write: () => string | undefined): string => {
 			try {
-				return `stored ${stringifyJson(record)}`;
+				return `stored ${write()}`;
 			} catch (error) {
 				return error instanceof TypeError ? "TypeError" : "another error";
 			}
 		};
-		const masked = maskSessionEntry(entry, mask);
-		expect({ unmasked: outcome(entry), masked: outcome(masked) }).toEqual({
-			unmasked: "TypeError",
-			masked: "TypeError",
-		});
+		expect({
+			unmasked: outcome(() => stringifyJson(entry)),
+			masked: outcome(() => stringifyJson(maskSessionEntry(entry, mask))),
+		}).toEqual({ unmasked: "TypeError", masked: "TypeError" });
 	});
 
 	for (const { name, message, bound } of NON_PLAIN_BINDINGS) {
