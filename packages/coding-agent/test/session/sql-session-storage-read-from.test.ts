@@ -203,6 +203,42 @@ for (const { adapter, url } of BACKENDS) {
 			}
 		});
 
+		it("reads a titled session's window as readText's bytes cut there, where the cut splits a character", async () => {
+			await using db = connect();
+			const storage = await db.open();
+			const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+			// The stored slot's title puts "é" at bytes 34-35, so a window ending at byte 35 splits it.
+			const storedSlot = serializeTitleSlot({ title: "Café", source: "auto", updatedAt: "t1" });
+			const sessions = [
+				{ path: "/sessions/p/ascii.jsonl", body: `${storedSlot}${header}`, title: "New" },
+				// "Ü" at bytes 31-32 of the slot this title gives.
+				{ path: "/sessions/p/unicode.jsonl", body: `${storedSlot}${header}`, title: "Ünïcödé ☕" },
+				// No slot: the overlay ends inside the "é" at bytes 255-256.
+				{ path: "/sessions/p/split.jsonl", body: `${"a".repeat(255)}é${"b".repeat(40)}\n`, title: "New" },
+			];
+			for (const { path, body, title } of sessions) {
+				await storage.writeText(path, body);
+				await storage.updateSessionTitle(path, { title, source: "user", updatedAt: "t2" });
+			}
+
+			// Every window compared at once, so a failure shows each one.
+			const read: Array<{ path: string; offset: number; maxBytes: number; text: string }> = [];
+			const cut: typeof read = [];
+			for (const [path, offset, maxBytes] of [
+				["/sessions/p/ascii.jsonl", 0, 35],
+				["/sessions/p/unicode.jsonl", 0, 35],
+				["/sessions/p/unicode.jsonl", 32, 0],
+				["/sessions/p/split.jsonl", 0, 256],
+				["/sessions/p/split.jsonl", 0, 260],
+			] as const) {
+				const { text } = await readSessionTextFrom(storage, path, offset, maxBytes);
+				read.push({ path, offset, maxBytes, text });
+				const whole = Buffer.from(await storage.readText(path));
+				cut.push({ path, offset, maxBytes, text: whole.subarray(offset, offset + maxBytes).toString("utf8") });
+			}
+			expect(read).toEqual(cut);
+		});
+
 		it("reads what another client appended after this store loaded its index, with the size it read", async () => {
 			await using db = connect();
 			const storage = await db.open();

@@ -831,7 +831,7 @@ export const cfgRetryRateLimitFallbackMaxContextTokens = register({
 		group: "Retry & Fallback",
 		label: "Rate Limit Fallback Context Cap",
 		description:
-			"A rate limit never moves a session whose context is larger than this many tokens down retry.fallbackChains: the turn keeps retrying the rate-limited model and, once retry.maxRetries is spent, ends with the provider's error. The new model would have to write the whole context to its prompt cache.",
+			"A rate limit never moves a session whose context is larger than this many tokens down retry.fallbackChains: the turn keeps retrying the rate-limited model and, once retry.maxRetries is spent or the stated wait is past retry.maxDelayMs, ends with the provider's error. The new model would have to write the whole context to its prompt cache.",
 	},
 });
 

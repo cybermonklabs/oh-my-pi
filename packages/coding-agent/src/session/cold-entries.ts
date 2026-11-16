@@ -101,8 +101,10 @@ const PATCH_RECORD_CUSTOM_TYPE = "entry_patch";
 
 /** Whether `entry` stays whole wherever it lies, by its type ({@link ENTRY_TYPES_KEPT_WHOLE}). */
 export function keptWholeByKind(entry: SessionEntry): boolean {
-	if (entry.type === "custom") return entry.customType !== PATCH_RECORD_CUSTOM_TYPE;
-	return ENTRY_TYPES_KEPT_WHOLE.has(entry.type);
+	return (
+		ENTRY_TYPES_KEPT_WHOLE.has(entry.type) &&
+		!(entry.type === "custom" && entry.customType === PATCH_RECORD_CUSTOM_TYPE)
+	);
 }
 
 /** Fields that always stay data: the tree structure every walk reads. */
@@ -509,11 +511,11 @@ interface CachedRecord {
  * One loaded manager's records of cold entries: a file under
  * `os.tmpdir()/omp-cold-<uid>/`, unlinked as soon as it is open on POSIX (its disk
  * is freed when the descriptor closes, and a killed process leaves nothing;
- * on Windows it is deleted when the store is collected and at exit). A record
- * is the entry exactly as the manager held it, with image data replaced by
- * blob references. Every cold entry refers to its store, so a clone sharing
- * the entries keeps it open as long as it needs it; the last manager holding
- * it closes it when that manager closes ({@link release}).
+ * on Windows it is deleted when the store is closed or collected and at
+ * exit). A record is the entry exactly as the manager held it, with image
+ * data replaced by blob references. Every cold entry refers to its store, so
+ * a clone sharing the entries keeps it open as long as it needs it; the last
+ * manager holding it closes it when that manager closes ({@link release}).
  */
 export class ColdEntryStore {
 	readonly #blobs: BlobStore;
@@ -741,7 +743,7 @@ export function hydrateColdEntry(entry: object, options?: { resolveBlobs?: boole
 		}
 		const shellSlots: ColdMessageSlots = shell;
 		delete shellSlots[COLD_OWNER];
-		Object.defineProperty(entry, "message", { value: shell, writable: true, enumerable: true, configurable: true });
+		setOwnField(entry, "message", shell);
 		delete slots[COLD_MESSAGE];
 	}
 	restoreFields(entry, parsed, entryFieldAccessors);
@@ -760,7 +762,7 @@ function restoreFields(
 ): void {
 	for (const key of Object.keys(target)) {
 		if (!isAccessorFrom(target, key, accessors)) continue;
-		Object.defineProperty(target, key, { value: source[key], writable: true, enumerable: true, configurable: true });
+		setOwnField(target, key, source[key]);
 	}
 }
 
@@ -905,4 +907,16 @@ export function convertToColdEntry(
 	}
 	if (options?.paced) paceCollection(data.length);
 	return true;
+}
+
+/** {@link convertToColdEntry} for each of `entries` that `boundary` leaves cold ({@link belongsCold}). */
+export function convertColdEntries(
+	entries: readonly SessionEntry[],
+	boundary: ColdBoundary,
+	openStore: () => ColdEntryStore | undefined,
+	options?: { paced?: boolean },
+): void {
+	for (let index = 0; index < entries.length; index++) {
+		if (belongsCold(boundary, index)) convertToColdEntry(entries[index]!, openStore, options);
+	}
 }

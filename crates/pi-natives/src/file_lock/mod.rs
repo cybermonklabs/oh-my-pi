@@ -64,10 +64,11 @@ impl FileLock {
 
 	/// Try to acquire `path` without waiting for a holder to release it.
 	///
-	/// On Linux a claim refused because the lock's name is in use is retried
-	/// for at most 200 ms, and at most 10 times 100 µs apart while a holder
-	/// answers on the name: under gVisor a probe of the name can make the claim
-	/// that follows a release find the name in use for a few milliseconds.
+	/// On Linux a claim refused because the lock's name is in use reports the
+	/// lock taken at once when this process holds it, and is otherwise retried
+	/// for at most 200 ms, and for at most 50 ms while a holder answers on the
+	/// name: under gVisor a probe of the name can make the claim that follows
+	/// a release find the name in use for a few milliseconds.
 	#[napi(factory)]
 	pub fn try_acquire(path: JsString) -> napi::Result<Self> {
 		let path = js::utf8(path)?;

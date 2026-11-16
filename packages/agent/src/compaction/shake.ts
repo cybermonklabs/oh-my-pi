@@ -13,16 +13,16 @@
 
 import type { TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { Tokenizer } from "../tokenizer";
-import type { AgentMessage, AgentToolCall } from "../types";
+import type { AgentMessage } from "../types";
 import type { CustomMessageEntry, SessionEntry, SessionMessageEntry } from "./entries";
 import { invalidateMessageCache } from "./message-cache";
 import {
-	collectToolCallsById,
 	getToolResultMessage,
 	isArtifactRecoveryToolResult,
 	isProtectedToolResult,
 	isSkillReadToolResult,
 	type ProtectedToolMatcher,
+	SentToolCalls,
 } from "./tool-protection";
 
 export interface ShakeConfig {
@@ -322,25 +322,17 @@ export function collectShakeRegions(entries: SessionEntry[], tokenizer: Tokenize
 					entries.findIndex(entry => entry.id === config.keepBoundaryId),
 				);
 
-	// Tokens of all entries strictly more recent than index i, from the boundary on.
+	// Tokens of all entries strictly more recent than index i, from the boundary on;
+	// slot i - boundaryIndex holds the count for entry i.
 	// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
-	const accumulatedAfter = new Array<number>(n);
+	const accumulatedAfter = new Array<number>(n - boundaryIndex);
 	let acc = 0;
 	for (let i = n - 1; i >= boundaryIndex; i--) {
-		accumulatedAfter[i] = acc;
+		accumulatedAfter[i - boundaryIndex] = acc;
 		acc += entryTokens(entries[i], tokenizer);
 	}
 
-	// Calls of the sent region are indexed up front; the prefix only when a result
-	// there pairs with a call before the boundary. Later calls win, as one scan does.
-	const sentToolCalls = collectToolCallsById(entries, boundaryIndex);
-	let prefixToolCalls: Map<string, AgentToolCall> | undefined;
-	const toolCallOf = (id: string): AgentToolCall | undefined => {
-		const call = sentToolCalls.get(id);
-		if (call !== undefined || boundaryIndex === 0) return call;
-		prefixToolCalls ??= collectToolCallsById(entries, 0, boundaryIndex);
-		return prefixToolCalls.get(id);
-	};
+	const toolCalls = new SentToolCalls(entries, boundaryIndex);
 
 	const regions: ShakeRegion[] = [];
 	for (let i = boundaryIndex; i < n; i++) {
@@ -349,10 +341,10 @@ export function collectShakeRegions(entries: SessionEntry[], tokenizer: Tokenize
 		// Useless-flagged results carry no information once consumed; they are
 		// eligible even inside the protect-recent window.
 		const uselessResult = toolResult !== undefined && toolResult.useless === true && toolResult.isError !== true;
-		if (!uselessResult && accumulatedAfter[i] < config.protectTokens) continue;
+		if (!uselessResult && accumulatedAfter[i - boundaryIndex] < config.protectTokens) continue;
 		if (toolResult) {
 			if (toolResult.prunedAt !== undefined) continue;
-			if (isProtectedToolResult(toolResult, toolCallOf(toolResult.toolCallId), config.protectedTools)) continue;
+			if (isProtectedToolResult(toolResult, toolCalls.get(toolResult.toolCallId), config.protectedTools)) continue;
 			const text = toolResultText(toolResult, tokenizer);
 			if (!text) continue;
 			regions.push({

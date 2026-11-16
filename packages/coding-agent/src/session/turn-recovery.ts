@@ -3283,11 +3283,16 @@ export class TurnRecovery {
 						creditBalanceRejection ? AIError.CREDIT_BALANCE_BACKOFF_MS : 0,
 					),
 				);
+			// Deferring a chain candidate only pays when another attempt on this
+			// model can succeed: not when `sameModelRetryAvailable` says the turn
+			// ends instead, and not under `retry.rateLimitWalksChain` for a rate
+			// limit on this model, which the next attempt re-hits.
+			const deferToSameModel = sameModelRetryAvailable && !sourceRateLimited;
 			// The rate-limit wait (see `rateLimited`), measured on the context the
 			// provider reported for the newest answered request.
 			const rateLimitHoldsModel =
 				rateLimited &&
-				((sameModelRetryAvailable && !sourceRateLimited) ||
+				(deferToSameModel ||
 					(findTranscriptUsageAnchor(this.#host.agent.state.messages)?.tokens ?? 0) >
 						retrySettings.rateLimitFallbackMaxContextTokens);
 			if (
@@ -3319,11 +3324,7 @@ export class TurnRecovery {
 					refusalWalk: classifierRefusal,
 					preserveFailedTurn,
 					wrapAround: longUsageLimitFallback,
-					// Deferring a chain candidate only pays when another attempt on this
-					// model can succeed: not when `sameModelRetryAvailable` says the turn
-					// ends instead, and not under `retry.rateLimitWalksChain` for a rate
-					// limit on this model, which the next attempt re-hits.
-					sameModelRetryAvailable: sameModelRetryAvailable && !sourceRateLimited,
+					sameModelRetryAvailable: deferToSameModel,
 				});
 			}
 			// Auto fallback from a Fireworks Fast variant to its base model. Independent

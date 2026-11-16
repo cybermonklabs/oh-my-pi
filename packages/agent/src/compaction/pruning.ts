@@ -4,16 +4,16 @@
 
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { Tokenizer } from "../tokenizer";
-import type { AgentMessage, AgentToolCall } from "../types";
+import type { AgentMessage } from "../types";
 import type { SessionEntry, SessionMessageEntry } from "./entries";
 import { invalidateMessageCache } from "./message-cache";
 import { type ConvertToLlm, defaultConvertToLlm, getMessageFromEntry } from "./messages";
 import {
-	collectToolCallsById,
 	getToolResultMessage,
 	isProtectedToolResult,
 	isSkillReadToolResult,
 	type ProtectedToolMatcher,
+	SentToolCalls,
 } from "./tool-protection";
 import { isAlternateFormReadSelector, splitReadSelector } from "./utils";
 
@@ -309,84 +309,6 @@ function resolveBoundaryIndex(entries: readonly SessionEntry[], keepBoundaryId: 
 		if (entries[i].id === keepBoundaryId) return i;
 	}
 	return 0;
-}
-
-/**
- * Tool calls of a summarized-away prefix `entries[0, length)` by call id: the
- * assistant entry holding each call, and in `resolved` the calls lookups have
- * read from those entries, arguments included.
- */
-interface PrefixToolCalls {
-	readonly length: number;
-	readonly boundary: SessionEntry;
-	readonly entryById: Map<string, SessionEntry>;
-	readonly resolved: Map<string, AgentToolCall>;
-}
-
-/**
- * The latest prefix index by the first entry of its branch. A branch prefix is
- * the path from the root to its boundary, so one index serves every pass while
- * the boundary and the branch stay; a new boundary or another branch replaces
- * it, so an older compaction's index never outlives the next one built for the
- * session.
- */
-const prefixToolCalls = new WeakMap<SessionEntry, PrefixToolCalls>();
-
-function prefixToolCallIndex(entries: readonly SessionEntry[], length: number): PrefixToolCalls {
-	const first = entries[0];
-	const boundary = entries[length];
-	const cached = prefixToolCalls.get(first);
-	if (cached && cached.length === length && cached.boundary === boundary) return cached;
-	const entryById = new Map<string, SessionEntry>();
-	for (let i = 0; i < length; i++) {
-		const entry = entries[i];
-		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-		for (const block of entry.message.content) {
-			if (block.type === "toolCall") entryById.set(block.id, entry);
-		}
-	}
-	const index: PrefixToolCalls = { length, boundary, entryById, resolved: new Map() };
-	prefixToolCalls.set(first, index);
-	return index;
-}
-
-function prefixToolCall(index: PrefixToolCalls, id: string): AgentToolCall | undefined {
-	const resolved = index.resolved.get(id);
-	if (resolved !== undefined) return resolved;
-	const entry = index.entryById.get(id);
-	if (entry?.type !== "message" || entry.message.role !== "assistant") return undefined;
-	const call = entry.message.content.findLast(
-		(block): block is AgentToolCall => block.type === "toolCall" && block.id === id,
-	);
-	if (call !== undefined) index.resolved.set(id, call);
-	return call;
-}
-
-/**
- * Tool-call lookup for results in the sent region `entries[start, end)`.
- * Calls there are indexed eagerly; the summarized-away prefix is indexed only
- * on the first miss, once per boundary and branch (see
- * {@link prefixToolCallIndex}), so lookups match a whole-branch scan while
- * repeated passes never walk history the boundary already excludes.
- */
-class SentToolCalls {
-	readonly #entries: readonly SessionEntry[];
-	readonly #start: number;
-	readonly #sent: Map<string, AgentToolCall>;
-	#prefix: PrefixToolCalls | undefined;
-
-	constructor(entries: readonly SessionEntry[], start: number) {
-		this.#entries = entries;
-		this.#start = start;
-		this.#sent = collectToolCallsById(entries, start);
-	}
-
-	get(id: string): AgentToolCall | undefined {
-		const call = this.#sent.get(id);
-		if (call !== undefined || this.#start === 0) return call;
-		this.#prefix ??= prefixToolCallIndex(this.#entries, this.#start);
-		return prefixToolCall(this.#prefix, id);
-	}
 }
 
 interface SupersedeCandidate {
