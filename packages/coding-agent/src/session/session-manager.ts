@@ -41,10 +41,11 @@ import {
 	coldEntryForPersistence,
 	convertToColdEntry,
 	copyColdEntry,
-	ENTRY_TYPES_KEPT_WHOLE,
 	hydrateColdEntry,
+	keptWholeByKind,
 	LoadedValueInterner,
 	isColdEntry,
+	streamedKeptStart,
 } from "./cold-entries";
 import type { CompactionMethod } from "./compaction-methods";
 import {
@@ -1337,7 +1338,9 @@ export class SessionManager {
 	readonly #coldStoreEnabled: boolean;
 	/** The store new cold entries go to; created when the first entry turns cold. */
 	#coldStore: ColdEntryStore | undefined;
-	/** The model the cut was last computed for (see `coldCutIndex`); unset until a context build names one. */
+	/** A store could not be opened since the last load: entries stay whole instead of trying again for each. */
+	#coldStoreUnavailable = false;
+	/** The model the cut was last computed for (see `coldCutPathIndex`); unset until a context build names one. */
 	#coldCutModel: Model | undefined;
 	/** The leaf, the entries or the newest compaction changed since the cut was last applied. */
 	#coldCutStale = false;
@@ -1839,7 +1842,9 @@ export class SessionManager {
 	 * manager's first entries, at least the durable frontier's, followed by
 	 * them, the frontier extends over all of them, so this manager's next
 	 * entries follow as an append; otherwise the retried rewrite republishes
-	 * them with the rest.
+	 * them with the rest. An `entry_patch` record among them sets its fields on
+	 * the entries it names, as a load does: the rewrite writes those fields
+	 * inline and the record empty.
 	 */
 	#adoptForeignEntries(found: ForeignEntries, diskSize: number): void {
 		const leaf = this.#index.leafId();
@@ -1854,6 +1859,7 @@ export class SessionManager {
 		this.#index.setLeaf(leaf);
 		this.#entries = [...this.#entries.slice(0, found.at), ...kept, ...this.#entries.slice(found.at)];
 		this.#expectedDiskSize = diskSize;
+		if (applyEntryPatches(kept, this.#index)) this.#bodyRevision++;
 		this.#durable =
 			found.extendsFrontier && durable && kept.length === found.foreign.length
 				? durableFrontier(this.#entriesGeneration, found.shared + kept.length, diskSize)
@@ -3068,28 +3074,43 @@ export class SessionManager {
 
 	/** Start over with `store` as the cold store: the cut is computed again, for no model yet. */
 	#resetColdCut(store: ColdEntryStore | undefined): void {
-		this.#coldStore = store;
+		this.#adoptColdStore(store);
+		this.#coldStoreUnavailable = false;
 		this.#coldCutModel = undefined;
 		this.#coldCutStale = false;
 	}
 
-	/** The store new cold entries go to, created on first use. */
-	#openColdStore(): ColdEntryStore {
-		this.#coldStore ??= new ColdEntryStore(this.#blobs);
-		return this.#coldStore;
+	/** Make `store` the one new cold entries go to, holding it in place of the previous one. */
+	#adoptColdStore(store: ColdEntryStore | undefined): void {
+		if (store === this.#coldStore) return;
+		this.#coldStore?.release(false);
+		store?.retain();
+		this.#coldStore = store;
 	}
 
 	/**
-	 * Bring every entry in line with `boundary`: in the `hydrate` phase entries
-	 * from the cut on (and the kinds kept whole) become whole again, in the
-	 * `convert` phase the others become cold.
+	 * The store new cold entries go to, created on first use; undefined when
+	 * none can be opened, and then not tried again before the next load.
+	 */
+	#openColdStore(): ColdEntryStore | undefined {
+		if (this.#coldStore || this.#coldStoreUnavailable) return this.#coldStore;
+		const store = ColdEntryStore.open(this.#blobs);
+		if (store) this.#adoptColdStore(store);
+		else this.#coldStoreUnavailable = true;
+		return store;
+	}
+
+	/**
+	 * Bring every entry in line with `boundary`: in the `hydrate` phase the
+	 * entries it keeps whole become whole again, in the `convert` phase the
+	 * others become cold.
 	 */
 	#applyColdBoundary(boundary: ColdBoundary, phase: "hydrate" | "convert"): void {
 		const entries = this.#entries;
 		const openStore = () => this.#openColdStore();
 		for (let index = 0; index < entries.length; index++) {
 			const entry = entries[index]!;
-			const cold = belongsCold(entry, index, boundary);
+			const cold = belongsCold(boundary, index);
 			if (phase === "hydrate") {
 				if (!cold) hydrateColdEntry(entry);
 			} else if (cold) {
@@ -3573,13 +3594,16 @@ export class SessionManager {
 	/**
 	 * Stream the session at `filePath` into memory one entry at a time, so the
 	 * transcript is never held whole: each entry is migrated, its usage
-	 * completed, adapted for a fork and indexed; every entry whose type is not
-	 * kept whole is written to a new cold store as it arrives. After the stream
-	 * the cut is computed, the entries from it on (and those kept whole by
-	 * position) are made whole again, stale replay metadata is stripped (after
-	 * any load-time pass, so from what the passes left), an entry before the cut
-	 * that a pass or the stripping made whole goes back to the store, and the
-	 * whole entries' blob references are resolved.
+	 * completed, adapted for a fork and indexed. When the stream reaches a
+	 * compaction, the entries before its kept start that are not kept whole by
+	 * kind are written to a new cold store; the entries since stay whole until
+	 * a later compaction or the end of the stream decides, so a session with no
+	 * compaction writes nothing. After the stream the cut is computed for the
+	 * leaf, the entries it keeps whole are made whole again, stale replay
+	 * metadata is stripped (after any load-time pass, so from what the passes
+	 * left), every other entry still whole goes to the store (an entry off the
+	 * leaf's path, or one a pass or the stripping made whole), and the whole
+	 * entries' blob references are resolved.
 	 */
 	async #loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
 		// A current-version file whose first entry has no id may predate ids
@@ -3640,16 +3664,25 @@ export class SessionManager {
 			entries: SessionEntry[];
 			index: SessionEntryIndex;
 			store: ColdEntryStore | undefined;
+			/** A store could not be opened: the entries stay whole. */
+			storeUnavailable: boolean;
+			/** Entries before this index were offered to the store by a compaction's kept start. */
+			cooled: number;
 			/** Entries carrying replay metadata a resume strips, sanitized once the load-time passes ran. */
 			unsanitized: SessionEntry[];
 		} = {
 			entries: [],
 			index: new SessionEntryIndex(),
 			store: undefined,
+			storeUnavailable: false,
+			cooled: 0,
 			unsanitized: [],
 		};
 		const openStore = () => {
-			intake.store ??= new ColdEntryStore(this.#blobs);
+			if (!intake.store && !intake.storeUnavailable) {
+				intake.store = ColdEntryStore.open(this.#blobs);
+				intake.storeUnavailable = intake.store === undefined;
+			}
 			return intake.store;
 		};
 		const startMigration = (current: SessionHeader): SessionEntryMigration => {
@@ -3696,8 +3729,13 @@ export class SessionManager {
 				interner.intern(entry, entry.parentId === null ? undefined : intake.index.get(entry.parentId));
 				intake.entries.push(entry);
 				intake.index.insert(entry);
-				if (this.#coldStoreEnabled && !ENTRY_TYPES_KEPT_WHOLE.has(entry.type)) {
-					convertToColdEntry(entry, openStore, { imagesExternalized: true, paced: true });
+				if (this.#coldStoreEnabled && entry.type === "compaction") {
+					const keptStart = streamedKeptStart(intake.entries, entry, intake.cooled, id => intake.index.has(id));
+					for (; intake.cooled < keptStart; intake.cooled++) {
+						const older = intake.entries[intake.cooled]!;
+						if (keptWholeByKind(older)) continue;
+						convertToColdEntry(older, openStore, { imagesExternalized: true, paced: true });
+					}
 				}
 			});
 			if (needsIndexCheck) {
@@ -3706,31 +3744,29 @@ export class SessionManager {
 			}
 			if (header && !migration) migration = startMigration(header);
 			intake.index.settleLeaf(intake.entries);
-			const boundary = intake.store ? coldBoundary(intake.entries, intake.index.branchView(), undefined) : undefined;
-			let hydratedFromCut = 0;
+			const boundary = this.#coldStoreEnabled
+				? coldBoundary(intake.entries, intake.index.branchView(), undefined)
+				: undefined;
 			if (boundary) {
 				for (let position = 0; position < intake.entries.length; position++) {
-					const entry = intake.entries[position]!;
-					if (belongsCold(entry, position, boundary)) continue;
-					if (hydrateColdEntry(entry, { resolveBlobs: false })) hydratedFromCut++;
+					if (belongsCold(boundary, position)) continue;
+					hydrateColdEntry(intake.entries[position]!, { resolveBlobs: false });
 				}
 			}
 			// Prune records, then patch records, apply after migration; a record
 			// whose target is cold writes through its accessor, which makes it
-			// whole until #recoolLoadWrites below returns it to the store.
+			// whole until #coolLoadedEntries below returns it to the store.
 			applyToolResultPrunes(intake.entries);
 			applyEntryPatches(intake.entries);
 			// Sanitize after the load-time passes, as a load of the whole transcript
 			// does, since a pass can change what an entry replays: every whole entry,
 			// and each entry the stream found replay metadata on, made whole for it.
-			for (const entry of intake.unsanitized) hydrateColdEntry(entry);
+			for (const entry of intake.unsanitized) hydrateColdEntry(entry, { resolveBlobs: false });
 			intake.unsanitized = [];
 			for (const entry of intake.entries) {
 				if (!isColdEntry(entry) && SessionManager.#sanitizeLoadedEntry(entry)) sanitized = true;
 			}
-			if (boundary && intake.store) {
-				SessionManager.#recoolLoadWrites(intake.entries, boundary, intake.store, hydratedFromCut);
-			}
+			if (boundary) SessionManager.#coolLoadedEntries(intake.entries, boundary, openStore);
 			await resolveBlobRefsInEntries(
 				intake.entries.filter(entry => !isColdEntry(entry)),
 				this.#blobs,
@@ -3760,22 +3796,19 @@ export class SessionManager {
 	}
 
 	/**
-	 * Put back in `store`, with the values it now holds, every entry before the
-	 * cut that the load made whole after the stream other than by the cut: a
-	 * load-time pass writing it through an accessor, or the replay-metadata
-	 * stripping (the store counts more hydrations than the `hydratedFromCut`
-	 * the cut made), so the targets of records before the cut stay cold.
+	 * Put in the store every entry `boundary` leaves cold that the load holds
+	 * whole: one the stream kept whole after the newest compaction's kept start
+	 * that the leaf's path leaves, and one a load-time pass (writing through an
+	 * accessor) or the replay-metadata stripping made whole, which goes back
+	 * with the values it now holds.
 	 */
-	static #recoolLoadWrites(
+	static #coolLoadedEntries(
 		entries: readonly SessionEntry[],
 		boundary: ColdBoundary,
-		store: ColdEntryStore,
-		hydratedFromCut: number,
+		openStore: () => ColdEntryStore | undefined,
 	): void {
-		if (store.hydrations <= hydratedFromCut) return;
-		for (let position = 0; position < boundary.cutIndex; position++) {
-			const entry = entries[position]!;
-			if (belongsCold(entry, position, boundary)) convertToColdEntry(entry, () => store);
+		for (let position = 0; position < entries.length; position++) {
+			if (belongsCold(boundary, position)) convertToColdEntry(entries[position]!, openStore, { paced: true });
 		}
 	}
 
@@ -4361,7 +4394,7 @@ export class SessionManager {
 		manager.#entries = this.#entries.map(entry =>
 			isColdEntry(entry) ? copyColdEntry(entry) : structuredClone(entry),
 		);
-		manager.#coldStore = this.#coldStore;
+		manager.#adoptColdStore(this.#coldStore);
 		manager.#coldCutStale = true;
 		manager.#index.rebuild(manager.#entries);
 		manager.#forceFileCreation = true;
@@ -4594,10 +4627,13 @@ export class SessionManager {
 	}
 
 	/**
-	 * Write the entries storage is missing, then close the append writer.
-	 * Rejects only while storage is still not proven to hold every entry.
-	 * While a {@link dropSession} deletes the current file, this waits for the
-	 * delete to settle first.
+	 * Write the entries storage is missing, then close the append writer and,
+	 * unless a clone still holds it, the store of older entry bodies, so its
+	 * descriptor and disk are freed now rather than at a collection. Close a
+	 * manager last: an older entry of it cannot be read once its store is
+	 * closed. Rejects only while storage is still not proven to hold every
+	 * entry. While a {@link dropSession} deletes the current file, this waits
+	 * for the delete to settle first.
 	 */
 	async close(): Promise<void> {
 		await this.#pendingDrop?.settled.promise;
@@ -4663,6 +4699,9 @@ export class SessionManager {
 				this.#closeOwesPublish = false;
 			}).catch(() => undefined);
 		}
+		// The writes above read older entries from the store; nothing reads them after close.
+		this.#coldStore?.release(true);
+		this.#coldStore = undefined;
 		// After a terminal release the entries are gone, so a latched failure
 		// cannot be shown harmless.
 		if (this.#diskFailure && (this.#entriesReleased || !this.#allEntriesHandedToStorage())) throw this.#diskFailure;
@@ -4710,7 +4749,7 @@ export class SessionManager {
 		this.#durable = undefined;
 		this.#refusedSessionSwitch = undefined;
 		this.#index.clear();
-		// Cold entries a clone still holds keep the store open; the last one to go closes it.
+		// A clone or a snapshot taken for a rollback can still read the store; it closes once collected.
 		this.#resetColdCut(undefined);
 		this.#inMemoryArtifacts = null;
 		this.#closeWriterEventually();
@@ -5446,7 +5485,10 @@ export class SessionManager {
 	 * `entry_patch` record, whose size follows the patched fields rather than
 	 * the transcript; whole-file readers replay it on load (`entry-patches.ts`).
 	 * Bumps the body revision, as {@link rewriteEntries} does, so observers of
-	 * in-place updates (the thread publisher) republish the entries.
+	 * in-place updates (the thread publisher) republish the entries. The record
+	 * holds its own copy of each value, and an entry keeps a value it already
+	 * holds (an elide pass passes a message's own `content`), so no entry
+	 * shares an object with the record.
 	 *
 	 * Rejects before changing anything when a patch names an entry this
 	 * session lacks or a field that entry's kind does not have. A failed write
@@ -5457,7 +5499,7 @@ export class SessionManager {
 	async patchEntries(patches: readonly EntryPatch[]): Promise<void> {
 		if (patches.length === 0) return;
 		const data = toEntryPatchData(patches);
-		const changes = data.patches.map(patch => {
+		const changes = patches.map(patch => {
 			const target = this.#index.get(patch.entryId);
 			if (!target || !entryAcceptsPatch(target, patch)) {
 				throw new Error(`Entry patch does not fit session entry ${patch.entryId}`);
@@ -5672,6 +5714,24 @@ export class SessionManager {
 		return context;
 	}
 
+	/**
+	 * The display transcript (`buildSessionContext({ transcript: true })`) of
+	 * the active branch from its newest compaction on. The full transcript ends
+	 * with these same messages, since that compaction renders as its summary
+	 * there too, so a reader of the last turns (the retry check of an idle
+	 * session) gets them without reading an entry before the compaction.
+	 */
+	buildTranscriptSinceCompaction(): SessionContext["messages"] {
+		const branch = this.#index.branchView();
+		const start = branch.findLastIndex(entry => entry.type === "compaction");
+		if (start < 0) return this.buildSessionContext({ transcript: true }).messages;
+		const tail = branch.slice(start);
+		return buildSessionContext(tail, this.#index.leafId(), new Map(tail.map(entry => [entry.id, entry])), {
+			transcript: true,
+			resolveFrameData: data => this.resolveFrameData(data),
+		}).messages;
+	}
+
 	/** Prompt blocks for a snapcompact archive, budgeted and resolved as {@link buildSessionContext} attaches them. */
 	snapcompactHistoryBlocks(archive: snapcompact.Archive): (TextContent | ImageContent)[] {
 		const resolveFrameData = (data: string) => this.resolveFrameData(data);
@@ -5777,9 +5837,11 @@ export class SessionManager {
 
 	/**
 	 * Put back in the store, with the values they hold now, the entries before
-	 * the cut that a write made whole. A write to a field of a cold entry makes
-	 * it whole: a prune pass blanking a result before the cut, or a failed
-	 * persist restoring the previous values; this returns the entry to the store.
+	 * the cut (or off the current path) that a write made whole. A write to a
+	 * field of a cold entry makes it whole: a prune pass blanking a result
+	 * before the cut, or a failed persist restoring the previous values; this
+	 * returns the entry to the store, to its former record when the values are
+	 * unchanged.
 	 */
 	recoolEntriesBeforeCut(): void {
 		if (!this.#coldStoreEnabled) return;

@@ -1,6 +1,7 @@
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { type AgentRef, AgentRegistry } from "../../registry/agent-registry";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
+import { applyEntryPatchesInWindow } from "../../session/entry-patches";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import { defaultSessionStorage, readSessionLinesFrom, type SessionStorage } from "../../session/session-storage";
@@ -104,6 +105,7 @@ export async function readRpcSubagentTranscript(
 	const lastNewline = text.lastIndexOf("\n");
 	const completeText = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : "";
 	const entries = completeText.length > 0 ? parseSessionEntries(completeText) : [];
+	applyEntryPatchesInWindow(entries);
 	const nextByte = startByte + Buffer.byteLength(completeText, "utf8");
 
 	return {

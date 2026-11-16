@@ -33,6 +33,9 @@ const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 /** A value whose JSON text is longer than this is a body. */
 const LARGE_JSON_BYTES = 4096;
 const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
+/** Patch records are appended by `SessionManager.patchEntries`, which a build without the patch-record change lacks. */
+const HAS_PATCH_ENTRIES = "patchEntries" in SessionManager.prototype;
+type PatchingSessionManager = SessionManager & { patchEntries(patches: object[]): Promise<void> };
 
 function assistant(text: string): AssistantMessage {
 	return {
@@ -344,65 +347,68 @@ describe("older bodies stay out of memory and the store is released", () => {
 	});
 
 	// Each elide pass appends a patch record; a resume must not hold every patched body again in those records.
-	it("keeps no patched body in memory through the patch records an elide pass appended before the cut", async () => {
-		await withScratchAgentDir(async () => {
-			using dir = TempDir.createSync("@omp-cold-lifetime-");
-			const file = await writeSession(dir.path(), [message("u0", null, user("start"))]);
-			const writer = await open(file);
-			const patched = new Map<string, Array<TextContent | ImageContent>>();
-			const rest = "r".repeat(16_000);
-			for (let index = 0; index < 12; index++) {
-				const id = writer.appendMessage(assistant(`a${index} ${rest} ${rest}`));
-				const content: TextContent[] = [{ type: "text", text: `a${index} [elided] ${rest}` }];
-				await writer.patchEntries([{ entryId: id, message: { content, elidedOutputTokens: 5 } }]);
-				patched.set(id, content);
-			}
-			for (let index = 0; index < 4; index++) {
-				const image: ImageContent = {
-					type: "image",
-					data: Buffer.alloc(6000, index + 1).toString("base64"),
-					mimeType: "image/png",
-				};
-				const id = writer.appendMessage({
-					role: "toolResult",
-					toolCallId: `call-${index}`,
-					toolName: "read",
-					content: [{ type: "text", text: `t${index} ${rest}` }, image],
-					isError: false,
-					timestamp: 3,
-				});
-				// What elide keeps of a tool result: the placeholder and every non-text block.
-				const content = [{ type: "text" as const, text: `[elided t${index}]` }, { ...image }];
-				await writer.patchEntries([{ entryId: id, message: { content, prunedAt: 4 } }]);
-				patched.set(id, content);
-			}
-			const keep = writer.appendMessage(user(`keep ${BODY}`));
-			writer.appendCompaction(`summary ${BODY}`, undefined, keep, 1000);
-			writer.appendMessage(assistant(`after ${BODY}`));
-			await writer.flush();
-			await writer.close();
-
-			// Closed here, before the scratch agent directory (and its blob store) goes away.
-			const manager = await open(file);
-			try {
-				for (const [id, content] of patched) {
-					const target = manager.getEntry(id);
-					expect(
-						target?.type === "message" ? JSON.parse(JSON.stringify(target.message)).content : undefined,
-					).toEqual(content);
+	it.skipIf(!HAS_PATCH_ENTRIES)(
+		"keeps no patched body in memory through the patch records an elide pass appended before the cut",
+		async () => {
+			await withScratchAgentDir(async () => {
+				using dir = TempDir.createSync("@omp-cold-lifetime-");
+				const file = await writeSession(dir.path(), [message("u0", null, user("start"))]);
+				const writer = (await open(file)) as PatchingSessionManager;
+				const patched = new Map<string, Array<TextContent | ImageContent>>();
+				const rest = "r".repeat(16_000);
+				for (let index = 0; index < 12; index++) {
+					const id = writer.appendMessage(assistant(`a${index} ${rest} ${rest}`));
+					const content: TextContent[] = [{ type: "text", text: `a${index} [elided] ${rest}` }];
+					await writer.patchEntries([{ entryId: id, message: { content, elidedOutputTokens: 5 } }]);
+					patched.set(id, content);
 				}
-				const entries = manager.getEntries();
-				const cut = entries.findIndex(found => found.id === keep);
-				const refs = refsToBodies(entries.slice(0, cut));
-				expect(refs.length).toBeGreaterThanOrEqual(2 * patched.size);
-				expect(readBodiesAgain(entries)).toBeGreaterThan(0);
-				await collectGarbage(() => alive(refs).length === 0);
-				expect(alive(refs)).toEqual([]);
-			} finally {
-				await manager.close();
-			}
-		});
-	});
+				for (let index = 0; index < 4; index++) {
+					const image: ImageContent = {
+						type: "image",
+						data: Buffer.alloc(6000, index + 1).toString("base64"),
+						mimeType: "image/png",
+					};
+					const id = writer.appendMessage({
+						role: "toolResult",
+						toolCallId: `call-${index}`,
+						toolName: "read",
+						content: [{ type: "text", text: `t${index} ${rest}` }, image],
+						isError: false,
+						timestamp: 3,
+					});
+					// What elide keeps of a tool result: the placeholder and every non-text block.
+					const content = [{ type: "text" as const, text: `[elided t${index}]` }, { ...image }];
+					await writer.patchEntries([{ entryId: id, message: { content, prunedAt: 4 } }]);
+					patched.set(id, content);
+				}
+				const keep = writer.appendMessage(user(`keep ${BODY}`));
+				writer.appendCompaction(`summary ${BODY}`, undefined, keep, 1000);
+				writer.appendMessage(assistant(`after ${BODY}`));
+				await writer.flush();
+				await writer.close();
+
+				// Closed here, before the scratch agent directory (and its blob store) goes away.
+				const manager = await open(file);
+				try {
+					for (const [id, content] of patched) {
+						const target = manager.getEntry(id);
+						expect(
+							target?.type === "message" ? JSON.parse(JSON.stringify(target.message)).content : undefined,
+						).toEqual(content);
+					}
+					const entries = manager.getEntries();
+					const cut = entries.findIndex(found => found.id === keep);
+					const refs = refsToBodies(entries.slice(0, cut));
+					expect(refs.length).toBeGreaterThanOrEqual(2 * patched.size);
+					expect(readBodiesAgain(entries)).toBeGreaterThan(0);
+					await collectGarbage(() => alive(refs).length === 0);
+					expect(alive(refs)).toEqual([]);
+				} finally {
+					await manager.close();
+				}
+			});
+		},
+	);
 
 	// A host that opens and closes many sessions (a subagent pool) must not run out of descriptors or disk.
 	it.skipIf(!HAS_PROC_FD)(

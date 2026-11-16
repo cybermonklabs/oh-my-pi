@@ -39,15 +39,16 @@ function tryAcquireLock(lockPath: string): NativeFileLock | null {
 	return null;
 }
 
-/** Acquire an exclusive lease without waiting; `null` while another holder owns it. */
+/** Acquire an exclusive lease without waiting for its holder to release it; `null` while another holder owns it. */
 export function tryAcquireFileLock(filePath: string): FileLockHandle | null {
 	return tryAcquireLock(getLockPath(filePath));
 }
 
 /**
  * Whether any holder, including this process, owns the lease, observed without
- * taking it, so a concurrent `tryAcquireFileLock` never meets the probe.
- * Throws when the lock cannot be probed.
+ * taking it. Under gVisor the probe can make a concurrent `tryAcquireFileLock`
+ * find the lease in use for a few milliseconds, which that claim retries, so
+ * the probe does not make it fail. Throws when the lock cannot be probed.
  */
 export function isFileLockHeld(filePath: string): boolean {
 	return NativeFileLock.isHeld(getLockPath(filePath));

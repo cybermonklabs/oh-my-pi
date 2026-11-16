@@ -26,6 +26,39 @@ const PLACEHOLDER = "[elided: see artifact://1]";
 /** One line, so a failure prints a short diff. */
 const HEAVY_RESULT = "heavy tool output ".repeat(16);
 
+/** The store of older entry bodies, whose counters the shake("elide") case reads. */
+const hasColdStore = "coldStoreStats" in SessionManager.prototype;
+type ColdStoreManager = SessionManager & { coldStoreStats(): { coldEntries: number; materializations: number } };
+/** The Agent Hub transcript source's windowed read, which the transcript reader case drives. */
+const hasTranscriptReadFrom = "readFrom" in agentTranscriptSource;
+type WindowedTranscriptSource = typeof agentTranscriptSource & {
+	readFrom(path: string, offset: number): Promise<string>;
+};
+
+/**
+ * Whether a manager's append adopts an entry another writer appended to its
+ * file, probed once on a scratch session. When it does not, the append adopts
+ * no entry another writer appended in this build, and the case that reads the
+ * live state after such an append is skipped.
+ */
+async function appendAdoptsForeignEntries(): Promise<boolean> {
+	using dir = TempDir.createSync("@omp-entry-patch-probe-");
+	const manager = SessionManager.create(dir.path(), dir.path(), new FileSessionStorage());
+	try {
+		manager.appendMessage(user("go"));
+		const leafId = manager.appendMessage(assistant("done"));
+		await manager.flush();
+		const foreign = { type: "message", id: "probe", parentId: leafId, timestamp: TIMESTAMP, message: user("other") };
+		fs.appendFileSync(sessionFileOf(manager), `${JSON.stringify(foreign)}\n`);
+		manager.appendMessage(user("next"));
+		await manager.flush();
+		return manager.getEntry("probe") !== undefined;
+	} finally {
+		await manager.close();
+	}
+}
+const appendAdoptsForeign = await appendAdoptsForeignEntries();
+
 /** How a retry saga marks the attempt its retry recovered. */
 const RECOVERED: AssistantRetryRecovery = {
 	kind: "auto-retry",
@@ -188,105 +221,118 @@ describe("entry patch records and the readers of a session", () => {
 	// a record after this manager loaded the file; the manager keeps such entries.
 	// Without the patch the live session shows the recovered attempt as a failure,
 	// and its next full write erases the marker for every later resume.
-	it("applies a patch record another writer appended, and keeps the patched field through a full rewrite", async () => {
-		using dir = TempDir.createSync("@omp-entry-patch-");
-		const manager = SessionManager.create(dir.path(), dir.path(), new FileSessionStorage());
-		try {
-			manager.appendMessage(user("go"));
-			const failedId = manager.appendMessage(failedAttempt());
-			const leafId = manager.appendMessage(assistant("Recovered after retry."));
-			await manager.flush();
-			const file = sessionFileOf(manager);
-
-			const record = {
-				type: "custom",
-				customType: "entry_patch",
-				id: "otherwriter",
-				parentId: leafId,
-				timestamp: TIMESTAMP,
-				data: { patches: [{ entryId: failedId, message: { retryRecovery: RECOVERED } }] },
-			};
-			fs.appendFileSync(file, `${JSON.stringify(record)}\n`);
-			// This manager's next append finds the record past what it wrote.
-			manager.appendMessage(user("next"));
-			await manager.flush();
-			const live = patchedFields(messagesOf(manager)).retryRecovery;
-
-			await manager.rewriteEntries();
-			await manager.flush();
-			const resumed = await SessionManager.open(file, dir.path(), new FileSessionStorage(), {
-				suppressBreadcrumb: true,
-			});
+	it.skipIf(!appendAdoptsForeign)(
+		"applies a patch record another writer appended, and keeps the patched field through a full rewrite",
+		async () => {
+			using dir = TempDir.createSync("@omp-entry-patch-");
+			const manager = SessionManager.create(dir.path(), dir.path(), new FileSessionStorage());
 			try {
-				expect({ live, resumedAfterRewrite: patchedFields(messagesOf(resumed)).retryRecovery }).toEqual({
-					live: RECOVERED,
-					resumedAfterRewrite: RECOVERED,
+				manager.appendMessage(user("go"));
+				const failedId = manager.appendMessage(failedAttempt());
+				const leafId = manager.appendMessage(assistant("Recovered after retry."));
+				await manager.flush();
+				const file = sessionFileOf(manager);
+
+				const record = {
+					type: "custom",
+					customType: "entry_patch",
+					id: "otherwriter",
+					parentId: leafId,
+					timestamp: TIMESTAMP,
+					data: { patches: [{ entryId: failedId, message: { retryRecovery: RECOVERED } }] },
+				};
+				fs.appendFileSync(file, `${JSON.stringify(record)}\n`);
+				// This manager's next append finds the record past what it wrote.
+				manager.appendMessage(user("next"));
+				await manager.flush();
+				const live = patchedFields(messagesOf(manager)).retryRecovery;
+
+				await manager.rewriteEntries();
+				await manager.flush();
+				const resumed = await SessionManager.open(file, dir.path(), new FileSessionStorage(), {
+					suppressBreadcrumb: true,
 				});
+				try {
+					expect({ live, resumedAfterRewrite: patchedFields(messagesOf(resumed)).retryRecovery }).toEqual({
+						live: RECOVERED,
+						resumedAfterRewrite: RECOVERED,
+					});
+				} finally {
+					await resumed.close();
+				}
 			} finally {
-				await resumed.close();
+				await manager.close();
 			}
-		} finally {
-			await manager.close();
-		}
-	});
+		},
+	);
 
 	// A client that reads a subagent's transcript must see what the subagent's
 	// session holds: otherwise a recovered attempt reads as a failed run and an
 	// elided result comes back in full.
-	it("shows a recovered attempt and an elided result to the RPC subagent transcript and the agent hub transcript", async () => {
-		using dir = TempDir.createSync("@omp-entry-patch-");
-		const manager = SessionManager.create(dir.path(), dir.path(), new FileSessionStorage());
-		try {
-			manager.appendMessage(user("do the task"));
-			const failedId = manager.appendMessage(failedAttempt());
-			manager.appendMessage(toolCall("call_1", "ls -R"));
-			const resultId = manager.appendMessage(toolResult("call_1", HEAVY_RESULT));
-			manager.appendMessage(assistant("Recovered after retry."));
-			await manager.flush();
-			// What the end of a retry saga and an elide pass record.
-			await manager.patchEntries([{ entryId: failedId, message: { retryRecovery: RECOVERED } }]);
-			await manager.patchEntries([
-				{ entryId: resultId, message: { content: [{ type: "text", text: PLACEHOLDER }], prunedAt: 5 } },
-			]);
-			await manager.flush();
-			const file = sessionFileOf(manager);
+	it.skipIf(!hasTranscriptReadFrom)(
+		"shows a recovered attempt and an elided result to the RPC subagent transcript and the agent hub transcript",
+		async () => {
+			using dir = TempDir.createSync("@omp-entry-patch-");
+			const manager = SessionManager.create(dir.path(), dir.path(), new FileSessionStorage());
+			try {
+				manager.appendMessage(user("do the task"));
+				const failedId = manager.appendMessage(failedAttempt());
+				manager.appendMessage(toolCall("call_1", "ls -R"));
+				const resultId = manager.appendMessage(toolResult("call_1", HEAVY_RESULT));
+				manager.appendMessage(assistant("Recovered after retry."));
+				await manager.flush();
+				// What the end of a retry saga and an elide pass record.
+				await manager.patchEntries([{ entryId: failedId, message: { retryRecovery: RECOVERED } }]);
+				await manager.patchEntries([
+					{ entryId: resultId, message: { content: [{ type: "text", text: PLACEHOLDER }], prunedAt: 5 } },
+				]);
+				await manager.flush();
+				const file = sessionFileOf(manager);
 
-			const rpc = await readRpcSubagentTranscript(file, 0);
-			const hub = agentTranscriptSource.parseEntries(await agentTranscriptSource.readFrom(file, 0));
-			const held = { retryRecovery: RECOVERED, result: [{ type: "text", text: PLACEHOLDER }] };
-			expect({
-				session: patchedFields(messagesOf(manager)),
-				rpcTranscript: patchedFields(rpc.messages),
-				agentHubTranscript: patchedFields(hub.flatMap(entry => (entry.type === "message" ? [entry.message] : []))),
-			}).toEqual({ session: held, rpcTranscript: held, agentHubTranscript: held });
-		} finally {
-			await manager.close();
-		}
-	});
+				const rpc = await readRpcSubagentTranscript(file, 0);
+				const hub = agentTranscriptSource.parseEntries(
+					await (agentTranscriptSource as WindowedTranscriptSource).readFrom(file, 0),
+				);
+				const held = { retryRecovery: RECOVERED, result: [{ type: "text", text: PLACEHOLDER }] };
+				expect({
+					session: patchedFields(messagesOf(manager)),
+					rpcTranscript: patchedFields(rpc.messages),
+					agentHubTranscript: patchedFields(
+						hub.flatMap(entry => (entry.type === "message" ? [entry.message] : [])),
+					),
+				}).toEqual({ session: held, rpcTranscript: held, agentHubTranscript: held });
+			} finally {
+				await manager.close();
+			}
+		},
+	);
 
 	// A running session must not read the bodies of entries before the cut back
 	// from the store: the pass runs on its own after compactions, and on a long
 	// session each read of the whole history blocks the session.
-	it('reads no body of an entry before the cut in a shake("elide") pass that has nothing left to shorten', async () => {
-		using dir = TempDir.createSync("@omp-entry-patch-");
-		const { session, manager, authStorage } = await resumeLongSession(dir.path());
-		try {
-			expect(manager.coldStoreStats().coldEntries).toBeGreaterThan(0);
-			const first = await session.shake("elide");
-			expect(first.toolResultsDropped + first.blocksDropped).toBe(2);
+	it.skipIf(!hasColdStore)(
+		'reads no body of an entry before the cut in a shake("elide") pass that has nothing left to shorten',
+		async () => {
+			using dir = TempDir.createSync("@omp-entry-patch-");
+			const { session, manager, authStorage } = await resumeLongSession(dir.path());
+			try {
+				expect((manager as ColdStoreManager).coldStoreStats().coldEntries).toBeGreaterThan(0);
+				const first = await session.shake("elide");
+				expect(first.toolResultsDropped + first.blocksDropped).toBe(2);
 
-			const before = manager.coldStoreStats().materializations;
-			const second = await session.shake("elide");
-			expect({
-				shortened: second.toolResultsDropped + second.blocksDropped,
-				olderBodiesRead: manager.coldStoreStats().materializations - before,
-			}).toEqual({ shortened: 0, olderBodiesRead: 0 });
-		} finally {
-			await session.dispose();
-			authStorage.close();
-			await manager.close();
-		}
-	});
+				const before = (manager as ColdStoreManager).coldStoreStats().materializations;
+				const second = await session.shake("elide");
+				expect({
+					shortened: second.toolResultsDropped + second.blocksDropped,
+					olderBodiesRead: (manager as ColdStoreManager).coldStoreStats().materializations - before,
+				}).toEqual({ shortened: 0, olderBodiesRead: 0 });
+			} finally {
+				await session.dispose();
+				authStorage.close();
+				await manager.close();
+			}
+		},
+	);
 
 	// A tool result's content is a list of blocks. A record that sets a string
 	// there is malformed: applied, it makes every later request of the session

@@ -187,7 +187,7 @@ struct GrepArgs {
 	patterns: Vec<String>,
 
 	/// Read patterns from FILE, one per line.
-	#[arg(short = 'f', long = "file", value_name = "FILE")]
+	#[arg(short = 'f', long = "file", value_name = "FILE", allow_hyphen_values = true)]
 	pattern_files: Vec<OsString>,
 
 	/// Interpret PATTERN as a strict extended regular expression.
@@ -812,12 +812,18 @@ fn build_matcher(
 		return build_default_matcher(&builder, &translated, patterns).map(Engine::Rust);
 	}
 
-	// A `{` that opens no interval is a literal to GNU and BSD grep, but the
-	// `regex` crate refuses the whole pattern, so `grep -E '{a}'` failed on
-	// patterns real grep matches. An attempted-but-unterminated interval
-	// stays an error in both.
-	let patterns: Vec<std::borrow::Cow<'_, str>> =
-		patterns.iter().map(|p| bre::ere_literalize_braces(p)).collect();
+	// The `regex` crate reads a bracket expression its own way: `[` opens a
+	// nested class there, and `&&`, `--` and `~~` are set operations, so
+	// `grep -E '[[]'` failed with "unclosed character class" and `[~~]`
+	// matched nothing. A `{` that opens no interval is a literal to GNU and
+	// BSD grep, but the `regex` crate refuses the whole pattern, so
+	// `grep -E '{a}'` failed on patterns real grep matches. An
+	// attempted-but-unterminated interval stays an error in both.
+	let translated: Vec<std::borrow::Cow<'_, str>> = patterns
+		.iter()
+		.map(|pattern| bre::ere_to_regex(pattern))
+		.collect::<Result<_, _>>()
+		.map_err(|e: bre::BreError| e.message().to_owned())?;
 
 	// `regex` accepts `^+` and compiles it as `(?:^)+`, which matches at every
 	// line start. GNU and BSD grep both reject the pattern, so returning every
@@ -830,7 +836,7 @@ fn build_matcher(
 	}
 
 	builder
-		.build_many(&patterns)
+		.build_many(&translated)
 		.map(Engine::Rust)
 		.map_err(|error| error.to_string())
 }
@@ -893,6 +899,10 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 		line_number: Option<u64>,
 		line_offset: u64,
 	) -> io::Result<()> {
+		// The searcher selects a line on its text alone, and GNU grep's `-o`
+		// matches within that text too: a class such as `[^x]` or
+		// `[[:space:]]` printed the record's terminator as one more match.
+		let line = line.strip_suffix(&[self.opts.record.terminator]).unwrap_or(line);
 		for_each_nonempty_match(self.matcher, line, line_offset, |found, match_offset| {
 			self.write_prefix(line_number, match_offset, b':')?;
 			self.write_record(&line[found.start()..found.end()])
@@ -2105,6 +2115,25 @@ mod tests {
 		assert_eq!((code, out.as_str()), (0, "2:-> y\n"), "{err}");
 	}
 
+	/// The measured `-e` cases, which agree with GNU grep 3.11: its count,
+	/// `-o` output and `-n` output for each. clap used to refuse `-e '- x'`
+	/// with "unexpected argument" and `-e -v` with "a value is required".
+	#[tokio::test(flavor = "multi_thread")]
+	async fn regexp_operands_starting_with_a_dash_match_what_gnu_grep_matches() {
+		for (args, line) in [
+			(&["-e", "- x"][..], "- x\n"),
+			(&["-F", "-e", "- x"][..], "- x\n"),
+			(&["-e", "-v"][..], "-v\n"),
+		] {
+			let outputs = [("-c", "1\n".to_owned()), ("-o", line.to_owned()), ("-n", format!("1:{line}"))];
+			for (flag, want) in outputs {
+				let argv: Vec<&str> = std::iter::once(flag).chain(args.iter().copied()).collect();
+				let (code, out, err) = run(&argv, line).await;
+				assert_eq!((code, out), (0, want), "{argv:?}: {err}");
+			}
+		}
+	}
+
 	#[tokio::test(flavor = "multi_thread")]
 	async fn pattern_file_is_resolved_against_shell_cwd() {
 		let tree = tempfile::tempdir().unwrap();
@@ -2113,6 +2142,24 @@ mod tests {
 		let (code, capture) = run_async_util::<Grep>(&["-f", "patterns", "haystack"], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "alpha\nbeta\n");
+	}
+
+	/// GNU grep reads the argument after `-f` as the file whatever its first
+	/// character; clap refused `-f -pats` with "a value is required for
+	/// '--file <FILE>'" and exit 2.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn pattern_file_name_may_start_with_a_dash() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("-pats"), "b\n").unwrap();
+		std::fs::write(tree.path().join("haystack"), "a\nb\nc\n").unwrap();
+		for (args, want) in [
+			(&["-c", "-f", "-pats", "haystack"][..], "1\n"),
+			(&["-o", "-f", "-pats", "haystack"][..], "b\n"),
+			(&["-n", "--file", "-pats", "haystack"][..], "2:b\n"),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;
+			assert_eq!((code, capture.out().as_str()), (0, want), "{args:?}: {}", capture.err());
+		}
 	}
 
 	/// A file with no line terminator used to make grep buffer it whole: on a
@@ -2764,6 +2811,91 @@ mod tests {
 			let (code, out, _) = run(&["-Ec", pattern], input).await;
 			assert_eq!(code, 2, "-E {pattern} must stay an error, got {out:?}");
 		}
+	}
+
+	/// Every expectation is GNU grep 3.11 on the same line: its count, `-o`
+	/// output and `-n` output, in BRE and in ERE. The `regex` crate read these
+	/// bracket expressions as a nested class or a set operation, so the count
+	/// was 0 and `-E '[[]'` failed with "unclosed character class".
+	#[tokio::test(flavor = "multi_thread")]
+	async fn bracket_expressions_match_what_gnu_grep_matches() {
+		for (pattern, line, only) in [
+			("[[:space:]*?[]", "X=a b\n", " \n"),
+			("[[]", "a[b\n", "[\n"),
+			("[a&&b]", "a&b\n", "a\n&\nb\n"),
+			("[~~]", "a~b\n", "~\n"),
+			("[!--]", "a-b\n", "-\n"),
+		] {
+			for mode in ["-G", "-E"] {
+				let (code, out, err) = run(&[mode, "-c", pattern], line).await;
+				assert_eq!((code, out.as_str()), (0, "1\n"), "{mode} -c {pattern}: {err}");
+				let (code, out, err) = run(&[mode, "-o", pattern], line).await;
+				assert_eq!((code, out.as_str()), (0, only), "{mode} -o {pattern}: {err}");
+				let (code, out, err) = run(&[mode, "-n", pattern], line).await;
+				assert_eq!((code, out), (0, format!("1:{line}")), "{mode} -n {pattern}: {err}");
+			}
+		}
+	}
+
+	/// The bracket forms that already agreed with GNU grep 3.11 keep its
+	/// meaning, in BRE and in ERE. `\` is an ordinary member, so `[\]]` is a
+	/// backslash then a `]`; outside a bracket expression `\]` is a `]`.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn common_bracket_expressions_keep_what_gnu_grep_matches() {
+		let input = "abc\nx\n]\n7\n\\]\nx]\n";
+		for (pattern, only, numbered) in [
+			("[a-z]", "a\nb\nc\nx\nx\n", "1:abc\n2:x\n6:x]\n"),
+			("[^x]", "a\nb\nc\n]\n7\n\\\n]\n]\n", "1:abc\n3:]\n4:7\n5:\\]\n6:x]\n"),
+			("[]a]", "a\n]\n]\n]\n", "1:abc\n3:]\n5:\\]\n6:x]\n"),
+			("[^]a]", "b\nc\nx\n7\n\\\nx\n", "1:abc\n2:x\n4:7\n5:\\]\n6:x]\n"),
+			("[[:alpha:]]", "a\nb\nc\nx\nx\n", "1:abc\n2:x\n6:x]\n"),
+			(r"[\]]", "\\]\n", "5:\\]\n"),
+			(r"\]", "]\n]\n]\n", "3:]\n5:\\]\n6:x]\n"),
+		] {
+			for mode in ["-G", "-E"] {
+				let (code, out, err) = run(&[mode, "-o", pattern], input).await;
+				assert_eq!((code, out.as_str()), (0, only), "{mode} -o {pattern}: {err}");
+				let (code, out, err) = run(&[mode, "-n", pattern], input).await;
+				assert_eq!((code, out.as_str()), (0, numbered), "{mode} -n {pattern}: {err}");
+			}
+		}
+	}
+
+	/// GNU grep 3.11 refuses these bracket expressions with these words and
+	/// exit 2, in BRE and in ERE, where the `regex` crate read them as a nested
+	/// class, a class only it knows, or a list of characters. An unterminated
+	/// one is refused in an ERE; in a BRE it still reaches the literal fallback.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn invalid_bracket_expressions_are_refused_as_gnu_grep_refuses_them() {
+		for (pattern, message) in [
+			("[[:foo:]]", "Invalid character class name"),
+			("[[:ascii:]]", "Invalid character class name"),
+			("[[.space.]]", "Invalid collation character"),
+			("[z-a]", "Invalid range end"),
+			("[a-b-z]", "Invalid range end"),
+			("[[:alpha:]-z]", "Invalid range end"),
+		] {
+			for mode in ["-G", "-E"] {
+				let (code, out, err) = run(&[mode, "-c", pattern], "a\n").await;
+				assert_eq!(code, 2, "{mode} {pattern} must be refused, got {out:?}");
+				assert!(err.contains(message), "{mode} {pattern}: {err}");
+			}
+		}
+		let (code, _, err) = run(&["-E", "-c", "a[b"], "a[b\n").await;
+		assert_eq!(code, 2, "{err}");
+		assert!(err.contains("Unmatched [, [^, [:, [., or [="), "{err}");
+	}
+
+	/// `-o` matches within the line's text, as GNU grep 3.11 does: a class that
+	/// takes in the newline printed it as one more, empty-looking match.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn only_matching_never_prints_the_line_terminator() {
+		let (code, out, err) = run(&["-o", "[^x]"], "ab\nx\n").await;
+		assert_eq!((code, out.as_str()), (0, "a\nb\n"), "{err}");
+		let (code, out, err) = run(&["-o", "[[:space:]]"], "a b\nc\n").await;
+		assert_eq!((code, out.as_str()), (0, " \n"), "{err}");
+		let (code, out, err) = run(&["-zo", "[^x]"], "ab\0x\0").await;
+		assert_eq!((code, out.as_str()), (0, "a\0b\0"), "{err}");
 	}
 }
 

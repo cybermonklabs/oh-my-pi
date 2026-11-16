@@ -1224,7 +1224,7 @@ For durable extension state:
 2. Rebuild state from `ctx.sessionManager.getBranch()` on `session_start`, `session_branch`, `session_tree`.
 3. Keep tool result `details` structured when state should be visible/reconstructible from tool result history.
 
-Entries before the latest compaction keep their large values (message content, tool `details`, summaries) on disk and read them on access, so rebuilding from types, roles, ids, timestamps, `stopReason`, `toolCallId` and `custom` data reads nothing back, while a large value of an older entry is read back when you touch it ([cold store](./session.md#older-entry-bodies-the-cold-store)). Never change an entry object you read: values read from an older entry are frozen (a write into them throws), and a change made in place is not persisted.
+Entries before the latest compaction, and entries off the current branch (which `getEntries()` returns too), keep their large values (message content, tool `details`, summaries) on disk and read them on access, so rebuilding from types, roles, ids, timestamps, `stopReason`, `toolCallId` and `custom` data reads nothing back, while a large value of an older entry is read back when you touch it ([cold store](./session.md#older-entry-bodies-the-cold-store)). Never change an entry object you read: values read from an older entry are frozen (a write into them throws), and a change made in place is not persisted.
 
 Example reconstruction pattern:
 

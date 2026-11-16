@@ -13,12 +13,18 @@
  * file calls {@link applyEntryPatches} after migration and after
  * `applyToolResultPrunes`: `SessionManager` resume and `forkFrom`,
  * `loadSessionMessagesReadOnly` (`history://` for parked agents), and the HTML
- * sub-session export.
+ * sub-session export. A `SessionManager` that keeps the entries another writer
+ * appended to its file applies the records among them to the entries it holds.
  *
- * Byte-offset tail readers (the Agent Hub transcript viewer, the collab agent
- * drawer, RPC subagent streaming) parse each line once as it lands and cannot
- * change a line they already emitted, so they show the fields as first
- * written; binaries older than the record show them the same way.
+ * The readers that show a subagent's transcript as they read it, the RPC
+ * subagent transcript and the Agent Hub transcript viewer, read a byte range
+ * of the file and call {@link applyEntryPatchesInWindow} on its entries, so
+ * each entry they return carries every record the range holds. A record
+ * written after a reader returned its target does not change that entry: the
+ * RPC result lists the record among its raw entries, and the viewer shows the
+ * field when it next reads the file from its start (on opening it, or after a
+ * rewrite). The collab agent drawer and binaries older than the record show
+ * the fields as first written.
  *
  * A later full rewrite writes every patched field inline and writes each
  * record with no patches ({@link withoutEntryPatches}), so a field that a
@@ -27,7 +33,7 @@
  */
 import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantRetryRecovery, ContextSnapshot, Message } from "@oh-my-pi/pi-ai";
-import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { cloneJsonTree, isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { CustomMessageEntry, FileEntry, SessionEntry } from "./session-entries";
 
 export const ENTRY_PATCH_CUSTOM_TYPE = "entry_patch";
@@ -77,8 +83,8 @@ function toEntryFields({ warning, tokensAfter, preserveData, content }: EntryFie
 	const fields: Writable<EntryFieldsPatch> = {};
 	if (warning !== undefined) fields.warning = warning;
 	if (tokensAfter !== undefined) fields.tokensAfter = tokensAfter;
-	if (preserveData !== undefined) fields.preserveData = preserveData;
-	if (content !== undefined) fields.content = content;
+	if (preserveData !== undefined) fields.preserveData = cloneJsonTree(preserveData);
+	if (content !== undefined) fields.content = cloneJsonTree(content);
 	return fields;
 }
 
@@ -90,18 +96,19 @@ function toMessageFields({
 	content,
 }: MessageFieldsPatch): MessageFieldsPatch {
 	const fields: Writable<MessageFieldsPatch> = {};
-	if (retryRecovery !== undefined) fields.retryRecovery = retryRecovery;
-	if (contextSnapshot !== undefined) fields.contextSnapshot = contextSnapshot;
+	if (retryRecovery !== undefined) fields.retryRecovery = cloneJsonTree(retryRecovery);
+	if (contextSnapshot !== undefined) fields.contextSnapshot = cloneJsonTree(contextSnapshot);
 	if (elidedOutputTokens !== undefined) fields.elidedOutputTokens = elidedOutputTokens;
 	if (prunedAt !== undefined) fields.prunedAt = prunedAt;
-	if (content !== undefined) fields.content = content;
+	if (content !== undefined) fields.content = cloneJsonTree(content);
 	return fields;
 }
 
 /**
  * The `data` to persist for one set of patches. Copies each field explicitly,
  * so a field a caller adds to a patch object does not silently become part of
- * the on-disk record.
+ * the on-disk record, and copies each object value ({@link cloneJsonTree}), so
+ * the record shares no object with the entries the caller patches.
  */
 export function toEntryPatchData(patches: readonly EntryPatch[]): EntryPatchData {
 	return {
@@ -114,10 +121,23 @@ export function toEntryPatchData(patches: readonly EntryPatch[]): EntryPatchData
 	};
 }
 
-/** Message roles whose `content` an elide pass shortens. */
-const CONTENT_ROLES: Record<Message["role"], true> = { user: true, developer: true, assistant: true, toolResult: true };
+/**
+ * Message roles whose `content` an elide pass shortens, each with whether that
+ * `content` may be a string; assistant and tool-result `content` is always a
+ * list of blocks.
+ */
+const CONTENT_TAKES_STRING: Record<Message["role"], boolean> = {
+	user: true,
+	developer: true,
+	assistant: false,
+	toolResult: false,
+};
 
-/** Whether every field `patch` names exists on `entry`'s kind. */
+function isContentRole(role: string): role is Message["role"] {
+	return Object.hasOwn(CONTENT_TAKES_STRING, role);
+}
+
+/** Whether every field `patch` names exists on `entry`'s kind, with a `content` of the shape its role holds. */
 export function entryAcceptsPatch(entry: SessionEntry, patch: EntryPatch): boolean {
 	const fields = patch.entry;
 	if (fields) {
@@ -136,24 +156,43 @@ export function entryAcceptsPatch(entry: SessionEntry, patch: EntryPatch): boole
 		message.elidedOutputTokens !== undefined;
 	if (assistantFields && role !== "assistant") return false;
 	if (message.prunedAt !== undefined && role !== "toolResult") return false;
-	return message.content === undefined || Object.hasOwn(CONTENT_ROLES, role);
+	if (message.content === undefined) return true;
+	return isContentRole(role) && (CONTENT_TAKES_STRING[role] || typeof message.content !== "string");
 }
 
-/** Set `patch`'s fields on `entry`, which {@link entryAcceptsPatch} accepted. */
+/** `value` for an entry that holds `current`: `current` itself when it is that value, else a copy. */
+function ownCopy<T>(current: T | undefined, value: T): T {
+	return current === value ? value : cloneJsonTree(value);
+}
+
+/**
+ * Set `patch`'s fields on `entry`, which {@link entryAcceptsPatch} accepted.
+ * Each object value is copied ({@link cloneJsonTree}, which shares the
+ * immutable strings) unless `entry` already holds that very value, so `entry`
+ * never shares an object with a record: a later in-place write to `entry`,
+ * such as an elide or prune pass writing into `content`, leaves the record as
+ * written and succeeds when the record's data was read back frozen.
+ */
 export function setPatchedFields(entry: SessionEntry, patch: EntryPatch): void {
 	const fields = patch.entry;
 	if (fields && entry.type === "compaction") {
 		if (fields.warning !== undefined) entry.warning = fields.warning;
 		if (fields.tokensAfter !== undefined) entry.tokensAfter = fields.tokensAfter;
-		if (fields.preserveData !== undefined) entry.preserveData = fields.preserveData;
+		if (fields.preserveData !== undefined) entry.preserveData = ownCopy(entry.preserveData, fields.preserveData);
 	}
-	if (fields?.content !== undefined && entry.type === "custom_message") entry.content = fields.content;
+	if (fields?.content !== undefined && entry.type === "custom_message") {
+		entry.content = ownCopy(entry.content, fields.content);
+	}
 	const patched = patch.message;
 	if (!patched || entry.type !== "message") return;
 	const message = entry.message;
 	if (message.role === "assistant") {
-		if (patched.retryRecovery !== undefined) message.retryRecovery = patched.retryRecovery;
-		if (patched.contextSnapshot !== undefined) message.contextSnapshot = patched.contextSnapshot;
+		if (patched.retryRecovery !== undefined) {
+			message.retryRecovery = ownCopy(message.retryRecovery, patched.retryRecovery);
+		}
+		if (patched.contextSnapshot !== undefined) {
+			message.contextSnapshot = ownCopy(message.contextSnapshot, patched.contextSnapshot);
+		}
 		if (patched.elidedOutputTokens !== undefined) message.elidedOutputTokens = patched.elidedOutputTokens;
 	}
 	if (patched.prunedAt !== undefined && message.role === "toolResult") message.prunedAt = patched.prunedAt;
@@ -161,7 +200,7 @@ export function setPatchedFields(entry: SessionEntry, patch: EntryPatch): void {
 		// `entryAcceptsPatch` admits only roles whose `content` is one member of
 		// `Message["content"]`; TypeScript cannot narrow the assignment across the union.
 		const target: { content: Message["content"] } = message;
-		target.content = patched.content;
+		target.content = cloneJsonTree(patched.content);
 		// The message keeps its identity across context rebuilds; drop its cached estimate.
 		invalidateMessageCache(message);
 	}
@@ -208,35 +247,72 @@ function isEntryPatchData(value: unknown): value is EntryPatchData {
 	return isRecord(value) && Array.isArray(value.patches) && value.patches.every(isEntryPatch);
 }
 
-/**
- * Set, in place, every field an `entry_patch` record in `entries` names, so
- * freshly loaded entries read as the live session's entries did. Records apply
- * in file order, so the newest value of a field wins, and applying them again
- * changes nothing. A record may precede its target. A malformed record, or a
- * patch whose target is missing or lacks a field it names, is skipped with a
- * warning.
- */
-export function applyEntryPatches(entries: readonly FileEntry[]): void {
-	let byId: Map<string, SessionEntry> | undefined;
+/** Where {@link applyEntryPatches} finds the entry a patch names. */
+export interface EntryPatchTargets {
+	get(entryId: string): SessionEntry | undefined;
+}
+
+function entriesById(entries: readonly FileEntry[]): Map<string, SessionEntry> {
+	const byId = new Map<string, SessionEntry>();
+	for (const entry of entries) if (entry.type !== "session") byId.set(entry.id, entry);
+	return byId;
+}
+
+function applyRecords(
+	entries: readonly FileEntry[],
+	targets: EntryPatchTargets | undefined,
+	warnMissingTarget: boolean,
+): boolean {
+	let lookup = targets;
+	let changed = false;
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== ENTRY_PATCH_CUSTOM_TYPE) continue;
 		if (!isEntryPatchData(entry.data)) {
 			logger.warn("Skipping malformed entry patch record", { id: entry.id });
 			continue;
 		}
-		if (!byId) {
-			byId = new Map();
-			for (const candidate of entries) if (candidate.type !== "session") byId.set(candidate.id, candidate);
-		}
+		lookup ??= entriesById(entries);
 		for (const patch of entry.data.patches) {
-			const target = byId.get(patch.entryId);
-			if (!target || !entryAcceptsPatch(target, patch)) {
-				logger.warn("Entry patch record targets no matching entry", { id: entry.id, target: patch.entryId });
+			const target = lookup.get(patch.entryId);
+			if (!target) {
+				if (warnMissingTarget) {
+					logger.warn("Entry patch record targets no matching entry", { id: entry.id, target: patch.entryId });
+				}
+				continue;
+			}
+			if (!entryAcceptsPatch(target, patch)) {
+				logger.warn("Skipping entry patch that does not fit its target", { id: entry.id, target: patch.entryId });
 				continue;
 			}
 			setPatchedFields(target, patch);
+			changed = true;
 		}
 	}
+	return changed;
+}
+
+/**
+ * Set, in place, every field an `entry_patch` record in `entries` names, so
+ * freshly loaded entries read as the live session's entries did. `targets`
+ * finds the entry a patch names; by default it is one of `entries`. Records
+ * apply in file order, so the newest value of a field wins, and applying them
+ * again changes nothing. A record may precede its target. A malformed record,
+ * or a patch whose target is missing, lacks a field it names, or holds
+ * `content` of another shape, is skipped with a warning. Returns whether any
+ * field was set.
+ */
+export function applyEntryPatches(entries: readonly FileEntry[], targets?: EntryPatchTargets): boolean {
+	return applyRecords(entries, targets, true);
+}
+
+/**
+ * {@link applyEntryPatches} on `entries`, the complete lines of a byte range of
+ * a transcript that a reader shows as it reads. A patch whose target is not
+ * among them is skipped with no warning: its target lies before the range,
+ * where the reader returned it earlier.
+ */
+export function applyEntryPatchesInWindow(entries: readonly FileEntry[]): void {
+	applyRecords(entries, undefined, false);
 }
 
 const NO_PATCHES: EntryPatchData = { patches: [] };

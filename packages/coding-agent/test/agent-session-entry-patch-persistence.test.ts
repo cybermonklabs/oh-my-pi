@@ -9,7 +9,8 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { applyEntryPatches } from "@oh-my-pi/pi-coding-agent/session/entry-patches";
+import type { FileEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadSessionMessagesReadOnly } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
@@ -139,6 +140,22 @@ function compactionStamp(source: { entries?: readonly SessionEntry[]; messages?:
 	const summary = source.messages?.findLast(message => message.role === "compactionSummary");
 	if (summary?.role !== "compactionSummary") throw new Error("Expected a compaction summary message");
 	return { warning: summary.warning, tokensAfter: summary.tokensAfter };
+}
+
+/** `value` with every object and array inside it frozen, as a store's read-back hands it over. */
+function deepFreeze<T>(value: T): T {
+	if (value !== null && typeof value === "object") {
+		for (const child of Object.values(value)) deepFreeze(child);
+		Object.freeze(value);
+	}
+	return value;
+}
+
+/** Write `text` into the first block of a tool result in place, as an elide pass writes into `content`. */
+function writeFirstTextInPlace(message: AgentMessage, text: string): void {
+	const block = message.role === "toolResult" ? message.content[0] : undefined;
+	if (block?.type !== "text") throw new Error("Expected a tool result whose first block is text");
+	block.text = text;
 }
 
 interface WholeFileReads<T> {
@@ -523,5 +540,65 @@ describe("AgentSession entry patch persistence", () => {
 			await resumed.close();
 		}
 		expect(retryMarks(await loadSessionMessagesReadOnly(sessionFileOf(manager)))).toHaveLength(1);
+	});
+
+	// A record's values must not be shared with the entry they patch: a later
+	// in-place write to the entry (an elide or prune pass) would otherwise change
+	// the record too, or throw when the record's data was read back frozen.
+	it("gives each patched entry its own copy of the record's values", async () => {
+		const placeholder = () => [{ type: "text" as const, text: "[elided: see artifact://1]" }];
+		const { manager } = await persistedManager(SHORT_HISTORY);
+		manager.appendMessage(
+			assistant([{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } }], {
+				stopReason: "toolUse",
+			}),
+		);
+		const resultId = manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call_1",
+			toolName: "bash",
+			content: [{ type: "text", text: "listing" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		await manager.patchEntries([{ entryId: resultId, message: { content: placeholder() } }]);
+		writeFirstTextInPlace(messageOf(manager, resultId), "written in place");
+		const record = manager
+			.getEntries()
+			.findLast(entry => entry.type === "custom" && entry.customType === "entry_patch");
+		expect(record?.type === "custom" ? record.data : undefined).toEqual({
+			patches: [{ entryId: resultId, message: { content: placeholder() } }],
+		});
+
+		// The same kind of record with frozen data, applied as a load applies it.
+		const loaded: FileEntry[] = [
+			{
+				type: "message",
+				id: "t1",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				message: {
+					role: "toolResult",
+					toolCallId: "call_1",
+					toolName: "bash",
+					content: [{ type: "text", text: "listing" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+			},
+			deepFreeze({
+				type: "custom",
+				customType: "entry_patch",
+				id: "p1",
+				parentId: "t1",
+				timestamp: new Date().toISOString(),
+				data: { patches: [{ entryId: "t1", message: { content: placeholder() } }] },
+			}),
+		];
+		applyEntryPatches(loaded);
+		const [target] = loaded;
+		if (target?.type !== "message") throw new Error("Expected the tool result entry");
+		writeFirstTextInPlace(target.message, "written in place");
+		expect(target.message).toMatchObject({ content: [{ type: "text", text: "written in place" }] });
 	});
 });

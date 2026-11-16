@@ -56,6 +56,7 @@
 - Extension API: `api.agents` — list/get/ensureLive/prompt for named registry agents ([#9543](https://github.com/can1357/oh-my-pi/pull/9543) by [@sjawhar](https://github.com/sjawhar)).
 - Resuming a long session from SQL session storage, and rewriting it in full, no longer holds the whole transcript in memory
 - Debug reports, `omp gc --blobs` and memories stage 1 read long transcripts from SQL session storage chunk by chunk instead of whole, and RPC `get_subagent_messages` and the Agent Hub transcript viewer read at most 8 MiB of a transcript at a time (an RPC client repeats the request from `nextByte` to read on)
+- Reading a session from SQL session storage on PostgreSQL or SQLite while another omp process rewrites it in full can no longer return a mix of the old and the new transcript (a rewrite of the same size, or one that kept every 1 MiB part boundary, went unseen); the read fails as a read conflict instead
 - Full rewrites to SQL or Redis session storage no longer fail with `EACCES` for every account on a machine but the first to run omp; each account spools rewrites in a private temporary directory of its own
 - Rewriting a session whose path is 474 to 512 characters long no longer fails on MySQL session storage
 - `omp gc --blobs` no longer fails when a session in SQL session storage is rewritten while gc reads it; it reads that session again
@@ -117,6 +118,8 @@
 - A subagent whose auto-retry gives up now tells the parent why it stopped and, when the provider stated it, when the limit resets: the task result shows `<retry-failure kind="usage-limit" reset-at="…" />` for any retry failure with an error kind, and `auto_retry_end` carries `kind` and `resetAtMs` for extensions and RPC clients
 - Fixed a usage limit spending the whole retry budget on back-to-back requests to the same exhausted account when no other stored account can serve the model; the session now moves to the fallback chain after one retry
 - Stopped long sessions from rewriting their entire session file on every turn that prunes tool output (superseded reads, uneventful results, or the context-size prune), so the disk writes of those turns no longer grow with session length.
+- A subagent's transcript read over RPC (`get_subagent_messages`) or in the Agent Hub now shows a recovered retry as recovered and an elided tool result as its placeholder, as the session itself does
+- A retry marker or other stamp that another process appended to the session file is no longer dropped when this session next rewrites the file, and a stamp whose content does not fit its entry is skipped with a warning instead of corrupting that entry
 - Stopped RPC mode from writing streamed output to a temporary spool file while the client was reading promptly; output now spills to disk only after 8 MiB is waiting on the client, and a stalled client still cannot grow memory past that
 - Mnemopi's `per-project`/`per-project-tagged` memory banks now derive from the repository's primary checkout root, so every linked git worktree and Jujutsu workspace of one repository shares the same bank instead of each getting its own isolated one ([#9424](https://github.com/can1357/oh-my-pi/pull/9424) by [@sjawhar](https://github.com/sjawhar)).
 - `providers.anthropic.serverSideFallbackModels` makes the Anthropic server-side fallback chain configurable (e.g. `fable-5 -> opus-5 -> opus-4-8`) instead of the catalog's single-hop Opus 5 chain; the setting caps at the wire's three-entry limit and, when unset, follows the catalog chain ([#9376](https://github.com/can1357/oh-my-pi/pull/9376) by [@sjawhar](https://github.com/sjawhar)).
@@ -149,6 +152,7 @@
 - Hindsight auto-retain, the pending-tool-call warning on resume and the exit record read only recent messages on each turn instead of the whole history
 - `.jsonl.gz` subagent transcripts in exports are decompressed as they are read instead of all at once
 - `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory
+- A rate limit now waits on the same model, retrying it after the wait the provider states, before it walks `retry.fallbackChains`, and never moves a session whose context is larger than the new `retry.rateLimitFallbackMaxContextTokens` (default 100,000 tokens); overloads and server errors still walk the chain at once
 
 ## [18.18.6] - 2026-11-09
 

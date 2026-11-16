@@ -324,10 +324,11 @@ describe("cold entry store", () => {
 		expect(textOf(entry(manager, a3))).toBe(`a3 ${BODY}`);
 		expect(Object.getOwnPropertyDescriptor(messageOf(entry(manager, a3)), "content")?.get).toBeUndefined();
 
-		// Back on the older compaction's branch, its kept entries are whole again.
+		// Back on the older compaction's branch, its kept entries are whole again;
+		// a3 and c2, off the current path after the move, are cold with u1 and a1.
 		manager.branch("a2");
 		manager.buildSessionContext();
-		expect(manager.coldStoreStats().coldEntries).toBe(2);
+		expect(manager.coldStoreStats().coldEntries).toBe(4);
 	});
 
 	it("returns frozen values from a cold body, so a nested write fails loudly", async () => {

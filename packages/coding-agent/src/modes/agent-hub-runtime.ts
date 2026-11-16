@@ -10,6 +10,7 @@ import { IrcBus, type IrcBusApi } from "../irc/bus";
 import { type AgentLifecycleApi, AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { registerPersistedSubagents, sessionFileBelongsToRoot } from "../registry/persisted-agents";
+import { applyEntryPatchesInWindow } from "../session/entry-patches";
 import { normalizeAssistantUsage, parseSessionEntries } from "../session/session-loader";
 import { defaultSessionStorage, readSessionLinesFrom, type SessionStorage } from "../session/session-storage";
 
@@ -24,9 +25,9 @@ function transcriptSource(storage: () => SessionStorage): AgentTranscriptSource 
 		stat: file => storage().statSync(file),
 		readFrom: async (file, offset) => (await readSessionLinesFrom(storage(), file, offset)).text,
 		parseEntries: text => {
-			const entries = parseSessionEntries(text).filter(
-				entry => entry.type === "message" || entry.type === "model_change",
-			);
+			const parsed = parseSessionEntries(text);
+			applyEntryPatchesInWindow(parsed);
+			const entries = parsed.filter(entry => entry.type === "message" || entry.type === "model_change");
 			for (const entry of entries) {
 				if (entry.type === "message" && entry.message.role === "assistant") normalizeAssistantUsage(entry.message);
 			}

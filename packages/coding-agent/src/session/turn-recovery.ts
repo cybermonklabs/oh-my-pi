@@ -5,6 +5,7 @@ import {
 	isSyntheticToolResultMessage,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
+import { findTranscriptUsageAnchor } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	AssistantMessage,
 	AssistantRetryRecovery,
@@ -2937,11 +2938,18 @@ export class TurnRecovery {
 			((classifierRefusal || AIError.is(id, AIError.Flag.MalformedFunctionCall) || AIError.retriable(id)) &&
 				this.#unexecutedToolCallsReplaySafe(message));
 		const rateLimitReason = parseRateLimitReason(errorMessage, message.errorRetryAfterMs);
-		// A rate limit is a cap the next attempt on this model re-hits, so
-		// retry.rateLimitWalksChain lets it skip the signed-thinking deferral in
-		// #tryRetryModelFallback and walk the chain at once. A chain entry may sit
-		// under a different cap; when it shares this one, its own failure walks the
-		// chain on. Off (the default) the deferral holds for a rate limit too.
+		// An HTTP 429 that is not a usage limit is a rate limit. Its window clears
+		// on this model, while a step down the chain sends the whole context to a
+		// model whose prompt cache holds none of it, and the step back sends it
+		// again. So the chain consult below waits on this model until its attempts
+		// are spent or the stated wait is past retry.maxDelayMs, and never walks
+		// for a context larger than retry.rateLimitFallbackMaxContextTokens.
+		const rateLimited = message.errorStatus === 429 && !AIError.is(id, AIError.Flag.UsageLimit);
+		// retry.rateLimitWalksChain opts out of that wait: a rate limit is a cap the
+		// next attempt on this model re-hits, so it walks the chain at once and
+		// skips the signed-thinking deferral in #tryRetryModelFallback too. A chain
+		// entry may sit under a different cap; when it shares this one, its own
+		// failure walks the chain on.
 		const sourceRateLimited =
 			retrySettings.rateLimitWalksChain &&
 			(message.errorStatus === 429 || rateLimitReason === "RATE_LIMIT_EXCEEDED");
@@ -3255,6 +3263,33 @@ export class TurnRecovery {
 			// chains say.
 			const refusalWalkKey = this.#refusalWalkKey(currentSelector);
 			const refusalWalkRepeats = classifierRefusal && this.#refusalWalkTried.has(refusalWalkKey);
+			// Whether the code below makes another attempt on this model that can
+			// succeed. Each term is a branch below that, with no switch, ends the turn
+			// instead: a spent budget, a refusal or account-policy denial, a
+			// hard-error or Fast-degrade consult the classifier would not retry, a
+			// wait past the fail-fast cap.
+			const sameModelRetryAvailable =
+				!retryBudgetExhausted &&
+				!classifierRefusal &&
+				!accountPolicyDenial &&
+				!((options?.fireworksFastFallback || options?.hardErrorFallback) && !this.isRetryableError(message)) &&
+				!exceedsDelayCap(
+					Math.max(
+						usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs
+							? parsedRetryAfterMs
+							: delayMs,
+						// The credit wait below never drops under its floor, so a cap
+						// below it ends the turn: defer no fallback for that retry.
+						creditBalanceRejection ? AIError.CREDIT_BALANCE_BACKOFF_MS : 0,
+					),
+				);
+			// The rate-limit wait (see `rateLimited`), measured on the context the
+			// provider reported for the newest answered request.
+			const rateLimitHoldsModel =
+				rateLimited &&
+				((sameModelRetryAvailable && !sourceRateLimited) ||
+					(findTranscriptUsageAnchor(this.#host.agent.state.messages)?.tokens ?? 0) >
+						retrySettings.rateLimitFallbackMaxContextTokens);
 			if (
 				allowModelFallback &&
 				retrySettings.modelFallback &&
@@ -3264,6 +3299,7 @@ export class TurnRecovery {
 				!sameModelSteerReplay &&
 				!waitForSiblingCredential &&
 				!refusalWalkRepeats &&
+				!rateLimitHoldsModel &&
 				!connectionHold
 			) {
 				if (classifierRefusal) {
@@ -3283,32 +3319,11 @@ export class TurnRecovery {
 					refusalWalk: classifierRefusal,
 					preserveFailedTurn,
 					wrapAround: longUsageLimitFallback,
-					// Deferring a chain candidate only pays when the code below makes
-					// another attempt on this model that can succeed. Each term is a
-					// branch below that, with no switch, ends the turn instead (a spent
-					// budget, a refusal or account-policy denial, a hard-error or
-					// Fast-degrade consult the classifier would not retry, a wait past
-					// the fail-fast cap), or, under `retry.rateLimitWalksChain`, a rate
+					// Deferring a chain candidate only pays when another attempt on this
+					// model can succeed: not when `sameModelRetryAvailable` says the turn
+					// ends instead, and not under `retry.rateLimitWalksChain` for a rate
 					// limit on this model, which the next attempt re-hits.
-					sameModelRetryAvailable:
-						!retryBudgetExhausted &&
-						!sourceRateLimited &&
-						!classifierRefusal &&
-						!accountPolicyDenial &&
-						!(
-							(options?.fireworksFastFallback || options?.hardErrorFallback) &&
-							!this.isRetryableError(message)
-						) &&
-						!exceedsDelayCap(
-							Math.max(
-								usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs
-									? parsedRetryAfterMs
-									: delayMs,
-								// The credit wait below never drops under its floor, so a cap
-								// below it ends the turn: defer no fallback for that retry.
-								creditBalanceRejection ? AIError.CREDIT_BALANCE_BACKOFF_MS : 0,
-							),
-						),
+					sameModelRetryAvailable: sameModelRetryAvailable && !sourceRateLimited,
 				});
 			}
 			// Auto fallback from a Fireworks Fast variant to its base model. Independent
@@ -3717,8 +3732,9 @@ export class TurnRecovery {
 		if (active[conversationEnd(active) - 1]?.role === "assistant") return false;
 		// A restored session omits the failed turn (and its synthetic results)
 		// from provider context, so — mirroring retry() — the persisted display
-		// transcript decides whether a retryable tool-call tail exists.
-		return abortedToolCallTail(this.#host.sessionManager.buildSessionContext({ transcript: true }).messages);
+		// transcript decides whether a retryable tool-call tail exists. Its end
+		// is all that decides, so no entry before the newest compaction is read.
+		return abortedToolCallTail(this.#host.sessionManager.buildTranscriptSinceCompaction());
 	}
 	/**
 	 * Manually retry the last failed assistant turn.
@@ -3769,7 +3785,7 @@ export class TurnRecovery {
 			// A restored session already dropped the failed assistant turn (and its
 			// paired synthetic tool results) from provider context, so the persisted
 			// display transcript is the source of truth for a retryable failed tail.
-			const transcriptMessages = this.#host.sessionManager.buildSessionContext({ transcript: true }).messages;
+			const transcriptMessages = this.#host.sessionManager.buildTranscriptSinceCompaction();
 			if (retryableAssistantTurnEnd(transcriptMessages) === undefined) return false;
 			// The boundary is already gone from active context; when the intact
 			// failed batch is still the tail, replay the tools directly.
