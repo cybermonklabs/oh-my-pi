@@ -797,8 +797,10 @@ Bun.spawn = ((...args: Parameters<typeof Bun.spawn>) => {
 		// Native killTree must signal the group the root leads, not only the root and
 		// its descendants: the stop relies on it to reach a command whose fork
 		// finished after the kill listed the descendants. The member here is no
-		// descendant: its parent exits, so it is reparented away, but it stays in
-		// the root's group.
+		// descendant: the subshell that started it exits, so it is reparented away,
+		// but it stays in the root's group. The test waits for that, as the leader's
+		// only child is that subshell: while it lives, the member is a grandchild and
+		// the descendant walk alone would end it.
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-group-member-"));
 		const pidFile = path.join(dir, "member");
 		const leader = spawn(["/bin/sh", "-c", `(sleep 3600 & echo $! > '${pidFile}'); exec sleep 3600`], {
@@ -810,15 +812,15 @@ Bun.spawn = ((...args: Parameters<typeof Bun.spawn>) => {
 			const root = Process.fromPid(leader.pid);
 			if (!root) throw new Error("failed to open the group leader");
 			const deadline = Date.now() + 10_000;
-			while (readFileSync(`/proc/${member}/stat`, "latin1").split(") ")[1]?.split(" ")[1] === String(leader.pid)) {
-				if (Date.now() > deadline) throw new Error("the member was never reparented");
+			while (root.children().length > 0) {
+				if (Date.now() > deadline) throw new Error("the subshell that started the member never exited");
 				await Bun.sleep(5);
 			}
 			expect(groupOf(member)?.pgrp, "the member must be in the leader's group").toBe(leader.pid);
 			expect(
-				root.children().map(child => child.pid),
-				"the member must not be the leader's descendant",
-			).not.toContain(member);
+				readFileSync(`/proc/${member}/stat`, "latin1").split(") ")[1]?.split(" ")[1],
+				"the member must have been reparented away from the leader's tree",
+			).not.toBe(String(leader.pid));
 			root.killTree(9);
 			expect(await runningAfter(member, 2_000), "the group member survived killTree").toBe(false);
 		} finally {
