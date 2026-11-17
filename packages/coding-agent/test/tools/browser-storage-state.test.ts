@@ -9,6 +9,7 @@ import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { chromiumAvailable } from "./chromium-probe";
+import { holdHeadlessBrowserForFile } from "./held-browser";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-storage-state-"));
@@ -29,6 +30,7 @@ const prelude = createBrowserPrelude(session);
 const context = { session, toolCallId: "browser-storage-state-test" };
 let server: Bun.Server<undefined>;
 let pageUrl = "";
+holdHeadlessBrowserForFile(CHROMIUM_AVAILABLE, () => root);
 
 async function invoke(parameters: unknown) {
 	return await prelude.invoke(parameters, context);

@@ -77,6 +77,8 @@ interface SessionHarness {
 	emitAgentEnd: () => void;
 	/** Finish a `toolName` call whose result is `text`. */
 	emitToolResult: (toolName: string, text: string) => void;
+	/** Consume a queued parent IRC steer in the running turn, as the agent loop does. */
+	emitParentSteer: (text: string) => void;
 	/** The observer factory installed by {@link attachIrcWakeTurnMonitor}, if any. */
 	wakeObserver: () =>
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
@@ -97,6 +99,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 	let yieldSeq = 0;
 	let toolSeq = 0;
 	let wakeObserver: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined;
+	const parentSteers = new WeakSet<AgentMessage>();
 	const emit = (event: AgentSessionEvent) => {
 		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 		for (const listener of [...listeners]) listener(event);
@@ -117,6 +120,11 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 			result: { content: [{ type: "text", text }] },
 		} as AgentSessionEvent);
 	};
+	const emitParentSteer = (text: string) => {
+		const message = { role: "user", content: text, attribution: "agent", timestamp: Date.now(), steering: true };
+		parentSteers.add(message as unknown as AgentMessage);
+		emit({ type: "message_end", message } as unknown as AgentSessionEvent);
+	};
 	const emitTerminalYield = (data: unknown) => {
 		yieldSeq += 1;
 		emit({
@@ -135,6 +143,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		model: undefined,
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
+		settings: Settings.isolated(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		getMountedXdevToolNames: () => [],
@@ -176,7 +185,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		trackIrcReply: () => {},
 		holdIrcWakes: () => () => {},
 		subscribeRunState: () => () => {},
-		isParentIrcSteer: () => false,
+		isParentIrcSteer: (message: AgentMessage) => parentSteers.has(message),
 		asyncJobManager: options?.asyncJobManager,
 	};
 	return {
@@ -187,6 +196,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		emitAssistantContent,
 		emitAgentEnd,
 		emitToolResult,
+		emitParentSteer,
 		wakeObserver: () => wakeObserver,
 	};
 }
@@ -304,6 +314,7 @@ describe("runSubprocess result acceptance", () => {
 			id: AGENT_ID,
 			agent: baseAgent,
 			message: "continue",
+			storeMaskCwd: "/tmp",
 		});
 
 		expect(result.exitCode).toBe(0);
@@ -317,7 +328,7 @@ describe("runSubprocess result acceptance", () => {
 	it("terminalizes the ref when an autonomous wake turn's yield is accepted", async () => {
 		const harness = createHarness();
 		registerRunning(harness.session);
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 		const observer = harness.wakeObserver();
 		expect(observer).toBeDefined();
 
@@ -357,7 +368,7 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -408,6 +419,7 @@ describe("runSubprocess result acceptance", () => {
 			agent: baseAgent,
 			structured: false,
 			artifactsDir,
+			storeMaskCwd: "/tmp",
 		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
@@ -469,7 +481,13 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			artifactsDir,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const accepted = '{"report":"accepted verdict"}';
@@ -518,7 +536,13 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			artifactsDir,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -567,7 +591,13 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			artifactsDir,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const accepted = '{"report":"accepted verdict"}';
@@ -611,7 +641,13 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			artifactsDir,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -665,6 +701,7 @@ describe("runSubprocess result acceptance", () => {
 				structured: false,
 				artifactsDir,
 				signal: AbortSignal.abort("cancelled"),
+				storeMaskCwd: "/tmp",
 			});
 			expect(result.aborted).toBe(true);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
@@ -695,7 +732,7 @@ describe("runSubprocess result acceptance", () => {
 				session: harness.session,
 				status: "idle",
 			});
-			attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+			attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 			const observer = harness.wakeObserver();
 			if (!observer) throw new Error("wake-turn observer was not registered");
 			const parent = {
@@ -730,14 +767,7 @@ describe("runSubprocess result acceptance", () => {
 				await finish?.(undefined);
 				const result = await waiting;
 				const job = result.details?.jobs?.[0];
-				expect(job?.status).toBe("completed");
-				expect(job?.resultText).toContain(`history://${AGENT_ID}`);
-				if (alreadyMessaged) {
-					expect(job?.resultText).not.toContain("produced no output");
-					expect(job?.resultText).toContain(`${AGENT_ID} sent a message during this turn`);
-				} else {
-					expect(job?.resultText).toContain("produced no output");
-				}
+				expect(job?.status).toBe("failed");
 			} finally {
 				await manager.dispose({ timeoutMs: 1000 });
 			}
@@ -755,7 +785,12 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const parent = {
@@ -807,7 +842,7 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		// The parent's message reaches the idle child through the real bus and bridge, as a live send would.
@@ -839,7 +874,9 @@ describe("runSubprocess result acceptance", () => {
 			expect((await waiting).details?.jobs?.[0]).toMatchObject({
 				id: AGENT_ID,
 				status: "completed",
-				resultText: "mask path fixed too",
+				resultText: expect.stringContaining(
+					"SYSTEM WARNING: Structured subagent replied without calling yield.\n\nmask path fixed too",
+				),
 			});
 
 			// The job carried the answer: the child is not silent, and nothing is owed.
@@ -871,7 +908,7 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -917,5 +954,239 @@ describe("runSubprocess result acceptance", () => {
 		});
 		expect(body).not.toContain("Running the tests.");
 		expect(body).toContain("produced no output");
+	});
+
+	it("marks a parent-owned structured wake that replies without yield", async () => {
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: true,
+			storeMaskCwd: "/tmp",
+		});
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const parent = {
+			cwd: "/tmp",
+			settings: Settings.isolated({ "launch.enabled": false }),
+			agentRegistry: AgentRegistry.global(),
+			asyncJobManager: manager,
+			getAgentId: () => "Parent",
+		} as unknown as ToolSession;
+		const warning = "SYSTEM WARNING: Structured subagent replied without calling yield.";
+
+		try {
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "report your findings",
+					display: false,
+					details: { id: "msg-report", from: "Parent", message: "report your findings" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			const waiting = new WaitTool(parent).execute("parent-wait", {});
+			harness.emitAssistantText("Everything verified; writing the report now.");
+			await finish?.(undefined);
+
+			const job = (await waiting).details?.jobs?.[0];
+			expect(job?.status).toBe("completed");
+			expect(job?.resultText).toContain(warning);
+			expect(job?.resultText).toContain("Everything verified; writing the report now.");
+			expect(job?.resultText).not.toContain("after 3 reminders");
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
+
+	it.each(["", " \n "])("fails an empty structured owner wake (%p)", async reply => {
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: true,
+			storeMaskCwd: "/tmp",
+		});
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const parent = {
+			cwd: "/tmp",
+			settings: Settings.isolated({ "launch.enabled": false }),
+			agentRegistry: AgentRegistry.global(),
+			asyncJobManager: manager,
+			getAgentId: () => "Parent",
+		} as unknown as ToolSession;
+
+		try {
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "report your findings",
+					display: false,
+					details: { id: "msg-empty", from: "Parent", message: "report your findings" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			const waiting = new WaitTool(parent).execute("parent-wait", {});
+			harness.emitAssistantText(reply);
+			await finish?.(undefined);
+
+			const job = (await waiting).details?.jobs?.[0];
+			expect(job?.status).toBe("failed");
+			expect(job?.resultText).toBeUndefined();
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
+
+	it.each([
+		["Everything verified; writing the report now.", "completed"],
+		["", "failed"],
+		[" \n ", "failed"],
+	] as const)("marks a structured wake that a parent steer joins mid-turn (%p)", async (reply, status) => {
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		const registry = AgentRegistry.global();
+		registry.register({
+			id: "OtherAgent",
+			displayName: "OtherAgent",
+			kind: "sub",
+			session: createHarness().session,
+			status: "running",
+		});
+		registry.register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: true,
+			storeMaskCwd: "/tmp",
+		});
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const parent = {
+			cwd: "/tmp",
+			settings: Settings.isolated({ "launch.enabled": false }),
+			agentRegistry: registry,
+			asyncJobManager: manager,
+			getAgentId: () => "Parent",
+		} as unknown as ToolSession;
+
+		try {
+			// A peer starts the turn; the parent's queued request enters it afterwards.
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "is line 42 fine?",
+					display: false,
+					details: { id: "msg-peer", from: "OtherAgent", message: "is line 42 fine?" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			harness.emitParentSteer("report your findings");
+			const waiting = new WaitTool(parent).execute("parent-wait", {});
+			harness.emitAssistantText(reply);
+			await finish?.(undefined);
+
+			const job = (await waiting).details?.jobs?.[0];
+			expect(job?.status).toBe(status);
+			if (status === "completed") {
+				expect(job?.resultText).toContain('missing-yield="wake"');
+				expect(job?.resultText).toContain("SYSTEM WARNING: Structured subagent replied without calling yield.");
+				expect(job?.resultText).toContain(reply);
+			}
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
+
+	it("delivers only a parent-owned structured wake's final report, with its warning", async () => {
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: true,
+			storeMaskCwd: "/tmp",
+		});
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const parent = {
+			cwd: "/tmp",
+			settings: Settings.isolated({ "launch.enabled": false }),
+			agentRegistry: AgentRegistry.global(),
+			asyncJobManager: manager,
+			getAgentId: () => "Parent",
+		} as unknown as ToolSession;
+
+		try {
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "report your findings",
+					display: false,
+					details: { id: "msg-narration", from: "Parent", message: "report your findings" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			const waiting = new WaitTool(parent).execute("parent-wait", {});
+			harness.emitAssistantContent([
+				{ type: "text", text: "Checking." },
+				{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "src/a.ts" } },
+			]);
+			harness.emitAssistantText("Answer.");
+			harness.emitAgentEnd();
+			await finish?.(undefined);
+
+			const job = (await waiting).details?.jobs?.[0];
+			expect(job?.status).toBe("completed");
+			expect(job?.resultText).toContain('missing-yield="wake"');
+			expect(job?.resultText).toContain(
+				"SYSTEM WARNING: Structured subagent replied without calling yield.\n\nAnswer.",
+			);
+			expect(job?.resultText).not.toContain("Checking.");
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
 	});
 });

@@ -90,6 +90,14 @@ export default function (pi) {
 }
 `;
 
+/**
+ * How long a frame held for startup is left unanswered before the dialog startup awaits is answered.
+ * Real time, deliberately: the contract is that a held frame produces nothing while the agent is
+ * otherwise idle, and no signal from the agent marks "would have answered by now" — a session change
+ * that did not wait answers in a few milliseconds, far inside this window.
+ */
+const HELD_FRAME_WINDOW_MS = 2_000;
+
 describe("RPC extension UI", () => {
 	it("keeps extension dialogs headless while tool selections round-trip", async () => {
 		await using temp = await TempDir.create("@rpc-headless-tool-ui-");
@@ -176,8 +184,15 @@ await runRpcMode(session, {
 		expect(requests[0]).toMatchObject({ title: "Tool choice", options: ["Keep", "Deploy"] });
 	}, 30_000);
 
-	/** Spawns an RPC runtime whose extension awaits a `confirm` in `session_start` and has a `/probe` command. */
-	async function spawnStartupDialogRuntime(temp: TempDir) {
+	/**
+	 * Spawns an RPC runtime whose extension awaits a dialog in `session_start` and has a `/probe`
+	 * command. `dialog` is the statement that opens it, so a case can choose which dialog the
+	 * client is asked to answer.
+	 */
+	async function spawnStartupDialogRuntime(
+		temp: TempDir,
+		dialog = 'ctx.ui.notify(String(await ctx.ui.confirm("Trust?", "startup")));',
+	) {
 		const fixturePath = temp.join("runtime.ts");
 		const sourceDir = path.resolve(import.meta.dir, "../src");
 		await Bun.write(
@@ -185,6 +200,7 @@ await runRpcMode(session, {
 			`
 import { createAgentSession, Settings } from ${JSON.stringify(path.join(sourceDir, "sdk.ts"))};
 import { runRpcMode } from ${JSON.stringify(path.join(sourceDir, "modes/rpc/rpc-mode.ts"))};
+import { requestApproval } from ${JSON.stringify(path.join(sourceDir, "tools/approval.ts"))};
 globalThis.fetch = async () => { throw new Error("Offline UI fixture refuses network"); };
 const { session } = await createAgentSession({
   cwd: process.cwd(),
@@ -198,8 +214,9 @@ const { session } = await createAgentSession({
       // A command's context is built per call, so it sees whether set_ask_dialog took effect.
       handler: async (_args, ctx) => ctx.ui.notify("askDialog:" + typeof ctx.ui.askDialog),
     });
+    // requestApproval is imported for the cases whose dialog raises an approval.
     pi.on("session_start", async (_event, ctx) => {
-      ctx.ui.notify(String(await ctx.ui.confirm("Trust?", "startup")));
+      ${dialog}
     });
   }],
 });
@@ -225,7 +242,7 @@ await runRpcMode(session);
 		});
 	}
 
-	it("answers a dialog session_start awaits, running commands sent meanwhile only after startup, in order", async () => {
+	it("answers a dialog session_start awaits, and answers commands sent meanwhile while it waits, in order", async () => {
 		await using temp = await TempDir.create("@rpc-startup-dialog-");
 		const child = await spawnStartupDialogRuntime(temp);
 		const stderr = new Response(child.stderr).text();
@@ -235,32 +252,84 @@ await runRpcMode(session);
 			if (!isRecord(frame)) continue;
 			if (frame.type === "extension_ui_request" && frame.method === "confirm") {
 				confirmId = frame.id;
-				// Held until startup finishes (had one run at once, its response would precede the confirm's
-				// notify) and then run in arrival order. set_ask_dialog is served during startup and takes effect.
+				// Answered as they arrive, in arrival order, while startup still waits for this dialog.
+				// set_ask_dialog serializes with every other command now, so it goes before the prompt that
+				// needs it. The confirm's `true` notify arrives only once the client answers the confirm below.
+				child.stdin.write(`${JSON.stringify({ id: "ask", type: "set_ask_dialog", enabled: true })}\n`);
 				for (const id of ["s1", "s2"]) child.stdin.write(`${JSON.stringify({ id, type: "get_state" })}\n`);
 				child.stdin.write(`${JSON.stringify({ id: "p", type: "prompt", message: "/probe" })}\n`);
 				child.stdin.write(`${JSON.stringify({ id: "s3", type: "get_state" })}\n`);
-				child.stdin.write(`${JSON.stringify({ id: "ask", type: "set_ask_dialog", enabled: true })}\n`);
 				await child.stdin.flush();
 			} else if (frame.type === "response" && frame.id === "ask") {
 				seen.push("ask");
-				child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: confirmId, confirmed: true })}\n`);
-				await child.stdin.flush();
 			} else if (frame.type === "extension_ui_request" && frame.method === "notify") {
 				seen.push(String(frame.message));
+				// Both notifies seen: nothing is left to answer, so end stdin and drain stdout to its end.
+				// Ending it earlier would reject the dialog startup awaits, which the test below covers.
+				if (seen.includes("true") && seen.includes("askDialog:function")) child.stdin.end();
 			} else if (frame.type === "response" && typeof frame.id === "string" && /^(s\d|p)$/.test(frame.id)) {
 				seen.push(`${frame.id}:${frame.success}`);
-				// Drain stdout to its end: closing the reader early would break the child's output pipe.
-				if (frame.id === "s3") child.stdin.end();
+				// Answer the dialog only now: every frame answered above was answered while startup waited.
+				if (frame.id === "s3") {
+					child.stdin.write(
+						`${JSON.stringify({ type: "extension_ui_response", id: confirmId, confirmed: true })}\n`,
+					);
+					await child.stdin.flush();
+				}
 			}
 		}
 		await child.exited;
-		// The probe's own frames race the later state responses; every other frame's order is fixed.
+		// The prompt's own response races the later state responses; every other frame's order is
+		// fixed. The startup hold covers `prompt`, so the probe runs only once startup finishes and
+		// its notify arrives after the confirm's.
 		expect(
-			seen.filter(entry => entry !== "p:true" && entry !== "askDialog:function"),
+			seen.filter(entry => entry !== "p:true"),
 			await stderr,
-		).toEqual(["ask", "true", "s1:true", "s2:true", "s3:true"]);
-		expect(seen).toContain("askDialog:function");
+		).toEqual(["ask", "s1:true", "s2:true", "s3:true", "true", "askDialog:function"]);
+	}, 30_000);
+
+	it("holds a session change sent while startup waits, and the command behind it, until startup finishes", async () => {
+		await using temp = await TempDir.create("@rpc-startup-dialog-session-");
+		const child = await spawnStartupDialogRuntime(temp);
+		const stderr = new Response(child.stderr).text();
+		const seen: string[] = [];
+		let confirmId: unknown;
+		for await (const frame of readJsonl<unknown>(child.stdout)) {
+			if (!isRecord(frame)) continue;
+			if (frame.type === "extension_ui_request" && frame.method === "confirm") {
+				confirmId = frame.id;
+				// A session change waits for startup, and the dispatcher serializes the get_state behind
+				// it, so neither may be answered before the confirm is. `btw_cancel` skips the serial
+				// queue and is answered at once: its response proves the two frames ahead of it on stdin
+				// were already read, so both are waiting before the confirm is answered.
+				child.stdin.write(`${JSON.stringify({ id: "n", type: "new_session" })}\n`);
+				child.stdin.write(`${JSON.stringify({ id: "s", type: "get_state" })}\n`);
+				child.stdin.write(`${JSON.stringify({ id: "read", type: "btw_cancel" })}\n`);
+				await child.stdin.flush();
+			} else if (frame.type === "extension_ui_request" && frame.method === "notify") {
+				seen.push(String(frame.message));
+			} else if (frame.type === "response" && typeof frame.id === "string" && /^(n|s|read)$/.test(frame.id)) {
+				seen.push(`${frame.id}:${frame.success}`);
+				if (frame.id === "read") {
+					// The agent now has nothing to do but the two held frames. A session change that
+					// did not wait would finish inside this window — far longer than one takes — and
+					// its response would land before the notify below. Real time is what separates
+					// "held until startup" from "ran at once": the dialog is answered only after it.
+					await Bun.sleep(HELD_FRAME_WINDOW_MS);
+					child.stdin.write(
+						`${JSON.stringify({ type: "extension_ui_response", id: confirmId, confirmed: true })}\n`,
+					);
+					await child.stdin.flush();
+				}
+				// The session change and the frame behind it are back: nothing is left to answer.
+				if (frame.id === "s") child.stdin.end();
+			}
+		}
+		await child.exited;
+		// `read` is answered while startup waits; the confirm's `true` notify comes from startup itself.
+		// Both responses after it prove `new_session` — and the `get_state` the dispatcher put behind
+		// it — waited for startup to finish rather than running during the window above.
+		expect(seen, await stderr).toEqual(["read:true", "true", "n:true", "s:true"]);
 	}, 30_000);
 
 	it("rejects a dialog session_start awaits when stdin closes, so the process still exits", async () => {
@@ -273,6 +342,63 @@ await runRpcMode(session);
 		}
 		const exitCode = await child.exited;
 		expect({ exitCode, signal: child.signalCode }, await stderr).toEqual({ exitCode: 0, signal: null });
+	}, 30_000);
+
+	it("reports the wait bracket for a dialog session_start awaits", async () => {
+		// `user_wait_start` is published once, when the dialog opens — here while
+		// startup is still inside extension initialization. A client that never
+		// receives it reports the session as idle for as long as the dialog stands.
+		// The frame carries the dialog's own title and its classification, so a
+		// client shows what is being asked without a per-tool-call record.
+		await using temp = await TempDir.create("@rpc-startup-dialog-wait-");
+		const child = await spawnStartupDialogRuntime(temp);
+		const stderr = new Response(child.stderr).text();
+		const seen: string[] = [];
+		for await (const frame of readJsonl<unknown>(child.stdout)) {
+			if (!isRecord(frame)) continue;
+			if (frame.type === "user_wait_start") seen.push(`start:${String(frame.kind)}:${String(frame.prompt)}`);
+			if (frame.type === "user_wait_end") seen.push("end");
+			if (frame.type === "extension_ui_request" && frame.method === "confirm") {
+				seen.push("confirm");
+				child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: frame.id, confirmed: true })}\n`);
+				await child.stdin.flush();
+			}
+			if (frame.type === "extension_ui_request" && frame.method === "notify") child.stdin.end();
+		}
+		await child.exited;
+		expect(seen, await stderr).toEqual(["start:question:Trust?", "confirm", "end"]);
+	}, 30_000);
+
+	it("classifies an approval the client answers through a select as a permission wait", async () => {
+		// A host without an approval dialog answers an approval through `select`
+		// (RPC, ACP, extension hosts). The dialog is still an approval of an
+		// operation: a client that reads the wait's classification must not be
+		// told a question is open while the request beside it offers Approve and
+		// Deny for a named tool.
+		await using temp = await TempDir.create("@rpc-startup-approval-wait-");
+		const child = await spawnStartupDialogRuntime(
+			temp,
+			'ctx.ui.notify(String(await requestApproval(ctx.ui, { name: "deploy", formatApprovalDetails: () => ["Target: prod"] }, {})));',
+		);
+		const stderr = new Response(child.stderr).text();
+		const seen: string[] = [];
+		for await (const frame of readJsonl<unknown>(child.stdout)) {
+			if (!isRecord(frame)) continue;
+			if (frame.type === "user_wait_start") seen.push(`start:${String(frame.kind)}:${String(frame.prompt)}`);
+			if (frame.type === "user_wait_end") seen.push("end");
+			if (frame.type === "extension_ui_request" && frame.method === "select") {
+				seen.push(`select:${JSON.stringify(frame.options)}`);
+				child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: frame.id, value: "Approve" })}\n`);
+				await child.stdin.flush();
+			}
+			if (frame.type === "extension_ui_request" && frame.method === "notify") child.stdin.end();
+		}
+		await child.exited;
+		expect(seen, await stderr).toEqual([
+			"start:permission:Allow tool: deploy\nTarget: prod",
+			'select:["Approve","Deny"]',
+			"end",
+		]);
 	}, 30_000);
 
 	it("keeps the label-only wire shape for bare options", async () => {
