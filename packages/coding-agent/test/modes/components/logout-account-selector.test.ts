@@ -12,6 +12,7 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { StoredAuthCredential } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	listLogoutAccounts,
+	listLogoutProviders,
 	logoutCredential,
 	toLogoutAccounts,
 } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/logout";
@@ -106,6 +107,72 @@ describe("LogoutAccountSelectorComponent", () => {
 			expect((await logoutCredential(session, "anthropic", id)).removed).toBe(true);
 			expect((await authStorage.credentials.listDisabled("anthropic")).some(isAutoDisabledCredential)).toBe(false);
 			expect(await listLogoutAccounts(authStorage, "anthropic", "logout-session")).toEqual([]);
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	it("lists the stored accounts and providers when the tombstone lookup fails", async () => {
+		// If this regresses, an auth broker that cannot answer the tombstone lookup leaves the user
+		// unable to remove even an active account: the selector only reports that it could not load them.
+		await using temp = await TempDir.create("@logout-lookup-failed-");
+		const authStorage = await AuthStorage.create(temp.join("auth.db"));
+		try {
+			await authStorage.credentials.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access",
+					refresh: "refresh",
+					expires: Date.now() + 60_000,
+					email: "active@example.test",
+				},
+			]);
+			const id = authStorage.credentials.list("anthropic")[0]!.id;
+			vi.spyOn(authStorage.credentials, "listDisabled").mockRejectedValue(new Error("auth broker unreachable"));
+
+			expect(await listLogoutAccounts(authStorage, "anthropic", "logout-session")).toEqual([
+				expect.objectContaining({ credentialId: id, label: expect.stringContaining("active@example.test") }),
+			]);
+			expect([...(await listLogoutProviders(authStorage))]).toEqual(["anthropic"]);
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	it("lists one account when a recoverable tombstone names the same login as an active row", async () => {
+		// If this regresses, /logout offers the account twice — once plain and once "(disabled)" —
+		// after the user logged in again, and removing the disabled row removes nothing of theirs.
+		await using temp = await TempDir.create("@logout-relogin-");
+		const authStorage = await AuthStorage.create(temp.join("auth.db"));
+		try {
+			await authStorage.credentials.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access",
+					refresh: "refresh",
+					expires: Date.now() + 60_000,
+					email: "relogin@example.test",
+					orgId: "org-relogin",
+				},
+			]);
+			const id = authStorage.credentials.list("anthropic")[0]!.id;
+			// The login a failure tore down before the user logged in again, as a broker that predates
+			// `identityKey` reports it: the account's identity, no store key to compare.
+			vi.spyOn(authStorage.credentials, "listDisabled").mockResolvedValue([
+				{
+					id: id + 100,
+					provider: "anthropic",
+					type: "oauth",
+					email: "relogin@example.test",
+					orgId: "org-relogin",
+					cause: "oauth refresh failed: invalid_grant",
+				},
+			]);
+
+			const accounts = await listLogoutAccounts(authStorage, "anthropic", "logout-session");
+
+			expect(accounts.map(account => account.credentialId)).toEqual([id]);
+			expect(accounts[0]?.label).not.toContain("(disabled)");
 		} finally {
 			authStorage.close();
 		}

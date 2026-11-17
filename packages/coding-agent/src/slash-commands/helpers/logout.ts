@@ -1,5 +1,7 @@
 import { getOAuthCredentialProvider } from "@oh-my-pi/pi-ai/oauth";
-import { isRecoverableDisabledCredential } from "@oh-my-pi/pi-ai/auth-storage";
+import { type DisabledCredentialSummary, isRecoverableDisabledCredential } from "@oh-my-pi/pi-ai/auth-storage";
+import { logger } from "@oh-my-pi/pi-utils";
+import { hasActiveAccount, toAccountIdentity } from "./usage-accounts";
 import type { AgentSession } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity, StoredAuthCredential } from "../../session/auth-storage";
 
@@ -108,6 +110,31 @@ export function toLogoutAccounts(
 		});
 }
 
+/** A credential store's tombstone listing, for one provider or for every provider. */
+export type DisabledCredentialLister = (provider?: string) => Promise<DisabledCredentialSummary[]>;
+
+/**
+ * Tombstones of logins a new login would restore ({@link isRecoverableDisabledCredential}).
+ * A lookup the store cannot answer — through an auth broker it is a request — logs and
+ * yields none, so a listing still offers the logins the store holds either way.
+ */
+async function recoverableTombstones(
+	listDisabled: DisabledCredentialLister,
+	provider?: string,
+): Promise<DisabledCredentialSummary[]> {
+	let tombstones: DisabledCredentialSummary[];
+	try {
+		tombstones = await listDisabled(provider);
+	} catch (error) {
+		logger.warn("Disabled credential lookup failed; logout lists the active logins only", {
+			provider,
+			error: String(error),
+		});
+		return [];
+	}
+	return tombstones.filter(summary => isRecoverableDisabledCredential(summary, tombstones));
+}
+
 /** Stored accounts `/logout` can remove, including recoverable failure-disabled logins. */
 export async function listLogoutAccounts(
 	authStorage: AuthStorage,
@@ -116,13 +143,16 @@ export async function listLogoutAccounts(
 ): Promise<LogoutAccount[]> {
 	const provider = getOAuthCredentialProvider(loginProvider);
 	await authStorage.credentials.reload();
-	const accounts = toLogoutAccounts(provider, authStorage.credentials.list(provider), {
+	const rows = authStorage.credentials.list(provider);
+	const accounts = toLogoutAccounts(provider, rows, {
 		activeIdentity: authStorage.oauth.identity(provider, sessionId),
 		activeApiKey: authStorage.keys.source(provider)?.kind === "api_key",
 	});
-	const tombstones = await authStorage.credentials.listDisabled(provider);
+	const active = rows.map(row => toAccountIdentity(provider, row.credential));
+	const tombstones = await recoverableTombstones(scope => authStorage.credentials.listDisabled(scope), provider);
 	for (const summary of tombstones) {
-		if (!isRecoverableDisabledCredential(summary, tombstones)) continue;
+		// The user logged this account in again: one row to remove, not an active and a disabled one.
+		if (hasActiveAccount(summary, active)) continue;
 		accounts.push({
 			credentialId: summary.id,
 			provider,
@@ -138,11 +168,24 @@ export async function listLogoutAccounts(
 /** Providers with active credentials or recoverable failure-disabled logins to remove. */
 export async function listLogoutProviders(authStorage: AuthStorage): Promise<ReadonlySet<string>> {
 	await authStorage.credentials.reload();
-	const providers = new Set(authStorage.credentials.list().map(row => row.provider));
-	const tombstones = await authStorage.credentials.listDisabled();
-	for (const summary of tombstones) {
-		if (isRecoverableDisabledCredential(summary, tombstones)) providers.add(summary.provider);
-	}
+	return collectLogoutProviders(
+		authStorage.credentials.list().map(row => row.provider),
+		scope => authStorage.credentials.listDisabled(scope),
+	);
+}
+
+/**
+ * Providers a logout can still remove a login from: those with an active credential, and
+ * those whose only logins a failure disabled — removing one of those retires the tombstone
+ * that keeps a turn retrying the provider's key. `omp auth-broker logout` offers the same
+ * providers, reading its own store.
+ */
+export async function collectLogoutProviders(
+	activeProviders: Iterable<string>,
+	listDisabled: DisabledCredentialLister,
+): Promise<ReadonlySet<string>> {
+	const providers = new Set(activeProviders);
+	for (const summary of await recoverableTombstones(listDisabled)) providers.add(summary.provider);
 	return providers;
 }
 

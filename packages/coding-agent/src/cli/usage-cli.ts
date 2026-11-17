@@ -60,6 +60,7 @@ import {
 	accountIdentityLabel,
 	collectStoredAccounts,
 	collectUnreportedAccounts,
+	hasActiveAccount,
 	selectReportableAccounts,
 	type UsageAccountIdentity,
 } from "../slash-commands/helpers/usage-accounts";
@@ -587,42 +588,6 @@ function formatReloginDeadline(
 	return `  ${chalk.yellow(`⚠ ${label} — re-login within ${formatDuration(remaining)} (Anthropic expires OAuth grants ~30d after login)`)}`;
 }
 
-/**
- * Tombstones worth a row in `omp usage`: OAuth credentials torn down
- * automatically ({@link isAutoDisabledCredential}) whose account has no active
- * credential. Rows the user replaced or deleted deliberately are lifecycle
- * noise, not lost capacity.
- */
-function isActionableDisable(summary: DisabledCredentialSummary, activeAccounts: UsageAccountIdentity[] = []): boolean {
-	if (!isAutoDisabledCredential(summary)) return false;
-
-	// Do not display tombstone if there is an active account for the same provider
-	// matching the same identity (email, accountId, or org).
-	const summaryEmail = summary.email?.toLowerCase();
-	const summaryAccountId = summary.accountId?.toLowerCase();
-	const summaryOrgId = summary.orgId?.toLowerCase();
-
-	const matchesActive = activeAccounts.some(account => {
-		if (account.provider !== summary.provider) return false;
-		if (summary.identityKey) return account.identityKey === summary.identityKey;
-
-		const accountEmail = account.email?.toLowerCase();
-		const accountAccountId = account.accountId?.toLowerCase();
-		const accountOrgId = account.orgId?.toLowerCase();
-
-		// If email or accountId match, it's the same identity
-		if (summaryEmail && accountEmail && summaryEmail === accountEmail) return true;
-		if (summaryAccountId && accountAccountId && summaryAccountId === accountAccountId) return true;
-
-		// Fallback: if orgId matches and neither email nor accountId contradicts
-		if (summaryOrgId && accountOrgId && summaryOrgId === accountOrgId) return true;
-
-		return false;
-	});
-
-	return !matchesActive;
-}
-
 /** Human-sized disable cause: the upstream `error_description` when embedded, else the first clause. */
 function shortDisableCause(cause: string): string {
 	const description = cause.match(/\\?"error_description\\?"\s*:\s*\\?"([^"\\]+)/)?.[1];
@@ -853,8 +818,10 @@ export function formatUsageBreakdown(
 		unreportedByProvider.set(account.provider, list);
 	}
 	const disabledByProvider = new Map<string, DisabledCredentialSummary[]>();
+	// Worth a row: a credential torn down automatically whose account has no active
+	// credential. Rows the user replaced or deleted deliberately are lifecycle noise.
 	for (const summary of disabled) {
-		if (!isActionableDisable(summary, accounts)) continue;
+		if (!isAutoDisabledCredential(summary) || hasActiveAccount(summary, accounts)) continue;
 		const list = disabledByProvider.get(summary.provider) ?? [];
 		list.push(summary);
 		disabledByProvider.set(summary.provider, list);
@@ -1707,7 +1674,9 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 				const stats = computeProviderWindowStats(filteredReports.filter(peer => peer.provider === report.provider));
 				if (stats.length > 0) capacity[report.provider] = stats;
 			}
-			let disabledForJson = disabled.filter(summary => isActionableDisable(summary, accounts));
+			let disabledForJson = disabled.filter(
+				summary => isAutoDisabledCredential(summary) && !hasActiveAccount(summary, accounts),
+			);
 			if (redaction) {
 				disabledForJson = disabledForJson.map(summary => ({
 					...summary,

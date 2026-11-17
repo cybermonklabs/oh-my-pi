@@ -1,4 +1,10 @@
-import { type AuthStorage, resolveCredentialIdentityKey, type UsageReport } from "@oh-my-pi/pi-ai";
+import {
+	type AuthCredential,
+	type AuthStorage,
+	type DisabledCredentialSummary,
+	resolveCredentialIdentityKey,
+	type UsageReport,
+} from "@oh-my-pi/pi-ai";
 
 /** Identity slice of a stored credential, for "every account" coverage. */
 export interface UsageAccountIdentity {
@@ -20,6 +26,57 @@ export interface UsageAccountIdentity {
 	authorizedAt?: number;
 }
 
+/** Identity row of one stored credential, as the usage listings and `/logout` read it. */
+export function toAccountIdentity(provider: string, credential: AuthCredential): UsageAccountIdentity {
+	if (credential.type !== "oauth") return { provider, type: "api_key" };
+	return {
+		provider,
+		type: "oauth",
+		identityKey: resolveCredentialIdentityKey(provider, credential) ?? undefined,
+		email: credential.email,
+		accountId: credential.accountId,
+		projectId: credential.projectId,
+		enterpriseUrl: credential.enterpriseUrl,
+		orgId: credential.orgId,
+		orgName: credential.orgName,
+		authorizedAt: credential.authorizedAt,
+	};
+}
+
+/**
+ * Whether one of `accounts` is the account `summary`'s tombstone names: the store's
+ * `identityKey` decides when the tombstone carries one (a broker older than the field
+ * sends none), else a shared email or account id, else an organization neither side
+ * contradicts. The user logged that account in again, so the tombstone is lifecycle
+ * noise — no lost capacity to report, no second row to log out of.
+ */
+export function hasActiveAccount(
+	summary: DisabledCredentialSummary,
+	accounts: readonly UsageAccountIdentity[],
+): boolean {
+	const summaryEmail = summary.email?.toLowerCase();
+	const summaryAccountId = summary.accountId?.toLowerCase();
+	const summaryOrgId = summary.orgId?.toLowerCase();
+
+	return accounts.some(account => {
+		if (account.provider !== summary.provider) return false;
+		if (summary.identityKey) return account.identityKey === summary.identityKey;
+
+		const accountEmail = account.email?.toLowerCase();
+		const accountAccountId = account.accountId?.toLowerCase();
+		const accountOrgId = account.orgId?.toLowerCase();
+
+		// If email or accountId match, it's the same identity
+		if (summaryEmail && accountEmail && summaryEmail === accountEmail) return true;
+		if (summaryAccountId && accountAccountId && summaryAccountId === accountAccountId) return true;
+
+		// Fallback: if orgId matches and neither email nor accountId contradicts
+		if (summaryOrgId && accountOrgId && summaryOrgId === accountOrgId) return true;
+
+		return false;
+	});
+}
+
 /** Flatten every stored credential (OAuth and API key) into identity rows for unreported-account detection. */
 export function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIdentity[] {
 	const accounts: UsageAccountIdentity[] = [];
@@ -27,24 +84,7 @@ export function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIde
 	for (const provider in all) {
 		const entry = all[provider];
 		const credentials = Array.isArray(entry) ? entry : [entry];
-		for (const credential of credentials) {
-			if (credential.type === "oauth") {
-				accounts.push({
-					provider,
-					type: "oauth",
-					identityKey: resolveCredentialIdentityKey(provider, credential) ?? undefined,
-					email: credential.email,
-					accountId: credential.accountId,
-					projectId: credential.projectId,
-					enterpriseUrl: credential.enterpriseUrl,
-					orgId: credential.orgId,
-					orgName: credential.orgName,
-					authorizedAt: credential.authorizedAt,
-				});
-			} else {
-				accounts.push({ provider, type: "api_key" });
-			}
-		}
+		for (const credential of credentials) accounts.push(toAccountIdentity(provider, credential));
 	}
 	return accounts;
 }
