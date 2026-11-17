@@ -54,6 +54,36 @@ function makeArchive(legacy = false, count = FRAME_COUNT): snapcompact.Archive {
 	};
 }
 
+/** A real foveated archive: high-quality edge frames around a denser middle, with dimmed tool output. */
+async function compactedArchive(): Promise<snapcompact.Archive> {
+	const result = await snapcompact.compact(
+		{
+			firstKeptEntryId: "kept",
+			messagesToSummarize: [
+				{ role: "user", content: `Head. ${"Important fact number one. ".repeat(400)}`, timestamp: 0 },
+				{
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "bash",
+					content: [{ type: "text", text: "FAIL the suite. ".repeat(600) }],
+					isError: false,
+					timestamp: 0,
+				},
+				{ role: "user", content: `${"Later fact number two. ".repeat(110)}Tail.`, timestamp: 0 },
+			],
+			turnPrefixMessages: [],
+			tokensBefore: 1000,
+			previousSummary: undefined,
+			previousPreserveData: undefined,
+			fileOps: snapcompact.createFileOps(),
+		},
+		{ model: { api: "anthropic-messages" }, frameSize: 320, maxFrames: 9 },
+	);
+	const archive = snapcompact.getPreservedArchive(result.preserveData);
+	if (!archive) throw new Error("Expected a snapcompact archive");
+	return archive;
+}
+
 function archiveFrames(session: SessionManager, entryId: string): snapcompact.Frame[] {
 	const entry = session.getEntry(entryId);
 	if (entry?.type !== "compaction") throw new Error(`Expected compaction ${entryId}`);
@@ -165,6 +195,24 @@ describe("lazy snapcompact frame resolution", () => {
 		const resumed = await SessionManager.open(sessionFile, sessionDir, undefined, { suppressBreadcrumb: true });
 		expect(archiveFrames(resumed, compactionId)[0]?.data).toStartWith("blob:sha256:");
 		expect(imageDataIn(resumed.buildSessionContext().messages)).toEqual([]);
+		await resumed.close();
+	});
+
+	it("draws missing frame blobs again from the archive text under the same references", async () => {
+		const archive = await compactedArchive();
+		expect(new Set(archive.frames.map(frame => frame.cols)).size).toBe(2);
+		const frames = archive.frames.map(frame => frame.data);
+		const hashes = frames.map(data => new Bun.SHA256().update(Buffer.from(data, "base64")).digest("hex"));
+		const { sessionFile, sessionDir, compactionId } = await writeJournal(structuredClone(archive));
+		await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+
+		const resumed = await SessionManager.open(sessionFile, sessionDir, undefined, { suppressBreadcrumb: true });
+		expect(archiveFrames(resumed, compactionId).map(frame => frame.data)).toEqual(
+			hashes.map(hash => `blob:sha256:${hash}`),
+		);
+		const messages = resumed.buildSessionContext().messages;
+		expect(new Set(imageDataIn(messages))).toEqual(new Set(frames));
+		expect(JSON.stringify(messages)).not.toContain("unavailable here");
 		await resumed.close();
 	});
 });

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A session resumed on another machine shows its snapcompact archive's frames again instead of `N archived image frames unavailable here`: each frame whose image blob is missing is drawn again from the archive text the session keeps and stored under the same reference, so the prompt cache prefix is unchanged. A frame that does not draw to the same bytes keeps the notice, and a warning names it.
+
+## [18.22.1] - 2026-11-17
+
 ### Breaking Changes
 
 - `SqlSessionStorage` with `createTable: false` refuses to start until the session table has a `byte_len` column and a `<table>_parts` table exists; docs/session.md gives the DDL, backfill, and rollback for each dialect. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
