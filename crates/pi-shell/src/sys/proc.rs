@@ -61,6 +61,26 @@ pub fn info(pid: i32) -> Option<ProcInfo> {
 	sys::info(pid)
 }
 
+/// Whether a process with the positive pid `pid` exists, a zombie included.
+///
+/// It asks the kernel (`kill(pid, 0)`), which fails with `ESRCH` only when
+/// no process has the pid; a read of `/proc` can also fail with no
+/// descriptor left or no permission.
+pub fn exists(pid: i32) -> bool {
+	// SAFETY: signal 0 sends nothing; it only checks the pid.
+	let probed = unsafe { libc::kill(pid, 0) };
+	probed == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Whether `pid` has ended: it is a zombie, or it does not [exist](exists).
+///
+/// A zombie exited and waits for its parent to reap it. A process whose
+/// [`info`] cannot be read has not ended while it exists: a failed read
+/// proves nothing.
+pub fn ended(pid: i32) -> bool {
+	info(pid).map_or_else(|| !exists(pid), |p| p.state == ProcState::Zombie)
+}
+
 /// The current instant in [`ProcInfo::start`] units: every process that
 /// exists has `start <= now()`, and one started after the call has
 /// `start >= ` the returned value (a "since" mark for containment checks).
@@ -442,5 +462,96 @@ mod tests {
 		assert!(signal_pinned(&p, Signal::Kill).unwrap());
 		let status = child.wait().unwrap();
 		assert!(!status.success());
+	}
+
+	/// [`ended`] tells a running process from one that has ended and waits
+	/// to be reaped: tests judge a killed command by it, and under a PID 1
+	/// that does not reap (a container started with `exec runuser`), a
+	/// killed command stays a zombie, which `kill(pid, 0)` still finds.
+	#[test]
+	fn ended_counts_a_zombie_and_not_a_running_process() {
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.unwrap();
+		let pid = child.id() as i32;
+		let running_ended = ended(pid);
+		// SAFETY: plain syscall; the test's own child.
+		unsafe { libc::kill(pid, libc::SIGKILL) };
+		// Not yet waited for, so the child stays a zombie of this process.
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		let mut state = None;
+		while std::time::Instant::now() < deadline {
+			state = info(pid).map(|p| p.state);
+			if state == Some(ProcState::Zombie) {
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		}
+		let zombie_ended = ended(pid);
+		let zombie_exists = exists(pid);
+		child.wait().unwrap();
+		assert!(!running_ended, "the running sleep {pid} counts as ended");
+		assert_eq!(state, Some(ProcState::Zombie), "sleep {pid} never became a zombie");
+		assert!(zombie_ended, "the zombie {pid} does not count as ended");
+		assert!(zombie_exists, "the zombie {pid} does not exist");
+		assert!(!exists(pid) && ended(pid), "the reaped sleep {pid} still exists");
+	}
+
+	/// The variable naming the process [`ended_with_no_descriptor_left`]
+	/// judges.
+	#[cfg(target_os = "linux")]
+	const ENDED_PROBE_PID: &str = "PI_SHELL_TEST_ENDED_PROBE_PID";
+
+	/// [`ended`] does not count a running process it cannot read as ended: a
+	/// failed read of `/proc` is no proof the process ended. The check runs
+	/// in a child test process, whose descriptor limit it lowers so that no
+	/// file opens. Linux only: macOS reads a process without a descriptor.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn ended_does_not_count_a_process_it_cannot_read() {
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.unwrap();
+		let probe = std::process::Command::new(std::env::current_exe().unwrap())
+			.args([
+				"--exact",
+				"sys::proc::tests::ended_with_no_descriptor_left",
+				"--ignored",
+				"--nocapture",
+				"--test-threads=1",
+			])
+			.env(ENDED_PROBE_PID, child.id().to_string())
+			.output()
+			.unwrap();
+		let _ = child.kill();
+		child.wait().unwrap();
+		let out = String::from_utf8_lossy(&probe.stdout);
+		let err = String::from_utf8_lossy(&probe.stderr);
+		assert!(probe.status.success(), "{out}{err}");
+		assert!(out.contains("1 passed"), "the probe did not run: {out}{err}");
+	}
+
+	/// Run by [`ended_does_not_count_a_process_it_cannot_read`] in a child
+	/// process: with no descriptor left to open `/proc/<pid>/stat`, the
+	/// running process named by [`ENDED_PROBE_PID`] must not count as ended.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by ended_does_not_count_a_process_it_cannot_read"]
+	fn ended_with_no_descriptor_left() {
+		let pid: i32 = std::env::var(ENDED_PROBE_PID)
+			.expect("the pid to judge")
+			.parse()
+			.unwrap();
+		let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+		// SAFETY: `limit` is writable for the call.
+		assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) }, 0);
+		limit.rlim_cur = 0;
+		// SAFETY: `limit` is readable for the call; this process only.
+		assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) }, 0);
+		assert!(info(pid).is_none(), "/proc/{pid}/stat could still be read");
+		assert!(exists(pid), "sleep {pid} is not running");
+		assert!(!ended(pid), "the running sleep {pid} counts as ended when it cannot be read");
 	}
 }

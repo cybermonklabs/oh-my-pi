@@ -914,11 +914,6 @@ mod tests {
 		capture(session, RunOptions::new(command)).await
 	}
 
-	fn alive(pid: i32) -> bool {
-		// SAFETY: signal 0 only probes existence.
-		unsafe { libc::kill(pid, 0) == 0 }
-	}
-
 	/// Exercise tracing through the real engine, native tools, spawner and
 	/// capture pipes, never `FakeHost`'s synthetic command implementations.
 	async fn trace_capture(
@@ -1892,10 +1887,10 @@ mod tests {
 		assert_ne!(pgid, own_group);
 		assert!(children.pids().is_empty(), "no run in flight");
 		let gone = Instant::now();
-		while alive(pid) && gone.elapsed() < Duration::from_secs(3) {
+		while !crate::sys::proc::ended(pid) && gone.elapsed() < Duration::from_secs(3) {
 			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
-		assert!(!alive(pid), "sleep {pid} survived the cancel");
+		assert!(crate::sys::proc::ended(pid), "sleep {pid} survived the cancel");
 		// The session is still usable.
 		assert_eq!(sh(&mut s, "echo ok").await.stdout, "ok\n");
 	}

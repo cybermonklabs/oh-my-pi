@@ -240,11 +240,13 @@ pub struct Script {
 	/// Shell variable names whose inherited bindings must not be exported in
 	/// the new subshell, including bindings hidden by local scopes.
 	pub unexport_env:     Vec<BString>,
-	/// The host hears of an `exec` that would replace the run's vproc and
-	/// that the system refuses because the command line is too long
-	/// (`E2BIG`, `ENAMETOOLONG`): the shell prints nothing for it, the run
-	/// ends with status 126, and [`Shell::exec_refusal`] has the error. A
-	/// callout can then retry with fewer arguments (`xargs`).
+	/// On Unix, the host hears of an `exec` replacing the run's vproc that
+	/// the system refuses because the command line is too long (`E2BIG`,
+	/// `ENAMETOOLONG`): the shell prints nothing for it, the run ends with
+	/// status 126, and [`Shell::exec_refusal`] has the error. A callout can
+	/// then retry with fewer arguments (`xargs`). Set it only for a script
+	/// that runs nothing before that `exec` (a callout's generated `exec` of
+	/// a program): a retry would run all of it again.
 	pub too_long_to_host: bool,
 }
 

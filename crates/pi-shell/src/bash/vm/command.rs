@@ -2558,7 +2558,7 @@ fn spawned_external(
 			s.stage = Stage::Await;
 			k.emit_op(cx, vp, op.node, EventData::Spawn { pid, argv });
 		},
-		Err(err) if too_long_for_host(vp, &err) => {
+		Err(err) if refused_as_too_long(&err) && too_long_to_host(vp) => {
 			// The host reports it (`xargs` retries with fewer arguments): no
 			// diagnostic, and the `exec` fails as a refused one does.
 			if let (Some(code), Some(run)) = (err.raw_os_error(), vp.runs.front()) {
@@ -2624,16 +2624,32 @@ fn spawned_external(
 	None
 }
 
-/// Whether the host hears of `err` instead of the user: the system refused
-/// the command line as too long (`E2BIG`, `ENAMETOOLONG`) for an `exec`
-/// replacing a run submitted with
-/// [`Script::too_long_to_host`](crate::bash::Script::too_long_to_host).
-fn too_long_for_host(vp: &mut Vproc, err: &std::io::Error) -> bool {
-	use std::io::ErrorKind;
-	err.raw_os_error().is_some()
-		&& matches!(err.kind(), ErrorKind::ArgumentListTooLong | ErrorKind::InvalidFilename)
-		&& matches!(st(vp).control, Some(Transfer::Exec))
+/// Whether the host hears of a too-long refusal instead of the user: only
+/// for an `exec` replacing a run submitted with
+/// [`Script::too_long_to_host`](crate::bash::Script::too_long_to_host), the
+/// `exec` a callout generated for a program. Nothing else runs in that
+/// vproc: a file it cannot `exec` (`ENOEXEC`) runs in a new shell, which
+/// has no run.
+fn too_long_to_host(vp: &mut Vproc) -> bool {
+	matches!(st(vp).control, Some(Transfer::Exec))
 		&& vp.runs.front().is_some_and(|run| run.too_long_to_host)
+}
+
+/// Whether `err` is the system refusing a command line as too long: `E2BIG`,
+/// or `ENAMETOOLONG` as GKE Sandbox (gVisor) says it. The same rule as
+/// `pi_builtins`' `command_line_too_long`, which decides whether `xargs` and
+/// `find` retry, so a refusal reaches them only when they act on it.
+#[cfg(unix)]
+fn refused_as_too_long(err: &std::io::Error) -> bool {
+	matches!(err.raw_os_error(), Some(libc::E2BIG | libc::ENAMETOOLONG))
+}
+
+/// Elsewhere no utility splits a command line, so every refused start keeps
+/// the shell's diagnostic and status (Windows' `ERROR_FILENAME_EXCED_RANGE`
+/// also stands for invalid names).
+#[cfg(not(unix))]
+fn refused_as_too_long(_err: &std::io::Error) -> bool {
+	false
 }
 
 /// The failure of a prefix assignment to `UID`, `EUID`, `GID` or `EGID`

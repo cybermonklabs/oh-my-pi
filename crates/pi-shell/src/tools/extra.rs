@@ -25,8 +25,11 @@
 //! An external the system refuses to `exec` because its command line is too
 //! long (`E2BIG`, `ENAMETOOLONG`) is the shell's diagnostic and status 126,
 //! unless the command asked to hear of it
-//! ([`ShellCommand::too_long_as_error`]): then the shell prints nothing and
-//! the utility gets the error, so `xargs` can retry with fewer arguments.
+//! ([`ShellCommand::too_long_as_error`]) and is a program this callout
+//! `exec`s itself: then, on Unix, the shell prints nothing and the utility
+//! gets the error, so `xargs` can retry with fewer arguments. A builtin's
+//! own `exec` (`xargs eval '…; exec prog'`) stays the shell's, since
+//! retrying would run what the builtin did before it again.
 
 use std::{
 	ffi::OsStr,
@@ -275,7 +278,9 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 	script.foreign_env = foreign_env;
 	script.unexport_env = unexport_env;
 	script.args = Some(args);
-	script.too_long_to_host = command.too_long_is_error();
+	// Only the generated `exec` of a program: a builtin may have done work
+	// before an `exec` of its own, which a retry would repeat.
+	script.too_long_to_host = matches!(program, Program::Path(_)) && command.too_long_is_error();
 	// The working directory is logical, as after `cd`: `-execdir` hands over
 	// `<root>/./sub`, and the command's `$PWD` is `<root>/sub`.
 	script.cwd = command

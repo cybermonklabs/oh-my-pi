@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	session::{RunOptions, RunStdio, Session, SessionConfig},
-	sys::proc::ProcState,
+	sys::proc,
 };
 
 fn session() -> Session {
@@ -73,51 +73,15 @@ async fn run(s: &mut Session, command: &str) -> Ran {
 	run_with(s, command, CancellationToken::new()).await
 }
 
-/// Whether `pid` still runs. A zombie has ended: it waits only for its parent
-/// to reap it, and under a PID 1 that reaps nothing but its own child (a
-/// container started with `exec runuser`) an orphan stays a zombie, which
-/// `kill(pid, 0)` still finds.
-fn alive(pid: i32) -> bool {
-	crate::sys::proc::info(pid).is_some_and(|p| p.state != ProcState::Zombie)
-}
-
-/// Waits (bounded) for `pid` to be gone; whether it is.
+/// Waits (bounded) for `pid` to have ended ([`proc::ended`]: a zombie
+/// counts, since under a PID 1 that reaps nothing but its own child an
+/// orphan stays one); whether it has.
 async fn gone(pid: i32, within: Duration) -> bool {
 	let start = Instant::now();
-	while alive(pid) && start.elapsed() < within {
+	while !proc::ended(pid) && start.elapsed() < within {
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
-	!alive(pid)
-}
-
-/// `alive` tells a running process from one that has ended and waits to be
-/// reaped: the tests here judge a killed command by it, and under a PID 1
-/// that does not reap, a killed command stays a zombie.
-#[test]
-fn alive_counts_a_running_process_and_not_a_zombie() {
-	let mut child = std::process::Command::new("sleep")
-		.arg("30")
-		.spawn()
-		.unwrap();
-	let pid = child.id() as i32;
-	let running = alive(pid);
-	// SAFETY: plain syscall; the test's own child.
-	unsafe { libc::kill(pid, libc::SIGKILL) };
-	// Not yet waited for, so the child stays a zombie of this process.
-	let deadline = Instant::now() + Duration::from_secs(10);
-	let mut state = None;
-	while Instant::now() < deadline {
-		state = crate::sys::proc::info(pid).map(|p| p.state);
-		if state == Some(ProcState::Zombie) {
-			break;
-		}
-		std::thread::sleep(Duration::from_millis(10));
-	}
-	let zombie_alive = alive(pid);
-	child.wait().unwrap();
-	assert!(running, "the running sleep {pid} counts as alive");
-	assert_eq!(state, Some(ProcState::Zombie), "sleep {pid} never became a zombie");
-	assert!(!zombie_alive, "the zombie {pid} counts as gone");
+	proc::ended(pid)
 }
 
 /// The pid an operand wrote to `file`, once it is there.
@@ -294,11 +258,11 @@ async fn nohup_operand_survives_cancel_and_teardown() {
 	let _reap = Reap(pid);
 	assert_ne!(r.status, 0, "the run was cancelled");
 	tokio::time::sleep(Duration::from_millis(1500)).await;
-	assert!(alive(pid), "the nohup operand died with the cancel");
+	assert!(!proc::ended(pid), "the nohup operand died with the cancel");
 	assert_eq!(run(&mut s, "echo ok").await.stdout, "ok\n");
 	drop(s);
 	tokio::time::sleep(Duration::from_millis(1500)).await;
-	assert!(alive(pid), "the nohup operand died with the session");
+	assert!(!proc::ended(pid), "the nohup operand died with the session");
 }
 
 /// Kills a process when dropped (a test's cleanup, even when it fails).

@@ -1453,8 +1453,11 @@ impl ShellCommand {
 	/// Reports a program the system refuses to run because the command line
 	/// is too long (`E2BIG`, `ENAMETOOLONG`) as that error from
 	/// [`RunningCommand::wait`], with nothing printed for it, so the utility
-	/// can retry with fewer arguments (`xargs`). Otherwise the shell prints
-	/// its diagnostic and the command ends with status 126.
+	/// can retry with fewer arguments (`xargs`). Only the program the command
+	/// names counts: a builtin's own `exec` (`eval '…; exec prog'`) keeps the
+	/// shell's diagnostic and status 126, since a retry would repeat what the
+	/// builtin did first. Otherwise, and on Windows, the shell prints its
+	/// diagnostic and the command ends with status 126.
 	pub fn too_long_as_error(mut self) -> Self {
 		self.too_long_as_error = true;
 		self
@@ -1476,7 +1479,8 @@ pub(crate) fn command_line_too_long(error: &io::Error) -> bool {
 	matches!(error.raw_os_error(), Some(libc::E2BIG | libc::ENAMETOOLONG))
 }
 
-/// Windows commands are not split: see the Unix twin.
+/// Windows commands are not split (the shell keeps its diagnostic for every
+/// refused start): see the Unix twin.
 #[cfg(not(unix))]
 pub(crate) fn command_line_too_long(_error: &io::Error) -> bool {
 	false
@@ -3339,6 +3343,27 @@ mod testing {
 		(code, read(output), read(error))
 	}
 
+	/// A `sh -c` script that prints an `@ N` line for its N arguments, then
+	/// each of them on a line of its own.
+	#[cfg(target_os = "linux")]
+	pub(crate) const SHOW_ARGS: &str = "echo \"@ $#\"; printf '%s\\n' \"$@\"";
+
+	/// The arguments of each line [`SHOW_ARGS`] ran, in order.
+	#[cfg(target_os = "linux")]
+	pub(crate) fn lines_run(stdout: &str) -> Vec<Vec<&str>> {
+		let mut lines: Vec<(usize, Vec<&str>)> = Vec::new();
+		for row in stdout.lines() {
+			match row.strip_prefix("@ ") {
+				Some(count) => lines.push((count.parse().unwrap(), Vec::new())),
+				None => lines.last_mut().expect("an argument before any line").1.push(row),
+			}
+		}
+		for (count, args) in &lines {
+			assert_eq!(*count, args.len(), "a line printed its arguments whole");
+		}
+		lines.into_iter().map(|(_, args)| args).collect()
+	}
+
 	/// What a [`Refusing`] runner was asked to run: how many arguments past
 	/// its `fixed` words each line had, and the arguments of the lines it
 	/// "ran".
@@ -3355,10 +3380,13 @@ mod testing {
 	/// other line as a command that succeeds without doing anything.
 	#[cfg(unix)]
 	pub(crate) struct Refusing {
-		fixed: usize,
-		most:  usize,
-		errno: i32,
-		seen:  Arc<Mutex<Refused>>,
+		fixed:      usize,
+		most:       usize,
+		errno:      i32,
+		seen:       Arc<Mutex<Refused>>,
+		/// Replies are held back until this many lines were asked for.
+		hold_until: usize,
+		held:       Vec<(flume::Sender<io::Result<super::CommandStatus>>, io::Result<super::CommandStatus>)>,
 	}
 
 	#[cfg(unix)]
@@ -3366,7 +3394,17 @@ mod testing {
 		/// The runner, and what it records.
 		pub(crate) fn new(fixed: usize, most: usize, errno: i32) -> (Self, Arc<Mutex<Refused>>) {
 			let seen = Arc::new(Mutex::new(Refused::default()));
-			(Self { fixed, most, errno, seen: Arc::clone(&seen) }, seen)
+			let runner =
+				Self { fixed, most, errno, seen: Arc::clone(&seen), hold_until: 0, held: Vec::new() };
+			(runner, seen)
+		}
+
+		/// Answers none of the first `count` lines until the last of them is
+		/// asked for, then all at once: the utility finds them all ended
+		/// together, as when many commands in flight finish in one burst.
+		pub(crate) fn holding_replies_until(mut self, count: usize) -> Self {
+			self.hold_until = count;
+			self
 		}
 	}
 
@@ -3385,6 +3423,18 @@ mod testing {
 				seen.ran.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
 				Ok(super::CommandStatus::Exited(0))
 			};
+			let asked = seen.tried.len();
+			drop(seen);
+			if asked < self.hold_until {
+				let (reply, replied) = flume::bounded(1);
+				self.held.push((reply, outcome));
+				return Box::pin(async move {
+					replied.recv_async().await.unwrap_or_else(|_| Err(io::ErrorKind::Interrupted.into()))
+				});
+			}
+			for (reply, held) in self.held.drain(..) {
+				let _ = reply.send(held);
+			}
 			Box::pin(std::future::ready(outcome))
 		}
 	}
@@ -4133,4 +4183,7 @@ pub(crate) use testing::run_extra_with;
 #[cfg(all(test, unix))]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
 pub(crate) use testing::Refusing;
+#[cfg(all(test, target_os = "linux"))]
+#[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
+pub(crate) use testing::{SHOW_ARGS, lines_run};
 

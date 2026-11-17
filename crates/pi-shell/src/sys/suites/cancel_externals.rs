@@ -60,11 +60,6 @@ fn until(what: &str, mut cond: impl FnMut() -> bool) -> Duration {
 	start.elapsed()
 }
 
-/// Exited (a zombie counts) or gone.
-fn gone(pid: i32) -> bool {
-	proc::info(pid).is_none_or(|i| i.state == ProcState::Zombie)
-}
-
 /// Live (non-zombie) members of session `sid`.
 fn live_session(sid: i32) -> Vec<ProcInfo> {
 	let mut m = proc::session_members(sid).unwrap();
@@ -243,7 +238,7 @@ fn cancel_term_sweeps_a_grandchild_that_outlives_its_leader() {
 	let sid = case.leader();
 	let (status, done, t0) = case.cancel();
 	assert_eq!(status, 143);
-	let leader = until("the leader terminated", || gone(sid));
+	let leader = until("the leader terminated", || proc::ended(sid));
 	assert!(t0.elapsed() < PROMPT, "TERM did not reach the leader at once: {leader:?}");
 	let killed = assert_killed_after_the_grace(&case, sid, 1, t0);
 	eprintln!(
@@ -278,17 +273,17 @@ fn inherit_cancel_reaches_only_the_external_itself() {
 	assert_eq!(status, 143);
 	let grace = SpawnConfig::DEFAULT_GRACE;
 	thread::sleep((grace / 2).saturating_sub(t0.elapsed()));
-	assert!(!gone(pid), "TERM is ignored and KILL waits for the grace");
-	until("the external killed", || gone(pid));
+	assert!(!proc::ended(pid), "TERM is ignored and KILL waits for the grace");
+	until("the external killed", || proc::ended(pid));
 	let killed = t0.elapsed();
 	assert!(killed >= grace && killed < grace + PROMPT, "KILL at {killed:?}");
 	until("no leftovers", || case.cleanup.spawner.leftovers().unwrap().is_empty());
 	for child in &children {
-		assert!(!gone(child.pid), "the external's children are outside the cancel's reach");
+		assert!(!proc::ended(child.pid), "the external's children are outside the cancel's reach");
 	}
 	for child in &children {
 		assert!(proc::signal_pinned(child, Signal::Kill).unwrap());
 	}
-	until("the children gone", || children.iter().all(|c| gone(c.pid)));
+	until("the children gone", || children.iter().all(|c| proc::ended(c.pid)));
 	eprintln!("inherit: cancel→Done {done:?}, cancel→external killed {killed:?}");
 }

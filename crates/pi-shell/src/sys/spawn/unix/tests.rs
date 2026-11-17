@@ -503,10 +503,6 @@ fn live(pid: i32) -> bool {
 	proc::info(pid).is_some_and(|i| !matches!(i.state, ProcState::Zombie | ProcState::Stopped))
 }
 
-fn gone(pid: i32) -> bool {
-	proc::info(pid).is_none_or(|i| i.state == ProcState::Zombie)
-}
-
 /// The first child of `parent` (the scan sees it once it has forked).
 fn child_of(parent: i32) -> proc::ProcInfo {
 	let mut found = None;
@@ -545,7 +541,7 @@ fn inherit_keeps_the_hosts_group_and_signals_only_the_child() {
 	assert_eq!(wait(&mut p), ExitStatus::Signaled(Signal::Kill));
 	assert!(live(grandchild.pid), "the grandchild is outside the child's scope");
 	assert!(proc::signal_pinned(&grandchild, Signal::Kill).unwrap());
-	until("grandchild gone", || gone(grandchild.pid));
+	until("grandchild gone", || proc::ended(grandchild.pid));
 }
 
 /// The abandon escalation (TERM, KILL after the grace) targets the child's
@@ -569,7 +565,7 @@ fn inherit_abandon_escalation_spares_the_hosts_group() {
 	drop(p);
 	thread::sleep(grace / 2);
 	assert!(live(pid), "TERM is ignored, KILL waits for the grace");
-	until("child killed", || gone(pid));
+	until("child killed", || proc::ended(pid));
 	assert!(start.elapsed() >= grace);
 	assert!(bystander.try_wait().unwrap().is_none(), "nothing was sent to the host's process group");
 	bystander.kill().unwrap();
@@ -653,8 +649,10 @@ fn abandon_escalates(grace: Duration) -> Duration {
 	until("group killed", || {
 		let mut killed = true;
 		for member in &members {
-			let gone = proc::info(member.pid)
-				.is_none_or(|now| now.start != member.start || now.state == ProcState::Zombie);
+			let gone = proc::info(member.pid).map_or_else(
+				|| !proc::exists(member.pid),
+				|now| now.start != member.start || now.state == ProcState::Zombie,
+			);
 			if gone {
 				assert!(start.elapsed() >= grace, "KILL before the grace: pid {}", member.pid);
 			}
@@ -686,7 +684,7 @@ fn dropped_detached_external_runs_on_and_is_no_leftover() {
 	assert!(live(pid), "released, not killed after the grace");
 	// SAFETY: plain syscall; the pid is unreaped while the sleep runs.
 	assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-	until("reaped after its exit", || proc::info(pid).is_none());
+	until("reaped after its exit", || !proc::exists(pid));
 }
 
 /// The shell tears down while a detached external runs: its `ExtProc` is
@@ -750,7 +748,7 @@ fn abandoning_a_paused_job_still_terminates_it() {
 	p.stop().unwrap();
 	until("stopped", || proc::info(pid).is_some_and(|i| i.state == ProcState::Stopped));
 	drop(p);
-	until("terminated", || proc::info(pid).is_none_or(|i| i.state == ProcState::Zombie));
+	until("terminated", || proc::ended(pid));
 }
 
 #[test]
@@ -1447,9 +1445,9 @@ fn a_parked_external_wakes_the_parker_at_its_exit() {
 		let start = Instant::now();
 		assert_eq!(wait_parked(&mut parker, &mut p), status, "{script}");
 		assert!(start.elapsed() < LONG / 2, "woken by the exit, not the timeout");
-		assert!(proc::info(pid).is_some(), "unreaped while the ExtProc lives");
+		assert!(proc::exists(pid), "unreaped while the ExtProc lives");
 		drop(p);
-		assert!(proc::info(pid).is_none(), "reaped on drop");
+		assert!(!proc::exists(pid), "reaped on drop");
 	}
 }
 
@@ -1497,7 +1495,7 @@ fn parked_externals_are_reaped_after_abandon_and_work_without_a_parker() {
 	assert!(p.poll_wait(&mut Context::from_waker(&waker)).is_pending());
 	until("exec'd", || proc::info(pid).is_some_and(|i| i.name == "sleep"));
 	drop(p);
-	until("killed and reaped", || proc::info(pid).is_none());
+	until("killed and reaped", || !proc::exists(pid));
 	drop(parker);
 
 	let a = sh("exit 7");

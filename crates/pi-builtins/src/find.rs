@@ -5659,21 +5659,27 @@ mod tests {
 		assert_eq!(out, "1 sub/d.txt\n");
 	}
 
-	/// Runs `find many -type f -exec /bin/sh -c 'printf "%s\n" "$#"' sh {} +`
-	/// from `root` with `env` added to the environment its commands get:
-	/// status, stderr, and how many files each line had.
+	/// Runs `find many -type f -exec /bin/sh -c SHOW_ARGS sh {} +` from
+	/// `root` with `env` added to the environment its commands get: status,
+	/// stderr, and the files of each line, in order
+	/// ([`crate::host::lines_run`]).
 	#[cfg(target_os = "linux")]
-	async fn count_files(root: &std::path::Path, env: &[(&str, &str)]) -> (i32, String, Vec<usize>) {
-		let argv = ["find", "many", "-type", "f", "-exec", "/bin/sh", "-c", "printf \"%s\\n\" \"$#\"", "sh", "{}", "+"];
+	async fn files_run(root: &std::path::Path, env: &[(&str, &str)]) -> (i32, String, Vec<Vec<String>>) {
+		let argv = ["find", "many", "-type", "f", "-exec", "/bin/sh", "-c", crate::host::SHOW_ARGS, "sh", "{}", "+"];
 		let (code, out, err) = crate::host::run_extra(&argv, "", root, env).await;
-		(code, err, out.lines().map(|line| line.parse().unwrap()).collect())
+		let ran = crate::host::lines_run(&out)
+			.into_iter()
+			.map(|files| files.into_iter().map(str::to_owned).collect())
+			.collect();
+		(code, err, ran)
 	}
 
 	/// `-exec ... {} +` sizes its batches against the process's environment
 	/// (`argmax`), but its commands get the shell's: a large exported
 	/// variable the process lacks makes the kernel refuse a full batch, which
-	/// runs again as two halves, as GNU xargs retries a line. Every file still
-	/// goes to a command, once.
+	/// runs again as two halves, as GNU xargs retries a line. Every file
+	/// still goes to a command once, in find's order; a line that fits (a
+	/// short last one) is left whole.
 	#[cfg(target_os = "linux")]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn exec_plus_runs_a_batch_the_kernel_refuses_as_halves() {
@@ -5684,23 +5690,33 @@ mod tests {
 		for i in 0..count {
 			fs::write(root.join("many").join(format!("{i:06}{}", "f".repeat(240))), b"").unwrap();
 		}
-		// What a full line holds, from `echo`, which runs in-process: no exec
+		// The lines find builds, from `echo`, which runs in-process: no exec
 		// limit refuses it (gVisor refuses even a plain `/bin/sh` line here).
 		let (code, out, err) =
 			crate::host::run_extra(&["find", "many", "-type", "f", "-exec", "echo", "{}", "+"], "", &root, &[])
 				.await;
 		assert_eq!((code, err.as_str()), (0, ""));
-		let full = out.lines().next().map_or(0, |line| line.split(' ').count());
+		let echoed: Vec<Vec<&str>> = out.lines().map(|line| line.split(' ').collect()).collect();
+		// A full line for this command holds as many files, or one fewer: its
+		// words take less room than one more file.
+		let full = echoed[0].len();
 
 		let pad = "x".repeat(16 * 1024);
-		let (code, err, lines) = count_files(&root, &[("FIND_TEST_PAD", &pad)]).await;
+		let (code, err, ran) = files_run(&root, &[("FIND_TEST_PAD", &pad)]).await;
 		assert_eq!((code, err.as_str()), (0, ""), "every line runs, and nothing is reported");
-		assert_eq!(lines.iter().sum::<usize>(), count, "{lines:?}");
-		let largest = lines.iter().copied().max().unwrap_or(0);
+		assert!(ran.concat() == echoed.concat(), "the files did not each run once, in find's order");
 		assert!(
-			largest <= full.div_ceil(2),
-			"no line was refused and split: one of {lines:?} has {largest} of the {full} files a full line \
-			 holds"
+			ran[0].len() + 1 < full,
+			"the first, full line was not refused and split: {} of about {full} files ran first",
+			ran[0].len()
+		);
+		let mut pieces = 0;
+		assert!(
+			ran.iter().any(|line| {
+				pieces += line.len();
+				pieces + 1 >= full && pieces <= full
+			}),
+			"the first lines run are not the pieces of the refused one"
 		);
 	}
 
@@ -5713,8 +5729,8 @@ mod tests {
 		fs::write(root.join("many/only"), b"").unwrap();
 		// An environment as large as the whole limit leaves no room for any line.
 		let pad = "x".repeat(unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize);
-		let (code, err, lines) = count_files(&root, &[("FIND_TEST_PAD", &pad)]).await;
-		assert_eq!((code, lines.as_slice()), (1, &[][..]), "{err}");
+		let (code, err, ran) = files_run(&root, &[("FIND_TEST_PAD", &pad)]).await;
+		assert_eq!((code, ran.len()), (1, 0), "{err}");
 		assert_eq!(err.matches("Argument list too long").count(), 1, "{err}");
 	}
 

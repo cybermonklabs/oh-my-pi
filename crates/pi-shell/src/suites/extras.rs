@@ -288,53 +288,74 @@ fn sh_at_a_long_path() -> (tempfile::TempDir, String) {
 	(dir, path)
 }
 
-/// xargs in the shell: a line the kernel refuses as too long runs again as
-/// two halves, with nothing printed for the refusal; one argument too long
-/// on its own is xargs' error, printed once.
+/// A command that prints an `@ N` line for its N arguments, then each of
+/// them on a line of its own: `sh -c` and its script, as shell words.
+#[cfg(target_os = "linux")]
+const SHOW_ARGS: &str = r#"-c 'echo "@ $#"; printf "%s\n" "$@"' sh"#;
+
+/// The arguments of each line [`SHOW_ARGS`] ran, in order.
+#[cfg(target_os = "linux")]
+fn lines_run(stdout: &str) -> Vec<Vec<&str>> {
+	let mut lines: Vec<(usize, Vec<&str>)> = Vec::new();
+	for row in stdout.lines() {
+		match row.strip_prefix("@ ") {
+			Some(count) => lines.push((count.parse().unwrap(), Vec::new())),
+			None => lines
+				.last_mut()
+				.expect("an argument before any line")
+				.1
+				.push(row),
+		}
+	}
+	for (count, args) in &lines {
+		assert_eq!(*count, args.len(), "a line printed its arguments whole");
+	}
+	lines.into_iter().map(|(_, args)| args).collect()
+}
+
+/// xargs in the shell: a full line the kernel refuses as too long runs
+/// again as two halves, with nothing printed for the refusal, and every
+/// argument still runs once, in order; one argument too long on its own is
+/// xargs' error, printed once.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xargs_splits_a_line_the_kernel_refuses_as_too_long() {
-	const COUNT_ARGS: &str = r#"'printf "%s\n" "$#"' sh"#;
-	let sizes =
-		|stdout: &str| -> Vec<usize> { stdout.lines().map(|line| line.parse().unwrap()).collect() };
 	let dir = tempfile::tempdir().unwrap();
 	// SAFETY: plain call without pointer arguments.
-	let count = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize / 256;
-	std::fs::write(dir.path().join("words"), format!("{}\n", "x".repeat(255)).repeat(count))
-		.unwrap();
+	let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
+	// More input than one line holds, so the first line is a full one.
+	let words: Vec<String> = (0..arg_max / 256)
+		.map(|i| format!("{i:07}{}", "x".repeat(248)))
+		.collect();
+	std::fs::write(dir.path().join("words"), words.join("\n") + "\n").unwrap();
 	let mut s = session_in(dir.path(), &[]);
-	// What a full line holds, from the builtin `echo`: no exec limit refuses
-	// it (gVisor refuses even a `/bin/sh` line here).
-	let ran = run(&mut s, "xargs -a words echo").await;
-	assert_eq!(ran.status, 0, "{}", ran.stderr);
-	let full = ran
-		.stdout
-		.lines()
-		.next()
-		.map_or(0, |line| line.split(' ').count());
-
 	let (_long, sh) = sh_at_a_long_path();
-	let ran = run(&mut s, &format!("xargs -a words {sh} -c {COUNT_ARGS}")).await;
-	assert_eq!(
-		(ran.status, ran.stderr.as_str()),
-		(0, ""),
-		"every line runs, and nothing is reported"
-	);
-	let lines = sizes(&ran.stdout);
-	assert_eq!(lines.iter().sum::<usize>(), count, "{lines:?}");
-	let largest = lines.iter().copied().max().unwrap_or(0);
+	let ran = run(&mut s, &format!("xargs -t -a words {sh} {SHOW_ARGS}")).await;
+	// `-t` traces each line before it is tried.
+	let (traces, reported): (Vec<&str>, Vec<&str>) =
+		ran.stderr.lines().partition(|line| line.starts_with(&sh));
+	assert_eq!((ran.status, reported), (0, vec![]), "every line runs, and nothing else is reported");
+	let lines = lines_run(&ran.stdout);
+	assert!(lines.concat() == words, "the arguments did not each run once, in order");
+	let tried: Vec<usize> = traces
+		.iter()
+		.map(|trace| trace.split(' ').filter(|word| word.len() == 255).count())
+		.collect();
+	let full = tried[0];
 	assert!(
-		largest <= full.div_ceil(2),
-		"no line was refused and split: one of {lines:?} has {largest} of the {full} arguments a \
-		 full line holds"
+		lines[0].len() < full && tried.get(1) == Some(&(full / 2)),
+		"the first, full line of {full} arguments was not refused and halved: {} ran first, and the \
+		 next line tried had {:?}",
+		lines[0].len(),
+		tried.get(1)
 	);
 
-	// One argument that fits xargs' count after the long path (a full line's
-	// arguments, 256 bytes and an argv pointer each, less the path, the other
-	// words and a margin), which the kernel refuses.
-	let big = "x".repeat(full * (256 + size_of::<*const u8>()) - sh.len() - 128);
+	// One argument that fits xargs' count after the long path (a full
+	// line's arguments, 256 bytes and an argv pointer each, less a margin),
+	// which the kernel refuses.
+	let big = "x".repeat(full * (256 + size_of::<*const u8>()) - 128);
 	std::fs::write(dir.path().join("big"), format!("{big}\n")).unwrap();
-	let ran = run(&mut s, &format!("xargs -a big {sh} -c {COUNT_ARGS}")).await;
+	let ran = run(&mut s, &format!("xargs -a big {sh} {SHOW_ARGS}")).await;
 	assert_eq!((ran.status, ran.stdout.as_str()), (126, ""), "{}", ran.stderr);
 	assert_eq!(ran.stderr.matches("Argument list too long").count(), 1, "{}", ran.stderr);
 }
@@ -342,14 +363,13 @@ async fn xargs_splits_a_line_the_kernel_refuses_as_too_long() {
 /// `find -exec ... {} +` in the shell: it sizes its batches against the
 /// process's environment, but its commands get the shell's, so a large
 /// exported variable the process lacks makes the kernel refuse a full batch,
-/// which runs again as two halves with nothing printed for the refusal. A
-/// line of one file the kernel refuses is find's error, printed once.
+/// which runs again as two halves with nothing printed for the refusal, and
+/// every file still runs once, in find's order. A line of one file the
+/// kernel refuses is find's error, printed once.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn find_exec_plus_splits_a_batch_the_kernel_refuses_as_too_long() {
-	const COUNT_FILES: &str = r#"find many -type f -exec /bin/sh -c 'printf "%s\n" "$#"' sh {} +"#;
-	let sizes =
-		|stdout: &str| -> Vec<usize> { stdout.lines().map(|line| line.parse().unwrap()).collect() };
+	let show_files = format!("find many -type f -exec /bin/sh {SHOW_ARGS} {{}} +");
 	let dir = tempfile::tempdir().unwrap();
 	std::fs::create_dir(dir.path().join("many")).unwrap();
 	// SAFETY: plain call without pointer arguments.
@@ -365,30 +385,32 @@ async fn find_exec_plus_splits_a_batch_the_kernel_refuses_as_too_long() {
 		)
 		.unwrap();
 	}
-	// What a full line holds, from the builtin `echo`: no exec limit refuses
+	// The lines find builds, from the builtin `echo`: no exec limit refuses
 	// it (gVisor refuses even a `/bin/sh` line here).
 	let ran = run(&mut session_in(dir.path(), &[]), "find many -type f -exec echo {} +").await;
 	assert_eq!((ran.status, ran.stderr.as_str()), (0, ""));
-	let full = ran
+	let echoed: Vec<Vec<&str>> = ran
 		.stdout
 		.lines()
-		.next()
-		.map_or(0, |line| line.split(' ').count());
+		.map(|line| line.split(' ').collect())
+		.collect();
+	// A full line for the `sh` command holds as many files, or one fewer:
+	// its words take less room than one more file.
+	let full = echoed[0].len();
 
 	let pad = "x".repeat(16 * 1024);
-	let ran = run(&mut session_in(dir.path(), &[("FIND_TEST_PAD", &pad)]), COUNT_FILES).await;
+	let ran = run(&mut session_in(dir.path(), &[("FIND_TEST_PAD", &pad)]), &show_files).await;
 	assert_eq!(
 		(ran.status, ran.stderr.as_str()),
 		(0, ""),
 		"every line runs, and nothing is reported"
 	);
-	let lines = sizes(&ran.stdout);
-	assert_eq!(lines.iter().sum::<usize>(), count, "{lines:?}");
-	let largest = lines.iter().copied().max().unwrap_or(0);
+	let lines = lines_run(&ran.stdout);
+	assert!(lines.concat() == echoed.concat(), "the files did not each run once, in find's order");
 	assert!(
-		largest <= full.div_ceil(2),
-		"no line was refused and split: one of {lines:?} has {largest} of the {full} files a full \
-		 line holds"
+		lines[0].len() + 1 < full,
+		"the first, full line was not refused and split: {} of about {full} files ran first",
+		lines[0].len()
 	);
 
 	// An environment as large as the whole limit leaves no room for any line.
@@ -396,9 +418,49 @@ async fn find_exec_plus_splits_a_batch_the_kernel_refuses_as_too_long() {
 	std::fs::create_dir(one.path().join("many")).unwrap();
 	std::fs::write(one.path().join("many/only"), b"").unwrap();
 	let pad = "x".repeat(arg_max);
-	let ran = run(&mut session_in(one.path(), &[("FIND_TEST_PAD", &pad)]), COUNT_FILES).await;
+	let ran = run(&mut session_in(one.path(), &[("FIND_TEST_PAD", &pad)]), &show_files).await;
 	assert_eq!((ran.status, ran.stdout.as_str()), (1, ""), "{}", ran.stderr);
 	assert_eq!(ran.stderr.matches("Argument list too long").count(), 1, "{}", ran.stderr);
+}
+
+/// A builtin's own `exec` that the system refuses as too long is the
+/// shell's: its diagnostic and status 126 (`xargs` 123, `find` 1), and the
+/// builtin runs once. Retrying it in halves, as for a program `xargs` or
+/// `find` runs, would repeat what the builtin did before the `exec`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_builtins_refused_exec_is_not_retried() {
+	let dir = tempfile::tempdir().unwrap();
+	// SAFETY: plain call without pointer arguments.
+	let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
+	// An environment string longer than the whole limit: the `exec` is
+	// refused with `E2BIG` whatever its arguments.
+	std::fs::write(dir.path().join("pad"), "x".repeat(arg_max + 1)).unwrap();
+	std::fs::create_dir(dir.path().join("many")).unwrap();
+	for n in 1..=10 {
+		std::fs::write(dir.path().join("many").join(n.to_string()), b"").unwrap();
+	}
+	let side_then_exec = r#"'echo SIDE; PAD=$(cat pad) exec /bin/sh -c "echo ran" sh'"#;
+	let mut s = session_in(dir.path(), &[]);
+	for (command, status) in [
+		(format!("printf '%s\\n' 1 2 3 4 5 6 7 8 9 10 | xargs eval {side_then_exec}"), 123),
+		(format!("find many -type f -exec eval {side_then_exec} {{}} +"), 1),
+	] {
+		let ran = run(&mut s, &command).await;
+		assert_eq!(
+			(ran.status, ran.stdout.as_str()),
+			(status, "SIDE\n"),
+			"{command}: {}",
+			ran.stderr
+		);
+		assert_eq!(
+			ran.stderr.matches("Argument list too long").count(),
+			1,
+			"{command}: {}",
+			ran.stderr
+		);
+		assert!(!ran.stderr.contains("could not be run"), "{command}: {}", ran.stderr);
+	}
 }
 
 /// `tail -f` writing into an engine pipe (no native handle) notices while
