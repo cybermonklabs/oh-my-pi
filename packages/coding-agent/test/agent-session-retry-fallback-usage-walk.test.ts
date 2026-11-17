@@ -562,4 +562,102 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 	});
+
+	describe("a classifier refusal whose fallback-credit target is spent", () => {
+		// The catalog lets Fable's refusal credit be redeemed on Opus 4.8 and not on Sonnet 4.5.
+		const FABLE = bundled("anthropic", "claude-fable-5");
+		const CREDIT_TARGET = bundled("anthropic", "claude-opus-4-8");
+		const OTHER_CLAUDE = bundled("anthropic", "claude-sonnet-4-5");
+
+		/** A Fable refusal that carries a live fallback credit. */
+		function refusalWithCredit(): MockResponse {
+			return {
+				content: [{ type: "thinking", thinking: "Before the refusal.", thinkingSignature: "sig_fable_refusal" }],
+				stopReason: "error",
+				stopDetails: {
+					type: "refusal",
+					category: "cyber",
+					explanation: "Classifier declined this turn.",
+					fallback_credit_token: "fct_signed_test",
+					fallback_has_prefill_claim: true,
+				},
+				errorMessage: "Refusal (cyber): Classifier declined this turn.",
+				fallbackCreditHandle: {
+					token: "fct_signed_test",
+					prefillClaim: true,
+					params: {
+						model: FABLE.id,
+						messages: [{ role: "user", content: "Test prompt" }],
+						max_tokens: 1024,
+						stream: true,
+					},
+					betas: ["fallback-credit-2026-06-01"],
+					expiresAt: Date.now() + 60_000,
+				},
+			};
+		}
+
+		// Each order reaches the other Claude model by a different path: after the
+		// walk passes over the spent target, or before the walk reads the target.
+		for (const [order, chain] of [
+			["the target first", chainOf(CREDIT_TARGET, OTHER_CLAUDE)],
+			["the other model first", chainOf(OTHER_CLAUDE, CREDIT_TARGET)],
+		] as const) {
+			it(`steps a refusal past its spent fallback-credit target to the next model (${order})`, async () => {
+				stubUsageReads({ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") });
+				const requestedModels: string[] = [];
+				// Stamped with Fable's identity, so the retry policy reads the refusal as Fable's.
+				const mock = createMockModel({
+					provider: FABLE.provider,
+					id: FABLE.id,
+					responses: [
+						{
+							content: [
+								{ type: "thinking", thinking: "Signed reasoning.", thinkingSignature: "seed-signature" },
+								"Seeded turn",
+							],
+						},
+						refusalWithCredit(),
+					],
+					handler: { content: ["answered"] },
+				});
+				const agent = new Agent({
+					getApiKey: model => `${model.provider}-test-key`,
+					initialState: { model: FABLE, systemPrompt: ["Test"], tools: [], messages: [] },
+					streamFn: (model, context, options) => {
+						requestedModels.push(formatModelString(model));
+						return mock.stream(model, context, options);
+					},
+				});
+				const run = startSession(
+					agent,
+					walkSettings(FABLE, {
+						"retry.maxRetries": 1,
+						"retry.fallbackChains": chain,
+						"retry.fallbackRevertPolicy": "cooldown-expiry",
+					}),
+				);
+				await runTurn(run.session, "Seed signed thinking");
+				// While a Fable turn with signed thinking leads the history and the
+				// credit is live, the refusal walk passes over the Claude models that
+				// cannot redeem it.
+				const seeded = agent.state.messages.findLast(
+					(message): message is AssistantMessage => message.role === "assistant",
+				);
+				if (!seeded) throw new Error("Expected the seeded assistant message");
+				seeded.api = FABLE.api;
+
+				await runTurn(run.session, "Recover from the refusal");
+
+				expect(requestedModels).toEqual([
+					formatModelString(FABLE),
+					formatModelString(FABLE),
+					formatModelString(OTHER_CLAUDE),
+				]);
+				expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
+				expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+				expect(lastAssistant(run.session).stopReason).toBe("stop");
+			});
+		}
+	});
 });
