@@ -455,6 +455,17 @@ export interface UsageLimitMarkResult {
 /** Combined model availability state across stored accounts. */
 export type ModelUsageHealthState = "healthy" | "reserve" | "depleted" | "unknown";
 
+/**
+ * Why {@link HealthApi.model} reads one account `depleted`:
+ * - `"usage"`: an exhausted current usage window in the report, or a
+ *   usage-limit block (the catch-all scope or a usage scope of the provider's
+ *   ranking strategy, which `limits.markReached` writes).
+ * - `"account-policy"`: only account-policy blocks (the `account-policy`
+ *   scope or a `model-policy:<model>` scope).
+ * - `"auth"`: only an `auth` block (a 401).
+ */
+export type ModelUsageDepletionCause = "usage" | "account-policy" | "auth";
+
 /** Usage health of one stored credential for a model. */
 export interface ModelUsageAccountHealth {
 	credentialId: number;
@@ -464,6 +475,12 @@ export interface ModelUsageAccountHealth {
 	state: ModelUsageHealthState;
 	remainingFraction?: number;
 	resetsAt?: number;
+	/**
+	 * Set on every `depleted` account and on no other. An account held by a
+	 * usage block and any other block reads `"usage"`; one held by
+	 * account-policy and auth blocks reads `"account-policy"`.
+	 */
+	depletedBy?: ModelUsageDepletionCause;
 }
 
 /** Aggregate model usage health and account detail. */

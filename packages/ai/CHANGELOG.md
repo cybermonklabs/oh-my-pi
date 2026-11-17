@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Model usage health now names why an account is depleted (`depletedBy`: `usage`, `account-policy` or `auth`).
+
 ## [18.18.4] - 2026-11-09
 
 ### Added
