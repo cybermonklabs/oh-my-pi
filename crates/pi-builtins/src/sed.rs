@@ -125,6 +125,66 @@ pub enum ReplacementPart {
 	Literal(String), // Normal text
 	WholeMatch,      // &
 	Group(u32),      // \1 to \9
+	Case(CaseFold),  // \U \L \u \l \E
+}
+
+/// The case GNU sed's `\U`, `\L`, `\u`, `\l` and `\E` give the text that
+/// follows them in a replacement: `sed 's/./\U&/'` on `ab` prints `Ab`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseFold {
+	/// `\U`: upper-case until `\E`, `\L` or the end.
+	Upper,
+	/// `\L`: lower-case until `\E`, `\U` or the end.
+	Lower,
+	/// `\u`: upper-case the next character alone.
+	UpperFirst,
+	/// `\l`: lower-case the next character alone.
+	LowerFirst,
+	/// `\E`: end the case an earlier `\U` or `\L` set.
+	End,
+}
+
+/// Builds a replacement, giving each piece of text the case the directives
+/// before it ask for.
+#[derive(Default)]
+struct CaseWriter {
+	out:  String,
+	/// The case `\U` or `\L` set, until `\E` ends it.
+	run:  Option<CaseFold>,
+	/// The case `\u` or `\l` set, for one character.
+	next: Option<CaseFold>,
+}
+
+impl CaseWriter {
+	fn fold(&mut self, fold: CaseFold) {
+		match fold {
+			CaseFold::Upper | CaseFold::Lower => {
+				self.run = Some(fold);
+				self.next = None;
+			},
+			CaseFold::UpperFirst | CaseFold::LowerFirst => self.next = Some(fold),
+			CaseFold::End => {
+				self.run = None;
+				self.next = None;
+			},
+		}
+	}
+
+	fn push(&mut self, text: &str) {
+		if self.run.is_none() && self.next.is_none() {
+			self.out.push_str(text);
+			return;
+		}
+		for c in text.chars() {
+			match (self.next.take(), self.run) {
+				(Some(CaseFold::UpperFirst), _) => self.out.extend(c.to_uppercase()),
+				(Some(CaseFold::LowerFirst), _) => self.out.extend(c.to_lowercase()),
+				(_, Some(CaseFold::Upper)) => self.out.extend(c.to_uppercase()),
+				(_, Some(CaseFold::Lower)) => self.out.extend(c.to_lowercase()),
+				_ => self.out.push(c),
+			}
+		}
+	}
 }
 
 // The maximum value allowed in regex quantifier
@@ -173,7 +233,7 @@ impl ReplacementTemplate {
 	/// Returns an error if a backreference in the template was not matched by
 	/// the RE.
 	pub fn apply_captures(&self, command: &Command, caps: &Captures) -> SedResult<String> {
-		let mut result = String::new();
+		let mut result = CaseWriter::default();
 
 		// Invalid group numbers may end here through (unkown at compile time)
 		// reused REs.
@@ -186,38 +246,42 @@ impl ReplacementTemplate {
 
 		for part in &self.parts {
 			match part {
-				ReplacementPart::Literal(s) => result.push_str(s),
+				ReplacementPart::Literal(s) => result.push(s),
 
 				ReplacementPart::WholeMatch => {
-					result.push_str(caps.get(0)?.map_or_default(|m| m.as_str()));
+					result.push(caps.get(0)?.map_or_default(|m| m.as_str()));
 				},
 
 				ReplacementPart::Group(n) => {
 					let i: usize = (*n).try_into().unwrap();
-					result.push_str(caps.get(i)?.map_or_default(|m| m.as_str()));
+					result.push(caps.get(i)?.map_or_default(|m| m.as_str()));
 				},
+
+				ReplacementPart::Case(fold) => result.fold(*fold),
 			}
 		}
 
-		Ok(result)
+		Ok(result.out)
 	}
 
 	/// Apply the template to the given RE single match.
 	pub fn apply_match(&self, m: &Match) -> String {
-		let mut result = String::new();
+		let mut result = CaseWriter::default();
 
 		for part in &self.parts {
 			match part {
-				ReplacementPart::Literal(s) => result.push_str(s),
+				ReplacementPart::Literal(s) => result.push(s),
 
-				ReplacementPart::WholeMatch => result.push_str(m.as_str()),
+				ReplacementPart::WholeMatch => result.push(m.as_str()),
+
+				ReplacementPart::Case(fold) => result.fold(*fold),
 
 				ReplacementPart::Group(_) => {
 					panic!("unexpected Regex group replacement")
 				},
 			}
 		}
-		result
+		result.out
 	}
 }
 
@@ -226,7 +290,8 @@ impl ReplacementTemplate {
 pub struct Substitution {
 	pub regex:       Option<Rc<Regex>>,   // Regular expression
 	pub replacement: ReplacementTemplate, // Specified broken-down replacement
-	pub occurrence:  usize,               // Which occurrence to substitute
+	pub occurrence:  usize,               // Which occurrence to substitute first
+	pub global:      bool,                // True if 'g' flag: that one and every later one
 	pub print_flag:  bool,                // True if 'p' flag
 	pub ignore_case: bool,                // True if 'I' flag
 	pub execute:     bool,                // True if 'e' flag (GNU extension)
@@ -582,7 +647,7 @@ use crate::openfile::OpenFile;
 use crate::host::ShellPaths;
 use crate::sed::{
 	command::{
-		Address, Command, CommandData, ProcessingContext, RegexMode, ReplacementPart,
+		Address, CaseFold, Command, CommandData, ProcessingContext, RegexMode, ReplacementPart,
 		ReplacementTemplate, Substitution, Transliteration,
 	},
 	delimited_parser::{parse_char_escape, parse_regex, parse_transliteration},
@@ -1136,42 +1201,64 @@ fn compile_regex(
 		return Ok(None);
 	}
 
-	// Convert basic to extended regular expression if needed. A BRE the
-	// dialect cannot express is a compilation error, matching real sed:
-	// `sed 's/\{1,3\}/X/'` reports an invalid RE rather than substituting.
-	// An ERE's bracket expressions are written out in the engine's syntax as
-	// a BRE's are: read by the engine, `[` in one opened a nested class, so
-	// `sed -E 's/[[]/x/'` was refused as an unclosed class.
-	let translated = if context.regex_extended {
-		crate::bre::ere_to_regex(pattern)
+	// Translate the dialect into the engine's syntax. A pattern GNU sed
+	// refuses is refused here with GNU's own message and exit status:
+	// `sed 's/[:alpha:]/X/'` is "character class syntax is [[:space:]], not
+	// [:space:]" and exit 4, while an ordinary bad RE exits 1.
+	let dialect = if context.regex_extended {
+		crate::bre::Dialect::Extended
 	} else {
-		crate::bre::bre_to_ere(pattern, crate::bre::Backrefs::Supported)
-			.map(std::borrow::Cow::<'_, str>::Owned)
-	}
-	.map_err(|e| {
-		compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))
-			.unwrap_err()
-	})?;
-
-	let mut modifiers = String::new();
-	if icase {
-		modifiers.push('i');
-	}
-	if multiline {
-		modifiers.push('m');
-	}
-	let pattern = if modifiers.is_empty() {
-		translated
-	} else {
-		std::borrow::Cow::Owned(format!("(?{modifiers}){translated}"))
+		crate::bre::Dialect::Basic
 	};
+	let translate = |text: &str| {
+		crate::bre::translate(text, dialect, crate::bre::Target::Fancy, icase).map_err(|error| {
+			// GNU sed exits 4 for a class name written without its outer
+			// brackets and 1 for any other invalid RE.
+			let message = format!(
+				"{}:{}:{}: error: invalid regex '{text}': {}",
+				lines.get_input_name(),
+				lines.get_line_number(),
+				line.get_pos() + 1,
+				error.message()
+			);
+			let code = if error == crate::bre::BreError::ClassSyntaxConfused { 4 } else { 1 };
+			SedError::new(code, message)
+		})
+	};
+	let modifiers = {
+		let mut modifiers = String::new();
+		if icase {
+			modifiers.push('i');
+		}
+		if multiline {
+			modifiers.push('m');
+		}
+		modifiers
+	};
+	let with_modifiers = |text: String| {
+		if modifiers.is_empty() { text } else { format!("(?{modifiers}){text}") }
+	};
+	let whole = with_modifiers(translate(pattern)?);
 
-	// Compile into engine.
-	let compiled = Regex::new(&pattern).map_err(|e| {
-		compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {e}"))
+	// POSIX replaces the LONGEST match, while the engines prefer the first
+	// branch of an alternation that matches: `sed -E 's/a|ab/X/'` on `ab`
+	// gave `Xb` where GNU gives `X`. Each branch is compiled on its own so
+	// the longest one can be chosen; a pattern with one branch is compiled
+	// as it always was.
+	let branches = crate::bre::alternatives(pattern, dialect, false);
+	let compiled = if branches.len() > 1 {
+		let translated: Vec<String> = branches
+			.iter()
+			.map(|branch| translate(branch).map(&with_modifiers))
+			.collect::<SedResult<_>>()?;
+		Regex::with_branches(&whole, &translated)
+	} else {
+		Regex::new(&whole)
+	};
+	let compiled = compiled.map_err(|e| {
+		compilation_error::<Regex>(lines, line, format!("invalid regex '{whole}': {e}"))
 			.unwrap_err()
 	})?;
-
 	Ok(Some(compiled))
 }
 
@@ -1219,6 +1306,22 @@ pub fn compile_replacement(
 							} else {
 								parts.push(ReplacementPart::Group(ref_num));
 							}
+							line.advance();
+						},
+
+						// GNU's case directives, which give the text that
+						// follows them its case: `s/./\U&/` on `ab` is `Ab`.
+						c @ ('U' | 'L' | 'u' | 'l' | 'E') => {
+							if !literal.is_empty() {
+								parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
+							}
+							parts.push(ReplacementPart::Case(match c {
+								'U' => CaseFold::Upper,
+								'L' => CaseFold::Lower,
+								'u' => CaseFold::UpperFirst,
+								'l' => CaseFold::LowerFirst,
+								_ => CaseFold::End,
+							}));
 							line.advance();
 						},
 
@@ -1385,9 +1488,11 @@ pub fn compile_subst_flags(
 	sandbox: bool,
 	paths: &ShellPaths,
 ) -> SedResult<()> {
-	let mut seen_g_or_n = false;
+	let mut seen_global = false;
+	let mut seen_number = false;
 
 	subst.occurrence = 1; // default
+	subst.global = false;
 	subst.print_flag = false;
 	subst.ignore_case = false;
 	subst.execute = false;
@@ -1402,15 +1507,11 @@ pub fn compile_subst_flags(
 
 		match line.current() {
 			'g' => {
-				if seen_g_or_n {
-					return compilation_error(
-						lines,
-						line,
-						"multiple 'g' or numeric flags in substitute command",
-					);
+				if seen_global {
+					return compilation_error(lines, line, "multiple `g' options to `s' command");
 				}
-				seen_g_or_n = true;
-				subst.occurrence = 0;
+				seen_global = true;
+				subst.global = true;
 				line.advance();
 			},
 
@@ -1447,13 +1548,11 @@ pub fn compile_subst_flags(
 				line.advance();
 			},
 
-			_c @ '1'..='9' => {
-				if seen_g_or_n {
-					return compilation_error(
-						lines,
-						line,
-						"multiple 'g' or numeric flags in substitute command",
-					);
+			_c @ '0'..='9' => {
+				// GNU takes a count beside `g` as "this occurrence and every
+				// later one": `sed 's/a/b/2g'` on `aaaa` prints `abbb`.
+				if seen_number {
+					return compilation_error(lines, line, "multiple number options to `s' command");
 				}
 
 				let mut number = 0usize;
@@ -1467,9 +1566,16 @@ pub fn compile_subst_flags(
 						})?;
 					line.advance();
 				}
+				if number == 0 {
+					return compilation_error(
+						lines,
+						line,
+						"number option to `s' command may not be zero",
+					);
+				}
 
 				subst.occurrence = number;
-				seen_g_or_n = true;
+				seen_number = true;
 			},
 
 			'w' => {
@@ -2671,7 +2777,33 @@ mod tests {
 		let mut subst = Substitution::default();
 
 		compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap();
-		assert_eq!(subst.occurrence, 0); // 'g' means all occurrences
+		assert!(subst.global); // 'g' means this occurrence and every later one
+		assert_eq!(subst.occurrence, 1);
+	}
+
+	#[test]
+	fn test_compile_subst_flag_number_and_g() {
+		// GNU: `s/a/b/2g` replaces the second match and every later one.
+		for flags in ["2g", "g2"] {
+			let (lines, mut chars) = make_providers(flags);
+			let mut subst = Substitution::default();
+
+			compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default())
+				.unwrap();
+			assert!(subst.global, "{flags}");
+			assert_eq!(subst.occurrence, 2, "{flags}");
+		}
+	}
+
+	#[test]
+	fn test_compile_subst_flag_zero_number_is_refused() {
+		let (lines, mut chars) = make_providers("0");
+		let mut subst = Substitution::default();
+
+		assert!(
+			compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default())
+				.is_err()
+		);
 	}
 
 	#[test]
@@ -2729,27 +2861,23 @@ mod tests {
 	}
 
 	#[test]
-	fn test_compile_subst_flag_g_and_number_should_fail() {
-		let (lines, mut chars) = make_providers("g3");
+	fn test_compile_subst_flag_repeated_g_should_fail() {
+		// A count beside `g` is GNU's "from this occurrence on"; two `g`
+		// flags are "multiple `g' options to `s' command".
+		let (lines, mut chars) = make_providers("gg");
 		let mut subst = Substitution::default();
 
 		let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("multiple 'g' or numeric flags in substitute command")
-		);
+		assert!(err.to_string().contains("multiple `g' options to `s' command"));
 	}
 
 	#[test]
-	fn test_compile_subst_flag_number_and_g_should_fail() {
-		let (lines, mut chars) = make_providers("2g");
+	fn test_compile_subst_flag_repeated_number_should_fail() {
+		let (lines, mut chars) = make_providers("2 3");
 		let mut subst = Substitution::default();
 
 		let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("multiple 'g' or numeric flags in substitute command")
-		);
+		assert!(err.to_string().contains("multiple number options to `s' command"));
 	}
 
 	#[test]
@@ -3843,17 +3971,17 @@ fn parse_character_class(
 		}
 
 		if ch == '\\' {
-			// Handle escape sequence
+			// GNU sed reads `\n` and the other escapes it defines inside a
+			// bracket expression, and leaves every other backslash an
+			// ordinary member: `sed 's/[\]/X/'` replaces a backslash, so the
+			// `]` that follows closes the list rather than being escaped.
 			line.advance();
 			if line.eol() {
 				break;
 			}
-			if let Some(decoded) = parse_char_escape(line) {
-				result.push(decoded);
-			} else {
-				result.push('\\');
-				result.push(line.current());
-				line.advance();
+			match parse_char_escape(line) {
+				Some(decoded) => result.push(decoded),
+				None => result.push('\\'),
 			}
 		} else {
 			result.push(ch);
@@ -4448,10 +4576,13 @@ mod tests {
 
 	#[test]
 	fn test_escaped_delimiter() {
+		// GNU sed reads a backslash inside a bracket expression as an
+		// ordinary member, so the list is `[a\]` and `bc]` is the text after
+		// it: `sed 's/[a\]bc]/X/'` replaces nothing in `a]bc]`.
 		let mut line = char_provider_from("[a\\]bc]");
 		let lines = test_lines();
 		let result = parse_character_class(&lines, &mut line).unwrap();
-		assert_eq!(result, "[a\\]bc]");
+		assert_eq!(result, "[a\\]");
 	}
 
 	#[test]
@@ -6598,8 +6729,10 @@ use crate::sed::fast_io::IOChunk;
 // For example, r"\\1" and r"[\1]" will match, whereas only a number
 // after an odd number of backslashes and outside a character class
 // should match.
+// A look-around needs it too: the word edges `\<` and `\>` are written as
+// `\b(?=\w)` and `\b(?<=\w)`, which the byte engine cannot compile.
 static NEEDS_FANCY_RE: LazyLock<RustRegex> =
-	LazyLock::new(|| regex::Regex::new(r"\\[1-9]").unwrap());
+	LazyLock::new(|| regex::Regex::new(r"\\[1-9]|\(\?[=!<]").unwrap());
 
 /// All characters signifying that the match must be handled by an RE
 /// rather than by plain string pattern matching.
@@ -6768,6 +6901,61 @@ pub enum Regex {
 	Literal(LiteralMatcher), // Fastest: literal bytes
 	Byte(ByteRegex),         // Slower: byte-based RE
 	Fancy(FancyRegex),       // Slowest: RE supporting UTF-8 and back-references
+	/// A top-level alternation, searched branch by branch: POSIX replaces
+	/// the LONGEST match at the leftmost position, while the engines above
+	/// prefer the first branch that matches there, so `sed -E 's/a|ab/X/'`
+	/// on `ab` gave `Xb` where GNU sed gives `X`.
+	Longest(Longest),
+}
+
+#[derive(Clone, Debug)]
+/// The branches of a top-level alternation, each compiled on its own.
+pub struct Longest {
+	/// The pattern as a whole, which answers whether a line matches at all
+	/// and how many groups the branches share.
+	whole:    Box<Regex>,
+	branches: Vec<Branch>,
+}
+
+#[derive(Clone, Debug)]
+/// One branch of an alternation.
+struct Branch {
+	re:     FancyRegex,
+	/// How many capture groups the branches before this one hold, so a group
+	/// of this branch keeps the number it has in the whole pattern and the
+	/// groups of the other branches stay unset, as POSIX leaves them.
+	offset: usize,
+}
+
+impl Longest {
+	/// The leftmost-longest match at or after `pos`: the leftmost start any
+	/// branch has, and among the branches that match there the longest one.
+	/// A tie goes to the earlier branch, the one POSIX prefers.
+	fn search<'t>(
+		&self,
+		text: &'t str,
+		pos: usize,
+	) -> SedResult<Option<(FancyCaptures<'t>, usize)>> {
+		let mut best: Option<(FancyCaptures<'t>, usize)> = None;
+		for branch in &self.branches {
+			let found = branch
+				.re
+				.captures_from_pos(text, pos)
+				.map_err(|e| SedError::new(2, e.to_string()))?;
+			let Some(caps) = found else { continue };
+			let Some(m) = caps.get(0) else { continue };
+			let better = match &best {
+				None => true,
+				Some((kept, _)) => kept
+					.get(0)
+					.is_none_or(|k| m.start() < k.start() || (m.start() == k.start() && m.end() > k.end())),
+			};
+			if better {
+				best = Some((caps, branch.offset));
+			}
+		}
+		Ok(best)
+	}
 }
 
 /// Ensure that a regex matches GNU sed's default semantics for `.`
@@ -6805,6 +6993,24 @@ impl Regex {
 		}
 	}
 
+	/// The engine for a pattern whose top-level alternation holds more than
+	/// one branch: the branches are searched one by one so the longest match
+	/// at the leftmost position is the one replaced, as POSIX and GNU sed
+	/// do. `branches` are the translations of that pattern's own branches,
+	/// in order.
+	pub fn with_branches(pattern: &str, branches: &[String]) -> Result<Self, Box<dyn Error>> {
+		let whole = Self::new(pattern)?;
+		let mut offset = 0;
+		let mut compiled = Vec::with_capacity(branches.len());
+		for branch in branches {
+			let re = FancyRegex::new(&ensure_dotall(branch))?;
+			let groups = re.captures_len() - 1;
+			compiled.push(Branch { re, offset });
+			offset += groups;
+		}
+		Ok(Self::Longest(Longest { whole: Box::new(whole), branches: compiled }))
+	}
+
 	/// Check if the regex matches the content of the IOChunk.
 	pub fn is_match(&self, chunk: &mut IOChunk) -> SedResult<bool> {
 		match self {
@@ -6815,6 +7021,9 @@ impl Regex {
 				re.is_match(text)
 					.map_err(|e| SedError::new(2, e.to_string()))
 			},
+			// A line matches the alternation when it matches any branch,
+			// which the whole pattern answers on the bytes themselves.
+			Regex::Longest(longest) => longest.whole.is_match(chunk),
 		}
 	}
 
@@ -6835,6 +7044,17 @@ impl Regex {
 				let text = chunk.as_str()?;
 				Ok(CaptureMatches::Fancy(re.captures_iter(text)))
 			},
+
+			Regex::Longest(longest) => {
+				let text = chunk.as_str()?;
+				Ok(CaptureMatches::Longest(LongestMatches {
+					longest,
+					text,
+					pos: 0,
+					total: longest.whole.captures_len(),
+					done: false,
+				}))
+			},
 		}
 	}
 
@@ -6844,6 +7064,7 @@ impl Regex {
 			Regex::Literal(_) => 1, // Only group 0
 			Regex::Byte(re) => re.captures_len(),
 			Regex::Fancy(re) => re.captures_len(),
+			Regex::Longest(longest) => longest.whole.captures_len(),
 		}
 	}
 
@@ -6870,6 +7091,14 @@ impl Regex {
 					Ok(None) => Ok(None),
 					Err(e) => Err(SedError::new(2, e.to_string())),
 				}
+			},
+
+			Regex::Longest(longest) => {
+				let text = chunk.as_str()?;
+				let total = longest.whole.captures_len();
+				Ok(longest
+					.search(text, 0)?
+					.map(|(caps, offset)| Captures::Branch { caps, offset, total }))
 			},
 		}
 	}
@@ -6907,6 +7136,13 @@ impl Regex {
 					Err(e) => Err(SedError::new(2, e.to_string())),
 				}
 			},
+
+			Regex::Longest(longest) => {
+				let text = chunk.as_str()?;
+				let Some((caps, _)) = longest.search(text, 0)? else { return Ok(None) };
+				let Some(m) = caps.get(0) else { return Ok(None) };
+				Ok(Some(Match { start: m.start(), end: m.end(), text: m.as_str() }))
+			},
 		}
 	}
 }
@@ -6916,6 +7152,38 @@ pub enum CaptureMatches<'t> {
 	Literal(Box<dyn Iterator<Item = SedResult<Captures<'t>>> + 't>),
 	Byte(ByteCaptureMatches<'t, 't>),
 	Fancy(FancyCaptureMatches<'t, 't>),
+	Longest(LongestMatches<'t>),
+}
+
+/// The matches of a top-level alternation, each the longest at its leftmost
+/// position, searched from where the one before it ended.
+pub struct LongestMatches<'t> {
+	longest: &'t Longest,
+	text:    &'t str,
+	pos:     usize,
+	total:   usize,
+	done:    bool,
+}
+
+impl<'t> LongestMatches<'t> {
+	/// Where the search for the next match starts: after this one, and one
+	/// character on where it is empty, as the engines' own iterators do.
+	fn advance(&mut self, start: usize, end: usize) {
+		self.pos = if end > start {
+			end
+		} else {
+			self.text[end..].chars().next().map_or(end + 1, |c| end + c.len_utf8())
+		};
+	}
+
+	fn step(&mut self) -> SedResult<Option<Captures<'t>>> {
+		let Some((caps, offset)) = self.longest.search(self.text, self.pos)? else {
+			return Ok(None);
+		};
+		let Some(m) = caps.get(0) else { return Ok(None) };
+		self.advance(m.start(), m.end());
+		Ok(Some(Captures::Branch { caps, offset, total: self.total }))
+	}
 }
 
 impl<'t> Iterator for CaptureMatches<'t> {
@@ -6931,6 +7199,22 @@ impl<'t> Iterator for CaptureMatches<'t> {
 					Some(Err(SedError::new(2, format!("error retrieving RE captures: {e}"))))
 				},
 				None => None,
+			},
+			CaptureMatches::Longest(iter) => {
+				if iter.done {
+					return None;
+				}
+				match iter.step() {
+					Ok(Some(caps)) => Some(Ok(caps)),
+					Ok(None) => {
+						iter.done = true;
+						None
+					},
+					Err(e) => {
+						iter.done = true;
+						Some(Err(e))
+					},
+				}
 			},
 		}
 	}
@@ -6964,6 +7248,15 @@ pub enum Captures<'t> {
 	Literal(Match<'t>), // only group 0
 	Byte(ByteCaptures<'t>),
 	Fancy(FancyCaptures<'t>),
+	/// The captures of one branch of a top-level alternation, numbered as
+	/// the whole pattern numbers them: `offset` groups belong to the
+	/// branches before it, and the groups of every other branch took no part
+	/// in the match, as POSIX leaves them.
+	Branch {
+		caps:   FancyCaptures<'t>,
+		offset: usize,
+		total:  usize,
+	},
 }
 
 impl<'t> Captures<'t> {
@@ -6986,6 +7279,18 @@ impl<'t> Captures<'t> {
 				Some(m) => Ok(Some(Match { start: m.start(), end: m.end(), text: m.as_str() })),
 				None => Ok(None),
 			},
+			Captures::Branch { caps, offset, .. } => {
+				let index = match i {
+					0 => 0,
+					_ if i > *offset => i - *offset,
+					// A group of another branch, which did not match.
+					_ => return Ok(None),
+				};
+				match caps.get(index) {
+					Some(m) => Ok(Some(Match { start: m.start(), end: m.end(), text: m.as_str() })),
+					None => Ok(None),
+				}
+			},
 		}
 	}
 
@@ -6995,6 +7300,7 @@ impl<'t> Captures<'t> {
 			Captures::Literal(_) => 1,
 			Captures::Byte(caps) => caps.len(),
 			Captures::Fancy(caps) => caps.len(),
+			Captures::Branch { total, .. } => *total,
 		}
 	}
 
@@ -8036,8 +8342,8 @@ fn substitute(
 	// The following let block allows a common input_runtime_error to be
 	// called once in all cases, and most importantly, to finish the regex
 	// mutable borrowing of context, so as to reuse context in the error call.
-	let subst_result = match (sub.occurrence, sub.replacement.max_group_number) {
-		(1, 0) => {
+	let subst_result = match (sub.occurrence, sub.global, sub.replacement.max_group_number) {
+		(1, false, 0) => {
 			// Example: s/foo/bar/: find() is enough.
 			match regex.find(pattern) {
 				Err(e) => Err(e),
@@ -8055,7 +8361,7 @@ fn substitute(
 			}
 		},
 
-		(1, _) => {
+		(1, false, _) => {
 			// Example: s/\(.\)\(.\)/\2\1/: captures() is enough.
 			match regex.captures(pattern) {
 				Err(e) => Err(e),
@@ -8075,8 +8381,9 @@ fn substitute(
 		},
 
 		(..) => {
-			// Example: s/(.)(.)/\2\1/3: captures_iter() is needed.
-			// Iterate over multiple captures of the RE in the pattern.
+			// Example: s/(.)(.)/\2\1/3 and s/a/b/2g: captures_iter() is
+			// needed. Iterate over multiple captures of the RE in the
+			// pattern.
 			'captures: {
 				for caps_result in regex.captures_iter(pattern)? {
 					let caps = match caps_result {
@@ -8093,7 +8400,7 @@ fn substitute(
 					}
 					result.push_str(&text.unwrap()[last_end..m.start()]);
 
-					if sub.occurrence == 0 || count == sub.occurrence {
+					if count == sub.occurrence || (sub.global && count > sub.occurrence) {
 						let replacement = sub.replacement.apply_captures(command, &caps)?;
 						result.push_str(&replacement);
 						replaced = true;
@@ -8104,9 +8411,9 @@ fn substitute(
 
 					last_end = m.end();
 
-					// Early exit if only a specific occurrence,
-					// (likely 1) needed replacing.
-					if count == sub.occurrence {
+					// Early exit once the one occurrence asked for is
+					// replaced; `g` goes on to the end of the line.
+					if count == sub.occurrence && !sub.global {
 						break 'captures Ok(());
 					}
 				}

@@ -22,7 +22,7 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum, parser
 use globset::{Glob, GlobMatcher};
 use grep_matcher::{LineTerminator, Matcher};
 use grep_pcre2::RegexMatcherBuilder as PcreMatcherBuilder;
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{
 	BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch,
 };
@@ -152,42 +152,47 @@ pub(crate) fn for_each_nonempty_match<M: Matcher>(
 	line_offset: u64,
 	visit: impl FnMut(grep_matcher::Match, u64) -> io::Result<()>,
 ) -> io::Result<()> {
-	for_each_nonempty_match_with(matcher, line, line_offset, |_| Ok(None), visit)
+	for_each_match_with(matcher, line, line_offset, |_| Ok(None), visit)
 }
 
-/// Calls `visit` with each non-empty match in `line`, left to right as `-o`
-/// prints them, plus its absolute byte offset given the line's `line_offset`.
-/// An empty match gives way to the non-empty match that `at_empty` finds
-/// starting at its position, if any.
-fn for_each_nonempty_match_with<M: Matcher>(
+/// Calls `visit` with each match `-o` prints in `line`, left to right, plus
+/// its absolute byte offset given the line's `line_offset`.
+///
+/// GNU prints the longest match at each position and never prints an empty
+/// one, while the engines prefer the first alternative that matches there.
+/// `longest_at` answers, for the position the engine's match starts at, the
+/// longest non-empty match any alternative has there; with no alternative to
+/// search it answers `None` and the engine's own match is printed.
+fn for_each_match_with<M: Matcher>(
 	matcher: &M,
 	line: &[u8],
 	line_offset: u64,
-	mut at_empty: impl FnMut(usize) -> io::Result<Option<grep_matcher::Match>>,
+	mut longest_at: impl FnMut(usize) -> io::Result<Option<grep_matcher::Match>>,
 	mut visit: impl FnMut(grep_matcher::Match, u64) -> io::Result<()>,
 ) -> io::Result<()> {
 	let mut at = 0usize;
 	while at <= line.len() {
-		let Some(mut found) = matcher
+		let Some(found) = matcher
 			.find_at(line, at)
 			.map_err(|error| io::Error::other(error.to_string()))?
 		else {
 			break;
 		};
-		if found.is_empty() {
-			match at_empty(found.start())? {
-				Some(longer) => found = longer,
-				None => {
-					at = found.end() + 1;
-					continue;
-				},
-			}
-		}
+		let printed = match longest_at(found.start())? {
+			Some(longest) => longest,
+			None if !found.is_empty() => found,
+			// An empty match with nothing longer at that position prints
+			// nothing, and the search goes on past it.
+			None => {
+				at = found.end() + 1;
+				continue;
+			},
+		};
 		let match_offset = line_offset.saturating_add(
-			u64::try_from(found.start()).map_err(|error| io::Error::other(error.to_string()))?,
+			u64::try_from(printed.start()).map_err(|error| io::Error::other(error.to_string()))?,
 		);
-		visit(found, match_offset)?;
-		at = found.end();
+		visit(printed, match_offset)?;
+		at = if printed.end() > at { printed.end() } else { at + 1 };
 	}
 	Ok(())
 }
@@ -537,29 +542,41 @@ struct Options {
 	group_separator:     Option<Vec<u8>>,
 	line_buffered:       bool,
 	binary_files:        BinaryFiles,
+	/// How many lines `-m` lets the search select, `None` when unbounded.
+	/// The count is kept here rather than in the searcher because GNU prints
+	/// the trailing context of the line that reaches it, and prints a
+	/// matching line inside that context as context; see [`GrepSink`].
+	max_count:           Option<u64>,
+	/// Whether the sink writes the `--` between two groups of lines itself.
+	/// The searcher reports a break only where a context count is larger
+	/// than zero, while GNU prints one whenever a context option was given:
+	/// `grep -C0 mid` prints `mid`, `--`, `mid`.
+	mark_gaps:           bool,
 	/// Whether an input that is the file stdout lands in is refused; see
 	/// [`Grep::run`].
 	refuse_output_file:  bool,
-	/// The non-empty patterns of `-o` with more than one, to compile each
-	/// alone; see [`GrepSink::print_only_matching`].
-	each_pattern:        Option<Arc<EachPattern>>,
+	/// The alternatives of a `-o` search, to search each alone; see
+	/// [`GrepSink::print_only_matching`].
+	alternatives:        Option<Arc<Alternatives>>,
 }
 
-/// The non-empty patterns of a `-o` search, each compiled alone at the first
-/// empty match that needs them, once for every file and worker of the search.
-struct EachPattern {
+/// The alternatives of a `-o` search - the branches of each pattern's
+/// alternation - compiled one by one at the first match that needs them,
+/// once for every file and worker of the search.
+struct Alternatives {
 	patterns: Vec<String>,
 	spec:     MatcherSpec,
 	engines:  OnceLock<Option<Vec<Engine>>>,
 }
 
-impl EachPattern {
-	/// Each pattern's engine, compiled on the first call.
+impl Alternatives {
+	/// Each alternative's engine, compiled on the first call.
 	fn engines(&self) -> Option<&[Engine]> {
 		self.engines
 			.get_or_init(|| {
-				// The alternation compiled, so a pattern alone can fail only on a
-				// size limit; empty matches then stay skipped.
+				// The patterns together compiled, so one alternative can fail
+				// only on a size limit; the engine's own match is printed
+				// then.
 				self.patterns
 					.iter()
 					.map(|pattern| build_matcher(std::slice::from_ref(pattern), self.spec).ok())
@@ -672,30 +689,24 @@ fn resolve_file_list_modes(matches: &ArgMatches) -> (bool, bool) {
 	}
 }
 
-fn resolve_context(cli: &GrepArgs, matches: &ArgMatches) -> (usize, usize) {
-	let mut events = Vec::with_capacity(3);
-	if let (Some(index), Some(value)) = (last_index(matches, "after_context"), cli.after_context) {
-		events.push((index, false, value));
-	}
-	if let (Some(index), Some(value)) = (last_index(matches, "before_context"), cli.before_context) {
-		events.push((index, true, value));
-	}
-	if let (Some(index), Some(value)) = (last_index(matches, "context"), cli.context) {
-		events.push((index, false, value));
-		events.push((index, true, value));
-	}
-	events.sort_unstable_by_key(|event| event.0);
-
-	let mut before = 0;
-	let mut after = 0;
-	for (_, is_before, value) in events {
-		if is_before {
-			before = value;
-		} else {
-			after = value;
-		}
-	}
-	(before, after)
+/// The context counts, and whether any context option was given.
+///
+/// `-A` and `-B` each set their own count, while `-C` and a digit option set
+/// the default the other two fall back to, whatever their order: GNU's
+/// `grep -A1 -C3` prints three lines before each match and one after. The
+/// last flag of each kind wins.
+///
+/// Whether one was given at all is what makes grep print a `--` between two
+/// groups of lines: `grep -C0` prints it and a plain `grep` does not.
+fn resolve_context(cli: &GrepArgs, matches: &ArgMatches) -> (usize, usize, bool) {
+	let after = last_index(matches, "after_context").and(cli.after_context);
+	let before = last_index(matches, "before_context").and(cli.before_context);
+	let default = last_index(matches, "context").and(cli.context);
+	(
+		before.or(default).unwrap_or(0),
+		after.or(default).unwrap_or(0),
+		before.is_some() || after.is_some() || default.is_some(),
+	)
 }
 
 fn resolve_group_separator(cli: &GrepArgs, matches: &ArgMatches) -> Option<Vec<u8>> {
@@ -741,9 +752,11 @@ fn resolve_follow_links(cli: &GrepArgs, matches: &ArgMatches) -> bool {
 }
 
 fn resolve_binary_files(cli: &GrepArgs, matches: &ArgMatches) -> BinaryFiles {
-	// Preserve the builtin's historical byte-transparent default. Explicit
-	// GNU/BSD binary controls opt into detection.
-	let mut selected = (0, BinaryFiles::Text);
+	// GNU's default: input holding a NUL byte is binary, so its matches are
+	// reported on standard error instead of being written as bytes into a
+	// pipeline, and a NUL ends a line (`grep -c . ` counts the runs between
+	// them). `-a` asks for the bytes themselves.
+	let mut selected = (0, BinaryFiles::Binary);
 	choose_latest(&mut selected, last_index(matches, "text"), BinaryFiles::Text);
 	choose_latest(
 		&mut selected,
@@ -757,14 +770,96 @@ fn resolve_binary_files(cli: &GrepArgs, matches: &ArgMatches) -> BinaryFiles {
 	selected.1
 }
 
-fn resolve_max_count(cli: &GrepArgs) -> Result<Option<u64>, String> {
+/// How many lines `-m` lets the search select, `None` when it is unbounded.
+///
+/// GNU holds the count in a signed counter the search decrements, so a
+/// negative one never reaches zero and never stops the search, while `-v`
+/// instead clamps the lines it may still print to that negative number and
+/// prints none. Measured: `grep -m -2 x` prints every match, `grep -v -m -1
+/// x` prints nothing and exits 1, and `grep -cv -m -1 x` prints `0`.
+fn resolve_max_count(cli: &GrepArgs) -> Option<u64> {
 	match cli.max_count {
-		None | Some(-1) => Ok(None),
-		Some(value) if value >= 0 => u64::try_from(value)
-			.map(Some)
-			.map_err(|_| format!("invalid max count: {value}")),
-		Some(value) => Err(format!("invalid max count: {value}")),
+		None => None,
+		Some(value) if value < 0 => cli.invert.then_some(0),
+		Some(value) => u64::try_from(value).ok(),
 	}
+}
+
+/// Every long option `grep` accepts, for the abbreviation getopt allows.
+const LONG_OPTIONS: &[&str] = &[
+	"after-context",
+	"basic-regexp",
+	"binary",
+	"binary-files",
+	"byte-offset",
+	"color",
+	"colour",
+	"context",
+	"count",
+	"dereference-recursive",
+	"devices",
+	"directories",
+	"exclude",
+	"exclude-dir",
+	"exclude-from",
+	"extended-regexp",
+	"file",
+	"files-with-matches",
+	"files-without-match",
+	"fixed-strings",
+	"group-separator",
+	"help",
+	"ignore-case",
+	"include",
+	"include-dir",
+	"initial-tab",
+	"invert-match",
+	"label",
+	"line-buffered",
+	"line-number",
+	"line-regexp",
+	"max-count",
+	"mmap",
+	"no-filename",
+	"no-group-separator",
+	"no-ignore-case",
+	"no-messages",
+	"null",
+	"null-data",
+	"only-matching",
+	"perl-regexp",
+	"quiet",
+	"recursive",
+	"regexp",
+	"silent",
+	"text",
+	"version",
+	"with-filename",
+	"word-regexp",
+];
+
+/// The long option an abbreviation names, as getopt reads one for GNU grep:
+/// `--regex=zz` is `--regexp=zz`, because no other long option starts with
+/// `regex`. A prefix that names several options is left as it is, which clap
+/// refuses as GNU refuses an ambiguous one.
+fn expand_long_option(text: &str) -> Option<String> {
+	let (name, value) = match text.split_once('=') {
+		Some((name, value)) => (name, Some(value)),
+		None => (text, None),
+	};
+	let name = name.strip_prefix("--").filter(|name| !name.is_empty())?;
+	if LONG_OPTIONS.contains(&name) {
+		return None;
+	}
+	let mut named = LONG_OPTIONS.iter().filter(|long| long.starts_with(name));
+	let long = named.next()?;
+	if named.next().is_some() {
+		return None;
+	}
+	Some(match value {
+		Some(value) => format!("--{long}={value}"),
+		None => format!("--{long}"),
+	})
 }
 
 /// Whether `long`, a long option without its `--`, takes the next argument as
@@ -802,8 +897,10 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 		let Some(text) = arg.to_str() else { normalized.push(arg); continue };
 		if text == "--" { literal = true; normalized.push(arg); continue }
 		if let Some(long) = text.strip_prefix("--") {
-			value_pending = long_option_takes_next_value(long);
-			normalized.push(arg);
+			let expanded = expand_long_option(text);
+			value_pending =
+				long_option_takes_next_value(expanded.as_deref().map_or(long, |text| &text[2..]));
+			normalized.push(expanded.map_or(arg, OsString::from));
 			continue;
 		}
 		let Some(group) = text.strip_prefix('-') else { normalized.push(arg); continue };
@@ -847,41 +944,45 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 	normalized
 }
 
-/// Build a matcher, falling back to a literal match for any pattern the engine
-/// refuses.
-///
-/// `fallbacks` supplies the text to escape when the corresponding entry of
-/// `patterns` will not compile. The two differ for a BRE, where `patterns`
-/// holds the translated form: a back-reference cannot be compiled by
-/// `grep-regex` at all, and escaping the TRANSLATION would make `\(a\)\1`
-/// match the text `(a)\1` rather than the bytes the user typed. The literal
-/// fallback must reproduce the user's pattern, which is what it did before the
-/// translation step existed.
-fn build_default_matcher<P: AsRef<str>, F: AsRef<str>>(
-	builder: &RegexMatcherBuilder,
-	patterns: &[P],
-	fallbacks: &[F],
-) -> Result<RegexMatcher, String> {
-	debug_assert_eq!(patterns.len(), fallbacks.len());
-	let error = match builder.build_many(patterns) {
-		Ok(matcher) => return Ok(matcher),
-		Err(error) => error,
-	};
-	let sanitized: Vec<String> = patterns
+/// The dialect a pattern is read in, or `None` for the modes that read no
+/// POSIX pattern: a fixed string, and PCRE's own dialect under `-P`.
+const fn dialect_of(mode: MatchMode) -> Option<bre::Dialect> {
+	match mode {
+		MatchMode::Default => Some(bre::Dialect::Basic),
+		MatchMode::Extended => Some(bre::Dialect::Extended),
+		MatchMode::Fixed | MatchMode::Perl => None,
+	}
+}
+
+/// Translates every pattern for `target`, reporting the first one GNU
+/// refuses with the message GNU prints for it.
+fn translate_patterns(
+	patterns: &[String],
+	dialect: bre::Dialect,
+	target: bre::Target,
+	icase: bool,
+) -> Result<Vec<String>, String> {
+	patterns
 		.iter()
-		.zip(fallbacks.iter())
-		.map(|(pattern, fallback)| {
-			let pattern = pattern.as_ref();
-			if builder.build(pattern).is_ok() {
-				pattern.to_owned()
-			} else {
-				regex::escape(fallback.as_ref())
-			}
-		})
-		.collect();
+		.map(|pattern| bre::translate(pattern, dialect, target, icase))
+		.collect::<Result<_, _>>()
+		.map_err(|error: bre::BreError| error.message().to_owned())
+}
+
+/// Compiles `patterns` - already in PCRE2's syntax - with PCRE2.
+fn build_pcre_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, String> {
+	let mut builder = PcreMatcherBuilder::new();
 	builder
-		.build_many(&sanitized)
-		.map_err(|_| error.to_string())
+		.caseless(spec.ignore_case)
+		.word(spec.word && !spec.line_regexp)
+		.whole_line(spec.line_regexp)
+		.utf(true)
+		.ucp(true)
+		.jit_if_available(spec.jit);
+	builder
+		.build_many(patterns)
+		.map(Engine::Pcre)
+		.map_err(|error| error.to_string())
 }
 
 /// What compiling the patterns takes, resolved once from the command line
@@ -898,20 +999,13 @@ struct MatcherSpec {
 }
 
 /// Compile all patterns using the last-selected matcher mode.
+///
+/// A pattern the engine cannot compile is an ERROR, as it is for GNU, which
+/// refuses `grep '\(a'` with exit 2. Matching such a pattern as the text the
+/// user typed answers a different question with a success status.
 fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, String> {
 	if spec.mode == MatchMode::Perl {
-		let mut builder = PcreMatcherBuilder::new();
-		builder
-			.caseless(spec.ignore_case)
-			.word(spec.word && !spec.line_regexp)
-			.whole_line(spec.line_regexp)
-			.utf(true)
-			.ucp(true)
-			.jit_if_available(spec.jit);
-		return builder
-			.build_many(patterns)
-			.map(Engine::Pcre)
-			.map_err(|error| error.to_string());
+		return build_pcre_matcher(patterns, spec);
 	}
 
 	// With no pattern (`-f` of an empty file) no line matches. To fold case,
@@ -934,65 +1028,75 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 			.map_err(|error| error.to_string());
 	}
 
-	if spec.mode == MatchMode::Default {
-		// BRE is a distinct dialect, not ERE with different escaping: `\+` is
-		// the operator and a bare `+` is a literal. Translating through the
-		// shared BRE module is what makes `grep 'fo+'` mean "fo+" and
-		// `grep '^+'` mean a leading plus, as GNU and BSD grep both do.
-		//
-		// The ORIGINAL patterns are handed to the fallback. `grep-regex`
-		// cannot compile a back-reference, so `\(a\)\1` falls back to a
-		// literal match, and it has to be the user's own text - escaping the
-		// translated `(a)\1` would silently match different bytes than before
-		// this translation step existed.
-		let translated: Vec<String> = patterns
-			.iter()
-			.map(|pattern| bre::bre_to_ere(pattern, bre::Backrefs::Unsupported))
-			.collect::<Result<_, _>>()
-			.map_err(|e: bre::BreError| e.message().to_owned())?;
-		return build_default_matcher(&builder, &translated, patterns).map(Engine::Rust);
+	// A BRE is a distinct dialect, not an ERE with different escaping: `\+`
+	// is the operator and a bare `+` is a literal. Both dialects go through
+	// the shared module, which also writes each bracket expression and each
+	// brace the way the engine reads it with POSIX's meaning.
+	let Some(dialect) = dialect_of(spec.mode) else {
+		return Err("no dialect for the selected matcher mode".to_owned());
+	};
+	// `grep-regex` cannot run a back-reference at all. GNU answers
+	// `grep '\(a\)\1'` with the lines holding a doubled character, so the
+	// pattern is compiled with PCRE2 - the engine `-P` already uses - rather
+	// than refused or searched as the text `\1`.
+	if patterns.iter().any(|pattern| bre::has_backreference(pattern)) {
+		let translated = translate_patterns(patterns, dialect, bre::Target::Pcre, spec.ignore_case)?;
+		return build_pcre_matcher(&translated, spec);
 	}
-
-	// The `regex` crate reads a bracket expression its own way: `[` opens a
-	// nested class there, and `&&`, `--` and `~~` are set operations, so
-	// `grep -E '[[]'` failed with "unclosed character class" and `[~~]`
-	// matched nothing. A `{` that opens no interval is a literal to GNU and
-	// BSD grep, but the `regex` crate refuses the whole pattern, so
-	// `grep -E '{a}'` failed on patterns real grep matches. An
-	// attempted-but-unterminated interval stays an error in both.
-	let translated: Vec<std::borrow::Cow<'_, str>> = patterns
-		.iter()
-		.map(|pattern| bre::ere_to_regex(pattern))
-		.collect::<Result<_, _>>()
-		.map_err(|e: bre::BreError| e.message().to_owned())?;
-
-	// `regex` accepts `^+` and compiles it as `(?:^)+`, which matches at every
-	// line start. GNU and BSD grep both reject the pattern, so returning every
-	// line with exit 0 would be a wrong answer reported as success.
-	if let Some(bad) = patterns
-		.iter()
-		.find(|pattern| bre::ere_repetition_operand_missing(pattern))
-	{
-		return Err(format!("repetition-operator operand invalid: {bad}"));
-	}
-
+	let translated = translate_patterns(patterns, dialect, bre::Target::Rust, spec.ignore_case)?;
 	builder
 		.build_many(&translated)
 		.map(Engine::Rust)
 		.map_err(|error| error.to_string())
 }
 
+/// The alternatives of every pattern, for the longest match `-o` prints at
+/// each position, or `None` where searching them apart can print nothing the
+/// patterns together do not.
+fn pattern_alternatives(patterns: &[String], spec: MatcherSpec) -> Option<Vec<String>> {
+	// `-P` is PCRE2, which prefers the first branch of an alternation as
+	// GNU's own `-P` does; a fixed string holds no alternation, so the
+	// patterns are the alternatives.
+	if spec.mode == MatchMode::Perl {
+		return None;
+	}
+	let dialect = dialect_of(spec.mode);
+	let mut all = Vec::with_capacity(patterns.len());
+	for pattern in patterns {
+		match dialect {
+			Some(dialect) => all.extend(bre::alternatives(pattern, dialect, true)),
+			None => all.push(pattern.clone()),
+		}
+	}
+	// An alternative that can only match the empty string is never printed;
+	// `grep -o -e '' -e zz` prints the matches of `zz`.
+	all.retain(|alternative| !alternative.is_empty());
+	// One alternative that is the whole pattern answers exactly what the
+	// search already found, so there is nothing to compile for it.
+	let trivial = all.len() == 1 && patterns.len() == 1 && all[0] == patterns[0];
+	(!all.is_empty() && !trivial).then_some(all)
+}
+
 /// A search sink that renders GNU-compatible records and tracks selection.
 struct GrepSink<'a, M: Matcher, W: Write> {
 	out:          &'a mut W,
+	/// What the search reports on standard error: the binary-file summary,
+	/// which GNU 3.11 writes there rather than into the pipeline.
+	err:          &'a mut Vec<u8>,
 	matcher:      &'a M,
 	display:      &'a [u8],
 	opts:         &'a Options,
 	match_count:  u64,
 	any_match:    bool,
 	binary:       bool,
-	/// Where each pattern alone next matches in the line `-o` prints; see
-	/// [`longest_match_at`]. Kept to be reused from line to line.
+	/// Where the line last printed ends, to tell one group of lines from the
+	/// next where the context counts are zero; see [`Options::mark_gaps`].
+	last_end:     Option<u64>,
+	/// How many records may still follow the line that reached `-m`'s count,
+	/// `None` until it is reached.
+	after_left:   Option<usize>,
+	/// Where each alternative alone next matches in the line `-o` prints;
+	/// see [`longest_match_at`]. Kept to be reused from line to line.
 	next_matches: Vec<Option<Option<grep_matcher::Match>>>,
 }
 
@@ -1037,12 +1141,30 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 		self.flush_record()
 	}
 
-	/// Prints the non-empty matches in `line`, as `-o` does. GNU grep prints
-	/// at each position the longest match of any pattern, and the engines take
-	/// the first pattern that matches there: where that one matches empty
-	/// (`q\?`, `x*`, `()`, an empty pattern), it hid another pattern's match,
-	/// and `-o -e 'q\?' -e zz` printed nothing. There the longest non-empty
-	/// match of one pattern alone is printed instead.
+	/// Writes the `--` that separates two groups of lines, where the context
+	/// counts are zero and the searcher reports no break of its own.
+	fn mark_gap(&mut self, offset: u64) -> io::Result<()> {
+		if self.opts.mark_gaps
+			&& self.last_end.is_some_and(|end| end != offset)
+			&& let Some(separator) = &self.opts.group_separator
+		{
+			self.out.write_all(separator)?;
+			self.out.write_all(&[self.opts.record.terminator])?;
+			self.flush_record()?;
+		}
+		Ok(())
+	}
+
+	/// Notes where the line just printed ends, for the next [`Self::mark_gap`].
+	fn note_line(&mut self, offset: u64, length: usize) {
+		self.last_end = Some(offset.saturating_add(length as u64));
+	}
+
+	/// Prints the matches in `line`, as `-o` does: at each position the
+	/// longest match of any alternative, never an empty one. The engines
+	/// take the first alternative that matches there, so `-o -e 'q\?' -e zz`
+	/// printed nothing and `-oE 'a|ab'` printed `a`; each alternative is
+	/// searched alone to print what GNU prints.
 	fn print_only_matching(
 		&mut self,
 		line: &[u8],
@@ -1055,14 +1177,15 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 		let line = line.strip_suffix(&[self.opts.record.terminator]).unwrap_or(line);
 		let (matcher, opts) = (self.matcher, self.opts);
 		let mut next = std::mem::take(&mut self.next_matches);
-		// No pattern is searched in this line yet.
+		// No alternative is searched in this line yet.
 		next.clear();
-		let printed = for_each_nonempty_match_with(
+		let printed = for_each_match_with(
 			matcher,
 			line,
 			line_offset,
 			|start| {
-				let Some(engines) = opts.each_pattern.as_deref().and_then(EachPattern::engines) else {
+				let Some(engines) = opts.alternatives.as_deref().and_then(Alternatives::engines)
+				else {
 					return Ok(None);
 				};
 				if next.is_empty() {
@@ -1077,6 +1200,37 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 		);
 		self.next_matches = next;
 		printed
+	}
+
+	/// A line the search does not select: context the searcher reports, or a
+	/// matching line past `-m`'s count, which GNU prints as context
+	/// (`grep -n12m1 -e mid` prints the second match as `13-mid`). Returns
+	/// whether the search goes on.
+	fn context_record(
+		&mut self,
+		bytes: &[u8],
+		line_number: Option<u64>,
+		offset: u64,
+	) -> io::Result<bool> {
+		// Past `-m`'s count only the trailing context the count allows is
+		// printed; with none, the search stops at the selected line.
+		if self.after_left == Some(0) {
+			return Ok(false);
+		}
+		if !self.normal_output_is_suppressed() && !self.opts.only_matching && !self.binary_summary()
+		{
+			self.mark_gap(offset)?;
+			self.write_prefix(line_number, offset, b'-')?;
+			self.write_record(bytes)?;
+			self.note_line(offset, bytes.len());
+		}
+		if let Some(left) = &mut self.after_left {
+			*left -= 1;
+			if *left == 0 {
+				return Ok(false);
+			}
+		}
+		Ok(true)
 	}
 
 	fn normal_output_is_suppressed(&self) -> bool {
@@ -1100,6 +1254,16 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 		if self.binary && self.opts.binary_files == BinaryFiles::WithoutMatch {
 			return Ok(false);
 		}
+		// A line that `-m`'s count no longer reaches is trailing context, as
+		// it is for GNU: `grep -n12m1 -e mid` prints the second match as
+		// `13-mid` and stops at the end of that context. A count of zero -
+		// `-v` with a negative one - selects nothing at all.
+		if self.after_left.is_none() && self.opts.max_count == Some(self.match_count) {
+			self.after_left = Some(self.opts.after);
+		}
+		if self.after_left.is_some() {
+			return self.context_record(mat.bytes(), mat.line_number(), mat.absolute_byte_offset());
+		}
 		self.any_match = true;
 		self.match_count += 1;
 		if self.opts.quiet
@@ -1109,30 +1273,32 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 		{
 			return Ok(false);
 		}
-		if self.opts.count {
-			return Ok(true);
+		if !self.opts.count {
+			self.mark_gap(mat.absolute_byte_offset())?;
+			if self.opts.only_matching {
+				self.print_only_matching(mat.bytes(), mat.line_number(), mat.absolute_byte_offset())?;
+			} else {
+				self.write_prefix(mat.line_number(), mat.absolute_byte_offset(), b':')?;
+				self.write_record(mat.bytes())?;
+			}
+			self.note_line(mat.absolute_byte_offset(), mat.bytes().len());
 		}
-		if self.opts.only_matching {
-			self.print_only_matching(mat.bytes(), mat.line_number(), mat.absolute_byte_offset())?;
-		} else {
-			self.write_prefix(mat.line_number(), mat.absolute_byte_offset(), b':')?;
-			self.write_record(mat.bytes())?;
+		if self.opts.max_count == Some(self.match_count) {
+			// The search goes on only for the trailing context this line is
+			// allowed.
+			self.after_left = Some(self.opts.after);
+			return Ok(self.opts.after > 0);
 		}
 		Ok(true)
 	}
 
 	fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, io::Error> {
-		if self.normal_output_is_suppressed() || self.opts.only_matching || self.binary_summary() {
-			return Ok(true);
-		}
-		self.write_prefix(ctx.line_number(), ctx.absolute_byte_offset(), b'-')?;
-		self.write_record(ctx.bytes())?;
-		Ok(true)
+		self.context_record(ctx.bytes(), ctx.line_number(), ctx.absolute_byte_offset())
 	}
 
 	fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, io::Error> {
+		// `-o` prints no context line, and GNU still separates its groups.
 		if !self.normal_output_is_suppressed()
-			&& !self.opts.only_matching
 			&& !self.binary_summary()
 			&& let Some(separator) = &self.opts.group_separator
 		{
@@ -1162,11 +1328,12 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 			return Ok(());
 		}
 		if self.binary_summary() && self.any_match {
-			self.out.write_all(b"Binary file ")?;
-			self.out.write_all(self.display)?;
-			self.out.write_all(b" matches")?;
-			self.out.write_all(&[self.opts.record.terminator])?;
-			return self.flush_record();
+			// GNU 3.11 reports a binary file on standard error, so what a
+			// pipeline reads holds the matched text alone.
+			self.err.write_all(b"grep: ")?;
+			self.err.write_all(self.display)?;
+			self.err.write_all(b": binary file matches\n")?;
+			return Ok(());
 		}
 		if self.opts.files_with_matches {
 			if self.any_match {
@@ -1243,6 +1410,9 @@ struct Worker {
 	searcher: Searcher,
 	buf:      Vec<u8>,
 	out:      Vec<u8>,
+	/// What the search reports on standard error, kept apart from `out` so
+	/// the file's matches stay a pipeline's input.
+	err:      Vec<u8>,
 	opener:   Option<FileOpener>,
 	/// Reused for the path of each listed file.
 	path:     PathBuf,
@@ -1290,6 +1460,15 @@ impl Worker {
 			std::mem::take(&mut self.out)
 		}
 	}
+
+	/// The same for what the file's search reported on standard error.
+	fn take_err(&mut self) -> Vec<u8> {
+		if self.err.is_empty() {
+			Vec::new()
+		} else {
+			std::mem::take(&mut self.err)
+		}
+	}
 }
 
 /// The walked files of a directory operand, searched by index.
@@ -1322,6 +1501,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 			searcher: self.searcher.build(),
 			buf:      vec![0u8; READ_CHUNK],
 			out:      Vec::new(),
+			err:      Vec::new(),
 			opener:   self
 				.listed
 				.as_ref()
@@ -1333,8 +1513,13 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 	}
 
 	/// Classifies one file's search result; a broken pipe stops the search, any other error is reported per file.
-	fn finish(&self, display_path: &Path, searched: io::Result<bool>, out: Vec<u8>) -> FileSearch {
-		let mut err = Vec::new();
+	fn finish(
+		&self,
+		display_path: &Path,
+		searched: io::Result<bool>,
+		out: Vec<u8>,
+		mut err: Vec<u8>,
+	) -> FileSearch {
 		let mut had_error = false;
 		let matched = match searched {
 			Ok(matched) => Ok(matched),
@@ -1363,16 +1548,19 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		display: &[u8],
 		worker: &mut Worker,
 	) -> io::Result<bool> {
-		let Worker { searcher, buf, out, .. } = worker;
+		let Worker { searcher, buf, out, err, .. } = worker;
 		let terminator = bound_terminator(searcher, &self.matcher);
 		let mut sink = GrepSink {
 			out,
+			err,
 			matcher: &self.matcher,
 			display,
 			opts: &self.opts,
 			match_count: 0,
 			any_match: false,
 			binary: false,
+			last_end: None,
+			after_left: None,
 			next_matches: Vec::new(),
 		};
 		let mut search = searcher.search_push(&self.matcher, &mut sink);
@@ -1468,7 +1656,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 				let searched = self
 					.push_input(&mut input, display_path.as_os_str().as_encoded_bytes(), worker)
 					.await;
-				self.finish(display_path, searched, worker.take_out())
+				self.finish(display_path, searched, worker.take_out(), worker.take_err())
 			},
 			Err(error) => {
 				let mut err = Vec::new();
@@ -1790,7 +1978,11 @@ pub(crate) async fn read_pattern_file(fs: &pi_vfs::Fs, path: &Path) -> io::Resul
 	}
 }
 
-fn build_searcher(cli: &GrepArgs, opts: &Options, max_count: Option<u64>) -> SearcherBuilder {
+/// The searcher the whole search shares. `-m`'s count is NOT given to it:
+/// GNU prints the trailing context of the line that reaches the count, and
+/// a matching line inside that context as a context line, which the sink
+/// does; the searcher would stop at the count instead.
+fn build_searcher(cli: &GrepArgs, opts: &Options) -> SearcherBuilder {
 	let binary_detection = if cli.null_data || opts.binary_files == BinaryFiles::Text {
 		BinaryDetection::none()
 	} else if opts.binary_files == BinaryFiles::WithoutMatch {
@@ -1805,7 +1997,6 @@ fn build_searcher(cli: &GrepArgs, opts: &Options, max_count: Option<u64>) -> Sea
 		.after_context(opts.after)
 		.invert_match(cli.invert)
 		.binary_detection(binary_detection)
-		.max_matches(max_count)
 		.heap_limit(Some(SEARCH_HEAP_LIMIT));
 	if cli.null_data {
 		builder.line_terminator(LineTerminator::byte(b'\0'));
@@ -1825,14 +2016,18 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 ) -> io::Result<bool> {
 	let mut searcher = builder.build();
 	let terminator = bound_terminator(&searcher, matcher);
+	let mut err = Vec::new();
 	let mut sink = GrepSink {
 		out,
+		err: &mut err,
 		matcher,
 		display: &display,
 		opts,
 		match_count: 0,
 		any_match: false,
 		binary: false,
+		last_end: None,
+		after_left: None,
 		next_matches: Vec::new(),
 	};
 	let mut search = searcher.search_push(matcher, &mut sink);
@@ -1851,8 +2046,10 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 		}
 	}
 	search.finish()?;
+	let matched = sink.any_match;
 	host.flush_output().await?;
-	Ok(sink.any_match)
+	let _ = host.stderr.write_all(&err);
+	Ok(matched)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1865,9 +2062,8 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 	follow_links: bool,
 	rules: &PathRules,
 	opts: &Options,
-	max_count: Option<u64>,
 ) -> i32 {
-	let builder = build_searcher(cli, opts, max_count);
+	let builder = build_searcher(cli, opts);
 	let fs = host.vfs();
 	let (_guard, outer) = HaltGuard::new();
 	let mut out = host.stdout_writer();
@@ -1946,11 +2142,15 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 				DirectoryAction::Skip => {},
 				DirectoryAction::Read => {
 					had_error = true;
-					let _ = writeln!(
-						host.stderr,
-						"grep: {}: Is a directory",
-						operand.display()
-					);
+					// `-s` silences this message as it silences the others;
+					// `grep -s zz . f1` prints the match and exits 2.
+					if !opts.no_messages {
+						let _ = writeln!(
+							host.stderr,
+							"grep: {}: Is a directory",
+							operand.display()
+						);
+					}
 				},
 			},
 			Ok(metadata) => {
@@ -2050,13 +2250,7 @@ impl AsyncUtility for Grep {
 		}));
 	}
 
-	let max_count = match resolve_max_count(&cli) {
-		Ok(max_count) => max_count,
-		Err(error) => {
-			let _ = writeln!(host.stderr, "grep: {error}");
-			return 2;
-		},
-	};
+	let max_count = resolve_max_count(&cli);
 	let rules = match build_path_rules(host, &cli, &matches).await {
 		Ok(rules) => rules,
 		Err(error) => {
@@ -2078,7 +2272,7 @@ impl AsyncUtility for Grep {
 		&& !zero_patterns
 		&& patterns.iter().all(|pattern| pattern.is_empty());
 	let selects_no_record =
-		(zero_patterns && !cli.invert) || inverted_empty_pattern || max_count == Some(0);
+		(zero_patterns && !cli.invert) || inverted_empty_pattern || cli.max_count == Some(0);
 	let (files_with_matches, files_without_match) = resolve_file_list_modes(&matches);
 	if selects_no_record && (cli.quiet || !files_without_match) {
 		return 1;
@@ -2099,25 +2293,20 @@ impl AsyncUtility for Grep {
 		},
 	};
 	let output_suppressed = cli.count || files_with_matches || files_without_match || cli.quiet;
-	// Where the patterns together match empty, `-o` prints the longest match
-	// of one pattern alone; see `GrepSink::print_only_matching`. The lines
-	// `-v` selects hold no match, and `-c`, `-l`, `-L` and `-q` print none.
+	// At each position `-o` prints the longest match of any alternative; see
+	// `GrepSink::print_only_matching`. The lines `-v` selects hold no match,
+	// and `-c`, `-l`, `-L` and `-q` print none.
 	let prints_matches = cli.only_matching && !cli.invert && !output_suppressed;
-	let each_pattern = if prints_matches && patterns.len() > 1 {
-		// An empty pattern can only match empty, which is never printed, so it
-		// is not compiled alone.
-		let mut each = std::mem::take(&mut patterns);
-		each.retain(|pattern| !pattern.is_empty());
-		(!each.is_empty())
-			.then(|| Arc::new(EachPattern { patterns: each, spec, engines: OnceLock::new() }))
-	} else {
-		None
-	};
+	let alternatives = prints_matches
+		.then(|| pattern_alternatives(&patterns, spec))
+		.flatten()
+		.map(|patterns| Arc::new(Alternatives { patterns, spec, engines: OnceLock::new() }));
 	patterns.clear();
 
-	let suppress_context = output_suppressed || cli.only_matching;
-	let (before, after) = if suppress_context {
-		(0, 0)
+	// `-o` prints no context line, and GNU still groups its output by the
+	// context counts, printing a `--` between two groups.
+	let (before, after, context_given) = if output_suppressed {
+		(0, 0, false)
 	} else {
 		resolve_context(&cli, &matches)
 	};
@@ -2150,8 +2339,12 @@ impl AsyncUtility for Grep {
 		group_separator: resolve_group_separator(&cli, &matches),
 		line_buffered: cli.line_buffered,
 		binary_files: resolve_binary_files(&cli, &matches),
+		max_count,
+		// The searcher reports a break only where a context count is larger
+		// than zero; GNU prints one wherever a context option was given.
+		mark_gaps: context_given && before == 0 && after == 0,
 		refuse_output_file,
-		each_pattern,
+		alternatives,
 	};
 	let follow_links = resolve_follow_links(&cli, &matches);
 
@@ -2165,7 +2358,6 @@ impl AsyncUtility for Grep {
 			follow_links,
 			&rules,
 			&opts,
-			max_count,
 		)
 		.await,
 		Engine::Pcre(matcher) => execute_search(
@@ -2177,7 +2369,6 @@ impl AsyncUtility for Grep {
 			follow_links,
 			&rules,
 			&opts,
-			max_count,
 		)
 		.await,
 	}
@@ -2840,9 +3031,10 @@ mod tests {
 		let (code, out, err) = run(&["-A", "1", "fail)"], "ok\n(1 fail)\nnext\n").await;
 		assert_eq!(code, 0, "{err}");
 		assert_eq!(out, "(1 fail)\nnext\n");
-		let (code, _, err) = run(&["-E", "fail)"], "fail)\n").await;
-		assert_eq!(code, 2);
-		assert!(err.contains("grep:"));
+		// GNU grep 3.11 takes an unmatched `)` in an ERE literally:
+		// `printf 'fail)\n' | grep -cE 'fail)'` counts the line and exits 0.
+		let (code, out, err) = run(&["-cE", "fail)"], "fail)\nplain\n").await;
+		assert_eq!((code, out.as_str()), (0, "1\n"), "{err}");
 		// In a BRE a bare `+` is a LITERAL, so `fo+` does not match `foooo`.
 		// This assertion previously expected `foooo`, which is ERE
 		// behaviour; `/usr/bin/grep -e 'fo+' -e 'bar)' -h` on this input
@@ -2879,10 +3071,10 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn repetition_with_no_operand_is_literal_in_bre_and_invalid_in_ere() {
-		// Measured against GNU/BSD grep 2.6.0 on the same fixture. Before
-		// this, every BRE row below returned 5 - the whole file - because
-		// `^+` reached the engine as an operator and compiled to `(?:^)+`,
+	async fn repetition_with_no_operand_is_literal_in_a_bre_and_dropped_in_an_ere() {
+		// Measured against /usr/bin/grep 3.11 on this fixture. Before this,
+		// every BRE row below returned 5 - the whole file - because `^+`
+		// reached the engine as an operator and compiled to `(?:^)+`,
 		// matching the empty string at every line start.
 		let input = "alpha\n+added\n-removed\n context\n+another\n";
 		for (pattern, want) in
@@ -2900,32 +3092,45 @@ mod tests {
 			assert_eq!(out, want, "pattern {pattern}");
 		}
 
-		// ERE rejects it outright, as the real grep does, rather than
-		// silently accepting a repeated anchor. The anchor breaks adjacency
-		// to an earlier atom too: `a^+` repeats `^`, not `a`.
-		for pattern in ["^+", "a^+", "a$*"] {
-			let (code, _, err) = run(&["-Ec", pattern], input).await;
-			assert_eq!(code, 2, "-E {pattern:?} must be rejected");
-			assert!(err.contains("grep:"), "{pattern}: {err}");
+		// An ERE drops the operator instead, with a warning of its own:
+		// `grep -cE '^+'` counts every line and `grep -cE '*x'` the lines
+		// holding an `x`. An anchor breaks adjacency to an earlier atom too,
+		// so `a^+` repeats the anchor and can never match.
+		for (pattern, want) in
+			[("^+", "5\n"), ("^*", "5\n"), ("^?", "5\n"), ("*x", "1\n"), ("a^+", "0\n"), ("a$*", "3\n")]
+		{
+			let (code, out, err) = run(&["-Ec", pattern], input).await;
+			assert!(code == 0 || code == 1, "-E {pattern}: {err}");
+			assert_eq!(out, want, "-E {pattern}");
 		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn no_operand_brace_interval_is_rejected_through_grep() {
-		// Covered here rather than only in the translator, because the failure
-		// mode was invisible at that level: `^\{2\}` translated to `^{2}`,
-		// which `grep-regex` ACCEPTS as `(?:^){2}` and matches at every line
-		// start, so the whole file came back with exit 0.
+	async fn an_interval_with_no_operand_is_the_text_itself_in_a_bre() {
+		// Measured: `printf '{1,4}\n' | grep -c '\{1,4\}'` is 1 and the same
+		// pattern counts no line of the fixture below, so the interval is the
+		// text, neither an operator nor an error. Emitting the operator let
+		// `grep-regex` compile `^{2}` as `(?:^){2}`, which matches at every
+		// line start, so the whole file came back with exit 0.
 		let input = "alpha\n+added\n-removed\n context\n+another\n";
-		for pattern in [r"^\{2\}", r"^\{1,4\}", r"\{1,4\}", r"\(\{2\}\)", r"a\|\{2\}"] {
+		for pattern in [r"^\{2\}", r"^\{1,4\}", r"\{1,4\}", r"\(\{2\}\)"] {
 			let (code, out, err) = run(&["-c", pattern], input).await;
-			assert_eq!(code, 2, "{pattern} must be rejected, got {out:?}");
-			assert!(err.contains("repetition-operator operand invalid"), "{pattern}: {err}");
+			assert_eq!((code, out.as_str()), (1, "0\n"), "{pattern}: {err}");
 		}
+		let (code, out, err) = run(&["-c", r"\{1,4\}"], "x{1,4}y\nplain\n").await;
+		assert_eq!((code, out.as_str()), (0, "1\n"), "{err}");
 		// With an operand it is an ordinary quantifier and still works.
-		let (code, out, err) = run(&["-c", r"a\{1,2\}"], input).await;
-		assert_eq!(code, 0, "{err}");
-		assert_eq!(out, "3\n");
+		for pattern in [r"a\{1,2\}", r"a\|\{2\}"] {
+			let (code, out, err) = run(&["-c", pattern], input).await;
+			assert_eq!((code, out.as_str()), (0, "3\n"), "{pattern}: {err}");
+		}
+		// A `\{` an atom precedes must open an interval: GNU refuses
+		// `grep 'a\{1'` with "Unmatched \{".
+		for pattern in [r"a\{1", r"a\{x", r"a\{"] {
+			let (code, out, err) = run(&["-c", pattern], input).await;
+			assert_eq!((code, out.as_str()), (2, ""), "{pattern}");
+			assert!(err.contains("Unmatched \\{"), "{pattern}: {err}");
+		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2944,25 +3149,23 @@ mod tests {
 		let (code, out, err) = run(&["-c", "^{"], input).await;
 		assert_eq!(code, 0, "{err}");
 		assert_eq!(out, "2\n");
-
-		// NOT asserted here, and a known divergence: `-E '{a}'` and `-E 'a{'`
-		// are literals to GNU grep but `regex` rejects them in its own parser,
-		// which it did before this operand check existed. Making those literal
-		// means rewriting ERE patterns rather than validating them.
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn unsupported_backreference_falls_back_to_the_users_own_text() {
-		// `grep-regex` cannot compile a back-reference, so the pattern is
-		// matched literally. That literal must be what the user typed: after
-		// translation the pattern reads `(a)\1`, and escaping THAT made
-		// `\(a\)\1` match the text `(a)\1` instead of `\(a\)\1`.
-		let (code, out, err) = run(&["-c", r"\(a\)\1"], "x\\(a\\)\\1y\nnope\n").await;
-		assert_eq!(code, 0, "{err}");
-		assert_eq!(out, "1\n", "fallback must match the original pattern text");
-		let (code, out, _) = run(&["-c", r"\(a\)\1"], "x(a)\\1y\nnope\n").await;
-		assert_eq!(code, 1, "translated text must not be what is matched");
-		assert_eq!(out, "0\n");
+	async fn a_back_reference_is_run_by_the_pcre_engine() {
+		// `grep-regex` cannot run a back-reference at all, so the pattern is
+		// compiled with PCRE2 and gives GNU's answer: `grep -c '\(a\)\1'`
+		// counts the lines holding a doubled `a`, not the lines holding the
+		// text of the pattern.
+		let (code, out, err) = run(&["-c", r"\(a\)\1"], "aa\nnope\n").await;
+		assert_eq!((code, out.as_str()), (0, "1\n"), "{err}");
+		let (code, out, err) = run(&["-cE", r"(a)\1"], "aa\nnope\n").await;
+		assert_eq!((code, out.as_str()), (0, "1\n"), "{err}");
+		let (code, out, err) = run(&["-c", r"\(a\)\1"], "x(a)\\1y\nnope\n").await;
+		assert_eq!((code, out.as_str()), (1, "0\n"), "the pattern's own text is not what matches: {err}");
+		// A back-reference to no group is refused, as GNU refuses it.
+		let (code, out, _) = run(&["-c", r"\1"], "x\n").await;
+		assert_eq!((code, out.as_str()), (2, ""));
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -3048,16 +3251,18 @@ mod tests {
 			assert_eq!(code, 0, "-E {pattern}: {err}");
 			assert_eq!(out, want, "-E {pattern}");
 		}
-
-		// The two brace patterns real grep REFUSES must stay refused. A `{`
-		// followed by a digit is an attempted interval: unterminated, it is
-		// "braces not balanced", and with no operand it is "repetition-operator
-		// operand invalid". Escaping those would convert a diagnosed mistake
-		// into a silent literal match.
-		for pattern in ["a{1,2", "{1}"] {
-			let (code, out, _) = run(&["-Ec", pattern], input).await;
-			assert_eq!(code, 2, "-E {pattern} must stay an error, got {out:?}");
-		}
+		// An unterminated interval is the text itself to GNU grep 3.11
+		// (`grep -cE 'a{1,2'` counts the lines holding `a{1,2`), and an
+		// interval with nothing to repeat is dropped with a warning, so
+		// `{1}` matches every line.
+		let (code, out, err) = run(&["-Ec", "a{1,2"], input).await;
+		assert_eq!((code, out.as_str()), (1, "0\n"), "{err}");
+		let (code, out, err) = run(&["-Ec", "{1}"], input).await;
+		assert_eq!((code, out.as_str()), (0, "7\n"), "{err}");
+		// An interval whose bounds run backwards stays an error, as it is
+		// for GNU ("Invalid content of \\{\\}").
+		let (code, out, _) = run(&["-Ec", "a{2,1}"], input).await;
+		assert_eq!((code, out.as_str()), (2, ""));
 	}
 
 	/// Every expectation is GNU grep 3.11 on the same line: its count, `-o`
