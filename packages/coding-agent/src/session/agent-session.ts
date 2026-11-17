@@ -2679,6 +2679,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			xdev: config.xdev,
 			setActiveToolNames: config.setActiveToolNames,
 			baseSystemPrompt: this.agent.state.systemPrompt,
+			operatorPromptDigest: config.operatorPromptDigest,
 			skills: config.skills,
 			skillWarnings: config.skillWarnings,
 			skillsSettings: config.skillsSettings,

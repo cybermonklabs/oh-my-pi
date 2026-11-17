@@ -195,6 +195,12 @@ interface SessionToolsOptions {
 	xdev?: XdevState;
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	baseSystemPrompt: string[];
+	/**
+	 * Digest of the prompt inputs the operator gives explicitly (custom prompt, template, appended text), or
+	 * undefined when they cannot be compared. A resumed transcript's stored prompt is sent again only under the
+	 * digest it was stored with (see `SessionTools.#restoreTranscriptPrompt`).
+	 */
+	operatorPromptDigest?: string;
 	skills?: Skill[];
 	skillWarnings?: SkillWarning[];
 	skillsSettings?: SkillsSettings;
@@ -290,6 +296,21 @@ const SKILL_NOTICE_MESSAGE_TYPE = "skill-notice";
 /** Custom entry holding the digest of the base prompt the branch's primary model calls are built from. */
 const SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE = "system-prompt-digest";
 
+/** Custom entry holding the base prompt blocks a {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record names. */
+const SYSTEM_PROMPT_CUSTOM_TYPE = "system-prompt";
+
+/** Data of a {@link SYSTEM_PROMPT_CUSTOM_TYPE} entry: a prompt a resumed process may send again. */
+interface StoredSystemPrompt {
+	/** Digest of {@link blocks}, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
+	digest: string;
+	/** Base prompt blocks, before a per-turn hook override. */
+	blocks: string[];
+	/** Top-level tools active when the blocks were stored. */
+	toolNames: string[];
+	/** {@link SessionToolsOptions.operatorPromptDigest} of the process that stored them. */
+	operatorDigest: string;
+}
+
 /**
  * Least time between two rediscoveries started by `skill://` names no loaded skill owns, so a typo
  * read in a loop (a shell resolving one URL per spawned command) costs one pass per interval
@@ -313,6 +334,20 @@ function samePromptBlocks(left: readonly string[], right: readonly string[]): bo
 export function promptDigestOfEntry(entry: SessionEntry): string | undefined | null {
 	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE) return null;
 	return typeof entry.data === "string" ? entry.data : undefined;
+}
+
+function isStringList(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every(item => typeof item === "string");
+}
+
+/** The prompt a branch entry stores, or `undefined` when it is no such record or a malformed one. */
+function storedPromptOfEntry(entry: SessionEntry): StoredSystemPrompt | undefined {
+	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_CUSTOM_TYPE || !isRecord(entry.data)) {
+		return undefined;
+	}
+	const { digest, blocks, toolNames, operatorDigest } = entry.data;
+	if (typeof digest !== "string" || typeof operatorDigest !== "string") return undefined;
+	return isStringList(blocks) && isStringList(toolNames) ? { digest, blocks, toolNames, operatorDigest } : undefined;
 }
 
 /**
@@ -441,6 +476,14 @@ export class SessionTools {
 	#recordedDigestScan: { branch: readonly SessionEntry[]; scanned: number; digest: string | undefined } | undefined;
 	/** {@link currentPromptDigest} for the base prompt array it hashed. */
 	#currentPromptDigest: { base: readonly string[]; digest: string } | undefined;
+	/** {@link SessionToolsOptions.operatorPromptDigest}. */
+	readonly #operatorPromptDigest: string | undefined;
+	/** {@link #baseSystemPrompt} is the restored transcript's stored prompt; see {@link #restoreTranscriptPrompt}. */
+	#basePromptRestored = false;
+	/** Newest prompt a branch view stores for each digest, and how much of it was scanned (as {@link #recordedDigestScan}). */
+	#storedPromptScan:
+		| { branch: readonly SessionEntry[]; scanned: number; prompts: Map<string, StoredSystemPrompt> }
+		| undefined;
 	/**
 	 * Dynamic (`xd://`) devices the model has already been told are mounted.
 	 * Seeded lazily from persisted history on resume (see
@@ -584,12 +627,14 @@ export class SessionTools {
 		if (this.#xdev) this.#xdev.decorateExecution = tool => this.#wrapToolForAcpPermission(tool);
 		this.#setActiveToolNames = options.setActiveToolNames;
 		this.#baseSystemPrompt = options.baseSystemPrompt;
+		this.#operatorPromptDigest = options.operatorPromptDigest;
 		const restoredReply = this.#latestReply();
 		const restoredPromptDigest = restoredReply && this.recordedPromptDigest();
 		this.#restoredTranscript =
 			restoredReply && restoredPromptDigest
 				? { reply: restoredReply, promptDigest: restoredPromptDigest }
 				: undefined;
+		this.#restoreTranscriptPrompt();
 		this.#skills = options.skills ?? [];
 		this.#promptSkills = this.#skills;
 		this.#skillWarnings = options.skillWarnings ?? [];
@@ -1621,8 +1666,10 @@ export class SessionTools {
 				}
 			}
 			if (rebuiltSystemPrompt && rebuiltSignature) {
-				// The restored transcript was sent with this prompt under the inherited cache key.
-				if (this.#lastAppliedToolSignature !== undefined && !restoresTranscriptPrompt) {
+				// The restored transcript was sent with this prompt under the inherited cache key. A prompt
+				// restored from the branch was too, so replacing it with another drops the key.
+				const committed = this.#lastAppliedToolSignature !== undefined || this.#basePromptRestored;
+				if (committed && !restoresTranscriptPrompt) {
 					this.#host.clearInheritedProviderPromptCacheKey();
 				}
 				this.#baseSystemPrompt = rebuiltSystemPrompt;
@@ -1760,34 +1807,103 @@ export class SessionTools {
 		this.recordPromptDigest(this.#replyPromptDigests.get(reply));
 	}
 
-	/** Records `digest` on the current branch unless it is already the branch's newest record. */
+	/**
+	 * Records `digest` on the current branch unless it is already the branch's
+	 * newest record, and stores the blocks it names (see {@link #storePromptBlocks}).
+	 */
 	recordPromptDigest(digest: string | undefined): void {
-		if (digest !== undefined && digest !== this.recordedPromptDigest()) {
+		if (digest === undefined) return;
+		if (digest !== this.recordedPromptDigest()) {
 			this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE, digest);
 		}
+		this.#storePromptBlocks(digest);
+	}
+
+	/**
+	 * Stores the base prompt blocks `digest` names on the current branch, once
+	 * per digest, for a resumed process to send again (see
+	 * {@link #restoreTranscriptPrompt}). Only the current base is at hand: a
+	 * reply produced under an older one (a forced rebuild committed while it
+	 * streamed) leaves its digest without blocks. Nothing reads them for a model
+	 * that does not bind its prefix, or when the operator inputs cannot be
+	 * compared, so nothing is stored then.
+	 */
+	#storePromptBlocks(digest: string): void {
+		const operatorDigest = this.#operatorPromptDigest;
+		if (operatorDigest === undefined || this.#host.model()?.thinking?.prefixBinding !== true) return;
+		if (this.#storedPrompt(digest) !== undefined || digest !== this.currentPromptDigest()) return;
+		const stored: StoredSystemPrompt = {
+			digest,
+			blocks: [...this.baseOfSystemPrompt(this.#host.agent.state.systemPrompt)],
+			toolNames: this.getActiveToolNames(),
+			operatorDigest,
+		};
+		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_CUSTOM_TYPE, stored);
+	}
+
+	/** The newest prompt the current branch stores for `digest`. */
+	#storedPrompt(digest: string): StoredSystemPrompt | undefined {
+		const branch = this.#host.sessionManager.getBranchView();
+		let scan = this.#storedPromptScan;
+		if (scan?.branch !== branch) {
+			scan = { branch, scanned: 0, prompts: new Map() };
+			this.#storedPromptScan = scan;
+		}
+		for (; scan.scanned < branch.length; scan.scanned++) {
+			const stored = storedPromptOfEntry(branch[scan.scanned]);
+			if (stored) scan.prompts.set(stored.digest, stored);
+		}
+		return scan.prompts.get(digest);
+	}
+
+	/**
+	 * Starts a resumed transcript from the prompt its newest reply was sent
+	 * with, when the branch stores it and this process built another one from
+	 * the same operator inputs. The rest of a startup build is raced against
+	 * deadlines or read from caches another process filled (skill descriptions,
+	 * context files, the workspace tree, tools that register late), and a changed
+	 * prompt makes a prefix-bound model write the whole cached conversation
+	 * again and drop its replayed thinking. What this build would change then
+	 * waits, as it does mid-session, on the frozen prompt's notices or a rebuild
+	 * that changes the prompt anyway. Models that do not bind their prefix keep
+	 * the fresh build: they rebuild freely mid-session as well.
+	 */
+	#restoreTranscriptPrompt(): void {
+		const restored = this.#restoredTranscript;
+		const operatorDigest = this.#operatorPromptDigest;
+		if (!restored || operatorDigest === undefined || this.#host.model()?.thinking?.prefixBinding !== true) return;
+		if (systemPromptDigest(this.#baseSystemPrompt) === restored.promptDigest) return;
+		const stored = this.#storedPrompt(restored.promptDigest);
+		if (stored?.operatorDigest !== operatorDigest || systemPromptDigest(stored.blocks) !== stored.digest) return;
+		this.#baseSystemPrompt = stored.blocks;
+		this.#basePromptRestored = true;
+		this.#applyAgentSystemPrompt(stored.blocks);
+		// The transcript's requests carried the stored roster: the next prompt announces what differs now.
+		this.#notifyToolRosterDelta(stored.toolNames, this.getActiveToolNames());
 	}
 
 	/** Drops retained transcript references when the session is disposed. */
 	releaseRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
 		this.#recordedDigestScan = undefined;
+		this.#storedPromptScan = undefined;
 	}
 
 	/**
 	 * What an implicit prompt rebuild must keep when the model binds signed
-	 * thinking to its prompt prefix. `"free"`: no prompt is committed yet, the
-	 * model does not bind, or the transcript holds no reply. `"frozen"`: the
-	 * transcript may be bound to the current prompt. Otherwise the newest reply is
-	 * the restored one and no primary model call has run: a resumed process builds
-	 * its base prompt before tools that register late (extension tools, MCP
-	 * servers), so a rebuild may commit only when it reproduces the prompt the
-	 * transcript was sent with. A transcript restored without a recorded digest,
-	 * or switched in later, stays frozen.
+	 * thinking to its prompt prefix. `"free"`: the model does not bind, no
+	 * prompt is committed yet (neither a rebuild nor a restored transcript
+	 * prompt), or the transcript holds no reply. `"frozen"`: the transcript may
+	 * be bound to the current prompt. Otherwise the newest reply is the restored
+	 * one and no primary model call has run: a resumed process builds its base
+	 * prompt before tools that register late (extension tools, MCP servers), so
+	 * a rebuild may commit only when it reproduces the prompt the transcript was
+	 * sent with. A transcript restored without a recorded digest, or switched in
+	 * later, stays frozen.
 	 */
 	#implicitRebuildBinding(): "free" | "frozen" | { promptDigest: string } {
-		if (this.#lastAppliedToolSignature === undefined || this.#host.model()?.thinking?.prefixBinding !== true) {
-			return "free";
-		}
+		if (this.#host.model()?.thinking?.prefixBinding !== true) return "free";
+		if (this.#lastAppliedToolSignature === undefined && !this.#basePromptRestored) return "free";
 		const latest = this.#latestReply();
 		if (latest === undefined) return "free";
 		return latest === this.#restoredTranscript?.reply ? this.#restoredTranscript : "frozen";

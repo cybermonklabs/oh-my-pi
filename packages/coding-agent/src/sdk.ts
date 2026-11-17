@@ -5105,6 +5105,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// primary agent gets in its system prompt, so the read-only reviewer judges
 		// against the user's standing project rules instead of advising blind.
 		const advisorContextPrompt = formatAdvisorContextPrompt(contextFiles);
+		// The prompt inputs the operator gives explicitly: a resumed transcript's stored prompt is sent again only
+		// while they are unchanged (`SessionTools`). A prompt function cannot be compared, so it never is.
+		const operatorPromptDigest =
+			typeof options.systemPrompt === "function"
+				? undefined
+				: Bun.hash
+						.wyhash(
+							JSON.stringify([
+								options.systemPrompt,
+								options.customSystemPrompt,
+								options.systemPromptTemplate,
+								options.appendSystemPrompt,
+							]),
+						)
+						.toString(16);
 		// Owned only when this session created the manager; subagents receive a
 		// parent's manager via `options.mcpManager` and MUST NOT disconnect it.
 		// Advisor spend recorded before this resume is restored off the critical
@@ -5196,6 +5211,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			advisorStreamFn: settingsAwareStreamFn,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			operatorPromptDigest,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,
 			presentationPinnedToolNames,

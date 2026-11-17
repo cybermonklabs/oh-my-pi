@@ -9,6 +9,7 @@
 ### Fixed
 
 - Past a provider's image limit, each new image no longer drops one more old image and rewrites almost the whole cached prompt: the limit now drops the oldest images down to half of it at once and keeps those drops, so the following requests read the cached prompt
+- Resuming a session in a new process (`--resume`) no longer rewrites the whole cached prompt on Claude models that bind thinking to it: the first request sends the system prompt the conversation was last sent with, even when the new process would build it differently (skill descriptions, context files, late tools), unless the custom or appended system prompt changed
 
 ## [18.18.6] - 2026-11-09
 
