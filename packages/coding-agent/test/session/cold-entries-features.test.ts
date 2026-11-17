@@ -23,6 +23,7 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	CURRENT_SESSION_VERSION,
@@ -191,6 +192,7 @@ interface SessionOptions {
 	interrupted?: boolean;
 	relay?: boolean;
 	todoEdits?: boolean;
+	todoEditsAfterCut?: boolean;
 	olderTurns?: number;
 }
 
@@ -206,7 +208,10 @@ interface SessionOptions {
  * cut too: before `c1`, before `c2`, before `c3` and on the other branch.
  * With `todoEdits`, the user edited the to-do list on each branch: `te` on
  * the other branch (followed by `b3`), then `ta` after `bs`, before the cut,
- * the newest snapshot of the current path. With `olderTurns`, that many more
+ * the newest snapshot of the current path. With `todoEditsAfterCut`, the
+ * user edited the list twice after the cut: `e1` while `u8` ran (before
+ * `a8`), then `e2` while `u10` ran, followed by `a10`, the leaf; `e2` is the
+ * newest snapshot of the current path. With `olderTurns`, that many more
  * rounds lie before `u6`, each a prompt (`hu…`), a `probe` call (`ha…`), its
  * result (`hr…`), a failed reply (`he…`) and a custom message (`hn…`).
  */
@@ -330,10 +335,20 @@ function sessionText(id: string, cwd: string, options: SessionOptions = {}): str
 	assistant("a7", "u7");
 	compaction("c3", "a7", "u7");
 	user("u8", "c3");
-	assistant("a8", "u8");
+	let beforeA8 = "u8";
+	if (options.todoEditsAfterCut) {
+		add("custom", "e1", "u8", { customType: USER_TODO_EDIT_CUSTOM_TYPE, data: { phases: phases("e1") } });
+		beforeA8 = "e1";
+	}
+	assistant("a8", beforeA8);
 	if (options.interrupted) {
 		user("u9", "a8");
 		assistant("a9", "u9", { id: "call_probe", name: "probe", arguments: { value: "again" } });
+	}
+	if (options.todoEditsAfterCut) {
+		user("u10", "a8");
+		add("custom", "e2", "u10", { customType: USER_TODO_EDIT_CUSTOM_TYPE, data: { phases: phases("e2") } });
+		assistant("a10", "e2");
 	}
 	const slot = serializeTitleSlot({ title: TITLE, source: "user", updatedAt: TIMESTAMP });
 	return slot + lines.map(line => `${JSON.stringify(line)}\n`).join("");
@@ -707,6 +722,51 @@ describe("features that read older entries, on a session whose older bodies are 
 			for (const [target, label] of [
 				["b3", "te"],
 				["a8", "ta"],
+			]) {
+				await coldSession.navigateTree(target);
+				await wholeSession.navigateTree(target);
+				expect(wire(coldSession.getTodoPhases())).toEqual(wire(phases(label)));
+				expect(wire(coldSession.getTodoPhases())).toEqual(wire(wholeSession.getTodoPhases()));
+			}
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
+		"restores the to-do list after a move in the tree to an entry after the cut whose newest snapshot is a cold to-do edit, reading it back from the store, and the live list after a move back, as a session over every entry does",
+		async () => {
+			// A to-do edit from the cut on that is not the newest snapshot is cold; a move to an entry before
+			// the newer edit that restored nothing, or the live list, would hand the user the wrong plan, and a
+			// move back would lose the live one.
+			const { cold, whole } = await writeBoth({ todoEditsAfterCut: true });
+			const coldSession = (await startSession(cold)).session;
+			const wholeSession = (await startSession(whole)).session;
+			const coldness = (id: string) => {
+				const entry = cold.getEntry(id);
+				if (!entry) throw new Error(`${id} was not loaded`);
+				return isColdEntry(entry);
+			};
+			expect({ e1: coldness("e1"), e2: coldness("e2") }).toEqual({ e1: true, e2: false });
+			expect(wire(coldSession.getTodoPhases())).toEqual(wire(phases("e2")));
+			expect(wire(coldSession.getTodoPhases())).toEqual(wire(wholeSession.getTodoPhases()));
+
+			// The manager's move, read as the to-do tracker reads the branch before the context is rebuilt.
+			const branchList = (manager: SessionManager) => wire(getLatestTodoPhasesFromEntries(manager.getBranch()));
+			const before = cold.coldStoreStats().materializations;
+			cold.branch("a8");
+			whole.branch("a8");
+			expect(branchList(cold)).toEqual(wire(phases("e1")));
+			expect(cold.coldStoreStats().materializations).toBeGreaterThan(before);
+			expect(branchList(cold)).toEqual(branchList(whole));
+			cold.branch("a10");
+			whole.branch("a10");
+			expect(branchList(cold)).toEqual(wire(phases("e2")));
+			expect(branchList(cold)).toEqual(branchList(whole));
+
+			// The session's move in the tree, which rebuilds the context and then the to-do list.
+			for (const [target, label] of [
+				["a8", "e1"],
+				["a10", "e2"],
 			]) {
 				await coldSession.navigateTree(target);
 				await wholeSession.navigateTree(target);
