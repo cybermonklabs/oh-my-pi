@@ -2651,9 +2651,9 @@ export class TurnRecovery {
 	 * set, in the chain the switch would pin and then the model's own chain. It
 	 * skips depleted and reserve candidates, passes over a key read that throws,
 	 * and holds nothing back for a refusal credit. The context it fits is the
-	 * retry's. One rule differs: under `retry.usageReservePolicy: "fail-closed"`
-	 * that check picks nothing for a depleted model (it throws), while the walk
-	 * still switches to what the search finds, under every reserve policy.
+	 * retry's. Unlike that check, which picks nothing for a depleted model under
+	 * `retry.usageReservePolicy: "fail-closed"` (it throws), the walk switches to
+	 * what the search finds under every reserve policy.
 	 *
 	 * When that search finds nothing, a live refusal credit counts as absent:
 	 * the candidates its hold passed over are searched the same way, in chain
