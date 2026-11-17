@@ -791,9 +791,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		}
 
 		it("keeps holding the same-provider Claude models for a live credit whose targets are not in the chain", async () => {
-			// No credit target is in the chain, so no target is seen spent: the
-			// credit stays live and the walk passes over the Claude model that
-			// cannot redeem it.
+			// No fallback the walk reaches is spent, so the credit stays live and the
+			// walk passes over the Claude model that cannot redeem it.
 			const { run, requestedModels } = await runCreditRefusal(chainOf(OTHER_CLAUDE), {});
 
 			expect(requestedModels).toEqual([formatModelString(FABLE), formatModelString(FABLE)]);
@@ -839,10 +838,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("steps a refusal to the next model when the spent target's sibling target cannot hold the context", async () => {
-			// Opus 5's window here cannot hold the conversation, so the walk would
-			// not try it. With Opus 4.8 spent, no target is left that the walk
-			// would try: the credit holds nothing back, and the walk goes on in
-			// chain order as with no credit.
+			// Opus 5's window here cannot hold the conversation. The walk sends no
+			// request to the spent Opus 4.8 and takes what the check before a model
+			// call would pick from it: Sonnet 4.5, next in the chain, so Opus 5 is not
+			// reached and changes nothing.
 			const sharedRegistry = modelRegistry;
 			const modelsConfigPath = path.join(tempDir.path(), "models-small-opus-5.yml");
 			await Bun.write(

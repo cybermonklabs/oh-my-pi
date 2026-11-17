@@ -2172,7 +2172,7 @@ export class TurnRecovery {
 		currentSelector: string,
 		currentModel: Model,
 		signal: AbortSignal,
-	): Promise<{ role: string; selector: RetryFallbackSelector; apiKey: string } | undefined> {
+	): Promise<(RetryFallbackEntry & { apiKey: string }) | undefined> {
 		return this.#searchKeyedRetryFallback(
 			this.#retryFallbackEntries(
 				this.retryFallbackChainKeys(currentSelector, currentModel),
@@ -2180,7 +2180,7 @@ export class TurnRecovery {
 				currentModel,
 			),
 			() => signal.aborted || !modelsAreEqual(this.#host.model(), currentModel),
-			candidateModel => this.#host.contextFitsModel(candidateModel),
+			undefined,
 			signal,
 		);
 	}
@@ -2201,16 +2201,17 @@ export class TurnRecovery {
 	/**
 	 * The check before a model call and the fallback walk share this search. It
 	 * answers the first entry that is not suppressed, has configured auth, fits
-	 * the effort ceiling and `contextFits`, reads neither depleted nor at the
-	 * reserve, and gives a key, with that key. A key read that throws passes
-	 * over the entry. Undefined when no entry passes, or once `stale()` is true.
+	 * the effort ceiling and the context without `excludedMessage`, reads
+	 * neither depleted nor at the reserve, and gives a key, with that key. A key
+	 * read that throws passes over the entry. Undefined when no entry passes, or
+	 * once `stale()` is true.
 	 */
 	async #searchKeyedRetryFallback(
 		entries: Iterable<RetryFallbackEntry>,
 		stale: () => boolean,
-		contextFits: (candidateModel: Model) => boolean,
+		excludedMessage: AssistantMessage | undefined,
 		signal: AbortSignal,
-	): Promise<{ role: string; selector: RetryFallbackSelector; apiKey: string } | undefined> {
+	): Promise<(RetryFallbackEntry & { apiKey: string }) | undefined> {
 		const ceiling = this.#host.thinkingLevelCeiling();
 		for (const { role, selector: candidate } of entries) {
 			if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
@@ -2220,7 +2221,7 @@ export class TurnRecovery {
 			if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
 			// Skip a candidate whose window cannot hold the live context so we
 			// never switch onto an oversized request (issue #8065).
-			if (!contextFits(candidateModel)) continue;
+			if (!this.#host.contextFitsModel(candidateModel, excludedMessage)) continue;
 			const candidateHealth = await this.#readCandidateUsage(candidateModel, stale, signal);
 			if (candidateHealth === "stale") return undefined;
 			if (candidateHealth?.state === "depleted" || candidateHealth?.state === "reserve") continue;
@@ -2409,9 +2410,10 @@ export class TurnRecovery {
 		// Read once, so one walk applies one rule to every candidate.
 		const usageAwareFallback = cfgRetryUsageAwareFallback.get(this.#host.settings);
 		const generation = this.#host.promptGeneration();
-		// The usage reads of this walk share one controller, made at the first
-		// read. It is the retry controller while a read runs, so abortRetry()
-		// stops the read. A stale read ends the walk with no switch.
+		// The usage reads of this walk, and the searches after a spent fallback
+		// (their key reads too), share one controller, made at the first one. It
+		// is the retry controller while one runs, so abortRetry() stops it. A
+		// stale read or search ends the walk with no switch.
 		let usageReadController: AbortController | undefined;
 		const usageReadStale = (): boolean =>
 			usageReadController?.signal.aborted === true ||
@@ -2556,8 +2558,8 @@ export class TurnRecovery {
 						});
 						// When that search finds nothing, a live refusal credit counts as
 						// absent: the candidates its hold passed over are searched the same
-						// way, in chain order. When neither finds one, the turn ends with
-						// the failed request's error.
+						// way, in chain order. When neither finds one, the walk switches to
+						// no model, as when no candidate passes.
 						for (const entries of [
 							this.#retryFallbackEntries(spentRoles, spentSelector, candidate),
 							heldEntries,
@@ -2567,11 +2569,7 @@ export class TurnRecovery {
 								this.#searchKeyedRetryFallback(
 									entries,
 									usageReadStale,
-									candidateModel =>
-										this.#host.contextFitsModel(
-											candidateModel,
-											options?.preserveFailedTurn ? undefined : failedMessage,
-										),
+									options?.preserveFailedTurn ? undefined : failedMessage,
 									signal,
 								),
 							);
