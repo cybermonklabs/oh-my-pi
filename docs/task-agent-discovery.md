@@ -7,6 +7,7 @@ It covers runtime behavior as implemented today, including precedence, invalid-d
 ## Implementation files
 
 - [`src/task/discovery.ts`](../packages/coding-agent/src/task/discovery.ts)
+- [`src/task/discovery-snapshots.ts`](../packages/coding-agent/src/task/discovery-snapshots.ts)
 - [`src/task/agents.ts`](../packages/coding-agent/src/task/agents.ts)
 - [`src/task/types.ts`](../packages/coding-agent/src/task/types.ts)
 - [`src/task/index.ts`](../packages/coding-agent/src/task/index.ts)
@@ -230,7 +231,7 @@ A missing name fails preflight with `Unknown agent "...". Available: ...`; no su
 
 ### Description vs execution-time discovery
 
-`TaskTool.create()` memoizes discovery by resolved working directory plus the complete effective extension-root configuration when building the model-facing tool description. Each description read also includes the user-tagged model agents frozen into the current base prompt surface (see [user-tagged model agents](#user-tagged-model-agents)) rather than the live set, so tagging a model mid-session cannot mutate the provider tool prefix. Execution rediscovers agents and merges the live session agents, so the runtime set can differ from the earlier description if agent or extension files changed mid-session. Blocking behavior is determined after policy resolution rather than from a stale description-time agent object.
+`TaskTool.create()` memoizes discovery by resolved working directory plus the complete effective extension-root configuration and publishes each settled scan; an explicit rescan (`refreshAgentDiscovery`: creating an agent in the agents hub, `/marketplace` and ACP plugin reloads) publishes a new one. In a session, the model-facing description lists the scan frozen into the current base prompt surface, and the user-tagged model agents frozen there too (see [user-tagged model agents](#user-tagged-model-agents)), rather than the live sets, so neither a rescan nor tagging a model mid-session can mutate the provider tool prefix. Agents a rescan added or dropped arrive as a hidden `task-agents` system notice on the next user turn; the next base-prompt rebuild absorbs the latest scan into the description. Execution rediscovers agents and merges the live session agents, so a newly discovered agent can be spawned at once, and the runtime set can differ from the description if agent or extension files changed mid-session. Blocking behavior is determined after policy resolution rather than from a stale description-time agent object.
 
 ## Model and structured-output precedence
 
@@ -278,7 +279,7 @@ Grants come from the operator's settings or an SDK host's settings instance; a p
 
 The operator's own files stay trusted: the global config, `--config` files and user-level agent files grant as written, and anything able to edit them can change grants like any other setting. The gate covers only calls that pass `model`; a call without it routes through `task.agentModelOverrides`, agent frontmatter and `modelRoles`, project layers included, as before.
 
-When per-call selection is enabled for a surface, the task/eval tool descriptions list approved role models and the narrowing allowlist. Provider-qualified role values are listed as configured, without checking availability; bare values are resolved through the current registry to exact `provider/model-id` selectors and omitted without one. Glob role values grant nothing and are not listed. The advertisement uses the same literal allowlist comparison as dispatch.
+When per-call selection is enabled for a surface, the task/eval tool descriptions list approved role models and the narrowing allowlist. Provider-qualified role values are listed as configured, without checking availability; bare values are resolved through the current registry to exact `provider/model-id` selectors and omitted without one. Glob role values grant nothing and are not listed. The advertisement uses the same literal allowlist comparison as dispatch. In a session, the list is frozen into the base prompt surface like the agent lists: a role or allowlist edit mid-session approves at once, but reaches the model as a hidden `per-call-models` system notice on the next user turn, restating the whole list, instead of rewriting the tool descriptions; the next base-prompt rebuild absorbs it.
 
 A `model` for an agent with a `task.agentModelOverrides` entry fails preflight with a conflict error, so the operator's override is never silently replaced. A `model` for a mention agent whose tag names a level fails the same way, even when it repeats the tagged selector, because per-call selection would cap the user's chosen effort at `task.maxEffort` ([effort level suffix](#effort-level-suffix)). Per-call `model` is not supported for the bundled seance agent, whose own `model` overrides its source session's saved model as before. A project or user agent that shadows the `seance` name is an ordinary agent: its `model` is a per-call `model`, held to every rule here.
 

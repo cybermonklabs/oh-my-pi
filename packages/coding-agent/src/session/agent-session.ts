@@ -277,6 +277,7 @@ import { prewarmSubagentWorker } from "../thread/subagent-worker";
 import { SubagentSpawnSignal } from "../thread/subagent-spawn-signal";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { AgentDefinition } from "../task/types";
+import type { PerCallModelAdvertisement } from "../task/model-approval";
 import type { ModelMention } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
 import { ModelMentionRegistry, type ResolvedModelMention } from "./model-mentions";
 import { parseCommandArgs } from "../utils/command-args";
@@ -7672,6 +7673,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#tools.advertisedSessionAgents;
 	}
 
+	/**
+	 * Discovered agents frozen into the task description (see
+	 * {@link SessionTools.advertisedDiscoveredAgents}). A later rescan rides a
+	 * hidden notice so the provider cache prefix stays intact.
+	 */
+	getAdvertisedDiscoveredAgents(): readonly AgentDefinition[] | undefined {
+		return this.#tools.advertisedDiscoveredAgents;
+	}
+
+	/**
+	 * Per-call model approvals frozen into the task and eval descriptions (see
+	 * {@link SessionTools.advertisedPerCallModels}). A later change rides a
+	 * hidden notice so the provider cache prefix stays intact.
+	 */
+	getAdvertisedPerCallModels(): PerCallModelAdvertisement | undefined {
+		return this.#tools.advertisedPerCallModels;
+	}
+
 	/** Cancels the local rollout-memory startup owned by this session. */
 	cancelLocalMemoryStartup(): void {
 		this.#memory.cancelLocalMemoryStartup();
@@ -9675,8 +9694,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				: undefined;
 			const evalPreludeNotice = isUserQueuedMessage(message) ? this.#tools.takeEvalPreludeNotice() : undefined;
 			const sessionAgentNotice = isUserQueuedMessage(message) ? this.#tools.takeSessionAgentNotice() : undefined;
+			const taskAgentNotice = isUserQueuedMessage(message) ? this.#tools.takeTaskAgentNotice() : undefined;
+			const perCallModelNotice = isUserQueuedMessage(message) ? this.#tools.takePerCallModelNotice() : undefined;
 			const skillNotice = isUserQueuedMessage(message) ? this.#tools.takeSkillNotice() : undefined;
-			if (xdevMountNotice || toolRosterNotice || evalPreludeNotice || sessionAgentNotice || skillNotice) {
+			if (
+				xdevMountNotice ||
+				toolRosterNotice ||
+				evalPreludeNotice ||
+				sessionAgentNotice ||
+				taskAgentNotice ||
+				perCallModelNotice ||
+				skillNotice
+			) {
 				messages.splice(
 					xdevMountNoticeIndex,
 					0,
@@ -9684,6 +9713,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					...(toolRosterNotice ? [toolRosterNotice] : []),
 					...(evalPreludeNotice ? [evalPreludeNotice] : []),
 					...(sessionAgentNotice ? [sessionAgentNotice] : []),
+					...(taskAgentNotice ? [taskAgentNotice] : []),
+					...(perCallModelNotice ? [perCallModelNotice] : []),
 					...(skillNotice ? [skillNotice] : []),
 				);
 			}

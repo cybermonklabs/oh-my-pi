@@ -31,10 +31,15 @@ import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import type { MemoryBackendStartOptions, MemoryPromptPreparation } from "../memory-backend/types";
+import { publishedAgentDiscovery } from "../task/discovery-snapshots";
+import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "../task/model-approval";
+import { perCallModelEnabled } from "../task/settings";
 import type { AgentDefinition } from "../task/types";
 import evalPreludeNoticePrompt from "../prompts/system/eval-prelude-notice.md" with { type: "text" };
+import perCallModelNoticePrompt from "../prompts/system/per-call-model-notice.md" with { type: "text" };
 import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md" with { type: "text" };
 import skillNoticePrompt from "../prompts/system/skill-notice.md" with { type: "text" };
+import taskAgentNoticePrompt from "../prompts/system/task-agent-notice.md" with { type: "text" };
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
@@ -292,6 +297,8 @@ const TOOL_ROSTER_NOTICE_MESSAGE_TYPE = "tool-roster-notice";
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 const EVAL_PRELUDE_NOTICE_MESSAGE_TYPE = "eval-prelude-notice";
 const SKILL_NOTICE_MESSAGE_TYPE = "skill-notice";
+const TASK_AGENT_NOTICE_MESSAGE_TYPE = "task-agent-notice";
+const PER_CALL_MODEL_NOTICE_MESSAGE_TYPE = "per-call-model-notice";
 
 /** Custom entry holding the digest of the base prompt the branch's primary model calls are built from. */
 const SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE = "system-prompt-digest";
@@ -385,6 +392,23 @@ interface SessionAgentNoticeDetails {
 	removed: string[];
 }
 
+/** Discovered agent names added/removed by one hidden {@link TASK_AGENT_NOTICE_MESSAGE_TYPE} message. */
+interface TaskAgentNoticeDetails {
+	added: string[];
+	removed: string[];
+}
+
+/** Whether `value` is the approvals a {@link PER_CALL_MODEL_NOTICE_MESSAGE_TYPE} message restated. */
+function isPerCallModelAdvertisement(value: unknown): value is PerCallModelAdvertisement {
+	return (
+		isRecord(value) &&
+		Array.isArray(value.roles) &&
+		value.roles.every(entry => isRecord(entry) && typeof entry.role === "string" && isStringList(entry.patterns)) &&
+		isStringList(value.allowlist) &&
+		typeof value.parentModelWithheld === "boolean"
+	);
+}
+
 /**
  * Prompt-affecting state frozen at each base rebuild. Tools render their
  * provider-visible text from this snapshot instead of live settings, so
@@ -400,6 +424,13 @@ interface PromptSurface {
 	sessionAgents: readonly AgentDefinition[];
 	/** Tool names the eval description lists as callable from cells. */
 	evalToolNames: readonly string[];
+	/**
+	 * Discovered agents listed in the task description: the latest discovery scan for the
+	 * session's cwd and extension roots; undefined when no task tool scanned them.
+	 */
+	discoveredAgents: readonly AgentDefinition[] | undefined;
+	/** Per-call models the task and eval descriptions approve; undefined while per-call models are off. */
+	perCallModels: PerCallModelAdvertisement | undefined;
 }
 
 /**
@@ -840,6 +871,22 @@ export class SessionTools {
 		return (this.#promptSurfaceScope.getStore() ?? this.#promptSurface).evalToolNames;
 	}
 
+	/**
+	 * Discovered agents the task description advertises (see {@link #promptSurface});
+	 * the candidate inside a rebuild frame. A rescan since rides {@link takeTaskAgentNotice}.
+	 */
+	get advertisedDiscoveredAgents(): readonly AgentDefinition[] | undefined {
+		return (this.#promptSurfaceScope.getStore() ?? this.#promptSurface).discoveredAgents;
+	}
+
+	/**
+	 * Per-call models the task and eval descriptions approve (see {@link #promptSurface});
+	 * the candidate inside a rebuild frame. A change since rides {@link takePerCallModelNotice}.
+	 */
+	get advertisedPerCallModels(): PerCallModelAdvertisement | undefined {
+		return (this.#promptSurfaceScope.getStore() ?? this.#promptSurface).perCallModels;
+	}
+
 	/** Derives the candidate surface from live state without publishing it. */
 	#derivePromptSurface(): PromptSurface {
 		return {
@@ -847,6 +894,14 @@ export class SessionTools {
 			evalPreludes: this.#host.evalPreludes(),
 			sessionAgents: this.#host.sessionAgents(),
 			evalToolNames: this.getEvalBridgeToolNames(),
+			discoveredAgents: publishedAgentDiscovery(
+				this.#host.sessionManager.getCwd(),
+				this.#host.effectiveExtensionRoots(),
+			),
+			perCallModels:
+				perCallModelEnabled(this.#host.settings, "task") || perCallModelEnabled(this.#host.settings, "eval")
+					? getPerCallModelAdvertisement(this.#host.settings, this.#host.model(), this.#host.modelRegistry)
+					: undefined,
 		};
 	}
 	/** Drops cached per-session ACP `allow_always`/`reject_always` decisions. */
@@ -1594,15 +1649,17 @@ export class SessionTools {
 					this.#promptSurfaceScope.run(surface, () =>
 						this.#computeAppliedToolSignature(validToolNames, tools, mountedSignatureTools),
 					);
-				// Eval-prelude, eval tool-name and model-mention changes alone never
-				// trigger a rebuild: they ride their hidden notices. The trigger keeps
-				// the committed sets; a rebuild caused by anything else absorbs the
-				// live ones.
+				// Eval-prelude, eval tool-name, model-mention, discovered-agent and
+				// per-call model changes alone never trigger a rebuild: they ride
+				// their hidden notices. The trigger keeps the committed sets; a
+				// rebuild caused by anything else absorbs the live ones.
 				const triggerSignature = computeSignature({
 					...candidate,
 					evalPreludes: this.#promptSurface.evalPreludes,
 					sessionAgents: this.#promptSurface.sessionAgents,
 					evalToolNames: this.#promptSurface.evalToolNames,
+					discoveredAgents: this.#promptSurface.discoveredAgents,
+					perCallModels: this.#promptSurface.perCallModels,
 				});
 				const freezeImplicitPromptRefresh =
 					!forcePromptRefresh &&
@@ -2194,6 +2251,82 @@ export class SessionTools {
 				removed,
 			}),
 			details: { added: added.map(agent => agent.name), removed },
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		};
+	}
+
+	/**
+	 * Builds the hidden notice reconciling the discovered agents the task
+	 * description advertises with the latest discovery scan. Delivered with the
+	 * next user prompt instead of rewriting the task description, so a rescan
+	 * mid-session (an agent file added through the agents hub, a plugin reload)
+	 * keeps the provider cache prefix intact. Spawning reads its own fresh scan,
+	 * so a new agent works before and after the notice.
+	 *
+	 * Known agents are the committed base snapshot, then every such notice still
+	 * in context, applied in order — mirroring {@link takeSessionAgentNotice}.
+	 */
+	takeTaskAgentNotice(): CustomMessage<TaskAgentNoticeDetails> | undefined {
+		const committed = this.#promptSurface.discoveredAgents;
+		const live = publishedAgentDiscovery(this.#host.sessionManager.getCwd(), this.#host.effectiveExtensionRoots());
+		// Without a committed scan the description lists the latest one itself.
+		if (!committed || !live) return undefined;
+		const known = new Set(committed.map(agent => agent.name));
+		for (const message of this.#host.agent.state.messages) {
+			if (message.role !== "custom" || message.customType !== TASK_AGENT_NOTICE_MESSAGE_TYPE) continue;
+			const details = message.details;
+			if (!isRecord(details) || !Array.isArray(details.added) || !Array.isArray(details.removed)) continue;
+			for (const name of details.added) if (typeof name === "string") known.add(name);
+			for (const name of details.removed) if (typeof name === "string") known.delete(name);
+		}
+		const liveNames = new Set(live.map(agent => agent.name));
+		const added = live.filter(agent => !known.has(agent.name));
+		const removed = [...known].filter(name => !liveNames.has(name));
+		if (added.length === 0 && removed.length === 0) return undefined;
+		return {
+			role: "custom",
+			customType: TASK_AGENT_NOTICE_MESSAGE_TYPE,
+			content: prompt.render(taskAgentNoticePrompt, {
+				added: added.map(agent => ({ name: agent.name, description: agent.description })),
+				removed,
+			}),
+			details: { added: added.map(agent => agent.name), removed },
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		};
+	}
+
+	/**
+	 * Builds the hidden notice restating the per-call models the task and eval
+	 * descriptions approve, when the live approvals differ from the ones the
+	 * model last read: the committed base snapshot, or the newest such notice
+	 * still in context. Delivered with the next user prompt instead of rewriting
+	 * the descriptions, so an operator's role or allowlist edit mid-session keeps
+	 * the provider cache prefix intact. The list is restated whole because roles,
+	 * allowlist and the own-model clause change together; a notice that a later
+	 * rebuild outdated costs at most one restatement of what the descriptions list.
+	 */
+	takePerCallModelNotice(): CustomMessage<PerCallModelAdvertisement> | undefined {
+		const settings = this.#host.settings;
+		let known = this.#promptSurface.perCallModels;
+		// Without a committed snapshot the descriptions list the live approvals themselves.
+		if (!known || (!perCallModelEnabled(settings, "task") && !perCallModelEnabled(settings, "eval"))) {
+			return undefined;
+		}
+		for (const message of this.#host.agent.state.messages) {
+			if (message.role !== "custom" || message.customType !== PER_CALL_MODEL_NOTICE_MESSAGE_TYPE) continue;
+			if (isPerCallModelAdvertisement(message.details)) known = message.details;
+		}
+		const live = getPerCallModelAdvertisement(settings, this.#host.model(), this.#host.modelRegistry);
+		if (Bun.deepEquals(live, known)) return undefined;
+		return {
+			role: "custom",
+			customType: PER_CALL_MODEL_NOTICE_MESSAGE_TYPE,
+			content: prompt.render(perCallModelNoticePrompt, { ...live }),
+			details: live,
 			attribution: "agent",
 			display: false,
 			timestamp: Date.now(),
