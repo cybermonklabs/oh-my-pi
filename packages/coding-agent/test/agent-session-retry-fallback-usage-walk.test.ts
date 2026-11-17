@@ -310,6 +310,59 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
+		it("passes over a fallback whose key read fails after a spent fallback", async () => {
+			// The walk sends no request to the spent fallback and takes what the
+			// check before a model call would pick from it. That check passes over
+			// the next fallback, whose key read throws here, and raises nothing.
+			const thirdFallback = bundled("anthropic", "claude-opus-4-8");
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
+			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
+				if (model.provider === NEXT_FALLBACK.provider && model.id === NEXT_FALLBACK.id) {
+					throw new Error("credential command failed");
+				}
+				return getApiKey(model, sessionId, options);
+			});
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
+				walkSettings(PRIMARY, { "retry.fallbackChains": chainOf(FALLBACK, NEXT_FALLBACK, thirdFallback) }),
+			);
+
+			await runTurn(run.session, "Fail on the primary");
+
+			expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(thirdFallback)]);
+			expect(run.fallbacks).toEqual([formatModelString(thirdFallback)]);
+			expect(modelOf(run.session)).toBe(formatModelString(thirdFallback));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		it("switches to the model that only the spent fallback's own chain names", async () => {
+			// The walk's chain ends at the spent Codex model. The check before a
+			// model call would also read the Codex model's own chain, which names
+			// the same model on another provider.
+			authStorage.keys.setRuntime(CODEX.provider, `${CODEX.provider}-test-key`);
+			stubUsageReads({ [formatModelString(CODEX)]: depletedRead("usage") });
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
+				walkSettings(PRIMARY, {
+					"retry.fallbackChains": {
+						default: [formatModelString(CODEX)],
+						[`${CODEX.provider}/*`]: ["openai/*"],
+					},
+				}),
+			);
+
+			await runTurn(run.session, "Fail on the primary");
+
+			const sameModelElsewhere = `openai/${CODEX.id}`;
+			expect(requestedModels).toEqual([formatModelString(PRIMARY), sameModelElsewhere]);
+			expect(run.fallbacks).toEqual([sameModelElsewhere]);
+			expect(modelOf(run.session)).toBe(sameModelElsewhere);
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
 		it("ends the turn on the denial of the primary when its only fallback is spent", async () => {
 			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
@@ -609,16 +662,16 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			};
 		}
 
-		// Each order reaches the other Claude model by a different path: after the
-		// walk passes over the spent target, or before the walk reads the target.
-		// Once its only target is spent the credit holds nothing back, so the walk
-		// goes on in chain order as with no credit: another provider's model later
-		// in the chain does not take the turn ahead of the other Claude model.
-		for (const [order, chain] of [
-			["the target first", chainOf(CREDIT_TARGET, OTHER_CLAUDE)],
-			["the other model first", chainOf(OTHER_CLAUDE, CREDIT_TARGET)],
-			["the target first, another provider last", chainOf(CREDIT_TARGET, OTHER_CLAUDE, FALLBACK)],
-			["the other model first, another provider last", chainOf(OTHER_CLAUDE, CREDIT_TARGET, FALLBACK)],
+		// The walk sends no request to the spent target. It takes what the check
+		// before a model call would pick from the target: the model after it in
+		// the chain, which no credit holds back. With no model after the target,
+		// the credit counts as absent and the other Claude model, which the credit
+		// held back, answers.
+		for (const [order, chain, answer] of [
+			["the target first", chainOf(CREDIT_TARGET, OTHER_CLAUDE), OTHER_CLAUDE],
+			["the other model first", chainOf(OTHER_CLAUDE, CREDIT_TARGET), OTHER_CLAUDE],
+			["the target first, another provider last", chainOf(CREDIT_TARGET, OTHER_CLAUDE, FALLBACK), OTHER_CLAUDE],
+			["the other model first, another provider last", chainOf(OTHER_CLAUDE, CREDIT_TARGET, FALLBACK), FALLBACK],
 		] as const) {
 			it(`steps a refusal past its spent fallback-credit target to the next model (${order})`, async () => {
 				stubUsageReads({ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") });
@@ -669,10 +722,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				expect(requestedModels).toEqual([
 					formatModelString(FABLE),
 					formatModelString(FABLE),
-					formatModelString(OTHER_CLAUDE),
+					formatModelString(answer),
 				]);
-				expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
-				expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+				expect(run.fallbacks).toEqual([formatModelString(answer)]);
+				expect(modelOf(run.session)).toBe(formatModelString(answer));
 				expect(lastAssistant(run.session).stopReason).toBe("stop");
 			});
 		}
@@ -753,9 +806,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(refusal?.stopDetails?.type).toBe("refusal");
 		});
 
-		it("redeems the credit on the next target when the first target is spent", async () => {
-			// A usable target keeps the credit live: the walk passes over the spent
-			// target and the Claude model that cannot redeem the credit.
+		it("answers on the model after a spent first target, ahead of the next target", async () => {
+			// The walk sends no request to the spent target. The check before a model
+			// call would pick the model after it in the chain, which no credit holds
+			// back, so the other Claude model answers before Opus 5 is reached.
 			const { run, requestedModels } = await runCreditRefusal(
 				chainOf(CREDIT_TARGET, OTHER_CLAUDE, NEXT_CREDIT_TARGET),
 				{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
@@ -764,10 +818,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(requestedModels).toEqual([
 				formatModelString(FABLE),
 				formatModelString(FABLE),
-				formatModelString(NEXT_CREDIT_TARGET),
+				formatModelString(OTHER_CLAUDE),
 			]);
-			expect(run.fallbacks).toEqual([formatModelString(NEXT_CREDIT_TARGET)]);
-			expect(modelOf(run.session)).toBe(formatModelString(NEXT_CREDIT_TARGET));
+			expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
+			expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
@@ -818,13 +872,13 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("steps a refusal to the next model when the spent target's sibling target is over the effort ceiling", async () => {
-			// Opus 5 here supports no effort at or below the session's ceiling, so
-			// the walk would not try it. With Opus 4.8 spent, no target is left
-			// that the walk would try: the credit holds nothing back, and the walk
-			// goes on in chain order as with no credit. The catalog gives both Opus
-			// models the same efforts, so this registry gives Opus 5 none below
-			// xhigh; Opus 4.8 and Sonnet 4.5 each support an effort at or below
-			// the high ceiling.
+			// Opus 5 here supports no effort at or below the session's ceiling. The
+			// walk sends no request to the spent Opus 4.8 and takes what the check
+			// before a model call would pick from it: Sonnet 4.5, next in the
+			// chain, so Opus 5 is not reached and changes nothing. The catalog
+			// gives both Opus models the same efforts, so this registry gives Opus
+			// 5 none below xhigh; Opus 4.8 and Sonnet 4.5 each support an effort at
+			// or below the high ceiling.
 			const sharedRegistry = modelRegistry;
 			const modelsConfigPath = path.join(tempDir.path(), "models-xhigh-floor-opus-5.yml");
 			await Bun.write(
@@ -863,10 +917,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("steps a refusal to the next model when the spent target's sibling target has no key", async () => {
-			// Opus 5 has no key here, so the walk would not try it. With Opus 4.8
-			// spent, no target is left that the walk would try: the credit holds
-			// nothing back, and the walk goes on in chain order as with no credit.
-			// Every other model keeps its key.
+			// Opus 5 has no key here. The walk sends no request to the spent Opus
+			// 4.8 and takes what the check before a model call would pick from it:
+			// Sonnet 4.5, next in the chain, so Opus 5 is not reached and changes
+			// nothing. Every other model keeps its key.
 			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
 			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) =>
 				model.provider === NEXT_CREDIT_TARGET.provider && model.id === NEXT_CREDIT_TARGET.id
@@ -911,10 +965,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("reads no credit target's key for the credit when no target is spent", async () => {
-			// With no credit target spent the credit is live, and deciding that reads
-			// no key. The credit-target keys read are the walk's own: its key probe
-			// of Opus 4.8 and the switch onto it, as with no credit check. Opus 5,
-			// which the walk never reaches, has no key read.
+			// With no credit target spent, the key reads of the credit targets are
+			// the walk's own, as at the base: its key read of Opus 4.8 and the
+			// switch onto it. Opus 5, which the walk never reaches, has no key
+			// read.
 			const creditTargetKeyReads: string[] = [];
 			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
 			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
@@ -936,10 +990,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("steps a refusal to the next model when the spent target's sibling target fails its key read", async () => {
-			// Opus 5's key read throws here. With Opus 4.8 spent, deciding the credit
-			// counts Opus 5 as a target the walk would not try and raises nothing:
-			// the credit holds nothing back, and the walk switches to the other
-			// Claude model, which comes before Opus 5 in the chain.
+			// Opus 5's key read throws here. The walk sends no request to the spent
+			// Opus 4.8 and takes what the check before a model call would pick from
+			// it: Sonnet 4.5, next in the chain, so Opus 5's key is never read and
+			// nothing is raised.
 			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
 			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
 				if (model.provider === NEXT_CREDIT_TARGET.provider && model.id === NEXT_CREDIT_TARGET.id) {
@@ -962,13 +1016,11 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
-		it("ends the turn on the key-read error when the walk reaches the spent target's sibling target that fails its key read", async () => {
-			// Opus 5's key read throws here, and the walk reaches Opus 5 before the
-			// other Claude model. The walk reads that key in its own order and the
-			// error leaves the walk, as for any candidate whose key read throws: the
-			// turn ends on the refusal with no switch, and the session warns that its
-			// post-turn maintenance failed with that error.
-			const notices = vi.spyOn(AgentSession.prototype, "emitNotice");
+		it("passes over the target after the spent target when its key read fails, to the model after it", async () => {
+			// Opus 5's key read throws here, and Opus 5 follows the spent target in
+			// the chain. The walk sends no request to the spent target and takes what
+			// the check before a model call would pick from it. That check passes over
+			// Opus 5 and raises nothing, so the other Claude model answers.
 			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
 			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
 				if (model.provider === NEXT_CREDIT_TARGET.provider && model.id === NEXT_CREDIT_TARGET.id) {
@@ -981,17 +1033,33 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
 			);
 
-			expect(requestedModels).toEqual([formatModelString(FABLE), formatModelString(FABLE)]);
-			expect(run.fallbacks).toEqual([]);
-			expect(modelOf(run.session)).toBe(formatModelString(FABLE));
-			expect(notices).toHaveBeenCalledWith(
-				"warning",
-				"Post-turn maintenance failed: credential command failed",
-				"agent-end",
-			);
-			const refusal = run.session.getLastAssistantMessage();
-			expect(refusal?.stopReason).toBe("error");
-			expect(refusal?.stopDetails?.type).toBe("refusal");
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(OTHER_CLAUDE),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
+			expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		it("answers on the Claude model the credit held back when nothing follows a spent fallback", async () => {
+			// The live credit holds the other Claude model back, and the fallback
+			// after it is spent. The check before a model call would pick nothing
+			// from that fallback, so the credit counts as absent and the model it
+			// held back answers.
+			const { run, requestedModels } = await runCreditRefusal(chainOf(OTHER_CLAUDE, FALLBACK), {
+				[formatModelString(FALLBACK)]: depletedRead("usage"),
+			});
+
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(OTHER_CLAUDE),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
+			expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 	});
 

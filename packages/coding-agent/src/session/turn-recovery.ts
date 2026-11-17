@@ -42,6 +42,7 @@ import {
 	type ConfiguredThinkingLevel,
 	clampThinkingLevelToCeiling,
 	modelSupportsEffortCeiling,
+	resolveProvisionalAutoLevel,
 	resolveThinkingLevelForModel,
 } from "@oh-my-pi/pi-tui/thinking";
 import type { EditModeSetting } from "../edit/settings";
@@ -259,6 +260,12 @@ function isUsageSpent(health: ModelUsageHealth): boolean {
 		health.accounts.length > 0 &&
 		health.accounts.every(account => account.depletedBy === "usage")
 	);
+}
+
+/** A fallback candidate and the chain key it was found under. */
+interface RetryFallbackEntry {
+	role: string;
+	selector: RetryFallbackSelector;
 }
 
 /** Result shape shared with automatic maintenance recovery. */
@@ -2161,38 +2168,73 @@ export class TurnRecovery {
 	}
 
 	/** First keyed, eligible fallback candidate; undefined when none or when the walk went stale. */
-	async #findKeyedRetryFallback(
+	#findKeyedRetryFallback(
 		currentSelector: string,
 		currentModel: Model,
 		signal: AbortSignal,
 	): Promise<{ role: string; selector: RetryFallbackSelector; apiKey: string } | undefined> {
-		const stale = () => signal.aborted || !modelsAreEqual(this.#host.model(), currentModel);
-		const ceiling = this.#host.thinkingLevelCeiling();
-		for (const role of this.retryFallbackChainKeys(currentSelector, currentModel)) {
-			for (const candidate of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
-				if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
-				const resolved = resolveModelOverride([candidate.raw], this.#host.modelRegistry, this.#host.settings);
-				const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
-				if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
-				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
-				// Skip a candidate whose window cannot hold the live context so we
-				// never switch onto an oversized request (issue #8065).
-				if (!this.#host.contextFitsModel(candidateModel)) continue;
-				const candidateHealth = await this.#readCandidateUsage(candidateModel, stale, signal);
-				if (candidateHealth === "stale") return undefined;
-				if (candidateHealth?.state === "depleted" || candidateHealth?.state === "reserve") continue;
-				if (stale()) return undefined;
-				let apiKey: string | undefined;
-				try {
-					apiKey = await this.#host.modelRegistry.getApiKey(candidateModel, this.#host.sessionId(), { signal });
-				} catch {
-					if (stale()) return undefined;
-					continue;
-				}
-				if (stale()) return undefined;
-				if (!apiKey) continue;
-				return { role, selector: candidate, apiKey };
+		return this.#searchKeyedRetryFallback(
+			this.#retryFallbackEntries(
+				this.retryFallbackChainKeys(currentSelector, currentModel),
+				currentSelector,
+				currentModel,
+			),
+			() => signal.aborted || !modelsAreEqual(this.#host.model(), currentModel),
+			candidateModel => this.#host.contextFitsModel(candidateModel),
+			signal,
+		);
+	}
+
+	/** The candidates after `currentSelector` in each chain of `roles`, in order. */
+	*#retryFallbackEntries(
+		roles: string[],
+		currentSelector: string,
+		currentModel: Model,
+	): Generator<RetryFallbackEntry> {
+		for (const role of roles) {
+			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
+				yield { role, selector };
 			}
+		}
+	}
+
+	/**
+	 * The check before a model call and the fallback walk share this search. It
+	 * answers the first entry that is not suppressed, has configured auth, fits
+	 * the effort ceiling and `contextFits`, reads neither depleted nor at the
+	 * reserve, and gives a key, with that key. A key read that throws passes
+	 * over the entry. Undefined when no entry passes, or once `stale()` is true.
+	 */
+	async #searchKeyedRetryFallback(
+		entries: Iterable<RetryFallbackEntry>,
+		stale: () => boolean,
+		contextFits: (candidateModel: Model) => boolean,
+		signal: AbortSignal,
+	): Promise<{ role: string; selector: RetryFallbackSelector; apiKey: string } | undefined> {
+		const ceiling = this.#host.thinkingLevelCeiling();
+		for (const { role, selector: candidate } of entries) {
+			if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
+			const resolved = resolveModelOverride([candidate.raw], this.#host.modelRegistry, this.#host.settings);
+			const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
+			if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
+			if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
+			// Skip a candidate whose window cannot hold the live context so we
+			// never switch onto an oversized request (issue #8065).
+			if (!contextFits(candidateModel)) continue;
+			const candidateHealth = await this.#readCandidateUsage(candidateModel, stale, signal);
+			if (candidateHealth === "stale") return undefined;
+			if (candidateHealth?.state === "depleted" || candidateHealth?.state === "reserve") continue;
+			if (stale()) return undefined;
+			let apiKey: string | undefined;
+			try {
+				apiKey = await this.#host.modelRegistry.getApiKey(candidateModel, this.#host.sessionId(), { signal });
+			} catch {
+				if (stale()) return undefined;
+				continue;
+			}
+			if (stale()) return undefined;
+			if (!apiKey) continue;
+			return { role, selector: candidate, apiKey };
 		}
 		return undefined;
 	}
@@ -2376,60 +2418,21 @@ export class TurnRecovery {
 			this.#host.abortInProgress() ||
 			this.#host.promptGeneration() !== generation ||
 			!modelsAreEqual(this.#host.model(), sourceModel);
-		// Each candidate's usage is read at most once per walk, so the walk pass
-		// reuses what the credit-target pass read. A read that throws is kept as
-		// unknown usage (`undefined`). A stale read is not kept: it ends the walk.
-		const usageReads = new Map<string, ModelUsageHealth | undefined>();
-		const readWalkUsage = async (candidate: Model): Promise<ModelUsageHealth | "stale" | undefined> => {
-			const key = `${candidate.provider}/${candidate.id}`;
-			if (usageReads.has(key)) return usageReads.get(key);
+		const withUsageReadSignal = async <T>(read: (signal: AbortSignal) => Promise<T>): Promise<T> => {
 			usageReadController ??= new AbortController();
 			this.#retryAbortController?.abort();
 			this.#retryAbortController = usageReadController;
 			try {
-				const usage = await this.#readCandidateUsage(candidate, usageReadStale, usageReadController.signal);
-				if (usage !== "stale") usageReads.set(key, usage);
-				return usage;
+				return await read(usageReadController.signal);
 			} finally {
 				if (this.#retryAbortController === usageReadController) this.#retryAbortController = undefined;
 			}
 		};
-		function* chainEntries(recovery: TurnRecovery): Generator<{ role: string; selector: RetryFallbackSelector }> {
-			for (const role of recovery.retryFallbackChainKeys(currentSelector)) {
-				for (const selector of recovery.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
-					yield { role, selector };
-				}
-			}
-		}
-		// While a classifier refusal's fallback credit is live, the hold below
-		// passes over the same-provider Claude models that cannot redeem it. A
-		// credit cannot be redeemed on a target whose usage is spent, so with
-		// retry.usageAwareFallback on, the credit-target pass runs first. It takes
-		// each candidate that can redeem the credit through the walk pass's steps
-		// before the key probe (the effort ceiling, the context fit and the usage
-		// skip) and switches to nothing. A target that the usage skip passes over
-		// is noted as spent; a target that passes every step is kept, in chain
-		// order. The pass reads no key. With no target spent, the credit stays
-		// live and no key is read for it. With a target spent, the kept targets'
-		// keys are read in chain order until one gives a key: that target is one
-		// the walk would try, so the credit stays live. A key read that throws
-		// counts as no key and is not raised there; the walk pass reads that key
-		// again only if it reaches the target, and raises the error as it does
-		// for any candidate. When no kept target gives a key, the spent target
-		// leaves the credit absent, and the walk pass runs in chain order as with
-		// no credit. Deciding this before the walk pass chooses keeps chain order:
-		// a same-provider Claude model earlier in the chain comes before another
-		// provider's model after it.
-		const creditLive = (): boolean =>
-			creditHandle !== undefined && creditTargets.length > 0 && Date.now() < creditHandle.expiresAt;
-		const runCreditTargetPass = usageAwareFallback && options?.refusalWalk === true && creditLive();
-		// The credit targets that the credit-target pass keeps, in chain order.
-		const keptCreditTargets: Model[] = [];
-		let creditTargetSpent = false;
-		let creditTargetUsable = false;
-		let creditCountsAbsent = false;
-		for (const creditTargetPass of runCreditTargetPass ? [true, false] : [false]) {
-			for (const { role, selector } of chainEntries(this)) {
+		// The candidates the credit hold below passes over while a refusal's
+		// fallback credit is live, in chain order.
+		const heldEntries: RetryFallbackEntry[] = [];
+		for (const role of this.retryFallbackChainKeys(currentSelector)) {
+			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
 				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
 				// A refusal walk visits any one model at most once per turn. Without this a
 				// pair of chains naming each other alternates: each hop is a model the walk
@@ -2457,10 +2460,6 @@ export class TurnRecovery {
 					candidate.provider === failedMessage.provider &&
 					creditTargets.includes(candidate.id) &&
 					Date.now() < creditHandle.expiresAt;
-				// The credit-target pass takes only the candidates that can redeem the
-				// credit. Each goes on through the steps below up to the key probe, and
-				// the hold does not apply to it.
-				if (creditTargetPass && !canRedeemFallbackCredit) continue;
 				// Anthropic signatures and redacted blocks are model-bound, while the
 				// latest assistant response must remain byte-identical. While another
 				// attempt on the model that signed them is still allowed, prefer it to a
@@ -2483,7 +2482,9 @@ export class TurnRecovery {
 				// `Invalid signature in thinking block` 400 escalates to a retry that
 				// replays no thinking and succeeds, and the session stops replaying it
 				// afterwards.
-				const refusalKeepsCredit = options?.refusalWalk === true && creditLive() && !creditCountsAbsent;
+				const creditLive =
+					creditHandle !== undefined && creditTargets.length > 0 && Date.now() < creditHandle.expiresAt;
+				const refusalKeepsCredit = options?.refusalWalk === true && creditLive;
 				if (
 					(signerRetryRemains || refusalKeepsCredit) &&
 					!canRedeemFallbackCredit &&
@@ -2497,6 +2498,7 @@ export class TurnRecovery {
 							block.type === "redactedThinking",
 					)
 				) {
+					if (refusalKeepsCredit) heldEntries.push({ role, selector });
 					continue;
 				}
 				// A candidate whose effort floor exceeds the per-spawn ceiling would be
@@ -2506,29 +2508,6 @@ export class TurnRecovery {
 				// failed assistant is excluded only when retry removes it; preserved
 				// unexecuted-tool turns remain part of the request (issue #8065).
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
-					continue;
-				}
-				// With retry.usageAwareFallback on, skip a candidate whose usage is
-				// spent. A request to it gets a usage-limit answer, and key selection
-				// gives back a blocked account as a last resort, so the key probe
-				// below does not stop it. An account-policy, model-policy (plan) or
-				// 401 block is not spent usage: it lasts minutes rather than a quota
-				// window (60 s for a denial, 5 minutes after a failed OAuth refresh,
-				// select.ts OAUTH_REFRESH_FAILURE_BACKOFF_MS), and the refusal steps
-				// must still reach the provider's other accounts and models. The
-				// credit-target pass notes a target it skips here as spent.
-				if (usageAwareFallback) {
-					const candidateUsage = await readWalkUsage(candidate);
-					if (candidateUsage === "stale") return false;
-					if (candidateUsage && isUsageSpent(candidateUsage)) {
-						if (creditTargetPass) creditTargetSpent = true;
-						continue;
-					}
-				}
-				// The credit-target pass keeps a target that passes every step above
-				// and reads no key for it.
-				if (creditTargetPass) {
-					keptCreditTargets.push(candidate);
 					continue;
 				}
 				// A session restricted to an OAuth account pool throws for a provider
@@ -2541,6 +2520,77 @@ export class TurnRecovery {
 					if (!(error instanceof AIError.MissingApiKeyError)) throw error;
 				}
 				if (!apiKey) continue;
+				// With retry.usageAwareFallback on, the walk sends no request to a
+				// candidate whose usage is spent; the key read above does not stop it,
+				// since key selection gives back a blocked account as a last resort.
+				// An account-policy, model-policy (plan) or 401 block is not spent
+				// usage: it lasts minutes rather than a quota window, and the refusal
+				// steps must still reach the provider's other accounts and models.
+				if (usageAwareFallback) {
+					const candidateUsage = await withUsageReadSignal(signal =>
+						this.#readCandidateUsage(candidate, usageReadStale, signal),
+					);
+					if (candidateUsage === "stale") return false;
+					if (candidateUsage && isUsageSpent(candidateUsage)) {
+						// The walk switches instead to what the check before a model call
+						// would pick after a switch here. That check reads the spent model
+						// as depleted, which ends a reserve approval, and searches from the
+						// model's selector at the thinking level the switch would set, in
+						// the chain the switch would pin and then the model's own chain. It
+						// skips depleted and reserve candidates, passes over a key read
+						// that throws, and holds nothing back for a refusal credit. The
+						// context it fits is the retry's.
+						this.#usageReserveApproval = undefined;
+						const requestedThinkingLevel = selector.thinkingLevel ?? this.#host.configuredThinkingLevel();
+						const spentSelector = formatRetryFallbackSelector(
+							candidate,
+							requestedThinkingLevel === AUTO_THINKING
+								? clampThinkingLevelToCeiling(candidate, resolveProvisionalAutoLevel(candidate), ceiling)
+								: resolveThinkingLevelForModel(
+										candidate,
+										clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, ceiling),
+									),
+						);
+						const spentRoles = this.retryFallbackChainKeys(spentSelector, candidate, {
+							pinnedRole: this.#activeRetryFallback?.role ?? role,
+						});
+						// When that search finds nothing, a live refusal credit counts as
+						// absent: the candidates its hold passed over are searched the same
+						// way, in chain order. When neither finds one, the turn ends with
+						// the failed request's error.
+						for (const entries of [
+							this.#retryFallbackEntries(spentRoles, spentSelector, candidate),
+							heldEntries,
+						]) {
+							if (usageReadStale()) return false;
+							const found = await withUsageReadSignal(signal =>
+								this.#searchKeyedRetryFallback(
+									entries,
+									usageReadStale,
+									candidateModel =>
+										this.#host.contextFitsModel(
+											candidateModel,
+											options?.preserveFailedTurn ? undefined : failedMessage,
+										),
+									signal,
+								),
+							);
+							if (!found) continue;
+							// Like the check before a model call, this switch sets no credit
+							// redemption. A route found from the spent model, with no fallback
+							// active yet, records the walk's role, as the base's switch onto the
+							// spent model did before that check ran; a held candidate keeps its
+							// own walk role.
+							const appliedRole = entries === heldEntries || this.#activeRetryFallback ? found.role : role;
+							return this.applyRetryFallbackCandidate(appliedRole, found.selector, currentSelector, {
+								...options,
+								apiKey: found.apiKey,
+								reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
+							});
+						}
+						return false;
+					}
+				}
 				const previousEditMode = this.#host.resolveActiveEditMode();
 				const previousSystemPrompt = [...this.#host.agent.state.systemPrompt];
 				const previousTools = [...this.#host.agent.state.tools];
@@ -2571,22 +2621,6 @@ export class TurnRecovery {
 				}
 				return applied;
 			}
-			// Only with a target spent: a kept target that gives a key is one the
-			// walk would try.
-			if (creditTargetPass && creditTargetSpent) {
-				for (const target of keptCreditTargets) {
-					try {
-						if (await this.#host.modelRegistry.getApiKey(target, this.#host.sessionId())) {
-							creditTargetUsable = true;
-							break;
-						}
-					} catch {
-						// A key read that throws counts as no key. The walk pass raises
-						// the error only if it reaches this target.
-					}
-				}
-			}
-			if (creditTargetPass) creditCountsAbsent = creditTargetSpent && !creditTargetUsable;
 		}
 
 		return false;
