@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `redrawFrames()` draws an archive's frames again from its kept source text (`Archive.text`) with each frame's recorded font, ink, line repeat, layout, columns and rows, and returns the ones the caller's byte check accepts.
+
 ## [18.20.0] - 2026-11-12
 
 ### Added
