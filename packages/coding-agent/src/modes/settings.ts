@@ -19,6 +19,7 @@ import { WORD_COMPLETION_METHODS } from "@oh-my-pi/pi-tui/prompt/word-completion
 import { applyHyperlinkSetting } from "@oh-my-pi/pi-tui/render/hyperlink";
 import { setInlineImageMaxColumns, setInlineImageMaxRows } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setShimmerMode } from "@oh-my-pi/pi-tui/theme/shimmer";
+import { setReduceMotionLevel } from "@oh-my-pi/pi-tui/reduce-motion";
 import { setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "@oh-my-pi/pi-tui/theme/theme";
 import { DEFAULT_MAX_FPS, parseMaxFps, setMaxFps } from "@oh-my-pi/pi-tui/frame-rate";
 import { setMotionEffects } from "@oh-my-pi/pi-tui/motion-effects";
@@ -768,6 +769,25 @@ export const cfgDisplaySmoothStreaming = register({
 			"Reveal assistant text and streamed tool input smoothly while chunks arrive (Tern types assistant text out itself)",
 	},
 });
+
+export const cfgDisplayReduceMotion = register({
+	id: "display.reduceMotion",
+	type: "enum",
+	values: ["off", "on", "strict"] as const,
+	default: "off",
+	ui: {
+		tab: "appearance",
+		group: "Display",
+		label: "Reduce Motion",
+		description: "Freeze cosmetic terminal animations; strict also limits repaint frequency",
+		options: [
+			{ value: "off", label: "Off", description: "Use the normal animation cadence" },
+			{ value: "on", label: "On", description: "Freeze cosmetic animations" },
+			{ value: "strict", label: "Strict", description: "Freeze animations and limit repaints to 4 fps" },
+		],
+	},
+});
+effect(cfgDisplayReduceMotion, setReduceMotionLevel);
 
 export const cfgDisplayHideToolActivity = register({
 	id: "display.hideToolActivity",

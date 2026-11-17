@@ -56,6 +56,18 @@ export async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal |
 	}
 }
 
+/** A real macrotask turn, in which I/O runs: Bun's fake timers hold `setTimeout` and `Bun.sleep`, not a message event. */
+export function nextTask(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const channel = new MessageChannel();
+	channel.port1.onmessage = () => {
+		channel.port1.close();
+		resolve();
+	};
+	channel.port2.postMessage(null);
+	return promise;
+}
+
 export function createCodexModel(
 	id: string,
 	spec?: Partial<ModelSpec<"openai-codex-responses">>,

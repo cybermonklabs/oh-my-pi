@@ -170,6 +170,8 @@ try {
 						HOME: home,
 						USERPROFILE: home,
 						PI_CONFIG_DIR: ".omp",
+						// The global broker is this home's (globalRuntimeDir), not the test process's root.
+						OMP_CONFIG_ROOT: undefined,
 						OMP_PROFILE: profile,
 						OMP_DAEMON_IDLE_GRACE_MS: "200",
 						OMP_TEST_RELAY_URL: cdpUrl,
@@ -243,6 +245,8 @@ try {
 					HOME: home,
 					USERPROFILE: home,
 					PI_CONFIG_DIR: ".omp",
+					// The global broker is this home's (globalRuntimeDir), not the test process's root.
+					OMP_CONFIG_ROOT: undefined,
 					OMP_DAEMON_IDLE_GRACE_MS: "200",
 					OMP_TEST_FIRST_RELAY_URL: firstUrl,
 					OMP_TEST_SECOND_RELAY_URL: secondUrl,
@@ -804,6 +808,9 @@ async function runWithIsolatedBroker(
 			HOME: home,
 			USERPROFILE: home,
 			PI_CONFIG_DIR: ".omp",
+			// The global broker lives under this home's `.omp` (see globalRuntimeDir), not the
+			// config root the test preload gave this process, which every child would share.
+			OMP_CONFIG_ROOT: undefined,
 			OMP_DAEMON_IDLE_GRACE_MS: "200",
 			...env,
 		},

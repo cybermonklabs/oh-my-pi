@@ -286,9 +286,13 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 	return result;
 }
 
-// Eagerly parse the user's $HOME/.env and the current project's .env (from cwd)
-const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
-const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
+// Eagerly parse the user's $HOME/.env, the config root's .env, the agent dir's .env and the
+// current project's .env (from cwd). A test process reads neither of the first two: they are
+// the developer's own (an auth broker and its token, provider keys, a telemetry collector) and
+// would refill every name the test preload removed. Its agent dir and project are its own.
+const readsHomeDotenv = !isBunTestRuntime();
+const homeEnv = readsHomeDotenv ? parseEnvFile(path.join(os.homedir(), ".env")) : {};
+const piEnv = readsHomeDotenv ? parseEnvFile(path.join(getConfigRootDir(), ".env")) : {};
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
 const projectEnv = parseEnvFile(path.join(getProjectDir(), ".env"));
 
