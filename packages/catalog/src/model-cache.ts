@@ -5,7 +5,15 @@
 import type { Database } from "bun:sqlite";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { getModelDbPath, isSqliteCorruptionError, logger, openSqliteDatabaseSync, VERSION } from "@oh-my-pi/pi-utils";
+import {
+	getModelDbPath,
+	isSqliteCorruptionError,
+	logger,
+	openSqliteDatabaseSync,
+	runInSlices,
+	runToCompletion,
+	VERSION,
+} from "@oh-my-pi/pi-utils";
 import RULES from "./compat/rules.json" with { type: "json" };
 import type { Api, Model } from "./types";
 
@@ -242,6 +250,11 @@ function initializeDb(db: Database): void {
 	// re-enables ON just around its DELETE.
 	db.run("PRAGMA secure_delete = FAST");
 	db.run("PRAGMA journal_mode = WAL");
+	// The cache is regenerable, so WAL's NORMAL sync (fsync at checkpoints, not
+	// at every commit) is safe: a crash can drop the newest rows, which the next
+	// refresh writes again. FULL made each multi-MB commit fsync on the main
+	// thread, tens of milliseconds the event loop waited for.
+	db.run("PRAGMA synchronous = NORMAL");
 	db.run(`
 		CREATE TABLE IF NOT EXISTS model_cache (
 			provider_id TEXT PRIMARY KEY,
@@ -694,138 +707,200 @@ export function writeModelCache<TApi extends Api>(
 	restorableHeaderFallback?: Record<string, string>,
 ): void {
 	try {
-		invalidateReadRow(providerId, dbPath);
-		withModelCacheDb(dbPath, db => {
-			const headerOmittedModelIds: string[] = [];
-			const unrestorableHeaderModelIds: string[] = [];
-			const cachedModels: PersistedModel<TApi>[] = [];
-			const rejectedModelIds: string[] = [];
-			const staticById = new Map(staticHeaderSources.map(model => [model.id, model]));
-			for (const model of models) {
-				const cachedModel = toCachedModel(model);
-				if (!isMaterializedModel(cachedModel)) {
-					// One unreadable model must not make the whole row fail
-					// validation on read (which deletes it and refetches forever).
-					rejectedModelIds.push(model.id);
-					continue;
-				}
-				if (hasModelHeaders(model)) {
-					headerOmittedModelIds.push(model.id);
-					// Synthesized variants (e.g. Copilot `-1m`) have no same-id static
-					// entry; their headers come from the `requestModelId` base. Match
-					// against that source too, else they are wrongly flagged
-					// unrestorable and dropped on the next offline read (#6037, #6284).
-					const staticHeaderSource =
-						staticById.get(model.id) ?? (model.requestModelId ? staticById.get(model.requestModelId) : undefined);
-					// A model with no static source is still restorable when its live
-					// headers equal a trusted provider-wide fallback that the reader can
-					// re-derive without persisting it. This keeps reference-less models
-					// with constant or configured headers alive offline.
-					const matchesStatic = model.resolveHeaders
-						? staticHeaderSource?.resolveHeaders === model.resolveHeaders
-						: staticHeaderSource
-							? headersEqual(model.headers, staticHeaderSource.headers)
-							: headersEqual(model.headers, restorableHeaderFallback);
-					if (!matchesStatic) {
-						unrestorableHeaderModelIds.push(model.id);
-					}
-				}
-				cachedModels.push(cachedModel);
-			}
-			if (rejectedModelIds.length > 0) {
-				logger.debug("model cache skipped models that would fail cache validation", {
-					provider: providerId,
-					models: rejectedModelIds,
-				});
-			}
-			const policy = materializationPolicy();
-			const authoritativeFlag = authoritative ? 1 : 0;
-			const serializedHeaderOmitted = JSON.stringify(headerOmittedModelIds);
-			const serializedUnrestorable = JSON.stringify(unrestorableHeaderModelIds);
-			const serializedModels = JSON.stringify(cachedModels);
-			// Length prefix: a collision would also need an equal payload size.
-			const modelsHash = `${serializedModels.length.toString(36)}:${Bun.hash(serializedModels).toString(36)}`;
-			const outcome = db
-				.transaction((): "skipped" | "refreshed" | "written" => {
-					const matchStmt = db.prepare<
-						StoredRowState,
-						[string, number, string, string, string, string, number, string]
-					>(
-						`SELECT m.updated_at, m.authoritative,
-							r.payload_updated_at AS refresh_payload_updated_at,
-							r.updated_at AS refresh_updated_at,
-							r.authoritative AS refresh_authoritative
-						FROM model_cache m
-						LEFT JOIN model_cache_refresh r ON r.provider_id = m.provider_id
-						WHERE m.provider_id = ? AND m.version = ? AND m.materialization_policy = ?
-							AND m.static_fingerprint = ? AND m.header_omitted_model_ids = ?
-							AND m.unrestorable_header_model_ids = ? AND m.header_restore_version = ? AND m.models_hash = ?`,
-					);
-					let stored: StoredRowState | null;
-					try {
-						stored = matchStmt.get(
-							providerId,
-							CACHE_SCHEMA_VERSION,
-							policy,
-							staticFingerprint,
-							serializedHeaderOmitted,
-							serializedUnrestorable,
-							HEADER_RESTORE_VERSION,
-							modelsHash,
-						);
-					} finally {
-						matchStmt.finalize();
-					}
-					if (stored) {
-						const state = rowState(stored);
-						if (state.updatedAt === updatedAt && state.authoritative === authoritative) return "skipped";
-						db.run(
-							`INSERT INTO model_cache_refresh (provider_id, payload_updated_at, updated_at, authoritative)
-							VALUES (?, ?, ?, ?)
-							ON CONFLICT(provider_id) DO UPDATE SET
-								payload_updated_at = excluded.payload_updated_at,
-								updated_at = excluded.updated_at,
-								authoritative = excluded.authoritative`,
-							[providerId, stored.updated_at, updatedAt, authoritativeFlag],
-						);
-						return "refreshed";
-					}
-					db.run(
-						`INSERT OR REPLACE INTO model_cache (
-							provider_id, version, materialization_policy, updated_at, authoritative, static_fingerprint,
-							header_omitted_model_ids, unrestorable_header_model_ids,
-							header_restore_version, models_hash, models
-						) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-						[
-							providerId,
-							CACHE_SCHEMA_VERSION,
-							policy,
-							updatedAt,
-							authoritativeFlag,
-							staticFingerprint,
-							serializedHeaderOmitted,
-							serializedUnrestorable,
-							HEADER_RESTORE_VERSION,
-							modelsHash,
-							serializedModels,
-						],
-					);
-					db.run("DELETE FROM model_cache_refresh WHERE provider_id = ?", [providerId]);
-					return "written";
-				})
-				.immediate();
-			if (outcome === "skipped") {
-				writeStats.skippedWrites++;
-			} else if (outcome === "refreshed") {
-				writeStats.refreshWrites++;
-			} else {
-				writeStats.payloadWrites++;
-				writeStats.payloadBytes += serializedModels.length;
-				if (recentPayloadProviders.length >= RECENT_PAYLOAD_PROVIDERS_MAX) recentPayloadProviders.shift();
-				recentPayloadProviders.push(providerId);
-			}
-		});
+		runToCompletion(
+			writeModelCacheSteps(
+				providerId,
+				updatedAt,
+				models,
+				authoritative,
+				staticFingerprint,
+				dbPath,
+				staticHeaderSources,
+				restorableHeaderFallback,
+			),
+		);
 	} catch {
 		// Cache writes are best-effort; failures should not break model resolution.
 	}
+}
+
+/**
+ * {@link writeModelCache} for a pass that must not hold the event loop: it
+ * validates the models in slices and returns to the loop before it serializes
+ * the row and before the write transaction, which runs in one step.
+ */
+export async function writeModelCacheInSlices<TApi extends Api>(
+	providerId: string,
+	updatedAt: number,
+	models: Model<TApi>[],
+	authoritative: boolean,
+	staticFingerprint: string,
+	dbPath?: string,
+	staticHeaderSources: readonly Model<TApi>[] = [],
+	restorableHeaderFallback?: Record<string, string>,
+): Promise<void> {
+	try {
+		await runInSlices(
+			writeModelCacheSteps(
+				providerId,
+				updatedAt,
+				models,
+				authoritative,
+				staticFingerprint,
+				dbPath,
+				staticHeaderSources,
+				restorableHeaderFallback,
+			),
+		);
+	} catch {
+		// Cache writes are best-effort; failures should not break model resolution.
+	}
+}
+
+/** The work of one cache write; each `yield` ends a unit that a sliced caller may return to the event loop after. */
+function* writeModelCacheSteps<TApi extends Api>(
+	providerId: string,
+	updatedAt: number,
+	models: Model<TApi>[],
+	authoritative: boolean,
+	staticFingerprint: string,
+	dbPath: string | undefined,
+	staticHeaderSources: readonly Model<TApi>[],
+	restorableHeaderFallback: Record<string, string> | undefined,
+): Generator<void, void, undefined> {
+	const headerOmittedModelIds: string[] = [];
+	const unrestorableHeaderModelIds: string[] = [];
+	const cachedModels: PersistedModel<TApi>[] = [];
+	const rejectedModelIds: string[] = [];
+	const staticById = new Map(staticHeaderSources.map(model => [model.id, model]));
+	for (const model of models) {
+		yield;
+		const cachedModel = toCachedModel(model);
+		if (!isMaterializedModel(cachedModel)) {
+			// One unreadable model must not make the whole row fail
+			// validation on read (which deletes it and refetches forever).
+			rejectedModelIds.push(model.id);
+			continue;
+		}
+		if (hasModelHeaders(model)) {
+			headerOmittedModelIds.push(model.id);
+			// Synthesized variants (e.g. Copilot `-1m`) have no same-id static
+			// entry; their headers come from the `requestModelId` base. Match
+			// against that source too, else they are wrongly flagged
+			// unrestorable and dropped on the next offline read (#6037, #6284).
+			const staticHeaderSource =
+				staticById.get(model.id) ?? (model.requestModelId ? staticById.get(model.requestModelId) : undefined);
+			// A model with no static source is still restorable when its live
+			// headers equal a trusted provider-wide fallback that the reader can
+			// re-derive without persisting it. This keeps reference-less models
+			// with constant or configured headers alive offline.
+			const matchesStatic = model.resolveHeaders
+				? staticHeaderSource?.resolveHeaders === model.resolveHeaders
+				: staticHeaderSource
+					? headersEqual(model.headers, staticHeaderSource.headers)
+					: headersEqual(model.headers, restorableHeaderFallback);
+			if (!matchesStatic) {
+				unrestorableHeaderModelIds.push(model.id);
+			}
+		}
+		cachedModels.push(cachedModel);
+	}
+	if (rejectedModelIds.length > 0) {
+		logger.debug("model cache skipped models that would fail cache validation", {
+			provider: providerId,
+			models: rejectedModelIds,
+		});
+	}
+	yield;
+	const policy = materializationPolicy();
+	const authoritativeFlag = authoritative ? 1 : 0;
+	const serializedHeaderOmitted = JSON.stringify(headerOmittedModelIds);
+	const serializedUnrestorable = JSON.stringify(unrestorableHeaderModelIds);
+	const serializedModels = JSON.stringify(cachedModels);
+	yield;
+	// Length prefix: a collision would also need an equal payload size.
+	const modelsHash = `${serializedModels.length.toString(36)}:${Bun.hash(serializedModels).toString(36)}`;
+	yield;
+	// A commit on the shared connection leaves its own `PRAGMA data_version`
+	// unchanged, so drop the read memo in the step that writes: a reader may
+	// have memoized the old row while this write was in slices.
+	invalidateReadRow(providerId, dbPath);
+	withModelCacheDb(dbPath, db => {
+		const outcome = db
+			.transaction((): "skipped" | "refreshed" | "written" => {
+				const matchStmt = db.prepare<StoredRowState, [string, number, string, string, string, string, number, string]>(
+					`SELECT m.updated_at, m.authoritative,
+						r.payload_updated_at AS refresh_payload_updated_at,
+						r.updated_at AS refresh_updated_at,
+						r.authoritative AS refresh_authoritative
+					FROM model_cache m
+					LEFT JOIN model_cache_refresh r ON r.provider_id = m.provider_id
+					WHERE m.provider_id = ? AND m.version = ? AND m.materialization_policy = ?
+						AND m.static_fingerprint = ? AND m.header_omitted_model_ids = ?
+						AND m.unrestorable_header_model_ids = ? AND m.header_restore_version = ? AND m.models_hash = ?`,
+				);
+				let stored: StoredRowState | null;
+				try {
+					stored = matchStmt.get(
+						providerId,
+						CACHE_SCHEMA_VERSION,
+						policy,
+						staticFingerprint,
+						serializedHeaderOmitted,
+						serializedUnrestorable,
+						HEADER_RESTORE_VERSION,
+						modelsHash,
+					);
+				} finally {
+					matchStmt.finalize();
+				}
+				if (stored) {
+					const state = rowState(stored);
+					if (state.updatedAt === updatedAt && state.authoritative === authoritative) return "skipped";
+					db.run(
+						`INSERT INTO model_cache_refresh (provider_id, payload_updated_at, updated_at, authoritative)
+						VALUES (?, ?, ?, ?)
+						ON CONFLICT(provider_id) DO UPDATE SET
+							payload_updated_at = excluded.payload_updated_at,
+							updated_at = excluded.updated_at,
+							authoritative = excluded.authoritative`,
+						[providerId, stored.updated_at, updatedAt, authoritativeFlag],
+					);
+					return "refreshed";
+				}
+				db.run(
+					`INSERT OR REPLACE INTO model_cache (
+						provider_id, version, materialization_policy, updated_at, authoritative, static_fingerprint,
+						header_omitted_model_ids, unrestorable_header_model_ids,
+						header_restore_version, models_hash, models
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					[
+						providerId,
+						CACHE_SCHEMA_VERSION,
+						policy,
+						updatedAt,
+						authoritativeFlag,
+						staticFingerprint,
+						serializedHeaderOmitted,
+						serializedUnrestorable,
+						HEADER_RESTORE_VERSION,
+						modelsHash,
+						serializedModels,
+					],
+				);
+				db.run("DELETE FROM model_cache_refresh WHERE provider_id = ?", [providerId]);
+				return "written";
+			})
+			.immediate();
+		if (outcome === "skipped") {
+			writeStats.skippedWrites++;
+		} else if (outcome === "refreshed") {
+			writeStats.refreshWrites++;
+		} else {
+			writeStats.payloadWrites++;
+			writeStats.payloadBytes += serializedModels.length;
+			if (recentPayloadProviders.length >= RECENT_PAYLOAD_PROVIDERS_MAX) recentPayloadProviders.shift();
+			recentPayloadProviders.push(providerId);
+		}
+	});
 }

@@ -29,7 +29,7 @@ import { applyCatalogMetrics, CatalogMetricsIndex, catalogMetricsOf } from "@oh-
 import { getModelCacheWriteStats, readModelCache, retainModelCacheConnection } from "@oh-my-pi/pi-catalog/model-cache";
 import {
 	createModelManager,
-	fingerprintStaticModels,
+	fingerprintStaticModelsSteps,
 	type ModelManagerOptions,
 	type ModelRefreshStrategy,
 } from "@oh-my-pi/pi-catalog/model-manager";
@@ -48,7 +48,17 @@ import {
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { apiServesKind, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
 import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-catalog/wire/codex";
-import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
+import {
+	getAgentDir,
+	isBunTestRuntime,
+	logger,
+	mapInSlices,
+	nextSlice,
+	runInSlices,
+	runToCompletion,
+	sliceExpired,
+	wrapFetchForExtraCa,
+} from "@oh-my-pi/pi-utils";
 import { resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import { redactUrlForLog } from "../mcp/json-rpc";
@@ -153,6 +163,12 @@ setCodexAttestationProvider(generateCodexAttestation);
 
 /** One built-in discovery pass rewriting more payload rows than this is debug-logged. */
 const MODEL_CACHE_REWRITE_LOG_THRESHOLD = 5;
+/**
+ * Sliced discovery merges a pass runs before its last merge runs in one step.
+ * Three: a reload during a merge is rare, and three in a row means the
+ * configuration keeps changing, so waiting for a quiet moment may never end.
+ */
+const MAX_SLICED_DISCOVERY_MERGES = 3;
 /** `scheme://user:pass@` in free text (e.g. a fetch error echoing the request URL). */
 const URL_USERINFO_RE = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
 const BUILT_IN_MODEL_MANAGER_PROVIDER_IDS: Readonly<Record<string, true>> = Object.freeze(
@@ -205,6 +221,15 @@ interface CustomModelsResult {
 interface ConfiguredModelDiscoveryResult {
 	models: Model<Api>[];
 	replaceRuntimeModels: boolean;
+}
+
+/** One built-in provider's cached catalog slice as read from the model cache. */
+interface CachedStandardProviderSlice {
+	/** Absent when the provider has no usable cache row. */
+	models?: Model<Api>[];
+	/** The row is fresh and written by an authoritative discovery. */
+	authoritativeFresh: boolean;
+	discoveryState?: ProviderDiscoveryState;
 }
 
 /**
@@ -363,6 +388,12 @@ export class ModelRegistry {
 			validUntil: number;
 		}
 	>();
+	/**
+	 * Advances on every static reload and runtime registration change: the
+	 * inputs a discovery merge reads. A discovery pass merges in slices and
+	 * commits only when no such change landed between its merge and commit.
+	 */
+	#compositionEpoch = 0;
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	// `provider/id:kind` of modelOverrides kinds already reported as unserved, so
 	// every rebuild does not log the same ignored override again.
@@ -734,6 +765,7 @@ export class ModelRegistry {
 			apply();
 		} finally {
 			this.#mirrorChangeDepth--;
+			this.#compositionEpoch++;
 		}
 		if (outermost) this.#recordMirrorChange(change);
 	}
@@ -1342,6 +1374,7 @@ export class ModelRegistry {
 	}
 
 	#resetStaticComposition(): void {
+		this.#compositionEpoch++;
 		this.#models = [];
 		this.#unprojectedModels = [];
 		this.#baseModels = [];
@@ -1470,13 +1503,19 @@ export class ModelRegistry {
 
 	/** Built-in and cached models, before runtime discoveries and every projection. */
 	#composeCachedBaseModels(providerFilter?: ReadonlySet<string>): Model<Api>[] {
+		return runToCompletion(this.#cachedBaseModelSteps(providerFilter));
+	}
+
+	/** {@link #composeCachedBaseModels} with a slice unit per built-in model, whose window policy resolves the rule cascade. */
+	*#cachedBaseModelSteps(providerFilter?: ReadonlySet<string>): Generator<void, Model<Api>[], undefined> {
 		const cachedStandardModels = this.#getCachedStandardModels(providerFilter);
-		let builtInModels = this.#applyHardcodedModelPolicies(
-			this.#loadBuiltInModels(this.#providerOverrides, providerFilter),
-		);
+		yield;
+		const loadedBuiltInModels = this.#loadBuiltInModels(this.#providerOverrides, providerFilter);
+		let builtInModels = yield* this.#hardcodedModelPolicySteps(loadedBuiltInModels);
 		if (this.#cachedAuthoritativeProviders.size > 0) {
 			builtInModels = dropProviderModels(builtInModels, this.#cachedAuthoritativeProviders, { kind: "chat" });
 		}
+		yield;
 		return this.#mergeResolvedModels(
 			this.#mergeResolvedModels(builtInModels, cachedStandardModels),
 			selectProviderModels(this.#cachedDiscoverableModels, providerFilter),
@@ -1501,12 +1540,11 @@ export class ModelRegistry {
 	 * projections. Referencing a projected or previously discovered row would
 	 * nest its header resolver one level deeper on every refresh.
 	 */
-	#composeDiscoveryReferenceModels(providerFilter: ReadonlySet<string>): Model<Api>[] {
+	*#discoveryReferenceModelSteps(providerFilter: ReadonlySet<string>): Generator<void, Model<Api>[], undefined> {
+		const cachedBaseModels = yield* this.#cachedBaseModelSteps(providerFilter);
+		yield;
 		return this.#mergeCustomModels(
-			this.#mergeCustomModels(
-				this.#composeCachedBaseModels(providerFilter),
-				selectProviderModels(this.#customModelOverlays, providerFilter),
-			),
+			this.#mergeCustomModels(cachedBaseModels, selectProviderModels(this.#customModelOverlays, providerFilter)),
 			selectProviderModels(this.#runtimeModelOverlays, providerFilter),
 		);
 	}
@@ -1653,137 +1691,146 @@ export class ModelRegistry {
 		return resolveModelCacheProviderId(providerId, { baseUrl });
 	}
 
-	#loadCachedStandardProviderModels(providerIds: readonly string[]): {
-		modelsByProvider: Map<string, Model<Api>[]>;
-		authoritativeFreshProviders: Set<string>;
-	} {
-		const modelsByProvider = new Map<string, Model<Api>[]>();
-		const authoritativeFreshProviders = new Set<string>();
-		using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
-		for (const providerId of providerIds) {
-			const cacheProviderId = this.#resolveStartupModelCacheProviderId(providerId);
-			const cache = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
-			const sharedCatalogProvider = MODELS_DEV_CATALOG_PROVIDER_ID_LOOKUP[providerId] === true;
-			const additiveSharedCatalogProvider = ADDITIVE_MODELS_DEV_CATALOG_PROVIDER_ID_LOOKUP[providerId] === true;
-			if (!cache) {
-				const descriptor = PROVIDER_DESCRIPTORS.find(candidate => candidate.providerId === providerId);
-				const discoveryExpected =
-					sharedCatalogProvider ||
-					(descriptor !== undefined &&
-						(this.authStorage.keys.source(providerId) !== undefined ||
-							descriptor.allowUnauthenticated === true ||
-							this.#keylessProviders.has(providerId)));
-				if (discoveryExpected) {
-					this.#providerDiscoveryStates.set(providerId, {
-						provider: providerId,
-						status: "idle",
-						optional: false,
-						stale: false,
-						source: "bundled",
-						models: [],
-					});
-				}
+	/**
+	 * Reads one built-in provider's cached catalog slice. Each `yield` ends a
+	 * unit for {@link #loadCachedStandardModelsInSlices}: a slice holds up to
+	 * thousands of models, and each model's context-window policy resolves the
+	 * rule cascade.
+	 */
+	*#cachedStandardProviderSteps(providerId: string): Generator<void, CachedStandardProviderSlice, undefined> {
+		const cacheProviderId = this.#resolveStartupModelCacheProviderId(providerId);
+		const cache = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
+		const sharedCatalogProvider = MODELS_DEV_CATALOG_PROVIDER_ID_LOOKUP[providerId] === true;
+		const additiveSharedCatalogProvider = ADDITIVE_MODELS_DEV_CATALOG_PROVIDER_ID_LOOKUP[providerId] === true;
+		if (!cache) {
+			const descriptor = PROVIDER_DESCRIPTORS.find(candidate => candidate.providerId === providerId);
+			const discoveryExpected =
+				sharedCatalogProvider ||
+				(descriptor !== undefined &&
+					(this.authStorage.keys.source(providerId) !== undefined ||
+						descriptor.allowUnauthenticated === true ||
+						this.#keylessProviders.has(providerId)));
+			return {
+				authoritativeFresh: false,
+				discoveryState: discoveryExpected
+					? { provider: providerId, status: "idle", optional: false, stale: false, source: "bundled", models: [] }
+					: undefined,
+			};
+		}
+		yield;
+		// The model cache never persists request headers (#5780): restore
+		// them from the bundled static catalog, and drop cached rows whose
+		// headers cannot be rebuilt so the bundled fallback (which still
+		// carries its headers) wins the startup merge instead of a cached
+		// model with required transport headers missing.
+		const omittedHeaderIds = new Set(cache.headerOmittedModelIds);
+		const unrestorableHeaderIds = new Set(cache.unrestorableHeaderModelIds);
+		const bundledModels =
+			omittedHeaderIds.size > 0 || sharedCatalogProvider
+				? (getBundledModels(providerId as Parameters<typeof getBundledModels>[0]) as Model<Api>[])
+				: undefined;
+		// Every shared-catalog manager layers the catalog additively
+		// (`#collectBuiltInModelManagerOptions`), authoritative or not.
+		const bundledFingerprint = bundledModels
+			? yield* fingerprintStaticModelsSteps(bundledModels, {
+					authoritative: sharedCatalogProvider && !additiveSharedCatalogProvider,
+					additive: sharedCatalogProvider,
+				})
+			: undefined;
+		// A matching cache may contain provider-endpoint overrides. Strip
+		// same-id rows only across a bundled-catalog upgrade, where the
+		// additive shared catalog must not replace the new bundled metadata.
+		const additiveCacheStaticMismatch =
+			additiveSharedCatalogProvider &&
+			bundledFingerprint !== undefined &&
+			cache.staticFingerprint !== bundledFingerprint &&
+			!cache.staticFingerprint.startsWith(`${bundledFingerprint}:drop:`);
+		const bundledById = bundledModels
+			? new Map(bundledModels.map(bundledModel => [bundledModel.id, bundledModel]))
+			: undefined;
+		const models: Model<Api>[] = [];
+		for (const cachedModel of cache.models) {
+			yield;
+			// Shared catalog rows can be projected under another provider id.
+			// That changes policy inputs, so only this projection is rebuilt;
+			// same-provider materialized cache rows stay on the zero-build path.
+			const model =
+				cachedModel.provider === providerId
+					? cachedModel
+					: buildModel({ ...toModelSpec(cachedModel), provider: providerId });
+			if (additiveCacheStaticMismatch && bundledById?.has(model.id)) continue;
+			if (!omittedHeaderIds.has(model.id)) {
+				models.push(model);
 				continue;
 			}
-			if (cache.fresh && cache.authoritative) {
-				authoritativeFreshProviders.add(providerId);
-			}
-			// The model cache never persists request headers (#5780): restore
-			// them from the bundled static catalog, and drop cached rows whose
-			// headers cannot be rebuilt so the bundled fallback (which still
-			// carries its headers) wins the startup merge instead of a cached
-			// model with required transport headers missing.
-			const omittedHeaderIds = new Set(cache.headerOmittedModelIds);
-			const unrestorableHeaderIds = new Set(cache.unrestorableHeaderModelIds);
-			const bundledModels =
-				omittedHeaderIds.size > 0 || sharedCatalogProvider
-					? (getBundledModels(providerId as Parameters<typeof getBundledModels>[0]) as Model<Api>[])
-					: undefined;
-			// Every shared-catalog manager layers the catalog additively
-			// (`#collectBuiltInModelManagerOptions`), authoritative or not.
-			const bundledFingerprint = bundledModels
-				? fingerprintStaticModels(bundledModels, {
-						authoritative: sharedCatalogProvider && !additiveSharedCatalogProvider,
-						additive: sharedCatalogProvider,
-					})
-				: undefined;
-			// A matching cache may contain provider-endpoint overrides. Strip
-			// same-id rows only across a bundled-catalog upgrade, where the
-			// additive shared catalog must not replace the new bundled metadata.
-			const additiveCacheStaticMismatch =
-				additiveSharedCatalogProvider &&
-				bundledFingerprint !== undefined &&
-				cache.staticFingerprint !== bundledFingerprint &&
-				!cache.staticFingerprint.startsWith(`${bundledFingerprint}:drop:`);
-			const bundledById = bundledModels
-				? new Map(bundledModels.map(bundledModel => [bundledModel.id, bundledModel]))
-				: undefined;
-			const models: Model<Api>[] = [];
-			for (const cachedModel of cache.models) {
-				// Shared catalog rows can be projected under another provider id.
-				// That changes policy inputs, so only this projection is rebuilt;
-				// same-provider materialized cache rows stay on the zero-build path.
-				const model =
-					cachedModel.provider === providerId
-						? cachedModel
-						: buildModel({ ...toModelSpec(cachedModel), provider: providerId });
-				if (additiveCacheStaticMismatch && bundledById?.has(model.id)) continue;
-				if (!omittedHeaderIds.has(model.id)) {
-					models.push(model);
-					continue;
-				}
-				// Current unrestorable markers prove that neither same-id nor
-				// request-model bundled headers matched the live model. Only markers
-				// from the old id-only writer may recover through `requestModelId`.
-				const unrestorable = unrestorableHeaderIds.has(model.id);
-				const bundledHeaders = (
-					unrestorable
-						? cache.legacyHeaderRestoreMarkers && model.requestModelId
-							? bundledById?.get(model.requestModelId)
-							: undefined
-						: (bundledById?.get(model.id) ??
-							(model.requestModelId ? bundledById?.get(model.requestModelId) : undefined))
-				)?.headers;
-				if (!bundledHeaders) continue;
-				models.push({ ...model, headers: bundledHeaders });
-			}
-			const providerOverride = this.#providerOverrides.get(providerId);
-			const withCompat = providerOverride
-				? models.map(model => {
-						const spec = this.#applyProviderTransportOverride(toModelSpec(model), providerOverride);
-						return buildModel({
-							...spec,
-							compat: mergeCompat(model.compatConfig, providerOverride.compat),
-						});
-					})
-				: models;
-			const resolved = this.#applyProviderModelOverrides(providerId, withCompat);
-			const cachedModels = this.#applyHardcodedModelPolicies(resolved);
-			modelsByProvider.set(providerId, cachedModels);
-			if (sharedCatalogProvider) {
-				const cacheMatchesBundledFingerprint =
-					bundledFingerprint !== undefined &&
-					(cache.staticFingerprint === bundledFingerprint ||
-						cache.staticFingerprint.startsWith(`${bundledFingerprint}:drop:`));
-				const cachedSnapshotMatchesBundled =
-					bundledModels !== undefined &&
-					fingerprintStaticModels(cache.models) === fingerprintStaticModels(bundledModels);
-				const cacheContributed = additiveSharedCatalogProvider
-					? cachedModels.some(model => bundledById?.has(model.id) !== true)
-					: !(cacheMatchesBundledFingerprint && cachedSnapshotMatchesBundled);
-				const stale = !cache.fresh || !cache.authoritative;
-				this.#providerDiscoveryStates.set(providerId, {
-					provider: providerId,
-					status: cacheContributed ? "cached" : stale ? "unavailable" : "idle",
-					optional: false,
-					stale,
-					...(cacheContributed ? { fetchedAt: cache.updatedAt } : {}),
-					source: cacheContributed ? "cache" : "bundled",
-					models: cachedModels.map(model => model.id),
-				});
+			// Current unrestorable markers prove that neither same-id nor
+			// request-model bundled headers matched the live model. Only markers
+			// from the old id-only writer may recover through `requestModelId`.
+			const unrestorable = unrestorableHeaderIds.has(model.id);
+			const bundledHeaders = (
+				unrestorable
+					? cache.legacyHeaderRestoreMarkers && model.requestModelId
+						? bundledById?.get(model.requestModelId)
+						: undefined
+					: (bundledById?.get(model.id) ??
+						(model.requestModelId ? bundledById?.get(model.requestModelId) : undefined))
+			)?.headers;
+			if (!bundledHeaders) continue;
+			models.push({ ...model, headers: bundledHeaders });
+		}
+		const providerOverride = this.#providerOverrides.get(providerId);
+		let withCompat = models;
+		if (providerOverride) {
+			withCompat = [];
+			for (const model of models) {
+				yield;
+				const spec = this.#applyProviderTransportOverride(toModelSpec(model), providerOverride);
+				withCompat.push(buildModel({ ...spec, compat: mergeCompat(model.compatConfig, providerOverride.compat) }));
 			}
 		}
-		return { modelsByProvider, authoritativeFreshProviders };
+		const resolved = this.#applyProviderModelOverrides(providerId, withCompat);
+		const cachedModels = yield* this.#hardcodedModelPolicySteps(resolved);
+		let discoveryState: ProviderDiscoveryState | undefined;
+		if (sharedCatalogProvider) {
+			yield;
+			const cacheMatchesBundledFingerprint =
+				bundledFingerprint !== undefined &&
+				(cache.staticFingerprint === bundledFingerprint ||
+					cache.staticFingerprint.startsWith(`${bundledFingerprint}:drop:`));
+			let cachedSnapshotMatchesBundled = false;
+			if (bundledModels !== undefined) {
+				const cachedSnapshotFingerprint = yield* fingerprintStaticModelsSteps(cache.models);
+				cachedSnapshotMatchesBundled = cachedSnapshotFingerprint === (yield* fingerprintStaticModelsSteps(bundledModels));
+			}
+			const cacheContributed = additiveSharedCatalogProvider
+				? cachedModels.some(model => bundledById?.has(model.id) !== true)
+				: !(cacheMatchesBundledFingerprint && cachedSnapshotMatchesBundled);
+			const stale = !cache.fresh || !cache.authoritative;
+			discoveryState = {
+				provider: providerId,
+				status: cacheContributed ? "cached" : stale ? "unavailable" : "idle",
+				optional: false,
+				stale,
+				...(cacheContributed ? { fetchedAt: cache.updatedAt } : {}),
+				source: cacheContributed ? "cache" : "bundled",
+				models: cachedModels.map(model => model.id),
+			};
+		}
+		return { models: cachedModels, authoritativeFresh: cache.fresh && cache.authoritative, discoveryState };
+	}
+
+	/** Records a provider slice that {@link #cachedStandardProviderSteps} read. */
+	#commitCachedStandardProvider(providerId: string, slice: CachedStandardProviderSlice): void {
+		if (slice.discoveryState) this.#providerDiscoveryStates.set(providerId, slice.discoveryState);
+		if (!slice.models) return;
+		this.#cachedStandardModelsByProvider.set(providerId, slice.models);
+		if (
+			slice.authoritativeFresh &&
+			(providersWithAuthoritativeProjectCatalog(slice.models).has(providerId) ||
+				AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS.has(providerId))
+		) {
+			this.#cachedAuthoritativeProviders.add(providerId);
+		}
 	}
 
 	/**
@@ -1800,21 +1847,12 @@ export class ModelRegistry {
 		);
 		if (providerIds.length > 0) {
 			for (const providerId of providerIds) this.#pendingStandardCacheProviders.delete(providerId);
-			const loaded = logger.time("modelRegistry:loadCachedStandardModels", () =>
-				this.#loadCachedStandardProviderModels(providerIds),
-			);
-			for (const [providerId, models] of loaded.modelsByProvider) {
-				this.#cachedStandardModelsByProvider.set(providerId, models);
-			}
-			for (const providerId of loaded.authoritativeFreshProviders) {
-				const models = loaded.modelsByProvider.get(providerId) ?? [];
-				if (
-					providersWithAuthoritativeProjectCatalog(models).has(providerId) ||
-					AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS.has(providerId)
-				) {
-					this.#cachedAuthoritativeProviders.add(providerId);
+			logger.time("modelRegistry:loadCachedStandardModels", () => {
+				using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
+				for (const providerId of providerIds) {
+					this.#commitCachedStandardProvider(providerId, runToCompletion(this.#cachedStandardProviderSteps(providerId)));
 				}
-			}
+			});
 		}
 
 		const models: Model<Api>[] = [];
@@ -1824,6 +1862,23 @@ export class ModelRegistry {
 			if (providerModels) models.push(...providerModels);
 		}
 		return models;
+	}
+
+	/**
+	 * Loads the pending cached slices among `providerFilter` in slices, so a
+	 * discovery pass that composes them never reads them all in one step. A
+	 * slice that a synchronous lookup loaded meanwhile, or one read before a
+	 * reload reset the composition, is not recorded.
+	 */
+	async #loadCachedStandardModelsInSlices(providerFilter: ReadonlySet<string>): Promise<void> {
+		using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
+		for (const providerId of STARTUP_MODEL_CACHE_PROVIDER_IDS) {
+			if (!providerFilter.has(providerId) || !this.#pendingStandardCacheProviders.has(providerId)) continue;
+			const epoch = this.#compositionEpoch;
+			const slice = await runInSlices(this.#cachedStandardProviderSteps(providerId));
+			if (epoch !== this.#compositionEpoch || !this.#pendingStandardCacheProviders.delete(providerId)) continue;
+			this.#commitCachedStandardProvider(providerId, slice);
+		}
 	}
 
 	#canRestoreConfiguredDiscoveryHeaders(providerId: string): boolean {
@@ -2218,37 +2273,66 @@ export class ModelRegistry {
 			this.#discoverBuiltInProviderModels(strategy, providerFilter),
 		]);
 		this.#captureCatalogMetrics(builtInDiscovery.models, providerFilter === undefined);
-		const currentDiscoverableProviders = new Set(this.#discoverableProviders);
-		const currentConfiguredDiscoveryResults = configuredDiscoveryResults.filter(result =>
-			currentDiscoverableProviders.has(result.provider),
-		);
-		const configuredDiscovered = currentConfiguredDiscoveryResults.flatMap(result => result.models);
-		const replacedConfiguredProviders = currentConfiguredDiscoveryResults.flatMap(result =>
-			result.replaceRuntimeModels ? [result.provider.provider] : [],
-		);
-		const discovered = [...configuredDiscovered, ...builtInDiscovery.models];
-		if (
-			discovered.length === 0 &&
-			builtInDiscovery.authoritativeProviders.size === 0 &&
-			builtInDiscovery.replaceRuntimeProviders.size === 0 &&
-			replacedConfiguredProviders.length === 0
-		) {
-			return;
-		}
-		const touchedProviders = new Set(discovered.map(model => model.provider));
-		for (const provider of replacedConfiguredProviders) touchedProviders.add(provider);
-		for (const provider of builtInDiscovery.replaceRuntimeProviders) touchedProviders.add(provider);
-		for (const provider of builtInDiscovery.authoritativeProviders) touchedProviders.add(provider);
-		const referenceModels = this.#composeDiscoveryReferenceModels(touchedProviders);
-		const discoveredModels = this.#applyHardcodedModelPolicies(
-			discovered.map(model =>
+		// The merge runs in slices so the pass never holds the event loop. A static
+		// reload or a provider registration between the merge and the commit
+		// changes what the merge read, so the pass merges again. After
+		// MAX_SLICED_DISCOVERY_MERGES merges that each saw such a change, the last
+		// merge runs in one synchronous step, as every merge did before slicing:
+		// the loop always ends, and the commit always matches the current
+		// configuration. Only a configuration that changes during every one of
+		// those merges pays that one blocking step.
+		for (let mergeCount = 1; ; mergeCount++) {
+			const epoch = this.#compositionEpoch;
+			const currentDiscoverableProviders = new Set(this.#discoverableProviders);
+			const currentConfiguredDiscoveryResults = configuredDiscoveryResults.filter(result =>
+				currentDiscoverableProviders.has(result.provider),
+			);
+			const configuredDiscovered = currentConfiguredDiscoveryResults.flatMap(result => result.models);
+			const replacedConfiguredProviders = currentConfiguredDiscoveryResults.flatMap(result =>
+				result.replaceRuntimeModels ? [result.provider.provider] : [],
+			);
+			const discovered = [...configuredDiscovered, ...builtInDiscovery.models];
+			if (
+				discovered.length === 0 &&
+				builtInDiscovery.authoritativeProviders.size === 0 &&
+				builtInDiscovery.replaceRuntimeProviders.size === 0 &&
+				replacedConfiguredProviders.length === 0
+			) {
+				return;
+			}
+			const touchedProviders = new Set(discovered.map(model => model.provider));
+			for (const provider of replacedConfiguredProviders) touchedProviders.add(provider);
+			for (const provider of builtInDiscovery.replaceRuntimeProviders) touchedProviders.add(provider);
+			for (const provider of builtInDiscovery.authoritativeProviders) touchedProviders.add(provider);
+			const sliced = mergeCount <= MAX_SLICED_DISCOVERY_MERGES;
+			if (sliced) {
+				await this.#loadCachedStandardModelsInSlices(touchedProviders);
+				if (epoch !== this.#compositionEpoch) continue;
+			}
+			const referenceSteps = this.#discoveryReferenceModelSteps(touchedProviders);
+			const referenceModels = sliced ? await runInSlices(referenceSteps) : runToCompletion(referenceSteps);
+			const merge = (model: Model<Api>) =>
 				this.#mergeDiscoveredModelMemoized(
 					model,
 					resolveProviderModelReference(model.provider, model.id, referenceModels),
 					this.#providerOverrides.get(model.provider),
-				),
-			),
-		);
+				);
+			const discoveredModels = sliced
+				? await runInSlices(this.#hardcodedModelPolicySteps(await mapInSlices(discovered, merge)))
+				: this.#applyHardcodedModelPolicies(discovered.map(merge));
+			if (epoch !== this.#compositionEpoch) continue;
+			this.#commitRuntimeDiscoveries(builtInDiscovery, replacedConfiguredProviders, touchedProviders, discoveredModels);
+			return;
+		}
+	}
+
+	/** Records a discovery pass's merged models; runs in one synchronous step after the pass's last slice. */
+	#commitRuntimeDiscoveries(
+		builtInDiscovery: BuiltInDiscoveryResult,
+		replacedConfiguredProviders: readonly string[],
+		touchedProviders: ReadonlySet<string>,
+		discoveredModels: Model<Api>[],
+	): void {
 		const authoritativeProviders = providersWithAuthoritativeProjectCatalog(discoveredModels);
 		for (const provider of builtInDiscovery.authoritativeProviders) {
 			authoritativeProviders.add(provider);
@@ -2789,6 +2873,8 @@ export class ModelRegistry {
 		);
 		const options: ModelManagerOptions<Api>[] = [];
 		for (let i = 0; i < standardProviderDescriptors.length; i++) {
+			// Some descriptors build seed catalogs here, through the rule cascade.
+			while (sliceExpired()) await nextSlice();
 			const descriptor = standardProviderDescriptors[i];
 			const apiKey = standardProviderKeys[i];
 			const hasExplicitVllmConfig =
@@ -2829,6 +2915,7 @@ export class ModelRegistry {
 		}
 
 		for (let i = 0; i < enabledSpecialProviderDescriptors.length; i++) {
+			while (sliceExpired()) await nextSlice();
 			const descriptor = enabledSpecialProviderDescriptors[i];
 			const key = descriptor.resolveKey(specialKeys[i]);
 			if (!isAuthenticated(key)) {
@@ -3238,9 +3325,17 @@ export class ModelRegistry {
 	}
 
 	#applyHardcodedModelPolicies(models: Model<Api>[]): Model<Api>[] {
+		return runToCompletion(this.#hardcodedModelPolicySteps(models));
+	}
+
+	/** {@link #applyHardcodedModelPolicies} with one slice unit per model: a window policy resolves the rule cascade. */
+	*#hardcodedModelPolicySteps(models: Model<Api>[]): Generator<void, Model<Api>[], undefined> {
 		const extendedContext = isExtendedContextEnabledFromSettings(this.#settings);
 		const compactionPoints = getModelCompactionPointsFromSettings(this.#settings);
-		return models.map(model => {
+		const out = new Array<Model<Api>>(models.length);
+		for (let index = 0; index < models.length; index++) {
+			yield;
+			let model = models[index];
 			let tiers: ContextWindowTiers | undefined;
 			// Hosts whose context window is authoritative (subscription limits that
 			// carry public price tiers only as estimates) skip every inferred
@@ -3249,8 +3344,9 @@ export class ModelRegistry {
 				({ model, tiers } = this.#applyContextWindowPolicies(model, extendedContext, compactionPoints));
 			}
 			if (tiers) this.#policyWindowTiers.set(model, tiers);
-			return model;
-		});
+			out[index] = model;
+		}
+		return out;
 	}
 
 	/**

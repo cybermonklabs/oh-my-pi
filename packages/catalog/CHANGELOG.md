@@ -6,6 +6,12 @@
 
 - Added the `supports-message-threads` compat axis (`supportsMessageThreads`), enabled for Claude 4.5 and newer on the first-party Anthropic provider
 - Added a standard Responses WebSocket capability rule for explicit opt-in through OMP settings or SDK preferences, disabled by default ([#17354](https://github.com/can1357/oh-my-pi/pull/17354) by [@TatsukiMeng](https://github.com/TatsukiMeng))
+- Added `writeModelCacheInSlices` and `fingerprintStaticModelsSteps`, which do the work of `writeModelCache` and `fingerprintStaticModels` in slices that return to the event loop
+
+### Fixed
+
+- Provider model resolution no longer holds the event loop while it builds, merges, fingerprints or writes a large catalog: it gives the loop a turn every 10 ms ([#17121](https://github.com/can1357/oh-my-pi/issues/17121))
+- Model cache commits no longer wait for an fsync on the main thread: the cache now uses WAL's `synchronous = NORMAL`, as omp's other regenerable caches do
 
 ## [18.16.0] - 2026-11-02
 
