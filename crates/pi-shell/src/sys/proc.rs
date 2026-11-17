@@ -83,6 +83,36 @@ pub fn info(pid: i32) -> Option<ProcInfo> {
 	sys::info(pid)
 }
 
+/// The process `pid`, for a check that must not miss one the caller may
+/// signal.
+///
+/// `Ok(None)` only when the failed read proves no signal of the caller's
+/// reaches it: it exited (`ESRCH`), or the read was refused (`ENOENT`,
+/// `EACCES`, `EPERM`: another user's process under `hidepid`) and
+/// `kill(pid, 0)` confirms the caller can signal no such process. `Err` for
+/// any other failure, which proves nothing: no descriptor or memory left, an
+/// I/O error, a line that does not parse, or a refused read of a process the
+/// caller can still signal (no `/proc`, another pid namespace's, or a
+/// set-user-ID child the caller started).
+pub fn read(pid: i32) -> io::Result<Option<ProcInfo>> {
+	match sys::read(pid) {
+		Ok(found) => Ok(Some(found)),
+		Err(error) if out_of_reach(pid, &error) => Ok(None),
+		Err(error) => Err(error),
+	}
+}
+
+/// Whether `error`, a failure to read the process `pid`, proves that no
+/// signal of the caller's reaches it (see [`read`]).
+pub(crate) fn out_of_reach(pid: i32, error: &io::Error) -> bool {
+	match error.raw_os_error() {
+		Some(libc::ESRCH) => true,
+		// SAFETY: signal 0 sends nothing; it only checks the pid.
+		Some(libc::ENOENT | libc::EACCES | libc::EPERM) => (unsafe { libc::kill(pid, 0) }) != 0,
+		_ => false,
+	}
+}
+
 /// Whether a process with the positive pid `pid` exists, a zombie included.
 ///
 /// It asks the kernel (`kill(pid, 0)`), which fails with `ESRCH` only when
@@ -124,6 +154,15 @@ pub fn running(pid: i32) -> bool {
 /// the second guarantee).
 pub fn now() -> io::Result<u64> {
 	sys::now()
+}
+
+/// How long ago a process whose [`ProcInfo::start`] is `start` started.
+///
+/// By [`now`]: on Linux to the clock tick (10 ms on most systems), on macOS
+/// to the µs. A start mark later than `now` (a step back of macOS's wall
+/// clock) is no time ago.
+pub fn age(start: u64) -> io::Result<std::time::Duration> {
+	sys::age(now()?.saturating_sub(start))
 }
 
 /// Processes whose session is `sid`, excluding the caller.
@@ -289,7 +328,7 @@ mod sys {
 
 	/// `/proc/<pid>/stat`, parsed; `InvalidData` for a line that does not
 	/// parse.
-	fn read(pid: i32) -> io::Result<ProcInfo> {
+	pub(super) fn read(pid: i32) -> io::Result<ProcInfo> {
 		let mut file = fs::File::open(format!("/proc/{pid}/stat"))?;
 		// The kernel hands over the whole line in one read when it fits (52
 		// numbers and a name of at most 64 bytes do); `fs::read` grows from
@@ -317,6 +356,18 @@ mod sys {
 		}
 		let ns = ts.tv_sec as u128 * 1_000_000_000 + ts.tv_nsec as u128;
 		Ok((ns * hz / 1_000_000_000) as u64)
+	}
+
+	/// `ticks` clock ticks as a duration.
+	pub fn age(ticks: u64) -> io::Result<std::time::Duration> {
+		// SAFETY: plain call without pointer arguments.
+		let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+		let hz = u128::try_from(hz)
+			.ok()
+			.filter(|&hz| hz > 0)
+			.ok_or_else(io::Error::last_os_error)?;
+		let nanos = u128::from(ticks) * 1_000_000_000 / hz;
+		Ok(std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)))
 	}
 
 	fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
@@ -449,7 +500,7 @@ mod sys {
 		read(pid).ok()
 	}
 
-	fn read(pid: i32) -> io::Result<ProcInfo> {
+	pub(super) fn read(pid: i32) -> io::Result<ProcInfo> {
 		let bi = bsdinfo(pid)?;
 		// SAFETY: plain syscall without pointer arguments.
 		let sid = unsafe { libc::getsid(pid) };
@@ -485,6 +536,12 @@ mod sys {
 			.duration_since(std::time::UNIX_EPOCH)
 			.map_err(io::Error::other)?;
 		Ok(since.as_micros() as u64)
+	}
+
+	/// `micros` µs as a duration.
+	#[expect(clippy::unnecessary_wraps, reason = "mirrors Linux's, which reads the clock tick")]
+	pub const fn age(micros: u64) -> io::Result<std::time::Duration> {
+		Ok(std::time::Duration::from_micros(micros))
 	}
 
 	pub fn signal_pinned(p: &ProcInfo, sig: i32) -> io::Result<bool> {

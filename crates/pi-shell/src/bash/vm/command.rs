@@ -2746,7 +2746,7 @@ fn fits_as_path(path: &[u8]) -> bool {
 /// the shell's diagnostic and status (Windows' `ERROR_FILENAME_EXCED_RANGE`
 /// also stands for invalid names).
 #[cfg(not(unix))]
-fn refused_as_too_long(
+const fn refused_as_too_long(
 	_err: &std::io::Error,
 	_path: &[u8],
 	_argv: &[BString],

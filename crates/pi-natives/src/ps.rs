@@ -73,7 +73,8 @@ pub struct Process {
 #[napi]
 #[allow(clippy::use_self, reason = "napi return types must name the exported class")]
 impl Process {
-	/// Open a stable process reference from a PID.
+	/// Open a stable process reference from a PID: `null` when the process is
+	/// gone, or cannot be pinned (no descriptor left, `pidfd_open` blocked).
 	#[napi]
 	pub fn from_pid(pid: i32) -> Option<Process> {
 		core_process::Process::from_pid(pid).map(Self::from_inner)
@@ -100,27 +101,51 @@ impl Process {
 		self.inner.ppid()
 	}
 
+	/// How long ago this process started, in milliseconds: `null` when the
+	/// clock cannot be read. With a pid recorded together with the time its
+	/// process started, it tells that process (started no later) from one
+	/// that reused the pid (started after).
+	#[napi]
+	pub fn started_ago_ms(&self) -> Option<f64> {
+		self
+			.inner
+			.started_ago()
+			.map(|age| age.as_secs_f64() * 1_000.0)
+	}
+
 	/// Launch arguments for this process.
 	#[napi]
 	pub fn args(&self) -> Vec<String> {
 		self.inner.args()
 	}
 
-	/// Send `signal` to this process and its descendants, children first.
+	/// Send `signal` to this process and its descendants, children first, and
+	/// to its process group when it leads one; returns how many processes were
+	/// signalled.
 	///
 	/// On Linux and macOS the signal is forwarded as-is. On Windows there is no
 	/// signal abstraction, so the `signal` argument is ignored and the entire
 	/// tree is hard-killed via `TerminateProcess`. Defaults to the POSIX
 	/// hard-kill signal.
+	///
+	/// Throws when the walk could not read every process of the tree (no
+	/// descriptor left, say): everything it read, and the process group, were
+	/// signalled, but a descendant outside the group may not have been.
 	#[napi]
-	pub fn kill_tree(&self, signal: Option<i32>) -> u32 {
-		self.inner.kill_tree(signal)
+	pub fn kill_tree(&self, signal: Option<i32>) -> Result<u32> {
+		self
+			.inner
+			.kill_tree(signal)
+			.map_err(|err| napi::Error::from_reason(err.to_string()))
 	}
 
 	/// Gracefully terminate this process and its descendants.
 	///
 	/// By default this waits 1000ms after polite termination before
-	/// hard-killing. Pass `graceful_ms < 0` to skip the graceful phase.
+	/// hard-killing. Pass `graceful_ms < 0` to skip the graceful phase. Rejects
+	/// when the hard wave's walk could not read every process of the tree,
+	/// once everything it read (and the process group the root leads) was
+	/// killed.
 	#[napi]
 	pub fn terminate<'env>(
 		&self,
@@ -171,15 +196,18 @@ impl Process {
 		self.inner.group_id()
 	}
 
-	/// Direct children of this process as stable process references.
+	/// Direct children of this process as stable process references. Throws
+	/// when a candidate could not be read (no descriptor left, say): a child
+	/// may be missing from what was found.
 	#[napi]
-	pub fn children(&self) -> Vec<Process> {
-		self
+	pub fn children(&self) -> Result<Vec<Process>> {
+		Ok(self
 			.inner
 			.children()
+			.map_err(|err| napi::Error::from_reason(err.to_string()))?
 			.into_iter()
 			.map(Self::from_inner)
-			.collect()
+			.collect())
 	}
 
 	/// Current status of this process reference.

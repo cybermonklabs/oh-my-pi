@@ -175,13 +175,20 @@ pub(crate) fn run<'a>(
 						// Selection may legitimately include an ancestor — `pgrep`
 						// should still list the terminal — but signalling one would
 						// tear down the session this shell runs in. Refuse late, at
-						// delivery, so only the destructive mode is affected.
+						// delivery, so only the destructive mode is affected. An
+						// ancestor the snapshot could not read refuses every signal:
+						// the target may be one above it.
 						if host.blocks(process.pid()) {
 							if !options.quiet {
+								let why = match host.unread {
+									Some(unread) if !host.protects(process.pid()) => {
+										format!("cannot read process {unread} to check it is not the shell's ancestor")
+									},
+									_ => "this shell or one of its ancestors".to_owned(),
+								};
 								writeln!(
 									context.stderr(),
-									"{command_name}: refusing to signal pid {} (this shell or one of its \
-									 ancestors)",
+									"{command_name}: refusing to signal pid {} ({why})",
 									process.pid()
 								)?;
 							}

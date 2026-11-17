@@ -1933,4 +1933,94 @@ mod tests {
 		child.kill().unwrap();
 		child.wait().unwrap();
 	}
+
+	/// The guard fails closed: with no descriptor left to read the process
+	/// table, a signal at the shell's parent is still refused (the kernel
+	/// names the parent), and so is one at any other process, with the
+	/// reason, since it may be an ancestor above. The unreadable case runs
+	/// in a child test process ([`crate::sys::proc::short_of_descriptors`]);
+	/// first, the control: with every process readable, the parent is
+	/// refused and the unrelated `sleep` is not.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn signals_are_refused_while_the_ancestors_cannot_be_read() {
+		use crate::{host::check_signal_target, sys::proc::short_of_descriptors};
+		let mut child = std::process::Command::new("/bin/sleep")
+			.arg("30")
+			.spawn()
+			.unwrap();
+		let pid = child.id();
+		// SAFETY: getppid has no preconditions.
+		let parent = unsafe { libc::getppid() };
+		let readable =
+			(check_signal_target(parent), check_signal_target(i32::try_from(pid).unwrap()));
+		let probed =
+			short_of_descriptors::run("session::tests::signal_target_with_no_descriptor_left", pid);
+		child.kill().unwrap();
+		child.wait().unwrap();
+		assert_eq!(readable.0.unwrap_err().kind(), io::ErrorKind::PermissionDenied, "the parent");
+		assert!(readable.1.is_ok(), "the unrelated sleep {pid}: {:?}", readable.1);
+		probed.unwrap();
+	}
+
+	/// Run by [`signals_are_refused_while_the_ancestors_cannot_be_read`] in
+	/// a child process with no descriptor left.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by signals_are_refused_while_the_ancestors_cannot_be_read"]
+	fn signal_target_with_no_descriptor_left() {
+		use crate::{host::check_signal_target, sys::proc::short_of_descriptors};
+		let Some(sleep) = short_of_descriptors::pid() else {
+			return;
+		};
+		// SAFETY: getppid has no preconditions.
+		let parent = unsafe { libc::getppid() };
+		short_of_descriptors::leave_none();
+		let me = i32::try_from(std::process::id()).unwrap();
+		assert!(crate::sys::proc::info(me).is_none(), "/proc/{me}/stat could still be read");
+		assert!(crate::sys::proc::info(parent).is_none(), "/proc/{parent}/stat could still be read");
+		let err =
+			check_signal_target(parent).expect_err("the signal at the unreadable parent went through");
+		assert_eq!(err.to_string(), "refusing to signal the shell process");
+		let err = check_signal_target(sleep)
+			.expect_err("the signal went through while the ancestors were unread");
+		assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+		let said = format!(
+			"cannot read process {parent} to check it is not the shell's ancestor: Too many open \
+			 files"
+		);
+		assert_eq!(err.to_string(), said);
+	}
+
+	/// [`crate::sys::proc::read`] proves a process out of reach only when no
+	/// signal of ours reaches it: a reaped child is, whatever the read said
+	/// (`ESRCH`, or a refusal: `ENOENT`, `EACCES`, `EPERM`); a refused read of
+	/// a running child we may signal is not (no `/proc`, another pid
+	/// namespace's, a set-user-ID child), nor is a failure that proves nothing
+	/// (`EMFILE`).
+	#[cfg(unix)]
+	#[test]
+	fn a_failed_read_proves_a_process_out_of_reach_only_when_no_signal_reaches_it() {
+		let mut child = std::process::Command::new("/bin/sleep")
+			.arg("30")
+			.spawn()
+			.unwrap();
+		let pid = i32::try_from(child.id()).unwrap();
+		let running = crate::sys::proc::read(pid);
+		let reach = |errno| crate::sys::proc::out_of_reach(pid, &io::Error::from_raw_os_error(errno));
+		let refused_while_running =
+			[libc::ENOENT, libc::EACCES, libc::EPERM, libc::EMFILE].map(reach);
+		child.kill().unwrap();
+		child.wait().unwrap();
+		assert!(matches!(&running, Ok(Some(found)) if found.pid == pid), "{running:?}");
+		assert_eq!(
+			refused_while_running, [false; 4],
+			"ENOENT, EACCES, EPERM, EMFILE for a running child"
+		);
+		for errno in [libc::ESRCH, libc::ENOENT, libc::EACCES, libc::EPERM] {
+			assert!(reach(errno), "errno {errno} for the reaped child");
+		}
+		assert!(!reach(libc::EMFILE), "EMFILE proves nothing, even for the reaped child");
+		assert!(matches!(crate::sys::proc::read(pid), Ok(None)), "the reaped child");
+	}
 }

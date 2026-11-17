@@ -122,6 +122,11 @@ impl Context {
 			.stdin(Stdio::null())
 			.stdout(Stdio::from(stdout))
 			.stderr(Stdio::from(stderr));
+		// Its own process group: a stop reaches the command's whole tree
+		// through the group, with no read of the process table (which can
+		// fail: no descriptor left), as far as the tree stays in it.
+		#[cfg(unix)]
+		std::os::unix::process::CommandExt::process_group(&mut command, 0);
 		let mut child = match command.spawn() {
 			Ok(child) => child,
 			Err(error) => {
@@ -152,10 +157,15 @@ impl Context {
 		let status = match wait_result {
 			Ok(status) => status,
 			Err(error) => {
-				terminate_child_tree(&mut child);
+				let stopped = terminate_child_tree(&mut child);
 				let _ = child.wait();
 				remove_command_outputs(&stdout_path, &stderr_path);
-				return Err(error);
+				return Err(match stopped {
+					Ok(()) => error,
+					Err(unread) => error.context(format!(
+						"and its process tree could not be read whole to stop it: {unread}"
+					)),
+				});
 			},
 		};
 
@@ -218,14 +228,31 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
 	Ok(bytes)
 }
 
+/// Kill the command `child` and its tree: the descendants a walk can read,
+/// and the process group the command leads (`process_group(0)` at spawn,
+/// which its unreaped leader keeps from reuse), which needs no read.
+///
+/// # Errors
+///
+/// When the tree could not be read whole (`Process::kill_tree`), or the
+/// command could not be pinned to walk it: a descendant outside the group
+/// may not have been killed.
 #[cfg(any(unix, test))]
-fn terminate_child_tree(child: &mut std::process::Child) {
-	if let Ok(pid) = i32::try_from(child.id())
-		&& let Some(process) = pi_shell::proctree::Process::from_pid(pid)
-	{
-		let _ = process.kill_tree(None);
+fn terminate_child_tree(child: &mut std::process::Child) -> std::io::Result<()> {
+	let mut stopped = Ok(());
+	if let Ok(pid) = i32::try_from(child.id()) {
+		match pi_shell::proctree::Process::open(pid) {
+			Ok(Some(process)) => stopped = process.kill_tree(None).map(drop),
+			Ok(None) => {},
+			Err(error) => {
+				#[cfg(unix)]
+				let _ = pi_shell::proctree::kill_process_group(pid, pi_shell::proctree::KILL_SIGNAL);
+				stopped = Err(error);
+			},
+		}
 	}
 	let _ = child.kill();
+	stopped
 }
 
 #[cfg(any(unix, test))]

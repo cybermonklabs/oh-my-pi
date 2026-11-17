@@ -1112,6 +1112,7 @@ mod proc_snapshot {
 pub mod sys {
 	use std::{
 		ffi::c_void,
+		io,
 		os::windows::io::{AsRawHandle, HandleOrInvalid, HandleOrNull, OwnedHandle, RawHandle},
 		sync::Arc,
 	};
@@ -1286,6 +1287,45 @@ pub mod sys {
 				return None;
 			}
 			Some(self.entry)
+		}
+	}
+
+	/// `GetLastError` of a `Process32NextW` past the snapshot's last entry.
+	const ERROR_NO_MORE_FILES: i32 = 18;
+	/// `GetLastError` of an `OpenProcess` for a pid no process holds.
+	const ERROR_INVALID_PARAMETER: i32 = 87;
+
+	/// Every process, from one Toolhelp snapshot taken now, for a walk that
+	/// must not miss one: an error when the snapshot could not be taken, or
+	/// not read to its end (`processes` ends silently on either).
+	pub fn process_table() -> io::Result<Vec<ProcessEntry>> {
+		let snapshot = toolhelp_snapshot(TH32CS_SNAPPROCESS).ok_or_else(io::Error::last_os_error)?;
+		// SAFETY: the all-zero record is valid; its ABI size is set below.
+		let mut entry = unsafe { std::mem::zeroed::<ProcessEntry>() };
+		entry.size = size_of::<ProcessEntry>() as u32;
+		let mut table = Vec::new();
+		// SAFETY: the snapshot is open and the entry carries its ABI size.
+		let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &raw mut entry) };
+		while found != 0 {
+			table.push(entry);
+			// SAFETY: as above.
+			found = unsafe { Process32NextW(snapshot.as_raw_handle(), &raw mut entry) };
+		}
+		let error = io::Error::last_os_error();
+		if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) { Ok(table) } else { Err(error) }
+	}
+
+	/// Opens `pid` with `access`, as [`open_process`] does: `Ok(None)` when
+	/// no process holds `pid` (`ERROR_INVALID_PARAMETER`), `Err` when it could
+	/// not be opened for another reason (`ERROR_ACCESS_DENIED`, no memory or
+	/// handle left).
+	pub fn try_open_process(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {
+		match open_process(pid, access) {
+			Some(handle) => Ok(Some(handle)),
+			None => {
+				let error = io::Error::last_os_error();
+				if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) { Ok(None) } else { Err(error) }
+			},
 		}
 	}
 
@@ -1900,12 +1940,21 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
 ///
 /// Listing is unaffected: `pgrep` still reports ancestors and `ps` still shows
 /// them. Only signalling consults this.
+///
+/// The walk fails closed: a recorded parent missing from the snapshot that
+/// the caller can still signal (`kill(pid, 0)` succeeds) was not read, not
+/// gone, so the chain above it is unknown and every signal is refused
+/// ([`Self::unread`]). One that exited, or another user's, ends the walk: no
+/// signal of ours reaches it.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub struct HostProcesses {
 	/// This process and its ancestors, nearest first.
-	pub pids:  smallvec::SmallVec<[i32; 16]>,
+	pub pids:   smallvec::SmallVec<[i32; 16]>,
 	/// The process groups those processes belong to.
-	pub pgids: smallvec::SmallVec<[i32; 16]>,
+	pub pgids:  smallvec::SmallVec<[i32; 16]>,
+	/// An ancestor the snapshot did not read though the caller can signal it,
+	/// above which the chain is unknown.
+	pub unread: Option<i32>,
 }
 
 /// One process as the chain walk sees it.
@@ -1926,7 +1975,7 @@ struct ChainNode {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl HostProcesses {
 	/// Whether signalling `target` would reach this process or one of its
-	/// ancestors.
+	/// ancestors, or might, since an ancestor was not read ([`Self::unread`]).
 	///
 	/// `target` follows `kill(2)`: a positive value is a pid, `0` is the caller's
 	/// own process group, `-1` is every process the caller may signal, and any
@@ -1937,6 +1986,13 @@ impl HostProcesses {
 	/// process table once, not once per operand.
 	#[must_use]
 	pub fn blocks(&self, target: i32) -> bool {
+		self.unread.is_some() || self.protects(target)
+	}
+
+	/// Whether `target` (as [`Self::blocks`] takes it) is this process, one of
+	/// the ancestors read, or one of their process groups.
+	#[must_use]
+	pub fn protects(&self, target: i32) -> bool {
 		if target == -1 || target == 0 {
 			return true;
 		}
@@ -1951,9 +2007,9 @@ impl HostProcesses {
 	/// table to select its targets; this spares it a second).
 	pub(crate) fn resolve_in(all: &[ProcInfo]) -> Self {
 		let Ok(self_pid) = i32::try_from(std::process::id()) else {
-			return Self { pids: smallvec::SmallVec::new(), pgids: smallvec::SmallVec::new() };
+			return Self { pids: smallvec::SmallVec::new(), pgids: smallvec::SmallVec::new(), unread: None };
 		};
-		Self::walk(self_pid, |pid| {
+		let lookup = |pid| {
 			all
 				.iter()
 				.find(|process| process.pid() == pid)
@@ -1962,10 +2018,13 @@ impl HostProcesses {
 					pgid:  process.group_id(),
 					start: process.start_time(),
 				})
-		})
+		};
+		Self::walk(self_pid, lookup, signalable)
 	}
 
-	/// Walks from `self_pid` up through `lookup`, collecting the chain.
+	/// Walks from `self_pid` up through `lookup`, collecting the chain;
+	/// `signalable` says whether a pid missing from `lookup` is one the caller
+	/// can still signal (then it was not read, and the walk fails closed).
 	///
 	/// A recorded parent pid is followed only when the process holding it is both
 	/// **present** and **no younger than its child**. Presence alone is not enough:
@@ -1975,13 +2034,22 @@ impl HostProcesses {
 	/// its child, so a later start time identifies the impostor. Equal start times
 	/// are accepted, since a `fork` within one clock tick is indistinguishable at
 	/// this resolution.
-	fn walk(self_pid: i32, lookup: impl Fn(i32) -> Option<ChainNode>) -> Self {
+	fn walk(
+		self_pid: i32,
+		lookup: impl Fn(i32) -> Option<ChainNode>,
+		signalable: impl Fn(i32) -> bool,
+	) -> Self {
 		let mut pids = smallvec::SmallVec::new();
 		let mut pgids = smallvec::SmallVec::new();
+		let mut unread = None;
 
-		// We always protect ourselves, whether or not the snapshot lists us.
+		// We always protect ourselves, whether or not the snapshot lists us;
+		// unlisted, our parent is unknown.
 		pids.push(self_pid);
 		let mut node = lookup(self_pid);
+		if node.is_none() && signalable(self_pid) {
+			unread = Some(self_pid);
+		}
 		while let Some(current) = node {
 			if let Some(pgid) = current.pgid
 				&& !pgids.contains(&pgid)
@@ -1997,6 +2065,11 @@ impl HostProcesses {
 				break;
 			}
 			let Some(found) = lookup(parent) else {
+				// A live parent we may signal was not read: the chain above
+				// it is unknown.
+				if signalable(parent) {
+					unread = Some(parent);
+				}
 				break;
 			};
 			if found.start > current.start {
@@ -2005,8 +2078,23 @@ impl HostProcesses {
 			pids.push(parent);
 			node = Some(found);
 		}
-		Self { pids, pgids }
+		Self { pids, pgids, unread }
 	}
+}
+
+/// Whether the caller can signal `pid` (`kill(pid, 0)` succeeds): it exists,
+/// and is ours (or the caller may signal anyone's).
+#[cfg(unix)]
+fn signalable(pid: i32) -> bool {
+	// SAFETY: signal 0 sends nothing; it only checks the pid.
+	unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Windows' table lists every process the caller may open: one missing from
+/// it is gone.
+#[cfg(windows)]
+const fn signalable(_pid: i32) -> bool {
+	false
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -2106,6 +2194,7 @@ mod tests {
 		let host = HostProcesses::walk(
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, Some(1), Some(9), 90)]),
+			gone,
 		);
 		assert_eq!(host.pids.as_slice(), [100], "a younger impostor must not join the chain");
 		assert!(!host.pgids.contains(&9), "the impostor's group must not be protected either");
@@ -2118,6 +2207,7 @@ mod tests {
 		let host = HostProcesses::walk(
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, Some(1), Some(9), 10), (1, None, Some(1), 0)]),
+			gone,
 		);
 		assert_eq!(host.pids.as_slice(), [100, 42, 1], "the real chain must be walked to the root");
 		assert!(host.pgids.contains(&9), "an ancestor's group must be protected");
@@ -2131,16 +2221,40 @@ mod tests {
 		let host = HostProcesses::walk(
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, None, Some(7), 50)]),
+			gone,
 		);
 		assert_eq!(host.pids.as_slice(), [100, 42], "same-tick parent must still be an ancestor");
 	}
 
-	/// A parent absent from the table has exited and its number may already be
-	/// reused; the walk stops rather than protecting it.
+	/// A parent absent from the table that no signal of ours reaches has
+	/// exited (or is another user's) and its number may already be reused;
+	/// the walk stops rather than protecting it, and signals elsewhere go on.
 	#[test]
 	fn a_departed_parent_stops_the_walk() {
-		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]));
+		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), gone);
 		assert_eq!(host.pids.as_slice(), [100], "an unobserved parent must not join the chain");
+		assert_eq!(host.unread, None);
+		assert!(!host.blocks(42) && !host.blocks(4242), "the chain ends at us");
+	}
+
+	/// A parent absent from the table that we can still signal was not read
+	/// (no descriptor left, say), not gone: the chain above it is unknown, so
+	/// every signal is refused, while the chain read still says which pids
+	/// are ours. So too when our own entry was not read.
+	#[test]
+	fn an_unread_parent_we_can_signal_refuses_every_signal() {
+		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), |pid| pid == 42);
+		assert_eq!((host.pids.as_slice(), host.unread), (&[100][..], Some(42)));
+		assert!(host.blocks(4242) && host.blocks(-4242), "a signal went through above an unread ancestor");
+		assert!(host.protects(100) && !host.protects(4242));
+		let host = HostProcesses::walk(100, tree(&[]), |_| true);
+		assert_eq!((host.pids.as_slice(), host.unread), (&[100][..], Some(100)));
+		assert!(host.blocks(4242), "a signal went through with our own entry unread");
+	}
+
+	/// No pid is signalable: every missing one is gone.
+	fn gone(_pid: i32) -> bool {
+		false
 	}
 
 	/// A cycle in the recorded parent links must not spin forever.
@@ -2149,6 +2263,7 @@ mod tests {
 		let host = HostProcesses::walk(
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, Some(100), Some(7), 10)]),
+			gone,
 		);
 		assert_eq!(host.pids.as_slice(), [100, 42], "the cycle must close the walk");
 	}
@@ -2229,7 +2344,9 @@ mod tests {
 
 	/// Regression guard for the pid-recycling hazard: the chain comes from the
 	/// snapshot handed in, so a parent absent from it — exited, and its number free
-	/// for reuse — is never carried forward.
+	/// for reuse — is never carried forward. Our real parent is alive and ours
+	/// to signal, though: missing from the snapshot, it was not read, so the
+	/// chain fails closed (on Unix, where `kill(pid, 0)` can tell).
 	#[test]
 	fn a_departed_parent_leaves_no_stale_pid() {
 		let self_pid = i32::try_from(std::process::id()).expect("pid fits in i32");
@@ -2250,6 +2367,11 @@ mod tests {
 				!host.pids.contains(&parent),
 				"pid {parent} was carried forward despite being absent from the snapshot"
 			);
+			#[cfg(unix)]
+			{
+				assert_eq!(host.unread, Some(parent), "our live parent was taken for gone");
+				assert!(host.blocks(i32::MAX), "a signal went through above the unread parent");
+			}
 		}
 	}
 

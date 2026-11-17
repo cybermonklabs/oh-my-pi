@@ -899,8 +899,9 @@ async fn kill_builtin_signals_every_process_in_a_jobspec_pipeline() {
 			.parse::<i32>()
 			.expect("pipeline pid")
 	});
-	for pid in pids {
-		wait_until_stopped(&pinned_process(pid)).await;
+	let pinned = pids.map(pinned_process);
+	for process in &pinned {
+		wait_until_stopped(process).await;
 	}
 	assert_eq!(
 		session
@@ -921,8 +922,12 @@ async fn kill_builtin_signals_every_process_in_a_jobspec_pipeline() {
 		.run_test("wait %1", &stdio)
 		.await
 		.expect("reap jobspec");
-	for pid in pids {
-		assert!(proctree::Process::from_pid(pid).is_none(), "pipeline process {pid} survived");
+	// Gone: a read proves it (a failed read is no proof), or the pid now
+	// names a later process.
+	for process in &pinned {
+		let now = proc::read(process.pid).expect("the process table can be read");
+		let pid = process.pid;
+		assert!(now.is_none_or(|now| now.start != process.start), "pipeline process {pid} survived");
 	}
 }
 

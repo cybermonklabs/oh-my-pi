@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{HashMap, HashSet},
+	io,
 	time::Duration,
 };
 
@@ -19,14 +20,14 @@ use crate::cancel::CancelToken;
 mod platform {
 	use std::{
 		collections::HashSet,
-		fs,
-		os::fd::{AsFd, AsRawFd, OwnedFd},
+		fs, io,
+		os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
 		sync::Arc,
 	};
 
 	use pi_builtins::proc_sys as sys;
 
-	use super::ProcessStatus;
+	use super::{ProcessStatus, Walk, unread};
 
 	/// Stable Linux process reference backed by a pidfd.
 	#[derive(Clone)]
@@ -38,21 +39,61 @@ mod platform {
 
 	impl Process {
 		pub fn from_pid(pid: i32) -> Option<Self> {
+			Self::open(pid).ok().flatten()
+		}
+
+		/// The process `pid`, pinned: `Ok(None)` when it is gone, or no
+		/// signal of ours reaches it; `Err` when it could not be pinned or
+		/// read for a reason that proves nothing (no descriptor left,
+		/// `pidfd_open` unavailable).
+		pub fn open(pid: i32) -> io::Result<Option<Self>> {
+			Ok(Self::pin(pid)?.map(|(process, _)| process))
+		}
+
+		/// [`Process::open`], with the parent the kernel records for it.
+		fn pin(pid: i32) -> io::Result<Option<(Self, i32)>> {
 			if pid <= 0 {
-				return None;
+				return Ok(None);
 			}
-			let pidfd = Arc::new(sys::open_pidfd(pid)?);
-			let start_time = sys::start_time(pid)?;
-			Some(Self { pid, pidfd, start_time })
+			// SAFETY: pidfd_open takes scalar arguments and returns a new owned
+			// fd.
+			let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+			if fd < 0 {
+				let error = io::Error::last_os_error();
+				return if error.raw_os_error() == Some(libc::ESRCH) {
+					Ok(None)
+				} else {
+					Err(error)
+				};
+			}
+			// SAFETY: a successful pidfd_open returned a uniquely owned
+			// descriptor that fits an `i32`.
+			let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+			let Some(info) = crate::sys::proc::read(pid)? else {
+				return Ok(None);
+			};
+			Ok(Some((Self { pid, pidfd: Arc::new(pidfd), start_time: info.start }, info.ppid)))
 		}
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
 		}
 
-		pub fn children(&self) -> Vec<Self> {
-			if !self.live_identity() {
-				return Vec::new();
+		/// How long ago this process started, from the start time read when
+		/// it was pinned; `None` when the clock cannot be read.
+		pub fn started_ago(&self) -> Option<std::time::Duration> {
+			crate::sys::proc::age(self.start_time).ok()
+		}
+
+		/// The live children, and whether every candidate was read: `Err`
+		/// names what could not be, while this process still runs (a child it
+		/// had is now another's).
+		pub fn children(&self) -> Walk<Self> {
+			let mut walk = Walk::default();
+			// The pidfd pins the process: while it runs, its pid is its own,
+			// and no read is needed to know it.
+			if self.status() != ProcessStatus::Running {
+				return walk;
 			}
 
 			// `/proc/{pid}/task/{tid}/children` is per-task: a child fork()ed from
@@ -60,33 +101,41 @@ mod platform {
 			// Walk every task subdir and union the lists, then re-validate
 			// parentage.
 			let task_dir = format!("/proc/{}/task", self.pid);
-			let Ok(entries) = fs::read_dir(&task_dir) else {
-				return Vec::new();
-			};
-
 			let mut seen: HashSet<i32> = HashSet::new();
-			let mut out = Vec::new();
 			let mut children_file_available = false;
-			for entry in entries.flatten() {
-				let name = entry.file_name();
-				let Some(tid_str) = name.to_str() else {
-					continue;
-				};
-				if tid_str.parse::<i32>().is_err() {
-					continue;
-				}
-				let children_path = format!("/proc/{}/task/{}/children", self.pid, tid_str);
-				let Ok(content) = fs::read_to_string(&children_path) else {
-					continue;
-				};
-				// The file is readable -> this kernel has CONFIG_PROC_CHILDREN.
-				children_file_available = true;
-				for part in content.split_whitespace() {
-					let Ok(child_pid) = part.parse::<i32>() else {
-						continue;
-					};
-					self.push_validated_child(child_pid, &mut seen, &mut out);
-				}
+			match fs::read_dir(&task_dir) {
+				Ok(entries) => {
+					for entry in entries {
+						let entry = match entry {
+							Ok(entry) => entry,
+							Err(error) => {
+								self.note(&mut walk, &error, "list the threads of");
+								continue;
+							},
+						};
+						let name = entry.file_name();
+						let Some(tid) = name.to_str().filter(|tid| tid.parse::<i32>().is_ok()) else {
+							continue;
+						};
+						match fs::read_to_string(format!("{task_dir}/{tid}/children")) {
+							Ok(content) => {
+								// The file is readable -> this kernel has
+								// CONFIG_PROC_CHILDREN.
+								children_file_available = true;
+								for part in content.split_whitespace() {
+									if let Ok(child_pid) = part.parse::<i32>() {
+										self.push_validated_child(child_pid, &mut seen, &mut walk);
+									}
+								}
+							},
+							// The thread exited since the listing.
+							Err(error)
+								if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {},
+							Err(error) => self.note(&mut walk, &error, "read the children of"),
+						}
+					}
+				},
+				Err(error) => self.note(&mut walk, &error, "list the threads of"),
 			}
 
 			// Some Kata / microVM guest kernels are built without
@@ -97,28 +146,75 @@ mod platform {
 			// by parent pid, the same primitive the macOS path uses. Only taken
 			// when no `children` file was readable, so kernels that support it
 			// keep the cheap per-task fast path.
-			if !children_file_available {
-				for child_pid in sys::pids() {
-					self.push_validated_child(child_pid, &mut seen, &mut out);
+			if !children_file_available
+				&& walk.complete.is_ok()
+				&& self.status() == ProcessStatus::Running
+			{
+				match fs::read_dir("/proc") {
+					Ok(entries) => {
+						for entry in entries {
+							let entry = match entry {
+								Ok(entry) => entry,
+								Err(error) => {
+									self.note(
+										&mut walk,
+										&error,
+										"scan the process table for the children of",
+									);
+									continue;
+								},
+							};
+							if let Some(child_pid) =
+								entry.file_name().to_str().and_then(|n| n.parse().ok())
+							{
+								self.push_validated_child(child_pid, &mut seen, &mut walk);
+							}
+						}
+					},
+					Err(error) => {
+						self.note(&mut walk, &error, "scan the process table for the children of");
+					},
 				}
 			}
-			out
+			walk
+		}
+
+		/// Records `error`, a failure to read what this process's children
+		/// are, unless this process has exited meanwhile.
+		fn note(&self, walk: &mut Walk<Self>, error: &io::Error, what: &str) {
+			if self.status() == ProcessStatus::Running {
+				walk.fail(unread(error, format_args!("cannot {what} process {}", self.pid)));
+			}
 		}
 
 		/// Validate a candidate child pid — dedup, still running, and currently
-		/// parented to `self` — then push it onto `out`. Shared by the
+		/// parented to `self` — then push it onto `walk`. Shared by the
 		/// `/proc/<pid>/task/<tid>/children` fast path and the `/proc`-scan
-		/// fallback for kernels without `CONFIG_PROC_CHILDREN`.
-		fn push_validated_child(&self, child_pid: i32, seen: &mut HashSet<i32>, out: &mut Vec<Self>) {
+		/// fallback for kernels without `CONFIG_PROC_CHILDREN`. A candidate
+		/// that cannot be pinned or read makes the walk incomplete.
+		fn push_validated_child(
+			&self,
+			child_pid: i32,
+			seen: &mut HashSet<i32>,
+			walk: &mut Walk<Self>,
+		) {
 			if child_pid == self.pid || !seen.insert(child_pid) {
 				return;
 			}
-			let Some(child) = Self::from_pid(child_pid) else {
-				return;
-			};
-			if child.status() == ProcessStatus::Running && sys::parent_pid(child.pid) == Some(self.pid)
-			{
-				out.push(child);
+			match Self::pin(child_pid) {
+				Ok(Some((child, parent))) => {
+					if parent == self.pid && child.status() == ProcessStatus::Running {
+						walk.processes.push(child);
+					}
+				},
+				Ok(None) => {},
+				Err(error) => walk.fail(unread(
+					&error,
+					format_args!(
+						"cannot read process {child_pid}, a possible child of process {}",
+						self.pid
+					),
+				)),
 			}
 		}
 
@@ -204,20 +300,25 @@ mod platform {
 		}
 
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
-		/// by PID so concurrent reparenting cannot trap us in a cycle.
-		pub fn descendants(&self) -> Vec<Self> {
-			let mut out = Vec::new();
+		/// by PID so concurrent reparenting cannot trap us in a cycle. The walk
+		/// goes on past a process it cannot read, and reports the first.
+		pub fn descendants(&self) -> Walk<Self> {
+			let mut walk = Walk::default();
 			let mut visited = HashSet::new();
 			visited.insert(self.pid);
-			self.descendants_into(&mut out, &mut visited);
-			out
+			self.descendants_into(&mut walk, &mut visited);
+			walk
 		}
 
-		fn descendants_into(&self, out: &mut Vec<Self>, visited: &mut HashSet<i32>) {
-			for child in self.children() {
+		fn descendants_into(&self, walk: &mut Walk<Self>, visited: &mut HashSet<i32>) {
+			let children = self.children();
+			if let Err(error) = children.complete {
+				walk.fail(error);
+			}
+			for child in children.processes {
 				if visited.insert(child.pid) {
-					child.descendants_into(out, visited);
-					out.push(child);
+					child.descendants_into(walk, visited);
+					walk.processes.push(child);
 				}
 			}
 		}
@@ -245,12 +346,12 @@ mod platform {
 mod platform {
 	use std::{
 		collections::{HashMap, HashSet},
-		ptr,
+		io, ptr,
 	};
 
 	use pi_builtins::proc_sys as sys;
 
-	use super::ProcessStatus;
+	use super::{ProcessStatus, Walk, unread};
 
 	/// macOS does not expose pidfds; identity is pinned via the kernel-reported
 	/// process start time so a recycled PID does not silently impersonate the
@@ -264,23 +365,45 @@ mod platform {
 
 	impl Process {
 		pub fn from_pid(pid: i32) -> Option<Self> {
+			Self::open(pid).ok().flatten()
+		}
+
+		/// The process `pid`, pinned by its start time: `Ok(None)` when it is
+		/// gone, or no signal of ours reaches it; `Err` when it could not be
+		/// read for a reason that proves nothing.
+		pub fn open(pid: i32) -> io::Result<Option<Self>> {
 			if pid <= 0 {
-				return None;
+				return Ok(None);
 			}
-			let info = sys::bsdinfo(pid)?;
-			if i32::try_from(info.pbi_pid).ok()? != pid {
-				return None;
-			}
-			Some(Self { pid, start_tvsec: info.pbi_start_tvsec, start_tvusec: info.pbi_start_tvusec })
+			let Some(info) = crate::sys::proc::read(pid)? else {
+				return Ok(None);
+			};
+			// `ProcInfo::start` is µs since the epoch, `tvsec * 1e6 + tvusec`.
+			Ok(Some(Self {
+				pid,
+				start_tvsec: info.start / 1_000_000,
+				start_tvusec: info.start % 1_000_000,
+			}))
 		}
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
 		}
 
-		pub fn children(&self) -> Vec<Self> {
+		/// How long ago this process started, from the start time read when
+		/// it was pinned; `None` when the clock cannot be read.
+		pub fn started_ago(&self) -> Option<std::time::Duration> {
+			let start = self
+				.start_tvsec
+				.saturating_mul(1_000_000)
+				.saturating_add(self.start_tvusec);
+			crate::sys::proc::age(start).ok()
+		}
+
+		/// The live children, and whether every candidate was read.
+		pub fn children(&self) -> Walk<Self> {
 			if self.live_bsdinfo().is_none() {
-				return Vec::new();
+				return Walk::default();
 			}
 			// `proc_listchildpids` (the obvious choice) is broken on recent macOS
 			// kernels when queried for the *calling* process — it returns one byte
@@ -292,8 +415,10 @@ mod platform {
 			// `proc_listallpids` and filter on `pbi_ppid` instead; this is the
 			// same approach we already use for `find_by_path` and that the
 			// Windows implementation uses via Toolhelp snapshots.
-			let tree = build_process_tree();
-			Self::children_from_tree(self.pid, &tree)
+			let (tree, complete) = build_process_tree();
+			let mut walk = Walk { processes: Vec::new(), complete };
+			Self::children_from_tree(self.pid, &tree, &mut walk);
+			walk
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
@@ -328,36 +453,46 @@ mod platform {
 		}
 
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
-		/// by PID so concurrent reparenting cannot trap us in a cycle.
-		pub fn descendants(&self) -> Vec<Self> {
+		/// by PID so concurrent reparenting cannot trap us in a cycle. The walk
+		/// goes on past a process it cannot read, and reports the first.
+		pub fn descendants(&self) -> Walk<Self> {
 			// One process-table snapshot per walk — building it inside the
 			// recursion would re-scan every pid for every visited node,
 			// producing an `O(N · D)` kernel call pattern. Mirrors the Windows
 			// implementation.
-			let tree = build_process_tree();
-			let mut out = Vec::new();
+			let (tree, complete) = build_process_tree();
+			let mut walk = Walk { processes: Vec::new(), complete };
 			let mut visited = HashSet::new();
 			visited.insert(self.pid);
-			Self::collect_descendants_from_tree(self.pid, &tree, &mut visited, &mut out);
-			out
+			Self::collect_descendants_from_tree(self.pid, &tree, &mut visited, &mut walk);
+			walk
 		}
 
-		fn children_from_tree(parent: i32, tree: &HashMap<i32, Vec<i32>>) -> Vec<Self> {
-			let Some(child_pids) = tree.get(&parent) else {
-				return Vec::new();
-			};
-			child_pids
-				.iter()
-				.copied()
-				.filter_map(Self::from_pid)
-				.collect()
+		/// The pinned process `child_pid`, or a failure to pin it recorded in
+		/// `walk`.
+		fn pin_child(child_pid: i32, walk: &mut Walk<Self>) -> Option<Self> {
+			match Self::open(child_pid) {
+				Ok(child) => child,
+				Err(error) => {
+					walk.fail(unread(&error, format_args!("cannot read process {child_pid}")));
+					None
+				},
+			}
+		}
+
+		fn children_from_tree(parent: i32, tree: &HashMap<i32, Vec<i32>>, walk: &mut Walk<Self>) {
+			for &child_pid in tree.get(&parent).into_iter().flatten() {
+				if let Some(child) = Self::pin_child(child_pid, walk) {
+					walk.processes.push(child);
+				}
+			}
 		}
 
 		fn collect_descendants_from_tree(
 			parent: i32,
 			tree: &HashMap<i32, Vec<i32>>,
 			visited: &mut HashSet<i32>,
-			out: &mut Vec<Self>,
+			walk: &mut Walk<Self>,
 		) {
 			let Some(child_pids) = tree.get(&parent) else {
 				return;
@@ -366,13 +501,13 @@ mod platform {
 				if !visited.insert(child_pid) {
 					continue;
 				}
-				let Some(child) = Self::from_pid(child_pid) else {
+				let Some(child) = Self::pin_child(child_pid, walk) else {
 					continue;
 				};
 				// Post-order: grandchildren first, so leaf processes get signalled
 				// before their parents during tree termination.
-				Self::collect_descendants_from_tree(child_pid, tree, visited, out);
-				out.push(child);
+				Self::collect_descendants_from_tree(child_pid, tree, visited, walk);
+				walk.processes.push(child);
 			}
 		}
 
@@ -441,26 +576,21 @@ mod platform {
 		}
 	}
 
-	/// Build a `ppid -> [pids]` map from a one-shot scan of `proc_listallpids`.
+	/// Build a `ppid -> [pids]` map from a one-shot scan of the process table
+	/// ([`crate::sys::proc::scan`]), and whether the scan read every process
+	/// that may be one of ours.
 	///
 	/// Used as the foundation of `Process::children` and `Process::descendants`
 	/// on macOS where `proc_listchildpids` returns no children for self-queries.
-	pub(super) fn build_process_tree() -> HashMap<i32, Vec<i32>> {
-		let pids = sys::pids();
-		let mut tree: HashMap<i32, Vec<i32>> = HashMap::with_capacity(pids.len() / 2);
-		for pid in pids {
-			let Some(info) = sys::bsdinfo(pid) else {
-				continue;
-			};
-			let Ok(ppid) = i32::try_from(info.pbi_ppid) else {
-				continue;
-			};
-			if ppid <= 0 {
-				continue;
+	pub(super) fn build_process_tree() -> (HashMap<i32, Vec<i32>>, io::Result<()>) {
+		let (table, complete) = crate::sys::proc::scan();
+		let mut tree: HashMap<i32, Vec<i32>> = HashMap::with_capacity(table.len() / 2);
+		for info in table {
+			if info.ppid > 0 {
+				tree.entry(info.ppid).or_default().push(info.pid);
 			}
-			tree.entry(ppid).or_default().push(pid);
 		}
-		tree
+		(tree, complete)
 	}
 
 	/// Find processes whose libproc-reported executable path equals `target`.
@@ -485,10 +615,12 @@ mod platform {
 	use pi_builtins::proc_sys as sys;
 	use smallvec::SmallVec;
 
-	use super::ProcessStatus;
+	use super::{ProcessStatus, Walk, unread};
 
 	const PROCESS_REFERENCE_ACCESS: u32 =
 		sys::PROCESS_TERMINATE | sys::PROCESS_QUERY_LIMITED_INFORMATION | sys::SYNCHRONIZE;
+	/// `GetLastError` of an `OpenProcess` refused the access asked for.
+	const ERROR_ACCESS_DENIED: i32 = 5;
 
 	#[derive(Clone)]
 	/// Stable Windows process reference backed by an owned process handle plus
@@ -502,17 +634,49 @@ mod platform {
 
 	impl Process {
 		pub fn from_pid(pid: i32) -> Option<Self> {
-			if pid <= 0 {
-				return None;
+			Self::open(pid).ok().flatten()
+		}
+
+		/// The process `pid`, pinned by a handle and its creation time:
+		/// `Ok(None)` when no process holds `pid` (`OpenProcess` gives
+		/// `ERROR_INVALID_PARAMETER`), or when the open is refused the access
+		/// a kill needs (`ERROR_ACCESS_DENIED`: no `TerminateProcess` of ours
+		/// reaches it, as `EPERM` on Unix); `Err` for any other failure (no
+		/// memory or handle left), which proves nothing.
+		pub fn open(pid: i32) -> std::io::Result<Option<Self>> {
+			let Ok(id) = u32::try_from(pid) else {
+				return Ok(None);
+			};
+			if id == 0 {
+				return Ok(None);
 			}
-			let handle =
-				Arc::new(sys::open_process(u32::try_from(pid).ok()?, PROCESS_REFERENCE_ACCESS)?);
-			let creation_time = sys::process_times(&handle)?.0;
-			Some(Self { pid, handle, creation_time })
+			let handle = match sys::try_open_process(id, PROCESS_REFERENCE_ACCESS) {
+				Ok(Some(handle)) => handle,
+				Ok(None) => return Ok(None),
+				Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => return Ok(None),
+				Err(error) => return Err(error),
+			};
+			let creation_time = sys::process_times(&handle)
+				.ok_or_else(std::io::Error::last_os_error)?
+				.0;
+			Ok(Some(Self { pid, handle: Arc::new(handle), creation_time }))
 		}
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
+		}
+
+		/// How long ago this process started, from its creation time; `None`
+		/// when the clock reads before the process's creation.
+		pub fn started_ago(&self) -> Option<std::time::Duration> {
+			/// 100 ns ticks from 1601 (FILETIME's epoch) to 1970.
+			const UNIX_EPOCH_TICKS: u128 = 116_444_736_000_000_000;
+			let since = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.ok()?;
+			let now = since.as_nanos() / 100 + UNIX_EPOCH_TICKS;
+			let ticks = now.checked_sub(u128::from(self.creation_time))?;
+			Some(std::time::Duration::from_nanos(u64::try_from(ticks * 100).ok()?))
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
@@ -526,9 +690,14 @@ mod platform {
 				.map_or_default(|command_line| sys::split_command_line(&command_line))
 		}
 
-		pub fn children(&self) -> Vec<Self> {
-			let tree = build_process_tree();
-			self.children_from_tree(&tree)
+		/// The children in one Toolhelp snapshot; the walk is incomplete when
+		/// the snapshot could not be taken or read whole, or a child could not
+		/// be opened ([`Process::open`]).
+		pub fn children(&self) -> Walk<Self> {
+			let (tree, complete) = build_process_tree();
+			let mut walk = Walk { processes: Vec::new(), complete };
+			walk.processes = self.children_from_tree(&tree, &mut walk);
+			walk
 		}
 
 		/// Walk the entire descendant tree using a single Toolhelp snapshot.
@@ -536,25 +705,38 @@ mod platform {
 		/// `children()` recursing per-node would re-snapshot the whole process
 		/// table for every visited descendant, making tree termination
 		/// `O(N · D)` snapshots. One snapshot per termination wave is enough.
-		pub fn descendants(&self) -> Vec<Self> {
-			let tree = build_process_tree();
+		pub fn descendants(&self) -> Walk<Self> {
+			let (tree, complete) = build_process_tree();
+			let mut walk = Walk { processes: Vec::new(), complete };
 			let Ok(root) = u32::try_from(self.pid) else {
-				return Vec::new();
+				return walk;
 			};
 			let mut visited: HashSet<u32> = HashSet::new();
 			visited.insert(root);
-			let mut out = Vec::new();
-			self.collect_descendants_from_tree(&tree, &mut visited, &mut out);
-			out
+			self.collect_descendants_from_tree(&tree, &mut visited, &mut walk);
+			walk
 		}
 
 		/// The running process `child_pid`, when it really is a child of
 		/// `self`. Windows never rewrites the parent id recorded for a process
 		/// whose parent exited, so such an orphan is listed as a child of
 		/// whichever process reuses that pid. A real child cannot have been
-		/// created before its parent; an orphan older than `self` can.
-		fn child(&self, child_pid: u32) -> Option<Self> {
-			let child = Self::from_pid(i32::try_from(child_pid).ok()?)?;
+		/// created before its parent; an orphan older than `self` can. A
+		/// candidate that cannot be opened makes `walk` incomplete.
+		fn child(&self, child_pid: u32, walk: &mut Walk<Self>) -> Option<Self> {
+			let child = match Self::open(i32::try_from(child_pid).ok()?) {
+				Ok(child) => child?,
+				Err(error) => {
+					walk.fail(unread(
+						&error,
+						format_args!(
+							"cannot open process {child_pid}, a possible child of process {}",
+							self.pid
+						),
+					));
+					return None;
+				},
+			};
 			(child.creation_time >= self.creation_time && child.status() == ProcessStatus::Running)
 				.then_some(child)
 		}
@@ -562,6 +744,7 @@ mod platform {
 		pub(super) fn children_from_tree(
 			&self,
 			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
+			walk: &mut Walk<Self>,
 		) -> Vec<Self> {
 			let Ok(pid_u32) = u32::try_from(self.pid) else {
 				return Vec::new();
@@ -570,7 +753,7 @@ mod platform {
 				.get(&pid_u32)
 				.into_iter()
 				.flatten()
-				.filter_map(|&child_pid| self.child(child_pid))
+				.filter_map(|&child_pid| self.child(child_pid, walk))
 				.collect()
 		}
 
@@ -578,7 +761,7 @@ mod platform {
 			&self,
 			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
 			visited: &mut HashSet<u32>,
-			out: &mut Vec<Self>,
+			walk: &mut Walk<Self>,
 		) {
 			let Some(children) = u32::try_from(self.pid).ok().and_then(|pid| tree.get(&pid)) else {
 				return;
@@ -587,13 +770,13 @@ mod platform {
 				if !visited.insert(child_pid) {
 					continue;
 				}
-				let Some(child) = self.child(child_pid) else {
+				let Some(child) = self.child(child_pid, walk) else {
 					continue;
 				};
 				// Post-order: collect grandchildren first so leaves are signalled
 				// before their parents during tree termination.
-				child.collect_descendants_from_tree(tree, visited, out);
-				out.push(child);
+				child.collect_descendants_from_tree(tree, visited, walk);
+				walk.processes.push(child);
 			}
 		}
 
@@ -622,13 +805,20 @@ mod platform {
 		}
 	}
 
-	/// Build a map of `parent_pid` -> [`child_pids`] for all processes.
-	fn build_process_tree() -> HashMap<u32, SmallVec<[u32; 4]>> {
+	/// Build a map of `parent_pid` -> [`child_pids`] for all processes, and
+	/// whether the snapshot was taken and read whole.
+	pub(super) fn build_process_tree() -> (HashMap<u32, SmallVec<[u32; 4]>>, std::io::Result<()>) {
 		let mut tree: HashMap<u32, SmallVec<[u32; 4]>> = HashMap::new();
-		for entry in sys::processes() {
+		let table = match sys::process_table() {
+			Ok(table) => table,
+			Err(error) => {
+				return (tree, Err(unread(&error, format_args!("cannot list the processes"))));
+			},
+		};
+		for entry in table {
 			tree.entry(entry.ppid).or_default().push(entry.pid);
 		}
-		tree
+		(tree, Ok(()))
 	}
 
 	/// Find processes whose `QueryFullProcessImageNameW` result equals `target`.
@@ -652,9 +842,22 @@ pub struct Process {
 }
 
 impl Process {
-	/// Open a stable process reference from a PID.
+	/// Open a stable process reference from a PID: `None` when the process is
+	/// gone, or cannot be pinned ([`Process::open`] tells the two apart).
 	pub fn from_pid(pid: i32) -> Option<Self> {
 		platform::Process::from_pid(pid).map(Self::from_inner)
+	}
+
+	/// Open a stable process reference from a PID: `Ok(None)` when the
+	/// process is gone, or no signal of ours reaches it.
+	///
+	/// # Errors
+	///
+	/// When the process could not be pinned or read for a reason that proves
+	/// nothing (no descriptor left, `pidfd_open` unavailable; on Windows, an
+	/// `OpenProcess` failure other than no such process or access denied).
+	pub fn open(pid: i32) -> io::Result<Option<Self>> {
+		Ok(platform::Process::open(pid)?.map(Self::from_inner))
 	}
 
 	/// Open stable process references whose executable path matches exactly.
@@ -669,6 +872,14 @@ impl Process {
 	#[must_use]
 	pub const fn pid(&self) -> i32 {
 		self.inner.pid()
+	}
+
+	/// How long ago this process started; `None` when the clock cannot be
+	/// read. A pid recorded with its start time names this process only if
+	/// it started no later than then: one that reused the pid started after.
+	#[must_use]
+	pub fn started_ago(&self) -> Option<Duration> {
+		self.inner.started_ago()
 	}
 
 	/// Parent process id for this process, when available.
@@ -690,14 +901,21 @@ impl Process {
 		self.inner.kill(signal)
 	}
 
-	/// Send `signal` to this process and its descendants, children first.
+	/// Send `signal` to this process and its descendants, children first, and
+	/// to its process group when it leads one; returns how many processes it
+	/// signalled.
 	///
 	/// On Linux and macOS the signal is forwarded as-is. On Windows there is no
 	/// signal abstraction, so the `signal` argument is ignored and the entire
 	/// tree is hard-killed via `TerminateProcess`. Defaults to the POSIX
 	/// hard-kill signal.
-	#[must_use]
-	pub fn kill_tree(&self, signal: Option<i32>) -> u32 {
+	///
+	/// # Errors
+	///
+	/// When the walk could not read every process of the tree: everything it
+	/// read is signalled first (and the group, which needs no read), but a
+	/// descendant it could not read, outside the group, may not have been.
+	pub fn kill_tree(&self, signal: Option<i32>) -> io::Result<u32> {
 		self.signal_tree(signal.unwrap_or(KILL_SIGNAL))
 	}
 
@@ -715,13 +933,15 @@ impl Process {
 	}
 
 	/// Direct children of this process as stable process references.
-	pub fn children(&self) -> Vec<Self> {
-		self
-			.inner
-			.children()
-			.into_iter()
-			.map(Self::from_inner)
-			.collect()
+	///
+	/// # Errors
+	///
+	/// When a candidate could not be read for a reason that proves nothing:
+	/// a child may be missing from what was found.
+	pub fn children(&self) -> io::Result<Vec<Self>> {
+		let walk = self.inner.children();
+		walk.complete?;
+		Ok(walk.processes.into_iter().map(Self::from_inner).collect())
 	}
 
 	/// Current status of this process reference.
@@ -737,6 +957,11 @@ impl Process {
 	/// exit before escalating to `KILL_SIGNAL`. Pass `graceful_ms < 0` to skip
 	/// the wait entirely (the polite signal is still emitted). Returns `true`
 	/// when the tree has exited by the end of the hard wave's wait window.
+	///
+	/// A wave whose walk could not read the whole tree also signals the
+	/// process group the root leads, if any (it needs no read); and the call
+	/// fails once the hard wave is sent if its walk was incomplete, since a
+	/// descendant it could not read may still run.
 	pub async fn terminate_tree(
 		&self,
 		group: bool,
@@ -763,17 +988,22 @@ impl Process {
 	/// Walk the live descendant tree from scratch. Cheap and idempotent — call
 	/// it again before each signal wave so grandchildren spawned during a grace
 	/// period are not missed.
-	fn live_descendants(&self) -> Vec<Self> {
-		self
-			.inner
-			.descendants()
-			.into_iter()
-			.map(Self::from_inner)
-			.collect()
+	fn live_descendants(&self) -> Walk<Self> {
+		let walk = self.inner.descendants();
+		Walk {
+			processes: walk.processes.into_iter().map(Self::from_inner).collect(),
+			complete:  walk.complete,
+		}
 	}
 
-	fn signal_tree(&self, signal: i32) -> u32 {
+	fn signal_tree(&self, signal: i32) -> io::Result<u32> {
 		self.signal_tree_excluding(signal, &host_protected_pids())
+	}
+
+	/// The process group this process leads, which a signal reaches without
+	/// reading the process table.
+	fn own_group(&self) -> Option<i32> {
+		self.group_id().filter(|&pgid| pgid == self.inner.pid())
 	}
 
 	/// Signal this process and its live descendants (children first), skipping
@@ -786,18 +1016,17 @@ impl Process {
 	/// pid matches the harness's stale parent pid makes the harness enumerate
 	/// as a false descendant; `TerminateProcess`-ing it drops the whole session
 	/// with no cleanup and no `session_exit` record (#7452, related #4605).
-	fn signal_tree_excluding(&self, signal: i32, protected: &HashSet<i32>) -> u32 {
+	fn signal_tree_excluding(&self, signal: i32, protected: &HashSet<i32>) -> io::Result<u32> {
 		let descendants = self.signalable_descendants(protected);
 		let mut signaled = 0u32;
 		// If self leads its own process group, also signal the group — this
 		// catches grandchildren reparented to init when their immediate parent
-		// died inside the descendant walk.
-		if let Some(pgid) = self.group_id()
-			&& pgid == self.inner.pid()
-		{
+		// died inside the descendant walk, and those the walk could not read.
+		let group = self.own_group();
+		if let Some(pgid) = group {
 			let _ = kill_process_group(pgid, signal);
 		}
-		for child in &descendants {
+		for child in &descendants.processes {
 			if child.inner.kill(signal) {
 				signaled += 1;
 			}
@@ -805,7 +1034,10 @@ impl Process {
 		if !protected.contains(&self.pid()) && self.inner.kill(signal) {
 			signaled += 1;
 		}
-		signaled
+		descendants
+			.complete
+			.map(|()| signaled)
+			.map_err(|error| partly_signalled(&error, signaled, group))
 	}
 
 	/// Live descendants with every protected subtree pruned, not just the exact
@@ -817,16 +1049,40 @@ impl Process {
 	/// exact protected pid would still terminate those unrelated worker/tool
 	/// subprocesses, so drop every node whose recorded parent chain — within the
 	/// enumerated set — passes through a protected pid (#7452 review).
-	fn signalable_descendants(&self, protected: &HashSet<i32>) -> Vec<Self> {
-		let descendants = self.live_descendants();
-		let parents: HashMap<i32, i32> = descendants
+	fn signalable_descendants(&self, protected: &HashSet<i32>) -> Walk<Self> {
+		let mut walk = self.live_descendants();
+		let parents: HashMap<i32, i32> = walk
+			.processes
 			.iter()
 			.filter_map(|descendant| descendant.ppid().map(|parent| (descendant.pid(), parent)))
 			.collect();
+		walk
+			.processes
+			.retain(|descendant| !pid_in_protected_subtree(descendant.pid(), protected, &parents));
+		walk
+	}
+
+	/// One signal wave: the group (`group`, or the one the root leads when
+	/// the walk is incomplete), every live descendant, then the root. Returns
+	/// the walk, for the wait.
+	fn signal_wave(&self, signal: i32, group: Option<i32>, protected: &HashSet<i32>) -> Walk<Self> {
+		if let Some(pgid) = group {
+			let _ = kill_process_group(pgid, signal);
+		}
+		let descendants = self.signalable_descendants(protected);
+		for child in &descendants.processes {
+			let _ = child.inner.kill(signal);
+		}
+		if !protected.contains(&self.pid()) {
+			let _ = self.inner.kill(signal);
+		}
+		if descendants.complete.is_err()
+			&& group.is_none()
+			&& let Some(pgid) = self.own_group()
+		{
+			let _ = kill_process_group(pgid, signal);
+		}
 		descendants
-			.into_iter()
-			.filter(|descendant| !pid_in_protected_subtree(descendant.pid(), protected, &parents))
-			.collect()
 	}
 
 	async fn terminate_tree_impl(
@@ -844,49 +1100,90 @@ impl Process {
 		let protected = host_protected_pids();
 
 		// Polite wave: SIGTERM the group, every live descendant, then the root.
-		if let Some(pgid) = process_group {
-			let _ = kill_process_group(pgid, TERM_SIGNAL);
-		}
-		let mut descendants = self.signalable_descendants(&protected);
-		for child in &descendants {
-			let _ = child.inner.kill(TERM_SIGNAL);
-		}
-		if !protected.contains(&self.pid()) {
-			let _ = self.inner.kill(TERM_SIGNAL);
-		}
+		let polite = self.signal_wave(TERM_SIGNAL, process_group, &protected);
 
 		// Optional grace wait. A negative `graceful_ms` skips the wait entirely
 		// (we still emit the polite signal so cleanup handlers can run before
-		// KILL).
+		// KILL). An incomplete walk proves no exit: the hard wave follows.
 		if graceful_ms >= 0 {
 			let exited = wait_for_exit(
 				self,
-				&descendants,
+				&polite.processes,
 				Some(Duration::from_millis(graceful_ms as u64)),
 				ct.clone(),
 			)
 			.await?;
-			if exited {
+			if exited && polite.complete.is_ok() {
 				return Ok(true);
 			}
 		}
 
 		// Hard wave. Re-walk the tree so any grandchild spawned during the grace
 		// period — or any process re-parented to the root — is signalled too.
-		if let Some(pgid) = process_group {
-			let _ = kill_process_group(pgid, KILL_SIGNAL);
+		let hard = self.signal_wave(KILL_SIGNAL, process_group, &protected);
+		let exited = wait_for_exit(
+			self,
+			&hard.processes,
+			Some(Duration::from_millis(u64::from(timeout_ms))),
+			ct,
+		)
+		.await?;
+		match hard.complete {
+			Ok(()) => Ok(exited),
+			Err(error) => {
+				let group = process_group.or_else(|| self.own_group());
+				Err(
+					partly_signalled(
+						&error,
+						u32::try_from(hard.processes.len()).unwrap_or(u32::MAX),
+						group,
+					)
+					.into(),
+				)
+			},
 		}
-		descendants = self.signalable_descendants(&protected);
-		for child in &descendants {
-			let _ = child.inner.kill(KILL_SIGNAL);
-		}
-		if !protected.contains(&self.pid()) {
-			let _ = self.inner.kill(KILL_SIGNAL);
-		}
-
-		wait_for_exit(self, &descendants, Some(Duration::from_millis(u64::from(timeout_ms))), ct)
-			.await
 	}
+}
+
+/// A walk of a process tree: the processes found, and the first process it
+/// could not read for a reason that proves nothing, after which a process of
+/// the tree may be missing from what was found.
+struct Walk<P> {
+	processes: Vec<P>,
+	complete:  io::Result<()>,
+}
+
+impl<P> Default for Walk<P> {
+	fn default() -> Self {
+		Self { processes: Vec::new(), complete: Ok(()) }
+	}
+}
+
+impl<P> Walk<P> {
+	/// Records `error` unless an earlier one was.
+	fn fail(&mut self, error: io::Error) {
+		if self.complete.is_ok() {
+			self.complete = Err(error);
+		}
+	}
+}
+
+/// `error`, a failed read, as `WHAT: strerror`.
+fn unread(error: &io::Error, what: std::fmt::Arguments<'_>) -> io::Error {
+	io::Error::new(error.kind(), format!("{what}: {}", crate::bash::diag::strerror(error)))
+}
+
+/// `error`, which left a walk incomplete, once `signalled` processes of the
+/// tree (and the process group `group`, if any) were signalled.
+fn partly_signalled(error: &io::Error, signalled: u32, group: Option<i32>) -> io::Error {
+	let group = group.map_or_else(String::new, |pgid| format!(" and process group {pgid}"));
+	io::Error::new(
+		error.kind(),
+		format!(
+			"{error}: signalled {signalled} processes of the tree{group}, but one the walk could not \
+			 read may not have been"
+		),
+	)
 }
 
 /// The harness pid — the one process a run-cancellation sweep must never
@@ -1115,16 +1412,25 @@ impl TerminationTargets {
 		self.pgids.is_empty() && self.processes.is_empty()
 	}
 
-	/// Send `signal` to every recorded target. Failures are swallowed:
-	/// targets routinely exit between collection and signalling, and
-	/// the caller's policy is "best effort".
-	pub fn signal(&self, signal: i32) {
+	/// Send `signal` to every recorded target. A target that already exited
+	/// is no failure: targets routinely exit between collection and
+	/// signalling, and the caller's policy is "best effort".
+	///
+	/// # Errors
+	///
+	/// The first tree whose walk could not read every process, once every
+	/// target was signalled ([`Process::kill_tree`]).
+	pub fn signal(&self, signal: i32) -> io::Result<()> {
 		for &pgid in &self.pgids {
 			let _ = kill_process_group(pgid, signal);
 		}
+		let mut complete = Ok(());
 		for process in &self.processes {
-			let _ = process.signal_tree(signal);
+			if let Err(error) = process.signal_tree(signal) {
+				complete = complete.and(Err(error));
+			}
 		}
+		complete
 	}
 }
 
@@ -1168,7 +1474,9 @@ mod tests {
 		// Treat the child's pid as protected (standing in for the harness/an
 		// ancestor). The sweep must refuse to signal it.
 		let protected: HashSet<i32> = HashSet::from([child_pid]);
-		let signaled = root.signal_tree_excluding(KILL_SIGNAL, &protected);
+		let signaled = root
+			.signal_tree_excluding(KILL_SIGNAL, &protected)
+			.expect("a whole walk");
 		assert_eq!(signaled, 0, "a protected root must never be signalled");
 
 		// The protected process is still alive after the sweep.
@@ -1181,7 +1489,9 @@ mod tests {
 
 		// With no protection the same sweep reaps it — proves the skip is what
 		// spared it, not a dead target.
-		let reaped = root.signal_tree_excluding(KILL_SIGNAL, &HashSet::new());
+		let reaped = root
+			.signal_tree_excluding(KILL_SIGNAL, &HashSet::new())
+			.expect("a whole walk");
 		assert!(reaped >= 1, "an unprotected root must be signalled");
 		let _ = child.wait();
 	}
@@ -1244,13 +1554,15 @@ mod tests {
 		// parent, as it would after its own parent exited and the pid was reused.
 		let tree = HashMap::from([(newer_pid, smallvec::SmallVec::from_slice(&[older_pid]))]);
 		assert!(
-			pin(newer_pid).children_from_tree(&tree).is_empty(),
+			pin(newer_pid)
+				.children_from_tree(&tree, &mut Walk::default())
+				.is_empty(),
 			"an older process is not a child"
 		);
 
 		// The same entry is accepted when the listed child is newer.
 		let tree = HashMap::from([(older_pid, smallvec::SmallVec::from_slice(&[newer_pid]))]);
-		let children = pin(older_pid).children_from_tree(&tree);
+		let children = pin(older_pid).children_from_tree(&tree, &mut Walk::default());
 		assert_eq!(
 			children
 				.iter()
@@ -1263,6 +1575,34 @@ mod tests {
 		let _ = newer.kill();
 		let _ = older.wait();
 		let _ = newer.wait();
+	}
+
+	/// `open` tells a pid no process holds (`OpenProcess` gives
+	/// `ERROR_INVALID_PARAMETER`) from a live process: `Ok(None)` once the
+	/// child is reaped and its last handle closed, `Ok(Some)` while it runs;
+	/// and a walk over a snapshot read whole is complete.
+	#[cfg(windows)]
+	#[test]
+	fn open_tells_a_process_that_is_gone_from_a_live_one() {
+		let mut child = std::process::Command::new("ping")
+			.args(["-n", "30", "127.0.0.1"])
+			.stdout(std::process::Stdio::null())
+			.spawn()
+			.expect("spawn sleeper");
+		let pid = i32::try_from(child.id()).unwrap();
+		let live = platform::Process::open(pid).expect("open a live child");
+		assert!(live.as_ref().is_some_and(|process| process.pid() == pid));
+		let me = platform::Process::open(i32::try_from(std::process::id()).unwrap())
+			.unwrap()
+			.unwrap();
+		let walk = me.children();
+		assert!(walk.complete.is_ok(), "{:?}", walk.complete);
+		assert!(walk.processes.iter().any(|process| process.pid() == pid), "the child is not listed");
+		drop((live, walk));
+		let _ = child.kill();
+		let _ = child.wait();
+		drop(child);
+		assert!(matches!(platform::Process::open(pid), Ok(None)), "the reaped child is not gone");
 	}
 
 	/// `kill_process_group` is the last line of defense: even if a future
@@ -1311,8 +1651,10 @@ mod tests {
 		// within milliseconds in practice; 1s is a comfortable upper bound.
 		let mut found = false;
 		for _ in 0..40 {
-			if harness
-				.live_descendants()
+			let walk = harness.live_descendants();
+			assert!(walk.complete.is_ok(), "{:?}", walk.complete);
+			if walk
+				.processes
 				.iter()
 				.any(|descendant| descendant.pid() == child_pid)
 			{
@@ -1402,5 +1744,121 @@ mod tests {
 			.expect("wait result");
 		assert!(exited, "exit resolves the wait");
 		let _ = child.wait();
+	}
+
+	/// `started_ago` measures from the process's own start: this test
+	/// process started before the child it spawns, and the child's age is
+	/// about the time since its spawn (within the clock tick, and a margin
+	/// for a loaded machine).
+	#[test]
+	fn started_ago_tells_an_older_process_from_a_younger_one() {
+		let before = std::time::Instant::now();
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.expect("spawn sleep");
+		let me = Process::from_pid(i32::try_from(std::process::id()).unwrap()).expect("pin self");
+		let pinned = Process::from_pid(i32::try_from(child.id()).unwrap()).expect("pin the child");
+		let (my_age, child_age) = (me.started_ago(), pinned.started_ago());
+		let since_spawn = before.elapsed();
+		let _ = child.kill();
+		let _ = child.wait();
+		let (my_age, child_age) = (my_age.expect("own age"), child_age.expect("child's age"));
+		assert!(
+			my_age >= child_age,
+			"the test process ({my_age:?}) is younger than its child ({child_age:?})"
+		);
+		let tick = Duration::from_millis(20);
+		assert!(
+			child_age <= since_spawn + tick,
+			"the child is {child_age:?} old {since_spawn:?} after the spawn began"
+		);
+	}
+
+	/// A tree the walk cannot read (in a child test process with no
+	/// descriptor left, [`crate::sys::proc::short_of_descriptors`]) is not
+	/// passed over in silence: `kill_tree` kills what needs no read (the root,
+	/// through its pidfd, and the process group the root leads) and fails
+	/// with what it could not read. Here the root is `sh`, with a `sleep` in
+	/// its own group, which dies with it; and then with both in the test's
+	/// group, which the root does not lead: the sleep is then reported, not
+	/// found.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn kill_tree_kills_the_group_and_reports_a_walk_it_could_not_finish() {
+		use std::{io::BufRead as _, os::unix::process::CommandExt as _, time::Instant};
+
+		use crate::sys::proc::short_of_descriptors;
+		for own_group in [true, false] {
+			let mut command = std::process::Command::new("/bin/sh");
+			command
+				.args(["-c", "sleep 30 & echo $!; wait"])
+				.stdout(std::process::Stdio::piped());
+			if own_group {
+				command.process_group(0);
+			}
+			let mut root = command.spawn().unwrap();
+			let mut line = String::new();
+			std::io::BufReader::new(root.stdout.take().unwrap())
+				.read_line(&mut line)
+				.unwrap();
+			let sleep = Process::from_pid(line.trim().parse().unwrap()).expect("pin the sleep");
+			let test = "proctree::tests::kill_tree_with_no_descriptor_left";
+			let probed = short_of_descriptors::run(test, root.id());
+			// The root is the parent test's child: its status says who killed it.
+			let deadline = Instant::now() + Duration::from_secs(10);
+			let mut killed = None;
+			while killed.is_none() && Instant::now() < deadline {
+				killed = root.try_wait().unwrap();
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			while own_group && sleep.status() == ProcessStatus::Running && Instant::now() < deadline {
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			let sleep_ran_on = sleep.status() == ProcessStatus::Running;
+			let _ = sleep.signal(KILL_SIGNAL);
+			if killed.is_none() {
+				let _ = root.kill();
+			}
+			// Reaps the root, or returns the status `try_wait` already reaped.
+			root.wait().unwrap();
+			probed.unwrap_or_else(|error| panic!("own group {own_group}: {error}"));
+			let killed_by =
+				killed.and_then(|status| std::os::unix::process::ExitStatusExt::signal(&status));
+			assert_eq!(killed_by, Some(KILL_SIGNAL), "own group {own_group}: the root was not killed");
+			if own_group {
+				assert!(
+					!sleep_ran_on,
+					"the sleep in the root's group survived the walk it could not read"
+				);
+			}
+		}
+	}
+
+	/// Run by [`kill_tree_kills_the_group_and_reports_a_walk_it_could_not_finish`]
+	/// in a child process: with no descriptor left, `kill_tree` of the root
+	/// it names fails, saying what it could not read and whether it reached
+	/// the root's group.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by \
+	            kill_tree_kills_the_group_and_reports_a_walk_it_could_not_finish"]
+	fn kill_tree_with_no_descriptor_left() {
+		use crate::sys::proc::short_of_descriptors;
+		let Some(pid) = short_of_descriptors::pid() else {
+			return;
+		};
+		let root = Process::from_pid(pid).expect("pin the root");
+		// SAFETY: plain syscall without pointer arguments.
+		let leads_group = unsafe { libc::getpgid(pid) } == pid;
+		short_of_descriptors::leave_none();
+		let error = root
+			.kill_tree(Some(KILL_SIGNAL))
+			.expect_err("kill_tree reported a whole tree it could not read");
+		let text = error.to_string();
+		let unread = format!("cannot list the threads of process {pid}: Too many open files");
+		assert!(text.starts_with(&unread), "{text}");
+		assert_eq!(text.contains(&format!("and process group {pid}")), leads_group, "{text}");
+		// No status check here: `poll` itself fails with no descriptor left.
 	}
 }

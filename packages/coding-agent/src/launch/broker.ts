@@ -120,6 +120,30 @@ interface ManagedDaemon {
 	persistedMeta?: string;
 	/** Completes after a terminal generation's log, metadata, and completion notification are published. */
 	terminalSettled?: Promise<void>;
+	/**
+	 * Kills this broker must make through a pin, while their daemon runs but
+	 * cannot be pinned ({@link pinDaemon}): retried at each refresh.
+	 */
+	pendingKills: PendingKill[];
+}
+
+/**
+ * A kill of a daemon process that could not be pinned when it was asked (no
+ * descriptor left): never made by the bare pid, which may name another
+ * process by the time it is retried. With `reap`, a recovered record is reaped
+ * once the daemon is gone (publishing its completion when `completion`);
+ * otherwise (a stop) the record settles as any exited daemon does.
+ */
+interface PendingKill {
+	/** The daemon process to kill, as recorded when the kill was asked. */
+	target: { pid: number; startedAt: number };
+	/** The generation whose record settles once the daemon is gone. */
+	generation: number;
+	gracefulMs: number;
+	timeoutMs: number;
+	reap?: { completion: boolean };
+	/** The retry in flight. */
+	attempt?: Promise<boolean>;
 }
 
 interface BrokerLease {
@@ -140,6 +164,53 @@ function terminalState(state: DaemonSnapshot["state"]): boolean {
 
 function settledState(state: DaemonSnapshot["state"]): boolean {
 	return terminalState(state) || state === "restarting";
+}
+
+/**
+ * How far after the recorded `startedAt` (a wall clock read just before the
+ * spawn) the daemon's own start may read: Linux counts process starts in
+ * clock ticks (10 ms), and the broker's wall clock and the kernel's process
+ * clock drift apart by little. A process that reused the daemon's pid started
+ * after the daemon exited.
+ */
+const START_SLACK_MS = 2_000;
+
+/** What the daemon process of a snapshot is now (see {@link pinDaemon}). */
+type DaemonPin =
+	/** The daemon, running and pinned: a kill through `process` reaches it alone. */
+	| { kind: "pinned"; process: Process }
+	/** Running (signal 0 reaches its pid), but not pinnable now: kill nothing by its pid. */
+	| { kind: "unpinned" }
+	/** Exited, or its pid now names a process that started after the daemon. */
+	| { kind: "gone" };
+
+/**
+ * Pins the daemon process `target.pid` that started at `target.startedAt` (a
+ * snapshot, or the target of a pending kill). `Process.fromPid` gives `null`
+ * both for a process that is gone and for one it cannot pin (no descriptor
+ * left, `pidfd_open` blocked), so a failed pin proves nothing: `kill(pid, 0)`
+ * asks the kernel (`EPERM` is another user's process holding the number, never
+ * the daemon this broker started). A pinned process that started more than
+ * {@link START_SLACK_MS} after `startedAt` reused the pid: the daemon is gone.
+ * When the start cannot be read, the pin is trusted.
+ */
+function pinDaemon(target: { pid?: number; startedAt: number }): DaemonPin {
+	const pid = target.pid;
+	if (pid === undefined) return { kind: "gone" };
+	const processRef = Process.fromPid(pid);
+	if (processRef) {
+		if (processRef.status() !== "running") return { kind: "gone" };
+		const startedAgo = processRef.startedAgoMs();
+		const started = startedAgo === null ? undefined : Date.now() - startedAgo;
+		if (started !== undefined && started > target.startedAt + START_SLACK_MS) return { kind: "gone" };
+		return { kind: "pinned", process: processRef };
+	}
+	try {
+		process.kill(pid, 0);
+		return { kind: "unpinned" };
+	} catch {
+		return { kind: "gone" };
+	}
 }
 
 function publishesCompletionOwners(request: DaemonWireRequest): boolean {
@@ -761,6 +832,7 @@ class DaemonBroker {
 				completionCapable: owner !== undefined && this.#completionSubscriptions.has(owner),
 				completionSubscriptionId: owner === undefined ? undefined : this.#completionSubscriptions.get(owner),
 				pendingCompletions: replace ? (existing?.pendingCompletions ?? []) : [],
+				pendingKills: [],
 			};
 			syncReadyPending(record);
 			this.#records.set(spec.name, record);
@@ -1008,14 +1080,88 @@ class DaemonBroker {
 		this.#markReady(record);
 	}
 
+	/**
+	 * Brings `record` up to date with its process: retries the kills it could
+	 * not pin the daemon for ({@link ManagedDaemon.pendingKills}), then, for a
+	 * detached daemon this broker does not hold, reads its output and settles
+	 * it once it is gone.
+	 */
 	async #refreshDetached(record: ManagedDaemon): Promise<void> {
-		if (!record.spec.detached || settledState(record.snapshot.state)) return;
+		if (settledState(record.snapshot.state)) return;
+		if (record.pendingKills.length > 0 && (await this.#retryPendingKills(record))) return;
+		if (!record.spec.detached) return;
 		const generation = record.generation;
 		await this.#readDetachedOutput(record, generation);
 		if (generation !== record.generation || record.process) return;
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-		if (processRef?.status() === "running") return;
+		if (pinDaemon(record.snapshot).kind !== "gone") return;
 		await this.#settle(record, generation);
+	}
+
+	/**
+	 * Retries every pending kill of `record`, each one retry at a time; `true`
+	 * while one for the current generation is still pending (its daemon runs
+	 * unpinned, or survived the kill) or once that generation's recovered
+	 * record was reaped, `false` when the current generation is the caller's
+	 * to refresh as usual (a stopped daemon gone settles as any).
+	 */
+	async #retryPendingKills(record: ManagedDaemon): Promise<boolean> {
+		const results = await Promise.all(
+			record.pendingKills.map(pending => {
+				pending.attempt ??= this.#attemptPendingKill(record, pending).finally(() => {
+					pending.attempt = undefined;
+				});
+				return pending.attempt;
+			}),
+		);
+		return results.some(Boolean);
+	}
+
+	/** One retry of `pending` (see {@link #retryPendingKills}). */
+	async #attemptPendingKill(record: ManagedDaemon, pending: PendingKill): Promise<boolean> {
+		const current = (): boolean => pending.generation === record.generation;
+		const pin = pinDaemon(pending.target);
+		if (pin.kind === "unpinned") return current();
+		if (pin.kind === "pinned") {
+			await pin.process
+				.terminate({ group: true, gracefulMs: pending.gracefulMs, timeoutMs: pending.timeoutMs })
+				.catch(error => {
+					logger.warn("Failed to stop daemon through its pin", {
+						name: record.snapshot.name,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+			if (pin.process.status() === "running") return current();
+		}
+		const at = record.pendingKills.indexOf(pending);
+		if (at < 0) return current();
+		record.pendingKills.splice(at, 1);
+		if (!current() || !pending.reap) return false;
+		this.#reapRecovered(record, pending.reap.completion);
+		return true;
+	}
+
+	/**
+	 * Reaps a recovered record whose daemon was killed or is gone, as recovery
+	 * reaps one that died with the previous broker ({@link reapRecoveredSnapshot}),
+	 * publishing its completion when `completion` (a daemon that was running,
+	 * not stopping) and no earlier one is pending.
+	 */
+	#reapRecovered(record: ManagedDaemon, completion: boolean): void {
+		const { snapshot } = record;
+		if (!reapRecoveredSnapshot(snapshot, Date.now())) return;
+		if (completion && record.completionCapable && snapshot.owner && record.pendingCompletions.length === 0) {
+			const notification: DaemonCompletionNotification = {
+				event: "daemon-completed",
+				completionId: crypto.randomUUID(),
+				owner: snapshot.owner,
+				daemon: { ...snapshot },
+			};
+			record.pendingCompletions.push(notification);
+			this.#notifyCompletion(notification);
+		}
+		this.#persist(record);
+		// The reaped record may have been the last live persistent daemon.
+		this.#scheduleIdleShutdown();
 	}
 
 	async #monitorRecoveredDetached(record: ManagedDaemon, generation: number): Promise<void> {
@@ -1272,9 +1418,12 @@ class DaemonBroker {
 				if (operation.signal === "SIGINT") record.pty.write("\u0003");
 				else record.pty.kill();
 			} else {
-				const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-				if (!processRef) throw new Error(`Daemon ${operation.name} process is unavailable`);
-				processRef.killTree(SIGNAL_NUMBER[operation.signal]);
+				const pin = pinDaemon(record.snapshot);
+				if (pin.kind === "unpinned") {
+					throw new Error(`Daemon ${operation.name} runs, but cannot be pinned to signal it now`);
+				}
+				if (pin.kind === "gone") throw new Error(`Daemon ${operation.name} process is unavailable`);
+				pin.process.killTree(SIGNAL_NUMBER[operation.signal]);
 			}
 		}
 		return { op: "send", daemon: record.snapshot };
@@ -1295,9 +1444,25 @@ class DaemonBroker {
 		}
 		record.snapshot.state = "stopping";
 		this.#persist(record);
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-		if (processRef) await processRef.terminate({ group: true, gracefulMs: timeoutMs, timeoutMs: timeoutMs + 1_000 });
-		else record.pty?.kill();
+		const pin = pinDaemon(record.snapshot);
+		if (pin.kind === "pinned") {
+			await pin.process.terminate({ group: true, gracefulMs: timeoutMs, timeoutMs: timeoutMs + 1_000 });
+		} else if (record.pty) {
+			record.pty.kill();
+		} else if (
+			pin.kind === "unpinned" &&
+			record.snapshot.pid !== undefined &&
+			!record.pendingKills.some(pending => pending.target.pid === record.snapshot.pid)
+		) {
+			// Running, but not pinnable now (no descriptor left): killed through a
+			// pin at a later refresh (the wait below refreshes), never by its pid.
+			record.pendingKills.push({
+				target: { pid: record.snapshot.pid, startedAt: record.snapshot.startedAt },
+				generation: record.generation,
+				gracefulMs: timeoutMs,
+				timeoutMs: timeoutMs + 1_000,
+			});
+		}
 		const settled = await this.#waitUntil(record, () => terminalState(record.snapshot.state), timeoutMs + 1_000);
 		if (!settled && record.pty) record.pty.kill();
 	}
@@ -1445,19 +1610,24 @@ class DaemonBroker {
 				const { meta: decoded, spec: storedSpec, legacyLayout } = stored;
 				const snapshot = parseDaemonSnapshot(decoded.daemon);
 				const spec = parseDaemonSpec(storedSpec);
-				const processRef = snapshot.pid === undefined ? null : Process.fromPid(snapshot.pid);
+				const live = terminalState(snapshot.state) ? ({ kind: "gone" } as const) : pinDaemon(snapshot);
 				const recoverableExit = !terminalState(snapshot.state) && snapshot.state !== "stopping";
-				const detached = spec.detached && recoverableExit && processRef?.status() === "running";
-				const recoveredDead = recoverableExit && !detached;
-				if (!detached) {
+				const detached = spec.detached && recoverableExit && live.kind !== "gone";
+				// A daemon recovery must kill (a non-detached one of the previous broker,
+				// or one it was stopping) that runs but cannot be pinned: never killed by
+				// its bare pid, which may be another process's by now. It stays, running,
+				// until a refresh pins it and kills it through the pin (#retryPendingKills).
+				const killLater = !detached && live.kind === "unpinned";
+				const recoveredDead = recoverableExit && !detached && !killLater;
+				if (!detached && !killLater) {
 					// Reap only records that were still alive when the previous broker
 					// exited; already-terminal records keep their real exit time so
 					// `list` ranks exited history by true recency (issue #6517).
-					if (!terminalState(snapshot.state) && processRef) {
-						await processRef.terminate({ group: true, gracefulMs: 500, timeoutMs: 2_000 });
+					if (live.kind === "pinned") {
+						await live.process.terminate({ group: true, gracefulMs: 500, timeoutMs: 2_000 });
 					}
 					reapRecoveredSnapshot(snapshot, Date.now());
-				} else if (snapshot.state === "restarting") {
+				} else if (detached && snapshot.state === "restarting") {
 					snapshot.state = spec.ready ? "starting" : "running";
 				}
 				snapshot.persist = spec.persist;
@@ -1508,6 +1678,18 @@ class DaemonBroker {
 								]
 							: [];
 					})(),
+					pendingKills:
+						killLater && snapshot.pid !== undefined
+							? [
+									{
+										target: { pid: snapshot.pid, startedAt: snapshot.startedAt },
+										generation: 0,
+										gracefulMs: 500,
+										timeoutMs: 2_000,
+										reap: { completion: recoverableExit },
+									},
+								]
+							: [],
 				};
 				if (recoveredDead && record.completionCapable && snapshot.owner && record.pendingCompletions.length === 0) {
 					record.pendingCompletions.push({
@@ -1519,7 +1701,11 @@ class DaemonBroker {
 				}
 				syncReadyPending(record);
 				this.#records.set(snapshot.name, record);
-				if (snapshot.owner && record.completionCapable && (detached || record.pendingCompletions.length > 0)) {
+				if (
+					snapshot.owner &&
+					record.completionCapable &&
+					(detached || killLater || record.pendingCompletions.length > 0)
+				) {
 					this.#completionSubscriptions.set(snapshot.owner, record.completionSubscriptionId);
 				}
 				if (record.completionCapable) {
@@ -1528,7 +1714,9 @@ class DaemonBroker {
 				if (detached && spec.ready?.port !== undefined && snapshot.state !== "ready") {
 					void this.#pollPort(record, record.generation, spec.ready);
 				}
-				if (detached) {
+				if (detached || killLater) {
+					// A detached daemon settles, and one recovery must kill is killed
+					// and reaped, when a refresh finds it gone or can pin it.
 					void this.#monitorRecoveredDetached(record, record.generation).catch(error => {
 						logger.warn("Failed to monitor recovered detached daemon", {
 							name: record.snapshot.name,

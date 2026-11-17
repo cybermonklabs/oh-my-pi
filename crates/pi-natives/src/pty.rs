@@ -477,13 +477,28 @@ fn run_pty_sync(
 	// the reap its pid may be recycled, and a pid-only signal (a lookup at
 	// cancellation time, or portable-pty's `clone_killer`) would hit whatever
 	// process took it (#4605). The child is only ever signalled through
-	// `pinned_child`.
+	// `pinned_child`. A child that cannot be pinned (no descriptor left) is
+	// still reached through its process group, but its tree cannot be walked:
+	// a stop then reports it.
 	let mut targets = ps::TerminationTargets::new();
 	#[cfg(unix)]
 	if let Some(pgid) = master.process_group_leader().filter(|pgid| *pgid > 0) {
 		targets.add_pgid(pgid);
 	}
-	let pinned_child = child_pid.and_then(pi_shell::proctree::Process::from_pid);
+	// Why a stop may have missed a process of the tree: the child could not be
+	// pinned, or the last kill wave could not read the whole tree.
+	let mut unreached: Option<std::io::Error> = None;
+	let pinned_child = match child_pid.map(pi_shell::proctree::Process::open) {
+		Some(Ok(pinned)) => pinned,
+		Some(Err(error)) => {
+			unreached = Some(std::io::Error::new(
+				error.kind(),
+				format!("the PTY command could not be pinned to walk its process tree: {error}"),
+			));
+			None
+		},
+		None => None,
+	};
 	if let Some(process) = &pinned_child {
 		targets.add_process(process.clone());
 	}
@@ -534,6 +549,7 @@ fn run_pty_sync(
 	// for an exit status at `give_up_at`.
 	let mut kill_at: Option<Instant> = None;
 	let mut give_up_at: Option<Instant> = None;
+	let mut wave_unreached: Option<std::io::Error> = None;
 	let status = loop {
 		let next = match kill_at.or(give_up_at) {
 			Some(deadline) => control_rx.recv_deadline(deadline),
@@ -568,12 +584,12 @@ fn run_pty_sync(
 			Ok(ControlMessage::JsGone | ControlMessage::Cancelled { .. }) => false,
 			Ok(ControlMessage::Exited(status)) => {
 				if kill_at.is_some() {
-					targets.signal(ps::KILL_SIGNAL);
+					wave_unreached = targets.signal(ps::KILL_SIGNAL).err();
 				}
 				break Some(status);
 			},
 			Err(flume::RecvTimeoutError::Timeout) if kill_at.take().is_some() => {
-				targets.signal(ps::KILL_SIGNAL);
+				wave_unreached = targets.signal(ps::KILL_SIGNAL).err();
 				false
 			},
 			// `give_up_at` passed; disconnect cannot happen while the waiter
@@ -581,7 +597,8 @@ fn run_pty_sync(
 			Err(_) => break None,
 		};
 		if terminate && give_up_at.is_none() {
-			targets.signal(ps::TERM_SIGNAL);
+			// The hard waves that follow re-walk the tree.
+			let _ = targets.signal(ps::TERM_SIGNAL);
 			// The hangup a closing terminal delivers: interactive shells ignore
 			// SIGTERM but exit on SIGHUP. On Windows TERM already terminated it.
 			#[cfg(unix)]
@@ -634,6 +651,15 @@ fn run_pty_sync(
 		|| abort_pump.abort(),
 	);
 	drop(pump_task);
+	// Every process the stop could find was killed, and the process groups,
+	// which need no read; one it could not find is reported, not passed over.
+	if (cancelled || timed_out)
+		&& let Some(error) = wave_unreached.or(unreached)
+	{
+		return Err(Error::from_reason(format!(
+			"PTY command stopped, but its process tree could not be read whole: {error}"
+		)));
+	}
 	Ok(PtyRunResult { exit_code, cancelled, timed_out })
 }
 

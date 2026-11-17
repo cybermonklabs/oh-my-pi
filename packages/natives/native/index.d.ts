@@ -512,7 +512,10 @@ export declare class PowerAssertion {
 
 /** Stable process reference. */
 export declare class Process {
-  /** Open a stable process reference from a PID. */
+  /**
+   * Open a stable process reference from a PID: `null` when the process is
+   * gone, or cannot be pinned (no descriptor left, `pidfd_open` blocked).
+   */
   static fromPid(pid: number): Process | null
   /** Open stable process references whose executable path matches exactly. */
   static fromPath(path: string): Array<Process>
@@ -520,22 +523,38 @@ export declare class Process {
   get pid(): number
   /** Parent process id for this process, when available. */
   get ppid(): number | null
+  /**
+   * How long ago this process started, in milliseconds: `null` when the
+   * clock cannot be read. With a pid recorded together with the time its
+   * process started, it tells that process (started no later) from one
+   * that reused the pid (started after).
+   */
+  startedAgoMs(): number | null
   /** Launch arguments for this process. */
   args(): Array<string>
   /**
-   * Send `signal` to this process and its descendants, children first.
+   * Send `signal` to this process and its descendants, children first, and
+   * to its process group when it leads one; returns how many processes were
+   * signalled.
    *
    * On Linux and macOS the signal is forwarded as-is. On Windows there is no
    * signal abstraction, so the `signal` argument is ignored and the entire
    * tree is hard-killed via `TerminateProcess`. Defaults to the POSIX
    * hard-kill signal.
+   *
+   * Throws when the walk could not read every process of the tree (no
+   * descriptor left, say): everything it read, and the process group, were
+   * signalled, but a descendant outside the group may not have been.
    */
   killTree(signal?: number | undefined | null): number
   /**
    * Gracefully terminate this process and its descendants.
    *
    * By default this waits 1000ms after polite termination before
-   * hard-killing. Pass `graceful_ms < 0` to skip the graceful phase.
+   * hard-killing. Pass `graceful_ms < 0` to skip the graceful phase. Rejects
+   * when the hard wave's walk could not read every process of the tree,
+   * once everything it read (and the process group the root leads) was
+   * killed.
    */
   terminate(options?: ProcessTerminateOptions | undefined | null): Promise<boolean>
   /**
@@ -546,7 +565,11 @@ export declare class Process {
   waitForExit(options?: ProcessWaitOptions | undefined | null): Promise<boolean>
   /** Process group id for this process, when supported by the platform. */
   groupId(): number | null
-  /** Direct children of this process as stable process references. */
+  /**
+   * Direct children of this process as stable process references. Throws
+   * when a candidate could not be read (no descriptor left, say): a child
+   * may be missing from what was found.
+   */
   children(): Array<Process>
   /** Current status of this process reference. */
   status(): ProcessStatus
