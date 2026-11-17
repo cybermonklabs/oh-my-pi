@@ -52,6 +52,8 @@ pub(crate) use windows::{break_console_groups, has_console_groups};
 
 #[cfg(unix)]
 use self::unix as imp;
+#[cfg(all(test, unix))]
+pub(crate) use self::unix::Escalation;
 #[cfg(windows)]
 use self::windows as imp;
 use crate::{
@@ -333,6 +335,14 @@ impl NativeSpawner {
 	/// [`leftover`]: NativeSpawner::leftovers
 	pub fn kill_leftovers(&self) -> io::Result<Vec<Leftover>> {
 		imp::kill_leftovers(&self.shared)
+	}
+
+	/// What the abandon escalation of each external this spawner dropped
+	/// while it ran (or before the engine collected its exit) did, as it
+	/// recorded it, in the order they were dropped.
+	#[cfg(all(test, unix))]
+	pub(crate) fn escalations(&self) -> Vec<imp::Escalation> {
+		self.shared.state.escalations()
 	}
 }
 

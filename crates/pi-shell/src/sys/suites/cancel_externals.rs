@@ -6,8 +6,8 @@
 //!
 //! With the default [`SpawnConfig`] ([`Sessions::Detach`]) every external
 //! leads its own session, so:
-//! - TERM reaches the whole group (child and grandchildren) at once: a group
-//!   that does not ignore TERM is gone well inside the grace;
+//! - TERM reaches the whole group (child and grandchildren): a group that does
+//!   not ignore TERM is gone before KILL is due;
 //! - a group that ignores TERM is killed once the grace
 //!   ([`SpawnConfig::DEFAULT_GRACE`], 2 s) is over, including a grandchild that
 //!   outlived its leader (the session sweep);
@@ -17,11 +17,25 @@
 //!
 //! Under [`Sessions::Inherit`] (`obash`, a standalone shell) externals stay
 //! in the host's process group, so the same cancel reaches only the
-//! external's own pid: TERM at once, KILL after the grace; its children are
+//! external's own pid: TERM, then KILL after the grace; its children are
 //! outside the engine's reach, as they are outside bash's.
 //!
-//! Run: `cango test -p pi-shell --lib sys::suites::cancel_externals --
-//! --nocapture --test-threads 1`. Each test prints its measured times.
+//! The cases assert on what the escalation recorded
+//! ([`NativeSpawner::escalations`]): when its KILL step ran against the drop,
+//! by the spawner's own clock; which processes (pid and start) were still
+//! alive then; whether KILL went to the scope; what the sweep after it
+//! reached. Not on how long a process took to go, which a loaded host
+//! stretches past any bound: on a host with 18,000 processes one scan of the
+//! process table takes seconds, and the escalation makes two. So `until`
+//! has no deadline either; it waits for an event the fixture cannot produce
+//! by itself, and a case whose event never comes hangs until the test
+//! runner's own timeout ends it (nextest's `ci` profile: four minutes). The
+//! jobs' `sleep 100000` never ends by itself while a case runs, however slow
+//! the host (a `sleep 30` did, on a host slow enough that the case outlasted
+//! it); each case's cleanup kills what is left.
+//!
+//! Run: `cargo test -p pi-shell --lib sys::suites::cancel_externals --
+//! --nocapture --test-threads 1`. Each test prints what the escalation took.
 
 #![cfg(unix)]
 
@@ -37,6 +51,7 @@ use crate::{
 	sys::{
 		NativeSpawner, Sessions, SpawnConfig,
 		proc::{self, ProcInfo, ProcState},
+		spawn::Escalation,
 	},
 	testkit::{
 		FakeHost,
@@ -45,19 +60,21 @@ use crate::{
 	},
 };
 
-const LONG: Duration = Duration::from_secs(20);
+/// After how long `until` says what it still waits for (once; it goes on
+/// waiting).
+const SLOW: Duration = Duration::from_secs(60);
 
-/// Well inside the grace: what "at once" must beat.
-const PROMPT: Duration = Duration::from_secs(1);
-
-/// Poll `cond` until it holds; the elapsed time.
-fn until(what: &str, mut cond: impl FnMut() -> bool) -> Duration {
+/// Poll `cond` until it holds, however long that takes.
+fn until(what: &str, mut cond: impl FnMut() -> bool) {
 	let start = Instant::now();
+	let mut told = false;
 	while !cond() {
-		assert!(start.elapsed() < LONG, "timed out waiting for {what}");
+		if !told && start.elapsed() >= SLOW {
+			eprintln!("still waiting for {what} after {SLOW:?}");
+			told = true;
+		}
 		thread::sleep(Duration::from_millis(5));
 	}
-	start.elapsed()
 }
 
 /// Live (non-zombie) members of session `sid`.
@@ -65,6 +82,13 @@ fn live_session(sid: i32) -> Vec<ProcInfo> {
 	let mut m = proc::session_members(sid).unwrap();
 	m.retain(|p| p.state != ProcState::Zombie);
 	m
+}
+
+/// The identity (pid and start) of each of `procs`, whatever its state.
+fn ids(procs: &[ProcInfo]) -> Vec<(i32, u64)> {
+	let mut ids: Vec<_> = procs.iter().map(|p| (p.pid, p.start)).collect();
+	ids.sort_unstable();
+	ids
 }
 
 /// Kills what a case left behind, even when it fails: the spawner's
@@ -132,10 +156,10 @@ impl Case {
 			.expect("the external leads its scope")
 	}
 
-	/// `cancel(TERM)` and step to the run's end: its status, the time from
-	/// the cancel to `Done`, and the instant of the cancel. The shell is
-	/// then checked for leaked vprocs and external handles.
-	fn cancel(&mut self) -> (i32, Duration, Instant) {
+	/// `cancel(TERM)` and step to the run's end: its status and the time
+	/// from the cancel to `Done` (for the log). The shell is then checked
+	/// for leaked vprocs and external handles.
+	fn cancel(&mut self) -> (i32, Duration) {
 		let t0 = Instant::now();
 		self.shell.control().cancel(Signal::Term);
 		let status = loop {
@@ -148,7 +172,22 @@ impl Case {
 		};
 		let done = t0.elapsed();
 		self.host.assert_no_leaks(&mut self.shell, &mut self.store);
-		(status, done, t0)
+		(status, done)
+	}
+
+	/// The record of the escalation of the shell's one external, once both
+	/// its KILL step and the sweep after it ran.
+	fn escalation(&self) -> Escalation {
+		let mut done = None;
+		until("the escalation's KILL step and sweep", || {
+			let all = self.cleanup.spawner.escalations();
+			assert!(all.len() <= 1, "one external, one escalation: {all:?}");
+			done = all
+				.into_iter()
+				.find(|e| e.fired.as_ref().is_some_and(|f| f.swept.is_some()));
+			done.is_some()
+		});
+		done.expect("the escalation ran")
 	}
 
 	fn stdout(&self) -> String {
@@ -162,33 +201,76 @@ impl Case {
 	}
 }
 
-/// Check the TERM-ignoring group of `case` (`procs` processes in session
-/// `sid`) survives half the grace and is gone after it.
-fn assert_killed_after_the_grace(case: &Case, sid: i32, procs: usize, t0: Instant) -> Duration {
-	let grace = SpawnConfig::DEFAULT_GRACE;
-	thread::sleep((grace / 2).saturating_sub(t0.elapsed()));
-	assert_eq!(live_session(sid).len(), procs, "TERM is ignored and KILL waits for the grace");
-	until("the group killed", || live_session(sid).is_empty());
-	let killed = t0.elapsed();
-	assert!(killed >= grace, "KILL before the grace: {killed:?}");
-	assert!(killed < grace + PROMPT, "KILL late: {killed:?}");
+/// What escalation `e` of the external whose scope is `scope` recorded: the
+/// KILL step ran only once the grace after the cancel's drop was over;
+/// `alive` are the processes still alive then (what TERM left); `killed`
+/// whether KILL went to the scope; and the sweep after it reached `swept`
+/// when given (and, always, nothing but processes alive at the KILL step).
+/// Whether the external still ran at the drop is not asserted: one that TERM
+/// ended before it is an exit the engine did not collect, swept the same
+/// way. Returns how long after the drop the KILL step ran, for the log.
+fn assert_escalation(
+	e: &Escalation,
+	scope: i32,
+	alive: &[ProcInfo],
+	killed: bool,
+	swept: Option<&[ProcInfo]>,
+) -> Duration {
+	assert_eq!(e.scope, scope, "{e:?}");
+	let fired = e.fired.as_ref().expect("the KILL step ran");
+	let after = fired.at.duration_since(e.abandoned);
+	assert!(
+		after >= SpawnConfig::DEFAULT_GRACE,
+		"the KILL step ran {after:?} after the drop, inside the grace"
+	);
+	let found = fired.alive.as_deref().expect("the scope was read");
+	assert_eq!(ids(found), ids(alive), "alive when KILL was due: {found:?}");
+	assert_eq!(fired.killed, killed, "KILL to the scope");
+	let reached = fired
+		.swept
+		.as_ref()
+		.expect("the sweep ran")
+		.as_deref()
+		.expect("the sweep read the process table");
+	assert!(
+		ids(reached).iter().all(|id| ids(found).contains(id)),
+		"the sweep reached a process not alive at the KILL step: {reached:?}"
+	);
+	if let Some(swept) = swept {
+		assert_eq!(ids(reached), ids(swept), "the sweep's KILL: {reached:?}");
+	}
+	after
+}
+
+/// The TERM-ignoring processes `group` of `case`'s external (session
+/// `sid`) all still ran when KILL was due, a grace after the cancel; KILL
+/// went to the session, and then nothing was left. How long after the drop
+/// the KILL step ran.
+fn assert_killed_after_the_grace(case: &Case, sid: i32, group: &[ProcInfo]) -> Duration {
+	let e = case.escalation();
+	assert!(e.running, "the external ran when the cancel dropped it: {e:?}");
+	let after = assert_escalation(&e, sid, group, true, None);
 	case.assert_clean(sid);
-	killed
+	after
 }
 
 #[test]
 fn cancel_term_reaches_the_externals_whole_group_at_once() {
 	// `sh` does not forward TERM to its children: they die only if the
 	// signal goes to the group.
-	let mut case =
-		Case::start(Sessions::Detach, "/bin/sh -c '/bin/sleep 30 & /bin/sleep 30; wait'", 3, 2);
+	let mut case = Case::start(
+		Sessions::Detach,
+		"/bin/sh -c '/bin/sleep 100000 & /bin/sleep 100000; wait'",
+		3,
+		2,
+	);
 	let sid = case.leader();
-	let (status, done, t0) = case.cancel();
+	let (status, done) = case.cancel();
 	assert_eq!(status, 143);
-	until("the group terminated", || live_session(sid).is_empty());
-	let term = t0.elapsed();
-	eprintln!("detach, TERM honoured: cancel→Done {done:?}, cancel→group gone {term:?}");
-	assert!(term < PROMPT, "TERM did not reach the group at once: {term:?}");
+	// TERM left nothing for KILL: no process of the session was alive when
+	// KILL was due, so KILL went nowhere.
+	let after = assert_escalation(&case.escalation(), sid, &[], false, Some(&[]));
+	eprintln!("detach, TERM honoured: cancel→Done {done:?}, KILL step {after:?} after the drop");
 	case.assert_clean(sid);
 }
 
@@ -196,69 +278,82 @@ fn cancel_term_reaches_the_externals_whole_group_at_once() {
 fn cancel_term_kills_a_group_ignoring_term_after_the_default_grace() {
 	let mut case = Case::start(
 		Sessions::Detach,
-		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 30 & /bin/sleep 30; wait'",
+		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 100000 & /bin/sleep 100000; wait'",
 		3,
 		2,
 	);
 	let sid = case.leader();
-	let (status, done, t0) = case.cancel();
+	let group = live_session(sid);
+	assert_eq!(group.len(), 3, "{group:?}");
+	let (status, done) = case.cancel();
 	assert_eq!(status, 143);
-	let killed = assert_killed_after_the_grace(&case, sid, 3, t0);
-	eprintln!("detach, TERM ignored: cancel→Done {done:?}, cancel→group killed {killed:?}");
+	let after = assert_killed_after_the_grace(&case, sid, &group);
+	eprintln!("detach, TERM ignored: cancel→Done {done:?}, KILL step {after:?} after the drop");
 }
 
-/// The shell's own TERM trap runs once; the external still gets TERM at
-/// once (it ignores it) and KILL after the grace.
+/// The shell's own TERM trap runs once; the external still gets TERM (it
+/// ignores it) and KILL after the grace.
 #[test]
 fn cancel_term_with_a_shell_trap_runs_it_and_still_kills_the_external_group() {
 	let mut case = Case::start(
 		Sessions::Detach,
-		"trap 'echo trapped' TERM\n/bin/sh -c 'trap \"\" TERM; /bin/sleep 30 & /bin/sleep 30; wait'",
+		"trap 'echo trapped' TERM\n/bin/sh -c 'trap \"\" TERM; /bin/sleep 100000 & /bin/sleep \
+		 100000; wait'",
 		3,
 		2,
 	);
 	let sid = case.leader();
-	let (status, done, t0) = case.cancel();
+	let group = live_session(sid);
+	assert_eq!(group.len(), 3, "{group:?}");
+	let (status, done) = case.cancel();
 	assert_eq!(status, 143);
 	assert_eq!(case.stdout(), "trapped\n", "the trap runs exactly once");
-	let killed = assert_killed_after_the_grace(&case, sid, 3, t0);
-	eprintln!("detach, shell trap: cancel→Done {done:?}, cancel→group killed {killed:?}");
+	let after = assert_killed_after_the_grace(&case, sid, &group);
+	eprintln!("detach, shell trap: cancel→Done {done:?}, KILL step {after:?} after the drop");
 }
 
-/// The leader dies of TERM at once; its grandchild ignores TERM, outlives
-/// it, and is swept from the session when the grace is over.
+/// The leader dies of TERM; its grandchild ignores TERM, outlives it, and
+/// is swept from the session when the grace is over.
 #[test]
 fn cancel_term_sweeps_a_grandchild_that_outlives_its_leader() {
 	let mut case = Case::start(
 		Sessions::Detach,
-		"/bin/sh -c '(trap \"\" TERM; exec /bin/sleep 30) & wait'",
+		"/bin/sh -c '(trap \"\" TERM; exec /bin/sleep 100000) & wait'",
 		2,
 		1,
 	);
 	let sid = case.leader();
-	let (status, done, t0) = case.cancel();
+	let grandchild: Vec<ProcInfo> = live_session(sid)
+		.into_iter()
+		.filter(|p| p.pid != sid)
+		.collect();
+	assert_eq!(grandchild.len(), 1, "{grandchild:?}");
+	let (status, done) = case.cancel();
 	assert_eq!(status, 143);
-	let leader = until("the leader terminated", || proc::ended(sid));
-	assert!(t0.elapsed() < PROMPT, "TERM did not reach the leader at once: {leader:?}");
-	let killed = assert_killed_after_the_grace(&case, sid, 1, t0);
+	// When KILL was due only the grandchild was alive: TERM had ended the
+	// leader, so KILL did not go to the session (its leader had exited),
+	// and the sweep's identity-pinned KILL reached the grandchild.
+	let after = assert_escalation(&case.escalation(), sid, &grandchild, false, Some(&grandchild));
+	assert!(proc::ended(sid), "the leader is gone");
+	case.assert_clean(sid);
 	eprintln!(
-		"detach, orphaned grandchild: cancel→Done {done:?}, leader gone {leader:?}, grandchild \
-		 killed {killed:?}"
+		"detach, orphaned grandchild: cancel→Done {done:?}, KILL step {after:?} after the drop"
 	);
 }
 
 /// `obash`'s layout: the external shares the host's group, so cancel reaches
-/// its pid only (TERM at once, KILL after the grace) and its children
-/// survive it.
+/// its pid only (TERM, then KILL after the grace) and its children survive
+/// it.
 #[test]
 fn inherit_cancel_reaches_only_the_external_itself() {
 	let mut case = Case::start(
 		Sessions::Inherit,
-		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 30 & /bin/sleep 30; wait'",
+		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 100000 & /bin/sleep 100000; wait'",
 		1,
 		0,
 	);
 	let pid = case.leader();
+	let external = proc::read(pid).unwrap().expect("the external runs");
 	let mut children = Vec::new();
 	until("both sleeps started", || {
 		children = proc::list()
@@ -269,14 +364,15 @@ fn inherit_cancel_reaches_only_the_external_itself() {
 		children.len() == 2
 	});
 	case.cleanup.strays.clone_from(&children);
-	let (status, done, t0) = case.cancel();
+	let (status, done) = case.cancel();
 	assert_eq!(status, 143);
-	let grace = SpawnConfig::DEFAULT_GRACE;
-	thread::sleep((grace / 2).saturating_sub(t0.elapsed()));
-	assert!(proc::running(pid), "TERM is ignored and KILL waits for the grace");
+	// TERM is ignored: the external alone still ran when KILL was due, and
+	// KILL went to its pid (a process scope sweeps nothing).
+	let alive = std::slice::from_ref(&external);
+	let e = case.escalation();
+	assert!(e.running, "the external ran when the cancel dropped it: {e:?}");
+	let after = assert_escalation(&e, pid, alive, true, Some(&[]));
 	until("the external killed", || proc::ended(pid));
-	let killed = t0.elapsed();
-	assert!(killed >= grace && killed < grace + PROMPT, "KILL at {killed:?}");
 	until("no leftovers", || case.cleanup.spawner.leftovers().unwrap().is_empty());
 	for child in &children {
 		assert!(proc::running(child.pid), "the external's children are outside the cancel's reach");
@@ -285,5 +381,5 @@ fn inherit_cancel_reaches_only_the_external_itself() {
 		assert!(proc::signal_pinned(child, Signal::Kill).unwrap());
 	}
 	until("the children gone", || children.iter().all(|c| proc::ended(c.pid)));
-	eprintln!("inherit: cancel→Done {done:?}, cancel→external killed {killed:?}");
+	eprintln!("inherit: cancel→Done {done:?}, KILL step {after:?} after the drop");
 }

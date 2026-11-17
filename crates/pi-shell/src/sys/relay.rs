@@ -400,9 +400,8 @@ impl Drop for Relayed {
 mod tests {
 	use std::{
 		os::{fd::OwnedFd, unix::ffi::OsStrExt},
-		path::Path,
+		path::{Path, PathBuf},
 		sync::Arc,
-		time::Instant,
 	};
 
 	use bstr::BString;
@@ -514,12 +513,26 @@ mod tests {
 	/// read concurrently on the test's own task; `text` makes that pipe a
 	/// text capture.
 	async fn run(session: &mut Session, command: &str, text: bool) -> Vec<u8> {
-		run_timed(session, command, text).await.0
+		run_releasing(session, command, text, None).await
 	}
 
-	/// [`run`], and how long the run took (the reader may see the end of the
-	/// pipe later, once leftovers holding it are gone).
-	async fn run_timed(session: &mut Session, command: &str, text: bool) -> (Vec<u8>, Duration) {
+	/// A leftover `sh` keeps the pipe open with: it runs until `release`
+	/// exists, then runs `then` (and ends).
+	fn leftover(release: &Path, then: &str) -> String {
+		format!("(while [ ! -e {} ]; do /bin/sleep 0.01; done; {then}) &", release.display())
+	}
+
+	/// [`run`], creating `release` once the run has returned, while the
+	/// reader still reads: a [`leftover`] waiting for it holds the pipe past
+	/// the run's end, whatever the host's speed. A run that waited for the
+	/// leftover would never return, and the test hangs until the runner's
+	/// timeout.
+	async fn run_releasing(
+		session: &mut Session,
+		command: &str,
+		text: bool,
+		release: Option<&Path>,
+	) -> Vec<u8> {
 		let (reader, writer) = io::pipe().unwrap();
 		let mut reader = Receiver::from_owned_fd(OwnedFd::from(reader)).unwrap();
 		let stdio = RunStdio {
@@ -535,14 +548,20 @@ mod tests {
 			bytes
 		};
 		let run = async {
-			let started = Instant::now();
 			session
 				.run_with(options, stdio, CancellationToken::new())
 				.await
 				.unwrap();
-			started.elapsed()
+			if let Some(release) = release {
+				std::fs::write(release, b"").unwrap();
+			}
 		};
-		tokio::join!(read, run)
+		tokio::join!(read, run).0
+	}
+
+	/// A file in `dir`, not there yet.
+	fn release_file(dir: &tempfile::TempDir) -> PathBuf {
+		dir.path().join("release")
 	}
 
 	fn legacy_file(dir: &Path) -> String {
@@ -629,30 +648,29 @@ mod tests {
 	/// the program ended inside: the exit is reported after the short hold
 	/// grace (a timer wakes the drain, nothing else would), and the held byte
 	/// is released at the end of the stream, when the leftover is gone, by the
-	/// relay that outlived the program's `ExtProc`.
+	/// relay that outlived the program's `ExtProc`. The leftover ends only
+	/// once the run returned: `X` before `c` is the exit reported first.
 	#[tokio::test(flavor = "current_thread")]
 	async fn held_bytes_wait_for_the_end_of_a_stream_a_leftover_holds() {
-		let (out, took) =
-			run_timed(&mut session(true), "/bin/sh -c 'printf abc; /bin/sleep 1 &'; printf X", true)
-				.await;
+		let dir = tempfile::tempdir().unwrap();
+		let release = release_file(&dir);
+		let command = format!("/bin/sh -c 'printf abc; {}'; printf X", leftover(&release, ":"));
+		let out = run_releasing(&mut session(true), &command, true, Some(&release)).await;
 		assert_eq!(out, b"abXc");
-		assert!(took < Duration::from_millis(800), "waited for the leftover: {took:?}");
 	}
 
 	/// What a process the program left running writes after the program's
 	/// exit was reported (and its `ExtProc` dropped) still reaches the
 	/// capture, through the relay adopted on the session's runtime, as it
-	/// would through a plain pipe.
+	/// would through a plain pipe. It writes only once the run returned.
 	#[tokio::test(flavor = "current_thread")]
 	async fn late_output_of_a_leftover_reaches_the_capture() {
-		let (out, took) = run_timed(
-			&mut session(false),
-			"/bin/sh -c 'echo early; (/bin/sleep 0.5; echo late) &'; echo done",
-			true,
-		)
-		.await;
+		let dir = tempfile::tempdir().unwrap();
+		let release = release_file(&dir);
+		let command =
+			format!("/bin/sh -c 'echo early; {}'; echo done", leftover(&release, "echo late"));
+		let out = run_releasing(&mut session(false), &command, true, Some(&release)).await;
 		assert_eq!(out, b"early\ndone\nlate\n");
-		assert!(took < Duration::from_millis(400), "waited for the leftover: {took:?}");
 	}
 
 	/// Relays, input feeds and output pumps are polled by their externals'
@@ -665,12 +683,10 @@ mod tests {
 	async fn relays_and_pumps_run_on_a_current_thread_runtime() {
 		let script = "big=$(/usr/bin/yes 0123456789 | /usr/bin/head -n 20000); printf '%s\\n' \
 		              \"$big\" | /bin/cat";
-		let (out, _) = tokio::time::timeout(
-			Duration::from_secs(20),
-			run_timed(&mut session(false), script, true),
-		)
-		.await
-		.expect("nothing blocks the runtime's only thread");
+		let out =
+			tokio::time::timeout(Duration::from_secs(20), run(&mut session(false), script, true))
+				.await
+				.expect("nothing blocks the runtime's only thread");
 		assert_eq!(out, "0123456789\n".repeat(20_000).into_bytes());
 	}
 
@@ -686,23 +702,22 @@ mod tests {
 		              <&4\n/bin/sh -c 'exit 0'\nx=$(/bin/cat <&4)\ny=$(/usr/bin/yes 0123456789 | \
 		              /usr/bin/head -n 30000)\n[ \"$x\" = \"$y\" ] && echo same || echo \"differ \
 		              ${#x} ${#y}\"";
-		let (out, _) = tokio::time::timeout(
-			Duration::from_secs(20),
-			run_timed(&mut session_with(None), script, false),
-		)
-		.await
-		.expect("the feeds never block the runtime's only thread");
+		let out =
+			tokio::time::timeout(Duration::from_secs(20), run(&mut session_with(None), script, false))
+				.await
+				.expect("the feeds never block the runtime's only thread");
 		assert_eq!(String::from_utf8_lossy(&out), "same\n");
 	}
 
 	/// A process the program left running keeps the relay's pipe open: the
-	/// program's exit is still reported at once, with its output.
+	/// program's exit is still reported, with its output, while it runs (it
+	/// ends only once the run returned).
 	#[tokio::test(flavor = "multi_thread")]
 	async fn exit_is_reported_while_a_leftover_holds_the_pipe() {
-		let (out, took) =
-			run_timed(&mut session(false), "/bin/sh -c 'echo hi; /bin/sleep 2 &'; echo done", true)
-				.await;
+		let dir = tempfile::tempdir().unwrap();
+		let release = release_file(&dir);
+		let command = format!("/bin/sh -c 'echo hi; {}'; echo done", leftover(&release, ":"));
+		let out = run_releasing(&mut session(false), &command, true, Some(&release)).await;
 		assert_eq!(out, b"hi\ndone\n");
-		assert!(took < Duration::from_secs(1), "waited for the leftover: {took:?}");
 	}
 }

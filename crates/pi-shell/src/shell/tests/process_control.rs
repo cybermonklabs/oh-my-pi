@@ -4,11 +4,19 @@ use super::*;
 #[cfg(unix)]
 use crate::sys::proc::{self, ProcInfo, ProcState};
 
+/// A `sh -c` script: a TERM trap that exits 42, the ready file `$1` written
+/// once the trap is set, then about 30 s of short sleeps before it ends by
+/// itself with status 0. A test waits for its end with no deadline: the
+/// status tells the trapped TERM (42) from no signal at all (0).
+#[cfg(unix)]
+const TRAPPED_TERM_EXITS_42: &str = "trap 'exit 42' TERM; : > \"$1\"; i=0; while [ \"$i\" -lt 600 \
+                                     ]; do sleep 0.05; i=$((i + 1)); done";
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn pgrep_matches_name_and_pkills_signal_probe() {
 	let (_dir, command, name) = process_test_command("opg");
-	let mut child = process_test_child(&command, Duration::from_secs(30))
+	let mut child = process_test_child(&command)
 		.spawn()
 		.expect("matching process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
@@ -64,8 +72,7 @@ async fn pkill_accepts_platform_signal_names() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pkill_queue_option_consumes_its_value() {
 	let (_dir, command, name) = process_test_command("opq");
-	let mut command = process_test_child(&command, Duration::from_secs(30));
-	command.kill_on_drop(true);
+	let mut command = process_test_child(&command);
 	let mut child = command.spawn().expect("queue test process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
 	wait_for_process_name(pid, &name).await;
@@ -83,8 +90,7 @@ async fn pkill_queue_option_consumes_its_value() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pkill_interactive_prompt_honors_cancellation() {
 	let (_dir, command, name) = process_test_command("opi");
-	let mut command = process_test_child(&command, Duration::from_secs(30));
-	command.kill_on_drop(true);
+	let mut command = process_test_child(&command);
 	let mut child = command.spawn().expect("interactive target");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
 	wait_for_process_name(pid, &name).await;
@@ -120,7 +126,7 @@ async fn pkill_interactive_prompt_honors_cancellation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pgrep_reads_pidfile_from_standard_input() {
 	let (_dir, command, name) = process_test_command("opf");
-	let mut child = process_test_child(&command, Duration::from_secs(30))
+	let mut child = process_test_child(&command)
 		.spawn()
 		.expect("pidfile process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
@@ -144,7 +150,7 @@ async fn pgrep_requires_an_externally_locked_pidfile() {
 	}
 
 	let (_dir, command, name) = process_test_command("opl");
-	let mut child = process_test_child(&command, Duration::from_secs(30))
+	let mut child = process_test_child(&command)
 		.spawn()
 		.expect("locked pidfile process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
@@ -199,10 +205,10 @@ async fn pgrep_requires_an_externally_locked_pidfile() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pkill_signals_every_matching_process() {
 	let (_dir, command, name) = process_test_command("opk");
-	let mut first = process_test_child(&command, Duration::from_secs(30))
+	let mut first = process_test_child(&command)
 		.spawn()
 		.expect("first matching process");
-	let mut second = process_test_child(&command, Duration::from_secs(30))
+	let mut second = process_test_child(&command)
 		.spawn()
 		.expect("second matching process");
 	let first_pid = i32::try_from(first.id().expect("first pid")).expect("pid fits i32");
@@ -211,26 +217,22 @@ async fn pkill_signals_every_matching_process() {
 	wait_for_process_name(second_pid, &name).await;
 
 	let (result, output) = execute_captured(format!("pkill -TERM -x {name}")).await;
-	let statuses =
-		time::timeout(Duration::from_secs(2), async { tokio::join!(first.wait(), second.wait()) })
-			.await;
-	if statuses.is_err() {
-		let _ = first.start_kill();
-		let _ = second.start_kill();
-		let _ = first.wait().await;
-		let _ = second.wait().await;
-	}
+	// Each ends only of pkill's TERM (it never ends by itself while the
+	// test runs): the wait is for that event, and the signal tells it.
+	let (first, second) = tokio::join!(first.wait(), second.wait());
 	assert_eq!(result.exit_code, Some(0));
 	assert_eq!(output, "");
-	assert!(statuses.is_ok(), "pkill did not signal every matching process");
+	for status in [first, second] {
+		let status = status.expect("matching process wait");
+		assert_eq!(status.signal(), Some(libc::SIGTERM), "pkill did not signal it: {status:?}");
+	}
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn pidwait_returns_after_the_matching_process_exits() {
 	let (_dir, command, name) = process_test_command("opw");
-	let mut command = process_test_child(&command, Duration::from_secs(30));
-	command.kill_on_drop(true);
+	let mut command = process_test_child(&command);
 	let mut child = command.spawn().expect("waited process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
 	wait_for_process_name(pid, &name).await;
@@ -277,10 +279,9 @@ async fn pidwait_returns_after_the_matching_process_exits() {
 	);
 
 	let _ = child.start_kill();
-	let result = time::timeout(Duration::from_secs(30), &mut pidwait)
-		.await
-		.expect("pidwait did not return after its matching process exited")
-		.expect("pidwait task");
+	// Waits as long as that takes: a pidwait that missed the exit hangs the
+	// test until the runner's timeout.
+	let result = (&mut pidwait).await.expect("pidwait task");
 	while let Ok(chunk) = rx.recv_async().await {
 		output.push_str(&chunk);
 	}
@@ -646,17 +647,9 @@ async fn kill_builtin_accepts_numeric_signal_for_multiple_processes() {
 		assert_eq!(code, 0, "numeric multi-process kill should succeed");
 	}
 
-	let statuses =
-		time::timeout(Duration::from_secs(5), async { tokio::join!(first.wait(), second.wait()) })
-			.await;
-	if statuses.is_err() {
-		let _ = first.kill().await;
-		let _ = second.kill().await;
-		let _ = first.wait().await;
-		let _ = second.wait().await;
-		panic!("kill must signal every process operand");
-	}
-	let (first_status, second_status) = statuses.expect("checked timeout");
+	// Each ends either of the KILL or at its own end, 30 s on: the signal
+	// tells which.
+	let (first_status, second_status) = tokio::join!(first.wait(), second.wait());
 	assert_eq!(first_status.expect("first wait").signal(), Some(libc::SIGKILL));
 	assert_eq!(second_status.expect("second wait").signal(), Some(libc::SIGKILL));
 }
@@ -669,12 +662,7 @@ async fn kill_builtin_defaults_to_sigterm() {
 	let dir = tempfile::tempdir().expect("temp dir");
 	let ready = dir.path().join("ready");
 	let mut child = Command::new("sh")
-		.args([
-			"-c",
-			"trap 'exit 42' TERM; : > \"$1\"; while :; do :; done",
-			"sh",
-			ready.to_str().expect("utf8 path"),
-		])
+		.args(["-c", TRAPPED_TERM_EXITS_42, "sh", ready.to_str().expect("utf8 path")])
 		.spawn()
 		.expect("trapping child");
 	let pid = child.id().expect("child pid");
@@ -697,14 +685,10 @@ async fn kill_builtin_defaults_to_sigterm() {
 		.expect("kill command");
 	let code = exit_code(&result);
 
-	let status = time::timeout(Duration::from_secs(5), child.wait()).await;
-	if status.is_err() {
-		let _ = child.kill().await;
-		let _ = child.wait().await;
-		panic!("default kill signal did not terminate the child");
-	}
+	// It ends either by its TERM trap (42) or at its own end (0).
+	let status = child.wait().await.expect("child wait");
 	assert_eq!(code, 0, "default kill should succeed");
-	assert_eq!(status.expect("checked timeout").expect("child wait").code(), Some(42));
+	assert_eq!(status.code(), Some(42), "{status:?}");
 }
 
 /// A negative PID after `--` targets a process group per `kill(2)` instead
@@ -718,12 +702,7 @@ async fn kill_builtin_preserves_negative_pid_process_group_operands() {
 	let plain_ready = dir.path().join("plain-ready");
 	let spawn_trapping = |ready: &std::path::Path, own_group: bool| {
 		let mut cmd = Command::new("sh");
-		cmd.args([
-			"-c",
-			"trap 'exit 42' TERM; : > \"$1\"; while :; do sleep 0.05; done",
-			"sh",
-			ready.to_str().expect("utf8 path"),
-		]);
+		cmd.args(["-c", TRAPPED_TERM_EXITS_42, "sh", ready.to_str().expect("utf8 path")]);
 		if own_group {
 			// pgid becomes this child's own pid, so `-pid` addresses the group.
 			cmd.process_group(0);
@@ -757,18 +736,8 @@ async fn kill_builtin_preserves_negative_pid_process_group_operands() {
 		.expect("kill command");
 	let code = exit_code(&result);
 
-	let statuses = time::timeout(Duration::from_secs(5), async {
-		tokio::join!(group_child.wait(), plain_child.wait())
-	})
-	.await;
-	if statuses.is_err() {
-		let _ = group_child.start_kill();
-		let _ = plain_child.start_kill();
-		let _ = group_child.wait().await;
-		let _ = plain_child.wait().await;
-		panic!("negative-PID kill must signal the process group and the plain PID");
-	}
-	let (group_status, plain_status) = statuses.expect("checked timeout");
+	// Each ends either by its TERM trap (42) or at its own end (0).
+	let (group_status, plain_status) = tokio::join!(group_child.wait(), plain_child.wait());
 	assert_eq!(code, 0, "negative-PID kill should succeed");
 	assert_eq!(group_status.expect("group wait").code(), Some(42));
 	assert_eq!(plain_status.expect("plain wait").code(), Some(42));
@@ -785,12 +754,7 @@ async fn kill_builtin_signals_group_when_marker_precedes_negative_pid() {
 	let named_ready = dir.path().join("named-ready");
 	let spawn_group_leader = |ready: &std::path::Path| {
 		Command::new("sh")
-			.args([
-				"-c",
-				"trap 'exit 42' TERM; : > \"$1\"; while :; do sleep 0.05; done",
-				"sh",
-				ready.to_str().expect("utf8 path"),
-			])
+			.args(["-c", TRAPPED_TERM_EXITS_42, "sh", ready.to_str().expect("utf8 path")])
 			.process_group(0)
 			.spawn()
 			.expect("group leader")
@@ -827,18 +791,8 @@ async fn kill_builtin_signals_group_when_marker_precedes_negative_pid() {
 		.await
 		.expect("named kill command");
 
-	let statuses = time::timeout(Duration::from_secs(5), async {
-		tokio::join!(default_child.wait(), named_child.wait())
-	})
-	.await;
-	if statuses.is_err() {
-		let _ = default_child.start_kill();
-		let _ = named_child.start_kill();
-		let _ = default_child.wait().await;
-		let _ = named_child.wait().await;
-		panic!("marker-preceded negative PID must signal the process group");
-	}
-	let (default_status, named_status) = statuses.expect("checked timeout");
+	// Each ends either by its TERM trap (42) or at its own end (0).
+	let (default_status, named_status) = tokio::join!(default_child.wait(), named_child.wait());
 	assert_eq!(exit_code(&default_result), 0, "`kill -- -<pgid>` should succeed");
 	assert_eq!(exit_code(&named_result), 0, "`kill -s TERM -- -<pgid>` should succeed");
 	assert_eq!(default_status.expect("default wait").code(), Some(42));
@@ -1332,17 +1286,9 @@ async fn kill_builtin_continues_after_target_failure() {
 		.expect("kill command");
 	let code = exit_code(&result);
 
-	let statuses =
-		time::timeout(Duration::from_secs(5), async { tokio::join!(first.wait(), second.wait()) })
-			.await;
-	if statuses.is_err() {
-		let _ = first.start_kill();
-		let _ = second.start_kill();
-		let _ = first.wait().await;
-		let _ = second.wait().await;
-		panic!("kill must continue signaling after an intermediate target fails");
-	}
-	let (first_status, second_status) = statuses.expect("checked timeout");
+	// Each ends either of the KILL or at its own end, 30 s on: the signal
+	// tells which.
+	let (first_status, second_status) = tokio::join!(first.wait(), second.wait());
 	assert_ne!(code, 0, "a failed target should make kill return non-zero");
 	assert_eq!(first_status.expect("first wait").signal(), Some(libc::SIGKILL));
 	assert_eq!(second_status.expect("second wait").signal(), Some(libc::SIGKILL));

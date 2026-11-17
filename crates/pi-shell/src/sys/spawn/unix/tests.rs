@@ -130,6 +130,55 @@ fn live_group(pgid: i32) -> Vec<proc::ProcInfo> {
 	m
 }
 
+/// The identity (pid and start) of each of `procs`, whatever its state.
+fn ids(procs: &[proc::ProcInfo]) -> Vec<(i32, u64)> {
+	let mut ids: Vec<_> = procs.iter().map(|p| (p.pid, p.start)).collect();
+	ids.sort_unstable();
+	ids
+}
+
+/// The record of the one escalation `s` started, once both its KILL step
+/// and the sweep after it ran. Waits as long as that takes: the escalation
+/// scans the process table, which takes seconds on a host with many
+/// processes, so a deadline here would measure the host, not the
+/// escalation (one that never ends hangs the test until the runner's
+/// timeout).
+fn escalated(s: &NativeSpawner) -> super::Escalation {
+	loop {
+		let all = s.escalations();
+		assert!(all.len() <= 1, "one external, one escalation: {all:?}");
+		if let Some(done) = all
+			.into_iter()
+			.find(|e| e.fired.as_ref().is_some_and(|f| f.swept.is_some()))
+		{
+			return done;
+		}
+		thread::sleep(Duration::from_millis(5));
+	}
+}
+
+/// What escalation `e` of an external that still ran when it was dropped
+/// recorded at its KILL step: how long after the drop it ran (at least
+/// `grace`), with the processes alive then (`alive`, what TERM left) and
+/// KILL sent to the scope.
+fn assert_killed_after(
+	e: &super::Escalation,
+	grace: Duration,
+	alive: &[proc::ProcInfo],
+) -> Duration {
+	let fired = e.fired.as_ref().expect("the KILL step ran");
+	let after = fired.at.duration_since(e.abandoned);
+	assert!(e.running, "the external ran when dropped: {e:?}");
+	assert!(
+		after >= grace,
+		"the KILL step ran {after:?} after the drop, inside the grace {grace:?}"
+	);
+	let found = fired.alive.as_deref().expect("the scope was read");
+	assert_eq!(ids(found), ids(alive), "alive when KILL was due: {found:?}");
+	assert!(fired.killed, "KILL went to the scope: {e:?}");
+	after
+}
+
 /// An engine-side file without an OS handle: a byte source, a capture, or a
 /// sink whose reader is gone.
 #[derive(Clone, Default)]
@@ -544,32 +593,46 @@ fn inherit_keeps_the_hosts_group_and_signals_only_the_child() {
 	until("grandchild gone", || proc::ended(grandchild.pid));
 }
 
+/// A child of the test, killed when dropped (also when the test fails).
+struct Bystander(std::process::Child);
+
+impl Drop for Bystander {
+	fn drop(&mut self) {
+		let _ = self.0.kill();
+		let _ = self.0.wait();
+	}
+}
+
 /// The abandon escalation (TERM, KILL after the grace) targets the child's
-/// pid: a process sharing the host's group survives it.
+/// pid: a process sharing the host's group survives it. The `sleep`s never
+/// end by themselves while the test runs, however slow the host.
 #[test]
 fn inherit_abandon_escalation_spares_the_hosts_group() {
 	let grace = Duration::from_millis(300);
 	let env = EnvView::default();
 	let s = spawner(Sessions::Inherit, grace);
-	let mut bystander = std::process::Command::new("/bin/sleep")
-		.arg("30")
-		.spawn()
-		.unwrap();
-	assert_eq!(pgid(bystander.id()), pgid(0));
+	let mut bystander = Bystander(
+		std::process::Command::new("/bin/sleep")
+			.arg("100000")
+			.spawn()
+			.unwrap(),
+	);
+	assert_eq!(pgid(bystander.0.id()), pgid(0));
 	// `exec` keeps the ignored TERM: one process that only KILL ends.
-	let a = sh("trap '' TERM; exec /bin/sleep 30");
+	let a = sh("trap '' TERM; exec /bin/sleep 100000");
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid() as i32;
 	until("exec'd", || proc::info(pid).is_some_and(|i| i.name == "sleep"));
-	let start = Instant::now();
+	let child = proc::info(pid).expect("the child runs");
 	drop(p);
-	thread::sleep(grace / 2);
-	assert!(live(pid), "TERM is ignored, KILL waits for the grace");
+	// TERM is ignored: the child still ran when KILL was due, and KILL went
+	// to its pid.
+	assert_killed_after(&escalated(&s), grace, std::slice::from_ref(&child));
 	until("child killed", || proc::ended(pid));
-	assert!(start.elapsed() >= grace);
-	assert!(bystander.try_wait().unwrap().is_none(), "nothing was sent to the host's process group");
-	bystander.kill().unwrap();
-	bystander.wait().unwrap();
+	assert!(
+		bystander.0.try_wait().unwrap().is_none(),
+		"nothing was sent to the host's process group"
+	);
 }
 
 /// Reaping retires a process-only leak scope before its pid can be reused.
@@ -630,13 +693,13 @@ fn stop_and_cont_reach_every_member_of_the_group() {
 }
 
 /// Cancel of a running external: TERM to the group at once, KILL after the
-/// grace. Observe the fixture, not a full process-table scan that can itself
-/// outlast the grace on a busy host.
-fn abandon_escalates(grace: Duration) -> Duration {
+/// grace, as the escalation recorded it (not how long the group took to go,
+/// which a busy host stretches).
+fn abandon_escalates(grace: Duration) {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Share, grace);
 	// The trap makes sh and the sleep it starts ignore TERM.
-	let a = sh("trap '' TERM; /bin/sleep 30; exit 0");
+	let a = sh("trap '' TERM; /bin/sleep 100000; exit 0");
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
 	let mut members = Vec::new();
@@ -644,26 +707,11 @@ fn abandon_escalates(grace: Duration) -> Duration {
 		members = live_group(group);
 		members.len() == 2
 	});
-	let start = Instant::now();
 	drop(p);
-	until("group killed", || {
-		let mut killed = true;
-		for member in &members {
-			let gone = proc::info(member.pid).map_or_else(
-				|| !proc::exists(member.pid),
-				|now| now.start != member.start || now.state == ProcState::Zombie,
-			);
-			if gone {
-				assert!(start.elapsed() >= grace, "KILL before the grace: pid {}", member.pid);
-			}
-			killed &= gone;
-		}
-		killed
-	});
-	let measured = start.elapsed();
-	eprintln!("TERM→KILL escalation: grace {grace:?}, measured {measured:?}");
-	assert!(measured >= grace, "KILL before the grace: {measured:?}");
-	measured
+	// Both still ran when KILL was due; KILL went to the group.
+	let after = assert_killed_after(&escalated(&s), grace, &members);
+	until("group killed", || live_group(group).is_empty());
+	eprintln!("TERM→KILL escalation: grace {grace:?}, KILL step {after:?} after the drop");
 }
 
 /// A detached external (`nohup`) dropped while it runs is released, not
@@ -680,8 +728,8 @@ fn dropped_detached_external_runs_on_and_is_no_leftover() {
 	let pid = p.pid() as i32;
 	assert!(s.leftovers().unwrap().is_empty(), "a detached external is no leak");
 	drop(p);
-	thread::sleep(Duration::from_millis(400));
-	assert!(live(pid), "released, not killed after the grace");
+	assert!(s.escalations().is_empty(), "released, not abandoned: no escalation started");
+	assert!(live(pid), "released, not killed");
 	// SAFETY: plain syscall; the pid is unreaped while the sleep runs.
 	assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
 	until("reaped after its exit", || !proc::exists(pid));
@@ -714,28 +762,28 @@ fn output_written_after_the_extproc_is_dropped_still_arrives() {
 
 #[test]
 fn abandoned_external_is_killed_after_a_short_grace() {
-	let grace = Duration::from_millis(300);
-	let measured = abandon_escalates(grace);
-	assert!(measured < grace + Duration::from_secs(1), "KILL late: {measured:?}");
+	abandon_escalates(Duration::from_millis(300));
 }
 
 #[test]
 fn abandoned_external_is_killed_after_the_default_grace() {
-	let measured = abandon_escalates(SpawnConfig::DEFAULT_GRACE);
-	assert!(measured < SpawnConfig::DEFAULT_GRACE + Duration::from_secs(1), "{measured:?}");
+	abandon_escalates(SpawnConfig::DEFAULT_GRACE);
 }
 
 #[test]
 fn abandon_sends_term_to_the_whole_group_at_once() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Share, Duration::from_secs(60));
-	let a = sh("/bin/sleep 30 & /bin/sleep 30 & wait");
+	let a = sh("/bin/sleep 100000 & /bin/sleep 100000 & wait");
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
 	until("members up", || live_group(group).len() == 3);
 	drop(p);
-	let t = until("group terminated", || live_group(group).is_empty());
-	assert!(t < Duration::from_secs(5), "TERM did not reach the group: {t:?}");
+	until("group terminated", || live_group(group).is_empty());
+	// TERM ended the whole group: the escalation's KILL step, due a minute
+	// after the drop, had not run when it was gone.
+	let all = s.escalations();
+	assert!(all.len() == 1 && all[0].running && all[0].fired.is_none(), "{all:?}");
 }
 
 #[test]

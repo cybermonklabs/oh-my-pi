@@ -397,8 +397,10 @@ fn shared_writer_retries_would_block() {
 }
 
 /// Cancelling while the client waits on its peer (a remote shell that never
-/// answers) ends the run promptly with upstream's signal exit: code 20 and the
-/// `received SIGINT, SIGTERM, or SIGHUP (code 20) at rsync.c(874)` trailer.
+/// answers, and never ends by itself while the test runs) ends the run with
+/// upstream's signal exit: code 20 and the `received SIGINT, SIGTERM, or
+/// SIGHUP (code 20) at rsync.c(874)` trailer. Only the cancel can end it: a
+/// run that did not notice it hangs the test until the runner's timeout.
 #[cfg(unix)]
 #[test]
 fn cancel_mid_connection_exits_20_with_trailer() {
@@ -408,7 +410,7 @@ fn cancel_mid_connection_exits_20_with_trailer() {
 	let dir = tempfile::tempdir().unwrap();
 	make_tree(&dir.path().join("src"));
 	let rsh = dir.path().join("stuckrsh");
-	fs::write(&rsh, "#!/bin/sh\nexec sleep 30\n").unwrap();
+	fs::write(&rsh, "#!/bin/sh\nexec sleep 100000\n").unwrap();
 	fs::set_permissions(&rsh, fs::Permissions::from_mode(0o755)).unwrap();
 	let (mut host, cap) = crate::host::Host::for_test_owning("rsync", Vec::new(), dir.path());
 	let cancel = host.cancel_flag_for_test();
@@ -418,11 +420,9 @@ fn cancel_mid_connection_exits_20_with_trailer() {
 	});
 	let rsh_arg = rsh.to_str().unwrap().to_string();
 	let parsed = Rsync::try_parse_from(["rsync", "--", "-a", "-e", &rsh_arg, "src/", "h:dst/"]).unwrap();
-	let started = Instant::now();
 	let code = crate::host::run_caught::<Rsync>(parsed, &mut host);
 	canceller.join().unwrap();
 	assert_eq!(code, RERR_SIGNAL);
-	assert!(started.elapsed() < Duration::from_secs(10), "cancellation was not prompt");
 	assert_eq!(cap.err(), "rsync error: received SIGINT, SIGTERM, or SIGHUP (code 20) at rsync.c(874) [sender=3.5.1]\n");
 }
 

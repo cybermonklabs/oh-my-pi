@@ -295,25 +295,21 @@ async fn execute_captured(command: String) -> (ShellExecuteResult, String) {
 	(result, output)
 }
 
-/// Waits until `pid` runs as `expected`. Each poll walks the whole process
-/// table, which takes seconds on a loaded host, so the bound is generous;
-/// it stays below the 30 s lifetime of the process-test children.
+/// Waits until `pid` runs as `expected`, however long that takes: each poll
+/// walks the whole process table, which takes seconds on a loaded host, and
+/// the process-test children never end by themselves while a test runs.
 #[cfg(unix)]
 async fn wait_for_process_name(pid: i32, expected: &str) {
-	time::timeout(Duration::from_secs(20), async {
-		loop {
-			if pi_builtins::ProcInfo::all().into_iter().any(|process| {
-				process.pid() == pid
-					&& process.match_name() == expected
-					&& process.status() == pi_builtins::ProcessStatus::Running
-			}) {
-				return;
-			}
-			time::sleep(Duration::from_millis(10)).await;
+	loop {
+		if pi_builtins::ProcInfo::all().into_iter().any(|process| {
+			process.pid() == pid
+				&& process.match_name() == expected
+				&& process.status() == pi_builtins::ProcessStatus::Running
+		}) {
+			return;
 		}
-	})
-	.await
-	.expect("child did not enter expected executable");
+		time::sleep(Duration::from_millis(10)).await;
+	}
 }
 
 #[cfg(unix)]
@@ -343,15 +339,19 @@ fn process_test_command(prefix: &str) -> (tempfile::TempDir, std::path::PathBuf,
 	(dir, command, name)
 }
 
+/// A process-test child: `command` sleeping until a test ends it. It never
+/// ends by itself while a test runs (it sleeps 100000 s; a 30 s child ended
+/// by itself on a host slow enough that the test outlasted it), so its end
+/// is always one the test caused; dropping its handle kills it.
 #[cfg(unix)]
-fn process_test_child(command: &std::path::Path, duration: Duration) -> Command {
-	let duration_ms = u64::try_from(duration.as_millis()).expect("test duration fits u64");
+fn process_test_child(command: &std::path::Path) -> Command {
 	let mut child = Command::new(command);
 	child
 		.args(["--ignored", "--exact", "shell::tests::process_test_sleeper"])
-		.env("PI_SHELL_PROCESS_TEST_SLEEP_MS", duration_ms.to_string())
+		.env("PI_SHELL_PROCESS_TEST_SLEEP_MS", "100000000")
 		.stdout(std::process::Stdio::null())
-		.stderr(std::process::Stdio::null());
+		.stderr(std::process::Stdio::null())
+		.kill_on_drop(true);
 	child
 }
 

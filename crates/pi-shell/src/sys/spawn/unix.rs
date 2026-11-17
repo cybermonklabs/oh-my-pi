@@ -168,8 +168,8 @@ fn next_wait(mb: &Arc<Mailbox>) -> Option<Wait> {
 pub(super) struct State {
 	/// The process umask when the spawner was created: `posix_spawn` cannot
 	/// set one, so specs asking for another take the fork path.
-	umask:     Option<u32>,
-	groups:    Mutex<Groups>,
+	umask:       Option<u32>,
+	groups:      Mutex<Groups>,
 	/// Optional libc extension: without it `posix_spawn` cannot set the cwd
 	/// (glibc < 2.29), so such libcs take the fork path. The gate also keeps
 	/// `POSIX_SPAWN_SETSID` (glibc 2.26+) off libcs older than that, where
@@ -177,7 +177,11 @@ pub(super) struct State {
 	/// into "the cwd is already right, skip `addchdir`": glibc 2.17–2.25 would
 	/// then reach `posix_spawn` and fail every `Place::Session` spawn.
 	#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
-	add_chdir: Option<posix::AddChdir>,
+	add_chdir:   Option<posix::AddChdir>,
+	/// The record of every abandon escalation, in the order the externals
+	/// were dropped.
+	#[cfg(test)]
+	escalations: Mutex<Vec<Arc<Mutex<Escalation>>>>,
 }
 
 /// Scopes the spawner created, for leak checks.
@@ -263,13 +267,113 @@ impl Scope {
 	}
 
 	/// KILL whatever is left in the scope after the external exited
-	/// (identity-pinned; a `Process` scope has nothing beyond the pid).
-	fn sweep(self) {
-		let _ = match self {
+	/// (identity-pinned; a `Process` scope has nothing beyond the pid): the
+	/// processes signalled, or the error of a scan that read only some.
+	fn sweep(self) -> io::Result<Vec<ProcInfo>> {
+		match self {
 			Self::Group(id) => proc::kill_group(id, Signal::Kill),
 			Self::Session(id) => proc::kill_session(id, Signal::Kill),
-			Self::Process { .. } => return,
+			Self::Process { .. } => Ok(Vec::new()),
+		}
+	}
+
+	/// The live (not zombie) processes of the scope.
+	#[cfg(test)]
+	fn members(self) -> io::Result<Vec<ProcInfo>> {
+		let mut all = match self {
+			Self::Group(id) => proc::group_members(id)?,
+			Self::Session(id) => proc::session_members(id)?,
+			Self::Process { pid } => proc::read(pid)?.into_iter().collect(),
 		};
+		all.retain(|p| p.state != ProcState::Zombie);
+		Ok(all)
+	}
+}
+
+/// What the abandon escalation of one external did, as it recorded it
+/// ([`NativeSpawner::escalations`](super::NativeSpawner::escalations)): what
+/// tests assert on, rather than on how long a process took to go on a busy
+/// host.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct Escalation {
+	/// The scope's id: session, group, or the external's own pid.
+	pub scope:     i32,
+	/// The external still ran when its `ExtProc` was dropped (rather than
+	/// having exited without the engine collecting it).
+	pub running:   bool,
+	/// When the `ExtProc` was dropped.
+	pub abandoned: Instant,
+	/// The KILL step, once it ran.
+	pub fired:     Option<Fired>,
+}
+
+/// The KILL step of an [`Escalation`].
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct Fired {
+	/// When it ran.
+	pub at:     Instant,
+	/// The scope's live processes just before it: what TERM and the grace
+	/// left.
+	pub alive:  Result<Vec<ProcInfo>, String>,
+	/// KILL went to the scope: its leader still ran.
+	pub killed: bool,
+	/// The processes the sweep then sent KILL, once it ran (identity-pinned).
+	pub swept:  Option<Result<Vec<ProcInfo>, String>>,
+}
+
+/// Where an abandon escalation records what it does ([`Escalation`]): in
+/// test builds only, a no-op otherwise.
+#[derive(Clone)]
+struct Journal(#[cfg(test)] Arc<Mutex<Escalation>>);
+
+impl Journal {
+	/// The record of the escalation of `scope`, whose `ExtProc` was dropped
+	/// at `abandoned` while it ran (`running`) or after it exited, opened in
+	/// `state`.
+	#[cfg_attr(not(test), expect(clippy::missing_const_for_fn, reason = "records in test builds"))]
+	fn open(state: &State, scope: Scope, running: bool, abandoned: Instant) -> Self {
+		#[cfg(test)]
+		{
+			let entry =
+				Arc::new(Mutex::new(Escalation { scope: scope.id(), running, abandoned, fired: None }));
+			state.escalations.lock().push(Arc::clone(&entry));
+			Self(entry)
+		}
+		#[cfg(not(test))]
+		{
+			let _ = (state, scope, running, abandoned);
+			Self()
+		}
+	}
+
+	/// The KILL step runs now on `scope`; `killed` when it sends KILL to it.
+	/// Called before the signal goes out.
+	#[cfg_attr(not(test), expect(clippy::missing_const_for_fn, reason = "records in test builds"))]
+	fn fire(&self, scope: Scope, killed: bool) {
+		#[cfg(test)]
+		{
+			let at = Instant::now();
+			let alive = scope.members().map_err(|e| e.to_string());
+			self.0.lock().fired = Some(Fired { at, alive, killed, swept: None });
+		}
+		#[cfg(not(test))]
+		let _ = (self, scope, killed);
+	}
+
+	/// The sweep after the KILL step ran, with this outcome.
+	#[cfg_attr(not(test), expect(clippy::missing_const_for_fn, reason = "records in test builds"))]
+	fn swept(&self, outcome: &io::Result<Vec<ProcInfo>>) {
+		#[cfg(test)]
+		if let Some(fired) = &mut self.0.lock().fired {
+			fired.swept = Some(match outcome {
+				Ok(swept) => Ok(swept.clone()),
+				Err(error) => Err(error.to_string()),
+			});
+		}
+		#[cfg(not(test))]
+		let _ = (self, outcome);
 	}
 }
 
@@ -282,7 +386,20 @@ impl State {
 			groups: Mutex::new(Groups { list: Vec::new(), next_sweep: SWEEP }),
 			#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
 			add_chdir: posix::add_chdir(),
+			#[cfg(test)]
+			escalations: Mutex::new(Vec::new()),
 		}
+	}
+
+	/// The record of every abandon escalation so far.
+	#[cfg(test)]
+	pub(super) fn escalations(&self) -> Vec<Escalation> {
+		self
+			.escalations
+			.lock()
+			.iter()
+			.map(|entry| entry.lock().clone())
+			.collect()
 	}
 
 	/// The process umask when the spawner was created.
@@ -1687,7 +1804,8 @@ impl Drop for UnixProc {
 			self.unpark();
 			return;
 		}
-		match life.abandon(Instant::now(), grace) {
+		let now = Instant::now();
+		match life.abandon(now, grace) {
 			Abandon::Exited => {
 				drop(life);
 				self.shared.state.reap(self.pid);
@@ -1700,7 +1818,8 @@ impl Drop for UnixProc {
 				let _ = self.scope.signal(Signal::Cont);
 				drop(life);
 				self.shared.state.reap(self.pid);
-				escalate_at(&self.tracker, self.scope, sweep_at);
+				let journal = Journal::open(&self.shared.state, self.scope, false, now);
+				escalate_at(&self.tracker, self.scope, sweep_at, journal);
 			},
 			Abandon::Escalate { term, kill_at } => {
 				// Under the lock: the waiter cannot record the exit and reap
@@ -1711,7 +1830,8 @@ impl Drop for UnixProc {
 				// A stopped (paused) group acts on TERM only once continued.
 				let _ = self.scope.signal(Signal::Cont);
 				drop(life);
-				escalate_at(&self.tracker, self.scope, kill_at);
+				let journal = Journal::open(&self.shared.state, self.scope, true, now);
+				escalate_at(&self.tracker, self.scope, kill_at, journal);
 				// Parked: a waiter observes the exit and reaps.
 				#[cfg(target_os = "linux")]
 				self.unpark();
@@ -1722,34 +1842,37 @@ impl Drop for UnixProc {
 
 /// [`escalate`] on a thread of its own; at once when no thread can be
 /// started (KILL now rather than never).
-fn escalate_at(tracker: &Arc<Tracker>, scope: Scope, kill_at: Instant) {
+fn escalate_at(tracker: &Arc<Tracker>, scope: Scope, kill_at: Instant, journal: Journal) {
 	let waiter = Arc::clone(tracker);
+	let fallback = journal.clone();
 	let started = thread::Builder::new()
 		.name("obash-kill".into())
 		.stack_size(SMALL_STACK)
-		.spawn(move || escalate(&waiter, scope, kill_at));
+		.spawn(move || escalate(&waiter, scope, kill_at, &journal));
 	if started.is_err() {
 		let now = Instant::now();
 		tracker.lock().schedule_kill(now);
-		escalate(tracker, scope, now);
+		escalate(tracker, scope, now, &fallback);
 	}
 }
 
 /// After `kill_at`: KILL the scope if its leader is still running (under the
 /// lock, so it is unreaped), then every straggler left in a group or session
-/// (identity-pinned).
-fn escalate(tracker: &Tracker, scope: Scope, kill_at: Instant) {
+/// (identity-pinned). `journal` records each step.
+fn escalate(tracker: &Tracker, scope: Scope, kill_at: Instant, journal: &Journal) {
 	let now = Instant::now();
 	if kill_at > now {
 		thread::sleep(kill_at - now);
 	}
 	{
 		let mut life = tracker.lock();
-		if life.take_kill(Instant::now().max(kill_at)) {
+		let kill = life.take_kill(Instant::now().max(kill_at));
+		journal.fire(scope, kill);
+		if kill {
 			let _ = scope.signal(Signal::Kill);
 		}
 	}
-	scope.sweep();
+	journal.swept(&scope.sweep());
 }
 
 /// The processes left in the recorded scopes, and whether the scan read

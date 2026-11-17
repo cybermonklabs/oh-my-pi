@@ -795,20 +795,17 @@ async fn persistent_shell_reaps_background_child_without_followup_run() {
 	assert!(pid > 0);
 
 	// No calls to the shell (including the live-job counter) until this
-	// child has exited and its parent has reaped it.
-	time::timeout(Duration::from_secs(5), async {
-		loop {
-			// SAFETY: signal 0 only probes this pid's existence.
-			if unsafe { libc::kill(pid, 0) } == -1 {
-				let err = io::Error::last_os_error();
-				assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "probe child: {err}");
-				break;
-			}
-			time::sleep(Duration::from_millis(20)).await;
+	// child has exited and its parent has reaped it. Waits as long as that
+	// takes: a child never reaped hangs the test until the runner's timeout.
+	loop {
+		// SAFETY: signal 0 only probes this pid's existence.
+		if unsafe { libc::kill(pid, 0) } == -1 {
+			let err = io::Error::last_os_error();
+			assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "probe child: {err}");
+			break;
 		}
-	})
-	.await
-	.expect("background child remained a zombie after exit");
+		time::sleep(Duration::from_millis(20)).await;
+	}
 
 	assert_eq!(shell.live_background_job_count().await, 0);
 
@@ -834,8 +831,10 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 	let first_pidfile = tempfile::NamedTempFile::new().expect("pipeline pidfile");
 	let last_pidfile = tempfile::NamedTempFile::new().expect("last stage pidfile");
 	// `$!` names the job for `wait`; each stage reports its OS pid itself.
+	// The first stage never ends by itself while the test runs (the test
+	// ends it).
 	let command = format!(
-		"/bin/sh -c 'echo $$ > \"$1\"; exec /bin/sleep 15' _ {} | /bin/sh -c 'echo $$ > \"$1\"; \
+		"/bin/sh -c 'echo $$ > \"$1\"; exec /bin/sleep 100000' _ {} | /bin/sh -c 'echo $$ > \"$1\"; \
 		 sleep 1; exit 9' _ {} >/dev/null 2>&1 & pid=$!",
 		quote_arg(&first_pidfile.path().to_string_lossy()),
 		quote_arg(&last_pidfile.path().to_string_lossy())
@@ -870,20 +869,18 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 	assert_ne!(first_pid, last_pid, "pipeline stages need distinct pids");
 
 	// A zombie still responds to signal 0. The last stage must disappear
-	// while the first is alive, without another shell/tool invocation.
-	time::timeout(Duration::from_secs(5), async {
-		loop {
-			// SAFETY: signal 0 only probes this pid's existence.
-			if unsafe { libc::kill(last_pid, 0) } == -1 {
-				let err = io::Error::last_os_error();
-				assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "probe child: {err}");
-				break;
-			}
-			time::sleep(Duration::from_millis(20)).await;
+	// while the first is alive, without another shell/tool invocation. Waits
+	// as long as that takes (a stage never reaped hangs the test until the
+	// runner's timeout).
+	loop {
+		// SAFETY: signal 0 only probes this pid's existence.
+		if unsafe { libc::kill(last_pid, 0) } == -1 {
+			let err = io::Error::last_os_error();
+			assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "probe child: {err}");
+			break;
 		}
-	})
-	.await
-	.expect("early exiting pipeline stage remained a zombie");
+		time::sleep(Duration::from_millis(20)).await;
+	}
 	// SAFETY: signal 0 only probes the other child, which must still be
 	// running for this to prove independent reaping.
 	assert_eq!(unsafe { libc::kill(first_pid, 0) }, 0, "first stage exited too soon");
@@ -1005,11 +1002,8 @@ async fn pids_reports_in_flight_children_until_run_returns() {
 	assert_eq!(child.status(), proctree::ProcessStatus::Running);
 
 	shell.abort().await;
-	let result = time::timeout(Duration::from_secs(5), run)
-		.await
-		.expect("aborted run returns")
-		.expect("run task")
-		.expect("run result");
+	// Returns either on the abort (`cancelled`) or at the sleep's own end.
+	let result = run.await.expect("run task").expect("run result");
 	assert!(result.cancelled, "run was aborted");
 	assert!(shell.pids().is_empty(), "pids cleared once the run returns");
 }
@@ -1613,11 +1607,9 @@ async fn embedded_external_command_runs_in_its_own_session() {
 		std::io::Error::last_os_error(),
 	);
 
-	// Drain the session task and the pipe reader.
-	let (_session, exec) = time::timeout(Duration::from_secs(5), shell_handle)
-		.await
-		.expect("shell timed out")
-		.expect("shell task panicked");
+	// Drain the session task (its command ends by itself) and the pipe
+	// reader.
+	let (_session, exec) = shell_handle.await.expect("shell task panicked");
 	assert_eq!(exec.status, 0, "unexpected exit: {}", exit_code(&exec));
 	let _ = time::timeout(Duration::from_secs(2), reader_handle).await;
 
@@ -1668,11 +1660,8 @@ async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() 
 	.await
 	.expect("background child ready");
 	abort.abort(AbortReason::Signal);
-	let result = time::timeout(Duration::from_secs(5), task)
-		.await
-		.expect("cancel finished")
-		.expect("run task")
-		.expect("shell result");
+	// Returns either on the abort (`cancelled`) or at the sleep's own end.
+	let result = task.await.expect("run task").expect("shell result");
 	assert!(result.cancelled);
 	assert_eq!(fs::read_to_string(root.path().join("cleaned")).expect("TERM cleanup"), "cleaned");
 }
@@ -1716,11 +1705,9 @@ async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 	.await
 	.expect("child ready");
 	abort.abort(AbortReason::Signal);
-	let result = time::timeout(Duration::from_secs(5), task)
-		.await
-		.expect("cancel finished")
-		.expect("run task")
-		.expect("shell result");
+	// Waits as long as that takes: a run the abort did not end hangs the test
+	// until the runner's timeout.
+	let result = task.await.expect("run task").expect("shell result");
 	assert!(result.cancelled);
 	assert_eq!(
 		fs::read_to_string(root.path().join("cleaned")).expect("TERM cleanup after writing output"),

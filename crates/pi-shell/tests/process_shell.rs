@@ -126,11 +126,14 @@ fn command_strings_and_exit_statuses_match_zsh() {
 }
 
 /// A standalone shell abandons the externals still running when it exits:
-/// a background job without `nohup` gets `TERM` and is gone shortly after.
+/// a background job without `nohup` gets `TERM`, which ends it. The job
+/// never ends by itself while the test runs, so only that `TERM` can; the
+/// test waits for it as long as that takes (a `TERM` that never came hangs
+/// the test until the runner's timeout).
 #[test]
 fn a_standalone_exit_ends_running_background_externals() {
 	let out = Command::new(env!("CARGO_BIN_EXE_obash"))
-		.args(["-c", "/bin/sleep 31 >/dev/null 2>&1 </dev/null & echo $!"])
+		.args(["-c", "/bin/sleep 100000 >/dev/null 2>&1 </dev/null & echo $!"])
 		.output()
 		.expect("start obash");
 	assert_eq!(out.status.code(), Some(0));
@@ -139,11 +142,9 @@ fn a_standalone_exit_ends_running_background_externals() {
 		.trim()
 		.parse()
 		.expect("the job's pid");
-	let deadline = std::time::Instant::now() + TIMEOUT;
 	// A zombie has ended (`proc::ended`): under a PID 1 that reaps only its
 	// own child (a container started with `exec runuser`), an orphan stays one.
 	while !proc::ended(pid) {
-		assert!(std::time::Instant::now() < deadline, "sleep {pid} still runs after obash exited");
 		std::thread::sleep(std::time::Duration::from_millis(20));
 	}
 }

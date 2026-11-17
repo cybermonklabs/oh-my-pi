@@ -1876,21 +1876,23 @@ mod tests {
 				(pid, ids)
 			}
 		};
-		let started = Instant::now();
+		// The sleep never ends by itself while the test runs: only the cancel
+		// ends it.
 		let (outcome, (pid, (pgid, sid, own_group))) =
-			tokio::join!(s.run("/bin/sleep 30", RunStdio::default(), cancel.clone()), probe);
+			tokio::join!(s.run("/bin/sleep 100000", RunStdio::default(), cancel.clone()), probe);
 		let outcome = outcome.unwrap();
 		assert!(outcome.cancelled);
+		// 143, not 137: the run ended on the cancel's TERM, inside the
+		// session's own grace, rather than by its KILL after it.
 		assert_eq!(outcome.status, 143);
-		assert!(started.elapsed() < Duration::from_secs(5), "cancel took {:?}", started.elapsed());
 		assert_eq!((pgid, sid), (pid, pid), "the external leads its own session");
 		assert_ne!(pgid, own_group);
 		assert!(children.pids().is_empty(), "no run in flight");
-		let gone = Instant::now();
-		while !crate::sys::proc::ended(pid) && gone.elapsed() < Duration::from_secs(3) {
+		// Waits as long as that takes: a sleep the cancel did not reach hangs
+		// the test until the runner's timeout.
+		while !crate::sys::proc::ended(pid) {
 			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
-		assert!(crate::sys::proc::ended(pid), "sleep {pid} survived the cancel");
 		// The session is still usable.
 		assert_eq!(sh(&mut s, "echo ok").await.stdout, "ok\n");
 	}
