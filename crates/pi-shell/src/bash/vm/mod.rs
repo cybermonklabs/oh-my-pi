@@ -216,46 +216,53 @@ impl Default for ShellInit {
 /// A script to run ([`Shell::submit`]).
 pub struct Script {
 	/// Source bytes.
-	pub source:       Arc<[u8]>,
+	pub source:           Arc<[u8]>,
 	/// Where they came from (diagnostic prefixes, events).
-	pub origin:       Origin,
+	pub origin:           Origin,
 	/// Mode to parse and run in; the vproc's mode before the run comes
 	/// back when it ends (`None`: the shell's current mode, which an
 	/// `emulate` in the script changes for later runs too).
-	pub mode:         Option<ModeId>,
+	pub mode:             Option<ModeId>,
 	/// Positional parameters for the script, replacing the inherited current
 	/// positional scope in a new subshell without changing its caller.
-	pub args:         Option<Vec<BString>>,
+	pub args:             Option<Vec<BString>>,
 	/// Which virtual process runs it.
-	pub vproc:        VprocSel,
+	pub vproc:            VprocSel,
 	/// Opaque host tag, echoed in `RunStart`.
-	pub tag:          u64,
+	pub tag:              u64,
 	/// Working directory for the run.
-	pub cwd:          Option<BString>,
+	pub cwd:              Option<BString>,
 	/// Exported variables for the run.
-	pub env:          Vec<(BString, BString)>,
+	pub env:              Vec<(BString, BString)>,
 	/// Changes to inherited non-shell environment entries for a new subshell.
 	/// A `None` name clears them; otherwise `None` removes and `Some` sets.
-	pub foreign_env:  Vec<(Option<BString>, Option<BString>)>,
+	pub foreign_env:      Vec<(Option<BString>, Option<BString>)>,
 	/// Shell variable names whose inherited bindings must not be exported in
 	/// the new subshell, including bindings hidden by local scopes.
-	pub unexport_env: Vec<BString>,
+	pub unexport_env:     Vec<BString>,
+	/// The host hears of an `exec` that would replace the run's vproc and
+	/// that the system refuses because the command line is too long
+	/// (`E2BIG`, `ENAMETOOLONG`): the shell prints nothing for it, the run
+	/// ends with status 126, and [`Shell::exec_refusal`] has the error. A
+	/// callout can then retry with fewer arguments (`xargs`).
+	pub too_long_to_host: bool,
 }
 
 impl Script {
 	/// A command script (`-c` semantics) on the root vproc.
 	pub fn command(source: impl Into<Arc<[u8]>>) -> Self {
 		Self {
-			source:       source.into(),
-			origin:       Origin::Command,
-			mode:         None,
-			args:         None,
-			vproc:        VprocSel::Root,
-			tag:          0,
-			cwd:          None,
-			env:          Vec::new(),
-			foreign_env:  Vec::new(),
-			unexport_env: Vec::new(),
+			source:           source.into(),
+			origin:           Origin::Command,
+			mode:             None,
+			args:             None,
+			vproc:            VprocSel::Root,
+			tag:              0,
+			cwd:              None,
+			env:              Vec::new(),
+			foreign_env:      Vec::new(),
+			unexport_env:     Vec::new(),
+			too_long_to_host: false,
 		}
 	}
 }
@@ -507,6 +514,12 @@ pub struct Kernel {
 	pub exec_signals:       HashMap<RunId, i32>,
 	/// Signal death associated with the most recently reported run.
 	pub reported_signal:    Option<(RunId, i32)>,
+	/// Errors of `exec`s the system refused as too long, replacing a run
+	/// submitted with [`Script::too_long_to_host`], pending its completion
+	/// report; not imaged, like `exec_signals`.
+	pub exec_refusals:      HashMap<RunId, i32>,
+	/// Refusal associated with the most recently reported run.
+	pub reported_refusal:   Option<(RunId, i32)>,
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:              Vec<proc::Bang>,
@@ -628,6 +641,8 @@ impl Kernel {
 			exited: None,
 			exec_signals: HashMap::new(),
 			reported_signal: None,
+			exec_refusals: HashMap::new(),
+			reported_refusal: None,
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
@@ -1770,6 +1785,7 @@ impl Shell {
 			env: Vec::new(),
 			started: false,
 			exit_trap_started: false,
+			too_long_to_host: script.too_long_to_host,
 		};
 		let stdio = match script.vproc {
 			VprocSel::Root => {
@@ -2142,6 +2158,7 @@ impl Shell {
 	fn report(&mut self) -> Option<Step> {
 		if let Some((run, status)) = self.k.done.pop_front() {
 			self.k.reported_signal = self.k.exec_signals.remove(&run).map(|signal| (run, signal));
+			self.k.reported_refusal = self.k.exec_refusals.remove(&run).map(|code| (run, code));
 			return Some(Step::Done { run, status });
 		}
 		let (id, call) = self.k.calls_out.pop_front()?;
@@ -2282,6 +2299,7 @@ impl Shell {
 		let vpid = (p.vpid, p.mode);
 		for run in &runs {
 			self.k.exec_signals.remove(&run.id);
+			self.k.exec_refusals.remove(&run.id);
 			if run.started {
 				self
 					.k
@@ -2540,6 +2558,18 @@ impl Shell {
 			.reported_signal
 			.filter(|(id, _)| *id == run)
 			.map(|(_, signal)| signal)
+	}
+
+	/// The error (`E2BIG` or `ENAMETOOLONG`) of the `exec` the system refused
+	/// as too long, replacing `run`, if `run` was submitted with
+	/// [`Script::too_long_to_host`]. Ask immediately after its
+	/// [`Step::Done`].
+	pub fn exec_refusal(&self, run: RunId) -> Option<i32> {
+		self
+			.k
+			.reported_refusal
+			.filter(|(id, _)| *id == run)
+			.map(|(_, code)| code)
 	}
 
 	/// Number of the root's background jobs that still wait for a running

@@ -12,7 +12,9 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches};
 
-use crate::host::{CommandStatus, Host, RunningCommand, ShellCommand, Utility, matches_parser};
+use crate::host::{
+	CommandStatus, Host, RunningCommand, ShellCommand, Utility, command_line_too_long, matches_parser,
+};
 
 mod options {
 	pub const COMMAND: &str = "COMMAND";
@@ -345,56 +347,159 @@ fn cannot_run(error: io::Error, name: &OsStr) -> CommandExecutionError {
 	}
 }
 
+/// A command line xargs runs: `argv`, of which the first `fixed` words (the
+/// command and its initial arguments; the whole line with `-I`) stay in
+/// both halves when a line the system refuses as too long is split.
+struct Batch {
+	argv:  Vec<OsString>,
+	fixed: usize,
+}
+
+impl Batch {
+	/// The two lines GNU xargs retries a refused one as, each with half of
+	/// its input arguments; `None` when one argument (or none) is left.
+	fn split(mut self) -> Option<(Self, Self)> {
+		let fixed = self.fixed;
+		let args = self.argv.len() - fixed;
+		if args < 2 {
+			return None;
+		}
+		let mut second = Vec::with_capacity(fixed + args - args / 2);
+		second.extend_from_slice(&self.argv[..fixed]);
+		second.extend(self.argv.drain(fixed + args / 2..));
+		Some((self, Self { argv: second, fixed }))
+	}
+}
+
 /// Commands launched and not yet reaped, at most `limit` at once (`-P`).
 struct Jobs {
-	limit:   usize,
-	running: Vec<RunningCommand>,
-	result:  CommandResult,
+	limit:       usize,
+	running:     Vec<RunningCommand>,
+	/// The command line of each of `running`, at the same index, kept until
+	/// it ends so a line the system refuses as too long can be split.
+	batches:     Vec<Batch>,
+	result:      CommandResult,
 	/// The command name every command line runs (`argv[0]`), for diagnostics.
-	command: OsString,
+	command:     OsString,
+	/// `-t`: each command line goes to stderr before it runs.
+	verbose:     bool,
+	/// `-p`: each command line runs only once the user confirms it.
+	interactive: bool,
+	/// A fatal outcome was seen: nothing more starts, a refused line's
+	/// halves included.
+	stopped:     bool,
 }
 
 impl Jobs {
-	fn new(limit: usize) -> Self {
-		Self { limit, running: Vec::new(), result: CommandResult::Success, command: OsString::new() }
+	fn new(limit: usize, verbose: bool, interactive: bool) -> Self {
+		Self {
+			limit,
+			running: Vec::new(),
+			batches: Vec::new(),
+			result: CommandResult::Success,
+			command: OsString::new(),
+			verbose,
+			interactive,
+			stopped: false,
+		}
 	}
 
-	/// Starts `argv`, then waits until fewer than `limit` commands run, so
+	/// Echoes `argv` for `-t`, or asks about it for `-p`; whether it runs.
+	fn confirm(&self, host: &mut Host, argv: &[OsString]) -> bool {
+		if !self.interactive && !self.verbose {
+			return true;
+		}
+		let line = argv
+			.iter()
+			.map(|arg| arg.to_string_lossy())
+			.collect::<Vec<_>>()
+			.join(" ");
+		if !self.interactive {
+			// GNU-style `-t`: echo the command line about to run on stderr.
+			let _ = writeln!(host.stderr, "{line}");
+			return true;
+		}
+		let _ = write!(host.stderr, "{line} ?...");
+		let _ = host.stderr.flush();
+		let mut response = Vec::new();
+		let mut byte = [0_u8; 1];
+		while host.stdin.read(&mut byte).unwrap_or(0) == 1 {
+			if byte[0] == b'\n' {
+				break;
+			}
+			response.push(byte[0]);
+		}
+		matches!(response.first(), Some(b'y' | b'Y'))
+	}
+
+	/// Starts `batch`, then waits until fewer than `limit` commands run, so
 	/// `-P 1` runs each command to completion before reading more input.
-	fn spawn(&mut self, host: &mut Host, argv: Vec<OsString>) -> Result<(), CommandExecutionError> {
+	fn spawn(&mut self, host: &mut Host, batch: Batch) -> Result<(), CommandExecutionError> {
+		if !self.confirm(host, &batch.argv) {
+			return Ok(());
+		}
 		// A child may have finished while there was still a free slot (in
 		// particular with -P 0). Observe fatal outcomes before launching more.
-		while let Some(status) = RunningCommand::try_wait_any(&mut self.running) {
-			self.result.combine(command_outcome(status, &self.command)?);
+		while let Some((index, status)) = RunningCommand::try_wait_any(&mut self.running) {
+			let done = self.batches.swap_remove(index);
+			self.settle(host, done, status)?;
 		}
-		if let Some(name) = argv.first() {
+		if let Some(name) = batch.argv.first() {
 			self.command.clone_from(name);
 		}
+		// The line is kept until the command ends: the refusal comes back
+		// from the shell then, and the halves are cut from it.
+		let command = ShellCommand::new(batch.argv.clone()).too_long_as_error();
 		let command = host
-			.spawn_command(ShellCommand::new(argv))
+			.spawn_command(command)
 			.map_err(|error| cannot_run(error, &self.command))?;
 		self.running.push(command);
+		self.batches.push(batch);
 		while self.running.len() >= self.limit {
-			self.reap()?;
+			self.reap(host)?;
 		}
 		Ok(())
 	}
 
 	/// Waits for one running command and folds its status into the result.
-	fn reap(&mut self) -> Result<(), CommandExecutionError> {
-		if let Some(status) = RunningCommand::wait_any(&mut self.running) {
-			self.result.combine(command_outcome(status, &self.command)?);
+	fn reap(&mut self, host: &mut Host) -> Result<(), CommandExecutionError> {
+		if let Some((index, status)) = RunningCommand::wait_any(&mut self.running) {
+			let batch = self.batches.swap_remove(index);
+			self.settle(host, batch, status)?;
 		}
 		Ok(())
 	}
 
+	/// Folds how `batch` ended into the result. A line the system refused as
+	/// too long runs again as two halves, first then second, as GNU xargs
+	/// retries it; one input argument too long on its own is the error.
+	fn settle(
+		&mut self,
+		host: &mut Host,
+		batch: Batch,
+		status: io::Result<CommandStatus>,
+	) -> Result<(), CommandExecutionError> {
+		if !self.stopped
+			&& !host.is_cancelled()
+			&& status.as_ref().is_err_and(command_line_too_long)
+			&& let Some((first, second)) = batch.split()
+		{
+			self.spawn(host, first)?;
+			return self.spawn(host, second);
+		}
+		self.result.combine(command_outcome(status, &self.command)?);
+		Ok(())
+	}
+
 	/// Waits for every running command, so none outlives xargs; the first
-	/// fatal error is reported only once all have finished.
-	fn finish(mut self) -> Result<CommandResult, CommandExecutionError> {
+	/// fatal error is reported only once all have finished, and stops new
+	/// commands, so a refused line is not split after one.
+	fn finish(mut self, host: &mut Host) -> Result<CommandResult, CommandExecutionError> {
 		let mut outcome = Ok(());
 		while !self.running.is_empty() {
-			let reaped = self.reap();
-			if outcome.is_ok() {
+			let reaped = self.reap(host);
+			if outcome.is_ok() && reaped.is_err() {
+				self.stopped = true;
 				outcome = reaped;
 			}
 		}
@@ -450,73 +555,50 @@ impl CommandBuilder<'_> {
 		Ok(())
 	}
 
-	fn execute(self, host: &mut Host, jobs: &mut Jobs) -> Result<(), CommandExecutionError> {
+	fn execute(mut self, host: &mut Host, jobs: &mut Jobs) -> Result<(), CommandExecutionError> {
 		let (entry_point, initial_args): (&OsStr, &[OsString]) = match &self.options.action {
 			ExecAction::Command(args) => (&args[0], &args[1..]),
 			ExecAction::Echo => (OsStr::new("echo"), &[]),
 		};
 
-		let final_args: Vec<OsString> = if let Some(replace_str) = &self.options.replace {
+		let mut argv = Vec::with_capacity(1 + initial_args.len() + self.extra_args.len());
+		argv.push(entry_point.to_owned());
+		let fixed = if let Some(replace_str) = &self.options.replace {
 			// Replace all occurrences in initial args with the extra arg,
 			// Thanks to `MaxArgsCommandSizeLimiter`, we only process a single extra arg
 			// here.
 			let replacement = self.extra_args[0].to_string_lossy();
-			initial_args
-				.iter()
-				.map(|arg| {
-					let arg_str = arg.to_string_lossy();
-					OsString::from(arg_str.replace(replace_str, &replacement))
-				})
-				.collect()
+			argv.extend(initial_args.iter().map(|arg| {
+				let arg_str = arg.to_string_lossy();
+				OsString::from(arg_str.replace(replace_str, &replacement))
+			}));
+			// The whole line comes of one input argument: it is not split.
+			argv.len()
 		} else {
 			// don't do any replacement
-			initial_args
-				.iter()
-				.cloned()
-				.chain(self.extra_args.iter().cloned())
-				.collect()
+			argv.extend(initial_args.iter().cloned());
+			let fixed = argv.len();
+			argv.append(&mut self.extra_args);
+			fixed
 		};
 
-		let mut line = entry_point.to_string_lossy().into_owned();
-		for arg in &final_args {
-			line.push(' ');
-			line.push_str(&arg.to_string_lossy());
-		}
-		if self.options.interactive {
-			let _ = write!(host.stderr, "{line} ?...");
-			let _ = host.stderr.flush();
-			let mut response = Vec::new();
-			let mut byte = [0_u8; 1];
-			while host.stdin.read(&mut byte).unwrap_or(0) == 1 {
-				if byte[0] == b'\n' {
-					break;
-				}
-				response.push(byte[0]);
-			}
-			if !matches!(response.first(), Some(b'y' | b'Y')) {
-				return Ok(());
-			}
-		} else if self.options.verbose {
-			// GNU-style `-t`: echo the command line about to run on stderr.
-			let _ = writeln!(host.stderr, "{line}");
-		}
-
 		match &self.options.action {
-			ExecAction::Command(_) => {
-				let argv = std::iter::once(entry_point.to_owned()).chain(final_args).collect();
-				jobs.spawn(host, argv)
-			},
+			ExecAction::Command(_) => jobs.spawn(host, Batch { argv, fixed }),
 			ExecAction::Echo => {
-				let _ = writeln!(
-					host.stdout,
-					"{}",
-					self
-						.extra_args
-						.iter()
-						.map(|arg| arg.to_string_lossy())
-						.collect::<Vec<_>>()
-						.join(" ")
-				);
+				if jobs.confirm(host, &argv) {
+					// With `-I` the line is just `echo`; the input argument is printed.
+					let words =
+						if self.options.replace.is_some() { &self.extra_args[..] } else { &argv[1..] };
+					let _ = writeln!(
+						host.stdout,
+						"{}",
+						words
+							.iter()
+							.map(|arg| arg.to_string_lossy())
+							.collect::<Vec<_>>()
+							.join(" ")
+					);
+				}
 				Ok(())
 			},
 		}
@@ -762,9 +844,11 @@ fn process_input(
 	args: Box<dyn ArgumentReader>,
 	options: &InputProcessOptions,
 ) -> Result<CommandResult, XargsError> {
-	let mut jobs = Jobs::new(options.max_procs);
+	let mut jobs = Jobs::new(options.max_procs, builder_options.verbose, builder_options.interactive);
 	let launched = launch_commands(host, builder_options, args, options, &mut jobs);
-	let finished = jobs.finish();
+	// After a fatal error nothing more starts, a refused line's halves included.
+	jobs.stopped = launched.is_err();
+	let finished = jobs.finish(host);
 	launched?;
 	Ok(finished?)
 }
@@ -1287,6 +1371,130 @@ mod tests {
 			stderr.contains("Base command and environment are too large"),
 			"an environment that exhausts ARG_MAX must reject the base command: {stderr}"
 		);
+	}
+
+	/// The command the size tests run: it prints how many input arguments
+	/// its line had.
+	const COUNT_ARGS: &str = "printf \"%s\\n\" \"$#\"";
+
+	/// The number of input arguments of each line `COUNT_ARGS` ran.
+	fn line_sizes(stdout: &str) -> Vec<usize> {
+		stdout.lines().map(|line| line.parse().unwrap()).collect()
+	}
+
+	/// `sh` behind a symlink at a path of about 3500 bytes (the directory goes
+	/// with the guard). `execve` copies the program's path onto the new stack
+	/// with the command line, while xargs counts only the command line and
+	/// the environment against `sysconf(_SC_ARG_MAX)`, with 2048 bytes to
+	/// spare: the kernel refuses a line xargs filled, as a sandbox whose limit
+	/// is below `sysconf` (gVisor) refuses every full line.
+	#[cfg(target_os = "linux")]
+	fn sh_at_a_long_path() -> (tempfile::TempDir, String) {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut path = dir.path().to_path_buf();
+		while path.as_os_str().len() < 3300 {
+			path.push("d".repeat(250));
+		}
+		std::fs::create_dir_all(&path).expect("long directory");
+		path.push("sh");
+		std::os::unix::fs::symlink("/bin/sh", &path).expect("sh symlink");
+		let path = path.into_os_string().into_string().expect("utf-8 path");
+		assert!(path.len() < 4000, "{} bytes is too close to PATH_MAX", path.len());
+		(dir, path)
+	}
+
+	/// A line the kernel refuses as too long runs again as two halves, as GNU
+	/// xargs retries it, so every input argument still runs, once.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn a_line_the_kernel_refuses_as_too_long_runs_as_halves() {
+		let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
+		let count = arg_max / 256;
+		let input = format!("{}\n", "x".repeat(255)).repeat(count);
+		let cwd = std::env::temp_dir();
+		// What a full line holds, from `echo`, which runs in-process: no
+		// exec limit refuses it (gVisor refuses even a `/bin/sh` line here).
+		let (code, stdout, stderr) = xargs_in(&cwd, &["echo"], &input).await;
+		assert_eq!(code, 0, "{stderr}");
+		let full = stdout.lines().next().map_or(0, |line| line.split(' ').count());
+
+		let (_dir, sh) = sh_at_a_long_path();
+		let (code, stdout, stderr) = xargs_in(&cwd, &[&sh, "-c", COUNT_ARGS, "sh"], &input).await;
+		assert_eq!((code, stderr.as_str()), (0, ""), "every line runs, and nothing is reported");
+		let lines = line_sizes(&stdout);
+		assert_eq!(lines.iter().sum::<usize>(), count, "{lines:?}");
+		let largest = lines.iter().copied().max().unwrap_or(0);
+		assert!(
+			largest <= full.div_ceil(2),
+			"no line was refused and split: one of {lines:?} has {largest} of the {full} arguments a \
+			 full line holds"
+		);
+	}
+
+	/// One input argument the kernel refuses even on its own is an error,
+	/// reported once, and nothing runs.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn one_argument_too_long_on_its_own_is_an_error() {
+		let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
+		let (_dir, sh) = sh_at_a_long_path();
+		let command = [sh.as_str(), "-c", COUNT_ARGS, "sh"];
+		// The longest argument xargs fits after this command, as it counts:
+		// each word with its NUL and argv pointer, the environment likewise,
+		// and 2048 bytes to spare. Less a margin, the kernel still refuses it
+		// for the program's path.
+		let word = |text: &str| text.len() + 1 + size_of::<*const u8>();
+		let env: usize = std::env::vars().map(|(name, value)| word(&name) + value.len() + 1).sum();
+		let room = arg_max - 2048 - env - command.iter().map(|text| word(text)).sum::<usize>();
+		let input = format!("{}\n", "x".repeat(room - word("") - 64));
+		let (code, stdout, stderr) = xargs_in(&std::env::temp_dir(), &command, &input).await;
+		assert_eq!((code, stdout.as_str()), (126, ""), "{stderr}");
+		assert_eq!(stderr.matches("Argument list too long").count(), 1, "{stderr}");
+	}
+
+	/// Runs `xargs true` over the words `1` to `10` against a system that
+	/// refuses lines of more than `most` of them with `errno`
+	/// ([`crate::host::Refusing`]): status, stderr, the input argument counts
+	/// of the lines tried, and the arguments that ran.
+	#[cfg(unix)]
+	async fn refused_above(most: usize, errno: i32) -> (i32, String, Vec<usize>, Vec<String>) {
+		let (runner, seen) = crate::host::Refusing::new(1, most, errno);
+		let (code, _, stderr) = crate::host::run_extra_with(
+			&["xargs", "true"],
+			"1 2 3 4 5 6 7 8 9 10\n",
+			&std::env::temp_dir(),
+			&[],
+			|_, _, _, _| Box::new(runner),
+		)
+		.await;
+		let seen = std::mem::take(&mut *seen.lock());
+		(code, stderr, seen.tried, seen.ran)
+	}
+
+	/// `E2BIG`, and `ENAMETOOLONG` as GKE Sandbox (gVisor) says it, split a
+	/// line in halves, first half first, until each half runs.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn a_refused_line_is_halved_in_order_for_e2big_and_enametoolong() {
+		let words: Vec<String> = (1..=10).map(|n| n.to_string()).collect();
+		for errno in [libc::E2BIG, libc::ENAMETOOLONG] {
+			let (code, stderr, tried, ran) = refused_above(3, errno).await;
+			assert_eq!((code, stderr.as_str()), (0, ""), "errno {errno}");
+			assert_eq!(tried, [10, 5, 2, 3, 5, 2, 3], "errno {errno}");
+			assert_eq!(ran, words, "errno {errno}");
+		}
+	}
+
+	/// Any other refusal is the error at once: the line is not split.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn other_refusals_are_not_split() {
+		for errno in [libc::EACCES, libc::ENOEXEC, libc::ENOMEM, libc::ETXTBSY] {
+			let (code, stderr, tried, ran) = refused_above(0, errno).await;
+			assert_eq!(code, 126, "errno {errno}: {stderr}");
+			assert_eq!(tried, [10], "errno {errno}");
+			assert!(ran.is_empty(), "errno {errno}: {ran:?}");
+		}
 	}
 
 	#[test]

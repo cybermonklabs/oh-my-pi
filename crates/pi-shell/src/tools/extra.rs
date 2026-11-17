@@ -21,6 +21,12 @@
 //! subshell through `exec`, so their actual signal deaths reach the utility
 //! as [`CommandStatus::Signaled`], distinct from an ordinary exit of `128+n`.
 //! In-engine commands report [`CommandStatus::Exited`].
+//!
+//! An external the system refuses to `exec` because its command line is too
+//! long (`E2BIG`, `ENAMETOOLONG`) is the shell's diagnostic and status 126,
+//! unless the command asked to hear of it
+//! ([`ShellCommand::too_long_as_error`]): then the shell prints nothing and
+//! the utility gets the error, so `xargs` can retry with fewer arguments.
 
 use std::{
 	ffi::OsStr,
@@ -147,16 +153,27 @@ impl Extra {
 	}
 
 	/// `run` ended with `status`; `false` when it is not one of this call's
-	/// commands.
-	pub(super) fn on_done(&mut self, run: RunId, status: i32, signal: Option<i32>) -> bool {
+	/// commands. `refusal` is the error of an `exec` the system refused as
+	/// too long, for a command that asked to hear of it
+	/// ([`ShellCommand::too_long_as_error`]).
+	pub(super) fn on_done(
+		&mut self,
+		run: RunId,
+		status: i32,
+		signal: Option<i32>,
+		refusal: Option<i32>,
+	) -> bool {
 		let Some(at) = self.runs.iter().position(|(r, _)| *r == run) else {
 			return false;
 		};
 		let (_, reply) = self.runs.swap_remove(at);
 		let code = u8::try_from(status.rem_euclid(256)).unwrap_or(u8::MAX);
+		let outcome = match refusal {
+			Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+			None => Ok(signal.map_or(CommandStatus::Exited(code), CommandStatus::Signaled)),
+		};
 		// The utility may have stopped waiting (cancelled).
-		let outcome = signal.map_or(CommandStatus::Exited(code), CommandStatus::Signaled);
-		let _ = reply.send(Ok(outcome));
+		let _ = reply.send(outcome);
 		true
 	}
 
@@ -258,6 +275,7 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 	script.foreign_env = foreign_env;
 	script.unexport_env = unexport_env;
 	script.args = Some(args);
+	script.too_long_to_host = command.too_long_is_error();
 	// The working directory is logical, as after `cd`: `-execdir` hands over
 	// `<root>/./sub`, and the command's `$PWD` is `<root>/sub`.
 	script.cwd = command

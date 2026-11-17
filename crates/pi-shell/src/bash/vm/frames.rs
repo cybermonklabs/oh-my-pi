@@ -893,6 +893,9 @@ impl Shell {
 					env:               r.env,
 					started:           r.started,
 					exit_trap_started: r.exit_trap_started,
+					// Only a callout's run asks for it, and callouts do not
+					// survive a restore.
+					too_long_to_host:  false,
 				});
 			}
 			report.runs += vp.runs.len() as u32;

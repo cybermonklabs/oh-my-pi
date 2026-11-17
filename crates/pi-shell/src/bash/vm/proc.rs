@@ -809,6 +809,8 @@ pub struct Run {
 	pub env:               Vec<(BString, BString)>,
 	pub started:           bool,
 	pub exit_trap_started: bool,
+	/// [`Script::too_long_to_host`](super::Script::too_long_to_host).
+	pub too_long_to_host:  bool,
 }
 
 /// What kind of activation a frame is.

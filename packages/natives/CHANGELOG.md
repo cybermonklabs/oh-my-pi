@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed embedded-shell `xargs` and `find -exec ... {} +` failing with "Argument list too long" where the system takes fewer argument bytes than they counted on (GKE Sandbox, whose gVisor can say `ENAMETOOLONG` instead; or, for `find`, exported shell variables its count leaves out): like GNU xargs, they split a refused command line in halves and retry, and one argument too long on its own is still an error (`xargs` status 126, `find` status 1)
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

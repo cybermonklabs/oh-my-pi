@@ -556,7 +556,7 @@ pub mod matchers {
 		};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
-		use crate::host::ShellCommand;
+		use crate::host::{ShellCommand, command_line_too_long};
 
 		/// `{}` replacement for `-execdir`: the entry name relative to its parent.
 		fn execdir_arg(path: &Path) -> PathBuf {
@@ -693,35 +693,52 @@ pub mod matchers {
 				command
 			}
 
+			/// Runs `command`. A line the system refuses as too long runs again
+			/// as two halves of its file arguments, first then second, as GNU
+			/// xargs retries it; one file too long on its own is the error.
 			async fn run_command(&self, command: &argmax::Command, matcher_io: &mut MatcherIO<'_>) {
-				let argv = std::iter::once(command.get_program())
-					.chain(command.get_args())
-					.map(OsString::from)
-					.collect();
-				// `-exec ... +` runs in find's (the shell's) working directory;
-				// `-execdir` batches carry their directory.
-				let mut shell_command = ShellCommand::new(argv);
-				if let Some(dir) = command.get_current_dir() {
-					shell_command = shell_command.current_dir(dir);
-				}
-				// The child writes to the shared fd directly: flush what find
-				// printed so far so its output stays in order.
-				let _ = matcher_io
-					.deps
-					.get_output()
-					.lock()
-					.unwrap_or_else(PoisonError::into_inner)
-					.flush();
-				match matcher_io.host().run_command_async(shell_command).await {
-					Ok(status) => {
-						if !status.success() {
+				let args: Vec<_> = command.get_args().collect();
+				// The words before the files (`self.args`), then the files.
+				let fixed = self.args.len();
+				// The file ranges still to run, the next one last: a refused
+				// range gives way to its halves.
+				let mut pending = vec![fixed..args.len()];
+				while let Some(files) = pending.pop() {
+					let argv = std::iter::once(command.get_program())
+						.chain(args[..fixed].iter().copied())
+						.chain(args[files.clone()].iter().copied())
+						.map(OsString::from)
+						.collect();
+					// `-exec ... +` runs in find's (the shell's) working directory;
+					// `-execdir` batches carry their directory.
+					let mut shell_command = ShellCommand::new(argv).too_long_as_error();
+					if let Some(dir) = command.get_current_dir() {
+						shell_command = shell_command.current_dir(dir);
+					}
+					// The child writes to the shared fd directly: flush what find
+					// printed so far so its output stays in order.
+					let _ = matcher_io
+						.deps
+						.get_output()
+						.lock()
+						.unwrap_or_else(PoisonError::into_inner)
+						.flush();
+					match matcher_io.host().run_command_async(shell_command).await {
+						Ok(status) => {
+							if !status.success() {
+								matcher_io.set_exit_code(1);
+							}
+						},
+						Err(e) if command_line_too_long(&e) && files.len() > 1 => {
+							let middle = files.start + files.len() / 2;
+							pending.push(middle..files.end);
+							pending.push(files.start..middle);
+						},
+						Err(e) => {
+							let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e);
 							matcher_io.set_exit_code(1);
-						}
-					},
-					Err(e) => {
-						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e);
-						matcher_io.set_exit_code(1);
-					},
+						},
+					}
 				}
 			}
 		}
@@ -5640,6 +5657,118 @@ mod tests {
 				.await;
 		assert_eq!(code, 0, "stderr: {err}");
 		assert_eq!(out, "1 sub/d.txt\n");
+	}
+
+	/// Runs `find many -type f -exec /bin/sh -c 'printf "%s\n" "$#"' sh {} +`
+	/// from `root` with `env` added to the environment its commands get:
+	/// status, stderr, and how many files each line had.
+	#[cfg(target_os = "linux")]
+	async fn count_files(root: &std::path::Path, env: &[(&str, &str)]) -> (i32, String, Vec<usize>) {
+		let argv = ["find", "many", "-type", "f", "-exec", "/bin/sh", "-c", "printf \"%s\\n\" \"$#\"", "sh", "{}", "+"];
+		let (code, out, err) = crate::host::run_extra(&argv, "", root, env).await;
+		(code, err, out.lines().map(|line| line.parse().unwrap()).collect())
+	}
+
+	/// `-exec ... {} +` sizes its batches against the process's environment
+	/// (`argmax`), but its commands get the shell's: a large exported
+	/// variable the process lacks makes the kernel refuse a full batch, which
+	/// runs again as two halves, as GNU xargs retries a line. Every file still
+	/// goes to a command, once.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn exec_plus_runs_a_batch_the_kernel_refuses_as_halves() {
+		let (_dir, root) = fixture();
+		fs::create_dir(root.join("many")).unwrap();
+		// More file arguments, of about 260 bytes each, than one line holds.
+		let count = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize / 250;
+		for i in 0..count {
+			fs::write(root.join("many").join(format!("{i:06}{}", "f".repeat(240))), b"").unwrap();
+		}
+		// What a full line holds, from `echo`, which runs in-process: no exec
+		// limit refuses it (gVisor refuses even a plain `/bin/sh` line here).
+		let (code, out, err) =
+			crate::host::run_extra(&["find", "many", "-type", "f", "-exec", "echo", "{}", "+"], "", &root, &[])
+				.await;
+		assert_eq!((code, err.as_str()), (0, ""));
+		let full = out.lines().next().map_or(0, |line| line.split(' ').count());
+
+		let pad = "x".repeat(16 * 1024);
+		let (code, err, lines) = count_files(&root, &[("FIND_TEST_PAD", &pad)]).await;
+		assert_eq!((code, err.as_str()), (0, ""), "every line runs, and nothing is reported");
+		assert_eq!(lines.iter().sum::<usize>(), count, "{lines:?}");
+		let largest = lines.iter().copied().max().unwrap_or(0);
+		assert!(
+			largest <= full.div_ceil(2),
+			"no line was refused and split: one of {lines:?} has {largest} of the {full} files a full line \
+			 holds"
+		);
+	}
+
+	/// A line of one file the kernel refuses is find's error, reported once.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn exec_plus_reports_a_single_file_the_kernel_refuses() {
+		let (_dir, root) = fixture();
+		fs::create_dir(root.join("many")).unwrap();
+		fs::write(root.join("many/only"), b"").unwrap();
+		// An environment as large as the whole limit leaves no room for any line.
+		let pad = "x".repeat(unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize);
+		let (code, err, lines) = count_files(&root, &[("FIND_TEST_PAD", &pad)]).await;
+		assert_eq!((code, lines.as_slice()), (1, &[][..]), "{err}");
+		assert_eq!(err.matches("Argument list too long").count(), 1, "{err}");
+	}
+
+	/// Runs `find many -type f -exec true {} +` over the files `1` to `10`
+	/// against a system that refuses lines of more than `most` of them with
+	/// `errno` ([`crate::host::Refusing`]): status, stderr, the file counts of
+	/// the lines tried, and the files that ran, sorted.
+	#[cfg(unix)]
+	async fn refused_above(most: usize, errno: i32) -> (i32, String, Vec<usize>, Vec<String>) {
+		let (_dir, root) = fixture();
+		fs::create_dir(root.join("many")).unwrap();
+		for n in 1..=10 {
+			fs::write(root.join("many").join(n.to_string()), b"").unwrap();
+		}
+		let (runner, seen) = crate::host::Refusing::new(1, most, errno);
+		let (code, _, err) = crate::host::run_extra_with(
+			&["find", "many", "-type", "f", "-exec", "true", "{}", "+"],
+			"",
+			&root,
+			&[],
+			|_, _, _, _| Box::new(runner),
+		)
+		.await;
+		let mut seen = std::mem::take(&mut *seen.lock());
+		seen.ran.sort_by_key(|path| path["many/".len()..].parse::<u32>().unwrap());
+		(code, err, seen.tried, seen.ran)
+	}
+
+	/// `E2BIG`, and `ENAMETOOLONG` as GKE Sandbox (gVisor) says it, split a
+	/// `-exec ... {} +` line in halves until each half runs.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn exec_plus_halves_a_refused_line_for_e2big_and_enametoolong() {
+		let files: Vec<String> = (1..=10).map(|n| format!("many/{n}")).collect();
+		for errno in [libc::E2BIG, libc::ENAMETOOLONG] {
+			let (code, err, tried, ran) = refused_above(3, errno).await;
+			assert_eq!((code, err.as_str()), (0, ""), "errno {errno}");
+			assert_eq!(tried, [10, 5, 2, 3, 5, 2, 3], "errno {errno}");
+			assert_eq!(ran, files, "errno {errno}");
+		}
+	}
+
+	/// Any other refusal of a `-exec ... {} +` line is find's error at once:
+	/// the line is not split.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn exec_plus_does_not_split_other_refusals() {
+		for errno in [libc::EACCES, libc::ENOEXEC, libc::ENOMEM, libc::ETXTBSY] {
+			let (code, err, tried, ran) = refused_above(0, errno).await;
+			assert_eq!(code, 1, "errno {errno}: {err}");
+			assert_eq!(err.matches("Failed to run true").count(), 1, "errno {errno}: {err}");
+			assert_eq!(tried, [10], "errno {errno}");
+			assert!(ran.is_empty(), "errno {errno}: {ran:?}");
+		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

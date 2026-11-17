@@ -480,22 +480,39 @@ mod tests {
 		assert_eq!(ok(b"a\0bc\n", &["-w", "2"], "C"), b"a\0b\nc\n");
 	}
 
+	/// The UTF-8 locale the multibyte cases run in: `C.UTF-8` on Linux, the
+	/// one a system has with no locale generated (a `rust:1-bookworm` image
+	/// lists only `C`, `C.utf8` and `POSIX`); other systems keep
+	/// `en_US.UTF-8`. `fold` counts bytes in a locale the system cannot load,
+	/// so a missing one is reported by name rather than as a byte mismatch.
+	fn utf8_locale() -> &'static str {
+		let name = if cfg!(target_os = "linux") { "C.UTF-8" } else { "en_US.UTF-8" };
+		#[cfg(unix)]
+		assert!(
+			crate::locale::locale_loadable(name, libc::LC_CTYPE_MASK),
+			"the UTF-8 cases need the {name} locale, which this system cannot load (`locale -a` lists \
+			 the installed ones)"
+		);
+		name
+	}
+
 	#[test]
 	fn utf8_locale_counts_display_columns_and_never_splits_characters() {
+		let utf8 = utf8_locale();
 		let cjk = "你你你\n".as_bytes();
-		assert_eq!(ok(cjk, &["-w", "3"], "en_US.UTF-8"), "你\n你\n你\n".as_bytes());
-		assert_eq!(ok(cjk, &["-c", "-w", "2"], "en_US.UTF-8"), "你你\n你\n".as_bytes());
-		assert_eq!(ok(cjk, &["-b", "-w", "4"], "en_US.UTF-8"), "你\n你\n你\n".as_bytes());
+		assert_eq!(ok(cjk, &["-w", "3"], utf8), "你\n你\n你\n".as_bytes());
+		assert_eq!(ok(cjk, &["-c", "-w", "2"], utf8), "你你\n你\n".as_bytes());
+		assert_eq!(ok(cjk, &["-b", "-w", "4"], utf8), "你\n你\n你\n".as_bytes());
 		// The C locale counts bytes as columns and may split characters.
 		assert_eq!(ok("你\n".as_bytes(), &["-w", "2"], "C"), b"\xe4\xbd\n\xa0\n");
 		// Combining marks are zero width; invalid bytes pass through as width 1.
-		assert_eq!(ok("ab\u{e9}\u{301}cd\n".as_bytes(), &["-w", "3"], "en_US.UTF-8"), "ab\u{e9}\u{301}\ncd\n".as_bytes());
-		assert_eq!(ok(b"\xe4\xbda\n", &["-w", "1"], "en_US.UTF-8"), b"\xe4\n\xbd\na\n");
+		assert_eq!(ok("ab\u{e9}\u{301}cd\n".as_bytes(), &["-w", "3"], utf8), "ab\u{e9}\u{301}\ncd\n".as_bytes());
+		assert_eq!(ok(b"\xe4\xbda\n", &["-w", "1"], utf8), b"\xe4\n\xbd\na\n");
 		// Backspace after a wide character wraps the unsigned column like GNU.
-		assert_eq!(ok("a你\x08\x08xyz\n".as_bytes(), &["-w", "10"], "en_US.UTF-8"), "a你\x08\n\x08xyz\n".as_bytes());
+		assert_eq!(ok("a你\x08\x08xyz\n".as_bytes(), &["-w", "10"], utf8), "a你\x08\n\x08xyz\n".as_bytes());
 		// No-break space is not a break point; ideographic space is.
-		assert_eq!(ok("a\u{a0}b c\n".as_bytes(), &["-s", "-w", "3"], "en_US.UTF-8"), "a\u{a0}b\n c\n".as_bytes());
-		assert_eq!(ok("a\u{3000}bcd\n".as_bytes(), &["-s", "-w", "3"], "en_US.UTF-8"), "a\u{3000}\nbcd\n".as_bytes());
+		assert_eq!(ok("a\u{a0}b c\n".as_bytes(), &["-s", "-w", "3"], utf8), "a\u{a0}b\n c\n".as_bytes());
+		assert_eq!(ok("a\u{3000}bcd\n".as_bytes(), &["-s", "-w", "3"], utf8), "a\u{3000}\nbcd\n".as_bytes());
 	}
 
 	#[test]

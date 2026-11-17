@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bash tool: `xargs` and `find -exec ... {} +` no longer fail with "Argument list too long" where the system takes fewer argument bytes than they counted on (GKE Sandbox, or large exported variables for `find`); like GNU xargs, they split a refused command line in halves and retry, and one argument too long on its own is still an error
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

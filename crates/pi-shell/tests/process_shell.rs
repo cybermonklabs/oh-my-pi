@@ -7,6 +7,7 @@ mod pty_support;
 
 use std::{io, os::unix::process::CommandExt, path::Path, process::Command};
 
+use pi_shell::sys::proc::{self, ProcState};
 use pty_support::{Spawn, TIMEOUT};
 
 fn run(program: &str, args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
@@ -139,8 +140,10 @@ fn a_standalone_exit_ends_running_background_externals() {
 		.parse()
 		.expect("the job's pid");
 	let deadline = std::time::Instant::now() + TIMEOUT;
-	// SAFETY: signal 0 only checks that the process exists.
-	while unsafe { libc::kill(pid, 0) } == 0 {
+	// A zombie has ended: under a PID 1 that reaps only its own child (a
+	// container started with `exec runuser`), the orphaned sleep stays one,
+	// and `kill(pid, 0)` still finds it.
+	while proc::info(pid).is_some_and(|p| p.state != ProcState::Zombie) {
 		assert!(std::time::Instant::now() < deadline, "sleep {pid} still runs after obash exited");
 		std::thread::sleep(std::time::Duration::from_millis(20));
 	}

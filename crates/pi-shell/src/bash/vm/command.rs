@@ -2558,6 +2558,17 @@ fn spawned_external(
 			s.stage = Stage::Await;
 			k.emit_op(cx, vp, op.node, EventData::Spawn { pid, argv });
 		},
+		Err(err) if too_long_for_host(vp, &err) => {
+			// The host reports it (`xargs` retries with fewer arguments): no
+			// diagnostic, and the `exec` fails as a refused one does.
+			if let (Some(code), Some(run)) = (err.raw_os_error(), vp.runs.front()) {
+				k.exec_refusals.insert(run.id, code);
+			}
+			let s = st(vp);
+			s.status = 126;
+			s.stage = Stage::Output;
+			exec_failed(k, cx, vp);
+		},
 		Err(err)
 			if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
 				&& !interp
@@ -2611,6 +2622,18 @@ fn spawned_external(
 		},
 	}
 	None
+}
+
+/// Whether the host hears of `err` instead of the user: the system refused
+/// the command line as too long (`E2BIG`, `ENAMETOOLONG`) for an `exec`
+/// replacing a run submitted with
+/// [`Script::too_long_to_host`](crate::bash::Script::too_long_to_host).
+fn too_long_for_host(vp: &mut Vproc, err: &std::io::Error) -> bool {
+	use std::io::ErrorKind;
+	err.raw_os_error().is_some()
+		&& matches!(err.kind(), ErrorKind::ArgumentListTooLong | ErrorKind::InvalidFilename)
+		&& matches!(st(vp).control, Some(Transfer::Exec))
+		&& vp.runs.front().is_some_and(|run| run.too_long_to_host)
 }
 
 /// The failure of a prefix assignment to `UID`, `EUID`, `GID` or `EGID`

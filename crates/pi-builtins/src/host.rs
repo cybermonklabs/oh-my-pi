@@ -1297,8 +1297,11 @@ impl RunningCommand {
 		self.response.recv().map_err(|_| cancelled_command())?
 	}
 
-	/// Removes a finished command without waiting, if one is ready.
-	pub fn try_wait_any(running: &mut Vec<Self>) -> Option<io::Result<CommandStatus>> {
+	/// Removes a finished command without waiting, if one is ready, with
+	/// its index in `running`: it goes as by [`Vec::swap_remove`], so a
+	/// caller keeping per-command data in a parallel `Vec` removes the same
+	/// index.
+	pub fn try_wait_any(running: &mut Vec<Self>) -> Option<(usize, io::Result<CommandStatus>)> {
 		let (index, response) = running.iter().enumerate().find_map(|(index, command)| {
 			match command.response.try_recv() {
 				Ok(status) => Some((index, status)),
@@ -1307,16 +1310,17 @@ impl RunningCommand {
 			}
 		})?;
 		drop(running.swap_remove(index));
-		Some(response)
+		Some((index, response))
 	}
 
 	/// Waits for whichever of `running` finishes first and removes it from
-	/// the list; `None` when `running` is empty.
+	/// the list as [`RunningCommand::try_wait_any`] does, returning its
+	/// index; `None` when `running` is empty.
 	///
 	/// # Errors
 	///
 	/// As for [`Host::run_command`], for the command that finished.
-	pub fn wait_any(running: &mut Vec<Self>) -> Option<io::Result<CommandStatus>> {
+	pub fn wait_any(running: &mut Vec<Self>) -> Option<(usize, io::Result<CommandStatus>)> {
 		if running.is_empty() {
 			return None;
 		}
@@ -1328,7 +1332,7 @@ impl RunningCommand {
 			})
 			.wait();
 		drop(running.swap_remove(index));
-		Some(response.map_err(|_| cancelled_command()).flatten())
+		Some((index, response.map_err(|_| cancelled_command()).flatten()))
 	}
 }
 
@@ -1342,6 +1346,7 @@ pub struct ShellCommand {
 	cwd:   Option<PathBuf>,
 	stdin: Option<Fd>,
 	env:   Vec<EnvChange>,
+	too_long_as_error: bool,
 }
 
 /// One environment change a [`ShellCommand`] makes for its own command,
@@ -1360,7 +1365,7 @@ impl ShellCommand {
 	/// A command running `argv`; `argv[0]` names the builtin or program.
 	#[must_use]
 	pub fn new(argv: Vec<OsString>) -> Self {
-		Self { argv, argv0: None, cwd: None, stdin: None, env: Vec::new() }
+		Self { argv, argv0: None, cwd: None, stdin: None, env: Vec::new(), too_long_as_error: false }
 	}
 
 	/// The command line; `argv[0]` names the builtin or program to look up.
@@ -1444,6 +1449,37 @@ impl ShellCommand {
 		self.stdin = Some(stdin);
 		self
 	}
+
+	/// Reports a program the system refuses to run because the command line
+	/// is too long (`E2BIG`, `ENAMETOOLONG`) as that error from
+	/// [`RunningCommand::wait`], with nothing printed for it, so the utility
+	/// can retry with fewer arguments (`xargs`). Otherwise the shell prints
+	/// its diagnostic and the command ends with status 126.
+	pub fn too_long_as_error(mut self) -> Self {
+		self.too_long_as_error = true;
+		self
+	}
+
+	/// Whether [`ShellCommand::too_long_as_error`] was asked for.
+	#[must_use]
+	pub fn too_long_is_error(&self) -> bool {
+		self.too_long_as_error
+	}
+}
+
+/// Whether `error` is the system refusing a command line as too long, as a
+/// command run with [`ShellCommand::too_long_as_error`] reports it: `E2BIG`,
+/// or `ENAMETOOLONG` as GKE Sandbox (gVisor) says it. A utility that batches
+/// arguments retries such a line in halves, as GNU xargs does.
+#[cfg(unix)]
+pub(crate) fn command_line_too_long(error: &io::Error) -> bool {
+	matches!(error.raw_os_error(), Some(libc::E2BIG | libc::ENAMETOOLONG))
+}
+
+/// Windows commands are not split: see the Unix twin.
+#[cfg(not(unix))]
+pub(crate) fn command_line_too_long(_error: &io::Error) -> bool {
+	false
 }
 
 /// How a command run through [`Host::run_command`] ended.
@@ -1521,7 +1557,10 @@ pub trait CommandRunner: Send {
 	///
 	/// The future fails with [`io::ErrorKind::NotFound`] when nothing is named
 	/// `argv[0]`, [`io::ErrorKind::PermissionDenied`] when it cannot be
-	/// executed, and any other kind for other failures to run it.
+	/// executed, and any other kind for other failures to run it. A command
+	/// line the system refuses as too long fails with that error (`E2BIG`,
+	/// `ENAMETOOLONG`) at least for a command that asks for it
+	/// ([`ShellCommand::too_long_is_error`]).
 	fn start(&mut self, command: ShellCommand) -> BoxFuture<'static, io::Result<CommandStatus>>;
 }
 
@@ -3241,6 +3280,27 @@ mod testing {
 		cwd: &std::path::Path,
 		env: &[(&str, &str)],
 	) -> (i32, String, String) {
+		run_extra_with(argv, stdin, cwd, env, |vars, cwd, stdout, stderr| {
+			Box::new(TestRunner::new(vars, cwd, stdout, stderr))
+		})
+		.await
+	}
+
+	/// [`run_extra`] with the commands served by the runner `runner` makes
+	/// from the environment, the working directory, and the utility's stdout
+	/// and stderr.
+	pub(crate) async fn run_extra_with(
+		argv: &[&str],
+		stdin: &str,
+		cwd: &std::path::Path,
+		env: &[(&str, &str)],
+		runner: impl FnOnce(
+			HashMap<String, String>,
+			PathBuf,
+			std::fs::File,
+			std::fs::File,
+		) -> Box<dyn super::CommandRunner>,
+	) -> (i32, String, String) {
 		use std::io::Seek;
 
 		let mut input = tempfile::tempfile().expect("stdin file");
@@ -3250,7 +3310,7 @@ mod testing {
 		let error = tempfile::tempfile().expect("stderr file");
 		let mut vars: HashMap<String, String> = std::env::vars().collect();
 		vars.extend(env.iter().map(|(name, value)| ((*name).to_string(), (*value).to_string())));
-		let runner = TestRunner::new(
+		let runner = runner(
 			vars.clone(),
 			cwd.to_path_buf(),
 			output.try_clone().expect("stdout"),
@@ -3267,7 +3327,7 @@ mod testing {
 			crate::extras::Fd::File(output.try_clone().expect("stdout")),
 			crate::extras::Fd::File(error.try_clone().expect("stderr")),
 		];
-		invocation.commands = Some(Box::new(runner));
+		invocation.commands = Some(runner);
 		let code = crate::extras::run(invocation).await;
 
 		let read = |mut file: std::fs::File| {
@@ -3277,6 +3337,56 @@ mod testing {
 			text
 		};
 		(code, read(output), read(error))
+	}
+
+	/// What a [`Refusing`] runner was asked to run: how many arguments past
+	/// its `fixed` words each line had, and the arguments of the lines it
+	/// "ran".
+	#[cfg(unix)]
+	#[derive(Default)]
+	pub(crate) struct Refused {
+		pub(crate) tried: Vec<usize>,
+		pub(crate) ran:   Vec<String>,
+	}
+
+	/// A [`CommandRunner`](super::CommandRunner) standing in for a system
+	/// that refuses, with the error `errno`, every command line with more
+	/// than `most` arguments after its first `fixed` words, and runs every
+	/// other line as a command that succeeds without doing anything.
+	#[cfg(unix)]
+	pub(crate) struct Refusing {
+		fixed: usize,
+		most:  usize,
+		errno: i32,
+		seen:  Arc<Mutex<Refused>>,
+	}
+
+	#[cfg(unix)]
+	impl Refusing {
+		/// The runner, and what it records.
+		pub(crate) fn new(fixed: usize, most: usize, errno: i32) -> (Self, Arc<Mutex<Refused>>) {
+			let seen = Arc::new(Mutex::new(Refused::default()));
+			(Self { fixed, most, errno, seen: Arc::clone(&seen) }, seen)
+		}
+	}
+
+	#[cfg(unix)]
+	impl super::CommandRunner for Refusing {
+		fn start(
+			&mut self,
+			command: super::ShellCommand,
+		) -> futures::future::BoxFuture<'static, io::Result<super::CommandStatus>> {
+			let args = &command.args()[self.fixed..];
+			let mut seen = self.seen.lock();
+			seen.tried.push(args.len());
+			let outcome = if args.len() > self.most {
+				Err(io::Error::from_raw_os_error(self.errno))
+			} else {
+				seen.ran.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
+				Ok(super::CommandStatus::Exited(0))
+			};
+			Box::pin(std::future::ready(outcome))
+		}
 	}
 
 	/// Runs the process builtin `P` with `argv` (`argv[0]` naming it), the
@@ -4017,4 +4127,10 @@ mod testing {
 pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
+#[cfg(test)]
+#[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
+pub(crate) use testing::run_extra_with;
+#[cfg(all(test, unix))]
+#[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
+pub(crate) use testing::Refusing;
 

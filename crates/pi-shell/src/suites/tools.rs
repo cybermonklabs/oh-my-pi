@@ -13,7 +13,10 @@ use std::{
 use bstr::BString;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::{RunOptions, RunStdio, Session, SessionConfig};
+use crate::{
+	session::{RunOptions, RunStdio, Session, SessionConfig},
+	sys::proc::ProcState,
+};
 
 fn session() -> Session {
 	let env = std::env::vars_os()
@@ -70,9 +73,12 @@ async fn run(s: &mut Session, command: &str) -> Ran {
 	run_with(s, command, CancellationToken::new()).await
 }
 
+/// Whether `pid` still runs. A zombie has ended: it waits only for its parent
+/// to reap it, and under a PID 1 that reaps nothing but its own child (a
+/// container started with `exec runuser`) an orphan stays a zombie, which
+/// `kill(pid, 0)` still finds.
 fn alive(pid: i32) -> bool {
-	// SAFETY: signal 0 only probes existence.
-	unsafe { libc::kill(pid, 0) == 0 }
+	crate::sys::proc::info(pid).is_some_and(|p| p.state != ProcState::Zombie)
 }
 
 /// Waits (bounded) for `pid` to be gone; whether it is.
@@ -82,6 +88,36 @@ async fn gone(pid: i32, within: Duration) -> bool {
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
 	!alive(pid)
+}
+
+/// `alive` tells a running process from one that has ended and waits to be
+/// reaped: the tests here judge a killed command by it, and under a PID 1
+/// that does not reap, a killed command stays a zombie.
+#[test]
+fn alive_counts_a_running_process_and_not_a_zombie() {
+	let mut child = std::process::Command::new("sleep")
+		.arg("30")
+		.spawn()
+		.unwrap();
+	let pid = child.id() as i32;
+	let running = alive(pid);
+	// SAFETY: plain syscall; the test's own child.
+	unsafe { libc::kill(pid, libc::SIGKILL) };
+	// Not yet waited for, so the child stays a zombie of this process.
+	let deadline = Instant::now() + Duration::from_secs(10);
+	let mut state = None;
+	while Instant::now() < deadline {
+		state = crate::sys::proc::info(pid).map(|p| p.state);
+		if state == Some(ProcState::Zombie) {
+			break;
+		}
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	let zombie_alive = alive(pid);
+	child.wait().unwrap();
+	assert!(running, "the running sleep {pid} counts as alive");
+	assert_eq!(state, Some(ProcState::Zombie), "sleep {pid} never became a zombie");
+	assert!(!zombie_alive, "the zombie {pid} counts as gone");
 }
 
 /// The pid an operand wrote to `file`, once it is there.
