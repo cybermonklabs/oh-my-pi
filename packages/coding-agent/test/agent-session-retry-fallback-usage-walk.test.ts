@@ -385,6 +385,62 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
+		it("keeps the walk's chain after a switch that the spent fallback's own chain names, for a later failure", async () => {
+			// The base's switch onto the spent model recorded the walk's chain, and
+			// the check before the next call kept it when it switched on from the
+			// spent model's own chain. A later failure walks from that chain: back to
+			// the primary first, then on.
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
+			const requestedModels: string[] = [];
+			let failNextFallback = false;
+			const mock = createMockModel();
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: PRIMARY, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requestedModels.push(formatModelString(model));
+					if (model.provider === PRIMARY.provider && model.id === PRIMARY.id) {
+						mock.push(ACCOUNT_POLICY_DENIAL);
+					} else if (failNextFallback) {
+						failNextFallback = false;
+						return providerErrorStream(model, SERVER_ERROR, 500);
+					} else {
+						mock.push({ content: ["answered"] });
+					}
+					return mock.stream(model, context, options);
+				},
+			});
+			const run = startSession(
+				agent,
+				walkSettings(PRIMARY, {
+					"retry.maxRetries": 1,
+					"retry.fallbackRevertPolicy": "cooldown-expiry",
+					"retry.fallbackChains": {
+						default: [formatModelString(FALLBACK)],
+						[formatModelString(FALLBACK)]: [formatModelString(NEXT_FALLBACK), formatModelString(CODEX_FALLBACK)],
+					},
+				}),
+			);
+			let now = Date.now();
+			vi.spyOn(Date, "now").mockImplementation(() => now);
+
+			await runTurn(run.session, "Fail on the primary");
+			// Past every fallback cooldown, so the later walk may go back to the primary.
+			now += 2 * 60 * 60 * 1000;
+			failNextFallback = true;
+			await runTurn(run.session, "Fail on the fallback");
+
+			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
+				formatModelString(NEXT_FALLBACK),
+				formatModelString(NEXT_FALLBACK),
+				formatModelString(PRIMARY),
+				formatModelString(CODEX_FALLBACK),
+			]);
+			expect(modelOf(run.session)).toBe(formatModelString(CODEX_FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
 		it("answers on the fallback after a spent one under the fail-closed reserve policy", async () => {
 			// Switching onto the spent model would let the check before its request
 			// end the turn with a fail-closed refusal although a usable fallback follows.
