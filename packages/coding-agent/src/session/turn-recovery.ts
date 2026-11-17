@@ -2286,12 +2286,24 @@ export class TurnRecovery {
 		if (!active || formatModelStringWithRouting(candidate) !== formatModelStringWithRouting(active)) return false;
 		const configured = this.#host.configuredThinkingLevel();
 		const requested = selector.thinkingLevel ?? (inheritedThinkingLevel ? inheritedThinkingLevel.level : configured);
-		if (requested === AUTO_THINKING || configured === AUTO_THINKING) return requested === configured;
-		const effective = resolveThinkingLevelForModel(
-			candidate,
-			clampThinkingLevelToCeiling(candidate, requested, this.#host.thinkingLevelCeiling()),
+		return this.#configuredLevelAfterSwitch(candidate, requested) === configured;
+	}
+
+	/**
+	 * The configured level a switch onto `model` that requests `requested`
+	 * leaves, as `applyRetryFallbackCandidate` and `setThinkingLevel` set it:
+	 * `auto` stays `auto`; another level is clamped to the effort ceiling and
+	 * then to what `model` supports (none when `model` has no thinking).
+	 */
+	#configuredLevelAfterSwitch(
+		model: Model,
+		requested: ConfiguredThinkingLevel | undefined,
+	): ConfiguredThinkingLevel | undefined {
+		if (requested === AUTO_THINKING) return AUTO_THINKING;
+		return resolveThinkingLevelForModel(
+			model,
+			clampThinkingLevelToCeiling(model, requested, this.#host.thinkingLevelCeiling()),
 		);
-		return effective === configured;
 	}
 
 	async applyRetryFallbackCandidate(
@@ -2571,13 +2583,7 @@ export class TurnRecovery {
 						const requestedThinkingLevel = selector.thinkingLevel ?? this.#host.configuredThinkingLevel();
 						// The configured level the switch onto the spent model would leave:
 						// a route found from it takes this level when its selector names none.
-						const spentThinkingLevel =
-							requestedThinkingLevel === AUTO_THINKING
-								? AUTO_THINKING
-								: resolveThinkingLevelForModel(
-										candidate,
-										clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, ceiling),
-									);
+						const spentThinkingLevel = this.#configuredLevelAfterSwitch(candidate, requestedThinkingLevel);
 						const spentSelector = formatRetryFallbackSelector(
 							candidate,
 							spentThinkingLevel === AUTO_THINKING
@@ -2609,8 +2615,8 @@ export class TurnRecovery {
 							// no level, the level the switch onto the spent model would leave, as
 							// the check's switch from that model did; a held candidate keeps the
 							// failed model's level. A route that is the model in use, at the level
-							// the switch would set, makes no switch, and the retry goes on with
-							// that model.
+							// the switch would set, makes no switch; the walk still answers true,
+							// so the retry goes on as after a switch.
 							const inheritedThinkingLevel = entries === heldEntries ? undefined : { level: spentThinkingLevel };
 							if (this.#isNoOpRetryFallback(found.model, found.selector, inheritedThinkingLevel)) return true;
 							// Like the check before a model call, this switch is pinned, so
