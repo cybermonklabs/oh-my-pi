@@ -235,6 +235,13 @@ interface ConfiguredModelDiscoveryResult {
  */
 type ModifyModelsHook = (models: Model<Api>[], credentials: OAuthCredentials) => Model<Api>[];
 
+/**
+ * Why a provider's stored credentials may give a key again: `cannot-serve`, they
+ * exist but none can serve now; `unreadable`, the store could not tell, since its
+ * lookup of disabled credentials failed.
+ */
+type StoredCredentialsOutage = "cannot-serve" | "unreadable";
+
 function getDisabledProviderIdsFromSettings(settingsInstance?: Settings): Set<string> {
 	try {
 		return new Set(cfgDisabledProviders.get(settingsInstance ?? settings));
@@ -3555,20 +3562,21 @@ export class ModelRegistry {
 	 * Whether a missing key for the provider may come back without the user
 	 * configuring one: its `!command` apiKey produced nothing
 	 * ({@link retriesFailedCommandKey}), or its stored credentials exist but none
-	 * can serve now ({@link #storedCredentialsUnavailable}). A turn's request
+	 * can serve now ({@link #storedCredentialsOutage}). A turn's request
 	 * reports such a key retryably ({@link turnResolver}).
 	 */
 	async missingKeyMayRecover(provider: string, sessionId?: string, signal?: AbortSignal): Promise<boolean> {
 		return (
 			this.retriesFailedCommandKey(provider) ||
-			(await this.#storedCredentialsUnavailable(provider, sessionId, signal))
+			(await this.#storedCredentialsOutage(provider, sessionId, signal)) !== undefined
 		);
 	}
 
 	/**
-	 * Whether the provider has stored credentials that exist but could not serve
-	 * a request: an active row that resolved no key, or an OAuth credential a
-	 * failure disabled ({@link isRecoverableDisabledCredential}) that the user has not
+	 * Why the provider's stored credentials may give a key again, if they may:
+	 * `cannot-serve` when they exist but could not serve a request: an active row
+	 * that resolved no key, or an OAuth credential a failure disabled
+	 * ({@link isRecoverableDisabledCredential}) that the user has not
 	 * since removed or replaced. A new login, here or in another session sharing
 	 * the store, brings such a credential back, so a turn waits for it; an account
 	 * whose latest teardown was the user's own (a logout), or a provider that never
@@ -3577,41 +3585,47 @@ export class ModelRegistry {
 	 * removal covers the same account only: removing one account of a provider
 	 * leaves another account's failure recoverable.
 	 * Only active credentials and failure identities the session's pool permits count.
-	 * A tombstone lookup that fails counts, since the store could not tell; one the
-	 * caller aborted does not. False for a disabled provider (in settings, or paused
-	 * by its auth rules: no key comes back until the user or the rules change) and
-	 * for one whose catalog dispatches without a key.
+	 * A tombstone lookup that fails is `unreadable`, since the store could not tell;
+	 * one the caller aborted does not count. Undefined for a disabled provider (in
+	 * settings, or paused by its auth rules: no key comes back until the user or the
+	 * rules change) and for one whose catalog dispatches without a key.
 	 */
-	async #storedCredentialsUnavailable(provider: string, sessionId?: string, signal?: AbortSignal): Promise<boolean> {
+	async #storedCredentialsOutage(
+		provider: string,
+		sessionId?: string,
+		signal?: AbortSignal,
+	): Promise<StoredCredentialsOutage | undefined> {
 		if (
 			this.#isProviderDisabled(provider) ||
 			providerPauseReason(provider) !== undefined ||
 			getProviderDefinition(provider)?.allowsMissingApiKey
 		)
-			return false;
+			return undefined;
 		if (
 			this.authStorage.credentials
 				.list(provider)
 				.some(row => sessionId === undefined || this.authStorage.sessions.permits(provider, sessionId, row.id))
 		)
-			return true;
+			return "cannot-serve";
 		let tombstones: DisabledCredentialSummary[];
 		try {
 			tombstones = await this.authStorage.credentials.listDisabled(provider, signal);
 		} catch (error) {
-			if (signal?.aborted) return false;
+			if (signal?.aborted) return undefined;
 			logger.debug("Disabled credential lookup failed; treating the missing key as recoverable", {
 				provider,
 				error: error instanceof Error ? error.message : String(error),
 			});
-			return true;
+			return "unreadable";
 		}
 		return tombstones.some(
 			failure =>
 				isRecoverableDisabledCredential(failure, tombstones) &&
 				(sessionId === undefined ||
 					this.authStorage.sessions.permitsIdentity(provider, sessionId, failure.identityKey)),
-		);
+		)
+			? "cannot-serve"
+			: undefined;
 	}
 
 	getDiscoverableProviders(): string[] {
@@ -3898,8 +3912,8 @@ export class ModelRegistry {
 	 * finds no key throws a transient {@link CredentialUnavailableError} when the
 	 * key may come back without the user configuring one:
 	 * - the provider's apiKey is a `!command` that produced nothing ({@link ApiKeyCommandError});
-	 * - the provider's stored credentials exist but none can serve now
-	 *   ({@link #storedCredentialsUnavailable}), also when the session's OAuth
+	 * - the provider's stored credentials exist but none can serve now, or the store
+	 *   could not tell ({@link #storedCredentialsOutage}), also when the session's OAuth
 	 *   account pool has no account that can serve ({@link AccountPoolUnavailableError},
 	 *   kept as `cause`). A pool whose credentials the user removed fails for good.
 	 * A registry view that builds its own resolvers wraps them with this.
@@ -3913,7 +3927,7 @@ export class ModelRegistry {
 				if (
 					ctx.error === undefined &&
 					error instanceof AccountPoolUnavailableError &&
-					(await this.#storedCredentialsUnavailable(provider, sessionId, ctx.signal))
+					(await this.#storedCredentialsOutage(provider, sessionId, ctx.signal)) !== undefined
 				) {
 					throw new CredentialUnavailableError(error.message, { cause: error });
 				}
@@ -3926,9 +3940,12 @@ export class ModelRegistry {
 					commandFailureRetryAfterMs(this.#customProviderApiKeys.get(provider)),
 				);
 			}
-			if (await this.#storedCredentialsUnavailable(provider, sessionId, ctx.signal)) {
+			const outage = await this.#storedCredentialsOutage(provider, sessionId, ctx.signal);
+			if (outage !== undefined) {
 				throw new CredentialUnavailableError(
-					`No API key for provider: ${provider} (its stored credentials are disabled or cannot serve now)`,
+					outage === "unreadable"
+						? `No API key for provider: ${provider} (its stored credentials could not be read)`
+						: `No API key for provider: ${provider} (its stored credentials are disabled or cannot serve now)`,
 				);
 			}
 			return resolved;

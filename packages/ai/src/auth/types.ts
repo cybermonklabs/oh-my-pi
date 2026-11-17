@@ -139,6 +139,10 @@ export interface DisabledCredentialSummary {
 export const DELETED_BY_USER = "deleted by user";
 /** Disable cause of a credential the user logged out of on the auth broker (`omp auth-broker logout`). */
 export const LOGGED_OUT_BY_USER = "logged out by user";
+/** Disable cause prefix of a credential a newer one replaced (`replaced by newer credential`, `replaced by oauth login`). */
+export const REPLACED_BY_CAUSE_PREFIX = "replaced by";
+/** Disable cause prefix of a duplicate row of an account merged away (`deduplicated duplicate credential`). */
+export const DEDUPLICATED_CAUSE_PREFIX = "deduplicated";
 
 /** Whether a disable cause records the user's own removal of a credential. */
 export function isUserRemovalCause(cause: string): boolean {
@@ -153,11 +157,9 @@ export function isUserRemovalCause(cause: string): boolean {
  * login restores, not lifecycle noise.
  */
 export function isAutoDisabledCredential(summary: DisabledCredentialSummary): boolean {
-	return (
-		summary.type === "oauth" &&
-		!isUserRemovalCause(summary.cause) &&
-		!/^(replaced by|deduplicated)/i.test(summary.cause)
-	);
+	if (summary.type !== "oauth" || isUserRemovalCause(summary.cause)) return false;
+	const cause = summary.cause.toLowerCase();
+	return !cause.startsWith(REPLACED_BY_CAUSE_PREFIX) && !cause.startsWith(DEDUPLICATED_CAUSE_PREFIX);
 }
 
 /**
@@ -1303,7 +1305,7 @@ export interface SessionsApi {
 	 * session's account pool. Unrestricted sessions allow every identity; a
 	 * restricted session rejects missing identities and keys outside its list.
 	 */
-	permitsIdentity(provider: string, sessionId: string | undefined, identityKey: string | undefined): boolean;
+	permitsIdentity(provider: string, sessionId: string, identityKey: string | undefined): boolean;
 	/**
 	 * Release a session's sticky credential so its next {@link getApiKey} call
 	 * re-runs native pool ranking. This never blocks or penalizes the released

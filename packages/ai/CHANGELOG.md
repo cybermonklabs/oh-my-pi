@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Custom `SessionsApi` implementations must implement `permitsIdentity(provider, sessionId, identityKey)` ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
+
 ### Added
 
 - Added `CredentialUnavailableError`, a transient error for a configured credential source that produced no key; unlike `MissingApiKeyError`, a retry may succeed. It accepts a `cause`, and `OAuthRefreshUnavailableError` is a `CredentialUnavailableError` ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar)).

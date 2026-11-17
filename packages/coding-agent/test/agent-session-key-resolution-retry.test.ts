@@ -92,6 +92,14 @@ const COPILOT_MODEL = { provider: "github-copilot", id: "gpt-4o" };
 const COMMAND_PROVIDER = "custom-proxy";
 /** What `omp auth-broker logout` records. */
 const LOGGED_OUT_BY_USER = "logged out by user";
+/**
+ * What `prompt()` refuses with in a session whose OAuth account pool has no account left: the
+ * pool's own error, which names the pool rather than the provider.
+ */
+const POOL_REFUSAL = {
+	name: "AccountPoolUnavailableError",
+	message: expect.stringContaining("restricted to its OAuth account pool"),
+};
 /** `Flag.Connection` where the error taxonomy has one; row 12's connection case runs only there. */
 const CONNECTION_FLAG = (AIError.Flag as Record<string, number>).Connection;
 
@@ -725,6 +733,36 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 		});
 	}
 
+	it("row 3: past the bound, says the stored credentials could not be read when their lookup fails, for a provider with none stored", async () => {
+		// If this regresses, the final error says the provider's stored credentials are disabled while none
+		// is stored: the store could not be read, and the user looks for a disabled login that does not exist.
+		const authStorage = await AuthStorage.create(root.join("empty-auth.db"), {
+			usageProviderResolver: () => undefined,
+		});
+		cleanups.push(() => authStorage.close());
+		const ctx = { authStorage, modelRegistry: new ModelRegistry(authStorage, root.join("models.yml")) };
+		vi.spyOn(authStorage.credentials, "listDisabled").mockRejectedValue(new Error("auth broker unreachable"));
+		const { session, mock, retryStarts } = await openSession(ctx, {
+			maxRetries: 2,
+			sessionManager: SessionManager.inMemory(),
+		});
+		mockSchedulerWaitWithClock();
+
+		await session.prompt("run the probe");
+		await session.waitForIdle();
+
+		const failed = lastAssistant(session);
+		expect({
+			stopReason: failed.stopReason,
+			credentialUnavailable: failed.credentialUnavailable,
+			retryAttempts: retryStarts.map(event => event.attempt),
+		}).toEqual({ stopReason: "error", credentialUnavailable: true, retryAttempts: [1, 2] });
+		expect(failed.errorMessage).toContain(
+			"No API key for provider: anthropic (its stored credentials could not be read)",
+		);
+		expect(mock.calls).toHaveLength(0);
+	});
+
 	it("row 4: a `!command` key that printed nothing past its retry cap leaves a turn omp --restore finishes", async () => {
 		// If this regresses, the failed turn is final: `--restore` finds nothing to go on with.
 		const keyFile = root.join("key.txt");
@@ -1120,7 +1158,13 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 				expect(failed.credentialUnavailable).toBeUndefined();
 				expect(retryStarts).toEqual([]);
 				expect(mock.calls).toHaveLength(1);
-				await expect(session.prompt("again")).rejects.toThrow("No API key found for anthropic");
+				// A pooled session's refusal names its pool; the refused prompt goes back to the user.
+				const dropped: string[] = [];
+				session.setPromptDropped(prompt => dropped.push(prompt.text));
+				const refusing = session.prompt("again");
+				if (pooled) await expect(refusing).rejects.toMatchObject(POOL_REFUSAL);
+				else await expect(refusing).rejects.toThrow("No API key found for anthropic");
+				expect(dropped).toEqual(["again"]);
 				await expect(session.restoreInterruptedTurn()).resolves.toBe(false);
 			});
 		}
@@ -1164,7 +1208,7 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 				expect(failed.credentialUnavailable).toBeUndefined();
 				expect(retryStarts).toEqual([]);
 				expect(mock.calls).toHaveLength(1);
-				await expect(session.prompt("again")).rejects.toThrow("No API key found for anthropic");
+				await expect(session.prompt("again")).rejects.toMatchObject(POOL_REFUSAL);
 				await expect(session.restoreInterruptedTurn()).resolves.toBe(false);
 			});
 		}
@@ -1199,7 +1243,7 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 				{ ...ctx, modelRegistry: registry },
 				{ maxRetries: 2, sessionManager: SessionManager.inMemory() },
 			);
-			await expect(session.prompt("run the probe")).rejects.toThrow("No API key found for anthropic");
+			await expect(session.prompt("run the probe")).rejects.toMatchObject(POOL_REFUSAL);
 			expect(mock.calls).toHaveLength(0);
 		});
 	}

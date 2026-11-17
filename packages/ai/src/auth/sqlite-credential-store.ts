@@ -26,6 +26,7 @@ import {
 	isAutoDisabledCredential,
 	isUserRemovalCause,
 	type OAuthCredential,
+	REPLACED_BY_CAUSE_PREFIX,
 	type StoredAuthCredential,
 	type StoredCredentialBlock,
 } from "./types";
@@ -1402,7 +1403,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 
 			for (const row of existing) {
 				if (!matchedExistingIds.has(row.id)) {
-					this.#deleteStmt.run("replaced by newer credential", row.id);
+					this.#deleteStmt.run(`${REPLACED_BY_CAUSE_PREFIX} newer credential`, row.id);
 				}
 			}
 
@@ -1428,7 +1429,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			if (item.type === "oauth") {
 				for (const row of existing) {
 					if (row.credential && row.credential.type === "api_key") {
-						this.#deleteStmt.run("replaced by oauth login", row.id);
+						this.#deleteStmt.run(`${REPLACED_BY_CAUSE_PREFIX} oauth login`, row.id);
 					}
 				}
 			}
@@ -1441,7 +1442,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 					this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, row.id);
 					continue;
 				}
-				this.#deleteStmt.run("replaced by newer credential", row.id);
+				this.#deleteStmt.run(`${REPLACED_BY_CAUSE_PREFIX} newer credential`, row.id);
 			}
 
 			if (targetId === null) {

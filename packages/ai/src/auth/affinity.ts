@@ -120,8 +120,8 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	/** Test a tombstone or snapshot identity against the session's allowed account keys. */
-	permitsIdentity(provider: string, sessionId: string | undefined, identityKey: string | undefined): boolean {
-		const allowed = sessionId === undefined ? undefined : this.#restrictions.get(provider)?.get(sessionId)?.allowed;
+	permitsIdentity(provider: string, sessionId: string, identityKey: string | undefined): boolean {
+		const allowed = this.#restrictions.get(provider)?.get(sessionId)?.allowed;
 		return allowed === undefined || (identityKey !== undefined && allowed.has(identityKey));
 	}
 

@@ -20,6 +20,7 @@ import {
 	type OAuthCredential,
 	type OAuthRefreshReason,
 	REMOTE_REFRESH_SENTINEL,
+	REPLACED_BY_CAUSE_PREFIX,
 	type RemoteOAuthCredential,
 	type StoredAuthCredential,
 	type StoredCredentialBlock,
@@ -1014,7 +1015,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const existing = this.listAuthCredentials(provider);
 		for (const entry of existing) {
 			try {
-				await this.#client.disableCredential(entry.id, "replaced by newer credential");
+				await this.#client.disableCredential(entry.id, `${REPLACED_BY_CAUSE_PREFIX} newer credential`);
 			} catch (error) {
 				logger.warn("auth-broker disable during replace failed", {
 					provider,

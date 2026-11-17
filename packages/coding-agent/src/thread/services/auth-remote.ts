@@ -459,7 +459,7 @@ class RemoteSessions implements SessionsApi {
 	permits(provider: string, sessionId: string, credentialId: number): boolean {
 		return this.#remote.callSync("sessions.permits", provider, sessionId, credentialId);
 	}
-	permitsIdentity(provider: string, sessionId: string | undefined, identityKey: string | undefined): boolean {
+	permitsIdentity(provider: string, sessionId: string, identityKey: string | undefined): boolean {
 		return this.#remote.callSync("sessions.permitsIdentity", provider, sessionId, identityKey);
 	}
 	release(provider: string, sessionId: string): boolean {

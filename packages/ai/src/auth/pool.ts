@@ -5,7 +5,13 @@ import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-cred
 import type { BlockStoreHealth } from "./blocks";
 import type { AccountPolicies } from "./policy";
 import type { AuthCredentialStore } from "./store";
-import { DELETED_BY_USER, isAutoDisabledCredential, isUserRemovalCause, REMOTE_REFRESH_SENTINEL } from "./types";
+import {
+	DEDUPLICATED_CAUSE_PREFIX,
+	DELETED_BY_USER,
+	isAutoDisabledCredential,
+	isUserRemovalCause,
+	REMOTE_REFRESH_SENTINEL,
+} from "./types";
 import type {
 	ApiKeyCredential,
 	AuthCredential,
@@ -431,7 +437,7 @@ export class CredentialPool implements CredentialsApi {
 		}
 		if (removed.length > 0) {
 			for (const entry of removed) {
-				await this.#store.deleteAuthCredential(entry.id, "deduplicated duplicate credential");
+				await this.#store.deleteAuthCredential(entry.id, `${DEDUPLICATED_CAUSE_PREFIX} duplicate credential`);
 			}
 			this.reset(provider);
 		}

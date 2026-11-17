@@ -9014,7 +9014,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			});
 		} catch (error) {
 			turnError = error;
-			if (error instanceof AgentStartPolicyChangedError || error instanceof PromptPreflightError) {
+			// A refusal before dispatch hands the prompt back; a pool's refusal is its own error.
+			if (
+				error instanceof AgentStartPolicyChangedError ||
+				error instanceof PromptPreflightError ||
+				error instanceof AIError.AccountPoolUnavailableError
+			) {
 				this.#reportDroppedPrompt(typedText, options, followUps);
 			}
 			throw error;
@@ -9503,12 +9508,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// cannot serve now, including an OAuth account pool none of whose accounts
 			// can) is left to the turn, whose resolver fails retryably so auto-retry
 			// covers it. Any other provider without a key, a pool whose credentials the
-			// user removed included, walks the retry fallback chain first.
+			// user removed included, walks the retry fallback chain first; a pool that
+			// refuses then names itself, not the provider.
 			let apiKey: string | undefined;
+			let poolRefusal: AIError.AccountPoolUnavailableError | undefined;
 			try {
 				apiKey = await logger.time("prompt:apiKey", () => this.#modelRegistry.getApiKey(model, this.sessionId));
 			} catch (error) {
 				if (!(error instanceof AIError.AccountPoolUnavailableError)) throw error;
+				poolRefusal = error;
 			}
 			if (
 				!apiKey &&
@@ -9516,6 +9524,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				!(await this.#recovery.applyMissingCredentialFallback(setupAbort.signal))
 			) {
 				if (setupAbort.signal.aborted) return false;
+				if (poolRefusal) throw poolRefusal;
 				throw new PromptPreflightError(
 					`No API key found for ${model.provider}.\n\n` +
 						`Use /login, set an API key environment variable, or create ${getAgentDbPath()}`,
