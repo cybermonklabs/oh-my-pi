@@ -47,8 +47,9 @@ const UNPACK_NOTE: Record<UnpackMode, string> = {
 /**
  * Why each action needs session files on disk. Under `session.storage: sql`
  * a session is a database row: there is no file to pack, place, or mark, and
- * no ownership lease to probe, so each refuses rather than act on files that
- * are not the session.
+ * its claim lives in the database rather than in the session-file ownership
+ * lease a probe reads, so each refuses rather than act on files that are not
+ * the session.
  */
 const DISK_ONLY_REASONS: Record<SessionAction, string> = {
 	pack: "it archives a session file and its artifact directory from disk, and this store keeps the transcripts as database rows",

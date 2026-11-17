@@ -510,6 +510,7 @@ import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-sta
 import { promptDigestOfEntry, SessionTools, type SessionToolsHost } from "./session-tools";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
+import { SESSION_OPEN_CLAIM_WAIT_MS } from "./sql-session-storage";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { TurnRecovery, type TurnRecoveryHost } from "./turn-recovery";
@@ -14085,7 +14086,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The file may be reloaded at the same path with a different latest contract (or the
 			// switch rolled back via restoreState); re-read it on the next model call either way.
 			this.#sessionInit = undefined;
-			await this.sessionManager.setSessionFile(sessionPath);
+			// Take its lease before the manager takes its id, waiting out another
+			// holder's (SQL storage only): while it waits, the manager still reports
+			// the session it had, and one another live omp process still holds
+			// moves to a minted id in the same step, before any hook hears of it.
+			await this.sessionManager.setSessionFile(sessionPath, {
+				claim: {
+					waitMs: SESSION_OPEN_CLAIM_WAIT_MS,
+					onWait: holder =>
+						logger.warn("Session switch waits for another omp process's lease", {
+							sessionPath,
+							host: holder.host,
+							pid: holder.pid,
+						}),
+				},
+			});
 			this.#bash.markSessionTransition(bashTransition);
 			const newCwd = this.sessionManager.getCwd();
 			const recordedCwd = this.sessionManager.getRecordedCwd() ?? previousSessionState.cwd;

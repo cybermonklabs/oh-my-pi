@@ -128,10 +128,16 @@ import {
 	type SessionContinuation,
 	type SessionInfo,
 } from "./session/session-listing";
-import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from "./session/session-manager";
-import { setDefaultSessionStorage } from "./session/session-storage";
+import {
+	ForkSourceNotFoundError,
+	isSessionExclusive,
+	SessionManager,
+	SessionMoveRefusedError,
+} from "./session/session-manager";
+import { defaultSessionStorage, setDefaultSessionStorage } from "./session/session-storage";
 import { resolveSessionStorage, SessionStorageConfigError } from "./session/session-storage-config";
-import { forkIfMovedAway } from "./session/session-transfer";
+import { forkIfMovedAway, lastSessionTransfer } from "./session/session-transfer";
+import { SESSION_OPEN_CLAIM_WAIT_MS } from "./session/sql-session-storage";
 import { shouldShowStartupSplash } from "./startup-splash";
 import {
 	discoverSystemPromptOverride,
@@ -1326,9 +1332,12 @@ export async function createSessionManager(
 
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
+		// A launcher's recorded id (OMP_SESSION_EXCLUSIVE=1), and an exact id, open
+		// exactly that session: no continuation an older build recorded is followed.
+		const followContinuation = !isSessionExclusive();
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
 			// The conversation may have gone on in a sibling file while another process held this one.
-			const continuation = await findSessionContinuation(sessionArg);
+			const continuation = followContinuation ? await findSessionContinuation(sessionArg) : undefined;
 			if (continuation) options.onSessionContinuation?.(continuation);
 			let manager: SessionManager;
 			try {
@@ -1346,14 +1355,17 @@ export async function createSessionManager(
 				}
 				throw err;
 			}
-			// A copy whose conversation moved to another machine continues as a fork.
-			return await forkIfMovedAway(manager, parsed.sessionDir);
+			return await claimOpenedSession(await forkIfMovedAwayUnlessExclusive(manager, parsed.sessionDir));
 		}
-		const target = await resolveResumeTarget(sessionArg, cwd, parsed.sessionDir);
+		const target =
+			followContinuation && !EXACT_SESSION_ID.test(sessionArg)
+				? await resolveResumeTarget(sessionArg, cwd, parsed.sessionDir)
+				: await resolveResumableSession(sessionArg, cwd, parsed.sessionDir, defaultSessionStorage());
 		if (!target) {
 			throw new SessionResolutionError(`Session "${sessionArg}" not found.`, SESSION_NOT_FOUND_HINT);
 		}
-		const { session, continuation } = target;
+		const { session } = target;
+		const continuation = "continuation" in target ? target.continuation : undefined;
 		if (continuation) options.onSessionContinuation?.(continuation);
 		const moveResult = await moveMissingCwdSessionIfNeeded(
 			sessionArg,
@@ -1363,19 +1375,26 @@ export async function createSessionManager(
 			askToMoveSession,
 		);
 		if (moveResult.status === "moved") {
-			return await forkIfMovedAway(moveResult.manager, parsed.sessionDir);
+			return await claimOpenedSession(await forkIfMovedAwayUnlessExclusive(moveResult.manager, parsed.sessionDir));
 		}
 		if (moveResult.status === "declined") {
 			return undefined;
 		}
-		return await forkIfMovedAway(await SessionManager.open(session.path, parsed.sessionDir), parsed.sessionDir);
+		return await claimOpenedSession(
+			await forkIfMovedAwayUnlessExclusive(
+				await SessionManager.open(session.path, parsed.sessionDir),
+				parsed.sessionDir,
+			),
+		);
 	}
 	if (parsed.continue) {
-		return await forkIfMovedAway(
-			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
-				onSessionContinuation: options.onSessionContinuation,
-			}),
-			parsed.sessionDir,
+		return await claimOpenedSession(
+			await forkIfMovedAwayUnlessExclusive(
+				await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
+					onSessionContinuation: options.onSessionContinuation,
+				}),
+				parsed.sessionDir,
+			),
 		);
 	}
 	// --resume without value is handled separately (needs picker UI)
@@ -1388,12 +1407,17 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	// An explicit startup goal starts fresh even when implicit auto-resume is configured.
+	// It claims the session at open but waits for no other holder: a start that
+	// names no session and picks none never waits.
 	if (parsed.goal === undefined && cfgAutoResume.get(activeSettings)) {
-		const manager = await forkIfMovedAway(
-			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
-				onSessionContinuation: options.onSessionContinuation,
-			}),
-			parsed.sessionDir,
+		const manager = await claimOpenedSession(
+			await forkIfMovedAwayUnlessExclusive(
+				await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
+					onSessionContinuation: options.onSessionContinuation,
+				}),
+				parsed.sessionDir,
+			),
+			{ wait: false },
 		);
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
@@ -1402,6 +1426,58 @@ export async function createSessionManager(
 	}
 	// Default case (new session) returns undefined, SDK will create one
 	return undefined;
+}
+
+/** A whole session id, as `--resume` takes one: it opens exactly that session. */
+const EXACT_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * {@link forkIfMovedAway}, except under `OMP_SESSION_EXCLUSIVE=1`: a
+ * `departed` entry (`omp session moved`, or one another process appended)
+ * never moves the launcher's recorded id. The start logs the entry, naming
+ * it, and opens the session itself, which it writes its next turn to.
+ */
+async function forkIfMovedAwayUnlessExclusive(manager: SessionManager, sessionDir?: string): Promise<SessionManager> {
+	if (!isSessionExclusive()) return forkIfMovedAway(manager, sessionDir);
+	const marker = lastSessionTransfer(manager.getEntries());
+	if (marker?.kind !== "departed") return manager;
+	logger.warn("Session holds a departed entry; OMP_SESSION_EXCLUSIVE=1 opens it anyway", {
+		sessionId: manager.getSessionId(),
+		sessionFile: manager.getSessionFile(),
+		departedTo: marker.to,
+	});
+	process.stderr.write(
+		`Session ${manager.getSessionId()} holds a departed entry (moved to ${marker.to}); OMP_SESSION_EXCLUSIVE=1 opens it here anyway.\n`,
+	);
+	return manager;
+}
+
+/**
+ * Claim the session `manager` opened before anything else sees it, on a
+ * storage that can tell at once (SQL storage; see
+ * `SessionManager.claimOpenedSession`). An explicit resume (`--resume`, the
+ * session `--continue` picks, the picker's pick) first waits up to
+ * {@link SESSION_OPEN_CLAIM_WAIT_MS} for another holder's lease to go or
+ * expire, telling the person on stderr, so a resume after its holder was
+ * killed keeps the id; the automatic resume (`wait: false`) does not. One
+ * still held then moves to a minted id, or, under `OMP_SESSION_EXCLUSIVE=1`,
+ * ends the process non-zero naming the holder.
+ */
+async function claimOpenedSession(manager: SessionManager, options: { wait?: boolean } = {}): Promise<SessionManager> {
+	if (options.wait === false) {
+		await manager.claimOpenedSession();
+		return manager;
+	}
+	await manager.claimOpenedSession({
+		waitMs: SESSION_OPEN_CLAIM_WAIT_MS,
+		onWait: holder => {
+			process.stderr.write(
+				`Session ${manager.getSessionId()} is held by another omp process (host ${holder.host}, pid ${holder.pid}); ` +
+					`waiting up to ${SESSION_OPEN_CLAIM_WAIT_MS / 1000} s for its lease to expire…\n`,
+			);
+		},
+	});
+	return manager;
 }
 
 /** Discover APPEND_SYSTEM.md file if no CLI append system prompt was provided */
@@ -2340,11 +2416,13 @@ export async function runRootCommand(
 			if (continuation) resumedContinuations.push(continuation);
 			const chosen = continuation?.session ?? selected;
 			try {
-				sessionManager = await forkIfMovedAway(
-					(await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
-						? await openRelocatedSession(chosen, cwd, parsedArgs.sessionDir)
-						: await SessionManager.open(chosen.path),
-					parsedArgs.sessionDir,
+				sessionManager = await claimOpenedSession(
+					await forkIfMovedAwayUnlessExclusive(
+						(await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
+							? await openRelocatedSession(chosen, cwd, parsedArgs.sessionDir)
+							: await SessionManager.open(chosen.path),
+						parsedArgs.sessionDir,
+					),
 				);
 			} catch (error: unknown) {
 				if (error instanceof SessionResolutionError) exitForSessionResolutionError(error);

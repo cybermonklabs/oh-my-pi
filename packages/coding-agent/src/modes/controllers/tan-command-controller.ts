@@ -55,7 +55,7 @@ async function removeCloneSession(
 		});
 	}
 	try {
-		await storage.deleteSessionWithArtifacts(cloneFile);
+		await SessionManager.deleteSessionFile(cloneFile, storage);
 		return;
 	} catch (error) {
 		if (!isEnoent(error)) {
