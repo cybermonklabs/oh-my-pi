@@ -14,7 +14,7 @@ import { createAgentHubRuntime } from "@oh-my-pi/pi-coding-agent/modes/agent-hub
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { copySessionArtifacts } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import type { SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { type AgentHubRemote, AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
@@ -51,14 +51,11 @@ describe("Agent Hub session scope", () => {
 	): Promise<string> {
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-hub-scope-"));
 		const { storage } = options;
-		const write = async (file: string, text: string) => {
-			if (storage) await storage.writeText(file, text);
-			else await Bun.write(file, text);
-		};
+		const store = storage ?? new FileSessionStorage();
 		const oldRoot = path.join(dir, "old.jsonl");
 		const newRoot = path.join(dir, "new.jsonl");
-		await write(oldRoot, "");
-		await write(newRoot, "");
+		await store.writeText(oldRoot, "");
+		await store.writeText(newRoot, "");
 		const registry = new AgentRegistry();
 		registry.register({
 			id: "OldParked",
@@ -104,9 +101,9 @@ describe("Agent Hub session scope", () => {
 				sessionFile: path.join(dir, "old", "OldAborted.jsonl"),
 			});
 			const files = ["OldParked.jsonl", "OldParked/OldIdle.jsonl", "OldAborted.jsonl"];
-			for (const file of files) await write(path.join(dir, "old", file), header(`old-${file}`));
+			for (const file of files) await store.writeText(path.join(dir, "old", file), header(`old-${file}`));
 			if (options.old === "copied") await copySessionArtifacts(oldRoot, newRoot, storage);
-			else for (const file of files) await write(path.join(dir, "new", file), header(`new-${file}`));
+			else for (const file of files) await store.writeText(path.join(dir, "new", file), header(`new-${file}`));
 		}
 		const hub = new AgentHubOverlayComponent({
 			...createAgentHubRuntime({
