@@ -707,6 +707,46 @@ def test_fetch_prune_drops_the_registration_of_a_worktree_nested_in_the_one_it_r
     assert (readd / ".git").is_file()
 
 
+def test_fetch_prune_keeps_a_locked_forged_registration_of_what_is_no_checkout(tmp_path: Path) -> None:
+    # A locked holding registration whose path is no checkout is kept, not
+    # dropped: the path it names is left alone, and the fetch recovers anyway,
+    # because `update-ref -d` deletes the bad ref.
+    from robomp.git_ops import fetch_prune
+
+    state = _forgeable_pool(tmp_path)
+    evil = _forge_registration(state, state.victim_dir)
+    (evil / "locked").write_text("forged\n", encoding="utf-8")
+    _plant_bad_ref(state.pool)
+
+    fetch_prune(state.pool, token=None)
+
+    assert (evil / "locked").is_file(), "a locked holding registration was dropped"
+    assert _intact(state) == dict.fromkeys(_intact(state), True)
+    fetch_prune(state.pool, token=None)
+
+
+def test_fetch_prune_keeps_both_registrations_of_a_checkout_one_of_them_locked(tmp_path: Path) -> None:
+    # A present checkout on the bad ref has two registrations, its own and a
+    # locked copy. The lock keeps the checkout; the copy is kept because it is
+    # locked, and the checkout's own registration because the checkout points
+    # back to it: neither is dropped.
+    from robomp.git_ops import _delete_bad_refs
+
+    state = _forgeable_pool(tmp_path)
+    own = _admin(state.a)
+    (own / "HEAD").write_text(f"ref: {_FORGED_REF}\n", encoding="utf-8")
+    duplicate = own.parent / "duplicate"
+    shutil.copytree(own, duplicate)
+    (duplicate / "locked").write_text("a copy someone locked\n", encoding="utf-8")
+    _plant_bad_ref(state.pool)
+
+    _delete_bad_refs(state.pool, f"fatal: bad object {_FORGED_REF}\n")
+
+    assert (state.a / ".git").is_file(), "the locked checkout was removed"
+    assert own.is_dir(), "the checkout's own registration was dropped"
+    assert (duplicate / "locked").is_file(), "the locked duplicate registration was dropped"
+
+
 def test_delete_bad_refs_leaves_the_pools_own_checkout_on_the_bad_ref(tmp_path: Path) -> None:
     # The pool's main worktree is no linked worktree: whatever its HEAD is on,
     # the repair must not remove it.
