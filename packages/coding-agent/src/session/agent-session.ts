@@ -391,6 +391,7 @@ import {
 	createInterruptedTurnAbortMessage,
 	hasRestorableTurn,
 	INTERRUPTED_TURN_ERROR,
+	plainTurnAbortReason,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
 	summarizeToolArguments,
@@ -6803,10 +6804,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#recovery.abortRetry({ cutOff: true });
 		this.abortCompaction();
 		// A process exit cuts a turn still in flight off instead of stopping it:
-		// label it as interrupted so `omp --restore` goes on with it.
+		// label it as interrupted so `omp --restore` goes on with it. Any other
+		// disposal cuts the turn off too; its plain reason says so to a sync subagent.
 		const abortReason = options.reason === postmortem.Reason.EXIT ? INTERRUPTED_TURN_ERROR : undefined;
 		const postPromptDrain = this.#cancelPostPromptTasks(abortReason);
-		this.agent.abort(abortReason);
+		this.agent.abort(abortReason ?? plainTurnAbortReason("cutOff"));
 		try {
 			await withTimeout(
 				postPromptDrain,
@@ -12103,18 +12105,32 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * and surfaces verbatim on the aborted assistant message's `errorMessage`, so
 	 * the transcript can distinguish a deliberate user interrupt from an opaque
 	 * abort. Omit it for internal/lifecycle aborts.
+	 *
+	 * The abort stops a turn waiting to retry: the turn ends with an aborted record
+	 * after its failed attempt, and `omp --restore` leaves it. That is right when
+	 * whoever aborts takes the aborted result: the user's stop, or an owner whose
+	 * own turn goes on. `cutOff` is for a session that is going away instead. The
+	 * agent's abort reason tells the turn's tools which it is ({@link turnAbortKind}),
+	 * so a sync subagent stops or is cut off with its parent.
 	 */
 	async abort(options?: {
 		goalReason?: "interrupted" | "internal";
 		reason?: string;
+		/**
+		 * The session's process is going away (an exit, a signal, a shutdown): a turn
+		 * waiting to retry is cut off, not stopped, and keeps its failed attempt as its
+		 * tail, so `omp --restore` goes on with it. The interrupted-turn reason
+		 * (`INTERRUPTED_TURN_ERROR`), which a shutdown gives, cuts the turn off too; a
+		 * cut-off gives no other reason.
+		 */
+		cutOff?: boolean;
 		/** Force queued user follow-ups into the continuation after a user interrupt. */
 		deliverQueuedMessages?: boolean;
 		/** Internal `/compact` startup keeps the manual-compaction marker alive while aborting the active turn. */
 		preserveCompaction?: boolean;
 	}): Promise<void> {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
-		// An abort stops a turn waiting to retry; a shutdown's abort only cuts it off, so `omp --restore` goes on with it.
-		const cutOff = options?.reason === INTERRUPTED_TURN_ERROR;
+		const cutOff = options?.cutOff === true || options?.reason === INTERRUPTED_TURN_ERROR;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		// Latch only when the interrupt stops something; an idle Esc would otherwise fold
 		// every later background completion for the rest of the session.
@@ -12169,7 +12185,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.abortEval();
 			const computerControlRevocation = revokeComputerControlForOwner(this.#eval.getKernelOwnerId());
 			const postPromptDrain = this.#cancelPostPromptTasks(options?.reason);
-			this.agent.abort(options?.reason);
+			// Without a reason of the caller's, the agent's reason still says whether this stops the turn or cuts it off.
+			this.agent.abort(options?.reason ?? plainTurnAbortReason(cutOff ? "cutOff" : "stop"));
 			await Promise.all([postPromptDrain, computerControlRevocation]);
 			await this.agent.waitForIdle();
 			this.#persistToolResultsEndedWhileDisconnected();
@@ -15135,7 +15152,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			isIdle: () => !this.isStreaming,
 			hasQueuedMessages: () => this.queuedMessageCount > 0,
 			abort: () => {
-				this.agent.abort();
+				this.agent.abort(plainTurnAbortReason("stop"));
 			},
 			settings: this.settings,
 			ui: uiContext,

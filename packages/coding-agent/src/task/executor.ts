@@ -96,7 +96,7 @@ import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
-import { INTERRUPTED_TURN_ERROR } from "../session/exit-diagnostics";
+import { INTERRUPTED_TURN_ERROR, turnAbortKind } from "../session/exit-diagnostics";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -1511,13 +1511,30 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let lastReportTurnText: string | undefined;
 	let sawAssistantMessage = false;
 	let activeSessionAbortPromise: Promise<void> | undefined;
+	/**
+	 * Whether the caller's abort (its signal's reason) cuts the subagent's turn off,
+	 * so `omp --restore` goes on with it, instead of stopping it. A sync run's signal
+	 * is its parent's turn, and the subagent follows the parent ({@link turnAbortKind}):
+	 * any stop of the parent's turn (the user's, `/new`, the parent's own budget or
+	 * time limit) stops it too, and the parent's process exit, dispose or shutdown
+	 * cuts it off, as does a reason that says neither. A detached run's signal is its
+	 * job's, and the owner's cancel of the job stops it.
+	 */
+	let callerCutOff = false;
 
 	const abortActiveSession = (): Promise<void> => {
 		const session = activeSession;
 		if (!session) return Promise.resolve();
 		// A process shutdown cuts the turn off instead of stopping it: label it as
-		// interrupted so `omp --restore` (and `/restart`) goes on with it.
-		const options = abortReason === "shutdown" ? { reason: INTERRUPTED_TURN_ERROR } : undefined;
+		// interrupted so `omp --restore` (and `/restart`) goes on with it. A caller's
+		// abort that is not a stop cuts it off too ({@link callerCutOff}). The rest
+		// (a kill, this run's own budget or time limit) stop it.
+		const options =
+			abortReason === "shutdown"
+				? { reason: INTERRUPTED_TURN_ERROR }
+				: abortReason === "signal" && callerCutOff
+					? { cutOff: true }
+					: undefined;
 		activeSessionAbortPromise ??= session.abort(options).catch(error => {
 			logger.debug("Subagent session abort cleanup failed", {
 				error: error instanceof Error ? error.message : String(error),
@@ -1622,7 +1639,13 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		signal.addEventListener(
 			"abort",
 			() => {
-				if (!resolved) requestAbort(signal.reason === ASYNC_JOB_MANAGER_SHUTDOWN_REASON ? "shutdown" : "signal");
+				if (resolved) return;
+				if (signal.reason === ASYNC_JOB_MANAGER_SHUTDOWN_REASON) {
+					requestAbort("shutdown");
+					return;
+				}
+				callerCutOff = args.detached !== true && turnAbortKind(signal.reason) === "cutOff";
+				requestAbort("signal");
 			},
 			{ once: true, signal: listenerSignal },
 		);

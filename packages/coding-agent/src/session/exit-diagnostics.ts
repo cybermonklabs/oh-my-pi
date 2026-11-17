@@ -269,6 +269,49 @@ export function createTurnAbortRecord(
 }
 
 /**
+ * Whether an abort stops a turn or cuts it off (its process is going away), as the
+ * reason the session's agent aborts with carries it to what runs under the turn: a
+ * sync subagent's run follows its parent's turn.
+ */
+export type TurnAbortKind = "stop" | "cutOff";
+
+/** The reason's own field that names its kind; a plain field, so it crosses a worker thread with the reason. */
+const TURN_ABORT_KIND_FIELD = "turnAbortKind";
+
+/** `reason`, an abort's own object reason, marked with the kind of abort it is ({@link turnAbortKind}). */
+export function markTurnAbort<T extends object>(reason: T, kind: TurnAbortKind): T {
+	Object.defineProperty(reason, TURN_ABORT_KIND_FIELD, { value: kind, configurable: true });
+	return reason;
+}
+
+/**
+ * The reason for an abort that gives none of its own: the platform's own abort
+ * reason (a `DOMException` named `AbortError`, which every abort label reads as a
+ * plain abort), marked with `kind`.
+ */
+export function plainTurnAbortReason(kind: TurnAbortKind): DOMException {
+	const controller = new AbortController();
+	controller.abort();
+	const reason: DOMException = controller.signal.reason;
+	return markTurnAbort(reason, kind);
+}
+
+/**
+ * The kind of abort a reason gives a turn. A marked reason ({@link markTurnAbort})
+ * says it. The interrupted-turn reason cuts the turn off, and any other reason an
+ * abort names itself (text, a symbol) stops it. A reason with neither, such as the
+ * platform's own, cuts it off: nothing tells it apart from a process going away.
+ */
+export function turnAbortKind(reason: unknown): TurnAbortKind {
+	if (typeof reason === "string") return reason === INTERRUPTED_TURN_ERROR ? "cutOff" : "stop";
+	if (typeof reason === "symbol") return "stop";
+	if (typeof reason === "object" && reason !== null && Reflect.get(reason, TURN_ABORT_KIND_FIELD) === "stop") {
+		return "stop";
+	}
+	return "cutOff";
+}
+
+/**
  * Whether a persisted process exit follows the branch's last message: the
  * branch's writer is gone, so resume recovery owns its interrupted tail.
  */

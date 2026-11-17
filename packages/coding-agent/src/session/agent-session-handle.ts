@@ -150,6 +150,8 @@ export interface AgentSessionHandle {
 	abort(options?: {
 		goalReason?: "interrupted" | "internal";
 		reason?: string;
+		/** The session is going away: a turn waiting to retry is cut off for `omp --restore`, not stopped. */
+		cutOff?: boolean;
 		preserveCompaction?: boolean;
 		deliverQueuedMessages?: boolean;
 	}): Promise<void>;

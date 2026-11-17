@@ -8335,7 +8335,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#abortLoopCondition();
 		this.#cancelLoopAutoSubmit();
 		try {
-			await this.session.abort();
+			// The session is closing, as the teardown's dispose would: a turn waiting to
+			// retry is cut off for `omp --restore`, not stopped.
+			await this.session.abort({ cutOff: true });
 			await this.#liveCommandController.stop();
 		} catch (err) {
 			this.showWarning(err instanceof Error ? err.message : String(err));

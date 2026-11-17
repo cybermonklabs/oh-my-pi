@@ -12,6 +12,7 @@ import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import geminiToolReminderTemplate from "../prompts/system/gemini-tool-call-reminder.md" with { type: "text" };
 import streamingEditRecoveryTemplate from "../prompts/system/streaming-edit-recovery.md" with { type: "text" };
+import { markTurnAbort } from "./exit-diagnostics";
 import type { CustomMessage } from "./messages";
 import type { SessionManager } from "./session-manager";
 import {
@@ -129,10 +130,13 @@ export class StreamingEditGuard {
 		logger.warn("Streaming edit aborted due to patch preview failure", { toolCallId, path: filePath, error });
 		const diagnostic = `${STREAMING_EDIT_ABORT_REASON} for ${filePath}: ${error}`;
 		this.#host.agent.abort(
-			createToolScopedAbortReason(
-				STREAMING_EDIT_ABORT_REASON,
-				{ [toolCallId]: diagnostic },
-				STREAMING_EDIT_ABORT_REASON,
+			markTurnAbort(
+				createToolScopedAbortReason(
+					STREAMING_EDIT_ABORT_REASON,
+					{ [toolCallId]: diagnostic },
+					STREAMING_EDIT_ABORT_REASON,
+				),
+				"stop",
 			),
 		);
 		this.#scheduleRecovery({ diagnostic });
