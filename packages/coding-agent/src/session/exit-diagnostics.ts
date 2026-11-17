@@ -199,7 +199,9 @@ function isCredentialUnavailableTurn(message: AgentMessage): boolean {
  * recovery already closed that nothing followed, not even a normal exit, or one
  * that ended because its key could not be resolved, whatever exit followed: a
  * worker exits normally on that turn, and nothing else would resume it. A turn
- * behind a `/clear` is never one: the user ended that conversation.
+ * behind a `/clear` is never one: the user ended that conversation. Nor is one
+ * the user stopped while it waited to retry: an aborted record follows its
+ * failed attempt and ends it.
  */
 export function hasRestorableTurn(entries: readonly SessionEntry[]): boolean {
 	let normalExit = false;
@@ -232,6 +234,20 @@ export function createInterruptedTurnAbortMessage(
 	if (!model) return undefined;
 
 	const recordedAt = Date.parse(turn.recordedAt);
+	return createTurnAbortRecord(model, INTERRUPTED_TURN_ERROR, Number.isFinite(recordedAt) ? recordedAt : Date.now());
+}
+
+/**
+ * The assistant record that ends a turn as aborted: no content, no usage, written
+ * under `model`'s identity, with `errorMessage` saying why the turn ended. Exit
+ * recovery closes an interrupted turn with one; a retry the user stops closes its
+ * turn with one too.
+ */
+export function createTurnAbortRecord(
+	model: AssistantModelMetadata,
+	errorMessage: string,
+	timestamp: number,
+): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
@@ -247,8 +263,8 @@ export function createInterruptedTurnAbortMessage(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "aborted",
-		errorMessage: INTERRUPTED_TURN_ERROR,
-		timestamp: Number.isFinite(recordedAt) ? recordedAt : Date.now(),
+		errorMessage,
+		timestamp,
 	};
 }
 

@@ -48,6 +48,7 @@ import {
 import type { EditModeSetting } from "../edit/settings";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ResetRecoveryResult } from "./codex-auto-reset";
+import { createTurnAbortRecord } from "./exit-diagnostics";
 import type {
 	InitialRetryFallbackState,
 	UsageFallbackConfirmation,
@@ -113,6 +114,8 @@ const GENERIC_ABORT_MAX_RETRIES = 2;
 const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
 const NON_WHITESPACE_RE = /\S/;
 const USAGE_PREFLIGHT_BLOCKED_PREFIX = "Usage preflight blocked:";
+/** A saga's `finalError` when its wait was cancelled, and the reason on the record a user stop ends its turn with. */
+const RETRY_CANCELLED = "Retry cancelled";
 const STREAM_STALL_ERROR_RE = /stream stall/i;
 const HTTP2_STREAM_RESET_ERROR_RE =
 	/stream closed with error code\s+nghttp2_(?:internal_error|refused_stream)|nghttp2_(?:internal_error|refused_stream)|HTTP2(?:StreamReset|RefusedStream)/i;
@@ -396,6 +399,13 @@ export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
 	readonly #unexpectedStopJudgeTimeoutMs: number;
 	#retryAbortController: AbortController | undefined;
+	/**
+	 * Whether the latest {@link abortRetry} stops the turn (the user's Esc, an abort)
+	 * rather than cutting it off (a process exit or shutdown). Every cancelled wait
+	 * follows an `abortRetry` call (an abort makes one before it raises
+	 * `abortInProgress`), so a saga reads the call that cancelled it.
+	 */
+	#retryCancelStopsTurn = false;
 	#retryAttempt = 0;
 	#genericAbortStreak = 0;
 	/**
@@ -2828,7 +2838,7 @@ export class TurnRecovery {
 				} catch (error) {
 					if (!resetAbortController.signal.aborted) throw error;
 					if (this.#retryAbortController !== resetAbortController) return false;
-					return this.#endCancelledRetry();
+					return this.#endCancelledRetry(message, this.#retryCancelStopsTurn);
 				} finally {
 					if (this.#retryAbortController === resetAbortController) this.#retryAbortController = undefined;
 				}
@@ -2943,7 +2953,7 @@ export class TurnRecovery {
 			} catch (error) {
 				if (!rotateAbortController.signal.aborted) throw error;
 				if (this.#retryAbortController !== rotateAbortController) return false;
-				return this.#endCancelledRetry();
+				return this.#endCancelledRetry(message, this.#retryCancelStopsTurn);
 			} finally {
 				if (this.#retryAbortController === rotateAbortController) this.#retryAbortController = undefined;
 			}
@@ -3197,7 +3207,8 @@ export class TurnRecovery {
 			errorId: message.errorId,
 		});
 		if (this.#host.abortInProgress() || this.#host.promptGeneration() !== generation) {
-			return this.#endCancelledRetry();
+			// A newer prompt alone supersedes the retry: the turn goes on in that prompt.
+			return this.#endCancelledRetry(message, this.#host.abortInProgress() && this.#retryCancelStopsTurn);
 		}
 
 		// Resolved stream-stall tools and proven-unexecuted malformed/refused
@@ -3228,7 +3239,7 @@ export class TurnRecovery {
 				return false;
 			}
 			// Aborted during sleep - emit end event so UI can clean up
-			return this.#endCancelledRetry();
+			return this.#endCancelledRetry(message, this.#retryCancelStopsTurn);
 		}
 		if (this.#retryAbortController === retryAbortController) {
 			this.#retryAbortController = undefined;
@@ -3267,20 +3278,40 @@ export class TurnRecovery {
 		return true;
 	}
 
-	/** Closes a retry saga whose credential wait or backoff sleep was aborted. */
-	async #endCancelledRetry(): Promise<false> {
+	/**
+	 * Closes a retry saga whose credential wait or backoff sleep was aborted. A user
+	 * stop (`stopped`) ends the turn as well ({@link #recordStoppedTurn}); a process
+	 * exit or a newer prompt leaves the turn as its failed attempt left it.
+	 */
+	async #endCancelledRetry(failed: AssistantMessage, stopped: boolean): Promise<false> {
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
 		this.#retryAbortController = undefined;
-		await this.#host.emitSessionEvent({
-			type: "auto_retry_end",
-			success: false,
-			attempt,
-			finalError: "Retry cancelled",
-		});
-		this.#clearPendingRetryErrors();
-		this.resolveRetry();
+		try {
+			if (stopped) await this.#recordStoppedTurn(failed);
+		} finally {
+			await this.#host.emitSessionEvent({
+				type: "auto_retry_end",
+				success: false,
+				attempt,
+				finalError: RETRY_CANCELLED,
+			});
+			this.#clearPendingRetryErrors();
+			this.resolveRetry();
+		}
 		return false;
+	}
+
+	/**
+	 * Ends a turn whose retry the user stopped with an aborted record after its failed
+	 * attempt, as an abort during a request ends one. Stopping is the user's choice, so
+	 * the turn is over: the attempt's key marker (`credentialUnavailable`) must not leave
+	 * it for `omp --restore` to send again. The attempt is persisted first, so the record
+	 * follows it in the session file.
+	 */
+	async #recordStoppedTurn(failed: AssistantMessage): Promise<void> {
+		await this.persistTerminalEmptyErrorTurn(failed);
+		this.#host.appendSessionMessage(createTurnAbortRecord(failed, RETRY_CANCELLED, Date.now()));
 	}
 
 	/**
@@ -3373,9 +3404,12 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * Cancel in-progress retry.
+	 * Cancel an in-progress retry. The cancel stops the turn (the user's Esc, an
+	 * abort) unless `cutOff`: a process exit or shutdown cuts the turn off instead,
+	 * and `omp --restore` goes on with it as its failed attempt left it.
 	 */
-	abortRetry(): void {
+	abortRetry(options: { cutOff?: boolean } = {}): void {
+		this.#retryCancelStopsTurn = options.cutOff !== true;
 		this.#retryAbortController?.abort();
 		// Note: _retryAttempt is reset in the catch block of _autoRetry
 		this.resolveRetry();

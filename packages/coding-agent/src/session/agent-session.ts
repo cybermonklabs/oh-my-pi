@@ -6799,7 +6799,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		// Stop fallback extension timers before aborting deferred work they could enqueue.
 		this.#fallbackExtensionTimers?.clearAll();
-		this.abortRetry();
+		// Disposal cuts a turn waiting to retry off rather than stopping it, so `omp --restore` can go on with it.
+		this.#recovery.abortRetry({ cutOff: true });
 		this.abortCompaction();
 		// A process exit cuts a turn still in flight off instead of stopping it:
 		// label it as interrupted so `omp --restore` goes on with it.
@@ -12112,6 +12113,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		preserveCompaction?: boolean;
 	}): Promise<void> {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
+		// An abort stops a turn waiting to retry; a shutdown's abort only cuts it off, so `omp --restore` goes on with it.
+		const cutOff = options?.reason === INTERRUPTED_TURN_ERROR;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		// Latch only when the interrupt stops something; an idle Esc would otherwise fold
 		// every later background completion for the rest of the session.
@@ -12141,7 +12144,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#abortAutolearnCapture();
 			for (const controller of this.#usagePreflightAbortControllers) controller.abort();
 			for (const controller of this.#imageDescriptionAbortControllers) controller.abort(options?.reason);
-			this.abortRetry();
+			this.#recovery.abortRetry({ cutOff });
 			this.#promptGeneration++;
 			// Cancel any awaited pre-dispatch setup (e.g. Hindsight auto-recall) so the
 			// admitted submission unwinds now instead of at the recall timeout (#12668).
@@ -12176,7 +12179,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// agent_end is awaited: a message_end stalled in an extension hook would
 			// otherwise hold /new and every abort for the full handler timeout.
 			await this.#drainAgentEndMaintenance();
-			this.abortRetry();
+			this.#recovery.abortRetry({ cutOff });
 			await this.#cancelPostPromptTasks();
 			// `/compact` disconnects the agent subscription until its finally block.
 			// Do not let abort-and-replace callers start a new prompt before that cleanup
@@ -13359,7 +13362,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	// Auto-Retry
 	// =========================================================================
 
-	/** Cancel an in-progress retry. */
+	/** Cancel an in-progress retry: the user stops the turn, so it ends as aborted and `omp --restore` leaves it. */
 	abortRetry(): void {
 		this.#recovery.abortRetry();
 	}
