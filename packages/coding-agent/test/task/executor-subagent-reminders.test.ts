@@ -369,7 +369,12 @@ describe("runSubprocess yield reminders", () => {
 			session,
 		});
 		try {
-			const result = await runSubagentFollowUpTurn({ ...baseOptions, id: "subagent-race", message: "batch work" });
+			const result = await runSubagentFollowUpTurn({
+				...baseOptions,
+				id: "subagent-race",
+				message: "batch work",
+				storeMaskCwd: "/tmp",
+			});
 			expect(prompts).toBe(2);
 			expect(result.exitCode).toBe(0);
 			expect(result.output).toContain('"batch": true');
@@ -423,6 +428,7 @@ describe("runSubprocess yield reminders", () => {
 				...baseOptions,
 				id: "subagent-prewait",
 				message: "batch work",
+				storeMaskCwd: "/tmp",
 			});
 			expect(calls.slice(0, 2)).toEqual(["waitForIdle", "setYield"]);
 			expect(result.exitCode).toBe(0);
@@ -457,7 +463,12 @@ describe("runSubprocess yield reminders", () => {
 			// Three waits still streaming: installing now would corrupt the active
 			// turn, and waiting forever would hang the pool, so fail instead.
 			await expect(
-				runSubagentFollowUpTurn({ ...baseOptions, id: "subagent-wedged", message: "batch work" }),
+				runSubagentFollowUpTurn({
+					...baseOptions,
+					id: "subagent-wedged",
+					message: "batch work",
+					storeMaskCwd: "/tmp",
+				}),
 			).rejects.toThrow("stayed busy through 3 ownership waits");
 			expect(calls).toEqual(["waitForIdle", "waitForIdle", "waitForIdle"]);
 			expect(calls).not.toContain("setYield");
@@ -501,7 +512,12 @@ describe("runSubprocess yield reminders", () => {
 			.mockResolvedValueOnce(stale)
 			.mockResolvedValue(revived);
 		try {
-			const result = await runSubagentFollowUpTurn({ ...baseOptions, id: "subagent-revive", message: "batch work" });
+			const result = await runSubagentFollowUpTurn({
+				...baseOptions,
+				id: "subagent-revive",
+				message: "batch work",
+				storeMaskCwd: "/tmp",
+			});
 			expect(ensureLive).toHaveBeenCalledTimes(3);
 			expect(calls).toEqual(["setYield:stale", "setYield:revived"]);
 			expect(result.exitCode).toBe(0);
@@ -533,7 +549,12 @@ describe("runSubprocess yield reminders", () => {
 			.mockResolvedValue(sessions[3]!);
 		try {
 			await expect(
-				runSubagentFollowUpTurn({ ...baseOptions, id: "subagent-churn", message: "batch work" }),
+				runSubagentFollowUpTurn({
+					...baseOptions,
+					id: "subagent-churn",
+					message: "batch work",
+					storeMaskCwd: "/tmp",
+				}),
 			).rejects.toThrow("was replaced during every install attempt");
 			expect(ensureLive).toHaveBeenCalledTimes(4);
 		} finally {
@@ -585,6 +606,7 @@ describe("runSubprocess yield reminders", () => {
 				...baseOptions,
 				id: "subagent-revive-wake",
 				message: "batch work",
+				storeMaskCwd: "/tmp",
 			});
 			expect(calls).toEqual(["setYield:stale", "waitForIdle:revived", "setYield:revived"]);
 			expect(result.exitCode).toBe(0);

@@ -449,6 +449,7 @@ it("keeps a follow-up turn's report when a peer message arrives right after it",
 			message: "report again",
 			structured: false,
 			artifactsDir: child.artifactsDir,
+			storeMaskCwd: path.join(root, "home", "work"),
 		});
 		expect(followUp.output).toBe("FOLLOW_UP_REPORT");
 		expect((await child.peerInbox)?.body).toBe("PEER_REPLY");
@@ -512,6 +513,7 @@ it("keeps a structured follow-up's yield when a peer message arrives as a turn o
 			agent: { name: "task", description: "test", systemPrompt: "test", tools: ["read"], source: "bundled" },
 			message: "report again",
 			artifactsDir: child.artifactsDir,
+			storeMaskCwd: path.join(root, "home", "work"),
 		});
 		expect((await peerSent)?.outcome).not.toBe("failed");
 		expect(followUp.output).toContain("FOLLOW_UP");

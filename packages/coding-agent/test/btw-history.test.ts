@@ -388,18 +388,22 @@ describe("BtwHistoryStore", () => {
 		// Unhashed, these would resolve to the sibling `worker` scope and outside the artifacts directory.
 		const unsafeScopes = ["../sessions/worker", "../../escape"];
 		for (const scope of unsafeScopes) {
-			const store = await BtwHistoryStore.open(artifactsDir, scope);
+			const store = await BtwHistoryStore.open(artifactsDir, { scope });
 			await store.upsert(record(`topic-${unsafeScopes.indexOf(scope)}`));
 			await store.flush();
 		}
-		const sibling = await BtwHistoryStore.open(artifactsDir, "worker");
+		const sibling = await BtwHistoryStore.open(artifactsDir, { scope: "worker" });
 		await sibling.upsert(record("sibling"));
 		await sibling.flush();
 
 		expect((await BtwHistoryStore.open(artifactsDir)).getRecords()).toEqual([]);
-		expect((await BtwHistoryStore.open(artifactsDir, "worker")).getRecords()).toEqual([record("sibling")]);
-		expect((await BtwHistoryStore.open(artifactsDir, unsafeScopes[0])).getRecords()).toEqual([record("topic-0")]);
-		expect((await BtwHistoryStore.open(artifactsDir, unsafeScopes[1])).getRecords()).toEqual([record("topic-1")]);
+		expect((await BtwHistoryStore.open(artifactsDir, { scope: "worker" })).getRecords()).toEqual([record("sibling")]);
+		expect((await BtwHistoryStore.open(artifactsDir, { scope: unsafeScopes[0] })).getRecords()).toEqual([
+			record("topic-0"),
+		]);
+		expect((await BtwHistoryStore.open(artifactsDir, { scope: unsafeScopes[1] })).getRecords()).toEqual([
+			record("topic-1"),
+		]);
 
 		const scopedRoot = path.join(artifactsDir, "btw-history", "sessions");
 		const files = (await fs.readdir(directory, { recursive: true, withFileTypes: true }))

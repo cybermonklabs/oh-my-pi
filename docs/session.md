@@ -556,6 +556,7 @@ Ordinary completed appends update memory and local file storage synchronously on
 - Saving an editor draft forces a discoverable header and stores `draft.txt` with a marker; if the draft disappears while only startup metadata remains, close removes that draft-only session. Explicit `ensureOnDisk()` sessions remain resumable.
 - Concurrent completed appends supersede an in-flight atomic rewrite with an authoritative full-body rewrite so stale publication cannot clobber them.
 - A queued indexed full rewrite stays non-current until confirmation. When a fenced rewrite lands after a successor supersedes it, the manager validates that durable body and records its byte size before retrying the newer transcript.
+- With `secrets.maskSessionStore` on, every write above masks a copy of what it writes: each entry, the header, the title slot, the title the store keeps and the draft. Under file storage, the title and the recaps recorded in `history.db` are masked too. Secret values the agent holds become markers such as `[REDACTED:env:NAME]`, and the live entries keep the values. The manager reads the setting per session, at each write: the code that gives it to a session binds it to that session's settings (`setStoreMasking`), so the sessions of one process can differ. A manager that no session binds reads the settings that the process itself runs with, from every layer, the project config included. See [Secrets in stored sessions](./secrets.md#secrets-in-stored-sessions).
 
 ### Durability operations
 

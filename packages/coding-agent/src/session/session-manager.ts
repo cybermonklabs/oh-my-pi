@@ -29,6 +29,14 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
+import { isSettingsInitialized, Settings } from "../config/settings";
+import {
+	recordMaskedHistory,
+	type SessionStoreMask,
+	type StoreMaskingBinding,
+	sessionStoreMaskFor,
+	settingsStoreMask,
+} from "../secrets/session-store-mask";
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
@@ -119,6 +127,7 @@ import {
 	worktreeSessionDirs,
 	writeTerminalBreadcrumb,
 } from "./session-paths";
+import { maskSessionEntry, maskTitleUpdate } from "./session-entry-mask";
 import { forgetExternalizedImages, prepareEntryForPersistence } from "./session-persistence";
 import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
@@ -1297,6 +1306,8 @@ export class SessionManager {
 	#inMemoryArtifactCounter = 0;
 
 	#suppressBreadcrumb = false;
+	/** `secrets.maskSessionStore` and agent dir of the session this manager writes for ({@link setStoreMasking}). */
+	#storeMasking: StoreMaskingBinding | undefined;
 	/**
 	 * The last breadcrumb this manager wrote marked a lazy fresh session whose
 	 * JSONL is not yet on disk. Cleared (and the crumb re-stamped non-fresh) once
@@ -2115,8 +2126,37 @@ export class SessionManager {
 		return this.#writer;
 	}
 
-	#lineFor(entry: FileEntry): string {
-		return `${stringifyJson(prepareEntryForPersistence(entry, this.#blobs)) ?? "null"}\n`;
+	/**
+	 * Bind this manager's writes to its session's `secrets.maskSessionStore` and agent dir: the
+	 * binding's `enabled` is read at each write, so a change reaches the next one, and the mask holds
+	 * the secrets.yml of its `agentDir`, the one the session's provider obfuscator reads
+	 * (`storeMaskingOf`). The code that gives the manager to a session binds it.
+	 */
+	setStoreMasking(binding: StoreMaskingBinding): void {
+		this.#storeMasking = binding;
+	}
+
+	/** This manager's store masking binding, or `undefined` while no session bound it ({@link setStoreMasking}). */
+	get storeMasking(): StoreMaskingBinding | undefined {
+		return this.#storeMasking;
+	}
+
+	/**
+	 * The mask this manager's writes apply now, or `null` while the setting is off. Off, no source
+	 * is read and no masker is built. A manager no session bound reads the setting and the agent dir
+	 * of this thread's global settings (the instance `Settings.init` made, or a worker's mirror) and
+	 * masks nothing without them. `null`, not `undefined`, so a writer that took one mask for a whole
+	 * body can pass "no mask" on without a default parameter asking again.
+	 */
+	storeMask(): SessionStoreMask | null {
+		const bound = this.#storeMasking;
+		if (bound) return sessionStoreMaskFor(bound.enabled(), { cwd: this.#cwd, agentDir: bound.agentDir });
+		if (!isSettingsInitialized()) return null;
+		return settingsStoreMask(Settings.instance, this.#cwd);
+	}
+
+	#lineFor(entry: FileEntry, mask = this.storeMask()): string {
+		return `${stringifyJson(prepareEntryForPersistence(maskSessionEntry(entry, mask), this.#blobs)) ?? "null"}\n`;
 	}
 
 	/**
@@ -2205,18 +2245,24 @@ export class SessionManager {
 			});
 	}
 
-	#titleSlotLine(): string {
-		return serializeTitleSlot({
-			title: this.#sessionName,
-			source: this.#titleSource,
-			updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
-		});
+	#titleSlotLine(mask = this.storeMask()): string {
+		return serializeTitleSlot(
+			maskTitleUpdate(
+				{
+					title: this.#sessionName,
+					source: this.#titleSource,
+					updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
+				},
+				mask,
+			),
+		);
 	}
 
 	/** Serialize the whole file lazily, retaining only one JSONL record at a time. */
 	#serializeBody(): SessionFileBody {
-		const titleLine = this.#titleSlotLine();
-		const headerLine = this.#lineFor(this.#header);
+		const mask = this.storeMask();
+		const titleLine = this.#titleSlotLine(mask);
+		const headerLine = this.#lineFor(this.#header, mask);
 		const entries = this.#entries;
 		const entryCount = entries.length;
 		const manager = this;
@@ -2232,7 +2278,7 @@ export class SessionManager {
 					yield line;
 				}
 				for (let index = 0; index < entryCount; index++) {
-					const line = manager.#lineFor(entries[index]!);
+					const line = manager.#lineFor(entries[index]!, mask);
 					const lineBytes = Buffer.byteLength(line, "utf8");
 					bytes += lineBytes;
 					bytesSinceGc += lineBytes;
@@ -2746,7 +2792,7 @@ export class SessionManager {
 					return;
 				}
 				try {
-					await this.#storage.updateSessionTitle(sessionFile, update);
+					await this.#storage.updateSessionTitle(sessionFile, maskTitleUpdate(update, this.storeMask()));
 				} catch {
 					this.#rewriteRequired = true;
 					if (!(await this.#runFencedAtomicRewrite(epoch))) return;
@@ -3038,6 +3084,7 @@ export class SessionManager {
 	cloneCurrentSession(options?: { persist?: boolean }): SessionManager {
 		const persist = options?.persist ?? this.#persist;
 		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage);
+		clone.#storeMasking = this.#storeMasking;
 		clone.#suppressBreadcrumb = true;
 		clone.restoreState(this.captureState());
 		if (!persist) {
@@ -3851,6 +3898,7 @@ export class SessionManager {
 	): Promise<SessionManager> {
 		const sessionDir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage);
 		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
+		manager.#storeMasking = this.#storeMasking;
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		manager.#resetToNewSession({ taskPromptCacheKey: this.#header.taskPromptCacheKey });
 		manager.#sessionName = this.#sessionName;
@@ -4497,7 +4545,7 @@ export class SessionManager {
 			await this.#writeDraftOnlySessionMarker();
 			this.#draftOnlySessionCleanupArmed = true;
 		}
-		await this.#storage.writeText(draftPath, text);
+		await this.#storage.writeText(draftPath, this.storeMask()?.maskText(text) ?? text);
 	}
 
 	async consumeDraft(): Promise<string | null> {
@@ -4636,7 +4684,7 @@ export class SessionManager {
 		// Keep the recent-sessions title index current so welcome-screen lookups
 		// never have to content-scan this session's file.
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			recordSessionTitle(this.#sessionId, title);
+			recordMaskedHistory(this, title, "title", stored => recordSessionTitle(this.#sessionId, stored));
 		}
 
 		this.#notifySessionNameListeners();
@@ -4694,7 +4742,7 @@ export class SessionManager {
 	 */
 	recordRecap(recap: string): void {
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
-			recordSessionRecap(this.#sessionId, this.#cwd, recap);
+			recordMaskedHistory(this, recap, "recap", stored => recordSessionRecap(this.#sessionId, this.#cwd, stored));
 		}
 	}
 
@@ -5488,6 +5536,10 @@ export class SessionManager {
 	 * workspace roots are dropped, and the source's `session_init` contracts
 	 * become inert `source_session_init` custom entries so revival never
 	 * mistakes them for the fork's own.
+	 *
+	 * `storeMasking` is the binding of the session that owns the fork ({@link setStoreMasking}).
+	 * The fork is written here, before any session binds the new manager, so it masks by its
+	 * owner's `secrets.maskSessionStore` and agent dir; without it, as an unbound manager does.
 	 */
 	static async forkFrom(
 		sourcePath: string,
@@ -5501,11 +5553,13 @@ export class SessionManager {
 			resetInheritedCost?: boolean;
 			repairInterruptedTail?: boolean;
 			seance?: boolean;
+			storeMasking?: StoreMaskingBinding;
 		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
+		if (options?.storeMasking) manager.setStoreMasking(options.storeMasking);
 
 		// A missing source must fail instead of forking an empty parentless session:
 		// the loader swallows ENOENT by default for fresh-session opens, so fork opts out.
