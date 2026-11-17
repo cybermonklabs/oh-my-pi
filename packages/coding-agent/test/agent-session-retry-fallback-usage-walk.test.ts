@@ -660,4 +660,31 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			});
 		}
 	});
+
+	describe("the fallback before a turn keeps its rule", () => {
+		it("passes over a fallback at the reserve when the primary is spent before its first request", async () => {
+			// The walk after a failed request switches to a fallback at the reserve.
+			// The check before the model call does not: on a spent primary it moves
+			// to the first fallback that is neither spent nor at the reserve.
+			stubUsageReads({
+				[formatModelString(PRIMARY)]: depletedRead("usage"),
+				[formatModelString(FALLBACK)]: {
+					state: "reserve",
+					accounts: [{ credentialId: 1, credentialType: "oauth", state: "reserve", remainingFraction: 0.05 }],
+				},
+			});
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
+				walkSettings(PRIMARY, { "retry.fallbackChains": chainOf(FALLBACK, NEXT_FALLBACK) }),
+			);
+
+			await runTurn(run.session, "Start on a spent primary");
+
+			expect(requestedModels).toEqual([formatModelString(NEXT_FALLBACK)]);
+			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+	});
 });
