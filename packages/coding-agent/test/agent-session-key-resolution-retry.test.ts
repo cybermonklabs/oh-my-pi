@@ -48,7 +48,7 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { hasRestorableTurn, SESSION_EXIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { activeBranch, type SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { collectSubSessions } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
@@ -196,6 +196,20 @@ function taskDetails(messages: readonly AgentMessage[]): TaskToolDetails | undef
 /** Requests that offered `toolName`: the turns of a session, not its label or title requests. */
 function turnsOffering(model: MockModel, toolName: string): MockCall[] {
 	return model.calls.filter(call => (call.context.tools ?? []).some(tool => tool.name === toolName));
+}
+
+/**
+ * The entries of the branch that ends at `leafId`, root first. A local walk, so the file
+ * also runs where the shared branch helper does not exist yet (the base and the release).
+ */
+function branchTo(entries: readonly SessionEntry[], leafId: string | null): SessionEntry[] {
+	const byId = new Map(entries.map(entry => [entry.id, entry]));
+	const branch: SessionEntry[] = [];
+	for (let entry = leafId ? byId.get(leafId) : undefined; entry;) {
+		branch.unshift(entry);
+		entry = entry.parentId ? byId.get(entry.parentId) : undefined;
+	}
+	return branch;
 }
 
 /** How the last message of `branch` ended its turn, when an assistant wrote it. */
@@ -1035,7 +1049,7 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 			const subSessions = Object.values(await collectSubSessions(parentFile));
 			expect(subSessions).toHaveLength(1);
 			const worker = subSessions[0]!;
-			const branch = activeBranch(worker.entries, worker.leafId);
+			const branch = branchTo(worker.entries, worker.leafId);
 			// The stop ended the worker's turn after its marked attempt.
 			expect(assistantTail(branch)).toEqual({
 				stopReason: "aborted",
