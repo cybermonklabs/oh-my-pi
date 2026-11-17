@@ -8,6 +8,7 @@ import type { EffectiveExtensionRoots } from "../capability/types";
 import { shouldInlineToolDescriptors } from "../config/inline-tool-descriptors-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelString } from "../config/model-resolver";
+import { type AnySetting, type SettingChange, settingValuesEqual } from "../config/registry";
 import type { Settings } from "../config/settings";
 import type { CustomTool, CustomToolContext } from "../extensibility/custom-tools/types";
 import { clearPluginRootsAndCaches } from "../discovery/helpers";
@@ -39,6 +40,8 @@ import type { AgentDefinition } from "../task/types";
 import evalPreludeNoticePrompt from "../prompts/system/eval-prelude-notice.md" with { type: "text" };
 import perCallModelNoticePrompt from "../prompts/system/per-call-model-notice.md" with { type: "text" };
 import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md" with { type: "text" };
+import heldToolRefusalPrompt from "../prompts/system/settings-held-tool-refusal.md" with { type: "text" };
+import settingsNoticePrompt from "../prompts/system/settings-notice.md" with { type: "text" };
 import skillNoticePrompt from "../prompts/system/skill-notice.md" with { type: "text" };
 import taskAgentNoticePrompt from "../prompts/system/task-agent-notice.md" with { type: "text" };
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
@@ -305,6 +308,7 @@ const EVAL_PRELUDE_NOTICE_MESSAGE_TYPE = "eval-prelude-notice";
 const SKILL_NOTICE_MESSAGE_TYPE = "skill-notice";
 const TASK_AGENT_NOTICE_MESSAGE_TYPE = "task-agent-notice";
 const PER_CALL_MODEL_NOTICE_MESSAGE_TYPE = "per-call-model-notice";
+const SETTINGS_NOTICE_MESSAGE_TYPE = "settings-notice";
 
 /** Custom entry holding the digest of the base prompt the branch's primary model calls are built from. */
 const SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE = "system-prompt-digest";
@@ -413,6 +417,54 @@ function isPerCallModelAdvertisement(value: unknown): value is PerCallModelAdver
 		isStringList(value.allowlist) &&
 		typeof value.parentModelWithheld === "boolean"
 	);
+}
+
+/**
+ * A rebuild that a settings change started while the prompt was bound, held until a cut the cut rule admits or a
+ * lapsed prompt cache entry ({@link SessionTools.absorbHeldSettingsRebuild}).
+ */
+interface HeldSettingsRebuild {
+	/** Tells holds apart: a cut admitted under one hold does not count for a later one. */
+	readonly id: number;
+	/** Each changed setting's value when the hold began: the value the bound prompt was built with. */
+	readonly before: Map<AnySetting, unknown>;
+	/** The value the settings notice last gave each setting under this hold. */
+	readonly announced: Map<AnySetting, unknown>;
+	/** Enabled tools a held reconcile unregistered, with the settings whose change did it; calls are refused. */
+	readonly disabledTools: Map<string, readonly AnySetting[]>;
+	/** Tools a held reconcile registered for the enabled set; the rebuild activates them. */
+	readonly enabledTools: Set<string>;
+	/** The tool lists the last settings notice gave. */
+	announcedTools: string;
+	/** A tool reconcile is held: the rebuild reapplies the enabled set. */
+	reconcile: boolean;
+	/** A skill rediscovery is held: the rebuild lists the registry's skills in the prompt. */
+	skills: boolean;
+}
+
+/** Data of a {@link SETTINGS_NOTICE_MESSAGE_TYPE} message: setting ids and tool names, never a value. */
+interface SettingsNoticeDetails {
+	settings: string[];
+	disabledTools: string[];
+	enabledTools: string[];
+}
+
+/** A changed setting as the settings notice and the held-tool refusal print it; a credential's values are withheld. */
+interface SettingChangeView {
+	id: string;
+	secret: boolean;
+	previous?: string;
+	next?: string;
+}
+
+function settingChangeView(setting: AnySetting, previous: unknown, next: unknown): SettingChangeView {
+	if (setting.isCredential) return { id: setting.id, secret: true };
+	return {
+		id: setting.id,
+		secret: false,
+		previous: previous === undefined ? "unset" : JSON.stringify(previous),
+		next: next === undefined ? "unset" : JSON.stringify(next),
+	};
 }
 
 /**
@@ -548,6 +600,9 @@ export class SessionTools {
 	#basePromptRoster: PromptRoster | undefined;
 	/** A frozen roster change is held out of {@link #baseSystemPrompt}, riding notices instead. */
 	#promptRosterHeld = false;
+	/** The rebuild a settings change started on a bound prompt, held; see {@link #holdSettingsRebuild}. */
+	#heldSettingsRebuild: HeldSettingsRebuild | undefined;
+	#nextSettingsRebuildId = 1;
 	/** Full enabled set, including tools demoted from the model-visible surface. */
 	#enabledToolNames = new Set<string>();
 	/**
@@ -1524,7 +1579,26 @@ export class SessionTools {
 		);
 	}
 
+	/**
+	 * A forced rebuild commits the live state, so it ends a held settings rebuild: the tools that rebuild enables join
+	 * `toolNames` and the prompt lists the registry's skills when it held a rediscovery.
+	 */
 	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
+		const held = forcePromptRefresh ? this.#heldSettingsRebuild : undefined;
+		if (!held) return this.#applyToolSet(toolNames, forcePromptRefresh, signal);
+		this.#heldSettingsRebuild = undefined;
+		const promptSkills = this.#promptSkills;
+		if (held.skills) this.#promptSkills = this.#skills;
+		try {
+			await this.#applyToolSet([...toolNames, ...held.enabledTools], true, signal);
+		} catch (error) {
+			this.#promptSkills = promptSkills;
+			this.#heldSettingsRebuild ??= held;
+			throw error;
+		}
+	}
+
+	async #applyToolSet(toolNames: string[], forcePromptRefresh: boolean, signal?: AbortSignal): Promise<void> {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
@@ -2513,12 +2587,21 @@ export class SessionTools {
 		};
 	}
 
-	/** Rediscovers reloadable skills and rebuilds the system prompt's skill list. */
-	refreshSkills(): Promise<void> {
+	/**
+	 * Rediscovers reloadable skills and rebuilds the system prompt's skill list. With `settingsChange` on a bound
+	 * prompt only the registry follows now ({@link reloadSkills}); the prompt's list waits for the held rebuild
+	 * ({@link #holdSettingsRebuild}) and {@link takeSkillNotice} tells the model.
+	 */
+	refreshSkills(options?: { settingsChange?: readonly SettingChange[] }): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			await this.#rediscoverSkills();
-			this.#promptSkills = this.#skills;
-			await this.refreshBaseSystemPrompt();
+			const held = this.#holdSettingsRebuild(options?.settingsChange);
+			if (held) {
+				held.skills = true;
+			} else {
+				this.#promptSkills = this.#skills;
+				await this.refreshBaseSystemPrompt();
+			}
 			this.#host.notifyCommandMetadataChanged();
 		});
 	}
@@ -2719,15 +2802,22 @@ export class SessionTools {
 	 * unregisters disallowed ones, and reapplies the enabled set with one forced
 	 * prompt rebuild — unconditionally unless `refreshPrompt` is false, then only
 	 * when the tool set changed. Unrelated selections and MCP/extension tools are
-	 * preserved.
+	 * preserved. With `settingsChange` on a bound prompt the registry still follows
+	 * the settings, but the reapply is held ({@link #holdSettingsRebuild}): an
+	 * unregistered tool stays declared and its calls are refused, a registered one
+	 * waits for the rebuild. A change of the `xd://` state is never held.
 	 */
-	reconcileBuiltinTools({ refreshPrompt = true }: { refreshPrompt?: boolean } = {}): Promise<void> {
+	reconcileBuiltinTools({
+		refreshPrompt = true,
+		settingsChange,
+	}: { refreshPrompt?: boolean; settingsChange?: readonly SettingChange[] } = {}): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			const reconcile = this.#reconcileSettingsGatedTools;
 			if (!reconcile || this.#host.isDisposed()) return;
 			// Sampled before the delta: it still carries names mounted under the
 			// `xd://` state the reconcile may release.
-			const enabled = new Set(this.getEnabledToolNames());
+			const wasEnabled = new Set(this.getEnabledToolNames());
+			const enabled = new Set(wasEnabled);
 			const delta = await reconcile(name => this.#builtInToolNames.has(name));
 			for (const name of delta.removed) {
 				enabled.delete(name);
@@ -2743,21 +2833,163 @@ export class SessionTools {
 				if (delta.xdev) delta.xdev.decorateExecution = tool => this.#wrapToolForAcpPermission(tool);
 			}
 			if (!refreshPrompt && !xdevChanged && delta.added.length === 0 && delta.removed.length === 0) return;
-			await this.#applyActiveToolsByName([...enabled], true);
+			const held = xdevChanged ? undefined : this.#holdSettingsRebuild(settingsChange);
+			if (!held) {
+				await this.#applyActiveToolsByName([...enabled], true);
+				return;
+			}
+			held.reconcile = true;
+			const gates = settingsChange?.map(change => change.setting) ?? [];
+			for (const name of delta.removed) {
+				// A tool registered under this hold was never active: it just leaves the pending list.
+				if (!held.enabledTools.delete(name) && wasEnabled.has(name)) held.disabledTools.set(name, gates);
+			}
+			for (const { name, activate } of delta.added) {
+				// A tool disabled under this hold is still declared: registered again, its calls run again.
+				if (!held.disabledTools.delete(name) && activate) held.enabledTools.add(name);
+			}
 		});
 	}
 
 	/**
 	 * Rebuilds the stable base prompt for the current tools and model.
 	 * `commitIf` lets asynchronous producers discard a stale rebuild atomically
-	 * after its inputs have been superseded.
+	 * after its inputs have been superseded. With `settingsChange` on a bound
+	 * prompt the rebuild is held ({@link #holdSettingsRebuild}). Any other rebuild
+	 * renders the live settings anyway, so it runs a held one first.
 	 */
-	refreshBaseSystemPrompt(commitIf?: () => boolean): Promise<void> {
+	refreshBaseSystemPrompt(
+		commitIf?: () => boolean,
+		options?: { settingsChange?: readonly SettingChange[] },
+	): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
+			if (this.#holdSettingsRebuild(options?.settingsChange)) return;
+			await this.#absorbHeldSettingsRebuild();
 			const prepared = await this.#prepareBaseSystemPrompt();
 			if (commitIf && !commitIf()) return;
 			prepared?.commit?.();
 		});
+	}
+
+	/**
+	 * Holds the rebuild that `settingsChange` started when the prompt is bound (a prefix-bound model has answered
+	 * under it): the system prompt and the tool definitions keep their bytes, {@link takeSettingsNotice} tells the
+	 * model what changed, and {@link absorbHeldSettingsRebuild} runs the rebuild at a cut the cut rule admits or once
+	 * the prompt cache entry lapses. Returns the hold to extend, or undefined when the rebuild runs now: no settings
+	 * change started it, or nothing is bound. Unlike {@link #implicitRebuildBinding}, the prompt the session was
+	 * created with binds as soon as a reply was produced under it, before any rebuild committed.
+	 */
+	#holdSettingsRebuild(settingsChange: readonly SettingChange[] | undefined): HeldSettingsRebuild | undefined {
+		if (!settingsChange) return undefined;
+		if (this.#host.model()?.thinking?.prefixBinding !== true || this.#latestReply() === undefined) return undefined;
+		let held = this.#heldSettingsRebuild;
+		if (!held) {
+			held = {
+				id: this.#nextSettingsRebuildId++,
+				before: new Map(),
+				announced: new Map(),
+				disabledTools: new Map(),
+				enabledTools: new Set(),
+				// The model knows of no disabled or enabled tool yet ({@link takeSettingsNotice}'s key for empty lists).
+				announcedTools: JSON.stringify([[], []]),
+				reconcile: false,
+				skills: false,
+			};
+			this.#heldSettingsRebuild = held;
+		}
+		for (const { setting, previous } of settingsChange) {
+			if (!held.before.has(setting)) held.before.set(setting, previous);
+		}
+		return held;
+	}
+
+	/** Id of the held settings rebuild ({@link #holdSettingsRebuild}), or undefined when none is held. */
+	get heldSettingsRebuildId(): number | undefined {
+		return this.#heldSettingsRebuild?.id;
+	}
+
+	/**
+	 * Runs the held settings rebuild when `due` (the cut rule admitted a cut under the hold, or the prompt cache
+	 * entry the cut rule reads has lapsed) or when the prompt is no longer bound ({@link #holdSettingsRebuild}).
+	 */
+	absorbHeldSettingsRebuild(due: boolean): Promise<void> {
+		return this.runToolRegistryMutation(async () => {
+			if (!this.#heldSettingsRebuild || this.#host.isDisposed()) return;
+			const bound = this.#host.model()?.thinking?.prefixBinding === true && this.#latestReply() !== undefined;
+			if (!due && bound) return;
+			await this.#absorbHeldSettingsRebuild();
+		});
+	}
+
+	/** Runs a held settings rebuild: the live settings, tool set and skills go into the prompt. */
+	async #absorbHeldSettingsRebuild(): Promise<void> {
+		const held = this.#heldSettingsRebuild;
+		if (!held) return;
+		if (held.reconcile) {
+			// The forced apply ends the hold and activates the tools it enables.
+			await this.#applyActiveToolsByName(
+				this.getEnabledToolNames().filter(name => !held.disabledTools.has(name)),
+				true,
+			);
+			return;
+		}
+		this.#heldSettingsRebuild = undefined;
+		const promptSkills = this.#promptSkills;
+		if (held.skills) this.#promptSkills = this.#skills;
+		try {
+			const prepared = await this.#prepareBaseSystemPrompt();
+			prepared?.commit?.();
+		} catch (error) {
+			this.#promptSkills = promptSkills;
+			this.#heldSettingsRebuild ??= held;
+			throw error;
+		}
+	}
+
+	/**
+	 * Builds the hidden notice of a held settings rebuild: each changed setting with the value the prompt was built
+	 * with and the value in force (a credential's values withheld), the tools the change disabled, whose calls are
+	 * refused, and the tools it enables at the rebuild. Gives only what changed since the last such notice.
+	 */
+	takeSettingsNotice(): CustomMessage<SettingsNoticeDetails> | undefined {
+		const held = this.#heldSettingsRebuild;
+		if (!held) return undefined;
+		const changes: SettingChangeView[] = [];
+		for (const [setting, before] of held.before) {
+			const known = held.announced.has(setting) ? held.announced.get(setting) : before;
+			const value = setting.get(this.#host.settings);
+			if (settingValuesEqual(value, known)) continue;
+			changes.push(settingChangeView(setting, known, value));
+			held.announced.set(setting, value);
+		}
+		const disabledTools = [...held.disabledTools.keys()];
+		const enabledTools = [...held.enabledTools];
+		const tools = JSON.stringify([disabledTools, enabledTools]);
+		if (changes.length === 0 && tools === held.announcedTools) return undefined;
+		held.announcedTools = tools;
+		return {
+			role: "custom",
+			customType: SETTINGS_NOTICE_MESSAGE_TYPE,
+			content: prompt.render(settingsNoticePrompt, { changes, disabledTools, enabledTools }),
+			details: { settings: changes.map(change => change.id), disabledTools, enabledTools },
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		};
+	}
+
+	/**
+	 * Why a call to `name` is refused: a held settings rebuild unregistered it while its definition stays in the
+	 * bound prompt. Undefined for every other tool.
+	 */
+	heldToolRefusal(name: string): string | undefined {
+		const held = this.#heldSettingsRebuild;
+		const gates = held?.disabledTools.get(name);
+		if (!held || !gates) return undefined;
+		const changes = gates.map(setting =>
+			settingChangeView(setting, held.before.get(setting), setting.get(this.#host.settings)),
+		);
+		return prompt.render(heldToolRefusalPrompt, { tool: name, changes });
 	}
 
 	async #prepareBaseSystemPrompt(isCurrent?: () => boolean): Promise<SystemPromptPreparation | undefined> {
@@ -2911,7 +3143,11 @@ export class SessionTools {
 
 			let refreshed: SystemPromptPreparation | undefined;
 			try {
-				refreshed = await this.runToolRegistryMutation(() => this.#prepareBaseSystemPrompt(isCurrent));
+				// This rebuild renders the live settings, so a held settings rebuild runs first.
+				refreshed = await this.runToolRegistryMutation(async () => {
+					await this.#absorbHeldSettingsRebuild();
+					return this.#prepareBaseSystemPrompt(isCurrent);
+				});
 			} catch (refreshErr) {
 				logger.debug("Memory backend prompt refresh after beforeAgentStartPrompt failed", {
 					backend: backend.id,

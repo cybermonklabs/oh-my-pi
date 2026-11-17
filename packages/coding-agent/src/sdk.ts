@@ -86,7 +86,7 @@ import {
 import { formatModelSelectorValue, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { buildServiceTierByFamily } from "./config/service-tier";
-import { bindEffects, combine } from "./config/registry";
+import { bindEffects, combine, type SettingChange } from "./config/registry";
 import { Settings } from "./config/settings";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
@@ -5292,9 +5292,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// `tools.format` catalog dialect, personality, …), so a bulk change rebuilds once.
 		// Hide Secrets first switches outbound obfuscation on the live obfuscator (earlier
 		// placeholders keep deobfuscating, the first switch-on builds it): the prompt
-		// reports its state.
-		cfgSystemPromptInputs.listen(session, async (next, previous) => {
-			if (next.secretsEnabled !== previous.secretsEnabled) {
+		// reports its state. Each settings-started rebuild below passes the change, so a
+		// bound prompt holds it until a cut or a lapsed cache entry (`SessionTools`).
+		cfgSystemPromptInputs.listenChanges(session, async settingsChange => {
+			if (settingsChange.some(change => change.setting === cfgSecretsEnabled)) {
 				try {
 					if (cfgSecretsEnabled.get(settings) && !obfuscator) {
 						const built = await buildSecretObfuscator(cwd, agentDir, options.agentDir);
@@ -5310,7 +5311,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 			if (session.isDisposed) return;
 			try {
-				await session.refreshBaseSystemPrompt();
+				await session.refreshBaseSystemPrompt(undefined, { settingsChange });
 			} catch (error) {
 				session.emitNotice("error", `Failed to rebuild the system prompt after a settings change: ${error}`);
 			}
@@ -5326,17 +5327,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// prompt once per coalesced change. Restricted (structured) sessions keep the
 		// exact host-provided tool list they were built with.
 		if (!restrictToolNames) {
-			const reconcileGatedTools = async (options?: { refreshPrompt?: boolean }): Promise<void> => {
+			const reconcileGatedTools = async (options: {
+				refreshPrompt?: boolean;
+				settingsChange: readonly SettingChange[];
+			}): Promise<void> => {
 				try {
 					await session.reconcileBuiltinTools(options);
 				} catch (error) {
 					session.emitNotice("error", `Failed to apply tool settings: ${error}`);
 				}
 			};
-			cfgSessionToolGates.listen(session, () => reconcileGatedTools());
+			cfgSessionToolGates.listenChanges(session, settingsChange => reconcileGatedTools({ settingsChange }));
 			// `find.enabled: auto` follows the judge role; a role change only touches
 			// the prompt when it actually adds or removes `find`.
-			cfgModelRoles.listen(session, () => reconcileGatedTools({ refreshPrompt: false }));
+			cfgModelRoles.listenChanges(session, settingsChange =>
+				reconcileGatedTools({ refreshPrompt: false, settingsChange }),
+			);
 		}
 		// Backfill the resumed advisor spend without blocking startup: the scan
 		// runs after the session is live, so `--resume` no longer scales with the
@@ -5454,9 +5460,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 		if (agentKind === "main") {
 			// Live skills/commands discovery settings: rediscover skills and file slash
-			// commands, rebuild the prompt, and notify command pickers (TUI/RPC/ACP).
-			// `enabledProviders`/`disabledProviders` gate foreign provider sources.
-			cfgSkillsAndCommandsDiscovery.listen(session, () => session.refreshSkillsAndCommands());
+			// commands, rebuild the prompt (held on a bound prompt), and notify command
+			// pickers (TUI/RPC/ACP). `enabledProviders`/`disabledProviders` gate foreign
+			// provider sources.
+			cfgSkillsAndCommandsDiscovery.listenChanges(session, settingsChange =>
+				session.refreshSkillsAndCommands({ settingsChange }),
+			);
 			// Live `extensions` / `disabledExtensions`: a settings-governed extension whose
 			// source leaves the rediscovered set is suspended (handlers, commands, tools,
 			// renderers, shortcuts, file fallbacks) and a returning source resumes. Modules

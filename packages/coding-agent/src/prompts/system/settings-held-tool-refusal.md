@@ -1,0 +1,1 @@
+`{{tool}}` is disabled by a settings change ({{#list changes join="; "}}`{{id}}`{{#if secret}} changed{{else}}: `{{previous}}` → `{{next}}`{{/if}}{{/list}}). Its definition stays in your tool list until the next prompt rebuild; do not call it.

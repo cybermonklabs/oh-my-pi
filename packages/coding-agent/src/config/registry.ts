@@ -325,6 +325,32 @@ export abstract class Derived<T> {
 		if ("settings" in scope) scope.addDisposer?.(unsubscribe);
 		return unsubscribe;
 	}
+
+	/**
+	 * {@link listen} for a caller that needs what changed: `onChange` receives each leaf setting of this
+	 * value whose effective value differs from the previous call (or the subscription), with that earlier value.
+	 */
+	listenChanges(scope: ScopeLike, onChange: (changes: readonly SettingChange[]) => void | Promise<void>): () => void {
+		const settings = settingsOf(scope);
+		const sources = this.sources;
+		const seen = sources.map(source => source.get(settings));
+		return this.listen(scope, () => {
+			const changes: SettingChange[] = [];
+			for (let i = 0; i < sources.length; i++) {
+				const value = sources[i].get(settings);
+				if (settingValuesEqual(value, seen[i])) continue;
+				changes.push({ setting: sources[i], previous: seen[i] });
+				seen[i] = value;
+			}
+			return onChange(changes);
+		});
+	}
+}
+
+/** A leaf setting whose effective value changed, with its value before the change ({@link Derived.listenChanges}). */
+export interface SettingChange {
+	readonly setting: AnySetting;
+	readonly previous: unknown;
 }
 
 /**

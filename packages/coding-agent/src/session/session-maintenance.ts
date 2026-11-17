@@ -101,7 +101,7 @@ import {
 	resolveMethodSettings,
 	resolveSpeculationMethod,
 } from "./compaction-methods";
-import { type ContextCut, decideSessionContextCut } from "./context-cut";
+import { type ContextCut, decideSessionContextCut, promptCacheEntryLapsed } from "./context-cut";
 import {
 	assistantTurnDelivered,
 	convertToLlm,
@@ -640,6 +640,8 @@ export class SessionMaintenance {
 		{ key: string; length: number; first: AgentMessage | undefined }
 	>();
 	readonly #host: SessionMaintenanceHost;
+	/** Called with every automatic cut the cut rule admits ({@link onContextCutAdmitted}). */
+	readonly #cutAdmittedListeners = new Set<(cut: ContextCut) => void>();
 
 	get #model(): Model | undefined {
 		return this.#host.model();
@@ -787,21 +789,39 @@ export class SessionMaintenance {
 	admitsContextCut(cut: ContextCut): boolean {
 		const model = this.#model;
 		// No model: no prices or window to weigh the cut with.
-		if (!model) return true;
+		const admitted =
+			!model ||
+			decideSessionContextCut(
+				{
+					model,
+					cacheEntry: this.#nextPromptCacheEntry(),
+					compactionSettings: this.#compactionSettings,
+					branch: this.#host.sessionManager.getBranchView(),
+					promptTokens: cut.promptTokens ?? this.#cutPromptTokens(),
+					now: Date.now(),
+				},
+				cut,
+			).admitted;
+		if (admitted) for (const listener of this.#cutAdmittedListeners) listener(cut);
+		return admitted;
+	}
+
+	/** Calls `listener` with each cut {@link admitsContextCut} admits, until the returned function is called. */
+	onContextCutAdmitted(listener: (cut: ContextCut) => void): () => void {
+		this.#cutAdmittedListeners.add(listener);
+		return () => this.#cutAdmittedListeners.delete(listener);
+	}
+
+	/** Whether the prompt cache entry the next request would read has lapsed, by the cut rule's lapse condition. */
+	promptCacheLapsed(): boolean {
+		return promptCacheEntryLapsed(this.#nextPromptCacheEntry(), Date.now());
+	}
+
+	/** The prompt cache entry the cut rule reads: none when the next request asks for no caching, so it counts as lapsed. */
+	#nextPromptCacheEntry(): ObservedPromptCacheEntry | undefined {
 		const retention = cfgProvidersCacheRetention.get(this.#host.settings);
 		const cachesNext = resolveCacheRetention(retention === "auto" ? undefined : retention) !== "none";
-		return decideSessionContextCut(
-			{
-				model,
-				// A next request that asks for no caching reads no entry: every cut counts as lapsed.
-				cacheEntry: cachesNext ? this.#host.observedPromptCacheEntry() : undefined,
-				compactionSettings: this.#compactionSettings,
-				branch: this.#host.sessionManager.getBranchView(),
-				promptTokens: cut.promptTokens ?? this.#cutPromptTokens(),
-				now: Date.now(),
-			},
-			cut,
-		).admitted;
+		return cachesNext ? this.#host.observedPromptCacheEntry() : undefined;
 	}
 
 	/** `P` for a cut whose site did not measure it: the live context, floored by the stored estimate. */

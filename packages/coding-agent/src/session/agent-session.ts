@@ -135,7 +135,7 @@ import {
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, isServiceTierForFamily, serviceTierSettingToTier } from "../config/service-tier";
-import { combine, type SettingsScope } from "../config/registry";
+import { combine, type SettingChange, type SettingsScope } from "../config/registry";
 import { type Settings, withActiveSettings } from "../config/settings";
 import { RawSseDebugBuffer } from "@oh-my-pi/pi-tui/apps/debug/raw-sse-buffer";
 import { getEditStore } from "../edit/store";
@@ -1151,6 +1151,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#movedFromEmptySessionFile?: string;
 
 	readonly #maintenance: SessionMaintenance;
+	/** Id of the held settings rebuild under which the cut rule last admitted a cut; see {@link #absorbHeldSettingsRebuildIfDue}. */
+	#settingsRebuildCutHold: number | undefined;
+	/** {@link admitsContextCut} is deciding a provider-context cut, which never runs a held settings rebuild. */
+	#admittingProviderContextCut = false;
 
 	// Branch summarization state
 	#branchSummaryAbortController: AbortController | undefined = undefined;
@@ -3040,6 +3044,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#maintenance.renderArchiveForModel(context.messages),
 			),
 		);
+		// A held settings rebuild runs at the first request after a cut the cut rule admits under the hold that
+		// rewrites everything after the system prompt and tools anyway (its kept prefix `p` is at most their tokens:
+		// a compaction, a forced rescue), or after the prompt cache entry lapses ({@link #absorbHeldSettingsRebuildIfDue}).
+		// A cheaper cut, such as a tail prune, would turn into a rewrite of the whole prompt. A provider-context cut
+		// (an image clamp) is made in a request whose prompt is already taken, so it never counts.
+		this.addDisposer(
+			this.#maintenance.onContextCutAdmitted(cut => {
+				const held = this.#tools.heldSettingsRebuildId;
+				if (held === undefined || this.#admittingProviderContextCut) return;
+				if (cut.prefixTokens <= computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision)) {
+					this.#settingsRebuildCutHold = held;
+				}
+			}),
+		);
+		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#absorbHeldSettingsRebuildIfDue()));
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
 		// The gate is registered only while a cap is set: any before-model-call gate also turns a user abort
 		// before the next request into a clean stop, which leaves no interrupted turn for `/retry`.
@@ -3294,12 +3313,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#releasePowerAssertion();
 			this.#acquirePowerAssertion();
 		});
-		cfgWorkspacePromptInputs.listen(this, async () => {
+		cfgWorkspacePromptInputs.listenChanges(this, async settingsChange => {
 			const rootsChanged = await this.#syncSettingsWorkspaceDirectories();
 			const autoQaEnabled = isAutoQaEnabled(this.settings);
 			const autoQaChanged = autoQaEnabled !== this.#autoQaEnabled;
 			this.#autoQaEnabled = autoQaEnabled;
-			if ((rootsChanged || autoQaChanged) && !this.#isDisposed) await this.refreshBaseSystemPrompt();
+			if ((rootsChanged || autoQaChanged) && !this.#isDisposed) {
+				await this.refreshBaseSystemPrompt(undefined, { settingsChange });
+			}
 		});
 	}
 
@@ -5785,8 +5806,27 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		return this.#ttsr.afterToolCall(ctx);
 	}
+
 	/**
-	 * Emits the extension `tool_call` event for a loop-dispatched call at
+	 * Runs a held settings rebuild ({@link SessionTools.absorbHeldSettingsRebuild}) once the cut rule admitted a cut
+	 * under the hold or the prompt cache entry it reads has lapsed, whichever comes first. Called before every main
+	 * request, and before a user prompt takes its hidden notices, so the request carries the rebuilt prompt.
+	 */
+	async #absorbHeldSettingsRebuildIfDue(): Promise<void> {
+		const held = this.#tools.heldSettingsRebuildId;
+		if (held === undefined) return;
+		const due = this.#settingsRebuildCutHold === held || this.#maintenance.promptCacheLapsed();
+		try {
+			await this.#tools.absorbHeldSettingsRebuild(due);
+		} catch (error) {
+			logger.warn("Held settings rebuild failed", { error: String(error) });
+		}
+	}
+
+	/**
+	 * Refuses a call to a tool a held settings rebuild disabled, with the reason
+	 * ({@link SessionTools.heldToolRefusal}). Otherwise emits the extension
+	 * `tool_call` event for a loop-dispatched call at
 	 * arg-prep time — before concurrency scheduling, `tool_execution_start`,
 	 * and the wrapper's approval gate. A handler block becomes a blocked tool
 	 * result; a handler `input` revision becomes the arguments the loop
@@ -5796,6 +5836,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
+		const heldRefusal = this.#tools.heldToolRefusal(ctx.tool.name);
+		if (heldRefusal) return { block: true, reason: heldRefusal };
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
@@ -7496,10 +7538,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Re-resolves settings-gated tools (built-in `*.enabled` toggles, eval backends,
 	 * image/speech generation, `tools.xdev`) against live settings and refreshes the
 	 * prompt once (`refreshPrompt: false` refreshes only if the tool set changed). The
-	 * SDK runs it whenever a gating setting changes; other runtime owners may call it
-	 * after changing an input the gate reads.
+	 * SDK runs it whenever a gating setting changes, passing the change, which holds
+	 * the reapply on a bound prompt (see {@link SessionTools.reconcileBuiltinTools});
+	 * other runtime owners may call it after changing an input the gate reads.
 	 */
-	reconcileBuiltinTools(options?: { refreshPrompt?: boolean }): Promise<void> {
+	reconcileBuiltinTools(options?: {
+		refreshPrompt?: boolean;
+		settingsChange?: readonly SettingChange[];
+	}): Promise<void> {
 		return this.#tools.reconcileBuiltinTools(options);
 	}
 
@@ -7611,9 +7657,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * Rediscovers skills and file-based slash commands for the current cwd, rebuilds the
 	 * system prompt, and notifies command-metadata listeners (TUI autocomplete, RPC/ACP
-	 * command lists). Serialized so overlapping reloads apply in call order.
+	 * command lists). Serialized so overlapping reloads apply in call order. A refresh a
+	 * settings change started passes `settingsChange`, which holds the prompt rebuild on a
+	 * bound prompt (see {@link SessionTools.refreshSkills}).
 	 */
-	refreshSkillsAndCommands(): Promise<void> {
+	refreshSkillsAndCommands(options?: { settingsChange?: readonly SettingChange[] }): Promise<void> {
 		const refresh = this.#skillsAndCommandsRefresh
 			.catch(() => {})
 			.then(async () => {
@@ -7624,7 +7672,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				});
 				// Resets the capability cache again, rediscovers skills, rebuilds the prompt,
 				// and fires the command-metadata notification after both lists are current.
-				await this.#tools.refreshSkills();
+				await this.#tools.refreshSkills(options);
 			});
 		this.#skillsAndCommandsRefresh = refresh;
 		return refresh;
@@ -7717,9 +7765,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#memory.settle();
 	}
 
-	/** Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. */
-	refreshBaseSystemPrompt(commitIf?: () => boolean): Promise<void> {
-		return this.#tools.refreshBaseSystemPrompt(commitIf);
+	/**
+	 * Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. A rebuild a settings
+	 * change started passes `settingsChange`, which holds it on a bound prompt (see
+	 * {@link SessionTools.refreshBaseSystemPrompt}).
+	 */
+	refreshBaseSystemPrompt(
+		commitIf?: () => boolean,
+		options?: { settingsChange?: readonly SettingChange[] },
+	): Promise<void> {
+		return this.#tools.refreshBaseSystemPrompt(commitIf, options);
 	}
 
 	/** Replaces connected MCP tools and enables them immediately. */
@@ -7802,9 +7857,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * Whether an automatic cut of the context runs now, by the cut rule over this session's figures
 	 * (`decideContextCut` in the agent's compaction package); see {@link SessionMaintenance.admitsContextCut}.
+	 * Called by provider-context transforms, whose cut never runs a held settings rebuild.
 	 */
 	admitsContextCut(cut: ContextCut): boolean {
-		return this.#maintenance.admitsContextCut(cut);
+		this.#admittingProviderContextCut = true;
+		try {
+			return this.#maintenance.admitsContextCut(cut);
+		} finally {
+			this.#admittingProviderContextCut = false;
+		}
 	}
 
 	/** Strip image content from the current branch and persist the rewrite. */
@@ -9668,6 +9729,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (this.#promptGeneration !== generation) {
 				return false;
 			}
+			// A held settings rebuild that is due goes into this request's prompt instead of its notice.
+			await this.#absorbHeldSettingsRebuildIfDue();
+			if (this.#promptGeneration !== generation) {
+				return false;
+			}
 			if (autoPrewalk) {
 				const decision = await autoPrewalk;
 				if (this.#promptGeneration !== generation) {
@@ -9707,6 +9773,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const taskAgentNotice = isUserQueuedMessage(message) ? this.#tools.takeTaskAgentNotice() : undefined;
 			const perCallModelNotice = isUserQueuedMessage(message) ? this.#tools.takePerCallModelNotice() : undefined;
 			const skillNotice = isUserQueuedMessage(message) ? this.#tools.takeSkillNotice() : undefined;
+			const settingsNotice = isUserQueuedMessage(message) ? this.#tools.takeSettingsNotice() : undefined;
 			if (
 				xdevMountNotice ||
 				toolRosterNotice ||
@@ -9714,7 +9781,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				sessionAgentNotice ||
 				taskAgentNotice ||
 				perCallModelNotice ||
-				skillNotice
+				skillNotice ||
+				settingsNotice
 			) {
 				messages.splice(
 					xdevMountNoticeIndex,
@@ -9726,6 +9794,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					...(taskAgentNotice ? [taskAgentNotice] : []),
 					...(perCallModelNotice ? [perCallModelNotice] : []),
 					...(skillNotice ? [skillNotice] : []),
+					...(settingsNotice ? [settingsNotice] : []),
 				);
 			}
 

@@ -81,6 +81,27 @@ function recentMainPrompts(branch: readonly SessionEntry[]): number[] {
 }
 
 /**
+ * Milliseconds since the newest real or warm request touched `cacheEntry`, and its lifetime: the model's declared one
+ * for the entry's tier, else five minutes or one hour. Without an entry the idle time is endless and the lifetime 0.
+ */
+function promptCacheEntryAge(
+	cacheEntry: ContextCutSession["cacheEntry"],
+	now: number,
+): { idleMs: number; lifeMs: number } {
+	if (!cacheEntry) return { idleMs: Number.POSITIVE_INFINITY, lifeMs: 0 };
+	return {
+		idleMs: now - cacheEntry.touchedAt,
+		lifeMs: cacheEntry.ttlMs ?? LIFETIME_MS[cacheEntry.tier === "long" ? "1h" : "5m"],
+	};
+}
+
+/** Whether `cacheEntry` has lapsed at `now`, as the cut rule's lapse condition reads it; no entry counts as lapsed. */
+export function promptCacheEntryLapsed(cacheEntry: ContextCutSession["cacheEntry"], now: number): boolean {
+	const { idleMs, lifeMs } = promptCacheEntryAge(cacheEntry, now);
+	return idleMs >= lifeMs;
+}
+
+/**
  * Decide whether `cut` runs now, from the live session's figures, and log the decision.
  *
  * The cache entry the next request would read sets the idle time (since the newest real or warm
@@ -97,6 +118,7 @@ export function decideSessionContextCut(session: ContextCutSession, cut: Context
 	const lifetime: CacheLifetime = cacheEntry?.tier === "long" ? "1h" : "5m";
 	const prices = getCacheTokenPrices(model.cost, lifetime, promptTokens, session.now);
 	const overBudget = contextWindow > 0 && promptTokens > promptBudgetTokens(contextWindow, compactionSettings);
+	const { idleMs, lifeMs } = promptCacheEntryAge(cacheEntry, session.now);
 	const decision = decideContextCut({
 		promptTokens,
 		prefixTokens: cut.prefixTokens,
@@ -105,8 +127,8 @@ export function decideSessionContextCut(session: ContextCutSession, cut: Context
 		writePrice: prices.write,
 		thresholdTokens: contextWindow > 0 ? resolveThresholdTokens(contextWindow, compactionSettings) : 0,
 		growthPerRequest: meanPromptGrowth(recentMainPrompts(session.branch)),
-		idleMs: cacheEntry ? session.now - cacheEntry.touchedAt : Number.POSITIVE_INFINITY,
-		lifeMs: cacheEntry ? (cacheEntry.ttlMs ?? LIFETIME_MS[lifetime]) : 0,
+		idleMs,
+		lifeMs,
 		forced: cut.forced || overBudget,
 	});
 	logger.debug("Context cut decision", {
