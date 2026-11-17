@@ -2574,14 +2574,16 @@ export class TurnRecovery {
 								),
 							);
 							if (!found) continue;
-							// Like the check before a model call, this switch sets no credit
-							// redemption. A route found from the spent model, with no fallback
-							// active yet, records the walk's role, as the base's switch onto the
-							// spent model did before that check ran; a held candidate keeps its
-							// own walk role.
+							// Like the check before a model call, this switch is pinned, so
+							// `cooldown-expiry` does not bring the primary back after it, and
+							// sets no credit redemption. A route found from the spent model, with
+							// no fallback active yet, records the walk's role, as the base's switch
+							// onto the spent model did before that check ran; a held candidate
+							// keeps its own walk role.
 							const appliedRole = entries === heldEntries || this.#activeRetryFallback ? found.role : role;
 							return this.applyRetryFallbackCandidate(appliedRole, found.selector, currentSelector, {
 								...options,
+								pinFallback: true,
 								apiKey: found.apiKey,
 								reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
 							});

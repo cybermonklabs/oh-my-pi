@@ -289,6 +289,37 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(modelChanges).not.toContain(formatModelString(FALLBACK));
 		});
 
+		it("pins the fallback after a spent one, so the primary is not restored when its cooldown ends", async () => {
+			// The base switched onto the spent model, and the check before the next
+			// model call then switched to the fallback after it and pinned it.
+			// `cooldown-expiry` restores only an unpinned fallback's primary.
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
+				walkSettings(PRIMARY, {
+					"retry.fallbackChains": chainOf(FALLBACK, NEXT_FALLBACK),
+					"retry.fallbackRevertPolicy": "cooldown-expiry",
+				}),
+			);
+			let now = Date.now();
+			vi.spyOn(Date, "now").mockImplementation(() => now);
+
+			await runTurn(run.session, "Fail on the primary");
+			// Past every fallback cooldown (30 minutes at most), so only the pin keeps
+			// the session on the fallback.
+			now += 60 * 60 * 1000;
+			await runTurn(run.session, "Stay on the fallback after the cooldown");
+
+			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
+				formatModelString(NEXT_FALLBACK),
+				formatModelString(NEXT_FALLBACK),
+			]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
 		it("answers on the fallback after a spent one under the fail-closed reserve policy", async () => {
 			// Switching onto the spent model would let the check before its request
 			// end the turn with a fail-closed refusal although a usable fallback follows.
