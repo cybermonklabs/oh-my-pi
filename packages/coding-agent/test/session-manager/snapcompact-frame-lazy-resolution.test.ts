@@ -202,14 +202,19 @@ describe("lazy snapcompact frame resolution", () => {
 		const archive = await compactedArchive();
 		expect(new Set(archive.frames.map(frame => frame.cols)).size).toBe(2);
 		const frames = archive.frames.map(frame => frame.data);
-		const hashes = frames.map(data => new Bun.SHA256().update(Buffer.from(data, "base64")).digest("hex"));
 		const { sessionFile, sessionDir, compactionId } = await writeJournal(structuredClone(archive));
+		// Persistence externalizes the larger frames; the refs they were written under are the ones to come back.
+		const refs = [...(await Bun.file(sessionFile).text()).matchAll(/blob:sha256:[0-9a-f]{64}/g)].map(
+			match => match[0],
+		);
+		expect(refs.length).toBeGreaterThan(1);
 		await fsp.rm(getBlobsDir(), { recursive: true, force: true });
 
 		const resumed = await SessionManager.open(sessionFile, sessionDir, undefined, { suppressBreadcrumb: true });
-		expect(archiveFrames(resumed, compactionId).map(frame => frame.data)).toEqual(
-			hashes.map(hash => `blob:sha256:${hash}`),
-		);
+		const resumedRefs = archiveFrames(resumed, compactionId)
+			.map(frame => frame.data)
+			.filter(data => data.startsWith("blob:sha256:"));
+		expect(resumedRefs).toEqual(refs);
 		const messages = resumed.buildSessionContext().messages;
 		expect(new Set(imageDataIn(messages))).toEqual(new Set(frames));
 		expect(JSON.stringify(messages)).not.toContain("unavailable here");
