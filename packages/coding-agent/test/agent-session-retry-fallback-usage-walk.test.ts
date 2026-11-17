@@ -1305,6 +1305,64 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
+		it("answers on the Claude model the credit held back at the session's level when the spent fallback names a level", async () => {
+			// The spent target's selector names low. The held model was passed over
+			// before the target, so it keeps the session's level, high.
+			stubUsageReads({ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") });
+			const requests: string[] = [];
+			const mock = createMockModel({
+				provider: FABLE.provider,
+				id: FABLE.id,
+				responses: [
+					{
+						content: [
+							{ type: "thinking", thinking: "Signed reasoning.", thinkingSignature: "seed-signature" },
+							"Seeded turn",
+						],
+					},
+					refusalWithCredit(),
+				],
+				handler: { content: ["answered"] },
+			});
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: FABLE, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requests.push(`${formatModelString(model)} at ${options?.reasoning}`);
+					return mock.stream(model, context, options);
+				},
+			});
+			const run = startSession(
+				agent,
+				walkSettings(FABLE, {
+					"retry.maxRetries": 1,
+					"retry.fallbackChains": {
+						default: [formatModelString(OTHER_CLAUDE), `${formatModelString(CREDIT_TARGET)}:low`],
+					},
+					"retry.fallbackRevertPolicy": "cooldown-expiry",
+				}),
+				undefined,
+				Effort.High,
+			);
+			run.session.setThinkingLevel(Effort.High);
+			await runTurn(run.session, "Seed signed thinking");
+			const seeded = agent.state.messages.findLast(
+				(message): message is AssistantMessage => message.role === "assistant",
+			);
+			if (!seeded) throw new Error("Expected the seeded assistant message");
+			seeded.api = FABLE.api;
+
+			await runTurn(run.session, "Recover from the refusal");
+
+			expect(requests).toEqual([
+				`${formatModelString(FABLE)} at high`,
+				`${formatModelString(FABLE)} at high`,
+				`${formatModelString(OTHER_CLAUDE)} at high`,
+			]);
+			expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
 		it("answers on Fable with no switch when the spent target's own chain names Fable", async () => {
 			// The base switched onto the spent target, and the check before the next
 			// model call switched back to Fable, which the target's own chain names.
