@@ -30,7 +30,7 @@ Behavior notes:
 - RPC/ACP pin neutral defaults for settings declaring the corresponding `protocolDefault`, including task isolation/execution, memory, advisor, and advisor tier settings. RPC additionally pins async-job and bash/eval auto-background defaults. Explicit project/global config, `--config`, and isolated settings remain authoritative; on-disk config changes are watched in long-lived CLI RPC processes. Todo settings are not host-defaulted.
 - The process claims stdin before extension discovery, then parses it one non-empty JSONL line at a time. Malformed JSON emits a recoverable `command: "parse"` failure and does not terminate the loop.
 - At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions and transport limits.
-- Extension startup (`session_start`) runs after `ready`. While it runs, only `extension_ui_response` (an extension may be waiting on a dialog) and `set_ask_dialog` are handled; every other valid frame is read and waits, in order, until startup finishes (a malformed line still gets its `parse` failure at once). If stdin closes during startup, dialogs the extension awaits are rejected so startup can finish.
+- Extension startup (`session_start`) runs after `ready`. Every frame is dispatched as it arrives, so a command sent during startup is answered while startup still runs (a malformed line still gets its `parse` failure at once). A frame that starts a turn, changes the session, changes goal state, or drives the live voice session — `prompt`, `steer`, `follow_up`, `abort_and_prompt`, `new_session`, `switch_session`, `branch`, `fork`, `open_session`, `compact`, `navigate_tree`, `handoff`, `live_start`, `live_connect`, `live_stop`, `live_mute`, and `goal` with any op but `get` — waits for startup to finish. Startup finishes once the `session_start` and `resources_discover` handlers have returned, goal state is reconciled and the first `available_commands_update` is written. It does not wait for a turn that one of those handlers started, so a waiting frame runs while that turn still streams: a `prompt` without `streamingBehavior` then fails as on any streaming turn (see [While streaming](#while-streaming)), and a `steer` goes into that turn. All four live frames wait, and the ones read while startup ran resume in the order they were read: a `live_stop` sent during startup stops the `live_start` sent before it, and a `live_start` sent after a `live_stop` is the request that survives. What orders them is that all four are dispatched off the serial queue, so each begins its wait for startup as it is read, and the four resume in that order when startup ends. Every waiting frame except those four is ordered with the other commands and keeps the place it arrived in; the four live frames take no place in the serial queue at all — after startup as well as during it, so a `live_stop` or `live_mute` sent at any time is answered without waiting behind the commands queued ahead of it. Of the waiting frames, only the four user-input ones and `new_session`, `switch_session`, `branch`, `fork`, `open_session` and `navigate_tree` are numbered as they are read, and only a numbered frame can be withdrawn by an `abort`, `abort_and_prompt` or `abort_and_restore_queue` read after it. An `abort` sent after one of the four user-input frames withdraws it; after an `abort_and_prompt` it withdraws the prompt half only, while the abort half still runs and the frame still answers success. An `abort`, `abort_and_prompt` or `abort_and_restore_queue` read while a waiting `new_session`, `switch_session`, `fork` or `navigate_tree` is still held withdraws that frame too: when startup finishes it is answered `cancelled` instead of running. The withdrawal covers exactly the frames read while startup ran, including one that comes to its turn only after startup because another held frame was ahead of it; a `new_session`, `switch_session`, `fork` or `navigate_tree` read after startup always runs, whatever abort follows it. `branch` and `open_session` are not withdrawn, because their answers carry the branch text and the opened session's id besides `cancelled`; they run when startup finishes, as do the held frames with no cancelled answer at all — `compact`, `handoff`, `goal`, and the four live frames — whether or not an `abort` followed them. A command the dispatcher serializes behind one of the waiting frames it runs inline — `abort_and_prompt`, `new_session`, `switch_session`, `branch`, `fork`, `open_session`, `compact`, `navigate_tree`, `handoff`, and a `goal` that changes goal state — waits with it, while a command sent behind a waiting `prompt`, `steer`, `follow_up`, `live_start`, `live_connect`, `live_stop` or `live_mute` is answered at once, because those seven are dispatched in the background. `set_ask_dialog` is ordered with every other command rather than answered out of band, so a host that wants the ask dialog for a prompt sends it before that prompt. An `extension_ui_response` still reaches the dialog a startup handler awaits; if stdin closes during startup, dialogs the extension awaits are rejected so startup can finish.
 - When stdin closes, pending extension UI, host-tool, and host-URI requests are rejected; accepted commands are drained, the session is disposed, pending stdout is delivered, and normal shutdown exits with code `0`. A session-persistence failure still latched at disposal exits with code `1` after delivering its `notice` frame.
 - Responses/events are written as one JSON object per line.
 
@@ -76,7 +76,7 @@ For an oversized `agent_end` in either version, the encoder first removes the le
 
 Legacy clients may ignore the added ready fields and remain on v1. In v1, an oversized response becomes `success: false` with `error: "RPC response exceeded the transport limit"`; oversized events may have strings, arrays, or object fields elided. If a v2 logical frame exceeds 64 MiB after terminal-frame compaction, responses receive the same overflow error, other events produce `rpc_frame_error`, and `agent_end` falls back to an empty `messages` array plus `messageCount`. Large history APIs should use pagination rather than depending on arbitrarily large logical frames.
 
-Output goes directly to stdout while the reader keeps up. Under backpressure, the server spills pending bytes to a private temporary file and drains it in 64 KiB blocks, preserving frame order. This limits queued output memory at the cost of disk I/O and temporary disk usage, which can grow until the reader catches up. The file is removed when the backlog drains or the process shuts down. Output or spool failures are logged, dispose the session, and exit with code `1`.
+Output goes directly to stdout while the reader keeps up. The writer counts the bytes it has handed to stdout that are not yet flushed; once that backlog reaches 8 MiB, later frames spill to a private temporary file that drains in 64 KiB blocks, preserving frame order. Queued output memory stays at about 9 MiB per process (the 8 MiB threshold plus the physical frame that crosses it, at most 1 MiB, plus one 64 KiB drain block), and disk is used only past the threshold; temporary disk usage can grow until the reader catches up. The file is removed when the backlog drains or the process shuts down. Output or spool failures are logged, dispose the session, and exit with code `1`.
 
 Clients MUST continue reading stdout after closing stdin. Normal EOF and extension-requested shutdown wait for pending output delivery; a client that keeps its stdout pipe open without reading can delay exit indefinitely.
 
@@ -361,10 +361,12 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 - `agentInvoked: false`: the prompt finished locally (an extension or custom command that started no turn) or failed before reaching the agent.
 - `agentInvoked: true`: the prompt was dispatched or queued for agent work; normal completion reports when the agent **yielded** — see [Yield vs settled](#yield-vs-settled). An abort that wins before dispatch can still report `true` with `status: "aborted"`. A prompt dispatched as a fresh turn reports the first run that started after it was accepted, so a late `agent_end` from an earlier run never completes it. A prompt queued into a live run (`streamingBehavior`) reports at the first yield after its message left the queue. An `agent_end` with `yielded: false` (the agent is retrying, compacting, or answering a stop-time reminder) never completes a prompt.
 - `status`: `"completed"`, `"aborted"` (interrupted by `abort`, `abort_and_prompt`, or a session transition, or dropped by an abort before dispatch), or `"error"`.
-- `error` (only with `status: "error"`): `{ message, provider?, model?, httpStatus?, retryable, code? }`. `message` is the provider's error text with OMP-local diagnostics (such as saved request-dump paths) removed. `retryable` marks a transient failure; OMP's own automatic retries have already been exhausted. `code: "cost_cap"` means the session reached `session.maxCost` and OMP did not send the next request; the server keeps running, and later prompts end the same way until the cap is raised. A prompt that fails before reaching the agent also gets the legacy error response with the same `id` before its `prompt_result`.
+- `error` (only with `status: "error"`): `{ message, provider?, model?, httpStatus?, retryable, code? }`. `message` is the failed turn's `errorMessage`: the provider's error text, which never carries OMP-local diagnostics such as saved request-dump paths. `retryable` marks a transient failure; OMP's own automatic retries have already been exhausted. `code: "cost_cap"` means the session reached `session.maxCost` and OMP did not send the next request; the server keeps running, and later prompts end the same way until the cap is raised. A prompt that fails before reaching the agent also gets the legacy error response with the same `id` before its `prompt_result`.
 - `sessionSettled`: whether the session is already done when the result is written — see [Yield vs settled](#yield-vs-settled). `false` means background work can still wake the agent; a `session_settled` frame follows once it has.
 
 A failed provider turn is not a failed command: the prompt response is still `success: true`, and the turn ends with a normal terminal `agent_end` whose last assistant message has `stopReason: "error"`. Use `prompt_result.status` rather than parsing that message.
+
+An assistant message's `errorMessage` is the failure's own text (the provider's, or OMP's for a failure it detected itself); OMP's retry and classification decisions read it. `errorDisplayMessage`, when present, is how OMP shows that failure: it adds the rejected request's dump path, the response's retry hint, or a provider-specific explanation, and can name local paths. Show `errorDisplayMessage ?? errorMessage` to a user; decide on `errorMessage`.
 
 Local-only slash commands may emit `command_output` frames before completing. They do not emit `agent_end`.
 
@@ -417,7 +419,7 @@ Remove the first matching user-authored message from the selected pending queue:
 
 Companions and their prompt are enqueued and dequeued as a complete group, including in `one-at-a-time` mode. Once that group leaves the pending queue for delivery, a removal request cannot report success after only part of its context has been emitted.
 
-Agent-authored entries never match, including internal handoffs with `role: "user"` and `attribution: "agent"`. With duplicate text, each request removes only the first matching occurrence; repeating a successful request can remove another occurrence.
+Agent-authored entries never match, including internal handoffs with `role: "user"` and `attribution: "agent"`. Input an extension queued with `pi.sendUserInput(…, { tag })` never matches either, though it shows as a queue chip: the response carries only text, so removing it would lose the tag the extension matches it by; it stays queued and is delivered with its tag. With duplicate text, each request removes only the first matching occurrence; repeating a successful request can remove another occurrence.
 
 The check and removal are synchronous: `data.removed: false` means no matching user message is pending in that queue at dispatch time. Already-dequeued messages and inputs still being preprocessed cannot be cancelled by this command. Live-steered input may remain visible in queue snapshots until the transcript records it, even though it has already left the removable pending queue. It does not resend input, abort a turn, or change interruption behavior. Non-string `message` values and missing or invalid `queue` values produce an error response.
 
@@ -436,7 +438,7 @@ Move the first matching user-authored follow-up to the end of the steering queue
 {"id":"req_3","type":"response","command":"promote_queued_message","success":true,"data":{"promoted":true}}
 ```
 
-The command moves the existing queued message, including its attachments and contiguous preceding hidden user companions, without reprocessing or duplicating it. `message` matches exactly as for `remove_queued_message`, so agent-authored entries never match. With duplicate text, each request moves only the first matching follow-up; repeating a successful request can move another occurrence.
+The command moves the existing queued message, including its attachments and contiguous preceding hidden user companions, without reprocessing or duplicating it. `message` matches as for `remove_queued_message`, so agent-authored entries never match, except that input an extension queued with a `tag` can be promoted: promotion moves the message itself, so its tag is kept. With duplicate text, each request moves only the first matching follow-up; repeating a successful request can move another occurrence.
 
 `data.promoted: false` means no matching user follow-up is pending at dispatch time (for example, it was already delivered). Non-string `message` values produce an error response. Existing steering, follow-up, and interrupt modes still apply; promotion does not abort the model stream or guarantee cancellation of running tools. While the agent is idle, a promoted message starts a turn right away, including after a user `abort` — promoting is an explicit request to steer now. The move is reported as one `queue_update` in which the message has already left `followUp` and joined `steering`.
 
@@ -453,7 +455,7 @@ Take queued user input back and abort, atomically — the RPC equivalent of pres
 {"id":"req_4","type":"response","command":"abort_and_restore_queue","success":true,"data":{"steering":[{"text":"Use the existing parser"}],"followUp":[{"text":"Then run the tests","images":[{"type":"image","mimeType":"image/png","data":"..."}]}]}}
 ```
 
-Before aborting, the server withdraws every user-authored steering and follow-up message, including input the run already took from the queue but never recorded in the transcript: steering the aborted response claimed live, and steering or follow-ups dequeued for its next model call. Visible queued messages that an extension or agent sent (extension cards from `pi.sendMessage`, a parent agent's steer, agent-attributed prompts with their hidden companions, advisor cards) are not returned and not lost: once the run stops, the abort records them in the transcript without starting a turn, so the model sees them with the next prompt. Other hidden queued context is dropped: `display: false` custom messages (goal/plan/budget notices) and synthetic developer directives. The abort starts no turn from the old queue; if another source started a turn while it was finishing, the visible messages join that turn as follow-ups. A plain `abort` instead requeues stranded steers and drains them into a fresh turn; withdrawing them first with `remove_queued_message` races the agent loop.
+Before aborting, the server withdraws every user-authored steering and follow-up message, including input the run already took from the queue but never recorded in the transcript: steering the aborted response claimed live, and steering or follow-ups dequeued for its next model call. Input an extension queued with `pi.sendUserInput(…, { tag })` is not returned: the abort records it in the transcript with its tag. Visible queued messages that an extension or agent sent (extension cards from `pi.sendMessage`, a parent agent's steer, agent-attributed prompts with their hidden companions, advisor cards) are not returned and not lost: once the run stops, the abort records them in the transcript without starting a turn, so the model sees them with the next prompt. Other hidden queued context is dropped: `display: false` custom messages (goal/plan/budget notices) and synthetic developer directives. The abort starts no turn from the old queue; if another source started a turn while it was finishing, the visible messages join that turn as follow-ups. A plain `abort` instead requeues stranded steers and drains them into a fresh turn; withdrawing them first with `remove_queued_message` races the agent loop.
 
 `data.steering` and `data.followUp` list the withdrawn messages oldest first, as `{ text, images? }` with `text` being the queue-chip text, so a client can put them back in its editor. The command otherwise behaves like `abort`: it stops goal continuation, cancels input received before it that is not yet admitted (that input is dropped, not returned), and responds after the abort completes. Older runtimes reject this command. The TypeScript client exposes `abortAndRestoreQueue(): Promise<{ steering, followUp }>`.
 
@@ -582,7 +584,8 @@ RPC process to apply and verify the new configuration.
 
 `queuedMessages` holds the same displayable queue-chip text as the `queue_update`
 event below. Use this text with `remove_queued_message`, subject to its pending-queue
-boundary: live-steered input stays visible until recorded but is no longer removable.
+boundary: live-steered input stays visible until recorded but is no longer removable,
+and input an extension queued with a `tag` is listed but never removable.
 Clients should render the queue from these snapshots instead of tracking chips
 independently, and treat removal responses as confirmation rather than a second
 source of truth. `queuedMessageCount` also includes advisor cards and pending
@@ -742,6 +745,13 @@ for every process; until a host enables it, the `ask` tool keeps prompting with
 one `select` (plus `editor` for free text) per choice. Builds without the
 command answer with a failed `response`, so hosts should keep the `select`
 fallback when enabling fails.
+
+The frame is ordered with every other command rather than answered out of band,
+so a command queued ahead of it — one still waiting for startup included —
+delays when it takes effect. Send it before the prompt it applies to: an
+extension handler reads the setting when its run starts, so a handler run that
+started before the frame took effect keeps the setting from before it for each
+dialog it raises.
 
 ```json
 { "id": "req_ask", "type": "set_ask_dialog", "enabled": true }
@@ -910,7 +920,8 @@ against the last value sent — a mutation that leaves the snapshot unchanged
 (for example, an agent-authored aside that never renders as a chip) never
 re-emits. `steering`/`followUp` mirror `get_state`'s `queuedMessages` field and
 carry the queue-chip text accepted by `remove_queued_message` while the message
-is still pending. Live-steered messages stay listed until recorded in the
+is still pending (input an extension queued with a `tag` is listed but never
+removable). Live-steered messages stay listed until recorded in the
 transcript, even after they cease to be removable. Render the queue from this
 event rather than tracking chips independently, and treat removal replies as
 confirmation of a change rather than independent queue state.
@@ -1238,10 +1249,17 @@ such notice and dropped, and the `btw` or session change proceeds.
 
 Ordinary commands run on a serialized queue. Extension UI responses and host
 tool/URI updates/results bypass that queue, so they can complete a request
-while its command handler is waiting. `bash` also bypasses the serial queue and
-is tracked as background command work; its response may arrive out of order.
-`prompt` and `steer_subagent` start in queue order but await admission in the
-background, so their responses may also arrive after later commands'.
+while its command handler is waiting. `bash`, `predict_word`, `btw_cancel`,
+`abort_branch_summary` and the four live commands (`live_start`,
+`live_connect`, `live_stop` and `live_mute`) also bypass the serial queue and
+are tracked as background command work; their responses may arrive out of
+order. A `live_stop` or `live_mute` therefore takes effect without waiting for
+a command queued ahead of it, or for the connect a `live_start` is still
+running.
+`prompt`, `steer`, `follow_up` and `steer_subagent` start in queue order but
+await admission in the background, and `dictation_start` likewise answers only
+once recording has started, so their responses may also arrive after later
+commands'.
 
 ### Immediate ack vs completion
 

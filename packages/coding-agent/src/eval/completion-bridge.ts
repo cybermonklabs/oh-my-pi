@@ -13,13 +13,14 @@
  */
 
 import { type } from "@oh-my-pi/omptype";
-import { instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
+import { agentPauseGate, instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import { type Api, type AssistantMessage, Effort, type Model, type Tool } from "@oh-my-pi/pi-ai";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import { clampThinkingLevelForModel, getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { extractTextContent, extractToolCall, parseJsonPayload } from "../commit/utils";
 
-import type { ModelRegistry } from "../config/model-registry";
+import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import {
 	expandRoleAlias,
 	extractExplicitThinkingSelector,
@@ -382,7 +383,7 @@ async function executeCompletion(
 		try {
 			// Forward the session id so session-sticky OAuth credentials
 			// resolve (see #5325); without it a usable fallback looks keyless.
-			const apiKey = await registry.getApiKey(model, session.getSessionId?.() ?? undefined, { signal });
+			const apiKey = await probeModelApiKey(registry, model, session.getSessionId?.() ?? undefined, { signal });
 			if (!apiKey) {
 				attempt.outcome = "no-credentials";
 				lastError = new ToolError(
@@ -404,6 +405,9 @@ async function executeCompletion(
 					reasoning: candidate.reasoning,
 					disableReasoning: candidate.disableReasoning,
 					toolChoice: schema ? { type: "tool", name: STRUCTURED_TOOL_NAME } : undefined,
+					// An eval cell already running when `/pause` lands still runs,
+					// but its `completion()` call is a new request: hold it here.
+					beforeDispatch: agentPauseGate.dispatchHold(signal),
 				},
 				{ telemetry, oneshotKind: "eval_completion" },
 			);
@@ -419,7 +423,7 @@ async function executeCompletion(
 			throw new ToolError("completion() request aborted.");
 		}
 		if (response.stopReason === "error") {
-			lastError = new ToolError(response.errorMessage ?? "completion() request failed.");
+			lastError = new ToolError(errorDisplayText(response) ?? "completion() request failed.");
 			failAttempt(attempt, lastError, signal);
 			if (!signal.aborted && index < candidates.length - 1) continue;
 			throw lastError;

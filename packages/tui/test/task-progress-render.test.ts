@@ -76,13 +76,17 @@ describe("task progress rendering", () => {
 	it("shortens current and recent path arguments without rewriting search patterns", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const file = `${os.homedir()}/private/file`;
+		// A search pattern keeps the absolute path, and the card previews a tool's argument in 40
+		// cells, so a long home directory cuts it short. Its first 30 characters are always shown,
+		// and a rewritten pattern ("~/…") would not start with them.
+		const patternShown = file.slice(0, 30);
 		for (const [key, recent, args, expected] of [
 			["file_path", false, file, "~/private/file"],
 			["path", true, file, "~/private/file"],
 			["command", false, `cat <${file}`, "cat <~/private/file"],
 			["task", false, `Inspect ${file}`, "Inspect ~/private/file"],
 			["prompt", false, `Explain ${file}`, "Explain ~/private/file"],
-			["pattern", false, file, file],
+			["pattern", false, file, patternShown],
 		] as const) {
 			const progress = runningProgress(
 				recent
@@ -838,6 +842,129 @@ describe("task progress rendering", () => {
 				expect(visibleWidth(row)).toBeLessThanOrEqual(40);
 			}
 		}
+	});
+
+	// The `400 <JSON body>` an Anthropic rejection arrives as. Retry events carry
+	// this provider text; the task's display error adds omp's request-dump line,
+	// whose path holds a newline, so it wraps.
+	const creditBalanceProviderError =
+		'400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CgbLuqzvWZWRDTHtaVVMj"}';
+	const creditBalanceDisplayError = `${creditBalanceProviderError}\nraw-http-request=/tmp/omp\nlogs/http-400-requests/1.json`;
+
+	it("names what a waiting subagent waits for, not the provider's JSON envelope", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const progress = runningProgress({
+			retryState: {
+				attempt: 3,
+				maxAttempts: 10,
+				delayMs: 30_000,
+				errorMessage: creditBalanceProviderError,
+				startedAtMs: Date.now(),
+			},
+		});
+		const row = Bun.stripANSI(
+			findRow(
+				taskToolRenderer.renderResult(
+					{ content: [], details: detailsFor(progress) },
+					{ expanded: false, isPartial: true },
+					theme,
+				),
+				"retrying 3/10",
+			),
+		);
+
+		expect(row).toMatch(/retrying 3\/10 in [\d.]+s: 400 Your credit balance is too low/);
+		expect(row).not.toContain('{"type"');
+	});
+
+	it("names the provider's reason when a subagent's retries ran out", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const progress = runningProgress({
+			status: "failed",
+			retryFailure: {
+				attempt: 10,
+				errorMessage: creditBalanceProviderError,
+			},
+		});
+		const row = Bun.stripANSI(
+			findRow(
+				taskToolRenderer.renderResult(
+					{ content: [], details: detailsFor(progress) },
+					{ expanded: false, isPartial: true },
+					theme,
+				),
+				"auto-retry gave up",
+			),
+		);
+
+		expect(row).toContain("auto-retry gave up after 10 attempts: 400 Your credit balance is too low");
+	});
+
+	it("names the provider reason after a subagent's retries run out", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const text = Bun.stripANSI(
+			taskToolRenderer
+				.renderResult(
+					{
+						content: [],
+						details: {
+							projectAgentsDir: null,
+							totalDurationMs: 0,
+							results: [
+								finishedResult({
+									exitCode: 1,
+									error: creditBalanceDisplayError,
+									retryFailure: {
+										attempt: 10,
+										errorMessage: creditBalanceProviderError,
+									},
+								}),
+							],
+						},
+					},
+					{ expanded: false, isPartial: false },
+					theme,
+				)
+				.render(120)
+				.join("\n"),
+		);
+
+		expect(text).toContain("auto-retry gave up after 10 attempts: 400 Your credit balance is too low");
+		expect(text).not.toContain("invalid_request_error");
+	});
+
+	it("keeps the full diagnostic, with its request-dump path, in an expanded retry failure", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const text = Bun.stripANSI(
+			taskToolRenderer
+				.renderResult(
+					{
+						content: [],
+						details: {
+							projectAgentsDir: null,
+							totalDurationMs: 0,
+							results: [
+								finishedResult({
+									exitCode: 1,
+									error: creditBalanceDisplayError,
+									retryFailure: {
+										attempt: 10,
+										errorMessage: creditBalanceProviderError,
+									},
+								}),
+							],
+						},
+					},
+					{ expanded: true, isPartial: false },
+					theme,
+				)
+				.render(400)
+				.join("\n"),
+		);
+
+		expect(text).toContain("auto-retry gave up after 10 attempts: 400 Your credit balance is too low");
+		expect(text).toContain("raw-http-request=/tmp/omp");
+		expect(text).toContain("http-400-requests/1.json");
 	});
 });
 
