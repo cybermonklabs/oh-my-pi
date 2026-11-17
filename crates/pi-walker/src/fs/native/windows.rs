@@ -43,17 +43,20 @@ use windows_sys::{
 	},
 	Win32::{
 		Foundation::{
-			ERROR_DIRECTORY, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_INVALID_NAME,
+			ERROR_DIRECTORY, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_INVALID_FUNCTION,
+			ERROR_INVALID_NAME, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
 			ERROR_STOPPED_ON_SYMLINK, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
 			STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, UNICODE_STRING,
 		},
 		Storage::FileSystem::{
 			BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-			FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-			FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
-			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, FileDispositionInfo,
-			GetFileInformationByHandle, GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE,
-			SetFileInformationByHandle,
+			FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
+			FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+			FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+			FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+			FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
+			FileDispositionInfo, FileDispositionInfoEx, GetFileInformationByHandle,
+			GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE, SetFileInformationByHandle,
 		},
 		System::IO::{IO_STATUS_BLOCK, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
 	},
@@ -470,6 +473,13 @@ pub(crate) fn write_file_beneath(
 /// itself, as `RemoveDirectoryW` and [`std::fs::remove_dir`] remove it);
 /// without, it must not be one, so a directory symlink or junction fails, as
 /// `DeleteFileW` and [`std::fs::remove_file`] fail on it.
+///
+/// The mark uses POSIX semantics and ignores the read-only attribute, as
+/// [`std::fs::remove_file`] does through its `posix_delete`, so a read-only
+/// file is removed and its name is freed at once. A file system that does
+/// not know that class (`ERROR_INVALID_PARAMETER`, `ERROR_NOT_SUPPORTED`,
+/// `ERROR_INVALID_FUNCTION`; FAT, for one) gets the classic mark, as `std`
+/// falls back, which refuses a read-only file there as `DeleteFileW` does.
 pub(crate) fn remove_beneath(
 	s: &mut Scratch,
 	root: &Handle,
@@ -484,15 +494,47 @@ pub(crate) fn remove_beneath(
 		FILE_NON_DIRECTORY_FILE
 	};
 	let h = nt_open(s, at, name, DELETE_ACCESS, kind | FILE_OPEN_REPARSE_POINT)?;
-	let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-	// SAFETY: `disposition` is a live `FILE_DISPOSITION_INFO` of the size
-	// passed.
+	let posix = FILE_DISPOSITION_INFO_EX {
+		Flags: FILE_DISPOSITION_FLAG_DELETE
+			| FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+			| FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+	};
+	// SAFETY: `FileDispositionInfoEx` takes a `FILE_DISPOSITION_INFO_EX`.
+	match unsafe { set_information(&h, FileDispositionInfoEx, &posix) } {
+		Err(err)
+			if err.raw_os_error().is_some_and(|code| {
+				matches!(
+					code as u32,
+					ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION
+				)
+			}) =>
+		{
+			let classic = FILE_DISPOSITION_INFO { DeleteFile: true };
+			// SAFETY: `FileDispositionInfo` takes a `FILE_DISPOSITION_INFO`.
+			unsafe { set_information(&h, FileDispositionInfo, &classic) }
+		},
+		result => result,
+	}
+}
+
+/// `SetFileInformationByHandle` of `info` in the class `class` on `h`.
+///
+/// # Safety
+///
+/// `T` must be the structure `class` takes.
+unsafe fn set_information<T>(
+	h: &Handle,
+	class: FILE_INFO_BY_HANDLE_CLASS,
+	info: &T,
+) -> io::Result<()> {
+	// SAFETY: `info` is a live `T` of the size passed, which the caller
+	// vouches is what `class` takes.
 	let ok = unsafe {
 		SetFileInformationByHandle(
 			h.as_raw_handle(),
-			FileDispositionInfo,
-			(&raw const disposition).cast(),
-			size_of::<FILE_DISPOSITION_INFO>() as u32,
+			class,
+			std::ptr::from_ref(info).cast(),
+			size_of::<T>() as u32,
 		)
 	};
 	if ok == 0 {

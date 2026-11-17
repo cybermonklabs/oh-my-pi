@@ -587,8 +587,6 @@ export function expandEnvVarsDeep<T>(obj: T, extraEnv?: Record<string, string>):
 	return obj;
 }
 
-const utf8 = new TextDecoder();
-
 /**
  * Load files from a directory matching extensions.
  * Uses native glob for fast filesystem scanning with gitignore support.
@@ -646,13 +644,14 @@ export async function loadFilesFromDir<T>(
 	// Read all matching files in parallel through the shared content cache. A miss
 	// reads below the walked directory, following no symlink the walk did not list:
 	// a directory on the way, or the file, swapped for a symlink after the listing is
-	// refused like an unreadable file.
+	// refused like an unreadable file. A Blob decodes the bytes as `Bun.file().text()`
+	// does: UTF-8, or UTF-16 after its byte order mark.
 	const fileResults = await Promise.all(
 		matches.map(async match => {
 			const filePath = path.join(dir, match.path);
 			const content = await readCachedFile(filePath, async () => {
 				const read = await readFileBeneath({ root: dir, path: match.path, followSymlink: match.symlink });
-				return read.content === undefined ? null : utf8.decode(read.content);
+				return read.content === undefined ? null : await new Blob([read.content]).text();
 			});
 			return { filePath, content };
 		}),

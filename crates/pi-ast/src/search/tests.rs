@@ -622,3 +622,36 @@ async fn rewrite_writes_no_file_through_a_directory_swapped_after_the_read() {
 	let err = result.unwrap_err().to_string();
 	assert!(err.starts_with("Failed to write "), "{err}");
 }
+
+/// A search over a sparse file larger than memory reports it as a warning
+/// (`out of memory`, as `std::fs::read` fails) and searches the other files,
+/// instead of aborting the process.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn search_reports_a_sparse_file_larger_than_memory_and_goes_on() {
+	let tree = temp_tree(&[("small.py", "print(1)\n")]);
+	let file = fs::File::create(tree.root.join("huge.py")).unwrap();
+	if let Err(err) = file.set_len(1 << 50) {
+		eprintln!(
+			"UNKNOWN: no 1 PiB sparse file on this filesystem ({err}); the search was not checked"
+		);
+		return;
+	}
+	drop(file);
+	let vfs = Fs::native();
+	let found = candidates(&vfs, &tree.root, None, None).await;
+	assert_eq!(displays(&found), ["huge.py", "small.py"]);
+	let patterns = ["print($A)".to_string()];
+	let query = Query {
+		patterns:   &patterns,
+		lang:       None,
+		selector:   None,
+		strictness: MatchStrictness::Smart,
+		captures:   false,
+	};
+	let found = find_page(&vfs, found, &query, Page { offset: 0, limit: 10 })
+		.await
+		.unwrap();
+	assert_eq!(found.hits.len(), 1);
+	assert_eq!(found.report.warnings, ["print($A): huge.py: out of memory"]);
+}

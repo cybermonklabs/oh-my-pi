@@ -211,4 +211,38 @@ describe("loadFilesFromDir reads below the walked directory", () => {
 		expect(reads).toHaveBeenCalledTimes(3);
 		expect(changed.items).toContainEqual({ name: "top.md", content: "changed\n" });
 	});
+
+	test("decodes each file as Bun.file().text() does, UTF-16 with a byte order mark included", async () => {
+		const text = "---\ndescription: hi\n---\nbody\n";
+		const utf16be = Buffer.from(text, "utf16le").swap16();
+		const files = {
+			"utf16le.md": Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]),
+			"utf16be.md": Buffer.concat([Buffer.from([0xfe, 0xff]), utf16be]),
+			"utf8bom.md": Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text)]),
+			"invalid.md": Buffer.from([0x61, 0xff, 0xfe, 0x62, 0x0a]),
+		};
+		for (const [name, bytes] of Object.entries(files)) {
+			fs.writeFileSync(path.join(dir, name), bytes);
+		}
+		const loaded = new Map((await load()).items.map(item => [item.name, item.content]));
+		expect(loaded.get("utf16le.md")).toBe(text);
+		for (const name of Object.keys(files)) {
+			expect(loaded.get(name), name).toBe(await Bun.file(path.join(dir, name)).text());
+		}
+	});
+
+	test("warns about a sparse file larger than memory and loads the others", async () => {
+		const fd = fs.openSync(path.join(dir, "huge.md"), "w");
+		try {
+			fs.ftruncateSync(fd, 2 ** 50);
+		} catch (error) {
+			console.error(`UNKNOWN: no 1 PiB sparse file on this filesystem (${error}); the load was not checked`);
+			return;
+		} finally {
+			fs.closeSync(fd);
+		}
+		const result = await load();
+		expect(result.warnings).toEqual([`Failed to read file: ${path.join(dir, "huge.md")}`]);
+		expect(result.items.map(item => item.name).sort()).toEqual([path.join("sub", "nested.md"), "top.md"]);
+	});
 });

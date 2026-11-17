@@ -1227,24 +1227,40 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 	/// Opens `path`, the listed file at walk-relative `rel` (`None` for a file
 	/// operand). A walk that does not follow symlinks opens it below the
 	/// walk's root with no symlink followed on the way, and never by path, so
-	/// a symlink swapped in since the listing is refused. Otherwise a native
-	/// tree's file opens through the worker's by-path opener, and anything
-	/// that fails there (a special file, an error) through `fs`, which reports
-	/// it as a standalone open would.
-	async fn open(&self, worker: &mut Worker, rel: Option<&[u8]>, path: &Path) -> io::Result<Input> {
+	/// a symlink swapped in since the listing is refused. A symlink that is the
+	/// file itself (its directory still opens below the root) is skipped with
+	/// no message and no error status (`None`), as GNU grep skips a file whose
+	/// `O_NOFOLLOW` open finds a symlink; one on the way to it is an error.
+	/// Otherwise a native tree's file opens through the worker's by-path
+	/// opener, and anything that fails there (a special file, an error)
+	/// through `fs`, which reports it as a standalone open would.
+	async fn open(&self, worker: &mut Worker, rel: Option<&[u8]>, path: &Path) -> io::Result<Option<Input>> {
 		match (&mut worker.opener, rel) {
 			(Some(Opener::Beneath(session, root)), Some(rel)) => {
-				let (file, _) = session.open_file_beneath(root, rel).await?;
-				return Ok(Input::Listed(file));
+				return match session.open_file_beneath(root, rel).await {
+					Ok((file, _)) => Ok(Some(Input::Listed(file))),
+					Err(err) if pi_walker::fs::is_symlink_refusal(&err) => {
+						let parent = rel
+							.iter()
+							.rposition(|&b| pi_walker::fs::is_rel_separator(b))
+							.map(|at| &rel[..at]);
+						let file_is_the_link = match parent {
+							Some(parent) => session.open_dir_beneath(root, parent).await.is_ok(),
+							None => true,
+						};
+						if file_is_the_link { Ok(None) } else { Err(err) }
+					},
+					Err(err) => Err(err),
+				};
 			},
 			(Some(Opener::Path(opener)), Some(_)) if self.fs.is_native_local(path) => {
 				if let Ok(file) = opener.open(path).await {
-					return Ok(Input::Listed(file));
+					return Ok(Some(Input::Listed(file)));
 				}
 			},
 			_ => {},
 		}
-		stdio::Source::open(&self.fs, path).await.map(Input::Source)
+		stdio::Source::open(&self.fs, path).await.map(|source| Some(Input::Source(source)))
 	}
 
 	/// Searches the `index`th listed file, its paths built in the worker's
@@ -1307,7 +1323,8 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		display_path: &Path,
 	) -> FileSearch {
 		match self.open(worker, rel, path).await {
-			Ok(mut input) => {
+			Ok(None) => FileSearch { out: Vec::new(), err: Vec::new(), had_error: false, matched: Ok(false) },
+			Ok(Some(mut input)) => {
 				if self.opts.refuse_output_file && self.is_output_file(&input).await {
 					return self.refused(display_path);
 				}
@@ -2095,17 +2112,37 @@ mod tests {
 
 	/// `grep -r` reads no file through a directory swapped, between the
 	/// walk's listing and the file's open, for a symlink to a directory
-	/// outside the operand that holds a file of the listed name; `-R`, which
-	/// follows symlinks, still reads through the link.
+	/// outside the operand that holds a file of the listed name, and reports
+	/// the refused open (exit 2); `-R`, which follows symlinks, still reads
+	/// through the link.
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn recursive_grep_reads_no_file_through_a_directory_swapped_after_the_walk() {
 		let tree = SwapTree::new("needle inside\n", "needle outside\n");
 		tree.swap_at(tree.root.clone());
 		let root_arg = tree.root.to_str().unwrap();
-		let (_, out, err) = run(&["-r", "needle", root_arg], "").await;
+		let (code, out, err) = run(&["-r", "needle", root_arg], "").await;
 		assert!(tree.swapped(), "the swap ran");
 		assert!(!out.contains("outside"), "read through the swapped link: {out:?} {err:?}");
+		assert!(code == 2 && err.contains("sub/decoy.txt: "), "{code} {err:?}");
+		let (_, followed, _) = run(&["-R", "needle", root_arg], "").await;
+		assert!(followed.contains("needle outside"), "-R follows the link: {followed:?}");
+	}
+
+	/// `grep -r` skips a listed file swapped for a symlink after the walk with
+	/// no message and no error status, as GNU grep 3.11 does (its `O_NOFOLLOW`
+	/// open fails with `ELOOP`), and searches the others; `-R` reads through
+	/// the link.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn recursive_grep_skips_a_file_swapped_for_a_symlink_after_the_walk() {
+		let tree = SwapTree::new("needle inside\n", "needle outside\n");
+		std::fs::write(tree.sub.join("other.txt"), "needle other\n").unwrap();
+		tree.swap_file_at(tree.root.clone());
+		let root_arg = tree.root.to_str().unwrap();
+		let (code, out, err) = run(&["-r", "needle", root_arg], "").await;
+		assert!(tree.swapped(), "the swap ran");
+		assert_eq!((code, out, err), (0, format!("{root_arg}/sub/other.txt:needle other\n"), String::new()));
 		let (_, followed, _) = run(&["-R", "needle", root_arg], "").await;
 		assert!(followed.contains("needle outside"), "-R follows the link: {followed:?}");
 	}

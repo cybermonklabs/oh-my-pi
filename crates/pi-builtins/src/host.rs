@@ -3297,6 +3297,22 @@ mod testing {
 			));
 		}
 
+		/// Replaces `sub/decoy.txt` with a symlink to `outside/decoy.txt` at
+		/// the first [`run_hook`] for `at`.
+		#[cfg(feature = "util.grep")]
+		pub(crate) fn swap_file_at(&self, at: PathBuf) {
+			let (file, target) = (self.sub.join("decoy.txt"), self.outside.join("decoy.txt"));
+			let swapped = Arc::clone(&self.swapped);
+			HOOKS.lock().push((
+				at,
+				Box::new(move || {
+					std::fs::remove_file(&file).unwrap();
+					std::os::unix::fs::symlink(target, &file).unwrap();
+					swapped.store(true, std::sync::atomic::Ordering::SeqCst);
+				}),
+			));
+		}
+
 		/// Whether the swap ran.
 		pub(crate) fn swapped(&self) -> bool {
 			self.swapped.load(std::sync::atomic::Ordering::SeqCst)

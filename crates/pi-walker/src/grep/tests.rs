@@ -1159,15 +1159,17 @@ async fn budgeted_search_refuses_a_file_below_a_directory_swapped_for_a_symlink(
 /// Case A in the budgeted pass, below the depth past which the ordered
 /// traversal stops keeping directory handles: `sub` is swapped for a symlink
 /// to a directory outside the root between its parent's listing and its own
-/// open. The traversal does not descend into the link.
+/// open. The traversal opens `sub` below the root's handle (not by path), so
+/// it does not descend into the link. That open is what the swap records:
+/// the candidate opens below the root too, so the read alone could not show
+/// a traversal that descended into the link.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn budgeted_search_past_the_open_directory_limit_refuses_a_swapped_directory() {
 	let tree = SwapTree::new("grep-budgeted-a-deep", walk::tree::MAX_OPEN_DIRS, Outside::OtherName);
 	tree.swap_dir_before_open(&tree.sub_name);
 	let result = run(&tree.root, &GrepOptions { max_count: Some(100), ..options(&needle()) }).await;
-	let swapped = tree.swapped();
-	assert!(swapped.is_some_and(|open| open != Open::At), "no handle reached sub: {swapped:?}");
+	assert_eq!(tree.swapped(), Some(Open::Beneath), "sub did not open below the root");
 	assert!(!escaped(texts(&result)), "descended into the swapped link: {:?}", texts(&result));
 }
 

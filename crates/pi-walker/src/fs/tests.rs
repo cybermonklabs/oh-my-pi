@@ -239,6 +239,9 @@ async fn opens_beneath_a_root_follow_no_symlink() {
 		assert!(refused_link(&err), "{rel}: {err:?}");
 	}
 	assert!(is_not_regular(&s.open_file_beneath(&root, b"a/b").await.unwrap_err()));
+	// A refused final symlink is a symlink refusal; a missing file is not.
+	assert!(is_symlink_refusal(&s.open_file_beneath(&root, b"a/b/flink").await.unwrap_err()));
+	assert!(!is_symlink_refusal(&s.open_file_beneath(&root, b"a/b/none").await.unwrap_err()));
 	for rel in NOT_WALK_RELATIVE {
 		let err = s
 			.open_file_beneath(&root, rel.as_bytes())
@@ -432,6 +435,25 @@ async fn windows_directory_links_are_removed_as_directories() {
 	assert!(tmp.0.join("root/target/keep.txt").exists(), "the link's target was removed");
 }
 
+/// On Windows a read-only file is removed, as `std::fs::remove_file` removes
+/// one there.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_read_only_files_are_removed() {
+	let tmp = TempDir::new("win-read-only");
+	for name in ["root/ours", "root/std"] {
+		let path = tmp.write(name, b"x");
+		let mut perms = std::fs::metadata(&path).unwrap().permissions();
+		perms.set_readonly(true);
+		std::fs::set_permissions(&path, perms).unwrap();
+	}
+	std::fs::remove_file(tmp.0.join("root/std")).expect("std removes a read-only file");
+	let mut s = Fs::native().session();
+	let root = s.open_dir(&tmp.0.join("root")).await.unwrap();
+	s.remove_file_beneath(&root, b"ours").await.unwrap();
+	assert!(std::fs::symlink_metadata(tmp.0.join("root/ours")).is_err(), "the file stays");
+}
+
 /// A listed file's open follows a symlink there only when asked to.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
@@ -463,7 +485,8 @@ async fn provider_opens_refuse_a_final_symlink() {
 			.size,
 		5
 	);
-	assert!(s.open_file_beneath(&root, b"dir/flink").await.is_err());
+	assert!(is_symlink_refusal(&s.open_file_beneath(&root, b"dir/flink").await.unwrap_err()));
+	assert!(!is_symlink_refusal(&s.open_file_beneath(&root, b"dir/none").await.unwrap_err()));
 	assert!(s.open_dir_beneath(&root, b"dir").await.is_ok());
 	assert!(s.open_dir_beneath(&root, b"link").await.is_err());
 	let err = s
@@ -666,6 +689,42 @@ fn read_into_short_reads() {
 	})
 	.unwrap();
 	assert_eq!(buf, b"abcdef");
+}
+
+/// A size the allocator refuses fails the read with `OutOfMemory`, as
+/// `std::fs::read` fails, instead of aborting the process; nothing is read.
+#[test]
+fn a_size_the_allocator_refuses_fails_with_out_of_memory() {
+	let mut buf = Vec::new();
+	let err =
+		fill(&mut buf, 1 << 62, u64::MAX, |_, _| panic!("read before the reservation")).unwrap_err();
+	assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err:?}");
+	assert!(buf.is_empty());
+}
+
+/// A sparse file larger than memory fails `read_into` with `OutOfMemory`,
+/// and the session reads the next file as before.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_a_sparse_file_larger_than_memory_fails_with_out_of_memory() {
+	let tmp = TempDir::new("huge");
+	tmp.write("small", b"small");
+	let huge = std::fs::File::create(tmp.0.join("huge")).unwrap();
+	if let Err(err) = huge.set_len(1 << 50) {
+		eprintln!(
+			"UNKNOWN: no 1 PiB sparse file on this filesystem ({err}); the read was not checked"
+		);
+		return;
+	}
+	drop(huge);
+	let mut s = Fs::native().session();
+	let dir = s.open_dir(&tmp.0).await.unwrap();
+	let (mut file, info) = s.open_file_at(&dir, b"huge", false).await.unwrap();
+	assert_eq!(info.size, 1 << 50);
+	let mut buf = Vec::new();
+	let err = file.read_into(&mut buf, u64::MAX).await.unwrap_err();
+	assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err:?}");
+	assert_eq!(read_all(&mut s, &dir, "small", u64::MAX).await.0, b"small");
 }
 
 /// Pseudo files report size 0 yet have contents.

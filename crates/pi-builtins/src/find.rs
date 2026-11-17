@@ -55,10 +55,7 @@ pub mod matchers {
 		 * file that was distributed with this source code.
 		 */
 
-		use std::{
-			io::{self, Write},
-			path::Path,
-		};
+		use std::io::{self, Write};
 
 		use uucore::display::Quotable;
 
@@ -106,10 +103,11 @@ pub mod matchers {
 		impl Matcher for DeleteMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				// This is a quirk in find's traditional semantics probably due to
-				// POSIX rmdir() not accepting "." (EINVAL). GNU find skips the
-				// operand `.` as given, which the display path spells.
+				// POSIX rmdir() not accepting "." (EINVAL). GNU find skips only the
+				// operand spelled exactly `.`, which the display path spells (a
+				// string compare: `./`, `.//` and `./.` fail with EINVAL, as GNU's).
 				let shown = file_info.display_path();
-				if shown == Path::new(".") {
+				if shown.as_os_str() == "." {
 					return true;
 				}
 
@@ -6072,15 +6070,27 @@ mod tests {
 	}
 
 	/// `find . -delete` empties the directory and leaves `.` itself, as GNU
-	/// find does, with no diagnostic.
+	/// find does, with no diagnostic. Any other spelling of the directory
+	/// (`./`, `.//`, `./.`) is not kept: its removal fails with EINVAL and
+	/// GNU find 4.9.0's message and exit status, and the directory stays.
+	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
-	async fn delete_leaves_the_dot_operand() {
-		let (_dir, root) = fixture();
-		fs::create_dir(root.join("sub")).unwrap();
-		fs::write(root.join("sub/f"), b"x").unwrap();
-		let (code, capture) = run(&root, &[".".into(), "-delete".into()]).await;
-		assert_eq!((code, capture.err().as_str()), (0, ""));
-		assert!(root.is_dir(), "`.` was removed");
-		assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "the contents are removed");
+	async fn delete_leaves_only_the_operand_spelled_dot() {
+		// GNU find 4.9.0's status and stderr (`/usr/bin/find` printed as
+		// `find`) for each operand, run on a fresh tree.
+		for (operand, gnu) in [
+			(".", (0, "")),
+			("./", (1, "find: cannot delete './': Invalid argument\n")),
+			(".//", (1, "find: cannot delete './/': Invalid argument\n")),
+			("./.", (1, "find: cannot delete './.': Invalid argument\n")),
+		] {
+			let (_dir, root) = fixture();
+			fs::create_dir(root.join("sub")).unwrap();
+			fs::write(root.join("sub/f"), b"x").unwrap();
+			let (code, capture) = run(&root, &[operand.into(), "-delete".into()]).await;
+			assert_eq!((code, capture.err().as_str()), gnu, "{operand:?}");
+			assert!(root.is_dir(), "{operand:?}: the directory was removed");
+			assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "{operand:?}: the contents stay");
+		}
 	}
 }

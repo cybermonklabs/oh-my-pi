@@ -367,7 +367,9 @@ impl File {
 	/// that returns exactly the remaining size is taken as end of file (no
 	/// confirming zero-length read), and growth after the open is not read;
 	/// files reporting size 0 (pseudo files) and short reads keep reading
-	/// until end of file or `limit`.
+	/// until end of file or `limit`. A buffer the allocator refuses (a sparse
+	/// file larger than memory, say) fails with [`io::ErrorKind::OutOfMemory`],
+	/// as [`std::fs::read`] fails, instead of aborting the process.
 	pub async fn read_into(&mut self, buf: &mut Vec<u8>, limit: u64) -> io::Result<()> {
 		buf.clear();
 		self.read_more(buf, limit).await
@@ -389,8 +391,8 @@ impl File {
 					file.seek_async(io::SeekFrom::Start(start)).await?;
 					self.pos = start;
 				}
-				let window = Fill::new(buf, self.size, limit);
-				while let Some(end) = window.next(buf) {
+				let window = Fill::new(buf, self.size, limit)?;
+				while let Some(end) = window.next(buf)? {
 					let len = buf.len();
 					buf.resize(end, 0);
 					let read = file.read_async(&mut buf[len..]).await;
@@ -416,7 +418,7 @@ impl Fill {
 	/// Reserves `buf` for reading on to `limit` bytes in all of a file whose
 	/// size at open time was `size` (0: empty or a pseudo file, read to end
 	/// of file); the bytes `buf` already holds are the file's first ones.
-	fn new(buf: &mut Vec<u8>, size: u64, limit: u64) -> Self {
+	fn new(buf: &mut Vec<u8>, size: u64, limit: u64) -> io::Result<Self> {
 		let limit = usize::try_from(limit).unwrap_or(usize::MAX);
 		let bound = if size > 0 {
 			usize::try_from(size).unwrap_or(usize::MAX).min(limit)
@@ -424,14 +426,14 @@ impl Fill {
 			limit
 		};
 		let want = bound.saturating_sub(buf.len());
-		buf.reserve(if size > 0 { want } else { want.min(4096) });
-		Self { bound }
+		try_reserve(buf, if size > 0 { want } else { want.min(4096) })?;
+		Ok(Self { bound })
 	}
 
 	/// End of the next read window (growing `buf`), `None` once full.
-	fn next(&self, buf: &mut Vec<u8>) -> Option<usize> {
+	fn next(&self, buf: &mut Vec<u8>) -> io::Result<Option<usize>> {
 		if buf.len() >= self.bound {
-			return None;
+			return Ok(None);
 		}
 		if buf.len() == buf.capacity() {
 			let grown = buf
@@ -439,9 +441,9 @@ impl Fill {
 				.saturating_mul(2)
 				.saturating_add(4096)
 				.min(self.bound);
-			buf.reserve(grown - buf.len());
+			try_reserve(buf, grown - buf.len())?;
 		}
-		Some(buf.capacity().min(self.bound))
+		Ok(Some(buf.capacity().min(self.bound)))
 	}
 
 	/// Whether to keep reading after a read returned `read` (0 is end of
@@ -466,13 +468,21 @@ fn fill(
 	limit: u64,
 	mut read: impl FnMut(&mut Vec<u8>, usize) -> io::Result<usize>,
 ) -> io::Result<()> {
-	let window = Fill::new(buf, size, limit);
-	while let Some(end) = window.next(buf) {
+	let window = Fill::new(buf, size, limit)?;
+	while let Some(end) = window.next(buf)? {
 		if !Fill::more(read(buf, end))? {
 			break;
 		}
 	}
 	Ok(())
+}
+
+/// Reserves `additional` more bytes in `buf`, failing with
+/// [`io::ErrorKind::OutOfMemory`] when the allocator refuses, as
+/// [`std::fs::read`] does, rather than aborting.
+fn try_reserve(buf: &mut Vec<u8>, additional: usize) -> io::Result<()> {
+	buf.try_reserve(additional)
+		.map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))
 }
 
 /// Sequential reads of a native [`File`], executed inline (see
@@ -559,6 +569,44 @@ pub(crate) fn not_regular() -> io::Error {
 /// directories and special files.
 pub fn is_not_regular(err: &io::Error) -> bool {
 	err.get_ref().is_some_and(|inner| inner.is::<NotRegular>())
+}
+
+/// Marker error behind a provider's refusal of a final symlink, which
+/// [`is_symlink_refusal`] recognizes.
+#[derive(Debug)]
+struct SymlinkRefused;
+
+impl std::fmt::Display for SymlinkRefused {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("refusing to follow a symbolic link")
+	}
+}
+
+impl std::error::Error for SymlinkRefused {}
+
+/// The error for an open that does not follow a symlink it found.
+pub(crate) fn symlink_refused() -> io::Error {
+	io::Error::new(io::ErrorKind::InvalidInput, SymlinkRefused)
+}
+
+/// Whether `err` is an open's refusal of a symlink it did not follow.
+///
+/// That is `ELOOP` on Unix, `ERROR_STOPPED_ON_SYMLINK` on Windows, or a
+/// provider's refusal of a final symlink. From
+/// [`Session::open_file_beneath`] the symlink may be the file or a directory
+/// on the way; opening the file's directory below the same root tells the
+/// two apart.
+pub fn is_symlink_refusal(err: &io::Error) -> bool {
+	#[cfg(unix)]
+	let code = Some(libc::ELOOP);
+	#[cfg(windows)]
+	let code = Some(windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK as i32);
+	#[cfg(not(any(unix, windows)))]
+	let code = None;
+	(code.is_some() && err.raw_os_error() == code)
+		|| err
+			.get_ref()
+			.is_some_and(|inner| inner.is::<SymlinkRefused>())
 }
 
 /// Per-thread filesystem operations. Slices returned by a method stay valid

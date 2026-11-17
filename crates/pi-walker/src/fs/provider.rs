@@ -20,6 +20,7 @@ use pi_vfs::{Fs, Metadata};
 
 use super::{
 	Detail, FileId, FileInfo, FileType, Listing, Stamp, is_rel_separator, not_regular, os_name,
+	symlink_refused,
 };
 
 /// Entry type of a provider file type; `None` for special files.
@@ -101,15 +102,13 @@ pub(super) fn beneath(root: &Path, rel: &[u8]) -> PathBuf {
 }
 
 /// The description of a regular file from metadata read without following a
-/// final symlink: a symlink there is refused, and anything else that is not
-/// a regular file fails as [`not_regular`].
+/// final symlink: a symlink there is refused ([`symlink_refused`]), and
+/// anything else that is not a regular file fails as [`not_regular`].
 fn unlinked_file_info(meta: &Metadata) -> io::Result<FileInfo> {
 	let info = info_of(meta);
 	match info.file_type {
 		Some(FileType::File) => Ok(info),
-		Some(FileType::Symlink) => {
-			Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symbolic link"))
-		},
+		Some(FileType::Symlink) => Err(symlink_refused()),
 		_ => Err(not_regular()),
 	}
 }

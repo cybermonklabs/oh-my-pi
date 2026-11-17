@@ -1327,16 +1327,15 @@ async fn a_walk_below_a_cached_listing_refuses_a_swapped_directory() {
 
 /// Case A for the ordered traversal below the depth past which it stops
 /// keeping directory handles: `sub` is swapped for a symlink to a directory
-/// outside the root between its parent's listing and its own open. The
-/// traversal does not descend into the link.
+/// outside the root between its parent's listing and its own open, which is
+/// below the root's handle. The traversal does not descend into the link.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn tree_past_the_open_directory_limit_refuses_a_swapped_directory() {
 	let tree = SwapTree::new("tree-deep-a", tree::MAX_OPEN_DIRS, Outside::OtherName);
 	tree.swap_dir_before_open(&tree.sub_name);
 	let (seen, _errors) = tree_events(&Fs::native(), &tree.root, &TreeOptions::default()).await;
-	let swapped = tree.swapped();
-	assert!(swapped.is_some_and(|open| open != Open::At), "no handle reached sub: {swapped:?}");
+	assert_eq!(tree.swapped(), Some(Open::Beneath), "sub did not open below the root");
 	assert!(
 		!seen.iter().any(|path| path.contains("secret")),
 		"descended into the swapped link: {:?}",

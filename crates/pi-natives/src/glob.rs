@@ -5,7 +5,10 @@
 //! Resolves a search root, runs `pi_walker::glob`, and optionally streams each
 //! returned match through a callback. `readFileBeneath` then reads a match
 //! below the same root without following a symlink the walk did not list, so
-//! a directory or file swapped for a symlink after the listing is refused.
+//! a directory or file swapped for a symlink after the listing is refused. A
+//! symlink the walk did list at a match is followed wherever its chain points
+//! when the read opens it, inside the root or out of it: what is confined is
+//! the path to the match, not where a listed link leads.
 //!
 //! `pi_walker::glob` never yields `.git`, and skips `node_modules` unless the
 //! pattern or options request it.
@@ -53,7 +56,8 @@ pub struct GlobMatch {
 	/// `true` when the listing shows a symbolic link at `path`, reported as
 	/// `Symlink` or, under a `File` or `Dir` filter, as its target (absent
 	/// otherwise). Pass it as `readFileBeneath`'s `followSymlink` to read
-	/// what the walk listed.
+	/// what the walk listed; the link is then followed wherever its chain
+	/// points at read time.
 	pub symlink:   Option<bool>,
 }
 
@@ -239,7 +243,9 @@ pub struct ReadFileBeneathOptions {
 	/// `/`-separated, no part empty, `.`, or `..`.
 	pub path:               String,
 	/// Follow a symlink at the final name, as the walk listed it (pass
-	/// `GlobMatch.symlink`). A symlink on the way to it is always refused;
+	/// `GlobMatch.symlink`): the link, and any link its target names, is
+	/// followed wherever it points when the file is opened, inside `root` or
+	/// out of it. A symlink on the way to the final name is always refused;
 	/// without this, one at the final name is refused too.
 	pub follow_symlink:     Option<bool>,
 	/// Leave a file larger than this many bytes unread (`skip: "large"`); a
@@ -273,7 +279,8 @@ pub struct ReadFileBeneathResult {
 /// Opens `root` by path as the walk opened it, then the file below that
 /// handle: no symlink on the way is followed (a directory swapped for a
 /// symlink since the listing is refused), and a symlink at the final name
-/// is followed only with `followSymlink`. One open serves the whole read:
+/// is followed only with `followSymlink`, then wherever its chain points at
+/// read time (not confined below `root`). One open serves the whole read:
 /// the size check against `maxBytes`, the binary probe, then the rest of the
 /// bytes, each byte read once. The read stops at the size the file had when
 /// it was opened (growth after the open is not read); a file that reports
@@ -284,7 +291,9 @@ pub struct ReadFileBeneathResult {
 /// Rejects when `root` is not a directory, `path` is not walk-relative, a
 /// symlink is refused (`ELOOP` or `ENOTDIR` on Unix,
 /// `ERROR_STOPPED_ON_SYMLINK` on Windows), the file is a directory or a
-/// special file, or the open or a read fails.
+/// special file, the memory to read it into cannot be allocated (`out of
+/// memory`, a sparse file larger than memory read without `maxBytes`), or
+/// the open or a read fails.
 #[napi]
 pub fn read_file_beneath(
 	env: &Env,
@@ -598,5 +607,37 @@ mod tests {
 		// A prefix past the end reads the whole file, probed or not.
 		assert_eq!(bytes(read(&root, "a/b/file.txt", false, prefix(100, 0)).await), b"inside");
 		assert_eq!(bytes(read(&root, "a/b/file.txt", false, prefix(100, 4)).await), b"inside");
+	}
+
+	/// A sparse file larger than memory, read with no `maxBytes` and no
+	/// binary probe (as the discovery loader reads), fails with `OutOfMemory`
+	/// instead of aborting the process. With a probe its leading NULs skip it
+	/// as binary, and with `maxBytes` it is skipped as large, each before the
+	/// rest is read.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_sparse_file_larger_than_memory_fails_with_out_of_memory() {
+		let tree = Tree::new();
+		let file = fs::File::create(tree.root().join("huge.md")).expect("create");
+		if let Err(err) = file.set_len(1 << 50) {
+			eprintln!(
+				"UNKNOWN: no 1 PiB sparse file on this filesystem ({err}); the read was not checked"
+			);
+			return;
+		}
+		drop(file);
+		let err = read(&tree.root(), "huge.md", false, ReadLimits::default())
+			.await
+			.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err:?}");
+		let limits = ReadLimits { probe: 8192, ..ReadLimits::default() };
+		assert_eq!(read(&tree.root(), "huge.md", false, limits).await.unwrap(), Beneath::Skipped {
+			size: 1 << 50,
+			skip: ReadSkip::Binary,
+		});
+		let limits = ReadLimits { max_bytes: Some(1 << 20), ..ReadLimits::default() };
+		assert_eq!(read(&tree.root(), "huge.md", false, limits).await.unwrap(), Beneath::Skipped {
+			size: 1 << 50,
+			skip: ReadSkip::Large,
+		});
 	}
 }

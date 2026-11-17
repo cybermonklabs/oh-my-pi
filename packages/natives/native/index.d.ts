@@ -2243,7 +2243,8 @@ export interface GlobMatch {
    * `true` when the listing shows a symbolic link at `path`, reported as
    * `Symlink` or, under a `File` or `Dir` filter, as its target (absent
    * otherwise). Pass it as `readFileBeneath`'s `followSymlink` to read
-   * what the walk listed.
+   * what the walk listed; the link is then followed wherever its chain
+   * points at read time.
    */
   symlink?: boolean
 }
@@ -3403,7 +3404,8 @@ export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxH
  * Opens `root` by path as the walk opened it, then the file below that
  * handle: no symlink on the way is followed (a directory swapped for a
  * symlink since the listing is refused), and a symlink at the final name
- * is followed only with `followSymlink`. One open serves the whole read:
+ * is followed only with `followSymlink`, then wherever its chain points at
+ * read time (not confined below `root`). One open serves the whole read:
  * the size check against `maxBytes`, the binary probe, then the rest of the
  * bytes, each byte read once. The read stops at the size the file had when
  * it was opened (growth after the open is not read); a file that reports
@@ -3414,7 +3416,9 @@ export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxH
  * Rejects when `root` is not a directory, `path` is not walk-relative, a
  * symlink is refused (`ELOOP` or `ENOTDIR` on Unix,
  * `ERROR_STOPPED_ON_SYMLINK` on Windows), the file is a directory or a
- * special file, or the open or a read fails.
+ * special file, the memory to read it into cannot be allocated (`out of
+ * memory`, a sparse file larger than memory read without `maxBytes`), or
+ * the open or a read fails.
  */
 export declare function readFileBeneath(options: ReadFileBeneathOptions): Promise<ReadFileBeneathResult>
 
@@ -3432,7 +3436,9 @@ export interface ReadFileBeneathOptions {
   path: string
   /**
    * Follow a symlink at the final name, as the walk listed it (pass
-   * `GlobMatch.symlink`). A symlink on the way to it is always refused;
+   * `GlobMatch.symlink`): the link, and any link its target names, is
+   * followed wherever it points when the file is opened, inside `root` or
+   * out of it. A symlink on the way to the final name is always refused;
    * without this, one at the final name is refused too.
    */
   followSymlink?: boolean
