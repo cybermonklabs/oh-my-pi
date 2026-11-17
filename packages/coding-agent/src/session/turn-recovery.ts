@@ -2376,14 +2376,25 @@ export class TurnRecovery {
 			this.#host.abortInProgress() ||
 			this.#host.promptGeneration() !== generation ||
 			!modelsAreEqual(this.#host.model(), sourceModel);
-		// While the refusal's fallback credit is live, the hold below passes over
-		// the same-provider Claude models that cannot redeem it. With
-		// retry.usageAwareFallback on, the walk keeps each of them here, in walk
-		// order, and notes whether its usage skip passed over a candidate that
-		// could redeem the credit because that candidate's usage is spent.
+		// Each candidate's usage is read at most once per walk, so the walk pass
+		// reuses what the credit-target pass read. A read that throws is kept as
+		// unknown usage (`undefined`). A stale read is not kept: it ends the walk.
+		const usageReads = new Map<string, ModelUsageHealth | undefined>();
+		const readWalkUsage = async (candidate: Model): Promise<ModelUsageHealth | "stale" | undefined> => {
+			const key = `${candidate.provider}/${candidate.id}`;
+			if (usageReads.has(key)) return usageReads.get(key);
+			usageReadController ??= new AbortController();
+			this.#retryAbortController?.abort();
+			this.#retryAbortController = usageReadController;
+			try {
+				const usage = await this.#readCandidateUsage(candidate, usageReadStale, usageReadController.signal);
+				if (usage !== "stale") usageReads.set(key, usage);
+				return usage;
+			} finally {
+				if (this.#retryAbortController === usageReadController) this.#retryAbortController = undefined;
+			}
+		};
 		type WalkEntry = { role: string; selector: RetryFallbackSelector };
-		const heldBack: WalkEntry[] = [];
-		let creditTargetSpent = false;
 		function* chainEntries(recovery: TurnRecovery): Generator<WalkEntry> {
 			for (const role of recovery.retryFallbackChainKeys(currentSelector)) {
 				for (const selector of recovery.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
@@ -2391,17 +2402,31 @@ export class TurnRecovery {
 				}
 			}
 		}
-		// The first round walks the chain. The second runs only when the first
-		// switched to nothing and its usage skip passed over a credit target. A
-		// credit cannot be redeemed on a spent target, so it stops holding the
-		// other models back: holding them would end on the refusal a turn that
-		// the walk answers with the setting off. The second round takes the
-		// held-back candidates, in walk order, through the same steps; the checks
-		// before the hold pass again, and the hold does not apply. A usable credit
-		// target or another provider's model later in the chain still comes first.
-		for (const heldBackRound of [false, true]) {
-			if (heldBackRound && !creditTargetSpent) break;
-			for (const { role, selector } of heldBackRound ? heldBack : chainEntries(this)) {
+		// While a classifier refusal's fallback credit is live, the hold below
+		// passes over the same-provider Claude models that cannot redeem it. The
+		// credit is live only while one of its targets is still a candidate the
+		// walk would try: a credit cannot be redeemed on a target whose usage is
+		// spent, so once every such target is spent it holds nothing back. With
+		// retry.usageAwareFallback on, the credit-target pass runs first: it reads
+		// the usage of each candidate that can redeem the credit and switches to
+		// nothing. When it saw a target and every target it saw is spent, the
+		// credit counts as absent, and the walk pass runs in chain order as with
+		// no credit. Deciding this before the walk pass chooses keeps chain order:
+		// a same-provider Claude model earlier in the chain comes before another
+		// provider's model after it. A credit whose targets are not in the chain
+		// stays live.
+		const readCreditTargets =
+			usageAwareFallback &&
+			options?.refusalWalk === true &&
+			creditHandle !== undefined &&
+			creditTargets.length > 0 &&
+			Date.now() < creditHandle.expiresAt;
+		let creditTargetsSeen = 0;
+		let creditTargetsUsable = 0;
+		let creditCountsAbsent = false;
+		for (const creditTargetPass of [true, false]) {
+			if (creditTargetPass && !readCreditTargets) continue;
+			for (const { role, selector } of chainEntries(this)) {
 				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
 				// A refusal walk visits any one model at most once per turn. Without this a
 				// pair of chains naming each other alternates: each hop is a model the walk
@@ -2429,6 +2454,14 @@ export class TurnRecovery {
 					candidate.provider === failedMessage.provider &&
 					creditTargets.includes(candidate.id) &&
 					Date.now() < creditHandle.expiresAt;
+				if (creditTargetPass) {
+					if (!canRedeemFallbackCredit) continue;
+					const targetUsage = await readWalkUsage(candidate);
+					if (targetUsage === "stale") return false;
+					creditTargetsSeen++;
+					if (!targetUsage || !isUsageSpent(targetUsage)) creditTargetsUsable++;
+					continue;
+				}
 				// Anthropic signatures and redacted blocks are model-bound, while the
 				// latest assistant response must remain byte-identical. While another
 				// attempt on the model that signed them is still allowed, prefer it to a
@@ -2453,9 +2486,8 @@ export class TurnRecovery {
 				// afterwards.
 				const creditLive =
 					creditHandle !== undefined && creditTargets.length > 0 && Date.now() < creditHandle.expiresAt;
-				const refusalKeepsCredit = options?.refusalWalk === true && creditLive;
+				const refusalKeepsCredit = options?.refusalWalk === true && creditLive && !creditCountsAbsent;
 				if (
-					!heldBackRound &&
 					(signerRetryRemains || refusalKeepsCredit) &&
 					!canRedeemFallbackCredit &&
 					candidate.api === "anthropic-messages" &&
@@ -2468,9 +2500,6 @@ export class TurnRecovery {
 							block.type === "redactedThinking",
 					)
 				) {
-					// With the setting on, a candidate that only the credit holds back
-					// waits for the second round above.
-					if (usageAwareFallback && !signerRetryRemains) heldBack.push({ role, selector });
 					continue;
 				}
 				// A candidate whose effort floor exceeds the per-spawn ceiling would be
@@ -2491,23 +2520,9 @@ export class TurnRecovery {
 				// select.ts OAUTH_REFRESH_FAILURE_BACKOFF_MS), and the refusal steps
 				// must still reach the provider's other accounts and models.
 				if (usageAwareFallback) {
-					usageReadController ??= new AbortController();
-					this.#retryAbortController?.abort();
-					this.#retryAbortController = usageReadController;
-					try {
-						const candidateUsage = await this.#readCandidateUsage(
-							candidate,
-							usageReadStale,
-							usageReadController.signal,
-						);
-						if (candidateUsage === "stale") return false;
-						if (candidateUsage && isUsageSpent(candidateUsage)) {
-							if (canRedeemFallbackCredit) creditTargetSpent = true;
-							continue;
-						}
-					} finally {
-						if (this.#retryAbortController === usageReadController) this.#retryAbortController = undefined;
-					}
+					const candidateUsage = await readWalkUsage(candidate);
+					if (candidateUsage === "stale") return false;
+					if (candidateUsage && isUsageSpent(candidateUsage)) continue;
 				}
 				// A session restricted to an OAuth account pool throws for a provider
 				// none of its pooled accounts can serve; that candidate is unavailable,
@@ -2549,6 +2564,7 @@ export class TurnRecovery {
 				}
 				return applied;
 			}
+			if (creditTargetPass) creditCountsAbsent = creditTargetsSeen > 0 && creditTargetsUsable === 0;
 		}
 
 		return false;

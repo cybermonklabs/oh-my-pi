@@ -664,6 +664,109 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				expect(lastAssistant(run.session).stopReason).toBe("stop");
 			});
 		}
+
+		// The catalog also lets Fable's refusal credit be redeemed on Opus 5.
+		const NEXT_CREDIT_TARGET = bundled("anthropic", "claude-opus-5");
+
+		/**
+		 * Seeds a Fable turn with signed thinking, then sends a turn that Fable
+		 * refuses with a live fallback credit, with the setup of each order above:
+		 * the walk runs on `chain`, and `usage` answers the usage reads.
+		 */
+		async function runCreditRefusal(
+			chain: Record<string, string[]>,
+			usage: Record<string, UsageAnswer>,
+		): Promise<{ run: WalkRun; requestedModels: string[] }> {
+			stubUsageReads(usage);
+			const requestedModels: string[] = [];
+			// Stamped with Fable's identity, so the retry policy reads the refusal as Fable's.
+			const mock = createMockModel({
+				provider: FABLE.provider,
+				id: FABLE.id,
+				responses: [
+					{
+						content: [
+							{ type: "thinking", thinking: "Signed reasoning.", thinkingSignature: "seed-signature" },
+							"Seeded turn",
+						],
+					},
+					refusalWithCredit(),
+				],
+				handler: { content: ["answered"] },
+			});
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: FABLE, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requestedModels.push(formatModelString(model));
+					return mock.stream(model, context, options);
+				},
+			});
+			const run = startSession(
+				agent,
+				walkSettings(FABLE, {
+					"retry.maxRetries": 1,
+					"retry.fallbackChains": chain,
+					"retry.fallbackRevertPolicy": "cooldown-expiry",
+				}),
+			);
+			await runTurn(run.session, "Seed signed thinking");
+			const seeded = agent.state.messages.findLast(
+				(message): message is AssistantMessage => message.role === "assistant",
+			);
+			if (!seeded) throw new Error("Expected the seeded assistant message");
+			seeded.api = FABLE.api;
+
+			await runTurn(run.session, "Recover from the refusal");
+			return { run, requestedModels };
+		}
+
+		it("keeps holding the same-provider Claude models for a live credit whose targets are not in the chain", async () => {
+			// No credit target is in the chain, so no target is seen spent: the
+			// credit stays live and the walk passes over the Claude model that
+			// cannot redeem it.
+			const { run, requestedModels } = await runCreditRefusal(chainOf(OTHER_CLAUDE), {});
+
+			expect(requestedModels).toEqual([formatModelString(FABLE), formatModelString(FABLE)]);
+			expect(run.fallbacks).toEqual([]);
+			expect(modelOf(run.session)).toBe(formatModelString(FABLE));
+			// The refusal ends the turn. The session drops it from the active
+			// context and keeps it as the last assistant message.
+			const refusal = run.session.getLastAssistantMessage();
+			expect(refusal?.stopReason).toBe("error");
+			expect(refusal?.stopDetails?.type).toBe("refusal");
+		});
+
+		it("redeems the credit on the next target when the first target is spent", async () => {
+			// A usable target keeps the credit live: the walk passes over the spent
+			// target and the Claude model that cannot redeem the credit.
+			const { run, requestedModels } = await runCreditRefusal(
+				chainOf(CREDIT_TARGET, OTHER_CLAUDE, NEXT_CREDIT_TARGET),
+				{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
+			);
+
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(NEXT_CREDIT_TARGET),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(NEXT_CREDIT_TARGET)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_CREDIT_TARGET));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		it("holds the same-provider Claude model back for a live credit whose target is usable", async () => {
+			const { run, requestedModels } = await runCreditRefusal(chainOf(OTHER_CLAUDE, CREDIT_TARGET), {});
+
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(CREDIT_TARGET),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(CREDIT_TARGET)]);
+			expect(modelOf(run.session)).toBe(formatModelString(CREDIT_TARGET));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
 	});
 
 	describe("the fallback before a turn keeps its rule", () => {
