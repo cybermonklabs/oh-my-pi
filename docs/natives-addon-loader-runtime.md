@@ -18,7 +18,7 @@ A successful call is not memoized by JS. Repeated calls rely on the runtime's `r
 - package version (the expected addon release, subject to the pre-sentinel compatibility exception below);
 - package-local `nativeDir` and the directory of `process.execPath`;
 - `nativesDir`: `getNativesDir()` from `native/natives-dir.js` (`@oh-my-pi/pi-natives/natives-dir`), the function pi-utils' `getNativesDir()` also calls, so the grammar directory the addon loads from is the one the agent installs into. In order: `PI_NATIVES_DIR` (trimmed, `~`-expanded, and normalized; empty or relative values are ignored), `<OMP_DOWNLOAD_ROOT>/natives`, on Linux and macOS `$XDG_CACHE_HOME/omp/natives` when `$XDG_CACHE_HOME/omp` exists, otherwise `<OMP_CONFIG_ROOT or ~/<PI_CONFIG_DIR or .omp>>/natives`. It never depends on the profile: the loader fixes the addon's grammar directory once, at load, and the profile can change later;
-- `versionedDir`: `<nativesDir>/<packageVersion>`;
+- `versionedDir`, this process's addon cache directory: `<nativesDir>/<packageVersion>-<digest prefix>`, where the digest prefix is the first 12 hex digits of the `digest` the addons carry from their build: the embedded manifest's for a compiled binary, the leaf package's `nativeAddons` for a Windows install that stages. Otherwise `<nativesDir>/<packageVersion>`, which only a compiled binary with no embedded addon probes;
 - legacy compiled-binary directory: `%LOCALAPPDATA%/omp` (or `~/AppData/Local/omp`) on Windows, `~/.local/bin` elsewhere;
 - workspace/install/compiled mode, optional leaf directory, Windows staging policy, CPU variant, filenames, and ordered candidates.
 
@@ -66,13 +66,17 @@ The platform leaf wins over a stale core artifact. Workspace loads deliberately 
 
 ### Windows `node_modules` staging
 
-When the platform is Windows, the runtime is non-compiled, and `nativeDir` contains a `node_modules` segment:
+When the platform is Windows, the runtime is non-compiled, `nativeDir` contains a `node_modules` segment, and the platform leaf package records its addons (`nativeAddons` in its `package.json`, see [the leaf package's addon list](#the-leaf-packages-addon-list)):
 
 1. Every selected filename in `versionedDir`.
 2. Leaf-package candidates.
 3. Package-local and executable candidates.
 
-Before probing, `maybeStageNodeModulesAddon()` copies each available filename from `leafPackageDir ?? nativeDir` to a missing cache target. Existing cache files are retained. This keeps the loaded DLL handle away from the package-manager copy that an update must replace. Directory/copy failures are recorded and normal probing continues.
+Before probing, `maybeStageNodeModulesAddon()` marks `versionedDir` used and copies each selected filename the leaf records into it. A copy already there with the recorded size is reused; any other is read from the leaf, checked against the recorded size and `sha256`, and written as extraction writes (below). `versionedDir` is named by the leaf's digest, so two installs of one release with different addons never share a staged copy. This keeps the loaded DLL handle away from the package-manager copy that an update must replace. Directory, read, check and write failures are recorded and normal probing continues. A leaf that records no addons is not staged: its addons load from where they are installed, never from a directory another install could have filled.
+
+#### The leaf package's addon list
+
+`scripts/gen-npm-packages.ts` writes `nativeAddons` into each leaf's `package.json` when it generates the package: `files[]` with each addon's `filename`, `size` and `sha256`, and `digest`, the SHA-256 over every `filename` and `sha256`, computed as the embedded manifest's is (`addonSetDigest()` in `scripts/embed-native.ts`). The loader reads it and never hashes an addon to name the directory.
 
 ### Compiled runtime
 
@@ -86,7 +90,8 @@ A successfully selected embedded candidate is prepended. Windows staging is disa
 `embedded-addon.js` is always `embeddedAddon = null` on disk, including the published core. Standalone binary builds replace it in memory with a manifest from `scripts/embed-native.ts` containing:
 
 - `platformTag` and package `version`;
-- `files[]` with `variant`, basename-only `filename`, decompressed `size`, and `zstdPath`, the embedded `<filename>.zst` zstd frame holding that addon.
+- `digest`, the SHA-256 over every file's `filename` and `sha256`: the build's identity, computed when the binary is built;
+- `files[]` with `variant`, basename-only `filename`, decompressed `size`, the decompressed addon's `sha256`, and `zstdPath`, the embedded `<filename>.zst` zstd frame holding that addon.
 
 Extraction runs only for compiled mode with matching platform and version and a selectable file. Selection is:
 
@@ -94,7 +99,7 @@ Extraction runs only for compiled mode with matching platform and version and a 
 - modern x64: `modern`, then `baseline`;
 - baseline x64: `baseline` only.
 
-The loader creates `versionedDir` and rejects any manifest filename that is not a bare basename. Each manifest file that is already a regular file with the declared size is reused; every other one is decompressed from its zstd frame, checked against the declared size, and written through a temporary file plus rename. Unreadable frames, corrupt frames, and size mismatches are errors.
+Every build of a release carries the same version, and two builds' addons can have the same size, so neither decides whether a cached file is this build's. Each build extracts into its own `versionedDir`, named by its digest, and only ever reads files it wrote there. The loader creates `versionedDir` and rejects any manifest filename that is not a bare basename. Each manifest file that is already a regular file with the declared size is reused: the loader puts a file in this directory only by renaming a copy whose SHA-256 it checked, so the size shows the file is whole without reading it at every start. Every other file is decompressed from its zstd frame, checked against the declared size and `sha256`, and written to a temporary file that is synced to disk, renamed into place, and followed by a sync of the directory (not on Windows, which cannot open a directory; a directory sync that fails is ignored, since the file is already whole and in place). A crash therefore never leaves a file of the right size with missing bytes. Unreadable frames, corrupt frames, size mismatches, and digest mismatches are errors, and nothing is written for them. A same-size file changed in place after extraction is not detected.
 
 Extraction errors are accumulated; the loader continues to ordinary candidates.
 
@@ -106,16 +111,26 @@ For each candidate:
 2. `require(candidate)`.
 3. Unless this is workspace development, require `__piNativesBuildVersion()` to return the package version. The build pipeline writes that version into a fixed 64-byte slot (`PI_NATIVES_VERSION_STAMP:<version>` + NUL padding) after linking (`scripts/stamp-native-version.ts`, called from every `scripts/bazel-natives.ts` install, the local cargo build, and the Nix package build), so a release bump edits no Rust input. Addons published before the stamp expose a per-release `__piNativesV<version_with_underscores>` export instead; those are still read as their release for diagnosis.
 4. Call `__ompInstallTokioRuntime()` if the addon provides it.
-5. Best-effort remove valid semantic-version cache directories older than the current version.
+5. Best-effort remove the addon cache directories no omp process has used for a day, other than `versionedDir`.
 6. Return the bindings.
 
 The version error distinguishes a previous addon still resident in the current process from a stale file on disk. If the loaded exports report an older release but the candidate bytes contain the current stamp (`PI_NATIVES_VERSION_STAMP:<packageVersion>\0`), the diagnostic says to restart. Otherwise it says to reinstall. The loader does not validate all public exports. As a compatibility exception, an addon with no release identity is accepted if it has `countTokens`, `executeShell`, `visibleWidth`, and a `DesktopSession` with `capture`, `execute`, and `close`, and the candidate bytes do not carry the expected current stamp. An unstamped current addon that exposes the stamp reader is not eligible.
 
-Workspace development skips the version check entirely, so a checkout that pulled a newer release boots before its rebuild. That tolerance is not silent: `native/index.js` uses `missingNativeExport(symbol)` for missing ordinary function exports (release-identity functions remain raw passthroughs), which is `undefined` on a current addon and a throwing stub on a stale one naming the symbol, the addon path, the loaded and expected releases, and `bun run build:native`. `nativeAddonStatus()` reports the same identity (`path`, `version`, `packageVersion`, `stale`) for callers that surface it themselves.
+Workspace development skips the version check entirely, so a checkout that pulled a newer release boots before its rebuild. That tolerance is not silent: `native/index.js` uses `missingNativeExport(symbol)` for missing ordinary function exports (release-identity functions remain raw passthroughs), which is `undefined` on a current addon and a throwing stub on a stale one naming the symbol, the addon path, the loaded and expected releases, and `bun run build:native`. `nativeAddonStatus()` reports the same identity (`path`, `version`, `packageVersion`, `stale`, `builtFromOtherSources`) for callers that surface it themselves.
 
 Rust module initialization installs crash diagnostics but does not spawn runtime threads under the dynamic-loader lock. The optional post-load hook installs bounded Windows Tokio and Rayon pools. It is best-effort; older addons or hook failures fall back to napi-rs behavior. Set `PI_DEBUG_STARTUP` to emit synchronous `[startup]` markers to stderr, including hook success/failure.
 
-Cache cleanup ignores read/delete failures and removes only directories named with an older `major.minor.patch` release and an mtime at least ten minutes old. `prepareNativeVersionDir()` refreshes the directory mtime before extraction or staging to protect concurrent starts. Cleanup preserves current/future versions, prerelease/non-version names, ordinary files, and recently active directories.
+Cache cleanup ignores read/delete failures. It considers only directories named `<major.minor.patch>` or `<major.minor.patch>-<12 hex digits>`, whatever their version, never `versionedDir`, and removes those whose mtime is more than a day old. Every start marks the directory it loads from as used: `prepareNativeVersionDir()` refreshes the mtime before extraction and at every staging start, reused copy or not. Two builds run in turn therefore keep one extracted addon each instead of extracting one at every switch, a directory a concurrent start is populating survives, and a build nobody has started for a day loses its directory and extracts again if it starts. Cleanup preserves `grammars`, prerelease and other names, and ordinary files.
+
+## Workspace addons built from other Rust sources
+
+A release difference is not the only way a workspace addon goes stale: an addon of this release built before the checkout's Rust sources changed carries other code under the same version. The native build therefore records the sources it compiled next to the addon, in `<addon>.sources.json`, and a workspace load compares that record with the checkout (`native/workspace-sources.js`). Compiled binaries and package installs never read it.
+
+- **What the sources are:** the files the build that made the addon compiles, named in the record as roots. A Cargo build (`CARGO_SOURCE_ROOTS`): `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` and `crates/`. A Bazel build (`BAZEL_SOURCE_ROOTS`): those, plus the root `BUILD.bazel`, `MODULE.bazel`, `.bazelrc`, `.bazelversion`, `.bazelignore` and `bazel/` (each crate's `BUILD.bazel` is under `crates/`). `MODULE.bazel.lock` is left out: a build rewrites it after `MODULE.bazel` changes, and it follows from `MODULE.bazel`. Below a root, `target` directories and names starting with a dot (editor swap files, `.DS_Store`; no compiled input is one) are skipped. A record naming a root outside the checkout is not judged.
+- **Who writes the record:** `scripts/bazel-natives.ts` (Bazel builds, and the copy of a Cargo build it installs elsewhere) and `packages/natives/scripts/build-bindings.ts` (Cargo builds), from the sources read before the build begins, so an edit made during the build reads as other sources rather than current. The record names the addon file by its size and modification time. It also keeps the build's settings (`build`: for Cargo the profile, features and `RUSTFLAGS`; for Bazel the labels, extra arguments and `OMP_BAZEL_RC`) to explain an addon; they are never compared. A `--source` install of prebuilt addons removes any record, since those sources are unknown.
+- **What a load compares:** the record holds the sources' digest (SHA-256 over each file's path, size and bytes) and a fingerprint (SHA-256 over each file's path, size and modification time) of a tree state whose digest is known. A start reads the record, the addon's size and time, and every source file's size and time. It reads the sources' bytes only for a fingerprint it has not seen, then writes that fingerprint and its digest back into the record (best-effort), so a tree whose files were rewritten with the same content is read once, not at every start.
+- **The verdict:** a digest other than the build's marks the addon `stale` with `builtFromOtherSources`: the stale-addon notice names the addon and its record, and absent exports get the throwing stubs. An addon without a record, or whose record names another addon file (an addon built before records existed, or copied in, as CI's prebuilt addons are), is not judged and loads as before.
+- **Limit:** a source changed without a new size or modification time (a copy that keeps both) is not seen, as git and cargo do not see it either.
 
 ## Failure diagnostics
 
@@ -136,7 +151,7 @@ entrypoint evaluates or lazy wrapper is invoked
   -> require candidates in deterministic order
        -> validate release stamp outside workspace development
        -> install optional post-load runtime; record addon identity
-       -> best-effort clean older version caches
+       -> best-effort clean cache directories unused for a day
        -> return bindings
   -> no success: throw unsupported-platform or aggregated load error
 ```

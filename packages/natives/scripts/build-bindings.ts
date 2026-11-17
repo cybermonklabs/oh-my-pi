@@ -19,6 +19,7 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
 import { stampNativeVersion } from "../../../scripts/stamp-native-version";
+import { CARGO_SOURCE_ROOTS, readRustSources, writeAddonSourcesStamp } from "../native/workspace-sources.js";
 import { generateEnumExports } from "./gen-enums";
 
 // pcre2-sys prefers a system libpcre2 when pkg-config finds one. Keep the
@@ -254,6 +255,10 @@ function tailSection(label: string, text: string): string {
 	return `\n--- ${label}${capped ? ` (last ${BUILD_LOG_TAIL_LINES} lines)` : ""} ---\n${shown.join("\n")}`;
 }
 
+// Read before the build begins: an edit made while cargo runs then reads as other sources,
+// so the workspace loader asks for a rebuild instead of trusting a mixed build.
+const sources = readRustSources(repoRoot, CARGO_SOURCE_ROOTS);
+
 try {
 	// The package declares Bun as its build runtime. Invoke napi's JavaScript
 	// entry through this Bun process instead of its `#!/usr/bin/env node` shim so
@@ -275,6 +280,14 @@ try {
 		console.log(`Normalizing native addon filename: ${path.basename(builtAddonPath)} → ${canonicalAddonFilename}`);
 		await installBinary(builtAddonPath, canonicalAddonPath);
 	}
+	// The workspace loader compares this record with the checkout (native/workspace-sources.js);
+	// the settings are there to explain the addon, never compared.
+	writeAddonSourcesStamp(canonicalAddonPath, sources, {
+		builder: "cargo",
+		profile: cargoProfile,
+		features: extraFeatures || null,
+		rustflags: Bun.env.RUSTFLAGS ?? null,
+	});
 
 	await installGeneratedBindings(buildOutputDir);
 

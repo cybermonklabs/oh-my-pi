@@ -38,12 +38,24 @@
  *
  * Every install stamps packages/natives/package.json#version into the addon's
  * post-link version slot (scripts/stamp-native-version.ts), so release bumps
- * never touch a Rust input. After install, the addon for the host's own target
- * is dlopen-probed in a child process and an unloadable image (or a load that
- * hangs) fails the build.
+ * never touch a Rust input. An addon built here also gets `<addon>.sources.json`,
+ * the build's sources (Bazel's own inputs as well, for a Bazel build) read before
+ * the build began, which the workspace loader compares with the checkout
+ * (packages/natives/native/workspace-sources.js); a `--source` install, whose
+ * sources are unknown, removes any such record. After
+ * install, the addon for the host's own target is dlopen-probed in a child
+ * process and an unloadable image (or a load that hangs) fails the build.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import {
+	addonSourcesStampPath,
+	BAZEL_SOURCE_ROOTS,
+	copyAddonSourcesStamp,
+	type RustSources,
+	readRustSources,
+	writeAddonSourcesStamp,
+} from "../packages/natives/native/workspace-sources.js";
 import { detectHostAvx2Support, detectHostMusl, resolveLocalHostAddon } from "./host-detect";
 import { hasVersionStampSlot, nativesPackageVersion, stampNativeVersion } from "./stamp-native-version";
 
@@ -362,6 +374,7 @@ async function buildLocalHostAddon(host: HostInfo, destDir: string): Promise<voi
 	if (path.dirname(builtPath) !== destDir) {
 		await fs.mkdir(destDir, { recursive: true });
 		await installAddon(builtPath, path.join(destDir, filename), await nativesPackageVersion(), false);
+		copyAddonSourcesStamp(builtPath, path.join(destDir, filename));
 	}
 	console.log(`installed ${filename} → ${path.join(destDir, filename)}`);
 	await verifyHostAddonLoads(path.join(destDir, filename), undefined, await nativesPackageVersion());
@@ -406,6 +419,8 @@ async function main(): Promise<void> {
 		return;
 	}
 	let outputs: string[];
+	// Null for a `--source` install: those addons were built from sources this checkout cannot name.
+	let recorded: { sources: RustSources; build: Record<string, unknown> } | null = null;
 
 	if (options.source) {
 		const sourceDir = path.resolve(options.source);
@@ -430,7 +445,13 @@ async function main(): Promise<void> {
 		// endpoint composition stays in .github/actions/bazel-cache.
 		const rcPath = Bun.env.OMP_BAZEL_RC?.trim();
 		const startupArgs = rcPath ? [`--bazelrc=${rcPath}`] : [];
-
+		// Read before the build begins: an edit made while bazel runs then reads as other
+		// sources, so the workspace loader asks for a rebuild instead of trusting a mixed build.
+		recorded = {
+			sources: readRustSources(repoRoot, BAZEL_SOURCE_ROOTS),
+			// Kept to explain the addon; never compared.
+			build: { builder: "bazel", labels, args: options.bazelArgs, bazelrc: rcPath || null },
+		};
 		const buildArgs = [...startupArgs, "build", ...options.bazelArgs, "--", ...labels];
 		console.log(`$ ${path.basename(bazel)} ${buildArgs.join(" ")}`);
 		const build = await runBazel(bazel, buildArgs, "inherit");
@@ -481,6 +502,8 @@ async function main(): Promise<void> {
 		const absolute = path.isAbsolute(output) ? output : path.join(repoRoot, output);
 		const destPath = path.join(destDir, path.basename(output));
 		const stamped = await installAddon(absolute, destPath, version, options.source !== undefined);
+		if (recorded) writeAddonSourcesStamp(destPath, recorded.sources, recorded.build);
+		else await fs.rm(addonSourcesStampPath(destPath), { force: true });
 		console.log(
 			stamped
 				? `installed ${path.basename(output)} (stamped ${version}) → ${destPath}`

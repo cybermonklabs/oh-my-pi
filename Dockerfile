@@ -98,6 +98,8 @@ RUN set -eux; \
 # Layer 4 — compile pi-natives to a Linux N-API addon. Persistent caches keep
 # repeat builds incremental: cargo's package index + git-deps (CARGO_HOME is
 # /usr/local/cargo in the rust image, not ~/.cargo) + the workspace target dir.
+# The seed keeps the build's sources record (`<addon>.sources.json`) and, with
+# `cp -p`, the addon's modification time, by which that record names it.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/pi/target \
@@ -105,7 +107,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     bun --cwd=packages/natives run build; \
     mkdir -p /out; \
     cp packages/natives/native/pi_natives.linux-*.node /out/; \
-    cp packages/natives/native/pi_natives.linux-*.node \
+    cp -p packages/natives/native/pi_natives.linux-*.node \
+       packages/natives/native/pi_natives.linux-*.node.sources.json \
        packages/natives/native/index.d.ts packages/natives/native/index.js \
        packages/natives/native/embedded-addon.js /out/natives-seed/
 

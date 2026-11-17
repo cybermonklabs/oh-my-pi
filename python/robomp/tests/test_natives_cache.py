@@ -78,14 +78,26 @@ def _seed_repo(root: Path, *, with_all_inputs: bool = True) -> Path:
     return root
 
 
-def _populate_built_artifacts(repo_dir: Path, *, body: bytes = b"\x7fELF...native") -> Path:
-    """Fill `packages/natives/native/` with a complete built-artifact set."""
+NODE = "pi_natives.linux-arm64.node"
+SOURCES_RECORD = f"{NODE}.sources.json"
+
+
+def _populate_built_artifacts(
+    repo_dir: Path, *, body: bytes = b"\x7fELF...native", sources_record: str | None = None
+) -> Path:
+    """Fill `packages/natives/native/` with a complete built-artifact set.
+
+    ``sources_record`` is written next to the addon as the native build writes
+    `<addon>.sources.json`, its record of the Rust sources it compiled.
+    """
     native_dir = repo_dir / "packages" / "natives" / "native"
     native_dir.mkdir(parents=True, exist_ok=True)
-    (native_dir / "pi_natives.linux-arm64.node").write_bytes(body)
+    (native_dir / NODE).write_bytes(body)
     (native_dir / "index.d.ts").write_text("export const X: number;\n")
     (native_dir / "index.js").write_text("export const X = 1;\n")
     (native_dir / "embedded-addon.js").write_text("export const embeddedAddon = null;\n")
+    if sources_record is not None:
+        (native_dir / SOURCES_RECORD).write_text(sources_record)
     return native_dir
 
 
@@ -227,10 +239,57 @@ def test_capture_then_populate_copies_artifacts(tmp_path: Path) -> None:
         assert cached_companion.read_text() == original, name
 
 
-@pytest.mark.parametrize("name", ["index.js", "pi_natives.linux-arm64.node"])
+def _clone_workspace(src_repo: Path, name: str) -> Path:
+    dst_repo = src_repo.parent.parent / name / "repo"
+    dst_repo.mkdir(parents=True)
+    _git(["clone", str(src_repo), str(dst_repo)], cwd=dst_repo.parent)
+    dst_native = dst_repo / "packages" / "natives" / "native"
+    dst_native.mkdir(parents=True, exist_ok=True)
+    return dst_native
+
+
+def test_capture_then_populate_restores_the_sources_record_with_the_addon_it_names(tmp_path: Path) -> None:
+    cache = _cache(tmp_path)
+    src_repo = _seed_repo(tmp_path / "src" / "repo")
+    record = '{"addon":{"size":15,"mtimeMs":1},"sources":"d1","seen":{"fingerprint":"f1","sources":"d1"}}\n'
+    native_dir = _populate_built_artifacts(src_repo, sources_record=record)
+    key = compute_key(src_repo, target="linux-arm64")
+    stored = cache.capture(REPO, key, native_dir)
+    assert stored is not None
+
+    dst_native = _clone_workspace(src_repo, "dst")
+    hit = cache.populate_workspace(REPO, key, dst_native)
+
+    assert hit is not None
+    assert dst_native / SOURCES_RECORD in hit.files
+    assert (dst_native / SOURCES_RECORD).read_text() == record
+    # The record names its addon by size and modification time; the restored addon keeps both,
+    # so the workspace loader still takes the record for this addon.
+    src_stat, dst_stat = (native_dir / NODE).stat(), (dst_native / NODE).stat()
+    assert (dst_stat.st_size, dst_stat.st_mtime_ns) == (src_stat.st_size, src_stat.st_mtime_ns)
+
+
+def test_an_entry_without_a_sources_record_is_served_and_leaves_none(tmp_path: Path) -> None:
+    cache = _cache(tmp_path)
+    src_repo = _seed_repo(tmp_path / "src" / "repo")
+    native_dir = _populate_built_artifacts(src_repo)
+    key = compute_key(src_repo, target="linux-arm64")
+    assert cache.capture(REPO, key, native_dir) is not None
+    dst_native = _clone_workspace(src_repo, "dst")
+    # A record an earlier build left in the workspace describes another addon.
+    (dst_native / SOURCES_RECORD).write_text('{"sources":"from an earlier build"}\n')
+
+    hit = cache.populate_workspace(REPO, key, dst_native)
+
+    assert hit is not None
+    assert (dst_native / NODE).read_bytes() == b"\x7fELF...native"
+    assert not (dst_native / SOURCES_RECORD).exists()
+
+
+@pytest.mark.parametrize("name", ["index.js", "pi_natives.linux-arm64.node", SOURCES_RECORD])
 def test_capture_rejects_symlink_sources(tmp_path: Path, name: str) -> None:
     cache = _cache(tmp_path)
-    native = _populate_built_artifacts(_seed_repo(tmp_path / "repo"))
+    native = _populate_built_artifacts(_seed_repo(tmp_path / "repo"), sources_record="{}\n")
     secret = tmp_path / "secret"
     secret.write_text("private marker")
     (native / name).unlink()

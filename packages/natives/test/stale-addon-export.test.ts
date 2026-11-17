@@ -37,6 +37,7 @@ function status(overrides: Partial<NativeAddonStatus> = {}): NativeAddonStatus {
 		version: "18.1.18",
 		packageVersion: "18.2.6",
 		stale: true,
+		builtFromOtherSources: false,
 		...overrides,
 	};
 }
@@ -73,8 +74,8 @@ describe("native exports missing from a stale addon", () => {
 		expect(loaded).not.toBeNull();
 		expect(loaded?.path.endsWith(".node")).toBe(true);
 		// Whatever the tree's build state, the flag the stubs branch on must be
-		// the one the reported release implies.
-		expect(loaded?.stale).toBe(loaded?.version !== loaded?.packageVersion);
+		// the one the reported release, or the build's record of its sources, implies.
+		expect(loaded?.stale).toBe(loaded?.version !== loaded?.packageVersion || loaded?.builtFromOtherSources);
 	});
 
 	// A bare `undefined` class export reaches `new RunTrace(cmd)` in
@@ -113,6 +114,18 @@ describe("stale workspace addon notice", () => {
 		expect(notice).toContain("@18.2.6");
 		expect(notice).toContain("bun run build:native");
 		expect(notice.endsWith("\n")).toBe(true);
+	});
+
+	it("names an addon of this release built from other Rust sources, and the rebuild", () => {
+		const otherSources = status({ version: "18.2.6", builtFromOtherSources: true });
+		const notice = staleWorkspaceAddonNotice(otherSources);
+		expect(notice).toContain(`${addonPath} was built from Rust sources other than this checkout's`);
+		expect(notice).toContain(`${addonPath}.sources.json`);
+		expect(notice).toContain("bun run build:native");
+		expect(notice).not.toContain("but this checkout is");
+		expect(missingNativeExportMessage("search", otherSources)).toContain(
+			`${addonPath} was built from Rust sources other than this checkout's`,
+		);
 	});
 
 	// `loadNative()` is not a startup-only call: `native/clipboard.js` and the

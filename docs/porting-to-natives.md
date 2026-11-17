@@ -125,9 +125,9 @@ Confirm the export is present and `__piNativesBuildVersion()` reports the packag
 
 ### Stale variant or cache wins
 
-x64 candidate order is modern → baseline → unsuffixed for a modern host, and baseline → unsuffixed for a baseline host. Compiled and staged Windows loads can also win from `<getNativesDir()>/<version>` before package paths. `getNativesDir()` (`@oh-my-pi/pi-natives/natives-dir`, shared with pi-utils) honors `PI_NATIVES_DIR` first (trimmed, `~`-expanded, and normalized; empty or relative values are ignored), then `<OMP_DOWNLOAD_ROOT>/natives`, then on Linux and macOS `$XDG_CACHE_HOME/omp/natives` when `$XDG_CACHE_HOME/omp` exists, otherwise `<OMP_CONFIG_ROOT or ~/<PI_CONFIG_DIR or .omp>>/natives`.
+x64 candidate order is modern → baseline → unsuffixed for a modern host, and baseline → unsuffixed for a baseline host. Compiled loads can also win from their build's `<getNativesDir()>/<version>-<digest prefix>`, and staged Windows loads from their leaf package's `<getNativesDir()>/<version>-<digest prefix>`, before package paths. `getNativesDir()` (`@oh-my-pi/pi-natives/natives-dir`, shared with pi-utils) honors `PI_NATIVES_DIR` first (trimmed, `~`-expanded, and normalized; empty or relative values are ignored), then `<OMP_DOWNLOAD_ROOT>/natives`, then on Linux and macOS `$XDG_CACHE_HOME/omp/natives` when `$XDG_CACHE_HOME/omp` exists, otherwise `<OMP_CONFIG_ROOT or ~/<PI_CONFIG_DIR or .omp>>/natives`.
 
-Remove only the stale local artifacts/cache identified by loader diagnostics, then rebuild. The loader best-effort deletes older `major.minor.patch` cache directories after a successful load only when their mtime is at least ten minutes old; it preserves the current-version directory.
+Remove only the stale local artifacts/cache identified by loader diagnostics, then rebuild. After a successful load the loader best-effort deletes the cache directories (`<major.minor.patch>` and `<major.minor.patch>-<digest prefix>`) no omp process has used for a day; it preserves its own directory.
 
 ### Declarations changed but shipping addon did not
 

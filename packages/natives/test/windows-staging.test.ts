@@ -7,11 +7,13 @@
  * tool execution (see Discord report, 2026-05-14).
  *
  * The fix has two halves, both pinned by this test:
- *   1. The loader stages `nativeDir/<filename>.node` → `versionedDir/<filename>.node`
- *      (per-package-version cache under `~/.omp/natives/<version>/`) so the
- *      running process holds its OS-level handle on a path bun is never asked
- *      to overwrite. Gated to Windows + node_modules installs + non-compiled
- *      mode by `shouldStageNodeModulesAddon`.
+ *   1. The loader stages the leaf package's `<filename>.node` →
+ *      `<natives dir>/<version>-<digest prefix>/<filename>.node`, named by the digest
+ *      the leaf package records when it is built (`nativeAddons` in its package.json),
+ *      so the running process holds its OS-level handle on a path bun is never asked
+ *      to overwrite, and two installs of one release never share a staged copy.
+ *      Gated to Windows + node_modules installs + non-compiled mode by
+ *      `shouldStageNodeModulesAddon`, and to a leaf package that records its addons.
  *   2. `resolveLoaderCandidates` puts the staged path ahead of the
  *      `node_modules` path so subsequent updates land in node_modules without
  *      contention.
@@ -19,19 +21,20 @@
  * Both behaviors are off in workspace dev (`bun --cwd=packages/natives run
  * build`) and on non-Windows so the regular path is unchanged.
  */
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	cleanupStaleNativeVersions,
 	getAddonFilenames,
 	initLoaderContext,
-	prepareNativeVersionDir,
+	maybeStageNodeModulesAddon,
 	resolveLoaderCandidates,
 	shouldStageNodeModulesAddon,
 } from "../native/loader-state.js";
 import packageJson from "../package.json" with { type: "json" };
+import { generateNpmPackages } from "../scripts/gen-npm-packages";
+import { durableWriteCalls, recordingFs } from "./recording-fs";
 
 const winNodeModulesNativeDir = "C:\\Users\\Admin\\node_modules\\@oh-my-pi\\pi-natives\\native";
 const winWorkspaceNativeDir = "C:\\Users\\Admin\\dev\\oh-my-pi\\packages\\natives\\native";
@@ -164,39 +167,140 @@ describe("windows native addon staging", () => {
 
 			expect(uppercaseWindowsInstall.isWorkspaceLoad).toBe(false);
 			expect(uppercaseWindowsInstall.leafPackageDir).toBe(leafPackageDir);
-			expect(uppercaseWindowsInstall.stageFromNodeModules).toBe(true);
+			// This leaf is not on disk, so it records no addons and nothing is staged; the tests
+			// below stage from an uppercase `NODE_MODULES` install whose leaf does.
+			expect(uppercaseWindowsInstall.stageFromNodeModules).toBe(false);
 			expect(uppercaseWindowsInstall.candidates).toContain(windowsLeafCandidate);
 		} finally {
 			if (previousVariantCache === undefined) delete process.env[variantCacheKey];
 			else process.env[variantCacheKey] = previousVariantCache;
 		}
 	});
+});
 
-	it("removes only older version directories after the current native version loads", async () => {
-		const nativesDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-natives-cache-"));
-		const currentMajor = Number.parseInt(packageJson.version, 10);
-		const futureVersion = `${currentMajor + 1}.0.0`;
-		const staleVersion = "15.10.11";
-		const freshVersion = "15.10.12";
-		try {
-			await fs.mkdir(path.join(nativesDir, staleVersion));
-			await fs.mkdir(path.join(nativesDir, freshVersion));
-			await fs.mkdir(path.join(nativesDir, packageJson.version));
-			await fs.mkdir(path.join(nativesDir, futureVersion));
-			await fs.mkdir(path.join(nativesDir, "not-a-version"));
-			await Bun.write(path.join(nativesDir, "README.txt"), "not a version directory");
-			await fs.utimes(path.join(nativesDir, staleVersion), new Date(0), new Date(0));
-			await fs.utimes(path.join(nativesDir, freshVersion), new Date(0), new Date(0));
-			prepareNativeVersionDir(path.join(nativesDir, freshVersion));
+describe("windows staging into the leaf package's digest directory", () => {
+	const ENV_KEYS = ["PI_NATIVES_DIR", "PI_NATIVE_VARIANT", "__PI_NATIVE_VARIANT_CACHE"] as const;
+	const tag = `win32-${process.arch}`;
+	const leafAddonFilenames =
+		process.arch === "x64"
+			? [`pi_natives.${tag}-baseline.node`, `pi_natives.${tag}-modern.node`]
+			: [`pi_natives.${tag}.node`];
+	let saved: Partial<Record<(typeof ENV_KEYS)[number], string>> = {};
+	let root = "";
+	let nativesDir = "";
 
-			const removed = cleanupStaleNativeVersions({ nativesDir, currentVersion: packageJson.version });
+	beforeEach(async () => {
+		saved = {};
+		for (const key of ENV_KEYS) if (process.env[key] !== undefined) saved[key] = process.env[key];
+		root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-staging-"));
+		nativesDir = path.join(root, "natives");
+		process.env.PI_NATIVES_DIR = nativesDir;
+		process.env.PI_NATIVE_VARIANT = "modern";
+		delete process.env.__PI_NATIVE_VARIANT_CACHE;
+	});
 
-			expect(removed.map(filePath => path.basename(filePath))).toEqual([staleVersion]);
-			expect((await fs.readdir(nativesDir)).sort()).toEqual(
-				["README.txt", freshVersion, packageJson.version, futureVersion, "not-a-version"].sort(),
-			);
-		} finally {
-			await fs.rm(nativesDir, { recursive: true, force: true });
+	afterEach(async () => {
+		for (const key of ENV_KEYS) {
+			if (saved[key] === undefined) delete process.env[key];
+			else process.env[key] = saved[key];
 		}
+		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	/** Generate a leaf package, as a release does, holding addons whose bytes name `install`. */
+	async function leafPackage(install: string) {
+		const packageDir = path.join(root, `package-${install}`);
+		await Bun.write(path.join(packageDir, "package.json"), JSON.stringify({ version: packageJson.version }));
+		await Bun.write(path.join(packageDir, "LICENSE"), "MIT\n");
+		await Bun.write(path.join(packageDir, "THIRD-PARTY-NOTICES.txt"), "Notices\n");
+		const addons = new Map(leafAddonFilenames.map(filename => [filename, `install ${install} ${filename}`]));
+		for (const [filename, bytes] of addons) await Bun.write(path.join(packageDir, "native", filename), bytes);
+		const [leaf] = await generateNpmPackages({ packageDir, tags: [tag] });
+		const digest: string = (await Bun.file(path.join(leaf.dir, "package.json")).json()).nativeAddons.digest;
+		return {
+			leafDir: leaf.dir,
+			addons,
+			stagedDir: path.join(nativesDir, `${packageJson.version}-${digest.slice(0, 12)}`),
+		};
+	}
+
+	function windowsInstall(leafPackageDir: string) {
+		return initLoaderContext({
+			platform: "win32",
+			isCompiledBinary: false,
+			nativeDir: path.join(root, "NODE_MODULES/@oh-my-pi/pi-natives/native"),
+			leafPackageDir,
+		});
+	}
+
+	it("stages into its own digest directory and never loads another install's copy", async () => {
+		const install = await leafPackage("A");
+		const ctx = windowsInstall(install.leafDir);
+		const first = ctx.addonFilenames.find(filename => install.addons.has(filename))!;
+		// Another install of this release, of the same size: where the loader staged before
+		// build digests, and in that install's own digest directory.
+		const other = install.addons.get(first)!.replace("install A", "install B");
+		await Bun.write(path.join(nativesDir, packageJson.version, first), other);
+		await Bun.write(path.join(nativesDir, `${packageJson.version}-bbbbbbbbbbbb`, first), other);
+		const errors: string[] = [];
+
+		const staged = maybeStageNodeModulesAddon(ctx, errors);
+
+		expect(errors).toEqual([]);
+		expect(staged).toBe(path.join(install.stagedDir, first));
+		expect(ctx.candidates[0]).toBe(staged!);
+		expect(await Bun.file(staged!).text()).toBe(install.addons.get(first)!);
+	});
+
+	it("replaces a truncated copy in its own digest directory", async () => {
+		const install = await leafPackage("A");
+		const ctx = windowsInstall(install.leafDir);
+		const first = ctx.addonFilenames.find(filename => install.addons.has(filename))!;
+		await Bun.write(path.join(install.stagedDir, first), install.addons.get(first)!.slice(0, 5));
+
+		const staged = maybeStageNodeModulesAddon(ctx, []);
+
+		expect(await Bun.file(staged!).text()).toBe(install.addons.get(first)!);
+	});
+
+	it("reuses its staged copy and marks the directory used", async () => {
+		const install = await leafPackage("A");
+		const ctx = windowsInstall(install.leafDir);
+		const staged = maybeStageNodeModulesAddon(ctx, [])!;
+		const { ino } = await fs.stat(staged);
+		const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+		await fs.utimes(install.stagedDir, twoDaysAgo, twoDaysAgo);
+
+		expect(maybeStageNodeModulesAddon(ctx, [])).toBe(staged);
+
+		expect((await fs.stat(staged)).ino).toBe(ino);
+		expect(Date.now() - (await fs.stat(install.stagedDir)).mtimeMs).toBeLessThan(60_000);
+	});
+
+	it("stages nothing from a leaf package that records no addons", async () => {
+		const install = await leafPackage("A");
+		const manifestPath = path.join(install.leafDir, "package.json");
+		const { nativeAddons: _, ...manifest } = await Bun.file(manifestPath).json();
+		await Bun.write(manifestPath, JSON.stringify(manifest));
+		const ctx = windowsInstall(install.leafDir);
+
+		expect(ctx.stageFromNodeModules).toBe(false);
+		expect(maybeStageNodeModulesAddon(ctx, [])).toBeNull();
+		expect(ctx.candidates.filter(candidate => candidate.startsWith(nativesDir))).toEqual([]);
+		expect(await fs.exists(nativesDir)).toBe(false);
+	});
+
+	it("syncs each staged addon before renaming it into place, and its directory after", async () => {
+		const install = await leafPackage("A");
+		const ctx = windowsInstall(install.leafDir);
+		const { io, calls } = recordingFs();
+
+		maybeStageNodeModulesAddon(ctx, [], io);
+
+		const staged = ctx.addonFilenames.filter(filename => install.addons.has(filename));
+		expect(staged.length).toBeGreaterThan(0);
+		expect(calls).toEqual(
+			staged.flatMap(filename => durableWriteCalls(path.join(install.stagedDir, filename), install.stagedDir)),
+		);
 	});
 });

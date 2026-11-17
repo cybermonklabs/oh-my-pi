@@ -269,8 +269,8 @@ Runtime x64 candidate order also includes the unsuffixed default filename after 
 
 ## Runtime flags
 
-- `PI_NATIVES_DIR`: overrides the native addon extraction/staging root before XDG/default paths; the loader appends the package version. Values are trimmed, `~`-expanded, and normalized; empty or relative values are ignored. Downloaded tree-sitter grammars live in its `grammars/` subdirectory, which the loader passes to the addon and version cleanup leaves alone; other application data stays at its usual location. The directory must be writable only by the user(s) running `omp`: reuse checks only the file size, and the version sentinel is read after the addon is loaded, so a same-sized file planted by another user would be loaded.
-  A directory shared by several `omp` versions is subject to the normal stale-version cleanup: a newer version's successful load removes older version directories idle for ten minutes, so a long-running older-version run whose directory was deleted re-extracts on its next fresh process start.
+- `PI_NATIVES_DIR`: overrides the native addon extraction/staging root before XDG/default paths; the loader extracts or stages into `<version>-<digest prefix>`, named by the digest the addons carry from their build (the embedded manifest's, or the leaf package's `nativeAddons`). Values are trimmed, `~`-expanded, and normalized; empty or relative values are ignored. Downloaded tree-sitter grammars live in its `grammars/` subdirectory, which the loader passes to the addon and cache cleanup leaves alone; other application data stays at its usual location. The directory must be writable only by the user(s) running `omp`: a file already in a build's own directory is reused when its size matches, and the version sentinel is read after the addon is loaded, so a same-sized file planted there by another user would be loaded.
+  A directory shared by several `omp` builds or versions keeps every cache directory an `omp` process used within a day, whatever its version, and removes the rest, so a long-running run whose directory was removed re-extracts on its next fresh process start.
 - `PI_NATIVE_VARIANT`: x64 runtime override; valid values are `modern` and `baseline`. Invalid values are ignored; the inherited variant cache is consulted before detection.
 - `PI_DEBUG_STARTUP`: writes synchronous `[startup] native:…` markers to stderr around loader entry, embedded extraction, candidate loads, and native Tokio runtime installation; use it to localize startup hangs.
 - `PI_COMPILED`: compiled-mode signal. Release compilation constant-folds `process.env.PI_COMPILED` to `"true"`; a populated embedded-addon manifest and Bun embedded URL markers also signal compiled mode.
@@ -284,7 +284,7 @@ Runtime x64 candidate order also includes the unsuffixed default filename after 
    - x64 looks for `modern` and `baseline` files;
    - non-x64 looks for one default file.
 3. **Validate availability**: at least one expected file must exist in `packages/natives/native`.
-4. **Validate release and generate frames + manifest**: every available addon must contain the current version stamp or legacy version sentinel. Compress each addon into its own in-memory `native/<addon>.node.zst` zstd frame (level 19, variants in parallel) and build an in-memory `native/embedded-addon.js` replacement with package version, filenames, decompressed sizes, and frame paths.
+4. **Validate release and generate frames + manifest**: every available addon must contain the current version stamp or legacy version sentinel. Compress each addon into its own in-memory `native/<addon>.node.zst` zstd frame (level 19, variants in parallel) and build an in-memory `native/embedded-addon.js` replacement with package version, filenames, decompressed sizes, each addon's SHA-256, the set's `digest` (SHA-256 over every filename and addon SHA-256), and frame paths. The loader extracts into `<getNativesDir()>/<version>-<first 12 hex digits of digest>`, so two builds of one release never share an extracted addon, and no start hashes an addon it does not extract.
 5. **Runtime extraction ready** for compiled mode.
 
 The frames are a pure function of the addon bytes: no container, file names, or timestamps. A release whose addon only changes its version stamp therefore embeds nearly identical bytes, so consecutive binaries differ only where the addon did. Do not reintroduce tar/gzip or per-build metadata into the embedded data.
@@ -298,10 +298,10 @@ The overrides stay in memory on purpose: `Bun.build` shares the runtime's direct
 Typical local loop:
 
 1. Build addon: `bun --cwd=packages/natives run build`.
-2. In a workspace checkout, loader skips npm leaf packages and resolves package-local `native/` then executable-dir candidates per filename. Installed packages probe the platform leaf first.
+2. In a workspace checkout, loader skips npm leaf packages and resolves package-local `native/` then executable-dir candidates per filename. Installed packages probe the platform leaf first. The build writes `<addon>.sources.json`, its record of the Rust sources it compiled; a workspace load whose checkout's sources differ prints the stale-addon notice (`… was built from Rust sources other than this checkout's …`) until the next build.
 3. Generated declarations in `native/index.d.ts` describe the public TS API. The default Cargo-backed host build regenerates them; after a Rust API change, `build:bindings` explicitly performs the same generation.
-4. On Windows package installs, the loader first copies a `node_modules` addon into the versioned cache so a running process does not lock the file Bun must replace during a later global update.
-5. After a successful load, older `major.minor.patch` cache directories with mtime at least ten minutes old are removed best-effort; cleanup failures never abort startup.
+4. On Windows package installs, the loader first copies the leaf package's addons into its digest-named cache directory so a running process does not lock the file Bun must replace during a later global update.
+5. After a successful load, cache directories no `omp` process has used for a day are removed best-effort; cleanup failures never abort startup.
 
 ## Shipped/compiled binary workflow
 
@@ -345,7 +345,7 @@ Generated declarations currently include exports from these Rust modules:
 - Unsupported platform tag: throws with supported platform list after probing fails.
 - No candidate could load: throws with full candidate error list and mode-specific remediation hints.
 - Embedded extraction and Windows staging problems: decompress/mkdir/write/copy errors are recorded and included in final diagnostics if load fails.
-- Version mismatch: install/compiled loads normally require the package version through a stamp or legacy sentinel. Pre-sentinel addons with no release identity can pass the loader's narrow compatibility check. Driver installs, local binding builds, and Nix builds stamp artifacts; a raw `bazel-bin` output copied elsewhere is unstamped and reports no version. Workspace loads skip release validation.
+- Version mismatch: install/compiled loads normally require the package version through a stamp or legacy sentinel. Pre-sentinel addons with no release identity can pass the loader's narrow compatibility check. Driver installs, local binding builds, and Nix builds stamp artifacts; a raw `bazel-bin` output copied elsewhere is unstamped and reports no version. Workspace loads skip release validation, and compare the build's `<addon>.sources.json` with the checkout's Rust sources instead.
 
 ## Troubleshooting matrix
 
@@ -355,7 +355,7 @@ Generated declarations currently include exports from these Rust modules:
 | Export is missing at runtime but present in TypeScript                 | Stale `.node` loaded, generated declarations newer than binary, or Rust export not compiled | Require the actual candidate and inspect `Object.keys(mod)`       | Rebuild native package and remove stale candidate/cache paths                                                                        |
 | x64 machine loads baseline when modern expected                        | `PI_NATIVE_VARIANT=baseline`, no AVX2 detected, or modern file unavailable                  | Check env and filenames in `native/`                              | Build and ship the modern target (`bun scripts/bazel-natives.ts linux-x64-modern --dest packages/natives/native`)                    |
 | gnu addon overwritten by musl (or vice versa)                          | Both built into one dest — they share canonical basenames by design                         | Compare `bazel-bin/natives-<t>/` sources vs installed file        | Separate invocations with separate `--dest` dirs (release matrix already does this)                                                  |
-| Compiled binary fails after upgrade                                    | Stale extracted cache, embedded frame/size mismatch, or embedded manifest version mismatch  | Inspect `<getNativesDir()>/<version>` and loader error list       | Delete versioned cache for the package version; regenerate embedded frames/manifest during packaging                                 |
+| Compiled binary fails after upgrade                                    | Corrupt extracted cache, embedded frame size or digest mismatch, or embedded manifest version mismatch | Inspect `<getNativesDir()>/<version>-<digest prefix>` and loader error list | Delete that build's cache directory; regenerate embedded frames/manifest during packaging                                  |
 | Binary build fails with `No native addons found`                       | Required platform artifact was not built before embedding                                   | Check expected list in error text                                 | Build at least one expected artifact for the target, then rerun the binary build                                                     |
 
 ## Operational commands
@@ -390,8 +390,9 @@ The cache captures the following files from `packages/natives/native/` under the
 - `index.js`
 - `embedded-addon.js`
 - `manifest.json` (cache metadata: key, target triple, capture timestamp, source workspace, commit)
+- `<addon>.sources.json`, optional: the native build's record of the Rust sources it compiled. It is captured with its addon when the build wrote one and restored on a hit; an entry without one is still served, and populate removes any record an earlier build left in the workspace, so the workspace loader judges the restored addon by its own record or not at all. Because copies keep the addon's modification time, by which the record names it, a restored record still describes its addon. The image seed (`Dockerfile`, `cp -p`) carries it too.
 
-An entry is only considered a hit when the `.node` glob matches AND every companion plus the manifest is present. GC removes manifest-less and dot-prefixed staging directories; an entry with a manifest but missing a companion is a miss, not automatically purged for that reason.
+An entry is only considered a hit when the `.node` glob matches AND every companion plus the manifest is present; the sources record is not required. GC removes manifest-less and dot-prefixed staging directories; an entry with a manifest but missing a companion is a miss, not automatically purged for that reason.
 
 ### Cache key
 

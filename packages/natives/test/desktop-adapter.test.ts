@@ -67,6 +67,7 @@ describe("lazy desktop exports", () => {
 			version: "18.8.7",
 			packageVersion: "18.12.1",
 			stale: true,
+			builtFromOtherSources: false,
 		};
 		vi.spyOn(loaderState, "loadNative").mockReturnValue({});
 		vi.spyOn(loaderState, "missingNativeExport").mockImplementation(name => missingNativeExport(name, stale));
