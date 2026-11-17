@@ -337,7 +337,7 @@ describe("queued user delivery policy", () => {
 		expect(requests).toHaveLength(3);
 		for (const request of requests) expect(JSON.stringify(request)).not.toContain("recovered recall");
 
-		setSystemTime(Date.now() + 30 * 60_000 + 1_000);
+		setSystemTime(Date.now() + 60_000 + 1_000);
 		await session.prompt("lookup after the wait");
 		expect(recalls).toBe(2);
 		expect(requests.at(-1)?.systemPrompt?.join("\n")).toContain("recovered recall");

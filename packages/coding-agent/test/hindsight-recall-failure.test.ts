@@ -40,7 +40,7 @@ const config = {
 	recallContextTurns: 1,
 	recallMaxQueryChars: 800,
 	recallPromptPreamble: "preamble",
-	recallCooldownMs: 1_800_000,
+	recallCooldownMs: 60_000,
 	debug: false,
 	requestTimeoutMs: 30_000,
 	reflectTimeoutMs: 30_000,
@@ -180,6 +180,25 @@ function answerWith(text: string): () => Promise<RecallResponse> {
 	return async () => ({ results: [{ id: "m", text }] });
 }
 
+/** The first pause with the shipped settings: the default of `hindsight.recallCooldownMs`. */
+const SHIPPED_FIRST_PAUSE_MS = 60_000;
+
+/**
+ * The config of a user who sets only the server and automatic recall: each pause setting keeps its default.
+ * `overrides` replaces or adds settings.
+ */
+function shippedConfig(overrides: Record<string, unknown> = {}): HindsightConfig {
+	return loadHindsightConfig(
+		Settings.isolated({
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.autoRecall": true,
+			"hindsight.autoRetain": false,
+			"hindsight.mentalModelsEnabled": false,
+			...overrides,
+		}),
+	);
+}
+
 /** Counts its recalls; each one does what `answer` does, by default fail at once with "boom". */
 class CountingRecallApi extends HindsightApi {
 	calls = 0;
@@ -199,6 +218,19 @@ describe("Hindsight automatic recall after a failure", () => {
 	function promptAt(state: HindsightSessionState, time: number) {
 		setSystemTime(time);
 		return state.beforeAgentStartPrompt(PROMPT);
+	}
+
+	/**
+	 * Prompts one second before `end`, when a pause must end, and one second after it.
+	 * Returns whether the first prompt sent no recall and the second prompt sent one.
+	 */
+	async function promptAroundEnd(state: HindsightSessionState, client: CountingRecallApi, end: number) {
+		const before = client.calls;
+		await promptAt(state, end - 1_000);
+		const skipped = client.calls === before;
+		const after = client.calls;
+		await promptAt(state, end + 1_000);
+		return { skipped, recalled: client.calls > after };
 	}
 
 	/** Persists the turn the session sent, which puts the transcript on disk; returns its file. */
@@ -225,14 +257,7 @@ describe("Hindsight automatic recall after a failure", () => {
 			},
 		});
 		servers.push(server);
-		const shipped = loadHindsightConfig(
-			Settings.isolated({
-				"hindsight.apiUrl": server.url.origin,
-				"hindsight.autoRecall": true,
-				"hindsight.autoRetain": false,
-				"hindsight.mentalModelsEnabled": false,
-			}),
-		);
+		const shipped = shippedConfig({ "hindsight.apiUrl": server.url.origin, "hindsight.recallTimeoutMs": 1_000 });
 		if (!isHindsightConfigured(shipped)) throw new Error("hindsight.apiUrl did not resolve");
 		const { state } = start(newSessionManager(), createHindsightClient(shipped), shipped);
 
@@ -242,14 +267,13 @@ describe("Hindsight automatic recall after a failure", () => {
 		started = performance.now();
 		const second = await state.beforeAgentStartPrompt("And the staging host?");
 		const secondWaitMs = Math.round(performance.now() - started);
-		console.log(JSON.stringify({ firstWaitMs, secondWaitMs, recallRequests }));
 
 		expect(first).toBeUndefined();
-		expect(firstWaitMs).toBeGreaterThanOrEqual(25_000);
+		expect(firstWaitMs).toBeGreaterThanOrEqual(900);
 		expect(second).toBeUndefined();
-		expect(secondWaitMs).toBeLessThan(1_000);
+		expect(secondWaitMs).toBeLessThan(500);
 		expect(recallRequests).toBe(1);
-	}, 90_000);
+	}, 10_000);
 
 	it("logs a failed recall once with its cause and a skipped recall once", async () => {
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -261,14 +285,6 @@ describe("Hindsight automatic recall after a failure", () => {
 		const failureLines = warn.mock.calls.filter(([message]) => message === "Hindsight: recall failed");
 		const skipLines = warn.mock.calls.filter(
 			([message]) => message === "Hindsight: recall skipped after a recent failure",
-		);
-		console.log(
-			JSON.stringify({
-				failureLines: failureLines.length,
-				skipLines: skipLines.length,
-				notices: notices.length,
-				recallCalls: client.calls,
-			}),
 		);
 
 		expect(failureLines).toHaveLength(1);
@@ -306,96 +322,120 @@ describe("Hindsight automatic recall after a failure", () => {
 		expect(client.calls).toBe(3);
 	});
 
-	it("a success resets the wait", async () => {
+	it("an answer after a pause starts the next pause again at the first length", async () => {
 		const client = new CountingRecallApi();
-		const { state } = start(newSessionManager(), client);
+		const { state } = start(newSessionManager(), client, shippedConfig());
 		await promptAt(state, T0);
 		expect(client.calls).toBe(1);
 
-		const recovered = T0 + COOLDOWN_MS + 1_000;
+		const recovered = T0 + SHIPPED_FIRST_PAUSE_MS + 1_000;
 		client.answer = answerWith("The deploy host is alpha-7.");
 		// Left uncommitted, as when the turn never goes out: the next prompt recalls again.
-		expect((await promptAt(state, recovered))?.context).toContain("alpha-7");
+		const answered = await promptAt(state, recovered);
+		expect(client.calls).toBe(2);
+		expect(answered?.context).toContain("alpha-7");
 		client.answer = failWithBoom;
 		await promptAt(state, recovered);
 		expect(client.calls).toBe(3);
 
-		await promptAt(state, recovered + COOLDOWN_MS - 1_000);
+		await promptAt(state, recovered + SHIPPED_FIRST_PAUSE_MS - 1_000);
 		expect(client.calls).toBe(3);
-		await promptAt(state, recovered + COOLDOWN_MS + 1_000);
+		await promptAt(state, recovered + SHIPPED_FIRST_PAUSE_MS + 1_000);
 		expect(client.calls).toBe(4);
 	});
 
-	it("a resumed session during the pause does not recall", async () => {
+	it("the pause doubles up to 30 minutes", async () => {
+		const client = new CountingRecallApi();
+		const { state } = start(newSessionManager(), client, shippedConfig());
+		await promptAt(state, T0);
+		// Each recall after a pause fails again, so each pause comes after one more failure in a row.
+		const pauseMinutes = [1, 2, 4, 8, 16, 30, 30];
+		const observed: { minutes: number; skipped: boolean; recalled: boolean }[] = [];
+		let failedAt = T0;
+		for (const minutes of pauseMinutes) {
+			const end = failedAt + minutes * 60_000;
+			observed.push({ minutes, ...(await promptAroundEnd(state, client, end)) });
+			failedAt = end + 1_000;
+		}
+
+		expect(observed).toEqual(pauseMinutes.map(minutes => ({ minutes, skipped: true, recalled: true })));
+		expect(client.calls).toBe(pauseMinutes.length + 1);
+	});
+
+	it("a setting above 30 minutes pauses that long every time", async () => {
+		const pauseMs = 2 * 60 * 60_000;
+		const client = new CountingRecallApi();
+		const { state } = start(newSessionManager(), client, { ...config, recallCooldownMs: pauseMs });
+		await promptAt(state, T0);
+		const first = await promptAroundEnd(state, client, T0 + pauseMs);
+		const secondFailure = T0 + pauseMs + 1_000;
+		const second = await promptAroundEnd(state, client, secondFailure + pauseMs);
+
+		expect([first, second]).toEqual([
+			{ skipped: true, recalled: true },
+			{ skipped: true, recalled: true },
+		]);
+	});
+
+	it("an automatic recall that answers ends a running pause", async () => {
+		setSystemTime(T0);
+		const client = new CountingRecallApi();
+		const { state, notices } = start(newSessionManager(), client, shippedConfig());
+		const called = Promise.withResolvers<void>();
+		const compactionAnswer = Promise.withResolvers<RecallResponse>();
+		client.answer = () => {
+			called.resolve();
+			return compactionAnswer.promise;
+		};
+		const compaction = state.recallForCompaction([{ role: "user", content: "what did we decide?" }]);
+		await called.promise;
+
+		client.answer = failWithBoom;
+		expect(await state.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
+		expect(notices[0]).toEqual({
+			level: "warning",
+			message: "Memory recall failed: recall request failed: boom",
+			source: HINDSIGHT_NOTICE_SOURCE,
+		});
+		expect(await state.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
+		expect(client.calls).toBe(2);
+
+		compactionAnswer.resolve({ results: [{ id: "m", text: "We chose alpha-7." }] });
+		expect(await compaction).toContain("alpha-7");
+		await state.beforeAgentStartPrompt(PROMPT);
+		expect(client.calls).toBe(3);
+	});
+
+	it("the pause holds through a conversation reset", async () => {
+		const client = new CountingRecallApi();
+		const { state } = start(newSessionManager(), client, shippedConfig());
+		await promptAt(state, T0);
+		state.resetConversationTracking();
+		await promptAt(state, T0 + 1_000);
+
+		expect(client.calls).toBe(1);
+	});
+
+	it("a fresh process does not inherit a pause", async () => {
+		const shipped = shippedConfig();
 		setSystemTime(T0);
 		const firstManager = newSessionManager();
-		const first = start(firstManager, new CountingRecallApi());
+		const first = start(firstManager, new CountingRecallApi(), shipped);
 		expect(await first.state.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
 		const sessionFile = await writeTurn(firstManager);
 		await firstManager.close();
 
-		setSystemTime(T0 + 10 * 60_000);
+		// Still inside the pause that the first process started.
+		setSystemTime(T0 + 10_000);
 		const resumedManager = await SessionManager.open(sessionFile);
 		managers.push(resumedManager);
 		const client = new CountingRecallApi();
 		client.answer = answerWith("The deploy host is beta-9.");
-		const resumed = start(resumedManager, client);
-		const started = performance.now();
+		const resumed = start(resumedManager, client, shipped);
 		const preparation = await resumed.state.beforeAgentStartPrompt(PROMPT);
-		const waitMs = performance.now() - started;
 
-		expect(client.calls).toBe(0);
-		expect(preparation).toBeUndefined();
-		expect(waitMs).toBeLessThan(1_000);
-		expect(resumed.notices).toHaveLength(1);
-		expect(resumed.notices[0]).toMatchObject({ level: "warning", source: HINDSIGHT_NOTICE_SOURCE });
-		expect(resumed.notices[0].message).toContain("boom");
-	});
-
-	it("a stored failure cause is cleaned before it is shown", async () => {
-		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
-		setSystemTime(T0);
-		const firstManager = newSessionManager();
-		const first = start(firstManager, new CountingRecallApi());
-		expect(await first.state.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
-		const sessionFile = await writeTurn(firstManager);
-		await firstManager.close();
-
-		// A damaged or foreign session file can hold what the write side removed from the cause.
-		let rewritten = 0;
-		const lines = (await Bun.file(sessionFile).text()).split("\n").map(line => {
-			if (!line) return line;
-			const entry = JSON.parse(line);
-			if (entry.type !== "custom" || entry.customType !== "memory_recall_failure") return line;
-			entry.data.error = `\x1b]52;c;aGVsbG8=\x07${"x".repeat(5000)}`;
-			rewritten++;
-			return JSON.stringify(entry);
-		});
-		expect(rewritten).toBe(1);
-		await Bun.write(sessionFile, lines.join("\n"));
-
-		setSystemTime(T0 + 10 * 60_000);
-		const resumedManager = await SessionManager.open(sessionFile);
-		managers.push(resumedManager);
-		const client = new CountingRecallApi();
-		const resumed = start(resumedManager, client);
-		expect(await resumed.state.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
-
-		expect(client.calls).toBe(0);
-		expect(resumed.notices).toHaveLength(1);
-		const [notice] = resumed.notices;
-		expect(notice).toMatchObject({ level: "warning", source: HINDSIGHT_NOTICE_SOURCE });
-		expect(notice.message).not.toMatch(/[\x00-\x1f\x7f]/);
-		// The pause text and retry time come before the cause, which is at most 200 characters.
-		expect(notice.message.length).toBeLessThan(300);
-		const skipLines = warn.mock.calls.filter(
-			([message]) => message === "Hindsight: recall skipped after a recent failure",
-		);
-		expect(skipLines).toHaveLength(1);
-		const loggedError = String(skipLines[0][1]?.error);
-		expect(loggedError).not.toMatch(/[\x00-\x1f\x7f]/);
-		expect(loggedError.length).toBeLessThanOrEqual(200);
-		expect(notice.message.endsWith(loggedError)).toBe(true);
+		expect(client.calls).toBe(1);
+		expect(preparation?.context).toContain("beta-9");
 	});
 
 	it("an aborted recall starts no pause", async () => {
@@ -439,18 +479,13 @@ describe("Hindsight automatic recall after a failure", () => {
 		expect(client.calls).toBe(2);
 	});
 
-	it("`recallCooldownMs: 0` recalls on every prompt and writes no failure entry", async () => {
+	it("`recallCooldownMs: 0` recalls on every prompt", async () => {
 		const client = new CountingRecallApi();
-		const sessionManager = newSessionManager();
-		const { state } = start(sessionManager, client, { ...config, recallCooldownMs: 0 });
+		const { state } = start(newSessionManager(), client, { ...config, recallCooldownMs: 0 });
 		await state.beforeAgentStartPrompt(PROMPT);
 		await state.beforeAgentStartPrompt(PROMPT);
 
 		expect(client.calls).toBe(2);
-		const failureEntries = sessionManager
-			.getBranch()
-			.filter(entry => entry.type === "custom" && entry.customType === "memory_recall_failure");
-		expect(failureEntries).toEqual([]);
 	});
 
 	it("the compaction recall waits out the pause, and its failure starts one", async () => {
@@ -458,7 +493,7 @@ describe("Hindsight automatic recall after a failure", () => {
 		const afterPrompt = new CountingRecallApi();
 		const prompted = start(newSessionManager(), afterPrompt).state;
 		await promptAt(prompted, T0);
-		setSystemTime(T0 + 60_000);
+		setSystemTime(T0 + COOLDOWN_MS - 1_000);
 		expect(await prompted.recallForCompaction(messages)).toBeUndefined();
 		expect(afterPrompt.calls).toBe(1);
 
@@ -467,7 +502,7 @@ describe("Hindsight automatic recall after a failure", () => {
 		setSystemTime(T0);
 		expect(await compacted.recallForCompaction(messages)).toBeUndefined();
 		expect(afterCompaction.calls).toBe(1);
-		expect(await promptAt(compacted, T0 + 60_000)).toBeUndefined();
+		expect(await promptAt(compacted, T0 + COOLDOWN_MS - 1_000)).toBeUndefined();
 		expect(afterCompaction.calls).toBe(1);
 	});
 
@@ -498,5 +533,50 @@ describe("Hindsight automatic recall after a failure", () => {
 			source: HINDSIGHT_NOTICE_SOURCE,
 		});
 		expect(notices[1].message).toContain("boom");
+	});
+
+	it("a recall in flight that fails during the pause does not lengthen it", async () => {
+		setSystemTime(T0);
+		const client = new CountingRecallApi();
+		const { state } = start(newSessionManager(), client, shippedConfig());
+		const firstTurnCalled = Promise.withResolvers<void>();
+		const firstTurnAnswer = Promise.withResolvers<RecallResponse>();
+		client.answer = () => {
+			firstTurnCalled.resolve();
+			return firstTurnAnswer.promise;
+		};
+		const firstTurn = state.beforeAgentStartPrompt(PROMPT);
+		await firstTurnCalled.promise;
+		const compactionCalled = Promise.withResolvers<void>();
+		const compactionAnswer = Promise.withResolvers<RecallResponse>();
+		client.answer = () => {
+			compactionCalled.resolve();
+			return compactionAnswer.promise;
+		};
+		const compaction = state.recallForCompaction([{ role: "user", content: "what did we decide?" }]);
+		await compactionCalled.promise;
+
+		// The first-turn recall fails and starts the pause; the compaction recall, sent before
+		// the pause began, fails inside it.
+		firstTurnAnswer.reject(new HindsightError("recall request failed: boom"));
+		expect(await firstTurn).toBeUndefined();
+		setSystemTime(T0 + 30_000);
+		compactionAnswer.reject(new HindsightError("recall request failed: boom"));
+		expect(await compaction).toBeUndefined();
+
+		client.answer = failWithBoom;
+		expect(await promptAroundEnd(state, client, T0 + SHIPPED_FIRST_PAUSE_MS)).toEqual({
+			skipped: true,
+			recalled: true,
+		});
+	});
+
+	it("a clock set back before the failure ends the pause", async () => {
+		const client = new CountingRecallApi();
+		const { state } = start(newSessionManager(), client, shippedConfig());
+		await promptAt(state, T0);
+		await promptAt(state, T0 - 60 * 60_000);
+
+		expect(client.calls).toBe(2);
 	});
 });
