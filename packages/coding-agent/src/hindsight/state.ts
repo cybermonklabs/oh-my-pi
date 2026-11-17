@@ -341,10 +341,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		this.config = options.config;
 		this.session = options.session;
 		this.banksSet = options.banksSet;
-		this.#recallWait = new RecallFailureWait(this.config.recallCooldownMs, () => ({
-			sessionManager: this.session.sessionManager,
-			scope: this.#recallScope(),
-		}));
+		this.#recallWait = new RecallFailureWait(this.config.recallCooldownMs);
 		this.lastRetainedTurn = options.lastRetainedTurn ?? 0;
 		this.#lastRetainedMessageIndex = 0;
 		this.#cachedTranscript = "";
@@ -437,16 +434,15 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	}
 
 	/**
-	 * Whether an automatic recall waits out a recent failure; the first skip of a failure
-	 * in this process logs and notifies, later ones stay quiet.
+	 * Whether an automatic recall waits out a recent failure; the first skip of each failure
+	 * logs and notifies, later ones stay quiet.
 	 */
 	#skipRecallAfterFailure(): boolean {
 		const now = Date.now();
 		const skip = this.#recallWait.skip(now);
 		if (!skip) return false;
 		if (skip.first) {
-			// The stored cause comes from the session file, which can hold what the write side removed.
-			const cause = noticeErrorText(skip.failure.error);
+			const cause = skip.failure.error;
 			logger.warn("Hindsight: recall skipped after a recent failure", {
 				bankId: this.bankId,
 				failedAt: new Date(skip.failure.at).toISOString(),
