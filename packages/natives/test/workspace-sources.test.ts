@@ -5,7 +5,7 @@
  * records which Rust sources it compiled (`<addon>.sources.json`), and a workspace load
  * compares that record with the checkout, reporting a mismatch through the stale-addon notice.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,6 +16,8 @@ import {
 	CARGO_SOURCE_ROOTS,
 	copyAddonSourcesStamp,
 	readRustSources,
+	settleRustSources,
+	uniqueTempPath,
 	writeAddonSourcesStamp,
 } from "../native/workspace-sources.js";
 import packageJson from "../package.json" with { type: "json" };
@@ -47,6 +49,9 @@ async function build(roots: readonly string[] = CARGO_SOURCE_ROOTS, settings: Re
 	writeAddonSourcesStamp(addon, readRustSources(repo, roots), settings);
 }
 
+/** Git with no user or system configuration, so a test repository behaves the same on any machine. */
+const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+
 describe("the Rust sources a workspace addon was built from", () => {
 	it("are current until a source file's content changes", async () => {
 		await build();
@@ -56,13 +61,35 @@ describe("the Rust sources a workspace addon was built from", () => {
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	});
 
-	it("are other sources when a file is added, removed, or the lock file changes", async () => {
+	it("are other sources when a recorded file is removed or the lock file changes", async () => {
 		await build();
-		await Bun.write(path.join(repo, "crates/pi-natives/src/new.rs"), "pub fn new() {}\n");
+		await fs.rm(path.join(repo, "crates/pi-natives/src/lib.rs"));
 		expect(addonSourcesState(addon, repo)).toBe("other");
-		await fs.rm(path.join(repo, "crates/pi-natives/src/new.rs"));
+		await Bun.write(path.join(repo, "crates/pi-natives/src/lib.rs"), "pub fn grep() {}\n");
 		expect(addonSourcesState(addon, repo)).toBe("current");
 		await Bun.write(path.join(repo, "Cargo.lock"), "version = 4\n# changed\n");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("change nothing when a file is added after the build, and see a new module through its parent", async () => {
+		await build();
+		// Editor backups, merge leftovers, a new test, snapshot drafts, caches: none was compiled.
+		for (const added of [
+			"crates/pi-natives/src/lib.rs~",
+			"crates/pi-natives/src/#lib.rs#",
+			"crates/pi-natives/src/lib.rs.orig",
+			"crates/pi-shell/tests/zz_probe_test.rs",
+			"crates/pi-natives/src/snapshots/a.snap.new",
+			"crates/pi-natives/tools/cache/blob",
+			"crates/pi-natives/tools/__pycache__/x.pyc",
+		]) {
+			await Bun.write(path.join(repo, added), "added after the build\n");
+		}
+		expect(addonSourcesState(addon, repo)).toBe("current");
+
+		// A module the addon compiles is declared in a file the build recorded.
+		await Bun.write(path.join(repo, "crates/pi-natives/src/zz.rs"), "pub fn zz() {}\n");
+		await Bun.write(path.join(repo, "crates/pi-natives/src/lib.rs"), "mod zz;\npub fn grep() {}\n");
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	});
 
@@ -142,6 +169,119 @@ describe("the Rust sources a workspace addon was built from", () => {
 		expect(addonSourcesState(copy, repo)).toBe("current");
 		await Bun.write(path.join(repo, "crates/pi-natives/src/lib.rs"), "pub fn grep2() {}\n");
 		expect(addonSourcesState(copy, repo)).toBe("other");
+	});
+
+	it("of a git checkout are the files git tracks or would track, never ignored ones", async () => {
+		await Bun.write(path.join(repo, ".gitignore"), "crates/pi-natives/tools/cache/\n");
+		await Bun.write(path.join(repo, "crates/pi-natives/tools/cache/blob"), "cache v1\n");
+		// Not yet added to git, not ignored: the build compiles it.
+		await Bun.write(path.join(repo, "crates/pi-natives/src/zz.rs"), "pub fn zz() {}\n");
+		const git = (...args: string[]) =>
+			Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe", env: gitEnv });
+		expect(git("init", "-q").exitCode).toBe(0);
+		expect(git("add", "Cargo.toml", "Cargo.lock", "crates/pi-natives/src/lib.rs").exitCode).toBe(0);
+		await build();
+
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(stamp.files).toEqual([
+			"Cargo.lock",
+			"Cargo.toml",
+			"crates/pi-natives/src/lib.rs",
+			"crates/pi-natives/src/zz.rs",
+		]);
+		await Bun.write(path.join(repo, "crates/pi-natives/tools/cache/blob"), "cache v2\n");
+		expect(addonSourcesState(addon, repo)).toBe("current");
+		await Bun.write(path.join(repo, "crates/pi-natives/src/zz.rs"), "pub fn zz2() {}\n");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it.each(["git", "walk"] as const)(
+		"record a symbolic link as a link and never follow it (%s listing)",
+		async listing => {
+			const outside = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-outside-"));
+			try {
+				await Bun.write(path.join(outside, "lib.rs"), "outside v1\n");
+				await fs.symlink(".", path.join(repo, "crates/loop"));
+				await fs.symlink(outside, path.join(repo, "crates/outside"));
+				if (listing === "git") {
+					const init = Bun.spawnSync(["git", "-C", repo, "init", "-q"], { env: gitEnv });
+					expect(init.exitCode).toBe(0);
+				}
+				await build();
+
+				const stamp = await Bun.file(`${addon}.sources.json`).json();
+				expect(stamp.files).toContain("crates/loop");
+				expect(stamp.files).toContain("crates/outside");
+				expect(stamp.files.filter((rel: string) => rel.startsWith("crates/loop/"))).toEqual([]);
+				expect(stamp.files.filter((rel: string) => rel.startsWith("crates/outside/"))).toEqual([]);
+				expect(addonSourcesState(addon, repo)).toBe("current");
+				// The target's content is not this checkout's; the link itself is.
+				await Bun.write(path.join(outside, "lib.rs"), "outside v2\n");
+				expect(addonSourcesState(addon, repo)).toBe("current");
+				await fs.rm(path.join(repo, "crates/outside"));
+				await fs.symlink(path.join(outside, "lib.rs"), path.join(repo, "crates/outside"));
+				expect(addonSourcesState(addon, repo)).toBe("other");
+			} finally {
+				await fs.rm(outside, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("take Cargo.lock as the build left it when the build rewrote it", async () => {
+		const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
+		// cargo updates the lock when a manifest's dependencies changed.
+		await Bun.write(path.join(repo, "Cargo.lock"), "version = 4\n# rewritten by cargo\n");
+
+		writeAddonSourcesStamp(addon, settleRustSources(repo, before), CARGO_BUILD);
+
+		expect(addonSourcesState(addon, repo)).toBe("current");
+	});
+
+	it("still name other sources when a file other than the lock changed during the build", async () => {
+		const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
+		await Bun.write(path.join(repo, "Cargo.lock"), "version = 4\n# rewritten by cargo\n");
+		await Bun.write(path.join(repo, "crates/pi-natives/src/lib.rs"), "pub fn edited_during_build() {}\n");
+
+		writeAddonSourcesStamp(addon, settleRustSources(repo, before), CARGO_BUILD);
+
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("name the addon by a whole-second time, so a copy that keeps only seconds still matches", async () => {
+		await fs.utimes(addon, new Date(1_700_000_000_123), new Date(1_700_000_000_456));
+		await build();
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(stamp.addon.mtimeMs % 1000).toBe(0);
+		expect((await fs.stat(addon)).mtimeMs).toBe(stamp.addon.mtimeMs);
+
+		// A Docker layer copy (or tar) of the checkout: bytes and record as they are, the
+		// addon's time cut to the second.
+		const copy = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-layer-"));
+		try {
+			await fs.cp(repo, copy, { recursive: true });
+			const copied = path.join(copy, path.relative(repo, addon));
+			const seconds = Math.floor((await fs.stat(addon)).mtimeMs / 1000);
+			await fs.utimes(copied, seconds, seconds);
+
+			expect(addonSourcesState(copied, copy)).toBe("current");
+		} finally {
+			await fs.rm(copy, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("temporary files", () => {
+	it("are unique to each writer in one process and one millisecond", () => {
+		// Worker threads share the pid, and a clock can return one millisecond to several.
+		const now = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+		try {
+			const target = "/natives/18.18.6-aaaaaaaaaaaa/pi_natives.node";
+			const [first, second] = [uniqueTempPath(target), uniqueTempPath(target)];
+			expect(first).not.toBe(second);
+			expect(first.startsWith(`${target}.tmp.${process.pid}.`)).toBe(true);
+		} finally {
+			now.mockRestore();
+		}
 	});
 });
 

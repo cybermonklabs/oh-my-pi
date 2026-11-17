@@ -7,6 +7,16 @@ const RENAME_RETRY_INITIAL_MS = 5;
 const RENAME_RETRY_MAX_MS = 100;
 
 /**
+ * A path beside `target` for staging a write: `<target>.<pid>.<uuid>.<suffix>`. The
+ * random UUID keeps it private to this writer even against another thread of this
+ * process (worker threads share the pid) writing the same target in the same
+ * millisecond, which a process id and a clock reading alone cannot.
+ */
+export function uniqueSiblingPath(target: string, suffix = "tmp"): string {
+	return `${target}.${process.pid}.${crypto.randomUUID()}.${suffix}`;
+}
+
+/**
  * Publish a staged sibling without moving the old destination aside, so readers
  * never observe a missing file while transient Windows replacement denials clear.
  */
@@ -99,7 +109,7 @@ async function replaceAfterWindowsRenameFailure(
  * carries a secret.
  */
 export async function writeFileAtomically(filePath: string, content: string, mode: number = 0o600): Promise<void> {
-	const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	const tempPath = uniqueSiblingPath(filePath);
 	let removeTemp = false;
 	try {
 		const handle = await fs.promises.open(tempPath, "wx", mode);
@@ -126,7 +136,7 @@ export async function writeFileAtomically(filePath: string, content: string, mod
  * await, such as the boot-time config migration.
  */
 export function writeFileAtomicallySync(filePath: string, content: string, mode: number = 0o600): void {
-	const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	const tempPath = uniqueSiblingPath(filePath);
 	let fd: number | undefined;
 	try {
 		fd = fs.openSync(tempPath, "wx", mode);
@@ -156,7 +166,7 @@ export function writeFileAtomicallySync(filePath: string, content: string, mode:
  * source removal are synchronous so in-process writers cannot land between them.
  */
 export async function moveFileAcrossDevices(source: string, destination: string): Promise<void> {
-	const staging = `${destination}.${process.pid}.${crypto.randomUUID()}.move`;
+	const staging = uniqueSiblingPath(destination, "move");
 	try {
 		for (;;) {
 			const before = fs.statSync(source, { bigint: true });
@@ -194,7 +204,7 @@ export async function moveFileAcrossDevices(source: string, destination: string)
  * source that cannot be removed is logged rather than failing the move.
  */
 export async function replaceFileAcrossDevices(source: string, destination: string): Promise<void> {
-	const staging = `${destination}.${process.pid}.${crypto.randomUUID()}.move`;
+	const staging = uniqueSiblingPath(destination, "move");
 	try {
 		await fs.promises.copyFile(source, staging);
 		const fd = fs.openSync(staging, "r+");

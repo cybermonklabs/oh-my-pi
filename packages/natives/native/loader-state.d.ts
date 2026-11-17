@@ -109,6 +109,8 @@ export interface CleanupStaleNativeVersionsInput {
 	nativesDir: string;
 	/** The cache directory this process loads from; never removed. */
 	currentDir: string;
+	/** `node:fs`; tests pass one that marks a directory used between cleanup's reads. */
+	io?: typeof nodeFs;
 }
 
 /**
@@ -127,7 +129,7 @@ export function prepareNativeVersionDir(versionedDir: string): void;
  */
 export type AddonFileIo = Pick<
 	typeof nodeFs,
-	"openSync" | "writeFileSync" | "fsyncSync" | "closeSync" | "renameSync" | "unlinkSync"
+	"openSync" | "writeFileSync" | "fsyncSync" | "closeSync" | "renameSync" | "unlinkSync" | "statSync" | "existsSync"
 >;
 
 export interface ExtractEmbeddedAddonsInput {
@@ -256,4 +258,10 @@ export function reportStaleWorkspaceAddon(
 /** Actionable text for {@link missingNativeExport}. */
 export function missingNativeExportMessage(symbolName: string, addon?: NativeAddonStatus | null): string;
 
-export function loadNative(): Record<string, unknown>;
+/**
+ * Load the native addon. `io` (default `node:fs`) is used for the cache checks and writes:
+ * extraction, staging, and the one retry of a cache file that vanished between the check that
+ * found it and its load, as it does while cleanup in another process holds its directory renamed
+ * away. Tests pass one that does that rename.
+ */
+export function loadNative(options?: { io?: typeof nodeFs }): Record<string, unknown>;

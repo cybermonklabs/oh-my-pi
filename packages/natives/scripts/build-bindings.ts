@@ -19,7 +19,12 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
 import { stampNativeVersion } from "../../../scripts/stamp-native-version";
-import { CARGO_SOURCE_ROOTS, readRustSources, writeAddonSourcesStamp } from "../native/workspace-sources.js";
+import {
+	CARGO_SOURCE_ROOTS,
+	readRustSources,
+	settleRustSources,
+	writeAddonSourcesStamp,
+} from "../native/workspace-sources.js";
 import { generateEnumExports } from "./gen-enums";
 
 // pcre2-sys prefers a system libpcre2 when pkg-config finds one. Keep the
@@ -256,8 +261,9 @@ function tailSection(label: string, text: string): string {
 }
 
 // Read before the build begins: an edit made while cargo runs then reads as other sources,
-// so the workspace loader asks for a rebuild instead of trusting a mixed build.
-const sources = readRustSources(repoRoot, CARGO_SOURCE_ROOTS);
+// so the workspace loader asks for a rebuild instead of trusting a mixed build. Cargo's own
+// rewrite of Cargo.lock is taken after the build (settleRustSources).
+const sourcesBeforeBuild = readRustSources(repoRoot, CARGO_SOURCE_ROOTS);
 
 try {
 	// The package declares Bun as its build runtime. Invoke napi's JavaScript
@@ -282,7 +288,7 @@ try {
 	}
 	// The workspace loader compares this record with the checkout (native/workspace-sources.js);
 	// the settings are there to explain the addon, never compared.
-	writeAddonSourcesStamp(canonicalAddonPath, sources, {
+	writeAddonSourcesStamp(canonicalAddonPath, settleRustSources(repoRoot, sourcesBeforeBuild), {
 		builder: "cargo",
 		profile: cargoProfile,
 		features: extraFeatures || null,

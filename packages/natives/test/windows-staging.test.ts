@@ -32,6 +32,7 @@ import {
 	resolveLoaderCandidates,
 	shouldStageNodeModulesAddon,
 } from "../native/loader-state.js";
+import { __resetNativesDirForTests } from "../native/natives-dir.js";
 import packageJson from "../package.json" with { type: "json" };
 import { generateNpmPackages } from "../scripts/gen-npm-packages";
 import { durableWriteCalls, recordingFs } from "./recording-fs";
@@ -197,6 +198,8 @@ describe("windows staging into the leaf package's digest directory", () => {
 		process.env.PI_NATIVES_DIR = nativesDir;
 		process.env.PI_NATIVE_VARIANT = "modern";
 		delete process.env.__PI_NATIVE_VARIANT_CACHE;
+		// One natives directory per process: resolve it again from this test's environment.
+		__resetNativesDirForTests();
 	});
 
 	afterEach(async () => {
@@ -204,6 +207,7 @@ describe("windows staging into the leaf package's digest directory", () => {
 			if (saved[key] === undefined) delete process.env[key];
 			else process.env[key] = saved[key];
 		}
+		__resetNativesDirForTests();
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
@@ -287,6 +291,27 @@ describe("windows staging into the leaf package's digest directory", () => {
 		expect(ctx.stageFromNodeModules).toBe(false);
 		expect(maybeStageNodeModulesAddon(ctx, [])).toBeNull();
 		expect(ctx.candidates.filter(candidate => candidate.startsWith(nativesDir))).toEqual([]);
+		expect(await fs.exists(nativesDir)).toBe(false);
+	});
+
+	it.each([
+		["a null entry", [null]],
+		["an entry without a SHA-256", [{ filename: "pi_natives.win32-x64-modern.node", size: 1 }]],
+		["an entry with a fractional size", [{ filename: "x.node", size: 1.5, sha256: "0".repeat(64) }]],
+		["a files list that is no list", { filename: "x.node" }],
+	])("stages nothing, and never throws, from a leaf whose addon list has %s", async (_label, files) => {
+		const install = await leafPackage("A");
+		const manifestPath = path.join(install.leafDir, "package.json");
+		const manifest = await Bun.file(manifestPath).json();
+		await Bun.write(manifestPath, JSON.stringify({ ...manifest, nativeAddons: { ...manifest.nativeAddons, files } }));
+		const ctx = windowsInstall(install.leafDir);
+		const errors: string[] = [];
+
+		const staged = maybeStageNodeModulesAddon(ctx, errors);
+
+		expect(staged).toBeNull();
+		expect(ctx.stageFromNodeModules).toBe(false);
+		expect(errors).toEqual([]);
 		expect(await fs.exists(nativesDir)).toBe(false);
 	});
 

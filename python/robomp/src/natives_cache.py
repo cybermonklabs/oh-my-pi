@@ -35,13 +35,16 @@ log = logging.getLogger(__name__)
 # different ordering would produce a different key. Cover every input the
 # napi build reads: all workspace crates (pi-natives transitively depends on
 # pi-ast/pi-iso/pi-shell), the workspace Cargo manifest + lock, the rust
-# toolchain pin, and the natives package itself (build script + scripts/* +
-# package.json with napi config).
+# toolchain pin, cargo's configuration (`.cargo/config.toml`: rustflags and
+# linker settings), and the natives package itself (build script + scripts/* +
+# package.json with napi config). The Dockerfile's image-seed key lists the
+# same paths in the same order.
 CACHE_KEY_PATHS: tuple[str, ...] = (
     "crates",
     "Cargo.lock",
     "Cargo.toml",
     "rust-toolchain.toml",
+    ".cargo",
     "packages/natives",
 )
 

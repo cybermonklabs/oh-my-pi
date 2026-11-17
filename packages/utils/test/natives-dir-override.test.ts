@@ -4,6 +4,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { __resetDirsFromEnvForTests, getAgentDir, getNativesDir } from "@oh-my-pi/pi-utils/dirs";
 
+/**
+ * The natives directory under the rule, from the environment as it is now. A process keeps
+ * its first answer (a `.env` file applied later moves nothing), so each read of the rule
+ * resolves afresh.
+ */
+function nativesDirNow(): string {
+	__resetDirsFromEnvForTests();
+	return getNativesDir();
+}
+
 const ENV_KEYS = [
 	"HOME",
 	"USERPROFILE",
@@ -69,21 +79,21 @@ describe("native directory override", () => {
 			"natives",
 		);
 		const agent = getAgentDir();
-		expect(getNativesDir()).toBe(defaultNatives);
+		expect(nativesDirNow()).toBe(defaultNatives);
 
 		process.env.PI_NATIVES_DIR = " " + shared + " ";
-		expect(getNativesDir()).toBe(shared);
+		expect(nativesDirNow()).toBe(shared);
 		expect(getAgentDir()).toBe(agent);
 
 		delete process.env.PI_NATIVES_DIR;
-		expect(getNativesDir()).toBe(defaultNatives);
+		expect(nativesDirNow()).toBe(defaultNatives);
 	});
 
 	it("expands home-relative overrides instead of treating tilde as a cwd-relative path", () => {
 		process.env.PI_NATIVES_DIR = "~";
-		expect(getNativesDir()).toBe(home);
+		expect(nativesDirNow()).toBe(home);
 		process.env.PI_NATIVES_DIR = " ~/unused/../shared ";
-		expect(getNativesDir()).toBe(path.join(home, "shared"));
+		expect(nativesDirNow()).toBe(path.join(home, "shared"));
 	});
 
 	it.each([
@@ -92,15 +102,15 @@ describe("native directory override", () => {
 		["relative", "relative/natives"],
 	])("keeps the existing cache root when the override is %s", (_label, override) => {
 		process.env.PI_NATIVES_DIR = override;
-		expect(getNativesDir()).toBe(path.join(home, ".omp", "natives"));
+		expect(nativesDirNow()).toBe(path.join(home, ".omp", "natives"));
 	});
 
 	it("takes the download root's natives below PI_NATIVES_DIR", () => {
 		const downloads = path.join(tempRoot, "downloads");
 		process.env.OMP_DOWNLOAD_ROOT = downloads;
 		process.env.OMP_CONFIG_ROOT = path.join(tempRoot, "config");
-		expect(getNativesDir()).toBe(path.join(downloads, "natives"));
+		expect(nativesDirNow()).toBe(path.join(downloads, "natives"));
 		process.env.PI_NATIVES_DIR = path.join(tempRoot, "shared");
-		expect(getNativesDir()).toBe(path.join(tempRoot, "shared"));
+		expect(nativesDirNow()).toBe(path.join(tempRoot, "shared"));
 	});
 });

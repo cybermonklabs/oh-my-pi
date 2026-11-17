@@ -17,7 +17,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getNativesDir } from "@oh-my-pi/pi-natives/natives-dir";
+import { __resetNativesDirForTests, getNativesDir } from "@oh-my-pi/pi-natives/natives-dir";
 import { expandWindowsLongPath } from "@oh-my-pi/pi-natives/path";
 import { engines, version } from "../package.json" with { type: "json" };
 import { isEnoent, isEnotdir } from "./fs-error";
@@ -614,11 +614,13 @@ export function __resetProfileSnapshotForTests(): void {
  * Test-only: rebuild profile + directory state from the current process env.
  * Production code keeps the module-load profile stable; tests that mutate
  * `setAgentDir`/`setProfile` need an exact restore point after they put env vars
- * back.
+ * back. The natives directory, fixed for the process at its first use, resolves
+ * again too.
  */
 export function __resetDirsFromEnvForTests(): void {
 	activeProfile = readProfileFromEnvSafe();
 	__resetProfileSnapshotForTests();
+	__resetNativesDirForTests();
 	refreshDirsFromEnv();
 }
 
@@ -951,8 +953,9 @@ export function getNativeGrammarsDir(): string {
 }
 
 /**
- * The natives directory, one per machine. The addon loader resolves it with the same
- * function, so the addon and the agent never name different directories.
+ * The natives directory, one answer per process: the addon loader resolves it with the
+ * same function, at the first use, so the addon and the agent never name different
+ * directories, even after a `.env` file sets a directory variable.
  */
 export { getNativesDir };
 

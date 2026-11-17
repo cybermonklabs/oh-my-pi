@@ -8,24 +8,41 @@ export const BAZEL_SOURCE_ROOTS: readonly string[];
 export interface RustSources {
 	/** The roots, relative to the repository root. */
 	roots: string[];
-	/** SHA-256 over each source file's path, size and modification time, hex. */
+	/** The source files under the roots, `/`-separated and sorted: git's tracked and unignored files, or a walk's. */
+	files: string[];
+	/** SHA-256 over each listed file's path, size and modification time, hex. */
 	fingerprint: string;
-	/** SHA-256 over each source file's path, size and bytes, hex. */
+	/** SHA-256 over each listed file's path and content (a link's target, for a link), hex. */
 	digest: string;
+	/** Each listed file's content hash; never written to the record. */
+	hashes: Record<string, string>;
 }
 
-/** The checkout's sources under `roots` now; reads every source file. */
+/** A path for a temporary file next to `target`, unique to this process and thread. */
+export function uniqueTempPath(target: string): string;
+
+/** The checkout's sources under `roots` now, read before a build begins; lists and reads every source file. */
 export function readRustSources(repoRoot: string, roots: readonly string[]): RustSources;
+
+/**
+ * The sources to record after the build: `before`, with `Cargo.lock` as the build left it
+ * when it is the only listed file that changed; `before` itself when anything else changed.
+ */
+export function settleRustSources(repoRoot: string, before: RustSources): RustSources;
 
 /** Where a native build records the sources of the addon at `addonPath` (`<addon>.sources.json`). */
 export function addonSourcesStampPath(addonPath: string): string;
 
 /**
  * Record that the addon at `addonPath`, as it is now on disk (its size and modification
- * time), was built from `sources`, read before the build began, with the settings `build`
+ * time, set to the whole second), was built from `sources` with the settings `build`
  * (profile, features, flags), kept for diagnosis and never compared.
  */
-export function writeAddonSourcesStamp(addonPath: string, sources: RustSources, build: Record<string, unknown>): void;
+export function writeAddonSourcesStamp(
+	addonPath: string,
+	sources: Omit<RustSources, "hashes">,
+	build: Record<string, unknown>,
+): void;
 
 /** Give `toAddonPath`, a copy of `fromAddonPath`, the record of the addon it was copied from. */
 export function copyAddonSourcesStamp(fromAddonPath: string, toAddonPath: string): void;

@@ -82,16 +82,17 @@ RUN bun install --frozen-lockfile --ignore-scripts
 COPY . /pi/
 
 # Hash the exact input trees in the build context before generated files change.
-# Extra untracked inputs change the key and safely result in a cache miss.
+# Extra untracked inputs change the key and safely result in a cache miss. The
+# paths and their order are robomp's `CACHE_KEY_PATHS` (python/robomp/src/natives_cache.py).
 RUN set -eux; \
     git init --bare /tmp/native-key.git; \
     export GIT_DIR=/tmp/native-key.git GIT_WORK_TREE=/pi; \
-    git add -f -- crates Cargo.lock Cargo.toml rust-toolchain.toml packages/natives \
+    git add -f -- crates Cargo.lock Cargo.toml rust-toolchain.toml .cargo packages/natives \
       ':(exclude)**/node_modules/**' ':(exclude)packages/natives/native/.build/**'; \
     tree="$(git write-tree)"; \
     mkdir -p /out/natives-seed; \
     printf '%s\n' "$tree:crates" "$tree:Cargo.lock" "$tree:Cargo.toml" \
-      "$tree:rust-toolchain.toml" "$tree:packages/natives" \
+      "$tree:rust-toolchain.toml" "$tree:.cargo" "$tree:packages/natives" \
       | git cat-file --batch-check > /out/natives-seed/trees.txt; \
     rm -rf /tmp/native-key.git
 

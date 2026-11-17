@@ -2109,6 +2109,62 @@ describe("runGcCommand cold-session archive", () => {
 		expect(await Bun.file(session).exists()).toBe(true);
 	});
 
+	test("an archive write never shares its temporary file with another writer of that archive in the same millisecond", async () => {
+		const session = await writeSession(root, "project", "same-tick", "complete", { ageDays: 90 });
+		const original = await Bun.file(session).bytes();
+		const archived = path.join(root, "archive", "sessions", "project", "same-tick.jsonl.gz");
+		const realNow = Date.now.bind(Date);
+		let tick: number | undefined;
+		// One clock tick for the archive write: from the archive directory's creation, right
+		// after which the writer names its temporary file, to that file's first open.
+		const clock = spyOn(Date, "now").mockImplementation(() => tick ?? realNow());
+		const realMkdir = fs.mkdir;
+		const mkdir = spyOn(fs, "mkdir").mockImplementation((async (target: string, ...rest: unknown[]) => {
+			if (String(target) === path.dirname(archived) && tick === undefined) tick = realNow();
+			return (realMkdir as (...args: unknown[]) => Promise<string | undefined>)(target, ...rest);
+		}) as typeof fs.mkdir);
+		const realOpen = fs.open;
+		let sameTickName: string | undefined;
+		const open = spyOn(fs, "open").mockImplementation((async (target: string, ...rest: unknown[]) => {
+			if (tick !== undefined && String(target).startsWith(`${archived}.`)) {
+				// The name another writer of this archive, in this process and on this tick,
+				// gives its temporary file when the name is only pid and clock.
+				sameTickName = `${archived}.${process.pid}.${tick}.tmp`;
+				tick = undefined;
+			}
+			return (realOpen as (...args: unknown[]) => Promise<fs.FileHandle>)(target, ...rest);
+		}) as typeof fs.open);
+		const realRename = fs.rename.bind(fs);
+		// That writer writes its temporary file just before this writer publishes its own.
+		const rename = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (String(to) === archived && sameTickName) await Bun.write(sameTickName, "another writer's bytes");
+			await realRename(from, to);
+		});
+		let result: GcResult;
+		try {
+			result = await runGcCommand({
+				flags: {
+					agentDir: root,
+					archive: true,
+					coldArchiveAfterDays: 30,
+					retainNewestGlobal: 0,
+					retainNewestPerCwd: 0,
+					apply: true,
+				},
+			});
+		} finally {
+			rename.mockRestore();
+			open.mockRestore();
+			mkdir.mockRestore();
+			clock.mockRestore();
+		}
+
+		expect(sameTickName).toBeDefined();
+		expect(result.archive?.errors).toEqual([]);
+		expect(result.archive?.archived).toBe(1);
+		expect(new Uint8Array(gunzipSync(await Bun.file(archived).bytes()))).toEqual(original);
+	});
+
 	test("dry-run does not recover orphaned session backups", async () => {
 		const sessionDir = path.join(getSessionsDir(root), "project");
 		await fs.mkdir(sessionDir, { recursive: true });

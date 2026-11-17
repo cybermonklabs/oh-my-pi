@@ -39,10 +39,11 @@
  * Every install stamps packages/natives/package.json#version into the addon's
  * post-link version slot (scripts/stamp-native-version.ts), so release bumps
  * never touch a Rust input. An addon built here also gets `<addon>.sources.json`,
- * the build's sources (Bazel's own inputs as well, for a Bazel build) read before
- * the build began, which the workspace loader compares with the checkout
- * (packages/natives/native/workspace-sources.js); a `--source` install, whose
- * sources are unknown, removes any such record. After
+ * the build's source files (Bazel's own inputs as well, for a Bazel build), read
+ * before the build began and checked after it (a `Cargo.lock` the build rewrote
+ * is taken as the build left it), which the workspace loader compares with the
+ * checkout (packages/natives/native/workspace-sources.js); a `--source` install,
+ * whose sources are unknown, removes any such record. After
  * install, the addon for the host's own target is dlopen-probed in a child
  * process and an unloadable image (or a load that hangs) fails the build.
  */
@@ -54,6 +55,7 @@ import {
 	copyAddonSourcesStamp,
 	type RustSources,
 	readRustSources,
+	settleRustSources,
 	writeAddonSourcesStamp,
 } from "../packages/natives/native/workspace-sources.js";
 import { detectHostAvx2Support, detectHostMusl, resolveLocalHostAddon } from "./host-detect";
@@ -498,11 +500,13 @@ async function main(): Promise<void> {
 	await fs.mkdir(destDir, { recursive: true });
 	const probeFilename = hostProbeFilename(options.targets, host);
 	const version = await nativesPackageVersion();
+	// A build that rewrote Cargo.lock compiled the lock it left (settleRustSources).
+	const sources = recorded && settleRustSources(repoRoot, recorded.sources);
 	for (const output of outputs) {
 		const absolute = path.isAbsolute(output) ? output : path.join(repoRoot, output);
 		const destPath = path.join(destDir, path.basename(output));
 		const stamped = await installAddon(absolute, destPath, version, options.source !== undefined);
-		if (recorded) writeAddonSourcesStamp(destPath, recorded.sources, recorded.build);
+		if (recorded && sources) writeAddonSourcesStamp(destPath, sources, recorded.build);
 		else await fs.rm(addonSourcesStampPath(destPath), { force: true });
 		console.log(
 			stamped

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -164,6 +165,21 @@ def test_compute_key_handles_missing_inputs(tmp_path: Path) -> None:
     assert key_before != key_after
 
 
+def test_compute_key_changes_with_cargo_config(tmp_path: Path) -> None:
+    # `.cargo/config.toml` sets rustflags and linker settings the napi build compiles with,
+    # and the addon's sources record covers it; a key that left it out would serve an
+    # addon built under the old configuration.
+    keys = []
+    for name, rustflags in (("a", "-C target-cpu=x86-64-v2"), ("b", "-C target-cpu=x86-64-v3")):
+        repo = _seed_repo(tmp_path / name / "repo")
+        (repo / ".cargo").mkdir()
+        (repo / ".cargo" / "config.toml").write_text(f'[build]\nrustflags = ["{rustflags}"]\n')
+        _git(["-C", str(repo), "add", "."], cwd=repo.parent)
+        _git(["-C", str(repo), "commit", "-m", "cargo config"], cwd=repo.parent)
+        keys.append(compute_key(repo, target="linux-arm64"))
+    assert keys[0] != keys[1]
+
+
 def test_compute_key_uses_all_documented_paths() -> None:
     # Sanity contract: the exported path list IS the input set.
     assert CACHE_KEY_PATHS == (
@@ -171,8 +187,23 @@ def test_compute_key_uses_all_documented_paths() -> None:
         "Cargo.lock",
         "Cargo.toml",
         "rust-toolchain.toml",
+        ".cargo",
         "packages/natives",
     )
+
+
+def test_image_seed_key_lists_the_cache_key_paths_in_order() -> None:
+    # The Dockerfile writes the image seed's `trees.txt` from its own path list; a seed is
+    # served under the key a workspace computes only when both lists are the same.
+    dockerfile = (Path(__file__).resolve().parents[3] / "Dockerfile").read_text(encoding="utf-8")
+    joined = dockerfile.replace("\\\n", " ")
+    added = re.search(r"git add -f -- ([^\n]*?) ':\(exclude\)", joined)
+    assert added is not None, "the Dockerfile's `git add -f -- <paths>` line is missing"
+    assert tuple(added.group(1).split()) == CACHE_KEY_PATHS
+    trees = re.search(r"printf '%s\\n' ((?:\"\$tree:[^\"]+\"\s*)+)\|", joined)
+    assert trees is not None, "the Dockerfile's `printf ... $tree:<path>` list is missing"
+    assert tuple(re.findall(r"\"\$tree:([^\"]+)\"", trees.group(1))) == CACHE_KEY_PATHS
+
 
 
 def test_compute_key_raises_on_non_repo(tmp_path: Path) -> None:

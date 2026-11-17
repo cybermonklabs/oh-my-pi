@@ -10,7 +10,7 @@ export function recordingFs() {
 	const paths = new Map<number, string>();
 	const label = (file: fs.PathOrFileDescriptor) =>
 		(typeof file === "number" ? (paths.get(file) ?? `fd ${file}`) : String(file)).replace(
-			/\S*\.tmp\.\d+\.\d+$/,
+			/\S*\.tmp\.\d+\.[0-9a-f-]{36}$/,
 			"<temp>",
 		);
 	const io = {

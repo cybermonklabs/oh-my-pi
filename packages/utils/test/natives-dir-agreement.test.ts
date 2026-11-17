@@ -126,3 +126,72 @@ describe("the natives directory the addon loader and pi-utils name", () => {
 		expect({ label, ...result }).toEqual({ label, loader: expected, piUtils: expected });
 	});
 });
+
+/**
+ * omp loads the addon (its SQLite lock shim) before pi-utils' `env.ts` applies `.env` files,
+ * so a directory variable from a `.env` file arrives after the loader has resolved the
+ * natives directory. Both must still name one directory. Each case runs in its own process,
+ * as omp does: the loader first, then `env.ts`, then pi-utils.
+ */
+describe("the natives directory when a directory variable comes from a .env file", () => {
+	const DIRECTORY_NAMES = [
+		"PI_NATIVES_DIR",
+		"OMP_DOWNLOAD_ROOT",
+		"OMP_CONFIG_ROOT",
+		"PI_CONFIG_DIR",
+		"PI_CODING_AGENT_DIR",
+		"OMP_PROFILE",
+		"PI_PROFILE",
+		"XDG_DATA_HOME",
+		"XDG_STATE_HOME",
+		"XDG_CACHE_HOME",
+		"__PI_NATIVES_DIR_CACHE",
+	];
+	let tempRoot = "";
+
+	beforeEach(async () => {
+		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-natives-dir-dotenv-"));
+	});
+
+	afterEach(async () => {
+		await fs.rm(tempRoot, { recursive: true, force: true });
+	});
+
+	const cases: [name: string, value: string, existing: string[]][] = [
+		["PI_NATIVES_DIR", "<tmp>/post", []],
+		["OMP_DOWNLOAD_ROOT", "<tmp>/dl", []],
+		["PI_CONFIG_DIR", ".alt", []],
+		...(xdgPlatform ? ([["XDG_CACHE_HOME", "<tmp>/xdg", ["xdg/omp"]]] as [string, string, string[]][]) : []),
+	];
+
+	it.each(cases)("names one directory when the agent's .env sets %s", async (name, value, existing) => {
+		const home = path.join(tempRoot, "home");
+		for (const dir of existing) await fs.mkdir(path.join(tempRoot, dir), { recursive: true });
+		await Bun.write(path.join(home, ".omp/agent/.env"), `${name}=${value.replaceAll("<tmp>", tempRoot)}\n`);
+		const script = path.join(tempRoot, "probe.ts");
+		await Bun.write(
+			script,
+			`const { initLoaderContext } = await import(${JSON.stringify(path.join(import.meta.dir, "../../natives/native/loader-state.js"))});
+const loaderFirst = initLoaderContext({ isCompiledBinary: true }).nativesDir;
+await import(${JSON.stringify(path.join(import.meta.dir, "../src/env.ts"))});
+const { getNativesDir } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/dirs.ts"))});
+console.log(JSON.stringify({ applied: process.env[${JSON.stringify(name)}], loaderFirst, loaderLater: initLoaderContext({ isCompiledBinary: true }).nativesDir, piUtils: getNativesDir() }));
+`,
+		);
+		const env: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
+		for (const key of DIRECTORY_NAMES) delete env[key];
+		const child = Bun.spawn([process.execPath, script], { cwd: tempRoot, env, stdout: "pipe", stderr: "pipe" });
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+		const result = JSON.parse(stdout);
+
+		// The .env file was read, so the case can fail.
+		expect(result.applied).toBe(value.replaceAll("<tmp>", tempRoot));
+		expect(result.loaderLater).toBe(result.loaderFirst);
+		expect(result.piUtils).toBe(result.loaderFirst);
+	});
+});

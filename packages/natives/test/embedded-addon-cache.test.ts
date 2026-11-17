@@ -8,6 +8,7 @@
  * reads the files it wrote itself, and two builds run in turn keep one copy each.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -172,6 +173,93 @@ describe("compiled binaries sharing one natives directory", () => {
 	}, 120_000);
 });
 
+describe("a compiled binary whose cache directory cleanup claims during the start", () => {
+	// The real addon this checkout built: the load must succeed for the start to count.
+	const realAddon = addonFilenames.find(filename => nodeFs.existsSync(path.join(loaderDir, filename)));
+	let root = "";
+	let binary = "";
+	let digest = "";
+
+	beforeAll(async () => {
+		if (!realAddon) throw new Error(`no built addon in ${loaderDir}; run \`bun run build:native\``);
+		root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-claimed-"));
+		const nativeDir = path.join(root, "native");
+		await fs.mkdir(nativeDir);
+		await fs.copyFile(path.join(loaderDir, realAddon), path.join(nativeDir, realAddon));
+		const embedded = await embeddedAddonFiles({ platform: process.platform, arch: process.arch, nativeDir, version });
+		const files: Record<string, string | Uint8Array> = {};
+		for (const file in embedded) files[path.join(loaderDir, path.basename(file))] = embedded[file];
+		digest = /digest: "([0-9a-f]{64})"/.exec(String(files[path.join(loaderDir, "embedded-addon.js")]))?.[1] ?? "";
+		expect(digest).toMatch(/^[0-9a-f]{64}$/);
+		const entry = path.join(root, "entry.ts");
+		// With PROBE_CLAIM set, cleanup in another process claims the cache directory (renames
+		// it to its private name) right after the loader's check found the addon there.
+		await Bun.write(
+			entry,
+			[
+				`import * as fs from "node:fs";`,
+				`import * as path from "node:path";`,
+				`import { loadNative } from ${JSON.stringify(path.join(loaderDir, "loader-state.js"))};`,
+				`let claimed = null;`,
+				`const io = { ...fs, statSync(target, ...rest) {`,
+				`	const stat = fs.statSync(target, ...rest);`,
+				`	if (process.env.PROBE_CLAIM && !claimed && String(target).endsWith(".node") && stat.isFile()) {`,
+				`		const dir = path.dirname(String(target));`,
+				`		claimed = path.join(path.dirname(dir), "." + path.basename(dir) + ".removing.1." + crypto.randomUUID());`,
+				`		fs.renameSync(dir, claimed);`,
+				`	}`,
+				`	return stat;`,
+				`} };`,
+				`try { loadNative({ io }); console.log(JSON.stringify({ loaded: true, claimed })); }`,
+				`catch (err) { console.log(JSON.stringify({ loaded: false, claimed, error: String(err?.message ?? err).split("\\n").slice(0, 4).join(" | ") })); }`,
+			].join("\n"),
+		);
+		binary = path.join(root, process.platform === "win32" ? "probe.exe" : "probe");
+		const build = await Bun.build({
+			entrypoints: [entry],
+			root: repoRoot,
+			target: "bun",
+			format: "esm",
+			files,
+			compile: { outfile: binary, autoloadBunfig: false, autoloadDotenv: false },
+		});
+		expect(build.success).toBe(true);
+	}, 600_000);
+
+	afterAll(async () => {
+		if (root) await fs.rm(root, { recursive: true, force: true });
+	});
+
+	async function probe(nativesDir: string, claim: boolean) {
+		const env: Record<string, string | undefined> = { ...process.env, PI_NATIVES_DIR: nativesDir };
+		delete env.__PI_NATIVE_VARIANT_CACHE;
+		delete env.__PI_NATIVES_DIR_CACHE;
+		if (process.arch === "x64") env.PI_NATIVE_VARIANT = realAddon?.includes("-baseline") ? "baseline" : "modern";
+		if (claim) env.PROBE_CLAIM = "1";
+		else delete env.PROBE_CLAIM;
+		const child = Bun.spawn([binary], { env, stdout: "pipe", stderr: "ignore" });
+		const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+		expect(exitCode).toBe(0);
+		return JSON.parse(output.trim().split("\n").at(-1)!) as {
+			loaded: boolean;
+			claimed: string | null;
+			error?: string;
+		};
+	}
+
+	it("loads the addon it puts back, never failing the start", async () => {
+		const nativesDir = path.join(root, "natives");
+		expect(await probe(nativesDir, false)).toEqual({ loaded: true, claimed: null });
+
+		const claimedStart = await probe(nativesDir, true);
+
+		expect(claimedStart.claimed).toBeString();
+		expect(claimedStart).toEqual({ loaded: true, claimed: claimedStart.claimed });
+		const ownDir = path.join(nativesDir, `${version}-${digest.slice(0, 12)}`);
+		expect(nodeFs.existsSync(path.join(ownDir, realAddon!))).toBe(true);
+	}, 300_000);
+});
+
 describe("embedded addon extraction", () => {
 	let root = "";
 
@@ -230,6 +318,28 @@ describe("embedded addon extraction", () => {
 
 		expect(calls).toEqual(durableWriteCalls(path.join(targetDir, file.filename), targetDir));
 	});
+
+	it("writes again into its directory when cleanup claimed it during the start", async () => {
+		const targetDir = path.join(root, "claimed");
+		await fs.mkdir(targetDir);
+		const file = await manifestFile("claimed", "claimed addon bytes");
+		let claimed = false;
+		// Cleanup renames a directory away just after the start marked it used (it renames it
+		// back, or a later start makes it again); the first write meets no directory.
+		const io = {
+			...nodeFs,
+			openSync(target: nodeFs.PathLike, flags: nodeFs.OpenMode, mode?: nodeFs.Mode | null) {
+				if (!claimed) {
+					claimed = true;
+					nodeFs.rmSync(targetDir, { recursive: true, force: true });
+				}
+				return nodeFs.openSync(target, flags, mode);
+			},
+		};
+
+		expect(extractEmbeddedAddons({ files: [file], targetDir, io })).toEqual([path.join(targetDir, file.filename)]);
+		expect(await Bun.file(path.join(targetDir, file.filename)).text()).toBe("claimed addon bytes");
+	});
 });
 
 describe("addon cache cleanup", () => {
@@ -271,6 +381,57 @@ describe("addon cache cleanup", () => {
 			expect((await fs.readdir(nativesDir)).sort()).toEqual(
 				[...Object.keys(dirs).filter(name => dirs[name].kept), "README.txt"].sort(),
 			);
+		} finally {
+			await fs.rm(nativesDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a directory a start marks used while cleanup is checking it", async () => {
+		const nativesDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-cleanup-race-"));
+		const twoDaysAgo = new Date(Date.now() - 2 * DAY_MS);
+		const used = path.join(nativesDir, `${version}-bbbbbbbbbbbb`);
+		try {
+			await Bun.write(path.join(used, "pi_natives.node"), "another build's addon");
+			await fs.utimes(used, twoDaysAgo, twoDaysAgo);
+			let marked = false;
+			// A start marks the directory used (`prepareNativeVersionDir`) right after cleanup
+			// first read its time.
+			const io = {
+				...nodeFs,
+				statSync(target: nodeFs.PathLike) {
+					const stat = nodeFs.statSync(target);
+					if (!marked && String(target) === used) {
+						marked = true;
+						nodeFs.utimesSync(used, new Date(), new Date());
+					}
+					return stat;
+				},
+			} as typeof nodeFs;
+
+			const removed = cleanupStaleNativeVersions({ nativesDir, currentDir: path.join(nativesDir, "none"), io });
+
+			expect(marked).toBe(true);
+			expect(removed).toEqual([]);
+			expect(await fs.readdir(nativesDir)).toEqual([path.basename(used)]);
+			expect(await Bun.file(path.join(used, "pi_natives.node")).text()).toBe("another build's addon");
+		} finally {
+			await fs.rm(nativesDir, { recursive: true, force: true });
+		}
+	});
+
+	it("removes what a stopped cleanup left once it is a day old", async () => {
+		const nativesDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-cleanup-left-"));
+		const twoDaysAgo = new Date(Date.now() - 2 * DAY_MS);
+		const old = `.${version}-cccccccccccc.removing.4242.${crypto.randomUUID()}`;
+		const recent = `.${version}-dddddddddddd.removing.4242.${crypto.randomUUID()}`;
+		try {
+			await fs.mkdir(path.join(nativesDir, old));
+			await fs.utimes(path.join(nativesDir, old), twoDaysAgo, twoDaysAgo);
+			await fs.mkdir(path.join(nativesDir, recent));
+
+			cleanupStaleNativeVersions({ nativesDir, currentDir: path.join(nativesDir, "none") });
+
+			expect(await fs.readdir(nativesDir)).toEqual([recent]);
 		} finally {
 			await fs.rm(nativesDir, { recursive: true, force: true });
 		}

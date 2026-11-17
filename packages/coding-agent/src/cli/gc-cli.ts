@@ -48,6 +48,7 @@ import {
 	tryAcquireSessionLease,
 } from "../session/session-storage";
 import { resolveSessionStorage } from "../session/session-storage-config";
+import { uniqueSiblingPath } from "../utils/atomic-file";
 import {
 	type CompressCandidate,
 	type CompressMethod,
@@ -1376,7 +1377,9 @@ async function digestArchivedSessionFile(file: string): Promise<{ hash: string; 
  */
 async function gzipSessionFile(source: string, destination: string): Promise<{ orphanedTarget?: string }> {
 	await fs.mkdir(path.dirname(destination), { recursive: true });
-	const tempPath = `${destination}.${process.pid}.${Date.now()}.tmp`;
+	// Private to this writer (`uniqueSiblingPath`): a pid and a clock reading can repeat
+	// for another writer of this archive in this process.
+	const tempPath = uniqueSiblingPath(destination);
 	// Only the transcript's own link counts. `realpath` would also resolve a
 	// symlinked sessions directory and report every transcript under it as an
 	// orphan, drowning the lines that name a real one.

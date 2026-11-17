@@ -271,6 +271,7 @@ Runtime x64 candidate order also includes the unsuffixed default filename after 
 
 - `PI_NATIVES_DIR`: overrides the native addon extraction/staging root before XDG/default paths; the loader extracts or stages into `<version>-<digest prefix>`, named by the digest the addons carry from their build (the embedded manifest's, or the leaf package's `nativeAddons`). Values are trimmed, `~`-expanded, and normalized; empty or relative values are ignored. Downloaded tree-sitter grammars live in its `grammars/` subdirectory, which the loader passes to the addon and cache cleanup leaves alone; other application data stays at its usual location. The directory must be writable only by the user(s) running `omp`: a file already in a build's own directory is reused when its size matches, and the version sentinel is read after the addon is loaded, so a same-sized file planted there by another user would be loaded.
   A directory shared by several `omp` builds or versions keeps every cache directory an `omp` process used within a day, whatever its version, and removes the rest, so a long-running run whose directory was removed re-extracts on its next fresh process start.
+  The directory is one answer per process, fixed when omp first loads the addon, before it applies `.env` files: set `PI_NATIVES_DIR`, and the variables the fallback reads, in the environment, not in a `.env` file.
 - `PI_NATIVE_VARIANT`: x64 runtime override; valid values are `modern` and `baseline`. Invalid values are ignored; the inherited variant cache is consulted before detection.
 - `PI_DEBUG_STARTUP`: writes synchronous `[startup] native:…` markers to stderr around loader entry, embedded extraction, candidate loads, and native Tokio runtime installation; use it to localize startup hangs.
 - `PI_COMPILED`: compiled-mode signal. Release compilation constant-folds `process.env.PI_COMPILED` to `"true"`; a populated embedded-addon manifest and Bun embedded URL markers also signal compiled mode.
@@ -390,7 +391,7 @@ The cache captures the following files from `packages/natives/native/` under the
 - `index.js`
 - `embedded-addon.js`
 - `manifest.json` (cache metadata: key, target triple, capture timestamp, source workspace, commit)
-- `<addon>.sources.json`, optional: the native build's record of the Rust sources it compiled. It is captured with its addon when the build wrote one and restored on a hit; an entry without one is still served, and populate removes any record an earlier build left in the workspace, so the workspace loader judges the restored addon by its own record or not at all. Because copies keep the addon's modification time, by which the record names it, a restored record still describes its addon. The image seed (`Dockerfile`, `cp -p`) carries it too.
+- `<addon>.sources.json`, optional: the native build's record of the Rust sources it compiled. It is captured with its addon when the build wrote one and restored on a hit; an entry without one is still served, and populate removes any record an earlier build left in the workspace, so the workspace loader judges the restored addon by its own record or not at all. Because copies keep the addon's modification time, by which the record names it, a restored record still describes its addon. The image seed (`Dockerfile`, `cp -p`) carries it too: a Docker layer `COPY` keeps only whole seconds of a modification time, so the build sets the addon's time to a whole second before it writes the record.
 
 An entry is only considered a hit when the `.node` glob matches AND every companion plus the manifest is present; the sources record is not required. GC removes manifest-less and dot-prefixed staging directories; an entry with a manifest but missing a companion is a miss, not automatically purged for that reason.
 
@@ -402,11 +403,14 @@ The key is `sha256` over `(path \t git-tree-hash \n)` pairs for the following in
 2. `Cargo.lock`
 3. `Cargo.toml`
 4. `rust-toolchain.toml`
-5. `packages/natives` (whole subtree — build script, `scripts/*`, package.json)
+5. `.cargo` (cargo's configuration: `rustflags`, linker settings)
+6. `packages/natives` (whole subtree — build script, `scripts/*`, package.json)
+
+The Dockerfile's image-seed key (`trees.txt`) lists the same paths in the same order, so a seed captured from the image has the key a robomp workspace computes.
 
 Tree hashes come from one `git cat-file --batch-check` invocation against `HEAD`; paths missing from `HEAD` fold in as a fixed null hash so the key stays deterministic across repos that don't ship every input. The target suffix is `<platform>-<arch>` on non-x64. On x64 it is `<platform>-<arch>-<TARGET_VARIANT>`, or `<platform>-<arch>-host` when `TARGET_VARIANT` is unset; the Python cache does not perform AVX2 detection.
 
-Anything outside this input set (Bazel definition files such as `MODULE.bazel`/`BUILD.bazel`, host glibc, env vars other than the target suffix) is **not** in the key. The content hashes also describe committed `HEAD`, not uncommitted worktree changes. Delete the relevant cache entry after an out-of-key or uncommitted build-input change; committing a change under one of the five keyed paths produces a new key automatically.
+Anything outside this input set (Bazel definition files such as `MODULE.bazel`/`BUILD.bazel`, host glibc, env vars other than the target suffix) is **not** in the key. The content hashes also describe committed `HEAD`, not uncommitted worktree changes. Delete the relevant cache entry after an out-of-key or uncommitted build-input change; committing a change under one of the six keyed paths produces a new key automatically.
 
 ### Layout and ownership
 
@@ -447,4 +451,4 @@ Workspaces that hardlinked a `.node` before GC retain access via the kernel inod
 - Everything: `rm -rf /data/cache/pi-natives/*` (preserve the root so its setgid mode survives).
 - Stuck lock: `rm /data/cache/pi-natives/<repo-slug>/.lock` (only when no orchestrator process is touching the repo).
 
-For a fixed target suffix, a committed `HEAD` change under `crates/`, `Cargo.lock`, `Cargo.toml`, `rust-toolchain.toml`, or `packages/natives/` produces an automatic miss. Changing platform/architecture, or `TARGET_VARIANT` on x64, also selects a different key. Merely editing an uncommitted worktree changes neither the `HEAD` hashes nor the key.
+For a fixed target suffix, a committed `HEAD` change under `crates/`, `Cargo.lock`, `Cargo.toml`, `rust-toolchain.toml`, `.cargo/`, or `packages/natives/` produces an automatic miss. Changing platform/architecture, or `TARGET_VARIANT` on x64, also selects a different key. Merely editing an uncommitted worktree changes neither the `HEAD` hashes nor the key.
