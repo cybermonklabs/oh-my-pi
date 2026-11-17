@@ -15,6 +15,7 @@
  * agent is still streaming: a long `write` is invisible in history until it
  * finishes, so without it the estimate stalls near 0% for minutes.
  */
+import { estimateTranscriptTokens, findTranscriptUsageAnchor } from "@oh-my-pi/pi-agent-core/compaction";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import {
 	formatDuration,
@@ -27,6 +28,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import completionProbePrompt from "../prompts/system/subagent-completion-probe.md" with { type: "text" };
+import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
 import { cfgTaskCompletionProbe } from "./settings";
 
@@ -35,6 +37,45 @@ import { cfgTaskCompletionProbe } from "./settings";
  * off to one side request an hour. The last entry repeats.
  */
 const PROBE_DELAYS_MS = [2, 5, 10, 30, 60].map(minutes => minutes * 60_000);
+
+/** Share of a probe's prompt that must be cache reads for the probe to go out. */
+const PROBE_MIN_CACHED_SHARE = 0.95;
+
+/**
+ * No probe goes out this close to the end of the agent's cache entry: after the check the probe still builds
+ * its request and can wait for a provider slot, so the entry must outlive that.
+ */
+const PROBE_EXPIRY_MARGIN_MS = 30_000;
+
+/**
+ * Whether a probe that asks `promptText` now would read at least {@link PROBE_MIN_CACHED_SHARE} of its prompt
+ * from the cache. The cache holds what the agent's newest request read or wrote. The probe sends more: that
+ * request's reply, everything after it (tool results), the reply still streaming (its text and thinking; the
+ * side turn drops its tool calls), the side-channel reminder and the question. Those are counted the way the
+ * session counts its context: the provider's report for the request and reply, a local count for the rest.
+ */
+function probePromptCached(session: AgentSession, promptText: string): boolean {
+	const messages = session.messages;
+	const anchor = findTranscriptUsageAnchor(messages);
+	if (!anchor) return false;
+	const { tokenizer } = session.agent;
+	const streaming = session.agent.state.streamMessage;
+	const streamingTokens =
+		streaming?.role === "assistant" && Array.isArray(streaming.content)
+			? tokenizer.countMessage({
+					...streaming,
+					content: streaming.content.filter(block => block.type !== "toolCall"),
+				})
+			: 0;
+	const questionTokens = tokenizer.countMessage({
+		role: "user",
+		content: `${sideChannelNoToolsReminder}\n${promptText}`,
+		timestamp: 0,
+	});
+	const probeTokens = estimateTranscriptTokens(messages, tokenizer) + streamingTokens + questionTokens;
+	const { cacheRead, cacheWrite } = anchor.message.usage;
+	return cacheRead + cacheWrite >= PROBE_MIN_CACHED_SHARE * probeTokens;
+}
 
 /**
  * Whether a subagent spawned by a session at `parentDepth` gets completion probes.
@@ -181,8 +222,13 @@ function inflightToolCalls(session: AgentSession): InflightToolCall[] {
 /**
  * Probe the run's session on the {@link PROBE_DELAYS_MS} schedule until `signal`
  * aborts. Each delay counts from the end of the previous probe, so probes never
- * overlap. A tick that finds the session idle is skipped; failures are logged.
- * Both still advance the schedule.
+ * overlap. A tick that finds the session idle is skipped, and so is one where the
+ * probe could not read the agent's prompt cache: less than {@link PROBE_MIN_CACHED_SHARE}
+ * of the probe's prompt is in the cache (a provider that keeps no cache reports none;
+ * a large tool result came back after the agent's last request), the entry ends within
+ * {@link PROBE_EXPIRY_MARGIN_MS}, or no lifetime is known ({@link AgentSession.promptCacheExpiresAt});
+ * the progress line keeps its last estimate. Failures are logged. Every skip still
+ * advances the schedule.
  */
 export function startCompletionProbe(options: CompletionProbeOptions): void {
 	const { signal } = options;
@@ -193,22 +239,31 @@ export function startCompletionProbe(options: CompletionProbeOptions): void {
 	const probe = async (): Promise<void> => {
 		const session = options.session();
 		if (!session?.isStreaming || signal.aborted) return;
+		const promptText = prompt.render(completionProbePrompt, {
+			inflight: inflightToolCalls(session),
+			previous: previous && {
+				percent: previous.percent,
+				stage: previous.stage,
+				ago: formatDuration(Date.now() - previous.at),
+			},
+		});
+		const cacheExpiresAt = session.promptCacheExpiresAt();
+		if (
+			!probePromptCached(session, promptText) ||
+			cacheExpiresAt === undefined ||
+			Date.now() >= cacheExpiresAt - PROBE_EXPIRY_MARGIN_MS
+		) {
+			logger.debug("Subagent completion probe skipped: it could not read the agent's prompt cache", {
+				cacheExpiresAt,
+			});
+			return;
+		}
 		try {
 			const usageOwner = {
 				sessionId: session.sessionManager.getSessionId(),
 				parentId: session.sessionManager.getLeafId(),
 			};
-			const { replyText, assistantMessage } = await session.runEphemeralTurn({
-				promptText: prompt.render(completionProbePrompt, {
-					inflight: inflightToolCalls(session),
-					previous: previous && {
-						percent: previous.percent,
-						stage: previous.stage,
-						ago: formatDuration(Date.now() - previous.at),
-					},
-				}),
-				signal,
-			});
+			const { replyText, assistantMessage } = await session.runEphemeralTurn({ promptText, signal });
 			if (assistantMessage.usage) {
 				session.sessionManager.appendModelUsage(
 					{

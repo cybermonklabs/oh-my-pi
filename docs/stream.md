@@ -70,7 +70,7 @@ Rows cross a private local Unix socket (`0600`, under the per-directory omp runt
 Redaction is irreversible and intentionally over-matches. Any match replaces the run with `••••••`; a row with a match is sent unstyled. Sources:
 
 - Values of environment variables whose names look secret (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*PASSWORD*`, …) and every value loaded from a `.env` file for the directory, regardless of name (8+ chars).
-- `.omp/secrets.yml` and `~/.omp/agent/secrets.yml` entries.
+- `.omp/secrets.yml` and `~/.omp/agent/secrets.yml` entries. A `secrets.yml` of any size is read, but one that is not a regular file, such as a directory or a FIFO, is skipped without being opened, and one that grows while it is read is skipped; each skip is logged as a warning.
 - Credential shapes (GitHub/GitLab/OpenAI/Anthropic/AWS/Slack/Stripe/npm/HF tokens, JWTs, PEM blocks, `Bearer …`). Vendor prefixes are matched **without** a length gate so a token is masked while it is still being typed or streamed character by character.
 - `NAME=value`, `NAME: value`, `"NAME": "value"` where `NAME` looks secret — the value is masked (covers `read .env` and config files on screen).
 - Passwords in connection URLs (`scheme://user:password@host`).

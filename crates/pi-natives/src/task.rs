@@ -415,6 +415,27 @@ where
 	AsyncTask::new(Blocking { tag, cancel_token: cancel_token.into(), work: Some(Box::new(work)) })
 }
 
+/// Settle a filesystem walk's Promise. `result` is `None` when the deadline
+/// beat the walk; the walk is cancelled by then, so a provider cannot hold the
+/// Promise up.
+///
+/// Only an explicit abort rejects a walk that finished. An elapsed deadline
+/// alone does not: settlement runs on the JS thread, which can be busy long
+/// after the walk finished inside its budget.
+fn settle_walk<T>(
+	token: &CancelToken,
+	result: Option<Result<T>>,
+	cancelled: impl FnOnce(AbortReason) -> Error,
+) -> Result<T> {
+	if let Some(reason) = token.abort_reason() {
+		return Err(match reason {
+			AbortReason::Timeout => Error::from_reason("Aborted: Timeout"),
+			reason => cancelled(reason),
+		});
+	}
+	result.unwrap_or_else(|| Err(Error::from_reason("Aborted: Timeout")))
+}
+
 /// Run synchronous filesystem work without occupying libuv's pool.
 ///
 /// Provider callbacks may need that pool for async I/O; cancellation interrupts
@@ -433,17 +454,7 @@ where
 	let settlement_token = cancel_token.clone();
 	let promise = env.spawn_future_with_callback(
 		async move { Ok(run_filesystem_worker(tag, cancel_token, fs, work).await) },
-		move |env, result| {
-			if let Some(reason) = settlement_token.abort_reason() {
-				return Err(match reason {
-					AbortReason::Timeout => Error::from_reason("Aborted: Timeout"),
-					_ => abort_error(*env, reason),
-				});
-			}
-			// An elapsed deadline has no explicit abort flag. The worker was
-			// already cancelled, so the provider cannot hold up this Promise.
-			result.unwrap_or_else(|| Err(Error::from_reason("Aborted: Timeout")))
-		},
+		move |env, result| settle_walk(&settlement_token, result, |reason| abort_error(*env, reason)),
 	)?;
 	// `Settled` only adds settlement reporting; the Promise still resolves to
 	// `T`.
@@ -470,15 +481,7 @@ where
 	let settlement_token = cancel_token.clone();
 	let promise = env.spawn_future_with_callback(
 		async move { Ok(run_filesystem_future(tag, cancel_token, fs, work).await) },
-		move |env, result| {
-			if let Some(reason) = settlement_token.abort_reason() {
-				return Err(match reason {
-					AbortReason::Timeout => Error::from_reason("Aborted: Timeout"),
-					_ => abort_error(*env, reason),
-				});
-			}
-			result.unwrap_or_else(|| Err(Error::from_reason("Aborted: Timeout")))
-		},
+		move |env, result| settle_walk(&settlement_token, result, |reason| abort_error(*env, reason)),
 	)?;
 	Ok(PromiseRaw::new(env.raw(), promise.raw()))
 }
@@ -1047,5 +1050,36 @@ mod tests {
 		assert_eq!(task.compute().unwrap().into_inner(), 1);
 		let err = task.compute().unwrap_err();
 		assert!(err.reason.contains("work already consumed"), "reason = {}", err.reason);
+	}
+
+	#[test]
+	fn settle_walk_delivers_a_finished_walk_past_its_deadline() {
+		let expired = CancelToken::new(Some(0), None);
+		assert!(expired.heartbeat().is_err(), "the deadline has not elapsed");
+		let delivered = settle_walk(&expired, Some(Ok(7_u32)), |reason| {
+			panic!("an elapsed deadline settled as an abort ({reason:?})")
+		});
+		assert_eq!(delivered.unwrap(), 7);
+	}
+
+	#[test]
+	fn settle_walk_rejects_a_finished_walk_on_explicit_abort() {
+		let mut token = CancelToken::new(None, None);
+		token.emplace_abort_token().abort(AbortReason::Signal);
+		let rejected = settle_walk(&token, Some(Ok(7_u32)), |reason| {
+			Error::new(Status::Cancelled, format!("cancelled: {reason:?}"))
+		});
+		let error = rejected.unwrap_err();
+		assert_eq!(error.status, Status::Cancelled);
+		assert_eq!(error.reason, "cancelled: Signal");
+	}
+
+	#[test]
+	fn settle_walk_rejects_a_walk_the_deadline_beat_as_a_timeout() {
+		let expired = CancelToken::new(Some(0), None);
+		let rejected = settle_walk::<u32>(&expired, None, |reason| {
+			panic!("an elapsed deadline settled as an abort ({reason:?})")
+		});
+		assert_eq!(rejected.unwrap_err().reason, "Aborted: Timeout");
 	}
 }
