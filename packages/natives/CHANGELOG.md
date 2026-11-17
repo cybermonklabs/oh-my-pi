@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a parallel directory walk (`grep()`, `glob()`, `fd()`, ast-grep, edit path recovery, and the shell's `grep -r` and `rg`) that could hang for ever, about once in several thousand walks on a busy machine with 8 or more CPUs: a worker that missed its stop message waited on an empty queue. A walk now stops by closing its job queue
+- Fixed a walk that its caller dropped before its first worker ran reading freed memory as a path
+- Fixed a panic in the input of an ordered search pool being swallowed, which ended the search early with no error; it now reaches the caller after the outputs before it
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

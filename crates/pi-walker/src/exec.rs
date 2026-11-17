@@ -6,8 +6,8 @@
 //! input stream into a bounded job channel the workers share; their outputs
 //! come back as a stream in input order ([`ordered`]).
 //! Dropping the output stream aborts the feeder and the
-//! workers at their next suspension point; a panic in `work` resumes in the
-//! consumer.
+//! workers at their next suspension point; a panic in `work` or in the input
+//! stream resumes in the consumer.
 //!
 //! A pool costs a task hand-off per item, which dominates short runs (a
 //! small tree's files); [`adaptive`] runs items inline on the consumer's task
@@ -87,6 +87,7 @@ where
 	let (jobs, queue) = flume::bounded::<Job<I>>(states.len());
 	let mut tasks = Vec::with_capacity(states.len() + 1);
 	let permits = Arc::new(Semaphore::new(window.max(1)));
+	let failed = results.clone();
 	tasks.push(
 		tokio::spawn(async move {
 			let mut inputs = pin!(inputs);
@@ -97,8 +98,16 @@ where
 				let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
 					return;
 				};
-				let Some(item) = inputs.next().await else {
-					return;
+				let item = match AssertUnwindSafe(inputs.next()).catch_unwind().await {
+					Ok(Some(item)) => item,
+					Ok(None) => return,
+					// The input's panic takes the next output's turn, so the
+					// consumer resumes it after every output before it rather
+					// than seeing the outputs end early.
+					Err(panic) => {
+						let _ = failed.send(Done { seq, output: Err(panic), permit });
+						return;
+					},
 				};
 				if jobs.send_async(Job { seq, item, permit }).await.is_err() {
 					return;
@@ -514,5 +523,29 @@ mod tests {
 			.await;
 		});
 		assert!(run.await.unwrap_err().is_panic());
+	}
+
+	/// A panic in the input stream resumes in the consumer after every
+	/// output before it, rather than ending the outputs early as if the
+	/// input were done.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn input_panics_resume_in_the_consumer() {
+		let inputs = stream::iter(0_u8..10).map(|n| {
+			assert_ne!(n, 5, "input boom");
+			n
+		});
+		let mut outputs = ordered(inputs, 2, 4, || (), |(), n| async move { ((), n) });
+		let mut got = Vec::new();
+		let resumed = loop {
+			match AssertUnwindSafe(outputs.next()).catch_unwind().await {
+				Ok(Some(n)) => got.push(n),
+				Ok(None) => break None,
+				Err(panic) => break Some(panic),
+			}
+		};
+		assert_eq!(got, [0, 1, 2, 3, 4]);
+		let panic = resumed.expect("the input panic was swallowed; the outputs ended early");
+		let message = panic.downcast_ref::<String>().map_or("", String::as_str);
+		assert!(message.contains("input boom"), "{message:?}");
 	}
 }
