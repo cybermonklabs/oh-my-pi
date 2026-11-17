@@ -4,7 +4,7 @@
  * canonical UUID, and pairs with no other session flag. `--resume <id>` opens the session that
  * holds exactly that id, never another one whose id merely starts with it.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, setSystemTime } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { gzipSync } from "node:zlib";
@@ -285,34 +285,41 @@ describe("omp --session-id", () => {
 		]);
 	});
 
-	it("lets only one of two concurrent launches under an id go on in SQL storage, which has no lease", async () => {
-		const storage = await sqlStorage();
-		const dir = path.resolve("/sessions/session-id-race");
-		const previous = defaultSessionStorage();
-		setDefaultSessionStorage(storage);
-		const isHeld = async () =>
-			(await resolveResumableSession(SESSION_ID, "/work", dir, storage, { exactId: true })) !== undefined;
-		let second: SessionManager | undefined;
-		try {
-			const first = await SessionManager.createWithSessionId("/work", dir, SESSION_ID, async () => {
-				const held = await isHeld();
-				// The competing launch runs whole between this launch's check and its first write.
-				second = await SessionManager.createWithSessionId("/work", dir, SESSION_ID, isHeld);
-				return held;
-			});
-			const accepted = [first, second].filter(manager => manager !== undefined);
+	for (const clock of ["distinct milliseconds", "the same millisecond"] as const) {
+		it(`lets only one of two concurrent launches under an id go on in SQL storage, at ${clock}`, async () => {
+			const storage = await sqlStorage();
+			const dir = path.resolve("/sessions/session-id-race");
+			const previous = defaultSessionStorage();
+			setDefaultSessionStorage(storage);
+			// At the same millisecond both launches name the same session file, `<time>_<id>.jsonl`.
+			if (clock === "the same millisecond") setSystemTime(LATER);
+			const isHeld = async () =>
+				(await resolveResumableSession(SESSION_ID, "/work", dir, storage, { exactId: true })) !== undefined;
+			let second: SessionManager | undefined;
 			try {
-				expect(accepted, "exactly one launch keeps the id").toHaveLength(1);
-				await storage.refresh?.();
-				const holders = storage.listFilesSync(dir, "*.jsonl").filter(file => file.endsWith(`_${SESSION_ID}.jsonl`));
-				expect(holders, "one stored session holds the id").toHaveLength(1);
+				const first = await SessionManager.createWithSessionId("/work", dir, SESSION_ID, async () => {
+					const held = await isHeld();
+					// The competing launch runs whole between this launch's check and its first write.
+					second = await SessionManager.createWithSessionId("/work", dir, SESSION_ID, isHeld);
+					return held;
+				});
+				const accepted = [first, second].filter(manager => manager !== undefined);
+				try {
+					expect(accepted, "exactly one launch keeps the id").toHaveLength(1);
+					await storage.refresh?.();
+					const holders = storage
+						.listFilesSync(dir, "*.jsonl")
+						.filter(file => file.endsWith(`_${SESSION_ID}.jsonl`));
+					expect(holders, "one stored session holds the id").toHaveLength(1);
+				} finally {
+					for (const manager of accepted) await manager.close();
+				}
 			} finally {
-				for (const manager of accepted) await manager.close();
+				setSystemTime();
+				setDefaultSessionStorage(previous);
 			}
-		} finally {
-			setDefaultSessionStorage(previous);
-		}
-	});
+		});
+	}
 });
 
 describe("omp --resume <id>", () => {

@@ -5467,10 +5467,13 @@ export class SessionManager {
 	 * launch under the id, in this process or another live one, finds it taken. Returns `undefined`,
 	 * having kept nothing, when another live process owns the id or `isHeld` answers `true`.
 	 *
-	 * A store with no ownership lease (`session.storage: sql`) cannot make that check atomic: another
-	 * launch under the id may pass it too. There each launch looks again once its own header is durable
-	 * in the shared store, and withdraws (deleting what it wrote) when another session is named for the
-	 * id, so at most one goes on; two that each see the other both withdraw.
+	 * The header is first published on the condition that its file does not exist yet, so a launch
+	 * that drew the same file name (the same id at the same millisecond) loses there instead of
+	 * taking the other launch's identical bytes for its own. A store with no ownership lease
+	 * (`session.storage: sql`) still cannot make the `isHeld` check atomic for two different file
+	 * names: there each launch looks again once its own header is durable in the shared store, and
+	 * withdraws (deleting what it wrote) when another session is named for the id, so at most one
+	 * goes on; two that each see the other both withdraw.
 	 */
 	static async createWithSessionId(
 		cwd: string,
@@ -5483,12 +5486,26 @@ export class SessionManager {
 			await manager.close();
 			return undefined;
 		}
+		const sessionFile = manager.#sessionFile;
+		if (sessionFile) {
+			const body = manager.#serializeBody();
+			try {
+				await manager.#storage.writeTextAtomic(sessionFile, Array.from(body.lines).join(""), {
+					expectedSize: null,
+				});
+			} catch (error) {
+				if (!(error instanceof SessionWriteConflictError)) throw error;
+				await manager.close();
+				return undefined;
+			}
+			manager.#expectedDiskSize = body.bytes;
+		}
 		await manager.ensureOnDisk();
 		if (!manager.#storage.claimSession && (await manager.#anotherSessionNamesThisId())) {
-			const sessionFile = manager.#sessionFile;
+			const written = manager.#sessionFile;
 			await manager.close();
-			if (sessionFile) {
-				await manager.#storage.deleteSessionWithArtifacts(sessionFile);
+			if (written) {
+				await manager.#storage.deleteSessionWithArtifacts(written);
 				// Durable before the refusal, so the launch that goes on never sees this one again.
 				await manager.#storage.drain();
 			}
