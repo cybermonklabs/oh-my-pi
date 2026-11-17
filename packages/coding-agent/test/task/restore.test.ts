@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Message } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Message, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import * as aiStream from "@oh-my-pi/pi-ai/stream";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
@@ -16,7 +16,7 @@ import { SESSION_EXIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
-import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import type { SingleResult, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const zeroUsage = {
@@ -144,13 +144,36 @@ function subagentResult(id: string): SingleResult {
 	};
 }
 
+/** The parent's `task` call that spawned subagent `id`, and the result that names it. */
+function appendTaskSpawn(main: SessionManager, id: string): void {
+	const callId = `call_${id}`;
+	main.appendMessage(
+		assistant({
+			content: [{ type: "toolCall", id: callId, name: "task", arguments: { agent: "task", task: `${id} task` } }],
+			stopReason: "toolUse",
+		}),
+	);
+	const details: TaskToolDetails = { projectAgentsDir: null, results: [subagentResult(id)], totalDurationMs: 5 };
+	const result: ToolResultMessage = {
+		role: "toolResult",
+		toolCallId: callId,
+		toolName: "task",
+		content: [{ type: "text", text: `${id} finished` }],
+		details,
+		isError: false,
+		timestamp: Date.now(),
+	};
+	main.appendMessage(result);
+}
+
 describe("restoreSession (omp --restore)", () => {
-	const ids = ["Cut", "Done", "Killed", "Stranded", "Refused", "ClearedHere", "ErrorHere"];
+	const ids = ["Cut", "Done", "Killed", "Stranded", "Refused", "ClearedHere", "ErrorHere", "Older", "Left", "Current"];
 	let tempDir: TempDir | undefined;
 	let manager: AsyncJobManager | undefined;
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		setSystemTime();
 		for (const id of ids) AgentRegistry.global().unregister(id);
 		await manager?.dispose({ timeoutMs: 1000 });
 		manager = undefined;
@@ -179,7 +202,7 @@ describe("restoreSession (omp --restore)", () => {
 		const followUp = vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockResolvedValue(subagentResult("Cut"));
 		const restoreTurn = vi.fn(async () => true);
 		const session = {
-			sessionManager: { getSessionFile: () => mainFile },
+			sessionManager: { getSessionFile: () => mainFile, getEntries: () => [], getLeafId: () => null },
 			asyncJobManager: manager,
 			settings: Settings.isolated(),
 			restoreInterruptedTurn: restoreTurn,
@@ -233,7 +256,7 @@ describe("restoreSession (omp --restore)", () => {
 			.spyOn(executorModule, "runSubagentFollowUpTurn")
 			.mockResolvedValue(subagentResult("Stranded"));
 		const session = {
-			sessionManager: { getSessionFile: () => mainFile },
+			sessionManager: { getSessionFile: () => mainFile, getEntries: () => [], getLeafId: () => null },
 			asyncJobManager: manager,
 			settings: Settings.isolated(),
 			restoreInterruptedTurn: vi.fn(async () => false),
@@ -295,7 +318,7 @@ describe("restoreSession (omp --restore)", () => {
 		manager.registerDeliverySink(MAIN_AGENT_ID, () => {});
 		vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockResolvedValue(subagentResult("ErrorHere"));
 		const session = {
-			sessionManager: { getSessionFile: () => mainFile },
+			sessionManager: { getSessionFile: () => mainFile, getEntries: () => [], getLeafId: () => null },
 			asyncJobManager: manager,
 			settings: Settings.isolated(),
 			restoreInterruptedTurn: vi.fn(async () => false),
@@ -305,5 +328,62 @@ describe("restoreSession (omp --restore)", () => {
 
 		expect(outcome).toEqual({ turn: false, subagents: ["ErrorHere"] });
 		await manager.getJob("ErrorHere")!.promise;
+	});
+
+	it("relaunches a subagent of the parent's current conversation, not one of a branch it left or from before its /clear", async () => {
+		// If this regresses, `--restore` relaunches a subagent of work its parent left behind, and the parent
+		// receives a result for a job its current conversation never started.
+		tempDir = TempDir.createSync("@pi-restore-parent-conversation-");
+		const cwd = tempDir.path();
+		const start = Date.parse("2026-11-17T12:00:00.000Z");
+		setSystemTime(new Date(start));
+		const main = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const mainFile = main.getSessionFile();
+		if (!mainFile) throw new Error("Expected a persisted session file");
+		main.appendMessage({ role: "user", content: "fan out", timestamp: Date.now() });
+		// No `task` result names "Older": the parent's process ended inside the call that spawned it, before the /clear.
+		await writeSubagent(mainFile, cwd, "Older", cutOff);
+		setSystemTime(new Date(start + 60_000));
+		main.appendResetBoundary();
+		setSystemTime(new Date(start + 120_000));
+		const prompt = main.appendMessage({ role: "user", content: "new work", timestamp: Date.now() });
+		// The parent spawned "Left", then went back to its prompt and went on another way.
+		appendTaskSpawn(main, "Left");
+		await writeSubagent(mainFile, cwd, "Left", cutOff);
+		main.branch(prompt);
+		// On that way it spawned "Current", and its process ended inside that call: no result names it either.
+		main.appendMessage(
+			assistant({
+				content: [
+					{
+						type: "toolCall",
+						id: "call_Current",
+						name: "task",
+						arguments: { agent: "task", task: "Current task" },
+					},
+				],
+				stopReason: "toolUse",
+			}),
+		);
+		await writeSubagent(mainFile, cwd, "Current", cutOff);
+		const mainEntries = main.getEntries();
+		const mainLeafId = main.getLeafId();
+		await main.close();
+		setSystemTime();
+
+		manager = new AsyncJobManager({});
+		manager.registerDeliverySink(MAIN_AGENT_ID, () => {});
+		vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockResolvedValue(subagentResult("Current"));
+		const session = {
+			sessionManager: { getSessionFile: () => mainFile, getEntries: () => mainEntries, getLeafId: () => mainLeafId },
+			asyncJobManager: manager,
+			settings: Settings.isolated(),
+			restoreInterruptedTurn: vi.fn(async () => false),
+		} as unknown as AgentSession;
+
+		const outcome = await restoreSession(session);
+
+		expect(outcome).toEqual({ turn: false, subagents: ["Current"] });
+		await manager.getJob("Current")!.promise;
 	});
 });

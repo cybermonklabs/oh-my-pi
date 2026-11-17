@@ -175,6 +175,8 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 	const session = {
 		sessionManager: {
 			getSessionFile: () => mainFile,
+			getEntries: () => [],
+			getLeafId: () => null,
 			getCwd: () => cwd,
 			getArtifactManager: () => undefined,
 		},
