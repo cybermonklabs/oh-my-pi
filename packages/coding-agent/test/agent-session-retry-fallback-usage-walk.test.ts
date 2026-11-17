@@ -599,9 +599,14 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 		// Each order reaches the other Claude model by a different path: after the
 		// walk passes over the spent target, or before the walk reads the target.
+		// Once its only target is spent the credit holds nothing back, so the walk
+		// goes on in chain order as with no credit: another provider's model later
+		// in the chain does not take the turn ahead of the other Claude model.
 		for (const [order, chain] of [
 			["the target first", chainOf(CREDIT_TARGET, OTHER_CLAUDE)],
 			["the other model first", chainOf(OTHER_CLAUDE, CREDIT_TARGET)],
+			["the target first, another provider last", chainOf(CREDIT_TARGET, OTHER_CLAUDE, FALLBACK)],
+			["the other model first, another provider last", chainOf(OTHER_CLAUDE, CREDIT_TARGET, FALLBACK)],
 		] as const) {
 			it(`steps a refusal past its spent fallback-credit target to the next model (${order})`, async () => {
 				stubUsageReads({ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") });
