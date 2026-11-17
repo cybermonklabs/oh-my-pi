@@ -121,7 +121,7 @@ async fn timeout_reports_the_status_of_a_command_that_finishes() {
 	assert_eq!(run(&mut s, "timeout 5 true").await.status, 0);
 	assert_eq!(run(&mut s, "timeout 5 sh -c 'exit 7'").await.status, 7);
 	assert_eq!(run(&mut s, "timeout 0 true").await.status, 0);
-	// Not found and not executable, as the shell reports them.
+	// Not found: coreutils' status (and words; see `suites::extras`).
 	assert_eq!(run(&mut s, "timeout 5 nosuchcommand-pi").await.status, 127);
 	// Operands reach the command as they are: no re-splitting or expansion.
 	let r = run(&mut s, "timeout 5 printf '[%s]' 'a b' '$HOME' ''").await;

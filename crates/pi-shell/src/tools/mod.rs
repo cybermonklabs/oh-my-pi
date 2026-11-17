@@ -22,9 +22,9 @@
 //! [`ToolCalls::poll`] on each turn, parking no longer than
 //! [`ToolCalls::next_deadline`]. A tool's subshells are ordinary runs of the
 //! engine: functions, builtins and externals run as anywhere else, and the
-//! tool only watches their `Done`. Under a callout that stands for a program
-//! (`xargs timeout 5 f`: [`ToolCall::as_program`]) they run no function, as
-//! a program's children run none.
+//! tool only watches their `Done`. Under a callout (`xargs timeout 5 f`) they
+//! are subshells of the callout's, which has none of the caller's functions
+//! ([`Script::as_program`](crate::bash::Script::as_program)).
 //!
 //! The `kill` builtin is the engine's intrinsic (`%job` operands stay on the
 //! virtual signal bus); the host's policy for OS pids is
@@ -35,15 +35,15 @@ mod git;
 mod nohup;
 mod timeout;
 
-use std::{collections::VecDeque, sync::Arc, task::Waker, time::Duration};
+use std::{collections::VecDeque, io, sync::Arc, task::Waker, time::Duration};
 
 use bstr::{BStr, BString, ByteSlice};
 use parking_lot::Mutex;
 
 use crate::{
 	bash::{
-		CallId, CallOutcome, ControlHandle, Cx, IoPoll, Lineage, NativeRef, RunId, Script, Shell,
-		ShellApi, ToolCall, ToolRef,
+		CallId, CallOutcome, ControlHandle, Cx, ExecRefusal, IoPoll, Lineage, NativeRef, RunId,
+		Script, Shell, ShellApi, ToolCall, ToolRef,
 	},
 	extras::{ExtrasGate, ReportedError},
 	git::{GitLayers, flag_on},
@@ -293,7 +293,7 @@ impl Tool {
 		run: RunId,
 		status: i32,
 		signal: Option<i32>,
-		refusal: Option<i32>,
+		refusal: Option<ExecRefusal>,
 	) -> bool {
 		let child = match self {
 			Self::Timeout(t) => &mut t.child,
@@ -333,12 +333,15 @@ impl Tool {
 /// A tool's subshell: its run and label, and its status once it ended.
 #[derive(Default)]
 struct Child {
-	run:     Option<RunId>,
-	label:   u32,
-	status:  Option<i32>,
-	/// The error of the subshell's `exec` the system refused as too long,
-	/// for a tool that hands it up ([`ToolCall::too_long_to_caller`]).
-	refusal: Option<i32>,
+	run:        Option<RunId>,
+	label:      u32,
+	status:     Option<i32>,
+	/// The subshell's `exec` the system refused, for a tool that hears of
+	/// it ([`Child::start`] with `reports`).
+	refusal:    Option<ExecRefusal>,
+	/// The command was neither found nor executable, so nothing ran: GNU's
+	/// status (127 or 126) and `strerror` text.
+	unrunnable: Option<(i32, String)>,
 }
 
 impl Child {
@@ -346,12 +349,17 @@ impl Child {
 	/// anywhere) in a subshell of the caller under a fresh label;
 	/// `redirect` is appended to the command (`>&2`).
 	///
-	/// For a call with [`ToolCall::too_long_to_caller`] whose command is a
-	/// program (or a wrapper that hands such a refusal up itself), the
-	/// subshell `exec`s it as a callout does its programs, so a refusal of
-	/// it as too long ends the subshell with [`Child::refusal`] instead of
-	/// the shell's diagnostic: the tool then hands it up
-	/// ([`CallOutcome::TooLong`]).
+	/// With `reports` (`timeout`, `nohup`), a program the command names (no
+	/// function, no builtin) runs as a callout runs its programs: the
+	/// subshell `exec`s it, and a refusal of that `exec` ends the subshell
+	/// with [`Child::refusal`] instead of the shell's diagnostic, so the tool
+	/// reports a command it cannot run as GNU's does ([`Child::cannot_run`]),
+	/// or hands a line too long up to a caller that retries it
+	/// ([`ToolCall::too_long_to_caller`], [`CallOutcome::TooLong`]). A name
+	/// that finds nothing to run starts no subshell
+	/// ([`Child::unrunnable`]). A builtin that hands such a refusal up itself
+	/// (`env` under `timeout` under `xargs`) runs as `"$@"` and is heard of
+	/// the same way.
 	fn start(
 		&mut self,
 		api: &mut ShellApi<'_, '_>,
@@ -360,22 +368,41 @@ impl Child {
 		mut argv: Vec<BString>,
 		detached: bool,
 		redirect: &str,
+		reports: bool,
 	) {
 		self.label = turn.labels.fresh(api.lineage().label);
+		self.status = None;
+		self.refusal = None;
+		self.unrunnable = None;
 		let mut source = Vec::new();
-		let mut hands_up = false;
-		if call.too_long_to_caller && redirect.is_empty() && !argv.is_empty() {
+		let (mut too_long_to_host, mut refusals_to_host) = (false, false);
+		if reports && !argv.is_empty() && !api.has_function(argv[0].as_bstr()) {
 			let command = pi_builtins::extras::ShellCommand::new(
 				argv
 					.iter()
 					.map(|arg| arg.to_os_str_lossy().into_owned())
 					.collect(),
 			);
-			if let Ok(program) = extra::Lookup::for_call(call, turn.config).program(&command) {
-				hands_up = program.hands_up_too_long(&argv[0]);
-				if let extra::Program::Path { path, skip } = &program {
-					extra::exec_source(&mut source, &mut argv, path, *skip, None);
-				}
+			match extra::Lookup::for_call(call, turn.config).program(&command) {
+				Ok(extra::Program::Path { path, skip }) => {
+					extra::exec_source(&mut source, &mut argv, &path, skip, None);
+					source.extend_from_slice(redirect.as_bytes());
+					(too_long_to_host, refusals_to_host) = (true, true);
+				},
+				Ok(program) => {
+					too_long_to_host = call.too_long_to_caller && program.hands_up_too_long(&argv[0]);
+				},
+				Err(error) => {
+					let status = if error.kind() == io::ErrorKind::NotFound {
+						127
+					} else {
+						126
+					};
+					self.unrunnable = Some((status, crate::bash::diag::strerror(&error).into_owned()));
+					self.status = Some(status);
+					self.run = None;
+					return;
+				},
 			}
 		}
 		if source.is_empty() {
@@ -389,10 +416,8 @@ impl Child {
 			.iter()
 			.map(|(name, value)| (BString::from(name), BString::from(value)))
 			.collect();
-		script.too_long_to_host = hands_up;
-		script.as_program = call.as_program;
-		self.status = None;
-		self.refusal = None;
+		script.too_long_to_host = too_long_to_host;
+		script.refusals_to_host = refusals_to_host;
 		let lineage = Lineage { label: self.label, detached };
 		// `nohup` (the detached tool) execs its operand: its subshell stands
 		// for the command, so `$!` of `nohup cmd &` is the program's pid.
@@ -403,7 +428,7 @@ impl Child {
 		});
 	}
 
-	fn on_done(&mut self, run: RunId, status: i32, refusal: Option<i32>) -> bool {
+	fn on_done(&mut self, run: RunId, status: i32, refusal: Option<ExecRefusal>) -> bool {
 		if self.run != Some(run) || self.status.is_some() {
 			return false;
 		}
@@ -415,6 +440,33 @@ impl Child {
 	/// The run, while its `Done` is still to come.
 	fn pending(&self) -> Option<RunId> {
 		self.run.filter(|_| self.status.is_none())
+	}
+
+	/// The error of a line too long to hand up to a caller that retries it
+	/// ([`ToolCall::too_long_to_caller`]), once the subshell ended.
+	fn too_long(&self, call: &ToolCall) -> Option<i32> {
+		self
+			.refusal
+			.filter(|refusal| refusal.too_long && call.too_long_to_caller)
+			.map(|refusal| refusal.errno)
+	}
+
+	/// The command could not run (nothing found, nothing executable, or the
+	/// system refused its `exec` for any reason but a line too long handed
+	/// up): GNU's status (127 for `ENOENT`, else 126) and `strerror` text,
+	/// which `timeout` and `nohup` print as `failed to run command`.
+	fn cannot_run(&self, call: &ToolCall) -> Option<(i32, String)> {
+		if let Some(unrunnable) = &self.unrunnable {
+			return Some(unrunnable.clone());
+		}
+		let refusal = self.refusal.filter(|_| self.too_long(call).is_none())?;
+		let error = io::Error::from_raw_os_error(refusal.errno);
+		let status = if error.kind() == io::ErrorKind::NotFound {
+			127
+		} else {
+			126
+		};
+		Some((status, crate::bash::diag::strerror(&error).into_owned()))
 	}
 }
 
@@ -490,14 +542,14 @@ impl ToolCalls {
 	/// A run that is not the session's own ended; `true` when it belonged
 	/// to a tool (the driver ignores it then). `signal` is the actual
 	/// signal death of a command replacing the run, not an exit code;
-	/// `refusal` the error of an `exec` the system refused as too long
+	/// `refusal` an `exec` the system refused, that the run hands up
 	/// ([`Shell::exec_refusal`]).
 	pub fn on_done(
 		&mut self,
 		run: RunId,
 		status: i32,
 		signal: Option<i32>,
-		refusal: Option<i32>,
+		refusal: Option<ExecRefusal>,
 	) -> bool {
 		if self
 			.active

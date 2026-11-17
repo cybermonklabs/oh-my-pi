@@ -17,7 +17,7 @@ use crate::bash::{
 	event::{CustomEvent, EventData},
 	host::Lineage,
 	ids::{CallId, RunId},
-	store::{Attrs, OptId, StateStore, VarValue},
+	store::{Attrs, Key, OptId, Record, StateStore, VarValue},
 };
 
 /// Access to the calling virtual process during a host callout
@@ -84,6 +84,20 @@ impl ShellApi<'_, '_> {
 			Err(err) => {
 				k.fail(err);
 				None
+			},
+		}
+	}
+
+	/// Whether the calling vproc sees a shell function named `name` (its
+	/// own or one it inherits; not one a callout hides). A store failure
+	/// reads as none and abandons the running scripts at the next step.
+	pub fn has_function(&mut self, name: &BStr) -> bool {
+		let k = &mut self.shell.k;
+		match state::record(self.cx.store, &self.shell.procs[self.vp], Key::Func(name)) {
+			Ok(found) => matches!(found, Some(Record::Func { .. })),
+			Err(err) => {
+				k.fail(err);
+				false
 			},
 		}
 	}

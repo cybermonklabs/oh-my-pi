@@ -14,7 +14,10 @@
 //! `find -exec … +`, `timeout` hands a refusal of its command as too long up
 //! to them ([`Phase::TooLong`]), and they retry the line in halves, each with
 //! a `timeout` of its own, as GNU's retry a line whose `timeout` the system
-//! refused.
+//! refused. A program it cannot run is reported as coreutils' `timeout`
+//! reports it: `timeout: failed to run command ‘NAME’: strerror` (quoted as
+//! GNU's `quote` does in the locale), status 126, or 127 when nothing is
+//! found (a `#!` interpreter included).
 
 use std::time::Duration;
 
@@ -321,6 +324,31 @@ impl Timeout {
 		}
 	}
 
+	/// The phase once the command ended before its limit: a line too long
+	/// handed up to a caller that retries it, a command that could not run
+	/// (coreutils' `timeout: failed to run command ‘NAME’: strerror`, 126, or
+	/// 127 when nothing is found), or its status.
+	fn ended(&mut self, opts: &Options) -> Phase {
+		if let Some(errno) = self.child.too_long(&self.call) {
+			return Phase::TooLong(errno);
+		}
+		if let Some((status, text)) = self.child.cannot_run(&self.call) {
+			let env = &self.call.env;
+			let name = pi_builtins::extras::gnu_quote(
+				|var| {
+					env.get(var.as_bytes())
+						.and_then(|value| value.to_str().ok())
+				},
+				&opts.command[0].to_str_lossy(),
+			);
+			self
+				.out
+				.push(2, format!("timeout: failed to run command {name}: {text}\n"));
+			return Phase::Exit(status);
+		}
+		Phase::Exit(self.child.status.unwrap_or_default())
+	}
+
 	pub(super) fn advance(
 		&mut self,
 		api: &mut ShellApi<'_, '_>,
@@ -331,14 +359,18 @@ impl Timeout {
 			Phase::Start(opts) => {
 				self
 					.child
-					.start(api, turn, &self.call, opts.command.clone(), false, "");
-				let deadline = opts.limit.map(|d| now.saturating_add(nanos(d)));
-				Phase::Running { opts, deadline }
+					.start(api, turn, &self.call, opts.command.clone(), false, "", true);
+				if self.child.status.is_some() {
+					// Nothing was found to run.
+					self.ended(&opts)
+				} else {
+					let deadline = opts.limit.map(|d| now.saturating_add(nanos(d)));
+					Phase::Running { opts, deadline }
+				}
 			},
-			Phase::Running { opts, deadline } => match (self.child.status, self.child.refusal) {
-				(Some(_), Some(code)) => Phase::TooLong(code),
-				(Some(status), None) => Phase::Exit(status),
-				(None, _) if deadline.is_some_and(|at| now >= at) => {
+			Phase::Running { opts, deadline } => match self.child.status {
+				Some(_) => self.ended(&opts),
+				None if deadline.is_some_and(|at| now >= at) => {
 					self.send(turn, &opts, opts.signal);
 					let killed = opts.signal == Signal::Kill;
 					Phase::Signalled {
@@ -350,7 +382,7 @@ impl Timeout {
 						opts,
 					}
 				},
-				(None, _) => Phase::Running { opts, deadline },
+				None => Phase::Running { opts, deadline },
 			},
 			Phase::Signalled { opts, mut kill_at, mut give_up, .. } => {
 				if kill_at.is_some_and(|at| now >= at) {

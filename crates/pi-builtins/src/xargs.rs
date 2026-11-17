@@ -14,7 +14,8 @@ use std::{
 use clap::{Arg, ArgAction, ArgMatches};
 
 use crate::host::{
-	CommandStatus, Host, RunningCommand, ShellCommand, Utility, command_line_too_long, matches_parser,
+	CommandStatus, Host, RunningCommand, ShellCommand, Utility, command_line_too_long, line_bytes,
+	matches_parser, run_strerror,
 };
 
 mod options {
@@ -303,11 +304,17 @@ enum CommandExecutionError {
 	// exit code 255
 	UrgentlyFailed,
 	Killed { name: OsString, signal: i32 },
-	CannotRun(io::Error),
-	/// Nothing runs under this command name (GNU: status 127).
+	/// The system refused to start the command named `name` for another
+	/// reason than a line too long (`EACCES`, a `#!` interpreter's path):
+	/// GNU's `NAME: strerror`, status 126, and xargs stops.
+	CannotRun { name: OsString, error: io::Error },
+	/// Nothing runs under this command name (GNU: status 127), or its `#!`
+	/// interpreter does not exist (`ENOENT`, as GNU reports it).
 	NotFound(OsString),
 	/// The system refuses a command line as too long even with one input
-	/// argument, or a whole `-I` line (GNU: status 1).
+	/// argument (GNU: status 1), or a whole `-I` line (also status 1 here;
+	/// GNU findutils 4.9.0 exits 127 for it, with `ARG: No such file or
+	/// directory`).
 	ArgumentSize,
 }
 
@@ -318,7 +325,7 @@ impl Display for CommandExecutionError {
 			Self::Killed { name, signal } => {
 				write!(f, "{}: terminated by signal {signal}", name.to_string_lossy())
 			},
-			Self::CannotRun(err) => write!(f, "Command could not be run: {err}"),
+			Self::CannotRun { name, error } => write!(f, "{}: {}", name.to_string_lossy(), run_strerror(error)),
 			Self::NotFound(name) => write!(f, "{}: No such file or directory", name.to_string_lossy()),
 			Self::ArgumentSize => write!(f, "can't call exec() due to argument size restrictions"),
 		}
@@ -348,7 +355,7 @@ fn cannot_run(error: io::Error, name: &OsStr) -> CommandExecutionError {
 	if error.kind() == io::ErrorKind::NotFound {
 		CommandExecutionError::NotFound(name.to_owned())
 	} else {
-		CommandExecutionError::CannotRun(error)
+		CommandExecutionError::CannotRun { name: name.to_owned(), error }
 	}
 }
 
@@ -472,8 +479,9 @@ impl Jobs {
 				self.command.clone_from(name);
 			}
 			// The line is kept until the command ends: the refusal comes back
-			// from the shell then, and the halves are cut from it.
-			let command = ShellCommand::new(batch.argv.clone()).too_long_as_error();
+			// from the shell then, and the halves are cut from it (or, for any
+			// other refusal, xargs stops with GNU's message).
+			let command = ShellCommand::new(batch.argv.clone()).refusal_as_error();
 			let command = host
 				.spawn_command(command)
 				.map_err(|error| cannot_run(error, &self.command))?;
@@ -498,7 +506,7 @@ impl Jobs {
 	/// Folds how `batch` ended into the result. A line the system refused as
 	/// too long is queued again as two halves, the first to start first, as
 	/// GNU xargs retries it; one input argument too long on its own (or a
-	/// whole `-I` line) is GNU's error, status 1.
+	/// whole `-I` line) is the error GNU's gives one argument, status 1.
 	fn settle(
 		&mut self,
 		host: &Host,
@@ -507,7 +515,7 @@ impl Jobs {
 	) -> Result<(), CommandExecutionError> {
 		let too_long = status.as_ref().is_err_and(|error| {
 			let program = batch.argv.first().map_or(Path::new(""), Path::new);
-			command_line_too_long(error, program, host.cwd())
+			command_line_too_long(error, program, line_bytes(&batch.argv), host.cwd())
 		});
 		if !too_long {
 			self.result.combine(command_outcome(status, &self.command)?);
@@ -1268,7 +1276,7 @@ impl Utility for Xargs {
 					match command_error {
 						CommandExecutionError::UrgentlyFailed => 124,
 						CommandExecutionError::Killed { .. } => 125,
-						CommandExecutionError::CannotRun(_) => 126,
+						CommandExecutionError::CannotRun { .. } => 126,
 						CommandExecutionError::NotFound(_) => 127,
 						CommandExecutionError::ArgumentSize => 1,
 					}
@@ -1416,6 +1424,7 @@ mod tests {
 
 	/// The command the size tests run: it prints how many input arguments
 	/// its line had.
+	#[cfg(target_os = "linux")]
 	const COUNT_ARGS: &str = "printf \"%s\\n\" \"$#\"";
 
 	/// The input arguments of the line `-t` traced in `trace`, all of them
@@ -1637,27 +1646,38 @@ mod tests {
 		assert!(seen.ran.is_empty(), "{:?}", seen.ran);
 	}
 
-	/// `E2BIG`, and `ENAMETOOLONG` as GKE Sandbox (gVisor) says it, split a
-	/// line in halves, first half first, until each half runs.
+	/// `E2BIG`, and `ENAMETOOLONG` as GKE Sandbox (gVisor) says it for a
+	/// line longer than `_POSIX_ARG_MAX` (4,096 bytes), split a line in
+	/// halves, first half first, until each half runs. A shorter line's
+	/// `ENAMETOOLONG` is a path's (a `#!` interpreter's): it is the error at
+	/// once, and the line is not split.
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn a_refused_line_is_halved_in_order_for_e2big_and_enametoolong() {
-		let words: Vec<String> = (1..=10).map(|n| n.to_string()).collect();
-		for errno in [libc::E2BIG, libc::ENAMETOOLONG] {
-			let (code, stderr, tried, ran) = refused_above(3, errno).await;
-			assert_eq!((code, stderr.as_str()), (0, ""), "errno {errno}");
-			assert_eq!(tried, [10, 5, 2, 3, 5, 2, 3], "errno {errno}");
-			assert_eq!(ran, words, "errno {errno}");
+		let short: Vec<String> = (1..=10).map(|n| n.to_string()).collect();
+		let long: Vec<String> = (1..=10).map(|n| format!("{n:0>1000}")).collect();
+		let cases = [(libc::E2BIG, &short), (libc::E2BIG, &long), (libc::ENAMETOOLONG, &long)];
+		for (errno, words) in cases {
+			let input = words.join(" ") + "\n";
+			let (code, stderr, tried, ran) = refused_with(&[], &input, 3, errno, 0).await;
+			assert_eq!((code, stderr.as_str()), (0, ""), "errno {errno}, {} bytes", words[0].len());
+			assert_eq!(tried, [10, 5, 2, 3, 5, 2, 3], "errno {errno}, {} bytes", words[0].len());
+			assert_eq!(&ran, words, "errno {errno}, {} bytes", words[0].len());
 		}
+		let (code, stderr, tried, ran) = refused_above(3, libc::ENAMETOOLONG).await;
+		assert_eq!((code, tried.as_slice()), (126, &[10][..]), "a short line's ENAMETOOLONG: {stderr}");
+		assert!(ran.is_empty(), "{ran:?}");
 	}
 
-	/// Any other refusal is the error at once: the line is not split.
+	/// Any other refusal is the error at once, as GNU's: `xargs: NAME:
+	/// strerror`, status 126, and nothing more runs; the line is not split.
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn other_refusals_are_not_split() {
 		for errno in [libc::EACCES, libc::ENOEXEC, libc::ENOMEM, libc::ETXTBSY] {
 			let (code, stderr, tried, ran) = refused_above(0, errno).await;
-			assert_eq!(code, 126, "errno {errno}: {stderr}");
+			let said = format!("xargs: true: {}\n", crate::host::strip_errno(&io::Error::from_raw_os_error(errno)));
+			assert_eq!((code, stderr), (126, said), "errno {errno}");
 			assert_eq!(tried, [10], "errno {errno}");
 			assert!(ran.is_empty(), "errno {errno}: {ran:?}");
 		}
@@ -1986,7 +2006,7 @@ mod tests {
 		let command = file.path().to_str().expect("utf8 temporary path");
 		let (code, _, err) = run_simple(&[command], "x\n").await;
 		assert_eq!(code, 126);
-		assert!(err.contains("could not be run"), "got: {err:?}");
+		assert_eq!(err, format!("xargs: {command}: Permission denied\n"));
 	}
 
 	#[tokio::test]

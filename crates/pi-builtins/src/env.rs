@@ -12,8 +12,10 @@
 //! ([`Host::too_long_to_caller`]), `env` hands a refusal of its command as
 //! too long up to them, printing nothing for it, so they retry the line in
 //! halves as GNU's retry a line whose `env` the system refused; its
-//! `--debug` trace, written before the command starts, comes again with
-//! each attempt.
+//! `--debug` trace and `--list-signal-handling` list, written before the
+//! command starts, come again with each attempt. With `--env0-from` it keeps
+//! the refusal: a retry would read the file again, which a pipe or FIFO
+//! cannot give twice.
 //!
 //! Signal options cannot change the host process's dispositions or mask,
 //! which every other command shares. A command starts with an empty signal
@@ -41,9 +43,10 @@ use uucore::{
 
 use crate::{
 	host::{
-		Host, ShellCommand, Utility, command_line_too_long, format_usage, os_bytes_lossy, strip_errno,
+		Host, ShellCommand, Utility, command_line_too_long, format_usage, line_bytes, os_bytes_lossy,
+		strip_errno,
 	},
-	locale,
+	locale::{self, gnu_quote},
 	quoting_style::quoting_style_by_name,
 };
 
@@ -552,16 +555,23 @@ impl Run<'_> {
 		// A caller that retries a refused line (`xargs env …`) hears of a
 		// refusal as too long: GNU's runs `env` as a program, whose own exec
 		// the system refuses, and env has done nothing visible but its
-		// `--debug` trace (written again for each attempt).
-		let hand_up = self.host.too_long_to_caller();
-		if hand_up {
-			command = command.too_long_as_error();
-		}
+		// `--debug` trace and `--list-signal-handling` list (written again
+		// for each attempt). Not once it read `--env0-from`: a retry would
+		// read the file again, and a pipe or FIFO has nothing left to give.
+		let hand_up = self.host.too_long_to_caller() && env0_from.is_none();
+		// Any refusal is env's to report, as coreutils' `env` reports a
+		// command it cannot run (126; 127 when nothing is found, a `#!`
+		// interpreter included), instead of the shell's diagnostic.
+		command = command.refusal_as_error();
+		// The line as the program gets it: `-a NAME` is its `argv[0]`.
+		let args = command.args();
+		let argv0 = command.presented_argv0().unwrap_or(args[0].as_os_str());
+		let line = line_bytes(std::iter::once(argv0).chain(args[1..].iter().map(OsString::as_os_str)));
 		match self.host.run_command(command) {
 			Ok(status) => Ok(status.code()),
 			Err(error)
 				if hand_up
-					&& command_line_too_long(&error, std::path::Path::new(&os_string(&program)), &dir)
+					&& command_line_too_long(&error, std::path::Path::new(&os_string(&program)), line, &dir)
 					&& self.host.hand_up_too_long(&error) =>
 			{
 				Err(EXIT_CANNOT_INVOKE)
@@ -575,7 +585,8 @@ impl Run<'_> {
 					},
 					_ => (EXIT_CANNOT_INVOKE, strip_errno(&error)),
 				};
-				self.error(&format!("{}: {text}", quote(&program)));
+				let name = gnu_quote(|key| self.host.var(key), &String::from_utf8_lossy(&program));
+				self.error(&format!("{name}: {text}"));
 				if code == EXIT_ENOENT && program.iter().any(|byte| C_ISSPACE_CHARS.contains(byte)) {
 					self.error("use -[v]S to pass options in shebang lines");
 				}
@@ -1485,8 +1496,10 @@ mod tests {
 	/// As the command of a caller that retries a refused line
 	/// (`Invocation::too_long_to_caller`), `env` hands a refusal of its
 	/// command as too long up to it: the error in the slot, nothing printed,
-	/// status 126. Without the caller's ask the refusal is env's own
-	/// diagnostic, and any other refusal is env's either way.
+	/// status 126. Its own diagnostic it keeps: without the caller's ask, for
+	/// any other refusal, for an `ENAMETOOLONG` of a line no system refuses
+	/// for its length (a path's), and after reading `--env0-from`, which a
+	/// retry would read again (a FIFO gives its data once).
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn a_refusal_as_too_long_goes_to_a_caller_that_retries() {
@@ -1500,14 +1513,23 @@ mod tests {
 
 		use crate::extras::{Fd, Invocation};
 
-		for (asked, errno, said) in [
-			(true, libc::E2BIG, ""),
-			(true, libc::ENAMETOOLONG, ""),
-			(false, libc::E2BIG, "env: 'prog': Argument list too long\n"),
-			(true, libc::EACCES, "env: 'prog': Permission denied\n"),
+		let dir = tempfile::tempdir().unwrap();
+		let env0 = dir.path().join("env0");
+		std::fs::write(&env0, b"A=1\0").unwrap();
+		let env0_from = format!("--env0-from={}", env0.display());
+		let long = "a".repeat(4100);
+		let e2big = "env: 'prog': Argument list too long\n";
+		for (asked, errno, option, arg, said) in [
+			(true, libc::E2BIG, "-i", "a", ""),
+			(true, libc::ENAMETOOLONG, "-i", long.as_str(), ""),
+			(true, libc::ENAMETOOLONG, "-i", "a", "env: 'prog': File name too long\n"),
+			(false, libc::E2BIG, "-i", "a", e2big),
+			(true, libc::EACCES, "-i", "a", "env: 'prog': Permission denied\n"),
+			(true, libc::E2BIG, env0_from.as_str(), "a", e2big),
 		] {
+			let case = format!("errno {errno}, asked {asked}, {option}, {} bytes", arg.len());
 			let mut error = tempfile::tempfile().unwrap();
-			let argv = ["env", "-i", "prog", "a"].map(String::from).to_vec();
+			let argv = ["env", option, "prog", arg].map(String::from).to_vec();
 			let mut invocation = Invocation::new(argv, std::env::temp_dir(), pi_vfs::Fs::native());
 			invocation.stdio = [Fd::Closed, Fd::Closed, Fd::File(error.try_clone().unwrap())];
 			let (runner, seen) = crate::host::Refusing::new(1, 0, errno);
@@ -1519,10 +1541,10 @@ mod tests {
 			error.rewind().unwrap();
 			error.read_to_string(&mut text).unwrap();
 			let handed = slot.map(|slot| slot.load(Ordering::Relaxed));
-			let handed_up = asked && errno != libc::EACCES;
-			assert_eq!((code, text.as_str()), (126, said), "errno {errno}, asked {asked}");
-			assert_eq!(handed, asked.then_some(if handed_up { errno } else { 0 }), "errno {errno}");
-			assert_eq!(seen.lock().tried, [1], "errno {errno}: env ran its command once");
+			let handed_up = asked && said.is_empty();
+			assert_eq!((code, text.as_str()), (126, said), "{case}");
+			assert_eq!(handed, asked.then_some(if handed_up { errno } else { 0 }), "{case}");
+			assert_eq!(seen.lock().tried, [1], "{case}: env ran its command once");
 		}
 	}
 

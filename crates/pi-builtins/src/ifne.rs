@@ -20,7 +20,7 @@ use std::{
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, builder::ValueParser};
 
 use crate::{
-	host::{Host, ShellCommand, Utility, command_line_too_long, matches_parser},
+	host::{Host, ShellCommand, Utility, command_line_too_long, line_bytes, matches_parser},
 	openfile::Fd,
 };
 
@@ -149,6 +149,7 @@ fn run_with_input(host: &mut Host, command: Vec<OsString>, first: Option<u8>) ->
 	if hand_up {
 		shell_command = shell_command.too_long_as_error();
 	}
+	let line = line_bytes(shell_command.args());
 	let status = host.run_command(shell_command);
 	let pumped = pump.join().unwrap_or(Ok(()));
 
@@ -156,7 +157,7 @@ fn run_with_input(host: &mut Host, command: Vec<OsString>, first: Option<u8>) ->
 		Ok(status) => status,
 		Err(err)
 			if hand_up
-				&& command_line_too_long(&err, std::path::Path::new(&name), host.cwd())
+				&& command_line_too_long(&err, std::path::Path::new(&name), line, host.cwd())
 				&& host.hand_up_too_long(&err) =>
 		{
 			return 126;

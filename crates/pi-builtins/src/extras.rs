@@ -16,6 +16,7 @@ use futures::future::BoxFuture;
 use super::*;
 pub use crate::{
 	host::{CommandRunner, CommandStatus, EnvChange, Invocation, ShellCommand},
+	locale::gnu_quote,
 	openfile::Fd,
 };
 #[allow(unused_imports, reason = "used by whichever table entries the enabled features compile")]

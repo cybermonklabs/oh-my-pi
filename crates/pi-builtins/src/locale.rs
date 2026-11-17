@@ -45,7 +45,16 @@ pub(crate) fn codeset_is_utf8(name: &str) -> bool {
 /// Whether the shell's `LC_CTYPE` is a UTF-8 locale the system can load: the
 /// multibyte character rules GNU utilities switch on after `setlocale`.
 pub(crate) fn ctype_is_utf8(host: &Host) -> bool {
-	let Some(name) = shell_locale(host, "LC_CTYPE") else {
+	ctype_is_utf8_in(|key| host.var(key))
+}
+
+/// [`ctype_is_utf8`] for the environment `var` reads (`LC_ALL`, `LC_CTYPE`,
+/// `LANG`).
+fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
+	let Some(name) = ["LC_ALL", "LC_CTYPE", "LANG"]
+		.into_iter()
+		.find_map(|key| var(key).filter(|value| !value.is_empty()))
+	else {
 		return false;
 	};
 	#[cfg(unix)]
@@ -53,6 +62,18 @@ pub(crate) fn ctype_is_utf8(host: &Host) -> bool {
 		return false;
 	}
 	codeset_is_utf8(name)
+}
+
+/// `name` quoted for a diagnostic as GNU's `quote` quotes it in the locale
+/// `var` reads (`LC_ALL`, `LC_CTYPE`, `LANG`): `‘name’` in a UTF-8 locale the
+/// system can load, `'name'` otherwise (the C locale), as coreutils' `env`
+/// and `timeout` print the command they could not run.
+pub fn gnu_quote<'v>(var: impl Fn(&str) -> Option<&'v str>, name: &str) -> String {
+	if ctype_is_utf8_in(var) {
+		format!("‘{name}’")
+	} else {
+		format!("'{name}'")
+	}
 }
 
 /// Parses a locale name the way uucore parses the process one:

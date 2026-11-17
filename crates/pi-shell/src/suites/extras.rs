@@ -489,14 +489,14 @@ fn lines_tried(stderr: &str, program: &str) -> usize {
 		.count()
 }
 
-/// No shell function runs in the commands xargs runs, as no function runs
-/// in a real xargs' children: not one named `exec`, `builtin` or `command`
-/// in place of the words a callout generates (`builtin exec` for a program,
-/// `command` for a builtin), which a retry of a refused line would run
-/// again each time.
+/// No function of the caller's runs in the commands xargs runs, as no
+/// function of a shell runs in a real xargs' children: not one named `exec`,
+/// `builtin` or `command` in place of the words a callout generates
+/// (`builtin exec` for a program, `command` for a builtin), which a retry of
+/// a refused line would run again each time.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_shell_function_runs_in_the_commands_xargs_runs() {
+async fn no_function_of_the_callers_runs_for_the_words_xargs_generates() {
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	std::fs::write(dir.path().join("two"), "1\n2\n").unwrap();
@@ -524,6 +524,482 @@ async fn no_shell_function_runs_in_the_commands_xargs_runs() {
 			"{function}: {}",
 			ran.stderr
 		);
+	}
+}
+
+/// The commands xargs runs start with none of the caller's functions, as
+/// a program's children do: `xargs eval f` finds no `f` directly, in a
+/// pipeline, in `( … )` or in `$( … )`, and the caller's
+/// `command_not_found_handle` does not run. The caller keeps them, and an
+/// exported one still reaches programs in the environment, unless `env -i`
+/// clears it (a read-only one too).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_commands_xargs_runs_have_none_of_the_callers_functions() {
+	let dir = tempfile::tempdir().unwrap();
+	let mut s = session_in(dir.path(), &[]);
+	let f = "f() { echo F; }";
+	for command in ["eval f", "eval 'f | cat; :'", "eval '(f); :'", "eval 'echo $(f); :'"] {
+		let ran = run(&mut s, &format!("{f}; echo x | xargs {command}")).await;
+		assert!(!ran.stdout.contains('F'), "{command}: the caller's f ran: {}", ran.stdout);
+		assert!(ran.stderr.contains("f: command not found"), "{command}: {}", ran.stderr);
+	}
+	let hook = "command_not_found_handle() { echo HOOK >&2; return 127; }";
+	let ran = run(&mut s, &format!("{hook}; echo x | xargs eval nosuchcmd")).await;
+	assert!(!ran.stderr.contains("HOOK"), "the caller's hook ran: {}", ran.stderr);
+	assert_eq!(ran.status, 123, "{}", ran.stderr);
+	let ran = run(&mut s, &format!("{f}; echo x | xargs eval f; f")).await;
+	assert_eq!(ran.stdout, "F\n", "the caller lost its f: {}", ran.stderr);
+
+	// No input: xargs runs `/usr/bin/env` once, with no argument.
+	let ran = run(&mut s, &format!("{f}; export -f f; xargs /usr/bin/env < /dev/null")).await;
+	assert!(ran.stdout.contains("BASH_FUNC_f%%=() "), "the exported f did not reach the program");
+	let readonly = format!("{f}; export -f f; readonly -f f; xargs env -i /usr/bin/env < /dev/null");
+	let ran = run(&mut s, &readonly).await;
+	assert_eq!((ran.status, ran.stderr.as_str()), (0, ""), "{}", ran.stdout);
+	assert!(!ran.stdout.contains("BASH_FUNC_f"), "env -i left the exported f: {}", ran.stdout);
+}
+
+/// A function the command xargs or `find -exec` runs defines itself is its
+/// own, and runs: in `eval`, in a pipeline of it, and in a sourced file.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_function_the_command_defines_runs_in_xargs_and_find() {
+	let dir = tempfile::tempdir().unwrap();
+	std::fs::write(dir.path().join("lib.sh"), "h() { echo H; }\nh\n").unwrap();
+	std::fs::create_dir_all(dir.path().join("r/a")).unwrap();
+	std::fs::write(dir.path().join("r/0"), "").unwrap();
+	std::fs::write(dir.path().join("r/a/0"), "").unwrap();
+	let mut s = session_in(dir.path(), &[]);
+	let g = "g() { echo G; }";
+	for (command, said) in [
+		(format!("echo x | xargs eval '{g}; g; :'"), "G\n"),
+		(format!("echo x | xargs eval '{g}; g | cat; :'"), "G\n"),
+		("echo x | xargs source lib.sh".to_owned(), "H\n"),
+		(format!("find r -name 0 -exec eval '{g}; g' \\;"), "G\nG\n"),
+	] {
+		let ran = run(&mut s, &command).await;
+		assert_eq!((ran.status, ran.stdout.as_str()), (0, said), "{command}: {}", ran.stderr);
+	}
+}
+
+/// The words a callout generates (`builtin exec`, `command`, and `env`'s
+/// `export` and `unset`) take none of the caller's aliases, as a program's
+/// children have none: an alias would run once per attempt of a refused
+/// line. Nor does the caller's `enable -n` stop them.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_words_a_callout_generates_take_no_alias_or_disabled_builtin() {
+	let dir = tempfile::tempdir().unwrap();
+	let words = words_past_a_full_line(dir.path());
+	std::fs::write(dir.path().join("two"), "1\n2\n").unwrap();
+	let (_long, sh) = sh_at_a_long_path();
+	for (alias, wrapper) in [
+		("builtin", ""),
+		("command", "env "),
+		("export", "env PI_TEST_VAR=1 "),
+		("unset", "env -u HOME "),
+	] {
+		let aliased = format!("shopt -s expand_aliases; alias {alias}='echo SIDE >&2; {alias}'");
+		let command = format!("{aliased}; xargs -t -a words {wrapper}{sh} {SHOW_ARGS}");
+		let ran = run(&mut session_in(dir.path(), &[]), &command).await;
+		let tried = ran
+			.stderr
+			.lines()
+			.filter(|line| line.starts_with(&format!("{wrapper}{sh}")))
+			.count();
+		assert!(tried > 2, "alias {alias}: no line was refused and split: {tried} tried");
+		let side = ran.stderr.matches("SIDE").count();
+		assert_eq!((ran.status, side), (0, 0), "alias {alias} ran: {}", ran.stderr);
+		assert!(
+			lines_run(&ran.stdout).concat() == words,
+			"alias {alias}: the arguments did not each run once"
+		);
+	}
+	for (builtin, command, said) in [
+		("builtin", "xargs -a two /usr/bin/printf '%s\\n'", "1\n2\n"),
+		("exec", "xargs -a two /usr/bin/printf '%s\\n'", "1\n2\n"),
+		("command", "xargs -a two echo", "1 2\n"),
+	] {
+		let ran =
+			run(&mut session_in(dir.path(), &[]), &format!("enable -n {builtin}; {command}")).await;
+		assert_eq!(
+			(ran.status, ran.stdout.as_str()),
+			(0, said),
+			"enable -n {builtin}: {}",
+			ran.stderr
+		);
+	}
+}
+
+/// The caller's `set -x` traces `xargs` once, and none of the commands it
+/// runs or retries, as GNU's xargs' children do not trace: with a refused
+/// line, directly and through `env`. The caller still traces what follows.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_callers_xtrace_does_not_trace_the_commands_xargs_runs() {
+	let dir = tempfile::tempdir().unwrap();
+	let words = words_past_a_full_line(dir.path());
+	let (_long, sh) = sh_at_a_long_path();
+	for wrapper in ["", "env "] {
+		let command = format!("set -x; xargs -t -a words {wrapper}{sh} {SHOW_ARGS}; : after");
+		let ran = run(&mut session_in(dir.path(), &[]), &command).await;
+		let tried = ran
+			.stderr
+			.lines()
+			.filter(|line| line.starts_with(&format!("{wrapper}{sh}")))
+			.count();
+		assert!(tried > 2, "{wrapper}: no line was refused and split: {tried} tried");
+		let traced: Vec<&str> = ran
+			.stderr
+			.lines()
+			.filter(|line| line.starts_with('+'))
+			.collect();
+		assert_eq!(traced.len(), 2, "{wrapper}: {traced:?}");
+		assert!(
+			traced[0].starts_with("+ xargs ") && traced[1] == "+ : after",
+			"{wrapper}: {traced:?}"
+		);
+		assert!(
+			lines_run(&ran.stdout).concat() == words,
+			"{wrapper}: the arguments did not each run once"
+		);
+	}
+}
+
+/// `env --env0-from=FILE` reads FILE before it runs its command, so it does
+/// not hand a refusal of that command as too long up to xargs: a retry
+/// would read FILE again, and a FIFO gives its data once (the retry would
+/// wait for a writer forever). env keeps the refusal: the shell's
+/// diagnostic, and xargs tries each of its two lines once (the full one,
+/// refused, then the rest), with FILE (a provider file that counts how
+/// often it is opened) read once for each, and exits 123.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn env_does_not_hand_up_a_refusal_after_reading_env0_from() {
+	let dir = tempfile::tempdir().unwrap();
+	words_past_a_full_line(dir.path());
+	let (_long, sh) = sh_at_a_long_path();
+	let env0 = Arc::new(Env0::default());
+	let vfs = VfsFs::new(pi_vfs::Fs::new(env0.clone()), tokio::runtime::Handle::current());
+	let mut s = Session::new(SessionConfig {
+		env:             env_with(&[]),
+		cwd:             BString::from(dir.path().as_os_str().as_bytes()),
+		fs:              Box::new(vfs.clone()),
+		vfs:             Some(vfs),
+		runtime:         tokio::runtime::Handle::current(),
+		output_decoding: None,
+	})
+	.unwrap();
+	// Without `-i`: the program's environment, larger than xargs counted
+	// by `A=1`, keeps the full line refused.
+	let command = format!("xargs -t -a words env --env0-from=mem://env0 {sh} {SHOW_ARGS}");
+	let ran = run(&mut s, &command).await;
+	let tried = ran
+		.stderr
+		.lines()
+		.filter(|line| line.starts_with("env --env0-from"))
+		.count();
+	assert_eq!((ran.status, tried), (123, 2), "the refused line was retried: {}", ran.stderr);
+	assert_eq!(too_long_reports(&ran.stderr), 1, "{}", ran.stderr);
+	let opens = env0.opens.load(std::sync::atomic::Ordering::SeqCst);
+	assert_eq!(opens, tried, "env read --env0-from again: {}", ran.stderr);
+}
+
+/// A directory of commands that cannot run, for xargs and find: `words`
+/// (`1` to `3`), `findroot` with a file in it and one in `findroot/a`, and
+/// - `noexec`, a script without the execute bit (`EACCES`);
+/// - `s`, a script whose `#!` interpreter is a symlink to a name past
+///   `NAME_MAX` (`ENAMETOOLONG` of a path, on a line no system refuses);
+/// - `mi`, a script whose `#!` interpreter does not exist (`ENOENT`);
+/// - `bin`, an executable that is no program (`ENOEXEC`), which runs as a
+///   script, as GNU's `execvp` runs it with `/bin/sh`.
+#[cfg(target_os = "linux")]
+fn cannot_run_dir() -> tempfile::TempDir {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let dir = tempfile::tempdir().unwrap();
+	let at = |name: &str| dir.path().join(name);
+	let write = |name: &str, text: &[u8], mode: u32| {
+		std::fs::write(at(name), text).unwrap();
+		std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(mode)).unwrap();
+	};
+	std::fs::write(at("words"), "1\n2\n3\n").unwrap();
+	std::fs::create_dir_all(at("findroot/a")).unwrap();
+	std::fs::write(at("findroot/f1"), "").unwrap();
+	std::fs::write(at("findroot/a/f2"), "").unwrap();
+	write("noexec", b"echo ran\n", 0o644);
+	std::os::unix::fs::symlink(at(&"0".repeat(256)), at("ll")).unwrap();
+	write("s", format!("#!{}\n", at("ll").display()).as_bytes(), 0o755);
+	write("mi", b"#!/nonexistent/interpreter\n", 0o755);
+	write("bin", b"\x7fELF\x02\x01\x01garbage\0\0\0", 0o755);
+	dir
+}
+
+/// Runs `xargs -t -n1 PROGRAM < words` in `dir` ([`cannot_run_dir`]) and
+/// asserts GNU's contract for a command xargs cannot run (findutils 4.9.0
+/// measured): it tries the first line only, stops, and exits `status`, with
+/// `xargs: PROGRAM: said` and nothing else.
+#[cfg(target_os = "linux")]
+async fn assert_xargs_cannot_run(dir: &Path, program: &str, status: i32, said: &str) {
+	let ran = run(&mut session_in(dir, &[]), &format!("xargs -t -n1 {program} < words")).await;
+	let (tried, reported): (Vec<&str>, Vec<&str>) = ran
+		.stderr
+		.lines()
+		.partition(|line| line.starts_with(&format!("{program} ")));
+	assert_eq!((ran.status, ran.stdout.as_str()), (status, ""), "{program}: {}", ran.stderr);
+	assert_eq!(tried, [format!("{program} 1")], "{program}: xargs did not stop at the first line");
+	assert_eq!(reported, [format!("xargs: {program}: {said}")], "{program}");
+}
+
+/// Runs `COMMAND; echo rc=$?` in `dir` ([`cannot_run_dir`]) for find, and
+/// asserts GNU's contract (findutils 4.9.0 measured): `find: ‘PROGRAM’:
+/// said` once per command line it could not run (find goes on to the
+/// next), and `rc`.
+#[cfg(target_os = "linux")]
+async fn assert_find_cannot_run(
+	dir: &Path,
+	command: &str,
+	program: &str,
+	said: &str,
+	times: usize,
+	rc: i32,
+) {
+	let ran = run(&mut session_in(dir, &[]), &format!("{command}; echo rc=$?")).await;
+	assert_eq!(ran.stdout, format!("rc={rc}\n"), "{command}: {}", ran.stderr);
+	let message = format!("find: ‘{program}’: {said}");
+	assert_eq!(ran.stderr.lines().collect::<Vec<_>>(), vec![message.as_str(); times], "{command}");
+}
+
+/// A command xargs cannot find: GNU's 127 and `No such file or directory`,
+/// and xargs stops. So for a name on `PATH`, a path, and a script whose
+/// `#!` interpreter does not exist (`ENOENT`, as GNU reports it).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn xargs_stops_with_127_for_a_command_it_cannot_find() {
+	let dir = cannot_run_dir();
+	for program in ["no-such-command-here", "./nosuch", "./mi"] {
+		assert_xargs_cannot_run(dir.path(), program, 127, "No such file or directory").await;
+	}
+}
+
+/// A command xargs may not run (`EACCES`): GNU's 126 and `Permission
+/// denied`, and xargs stops.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn xargs_stops_with_126_for_a_command_it_may_not_run() {
+	let dir = cannot_run_dir();
+	assert_xargs_cannot_run(dir.path(), "./noexec", 126, "Permission denied").await;
+}
+
+/// An `ENAMETOOLONG` that is no line's, from a `#!` interpreter whose path
+/// holds a name past `NAME_MAX`, is no line too long: the line is not
+/// split, and the command cannot run, as GNU's xargs reports it (126, `File
+/// name too long`, stop). Under `timeout`, which ran, it is timeout's
+/// failure in coreutils' words (status 126, xargs 123), as with GNU's.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn xargs_stops_with_126_for_a_shebang_path_too_long() {
+	let dir = cannot_run_dir();
+	assert_xargs_cannot_run(dir.path(), "./s", 126, "File name too long").await;
+	let ran =
+		run(&mut session_in(dir.path(), &[("LC_ALL", "C")]), "xargs -t timeout 5s ./s < words").await;
+	let said: Vec<&str> = ran.stderr.lines().collect();
+	let expected =
+		["timeout 5s ./s 1 2 3", "timeout: failed to run command './s': File name too long"];
+	assert_eq!((ran.status, said), (123, expected.to_vec()), "{}", ran.stderr);
+}
+
+/// A file the system cannot run as a program (`ENOEXEC`) runs as a script,
+/// as GNU's `execvp` runs it with `/bin/sh`: this one fails as a script
+/// (status 126 from the shell), and xargs goes on to every line, exiting
+/// 123, as GNU's does; the message is the shell's, not xargs'.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn xargs_runs_a_file_that_is_no_program_as_a_script() {
+	let dir = cannot_run_dir();
+	let ran = run(&mut session_in(dir.path(), &[]), "xargs -t -n1 ./bin < words").await;
+	assert_eq!((ran.status, lines_tried(&ran.stderr, "./bin")), (123, 3), "{}", ran.stderr);
+	assert!(!ran.stderr.contains("xargs:"), "{}", ran.stderr);
+}
+
+/// `find -exec … +` and `-exec … ;` with a command they cannot run: GNU's
+/// `find: ‘NAME’: strerror` for each command line, find goes on, and exits
+/// 1 for `+` (0 for `;`, whose failure is only the test's). One batch per
+/// directory with `-execdir`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn find_reports_a_command_it_cannot_run_as_gnu() {
+	let dir = cannot_run_dir();
+	let p = dir.path();
+	let abs = |name: &str| p.join(name).display().to_string();
+	for (program, said) in [
+		("no-such-command-here", "No such file or directory"),
+		("./mi", "No such file or directory"),
+		("./noexec", "Permission denied"),
+		("./s", "File name too long"),
+	] {
+		let plus = format!("find findroot -type f -exec {program} {{}} +");
+		assert_find_cannot_run(p, &plus, program, said, 1, 1).await;
+		let each = format!("find findroot -type f -exec {program} {{}} \\;");
+		assert_find_cannot_run(p, &each, program, said, 2, 0).await;
+	}
+	for (name, said) in [
+		("noexec", "Permission denied"),
+		("s", "File name too long"),
+		("nosuch", "No such file or directory"),
+	] {
+		let execdir = format!("find findroot -type f -execdir {} {{}} +", abs(name));
+		assert_find_cannot_run(p, &execdir, &abs(name), said, 2, 1).await;
+	}
+	// A file that is no program runs as a script, as GNU's `execvp` runs it.
+	let ran =
+		run(&mut session_in(p, &[]), "find findroot -type f -exec ./bin {} +; echo rc=$?").await;
+	assert_eq!(ran.stdout, "rc=1\n", "{}", ran.stderr);
+	assert!(!ran.stderr.contains("find:"), "{}", ran.stderr);
+}
+
+/// Runs `WRAPPER PROGRAM` (`env`, `timeout 5`, `nohup`) in `dir`
+/// ([`cannot_run_dir`]) in the locale `locale`, both as GNU coreutils'
+/// (`/usr/bin/NAME`, named `NAME`) and as pi's, and asserts the same status
+/// and the same stderr: a command the wrapper cannot run, reported in
+/// coreutils' words (`env: ‘NAME’: …`, `timeout: failed to run command
+/// ‘NAME’: …`, `nohup: failed to run command 'NAME': …`), with 126, or 127
+/// when nothing is found.
+#[cfg(target_os = "linux")]
+async fn assert_wrapper_reports_as_gnu(dir: &Path, wrapper: &str, program: &str, locale: &str) {
+	use std::os::unix::process::CommandExt as _;
+
+	let words: Vec<&str> = wrapper.split(' ').collect();
+	let gnu_path = format!("/usr/bin/{}", words[0]);
+	assert!(Path::new(&gnu_path).exists(), "{gnu_path} is the reference: GNU coreutils");
+	let gnu = std::process::Command::new(&gnu_path)
+		.arg0(words[0])
+		.args(&words[1..])
+		.arg(program)
+		.current_dir(dir)
+		.env("LC_ALL", locale)
+		.stdin(std::process::Stdio::null())
+		.output()
+		.unwrap();
+	let gnu_err = String::from_utf8_lossy(&gnu.stderr);
+	let ran =
+		run(&mut session_in(dir, &[("LC_ALL", locale)]), &format!("{wrapper} {program}")).await;
+	let case = format!("LC_ALL={locale} {wrapper} {program}");
+	assert_eq!((ran.status, ran.stderr.as_str()), (gnu.status.code().unwrap(), &*gnu_err), "{case}");
+	assert!(matches!(ran.status, 126 | 127), "{case}: {}", ran.stderr);
+}
+
+/// The programs each wrapper test runs: not found by name or by path, a
+/// `#!` interpreter that does not exist, no execute bit (`EACCES`), and a
+/// `#!` interpreter past `NAME_MAX` (`ENAMETOOLONG`).
+#[cfg(target_os = "linux")]
+const CANNOT_RUN: [&str; 5] = ["no-such-command-here", "./nosuch", "./mi", "./noexec", "./s"];
+
+/// `env PROGRAM` that cannot run, as coreutils' `env` reports it, in the
+/// C and UTF-8 locales.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn env_reports_a_command_it_cannot_run_as_coreutils() {
+	let dir = cannot_run_dir();
+	for locale in ["C", "C.UTF-8"] {
+		for program in CANNOT_RUN {
+			assert_wrapper_reports_as_gnu(dir.path(), "env", program, locale).await;
+		}
+	}
+}
+
+/// `timeout 5 PROGRAM` that cannot run, as coreutils' `timeout` reports it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_reports_a_command_it_cannot_run_as_coreutils() {
+	let dir = cannot_run_dir();
+	for locale in ["C", "C.UTF-8"] {
+		for program in CANNOT_RUN {
+			assert_wrapper_reports_as_gnu(dir.path(), "timeout 5", program, locale).await;
+		}
+	}
+}
+
+/// `nohup PROGRAM` that cannot run, as coreutils' `nohup` reports it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nohup_reports_a_command_it_cannot_run_as_coreutils() {
+	let dir = cannot_run_dir();
+	for locale in ["C", "C.UTF-8"] {
+		for program in CANNOT_RUN {
+			assert_wrapper_reports_as_gnu(dir.path(), "nohup", program, locale).await;
+		}
+	}
+}
+
+/// A function or a builtin still runs under `timeout` and `nohup` (pi's
+/// own), though a program they cannot run is reported as coreutils does.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_and_nohup_still_run_functions_and_builtins() {
+	let dir = cannot_run_dir();
+	let mut s = session_in(dir.path(), &[]);
+	for wrapper in ["timeout 5", "nohup"] {
+		let ran =
+			run(&mut s, &format!("f() {{ echo F \"$@\"; }}; {wrapper} f 1; {wrapper} echo b")).await;
+		assert_eq!((ran.status, ran.stdout.as_str()), (0, "F 1\nb\n"), "{wrapper}: {}", ran.stderr);
+	}
+}
+
+/// A long line (more than `_POSIX_ARG_MAX`) whose program is a `#!` script
+/// with an interpreter past `NAME_MAX`: its `ENAMETOOLONG` is the
+/// interpreter's, not the line's, so nothing is split, as GNU's xargs never
+/// splits it. xargs tries the line once and stops with 126 (by path, and
+/// by a name found on `PATH`); `find -exec … +` prints one message per
+/// command line.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_line_refused_for_its_interpreter_is_not_split() {
+	let dir = cannot_run_dir();
+	let p = dir.path();
+	let words: Vec<String> = (0..10).map(|n| format!("{n:0>500}")).collect();
+	std::fs::write(p.join("long"), words.join("\n") + "\n").unwrap();
+	std::fs::create_dir(p.join("path")).unwrap();
+	std::fs::copy(p.join("s"), p.join("path/s")).unwrap();
+	let path = format!("{}:{}", p.join("path").display(), std::env::var("PATH").unwrap_or_default());
+	let mut s = session_in(p, &[("PATH", &path)]);
+	for program in ["./s", "s"] {
+		let ran = run(&mut s, &format!("xargs -t -a long {program}")).await;
+		let (tried, said): (Vec<&str>, Vec<&str>) = ran
+			.stderr
+			.lines()
+			.partition(|line| line.starts_with(&format!("{program} ")));
+		assert_eq!((ran.status, tried.len()), (126, 1), "{program}: {}", ran.stderr);
+		assert_eq!(said, [format!("xargs: {program}: File name too long")], "{program}");
+	}
+	let pad = "x".repeat(4100);
+	for (command, times) in [
+		(format!("find findroot -type f -exec ./s {pad} {{}} +"), 1),
+		(format!("find findroot -type f -execdir {} {pad} {{}} +", p.join("s").display()), 2),
+	] {
+		let ran = run(&mut s, &format!("{command}; echo rc=$?")).await;
+		assert_eq!(ran.stdout, "rc=1\n", "{}", ran.stderr);
+		assert_eq!(ran.stderr.matches("File name too long").count(), times, "{}", ran.stderr);
+	}
+}
+
+/// A script without `#!` that xargs runs, directly or under `timeout` or
+/// `nohup`, gets the name it was given as `$0`, as from GNU's utilities: a
+/// name with `/` runs as written, not by the absolute path it was found at.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_script_without_a_shebang_keeps_its_name_as_dollar_zero() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let dir = tempfile::tempdir().unwrap();
+	let script = dir.path().join("ns");
+	std::fs::write(&script, "echo \"0=$0\"\n").unwrap();
+	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+	let mut s = session_in(dir.path(), &[]);
+	for wrapper in ["", "timeout 5 ", "nohup "] {
+		let ran = run(&mut s, &format!("echo x | xargs {wrapper}./ns")).await;
+		assert_eq!((ran.status, ran.stdout.as_str()), (0, "0=./ns\n"), "{wrapper}: {}", ran.stderr);
 	}
 }
 
@@ -884,9 +1360,9 @@ fn deeper_than_path_max(root: &Path) -> std::path::PathBuf {
 }
 
 /// `ENAMETOOLONG` from a working directory longer than `PATH_MAX` is no
-/// command line too long: the shell reports the program it could not start,
-/// as for any other refusal (status 126, xargs 123), and xargs does not
-/// split the line, since fewer arguments cannot help.
+/// command line too long, and xargs does not split the line, since fewer
+/// arguments cannot help: the command cannot be run, and xargs says so as
+/// GNU's does (`xargs: NAME: File name too long`, status 126) and stops.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_working_directory_past_path_max_is_no_line_too_long() {
@@ -894,18 +1370,16 @@ async fn a_working_directory_past_path_max_is_no_line_too_long() {
 	let ten = dir.path().join("ten");
 	std::fs::write(&ten, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
 	let deep = deeper_than_path_max(dir.path());
-	let command = format!("xargs -t -a {} /usr/bin/printf '%s\\n'", ten.display());
+	let command = format!("xargs -t -n5 -a {} /usr/bin/printf '%s\\n'", ten.display());
 	let ran = run(&mut session_in(&deep, &[]), &command).await;
 	let tried = lines_tried(&ran.stderr, "/usr/bin/printf");
-	assert_eq!((ran.status, ran.stdout.as_str(), tried), (123, "", 1), "{}", ran.stderr);
-	assert_eq!(
-		ran.stderr
-			.matches("/usr/bin/printf: File name too long")
-			.count(),
-		1,
-		"{}",
-		ran.stderr
-	);
+	assert_eq!((ran.status, ran.stdout.as_str(), tried), (126, "", 1), "{}", ran.stderr);
+	let said: Vec<&str> = ran
+		.stderr
+		.lines()
+		.filter(|line| !line.starts_with("/usr/bin/printf"))
+		.collect();
+	assert_eq!(said, ["xargs: /usr/bin/printf: File name too long"]);
 }
 
 /// `tail -f` writing into an engine pipe (no native handle) notices while
@@ -989,7 +1463,7 @@ async fn suspend_is_withheld_and_exec_spares_pi() {
 }
 
 // ---------------------------------------------------------------------------
-// A provider filesystem.
+// Provider filesystems.
 
 const NOTES: &[u8] = b"pear\napple\n";
 
@@ -1007,14 +1481,14 @@ impl FileSystem for Notes {
 		if path != Path::new("mem://notes") {
 			return Err(io::ErrorKind::NotFound.into());
 		}
-		Ok(pi_vfs::File::from_handle(NotesHandle { pos: Mutex::new(0) }))
+		Ok(pi_vfs::File::from_handle(BytesHandle { data: NOTES, pos: Mutex::new(0) }))
 	}
 
 	async fn metadata(&self, path: &Path) -> io::Result<Metadata> {
 		if path != Path::new("mem://notes") {
 			return Err(io::ErrorKind::NotFound.into());
 		}
-		Ok(notes_meta())
+		Ok(file_meta(NOTES))
 	}
 
 	async fn read_dir(&self, _path: &Path) -> io::Result<ReadDir> {
@@ -1022,25 +1496,67 @@ impl FileSystem for Notes {
 	}
 }
 
-fn notes_meta() -> Metadata {
+#[cfg(target_os = "linux")]
+const ENV0: &[u8] = b"A=1\0";
+
+/// One read-only provider file, `mem://env0` (`A=1`, for `env
+/// --env0-from`), that counts how often it is opened; every other path is
+/// the host's.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct Env0 {
+	opens: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl FileSystem for Env0 {
+	fn is_native_local(&self, path: &Path) -> bool {
+		!pi_vfs::is_virtual_path(path)
+	}
+
+	async fn open(&self, path: &Path, _options: &OpenOptions) -> io::Result<pi_vfs::File> {
+		if path != Path::new("mem://env0") {
+			return Err(io::ErrorKind::NotFound.into());
+		}
+		self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		Ok(pi_vfs::File::from_handle(BytesHandle { data: ENV0, pos: Mutex::new(0) }))
+	}
+
+	async fn metadata(&self, path: &Path) -> io::Result<Metadata> {
+		if path != Path::new("mem://env0") {
+			return Err(io::ErrorKind::NotFound.into());
+		}
+		Ok(file_meta(ENV0))
+	}
+
+	async fn read_dir(&self, _path: &Path) -> io::Result<ReadDir> {
+		Err(io::ErrorKind::NotFound.into())
+	}
+}
+
+/// The metadata of a provider file holding `data`.
+fn file_meta(data: &[u8]) -> Metadata {
 	Metadata::new(
 		FileType::from_kind(pi_vfs::FileKind::File),
-		NOTES.len() as u64,
+		data.len() as u64,
 		Permissions::from_mode(0o644),
 	)
 }
 
+/// An open provider file holding `data`.
 #[derive(Debug)]
-struct NotesHandle {
-	pos: Mutex<usize>,
+struct BytesHandle {
+	data: &'static [u8],
+	pos:  Mutex<usize>,
 }
 
 #[async_trait]
-impl FileHandle for NotesHandle {
+impl FileHandle for BytesHandle {
 	async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 		let mut pos = self.pos.lock();
-		let n = (NOTES.len() - *pos).min(buf.len());
-		buf[..n].copy_from_slice(&NOTES[*pos..*pos + n]);
+		let n = (self.data.len() - *pos).min(buf.len());
+		buf[..n].copy_from_slice(&self.data[*pos..*pos + n]);
 		*pos += n;
 		Ok(n)
 	}
@@ -1052,14 +1568,16 @@ impl FileHandle for NotesHandle {
 	async fn seek(&self, pos: io::SeekFrom) -> io::Result<u64> {
 		let mut at = self.pos.lock();
 		*at = match pos {
-			io::SeekFrom::Start(to) => usize::try_from(to).unwrap_or(usize::MAX).min(NOTES.len()),
+			io::SeekFrom::Start(to) => usize::try_from(to)
+				.unwrap_or(usize::MAX)
+				.min(self.data.len()),
 			_ => return Err(io::ErrorKind::Unsupported.into()),
 		};
 		Ok(*at as u64)
 	}
 
 	async fn metadata(&self) -> io::Result<Metadata> {
-		Ok(notes_meta())
+		Ok(file_meta(self.data))
 	}
 }
 

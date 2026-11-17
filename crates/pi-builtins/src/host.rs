@@ -34,7 +34,7 @@
 use std::{
 	cell::Cell,
 	collections::HashMap,
-	ffi::OsString,
+	ffi::{OsStr, OsString},
 	future::poll_fn,
 	io::{self, BufWriter, LineWriter, Read, Write},
 	panic::{AssertUnwindSafe, catch_unwind},
@@ -962,9 +962,10 @@ impl Host {
 
 	/// Whether the utility's caller retries a command line the system
 	/// refuses as too long ([`Invocation::too_long_to_caller`]): a utility
-	/// that has done nothing visible when it runs its command (`env`) then
-	/// runs it with [`ShellCommand::too_long_as_error`] and hands such a
-	/// refusal up ([`Host::hand_up_too_long`]).
+	/// that has done nothing a retry would repeat when it runs its command
+	/// (`env` without `--env0-from`, `ifne`) then runs it with
+	/// [`ShellCommand::too_long_as_error`] and hands such a refusal up
+	/// ([`Host::hand_up_too_long`]).
 	#[must_use]
 	pub fn too_long_to_caller(&self) -> bool {
 		self.too_long_to_caller.is_some()
@@ -1428,6 +1429,7 @@ pub struct ShellCommand {
 	stdin: Option<Fd>,
 	env:   Vec<EnvChange>,
 	too_long_as_error: bool,
+	refusal_as_error: bool,
 }
 
 /// One environment change a [`ShellCommand`] makes for its own command,
@@ -1446,7 +1448,15 @@ impl ShellCommand {
 	/// A command running `argv`; `argv[0]` names the builtin or program.
 	#[must_use]
 	pub fn new(argv: Vec<OsString>) -> Self {
-		Self { argv, argv0: None, cwd: None, stdin: None, env: Vec::new(), too_long_as_error: false }
+		Self {
+			argv,
+			argv0: None,
+			cwd: None,
+			stdin: None,
+			env: Vec::new(),
+			too_long_as_error: false,
+			refusal_as_error: false,
+		}
 	}
 
 	/// The command line; `argv[0]` names the builtin or program to look up.
@@ -1544,44 +1554,122 @@ impl ShellCommand {
 		self
 	}
 
-	/// Whether [`ShellCommand::too_long_as_error`] was asked for.
+	/// Whether [`ShellCommand::too_long_as_error`] was asked for (or
+	/// [`ShellCommand::refusal_as_error`]).
 	#[must_use]
 	pub fn too_long_is_error(&self) -> bool {
 		self.too_long_as_error
 	}
+
+	/// Reports every refusal of the system to start the program the command
+	/// names as that error from [`RunningCommand::wait`], with nothing
+	/// printed for it: a line too long, as [`ShellCommand::too_long_as_error`]
+	/// does, and any other (`EACCES`, `ENOENT` of a `#!` interpreter,
+	/// `ENAMETOOLONG` of a path), so the utility reports it as GNU's xargs
+	/// and find report a command they cannot run. `ENOEXEC` is no refusal:
+	/// the shell runs such a file as a script, as GNU's `execvp` does. A
+	/// builtin's own `exec` keeps the shell's diagnostic, as for
+	/// [`ShellCommand::too_long_as_error`]; so does every refusal on Windows.
+	pub fn refusal_as_error(mut self) -> Self {
+		self.too_long_as_error = true;
+		self.refusal_as_error = true;
+		self
+	}
+
+	/// Whether [`ShellCommand::refusal_as_error`] was asked for.
+	#[must_use]
+	pub fn refusal_is_error(&self) -> bool {
+		self.refusal_as_error
+	}
 }
 
 /// Whether `error`, the failure to start `program` in the working directory
-/// `cwd`, is the system refusing the command line as too long, as a command
-/// run with [`ShellCommand::too_long_as_error`] reports it: `E2BIG`, or
-/// `ENAMETOOLONG` as GKE Sandbox (gVisor) says it. A utility that batches
+/// `cwd` with a command line whose arguments take `line` bytes
+/// ([`line_bytes`]), is the system refusing the line as too long, as a
+/// command run with [`ShellCommand::too_long_as_error`] reports it: `E2BIG`,
+/// or `ENAMETOOLONG` as GKE Sandbox (gVisor) says it. A utility that batches
 /// arguments retries such a line in halves, as GNU xargs does.
 ///
-/// `ENAMETOOLONG` counts only when no path can have caused it: the program's
-/// and the working directory's are each shorter than `PATH_MAX`, with no
-/// name in them longer than `NAME_MAX`. A working directory past `PATH_MAX`
-/// refuses every command alike, however few its arguments. `program` is the
-/// name the utility gave: a relative path runs from `cwd`, and a bare name
-/// is looked up on `PATH`, where only a path that fits is found.
+/// `ENAMETOOLONG` counts only when nothing else can have caused it:
+/// - The line is longer than POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`,
+///   4,096 bytes), which no system refuses: a short line's `ENAMETOOLONG`
+///   is a path's, such as a `#!` interpreter's past `NAME_MAX`.
+/// - The program's path and the working directory are each shorter than
+///   `PATH_MAX`, with no name in them longer than `NAME_MAX`: a working
+///   directory past `PATH_MAX` refuses every command alike, however few its
+///   arguments.
+/// - A program named by its path is no `#!` script whose interpreter the
+///   system cannot reach by its path ([`interpreter_path_too_long`]),
+///   whatever the line's size, as GNU's xargs never splits it.
+///
+/// `program` is the name the utility gave: a relative path runs from `cwd`,
+/// and a bare name is looked up on `PATH`, where only a path that fits is
+/// found (the shell's twin reads that program: a refusal it finds to be the
+/// interpreter's reaches the utility without its `errno`). `cwd` is taken
+/// lexically normalized (`-execdir`'s `<dir>/./sub` is `<dir>/sub`), as the
+/// shell enters it.
 ///
 /// The shell's twin, `refused_as_too_long` in pi-shell's VM
 /// (`bash/vm/command.rs`), decides which refusals reach the utility; the
 /// two apply the same rule.
 #[cfg(unix)]
-pub(crate) fn command_line_too_long(error: &io::Error, program: &Path, cwd: &Path) -> bool {
+pub(crate) fn command_line_too_long(error: &io::Error, program: &Path, line: usize, cwd: &Path) -> bool {
 	use std::os::unix::ffi::OsStrExt as _;
 	match error.raw_os_error() {
 		Some(libc::E2BIG) => true,
-		Some(libc::ENAMETOOLONG) => {
-			let program = if program.as_os_str().as_bytes().contains(&b'/') {
-				cwd.join(program)
-			} else {
-				program.to_path_buf()
-			};
-			path_fits(&program) && path_fits(cwd)
+		Some(libc::ENAMETOOLONG) if line > POSIX_ARG_MAX => {
+			let cwd = pi_vfs::normalize_lexically(cwd);
+			let named = program.as_os_str().as_bytes().contains(&b'/');
+			let program = if named { cwd.join(program) } else { program.to_path_buf() };
+			path_fits(&program) && path_fits(&cwd) && !(named && interpreter_path_too_long(&program, &cwd))
 		},
 		_ => false,
 	}
+}
+
+/// Whether the program at `path` is a `#!` script whose interpreter the
+/// system cannot reach by its path: the interpreter its first line names
+/// (read as the kernel reads it, from the file's first 256 bytes; relative
+/// to `cwd` when relative) is past `PATH_MAX` or holds a name past
+/// `NAME_MAX`, or looking it up fails with `ENAMETOOLONG` (a symlink on its
+/// way names one). Only read for an `ENAMETOOLONG` of a long line, the one
+/// refusal it decides. The shell's twin is `interpreter_path_too_long` in
+/// pi-shell's VM.
+#[cfg(unix)]
+fn interpreter_path_too_long(path: &Path, cwd: &Path) -> bool {
+	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
+	let Ok(file) = std::fs::File::open(path) else {
+		return false;
+	};
+	let mut head = Vec::with_capacity(256);
+	if file.take(256).read_to_end(&mut head).is_err() {
+		return false;
+	}
+	let Some(line) = head.strip_prefix(b"#!") else {
+		return false;
+	};
+	let line = &line[line.iter().take_while(|&&c| c == b' ' || c == b'\t').count()..];
+	let end = line
+		.iter()
+		.position(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\0'))
+		.unwrap_or(line.len());
+	if end == 0 {
+		return false;
+	}
+	let interpreter = cwd.join(std::ffi::OsStr::from_bytes(&line[..end]));
+	!path_fits(&interpreter)
+		|| std::fs::metadata(&interpreter).is_err_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG))
+}
+
+/// POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`): no system refuses a command
+/// line whose arguments take no more.
+#[cfg(unix)]
+const POSIX_ARG_MAX: usize = 4096;
+
+/// The bytes the arguments `argv` take in a command line: each string and
+/// its terminating NUL, as the system counts them.
+pub(crate) fn line_bytes<S: AsRef<OsStr>>(argv: impl IntoIterator<Item = S>) -> usize {
+	argv.into_iter().map(|arg| arg.as_ref().len() + 1).sum()
 }
 
 /// Whether the system takes `path` as a name: shorter than `PATH_MAX`, with
@@ -1598,7 +1686,7 @@ fn path_fits(path: &Path) -> bool {
 /// Windows commands are not split (the shell keeps its diagnostic for every
 /// refused start): see the Unix twin.
 #[cfg(not(unix))]
-pub(crate) fn command_line_too_long(_error: &io::Error, _program: &Path, _cwd: &Path) -> bool {
+pub(crate) fn command_line_too_long(_error: &io::Error, _program: &Path, _line: usize, _cwd: &Path) -> bool {
 	false
 }
 
@@ -1606,11 +1694,12 @@ pub(crate) fn command_line_too_long(_error: &io::Error, _program: &Path, _cwd: &
 mod too_long_tests {
 	use std::{io, path::Path};
 
-	use super::command_line_too_long;
+	use super::{POSIX_ARG_MAX, command_line_too_long};
 
-	/// `E2BIG` is always a line too long; `ENAMETOOLONG` only when neither
-	/// the program's path nor the working directory is past `PATH_MAX` or
-	/// holds a name past `NAME_MAX`; any other error never is.
+	/// `E2BIG` is always a line too long; `ENAMETOOLONG` only for a line
+	/// longer than `_POSIX_ARG_MAX` when neither the program's path nor the
+	/// (normalized) working directory is past `PATH_MAX` or holds a name past
+	/// `NAME_MAX`; any other error never is.
 	#[test]
 	fn enametoolong_is_a_line_too_long_only_when_no_path_is() {
 		let e2big = io::Error::from_raw_os_error(libc::E2BIG);
@@ -1620,8 +1709,11 @@ mod too_long_tests {
 		let longest = &longest[..path_max - 1];
 		let too_long = format!("{longest}d");
 		let name = "n".repeat(255);
-		let fits = |program: &str, cwd: &str| command_line_too_long(&enametoolong, Path::new(program), Path::new(cwd));
-		assert!(command_line_too_long(&e2big, Path::new(&too_long), Path::new(&too_long)));
+		let long = POSIX_ARG_MAX + 1;
+		let fits = |program: &str, cwd: &str| {
+			command_line_too_long(&enametoolong, Path::new(program), long, Path::new(cwd))
+		};
+		assert!(command_line_too_long(&e2big, Path::new(&too_long), 2, Path::new(&too_long)));
 		assert!(fits("/usr/bin/printf", "/tmp"));
 		assert!(fits("printf", longest), "a bare name is looked up on PATH, not under the directory");
 		assert!(fits(&format!("/{name}"), &format!("/{name}")));
@@ -1631,8 +1723,54 @@ mod too_long_tests {
 		assert!(!fits("./sub/printf", longest), "a relative program path runs from the directory");
 		assert!(!fits("/usr/bin/printf", &format!("/{name}n")), "a directory name past NAME_MAX");
 		assert!(!fits(&format!("{name}n"), "/tmp"), "a program name past NAME_MAX");
+		// `-execdir`'s `<dir>/./sub` is entered as `<dir>/sub`: `PATH_MAX`
+		// bytes as given, two fewer normalized.
+		let dir = &longest[..path_max - 4];
+		assert!(fits("/usr/bin/printf", &format!("{dir}/./d")), "the directory is taken normalized");
+		let short = |errno: i32, line: usize| {
+			command_line_too_long(&io::Error::from_raw_os_error(errno), Path::new("./s"), line, Path::new("/tmp"))
+		};
+		assert!(!short(libc::ENAMETOOLONG, POSIX_ARG_MAX), "a line no system refuses: a path's error");
+		assert!(short(libc::ENAMETOOLONG, POSIX_ARG_MAX + 1));
+		assert!(short(libc::E2BIG, 2), "E2BIG is the line's, however short");
 		let other = io::Error::from_raw_os_error(libc::ENOMEM);
-		assert!(!command_line_too_long(&other, Path::new("/usr/bin/printf"), Path::new("/tmp")));
+		assert!(!command_line_too_long(&other, Path::new("/usr/bin/printf"), long, Path::new("/tmp")));
+	}
+
+	/// An `ENAMETOOLONG` of a long line whose program is a `#!` script with
+	/// an interpreter the system cannot reach by its path (a symlink to a
+	/// name past `NAME_MAX`) is the interpreter's, whatever the line's size;
+	/// a script whose interpreter is reachable, and a program with no `#!`,
+	/// keep the line's (gVisor's `ENAMETOOLONG` for `E2BIG`).
+	#[test]
+	fn enametoolong_of_a_shebang_interpreter_is_no_line_too_long() {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let dir = tempfile::tempdir().unwrap();
+		let at = |name: &str| dir.path().join(name);
+		std::os::unix::fs::symlink(at(&"0".repeat(256)), at("ll")).unwrap();
+		for (name, text) in [
+			("s", format!("#!{}\n", at("ll").display())),
+			("tab", format!("#! \t{} -x\n", at("ll").display())),
+			("relative", "#!ll\n".to_owned()),
+			("sh", "#!/bin/sh\n".to_owned()),
+			("plain", "echo hi\n".to_owned()),
+		] {
+			std::fs::write(at(name), text).unwrap();
+			std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		let enametoolong = io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+		let too_long =
+			|program: &str, line: usize| command_line_too_long(&enametoolong, Path::new(program), line, dir.path());
+		let long = POSIX_ARG_MAX * 4;
+		for program in ["./s", "./tab", "./relative"] {
+			assert!(!too_long(program, long), "{program}: the interpreter's path is the error");
+		}
+		for program in ["./sh", "./plain", "./missing", "/usr/bin/printf"] {
+			assert!(too_long(program, long), "{program}: the line's");
+		}
+		let e2big = io::Error::from_raw_os_error(libc::E2BIG);
+		assert!(command_line_too_long(&e2big, Path::new("./s"), long, dir.path()), "E2BIG is the line's");
 	}
 }
 
@@ -1717,7 +1855,9 @@ pub trait CommandRunner: Send {
 	/// executed, and any other kind for other failures to run it. A command
 	/// line the system refuses as too long fails with that error (`E2BIG`,
 	/// `ENAMETOOLONG`) at least for a command that asks for it
-	/// ([`ShellCommand::too_long_is_error`]).
+	/// ([`ShellCommand::too_long_is_error`]), and so does any other refusal
+	/// to start its program for a command that asks for that
+	/// ([`ShellCommand::refusal_is_error`]).
 	fn start(&mut self, command: ShellCommand) -> BoxFuture<'static, io::Result<CommandStatus>>;
 }
 
@@ -2155,6 +2295,18 @@ pub(crate) fn strip_errno(error: &io::Error) -> String {
 	message
 }
 
+/// The `strerror` text of a failure to run a command, as GNU's xargs and
+/// find print it: [`strip_errno`], with POSIX's words for the bare kinds a
+/// [`CommandRunner`] reports for its own lookup (`NotFound`: nothing has
+/// the name; `PermissionDenied`: nothing with it can be executed).
+pub(crate) fn run_strerror(error: &io::Error) -> String {
+	match (error.raw_os_error(), error.kind()) {
+		(None, io::ErrorKind::NotFound) => "No such file or directory".to_owned(),
+		(None, io::ErrorKind::PermissionDenied) => "Permission denied".to_owned(),
+		_ => strip_errno(error),
+	}
+}
+
 /// POSIX `strerror` text for an OS error kind. Kinds that cover several errnos
 /// on unix (`PermissionDenied` is both `EPERM` and `EACCES`) keep the native
 /// text there, which is already exact.
@@ -2293,8 +2445,9 @@ pub struct Invocation {
 	pub reported_error: Option<Arc<AtomicBool>>,
 	/// Set when the extra's caller retries a command line the system refuses
 	/// as too long (the extra runs as the command of `xargs` or `find -exec
-	/// … +`): an extra that runs nothing visible before its command (`env`)
-	/// then stores here the error of such a refusal of its command
+	/// … +`): an extra that has done nothing a retry would repeat when it
+	/// runs its command (`env` without `--env0-from`, `ifne`) then stores
+	/// here the error of such a refusal of its command
 	/// ([`Host::hand_up_too_long`]), prints nothing for it, and exits 126.
 	/// Zero until then; `None` when nobody asks.
 	pub too_long_to_caller: Option<Arc<AtomicI32>>,

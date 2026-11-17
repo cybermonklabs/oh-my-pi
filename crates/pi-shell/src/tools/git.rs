@@ -81,7 +81,7 @@ impl Git {
 									let redirect = if to_stderr { " >&2" } else { "" };
 									self
 										.child
-										.start(api, turn, &self.call, argv, false, redirect);
+										.start(api, turn, &self.call, argv, false, redirect, false);
 									Stage::Running
 								} else {
 									self.out.push(2, "git: command not found\n");

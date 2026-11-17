@@ -811,8 +811,8 @@ pub struct Run {
 	pub exit_trap_started: bool,
 	/// [`Script::too_long_to_host`](super::Script::too_long_to_host).
 	pub too_long_to_host:  bool,
-	/// [`Script::as_program`](super::Script::as_program).
-	pub as_program:        bool,
+	/// [`Script::refusals_to_host`](super::Script::refusals_to_host).
+	pub refusals_to_host:  bool,
 }
 
 /// What kind of activation a frame is.
