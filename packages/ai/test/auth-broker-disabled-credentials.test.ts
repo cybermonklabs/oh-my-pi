@@ -17,6 +17,11 @@ import {
 } from "@oh-my-pi/pi-ai/auth-broker";
 import { removeWithRetries } from "../../utils/src/temp";
 
+/** What a user's removal records (`omp` auth commands, `/logout`). */
+const DELETED_BY_USER = "deleted by user";
+/** What `omp auth-broker logout` records. */
+const LOGGED_OUT_BY_USER = "logged out by user";
+
 const DISABLE_CAUSE =
 	'oauth refresh failed: OAuthError: Anthropic token refresh request failed. url=https://api.anthropic.com/v1/oauth/token; body={"error": "invalid_grant", "error_description": "Refresh token expired"}';
 
@@ -49,7 +54,7 @@ describe("disabled credential tombstones", () => {
 	});
 
 	test("sqlite store lists identity + cause + disabledAtMs and never token material", async () => {
-		await store!.saveOAuth("anthropic", mintOAuth("dead@example.test"));
+		await store!.saveOAuth("anthropic", { ...mintOAuth("dead@example.test"), orgId: "org-dead" });
 		await store!.saveOAuth("openai-codex", mintOAuth("alive@example.test"));
 		const row = store!.listAuthCredentials("anthropic")[0];
 		await store!.deleteAuthCredential(row.id, DISABLE_CAUSE);
@@ -63,6 +68,7 @@ describe("disabled credential tombstones", () => {
 			type: "oauth",
 			email: "dead@example.test",
 			accountId: "account-dead@example.test",
+			identityKey: "email:dead@example.test|org:org-dead",
 			cause: DISABLE_CAUSE,
 		});
 		expect(typeof summary.disabledAtMs).toBe("number");
@@ -91,6 +97,55 @@ describe("disabled credential tombstones", () => {
 		});
 		const client = new AuthBrokerClient({ url: "http://127.0.0.1:9", token: "unused", fetchImpl });
 		expect(await client.listDisabledCredentials()).toEqual([]);
+	});
+
+	test("row 10: a user's removal or logout reads as theirs, also over a login a failure already disabled", async () => {
+		// If this regresses, the failure stays the login's latest teardown, and a turn waits for a login the user removed.
+		// The only login a failure disabled, then the user removes the provider: no active row is left to mark.
+		await store!.saveOAuth("anthropic", mintOAuth("failed@example.test"));
+		await store!.deleteAuthCredential(store!.listAuthCredentials("anthropic")[0]!.id, DISABLE_CAUSE);
+		await storage!.credentials.remove("anthropic");
+		// A broker logout of an active login, and of a provider a failure already emptied.
+		await store!.saveOAuth("openai-codex", mintOAuth("active@example.test"));
+		await store!.deleteAuthCredentials("openai-codex", LOGGED_OUT_BY_USER);
+		await store!.saveOAuth("github-copilot", mintOAuth("emptied@example.test"));
+		await store!.deleteAuthCredential(store!.listAuthCredentials("github-copilot")[0]!.id, DISABLE_CAUSE);
+		await store!.deleteAuthCredentials("github-copilot", LOGGED_OUT_BY_USER);
+		// A failure-disabled login of a provider the user did not touch stays recoverable.
+		await store!.saveOAuth("google-gemini-cli", mintOAuth("untouched@example.test"));
+		await store!.deleteAuthCredential(store!.listAuthCredentials("google-gemini-cli")[0]!.id, DISABLE_CAUSE);
+
+		// Each provider's tombstone cause: the user's own wherever they removed or logged out.
+		const causes = Object.fromEntries(
+			(await storage!.credentials.listDisabled()).map(row => [row.provider, row.cause]),
+		);
+		expect(causes).toEqual({
+			anthropic: DELETED_BY_USER,
+			"openai-codex": LOGGED_OUT_BY_USER,
+			"github-copilot": LOGGED_OUT_BY_USER,
+			"google-gemini-cli": DISABLE_CAUSE,
+		});
+	});
+
+	test("row 10: removing one account a failure already disabled records the user's removal on it, and only on it", async () => {
+		// If this regresses, the per-account removal reaches nothing and the removed account's failure stays recoverable.
+		await store!.saveOAuth("anthropic", mintOAuth("first@example.test"));
+		await store!.saveOAuth("anthropic", mintOAuth("second@example.test"));
+		await storage!.credentials.reload();
+		const [first, second] = store!.listAuthCredentials("anthropic");
+		await store!.deleteAuthCredential(first!.id, DISABLE_CAUSE);
+		await store!.deleteAuthCredential(second!.id, DISABLE_CAUSE);
+		await storage!.credentials.reload();
+
+		expect(await storage!.credentials.removeById("anthropic", first!.id)).toBe(true);
+		// A per-id removal of another provider's id, or of one already removed, reaches nothing.
+		expect(await storage!.credentials.removeById("openai-codex", second!.id)).toBe(false);
+		expect(await storage!.credentials.removeById("anthropic", first!.id)).toBe(false);
+
+		const byEmail = Object.fromEntries(
+			(await storage!.credentials.listDisabled("anthropic")).map(row => [row.email, row.cause]),
+		);
+		expect(byEmail).toEqual({ "first@example.test": DELETED_BY_USER, "second@example.test": DISABLE_CAUSE });
 	});
 });
 
@@ -130,7 +185,7 @@ describe("broker /v1/credentials/disabled round-trip", () => {
 	});
 
 	test("a row disabled on the broker surfaces to remote clients as a tombstone", async () => {
-		await serverStore!.saveOAuth("anthropic", mintOAuth("gone@example.test"));
+		await serverStore!.saveOAuth("anthropic", { ...mintOAuth("gone@example.test"), orgId: "org-gone" });
 		const row = serverStore!.listAuthCredentials("anthropic")[0];
 		await serverStore!.deleteAuthCredential(row.id, DISABLE_CAUSE);
 
@@ -141,9 +196,41 @@ describe("broker /v1/credentials/disabled round-trip", () => {
 			provider: "anthropic",
 			type: "oauth",
 			email: "gone@example.test",
+			identityKey: "email:gone@example.test|org:org-gone",
 			cause: DISABLE_CAUSE,
 		});
 		expect(JSON.stringify(disabled[0])).not.toContain("refresh-gone");
+	});
+
+	test("row 10: a remote client's removal reaches a login the broker already disabled", async () => {
+		// If this regresses, the broker keeps the failure as the login's latest teardown.
+		await serverStore!.saveOAuth("anthropic", mintOAuth("failed@example.test"));
+		await serverStore!.deleteAuthCredential(serverStore!.listAuthCredentials("anthropic")[0]!.id, DISABLE_CAUSE);
+		await clientStorage!.credentials.reload();
+
+		await clientStorage!.credentials.remove("anthropic");
+
+		const tombstones = await serverStorage!.credentials.listDisabled("anthropic");
+		expect(tombstones.map(row => row.cause)).toEqual([DELETED_BY_USER]);
+	});
+
+	test("row 10: a remote client's removal of one account reaches that login after the broker disabled it", async () => {
+		// If this regresses, the broker keeps the failure as that login's latest teardown.
+		await serverStore!.saveOAuth("anthropic", mintOAuth("first@example.test"));
+		await serverStore!.saveOAuth("anthropic", mintOAuth("second@example.test"));
+		const [first, second] = serverStore!.listAuthCredentials("anthropic");
+		await serverStore!.deleteAuthCredential(first!.id, DISABLE_CAUSE);
+		await serverStore!.deleteAuthCredential(second!.id, DISABLE_CAUSE);
+		await clientStorage!.credentials.reload();
+
+		expect(await clientStorage!.credentials.removeById("anthropic", first!.id)).toBe(true);
+		expect(await clientStorage!.credentials.disable(second!.id, DELETED_BY_USER)).toBe(true);
+
+		const tombstones = await serverStorage!.credentials.listDisabled("anthropic");
+		expect(tombstones.map(row => ({ email: row.email, cause: row.cause }))).toEqual([
+			{ email: "first@example.test", cause: DELETED_BY_USER },
+			{ email: "second@example.test", cause: DELETED_BY_USER },
+		]);
 	});
 
 	test("revalidateCredentials re-hydrates broker-side identity changes past a stale snapshot", async () => {

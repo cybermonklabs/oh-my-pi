@@ -1,6 +1,7 @@
 import { type MessagePort, parentPort } from "node:worker_threads";
 import { AuthStorage, type SessionRestrictionLease } from "@oh-my-pi/pi-ai";
-import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
+import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+import { classify, MissingApiKeyError, retriable } from "@oh-my-pi/pi-ai/error";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { anthropicSlowModeLanes } from "../../src/session/anthropic-slow-mode";
 import type { WorkerThreadLink } from "../../src/thread/protocol";
@@ -11,10 +12,20 @@ import { RemoteSlowModeLane } from "../../src/thread/services/auth-remote";
 /** Worker-side operations the test drives; each crosses to main as an async function. */
 export interface AuthProbe {
 	key(provider: string, sessionId: string): Promise<string | undefined>;
-	keyError(provider: string, sessionId: string): Promise<{ missingApiKey: boolean; message: string }>;
+	keyError(provider: string, sessionId: string): Promise<{ missingApiKey: boolean; name: string; message: string }>;
 	accountId(provider: string, sessionId: string): Promise<string | undefined>;
 	restrict(provider: string, sessionId: string, identityKeys: string[]): Promise<number>;
 	unrestrict(provider: string, sessionId: string, handle: number): Promise<void>;
+	/**
+	 * How the worker's own registry fails an agent turn's first key lookup for `provider`
+	 * (`turnResolver`, as a subagent's turn resolves keys): the error's class name, and
+	 * whether turn recovery retries it.
+	 */
+	turnKeyFailure(
+		registry: ModelRegistry,
+		provider: string,
+		sessionId: string,
+	): Promise<{ name: string; retryable: boolean } | undefined>;
 	sameStorage(storage: AuthStorage): Promise<boolean>;
 	watchGenerations(): Promise<void>;
 	generations(): Promise<number[]>;
@@ -56,10 +67,11 @@ function buildProbe(storage: AuthStorage): AuthProbe {
 		keyError: async (provider, sessionId) => {
 			try {
 				await storage.keys.get(provider, sessionId);
-				return { missingApiKey: false, message: "resolved" };
+				return { missingApiKey: false, name: "resolved", message: "resolved" };
 			} catch (error) {
 				return {
 					missingApiKey: error instanceof MissingApiKeyError,
+					name: error instanceof Error ? error.name : typeof error,
 					message: error instanceof Error ? error.message : String(error),
 				};
 			}
@@ -71,6 +83,18 @@ function buildProbe(storage: AuthStorage): AuthProbe {
 			const lease = leases[handle];
 			if (lease === undefined) throw new Error(`no lease ${handle}`);
 			storage.sessions.unrestrict(provider, sessionId, lease);
+		},
+		turnKeyFailure: async (registry, provider, sessionId) => {
+			const model = { provider, id: "pooled-model", baseUrl: "https://pooled.example.invalid/v1" };
+			try {
+				await resolveApiKeyOnce(registry.turnResolver(model, sessionId));
+				return undefined;
+			} catch (error) {
+				return {
+					name: error instanceof Error ? error.name : typeof error,
+					retryable: retriable(classify(error)),
+				};
+			}
 		},
 		sameStorage: async other => other === storage,
 		watchGenerations: async () => {

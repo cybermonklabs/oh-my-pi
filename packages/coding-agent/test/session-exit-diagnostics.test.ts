@@ -350,6 +350,40 @@ describe("session exit diagnostics", () => {
 		expect(hasRestorableTurn(sessionManager.getBranch())).toBe(false);
 	});
 
+	it("row 8: leaves nothing to restore behind a /clear, even a turn whose key could not be resolved", () => {
+		// If this regresses, `--restore` relaunches a turn the user cleared. Without the marker the key-unresolved
+		// tail is never restorable at all, so the first check fails.
+		const keyUnresolved: AssistantMessage = {
+			...pendingAssistant,
+			content: [],
+			stopReason: "error",
+			errorMessage: "Retry budget exhausted after 2 retries: No API key for provider: anthropic",
+			credentialUnavailable: true,
+		};
+		for (const tail of [keyUnresolved, pendingAssistant]) {
+			const sessionManager = SessionManager.inMemory();
+			sessionManager.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });
+			sessionManager.appendMessage(tail);
+			expect(hasRestorableTurn(sessionManager.getBranch())).toBe(true);
+
+			sessionManager.appendResetBoundary();
+
+			const cleared = sessionManager.getBranch();
+			expect({ stopReason: tail.stopReason, restorable: hasRestorableTurn(cleared) }).toEqual({
+				stopReason: tail.stopReason,
+				restorable: false,
+			});
+			expect(createInterruptedTurnAbortMessage(cleared, undefined, { assumeExit: true })).toBeUndefined();
+			// After a normal exit too: a worker that exits on the cleared session has nothing to go on with.
+			sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+				reason: "manual exit",
+				kind: "normal",
+				recordedAt: "2026-07-11T02:20:08.800Z",
+			});
+			expect(hasRestorableTurn(sessionManager.getBranch())).toBe(false);
+		}
+	});
+
 	it("reconstructs a normal exit that reports pending tool calls", () => {
 		const sessionManager = SessionManager.inMemory();
 		sessionManager.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });
