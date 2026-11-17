@@ -5465,7 +5465,12 @@ export class SessionManager {
 	 * the id's ownership lease first, then asks `isHeld` whether a stored session already holds it,
 	 * and only then writes its header and records itself as the terminal's last session. So a second
 	 * launch under the id, in this process or another live one, finds it taken. Returns `undefined`,
-	 * having written nothing, when another live process owns the id or `isHeld` answers `true`.
+	 * having kept nothing, when another live process owns the id or `isHeld` answers `true`.
+	 *
+	 * A store with no ownership lease (`session.storage: sql`) cannot make that check atomic: another
+	 * launch under the id may pass it too. There each launch looks again once its own header is durable
+	 * in the shared store, and withdraws (deleting what it wrote) when another session is named for the
+	 * id, so at most one goes on; two that each see the other both withdraw.
 	 */
 	static async createWithSessionId(
 		cwd: string,
@@ -5478,9 +5483,34 @@ export class SessionManager {
 			await manager.close();
 			return undefined;
 		}
-		manager.#suppressBreadcrumb = false;
 		await manager.ensureOnDisk();
+		if (!manager.#storage.claimSession && (await manager.#anotherSessionNamesThisId())) {
+			const sessionFile = manager.#sessionFile;
+			await manager.close();
+			if (sessionFile) {
+				await manager.#storage.deleteSessionWithArtifacts(sessionFile);
+				// Durable before the refusal, so the launch that goes on never sees this one again.
+				await manager.#storage.drain();
+			}
+			return undefined;
+		}
+		manager.#suppressBreadcrumb = false;
+		if (manager.#sessionFile) manager.#rememberBreadcrumb(manager.#cwd, manager.#sessionFile);
 		return manager;
+	}
+
+	/**
+	 * Whether a stored session other than this one is named for this session's id, read from the
+	 * shared store once this manager's own writes are durable there.
+	 */
+	async #anotherSessionNamesThisId(): Promise<boolean> {
+		await this.#storage.drain();
+		await this.#storage.refresh?.();
+		const suffix = `_${this.#sessionId}.jsonl`;
+		const own = this.#sessionFile ? path.resolve(this.#sessionFile) : undefined;
+		// Key-indexed stores match only `*`, `*.ext` and exact names, so the id is matched here.
+		const files = this.#storage.listAllSync?.() ?? this.#storage.listFilesSync(this.#sessionDir, "*.jsonl");
+		return files.some(file => file.endsWith(suffix) && path.resolve(file) !== own);
 	}
 
 	/**

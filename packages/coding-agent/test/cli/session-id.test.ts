@@ -16,7 +16,12 @@ import { findArchivedSessionFiles } from "@oh-my-pi/pi-coding-agent/session/sess
 import { resolveResumableSession, resolveResumeTarget } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	defaultSessionStorage,
+	FileSessionStorage,
+	type SessionStorage,
+	setDefaultSessionStorage,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
@@ -278,6 +283,35 @@ describe("omp --session-id", () => {
 			"--restore",
 			SESSION_ID,
 		]);
+	});
+
+	it("lets only one of two concurrent launches under an id go on in SQL storage, which has no lease", async () => {
+		const storage = await sqlStorage();
+		const dir = path.resolve("/sessions/session-id-race");
+		const previous = defaultSessionStorage();
+		setDefaultSessionStorage(storage);
+		const isHeld = async () =>
+			(await resolveResumableSession(SESSION_ID, "/work", dir, storage, { exactId: true })) !== undefined;
+		let second: SessionManager | undefined;
+		try {
+			const first = await SessionManager.createWithSessionId("/work", dir, SESSION_ID, async () => {
+				const held = await isHeld();
+				// The competing launch runs whole between this launch's check and its first write.
+				second = await SessionManager.createWithSessionId("/work", dir, SESSION_ID, isHeld);
+				return held;
+			});
+			const accepted = [first, second].filter(manager => manager !== undefined);
+			try {
+				expect(accepted, "exactly one launch keeps the id").toHaveLength(1);
+				await storage.refresh?.();
+				const holders = storage.listFilesSync(dir, "*.jsonl").filter(file => file.endsWith(`_${SESSION_ID}.jsonl`));
+				expect(holders, "one stored session holds the id").toHaveLength(1);
+			} finally {
+				for (const manager of accepted) await manager.close();
+			}
+		} finally {
+			setDefaultSessionStorage(previous);
+		}
 	});
 });
 
