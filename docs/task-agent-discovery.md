@@ -329,7 +329,9 @@ environment, and stored API keys
 are not used; a `models.yml` `apiKey` for the provider fails the request instead of sending a pooled
 token to that endpoint. When no pooled account can serve, the request fails with `No API key for
 provider: … restricted to its OAuth account pool` instead of borrowing another account; an agent
-turn retries that failure with backoff, since a pooled account can come back. An empty
+turn retries that failure with backoff while one of the pool's accounts is stored and active, or was
+disabled by a failure and not removed or logged out since, because such an account can come back. A
+pool whose accounts the user removed or logged out fails at once and is not retried. An empty
 list allows no account. Saved resets about to expire are still salvaged on every account, because
 salvage serves the account that holds the reset. Pools do not pick models, so model and retry-fallback policy still decide
 which provider the child calls. The pool covers every key lookup the agent makes, whatever provider

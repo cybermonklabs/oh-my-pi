@@ -497,7 +497,9 @@ a revived agent's turn the lifecycle teardown disposes.
    background job of its parent, under the subagent's id. The lifecycle reviver
    rebuilds it from its transcript, the turn goes on as below, and the parent
    receives the result as the job's ordinary `async-result`, so a parent waiting on
-   that job finds it again.
+   that job finds it again. A subagent is judged by the branch its transcript
+   selects, as its own session reopens it: a turn on another branch (an abandoned
+   turn, or a `/clear` that was rolled back) does not count.
 2. **Then the session's own turn** (`AgentSession.restoreInterruptedTurn`). A turn
    cut off without a `session_exit` record (a crash, SIGKILL or power loss records
    none) is first closed the way exit recovery closes one whose exit was recorded:
@@ -514,8 +516,10 @@ nothing was sent, and a subagent's process exits normally on such a turn.
 
 Nothing else is continued when the last turn finished, failed, or the user interrupted
 it, or when a normal exit was recorded after it (the user quit with it
-interrupted). `--restore` is interactive only, takes no prompt, and cannot be
-combined with `--continue`, `--fork`, imports, `--goal` or `--no-session`.
+interrupted). Nothing behind a `/clear` is restored, not even a turn whose key
+could not be resolved: the user ended that conversation. `--restore` is
+interactive only, takes no prompt, and cannot be combined with `--continue`,
+`--fork`, imports, `--goal` or `--no-session`.
 `/restart` drops a launch `--restore` like the other one-shot selectors and adds
 its own for the current session.
 
