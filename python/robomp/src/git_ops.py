@@ -20,7 +20,7 @@ import os
 import platform
 import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -162,18 +162,53 @@ def _append_safe_directory(env: dict[str, str], repo_dir: Path) -> None:
     _append_git_config(env, "safe.directory", str(repo_dir))
 
 
-def _safe_directory_overlay(base: Mapping[str, str], repo_dir: Path) -> dict[str, str]:
-    """`GIT_CONFIG_*` overlay that appends ``safe.directory=<repo_dir>`` once merged over ``base``.
+def _is_inherited_git_config_key(name: str) -> bool:
+    """A variable that hands git config to a child: the `GIT_CONFIG_*` series or `GIT_CONFIG_PARAMETERS`."""
+    return name == "GIT_CONFIG_PARAMETERS" or _is_git_config_series_key(name)
 
-    For an env assembled as ``{**base, **overlay}`` (omp_rpc's child env), the
-    merge equals `_append_safe_directory` applied to ``base``, except that the
-    stale slots it drops are overlaid as empty strings: an overlay cannot remove
-    a key, and git reads nothing past the count.
+
+def _replace_git_config_with_safe_directory(env: dict[str, str], repo_dir: Path) -> None:
+    """Leave ``safe.directory=<repo_dir>`` as the only git config ``env`` hands a child.
+
+    For the commands that run code from the checkout: robomp's own series and
+    `GIT_CONFIG_PARAMETERS` can carry a credential helper or an
+    `http.extraHeader`, which must not reach them.
     """
-    series = {name: value for name, value in base.items() if _is_git_config_series_key(name)}
-    appended = dict(series)
-    _append_safe_directory(appended, repo_dir)
-    return {**dict.fromkeys(series.keys() - appended.keys(), ""), **appended}
+    for name in [name for name in env if _is_inherited_git_config_key(name)]:
+        del env[name]
+    _append_safe_directory(env, repo_dir)
+
+
+def _safe_directory_overlay(base: Mapping[str, str], repo_dir: Path) -> dict[str, str]:
+    """Overlay that leaves ``safe.directory=<repo_dir>`` as the only git config once merged over ``base``.
+
+    For the agent's env, which omp_rpc assembles as ``{**base, **overlay}``: the
+    agent runs code from the checkout, so robomp's own series and
+    `GIT_CONFIG_PARAMETERS` (a credential helper, an `http.extraHeader`) must
+    not reach it. An overlay cannot remove a key, so each inherited one is
+    blanked; git reads no slot past the count and no config from an empty
+    `GIT_CONFIG_PARAMETERS`.
+    """
+    overlay = dict.fromkeys((name for name in base if _is_inherited_git_config_key(name)), "")
+    overlay.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": str(repo_dir)})
+    return overlay
+
+
+def _global_git_config_overlay(base: Mapping[str, str], agent_home: Path | None) -> dict[str, str]:
+    """`GIT_CONFIG_GLOBAL` overlay for a process that runs code from the checkout.
+
+    With no agent home the process keeps robomp's HOME, so git would read the
+    operator's `~/.gitconfig`, a credential helper included: it reads an empty
+    file instead. With an agent home git reads that home's own config, unless
+    ``base`` (robomp's env) names a global file of its own, which would replace
+    it; an overlay cannot unset the variable, so it names the agent home's
+    `~/.gitconfig` instead.
+    """
+    if agent_home is None:
+        return {"GIT_CONFIG_GLOBAL": os.devnull}
+    if "GIT_CONFIG_GLOBAL" in base:
+        return {"GIT_CONFIG_GLOBAL": str(agent_home / ".gitconfig")}
+    return {}
 
 
 def _local_remote_safe_directory(remote_url: str, *, cwd: Path) -> Path | None:
@@ -463,21 +498,73 @@ def _worktrees_holding_refs(repo_dir: Path, refs: tuple[str, ...]) -> dict[str, 
     return by_ref
 
 
+def _parent_real_path(path: str | Path) -> str:
+    """``path`` made absolute, with its parent directories resolved through symlinks and its last part kept as is."""
+    head, tail = os.path.split(os.path.abspath(path))
+    return os.path.join(os.path.realpath(head), tail)
+
+
+def _drop_worktree_registration(
+    checkout: Path, run: Callable[[list[str]], subprocess.CompletedProcess[str]]
+) -> subprocess.CompletedProcess[str] | None:
+    """Drop the registration of ``checkout`` once its directory is gone.
+
+    ``run`` runs `git <args>` in the pool. `git worktree remove --force --force
+    <path>` drops exactly that registration, locked or not (a `git` wrapper on
+    PATH may lock every `git worktree add`), with its checkout already deleted,
+    and leaves every other registration alone (measured on git 2.39.5 and
+    2.43.0). It replaces `git worktree prune`, which keeps locked
+    registrations, acts on the whole pool, and which such a wrapper may refuse.
+
+    Nothing is dropped while anything is left at ``checkout``: git would follow
+    a link there into another worktree. The registration is found among the
+    pool's by its absolute path, parents resolved, never its last part (a
+    relative path would resolve from the pool), and handed to git as git listed
+    it. Returns None when there was nothing to drop; otherwise the listing's
+    result when it failed, else the removal's, which callers check.
+    """
+    target = _parent_real_path(checkout)
+    if os.path.lexists(target):
+        return None
+    listed = run(["worktree", "list", "--porcelain"])
+    if listed.returncode != 0:
+        return listed
+    for line in listed.stdout.splitlines():
+        registered = line.removeprefix("worktree ")
+        if registered != line and _parent_real_path(registered) == target:
+            return run(["worktree", "remove", "--force", "--force", registered])
+    return None
+
+
 def _remove_worktrees(repo_dir: Path, paths: list[str]) -> None:
+    """Remove the worktrees holding a bad ref, and drop each one's registration.
+
+    `git worktree remove --force` deletes a checkout with its registration but
+    refuses a locked one, and a killed remove can leave the registration
+    behind. Once a checkout is gone its registration is dropped exactly, and a
+    failed drop raises: a registration left behind keeps holding the ref, and
+    the next fetch fails the same way. A checkout still present after a failed
+    remove is left as it is and logged.
+    """
+
+    def run(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return _run_git(args, cwd=repo_dir, token=None)
+
     for path in paths:
-        proc = _run_git(["worktree", "remove", "--force", path], cwd=repo_dir, token=None)
-        if proc.returncode != 0:
+        removed = run(["worktree", "remove", "--force", path])
+        dropped = _drop_worktree_registration(Path(path), run)
+        if dropped is not None:
+            _check(dropped, list(dropped.args))
+        if removed.returncode != 0 and os.path.lexists(path):
             log.warning(
                 "failed to remove worktree during fetch repair",
-                extra={"repo_dir": str(repo_dir), "worktree": path, "stderr": proc.stderr[:500]},
+                extra={"repo_dir": str(repo_dir), "worktree": path, "stderr": removed.stderr[:500]},
             )
             continue
         log.warning(
             "removed worktree during fetch repair",
             extra={"repo_dir": str(repo_dir), "worktree": path},
         )
-    if paths:
-        _run_git(["worktree", "prune"], cwd=repo_dir, token=None)
 
 
 def _delete_bad_refs(repo_dir: Path, output: str) -> bool:

@@ -390,16 +390,8 @@ async def test_run_rpc_uses_workspace_xdg_dirs_without_slot(tmp_path: Path, sett
     assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
 
 
-@pytest.mark.asyncio
-async def test_run_rpc_appends_safe_directory_after_inherited_git_config(
-    tmp_path: Path,
-    settings: Settings,
-    git_config: GitConfigSeries,
-    inherited_git_config: list[tuple[str, str]],
-) -> None:
-    # omp_rpc starts the agent with `{**os.environ, **env}`: the user's own
-    # GIT_CONFIG_* entries reach the agent ahead of robomp's safe.directory, and
-    # no slot is left past the count.
+def _agent_env(tmp_path: Path, settings: Settings) -> tuple[dict[str, str], worker.TaskInputs]:
+    """Run a triage turn against the fake client; return the env the agent starts with."""
     inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False, slot_uid=None)
     loop = asyncio.new_event_loop()
     try:
@@ -412,13 +404,58 @@ async def test_run_rpc_appends_safe_directory_after_inherited_git_config(
         )
     finally:
         loop.close()
+    # omp_rpc starts the agent with `{**os.environ, **env}`.
+    return {**os.environ, **_FakeRpcClient.instances[0].kwargs["env"]}, inputs
 
-    agent_env = {**os.environ, **_FakeRpcClient.instances[0].kwargs["env"]}
-    assert git_config.entries(agent_env) == [
-        *inherited_git_config,
-        ("safe.directory", str(inputs.workspace.repo_dir)),
-    ]
+
+@pytest.mark.asyncio
+async def test_run_rpc_replaces_inherited_git_config_with_safe_directory(
+    tmp_path: Path,
+    settings: Settings,
+    git_config: GitConfigSeries,
+    inherited_git_config: list[tuple[str, str]],
+) -> None:
+    # The agent runs code from the checkout: robomp's own series never reaches
+    # it, and no slot is left past the count.
+    agent_env, inputs = _agent_env(tmp_path, settings)
+
+    assert git_config.entries(agent_env) == [("safe.directory", str(inputs.workspace.repo_dir))]
     assert git_config.past_count(agent_env) == {}
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_keeps_inherited_credential_config_from_the_agent(
+    tmp_path: Path, settings: Settings, git_config: GitConfigSeries, inherited_credentials: str
+) -> None:
+    # robomp's own git config names a credential helper and an Authorization
+    # header; git, run in the agent's env, must see neither.
+    agent_env, inputs = _agent_env(tmp_path, settings)
+
+    assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the inherited config"
+    assert git_config.credentials(agent_env, tmp_path) == []
+    assert git_config.entries(agent_env) == [("safe.directory", str(inputs.workspace.repo_dir))]
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_keeps_the_operator_global_git_config_from_the_agent(
+    tmp_path: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    operator_git_config: str,
+    agent_home: Path,
+) -> None:
+    # robomp's HOME holds the operator's global git config, a credential helper
+    # included. With no agent home the agent keeps that HOME and must read an
+    # empty global config; with one it reads the agent home's own config only.
+    monkeypatch.setattr(worker, "_AGENT_HOME", agent_home)
+
+    agent_env, _ = _agent_env(tmp_path, settings)
+
+    assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the operator's config"
+    assert git_config.credentials(agent_env, tmp_path) == []
+    expected_user = git_config.AGENT_HOME_USER if agent_home.is_dir() else None
+    assert git_config.get(agent_env, tmp_path, "user.name") == expected_user
 
 
 @pytest.mark.asyncio

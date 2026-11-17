@@ -36,7 +36,7 @@ from robomp import host_tools, persona, pragmas
 from robomp.cancellation import register_cancel_hook, unregister_cancel_hook
 from robomp.config import Settings
 from robomp.db import Database, issue_key
-from robomp.git_ops import DirtyState, _safe_directory_overlay, inspect_dirty_state
+from robomp.git_ops import DirtyState, _global_git_config_overlay, _safe_directory_overlay, inspect_dirty_state
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import CommentInfo, IssueInfo, PullRequestInfo, RepoInfo
 from robomp.host_tools import AbortController, ReleaseToolContext, ToolBindings, _git_identity_env
@@ -242,8 +242,12 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     # (x-omp-app) so broker-side per-client burn tracking shows `robomp`
     # instead of an anonymous gateway client.
     env["OMP_APP_NAME"] = "robomp"
-    if _AGENT_HOME.is_dir():
-        env["HOME"] = str(_AGENT_HOME)
+    agent_home = _AGENT_HOME if _AGENT_HOME.is_dir() else None
+    if agent_home is not None:
+        env["HOME"] = str(agent_home)
+    # Without an agent home the agent keeps robomp's HOME: the operator's
+    # ~/.gitconfig, credential helper included, must not reach it.
+    env.update(_global_git_config_overlay(os.environ, agent_home))
     return env
 
 
@@ -595,7 +599,8 @@ def _run_rpc_blocking(
 
     rpc_env = _build_extra_env(settings)
     rpc_env.update(_prepare_slot_runtime_env(inputs.workspace, inputs.slot_uid))
-    # omp_rpc starts the agent with `{**os.environ, **rpc_env}`.
+    # omp_rpc starts the agent with `{**os.environ, **rpc_env}`; the overlay
+    # blanks robomp's own git config env and leaves only safe.directory.
     rpc_env.update(_safe_directory_overlay(os.environ, bindings.workspace.repo_dir))
     rpc_env.update(_git_identity_env(inputs.settings.resolved_author_name, inputs.settings.git_author_email))
     # Bare worktrees have no node_modules; install (idempotently) so the agent

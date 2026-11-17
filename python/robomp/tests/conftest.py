@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
@@ -16,25 +17,42 @@ from robomp.db import Database, close_database
 _GIT_CONFIG_SLOT = re.compile(r"GIT_CONFIG_(?:KEY|VALUE)_(\d+)")
 
 
-def _is_git_config_series_key(key: str) -> bool:
-    return key == "GIT_CONFIG_COUNT" or _GIT_CONFIG_SLOT.fullmatch(key) is not None
-
-
 @pytest.fixture(autouse=True)
-def _no_inherited_git_config_series(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run every test without the shell's GIT_CONFIG_COUNT/KEY_<n>/VALUE_<n> series.
+def _no_inherited_git_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every test without the shell's git environment or the machine's git config.
 
-    robomp appends its own git config entries after an inherited series, so a
-    series the developer's shell exports (an agent session exports one) would
-    move them. A test that needs an inherited series sets it with `git_config`.
+    Every inherited `GIT_*` variable is dropped: the `GIT_CONFIG_COUNT`/`KEY_<n>`/
+    `VALUE_<n>` series (an agent session exports one), `GIT_CONFIG_PARAMETERS`
+    (`git -c` hands it to git's children), `GIT_CONFIG`, and the variables that
+    move git elsewhere (`GIT_DIR`, `GIT_INDEX_FILE`, which a git hook exports).
+    The global and system config files are then replaced by an empty one, so
+    `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` and `/etc/gitconfig` are not
+    read either. A test that needs git config sets it itself (`git_config`, or
+    its own `GIT_CONFIG_SYSTEM`, after dropping `GIT_CONFIG_NOSYSTEM`).
     """
     for key in list(os.environ):
-        if _is_git_config_series_key(key):
+        if key.startswith("GIT_"):
             monkeypatch.delenv(key)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+# Included through an inherited channel, this file gives git a credential helper
+# and an Authorization header, as a developer's or an agent session's config can.
+_CREDENTIAL_INCLUDE = (
+    '[credential "https://github.com/"]\n'
+    "\thelper = !probe-helper\n"
+    "[http]\n"
+    "\textraHeader = Authorization: Basic PROBE-SECRET\n"
+)
 
 
 class GitConfigSeries:
     """Sets an inherited GIT_CONFIG_* series in os.environ and reads one back from an env."""
+
+    # `user.name` in the `agent_home` fixture's own `~/.gitconfig`.
+    AGENT_HOME_USER = "agent-home-user"
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._monkeypatch = monkeypatch
@@ -68,6 +86,38 @@ class GitConfigSeries:
             if (match := _GIT_CONFIG_SLOT.fullmatch(key)) and int(match.group(1)) >= count and value
         }
 
+    def inherit_credentials(self, include: Path, *, channel: str) -> None:
+        """Export git config that includes a credential helper and an `http.extraHeader`.
+
+        ``channel`` is `series` (`GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`) or
+        `parameters` (`GIT_CONFIG_PARAMETERS`, as `git -c` exports it).
+        """
+        include.write_text(_CREDENTIAL_INCLUDE, encoding="utf-8")
+        if channel == "series":
+            self._monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+            self._monkeypatch.setenv("GIT_CONFIG_KEY_0", "include.path")
+            self._monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(include))
+        elif channel == "parameters":
+            self._monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'include.path'='{include}'")
+        else:
+            raise ValueError(f"unknown git config channel {channel!r}")
+
+    @staticmethod
+    def credentials(env: Mapping[str, str], cwd: Path) -> list[str]:
+        """The credential helpers and `http.extraHeader` values git reads under ``env``."""
+        listed = subprocess.run(
+            ["git", "config", "--list"], cwd=cwd, env=dict(env), capture_output=True, text=True, check=True
+        ).stdout
+        return [
+            line for line in listed.splitlines() if line.partition("=")[0].lower().endswith((".helper", ".extraheader"))
+        ]
+
+    @staticmethod
+    def get(env: Mapping[str, str], cwd: Path, key: str) -> str | None:
+        """The value git reads for ``key`` under ``env``, or None."""
+        got = subprocess.run(["git", "config", "--get", key], cwd=cwd, env=dict(env), capture_output=True, text=True)
+        return got.stdout.strip() if got.returncode == 0 else None
+
 
 @pytest.fixture
 def git_config(monkeypatch: pytest.MonkeyPatch) -> GitConfigSeries:
@@ -82,6 +132,44 @@ def inherited_git_config(request: pytest.FixtureRequest, git_config: GitConfigSe
     """An inherited series of 1, of 3, and of 1 with stray slots 1 and 4 left past its count."""
     count, stale = request.param
     return git_config.inherit(count, stale=stale)
+
+
+@pytest.fixture(params=["series", "parameters"])
+def inherited_credentials(request: pytest.FixtureRequest, git_config: GitConfigSeries, tmp_path: Path) -> str:
+    """Inherited git config, through ``request.param``'s channel, that names a credential helper."""
+    git_config.inherit_credentials(tmp_path / "credentials.gitconfig", channel=request.param)
+    return request.param
+
+
+@pytest.fixture(params=["home", "global-file"])
+def operator_git_config(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
+    """robomp runs with an operator's HOME whose global git config names a credential helper.
+
+    `home` keeps it in `$HOME/.gitconfig`, where git finds it with
+    `GIT_CONFIG_GLOBAL` unset; `global-file` names another file with it.
+    """
+    home = tmp_path / "operator-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    if request.param == "home":
+        (home / ".gitconfig").write_text(_CREDENTIAL_INCLUDE, encoding="utf-8")
+        monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+    else:
+        config = home / "operator.gitconfig"
+        config.write_text(_CREDENTIAL_INCLUDE, encoding="utf-8")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    return request.param
+
+
+@pytest.fixture(params=["no-agent-home", "agent-home"])
+def agent_home(request: pytest.FixtureRequest, tmp_path: Path) -> Path:
+    """The agent home robomp would use: missing, or present with its own `~/.gitconfig`."""
+    home = tmp_path / "agent-home"
+    if request.param == "agent-home":
+        home.mkdir()
+        user = GitConfigSeries.AGENT_HOME_USER
+        (home / ".gitconfig").write_text(f"[user]\n\tname = {user}\n", encoding="utf-8")
+    return home
 
 
 # Minimum HTML the dashboard handler needs to render: `<title>` plus a script

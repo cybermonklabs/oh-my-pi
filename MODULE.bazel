@@ -194,9 +194,10 @@ crate.from_cargo(
 # build-script PATH, which --incompatible_strict_action_env leaves to these
 # annotations. @cmake_ninja is the exec host's copy of the CMake and Ninja
 # releases the omp-ci template pins: its bin/ goes first on that PATH and its
-# files are the build script's tools, so the scripts run the same tools from the
-# same exec-root path on every machine, wherever (or whether) the host installed
-# its own. The system dirs after it stay for whatever else the scripts spawn.
+# files are the build script's tools, so the scripts run the same cmake and
+# ninja from the same exec-root path on every machine, wherever (or whether) the
+# host installed its own. The system dirs after it stay for the other tools the
+# scripts and cmake look up (binutils, and a compiler no cc toolchain names).
 # The PATH entry and the tools label name the canonical repo
 # (`+<repo rule>+<name>`, as for @msvc_cc below): keep them in sync if the rule
 # or the repo is ever renamed.

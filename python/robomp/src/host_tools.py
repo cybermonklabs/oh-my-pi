@@ -24,7 +24,12 @@ from omp_rpc import HostTool, HostToolContext, RpcCommandError, host_tool
 from robomp import persona
 from robomp.config import Settings
 from robomp.db import Database, IssueState, issue_key
-from robomp.git_ops import GitCommandError, HeadDriftError, _append_safe_directory
+from robomp.git_ops import (
+    GitCommandError,
+    HeadDriftError,
+    _global_git_config_overlay,
+    _replace_git_config_with_safe_directory,
+)
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import GitHubError, IssueInfo, PullRequestFileInfo, RepoInfo
 from robomp.issue_index import parse_search_query
@@ -243,17 +248,23 @@ def _repo_command_env(bindings: ToolBindings) -> dict[str, str]:
     """Environment for repo-owned commands (`bun`, formatter, local git).
 
     These commands execute code from the checked-out repository, so they must
-    not inherit GitHub credentials from the orchestrator. They also need the
-    exact same HOME/XDG/TMP/Bun cache paths as the agent process; otherwise
-    host-side pre-publish gates validate a different machine than the agent saw.
+    not inherit robomp's GitHub credentials, nor robomp's own git config: the
+    `GIT_CONFIG_*` series and `GIT_CONFIG_PARAMETERS` (the only entry they get
+    is `safe.directory`), and the operator's `~/.gitconfig` when there is no
+    agent home; each can carry a credential helper or an `http.extraHeader`.
+    They also need the exact same HOME/XDG/TMP/Bun cache paths and git config as
+    the agent process; otherwise host-side pre-publish gates validate a
+    different machine than the agent saw.
     """
     env = os.environ.copy()
     for key in _REPO_COMMAND_SCRUBBED_ENV_KEYS:
         env[key] = ""
-    if _AGENT_HOME.is_dir():
-        env["HOME"] = str(_AGENT_HOME)
+    agent_home = _AGENT_HOME if _AGENT_HOME.is_dir() else None
+    if agent_home is not None:
+        env["HOME"] = str(agent_home)
+    env.update(_global_git_config_overlay(os.environ, agent_home))
     env.update(_prepare_slot_runtime_env(bindings.workspace, bindings.slot_uid))
-    _append_safe_directory(env, bindings.workspace.repo_dir)
+    _replace_git_config_with_safe_directory(env, bindings.workspace.repo_dir)
     env.update(_git_identity_env(bindings.author_name, bindings.author_email))
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env

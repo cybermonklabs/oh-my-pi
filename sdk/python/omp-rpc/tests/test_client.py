@@ -734,7 +734,6 @@ V2_MESSAGES_SERVER = textwrap.dedent(
     """
     import base64
     import json
-    import os
     import sys
 
     message = {
@@ -795,7 +794,7 @@ V2_MESSAGES_SERVER = textwrap.dedent(
                 }
             )
         elif command_type == "get_messages_page":
-            if os.environ.get("V2_MESSAGES_BUSY") == "1":
+            if "busy" in sys.argv[1:]:
                 emit(
                     {
                         "id": request_id,
@@ -807,7 +806,7 @@ V2_MESSAGES_SERVER = textwrap.dedent(
                     }
                 )
                 continue
-            if os.environ.get("V2_MESSAGES_STALE") == "1":
+            if "stale" in sys.argv[1:]:
                 if command.get("cursor") is not None:
                     emit(
                         {
@@ -1140,13 +1139,23 @@ FORWARD_COMPAT_SERVER = textwrap.dedent(
 
 
 class RpcClientTests(unittest.TestCase):
-    def make_client(self, server: str = FAKE_SERVER, **kwargs: object) -> RpcClient:
+    def make_client(
+        self,
+        server: str = FAKE_SERVER,
+        *,
+        server_args: tuple[str, ...] = (),
+        **kwargs: object,
+    ) -> RpcClient:
+        # A fake server takes its mode from its own arguments, never from the
+        # environment, which the test inherits from whoever runs it.
         options: dict[str, object] = {
             "startup_timeout": 2.0,
             "request_timeout": 2.0,
             **kwargs,
         }
-        return RpcClient(command=[sys.executable, "-u", "-c", server], **options)
+        return RpcClient(
+            command=[sys.executable, "-u", "-c", server, *server_args], **options
+        )
 
     def test_ask_answers_reach_the_wire_in_question_order(self) -> None:
         with self.make_client() as client:
@@ -1919,7 +1928,7 @@ class RpcClientTests(unittest.TestCase):
 
     def test_protocol_v2_get_messages_falls_back_to_streaming_snapshot(self) -> None:
         with self.make_client(
-            server=V2_MESSAGES_SERVER, env={"V2_MESSAGES_BUSY": "1"}
+            server=V2_MESSAGES_SERVER, server_args=("busy",)
         ) as client:
             with self.assertRaisesRegex(
                 RpcCommandError, "Cannot page messages while the session is changing"
@@ -1932,7 +1941,7 @@ class RpcClientTests(unittest.TestCase):
 
     def test_protocol_v2_get_messages_discards_stale_page_walk(self) -> None:
         with self.make_client(
-            server=V2_MESSAGES_SERVER, env={"V2_MESSAGES_STALE": "1"}
+            server=V2_MESSAGES_SERVER, server_args=("stale",)
         ) as client:
             with self.assertRaisesRegex(RpcCommandError, "RPC message cursor is stale"):
                 client.get_messages_page(cursor="page-two")

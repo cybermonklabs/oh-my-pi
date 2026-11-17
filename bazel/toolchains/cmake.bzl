@@ -10,7 +10,14 @@ only where some machine happened to install them (not under mise, asdf, a nix
 profile or ~/.local/bin). This repo is the exec host's own copy instead: the
 same CMake and Ninja releases the omp-ci template pins
 (infra/vmon/omp_ci_template.py), at one exec-root path on every machine, so the
-build-script actions read the same tools and key the same everywhere.
+build-script actions run the same cmake and ninja and key the same everywhere.
+The other tools cmake looks up (the binutils, and the compiler where no Bazel
+cc toolchain names one) still come from the system dirs on that PATH.
+
+These are the upstream release binaries, so the exec host needs what they need:
+glibc 2.17 for linux-x64 CMake and 2.28 for linux-arm64 CMake, and glibc 2.15
+plus a libstdc++ with GLIBCXX_3.4.21 for linux-x64 Ninja (centos:7's is too
+old). A musl host (alpine) runs none of them.
 
     bin/cmake, bin/ninja   the executables the annotations put first on PATH
     share/cmake-<minor>/   CMake's module tree (Help/ pruned), which cmake

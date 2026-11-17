@@ -27,8 +27,8 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "respx>=0.21",
-  # Exact: `bun run lint:py` and `fix:py` run this ruff (`python3 -m ruff`),
-  # so their result does not depend on the ruff a machine has on PATH.
+  # Exact: `bun run lint:py` and `fix:py` (scripts/ruff.ts) read this pin and
+  # refuse a `python3 -m ruff` of any other version, or none.
   "ruff==0.17.5",
 ]
 

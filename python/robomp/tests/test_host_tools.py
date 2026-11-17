@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -156,19 +157,59 @@ def test_repo_command_env_scrubs_secrets_and_uses_workspace_cache(
     assert (bindings.workspace.root / ".omp-tmp").is_dir()
 
 
-def test_repo_command_env_appends_safe_directory_after_inherited_git_config(
+def test_repo_command_env_replaces_inherited_git_config_with_safe_directory(
     db: Database, tmp_path: Path, git_config: GitConfigSeries, inherited_git_config: list[tuple[str, str]]
 ) -> None:
-    # The user's own GIT_CONFIG_* entries stay ahead of safe.directory, and no
-    # slot is left past the count.
+    # Repo commands run code from the checkout: robomp's own series never
+    # reaches them, and no slot is left past the count.
     bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
     try:
         env = host_tools._repo_command_env(bindings)
     finally:
         _stop_loop(loop, thread)
 
-    assert git_config.entries(env) == [*inherited_git_config, ("safe.directory", str(bindings.workspace.repo_dir))]
+    assert git_config.entries(env) == [("safe.directory", str(bindings.workspace.repo_dir))]
     assert git_config.past_count(env) == {}
+
+
+def test_repo_command_env_keeps_inherited_credential_config_out(
+    db: Database, tmp_path: Path, git_config: GitConfigSeries, inherited_credentials: str
+) -> None:
+    # robomp's own git config names a credential helper and an Authorization
+    # header; git, run in a repo command's env, must see neither.
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the inherited config"
+    assert git_config.credentials(env, tmp_path) == []
+    assert git_config.entries(env) == [("safe.directory", str(bindings.workspace.repo_dir))]
+
+
+def test_repo_command_env_keeps_the_operator_global_git_config_out(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    operator_git_config: str,
+    agent_home: Path,
+) -> None:
+    # robomp's HOME holds the operator's global git config, a credential helper
+    # included. With no agent home a repo command keeps that HOME and must read
+    # an empty global config; with one it reads the agent home's own config only.
+    monkeypatch.setattr(host_tools, "_AGENT_HOME", agent_home)
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the operator's config"
+    assert git_config.credentials(env, tmp_path) == []
+    expected_user = git_config.AGENT_HOME_USER if agent_home.is_dir() else None
+    assert git_config.get(env, tmp_path, "user.name") == expected_user
 
 
 def test_run_repo_command_uses_slot_identity_kwargs(

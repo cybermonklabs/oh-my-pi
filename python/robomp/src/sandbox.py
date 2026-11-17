@@ -57,6 +57,7 @@ from robomp.git_ops import (
     GitCommandError,
     PushResult,
     _append_safe_directory,
+    _drop_worktree_registration,
     redact_credentials,
 )
 from robomp.git_ops import (
@@ -385,18 +386,14 @@ def _run(
     return proc
 
 
-def _prune_deleted_worktree(pool: Path, repo_dir: Path) -> subprocess.CompletedProcess[str]:
-    """Drop the pool's registration of ``repo_dir`` after its checkout was deleted.
+def _drop_deleted_worktree(pool: Path, repo_dir: Path) -> subprocess.CompletedProcess[str] | None:
+    """Drop the pool's registration of ``repo_dir`` once its checkout is gone.
 
-    `git worktree prune` keeps a locked registration, and the lock need not be
-    ours: a `git` wrapper on PATH may add `--lock` to every `git worktree add`.
-    The checkout is this workspace's and already gone, so its lock protects
-    nothing and would only make the next add at this path fail; unlock it
-    first. The unlock exits non-zero, harmlessly, when the registration is not
-    locked or not there; the prune's result is the one callers check.
+    A failed remove or add leaves the registration behind, and the next add at
+    this path then fails. See `git_ops._drop_worktree_registration` for how the
+    one registration is found and dropped, and what is returned.
     """
-    _safe_run(["git", "worktree", "unlock", str(repo_dir)], cwd=pool)
-    return _safe_run(["git", "worktree", "prune"], cwd=pool)
+    return _drop_worktree_registration(repo_dir, lambda args: _safe_run(["git", *args], cwd=pool))
 
 
 def _worktree_add(add_cmd: list[str], *, pool: Path, repo_dir: Path) -> None:
@@ -406,20 +403,19 @@ def _worktree_add(add_cmd: list[str], *, pool: Path, repo_dir: Path) -> None:
     GitCommandError 124, or any nonzero git failure) can leave a partial
     checkout at `repo_dir` and/or a dangling pool worktree registration. Left
     behind, the event retry hits stale metadata and fails again on the same
-    path. Best-effort remove the checkout and prune the pool, then re-raise so the
-    retry starts from a clean path. If the prune itself fails (incl. a 124
-    timeout), raise that instead — chained from the add error — since a
-    dangling registration left behind is exactly what poisons the retry.
+    path. Best-effort remove the checkout and drop its registration, then
+    re-raise so the retry starts from a clean path. If dropping the
+    registration itself fails (incl. a 124 timeout), raise that instead —
+    chained from the add error — since a dangling registration left behind is
+    exactly what poisons the retry.
     """
     try:
         _run(add_cmd, cwd=pool)
     except GitCommandError as add_err:
         shutil.rmtree(repo_dir, ignore_errors=True)
-        pruned = _prune_deleted_worktree(pool, repo_dir)
-        if pruned.returncode != 0:
-            raise GitCommandError(
-                ["git", "worktree", "prune"], pruned.returncode, pruned.stdout, pruned.stderr
-            ) from add_err
+        dropped = _drop_deleted_worktree(pool, repo_dir)
+        if dropped is not None and dropped.returncode != 0:
+            raise GitCommandError(list(dropped.args), dropped.returncode, dropped.stdout, dropped.stderr) from add_err
         raise
 
 
@@ -807,11 +803,13 @@ class SandboxManager:
         transport: GitTransport | None = None,
         natives_cache: NativesCache | None = None,
     ) -> None:
-        self.root = root
-        self.pool = root / "_pool"
+        # Absolute: every worktree is added with the pool as git's cwd, where a
+        # relative path would put it inside the pool.
+        self.root = root.absolute()
+        self.pool = self.root / "_pool"
         self.transport: GitTransport = transport or LocalGitTransport(token=None)
         self.natives_cache = natives_cache
-        root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True)
         self.pool.mkdir(parents=True, exist_ok=True)
         self._repo_locks: dict[str, threading.RLock] = {}
         self._repo_locks_guard = threading.Lock()
@@ -1152,31 +1150,36 @@ class SandboxManager:
             # dangling, which fails the next `git worktree add` for this path.
             # Only run git in a REAL pool clone: `ensure_clone` mkdir's the pool
             # dir BEFORE cloning, so a failed first clone can leave a non-git dir
-            # here, and `git worktree prune` in it would error. Mirror
-            # `ensure_clone`'s own `.git`/`HEAD` validity check.
+            # here, and git in it would error. Mirror `ensure_clone`'s own
+            # `.git`/`HEAD` validity check.
             if (pool / ".git").exists() or (pool / "HEAD").exists():
-                needs_prune = False
-                if repo_dir.exists():
+                needs_drop = False
+                if repo_dir.is_symlink():
+                    # The checkout was replaced by a link (the workspace is the
+                    # agent's to change). `git worktree remove` would follow it
+                    # into whatever it names, another workspace's checkout
+                    # included: drop the link, then this path's registration.
+                    repo_dir.unlink()
+                    needs_drop = True
+                elif repo_dir.exists():
                     removed = _safe_run(["git", "worktree", "remove", "--force", str(repo_dir)], cwd=pool)
                     if removed.returncode != 0:
                         shutil.rmtree(repo_dir, ignore_errors=True)
-                        needs_prune = True
+                        needs_drop = True
                 elif ws_root.exists():
                     # Checkout gone but the workspace root remains -> a prior op
                     # was killed mid-flight and may have left a dangling
                     # registration. A fully-cleaned workspace has no ws_root, so
-                    # a plain repeat close prunes nothing.
-                    needs_prune = True
-                if needs_prune:
-                    pruned = _prune_deleted_worktree(pool, repo_dir)
-                    if pruned.returncode != 0:
-                        # Prune is the step that clears the dangling registration.
+                    # a plain repeat close runs no git at all.
+                    needs_drop = True
+                if needs_drop:
+                    dropped = _drop_deleted_worktree(pool, repo_dir)
+                    if dropped is not None and dropped.returncode != 0:
+                        # Dropping the registration is the step that clears it.
                         # If it fails (incl. a 124 timeout), report it so the
                         # cleanup event retries instead of recording success with
                         # stale metadata still blocking the next add.
-                        raise GitCommandError(
-                            ["git", "worktree", "prune"], pruned.returncode, pruned.stdout, pruned.stderr
-                        )
+                        raise GitCommandError(list(dropped.args), dropped.returncode, dropped.stdout, dropped.stderr)
             if ws_root.exists():
                 shutil.rmtree(ws_root, ignore_errors=True)
 
