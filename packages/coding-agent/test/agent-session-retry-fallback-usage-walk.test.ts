@@ -551,6 +551,38 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(last.errorMessage).toBe(`Retry budget exhausted after 0 retries: ${SERVER_ERROR}`);
 		});
 
+		it("ends the turn on the spent retry budget when the spent fallback's own chain names an alias of the failing primary", async () => {
+			// `pi/default` resolves to the primary, which each failure puts in
+			// cooldown. The search from the spent fallback passes over the alias,
+			// so the walk makes no switch and the budget ends the turn: the first
+			// request, then the two retries it allows.
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createWalkAgent(PRIMARY, requestedModels, model => providerErrorStream(model, SERVER_ERROR, 500)),
+				walkSettings(PRIMARY, {
+					"retry.maxRetries": 2,
+					"retry.fallbackChains": {
+						default: [formatModelString(FALLBACK)],
+						[formatModelString(FALLBACK)]: ["pi/default"],
+					},
+				}),
+			);
+
+			await runTurn(run.session, "Fail on the primary");
+
+			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
+				formatModelString(PRIMARY),
+				formatModelString(PRIMARY),
+			]);
+			expect(run.fallbacks).toEqual([]);
+			expect(modelOf(run.session)).toBe(formatModelString(PRIMARY));
+			const last = lastAssistant(run.session);
+			expect(last.stopReason).toBe("error");
+			expect(last.errorMessage).toBe(`Retry budget exhausted after 2 retries: ${SERVER_ERROR}`);
+		});
+
 		it("switches to no fallback when the session is aborted during the usage read of a fallback", async () => {
 			const readStarted = Promise.withResolvers<void>();
 			stubUsageReads({

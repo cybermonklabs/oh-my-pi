@@ -5,6 +5,7 @@
 ### Fixed
 
 - With `retry.usageAwareFallback` on, the fallback walk after a failed request no longer sends the request to a model whose usage is spent
+- A fallback entry that is an alias of a model in cooldown, such as `pi/default`, is now passed over, so a turn whose model keeps failing ends within its retry budget instead of retrying without end
 
 ## [18.18.6] - 2026-11-09
 
