@@ -3,6 +3,7 @@
  * session's subagents after `/new` or a session switch, but the Agent Hub
  * roster only lists the current session's tree.
  */
+import { SQL } from "bun";
 import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -13,6 +14,8 @@ import { createAgentHubRuntime } from "@oh-my-pi/pi-coding-agent/modes/agent-hub
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { copySessionArtifacts } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { type AgentHubRemote, AgentHubOverlayComponent } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -20,6 +23,7 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 describe("Agent Hub session scope", () => {
 	let dir: string;
 	const hubs: AgentHubOverlayComponent[] = [];
+	const clients: SQL[] = [];
 
 	beforeAll(async () => {
 		await initTheme();
@@ -28,6 +32,7 @@ describe("Agent Hub session scope", () => {
 	afterEach(async () => {
 		for (const hub of hubs.splice(0)) hub.dispose();
 		AgentRegistry.resetGlobalForTests();
+		for (const client of clients.splice(0)) await client.end();
 		if (dir) await fs.rm(dir, { recursive: true, force: true });
 	});
 
@@ -38,14 +43,22 @@ describe("Agent Hub session scope", () => {
 	/**
 	 * Render a hub opened on the new session while the registry still holds the old one's tree.
 	 * `copied`: idle/aborted refs' transcripts were forked into the new root. `collision`: the new
-	 * root holds separately created transcripts under the same agent ids.
+	 * root holds separately created transcripts under the same agent ids. `storage`: the session's
+	 * storage holding every transcript, none of them a file; default: files on disk.
 	 */
-	async function renderHub(options: { remote?: AgentHubRemote; old?: "copied" | "collision" } = {}): Promise<string> {
+	async function renderHub(
+		options: { remote?: AgentHubRemote; old?: "copied" | "collision"; storage?: SessionStorage } = {},
+	): Promise<string> {
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-hub-scope-"));
+		const { storage } = options;
+		const write = async (file: string, text: string) => {
+			if (storage) await storage.writeText(file, text);
+			else await Bun.write(file, text);
+		};
 		const oldRoot = path.join(dir, "old.jsonl");
 		const newRoot = path.join(dir, "new.jsonl");
-		await Bun.write(oldRoot, "");
-		await Bun.write(newRoot, "");
+		await write(oldRoot, "");
+		await write(newRoot, "");
 		const registry = new AgentRegistry();
 		registry.register({
 			id: "OldParked",
@@ -91,9 +104,9 @@ describe("Agent Hub session scope", () => {
 				sessionFile: path.join(dir, "old", "OldAborted.jsonl"),
 			});
 			const files = ["OldParked.jsonl", "OldParked/OldIdle.jsonl", "OldAborted.jsonl"];
-			for (const file of files) await Bun.write(path.join(dir, "old", file), header(`old-${file}`));
-			if (options.old === "copied") await copySessionArtifacts(oldRoot, newRoot);
-			else for (const file of files) await Bun.write(path.join(dir, "new", file), header(`new-${file}`));
+			for (const file of files) await write(path.join(dir, "old", file), header(`old-${file}`));
+			if (options.old === "copied") await copySessionArtifacts(oldRoot, newRoot, storage);
+			else for (const file of files) await write(path.join(dir, "new", file), header(`new-${file}`));
 		}
 		const hub = new AgentHubOverlayComponent({
 			...createAgentHubRuntime({
@@ -101,6 +114,7 @@ describe("Agent Hub session scope", () => {
 				registry,
 				remote: options.remote,
 				sessionFile: newRoot,
+				storage,
 			}),
 			observers: new SessionObserverRegistry(),
 			hubKeys: [],
@@ -140,6 +154,22 @@ describe("Agent Hub session scope", () => {
 		expect(text).toContain("OldAborted");
 		expect(text).toContain("OldParked");
 		expect(text).not.toContain("OldNested");
+	});
+
+	it("keeps idle and aborted refs a fork copied when only the session's storage holds the transcripts", async () => {
+		// Under `session.storage: sql` the transcripts are rows. The fork-copy check must read both header
+		// ids through that storage: read from the default (file) storage, it finds no transcript, reports
+		// no copy, and the hub hides the idle and aborted agents the fork carried over.
+		const client = new SQL("sqlite::memory:");
+		clients.push(client);
+		const text = await renderHub({ old: "copied", storage: await SqlSessionStorage.create({ client }) });
+		for (const root of ["old", "new"]) {
+			for (const file of ["OldParked/OldIdle.jsonl", "OldAborted.jsonl"]) {
+				expect(await Bun.file(path.join(dir, root, file)).exists()).toBe(false);
+			}
+		}
+		expect(text).toContain("OldIdle");
+		expect(text).toContain("OldAborted");
 	});
 
 	it("hides idle and aborted refs whose id merely collides with the current session's transcripts", async () => {
