@@ -14,7 +14,12 @@
 //!   without the caller opening a handle.
 //!
 //! Reparse points (symlinks, junctions, mount points, cloud placeholders) are
-//! reported as symlinks and never descended.
+//! reported as symlinks and never descended. Opens that do not follow them
+//! (a child directory, a listed file, a path below a walk root) open one
+//! component at a time relative to the directory before it with
+//! `FILE_OPEN_REPARSE_POINT`, which opens a reparse point itself instead of
+//! its target; file opens and opens below a walk root then refuse a reparse
+//! point they reached.
 
 use std::{
 	io,
@@ -30,29 +35,31 @@ use windows_sys::{
 	Wdk::{
 		Foundation::OBJECT_ATTRIBUTES,
 		Storage::FileSystem::{
-			FILE_DIRECTORY_FILE, FILE_NETWORK_OPEN_INFORMATION, FILE_OPEN,
-			FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-			FileDirectoryInformation, FileNetworkOpenInformation, NtCreateFile, NtQueryDirectoryFile,
-			NtQueryFullAttributesFile, NtQueryInformationFile,
+			FILE_DIRECTORY_FILE, FILE_NETWORK_OPEN_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+			FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+			FILE_SYNCHRONOUS_IO_NONALERT, FileDirectoryInformation, FileNetworkOpenInformation,
+			NtCreateFile, NtQueryDirectoryFile, NtQueryFullAttributesFile, NtQueryInformationFile,
 		},
 	},
 	Win32::{
 		Foundation::{
-			ERROR_DIRECTORY, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_INVALID_NAME, HANDLE,
-			NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_NO_MORE_FILES,
-			STATUS_NO_SUCH_FILE, UNICODE_STRING,
+			ERROR_DIRECTORY, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_INVALID_NAME,
+			ERROR_STOPPED_ON_SYMLINK, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
+			STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, UNICODE_STRING,
 		},
 		Storage::FileSystem::{
-			BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-			FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-			FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-			GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE,
+			BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+			FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+			FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, FileDispositionInfo,
+			GetFileInformationByHandle, GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE,
+			SetFileInformationByHandle,
 		},
 		System::IO::{IO_STATUS_BLOCK, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
 	},
 };
 
-use super::{aligned_buf, le32, le64};
+use super::{aligned_buf, le32, le64, rewrite};
 use crate::fs::{
 	Detail, FileId, FileInfo, FileType, Listing, Stamp, not_regular,
 	wtf8::{push_wide, push_wtf8},
@@ -84,6 +91,11 @@ const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 /// Lists entries and reads attributes (for stamps).
 const DIR_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const FILE_ACCESS: u32 = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+/// Truncates and writes a file, and reads attributes to refuse a reparse
+/// point first.
+const WRITE_ACCESS: u32 = FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+/// Marks an entry for deletion.
+const DELETE_ACCESS: u32 = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 
 /// Per-session syscall scratch.
 #[derive(Default)]
@@ -141,6 +153,18 @@ fn nt_open(
 	access: u32,
 	options: u32,
 ) -> io::Result<Handle> {
+	nt_create(s, parent, name, access, FILE_OPEN, options)
+}
+
+/// Opens (or, as `disposition` says, creates) `name` relative to `parent`.
+fn nt_create(
+	s: &mut Scratch,
+	parent: &Handle,
+	name: &[u8],
+	access: u32,
+	disposition: u32,
+	options: u32,
+) -> io::Result<Handle> {
 	s.wname.clear();
 	push_wide(&mut s.wname, name);
 	if s.wname.is_empty() || s.wname.len() > MAX_NAME_UNITS {
@@ -173,7 +197,7 @@ fn nt_open(
 			null(),
 			0,
 			SHARE_ALL,
-			FILE_OPEN,
+			disposition,
 			options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT,
 			null(),
 			0,
@@ -186,9 +210,9 @@ fn nt_open(
 	Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
-/// Stamps an open handle and reports its type and size (reparse points
+/// Queries an open handle's attributes, size, and times (reparse points
 /// opened without `FILE_OPEN_REPARSE_POINT` report their target).
-fn stat_handle(h: &Handle) -> io::Result<FileInfo> {
+fn query_handle(h: &Handle) -> io::Result<FILE_NETWORK_OPEN_INFORMATION> {
 	let mut info = FILE_NETWORK_OPEN_INFORMATION::default();
 	let mut iosb = IO_STATUS_BLOCK::default();
 	// SAFETY: `info` is a writable buffer of the size passed.
@@ -204,7 +228,65 @@ fn stat_handle(h: &Handle) -> io::Result<FileInfo> {
 	if status < 0 {
 		return Err(nt_error(status));
 	}
-	Ok(info_of(&info))
+	Ok(info)
+}
+
+/// Stamps an open handle and reports its type and size (reparse points
+/// opened without `FILE_OPEN_REPARSE_POINT` report their target).
+fn stat_handle(h: &Handle) -> io::Result<FileInfo> {
+	query_handle(h).map(|info| info_of(&info))
+}
+
+/// Opens `name` (one component) of `parent` with `FILE_OPEN_REPARSE_POINT`,
+/// so a reparse point there is opened itself rather than followed, and
+/// refuses one (`ERROR_STOPPED_ON_SYMLINK`), as listings report every reparse
+/// point as a symlink.
+fn nt_open_unlinked(
+	s: &mut Scratch,
+	parent: &Handle,
+	name: &[u8],
+	access: u32,
+	options: u32,
+) -> io::Result<(Handle, FileInfo)> {
+	nt_create_unlinked(s, parent, name, access, FILE_OPEN, options)
+}
+
+/// [`nt_open_unlinked`] with a create `disposition`.
+fn nt_create_unlinked(
+	s: &mut Scratch,
+	parent: &Handle,
+	name: &[u8],
+	access: u32,
+	disposition: u32,
+	options: u32,
+) -> io::Result<(Handle, FileInfo)> {
+	let h = nt_create(s, parent, name, access, disposition, options | FILE_OPEN_REPARSE_POINT)?;
+	let info = query_handle(&h)?;
+	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return Err(win_error(ERROR_STOPPED_ON_SYMLINK));
+	}
+	Ok((h, info_of(&info)))
+}
+
+/// Opens every directory on the way to the last component of the
+/// walk-relative `rel` (separated by `/` or `\`) below `root`, one component
+/// at a time, following no reparse point ([`nt_open_unlinked`]); returns the
+/// directory reached (`None`: `root` itself) and the last component. At most
+/// two handles are open at once.
+fn parent_beneath<'r>(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &'r [u8],
+) -> io::Result<(Option<Handle>, &'r [u8])> {
+	let mut reached: Option<Handle> = None;
+	let mut rest = rel;
+	while let Some(slash) = memchr::memchr2(b'/', b'\\', rest) {
+		let at = reached.as_ref().unwrap_or(root);
+		let (dir, _) = nt_open_unlinked(s, at, &rest[..slash], DIR_ACCESS, FILE_DIRECTORY_FILE)?;
+		reached = Some(dir);
+		rest = &rest[slash + 1..];
+	}
+	Ok((reached, rest))
 }
 
 pub(crate) fn open_dir(_s: &mut Scratch, path: &Path) -> io::Result<Handle> {
@@ -318,24 +400,113 @@ pub(crate) fn list(
 	}
 }
 
+/// `h` and its information when it is a regular file (a reparse point opened
+/// without `FILE_OPEN_REPARSE_POINT` reports its target).
 fn regular(h: Handle) -> io::Result<(Handle, FileInfo)> {
 	let info = stat_handle(&h)?;
-	if info.file_type != Some(FileType::File) {
-		return Err(not_regular());
-	}
-	Ok((h, info))
+	file_of((h, info))
 }
 
+/// Opens the regular file `name` (one component) in `dir`; without `follow`,
+/// a reparse point there is refused ([`nt_open_unlinked`]).
 pub(crate) fn open_file_at(
 	s: &mut Scratch,
 	dir: &Handle,
 	name: &[u8],
+	follow: bool,
 ) -> io::Result<(Handle, FileInfo)> {
-	regular(nt_open(s, dir, name, FILE_ACCESS, 0)?)
+	if follow {
+		return regular(nt_open(s, dir, name, FILE_ACCESS, 0)?);
+	}
+	file_of(nt_open_unlinked(s, dir, name, FILE_ACCESS, 0)?)
 }
 
 pub(crate) fn open_file(_s: &mut Scratch, path: &Path) -> io::Result<(Handle, FileInfo)> {
 	regular(open_path(path, FILE_ACCESS)?)
+}
+
+/// Opens the regular file at the walk-relative `rel` below `root`, following
+/// no reparse point on the way ([`parent_beneath`]).
+pub(crate) fn open_file_beneath(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+) -> io::Result<(Handle, FileInfo)> {
+	let (reached, name) = parent_beneath(s, root, rel)?;
+	file_of(nt_open_unlinked(s, reached.as_ref().unwrap_or(root), name, FILE_ACCESS, 0)?)
+}
+
+/// Opens the directory at the walk-relative `rel` below `root`, following no
+/// reparse point on the way ([`parent_beneath`]).
+pub(crate) fn open_dir_beneath(s: &mut Scratch, root: &Handle, rel: &[u8]) -> io::Result<Handle> {
+	let (reached, name) = parent_beneath(s, root, rel)?;
+	let at = reached.as_ref().unwrap_or(root);
+	nt_open_unlinked(s, at, name, DIR_ACCESS, FILE_DIRECTORY_FILE).map(|(h, _)| h)
+}
+
+/// Rewrites the regular file at the walk-relative `rel` below `root` in place
+/// with `contents`, creating it when missing: every directory on the way and
+/// the file open without following a reparse point ([`parent_beneath`],
+/// [`nt_create_unlinked`]), and the file is truncated only once it is known
+/// to be no reparse point and no directory.
+pub(crate) fn write_file_beneath(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+	contents: &[u8],
+) -> io::Result<()> {
+	let (reached, name) = parent_beneath(s, root, rel)?;
+	let at = reached.as_ref().unwrap_or(root);
+	let (h, _) =
+		nt_create_unlinked(s, at, name, WRITE_ACCESS, FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE)?;
+	rewrite(std::fs::File::from(h), contents)
+}
+
+/// Removes the entry at the walk-relative `rel` below `root`: every directory
+/// on the way opens without following a reparse point ([`parent_beneath`]),
+/// and the entry, opened itself with `FILE_OPEN_REPARSE_POINT`, is marked for
+/// deletion, which happens when its handle closes here. With `dir` the entry
+/// must be a directory, a directory symlink or junction included (removed
+/// itself, as `RemoveDirectoryW` and [`std::fs::remove_dir`] remove it);
+/// without, it must not be one, so a directory symlink or junction fails, as
+/// `DeleteFileW` and [`std::fs::remove_file`] fail on it.
+pub(crate) fn remove_beneath(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+	dir: bool,
+) -> io::Result<()> {
+	let (reached, name) = parent_beneath(s, root, rel)?;
+	let at = reached.as_ref().unwrap_or(root);
+	let kind = if dir {
+		FILE_DIRECTORY_FILE
+	} else {
+		FILE_NON_DIRECTORY_FILE
+	};
+	let h = nt_open(s, at, name, DELETE_ACCESS, kind | FILE_OPEN_REPARSE_POINT)?;
+	let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+	// SAFETY: `disposition` is a live `FILE_DISPOSITION_INFO` of the size
+	// passed.
+	let ok = unsafe {
+		SetFileInformationByHandle(
+			h.as_raw_handle(),
+			FileDispositionInfo,
+			(&raw const disposition).cast(),
+			size_of::<FILE_DISPOSITION_INFO>() as u32,
+		)
+	};
+	if ok == 0 {
+		return Err(io::Error::last_os_error());
+	}
+	Ok(())
+}
+
+/// An opened handle and its information when it is a regular file.
+fn file_of((h, info): (Handle, FileInfo)) -> io::Result<(Handle, FileInfo)> {
+	if info.file_type != Some(FileType::File) {
+		return Err(not_regular());
+	}
+	Ok((h, info))
 }
 
 /// `ReadFile` at offset `off`. The offset rides in an OVERLAPPED, which on a

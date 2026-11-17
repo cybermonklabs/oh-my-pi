@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `readFileBeneath()`, which reads a file a `glob` listed below the directory the glob walked without following a symlink the walk did not list; one open checks the size against `maxBytes`, probes the first `binaryProbeBytes` bytes for a NUL byte, and returns the bytes (only the first `prefixBytes` when set), reading each byte once
+- Added `GlobMatch.symlink`, set when the listing shows a symbolic link at the match (reported as `Symlink`, or as its target under a `File` or `Dir` filter); pass it to `readFileBeneath()` as `followSymlink`
+
+### Changed
+
+- A directory walk that does not follow symlinks no longer reads a `.gitignore`, `.ignore` or `.git/info/exclude` inside the walked directory that is a symbolic link, as git reads no symlinked `.gitignore`; git does follow a symlinked `.git/info/exclude`, so there the walk now differs from git
+
+### Fixed
+
+- A walk of a host directory that does not follow symlinks (`grep()`, `grep -r`, `rg`, `find -delete` without `-L`, `ast-grep` and `astGrep`/`astEdit` without following links) no longer reads, rewrites or deletes a file through a symlink swapped in after the walk listed it: the file is reached below the walk's own open root, and a swapped directory makes that file's read, write or removal fail instead of reaching outside the tree
+- `find -delete` reports a failed removal as GNU find does (`find: cannot delete 'path': reason`, exit status 1), and `find . -delete` keeps `.` without an error
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

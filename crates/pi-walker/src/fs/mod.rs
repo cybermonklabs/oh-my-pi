@@ -14,6 +14,18 @@
 //! ([`Session::open_file_at`], which also stats them) and then read into a
 //! reusable buffer ([`File::read_into`]) or streamed ([`File::read`]).
 //!
+//! A walk that does not follow symlinks opens nothing through one: child
+//! directories and listed files open relative to the listed directory's
+//! handle without following a symlink there ([`Session::open_child`],
+//! [`Session::open_file_at`] without `follow`), and an entry whose listing
+//! carries no handle opens below the walk root's handle with no symlink
+//! followed on the way ([`Session::open_file_beneath`],
+//! [`Session::open_dir_beneath`]). Consumers write back and remove listed
+//! entries below the root the same way ([`Session::write_file_beneath`],
+//! [`Session::remove_file_beneath`], [`Session::remove_dir_beneath`]). Only
+//! the root itself, and files named outside it (git's global excludes,
+//! ancestors' ignore files), open by path.
+//!
 //! ```ignore
 //! let fs = Fs::native();
 //! let mut s = fs.session();
@@ -353,17 +365,29 @@ impl File {
 	/// Replaces `buf`'s contents with up to `limit` leading bytes of the file.
 	/// Reads stop at the size reported at open time or at end of file: a read
 	/// that returns exactly the remaining size is taken as end of file (no
-	/// confirming zero-length read); files reporting size 0 (pseudo files)
-	/// and short reads keep reading until end of file or `limit`.
+	/// confirming zero-length read), and growth after the open is not read;
+	/// files reporting size 0 (pseudo files) and short reads keep reading
+	/// until end of file or `limit`.
 	pub async fn read_into(&mut self, buf: &mut Vec<u8>, limit: u64) -> io::Result<()> {
+		buf.clear();
+		self.read_more(buf, limit).await
+	}
+
+	/// Continues [`Self::read_into`]: appends the file's bytes from offset
+	/// `buf.len()`, taking the bytes `buf` holds as the file's first ones (as
+	/// an earlier `read_into` or `read_more` left them), so no byte is read
+	/// twice. Stops where `read_into` stops: at `limit` bytes in all, at the
+	/// size reported at open time, or at end of file.
+	pub async fn read_more(&mut self, buf: &mut Vec<u8>, limit: u64) -> io::Result<()> {
 		match &mut self.repr {
 			FileRepr::Native(handle) => {
 				fill(buf, self.size, limit, |buf, end| native::read_append(handle, buf, end))
 			},
 			FileRepr::Provider(file) => {
-				if self.pos != 0 {
-					file.seek_async(io::SeekFrom::Start(0)).await?;
-					self.pos = 0;
+				let start = buf.len() as u64;
+				if self.pos != start {
+					file.seek_async(io::SeekFrom::Start(start)).await?;
+					self.pos = start;
 				}
 				let window = Fill::new(buf, self.size, limit);
 				while let Some(end) = window.next(buf) {
@@ -382,25 +406,25 @@ impl File {
 	}
 }
 
-/// The read loop of [`File::read_into`], shared by its sync (native) and
+/// The read loop of [`File::read_more`], shared by its sync (native) and
 /// async (provider) arms.
 struct Fill {
 	bound: usize,
 }
 
 impl Fill {
-	/// Clears `buf` and reserves for up to `limit` bytes of a file whose size
-	/// at open time was `size` (0: empty or a pseudo file, read to end of
-	/// file).
+	/// Reserves `buf` for reading on to `limit` bytes in all of a file whose
+	/// size at open time was `size` (0: empty or a pseudo file, read to end
+	/// of file); the bytes `buf` already holds are the file's first ones.
 	fn new(buf: &mut Vec<u8>, size: u64, limit: u64) -> Self {
-		buf.clear();
 		let limit = usize::try_from(limit).unwrap_or(usize::MAX);
 		let bound = if size > 0 {
 			usize::try_from(size).unwrap_or(usize::MAX).min(limit)
 		} else {
 			limit
 		};
-		buf.reserve(if size > 0 { bound } else { bound.min(4096) });
+		let want = bound.saturating_sub(buf.len());
+		buf.reserve(if size > 0 { want } else { want.min(4096) });
 		Self { bound }
 	}
 
@@ -432,10 +456,10 @@ impl Fill {
 	}
 }
 
-/// Fills `buf` through `read` until end of file or `limit` bytes, given the
-/// `size` reported at open time; see [`File::read_into`]. `read(buf, end)`
-/// appends at most `end - buf.len()` bytes and returns the count (0 at end of
-/// file).
+/// Appends to `buf` through `read` until end of file or `limit` bytes in all,
+/// given the `size` reported at open time; see [`File::read_more`].
+/// `read(buf, end)` appends at most `end - buf.len()` bytes and returns the
+/// count (0 at end of file).
 fn fill(
 	buf: &mut Vec<u8>,
 	size: u64,
@@ -501,6 +525,16 @@ impl File {
 			FileRepr::Provider(file) => file.metadata(),
 		}
 	}
+
+	/// The open file as a [`pi_vfs::File`], for readers built on `pi_vfs`:
+	/// the same open file (no reopen by path). A native file reads from its
+	/// start, a provider file from where this file's reads left it.
+	pub fn into_vfs(self) -> pi_vfs::File {
+		match self.repr {
+			FileRepr::Native(handle) => pi_vfs::File::from(std::fs::File::from(handle)),
+			FileRepr::Provider(file) => file,
+		}
+	}
 }
 
 /// Marker error behind [`is_not_regular`].
@@ -520,8 +554,9 @@ pub(crate) fn not_regular() -> io::Error {
 	io::Error::new(io::ErrorKind::InvalidInput, NotRegular)
 }
 
-/// Whether `err` is the error [`Session::open_file_at`] and
-/// [`Session::open_file`] return for directories and special files.
+/// Whether `err` is the error [`Session::open_file_at`],
+/// [`Session::open_file`], and [`Session::open_file_beneath`] return for
+/// directories and special files.
 pub fn is_not_regular(err: &io::Error) -> bool {
 	err.get_ref().is_some_and(|inner| inner.is::<NotRegular>())
 }
@@ -543,9 +578,34 @@ fn foreign_dir() -> io::Error {
 	io::Error::new(io::ErrorKind::InvalidInput, "directory belongs to another filesystem")
 }
 
+/// Refuses a path that is not walk-relative: empty, or with an empty, `.`, or
+/// `..` component, each of which would reach something other than an entry a
+/// walk listed below its root.
+fn check_relative(rel: &[u8]) -> io::Result<()> {
+	if rel
+		.split(|&b| is_rel_separator(b))
+		.any(|part| matches!(part, b"" | b"." | b".."))
+	{
+		return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a walk-relative path"));
+	}
+	Ok(())
+}
+
+/// Whether `byte` separates the components of a walk-relative path.
+///
+/// That is `/`, and on Windows also `\`, which no listed name contains there
+/// and which the NT namespace would otherwise resolve inside one component.
+/// A caller that splits a walk-relative path before passing its parts to a
+/// `beneath` open splits it here, so both agree on its components.
+pub const fn is_rel_separator(byte: u8) -> bool {
+	byte == b'/' || (cfg!(windows) && byte == b'\\')
+}
+
 impl Session {
 	/// Opens the directory at an absolute path, following symlinks.
 	pub async fn open_dir(&mut self, path: &Path) -> io::Result<Dir> {
+		#[cfg(test)]
+		seam::fire(seam::last(path), seam::Open::Path);
 		let repr = match &mut self.imp {
 			Imp::Native(s) => DirRepr::Native(native::open_dir(s, path)?),
 			Imp::Provider(fs) => DirRepr::Provider(provider::open_dir(fs, path).await?),
@@ -556,6 +616,8 @@ impl Session {
 	/// Opens the subdirectory `name` of `parent` without following a symlink
 	/// that replaced it since `parent` was listed.
 	pub async fn open_child(&mut self, parent: &Dir, name: &[u8]) -> io::Result<Dir> {
+		#[cfg(test)]
+		seam::fire(name, seam::Open::At);
 		let repr = match (&mut self.imp, &parent.repr) {
 			(Imp::Native(s), DirRepr::Native(h)) => DirRepr::Native(native::open_child(s, h, name)?),
 			(Imp::Provider(fs), DirRepr::Provider(path)) => {
@@ -591,17 +653,35 @@ impl Session {
 		list_with(&mut self.imp, dir, detail, children, out).await
 	}
 
-	/// Opens the regular file `name` (one component) in `dir`, following
-	/// symlinks, and describes it. Fails for directories and special files
-	/// (see [`is_not_regular`]); FIFOs never block the open.
-	pub async fn open_file_at(&mut self, dir: &Dir, name: &[u8]) -> io::Result<(File, FileInfo)> {
+	/// Opens the regular file `name` (one component) in `dir` and describes
+	/// it. With `follow`, a symlink there is followed, as an open by path
+	/// follows it. Without, a symlink there is refused (`ELOOP` on Unix,
+	/// `ERROR_STOPPED_ON_SYMLINK` for any reparse point on Windows): a walk
+	/// that does not follow symlinks reads the file it listed or nothing, also
+	/// when the name was replaced by a symlink since the listing. Fails for
+	/// directories and special files (see [`is_not_regular`]); FIFOs never
+	/// block the open. Providers check the name and then open it, see
+	/// [`Self::open_file_beneath`].
+	pub async fn open_file_at(
+		&mut self,
+		dir: &Dir,
+		name: &[u8],
+		follow: bool,
+	) -> io::Result<(File, FileInfo)> {
+		#[cfg(test)]
+		seam::fire(name, seam::Open::At);
 		let (repr, info) = match (&mut self.imp, &dir.repr) {
 			(Imp::Native(s), DirRepr::Native(h)) => {
-				let (handle, info) = native::open_file_at(s, h, name)?;
+				let (handle, info) = native::open_file_at(s, h, name, follow)?;
 				(FileRepr::Native(handle), info)
 			},
 			(Imp::Provider(fs), DirRepr::Provider(path)) => {
-				let (file, info) = provider::open_file(fs, &provider::child(path, name)).await?;
+				let path = provider::child(path, name);
+				let (file, info) = if follow {
+					provider::open_file(fs, &path).await?
+				} else {
+					provider::open_file_unlinked(fs, &path).await?
+				};
 				(FileRepr::Provider(file), info)
 			},
 			_ => return Err(foreign_dir()),
@@ -609,8 +689,183 @@ impl Session {
 		Ok((File { repr, size: info.size, pos: 0 }, info))
 	}
 
-	/// [`Self::open_file_at`] for an absolute path.
+	/// Opens the regular file at the walk-relative `rel` (`/`-separated raw
+	/// names, none of them empty, `.`, or `..`; on Windows `\` separates them
+	/// too) below the open directory `root`, following no symlink on the way:
+	/// neither the file nor any directory between `root` and it, also one
+	/// swapped in since the listing. This is how a walk that does not follow
+	/// symlinks opens a file whose listing carries no directory handle.
+	///
+	/// Native opens resolve below `root`'s handle, never by path: on Linux
+	/// one `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` where the
+	/// kernel has it; elsewhere, and where it does not, one component at a
+	/// time relative to the directory before it (`O_NOFOLLOW`; on Windows
+	/// `FILE_OPEN_REPARSE_POINT`), holding at most two handles at once. A
+	/// symlink on the way fails the open (`ELOOP` or `ENOTDIR` on Unix,
+	/// `ERROR_STOPPED_ON_SYMLINK` for any reparse point on Windows).
+	///
+	/// Providers resolve paths themselves, so they cannot hold this against a
+	/// concurrent swap: the open checks the final component with
+	/// `symlink_metadata` and refuses a symlink, then opens the path, and the
+	/// provider resolves the directories on the way. A symlink swapped in
+	/// between the check and the open, or for one of those directories, is
+	/// followed.
+	///
+	/// # Errors
+	///
+	/// [`io::ErrorKind::InvalidInput`] for a `rel` that is not walk-relative,
+	/// the refusal of a symlink, [`is_not_regular`] for directories and
+	/// special files, and the open's own errors.
+	pub async fn open_file_beneath(
+		&mut self,
+		root: &Dir,
+		rel: &[u8],
+	) -> io::Result<(File, FileInfo)> {
+		check_relative(rel)?;
+		#[cfg(test)]
+		seam::fire(seam::last_of(rel), seam::Open::Beneath);
+		let (repr, info) = match (&mut self.imp, &root.repr) {
+			(Imp::Native(s), DirRepr::Native(h)) => {
+				let (handle, info) = native::open_file_beneath(s, h, rel)?;
+				(FileRepr::Native(handle), info)
+			},
+			(Imp::Provider(fs), DirRepr::Provider(path)) => {
+				let (file, info) =
+					provider::open_file_unlinked(fs, &provider::beneath(path, rel)).await?;
+				(FileRepr::Provider(file), info)
+			},
+			_ => return Err(foreign_dir()),
+		};
+		Ok((File { repr, size: info.size, pos: 0 }, info))
+	}
+
+	/// Opens the directory at the walk-relative `rel` below the open directory
+	/// `root`, following no symlink on the way, as [`Self::open_file_beneath`]
+	/// opens a file (with the same provider limits). This is how a walk that
+	/// does not follow symlinks opens a directory whose parent's listing
+	/// carries no handle.
+	///
+	/// # Errors
+	///
+	/// As for [`Self::open_file_beneath`]; a `rel` that is not a directory
+	/// fails like [`Self::open_child`].
+	pub async fn open_dir_beneath(&mut self, root: &Dir, rel: &[u8]) -> io::Result<Dir> {
+		check_relative(rel)?;
+		#[cfg(test)]
+		seam::fire(seam::last_of(rel), seam::Open::Beneath);
+		let repr = match (&mut self.imp, &root.repr) {
+			(Imp::Native(s), DirRepr::Native(h)) => {
+				DirRepr::Native(native::open_dir_beneath(s, h, rel)?)
+			},
+			(Imp::Provider(fs), DirRepr::Provider(path)) => {
+				DirRepr::Provider(provider::open_dir_unlinked(fs, provider::beneath(path, rel)).await?)
+			},
+			_ => return Err(foreign_dir()),
+		};
+		Ok(Dir { repr })
+	}
+
+	/// Replaces the contents of the regular file at the walk-relative `rel`
+	/// below the open directory `root` with `contents`, creating the file
+	/// when it is missing, and follows no symlink on the way or at the file:
+	/// the write lands on a file below `root` or nowhere, also when a
+	/// directory on the way or the file itself was replaced by a symlink
+	/// since the listing. This is how a walk that does not follow symlinks
+	/// writes back a file it listed.
+	///
+	/// The file is rewritten in place, as [`std::fs::write`] and
+	/// [`pi_vfs::Fs::write`] rewrite it: one open, truncated, then written,
+	/// so its identity, permissions, owner, and hard links stay, and a new
+	/// file gets mode `0o666` less the umask. Native writes open the file's
+	/// directory as [`Self::open_dir_beneath`] does, then the file relative
+	/// to that directory without following a symlink there (`O_NOFOLLOW`;
+	/// on Windows `FILE_OPEN_REPARSE_POINT`, refusing the reparse point it
+	/// reached), and truncate only once the open file is known to be a
+	/// regular one, so a special file is left as it was (FIFOs never block
+	/// the open).
+	///
+	/// Providers check the final component with `symlink_metadata` and
+	/// refuse a symlink or a special file there, then write by path, with
+	/// the limits [`Self::open_file_beneath`] describes.
+	///
+	/// # Errors
+	///
+	/// [`io::ErrorKind::InvalidInput`] for a `rel` that is not walk-relative,
+	/// the refusal of a symlink, [`is_not_regular`] for special files (a
+	/// directory fails the open itself), and the open's and the write's own
+	/// errors.
+	pub async fn write_file_beneath(
+		&mut self,
+		root: &Dir,
+		rel: &[u8],
+		contents: &[u8],
+	) -> io::Result<()> {
+		check_relative(rel)?;
+		match (&mut self.imp, &root.repr) {
+			(Imp::Native(s), DirRepr::Native(h)) => native::write_file_beneath(s, h, rel, contents),
+			(Imp::Provider(fs), DirRepr::Provider(path)) => {
+				provider::write_file_unlinked(fs, &provider::beneath(path, rel), contents).await
+			},
+			_ => Err(foreign_dir()),
+		}
+	}
+
+	/// Removes the file, symlink, or special file at the walk-relative `rel`
+	/// below the open directory `root`, following no symlink on the way: the
+	/// entry removed is below `root` or nothing is, also when a directory on
+	/// the way was replaced by a symlink since the listing. A symlink at
+	/// `rel` is removed itself, as `unlink` removes it; on Windows a
+	/// directory symlink or junction is a directory, which this call refuses
+	/// as [`std::fs::remove_file`] refuses it there, and
+	/// [`Self::remove_dir_beneath`] removes. This is how a walk that does not
+	/// follow symlinks removes an entry it listed.
+	///
+	/// Native removals open the entry's directory as
+	/// [`Self::open_dir_beneath`] does, then remove the entry relative to it
+	/// (`unlinkat`; on Windows a delete disposition on the entry opened with
+	/// `FILE_OPEN_REPARSE_POINT`). Providers remove by path, resolving the
+	/// directories on the way themselves (see [`Self::open_file_beneath`]).
+	///
+	/// # Errors
+	///
+	/// [`io::ErrorKind::InvalidInput`] for a `rel` that is not walk-relative,
+	/// the refusal of a symlink on the way, and the removal's own errors (a
+	/// directory at `rel` fails, as [`std::fs::remove_file`] fails).
+	pub async fn remove_file_beneath(&mut self, root: &Dir, rel: &[u8]) -> io::Result<()> {
+		self.remove_beneath(root, rel, false).await
+	}
+
+	/// Removes the empty directory at the walk-relative `rel` below the open
+	/// directory `root`, following no symlink on the way, as
+	/// [`Self::remove_file_beneath`] removes a file (`unlinkat` with
+	/// `AT_REMOVEDIR`).
+	///
+	/// # Errors
+	///
+	/// As for [`Self::remove_file_beneath`]; a `rel` that is not an empty
+	/// directory fails, as [`std::fs::remove_dir`] fails. On Windows a
+	/// directory symlink or junction at `rel` is removed itself (not its
+	/// target), as [`std::fs::remove_dir`] removes it there.
+	pub async fn remove_dir_beneath(&mut self, root: &Dir, rel: &[u8]) -> io::Result<()> {
+		self.remove_beneath(root, rel, true).await
+	}
+
+	async fn remove_beneath(&mut self, root: &Dir, rel: &[u8], dir: bool) -> io::Result<()> {
+		check_relative(rel)?;
+		match (&mut self.imp, &root.repr) {
+			(Imp::Native(s), DirRepr::Native(h)) => native::remove_beneath(s, h, rel, dir),
+			(Imp::Provider(fs), DirRepr::Provider(path)) => {
+				provider::remove(fs, &provider::beneath(path, rel), dir).await
+			},
+			_ => Err(foreign_dir()),
+		}
+	}
+
+	/// Opens the regular file at an absolute path, following symlinks, and
+	/// describes it; fails like [`Self::open_file_at`].
 	pub async fn open_file(&mut self, path: &Path) -> io::Result<(File, FileInfo)> {
+		#[cfg(test)]
+		seam::fire(seam::last(path), seam::Open::Path);
 		let (repr, info) = match &mut self.imp {
 			Imp::Native(s) => {
 				let (handle, info) = native::open_file(s, path)?;
@@ -627,6 +882,8 @@ impl Session {
 	/// Describes the file or directory at an absolute path, following a final
 	/// symlink only when `follow` is set.
 	pub async fn stat(&mut self, path: &Path, follow: bool) -> io::Result<FileInfo> {
+		#[cfg(test)]
+		seam::fire(seam::last(path), seam::Open::Stat);
 		match &mut self.imp {
 			Imp::Native(s) => native::stat(s, path, follow),
 			Imp::Provider(fs) => provider::stat(fs, path, follow).await,
@@ -678,6 +935,10 @@ impl Session {
 
 /// Opens regular files by absolute path relative to their directory.
 ///
+/// It follows symlinks, as any open by path does, so it confines nothing: a
+/// walk that must not follow symlinks opens through
+/// [`Session::open_file_at`] or [`Session::open_file_beneath`] instead.
+///
 /// It keeps the directory open: consecutive files of one directory (a walk's
 /// output in path order) cost one single-component lookup each instead of a
 /// full path resolution.
@@ -714,7 +975,7 @@ impl FileOpener {
 		let dir = self.dir.as_ref().expect("opened above");
 		self
 			.session
-			.open_file_at(dir, name.as_encoded_bytes())
+			.open_file_at(dir, name.as_encoded_bytes(), true)
 			.await
 			.map(|(file, _)| file)
 	}
@@ -732,6 +993,79 @@ async fn list_with(
 		(Imp::Native(s), DirRepr::Native(h)) => native::list(s, h, detail, children, out),
 		(Imp::Provider(fs), DirRepr::Provider(path)) => provider::list(fs, path, detail, out).await,
 		_ => Err(foreign_dir()),
+	}
+}
+
+/// Test seam between a listing and the calls that follow it: a test registers
+/// a closure for an entry name, and the first open (or, registered for it,
+/// stat) of an entry by that name runs it just before the call, so the test
+/// can swap the entry for a symlink exactly there, without a racing writer.
+#[cfg(test)]
+pub(crate) mod seam {
+	use std::path::Path;
+
+	use parking_lot::Mutex;
+
+	/// How the call that ran a hook reaches its entry.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(crate) enum Open {
+		/// An open by absolute path.
+		Path,
+		/// An open relative to the directory it was listed from.
+		At,
+		/// An open below the walk root, with no symlink followed on the way.
+		Beneath,
+		/// A stat by path; only [`before_stat`] hooks run here.
+		Stat,
+	}
+
+	type Hook = Box<dyn FnOnce(Open) + Send>;
+
+	/// Hooks by entry name, and whether they wait for a stat.
+	static HOOKS: Mutex<Vec<(Vec<u8>, bool, Hook)>> = Mutex::new(Vec::new());
+
+	/// Runs `hook` just before the first open of an entry named `name`.
+	#[cfg_attr(not(unix), expect(dead_code, reason = "only the Unix swap tests register hooks"))]
+	pub(crate) fn before_open(name: &str, hook: impl FnOnce(Open) + Send + 'static) {
+		HOOKS
+			.lock()
+			.push((name.as_bytes().to_vec(), false, Box::new(hook)));
+	}
+
+	/// Runs `hook` just before the first stat of an entry named `name`.
+	#[cfg_attr(not(unix), expect(dead_code, reason = "only the Unix swap tests register hooks"))]
+	pub(crate) fn before_stat(name: &str, hook: impl FnOnce(Open) + Send + 'static) {
+		HOOKS
+			.lock()
+			.push((name.as_bytes().to_vec(), true, Box::new(hook)));
+	}
+
+	/// Runs (once) the hook registered for `name` and this kind of call, if
+	/// any.
+	pub(crate) fn fire(name: &[u8], open: Open) {
+		let stat = open == Open::Stat;
+		let hook = {
+			let mut hooks = HOOKS.lock();
+			let found = hooks
+				.iter()
+				.position(|(hooked, on_stat, _)| hooked == name && *on_stat == stat);
+			found.map(|index| hooks.swap_remove(index).2)
+		};
+		if let Some(hook) = hook {
+			hook(open);
+		}
+	}
+
+	/// The final component of `path`.
+	pub(crate) fn last(path: &Path) -> &[u8] {
+		path.file_name().map_or(b"", |name| name.as_encoded_bytes())
+	}
+
+	/// The final component of the walk-relative `rel`.
+	pub(crate) fn last_of(rel: &[u8]) -> &[u8] {
+		rel.rsplit(|&b| super::is_rel_separator(b))
+			.next()
+			.unwrap_or(rel)
 	}
 }
 

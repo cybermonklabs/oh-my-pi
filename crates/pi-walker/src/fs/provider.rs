@@ -1,6 +1,13 @@
 //! [`pi_vfs::Fs`] providers: directories are paths, listings come from
 //! `read_dir`, and files are provider [`pi_vfs::File`]s. URL children are
 //! joined with [`pi_vfs::child_path`], which percent-encodes raw names.
+//!
+//! A provider resolves each path itself, so opens and writes that do not
+//! follow symlinks check the final component with `symlink_metadata` and
+//! then open or write by path: two calls, with intermediate directories
+//! resolved however the provider resolves them. They refuse a symlink that
+//! is there when checked, not one swapped in between the check and the open.
+//! Removals remove by path, which removes a final symlink itself.
 
 use std::{
 	ffi::OsStr,
@@ -11,7 +18,9 @@ use std::{
 
 use pi_vfs::{Fs, Metadata};
 
-use super::{Detail, FileId, FileInfo, FileType, Listing, Stamp, not_regular, os_name};
+use super::{
+	Detail, FileId, FileInfo, FileType, Listing, Stamp, is_rel_separator, not_regular, os_name,
+};
 
 /// Entry type of a provider file type; `None` for special files.
 fn type_of(file_type: pi_vfs::FileType) -> Option<FileType> {
@@ -81,6 +90,30 @@ pub(super) fn child(dir: &Path, name: &[u8]) -> PathBuf {
 	pi_vfs::child_path(dir, &os_name(name))
 }
 
+/// The walk-relative `rel` (raw names, see
+/// [`super::Session::open_file_beneath`]) below `root`.
+pub(super) fn beneath(root: &Path, rel: &[u8]) -> PathBuf {
+	let mut path = root.to_path_buf();
+	for segment in rel.split(|&b| is_rel_separator(b)) {
+		path = child(&path, segment);
+	}
+	path
+}
+
+/// The description of a regular file from metadata read without following a
+/// final symlink: a symlink there is refused, and anything else that is not
+/// a regular file fails as [`not_regular`].
+fn unlinked_file_info(meta: &Metadata) -> io::Result<FileInfo> {
+	let info = info_of(meta);
+	match info.file_type {
+		Some(FileType::File) => Ok(info),
+		Some(FileType::Symlink) => {
+			Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to follow a symbolic link"))
+		},
+		_ => Err(not_regular()),
+	}
+}
+
 pub(super) async fn open_dir(fs: &Fs, path: &Path) -> io::Result<PathBuf> {
 	if !fs.metadata(path).await?.is_dir() {
 		return Err(not_a_directory());
@@ -88,12 +121,16 @@ pub(super) async fn open_dir(fs: &Fs, path: &Path) -> io::Result<PathBuf> {
 	Ok(path.to_path_buf())
 }
 
-pub(super) async fn open_child(fs: &Fs, parent: &Path, name: &[u8]) -> io::Result<PathBuf> {
-	let path = child(parent, name);
+/// Checks, without following a symlink, that `path` is a directory.
+pub(super) async fn open_dir_unlinked(fs: &Fs, path: PathBuf) -> io::Result<PathBuf> {
 	if !fs.symlink_metadata(&path).await?.is_dir() {
 		return Err(not_a_directory());
 	}
 	Ok(path)
+}
+
+pub(super) async fn open_child(fs: &Fs, parent: &Path, name: &[u8]) -> io::Result<PathBuf> {
+	open_dir_unlinked(fs, child(parent, name)).await
 }
 
 pub(super) async fn list(fs: &Fs, dir: &Path, detail: Detail, out: &mut Listing) -> io::Result<()> {
@@ -138,6 +175,39 @@ pub(super) async fn open_file(fs: &Fs, path: &Path) -> io::Result<(pi_vfs::File,
 		return Err(not_regular());
 	}
 	Ok((fs.open(path).await?, info))
+}
+
+/// Opens the regular file at `path`, refusing a final symlink: the type is
+/// checked without following it before the open.
+pub(super) async fn open_file_unlinked(
+	fs: &Fs,
+	path: &Path,
+) -> io::Result<(pi_vfs::File, FileInfo)> {
+	let info = unlinked_file_info(&fs.symlink_metadata(path).await?)?;
+	Ok((fs.open(path).await?, info))
+}
+
+/// Replaces the contents of the regular file at `path`, creating it when
+/// missing, refusing a final symlink or special file: the type is checked
+/// without following it before the write.
+pub(super) async fn write_file_unlinked(fs: &Fs, path: &Path, contents: &[u8]) -> io::Result<()> {
+	match fs.symlink_metadata(path).await {
+		Ok(meta) => {
+			unlinked_file_info(&meta)?;
+		},
+		Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+		Err(err) => return Err(err),
+	}
+	fs.write(path, contents).await
+}
+
+/// Removes the entry at `path` (an empty directory when `dir`).
+pub(super) async fn remove(fs: &Fs, path: &Path, dir: bool) -> io::Result<()> {
+	if dir {
+		fs.remove_dir(path).await
+	} else {
+		fs.remove_file(path).await
+	}
 }
 
 pub(super) async fn stat(fs: &Fs, path: &Path, follow: bool) -> io::Result<FileInfo> {

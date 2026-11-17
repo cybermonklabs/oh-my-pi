@@ -1,6 +1,6 @@
 use std::{
 	fs,
-	sync::atomic::{self, AtomicUsize},
+	sync::atomic::{self, AtomicBool, AtomicUsize, Ordering},
 };
 
 use super::*;
@@ -485,5 +485,140 @@ async fn single_file_url_root_displays_its_decoded_name() {
 	assert_eq!(found, [Candidate {
 		path:    PathBuf::from("mem://root/a%20b.ts"),
 		display: "a b.ts".to_string(),
+		beneath: None,
 	}]);
+}
+
+/// What a test runs just before a search or rewrite reads (`false`), or a
+/// rewrite writes (`true`), the file at a path.
+type Hook = (PathBuf, bool, Box<dyn FnOnce() + Send>);
+static HOOKS: std::sync::Mutex<Vec<Hook>> = std::sync::Mutex::new(Vec::new());
+
+/// Runs (once) the hook registered for `path` and this kind of access.
+fn fire(path: &Path, write: bool) {
+	let hook = {
+		let mut hooks = HOOKS
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		let found = hooks
+			.iter()
+			.position(|(hooked, on_write, _)| hooked == path && *on_write == write);
+		found.map(|index| hooks.swap_remove(index).2)
+	};
+	if let Some(hook) = hook {
+		hook();
+	}
+}
+
+pub(super) fn before_read(path: &Path) {
+	fire(path, false);
+}
+
+pub(super) fn before_write(path: &Path) {
+	fire(path, true);
+}
+
+/// A tree with `root/sub/a.py` holding `inside` and, outside the root,
+/// `outside/a.py` holding `outside`; registers a hook that, before the access
+/// `write` names of `root/sub/a.py`, moves `root/sub` aside to `parked` and
+/// puts a symlink to `outside` in its place. Returns the tree and the flag
+/// the swap raises.
+#[cfg(unix)]
+fn swapped_tree(inside: &str, outside: &str, write: bool) -> (TempTree, Arc<AtomicBool>) {
+	let tree = temp_tree(&[("root/sub/a.py", inside), ("outside/a.py", outside)]);
+	let swapped = Arc::new(AtomicBool::new(false));
+	let (flag, sub, outside, parked) = (
+		Arc::clone(&swapped),
+		tree.root.join("root/sub"),
+		tree.root.join("outside"),
+		tree.root.join("parked"),
+	);
+	// Discovery reports paths below the canonical root.
+	let listed = fs::canonicalize(&sub).unwrap().join("a.py");
+	HOOKS.lock().unwrap().push((
+		listed,
+		write,
+		Box::new(move || {
+			fs::rename(&sub, parked).unwrap();
+			std::os::unix::fs::symlink(outside, &sub).unwrap();
+			flag.store(true, Ordering::SeqCst);
+		}),
+	));
+	(tree, swapped)
+}
+
+/// A search reads no file through a directory swapped, between discovery
+/// and the read, for a symlink to a directory outside the root that holds a
+/// file of the listed name; the refused read is reported. A walk that
+/// follows symlinks still reads by path.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn search_reads_no_file_through_a_directory_swapped_after_discovery() {
+	let (tree, swapped) = swapped_tree("print(\"inside\")\n", "print(\"outside\")\n", false);
+	let root = tree.root.join("root");
+	let vfs = Fs::native();
+	let found = candidates(&vfs, &root, None, None).await;
+	assert_eq!(displays(&found), ["sub/a.py"]);
+	let patterns = ["print($A)".to_string()];
+	let query = Query {
+		patterns:   &patterns,
+		lang:       None,
+		selector:   None,
+		strictness: MatchStrictness::Smart,
+		captures:   false,
+	};
+	let page = Page { offset: 0, limit: 10 };
+	let found = find_page(&vfs, found, &query, page).await.unwrap();
+	assert!(swapped.load(Ordering::SeqCst), "the swap ran");
+	let texts: Vec<_> = found
+		.hits
+		.iter()
+		.map(|hit| hit.matched.text.as_str())
+		.collect();
+	assert!(
+		!texts.iter().any(|text| text.contains("outside")),
+		"read through the swapped link: {texts:?}"
+	);
+	assert!(
+		found
+			.report
+			.warnings
+			.iter()
+			.any(|warning| warning.contains("sub/a.py")),
+		"the refused read is reported: {:?}",
+		found.report.warnings
+	);
+
+	let opts = Discover { follow_links: true, ..Default::default() };
+	let followed = discover(&vfs, &root, &opts).await.unwrap();
+	let found = find_page(&vfs, followed, &query, page).await.unwrap();
+	let texts: Vec<_> = found
+		.hits
+		.iter()
+		.map(|hit| hit.matched.text.as_str())
+		.collect();
+	assert_eq!(texts, ["print(\"outside\")"], "a following walk reads through the link");
+}
+
+/// A rewrite writes no file through a directory swapped, between the read
+/// and the write, for a symlink to a directory outside the root that holds
+/// a file of the listed name: the write fails, and neither the file outside
+/// nor the listed one changes.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn rewrite_writes_no_file_through_a_directory_swapped_after_the_read() {
+	let (tree, swapped) = swapped_tree("print(1)\n", "print(1)\n", true);
+	let rules = rules(&[("print($A)", "repr($A)")]);
+	let spec = rewrite_spec(&rules, None, Mode::Write);
+	let vfs = Fs::native();
+	let found = candidates(&vfs, &tree.root.join("root"), None, None).await;
+	assert_eq!(displays(&found), ["sub/a.py"]);
+	let result = rewrite(&vfs, found, &spec).await;
+	assert!(swapped.load(Ordering::SeqCst), "the swap ran");
+	let outside = fs::read_to_string(tree.root.join("outside/a.py")).unwrap();
+	assert_eq!(outside, "print(1)\n", "written through the swapped link: {result:?}");
+	let listed = fs::read_to_string(tree.root.join("parked/a.py")).unwrap();
+	assert_eq!(listed, "print(1)\n", "written by another route: {result:?}");
+	let err = result.unwrap_err().to_string();
+	assert!(err.starts_with("Failed to write "), "{err}");
 }
