@@ -495,11 +495,14 @@ change to the terminal's record that `--continue` reads. Otherwise the session's
 header is written at once, rather than with its first entry, so a later launch
 under the same id finds it taken, and only then is the terminal's record updated.
 
-A store with no ownership lease (`session.storage: sql`) cannot make that check
-atomic: two launches under one id can both pass it. There each launch reads the
-store again once its own header is durable, and withdraws, deleting the header it
-wrote and failing with the same message, when another session is named for the id.
-At most one of them goes on; two that each see the other both fail.
+The header is first published on the condition that its file does not exist yet,
+so a launch that drew the same file name (the same id at the same millisecond)
+fails there with the same message. A store with no ownership lease
+(`session.storage: sql`) still cannot make the held check atomic for two different
+file names: there each launch reads the store again once its own header is
+durable, and withdraws, deleting the header it wrote and failing with the same
+message, when another session is named for the id. At most one of them goes on;
+two that each see the other both fail.
 
 `--session-id` starts a new session, so it is refused beside every other session
 selector: `--resume`/`-r`/`--session`, `--restore`, `--continue`/`-c`, `--fork`,
