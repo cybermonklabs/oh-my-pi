@@ -458,8 +458,9 @@ export class ChildProcess<In extends InMask = InMask> {
 	 * subreaper is launching even when another process resumes it between them.
 	 * Signalling the subreaper alone would not: SIGSTOP does not end a fork in
 	 * progress, and its child can appear after the read. The one escape is a
-	 * command that leaves the group (setsid) after its fork and before the kill,
-	 * which needs another process to resume the frozen subreaper in that window.
+	 * command that leaves the group (setsid or setpgid, as coreutils `timeout`
+	 * and job-control shells do) after its fork and before the kill, which needs
+	 * another process to resume the frozen subreaper in that window.
 	 * Freeze, kill and resume all go through `root`, the native handle pinned to
 	 * the subreaper's identity, never through a pid this code holds: once the
 	 * subreaper has been reaped and its pid reused, they signal nothing. The
@@ -770,10 +771,11 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	 * On Linux, `subreaper` implies `detached`: the subreaper always leads its
 	 * own process group and session. A stop signals that group, and Linux
 	 * delivers a group signal to a child that a fork in progress adds, so a kill
-	 * cannot miss a command the subreaper is launching. Terminal job control
-	 * (Ctrl-C, Ctrl-Z) therefore no longer reaches the command directly; stop it
-	 * with `kill()`, `signal` or `timeout`. `detached: false` with `subreaper`
-	 * contradicts this and is refused on every platform.
+	 * cannot miss a command the subreaper is launching. The new session has no
+	 * controlling terminal, so the command cannot open `/dev/tty`, and terminal
+	 * job control (Ctrl-C, Ctrl-Z) and a terminal hangup (SIGHUP) no longer reach
+	 * it directly; stop it with `kill()`, `signal` or `timeout`. `detached:
+	 * false` with `subreaper` contradicts this and is refused on every platform.
 	 */
 	subreaper?: boolean;
 	/** Expose and retain complete stderr for a later `wait({ stderr: "full" })`. */

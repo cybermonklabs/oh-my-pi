@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import { Process } from "@oh-my-pi/pi-natives";
 import { type ChildProcess, spawn } from "@oh-my-pi/pi-utils/ptree";
 
@@ -86,7 +87,9 @@ describe.skipIf(process.platform !== "linux")("ptree subreaper kill without a us
 		// The first children() read reports nothing, so the stop freezes the tree and
 		// reads again; that read throws. The resume must still run, so the fallback's
 		// SIGTERM ends the subreaper (a stopped one would only die at the SIGKILL)
-		// and the command is not left stopped for ever.
+		// and the command is not left stopped for ever. The fallback's group signal
+		// can end the command itself on a hard kill, so the resume is also checked
+		// directly: it is the SIGCONT the stop sends on its way out.
 		for (const [gracefulMs, signalCode] of [
 			[50, "SIGTERM"],
 			[-1, "SIGKILL"],
@@ -100,12 +103,16 @@ describe.skipIf(process.platform !== "linux")("ptree subreaper kill without a us
 			if (!root || !command) throw new Error("failed to capture the subreaper process tree");
 			try {
 				let reads = 0;
+				const sent: number[] = [];
 				const failingSecondRead = {
 					children: (): Process[] => {
 						if (++reads === 1) return [];
 						throw new Error("Value is not an instance of class `Process`");
 					},
-					killTree: (signal?: number) => root.killTree(signal),
+					killTree: (signal?: number) => {
+						if (signal !== undefined) sent.push(signal);
+						return root.killTree(signal);
+					},
 				} as unknown as Process;
 				const lookup = spyOn(Process, "fromPid").mockImplementation(pid =>
 					pid === child.pid ? failingSecondRead : null,
@@ -116,6 +123,7 @@ describe.skipIf(process.platform !== "linux")("ptree subreaper kill without a us
 				lookup.mockRestore();
 
 				expect(reads).toBe(2);
+				expect(sent, "the stop must resume the frozen tree").toContain(os.constants.signals.SIGCONT);
 				expect(child.proc.signalCode).toBe(signalCode);
 				// procfs reports size 0, so read it with readFile rather than a sized Bun.file read.
 				// The fallback signals the group the subreaper leads, which can end the command
