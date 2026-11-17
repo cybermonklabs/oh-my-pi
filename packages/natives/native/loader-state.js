@@ -1144,14 +1144,15 @@ export function initLoaderContext(overrides = {}) {
 }
 
 /**
- * Put back a file of this process's own cache directory that vanished between
- * the check that found it and its load: cleanup in another process renames a
- * stale directory away for a moment while it checks whether a start marked it
- * used (`cleanupStaleNativeVersions`). Extracting or staging again makes the
- * directory and writes the file, unless cleanup renamed the directory back
- * first. Returns whether `candidate` is there now.
+ * Have a file of this process's own cache directory there again after it
+ * vanished between the check that found it and its load: cleanup in another
+ * process renames a stale directory away for a moment while it checks whether a
+ * start marked it used (`cleanupStaleNativeVersions`). If cleanup has renamed it
+ * back, the file is there already; otherwise extracting or staging again makes
+ * the directory and writes the file. Returns whether `candidate` is there now.
  */
 function restoreCachedAddon(ctx, errors, candidate, io) {
+	if (io.existsSync(candidate)) return true;
 	const filename = path.basename(candidate);
 	const embeddedFile = ctx.isCompiledBinary && embeddedAddon?.files.find(file => file.filename === filename);
 	if (embeddedFile) maybeExtractEmbeddedAddon(ctx, errors, embeddedFile, io);
@@ -1177,7 +1178,9 @@ export function loadNative({ io = fs } = {}) {
 	const embeddedCandidate = maybeExtractEmbeddedAddon(ctx, errors, undefined, io);
 	const stagedCandidate = embeddedCandidate ? null : maybeStageNodeModulesAddon(ctx, errors, io);
 	const prepended = [embeddedCandidate, stagedCandidate].filter(c => typeof c === "string");
-	const runtimeCandidates = prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
+	// Each path once: a load that fails is retried below for its own reason, never by
+	// finding the same path again further down the list.
+	const runtimeCandidates = [...new Set([...prepended, ...ctx.candidates])];
 	const fallbackEmbeddedFile =
 		ctx.selectedVariant === "modern" && embeddedAddon
 			? embeddedAddon.files.find(file => file.variant === "baseline")
@@ -1206,10 +1209,12 @@ export function loadNative({ io = fs } = {}) {
 			return load(candidate);
 		} catch (err) {
 			let failure = err;
-			// Once: a file of this process's cache directory that vanished since it was found.
+			// Once: a file of this process's cache directory that was not there when it was
+			// loaded (`MODULE_NOT_FOUND`), though the check before found it, whether cleanup has
+			// put it back since or not.
 			if (
 				path.dirname(candidate) === ctx.versionedDir &&
-				!io.existsSync(candidate) &&
+				(failure?.code === "MODULE_NOT_FOUND" || !io.existsSync(candidate)) &&
 				restoreCachedAddon(ctx, errors, candidate, io)
 			) {
 				try {

@@ -193,7 +193,9 @@ describe("a compiled binary whose cache directory cleanup claims during the star
 		expect(digest).toMatch(/^[0-9a-f]{64}$/);
 		const entry = path.join(root, "entry.ts");
 		// With PROBE_CLAIM set, cleanup in another process claims the cache directory (renames
-		// it to its private name) right after the loader's check found the addon there.
+		// it to its private name) right after the loader's check found the addon there. With
+		// PROBE_CLAIM=putback, cleanup then renames it back (a start had marked it used) before
+		// the loader next asks whether the file is there.
 		await Bun.write(
 			entry,
 			[
@@ -201,16 +203,24 @@ describe("a compiled binary whose cache directory cleanup claims during the star
 				`import * as path from "node:path";`,
 				`import { loadNative } from ${JSON.stringify(path.join(loaderDir, "loader-state.js"))};`,
 				`let claimed = null;`,
+				`let dir = null;`,
+				`let putBack = false;`,
 				`const io = { ...fs, statSync(target, ...rest) {`,
 				`	const stat = fs.statSync(target, ...rest);`,
 				`	if (process.env.PROBE_CLAIM && !claimed && String(target).endsWith(".node") && stat.isFile()) {`,
-				`		const dir = path.dirname(String(target));`,
+				`		dir = path.dirname(String(target));`,
 				`		claimed = path.join(path.dirname(dir), "." + path.basename(dir) + ".removing.1." + crypto.randomUUID());`,
 				`		fs.renameSync(dir, claimed);`,
 				`	}`,
 				`	return stat;`,
+				`}, existsSync(target) {`,
+				`	if (process.env.PROBE_CLAIM === "putback" && claimed && !putBack && String(target).endsWith(".node")) {`,
+				`		putBack = true;`,
+				`		fs.renameSync(claimed, dir);`,
+				`	}`,
+				`	return fs.existsSync(target);`,
 				`} };`,
-				`try { loadNative({ io }); console.log(JSON.stringify({ loaded: true, claimed })); }`,
+				`try { loadNative({ io }); console.log(JSON.stringify({ loaded: true, claimed, putBack })); }`,
 				`catch (err) { console.log(JSON.stringify({ loaded: false, claimed, error: String(err?.message ?? err).split("\\n").slice(0, 4).join(" | ") })); }`,
 			].join("\n"),
 		);
@@ -230,12 +240,12 @@ describe("a compiled binary whose cache directory cleanup claims during the star
 		if (root) await fs.rm(root, { recursive: true, force: true });
 	});
 
-	async function probe(nativesDir: string, claim: boolean) {
+	async function probe(nativesDir: string, claim: "" | "stay" | "putback") {
 		const env: Record<string, string | undefined> = { ...process.env, PI_NATIVES_DIR: nativesDir };
 		delete env.__PI_NATIVE_VARIANT_CACHE;
 		delete env.__PI_NATIVES_DIR_CACHE;
 		if (process.arch === "x64") env.PI_NATIVE_VARIANT = realAddon?.includes("-baseline") ? "baseline" : "modern";
-		if (claim) env.PROBE_CLAIM = "1";
+		if (claim) env.PROBE_CLAIM = claim;
 		else delete env.PROBE_CLAIM;
 		const child = Bun.spawn([binary], { env, stdout: "pipe", stderr: "ignore" });
 		const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
@@ -243,20 +253,33 @@ describe("a compiled binary whose cache directory cleanup claims during the star
 		return JSON.parse(output.trim().split("\n").at(-1)!) as {
 			loaded: boolean;
 			claimed: string | null;
+			putBack?: boolean;
 			error?: string;
 		};
 	}
 
-	it("loads the addon it puts back, never failing the start", async () => {
-		const nativesDir = path.join(root, "natives");
-		expect(await probe(nativesDir, false)).toEqual({ loaded: true, claimed: null });
+	it("extracts the addon again and loads it when the directory stays away", async () => {
+		const nativesDir = path.join(root, "natives-stay");
+		expect(await probe(nativesDir, "")).toMatchObject({ loaded: true, claimed: null });
 
-		const claimedStart = await probe(nativesDir, true);
+		const claimedStart = await probe(nativesDir, "stay");
 
 		expect(claimedStart.claimed).toBeString();
-		expect(claimedStart).toEqual({ loaded: true, claimed: claimedStart.claimed });
+		expect(claimedStart).toEqual({ loaded: true, claimed: claimedStart.claimed, putBack: false });
 		const ownDir = path.join(nativesDir, `${version}-${digest.slice(0, 12)}`);
 		expect(nodeFs.existsSync(path.join(ownDir, realAddon!))).toBe(true);
+	}, 300_000);
+
+	it("loads the addon again when cleanup put the directory back, extracting nothing", async () => {
+		const nativesDir = path.join(root, "natives-putback");
+		expect(await probe(nativesDir, "")).toMatchObject({ loaded: true, claimed: null });
+		const ownAddon = path.join(nativesDir, `${version}-${digest.slice(0, 12)}`, realAddon!);
+		const { ino } = await fs.stat(ownAddon);
+
+		const claimedStart = await probe(nativesDir, "putback");
+
+		expect(claimedStart).toEqual({ loaded: true, claimed: claimedStart.claimed, putBack: true });
+		expect((await fs.stat(ownAddon)).ino).toBe(ino);
 	}, 300_000);
 });
 

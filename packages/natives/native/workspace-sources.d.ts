@@ -10,12 +10,20 @@ export interface RustSources {
 	roots: string[];
 	/** The source files under the roots, `/`-separated and sorted: git's tracked and unignored files, or a walk's. */
 	files: string[];
-	/** SHA-256 over each listed file's path, size and modification time, hex. */
-	fingerprint: string;
-	/** SHA-256 over each listed file's path and content (a link's target, for a link), hex. */
-	digest: string;
+	/** The listed files git did not track at build time; they count while they exist. */
+	untracked: string[];
 	/** Each listed file's content hash; never written to the record. */
 	hashes: Record<string, string>;
+	/** SHA-256 over each listed file's path, size and modification time, hex. */
+	fingerprint: string;
+	/** SHA-256 over each tracked file's path and content (a link's target, for a link), hex. */
+	digest: string;
+	/** Each untracked file's content hash. */
+	untrackedHashes: Record<string, string>;
+	/** The directories build scripts scan, each with the modification times of it and its subdirectories. */
+	scanned: { dir: string; dirs: Record<string, number> }[];
+	/** Each package directory and whether it has a `build.rs`. */
+	packages: { dir: string; buildScript: boolean }[];
 }
 
 /** A path for a temporary file next to `target`, unique to this process and thread. */
@@ -38,11 +46,7 @@ export function addonSourcesStampPath(addonPath: string): string;
  * time, set to the whole second), was built from `sources` with the settings `build`
  * (profile, features, flags), kept for diagnosis and never compared.
  */
-export function writeAddonSourcesStamp(
-	addonPath: string,
-	sources: Omit<RustSources, "hashes">,
-	build: Record<string, unknown>,
-): void;
+export function writeAddonSourcesStamp(addonPath: string, sources: RustSources, build: Record<string, unknown>): void;
 
 /** Give `toAddonPath`, a copy of `fromAddonPath`, the record of the addon it was copied from. */
 export function copyAddonSourcesStamp(fromAddonPath: string, toAddonPath: string): void;

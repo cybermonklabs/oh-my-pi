@@ -130,8 +130,10 @@ describe("the natives directory the addon loader and pi-utils name", () => {
 /**
  * omp loads the addon (its SQLite lock shim) before pi-utils' `env.ts` applies `.env` files,
  * so a directory variable from a `.env` file arrives after the loader has resolved the
- * natives directory. Both must still name one directory. Each case runs in its own process,
- * as omp does: the loader first, then `env.ts`, then pi-utils.
+ * natives directory. The loader, pi-utils, and a child process started with the environment
+ * that follows (as omp starts its subprocess workers) must still name one directory. Each case
+ * runs in its own process, as omp does: the loader first, then `env.ts`, then pi-utils, then
+ * the child.
  */
 describe("the natives directory when a directory variable comes from a .env file", () => {
 	const DIRECTORY_NAMES = [
@@ -167,7 +169,11 @@ describe("the natives directory when a directory variable comes from a .env file
 	it.each(cases)("names one directory when the agent's .env sets %s", async (name, value, existing) => {
 		const home = path.join(tempRoot, "home");
 		for (const dir of existing) await fs.mkdir(path.join(tempRoot, dir), { recursive: true });
-		await Bun.write(path.join(home, ".omp/agent/.env"), `${name}=${value.replaceAll("<tmp>", tempRoot)}\n`);
+		// The marker shows the `.env` file was read, so the case can fail.
+		await Bun.write(
+			path.join(home, ".omp/agent/.env"),
+			`${name}=${value.replaceAll("<tmp>", tempRoot)}\nNATIVES_DOTENV_PROBE=read\n`,
+		);
 		const script = path.join(tempRoot, "probe.ts");
 		await Bun.write(
 			script,
@@ -175,7 +181,8 @@ describe("the natives directory when a directory variable comes from a .env file
 const loaderFirst = initLoaderContext({ isCompiledBinary: true }).nativesDir;
 await import(${JSON.stringify(path.join(import.meta.dir, "../src/env.ts"))});
 const { getNativesDir } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/dirs.ts"))});
-console.log(JSON.stringify({ applied: process.env[${JSON.stringify(name)}], loaderFirst, loaderLater: initLoaderContext({ isCompiledBinary: true }).nativesDir, piUtils: getNativesDir() }));
+const child = Bun.spawnSync([process.execPath, "-e", ${JSON.stringify(`console.log((await import(${JSON.stringify(path.join(import.meta.dir, "../../natives/native/natives-dir.js"))})).getNativesDir())`)}], { env: process.env });
+console.log(JSON.stringify({ marker: process.env.NATIVES_DOTENV_PROBE, loaderFirst, loaderLater: initLoaderContext({ isCompiledBinary: true }).nativesDir, piUtils: getNativesDir(), child: child.stdout.toString().trim() }));
 `,
 		);
 		const env: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
@@ -189,9 +196,9 @@ console.log(JSON.stringify({ applied: process.env[${JSON.stringify(name)}], load
 		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
 		const result = JSON.parse(stdout);
 
-		// The .env file was read, so the case can fail.
-		expect(result.applied).toBe(value.replaceAll("<tmp>", tempRoot));
+		expect(result.marker).toBe("read");
 		expect(result.loaderLater).toBe(result.loaderFirst);
 		expect(result.piUtils).toBe(result.loaderFirst);
+		expect(result.child).toBe(result.loaderFirst);
 	});
 });

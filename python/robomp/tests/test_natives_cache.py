@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -204,6 +205,106 @@ def test_image_seed_key_lists_the_cache_key_paths_in_order() -> None:
     assert trees is not None, "the Dockerfile's `printf ... $tree:<path>` list is missing"
     assert tuple(re.findall(r"\"\$tree:([^\"]+)\"", trees.group(1))) == CACHE_KEY_PATHS
 
+
+def _dockerignore_excludes(patterns: list[str], rel: str) -> bool:
+    """Whether Docker's build context leaves out `rel` under these dockerignore patterns.
+
+    Docker's rules: `**` matches any number of directories, `*` and `?` stay within one;
+    a pattern that matches a parent directory leaves out everything below it; `!` keeps;
+    the last matching pattern wins.
+    """
+
+    def regex(pattern: str) -> re.Pattern[str]:
+        out = ""
+        i = 0
+        while i < len(pattern):
+            if pattern.startswith("**/", i):
+                out += "(?:.*/)?"
+                i += 3
+            elif pattern.startswith("**", i):
+                out += ".*"
+                i += 2
+            elif pattern[i] == "*":
+                out += "[^/]*"
+                i += 1
+            elif pattern[i] == "?":
+                out += "[^/]"
+                i += 1
+            else:
+                out += re.escape(pattern[i])
+                i += 1
+        return re.compile(out)
+
+    parts = rel.split("/")
+    prefixes = ["/".join(parts[: n + 1]) for n in range(len(parts))]
+    excluded = False
+    for line in patterns:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        keep = line.startswith("!")
+        pattern = line[1:] if keep else line
+        pattern = pattern.strip().strip("/")
+        if pattern and any(regex(pattern).fullmatch(prefix) for prefix in prefixes):
+            excluded = not keep
+    return excluded
+
+
+def _image_seed_trees(context: Path, trees: Path) -> None:
+    """The Dockerfile's key step over a build context (`git add -f` into a throwaway index)."""
+    git_dir = context.parent / f"{context.name}.key.git"
+    config = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "init", "-q", "--bare", str(git_dir)], check=True, env=os.environ | config)
+    env = os.environ | config | {"GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(context)}
+    present = [path for path in CACHE_KEY_PATHS if (context / path).exists()]
+    subprocess.run(
+        ["git", "add", "-f", "--", *present, ":(exclude)**/node_modules/**"], check=True, cwd=context, env=env
+    )
+    tree = subprocess.run(["git", "write-tree"], check=True, capture_output=True, text=True, env=env).stdout.strip()
+    lines = subprocess.run(
+        ["git", "cat-file", "--batch-check"],
+        input="".join(f"{tree}:{path}\n" for path in CACHE_KEY_PATHS),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout
+    trees.write_text(lines)
+
+
+@pytest.mark.parametrize("dockerignore", [".dockerignore", "Dockerfile.dockerignore"])
+def test_build_context_leaves_out_a_host_sources_record(dockerignore: str) -> None:
+    patterns = (Path(__file__).resolve().parents[3] / dockerignore).read_text(encoding="utf-8").splitlines()
+    assert _dockerignore_excludes(patterns, f"packages/natives/native/{SOURCES_RECORD}")
+    assert _dockerignore_excludes(patterns, f"crates/x/{SOURCES_RECORD}")
+    # Not everything: the context still holds the sources the image builds from.
+    assert not _dockerignore_excludes(patterns, "crates/pi-natives/src/lib.rs")
+
+
+def test_image_seed_key_ignores_a_host_sources_record_in_the_context(tmp_path: Path) -> None:
+    # A working checkout where someone ran `bun run build:native` holds the addon's sources
+    # record. Docker sends the context through Dockerfile.dockerignore; the seed key computed
+    # from it must be the one a robomp workspace of the same commit computes.
+    repo = _seed_repo(tmp_path / "repo")
+    (repo / "packages" / "natives" / "native" / SOURCES_RECORD).write_text('{"addon":{}}\n')
+    patterns = (
+        (Path(__file__).resolve().parents[3] / "Dockerfile.dockerignore").read_text(encoding="utf-8").splitlines()
+    )
+    context = tmp_path / "context"
+    for source in repo.rglob("*"):
+        rel = source.relative_to(repo).as_posix()
+        if rel == ".git" or rel.startswith(".git/") or not source.is_file():
+            continue
+        if _dockerignore_excludes(patterns, rel):
+            continue
+        (context / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, context / rel)
+    trees = tmp_path / "trees.txt"
+    _image_seed_trees(context, trees)
+
+    assert natives_cache._key_from_lines(trees.read_text().splitlines(), "linux-arm64") == compute_key(
+        repo, target="linux-arm64"
+    )
 
 
 def test_compute_key_raises_on_non_repo(tmp_path: Path) -> None:

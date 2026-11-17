@@ -270,6 +270,319 @@ describe("the Rust sources a workspace addon was built from", () => {
 	});
 });
 
+/** The real git, resolved once: a test below puts a fake one first on PATH. */
+const gitBinary = Bun.which("git") ?? "git";
+
+/** Run git in `cwd` with no user or system configuration and a fixed identity. */
+function git(cwd: string, ...args: string[]) {
+	const result = Bun.spawnSync([gitBinary, "-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t", ...args], {
+		env: gitEnv,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	expect(result.exitCode).toBe(0);
+}
+
+describe("inputs a build takes in that no listed file names", () => {
+	const defs = "crates/pi-shell/src/minimizer/defs";
+
+	/** A checkout like this one: pi-shell's build script compiles every defs `.toml`, as its BUILD.bazel declares. */
+	async function checkout() {
+		await Bun.write(path.join(repo, "Cargo.toml"), '[workspace]\nmembers = ["crates/*"]\n');
+		await Bun.write(path.join(repo, "crates/pi-shell/Cargo.toml"), '[package]\nname = "pi-shell"\n');
+		await Bun.write(path.join(repo, "crates/pi-shell/build.rs"), "fn main() {}\n");
+		await Bun.write(
+			path.join(repo, "crates/pi-shell/BUILD.bazel"),
+			[
+				'# build.rs concatenates the defs (a comment naming glob(["ignored/*"]) is no input).',
+				"cargo_build_script(",
+				'    name = "build_script",',
+				'    srcs = ["build.rs"],',
+				'    data = glob(["src/minimizer/defs/*.toml"]),',
+				")",
+				"",
+				"rust_library(",
+				'    name = "pi-shell",',
+				'    compile_data = glob(["src/process/*.txt"]),',
+				")",
+				"",
+			].join("\n"),
+		);
+		await Bun.write(path.join(repo, "crates/pi-shell/src/lib.rs"), "pub fn shell() {}\n");
+		await Bun.write(path.join(repo, "crates/pi-shell/src/process/a.txt"), "text\n");
+		await Bun.write(path.join(repo, defs, "a.toml"), "[filters.a]\n");
+		await Bun.write(path.join(repo, "crates/pi-ast/Cargo.toml"), '[package]\nname = "pi-ast"\n');
+		await Bun.write(path.join(repo, "crates/pi-ast/src/lib.rs"), "pub fn ast() {}\n");
+		git(repo, "init", "-q");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-qm", "base");
+		await build();
+	}
+
+	it("record the directories build scripts scan and the packages' build scripts", async () => {
+		await checkout();
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(stamp.scanned.map((entry: { dir: string }) => entry.dir)).toEqual([defs]);
+		expect(stamp.packages).toEqual([
+			{ dir: ".", buildScript: false },
+			{ dir: "crates/pi-ast", buildScript: false },
+			{ dir: "crates/pi-shell", buildScript: true },
+		]);
+	});
+
+	it("are other sources when a file is added to a scanned directory, committed or not", async () => {
+		await checkout();
+		await Bun.write(path.join(repo, defs, "zz-probe.toml"), "[filters.zz_probe]\n");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-qm", "new filter");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("are other sources when a file leaves a scanned directory", async () => {
+		await checkout();
+		await Bun.write(path.join(repo, defs, "b.toml"), "[filters.b]\n");
+		await build();
+		await fs.rm(path.join(repo, defs, "b.toml"));
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("are other sources when a package gains a build.rs", async () => {
+		await checkout();
+		await Bun.write(path.join(repo, "crates/pi-ast/build.rs"), 'fn main() { println!("cargo:rustc-cfg=zz"); }\n');
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("stay current for an unrelated new file, and for a scanned directory touched with the same files", async () => {
+		await checkout();
+		for (const added of [
+			"crates/pi-shell/tests/zz_probe_test.rs",
+			"crates/pi-shell/src/lib.rs~",
+			"crates/pi-shell/src/process/b.txt",
+			"crates/pi-ast/README.md",
+		]) {
+			await Bun.write(path.join(repo, added), "added after the build\n");
+		}
+		expect(addonSourcesState(addon, repo)).toBe("current");
+
+		// A file made and removed in a scanned directory moves its time and nothing else.
+		await Bun.write(path.join(repo, defs, "a.toml.swp-like"), "scratch\n");
+		await fs.rm(path.join(repo, defs, "a.toml.swp-like"));
+		const later = new Date(Date.now() + 60_000);
+		await fs.utimes(path.join(repo, defs), later, later);
+		expect(addonSourcesState(addon, repo)).toBe("current");
+		// The start remembers the directory's new time, so the next start lists nothing.
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(stamp.scanned[0].dirs[defs]).toBe((await fs.stat(path.join(repo, defs))).mtimeMs);
+	});
+
+	it("are other sources when a listed file in a scanned directory changes (control)", async () => {
+		await checkout();
+		await Bun.write(path.join(repo, defs, "a.toml"), "[filters.a]\n# edited\n");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("are other sources when a gitignored file is added to a scanned directory", async () => {
+		// Bazel's glob and pi-shell's build.rs read every `.toml` there, gitignored or not.
+		await checkout();
+		await Bun.write(path.join(repo, ".gitignore"), "crates/pi-shell/src/minimizer/defs/local-*.toml\n");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-qm", "ignore local defs");
+		await build();
+		expect(addonSourcesState(addon, repo)).toBe("current");
+
+		await Bun.write(path.join(repo, defs, "local-probe.toml"), "[filters.local_probe]\n");
+
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("record a gitignored file a scanned directory held at build time, and see its edits", async () => {
+		await checkout();
+		await Bun.write(path.join(repo, ".gitignore"), "crates/pi-shell/src/minimizer/defs/local-*.toml\n");
+		await Bun.write(path.join(repo, defs, "local-a.toml"), "[filters.local_a]\n");
+		await build();
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(stamp.files).toContain(`${defs}/local-a.toml`);
+		expect(addonSourcesState(addon, repo)).toBe("current");
+
+		await Bun.write(path.join(repo, defs, "local-a.toml"), "[filters.local_a]\n# edited\n");
+
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("record a link in a scanned directory as a link, never followed", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-outside-def-"));
+		try {
+			await Bun.write(path.join(outside, "shared.toml"), "[filters.shared]\n");
+			await checkout();
+			await fs.symlink(path.join(outside, "shared.toml"), path.join(repo, defs, "shared.toml"));
+			// A link to a directory, and one that loops: entries, never walked into.
+			await fs.symlink(outside, path.join(repo, defs, "vendored"));
+			await fs.symlink(".", path.join(repo, defs, "loop"));
+			await build();
+			const stamp = await Bun.file(`${addon}.sources.json`).json();
+			expect(stamp.files.filter((rel: string) => rel.startsWith(`${defs}/`))).toEqual([
+				`${defs}/a.toml`,
+				`${defs}/loop`,
+				`${defs}/shared.toml`,
+				`${defs}/vendored`,
+			]);
+
+			// The target is not this checkout's; the link is.
+			await Bun.write(path.join(outside, "shared.toml"), "[filters.shared]\n# edited elsewhere\n");
+			expect(addonSourcesState(addon, repo)).toBe("current");
+			await fs.rm(path.join(repo, defs, "shared.toml"));
+			await fs.symlink(path.join(outside, "other.toml"), path.join(repo, defs, "shared.toml"));
+			expect(addonSourcesState(addon, repo)).toBe("other");
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("a build where git will not list the repository", () => {
+	let savedPath: string | undefined;
+	let bin = "";
+
+	beforeEach(async () => {
+		savedPath = process.env.PATH;
+		bin = `${repo}-bin`;
+		// git refusing a repository it does not trust, as `safe.directory` makes it: with
+		// FAKE_GIT_REFUSE=repo it refuses a listing of the checkout (`git -C <checkout> …`) and
+		// runs the throwaway repository's commands; with FAKE_GIT_REFUSE=all it refuses all.
+		await Bun.write(
+			path.join(bin, "git"),
+			[
+				"#!/bin/sh",
+				'if [ "$FAKE_GIT_REFUSE" = all ] || { [ "$FAKE_GIT_REFUSE" = repo ] && [ "$1" = "-C" ]; }; then',
+				"  echo \"fatal: detected dubious ownership in repository at '$2'\" >&2",
+				'  echo "To add an exception for this directory, call:" >&2',
+				'  echo "" >&2',
+				'  echo "	git config --global --add safe.directory $2" >&2',
+				"  exit 128",
+				"fi",
+				`exec ${JSON.stringify(gitBinary)} "$@"`,
+				"",
+			].join("\n"),
+		);
+		await fs.chmod(path.join(bin, "git"), 0o755);
+		await Bun.write(path.join(repo, ".gitignore"), "crates/pi-natives/tools/cache/\n");
+		await Bun.write(path.join(repo, "crates/pi-natives/tools/cache/raw.json"), "download v1\n");
+		await Bun.write(path.join(repo, "crates/pi-natives/src/.lib.rs.swp"), "swap\n");
+		await Bun.write(path.join(repo, "crates/pi-natives/target/debug/out.o"), "object\n");
+		git(repo, "init", "-q");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-qm", "base");
+		process.env.PATH = `${bin}${path.delimiter}${savedPath ?? ""}`;
+	});
+
+	afterEach(async () => {
+		if (savedPath === undefined) delete process.env.PATH;
+		else process.env.PATH = savedPath;
+		delete process.env.FAKE_GIT_REFUSE;
+		await fs.rm(bin, { recursive: true, force: true });
+	});
+
+	it("lists against a throwaway repository, so .gitignore still applies, when git refuses the checkout", async () => {
+		process.env.FAKE_GIT_REFUSE = "repo";
+		await build();
+
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(stamp.files).toEqual([
+			"Cargo.lock",
+			"Cargo.toml",
+			"crates/pi-natives/src/.lib.rs.swp",
+			"crates/pi-natives/src/lib.rs",
+		]);
+		// Every listed file counts as tracked there.
+		expect(stamp.untracked).toEqual({});
+		await Bun.write(path.join(repo, "crates/pi-natives/tools/cache/raw.json"), "download v2\n");
+		expect(addonSourcesState(addon, repo)).toBe("current");
+		await Bun.write(path.join(repo, "crates/pi-natives/src/lib.rs"), "pub fn grep2() {}\n");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("walks the tree when git refuses every listing", async () => {
+		process.env.FAKE_GIT_REFUSE = "all";
+		await build();
+
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		// Every file, `.gitignore` or not, without names starting with a dot or `target`.
+		expect(stamp.files).toEqual([
+			"Cargo.lock",
+			"Cargo.toml",
+			"crates/pi-natives/src/lib.rs",
+			"crates/pi-natives/tools/cache/raw.json",
+		]);
+		await Bun.write(path.join(repo, "crates/pi-natives/tools/cache/raw.json"), "download v2\n");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+});
+
+describe("a record judged in another checkout of the same commit", () => {
+	/** A commit of the sources, and a clean clone of it to judge records in. */
+	async function commitAndClone() {
+		await Bun.write(path.join(repo, ".gitignore"), "crates/pi-natives/tools/cache/\n");
+		git(repo, "init", "-q");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-qm", "base");
+		const clean = `${repo}-clean`;
+		git(path.dirname(repo), "clone", "-q", repo, clean);
+		return clean;
+	}
+
+	/** Write the record in `tree`, then judge it in `clean`, with the addon copied as robomp copies it. */
+	async function judgeIn(tree: string, clean: string) {
+		const built = path.join(tree, "addon.node");
+		await Bun.write(built, "addon bytes");
+		writeAddonSourcesStamp(built, settleRustSources(tree, readRustSources(tree, CARGO_SOURCE_ROOTS)), CARGO_BUILD);
+		const copied = path.join(clean, "addon.node");
+		await fs.copyFile(built, copied);
+		await fs.copyFile(`${built}.sources.json`, `${copied}.sources.json`);
+		const { mtime, atime } = await fs.stat(built);
+		await fs.utimes(copied, atime, mtime);
+		return addonSourcesState(copied, clean);
+	}
+
+	afterEach(async () => {
+		await fs.rm(`${repo}-clean`, { recursive: true, force: true });
+		await fs.rm(`${repo}-context`, { recursive: true, force: true });
+	});
+
+	it("is current when it was written outside a repository holding a gitignored file", async () => {
+		const clean = await commitAndClone();
+		// A Docker build context: the tree without its `.git`, plus a gitignored download.
+		const context = `${repo}-context`;
+		await fs.cp(repo, context, { recursive: true, filter: source => path.basename(source) !== ".git" });
+		await Bun.write(path.join(context, "crates/pi-natives/tools/cache/raw.json"), "token\n");
+
+		expect(await judgeIn(context, clean)).toBe("current");
+	});
+
+	it("is current when it was written with an untracked file the other checkout lacks", async () => {
+		const clean = await commitAndClone();
+		await Bun.write(path.join(repo, "crates/pi-natives/NOTES.txt"), "scratch\n");
+
+		expect(await judgeIn(repo, clean)).toBe("current");
+	});
+
+	it("is other when a listed file differs in the other checkout (control)", async () => {
+		const clean = await commitAndClone();
+		await Bun.write(path.join(clean, "crates/pi-natives/src/lib.rs"), "pub fn grep2() {}\n");
+
+		expect(await judgeIn(repo, clean)).toBe("other");
+	});
+
+	it("still sees its own edits to a file untracked at build time", async () => {
+		await commitAndClone();
+		await Bun.write(path.join(repo, "crates/pi-natives/src/zz.rs"), "pub fn zz() {}\n");
+		await build();
+		await Bun.write(path.join(repo, "crates/pi-natives/src/zz.rs"), "pub fn zz2() {}\n");
+
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+});
+
 describe("temporary files", () => {
 	it("are unique to each writer in one process and one millisecond", () => {
 		// Worker threads share the pid, and a clock can return one millisecond to several.

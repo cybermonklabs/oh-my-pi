@@ -178,15 +178,122 @@ describe("one natives directory per process", () => {
 		expect(output.trim()).toBe(childDir);
 	});
 
-	it("takes an inherited answer only from its own process and parent", () => {
+	it("gives the child processes it starts its answer, whatever the variables say since", async () => {
+		const savedDownloadRoot = process.env.OMP_DOWNLOAD_ROOT;
+		// A first answer from a fallback root, with no PI_NATIVES_DIR set.
+		delete process.env.PI_NATIVES_DIR;
+		process.env.OMP_DOWNLOAD_ROOT = path.join(tempRoot, "first-root");
+		__resetNativesDirForTests();
+		try {
+			const first = getNativesDir();
+			// What a `.env` file read after the first call can set.
+			process.env.OMP_DOWNLOAD_ROOT = path.join(tempRoot, "from-dotenv");
+			const child = Bun.spawn(
+				[
+					process.execPath,
+					"-e",
+					`console.log((await import(${JSON.stringify(path.join(import.meta.dir, "../native/natives-dir.js"))})).getNativesDir())`,
+				],
+				{ env: process.env, stdout: "pipe", stderr: "inherit" },
+			);
+			const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+
+			expect(first).toBe(path.join(tempRoot, "first-root", "natives"));
+			expect(exitCode).toBe(0);
+			expect(output.trim()).toBe(first);
+		} finally {
+			if (savedDownloadRoot === undefined) delete process.env.OMP_DOWNLOAD_ROOT;
+			else process.env.OMP_DOWNLOAD_ROOT = savedDownloadRoot;
+		}
+	});
+
+	it("takes an inherited answer only from this process", () => {
 		const elsewhere = path.join(tempRoot, "elsewhere");
-		// A process whose pid was reused: same pid, another parent.
-		process.env.__PI_NATIVES_DIR_CACHE = JSON.stringify({ pid: process.pid, ppid: process.ppid + 1, dir: elsewhere });
+		getNativesDir();
+		const own = JSON.parse(process.env.__PI_NATIVES_DIR_CACHE!);
+		__resetNativesDirForTests();
+		// Another process given this pid later: same pid, another start time (Linux), or a
+		// recorded parent that still runs and is not this process's parent.
+		const other =
+			own.start === undefined
+				? { pid: process.pid, ppid: process.pid, dir: elsewhere }
+				: { pid: process.pid, ppid: process.ppid, start: `${Number(own.start) + 1}`, dir: elsewhere };
+		process.env.__PI_NATIVES_DIR_CACHE = JSON.stringify(other);
 		expect(getNativesDir()).toBe(path.join(tempRoot, "first"));
 
 		__resetNativesDirForTests();
-		// The main thread of this process, as a worker thread sees it.
-		process.env.__PI_NATIVES_DIR_CACHE = JSON.stringify({ pid: process.pid, ppid: process.ppid, dir: elsewhere });
+		// This process, as its worker threads see it.
+		process.env.__PI_NATIVES_DIR_CACHE = JSON.stringify({ ...own, dir: elsewhere });
 		expect(getNativesDir()).toBe(elsewhere);
 	});
+
+	it("without a start time, takes the answer of a process whose recorded parent has exited", async () => {
+		const exited = Bun.spawn([process.execPath, "-e", ""]);
+		await exited.exited;
+		const elsewhere = path.join(tempRoot, "elsewhere");
+		// Re-parented: the parent recorded at the first call is gone, and the live one differs.
+		process.env.__PI_NATIVES_DIR_CACHE = JSON.stringify({ pid: process.pid, ppid: exited.pid, dir: elsewhere });
+		expect(getNativesDir()).toBe(elsewhere);
+
+		__resetNativesDirForTests();
+		// A recorded parent that still runs and is not this process's parent: another process.
+		process.env.__PI_NATIVES_DIR_CACHE = JSON.stringify({ pid: process.pid, ppid: process.pid, dir: elsewhere });
+		expect(getNativesDir()).toBe(path.join(tempRoot, "first"));
+	});
+
+	it.each(["parent alive", "parent exited"] as const)(
+		"gives a worker thread started later the process's answer (%s)",
+		async arm => {
+			const natives = JSON.stringify(path.join(import.meta.dir, "../native/natives-dir.js"));
+			const worker = path.join(tempRoot, "worker.ts");
+			const child = path.join(tempRoot, "child.ts");
+			const parent = path.join(tempRoot, "parent.ts");
+			await Bun.write(worker, `postMessage((await import(${natives})).getNativesDir());\n`);
+			// The child resolves, has the variable changed (as a `.env` file can), tells its parent
+			// it is ready, and in the "parent exited" arm waits to be re-parented before it starts
+			// a worker. Re-parenting is the kernel's, with no event to await, so the child polls
+			// its parent pid. It prints its result on the stdout it shares with the parent.
+			await Bun.write(
+				child,
+				[
+					`const first = (await import(${natives})).getNativesDir();`,
+					`const ppidAtFirst = process.ppid;`,
+					`process.env.PI_NATIVES_DIR = ${JSON.stringify(path.join(tempRoot, "from-dotenv"))};`,
+					`process.stderr.write("ready\\n");`,
+					`if (process.argv[2] === "parent exited") { const until = Date.now() + 20_000; while (process.ppid === ppidAtFirst && Date.now() < until) await Bun.sleep(20); }`,
+					`const w = new Worker(${JSON.stringify(worker)}, { type: "module" });`,
+					`const answer = await new Promise(resolve => { w.onmessage = e => resolve(e.data); });`,
+					`w.terminate();`,
+					`console.log(JSON.stringify({ first, answer, reparented: process.ppid !== ppidAtFirst }));`,
+				].join("\n"),
+			);
+			// The parent starts the child detached, waits for its "ready", and exits at once in the
+			// "parent exited" arm, so the child outlives it.
+			await Bun.write(
+				parent,
+				[
+					`const arm = process.argv[2];`,
+					`const child = Bun.spawn([process.execPath, ${JSON.stringify(child)}, arm], { stdio: ["ignore", "inherit", "pipe"], detached: true });`,
+					`child.unref();`,
+					`await child.stderr.getReader().read();`,
+					`if (arm === "parent alive") await child.exited;`,
+				].join("\n"),
+			);
+
+			const run = Bun.spawn([process.execPath, parent, arm], {
+				env: process.env,
+				stdout: "pipe",
+				stderr: "inherit",
+			});
+			// The pipe closes when its last writer, the child, exits.
+			const output = await new Response(run.stdout).text();
+			expect(await run.exited).toBe(0);
+			const { first, answer, reparented } = JSON.parse(output.trim().split("\n").at(-1)!);
+
+			expect(reparented).toBe(arm === "parent exited");
+			expect(first).toBe(path.join(tempRoot, "first"));
+			expect(answer).toBe(first);
+		},
+		60_000,
+	);
 });
