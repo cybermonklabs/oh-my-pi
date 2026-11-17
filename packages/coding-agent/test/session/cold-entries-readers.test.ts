@@ -125,12 +125,21 @@ const prunesPersistAsAppendedRecords = fs.existsSync(
 	path.join(import.meta.dir, "../../src/session/tool-result-prunes.ts"),
 );
 const PRUNABLE_RESULT_TEXT = `match line\n${BODY}`;
+/**
+ * The kept entry a compaction names that is not on the branch: the context
+ * cuts at the compaction itself, and the boundary the prune and shake passes
+ * resolve from it is 0, so they walk the entries before the cut. (A compaction
+ * that keeps no entry, `firstKeptEntryId: ""`, cuts at itself for the passes
+ * too, which then read nothing before it.)
+ */
+const KEPT_ENTRY_OFF_BRANCH = "kept-elsewhere";
 
 /**
  * A `grep` result flagged useless lies before the cut: a compaction that names
- * no kept entry cuts at itself, and the prune boundary it gives resolves
- * nowhere, so the next prune pass blanks the result. Blanking replaces only
- * its content; its large `details` stay. `now` dates the turn.
+ * a kept entry off the branch ({@link KEPT_ENTRY_OFF_BRANCH}) cuts at itself,
+ * and the prune boundary it gives resolves nowhere, so the next prune pass
+ * blanks the result. Blanking replaces only its content; its large `details`
+ * stay. `now` dates the turn.
  */
 function prunableResultSession(dir: string, now: number): Promise<string> {
 	const message = (id: string, parentId: string | null, body: unknown) => ({
@@ -162,7 +171,7 @@ function prunableResultSession(dir: string, now: number): Promise<string> {
 			parentId: "r1",
 			timestamp: TIMESTAMP,
 			summary: `c1 ${BODY}`,
-			firstKeptEntryId: "",
+			firstKeptEntryId: KEPT_ENTRY_OFF_BRANCH,
 			tokensBefore: 1000,
 		},
 	]);
@@ -255,7 +264,8 @@ describe("readers of the recent turns read no older body", () => {
 	it("elides a block of an entry before the cut, which goes back to the store with the placeholder", async () => {
 		using dir = TempDir.createSync("@omp-cold-readers-");
 		const fence = `\`\`\`ts\n${"const value = compute(a, b, c, d, e);\n".repeat(200)}\`\`\``;
-		// A compaction that names no kept entry cuts at itself, and the shake boundary it gives resolves nowhere.
+		// A compaction that names a kept entry off the branch cuts at itself, and the shake boundary it gives
+		// resolves nowhere.
 		const file = await writeEntries(dir.path(), [
 			{
 				type: "message",
@@ -277,7 +287,7 @@ describe("readers of the recent turns read no older body", () => {
 				parentId: "a1",
 				timestamp: TIMESTAMP,
 				summary: `c1 ${BODY}`,
-				firstKeptEntryId: "",
+				firstKeptEntryId: KEPT_ENTRY_OFF_BRANCH,
 				tokensBefore: 1000,
 			},
 			{

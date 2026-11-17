@@ -29,7 +29,9 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { type BlobStore, isBlobRef } from "./blob-store";
+import { COLD_OWNER, type ColdMessageSlots } from "./cold-message";
 import { TOOL_EXECUTION_START_CUSTOM_TYPE } from "./exit-diagnostics";
+import { forgetConvertMemo } from "./messages";
 import { compactionKeptStart, getReadableCompactionEntry } from "./session-context";
 import {
 	type CompactionEntry,
@@ -44,7 +46,9 @@ import { entryRecordText } from "./session-persistence";
 
 /**
  * A string value of a cold entry stays in memory up to this many UTF-16 units:
- * ids, roles, providers, models, stop reasons, tool names and call ids fit.
+ * ids, roles, stop reasons and most providers, models, tool names and call ids
+ * fit. A message's identity strings stay whatever their length
+ * ({@link MESSAGE_IDENTITY_FIELDS}).
  */
 export const COLD_STRING_MAX_UNITS = 64;
 /**
@@ -150,11 +154,13 @@ const MESSAGE_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["role"]);
  * `toolCallId`, `toolName` and `attribution`; the prompt cache scan of a new
  * branch view reads `stopReason` and `usage`; the to-do restore `toolName`
  * and `isError`; the retry checks that find a failed reply `errorMessage`;
- * the prune passes that run at the end of every turn, which walk the whole
- * branch after a compaction that keeps no entry (`firstKeptEntryId: ""`),
- * `prunedAt` (`collectSupersededResults` and `collectUselessResults`) and
- * `useless` (`collectUselessResults`); `api`, `customType` and `display` tell
- * extensions what a message is.
+ * the prune passes that run at the end of every turn read `prunedAt`
+ * (`collectSupersededResults` and `collectUselessResults`) and `useless`
+ * (`collectUselessResults`) of the results from the latest compaction's
+ * boundary on (that compaction itself when it kept no entry), which is the
+ * whole branch when the boundary is not on it; `api`, `customType` and
+ * `display` tell extensions what a message is. The strings of
+ * {@link MESSAGE_IDENTITY_FIELDS} stay data whatever their length.
  */
 const MESSAGE_FIELDS_KEPT_WHILE_SMALL: ReadonlySet<string> = new Set([
 	"timestamp",
@@ -173,6 +179,25 @@ const MESSAGE_FIELDS_KEPT_WHILE_SMALL: ReadonlySet<string> = new Set([
 	"errorMessage",
 	"prunedAt",
 	"useless",
+]);
+/**
+ * The fields of {@link MESSAGE_FIELDS_KEPT_WHILE_SMALL} that name what a
+ * message is and whom it answers: a string value of one stays data whatever
+ * its length. They are bounded identifiers a provider or a tool assigns, not
+ * bodies a turn writes, and the per-turn readers key every message on the
+ * branch by them, so one behind an accessor reads that message's record back
+ * from the store on every turn: an OpenAI Responses tool call id is its
+ * `call_id` and item id joined (81 characters), and a Bedrock application
+ * inference profile ARN as a model id runs past 64 too.
+ */
+const MESSAGE_IDENTITY_FIELDS: ReadonlySet<string> = new Set([
+	"toolCallId",
+	"responseId",
+	"provider",
+	"model",
+	"api",
+	"toolName",
+	"customType",
 ]);
 
 /**
@@ -346,7 +371,6 @@ const COLD_STORE = Symbol("omp.coldStore");
 const COLD_OFFSET = Symbol("omp.coldOffset");
 const COLD_LENGTH = Symbol("omp.coldLength");
 const COLD_MESSAGE = Symbol("omp.coldMessage");
-const COLD_OWNER = Symbol("omp.coldOwner");
 /** On an entry made whole again: the record it had, which it takes back if it goes cold unchanged. */
 const COLD_FORMER = Symbol("omp.coldFormer");
 
@@ -356,10 +380,6 @@ interface ColdEntrySlots {
 	[COLD_LENGTH]?: number;
 	[COLD_MESSAGE]?: object;
 	[COLD_FORMER]?: ColdRecord;
-}
-
-interface ColdMessageSlots {
-	[COLD_OWNER]?: object;
 }
 
 function recordOf(entry: object): ColdRecord | undefined {
@@ -464,17 +484,20 @@ function isAccessorFrom(target: object, key: string, accessors: ReadonlyMap<stri
  * Fields of `holder` a cold entry reads back from the store, in key order:
  * every one not in `inMemory` that is too large to keep, and every one not in
  * `whileSmall` whatever its size (with `whileSmall` undefined, any field stays
- * while small).
+ * while small). A string of a field in `identities` stays whatever its length.
  */
 function coldFields(
 	holder: Record<string, unknown>,
 	inMemory: ReadonlySet<string>,
 	whileSmall: ReadonlySet<string> | undefined,
+	identities?: ReadonlySet<string>,
 ): string[] {
 	const keys: string[] = [];
 	for (const key of Object.keys(holder)) {
 		if (inMemory.has(key)) continue;
-		if ((whileSmall && !whileSmall.has(key)) || !staysInMemory(holder[key])) keys.push(key);
+		const value = holder[key];
+		if (identities?.has(key) && typeof value === "string" && !isBlobRef(value)) continue;
+		if ((whileSmall && !whileSmall.has(key)) || !staysInMemory(value)) keys.push(key);
 	}
 	return keys;
 }
@@ -967,7 +990,9 @@ export function convertToColdEntry(
 		typeof message === "object" && message !== null && !Array.isArray(message) && Object.isExtensible(message)
 			? (message as Record<string, unknown>)
 			: undefined;
-	const messageKeys = shell ? coldFields(shell, MESSAGE_FIELDS_IN_MEMORY, MESSAGE_FIELDS_KEPT_WHILE_SMALL) : [];
+	const messageKeys = shell
+		? coldFields(shell, MESSAGE_FIELDS_IN_MEMORY, MESSAGE_FIELDS_KEPT_WHILE_SMALL, MESSAGE_IDENTITY_FIELDS)
+		: [];
 	const entryKeys = (
 		isCoreColdCustom(entry)
 			? coldFields(holder, CORE_CUSTOM_FIELDS_IN_MEMORY, CORE_CUSTOM_FIELDS_KEPT_WHILE_SMALL)
@@ -990,6 +1015,9 @@ export function convertToColdEntry(
 		for (const key of messageKeys) Object.defineProperty(shell, key, messageFieldAccessor(key));
 		setHiddenSlot(entry, COLD_MESSAGE, shell);
 		Object.defineProperty(entry, "message", entryMessageAccessor);
+		// The message keeps its identity, so its conversion for the model would
+		// keep the bodies it held in memory; none is kept while it is cold.
+		forgetConvertMemo(shell);
 	}
 	if (options?.paced) paceCollection(data.length);
 	return true;

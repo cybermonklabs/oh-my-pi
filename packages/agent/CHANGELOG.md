@@ -10,6 +10,7 @@
 
 - The context figure that the status line, compaction and the rate-limit fallback read now counts `$` Python output, `@file` mentions and a `!` command's terminal images, and no longer counts a `!!` or `$$` output that no request carries
 - Counting a stored custom message whose content is neither text nor blocks no longer throws
+- After a compaction that kept no entry (an Anthropic native compaction that summarizes everything), the prune and shake passes start at that compaction instead of walking, and reading, the whole history on every turn
 
 ## [18.18.2] - 2026-11-08
 

@@ -234,10 +234,12 @@ describe("AgentSession session stats", () => {
 		const directUsage = session.getContextUsage();
 		const stats = session.getSessionStats();
 
+		// The provider's prompt, and the answer the next request carries on top of it.
+		const tokens = 120_000 + agent.tokenizer.countMessage(assistantMessage);
 		expect(directUsage).toEqual({
-			tokens: 120_000,
+			tokens,
 			contextWindow: model.contextWindow,
-			percent: (120_000 / model.contextWindow) * 100,
+			percent: (tokens / model.contextWindow) * 100,
 		});
 		expect(stats.contextUsage).toEqual(directUsage);
 	});

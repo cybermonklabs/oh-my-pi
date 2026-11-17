@@ -82,6 +82,39 @@ function prefixToolCall(index: PrefixToolCalls, id: string): AgentToolCall | und
 }
 
 /**
+ * Resolve the array index of the compaction boundary (`keepBoundaryId`, the
+ * `firstKeptEntryId` of the latest compaction). Entries before this index are
+ * summarized away by that compaction and never sent, so the prune and shake
+ * passes neither walk nor mutate them. Returns 0 when there is no boundary (no
+ * compaction → whole branch is sent) or the id is absent from `entries`.
+ *
+ * A compaction that kept no entry (`firstKeptEntryId: ""`, as an Anthropic
+ * native compaction that summarizes everything leaves) keeps nothing before
+ * it: the boundary is that compaction, the latest on `entries`, or the entry
+ * after the one its native replay covers when turns were appended while it
+ * ran. The context the coding agent sends starts there too
+ * (`compactionKeptStart`); reading `""` as no boundary would walk, and read the
+ * bodies of, the whole branch on every pass.
+ */
+export function resolveBoundaryIndex(entries: readonly SessionEntry[], keepBoundaryId: string | undefined): number {
+	if (keepBoundaryId === undefined) return 0;
+	if (keepBoundaryId === "") {
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i];
+			if (entry.type !== "compaction") continue;
+			const replayThroughId = entry.providerReplayThroughEntryId;
+			const replayThroughIndex = replayThroughId ? entries.findIndex(other => other.id === replayThroughId) : -1;
+			return replayThroughIndex >= 0 && replayThroughIndex + 1 < i ? replayThroughIndex + 1 : i;
+		}
+		return 0;
+	}
+	for (let i = entries.length - 1; i >= 0; i--) {
+		if (entries[i].id === keepBoundaryId) return i;
+	}
+	return 0;
+}
+
+/**
  * Tool-call lookup for results in the sent region `entries[start, end)`.
  * Calls there are indexed eagerly; the summarized-away prefix is indexed only
  * on the first miss, once per boundary and branch (see

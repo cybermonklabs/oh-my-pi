@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A rate limit or overload the Anthropic API reports inside a streamed response (an `error` event of type `rate_limit_error` or `overloaded_error`) now carries HTTP status 429 or 529, so it is retried and held on the same model as the HTTP response would be
+
 ## [18.18.4] - 2026-11-09
 
 ### Added
