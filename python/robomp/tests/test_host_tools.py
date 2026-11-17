@@ -7,7 +7,7 @@ import json
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -20,6 +20,9 @@ from robomp.git_ops import PushResult
 from robomp.github_client import GitHubClient, IssueIndexEntry, IssueInfo, RepoInfo
 from robomp.host_tools import AbortController, ReleaseToolContext, ToolBindings, build
 from robomp.sandbox import LocalGitTransport, Workspace
+
+if TYPE_CHECKING:
+    from tests.conftest import GitConfigSeries
 
 
 def _stub_workspace(tmp_path: Path) -> Workspace:
@@ -151,6 +154,21 @@ def test_repo_command_env_scrubs_secrets_and_uses_workspace_cache(
     assert env["GIT_COMMITTER_NAME"] == bindings.author_name
     assert env["GIT_COMMITTER_EMAIL"] == bindings.author_email
     assert (bindings.workspace.root / ".omp-tmp").is_dir()
+
+
+def test_repo_command_env_appends_safe_directory_after_inherited_git_config(
+    db: Database, tmp_path: Path, git_config: GitConfigSeries, inherited_git_config: list[tuple[str, str]]
+) -> None:
+    # The user's own GIT_CONFIG_* entries stay ahead of safe.directory, and no
+    # slot is left past the count.
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert git_config.entries(env) == [*inherited_git_config, ("safe.directory", str(bindings.workspace.repo_dir))]
+    assert git_config.past_count(env) == {}
 
 
 def test_run_repo_command_uses_slot_identity_kwargs(

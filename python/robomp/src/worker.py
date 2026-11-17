@@ -36,13 +36,13 @@ from robomp import host_tools, persona, pragmas
 from robomp.cancellation import register_cancel_hook, unregister_cancel_hook
 from robomp.config import Settings
 from robomp.db import Database, issue_key
-from robomp.git_ops import DirtyState, inspect_dirty_state
+from robomp.git_ops import DirtyState, _safe_directory_overlay, inspect_dirty_state
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import CommentInfo, IssueInfo, PullRequestInfo, RepoInfo
 from robomp.host_tools import AbortController, ReleaseToolContext, ToolBindings, _git_identity_env
 from robomp.natives_cache import NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key
-from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env, _safe_directory_env
+from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env
 
 log = logging.getLogger(__name__)
 
@@ -595,7 +595,8 @@ def _run_rpc_blocking(
 
     rpc_env = _build_extra_env(settings)
     rpc_env.update(_prepare_slot_runtime_env(inputs.workspace, inputs.slot_uid))
-    rpc_env.update(_safe_directory_env(bindings.workspace.repo_dir))
+    # omp_rpc starts the agent with `{**os.environ, **rpc_env}`.
+    rpc_env.update(_safe_directory_overlay(os.environ, bindings.workspace.repo_dir))
     rpc_env.update(_git_identity_env(inputs.settings.resolved_author_name, inputs.settings.git_author_email))
     # Bare worktrees have no node_modules; install (idempotently) so the agent
     # can resolve workspace packages (@oh-my-pi/pi-*) and actually run tests.

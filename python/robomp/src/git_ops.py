@@ -130,11 +130,50 @@ def _slot_subprocess_kwargs(slot_uid: int | None) -> dict[str, Any]:
     return {"user": slot_uid, "group": slot_uid, "extra_groups": [_SHARED_OMP_GID], "umask": 0o002}
 
 
-def _append_safe_directory(env: dict[str, str], repo_dir: Path) -> None:
+_GIT_CONFIG_SLOT_RE = re.compile(r"GIT_CONFIG_(?:KEY|VALUE)_(\d+)")
+
+
+def _is_git_config_series_key(name: str) -> bool:
+    return name == "GIT_CONFIG_COUNT" or _GIT_CONFIG_SLOT_RE.fullmatch(name) is not None
+
+
+def _git_config_series(env: Mapping[str, str]) -> list[tuple[str, str]]:
+    """The `GIT_CONFIG_COUNT`/`KEY_<n>`/`VALUE_<n>` entries git reads from ``env``, in order."""
     count = int(env.get("GIT_CONFIG_COUNT", "0"))
-    env[f"GIT_CONFIG_KEY_{count}"] = "safe.directory"
-    env[f"GIT_CONFIG_VALUE_{count}"] = str(repo_dir)
+    return [(env.get(f"GIT_CONFIG_KEY_{i}", ""), env.get(f"GIT_CONFIG_VALUE_{i}", "")) for i in range(count)]
+
+
+def _append_git_config(env: dict[str, str], key: str, value: str) -> None:
+    """Add ``key=value`` after the `GIT_CONFIG_*` series ``env`` already carries.
+
+    Every inherited entry (a caller's own git config) keeps its slot and the new
+    one takes the next. Any slot ``env`` holds past the new count is dropped, so
+    no stale entry is left for git or a later append to read.
+    """
+    count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    env[f"GIT_CONFIG_KEY_{count}"] = key
+    env[f"GIT_CONFIG_VALUE_{count}"] = value
     env["GIT_CONFIG_COUNT"] = str(count + 1)
+    for name in [name for name in env if (slot := _GIT_CONFIG_SLOT_RE.fullmatch(name)) and int(slot[1]) > count]:
+        del env[name]
+
+
+def _append_safe_directory(env: dict[str, str], repo_dir: Path) -> None:
+    _append_git_config(env, "safe.directory", str(repo_dir))
+
+
+def _safe_directory_overlay(base: Mapping[str, str], repo_dir: Path) -> dict[str, str]:
+    """`GIT_CONFIG_*` overlay that appends ``safe.directory=<repo_dir>`` once merged over ``base``.
+
+    For an env assembled as ``{**base, **overlay}`` (omp_rpc's child env), the
+    merge equals `_append_safe_directory` applied to ``base``, except that the
+    stale slots it drops are overlaid as empty strings: an overlay cannot remove
+    a key, and git reads nothing past the count.
+    """
+    series = {name: value for name, value in base.items() if _is_git_config_series_key(name)}
+    appended = dict(series)
+    _append_safe_directory(appended, repo_dir)
+    return {**dict.fromkeys(series.keys() - appended.keys(), ""), **appended}
 
 
 def _local_remote_safe_directory(remote_url: str, *, cwd: Path) -> Path | None:
@@ -221,6 +260,10 @@ def _run_git(
     to another host, following `url.*.insteadOf` to `ext::`/ssh/file helpers,
     or running workspace hooks with the token in the environment.
 
+    The inherited `GIT_CONFIG_*` series (the caller's own git config) is kept;
+    the entries of an `extra_env` series and then `safe_directory` are appended
+    after it rather than written over its slots.
+
     A returncode of 0 returns the populated `CompletedProcess`. Non-zero exit
     returns the same shape; callers either `_check` it or inspect manually
     (e.g. when probing for ref existence). Stdout/stderr are always
@@ -230,7 +273,9 @@ def _run_git(
     if user is not None and _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
     if extra_env:
-        env.update(extra_env)
+        env.update({name: value for name, value in extra_env.items() if not _is_git_config_series_key(name)})
+        for key, value in _git_config_series(extra_env):
+            _append_git_config(env, key, value)
     if safe_directory is not None:
         _append_safe_directory(env, safe_directory)
 

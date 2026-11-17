@@ -11,6 +11,7 @@ import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -31,11 +32,11 @@ from robomp.sandbox import (
     SandboxManager,
     Workspace,
     _chown_workspace,
+    _git_env_for_repo,
     _prepare_slot_runtime_env,
     _prepare_slot_tmpdir,
     _provision_runtime_dirs,
     _reap_slot,
-    _safe_directory_env,
     _share_git_metadata_with_slots,
     _slot_pids,
     _slot_subprocess_kwargs,
@@ -43,6 +44,9 @@ from robomp.sandbox import (
     rename_workspace_branch,
     workspace_key,
 )
+
+if TYPE_CHECKING:
+    from tests.conftest import GitConfigSeries
 
 
 def _git(args: list[str], cwd: Path) -> None:
@@ -763,14 +767,26 @@ def test_provision_runtime_dirs_replaces_tmpdir_symlink_and_creates_xdg_tree(tmp
     assert (tmp_path / ".omp-xdg" / "cache" / "bun-install").is_dir()
 
 
-def test_safe_directory_env_scopes_single_repo_path(tmp_path: Path) -> None:
+def test_git_env_for_repo_whitelists_only_the_repo_path(tmp_path: Path, git_config: GitConfigSeries) -> None:
     repo_dir = tmp_path / "repo"
 
-    assert _safe_directory_env(repo_dir) == {
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "safe.directory",
-        "GIT_CONFIG_VALUE_0": str(repo_dir),
-    }
+    env = _git_env_for_repo(repo_dir)
+
+    assert git_config.entries(env) == [("safe.directory", str(repo_dir))]
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_git_env_for_repo_appends_after_inherited_git_config(
+    tmp_path: Path, git_config: GitConfigSeries, inherited_git_config: list[tuple[str, str]]
+) -> None:
+    # The caller's own GIT_CONFIG_* entries stay ahead of safe.directory, and no
+    # slot is left past the count.
+    repo_dir = tmp_path / "repo"
+
+    env = _git_env_for_repo(repo_dir)
+
+    assert git_config.entries(env) == [*inherited_git_config, ("safe.directory", str(repo_dir))]
+    assert git_config.past_count(env) == {}
 
 
 def test_slot_subprocess_kwargs_run_as_slot_on_linux_root(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1431,11 +1447,7 @@ def test_push_force_with_lease_refuses_when_origin_moved(tmp_path: Path, upstrea
     )
 
 
-def test_run_git_injects_safe_directory_and_subprocess_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from robomp.git_ops import _run_git
-
+def _capture_run_git_call(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     captured: dict[str, object] = {}
 
     def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -1444,6 +1456,15 @@ def test_run_git_injects_safe_directory_and_subprocess_identity(
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr("robomp.git_ops.subprocess.run", fake_run)
+    return captured
+
+
+def test_run_git_injects_safe_directory_and_subprocess_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from robomp.git_ops import _run_git
+
+    captured = _capture_run_git_call(monkeypatch)
 
     _run_git(
         ["status"],
@@ -1468,6 +1489,53 @@ def test_run_git_injects_safe_directory_and_subprocess_identity(
     assert captured["group"] == 2001
     assert captured["extra_groups"] == [2000]
     assert captured["umask"] == 0o002
+
+
+def test_run_git_appends_safe_directory_after_inherited_git_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    inherited_git_config: list[tuple[str, str]],
+) -> None:
+    # The caller's own GIT_CONFIG_* entries stay ahead of safe.directory, and no
+    # slot is left past the count.
+    from robomp.git_ops import _run_git
+
+    captured = _capture_run_git_call(monkeypatch)
+
+    _run_git(["status"], cwd=tmp_path, token=None, safe_directory=Path("/x"))
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert git_config.entries(env) == [*inherited_git_config, ("safe.directory", "/x")]
+    assert git_config.past_count(env) == {}
+
+
+def test_run_git_appends_extra_env_series_after_inherited_git_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    inherited_git_config: list[tuple[str, str]],
+) -> None:
+    # A local remote's safe.directory reaches `_run_git` as an `extra_env` series
+    # (`_explicit_remote_env`); it goes after the inherited entries, not over them.
+    from robomp.git_ops import _explicit_remote_env, _run_git
+
+    remote = tmp_path / "upstream.git"
+    extra_env = _explicit_remote_env(str(remote), cwd=tmp_path)
+    assert extra_env is not None
+    captured = _capture_run_git_call(monkeypatch)
+
+    _run_git(["fetch", str(remote)], cwd=tmp_path, token=None, extra_env=extra_env, safe_directory=Path("/x"))
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert git_config.entries(env) == [
+        *inherited_git_config,
+        ("safe.directory", str(remote)),
+        ("safe.directory", "/x"),
+    ]
+    assert git_config.past_count(env) == {}
 
 
 def test_run_git_scopes_token_and_scrubs_parent_auth_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2128,8 +2196,35 @@ def test_ensure_workspace_raises_when_symbolic_ref_probe_times_out(
         )
 
 
+def _worktree_entry(pool: Path, path: Path) -> list[str] | None:
+    """The `git worktree list --porcelain` lines of ``path``'s registration in ``pool``, or None."""
+    listed = subprocess.run(
+        ["git", "-C", str(pool), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    for block in listed.split("\n\n"):
+        lines = block.splitlines()
+        if lines and lines[0] == f"worktree {path}":
+            return lines
+    return None
+
+
+def _set_worktree_lock(pool: Path, path: Path, *, locked: bool) -> None:
+    """Lock or unlock ``path``'s registration, whatever the `git` that added it did."""
+    entry = _worktree_entry(pool, path)
+    assert entry is not None, f"{path} is not registered in {pool}"
+    if any(line.startswith("locked") for line in entry) != locked:
+        verb = ["lock", "--reason", "test lock"] if locked else ["unlock"]
+        _git(["-C", str(pool), "worktree", *verb, str(path)], cwd=pool)
+    entry = _worktree_entry(pool, path)
+    assert entry is not None and any(line.startswith("locked") for line in entry) == locked, entry
+
+
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "locked"])
 def test_remove_workspace_real_prune_clears_dangling_registration(
-    tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch, locked: bool
 ) -> None:
     # Integration guard: the other prune tests fully mock `_safe_run`, so the
     # REAL `git worktree prune` never runs and the stale-metadata risk this
@@ -2138,6 +2233,9 @@ def test_remove_workspace_real_prune_clears_dangling_registration(
     # `git worktree remove` to "time out" (124), and let the real rmtree+prune
     # run. The dangling registration must actually be gone afterward, and a
     # fresh add at the same path must succeed — the real integration risk.
+    # A prune keeps a locked registration, and a `git` wrapper on PATH may lock
+    # every `git worktree add`, so the test sets the lock state itself: both
+    # states must end with the path reusable.
     import robomp.sandbox as s
 
     mgr = SandboxManager(tmp_path / "workspaces")
@@ -2153,13 +2251,7 @@ def test_remove_workspace_real_prune_clears_dangling_registration(
     pool = mgr.pool_path("octo/widget")
     repo_dir = ws.repo_dir
     assert repo_dir.exists()
-    listed = subprocess.run(
-        ["git", "-C", str(pool), "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    assert str(repo_dir) in listed  # sanity: registration exists
+    _set_worktree_lock(pool, repo_dir, locked=locked)
 
     real_safe_run = s._safe_run
 
@@ -2174,20 +2266,31 @@ def test_remove_workspace_real_prune_clears_dangling_registration(
 
     mgr.remove_workspace(repo="octo/widget", number=21)
 
-    listed_after = subprocess.run(
-        ["git", "-C", str(pool), "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    assert str(repo_dir) not in listed_after, listed_after
+    assert _worktree_entry(pool, repo_dir) is None
     # The path is genuinely reusable again — the actual failure the fix prevents.
-    subprocess.run(
-        ["git", "-C", str(pool), "worktree", "add", "--detach", str(repo_dir), "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    _git(["-C", str(pool), "worktree", "add", "--detach", str(repo_dir), "HEAD"], cwd=pool)
+    assert repo_dir.exists()
+
+
+def test_worktree_add_failure_clears_locked_registration(tmp_path: Path, upstream_repo: Path) -> None:
+    # A killed `git worktree add --lock` (the lock can come from a wrapper on
+    # PATH) leaves a locked registration; the failed retry then deletes its
+    # checkout. The cleanup prune must still clear the registration, or every
+    # later retry fails on the same path.
+    import robomp.sandbox as s
+
+    pool = tmp_path / "pool"
+    _git(["clone", str(upstream_repo), str(pool)], cwd=tmp_path)
+    repo_dir = tmp_path / "ws" / "repo"
+    _git(["-C", str(pool), "worktree", "add", "--lock", "--detach", str(repo_dir), "HEAD"], cwd=tmp_path)
+    _set_worktree_lock(pool, repo_dir, locked=True)
+
+    with pytest.raises(GitCommandError):
+        s._worktree_add(["git", "worktree", "add", "--detach", str(repo_dir), "HEAD"], pool=pool, repo_dir=repo_dir)
+
+    assert not repo_dir.exists()
+    assert _worktree_entry(pool, repo_dir) is None
+    _git(["-C", str(pool), "worktree", "add", "--detach", str(repo_dir), "HEAD"], cwd=pool)
     assert repo_dir.exists()
 
 

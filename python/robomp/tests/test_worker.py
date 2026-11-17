@@ -8,18 +8,22 @@ whether the workspace's omp session directory already holds a JSONL transcript.
 from __future__ import annotations
 
 import asyncio
+import os
 import stat
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from robomp import worker
 from robomp.config import Settings
 from robomp.git_ops import DirtyState
+
+if TYPE_CHECKING:
+    from tests.conftest import GitConfigSeries
 
 
 class _FakeRpcClient:
@@ -384,6 +388,37 @@ async def test_run_rpc_uses_workspace_xdg_dirs_without_slot(tmp_path: Path, sett
     assert env["GIT_COMMITTER_EMAIL"] == settings.git_author_email
     assert tmpdir.is_dir()
     assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_appends_safe_directory_after_inherited_git_config(
+    tmp_path: Path,
+    settings: Settings,
+    git_config: GitConfigSeries,
+    inherited_git_config: list[tuple[str, str]],
+) -> None:
+    # omp_rpc starts the agent with `{**os.environ, **env}`: the user's own
+    # GIT_CONFIG_* entries reach the agent ahead of robomp's safe.directory, and
+    # no slot is left past the count.
+    inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False, slot_uid=None)
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="triage_issue",
+            prompt="x",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+
+    agent_env = {**os.environ, **_FakeRpcClient.instances[0].kwargs["env"]}
+    assert git_config.entries(agent_env) == [
+        *inherited_git_config,
+        ("safe.directory", str(inputs.workspace.repo_dir)),
+    ]
+    assert git_config.past_count(agent_env) == {}
 
 
 @pytest.mark.asyncio

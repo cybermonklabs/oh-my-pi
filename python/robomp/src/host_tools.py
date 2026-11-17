@@ -24,7 +24,7 @@ from omp_rpc import HostTool, HostToolContext, RpcCommandError, host_tool
 from robomp import persona
 from robomp.config import Settings
 from robomp.db import Database, IssueState, issue_key
-from robomp.git_ops import GitCommandError, HeadDriftError
+from robomp.git_ops import GitCommandError, HeadDriftError, _append_safe_directory
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import GitHubError, IssueInfo, PullRequestFileInfo, RepoInfo
 from robomp.issue_index import parse_search_query
@@ -32,7 +32,6 @@ from robomp.sandbox import (
     GitTransport,
     Workspace,
     _prepare_slot_runtime_env,
-    _safe_directory_env,
     _share_git_metadata_with_slots,
     _slot_permissions_active,
     _slot_subprocess_kwargs,
@@ -254,7 +253,7 @@ def _repo_command_env(bindings: ToolBindings) -> dict[str, str]:
     if _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
     env.update(_prepare_slot_runtime_env(bindings.workspace, bindings.slot_uid))
-    env.update(_safe_directory_env(bindings.workspace.repo_dir))
+    _append_safe_directory(env, bindings.workspace.repo_dir)
     env.update(_git_identity_env(bindings.author_name, bindings.author_email))
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env

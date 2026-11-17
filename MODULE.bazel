@@ -189,27 +189,45 @@ crate.from_cargo(
     ],
 )
 
-# opusic-sys builds its bundled Opus via `cmake` and selects Ninja from PATH.
-# The target-specific toolchain keeps MSVC cross builds on the wrapper
-# compiler/linker; CFLAGS keeps Zig cross builds free of host UBSan links.
+# --- build-script cmake and ninja (owned by bazel/toolchains:cmake.bzl) --------
+# opusic-sys and wasmtime-c-api-impl spawn `cmake` and `ninja` by name from the
+# build-script PATH, which --incompatible_strict_action_env leaves to these
+# annotations. @cmake_ninja is the exec host's copy of the CMake and Ninja
+# releases the omp-ci template pins: its bin/ goes first on that PATH and its
+# files are the build script's tools, so the scripts run the same tools from the
+# same exec-root path on every machine, wherever (or whether) the host installed
+# its own. The system dirs after it stay for whatever else the scripts spawn.
+# The PATH entry and the tools label name the canonical repo
+# (`+<repo rule>+<name>`, as for @msvc_cc below): keep them in sync if the rule
+# or the repo is ever renamed.
+cmake_ninja = use_repo_rule("//bazel/toolchains:cmake.bzl", "cmake_ninja_repository")
+
+cmake_ninja(name = "cmake_ninja")
+
+# opusic-sys builds its bundled Opus via `cmake` and selects Ninja when `ninja`
+# runs from PATH. The target-specific toolchain keeps MSVC cross builds on the
+# wrapper compiler/linker; CFLAGS keeps Zig cross builds free of host UBSan links.
 crate.annotation(
     build_script_env = {
         "CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc": "$${pwd}/external/+msvc_cc_repository+msvc_cc/toolchain.cmake",
         "CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc": "$${pwd}/external/+msvc_cc_repository+msvc_cc_arm64/toolchain.cmake",
         "CFLAGS": "-fno-sanitize=undefined",
-        "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/run/current-system/sw/bin",
+        "PATH": "$${pwd}/external/+cmake_ninja_repository+cmake_ninja/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/run/current-system/sw/bin",
     },
+    build_script_tools = ["@@+cmake_ninja_repository+cmake_ninja//:all"],
     crate = "opusic-sys",
 )
 
 # wasmtime-c-api-impl (tree-sitter's `wasm` feature) runs `cmake -P` to install
-# the C API headers tree-sitter compiles against; same host PATH as opusic-sys.
+# the C API headers tree-sitter compiles against; same PATH as opusic-sys.
 crate.annotation(
     build_script_env = {
-        "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/run/current-system/sw/bin",
+        "PATH": "$${pwd}/external/+cmake_ninja_repository+cmake_ninja/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/run/current-system/sw/bin",
     },
+    build_script_tools = ["@@+cmake_ninja_repository+cmake_ninja//:all"],
     crate = "wasmtime-c-api-impl",
 )
+# --- end build-script cmake and ninja -----------------------------------------
 
 # cargo-bazel omits workspace-local build dependencies from generated registry
 # build scripts; restore nix 0.28's edge to the patched cfg_aliases crate.
@@ -279,7 +297,7 @@ msvc_cc(
 # rules_rust build-script runner. The leading entry is the canonical repo path
 # of @msvc_cc (`+<repo rule>+<name>`) — keep in sync if the rule or repo in
 # this section is ever renamed. On non-msvc targets the dir simply does not
-# exist and the rest of the PATH matches the opusic-sys annotation above.
+# exist and the rest of the PATH is the system dirs.
 crate.annotation(
     build_script_env = {
         "PATH": "$${pwd}/external/+msvc_cc_repository+msvc_cc/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",

@@ -30,6 +30,7 @@ from robomp.config import Settings
 from robomp.git_ops import (
     GitCommandError,
     HeadDriftError,
+    _append_safe_directory,
 )
 from robomp.git_ops import (
     clone as git_clone,
@@ -51,7 +52,7 @@ from robomp.git_ops import (
 )
 from robomp.github_client import GitHubClient, GitHubError
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, verify
-from robomp.sandbox import _safe_directory_env, _slot_subprocess_kwargs
+from robomp.sandbox import _slot_subprocess_kwargs
 from robomp.sandbox import workspace_key as compute_workspace_key
 
 log = logging.getLogger(__name__)
@@ -269,7 +270,7 @@ def _git_probe_env(repo_dir: Path) -> dict[str, str]:
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}
     for key in _GIT_PROBE_SCRUBBED_ENV_KEYS:
         env.pop(key, None)
-    env.update(_safe_directory_env(repo_dir))
+    _append_safe_directory(env, repo_dir)
     return env
 
 

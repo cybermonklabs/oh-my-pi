@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import re
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 import pytest
@@ -9,6 +12,77 @@ import pytest
 from robomp.config import Settings, reset_settings_cache
 from robomp.dashboard import reset_index_cache, static_dir
 from robomp.db import Database, close_database
+
+_GIT_CONFIG_SLOT = re.compile(r"GIT_CONFIG_(?:KEY|VALUE)_(\d+)")
+
+
+def _is_git_config_series_key(key: str) -> bool:
+    return key == "GIT_CONFIG_COUNT" or _GIT_CONFIG_SLOT.fullmatch(key) is not None
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_git_config_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every test without the shell's GIT_CONFIG_COUNT/KEY_<n>/VALUE_<n> series.
+
+    robomp appends its own git config entries after an inherited series, so a
+    series the developer's shell exports (an agent session exports one) would
+    move them. A test that needs an inherited series sets it with `git_config`.
+    """
+    for key in list(os.environ):
+        if _is_git_config_series_key(key):
+            monkeypatch.delenv(key)
+
+
+class GitConfigSeries:
+    """Sets an inherited GIT_CONFIG_* series in os.environ and reads one back from an env."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._monkeypatch = monkeypatch
+
+    def inherit(self, count: int, *, stale: Iterable[int] = ()) -> list[tuple[str, str]]:
+        """Export ``count`` entries, plus stray slots ``stale`` past the count; return the entries."""
+        entries = [(f"inherited.key{i}", f"value{i}") for i in range(count)]
+        self._monkeypatch.setenv("GIT_CONFIG_COUNT", str(count))
+        for i, (key, value) in enumerate(entries):
+            self._monkeypatch.setenv(f"GIT_CONFIG_KEY_{i}", key)
+            self._monkeypatch.setenv(f"GIT_CONFIG_VALUE_{i}", value)
+        for i in stale:
+            assert i >= count, "a stale slot lies past the count"
+            self._monkeypatch.setenv(f"GIT_CONFIG_KEY_{i}", f"stale.key{i}")
+            self._monkeypatch.setenv(f"GIT_CONFIG_VALUE_{i}", f"stale{i}")
+        return entries
+
+    @staticmethod
+    def entries(env: Mapping[str, str]) -> list[tuple[str, str]]:
+        """The entries git reads from ``env``, in order."""
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+        return [(env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"]) for i in range(count)]
+
+    @staticmethod
+    def past_count(env: Mapping[str, str]) -> dict[str, str]:
+        """Non-empty GIT_CONFIG_KEY_<n>/VALUE_<n> slots of ``env`` at or past its count."""
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+        return {
+            key: value
+            for key, value in env.items()
+            if (match := _GIT_CONFIG_SLOT.fullmatch(key)) and int(match.group(1)) >= count and value
+        }
+
+
+@pytest.fixture
+def git_config(monkeypatch: pytest.MonkeyPatch) -> GitConfigSeries:
+    return GitConfigSeries(monkeypatch)
+
+
+@pytest.fixture(
+    params=[(1, ()), (3, ()), (1, (1, 4))],
+    ids=["inherited-1", "inherited-3", "inherited-1-stale-1-4"],
+)
+def inherited_git_config(request: pytest.FixtureRequest, git_config: GitConfigSeries) -> list[tuple[str, str]]:
+    """An inherited series of 1, of 3, and of 1 with stray slots 1 and 4 left past its count."""
+    count, stale = request.param
+    return git_config.inherit(count, stale=stale)
+
 
 # Minimum HTML the dashboard handler needs to render: `<title>` plus a script
 # block carrying the `__ROBOMP_CONFIG__` sentinel. The real Vite-built bundle

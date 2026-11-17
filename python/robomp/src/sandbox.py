@@ -56,6 +56,7 @@ from typing import Any, Protocol
 from robomp.git_ops import (
     GitCommandError,
     PushResult,
+    _append_safe_directory,
     redact_credentials,
 )
 from robomp.git_ops import (
@@ -121,18 +122,9 @@ def workspace_key(repo: str, number: int | str) -> str:
     return f"{repo.replace('/', '__')}__{number}"
 
 
-def _safe_directory_env(repo_dir: Path) -> dict[str, str]:
-    """Return a Git config env overlay whitelisting ``repo_dir`` as safe."""
-    return {
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "safe.directory",
-        "GIT_CONFIG_VALUE_0": str(repo_dir),
-    }
-
-
 def _git_env_for_repo(repo_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
-    env.update(_safe_directory_env(repo_dir))
+    _append_safe_directory(env, repo_dir)
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
@@ -393,6 +385,20 @@ def _run(
     return proc
 
 
+def _prune_deleted_worktree(pool: Path, repo_dir: Path) -> subprocess.CompletedProcess[str]:
+    """Drop the pool's registration of ``repo_dir`` after its checkout was deleted.
+
+    `git worktree prune` keeps a locked registration, and the lock need not be
+    ours: a `git` wrapper on PATH may add `--lock` to every `git worktree add`.
+    The checkout is this workspace's and already gone, so its lock protects
+    nothing and would only make the next add at this path fail; unlock it
+    first. The unlock exits non-zero, harmlessly, when the registration is not
+    locked or not there; the prune's result is the one callers check.
+    """
+    _safe_run(["git", "worktree", "unlock", str(repo_dir)], cwd=pool)
+    return _safe_run(["git", "worktree", "prune"], cwd=pool)
+
+
 def _worktree_add(add_cmd: list[str], *, pool: Path, repo_dir: Path) -> None:
     """Run `git worktree add`, cleaning partial state on failure.
 
@@ -409,7 +415,7 @@ def _worktree_add(add_cmd: list[str], *, pool: Path, repo_dir: Path) -> None:
         _run(add_cmd, cwd=pool)
     except GitCommandError as add_err:
         shutil.rmtree(repo_dir, ignore_errors=True)
-        pruned = _safe_run(["git", "worktree", "prune"], cwd=pool)
+        pruned = _prune_deleted_worktree(pool, repo_dir)
         if pruned.returncode != 0:
             raise GitCommandError(
                 ["git", "worktree", "prune"], pruned.returncode, pruned.stdout, pruned.stderr
@@ -1162,7 +1168,7 @@ class SandboxManager:
                     # a plain repeat close prunes nothing.
                     needs_prune = True
                 if needs_prune:
-                    pruned = _safe_run(["git", "worktree", "prune"], cwd=pool)
+                    pruned = _prune_deleted_worktree(pool, repo_dir)
                     if pruned.returncode != 0:
                         # Prune is the step that clears the dangling registration.
                         # If it fails (incl. a 124 timeout), report it so the
