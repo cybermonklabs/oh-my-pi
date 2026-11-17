@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -48,6 +48,8 @@ describe("profile directories", () => {
 	let originalXdgDataHome: string | undefined;
 	let originalXdgStateHome: string | undefined;
 	let originalXdgCacheHome: string | undefined;
+	let originalRootEnv: Record<string, string | undefined> = {};
+	let homedirSpy: Mock<typeof os.homedir> | undefined;
 
 	beforeEach(async () => {
 		originalAgentDir = getAgentDir();
@@ -59,9 +61,18 @@ describe("profile directories", () => {
 		originalXdgDataHome = process.env.XDG_DATA_HOME;
 		originalXdgStateHome = process.env.XDG_STATE_HOME;
 		originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+		originalRootEnv = {
+			OMP_CONFIG_ROOT: process.env.OMP_CONFIG_ROOT,
+			OMP_DOWNLOAD_ROOT: process.env.OMP_DOWNLOAD_ROOT,
+		};
 		tempRoot = path.join(os.tmpdir(), "pi-utils-profiles", Snowflake.next());
 		configDir = `.omp-profile-test-${Snowflake.next()}`;
 		await fs.mkdir(tempRoot, { recursive: true });
+		// The config root is `<home>/<configDir>`: a home of this test's own, not the one
+		// the test process runs in (whose root the preload replaced).
+		homedirSpy = spyOn(os, "homedir").mockReturnValue(path.join(tempRoot, "home"));
+		delete process.env.OMP_CONFIG_ROOT;
+		delete process.env.OMP_DOWNLOAD_ROOT;
 		process.env.PI_CONFIG_DIR = configDir;
 		// Other suites that run before this one (e.g. dirs-python-gateway) may have
 		// called `setAgentDir`, which permanently mutates the module-level
@@ -96,6 +107,11 @@ describe("profile directories", () => {
 		} else {
 			process.env.XDG_CACHE_HOME = originalXdgCacheHome;
 		}
+		for (const [key, value] of Object.entries(originalRootEnv)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		homedirSpy?.mockRestore();
 		if (originalProfile) {
 			setProfile(originalProfile);
 		} else if (originalAgentDirEnv !== undefined) {
@@ -114,7 +130,6 @@ describe("profile directories", () => {
 			process.env.PI_PROFILE = originalPiProfileEnv;
 		}
 		await fs.rm(tempRoot, { recursive: true, force: true });
-		await fs.rm(path.join(os.homedir(), configDir), { recursive: true, force: true });
 	});
 
 	it("moves agent and root data under the named profile root", () => {
@@ -369,8 +384,9 @@ describe("dirs module import behavior", () => {
 		const probeConfigDir = `.omp-default-profile-${Snowflake.next()}`;
 		try {
 			const dirsUrl = url.pathToFileURL(path.join(import.meta.dir, "..", "src", "dirs.ts")).href;
-			const workAgentDir = path.join(os.homedir(), probeConfigDir, "profiles", "work", "agent");
-			const defaultAgentDir = path.join(os.homedir(), probeConfigDir, "agent");
+			const home = path.join(root, "home");
+			const workAgentDir = path.join(home, probeConfigDir, "profiles", "work", "agent");
+			const defaultAgentDir = path.join(home, probeConfigDir, "agent");
 
 			for (const ompProfile of ["", "default"]) {
 				const probePath = path.join(root, `default-profile-${ompProfile || "empty"}.ts`);
@@ -387,6 +403,12 @@ describe("dirs module import behavior", () => {
 
 				const childEnv: Record<string, string | undefined> = {
 					...process.env,
+					// os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
+					HOME: home,
+					USERPROFILE: home,
+					// The config root is this home's, not the test process's own.
+					OMP_CONFIG_ROOT: undefined,
+					OMP_DOWNLOAD_ROOT: undefined,
 					PI_CONFIG_DIR: probeConfigDir,
 					OMP_PROFILE: ompProfile,
 					PI_PROFILE: "work",
@@ -411,7 +433,6 @@ describe("dirs module import behavior", () => {
 			}
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
-			await fs.rm(path.join(os.homedir(), probeConfigDir), { recursive: true, force: true });
 		}
 	});
 
@@ -456,6 +477,9 @@ describe("dirs module import behavior", () => {
 				PI_PROFILE: "work",
 			};
 			delete childEnv.PI_CODING_AGENT_DIR;
+			// The config root is this home's, not the test process's own.
+			delete childEnv.OMP_CONFIG_ROOT;
+			delete childEnv.OMP_DOWNLOAD_ROOT;
 			delete childEnv.XDG_DATA_HOME;
 			delete childEnv.XDG_STATE_HOME;
 			delete childEnv.XDG_CACHE_HOME;
