@@ -2394,8 +2394,7 @@ export class TurnRecovery {
 				if (this.#retryAbortController === usageReadController) this.#retryAbortController = undefined;
 			}
 		};
-		type WalkEntry = { role: string; selector: RetryFallbackSelector };
-		function* chainEntries(recovery: TurnRecovery): Generator<WalkEntry> {
+		function* chainEntries(recovery: TurnRecovery): Generator<{ role: string; selector: RetryFallbackSelector }> {
 			for (const role of recovery.retryFallbackChainKeys(currentSelector)) {
 				for (const selector of recovery.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
 					yield { role, selector };
@@ -2409,25 +2408,21 @@ export class TurnRecovery {
 		// each candidate that can redeem the credit through the same steps as the
 		// walk pass (the effort ceiling, the context fit, the usage skip and the
 		// key probe) and switches to nothing. A target that passes every step is
-		// one the walk would try, and the pass counts it usable; a target that
-		// the usage skip passes over is counted spent. When the pass counted a
-		// target spent and none usable, the credit counts as absent, and the walk
-		// pass runs in chain order as with no credit. Deciding this before the
-		// walk pass chooses keeps chain order: a same-provider Claude model
+		// one the walk would try: the pass notes it as usable and stops. A target
+		// that the usage skip passes over is noted as spent. When the pass found
+		// a spent target and no usable one, the credit counts as absent, and the
+		// walk pass runs in chain order as with no credit. Deciding this before
+		// the walk pass chooses keeps chain order: a same-provider Claude model
 		// earlier in the chain comes before another provider's model after it. A
 		// credit whose targets are not in the chain, or whose targets fail the
 		// other steps with none spent, stays live.
-		const readCreditTargets =
-			usageAwareFallback &&
-			options?.refusalWalk === true &&
-			creditHandle !== undefined &&
-			creditTargets.length > 0 &&
-			Date.now() < creditHandle.expiresAt;
-		let creditTargetsSpent = 0;
-		let creditTargetsUsable = 0;
+		const creditLive = (): boolean =>
+			creditHandle !== undefined && creditTargets.length > 0 && Date.now() < creditHandle.expiresAt;
+		const runCreditTargetPass = usageAwareFallback && options?.refusalWalk === true && creditLive();
+		let creditTargetSpent = false;
+		let creditTargetUsable = false;
 		let creditCountsAbsent = false;
-		for (const creditTargetPass of [true, false]) {
-			if (creditTargetPass && !readCreditTargets) continue;
+		for (const creditTargetPass of runCreditTargetPass ? [true, false] : [false]) {
 			for (const { role, selector } of chainEntries(this)) {
 				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
 				// A refusal walk visits any one model at most once per turn. Without this a
@@ -2482,9 +2477,7 @@ export class TurnRecovery {
 				// `Invalid signature in thinking block` 400 escalates to a retry that
 				// replays no thinking and succeeds, and the session stops replaying it
 				// afterwards.
-				const creditLive =
-					creditHandle !== undefined && creditTargets.length > 0 && Date.now() < creditHandle.expiresAt;
-				const refusalKeepsCredit = options?.refusalWalk === true && creditLive && !creditCountsAbsent;
+				const refusalKeepsCredit = options?.refusalWalk === true && creditLive() && !creditCountsAbsent;
 				if (
 					(signerRetryRemains || refusalKeepsCredit) &&
 					!canRedeemFallbackCredit &&
@@ -2517,12 +2510,12 @@ export class TurnRecovery {
 				// window (60 s for a denial, 5 minutes after a failed OAuth refresh,
 				// select.ts OAUTH_REFRESH_FAILURE_BACKOFF_MS), and the refusal steps
 				// must still reach the provider's other accounts and models. The
-				// credit-target pass counts a target it skips here as spent.
+				// credit-target pass notes a target it skips here as spent.
 				if (usageAwareFallback) {
 					const candidateUsage = await readWalkUsage(candidate);
 					if (candidateUsage === "stale") return false;
 					if (candidateUsage && isUsageSpent(candidateUsage)) {
-						if (creditTargetPass) creditTargetsSpent++;
+						if (creditTargetPass) creditTargetSpent = true;
 						continue;
 					}
 				}
@@ -2541,7 +2534,7 @@ export class TurnRecovery {
 				// target decides it, and probing later targets would only send key
 				// requests that the walk pass may never make.
 				if (creditTargetPass) {
-					creditTargetsUsable++;
+					creditTargetUsable = true;
 					break;
 				}
 				const previousEditMode = this.#host.resolveActiveEditMode();
@@ -2574,7 +2567,7 @@ export class TurnRecovery {
 				}
 				return applied;
 			}
-			if (creditTargetPass) creditCountsAbsent = creditTargetsSpent > 0 && creditTargetsUsable === 0;
+			if (creditTargetPass) creditCountsAbsent = creditTargetSpent && !creditTargetUsable;
 		}
 
 		return false;

@@ -893,7 +893,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		it("passes over a fallback at the reserve when the primary is spent before its first request", async () => {
 			// The walk after a failed request switches to a fallback at the reserve.
 			// The check before the model call does not: on a spent primary it moves
-			// to the first fallback that is neither spent nor at the reserve.
+			// to the first fallback that is neither depleted nor at the reserve.
 			stubUsageReads({
 				[formatModelString(PRIMARY)]: depletedRead("usage"),
 				[formatModelString(FALLBACK)]: {
