@@ -534,4 +534,49 @@ describe("Hindsight automatic recall after a failure", () => {
 		});
 		expect(notices[1].message).toContain("boom");
 	});
+
+	it("a recall in flight that fails during the pause does not lengthen it", async () => {
+		setSystemTime(T0);
+		const client = new CountingRecallApi();
+		const { state } = start(newSessionManager(), client, shippedConfig());
+		const firstTurnCalled = Promise.withResolvers<void>();
+		const firstTurnAnswer = Promise.withResolvers<RecallResponse>();
+		client.answer = () => {
+			firstTurnCalled.resolve();
+			return firstTurnAnswer.promise;
+		};
+		const firstTurn = state.beforeAgentStartPrompt(PROMPT);
+		await firstTurnCalled.promise;
+		const compactionCalled = Promise.withResolvers<void>();
+		const compactionAnswer = Promise.withResolvers<RecallResponse>();
+		client.answer = () => {
+			compactionCalled.resolve();
+			return compactionAnswer.promise;
+		};
+		const compaction = state.recallForCompaction([{ role: "user", content: "what did we decide?" }]);
+		await compactionCalled.promise;
+
+		// The first-turn recall fails and starts the pause; the compaction recall, sent before
+		// the pause began, fails inside it.
+		firstTurnAnswer.reject(new HindsightError("recall request failed: boom"));
+		expect(await firstTurn).toBeUndefined();
+		setSystemTime(T0 + 30_000);
+		compactionAnswer.reject(new HindsightError("recall request failed: boom"));
+		expect(await compaction).toBeUndefined();
+
+		client.answer = failWithBoom;
+		expect(await promptAroundEnd(state, client, T0 + SHIPPED_FIRST_PAUSE_MS)).toEqual({
+			skipped: true,
+			recalled: true,
+		});
+	});
+
+	it("a clock set back before the failure ends the pause", async () => {
+		const client = new CountingRecallApi();
+		const { state } = start(newSessionManager(), client, shippedConfig());
+		await promptAt(state, T0);
+		await promptAt(state, T0 - 60 * 60_000);
+
+		expect(client.calls).toBe(2);
+	});
 });
