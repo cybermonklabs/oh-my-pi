@@ -767,6 +767,39 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(modelOf(run.session)).toBe(formatModelString(CREDIT_TARGET));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
+
+		it("steps a refusal to the next model when the spent target's sibling target cannot hold the context", async () => {
+			// Opus 5's window here cannot hold the conversation, so the walk would
+			// not try it. With Opus 4.8 spent, no target is left that the walk
+			// would try: the credit holds nothing back, and the walk goes on in
+			// chain order as with no credit.
+			const sharedRegistry = modelRegistry;
+			const modelsConfigPath = path.join(tempDir.path(), "models-small-opus-5.yml");
+			await Bun.write(
+				modelsConfigPath,
+				JSON.stringify({
+					providers: { anthropic: { modelOverrides: { [NEXT_CREDIT_TARGET.id]: { contextWindow: 1 } } } },
+				}),
+			);
+			modelRegistry = new ModelRegistry(authStorage, modelsConfigPath);
+			try {
+				const { run, requestedModels } = await runCreditRefusal(
+					chainOf(CREDIT_TARGET, OTHER_CLAUDE, NEXT_CREDIT_TARGET),
+					{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
+				);
+
+				expect(requestedModels).toEqual([
+					formatModelString(FABLE),
+					formatModelString(FABLE),
+					formatModelString(OTHER_CLAUDE),
+				]);
+				expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
+				expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+				expect(lastAssistant(run.session).stopReason).toBe("stop");
+			} finally {
+				modelRegistry = sharedRegistry;
+			}
+		});
 	});
 
 	describe("the fallback before a turn keeps its rule", () => {
