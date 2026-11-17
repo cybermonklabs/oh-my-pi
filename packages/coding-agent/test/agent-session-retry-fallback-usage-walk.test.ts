@@ -887,6 +887,28 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
+
+		it("switches to another provider's model first in the chain when a credit target's key read fails", async () => {
+			// The walk switches to the model first in the chain and never reaches the
+			// credit target, so the target's failing key read must not end the turn.
+			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
+				if (model.provider === CREDIT_TARGET.provider && model.id === CREDIT_TARGET.id) {
+					throw new Error("credential command failed");
+				}
+				return getApiKey(model, sessionId, options);
+			});
+			const { run, requestedModels } = await runCreditRefusal(chainOf(FALLBACK, CREDIT_TARGET), {});
+
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(FALLBACK),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
 	});
 
 	describe("the fallback before a turn keeps its rule", () => {
