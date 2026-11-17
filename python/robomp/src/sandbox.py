@@ -1139,29 +1139,25 @@ class SandboxManager:
     def remove_workspace(self, *, repo: str, number: int | str) -> None:
         with self._repo_lock(repo):
             ws_root = self.workspace_root(repo, number)
-            repo_dir = ws_root / "repo"
             pool = self.pool_path(repo)
-            # Only run git in a REAL pool clone: `ensure_clone` mkdir's the pool
-            # dir BEFORE cloning, so a failed first clone can leave a non-git dir
-            # here, and git in it would error. Mirror `ensure_clone`'s own
-            # `.git`/`HEAD` validity check.
-            is_pool = (pool / ".git").exists() or (pool / "HEAD").exists()
-            # The workspace is the agent's to change: a link left at repo_dir
-            # would take `git worktree remove` into whatever it names, another
-            # workspace's checkout included, so only a real directory goes to
-            # git. Whatever git refuses or leaves goes with the rmtree below.
-            if is_pool and not repo_dir.is_symlink() and repo_dir.is_dir():
-                _safe_run(["git", "worktree", "remove", "--force", str(repo_dir)], cwd=pool)
+            # No git runs here. The workspace is the agent's to change, and git
+            # checks a path and then opens it again to delete it, so a link
+            # swapped in between would take it into whatever the link names,
+            # another workspace's checkout included. rmtree unlinks a link
+            # instead of following it.
             if ws_root.exists():
                 shutil.rmtree(ws_root, ignore_errors=True)
-            if is_pool:
+            # Only touch a REAL pool clone: `ensure_clone` mkdir's the pool dir
+            # BEFORE cloning, so a failed first clone can leave a non-git dir
+            # here. Mirror `ensure_clone`'s own `.git`/`HEAD` validity check.
+            if (pool / ".git").exists() or (pool / "HEAD").exists():
                 # Every worktree under the workspace root was its own: the
-                # checkout a failed or killed remove left, and any the agent
-                # added inside it. A registration left behind keeps holding its
-                # branch and fails the next add, so drop each one now gone; if
-                # that fails, raise so the cleanup event retries (this runs
-                # again with ws_root already gone). Without a dead registration
-                # under ws_root (a repeat close) it deletes nothing.
+                # checkout, and any the agent added inside it. A registration
+                # left behind keeps holding its branch and fails the next add,
+                # so drop each one now gone; if that fails, raise so the
+                # cleanup event retries (this runs again with ws_root already
+                # gone). Without a dead registration under ws_root (a repeat
+                # close) it deletes nothing.
                 _drop_worktree_registration(ws_root, pool, under=True)
 
     def reclaim_workspace_caches(self, *, repo: str, number: int | str) -> bool:

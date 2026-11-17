@@ -198,6 +198,32 @@ def test_repo_command_env_keeps_the_operator_credential_config_out(
     assert git_config.get(env, tmp_path, "user.name") == expected_user
 
 
+def test_repo_command_env_gives_its_own_xdg_config_home(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    operator_git_ignore: Path,
+    agent_home: Path,
+) -> None:
+    # `GIT_CONFIG_GLOBAL` does not keep git from reading the operator's
+    # per-user ignore file, and gh's token lives under `$XDG_CONFIG_HOME` too.
+    # A repo command's `XDG_CONFIG_HOME` is the agent home's `.config`, else
+    # the workspace's own empty dir, so git in its env still shows the file the
+    # operator's ignore file hides.
+    monkeypatch.setattr(host_tools, "_AGENT_HOME", agent_home)
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert git_config.untracked(os.environ, operator_git_ignore) == [], "control: git reads the operator's ignore"
+    assert git_config.untracked(env, operator_git_ignore) == ["untracked.txt"]
+    expected = agent_home / ".config" if agent_home.is_dir() else bindings.workspace.root / ".omp-xdg" / "config"
+    assert env["XDG_CONFIG_HOME"] == str(expected)
+
+
 def test_repo_command_env_keeps_credential_variables_out(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -117,6 +117,19 @@ class GitConfigSeries:
         got = subprocess.run(["git", "config", "--get", key], cwd=cwd, env=dict(env), capture_output=True, text=True)
         return got.stdout.strip() if got.returncode == 0 else None
 
+    @staticmethod
+    def untracked(env: Mapping[str, str], cwd: Path) -> list[str]:
+        """The files `git status` reports untracked in ``cwd`` under ``env``, ignore rules applied."""
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=cwd,
+            env=dict(env),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return [line.removeprefix("?? ") for line in status.splitlines() if line.startswith("?? ")]
+
 
 @pytest.fixture
 def git_config(monkeypatch: pytest.MonkeyPatch) -> GitConfigSeries:
@@ -197,6 +210,25 @@ def agent_home(request: pytest.FixtureRequest, tmp_path: Path) -> Path:
         user = GitConfigSeries.AGENT_HOME_USER
         (home / ".gitconfig").write_text(f"[user]\n\tname = {user}\n", encoding="utf-8")
     return home
+
+
+@pytest.fixture
+def operator_git_ignore(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A repository with one untracked file, and an operator's per-user ignore file that hides it.
+
+    robomp runs with an operator's HOME and, as a deployed robomp does, no
+    `XDG_CONFIG_HOME` of its own, so git reads `$HOME/.config/git/ignore`
+    (`*`) whatever `GIT_CONFIG_GLOBAL` says. Returns the repository.
+    """
+    home = tmp_path / "operator-home"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "ignore").write_text("*\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    repo = tmp_path / "status-repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    (repo / "untracked.txt").write_text("not ignored\n", encoding="utf-8")
+    return repo
 
 
 # Minimum HTML the dashboard handler needs to render: `<title>` plus a script

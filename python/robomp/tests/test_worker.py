@@ -447,6 +447,30 @@ async def test_run_rpc_keeps_the_operator_credential_config_from_the_agent(
     assert git_config.get(agent_env, tmp_path, "user.name") == expected_user
 
 
+@pytest.mark.asyncio
+async def test_run_rpc_gives_the_agent_its_own_xdg_config_home(
+    tmp_path: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    operator_git_ignore: Path,
+    agent_home: Path,
+) -> None:
+    # `GIT_CONFIG_GLOBAL` does not keep git from reading the operator's
+    # per-user ignore file, and gh's token lives under `$XDG_CONFIG_HOME` too.
+    # The agent's `XDG_CONFIG_HOME` is the agent home's `.config`, else the
+    # workspace's own empty dir, so git in the agent's env still shows the file
+    # the operator's ignore file hides.
+    monkeypatch.setattr(worker, "_AGENT_HOME", agent_home)
+
+    agent_env, inputs = _agent_env(tmp_path, settings)
+
+    assert git_config.untracked(os.environ, operator_git_ignore) == [], "control: git reads the operator's ignore"
+    assert git_config.untracked(agent_env, operator_git_ignore) == ["untracked.txt"]
+    expected = agent_home / ".config" if agent_home.is_dir() else inputs.workspace.root / ".omp-xdg" / "config"
+    assert agent_env["XDG_CONFIG_HOME"] == str(expected)
+
+
 _CREDENTIAL_ENV = {
     "GH_TOKEN": "probe-gh-token",
     "GIT_ASKPASS": "/probe/askpass",
