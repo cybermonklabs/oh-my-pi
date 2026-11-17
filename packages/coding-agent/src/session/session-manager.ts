@@ -2998,7 +2998,7 @@ export class SessionManager {
 			this.#sessionDir = path.resolve(options.sessionDir);
 			this.#storage.ensureDirSync(this.#sessionDir);
 		}
-		this.#sessionId = mintSessionId();
+		this.#sessionId = options?.sessionId ?? mintSessionId();
 		this.#taskSiblingCandidate = undefined;
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
@@ -6032,12 +6032,90 @@ export class SessionManager {
 	 * Create a new session.
 	 * @param cwd Working directory (stored in the session header)
 	 * @param sessionDir Optional session directory; defaults to the cwd-derived dir.
+	 * @param options New-session options; `sessionId` names the session instead of a minted id, and
+	 *   `suppressBreadcrumb` keeps the terminal's last-session record untouched.
 	 */
-	static create(cwd: string, sessionDir?: string, storage: SessionStorage = defaultSessionStorage()): SessionManager {
+	static create(
+		cwd: string,
+		sessionDir?: string,
+		storage: SessionStorage = defaultSessionStorage(),
+		options?: NewSessionOptions & { suppressBreadcrumb?: boolean },
+	): SessionManager {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
-		manager.#resetToNewSession();
+		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
+		manager.#resetToNewSession(options);
 		return manager;
+	}
+
+	/**
+	 * Create a new session under a launcher-chosen id, reserved for this process. The session claims
+	 * the id's ownership lease first, then asks `isHeld` whether a stored session already holds it,
+	 * and only then writes its header and records itself as the terminal's last session. So a second
+	 * launch under the id, in this process or another live one, finds it taken. Returns `undefined`,
+	 * having kept nothing, when another live process owns the id or `isHeld` answers `true`.
+	 *
+	 * The header is first published on the condition that its file does not exist yet, so a launch
+	 * that drew the same file name (the same id at the same millisecond) loses there instead of
+	 * taking the other launch's identical bytes for its own. A store with no ownership lease
+	 * (`session.storage: sql`) still cannot make the `isHeld` check atomic for two different file
+	 * names: there each launch looks again once its own header is durable in the shared store, and
+	 * withdraws (deleting what it wrote) when another session is named for the id, so at most one
+	 * goes on; two that each see the other both withdraw.
+	 */
+	static async createWithSessionId(
+		cwd: string,
+		sessionDir: string | undefined,
+		sessionId: string,
+		isHeld: () => Promise<boolean>,
+	): Promise<SessionManager | undefined> {
+		const manager = SessionManager.create(cwd, sessionDir, undefined, { sessionId, suppressBreadcrumb: true });
+		if (manager.#sessionOwnedElsewhere() || (await isHeld())) {
+			await manager.close();
+			return undefined;
+		}
+		const sessionFile = manager.#sessionFile;
+		if (sessionFile) {
+			const body = manager.#serializeBody();
+			try {
+				await manager.#storage.writeTextAtomic(sessionFile, Array.from(body.lines).join(""), {
+					expectedSize: null,
+				});
+			} catch (error) {
+				if (!(error instanceof SessionWriteConflictError)) throw error;
+				await manager.close();
+				return undefined;
+			}
+			manager.#expectedDiskSize = body.bytes;
+		}
+		await manager.ensureOnDisk();
+		if (!manager.#storage.claimSession && (await manager.#anotherSessionNamesThisId())) {
+			const written = manager.#sessionFile;
+			await manager.close();
+			if (written) {
+				await manager.#storage.deleteSessionWithArtifacts(written);
+				// Durable before the refusal, so the launch that goes on never sees this one again.
+				await manager.#storage.drain();
+			}
+			return undefined;
+		}
+		manager.#suppressBreadcrumb = false;
+		if (manager.#sessionFile) manager.#rememberBreadcrumb(manager.#cwd, manager.#sessionFile);
+		return manager;
+	}
+
+	/**
+	 * Whether a stored session other than this one is named for this session's id, read from the
+	 * shared store once this manager's own writes are durable there.
+	 */
+	async #anotherSessionNamesThisId(): Promise<boolean> {
+		await this.#storage.drain();
+		await this.#storage.refresh?.();
+		const suffix = `_${this.#sessionId}.jsonl`;
+		const own = this.#sessionFile ? path.resolve(this.#sessionFile) : undefined;
+		// Key-indexed stores match only `*`, `*.ext` and exact names, so the id is matched here.
+		const files = this.#storage.listAllSync?.() ?? this.#storage.listFilesSync(this.#sessionDir, "*.jsonl");
+		return files.some(file => file.endsWith(suffix) && path.resolve(file) !== own);
 	}
 
 	/**

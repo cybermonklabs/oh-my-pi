@@ -218,7 +218,8 @@ describe("BashTool ACP terminal routing", () => {
 	});
 
 	it("resolves using the last polled output when final output retrieval fails", async () => {
-		shortenAcpWaits();
+		// Real waits: the case ends on the terminal's own exit after one 250 ms poll tick. Compressing the
+		// command's deadline would race it against that exit, and a loaded machine would lose the race.
 		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
 		let currentOutputCalls = 0;
 		const handle: ClientBridgeTerminalHandle = {

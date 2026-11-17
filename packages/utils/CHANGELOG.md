@@ -13,10 +13,12 @@
 - Added `readByteSourceChunks` to read a byte range of a `ByteSource` as reads of at most 1 MiB
 - Added the optional `MemberSource.chunks` so a format can serve a member in bounded chunks, and `chunksOrWhole` to read a source through it or, without it, as one chunk
 - Added `writeChunksToFile` to write an async iterable of byte chunks to a file one awaited write at a time
+- Added `OMP_CONFIG_ROOT`, an absolute config root that replaces `~/.omp` on every OS (profiles, the default agent directory, and all state, data and caches move under it), and `OMP_DOWNLOAD_ROOT`, a config root that holds only the version-fixed downloads (the managed Chromium, the native addon and its grammars, FastEmbed models and runtime, tiny models), so several config roots share one copy; added `getConfigRootOverride()` and `getBrowserStateDir()`. The test preload gives every test process a config root of its own and shares only the developer's downloads
 
 ### Fixed
 
 - Fixed `extractRetryHint` ignoring a wait or reset window stated as a Go duration such as `try again in 6m0s`, `try again in 1m30s` or `resets in 1h30m`: its parts now add up, so a caller waits the time the provider states instead of its own backoff
+- Fixed test processes (`PI_TEST_RUNTIME=1` or a Bun test entrypoint) loading `~/.env` and the config root's `.env` (`~/.omp/.env`), which put the developer's auth broker, tokens and provider keys back into a test's environment; the agent directory's and project's `.env` files still load
 
 ## [18.18.2] - 2026-11-08
 

@@ -76,13 +76,17 @@ describe("task progress rendering", () => {
 	it("shortens current and recent path arguments without rewriting search patterns", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const file = `${os.homedir()}/private/file`;
+		// A search pattern keeps the absolute path, and the card previews a tool's argument in 40
+		// cells, so a long home directory cuts it short. Its first 30 characters are always shown,
+		// and a rewritten pattern ("~/…") would not start with them.
+		const patternShown = file.slice(0, 30);
 		for (const [key, recent, args, expected] of [
 			["file_path", false, file, "~/private/file"],
 			["path", true, file, "~/private/file"],
 			["command", false, `cat <${file}`, "cat <~/private/file"],
 			["task", false, `Inspect ${file}`, "Inspect ~/private/file"],
 			["prompt", false, `Explain ${file}`, "Explain ~/private/file"],
-			["pattern", false, file, file],
+			["pattern", false, file, patternShown],
 		] as const) {
 			const progress = runningProgress(
 				recent

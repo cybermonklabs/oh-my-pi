@@ -34,6 +34,7 @@ import {
 	validateGoalStartup,
 	validateRestoreLaunch,
 	validateRestorePrompt,
+	validateSessionIdLaunch,
 	validateToolNames,
 } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -1266,7 +1267,7 @@ function validateSessionPersistenceArgs(parsed: Pick<Args, "continue" | "noSessi
 	}
 }
 /**
- * Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager.
+ * Resolves CLI session flags into an existing, forked, in-memory, new, or cancelled session manager.
  *
  * `nativeFlagOwnership: "preliminary"` is reserved for the startup parse,
  * before extensions establish whether a built-in-named flag belongs to them.
@@ -1283,6 +1284,23 @@ export async function createSessionManager(
 		onSessionContinuation?: (continuation: SessionContinuation) => void;
 	} = {},
 ): Promise<SessionManager | undefined> {
+	if (parsed.sessionId !== undefined) {
+		const sessionId = parsed.sessionId;
+		// A stored session holds the id when `--resume <id>` would open it: the same scopes and storage,
+		// matched by the exact id.
+		const manager = await SessionManager.createWithSessionId(
+			cwd,
+			parsed.sessionDir,
+			sessionId,
+			async () => (await resolveResumeTarget(sessionId, cwd, parsed.sessionDir, { exactId: true })) !== undefined,
+		);
+		if (!manager) {
+			throw new SessionResolutionError(
+				`Session "${sessionId}" already exists; resume it with --resume ${sessionId}.`,
+			);
+		}
+		return manager;
+	}
 	if (parsed.fork) {
 		if (parsed.noSession) {
 			throw new SessionResolutionError("--fork requires session persistence");
@@ -1956,6 +1974,7 @@ export async function runRootCommand(
 		// Before session resolution: resume, fork, and import act on these same
 		// startup-parse flags, so rejecting later would leave forked or imported
 		// transcripts (or an opened picker) behind a usage error.
+		validateSessionIdLaunch(parsedArgs);
 		validateGoalLaunch(parsedArgs, isInteractive);
 		validateRestoreLaunch(parsedArgs, isInteractive);
 		// Without piped text the prompt must come from argv, which only the

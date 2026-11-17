@@ -149,6 +149,20 @@ export function observedPromptCacheTier(usage: Usage): PromptCacheTier | undefin
 	return undefined;
 }
 
+/**
+ * Lifetime of the entry a completed response wrote, as the provider named it in
+ * its per-TTL cache-write breakdown (Anthropic `usage.cache_creation`): the
+ * `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens` fields name
+ * their entries' lifetimes. A response that wrote both names the shorter: the
+ * cached prefix lives only as long as its shortest part. Undefined when the
+ * response wrote nothing or the provider does not report the split.
+ */
+export function observedPromptCacheTtlMs(usage: Usage): number | undefined {
+	if ((usage.cttl?.ephemeral5m ?? 0) > 0) return 5 * 60_000;
+	if ((usage.cttl?.ephemeral1h ?? 0) > 0) return 60 * 60_000;
+	return undefined;
+}
+
 /** Prompt size of a response: what its request sent, cached or not. */
 export function promptTokensOf(usage: Usage): number {
 	return usage.input + usage.cacheRead + usage.cacheWrite;

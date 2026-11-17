@@ -52,12 +52,12 @@ afterEach(async () => {
  * Environment for a probe subprocess, with a home and agent dir of its own, that must
  * not read the developer's real omp dotenv files (omp keeps `OTEL_*` from them in a
  * private map that the SDK window exposes). The probe loads `@oh-my-pi/pi-utils`, which
- * fills every unset variable from `~/.env`, `~/.omp/.env` and the agent dir's `.env`, so
- * a kill-switch removed above would come back from the developer's own dotenv files and
- * silence the signal the probe expects; every variable `dirs.ts` uses to locate those
- * files is cleared here too. The probe is marked as a test child, as `ci-test-ts` marks
- * it, so a local run takes the same export gate as CI does instead of passing for a
- * production process.
+ * fills every unset variable from the agent dir's `.env` (and, in a production process,
+ * from `~/.env` and `~/.omp/.env`), so a kill-switch removed above could come back from
+ * a dotenv file and silence the signal the probe expects; every variable `dirs.ts` uses
+ * to locate those files is cleared here too. The probe is marked as a test child, as
+ * `ci-test-ts` marks it, so a local run takes the same export gate as CI does instead of
+ * passing for a production process.
  */
 function probeEnv(home: TempDir): Record<string, string | undefined> {
 	return {

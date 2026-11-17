@@ -486,6 +486,7 @@ import {
 	type CacheWarmingMode,
 	type CacheWarmingStatus,
 	observedPromptCacheTier,
+	observedPromptCacheTtlMs,
 	type PromptCacheChange,
 	type PromptCacheEntry,
 	promptTokensOf,
@@ -807,6 +808,11 @@ interface BranchPromptCacheObservation {
 	compacted: boolean;
 	/** Digest of the base prompt the reply was produced under; undefined when none is recorded. */
 	promptDigest: string | undefined;
+	/**
+	 * Lifetime the provider named for the entry, from the newest reply of the same model that reported its
+	 * cache-write split (a reply that only read the entry reports none); undefined when no reply named one.
+	 */
+	reportedTtlMs: number | undefined;
 }
 
 /**
@@ -820,6 +826,8 @@ interface BranchPromptCacheScan {
 	/** Newest system prompt digest recorded in the scanned entries. */
 	digest: string | undefined;
 	observation: BranchPromptCacheObservation | undefined;
+	/** The newest reply's model and the lifetime it named for the entry it wrote; see `reportedTtlMs`. */
+	reported: { provider: string; model: string; ttlMs: number } | undefined;
 }
 
 /** Folds `scan.branch`'s unscanned entries into what the newest reply that read or wrote the prompt cache left. */
@@ -840,6 +848,7 @@ function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
 		// `/clear` starts a new transcript: nothing before the boundary is a prefix of the next request.
 		if (entry.type === "reset_boundary") {
 			scan.observation = undefined;
+			scan.reported = undefined;
 			continue;
 		}
 		// Failed, replaced and outdated refreshes carry no outcome: they say nothing about this entry.
@@ -855,7 +864,18 @@ function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 		const reply = entry.message;
 		if (reply.stopReason === "error" || reply.usage.cacheRead + reply.usage.cacheWrite <= 0) continue;
-		scan.observation = { reply, warmedAt: 0, refreshMissed: false, compacted: false, promptDigest: scan.digest };
+		const ttlMs = observedPromptCacheTtlMs(reply.usage);
+		if (ttlMs !== undefined) scan.reported = { provider: reply.provider, model: reply.model, ttlMs };
+		const reported = scan.reported;
+		scan.observation = {
+			reply,
+			warmedAt: 0,
+			refreshMissed: false,
+			compacted: false,
+			promptDigest: scan.digest,
+			reportedTtlMs:
+				reported?.provider === reply.provider && reported.model === reply.model ? reported.ttlMs : undefined,
+		};
 	}
 	scan.scanned = branch.length;
 }
@@ -1514,9 +1534,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#recordsInTurn = 0;
 	/** Latest `session_init` of the transcript the model calls ran on; `init` is null when it has none. */
 	#sessionInit: { sessionFile: string | undefined; init: PersistedSessionInit | null } | undefined;
-	/** Settles when switchSession commits or restores its previous generation on rollback.
-	 *  newSession never rolls its generation back, so it does not delay stale aside/SDK calls. */
-	#sessionGenerationSettled: Promise<void> | undefined;
+	/** The generation changes switchSession has made and may still undo, each settling when its
+	 *  switch commits or restores its previous generation on rollback. A switch started from
+	 *  another one's hooks and not awaited outlives it, so they settle in any order: each switch
+	 *  removes only its own (see #beginSessionGenerationChange), and every promise held here is
+	 *  still pending. newSession never rolls its generation back, so it does not delay stale
+	 *  aside/SDK calls. */
+	readonly #pendingSessionGenerationChanges = new Set<Promise<void>>();
 	/** Readiness barrier for the outermost session/transcript transition, including all
 	 *  hooks and rollback reconciliation, independently of when its generation settles. */
 	#sessionTransitionSettled: Promise<void> | undefined;
@@ -1571,6 +1595,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#promptCacheArmSessionId: string | undefined;
 	/** Each armed main-loop request's dispatch hook, keyed by the context it was armed with. */
 	readonly #promptCacheDispatch = new WeakMap<Context, () => void>();
+	/**
+	 * The newest main-loop request's shape, messages and transcript, recorded with or without a warmer: a
+	 * side request repeats that request's prefix only while none of them changed (see {@link promptCacheExpiresAt}).
+	 */
+	#lastRequestArm: { sessionId: string; shape: PromptCacheShape; messages: readonly AgentMessage[] } | undefined;
 	/** {@link #promptCacheShape} for the inputs it was last built from. */
 	#promptCacheShapeMemo:
 		| {
@@ -2019,16 +2048,32 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Re-validates a #sessionGeneration snapshot captured before an aside/SDK call's await.
 	 *  A mismatch alone does not mean the record's source session is gone —
 	 *  switchSession() restores the exact prior generation on rollback — so wait out any in-flight
-	 *  generation change (#sessionGenerationSettled) and recheck rather than discarding immediately.
+	 *  generation change (#pendingSessionGenerationChanges) and recheck rather than discarding immediately.
 	 *  Returns true when the caller should drop its record (no in-flight transition to wait for, or
 	 *  the generation is still different once one settles); false once the generation matches again. */
 	async #sessionGenerationChanged(sessionGeneration: number): Promise<boolean> {
 		while (this.#sessionGeneration !== sessionGeneration) {
-			const settled = this.#sessionGenerationSettled;
-			if (!settled) return true;
-			await settled;
+			if (this.#pendingSessionGenerationChanges.size === 0) return true;
+			// Every change held here is still pending, so each pass waits for a real settle: the loop
+			// cannot spin on a settled promise, which would starve the event loop and every timer.
+			await Promise.race(this.#pendingSessionGenerationChanges);
 		}
 		return false;
+	}
+
+	/**
+	 * Records a generation change a switch may still undo, for {@link #sessionGenerationChanged}.
+	 * The switch settles it once it commits or restores the previous generation; disposing settles
+	 * it too, so no exit path leaves it pending for good.
+	 */
+	#beginSessionGenerationChange(): Disposable & { settle: () => void } {
+		const change = Promise.withResolvers<void>();
+		this.#pendingSessionGenerationChanges.add(change.promise);
+		const settle = (): void => {
+			this.#pendingSessionGenerationChanges.delete(change.promise);
+			change.resolve();
+		};
+		return { settle, [Symbol.dispose]: settle };
 	}
 
 	/** Fire-and-forget wake turn for incoming IRC — idle delivery and stranded-aside resume both
@@ -6685,23 +6730,25 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * session streamFn with its raw request options; retention settings are
 	 * resolved here to match the settings-aware stream wrapper.
 	 * {@link markPromptCacheDispatched} starts the armed entry's lifetime once the request is sent.
+	 * Also records the request's shape for {@link promptCacheExpiresAt}, in a session with no warmer too.
 	 */
 	startCacheWarming(model: Model, context: Context, options: SimpleStreamOptions): void {
+		const sessionId = this.sessionManager.getSessionId();
+		// A copy: `/clear` truncates the live array in place, which an alias would follow.
+		const armMessages = this.messages.slice();
+		const armShape = this.#promptCacheShape(model);
+		this.#lastRequestArm = { sessionId, shape: armShape, messages: armMessages };
 		const warmer = this.#cacheWarmer;
 		if (!warmer) return;
 		// The warmer keeps its confirmed entry across requests until a response
 		// replaces it; another transcript's entry says nothing about this one.
-		const sessionId = this.sessionManager.getSessionId();
 		if (this.#promptCacheArmSessionId !== sessionId) warmer.cancel();
 		this.#promptCacheArmSessionId = sessionId;
-		// A copy: `/clear` truncates the live array in place, which an alias would follow.
-		const armMessages = this.messages.slice();
 		const retentionSetting = cfgProvidersCacheRetention.get(this.settings);
 		const warmingOptions = {
 			...options,
 			cacheRetention: options.cacheRetention ?? (retentionSetting === "auto" ? undefined : retentionSetting),
 		};
-		const armShape = this.#promptCacheShape(model);
 		const dispatched = warmer.start({ model, context, options: warmingOptions }, () =>
 			this.#promptCacheChange(armShape, armMessages),
 		);
@@ -6815,6 +6862,35 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
+	 * When the prompt cache entry the branch's newest cached reply left stops answering a
+	 * request that repeats its prefix. Undefined when the cache cannot answer such a request
+	 * at all: no reply read or wrote the cache (a provider that keeps none), the next request
+	 * sends something else first (another model or retention tier, a compaction, a new system
+	 * prompt; or, since this process's newest request, other tools, another thinking level or
+	 * rewritten history), the latest warm refresh missed, or no lifetime is known. The lifetime
+	 * is the shorter of the one the model declares for the tier (`promptCache`) and the one the
+	 * provider named for the entry it wrote (see {@link observedPromptCacheTtlMs}): the prefix
+	 * lives only as long as its shortest part.
+	 */
+	promptCacheExpiresAt(): number | undefined {
+		const entry = this.#inferredPromptCacheEntry();
+		if (!entry || entry.change !== undefined || entry.refreshMissed) return undefined;
+		const arm = this.#lastRequestArm;
+		if (
+			arm?.sessionId === this.sessionManager.getSessionId() &&
+			this.#promptCacheChange(arm.shape, arm.messages) !== undefined
+		) {
+			return undefined;
+		}
+		const reportedTtlMs = this.#branchPromptCacheObservation()?.reportedTtlMs;
+		const ttlMs =
+			entry.ttlMs === undefined || reportedTtlMs === undefined
+				? (entry.ttlMs ?? reportedTtlMs)
+				: Math.min(entry.ttlMs, reportedTtlMs);
+		return ttlMs === undefined ? undefined : entry.touchedAt + ttlMs;
+	}
+
+	/**
 	 * The entry the branch's newest cached reply left, for a transcript this
 	 * process has not sent yet (a reopened or switched session): touched at the
 	 * reply's send time or a later warm refresh that hit, under the lifetime its
@@ -6879,7 +6955,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const branch = this.sessionManager.getBranchView();
 		let scan = this.#branchPromptCacheScan;
 		if (scan?.branch !== branch) {
-			scan = { branch, scanned: 0, digest: undefined, observation: undefined };
+			scan = { branch, scanned: 0, digest: undefined, observation: undefined, reported: undefined };
 			this.#branchPromptCacheScan = scan;
 		}
 		if (scan.scanned < branch.length) scanBranchPromptCache(scan);
@@ -14959,9 +15035,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// record on success but stays valid if the switch is rolled back to this same session.
 		const previousIrcPending = this.#discardOutgoingIrcRecords(false);
 		const previousSessionGeneration = this.#sessionGeneration++;
-		const generationSettled = Promise.withResolvers<void>();
-		const previousSessionGenerationSettled = this.#sessionGenerationSettled;
-		this.#sessionGenerationSettled = generationSettled.promise;
+		using generationChange = this.#beginSessionGenerationChange();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#queuedMessageDrainBlocked = false;
@@ -15192,8 +15266,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (previousSessionState.sessionId !== this.sessionManager.getSessionId()) {
 				this.#notifySessionChangeCallbacks();
 			}
-			generationSettled.resolve();
-			this.#sessionGenerationSettled = previousSessionGenerationSettled;
+			generationChange.settle();
 			// Past the rollback window: the records this switch cleared are not coming back, so
 			// settle an end an earlier run left open for a turn one of them promised, as newSession
 			// does. Before this point a rollback would restore them and they still wake.
@@ -15219,8 +15292,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			);
 			this.#irc.restorePending(previousIrcPending);
 			this.#sessionGeneration = previousSessionGeneration;
-			generationSettled.resolve();
-			this.#sessionGenerationSettled = previousSessionGenerationSettled;
+			generationChange.settle();
 			// The records are back in the live session, but the abort above ran while the agent was
 			// disconnected, so its own stranded-aside drain refused them and nothing else resumes
 			// them: they would ride the next unrelated prompt into context, and a record promised a

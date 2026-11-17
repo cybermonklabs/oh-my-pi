@@ -14,7 +14,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { removeWithRetries, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { removeWithRetries, TempDir } from "@oh-my-pi/pi-utils";
 
 // An extension that starts a turn from `session_start` (pi.sendMessage with
 // triggerTurn) must not decide when the host can take its first command.
@@ -30,10 +30,12 @@ describe("turn started by a session_start handler", () => {
 		});
 		try {
 			// start() waits for `ready` and then for the `negotiate_protocol` response. The
-			// fixture's startup turn streams for 60s, so both commands are answered only if
-			// the host reads input while that turn runs.
-			await withTimeout(client.start(), 10_000, "negotiate_protocol was not answered during the startup turn");
-			const state = await withTimeout(client.getState(), 10_000, "get_state was not answered");
+			// fixture's startup turn streams until it is aborted, so both commands are answered
+			// only if the host reads input while that turn runs; a host that waits the turn out
+			// never answers, and the runner's per-test timeout fails the case. No clock of this
+			// test decides the outcome.
+			await client.start();
+			const state = await client.getState();
 			expect(state.isStreaming).toBe(true);
 
 			const ended = Promise.withResolvers<void>();
@@ -42,7 +44,7 @@ describe("turn started by a session_start handler", () => {
 			});
 			try {
 				await client.abort();
-				await withTimeout(ended.promise, 10_000, "abort did not end the startup turn");
+				await ended.promise;
 			} finally {
 				unsubscribe();
 			}
@@ -127,11 +129,11 @@ describe("turn started by a session_start handler", () => {
 			if (event.type === "agent_end") ended.resolve();
 		});
 		try {
-			await withTimeout(client.start(), 10_000, "negotiate_protocol was not answered during the startup turn");
-			await withTimeout(announced.promise, 10_000, "the startup turn's message never reached the RPC stream");
+			await client.start();
+			await announced.promise;
 			expect(types[0]).toBe("agent_start");
 			await client.abort();
-			await withTimeout(ended.promise, 10_000, "abort did not end the startup turn");
+			await ended.promise;
 		} finally {
 			unsubscribe();
 			await client.stop();
