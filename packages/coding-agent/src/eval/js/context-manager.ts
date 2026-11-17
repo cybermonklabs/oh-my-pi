@@ -22,6 +22,7 @@ import {
 } from "../executor-base";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { updateEvalState } from "../state";
+import { SupersededKernelReaper } from "../superseded-reclaim";
 import type { EvalShadowCellSession } from "../speculation/cell-session";
 import { getActiveEvalShadowCell } from "../speculation/runtime-context";
 import type { ShadowPlan } from "../speculation/types";
@@ -117,6 +118,12 @@ interface JsSession {
 	pendingShadowRuns: Map<string, PromiseWithResolvers<Extract<WorkerOutbound, { type: "shadow-run" }>>>;
 	ownerIds: Set<string>;
 	hasFallbackOwner: boolean;
+	/**
+	 * Callers currently holding this context: a cell from the moment it
+	 * acquires the session, and a borrower such as a subagent that can call the
+	 * context's kernel-defined tools.
+	 */
+	activeUses: number;
 }
 
 interface StartingJsSession extends SessionOwners {
@@ -124,6 +131,7 @@ interface StartingJsSession extends SessionOwners {
 }
 
 const sessions = new Map<string, JsSession>();
+const reaper = new SupersededKernelReaper<JsSession>();
 const startingSessions = new Map<string, StartingJsSession>();
 const resettingSessions = new Map<string, Promise<void>>();
 // Owners of session keys whose worker died outside reset/disposal; the next cell announces the loss.
@@ -219,16 +227,82 @@ export async function executeInVmContext(options: {
 	if (!options.reset && lostSessions.delete(sessionKey)) {
 		options.runState.onText?.(`${formatKernelRestartNotice("JS worker")}\n`);
 	}
-	const result = await runOnce(session, options);
-	if (session.state === "alive" && path.isAbsolute(options.filename)) {
-		updateEvalState(options.session, {
-			language: "js",
-			kernelId: session.kernelId,
-			alive: true,
-			loadedPath: options.filename,
+	try {
+		reclaimSupersededJsSessions(sessionKey, options.ownerId);
+		const result = await runOnce(session, options);
+		if (session.state === "alive" && path.isAbsolute(options.filename)) {
+			updateEvalState(options.session, {
+				language: "js",
+				kernelId: session.kernelId,
+				alive: true,
+				loadedPath: options.filename,
+			});
+		}
+		return result;
+	} finally {
+		session.activeUses -= 1;
+	}
+}
+
+/**
+ * Shut down, after an idle grace, the contexts this owner left behind under
+ * other session keys.
+ *
+ * A retained JavaScript context is keyed by the eval session id, which ends in
+ * `:cwd:<cwd>`, so an owner that changes directory — or whose eval session id
+ * gains its on-disk session file — acquires a *new* worker and strands the
+ * previous one. Nothing reclaimed it: its V8 heap stayed resident until the
+ * host process exited, and unlike a Python runner it is a worker thread no
+ * process list will ever show. The guards match the Python registry's: another
+ * agent registered against it, a caller holding it, or work still in flight
+ * all keep it, and each is re-checked when the grace expires.
+ */
+function reclaimSupersededJsSessions(sessionKey: string, ownerId: string | undefined): void {
+	// Without an explicit owner the registry records only the first caller and
+	// cannot tell two of them apart, so it reclaims nothing rather than guess.
+	if (ownerId === undefined) return;
+	for (const [key, session] of Array.from(sessions.entries())) {
+		if (key === sessionKey) continue;
+		// Armed on ownership alone; the fire-time guard decides. See the Python
+		// registry's `reclaimSupersededSessions` for why a busy session is armed.
+		if (!ownedAloneBy(key, session, ownerId)) continue;
+		reaper.schedule(session, async () => {
+			if (!isJsSessionReclaimable(key, session, ownerId)) return;
+			await killSessionFor(session, new ToolError("JS context left behind by its session"), { force: false });
 		});
 	}
-	return result;
+}
+
+/** Whether `session` under `key` is still this owner's alone. */
+function ownedAloneBy(key: string, session: JsSession, ownerId: string): boolean {
+	if (sessions.get(key) !== session) return false;
+	return session.ownerIds.size === 1 && session.ownerIds.has(ownerId);
+}
+
+/** Whether this owner's superseded `session` may be shut down right now. */
+function isJsSessionReclaimable(key: string, session: JsSession, ownerId: string): boolean {
+	if (!ownedAloneBy(key, session, ownerId) || session.state !== "alive") return false;
+	if (session.activeUses > 0) return false;
+	return session.pending.size === 0 && session.pendingSnapshots.size === 0 && session.pendingShadowRuns.size === 0;
+}
+
+/**
+ * Hold the live JavaScript context for `sessionKey` so a superseded-context
+ * reclaim leaves it alone, and return the release. Borrowers that can call its
+ * kernel-defined tools between cells — a background subagent given `tools=[…]`
+ * — hold one for as long as that is true.
+ */
+export function borrowVmContext(sessionKey: string): () => void {
+	const session = sessions.get(sessionKey);
+	if (!session) return () => {};
+	session.activeUses += 1;
+	reaper.cancel(session);
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		session.activeUses -= 1;
+	};
 }
 
 /** Describe or invoke tools defined in a retained JavaScript kernel. */
@@ -402,11 +476,15 @@ export async function resetVmContext(sessionKey: string): Promise<void> {
 	lostSessions.delete(sessionKey);
 	const session = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.promise.catch(() => undefined));
 	if (!session) return;
+	reaper.cancel(session);
 	sessions.delete(sessionKey);
 	await killSession(session, new ToolError("JS context reset"), { force: false });
 }
 
 export async function disposeAllVmContexts(): Promise<void> {
+	// A disposal never waits out a grace: the timers go, and the contexts they
+	// held are killed below like any other.
+	reaper.cancelAll();
 	const pending = [...startingSessions.values()].map(starting => starting.promise);
 	startingSessions.clear();
 	const started = await Promise.allSettled(pending);
@@ -419,6 +497,9 @@ export async function disposeAllVmContexts(): Promise<void> {
 	// After the await: a worker that died while startups settled marked its key lost.
 	lostSessions.clear();
 	await Promise.all(all.map(session => killSession(session, new ToolError("JS context disposed"), { force: false })));
+	// A reclaim that fired just before the cancel may still be terminating a
+	// worker; a dispose must not return while one is up.
+	await reaper.settle();
 }
 
 /**
@@ -427,6 +508,9 @@ export async function disposeAllVmContexts(): Promise<void> {
  */
 export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
 	const toKill: JsSession[] = [];
+	for (const session of sessions.values()) {
+		if (session.ownerIds.has(ownerId)) reaper.cancel(session);
+	}
 	for (const session of Array.from(sessions.values())) {
 		if (!session.ownerIds.has(ownerId)) continue;
 		if (session.ownerIds.size === 1) {
@@ -486,6 +570,7 @@ export async function smokeTestJsEvalWorker(): Promise<void> {
 		pendingShadowRuns: new Map(),
 		ownerIds: new Set(),
 		hasFallbackOwner: false,
+		activeUses: 0,
 	};
 	try {
 		await initWorker(session, { cwd: process.cwd(), sessionId: "smoke" }, WORKER_INIT_TIMEOUT_MS);
@@ -624,6 +709,11 @@ async function acquireSession(
 		existing.packageRoot = snapshot.packageRoot;
 		existing.packageEnvironment = snapshot.packageEnvironment;
 		attachSessionOwner(existing, snapshot.sessionId, ownerId);
+		// Reacquired inside its grace: keep the context and its globals.
+		reaper.cancel(existing);
+		// Held before returning, so no reclaim can run between this lookup and
+		// the caller taking its hold. The caller releases it.
+		existing.activeUses += 1;
 		markJsSessionAlive(existing, toolSession, snapshot.packageEnvironment);
 		return existing;
 	}
@@ -631,6 +721,7 @@ async function acquireSession(
 	if (starting) {
 		attachSessionOwner(starting, snapshot.sessionId, ownerId);
 		const session = await starting.promise;
+		session.activeUses += 1;
 		markJsSessionAlive(session, toolSession, snapshot.packageEnvironment);
 		return session;
 	}
@@ -656,6 +747,10 @@ async function acquireSession(
 			pendingShadowRuns: new Map(),
 			ownerIds: new Set(),
 			hasFallbackOwner: false,
+			// Born held for the caller that started it, which releases it when
+			// its cell ends; publishing to `sessions` precedes that hold by a
+			// tick otherwise.
+			activeUses: 1,
 		};
 		// Init headroom is the fixed infrastructure floor; the caller's per-cell timeout
 		// dominates when larger so users can grant more by raising `timeout` on a cell.

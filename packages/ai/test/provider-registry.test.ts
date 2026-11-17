@@ -75,6 +75,7 @@ describe("provider registry auth surface", () => {
 		expect([...PASTE_CODE_LOGIN_PROVIDERS].sort()).toEqual(
 			[
 				"anthropic",
+				"anthropic-console",
 				"devin",
 				"gitlab-duo",
 				"gitlab-duo-agent",

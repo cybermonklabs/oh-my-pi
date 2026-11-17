@@ -1306,7 +1306,16 @@
 					"type": "string"
 				},
 				"errorMessage": {
-					"type": "string"
+					"type": "string",
+					"description": "The failure's own text: what the provider sent, or omp's text for a failure it detected itself. Retry and classification decisions read this."
+				},
+				"errorDisplayMessage": {
+					"type": "string",
+					"description": "`errorMessage` as omp shows it, when that differs: with the rejected request's dump path, a provider-specific explanation or the response's retry hint added. Display only; it can name local paths."
+				},
+				"errorRetryAfterMs": {
+					"type": "number",
+					"description": "The delay, in milliseconds, the failed response's headers asked for before a retry. Retry decisions read this with `errorMessage`."
 				},
 				"errorStatus": {
 					"type": "integer"
@@ -4085,6 +4094,14 @@
 				"finalError": {
 					"type": "string"
 				},
+				"kind": {
+					"type": "string",
+					"description": "Error kind of the failure that ended the retry: kind labels joined by `|` (e.g. `usage-limit`, `transient|usage-limit`), or `status:<code>` for an error known only by its HTTP status; test membership, not equality."
+				},
+				"resetAtMs": {
+					"type": "integer",
+					"description": "Epoch ms when the failing credential's limit resets, as the provider stated it; absent when the provider stated no time. Covers only the account this run used; another stored account may become usable sooner."
+				},
 				"retryErrors": {
 					"type": "array",
 					"items": {
@@ -4426,6 +4443,50 @@
 			],
 			"description": "Coalesced snapshot of the displayable steering/follow-up queue, sent whenever it changes."
 		},
+		"UserWaitStartEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "user_wait_start"
+				},
+				"prompt": {
+					"type": "string",
+					"description": "What the session is asking a person to decide."
+				},
+				"kind": {
+					"enum": [
+						"permission",
+						"question"
+					],
+					"type": "string",
+					"description": "Whether the dialog approves an operation or asks a question; absent when its opener named no classification."
+				},
+				"toolCalls": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Every tool call whose dialog is open, oldest first; absent when no open dialog belongs to one. A call that leaves this list between frames has had its own dialog answered, which is not the same moment as the last dialog settling."
+				}
+			},
+			"required": [
+				"type",
+				"prompt"
+			],
+			"description": "The session opened a dialog only a person can answer and the turn is held until it settles."
+		},
+		"UserWaitEndEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "user_wait_end"
+				}
+			},
+			"required": [
+				"type"
+			],
+			"description": "The last dialog waiting on a person settled; the turn goes on."
+		},
 		"RpcAgentEvent": {
 			"anyOf": [
 				{
@@ -4526,6 +4587,12 @@
 				},
 				{
 					"$ref": "#/$defs/QueueUpdateEvent"
+				},
+				{
+					"$ref": "#/$defs/UserWaitStartEvent"
+				},
+				{
+					"$ref": "#/$defs/UserWaitEndEvent"
 				}
 			],
 			"description": "A session event, discriminated by `type`; `set_event_filter` selects which are sent."
