@@ -1,14 +1,29 @@
 import * as path from "node:path";
-import type { ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
+import type { ApiKeyResolution, ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
 import { resolvedApiKeyBearer } from "@oh-my-pi/pi-ai/auth-retry";
-import { type AuthApiKeyOptions, type AuthPeekOptions, oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
+import {
+	type AuthApiKeyOptions,
+	type AuthPeekOptions,
+	type DisabledCredentialSummary,
+	isRecoverableDisabledCredential,
+	oauthAccountKey,
+} from "@oh-my-pi/pi-ai/auth-storage";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import {
+	providerPauseReason,
+	registerOAuthProvider,
+	unregisterOAuthProvider,
+	unregisterOAuthProviders,
+} from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
 import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
-import { OAuthRefreshUnavailableError } from "@oh-my-pi/pi-ai/error";
+import {
+	AccountPoolUnavailableError,
+	CredentialUnavailableError,
+	OAuthRefreshUnavailableError,
+} from "@oh-my-pi/pi-ai/error";
 import type {
 	Api,
 	Context,
@@ -3536,6 +3551,68 @@ export class ModelRegistry {
 		return this.hasCommandBackedApiKey(provider) && !getProviderDefinition(provider)?.allowsMissingApiKey;
 	}
 
+	/**
+	 * Whether a missing key for the provider may come back without the user
+	 * configuring one: its `!command` apiKey produced nothing
+	 * ({@link retriesFailedCommandKey}), or its stored credentials exist but none
+	 * can serve now ({@link #storedCredentialsUnavailable}). A turn's request
+	 * reports such a key retryably ({@link turnResolver}).
+	 */
+	async missingKeyMayRecover(provider: string, sessionId?: string, signal?: AbortSignal): Promise<boolean> {
+		return (
+			this.retriesFailedCommandKey(provider) ||
+			(await this.#storedCredentialsUnavailable(provider, sessionId, signal))
+		);
+	}
+
+	/**
+	 * Whether the provider has stored credentials that exist but could not serve
+	 * a request: an active row that resolved no key, or an OAuth credential a
+	 * failure disabled ({@link isRecoverableDisabledCredential}) that the user has not
+	 * since removed or replaced. A new login, here or in another session sharing
+	 * the store, brings such a credential back, so a turn waits for it; an account
+	 * whose latest teardown was the user's own (a logout), or a provider that never
+	 * had a credential, does not count: the user chose that, and no key comes back
+	 * until they log in again, so waiting would only delay the error. A user's
+	 * removal covers the same account only: removing one account of a provider
+	 * leaves another account's failure recoverable.
+	 * Only active credentials and failure identities the session's pool permits count.
+	 * A tombstone lookup that fails counts, since the store could not tell; one the
+	 * caller aborted does not. False for a disabled provider (in settings, or paused
+	 * by its auth rules: no key comes back until the user or the rules change) and
+	 * for one whose catalog dispatches without a key.
+	 */
+	async #storedCredentialsUnavailable(provider: string, sessionId?: string, signal?: AbortSignal): Promise<boolean> {
+		if (
+			this.#isProviderDisabled(provider) ||
+			providerPauseReason(provider) !== undefined ||
+			getProviderDefinition(provider)?.allowsMissingApiKey
+		)
+			return false;
+		if (
+			this.authStorage.credentials
+				.list(provider)
+				.some(row => sessionId === undefined || this.authStorage.sessions.permits(provider, sessionId, row.id))
+		)
+			return true;
+		let tombstones: DisabledCredentialSummary[];
+		try {
+			tombstones = await this.authStorage.credentials.listDisabled(provider, signal);
+		} catch (error) {
+			if (signal?.aborted) return false;
+			logger.debug("Disabled credential lookup failed; treating the missing key as recoverable", {
+				provider,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return true;
+		}
+		return tombstones.some(
+			failure =>
+				this.authStorage.sessions.permitsIdentity(provider, sessionId, failure.identityKey) &&
+				isRecoverableDisabledCredential(failure, tombstones),
+		);
+	}
+
 	getDiscoverableProviders(): string[] {
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		return this.#discoverableProviders
@@ -3805,33 +3882,52 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * The {@link resolver} for an agent turn's requests. When the provider's
-	 * configured apiKey is a `!command` that produced no key, the initial resolve
-	 * throws {@link ApiKeyCommandError} instead of returning no key, so the turn
-	 * fails retryably and turn recovery runs the command again. Other callers
-	 * keep {@link resolver}, where such a request fails at once as a missing key.
+	 * The {@link resolver} for an agent turn's requests. When the initial resolve
+	 * finds no key that may come back ({@link failCommandKeyRetryably}), it throws
+	 * a {@link CredentialUnavailableError} instead of returning no key, so the
+	 * turn fails retryably and turn recovery resolves again. Other callers keep
+	 * {@link resolver}, where such a request fails at once as a missing key.
 	 */
 	turnResolver(model: ApiKeyResolverModel, sessionId?: string): ApiKeyResolver {
-		return this.failCommandKeyRetryably(model.provider, this.resolver(model, sessionId));
+		return this.failCommandKeyRetryably(model.provider, this.resolver(model, sessionId), sessionId);
 	}
 
 	/**
-	 * `resolve` as {@link turnResolver} hands it out: an initial resolve that
-	 * returns no key throws {@link ApiKeyCommandError} when the provider's apiKey
-	 * is a `!command`. A registry view that builds its own resolvers wraps them
-	 * with this.
+	 * `resolve` as {@link turnResolver} hands it out. An initial resolve that
+	 * finds no key throws a transient {@link CredentialUnavailableError} when the
+	 * key may come back without the user configuring one:
+	 * - the provider's apiKey is a `!command` that produced nothing ({@link ApiKeyCommandError});
+	 * - the provider's stored credentials exist but none can serve now
+	 *   ({@link #storedCredentialsUnavailable}), also when the session's OAuth
+	 *   account pool has no account that can serve ({@link AccountPoolUnavailableError},
+	 *   kept as `cause`). A pool whose credentials the user removed fails for good.
+	 * A registry view that builds its own resolvers wraps them with this.
 	 */
-	failCommandKeyRetryably(provider: string, resolve: ApiKeyResolver): ApiKeyResolver {
+	failCommandKeyRetryably(provider: string, resolve: ApiKeyResolver, sessionId?: string): ApiKeyResolver {
 		return async ctx => {
-			const resolved = await resolve(ctx);
-			if (
-				ctx.error === undefined &&
-				resolvedApiKeyBearer(resolved) === undefined &&
-				this.retriesFailedCommandKey(provider)
-			) {
+			let resolved: ApiKeyResolution;
+			try {
+				resolved = await resolve(ctx);
+			} catch (error) {
+				if (
+					ctx.error === undefined &&
+					error instanceof AccountPoolUnavailableError &&
+					(await this.#storedCredentialsUnavailable(provider, sessionId, ctx.signal))
+				) {
+					throw new CredentialUnavailableError(error.message, { cause: error });
+				}
+				throw error;
+			}
+			if (ctx.error !== undefined || resolvedApiKeyBearer(resolved) !== undefined) return resolved;
+			if (this.retriesFailedCommandKey(provider)) {
 				throw new ApiKeyCommandError(
 					provider,
 					commandFailureRetryAfterMs(this.#customProviderApiKeys.get(provider)),
+				);
+			}
+			if (await this.#storedCredentialsUnavailable(provider, sessionId, ctx.signal)) {
+				throw new CredentialUnavailableError(
+					`No API key for provider: ${provider} (its stored credentials are disabled or cannot serve now)`,
 				);
 			}
 			return resolved;
