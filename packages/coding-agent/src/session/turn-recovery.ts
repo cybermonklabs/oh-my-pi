@@ -2405,20 +2405,26 @@ export class TurnRecovery {
 		// passes over the same-provider Claude models that cannot redeem it. A
 		// credit cannot be redeemed on a target whose usage is spent, so with
 		// retry.usageAwareFallback on, the credit-target pass runs first. It takes
-		// each candidate that can redeem the credit through the same steps as the
-		// walk pass (the effort ceiling, the context fit, the usage skip and the
-		// key probe) and switches to nothing. A target that passes every step is
-		// one the walk would try: the pass notes it as usable and stops. A target
-		// that the usage skip passes over is noted as spent. When the pass found
-		// a spent target and no usable one, the credit counts as absent, and the
-		// walk pass runs in chain order as with no credit. Deciding this before
-		// the walk pass chooses keeps chain order: a same-provider Claude model
-		// earlier in the chain comes before another provider's model after it. A
-		// credit whose targets are not in the chain, or whose targets fail the
-		// other steps with none spent, stays live.
+		// each candidate that can redeem the credit through the walk pass's steps
+		// before the key probe (the effort ceiling, the context fit and the usage
+		// skip) and switches to nothing. A target that the usage skip passes over
+		// is noted as spent; a target that passes every step is kept, in chain
+		// order. The pass reads no key. With no target spent, the credit stays
+		// live and no key is read for it. With a target spent, the kept targets'
+		// keys are read in chain order until one gives a key: that target is one
+		// the walk would try, so the credit stays live. A key read that throws
+		// counts as no key and is not raised there; the walk pass reads that key
+		// again only if it reaches the target, and raises the error as it does
+		// for any candidate. When no kept target gives a key, the spent target
+		// leaves the credit absent, and the walk pass runs in chain order as with
+		// no credit. Deciding this before the walk pass chooses keeps chain order:
+		// a same-provider Claude model earlier in the chain comes before another
+		// provider's model after it.
 		const creditLive = (): boolean =>
 			creditHandle !== undefined && creditTargets.length > 0 && Date.now() < creditHandle.expiresAt;
 		const runCreditTargetPass = usageAwareFallback && options?.refusalWalk === true && creditLive();
+		// The credit targets that the credit-target pass keeps, in chain order.
+		const keptCreditTargets: Model[] = [];
 		let creditTargetSpent = false;
 		let creditTargetUsable = false;
 		let creditCountsAbsent = false;
@@ -2452,8 +2458,8 @@ export class TurnRecovery {
 					creditTargets.includes(candidate.id) &&
 					Date.now() < creditHandle.expiresAt;
 				// The credit-target pass takes only the candidates that can redeem the
-				// credit. Each goes on through the steps below, and the hold does not
-				// apply to it.
+				// credit. Each goes on through the steps below up to the key probe, and
+				// the hold does not apply to it.
 				if (creditTargetPass && !canRedeemFallbackCredit) continue;
 				// Anthropic signatures and redacted blocks are model-bound, while the
 				// latest assistant response must remain byte-identical. While another
@@ -2519,6 +2525,12 @@ export class TurnRecovery {
 						continue;
 					}
 				}
+				// The credit-target pass keeps a target that passes every step above
+				// and reads no key for it.
+				if (creditTargetPass) {
+					keptCreditTargets.push(candidate);
+					continue;
+				}
 				// A session restricted to an OAuth account pool throws for a provider
 				// none of its pooled accounts can serve; that candidate is unavailable,
 				// exactly like one without a credential.
@@ -2529,14 +2541,6 @@ export class TurnRecovery {
 					if (!(error instanceof AIError.MissingApiKeyError)) throw error;
 				}
 				if (!apiKey) continue;
-				// The walk would try this credit target, so the credit stays live. The
-				// credit-target pass switches to nothing and stops here: one usable
-				// target decides it, and probing later targets would only send key
-				// requests that the walk pass may never make.
-				if (creditTargetPass) {
-					creditTargetUsable = true;
-					break;
-				}
 				const previousEditMode = this.#host.resolveActiveEditMode();
 				const previousSystemPrompt = [...this.#host.agent.state.systemPrompt];
 				const previousTools = [...this.#host.agent.state.tools];
@@ -2566,6 +2570,21 @@ export class TurnRecovery {
 					};
 				}
 				return applied;
+			}
+			// Only with a target spent: a kept target that gives a key is one the
+			// walk would try.
+			if (creditTargetPass && creditTargetSpent) {
+				for (const target of keptCreditTargets) {
+					try {
+						if (await this.#host.modelRegistry.getApiKey(target, this.#host.sessionId())) {
+							creditTargetUsable = true;
+							break;
+						}
+					} catch {
+						// A key read that throws counts as no key. The walk pass raises
+						// the error only if it reaches this target.
+					}
+				}
 			}
 			if (creditTargetPass) creditCountsAbsent = creditTargetSpent && !creditTargetUsable;
 		}

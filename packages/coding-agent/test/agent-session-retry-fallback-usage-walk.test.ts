@@ -909,6 +909,90 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(modelOf(run.session)).toBe(formatModelString(FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
+
+		it("reads no credit target's key for the credit when no target is spent", async () => {
+			// With no credit target spent the credit is live, and deciding that reads
+			// no key. The credit-target keys read are the walk's own: its key probe
+			// of Opus 4.8 and the switch onto it, as with no credit check. Opus 5,
+			// which the walk never reaches, has no key read.
+			const creditTargetKeyReads: string[] = [];
+			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
+				const read = formatModelString(model);
+				if (read === formatModelString(CREDIT_TARGET) || read === formatModelString(NEXT_CREDIT_TARGET)) {
+					creditTargetKeyReads.push(read);
+				}
+				return getApiKey(model, sessionId, options);
+			});
+			const { run, requestedModels } = await runCreditRefusal(chainOf(CREDIT_TARGET, NEXT_CREDIT_TARGET), {});
+
+			expect(creditTargetKeyReads).toEqual([formatModelString(CREDIT_TARGET), formatModelString(CREDIT_TARGET)]);
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(CREDIT_TARGET),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(CREDIT_TARGET)]);
+		});
+
+		it("steps a refusal to the next model when the spent target's sibling target fails its key read", async () => {
+			// Opus 5's key read throws here. With Opus 4.8 spent, deciding the credit
+			// counts Opus 5 as a target the walk would not try and raises nothing:
+			// the credit holds nothing back, and the walk switches to the other
+			// Claude model, which comes before Opus 5 in the chain.
+			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
+				if (model.provider === NEXT_CREDIT_TARGET.provider && model.id === NEXT_CREDIT_TARGET.id) {
+					throw new Error("credential command failed");
+				}
+				return getApiKey(model, sessionId, options);
+			});
+			const { run, requestedModels } = await runCreditRefusal(
+				chainOf(CREDIT_TARGET, OTHER_CLAUDE, NEXT_CREDIT_TARGET),
+				{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
+			);
+
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(OTHER_CLAUDE),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
+			expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		it("ends the turn on the key-read error when the walk reaches the spent target's sibling target that fails its key read", async () => {
+			// Opus 5's key read throws here, and the walk reaches Opus 5 before the
+			// other Claude model. The walk reads that key in its own order and the
+			// error leaves the walk, as for any candidate whose key read throws: the
+			// turn ends on the refusal with no switch, and the session warns that its
+			// post-turn maintenance failed with that error.
+			const notices = vi.spyOn(AgentSession.prototype, "emitNotice");
+			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
+				if (model.provider === NEXT_CREDIT_TARGET.provider && model.id === NEXT_CREDIT_TARGET.id) {
+					throw new Error("credential command failed");
+				}
+				return getApiKey(model, sessionId, options);
+			});
+			const { run, requestedModels } = await runCreditRefusal(
+				chainOf(CREDIT_TARGET, NEXT_CREDIT_TARGET, OTHER_CLAUDE),
+				{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
+			);
+
+			expect(requestedModels).toEqual([formatModelString(FABLE), formatModelString(FABLE)]);
+			expect(run.fallbacks).toEqual([]);
+			expect(modelOf(run.session)).toBe(formatModelString(FABLE));
+			expect(notices).toHaveBeenCalledWith(
+				"warning",
+				"Post-turn maintenance failed: credential command failed",
+				"agent-end",
+			);
+			const refusal = run.session.getLastAssistantMessage();
+			expect(refusal?.stopReason).toBe("error");
+			expect(refusal?.stopDetails?.type).toBe("refusal");
+		});
 	});
 
 	describe("the fallback before a turn keeps its rule", () => {
