@@ -320,6 +320,48 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
+		it("answers on the fallback after a spent one at the level the spent fallback's selector names", async () => {
+			// The base switched onto the spent model at the level its selector
+			// names, and the check before the next model call then switched to the
+			// fallback after it, which names no level, so it carried that level.
+			stubUsageReads({ [formatModelString(CODEX_FALLBACK)]: depletedRead("usage") });
+			const requests: string[] = [];
+			const mock = createMockModel();
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: PRIMARY, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requests.push(`${formatModelString(model)} at ${options?.reasoning}`);
+					mock.push(
+						model.provider === PRIMARY.provider && model.id === PRIMARY.id
+							? ACCOUNT_POLICY_DENIAL
+							: { content: ["answered"] },
+					);
+					return mock.stream(model, context, options);
+				},
+			});
+			const run = startSession(
+				agent,
+				walkSettings(PRIMARY, {
+					"retry.fallbackChains": {
+						default: [`${formatModelString(CODEX_FALLBACK)}:low`, formatModelString(NEXT_FALLBACK)],
+					},
+				}),
+				undefined,
+				Effort.High,
+			);
+			run.session.setThinkingLevel(Effort.High);
+
+			await runTurn(run.session, "Fail on the primary");
+
+			expect(requests).toEqual([
+				`${formatModelString(PRIMARY)} at high`,
+				`${formatModelString(NEXT_FALLBACK)} at low`,
+			]);
+			expect(run.session.thinkingLevel).toBe(Effort.Low);
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
 		it("answers on the fallback after a spent one under the fail-closed reserve policy", async () => {
 			// Switching onto the spent model would let the check before its request
 			// end the turn with a fail-closed refusal although a usable fallback follows.
