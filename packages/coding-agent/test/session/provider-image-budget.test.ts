@@ -22,6 +22,7 @@ import {
 	capArchiveFrameBytes,
 	clampProviderContextImageBytes,
 	clampProviderContextImages,
+	ProviderImageClamp,
 } from "@oh-my-pi/pi-coding-agent/session/provider-image-budget";
 import { isRecord } from "@oh-my-pi/pi-utils";
 
@@ -1619,5 +1620,91 @@ describe("provider context image budgets", () => {
 		expect(summary.content.map(block => block.type)).toEqual(["text", "text", "image", "text"]);
 		expect(textData(capped)).toContainEqual(expect.stringContaining("2 archived image frames could not be included"));
 		expect(capArchiveFrameBytes(context, ANTHROPIC_MODEL)).toBe(context);
+	});
+});
+
+/** `turns` user turns of a conversation from turn `first` on, each attaching `perTurn` images. */
+function conversation(turns: number, first = 0, perTurn = 3): Message[] {
+	return Array.from({ length: turns }, (_, offset) => {
+		const turn = first + offset;
+		return {
+			role: "user" as const,
+			content: [
+				text(`turn-${turn}`),
+				...Array.from({ length: perTurn }, (_, index) => image(`image-${turn}-${index}`)),
+			],
+			timestamp: turn,
+		};
+	});
+}
+
+function request(messages: Message[]): Context {
+	return { systemPrompt: ["system"], tools: [], messages };
+}
+
+/** Whether `later` sends every message `earlier` sent with the same bytes, so its prompt cache prefix still reads. */
+function continuesPrefix(earlier: Context, later: Context): boolean {
+	const serialize = (messages: Message[]) => messages.map(message => JSON.stringify(message));
+	return Bun.deepEquals(serialize(later.messages.slice(0, earlier.messages.length)), serialize(earlier.messages));
+}
+
+describe("ProviderImageClamp", () => {
+	it("drops the same oldest images while new ones fit and halves the budget at each forced drop", () => {
+		// The Umans route takes 10 images; each turn attaches 3.
+		const forced: number[] = [];
+		const clamp = new ProviderImageClamp((site, _before, after) => {
+			expect(site).toBe("image-count-clamp");
+			forced.push(imageData(after).length);
+		});
+		const sent: Context[] = [];
+		for (let turns = 1; turns <= 8; turns++) {
+			sent.push(clamp.clampImageCount(request(conversation(turns)), UMANS_MODEL));
+		}
+
+		expect(sent.map(context => imageData(context).length)).toEqual([3, 6, 9, 5, 8, 5, 8, 5]);
+		expect(forced).toEqual([5, 5, 5]);
+		// Between forced drops every request keeps the previous one's messages byte for byte.
+		expect(sent.slice(1).map((context, index) => continuesPrefix(sent[index], context))).toEqual([
+			true,
+			true,
+			false,
+			true,
+			false,
+			true,
+			false,
+		]);
+		expect(imageData(sent[7])).toEqual(["image-6-1", "image-6-2", "image-7-0", "image-7-1", "image-7-2"]);
+		expect(textData(sent[7])).toEqual(Array.from({ length: 8 }, (_, turn) => `turn-${turn}`));
+	});
+
+	it("recomputes its drops for the history a compaction leaves and for a model with another budget", () => {
+		const clamp = new ProviderImageClamp();
+		expect(imageData(clamp.clampImageCount(request(conversation(4)), UMANS_MODEL))).toHaveLength(5);
+
+		// The summary replaced turns 0-1; the 9 images left fit, so none of the 7 dropped before goes now.
+		const summary: Message = { role: "user", content: "summary of turns 0-1", timestamp: 10 };
+		const compacted = request([summary, ...conversation(3, 2)]);
+		expect(clamp.clampImageCount(compacted, UMANS_MODEL)).toBe(compacted);
+
+		// An Anthropic proxy takes 90 images: the 12 the Umans route had to cut all go out.
+		const history = request(conversation(4));
+		expect(clamp.clampImageCount(history, ANTHROPIC_PROXY_MODEL)).toBe(history);
+	});
+
+	it("drops the main request's images again for a side request that sends a prefix of its history", () => {
+		const clamp = new ProviderImageClamp();
+		clamp.clampImageCount(request(conversation(4)), UMANS_MODEL);
+		const main = clamp.clampImageCount(request(conversation(5)), UMANS_MODEL);
+
+		// The side request carries turns 0-2: the 7 oldest images still go, so it reads the main request's prefix.
+		const side = clamp.clampImageCount(request(conversation(3)), UMANS_MODEL);
+		expect(imageData(side)).toEqual(["image-2-1", "image-2-2"]);
+		expect(continuesPrefix(side, main)).toBe(true);
+
+		const next = clamp.clampImageCount(
+			request([...conversation(5), { role: "user", content: "no image", timestamp: 9 }]),
+			UMANS_MODEL,
+		);
+		expect(continuesPrefix(main, next)).toBe(true);
 	});
 });

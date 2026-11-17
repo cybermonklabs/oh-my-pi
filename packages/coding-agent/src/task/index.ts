@@ -60,6 +60,12 @@ import { InternalUrlRouter } from "../internal-urls/router";
 import { AgentRegistry, isResumable } from "../registry/agent-registry";
 import { sessionTreeStorage } from "../session/session-storage";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
+import {
+	clearPublishedAgentDiscovery,
+	discoveryCacheKey,
+	publishAgentDiscovery,
+	publishedAgentDiscovery,
+} from "./discovery-snapshots";
 import { borrowEvalToolKernels, createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import {
 	approvedTaskFile,
@@ -162,7 +168,7 @@ export {
 } from "./types";
 
 interface TaskDescriptionOptions {
-	agents: AgentDefinition[];
+	agents: readonly AgentDefinition[];
 	sessionAgents: readonly AgentDefinition[];
 	isolationEnabled: boolean;
 	applyIsolatedChanges: boolean;
@@ -854,8 +860,9 @@ export function composeSpawnAdvisory(args: {
 class TaskJobError extends AsyncJobError {}
 
 /**
- * Process-level create-time discovery memo and published reload snapshots,
- * keyed by resolved cwd plus the exact effective `extensions` array.
+ * Process-level create-time discovery memo, keyed by resolved cwd plus the
+ * exact effective `extensions` array; each settled scan is published to
+ * `./discovery-snapshots` under the same key.
  *
  * `TaskTool.create` runs for every (sub)agent session in this process. Sessions
  * may share a cwd while carrying different overlay/runtime extension settings,
@@ -866,42 +873,36 @@ class TaskJobError extends AsyncJobError {}
  * both caches automatically.
  */
 const discoveryMemo = new Map<string, Promise<DiscoveryResult>>();
-const discoverySnapshots = new Map<string, AgentDefinition[]>();
 let discoveryMemoFn: typeof discoverAgents | undefined;
-
-/** Stable cache identity for the filesystem root and the full effective extension-root struct. */
-function discoveryCacheKey(cwd: string, extensionRoots?: EffectiveExtensionRoots): string {
-	return `${path.resolve(cwd)}\0${JSON.stringify(extensionRoots ?? null)}`;
-}
 
 function discoverAgentsForCreate(cwd: string, extensionRoots?: EffectiveExtensionRoots): Promise<DiscoveryResult> {
 	const fn = discoverAgents;
 	if (discoveryMemoFn !== fn) {
 		discoveryMemoFn = fn;
 		discoveryMemo.clear();
-		discoverySnapshots.clear();
+		clearPublishedAgentDiscovery();
 	}
 	const key = discoveryCacheKey(cwd, extensionRoots);
-	let pending = discoveryMemo.get(key);
-	if (!pending) {
-		pending = fn(cwd, undefined, extensionRoots);
-		discoveryMemo.set(key, pending);
-		pending.catch(() => {
+	const memoized = discoveryMemo.get(key);
+	if (memoized) return memoized;
+	const pending = fn(cwd, undefined, extensionRoots);
+	discoveryMemo.set(key, pending);
+	// Registered before any caller awaits `pending`, so a creation or rescan sees its scan published.
+	pending.then(
+		({ agents }) => {
+			if (discoveryMemo.get(key) === pending) publishAgentDiscovery(key, agents);
+		},
+		() => {
 			if (discoveryMemo.get(key) === pending) discoveryMemo.delete(key);
-		});
-	}
+		},
+	);
 	return pending;
 }
 
 /** Rescan one cwd and publish its definitions to existing and future task tools. */
 export async function refreshAgentDiscovery(cwd: string, extensionRoots?: EffectiveExtensionRoots): Promise<void> {
-	const key = discoveryCacheKey(cwd, extensionRoots);
-	discoveryMemo.delete(key);
-	const pending = discoverAgentsForCreate(cwd, extensionRoots);
-	const { agents } = await pending;
-	if (discoveryMemo.get(key) === pending) {
-		discoverySnapshots.set(key, agents);
-	}
+	discoveryMemo.delete(discoveryCacheKey(cwd, extensionRoots));
+	await discoverAgentsForCreate(cwd, extensionRoots);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1115,9 +1116,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	/** Dynamic description that reflects current task settings. */
 	get description(): string {
 		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
-		const agents =
-			discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
-			this.#discoveredAgents;
+		const agents = this.#advertisedAgents();
 		const sessionAgents = this.session.advertisedSessionAgents?.() ?? this.session.getSessionAgents?.() ?? [];
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = cfgTaskIsolationEnabled.get(this.session.settings);
@@ -1132,11 +1131,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
 			perCallModelEnabled: perCallModel,
 			perCallModelAdvertisement: perCallModel
-				? getPerCallModelAdvertisement(
+				? (this.session.advertisedPerCallModels?.() ??
+					getPerCallModelAdvertisement(
 						this.session.settings,
 						this.session.getActiveModel?.(),
 						this.session.modelRegistry,
-					)
+					))
 				: undefined,
 			evalToolsEnabled: evalToolsEnabled(this.session),
 			structured: this.#isStructured(),
@@ -1201,12 +1201,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		) {
 			return undefined;
 		}
-		const agents =
-			discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
-			this.#discoveredAgents;
+		const agents = this.#advertisedAgents();
 		const sessionAgents = this.session.advertisedSessionAgents?.() ?? this.session.getSessionAgents?.() ?? [];
 		const seanceAgent = [...agents, ...sessionAgents].find(agent => agent.name === SEANCE_AGENT_NAME);
 		return seanceAgent && isBundledSeance(seanceAgent) ? seanceTaskSchemaFields : undefined;
+	}
+
+	/**
+	 * Discovered agents the description and schema list: the prompt surface's snapshot, so a rescan
+	 * leaves the tool's bytes alone and reaches the model by a hidden notice. Embedders without a
+	 * prompt surface list the latest scan.
+	 */
+	#advertisedAgents(): readonly AgentDefinition[] {
+		return (
+			this.session.advertisedDiscoveredAgents?.() ??
+			publishedAgentDiscovery(this.session.cwd, this.session.effectiveExtensionRoots?.()) ??
+			this.#discoveredAgents
+		);
 	}
 
 	#defaultAgent(): string {

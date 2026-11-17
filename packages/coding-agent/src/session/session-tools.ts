@@ -8,6 +8,7 @@ import type { EffectiveExtensionRoots } from "../capability/types";
 import { shouldInlineToolDescriptors } from "../config/inline-tool-descriptors-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelString } from "../config/model-resolver";
+import { type AnySetting, type SettingChange, settingValuesEqual } from "../config/registry";
 import type { Settings } from "../config/settings";
 import { realpathIfExists } from "../discovery/contained-path";
 import { compareSkillOrder } from "../discovery/helpers";
@@ -30,15 +31,23 @@ import {
 import { type LocalProtocolOptions } from "../internal-urls";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
+import { MEMORY_RECALL_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import type { MemoryBackendStartOptions, MemoryPromptPreparation } from "../memory-backend/types";
+import { publishedAgentDiscovery } from "../task/discovery-snapshots";
+import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "../task/model-approval";
+import { perCallModelEnabled } from "../task/settings";
 import type { AgentDefinition } from "../task/types";
 import type { BlockedKind } from "../utils/run-status";
 import evalPreludeNoticePrompt from "../prompts/system/eval-prelude-notice.md" with { type: "text" };
+import perCallModelNoticePrompt from "../prompts/system/per-call-model-notice.md" with { type: "text" };
 import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md" with { type: "text" };
+import heldToolRefusalPrompt from "../prompts/system/settings-held-tool-refusal.md" with { type: "text" };
+import settingsNoticePrompt from "../prompts/system/settings-notice.md" with { type: "text" };
 import skillNoticePrompt from "../prompts/system/skill-notice.md" with { type: "text" };
+import taskAgentNoticePrompt from "../prompts/system/task-agent-notice.md" with { type: "text" };
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
@@ -174,6 +183,11 @@ export interface RefreshSkillsOptions {
 	 * `refreshSkillsAndCommands` (cwd change, extension-source edit).
 	 */
 	rediscover?: boolean;
+	/**
+	 * The settings change that started this refresh. On a bound prompt only the registry follows
+	 * now; the prompt's list waits for the held rebuild ({@link SessionTools.refreshSkills}).
+	 */
+	settingsChange?: readonly SettingChange[];
 }
 
 /**
@@ -213,6 +227,12 @@ interface SessionToolsOptions {
 	xdev?: XdevState;
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	baseSystemPrompt: string[];
+	/**
+	 * Digest of the prompt inputs the operator gives explicitly (custom prompt, template, appended text), or
+	 * undefined when they cannot be compared. A resumed transcript's stored prompt is sent again only under the
+	 * digest it was stored with (see `SessionTools.#restoreTranscriptPrompt`).
+	 */
+	operatorPromptDigest?: string;
 	skills?: Skill[];
 	skillWarnings?: SkillWarning[];
 	skillsSettings?: SkillsSettings;
@@ -230,6 +250,11 @@ interface SystemPromptPreparation {
 	systemPrompt: string[];
 	/** Memory backend note to deliver with the turn ({@link MemoryPromptPreparation.notice}). */
 	memoryNotice?: MemoryPromptPreparation["notice"];
+	/**
+	 * Recall block to deliver as a hidden message after the turn's newest content rather than in
+	 * {@link systemPrompt}: the conversation's bound prompt was already sent without a recall.
+	 */
+	memoryRecall?: string;
 	/** Publish staged state at validated delivery; false declines the prepared turn without mutation. */
 	commit?(): boolean;
 }
@@ -311,9 +336,27 @@ const TOOL_ROSTER_NOTICE_MESSAGE_TYPE = "tool-roster-notice";
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 const EVAL_PRELUDE_NOTICE_MESSAGE_TYPE = "eval-prelude-notice";
 const SKILL_NOTICE_MESSAGE_TYPE = "skill-notice";
+const TASK_AGENT_NOTICE_MESSAGE_TYPE = "task-agent-notice";
+const PER_CALL_MODEL_NOTICE_MESSAGE_TYPE = "per-call-model-notice";
+const SETTINGS_NOTICE_MESSAGE_TYPE = "settings-notice";
 
 /** Custom entry holding the digest of the base prompt the branch's primary model calls are built from. */
 const SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE = "system-prompt-digest";
+
+/** Custom entry holding the base prompt blocks a {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record names. */
+const SYSTEM_PROMPT_CUSTOM_TYPE = "system-prompt";
+
+/** Data of a {@link SYSTEM_PROMPT_CUSTOM_TYPE} entry: a prompt a resumed process may send again. */
+interface StoredSystemPrompt {
+	/** Digest of {@link blocks}, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
+	digest: string;
+	/** Base prompt blocks, before a per-turn hook override. */
+	blocks: string[];
+	/** Top-level tools active when the blocks were stored. */
+	toolNames: string[];
+	/** {@link SessionToolsOptions.operatorPromptDigest} of the process that stored them. */
+	operatorDigest: string;
+}
 
 /**
  * Least time between two rediscoveries started by `skill://` names no loaded skill owns, so a typo
@@ -338,6 +381,20 @@ function samePromptBlocks(left: readonly string[], right: readonly string[]): bo
 export function promptDigestOfEntry(entry: SessionEntry): string | undefined | null {
 	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE) return null;
 	return typeof entry.data === "string" ? entry.data : undefined;
+}
+
+function isStringList(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every(item => typeof item === "string");
+}
+
+/** The prompt a branch entry stores, or `undefined` when it is no such record or a malformed one. */
+function storedPromptOfEntry(entry: SessionEntry): StoredSystemPrompt | undefined {
+	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_CUSTOM_TYPE || !isRecord(entry.data)) {
+		return undefined;
+	}
+	const { digest, blocks, toolNames, operatorDigest } = entry.data;
+	if (typeof digest !== "string" || typeof operatorDigest !== "string") return undefined;
+	return isStringList(blocks) && isStringList(toolNames) ? { digest, blocks, toolNames, operatorDigest } : undefined;
 }
 
 /**
@@ -375,6 +432,71 @@ interface SessionAgentNoticeDetails {
 	removed: string[];
 }
 
+/** Discovered agent names added/removed by one hidden {@link TASK_AGENT_NOTICE_MESSAGE_TYPE} message. */
+interface TaskAgentNoticeDetails {
+	added: string[];
+	removed: string[];
+}
+
+/** Whether `value` is the approvals a {@link PER_CALL_MODEL_NOTICE_MESSAGE_TYPE} message restated. */
+function isPerCallModelAdvertisement(value: unknown): value is PerCallModelAdvertisement {
+	return (
+		isRecord(value) &&
+		Array.isArray(value.roles) &&
+		value.roles.every(entry => isRecord(entry) && typeof entry.role === "string" && isStringList(entry.patterns)) &&
+		isStringList(value.allowlist) &&
+		typeof value.parentModelWithheld === "boolean"
+	);
+}
+
+/**
+ * A rebuild that a settings change started while the prompt was bound, held until a cut the cut rule admits or a
+ * lapsed prompt cache entry ({@link SessionTools.absorbHeldSettingsRebuild}).
+ */
+interface HeldSettingsRebuild {
+	/** Tells holds apart: a cut admitted under one hold does not count for a later one. */
+	readonly id: number;
+	/** Each changed setting's value when the hold began: the value the bound prompt was built with. */
+	readonly before: Map<AnySetting, unknown>;
+	/** The value the settings notice last gave each setting under this hold. */
+	readonly announced: Map<AnySetting, unknown>;
+	/** Enabled tools a held reconcile unregistered, with the settings whose change did it; calls are refused. */
+	readonly disabledTools: Map<string, readonly AnySetting[]>;
+	/** Tools a held reconcile registered for the enabled set; the rebuild activates them. */
+	readonly enabledTools: Set<string>;
+	/** The tool lists the last settings notice gave. */
+	announcedTools: string;
+	/** A tool reconcile is held: the rebuild reapplies the enabled set. */
+	reconcile: boolean;
+	/** A skill rediscovery is held: the rebuild lists the registry's skills in the prompt. */
+	skills: boolean;
+}
+
+/** Data of a {@link SETTINGS_NOTICE_MESSAGE_TYPE} message: setting ids and tool names, never a value. */
+interface SettingsNoticeDetails {
+	settings: string[];
+	disabledTools: string[];
+	enabledTools: string[];
+}
+
+/** A changed setting as the settings notice and the held-tool refusal print it; a credential's values are withheld. */
+interface SettingChangeView {
+	id: string;
+	secret: boolean;
+	previous?: string;
+	next?: string;
+}
+
+function settingChangeView(setting: AnySetting, previous: unknown, next: unknown): SettingChangeView {
+	if (setting.isCredential) return { id: setting.id, secret: true };
+	return {
+		id: setting.id,
+		secret: false,
+		previous: previous === undefined ? "unset" : JSON.stringify(previous),
+		next: next === undefined ? "unset" : JSON.stringify(next),
+	};
+}
+
 /**
  * Prompt-affecting state frozen at each base rebuild. Tools render their
  * provider-visible text from this snapshot instead of live settings, so
@@ -390,6 +512,13 @@ interface PromptSurface {
 	sessionAgents: readonly AgentDefinition[];
 	/** Tool names the eval description lists as callable from cells. */
 	evalToolNames: readonly string[];
+	/**
+	 * Discovered agents listed in the task description: the latest discovery scan for the
+	 * session's cwd and extension roots; undefined when no task tool scanned them.
+	 */
+	discoveredAgents: readonly AgentDefinition[] | undefined;
+	/** Per-call models the task and eval descriptions approve; undefined while per-call models are off. */
+	perCallModels: PerCallModelAdvertisement | undefined;
 }
 
 /**
@@ -466,6 +595,14 @@ export class SessionTools {
 	#recordedDigestScan: { branch: readonly SessionEntry[]; scanned: number; digest: string | undefined } | undefined;
 	/** {@link currentPromptDigest} for the base prompt array it hashed. */
 	#currentPromptDigest: { base: readonly string[]; digest: string } | undefined;
+	/** {@link SessionToolsOptions.operatorPromptDigest}. */
+	readonly #operatorPromptDigest: string | undefined;
+	/** {@link #baseSystemPrompt} is the restored transcript's stored prompt; see {@link #restoreTranscriptPrompt}. */
+	#basePromptRestored = false;
+	/** Newest prompt a branch view stores for each digest, and how much of it was scanned (as {@link #recordedDigestScan}). */
+	#storedPromptScan:
+		| { branch: readonly SessionEntry[]; scanned: number; prompts: Map<string, StoredSystemPrompt> }
+		| undefined;
 	/**
 	 * Dynamic (`xd://`) devices the model has already been told are mounted.
 	 * Seeded lazily from persisted history on resume (see
@@ -493,6 +630,9 @@ export class SessionTools {
 	#basePromptRoster: PromptRoster | undefined;
 	/** A frozen roster change is held out of {@link #baseSystemPrompt}, riding notices instead. */
 	#promptRosterHeld = false;
+	/** The rebuild a settings change started on a bound prompt, held; see {@link #holdSettingsRebuild}. */
+	#heldSettingsRebuild: HeldSettingsRebuild | undefined;
+	#nextSettingsRebuildId = 1;
 	/** Full enabled set, including tools demoted from the model-visible surface. */
 	#enabledToolNames = new Set<string>();
 	/**
@@ -619,12 +759,14 @@ export class SessionTools {
 		if (this.#xdev) this.#xdev.decorateExecution = tool => this.#wrapToolForAcpPermission(tool);
 		this.#setActiveToolNames = options.setActiveToolNames;
 		this.#baseSystemPrompt = options.baseSystemPrompt;
+		this.#operatorPromptDigest = options.operatorPromptDigest;
 		const restoredReply = this.#latestReply();
 		const restoredPromptDigest = restoredReply && this.recordedPromptDigest();
 		this.#restoredTranscript =
 			restoredReply && restoredPromptDigest
 				? { reply: restoredReply, promptDigest: restoredPromptDigest }
 				: undefined;
+		this.#restoreTranscriptPrompt();
 		this.#skills = options.skills ?? [];
 		this.#promptSkills = this.#skills;
 		this.#skillWarnings = options.skillWarnings ?? [];
@@ -849,6 +991,22 @@ export class SessionTools {
 		return (this.#promptSurfaceScope.getStore() ?? this.#promptSurface).evalToolNames;
 	}
 
+	/**
+	 * Discovered agents the task description advertises (see {@link #promptSurface});
+	 * the candidate inside a rebuild frame. A rescan since rides {@link takeTaskAgentNotice}.
+	 */
+	get advertisedDiscoveredAgents(): readonly AgentDefinition[] | undefined {
+		return (this.#promptSurfaceScope.getStore() ?? this.#promptSurface).discoveredAgents;
+	}
+
+	/**
+	 * Per-call models the task and eval descriptions approve (see {@link #promptSurface});
+	 * the candidate inside a rebuild frame. A change since rides {@link takePerCallModelNotice}.
+	 */
+	get advertisedPerCallModels(): PerCallModelAdvertisement | undefined {
+		return (this.#promptSurfaceScope.getStore() ?? this.#promptSurface).perCallModels;
+	}
+
 	/** Derives the candidate surface from live state without publishing it. */
 	#derivePromptSurface(): PromptSurface {
 		return {
@@ -856,6 +1014,14 @@ export class SessionTools {
 			evalPreludes: this.#host.evalPreludes(),
 			sessionAgents: this.#host.sessionAgents(),
 			evalToolNames: this.getEvalBridgeToolNames(),
+			discoveredAgents: publishedAgentDiscovery(
+				this.#host.sessionManager.getCwd(),
+				this.#host.effectiveExtensionRoots(),
+			),
+			perCallModels:
+				perCallModelEnabled(this.#host.settings, "task") || perCallModelEnabled(this.#host.settings, "eval")
+					? getPerCallModelAdvertisement(this.#host.settings, this.#host.model(), this.#host.modelRegistry)
+					: undefined,
 		};
 	}
 	/** Drops cached per-session ACP `allow_always`/`reject_always` decisions. */
@@ -1476,7 +1642,26 @@ export class SessionTools {
 		);
 	}
 
+	/**
+	 * A forced rebuild commits the live state, so it ends a held settings rebuild: the tools that rebuild enables join
+	 * `toolNames` and the prompt lists the registry's skills when it held a rediscovery.
+	 */
 	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
+		const held = forcePromptRefresh ? this.#heldSettingsRebuild : undefined;
+		if (!held) return this.#applyToolSet(toolNames, forcePromptRefresh, signal);
+		this.#heldSettingsRebuild = undefined;
+		const promptSkills = this.#promptSkills;
+		if (held.skills) this.#promptSkills = this.#skills;
+		try {
+			await this.#applyToolSet([...toolNames, ...held.enabledTools], true, signal);
+		} catch (error) {
+			this.#promptSkills = promptSkills;
+			this.#heldSettingsRebuild ??= held;
+			throw error;
+		}
+	}
+
+	async #applyToolSet(toolNames: string[], forcePromptRefresh: boolean, signal?: AbortSignal): Promise<void> {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
@@ -1607,15 +1792,17 @@ export class SessionTools {
 					this.#promptSurfaceScope.run(surface, () =>
 						this.#computeAppliedToolSignature(validToolNames, tools, mountedSignatureTools),
 					);
-				// Eval-prelude, eval tool-name and model-mention changes alone never
-				// trigger a rebuild: they ride their hidden notices. The trigger keeps
-				// the committed sets; a rebuild caused by anything else absorbs the
-				// live ones.
+				// Eval-prelude, eval tool-name, model-mention, discovered-agent and
+				// per-call model changes alone never trigger a rebuild: they ride
+				// their hidden notices. The trigger keeps the committed sets; a
+				// rebuild caused by anything else absorbs the live ones.
 				const triggerSignature = computeSignature({
 					...candidate,
 					evalPreludes: this.#promptSurface.evalPreludes,
 					sessionAgents: this.#promptSurface.sessionAgents,
 					evalToolNames: this.#promptSurface.evalToolNames,
+					discoveredAgents: this.#promptSurface.discoveredAgents,
+					perCallModels: this.#promptSurface.perCallModels,
 				});
 				const freezeImplicitPromptRefresh =
 					!forcePromptRefresh &&
@@ -1679,8 +1866,10 @@ export class SessionTools {
 				}
 			}
 			if (rebuiltSystemPrompt && rebuiltSignature) {
-				// The restored transcript was sent with this prompt under the inherited cache key.
-				if (this.#lastAppliedToolSignature !== undefined && !restoresTranscriptPrompt) {
+				// The restored transcript was sent with this prompt under the inherited cache key. A prompt
+				// restored from the branch was too, so replacing it with another drops the key.
+				const committed = this.#lastAppliedToolSignature !== undefined || this.#basePromptRestored;
+				if (committed && !restoresTranscriptPrompt) {
 					this.#host.clearInheritedProviderPromptCacheKey();
 				}
 				this.#baseSystemPrompt = rebuiltSystemPrompt;
@@ -1818,34 +2007,103 @@ export class SessionTools {
 		this.recordPromptDigest(this.#replyPromptDigests.get(reply));
 	}
 
-	/** Records `digest` on the current branch unless it is already the branch's newest record. */
+	/**
+	 * Records `digest` on the current branch unless it is already the branch's
+	 * newest record, and stores the blocks it names (see {@link #storePromptBlocks}).
+	 */
 	recordPromptDigest(digest: string | undefined): void {
-		if (digest !== undefined && digest !== this.recordedPromptDigest()) {
+		if (digest === undefined) return;
+		if (digest !== this.recordedPromptDigest()) {
 			this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE, digest);
 		}
+		this.#storePromptBlocks(digest);
+	}
+
+	/**
+	 * Stores the base prompt blocks `digest` names on the current branch, once
+	 * per digest, for a resumed process to send again (see
+	 * {@link #restoreTranscriptPrompt}). Only the current base is at hand: a
+	 * reply produced under an older one (a forced rebuild committed while it
+	 * streamed) leaves its digest without blocks. Nothing reads them for a model
+	 * that does not bind its prefix, or when the operator inputs cannot be
+	 * compared, so nothing is stored then.
+	 */
+	#storePromptBlocks(digest: string): void {
+		const operatorDigest = this.#operatorPromptDigest;
+		if (operatorDigest === undefined || this.#host.model()?.thinking?.prefixBinding !== true) return;
+		if (this.#storedPrompt(digest) !== undefined || digest !== this.currentPromptDigest()) return;
+		const stored: StoredSystemPrompt = {
+			digest,
+			blocks: [...this.baseOfSystemPrompt(this.#host.agent.state.systemPrompt)],
+			toolNames: this.getActiveToolNames(),
+			operatorDigest,
+		};
+		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_CUSTOM_TYPE, stored);
+	}
+
+	/** The newest prompt the current branch stores for `digest`. */
+	#storedPrompt(digest: string): StoredSystemPrompt | undefined {
+		const branch = this.#host.sessionManager.getBranchView();
+		let scan = this.#storedPromptScan;
+		if (scan?.branch !== branch) {
+			scan = { branch, scanned: 0, prompts: new Map() };
+			this.#storedPromptScan = scan;
+		}
+		for (; scan.scanned < branch.length; scan.scanned++) {
+			const stored = storedPromptOfEntry(branch[scan.scanned]);
+			if (stored) scan.prompts.set(stored.digest, stored);
+		}
+		return scan.prompts.get(digest);
+	}
+
+	/**
+	 * Starts a resumed transcript from the prompt its newest reply was sent
+	 * with, when the branch stores it and this process built another one from
+	 * the same operator inputs. The rest of a startup build is raced against
+	 * deadlines or read from caches another process filled (skill descriptions,
+	 * context files, the workspace tree, tools that register late), and a changed
+	 * prompt makes a prefix-bound model write the whole cached conversation
+	 * again and drop its replayed thinking. What this build would change then
+	 * waits, as it does mid-session, on the frozen prompt's notices or a rebuild
+	 * that changes the prompt anyway. Models that do not bind their prefix keep
+	 * the fresh build: they rebuild freely mid-session as well.
+	 */
+	#restoreTranscriptPrompt(): void {
+		const restored = this.#restoredTranscript;
+		const operatorDigest = this.#operatorPromptDigest;
+		if (!restored || operatorDigest === undefined || this.#host.model()?.thinking?.prefixBinding !== true) return;
+		if (systemPromptDigest(this.#baseSystemPrompt) === restored.promptDigest) return;
+		const stored = this.#storedPrompt(restored.promptDigest);
+		if (stored?.operatorDigest !== operatorDigest || systemPromptDigest(stored.blocks) !== stored.digest) return;
+		this.#baseSystemPrompt = stored.blocks;
+		this.#basePromptRestored = true;
+		this.#applyAgentSystemPrompt(stored.blocks);
+		// The transcript's requests carried the stored roster: the next prompt announces what differs now.
+		this.#notifyToolRosterDelta(stored.toolNames, this.getActiveToolNames());
 	}
 
 	/** Drops retained transcript references when the session is disposed. */
 	releaseRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
 		this.#recordedDigestScan = undefined;
+		this.#storedPromptScan = undefined;
 	}
 
 	/**
 	 * What an implicit prompt rebuild must keep when the model binds signed
-	 * thinking to its prompt prefix. `"free"`: no prompt is committed yet, the
-	 * model does not bind, or the transcript holds no reply. `"frozen"`: the
-	 * transcript may be bound to the current prompt. Otherwise the newest reply is
-	 * the restored one and no primary model call has run: a resumed process builds
-	 * its base prompt before tools that register late (extension tools, MCP
-	 * servers), so a rebuild may commit only when it reproduces the prompt the
-	 * transcript was sent with. A transcript restored without a recorded digest,
-	 * or switched in later, stays frozen.
+	 * thinking to its prompt prefix. `"free"`: the model does not bind, no
+	 * prompt is committed yet (neither a rebuild nor a restored transcript
+	 * prompt), or the transcript holds no reply. `"frozen"`: the transcript may
+	 * be bound to the current prompt. Otherwise the newest reply is the restored
+	 * one and no primary model call has run: a resumed process builds its base
+	 * prompt before tools that register late (extension tools, MCP servers), so
+	 * a rebuild may commit only when it reproduces the prompt the transcript was
+	 * sent with. A transcript restored without a recorded digest, or switched in
+	 * later, stays frozen.
 	 */
 	#implicitRebuildBinding(): "free" | "frozen" | { promptDigest: string } {
-		if (this.#lastAppliedToolSignature === undefined || this.#host.model()?.thinking?.prefixBinding !== true) {
-			return "free";
-		}
+		if (this.#host.model()?.thinking?.prefixBinding !== true) return "free";
+		if (this.#lastAppliedToolSignature === undefined && !this.#basePromptRestored) return "free";
 		const latest = this.#latestReply();
 		if (latest === undefined) return "free";
 		return latest === this.#restoredTranscript?.reply ? this.#restoredTranscript : "frozen";
@@ -2136,6 +2394,82 @@ export class SessionTools {
 				removed,
 			}),
 			details: { added: added.map(agent => agent.name), removed },
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		};
+	}
+
+	/**
+	 * Builds the hidden notice reconciling the discovered agents the task
+	 * description advertises with the latest discovery scan. Delivered with the
+	 * next user prompt instead of rewriting the task description, so a rescan
+	 * mid-session (an agent file added through the agents hub, a plugin reload)
+	 * keeps the provider cache prefix intact. Spawning reads its own fresh scan,
+	 * so a new agent works before and after the notice.
+	 *
+	 * Known agents are the committed base snapshot, then every such notice still
+	 * in context, applied in order — mirroring {@link takeSessionAgentNotice}.
+	 */
+	takeTaskAgentNotice(): CustomMessage<TaskAgentNoticeDetails> | undefined {
+		const committed = this.#promptSurface.discoveredAgents;
+		const live = publishedAgentDiscovery(this.#host.sessionManager.getCwd(), this.#host.effectiveExtensionRoots());
+		// Without a committed scan the description lists the latest one itself.
+		if (!committed || !live) return undefined;
+		const known = new Set(committed.map(agent => agent.name));
+		for (const message of this.#host.agent.state.messages) {
+			if (message.role !== "custom" || message.customType !== TASK_AGENT_NOTICE_MESSAGE_TYPE) continue;
+			const details = message.details;
+			if (!isRecord(details) || !Array.isArray(details.added) || !Array.isArray(details.removed)) continue;
+			for (const name of details.added) if (typeof name === "string") known.add(name);
+			for (const name of details.removed) if (typeof name === "string") known.delete(name);
+		}
+		const liveNames = new Set(live.map(agent => agent.name));
+		const added = live.filter(agent => !known.has(agent.name));
+		const removed = [...known].filter(name => !liveNames.has(name));
+		if (added.length === 0 && removed.length === 0) return undefined;
+		return {
+			role: "custom",
+			customType: TASK_AGENT_NOTICE_MESSAGE_TYPE,
+			content: prompt.render(taskAgentNoticePrompt, {
+				added: added.map(agent => ({ name: agent.name, description: agent.description })),
+				removed,
+			}),
+			details: { added: added.map(agent => agent.name), removed },
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		};
+	}
+
+	/**
+	 * Builds the hidden notice restating the per-call models the task and eval
+	 * descriptions approve, when the live approvals differ from the ones the
+	 * model last read: the committed base snapshot, or the newest such notice
+	 * still in context. Delivered with the next user prompt instead of rewriting
+	 * the descriptions, so an operator's role or allowlist edit mid-session keeps
+	 * the provider cache prefix intact. The list is restated whole because roles,
+	 * allowlist and the own-model clause change together; a notice that a later
+	 * rebuild outdated costs at most one restatement of what the descriptions list.
+	 */
+	takePerCallModelNotice(): CustomMessage<PerCallModelAdvertisement> | undefined {
+		const settings = this.#host.settings;
+		let known = this.#promptSurface.perCallModels;
+		// Without a committed snapshot the descriptions list the live approvals themselves.
+		if (!known || (!perCallModelEnabled(settings, "task") && !perCallModelEnabled(settings, "eval"))) {
+			return undefined;
+		}
+		for (const message of this.#host.agent.state.messages) {
+			if (message.role !== "custom" || message.customType !== PER_CALL_MODEL_NOTICE_MESSAGE_TYPE) continue;
+			if (isPerCallModelAdvertisement(message.details)) known = message.details;
+		}
+		const live = getPerCallModelAdvertisement(settings, this.#host.model(), this.#host.modelRegistry);
+		if (Bun.deepEquals(live, known)) return undefined;
+		return {
+			role: "custom",
+			customType: PER_CALL_MODEL_NOTICE_MESSAGE_TYPE,
+			content: prompt.render(perCallModelNoticePrompt, { ...live }),
+			details: live,
 			attribution: "agent",
 			display: false,
 			timestamp: Date.now(),
@@ -2460,7 +2794,9 @@ export class SessionTools {
 	 * effects still run on reload; only the skill rescan is skipped for those
 	 * sessions. A plain rescan (`manage_skill`, `/skills install`/`update`) reuses the
 	 * directories the last discovery round returned instead of re-running every
-	 * extension's reload handler (PR #9379 review).
+	 * extension's reload handler (PR #9379 review). With `settingsChange` on a bound prompt
+	 * only the registry follows now; the prompt's list waits for the held rebuild
+	 * ({@link #holdSettingsRebuild}) and {@link takeSkillNotice} tells the model.
 	 */
 	refreshSkills(options?: RefreshSkillsOptions): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
@@ -2468,8 +2804,7 @@ export class SessionTools {
 			const runner = this.#host.extensionRunner();
 			if (!options?.rediscover || !runner) {
 				if (this.#skillsReloadable) await this.#applyDiscoveredSkills(this.#extensionSkillDirectories);
-				this.#promptSkills = this.#skills;
-				await this.refreshBaseSystemPrompt();
+				await this.#applySkillsToPrompt(options?.settingsChange);
 				this.#host.notifyCommandMetadataChanged();
 				return;
 			}
@@ -2497,11 +2832,24 @@ export class SessionTools {
 					// whose directory is no longer returned must drop back out.
 					await this.#mergeDiscoveredSkillDirectories(extensionDirectories);
 				}
-				this.#promptSkills = this.#skills;
-				await this.refreshBaseSystemPrompt();
+				await this.#applySkillsToPrompt(options?.settingsChange);
 				this.#host.notifyCommandMetadataChanged();
 			});
 		});
+	}
+
+	/**
+	 * Puts the rediscovered skills in the prompt's list and rebuilds it, or, for a settings change on a
+	 * bound prompt, leaves the list to the held rebuild ({@link #holdSettingsRebuild}).
+	 */
+	async #applySkillsToPrompt(settingsChange: readonly SettingChange[] | undefined): Promise<void> {
+		const held = this.#holdSettingsRebuild(settingsChange);
+		if (held) {
+			held.skills = true;
+			return;
+		}
+		this.#promptSkills = this.#skills;
+		await this.refreshBaseSystemPrompt();
 	}
 
 	/**
@@ -2741,15 +3089,22 @@ export class SessionTools {
 	 * unregisters disallowed ones, and reapplies the enabled set with one forced
 	 * prompt rebuild — unconditionally unless `refreshPrompt` is false, then only
 	 * when the tool set changed. Unrelated selections and MCP/extension tools are
-	 * preserved.
+	 * preserved. With `settingsChange` on a bound prompt the registry still follows
+	 * the settings, but the reapply is held ({@link #holdSettingsRebuild}): an
+	 * unregistered tool stays declared and its calls are refused, a registered one
+	 * waits for the rebuild. A change of the `xd://` state is never held.
 	 */
-	reconcileBuiltinTools({ refreshPrompt = true }: { refreshPrompt?: boolean } = {}): Promise<void> {
+	reconcileBuiltinTools({
+		refreshPrompt = true,
+		settingsChange,
+	}: { refreshPrompt?: boolean; settingsChange?: readonly SettingChange[] } = {}): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			const reconcile = this.#reconcileSettingsGatedTools;
 			if (!reconcile || this.#host.isDisposed()) return;
 			// Sampled before the delta: it still carries names mounted under the
 			// `xd://` state the reconcile may release.
-			const enabled = new Set(this.getEnabledToolNames());
+			const wasEnabled = new Set(this.getEnabledToolNames());
+			const enabled = new Set(wasEnabled);
 			const delta = await reconcile(name => this.#builtInToolNames.has(name));
 			for (const name of delta.removed) {
 				enabled.delete(name);
@@ -2765,21 +3120,163 @@ export class SessionTools {
 				if (delta.xdev) delta.xdev.decorateExecution = tool => this.#wrapToolForAcpPermission(tool);
 			}
 			if (!refreshPrompt && !xdevChanged && delta.added.length === 0 && delta.removed.length === 0) return;
-			await this.#applyActiveToolsByName([...enabled], true);
+			const held = xdevChanged ? undefined : this.#holdSettingsRebuild(settingsChange);
+			if (!held) {
+				await this.#applyActiveToolsByName([...enabled], true);
+				return;
+			}
+			held.reconcile = true;
+			const gates = settingsChange?.map(change => change.setting) ?? [];
+			for (const name of delta.removed) {
+				// A tool registered under this hold was never active: it just leaves the pending list.
+				if (!held.enabledTools.delete(name) && wasEnabled.has(name)) held.disabledTools.set(name, gates);
+			}
+			for (const { name, activate } of delta.added) {
+				// A tool disabled under this hold is still declared: registered again, its calls run again.
+				if (!held.disabledTools.delete(name) && activate) held.enabledTools.add(name);
+			}
 		});
 	}
 
 	/**
 	 * Rebuilds the stable base prompt for the current tools and model.
 	 * `commitIf` lets asynchronous producers discard a stale rebuild atomically
-	 * after its inputs have been superseded.
+	 * after its inputs have been superseded. With `settingsChange` on a bound
+	 * prompt the rebuild is held ({@link #holdSettingsRebuild}). Any other rebuild
+	 * renders the live settings anyway, so it runs a held one first.
 	 */
-	refreshBaseSystemPrompt(commitIf?: () => boolean): Promise<void> {
+	refreshBaseSystemPrompt(
+		commitIf?: () => boolean,
+		options?: { settingsChange?: readonly SettingChange[] },
+	): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
+			if (this.#holdSettingsRebuild(options?.settingsChange)) return;
+			await this.#absorbHeldSettingsRebuild();
 			const prepared = await this.#prepareBaseSystemPrompt();
 			if (commitIf && !commitIf()) return;
 			prepared?.commit?.();
 		});
+	}
+
+	/**
+	 * Holds the rebuild that `settingsChange` started when the prompt is bound (a prefix-bound model has answered
+	 * under it): the system prompt and the tool definitions keep their bytes, {@link takeSettingsNotice} tells the
+	 * model what changed, and {@link absorbHeldSettingsRebuild} runs the rebuild at a cut the cut rule admits or once
+	 * the prompt cache entry lapses. Returns the hold to extend, or undefined when the rebuild runs now: no settings
+	 * change started it, or nothing is bound. Unlike {@link #implicitRebuildBinding}, the prompt the session was
+	 * created with binds as soon as a reply was produced under it, before any rebuild committed.
+	 */
+	#holdSettingsRebuild(settingsChange: readonly SettingChange[] | undefined): HeldSettingsRebuild | undefined {
+		if (!settingsChange) return undefined;
+		if (this.#host.model()?.thinking?.prefixBinding !== true || this.#latestReply() === undefined) return undefined;
+		let held = this.#heldSettingsRebuild;
+		if (!held) {
+			held = {
+				id: this.#nextSettingsRebuildId++,
+				before: new Map(),
+				announced: new Map(),
+				disabledTools: new Map(),
+				enabledTools: new Set(),
+				// The model knows of no disabled or enabled tool yet ({@link takeSettingsNotice}'s key for empty lists).
+				announcedTools: JSON.stringify([[], []]),
+				reconcile: false,
+				skills: false,
+			};
+			this.#heldSettingsRebuild = held;
+		}
+		for (const { setting, previous } of settingsChange) {
+			if (!held.before.has(setting)) held.before.set(setting, previous);
+		}
+		return held;
+	}
+
+	/** Id of the held settings rebuild ({@link #holdSettingsRebuild}), or undefined when none is held. */
+	get heldSettingsRebuildId(): number | undefined {
+		return this.#heldSettingsRebuild?.id;
+	}
+
+	/**
+	 * Runs the held settings rebuild when `due` (the cut rule admitted a cut under the hold, or the prompt cache
+	 * entry the cut rule reads has lapsed) or when the prompt is no longer bound ({@link #holdSettingsRebuild}).
+	 */
+	absorbHeldSettingsRebuild(due: boolean): Promise<void> {
+		return this.runToolRegistryMutation(async () => {
+			if (!this.#heldSettingsRebuild || this.#host.isDisposed()) return;
+			const bound = this.#host.model()?.thinking?.prefixBinding === true && this.#latestReply() !== undefined;
+			if (!due && bound) return;
+			await this.#absorbHeldSettingsRebuild();
+		});
+	}
+
+	/** Runs a held settings rebuild: the live settings, tool set and skills go into the prompt. */
+	async #absorbHeldSettingsRebuild(): Promise<void> {
+		const held = this.#heldSettingsRebuild;
+		if (!held) return;
+		if (held.reconcile) {
+			// The forced apply ends the hold and activates the tools it enables.
+			await this.#applyActiveToolsByName(
+				this.getEnabledToolNames().filter(name => !held.disabledTools.has(name)),
+				true,
+			);
+			return;
+		}
+		this.#heldSettingsRebuild = undefined;
+		const promptSkills = this.#promptSkills;
+		if (held.skills) this.#promptSkills = this.#skills;
+		try {
+			const prepared = await this.#prepareBaseSystemPrompt();
+			prepared?.commit?.();
+		} catch (error) {
+			this.#promptSkills = promptSkills;
+			this.#heldSettingsRebuild ??= held;
+			throw error;
+		}
+	}
+
+	/**
+	 * Builds the hidden notice of a held settings rebuild: each changed setting with the value the prompt was built
+	 * with and the value in force (a credential's values withheld), the tools the change disabled, whose calls are
+	 * refused, and the tools it enables at the rebuild. Gives only what changed since the last such notice.
+	 */
+	takeSettingsNotice(): CustomMessage<SettingsNoticeDetails> | undefined {
+		const held = this.#heldSettingsRebuild;
+		if (!held) return undefined;
+		const changes: SettingChangeView[] = [];
+		for (const [setting, before] of held.before) {
+			const known = held.announced.has(setting) ? held.announced.get(setting) : before;
+			const value = setting.get(this.#host.settings);
+			if (settingValuesEqual(value, known)) continue;
+			changes.push(settingChangeView(setting, known, value));
+			held.announced.set(setting, value);
+		}
+		const disabledTools = [...held.disabledTools.keys()];
+		const enabledTools = [...held.enabledTools];
+		const tools = JSON.stringify([disabledTools, enabledTools]);
+		if (changes.length === 0 && tools === held.announcedTools) return undefined;
+		held.announcedTools = tools;
+		return {
+			role: "custom",
+			customType: SETTINGS_NOTICE_MESSAGE_TYPE,
+			content: prompt.render(settingsNoticePrompt, { changes, disabledTools, enabledTools }),
+			details: { settings: changes.map(change => change.id), disabledTools, enabledTools },
+			attribution: "agent",
+			display: false,
+			timestamp: Date.now(),
+		};
+	}
+
+	/**
+	 * Why a call to `name` is refused: a held settings rebuild unregistered it while its definition stays in the
+	 * bound prompt. Undefined for every other tool.
+	 */
+	heldToolRefusal(name: string): string | undefined {
+		const held = this.#heldSettingsRebuild;
+		const gates = held?.disabledTools.get(name);
+		if (!held || !gates) return undefined;
+		const changes = gates.map(setting =>
+			settingChangeView(setting, held.before.get(setting), setting.get(this.#host.settings)),
+		);
+		return prompt.render(heldToolRefusalPrompt, { tool: name, changes });
 	}
 
 	async #prepareBaseSystemPrompt(isCurrent?: () => boolean): Promise<SystemPromptPreparation | undefined> {
@@ -2900,17 +3397,44 @@ export class SessionTools {
 			const memory = await backend.beforeAgentStartPrompt(this.#host.memoryBackendSession(), promptText, signal);
 			if (!isCurrent() || !memory) return { systemPrompt: this.#baseSystemPrompt };
 			const injected = memory.context;
-			if (!injected) {
+			// A recall the conversation already carries as a hidden message (see below) is history.
+			if (
+				!injected ||
+				this.#host.agent.state.messages.some(
+					message => message.role === "custom" && message.customType === MEMORY_RECALL_MESSAGE_TYPE,
+				)
+			) {
 				return {
 					systemPrompt: this.#baseSystemPrompt,
 					memoryNotice: memory.notice,
 					commit: () => isCurrent() && memory.commit(),
 				};
 			}
+			// A conversation a prefix-bound model has answered went out without a recall (a reused one is
+			// the transcript's own). A fresh recall now would add a system block, and the provider would
+			// write the whole conversation to its cache again and drop its replayed thinking: it rides
+			// after the turn's newest content instead, with no rebuild. The backend's instructions carry
+			// the adopted recall, so the next rebuild (at a cut) may place it in the prompt.
+			if (
+				!memory.reused &&
+				this.#host.model()?.thinking?.prefixBinding === true &&
+				this.#latestReply() !== undefined
+			) {
+				return {
+					systemPrompt: this.#baseSystemPrompt,
+					memoryNotice: memory.notice,
+					memoryRecall: injected,
+					commit: () => isCurrent() && memory.commit(),
+				};
+			}
 
 			let refreshed: SystemPromptPreparation | undefined;
 			try {
-				refreshed = await this.runToolRegistryMutation(() => this.#prepareBaseSystemPrompt(isCurrent));
+				// This rebuild renders the live settings, so a held settings rebuild runs first.
+				refreshed = await this.runToolRegistryMutation(async () => {
+					await this.#absorbHeldSettingsRebuild();
+					return this.#prepareBaseSystemPrompt(isCurrent);
+				});
 			} catch (refreshErr) {
 				logger.debug("Memory backend prompt refresh after beforeAgentStartPrompt failed", {
 					backend: backend.id,

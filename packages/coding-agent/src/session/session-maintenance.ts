@@ -32,8 +32,10 @@ import {
 	DEFAULT_SHAKE_CONFIG,
 	type CompactionSettings as EngineCompactionSettings,
 	effectiveReserveTokens,
+	getMessageFromEntry,
 	invalidateMessageCache,
 	isTranscriptUsageAnchor,
+	MAX_SUMMARY_TOKENS,
 	NativeCompactionError,
 	prepareCompaction,
 	promptBudgetTokens,
@@ -50,19 +52,21 @@ import {
 } from "@oh-my-pi/pi-agent-core/compaction";
 import {
 	DEFAULT_PRUNE_CONFIG,
+	type PruneCut,
 	type PruneResult,
 	pruneSupersededToolResults,
 	pruneToolOutputs,
 	readToolSupersedeKey,
 } from "@oh-my-pi/pi-agent-core/compaction/pruning";
 import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
-import type {
-	AssistantMessage,
-	CodexCompactionContext,
-	Context,
-	Message,
-	Model,
-	ProviderSessionState,
+import {
+	type AssistantMessage,
+	type CodexCompactionContext,
+	type Context,
+	type Message,
+	type Model,
+	type ProviderSessionState,
+	resolveCacheRetention,
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { replaysNativeResponsesHistory } from "@oh-my-pi/pi-ai/providers/openai-shared";
@@ -99,6 +103,7 @@ import {
 	resolveMethodSettings,
 	resolveSpeculationMethod,
 } from "./compaction-methods";
+import { type ContextCut, decideSessionContextCut, promptCacheEntryLapsed } from "./context-cut";
 import {
 	assistantTurnDelivered,
 	convertToLlm,
@@ -106,6 +111,7 @@ import {
 	isUserAuthoredMessage,
 	stripImagesFromMessage,
 } from "./messages";
+import type { ObservedPromptCacheEntry } from "./prompt-cache-status";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
 import {
 	resolveCompactionConfiguredTarget,
@@ -137,7 +143,7 @@ import {
 	cfgSnapcompactShape,
 } from "./context-settings";
 import { resolveModelCompactionSettings } from "./model-compaction-threshold";
-import { cfgProvidersOpenaiCodexDaybreak, cfgRetry } from "./settings";
+import { cfgProvidersCacheRetention, cfgProvidersOpenaiCodexDaybreak, cfgRetry } from "./settings";
 
 export type CompactionCheckResult = Readonly<{
 	continuationScheduled: boolean;
@@ -504,6 +510,8 @@ export interface SessionMaintenanceHost {
 		pendingMessages?: AgentMessage[];
 	}): ContextUsageBreakdown | undefined;
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined;
+	/** The prompt cache entry the next request would read (`AgentSession.getPromptCacheStatus`'s entry). */
+	observedPromptCacheEntry(): ObservedPromptCacheEntry | undefined;
 	shake(mode: ShakeMode, options?: { config?: ShakeConfig; signal?: AbortSignal }): Promise<ShakeResult>;
 	dropImages(): Promise<{ removed: number; tokensFreed: number }>;
 	generateHandoffDocument(
@@ -636,6 +644,8 @@ export class SessionMaintenance {
 		{ key: string; length: number; first: AgentMessage | undefined }
 	>();
 	readonly #host: SessionMaintenanceHost;
+	/** Called with every automatic cut the cut rule admits ({@link onContextCutAdmitted}). */
+	readonly #cutAdmittedListeners = new Set<(cut: ContextCut) => void>();
 
 	get #model(): Model | undefined {
 		return this.#host.model();
@@ -775,6 +785,87 @@ export class SessionMaintenance {
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 	}
 
+	/**
+	 * Whether an automatic cut runs now, by the cut rule over the live session's figures
+	 * ({@link decideSessionContextCut}). A cut that is not admitted does not run: the next
+	 * maintenance point proposes it again, and it runs once it pays, the cache entry lapses, or the
+	 * request cannot be served without it. Manual `/shake` and `/compact`, and a compaction an RPC
+	 * client requests, do not ask.
+	 */
+	admitsContextCut(cut: ContextCut): boolean {
+		const model = this.#model;
+		// No model: no prices or window to weigh the cut with.
+		const admitted =
+			!model ||
+			decideSessionContextCut(
+				{
+					model,
+					cacheEntry: this.#nextPromptCacheEntry(),
+					compactionSettings: this.#compactionSettings,
+					branch: this.#host.sessionManager.getBranchView(),
+					promptTokens: cut.promptTokens ?? this.#cutPromptTokens(),
+					now: Date.now(),
+				},
+				cut,
+			).admitted;
+		if (admitted) for (const listener of this.#cutAdmittedListeners) listener(cut);
+		return admitted;
+	}
+
+	/** Calls `listener` with each cut {@link admitsContextCut} admits, until the returned function is called. */
+	onContextCutAdmitted(listener: (cut: ContextCut) => void): () => void {
+		this.#cutAdmittedListeners.add(listener);
+		return () => this.#cutAdmittedListeners.delete(listener);
+	}
+
+	/** Whether the prompt cache entry the next request would read has lapsed, by the cut rule's lapse condition. */
+	promptCacheLapsed(): boolean {
+		return promptCacheEntryLapsed(this.#nextPromptCacheEntry(), Date.now());
+	}
+
+	/** The prompt cache entry the cut rule reads: none when the next request asks for no caching, so it counts as lapsed. */
+	#nextPromptCacheEntry(): ObservedPromptCacheEntry | undefined {
+		const retention = cfgProvidersCacheRetention.get(this.#host.settings);
+		const cachesNext = resolveCacheRetention(retention === "auto" ? undefined : retention) !== "none";
+		return cachesNext ? this.#host.observedPromptCacheEntry() : undefined;
+	}
+
+	/** `P` for a cut whose site did not measure it: the live context, floored by the stored estimate. */
+	#cutPromptTokens(): number {
+		return compactionContextTokens(
+			this.#host.getContextUsage({ contextWindow: this.#model?.contextWindow ?? 0 })?.tokens ?? 0,
+			this.#estimateStoredContextTokens(),
+		);
+	}
+
+	/**
+	 * Tokens `entries` sends from `index` on. Encrypted reasoning counts at its full local size, so
+	 * the figure errs high, and `P` less it, a cut's cached prefix `p`, errs low: a smaller `p`
+	 * only makes the cut's rewrite look dearer.
+	 */
+	#tokensFrom(entries: readonly SessionEntry[], index: number): number {
+		let tokens = 0;
+		for (let i = index; i < entries.length; i++) {
+			const message = getMessageFromEntry(entries[i]);
+			if (message) tokens += this.#tokenizer.countMessage(message);
+		}
+		return tokens;
+	}
+
+	/** The cut-rule gate of a prune pass over `entries`: it keeps what precedes its first blanked result. */
+	#pruneGate(site: string, entries: readonly SessionEntry[]): (cut: PruneCut) => boolean {
+		return cut => {
+			const promptTokens = this.#cutPromptTokens();
+			return this.admitsContextCut({
+				site,
+				prefixTokens: Math.max(0, promptTokens - this.#tokensFrom(entries, cut.firstIndex)),
+				removedTokens: cut.tokensSaved,
+				forced: false,
+				promptTokens,
+			});
+		};
+	}
+
 	#pruneToolOutputs(): { prunedCount: number; tokensSaved: number } | undefined {
 		const branchEntries = this.#host.sessionManager.getBranchView();
 		const keepBoundaryId = getLatestCompactionEntry(branchEntries)?.firstKeptEntryId;
@@ -792,6 +883,7 @@ export class SessionMaintenance {
 				cacheWarmSuffixTokens: model?.thinking?.prefixBinding === true ? 0 : PRUNE_CACHE_WARM_SUFFIX_TOKENS,
 				cacheLookbackPositions: model ? resolvePromptCacheLookback(model) : undefined,
 				convertToLlm,
+				admit: this.#pruneGate("prune-tool-outputs", branchEntries),
 			}),
 		);
 		if (result.prunedCount === 0) {
@@ -836,6 +928,7 @@ export class SessionMaintenance {
 				suffixTokenLimit: model?.thinking?.prefixBinding === true ? 0 : undefined,
 				cacheLookbackPositions: model ? resolvePromptCacheLookback(model) : undefined,
 				convertToLlm,
+				admit: this.#pruneGate("prune-stale-tool-results", branchEntries),
 			}),
 		);
 		if (result.prunedCount === 0) {
@@ -1047,18 +1140,10 @@ export class SessionMaintenance {
 			if (opts.signal?.aborted || opts.isCurrent?.() === false) throw new CompactionCancelledError();
 		};
 		assertCurrent();
-		const branchEntries = this.#host.sessionManager.getBranch();
-		const latestCompaction = getLatestCompactionEntry(branchEntries);
-		const config = this.#withPlanProtection({
-			...(opts.config ?? AGGRESSIVE_SHAKE_CONFIG),
-			// Skip entries summarized away by the latest compaction — shaking them
-			// only churns persisted history with no prompt/cache effect. The cut is
-			// unconditional on the wire (see `buildSessionContext`), so a compaction
-			// the active model cannot replay still hides its prefix from the prompt.
-			keepBoundaryId: latestCompaction?.firstKeptEntryId,
-		});
-		let regions = collectShakeRegions(branchEntries, this.#tokenizer, config);
-		if (opts.toolResultsOnly) regions = regions.filter(region => region.kind === "toolResult");
+		const { branchEntries, latestCompaction, config, regions } = this.#elideRegions(
+			opts.config,
+			opts.toolResultsOnly,
+		);
 		if (regions.length === 0) {
 			return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
 		}
@@ -1172,6 +1257,12 @@ export class SessionMaintenance {
 		if (!settings.enabled || !resolveCompactionMethodOrder(settings.methodOrder).includes("shake")) return false;
 		const isCurrent = () => !this.#host.isDisposed() && this.#host.promptGeneration() === generation;
 		if (!isCurrent()) return false;
+		// The provider timed out reading the request body: it cannot be served as it is.
+		const cut = this.#shakeCut("request-body-timeout-shake", DEFAULT_SHAKE_CONFIG, {
+			forced: true,
+			toolResultsOnly: true,
+		});
+		if (cut && !this.admitsContextCut(cut)) return false;
 		try {
 			const result = await this.shake("elide", {
 				config: DEFAULT_SHAKE_CONFIG,
@@ -1186,6 +1277,52 @@ export class SessionMaintenance {
 			}
 			return false;
 		}
+	}
+
+	/** What `shake("elide")` with `configOverride` would elide on the current branch, oldest region first. */
+	#elideRegions(configOverride: ShakeConfig | undefined, toolResultsOnly: boolean | undefined) {
+		const branchEntries = this.#host.sessionManager.getBranch();
+		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		const config = this.#withPlanProtection({
+			...(configOverride ?? AGGRESSIVE_SHAKE_CONFIG),
+			// Skip entries summarized away by the latest compaction — shaking them
+			// only churns persisted history with no prompt/cache effect. The cut is
+			// unconditional on the wire (see `buildSessionContext`), so a compaction
+			// the active model cannot replay still hides its prefix from the prompt.
+			keepBoundaryId: latestCompaction?.firstKeptEntryId,
+		});
+		let regions = collectShakeRegions(branchEntries, this.#tokenizer, config);
+		if (toolResultsOnly) regions = regions.filter(region => region.kind === "toolResult");
+		return { branchEntries, latestCompaction, config, regions };
+	}
+
+	/**
+	 * The cut an automatic `shake("elide")` with `config` would make: it keeps what precedes its
+	 * oldest region and saves each region less its placeholder. `undefined` when nothing is
+	 * eligible: that shake rewrites nothing, and its caller's no-progress handling runs as before.
+	 */
+	#shakeCut(
+		site: string,
+		config: ShakeConfig,
+		options: { forced: boolean; promptTokens?: number; toolResultsOnly?: boolean },
+	): ContextCut | undefined {
+		const { branchEntries, regions } = this.#elideRegions(config, options.toolResultsOnly);
+		if (regions.length === 0) return undefined;
+		const promptTokens = options.promptTokens ?? this.#cutPromptTokens();
+		let removedTokens = 0;
+		// Placeholders as written without a recovery artifact; the artifact link adds a few tokens to each.
+		for (const [index, region] of regions.entries()) {
+			const placeholder = this.#tokenizer.countTokens(this.#shakeElidePlaceholder(region, index, undefined));
+			removedTokens += Math.max(0, region.tokens - placeholder);
+		}
+		const firstIndex = branchEntries.indexOf(regions[0].entry);
+		return {
+			site,
+			prefixTokens: Math.max(0, promptTokens - this.#tokensFrom(branchEntries, firstIndex)),
+			removedTokens,
+			forced: options.forced,
+			promptTokens,
+		};
 	}
 
 	#shakeElidePlaceholder(region: ShakeRegion, index: number, artifactId: string | undefined): string {
@@ -4566,7 +4703,12 @@ export class SessionMaintenance {
 		let elided = 0;
 		let elidedTokens = 0;
 		let elideSink = "placeholders";
-		if (!options.skipElide) {
+		// Every rescue tier is forced (cut rule condition 1): the compaction before it could not free
+		// enough context to serve the request. Each tier still asks the rule, which logs its decision.
+		const shakeCut = options.skipElide
+			? undefined
+			: this.#shakeCut("rescue-shake", RESCUE_SHAKE_CONFIG, { forced: true });
+		if (!options.skipElide && (!shakeCut || this.admitsContextCut(shakeCut))) {
 			try {
 				const result = await this.#host.shake("elide", { config: RESCUE_SHAKE_CONFIG, signal });
 				elided = result.toolResultsDropped + result.blocksDropped;
@@ -4594,13 +4736,17 @@ export class SessionMaintenance {
 		}
 		if (signal.aborted) return false;
 		let imagesDropped = 0;
-		try {
-			imagesDropped = (await this.#host.dropImages()).removed;
-			if (imagesDropped > 0) this.#host.rebaseAfterCompaction();
-		} catch (error) {
-			logger.warn("Dead-end image-drop rescue failed", {
-				error: error instanceof Error ? error.message : String(error),
-			});
+		// The pass measures the image tokens itself; p = 0 is the conservative bound, and a forced
+		// cut's figures only reach the log.
+		if (this.admitsContextCut({ site: "rescue-drop-images", prefixTokens: 0, removedTokens: 0, forced: true })) {
+			try {
+				imagesDropped = (await this.#host.dropImages()).removed;
+				if (imagesDropped > 0) this.#host.rebaseAfterCompaction();
+			} catch (error) {
+				logger.warn("Dead-end image-drop rescue failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
 		if (imagesDropped > 0 && options.hasProgress()) {
 			const elidedPart = elided > 0 ? `${this.#describeElideRescue(elided, elidedTokens, elideSink)} and ` : "";
@@ -5168,6 +5314,43 @@ export class SessionMaintenance {
 	}
 
 	/**
+	 * The cut-rule gate of an automatic compaction with `settings`. A compaction keeps the tools and
+	 * system prompt cached (`p`, their local estimate) and writes every message after them again: the
+	 * kept tail and the summary, which does not exist yet and is counted at the summarizer's cap (one
+	 * more for a split turn's prefix), so the write is never underestimated. `s` is the rest of the
+	 * prompt. With nothing to summarize the method's own no-op handling runs and nothing is cut, so the
+	 * rule is not asked.
+	 */
+	#admitsCompaction(
+		site: string,
+		reason: "overflow" | "threshold" | "idle" | "incomplete",
+		settings: EngineCompactionSettings,
+		triggerContextTokens: number | undefined,
+	): boolean {
+		const model = this.#model;
+		if (!model) return true;
+		const preparation = prepareCompaction(this.#host.sessionManager.getBranch(), settings, model, this.#tokenizer);
+		if (!preparation) return true;
+		const promptTokens = triggerContextTokens ?? this.#cutPromptTokens();
+		const prefixTokens = computeNonMessageTokens(
+			this.#host.nonMessageTokenSource(),
+			this.#tokenizer,
+			this.#host.settings.revision,
+		);
+		const rewrittenTokens =
+			this.#tokenizer.countMessages(preparation.recentMessages) +
+			MAX_SUMMARY_TOKENS * (preparation.isSplitTurn ? 2 : 1);
+		return this.admitsContextCut({
+			site,
+			prefixTokens,
+			removedTokens: Math.max(0, promptTokens - prefixTokens - rewrittenTokens),
+			// The provider refused the request for its size, or stopped its turn with the window full.
+			forced: reason === "overflow" || reason === "incomplete",
+			promptTokens,
+		});
+	}
+
+	/**
 	 * Internal: Run auto-compaction with events.
 	 *
 	 * Every method, handoff included, runs to completion before this resolves,
@@ -5223,6 +5406,13 @@ export class SessionMaintenance {
 			if (deadEnd) return deadEnd;
 		}
 		if (this.#usesExperimentalContextManagement()) {
+			// A rollover the model asked for (`new_context`) is its choice, not an automatic cut.
+			if (
+				!explicitNewContextRequest &&
+				!this.#admitsCompaction("context-rollover", reason, compactionSettings, options.triggerContextTokens)
+			) {
+				return COMPACTION_CHECK_NONE;
+			}
 			return await this.#runExperimentalContextRollover(reason, willRetry, options);
 		}
 		// The explicit request is valid only on the notes-backed rollover path.
@@ -5287,6 +5477,20 @@ export class SessionMaintenance {
 			return startIndex > 0 && reason === "threshold"
 				? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION
 				: COMPACTION_CHECK_NONE;
+		}
+
+		// A compaction that waits leaves any background speculation armed for a later pass. Shake
+		// weighs its own, smaller cut ({@link #runAutoShake}).
+		if (
+			method !== "shake" &&
+			!this.#admitsCompaction(
+				`compaction-${method}`,
+				reason,
+				resolveMethodSettings(compactionSettings, method),
+				options.triggerContextTokens,
+			)
+		) {
+			return COMPACTION_CHECK_NONE;
 		}
 
 		// A speculative pass may have already produced this compaction's summary
@@ -6486,6 +6690,12 @@ export class SessionMaintenance {
 		detachPostCommit = false,
 	): Promise<CompactionCheckResult | "fallback"> {
 		const action = "shake";
+		// A shake that waits starts nothing: no lifecycle events, and no later method takes its place.
+		const cut = this.#shakeCut("auto-shake", DEFAULT_SHAKE_CONFIG, {
+			forced: reason === "overflow" || reason === "incomplete",
+			promptTokens: triggerContextTokens,
+		});
+		if (cut && !this.admitsContextCut(cut)) return COMPACTION_CHECK_NONE;
 		this.#autoCompactionAbortController?.abort();
 		const controller = new AbortController();
 		this.#autoCompactionAbortController = controller;

@@ -9,6 +9,9 @@
 - `CustomMessage` has an optional `tag`, a caller correlation id that stays with the message ([#14323](https://github.com/can1357/oh-my-pi/pull/14323) by [@sjawhar](https://github.com/sjawhar))
 - Added `errorDisplayMessage` and `errorRetryAfterMs` to the proxy `error` event, copied onto the failed turn so a proxied failure keeps omp's shown text and the response's header retry delay apart from the provider's `errorMessage` ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
 - Added `PruneResult.pruned`, a list of exported `ToolResultPrune` records (each blanked tool result's entry id, notice, and `prunedAt`), and `blankToolResult()`, which applies one record to a loaded copy of its tool result.
+- Added `decideContextCut()`, which decides whether an automatic context cut runs now or waits until the prompt-cache reads it saves pay for the cache write it causes, and `meanPromptGrowth()` for its prompt-growth input
+- Added an `admit` gate to `pruneToolOutputs()` and `pruneSupersededToolResults()` configs: it sees where a pass would first change the history and what it would save, and a refused pass blanks nothing
+- Added `RepeatedPerCallMessages` and `AgentLoopConfig.repeatedPerCallMessages`, which every `Agent` sets for its own loop
 
 ### Fixed
 
@@ -18,6 +21,7 @@
 - The main loop's own dispatch hold carries that probe too, and fails an aborted request instead of resolving; the remote compaction requests send inside the same step as their hold check and arm their timeout at the wire, so a transport that holds one again does not spend it ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - The placeholder result for a tool call that never ran no longer repeats the provider's error text to the model: its content is a fixed sentence, and the provider's words stay in `details.upstreamError`, which no request carries. Quoting a refusal there got every later turn of the session refused as well
 - A turn that fails with a thrown `CredentialUnavailableError` now carries its transient classification (`errorId`) on the error message, so a host's turn retry can treat it as retryable ([#14031](https://github.com/can1357/oh-my-pi/pull/14031) by [@sjawhar](https://github.com/sjawhar)).
+- A per-call context message (`markPerCallContextMessage`) that a main request repeats with the bytes the previous main request had at the same position is now sent as history, so Anthropic prompt caching keeps both rolling breakpoints instead of anchoring one before it; side requests (`buildSideRequestContext`) keep the marks as set
 
 ### Breaking Changes
 

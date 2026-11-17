@@ -73,6 +73,8 @@ function newSession(
 		beforeRequest?: () => Promise<void>;
 		/** Prompt-cache key inherited from the session a fork was taken from. */
 		forkPromptCacheKey?: string;
+		/** Digest of the operator's prompt inputs, as `createAgentSession` passes it. */
+		operatorPromptDigest?: string;
 	} = {},
 ): TestSession {
 	const read = createTool("read");
@@ -128,6 +130,7 @@ function newSession(
 		rebuildSystemPrompt: async toolNames => ({
 			systemPrompt: [await rebuilder.rebuildSystemPrompt(toolNames)],
 		}),
+		operatorPromptDigest: options.operatorPromptDigest,
 	});
 	return {
 		session,
@@ -214,13 +217,16 @@ describe("prefix-bound tool roster changes", () => {
 
 	describe("after a resume", () => {
 		/** Transcript of a process that sent its first turn with `toolNames` active. */
-		async function liveTranscript(toolNames = ["read", "bash"]): Promise<{
+		async function liveTranscript(
+			toolNames = ["read", "bash"],
+			operatorPromptDigest?: string,
+		): Promise<{
 			sessionManager: SessionManager;
 			replyEntryId: string;
 			systemPrompt: string[];
 		}> {
 			const sessionManager = SessionManager.inMemory();
-			const live = newSession(createPrefixBindingModel(), { sessionManager });
+			const live = newSession(createPrefixBindingModel(), { sessionManager, operatorPromptDigest });
 			sessions.push(live.session);
 			await live.session.setActiveToolPresentation(toolNames, []);
 			await live.session.prompt("first");
@@ -415,6 +421,43 @@ describe("prefix-bound tool roster changes", () => {
 
 			expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
 			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
+		});
+
+		describe("whose process builds another prompt from the same operator inputs", () => {
+			const operatorPromptDigest = "operator-inputs";
+
+			it("keeps the transcript's stored prompt through a tool that registers late", async () => {
+				const transcript = await liveTranscript(["read", "bash"], operatorPromptDigest);
+				const resumed = newSession(createPrefixBindingModel(), {
+					sessionManager: transcript.sessionManager,
+					operatorPromptDigest,
+				});
+				sessions.push(resumed.session);
+				// A skill description or context file renders otherwise in this process.
+				resumed.changePromptInputs();
+				await resumed.session.setActiveToolPresentation(["read"], []);
+				await resumed.session.setActiveToolPresentation(["read", "bash"], []);
+
+				await resumed.session.prompt("second");
+
+				expect(resumed.systemPrompts[0]).toEqual(transcript.systemPrompt);
+				expect(providerText(resumed.contexts[0])).not.toContain("Tool availability changed.");
+			});
+
+			it("announces a tool the stored prompt lists that this process lacks", async () => {
+				const transcript = await liveTranscript(["read", "bash"], operatorPromptDigest);
+				const resumed = newSession(createPrefixBindingModel(), {
+					sessionManager: transcript.sessionManager,
+					operatorPromptDigest,
+				});
+				sessions.push(resumed.session);
+				await resumed.session.setActiveToolPresentation(["read"], []);
+
+				await resumed.session.prompt("second");
+
+				expect(resumed.systemPrompts[0]).toEqual(transcript.systemPrompt);
+				expect(providerText(resumed.contexts[0])).toContain("No longer available: bash.");
+			});
 		});
 
 		/** Kept out of the test body so no strong local binding outlives the capture. */

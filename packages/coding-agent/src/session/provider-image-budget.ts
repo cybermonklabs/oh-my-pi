@@ -222,17 +222,18 @@ function clampImages(context: Context, state: ImageBudgetState): Context {
 }
 
 /**
- * Drops oldest transient image blocks so outgoing vision requests fit the active provider's image cap.
+ * Drops the `dropped` oldest transient image blocks, by default just enough for outgoing vision requests to fit the
+ * active provider's image cap. A conversation's transform drops through {@link ProviderImageClamp}, which keeps the
+ * same drops from one request to the next.
  *
  * {@link countImages} counts exactly the roles {@link clampImages} can drop, so the
  * budget is always fully spendable and the clamp never evicts an input image
  * on behalf of a model output.
  */
-export function clampProviderContextImages(context: Context, model: Model): Context {
+export function clampProviderContextImages(context: Context, model: Model, dropped?: number): Context {
 	if (!model.input.includes("image")) return context;
 	const metadataWire = sendsComputerScreenshotMetadata(model);
-	const totalImages = countImages(context, metadataWire);
-	const remainingDrops = totalImages - providerImageBudget(model);
+	const remainingDrops = dropped ?? countImages(context, metadataWire) - providerImageBudget(model);
 	if (remainingDrops <= 0) return context;
 	return clampImages(context, {
 		remainingDrops,
@@ -241,6 +242,118 @@ export function clampProviderContextImages(context: Context, model: Model): Cont
 		model,
 		metadataWire,
 	});
+}
+
+/**
+ * Names a conversation's image history by its oldest image a request sends ({@link countImages}' order) and the turn
+ * that carries it: equal for every request that continues it, a side request's copy of it, or a branch of it, and
+ * different once a compaction summarized that turn away, even where a later turn carries the same image bytes. The
+ * turn is its role and timestamp, which every copy of a stored turn keeps (a context hook can re-stamp only a turn it
+ * builds itself). `undefined` when the request sends no countable image.
+ */
+function oldestImageKey(context: Context, metadataWire: boolean): string | undefined {
+	for (const message of context.messages) {
+		if (message.role === "assistant") continue;
+		const turn = `${message.role}:${message.timestamp}`;
+		// The one image a computer result counts as where the route sends its metadata screenshot (sentScreenshotBytes).
+		if (metadataWire && message.role === "toolResult" && message.providerMetadata?.type === "computer") {
+			return `${turn}:${Bun.hash(JSON.stringify(message.providerMetadata.screenshot))}`;
+		}
+		if (!Array.isArray(message.content)) continue;
+		for (const part of message.content) {
+			if (part.type === "image") return `${turn}:${Bun.hash(part.data)}`;
+		}
+	}
+	return undefined;
+}
+
+/** What a conversation's count clamp dropped, for the image budget it dropped them for. */
+interface StickyImageDrop {
+	budget: number;
+	/** The most images a request of the conversation carried. */
+	images: number;
+	/** How many of its oldest images every request drops. */
+	dropped: number;
+}
+
+/**
+ * Conversations whose drops one clamp remembers: each compaction starts another, and a branch switch can go back
+ * to the history before it. The oldest is forgotten first.
+ */
+const MAX_STICKY_IMAGE_CONVERSATIONS = 8;
+
+/** A forced image drop, with the context as the clamp received it and as it sends it. */
+export type ForcedImageDrop = (site: "image-count-clamp" | "image-byte-clamp", before: Context, after: Context) => void;
+
+/**
+ * The provider image clamps of one conversation, held by its provider-context transform so that each request drops
+ * what the previous one dropped.
+ *
+ * The count clamp is sticky. While the request's images fit the budget with the oldest images already dropped, it
+ * drops exactly those again, so the prompt prefix keeps its bytes and the next request reads it from the cache. When
+ * a new image would exceed the budget, the request cannot be served without a drop (cut rule condition 1): it drops
+ * the oldest images down to half the budget (rounded up) in one step, so the next forced drop is at least half the
+ * budget of new images away. The images dropped beyond the one the budget needed sit after it, so they add no cache
+ * write to the rewrite the forced drop already causes, and they shrink what is written. A dropped image keeps the
+ * clamp's placement: an image-only message still gets the omission text.
+ *
+ * A request whose images are a prefix or a branch of the history already sent (a side request, a prune, a branch
+ * switch) drops the same oldest images and leaves the state alone: its shared prefix keeps its bytes, and it never
+ * needs more drops than the request that carried the most images. A compaction replaces the oldest images, so the
+ * history it leaves is another conversation whose drops are recomputed from its own images; so is the state of a
+ * model whose budget differs.
+ *
+ * The byte clamp ({@link clampProviderContextImageBytes}) keeps the newest user message and the newest image tool
+ * result past the byte budget while they fit the body limit, and which messages those are moves with every turn: a
+ * message it protected becomes the oldest one it may evict once a newer one arrives, ahead of images it already
+ * dropped. Dropping a remembered number of oldest images would then evict a different set, so it is not sticky; each
+ * drop that evicts more than the previous request is reported as forced.
+ */
+export class ProviderImageClamp {
+	readonly #drops = new LRUCache<string, StickyImageDrop>({ max: MAX_STICKY_IMAGE_CONVERSATIONS });
+	readonly #onForcedDrop: ForcedImageDrop | undefined;
+	/** Images the byte clamp evicted from the previous request. */
+	#byteDrops = 0;
+
+	constructor(onForcedDrop?: ForcedImageDrop) {
+		this.#onForcedDrop = onForcedDrop;
+	}
+
+	/** {@link clampProviderContextImages}, dropping what this conversation's previous requests dropped. */
+	clampImageCount(context: Context, model: Model): Context {
+		if (!model.input.includes("image")) return context;
+		const metadataWire = sendsComputerScreenshotMetadata(model);
+		const conversation = oldestImageKey(context, metadataWire);
+		if (conversation === undefined) return context;
+		const images = countImages(context, metadataWire);
+		const budget = providerImageBudget(model);
+		const known = this.#drops.get(conversation);
+		const state = known?.budget === budget ? known : undefined;
+		let dropped = state?.dropped ?? 0;
+		let forced = false;
+		if (state && images <= state.images) {
+			dropped = Math.min(dropped, images);
+		} else {
+			if (images - dropped > budget) {
+				dropped = images - Math.ceil(budget / 2);
+				forced = true;
+			}
+			this.#drops.set(conversation, { budget, images, dropped });
+		}
+		const clamped = clampProviderContextImages(context, model, dropped);
+		if (forced) this.#onForcedDrop?.("image-count-clamp", context, clamped);
+		return clamped;
+	}
+
+	/** {@link clampProviderContextImageBytes}, reporting each drop that evicts more images than the last. */
+	clampImageBytes(context: Context, model: Model): Context {
+		const clamped = clampProviderContextImageBytes(context, model);
+		const metadataWire = sendsComputerScreenshotMetadata(model);
+		const dropped = clamped === context ? 0 : countImages(context, metadataWire) - countImages(clamped, metadataWire);
+		if (dropped > this.#byteDrops) this.#onForcedDrop?.("image-byte-clamp", context, clamped);
+		this.#byteDrops = dropped;
+		return clamped;
+	}
 }
 
 /**

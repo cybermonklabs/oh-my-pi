@@ -180,6 +180,7 @@ export const mnemopiBackend: MemoryBackend = {
 		if (!state || !preparation) return undefined;
 		return {
 			context: preparation.context,
+			reused: preparation.reused,
 			notice: preparation.notice,
 			commit: () => getMnemopiSessionState(session) === state && preparation.commit(),
 		};

@@ -775,6 +775,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			const changes = this.#recallChanges(persisted.memories);
 			return {
 				context: persisted.text || undefined,
+				reused: true,
 				notice: changes && {
 					content: changes.content,
 					details: { scope, memories: changes.memories } satisfies MemoryRecallChangesDetails,

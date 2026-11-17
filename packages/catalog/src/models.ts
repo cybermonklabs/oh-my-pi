@@ -220,17 +220,59 @@ export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage
 	return calculateUsageCost(model.cost, usage, timestamp);
 }
 
+/** Lifetime a prompt-cache write is billed at: five minutes or one hour. */
+export type CacheLifetime = "5m" | "1h";
+
+/** Dollars per token for reading cached prompt tokens and writing them at one lifetime. */
+export interface CacheTokenPrices {
+	/** Price of one prompt token read from the cache. */
+	read: number;
+	/** Price of one prompt token written to the cache at the requested lifetime. */
+	write: number;
+}
+
+/**
+ * Per-token cache prices for a write not yet made, by the rule usage is billed by: a one-hour
+ * write at twice the input rate, a five-minute write at the `cacheWrite` rate, a read at the
+ * `cacheRead` rate. `promptInputTokens` selects the long-context tier and `timestamp` (Unix ms)
+ * the dated card and peak/off-peak multiplier, exactly as {@link calculateUsageCost} applies
+ * them; only scheduled prices default to now.
+ */
+export function getCacheTokenPrices(
+	cost: ModelCost,
+	lifetime: CacheLifetime,
+	promptInputTokens: number,
+	timestamp?: number,
+): CacheTokenPrices {
+	const pricingTimestamp = cost.timeBased ? (timestamp ?? Date.now()) : undefined;
+	const rates = resolveTokenCost(cost, promptInputTokens, pricingTimestamp);
+	const multiplier = timeBasedMultiplier(cost.timeBased, pricingTimestamp);
+	return {
+		read: (rates.cacheRead / 1000000) * multiplier,
+		write: cacheWriteRate(rates, lifetime) * multiplier,
+	};
+}
+
+/**
+ * Price of one cache-write token at `lifetime`, before any peak/off-peak multiplier.
+ *
+ * `rates.cacheWrite` is the 5-minute write rate (Anthropic bills 5m writes at
+ * 1.25x base input). 1h writes bill at 2x base input. Deriving 1h from
+ * `input * 2` (Anthropic's published multiplier) is model-independent and
+ * stays correct even for legacy entries whose stored `cacheWrite` scalar
+ * drifts from 1.25x input.
+ */
+function cacheWriteRate(rates: TokenCost, lifetime: CacheLifetime): number {
+	return lifetime === "1h" ? (rates.input * 2) / 1000000 : rates.cacheWrite / 1000000;
+}
+
 /**
  * Price cache-write tokens, honoring the TTL breakdown when the provider reports one.
  *
- * `rates.cacheWrite` is the 5-minute write rate (Anthropic bills 5m writes at
- * 1.25x base input). When `usage.cttl` is present the write can mix 5m and 1h
- * breakpoints, and 1h writes bill at 2x base input, so each component is
- * priced at its own rate instead of the flat 5m rate. Deriving 1h from
- * `input * 2` (Anthropic's published multiplier) is model-independent and
- * stays correct even for legacy entries whose stored
- * `cacheWrite` scalar drifts from 1.25x input. Providers that omit `cttl`
- * (everyone but Anthropic) keep the flat-rate calculation.
+ * When `usage.cttl` is present the write can mix 5m and 1h breakpoints, so
+ * each component is priced at its own {@link cacheWriteRate} instead of the
+ * flat 5m rate. Providers that omit `cttl` (everyone but Anthropic) keep the
+ * flat-rate calculation.
  *
  * The breakdown is documented to sum to `usage.cacheWrite`, but the two are written
  * from independent wire fields (`cache_creation` vs `cache_creation_input_tokens`),
@@ -238,13 +280,13 @@ export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage
  * a partial or stale breakdown must never make write tokens free.
  */
 function cacheWriteCost(rates: TokenCost, usage: Usage): number {
-	const rate5m = rates.cacheWrite / 1000000;
+	const rate5m = cacheWriteRate(rates, "5m");
 	const cttl = usage.cttl;
 	if (!cttl) return rate5m * usage.cacheWrite;
 	const fiveMinute = cttl.ephemeral5m ?? 0;
 	const oneHour = cttl.ephemeral1h ?? 0;
 	const residual = Math.max(0, usage.cacheWrite - fiveMinute - oneHour);
-	return rate5m * (fiveMinute + residual) + ((rates.input * 2) / 1000000) * oneHour;
+	return rate5m * (fiveMinute + residual) + cacheWriteRate(rates, "1h") * oneHour;
 }
 
 /**

@@ -96,6 +96,11 @@ export interface MemoryBackendStartOptions {
 export interface MemoryPromptPreparation {
 	context?: string;
 	/**
+	 * `context` is the recall this transcript already delivered, read back from the session
+	 * rather than recalled again: the transcript's requests carried it.
+	 */
+	reused?: boolean;
+	/**
 	 * Model-facing note delivered with this turn's user message, e.g. what changed in the
 	 * memories a reused recall holds. Persisted in the transcript as a hidden custom message
 	 * whose `details` carry the backend's bookkeeping, so both land only once delivered.

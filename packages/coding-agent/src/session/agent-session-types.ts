@@ -366,6 +366,11 @@ export interface AgentSessionConfig {
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. */
 	rebuildSystemPrompt?: SystemPromptRebuilder;
+	/**
+	 * Digest of the prompt inputs the operator gives explicitly, or undefined when they cannot be compared; a
+	 * resumed transcript's stored prompt is sent again only while it is unchanged.
+	 */
+	operatorPromptDigest?: string;
 	/** Tools mounted under `xd://`, for `/tools` display. */
 	getXdevToolEntries?: () => Array<{ name: string; summary: string }>;
 	/** `xd://` presentation state backed by the canonical tool map. */
