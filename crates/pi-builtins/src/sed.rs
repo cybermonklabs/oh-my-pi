@@ -1139,17 +1139,19 @@ fn compile_regex(
 	// Convert basic to extended regular expression if needed. A BRE the
 	// dialect cannot express is a compilation error, matching real sed:
 	// `sed 's/\{1,3\}/X/'` reports an invalid RE rather than substituting.
+	// An ERE's bracket expressions are written out in the engine's syntax as
+	// a BRE's are: read by the engine, `[` in one opened a nested class, so
+	// `sed -E 's/[[]/x/'` was refused as an unclosed class.
 	let translated = if context.regex_extended {
-		None
+		crate::bre::ere_to_regex(pattern)
 	} else {
-		Some(
-			crate::bre::bre_to_ere(pattern, crate::bre::Backrefs::Supported).map_err(|e| {
-				compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))
-					.unwrap_err()
-			})?,
-		)
-	};
-	let pattern = translated.as_deref().unwrap_or(pattern);
+		crate::bre::bre_to_ere(pattern, crate::bre::Backrefs::Supported)
+			.map(std::borrow::Cow::<'_, str>::Owned)
+	}
+	.map_err(|e| {
+		compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))
+			.unwrap_err()
+	})?;
 
 	let mut modifiers = String::new();
 	if icase {
@@ -1159,9 +1161,9 @@ fn compile_regex(
 		modifiers.push('m');
 	}
 	let pattern = if modifiers.is_empty() {
-		pattern.to_string()
+		translated
 	} else {
-		format!("(?{modifiers}){pattern}")
+		std::borrow::Cow::Owned(format!("(?{modifiers}){translated}"))
 	};
 
 	// Compile into engine.
@@ -3793,13 +3795,9 @@ fn parse_character_class(
 
 		if ch == '[' {
 			line.advance();
-			if line.eol() {
-				result.push('[');
-				continue;
-			}
-			let marker = line.current();
 			// POSIX character class, collating symbol, or equivalence
-			if marker == ':' || marker == '.' || marker == '=' {
+			if !line.eol() && matches!(line.current(), ':' | '.' | '=') {
+				let marker = line.current();
 				line.advance();
 
 				result.push('[');
@@ -3838,10 +3836,9 @@ fn parse_character_class(
 
 				continue;
 			}
-			// Not a POSIX construct — treat as literal
+			// Not a POSIX construct: the `[` is a member of the list, and what
+			// follows is read as any member is.
 			result.push('[');
-			result.push(marker);
-			line.advance();
 			continue;
 		}
 

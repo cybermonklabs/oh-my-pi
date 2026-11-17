@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type {
 	BankProfileResponse,
 	CreateBankOptions,
@@ -9,7 +10,7 @@ import type {
 	RetainResponse,
 } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
-import type { HindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
+import { type HindsightConfig, loadHindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import { prepareRetentionTranscript, sliceLastTurnsByUserBoundary } from "@oh-my-pi/pi-coding-agent/hindsight/content";
 import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import { countUserTurns, extractLastTurns, extractMessages } from "@oh-my-pi/pi-coding-agent/hindsight/transcript";
@@ -104,8 +105,10 @@ class FakeHindsightApi extends HindsightApi {
 	}
 }
 
+/** The defaults of every field, so a field the config gains later needs no line here. */
 function config(overrides: Partial<HindsightConfig>): HindsightConfig {
 	return {
+		...loadHindsightConfig(Settings.isolated()),
 		hindsightApiUrl: "http://localhost:8888",
 		hindsightApiToken: null,
 		bankId: null,
