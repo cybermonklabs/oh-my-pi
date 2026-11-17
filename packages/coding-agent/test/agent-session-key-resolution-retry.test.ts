@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import {
@@ -32,20 +33,29 @@ import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { SessionAccountPoolScope } from "@oh-my-pi/pi-coding-agent/config/account-pools";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { invalidateAllCommandConfigs } from "@oh-my-pi/pi-coding-agent/config/resolve-config-value";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { hasRestorableTurn, SESSION_EXIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { activeBranch, type SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { collectSubSessions } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
+import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
@@ -188,14 +198,37 @@ function turnsOffering(model: MockModel, toolName: string): MockCall[] {
 	return model.calls.filter(call => (call.context.tools ?? []).some(tool => tool.name === toolName));
 }
 
+/** How the last message of `branch` ended its turn, when an assistant wrote it. */
+function assistantTail(branch: readonly SessionEntry[]) {
+	const tail = branch.filter(entry => entry.type === "message").at(-1);
+	if (tail?.type !== "message" || tail.message.role !== "assistant") return undefined;
+	const { stopReason, errorMessage, credentialUnavailable } = tail.message;
+	return { stopReason, errorMessage, credentialUnavailable };
+}
+
+/** Holds the backoff wait (a wait of a second or more) until it is aborted; shorter waits pass at once. */
+function holdBackoff() {
+	const started = Promise.withResolvers<void>();
+	const wait = vi.spyOn(scheduler, "wait").mockImplementation(async (delayMs, options) => {
+		options?.signal?.throwIfAborted();
+		if (delayMs < 1_000) return;
+		started.resolve();
+		const held = Promise.withResolvers<void>();
+		options?.signal?.addEventListener("abort", () => held.reject(options.signal?.reason), { once: true });
+		await held.promise;
+	});
+	return { started: started.promise, wait };
+}
+
 /**
  * A parent session on the production SDK path whose model spawns `WORKER` as a
  * task subagent and, when `async`, waits for it. The worker's model is on
  * anthropic, keyed by the store's only OAuth login; once its first request has
  * gone out, a failed refresh disables that login, so no later key lookup of
- * the worker resolves. Settings give the worker a retry budget of two.
+ * the worker resolves. Settings give the worker a retry budget of two, each
+ * retry after `retryDelayMs` (default `BASE_DELAY_MS`).
  */
-async function openParentWithKeyedWorker(options: { async: boolean }) {
+async function openParentWithKeyedWorker(options: { async: boolean; retryDelayMs?: number }) {
 	const cwd = root.join("home", "work");
 	await Bun.write(path.join(cwd, NOTES_FILE), "the notes\n");
 	const authStorage = await AuthStorage.create(root.join("testauth.db"), { usageProviderResolver: () => undefined });
@@ -282,7 +315,7 @@ async function openParentWithKeyedWorker(options: { async: boolean }) {
 			"task.completionProbe": false,
 			"compaction.enabled": false,
 			"retry.maxRetries": 2,
-			"retry.baseDelayMs": BASE_DELAY_MS,
+			"retry.baseDelayMs": options.retryDelayMs ?? BASE_DELAY_MS,
 			"retry.modelFallback": false,
 			"todo.enabled": false,
 			"todo.reminders": false,
@@ -431,6 +464,7 @@ function keyOutage(ctx: KeyResolutionContext, mode: OutageMode): KeyOutage {
  * `outage`, the key goes away while `probe` runs (`startOn: "probe"`) or
  * before the prompt (`startOn: "prompt"`, the caller starts it), and comes
  * back after `resolvesWhileDown` of the turn's key resolutions have failed.
+ * `extensionRunner` runs extension handlers on the session's events.
  */
 async function openSession(
 	ctx: KeyResolutionContext,
@@ -439,6 +473,7 @@ async function openSession(
 		sessionManager: SessionManager;
 		model?: Model<Api>;
 		outage?: { keys: KeyOutage; startOn: "probe" | "prompt"; resolvesWhileDown: number };
+		extensionRunner?: ExtensionRunner;
 	},
 ) {
 	const { modelRegistry } = ctx;
@@ -506,6 +541,7 @@ async function openSession(
 		settings,
 		modelRegistry,
 		providerSessionId: PROVIDER_SESSION_ID,
+		extensionRunner: options.extensionRunner,
 	});
 	cleanups.push(() => session.dispose());
 
@@ -921,6 +957,110 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 		// The wait ended on the job, not on its window.
 		expect(waited).not.toContain("No job finished");
 	}, 30_000);
+
+	it("row 3: a retry that a fork superseded while it was announced leaves its turn for omp --restore, after an earlier stop", async () => {
+		// If this regresses, a retry that a session transition superseded reads as the user's stop once the session saw
+		// any stop before: the turn ends on a "Retry cancelled" record, and `--restore` leaves a turn nobody stopped.
+		const ctx = await setUp();
+		const keys = keyOutage(ctx, "credential-disabled");
+		await keys.start();
+		const sessionManager = SessionManager.create(root.path(), root.join("sessions"));
+		const forking: { session?: AgentSession } = {};
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				// The user forks the session (`/fork`) while the retry's announcement is handled.
+				pi.on("auto_retry_start", async () => {
+					await forking.session?.fork();
+				});
+			},
+			root.path(),
+			new EventBus(),
+			runtime,
+			"fork-during-retry",
+		);
+		const { session, mock, retryEnds } = await openSession(ctx, {
+			maxRetries: 2,
+			sessionManager,
+			outage: { keys, startOn: "prompt", resolvesWhileDown: Number.POSITIVE_INFINITY },
+			extensionRunner: new ExtensionRunner([extension], runtime, root.path(), sessionManager, ctx.modelRegistry),
+		});
+		forking.session = session;
+		mockSchedulerWaitWithClock();
+		// Earlier, the user stopped a retry (an RPC `abort_retry`, sent while none ran).
+		session.abortRetry();
+		const firstFile = sessionManager.getSessionFile();
+
+		await session.prompt("run the probe");
+		await session.waitForIdle();
+
+		// The fork superseded the retry: the turn did not go on, and no request went out without a key.
+		expect(sessionManager.getSessionFile()).not.toBe(firstFile);
+		expect(retryEnds).toEqual([
+			expect.objectContaining({ success: false, attempt: 1, finalError: "Retry cancelled" }),
+		]);
+		expect(mock.calls).toHaveLength(0);
+		// Nobody stopped the turn: its marked failed attempt is still its tail, and `--restore` goes on with it.
+		const branch = sessionManager.getBranch();
+		expect(assistantTail(branch)).toMatchObject({ stopReason: "error", credentialUnavailable: true });
+		expect(hasRestorableTurn(branch)).toBe(true);
+	}, 30_000);
+
+	/** Stops of a parent's turn, the user's and the session's own; each must stop the sync subagent it waits on. */
+	const PARENT_STOPS: Record<string, (parent: AgentSession) => Promise<unknown>> = {
+		"the user's Esc or an RPC `abort`": parent => parent.abort({ reason: USER_INTERRUPT_LABEL }),
+		"a bare abort() with no reason": parent => parent.abort(),
+		"/new": parent => parent.newSession(),
+	};
+
+	for (const [stop, stopParent] of Object.entries(PARENT_STOPS)) {
+		it(`row 6: a parent's stop (${stop}) stops its sync subagent waiting to retry its key, and omp --restore leaves it`, async () => {
+			// If this regresses, the parent's stop reads to the subagent as its parent's process exit: the subagent's
+			// turn keeps its key marker, and `--restore` of the parent sends the stopped work again.
+			const { parent, workerModel } = await openParentWithKeyedWorker({ async: false, retryDelayMs: 5_000 });
+			const backoff = holdBackoff();
+			const prompting = parent.prompt("Delegate reading the notes.").catch(() => undefined);
+			// The worker's first request went out; its next one has no key and waits out the backoff.
+			await backoff.started;
+			expect(turnsOffering(workerModel, "read")).toHaveLength(1);
+			const parentFile = parent.sessionManager.getSessionFile();
+			if (!parentFile) throw new Error("Expected a persisted parent session file");
+			// The parent's turn is stopped, then the user quits.
+			await stopParent(parent);
+			await prompting;
+			backoff.wait.mockRestore();
+			await parent.dispose();
+			await AgentLifecycleManager.global().dispose();
+
+			const subSessions = Object.values(await collectSubSessions(parentFile));
+			expect(subSessions).toHaveLength(1);
+			const worker = subSessions[0]!;
+			const branch = activeBranch(worker.entries, worker.leafId);
+			// The stop ended the worker's turn after its marked attempt.
+			expect(assistantTail(branch)).toEqual({
+				stopReason: "aborted",
+				errorMessage: "Retry cancelled",
+				credentialUnavailable: undefined,
+			});
+			expect(hasRestorableTurn(branch)).toBe(false);
+
+			// A new process restores the parent: no subagent goes on.
+			const manager = new AsyncJobManager({});
+			cleanups.push(() => manager.dispose({ timeoutMs: 1000 }));
+			manager.registerDeliverySink(MAIN_AGENT_ID, () => {});
+			const followUp = vi
+				.spyOn(executorModule, "runSubagentFollowUpTurn")
+				.mockRejectedValue(new Error("relaunched a subagent whose parent stopped it"));
+			const restoring = {
+				sessionManager: await SessionManager.open(parentFile),
+				asyncJobManager: manager,
+				settings: Settings.isolated(),
+				restoreInterruptedTurn: vi.fn(async () => false),
+			} as unknown as AgentSession;
+			await expect(restoreSession(restoring)).resolves.toEqual({ turn: false, subagents: [] });
+			expect(followUp).not.toHaveBeenCalled();
+		}, 30_000);
+	}
 
 	/** Ways the user ends a provider's credentials; each must end a turn at once, never retry it. */
 	const USER_REMOVALS: Record<string, (authStorage: AuthStorage) => Promise<void>> = {
