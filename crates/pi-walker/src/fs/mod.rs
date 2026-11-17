@@ -367,9 +367,11 @@ impl File {
 	/// that returns exactly the remaining size is taken as end of file (no
 	/// confirming zero-length read), and growth after the open is not read;
 	/// files reporting size 0 (pseudo files) and short reads keep reading
-	/// until end of file or `limit`. A buffer the allocator refuses (a sparse
-	/// file larger than memory, say) fails with [`io::ErrorKind::OutOfMemory`],
-	/// as [`std::fs::read`] fails, instead of aborting the process.
+	/// until end of file or `limit`. A size the allocator refuses (beyond the
+	/// address space, or above memory where overcommit is limited) fails with
+	/// [`io::ErrorKind::OutOfMemory`], as [`std::fs::read`] fails, instead of
+	/// aborting the process; a size it grants is read as `std::fs::read`
+	/// reads it.
 	pub async fn read_into(&mut self, buf: &mut Vec<u8>, limit: u64) -> io::Result<()> {
 		buf.clear();
 		self.read_more(buf, limit).await
@@ -893,7 +895,9 @@ impl Session {
 	/// As for [`Self::remove_file_beneath`]; a `rel` that is not an empty
 	/// directory fails, as [`std::fs::remove_dir`] fails. On Windows a
 	/// directory symlink or junction at `rel` is removed itself (not its
-	/// target), as [`std::fs::remove_dir`] removes it there.
+	/// target), as [`std::fs::remove_dir`] removes it there, and an empty
+	/// directory with the read-only attribute is removed too, as `rmdir`
+	/// removes one on Unix, where [`std::fs::remove_dir`] refuses it.
 	pub async fn remove_dir_beneath(&mut self, root: &Dir, rel: &[u8]) -> io::Result<()> {
 		self.remove_beneath(root, rel, true).await
 	}

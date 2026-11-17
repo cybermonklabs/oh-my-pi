@@ -231,7 +231,7 @@ describe("loadFilesFromDir reads below the walked directory", () => {
 		}
 	});
 
-	test("warns about a sparse file larger than memory and loads the others", async () => {
+	test("warns about a sparse file whose size the allocator refuses and loads the others", async () => {
 		const fd = fs.openSync(path.join(dir, "huge.md"), "w");
 		try {
 			fs.ftruncateSync(fd, 2 ** 50);

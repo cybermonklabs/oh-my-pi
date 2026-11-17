@@ -454,6 +454,49 @@ async fn windows_read_only_files_are_removed() {
 	assert!(std::fs::symlink_metadata(tmp.0.join("root/ours")).is_err(), "the file stays");
 }
 
+/// On Windows a path stated without following a final symlink, as the
+/// listing cache stats a directory and its ignore files, has the stamp a
+/// handle reports, `ChangeTime` included, also after an attribute change
+/// moved `ChangeTime` away from `LastWriteTime`.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_path_stamps_agree_with_handle_stamps() {
+	let set_readonly = |path: &Path, readonly: bool| {
+		let mut perms = std::fs::metadata(path).unwrap().permissions();
+		perms.set_readonly(readonly);
+		std::fs::set_permissions(path, perms).unwrap();
+	};
+	let tmp = TempDir::new("win-stamps");
+	let file = tmp.write("root/.gitignore", b"*.log\n");
+	let dir_path = tmp.0.join("root");
+	std::thread::sleep(std::time::Duration::from_millis(50));
+	// An attribute change moves `ChangeTime`, not `LastWriteTime`.
+	set_readonly(&file, true);
+	set_readonly(&dir_path, true);
+	let mut s = Fs::native().session();
+	let dir = s.open_dir(&dir_path).await.unwrap();
+	let (_, file_by_handle) = s.open_file_at(&dir, b".gitignore", false).await.unwrap();
+	let dir_by_handle = s.stat_dir(&dir).await.unwrap();
+	let file_by_path = s.stat(&file, false).await.unwrap();
+	let dir_by_path = s.stat(&dir_path, false).await.unwrap();
+	drop(dir);
+	set_readonly(&file, false);
+	set_readonly(&dir_path, false);
+	if file_by_handle.stamp.ctime == file_by_handle.stamp.mtime
+		|| dir_by_handle.ctime == dir_by_handle.mtime
+	{
+		eprintln!(
+			"UNKNOWN: ChangeTime did not move away from LastWriteTime on this file system; the \
+			 stamps were not compared"
+		);
+		return;
+	}
+	assert_eq!(file_by_path.stamp, file_by_handle.stamp, "the file's stamps differ");
+	assert_eq!(file_by_path.file_type, Some(FileType::File));
+	assert_eq!(dir_by_path.stamp, dir_by_handle, "the directory's stamps differ");
+	assert_eq!(dir_by_path.file_type, Some(FileType::Dir));
+}
+
 /// A listed file's open follows a symlink there only when asked to.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
@@ -702,11 +745,12 @@ fn a_size_the_allocator_refuses_fails_with_out_of_memory() {
 	assert!(buf.is_empty());
 }
 
-/// A sparse file larger than memory fails `read_into` with `OutOfMemory`,
-/// and the session reads the next file as before.
+/// A 1 PiB sparse file, a size the allocator refuses (beyond the address
+/// space), fails `read_into` with `OutOfMemory`, and the session reads the
+/// next file as before.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn reading_a_sparse_file_larger_than_memory_fails_with_out_of_memory() {
+async fn reading_a_sparse_file_beyond_the_address_space_fails_with_out_of_memory() {
 	let tmp = TempDir::new("huge");
 	tmp.write("small", b"small");
 	let huge = std::fs::File::create(tmp.0.join("huge")).unwrap();

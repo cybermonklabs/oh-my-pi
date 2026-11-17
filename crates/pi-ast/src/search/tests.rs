@@ -623,12 +623,13 @@ async fn rewrite_writes_no_file_through_a_directory_swapped_after_the_read() {
 	assert!(err.starts_with("Failed to write "), "{err}");
 }
 
-/// A search over a sparse file larger than memory reports it as a warning
-/// (`out of memory`, as `std::fs::read` fails) and searches the other files,
-/// instead of aborting the process.
+/// A search over a 1 PiB sparse file, a size the allocator refuses (beyond
+/// the address space), reports it as a warning (`out of memory`, as
+/// `std::fs::read` fails) and searches the other files, instead of aborting
+/// the process.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn search_reports_a_sparse_file_larger_than_memory_and_goes_on() {
+async fn search_reports_a_sparse_file_beyond_the_address_space_and_goes_on() {
 	let tree = temp_tree(&[("small.py", "print(1)\n")]);
 	let file = fs::File::create(tree.root.join("huge.py")).unwrap();
 	if let Err(err) = file.set_len(1 << 50) {

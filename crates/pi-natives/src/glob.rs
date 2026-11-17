@@ -291,9 +291,9 @@ pub struct ReadFileBeneathResult {
 /// Rejects when `root` is not a directory, `path` is not walk-relative, a
 /// symlink is refused (`ELOOP` or `ENOTDIR` on Unix,
 /// `ERROR_STOPPED_ON_SYMLINK` on Windows), the file is a directory or a
-/// special file, the memory to read it into cannot be allocated (`out of
-/// memory`, a sparse file larger than memory read without `maxBytes`), or
-/// the open or a read fails.
+/// special file, the file's size is one the allocator refuses (beyond the
+/// address space, or above memory where overcommit is limited) and no
+/// `maxBytes` skips it first (`out of memory`), or the open or a read fails.
 #[napi]
 pub fn read_file_beneath(
 	env: &Env,
@@ -609,13 +609,13 @@ mod tests {
 		assert_eq!(bytes(read(&root, "a/b/file.txt", false, prefix(100, 4)).await), b"inside");
 	}
 
-	/// A sparse file larger than memory, read with no `maxBytes` and no
-	/// binary probe (as the discovery loader reads), fails with `OutOfMemory`
-	/// instead of aborting the process. With a probe its leading NULs skip it
-	/// as binary, and with `maxBytes` it is skipped as large, each before the
-	/// rest is read.
+	/// A 1 PiB sparse file, a size the allocator refuses (beyond the address
+	/// space), read with no `maxBytes` and no binary probe (as the discovery
+	/// loader reads), fails with `OutOfMemory` instead of aborting the
+	/// process. With a probe its leading NULs skip it as binary, and with
+	/// `maxBytes` it is skipped as large, each before the rest is read.
 	#[tokio::test(flavor = "multi_thread")]
-	async fn a_sparse_file_larger_than_memory_fails_with_out_of_memory() {
+	async fn a_sparse_file_beyond_the_address_space_fails_with_out_of_memory() {
 		let tree = Tree::new();
 		let file = fs::File::create(tree.root().join("huge.md")).expect("create");
 		if let Err(err) = file.set_len(1 << 50) {

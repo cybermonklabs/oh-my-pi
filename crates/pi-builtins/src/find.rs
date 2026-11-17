@@ -70,7 +70,10 @@ pub mod matchers {
 		/// provider trees, and `-L` walks remove by path. A symlink is removed
 		/// as a file, itself; on Windows a directory symlink or junction is a
 		/// directory and fails that removal, below the root as by path, as
-		/// [`std::fs::remove_file`] fails on it there.
+		/// [`std::fs::remove_file`] fails on it there. On Windows an empty
+		/// directory with the read-only attribute is removed below the root, as
+		/// `rmdir` removes one on Unix; by path it fails, as
+		/// [`std::fs::remove_dir`] (`RemoveDirectoryW`) refuses it there.
 		pub struct DeleteMatcher {
 			/// Removes entries below their (native) walk's root.
 			session: tokio::sync::Mutex<pi_walker::fs::Session>,

@@ -10,8 +10,9 @@
 //!   costs nothing extra and each call returns as many entries as possible.
 //! - Names convert from UTF-16 straight into the listing arena as WTF-8, which
 //!   round-trips unpaired surrogates back to the exact on-disk name.
-//! - Following path stats use `NtQueryFullAttributesFile`, which answers
-//!   without the caller opening a handle.
+//! - Stats of an absolute path use `NtQueryFullAttributesFile`, which answers
+//!   without the caller opening a handle and stamps `ChangeTime` as a handle's
+//!   query does, so the listing cache compares like with like.
 //!
 //! Reparse points (symlinks, junctions, mount points, cloud placeholders) are
 //! reported as symlinks and never descended. Opens that do not follow them
@@ -476,10 +477,14 @@ pub(crate) fn write_file_beneath(
 ///
 /// The mark uses POSIX semantics and ignores the read-only attribute, as
 /// [`std::fs::remove_file`] does through its `posix_delete`, so a read-only
-/// file is removed and its name is freed at once. A file system that does
-/// not know that class (`ERROR_INVALID_PARAMETER`, `ERROR_NOT_SUPPORTED`,
+/// file is removed and its name is freed at once. The same mark serves a
+/// directory, so an empty directory with the read-only attribute is removed
+/// too, as `rmdir` removes one on Unix, where [`std::fs::remove_dir`]
+/// (`RemoveDirectoryW`) refuses it. A file system that does not know that
+/// class (`ERROR_INVALID_PARAMETER`, `ERROR_NOT_SUPPORTED`,
 /// `ERROR_INVALID_FUNCTION`; FAT, for one) gets the classic mark, as `std`
-/// falls back, which refuses a read-only file there as `DeleteFileW` does.
+/// falls back, which refuses a read-only file or directory there as
+/// `DeleteFileW` and `RemoveDirectoryW` do.
 pub(crate) fn remove_beneath(
 	s: &mut Scratch,
 	root: &Handle,
@@ -603,10 +608,29 @@ pub(crate) fn handle_metadata(h: &Handle) -> io::Result<pi_vfs::Metadata> {
 	pi_vfs::Metadata::from_file(&std::fs::File::from(owned))
 }
 
+/// Describes the file at `path`. An absolute path is answered by
+/// [`full_attributes`], which describes a reparse point itself: without
+/// `follow` one is reported as [`FileType::Symlink`]; with `follow` its
+/// target is described through `std::fs`. Either way the stamp's `ctime` is
+/// `ChangeTime`, as the stamps taken from handles ([`stat_dir`],
+/// [`open_file_at`]) have it, which the listing cache compares them with.
 pub(crate) fn stat(s: &mut Scratch, path: &Path, follow: bool) -> io::Result<FileInfo> {
-	if !follow || !path.is_absolute() {
+	if !path.is_absolute() {
 		return stat_win32(path, follow);
 	}
+	let info = full_attributes(s, path)?;
+	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		if follow {
+			return stat_win32(path, true);
+		}
+		return Ok(FileInfo { file_type: Some(FileType::Symlink), size: 0, ..info_of(&info) });
+	}
+	Ok(info_of(&info))
+}
+
+/// `NtQueryFullAttributesFile` of the absolute `path`, which describes a
+/// reparse point (symlink, junction) at `path` itself, not its target.
+fn full_attributes(s: &mut Scratch, path: &Path) -> io::Result<FILE_NETWORK_OPEN_INFORMATION> {
 	// The NT layer takes names as spelled; Win32 rewriting (`/`, `.`/`..`,
 	// trailing dots and spaces) must happen first, as `std::fs` does.
 	let normalized;
@@ -651,15 +675,12 @@ pub(crate) fn stat(s: &mut Scratch, path: &Path, follow: bool) -> io::Result<Fil
 	if status < 0 {
 		return Err(nt_error(status));
 	}
-	// The attribute query describes a reparse point (symlink, junction)
-	// itself, not its target.
-	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return stat_win32(path, true);
-	}
-	Ok(info_of(&info))
+	Ok(info)
 }
 
-/// [`stat`] through `std::fs`, which follows reparse points when `follow`.
+/// [`stat`] of a relative path, or of a reparse point's target, through
+/// `std::fs`, which follows reparse points when `follow`. Its stamp's `ctime`
+/// is the last write time: `std::fs` metadata carries no `ChangeTime`.
 fn stat_win32(path: &Path, follow: bool) -> io::Result<FileInfo> {
 	let meta = if follow {
 		std::fs::metadata(path)?

@@ -3416,9 +3416,9 @@ export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxH
  * Rejects when `root` is not a directory, `path` is not walk-relative, a
  * symlink is refused (`ELOOP` or `ENOTDIR` on Unix,
  * `ERROR_STOPPED_ON_SYMLINK` on Windows), the file is a directory or a
- * special file, the memory to read it into cannot be allocated (`out of
- * memory`, a sparse file larger than memory read without `maxBytes`), or
- * the open or a read fails.
+ * special file, the file's size is one the allocator refuses (beyond the
+ * address space, or above memory where overcommit is limited) and no
+ * `maxBytes` skips it first (`out of memory`), or the open or a read fails.
  */
 export declare function readFileBeneath(options: ReadFileBeneathOptions): Promise<ReadFileBeneathResult>
 
