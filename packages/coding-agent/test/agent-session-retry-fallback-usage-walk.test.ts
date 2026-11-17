@@ -582,6 +582,98 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(modelOf(run.session)).toBe(formatModelString(PRIMARY));
 			expect(run.session.isRetrying).toBe(false);
 		});
+
+		it("asks again about the primary's reserve after a walk passed over a spent fallback", async () => {
+			// The user keeps the primary at the reserve once. The base then switched
+			// onto the spent fallback, and the check before the next model call read
+			// it as depleted, which ended that approval, so the reserve is asked
+			// about again once the session is back on the primary.
+			stubUsageReads({
+				[formatModelString(PRIMARY)]: {
+					state: "reserve",
+					accounts: [{ credentialId: 1, credentialType: "oauth", state: "reserve", remainingFraction: 0.05 }],
+				},
+				[formatModelString(FALLBACK)]: depletedRead("usage"),
+			});
+			const requestedModels: string[] = [];
+			let denyPrimary = false;
+			const mock = createMockModel();
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: PRIMARY, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requestedModels.push(formatModelString(model));
+					mock.push(
+						denyPrimary && model.provider === PRIMARY.provider && model.id === PRIMARY.id
+							? ACCOUNT_POLICY_DENIAL
+							: { content: ["answered"] },
+					);
+					return mock.stream(model, context, options);
+				},
+			});
+			const run = startSession(
+				agent,
+				walkSettings(PRIMARY, {
+					"retry.usageReservePolicy": "confirm",
+					"retry.fallbackChains": chainOf(FALLBACK, NEXT_FALLBACK),
+				}),
+			);
+			const offered: string[] = [];
+			run.session.setUsageFallbackConfirmer(async confirmation => {
+				offered.push(confirmation.to);
+				return false;
+			});
+
+			await runTurn(run.session, "Keep the primary at the reserve");
+			denyPrimary = true;
+			await runTurn(run.session, "Fail on the primary");
+			denyPrimary = false;
+			await run.session.setModel(PRIMARY);
+			await runTurn(run.session, "Spend the primary's reserve again");
+
+			expect(offered).toEqual([formatModelString(NEXT_FALLBACK), formatModelString(NEXT_FALLBACK)]);
+			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
+				formatModelString(PRIMARY),
+				formatModelString(NEXT_FALLBACK),
+				formatModelString(PRIMARY),
+			]);
+			expect(modelOf(run.session)).toBe(formatModelString(PRIMARY));
+		});
+
+		it("switches to the fallback after a spent one whose window holds the retry only without the failed turn", async () => {
+			// The base switched onto the spent fallback, and the retry dropped the
+			// failed turn before the check before the next model call fit the
+			// fallback after it. Here the failed turn's thinking alone overflows that
+			// fallback's window, and the rest of the request fits it.
+			const sharedRegistry = modelRegistry;
+			const modelsConfigPath = path.join(tempDir.path(), "models-small-gpt-4o-mini.yml");
+			await Bun.write(
+				modelsConfigPath,
+				JSON.stringify({ providers: { openai: { modelOverrides: { [FALLBACK.id]: { contextWindow: 8000 } } } } }),
+			);
+			modelRegistry = new ModelRegistry(authStorage, modelsConfigPath);
+			try {
+				stubUsageReads({ [formatModelString(NEXT_FALLBACK)]: depletedRead("usage") });
+				const requestedModels: string[] = [];
+				const run = startSession(
+					createWalkAgent(PRIMARY, requestedModels, {
+						content: [{ type: "thinking", thinking: "lorem ipsum ".repeat(5000) }],
+						stopReason: "error",
+						errorMessage: ACCOUNT_POLICY_DENIAL.errorMessage,
+					}),
+					walkSettings(PRIMARY, { "retry.fallbackChains": chainOf(NEXT_FALLBACK, FALLBACK) }),
+				);
+
+				await runTurn(run.session, "Fail on the primary after a long thought");
+
+				expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(FALLBACK)]);
+				expect(modelOf(run.session)).toBe(formatModelString(FALLBACK));
+				expect(lastAssistant(run.session).stopReason).toBe("stop");
+			} finally {
+				modelRegistry = sharedRegistry;
+			}
+		});
 	});
 
 	describe("switching to a fallback whose usage is not spent", () => {
@@ -1210,6 +1302,29 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			]);
 			expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
 			expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		it("answers on Fable with no switch when the spent target's own chain names Fable", async () => {
+			// The base switched onto the spent target, and the check before the next
+			// model call switched back to Fable, which the target's own chain names.
+			// The walk sends no request to the target, and Fable is already the model
+			// in use at the level that switch would set, so the walk makes no switch.
+			const { run, requestedModels } = await runCreditRefusal(
+				{
+					default: [formatModelString(CREDIT_TARGET)],
+					[formatModelString(CREDIT_TARGET)]: [formatModelString(FABLE)],
+				},
+				{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
+			);
+
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+			]);
+			expect(run.fallbacks).toEqual([]);
+			expect(modelOf(run.session)).toBe(formatModelString(FABLE));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 	});

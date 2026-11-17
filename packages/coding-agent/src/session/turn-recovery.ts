@@ -268,6 +268,16 @@ interface RetryFallbackEntry {
 	selector: RetryFallbackSelector;
 }
 
+/**
+ * The thinking level a fallback switch requests in place of the session's
+ * when the fallback's selector names none. `level` may be `undefined`: a
+ * switch onto a model with no thinking leaves no level, and the switch after
+ * it takes none either.
+ */
+interface InheritedThinkingLevel {
+	level: ConfiguredThinkingLevel | undefined;
+}
+
 /** Result shape shared with automatic maintenance recovery. */
 export interface RecoveryCompactionResult {
 	continuationScheduled: boolean;
@@ -2202,16 +2212,16 @@ export class TurnRecovery {
 	 * The check before a model call and the fallback walk share this search. It
 	 * answers the first entry that is not suppressed, has configured auth, fits
 	 * the effort ceiling and the context without `excludedMessage`, reads
-	 * neither depleted nor at the reserve, and gives a key, with that key. A key
-	 * read that throws passes over the entry. Undefined when no entry passes, or
-	 * once `stale()` is true.
+	 * neither depleted nor at the reserve, and gives a key, with that key and
+	 * the model the entry resolves to. A key read that throws passes over the
+	 * entry. Undefined when no entry passes, or once `stale()` is true.
 	 */
 	async #searchKeyedRetryFallback(
 		entries: Iterable<RetryFallbackEntry>,
 		stale: () => boolean,
 		excludedMessage: AssistantMessage | undefined,
 		signal: AbortSignal,
-	): Promise<(RetryFallbackEntry & { apiKey: string }) | undefined> {
+	): Promise<(RetryFallbackEntry & { apiKey: string; model: Model }) | undefined> {
 		const ceiling = this.#host.thinkingLevelCeiling();
 		for (const { role, selector: candidate } of entries) {
 			if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
@@ -2235,7 +2245,7 @@ export class TurnRecovery {
 			}
 			if (stale()) return undefined;
 			if (!apiKey) continue;
-			return { role, selector: candidate, apiKey };
+			return { role, selector: candidate, apiKey, model: candidateModel };
 		}
 		return undefined;
 	}
@@ -2263,13 +2273,19 @@ export class TurnRecovery {
 	 * effective thinking level after the ceiling clamp in
 	 * {@link applyRetryFallbackCandidate} and the per-model clamp in
 	 * `setThinkingLevel`. A different route or a different effective level is a
-	 * real change of request and stays eligible.
+	 * real change of request and stays eligible. `inheritedThinkingLevel` stands
+	 * in for the session's level when `selector` names none, as in
+	 * {@link applyRetryFallbackCandidate}.
 	 */
-	#isNoOpRetryFallback(candidate: Model, selector: RetryFallbackSelector): boolean {
+	#isNoOpRetryFallback(
+		candidate: Model,
+		selector: RetryFallbackSelector,
+		inheritedThinkingLevel?: InheritedThinkingLevel,
+	): boolean {
 		const active = this.#host.model();
 		if (!active || formatModelStringWithRouting(candidate) !== formatModelStringWithRouting(active)) return false;
 		const configured = this.#host.configuredThinkingLevel();
-		const requested = selector.thinkingLevel ?? configured;
+		const requested = selector.thinkingLevel ?? (inheritedThinkingLevel ? inheritedThinkingLevel.level : configured);
 		if (requested === AUTO_THINKING || configured === AUTO_THINKING) return requested === configured;
 		const effective = resolveThinkingLevelForModel(
 			candidate,
@@ -2282,7 +2298,14 @@ export class TurnRecovery {
 		role: string,
 		selector: RetryFallbackSelector,
 		currentSelector: string,
-		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string },
+		options?: {
+			pinFallback?: boolean;
+			apiKey?: string;
+			signal?: AbortSignal;
+			reason?: string;
+			/** The level to request when `selector` names none, in place of the session's. */
+			inheritedThinkingLevel?: InheritedThinkingLevel;
+		},
 	): Promise<boolean> {
 		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
@@ -2300,7 +2323,9 @@ export class TurnRecovery {
 		// Capture the configured selector (auto-aware) so a fallback chain preserves
 		// `auto` instead of collapsing it to the level it resolved to this turn.
 		const currentThinkingLevel = this.#host.configuredThinkingLevel();
-		const requestedThinkingLevel = selector.thinkingLevel ?? currentThinkingLevel;
+		const requestedThinkingLevel =
+			selector.thinkingLevel ??
+			(options?.inheritedThinkingLevel ? options.inheritedThinkingLevel.level : currentThinkingLevel);
 		// A fallback selector's explicit level (or the carried level after the
 		// replacement model's floor clamp) must never exceed the session's
 		// per-spawn effort ceiling.
@@ -2544,14 +2569,20 @@ export class TurnRecovery {
 						// context it fits is the retry's.
 						this.#usageReserveApproval = undefined;
 						const requestedThinkingLevel = selector.thinkingLevel ?? this.#host.configuredThinkingLevel();
-						const spentSelector = formatRetryFallbackSelector(
-							candidate,
+						// The configured level the switch onto the spent model would leave:
+						// a route found from it takes this level when its selector names none.
+						const spentThinkingLevel =
 							requestedThinkingLevel === AUTO_THINKING
-								? clampThinkingLevelToCeiling(candidate, resolveProvisionalAutoLevel(candidate), ceiling)
+								? AUTO_THINKING
 								: resolveThinkingLevelForModel(
 										candidate,
 										clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, ceiling),
-									),
+									);
+						const spentSelector = formatRetryFallbackSelector(
+							candidate,
+							spentThinkingLevel === AUTO_THINKING
+								? clampThinkingLevelToCeiling(candidate, resolveProvisionalAutoLevel(candidate), ceiling)
+								: spentThinkingLevel,
 						);
 						const spentRoles = this.retryFallbackChainKeys(spentSelector, candidate, {
 							pinnedRole: this.#activeRetryFallback?.role ?? role,
@@ -2574,6 +2605,14 @@ export class TurnRecovery {
 								),
 							);
 							if (!found) continue;
+							// A route found from the spent model requests, when its selector names
+							// no level, the level the switch onto the spent model would leave, as
+							// the check's switch from that model did; a held candidate keeps the
+							// failed model's level. A route that is the model in use, at the level
+							// the switch would set, makes no switch, and the retry goes on with
+							// that model.
+							const inheritedThinkingLevel = entries === heldEntries ? undefined : { level: spentThinkingLevel };
+							if (this.#isNoOpRetryFallback(found.model, found.selector, inheritedThinkingLevel)) return true;
 							// Like the check before a model call, this switch is pinned, so
 							// `cooldown-expiry` does not bring the primary back after it, and
 							// sets no credit redemption. A route found from the spent model, with
@@ -2585,6 +2624,7 @@ export class TurnRecovery {
 								...options,
 								pinFallback: true,
 								apiKey: found.apiKey,
+								inheritedThinkingLevel,
 								reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
 							});
 						}
