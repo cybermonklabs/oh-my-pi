@@ -16,7 +16,7 @@ import {
 	type LiveServerEvent,
 } from "./protocol";
 import { OUTPUT_ACTIVE_LEVEL, OutputActivity } from "./output-activity";
-import { CodexLiveTransport } from "./transport";
+import { type LiveEndpoint, LiveTransport, resolveLiveEndpoint } from "./transport";
 import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { DEFAULT_LIVE_VOICE } from "./voices";
 
@@ -106,7 +106,9 @@ export class LiveSessionController {
 	readonly #instructionsTemplate: string;
 	readonly #sdpOffer: string | undefined;
 
-	#transport: CodexLiveTransport | undefined;
+	#transport: LiveTransport | undefined;
+	/** The custom server set by `live.endpoint`, resolved at start; unset uses Codex. */
+	#endpoint: LiveEndpoint | undefined;
 	#recorder: AudioCapture | undefined;
 	#unsubscribeSession: (() => void) | undefined;
 	#sendChain: Promise<void> = Promise.resolve();
@@ -179,10 +181,15 @@ export class LiveSessionController {
 		}
 
 		try {
+			this.#endpoint = await resolveLiveEndpoint(this.#session.settings);
+			if (this.#stopped) {
+				throw this.#failure ?? new Error("The live session stopped while starting.");
+			}
 			const user = currentUser();
 			const instructions = prompt.render(this.#instructionsTemplate, user);
-			const transport = new CodexLiveTransport({
+			const transport = new LiveTransport({
 				authStorage: this.#session.modelRegistry.authStorage,
+				endpoint: this.#endpoint,
 				sessionId: this.#session.sessionId,
 				instructions,
 				voice: this.#voice,
