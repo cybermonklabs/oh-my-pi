@@ -15,6 +15,7 @@ import {
 	type AuthCredentialSnapshotEntry,
 	type DisabledCredentialSummary,
 	isAutoDisabledCredential,
+	isRecoverableDisabledCredential,
 	isUserRemovalCause,
 	type OAuthCredential,
 	type OAuthRefreshReason,
@@ -266,6 +267,23 @@ function mergeUsageReports(base: UsageReport, overlay: UsageReport): UsageReport
 				: {}),
 		},
 	};
+}
+
+/**
+ * The broker refused a user's removal of a login a failure disabled, and the
+ * login still reads as one a new login restores, so turns keep waiting for it.
+ * A broker older than its clients refuses (404): only an upgraded broker
+ * records a removal on such a login.
+ */
+export class AuthBrokerRemovalNotRecordedError extends AuthBrokerError {
+	constructor(provider: string, credentialIds: readonly number[]) {
+		const one = credentialIds.length === 1;
+		const credentials = credentialIds.map(id => `#${id}`).join(", ");
+		super(
+			`The auth broker did not record the removal of ${provider} ${one ? "credential" : "credentials"} ${credentials}. Upgrade the auth broker, then remove ${one ? "it" : "them"} again.`,
+		);
+		this.name = "AuthBrokerRemovalNotRecordedError";
+	}
 }
 
 export interface RemoteAuthCredentialStoreOptions {
@@ -924,11 +942,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			// Not active here, but the broker may hold it as a login a failure disabled: a
 			// user's removal records itself on that tombstone (`isAutoDisabledCredential`).
 			if (!isUserRemovalCause(disabledCause)) return false;
-			try {
-				return (await this.#client.disableCredential(id, disabledCause)).ok;
-			} catch {
-				return false;
-			}
+			if (await this.#recordRemoval(id, disabledCause)) return true;
+			await this.#assertRemovalsRecorded([id]);
+			return false;
 		}
 		await this.#client.disableCredential(id, disabledCause);
 		this.#removeCredentialById(id);
@@ -1023,15 +1039,18 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 * then drop them from the local snapshot. Refresh fetches the authoritative
 	 * post-state in the background. A user's removal also reaches the provider's
 	 * logins a failure already disabled, so the broker records it even when no
-	 * active row is left (see `isAutoDisabledCredential`).
+	 * active row is left (see `isAutoDisabledCredential`); when the broker
+	 * refuses that, this throws {@link AuthBrokerRemovalNotRecordedError} after
+	 * the rest is done.
 	 */
 	async deleteAuthCredentials(provider: string, disabledCause: string): Promise<void> {
 		const ids = this.listAuthCredentials(provider).map(entry => entry.id);
+		const tombstoneIds: number[] = [];
 		if (isUserRemovalCause(disabledCause)) {
 			try {
 				const tombstones = await this.#client.listDisabledCredentials(provider);
 				for (const tombstone of tombstones) {
-					if (isAutoDisabledCredential(tombstone)) ids.push(tombstone.id);
+					if (isAutoDisabledCredential(tombstone)) tombstoneIds.push(tombstone.id);
 				}
 			} catch (error) {
 				logger.warn("auth-broker disabled credential lookup during delete failed", {
@@ -1051,8 +1070,53 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				});
 			}
 		}
+		const refused: number[] = [];
+		for (const id of tombstoneIds) {
+			try {
+				if (!(await this.#recordRemoval(id, disabledCause))) refused.push(id);
+			} catch (error) {
+				logger.warn("auth-broker disable during delete failed", {
+					provider,
+					id,
+					error: String(error),
+				});
+			}
+		}
 		this.#removeProviderEntries(provider);
 		this.#maybeRefreshSnapshot("delete");
+		await this.#assertRemovalsRecorded(refused, provider);
+	}
+
+	/**
+	 * Ask the broker to record a user's removal on a tombstone. `false` when it
+	 * refused (404, `ok: false`); other broker errors propagate.
+	 */
+	async #recordRemoval(id: number, disabledCause: string): Promise<boolean> {
+		try {
+			return (await this.#client.disableCredential(id, disabledCause)).ok;
+		} catch (error) {
+			if (error instanceof AuthBrokerError && error.status === 404) return false;
+			throw error;
+		}
+	}
+
+	/**
+	 * Throw {@link AuthBrokerRemovalNotRecordedError} when the broker refused a
+	 * removal in `refused` and that login still reads as recoverable. A refusal
+	 * that leaves nothing to wait for (the row is gone, or a removal already
+	 * recorded on it or a later one covers it) is no error.
+	 */
+	async #assertRemovalsRecorded(refused: readonly number[], provider?: string): Promise<void> {
+		if (refused.length === 0) return;
+		const tombstones = await this.#client.listDisabledCredentials(provider);
+		const kept = tombstones.filter(
+			tombstone => refused.includes(tombstone.id) && isRecoverableDisabledCredential(tombstone, tombstones),
+		);
+		if (kept.length === 0) return;
+		throw new AuthBrokerRemovalNotRecordedError(
+			kept[0]!.provider,
+			kept.map(tombstone => tombstone.id),
+		);
 	}
 
 	#applyProviderEntries(provider: string, entries: AuthCredentialSnapshotEntry[]): void {

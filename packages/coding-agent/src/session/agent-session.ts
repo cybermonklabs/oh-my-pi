@@ -382,6 +382,7 @@ import {
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
+import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "./credential-disabled-notice";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost, type PythonExecuteOptions } from "./eval-runner";
@@ -5094,7 +5095,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					!isConcurrencyCap &&
 					!AIError.isGitHubCopilotPolicyDenial(msg.provider, msg.errorStatus, msg.errorMessage)
 				) {
-					await this.#modelRegistry.authStorage.credentials.remove("github-copilot");
+					try {
+						await this.#modelRegistry.authStorage.credentials.remove("github-copilot");
+					} catch (error) {
+						// An auth broker older than this client cannot record the removal on a login a
+						// failure disabled: say so, and let the rest of the turn's maintenance run. Matched
+						// by name, since from a subagent worker it crosses the thread as a plain `Error`.
+						if (!(error instanceof Error) || error.name !== "AuthBrokerRemovalNotRecordedError") throw error;
+						this.emitNotice("warning", error.message, CREDENTIAL_DISABLED_NOTICE_SOURCE);
+					}
 				}
 			}
 

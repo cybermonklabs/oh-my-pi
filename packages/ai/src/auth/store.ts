@@ -52,8 +52,12 @@ export interface CredentialRowStore {
 	listDisabledCredentials?(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]>;
 	updateAuthCredential(id: number, credential: AuthCredential): void;
 	/**
-	 * Disable one active row; return false if it was already absent or disabled.
-	 * Remote stores await broker persistence before updating their snapshot.
+	 * Disable one active row. For a user's removal cause (`isUserRemovalCause`),
+	 * a row a failure already disabled (`isAutoDisabledCredential`) gets the
+	 * removal recorded on its tombstone instead. Return false when no row changed.
+	 * Remote stores await broker persistence before updating their snapshot, and
+	 * throw `AuthBrokerRemovalNotRecordedError` when the broker refuses to record
+	 * a user's removal on such a tombstone.
 	 */
 	deleteAuthCredential(id: number, disabledCause: string): Promise<boolean>;
 	tryDisableAuthCredentialIfMatches(
@@ -81,7 +85,12 @@ export interface CredentialRowStore {
 	 * so subsequent reads see the persisted result.
 	 */
 	upsertAuthCredential(provider: string, credential: AuthCredential): Promise<StoredAuthCredential[]>;
-	/** Disable all active rows for a provider (logout), forwarding remote writes to the broker before returning. */
+	/**
+	 * Disable all active rows for a provider (logout), forwarding remote writes to
+	 * the broker before returning. A user's removal cause also records itself on
+	 * the provider's rows a failure disabled; remote stores throw
+	 * `AuthBrokerRemovalNotRecordedError` when the broker refuses that record.
+	 */
 	deleteAuthCredentials(provider: string, disabledCause: string): Promise<void>;
 }
 

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
@@ -11,6 +12,7 @@ import {
 	AuthBrokerError,
 	type AuthBrokerServerHandle,
 	AuthBrokerStreamUnsupportedError,
+	RemoteAuthCredentialStore,
 	type SnapshotResponse,
 	type SnapshotStreamEvent,
 	startAuthBroker,
@@ -41,6 +43,37 @@ function fetchWithoutAuthBrokerCapabilities(): typeof fetch {
 			return fetch(input, { ...init, headers });
 		},
 		{ preconnect: fetch.preconnect },
+	);
+}
+
+/** What a refresh failure records on the login it disables. */
+const FAILURE_CAUSE = "oauth refresh failed: invalid_grant";
+/** The capability a client announces to receive `identityKey` on disabled-credential summaries. */
+const DISABLED_IDENTITY_KEY_CAPABILITY = "disabled-identity-key";
+
+/** `GET /v1/credentials/disabled` as a client built before `identityKey` validates it: strict, no `identityKey`. */
+const priorDisabledCredentialsResponseSchema = type({
+	"+": "reject",
+	generatedAt: "number",
+	disabled: type({
+		"+": "reject",
+		id: "number.integer",
+		provider: type("string").atLeastLength(1),
+		type: "'oauth' | 'api_key'",
+		"email?": "string",
+		"accountId?": "string",
+		"orgId?": "string",
+		"orgName?": "string",
+		cause: "string",
+		"disabledAtMs?": "number",
+	}).array(),
+});
+
+/** Makes the broker answer like one built before it recorded removals on tombstones: an id that is not active is a 404. */
+function refuseTombstoneRemovals(brokerStorage: AuthStorage): void {
+	const disable = brokerStorage.credentials.disable.bind(brokerStorage.credentials);
+	vi.spyOn(brokerStorage.credentials, "disable").mockImplementation(async (id, disabledCause) =>
+		brokerStorage.credentials.list().some(row => row.id === id) ? disable(id, disabledCause) : false,
 	);
 }
 
@@ -532,6 +565,76 @@ describe("auth-broker wire surface", () => {
 		expect(afterResult.snapshot.credentials).toHaveLength(0);
 
 		await expect(client.refreshCredential(id)).rejects.toThrow();
+	});
+
+	test("GET /v1/credentials/disabled leaves identityKey out for a client that does not announce it", async () => {
+		// If this regresses, an older client's strict schema rejects the answer and `omp usage` loses its relogin rows.
+		const id = storage!.credentials.snapshot().credentials[0]!.id;
+		expect(await storage!.credentials.disable(id, FAILURE_CAUSE)).toBe(true);
+
+		const res = await fetch(`${handle!.url}/v1/credentials/disabled`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { disabled: Array<{ id: number }> };
+		const validated = priorDisabledCredentialsResponseSchema(body);
+		expect(validated instanceof type.errors ? validated.summary : "accepted").toBe("accepted");
+		expect(body.disabled.map(row => row.id)).toEqual([id]);
+		// The answer depends on the announcement, so a shared cache must key on it.
+		expect(res.headers.get("vary")).toBe(AUTH_BROKER_CAPABILITIES_HEADER);
+	});
+
+	test("GET /v1/credentials/disabled serves identityKey to a client that announces it", async () => {
+		// If this regresses, a client can no longer tell one account's tombstone from another's.
+		const { id, identityKey } = storage!.credentials.snapshot().credentials[0]!;
+		if (identityKey === null) throw new Error("the fixture login must resolve an identity");
+		expect(await storage!.credentials.disable(id, FAILURE_CAUSE)).toBe(true);
+		const announced: Array<string | null> = [];
+		const fetchImpl = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit) => {
+				announced.push(new Headers(init?.headers).get(AUTH_BROKER_CAPABILITIES_HEADER));
+				return fetch(input, init);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const disabled = await new AuthBrokerClient({ url: handle!.url, token, fetchImpl }).listDisabledCredentials(
+			"anthropic",
+		);
+
+		expect(disabled.map(row => row.identityKey)).toEqual([identityKey]);
+		// The header is a comma list; the capability the client already announced stays in it.
+		const capabilities = (announced[0] ?? "").split(",").map(capability => capability.trim());
+		expect(capabilities).toContain(DISABLED_IDENTITY_KEY_CAPABILITY);
+		expect(capabilities).toContain(AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES);
+	});
+
+	test("a client's provider removal reports the failure-disabled login an older broker did not record", async () => {
+		// If this regresses, the removal reads as done while the broker keeps the failure, and turns keep waiting for that login.
+		const id = storage!.credentials.snapshot().credentials[0]!.id;
+		expect(await storage!.credentials.disable(id, FAILURE_CAUSE)).toBe(true);
+		refuseTombstoneRemovals(storage!);
+		const clientStorage = new AuthStorage(
+			new RemoteAuthCredentialStore({
+				client: new AuthBrokerClient({ url: handle!.url, token }),
+				streamSnapshots: false,
+			}),
+		);
+		try {
+			await clientStorage.credentials.reload();
+
+			const error = await clientStorage.credentials.remove("anthropic").then(
+				() => undefined,
+				(reason: unknown) => reason,
+			);
+
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).name).toBe("AuthBrokerRemovalNotRecordedError");
+			expect((error as Error).message).toContain(`anthropic credential #${id}`);
+			expect((error as Error).message).toContain("Upgrade the auth broker");
+		} finally {
+			clientStorage.close();
+		}
 	});
 
 	test("GET /v1/usage/history serves recorded snapshots with sinceMs/provider filters and requires auth", async () => {

@@ -174,6 +174,13 @@ export const AUTH_BROKER_CAPABILITIES_HEADER = "OMP-Auth-Broker-Capabilities";
 /** Client understands independent Codex `chat` and `spark` credential-block scopes. */
 export const AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES = "codex-meter-block-scopes";
 
+/**
+ * Client accepts `identityKey` on disabled-credential summaries (`GET /v1/credentials/disabled`).
+ * Clients that predate the field validate summaries strictly and reject it, so the broker leaves
+ * it out for them.
+ */
+export const AUTH_BROKER_CAPABILITY_DISABLED_IDENTITY_KEY = "disabled-identity-key";
+
 /** Default port when none is configured. Loopback-only, no external exposure. */
 export const DEFAULT_AUTH_BROKER_BIND = "127.0.0.1:8765";
 

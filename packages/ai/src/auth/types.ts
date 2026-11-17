@@ -960,18 +960,26 @@ export interface CredentialsApi {
 	 */
 	upsert(provider: string, credential: AuthCredential): Promise<AuthCredentialSnapshotEntry[]>;
 	/**
-	 * Remove credential for a provider.
+	 * Remove credential for a provider, and record the user's removal on the
+	 * provider's logins a failure disabled. A remote store throws
+	 * `AuthBrokerRemovalNotRecordedError` when its broker refuses that record.
 	 */
 	remove(provider: string): Promise<void>;
 	/**
-	 * Remove one stored credential for a provider.
+	 * Remove one stored credential for a provider, or record the user's removal
+	 * on its tombstone when a failure disabled it. A remote store throws
+	 * `AuthBrokerRemovalNotRecordedError` when its broker refuses that record.
 	 */
 	removeById(provider: string, credentialId: number): Promise<boolean>;
 	/**
-	 * Disable the credential with the given id and emit a
+	 * Disable the active credential with the given id and emit a
 	 * {@link CredentialDisabledEvent}. Used by the auth-broker server to honour
-	 * `POST /v1/credential/:id/disable`. Resolves after persistence; returns
-	 * `false` when no active row with this ID exists.
+	 * `POST /v1/credential/:id/disable`. Resolves after persistence. For a user's
+	 * removal cause ({@link isUserRemovalCause}), an id that is no longer active
+	 * but whose tombstone a failure left ({@link isAutoDisabledCredential}) gets
+	 * the removal recorded on that tombstone instead, with no event; a remote
+	 * store throws `AuthBrokerRemovalNotRecordedError` when its broker refuses
+	 * that. Returns `false` when it changed no row.
 	 */
 	disable(id: number, disabledCause: string): Promise<boolean>;
 	/**

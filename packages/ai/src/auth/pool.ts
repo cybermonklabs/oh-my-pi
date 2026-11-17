@@ -632,12 +632,17 @@ export class CredentialPool implements CredentialsApi {
 	}
 
 	/**
-	 * Remove credential for a provider.
+	 * Remove credential for a provider. A remote store that could not record the
+	 * removal on a login a failure disabled throws after it removed the rest; the
+	 * provider's rows are dropped here either way.
 	 */
 	async remove(provider: string): Promise<void> {
-		await this.#store.deleteAuthCredentials(provider, DELETED_BY_USER);
-		this.replace(provider, []);
-		this.reset(provider);
+		try {
+			await this.#store.deleteAuthCredentials(provider, DELETED_BY_USER);
+		} finally {
+			this.replace(provider, []);
+			this.reset(provider);
+		}
 	}
 
 	/**
