@@ -10,12 +10,14 @@
  * from a {@link ColdEntryStore}. A cold message keeps as data only the small
  * values of the fields that readers walking the whole branch on every turn
  * read ({@link MESSAGE_FIELDS_KEPT_WHILE_SMALL}); its other fields are
- * accessors whatever their size. `JSON.stringify`, spread and `structuredClone`
- * still see every field. A read returns a deep-frozen value, so a place that
- * writes into a nested value of a cold body fails with a `TypeError` instead of
- * losing the write; assigning a field (`entry.message = …`,
- * `message.content = …`) first makes the whole entry whole again
- * ({@link hydrateColdEntry}).
+ * accessors whatever their size. A cold to-do edit or tool start marker keeps
+ * as data only its tree fields, `customType` and a small `runtime`
+ * ({@link CORE_CUSTOM_TYPES_COLD}). `JSON.stringify`, spread and
+ * `structuredClone` still see every field. A read returns a deep-frozen value,
+ * so a place that writes into a nested value of a cold body fails with a
+ * `TypeError` instead of losing the write; assigning a field
+ * (`entry.message = …`, `message.content = …`) first makes the whole entry
+ * whole again ({@link hydrateColdEntry}).
  *
  * Accessor functions are shared per field name and find their entry's record
  * through a symbol-keyed property, so a cold entry costs no closure.
@@ -108,9 +110,11 @@ const PATCH_RECORD_CUSTOM_TYPE = "entry_patch";
 
 /**
  * `custom` types of the core that go cold too, every value but the tree
- * fields and `customType` read back from the store however small: a user's
- * edit of the to-do list holds the whole list, of which the restore reads
- * only the newest snapshot on the path, kept whole by position
+ * fields, `customType` and a small `runtime` read back from the store however
+ * small. The `runtime` is one object per build ({@link LoadedValueInterner}),
+ * so keeping it costs nothing, and `/session` reads it of every entry. A
+ * user's edit of the to-do list holds the whole list, of which the restore
+ * reads only the newest snapshot on the path, kept whole by position
  * ({@link entriesKeptWholeOnPath}); a tool start marker is read only for the
  * calls left pending at the end of the branch, which lie after the cut.
  */
@@ -119,17 +123,23 @@ const CORE_CUSTOM_TYPES_COLD: ReadonlySet<string> = new Set([
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 ]);
 
+/** Whether `entry` is a `custom` entry of a type of {@link CORE_CUSTOM_TYPES_COLD}. */
+function isCoreColdCustom(entry: SessionEntry): boolean {
+	return entry.type === "custom" && CORE_CUSTOM_TYPES_COLD.has(entry.customType);
+}
+
 /** Whether `entry` stays whole wherever it lies, by its type ({@link ENTRY_TYPES_KEPT_WHOLE}). */
 export function keptWholeByKind(entry: SessionEntry): boolean {
-	if (!ENTRY_TYPES_KEPT_WHOLE.has(entry.type)) return false;
-	if (entry.type !== "custom") return true;
-	return entry.customType !== PATCH_RECORD_CUSTOM_TYPE && !CORE_CUSTOM_TYPES_COLD.has(entry.customType);
+	if (!ENTRY_TYPES_KEPT_WHOLE.has(entry.type) || isCoreColdCustom(entry)) return false;
+	return entry.type !== "custom" || entry.customType !== PATCH_RECORD_CUSTOM_TYPE;
 }
 
 /** Fields that always stay data: the tree structure every walk reads. */
 const ENTRY_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["type", "id", "parentId", "timestamp", "activeLeafId"]);
 /** The fields of a cold entry of {@link CORE_CUSTOM_TYPES_COLD} that stay data. */
 const CORE_CUSTOM_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set([...ENTRY_FIELDS_IN_MEMORY, "customType"]);
+/** The fields of a cold entry of {@link CORE_CUSTOM_TYPES_COLD} that stay data while small. */
+const CORE_CUSTOM_FIELDS_KEPT_WHILE_SMALL: ReadonlySet<string> = new Set(["runtime"]);
 const MESSAGE_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["role"]);
 /**
  * The fields of a cold message that stay data while small: those that readers
@@ -140,7 +150,11 @@ const MESSAGE_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["role"]);
  * `toolCallId`, `toolName` and `attribution`; the prompt cache scan of a new
  * branch view reads `stopReason` and `usage`; the to-do restore `toolName`
  * and `isError`; the retry checks that find a failed reply `errorMessage`;
- * `api`, `customType` and `display` tell extensions what a message is.
+ * the prune passes that run at the end of every turn, which walk the whole
+ * branch after a compaction that keeps no entry (`firstKeptEntryId: ""`),
+ * `prunedAt` (`collectSupersededResults` and `collectUselessResults`) and
+ * `useless` (`collectUselessResults`); `api`, `customType` and `display` tell
+ * extensions what a message is.
  */
 const MESSAGE_FIELDS_KEPT_WHILE_SMALL: ReadonlySet<string> = new Set([
 	"timestamp",
@@ -157,8 +171,9 @@ const MESSAGE_FIELDS_KEPT_WHILE_SMALL: ReadonlySet<string> = new Set([
 	"display",
 	"attribution",
 	"errorMessage",
+	"prunedAt",
+	"useless",
 ]);
-const NO_FIELDS: ReadonlySet<string> = new Set();
 
 /**
  * Entries of `path` kept whole before the cut although their type is not:
@@ -928,8 +943,8 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
  * each value of the entry too large to keep ({@link COLD_STRING_MAX_UNITS},
  * {@link COLD_JSON_MAX_BYTES}), each value of its `message` but the small ones
  * of {@link MESSAGE_FIELDS_KEPT_WHILE_SMALL}, and for a type of
- * {@link CORE_CUSTOM_TYPES_COLD} every value but the tree fields and
- * `customType`. An entry made whole from this
+ * {@link CORE_CUSTOM_TYPES_COLD} every value but the tree fields, `customType`
+ * and a small `runtime`. An entry made whole from this
  * store whose values are unchanged takes its former record back instead of
  * writing a new one. Pass `imagesExternalized` for an entry parsed from a
  * session file, whose image data are blob references already, and `paced`
@@ -954,8 +969,8 @@ export function convertToColdEntry(
 			: undefined;
 	const messageKeys = shell ? coldFields(shell, MESSAGE_FIELDS_IN_MEMORY, MESSAGE_FIELDS_KEPT_WHILE_SMALL) : [];
 	const entryKeys = (
-		entry.type === "custom" && CORE_CUSTOM_TYPES_COLD.has(entry.customType)
-			? coldFields(holder, CORE_CUSTOM_FIELDS_IN_MEMORY, NO_FIELDS)
+		isCoreColdCustom(entry)
+			? coldFields(holder, CORE_CUSTOM_FIELDS_IN_MEMORY, CORE_CUSTOM_FIELDS_KEPT_WHILE_SMALL)
 			: coldFields(holder, ENTRY_FIELDS_IN_MEMORY, undefined)
 	).filter(key => key !== "message" || !shell);
 	if (entryKeys.length === 0 && messageKeys.length === 0) return false;

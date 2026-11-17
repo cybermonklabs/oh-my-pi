@@ -1,11 +1,11 @@
 /**
  * What one cold entry keeps in memory. A cold message keeps as data only the
  * small values of the fields that readers walking the whole branch read on
- * every turn; its other fields (request controls, response ids, timings, tool
- * details, content) are read back from the store on access. A tool start
- * marker before the cut and every user's edit of the to-do list but the newest
- * snapshot on the path, wherever it lies, keep only their tree fields and
- * `customType`; the newest snapshot stays whole.
+ * every turn; its other fields (request controls, timings, tool details,
+ * content) are read back from the store on access. A tool start marker before
+ * the cut and every user's edit of the to-do list but the newest snapshot on
+ * the path, wherever it lies, keep only their tree fields, `customType` and a
+ * small `runtime`; the newest snapshot stays whole.
  * Every read still returns what the transcript holds, as a manager holding
  * every entry returns it.
  */
@@ -39,9 +39,11 @@ const READ_EVERY_TURN = [
 	"display",
 	"attribution",
 	"errorMessage",
+	"prunedAt",
+	"useless",
 ];
 
-/** The fields of a cold to-do edit or tool start marker that stay data. */
+/** The fields of a cold to-do edit or tool start marker that stay data, for one written without a `runtime`. */
 const MARKER_FIELDS_IN_MEMORY = ["type", "id", "parentId", "timestamp", "customType"];
 
 function text(label: string): string {
@@ -180,7 +182,7 @@ function dataFields(holder: object): string[] {
 
 /** Fields of cold entries that their records hold, by entry id, read back on access. */
 const READ_BACK: Record<string, readonly string[]> = {
-	a1: ["requestControls", "responseId", "duration", "ttft", "completedAt", "contextSnapshot"],
+	a1: ["requestControls", "duration", "ttft", "completedAt", "contextSnapshot"],
 	r1: ["details"],
 };
 
@@ -265,24 +267,35 @@ describe("what a cold entry keeps in memory", () => {
 	it("keeps whole a to-do edit appended after a resume, sends the one before it to the store at the next recool and when a compaction moves the cut, and restores the list from the new one", async () => {
 		// A recool that kept the previous snapshot whole would let a long session's edits pile up in memory;
 		// one that sent the new snapshot to the store would read it back on every to-do restore.
-		const { file } = await written();
-		const cold = await open(file, true);
-		const appended = cold.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: phases("e5") });
-		const coldness = () => ({
-			previous: isColdEntry(cold.getEntry("e4") ?? {}),
-			appended: isColdEntry(cold.getEntry(appended) ?? {}),
-		});
-		const list = () => wire(getLatestTodoPhasesFromEntries(cold.getBranch()));
-		cold.recoolEntries();
-		expect(coldness()).toEqual({ previous: true, appended: false });
-		const before = cold.coldStoreStats().materializations;
-		expect(list()).toEqual(wire(phases("e5")));
+		async function resumedWithNewEdit() {
+			const { file } = await written();
+			const cold = await open(file, true);
+			const appended = cold.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: phases("e5") });
+			const coldness = () => ({
+				previous: isColdEntry(cold.getEntry("e4") ?? {}),
+				appended: isColdEntry(cold.getEntry(appended) ?? {}),
+			});
+			expect(coldness()).toEqual({ previous: false, appended: false });
+			return { cold, coldness };
+		}
+		function expectListFromAppended(cold: SessionManager): void {
+			const before = cold.coldStoreStats().materializations;
+			expect(wire(getLatestTodoPhasesFromEntries(cold.getBranch()))).toEqual(wire(phases("e5")));
+			expect(cold.coldStoreStats().materializations).toBe(before);
+		}
 
-		cold.appendCompaction(text("c4"), undefined, "a7", 2000);
-		cold.buildSessionContext();
-		expect(coldness()).toEqual({ previous: true, appended: false });
-		expect(list()).toEqual(wire(phases("e5")));
-		expect(cold.coldStoreStats().materializations).toBe(before);
+		const recooled = await resumedWithNewEdit();
+		recooled.cold.recoolEntries();
+		expect(recooled.coldness()).toEqual({ previous: true, appended: false });
+		expectListFromAppended(recooled.cold);
+
+		// A fresh copy, never recooled: `c4` moves the cut from `u6` to `u7`, so `e4` still lies from the cut
+		// on and only the context build after the compaction sends it to the store.
+		const compacted = await resumedWithNewEdit();
+		compacted.cold.appendCompaction(text("c4"), undefined, "u7", 2000);
+		compacted.cold.buildSessionContext();
+		expect(compacted.coldness()).toEqual({ previous: true, appended: false });
+		expectListFromAppended(compacted.cold);
 	});
 
 	it("reads a cold message's other fields back from the store, through every accessor and RPC answer, as the transcript holds them and a manager holding every entry gives them", async () => {

@@ -408,7 +408,7 @@ export function resolveSessionLeafId(entries: readonly SessionEntry[]): string |
  * snapshot the to-do list restores from. A `view` changes nothing and
  * records none.
  */
-export function todoResultPhases(entry: SessionEntry): unknown[] | undefined {
+function todoResultPhases(entry: SessionEntry): unknown[] | undefined {
 	if (entry.type !== "message") return undefined;
 	const message = entry.message;
 	if (message.role !== "toolResult" || message.toolName !== "todo" || message.isError) return undefined;

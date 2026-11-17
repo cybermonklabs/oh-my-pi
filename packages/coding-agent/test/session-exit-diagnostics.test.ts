@@ -281,6 +281,28 @@ describe("session exit diagnostics", () => {
 		expect(describePendingToolCalls(sessionManager.getBranch())).toBeUndefined();
 	});
 
+	it("reports only the calls of the last assistant message, not those older messages and markers left unanswered", () => {
+		// The next reply supersedes an older unanswered call: warning of it on resume, or closing it with a
+		// synthetic result, would answer a call the model no longer waits on.
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage({
+			...pendingAssistant,
+			content: [{ type: "toolCall", id: "toolu_older", name: "read", arguments: { path: "old.txt" } }],
+		});
+		for (const marker of [
+			{ toolCallId: "toolu_older", toolName: "read" },
+			{ toolCallId: "toolu_orphan", toolName: "bash" },
+		]) {
+			sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+				...marker,
+				startedAt: new Date().toISOString(),
+			} satisfies ToolExecutionStartData);
+		}
+		sessionManager.appendMessage(pendingAssistant);
+
+		expect(collectPendingToolCalls(sessionManager.getBranch()).map(call => call.toolCallId)).toEqual(["toolu_repro"]);
+	});
+
 	it("reconstructs an abnormal process-exit tail as one terminal aborted assistant message", () => {
 		const sessionManager = SessionManager.inMemory();
 		sessionManager.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });

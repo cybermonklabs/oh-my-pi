@@ -400,10 +400,19 @@ function applyMessageEntry(pending: Map<string, PendingToolCallRecord>, message:
 	appendAssistantToolCalls(pending, message);
 }
 
-/** Finds tool calls left pending at the end of a session branch. */
+/**
+ * Finds tool calls left pending at the end of a session branch. Each assistant
+ * message replaces the pending set with its own calls, so the walk starts at
+ * the last one and reads no entry before it.
+ */
 export function collectPendingToolCalls(entries: readonly SessionEntry[]): PendingToolCallDiagnostic[] {
 	const pending = new Map<string, PendingToolCallRecord>();
-	for (const entry of entries) {
+	const start = Math.max(
+		0,
+		entries.findLastIndex(entry => entry.type === "message" && entry.message.role === "assistant"),
+	);
+	for (let index = start; index < entries.length; index++) {
+		const entry = entries[index]!;
 		if (entry.type === "message") {
 			applyMessageEntry(pending, entry.message);
 			continue;

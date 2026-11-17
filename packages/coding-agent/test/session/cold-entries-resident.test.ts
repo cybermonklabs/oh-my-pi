@@ -13,6 +13,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { selectRpcEntries } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-compat";
+import { TOOL_EXECUTION_START_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import {
 	type CompactionEntry,
 	CURRENT_SESSION_VERSION,
@@ -41,9 +42,11 @@ const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 const LARGE_JSON_BYTES = 4096;
 
 /**
- * Kinds an entry before the cut keeps whole: extension and feature state and
- * the selections a resume restores. The newest `session_init` and the newest
- * `todo` result on the current path are kept too.
+ * Kinds an entry before the cut keeps whole: extension and feature state
+ * (every `custom` type but those of {@link CUSTOM_TYPES_COLD}) and the
+ * selections a resume restores. The newest `session_init` and the newest
+ * to-do snapshot (a `todo` result or a user's edit of the list) on the current
+ * path are kept too.
  */
 const KINDS_KEPT_WHOLE: Record<string, true> = {
 	custom: true,
@@ -57,6 +60,13 @@ const KINDS_KEPT_WHOLE: Record<string, true> = {
 	reset_boundary: true,
 	model_usage: true,
 	title_change: true,
+};
+/** `custom` type of a user's edit of the to-do list, whose `data.phases` is the whole list. */
+const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
+/** `custom` types that go cold before the cut: a user's edit of the to-do list and a tool start marker. */
+const CUSTOM_TYPES_COLD: Record<string, true> = {
+	[USER_TODO_EDIT_CUSTOM_TYPE]: true,
+	[TOOL_EXECUTION_START_CUSTOM_TYPE]: true,
 };
 
 function text(label: string): string {
@@ -244,16 +254,27 @@ async function holdingEveryEntry(session: StoredSession): Promise<SessionManager
 	return manager;
 }
 
-/** Whether `entry` records the to-do list: a `todo` result with phases. */
-function isTodoListResult(entry: SessionEntry): boolean {
+/**
+ * Whether `entry` is a to-do snapshot the list restores from: a user's edit
+ * of the list, or a successful `todo` result that records it (a `view`
+ * records none).
+ */
+function isTodoSnapshot(entry: SessionEntry): boolean {
+	if (entry.type === "custom") {
+		if (entry.customType !== USER_TODO_EDIT_CUSTOM_TYPE) return false;
+		const data: unknown = entry.data;
+		return typeof data === "object" && data !== null && "phases" in data && Array.isArray(data.phases);
+	}
 	if (entry.type !== "message" || entry.message.role !== "toolResult") return false;
 	const message = entry.message;
 	if (message.toolName !== "todo" || message.isError) return false;
 	const details: unknown = message.details;
-	return typeof details === "object" && details !== null && "phases" in details;
+	if (typeof details !== "object" || details === null) return false;
+	if ("op" in details && details.op === "view") return false;
+	return "phases" in details && Array.isArray(details.phases);
 }
 
-/** Ids of the entries whose bodies must stay in memory: from the cut on, and those kept whole. */
+/** Ids of the entries whose bodies must stay in memory: from the cut on, and those kept whole by kind or position. */
 function residentIds(manager: SessionManager): Set<string> {
 	const entries = manager.getEntries();
 	const branch = manager.getBranch();
@@ -262,12 +283,14 @@ function residentIds(manager: SessionManager): Set<string> {
 	const resident = new Set<string>();
 	for (const id of [
 		branch.findLast(entry => entry.type === "session_init")?.id,
-		branch.findLast(isTodoListResult)?.id,
+		branch.findLast(isTodoSnapshot)?.id,
 	]) {
 		if (id) resident.add(id);
 	}
 	entries.forEach((entry, index) => {
-		if (index >= cut || KINDS_KEPT_WHOLE[entry.type]) resident.add(entry.id);
+		const keptByKind =
+			KINDS_KEPT_WHOLE[entry.type] && !(entry.type === "custom" && CUSTOM_TYPES_COLD[entry.customType]);
+		if (index >= cut || keptByKind) resident.add(entry.id);
 	});
 	return resident;
 }

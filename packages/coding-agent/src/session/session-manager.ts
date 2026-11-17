@@ -5685,7 +5685,8 @@ export class SessionManager {
 	/**
 	 * The active-leaf branch from the cut on: the first entry the model context
 	 * keeps of the latest compaction (see `coldCutPathIndex`) to the leaf. Their
-	 * bodies stay in memory, so a reader of the recent turns reads no older body.
+	 * bodies stay in memory, except a user's to-do edit older than the newest
+	 * to-do snapshot, so a reader of the recent turns reads no older body.
 	 * The whole branch when the context uses no compaction.
 	 */
 	getBranchFromCut(): SessionEntry[] {
