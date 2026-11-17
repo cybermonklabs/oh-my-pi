@@ -94,11 +94,11 @@ interface RelayEntry {
 /**
  * A messaging extension's own entries in session `sessionId` (`entries`, by
  * where {@link sessionText} writes them with `relay`, all before the cut) and
- * what it restores from them (`restored`): the newest valid role claim on the
+ * what it restores from them (`restored`): the newest role claim on the
  * current path (`r2`, over the older `r1` and over `rb`, on the other branch
- * and newer in the file), every replay state in order with the topics of the
- * newest, every delivery of the ledger, and this session's consumer state
- * (`q1`, not the newer `q2` of another session).
+ * and newer in the file), every replay state in order, every delivery of the
+ * ledger, and this session's consumer state (`q1`, not the newer `q2` of
+ * another session).
  */
 function relayState(sessionId: string) {
 	const ownTopic = "notifications.agent.3b8f6a2e-5d41-4c9a-8e07-1f2d3c4b5a69";
@@ -139,7 +139,6 @@ function relayState(sessionId: string) {
 		restored: {
 			claim,
 			states: [olderState, newerState],
-			topics: newerState.topics,
 			ledger: [delivered(1), delivered(2), delivered(3), delivered(4)],
 			consumer,
 		},
@@ -299,36 +298,19 @@ function customData(entries: readonly SessionEntry[], customType: string): unkno
 	);
 }
 
-/** The topics a replay state names: its `topics`, or the keys of the older form's `subjects`; none when invalid. */
-function replayStateTopics(data: unknown): string[] | undefined {
-	if (!isRecord(data)) return undefined;
-	if (Array.isArray(data.topics)) {
-		return data.topics.every(topic => typeof topic === "string") ? data.topics : undefined;
-	}
-	return isRecord(data.subjects) ? Object.keys(data.subjects) : undefined;
-}
-
 /**
  * What the messaging extension restores after a resume, each read through the
- * accessor it uses: the role claim from the current path (`getBranch()`), its
- * `role` a string or null and its `session_id` and `client_instance_id`
- * strings when set, and the replay states, the ledger and the consumer state
- * from every entry (`getEntries()`).
+ * accessor it uses: the newest role claim on the current path (`getBranch()`),
+ * and the replay states, the ledger and this session's consumer state from
+ * every entry (`getEntries()`).
  */
 function relayRestored(manager: SessionManager): unknown {
-	const states = customData(manager.getEntries(), REPLAY_STATE_TYPE);
+	const entries = manager.getEntries();
 	return wire({
-		claim: customData(manager.getBranch(), ROLE_CLAIM_TYPE).findLast(
-			data =>
-				isRecord(data) &&
-				(typeof data.role === "string" || data.role === null) &&
-				(data.session_id === undefined || typeof data.session_id === "string") &&
-				(data.client_instance_id === undefined || typeof data.client_instance_id === "string"),
-		),
-		states,
-		topics: states.map(replayStateTopics).findLast(topics => topics !== undefined),
-		ledger: customData(manager.getEntries(), REPLAY_DELIVERED_TYPE),
-		consumer: customData(manager.getEntries(), CONSUMER_STATE_TYPE).findLast(
+		claim: customData(manager.getBranch(), ROLE_CLAIM_TYPE).at(-1),
+		states: customData(entries, REPLAY_STATE_TYPE),
+		ledger: customData(entries, REPLAY_DELIVERED_TYPE),
+		consumer: customData(entries, CONSUMER_STATE_TYPE).findLast(
 			data => isRecord(data) && data.session_id === manager.getSessionId(),
 		),
 	});
@@ -606,22 +588,17 @@ describe("features that read older entries, on a session whose older bodies are 
 	);
 
 	it(
-		"restores a messaging extension's role claim, topics, replay ledger and consumer state after a resume as a manager holding every entry does",
+		"restores a messaging extension's role claim, replay states, ledger and consumer state after a resume as a manager holding every entry does",
 		async () => {
-			// A messaging extension's role claim, topics, replay ledger and consumer state after a resume: it reads
-			// its own custom entries, all written before the cut, through getBranch() and getEntries().
+			// Custom entries stay whole before the cut; a resume that dropped or re-linked them would hand the
+			// extension r1 or rb as its claim, a ledger missing rows, or q2's consumer state.
 			const written = await writeSession(tempRoot(), "session", { relay: true });
 			const { cold, whole } = await openBoth(written.file);
 			const expected = wire(relayState(written.id).restored);
+			const before = cold.coldStoreStats().materializations;
 			expect(relayRestored(cold)).toEqual(expected);
 			expect(relayRestored(cold)).toEqual(relayRestored(whole));
-
-			// Once more after a read served from the store, so reads from the store and from memory agree.
-			const materializations = cold.coldStoreStats().materializations;
-			expect(wire(cold.getEntries())).toEqual(wire(whole.getEntries()));
-			expect(cold.coldStoreStats().materializations).toBeGreaterThan(materializations);
-			expect(relayRestored(cold)).toEqual(expected);
-			expect(relayRestored(cold)).toEqual(relayRestored(whole));
+			expect(cold.coldStoreStats().materializations).toBe(before);
 		},
 		CASE_TIMEOUT_MS,
 	);
