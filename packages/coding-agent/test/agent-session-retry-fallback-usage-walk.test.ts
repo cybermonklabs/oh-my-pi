@@ -15,7 +15,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Model, ModelUsageHealth } from "@oh-my-pi/pi-ai";
+import { type AssistantMessage, Effort, type Model, type ModelUsageHealth } from "@oh-my-pi/pi-ai";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import * as envApiKey from "@oh-my-pi/pi-ai/env-api-key";
 import { createMockModel, type MockResponse, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
@@ -236,9 +236,21 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 	}
 
-	function startSession(agent: Agent, settings: Settings, providerSessionId?: string): WalkRun {
+	function startSession(
+		agent: Agent,
+		settings: Settings,
+		providerSessionId?: string,
+		thinkingLevelCeiling?: Effort,
+	): WalkRun {
 		const sessionManager = SessionManager.inMemory();
-		const started = new AgentSession({ agent, sessionManager, settings, modelRegistry, providerSessionId });
+		const started = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			providerSessionId,
+			thinkingLevelCeiling,
+		});
 		session = started;
 		const fallbacks: string[] = [];
 		started.subscribe(event => {
@@ -671,11 +683,13 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		/**
 		 * Seeds a Fable turn with signed thinking, then sends a turn that Fable
 		 * refuses with a live fallback credit, with the setup of each order above:
-		 * the walk runs on `chain`, and `usage` answers the usage reads.
+		 * the walk runs on `chain`, `usage` answers the usage reads, and
+		 * `thinkingLevelCeiling`, when given, is the session's effort ceiling.
 		 */
 		async function runCreditRefusal(
 			chain: Record<string, string[]>,
 			usage: Record<string, UsageAnswer>,
+			thinkingLevelCeiling?: Effort,
 		): Promise<{ run: WalkRun; requestedModels: string[] }> {
 			stubUsageReads(usage);
 			const requestedModels: string[] = [];
@@ -709,6 +723,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 					"retry.fallbackChains": chain,
 					"retry.fallbackRevertPolicy": "cooldown-expiry",
 				}),
+				undefined,
+				thinkingLevelCeiling,
 			);
 			await runTurn(run.session, "Seed signed thinking");
 			const seeded = agent.state.messages.findLast(
@@ -799,6 +815,77 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			} finally {
 				modelRegistry = sharedRegistry;
 			}
+		});
+
+		it("steps a refusal to the next model when the spent target's sibling target is over the effort ceiling", async () => {
+			// Opus 5 here supports no effort at or below the session's ceiling, so
+			// the walk would not try it. With Opus 4.8 spent, no target is left
+			// that the walk would try: the credit holds nothing back, and the walk
+			// goes on in chain order as with no credit. The catalog gives both Opus
+			// models the same efforts, so this registry gives Opus 5 none below
+			// xhigh; Opus 4.8 and Sonnet 4.5 each support an effort at or below
+			// the high ceiling.
+			const sharedRegistry = modelRegistry;
+			const modelsConfigPath = path.join(tempDir.path(), "models-xhigh-floor-opus-5.yml");
+			await Bun.write(
+				modelsConfigPath,
+				JSON.stringify({
+					providers: {
+						anthropic: {
+							modelOverrides: {
+								[NEXT_CREDIT_TARGET.id]: {
+									thinking: { mode: "anthropic-adaptive", efforts: [Effort.XHigh, Effort.Max] },
+								},
+							},
+						},
+					},
+				}),
+			);
+			modelRegistry = new ModelRegistry(authStorage, modelsConfigPath);
+			try {
+				const { run, requestedModels } = await runCreditRefusal(
+					chainOf(CREDIT_TARGET, OTHER_CLAUDE, NEXT_CREDIT_TARGET),
+					{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
+					Effort.High,
+				);
+
+				expect(requestedModels).toEqual([
+					formatModelString(FABLE),
+					formatModelString(FABLE),
+					formatModelString(OTHER_CLAUDE),
+				]);
+				expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
+				expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+				expect(lastAssistant(run.session).stopReason).toBe("stop");
+			} finally {
+				modelRegistry = sharedRegistry;
+			}
+		});
+
+		it("steps a refusal to the next model when the spent target's sibling target has no key", async () => {
+			// Opus 5 has no key here, so the walk would not try it. With Opus 4.8
+			// spent, no target is left that the walk would try: the credit holds
+			// nothing back, and the walk goes on in chain order as with no credit.
+			// Every other model keeps its key.
+			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) =>
+				model.provider === NEXT_CREDIT_TARGET.provider && model.id === NEXT_CREDIT_TARGET.id
+					? undefined
+					: getApiKey(model, sessionId, options),
+			);
+			const { run, requestedModels } = await runCreditRefusal(
+				chainOf(CREDIT_TARGET, OTHER_CLAUDE, NEXT_CREDIT_TARGET),
+				{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
+			);
+
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(OTHER_CLAUDE),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
+			expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 	});
 

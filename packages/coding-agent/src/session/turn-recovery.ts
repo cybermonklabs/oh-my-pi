@@ -2403,25 +2403,27 @@ export class TurnRecovery {
 			}
 		}
 		// While a classifier refusal's fallback credit is live, the hold below
-		// passes over the same-provider Claude models that cannot redeem it. The
-		// credit is live only while one of its targets is still a candidate the
-		// walk would try: a credit cannot be redeemed on a target whose usage is
-		// spent, so once every such target is spent it holds nothing back. With
-		// retry.usageAwareFallback on, the credit-target pass runs first: it reads
-		// the usage of each candidate that can redeem the credit and switches to
-		// nothing. When it saw a target and every target it saw is spent, the
-		// credit counts as absent, and the walk pass runs in chain order as with
-		// no credit. Deciding this before the walk pass chooses keeps chain order:
-		// a same-provider Claude model earlier in the chain comes before another
-		// provider's model after it. A credit whose targets are not in the chain
-		// stays live.
+		// passes over the same-provider Claude models that cannot redeem it. A
+		// credit cannot be redeemed on a target whose usage is spent, so with
+		// retry.usageAwareFallback on, the credit-target pass runs first. It takes
+		// each candidate that can redeem the credit through the same steps as the
+		// walk pass (the effort ceiling, the context fit, the usage skip and the
+		// key probe) and switches to nothing. A target that passes every step is
+		// one the walk would try, and the pass counts it usable; a target that
+		// the usage skip passes over is counted spent. When the pass counted a
+		// target spent and none usable, the credit counts as absent, and the walk
+		// pass runs in chain order as with no credit. Deciding this before the
+		// walk pass chooses keeps chain order: a same-provider Claude model
+		// earlier in the chain comes before another provider's model after it. A
+		// credit whose targets are not in the chain, or whose targets fail the
+		// other steps with none spent, stays live.
 		const readCreditTargets =
 			usageAwareFallback &&
 			options?.refusalWalk === true &&
 			creditHandle !== undefined &&
 			creditTargets.length > 0 &&
 			Date.now() < creditHandle.expiresAt;
-		let creditTargetsSeen = 0;
+		let creditTargetsSpent = 0;
 		let creditTargetsUsable = 0;
 		let creditCountsAbsent = false;
 		for (const creditTargetPass of [true, false]) {
@@ -2454,14 +2456,10 @@ export class TurnRecovery {
 					candidate.provider === failedMessage.provider &&
 					creditTargets.includes(candidate.id) &&
 					Date.now() < creditHandle.expiresAt;
-				if (creditTargetPass) {
-					if (!canRedeemFallbackCredit) continue;
-					const targetUsage = await readWalkUsage(candidate);
-					if (targetUsage === "stale") return false;
-					creditTargetsSeen++;
-					if (!targetUsage || !isUsageSpent(targetUsage)) creditTargetsUsable++;
-					continue;
-				}
+				// The credit-target pass takes only the candidates that can redeem the
+				// credit. Each goes on through the steps below, and the hold does not
+				// apply to it.
+				if (creditTargetPass && !canRedeemFallbackCredit) continue;
 				// Anthropic signatures and redacted blocks are model-bound, while the
 				// latest assistant response must remain byte-identical. While another
 				// attempt on the model that signed them is still allowed, prefer it to a
@@ -2518,11 +2516,15 @@ export class TurnRecovery {
 				// 401 block is not spent usage: it lasts minutes rather than a quota
 				// window (60 s for a denial, 5 minutes after a failed OAuth refresh,
 				// select.ts OAUTH_REFRESH_FAILURE_BACKOFF_MS), and the refusal steps
-				// must still reach the provider's other accounts and models.
+				// must still reach the provider's other accounts and models. The
+				// credit-target pass counts a target it skips here as spent.
 				if (usageAwareFallback) {
 					const candidateUsage = await readWalkUsage(candidate);
 					if (candidateUsage === "stale") return false;
-					if (candidateUsage && isUsageSpent(candidateUsage)) continue;
+					if (candidateUsage && isUsageSpent(candidateUsage)) {
+						if (creditTargetPass) creditTargetsSpent++;
+						continue;
+					}
 				}
 				// A session restricted to an OAuth account pool throws for a provider
 				// none of its pooled accounts can serve; that candidate is unavailable,
@@ -2534,6 +2536,14 @@ export class TurnRecovery {
 					if (!(error instanceof AIError.MissingApiKeyError)) throw error;
 				}
 				if (!apiKey) continue;
+				// The walk would try this credit target, so the credit stays live. The
+				// credit-target pass switches to nothing and stops here: one usable
+				// target decides it, and probing later targets would only send key
+				// requests that the walk pass may never make.
+				if (creditTargetPass) {
+					creditTargetsUsable++;
+					break;
+				}
 				const previousEditMode = this.#host.resolveActiveEditMode();
 				const previousSystemPrompt = [...this.#host.agent.state.systemPrompt];
 				const previousTools = [...this.#host.agent.state.tools];
@@ -2564,7 +2574,7 @@ export class TurnRecovery {
 				}
 				return applied;
 			}
-			if (creditTargetPass) creditCountsAbsent = creditTargetsSeen > 0 && creditTargetsUsable === 0;
+			if (creditTargetPass) creditCountsAbsent = creditTargetsSpent > 0 && creditTargetsUsable === 0;
 		}
 
 		return false;
