@@ -1,12 +1,12 @@
 // Integration test: runBoundedProbe spawns and kills a real subprocess, so the
 // timeout/abort teardown is inherently wall-clock bound. Fake timers cannot
 // advance a child process's execution or resolve its `exited` promise, so the
-// real-timer exception in ts-no-test-timers applies here.
-import { describe, expect, test } from "bun:test";
-import { rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+// real-timer exception in ts-no-test-timers applies here. The one case whose
+// child must start a process of its own before the bound fakes only the bound's
+// clock, so the bound cannot run out before that process is up.
+import { describe, expect, test, vi } from "bun:test";
 import { probeCandidates, runBoundedProbe } from "../../src/eval/probe";
+import { dialAndHold, livenessListener } from "../helpers/liveness-listener";
 
 // A cross-platform "hangs forever" command: re-invoke the running Bun to sleep.
 const bun = process.execPath;
@@ -34,41 +34,24 @@ describe("runBoundedProbe", () => {
 	});
 
 	test("kills descendants spawned by an interpreter shim", async () => {
-		const pidFile = join(tmpdir(), `omp-probe-grandchild-${process.pid}-${Date.now()}.pid`);
-		let grandchildPid: number | undefined;
+		// The shim's child dials this listener once it runs and holds the connection, so the
+		// connection opening says it is up and its closing says it is dead.
+		using liveness = livenessListener();
 		const wrapper = [
 			bun,
 			"-e",
-			`const child=Bun.spawn([process.execPath,"-e","await Bun.sleep(60_000)"],{stdin:"ignore",stdout:"ignore",stderr:"ignore"});await Bun.write(${JSON.stringify(pidFile)},String(child.pid));await child.exited`,
+			`const child=Bun.spawn([process.execPath,"-e",${JSON.stringify(dialAndHold(liveness.port))}],{stdin:"ignore",stdout:"ignore",stderr:"ignore"});await child.exited`,
 		];
+		vi.useFakeTimers();
 		try {
-			const result = await runBoundedProbe(wrapper, {
-				cwd: process.cwd(),
-				env: baseEnv(),
-				timeoutMs: 1_000,
-			});
-			expect(result).toEqual({ exitCode: null, timedOut: true, aborted: false });
-			grandchildPid = Number(await Bun.file(pidFile).text());
-			const deadline = Date.now() + 2_000;
-			while (Date.now() < deadline) {
-				try {
-					process.kill(grandchildPid, 0);
-					await Bun.sleep(25);
-				} catch {
-					break;
-				}
-			}
-			expect(() => process.kill(grandchildPid!, 0)).toThrow();
+			const probe = runBoundedProbe(wrapper, { cwd: process.cwd(), env: baseEnv(), timeoutMs: 1_000 });
+			await liveness.started;
+			vi.advanceTimersByTime(1_000);
+			expect(await probe).toEqual({ exitCode: null, timedOut: true, aborted: false });
 		} finally {
-			if (grandchildPid !== undefined) {
-				try {
-					process.kill(grandchildPid, "SIGKILL");
-				} catch {
-					// Expected when the process-tree teardown succeeded.
-				}
-			}
-			await rm(pidFile, { force: true });
+			vi.useRealTimers();
 		}
+		await liveness.exited;
 	});
 
 	test("an already-aborted signal short-circuits without spawning", async () => {

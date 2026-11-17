@@ -11,7 +11,7 @@ Covers:
 - Migration/compatibility behavior when loading old or malformed files
 - Context reconstruction (`buildSessionContext`)
 - Persistence guarantees, failure behavior, truncation/blob externalization
-- Storage abstractions (`FileSessionStorage`, `MemorySessionStorage`) and related utilities
+- Storage abstractions (`FileSessionStorage`, `MemorySessionStorage`, the `SqlSessionStorage` schema) and related utilities
 
 Does not cover `/tree` UI rendering behavior beyond semantics that affect session data.
 
@@ -30,6 +30,7 @@ Does not cover `/tree` UI rendering behavior beyond semantics that affect sessio
 - [`src/session/session-storage.ts`](../packages/coding-agent/src/session/session-storage.ts) — storage abstractions
 - [`src/session/session-title-slot.ts`](../packages/coding-agent/src/session/session-title-slot.ts) — fixed-width current-title slot
 - [`src/session/indexed-session-storage.ts`](../packages/coding-agent/src/session/indexed-session-storage.ts) — local index + ordered remote-backed storage adapter
+- [`src/session/sql-session-storage.ts`](../packages/coding-agent/src/session/sql-session-storage.ts) — PostgreSQL/MySQL/SQLite storage: session rows plus appended parts
 - [`src/session/messages.ts`](../packages/coding-agent/src/session/messages.ts) — custom-message transformers
 - [`src/session/blob-store.ts`](../packages/coding-agent/src/session/blob-store.ts) — content-addressed blob store
 - [`src/session/history-storage.ts`](../packages/coding-agent/src/session/history-storage.ts) — prompt history (separate subsystem)
@@ -233,9 +234,11 @@ initiating session/branch and rejects stale session ownership.
 ```
 
 `role` is optional; missing is treated as `default` in context reconstruction.
-`resolvedModelIsFallback` optionally marks a retry-fallback transition. The
-reserved role `fallback` is ephemeral: model restoration prefers the configured
-default instead of restoring that role's temporary model.
+`resolvedModelIsFallback` optionally marks a transition onto a model other than
+the requested one: a retry fallback, or a model that replaced the requested one
+when the session started. The reserved role `fallback` is ephemeral: model
+restoration prefers the configured default instead of restoring that role's
+temporary model.
 
 ### `service_tier_change`
 
@@ -332,11 +335,14 @@ Current core-owned values include:
 | `tool_execution_start`   | `{ toolCallId: string, toolName: string, startedAt: string, args?: { command?: string, path?: string }, intent?: string }`                                                                                                                               | `AgentSession` writes a marker immediately before a tool implementation starts. Exit diagnostics combine it with assistant tool calls and tool results to reconstruct calls left pending. Argument summaries are truncated projections; older full argument objects are accepted on read.                                                                                                                                                                              |
 | `session_exit`           | `{ reason: string, kind: "normal" \| "signal" \| "fatal" \| "process_exit", recordedAt: string, pendingToolCalls?: Array<{ toolCallId?: string, toolName: string, args?: unknown, intent?: string, assistantTimestamp?: number, startedAt?: string }> }` | Normal disposal and postmortem teardown record the exit when the session has assistant history or pending tool calls. The writer immediately calls `flushSync()` so a subsequent process can inspect the last durable turn; a flush failure is logged. Resume diagnostics consume the latest valid record.                                                                                                                                                             |
 | `user_todo_edit`         | `{ phases: TodoPhase[] }`                                                                                                                                                                                                                                | SDK/UI todo editing persists the complete phase snapshot. Todo restoration scans backward for the latest snapshot (or a successful `todo` tool result) and restores its phases.                                                                                                                                                                                                                                                                                        |
+| `tool_result_prune`      | `{ results: Array<{ entryId: string, notice: string, prunedAt: number }> }`                                                                                                                                                                              | The per-turn prune passes append one record per pass naming the tool results they blanked, instead of rewriting the transcript. Whole-file loads (resume, `forkFrom`, read-only `history://`, HTML sub-session export) replay it, after migration and before blob resolution where the reader does both.   |
 | `vibe-session-lifecycle` | Version-1 event with `{ version: 1, id, ownerId, parentSessionId, action, ... }`; `spawn` adds `cli`, `agent`, `childSessionFile`, and `createdAt`; turn events add `turn`; tombstone events add `reason`.                                               | Vibe runtime persists and replays child spawn, turn-started/settled, tombstone, and tombstone-revoked transitions to recover owned child sessions and in-flight state. Invalid or out-of-scope events are ignored.                                                                                                                                                                                                                                                     |
 | `autoresearch-control`   | `{ mode: "on" \| "off" \| "clear", goal?: string }`                                                                                                                                                                                                      | The built-in autoresearch command writes mode/goal changes, and experiment-limit shutdown writes `mode: "off"`. `reconstructControlState()` replays valid records on resume to restore whether autoresearch is active and its goal; `clear` removes the goal.                                                                                                                                                                                                          |
 | `system-prompt-digest`   | Hexadecimal string: a hash of the base system prompt blocks (before a per-turn hook override)                                                                                                                                                            | `AgentSession` appends it just before a primary assistant reply with provider output whose prompt differs from the branch's latest record, and carries it onto a rewind branch with the reparented sibling reply. Before a resumed session's first model call, a prefix-bound tool-list rebuild commits only if it reproduces that prompt; without a record it freezes. Memory recall injected into the base prompt is part of the hash, so such sessions stay frozen. |
 
 On resume, a valid latest `session_exit` after a non-terminal conversation tail causes `AgentSession`/SDK initialization to append a synthetic assistant message with `stopReason: "aborted"` and rebuild the display/agent context. A normal exit only triggers that transition when it recorded pending tool calls; abnormal exit kinds can trigger it without that list. This prevents the restored transcript from presenting an interrupted turn as still live.
+
+A tool result named by a `tool_result_prune` record keeps its original content in the file until a later full rewrite writes the blanked content inline (the record stays; replaying it again changes nothing). Readers that tail the file by byte offset — the Agent Hub transcript viewer, the collab agent drawer, and RPC subagent streaming — cannot apply a record to a line they already emitted and show the original content.
 
 The strings in the table are reserved for their core consumers. Extensions MUST NOT use them. Use a namespaced identifier such as a reverse-domain or package-qualified name for extension records; a collision can cause core replay logic to interpret extension data as lifecycle state. Unknown namespaced values remain opaque to core session-context reconstruction.
 
@@ -490,7 +496,8 @@ Applied when header `version < 3`:
 
 - Missing or genuinely empty files initialize a new session at that exact path and materialize its header immediately. `SessionManager.open(..., { throwIfMissing: true })` instead rejects missing/empty input.
 - Non-empty data without a valid leading session header is rejected without modifying the file. An array-only `loadEntriesFromFile()` result of `[]` therefore does not distinguish empty from corrupt input; the manager uses `loadSessionFile()` diagnostics.
-- Valid files are loaded, migrated if needed, blob refs resolved, then indexed. Migrations, skipped malformed records, and loaded OpenAI replay sanitization mark the next persistence operation for a full rewrite.
+- Valid files are loaded, migrated if needed, `tool_result_prune` records applied to the tool results they name, blob refs resolved, then indexed. Migrations, skipped malformed records, and loaded OpenAI replay sanitization mark the next persistence operation for a full rewrite.
+- Fail-closed opens (`throwIfMissing`) digest the content they parse, digest the current content again after cwd adoption, and reparse only when the two differ, so a stable transcript is parsed once. Size, modification time, and inode are not trusted: an in-place rewrite can keep all three, and an indexed backend's stat reads only its local index. Deletion (including a row removed from a Redis or SQL backend), truncation, and replacement still fail closed.
 - A recorded cwd is adopted only when it is enterable. Otherwise runtime cwd stays at the launch/current directory while the transcript remains in its original location; workspace-root edits stay runtime-only until relocation.
 
 ## Tree and Leaf Semantics
@@ -503,7 +510,7 @@ The underlying model is append-only tree + mutable leaf pointer:
 - `resetLeaf()` sets `leafId = null`; next append creates a new root entry (`parentId: null`).
 - `branchWithSummary()` sets leaf to branch target and appends a `branch_summary` entry.
 
-`getEntries()` returns all non-header entries in insertion order. There is no separate persisted leaf field: loading rebuilds the leaf from the last physical entry. Pointer-only `branch()`/`resetLeaf()` changes therefore need a subsequent append to survive reload. `discardEntryDurably()` appends a metadata branch marker and rewrites the journal to make a discarded path durable.
+`getEntries()` returns all non-header entries in insertion order. There is no separate persisted leaf field: loading rebuilds the leaf from the last physical entry. Pointer-only `branch()`/`resetLeaf()` changes therefore need a subsequent append to survive reload. `discardEntryDurably()` removes a discarded entry whose children are all `service_tier_change` entries (chaining them onto its parent), appends a metadata branch marker, and republishes the journal without the entry; when the entry has content children, its subtree stays off-branch under the marker instead. If that republish fails, the removal is undone in memory and the discard is made durable by appending only: the marker under the discarded entry's parent, then fresh copies of its `service_tier_change` children, with the entry left in the journal off the active branch.
 
 `createBranchedSession(leafId, { copyArtifacts? })` creates a new identity containing only the selected root-to-leaf path. It drops old label records and recreates the resolved labels for retained entries. Unlike a full fork, it does not inherit the provider prompt-cache key. With `copyArtifacts` (used by `AgentSession.fork(entryId)`), the artifacts directory is copied in the background and the new artifact manager waits for the copy before allocating ids or resolving `artifact://`, as for a move to a sibling file.
 
@@ -526,7 +533,7 @@ Algorithm:
    - mode/modeData from latest `mode_change` (default mode `"none"`)
 4. Choose the emission boundary:
    - a later `reset_boundary` hides everything through that boundary from model context and collapsed live transcript
-   - otherwise the latest compaction emits its summary plus kept/post-compaction messages (provider-native replacement history may supply the kept model context); for model context, `options.model` skips compactions whose OpenAI payload that model cannot replay, so the history behind them is emitted
+   - otherwise the latest compaction emits its summary plus kept/post-compaction messages (provider-native replacement history may supply the kept model context)
    - full transcript export retains pre-reset history and renders compactions chronologically
 5. Convert `message`, `custom_message`, and `branch_summary` entries into messages. Other entry types only affect replay state or metadata.
 6. Remove dangling tool calls from replay (unless explicitly retained for a mid-turn transcript), neutralizing protected reasoning metadata on rewritten turns; drop unsafe aborted/error assistant turns and their paired tool results from model context.
@@ -553,20 +560,26 @@ Ordinary completed appends update memory and local file storage synchronously on
 ### Durability operations
 
 - `flush()` drains async disk/storage queues and the open writer (no `fsync`); `flushSync()` drains synchronously supported work or rewrites a non-current file. It cannot confirm queued remote publication; those backends still require awaited `flush()`/drain.
-- Atomic full rewrites use storage `writeTextAtomic` with a commit guard and expected byte-size precondition; file storage stages then renames over the target, including an EPERM-safe move-aside fallback.
+- Atomic full rewrites use storage `writeTextAtomic` with a commit guard and expected byte-size precondition; file storage stages then renames over the target, including an EPERM-safe move-aside fallback. A rewrite whose acknowledgement fails still counts as published when the stored bytes match the intended body exactly, except inside `appendEntriesAtomically()`.
+- File-backed full rewrites lazily generate JSONL records and periodically hint garbage collection, so they do not retain a second transcript-sized line array. Indexed Redis/SQL backends retain their existing whole-text join path because their backend interfaces do not expose streamed writes.
 - Local appends and publication share a cross-process publish lock. A changed byte size raises `SessionWriteConflictError`; lock contention raises `SessionLockError` without publishing the staged rewrite. This is not a content-hash comparison and cannot protect against non-cooperating external writers.
 - `FileSessionStorage` holds a process-owned OS lease on each session a process writes, keyed by the session id rather than the file's path, so every process that reaches one journal (through a symlink, a hard link, or after a move) meets the same lease. The lease is `pi-utils` `tryAcquireFileLock` on `<session-owners>/<session-id>`, where `<session-owners>` is `~/.omp/run/session-owners` (XDG: `$XDG_STATE_HOME/omp/run/session-owners`), shared across profiles: on Linux an abstract socket and on Windows a named mutex, neither of which creates a file; on macOS and other non-Linux Unix a `flock` on a sidecar in that directory. Only write paths claim it, so the first process to write a session owns it; opening a session to inspect it (`omp share`, `--export`, `render`) never does. Managers in one process share the lease; it is released on close or a session switch, and the kernel drops it when its process exits. Processes with different home or state directories do not meet in this lease. A plain copy of a session file keeps its id, so a process writing the copy while the original's writer is live moves to a sibling; a collab guest's replica takes its own id (`parentSession` is the host's) so it never contends with the host.
 - A process never writes a session whose lease another live process holds: its first write moves the session to a fresh sibling `<timestamp>_<new-session-id>.jsonl` in the same directory, publishes the whole in-memory transcript there once, and continues appending incrementally. The owner's file is left untouched. Like `fork`, the sibling gets a new session id with `parentSession` pointing at the old one and keeps the provider prompt-cache key, so resume-by-id, the title index, and the picker never see two files for one id. The artifacts directory is copied in the background without overwriting files the moved session has already written; its artifact manager waits for the copy before allocating ids or resolving `artifact://`, and `flush()`/`close()` await it. `local://` and `agent://` reads that bypass the artifact manager can miss pre-move files until the copy finishes.
 - `moveTo()` refuses, before anything moves or any directory is created, to move a session another live process writes or to replace a destination file whose session (by its header id) another live process writes.
 - Another program can check ownership without claiming: `isSessionLeaseHeld(sessionId)`, `omp session lease --json -- <id>...` (`{"held": [...], "unknown": [...]}`), and RPC `get_session_lease` observe the lease without taking or opening it (a connect probe on Linux, `F_GETLK` on other Unix, a `\BaseNamedObjects` directory listing on Windows), so they never make a concurrent claim fork the session.
-- Under `bun test`, the lease directory is `<os temp>/omp-test-session-owners-<uid>` instead of the real state directory. It is exported as `PI_TEST_SESSION_OWNERS_DIR` when `session-storage` loads; a test that spawns an omp process which writes sessions must pass `env: process.env` (Bun's default is the launch environment), or run under `ci-test-ts`, whose children inherit `PI_TEST_RUNTIME=1` and derive the same directory.
+- Under `bun test`, the lease directory is `<os temp>/omp-test-session-owners-<uid>` instead of the real state directory. It is exported as `PI_TEST_SESSION_OWNERS_DIR` when `session-storage` loads, and an omp process a test spawns derives the same directory from the `PI_TEST_RUNTIME=1` marker that every child of a test inherits (`scripts/test-preload.ts`). A test that builds a child's environment from nothing, or removes that marker, must pass `PI_TEST_SESSION_OWNERS_DIR` itself.
 - On the file and memory backends, a `SessionWriteConflictError` on durable bytes during a full rewrite means a writer without the lease (an older omp, an external tool) changed the file. The manager reads it back, keeps the entries it lacks as a side branch (the active leaf stays its own), and retries against the size it read, up to three times per rewrite. If that writer changes the file inside every retry, the session leaves the file to it and moves to a sibling (`reason: "contested"`) rather than re-serializing the transcript on every later write. A deleted file is recreated; a file that no longer reads as this session is left untouched and the session moves to a sibling. Indexed backends keep reporting the conflict, since there it can be the manager racing its own unconfirmed publish.
-- `appendEntriesAtomically()` groups a synchronous callback's appends into one atomic publication. Failure rolls back staged entries and repairs retained concurrent work.
-- Rewrites serve renames, entry rewrites, migrations/sanitization, move/fork, and recovery. Session-title changes normally update the fixed-width title slot and append a `title_change` audit entry instead of rewriting the body.
+- `appendEntriesAtomically()` groups a synchronous callback's appends into one atomic publication. Failure rolls back staged entries and repairs retained concurrent work, including a publish whose acknowledgement failed after its body landed.
+- Rewrites serve renames, entry rewrites, migrations/sanitization, move/fork, and recovery. A session-title change appends its `title_change` entry like any other entry and updates the fixed-width title slot in place instead of rewriting the body.
 
 ### Error behavior
 
-- Ordinary append failures are latched and logged once with session-file context rather than thrown into the turn loop. Later appends may retry the complete in-memory journal; `flush()`/`flushSync()` and close surface unresolved failures.
+- The manager records what the session file is proven to hold: the entries a load or a successful write left there, and the file's byte size. An append writes every entry past that record in order, in chunks of whole entries of at most 4 MiB each (an entry larger than that goes alone), and the record advances as each chunk lands, so after a failed append, or a failed full rewrite that carried entries the file lacked, the next append restores the missing entries before their successors, resuming after the last chunk that landed. A file that grew past the record by whole entries, this manager's own next ones followed only by entries another writer added under known parents or as roots (a resumed session's previous process writing its exit marker, or the original of a cloned manager restoring an entry both hold), is read back only past the record; those entries are kept, the record extends over them, and appending continues. A root is kept only while the file's header, read from a bounded prefix, still names this session: another session's journal that replaced a header-only file measures the same and starts with a root, and that file republishes instead, which moves the session to a sibling. A structural change (migration, a session switch, entries adopted from another writer during a conflicting rewrite) or any other file whose size does not match the record republishes the whole journal instead; a rolled-back atomic batch keeps the record when none of its entries reached the file. Content-only changes (`rewriteEntries()` after in-place edits, header changes, the title slot) never gate appends: if their full rewrite fails, turns keep saving and the next successful full rewrite carries the change, so until then a restart shows the earlier content. `rewriteEntries()` persists content changes; re-parenting entries in place is not supported. Failures are logged once with session-file context rather than thrown into the turn loop; `flush()`, `flushSync()` and `close()` surface a failure only while an entry is still missing from storage, and surface the latest one (`getPersistenceFailure()`), not an earlier failure that has since cleared.
+- `flush()`, `close()` and `newSession()` restore missing entries only by appending them, and only while the file still measures what the record says, after keeping entries another writer appended as above. A file that vanished, grew in any other way, or needs a republish is left to the next append, so these calls never start a full rewrite.
+- From the moment `dropSession()` starts deleting the current session file, nothing the manager starts writes that path: no append, heal, rewrite or title write. A publish already on the disk queue lands before the delete; an authoritative repair already in flight is abandoned and waited for before the delete. Entries recorded meanwhile stay in memory past the record, rewrites and titles wait, `flush()` and `close()` wait for the delete to settle, and `flushSync()` returns without writing or throwing.
+- The file counts as gone when the delete succeeds, or when it fails and a stat of the journal then fails with `ENOENT`: the file backend unlinks the journal before it removes the artifact directory, and an indexed backend's remove can fail after it deleted the session row, so a delete can fail with the journal already gone. Any other stat result counts as present. Once gone, the file's persistence ends even if the delete failed: the entries stay in memory, those recorded during the delete are discarded with the file, nothing writes that path again, the next `newSession()` or `setSessionFile()` starts from there, and a failed delete still rethrows.
+- When the delete fails with the journal present, the session keeps saving as before, by append alone where a full rewrite cannot land (a read-only directory). A title set during the delete is written to the title slot in place; a full rewrite runs only for an in-place edit or abandoned publish that waited, or when the slot write fails. The next append, `flush()` or `close()` appends the entries recorded during the delete and any that missed the journal before it, or reports the failure. On an indexed backend the whole journal is instead published once, checked against the stored size: a remove can fail after deleting the session row while the readback of that row fails too, and then the publish reports the missing row rather than an append recreating it without its header. That publish runs before `dropSession()` returns when any entry is unsaved (a turn or title recorded during the delete, or a turn the backend rejected before it), since `flush()`, `close()` and a session switch only append; otherwise it is the next write. The next `newSession()` for the same entries switches without appending the entries the file is missing, so it writes nothing to that file. The file, memory and indexed backends all behave this way.
+- `AgentSession` folds a hidden persistence warning into the next prompt after `onPersistenceError`, so the agent can preserve critical work before continuing an at-risk session.
 - `onPersistenceNotice` reports a session moving to a sibling file as a `SessionPersistenceNotice` (`reason`, `from`, `to`); it latches nothing and never reaches `onPersistenceError`. Every notice raised so far is replayed to each new subscriber, like a latched failure. Interactive mode shows it as a warning, print mode on stderr, RPC as a `warning` notice frame, each with home-relative paths.
 - Atomic batch and recovery paths attempt authoritative repair. If publication may have happened and repair cannot be proven durable, `SessionPersistenceIndeterminateError` fails closed with the original and recovery errors.
 - Writer close propagates the first meaningful error. Final disposal seals the manager, making late appends/rewrites no-ops, then releases retained entries so a disposed manager cannot overwrite a revived transcript.
@@ -586,15 +599,145 @@ These projections leave the live entries unchanged. On load, ordinary persisted 
 
 ## Storage Abstractions
 
-`SessionStorage` owns filesystem-like operations used by `SessionManager`: synchronous directory/existence/write/stat/list operations; async read, sliced read, write, guarded atomic write, rename, unlink, artifact-aware deletion, title update, writer creation, and backend drain. Optional capabilities include synchronous reads, confirmed remote writes, line scans (`scanLines`), file locking, session ownership claims, and conditional artifact-aware deletion.
+`SessionStorage` owns filesystem-like operations used by `SessionManager`: synchronous directory/existence/write/stat/list operations; async read, sliced read, write, guarded atomic write, rename, unlink, artifact-aware deletion, title update, writer creation, and backend drain. Optional capabilities include synchronous reads, confirmed remote writes, assistant-turn scans, file locking, session ownership claims, and conditional artifact-aware deletion.
 
 Implementations and adapters:
 
 - `FileSessionStorage`: real local files
 - `MemorySessionStorage`: map/chunk-backed in-memory storage for non-persistent sessions and tests
 - `IndexedSessionStorage`: shared local index plus ordered remote publication used by Redis/SQL-backed storage
+- `SqlSessionStorage`: a PostgreSQL, MySQL, or SQLite session table (`omp_session_files`, created on first use) keyed by the same path string a file session would have, with each session's content in a `<table>_parts` table (see [SQL session storage](#sql-session-storage))
 
 `SessionStorageWriter` exposes `append`, optional `appendSync`, `flush`, optional `flushSync`, `isOpen`, `close`, and `getError`.
+
+### Selecting the storage
+
+The root command (interactive, print, RPC and ACP modes, and `omp join`) resolves one process-wide default storage at start-up (`resolveSessionStorage` in `session-storage-config.ts`, installed with `setDefaultSessionStorage`) before it opens any session; every `SessionManager` factory, `resolveResumableSession`, the session picker, recent-session listing, the session archive's listing and lookup by id, and the subagent transcript discovery behind `/export` and `/dump all` fall back to `defaultSessionStorage()` when no storage is passed, so a session written to SQL is found by `--resume`, `--continue`, the picker, and the archive, and exports with its subagents, without a second path. `--export` and `omp share` read a session without reaching that install, so each resolves and installs the same storage itself first. `omp gc`'s blob sweep resolves `session.storage` the same way at maintenance time so it can discover a SQL-only session's blob references; its archive and WAL sweeps are unrelated to the transcript backend and stay on-disk-tree-only. The other subcommands never install the configured storage and still use the JSONL tree: `omp render` and session-id shell completion read sessions there, `omp stats` counts usage only from transcripts there (so SQL-stored sessions are not counted), and `omp cleanse` and `omp compress` write their own sessions there.
+
+- `session.storage: file` (default) — the JSONL tree above; nothing is read or logged.
+- `session.storage: sql` — read the file `session.sql.dsnFile` names, trim it, open it with `Bun.SQL` (dialect from the URL scheme: `postgres://`, `mysql://`, `sqlite:`), and `await SqlSessionStorage.create({ client })`, which creates both tables (migrating an older session table) and warms the index. `OMP_SESSION_STORAGE` and `OMP_SESSION_SQL_DSN_FILE` take precedence over both settings.
+- SQL-backed sessions run subagents inline on the main thread until a session-storage service for workers exists; `task.workerThreads` does not offload their runs, follow-up turns, or revivals. File-backed sessions keep worker placement.
+- For PostgreSQL and MySQL, an omp-created SQL client holds at most two connections and returns idle connections after five seconds. The next session operation reconnects if needed. This pool policy is built in; callers using `SqlSessionStorage` directly keep control of their own client.
+- Resume takes the same value as today, `--resume=<session path>`: under SQL that string is the row's `path` key, and it embeds the home-relative sessions root, so the resuming process needs the same storage variables and the same home directory.
+- Refusals (exit 1, message on stderr, never a fallback to files): `sql` with no file named anywhere names both `OMP_SESSION_SQL_DSN_FILE` and `session.sql.dsnFile`; a missing or unreadable file — `<source> names <path>, which could not be read: <reason>`; a blank file — `<source> names <path>, which is empty`; an unreachable database — `<source> names <path>, but the session database could not be opened: <driver error> (<code>)`; any other storage value — `<source> is "<value>"; expected "file" or "sql"`. `<source>` is the variable or setting that supplied the value; the connection string itself is never printed.
+- Tool artifacts and image blobs stay under the agent directory on local disk in either mode; only the transcript moves. `omp gc`'s archive and WAL sweeps keep working on that on-disk tree; the blob sweep also reads a SQL-only session's transcript straight from the table so it never deletes a blob that transcript still references.
+- Joining a collab session (`/join`) needs file storage: the guest's replica of the host session is a local file, so under `sql` the join refuses with an error naming `session.storage` rather than resuming an empty session.
+- The resume picker's F2 rename reads and writes the session through the configured storage. Under file storage it first takes the session's ownership lease and leaves a session another process owns alone. A SQL-backed session has no lease, so under `sql` the rename does not check whether another process has the session open.
+- These features work only on the JSONL tree. Under `sql` each refuses with `<feature> is unavailable with session.storage: sql: <reason>` instead of acting on an empty tree:
+   - `omp gc --compress` (or `gc.compress`) and the background `gc.autoCompress` run compress session files in place on disk. `omp gc` skips the compress and archive steps and runs the others; `gc.autoCompress` writes the refusal to `gc-auto-compress.log` and does not start.
+   - `omp stats`, `/stats`, `/trace` and the `/usage` activity heatmap read session files. `/usage` still shows provider quotas.
+   - `omp session lease` and RPC `get_session_lease` probe the file ownership lease, which a SQL-backed session never takes. `omp session pack`, `unpack`, and `moved` work only on session files on disk.
+- `omp cleanse`, `omp compress` and session completion (`omp __complete sessions`) read the configured storage.
+- The debug menu's "Clear artifact cache" removes tool output files (`<id>.<tool>.log`) older than 30 days from the sessions' artifacts directories, in both storages. Nothing else there is removed: not transcripts or their sidecars, subagent outputs, `/btw` conversations or drafts, and never a session or project directory. It does not follow a directory replaced by a symlink, and leaves a file replaced since it was listed.
+- Resume forks a session that `omp session moved` marked as moved away (`forkIfMovedAway`). Only a session file can carry that mark, so a SQL-stored session always resumes in place.
+
+### SQL session storage
+
+`SqlSessionStorage` (`sql-session-storage.ts`) keeps sessions in PostgreSQL, MySQL/MariaDB, or SQLite through `bun:sql`, in two tables:
+
+- `<table>` (default `omp_session_files`): one row per session file with `path`, `content`, `mtime_ms`, the title fields, and `byte_len`, the session's size in UTF-8 bytes.
+- `<table>_parts`: the session's content as parts keyed by (`path`, `start_offset`), where `start_offset` is the part's byte offset in the session.
+
+A session's content is its row's `content` followed by its parts in `start_offset` order. `content` is non-empty only on rows written before parts existed, until the session's next full write.
+
+- An append is one transaction: it adds the line's byte length to `byte_len`, which takes the session row's lock, and inserts the line as a part at the old length. Concurrent writers serialize on that lock, and an append writes only the appended bytes.
+- A full write (rewrite, size-checked replace, create-if-missing, truncate) is one transaction that locks the row, compares `byte_len` with the expected size, empties `content`, and replaces the parts with parts of at most 1 MiB split on UTF-8 character boundaries. No stored value grows past 1 MiB or the longest appended line, so sessions stay clear of PostgreSQL's 1 GB field limit.
+- Delete and rename remove or move the row and its parts in one transaction. Warming the index reads session rows only; a sliced read fetches only the bytes of the parts covering its head and tail windows, and a read from an offset (`readTextFrom`) only the session's size and the bytes of the parts covering `[offset, offset + maxBytes)`, each in one query whatever the part count.
+- `moveTo()` refreshes the store before it checks the destination and refuses a destination that holds any session, a copy of the moving session included, because another process may have it open. It moves the session and every row under its artifacts directory with a rename that never replaces (`renameNoReplace`): one `UPDATE … SET path` whose primary key rejects a destination row that exists, or that another client inserts during the move. The transaction then rolls back, the rows already moved go back (a key written at an old path since is kept, and the move reports the failed rollback), and the move fails with `SessionMoveRefusedError` naming the taken key. Redis storage does the same check, rename, mtime and title update in one script.
+- Deleting a session removes its row and, in the same transaction, every row whose path starts with its artifacts directory (`substr(path, 1, n)`, so `%` and `_` stay literal) together with exactly those rows' parts, including rows another client committed after this client last refreshed. PostgreSQL (a `DELETE … RETURNING` feeding the parts `DELETE`) and MySQL (a multi-table `DELETE`) do it in one statement, so a child another client commits during the delete is either removed whole or kept whole; SQLite's `BEGIN IMMEDIATE` keeps every other writer out meanwhile. Redis finds and deletes the keys and their metadata in one script.
+- SQL storage has no cross-process session ownership: two omp processes can hold the same session open, and nothing stops the second one writing it during or after a move or delete, so its entry lands at the old key. A session lease with fenced writes is planned in a follow-on change.
+- PostgreSQL and MySQL run a write again, up to five attempts, when the database aborts it as a deadlock victim; each attempt recomputes everything under its own locks. On MySQL a full write deletes a session's parts only after a non-locking look finds some, so creating sessions at once takes no gap locks.
+- On SQLite every store in a process runs one call at a time per database file, across all the clients of that file (keyed by `client.options.filename`; in-memory databases, and wrappers that do not pass `options` through, queue per client), and opens every write with `BEGIN IMMEDIATE`. Clients of one file in one process therefore take turns and never wait on each other. When a client has no busy timeout, the store sets 5 s: a write then waits for another process's write lock, and if the lock is not released in time it fails at `BEGIN`, before changing anything. Keep your own transactions off a client the store uses: Bun runs each client on one connection, so the store's statements would join them.
+- Table names are limited to 57 characters, so `<table>_parts` stays within the 63-character identifier limit.
+
+With `createTable` on (the default), `create()` creates both tables when missing. On a session table from an older Oh My Pi it adds `byte_len`, backfills it from each row's `content` where it is null, and creates `<table>_parts`. Stop every older Oh My Pi process that writes the table before the first upgraded one starts: an older version appends to `content` without updating `byte_len`.
+
+With `createTable: false`, `create()` runs no DDL and refuses to start, naming what is missing, until the session table has `byte_len` and `<table>_parts` exists; it also refuses while any row's `byte_len` is null. Apply the schema in your own migration, substituting your table name for `omp_session_files`. A new database creates the session table with `byte_len`; an existing session table adds the column and backfills it. Both then create the parts table.
+
+PostgreSQL:
+
+```sql
+-- New database
+CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms BIGINT NOT NULL,
+  title TEXT, title_source TEXT, title_updated_at TEXT, byte_len BIGINT);
+-- Existing session table
+ALTER TABLE omp_session_files ADD COLUMN byte_len BIGINT;
+UPDATE omp_session_files SET byte_len = octet_length(content) WHERE byte_len IS NULL;
+-- Both
+CREATE TABLE omp_session_files_parts (path TEXT NOT NULL, start_offset BIGINT NOT NULL, content TEXT NOT NULL,
+  PRIMARY KEY (path, start_offset));
+```
+
+MySQL / MariaDB:
+
+```sql
+-- New database
+CREATE TABLE omp_session_files (path VARCHAR(512) NOT NULL PRIMARY KEY, content LONGTEXT NOT NULL,
+  mtime_ms BIGINT NOT NULL, title TEXT NULL, title_source VARCHAR(16) NULL, title_updated_at VARCHAR(64) NULL,
+  byte_len BIGINT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+-- Existing session table
+ALTER TABLE omp_session_files ADD COLUMN byte_len BIGINT NULL;
+UPDATE omp_session_files SET byte_len = length(content) WHERE byte_len IS NULL;
+-- Both
+CREATE TABLE omp_session_files_parts (path VARCHAR(512) NOT NULL, start_offset BIGINT NOT NULL,
+  content LONGTEXT NOT NULL, PRIMARY KEY (path, start_offset))
+  ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+```
+
+SQLite:
+
+```sql
+-- New database
+CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL,
+  title TEXT, title_source TEXT, title_updated_at TEXT, byte_len INTEGER);
+-- Existing session table
+ALTER TABLE omp_session_files ADD COLUMN byte_len INTEGER;
+UPDATE omp_session_files SET byte_len = length(cast(content AS blob)) WHERE byte_len IS NULL;
+-- Both
+CREATE TABLE omp_session_files_parts (path TEXT NOT NULL, start_offset INTEGER NOT NULL, content TEXT NOT NULL,
+  PRIMARY KEY (path, start_offset));
+```
+
+Before running an older Oh My Pi against the tables, roll back. Stop the newer processes first. The statements fold each session's parts into its row's `content`, then delete the parts of, and clear `byte_len` on, only those rows whose `content` now measures `byte_len`. A session whose fold failed keeps its parts and `byte_len`, so this version still reads it whole, even when the client carries on past an error.
+
+A session cannot be folded when its content exceeds the older version's single-value limit: 1 GB on PostgreSQL, `max_allowed_packet` on MySQL (64 MiB by default on MySQL 8, 4 MiB on 5.7, at most 1 GB), and `SQLITE_MAX_LENGTH` on SQLite (1,000,000,000 bytes by default). On PostgreSQL, on SQLite, and on MySQL in strict mode (the default), one such session makes the whole fold statement fail, so nothing is folded until that session is removed or the limit is raised.
+
+```sql
+-- PostgreSQL
+BEGIN;
+UPDATE omp_session_files AS s SET content = s.content || p.content
+FROM (SELECT path, string_agg(content, '' ORDER BY start_offset) AS content
+      FROM omp_session_files_parts GROUP BY path) AS p
+WHERE p.path = s.path;
+DELETE FROM omp_session_files_parts
+WHERE path IN (SELECT path FROM omp_session_files WHERE octet_length(content) = byte_len);
+UPDATE omp_session_files SET byte_len = NULL WHERE octet_length(content) = byte_len;
+COMMIT;
+
+-- MySQL / MariaDB (GROUP_CONCAT truncates at group_concat_max_len, 1024 bytes by default)
+SET SESSION group_concat_max_len = 18446744073709551615;
+START TRANSACTION;
+UPDATE omp_session_files AS s
+JOIN (SELECT path, GROUP_CONCAT(content ORDER BY start_offset SEPARATOR '') AS content
+      FROM omp_session_files_parts GROUP BY path) AS p ON p.path = s.path
+SET s.content = CONCAT(s.content, p.content)
+WHERE length(CONCAT(s.content, p.content)) = s.byte_len;
+DELETE FROM omp_session_files_parts
+WHERE path IN (SELECT path FROM omp_session_files WHERE length(content) = byte_len);
+UPDATE omp_session_files SET byte_len = NULL WHERE length(content) = byte_len;
+COMMIT;
+
+-- SQLite 3.44 or later
+BEGIN;
+UPDATE omp_session_files SET content = content || (
+  SELECT string_agg(content, '' ORDER BY start_offset) FROM omp_session_files_parts AS p
+  WHERE p.path = omp_session_files.path)
+WHERE path IN (SELECT path FROM omp_session_files_parts);
+DELETE FROM omp_session_files_parts
+WHERE path IN (SELECT path FROM omp_session_files WHERE length(cast(content AS blob)) = byte_len);
+UPDATE omp_session_files SET byte_len = NULL WHERE length(cast(content AS blob)) = byte_len;
+COMMIT;
+```
 
 ### Manual storage maintenance
 
@@ -611,7 +754,7 @@ The compress phase is opt-in as well: `--compress` or `gc.compress` (default off
 
 Other filesystems report the phase as unsupported.
 
-The strip phase is opt-in too: `--strip` or `gc.strip` (default off). Providers return state only they can read back, which omp persists so a resumed turn replays natively: signed and encrypted reasoning, the verbatim wire response kept for prompt caching, request controls, uploaded-file references. Once a transcript has been idle for `gc.stripAfterDays` (default 30, `--strip-after-days`), past every provider's cache and response retention, the phase rewrites it without that state: incremental OpenAI Responses histories, Cursor and Gemini native histories, `requestControls`, `inputTransformations`, opaque `thinkingSignature`s, `itemId`s, `redactedThinking` blocks, tool-call `thoughtSignature`s and leftover streaming state, and image `providerFile` references. Each turn then reads like one recorded by another model, which every provider already replays (reasoning as plain text, or not at all). The latest surviving assistant turn keeps everything, since a resumed tool loop must replay the most recent response's reasoning unmodified. State with no copy elsewhere also stays: reasoning source markers (`reasoning_content`), text signatures (OpenAI message phase), Anthropic message controls and native compaction blocks, OpenAI snapshot histories, and compaction entries (an OpenAI remote compaction's stored summary is only a placeholder for its encrypted history). It covers each session's transcript and the subagent transcripts in its artifact tree, under the same ownership-lease rules as compression, and archived `.jsonl.gz` sessions, which are recompressed. Lines without replay data keep their bytes, the title slot included, and the transcript keeps its mtime, so session ordering is unchanged; the stats database reparses a rewritten transcript once. The phase runs before archiving and compression so both store the stripped transcripts.
+The strip phase is opt-in too: `--strip` or `gc.strip` (default off). Providers return state only they can read back, which omp persists so a resumed turn replays natively: signed and encrypted reasoning, the verbatim wire response kept for prompt caching, request controls, uploaded-file references. Once a transcript has been idle for `gc.stripAfterDays` (default 30, `--strip-after-days`), past every provider's cache and response retention, the phase rewrites it without that state: incremental OpenAI Responses histories, Cursor and Gemini native histories, `requestControls`, `inputTransformations`, opaque `thinkingSignature`s, `itemId`s, `redactedThinking` blocks, tool-call `thoughtSignature`s and leftover streaming state, and image `providerFile` references. Each turn then reads like one recorded by another model, which every provider already replays (reasoning as plain text, or not at all). The latest replay turn keeps everything: its run of assistant responses joined by tool results, which a provider replays as one assistant message and validates as a unit, since a resumed tool loop must replay every one of those responses' reasoning unmodified. State with no copy elsewhere also stays: reasoning source markers (`reasoning_content`), text signatures (OpenAI message phase), Anthropic message controls and native compaction blocks, OpenAI snapshot histories, and compaction entries (an OpenAI remote compaction's stored summary is only a placeholder for its encrypted history). It covers each session's transcript and the subagent transcripts in its artifact tree, under the same ownership-lease rules as compression, and archived `.jsonl.gz` sessions, which are recompressed. Lines without replay data keep their bytes, the title slot included, and the transcript keeps its mtime, so session ordering is unchanged; the stats database reparses a rewritten transcript once. The phase runs before archiving and compression so both store the stripped transcripts.
 
 To compress without running the command, enable `gc.autoCompress` (default off). Once an interactive session has painted its first frame, omp starts a detached `omp gc --compress --apply` at low CPU priority when the last background run is at least a day old and the sessions directory supports compression. Support is checked by compressing a throwaway probe file in the sessions directory, so a volume whose compressor stores files uncompressed (macOS 27's `ditto --hfsCompression`, #16244) is not copied and hashed every day; when the check fails, `gc-auto-compress.log` records why and the next check is a day later. Launches claim the run under an OS lock keyed on the log and recheck the interval while holding it, so simultaneous launches start one child. The child outlives the launching session, writes its summary to `gc-auto-compress.log` in the agent dir, and that file's mtime marks the last run; a spawn that fails removes the log so the next launch retries. The child takes `gc.lock` like any other gc run, so a run that finds gc already running exits with that error in the log and is retried a day later. A file that compresses but does not shrink stays a candidate and is copied again on later runs. Print, RPC, and ACP launches never start it.
 
@@ -632,7 +775,7 @@ Discovery helpers live in `session-listing.ts`; `SessionManager` exposes project
 - `SessionManager.listForPicker(...)` / `listAllForPicker()` -> pinned-first lists with untitled, prompt-less zero-turn stubs removed; pinned stubs remain selectable
 - `resolveResumableSession(...)` -> local lookup then optional global fallback
 
-`getRecentSessions()` sorts file stats and first looks up titles in `history.db`'s `session_titles` index; unindexed files fall back to content scanning and backfill their title. `findMostRecentSession()` reads a 4 KiB prefix. Status-enabled full/non-empty scans read that prefix plus a bounded 32 KiB tail. When those windows hold no text prompt or no assistant record, one `scanLines` pass over the file recovers them, so a prompt behind a large memory recall or attachment still previews (capped at 4 KiB of text); backends without `scanLines` keep the window evidence. Scans are stat-keyed and cached; large full lists use bounded parallel workers. Normal per-directory scans also recover the newest orphaned EPERM backup when its primary JSONL is missing.
+`getRecentSessions()` sorts file stats and first looks up titles in `history.db`'s `session_titles` index; unindexed files fall back to content scanning and backfill their title. `findMostRecentSession()` reads a 4 KiB prefix. Status-enabled full/non-empty scans read that prefix plus a bounded 32 KiB tail. Scans are stat-keyed and cached; large full lists use bounded parallel workers. Normal per-directory scans also recover the newest orphaned EPERM backup when its primary JSONL is missing.
 
 `SessionManager.list()`/`listAll()` sort pinned sessions first; raw listing helpers sort newest first. Empty filtering is picker/continue-specific, not applied to id lookup or maintenance. Resume matching is case-insensitive and accepts session id prefixes, full filename prefixes, or the id suffix after the timestamp. Explicit `sessionDir` disables global fallback unless `allowGlobalFallback: true` is requested.
 
