@@ -6,6 +6,11 @@
 
 - Added `decideContextCut()`, which decides whether an automatic context cut runs now or waits until the prompt-cache reads it saves pay for the cache write it causes, and `meanPromptGrowth()` for its prompt-growth input
 - Added an `admit` gate to `pruneToolOutputs()` and `pruneSupersededToolResults()` configs: it sees where a pass would first change the history and what it would save, and a refused pass blanks nothing
+- Added `RepeatedPerCallMessages` and `AgentLoopConfig.repeatedPerCallMessages`, which every `Agent` sets for its own loop
+
+### Fixed
+
+- A per-call context message (`markPerCallContextMessage`) that a main request repeats with the bytes the previous main request had at the same position is now sent as history, so Anthropic prompt caching keeps both rolling breakpoints instead of anchoring one before it; side requests (`buildSideRequestContext`) keep the marks as set
 
 ## [18.18.2] - 2026-11-08
 

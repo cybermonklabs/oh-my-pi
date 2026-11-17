@@ -12,6 +12,8 @@ export * from "./output-budget";
 export * from "./pause";
 // Proxy utilities
 export * from "./proxy";
+// Per-call messages a main request repeats from the previous one, sent as history
+export * from "./repeated-per-call-messages";
 // Replay policy
 export * from "./replay-policy";
 // Run-level telemetry collector + aggregators

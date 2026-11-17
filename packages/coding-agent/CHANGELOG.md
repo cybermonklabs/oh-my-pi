@@ -12,6 +12,7 @@
 - Resuming a session in a new process (`--resume`) no longer rewrites the whole cached prompt on Claude models that bind thinking to it: the first request sends the system prompt the conversation was last sent with, even when the new process would build it differently (skill descriptions, context files, late tools), unless the custom or appended system prompt changed
 - Adding an agent (agents hub, plugin reload) or editing the approved per-call models mid-session no longer rewrites the whole cached prompt: the `task` and `eval` descriptions keep the lists they were sent with, the change reaches the model as a hidden note on the next turn, and a new agent can be spawned at once
 - A memory recall (Hindsight, Mnemopi) that succeeds only after earlier ones failed no longer rewrites the whole cached prompt on Claude models that bind thinking to it: it is sent as a hidden message after the turn's newest content instead of a new system prompt block
+- Claude sessions with an extension `context` hook no longer lose a rolling prompt-cache breakpoint to the head of the conversation (after a compaction, to the summary): replies the hook leaves untouched stay history, and a message the hook inserts with the same bytes at the same place on every request, such as a fixed note after the summary, is cached like history from its second request on; a message whose text or place changes still gets the breakpoint before it
 
 ## [18.18.6] - 2026-11-09
 

@@ -2462,7 +2462,19 @@ export class ExtensionRunner {
 		}
 		for (let index = 0; index < currentMessages.length; index++) {
 			const message = currentMessages[index];
-			if (message) setContextHistoryIndex(message, index);
+			if (!message) continue;
+			// `structuredClone` drops symbol-keyed tags (a session entry id, the provider a request went to), and
+			// `Bun.deepEquals` compares them: without them an untouched clone reads as changed below and goes out
+			// per-call. Restore the tags an object spread would keep.
+			const original = messages[index];
+			if (original && original !== message) {
+				for (const key of Object.getOwnPropertySymbols(original)) {
+					if (Object.prototype.propertyIsEnumerable.call(original, key)) {
+						Reflect.set(message, key, Reflect.get(original, key));
+					}
+				}
+			}
+			setContextHistoryIndex(message, index);
 		}
 
 		for (const ext of this.extensions) {
