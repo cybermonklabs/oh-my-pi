@@ -15,6 +15,7 @@ Both are persisted as session entries and converted back into user-context messa
 - `packages/agent/src/compaction/pruning.ts`
 - `packages/agent/src/compaction/compaction-v2-streaming.ts` (provider-native streaming compaction)
 - `packages/agent/src/compaction/shake.ts` (mechanical content elision)
+- `packages/agent/src/compaction/cut-rule.ts` (whether an automatic cut runs now or waits for the prompt cache)
 - `packages/agent/src/compaction/utils.ts`
 - `packages/agent/src/compaction/openai.ts`
 - `packages/agent/src/compaction/messages.ts` (shared LLM conversion and summary wrappers)
@@ -163,6 +164,36 @@ The automatic paths are intentionally different:
 HTTP 413 / payload rejections are not automatically treated as token overflow. A known window with at least 10% locally estimated headroom and provider input usage within that window, or explicit image-limit evidence without usage-backed overflow, blocks automatic continuation and emits a payload-budget warning rather than promoting or compacting.
 
 When provider usage proves token overflow, maintenance can still shrink context. Snapcompact is excluded for byte/media-shaped rejections unless usage proves a token overflow without explicit media-limit evidence. With an unknown window, maintenance may attempt a runnable overflow method; an unavailable or no-progress recovery blocks automatic continuation rather than resubmitting unchanged history.
+
+### Cut rule: when an automatic cut may rewrite the cached prompt
+
+A cut (a prune, a shake, a compaction, an image clamp) changes the prompt from its first changed position on. The next request still reads the tokens before that position from the prompt cache, but writes every token after it again. `decideContextCut()` (`packages/agent/src/compaction/cut-rule.ts`) decides whether an automatic cut runs now or waits.
+
+Inputs:
+
+- `P`: prompt tokens of the request the cut changes.
+- `p`: tokens before the cut's first changed position.
+- `s`: tokens the cut removes.
+- `r` and `w`: the price of one cached token read and of one token written, at the cache lifetime the next request asks, from the model's cost data by the rule usage is billed by (`getCacheTokenPrices()` in `packages/catalog/src/models.ts`: a one-hour write at twice the input price, a five-minute write at `cacheWrite`, a read at `cacheRead`).
+- `T`: the compaction threshold `shouldCompact` uses (`resolveThresholdTokens`).
+- `g`: the mean prompt growth per main request over the last 20 main requests, at least 1 token (`meanPromptGrowth()`; a request whose prompt shrank came after a cut and is left out).
+- `N = max(0, floor((T - (P - s)) / g))`: the requests until the context after the cut reaches the threshold again.
+- idle: the time since the last request; life: that request's cache lifetime.
+
+The cut is admitted when any of these holds:
+
+1. The request cannot be served without it: `P` is over the window less the reserve, or the provider refused the request for its size.
+2. idle ≥ life: the prefix has already left the cache, so the cut adds no write.
+3. `N * s * r > (P - p - s) * (w - r)`: the reads the cut saves before the threshold is reached again cost more than writing the tokens after it again.
+
+A cut that is not admitted waits, and runs at the first later point where it is admitted: a lapse, the threshold, or a forced cut. The decision names the condition that decided it (`forced`, `lapsed`, `pays` or `waits`) and carries `N`, the saving `N * s * r` and the write cost `(P - p - s) * (w - r)`, so a caller can log why a cut ran or waited. Negative or NaN inputs count as 0.
+
+Worked figures, on claude-opus-5-5 with one-hour writes (`w` = $8 and `r` = $0.20 per million tokens, so `(w - r) / r` = 39):
+
+- A prune of `s` = 21,500 tokens at `p` = 100,000 in a prompt of `P` = 600,000 leaves 478,500 tokens to write again, so (3) needs `N` ≥ 868. With `g` = 1,000 and `T` = 850,000, `N` = 271, and the prune waits.
+- A compaction at `P` = 850,000 that keeps `p` = 30,000 tokens of tools and system prompt and sends 60,000 (`s` = 790,000, 30,000 to write again) needs `N` ≥ 2, and `N` = 790: it is admitted.
+
+The rule governs every automatic cut: the superseded-read, useless-result and age-based tool-result prunes (`pruneSupersededToolResults`, `pruneToolOutputs`), automatic shake, the maintenance rescue's shake and image drop (`dropImages`), the request-body-timeout shake, threshold and idle compaction, and the provider image clamps (`clampProviderContextImages`, `clampProviderContextImageBytes`). Manual `/shake` and `/compact`, and a compaction an RPC client requests, are a person's or an operator's choice and are not governed by it.
 
 ### Experimental notes-backed context windows
 
