@@ -202,6 +202,7 @@ function collectIdentityStrings(
 		}
 	}
 	for (const account of accounts) {
+		add(account.identityKey);
 		add(account.email);
 		add(account.accountId);
 		add(account.projectId);
@@ -603,19 +604,7 @@ function isActionableDisable(summary: DisabledCredentialSummary, activeAccounts:
 
 	const matchesActive = activeAccounts.some(account => {
 		if (account.provider !== summary.provider) return false;
-		if (summary.identityKey) {
-			return (
-				account.type === "oauth" &&
-				summary.identityKey ===
-					resolveCredentialIdentityKey(account.provider, {
-						...account,
-						type: "oauth",
-						access: "",
-						refresh: "",
-						expires: 0,
-					})
-			);
-		}
+		if (summary.identityKey) return account.identityKey === summary.identityKey;
 
 		const accountEmail = account.email?.toLowerCase();
 		const accountAccountId = account.accountId?.toLowerCase();
@@ -1703,6 +1692,7 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 				trimmed = trimmed.map(report => redactReportForJson(report, redaction));
 				unreportedAccounts = unreportedAccounts.map(account => ({
 					...account,
+					identityKey: maskIdentity(redaction, account.identityKey),
 					email: maskIdentity(redaction, account.email),
 					accountId: maskIdentity(redaction, account.accountId),
 					projectId: maskIdentity(redaction, account.projectId),

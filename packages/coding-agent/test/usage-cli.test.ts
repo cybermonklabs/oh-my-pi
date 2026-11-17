@@ -1127,12 +1127,6 @@ describe("formatUsageBreakdown", () => {
 	});
 
 	it("keeps a failed subscription visible when the same email is active in another organization", () => {
-		const active: UsageAccountIdentity = {
-			provider: "anthropic",
-			type: "oauth",
-			email: "shared@example.test",
-			orgId: "org-live",
-		};
 		const failed = {
 			type: "oauth" as const,
 			access: "unused",
@@ -1140,6 +1134,13 @@ describe("formatUsageBreakdown", () => {
 			expires: 0,
 			email: "shared@example.test",
 			orgId: "org-dead",
+		};
+		const active: UsageAccountIdentity = {
+			provider: "anthropic",
+			type: "oauth",
+			email: "shared@example.test",
+			orgId: "org-live",
+			identityKey: resolveCredentialIdentityKey("anthropic", { ...failed, orgId: "org-live" })!,
 		};
 		const disabled = [
 			{
@@ -1155,7 +1156,13 @@ describe("formatUsageBreakdown", () => {
 		const text = stripVTControlCharacters(formatUsageBreakdown([], [active], Date.now(), undefined, disabled));
 		expect(text).toContain("✗ shared@example.test · org-dead — disabled");
 		const restored = stripVTControlCharacters(
-			formatUsageBreakdown([], [{ ...active, orgId: "org-dead" }], Date.now(), undefined, disabled),
+			formatUsageBreakdown(
+				[],
+				[{ ...active, orgId: "org-dead", identityKey: resolveCredentialIdentityKey("anthropic", failed)! }],
+				Date.now(),
+				undefined,
+				disabled,
+			),
 		);
 		expect(restored).not.toContain("— disabled");
 	});
@@ -1957,6 +1964,50 @@ describe("omp usage --json account policy", () => {
 			}
 		},
 	);
+
+	it("does not list an active account as disabled when its identity is only in its token claims", async () => {
+		// If this regresses, `omp usage` reports a working login as a disabled one to log in again.
+		const claimsToken = (nonce: string) =>
+			`header.${Buffer.from(JSON.stringify({ sub: "claims-only-account", nonce })).toString("base64url")}.signature`;
+		const earlierLogin: OAuthCredential = {
+			type: "oauth",
+			access: claimsToken("before"),
+			refresh: "refresh-before",
+			expires: 0,
+		};
+		const authStorage = createInMemoryAuthStorage();
+		try {
+			await authStorage.credentials.set("anthropic", {
+				type: "oauth",
+				access: claimsToken("after"),
+				refresh: "refresh-after",
+				expires: Date.now() + HOUR,
+			});
+			// A failure tore down the same account's earlier login; the store keys its tombstone by the token claims.
+			vi.spyOn(authStorage.credentials, "listDisabled").mockResolvedValue([
+				{
+					id: 99,
+					provider: "anthropic",
+					type: "oauth",
+					identityKey: resolveCredentialIdentityKey("anthropic", earlierLogin)!,
+					cause: "oauth refresh failed: expired grant",
+				},
+			]);
+			vi.spyOn(authStorage.usage, "reports").mockResolvedValue([]);
+			vi.spyOn(Settings, "loadReadOnly").mockResolvedValue(Settings.isolated());
+			vi.spyOn(sdkModule, "discoverAuthStorage").mockResolvedValue(authStorage);
+			let stdout = "";
+			vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+				stdout += String(chunk);
+				return true;
+			});
+			await runUsageCommand({ json: true, noExtensions: true });
+			const { disabledCredentials } = JSON.parse(stdout) as { disabledCredentials: unknown[] };
+			expect(disabledCredentials).toEqual([]);
+		} finally {
+			authStorage.close();
+		}
+	});
 });
 
 describe("omp usage reset", () => {

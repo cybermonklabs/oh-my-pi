@@ -1,9 +1,14 @@
-import type { AuthStorage, UsageReport } from "@oh-my-pi/pi-ai";
+import { type AuthStorage, resolveCredentialIdentityKey, type UsageReport } from "@oh-my-pi/pi-ai";
 
 /** Identity slice of a stored credential, for "every account" coverage. */
 export interface UsageAccountIdentity {
 	provider: string;
 	type: "api_key" | "oauth";
+	/**
+	 * Store-defined identity of an OAuth account, computed from the stored
+	 * credential (token claims included), as its disabled tombstones carry it.
+	 */
+	identityKey?: string;
 	email?: string;
 	accountId?: string;
 	projectId?: string;
@@ -27,6 +32,7 @@ export function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIde
 				accounts.push({
 					provider,
 					type: "oauth",
+					identityKey: resolveCredentialIdentityKey(provider, credential) ?? undefined,
 					email: credential.email,
 					accountId: credential.accountId,
 					projectId: credential.projectId,

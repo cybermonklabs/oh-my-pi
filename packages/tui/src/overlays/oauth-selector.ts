@@ -171,10 +171,11 @@ export class OAuthSelectorComponent extends OverlayPanel {
 		this.#updateList();
 	}
 	#hasSelectableAuth(providerId: string): boolean {
-		return this.#mode === "logout"
-			? (this.#logoutProviders?.has(getOAuthCredentialProvider(providerId)) ??
-					this.#authStorage.credentials.has(getOAuthCredentialProvider(providerId)))
-			: this.#authStorage.keys.source(providerId) !== undefined;
+		if (this.#mode === "logout") {
+			const credentialProvider = getOAuthCredentialProvider(providerId);
+			return this.#logoutProviders?.has(credentialProvider) ?? this.#authStorage.credentials.has(credentialProvider);
+		}
+		return this.#authStorage.keys.source(providerId) !== undefined;
 	}
 
 	#loadProviders(disabledProviders: readonly string[] = []): void {
@@ -182,7 +183,14 @@ export class OAuthSelectorComponent extends OverlayPanel {
 		if (this.#mode === "logout") {
 			// Logout stays unfiltered by `disabledProviders`: a now-disabled
 			// provider may still hold stored credentials worth removing.
-			this.#menu.setItems(providers.filter(provider => this.#hasSelectableAuth(provider.id)));
+			const listed = providers.filter(provider => this.#hasSelectableAuth(provider.id));
+			const listedIds = new Set(listed.map(provider => provider.id));
+			// An alias login (e.g. `openai-codex-device`) stores its credentials
+			// under its target's id, so beside a listed target its row would
+			// remove the same logins; it stays only when its target is not listed.
+			this.#menu.setItems(
+				listed.filter(provider => !(provider.storeCredentialsAs && listedIds.has(provider.storeCredentialsAs))),
+			);
 		} else {
 			const disabled = new Set(disabledProviders);
 			// Hide a login entry when either its own id or the provider id it

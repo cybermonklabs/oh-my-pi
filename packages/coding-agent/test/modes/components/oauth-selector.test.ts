@@ -111,6 +111,42 @@ describe("OAuthSelectorComponent", () => {
 		expect(selected).toEqual(["opencode-go"]);
 	});
 
+	it("offers an alias login's stored credentials for logout once, under the provider that stores them", () => {
+		const providers = getOAuthProviders();
+		const target = providers.find(provider => provider.id === "openai-codex");
+		const alias = providers.find(provider => provider.storeCredentialsAs === "openai-codex");
+		expect(target).toBeDefined();
+		expect(alias).toBeDefined();
+		if (!target || !alias) return;
+
+		const validated: string[] = [];
+		const component = new OAuthSelectorComponent(
+			"logout",
+			{
+				credentials: { has: (providerId: string) => providerId === "openai-codex" },
+				keys: { source: (_providerId: string) => undefined },
+			} as unknown as AuthStorage,
+			() => {},
+			() => {},
+			{
+				validateAuth: async providerId => {
+					validated.push(providerId);
+					return true;
+				},
+			},
+		);
+		const rendered = component
+			.render(80)
+			.map(line => Bun.stripANSI(line))
+			.join("\n");
+		component.stopValidation();
+
+		// The alias row would remove the same logins as its target's row.
+		expect(rendered).toContain(target.name);
+		expect(rendered).not.toContain(alias.name);
+		expect(validated).toEqual(["openai-codex"]);
+	});
+
 	describe("disabledProviders", () => {
 		afterEach(() => {
 			resetSettingsForTest();
