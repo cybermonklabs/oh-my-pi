@@ -490,14 +490,19 @@ def _worktrees_holding_refs(repo_dir: Path, refs: tuple[str, ...]) -> dict[str, 
     refs_set = set(refs)
     by_ref: dict[str, list[str]] = {}
     for entry, worktree in _registered_worktrees(repo_dir):
-        try:
-            head = os.fsdecode(Path(entry, "HEAD").read_bytes()).strip()
-        except OSError:
-            continue
-        ref = head.removeprefix("ref: ")
-        if ref != head and ref in refs_set:
+        ref = _head_ref(entry)
+        if ref in refs_set:
             by_ref.setdefault(ref, []).append(worktree)
     return by_ref
+
+
+def _head_ref(entry: str) -> str | None:
+    """The ref a `worktrees/<id>` entry's `HEAD` is on, or None (detached, or unreadable)."""
+    try:
+        head = os.fsdecode(Path(entry, "HEAD").read_bytes()).strip()
+    except OSError:
+        return None
+    return head.removeprefix("ref: ") if head.startswith("ref: ") else None
 
 
 def _real_path(path: str | Path) -> str:
@@ -517,11 +522,14 @@ def _registered_worktrees(pool: Path) -> list[tuple[str, str]]:
     bytes and its worktree resolved as git and the kernel resolve it. No
     listing is parsed and git does not run, so one unreadable, locked or oddly
     named entry cannot stop the others. An entry whose `gitdir` cannot be read
-    or is relative (git 2.48's `worktree.useRelativePaths`) is left out.
+    or is relative (git 2.48's `worktree.useRelativePaths`) is left out. The
+    git directory is resolved first, so an entry's path compares equal to the
+    resolved path a checkout's `.git` file names.
     """
     git_dir = _git_dir(pool)
     if git_dir is None:
         return []
+    git_dir = Path(os.path.realpath(git_dir))
     try:
         entries = list(os.scandir(git_dir / "worktrees"))
     except (FileNotFoundError, NotADirectoryError):
@@ -573,57 +581,81 @@ def _drop_worktree_registration(checkout: Path, pool: Path, *, under: bool = Fal
         raise GitCommandError(["git", "worktree", "remove", str(checkout)], 1, "", "; ".join(failed))
 
 
-def _remove_worktrees(repo_dir: Path, paths: list[str]) -> None:
-    """Remove the linked worktrees holding a bad ref, and drop each one's registration.
+def _checkout_registration(checkout: str) -> str | None:
+    """The resolved `worktrees/<id>` entry the checkout at ``checkout`` points back to, or None.
 
-    Git does not run: `git worktree remove` checks a path and opens it again
-    to delete it, following a link swapped in between into another worktree.
-    A path no linked worktree of the pool registers is left alone, and so is a
-    locked worktree whose checkout is there. Otherwise a link or file at the
-    path is unlinked and a directory removed without following any link
-    (`shutil.rmtree` refuses one swapped in after the check), which loses
-    nothing `git worktree remove --force` would keep; then the registration is
-    dropped. A checkout or registration that cannot be deleted raises
-    GitCommandError, after the other paths are done: a registration left
-    behind keeps holding the ref, and the next fetch fails the same way.
+    It is git's check before `git worktree remove`: ``checkout`` must be a
+    real directory (not a link) holding a `.git` regular file that reads
+    `gitdir: <entry>`. Anything else at the path is no linked worktree's
+    checkout.
+    """
+    dot_git = os.path.join(checkout, ".git")
+    try:
+        if not stat.S_ISDIR(os.lstat(checkout).st_mode) or not stat.S_ISREG(os.lstat(dot_git).st_mode):
+            return None
+        with open(dot_git, "rb") as gitfile:
+            text = gitfile.read(65536)
+    except OSError:
+        return None
+    if not text.startswith(b"gitdir: "):
+        return None
+    return os.path.realpath(os.fsdecode(text.removeprefix(b"gitdir: ").strip()))
+
+
+def _remove_worktrees(repo_dir: Path, paths: list[str], ref: str) -> None:
+    """Remove the linked worktrees holding ``ref``, and drop their registrations.
+
+    Any slot can write a registration naming any path, and robomp runs as
+    root, so a path is removed only when it is the checkout of a registration
+    holding ``ref``: a real directory whose `.git` file names that
+    registration (`_checkout_registration`), and with no registration of the
+    path locked. Then every dead registration at or under the path goes, a
+    worktree nested in the checkout included. In every other case the path is
+    left as it is and only the holding registrations are dropped, which
+    clears the HEAD that blocks the fetch; a locked one, or the one the
+    checkout there points back to, is kept. Git does not run: `git worktree
+    remove` checks a path and opens it again to delete it. `shutil.rmtree`
+    refuses a link swapped in for the checkout after the check; a link swapped
+    in for a parent directory is not guarded. A checkout or registration that
+    cannot be deleted raises GitCommandError, after the other paths are done:
+    a registration left behind keeps holding the ref, and the next fetch fails
+    the same way.
     """
     registered = _registered_worktrees(repo_dir)
     failed: list[str] = []
-    for path in paths:
+    for path in dict.fromkeys(paths):
         target = _real_path(path)
         entries = [entry for entry, worktree in registered if worktree == target]
-        if not entries:
+        holders = {os.path.realpath(entry) for entry in entries if _head_ref(entry) == ref}
+        if not holders:
             log.warning(
-                "left a path no linked worktree registers during fetch repair",
+                "left a path no linked worktree on the bad ref registers during fetch repair",
                 extra={"repo_dir": str(repo_dir), "worktree": target},
             )
             continue
+        own = _checkout_registration(target)
+        locked = any(os.path.lexists(os.path.join(entry, "locked")) for entry in entries)
         try:
-            mode: int | None = os.lstat(target).st_mode
-        except FileNotFoundError:
-            mode = None
-        if mode is not None:
-            if any(os.path.lexists(os.path.join(entry, "locked")) for entry in entries):
+            if own in holders and not locked:
+                shutil.rmtree(target)
+            if not os.path.lexists(target):
+                _drop_worktree_registration(Path(target), repo_dir, under=True)
                 log.warning(
-                    "kept a locked worktree during fetch repair",
+                    "removed worktree during fetch repair",
                     extra={"repo_dir": str(repo_dir), "worktree": target},
                 )
                 continue
-            try:
-                if stat.S_ISDIR(mode):
-                    shutil.rmtree(target)
-                else:
-                    os.unlink(target)
-            except OSError as exc:
-                failed.append(f"{target}: {exc}")
-                continue
-        try:
-            _drop_worktree_registration(Path(target), repo_dir)
+            for holder in holders - {own}:
+                if not os.path.lexists(os.path.join(holder, "locked")):
+                    shutil.rmtree(holder)
         except GitCommandError as exc:
             failed.append(exc.stderr)
             continue
+        except OSError as exc:
+            failed.append(f"{target}: {exc}")
+            continue
         log.warning(
-            "removed worktree during fetch repair",
+            "left a path that is no unlocked holding registration's checkout during fetch repair",
             extra={"repo_dir": str(repo_dir), "worktree": target},
         )
     if failed:
@@ -639,7 +671,7 @@ def _delete_bad_refs(repo_dir: Path, output: str) -> bool:
     for ref in bad_refs:
         worktrees = holding.get(ref) or []
         if worktrees:
-            _remove_worktrees(repo_dir, worktrees)
+            _remove_worktrees(repo_dir, worktrees, ref)
             changed = True
         proc = _run_git(["update-ref", "-d", ref], cwd=repo_dir, token=None)
         if proc.returncode == 0:
