@@ -278,6 +278,38 @@ interface InheritedThinkingLevel {
 	level: ConfiguredThinkingLevel | undefined;
 }
 
+/** The options of one fallback walk after a failed request. */
+interface RetryModelFallbackOptions {
+	excludeProvider?: string;
+	pinFallback?: boolean;
+	preserveFailedTurn?: boolean;
+	wrapAround?: boolean;
+	/** This hop is a classifier-refusal walk, which visits each model at most once per turn. */
+	refusalWalk?: boolean;
+	/** The retry policy retries the failed model if this hop does not switch. */
+	sameModelRetryAvailable?: boolean;
+}
+
+/** What the fallback walk hands over when it reaches a fallback whose usage is spent. */
+interface SpentRetryFallback {
+	/** The model the spent fallback's selector resolves to. */
+	candidate: Model;
+	/** The spent fallback's selector in the walk's chain. */
+	selector: RetryFallbackSelector;
+	/** The walk's chain key the spent fallback was found under. */
+	role: string;
+	/** The selector of the model the request failed on. */
+	currentSelector: string;
+	failedMessage: AssistantMessage;
+	options: RetryModelFallbackOptions | undefined;
+	/** The candidates the refusal-credit hold passed over, in chain order. */
+	heldEntries: readonly RetryFallbackEntry[];
+	/** True once the walk is stale; a stale search ends the walk with no switch. */
+	usageReadStale: () => boolean;
+	/** Runs a read under the walk's abort controller, which `abortRetry()` stops. */
+	withUsageReadSignal: <T>(read: (signal: AbortSignal) => Promise<T>) => Promise<T>;
+}
+
 /** Result shape shared with automatic maintenance recovery. */
 export interface RecoveryCompactionResult {
 	continuationScheduled: boolean;
@@ -2404,16 +2436,7 @@ export class TurnRecovery {
 	async #tryRetryModelFallback(
 		currentSelector: string,
 		failedMessage: AssistantMessage,
-		options?: {
-			excludeProvider?: string;
-			pinFallback?: boolean;
-			preserveFailedTurn?: boolean;
-			wrapAround?: boolean;
-			/** This hop is a classifier-refusal walk, which visits each model at most once per turn. */
-			refusalWalk?: boolean;
-			/** The retry policy retries the failed model if this hop does not switch. */
-			sameModelRetryAvailable?: boolean;
-		},
+		options?: RetryModelFallbackOptions,
 	): Promise<boolean> {
 		const ceiling = this.#host.thinkingLevelCeiling();
 		const latestAssistant = options?.preserveFailedTurn
@@ -2482,8 +2505,8 @@ export class TurnRecovery {
 				if (!candidate) continue;
 				// A candidate that would leave the request exactly as it is — same
 				// routed model, same effective thinking level — is not a switch, and
-				// must never be applied: `findRetryFallbackCandidates` excludes the
-				// current model by selector STRING, while what gets applied is what
+				// must never be applied as one: `findRetryFallbackCandidates` excludes
+				// the current model by selector STRING, while what gets applied is what
 				// `resolveModelOverride` resolves that string to, clamped. When those
 				// disagree, the swap "succeeds" onto the failing request, the caller
 				// sets `switchedModel`, and the retry budget is reset to 1 on every
@@ -2571,70 +2594,17 @@ export class TurnRecovery {
 					);
 					if (candidateUsage === "stale") return false;
 					if (candidateUsage && isUsageSpent(candidateUsage)) {
-						// The walk switches instead to what the check before a model call
-						// would pick after a switch here. That check reads the spent model
-						// as depleted, which ends a reserve approval, and searches from the
-						// model's selector at the thinking level the switch would set, in
-						// the chain the switch would pin and then the model's own chain. It
-						// skips depleted and reserve candidates, passes over a key read
-						// that throws, and holds nothing back for a refusal credit. The
-						// context it fits is the retry's.
-						this.#usageReserveApproval = undefined;
-						const requestedThinkingLevel = selector.thinkingLevel ?? this.#host.configuredThinkingLevel();
-						// The configured level the switch onto the spent model would leave:
-						// a route found from it takes this level when its selector names none.
-						const spentThinkingLevel = this.#configuredLevelAfterSwitch(candidate, requestedThinkingLevel);
-						const spentSelector = formatRetryFallbackSelector(
+						return this.#switchFromSpentFallback({
 							candidate,
-							spentThinkingLevel === AUTO_THINKING
-								? clampThinkingLevelToCeiling(candidate, resolveProvisionalAutoLevel(candidate), ceiling)
-								: spentThinkingLevel,
-						);
-						const spentRoles = this.retryFallbackChainKeys(spentSelector, candidate, {
-							pinnedRole: this.#activeRetryFallback?.role ?? role,
-						});
-						// When that search finds nothing, a live refusal credit counts as
-						// absent: the candidates its hold passed over are searched the same
-						// way, in chain order. When neither finds one, the walk switches to
-						// no model, as when no candidate passes.
-						for (const entries of [
-							this.#retryFallbackEntries(spentRoles, spentSelector, candidate),
+							selector,
+							role,
+							currentSelector,
+							failedMessage,
+							options,
 							heldEntries,
-						]) {
-							if (usageReadStale()) return false;
-							const found = await withUsageReadSignal(signal =>
-								this.#searchKeyedRetryFallback(
-									entries,
-									usageReadStale,
-									options?.preserveFailedTurn ? undefined : failedMessage,
-									signal,
-								),
-							);
-							if (!found) continue;
-							// A route found from the spent model requests, when its selector names
-							// no level, the level the switch onto the spent model would leave, as
-							// the check's switch from that model did; a held candidate keeps the
-							// failed model's level. A route that is the model in use, at the level
-							// the switch would set, makes no switch; the walk still answers true,
-							// so the retry goes on as after a switch.
-							const inheritedThinkingLevel = entries === heldEntries ? undefined : { level: spentThinkingLevel };
-							if (this.#isNoOpRetryFallback(found.model, found.selector, inheritedThinkingLevel)) return true;
-							// Like the check before a model call, this switch is pinned, so
-							// `cooldown-expiry` does not bring the primary back after it, and
-							// sets no credit redemption. A route found from the spent model, with
-							// no fallback active yet, records the walk's role, as the base's switch
-							// onto the spent model did before that check ran; a held candidate
-							// keeps its own walk role.
-							const appliedRole = entries === heldEntries || this.#activeRetryFallback ? found.role : role;
-							return this.applyRetryFallbackCandidate(appliedRole, found.selector, currentSelector, {
-								...options,
-								pinFallback: true,
-								apiKey: found.apiKey,
-								inheritedThinkingLevel,
-								reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
-							});
-						}
-						return false;
+							usageReadStale,
+							withUsageReadSignal,
+						});
 					}
 				}
 				const previousEditMode = this.#host.resolveActiveEditMode();
@@ -2669,6 +2639,120 @@ export class TurnRecovery {
 			}
 		}
 
+		return false;
+	}
+
+	/**
+	 * The fallback walk's answer at `candidate`, a fallback whose usage is
+	 * spent: it sends that model no request and switches instead to what the
+	 * check before a model call would pick after a switch onto it. That check
+	 * reads the spent model as depleted, which ends a reserve approval, and
+	 * searches from the model's selector at the thinking level the switch would
+	 * set, in the chain the switch would pin and then the model's own chain. It
+	 * skips depleted and reserve candidates, passes over a key read that throws,
+	 * and holds nothing back for a refusal credit. The context it fits is the
+	 * retry's. One rule differs: under `retry.usageReservePolicy: "fail-closed"`
+	 * that check picks nothing for a depleted model (it throws), while the walk
+	 * still switches to what the search finds, under every reserve policy.
+	 *
+	 * When that search finds nothing, a live refusal credit counts as absent:
+	 * the candidates its hold passed over are searched the same way, in chain
+	 * order. When neither finds one, the walk switches to no model, as when no
+	 * candidate passes.
+	 */
+	async #switchFromSpentFallback({
+		candidate,
+		selector,
+		role,
+		currentSelector,
+		failedMessage,
+		options,
+		heldEntries,
+		usageReadStale,
+		withUsageReadSignal,
+	}: SpentRetryFallback): Promise<boolean> {
+		this.#usageReserveApproval = undefined;
+		const ceiling = this.#host.thinkingLevelCeiling();
+		const requestedThinkingLevel = selector.thinkingLevel ?? this.#host.configuredThinkingLevel();
+		// The configured level the switch onto the spent model would leave:
+		// a route found from it takes this level when its selector names none.
+		const spentThinkingLevel = this.#configuredLevelAfterSwitch(candidate, requestedThinkingLevel);
+		const spentSelector = formatRetryFallbackSelector(
+			candidate,
+			spentThinkingLevel === AUTO_THINKING
+				? clampThinkingLevelToCeiling(candidate, resolveProvisionalAutoLevel(candidate), ceiling)
+				: spentThinkingLevel,
+		);
+		const spentRoles = this.retryFallbackChainKeys(spentSelector, candidate, {
+			pinnedRole: this.#activeRetryFallback?.role ?? role,
+		});
+		// The searches fit the retry's context: the failed turn counts only when the retry keeps it.
+		const excludedMessage = options?.preserveFailedTurn ? undefined : failedMessage;
+
+		// First, a route found from the spent model.
+		if (usageReadStale()) return false;
+		const route = await withUsageReadSignal(signal =>
+			this.#searchKeyedRetryFallback(
+				this.#retryFallbackEntries(spentRoles, spentSelector, candidate),
+				usageReadStale,
+				excludedMessage,
+				signal,
+			),
+		);
+		if (route) {
+			const inheritedThinkingLevel = { level: spentThinkingLevel };
+			if (this.#isNoOpRetryFallback(route.model, route.selector, inheritedThinkingLevel)) {
+				// A route that is the model in use, at the level the switch would set,
+				// makes no switch. The walk still answers true, so the retry goes on as
+				// after a switch, and it pins the active fallback's record, as the
+				// switch onto the spent model and the check's switch back would pin it;
+				// with no record, the model in use is no fallback and none is made. A
+				// true answer resets a spent retry budget, and this one is bounded: in a
+				// refusal walk, `#refusalWalkTried` ends the next refusal on the model
+				// in use, and for any other failure the caller put the model in use in
+				// cooldown (`noteRetryFallbackCooldown`), so the search skips it
+				// (`isRetryFallbackSelectorSuppressed`).
+				if (this.#activeRetryFallback) this.#activeRetryFallback.pinned = true;
+				return true;
+			}
+			// Like the check before a model call, this switch is pinned, so
+			// `cooldown-expiry` does not bring the primary back after it, and sets
+			// no credit redemption. It records the walk's role when no fallback is
+			// active yet, as a switch onto the spent model would.
+			return this.applyRetryFallbackCandidate(
+				this.#activeRetryFallback ? route.role : role,
+				route.selector,
+				currentSelector,
+				{
+					...options,
+					pinFallback: true,
+					apiKey: route.apiKey,
+					inheritedThinkingLevel,
+					reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
+				},
+			);
+		}
+
+		// Then the candidates the credit hold passed over. A held candidate keeps
+		// the session's level and its own walk role.
+		if (usageReadStale()) return false;
+		const held = await withUsageReadSignal(signal =>
+			this.#searchKeyedRetryFallback(heldEntries, usageReadStale, excludedMessage, signal),
+		);
+		if (held) {
+			if (this.#isNoOpRetryFallback(held.model, held.selector)) {
+				// No switch, as for a route above, with the same pin and bound.
+				if (this.#activeRetryFallback) this.#activeRetryFallback.pinned = true;
+				return true;
+			}
+			// Pinned, with no credit redemption, as for a route above.
+			return this.applyRetryFallbackCandidate(held.role, held.selector, currentSelector, {
+				...options,
+				pinFallback: true,
+				apiKey: held.apiKey,
+				reason: `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`,
+			});
+		}
 		return false;
 	}
 

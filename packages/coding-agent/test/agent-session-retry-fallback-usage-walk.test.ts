@@ -290,9 +290,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("pins the fallback after a spent one, so the primary is not restored when its cooldown ends", async () => {
-			// The base switched onto the spent model, and the check before the next
-			// model call then switched to the fallback after it and pinned it.
-			// `cooldown-expiry` restores only an unpinned fallback's primary.
+			// The walk's switch from the spent model to the fallback after it is
+			// pinned, like the switch the check before a model call makes from a
+			// depleted model. `cooldown-expiry` restores only an unpinned fallback's
+			// primary.
 			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
@@ -321,9 +322,9 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("answers on the fallback after a spent one at the level the spent fallback's selector names", async () => {
-			// The base switched onto the spent model at the level its selector
-			// names, and the check before the next model call then switched to the
-			// fallback after it, which names no level, so it carried that level.
+			// The fallback after the spent one names no level, so it takes the level
+			// the switch onto the spent fallback would set: low, which that
+			// fallback's selector names.
 			stubUsageReads({ [formatModelString(CODEX_FALLBACK)]: depletedRead("usage") });
 			const requests: string[] = [];
 			const mock = createMockModel();
@@ -363,8 +364,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("searches the chain the switch would pin before the spent fallback's own chain", async () => {
-			// The base switched onto the spent model, and the check before the next
-			// model call searched the chain that switch pinned, then the model's own.
+			// The search from the spent model reads the chain a switch onto it would
+			// pin, then the model's own chain.
 			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
@@ -386,10 +387,9 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("keeps the walk's chain after a switch that the spent fallback's own chain names, for a later failure", async () => {
-			// The base's switch onto the spent model recorded the walk's chain, and
-			// the check before the next call kept it when it switched on from the
-			// spent model's own chain. A later failure walks from that chain: back to
-			// the primary first, then on.
+			// A switch to a model that only the spent model's own chain names records
+			// the walk's chain when no fallback is active yet, so a later failure
+			// walks from that chain: back to the primary first, then on.
 			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			let failNextFallback = false;
@@ -584,10 +584,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("asks again about the primary's reserve after a walk passed over a spent fallback", async () => {
-			// The user keeps the primary at the reserve once. The base then switched
-			// onto the spent fallback, and the check before the next model call read
-			// it as depleted, which ended that approval, so the reserve is asked
-			// about again once the session is back on the primary.
+			// The user keeps the primary at the reserve once. A walk that passes over
+			// a spent fallback ends that approval, as the check before a model call
+			// does when it reads a depleted model, so the reserve is asked about
+			// again once the session is back on the primary.
 			stubUsageReads({
 				[formatModelString(PRIMARY)]: {
 					state: "reserve",
@@ -642,10 +642,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("switches to the fallback after a spent one whose window holds the retry only without the failed turn", async () => {
-			// The base switched onto the spent fallback, and the retry dropped the
-			// failed turn before the check before the next model call fit the
-			// fallback after it. Here the failed turn's thinking alone overflows that
-			// fallback's window, and the rest of the request fits it.
+			// The search from the spent fallback fits the fallback after it to the
+			// retry's context, which drops the failed turn. Here the failed turn's
+			// thinking alone overflows that fallback's window, and the rest of the
+			// request fits it.
 			const sharedRegistry = modelRegistry;
 			const modelsConfigPath = path.join(tempDir.path(), "models-small-gpt-4o-mini.yml");
 			await Bun.write(
@@ -1207,11 +1207,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
-		it("reads no credit target's key for the credit when no target is spent", async () => {
-			// With no credit target spent, the key reads of the credit targets are
-			// the walk's own, as at the base: its key read of Opus 4.8 and the
-			// switch onto it. Opus 5, which the walk never reaches, has no key
-			// read.
+		it("reads no key of a credit target the walk does not reach", async () => {
+			// The walk switches to Opus 4.8, the first credit target, whose usage is
+			// not spent, so it never reaches Opus 5 and reads no key of it. The key
+			// reads of Opus 4.8 show that the spy records.
 			const creditTargetKeyReads: string[] = [];
 			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
 			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
@@ -1223,7 +1222,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			});
 			const { run, requestedModels } = await runCreditRefusal(chainOf(CREDIT_TARGET, NEXT_CREDIT_TARGET), {});
 
-			expect(creditTargetKeyReads).toEqual([formatModelString(CREDIT_TARGET), formatModelString(CREDIT_TARGET)]);
+			expect(creditTargetKeyReads).toContain(formatModelString(CREDIT_TARGET));
+			expect(creditTargetKeyReads).not.toContain(formatModelString(NEXT_CREDIT_TARGET));
 			expect(requestedModels).toEqual([
 				formatModelString(FABLE),
 				formatModelString(FABLE),
@@ -1364,10 +1364,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("answers on Fable with no switch when the spent target's own chain names Fable", async () => {
-			// The base switched onto the spent target, and the check before the next
-			// model call switched back to Fable, which the target's own chain names.
-			// The walk sends no request to the target, and Fable is already the model
-			// in use at the level that switch would set, so the walk makes no switch.
+			// The search from the spent target finds Fable, which the target's own
+			// chain names. The walk sends no request to the target, and Fable is
+			// already the model in use at the level a switch to it would set, so the
+			// walk makes no switch.
 			const { run, requestedModels } = await runCreditRefusal(
 				{
 					default: [formatModelString(CREDIT_TARGET)],
@@ -1382,6 +1382,68 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				formatModelString(FABLE),
 			]);
 			expect(run.fallbacks).toEqual([]);
+			expect(modelOf(run.session)).toBe(formatModelString(FABLE));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		it("pins the fallback in use when the step past a spent target makes no switch, so the primary is not restored when its cooldown ends", async () => {
+			// An account-policy denial on the primary switches to Fable, unpinned.
+			// Fable then refuses with a live credit, and the walk reaches the spent
+			// target, whose own chain names Fable, so it makes no switch. A switch
+			// onto the target and the switch back to Fable would each pin the
+			// fallback in use, so the step that makes neither pins it too.
+			// `cooldown-expiry` restores only an unpinned fallback's primary, and the
+			// primary fails each time.
+			let now = Date.now();
+			vi.spyOn(Date, "now").mockImplementation(() => now);
+			stubUsageReads({ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") });
+			const requestedModels: string[] = [];
+			const primaryMock = createMockModel();
+			// Stamped with Fable's identity, so the retry policy reads the refusal as Fable's.
+			const fableMock = createMockModel({
+				provider: FABLE.provider,
+				id: FABLE.id,
+				responses: [{ content: ["answered"] }, refusalWithCredit()],
+				handler: { content: ["answered"] },
+			});
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: PRIMARY, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requestedModels.push(formatModelString(model));
+					if (model.provider === PRIMARY.provider && model.id === PRIMARY.id) {
+						primaryMock.push(ACCOUNT_POLICY_DENIAL);
+						return primaryMock.stream(model, context, options);
+					}
+					return fableMock.stream(model, context, options);
+				},
+			});
+			const run = startSession(
+				agent,
+				walkSettings(PRIMARY, {
+					"retry.fallbackChains": {
+						default: [formatModelString(FABLE), formatModelString(CREDIT_TARGET)],
+						[formatModelString(CREDIT_TARGET)]: [formatModelString(FABLE)],
+					},
+					"retry.fallbackRevertPolicy": "cooldown-expiry",
+				}),
+			);
+
+			await runTurn(run.session, "Fail on the primary");
+			await runTurn(run.session, "Recover from the refusal");
+			// Past every fallback cooldown (30 minutes at most), so only the pin keeps
+			// the session on Fable.
+			now += 60 * 60 * 1000;
+			await runTurn(run.session, "Stay on Fable after the cooldown");
+
+			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(FABLE)]);
 			expect(modelOf(run.session)).toBe(formatModelString(FABLE));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
