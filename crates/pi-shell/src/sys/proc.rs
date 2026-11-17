@@ -52,8 +52,30 @@ pub enum ProcState {
 }
 
 /// Every process visible to the caller.
+///
+/// Fails, rather than leave a process out, when one could not be read for a
+/// reason that can hide one of the caller's own: no descriptor or memory
+/// left, an I/O error, a `stat` line that does not parse. A scan that leaves
+/// out a running process reports it gone (a leak check finds no leftover).
+/// A process that exited meanwhile (`ENOENT`, `ESRCH`) is left out, and so,
+/// deliberately, is one the system will not show the caller (`EACCES`,
+/// `EPERM`: another user's, under `hidepid`), which is never the caller's.
 pub fn list() -> io::Result<Vec<ProcInfo>> {
-	sys::list()
+	let (procs, complete) = scan();
+	complete.map(|()| procs)
+}
+
+/// The processes [`list`] could read, and `Err` with the first failure that
+/// can have left out one of the caller's own (see [`list`]). A kill uses
+/// it: it signals what it read, and reports the failure after.
+pub fn scan() -> (Vec<ProcInfo>, io::Result<()>) {
+	sys::scan()
+}
+
+/// Whether a failure to read a process proves only that the process
+/// exited, or that it is another user's (see [`list`]).
+fn gone_or_foreign(error: &io::Error) -> bool {
+	matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH | libc::EACCES | libc::EPERM))
 }
 
 /// The process `pid`, if it exists.
@@ -79,6 +101,16 @@ pub fn exists(pid: i32) -> bool {
 /// proves nothing.
 pub fn ended(pid: i32) -> bool {
 	info(pid).map_or_else(|| !exists(pid), |p| p.state == ProcState::Zombie)
+}
+
+/// Whether `pid` is running: its [`info`] was read, and it is no zombie (a
+/// stopped process counts).
+///
+/// The positive evidence a check that a process is still alive needs: a
+/// process that cannot be read is not running here, as it has not
+/// [`ended`] there, since a failed read proves nothing.
+pub fn running(pid: i32) -> bool {
+	info(pid).is_some_and(|p| p.state != ProcState::Zombie)
 }
 
 /// The current instant in [`ProcInfo::start`] units: every process that
@@ -113,29 +145,49 @@ fn members(pred: impl Fn(&ProcInfo) -> bool) -> io::Result<Vec<ProcInfo>> {
 
 /// Signal every member of session `sid` (identity-pinned, zombies skipped);
 /// returns the members signalled.
+///
+/// When the scan could not read every process ([`scan`]), the members it
+/// read are signalled, then its error is returned.
 pub fn kill_session(sid: i32, sig: Signal) -> io::Result<Vec<ProcInfo>> {
-	signal_all(session_members(sid)?, sig)
+	kill_members(|p| p.sid == sid, sig)
 }
 
-/// Signal every member of process group `pgid` (identity-pinned, zombies
-/// skipped); returns the members signalled.
+/// Signal every member of process group `pgid`, as [`kill_session`] does.
 pub fn kill_group(pgid: i32, sig: Signal) -> io::Result<Vec<ProcInfo>> {
-	signal_all(group_members(pgid)?, sig)
+	kill_members(|p| p.pgid == pgid, sig)
 }
 
-fn signal_all(mut procs: Vec<ProcInfo>, sig: Signal) -> io::Result<Vec<ProcInfo>> {
+fn kill_members(pred: impl Fn(&ProcInfo) -> bool, sig: Signal) -> io::Result<Vec<ProcInfo>> {
+	let me = std::process::id() as i32;
+	let (mut all, complete) = scan();
+	all.retain(|p| p.pid != me && pred(p));
+	let (sent, signalled) = signal_all(all, sig);
+	complete.and(signalled).map(|()| sent)
+}
+
+/// Signals every one of `procs` that is not a zombie, and returns those it
+/// signalled with the first failure, if any: one process that cannot be
+/// signalled does not keep the rest from being signalled.
+fn signal_all(mut procs: Vec<ProcInfo>, sig: Signal) -> (Vec<ProcInfo>, io::Result<()>) {
 	procs.retain(|p| p.state != ProcState::Zombie);
 	let mut sent = Vec::with_capacity(procs.len());
+	let mut outcome = Ok(());
 	for p in procs {
-		if signal_pinned(&p, sig)? {
-			sent.push(p);
+		match signal_pinned(&p, sig) {
+			Ok(true) => sent.push(p),
+			Ok(false) => {},
+			Err(error) => outcome = outcome.and(Err(error)),
 		}
 	}
-	Ok(sent)
+	(sent, outcome)
 }
 
 /// Send `sig` to `p` if the pid still names the process that was scanned.
-/// `Ok(false)` when it has exited or the pid now names another process.
+///
+/// `Ok(false)` when it has exited, the pid now names another process, or the
+/// process is another user's; an error when the process cannot be read for
+/// any other reason (no descriptor left), since then nothing shows which
+/// process the pid names.
 pub fn signal_pinned(p: &ProcInfo, sig: Signal) -> io::Result<bool> {
 	sys::signal_pinned(p, i32::from(sig.number(Platform::current())))
 }
@@ -197,12 +249,23 @@ mod sys {
 		os::fd::{AsRawFd, FromRawFd, OwnedFd},
 	};
 
-	use super::{ProcInfo, parse_stat};
+	use super::{ProcInfo, gone_or_foreign, parse_stat};
 
-	pub fn list() -> io::Result<Vec<ProcInfo>> {
+	pub fn scan() -> (Vec<ProcInfo>, io::Result<()>) {
 		let mut out = Vec::new();
-		for entry in fs::read_dir("/proc")? {
-			let Ok(entry) = entry else { continue };
+		let entries = match fs::read_dir("/proc") {
+			Ok(entries) => entries,
+			Err(error) => return (out, Err(error)),
+		};
+		let mut complete = Ok(());
+		for entry in entries {
+			let entry = match entry {
+				Ok(entry) => entry,
+				Err(error) => {
+					complete = complete.and(Err(error));
+					continue;
+				},
+			};
 			let Some(pid) = entry
 				.file_name()
 				.to_str()
@@ -210,27 +273,37 @@ mod sys {
 			else {
 				continue;
 			};
-			// The process may exit between readdir and the read.
-			if let Some(p) = info(pid) {
-				out.push(p);
+			match read(pid) {
+				Ok(p) => out.push(p),
+				// It exited between readdir and the read, or is another user's.
+				Err(error) if gone_or_foreign(&error) => {},
+				Err(error) => complete = complete.and(Err(error)),
 			}
 		}
-		Ok(out)
+		(out, complete)
 	}
 
 	pub fn info(pid: i32) -> Option<ProcInfo> {
-		let mut file = fs::File::open(format!("/proc/{pid}/stat")).ok()?;
+		read(pid).ok()
+	}
+
+	/// `/proc/<pid>/stat`, parsed; `InvalidData` for a line that does not
+	/// parse.
+	fn read(pid: i32) -> io::Result<ProcInfo> {
+		let mut file = fs::File::open(format!("/proc/{pid}/stat"))?;
 		// The kernel hands over the whole line in one read when it fits (52
 		// numbers and a name of at most 64 bytes do); `fs::read` grows from
 		// 32 bytes a read at a time (a spawn reads its child's).
 		let mut buf = [0; 1024];
-		let n = file.read(&mut buf).ok()?;
-		if n < buf.len() {
-			return parse_stat(pid, &buf[..n]);
-		}
-		let mut line = buf.to_vec();
-		file.read_to_end(&mut line).ok()?;
-		parse_stat(pid, &line)
+		let n = file.read(&mut buf)?;
+		let parsed = if n < buf.len() {
+			parse_stat(pid, &buf[..n])
+		} else {
+			let mut line = buf.to_vec();
+			file.read_to_end(&mut line)?;
+			parse_stat(pid, &line)
+		};
+		parsed.ok_or_else(|| io::ErrorKind::InvalidData.into())
 	}
 
 	pub fn now() -> io::Result<u64> {
@@ -265,9 +338,14 @@ mod sys {
 			Err(e) => return Err(e),
 		};
 		// With the pidfd open the pid cannot be reused for another process
-		// while we check that it still names the scanned one.
-		if info(p.pid).is_none_or(|now| now.start != p.start) {
-			return Ok(false);
+		// while we check that it still names the scanned one. A read that
+		// fails for another reason than the process being gone or another
+		// user's proves nothing either way, so it is the caller's error.
+		match read(p.pid) {
+			Ok(now) if now.start == p.start => {},
+			Ok(_) => return Ok(false),
+			Err(error) if gone_or_foreign(&error) => return Ok(false),
+			Err(error) => return Err(error),
 		}
 		let rc = match &pidfd {
 			// SAFETY: the pidfd is open for the call; a null siginfo makes the
@@ -302,9 +380,27 @@ mod sys {
 
 	use bstr::BString;
 
-	use super::{ProcInfo, ProcState};
+	use super::{ProcInfo, ProcState, gone_or_foreign};
 
-	pub fn list() -> io::Result<Vec<ProcInfo>> {
+	pub fn scan() -> (Vec<ProcInfo>, io::Result<()>) {
+		let pids = match all_pids() {
+			Ok(pids) => pids,
+			Err(error) => return (Vec::new(), Err(error)),
+		};
+		let mut out = Vec::with_capacity(pids.len());
+		let mut complete = Ok(());
+		for pid in pids.into_iter().filter(|&pid| pid > 0) {
+			match read(pid) {
+				Ok(p) => out.push(p),
+				// It exited since the listing, or is not ours to read.
+				Err(error) if gone_or_foreign(&error) => {},
+				Err(error) => complete = complete.and(Err(error)),
+			}
+		}
+		(out, complete)
+	}
+
+	fn all_pids() -> io::Result<Vec<i32>> {
 		// SAFETY: a null buffer with size 0 is libproc's sizing query.
 		let reported = unsafe { libc::proc_listallpids(ptr::null_mut(), 0) };
 		if reported <= 0 {
@@ -322,21 +418,25 @@ mod sys {
 			return Err(io::Error::last_os_error());
 		}
 		pids.truncate((n as usize).min(capacity));
-		Ok(pids
-			.into_iter()
-			.filter(|&pid| pid > 0)
-			.filter_map(info)
-			.collect())
+		Ok(pids)
 	}
 
-	fn bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
+	/// `PROC_PIDTBSDINFO` of `pid`. libproc's `proc_pidinfo` returns 0 and
+	/// sets `errno` when the call fails; a short answer is `InvalidData`.
+	fn bsdinfo(pid: i32) -> io::Result<libc::proc_bsdinfo> {
 		// SAFETY: proc_bsdinfo is plain C integers and arrays, valid zeroed.
 		let mut bi: libc::proc_bsdinfo = unsafe { mem::zeroed() };
 		let size = mem::size_of::<libc::proc_bsdinfo>() as i32;
 		// SAFETY: `bi` is writable for `size` bytes; arg 1 includes zombies.
 		let got =
 			unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 1, (&raw mut bi).cast(), size) };
-		(got >= size).then_some(bi)
+		if got <= 0 {
+			return Err(io::Error::last_os_error());
+		}
+		if got < size {
+			return Err(io::ErrorKind::InvalidData.into());
+		}
+		Ok(bi)
 	}
 
 	fn c_name(raw: &[libc::c_char]) -> &[u8] {
@@ -346,6 +446,10 @@ mod sys {
 	}
 
 	pub fn info(pid: i32) -> Option<ProcInfo> {
+		read(pid).ok()
+	}
+
+	fn read(pid: i32) -> io::Result<ProcInfo> {
 		let bi = bsdinfo(pid)?;
 		// SAFETY: plain syscall without pointer arguments.
 		let sid = unsafe { libc::getsid(pid) };
@@ -362,7 +466,7 @@ mod sys {
 			5 => ProcState::Zombie,   // SZOMB
 			_ => ProcState::Other,
 		};
-		Some(ProcInfo {
+		Ok(ProcInfo {
 			pid,
 			ppid: bi.pbi_ppid as i32,
 			pgid: bi.pbi_pgid as i32,
@@ -384,8 +488,11 @@ mod sys {
 	}
 
 	pub fn signal_pinned(p: &ProcInfo, sig: i32) -> io::Result<bool> {
-		if info(p.pid).is_none_or(|now| now.start != p.start) {
-			return Ok(false);
+		match read(p.pid) {
+			Ok(now) if now.start == p.start => {},
+			Ok(_) => return Ok(false),
+			Err(error) if gone_or_foreign(&error) => return Ok(false),
+			Err(error) => return Err(error),
 		}
 		// SAFETY: plain syscall without pointer arguments.
 		if unsafe { libc::kill(p.pid, sig) } == 0 {
@@ -498,11 +605,6 @@ mod tests {
 		assert!(!exists(pid) && ended(pid), "the reaped sleep {pid} still exists");
 	}
 
-	/// The variable naming the process [`ended_with_no_descriptor_left`]
-	/// judges.
-	#[cfg(target_os = "linux")]
-	const ENDED_PROBE_PID: &str = "PI_SHELL_TEST_ENDED_PROBE_PID";
-
 	/// [`ended`] does not count a running process it cannot read as ended: a
 	/// failed read of `/proc` is no proof the process ended. The check runs
 	/// in a child test process, whose descriptor limit it lowers so that no
@@ -514,44 +616,223 @@ mod tests {
 			.arg("30")
 			.spawn()
 			.unwrap();
-		let probe = std::process::Command::new(std::env::current_exe().unwrap())
-			.args([
-				"--exact",
-				"sys::proc::tests::ended_with_no_descriptor_left",
-				"--ignored",
-				"--nocapture",
-				"--test-threads=1",
-			])
-			.env(ENDED_PROBE_PID, child.id().to_string())
-			.output()
-			.unwrap();
+		let probed =
+			short_of_descriptors::run("sys::proc::tests::ended_with_no_descriptor_left", child.id());
 		let _ = child.kill();
 		child.wait().unwrap();
-		let out = String::from_utf8_lossy(&probe.stdout);
-		let err = String::from_utf8_lossy(&probe.stderr);
-		assert!(probe.status.success(), "{out}{err}");
-		assert!(out.contains("1 passed"), "the probe did not run: {out}{err}");
+		probed.unwrap();
 	}
 
 	/// Run by [`ended_does_not_count_a_process_it_cannot_read`] in a child
 	/// process: with no descriptor left to open `/proc/<pid>/stat`, the
-	/// running process named by [`ENDED_PROBE_PID`] must not count as ended.
+	/// running process it names must not count as ended.
 	#[cfg(target_os = "linux")]
 	#[test]
 	#[ignore = "run in a child process by ended_does_not_count_a_process_it_cannot_read"]
 	fn ended_with_no_descriptor_left() {
-		let pid: i32 = std::env::var(ENDED_PROBE_PID)
-			.expect("the pid to judge")
-			.parse()
-			.unwrap();
-		let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-		// SAFETY: `limit` is writable for the call.
-		assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) }, 0);
-		limit.rlim_cur = 0;
-		// SAFETY: `limit` is readable for the call; this process only.
-		assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) }, 0);
+		let Some(pid) = short_of_descriptors::pid() else {
+			return;
+		};
+		short_of_descriptors::leave_none();
 		assert!(info(pid).is_none(), "/proc/{pid}/stat could still be read");
 		assert!(exists(pid), "sleep {pid} is not running");
 		assert!(!ended(pid), "the running sleep {pid} counts as ended when it cannot be read");
+	}
+
+	/// [`running`] needs positive evidence: a running process is, and a
+	/// zombie, a reaped process and (in a child test process with no
+	/// descriptor left) a running process it cannot read are not.
+	#[test]
+	fn running_needs_a_read_that_shows_the_process_running() {
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.unwrap();
+		let pid = child.id() as i32;
+		let was_running = running(pid);
+		#[cfg(target_os = "linux")]
+		let probed =
+			short_of_descriptors::run("sys::proc::tests::running_with_no_descriptor_left", child.id());
+		// SAFETY: plain syscall; the test's own child.
+		unsafe { libc::kill(pid, libc::SIGKILL) };
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while info(pid).is_some_and(|p| p.state != ProcState::Zombie)
+			&& std::time::Instant::now() < deadline
+		{
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		}
+		let zombie_running = running(pid);
+		child.wait().unwrap();
+		#[cfg(target_os = "linux")]
+		probed.unwrap();
+		assert!(was_running, "the running sleep {pid} does not count as running");
+		assert!(!zombie_running, "the zombie {pid} counts as running");
+		assert!(!running(pid), "the reaped sleep {pid} counts as running");
+	}
+
+	/// Run by [`running_needs_a_read_that_shows_the_process_running`] in a
+	/// child process: a running process it cannot read is not running.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by running_needs_a_read_that_shows_the_process_running"]
+	fn running_with_no_descriptor_left() {
+		let Some(pid) = short_of_descriptors::pid() else {
+			return;
+		};
+		short_of_descriptors::leave_none();
+		assert!(info(pid).is_none(), "/proc/{pid}/stat could still be read");
+		assert!(exists(pid), "sleep {pid} is not running");
+		assert!(!running(pid), "the sleep {pid} counts as running with no read to show it");
+	}
+
+	/// A scan of the process table fails, and so do the scans of a group or
+	/// session on it, when it cannot read a process for want of a
+	/// descriptor: leaving the process out would report it gone. The check
+	/// runs in a child test process, with a descriptor for `/proc` and none
+	/// for any `/proc/<pid>/stat`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_scan_fails_when_it_cannot_read_a_process() {
+		use std::os::unix::process::CommandExt as _;
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.process_group(0)
+			.spawn()
+			.unwrap();
+		let probed =
+			short_of_descriptors::run("sys::proc::tests::scan_with_one_descriptor_left", child.id());
+		let _ = child.kill();
+		child.wait().unwrap();
+		probed.unwrap();
+	}
+
+	/// Run by [`a_scan_fails_when_it_cannot_read_a_process`] in a child
+	/// process, for the process group of the process it names. The one
+	/// descriptor left reads the process alone, but a scan holds it for the
+	/// listing of `/proc`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by a_scan_fails_when_it_cannot_read_a_process"]
+	fn scan_with_one_descriptor_left() {
+		let Some(pgid) = short_of_descriptors::pid() else {
+			return;
+		};
+		let found: Vec<i32> = group_members(pgid).unwrap().iter().map(|p| p.pid).collect();
+		assert_eq!(found, [pgid], "the control scan did not find the sleep");
+		short_of_descriptors::leave_one();
+		assert!(info(pgid).is_some(), "/proc/{pgid}/stat cannot be read with a descriptor left");
+		let (read, complete) = scan();
+		let failed = complete.expect_err("the scan reported no failure");
+		assert_eq!(failed.raw_os_error(), Some(libc::EMFILE), "{failed}");
+		assert!(!read.iter().any(|p| p.pid == pgid), "the sleep {pgid} was read after all");
+		assert!(list().is_err(), "list left out what it could not read");
+		assert!(group_members(pgid).is_err(), "group_members left out what it could not read");
+		// SAFETY: plain call without pointer arguments.
+		let sid = unsafe { libc::getsid(0) };
+		assert!(session_members(sid).is_err(), "session_members left out what it could not read");
+		assert!(kill_group(pgid, Signal::Kill).is_err(), "kill_group reported a whole scan");
+		assert!(exists(pgid) && !ended(pgid), "the sleep {pgid} ended");
+	}
+
+	/// A pinned signal to a process it cannot read once its pidfd is open
+	/// fails instead of reporting the process gone, so a KILL sweep does not
+	/// skip a live process in silence. The check runs in a child test
+	/// process, with one descriptor left, which the pidfd takes.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_pinned_signal_fails_when_it_cannot_read_the_process() {
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.unwrap();
+		let probed = short_of_descriptors::run(
+			"sys::proc::tests::pinned_signal_with_one_descriptor_left",
+			child.id(),
+		);
+		let _ = child.kill();
+		child.wait().unwrap();
+		probed.unwrap();
+	}
+
+	/// Run by [`a_pinned_signal_fails_when_it_cannot_read_the_process`] in a
+	/// child process.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by a_pinned_signal_fails_when_it_cannot_read_the_process"]
+	fn pinned_signal_with_one_descriptor_left() {
+		let Some(pid) = short_of_descriptors::pid() else {
+			return;
+		};
+		let scanned = info(pid).expect("the control read of the sleep");
+		short_of_descriptors::leave_one();
+		let sent = signal_pinned(&scanned, Signal::Term);
+		let failed = sent.expect_err("the pinned signal reported the unreadable sleep gone");
+		assert_eq!(failed.raw_os_error(), Some(libc::EMFILE), "{failed}");
+		assert!(running(pid), "the sleep {pid} was signalled");
+	}
+}
+
+/// Test support for checks that need a process short of descriptors: each
+/// runs as an ignored test of this binary in a child process, which lowers
+/// its own descriptor limit.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod short_of_descriptors {
+	/// The variable naming the pid a child test judges.
+	const PID: &str = "PI_SHELL_TEST_PROBE_PID";
+
+	/// Runs the ignored test `test` (its whole path) in a child process of
+	/// this test binary, to judge `pid`: `Err` with the child's output
+	/// unless it ran, and passed. The caller cleans up before it asserts.
+	pub(crate) fn run(test: &str, pid: u32) -> Result<(), String> {
+		let probe = std::process::Command::new(std::env::current_exe().unwrap())
+			.args(["--exact", test, "--ignored", "--nocapture", "--test-threads=1"])
+			.env(PID, pid.to_string())
+			.output()
+			.unwrap();
+		let out = String::from_utf8_lossy(&probe.stdout);
+		let err = String::from_utf8_lossy(&probe.stderr);
+		if !probe.status.success() {
+			return Err(format!("{test} failed: {out}{err}"));
+		}
+		if !out.contains("1 passed") {
+			return Err(format!("{test} did not run: {out}{err}"));
+		}
+		Ok(())
+	}
+
+	/// In the child test, the pid to judge; `None` when no parent test
+	/// started it (`--include-ignored` runs it on its own, with nothing to
+	/// judge).
+	pub(crate) fn pid() -> Option<i32> {
+		std::env::var(PID)
+			.ok()
+			.map(|pid| pid.parse().expect("a pid"))
+	}
+
+	/// No file opens from now on in this process.
+	pub(crate) fn leave_none() {
+		limit(0);
+	}
+
+	/// One more file opens from now on in this process, and no other.
+	pub(crate) fn leave_one() {
+		// SAFETY: duplicates a descriptor of this process and closes the copy:
+		// the lowest free descriptor.
+		let lowest = unsafe {
+			let fd = libc::dup(0);
+			assert!(fd >= 0, "no descriptor to duplicate");
+			libc::close(fd);
+			fd
+		};
+		limit(lowest as u64 + 1);
+	}
+
+	fn limit(files: u64) {
+		let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+		// SAFETY: `limit` is writable for the call.
+		assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) }, 0);
+		limit.rlim_cur = files;
+		// SAFETY: `limit` is readable for the call; this process only.
+		assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) }, 0);
 	}
 }

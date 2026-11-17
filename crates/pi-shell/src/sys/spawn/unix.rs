@@ -1752,39 +1752,54 @@ fn escalate(tracker: &Tracker, scope: Scope, kill_at: Instant) {
 	scope.sweep();
 }
 
-fn leftover_procs(shared: &Shared) -> io::Result<Vec<(Scope, ProcInfo)>> {
+/// The processes left in the recorded scopes, and whether the scan read
+/// every process ([`proc::scan`]): one it could not read may be a leftover.
+fn leftover_procs(shared: &Shared) -> (Vec<(Scope, ProcInfo)>, io::Result<()>) {
 	// Keep process-only scopes unreaped until their identities have been
 	// read: otherwise a recycled pid could appear to be our external.
 	let mut groups = shared.state.groups.lock();
 	let me = std::process::id() as i32;
-	let table = proc::list()?;
+	let (table, complete) = proc::scan();
+	// A scope whose members were not read stays while `alive` says so.
 	groups
 		.list
 		.retain(|s| table.iter().any(|p| s.contains(p)) || s.alive());
 	groups.next_sweep = groups.list.len() + SWEEP;
-	Ok(table
+	let left = table
 		.into_iter()
 		.filter(|p| p.pid != me && p.state != ProcState::Zombie)
 		.filter_map(|p| groups.list.iter().find(|g| g.contains(&p)).map(|g| (*g, p)))
-		.collect())
+		.collect();
+	(left, complete)
 }
 
 fn leftover((s, p): &(Scope, ProcInfo)) -> Leftover {
 	Leftover { pid: p.pid as u32, group: s.id() as u32, name: p.name.clone() }
 }
 
+/// The leftovers; an error when the scan could not read every process,
+/// since an unread one may be left over.
 pub(super) fn leftovers(shared: &Shared) -> io::Result<Vec<Leftover>> {
-	Ok(leftover_procs(shared)?.iter().map(leftover).collect())
+	let (left, complete) = leftover_procs(shared);
+	complete?;
+	Ok(left.iter().map(leftover).collect())
 }
 
+/// Sends KILL to the leftovers the scan read, then reports whether it read
+/// and signalled every process: one that cannot be signalled does not keep
+/// the rest from being killed.
 pub(super) fn kill_leftovers(shared: &Shared) -> io::Result<Vec<Leftover>> {
+	let (left, complete) = leftover_procs(shared);
 	let mut killed = Vec::new();
-	for entry in leftover_procs(shared)? {
-		if proc::signal_pinned(&entry.1, Signal::Kill)? {
-			killed.push(leftover(&entry));
+	let mut signalled = Ok(());
+	for entry in left {
+		match proc::signal_pinned(&entry.1, Signal::Kill) {
+			Ok(true) => killed.push(leftover(&entry)),
+			Ok(false) => {},
+			Err(error) => signalled = signalled.and(Err(error)),
 		}
 	}
-	Ok(killed)
+	complete.and(signalled).map(|()| killed)
 }
 
 #[cfg(test)]

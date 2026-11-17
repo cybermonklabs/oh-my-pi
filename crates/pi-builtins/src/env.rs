@@ -8,6 +8,12 @@
 //! and the environment prints shell-quoted. The command runs through the
 //! shell's own dispatch ([`Host::run_command`]), so builtins run in-process;
 //! its environment changes live only in the worker subshell that runs it.
+//! As the command of `xargs` or `find -exec … +`
+//! ([`Host::too_long_to_caller`]), `env` hands a refusal of its command as
+//! too long up to them, printing nothing for it, so they retry the line in
+//! halves as GNU's retry a line whose `env` the system refused; its
+//! `--debug` trace, written before the command starts, comes again with
+//! each attempt.
 //!
 //! Signal options cannot change the host process's dispositions or mask,
 //! which every other command shares. A command starts with an empty signal
@@ -34,7 +40,9 @@ use uucore::{
 };
 
 use crate::{
-	host::{Host, ShellCommand, Utility, format_usage, os_bytes_lossy, strip_errno},
+	host::{
+		Host, ShellCommand, Utility, command_line_too_long, format_usage, os_bytes_lossy, strip_errno,
+	},
 	locale,
 	quoting_style::quoting_style_by_name,
 };
@@ -512,9 +520,12 @@ impl Run<'_> {
 		let mut command_args = argv[optind..].to_vec();
 		let program = command_args[0].clone();
 		let mut command = ShellCommand::new(command_args.iter().map(|arg| os_string(arg)).collect());
-		if let Some(dir) = &newdir {
-			self.debug_quoted("change dir: ", dir);
-			let resolved = self.change_dir(dir)?;
+		// Where the command runs, for the too-long check below.
+		let mut dir = self.host.cwd().to_path_buf();
+		if let Some(newdir) = &newdir {
+			self.debug_quoted("change dir: ", newdir);
+			let resolved = self.change_dir(newdir)?;
+			dir.clone_from(&resolved);
 			command = command.current_dir(resolved);
 		}
 		if let Some(argv0) = &argv0 {
@@ -538,8 +549,23 @@ impl Run<'_> {
 		if let Ok(stdin) = self.host.stdin.file().to_fd() {
 			command = command.stdin(stdin);
 		}
+		// A caller that retries a refused line (`xargs env …`) hears of a
+		// refusal as too long: GNU's runs `env` as a program, whose own exec
+		// the system refuses, and env has done nothing visible but its
+		// `--debug` trace (written again for each attempt).
+		let hand_up = self.host.too_long_to_caller();
+		if hand_up {
+			command = command.too_long_as_error();
+		}
 		match self.host.run_command(command) {
 			Ok(status) => Ok(status.code()),
+			Err(error)
+				if hand_up
+					&& command_line_too_long(&error, std::path::Path::new(&os_string(&program)), &dir)
+					&& self.host.hand_up_too_long(&error) =>
+			{
+				Err(EXIT_CANNOT_INVOKE)
+			},
 			Err(error) => {
 				let (code, text) = match error.kind() {
 					io::ErrorKind::Interrupted => return Err(EXIT_INTERRUPTED),
@@ -1453,6 +1479,50 @@ mod tests {
 				}
 			}
 			0
+		}
+	}
+
+	/// As the command of a caller that retries a refused line
+	/// (`Invocation::too_long_to_caller`), `env` hands a refusal of its
+	/// command as too long up to it: the error in the slot, nothing printed,
+	/// status 126. Without the caller's ask the refusal is env's own
+	/// diagnostic, and any other refusal is env's either way.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn a_refusal_as_too_long_goes_to_a_caller_that_retries() {
+		use std::{
+			io::{Read, Seek},
+			sync::{
+				Arc,
+				atomic::{AtomicI32, Ordering},
+			},
+		};
+
+		use crate::extras::{Fd, Invocation};
+
+		for (asked, errno, said) in [
+			(true, libc::E2BIG, ""),
+			(true, libc::ENAMETOOLONG, ""),
+			(false, libc::E2BIG, "env: 'prog': Argument list too long\n"),
+			(true, libc::EACCES, "env: 'prog': Permission denied\n"),
+		] {
+			let mut error = tempfile::tempfile().unwrap();
+			let argv = ["env", "-i", "prog", "a"].map(String::from).to_vec();
+			let mut invocation = Invocation::new(argv, std::env::temp_dir(), pi_vfs::Fs::native());
+			invocation.stdio = [Fd::Closed, Fd::Closed, Fd::File(error.try_clone().unwrap())];
+			let (runner, seen) = crate::host::Refusing::new(1, 0, errno);
+			invocation.commands = Some(Box::new(runner));
+			let slot = asked.then(|| Arc::new(AtomicI32::new(0)));
+			invocation.too_long_to_caller = slot.clone();
+			let code = crate::extras::run(invocation).await;
+			let mut text = String::new();
+			error.rewind().unwrap();
+			error.read_to_string(&mut text).unwrap();
+			let handed = slot.map(|slot| slot.load(Ordering::Relaxed));
+			let handed_up = asked && errno != libc::EACCES;
+			assert_eq!((code, text.as_str()), (126, said), "errno {errno}, asked {asked}");
+			assert_eq!(handed, asked.then_some(if handed_up { errno } else { 0 }), "errno {errno}");
+			assert_eq!(seen.lock().tried, [1], "errno {errno}: env ran its command once");
 		}
 	}
 

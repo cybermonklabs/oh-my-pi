@@ -8,6 +8,7 @@ use std::{
 	ffi::{OsStr, OsString},
 	fmt::Display,
 	io::{self, Read, Write},
+	path::Path,
 };
 
 use clap::{Arg, ArgAction, ArgMatches};
@@ -305,6 +306,9 @@ enum CommandExecutionError {
 	CannotRun(io::Error),
 	/// Nothing runs under this command name (GNU: status 127).
 	NotFound(OsString),
+	/// The system refuses a command line as too long even with one input
+	/// argument, or a whole `-I` line (GNU: status 1).
+	ArgumentSize,
 }
 
 impl Display for CommandExecutionError {
@@ -316,6 +320,7 @@ impl Display for CommandExecutionError {
 			},
 			Self::CannotRun(err) => write!(f, "Command could not be run: {err}"),
 			Self::NotFound(name) => write!(f, "{}: No such file or directory", name.to_string_lossy()),
+			Self::ArgumentSize => write!(f, "can't call exec() due to argument size restrictions"),
 		}
 	}
 }
@@ -492,24 +497,28 @@ impl Jobs {
 
 	/// Folds how `batch` ended into the result. A line the system refused as
 	/// too long is queued again as two halves, the first to start first, as
-	/// GNU xargs retries it; one input argument too long on its own is the
-	/// error.
+	/// GNU xargs retries it; one input argument too long on its own (or a
+	/// whole `-I` line) is GNU's error, status 1.
 	fn settle(
 		&mut self,
 		host: &Host,
 		batch: Batch,
 		status: io::Result<CommandStatus>,
 	) -> Result<(), CommandExecutionError> {
-		if !self.stopped
-			&& !host.is_cancelled()
-			&& status.as_ref().is_err_and(command_line_too_long)
-			&& let Some((first, second)) = batch.split()
-		{
-			self.queued.push(second);
-			self.queued.push(first);
+		let too_long = status.as_ref().is_err_and(|error| {
+			let program = batch.argv.first().map_or(Path::new(""), Path::new);
+			command_line_too_long(error, program, host.cwd())
+		});
+		if !too_long {
+			self.result.combine(command_outcome(status, &self.command)?);
 			return Ok(());
 		}
-		self.result.combine(command_outcome(status, &self.command)?);
+		if self.stopped || host.is_cancelled() {
+			return Err(CommandExecutionError::ArgumentSize);
+		}
+		let (first, second) = batch.split().ok_or(CommandExecutionError::ArgumentSize)?;
+		self.queued.push(second);
+		self.queued.push(first);
 		Ok(())
 	}
 
@@ -1261,6 +1270,7 @@ impl Utility for Xargs {
 						CommandExecutionError::Killed { .. } => 125,
 						CommandExecutionError::CannotRun(_) => 126,
 						CommandExecutionError::NotFound(_) => 127,
+						CommandExecutionError::ArgumentSize => 1,
 					}
 				} else {
 					1
@@ -1486,8 +1496,10 @@ mod tests {
 		);
 	}
 
-	/// One input argument the kernel refuses even on its own is an error,
-	/// reported once, and nothing runs.
+	/// One input argument the kernel refuses even on its own is GNU's error,
+	/// status 1, reported once, and nothing runs. The message names no
+	/// errno: GKE Sandbox (gVisor) says `ENAMETOOLONG` where Linux says
+	/// `E2BIG`.
 	#[cfg(target_os = "linux")]
 	#[tokio::test]
 	async fn one_argument_too_long_on_its_own_is_an_error() {
@@ -1504,23 +1516,23 @@ mod tests {
 		let room = arg_max - 2048 - env - command.iter().map(|text| word(text)).sum::<usize>();
 		let input = format!("{}\n", "x".repeat(room - word("") - 64));
 		let (code, stdout, stderr) = xargs_in(&std::env::temp_dir(), &command, &input).await;
-		assert_eq!((code, stdout.as_str()), (126, ""), "{stderr}");
-		assert_eq!(stderr.matches("Argument list too long").count(), 1, "{stderr}");
+		assert_eq!((code, stdout.as_str()), (1, ""), "{stderr}");
+		assert_eq!(stderr, ARGUMENT_SIZE);
 	}
 
 	/// Runs `xargs ARGS true` over `input` against a system that refuses
 	/// lines of more than `most` input arguments with `errno`, answering none
 	/// of the first `held` lines before the last of them is asked for
-	/// ([`crate::host::Refusing`]): status, stderr, the input argument counts
-	/// of the lines tried, and the arguments that ran.
+	/// ([`crate::host::Refusing`]): status, stderr, and what the system was
+	/// asked.
 	#[cfg(unix)]
-	async fn refused_with(
+	async fn refusing(
 		args: &[&str],
 		input: &str,
 		most: usize,
 		errno: i32,
 		held: usize,
-	) -> (i32, String, Vec<usize>, Vec<String>) {
+	) -> (i32, String, crate::host::Refused) {
 		let (runner, seen) = crate::host::Refusing::new(1, most, errno);
 		let runner = runner.holding_replies_until(held);
 		let argv: Vec<&str> = std::iter::once("xargs").chain(args.iter().copied()).chain(["true"]).collect();
@@ -1530,6 +1542,20 @@ mod tests {
 			})
 			.await;
 		let seen = std::mem::take(&mut *seen.lock());
+		(code, stderr, seen)
+	}
+
+	/// [`refusing`]: status, stderr, the input argument counts of the lines
+	/// tried, and the arguments that ran.
+	#[cfg(unix)]
+	async fn refused_with(
+		args: &[&str],
+		input: &str,
+		most: usize,
+		errno: i32,
+		held: usize,
+	) -> (i32, String, Vec<usize>, Vec<String>) {
+		let (code, stderr, seen) = refusing(args, input, most, errno, held).await;
 		(code, stderr, seen.tried, seen.ran)
 	}
 
@@ -1539,16 +1565,17 @@ mod tests {
 		refused_with(&[], "1 2 3 4 5 6 7 8 9 10\n", most, errno, 0).await
 	}
 
+	/// What xargs prints when a single argument is refused as too long.
+	#[cfg(unix)]
+	const ARGUMENT_SIZE: &str = "xargs: can't call exec() due to argument size restrictions\n";
+
 	/// A line refused down to one argument is the error: the retries stop
 	/// there, and the other half never starts.
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn retries_stop_at_a_single_argument_the_system_refuses() {
 		let (code, stderr, tried, ran) = refused_above(0, libc::E2BIG).await;
-		assert_eq!(
-			(code, stderr.as_str()),
-			(126, "xargs: Command could not be run: Argument list too long (os error 7)\n")
-		);
+		assert_eq!((code, stderr.as_str()), (1, ARGUMENT_SIZE));
 		assert_eq!(tried, [10, 5, 2, 1]);
 		assert!(ran.is_empty(), "{ran:?}");
 	}
@@ -1580,18 +1607,34 @@ mod tests {
 	}
 
 	/// The same when every retry is refused too: the first single argument
-	/// refused ends xargs with its error, and nothing more starts.
+	/// refused ends xargs with its error. Whether nothing more starts once
+	/// xargs has read that refusal is not checked here: thousands of replies
+	/// are in flight, and xargs may rightly start a line before the refusal
+	/// reaches it (see
+	/// `a_lone_refusal_found_while_finishing_stops_what_is_left`).
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn thousands_of_lines_refused_down_to_one_argument_end_in_one_error() {
 		let (words, input) = numbered(16_384);
 		let lines = words.len() / 2;
 		let (code, stderr, _, ran) = refused_with(&["-P0", "-n2"], &input, 0, libc::E2BIG, lines).await;
-		assert_eq!(
-			(code, stderr.as_str()),
-			(126, "xargs: Command could not be run: Argument list too long (os error 7)\n")
-		);
+		assert_eq!((code, stderr.as_str()), (1, ARGUMENT_SIZE));
 		assert!(ran.is_empty(), "{} arguments ran", ran.len());
+	}
+
+	/// A single argument refused while xargs waits for its last commands
+	/// stops it too: a line refused after it is not split, and nothing more
+	/// starts. Both lines start together (`-P 0`) and are answered together
+	/// once the second is asked for, the lone `1` first.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn a_lone_refusal_found_while_finishing_stops_what_is_left() {
+		let (code, stderr, seen) = refusing(&["-P0", "-L1"], "1\n2 3 4 5\n", 0, libc::E2BIG, 2).await;
+		assert_eq!((code, stderr.as_str()), (1, ARGUMENT_SIZE));
+		let after = &seen.after_lone_refusal;
+		assert!(after.is_empty(), "lines of {after:?} arguments started after the lone refusal");
+		assert_eq!(seen.tried, [1, 4]);
+		assert!(seen.ran.is_empty(), "{:?}", seen.ran);
 	}
 
 	/// `E2BIG`, and `ENAMETOOLONG` as GKE Sandbox (gVisor) says it, split a
@@ -1618,6 +1661,50 @@ mod tests {
 			assert_eq!(tried, [10], "errno {errno}");
 			assert!(ran.is_empty(), "errno {errno}: {ran:?}");
 		}
+	}
+
+	/// A directory inside `root` whose path is longer than `PATH_MAX`, made
+	/// one level at a time through the descriptor of the one before: nothing
+	/// starts in it, since the system refuses its path with `ENAMETOOLONG`.
+	#[cfg(target_os = "linux")]
+	fn deeper_than_path_max(root: &std::path::Path) -> std::path::PathBuf {
+		use std::os::fd::{AsRawFd as _, FromRawFd as _};
+		let name = "d".repeat(200);
+		let levels = libc::PATH_MAX as usize / (name.len() + 1) + 1;
+		let c_name = std::ffi::CString::new(name.as_str()).expect("a name");
+		let mut dir = std::fs::File::open(root).expect("root");
+		for _ in 0..levels {
+			// SAFETY: `dir` is an open directory and `c_name` NUL-terminated.
+			let made = unsafe { libc::mkdirat(dir.as_raw_fd(), c_name.as_ptr(), 0o755) };
+			assert_eq!(made, 0, "mkdirat: {}", std::io::Error::last_os_error());
+			// SAFETY: as above; the new descriptor is owned by the `File`.
+			let fd = unsafe {
+				libc::openat(dir.as_raw_fd(), c_name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+			};
+			assert!(fd >= 0, "openat: {}", std::io::Error::last_os_error());
+			// SAFETY: `fd` is a descriptor just opened and owned by nothing else.
+			dir = unsafe { std::fs::File::from_raw_fd(fd) };
+		}
+		let mut path = root.to_path_buf();
+		for _ in 0..levels {
+			path.push(&name);
+		}
+		assert!(path.as_os_str().len() >= libc::PATH_MAX as usize);
+		path
+	}
+
+	/// `ENAMETOOLONG` from a working directory longer than `PATH_MAX` is not
+	/// a command line too long: the line fails once, as for any other
+	/// refusal, and is not split (fewer arguments cannot help).
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn a_working_directory_past_path_max_does_not_split_a_line() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let deep = deeper_than_path_max(dir.path());
+		let (code, stdout, stderr) = xargs_in(&deep, &["-t", "/bin/echo"], "1 2 3 4 5 6 7 8 9 10\n").await;
+		let tried = stderr.lines().filter(|line| line.starts_with("/bin/echo")).count();
+		assert_eq!((code, stdout.as_str(), tried), (126, "", 1), "{stderr}");
+		assert_eq!(stderr.matches("File name too long").count(), 1, "{stderr}");
 	}
 
 	#[test]

@@ -5,7 +5,11 @@
 //! streams, working directory, environment, and cancellation come from the
 //! invoking shell. The command runs through the shell's own dispatch
 //! ([`Host::run_command`](crate::host::Host::run_command)): builtins first, and
-//! its words are never re-parsed.
+//! its words are never re-parsed. As the command of `xargs` or `find -exec
+//! … +` ([`Host::too_long_to_caller`]), whose commands read the null device,
+//! `ifne` hands a refusal of its command as too long up to them, printing
+//! nothing for it: a retry reads the same empty input again, as GNU's retry
+//! a line whose `ifne` program the system refused.
 
 use std::{
 	ffi::OsString,
@@ -16,7 +20,7 @@ use std::{
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, builder::ValueParser};
 
 use crate::{
-	host::{Host, ShellCommand, Utility, matches_parser},
+	host::{Host, ShellCommand, Utility, command_line_too_long, matches_parser},
 	openfile::Fd,
 };
 
@@ -140,11 +144,23 @@ fn run_with_input(host: &mut Host, command: Vec<OsString>, first: Option<u8>) ->
 			result => result,
 		}
 	});
-	let status = host.run_command(ShellCommand::new(command).stdin(Fd::from(reader)));
+	let mut shell_command = ShellCommand::new(command).stdin(Fd::from(reader));
+	let hand_up = host.too_long_to_caller();
+	if hand_up {
+		shell_command = shell_command.too_long_as_error();
+	}
+	let status = host.run_command(shell_command);
 	let pumped = pump.join().unwrap_or(Ok(()));
 
 	let status = match status {
 		Ok(status) => status,
+		Err(err)
+			if hand_up
+				&& command_line_too_long(&err, std::path::Path::new(&name), host.cwd())
+				&& host.hand_up_too_long(&err) =>
+		{
+			return 126;
+		},
 		Err(err) => {
 			let code = match err.kind() {
 				ErrorKind::NotFound => 127,

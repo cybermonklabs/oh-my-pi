@@ -1875,8 +1875,13 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			} else {
 				false
 			};
-			// Outside posix mode a function name may contain a slash.
-			if via == Via::Plain && (!has_slash || !posix) && !special {
+			// Outside posix mode a function name may contain a slash. A run
+			// standing for a program (`Script::as_program`) calls none.
+			if via == Via::Plain
+				&& (!has_slash || !posix)
+				&& !special
+				&& !vp.runs.front().is_some_and(|run| run.as_program)
+			{
 				let found = match state::record(cx.store, vp, Key::Func(BStr::new(name))) {
 					Ok(Some(Record::Func { .. })) => true,
 					Ok(_) => false,
@@ -2270,6 +2275,10 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				let s = st(vp);
 				(s.argv.clone(), s.tag)
 			};
+			let (too_long_to_caller, as_program) = vp
+				.runs
+				.front()
+				.map_or((false, false), |run| (run.too_long_to_host, run.as_program));
 			let call = ToolCall {
 				tool,
 				argv,
@@ -2280,6 +2289,8 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				extra_fds: extra_fds(vp),
 				env,
 				umask,
+				too_long_to_caller,
+				as_program,
 			};
 			k.emit_op(cx, vp, op.node, EventData::Call { id, argv: &call.argv });
 			k.calls_out.push_back((id, call));
@@ -2558,7 +2569,7 @@ fn spawned_external(
 			s.stage = Stage::Await;
 			k.emit_op(cx, vp, op.node, EventData::Spawn { pid, argv });
 		},
-		Err(err) if refused_as_too_long(&err) && too_long_to_host(vp) => {
+		Err(err) if refused_as_too_long(&err, &path, &vp.cwd) && too_long_to_host(vp) => {
 			// The host reports it (`xargs` retries with fewer arguments): no
 			// diagnostic, and the `exec` fails as a refused one does.
 			if let (Some(code), Some(run)) = (err.raw_os_error(), vp.runs.front()) {
@@ -2635,20 +2646,39 @@ fn too_long_to_host(vp: &mut Vproc) -> bool {
 		&& vp.runs.front().is_some_and(|run| run.too_long_to_host)
 }
 
-/// Whether `err` is the system refusing a command line as too long: `E2BIG`,
-/// or `ENAMETOOLONG` as GKE Sandbox (gVisor) says it. The same rule as
-/// `pi_builtins`' `command_line_too_long`, which decides whether `xargs` and
-/// `find` retry, so a refusal reaches them only when they act on it.
+/// Whether `err`, the failure to start the program at `path` in the working
+/// directory `cwd`, is the system refusing the command line as too long:
+/// `E2BIG`, or `ENAMETOOLONG` as GKE Sandbox (gVisor) says it, but that only
+/// when no path can have caused it: each is shorter than `PATH_MAX`, with no
+/// name in it longer than `NAME_MAX` (a working directory past `PATH_MAX`
+/// refuses every command alike). The same rule as `pi_builtins`'
+/// `command_line_too_long`, which decides whether `xargs` and `find` retry,
+/// so a refusal reaches them only when they act on it.
 #[cfg(unix)]
-fn refused_as_too_long(err: &std::io::Error) -> bool {
-	matches!(err.raw_os_error(), Some(libc::E2BIG | libc::ENAMETOOLONG))
+fn refused_as_too_long(err: &std::io::Error, path: &[u8], cwd: &[u8]) -> bool {
+	match err.raw_os_error() {
+		Some(libc::E2BIG) => true,
+		Some(libc::ENAMETOOLONG) => fits_as_path(path) && fits_as_path(cwd),
+		_ => false,
+	}
+}
+
+/// Whether the system takes `path` as a name: shorter than `PATH_MAX`, with
+/// no name in it longer than `NAME_MAX` (255 on Linux and macOS).
+#[cfg(unix)]
+fn fits_as_path(path: &[u8]) -> bool {
+	const NAME_MAX: usize = 255;
+	path.len() < crate::sys::PATH_MAX
+		&& path
+			.split(|&b| b == b'/')
+			.all(|name| name.len() <= NAME_MAX)
 }
 
 /// Elsewhere no utility splits a command line, so every refused start keeps
 /// the shell's diagnostic and status (Windows' `ERROR_FILENAME_EXCED_RANGE`
 /// also stands for invalid names).
 #[cfg(not(unix))]
-fn refused_as_too_long(_err: &std::io::Error) -> bool {
+fn refused_as_too_long(_err: &std::io::Error, _path: &[u8], _cwd: &[u8]) -> bool {
 	false
 }
 
@@ -4503,6 +4533,24 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				k.diag(cx, vp, line, Diag::Tool { tool, msg });
 				1
 			},
+			Some(CallOutcome::TooLong(code)) => {
+				let asked = vp
+					.runs
+					.front()
+					.filter(|run| run.too_long_to_host)
+					.map(|run| run.id);
+				if let Some(run) = asked {
+					// The host hears of it, as of a refused `exec` of the run.
+					k.exec_refusals.insert(run, code);
+				} else {
+					// Nobody asked: the error is the tool's, as a refused start.
+					let tool = st(vp).argv[0].clone();
+					let err = std::io::Error::from_raw_os_error(code);
+					let msg = BString::from(crate::bash::diag::strerror(&err).as_ref());
+					k.diag(cx, vp, line, Diag::Tool { tool, msg });
+				}
+				126
+			},
 			None => return Some(Flow::Block(WaitKey::Call(id))),
 		},
 		Some(Awaited::Task(native)) => {
@@ -5298,5 +5346,36 @@ mod tests {
 		assert!(looks_binary(b"\x7fELF\x02\x01\x01\0\0"));
 		assert!(!looks_binary(b"echo hi\n\0binary after the first line"));
 		assert!(!looks_binary(b""));
+	}
+
+	/// `E2BIG` is always a command line too long; `ENAMETOOLONG` only when
+	/// neither the program's path nor the working directory is past
+	/// `PATH_MAX` or holds a name past `NAME_MAX`; any other error never is.
+	/// The cases of `pi_builtins`' twin (`command_line_too_long`), for
+	/// resolved paths.
+	#[cfg(unix)]
+	#[test]
+	fn enametoolong_is_a_line_too_long_only_when_no_path_is() {
+		use super::refused_as_too_long;
+		let e2big = std::io::Error::from_raw_os_error(libc::E2BIG);
+		let enametoolong = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+		let path_max = crate::sys::PATH_MAX;
+		let longest = format!("/{}", "d/".repeat((path_max - 2) / 2));
+		let longest = &longest[..path_max - 1];
+		let too_long = format!("{longest}d");
+		let name = "n".repeat(255);
+		let fits = |path: &str, cwd: &str| {
+			refused_as_too_long(&enametoolong, path.as_bytes(), cwd.as_bytes())
+		};
+		assert!(refused_as_too_long(&e2big, too_long.as_bytes(), too_long.as_bytes()));
+		assert!(fits("/usr/bin/printf", "/tmp"));
+		assert!(fits(&format!("/{name}"), &format!("/{name}")));
+		assert!(fits("/usr/bin/printf", longest));
+		assert!(!fits("/usr/bin/printf", &too_long), "a working directory past PATH_MAX");
+		assert!(!fits(&too_long, "/tmp"), "a program path past PATH_MAX");
+		assert!(!fits("/usr/bin/printf", &format!("/{name}n")), "a directory name past NAME_MAX");
+		assert!(!fits(&format!("/{name}n"), "/tmp"), "a program name past NAME_MAX");
+		let other = std::io::Error::from_raw_os_error(libc::ENOMEM);
+		assert!(!refused_as_too_long(&other, b"/usr/bin/printf", b"/tmp"));
 	}
 }

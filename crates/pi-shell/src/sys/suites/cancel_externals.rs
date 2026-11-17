@@ -273,13 +273,13 @@ fn inherit_cancel_reaches_only_the_external_itself() {
 	assert_eq!(status, 143);
 	let grace = SpawnConfig::DEFAULT_GRACE;
 	thread::sleep((grace / 2).saturating_sub(t0.elapsed()));
-	assert!(!proc::ended(pid), "TERM is ignored and KILL waits for the grace");
+	assert!(proc::running(pid), "TERM is ignored and KILL waits for the grace");
 	until("the external killed", || proc::ended(pid));
 	let killed = t0.elapsed();
 	assert!(killed >= grace && killed < grace + PROMPT, "KILL at {killed:?}");
 	until("no leftovers", || case.cleanup.spawner.leftovers().unwrap().is_empty());
 	for child in &children {
-		assert!(!proc::ended(child.pid), "the external's children are outside the cancel's reach");
+		assert!(proc::running(child.pid), "the external's children are outside the cancel's reach");
 	}
 	for child in &children {
 		assert!(proc::signal_pinned(child, Signal::Kill).unwrap());

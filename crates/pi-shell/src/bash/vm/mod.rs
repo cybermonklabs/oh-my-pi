@@ -244,10 +244,22 @@ pub struct Script {
 	/// the system refuses because the command line is too long (`E2BIG`,
 	/// `ENAMETOOLONG`): the shell prints nothing for it, the run ends with
 	/// status 126, and [`Shell::exec_refusal`] has the error. A callout can
-	/// then retry with fewer arguments (`xargs`). Set it only for a script
-	/// that runs nothing before that `exec` (a callout's generated `exec` of
-	/// a program): a retry would run all of it again.
+	/// then retry with fewer arguments (`xargs`). A tool the run calls hears
+	/// of it as well ([`ToolCall::too_long_to_caller`]) and hands such a
+	/// refusal of its own command up the same way ([`CallOutcome::TooLong`]).
+	/// Set it only for a script that runs nothing before that `exec` or tool
+	/// (a callout's generated `exec` of a program, or its call of `timeout`,
+	/// `nohup`, `env` or `ifne`, in a subshell with [`Script::as_program`]): a
+	/// retry would run all of it again.
 	pub too_long_to_host: bool,
+	/// The new subshell stands for a program the caller started (a callout
+	/// running a utility's command), whose children never run the caller's
+	/// shell code: the run calls no shell function (command lookup skips
+	/// them, while exported ones still reach programs in the environment),
+	/// and the subshell inherits none of the caller's DEBUG, ERR and RETURN
+	/// traps, even under `functrace` or `errtrace` (`set -T`, `set -E`). Its
+	/// own `trap` sets them as usual.
+	pub as_program:       bool,
 }
 
 impl Script {
@@ -265,6 +277,7 @@ impl Script {
 			foreign_env:      Vec::new(),
 			unexport_env:     Vec::new(),
 			too_long_to_host: false,
+			as_program:       false,
 		}
 	}
 }
@@ -350,23 +363,32 @@ pub enum Step {
 #[derive(Clone, Debug)]
 pub struct ToolCall {
 	/// From [`Resolved::Tool`](crate::bash::Resolved::Tool).
-	pub tool:      ToolRef,
+	pub tool:               ToolRef,
 	/// Expanded argv.
-	pub argv:      Vec<BString>,
+	pub argv:               Vec<BString>,
 	/// Calling vproc.
-	pub vpid:      Vpid,
+	pub vpid:               Vpid,
 	/// Output tag of this execution.
-	pub tag:       CmdTag,
+	pub tag:                CmdTag,
 	/// Working directory.
-	pub cwd:       BString,
+	pub cwd:                BString,
 	/// fds 0, 1, 2 (also reachable by number through [`ShellApi`]).
-	pub stdio:     [FdRef; 3],
+	pub stdio:              [FdRef; 3],
 	/// Further open fds.
-	pub extra_fds: Vec<(i32, FdRef)>,
+	pub extra_fds:          Vec<(i32, FdRef)>,
 	/// Environment.
-	pub env:       EnvView,
+	pub env:                EnvView,
 	/// File-creation mask: the shell's `umask`.
-	pub umask:     u32,
+	pub umask:              u32,
+	/// The calling run was submitted with [`Script::too_long_to_host`]: a
+	/// tool that runs nothing visible before its command (`timeout`,
+	/// `nohup`, `env`, `ifne`) answers [`CallOutcome::TooLong`] when the system
+	/// refuses that command's line as too long, so the host that submitted
+	/// the run retries with fewer arguments (`xargs`).
+	pub too_long_to_caller: bool,
+	/// The calling run was submitted with [`Script::as_program`]: the
+	/// tool's own subshells stand for a program too.
+	pub as_program:         bool,
 }
 
 /// How a host callout ended.
@@ -378,6 +400,12 @@ pub enum CallOutcome {
 	Signaled(Signal),
 	/// Failed: printed as `name: line N: tool: msg`, status 1.
 	Error(BString),
+	/// For a call with [`ToolCall::too_long_to_caller`]: the system refused
+	/// the tool's command as too long with this error (`E2BIG`,
+	/// `ENAMETOOLONG`). The calling run hears of it as of its own refused
+	/// `exec`: status 126, nothing printed, and [`Shell::exec_refusal`] has
+	/// the error.
+	TooLong(i32),
 }
 
 /// One shell: transient execution state only (scheduler, vprocs, frames,
@@ -1788,6 +1816,7 @@ impl Shell {
 			started: false,
 			exit_trap_started: false,
 			too_long_to_host: script.too_long_to_host,
+			as_program: script.as_program,
 		};
 		let stdio = match script.vproc {
 			VprocSel::Root => {
@@ -1867,6 +1896,13 @@ impl Shell {
 				if let Some(Some(var)) = scope.vars.get_mut(&name) {
 					var.attrs = var.attrs.without(Attrs::EXPORT);
 				}
+			}
+		}
+		if script.as_program {
+			use crate::bash::store::TrapKey;
+			// No record in the overlay hides the caller's, as an unset trap.
+			for key in [TrapKey::Debug, TrapKey::Err, TrapKey::Return] {
+				overlay.records.insert(KeyBuf::Trap(key), None);
 			}
 		}
 		let parent_vpid = p.vpid;

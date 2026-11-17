@@ -258,11 +258,11 @@ async fn nohup_operand_survives_cancel_and_teardown() {
 	let _reap = Reap(pid);
 	assert_ne!(r.status, 0, "the run was cancelled");
 	tokio::time::sleep(Duration::from_millis(1500)).await;
-	assert!(!proc::ended(pid), "the nohup operand died with the cancel");
+	assert!(proc::running(pid), "the nohup operand died with the cancel");
 	assert_eq!(run(&mut s, "echo ok").await.stdout, "ok\n");
 	drop(s);
 	tokio::time::sleep(Duration::from_millis(1500)).await;
-	assert!(!proc::ended(pid), "the nohup operand died with the session");
+	assert!(proc::running(pid), "the nohup operand died with the session");
 }
 
 /// Kills a process when dropped (a test's cleanup, even when it fails).

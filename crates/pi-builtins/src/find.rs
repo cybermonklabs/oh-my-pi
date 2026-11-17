@@ -729,7 +729,7 @@ pub mod matchers {
 								matcher_io.set_exit_code(1);
 							}
 						},
-						Err(e) if command_line_too_long(&e) && files.len() > 1 => {
+						Err(e) if files.len() > 1 && too_long(&e, command, matcher_io.host().cwd()) => {
 							let middle = files.start + files.len() / 2;
 							pending.push(middle..files.end);
 							pending.push(files.start..middle);
@@ -741,6 +741,14 @@ pub mod matchers {
 					}
 				}
 			}
+		}
+
+		/// Whether `error` is the system refusing `command`'s line as too long
+		/// ([`command_line_too_long`]), for a command find runs from `cwd`: in
+		/// it, or in the directory of its `-execdir` batch.
+		fn too_long(error: &std::io::Error, command: &argmax::Command, cwd: &Path) -> bool {
+			let dir = command.get_current_dir().map_or_else(|| cwd.to_path_buf(), |dir| cwd.join(dir));
+			command_line_too_long(error, Path::new(command.get_program()), &dir)
 		}
 
 		#[async_trait::async_trait]
@@ -5731,7 +5739,9 @@ mod tests {
 		let pad = "x".repeat(unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize);
 		let (code, err, ran) = files_run(&root, &[("FIND_TEST_PAD", &pad)]).await;
 		assert_eq!((code, ran.len()), (1, 0), "{err}");
-		assert_eq!(err.matches("Argument list too long").count(), 1, "{err}");
+		// `E2BIG`'s words, or `ENAMETOOLONG`'s, which GKE Sandbox (gVisor) says.
+		let refused = err.matches("Argument list too long").count() + err.matches("File name too long").count();
+		assert_eq!(refused, 1, "{err}");
 	}
 
 	/// Runs `find many -type f -exec true {} +` over the files `1` to `10`

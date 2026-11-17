@@ -37,12 +37,17 @@ fn env_with(extra: &[(&str, &str)]) -> Vec<(BString, BString)> {
 }
 
 fn session_in(dir: &Path, extra: &[(&str, &str)]) -> Session {
+	session_with(dir, env_with(extra))
+}
+
+/// A session in `dir` whose environment is `env` alone.
+fn session_with(dir: &Path, env: Vec<(BString, BString)>) -> Session {
 	Session::new(SessionConfig {
-		env:             env_with(extra),
-		cwd:             BString::from(dir.as_os_str().as_bytes()),
-		fs:              Box::new(crate::sys::StdFs::default()),
-		vfs:             None,
-		runtime:         tokio::runtime::Handle::current(),
+		env,
+		cwd: BString::from(dir.as_os_str().as_bytes()),
+		fs: Box::new(crate::sys::StdFs::default()),
+		vfs: None,
+		runtime: tokio::runtime::Handle::current(),
 		output_decoding: None,
 	})
 	.unwrap()
@@ -313,21 +318,37 @@ fn lines_run(stdout: &str) -> Vec<Vec<&str>> {
 	lines.into_iter().map(|(_, args)| args).collect()
 }
 
+/// Words of 255 bytes, more than one line holds, written one per line to
+/// `words` in `dir`: run by [`sh_at_a_long_path`], the first, full line
+/// xargs builds of them is one the kernel refuses.
+#[cfg(target_os = "linux")]
+fn words_past_a_full_line(dir: &Path) -> Vec<String> {
+	// SAFETY: plain call without pointer arguments.
+	let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
+	let words: Vec<String> = (0..arg_max / 256)
+		.map(|i| format!("{i:07}{}", "x".repeat(248)))
+		.collect();
+	std::fs::write(dir.join("words"), words.join("\n") + "\n").unwrap();
+	words
+}
+
+/// How often `stderr` reports a command line the system refused as too
+/// long: in `E2BIG`'s words, or in `ENAMETOOLONG`'s, which GKE Sandbox
+/// (gVisor) says instead.
+#[cfg(target_os = "linux")]
+fn too_long_reports(stderr: &str) -> usize {
+	stderr.matches("Argument list too long").count() + stderr.matches("File name too long").count()
+}
+
 /// xargs in the shell: a full line the kernel refuses as too long runs
 /// again as two halves, with nothing printed for the refusal, and every
 /// argument still runs once, in order; one argument too long on its own is
-/// xargs' error, printed once.
+/// xargs' error, GNU's, printed once.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xargs_splits_a_line_the_kernel_refuses_as_too_long() {
 	let dir = tempfile::tempdir().unwrap();
-	// SAFETY: plain call without pointer arguments.
-	let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
-	// More input than one line holds, so the first line is a full one.
-	let words: Vec<String> = (0..arg_max / 256)
-		.map(|i| format!("{i:07}{}", "x".repeat(248)))
-		.collect();
-	std::fs::write(dir.path().join("words"), words.join("\n") + "\n").unwrap();
+	let words = words_past_a_full_line(dir.path());
 	let mut s = session_in(dir.path(), &[]);
 	let (_long, sh) = sh_at_a_long_path();
 	let ran = run(&mut s, &format!("xargs -t -a words {sh} {SHOW_ARGS}")).await;
@@ -356,8 +377,8 @@ async fn xargs_splits_a_line_the_kernel_refuses_as_too_long() {
 	let big = "x".repeat(full * (256 + size_of::<*const u8>()) - 128);
 	std::fs::write(dir.path().join("big"), format!("{big}\n")).unwrap();
 	let ran = run(&mut s, &format!("xargs -a big {sh} {SHOW_ARGS}")).await;
-	assert_eq!((ran.status, ran.stdout.as_str()), (126, ""), "{}", ran.stderr);
-	assert_eq!(ran.stderr.matches("Argument list too long").count(), 1, "{}", ran.stderr);
+	assert_eq!((ran.status, ran.stdout.as_str()), (1, ""), "{}", ran.stderr);
+	assert_eq!(ran.stderr, "xargs: can't call exec() due to argument size restrictions\n");
 }
 
 /// `find -exec ... {} +` in the shell: it sizes its batches against the
@@ -420,7 +441,7 @@ async fn find_exec_plus_splits_a_batch_the_kernel_refuses_as_too_long() {
 	let pad = "x".repeat(arg_max);
 	let ran = run(&mut session_in(one.path(), &[("FIND_TEST_PAD", &pad)]), &show_files).await;
 	assert_eq!((ran.status, ran.stdout.as_str()), (1, ""), "{}", ran.stderr);
-	assert_eq!(ran.stderr.matches("Argument list too long").count(), 1, "{}", ran.stderr);
+	assert_eq!(too_long_reports(&ran.stderr), 1, "{}", ran.stderr);
 }
 
 /// A builtin's own `exec` that the system refuses as too long is the
@@ -453,14 +474,438 @@ async fn a_builtins_refused_exec_is_not_retried() {
 			"{command}: {}",
 			ran.stderr
 		);
-		assert_eq!(
-			ran.stderr.matches("Argument list too long").count(),
-			1,
-			"{command}: {}",
-			ran.stderr
-		);
+		assert_eq!(too_long_reports(&ran.stderr), 1, "{command}: {}", ran.stderr);
 		assert!(!ran.stderr.contains("could not be run"), "{command}: {}", ran.stderr);
 	}
+}
+
+/// The number of lines `-t` traced for `program` in `stderr`: the lines
+/// xargs tried.
+#[cfg(target_os = "linux")]
+fn lines_tried(stderr: &str, program: &str) -> usize {
+	stderr
+		.lines()
+		.filter(|line| line.starts_with(program))
+		.count()
+}
+
+/// No shell function runs in the commands xargs runs, as no function runs
+/// in a real xargs' children: not one named `exec`, `builtin` or `command`
+/// in place of the words a callout generates (`builtin exec` for a program,
+/// `command` for a builtin), which a retry of a refused line would run
+/// again each time.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_shell_function_runs_in_the_commands_xargs_runs() {
+	let dir = tempfile::tempdir().unwrap();
+	let words = words_past_a_full_line(dir.path());
+	std::fs::write(dir.path().join("two"), "1\n2\n").unwrap();
+	let (_long, sh) = sh_at_a_long_path();
+	for function in [
+		r#"exec() { echo SIDE >&2; builtin exec "$@"; }"#,
+		r#"builtin() { echo SIDE >&2; command builtin "$@"; }"#,
+		r#"command() { echo SIDE >&2; builtin command "$@"; }"#,
+	] {
+		let mut s = session_in(dir.path(), &[]);
+		let ran = run(&mut s, &format!("{function}; xargs -t -a words {sh} {SHOW_ARGS}")).await;
+		let tried = lines_tried(&ran.stderr, &sh);
+		assert!(tried > 2, "{function}: no line was refused and split: {tried} tried");
+		let side = ran.stderr.matches("SIDE").count();
+		assert_eq!((ran.status, side), (0, 0), "{function}: the function ran: {}", ran.stderr);
+		assert!(
+			lines_run(&ran.stdout).concat() == words,
+			"{function}: the arguments did not each run once"
+		);
+		let ran = run(&mut s, "xargs -n1 -a two echo").await;
+		let side = ran.stderr.matches("SIDE").count();
+		assert_eq!(
+			(ran.status, ran.stdout.as_str(), side),
+			(0, "1\n2\n", 0),
+			"{function}: {}",
+			ran.stderr
+		);
+	}
+}
+
+/// `xargs env NAME=VALUE PROG`, `xargs command PROG` and `xargs exec PROG`
+/// run PROG as `xargs PROG` does, since those builtins run nothing before
+/// they `exec` it: a line the system refuses as too long is split, as GNU's
+/// xargs splits it for the program `env`, and `env`'s variables reach PROG.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_line_is_split_through_env_command_and_exec() {
+	let dir = tempfile::tempdir().unwrap();
+	let words = words_past_a_full_line(dir.path());
+	let (_long, sh) = sh_at_a_long_path();
+	let mut s = session_in(dir.path(), &[]);
+	for wrapper in ["env PI_TEST_VAR=set", "command", "command --", "exec", "builtin exec"] {
+		let ran = run(&mut s, &format!("xargs -t -a words {wrapper} {sh} {SHOW_ARGS}")).await;
+		let (traces, reported): (Vec<&str>, Vec<&str>) = ran
+			.stderr
+			.lines()
+			.partition(|line| line.starts_with(wrapper));
+		assert_eq!(
+			(ran.status, reported),
+			(0, vec![]),
+			"{wrapper}: every line runs, and nothing else is reported"
+		);
+		assert!(traces.len() > 2, "{wrapper}: no line was refused and split: {} tried", traces.len());
+		assert!(
+			lines_run(&ran.stdout).concat() == words,
+			"{wrapper}: the arguments did not each run once, in order"
+		);
+	}
+	let ran =
+		run(&mut s, r#"echo x | xargs env PI_TEST_VAR=set /bin/sh -c 'echo "$PI_TEST_VAR $1"' sh"#)
+			.await;
+	assert_eq!((ran.status, ran.stdout.as_str()), (0, "set x\n"), "{}", ran.stderr);
+}
+
+/// What a wrapper prints itself for each attempt, on stderr: `env`'s
+/// `--debug` trace and `--list-signal-handling` list (GNU's `env` prints
+/// them only for the pieces that run, as the system refuses its own exec
+/// before it starts; pi's `env` prints them before the command, so for
+/// every attempt).
+#[cfg(target_os = "linux")]
+fn wrapper_output(line: &str) -> bool {
+	line.starts_with("executing: ") || line.starts_with("   arg[") || line.ends_with("): IGNORE")
+}
+
+/// Runs `xargs -t -a words COMMAND` in `s`, where `COMMAND` (shell words)
+/// runs [`SHOW_ARGS`] over `words` ([`words_past_a_full_line`]) through a
+/// wrapper and `-t` traces each line with `trace` first: the line splits as
+/// GNU's xargs splits a line whose wrapper program the system refused, and
+/// as the program alone splits. Every word runs once, in order; the first,
+/// full line is refused and halved; nothing is printed for a refusal but
+/// the wrapper's own output ([`wrapper_output`]), once for each attempt.
+/// Returns the arguments of the full line.
+#[cfg(target_os = "linux")]
+async fn assert_split_through(
+	s: &mut Session,
+	command: &str,
+	trace: &str,
+	words: &[String],
+) -> usize {
+	let ran = run(s, &format!("xargs -t -a words {command}")).await;
+	let (traces, reported): (Vec<&str>, Vec<&str>) =
+		ran.stderr.lines().partition(|line| line.starts_with(trace));
+	let (own, reported): (Vec<&str>, Vec<&str>) =
+		reported.into_iter().partition(|line| wrapper_output(line));
+	assert_eq!(
+		(ran.status, reported),
+		(0, vec![]),
+		"{command}: every line runs, and nothing else is reported"
+	);
+	let executing = own
+		.iter()
+		.filter(|line| line.starts_with("executing: "))
+		.count();
+	assert!(
+		executing == 0 || executing == traces.len(),
+		"{command}: {executing} traces for {} attempts",
+		traces.len()
+	);
+	assert!(
+		lines_run(&ran.stdout).concat() == words,
+		"{command}: the arguments did not each run once, in order"
+	);
+	let tried: Vec<usize> = traces
+		.iter()
+		.map(|trace| trace.split(' ').filter(|word| word.len() == 255).count())
+		.collect();
+	let full = tried[0];
+	let first = lines_run(&ran.stdout)[0].len();
+	assert!(
+		first < full && tried.get(1) == Some(&(full / 2)),
+		"{command}: the first, full line of {full} arguments was not refused and halved: {first} \
+		 ran first, and the next line tried had {:?}",
+		tried.get(1)
+	);
+	full
+}
+
+/// Runs `xargs -a big COMMAND` in `s`, `big` holding one argument the
+/// system refuses even alone: GNU's error and status 1, as GNU's xargs ends
+/// when the system refuses a wrapper program with one argument, and nothing
+/// runs.
+#[cfg(target_os = "linux")]
+async fn assert_refused_alone_through(s: &mut Session, command: &str) {
+	let ran = run(s, &format!("xargs -a big {command}")).await;
+	let reported: Vec<&str> = ran
+		.stderr
+		.lines()
+		.filter(|line| !wrapper_output(line))
+		.collect();
+	assert_eq!(
+		(ran.status, ran.stdout.as_str(), reported),
+		(1, "", vec!["xargs: can't call exec() due to argument size restrictions"]),
+		"{command}"
+	);
+}
+
+/// Writes `big` in `dir`: one argument of about the room a line of `full`
+/// words has (256 bytes and an argv pointer each), less room for the widest
+/// wrapper, which xargs fits and the kernel refuses: one string past
+/// `MAX_ARG_STRLEN` (128 KiB), and past the whole limit with the long path.
+#[cfg(target_os = "linux")]
+fn big_argument(dir: &Path, full: usize) {
+	let big = "x".repeat(full * (256 + size_of::<*const u8>()) - 8192);
+	std::fs::write(dir.join("big"), format!("{big}\n")).unwrap();
+}
+
+/// `xargs env OPTIONS PROG`: `env` applies its options as it does anywhere,
+/// then hands a refusal of PROG's line as too long up to xargs, which
+/// splits the line as GNU's xargs splits it for the program `env`; one
+/// argument refused alone is xargs' error. Measured against GNU findutils
+/// 4.9.0 and coreutils 9.4 (`-a` is pi's only).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_line_is_split_through_env_and_its_options() {
+	let dir = tempfile::tempdir().unwrap();
+	let words = words_past_a_full_line(dir.path());
+	let (_long, sh) = sh_at_a_long_path();
+	let mut s = session_in(dir.path(), &[]);
+	let full = assert_split_through(&mut s, &format!("{sh} {SHOW_ARGS}"), &sh, &words).await;
+	big_argument(dir.path(), full);
+	for (options, trace) in [
+		("-u HOME".to_owned(), "env -u HOME".to_owned()),
+		("-C /".to_owned(), "env -C /".to_owned()),
+		("-S '-u HOME'".to_owned(), "env -S -u HOME".to_owned()),
+		("-v".to_owned(), "env -v".to_owned()),
+		("--default-signal=USR1".to_owned(), "env --default-signal=USR1".to_owned()),
+		("--list-signal-handling".to_owned(), "env --list-signal-handling".to_owned()),
+	] {
+		let command = format!("env {options} {sh} {SHOW_ARGS}");
+		assert_split_through(&mut s, &command, &trace, &words).await;
+		assert_refused_alone_through(&mut s, &command).await;
+	}
+	// `-i` leaves the program less than xargs counted, and with `-a` the
+	// long path xargs counted is no longer in `argv`: the line is refused
+	// only when the uncounted path the kernel copies outweighs xargs' own
+	// environment, in a session that has little more than a `PATH`.
+	let mut small =
+		session_with(dir.path(), vec![(BString::from("PATH"), BString::from("/usr/bin:/bin"))]);
+	let long_dir = Path::new(&sh).parent().unwrap().display().to_string();
+	for (command, trace) in [
+		(format!("env -i {sh} {SHOW_ARGS}"), "env -i".to_owned()),
+		(format!("env -a sh PATH={long_dir} sh {SHOW_ARGS}"), "env -a sh PATH=".to_owned()),
+	] {
+		assert_split_through(&mut small, &command, &trace, &words).await;
+		assert_refused_alone_through(&mut small, &command).await;
+	}
+	// The options still apply to every piece.
+	let ran =
+		run(&mut s, r#"echo x | xargs env -i -C / /bin/sh -c 'echo "$(pwd) ${HOME-unset} $1"' sh"#)
+			.await;
+	assert_eq!((ran.status, ran.stdout.as_str()), (0, "/ unset x\n"), "{}", ran.stderr);
+}
+
+/// `xargs nohup PROG`: pi's `nohup` does nothing visible before PROG starts
+/// (no `nohup.out`, no notice), so it hands a refusal of PROG's line as too
+/// long up to xargs, which splits the line as GNU's xargs splits it for the
+/// program `nohup`, each piece with a `nohup` of its own; one argument
+/// refused alone is xargs' error.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_line_is_split_through_nohup() {
+	let dir = tempfile::tempdir().unwrap();
+	let words = words_past_a_full_line(dir.path());
+	let (_long, sh) = sh_at_a_long_path();
+	let mut s = session_in(dir.path(), &[]);
+	let full = assert_split_through(&mut s, &format!("{sh} {SHOW_ARGS}"), &sh, &words).await;
+	big_argument(dir.path(), full);
+	for wrapper in ["nohup", "nohup --"] {
+		let command = format!("{wrapper} {sh} {SHOW_ARGS}");
+		assert_split_through(&mut s, &command, wrapper, &words).await;
+		assert_refused_alone_through(&mut s, &command).await;
+	}
+	let ran = run(&mut s, "printf '1\\n2\\n' | xargs nohup /bin/echo").await;
+	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), (0, "1 2\n", ""));
+}
+
+/// `xargs ifne -n PROG`: the commands xargs runs read the null device, so
+/// `ifne -n` has read nothing a retry would miss when it starts PROG; it
+/// hands a refusal of PROG's line as too long up to xargs, which splits the
+/// line as for the program alone; one argument refused alone is xargs'
+/// error. Without `-n`, empty input runs nothing.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_line_is_split_through_ifne() {
+	let dir = tempfile::tempdir().unwrap();
+	let words = words_past_a_full_line(dir.path());
+	let (_long, sh) = sh_at_a_long_path();
+	let mut s = session_in(dir.path(), &[]);
+	let full = assert_split_through(&mut s, &format!("{sh} {SHOW_ARGS}"), &sh, &words).await;
+	big_argument(dir.path(), full);
+	let command = format!("ifne -n {sh} {SHOW_ARGS}");
+	assert_split_through(&mut s, &command, "ifne -n", &words).await;
+	assert_refused_alone_through(&mut s, &command).await;
+	let ran = run(&mut s, &format!("xargs -a words ifne {sh} {SHOW_ARGS}")).await;
+	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), (0, "", ""));
+}
+
+/// `xargs timeout DURATION PROG`: `timeout` starts PROG and supervises it;
+/// a refusal of PROG's line as too long comes before any signal, so
+/// `timeout` hands it up to xargs, which splits the line as GNU's xargs
+/// splits it for the program `timeout`, each piece under a `timeout` of its
+/// own, through a nested wrapper too; one argument refused alone is xargs'
+/// error. Outside a callout the refusal stays `timeout`'s: the shell's
+/// diagnostic, status 126.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_line_is_split_through_timeout() {
+	let dir = tempfile::tempdir().unwrap();
+	let words = words_past_a_full_line(dir.path());
+	let (_long, sh) = sh_at_a_long_path();
+	let mut s = session_in(dir.path(), &[]);
+	let full = assert_split_through(&mut s, &format!("{sh} {SHOW_ARGS}"), &sh, &words).await;
+	big_argument(dir.path(), full);
+	for wrapper in
+		["timeout 5s", "timeout -k 1s 5s", "timeout 5s env PI_TEST_VAR=set", "timeout 5s nohup"]
+	{
+		let command = format!("{wrapper} {sh} {SHOW_ARGS}");
+		assert_split_through(&mut s, &command, wrapper, &words).await;
+		assert_refused_alone_through(&mut s, &command).await;
+	}
+	let ran = run(&mut s, "printf '1\\n2\\n' | xargs timeout 5s /bin/echo").await;
+	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), (0, "1 2\n", ""));
+	let ran = run(&mut s, "printf '1\\n' | xargs timeout 5s false").await;
+	assert_eq!((ran.status, ran.stderr.as_str()), (123, ""));
+	// SAFETY: plain call without pointer arguments.
+	let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
+	std::fs::write(dir.path().join("pad"), "x".repeat(arg_max + 1)).unwrap();
+	let ran = run(&mut s, "PAD=$(cat pad) timeout 5s /bin/sh -c 'echo ran'").await;
+	assert_eq!((ran.status, ran.stdout.as_str()), (126, ""), "{}", ran.stderr);
+	assert_eq!(too_long_reports(&ran.stderr), 1, "{}", ran.stderr);
+	// `timeout`'s own subshell stands for the program too: no function runs.
+	let ran = run(&mut s, "f() { echo SIDE; }; echo x | xargs timeout 5s f").await;
+	assert_eq!((ran.status, ran.stdout.as_str()), (123, ""), "{}", ran.stderr);
+
+	// `find -exec … +` runs its lines through the same callouts: a batch
+	// refused under `timeout` splits too (the batches are sized against the
+	// process's environment, which lacks the session's pad).
+	std::fs::create_dir(dir.path().join("many")).unwrap();
+	let mut files: Vec<String> = (0..arg_max / 250)
+		.map(|i| format!("many/{i:06}{}", "f".repeat(240)))
+		.collect();
+	for file in &files {
+		std::fs::write(dir.path().join(file), b"").unwrap();
+	}
+	let batches = run(&mut s, "find many -type f -exec echo {} +")
+		.await
+		.stdout
+		.lines()
+		.count();
+	let pad = "x".repeat(16 * 1024);
+	let mut padded = session_in(dir.path(), &[("FIND_TEST_PAD", &pad)]);
+	let command = format!("find many -type f -exec timeout 5s /bin/sh {SHOW_ARGS} {{}} +");
+	let ran = run(&mut padded, &command).await;
+	assert_eq!(
+		(ran.status, ran.stderr.as_str()),
+		(0, ""),
+		"every batch runs, and nothing is reported"
+	);
+	let lines = lines_run(&ran.stdout);
+	assert!(
+		lines.len() > batches,
+		"no batch was refused and split: {} lines for {batches} batches",
+		lines.len()
+	);
+	let mut ran_files: Vec<&str> = lines.concat();
+	ran_files.sort_unstable();
+	files.sort_unstable();
+	assert!(ran_files == files, "the files did not each run once");
+}
+
+/// The commands xargs runs run none of the caller's DEBUG or ERR traps,
+/// even under `set -T` and `set -E`, as a program's children run none:
+/// each trap runs in the caller, once, for xargs, however many lines xargs
+/// starts or retries.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_callers_debug_and_err_traps_do_not_run_in_xargs_commands() {
+	let dir = tempfile::tempdir().unwrap();
+	let words = words_past_a_full_line(dir.path());
+	std::fs::write(dir.path().join("two"), "1\n2\n").unwrap();
+	let (_long, sh) = sh_at_a_long_path();
+	let debug = "set -T; trap 'echo DBG >&2' DEBUG";
+
+	let ran =
+		run(&mut session_in(dir.path(), &[]), &format!("{debug}; xargs -a two /bin/echo")).await;
+	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), (0, "1 2\n", "DBG\n"));
+
+	let refused = format!("{debug}; xargs -t -a words {sh} {SHOW_ARGS}");
+	let ran = run(&mut session_in(dir.path(), &[]), &refused).await;
+	let tried = lines_tried(&ran.stderr, &sh);
+	assert!(tried > 2, "no line was refused and split: {tried} tried");
+	assert_eq!((ran.status, ran.stderr.matches("DBG").count()), (0, 1), "{}", ran.stderr);
+	assert!(
+		lines_run(&ran.stdout).concat() == words,
+		"the arguments did not each run once, in order"
+	);
+
+	let err = "set -E; trap 'echo ERR >&2' ERR; xargs -n1 -a two false";
+	let ran = run(&mut session_in(dir.path(), &[]), err).await;
+	assert_eq!((ran.status, ran.stderr.as_str()), (123, "ERR\n"));
+}
+
+/// A directory inside `root` whose path is longer than `PATH_MAX`, made
+/// one level at a time through the descriptor of the one before: nothing
+/// starts in it, since the system refuses its path with `ENAMETOOLONG`.
+#[cfg(target_os = "linux")]
+fn deeper_than_path_max(root: &Path) -> std::path::PathBuf {
+	use std::os::fd::{AsRawFd as _, FromRawFd as _};
+	let name = "d".repeat(200);
+	let levels = crate::sys::PATH_MAX / (name.len() + 1) + 1;
+	let c_name = std::ffi::CString::new(name.as_str()).unwrap();
+	let mut dir = std::fs::File::open(root).unwrap();
+	for _ in 0..levels {
+		// SAFETY: `dir` is an open directory and `c_name` NUL-terminated.
+		let made = unsafe { libc::mkdirat(dir.as_raw_fd(), c_name.as_ptr(), 0o755) };
+		assert_eq!(made, 0, "mkdirat: {}", io::Error::last_os_error());
+		// SAFETY: as above; the new descriptor is owned by the `File`.
+		let fd = unsafe {
+			libc::openat(
+				dir.as_raw_fd(),
+				c_name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+			)
+		};
+		assert!(fd >= 0, "openat: {}", io::Error::last_os_error());
+		// SAFETY: `fd` is a descriptor just opened and owned by nothing else.
+		dir = unsafe { std::fs::File::from_raw_fd(fd) };
+	}
+	let mut path = root.to_path_buf();
+	for _ in 0..levels {
+		path.push(&name);
+	}
+	assert!(path.as_os_str().len() >= crate::sys::PATH_MAX);
+	path
+}
+
+/// `ENAMETOOLONG` from a working directory longer than `PATH_MAX` is no
+/// command line too long: the shell reports the program it could not start,
+/// as for any other refusal (status 126, xargs 123), and xargs does not
+/// split the line, since fewer arguments cannot help.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_working_directory_past_path_max_is_no_line_too_long() {
+	let dir = tempfile::tempdir().unwrap();
+	let ten = dir.path().join("ten");
+	std::fs::write(&ten, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+	let deep = deeper_than_path_max(dir.path());
+	let command = format!("xargs -t -a {} /usr/bin/printf '%s\\n'", ten.display());
+	let ran = run(&mut session_in(&deep, &[]), &command).await;
+	let tried = lines_tried(&ran.stderr, "/usr/bin/printf");
+	assert_eq!((ran.status, ran.stdout.as_str(), tried), (123, "", 1), "{}", ran.stderr);
+	assert_eq!(
+		ran.stderr
+			.matches("/usr/bin/printf: File name too long")
+			.count(),
+		1,
+		"{}",
+		ran.stderr
+	);
 }
 
 /// `tail -f` writing into an engine pipe (no native handle) notices while

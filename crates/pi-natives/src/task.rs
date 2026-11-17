@@ -776,6 +776,10 @@ mod tests {
 	/// runtime, and a bare `JoinHandle` would detach on drop. Covers a walk
 	/// that yields between directories; one parked in a stalled syscall is
 	/// bounded by the device.
+	///
+	/// The start is a handshake rather than a sleep, so a slow scheduler
+	/// cannot fail it; only the span between the drop and the walk's own
+	/// completion is a wait, and it is generous.
 	#[test]
 	fn dropping_the_caller_stops_the_walk() {
 		use std::{
@@ -791,9 +795,8 @@ mod tests {
 			.enable_all()
 			.build()
 			.unwrap();
-		let started = Arc::new(AtomicBool::new(false));
+		let (started_tx, started_rx) = flume::bounded::<()>(1);
 		let ran_on = Arc::new(AtomicBool::new(false));
-		let started_probe = Arc::clone(&started);
 		let ran_on_probe = Arc::clone(&ran_on);
 
 		host.block_on(async move {
@@ -802,23 +805,22 @@ mod tests {
 				CancelToken::new(None, None),
 				Fs::native(),
 				move |_fs| async move {
-					started_probe.store(true, Ordering::SeqCst);
+					let _ = started_tx.send(());
 					// The yield point a walker has between directories.
-					tokio::time::sleep(Duration::from_millis(200)).await;
+					tokio::time::sleep(Duration::from_secs(2)).await;
 					ran_on_probe.store(true, Ordering::SeqCst);
 					Ok(1_u32)
 				},
 			));
 			let mut walk = Some(walk);
-			// Start it, then let go while the work is still in flight.
+			// Let go the moment the walk is in flight.
 			tokio::select! {
 				_ = walk.as_mut().unwrap() => panic!("the walk finished before it was dropped"),
-				() = tokio::time::sleep(Duration::from_millis(60)) => {},
+				started = started_rx.recv_async() => started.expect("the walk never started"),
 			}
-			assert!(started.load(Ordering::SeqCst), "the walk never started");
 			drop(walk.take());
 
-			tokio::time::sleep(Duration::from_millis(400)).await;
+			tokio::time::sleep(Duration::from_secs(3)).await;
 			assert!(
 				!ran_on.load(Ordering::SeqCst),
 				"the walk ran on after its caller was dropped, so a torn-down host leaves filesystem \

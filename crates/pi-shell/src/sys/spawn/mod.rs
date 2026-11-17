@@ -311,6 +311,12 @@ impl NativeSpawner {
 	/// Processes still alive in the groups, sessions (Unix) or jobs
 	/// (Windows) this spawner created, excluding zombies and the calling
 	/// process. Empty after a clean case.
+	///
+	/// # Errors
+	///
+	/// On Unix, when the process table could not be read whole
+	/// (`sys::proc::list`): a process it could not read may be a
+	/// leftover.
 	pub fn leftovers(&self) -> io::Result<Vec<Leftover>> {
 		imp::leftovers(&self.shared)
 	}
@@ -318,6 +324,11 @@ impl NativeSpawner {
 	/// Kill (`SIGKILL`, `TerminateJobObject`) every [`leftover`] and return
 	/// them. Unix kills are identity-pinned: a pid recycled since the scan is
 	/// never hit.
+	///
+	/// # Errors
+	///
+	/// As for [`leftovers`](NativeSpawner::leftovers), once the leftovers the
+	/// scan read are killed.
 	///
 	/// [`leftover`]: NativeSpawner::leftovers
 	pub fn kill_leftovers(&self) -> io::Result<Vec<Leftover>> {

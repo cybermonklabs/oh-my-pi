@@ -6,7 +6,12 @@
 //! end its externals at teardown. A signal aimed at the `nohup` itself
 //! (`kill $!` of `nohup cmd &`, `kill %1`) still reaches the command, as it
 //! reaches the program a real `nohup` `exec`s. Unlike coreutils, `SIGHUP` is
-//! not masked and output is not redirected to `nohup.out`.
+//! not masked and output is not redirected to `nohup.out`, so `nohup` does
+//! nothing visible before its command starts: as the command of `xargs` or
+//! `find -exec … +`, it hands a refusal of that command as too long up to
+//! them ([`CallOutcome::TooLong`]), and they retry the line in halves, each
+//! with a `nohup` of its own, as GNU's retry a line whose `nohup` the system
+//! refused.
 
 use bstr::BString;
 
@@ -93,7 +98,13 @@ impl Nohup {
 			self.child.start(api, turn, &self.call, command, true, "");
 		}
 		let code = self.exit.or(self.child.status)?;
-		self.out.flush(api).then_some(CallOutcome::Exit(code))
+		let outcome = match self.child.refusal {
+			// A caller that retries a refused line hears of it, as of a
+			// `nohup` whose own `exec` the system refused.
+			Some(refused) if self.exit.is_none() => CallOutcome::TooLong(refused),
+			_ => CallOutcome::Exit(code),
+		};
+		self.out.flush(api).then_some(outcome)
 	}
 }
 

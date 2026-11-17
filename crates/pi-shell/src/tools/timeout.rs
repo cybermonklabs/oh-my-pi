@@ -10,7 +10,11 @@
 //! [`REAP_AFTER_KILL`] after that. Exit status: the command's when it
 //! finishes in time; 124 after the deadline; 137 once `KILL` was sent;
 //! the command's own under `--preserve-status`; 125 for timeout's own
-//! errors (bad usage, interval or signal).
+//! errors (bad usage, interval or signal). As the command of `xargs` or
+//! `find -exec … +`, `timeout` hands a refusal of its command as too long up
+//! to them ([`Phase::TooLong`]), and they retry the line in halves, each with
+//! a `timeout` of its own, as GNU's retry a line whose `timeout` the system
+//! refused.
 
 use std::time::Duration;
 
@@ -251,6 +255,11 @@ enum Phase {
 	Signalled { opts: Options, kill_at: Option<u64>, give_up: Option<u64>, recheck: u64 },
 	/// The answer, once the output is written.
 	Exit(i32),
+	/// The system refused the command's line as too long with this error,
+	/// for a caller that retries it ([`ToolCall::too_long_to_caller`]): no
+	/// signal was sent, nothing ran, and the caller hears of it as of a
+	/// `timeout` whose own `exec` the system refused, as GNU's xargs does.
+	TooLong(i32),
 }
 
 /// A `timeout` call.
@@ -285,7 +294,7 @@ impl Timeout {
 				.into_iter()
 				.flatten()
 				.min(),
-			Phase::Start(_) | Phase::Exit(_) => None,
+			Phase::Start(_) | Phase::Exit(_) | Phase::TooLong(_) => None,
 		}
 	}
 
@@ -326,9 +335,10 @@ impl Timeout {
 				let deadline = opts.limit.map(|d| now.saturating_add(nanos(d)));
 				Phase::Running { opts, deadline }
 			},
-			Phase::Running { opts, deadline } => match self.child.status {
-				Some(status) => Phase::Exit(status),
-				None if deadline.is_some_and(|at| now >= at) => {
+			Phase::Running { opts, deadline } => match (self.child.status, self.child.refusal) {
+				(Some(_), Some(code)) => Phase::TooLong(code),
+				(Some(status), None) => Phase::Exit(status),
+				(None, _) if deadline.is_some_and(|at| now >= at) => {
 					self.send(turn, &opts, opts.signal);
 					let killed = opts.signal == Signal::Kill;
 					Phase::Signalled {
@@ -340,7 +350,7 @@ impl Timeout {
 						opts,
 					}
 				},
-				None => Phase::Running { opts, deadline },
+				(None, _) => Phase::Running { opts, deadline },
 			},
 			Phase::Signalled { opts, mut kill_at, mut give_up, .. } => {
 				if kill_at.is_some_and(|at| now >= at) {
@@ -376,9 +386,11 @@ impl Timeout {
 				}
 			},
 			Phase::Exit(code) => Phase::Exit(code),
+			Phase::TooLong(code) => Phase::TooLong(code),
 		};
 		match self.phase {
 			Phase::Exit(code) if self.out.flush(api) => Some(CallOutcome::Exit(code)),
+			Phase::TooLong(code) if self.out.flush(api) => Some(CallOutcome::TooLong(code)),
 			_ => {
 				// Verbose lines go out as they come.
 				self.out.flush(api);
