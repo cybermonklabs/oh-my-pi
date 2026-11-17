@@ -497,6 +497,48 @@ async fn windows_path_stamps_agree_with_handle_stamps() {
 	assert_eq!(dir_by_path.file_type, Some(FileType::Dir));
 }
 
+/// On Windows a stat that follows a symlink stamps its target as a handle
+/// does, `ChangeTime` included, also after an attribute change moved
+/// `ChangeTime` away from `LastWriteTime`; one that does not follow reports
+/// the link.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_following_stats_stamp_the_target_as_a_handle_does() {
+	let tmp = TempDir::new("win-link-stamps");
+	let target = tmp.write("root/target.txt", b"target");
+	let link = tmp.0.join("root/link.txt");
+	if let Err(err) = std::os::windows::fs::symlink_file(&target, &link) {
+		eprintln!("UNKNOWN: no file symlink could be made ({err}); the stamps were not compared");
+		return;
+	}
+	let set_readonly = |readonly: bool| {
+		let mut perms = std::fs::metadata(&target).unwrap().permissions();
+		perms.set_readonly(readonly);
+		std::fs::set_permissions(&target, perms).unwrap();
+	};
+	std::thread::sleep(std::time::Duration::from_millis(50));
+	// An attribute change moves `ChangeTime`, not `LastWriteTime`.
+	set_readonly(true);
+	let mut s = Fs::native().session();
+	let dir = s.open_dir(&tmp.0.join("root")).await.unwrap();
+	let (_, by_handle) = s.open_file_at(&dir, b"target.txt", false).await.unwrap();
+	let followed = s.stat(&link, true).await.unwrap();
+	let unfollowed = s.stat(&link, false).await.unwrap();
+	drop(dir);
+	set_readonly(false);
+	assert_eq!(unfollowed.file_type, Some(FileType::Symlink));
+	if by_handle.stamp.ctime == by_handle.stamp.mtime {
+		eprintln!(
+			"UNKNOWN: ChangeTime did not move away from LastWriteTime on this file system; the \
+			 stamps were not compared"
+		);
+		return;
+	}
+	assert_eq!(followed.file_type, Some(FileType::File));
+	assert_eq!(followed.size, 6);
+	assert_eq!(followed.stamp, by_handle.stamp, "the target's stamps differ");
+}
+
 /// A listed file's open follows a symlink there only when asked to.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]

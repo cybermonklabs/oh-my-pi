@@ -10,9 +10,10 @@
 //!   costs nothing extra and each call returns as many entries as possible.
 //! - Names convert from UTF-16 straight into the listing arena as WTF-8, which
 //!   round-trips unpaired surrogates back to the exact on-disk name.
-//! - Stats of an absolute path use `NtQueryFullAttributesFile`, which answers
-//!   without the caller opening a handle and stamps `ChangeTime` as a handle's
-//!   query does, so the listing cache compares like with like.
+//! - Stats of an absolute path use `NtQueryFullAttributesFile` (a reparse
+//!   point's target under `follow`: a handle opened by path), which stamp
+//!   `ChangeTime` as a handle's query does, so the listing cache compares like
+//!   with like. A file that refuses them falls back to `std::fs`.
 //!
 //! Reparse points (symlinks, junctions, mount points, cloud placeholders) are
 //! reported as symlinks and never descended. Opens that do not follow them
@@ -44,10 +45,10 @@ use windows_sys::{
 	},
 	Win32::{
 		Foundation::{
-			ERROR_DIRECTORY, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_INVALID_FUNCTION,
-			ERROR_INVALID_NAME, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
-			ERROR_STOPPED_ON_SYMLINK, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
-			STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, UNICODE_STRING,
+			ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_HANDLE_EOF, ERROR_INVALID_DATA,
+			ERROR_INVALID_FUNCTION, ERROR_INVALID_NAME, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+			ERROR_SHARING_VIOLATION, ERROR_STOPPED_ON_SYMLINK, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE,
+			RtlNtStatusToDosError, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, UNICODE_STRING,
 		},
 		Storage::FileSystem::{
 			BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
@@ -611,21 +612,63 @@ pub(crate) fn handle_metadata(h: &Handle) -> io::Result<pi_vfs::Metadata> {
 /// Describes the file at `path`. An absolute path is answered by
 /// [`full_attributes`], which describes a reparse point itself: without
 /// `follow` one is reported as [`FileType::Symlink`]; with `follow` its
-/// target is described through `std::fs`. Either way the stamp's `ctime` is
-/// `ChangeTime`, as the stamps taken from handles ([`stat_dir`],
-/// [`open_file_at`]) have it, which the listing cache compares them with.
+/// target is described through a handle opened by path ([`stat_target`]).
+/// Those stamps have `ChangeTime` as their `ctime`, as the stamps taken from
+/// handles ([`stat_dir`], [`open_file_at`]) have it, which the listing cache
+/// compares them with. A file that refuses those queries
+/// ([`refuses_queries`]; `C:\hiberfil.sys`, for one) and a relative path are
+/// described through `std::fs` instead ([`stat_win32`]), whose stamp has the
+/// last write time as its `ctime`.
 pub(crate) fn stat(s: &mut Scratch, path: &Path, follow: bool) -> io::Result<FileInfo> {
 	if !path.is_absolute() {
 		return stat_win32(path, follow);
 	}
-	let info = full_attributes(s, path)?;
-	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		if follow {
-			return stat_win32(path, true);
-		}
-		return Ok(FileInfo { file_type: Some(FileType::Symlink), size: 0, ..info_of(&info) });
+	let info = match full_attributes(s, path) {
+		Ok(info) => info,
+		Err(err) if refuses_queries(&err) => return stat_win32(path, follow),
+		Err(err) => return Err(err),
+	};
+	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+		Ok(info_of(&info))
+	} else if follow {
+		stat_target(path)
+	} else {
+		Ok(symlink_info(&info))
 	}
-	Ok(info_of(&info))
+}
+
+/// The final target of the reparse point at the absolute `path`, described
+/// through a handle opened by path following reparse points, as
+/// `std::fs::metadata` opens it: a dangling or looping link fails as it fails
+/// there. A target still a reparse point once opened (a cloud placeholder) is
+/// reported as a symlink, as [`stat_win32`] reports it. A target that refuses
+/// the open ([`refuses_queries`]) is described through [`stat_win32`].
+fn stat_target(path: &Path) -> io::Result<FileInfo> {
+	let h = match open_path(path, FILE_READ_ATTRIBUTES) {
+		Ok(h) => h,
+		Err(err) if refuses_queries(&err) => return stat_win32(path, true),
+		Err(err) => return Err(err),
+	};
+	let info = query_handle(&h)?;
+	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+		Ok(info_of(&info))
+	} else {
+		Ok(symlink_info(&info))
+	}
+}
+
+/// A reparse point described by `info`, reported as a symlink.
+const fn symlink_info(info: &FILE_NETWORK_OPEN_INFORMATION) -> FileInfo {
+	FileInfo { file_type: Some(FileType::Symlink), size: 0, ..info_of(info) }
+}
+
+/// Whether `err` is a refusal that `std::fs::metadata` answers from the
+/// directory's entry instead (`FindFirstFileExW`): `ERROR_SHARING_VIOLATION`
+/// from a system file locked even against attribute reads, or
+/// `ERROR_ACCESS_DENIED`.
+fn refuses_queries(err: &io::Error) -> bool {
+	err.raw_os_error()
+		.is_some_and(|code| matches!(code as u32, ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED))
 }
 
 /// `NtQueryFullAttributesFile` of the absolute `path`, which describes a
@@ -678,9 +721,10 @@ fn full_attributes(s: &mut Scratch, path: &Path) -> io::Result<FILE_NETWORK_OPEN
 	Ok(info)
 }
 
-/// [`stat`] of a relative path, or of a reparse point's target, through
-/// `std::fs`, which follows reparse points when `follow`. Its stamp's `ctime`
-/// is the last write time: `std::fs` metadata carries no `ChangeTime`.
+/// [`stat`] of a relative path, or of a file that refuses the attribute
+/// queries, through `std::fs`, which follows reparse points when `follow` and
+/// answers such a file from its directory's entry. Its stamp's `ctime` is the
+/// last write time: `std::fs` metadata carries no `ChangeTime`.
 fn stat_win32(path: &Path, follow: bool) -> io::Result<FileInfo> {
 	let meta = if follow {
 		std::fs::metadata(path)?
@@ -767,4 +811,61 @@ pub(crate) fn stable_stamps(h: &Handle, _stamp: &Stamp) -> bool {
 	["NTFS", "ReFS"]
 		.iter()
 		.any(|fs| fs.encode_utf16().eq(name.iter().copied()))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{os::windows::fs::OpenOptionsExt, path::PathBuf};
+
+	use super::{Scratch, full_attributes, refuses_queries, stat};
+	use crate::fs::FileType;
+
+	/// A stat of a file that refuses the attribute query falls back to
+	/// `std::fs`, which answers it from the directory's entry, with and
+	/// without `follow`, as `std::fs::metadata` does. The candidates are a
+	/// file this test holds open with share mode 0 and the system files that
+	/// are locked even against attribute reads; a candidate that answers the
+	/// query is not checked, and when none refused it the test prints UNKNOWN.
+	#[test]
+	fn a_file_that_refuses_the_attribute_query_is_stated_through_std() {
+		let held = std::env::temp_dir().join(format!("pi-walker-locked-{}", std::process::id()));
+		std::fs::write(&held, b"held").unwrap();
+		let lock = std::fs::OpenOptions::new()
+			.read(true)
+			.share_mode(0)
+			.open(&held)
+			.unwrap();
+		let mut candidates = vec![held.clone()];
+		candidates.extend(
+			[r"C:\hiberfil.sys", r"C:\pagefile.sys", r"C:\swapfile.sys", r"D:\pagefile.sys"]
+				.map(PathBuf::from),
+		);
+		let mut s = Scratch::default();
+		let (mut reached, mut answered) = (Vec::new(), Vec::new());
+		for path in &candidates {
+			match full_attributes(&mut s, path) {
+				Err(err) if refuses_queries(&err) => {},
+				other => {
+					answered.push(format!("{}: {:?}", path.display(), other.map(|_| "answered")));
+					continue;
+				},
+			}
+			let want = std::fs::symlink_metadata(path).expect("std answers it");
+			for follow in [false, true] {
+				let info = stat(&mut s, path, follow)
+					.unwrap_or_else(|err| panic!("{} (follow {follow}): {err}", path.display()));
+				assert_eq!(info.file_type, Some(FileType::File), "{}", path.display());
+				assert_eq!(info.size, want.len(), "{}", path.display());
+			}
+			reached.push(path.display().to_string());
+		}
+		drop(lock);
+		let _ = std::fs::remove_file(&held);
+		if reached.is_empty() {
+			eprintln!(
+				"UNKNOWN: no candidate refused the attribute query ({}); the fallback was not checked",
+				answered.join("; ")
+			);
+		}
+	}
 }
