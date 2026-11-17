@@ -12,6 +12,8 @@ const ENV_KEYS = [
 	"PI_CONFIG_DIR",
 	"PI_CODING_AGENT_DIR",
 	"PI_NATIVES_DIR",
+	"OMP_CONFIG_ROOT",
+	"OMP_DOWNLOAD_ROOT",
 	"XDG_DATA_HOME",
 	"XDG_STATE_HOME",
 	"XDG_CACHE_HOME",
@@ -91,5 +93,14 @@ describe("native directory override", () => {
 	])("keeps the existing cache root when the override is %s", (_label, override) => {
 		process.env.PI_NATIVES_DIR = override;
 		expect(getNativesDir()).toBe(path.join(home, ".omp", "natives"));
+	});
+
+	it("takes the download root's natives below PI_NATIVES_DIR", () => {
+		const downloads = path.join(tempRoot, "downloads");
+		process.env.OMP_DOWNLOAD_ROOT = downloads;
+		process.env.OMP_CONFIG_ROOT = path.join(tempRoot, "config");
+		expect(getNativesDir()).toBe(path.join(downloads, "natives"));
+		process.env.PI_NATIVES_DIR = path.join(tempRoot, "shared");
+		expect(getNativesDir()).toBe(path.join(tempRoot, "shared"));
 	});
 });

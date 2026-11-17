@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `ref` option to `sleepLong()`: `{ ref: false }` arms every chunk unreferenced, so a day-scale deadline does not by itself keep the process alive ([#17400](https://github.com/can1357/oh-my-pi/pull/17400) by [@sjawhar](https://github.com/sjawhar))
+- Added `expandTilde(path, home?)` (`@oh-my-pi/pi-utils/path`), which expands a leading `~` to the home directory; `@oh-my-pi/pi-coding-agent/tools/path-utils` re-exports it ([#17931](https://github.com/can1357/oh-my-pi/pull/17931) by [@will-bogusz](https://github.com/will-bogusz))
+- Added `stderrSharesStdoutTerminal()`, which reports whether stderr is the terminal stdout writes to ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Added `headerRetryAfterMs` to `RetryHintOptions`: `extractRetryHint` merges an already parsed response-header delay with the body's signals, longest first ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
+- Added `OMP_CONFIG_ROOT`, an absolute config root that replaces `~/.omp` on every OS (profiles, the default agent directory, and all state, data and caches move under it), and `OMP_DOWNLOAD_ROOT`, a config root that holds only the version-fixed downloads (the managed Chromium, the native addon and its grammars, FastEmbed models and runtime, tiny models), so several config roots share one copy; added `getConfigRootOverride()` and `getBrowserStateDir()`. The test preload gives every test process a config root of its own and shares only the developer's downloads
+
+### Fixed
+
+- Fixed test processes (`PI_TEST_RUNTIME=1` or a Bun test entrypoint) loading `~/.env` and the config root's `.env` (`~/.omp/.env`), which put the developer's auth broker, tokens and provider keys back into a test's environment; the agent directory's and project's `.env` files still load
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

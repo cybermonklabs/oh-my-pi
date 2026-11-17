@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +6,7 @@ import { defaultTripleDbPath, TripleStore } from "@oh-my-pi/pi-mnemopi/core/trip
 
 const originalHome = process.env.HOME;
 const originalDataDir = process.env.MNEMOPI_DATA_DIR;
+const originalConfigRoot = process.env.OMP_CONFIG_ROOT;
 const roots: string[] = [];
 
 function tempRoot(): string {
@@ -14,11 +15,19 @@ function tempRoot(): string {
 	return root;
 }
 
+// Each case builds the home its default and legacy locations derive from, so the config
+// root the test preload relocated is cleared for its scope.
+beforeEach(() => {
+	delete process.env.OMP_CONFIG_ROOT;
+});
+
 afterEach(() => {
 	if (originalHome === undefined) delete process.env.HOME;
 	else process.env.HOME = originalHome;
 	if (originalDataDir === undefined) delete process.env.MNEMOPI_DATA_DIR;
 	else process.env.MNEMOPI_DATA_DIR = originalDataDir;
+	if (originalConfigRoot === undefined) delete process.env.OMP_CONFIG_ROOT;
+	else process.env.OMP_CONFIG_ROOT = originalConfigRoot;
 	while (roots.length > 0) rmSync(roots.pop() as string, { recursive: true, force: true });
 });
 
@@ -69,6 +78,31 @@ describe("TripleStore default data-directory handling", () => {
 		}
 		expect(existsSync(legacyDb)).toBe(true);
 		expect(existsSync(join(dataDir, "triples.db"))).toBe(true);
+	});
+
+	it("never reads the legacy home database under a relocated omp config root", () => {
+		const root = tempRoot();
+		const home = join(root, "home");
+		const configRoot = join(root, "config");
+		const legacyDb = join(home, ".hermes", "mnemopi", "data", "triples.db");
+		process.env.HOME = home;
+		delete process.env.MNEMOPI_DATA_DIR;
+		process.env.OMP_CONFIG_ROOT = configRoot;
+
+		const legacy = new TripleStore(legacyDb);
+		try {
+			legacy.add("legacy-subject", "legacy-predicate", "legacy-object", { validFrom: "2026-05-08" });
+		} finally {
+			legacy.close();
+		}
+
+		const store = new TripleStore();
+		try {
+			expect(store.dbPath).toBe(join(configRoot, "mnemopi", "data", "triples.db"));
+			expect(store.query({ subject: "legacy-subject" })).toEqual([]);
+		} finally {
+			store.close();
+		}
 	});
 
 	it("supports single-current-truth CRUD and historical queries", () => {

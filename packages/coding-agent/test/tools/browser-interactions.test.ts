@@ -13,12 +13,18 @@ import {
 	resolveActionableQueryHandlerClickTarget,
 	TypingInterruptedError,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/interactions";
-import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import {
+	acquireBrowser,
+	type BrowserHandle,
+	holdBrowser,
+	releaseBrowser,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { TERN_KIT_SOURCE } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/page-kit";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
+import { holdHeadlessBrowserForFile } from "./held-browser";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 const TAB_NAME = `interactions-${crypto.randomUUID()}`;
@@ -85,6 +91,18 @@ beforeAll(async () => {
 	uploadPath = path.join(tempDir, "drop-fixture.txt");
 	await Bun.write(uploadPath, "drop contents");
 });
+// After the hook above, which makes the directory the sessions run in.
+holdHeadlessBrowserForFile(CHROMIUM_AVAILABLE, () => tempDir);
+
+/**
+ * The file's headless browser, held for one test: the `releaseBrowser` in the test's `finally` gives this hold back.
+ * `acquireBrowser` takes no hold, so a release without it took the file's hold instead and closed its browser.
+ */
+async function acquireHeldHeadless(): Promise<BrowserHandle> {
+	const handle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+	holdBrowser(handle);
+	return handle;
+}
 
 afterAll(async () => {
 	await releaseAllTabs({ kill: true });
@@ -94,7 +112,7 @@ afterAll(async () => {
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("browser click timeouts", () => {
 	test("rejects promptly when a text-click candidate evaluation is aborted", async () => {
-		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		const browserHandle = await acquireHeldHeadless();
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
 		const page = await browserHandle.browser.newPage();
 		try {
@@ -151,7 +169,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser click timeouts", () => {
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("browser fill aborts", () => {
 	test("reports a rich-text replacement that was already sent when the fill is aborted", async () => {
-		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		const browserHandle = await acquireHeldHeadless();
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
 		const page = await browserHandle.browser.newPage();
 		try {
@@ -1674,7 +1692,7 @@ return picks;`,
 	}, 30_000);
 
 	test("fails a click the browser does not deliver and completes the rest", async () => {
-		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		const browserHandle = await acquireHeldHeadless();
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
 		const page = await browserHandle.browser.newPage();
 		const outcomes = async (ids: string[]): Promise<Record<string, string>> => {
@@ -1748,7 +1766,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	}, 30_000);
 
 	test("skips an off-screen text match that stays clipped once scrolled to", async () => {
-		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		const browserHandle = await acquireHeldHeadless();
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
 		const page = await browserHandle.browser.newPage();
 		try {
@@ -1770,7 +1788,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	}, 30_000);
 
 	test("scrolls off-screen text matches only until the first reachable one", async () => {
-		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		const browserHandle = await acquireHeldHeadless();
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
 		const page = await browserHandle.browser.newPage();
 		try {
@@ -1803,7 +1821,7 @@ document.getElementById("menu-item").addEventListener("pointerdown", event => {
 	}, 30_000);
 
 	test("clips query matches only by overflow boxes holding their containing block, through slots", async () => {
-		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		const browserHandle = await acquireHeldHeadless();
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
 		const page = await browserHandle.browser.newPage();
 		const later = `<button id="later" style="position: absolute; top: 200px; left: 10px">Pick</button>`;
