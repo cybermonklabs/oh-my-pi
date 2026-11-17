@@ -31,7 +31,7 @@ import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-st
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { persistedAgentDefinition } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 const TITLE = "Refactor the module tree";
@@ -78,6 +78,74 @@ function phases(label: string) {
 	];
 }
 
+/** Custom types of a messaging extension that keeps its own state in the session. */
+const ROLE_CLAIM_TYPE = "relay-role-claim";
+const REPLAY_STATE_TYPE = "relay-replay-state";
+const REPLAY_DELIVERED_TYPE = "relay-replay-delivered";
+const CONSUMER_STATE_TYPE = "relay-consumer-state";
+
+/** One `custom` entry of the messaging extension, with the id {@link sessionText} writes it under. */
+interface RelayEntry {
+	id: string;
+	customType: string;
+	data: object;
+}
+
+/**
+ * A messaging extension's own entries in session `sessionId` (`entries`, by
+ * where {@link sessionText} writes them with `relay`, all before the cut) and
+ * what it restores from them (`restored`): the newest valid role claim on the
+ * current path (`r2`, over the older `r1` and over `rb`, on the other branch
+ * and newer in the file), every replay state in order with the topics of the
+ * newest, every delivery of the ledger, and this session's consumer state
+ * (`q1`, not the newer `q2` of another session).
+ */
+function relayState(sessionId: string) {
+	const ownTopic = "notifications.agent.3b8f6a2e-5d41-4c9a-8e07-1f2d3c4b5a69";
+	const peerTopic = "notifications.agent.9e1c7d40-2a6b-4f38-b5d2-6c8e0a1f7b34";
+	const olderState = { subjects: { [ownTopic]: {} } };
+	const newerState = { topics: [ownTopic, peerTopic] };
+	const claim = { role: "reviewer", session_id: sessionId, client_instance_id: "client-7f3a" };
+	const consumer = { session_id: sessionId, resume: { stream_id: "agent-notifications", seq: 41 } };
+	const otherConsumer = {
+		session_id: "0f6d2b84-7c1e-4a95-9b3d-5e8a2c6f1d07",
+		resume: { stream_id: "agent-notifications", seq: 7 },
+	};
+	const delivered = (index: number) => ({
+		event_id: `${index}c4e9a07b2f5d18e6`,
+		dedupe_key: `review-request:${index}`,
+		at: Date.parse(TIMESTAMP) + index * 1000,
+	});
+	const entry = (id: string, customType: string, data: object): RelayEntry => ({ id, customType, data });
+	return {
+		entries: {
+			beforeC1: [
+				entry("r1", ROLE_CLAIM_TYPE, { role: "planner" }),
+				entry("p1", REPLAY_STATE_TYPE, olderState),
+				entry("d1", REPLAY_DELIVERED_TYPE, delivered(1)),
+				entry("q1", CONSUMER_STATE_TYPE, consumer),
+			],
+			beforeC2: [entry("d2", REPLAY_DELIVERED_TYPE, delivered(2)), entry("q2", CONSUMER_STATE_TYPE, otherConsumer)],
+			beforeC3: [
+				entry("r2", ROLE_CLAIM_TYPE, claim),
+				entry("p2", REPLAY_STATE_TYPE, newerState),
+				entry("d3", REPLAY_DELIVERED_TYPE, delivered(3)),
+			],
+			otherBranch: [
+				entry("rb", ROLE_CLAIM_TYPE, { role: "worker" }),
+				entry("d4", REPLAY_DELIVERED_TYPE, delivered(4)),
+			],
+		},
+		restored: {
+			claim,
+			states: [olderState, newerState],
+			topics: newerState.topics,
+			ledger: [delivered(1), delivered(2), delivered(3), delivered(4)],
+			consumer,
+		},
+	};
+}
+
 /**
  * A titled session. On the current path: `c1` keeps from `u2`, `c2` from
  * `u4`, `c3` from `u7` (the cut). Before the cut lie a session contract
@@ -85,9 +153,11 @@ function phases(label: string) {
  * the default and the `smol` role, a thinking level, a service tier, a TTSR
  * injection, a plan mode, a custom entry, a custom message, and a second
  * branch off `c2` (`b1`, `b2`) left for `bs`. With `interrupted`, the last
- * turn stopped after a `probe` call that never got its result.
+ * turn stopped after a `probe` call that never got its result. With `relay`,
+ * a messaging extension's own entries ({@link relayState}) lie before the
+ * cut too: before `c1`, before `c2`, before `c3` and on the other branch.
  */
-function sessionText(id: string, cwd: string, options: { interrupted?: boolean } = {}): string {
+function sessionText(id: string, cwd: string, options: { interrupted?: boolean; relay?: boolean } = {}): string {
 	const lines: object[] = [{ type: "session", version: CURRENT_SESSION_VERSION, id, timestamp: TIMESTAMP, cwd }];
 	const add = (entryType: string, entryId: string, parentId: string | null, fields: object) =>
 		lines.push({ type: entryType, id: entryId, parentId, timestamp: TIMESTAMP, ...fields });
@@ -111,6 +181,16 @@ function sessionText(id: string, cwd: string, options: { interrupted?: boolean }
 		});
 	const compaction = (entryId: string, parentId: string, firstKeptEntryId: string) =>
 		add("compaction", entryId, parentId, { summary: text(entryId), firstKeptEntryId, tokensBefore: 1000 });
+	const relay = options.relay ? relayState(id).entries : undefined;
+	/** Chain `entries` after `parentId`; returns the id the next entry hangs from. */
+	const chain = (parentId: string, entries: readonly RelayEntry[] = []) => {
+		let last = parentId;
+		for (const entry of entries) {
+			add("custom", entry.id, last, { customType: entry.customType, data: entry.data });
+			last = entry.id;
+		}
+		return last;
+	};
 
 	add("session_init", "s0", null, {
 		systemPrompt: [text("system prompt")],
@@ -124,7 +204,7 @@ function sessionText(id: string, cwd: string, options: { interrupted?: boolean }
 	assistant("a1", "m1", { id: "call_t1", name: "todo", arguments: { op: "replace" } });
 	todo("t1", "a1", "call_t1");
 	add("custom", "x1", "t1", { customType: "test-ledger", data: { checkpoints: ["first", "second"] } });
-	user("u2", "x1");
+	user("u2", chain("x1", relay?.beforeC1));
 	assistant("a2", "u2");
 	compaction("c1", "a2", "u2");
 	add("thinking_level_change", "k1", "c1", { thinkingLevel: "high", configured: "high" });
@@ -132,7 +212,7 @@ function sessionText(id: string, cwd: string, options: { interrupted?: boolean }
 	add("service_tier_change", "st", "m2", { serviceTier: { anthropic: "priority" } });
 	add("ttsr_injection", "tt", "st", { injectedRules: ["no-console-log", "prefer-bun-file"] });
 	add("mode_change", "md", "tt", { mode: "plan", data: { planFile: "PLAN.md" } });
-	user("u3", "md");
+	user("u3", chain("md", relay?.beforeC2));
 	assistant("a3", "u3", { id: "call_t3", name: "todo", arguments: { op: "replace" } });
 	todo("t3", "a3", "call_t3");
 	add("custom_message", "cm", "t3", {
@@ -145,9 +225,10 @@ function sessionText(id: string, cwd: string, options: { interrupted?: boolean }
 	compaction("c2", "a4", "u4");
 	user("u5", "c2");
 	assistant("a5", "u5");
+	const beforeBranchSummary = chain("a5", relay?.beforeC3);
 	user("b1", "c2");
-	assistant("b2", "b1");
-	add("branch_summary", "bs", "a5", { fromId: "b2", summary: text("bs") });
+	assistant("b2", chain("b1", relay?.otherBranch));
+	add("branch_summary", "bs", beforeBranchSummary, { fromId: "b2", summary: text("bs") });
 	user("u6", "bs");
 	assistant("a6", "u6");
 	user("u7", "a6");
@@ -174,7 +255,7 @@ interface WrittenSession {
 async function writeSession(
 	root: string,
 	name: string,
-	options: { interrupted?: boolean } = {},
+	options: { interrupted?: boolean; relay?: boolean } = {},
 ): Promise<WrittenSession> {
 	const id = crypto.randomUUID();
 	const cwd = path.join(root, name, "project");
@@ -209,6 +290,48 @@ function probeTool(executed: string[]): AgentTool {
 		},
 	};
 	return tool as AgentTool;
+}
+
+/** The `data` of every `customType` entry among `entries`, filtered as the messaging extension filters them. */
+function customData(entries: readonly SessionEntry[], customType: string): unknown[] {
+	return entries.flatMap(entry =>
+		entry.type === "custom" && entry.customType === customType && "data" in entry ? [entry.data] : [],
+	);
+}
+
+/** The topics a replay state names: its `topics`, or the keys of the older form's `subjects`; none when invalid. */
+function replayStateTopics(data: unknown): string[] | undefined {
+	if (!isRecord(data)) return undefined;
+	if (Array.isArray(data.topics)) {
+		return data.topics.every(topic => typeof topic === "string") ? data.topics : undefined;
+	}
+	return isRecord(data.subjects) ? Object.keys(data.subjects) : undefined;
+}
+
+/**
+ * What the messaging extension restores after a resume, each read through the
+ * accessor it uses: the role claim from the current path (`getBranch()`), its
+ * `role` a string or null and its `session_id` and `client_instance_id`
+ * strings when set, and the replay states, the ledger and the consumer state
+ * from every entry (`getEntries()`).
+ */
+function relayRestored(manager: SessionManager): unknown {
+	const states = customData(manager.getEntries(), REPLAY_STATE_TYPE);
+	return wire({
+		claim: customData(manager.getBranch(), ROLE_CLAIM_TYPE).findLast(
+			data =>
+				isRecord(data) &&
+				(typeof data.role === "string" || data.role === null) &&
+				(data.session_id === undefined || typeof data.session_id === "string") &&
+				(data.client_instance_id === undefined || typeof data.client_instance_id === "string"),
+		),
+		states,
+		topics: states.map(replayStateTopics).findLast(topics => topics !== undefined),
+		ledger: customData(manager.getEntries(), REPLAY_DELIVERED_TYPE),
+		consumer: customData(manager.getEntries(), CONSUMER_STATE_TYPE).findLast(
+			data => isRecord(data) && data.session_id === manager.getSessionId(),
+		),
+	});
 }
 
 describe("features that read older entries, on a session whose older bodies are cold", () => {
@@ -478,6 +601,27 @@ describe("features that read older entries, on a session whose older bodies are 
 			const coldPhases = (await startSession(cold)).session.getTodoPhases();
 			expect(wire(coldPhases)).toEqual(wire(phases("t3")));
 			expect(wire(coldPhases)).toEqual(wire((await startSession(whole)).session.getTodoPhases()));
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
+		"restores a messaging extension's role claim, topics, replay ledger and consumer state after a resume as a manager holding every entry does",
+		async () => {
+			// A messaging extension's role claim, topics, replay ledger and consumer state after a resume: it reads
+			// its own custom entries, all written before the cut, through getBranch() and getEntries().
+			const written = await writeSession(tempRoot(), "session", { relay: true });
+			const { cold, whole } = await openBoth(written.file);
+			const expected = wire(relayState(written.id).restored);
+			expect(relayRestored(cold)).toEqual(expected);
+			expect(relayRestored(cold)).toEqual(relayRestored(whole));
+
+			// Once more after a read served from the store, so reads from the store and from memory agree.
+			const materializations = cold.coldStoreStats().materializations;
+			expect(wire(cold.getEntries())).toEqual(wire(whole.getEntries()));
+			expect(cold.coldStoreStats().materializations).toBeGreaterThan(materializations);
+			expect(relayRestored(cold)).toEqual(expected);
+			expect(relayRestored(cold)).toEqual(relayRestored(whole));
 		},
 		CASE_TIMEOUT_MS,
 	);
