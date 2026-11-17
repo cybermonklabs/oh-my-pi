@@ -87,7 +87,9 @@ where
 	let (jobs, queue) = flume::bounded::<Job<I>>(states.len());
 	let mut tasks = Vec::with_capacity(states.len() + 1);
 	let permits = Arc::new(Semaphore::new(window.max(1)));
-	let failed = results.clone();
+	// Weak, so the outputs still end once every worker has gone: the feeder
+	// can outlive them, waiting on an input that never ends or on a permit.
+	let failed = results.downgrade();
 	tasks.push(
 		tokio::spawn(async move {
 			let mut inputs = pin!(inputs);
@@ -105,7 +107,11 @@ where
 					// consumer resumes it after every output before it rather
 					// than seeing the outputs end early.
 					Err(panic) => {
-						let _ = failed.send(Done { seq, output: Err(panic), permit });
+						// With every worker gone, the consumer already has their
+						// panics, and nothing is left to report this one to.
+						if let Some(failed) = failed.upgrade() {
+							let _ = failed.send(Done { seq, output: Err(panic), permit });
+						}
 						return;
 					},
 				};
@@ -547,5 +553,42 @@ mod tests {
 		let panic = resumed.expect("the input panic was swallowed; the outputs ended early");
 		let message = panic.downcast_ref::<String>().map_or("", String::as_str);
 		assert!(message.contains("input boom"), "{message:?}");
+	}
+
+	/// The outputs end once every worker has gone, also while the feeder
+	/// still waits on its input: a consumer that catches each resumed panic
+	/// and polls again must not wait for ever.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn outputs_end_when_every_worker_panicked_and_the_input_waits() {
+		let default = std::panic::take_hook();
+		std::panic::set_hook(Box::new(move |info| {
+			if !info.to_string().contains("work boom") {
+				default(info);
+			}
+		}));
+		let inputs = stream::iter(0..2_u32).chain(stream::pending());
+		let mut outputs = ordered(
+			inputs,
+			2,
+			4,
+			|| (),
+			|(), n: u32| async move {
+				assert!(n > 100, "work boom");
+				((), n)
+			},
+		);
+		let mut panics = 0;
+		let ended = tokio::time::timeout(Duration::from_secs(10), async {
+			loop {
+				match AssertUnwindSafe(outputs.next()).catch_unwind().await {
+					Ok(Some(_)) => {},
+					Ok(None) => break,
+					Err(_) => panics += 1,
+				}
+			}
+		})
+		.await;
+		assert!(ended.is_ok(), "outputs never ended after {panics} panics");
+		assert_eq!(panics, 2, "each worker's panic resumes once");
 	}
 }
