@@ -315,6 +315,30 @@ async fn wide_trees_agree_on_every_worker_count() {
 	}
 }
 
+/// Every walk ends, also when a waiting worker's wakeup is lost: flume
+/// 0.12's `recv_async` misses a message sent while it re-registers after
+/// another worker took the message it was woken for (zesterer/flume#177).
+/// Ending the walk with one stop message per worker left such a worker
+/// waiting forever, and its walk with it; on a loaded machine one walk in a
+/// few thousand of this shape did.
+#[tokio::test(flavor = "multi_thread")]
+async fn walks_end_when_a_waiting_worker_misses_a_wakeup() {
+	let tmp = make_tree("ends", &["a.txt", "d1/x", "d2/y", "d3/z", "d4/w", "d5/v/u"]);
+	let fs = Fs::native();
+	let opts = Options { workers: Some(8), ..Default::default() };
+	for round in 0..20_000 {
+		let walked = drain(&fs, tmp.path(), &opts, |_, _, out: &mut Vec<()>| {
+			out.push(());
+			Action::Continue
+		});
+		let (visited, _) = tokio::time::timeout(Duration::from_secs(30), walked)
+			.await
+			.unwrap_or_else(|_| panic!("walk {round} did not end"))
+			.expect("walk");
+		assert_eq!(visited.len(), 12, "walk {round}");
+	}
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn visitor_actions() {
 	let tmp = make_tree("actions", &["keep/a", "skip/b", "skip/c/d"]);
