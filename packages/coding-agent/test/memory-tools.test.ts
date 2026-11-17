@@ -1960,7 +1960,7 @@ describe("recall.execute", () => {
 		const recallSpy = vi.spyOn(HindsightApi.prototype, "recall").mockRejectedValue(new Error("HTTP 503"));
 		registerState(client, settings, {
 			sessionOverrides: {
-				sessionManager: { getEntries: () => [], getBranch: () => [], appendCustomEntry: () => "" },
+				sessionManager: { getEntries: () => [], getBranch: () => [] },
 			},
 		});
 		const state = registeredState!;

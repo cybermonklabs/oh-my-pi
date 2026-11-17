@@ -90,7 +90,6 @@ export class RecallFailureWait {
 
 	/** The failure that holds off an automatic recall at `now`; undefined when the recall may run. */
 	skip(now: number): RecallSkip | undefined {
-		if (this.#cooldownMs <= 0) return undefined;
 		const failure = this.#failure;
 		if (!failure || !isWaiting(failure, this.#cooldownMs, now)) return undefined;
 		const first = this.#announced !== failure;
@@ -110,8 +109,9 @@ export class RecallFailureWait {
 	/**
 	 * Records an automatic recall's outcome. A failure (`failure`, its cause) starts a pause,
 	 * or a doubled one when the previous pause has ended. A failure during a running pause
-	 * changes nothing. An answered recall (`ok`) ends the pause, so the next failure starts
-	 * again at the first pause. An aborted or stale recall has neither and records nothing.
+	 * changes nothing. An answered recall (`ok`) ends the pause, also one that a conversation
+	 * reset made stale, so the next failure starts again at the first pause. An aborted recall,
+	 * or a failure that a reset made stale, has neither and records nothing.
 	 */
 	record(outcome: { ok: boolean; failure?: string }, now: number): void {
 		if (this.#cooldownMs <= 0) return;

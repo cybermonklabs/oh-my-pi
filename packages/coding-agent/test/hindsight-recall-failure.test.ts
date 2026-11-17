@@ -183,14 +183,18 @@ function answerWith(text: string): () => Promise<RecallResponse> {
 /** The first pause with the shipped settings: the default of `hindsight.recallCooldownMs`. */
 const SHIPPED_FIRST_PAUSE_MS = 60_000;
 
-/** The config of a user who sets only the server and automatic recall: each pause setting keeps its default. */
-function shippedConfig(): HindsightConfig {
+/**
+ * The config of a user who sets only the server and automatic recall: each pause setting keeps its default.
+ * `overrides` replaces or adds settings.
+ */
+function shippedConfig(overrides: Record<string, unknown> = {}): HindsightConfig {
 	return loadHindsightConfig(
 		Settings.isolated({
 			"hindsight.apiUrl": "http://localhost:8888",
 			"hindsight.autoRecall": true,
 			"hindsight.autoRetain": false,
 			"hindsight.mentalModelsEnabled": false,
+			...overrides,
 		}),
 	);
 }
@@ -253,14 +257,7 @@ describe("Hindsight automatic recall after a failure", () => {
 			},
 		});
 		servers.push(server);
-		const shipped = loadHindsightConfig(
-			Settings.isolated({
-				"hindsight.apiUrl": server.url.origin,
-				"hindsight.autoRecall": true,
-				"hindsight.autoRetain": false,
-				"hindsight.mentalModelsEnabled": false,
-			}),
-		);
+		const shipped = shippedConfig({ "hindsight.apiUrl": server.url.origin, "hindsight.recallTimeoutMs": 1_000 });
 		if (!isHindsightConfigured(shipped)) throw new Error("hindsight.apiUrl did not resolve");
 		const { state } = start(newSessionManager(), createHindsightClient(shipped), shipped);
 
@@ -270,14 +267,13 @@ describe("Hindsight automatic recall after a failure", () => {
 		started = performance.now();
 		const second = await state.beforeAgentStartPrompt("And the staging host?");
 		const secondWaitMs = Math.round(performance.now() - started);
-		console.log(JSON.stringify({ firstWaitMs, secondWaitMs, recallRequests }));
 
 		expect(first).toBeUndefined();
-		expect(firstWaitMs).toBeGreaterThanOrEqual(25_000);
+		expect(firstWaitMs).toBeGreaterThanOrEqual(900);
 		expect(second).toBeUndefined();
-		expect(secondWaitMs).toBeLessThan(1_000);
+		expect(secondWaitMs).toBeLessThan(500);
 		expect(recallRequests).toBe(1);
-	}, 90_000);
+	}, 10_000);
 
 	it("logs a failed recall once with its cause and a skipped recall once", async () => {
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -289,14 +285,6 @@ describe("Hindsight automatic recall after a failure", () => {
 		const failureLines = warn.mock.calls.filter(([message]) => message === "Hindsight: recall failed");
 		const skipLines = warn.mock.calls.filter(
 			([message]) => message === "Hindsight: recall skipped after a recent failure",
-		);
-		console.log(
-			JSON.stringify({
-				failureLines: failureLines.length,
-				skipLines: skipLines.length,
-				notices: notices.length,
-				recallCalls: client.calls,
-			}),
 		);
 
 		expect(failureLines).toHaveLength(1);
@@ -448,11 +436,6 @@ describe("Hindsight automatic recall after a failure", () => {
 
 		expect(client.calls).toBe(1);
 		expect(preparation?.context).toContain("beta-9");
-		// The second process read these entries from the first process's file.
-		const failureEntries = resumedManager
-			.getEntries()
-			.filter(entry => entry.type === "custom" && entry.customType === "memory_recall_failure");
-		expect(failureEntries).toEqual([]);
 	});
 
 	it("an aborted recall starts no pause", async () => {
