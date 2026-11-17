@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed `ChildProcess.kill()` and disposing a `ChildProcess` reporting the process's exit as an unhandled rejection when the process exits before anyone waits on it
 - Fixed abort signals leaving command output reads blocked when a descendant keeps stdout or stderr open after the root process exits. ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.17.0] - 2026-11-06
