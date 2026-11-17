@@ -1707,4 +1707,44 @@ describe("ProviderImageClamp", () => {
 		);
 		expect(continuesPrefix(main, next)).toBe(true);
 	});
+
+	it("shares its count drops with a side request but keeps the side request's byte drops out of its reports", () => {
+		const reported: string[] = [];
+		const main = new ProviderImageClamp((site, before, after) => {
+			reported.push(`${site} ${imageData(before).length - imageData(after).length}`);
+		});
+		const capture = main.sideRequestClamp();
+
+		// The capture drops the 7 oldest images the main loop's count clamp dropped, so it reads the main prefix.
+		main.clampImageCount(request(conversation(4)), UMANS_MODEL);
+		expect(imageData(capture.clampImageCount(request(conversation(3)), UMANS_MODEL))).toEqual([
+			"image-2-1",
+			"image-2-2",
+		]);
+		expect(reported).toEqual(["image-count-clamp 7"]);
+
+		// Factory's hosted route keeps 3.5 MB of inline images: of n 1 MB screenshots the byte clamp drops n - 3.
+		const hosted = factoryDroidModel(factoryDroidWireBaseUrl("anthropic-messages", "global"));
+		const screenshot = "A".repeat(1_000_000);
+		const screenshots = (count: number) =>
+			request(
+				Array.from({ length: count }, (_, index) => ({
+					role: "toolResult" as const,
+					toolCallId: `call-${index}`,
+					toolName: "screenshot",
+					content: [text(`result-${index}`), image(screenshot)],
+					isError: false,
+					timestamp: index,
+				})),
+			);
+		main.clampImageBytes(screenshots(5), hosted);
+		expect(reported).toEqual(["image-count-clamp 7", "image-byte-clamp 2"]);
+		// A capture that drops 1 leaves the main loop's next request, which drops 2 again, unreported.
+		expect(imageData(capture.clampImageBytes(screenshots(4), hosted))).toHaveLength(3);
+		main.clampImageBytes(screenshots(5), hosted);
+		// A capture that drops 4 reports nothing, and the main loop still reports its own next drop, of 3.
+		expect(imageData(capture.clampImageBytes(screenshots(7), hosted))).toHaveLength(3);
+		main.clampImageBytes(screenshots(6), hosted);
+		expect(reported).toEqual(["image-count-clamp 7", "image-byte-clamp 2", "image-byte-clamp 3"]);
+	});
 });

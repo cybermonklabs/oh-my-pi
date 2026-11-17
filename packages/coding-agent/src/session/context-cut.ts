@@ -49,7 +49,8 @@ export interface ContextCutSession {
 	/**
 	 * The prompt cache entry the next request would read (the session's prompt cache status entry):
 	 * touched by the newest real or warm request that hit it. `undefined` when there is none, no reply
-	 * used the cache or the next request asks for no caching, so every cut counts as lapsed.
+	 * used the cache, the next request cannot read it (the entry's `change`) or asks for no caching,
+	 * so every cut counts as lapsed.
 	 */
 	cacheEntry: Pick<ObservedPromptCacheEntry, "tier" | "touchedAt" | "ttlMs"> | undefined;
 	/** The compaction policy in force for `model` (its threshold and reserve). */

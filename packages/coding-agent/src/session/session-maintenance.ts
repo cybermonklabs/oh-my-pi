@@ -817,11 +817,16 @@ export class SessionMaintenance {
 		return promptCacheEntryLapsed(this.#nextPromptCacheEntry(), Date.now());
 	}
 
-	/** The prompt cache entry the cut rule reads: none when the next request asks for no caching, so it counts as lapsed. */
+	/**
+	 * The prompt cache entry the cut rule reads: none when the next request asks for no caching or cannot read the
+	 * entry (its `change`: the model, thinking level, tools, system prompt or retention changed since, or a compaction
+	 * replaced what it cached), so it counts as lapsed.
+	 */
 	#nextPromptCacheEntry(): ObservedPromptCacheEntry | undefined {
 		const retention = cfgProvidersCacheRetention.get(this.#host.settings);
-		const cachesNext = resolveCacheRetention(retention === "auto" ? undefined : retention) !== "none";
-		return cachesNext ? this.#host.observedPromptCacheEntry() : undefined;
+		if (resolveCacheRetention(retention === "auto" ? undefined : retention) === "none") return undefined;
+		const entry = this.#host.observedPromptCacheEntry();
+		return entry?.change === undefined ? entry : undefined;
 	}
 
 	/** `P` for a cut whose site did not measure it: the live context, floored by the stored estimate. */
@@ -4739,8 +4744,9 @@ export class SessionMaintenance {
 		}
 		if (signal.aborted) return false;
 		let imagesDropped = 0;
-		// The pass measures the image tokens itself; p = 0 is the conservative bound, and a forced
-		// cut's figures only reach the log.
+		// The pass measures the image tokens itself, so the cut states s = 0. Forced, it is admitted whatever its
+		// figures, which the rule logs; p = 0, the conservative bound, also tells AgentSession's cut listener that it
+		// rewrites every message, so a held settings rebuild runs before the next request, as after a compaction.
 		if (this.admitsContextCut({ site: "rescue-drop-images", prefixTokens: 0, removedTokens: 0, forced: true })) {
 			try {
 				imagesDropped = (await this.#host.dropImages()).removed;

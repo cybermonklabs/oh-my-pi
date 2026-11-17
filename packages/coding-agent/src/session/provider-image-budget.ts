@@ -310,13 +310,23 @@ export type ForcedImageDrop = (site: "image-count-clamp" | "image-byte-clamp", b
  * drop that evicts more than the previous request is reported as forced.
  */
 export class ProviderImageClamp {
-	readonly #drops = new LRUCache<string, StickyImageDrop>({ max: MAX_STICKY_IMAGE_CONVERSATIONS });
+	#drops = new LRUCache<string, StickyImageDrop>({ max: MAX_STICKY_IMAGE_CONVERSATIONS });
 	readonly #onForcedDrop: ForcedImageDrop | undefined;
 	/** Images the byte clamp evicted from the previous request. */
 	#byteDrops = 0;
 
 	constructor(onForcedDrop?: ForcedImageDrop) {
 		this.#onForcedDrop = onForcedDrop;
+	}
+
+	/**
+	 * A clamp for a side request of this conversation: it shares the count clamp's drops, so it sends the images this
+	 * conversation sends, but it counts its own byte drops and reports no forced drop.
+	 */
+	sideRequestClamp(): ProviderImageClamp {
+		const side = new ProviderImageClamp();
+		side.#drops = this.#drops;
+		return side;
 	}
 
 	/** {@link clampProviderContextImages}, dropping what this conversation's previous requests dropped. */
