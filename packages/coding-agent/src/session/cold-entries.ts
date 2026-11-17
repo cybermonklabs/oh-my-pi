@@ -3,10 +3,14 @@
  *
  * The model context only needs the entries of the current branch from the
  * latest compaction's cut on (see {@link coldBoundary}). An entry before the
- * cut, or off the current branch, becomes *cold*: the same
+ * cut, or off the current branch, becomes *cold*, as does a user's edit of the
+ * to-do list from the cut on that is not the newest snapshot: the same
  * object, converted in place, whose small values stay data properties and whose
  * large values become enumerable accessors that read the entry's record back
- * from a {@link ColdEntryStore}. `JSON.stringify`, spread and `structuredClone`
+ * from a {@link ColdEntryStore}. A cold message keeps as data only the small
+ * values of the fields that readers walking the whole branch on every turn
+ * read ({@link MESSAGE_FIELDS_KEPT_WHILE_SMALL}); its other fields are
+ * accessors whatever their size. `JSON.stringify`, spread and `structuredClone`
  * still see every field. A read returns a deep-frozen value, so a place that
  * writes into a nested value of a cold body fails with a `TypeError` instead of
  * losing the write; assigning a field (`entry.message = …`,
@@ -23,13 +27,15 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { type BlobStore, isBlobRef } from "./blob-store";
+import { TOOL_EXECUTION_START_CUSTOM_TYPE } from "./exit-diagnostics";
 import { compactionKeptStart, getReadableCompactionEntry } from "./session-context";
 import {
 	type CompactionEntry,
 	type FileEntry,
 	type SessionEntry,
 	TITLE_CHANGE_ENTRY_TYPE,
-	todoResultPhases,
+	todoSnapshotPhases,
+	USER_TODO_EDIT_CUSTOM_TYPE,
 } from "./session-entries";
 import { repairTruncatedSnapcompactFrames, resolveBlobRefsInEntriesSync } from "./session-loader";
 import { entryRecordText } from "./session-persistence";
@@ -73,10 +79,11 @@ function paceCollection(bytes: number): void {
 }
 
 /**
- * Entry types that stay whole before the cut: extension and feature state, and
- * the selections a resume restores (model of each role, thinking level,
- * service tier, mode, TTSR rules, labels, credential pins, `/clear` boundaries,
- * usage, titles). {@link entriesKeptWholeOnPath} adds two entries by position.
+ * Entry types that stay whole before the cut: extension and feature state
+ * (every `custom` type but those {@link keptWholeByKind} names), and the
+ * selections a resume restores (model of each role, thinking level, service
+ * tier, mode, TTSR rules, labels, credential pins, `/clear` boundaries, usage,
+ * titles). {@link entriesKeptWholeOnPath} adds two entries by position.
  */
 const ENTRY_TYPES_KEPT_WHOLE: ReadonlySet<string> = new Set<SessionEntry["type"]>([
 	"custom",
@@ -93,29 +100,71 @@ const ENTRY_TYPES_KEPT_WHOLE: ReadonlySet<string> = new Set<SessionEntry["type"]
 ]);
 
 /**
- * The one `custom` type that goes cold like a message: the patch records a
+ * The `custom` type that goes cold like a message: the patch records a
  * shake pass appends hold the new bodies of the entries they patch, which a
  * load applies to those entries; no turn reads the records themselves.
  */
 const PATCH_RECORD_CUSTOM_TYPE = "entry_patch";
 
+/**
+ * `custom` types of the core that go cold too, every value but the tree
+ * fields and `customType` read back from the store however small: a user's
+ * edit of the to-do list holds the whole list, of which the restore reads
+ * only the newest snapshot on the path, kept whole by position
+ * ({@link entriesKeptWholeOnPath}); a tool start marker is read only for the
+ * calls left pending at the end of the branch, which lie after the cut.
+ */
+const CORE_CUSTOM_TYPES_COLD: ReadonlySet<string> = new Set([
+	USER_TODO_EDIT_CUSTOM_TYPE,
+	TOOL_EXECUTION_START_CUSTOM_TYPE,
+]);
+
 /** Whether `entry` stays whole wherever it lies, by its type ({@link ENTRY_TYPES_KEPT_WHOLE}). */
 export function keptWholeByKind(entry: SessionEntry): boolean {
-	return (
-		ENTRY_TYPES_KEPT_WHOLE.has(entry.type) &&
-		!(entry.type === "custom" && entry.customType === PATCH_RECORD_CUSTOM_TYPE)
-	);
+	if (!ENTRY_TYPES_KEPT_WHOLE.has(entry.type)) return false;
+	if (entry.type !== "custom") return true;
+	return entry.customType !== PATCH_RECORD_CUSTOM_TYPE && !CORE_CUSTOM_TYPES_COLD.has(entry.customType);
 }
 
 /** Fields that always stay data: the tree structure every walk reads. */
 const ENTRY_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["type", "id", "parentId", "timestamp", "activeLeafId"]);
+/** The fields of a cold entry of {@link CORE_CUSTOM_TYPES_COLD} that stay data. */
+const CORE_CUSTOM_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set([...ENTRY_FIELDS_IN_MEMORY, "customType"]);
 const MESSAGE_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["role"]);
+/**
+ * The fields of a cold message that stay data while small: those that readers
+ * walking the whole branch read of every message. The check whether a new
+ * message is persisted already keys every message on the branch again after
+ * each entry that is not a message (every tool call appends a start marker)
+ * by `timestamp`, `provider`, `model`, `responseId`, `stopReason`,
+ * `toolCallId`, `toolName` and `attribution`; the prompt cache scan of a new
+ * branch view reads `stopReason` and `usage`; the to-do restore `toolName`
+ * and `isError`; the retry checks that find a failed reply `errorMessage`;
+ * `api`, `customType` and `display` tell extensions what a message is.
+ */
+const MESSAGE_FIELDS_KEPT_WHILE_SMALL: ReadonlySet<string> = new Set([
+	"timestamp",
+	"stopReason",
+	"toolCallId",
+	"toolName",
+	"isError",
+	"provider",
+	"model",
+	"api",
+	"usage",
+	"responseId",
+	"customType",
+	"display",
+	"attribution",
+	"errorMessage",
+]);
+const NO_FIELDS: ReadonlySet<string> = new Set();
 
 /**
  * Entries of `path` kept whole before the cut although their type is not:
  * the newest `session_init` (the contract a revived subagent rebuilds from)
- * and the newest `todo` result that records the list (what the to-do list
- * restores from).
+ * and the newest canonical to-do snapshot, a `todo` result that records the
+ * list or a user's edit of it (what the to-do list restores from).
  */
 export function entriesKeptWholeOnPath(path: readonly SessionEntry[]): Set<SessionEntry> {
 	const kept = new Set<SessionEntry>();
@@ -126,7 +175,7 @@ export function entriesKeptWholeOnPath(path: readonly SessionEntry[]): Set<Sessi
 		if (entry.type === "session_init") {
 			if (!sessionInit) kept.add(entry);
 			sessionInit = true;
-		} else if (!todo && todoResultPhases(entry)) {
+		} else if (!todo && todoSnapshotPhases(entry)) {
 			kept.add(entry);
 			todo = true;
 		}
@@ -238,9 +287,11 @@ export interface ColdBoundary {
 /**
  * Which of `entries` (file order) belong in the store while the leaf ends
  * `path`: every entry except those the context reads (the current path from
- * the cut on), those kept whole by kind ({@link keptWholeByKind}) and those
- * kept whole by position on the path ({@link entriesKeptWholeOnPath}). An
- * entry off the current path is cold wherever it lies.
+ * the cut on, but a user's edit of the to-do list, which no context or turn
+ * reads but the newest snapshot), those kept whole by kind
+ * ({@link keptWholeByKind}) and those kept whole by position on the path
+ * ({@link entriesKeptWholeOnPath}). An entry off the current path is cold
+ * wherever it lies.
  */
 export function coldBoundary(
 	entries: readonly SessionEntry[],
@@ -249,7 +300,11 @@ export function coldBoundary(
 ): ColdBoundary {
 	const cut = coldCutPathIndex(path, model);
 	const whole = cut > 0 ? entriesKeptWholeOnPath(path) : new Set<SessionEntry>();
-	for (let index = cut; index < path.length; index++) whole.add(path[index]!);
+	for (let index = cut; index < path.length; index++) {
+		const entry = path[index]!;
+		if (cut > 0 && entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) continue;
+		whole.add(entry);
+	}
 	const cold = new Uint8Array(entries.length);
 	for (let index = 0; index < entries.length; index++) {
 		const entry = entries[index]!;
@@ -390,12 +445,21 @@ function isAccessorFrom(target: object, key: string, accessors: ReadonlyMap<stri
 	return getter !== undefined && getter === accessors.get(key)?.get;
 }
 
-/** Fields of `holder` too large to keep in memory, in key order. */
-function largeFields(holder: Record<string, unknown>, inMemory: ReadonlySet<string>): string[] {
+/**
+ * Fields of `holder` a cold entry reads back from the store, in key order:
+ * every one not in `inMemory` that is too large to keep, and every one not in
+ * `whileSmall` whatever its size (with `whileSmall` undefined, any field stays
+ * while small).
+ */
+function coldFields(
+	holder: Record<string, unknown>,
+	inMemory: ReadonlySet<string>,
+	whileSmall: ReadonlySet<string> | undefined,
+): string[] {
 	const keys: string[] = [];
 	for (const key of Object.keys(holder)) {
 		if (inMemory.has(key)) continue;
-		if (!staysInMemory(holder[key])) keys.push(key);
+		if ((whileSmall && !whileSmall.has(key)) || !staysInMemory(holder[key])) keys.push(key);
 	}
 	return keys;
 }
@@ -860,16 +924,19 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
 
 /**
  * Make `entry` cold, in place: write its record to the store `openStore`
- * returns (called only when a record is written) and turn each value of the
- * entry and of its `message` too large to keep ({@link COLD_STRING_MAX_UNITS},
- * {@link COLD_JSON_MAX_BYTES}) into an accessor. An entry made whole from this
+ * returns (called only when a record is written) and turn into an accessor
+ * each value of the entry too large to keep ({@link COLD_STRING_MAX_UNITS},
+ * {@link COLD_JSON_MAX_BYTES}), each value of its `message` but the small ones
+ * of {@link MESSAGE_FIELDS_KEPT_WHILE_SMALL}, and for a type of
+ * {@link CORE_CUSTOM_TYPES_COLD} every value but the tree fields and
+ * `customType`. An entry made whole from this
  * store whose values are unchanged takes its former record back instead of
  * writing a new one. Pass `imagesExternalized` for an entry parsed from a
  * session file, whose image data are blob references already, and `paced`
  * from a load, which converts a whole transcript in one burst: the record's
  * bytes count toward the next full collection
  * ({@link COLLECT_AFTER_RECORD_BYTES}), as a read's do. Returns false,
- * changing nothing, when every value is small, `entry` is cold already, or
+ * changing nothing, when every value stays, `entry` is cold already, or
  * there is no store that takes records (`openStore` returns undefined, or a
  * write to the store failed): the entry then stays whole.
  */
@@ -885,8 +952,12 @@ export function convertToColdEntry(
 		typeof message === "object" && message !== null && !Array.isArray(message) && Object.isExtensible(message)
 			? (message as Record<string, unknown>)
 			: undefined;
-	const messageKeys = shell ? largeFields(shell, MESSAGE_FIELDS_IN_MEMORY) : [];
-	const entryKeys = largeFields(holder, ENTRY_FIELDS_IN_MEMORY).filter(key => key !== "message" || !shell);
+	const messageKeys = shell ? coldFields(shell, MESSAGE_FIELDS_IN_MEMORY, MESSAGE_FIELDS_KEPT_WHILE_SMALL) : [];
+	const entryKeys = (
+		entry.type === "custom" && CORE_CUSTOM_TYPES_COLD.has(entry.customType)
+			? coldFields(holder, CORE_CUSTOM_FIELDS_IN_MEMORY, NO_FIELDS)
+			: coldFields(holder, ENTRY_FIELDS_IN_MEMORY, undefined)
+	).filter(key => key !== "message" || !shell);
 	if (entryKeys.length === 0 && messageKeys.length === 0) return false;
 
 	const store = openStore();

@@ -99,7 +99,7 @@ import { conversationTip, lastModelChangeRole, SessionEntryIndex } from "../sess
 import type { AgentDefinition } from "../task/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { type ApprovalGrantStore, getApprovalGrants } from "../tools/approval-cache";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "../tools/todo";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "../session/session-entries";
 import { TokenRateMeter } from "../utils/token-rate";
 import type { ThreadId } from "./identity";
 import { type RemoteObject, RpcClosedError, rpcSync } from "./rpc";

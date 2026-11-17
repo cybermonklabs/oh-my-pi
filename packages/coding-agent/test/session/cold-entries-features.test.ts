@@ -24,12 +24,17 @@ import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { CURRENT_SESSION_VERSION, type SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import {
+	CURRENT_SESSION_VERSION,
+	type SessionEntry,
+	USER_TODO_EDIT_CUSTOM_TYPE,
+} from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { resolveResumeTarget } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { extractSessionInit, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { persistedAgentDefinition } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
+import { getLatestTodoPhasesFromEntries } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 
@@ -37,6 +42,29 @@ const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 const TITLE = "Refactor the module tree";
 /** Each case writes, resumes and compares two copies of a session; one runs ten model turns. */
 const CASE_TIMEOUT_MS = 60_000;
+/**
+ * The message fields that readers walking the whole branch read of every
+ * message on a turn (the persistence check of each new message, the prompt
+ * cache scan, the to-do restore, the retry checks, extensions), so a cold
+ * message keeps them in memory.
+ */
+const MESSAGE_FIELDS_READ_EVERY_TURN = [
+	"role",
+	"stopReason",
+	"timestamp",
+	"toolCallId",
+	"toolName",
+	"isError",
+	"provider",
+	"model",
+	"api",
+	"usage",
+	"responseId",
+	"customType",
+	"display",
+	"attribution",
+	"errorMessage",
+];
 
 function text(label: string): string {
 	return `${label} ${"body ".repeat(900)}`;
@@ -53,6 +81,7 @@ function usage() {
 	};
 }
 
+/** An assistant message with the fields a recent Anthropic reply records. */
 function assistantMessage(label: string, toolCall?: { id: string; name: string; arguments: object }) {
 	return {
 		role: "assistant",
@@ -63,6 +92,16 @@ function assistantMessage(label: string, toolCall?: { id: string; name: string; 
 		usage: usage(),
 		stopReason: toolCall ? "toolUse" : "stop",
 		timestamp: 2,
+		requestControls: {
+			messageIndex: 8,
+			tools: { declared: ["read", "todo", "probe"], deferred: [], active: ["read", "todo", "probe"] },
+			effort: { topLevel: "high", tail: "high" },
+		},
+		responseId: `msg_01${label}Fixture`,
+		duration: 4163.076492,
+		ttft: 2100.812789,
+		completedAt: 1767225604163,
+		contextSnapshot: { promptTokens: 40814, nonMessageTokens: 32441, toolSchemaTokens: 9132, compactionEpoch: 0 },
 	};
 }
 
@@ -145,6 +184,14 @@ function relayState(sessionId: string) {
 	};
 }
 
+/** What {@link sessionText} adds to the session it always writes. */
+interface SessionOptions {
+	interrupted?: boolean;
+	relay?: boolean;
+	todoEdits?: boolean;
+	olderTurns?: number;
+}
+
 /**
  * A titled session. On the current path: `c1` keeps from `u2`, `c2` from
  * `u4`, `c3` from `u7` (the cut). Before the cut lie a session contract
@@ -155,14 +202,19 @@ function relayState(sessionId: string) {
  * turn stopped after a `probe` call that never got its result. With `relay`,
  * a messaging extension's own entries ({@link relayState}) lie before the
  * cut too: before `c1`, before `c2`, before `c3` and on the other branch.
+ * With `todoEdits`, the user edited the to-do list on each branch: `te` on
+ * the other branch (followed by `b3`), then `ta` after `bs`, before the cut,
+ * the newest snapshot of the current path. With `olderTurns`, that many more
+ * rounds lie before `u6`, each a prompt (`hu…`), a `probe` call (`ha…`), its
+ * result (`hr…`), a failed reply (`he…`) and a custom message (`hn…`).
  */
-function sessionText(id: string, cwd: string, options: { interrupted?: boolean; relay?: boolean } = {}): string {
+function sessionText(id: string, cwd: string, options: SessionOptions = {}): string {
 	const lines: object[] = [{ type: "session", version: CURRENT_SESSION_VERSION, id, timestamp: TIMESTAMP, cwd }];
 	const add = (entryType: string, entryId: string, parentId: string | null, fields: object) =>
 		lines.push({ type: entryType, id: entryId, parentId, timestamp: TIMESTAMP, ...fields });
 	const user = (entryId: string, parentId: string) =>
 		add("message", entryId, parentId, {
-			message: { role: "user", content: [{ type: "text", text: text(entryId) }], timestamp: 1 },
+			message: { role: "user", content: [{ type: "text", text: text(entryId) }], attribution: "user", timestamp: 1 },
 		});
 	const assistant = (entryId: string, parentId: string, toolCall?: { id: string; name: string; arguments: object }) =>
 		add("message", entryId, parentId, { message: assistantMessage(entryId, toolCall) });
@@ -227,8 +279,50 @@ function sessionText(id: string, cwd: string, options: { interrupted?: boolean; 
 	const beforeBranchSummary = chain("a5", relay?.beforeC3);
 	user("b1", "c2");
 	assistant("b2", chain("b1", relay?.otherBranch));
+	if (options.todoEdits) {
+		add("custom", "te", "b2", { customType: USER_TODO_EDIT_CUSTOM_TYPE, data: { phases: phases("te") } });
+		assistant("b3", "te");
+	}
 	add("branch_summary", "bs", beforeBranchSummary, { fromId: "b2", summary: text("bs") });
-	user("u6", "bs");
+	let beforeU6 = "bs";
+	if (options.todoEdits) {
+		add("custom", "ta", "bs", { customType: USER_TODO_EDIT_CUSTOM_TYPE, data: { phases: phases("ta") } });
+		beforeU6 = "ta";
+	}
+	for (let round = 1; round <= (options.olderTurns ?? 0); round++) {
+		const callId = `call_h${round}`;
+		user(`hu${round}`, beforeU6);
+		assistant(`ha${round}`, `hu${round}`, { id: callId, name: "probe", arguments: { value: `round ${round}` } });
+		add("message", `hr${round}`, `ha${round}`, {
+			message: {
+				role: "toolResult",
+				toolCallId: callId,
+				toolName: "probe",
+				content: [{ type: "text", text: text(`hr${round}`) }],
+				details: { value: `round ${round}` },
+				isError: false,
+				timestamp: 3,
+			},
+		});
+		add("message", `he${round}`, `hr${round}`, {
+			message: {
+				role: "assistant",
+				content: [],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: usage(),
+				stopReason: "error",
+				errorMessage: "529 overloaded_error: Overloaded",
+				timestamp: 4,
+			},
+		});
+		add("message", `hn${round}`, `he${round}`, {
+			message: { role: "custom", customType: "test-note", content: text(`hn${round}`), display: true, timestamp: 5 },
+		});
+		beforeU6 = `hn${round}`;
+	}
+	user("u6", beforeU6);
 	assistant("a6", "u6");
 	user("u7", "a6");
 	assistant("a7", "u7");
@@ -251,11 +345,7 @@ interface WrittenSession {
 }
 
 /** Write the session to its own directory under `root`, as `name`, with a session id of its own. */
-async function writeSession(
-	root: string,
-	name: string,
-	options: { interrupted?: boolean; relay?: boolean } = {},
-): Promise<WrittenSession> {
+async function writeSession(root: string, name: string, options: SessionOptions = {}): Promise<WrittenSession> {
 	const id = crypto.randomUUID();
 	const cwd = path.join(root, name, "project");
 	const sessionDir = path.join(root, name, "sessions");
@@ -354,7 +444,7 @@ describe("features that read older entries, on a session whose older bodies are 
 	}
 
 	/** Two copies, each with its own session id, so each manager owns the file it writes. */
-	async function writeBoth(options: { interrupted?: boolean } = {}) {
+	async function writeBoth(options: SessionOptions = {}) {
 		const root = tempRoot();
 		const coldCopy = await writeSession(root, "cold", options);
 		const wholeCopy = await writeSession(root, "whole", options);
@@ -588,6 +678,44 @@ describe("features that read older entries, on a session whose older bodies are 
 	);
 
 	it(
+		"restores each branch's to-do list after a move in the tree, reading the other branch's cold to-do edit back from the store, as a session over every entry does",
+		async () => {
+			// A to-do edit before the cut is cold; a move onto its branch that restored nothing, or the
+			// live branch's list, would hand the user the wrong plan, and a move back would lose the live one.
+			const { cold, whole } = await writeBoth({ todoEdits: true });
+			const coldSession = (await startSession(cold)).session;
+			const wholeSession = (await startSession(whole)).session;
+			expect(wire(coldSession.getTodoPhases())).toEqual(wire(phases("ta")));
+			expect(wire(coldSession.getTodoPhases())).toEqual(wire(wholeSession.getTodoPhases()));
+
+			// The manager's move, read as the to-do tracker reads the branch before the context is rebuilt.
+			const branchList = (manager: SessionManager) => wire(getLatestTodoPhasesFromEntries(manager.getBranch()));
+			const before = cold.coldStoreStats().materializations;
+			cold.branch("b3");
+			whole.branch("b3");
+			expect(branchList(cold)).toEqual(wire(phases("te")));
+			expect(cold.coldStoreStats().materializations).toBe(before + 1);
+			expect(branchList(cold)).toEqual(branchList(whole));
+			cold.branch("a8");
+			whole.branch("a8");
+			expect(branchList(cold)).toEqual(wire(phases("ta")));
+			expect(branchList(cold)).toEqual(branchList(whole));
+
+			// The session's move in the tree, which rebuilds the context and then the to-do list.
+			for (const [target, label] of [
+				["b3", "te"],
+				["a8", "ta"],
+			]) {
+				await coldSession.navigateTree(target);
+				await wholeSession.navigateTree(target);
+				expect(wire(coldSession.getTodoPhases())).toEqual(wire(phases(label)));
+				expect(wire(coldSession.getTodoPhases())).toEqual(wire(wholeSession.getTodoPhases()));
+			}
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
 		"restores a messaging extension's role claim, replay states, ledger and consumer state after a resume as a manager holding every entry does",
 		async () => {
 			// Custom entries stay whole before the cut; a resume that dropped or re-linked them would hand the
@@ -645,7 +773,9 @@ describe("features that read older entries, on a session whose older bodies are 
 		"reads no older body on the ten turns after the first one following a resume, with tool calls, prune passes and an extension reading every entry's small fields",
 		async () => {
 			const root = tempRoot();
-			const written = await writeSession(root, "session");
+			// More older rounds than the eight records a store keeps parsed: a read of a field gone cold
+			// that every turn repeats over every message misses that cache and reads the store again.
+			const written = await writeSession(root, "session", { olderTurns: 9 });
 			const manager = await open(written.file, true);
 			const extensionReads: unknown[] = [];
 			const runtime = new ExtensionRuntime();
@@ -655,10 +785,8 @@ describe("features that read older entries, on a session whose older bodies are 
 						const read = (entry: SessionEntry) => {
 							const fields: unknown[] = [entry.type, entry.id, entry.parentId, entry.timestamp];
 							if (entry.type === "message") {
-								const message = entry.message;
-								fields.push(message.role, message.timestamp);
-								if (message.role === "assistant") fields.push(message.stopReason);
-								if (message.role === "toolResult") fields.push(message.toolCallId);
+								for (const field of MESSAGE_FIELDS_READ_EVERY_TURN)
+									fields.push(Reflect.get(entry.message, field));
 							}
 							if (entry.type === "custom") fields.push(entry.data);
 							return fields;

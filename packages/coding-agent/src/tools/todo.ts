@@ -13,7 +13,7 @@ import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
-import { type SessionEntry, todoResultPhases } from "../session/session-entries";
+import { type SessionEntry, todoSnapshotPhases } from "../session/session-entries";
 
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
 
@@ -154,8 +154,6 @@ export function nextActionableTask(phases: readonly TodoPhase[]): TodoItem | und
 	return firstPending;
 }
 
-export const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
-
 export const TODO_HUD_STATE_CUSTOM_TYPE = "todo_hud_state";
 
 export type TodoHudVisibility = "dismissed" | "revealed";
@@ -182,21 +180,12 @@ function todoPhasesFingerprint(phases: readonly TodoPhase[]): string {
 	);
 }
 
-function canonicalTodoPhases(entry: SessionEntry): TodoPhase[] | undefined {
-	if (entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
-		const phases = (entry.data as { phases?: unknown } | undefined)?.phases;
-		return Array.isArray(phases) ? (phases as TodoPhase[]) : undefined;
-	}
-	const phases = todoResultPhases(entry);
-	return phases ? (phases as TodoPhase[]) : undefined;
-}
-
 /** Identify the latest durable canonical todo snapshot on the active branch. */
 export function getLatestTodoSnapshotIdentity(entries: SessionEntry[]): TodoSnapshotIdentity | undefined {
 	let latest: TodoPhase[] | undefined;
 	let sourceEntryId: string | undefined;
 	for (let i = entries.length - 1; i >= 0; i--) {
-		const phases = canonicalTodoPhases(entries[i]);
+		const phases = todoSnapshotPhases(entries[i]) as TodoPhase[] | undefined;
 		if (phases) {
 			latest = phases;
 			sourceEntryId = entries[i].id;
@@ -242,7 +231,7 @@ export function createTodoHudStateData(
 
 export function getLatestTodoPhasesFromEntries(entries: SessionEntry[]): TodoPhase[] {
 	for (let i = entries.length - 1; i >= 0; i--) {
-		const phases = canonicalTodoPhases(entries[i]);
+		const phases = todoSnapshotPhases(entries[i]) as TodoPhase[] | undefined;
 		if (phases) return clonePhases(phases);
 	}
 	return [];
