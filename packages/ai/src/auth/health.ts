@@ -47,15 +47,11 @@ interface BlockDepletion {
  * cause present: usage, then account-policy, then auth.
  */
 function blockDepletion({ usage, accountPolicy, auth }: CredentialBlockDeadlines): BlockDepletion | undefined {
-	const depletedBy: ModelUsageDepletionCause | undefined =
-		usage !== undefined
-			? "usage"
-			: accountPolicy !== undefined
-				? "account-policy"
-				: auth !== undefined
-					? "auth"
-					: undefined;
-	if (depletedBy === undefined) return undefined;
+	let depletedBy: ModelUsageDepletionCause;
+	if (usage !== undefined) depletedBy = "usage";
+	else if (accountPolicy !== undefined) depletedBy = "account-policy";
+	else if (auth !== undefined) depletedBy = "auth";
+	else return undefined;
 	return { resetsAt: Math.max(usage ?? -Infinity, accountPolicy ?? -Infinity, auth ?? -Infinity), depletedBy };
 }
 

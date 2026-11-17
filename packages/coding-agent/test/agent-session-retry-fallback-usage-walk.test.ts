@@ -3,7 +3,8 @@
  * on: a fallback model whose usage is spent (every account held by an
  * exhausted quota window or a usage-limit block) is passed over, and every
  * other read (the reserve, unknown usage, a read that throws, a short
- * account-policy or 401 block) still switches to it, so the refusal steps keep
+ * account-policy or 401 block, a depleted read that lists no account, a usage
+ * limit on only some accounts) still switches to it, so the refusal steps keep
  * reaching the other accounts and models.
  *
  * The failing model P, the fallback X and the fallback after it Y are bundled
@@ -22,6 +23,7 @@ import * as aiStream from "@oh-my-pi/pi-ai/stream";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { formatModelString } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -63,12 +65,8 @@ const NEXT_FALLBACK = bundled("google", "gemini-2.5-flash");
 const CODEX = bundled("openai-codex", "gpt-5.6-sol");
 const CODEX_FALLBACK = bundled("openai", "gpt-5.5");
 
-function selectorOf(model: { provider: string; id: string }): string {
-	return `${model.provider}/${model.id}`;
-}
-
 function chainOf(...models: Model[]): Record<string, string[]> {
-	return { default: models.map(selectorOf) };
+	return { default: models.map(formatModelString) };
 }
 
 /**
@@ -106,13 +104,18 @@ function providerErrorStream(model: Model, errorMessage: string, errorStatus?: n
 type DepletionCause = "usage" | "account-policy" | "auth";
 
 /**
- * A depleted read whose one account a block of `cause` holds. The account is
- * built apart from the read, so the read also compiles against a usage type
- * that names no cause.
+ * A depleted read with one account per cause, each held by a block of that
+ * cause. The accounts are built apart from the read, so the read also
+ * compiles against a usage type that names no cause.
  */
-function depletedRead(cause: DepletionCause): ModelUsageHealth {
-	const account = { credentialId: 1, credentialType: "oauth" as const, state: "depleted" as const, depletedBy: cause };
-	return { state: "depleted", accounts: [account] };
+function depletedRead(...causes: DepletionCause[]): ModelUsageHealth {
+	const accounts = causes.map((cause, index) => ({
+		credentialId: index + 1,
+		credentialType: "oauth" as const,
+		state: "depleted" as const,
+		depletedBy: cause,
+	}));
+	return { state: "depleted", accounts };
 }
 
 /** Rejects once `signal` aborts, and never before. */
@@ -140,7 +143,7 @@ function createWalkAgent(
 		getApiKey: model => `${model.provider}-test-key`,
 		initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
 		streamFn: (model, context, options) => {
-			requestedModels.push(selectorOf(model));
+			requestedModels.push(formatModelString(model));
 			if (model.provider === primary.provider && model.id === primary.id) {
 				if (typeof failure === "function") return failure(model);
 				mock.push(failure);
@@ -159,12 +162,12 @@ function walkSettings(primary: Model, values: Readonly<Record<string, unknown>>)
 		"retry.usageAwareFallback": true,
 		...values,
 	});
-	settings.setModelRole("default", selectorOf(primary));
+	settings.setModelRole("default", formatModelString(primary));
 	return settings;
 }
 
 function modelOf(session: AgentSession): string | undefined {
-	return session.model ? selectorOf(session.model) : undefined;
+	return session.model ? formatModelString(session.model) : undefined;
 }
 
 function lastAssistant(session: AgentSession): AssistantMessage {
@@ -246,15 +249,15 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 	/** The fallback X answered the turn: the walk switched onto it once and nothing else ran. */
 	function expectAnsweredOnFallback(run: WalkRun, requestedModels: string[]): void {
-		expect(requestedModels).toEqual([selectorOf(PRIMARY), selectorOf(FALLBACK)]);
-		expect(run.fallbacks).toEqual([selectorOf(FALLBACK)]);
-		expect(modelOf(run.session)).toBe(selectorOf(FALLBACK));
+		expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(FALLBACK)]);
+		expect(run.fallbacks).toEqual([formatModelString(FALLBACK)]);
+		expect(modelOf(run.session)).toBe(formatModelString(FALLBACK));
 		expect(lastAssistant(run.session).stopReason).toBe("stop");
 	}
 
 	describe("passing over a spent fallback", () => {
 		it("skips a fallback whose usage is spent and switches to the one after it", async () => {
-			stubUsageReads({ [selectorOf(FALLBACK)]: depletedRead("usage") });
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
 				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
@@ -263,21 +266,21 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Fail on the primary");
 
-			expect(requestedModels).toEqual([selectorOf(PRIMARY), selectorOf(NEXT_FALLBACK)]);
-			expect(run.fallbacks).toEqual([selectorOf(NEXT_FALLBACK)]);
-			expect(modelOf(run.session)).toBe(selectorOf(NEXT_FALLBACK));
+			expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(NEXT_FALLBACK)]);
+			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 			// The session history never records a switch onto the spent model.
 			const entries = run.sessionManager.getEntries();
 			const modelChanges = entries.flatMap(entry => (entry.type === "model_change" ? [entry.model] : []));
-			expect(modelChanges).toContain(selectorOf(NEXT_FALLBACK));
-			expect(modelChanges).not.toContain(selectorOf(FALLBACK));
+			expect(modelChanges).toContain(formatModelString(NEXT_FALLBACK));
+			expect(modelChanges).not.toContain(formatModelString(FALLBACK));
 		});
 
 		it("answers on the fallback after a spent one under the fail-closed reserve policy", async () => {
 			// Switching onto the spent model would let the check before its request
 			// end the turn with a fail-closed refusal although a usable fallback follows.
-			stubUsageReads({ [selectorOf(FALLBACK)]: depletedRead("usage") });
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
 				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
@@ -289,14 +292,14 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Fail on the primary");
 
-			expect(requestedModels).toEqual([selectorOf(PRIMARY), selectorOf(NEXT_FALLBACK)]);
-			expect(run.fallbacks).toEqual([selectorOf(NEXT_FALLBACK)]);
-			expect(modelOf(run.session)).toBe(selectorOf(NEXT_FALLBACK));
+			expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(NEXT_FALLBACK)]);
+			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
 		it("ends the turn on the denial of the primary when its only fallback is spent", async () => {
-			stubUsageReads({ [selectorOf(FALLBACK)]: depletedRead("usage") });
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
 				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
@@ -305,16 +308,16 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Fail on the primary");
 
-			expect(requestedModels).toEqual([selectorOf(PRIMARY)]);
+			expect(requestedModels).toEqual([formatModelString(PRIMARY)]);
 			expect(run.fallbacks).toEqual([]);
-			expect(modelOf(run.session)).toBe(selectorOf(PRIMARY));
+			expect(modelOf(run.session)).toBe(formatModelString(PRIMARY));
 			const last = lastAssistant(run.session);
 			expect(last.stopReason).toBe("error");
 			expect(last.errorMessage).toBe(ACCOUNT_POLICY_DENIAL.errorMessage);
 		});
 
 		it("ends the turn on the spent retry budget when the only fallback is spent", async () => {
-			stubUsageReads({ [selectorOf(FALLBACK)]: depletedRead("usage") });
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
 				createWalkAgent(PRIMARY, requestedModels, model => providerErrorStream(model, SERVER_ERROR, 500)),
@@ -323,9 +326,9 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Fail on the primary");
 
-			expect(requestedModels).toEqual([selectorOf(PRIMARY)]);
+			expect(requestedModels).toEqual([formatModelString(PRIMARY)]);
 			expect(run.fallbacks).toEqual([]);
-			expect(modelOf(run.session)).toBe(selectorOf(PRIMARY));
+			expect(modelOf(run.session)).toBe(formatModelString(PRIMARY));
 			const last = lastAssistant(run.session);
 			expect(last.stopReason).toBe("error");
 			expect(last.errorMessage).toBe(`Retry budget exhausted after 0 retries: ${SERVER_ERROR}`);
@@ -334,7 +337,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		it("switches to no fallback when the session is aborted during the usage read of a fallback", async () => {
 			const readStarted = Promise.withResolvers<void>();
 			stubUsageReads({
-				[selectorOf(FALLBACK)]: signal => {
+				[formatModelString(FALLBACK)]: signal => {
 					readStarted.resolve();
 					return rejectWhenAborted(signal);
 				},
@@ -357,9 +360,9 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			await withTimeout(turn, WAIT_MS, "The prompt did not settle");
 			await withTimeout(run.session.waitForIdle(), WAIT_MS, "The session did not settle");
 
-			expect(requestedModels).toEqual([selectorOf(PRIMARY)]);
+			expect(requestedModels).toEqual([formatModelString(PRIMARY)]);
 			expect(run.fallbacks).toEqual([]);
-			expect(modelOf(run.session)).toBe(selectorOf(PRIMARY));
+			expect(modelOf(run.session)).toBe(formatModelString(PRIMARY));
 			expect(run.session.isRetrying).toBe(false);
 		});
 	});
@@ -367,7 +370,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 	describe("switching to a fallback whose usage is not spent", () => {
 		it("switches to a fallback at the reserve", async () => {
 			stubUsageReads({
-				[selectorOf(FALLBACK)]: {
+				[formatModelString(FALLBACK)]: {
 					state: "reserve",
 					accounts: [{ credentialId: 1, credentialType: "oauth", state: "reserve", remainingFraction: 0.05 }],
 				},
@@ -385,7 +388,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 		it("switches to a fallback whose usage is unknown", async () => {
 			stubUsageReads({
-				[selectorOf(FALLBACK)]: {
+				[formatModelString(FALLBACK)]: {
 					state: "unknown",
 					accounts: [{ credentialId: 1, credentialType: "oauth", state: "unknown" }],
 				},
@@ -402,7 +405,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		});
 
 		it("switches to a fallback whose usage read throws", async () => {
-			stubUsageReads({ [selectorOf(FALLBACK)]: new Error("usage endpoint unreachable") });
+			stubUsageReads({ [formatModelString(FALLBACK)]: new Error("usage endpoint unreachable") });
 			const requestedModels: string[] = [];
 			const run = startSession(
 				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
@@ -416,7 +419,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 		for (const cause of ["account-policy", "auth"] as const) {
 			it(`switches to a depleted fallback that only a short ${cause} block holds`, async () => {
-				stubUsageReads({ [selectorOf(FALLBACK)]: depletedRead(cause) });
+				stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead(cause) });
 				const requestedModels: string[] = [];
 				const run = startSession(
 					createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
@@ -429,8 +432,35 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			});
 		}
 
+		it("switches to a fallback whose depleted read lists no account", async () => {
+			// The plan gate leaves this read when it filters every account out.
+			stubUsageReads({ [formatModelString(FALLBACK)]: { state: "depleted", accounts: [] } });
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
+				walkSettings(PRIMARY, { "retry.fallbackChains": chainOf(FALLBACK) }),
+			);
+
+			await runTurn(run.session, "Fail on the primary");
+
+			expectAnsweredOnFallback(run, requestedModels);
+		});
+
+		it("switches to a fallback that a usage limit holds on one account only", async () => {
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage", "account-policy") });
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
+				walkSettings(PRIMARY, { "retry.fallbackChains": chainOf(FALLBACK) }),
+			);
+
+			await runTurn(run.session, "Fail on the primary");
+
+			expectAnsweredOnFallback(run, requestedModels);
+		});
+
 		it("switches to a spent fallback when usage-aware fallback is off", async () => {
-			stubUsageReads({ [selectorOf(FALLBACK)]: depletedRead("usage") });
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
 				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
@@ -465,7 +495,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			vi.spyOn(envApiKey, "getEnvApiKey").mockReturnValue(undefined);
 			registerMockApi(MOCK_API_SOURCE);
 			const accountKeys = ["codex-key-A", "codex-key-B", "codex-key-C", "codex-key-D"];
-			await authStorage.credentials.set(CODEX.provider, accountKeys.map(key => ({ type: "api_key" as const, key })));
+			await authStorage.credentials.set(
+				CODEX.provider,
+				accountKeys.map(key => ({ type: "api_key" as const, key })),
+			);
 			stubUsageReads({});
 			const requestedKeys: string[] = [];
 			const codexMock = createMockModel({
@@ -486,7 +519,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				sessionId: providerSessionId,
 				initialState: { model: CODEX, systemPrompt: ["Test"], tools: [], messages: [] },
 				streamFn: (model, context, options) => {
-					requestedModels.push(selectorOf(model));
+					requestedModels.push(formatModelString(model));
 					return model.provider === CODEX.provider
 						? aiStream.streamSimple(codexMock.model, context, options)
 						: answerMock.stream(model, context, options);
@@ -500,10 +533,13 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Continue authorized security work");
 
-			expect(requestedModels).toEqual([...accountKeys.map(() => selectorOf(CODEX)), selectorOf(CODEX_FALLBACK)]);
+			expect(requestedModels).toEqual([
+				...accountKeys.map(() => formatModelString(CODEX)),
+				formatModelString(CODEX_FALLBACK),
+			]);
 			expect([...requestedKeys].sort()).toEqual(accountKeys);
-			expect(run.fallbacks).toEqual([selectorOf(CODEX_FALLBACK)]);
-			expect(modelOf(run.session)).toBe(selectorOf(CODEX_FALLBACK));
+			expect(run.fallbacks).toEqual([formatModelString(CODEX_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(CODEX_FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
@@ -520,7 +556,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			await runTurn(run.session, "Use a model the plan does not include");
 
 			const sameModelElsewhere = `openai/${CODEX.id}`;
-			expect(requestedModels).toEqual([selectorOf(CODEX), sameModelElsewhere]);
+			expect(requestedModels).toEqual([formatModelString(CODEX), sameModelElsewhere]);
 			expect(run.fallbacks).toEqual([sameModelElsewhere]);
 			expect(modelOf(run.session)).toBe(sameModelElsewhere);
 			expect(lastAssistant(run.session).stopReason).toBe("stop");

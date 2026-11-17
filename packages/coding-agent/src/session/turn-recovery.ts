@@ -249,8 +249,9 @@ function toolReplayStart(messages: readonly AgentMessage[]): number | undefined 
  * Whether a usage read says the model's usage is spent: the pool is
  * `depleted`, it lists at least one account, and usage holds every account (an
  * exhausted quota window or a usage-limit block). An empty pool (the plan gate
- * filtered every account out) is not spent. A pool where an account-policy,
- * model-policy or 401 block holds any account is not spent either.
+ * filtered every account out) is not spent. A pool where any account is held
+ * only by account-policy, model-policy or 401 blocks (no usage block holds it)
+ * is not spent either.
  */
 function isUsageSpent(health: ModelUsageHealth): boolean {
 	return (
@@ -2454,12 +2455,13 @@ export class TurnRecovery {
 					continue;
 				}
 				// With retry.usageAwareFallback on, skip a candidate whose usage is
-				// spent, as the fallback before a turn does. A request to it gets a
-				// usage-limit answer, and key selection gives back a blocked account
-				// as a last resort, so the key probe below does not stop it. A short
-				// account-policy or 401 block is not spent usage: it lasts about a
-				// minute and covers every model of the provider, and the refusal
-				// steps must still reach the other accounts and models of the provider.
+				// spent. A request to it gets a usage-limit answer, and key selection
+				// gives back a blocked account as a last resort, so the key probe
+				// below does not stop it. An account-policy, model-policy (plan) or
+				// 401 block is not spent usage: it lasts minutes rather than a quota
+				// window (60 s for a denial, 5 minutes after a failed OAuth refresh,
+				// select.ts OAUTH_REFRESH_FAILURE_BACKOFF_MS), and the refusal steps
+				// must still reach the provider's other accounts and models.
 				if (usageAwareFallback) {
 					usageReadController ??= new AbortController();
 					this.#retryAbortController?.abort();

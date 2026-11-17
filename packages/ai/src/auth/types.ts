@@ -460,9 +460,11 @@ export type ModelUsageHealthState = "healthy" | "reserve" | "depleted" | "unknow
  * - `"usage"`: an exhausted current usage window in the report, or a
  *   usage-limit block (the catch-all scope or a usage scope of the provider's
  *   ranking strategy, which `limits.markReached` writes).
- * - `"account-policy"`: only account-policy blocks (the `account-policy`
- *   scope or a `model-policy:<model>` scope).
- * - `"auth"`: only an `auth` block (a 401).
+ * - `"account-policy"`: account-policy blocks (the `account-policy` scope or a
+ *   `model-policy:<model>` scope) and no usage block; an `auth` block may hold
+ *   the account too.
+ * - `"auth"`: an `auth` block (a 401 or a failed OAuth refresh) and no other
+ *   block.
  */
 export type ModelUsageDepletionCause = "usage" | "account-policy" | "auth";
 
