@@ -344,6 +344,14 @@ impl Source {
 		}
 	}
 
+	/// A file a walk listed, already opened by the walker (below the walk's
+	/// root or relative to its directory): read through the file's async API,
+	/// never reopened by path. It records no metadata at open, so
+	/// [`Self::metadata`] is `None`; [`Self::handle_metadata`] reads the handle.
+	pub fn listed(file: pi_walker::fs::File) -> Self {
+		Self::new(Repr::File(file.into_vfs()), None)
+	}
+
 	/// Opens a native path that is neither a regular file nor a directory.
 	async fn open_special(
 		fs: &pi_vfs::Fs,

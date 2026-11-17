@@ -3229,6 +3229,96 @@ mod testing {
 		tree
 	}
 
+	/// Hooks keyed by path, each run once by the first [`run_hook`] for its
+	/// path ([`SwapTree::swap_at`] registers them).
+	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg"))]
+	type Hook = (PathBuf, Box<dyn FnOnce() + Send>);
+	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg"))]
+	static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
+
+	/// Runs (once) the hook a test registered for `path`, if any: the seam
+	/// where a test swaps an entry a walk listed before the utility reaches it.
+	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg"))]
+	pub(crate) fn run_hook(path: &std::path::Path) {
+		let hook = {
+			let mut hooks = HOOKS.lock();
+			let found = hooks.iter().position(|(hooked, _)| hooked == path);
+			found.map(|index| hooks.swap_remove(index).1)
+		};
+		if let Some(hook) = hook {
+			hook();
+		}
+	}
+
+	/// A tree for the symlink-swap tests in a fresh canonical temporary
+	/// directory `base`: `root/sub/decoy.txt` holding `inside`, and next to
+	/// `root` the directory `outside/` with a `decoy.txt` holding `outside`.
+	#[cfg(all(unix, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
+	pub(crate) struct SwapTree {
+		_dir:        tempfile::TempDir,
+		pub base:    PathBuf,
+		/// The walk root.
+		pub root:    PathBuf,
+		/// The directory a swap replaces with a symlink to `outside`.
+		pub sub:     PathBuf,
+		pub outside: PathBuf,
+		/// Where a swap moves `sub`.
+		pub parked:  PathBuf,
+		swapped:     Arc<AtomicBool>,
+	}
+
+	#[cfg(all(unix, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
+	impl SwapTree {
+		pub(crate) fn new(inside: &str, outside: &str) -> Self {
+			let dir = tempfile::tempdir().unwrap();
+			let base = std::fs::canonicalize(dir.path()).unwrap();
+			let (root, outside_dir) = (base.join("root"), base.join("outside"));
+			let sub = root.join("sub");
+			std::fs::create_dir_all(&sub).unwrap();
+			std::fs::create_dir_all(&outside_dir).unwrap();
+			std::fs::write(sub.join("decoy.txt"), inside).unwrap();
+			std::fs::write(outside_dir.join("decoy.txt"), outside).unwrap();
+			let parked = base.join("parked");
+			Self { _dir: dir, base, root, sub, outside: outside_dir, parked, swapped: Arc::default() }
+		}
+
+		/// Moves `sub` to `parked` and puts a symlink to `outside` in its
+		/// place at the first [`run_hook`] for `at`.
+		pub(crate) fn swap_at(&self, at: PathBuf) {
+			let (sub, outside, parked) = (self.sub.clone(), self.outside.clone(), self.parked.clone());
+			let swapped = Arc::clone(&self.swapped);
+			HOOKS.lock().push((
+				at,
+				Box::new(move || {
+					std::fs::rename(&sub, parked).unwrap();
+					std::os::unix::fs::symlink(outside, &sub).unwrap();
+					swapped.store(true, std::sync::atomic::Ordering::SeqCst);
+				}),
+			));
+		}
+
+		/// Replaces `sub/decoy.txt` with a symlink to `outside/decoy.txt` at
+		/// the first [`run_hook`] for `at`.
+		#[cfg(feature = "util.grep")]
+		pub(crate) fn swap_file_at(&self, at: PathBuf) {
+			let (file, target) = (self.sub.join("decoy.txt"), self.outside.join("decoy.txt"));
+			let swapped = Arc::clone(&self.swapped);
+			HOOKS.lock().push((
+				at,
+				Box::new(move || {
+					std::fs::remove_file(&file).unwrap();
+					std::os::unix::fs::symlink(target, &file).unwrap();
+					swapped.store(true, std::sync::atomic::Ordering::SeqCst);
+				}),
+			));
+		}
+
+		/// Whether the swap ran.
+		pub(crate) fn swapped(&self) -> bool {
+			self.swapped.load(std::sync::atomic::Ordering::SeqCst)
+		}
+	}
+
 	/// Runs the extra `argv` through [`run`](crate::extras::run) from `cwd`
 	/// with `stdin` on fd 0 and the process environment plus `env`, returning
 	/// its status, stdout, and stderr.
@@ -4017,4 +4107,8 @@ mod testing {
 pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
+#[cfg(all(test, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
+pub(crate) use testing::run_hook;
+#[cfg(all(test, unix, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
+pub(crate) use testing::SwapTree;
 

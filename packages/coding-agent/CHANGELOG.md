@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Loading commands, prompts, rules, instructions, hooks and tools from a directory, `omp ttsr scan`, and the `find` tool searching a host directory no longer read a file through a symlink swapped in for it, or for a directory on its way, after the directory was listed: such a file is skipped with the warning, the `unreadable` count or the read failure an unreadable file gets. A file that was a symlink when the directory was listed still loads
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

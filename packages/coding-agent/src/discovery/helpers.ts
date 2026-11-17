@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { FileType, glob } from "@oh-my-pi/pi-natives";
+import { FileType, type GlobMatch, glob, readFileBeneath } from "@oh-my-pi/pi-natives";
 import {
 	CONFIG_DIR_NAME,
 	getAgentDir,
@@ -18,7 +18,7 @@ import {
 import { isUserSourceEnabled } from "../capability";
 import type { ContextFile } from "../capability/context-file";
 import type { ExtensionModule } from "../capability/extension-module";
-import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../capability/fs";
+import { invalidate as invalidateFsCache, readCachedFile, readDirEntries, readFile } from "../capability/fs";
 import {
 	MAIN_AGENT_RULE_NAME,
 	parseRuleAgents,
@@ -621,7 +621,7 @@ export async function loadFilesFromDir<T>(
 	}
 
 	// Use native glob for fast scanning with gitignore support
-	let matches: Array<{ path: string }>;
+	let matches: GlobMatch[];
 	try {
 		const result = await glob({
 			pattern,
@@ -641,11 +641,18 @@ export async function loadFilesFromDir<T>(
 		return { items, warnings };
 	}
 
-	// Read all matching files in parallel
+	// Read all matching files in parallel through the shared content cache. A miss
+	// reads below the walked directory, following no symlink the walk did not list:
+	// a directory on the way, or the file, swapped for a symlink after the listing is
+	// refused like an unreadable file. A Blob decodes the bytes as `Bun.file().text()`
+	// does: UTF-8, or UTF-16 after its byte order mark.
 	const fileResults = await Promise.all(
 		matches.map(async match => {
 			const filePath = path.join(dir, match.path);
-			const content = await readFile(filePath);
+			const content = await readCachedFile(filePath, async () => {
+				const read = await readFileBeneath({ root: dir, path: match.path, followSymlink: match.symlink });
+				return read.content === undefined ? null : await new Blob([read.content]).text();
+			});
 			return { filePath, content };
 		}),
 	);
