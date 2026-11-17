@@ -381,6 +381,7 @@ import {
 	shouldEvaluateCodexAutoRedeem,
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
+import type { ContextCut } from "./context-cut";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { isDateCwdReminderControl } from "./date-cwd-reminder";
@@ -3012,6 +3013,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			recordAnchoredHistoryRewrite: tokensRemoved => this.#stats.recordAnchoredHistoryRewrite(tokensRemoved),
 			getContextBreakdown: options => this.getContextBreakdown(options),
 			getContextUsage: options => this.getContextUsage(options),
+			observedPromptCacheEntry: () => this.observedPromptCacheEntry(),
 			shake: (mode, options) => this.shake(mode, options),
 			dropImages: () => this.dropImages(),
 			generateHandoffDocument: (customInstructions, options) =>
@@ -6184,24 +6186,44 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * counted it (the status line); otherwise it is counted here.
 	 */
 	getPromptCacheStatus(nowMs = Date.now(), nextTokens?: number): PromptCacheStatus | undefined {
-		const warmer = this.#cacheWarmer;
-		if (!warmer) return undefined;
+		if (!this.#cacheWarmer) return undefined;
+		const current = this.#currentPromptCacheEntry();
+		if (!current) return undefined;
+		return promptCacheStatus(current.entry, {
+			nowMs,
+			warming: current.warming,
+			nextTokens: nextTokens ?? this.getContextUsage()?.tokens ?? 0,
+		});
+	}
+
+	/**
+	 * The prompt cache entry the next request would read, the one {@link getPromptCacheStatus}
+	 * reports: touched by the newest real or warm request that hit it, with its tier and lifetime.
+	 * Unlike {@link promptCacheEntry}, it holds without a warmer, from the branch's newest cached
+	 * reply. Undefined with no reply that used the cache.
+	 */
+	observedPromptCacheEntry(): ObservedPromptCacheEntry | undefined {
+		return this.#currentPromptCacheEntry()?.entry;
+	}
+
+	/**
+	 * The warmer's confirmed entry while it still extends the branch on screen, with its warming
+	 * state; otherwise the entry the branch's own newest cached reply left.
+	 */
+	#currentPromptCacheEntry(): { entry: ObservedPromptCacheEntry; warming?: CacheWarmingStatus } | undefined {
 		const view =
-			this.#promptCacheArmSessionId === this.sessionManager.getSessionId() ? warmer.confirmedView : undefined;
+			this.#promptCacheArmSessionId === this.sessionManager.getSessionId()
+				? this.#cacheWarmer?.confirmedView
+				: undefined;
 		const confirmed = view?.entry;
 		const change = confirmed?.change;
 		// A replaced transcript (rewind, branch switch, reload, compaction) no longer extends the
 		// armed request; the branch now on screen says what its own replies cached.
-		const live = confirmed !== undefined && change?.kind !== "history";
-		const entry: ObservedPromptCacheEntry | undefined = live
-			? { ...confirmed, change, inferred: false }
-			: this.#inferredPromptCacheEntry();
-		if (!entry) return undefined;
-		return promptCacheStatus(entry, {
-			nowMs,
-			warming: live ? view?.warming : undefined,
-			nextTokens: nextTokens ?? this.getContextUsage()?.tokens ?? 0,
-		});
+		if (confirmed !== undefined && change?.kind !== "history") {
+			return { entry: { ...confirmed, change, inferred: false }, warming: view?.warming };
+		}
+		const inferred = this.#inferredPromptCacheEntry();
+		return inferred ? { entry: inferred } : undefined;
 	}
 
 	/**
@@ -7757,6 +7779,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	get compactionSpeculation(): "idle" | "running" | "armed" {
 		return this.#maintenance.speculationState;
 	}
+	/**
+	 * Whether an automatic cut of the context runs now, by the cut rule over this session's figures
+	 * (`decideContextCut` in the agent's compaction package); see {@link SessionMaintenance.admitsContextCut}.
+	 */
+	admitsContextCut(cut: ContextCut): boolean {
+		return this.#maintenance.admitsContextCut(cut);
+	}
+
 	/** Strip image content from the current branch and persist the rewrite. */
 	dropImages(): Promise<{ removed: number; tokensFreed: number }> {
 		return this.#maintenance.dropImages();

@@ -72,7 +72,9 @@ function nonNegative(value: number): number {
  *    prefix is already gone and the cut adds no write.
  * 3. `N * s * r > (P - p - s) * (w - r)`: the reads the cut saves before the
  *    threshold is reached again cost more than writing the `P - p - s` tokens
- *    after it again.
+ *    after it again. A cut whose rewrite costs nothing more than its reads
+ *    (`(P - p - s) * (w - r) <= 0`: a cut at the tail, a model with no cache
+ *    prices, or a write no dearer than a read) is admitted too.
  *
  * Otherwise it waits, and runs at the first later point where it is admitted:
  * a lapse, the threshold, or a forced cut.
@@ -102,7 +104,7 @@ export function decideContextCut(inputs: ContextCutInputs): ContextCutDecision {
 	let reason: ContextCutReason;
 	if (inputs.forced) reason = "forced";
 	else if (nonNegative(inputs.idleMs) >= nonNegative(inputs.lifeMs)) reason = "lapsed";
-	else if (saving > writeCost) reason = "pays";
+	else if (saving > writeCost || writeCost <= 0) reason = "pays";
 	else reason = "waits";
 	return { admitted: reason !== "waits", reason, requestsToThreshold, saving, writeCost };
 }

@@ -35,7 +35,23 @@ export interface CacheLookbackConfig {
 	convertToLlm?: ConvertToLlm;
 }
 
-export interface PruneConfig extends CacheLookbackConfig {
+/** A prune pass's cut, offered to {@link PruneGateConfig.admit} before any result is blanked. */
+export interface PruneCut {
+	/** Index in `entries` of the earliest result the pass would blank: the first position it changes. */
+	firstIndex: number;
+	/** Tokens the pass would save. */
+	tokensSaved: number;
+}
+
+export interface PruneGateConfig {
+	/**
+	 * Whether the pass may blank its results now. A refused pass blanks nothing and reports
+	 * nothing pruned, so the caller proposes it again later. Undefined = always admitted.
+	 */
+	admit?: (cut: PruneCut) => boolean;
+}
+
+export interface PruneConfig extends CacheLookbackConfig, PruneGateConfig {
 	/** Keep the most recent tool output tokens intact. */
 	protectTokens: number;
 	/** Only prune if total savings meets this threshold. */
@@ -137,7 +153,7 @@ export type SupersedeKeyFn = (toolName: string, args: Record<string, unknown>) =
  */
 export type SupersedeCompleteFn = (message: ToolResultMessage) => boolean;
 
-export interface SupersedePruneConfig extends CacheLookbackConfig {
+export interface SupersedePruneConfig extends CacheLookbackConfig, PruneGateConfig {
 	/** Supersede key function; a newer successful result with the same key supersedes older ones (see {@link SupersedeKeyFn}). */
 	supersedeKey?: SupersedeKeyFn;
 	/**
@@ -528,6 +544,7 @@ export function pruneSupersededToolResults(
 
 	let tokensSaved = 0;
 	for (const candidate of toPrune) tokensSaved += estimatePrunedSavings(candidate.tokens, candidate.notice);
+	if (config.admit && !config.admit({ firstIndex: toPrune[0].index, tokensSaved })) return NOTHING_PRUNED;
 
 	const prunedAt = Date.now();
 	const steps = toPrune.map(candidate => blankToolResult(candidate.message, candidate.notice, prunedAt));
@@ -542,7 +559,13 @@ export function pruneToolOutputs(
 	let accumulatedTokens = 0;
 	let tokensSaved = 0;
 
-	const candidates: Array<{ entry: SessionMessageEntry; tokens: number; superseded: boolean; useless: boolean }> = [];
+	const candidates: Array<{
+		entry: SessionMessageEntry;
+		index: number;
+		tokens: number;
+		superseded: boolean;
+		useless: boolean;
+	}> = [];
 	// Entries before the compaction boundary are summarized away (never sent)
 	// and are never prune candidates, so no pass below walks them.
 	const boundaryIndex = resolveBoundaryIndex(entries, config.keepBoundaryId);
@@ -633,7 +656,7 @@ export function pruneToolOutputs(
 			continue;
 		}
 
-		candidates.push({ entry: entry as SessionMessageEntry, tokens, superseded, useless });
+		candidates.push({ entry: entry as SessionMessageEntry, index: i, tokens, superseded, useless });
 		accumulatedTokens += tokens;
 	}
 
@@ -649,6 +672,10 @@ export function pruneToolOutputs(
 	}
 
 	if (tokensSaved < config.minimumSavings || candidates.length === 0) {
+		return NOTHING_PRUNED;
+	}
+	// Candidates were collected newest first, so the last one is where the pass first changes the history.
+	if (config.admit && !config.admit({ firstIndex: candidates[candidates.length - 1].index, tokensSaved })) {
 		return NOTHING_PRUNED;
 	}
 

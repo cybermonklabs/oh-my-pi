@@ -78,7 +78,13 @@ describe("decideContextCut", () => {
 		expect(decideContextCut({ ...prune, forced: true })).toMatchObject({ admitted: true, reason: "forced" });
 	});
 
-	it("holds a cut on degenerate figures and reports them finite and non-negative", () => {
+	it("admits a cut on a model without cache prices that the same figures hold on a priced one", () => {
+		expect(decideContextCut(prune)).toMatchObject({ admitted: false, reason: "waits" });
+		const free = decideContextCut({ ...prune, readPrice: 0, writePrice: 0 });
+		expect(free).toMatchObject({ admitted: true, reason: "pays", saving: 0, writeCost: 0 });
+	});
+
+	it("admits a cut on degenerate figures that leaves nothing to write, and reports them finite and non-negative", () => {
 		// NaN removed and idle count as 0, negative growth as 1, a cut position past the prompt end as nothing to write.
 		const decision = decideContextCut({
 			...prune,
@@ -88,8 +94,8 @@ describe("decideContextCut", () => {
 			idleMs: Number.NaN,
 		});
 		expect(decision).toEqual({
-			admitted: false,
-			reason: "waits",
+			admitted: true,
+			reason: "pays",
 			requestsToThreshold: 250_000,
 			saving: 0,
 			writeCost: 0,

@@ -156,6 +156,7 @@ describe("async speculative compaction", () => {
 			recordAnchoredHistoryRewrite: () => {},
 			getContextBreakdown: () => undefined,
 			getContextUsage: () => undefined,
+			observedPromptCacheEntry: () => undefined,
 			shake: async () => ({ modified: false, tokensRemoved: 0 }),
 			dropImages: async () => ({ removed: 0 }),
 			generateHandoffDocument: options.generateHandoffDocument ?? (async () => undefined),

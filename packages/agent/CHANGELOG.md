@@ -5,6 +5,7 @@
 ### Added
 
 - Added `decideContextCut()`, which decides whether an automatic context cut runs now or waits until the prompt-cache reads it saves pay for the cache write it causes, and `meanPromptGrowth()` for its prompt-growth input
+- Added an `admit` gate to `pruneToolOutputs()` and `pruneSupersededToolResults()` configs: it sees where a pass would first change the history and what it would save, and a refused pass blanks nothing
 
 ## [18.18.2] - 2026-11-08
 
