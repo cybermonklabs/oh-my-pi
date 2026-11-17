@@ -2717,11 +2717,11 @@ export class TurnRecovery {
 		}
 
 		// Then the candidates the credit hold passed over. A held candidate keeps
-		// the session's level and its own walk role. It is the model in use only
-		// when something outside the walk changed while the walk waited, such as
-		// the user changing the thinking level during a read: the walk drops a
-		// no-op candidate before it holds one, and `usageReadStale` compares only
-		// the model's provider and id.
+		// the session's level and its own walk role. It is the model in use at
+		// the level the switch would set only when something outside the walk
+		// changed while the walk waited, such as the user changing the thinking
+		// level during a read: the walk drops a no-op candidate before it holds
+		// one, and `usageReadStale` compares only the model's provider and id.
 		if (usageReadStale()) return false;
 		const held = await withUsageReadSignal(signal =>
 			this.#searchKeyedRetryFallback(heldEntries, usageReadStale, excludedMessage, signal),
@@ -2732,7 +2732,8 @@ export class TurnRecovery {
 
 	/**
 	 * How both searches after a spent fallback end: with the switch to `pick`,
-	 * recorded under `role`, or with no switch when `pick` is the model in use.
+	 * recorded under `role`, or with no switch when `pick` is the model in use at
+	 * the level the switch would set.
 	 * `inheritedThinkingLevel` stands in for the session's level when `pick`'s
 	 * selector names none.
 	 */
