@@ -187,7 +187,7 @@ import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sh
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { DaemonCompletionNotification } from "../launch/protocol";
-import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
+import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE, MEMORY_RECALL_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
@@ -9407,6 +9407,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			};
 			if (!overrideIsCurrent()) continue;
 			const messages: AgentMessage[] = [];
+			if (basePreparation.memoryRecall) {
+				messages.push({
+					role: "custom",
+					customType: MEMORY_RECALL_MESSAGE_TYPE,
+					content: basePreparation.memoryRecall,
+					display: false,
+					attribution: "agent",
+					timestamp: Date.now(),
+				});
+			}
 			if (basePreparation.memoryNotice) {
 				messages.push({
 					role: "custom",

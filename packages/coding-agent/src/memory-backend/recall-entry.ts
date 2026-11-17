@@ -21,6 +21,14 @@ export const MEMORY_RECALL_ENTRY_TYPE = "memory_recall";
  */
 export const MEMORY_RECALL_CHANGES_MESSAGE_TYPE = "memory-recall-changes";
 
+/**
+ * Hidden message carrying a recall that first succeeded after the conversation's prompt had been
+ * sent without one: delivered after the turn's newest content instead of as a new system block, so
+ * the cached prompt holds. A transcript that carries one has its recall, so a resume does not add it
+ * to the system prompt.
+ */
+export const MEMORY_RECALL_MESSAGE_TYPE = "memory-recall";
+
 /** One memory in a recall block, as last reported to the model. */
 export interface RecalledMemory {
 	id: string;

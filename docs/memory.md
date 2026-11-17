@@ -155,6 +155,8 @@ Tool-initiated `retain` and `learn` writes go through a durable outbox: each mem
 
 Recall is injected as background context, not instructions, and recalled memory is also available as extra context during compaction. The first-turn recall is stored in the session file, so resuming, switching to, or forking the session sends it unchanged instead of recalling again; a context reset, a different bank or tag filter, or a branch that edits the first prompt recalls afresh. Hindsight memories cannot be looked up by id, so changes to them since the recall are not reported. Mental models are still reloaded when a new process starts. Selecting Hindsight exposes `recall`, `retain`, and `reflect`; `memory_edit` is not available because upstream Hindsight memories are not edited through this backend.
 
+A failed recall is retried on each later turn until one succeeds. On a model that binds its thinking to the cached prompt (such as Claude Opus 5.5), a recall that succeeds after the model has already answered goes out as a hidden `memory-recall` message after the turn's newest content, not as a new system prompt block, so the conversation's cached prompt still holds; the next system prompt rebuild (a compaction) places the recall in the prompt. A transcript that carries such a message is not given the recall again on resume. A recall on the first turn stays in the system prompt as before.
+
 `/memory view`, `/memory stats`, `/memory diagnose`, and `/memory enqueue` operate through the active Hindsight state. `/memory clear` first drains pending retains, then clears only the local session state and recall cache. It **does not delete the server-side bank**; delete that bank with the Hindsight UI or API.
 
 ## Sharpshooter backend

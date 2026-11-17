@@ -520,6 +520,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		if (persisted !== undefined) {
 			return {
 				context: persisted.text || undefined,
+				reused: true,
 				commit: () => this.#commitRecall(generation, persisted.text, false),
 			};
 		}

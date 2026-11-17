@@ -27,6 +27,7 @@ import {
 import { type LocalProtocolOptions } from "../internal-urls";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
+import { MEMORY_RECALL_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
@@ -216,6 +217,11 @@ interface SystemPromptPreparation {
 	systemPrompt: string[];
 	/** Memory backend note to deliver with the turn ({@link MemoryPromptPreparation.notice}). */
 	memoryNotice?: MemoryPromptPreparation["notice"];
+	/**
+	 * Recall block to deliver as a hidden message after the turn's newest content rather than in
+	 * {@link systemPrompt}: the conversation's bound prompt was already sent without a recall.
+	 */
+	memoryRecall?: string;
 	/** Publish staged state at validated delivery; false declines the prepared turn without mutation. */
 	commit?(): boolean;
 }
@@ -2872,10 +2878,33 @@ export class SessionTools {
 			const memory = await backend.beforeAgentStartPrompt(this.#host.memoryBackendSession(), promptText, signal);
 			if (!isCurrent() || !memory) return { systemPrompt: this.#baseSystemPrompt };
 			const injected = memory.context;
-			if (!injected) {
+			// A recall the conversation already carries as a hidden message (see below) is history.
+			if (
+				!injected ||
+				this.#host.agent.state.messages.some(
+					message => message.role === "custom" && message.customType === MEMORY_RECALL_MESSAGE_TYPE,
+				)
+			) {
 				return {
 					systemPrompt: this.#baseSystemPrompt,
 					memoryNotice: memory.notice,
+					commit: () => isCurrent() && memory.commit(),
+				};
+			}
+			// A conversation a prefix-bound model has answered went out without a recall (a reused one is
+			// the transcript's own). A fresh recall now would add a system block, and the provider would
+			// write the whole conversation to its cache again and drop its replayed thinking: it rides
+			// after the turn's newest content instead, with no rebuild. The backend's instructions carry
+			// the adopted recall, so the next rebuild (at a cut) may place it in the prompt.
+			if (
+				!memory.reused &&
+				this.#host.model()?.thinking?.prefixBinding === true &&
+				this.#latestReply() !== undefined
+			) {
+				return {
+					systemPrompt: this.#baseSystemPrompt,
+					memoryNotice: memory.notice,
+					memoryRecall: injected,
 					commit: () => isCurrent() && memory.commit(),
 				};
 			}
