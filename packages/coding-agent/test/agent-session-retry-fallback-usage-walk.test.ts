@@ -362,6 +362,29 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
+		it("searches the chain the switch would pin before the spent fallback's own chain", async () => {
+			// The base switched onto the spent model, and the check before the next
+			// model call searched the chain that switch pinned, then the model's own.
+			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createWalkAgent(PRIMARY, requestedModels, ACCOUNT_POLICY_DENIAL),
+				walkSettings(PRIMARY, {
+					"retry.fallbackChains": {
+						default: [formatModelString(FALLBACK), formatModelString(NEXT_FALLBACK)],
+						[formatModelString(FALLBACK)]: [formatModelString(CODEX_FALLBACK)],
+					},
+				}),
+			);
+
+			await runTurn(run.session, "Fail on the primary");
+
+			expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(NEXT_FALLBACK)]);
+			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
 		it("answers on the fallback after a spent one under the fail-closed reserve policy", async () => {
 			// Switching onto the spent model would let the check before its request
 			// end the turn with a fail-closed refusal although a usable fallback follows.
