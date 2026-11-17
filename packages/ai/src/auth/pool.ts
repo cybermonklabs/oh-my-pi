@@ -649,9 +649,7 @@ export class CredentialPool implements CredentialsApi {
 		const entries = this.entries(provider);
 		const index = entries.findIndex(entry => entry.id === credentialId);
 		if (index === -1) {
-			const tombstones = this.#store.listDisabledCredentials
-				? await this.#store.listDisabledCredentials(provider)
-				: [];
+			const tombstones = await this.listDisabled(provider);
 			const failed = tombstones.find(tombstone => tombstone.id === credentialId);
 			if (!failed || !isAutoDisabledCredential(failed)) return false;
 			return this.#store.deleteAuthCredential(credentialId, DELETED_BY_USER);

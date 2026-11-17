@@ -142,7 +142,8 @@ export const LOGGED_OUT_BY_USER = "logged out by user";
 
 /** Whether a disable cause records the user's own removal of a credential. */
 export function isUserRemovalCause(cause: string): boolean {
-	return /^(deleted|logged out) by user/i.test(cause);
+	const lower = cause.toLowerCase();
+	return lower.startsWith(DELETED_BY_USER) || lower.startsWith(LOGGED_OUT_BY_USER);
 }
 
 /**

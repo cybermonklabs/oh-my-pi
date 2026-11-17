@@ -76,7 +76,7 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 		const sub = subSessions[key]!;
 		// The selected branch, as the subagent's own session reopens it: entries on other branches
 		// (an abandoned turn, a `/clear` that was rolled back) are not its conversation.
-		if (sub.aborted || !hasRestorableTurn(activeBranch(sub.entries))) continue;
+		if (sub.aborted || !hasRestorableTurn(activeBranch(sub.entries, sub.leafId))) continue;
 		const id = sub.agentId;
 		const ref = registry.get(id);
 		const init = extractSessionInit(sub.entries);

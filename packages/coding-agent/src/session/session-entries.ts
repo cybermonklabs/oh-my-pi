@@ -412,9 +412,14 @@ export function branchPath(leaf: SessionEntry, byId: ReadonlyMap<string, Session
 	return path.reverse();
 }
 
-/** The branch a file's replay selects: the entries from the root to its active leaf (see {@link resolveSessionLeafId}). */
-export function activeBranch(entries: readonly SessionEntry[]): SessionEntry[] {
-	const leafId = resolveSessionLeafId(entries);
+/**
+ * The branch a file's replay selects: the entries from the root to its active leaf (see {@link resolveSessionLeafId}).
+ * A caller that already resolved the leaf of these same entries passes it as `leafId`.
+ */
+export function activeBranch(
+	entries: readonly SessionEntry[],
+	leafId: string | null = resolveSessionLeafId(entries),
+): SessionEntry[] {
 	if (leafId === null) return [];
 	const byId = new Map(entries.map(entry => [entry.id, entry]));
 	const leaf = byId.get(leafId);

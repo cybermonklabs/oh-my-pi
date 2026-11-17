@@ -48,7 +48,10 @@ import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { asGlobalFetch } from "./helpers/fetch-mock";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
@@ -89,16 +92,6 @@ let savedEnv: Record<string, string | undefined> = {};
 let root: TempDir;
 /** Disposals of the running test, run newest first by `afterEach`. */
 const cleanups: Array<() => unknown> = [];
-
-function restoreEnvValue(key: string, value: string | undefined): void {
-	if (value === undefined) {
-		delete process.env[key];
-		delete Bun.env[key];
-		return;
-	}
-	process.env[key] = value;
-	Bun.env[key] = value;
-}
 
 beforeEach(async () => {
 	savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
@@ -778,19 +771,16 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 		let brokerDown = false;
 		let refusedRefreshes = 0;
 		let refreshesAfterOutage = 0;
-		const brokerFetch: typeof fetch = Object.assign(
-			(input: string | URL | Request, init?: RequestInit) => {
-				const url = String(input);
-				const refresh = url.includes("/refresh");
-				if (!brokerDown) {
-					if (refresh && refusedRefreshes > 0) refreshesAfterOutage++;
-					return fetch(input, init);
-				}
-				if (refresh) refusedRefreshes++;
-				return fetch(url.replace(broker.url, downOrigin), init);
-			},
-			{ preconnect: fetch.preconnect },
-		);
+		const brokerFetch = asGlobalFetch((input, init) => {
+			const url = String(input);
+			const refresh = url.includes("/refresh");
+			if (!brokerDown) {
+				if (refresh && refusedRefreshes > 0) refreshesAfterOutage++;
+				return fetch(input, init);
+			}
+			if (refresh) refusedRefreshes++;
+			return fetch(url.replace(broker.url, downOrigin), init);
+		});
 		const client = new AuthBrokerClient({ url: broker.url, token: BROKER_TOKEN, fetchImpl: brokerFetch });
 		const initial = await client.fetchSnapshot();
 		if (initial.status !== 200) throw new Error("Expected the broker's snapshot");
@@ -1188,23 +1178,14 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 		const { failed, restorable } = await storedFailedTurn(model => {
 			const stream = new AssistantMessageEventStream();
 			const overloaded: AssistantMessage = {
-				role: "assistant",
+				...createAssistantMessage(""),
 				content: [],
 				api: model.api,
 				provider: model.provider,
 				model: model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
 				stopReason: "error",
 				errorMessage: "529 overloaded_error: Overloaded",
 				errorStatus: 529,
-				timestamp: Date.now(),
 			};
 			queueMicrotask(() => {
 				stream.push({ type: "start", partial: overloaded });

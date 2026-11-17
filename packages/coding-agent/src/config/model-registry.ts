@@ -3608,8 +3608,9 @@ export class ModelRegistry {
 		}
 		return tombstones.some(
 			failure =>
-				this.authStorage.sessions.permitsIdentity(provider, sessionId, failure.identityKey) &&
-				isRecoverableDisabledCredential(failure, tombstones),
+				isRecoverableDisabledCredential(failure, tombstones) &&
+				(sessionId === undefined ||
+					this.authStorage.sessions.permitsIdentity(provider, sessionId, failure.identityKey)),
 		);
 	}
 
