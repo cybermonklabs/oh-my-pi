@@ -540,13 +540,13 @@ struct Options {
 	/// Whether an input that is the file stdout lands in is refused; see
 	/// [`Grep::run`].
 	refuse_output_file:  bool,
-	/// The patterns of `-o` with more than one, to compile each alone; see
-	/// [`GrepSink::print_only_matching`].
+	/// The non-empty patterns of `-o` with more than one, to compile each
+	/// alone; see [`GrepSink::print_only_matching`].
 	each_pattern:        Option<Arc<EachPattern>>,
 }
 
-/// The patterns of a `-o` search, each compiled alone at the first empty
-/// match that needs them, once for every file and worker of the search.
+/// The non-empty patterns of a `-o` search, each compiled alone at the first
+/// empty match that needs them, once for every file and worker of the search.
 struct EachPattern {
 	patterns: Vec<String>,
 	spec:     MatcherSpec,
@@ -558,7 +558,8 @@ impl EachPattern {
 	fn engines(&self) -> Option<&[Engine]> {
 		self.engines
 			.get_or_init(|| {
-				// One failing alone (the alternation compiled: a size limit) skips empty matches, as before.
+				// The alternation compiled, so a pattern alone can fail only on a
+				// size limit; empty matches then stay skipped.
 				self.patterns
 					.iter()
 					.map(|pattern| build_matcher(std::slice::from_ref(pattern), self.spec).ok())
@@ -775,16 +776,19 @@ fn long_option_takes_next_value(long: &str) -> bool {
 		| "include-dir")
 }
 
-/// Rewrites GNU grep's context counts, which clap cannot read, to
-/// `--context=N`: an argument of digits (`-5`), and each run of digits in a
-/// group of short options (`-5e mid`, `-n2e mid`).
+/// Rewrites what clap reads otherwise than GNU grep: a context count becomes
+/// `--context=N`, as an argument of digits (`-5`) and as each run of digits
+/// in a group of short options (`-5e mid`, `-n2e mid`), and an option's value
+/// attached with a leading `=` (`-e=x`, `-ve=x`) is passed apart, as clap
+/// would drop the `=`.
 ///
 /// A group is read as getopt reads it with GNU grep's digit options: a run of
 /// digits is one count (`-15`), and a later count replaces it (`-5n3` is
 /// `-3`). The first option in the group that takes a value takes the rest of
 /// it (`-ve-5`, `-m5`), or the next argument whatever its first character
-/// when the group ends there (`-ve -5`, `-2f -1`). A group with no count
-/// before that option is passed on as it is.
+/// when the group ends there (`-ve -5`, `-2f -1`). Any other group is passed
+/// on as it is, and so is one with a `-` before that option (`-5-`), which
+/// GNU grep and clap both refuse.
 fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 	let mut normalized = Vec::with_capacity(argv.len());
 	let mut literal = false;
@@ -811,7 +815,10 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 				.unwrap_or(group.len()),
 		);
 		value_pending = valued.len() == 1;
-		if !options.contains(|c: char| c.is_ascii_digit()) {
+		let value_starts_with_equals = valued.get(1..).is_some_and(|value| value.starts_with('='));
+		if options.contains('-')
+			|| !(value_starts_with_equals || options.contains(|c: char| c.is_ascii_digit()))
+		{
 			normalized.push(arg);
 			continue;
 		}
@@ -1048,7 +1055,8 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 		let line = line.strip_suffix(&[self.opts.record.terminator]).unwrap_or(line);
 		let (matcher, opts) = (self.matcher, self.opts);
 		let mut next = std::mem::take(&mut self.next_matches);
-		let mut asked = false;
+		// No pattern is searched in this line yet.
+		next.clear();
 		let printed = for_each_nonempty_match_with(
 			matcher,
 			line,
@@ -1057,11 +1065,8 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 				let Some(engines) = opts.each_pattern.as_deref().and_then(EachPattern::engines) else {
 					return Ok(None);
 				};
-				if !asked {
-					// No pattern is searched in this line yet.
-					next.clear();
+				if next.is_empty() {
 					next.resize(engines.len(), None);
-					asked = true;
 				}
 				longest_match_at(engines, &mut next, line, start)
 			},
@@ -2093,26 +2098,24 @@ impl AsyncUtility for Grep {
 			return 2;
 		},
 	};
+	let output_suppressed = cli.count || files_with_matches || files_without_match || cli.quiet;
 	// Where the patterns together match empty, `-o` prints the longest match
 	// of one pattern alone; see `GrepSink::print_only_matching`. The lines
 	// `-v` selects hold no match, and `-c`, `-l`, `-L` and `-q` print none.
-	let prints_matches = cli.only_matching
-		&& !cli.invert
-		&& !cli.count
-		&& !files_with_matches
-		&& !files_without_match
-		&& !cli.quiet;
-	let each_pattern = (prints_matches && patterns.len() > 1).then(|| {
-		Arc::new(EachPattern {
-			patterns: std::mem::take(&mut patterns),
-			spec,
-			engines: OnceLock::new(),
-		})
-	});
+	let prints_matches = cli.only_matching && !cli.invert && !output_suppressed;
+	let each_pattern = if prints_matches && patterns.len() > 1 {
+		// An empty pattern can only match empty, which is never printed, so it
+		// is not compiled alone.
+		let mut each = std::mem::take(&mut patterns);
+		each.retain(|pattern| !pattern.is_empty());
+		(!each.is_empty())
+			.then(|| Arc::new(EachPattern { patterns: each, spec, engines: OnceLock::new() }))
+	} else {
+		None
+	};
 	patterns.clear();
 
-	let suppress_context =
-		cli.count || files_with_matches || files_without_match || cli.quiet || cli.only_matching;
+	let suppress_context = output_suppressed || cli.only_matching;
 	let (before, after) = if suppress_context {
 		(0, 0)
 	} else {
@@ -2125,11 +2128,7 @@ impl AsyncUtility for Grep {
 	// without bound. It exempts the modes that write at most one line per file
 	// (`-q`, `-c`, `-l`, `-L`) and the bounded `-m1`, which stop before their
 	// output can feed back into the search.
-	let refuse_output_file = !cli.quiet
-		&& !cli.count
-		&& !files_with_matches
-		&& !files_without_match
-		&& max_count.is_none_or(|count| count > 1);
+	let refuse_output_file = !output_suppressed && max_count.is_none_or(|count| count > 1);
 	let opts = Options {
 		line_number: cli.line_number,
 		byte_offset: cli.byte_offset,
@@ -2377,13 +2376,15 @@ mod tests {
 	/// and a later one replaces it, and the first option that takes a value
 	/// takes the rest of the group or the next argument. Only an argument of
 	/// digits was a count, so clap refused `-5e` with "unexpected argument
-	/// '-5'" and exit 2.
+	/// '-5'" and exit 2. A value attached with a leading `=` keeps it, as GNU
+	/// grep reads it, where clap dropped it: `-e=x` searched `x`.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn a_context_count_in_a_group_of_short_options_is_read_as_gnu_grep_reads_it() {
 		let tree = tempfile::tempdir().unwrap();
 		std::fs::write(tree.path().join("ctx"), "1\n2\n3\nmid\n5\n6\n7\n").unwrap();
 		std::fs::write(tree.path().join("in"), "-5\n-1\nx\nzz\nb\n").unwrap();
 		std::fs::write(tree.path().join("-1"), "-5\n").unwrap();
+		std::fs::write(tree.path().join("eq"), "a=x\nx\n").unwrap();
 		for (args, want) in [
 			(&["-5e", "mid", "ctx"][..], "1\n2\n3\nmid\n5\n6\n7\n"),
 			(&["-2f", "-1", "in"][..], "-5\n-1\nx\n"),
@@ -2398,9 +2399,17 @@ mod tests {
 			(&["-A2", "mid", "ctx"][..], "mid\n5\n6\n"),
 			(&["-e5", "ctx"][..], "5\n"),
 			(&["-5", "mid", "ctx"][..], "1\n2\n3\nmid\n5\n6\n7\n"),
+			(&["-e=x", "eq"][..], "a=x\n"),
+			(&["-ve=x", "eq"][..], "x\n"),
 		] {
 			let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;
 			assert_eq!((code, capture.out().as_str()), (0, want), "{args:?}: {}", capture.err());
+		}
+		// GNU grep refuses a `-` in a group ("invalid option -- '-'") and a
+		// count with a leading `=` ("invalid max count"), and exits 2.
+		for args in [&["-5-", "mid", "ctx"][..], &["-5-3", "ctx"][..], &["-m=1", "x", "eq"][..]] {
+			let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;
+			assert_eq!((code, capture.out().as_str()), (2, ""), "{args:?}: {}", capture.err());
 		}
 	}
 
@@ -3200,7 +3209,7 @@ mod tests {
 			// still ignores case.
 			(&["-ob", "-e", r"q\?", "-e", "zz", "ab"][..], "4:zz\n9:zz\n"),
 			(&["-oi", "-e", r"q\?", "-e", "zz", "ab"][..], "zz\nzz\nZZ\n"),
-			// No match is empty, so the patterns are never compiled alone.
+			// No match is empty: each prints as the first pattern that matches there finds it.
 			(&["-o", "-e", "zz", "-e", "b", "ab"][..], "b\nzz\nzz\nb\n"),
 		] {
 			let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;

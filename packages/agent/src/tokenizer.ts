@@ -362,6 +362,11 @@ export class Tokenizer {
 		return estimateImageTokens(size, detail, this.#frameBilling.rule);
 	}
 
+	/** {@link imageTokens} for an image block a request carries. */
+	#imageBlockTokens(image: ImageContent): number {
+		return this.imageTokens(base64ImageSize(image.data), image.detail);
+	}
+
 	/**
 	 * Whether `message`'s signed reasoning reaches this reader natively: from
 	 * the same model, host and wire, or from another Claude model on the same
@@ -426,11 +431,9 @@ export class Tokenizer {
 			case "hookMessage": {
 				// All four roles carry `string | (TextContent | ImageContent)[]` and all are
 				// sent to the provider -- convertMessageToLlm handles developer alongside
-				// user -- so they are counted alike. Without the developer case the switch
-				// fell through to `default: return 0`, and the old annotation narrowed the
-				// blocks to text-only, hiding the image charge the toolResult arm applies.
-				// Content that is neither (a malformed persisted custom message) is in no
-				// request: the coding-agent's `convertToLlm` drops it, and it counts 0.
+				// user -- so they are counted alike. Content that is neither (a malformed
+				// persisted custom message) is in no request: the coding-agent's
+				// `convertToLlm` drops it, and it counts 0.
 				const content = message.content;
 				if (typeof content === "string") {
 					fragments.push(content);
@@ -439,7 +442,7 @@ export class Tokenizer {
 						if (block.type === "text" && block.text) {
 							fragments.push(block.text);
 						} else if (block.type === "image") {
-							extra += this.imageTokens(base64ImageSize(block.data), block.detail);
+							extra += this.#imageBlockTokens(block);
 						}
 					}
 				}
@@ -553,7 +556,7 @@ export class Tokenizer {
 						if (block.type === "text" && block.text) {
 							fragments.push(block.text);
 						} else if (block.type === "image") {
-							extra += this.imageTokens(base64ImageSize(block.data), block.detail);
+							extra += this.#imageBlockTokens(block);
 						}
 					}
 				}
@@ -615,7 +618,7 @@ export class Tokenizer {
 			if (role === "bashExecution" && "images" in message && Array.isArray(message.images)) {
 				const images: readonly unknown[] = message.images;
 				for (const image of images) {
-					if (isImageBlock(image)) extra += this.imageTokens(base64ImageSize(image.data), image.detail);
+					if (isImageBlock(image)) extra += this.#imageBlockTokens(image);
 				}
 			}
 		} else if ("files" in message && Array.isArray(message.files)) {
@@ -624,9 +627,7 @@ export class Tokenizer {
 				if (!isRecord(file)) continue;
 				if (typeof file.path === "string") fragments.push(file.path);
 				if (typeof file.content === "string") fragments.push(file.content);
-				if (isImageBlock(file.image)) {
-					extra += this.imageTokens(base64ImageSize(file.image.data), file.image.detail);
-				}
+				if (isImageBlock(file.image)) extra += this.#imageBlockTokens(file.image);
 			}
 		}
 		return fragments.length === 0 ? extra : extra + this.countTokens(fragments);

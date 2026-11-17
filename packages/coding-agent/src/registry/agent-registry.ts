@@ -103,6 +103,11 @@ export function isResumable(ref: AgentRef | undefined): boolean {
 	return (ref?.status === "parked" || ref?.status === "aborted") && ref.sessionFile !== null;
 }
 
+/** Whether `ref` is a live agent: `running` or `idle`. */
+export function isLive(ref: AgentRef | undefined): boolean {
+	return ref?.status === "running" || ref?.status === "idle";
+}
+
 export type RegistryEvent =
 	| { type: "registered"; ref: AgentRef }
 	| { type: "status_changed"; ref: AgentRef }
@@ -452,9 +457,7 @@ export class AgentRegistry implements AgentRegistryApi {
 	 * Flat namespace: every other agent is visible.
 	 */
 	listVisibleTo(id: string): AgentRef[] {
-		return this.list().filter(
-			ref => ref.id !== id && ref.kind !== "advisor" && (ref.status === "running" || ref.status === "idle"),
-		);
+		return this.list().filter(ref => ref.id !== id && ref.kind !== "advisor" && isLive(ref));
 	}
 
 	/** Whether a ref's claimed running state is corroborated by its attached live session. */

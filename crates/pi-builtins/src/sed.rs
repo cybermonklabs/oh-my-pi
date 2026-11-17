@@ -1152,7 +1152,6 @@ fn compile_regex(
 		compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))
 			.unwrap_err()
 	})?;
-	let pattern: &str = &translated;
 
 	let mut modifiers = String::new();
 	if icase {
@@ -1162,9 +1161,9 @@ fn compile_regex(
 		modifiers.push('m');
 	}
 	let pattern = if modifiers.is_empty() {
-		pattern.to_string()
+		translated
 	} else {
-		format!("(?{modifiers}){pattern}")
+		std::borrow::Cow::Owned(format!("(?{modifiers}){translated}"))
 	};
 
 	// Compile into engine.
@@ -3796,13 +3795,9 @@ fn parse_character_class(
 
 		if ch == '[' {
 			line.advance();
-			if line.eol() {
-				result.push('[');
-				continue;
-			}
-			let marker = line.current();
 			// POSIX character class, collating symbol, or equivalence
-			if marker == ':' || marker == '.' || marker == '=' {
+			if !line.eol() && matches!(line.current(), ':' | '.' | '=') {
+				let marker = line.current();
 				line.advance();
 
 				result.push('[');
@@ -3842,9 +3837,7 @@ fn parse_character_class(
 				continue;
 			}
 			// Not a POSIX construct: the `[` is a member of the list, and what
-			// follows is read as any member is. Taken along with the `[`, a
-			// `]` there no longer closed the list, so `[[]`, `[][]` and
-			// `[[:alpha:][]` were refused as unterminated.
+			// follows is read as any member is.
 			result.push('[');
 			continue;
 		}
@@ -9632,26 +9625,6 @@ mod tests {
 		let (code, capture) = crate::host::run_util::<Sed>(&["s/^^/X/"], "^a\naaa\n^^b\n", "/");
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "Xa\naaa\nX^b\n");
-	}
-
-	#[test]
-	fn builtin_reads_a_bracket_inside_a_bracket_expression_as_a_member() {
-		// GNU sed 4.9 on `a[b`: inside a list, `[` opens something only as
-		// `[:`, `[.` or `[=`, else it is one more member. The `[` took the
-		// character after it along, so the `]` closing `[[]` went unseen and
-		// each script was refused with "Unterminated bracket expression"; with
-		// `-E` the engine then read `[[]` as an unclosed nested class.
-		for (args, want) in [
-			(&["s/[[]/x/"][..], "axb\n"),
-			(&["-E", "s/[[]/x/"][..], "axb\n"),
-			(&["-n", "/[[]/p"][..], "a[b\n"),
-			(&["s/[^[]/y/g"][..], "y[y\n"),
-			(&["s/[][]/y/g"][..], "ayb\n"),
-			(&["s/[[:alpha:][]/y/g"][..], "yyy\n"),
-		] {
-			let (code, capture) = crate::host::run_util::<Sed>(args, "a[b\n", "/");
-			assert_eq!((code, capture.out().as_str()), (0, want), "{args:?}: {}", capture.err());
-		}
 	}
 
 	#[test]

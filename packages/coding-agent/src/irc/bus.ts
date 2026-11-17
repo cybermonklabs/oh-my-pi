@@ -17,6 +17,7 @@ import {
 	AgentRegistry,
 	type AgentRegistryApi,
 	type AgentStatus,
+	isLive,
 	MAIN_AGENT_ID,
 } from "../registry/agent-registry";
 import type { CustomMessage } from "../session/messages";
@@ -54,11 +55,6 @@ export function ircWaitAccepts(filter: IrcWaitFilter, msg: IrcMessage): boolean 
 interface SendMark {
 	ts: number;
 	seq: number;
-}
-
-/** Whether `ref` is a live agent, whose send marks the bus keeps; see {@link IrcBus.forgetAgent}. */
-function isLive(ref: AgentRef | undefined): boolean {
-	return ref?.status === "running" || ref?.status === "idle";
 }
 
 /** Mailbox cap per agent; oldest messages are dropped beyond it. */

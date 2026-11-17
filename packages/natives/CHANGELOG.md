@@ -11,6 +11,7 @@
 - `grep` with an empty `-f` file selects no line with `-i` too, and prints no count
 - `grep -o` prints the matches of the other patterns beside a pattern that matches empty, such as `''`, `q\?` or `x*`
 - `grep` reads a context count inside a group of short options, such as `-5e mid` or `-n2e mid`, as GNU grep does
+- `grep` keeps the `=` that starts a value attached to a short option, so `grep -e=x` searches `=x` and `grep -m=1` is refused, as GNU grep does
 - `grep -m0` prints nothing, not even a count, and reports no missing file, as GNU grep does
 - `sed` reads a `[` inside a bracket expression as a member, so `s/[[]/x/` and `s/[][]/y/g` work, and `sed -E` reads bracket expressions as `sed` does
 

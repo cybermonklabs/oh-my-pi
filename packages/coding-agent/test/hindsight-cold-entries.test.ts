@@ -2,13 +2,13 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type {
 	BankProfileResponse,
 	CreateBankOptions,
 	RetainOptions,
 	RetainResponse,
 } from "@oh-my-pi/pi-coding-agent/hindsight/client";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import { type HindsightConfig, loadHindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import { prepareRetentionTranscript, sliceLastTurnsByUserBoundary } from "@oh-my-pi/pi-coding-agent/hindsight/content";
