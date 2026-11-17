@@ -5,7 +5,7 @@
 ### Changed
 
 - A resumed session keeps in memory only the entries since its latest compaction: older message bodies, tool results and summaries wait in a temporary file and are read back when something asks for them, so long sessions take far less memory
-- A resumed session keeps less of each older entry in memory: an older message keeps only the few small fields every turn reads, and every to-do list edit but the newest, and each older tool start marker, waits in the temporary file with the older bodies, so memory grows far less as a session gets longer
+- A resumed session keeps less of each older entry in memory: an older message keeps only the few small fields every turn reads, and older tool start markers and every to-do list edit except the one the list restores from wait in the temporary file with the older bodies, so memory grows far less as a session gets longer
 - Hindsight auto-retain, the pending-tool-call warning on resume and the exit record read only recent messages on each turn instead of the whole history
 - `.jsonl.gz` subagent transcripts in exports are decompressed as they are read instead of all at once
 - `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory

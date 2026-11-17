@@ -45,8 +45,8 @@ const CASE_TIMEOUT_MS = 60_000;
 /**
  * The message fields that readers walking the whole branch read of every
  * message on a turn (the persistence check of each new message, the prompt
- * cache scan, the to-do restore, the retry checks, extensions), so a cold
- * message keeps them in memory.
+ * cache scan, the to-do restore, the retry checks, the prune passes,
+ * extensions), so a cold message keeps them in memory.
  */
 const MESSAGE_FIELDS_READ_EVERY_TURN = [
 	"role",
@@ -64,6 +64,8 @@ const MESSAGE_FIELDS_READ_EVERY_TURN = [
 	"display",
 	"attribution",
 	"errorMessage",
+	"prunedAt",
+	"useless",
 ];
 
 function text(label: string): string {
