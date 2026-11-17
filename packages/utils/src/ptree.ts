@@ -451,13 +451,24 @@ export class ChildProcess<In extends InMask = InMask> {
 	 * A subreaper with no child has not launched the command yet (or the
 	 * command has ended). It is looked at again while frozen with SIGSTOP and,
 	 * when still childless, killed, so a command cancelled before its launch
-	 * never starts. Freeze, kill and resume all go through `root`, the native
-	 * handle pinned to the subreaper's identity, never through the numeric pid:
-	 * once the subreaper has been reaped and its pid reused, they signal
-	 * nothing. The resume runs on every way out of the frozen section,
-	 * including a throw; it is a no-op on a killed subreaper. The grace timer is
-	 * cleared as soon as the sequence moves on, so a finished stop never keeps
-	 * the caller's process alive.
+	 * never starts. The subreaper leads its own process group (see `subreaper`),
+	 * so the native freeze and kill also signal that group. Linux delivers a
+	 * group signal to the child of a fork in progress, and restarts that fork if
+	 * the signal comes first, so the freeze and the kill reach a command the
+	 * subreaper is launching even when another process resumes it between them.
+	 * Signalling the subreaper alone would not: SIGSTOP does not end a fork in
+	 * progress, and its child can appear after the read. The one escape is a
+	 * command that leaves the group (setsid) after its fork and before the kill,
+	 * which needs another process to resume the frozen subreaper in that window.
+	 * Freeze, kill and resume all go through `root`, the native handle pinned to
+	 * the subreaper's identity, never through a pid this code holds: once the
+	 * subreaper has been reaped and its pid reused, they signal nothing. The
+	 * handle signals the group only while it sees the subreaper running, and
+	 * the group is named by the subreaper's own pid, which a running process
+	 * keeps. The resume runs on every way out of the frozen section, including
+	 * a throw; it is a no-op on a killed subreaper. The grace timer is cleared
+	 * as soon as the sequence moves on, so a finished stop never keeps the
+	 * caller's process alive.
 	 */
 	async #stopSubreaperTree(root: Process, gracefulMs: number, escalated: Promise<void>): Promise<void> {
 		let children = root.children();
@@ -755,6 +766,14 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	 * remain reachable after changing session and reparenting. Other platforms
 	 * ignore this option. macOS process groups cannot retain a daemonized
 	 * descendant that creates a new session and reparents to launchd.
+	 *
+	 * On Linux, `subreaper` implies `detached`: the subreaper always leads its
+	 * own process group and session. A stop signals that group, and Linux
+	 * delivers a group signal to a child that a fork in progress adds, so a kill
+	 * cannot miss a command the subreaper is launching. Terminal job control
+	 * (Ctrl-C, Ctrl-Z) therefore no longer reaches the command directly; stop it
+	 * with `kill()`, `signal` or `timeout`. `detached: false` with `subreaper`
+	 * contradicts this and is refused on every platform.
 	 */
 	subreaper?: boolean;
 	/** Expose and retain complete stderr for a later `wait({ stderr: "full" })`. */
@@ -767,14 +786,20 @@ function spawnInternal<In extends InMask = InMask>(
 	retainFullStderr: boolean,
 ): ChildProcess<In> {
 	const { timeout = -1, signal, stderr, detached, subreaper = false, ...rest } = opts ?? {};
+	if (subreaper && detached === false) {
+		throw new Error("subreaper implies detached: the subreaper leads its own process group (omit detached: false)");
+	}
 	const useSubreaper = subreaper && process.platform === "linux";
+	// A subreaper leads its own group, so the stop's freeze and kill reach the
+	// command it is forking (see `subreaper`).
+	const leadsGroup = detached === true || useSubreaper;
 	const commandEnv = rest.env ?? Bun.env;
 	const child = Bun.spawn(useSubreaper ? [process.execPath, "-e", LINUX_SUBREAPER_SCRIPT] : cmd, {
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
 		windowsHide: true,
-		detached,
+		detached: leadsGroup,
 		...rest,
 		env: useSubreaper
 			? {
@@ -785,7 +810,7 @@ function spawnInternal<In extends InMask = InMask>(
 				}
 			: rest.env,
 	});
-	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, detached === true, useSubreaper);
+	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, leadsGroup, useSubreaper);
 	if (signal) cp.attachSignal(signal);
 	if (timeout > 0) cp.attachTimeout(timeout);
 	return cp;
