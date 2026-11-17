@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- After a Hindsight auto-recall fails, later prompts no longer each wait out the recall timeout: automatic recall pauses for `hindsight.recallCooldownMs` (also `HINDSIGHT_RECALL_COOLDOWN_MS`, default 30 minutes), doubling with each further failure, and a notice says when it tries again; `0` turns the pause off
 - In RPC mode a command sent after the `ready` frame is answered while startup still runs instead of after it finishes; a frame that starts a turn, changes the session or changes goal state still waits for startup ([#19126](https://github.com/can1357/oh-my-pi/pull/19126) by [@sjawhar](https://github.com/sjawhar))
 - In RPC mode an `abort` sent while a `new_session`, `switch_session`, `fork` or `navigate_tree` waits for startup now withdraws it: the frame answers `cancelled` instead of changing the session once startup finishes ([#19126](https://github.com/can1357/oh-my-pi/pull/19126) by [@sjawhar](https://github.com/sjawhar))
 - In RPC mode a `live_stop` or `live_mute` is now answered without waiting behind the commands queued ahead of it, after startup as well as during it, so a stop reaches a live session that is still connecting ([#19126](https://github.com/can1357/oh-my-pi/pull/19126) by [@sjawhar](https://github.com/sjawhar))
