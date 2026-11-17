@@ -203,6 +203,7 @@ import {
 	loadEffectiveAuthAccountPolicyConfig,
 } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
+import { providerContextCut } from "./session/context-cut";
 import { CostCapError, type CostGateApi, guardStreamFn } from "./session/cost-gate";
 import {
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
@@ -223,12 +224,7 @@ import {
 	USER_INTERRUPT_LABEL,
 	wrapSteeringForModel,
 } from "./session/messages";
-import {
-	capArchiveFrameBytes,
-	clampProviderContextImageBytes,
-	clampProviderContextImages,
-	dropUnreadableContextImages,
-} from "./session/provider-image-budget";
+import { capArchiveFrameBytes, dropUnreadableContextImages, ProviderImageClamp } from "./session/provider-image-budget";
 import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
@@ -4684,16 +4680,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			blobBroker,
 		);
 		// One transform per conversation: the date/cwd reminder remembers what each
-		// conversation was sent, so the main loop and every advisor get their own.
-		// Only the main loop journals its reminders in the session.
-		const createTransformProviderContext = (journal?: DateCwdReminderJournal) => {
+		// conversation was sent, and the image clamp what each request dropped, so
+		// the main loop and every advisor get their own. Only the main loop
+		// journals its reminders in the session and asks the session's cut rule
+		// about its forced image drops: an advisor's history is not the session's.
+		const createTransformProviderContext = (
+			journal?: DateCwdReminderJournal,
+			imageClamp = new ProviderImageClamp(),
+		) => {
 			const dateCwdReminder = new DateCwdReminderInjector(journal);
 			return async (context: Context, transformModel: Model): Promise<Context> => {
 				let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
 				// The archive was sized for the model active at the last context build; a model switch may have lowered the budget.
 				transformed = capArchiveFrameBytes(transformed, transformModel);
 				transformed = await snapcompactInline.transform(transformed, transformModel);
-				transformed = clampProviderContextImages(transformed, transformModel);
+				transformed = imageClamp.clampImageCount(transformed, transformModel);
 				transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
 				// After the model-specific normalizers: they carry better wording for the
 				// cases they own (STB WebP), so this stays the backstop for everything
@@ -4701,7 +4702,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				transformed = await dropUnreadableContextImages(transformed, transformModel);
 				transformed = await blobBroker.decorateContext(transformed, transformModel);
 				// Byte budget after decoration: URL/file-referenced images carry no inline bytes.
-				transformed = clampProviderContextImageBytes(transformed, transformModel);
+				transformed = imageClamp.clampImageBytes(transformed, transformModel);
 				// Keep per-request volatility out of the system prompt: the date/cwd
 				// reminder rides on the first user turn so open-weight providers keep
 				// their tool-schema prefix cache (#7404).
@@ -4712,8 +4713,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				);
 			};
 		};
+		// A request past the image budget cannot be served without the drop, so the rule admits it
+		// as forced; asking it logs the decision with the cut's figures.
+		const mainImageClamp = new ProviderImageClamp((site, before, after) => {
+			if (session) session.admitsContextCut(providerContextCut(site, before, after, session.agent.tokenizer));
+		});
 		const transformProviderContext = createTransformProviderContext(
 			createSessionDateCwdReminderJournal(sessionManager),
+			mainImageClamp,
 		);
 		const onPayload = async (payload: unknown, model?: Model, signal?: AbortSignal) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload, model, signal);
@@ -5748,11 +5755,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					cwdResolver: () => sessionManager.getCwd(),
 					convertToLlm: convertToLlmFinal,
 					transformContext: async messages => wrapSteeringForModel(messages),
-					// The primary's chain and reminder placements, so the capture matches its cached prompt.
-					transformProviderContext: createTransformProviderContext({
-						...createSessionDateCwdReminderJournal(sessionManager),
-						record: () => {},
-					}),
+					// The primary's chain, reminder placements and image drops, so the capture matches its cached prompt.
+					transformProviderContext: createTransformProviderContext(
+						{ ...createSessionDateCwdReminderJournal(sessionManager), record: () => {} },
+						mainImageClamp,
+					),
 					temperature: agent.temperature,
 					topP: agent.topP,
 					topK: agent.topK,

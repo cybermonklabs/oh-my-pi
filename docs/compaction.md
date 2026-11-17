@@ -184,7 +184,7 @@ The cut is admitted when any of these holds:
 
 1. The request cannot be served without it: `P` is over the window less the reserve, or the provider refused the request for its size.
 2. idle ≥ life: the prefix has already left the cache, so the cut adds no write.
-3. `N * s * r > (P - p - s) * (w - r)`: the reads the cut saves before the threshold is reached again cost more than writing the tokens after it again.
+3. `N * s * r > (P - p - s) * (w - r)`: the reads the cut saves before the threshold is reached again cost more than writing the tokens after it again. A cut whose rewrite costs nothing more than its reads is admitted too (`(P - p - s) * (w - r) <= 0`: a cut at the tail, a model with no cache prices, or a write no dearer than a read).
 
 A cut that is not admitted waits, and runs at the first later point where it is admitted: a lapse, the threshold, or a forced cut. The decision names the condition that decided it (`forced`, `lapsed`, `pays` or `waits`) and carries `N`, the saving `N * s * r` and the write cost `(P - p - s) * (w - r)`, so a caller can log why a cut ran or waited. Negative or NaN inputs count as 0.
 
@@ -193,7 +193,25 @@ Worked figures, on claude-opus-5-5 with one-hour writes (`w` = $8 and `r` = $0.2
 - A prune of `s` = 21,500 tokens at `p` = 100,000 in a prompt of `P` = 600,000 leaves 478,500 tokens to write again, so (3) needs `N` ≥ 868. With `g` = 1,000 and `T` = 850,000, `N` = 271, and the prune waits.
 - A compaction at `P` = 850,000 that keeps `p` = 30,000 tokens of tools and system prompt and sends 60,000 (`s` = 790,000, 30,000 to write again) needs `N` ≥ 2, and `N` = 790: it is admitted.
 
-The rule governs every automatic cut: the superseded-read, useless-result and age-based tool-result prunes (`pruneSupersededToolResults`, `pruneToolOutputs`), automatic shake, the maintenance rescue's shake and image drop (`dropImages`), the request-body-timeout shake, threshold and idle compaction, and the provider image clamps (`clampProviderContextImages`, `clampProviderContextImageBytes`). Manual `/shake` and `/compact`, and a compaction an RPC client requests, are a person's or an operator's choice and are not governed by it.
+The rule governs every automatic cut: the superseded-read, useless-result and age-based tool-result prunes (`pruneSupersededToolResults`, `pruneToolOutputs`), automatic shake, the maintenance rescue's shake and image drop (`dropImages`), the request-body-timeout shake, threshold, pre-prompt, mid-run and idle compaction (and the notes-backed rollover they run when experimental context management is on), and the provider image clamps (`clampProviderContextImages`, `clampProviderContextImageBytes`). Manual `/shake` and `/compact`, a compaction an RPC client requests, and a rollover the model asks for with `new_context` are a person's, an operator's or the model's choice and are not governed by it.
+
+In the coding agent each automatic cut asks `decideSessionContextCut()` (`packages/coding-agent/src/session/context-cut.ts`) before it changes the context, through `SessionMaintenance.admitsContextCut()`. The session supplies the inputs the cut site does not know:
+
+- `P`: the context tokens the threshold check uses (the site's trigger figure where it has one, else the live context floored by the stored estimate).
+- idle, life, and the lifetime `r` and `w` are priced at: from the prompt cache entry the next request would read, the one the status line's cache marker reports (the warmer's live entry, else the one the branch's newest cached reply left). Idle runs from the newest real or warm request that hit the entry, so a warm refresh keeps the cache counted as live; life is the lifetime the model declares for the entry's tier, else five minutes or one hour; `long` prices one-hour writes and `short` five-minute ones. With no entry (no reply used the cache, or the next request asks for no caching) every cut counts as lapsed.
+- `T`: `resolveThresholdTokens()` for the model's compaction settings.
+- `g`: from the prompt sizes (input + cache read + cache write) of the recent main-loop replies on the current branch.
+- forced: the site's own evidence (a provider overflow or size refusal, an incomplete turn with the window full, a request-body timeout, the dead-end rescue, an exceeded image budget), or `P` over the window less the reserve. With default settings the threshold is the window less the reserve, so default threshold compaction is always forced.
+
+Each site supplies `p` and `s`. A prune keeps what precedes its first blanked result and saves what it blanks (the agent's prune passes take an `admit` gate for this). A shake keeps what precedes its first elided region and saves the regions less their placeholders. A compaction keeps the tools and system prompt and writes the kept tail and the summary again; the summary is counted at the summarizer's cap, as it does not exist yet. Where a site cannot measure `p` exactly it errs low, which only makes the cut's write look larger. A cut that waits does not run and starts nothing: the next maintenance point proposes it again, and a compaction that waits leaves a background speculation armed. With nothing to cut (no prune candidate, no shake region, no history to summarize) the rule is not asked and the site's own no-progress handling runs as before.
+
+#### Image clamps
+
+A conversation's provider-context transform holds one `ProviderImageClamp`, so its count clamp drops the same images from one request to the next. While a request's images fit the image budget with the oldest images already dropped, it drops exactly those again, and the prompt prefix keeps its bytes. When a new image would exceed the budget the request cannot be sent without a drop (a forced cut): the clamp drops the oldest images down to half the budget, rounded up, in one step, so the next forced drop is at least half the budget of new images away. The images dropped beyond the one the budget needed come after it in the prompt, so they add nothing to the write the forced drop already causes. A dropped image keeps its placement: an image-only message still carries the omission text.
+
+A request whose images are a prefix or a branch of what the conversation already sent (a side request, a prune, a branch switch) drops the same oldest images and leaves the state alone, so its shared prefix keeps its bytes. A compaction replaces the oldest images, so the history it leaves starts again from its own images; a model with another image budget does too. Without this, past the budget each new image dropped one more old image, and every request rewrote the prompt from the oldest image it still sent.
+
+The byte clamp keeps the newest user message and the newest image tool result past the byte budget while they fit the request-body limit, and which messages those are moves with every turn, so a remembered drop would evict a different set of images. It keeps its per-request behaviour, and each drop that evicts more images than the previous request's is passed to the rule as forced.
 
 ### Experimental notes-backed context windows
 

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Automatic context cuts (tool-result pruning, auto-shake, automatic compaction and its rescue) now run only when the prompt-cache reads they save pay for the cache write they cause, the cached prompt has already expired, or the request cannot be sent without them; manual `/shake`, `/compact` and RPC-requested compaction are unchanged
+
+### Fixed
+
+- Past a provider's image limit, each new image no longer drops one more old image and rewrites almost the whole cached prompt: the limit now drops the oldest images down to half of it at once and keeps those drops, so the following requests read the cached prompt
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
