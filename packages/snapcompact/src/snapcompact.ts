@@ -2066,6 +2066,182 @@ export function capFrameDataBytes(
 }
 
 // ============================================================================
+// Redrawing stored frames
+// ============================================================================
+
+/** Frame edges snapcompact picks by itself: the per-model sizes and the shape
+ *  table's. A caller's `frameSize` or a host's image edge can be any other. */
+const KNOWN_FRAME_SIZES: ReadonlySet<number> = new Set([
+	...MODEL_VARIANTS.flatMap(([, ideal]) => (ideal.frameSize === undefined ? [] : [ideal.frameSize])),
+	...Object.values(SHAPE_VARIANTS).map(variant => variant.frameSize),
+	FRAME_SIZE,
+]);
+
+const VARIANT_GEOMETRIES: readonly ShapeGeometry[] = Object.values(SHAPE_VARIANTS);
+
+/** `base` at frame edge `size`, as a shape {@link render} draws. */
+function shapeAt(base: ShapeGeometry, size: number): Shape {
+	return { ...base, frameSize: size, frameTokenEstimate: FRAME_TOKEN_ESTIMATE };
+}
+
+/** The shape table's geometries that fit `frame`'s recorded font, ink, line
+ *  repeat, layout and dimming. A frame without a font is a legacy 5x8 frame. */
+function frameGeometries(frame: Frame): ShapeGeometry[] {
+	const legacy = SHAPE_VARIANTS["5x8-sent"];
+	const font = frame.font ?? legacy.font;
+	const ink = frame.variant ?? legacy.variant;
+	const lineRepeat = frame.lineRepeat ?? legacy.lineRepeat;
+	return VARIANT_GEOMETRIES.filter(
+		base =>
+			base.font === font &&
+			base.variant === ink &&
+			base.lineRepeat === lineRepeat &&
+			(base.columns ?? 1) === (frame.columns ?? 1) &&
+			(base.stopwordDim ?? false) === (frame.stopwordDim ?? false),
+	);
+}
+
+/** Frame edges at which `base` lays out `frame`'s recorded columns and rows. */
+function frameSizes(frame: Frame, base: ShapeGeometry): number[] {
+	// A doc frame's columns are `(gridCols - DOC_GUTTER) / 2` rounded down, so two grid widths give one count.
+	const gridCols = base.columns === 2 ? 2 * frame.cols + DOC_GUTTER : frame.cols;
+	const gridColsSpan = base.columns === 2 ? 2 : 1;
+	const rowPitch = base.cellHeight * base.lineRepeat;
+	const low = Math.max(gridCols * base.cellWidth, frame.rows * rowPitch);
+	const high = Math.min((gridCols + gridColsSpan) * base.cellWidth, (frame.rows + 1) * rowPitch);
+	const sizes: number[] = [];
+	for (let size = low; size < high; size++) {
+		const laid = geometry(shapeAt(base, size));
+		if (laid.cols === frame.cols && laid.rows === frame.rows) sizes.push(size);
+	}
+	return sizes;
+}
+
+/** Frame edges that lay out every frame of `frames` at its recorded columns
+ *  and rows, the edges snapcompact picks by itself first. */
+function archiveFrameSizes(frames: readonly Frame[]): number[] {
+	let common: number[] | undefined;
+	for (const frame of frames) {
+		const sizes = new Set(frameGeometries(frame).flatMap(base => frameSizes(frame, base)));
+		common = (common ?? [...sizes]).filter(size => sizes.has(size));
+		if (common.length === 0) return [];
+	}
+	return (common ?? []).sort((a, b) => Number(KNOWN_FRAME_SIZES.has(b)) - Number(KNOWN_FRAME_SIZES.has(a)) || a - b);
+}
+
+/** The shape that draws `frame` at frame edge `size`, if one fits its record. */
+function frameShape(frame: Frame, size: number): Shape | undefined {
+	for (const base of frameGeometries(frame)) {
+		const shape = shapeAt(base, size);
+		const laid = geometry(shape);
+		if (laid.cols === frame.cols && laid.rows === frame.rows) return shape;
+	}
+	return undefined;
+}
+
+/**
+ * The imaged middle of a grid archive cut into one slice per frame: the
+ * frame's recorded count of printed characters, then the zero-width ink
+ * toggles up to the next printed one (pagination leaves them on the earlier
+ * page). `undefined` unless the counts consume the middle exactly.
+ */
+function gridSlices(middle: string, frames: readonly Frame[]): string[] | undefined {
+	const chars = [...middle];
+	const slices: string[] = [];
+	let start = 0;
+	for (const frame of frames) {
+		let end = start;
+		let printed = 0;
+		while (end < chars.length && printed < frame.chars) {
+			if (chars[end] !== DIM_ON && chars[end] !== DIM_OFF) printed++;
+			end++;
+		}
+		if (printed < frame.chars) return undefined;
+		while (end < chars.length && (chars[end] === DIM_ON || chars[end] === DIM_OFF)) end++;
+		slices.push(chars.slice(start, end).join(""));
+		start = end;
+	}
+	return start === chars.length ? slices : undefined;
+}
+
+/** One frame's page as {@link compact} handed it to {@link render}, and the shape that draws it. */
+interface FramePage {
+	text: string;
+	shape: Shape;
+}
+
+/**
+ * Every frame's page cut back out of the archive's kept source, oldest first,
+ * for frame edge `size`: a grid archive by the frames' printed character
+ * counts, a doc archive (persisted as its pages' words in one run) by wrapping
+ * it again. Each page opens with the ink state the previous one left, as
+ * {@link compact} drew it. A frame no shape fits at `size` has no page;
+ * `undefined` when the source does not split into the recorded frames.
+ */
+function framePages(archive: Archive, size: number): (FramePage | undefined)[] | undefined {
+	const { text, frames } = archive;
+	const head = archive.textHead ?? "";
+	const tail = archive.textTail ?? "";
+	if (!text || text.length < head.length + tail.length || !text.startsWith(head) || !text.endsWith(tail)) {
+		return undefined;
+	}
+	const middle = text.slice(head.length, text.length - tail.length);
+	const shapes = frames.map(frame => frameShape(frame, size));
+	const docShape = shapes[0];
+	const slices = frames.every(frame => frame.columns === 2)
+		? docShape && docPages(middle, geometry(docShape), usesWideCells(docShape))
+		: gridSlices(middle, frames);
+	if (!slices || slices.length !== frames.length) return undefined;
+	let dimOpen = head.lastIndexOf(DIM_ON) > head.lastIndexOf(DIM_OFF);
+	return slices.map((slice, index) => {
+		const page = dimOpen ? DIM_ON + slice : slice;
+		dimOpen = page.lastIndexOf(DIM_ON) > page.lastIndexOf(DIM_OFF);
+		const shape = shapes[index];
+		return shape && { text: shape.stopwordDim ? dimStopwords(page) : page, shape };
+	});
+}
+
+/**
+ * Draw the frames at `indexes` again from the archive's kept source text
+ * ({@link Archive.text}), for frames whose stored PNG is gone. Each page is cut
+ * back out of the text in frame order and drawn with its frame's recorded
+ * font, ink, line repeat and layout, at a frame edge that lays out every
+ * frame's recorded columns and rows. `matches` says whether a drawn PNG
+ * (base64) is stored frame `index`; only those are returned. One archive draws
+ * all its frames at one edge, so the first frame settles the edge and the rest
+ * are drawn at it once each.
+ */
+export async function redrawFrames(
+	archive: Archive,
+	indexes: readonly number[],
+	matches: (index: number, data: string) => boolean,
+): Promise<Map<number, string>> {
+	const redrawn = new Map<number, string>();
+	const [first, ...rest] = indexes;
+	if (first === undefined || !archive.text) return redrawn;
+	const draw = async (page: FramePage | undefined, index: number): Promise<boolean> => {
+		if (!page) return false;
+		const { data } = await render(page.text, page.shape);
+		if (!matches(index, data)) return false;
+		redrawn.set(index, data);
+		return true;
+	};
+	let settled: (FramePage | undefined)[] | undefined;
+	for (const size of archiveFrameSizes(archive.frames)) {
+		const pages = framePages(archive, size);
+		if (!pages) continue;
+		settled ??= pages;
+		if (await draw(pages[first], first)) {
+			settled = pages;
+			break;
+		}
+	}
+	const pages = settled;
+	if (pages) await Promise.all(rest.map(index => draw(pages[index], index)));
+	return redrawn;
+}
+
+// ============================================================================
 // Compaction entry point
 // ============================================================================
 

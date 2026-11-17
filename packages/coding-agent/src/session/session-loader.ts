@@ -8,6 +8,7 @@ import {
 	isEnoent,
 	isEnotdir,
 	jsonContainerEnd,
+	logger,
 	parseJsonlLenient,
 	peekFile,
 	tryParseJson,
@@ -16,15 +17,24 @@ import * as snapcompact from "@oh-my-pi/snapcompact";
 import { Semaphore } from "../task/parallel";
 import {
 	BlobStore,
+	externalizeImageData,
 	isBlobRef,
 	lazyImageDataSync,
+	parseBlobRef,
 	resolveImageData,
 	resolveImageDataSync,
 	resolveImageDataUrl,
 	resolveImageDataUrlSync,
 } from "./blob-store";
 import { buildSessionContext } from "./session-context";
-import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
+import {
+	type CompactionEntry,
+	type FileEntry,
+	type RawFileEntry,
+	resolveSessionLeafId,
+	type SessionEntry,
+	type SessionHeader,
+} from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
 import { defaultSessionStorage, FileSessionStorage, type SessionStorage } from "./session-storage";
@@ -777,18 +787,110 @@ async function resolveBlobRefs(values: readonly unknown[], blobStore: BlobStore)
 }
 
 /** The non-header entries, with legacy truncated snapcompact frames repaired before their blobs resolve. */
-function entriesForBlobResolution(entries: FileEntry[]): FileEntry[] {
-	const sessionEntries = entries.filter(entry => entry.type !== "session");
+function entriesForBlobResolution(entries: FileEntry[]): SessionEntry[] {
+	const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
 	for (const entry of sessionEntries) repairTruncatedSnapcompactFrames(entry);
 	return sessionEntries;
 }
 
-/** Restore the image data that persistence externalized to the blob store, in place. */
-export async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): Promise<void> {
-	await resolveBlobRefs(entriesForBlobResolution(entries), blobStore);
+/**
+ * The newest compaction on the active branch, when it holds a snapcompact
+ * archive: the one a rebuilt context draws frames from.
+ */
+function activeSnapcompactCompaction(
+	entries: readonly SessionEntry[],
+): { entry: CompactionEntry; archive: snapcompact.Archive } | undefined {
+	const byId = new Map(entries.map(entry => [entry.id, entry]));
+	const leafId = resolveSessionLeafId(entries);
+	const seen = new Set<string>();
+	let current = leafId === null ? undefined : byId.get(leafId);
+	while (current && !seen.has(current.id)) {
+		if (current.type === "compaction") {
+			const archive = snapcompact.getPreservedArchive(current.preserveData);
+			return archive ? { entry: current, archive } : undefined;
+		}
+		seen.add(current.id);
+		current = current.parentId ? byId.get(current.parentId) : undefined;
+	}
+	return undefined;
 }
 
-/** Synchronous {@link resolveBlobRefsInEntries}. */
+/**
+ * Draw again, from the archive's kept source text, each frame whose blob this
+ * machine lacks, and store each one whose bytes hash to its reference. A
+ * frame that does not draw so keeps its missing blob, which the rebuilt
+ * context reports as unavailable.
+ */
+async function restoreArchiveFrames(
+	archive: snapcompact.Archive,
+	blobStore: BlobStore,
+	entryId: string,
+): Promise<void> {
+	const missing: number[] = [];
+	for (const [index, frame] of archive.frames.entries()) {
+		const hash = parseBlobRef(frame.data);
+		if (hash && !(await blobStore.has(hash))) missing.push(index);
+	}
+	if (missing.length === 0) return;
+	const redrawn = await snapcompact.redrawFrames(
+		archive,
+		missing,
+		(index, data) =>
+			new Bun.SHA256().update(Buffer.from(data, "base64")).digest("hex") ===
+			parseBlobRef(archive.frames[index]?.data ?? ""),
+	);
+	for (const index of missing) {
+		const frame = archive.frames[index];
+		const data = redrawn.get(index);
+		if (frame && data !== undefined) {
+			await externalizeImageData(blobStore, data, frame.mimeType);
+			continue;
+		}
+		logger.warn("Snapcompact frame blob is missing, and the archive text does not draw it again", {
+			entryId,
+			frame: index + 1,
+			frames: archive.frames.length,
+			ref: frame?.data,
+		});
+	}
+}
+
+/**
+ * Restore the frames of the active snapcompact archive whose blobs this
+ * machine lacks: a session resumed on another machine brings its frame
+ * references but not the blob store that held them.
+ */
+async function restoreSnapcompactFrames(entries: readonly SessionEntry[], blobStore: BlobStore): Promise<void> {
+	const active = activeSnapcompactCompaction(entries);
+	if (!active) return;
+	for (const archive of [active.archive, active.archive.withoutThinking?.archive]) {
+		if (!archive) continue;
+		try {
+			await restoreArchiveFrames(archive, blobStore, active.entry.id);
+		} catch (error) {
+			logger.warn("Restoring missing snapcompact frames failed", {
+				entryId: active.entry.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+}
+
+/**
+ * Restore the image data that persistence externalized to the blob store, in
+ * place, and draw again the active snapcompact archive's frames whose blobs
+ * are missing.
+ */
+export async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): Promise<void> {
+	const sessionEntries = entriesForBlobResolution(entries);
+	await resolveBlobRefs(sessionEntries, blobStore);
+	await restoreSnapcompactFrames(sessionEntries, blobStore);
+}
+
+/**
+ * Synchronous {@link resolveBlobRefsInEntries}, without drawing missing
+ * snapcompact frames again (drawing is asynchronous).
+ */
 export function resolveBlobRefsInEntriesSync(entries: FileEntry[], blobStore: BlobStore): void {
 	const resolved = new Map<string, string>();
 	for (const site of blobRefSites(entriesForBlobResolution(entries))) {
