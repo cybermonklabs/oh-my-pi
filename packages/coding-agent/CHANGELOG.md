@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `secrets.maskSessionStore` (off by default): when it is on, the secret values the agent holds (secret-named environment variables except `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS`, the file that each `*_FILE` variable names except the session transcript that `PI_SESSION_FILE` names, and `secrets.yml` entries) are replaced with a `[REDACTED:<source>:<name>]` marker before a session entry, the title, the draft or a collab replica is written to the session store, before the `/btw` history, a subagent's output files (`agent://<id>`) or the shell commands of the selective-commit journal (`changes.jsonl`, which leaves out a file snapshot that masking would change) are written, and before the title and the recaps are kept in `history.db`, while the live session keeps the values. Each session follows its own setting. See [Secrets in stored sessions](../../docs/secrets.md#secrets-in-stored-sessions)
+
+### Changed
+
+- Secret obfuscation and the stream redaction of `omp stream` and `/record` no longer take `GIT_CONFIG_KEY_<n>` and `SSH_ASKPASS` from the environment: they hold git configuration key names and an askpass program path, not secrets, so text that holds those common strings reaches the model provider, stream viewers and recordings unchanged
+- Secret obfuscation and the stream redaction of `omp stream` and `/record` skip a `secrets.yml` that is not a regular file, such as a directory or a FIFO, without opening it, and one that grows while it is read; both skips are logged as a warning
+
+### Fixed
+
+- Secret obfuscation no longer fails every model request when a `secrets.yml` entry or a secret environment variable is very long
+
 ## [18.22.1] - 2026-11-17
 
 ### Breaking Changes

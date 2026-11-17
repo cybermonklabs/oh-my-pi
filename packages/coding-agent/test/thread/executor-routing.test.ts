@@ -466,6 +466,7 @@ describe("subagent runs routed into pooled workers", () => {
 				id: "Parked",
 				agent: AGENT,
 				message: "again",
+				storeMaskCwd: cwd,
 			});
 			expect(followUp.error).toBeUndefined();
 			expect(followUp.output).toBe("pong");
@@ -517,7 +518,7 @@ describe("subagent runs routed into pooled workers", () => {
 			const worker = pool.forThread(home);
 			if (!worker) throw new Error("home worker missing");
 
-			const turn = runSubagentFollowUpTurn({ id: "Crash", agent: AGENT, message: HANG_TASK });
+			const turn = runSubagentFollowUpTurn({ id: "Crash", agent: AGENT, message: HANG_TASK, storeMaskCwd: cwd });
 			await server.hung();
 			worker.terminate("worker crashed: boom");
 			const failed = await turn;
@@ -549,6 +550,7 @@ describe("subagent runs routed into pooled workers", () => {
 				id: "Crash",
 				agent: AGENT,
 				message: "again",
+				storeMaskCwd: cwd,
 			});
 			expect(again.output).toBe("pong");
 		},

@@ -39,7 +39,10 @@ export interface ChangeRecord extends JournalAgent {
 	tool: string;
 	/** Absolute path. */
 	path: string;
-	/** Content before the write; `null` when the file did not exist; `undefined` when not stored (too large). */
+	/**
+	 * Content before the write; `null` when the file did not exist; `undefined` when not stored (too large, or
+	 * changed by the session store mask).
+	 */
 	before: string | null | undefined;
 	/** Content after the write; `null` when the write deleted the file; `undefined` when not stored. */
 	after: string | null | undefined;
@@ -96,12 +99,12 @@ export interface CommitRecord extends JournalAgent {
 
 export type JournalRecord = ChangeRecord | CallRecord | CommitRecord;
 
-/** Content snapshot passed to {@link ChangeJournal.recordChange}; `null` = file absent. */
+/** Content snapshot passed to {@link ChangeJournal.recordChange}; `null` = file absent, `undefined` = not stored. */
 export interface ChangeInput extends JournalAgent {
 	tool: string;
 	path: string;
-	before: string | null;
-	after: string | null;
+	before: string | null | undefined;
+	after: string | null | undefined;
 	beforeMtimeMs?: number;
 }
 
@@ -151,7 +154,8 @@ export class ChangeJournal {
 	 * disk cannot fail the edit that triggered the record.
 	 */
 	recordChange(input: ChangeInput): void {
-		if (input.before === input.after) return;
+		// Two snapshots left out may still differ: the caller compares their contents.
+		if (input.before !== undefined && input.before === input.after) return;
 		const at = Date.now();
 		this.#enqueue(async () => {
 			const [before, after] = await Promise.all([this.#storeBlob(input.before), this.#storeBlob(input.after)]);
@@ -236,9 +240,9 @@ export class ChangeJournal {
 		this.#dirReady = true;
 	}
 
-	/** Store `content` content-addressed; `null` passes through, oversized content yields `undefined`. */
-	async #storeBlob(content: string | null): Promise<string | null | undefined> {
-		if (content === null) return null;
+	/** Store `content` content-addressed; `null` and `undefined` pass through, oversized content yields `undefined`. */
+	async #storeBlob(content: string | null | undefined): Promise<string | null | undefined> {
+		if (content === null || content === undefined) return content;
 		const bytes = Buffer.from(content, "utf8");
 		if (bytes.byteLength > MAX_BLOB_BYTES) return undefined;
 		const key = `${bytes.byteLength.toString(36)}-${Bun.hash(bytes).toString(36)}`;

@@ -519,6 +519,7 @@ describe("BtwController", () => {
 					getSessionId: () => "worker-session",
 					getArtifactsDir: () => artifacts,
 					ensureOnDisk: async () => {},
+					storeMask: () => null,
 				},
 			} as unknown as InteractiveModeContext["session"];
 			Object.assign(ctx, { focusedAgentId: "Worker", viewSession: focusedSession });
@@ -535,7 +536,9 @@ describe("BtwController", () => {
 				"Main question?",
 			]);
 			expect(
-				(await BtwHistoryStore.open(artifacts, "worker-session")).getRecords().map(record => record.question),
+				(await BtwHistoryStore.open(artifacts, { scope: "worker-session" }))
+					.getRecords()
+					.map(record => record.question),
 			).toEqual(["Worker question?"]);
 		} finally {
 			await controller.dispose();

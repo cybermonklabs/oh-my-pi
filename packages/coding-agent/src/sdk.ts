@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { type CallRecord, ChangeJournal, callDetails } from "./commit/selective/journal";
+import { ChangeJournal, callDetails } from "./commit/selective/journal";
 import { createCommitPrelude } from "./commit/selective/prelude-definition";
 import { cfgDisasmBackend } from "./disasm/active";
 import { createDsmPrelude, releaseDsmReferences } from "./disasm/prelude-definition";
@@ -254,6 +254,7 @@ import {
 import { describeUsageFallback } from "./session/retry-fallback-reason";
 import { kUsageLimitRequestProvider } from "./session/turn-recovery";
 import { getReadableCompactionEntry, getRestorableSessionModels } from "./session/session-context";
+import { maskStoredData } from "./session/session-entry-mask";
 import { SessionManager } from "./session/session-manager";
 import { cfgOffline } from "./config/auxiliary-model-policy";
 import { SHAPE_RULE } from "./spotlight/shape";
@@ -453,7 +454,8 @@ import {
 	cfgMcpStartupTimeoutMs,
 } from "./mcp/settings";
 import { cfgPlanEnabled } from "./plan-mode/settings";
-import { cfgSecretsEnabled } from "./secrets/settings";
+import type { SessionStoreMask } from "./secrets/session-store-mask";
+import { cfgSecretsEnabled, cfgSecretsMaskSessionStore } from "./secrets/settings";
 import {
 	cfgSnapcompactShape,
 	cfgSnapcompactSystemPrompt,
@@ -2196,6 +2198,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		logger.time("sessionManager", () =>
 			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
 		);
+	// Bind before the first write below: every write masks by this session's settings, with the
+	// secrets.yml of the agent dir the provider obfuscator reads.
+	sessionManager.setStoreMasking({ enabled: () => cfgSecretsMaskSessionStore.get(settings), agentDir });
 	const configuredDirs = options.additionalDirectories
 		? options.additionalDirectories
 		: cfgWorkspaceAdditionalDirectories.get(settings);
@@ -2609,6 +2614,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const dir = sessionManager.getArtifactsDir();
 		return dir ? ChangeJournal.at(dir) : null;
 	};
+	/**
+	 * Runs `record` with the mask this session's store writes apply now (`secrets.maskSessionStore`, read
+	 * at each write). A mask that cannot be built or fails skips the record and logs it, so the journal
+	 * never holds a value raw and the tool call it records never fails.
+	 */
+	const withJournalMask = (record: (mask: SessionStoreMask | null) => void): void => {
+		try {
+			record(sessionManager.storeMask());
+		} catch (error) {
+			logger.warn("Change journal masking failed; skipped a record", { error: String(error) });
+		}
+	};
 	const resolvedAgentDisplayName = options.agentDisplayName ?? agentKind;
 	let registeredAgentRef: AgentRef | undefined;
 	/**
@@ -2781,15 +2798,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const journal = changeJournal();
 				// Session artifacts (local:// plans, outputs) are never commit material.
 				if (!journal || change.path.startsWith(`${journal.dir}${path.sep}`)) return;
+				if (change.before === change.after) return;
 				const owner = change.agent ?? journalAgent;
-				journal.recordChange({
-					agent: owner.agent,
-					parent: owner.parent,
-					tool: change.tool,
-					path: change.path,
-					before: change.before,
-					after: change.after,
-					beforeMtimeMs: change.beforeMtimeMs,
+				withJournalMask(mask => {
+					// `/commit` needs a snapshot byte for byte: one that masking would change is not stored, as an oversized one.
+					const stored = (text: string | null) =>
+						text !== null && mask !== null && mask.maskText(text) !== text ? undefined : text;
+					journal.recordChange({
+						agent: owner.agent,
+						parent: owner.parent,
+						tool: change.tool,
+						path: change.path,
+						before: stored(change.before),
+						after: stored(change.after),
+						beforeMtimeMs: change.beforeMtimeMs,
+					});
 				});
 			},
 			getTodoPhases: () => session.getTodoPhases(),
@@ -5158,16 +5181,28 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Shell-like calls bound the windows in which scripts, formatters, and codegen changed
 		// files on this agent's behalf; selective commits match file ctimes against them, and the
 		// paths their scripts name against deleted files.
-		const shellCalls = new Map<string, Omit<CallRecord, "type" | "agent" | "parent" | "end">>();
+		const shellCalls = new Map<string, { tool: string; start: number; args: unknown }>();
 		agent.subscribe(event => {
 			if (event.type === "tool_execution_start") {
 				if (event.toolName !== "bash" && event.toolName !== "eval") return;
-				shellCalls.set(event.toolCallId, { tool: event.toolName, start: Date.now(), ...callDetails(event.args) });
+				shellCalls.set(event.toolCallId, { tool: event.toolName, start: Date.now(), args: event.args });
 			} else if (event.type === "tool_execution_end") {
 				const call = shellCalls.get(event.toolCallId);
 				if (!call) return;
 				shellCalls.delete(event.toolCallId);
-				changeJournal()?.recordCall({ ...journalAgent, ...call, end: Date.now() });
+				const journal = changeJournal();
+				if (!journal) return;
+				const end = Date.now();
+				// Masked before `callDetails` cuts the label and the script, so no cut keeps part of a value.
+				withJournalMask(mask =>
+					journal.recordCall({
+						...journalAgent,
+						tool: call.tool,
+						start: call.start,
+						end,
+						...callDetails(maskStoredData(call.args, mask)),
+					}),
+				);
 			}
 		});
 		// Catalog rows carry the registry settings' extended-window opt-ins; this

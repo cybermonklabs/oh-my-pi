@@ -44,7 +44,7 @@ describe("IRC wake turn yield reset", () => {
 			trackIrcReply: () => {},
 		} as unknown as AgentSession;
 
-		attachIrcWakeTurnMonitor(session, { id: "wake-1", agent: wakeAgent, outputSchema: {} });
+		attachIrcWakeTurnMonitor(session, { id: "wake-1", agent: wakeAgent, outputSchema: {}, storeMaskCwd: "/tmp" });
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
 		// A prior run's incremental section makes a data-less terminal yield valid.

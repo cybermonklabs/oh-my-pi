@@ -1,3 +1,4 @@
+import { isAscii, LiteralIndex } from "./literal-index";
 import {
 	buildHashBase,
 	buildKeyedReplacementRun,
@@ -69,7 +70,7 @@ interface CompiledRegexEntry {
 	replacement?: string;
 	friendlyName?: string;
 	/** Gate from `literalPrefixes`, checked before every scan of this entry; null = always scan. */
-	probe: RegExp | null;
+	probe: LiteralDetector | null;
 	/**
 	 * Literals one of which every match contains: `literalPrefixes`, else the
 	 * one {@link requiredLiteral} reads from the pattern; null = none known.
@@ -81,7 +82,7 @@ interface CompiledRegexEntry {
 	 * placeholder-expanded view, where an expanded secret can supply the
 	 * literal, so it is gated by `probe` alone.
 	 */
-	scanProbe: RegExp | null;
+	scanProbe: LiteralDetector | null;
 	ignoreCase: boolean;
 }
 
@@ -97,7 +98,6 @@ export type JsonRecord = { [key: string]: JsonValue | undefined };
 
 const EMPTY_SECRET_VALUES: ReadonlySet<string> = new Set();
 const NO_VALUES: readonly string[] = [];
-const NON_ASCII_RE = /[^\x00-\x7F]/;
 
 /** Distinct placeholder prefixes whose regex verdict is memoized; forged prefixes beyond this are just re-tested. */
 const MAX_PREFIX_REGEX_MEMO = 4096;
@@ -148,36 +148,35 @@ interface RegexScanMemo {
 	scan: ReplaceRegexScan;
 }
 
-/**
- * One non-global regex matching any of `literals` anywhere: `test()` is true
- * exactly when some literal occurs, in a single scan instead of one
- * `includes` per literal. Undefined when there is nothing to detect.
- */
-function buildLiteralDetector(literals: readonly string[], flags?: string): RegExp | undefined {
-	if (literals.length === 0) return undefined;
-	return new RegExp(literalTrie(literals.map(literal => [...literal])), flags);
+/** What {@link buildLiteralDetector} returns: whether some literal occurs in a text. */
+interface LiteralDetector {
+	test(text: string): boolean;
 }
 
 /**
- * Alternation of code-point sequences with shared prefixes factored out, so
- * the engine compares a common prefix (`SECRET_1`, `SECRET_2`, …) once per
- * position instead of once per literal. A sequence that ends where others
- * continue makes them redundant for an existence test, so they are dropped.
+ * The characters outside ASCII that Unicode simple case folding takes into ASCII: the Kelvin sign
+ * (to `k`) and the long s (to `s`). A case-insensitive `u` or `v` regex finds an ASCII literal
+ * through them and through no other character outside ASCII; an `i` regex without `u`, through none.
  */
-function literalTrie(words: readonly string[][]): string {
-	const branches = new Map<string, string[][]>();
-	for (const word of words) {
-		if (word.length === 0) return "";
-		const rest = branches.get(word[0]!);
-		if (rest === undefined) branches.set(word[0]!, [word.slice(1)]);
-		else rest.push(word.slice(1));
-	}
-	const alternatives: string[] = [];
-	for (const [head, rests] of branches) {
-		const tail = rests.length === 1 ? RegExp.escape(rests[0]!.join("")) : literalTrie(rests);
-		alternatives.push(RegExp.escape(head) + (tail === "" || rests.length === 1 ? tail : `(?:${tail})`));
-	}
-	return alternatives.join("|");
+const FOLDS_TO_ASCII_RE = /[\u017F\u212A]/g;
+
+/**
+ * A detector of `literals` anywhere: `test()` is true exactly when some literal occurs, in a single
+ * scan instead of one `includes` per literal; under `flags`, exactly where an `i` or `iu` regex of
+ * the literals would match, every literal then ASCII. No pattern grows with a literal. Undefined
+ * when there is nothing to detect.
+ */
+function buildLiteralDetector(literals: readonly string[], flags?: "i" | "iu"): LiteralDetector | undefined {
+	if (literals.length === 0) return undefined;
+	const index = new LiteralIndex(literals, { ignoreCase: flags !== undefined });
+	if (flags !== "iu") return index;
+	// The index matches up to ASCII case, which is what `iu` matches once those two characters are folded.
+	// Most text holds neither, so it is copied only when it does.
+	const fold = (text: string) =>
+		text.includes("\u212A") || text.includes("\u017F")
+			? text.replace(FOLDS_TO_ASCII_RE, char => (char === "\u212A" ? "k" : "s"))
+			: text;
+	return { test: text => index.test(fold(text)) };
 }
 
 function isUnicode(regex: RegExp): boolean {
@@ -191,11 +190,11 @@ function isUnicode(regex: RegExp): boolean {
  * can match. Null means the entry is always scanned.
  */
 function gateableProbes(regex: RegExp, probes: readonly string[]): readonly string[] | null {
-	return regex.ignoreCase && probes.some(probe => NON_ASCII_RE.test(probe)) ? null : probes;
+	return regex.ignoreCase && probes.some(probe => !isAscii(probe)) ? null : probes;
 }
 
 /** One search for any of `probes`, in `regex`'s case mode. */
-function probeDetector(regex: RegExp, probes: readonly string[]): RegExp {
+function probeDetector(regex: RegExp, probes: readonly string[]): LiteralDetector {
 	return buildLiteralDetector(probes, regex.ignoreCase ? (isUnicode(regex) ? "iu" : "i") : undefined)!;
 }
 
@@ -269,19 +268,19 @@ export class SecretObfuscator {
 	/** Literal-derived data (sorted mappings and detectors), valid for the recorded mapping versions. */
 	#sortedReplaceEntries: [string, string][] | undefined;
 	#sortedPlainEntries: [string, number][] | undefined;
-	#literalDetector: RegExp | undefined;
-	/** Literals, `$$` and case-sensitive probes in one regex; see {@link #mayNeedRedaction}. */
-	#cleanDetector: RegExp | undefined;
+	#literalDetector: LiteralDetector | undefined;
+	/** Literals, `$$` and case-sensitive probes in one detector; see {@link #mayNeedRedaction}. */
+	#cleanDetector: LiteralDetector | undefined;
 	/** Configured literals only (no `$$`); `null` when there are none. See {@link #isRedactionIdentity}. */
-	#configuredLiteralDetector: RegExp | null | undefined;
+	#configuredLiteralDetector: LiteralDetector | null | undefined;
 	#literalCachePlainVersion = -1;
 	#literalCacheReplaceVersion = -1;
 
 	/** Probes of case-sensitive probed regex entries. */
 	readonly #rawProbes: readonly string[];
-	/** Matches any probe of a case-sensitive / case-insensitive probed regex entry; undefined when there are none. */
-	readonly #rawProbeDetector: RegExp | undefined;
-	readonly #caselessProbeDetector: RegExp | undefined;
+	/** Detects any probe of a case-sensitive / case-insensitive probed regex entry; undefined when there are none. */
+	readonly #rawProbeDetector: LiteralDetector | undefined;
+	readonly #caselessProbeDetector: LiteralDetector | undefined;
 
 	/** Per-string results kept across batches; only read and written while a {@link batch} is open. */
 	readonly #scans = new Map<string, TextScan>();

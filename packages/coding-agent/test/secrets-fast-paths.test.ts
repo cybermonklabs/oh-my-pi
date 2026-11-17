@@ -43,6 +43,21 @@ describe("SecretObfuscator probe gating", () => {
 		expect(output).not.toContain(secret);
 		expect(obfuscator.deobfuscate(output)).toBe(`token ${secret} here`);
 	});
+
+	it("redacts a case-insensitive unicode match that holds a long s", () => {
+		// U+017F LATIN SMALL LETTER LONG S folds to "s" under a `u`-flag
+		// case-insensitive regex, the only other character outside ASCII that
+		// folds into ASCII: the probe gate must not skip this text either.
+		const obfuscator = new SecretObfuscator([
+			{ type: "regex", content: "sk-[a-z]{8}", flags: "iu", literalPrefixes: ["sk-"] },
+		]);
+		const secret = "\u017FK-abcdefgh";
+
+		const output = obfuscator.obfuscate(`token ${secret} here`);
+
+		expect(output).not.toContain(secret);
+		expect(obfuscator.deobfuscate(output)).toBe(`token ${secret} here`);
+	});
 });
 
 describe("SecretObfuscator text that is only placeholders", () => {
