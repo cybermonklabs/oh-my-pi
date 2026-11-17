@@ -539,6 +539,16 @@ describe("IRC", () => {
 				}
 			}
 
+			/** Makes each delivery to the registered agent `id` run `during` before it resolves, as a park or release racing the send. */
+			function raceDelivery(id: string, during: () => void): void {
+				const session = registry.get(id)?.session;
+				if (!session) throw new Error(`${id} has no session`);
+				session.deliverIrcMessage = async () => {
+					during();
+					return "injected";
+				};
+			}
+
 			function jobManager(): AsyncJobManager {
 				const manager = new AsyncJobManager({});
 				manager.registerDeliverySink("0-Main", () => {});
@@ -709,6 +719,68 @@ describe("IRC", () => {
 				expect(registry.get("0-Sub")?.status).toBe("aborted");
 				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
 				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+			});
+
+			// Regressed: a subagent parked while a message to it is delivered keeps that message's
+			// mark, and its owner's wait counts the parked agent as owing a reply.
+			it("records no mark for a recipient parked during the delivery", async () => {
+				registerAgents("0-Main", "0-Sub");
+				raceDelivery("0-Sub", () => {
+					registry.detachSession("0-Sub");
+					registry.setStatus("0-Sub", "parked");
+				});
+
+				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				expect(receipt.outcome).toBe("injected");
+
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
+			});
+
+			// Regressed: a subagent released while a message to it is delivered keeps that message's
+			// mark for the rest of the session.
+			it("records no mark for a recipient removed during the delivery", async () => {
+				registerAgents("0-Main", "0-Sub");
+				raceDelivery("0-Sub", () => registry.unregister("0-Sub"));
+
+				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				expect(receipt.outcome).toBe("injected");
+
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
+			});
+
+			// Regressed: a subagent killed while its own message is delivered keeps that message's
+			// mark for the rest of the session.
+			it("records no mark from a sender killed during the delivery", async () => {
+				registerAgents("0-Main", "0-Sub", "0-Peer");
+				raceDelivery("0-Peer", () => {
+					registry.detachSession("0-Sub");
+					registry.setStatus("0-Sub", "aborted");
+				});
+
+				const receipt = await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				expect(receipt.outcome).toBe("injected");
+
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Sub", 0)).toEqual([]);
+			});
+
+			// Regressed: a question that revives a parked subagent is not counted as owed, so its
+			// owner's wait does not block for the answer.
+			it("keeps the mark for a recipient the delivery revived", async () => {
+				registerAgents("0-Main", "0-Sub");
+				const lifecycle = AgentLifecycleManager.global();
+				lifecycle.adopt("0-Sub", { idleTtlMs: 0, revive: async () => makeFakeSession().session });
+				await lifecycle.park("0-Sub");
+
+				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				expect(receipt.outcome).toBe("revived");
+
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([
+					{ to: "0-Sub", sentAt: expect.any(Number), promised: false },
+				]);
 			});
 		});
 	});

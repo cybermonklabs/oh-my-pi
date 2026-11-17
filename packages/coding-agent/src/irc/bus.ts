@@ -12,7 +12,13 @@
 import { type IrcDeliveryReceipt, type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { type AgentLifecycleApi, AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
+import {
+	type AgentRef,
+	AgentRegistry,
+	type AgentRegistryApi,
+	type AgentStatus,
+	MAIN_AGENT_ID,
+} from "../registry/agent-registry";
 import type { CustomMessage } from "../session/messages";
 
 interface IrcWaiter {
@@ -48,6 +54,11 @@ export function ircWaitAccepts(filter: IrcWaitFilter, msg: IrcMessage): boolean 
 interface SendMark {
 	ts: number;
 	seq: number;
+}
+
+/** Whether `ref` is a live agent, whose send marks the bus keeps; see {@link IrcBus.forgetAgent}. */
+function isLive(ref: AgentRef | undefined): boolean {
+	return ref?.status === "running" || ref?.status === "idle";
 }
 
 /** Mailbox cap per agent; oldest messages are dropped beyond it. */
@@ -177,7 +188,17 @@ export class IrcBus implements IrcBusApi {
 		// Taken before delivery: a reply sent while this message is still being
 		// delivered must still order after it.
 		const mark: SendMark = { ts: message.ts, seq: ++this.#sendSeq };
+		// Read before delivery, to tell an agent forgotten during it.
+		const fromRef = this.#registry.get(message.from);
+		const fromStatus = fromRef?.status;
+		const toRef = this.#registry.get(message.to);
+		const toStatus = toRef?.status;
 		const receipt = await this.#deliver(message);
+		// An agent parked, killed or unregistered during the delivery was already
+		// forgotten (see forgetAgent), so a mark recorded now would outlive it.
+		if (this.#forgotDuring(message.from, fromRef, fromStatus) || this.#forgotDuring(message.to, toRef, toStatus)) {
+			return receipt;
+		}
 		if (receipt.outcome !== "failed") {
 			if (message.progress) {
 				this.#record(this.#lastProgress, message.from, message.to, mark);
@@ -200,6 +221,18 @@ export class IrcBus implements IrcBusApi {
 		if ((sent.get(to)?.seq ?? 0) < mark.seq) sent.set(to, mark);
 	}
 
+	/**
+	 * Whether this bus forgot `agentId` during an await that began with its
+	 * registry entry `ref` of `status`: the entry changed meanwhile, and the
+	 * agent is now not live (parked or aborted) or not held at all. An agent
+	 * whose entry did not change records as usual, a parked one or one the
+	 * registry never held included; a revived one is live.
+	 */
+	#forgotDuring(agentId: string, ref: AgentRef | undefined, status: AgentStatus | undefined): boolean {
+		const now = this.#registry.get(agentId);
+		return (now !== ref || now?.status !== status) && !isLive(now);
+	}
+
 	/** Instance half of {@link IrcBus.recordReply}: records the job-carried reply on this bus. */
 	recordReply(from: string, to: string): void {
 		this.#record(this.#lastJobReply, from, to, { ts: Date.now(), seq: ++this.#sendSeq });
@@ -215,8 +248,7 @@ export class IrcBus implements IrcBusApi {
 	 * go once this bus's registry reports it parked, aborted or gone.
 	 */
 	forgetAgent(agentId: string): void {
-		const status = this.#registry.get(agentId)?.status;
-		if (status === "running" || status === "idle") return;
+		if (isLive(this.#registry.get(agentId))) return;
 		for (const table of [this.#lastSent, this.#lastDirect, this.#lastProgress, this.#lastJobReply]) {
 			table.delete(agentId);
 			for (const [from, marks] of table) {
