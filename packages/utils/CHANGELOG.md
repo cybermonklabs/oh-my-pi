@@ -2,9 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `spawn(cmd, { subreaper: true })` on Linux now starts the subreaper as the leader of its own process group and session, as `detached: true` does, and `subreaper` with `detached: false` is refused on every platform. Terminal job control (Ctrl-C, Ctrl-Z) therefore no longer reaches such a command directly; stop it with `kill()`, `signal` or `timeout`
+
 ### Fixed
 
 - Fixed `ChildProcess.kill()` and disposing a `ChildProcess` reporting the process's exit as an unhandled rejection when the process exits before anyone waits on it
+- Fixed a kill of a command run with `spawn(cmd, { subreaper: true })` (Linux, not `detached`) letting the command run on when the kill came while the subreaper was launching it. SIGSTOP does not end a fork in progress, and the stop signalled only the subreaper, so a command the fork added after the stop's last look survived the kill. The stop's freeze and kill now also reach the process group the subreaper leads, and Linux delivers a group signal to a child that a fork in progress adds. One gap remains: a command that leaves the group with `setsid()` after its fork and before the kill escapes it, which needs another process to resume the frozen subreaper in that window
 - Fixed abort signals leaving command output reads blocked when a descendant keeps stdout or stderr open after the root process exits. ([#N](https://github.com/can1357/oh-my-pi/pull/N) by [@eggpeat](https://github.com/eggpeat))
 
 ## [18.17.0] - 2026-11-06

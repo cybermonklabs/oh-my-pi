@@ -118,7 +118,16 @@ describe.skipIf(process.platform !== "linux")("ptree subreaper kill without a us
 				expect(reads).toBe(2);
 				expect(child.proc.signalCode).toBe(signalCode);
 				// procfs reports size 0, so read it with readFile rather than a sized Bun.file read.
-				const state = (await fs.readFile(`/proc/${command.pid}/stat`, "utf8")).split(") ")[1]?.[0];
+				// The fallback signals the group the subreaper leads, which can end the command
+				// itself; a command that is gone is not left stopped.
+				const state = await fs.readFile(`/proc/${command.pid}/stat`, "utf8").then(
+					stat => stat.split(") ")[1]?.[0],
+					(error: NodeJS.ErrnoException) => {
+						// Only a process that no longer exists is gone; any other read error is a failure.
+						if (error.code === "ENOENT" || error.code === "ESRCH") return "gone";
+						throw error;
+					},
+				);
 				expect(state, `command ${command.pid} left stopped`).not.toBe("T");
 			} finally {
 				command.killTree(9);

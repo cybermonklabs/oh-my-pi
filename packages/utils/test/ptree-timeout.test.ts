@@ -1,4 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -623,36 +624,299 @@ describe.skipIf(process.platform !== "linux")("ptree subreaper stop", () => {
 		}, 30_000);
 	}
 
+	// Holds a subreaper in a Bun preload, before any code of its own runs, until
+	// `release()`. Leaving the hold, the preload writes `passed`, so a subreaper
+	// that has exited without writing it never reached its launch.
+	async function holdBeforeLaunch(dir: string) {
+		const preload = path.join(dir, "hold.ts");
+		const release = path.join(dir, "release");
+		const passed = path.join(dir, "passed");
+		await Bun.write(
+			preload,
+			`import * as fs from "node:fs";
+while (!fs.existsSync(${JSON.stringify(release)})) Bun.sleepSync(2);
+fs.writeFileSync(${JSON.stringify(passed)}, "");
+`,
+		);
+		return {
+			env: { ...Bun.env, BUN_OPTIONS: `--preload ${preload}` },
+			release: () => Bun.write(release, ""),
+			passed,
+		};
+	}
+
+	// Holds a subreaper at its launch, inside its Bun.spawn just before it forks
+	// the command, until `release()`.
+	async function holdAtLaunch(dir: string) {
+		const preload = path.join(dir, "hold-launch.ts");
+		const reached = path.join(dir, "reached");
+		const release = path.join(dir, "release-launch");
+		const launched = path.join(dir, "launched");
+		await Bun.write(
+			preload,
+			`import * as fs from "node:fs";
+const spawn = Bun.spawn;
+Bun.spawn = ((...args: Parameters<typeof Bun.spawn>) => {
+	fs.writeFileSync(${JSON.stringify(reached)}, "");
+	while (!fs.existsSync(${JSON.stringify(release)})) Bun.sleepSync(2);
+	const child = spawn(...args);
+	fs.writeFileSync(${JSON.stringify(launched)}, "");
+	return child;
+}) as typeof Bun.spawn;
+`,
+		);
+		return {
+			env: { ...Bun.env, BUN_OPTIONS: `--preload ${preload}` },
+			reached: async () => {
+				const deadline = Date.now() + 10_000;
+				while (!existsSync(reached)) {
+					if (Date.now() > deadline) throw new Error("the subreaper never reached its launch");
+					await Bun.sleep(5);
+				}
+			},
+			release: () => writeFileSync(release, ""),
+			launched: () => existsSync(launched),
+		};
+	}
+
+	// The process group and session of the Linux process `pid`, from /proc.
+	function groupOf(pid: number): { pgrp: number; session: number } | undefined {
+		let stat: string;
+		try {
+			stat = readFileSync(`/proc/${pid}/stat`, "latin1");
+		} catch {
+			return undefined;
+		}
+		// After the name, which is in parentheses: state, ppid, pgrp, session.
+		const [, , pgrp, session] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		return { pgrp: Number(pgrp), session: Number(session) };
+	}
+
 	for (const [name, start] of [
 		[
 			"its signal is already aborted",
-			(cmd: string[]) => spawn(cmd, { subreaper: true, signal: AbortSignal.abort() }),
+			(cmd: string[], env: Record<string, string | undefined>) =>
+				spawn(cmd, { subreaper: true, env, signal: AbortSignal.abort() }),
 		],
 		[
 			"it is killed before the subreaper launches it",
-			(cmd: string[]) => {
-				const child = spawn(cmd, { subreaper: true });
+			(cmd: string[], env: Record<string, string | undefined>) => {
+				const child = spawn(cmd, { subreaper: true, env });
 				child.kill(new AbortError(new Error("stop"), ""));
 				return child;
 			},
 		],
 	] as const) {
 		it(`never runs the command when ${name}`, async () => {
-			// The subreaper has no child yet, so there is nothing to warn: the
-			// stop must end the subreaper before it launches the cancelled command,
-			// not wait out a grace period during which the command starts.
+			// The subreaper is held before its own code runs until the stop has been
+			// requested, so the stop comes before the launch however slowly this
+			// process runs. It is released at once: the stop must end it before it
+			// launches the cancelled command, not wait out a grace period during
+			// which the command starts.
 			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-subreaper-stop-"));
 			const marker = path.join(dir, "ran");
 			try {
-				const child = start(["/bin/sh", "-c", `echo ran > '${marker}'; sleep 5`]);
+				const hold = await holdBeforeLaunch(dir);
+				const child = start(["/bin/sh", "-c", `echo ran > '${marker}'; sleep 5`], hold.env);
+				await hold.release();
+				// wait() settles once the subreaper has exited, and a subreaper writes
+				// `passed` before it can launch anything, so both checks are final.
 				expect(await child.wait().catch((error: unknown) => error)).toBeInstanceOf(AbortError);
-				// A command the subreaper launched in its last instant would be a real
-				// process outside our control; no event marks "it never wrote", so give
-				// such an escaped command real time to write before checking.
-				await Bun.sleep(100);
+				expect(await fs.exists(hold.passed)).toBe(false);
 				expect(await fs.exists(marker)).toBe(false);
 			} finally {
 				await fs.rm(dir, { recursive: true, force: true });
+			}
+		}, 30_000);
+	}
+
+	it("ends a command the subreaper launches when another process resumes it between the freeze and the kill", async () => {
+		// The subreaper is held at its launch, so the stop finds no child, freezes
+		// it, finds none again, and kills it. A third process resumes the subreaper
+		// after the native kill has listed its descendants and before it signals
+		// them: the subreaper forks the command, and the kill then signals as
+		// native signal_tree does with that list, the group the subreaper leads (if
+		// it leads one) and then the subreaper. This is the window the original
+		// defect opens too: a fork in progress at the freeze adds its child after
+		// the kill's list. Only the group signal reaches the command; Linux delivers
+		// it to a child a fork in progress adds. That native killTree signals the
+		// group is tested on its own below, without a stand-in.
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-subreaper-stop-"));
+		const seen = new Map<number, Process>();
+		let subreaperPid: number | undefined;
+		try {
+			const hold = await holdAtLaunch(dir);
+			const child = spawn(["/bin/sh", "-c", "exec sleep 3600"], { subreaper: true, env: hold.env });
+			subreaperPid = child.pid;
+			await hold.reached();
+			const subreaper = Process.fromPid(child.pid);
+			if (!subreaper) throw new Error("failed to open the subreaper");
+			let resumed = false;
+			const resumedBeforeTheKill = {
+				pid: subreaper.pid,
+				children: () => subreaper.children(),
+				status: () => subreaper.status(),
+				killTree: (signal?: number) => {
+					if (signal !== 9 || resumed) return subreaper.killTree(signal);
+					resumed = true;
+					const leadsGroup = groupOf(subreaper.pid)?.pgrp === subreaper.pid;
+					hold.release();
+					process.kill(subreaper.pid, "SIGCONT");
+					const deadline = Date.now() + 10_000;
+					while (subreaper.children().length === 0 && Date.now() < deadline) Bun.sleepSync(2);
+					for (const command of subreaper.children()) seen.set(command.pid, command);
+					if (leadsGroup) process.kill(-subreaper.pid, "SIGKILL");
+					process.kill(subreaper.pid, "SIGKILL");
+					return 1;
+				},
+			} as unknown as Process;
+			const nativeFromPid = Process.fromPid.bind(Process);
+			const fromPid = spyOn(Process, "fromPid").mockImplementation(pid =>
+				pid === child.pid ? resumedBeforeTheKill : nativeFromPid(pid),
+			);
+			try {
+				child.kill(new AbortError(new Error("stop"), ""), -1);
+				expect(await child.wait().catch((error: unknown) => error)).toBeInstanceOf(AbortError);
+			} finally {
+				fromPid.mockRestore();
+				hold.release();
+			}
+			expect(resumed, "the stop must kill the childless subreaper").toBe(true);
+			expect(seen.size, "the resumed subreaper must launch the command").toBeGreaterThan(0);
+			for (const command of seen.values()) {
+				expect(await runningAfter(command.pid, 2_000), `command ${command.pid} survived the stop`).toBe(false);
+			}
+		} finally {
+			for (const command of seen.values()) command.killTree(9);
+			if (subreaperPid !== undefined) Process.fromPid(subreaperPid)?.killTree(9);
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("signals a member of the group a process leads that is not its descendant", async () => {
+		// Native killTree must signal the group the root leads, not only the root and
+		// its descendants: the stop relies on it to reach a command whose fork
+		// finished after the kill listed the descendants. The member here is no
+		// descendant: its parent exits, so it is reparented away, but it stays in
+		// the root's group.
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-group-member-"));
+		const pidFile = path.join(dir, "member");
+		const leader = spawn(["/bin/sh", "-c", `(sleep 3600 & echo $! > '${pidFile}'); exec sleep 3600`], {
+			detached: true,
+		});
+		let member: number | undefined;
+		try {
+			member = await readPid(pidFile);
+			const root = Process.fromPid(leader.pid);
+			if (!root) throw new Error("failed to open the group leader");
+			const deadline = Date.now() + 10_000;
+			while (readFileSync(`/proc/${member}/stat`, "latin1").split(") ")[1]?.split(" ")[1] === String(leader.pid)) {
+				if (Date.now() > deadline) throw new Error("the member was never reparented");
+				await Bun.sleep(5);
+			}
+			expect(groupOf(member)?.pgrp, "the member must be in the leader's group").toBe(leader.pid);
+			expect(
+				root.children().map(child => child.pid),
+				"the member must not be the leader's descendant",
+			).not.toContain(member);
+			root.killTree(9);
+			expect(await runningAfter(member, 2_000), "the group member survived killTree").toBe(false);
+		} finally {
+			if (member !== undefined) Process.fromPid(member)?.killTree(9);
+			leader.kill(new AbortError(new Error("stop"), ""), -1);
+			await leader.wait().catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("ends a subreaper whose launch cannot progress, on a hard kill", async () => {
+		// Its launching thread is held just before the fork and never released, as
+		// a debugger holding that thread would hold it, while the runtime's other
+		// threads run on. The stop must not wait for the launch. A real debugger
+		// stop needs ptrace from a helper program, so this case holds the thread
+		// in a preload instead; the PR records the ptrace probe.
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-subreaper-stop-"));
+		const hold = await holdAtLaunch(dir);
+		let subreaperPid: number | undefined;
+		try {
+			const child = spawn(["/bin/sh", "-c", "exec sleep 3600"], { subreaper: true, env: hold.env });
+			subreaperPid = child.pid;
+			await hold.reached();
+			child.kill(new AbortError(new Error("stop"), ""), -1);
+			const settled = await Promise.race([
+				child.wait().catch((error: unknown) => error),
+				Bun.sleep(10_000).then(() => "still waiting after 10 s"),
+			]);
+			expect(settled).toBeInstanceOf(AbortError);
+			expect(hold.launched(), "the held launch must not run").toBe(false);
+		} finally {
+			if (subreaperPid !== undefined) Process.fromPid(subreaperPid)?.killTree(9);
+			hold.release();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	// Only root can start a process as another user.
+	it.skipIf(process.getuid?.() !== 0)(
+		"runs a command as another user",
+		async () => {
+			const result = await spawn(["/bin/sh", "-c", "id -u; id -g"], {
+				subreaper: true,
+				uid: 65534,
+				gid: 65534,
+			}).wait({ allowNonZero: true });
+			expect({ stdout: result.stdout, exitCode: result.exitCode }).toEqual({
+				stdout: "65534\n65534\n",
+				exitCode: 0,
+			});
+		},
+		30_000,
+	);
+
+	it("refuses a subreaper with detached: false", () => {
+		expect(() => spawn(["/bin/true"], { subreaper: true, detached: false })).toThrow("subreaper implies detached");
+	});
+
+	it("starts a subreaper as the leader of its own process group and session", async () => {
+		const child = spawn(["/bin/sh", "-c", "exec sleep 30"], { subreaper: true });
+		try {
+			expect(groupOf(child.pid)).toEqual({ pgrp: child.pid, session: child.pid });
+		} finally {
+			child.kill(new AbortError(new Error("stop"), ""), -1);
+			await child.wait().catch(() => {});
+		}
+	});
+
+	for (const [name, gracefulMs] of [
+		["on a graceful kill", undefined],
+		["on a hard kill", -1],
+	] as const) {
+		it(`ends a subreaper that its own command stopped before it exited, ${name}`, async () => {
+			// The command sends SIGSTOP to its parent, the subreaper, and exits. The
+			// subreaper has no running child and, while stopped, neither launches nor
+			// exits, so a stop that waits for either never ends.
+			const child = spawn(["/bin/sh", "-c", 'kill -STOP "$PPID"'], { subreaper: true });
+			const subreaper = Process.fromPid(child.pid);
+			if (!subreaper) throw new Error("failed to open the subreaper");
+			const stateOf = async (pid: number) => {
+				const stat = await fs.readFile(`/proc/${pid}/stat`, "latin1").catch(() => "");
+				return stat.charAt(stat.lastIndexOf(")") + 2);
+			};
+			const deadline = Date.now() + 10_000;
+			while ((await stateOf(child.pid)) !== "T" || subreaper.children().length > 0) {
+				if (Date.now() > deadline) throw new Error("the command never stopped the subreaper");
+				await Bun.sleep(5);
+			}
+			try {
+				child.kill(new AbortError(new Error("stop"), ""), gracefulMs);
+				const settled = await Promise.race([
+					child.wait().catch((error: unknown) => error),
+					Bun.sleep(10_000).then(() => "still waiting after 10 s"),
+				]);
+				expect(settled).toBeInstanceOf(AbortError);
+				expect(child.proc.signalCode).toBe("SIGKILL");
+			} finally {
+				subreaper.killTree(9);
 			}
 		}, 30_000);
 	}
