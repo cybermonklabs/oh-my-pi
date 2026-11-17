@@ -11,7 +11,7 @@ import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { __resetDirsFromEnvForTests, logger, removeWithRetries } from "@oh-my-pi/pi-utils";
-import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
+import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobManager } from "../../src/async/job-manager";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -23,6 +23,7 @@ import type { AgentSessionHandle } from "../../src/session/agent-session-handle"
 import { AgentStorage } from "../../src/session/agent-storage";
 import type { AuthStorage } from "../../src/session/auth-storage";
 import { CostGate } from "../../src/session/cost-gate";
+import { hasRestorableTurn, INTERRUPTED_TURN_ERROR } from "../../src/session/exit-diagnostics";
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../../src/task/executor";
@@ -447,6 +448,34 @@ describe("subagent runs routed into pooled workers", () => {
 			expect(result.aborted).toBe(true);
 			expect(result.exitCode).not.toBe(0);
 			expect(lifecycleStatuses.filter(frame => frame.id === "Hang").at(-1)?.status).toBe("aborted");
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"cuts a detached worker run off when main's job manager shuts down, leaving its turn for --restore",
+		async () => {
+			// If this regresses, the manager's shutdown reason (a symbol, which cannot cross) reaches the worker as
+			// text, which reads as a stop: the run's turn ends on a stop record and `omp --restore` drops it.
+			const manager = new AsyncJobManager({});
+			cleanups.push(() => manager.dispose({ timeoutMs: 1_000 }));
+			const run = Promise.withResolvers<SingleResult>();
+			manager.register("task", "Shutdown", async ({ signal }) => {
+				const result = await runSubprocess(runOptions("Shutdown", HANG_TASK, { signal, detached: true }));
+				run.resolve(result);
+				return result.output;
+			});
+			await server.hung();
+			await manager.dispose({ timeoutMs: 30_000 });
+			const result = await run.promise;
+			expect(result.aborted).toBe(true);
+			// The shutdown releases the run's ref; its transcript stays where the run wrote it.
+			const branch = (await SessionManager.open(path.join(root, "artifacts", "Shutdown.jsonl"))).getBranch();
+			const tail = branch.filter(entry => entry.type === "message").at(-1);
+			expect(
+				tail?.type === "message" && tail.message.role === "assistant" ? tail.message.errorMessage : undefined,
+			).toBe(INTERRUPTED_TURN_ERROR);
+			expect(hasRestorableTurn(branch)).toBe(true);
 		},
 		TEST_TIMEOUT_MS,
 	);

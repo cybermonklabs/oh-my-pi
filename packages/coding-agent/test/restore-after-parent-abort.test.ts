@@ -1,10 +1,11 @@
 /**
- * `omp --restore` and the sync subagents a parent's `task` call launched while it
- * streamed, each waiting to retry a key that could not be resolved: a launch the
- * call discards unadopted is stopped, so `--restore` relaunches nothing for a job the
- * parent never adopted; and launches the call adopted but never started, because the
+ * `omp --restore` and a parent's sync subagents waiting to retry a key that could not
+ * be resolved, when the parent's abort reaches them: a launch the parent's streamed
+ * `task` call discards unadopted is stopped, so `--restore` relaunches nothing for a job
+ * the parent never adopted; launches the call adopted but never started, because the
  * call was aborted first, follow that abort: the parent's process exit leaves them
- * restorable, the parent's stop ends them.
+ * restorable, the parent's stop ends them; and a stop of a continuation turn (one a
+ * queued steer started) without a reason stops its subagent too.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -38,7 +39,7 @@ import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "./helpers/settings-test-state";
 
-const MOCK_API_SOURCE = "restore-after-speculative-discard-test";
+const MOCK_API_SOURCE = "restore-after-parent-abort-test";
 const LOGIN_DISABLED_CAUSE = 'oauth refresh failed: HTTP 400 {"error":"invalid_grant"}';
 const NOTES_FILE = "notes.txt";
 
@@ -50,7 +51,7 @@ const cleanups: Array<() => unknown> = [];
 
 beforeEach(async () => {
 	savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
-	root = TempDir.createSync("@pi-restore-after-speculative-discard-");
+	root = TempDir.createSync("@pi-restore-after-parent-abort-");
 	const home = root.join("home");
 	await fs.mkdir(path.join(home, "work"), { recursive: true });
 	restoreEnvValue("HOME", home);
@@ -144,10 +145,11 @@ function holdBackoff(expected: number) {
 
 /**
  * A parent session on the production SDK path whose batch `task` tool runs `WORKER`
- * subagents in sync (no background jobs). The worker's model is on anthropic, keyed by
- * the store's only OAuth login; its first request disables that login, as a failed
- * refresh does, so every later request has no key and its turn waits out a retry
- * backoff. Every subagent run's result is collected in `runs`.
+ * subagents in sync (no background jobs); a turn of its model spawns one worker. The
+ * worker's model is on anthropic, keyed by the store's only OAuth login; its first
+ * request disables that login, as a failed refresh does, so every later request has no
+ * key and its turn waits out a retry backoff. Every subagent run's result is collected
+ * in `runs`.
  */
 async function openParentWithKeyedWorkers() {
 	const cwd = root.join("home", "work");
@@ -157,7 +159,19 @@ async function openParentWithKeyedWorkers() {
 	authStorage.keys.setRuntime("mock", "test-key");
 	await authStorage.credentials.set("anthropic", [oauthLogin("acc-live")]);
 	const modelRegistry = new ModelRegistry(authStorage, root.join("models.yml"));
-	const parentModel = createMockModel({ id: "parent-model", handler: { content: ["label"] } });
+	const parentModel = createMockModel({
+		id: "parent-model",
+		handler: context => {
+			if (!(context.tools ?? []).some(tool => tool.name === "task")) return { content: ["label"] };
+			if (context.messages.some(message => message.role === "toolResult")) {
+				return { content: ["The worker could not read the notes."] };
+			}
+			return {
+				content: [{ type: "toolCall", id: CALL.id, name: "task", arguments: batchCall(["SteeredWorker"]) }],
+				stopReason: "toolUse",
+			};
+		},
+	});
 	const workerModel = createMockModel({
 		provider: "anthropic",
 		id: "mock-claude",
@@ -354,4 +368,27 @@ describe("omp --restore after a sync task call was aborted before the launches i
 			expect(subagents.map(turnEnd)).toEqual([end, end]);
 		}, 30_000);
 	}
+});
+
+describe("omp --restore after a stop without a reason ended a continuation turn's sync subagent waiting to retry its key", () => {
+	it("stops the subagent's turn, so --restore of the parent relaunches nothing", async () => {
+		// If this regresses, the continuation's own signal aborts first with the platform's unmarked reason, which
+		// reads to the subagent as its parent's process exit: its turn keeps the marked error, and `omp --restore`
+		// relaunches a subagent of a turn the user stopped.
+		const { parent, runs } = await openParentWithKeyedWorkers();
+		const backoff = holdBackoff(1);
+		// A steer on the idle parent starts its turn as a continuation (a queued-message drain).
+		await parent.steer("Delegate reading the notes.");
+		await backoff.allHeld;
+		expect(runs).toHaveLength(1);
+		await parent.abort();
+
+		const { outcome, subagents } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		expect(outcome.subagents).toEqual([]);
+		expect(subagents.map(turnEnd)).toEqual([
+			{ stopReason: "aborted", credentialUnavailable: undefined, restorable: false },
+		]);
+	}, 30_000);
 });

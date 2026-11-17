@@ -122,6 +122,7 @@ import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { isMainThread } from "../thread/identity";
 import { runFollowUpTurnOnHome, runSubprocessPlaced } from "../thread/executor-routing";
+import { fromWireSignal, toWireSignal } from "../thread/services/async-jobs-protocol";
 import { existingSubagentWorkerPool, subagentWorkerPool } from "../thread/subagent-worker";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
@@ -3889,11 +3890,12 @@ function ownAttachedSession(id: string): AgentSession | undefined {
 export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Promise<SingleResult> {
 	const startTime = Date.now();
 	const session = await AgentLifecycleManager.global().ensureLive(options.id);
-	if (!isLocalAgentSession(session)) return runFollowUpTurnOnHome(session, options);
+	if (!isLocalAgentSession(session)) return runFollowUpTurnOnHome(session, withWireSignal(options));
 	// A turn of a main-homed session loads the main thread like a placed run.
 	const endMainRun = isMainThread() ? existingSubagentWorkerPool()?.beginMainRun() : undefined;
 	try {
-		return await driveFollowUpTurn(options, session, startTime);
+		// Main also runs here the follow-ups a worker routes through it, their signal in its wire form.
+		return await driveFollowUpTurn(withLocalSignal(options), session, startTime);
 	} finally {
 		endMainRun?.();
 	}
@@ -3905,7 +3907,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
  */
 export async function runFollowUpTurnOnThisThread(options: FollowUpTurnOptions): Promise<SingleResult> {
 	const startTime = Date.now();
-	return driveFollowUpTurn(options, await ensureLocalLive(options.id), startTime);
+	return driveFollowUpTurn(withLocalSignal(options), await ensureLocalLive(options.id), startTime);
 }
 
 /** The follow-up turn itself, on `live`, the subagent's revived local session. */
@@ -4463,14 +4465,28 @@ export interface SubagentRunRequest {
 /** Package `options` for a worker, carrying what the settings' symbol tag holds explicitly. */
 export function subagentRunRequest(options: ExecutorOptions): SubagentRunRequest {
 	const settings: SubagentChainSettings | undefined = options.settings;
-	return { options, rootThresholds: settings?.[kRootCompactionThresholds] };
+	return { options: withWireSignal(options), rootThresholds: settings?.[kRootCompactionThresholds] };
 }
 
 /** Worker entry of a routed run: re-tag the settings mirror, then run here. */
 export function runSubagentRunRequest(request: SubagentRunRequest): Promise<SingleResult> {
 	const settings: SubagentChainSettings | undefined = request.options.settings;
 	if (settings && request.rootThresholds) settings[kRootCompactionThresholds] = request.rootThresholds;
-	return runSubprocessOnThisThread(request.options);
+	return runSubprocessOnThisThread(withLocalSignal(request.options));
+}
+
+/**
+ * `options` as they cross to another thread: their signal aborts there with the wire form
+ * of its reason ({@link toWireSignal}). A symbol cannot cross, and the job manager's
+ * shutdown reason, which cuts a run off, would otherwise arrive as text, which stops it.
+ */
+function withWireSignal<T extends { signal?: AbortSignal }>(options: T): T {
+	return options.signal ? { ...options, signal: toWireSignal(options.signal) } : options;
+}
+
+/** `options` as they arrive from another thread: their signal's reason back from its wire form ({@link fromWireSignal}). */
+function withLocalSignal<T extends { signal?: AbortSignal }>(options: T): T {
+	return options.signal ? { ...options, signal: fromWireSignal(options.signal) } : options;
 }
 
 /**

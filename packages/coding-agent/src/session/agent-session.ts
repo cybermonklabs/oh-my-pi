@@ -5724,8 +5724,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return true;
 	}
 
-	/** Cancel scheduled continuations; `reason` labels a continuation already running, as `agent.abort(reason)` does. */
-	async #cancelPostPromptTasks(reason?: string): Promise<void> {
+	/**
+	 * Cancel scheduled continuations. `reason` is the abort reason of a continuation already
+	 * running, as `agent.abort(reason)` gives its turn: its text labels the turn's end, and its
+	 * kind ({@link turnAbortKind}) stops a sync subagent of that turn or cuts it off. Give the
+	 * reason the turn's own abort gives, or the platform's reason marked with its kind.
+	 */
+	async #cancelPostPromptTasks(reason: string | DOMException): Promise<void> {
 		this.#postPromptTasksAbortController.abort(reason);
 		this.#postPromptTasksAbortController = new AbortController();
 		this.#ttsr.resolveResume();
@@ -6814,10 +6819,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.abortCompaction();
 		// A process exit cuts a turn still in flight off instead of stopping it:
 		// label it as interrupted so `omp --restore` goes on with it. Any other
-		// disposal cuts the turn off too; its plain reason says so to a sync subagent.
-		const abortReason = options.reason === postmortem.Reason.EXIT ? INTERRUPTED_TURN_ERROR : undefined;
+		// disposal cuts the turn off too; its plain reason says so to a sync subagent,
+		// of the turn or of a continuation already running.
+		const abortReason =
+			options.reason === postmortem.Reason.EXIT ? INTERRUPTED_TURN_ERROR : plainTurnAbortReason("cutOff");
 		const postPromptDrain = this.#cancelPostPromptTasks(abortReason);
-		this.agent.abort(abortReason ?? plainTurnAbortReason("cutOff"));
+		this.agent.abort(abortReason);
 		try {
 			await withTimeout(
 				postPromptDrain,
@@ -7048,7 +7055,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		//     re-deliver stale tool output into the cleared conversation
 		//     (mirrors newSession()).
 		this.#promptGeneration++;
-		await this.#cancelPostPromptTasks();
+		await this.#cancelPostPromptTasks(plainTurnAbortReason("stop"));
 		this.#cancelOwnAsyncJobs();
 
 		// Drop the conversation: messages, queued steers/follow-ups, pending tool
@@ -12193,9 +12200,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.abortBash();
 			this.abortEval();
 			const computerControlRevocation = revokeComputerControlForOwner(this.#eval.getKernelOwnerId());
-			const postPromptDrain = this.#cancelPostPromptTasks(options?.reason);
-			// Without a reason of the caller's, the agent's reason still says whether this stops the turn or cuts it off.
-			this.agent.abort(options?.reason ?? plainTurnAbortReason(cutOff ? "cutOff" : "stop"));
+			// Without a reason of the caller's, the reason still says whether this stops the turn or cuts it off,
+			// to the turn and to a continuation already running, which aborts first (`AbortSignal.any` keeps it).
+			const turnAbortReason = options?.reason ?? plainTurnAbortReason(cutOff ? "cutOff" : "stop");
+			const postPromptDrain = this.#cancelPostPromptTasks(turnAbortReason);
+			this.agent.abort(turnAbortReason);
 			await Promise.all([postPromptDrain, computerControlRevocation]);
 			await this.agent.waitForIdle();
 			this.#persistToolResultsEndedWhileDisconnected();
@@ -12206,7 +12215,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// otherwise hold /new and every abort for the full handler timeout.
 			await this.#drainAgentEndMaintenance();
 			this.#recovery.abortRetry({ cutOff });
-			await this.#cancelPostPromptTasks();
+			await this.#cancelPostPromptTasks(turnAbortReason);
 			// `/compact` disconnects the agent subscription until its finally block.
 			// Do not let abort-and-replace callers start a new prompt before that cleanup
 			// finishes, or the replacement turn's events are neither forwarded nor persisted.
@@ -14656,7 +14665,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			: undefined;
 
 		await withTimeout(
-			this.#cancelPostPromptTasks(),
+			this.#cancelPostPromptTasks(plainTurnAbortReason("stop")),
 			POST_PROMPT_DRAIN_TIMEOUT_MS,
 			"Timed out draining post-prompt tasks before /btw branch",
 		);
