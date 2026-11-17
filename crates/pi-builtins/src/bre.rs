@@ -432,7 +432,10 @@ fn push_bracket_char(out: &mut String, c: char) {
 /// escaping it would turn a diagnosed mistake into a silent literal match.
 /// A digit after `{` is what separates the two - it marks an attempted
 /// interval, which is left for the engine to accept or reject.
-#[cfg(feature = "util.grep")]
+///
+/// `sed -E` reads its bracket expressions through it too; its own parser has
+/// already checked each interval.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
 pub(crate) fn ere_to_regex(pattern: &str) -> Result<std::borrow::Cow<'_, str>, BreError> {
 	if !pattern.contains(['{', '[']) {
 		return Ok(std::borrow::Cow::Borrowed(pattern));
