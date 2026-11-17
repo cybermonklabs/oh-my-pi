@@ -2238,10 +2238,15 @@ export class Agent {
 				: err instanceof Error
 					? err.message
 					: String(err);
-			// A credential source that produced no key keeps its Transient flag so
-			// turn recovery retries it; other thrown errors stay classified by text.
-			const errorId =
-				!stoppedForAbort && err instanceof AIError.CredentialUnavailableError ? AIError.classify(err) : undefined;
+			// A credential source that produced no key (a failed key command, stored
+			// credentials that cannot serve now, a transient OAuth refresh failure)
+			// keeps its Transient flag so turn recovery retries it: the key may come
+			// back, and nothing was sent. Only that error marks the message
+			// `credentialUnavailable`, so the turn stays resumable if the retries run
+			// out. Other thrown errors stay classified by text and are not marked.
+			const credentialUnavailable =
+				!stoppedForAbort && err instanceof AIError.CredentialUnavailableError ? true : undefined;
+			const errorId = credentialUnavailable ? AIError.classify(err) : undefined;
 			const shouldEmitVisibleError = !stoppedForAbort;
 			const assistantPartial = partial?.role === "assistant" ? partial : undefined;
 			const hadAssistantStart = assistantPartial !== undefined;
@@ -2270,6 +2275,7 @@ export class Agent {
 							stopReason: "error",
 							errorMessage,
 							errorId,
+							credentialUnavailable,
 						}
 					: {
 							role: "assistant",
@@ -2288,6 +2294,7 @@ export class Agent {
 							stopReason: stoppedForAbort ? "aborted" : "error",
 							errorMessage,
 							errorId,
+							credentialUnavailable,
 							timestamp: Date.now(),
 						};
 

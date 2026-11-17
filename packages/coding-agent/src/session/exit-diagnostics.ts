@@ -142,6 +142,8 @@ function findUnfinishedTurn(
 	let tail: AgentMessage | undefined;
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index]!;
+		// `/clear` ends the conversation before it: nothing behind the boundary is unfinished.
+		if (entry.type === "reset_boundary") break;
 		if (entry.type !== "message") continue;
 		tailIndex = index;
 		tail = entry.message;
@@ -182,16 +184,32 @@ export function isInterruptedTurnAbort(message: AgentMessage): boolean {
 }
 
 /**
+ * Whether `message` ended its turn because no request could resolve the
+ * provider's key (`credentialUnavailable`), even after the turn's retries.
+ * Nothing was sent and nobody chose to stop, so the turn stays unfinished. A
+ * turn the provider refused or that failed otherwise does not carry the field.
+ */
+function isCredentialUnavailableTurn(message: AgentMessage): boolean {
+	return message.role === "assistant" && message.stopReason === "error" && message.credentialUnavailable === true;
+}
+
+/**
  * Whether `omp --restore` has a turn to go on with on this branch: one its last
- * process left unfinished ({@link findUnfinishedTurn}, the exit assumed), or one exit
- * recovery already closed that nothing followed, not even a normal exit.
+ * process left unfinished ({@link findUnfinishedTurn}, the exit assumed), one exit
+ * recovery already closed that nothing followed, not even a normal exit, or one
+ * that ended because its key could not be resolved, whatever exit followed: a
+ * worker exits normally on that turn, and nothing else would resume it. A turn
+ * behind a `/clear` is never one: the user ended that conversation.
  */
 export function hasRestorableTurn(entries: readonly SessionEntry[]): boolean {
+	let normalExit = false;
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index]!;
-		const exit = readSessionExit(entry);
-		if (exit?.kind === "normal") return false;
+		if (entry.type === "reset_boundary") return false;
+		if (readSessionExit(entry)?.kind === "normal") normalExit = true;
 		if (entry.type !== "message") continue;
+		if (isCredentialUnavailableTurn(entry.message)) return true;
+		if (normalExit) return false;
 		if (isInterruptedTurnAbort(entry.message)) return true;
 		break;
 	}
