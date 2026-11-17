@@ -9,6 +9,10 @@
 - Added `stderrSharesStdoutTerminal()`, which reports whether stderr is the terminal stdout writes to ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
 - Added `headerRetryAfterMs` to `RetryHintOptions`: `extractRetryHint` merges an already parsed response-header delay with the body's signals, longest first ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
 
+### Fixed
+
+- Fixed `ChildProcess.kill()` and disposing a `ChildProcess` reporting the process's exit as an unhandled rejection when the process exits before anyone waits on it
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

@@ -340,6 +340,9 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	kill(reason?: Exception, gracefulMs?: number) {
+		// A kill makes the exit promise reject. Its caller may wait later or never,
+		// as with a signal or a deadline, so that rejection is never left unhandled.
+		this.#exited.catch(() => {});
 		if (reason && !this.#exitReasonPending) {
 			this.#exitReasonPending = reason;
 			// The normalized exit promise may already have resolved from a dead
