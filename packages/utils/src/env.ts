@@ -136,6 +136,16 @@ function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
 const launchEnvValues = readLaunchEnv();
 const projectEnvNamesLoadedByOmp = new Set<string>();
 
+/**
+ * `PI_NATIVES_DIR` as omp was started with it, before omp applies its own `.env` files
+ * (undefined when it was not set). The commands the agent runs get this value: neither a
+ * value a `.env` file set later nor the directory omp resolved, so a command, and an omp it
+ * starts with its own `HOME`, resolves the natives directory for itself. omp's children that
+ * are omp get the resolved directory instead (`workerEnvFromParent`, `ompDaemonSpecEnv`, the
+ * fork command).
+ */
+const nativesDirAtLaunch = launchEnvValues ? launchEnvValues.get("PI_NATIVES_DIR") : Bun.env.PI_NATIVES_DIR;
+
 function expandDotenvValues(values: Record<string, string>, env: Record<string, string>): Record<string, string> {
 	const expanded: Record<string, string> = {};
 	for (const key in values) {
@@ -159,6 +169,11 @@ function filterChildShellEnvInternal(
 ): Record<string, string> {
 	const runtimeLaunchEnvValues = env === Bun.env || env === process.env ? launchEnvValues : undefined;
 	const result = filterProcessEnv(env);
+	if (env === Bun.env || env === process.env) {
+		// Before the dotenv merge below, which still removes a value the project's `.env` set.
+		if (nativesDirAtLaunch === undefined) delete result.PI_NATIVES_DIR;
+		else result.PI_NATIVES_DIR = nativesDirAtLaunch;
+	}
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
 	const launchNodeEnv = runtimeLaunchEnvValues ? runtimeLaunchEnvValues.get("NODE_ENV") : env.NODE_ENV;
 	const nodeEnvName = `.env.${launchNodeEnv || "development"}`;

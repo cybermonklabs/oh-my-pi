@@ -14,6 +14,7 @@ import {
 	WhichCachePolicy,
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
+import { getNativesDir } from "@oh-my-pi/pi-utils/dirs";
 import { stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
 import type { Subprocess } from "bun";
 
@@ -186,6 +187,11 @@ export function resolveWorkerSpawnCmd(workerArg: string): WorkerSpawnCommand {
  * Snapshot the parent environment for the child. `process.env` carries
  * `undefined` slots that `Bun.spawn` rejects, so filter them out; an optional
  * `overlay` (e.g. the tiny-model device/dtype vars) wins over inherited keys.
+ *
+ * The worker is omp, so it gets this process's natives directory as
+ * `PI_NATIVES_DIR`: it loads the addon and its grammars from the directory
+ * the parent does, whatever directory variables a `.env` file set since the
+ * parent resolved it.
  */
 export function workerEnvFromParent(overlay?: Record<string, string>): Record<string, string> {
 	const base = $env as Record<string, string | undefined>;
@@ -197,10 +203,35 @@ export function workerEnvFromParent(overlay?: Record<string, string>): Record<st
 	// Inherited repo-location overrides must not reach a worker or the PTY
 	// daemons it hosts (issue #11082); an explicit overlay still wins below.
 	stripGitRepoLocationEnv(merged);
+	merged.PI_NATIVES_DIR = getNativesDir();
 	if (overlay) {
 		for (const key in overlay) merged[key] = overlay[key];
 	}
 	return merged;
+}
+
+/**
+ * The spec environment of an omp daemon the launch broker runs (`DaemonSpec.env`):
+ * `env` with this process's natives directory as `PI_NATIVES_DIR`, since the daemon
+ * is omp. The broker gives a managed program `PI_NATIVES_DIR` only as its spec does
+ * ({@link managedDaemonEnv}).
+ */
+export function ompDaemonSpecEnv(env: Record<string, string>): Record<string, string> {
+	return { PI_NATIVES_DIR: getNativesDir(), ...env };
+}
+
+/**
+ * The environment the launch broker gives a program it manages: its own environment
+ * ({@link workerEnvFromParent}) with `specEnv` over it, and `PI_NATIVES_DIR` only as
+ * `specEnv` gives it. The broker runs omp's daemons and the agent's commands and
+ * services alike: an omp daemon's spec names the natives directory
+ * ({@link ompDaemonSpecEnv}); a command's carries `PI_NATIVES_DIR` as omp was started
+ * with it, or none, so the command resolves its own.
+ */
+export function managedDaemonEnv(specEnv: Record<string, string>): Record<string, string> {
+	const env = workerEnvFromParent();
+	delete env.PI_NATIVES_DIR;
+	return Object.assign(env, specEnv);
 }
 
 /**

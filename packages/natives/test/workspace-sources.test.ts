@@ -410,6 +410,55 @@ describe("inputs a build takes in that no listed file names", () => {
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	});
 
+	it("stay current for a file added to a scanned directory that its glob does not match", async () => {
+		// pi-shell's glob is `src/minimizer/defs/*.toml`: top-level `.toml` files only.
+		await checkout();
+		await Bun.write(path.join(repo, defs, "README.md"), "# filter defs\n");
+		await Bun.write(path.join(repo, defs, "old/a.toml"), "[filters.archived]\n");
+		await Bun.write(path.join(repo, defs, ".a.toml.swp"), "swap\n");
+		await Bun.write(path.join(repo, defs, "a.toml~"), "backup\n");
+
+		expect(addonSourcesState(addon, repo)).toBe("current");
+		// And a matching file is still seen (control).
+		await Bun.write(path.join(repo, defs, "zz.toml"), "[filters.zz]\n");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("record only the files a scanned directory's glob matches, honouring exclude", async () => {
+		await Bun.write(
+			path.join(repo, "crates/pi-gen/BUILD.bazel"),
+			[
+				"cargo_build_script(",
+				'    name = "build_script",',
+				'    srcs = ["build.rs"],',
+				'    data = glob(include = ["assets/**/*.json"], exclude = ["assets/**/draft-*.json"]),',
+				")",
+				"",
+			].join("\n"),
+		);
+		await Bun.write(path.join(repo, "crates/pi-gen/Cargo.toml"), '[package]\nname = "pi-gen"\n');
+		await Bun.write(path.join(repo, "crates/pi-gen/build.rs"), "fn main() {}\n");
+		await Bun.write(path.join(repo, "crates/pi-gen/assets/top.json"), "{}\n");
+		await Bun.write(path.join(repo, "crates/pi-gen/assets/deep/nested.json"), "{}\n");
+		await Bun.write(path.join(repo, "crates/pi-gen/assets/deep/draft-wip.json"), "{}\n");
+		await Bun.write(path.join(repo, "crates/pi-gen/assets/deep/notes.txt"), "notes\n");
+		await Bun.write(path.join(repo, ".gitignore"), "crates/pi-gen/assets/\n");
+		git(repo, "init", "-q");
+		git(repo, "add", "-A");
+		git(repo, "commit", "-qm", "base");
+		await build();
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(stamp.files.filter((rel: string) => rel.startsWith("crates/pi-gen/assets/"))).toEqual([
+			"crates/pi-gen/assets/deep/nested.json",
+			"crates/pi-gen/assets/top.json",
+		]);
+
+		await Bun.write(path.join(repo, "crates/pi-gen/assets/deep/draft-next.json"), "{}\n");
+		await Bun.write(path.join(repo, "crates/pi-gen/assets/deep/more.txt"), "more\n");
+		expect(addonSourcesState(addon, repo)).toBe("current");
+		await Bun.write(path.join(repo, "crates/pi-gen/assets/deeper/still/new.json"), "{}\n");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
 	it("record a link in a scanned directory as a link, never followed", async () => {
 		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-outside-def-"));
 		try {
@@ -581,6 +630,104 @@ describe("a record judged in another checkout of the same commit", () => {
 
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	});
+});
+
+describe("a file untracked at build time, judged in the checkout that built it", () => {
+	it("reads other when it moves or goes away there", async () => {
+		await Bun.write(path.join(repo, ".cargo/config.toml"), '[build]\nrustflags = ["-C", "target-cpu=native"]\n');
+		git(repo, "init", "-q");
+		git(repo, "add", "Cargo.toml", "Cargo.lock", "crates/pi-natives/src/lib.rs");
+		git(repo, "commit", "-qm", "base");
+		await Bun.write(path.join(repo, "crates/pi-natives/src/foo.rs"), "pub fn foo() {}\n");
+		await build();
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(Object.keys(stamp.untracked).sort()).toEqual([".cargo/config.toml", "crates/pi-natives/src/foo.rs"]);
+		expect(addonSourcesState(addon, repo)).toBe("current");
+
+		// The module moves to `foo/mod.rs`, with other code.
+		await fs.rm(path.join(repo, "crates/pi-natives/src/foo.rs"));
+		await Bun.write(path.join(repo, "crates/pi-natives/src/foo/mod.rs"), "pub fn foo() { /* moved */ }\n");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("reads other when an untracked cargo config is deleted there", async () => {
+		await Bun.write(path.join(repo, ".cargo/config.toml"), '[build]\nrustflags = ["-C", "target-cpu=native"]\n');
+		git(repo, "init", "-q");
+		git(repo, "add", "Cargo.toml", "Cargo.lock", "crates/pi-natives/src/lib.rs");
+		git(repo, "commit", "-qm", "base");
+		await build();
+
+		await fs.rm(path.join(repo, ".cargo/config.toml"));
+
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("reads other in a new checkout made where the old one was (another directory, same path)", async () => {
+		git(repo, "init", "-q");
+		git(repo, "add", "Cargo.toml", "Cargo.lock", "crates/pi-natives/src/lib.rs");
+		git(repo, "commit", "-qm", "base");
+		await Bun.write(path.join(repo, "crates/pi-natives/src/foo.rs"), "pub fn foo() {}\n");
+		await build();
+		// Its directory replaced by a fresh one holding the same commit (no foo.rs), record and addon kept.
+		const moved = `${repo}-old`;
+		await fs.rename(repo, moved);
+		try {
+			git(path.dirname(repo), "clone", "-q", moved, repo);
+			await fs.mkdir(path.dirname(addon), { recursive: true });
+			await fs.cp(path.join(moved, path.relative(repo, addon)), addon, { preserveTimestamps: true });
+			await fs.cp(`${path.join(moved, path.relative(repo, addon))}.sources.json`, `${addon}.sources.json`);
+
+			// Not the checkout that built it, so the missing untracked file is no difference.
+			expect(addonSourcesState(addon, repo)).toBe("current");
+		} finally {
+			await fs.rm(moved, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("a tree with no .git of its own inside another repository", () => {
+	afterEach(async () => {
+		await fs.rm(`${repo}-outer`, { recursive: true, force: true });
+		await fs.rm(`${repo}-judge`, { recursive: true, force: true });
+	});
+
+	/** Move the tree to `<outer>/export`, inside a repository at `outer` that does not track it. */
+	async function nest(ignoredByOuter: boolean) {
+		const outer = `${repo}-outer`;
+		await fs.mkdir(outer, { recursive: true });
+		await Bun.write(path.join(outer, "README.md"), "outer\n");
+		if (ignoredByOuter) await Bun.write(path.join(outer, ".gitignore"), "export/\n");
+		git(outer, "init", "-q");
+		git(outer, "add", "-A");
+		git(outer, "commit", "-qm", "outer");
+		const tree = path.join(outer, "export");
+		await fs.cp(repo, tree, { recursive: true });
+		return tree;
+	}
+
+	it.each([
+		["does not ignore it", false],
+		["ignores it", true],
+	] as const)(
+		"lists against a throwaway repository, its files tracked, when the outer repository %s",
+		async (_label, ignoredByOuter) => {
+			const tree = await nest(ignoredByOuter);
+			const built = path.join(tree, "addon.node");
+			await Bun.write(built, "addon bytes");
+			writeAddonSourcesStamp(built, readRustSources(tree, CARGO_SOURCE_ROOTS), CARGO_BUILD);
+			const stamp = await Bun.file(`${built}.sources.json`).json();
+			expect(stamp.files).toEqual(["Cargo.lock", "Cargo.toml", "crates/pi-natives/src/lib.rs"]);
+			expect(stamp.untracked).toEqual({});
+
+			// Judged in another checkout: a deleted Cargo.lock is a difference, as for any tracked file.
+			const judge = `${repo}-judge`;
+			await fs.cp(tree, judge, { recursive: true });
+			const { atime, mtime } = await fs.stat(built);
+			await fs.utimes(path.join(judge, "addon.node"), atime, mtime);
+			await fs.rm(path.join(judge, "Cargo.lock"));
+			expect(addonSourcesState(path.join(judge, "addon.node"), judge)).toBe("other");
+		},
+	);
 });
 
 describe("temporary files", () => {

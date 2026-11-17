@@ -178,29 +178,35 @@ describe("one natives directory per process", () => {
 		expect(output.trim()).toBe(childDir);
 	});
 
-	it("gives the child processes it starts its answer, whatever the variables say since", async () => {
+	it("leaves the environment alone, so a child with its own HOME resolves its own, before and after the first call", async () => {
 		const savedDownloadRoot = process.env.OMP_DOWNLOAD_ROOT;
-		// A first answer from a fallback root, with no PI_NATIVES_DIR set.
 		delete process.env.PI_NATIVES_DIR;
-		process.env.OMP_DOWNLOAD_ROOT = path.join(tempRoot, "first-root");
+		process.env.OMP_DOWNLOAD_ROOT = path.join(tempRoot, "parent-root");
 		__resetNativesDirForTests();
-		try {
-			const first = getNativesDir();
-			// What a `.env` file read after the first call can set.
-			process.env.OMP_DOWNLOAD_ROOT = path.join(tempRoot, "from-dotenv");
+		const childHome = path.join(tempRoot, "child-home");
+		// As scripts/test-preload.ts tells a test to start a child with a home of its own.
+		const childNativesDir = async () => {
+			const env: Record<string, string | undefined> = { ...process.env, HOME: childHome, USERPROFILE: childHome };
+			for (const name of ["OMP_CONFIG_ROOT", "OMP_DOWNLOAD_ROOT", "XDG_CACHE_HOME"]) delete env[name];
 			const child = Bun.spawn(
 				[
 					process.execPath,
 					"-e",
 					`console.log((await import(${JSON.stringify(path.join(import.meta.dir, "../native/natives-dir.js"))})).getNativesDir())`,
 				],
-				{ env: process.env, stdout: "pipe", stderr: "inherit" },
+				{ env, stdout: "pipe", stderr: "inherit" },
 			);
 			const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-
-			expect(first).toBe(path.join(tempRoot, "first-root", "natives"));
 			expect(exitCode).toBe(0);
-			expect(output.trim()).toBe(first);
+			return output.trim();
+		};
+		try {
+			expect(await childNativesDir()).toBe(path.join(childHome, ".omp", "natives"));
+
+			expect(getNativesDir()).toBe(path.join(tempRoot, "parent-root", "natives"));
+
+			expect(process.env.PI_NATIVES_DIR).toBeUndefined();
+			expect(await childNativesDir()).toBe(path.join(childHome, ".omp", "natives"));
 		} finally {
 			if (savedDownloadRoot === undefined) delete process.env.OMP_DOWNLOAD_ROOT;
 			else process.env.OMP_DOWNLOAD_ROOT = savedDownloadRoot;

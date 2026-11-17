@@ -15,31 +15,37 @@ import * as path from "node:path";
  *
  * The record lists the source files the build had: under the build's roots
  * ({@link CARGO_SOURCE_ROOTS} or {@link BAZEL_SOURCE_ROOTS}), the files git tracks
- * or would track, so a gitignored file is never a source. Outside a repository
- * the build lists against a throwaway one, so the tree's `.gitignore` files still
- * apply; only where git cannot run at all does it list every file, skipping
- * `target` directories and names starting with a dot. Symbolic links are recorded
- * as links, never followed.
+ * or would track, so a gitignored file is never a source. That listing is used
+ * only in a repository whose top level is the tree; elsewhere (a Docker build
+ * context, a tree with no `.git` inside another repository) the build lists
+ * against a throwaway repository, so the tree's `.gitignore` files still apply;
+ * only where git fails there too does it list every file, skipping `target`
+ * directories and names starting with a dot. Symbolic links are recorded as
+ * links, never followed.
  *
  * A start looks at the listed files, and at the two ways a build takes in a file
  * no listed file names:
  * - a directory a build script scans (`crates/pi-shell/build.rs` compiles every
  *   `src/minimizer/defs/*.toml`): the directories each crate's `BUILD.bazel`
  *   gives its `cargo_build_script` through a `glob()`, which Bazel requires and
- *   Cargo's `rerun-if-changed` matches. Bazel's glob and a `build.rs` read every
- *   file there, so the record lists every file and link there, gitignored or
- *   dot-named or not, and keeps the directories' modification times; when one
- *   differs, the start lists that directory again, and a file added or removed
- *   there means other sources;
+ *   Cargo's `rerun-if-changed` matches. The record keeps each glob's patterns and
+ *   lists the files there they match, gitignored or not, as Bazel gives them to
+ *   the build script; it keeps the directories' modification times too. When one
+ *   differs, the start lists that directory again, and a matched file added or
+ *   removed there means other sources; a file the globs do not match (a README,
+ *   a subdirectory, a swap file) changes nothing;
  * - a `build.rs` Cargo finds by itself in a package's directory: the record notes
  *   which packages have one.
  * Any other file added later (an editor backup, a new test, a cache) changes
  * nothing, and a new module is seen through the listed file that declares it.
  *
- * Files git did not track at build time (a new module not yet added, a scratch
- * note) count while they exist: their bytes must match, but one missing in
- * another checkout of the same commit, as robomp's cache carries a record
- * between checkouts, is not a difference. Two identities are kept:
+ * Files git did not track at build time (a new module not yet added, a local
+ * cargo config) count: their bytes must match, and in the checkout that built
+ * the addon one that moved or went away means other sources. Only in another
+ * checkout of the commit, as robomp's cache and the image seed carry a record
+ * between checkouts, is a missing one no difference; the record names its
+ * checkout by real path and the directory's device and inode. Two identities are
+ * kept:
  * - the digest, SHA-256 over each tracked file's path and content (a link's
  *   target, for a link), and each untracked file's own SHA-256, which decide;
  * - the fingerprint, SHA-256 over each listed file's path, size and modification
@@ -152,13 +158,29 @@ function walkSources(repoRoot, roots) {
 }
 
 /**
+ * Whether `repoRoot` is the top level of a git repository or worktree, not a
+ * directory inside another one (`git rev-parse --show-toplevel`).
+ * @param {string} repoRoot
+ */
+function isRepositoryRoot(repoRoot) {
+	const top = runGit(["-C", repoRoot, "rev-parse", "--show-toplevel"])?.trim();
+	if (!top) return false;
+	try {
+		return fs.realpathSync(top) === fs.realpathSync(repoRoot);
+	} catch {
+		return false;
+	}
+}
+
+/**
  * The source files under `roots`, `/`-separated and sorted, and the ones among
- * them git does not track. In a repository: git's tracked files and its untracked,
- * unignored ones. Outside one (a Docker build context), or when git fails there:
- * git against a throwaway repository, as the Dockerfile's key step does, so
- * `.gitignore` still applies; every file then counts as tracked, since nothing
- * tells a source from a scratch file there. When git fails that way too, or
- * cannot run: {@link walkSources}. Directories (a submodule's entry) and listed
+ * them git does not track. In a repository whose top level is `repoRoot`: git's
+ * tracked files and its untracked, unignored ones. Otherwise (a Docker build
+ * context, a tree with no `.git` inside another repository), or when git fails in
+ * the repository: git against a throwaway repository, as the Dockerfile's key step
+ * does, so `.gitignore` still applies; every file then counts as tracked, since
+ * nothing tells a source from a scratch file there. When git fails that way too,
+ * or cannot run: {@link walkSources}. Directories (a submodule's entry) and listed
  * files that no longer exist are left out.
  * @param {string} repoRoot
  * @param {readonly string[]} roots
@@ -167,7 +189,9 @@ function walkSources(repoRoot, roots) {
 function listBuildSources(repoRoot, roots) {
 	const args = ["ls-files", "-z", "-t", "--cached", "--others", "--exclude-standard", "--", ...roots];
 	let entries;
-	const inRepository = runGit(["-C", repoRoot, ...args]);
+	// Only the repository whose top level is this tree: a tree with no `.git` of its own
+	// inside another repository is no checkout of that repository.
+	const inRepository = isRepositoryRoot(repoRoot) ? runGit(["-C", repoRoot, ...args]) : null;
 	if (inRepository !== null) entries = parseListing(inRepository);
 	else {
 		const gitDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-sources-git-"));
@@ -202,49 +226,121 @@ function listBuildSources(repoRoot, roots) {
 }
 
 /**
- * The argument text of each call to `name` in a Starlark file, comments removed.
+ * The argument text of the call whose `(` ends just before `start`, comments
+ * removed.
+ * @param {string} text
+ * @param {number} start
+ */
+function callArguments(text, start) {
+	let depth = 1;
+	let quote = "";
+	let body = "";
+	for (let i = start; i < text.length && depth > 0; i++) {
+		const char = text[i];
+		if (quote) {
+			body += char;
+			if (char === "\\") body += text[++i] ?? "";
+			else if (char === quote) quote = "";
+			continue;
+		}
+		if (char === "#") {
+			const end = text.indexOf("\n", i);
+			i = end < 0 ? text.length : end - 1;
+			continue;
+		}
+		if (char === '"' || char === "'") quote = char;
+		else if (char === "(") depth++;
+		else if (char === ")" && --depth === 0) break;
+		body += char;
+	}
+	return body;
+}
+
+/**
+ * The argument text of each top-level call to `name` in a Starlark file.
  * @param {string} text
  * @param {string} name
  */
 function* starlarkCalls(text, name) {
 	for (const match of text.matchAll(new RegExp(`(?:^|\\n)[ \\t]*${name}\\s*\\(`, "g"))) {
-		let depth = 1;
-		let quote = "";
-		let body = "";
-		for (let i = match.index + match[0].length; i < text.length && depth > 0; i++) {
-			const char = text[i];
-			if (quote) {
-				body += char;
-				if (char === "\\") body += text[++i] ?? "";
-				else if (char === quote) quote = "";
-				continue;
-			}
-			if (char === "#") {
-				const end = text.indexOf("\n", i);
-				i = end < 0 ? text.length : end - 1;
-				continue;
-			}
-			if (char === '"' || char === "'") quote = char;
-			else if (char === "(") depth++;
-			else if (char === ")" && --depth === 0) break;
-			body += char;
-		}
-		yield body;
+		yield callArguments(text, match.index + match[0].length);
+	}
+}
+
+/** @param {string} list the text inside a Starlark list's brackets */
+function stringsOf(list) {
+	return [...list.matchAll(/["']([^"']+)["']/g)].map(([, value]) => value);
+}
+
+/**
+ * Each `glob()` in `text`: its `include` patterns (the first list, positional or
+ * `include = […]`) and its `exclude` patterns.
+ * @param {string} text
+ * @returns {Generator<{ include: string[]; exclude: string[] }>}
+ */
+function* globCalls(text) {
+	for (const match of text.matchAll(/\bglob\s*\(/g)) {
+		const args = callArguments(text, match.index + match[0].length);
+		const excludeList = /\bexclude\s*=\s*\[([^\]]*)\]/.exec(args);
+		const rest = excludeList ? args.replace(excludeList[0], "") : args;
+		const includeList = /\[([^\]]*)\]/.exec(rest);
+		yield { include: includeList ? stringsOf(includeList[1]) : [], exclude: excludeList ? stringsOf(excludeList[1]) : [] };
 	}
 }
 
 /**
- * The directories build scripts scan: for each listed `BUILD.bazel`, every
- * `glob()` pattern in its `cargo_build_script` calls, cut at its first segment
- * with a wildcard. Bazel gives a build script only the files it declares, so these
- * are the directories whose new files a build script can read; Cargo's
- * `rerun-if-changed` names the same ones.
+ * A Bazel glob pattern as a regular expression over `/`-separated paths: `*` and
+ * `?` stay within one segment (and match a leading dot, as Bazel's do), and a
+ * `**` segment matches any number of segments.
+ * @param {string} pattern
+ */
+function globRegExp(pattern) {
+	const segments = pattern.split("/");
+	let source = "";
+	segments.forEach((segment, i) => {
+		const last = i === segments.length - 1;
+		if (segment === "**") {
+			source += last ? ".*" : "(?:[^/]+/)*";
+			return;
+		}
+		for (const char of segment) {
+			if (char === "*") source += "[^/]*";
+			else if (char === "?") source += "[^/]";
+			else source += char.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+		}
+		if (!last) source += "/";
+	});
+	return new RegExp(`^${source}$`);
+}
+
+/**
+ * Whether a build script's globs take in `rel`: one glob includes it and does not
+ * exclude it.
+ * @param {readonly { include: string[]; exclude: string[] }[]} globs
+ * @param {string} rel
+ */
+function globsMatch(globs, rel) {
+	return globs.some(
+		glob =>
+			glob.include.some(pattern => globRegExp(pattern).test(rel)) &&
+			!glob.exclude.some(pattern => globRegExp(pattern).test(rel)),
+	);
+}
+
+/**
+ * The directories build scripts scan, with the globs that say which of their files
+ * a build script takes in: for each listed `BUILD.bazel`, every `glob()` in its
+ * `cargo_build_script` calls (patterns made relative to the repository root), each
+ * pattern's directory being its part before the first segment with a wildcard.
+ * Bazel gives a build script only the files its globs match, so those files, and
+ * no others there, are what a build script can read; Cargo's `rerun-if-changed`
+ * names the same directories.
  * @param {string} repoRoot
  * @param {readonly string[]} files
- * @returns {string[]}
+ * @returns {{ dir: string; globs: { include: string[]; exclude: string[] }[] }[]}
  */
 function buildScriptScannedDirs(repoRoot, files) {
-	const dirs = new Set();
+	const byDir = new Map();
 	for (const rel of files) {
 		if (path.posix.basename(rel) !== "BUILD.bazel") continue;
 		let text;
@@ -253,19 +349,23 @@ function buildScriptScannedDirs(repoRoot, files) {
 		} catch {
 			continue;
 		}
+		const pkg = path.posix.dirname(rel);
 		for (const call of starlarkCalls(text, "cargo_build_script")) {
-			for (const [, list] of call.matchAll(/\bglob\(\s*\[([^\]]*)\]/g)) {
-				for (const [, pattern] of list.matchAll(/["']([^"']+)["']/g)) {
+			for (const glob of globCalls(call)) {
+				const exclude = glob.exclude.map(pattern => path.posix.join(pkg, pattern));
+				for (const pattern of glob.include) {
 					const segments = pattern.split("/");
-					const wildcard = segments.findIndex(segment => /[*?[]/.test(segment));
+					const wildcard = segments.findIndex(segment => /[*?]/.test(segment));
 					if (wildcard < 0) continue;
-					const dir = path.posix.join(path.posix.dirname(rel), ...segments.slice(0, wildcard));
-					if (lstatSource(repoRoot, dir)?.isDirectory()) dirs.add(dir);
+					const dir = path.posix.join(pkg, ...segments.slice(0, wildcard));
+					if (!lstatSource(repoRoot, dir)?.isDirectory()) continue;
+					if (!byDir.has(dir)) byDir.set(dir, []);
+					byDir.get(dir).push({ include: [path.posix.join(pkg, pattern)], exclude });
 				}
 			}
 		}
 	}
-	return [...dirs].sort();
+	return [...byDir.keys()].sort().map(dir => ({ dir, globs: byDir.get(dir) }));
 }
 
 /**
@@ -378,29 +478,60 @@ function identities(files, untracked, hashes) {
 }
 
 /**
+ * The checkout at `repoRoot` as a record names it: its real path and the device
+ * and inode of its directory, so a new checkout made at the same path (robomp
+ * recreating a workspace, say) is another checkout.
+ * @param {string} repoRoot
+ * @returns {{ path: string; dev: string; ino: string }}
+ */
+function checkoutIdentity(repoRoot) {
+	const real = fs.realpathSync(repoRoot);
+	const stat = fs.statSync(real, { bigint: true });
+	return { path: real, dev: String(stat.dev), ino: String(stat.ino) };
+}
+
+/**
+ * Whether `repoRoot` is the checkout a record names.
+ * @param {{ path: string; dev: string; ino: string }} recorded
+ * @param {string} repoRoot
+ */
+function isSameCheckout(recorded, repoRoot) {
+	try {
+		const now = checkoutIdentity(repoRoot);
+		return now.path === recorded.path && now.dev === recorded.dev && now.ino === recorded.ino;
+	} catch {
+		return false;
+	}
+}
+
+/**
  * The checkout's sources under `roots` now, as a native build records them, read
- * before the build begins. Lists the files once (one `git ls-files`), adds every
- * file of the directories build scripts scan, gitignored or not, as sources the
- * build had, and reads every one.
+ * before the build begins. Lists the files once (one `git ls-files`), adds the
+ * files of the directories build scripts scan that their globs match, gitignored
+ * or not, as sources the build had, and reads every one.
  * @param {string} repoRoot
  * @param {readonly string[]} roots
  */
 export function readRustSources(repoRoot, roots) {
 	const listed = listBuildSources(repoRoot, roots);
-	const scans = buildScriptScannedDirs(repoRoot, listed.files).map(dir => ({ dir, ...scanDirectory(repoRoot, dir) }));
+	const scans = buildScriptScannedDirs(repoRoot, listed.files).map(({ dir, globs }) => {
+		const scan = scanDirectory(repoRoot, dir);
+		return { dir, globs, times: scan.times, files: scan.files.filter(rel => globsMatch(globs, rel)) };
+	});
 	const scannedFiles = new Set(scans.flatMap(scan => scan.files));
 	const files = [...new Set([...listed.files, ...scannedFiles])].sort();
-	// A scanned directory's files are compiled whether git tracks them or not.
+	// A scanned directory's matched files are compiled whether git tracks them or not.
 	const untracked = listed.untracked.filter(rel => !scannedFiles.has(rel));
 	const hashes = hashSources(repoRoot, files);
 	return {
 		roots: [...roots],
+		checkout: checkoutIdentity(repoRoot),
 		files,
 		untracked,
 		hashes,
 		fingerprint: fingerprintOf(repoRoot, files),
 		...identities(files, untracked, hashes),
-		scanned: scans.map(({ dir, times }) => ({ dir, dirs: times })),
+		scanned: scans.map(({ dir, globs, times }) => ({ dir, globs, dirs: times })),
 		packages: packageBuildScripts(repoRoot, files),
 	};
 }
@@ -481,6 +612,7 @@ export function writeAddonSourcesStamp(addonPath, sources, build) {
 	writeStamp(addonPath, {
 		addon: addonIdentity(addonPath),
 		roots: sources.roots,
+		checkout: sources.checkout,
 		files: sources.files,
 		untracked: sources.untrackedHashes,
 		sources: sources.digest,
@@ -520,10 +652,18 @@ function isWellFormedStamp(stamp) {
 		dirs !== null &&
 		typeof dirs === "object" &&
 		Object.entries(dirs).every(([rel, time]) => isCheckoutPath(rel) && typeof time === "number");
+	const isPatterns = patterns => Array.isArray(patterns) && patterns.every(isCheckoutPath);
+	const isGlobs = globs =>
+		Array.isArray(globs) &&
+		globs.length > 0 &&
+		globs.every(glob => isPatterns(glob?.include) && glob.include.length > 0 && isPatterns(glob.exclude));
 	return (
 		typeof stamp?.sources === "string" &&
 		typeof stamp.seen?.fingerprint === "string" &&
 		(stamp.seen.verdict === "current" || stamp.seen.verdict === "other") &&
+		typeof stamp.checkout?.path === "string" &&
+		typeof stamp.checkout.dev === "string" &&
+		typeof stamp.checkout.ino === "string" &&
 		Array.isArray(stamp.files) &&
 		stamp.files.length > 0 &&
 		stamp.files.every(isCheckoutPath) &&
@@ -531,7 +671,7 @@ function isWellFormedStamp(stamp) {
 		typeof stamp.untracked === "object" &&
 		Object.entries(stamp.untracked).every(([rel, hash]) => isCheckoutPath(rel) && typeof hash === "string") &&
 		Array.isArray(stamp.scanned) &&
-		stamp.scanned.every(entry => isCheckoutPath(entry?.dir) && isTimes(entry.dirs)) &&
+		stamp.scanned.every(entry => isCheckoutPath(entry?.dir) && isGlobs(entry.globs) && isTimes(entry.dirs)) &&
 		Array.isArray(stamp.packages) &&
 		stamp.packages.every(entry => typeof entry?.dir === "string" && typeof entry.buildScript === "boolean") &&
 		stamp.packages.every(entry => entry.dir === "." || isCheckoutPath(entry.dir))
@@ -578,11 +718,12 @@ export function addonSourcesState(addonPath, repoRoot) {
 				scanned.push(entry);
 				continue;
 			}
-			// Every file there, gitignored or not, as the build script reads them.
-			const recorded = stamp.files.filter(rel => rel.startsWith(`${entry.dir}/`));
+			// The files there its globs match, gitignored or not, as the build script reads them.
+			const recorded = stamp.files.filter(rel => rel.startsWith(`${entry.dir}/`) && globsMatch(entry.globs, rel));
 			const now = scanDirectory(repoRoot, entry.dir);
-			if (now.files.length !== recorded.length || now.files.some((rel, i) => rel !== recorded[i])) return "other";
-			scanned.push({ dir: entry.dir, dirs: now.times });
+			const matched = now.files.filter(rel => globsMatch(entry.globs, rel));
+			if (matched.length !== recorded.length || matched.some((rel, i) => rel !== recorded[i])) return "other";
+			scanned.push({ dir: entry.dir, globs: entry.globs, dirs: now.times });
 			learned = true;
 		}
 		const fingerprint = fingerprintOf(repoRoot, stamp.files);
@@ -591,8 +732,11 @@ export function addonSourcesState(addonPath, repoRoot) {
 			const untracked = Object.keys(stamp.untracked);
 			const hashes = hashSources(repoRoot, stamp.files);
 			const now = identities(stamp.files, untracked, hashes);
+			// A file untracked at build time may be missing only in another checkout of the
+			// commit (robomp's cache, the image seed); where it was built, missing is a change.
+			const sameCheckout = isSameCheckout(stamp.checkout, repoRoot);
 			const sameUntracked = untracked.every(
-				rel => hashes[rel] === "missing" || hashes[rel] === stamp.untracked[rel],
+				rel => (hashes[rel] === "missing" && !sameCheckout) || hashes[rel] === stamp.untracked[rel],
 			);
 			verdict = now.digest === stamp.sources && sameUntracked ? "current" : "other";
 			learned = true;

@@ -23,7 +23,7 @@ import {
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
-import { getActiveProfile, getConfigDirName } from "@oh-my-pi/pi-utils/dirs";
+import { getActiveProfile, getConfigDirName, getNativesDir } from "@oh-my-pi/pi-utils/dirs";
 import { classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
@@ -1595,6 +1595,9 @@ export class CommandController {
 					XDG_DATA_HOME: environment.XDG_DATA_HOME,
 					XDG_STATE_HOME: environment.XDG_STATE_HOME,
 					XDG_CACHE_HOME: environment.XDG_CACHE_HOME,
+					// The fork is omp: it loads the addon and grammars from this session's
+					// natives directory, whatever the multiplexer's environment says.
+					PI_NATIVES_DIR: getNativesDir(),
 				}),
 				...dependencies.resolveCliEntryCmd(),
 				...childArgs,

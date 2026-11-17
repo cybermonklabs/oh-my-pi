@@ -47,9 +47,6 @@ const NATIVES_DIR_CACHE_ENV_KEY = "__PI_NATIVES_DIR_CACHE";
 /** This process's answer, once the first call has given it. */
 let processNativesDir;
 
-/** What the first call did to `PI_NATIVES_DIR`, so a test reset can undo it. */
-let exportedOverride;
-
 /**
  * This process's start time on Linux (`/proc/self/stat` field 22, in clock ticks since
  * boot): with the pid it names one process for its whole life, in every thread. Undefined
@@ -94,10 +91,11 @@ function isThisProcess(cached) {
 }
 
 /**
- * Make `dir` this process's answer: kept for later calls, carried to worker threads, and set
- * as `PI_NATIVES_DIR`, so every child process omp starts, which inherits its environment,
- * names the same directory, and a `.env` file applied later (omp's `.env` loading never
- * replaces a variable already set) cannot change it.
+ * Make `dir` this process's answer: kept for later calls, and carried to worker threads
+ * through {@link NATIVES_DIR_CACHE_ENV_KEY}. `PI_NATIVES_DIR` is left as it is: a child
+ * process resolves for itself, unless omp gives it the answer (its subprocess workers, the
+ * omp daemons its launch broker runs, and a forked session get `PI_NATIVES_DIR`; the commands
+ * the agent runs do not).
  * @param {string} dir
  */
 function adopt(dir) {
@@ -108,10 +106,6 @@ function adopt(dir) {
 		start: processStartTime(),
 		dir,
 	});
-	if (process.env.PI_NATIVES_DIR !== dir) {
-		exportedOverride = { value: dir, previous: process.env.PI_NATIVES_DIR };
-		process.env.PI_NATIVES_DIR = dir;
-	}
 	return dir;
 }
 
@@ -122,14 +116,15 @@ function adopt(dir) {
  * `@oh-my-pi/pi-utils` both call this, so the grammars the agent installs are the ones the
  * addon loads.
  *
- * It is one directory per process tree, never per profile: the first call resolves it, every
- * later call in that process and its worker threads returns the same answer, and the answer is
- * set as `PI_NATIVES_DIR` for the child processes it starts. The addon loads once per path, so
- * a second directory would load a second copy of the addon into the process, and the grammars
- * the agent downloads would go where the addon does not look. omp first loads the addon before
- * it reads `.env` files, so set a directory variable in the environment: one set in a `.env`
- * file does not move the natives directory, in omp or in its child processes. The first call
- * reads, in order:
+ * It is one directory per process, never per profile: the first call resolves it, and every
+ * later call in that process and its worker threads returns the same answer. The addon loads
+ * once per path, so a second directory would load a second copy of the addon into the
+ * process, and the grammars the agent downloads would go where the addon does not look. omp
+ * first loads the addon before it reads `.env` files, so set a directory variable in the
+ * environment: one set in a `.env` file does not move the natives directory. A child process
+ * resolves for itself; omp passes the answer as `PI_NATIVES_DIR` to the children that are
+ * omp (its subprocess workers, its omp daemons, a forked session), not to the commands the
+ * agent runs. The first call reads, in order:
  * 1. `PI_NATIVES_DIR`;
  * 2. `<OMP_DOWNLOAD_ROOT>/natives`;
  * 3. on Linux and macOS, `$XDG_CACHE_HOME/omp/natives` when `$XDG_CACHE_HOME/omp` exists;
@@ -149,16 +144,8 @@ export function getNativesDir() {
 	return adopt(resolveNativesDir());
 }
 
-/**
- * Forget this process's answer, so a test can resolve again from a changed environment. A
- * `PI_NATIVES_DIR` the first call set goes back to what it was, unless the test changed it since.
- */
+/** Forget this process's answer, so a test can resolve again from a changed environment. */
 export function __resetNativesDirForTests() {
 	processNativesDir = undefined;
 	delete process.env[NATIVES_DIR_CACHE_ENV_KEY];
-	if (exportedOverride && process.env.PI_NATIVES_DIR === exportedOverride.value) {
-		if (exportedOverride.previous === undefined) delete process.env.PI_NATIVES_DIR;
-		else process.env.PI_NATIVES_DIR = exportedOverride.previous;
-	}
-	exportedOverride = undefined;
 }

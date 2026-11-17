@@ -8,9 +8,18 @@ export const BAZEL_SOURCE_ROOTS: readonly string[];
 export interface RustSources {
 	/** The roots, relative to the repository root. */
 	roots: string[];
-	/** The source files under the roots, `/`-separated and sorted: git's tracked and unignored files, or a walk's. */
+	/** The checkout that built the addon: its real path, and its directory's device and inode. */
+	checkout: { path: string; dev: string; ino: string };
+	/**
+	 * The source files, `/`-separated and sorted: under the roots, git's tracked and unignored
+	 * files (or a throwaway listing's, or a walk's), and in each scanned directory the files its
+	 * globs match, gitignored or not.
+	 */
 	files: string[];
-	/** The listed files git did not track at build time; they count while they exist. */
+	/**
+	 * The listed files git did not track at build time. Their bytes must match; one may be
+	 * missing only when the record is judged in another checkout.
+	 */
 	untracked: string[];
 	/** Each listed file's content hash; never written to the record. */
 	hashes: Record<string, string>;
@@ -20,8 +29,11 @@ export interface RustSources {
 	digest: string;
 	/** Each untracked file's content hash. */
 	untrackedHashes: Record<string, string>;
-	/** The directories build scripts scan, each with the modification times of it and its subdirectories. */
-	scanned: { dir: string; dirs: Record<string, number> }[];
+	/**
+	 * The directories build scripts scan: each with its `cargo_build_script` globs (patterns
+	 * relative to the repository root) and the modification times of it and its subdirectories.
+	 */
+	scanned: { dir: string; globs: { include: string[]; exclude: string[] }[]; dirs: Record<string, number> }[];
 	/** Each package directory and whether it has a `build.rs`. */
 	packages: { dir: string; buildScript: boolean }[];
 }

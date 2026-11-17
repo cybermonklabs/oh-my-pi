@@ -953,10 +953,11 @@ export function getNativeGrammarsDir(): string {
 }
 
 /**
- * The natives directory, one answer per process tree: the addon loader resolves it with the
- * same function, at the first use, and passes it to child processes as `PI_NATIVES_DIR`, so
- * the addon and the agent never name different directories, even after a `.env` file sets a
- * directory variable.
+ * The natives directory, one answer per process: the addon loader resolves it with the same
+ * function, at the first use, so the addon and the agent never name different directories,
+ * even after a `.env` file sets a directory variable. omp's children that are omp get it as
+ * `PI_NATIVES_DIR` (`workerEnvFromParent`, `ompDaemonSpecEnv`, the fork command); other
+ * children resolve for themselves.
  */
 export { getNativesDir };
 

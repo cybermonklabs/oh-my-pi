@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { classifyTerminalMultiplexer, type TerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { getNativesDir } from "@oh-my-pi/pi-utils/dirs";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { Settings } from "../../../src/config/settings";
@@ -312,6 +313,24 @@ describe("/fork terminal placement", () => {
 		expect(appArgs).not.toContain("old-provider");
 		expect(appArgs).not.toContain("old-provider/model-a");
 		expect(command.slice(-2)).toEqual(["--fork", path.resolve(sourceSessionFile)]);
+	});
+
+	it("pins this session's natives directory, whatever the multiplexer's environment says", async () => {
+		const { controller, launchTerminal } = createContext({
+			environment: () =>
+				({
+					TMUX: "server,1,0",
+					TMUX_PANE: "%1",
+					PI_NATIVES_DIR: path.join(tempDirectory, "stale server natives"),
+				}) as NodeJS.ProcessEnv,
+		});
+
+		await controller.handleForkCommand("pane");
+
+		const command = launchTerminal.mock.calls[0]?.[0].command ?? [];
+		const envArgs = command.slice(0, command.indexOf("omp-entry"));
+		expect(envArgs).toContain(`PI_NATIVES_DIR=${getNativesDir()}`);
+		expect(command.join(" ")).not.toContain("stale server natives");
 	});
 
 	it("launches after a cwd move with the original overlay and configured thinking selector", async () => {

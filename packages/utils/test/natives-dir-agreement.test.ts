@@ -130,10 +130,11 @@ describe("the natives directory the addon loader and pi-utils name", () => {
 /**
  * omp loads the addon (its SQLite lock shim) before pi-utils' `env.ts` applies `.env` files,
  * so a directory variable from a `.env` file arrives after the loader has resolved the
- * natives directory. The loader, pi-utils, and a child process started with the environment
- * that follows (as omp starts its subprocess workers) must still name one directory. Each case
- * runs in its own process, as omp does: the loader first, then `env.ts`, then pi-utils, then
- * the child.
+ * natives directory. The loader and pi-utils must still name one directory, and the commands
+ * the agent runs (the bash tool builds their environment with `filterChildShellEnv(Bun.env)`)
+ * get `PI_NATIVES_DIR` only as omp was started with it, so an omp they start resolves for
+ * itself. Each case runs in its own process, as omp does: the loader first, then `env.ts`,
+ * then pi-utils.
  */
 describe("the natives directory when a directory variable comes from a .env file", () => {
 	const DIRECTORY_NAMES = [
@@ -166,27 +167,23 @@ describe("the natives directory when a directory variable comes from a .env file
 		...(xdgPlatform ? ([["XDG_CACHE_HOME", "<tmp>/xdg", ["xdg/omp"]]] as [string, string, string[]][]) : []),
 	];
 
-	it.each(cases)("names one directory when the agent's .env sets %s", async (name, value, existing) => {
+	/** Run the probe with `launch` added to its environment; returns what it saw. */
+	async function probe(dotenv: string, launch: Record<string, string> = {}) {
 		const home = path.join(tempRoot, "home");
-		for (const dir of existing) await fs.mkdir(path.join(tempRoot, dir), { recursive: true });
-		// The marker shows the `.env` file was read, so the case can fail.
-		await Bun.write(
-			path.join(home, ".omp/agent/.env"),
-			`${name}=${value.replaceAll("<tmp>", tempRoot)}\nNATIVES_DOTENV_PROBE=read\n`,
-		);
+		await Bun.write(path.join(home, ".omp/agent/.env"), dotenv);
 		const script = path.join(tempRoot, "probe.ts");
 		await Bun.write(
 			script,
 			`const { initLoaderContext } = await import(${JSON.stringify(path.join(import.meta.dir, "../../natives/native/loader-state.js"))});
 const loaderFirst = initLoaderContext({ isCompiledBinary: true }).nativesDir;
-await import(${JSON.stringify(path.join(import.meta.dir, "../src/env.ts"))});
+const { filterChildShellEnv } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/env.ts"))});
 const { getNativesDir } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/dirs.ts"))});
-const child = Bun.spawnSync([process.execPath, "-e", ${JSON.stringify(`console.log((await import(${JSON.stringify(path.join(import.meta.dir, "../../natives/native/natives-dir.js"))})).getNativesDir())`)}], { env: process.env });
-console.log(JSON.stringify({ marker: process.env.NATIVES_DOTENV_PROBE, loaderFirst, loaderLater: initLoaderContext({ isCompiledBinary: true }).nativesDir, piUtils: getNativesDir(), child: child.stdout.toString().trim() }));
+console.log(JSON.stringify({ marker: process.env.NATIVES_DOTENV_PROBE, loaderFirst, loaderLater: initLoaderContext({ isCompiledBinary: true }).nativesDir, piUtils: getNativesDir(), applied: process.env.PI_NATIVES_DIR ?? null, command: filterChildShellEnv(Bun.env).PI_NATIVES_DIR ?? null }));
 `,
 		);
 		const env: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
 		for (const key of DIRECTORY_NAMES) delete env[key];
+		Object.assign(env, launch);
 		const child = Bun.spawn([process.execPath, script], { cwd: tempRoot, env, stdout: "pipe", stderr: "pipe" });
 		const [stdout, stderr, exitCode] = await Promise.all([
 			new Response(child.stdout).text(),
@@ -194,11 +191,37 @@ console.log(JSON.stringify({ marker: process.env.NATIVES_DOTENV_PROBE, loaderFir
 			child.exited,
 		]);
 		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-		const result = JSON.parse(stdout);
+		return JSON.parse(stdout);
+	}
+
+	it.each(cases)("names one directory when the agent's .env sets %s", async (name, value, existing) => {
+		for (const dir of existing) await fs.mkdir(path.join(tempRoot, dir), { recursive: true });
+		// The marker shows the `.env` file was read, so the case can fail.
+		const result = await probe(`${name}=${value.replaceAll("<tmp>", tempRoot)}\nNATIVES_DOTENV_PROBE=read\n`);
 
 		expect(result.marker).toBe("read");
 		expect(result.loaderLater).toBe(result.loaderFirst);
 		expect(result.piUtils).toBe(result.loaderFirst);
-		expect(result.child).toBe(result.loaderFirst);
+		// omp was started without PI_NATIVES_DIR, so a command gets none, whatever `.env` set.
+		expect(result.command).toBeNull();
+	});
+
+	it("gives the commands the agent runs PI_NATIVES_DIR as omp was started with it", async () => {
+		const launch = path.join(tempRoot, "launch");
+		const result = await probe(`PI_NATIVES_DIR=${path.join(tempRoot, "post")}\nNATIVES_DOTENV_PROBE=read\n`, {
+			PI_NATIVES_DIR: launch,
+		});
+
+		expect(result.marker).toBe("read");
+		expect(result.loaderFirst).toBe(launch);
+		expect(result.command).toBe(launch);
+	});
+
+	it("lets the agent's .env set PI_NATIVES_DIR in omp's own environment, which a command does not get (control)", async () => {
+		const result = await probe(`PI_NATIVES_DIR=${path.join(tempRoot, "post")}\nNATIVES_DOTENV_PROBE=read\n`);
+
+		// What a command would carry without the restore: the value `.env` put in process.env.
+		expect(result.applied).toBe(path.join(tempRoot, "post"));
+		expect(result.command).toBeNull();
 	});
 });
