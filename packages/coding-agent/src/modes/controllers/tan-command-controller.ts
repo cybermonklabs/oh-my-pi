@@ -13,7 +13,7 @@ import { isHiddenUserCompanion } from "../../session/queued-messages";
 import { SessionManager } from "../../session/session-manager";
 import type { SessionStorage } from "../../session/session-storage";
 import { createSubagentSettings, followMCPTools } from "../../task/executor";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../session/session-entries";
 import type { InteractiveModeContext } from "../types";
 
 import { cfgTaskEnableLsp } from "../../task/settings";

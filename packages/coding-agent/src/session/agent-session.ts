@@ -272,7 +272,7 @@ import {
 } from "../tools/resolve";
 import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
 import { supportsExternalThinking } from "../tools/think";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "../tools/todo";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "./session-entries";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { currentThreadId, isMainThread } from "../thread/identity";

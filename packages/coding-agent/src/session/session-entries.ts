@@ -418,6 +418,24 @@ export function todoResultPhases(entry: SessionEntry): unknown[] | undefined {
 	return "phases" in details && Array.isArray(details.phases) ? details.phases : undefined;
 }
 
+/** `custom` type of the entry a user's edit of the to-do list appends: its `data.phases` is the whole list. */
+export const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
+
+/**
+ * The phases a canonical to-do snapshot records, or undefined: a user's edit
+ * of the list ({@link USER_TODO_EDIT_CUSTOM_TYPE}) or a successful `todo`
+ * result ({@link todoResultPhases}). The to-do list restores from the newest
+ * one on the branch.
+ */
+export function todoSnapshotPhases(entry: SessionEntry): unknown[] | undefined {
+	if (entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
+		const data: unknown = entry.data;
+		const phases = typeof data === "object" && data !== null && "phases" in data ? data.phases : undefined;
+		return Array.isArray(phases) ? phases : undefined;
+	}
+	return todoResultPhases(entry);
+}
+
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
 export type FileEntry = SessionHeader | SessionEntry;
 
