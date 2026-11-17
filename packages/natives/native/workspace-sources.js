@@ -43,15 +43,18 @@ import * as path from "node:path";
  * cargo config) count: their bytes must match, and in the checkout that built
  * the addon one that moved or went away means other sources. Only in another
  * checkout of the commit, as robomp's cache and the image seed carry a record
- * between checkouts, is a missing one no difference; the record names its
- * checkout by real path and the directory's device and inode. Two identities are
- * kept:
+ * between checkouts, is a missing one no difference. The record names its
+ * checkout by an id the first build keeps in the checkout's git directory
+ * (`omp-checkout-id`): it moves with the checkout (a `mv`, a bind mount, a dev
+ * container), and a new checkout made where an old one was has none of its own.
+ * Two identities are kept:
  * - the digest, SHA-256 over each tracked file's path and content (a link's
  *   target, for a link), and each untracked file's own SHA-256, which decide;
  * - the fingerprint, SHA-256 over each listed file's path, size and modification
- *   time, which stands for a verdict already reached. A start reads the sizes and
- *   times; it reads the bytes only when the fingerprint is one it has not seen,
- *   and records the verdict for the next start.
+ *   time, which stands for a verdict already reached, with whether the judging
+ *   checkout is the record's (when it has an untracked file). A start reads the
+ *   sizes and times; it reads the bytes only when the fingerprint, or the
+ *   checkout, is one it has not seen, and records the verdict for the next start.
  * A file changed without a new size or modification time (a copy that keeps
  * both) is not seen, as git and cargo do not see it either. The record also
  * carries the build's settings (`build`: profile, features, flags) to explain an
@@ -477,31 +480,62 @@ function identities(files, untracked, hashes) {
 	};
 }
 
+/** The file, in a checkout's git directory, that names the checkout. */
+const CHECKOUT_ID_FILE = "omp-checkout-id";
+
 /**
- * The checkout at `repoRoot` as a record names it: its real path and the device
- * and inode of its directory, so a new checkout made at the same path (robomp
- * recreating a workspace, say) is another checkout.
+ * The git directory of the checkout at `repoRoot`: its `.git` directory, or the
+ * one its `.git` file names (`gitdir: …`, as a worktree's or a submodule's does);
+ * undefined when `repoRoot` has no `.git` of its own.
  * @param {string} repoRoot
- * @returns {{ path: string; dev: string; ino: string }}
+ * @returns {string | undefined}
  */
-function checkoutIdentity(repoRoot) {
-	const real = fs.realpathSync(repoRoot);
-	const stat = fs.statSync(real, { bigint: true });
-	return { path: real, dev: String(stat.dev), ino: String(stat.ino) };
+function checkoutGitDir(repoRoot) {
+	const dotGit = path.join(repoRoot, ".git");
+	const stat = fs.lstatSync(dotGit, { throwIfNoEntry: false });
+	if (stat?.isDirectory()) return dotGit;
+	if (!stat?.isFile()) return undefined;
+	const named = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(fs.readFileSync(dotGit, "utf8"));
+	return named ? path.resolve(repoRoot, named[1]) : undefined;
 }
 
 /**
- * Whether `repoRoot` is the checkout a record names.
- * @param {{ path: string; dev: string; ino: string }} recorded
+ * The id of the checkout at `repoRoot`: a random UUID kept in its git directory
+ * ({@link CHECKOUT_ID_FILE}), made there by the first build when `create` is set.
+ * It moves with the checkout (a `mv`, a bind mount at another path, a dev
+ * container), and a new checkout, even one made where an old one was, has none
+ * of its own until it builds. Null for a tree with no `.git` of its own (a Docker
+ * build context, an export): no record names it as its checkout.
  * @param {string} repoRoot
+ * @param {boolean} create
+ * @returns {string | null}
  */
-function isSameCheckout(recorded, repoRoot) {
+function checkoutId(repoRoot, create) {
+	let idPath;
 	try {
-		const now = checkoutIdentity(repoRoot);
-		return now.path === recorded.path && now.dev === recorded.dev && now.ino === recorded.ino;
+		const gitDir = checkoutGitDir(repoRoot);
+		if (!gitDir) return null;
+		idPath = path.join(gitDir, CHECKOUT_ID_FILE);
 	} catch {
-		return false;
+		return null;
 	}
+	const read = () => {
+		try {
+			const id = fs.readFileSync(idPath, "utf8").trim();
+			return /^[0-9a-f-]{36}$/.test(id) ? id : null;
+		} catch {
+			return null;
+		}
+	};
+	const existing = read();
+	if (existing || !create) return existing;
+	try {
+		fs.writeFileSync(idPath, `${crypto.randomUUID()}\n`, { flag: "wx" });
+	} catch (err) {
+		// Another build made it first, or the git directory cannot be written.
+		if (err?.code !== "EEXIST") return null;
+	}
+	return read();
 }
 
 /**
@@ -525,7 +559,7 @@ export function readRustSources(repoRoot, roots) {
 	const hashes = hashSources(repoRoot, files);
 	return {
 		roots: [...roots],
-		checkout: checkoutIdentity(repoRoot),
+		checkout: checkoutId(repoRoot, true),
 		files,
 		untracked,
 		hashes,
@@ -618,9 +652,27 @@ export function writeAddonSourcesStamp(addonPath, sources, build) {
 		sources: sources.digest,
 		scanned: sources.scanned,
 		packages: sources.packages,
-		seen: { fingerprint: sources.fingerprint, verdict: "current" },
+		// The checkout that built the addon is the one judging it now.
+		seen: {
+			fingerprint: sources.fingerprint,
+			sameCheckout: sameCheckoutKey(sources.untracked.length > 0, sources.checkout, sources.checkout),
+			verdict: "current",
+		},
 		build,
 	});
+}
+
+/**
+ * Whether the checkout judging a record is the one that wrote it, as the cached
+ * verdict is keyed by it: null when the record has no untracked file, for which
+ * it cannot matter.
+ * @param {boolean} hasUntracked
+ * @param {string | null} recorded the record's checkout id
+ * @param {string | null} current the judging checkout's id
+ * @returns {boolean | null}
+ */
+function sameCheckoutKey(hasUntracked, recorded, current) {
+	return hasUntracked ? recorded !== null && recorded === current : null;
 }
 
 /**
@@ -661,9 +713,8 @@ function isWellFormedStamp(stamp) {
 		typeof stamp?.sources === "string" &&
 		typeof stamp.seen?.fingerprint === "string" &&
 		(stamp.seen.verdict === "current" || stamp.seen.verdict === "other") &&
-		typeof stamp.checkout?.path === "string" &&
-		typeof stamp.checkout.dev === "string" &&
-		typeof stamp.checkout.ino === "string" &&
+		(stamp.seen.sameCheckout === null || typeof stamp.seen.sameCheckout === "boolean") &&
+		(stamp.checkout === null || (typeof stamp.checkout === "string" && /^[0-9a-f-]{36}$/.test(stamp.checkout))) &&
 		Array.isArray(stamp.files) &&
 		stamp.files.length > 0 &&
 		stamp.files.every(isCheckoutPath) &&
@@ -727,14 +778,20 @@ export function addonSourcesState(addonPath, repoRoot) {
 			learned = true;
 		}
 		const fingerprint = fingerprintOf(repoRoot, stamp.files);
+		const untracked = Object.keys(stamp.untracked);
+		// Which checkout judges matters only for an untracked file, and the cached
+		// verdict is keyed by it as well as by the files' state.
+		const sameCheckout = sameCheckoutKey(
+			untracked.length > 0,
+			stamp.checkout,
+			untracked.length > 0 ? checkoutId(repoRoot, false) : null,
+		);
 		let verdict = stamp.seen.verdict;
-		if (fingerprint !== stamp.seen.fingerprint) {
-			const untracked = Object.keys(stamp.untracked);
+		if (fingerprint !== stamp.seen.fingerprint || sameCheckout !== stamp.seen.sameCheckout) {
 			const hashes = hashSources(repoRoot, stamp.files);
 			const now = identities(stamp.files, untracked, hashes);
 			// A file untracked at build time may be missing only in another checkout of the
 			// commit (robomp's cache, the image seed); where it was built, missing is a change.
-			const sameCheckout = isSameCheckout(stamp.checkout, repoRoot);
 			const sameUntracked = untracked.every(
 				rel => (hashes[rel] === "missing" && !sameCheckout) || hashes[rel] === stamp.untracked[rel],
 			);
@@ -743,7 +800,7 @@ export function addonSourcesState(addonPath, repoRoot) {
 		}
 		if (learned) {
 			try {
-				writeStamp(addonPath, { ...stamp, scanned, seen: { fingerprint, verdict } });
+				writeStamp(addonPath, { ...stamp, scanned, seen: { fingerprint, sameCheckout, verdict } });
 			} catch {
 				// A checkout that cannot be written checks again next start.
 			}

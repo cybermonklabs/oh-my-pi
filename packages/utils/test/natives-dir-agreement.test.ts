@@ -217,11 +217,12 @@ console.log(JSON.stringify({ marker: process.env.NATIVES_DOTENV_PROBE, loaderFir
 		expect(result.command).toBe(launch);
 	});
 
-	it("lets the agent's .env set PI_NATIVES_DIR in omp's own environment, which a command does not get (control)", async () => {
+	it("never applies a .env file's PI_NATIVES_DIR, so no program omp starts can carry it", async () => {
 		const result = await probe(`PI_NATIVES_DIR=${path.join(tempRoot, "post")}\nNATIVES_DOTENV_PROBE=read\n`);
 
-		// What a command would carry without the restore: the value `.env` put in process.env.
-		expect(result.applied).toBe(path.join(tempRoot, "post"));
+		// The `.env` file was read (its other value applied), its PI_NATIVES_DIR was not.
+		expect(result.marker).toBe("read");
+		expect(result.applied).toBeNull();
 		expect(result.command).toBeNull();
 	});
 });

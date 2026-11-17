@@ -23,7 +23,9 @@ import {
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
-import { getActiveProfile, getConfigDirName, getNativesDir } from "@oh-my-pi/pi-utils/dirs";
+import { NATIVES_DIR_HANDOFF_ENV_KEY, nativesDirHandoff, nativesDirInputNames } from "@oh-my-pi/pi-natives/natives-dir";
+import { getActiveProfile, getConfigDirName } from "@oh-my-pi/pi-utils/dirs";
+import { launchEnvValue } from "@oh-my-pi/pi-utils/env";
 import { classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
@@ -1584,24 +1586,27 @@ export class CommandController {
 			}
 			childArgs.push("--fork", sourceSessionFile);
 			// Pin only non-secret scope variables.
-			const command = [
-				...forkScopeEnvCommand({
-					PI_CODING_AGENT_DIR: this.ctx.settings.getAgentDir(),
-					PI_CONFIG_DIR: getConfigDirName(),
-					OMP_PROFILE: activeProfile,
-					PI_PROFILE: activeProfile,
-					PI_CONFIG_FILES: this.ctx.settings.getConfigFiles().join(path.delimiter),
-					PI_CODING_AGENT_SESSION_DIR: environment.PI_CODING_AGENT_SESSION_DIR,
-					XDG_DATA_HOME: environment.XDG_DATA_HOME,
-					XDG_STATE_HOME: environment.XDG_STATE_HOME,
-					XDG_CACHE_HOME: environment.XDG_CACHE_HOME,
-					// The fork is omp: it loads the addon and grammars from this session's
-					// natives directory, whatever the multiplexer's environment says.
-					PI_NATIVES_DIR: getNativesDir(),
-				}),
-				...dependencies.resolveCliEntryCmd(),
-				...childArgs,
-			];
+			const scope: Record<string, string | undefined> = {
+				PI_CODING_AGENT_DIR: this.ctx.settings.getAgentDir(),
+				PI_CONFIG_DIR: getConfigDirName(),
+				OMP_PROFILE: activeProfile,
+				PI_PROFILE: activeProfile,
+				PI_CONFIG_FILES: this.ctx.settings.getConfigFiles().join(path.delimiter),
+				PI_CODING_AGENT_SESSION_DIR: environment.PI_CODING_AGENT_SESSION_DIR,
+				XDG_DATA_HOME: environment.XDG_DATA_HOME,
+				XDG_STATE_HOME: environment.XDG_STATE_HOME,
+				XDG_CACHE_HOME: environment.XDG_CACHE_HOME,
+			};
+			// The fork is omp: it takes this session's natives directory from a handoff
+			// keyed to the directory rule's inputs, which are pinned here, the rest at
+			// their launch values (`PI_NATIVES_DIR` as this session was started with it),
+			// so the commands the fork runs get what this session's commands get.
+			for (const name of nativesDirInputNames()) {
+				// `forkScopeEnvCommand` unsets an empty value, so the handoff records it unset.
+				scope[name] = (name in scope ? scope[name] : launchEnvValue(name)) || undefined;
+			}
+			scope[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(scope, { parent: null });
+			const command = [...forkScopeEnvCommand(scope), ...dependencies.resolveCliEntryCmd(), ...childArgs];
 			const launchPlan = createDefaultTerminalLaunchRequest(
 				multiplexer,
 				placement,

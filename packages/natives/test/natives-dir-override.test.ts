@@ -3,7 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { initLoaderContext, prepareNativeVersionDir } from "../native/loader-state.js";
-import { __resetNativesDirForTests, getNativesDir } from "../native/natives-dir.js";
+import {
+	__resetNativesDirForTests,
+	getNativesDir,
+	nativesDirHandoff,
+	nativesDirInputNames,
+} from "../native/natives-dir.js";
 import packageJson from "../package.json" with { type: "json" };
 
 const ENV_KEYS = [
@@ -176,6 +181,87 @@ describe("one natives directory per process", () => {
 
 		expect(exitCode).toBe(0);
 		expect(output.trim()).toBe(childDir);
+	});
+
+	describe("a handoff to a child that is omp", () => {
+		const nativesDirJs = JSON.stringify(path.join(import.meta.dir, "../native/natives-dir.js"));
+		// The child prints its answer, then the answer of a program it starts with its own
+		// environment, as Bun does when a spawn names no `env`.
+		const probe = [
+			`const mod = await import(${nativesDirJs});`,
+			"const own = mod.getNativesDir();",
+			`const grandchild = Bun.spawnSync([process.execPath, "-e", ${JSON.stringify(`console.log((await import(${nativesDirJs})).getNativesDir())`)}]);`,
+			"console.log(JSON.stringify({ own, grandchild: grandchild.stdout.toString().trim(), handoffLeft: process.env.__PI_NATIVES_DIR_HANDOFF ?? null }));",
+		].join("\n");
+
+		async function runChild(env: Record<string, string | undefined>) {
+			const child = Bun.spawn([process.execPath, "-e", probe], { env, stdout: "pipe", stderr: "inherit" });
+			const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+			expect(exitCode).toBe(0);
+			return JSON.parse(output.trim()) as { own: string; grandchild: string; handoffLeft: string | null };
+		}
+
+		it("is taken by the child it was written for, and by no program that child starts", async () => {
+			const handedOver = path.join(tempRoot, "handed-over");
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				PI_NATIVES_DIR: path.join(tempRoot, "child"),
+			};
+			env.__PI_NATIVES_DIR_HANDOFF = nativesDirHandoff(env, { parent: process.pid, dir: handedOver });
+
+			const result = await runChild(env);
+
+			expect(result.own).toBe(handedOver);
+			// Its own child resolves from the same variables: the handoff names another parent.
+			expect(result.grandchild).toBe(path.join(tempRoot, "child"));
+			expect(result.handoffLeft).toBeNull();
+		});
+
+		it("is not taken by a child whose directory variables differ from the recorded ones", async () => {
+			const recorded: Record<string, string | undefined> = {
+				...process.env,
+				PI_NATIVES_DIR: path.join(tempRoot, "child"),
+			};
+			const handoff = nativesDirHandoff(recorded, { parent: process.pid, dir: path.join(tempRoot, "handed-over") });
+			const ownHome = path.join(tempRoot, "own-home");
+			const env = {
+				...recorded,
+				HOME: ownHome,
+				USERPROFILE: ownHome,
+				PI_NATIVES_DIR: undefined,
+				OMP_DOWNLOAD_ROOT: undefined,
+				OMP_CONFIG_ROOT: undefined,
+				XDG_CACHE_HOME: undefined,
+				__PI_NATIVES_DIR_HANDOFF: handoff,
+			};
+
+			expect((await runChild(env)).own).toBe(path.join(ownHome, ".omp", "natives"));
+		});
+
+		it("with no parent recorded, is taken by whichever process has the recorded variables", async () => {
+			const handedOver = path.join(tempRoot, "handed-over");
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				PI_NATIVES_DIR: path.join(tempRoot, "child"),
+			};
+			// A forked session's: the terminal, not this process, starts it.
+			env.__PI_NATIVES_DIR_HANDOFF = nativesDirHandoff(env, { parent: null, dir: handedOver });
+
+			expect((await runChild(env)).own).toBe(handedOver);
+		});
+
+		it("names every variable the rule reads, so a new one cannot be left out of it", async () => {
+			// A handoff is taken when the recorded inputs match, so a variable the rule reads and
+			// the list omits would let a child with its own value of it take the parent's answer.
+			const source = await Bun.file(path.join(import.meta.dir, "../native/natives-dir.js")).text();
+			const rule = /function resolveNativesDir\(\) \{\n(?<body>[\s\S]*?)\n\}/.exec(source)?.groups?.body;
+			if (!rule) throw new Error("resolveNativesDir not found in natives-dir.js");
+			const read = new Set(rule.match(/process\.env\.([A-Z0-9_]+)/g)?.map(hit => hit.slice("process.env.".length)));
+			// `os.homedir()` reads the home directory's variable, which the list names as well.
+			if (rule.includes("os.homedir()")) read.add(process.platform === "win32" ? "USERPROFILE" : "HOME");
+
+			expect([...read].sort()).toEqual([...nativesDirInputNames()].sort());
+		});
 	});
 
 	it("leaves the environment alone, so a child with its own HOME resolves its own, before and after the first call", async () => {

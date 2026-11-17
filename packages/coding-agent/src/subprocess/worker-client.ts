@@ -14,8 +14,8 @@ import {
 	WhichCachePolicy,
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
-import { getNativesDir } from "@oh-my-pi/pi-utils/dirs";
-import { stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
+import { NATIVES_DIR_HANDOFF_ENV_KEY, nativesDirHandoff, nativesDirHandoffDir } from "@oh-my-pi/pi-natives/natives-dir";
+import { filterChildShellEnv, launchEnvValue, stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
 import type { Subprocess } from "bun";
 
 /**
@@ -184,14 +184,26 @@ export function resolveWorkerSpawnCmd(workerArg: string): WorkerSpawnCommand {
 }
 
 /**
+ * Hand this process's natives directory to `env`, the whole environment of a child that is
+ * omp and that this process starts itself. The handoff names this process as the child's
+ * parent and records the child's values of the directory rule's inputs, so a program the
+ * child starts, with the same environment or its own, does not take it.
+ */
+function withNativesDirHandoff(env: Record<string, string>): Record<string, string> {
+	env[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(env, { parent: process.pid });
+	return env;
+}
+
+/**
  * Snapshot the parent environment for the child. `process.env` carries
  * `undefined` slots that `Bun.spawn` rejects, so filter them out; an optional
  * `overlay` (e.g. the tiny-model device/dtype vars) wins over inherited keys.
  *
- * The worker is omp, so it gets this process's natives directory as
- * `PI_NATIVES_DIR`: it loads the addon and its grammars from the directory
- * the parent does, whatever directory variables a `.env` file set since the
- * parent resolved it.
+ * The worker is omp, so it takes this process's natives directory from a
+ * handoff: it loads the addon and its grammars from the directory the parent
+ * does, whatever directory variables a `.env` file set since the parent
+ * resolved it. `PI_NATIVES_DIR` is as omp was started with it, so the programs
+ * a worker starts (the JS eval kernel's, say) resolve their own.
  */
 export function workerEnvFromParent(overlay?: Record<string, string>): Record<string, string> {
 	const base = $env as Record<string, string | undefined>;
@@ -203,35 +215,51 @@ export function workerEnvFromParent(overlay?: Record<string, string>): Record<st
 	// Inherited repo-location overrides must not reach a worker or the PTY
 	// daemons it hosts (issue #11082); an explicit overlay still wins below.
 	stripGitRepoLocationEnv(merged);
-	merged.PI_NATIVES_DIR = getNativesDir();
+	const nativesDirAtLaunch = launchEnvValue("PI_NATIVES_DIR");
+	if (nativesDirAtLaunch === undefined) delete merged.PI_NATIVES_DIR;
+	else merged.PI_NATIVES_DIR = nativesDirAtLaunch;
 	if (overlay) {
 		for (const key in overlay) merged[key] = overlay[key];
 	}
-	return merged;
+	return withNativesDirHandoff(merged);
+}
+
+/**
+ * The environment of the launch broker. The broker runs the agent's services and
+ * commands as well as omp's daemons, so its environment is a command's
+ * (`filterChildShellEnv`: no value a project `.env` file set, `PI_NATIVES_DIR` as
+ * omp was started with it), with `overlay` over it; being omp, it takes this
+ * process's natives directory from a handoff.
+ */
+export function brokerEnvFromParent(overlay: Record<string, string>): Record<string, string> {
+	return withNativesDirHandoff(Object.assign(filterChildShellEnv($env), overlay));
 }
 
 /**
  * The spec environment of an omp daemon the launch broker runs (`DaemonSpec.env`):
- * `env` with this process's natives directory as `PI_NATIVES_DIR`, since the daemon
- * is omp. The broker gives a managed program `PI_NATIVES_DIR` only as its spec does
- * ({@link managedDaemonEnv}).
+ * `env` with a handoff of this process's natives directory, since the daemon is
+ * omp. The broker, which starts the daemon, re-issues the handoff for the daemon's
+ * own environment ({@link managedDaemonEnv}).
  */
 export function ompDaemonSpecEnv(env: Record<string, string>): Record<string, string> {
-	return { PI_NATIVES_DIR: getNativesDir(), ...env };
+	return { ...env, [NATIVES_DIR_HANDOFF_ENV_KEY]: nativesDirHandoff(env, { parent: process.pid }) };
 }
 
 /**
- * The environment the launch broker gives a program it manages: its own environment
- * ({@link workerEnvFromParent}) with `specEnv` over it, and `PI_NATIVES_DIR` only as
- * `specEnv` gives it. The broker runs omp's daemons and the agent's commands and
- * services alike: an omp daemon's spec names the natives directory
- * ({@link ompDaemonSpecEnv}); a command's carries `PI_NATIVES_DIR` as omp was started
- * with it, or none, so the command resolves its own.
+ * The environment the launch broker gives a program it manages: the broker's own
+ * environment as a command's (`filterChildShellEnv`: no value a project `.env`
+ * file set, `PI_NATIVES_DIR` as the broker was started with it, no natives
+ * handoff), with `specEnv` over it. A service's spec is the shell environment of
+ * the session that asked for it, so the service gets what the bash tool's command
+ * would. An omp daemon's spec carries a handoff of the asking session's natives
+ * directory ({@link ompDaemonSpecEnv}); the broker re-issues it for the daemon's
+ * environment, with itself as the parent.
  */
 export function managedDaemonEnv(specEnv: Record<string, string>): Record<string, string> {
-	const env = workerEnvFromParent();
-	delete env.PI_NATIVES_DIR;
-	return Object.assign(env, specEnv);
+	const env = Object.assign(filterChildShellEnv($env), specEnv);
+	const handedOver = nativesDirHandoffDir(specEnv[NATIVES_DIR_HANDOFF_ENV_KEY]);
+	if (handedOver) env[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(env, { parent: process.pid, dir: handedOver });
+	return env;
 }
 
 /**

@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseEnv } from "node:util";
+import { getNativesDir, NATIVES_DIR_HANDOFF_ENV_KEY } from "@oh-my-pi/pi-natives/natives-dir";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
 import { isBunTestRuntime } from "./test-runtime";
 
@@ -137,14 +138,30 @@ const launchEnvValues = readLaunchEnv();
 const projectEnvNamesLoadedByOmp = new Set<string>();
 
 /**
- * `PI_NATIVES_DIR` as omp was started with it, before omp applies its own `.env` files
- * (undefined when it was not set). The commands the agent runs get this value: neither a
- * value a `.env` file set later nor the directory omp resolved, so a command, and an omp it
- * starts with its own `HOME`, resolves the natives directory for itself. omp's children that
- * are omp get the resolved directory instead (`workerEnvFromParent`, `ompDaemonSpecEnv`, the
- * fork command).
+ * `name` as omp was started with it, before omp applied its own `.env` files (undefined when
+ * it was not set). Where the platform keeps no copy of the launch environment (procfs) and
+ * Bun loaded none of its own, the value now.
  */
-const nativesDirAtLaunch = launchEnvValues ? launchEnvValues.get("PI_NATIVES_DIR") : Bun.env.PI_NATIVES_DIR;
+export function launchEnvValue(name: string): string | undefined {
+	return launchEnvValues ? launchEnvValues.get(name) : Bun.env[name];
+}
+
+/**
+ * `PI_NATIVES_DIR` as omp was started with it. The commands the agent runs get this value,
+ * never the directory omp resolved, so a command, and an omp it starts with its own `HOME`,
+ * resolves the natives directory for itself. omp's children that are omp take the resolved
+ * directory from a handoff instead (`NATIVES_DIR_HANDOFF_ENV_KEY`), which commands never get.
+ */
+const nativesDirAtLaunch = launchEnvValue("PI_NATIVES_DIR");
+
+/**
+ * Whether `name` is `PI_NATIVES_DIR`, which omp never applies from a `.env` file: the natives
+ * directory is fixed before `.env` files are read, so the value could only mislead the
+ * programs omp starts.
+ */
+function isNativesDirEnvName(name: string): boolean {
+	return process.platform === "win32" ? name.toUpperCase() === "PI_NATIVES_DIR" : name === "PI_NATIVES_DIR";
+}
 
 function expandDotenvValues(values: Record<string, string>, env: Record<string, string>): Record<string, string> {
 	const expanded: Record<string, string> = {};
@@ -174,6 +191,8 @@ function filterChildShellEnvInternal(
 		if (nativesDirAtLaunch === undefined) delete result.PI_NATIVES_DIR;
 		else result.PI_NATIVES_DIR = nativesDirAtLaunch;
 	}
+	// omp's own handoff to a child that is omp; a command is no such child.
+	delete result[NATIVES_DIR_HANDOFF_ENV_KEY];
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
 	const launchNodeEnv = runtimeLaunchEnvValues ? runtimeLaunchEnvValues.get("NODE_ENV") : env.NODE_ENV;
 	const nodeEnvName = `.env.${launchNodeEnv || "development"}`;
@@ -399,9 +418,14 @@ export function withOmpOtelEnv<T>(fn: () => T): T {
 	}
 }
 
+// The natives directory is one answer per process, from the environment omp was started
+// with (or the handoff its parent gave it): fix it before the `.env` files below can change a
+// variable the rule reads, in every omp process, whichever module loads first.
+getNativesDir();
+
 for (const file of [projectEnv, agentEnv, piEnv, homeEnv]) {
 	for (const key in file) {
-		if (isMacosMallocStackLoggingEnvName(key)) continue;
+		if (isMacosMallocStackLoggingEnvName(key) || isNativesDirEnvName(key)) continue;
 		if (file !== projectEnv && claimOmpOtelEnvFileEntry(key, file[key])) continue;
 		if (!Bun.env[key]) {
 			Bun.env[key] = file[key];

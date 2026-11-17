@@ -8,8 +8,11 @@ export const BAZEL_SOURCE_ROOTS: readonly string[];
 export interface RustSources {
 	/** The roots, relative to the repository root. */
 	roots: string[];
-	/** The checkout that built the addon: its real path, and its directory's device and inode. */
-	checkout: { path: string; dev: string; ino: string };
+	/**
+	 * The checkout that built the addon: the id kept in its git directory (`omp-checkout-id`,
+	 * made by its first build), or null for a tree with no `.git` of its own.
+	 */
+	checkout: string | null;
 	/**
 	 * The source files, `/`-separated and sorted: under the roots, git's tracked and unignored
 	 * files (or a throwaway listing's, or a walk's), and in each scanned directory the files its

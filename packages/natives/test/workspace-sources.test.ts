@@ -685,6 +685,70 @@ describe("a file untracked at build time, judged in the checkout that built it",
 	});
 });
 
+describe("the checkout a record names", () => {
+	/** A commit without `src/foo.rs`, then a build with it untracked: the record's one untracked file. */
+	async function buildWithUntrackedModule() {
+		git(repo, "init", "-q");
+		git(repo, "add", "Cargo.toml", "Cargo.lock", "crates/pi-natives/src/lib.rs");
+		git(repo, "commit", "-qm", "base");
+		await Bun.write(path.join(repo, "crates/pi-natives/src/foo.rs"), "pub fn foo() {}\n");
+		await build();
+		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(Object.keys(stamp.untracked)).toEqual(["crates/pi-natives/src/foo.rs"]);
+		expect(stamp.checkout).toBe((await Bun.file(path.join(repo, ".git/omp-checkout-id")).text()).trim());
+	}
+
+	afterEach(async () => {
+		for (const suffix of ["-moved", "-origin", "-saved"])
+			await fs.rm(`${repo}${suffix}`, { recursive: true, force: true });
+	});
+
+	it("is the same checkout after it moves, so its missing untracked file reads other", async () => {
+		await buildWithUntrackedModule();
+		const moved = `${repo}-moved`;
+		// A `mv`, or a bind mount at another path: the checkout keeps its `.git`.
+		await fs.rename(repo, moved);
+		try {
+			await fs.rm(path.join(moved, "crates/pi-natives/src/foo.rs"));
+
+			expect(addonSourcesState(path.join(moved, path.relative(repo, addon)), moved)).toBe("other");
+		} finally {
+			await fs.rename(moved, repo);
+		}
+	});
+
+	it("is another checkout when the checkout is deleted and cloned again at the same path", async () => {
+		await buildWithUntrackedModule();
+		const origin = `${repo}-origin`;
+		git(path.dirname(repo), "clone", "-q", "--bare", repo, origin);
+		const saved = `${repo}-saved`;
+		await fs.mkdir(saved);
+		await fs.cp(addon, path.join(saved, "addon.node"), { preserveTimestamps: true });
+		await fs.cp(`${addon}.sources.json`, path.join(saved, "addon.node.sources.json"));
+		// No rename: the directory is removed, and a new one made where it was.
+		await fs.rm(repo, { recursive: true, force: true });
+		git(path.dirname(repo), "clone", "-q", origin, repo);
+		await fs.mkdir(path.dirname(addon), { recursive: true });
+		await fs.cp(path.join(saved, "addon.node"), addon, { preserveTimestamps: true });
+		await fs.cp(path.join(saved, "addon.node.sources.json"), `${addon}.sources.json`);
+
+		expect(await fs.exists(path.join(repo, ".git/omp-checkout-id"))).toBe(false);
+		// The fresh clone never had foo.rs: no difference.
+		expect(addonSourcesState(addon, repo)).toBe("current");
+	});
+
+	it("keys the cached verdict by whether the checkout is the record's", async () => {
+		await buildWithUntrackedModule();
+		await fs.rm(path.join(repo, "crates/pi-natives/src/foo.rs"));
+		expect(addonSourcesState(addon, repo)).toBe("other");
+
+		// The same files and times, judged as another checkout would judge them.
+		await fs.rm(path.join(repo, ".git/omp-checkout-id"));
+
+		expect(addonSourcesState(addon, repo)).toBe("current");
+	});
+});
+
 describe("a tree with no .git of its own inside another repository", () => {
 	afterEach(async () => {
 		await fs.rm(`${repo}-outer`, { recursive: true, force: true });

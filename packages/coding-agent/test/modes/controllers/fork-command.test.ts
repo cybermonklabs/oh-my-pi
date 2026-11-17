@@ -5,7 +5,6 @@ import * as path from "node:path";
 import { classifyTerminalMultiplexer, type TerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import { getNativesDir } from "@oh-my-pi/pi-utils/dirs";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { Settings } from "../../../src/config/settings";
@@ -21,6 +20,20 @@ import { type FakeAnswer, type FakeDaemon, startFakeDaemon } from "../../tools/t
 
 let tempDirectory: string;
 let sourceSessionFile: string;
+
+/** The variables the natives directory rule reads, and its own, none inherited by a stand-in. */
+const FORK_NATIVES_DIR_NAMES = [
+	"PI_NATIVES_DIR",
+	"OMP_DOWNLOAD_ROOT",
+	"OMP_CONFIG_ROOT",
+	"PI_CONFIG_DIR",
+	"PI_CODING_AGENT_DIR",
+	"OMP_PROFILE",
+	"PI_PROFILE",
+	"XDG_CACHE_HOME",
+	"__PI_NATIVES_DIR_CACHE",
+	"__PI_NATIVES_DIR_HANDOFF",
+];
 
 beforeEach(async () => {
 	tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-fork-command-"));
@@ -315,23 +328,92 @@ describe("/fork terminal placement", () => {
 		expect(command.slice(-2)).toEqual(["--fork", path.resolve(sourceSessionFile)]);
 	});
 
-	it("pins this session's natives directory, whatever the multiplexer's environment says", async () => {
-		const { controller, launchTerminal } = createContext({
-			environment: () =>
-				({
-					TMUX: "server,1,0",
-					TMUX_PANE: "%1",
-					PI_NATIVES_DIR: path.join(tempDirectory, "stale server natives"),
-				}) as NodeJS.ProcessEnv,
+	it("gives the fork this session's natives directory, and the fork's commands PI_NATIVES_DIR as this session was started with it", async () => {
+		// Real processes, as in the review's probe: a session builds the /fork command, and the
+		// command runs a stand-in fork in a multiplexer whose server holds a stale PI_NATIVES_DIR.
+		// By path: a script outside the repository would take a package name from Bun's install cache.
+		const controllerTs = path.join(import.meta.dir, "../../../src/modes/controllers/command-controller.ts");
+		const nativesDirJs = path.join(import.meta.dir, "../../../../natives/native/natives-dir.js");
+		const envTs = path.join(import.meta.dir, "../../../../utils/src/env.ts");
+		const home = path.join(tempDirectory, "home");
+		const cmdHome = path.join(tempDirectory, "cmdhome");
+		// A directory variable the session's environment gained after it resolved its natives
+		// directory (an agent `.env`, say): the fork's pinned inputs alone would name another.
+		const lateCache = path.join(tempDirectory, "late-cache");
+		await fs.mkdir(path.join(lateCache, "omp"), { recursive: true });
+		const fork = path.join(tempDirectory, "fork.ts");
+		await Bun.write(
+			fork,
+			`const { getNativesDir } = await import(${JSON.stringify(nativesDirJs)});
+const dir = getNativesDir();
+const { filterChildShellEnv } = await import(${JSON.stringify(envTs)});
+const commandEnv = filterChildShellEnv(Bun.env);
+// A command's omp with a home of its own and no directory variables.
+const own = { ...commandEnv, HOME: ${JSON.stringify(cmdHome)}, USERPROFILE: ${JSON.stringify(cmdHome)} };
+for (const name of ["OMP_CONFIG_ROOT", "OMP_DOWNLOAD_ROOT", "XDG_CACHE_HOME"]) delete own[name];
+const child = Bun.spawnSync([process.execPath, "--no-env-file", "-e", ${JSON.stringify(`console.log((await import(${JSON.stringify(nativesDirJs)})).getNativesDir())`)}], { env: own });
+if (child.exitCode !== 0) throw new Error(child.stderr.toString());
+console.log(JSON.stringify({ dir, commandEnv: commandEnv.PI_NATIVES_DIR ?? null, commandChild: child.stdout.toString().trim() }));
+`,
+		);
+		const sessionTs = path.join(tempDirectory, "session.ts");
+		await Bun.write(
+			sessionTs,
+			`const { CommandController } = await import(${JSON.stringify(controllerTs)});
+const { getNativesDir } = await import(${JSON.stringify(nativesDirJs)});
+const sessionFile = ${JSON.stringify(sourceSessionFile)};
+let request;
+const ctx = {
+	session: { isStreaming: false, fork: async () => true, flushToDisk: async () => undefined, sessionFile, sessionId: "parent-session-id", agent: {}, model: { provider: "provider", id: "model" }, configuredThinkingLevel: () => undefined },
+	sessionManager: { getHeader: () => undefined, getCwd: () => process.cwd(), getSessionFile: () => sessionFile, isSessionOnDisk: () => true, getStorage: () => ({ exists: async () => true }), flush: async () => undefined },
+	settings: { getAgentDir: () => ${JSON.stringify(path.join(home, ".omp/agent"))}, getConfigFiles: () => [] },
+	loadingAnimation: undefined,
+	statusContainer: { disposeChildren() {} },
+	statusLine: { invalidate() {} },
+	ui: { requestRender() {} },
+	present() {},
+	showStatus() {},
+	showWarning(message) { throw new Error(String(message)); },
+	showError(message) { throw new Error(String(message)); },
+	showHookConfirm: async () => false,
+};
+const controller = new CommandController(ctx, {
+	classifyTerminalMultiplexer: () => "tmux",
+	environment: () => ({ ...process.env, TMUX: "server,1,0", TMUX_PANE: "%1", XDG_CACHE_HOME: ${JSON.stringify(lateCache)} }),
+	launchTerminal: async launch => { request = launch; return { multiplexer: launch.multiplexer, placement: launch.placement }; },
+	resolveCliEntryCmd: () => [process.execPath, "--no-env-file", ${JSON.stringify(fork)}],
+	getActiveProfile: () => undefined,
+	argv: () => [],
+});
+await controller.handleForkCommand("pane");
+console.log(JSON.stringify({ dir: getNativesDir(), command: request.command }));
+`,
+		);
+		const env: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
+		for (const name of FORK_NATIVES_DIR_NAMES) delete env[name];
+		const run = async (command: string[], childEnv: Record<string, string | undefined>) => {
+			const child = Bun.spawn(command, { cwd: tempDirectory, env: childEnv, stdout: "pipe", stderr: "pipe" });
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+			return JSON.parse(stdout);
+		};
+
+		const session = await run([process.execPath, "--no-env-file", sessionTs], env);
+		const forked = await run(session.command, {
+			...env,
+			PI_NATIVES_DIR: path.join(tempDirectory, "stale server natives"),
 		});
 
-		await controller.handleForkCommand("pane");
-
-		const command = launchTerminal.mock.calls[0]?.[0].command ?? [];
-		const envArgs = command.slice(0, command.indexOf("omp-entry"));
-		expect(envArgs).toContain(`PI_NATIVES_DIR=${getNativesDir()}`);
-		expect(command.join(" ")).not.toContain("stale server natives");
-	});
+		expect(session.dir).toBe(path.join(home, ".omp", "natives"));
+		expect(forked.dir).toBe(session.dir);
+		// This session was started without PI_NATIVES_DIR, so its commands, and the fork's, get none.
+		expect(forked.commandEnv).toBeNull();
+		expect(forked.commandChild).toBe(path.join(cmdHome, ".omp", "natives"));
+	}, 120_000);
 
 	it("launches after a cwd move with the original overlay and configured thinking selector", async () => {
 		const oldCwd = path.join(tempDirectory, "old project");

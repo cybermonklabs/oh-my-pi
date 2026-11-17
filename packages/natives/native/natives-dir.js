@@ -92,10 +92,8 @@ function isThisProcess(cached) {
 
 /**
  * Make `dir` this process's answer: kept for later calls, and carried to worker threads
- * through {@link NATIVES_DIR_CACHE_ENV_KEY}. `PI_NATIVES_DIR` is left as it is: a child
- * process resolves for itself, unless omp gives it the answer (its subprocess workers, the
- * omp daemons its launch broker runs, and a forked session get `PI_NATIVES_DIR`; the commands
- * the agent runs do not).
+ * through {@link NATIVES_DIR_CACHE_ENV_KEY}. `PI_NATIVES_DIR` is left as it is, so the
+ * commands the agent runs carry it as omp was started with it.
  * @param {string} dir
  */
 function adopt(dir) {
@@ -110,6 +108,81 @@ function adopt(dir) {
 }
 
 /**
+ * Hidden variable by which omp hands its answer to a child process that is omp (a subprocess
+ * worker, an omp daemon its launch broker runs, a forked session),
+ * `{"dir":…,"parent":…,"inputs":{…}}`. Only this module reads it, and `PI_NATIVES_DIR` stays
+ * as omp was started with it, so the commands such a child runs never carry the directory.
+ *
+ * A process takes the answer only when it is the one it was written for:
+ * - `inputs`, the values the rule reads ({@link nativesDirInputNames}), match its own
+ *   environment, so a program started with a home or directory variables of its own resolves
+ *   its own directory;
+ * - `parent`, when not null, is its parent's pid, so a program the child starts (one the
+ *   agent's code starts in the JS eval kernel, say) resolves for itself even with the same
+ *   environment. A forked session's handoff has no parent: the terminal starts the fork.
+ */
+export const NATIVES_DIR_HANDOFF_ENV_KEY = "__PI_NATIVES_DIR_HANDOFF";
+
+/**
+ * The environment variables the rule reads, the home directory's included (`HOME`, or
+ * `USERPROFILE` on Windows): a handoff is taken only by a process whose values of these are the
+ * recorded ones.
+ * @returns {string[]}
+ */
+export function nativesDirInputNames() {
+	return [
+		"PI_NATIVES_DIR",
+		"OMP_DOWNLOAD_ROOT",
+		"XDG_CACHE_HOME",
+		"OMP_CONFIG_ROOT",
+		"PI_CONFIG_DIR",
+		process.platform === "win32" ? "USERPROFILE" : "HOME",
+	];
+}
+
+/**
+ * The {@link NATIVES_DIR_HANDOFF_ENV_KEY} value for a child process whose environment is `env`
+ * (its values of the rule's inputs are recorded from it): this process's answer, or `dir`, for
+ * a process whose parent is `parent` (null: any parent).
+ * @param {Record<string, string | undefined>} env
+ * @param {{ parent: number | null; dir?: string }} options
+ * @returns {string}
+ */
+export function nativesDirHandoff(env, { parent, dir = getNativesDir() }) {
+	const inputs = {};
+	for (const name of nativesDirInputNames()) inputs[name] = env[name] ?? null;
+	return JSON.stringify({ dir, parent, inputs });
+}
+
+/**
+ * The directory a {@link NATIVES_DIR_HANDOFF_ENV_KEY} value hands over, or undefined for a
+ * value this module did not write. With `env`, also undefined unless the value was written
+ * for a process whose environment is `env` and whose parent is `ppid`.
+ * @param {string | undefined} value
+ * @param {{ env: Record<string, string | undefined>; ppid: number }} [addressee]
+ * @returns {string | undefined}
+ */
+export function nativesDirHandoffDir(value, addressee) {
+	let handoff;
+	try {
+		handoff = JSON.parse(value ?? "null");
+	} catch {
+		return undefined;
+	}
+	if (typeof handoff?.dir !== "string" || !path.isAbsolute(handoff.dir)) return undefined;
+	if (!addressee) return handoff.dir;
+	if (handoff.parent !== null && handoff.parent !== addressee.ppid) return undefined;
+	const inputs = handoff.inputs;
+	if (inputs === null || typeof inputs !== "object") return undefined;
+	const names = nativesDirInputNames();
+	if (Object.keys(inputs).length !== names.length) return undefined;
+	for (const name of names) {
+		if (!(name in inputs) || (addressee.env[name] ?? null) !== inputs[name]) return undefined;
+	}
+	return handoff.dir;
+}
+
+/**
  * The natives directory: the native addon's cached copies (`<dir>/<version>-<digest prefix>`
  * per compiled build and per Windows install's leaf package) and the
  * tree-sitter grammars the agent downloads (`<dir>/grammars`). The addon loader and
@@ -121,10 +194,10 @@ function adopt(dir) {
  * once per path, so a second directory would load a second copy of the addon into the
  * process, and the grammars the agent downloads would go where the addon does not look. omp
  * first loads the addon before it reads `.env` files, so set a directory variable in the
- * environment: one set in a `.env` file does not move the natives directory. A child process
- * resolves for itself; omp passes the answer as `PI_NATIVES_DIR` to the children that are
- * omp (its subprocess workers, its omp daemons, a forked session), not to the commands the
- * agent runs. The first call reads, in order:
+ * environment: omp never applies a `.env` file's `PI_NATIVES_DIR`, and another directory
+ * variable set in a `.env` file does not move the natives directory. A child process that is
+ * omp takes its parent's answer from a handoff ({@link NATIVES_DIR_HANDOFF_ENV_KEY}); any other
+ * child resolves for itself. The first call reads, in order:
  * 1. `PI_NATIVES_DIR`;
  * 2. `<OMP_DOWNLOAD_ROOT>/natives`;
  * 3. on Linux and macOS, `$XDG_CACHE_HOME/omp/natives` when `$XDG_CACHE_HOME/omp` exists;
@@ -141,7 +214,13 @@ export function getNativesDir() {
 	} catch {
 		// Not this module's value; resolve below and replace it.
 	}
-	return adopt(resolveNativesDir());
+	const handedOver = nativesDirHandoffDir(process.env[NATIVES_DIR_HANDOFF_ENV_KEY], {
+		env: process.env,
+		ppid: process.ppid,
+	});
+	// Read once: the children this process starts with its environment must not take it.
+	delete process.env[NATIVES_DIR_HANDOFF_ENV_KEY];
+	return adopt(handedOver ?? resolveNativesDir());
 }
 
 /** Forget this process's answer, so a test can resolve again from a changed environment. */
