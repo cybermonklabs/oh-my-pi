@@ -1514,11 +1514,13 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	/**
 	 * Whether the caller's abort (its signal's reason) cuts the subagent's turn off,
 	 * so `omp --restore` goes on with it, instead of stopping it. A sync run's signal
-	 * is its parent's turn, and the subagent follows the parent ({@link turnAbortKind}):
-	 * any stop of the parent's turn (the user's, `/new`, the parent's own budget or
-	 * time limit) stops it too, and the parent's process exit, dispose or shutdown
-	 * cuts it off, as does a reason that says neither. A detached run's signal is its
-	 * job's, and the owner's cancel of the job stops it.
+	 * is its parent's turn (from adoption on, for a run launched while the call
+	 * streamed), and the subagent follows the parent ({@link turnAbortKind}): any stop
+	 * of the parent's turn (the user's, `/new`, the parent's own budget or time limit)
+	 * stops it too, as does the discard of a launch nobody adopted, and the parent's
+	 * process exit, dispose or shutdown cuts it off, as does the platform's unmarked
+	 * abort reason, which says neither. A detached run's signal is its job's, and the
+	 * owner's cancel of the job stops it.
 	 */
 	let callerCutOff = false;
 

@@ -402,8 +402,9 @@ export class TurnRecovery {
 	/**
 	 * Whether the latest {@link abortRetry} stops the turn (the user's Esc, an abort)
 	 * rather than cutting it off (a process exit or shutdown). Every cancelled wait
-	 * follows an `abortRetry` call (an abort makes one before it raises
-	 * `abortInProgress`), so a saga reads the call that cancelled it.
+	 * follows an `abortRetry` call: an abort raises `abortInProgress` first and calls
+	 * `abortRetry` after it, with nothing awaited between, so a saga that wakes sees
+	 * both and reads the call that cancelled it.
 	 */
 	#retryCancelStopsTurn = false;
 	#retryAttempt = 0;

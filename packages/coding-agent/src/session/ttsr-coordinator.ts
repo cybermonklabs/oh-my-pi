@@ -29,7 +29,6 @@ import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" w
 import ttsrWarningTemplate from "../prompts/system/ttsr-warning.md" with { type: "text" };
 import type { AgentSessionEvent } from "./agent-session-events";
 import { escapeHarnessTags } from "./harness-tags";
-import { markTurnAbort } from "./exit-diagnostics";
 import type { SessionManager } from "./session-manager";
 import { TtsrToolInspector } from "./ttsr-outputs";
 
@@ -693,13 +692,10 @@ export class TtsrCoordinator {
 		const abortReason = this.#formatAbortReason(matches);
 		this.#host.agent.abort(
 			matchedToolId
-				? markTurnAbort(
-						createToolScopedAbortReason(
-							abortReason,
-							{ [matchedToolId]: abortReason },
-							"TTSR interrupt on another tool call",
-						),
-						"stop",
+				? createToolScopedAbortReason(
+						abortReason,
+						{ [matchedToolId]: abortReason },
+						"TTSR interrupt on another tool call",
 					)
 				: abortReason,
 		);

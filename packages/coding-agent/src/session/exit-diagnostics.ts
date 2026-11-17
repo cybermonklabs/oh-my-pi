@@ -275,14 +275,14 @@ export function createTurnAbortRecord(
  */
 export type TurnAbortKind = "stop" | "cutOff";
 
-/** The reason's own field that names its kind; a plain field, so it crosses a worker thread with the reason. */
+/**
+ * The field that marks the platform's own abort reason with its kind
+ * ({@link plainTurnAbortReason}). It is not enumerable, so a copy of a plain object
+ * would drop it; the thread RPC carries an error's own fields, enumerable or not,
+ * and rebuilds a `DOMException` named `AbortError` as one, so the marked reason
+ * crosses a worker thread with its mark.
+ */
 const TURN_ABORT_KIND_FIELD = "turnAbortKind";
-
-/** `reason`, an abort's own object reason, marked with the kind of abort it is ({@link turnAbortKind}). */
-export function markTurnAbort<T extends object>(reason: T, kind: TurnAbortKind): T {
-	Object.defineProperty(reason, TURN_ABORT_KIND_FIELD, { value: kind, configurable: true });
-	return reason;
-}
 
 /**
  * The reason for an abort that gives none of its own: the platform's own abort
@@ -293,22 +293,24 @@ export function plainTurnAbortReason(kind: TurnAbortKind): DOMException {
 	const controller = new AbortController();
 	controller.abort();
 	const reason: DOMException = controller.signal.reason;
-	return markTurnAbort(reason, kind);
+	Object.defineProperty(reason, TURN_ABORT_KIND_FIELD, { value: kind, configurable: true });
+	return reason;
 }
 
 /**
- * The kind of abort a reason gives a turn. A marked reason ({@link markTurnAbort})
- * says it. The interrupted-turn reason cuts the turn off, and any other reason an
- * abort names itself (text, a symbol) stops it. A reason with neither, such as the
- * platform's own, cuts it off: nothing tells it apart from a process going away.
+ * The kind of abort a reason gives a turn. The interrupted-turn reason cuts the
+ * turn off. Any other reason that carries its own text or identity stops it: other
+ * text, a symbol, an error, a plain object. The platform's own abort reason (a
+ * `DOMException` named `AbortError`) says its kind when it is marked
+ * ({@link plainTurnAbortReason}); unmarked, like no reason at all, it cuts the turn
+ * off: nothing tells it apart from a process going away.
  */
 export function turnAbortKind(reason: unknown): TurnAbortKind {
 	if (typeof reason === "string") return reason === INTERRUPTED_TURN_ERROR ? "cutOff" : "stop";
 	if (typeof reason === "symbol") return "stop";
-	if (typeof reason === "object" && reason !== null && Reflect.get(reason, TURN_ABORT_KIND_FIELD) === "stop") {
-		return "stop";
-	}
-	return "cutOff";
+	if (typeof reason !== "object" || reason === null) return "cutOff";
+	if (!(reason instanceof DOMException) || reason.name !== "AbortError") return "stop";
+	return Reflect.get(reason, TURN_ABORT_KIND_FIELD) === "stop" ? "stop" : "cutOff";
 }
 
 /**
