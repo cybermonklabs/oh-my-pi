@@ -499,7 +499,13 @@ a revived agent's turn the lifecycle teardown disposes.
    receives the result as the job's ordinary `async-result`, so a parent waiting on
    that job finds it again. A subagent is judged by the branch its transcript
    selects, as its own session reopens it: a turn on another branch (an abandoned
-   turn, or a `/clear` that was rolled back) does not count.
+   turn, or a `/clear` that was rolled back) does not count. It must also belong to
+   its parent's current conversation: a `task` result on the parent's active branch,
+   after the parent's last `/clear`, names it. A subagent whose `task` result sits
+   before that `/clear`, or on a branch the parent left, is work the parent left
+   behind: it is not relaunched, and neither are the subagents it spawned. When no
+   `task` result names a subagent (the parent's process ended inside the call that
+   spawned it), it belongs when its transcript began after that `/clear`.
 2. **Then the session's own turn** (`AgentSession.restoreInterruptedTurn`). A turn
    cut off without a `session_exit` record (a crash, SIGKILL or power loss records
    none) is first closed the way exit recovery closes one whose exit was recorded:
@@ -512,7 +518,11 @@ A turn that ended because no request could resolve its provider key, even after
 its retries (a `!command` apiKey that produced nothing, stored credentials that
 were disabled or cannot serve, an OAuth account pool with no account that can
 serve, a failed OAuth refresh), is retried too, whatever exit followed it:
-nothing was sent, and a subagent's process exits normally on such a turn.
+nothing was sent, and a subagent's process exits normally on such a turn. A turn
+the user stopped while it waited to retry (Esc, or an RPC `abort` or `abort_retry`)
+is not: the stop ends it with an aborted record ("Retry cancelled") after its failed
+attempt. A process exit during that wait cuts the turn off instead, and `--restore`
+goes on with it.
 
 Nothing else is continued when the last turn finished, failed, or the user interrupted
 it, or when a normal exit was recorded after it (the user quit with it
