@@ -172,33 +172,18 @@ def test_repo_command_env_replaces_inherited_git_config_with_safe_directory(
     assert git_config.past_count(env) == {}
 
 
-def test_repo_command_env_keeps_inherited_credential_config_out(
-    db: Database, tmp_path: Path, git_config: GitConfigSeries, inherited_credentials: str
-) -> None:
-    # robomp's own git config names a credential helper and an Authorization
-    # header; git, run in a repo command's env, must see neither.
-    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
-    try:
-        env = host_tools._repo_command_env(bindings)
-    finally:
-        _stop_loop(loop, thread)
-
-    assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the inherited config"
-    assert git_config.credentials(env, tmp_path) == []
-    assert git_config.entries(env) == [("safe.directory", str(bindings.workspace.repo_dir))]
-
-
-def test_repo_command_env_keeps_the_operator_global_git_config_out(
+def test_repo_command_env_keeps_the_operator_credential_config_out(
     db: Database,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     git_config: GitConfigSeries,
-    operator_git_config: str,
+    operator_config_channel: str,
     agent_home: Path,
 ) -> None:
-    # robomp's HOME holds the operator's global git config, a credential helper
-    # included. With no agent home a repo command keeps that HOME and must read
-    # an empty global config; with one it reads the agent home's own config only.
+    # Repo commands run code from the checkout. robomp's env names a credential
+    # helper and an Authorization header through each of seven channels; git,
+    # run in a repo command's env, must see neither, with or without an agent
+    # home. With one it reads that home's own config.
     monkeypatch.setattr(host_tools, "_AGENT_HOME", agent_home)
     bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
     try:
@@ -208,8 +193,31 @@ def test_repo_command_env_keeps_the_operator_global_git_config_out(
 
     assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the operator's config"
     assert git_config.credentials(env, tmp_path) == []
+    assert git_config.entries(env) == [("safe.directory", str(bindings.workspace.repo_dir))]
     expected_user = git_config.AGENT_HOME_USER if agent_home.is_dir() else None
     assert git_config.get(env, tmp_path, "user.name") == expected_user
+
+
+def test_repo_command_env_keeps_credential_variables_out(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A token, a credential prompt program or the operator's ssh agent in
+    # robomp's env would let code from the checkout authenticate as robomp.
+    credential_env = {
+        "GH_TOKEN": "probe-gh-token",
+        "GIT_ASKPASS": "/probe/askpass",
+        "SSH_ASKPASS": "/probe/ssh-askpass",
+        "SSH_AUTH_SOCK": "/probe/agent.sock",
+    }
+    for key, value in credential_env.items():
+        monkeypatch.setenv(key, value)
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert {key: env.get(key) for key in credential_env} == dict.fromkeys(credential_env, "")
 
 
 def test_run_repo_command_uses_slot_identity_kwargs(

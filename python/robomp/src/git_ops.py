@@ -19,6 +19,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -194,21 +195,28 @@ def _safe_directory_overlay(base: Mapping[str, str], repo_dir: Path) -> dict[str
     return overlay
 
 
-def _global_git_config_overlay(base: Mapping[str, str], agent_home: Path | None) -> dict[str, str]:
-    """`GIT_CONFIG_GLOBAL` overlay for a process that runs code from the checkout.
+def _operator_config_overlay(base: Mapping[str, str], agent_home: Path | None) -> dict[str, str]:
+    """Overlay that keeps robomp's operator's config from a process that runs code from the checkout.
 
-    With no agent home the process keeps robomp's HOME, so git would read the
-    operator's `~/.gitconfig`, a credential helper included: it reads an empty
-    file instead. With an agent home git reads that home's own config, unless
-    ``base`` (robomp's env) names a global file of its own, which would replace
-    it; an overlay cannot unset the variable, so it names the agent home's
-    `~/.gitconfig` instead.
+    Git reads a global config file, a system one and `$XDG_CONFIG_HOME/git/
+    config`, and other tools (gh, lspmux, …) read `$XDG_CONFIG_HOME` too; any
+    of them can carry a credential helper or a token. Merged over ``base``
+    (robomp's env) after the slot runtime env, which points `XDG_CONFIG_HOME`
+    at the workspace's own empty config dir:
+
+    - with no agent home the process keeps robomp's HOME, so git reads an empty
+      global file instead of the operator's `~/.gitconfig`;
+    - with an agent home both name that home's own files, as its HOME would,
+      whatever `GIT_CONFIG_GLOBAL` or `XDG_CONFIG_HOME` ``base`` sets;
+    - a `GIT_CONFIG_SYSTEM` file that ``base`` names is not read
+      (`GIT_CONFIG_NOSYSTEM`); the machine's own system config still is.
     """
-    if agent_home is None:
-        return {"GIT_CONFIG_GLOBAL": os.devnull}
-    if "GIT_CONFIG_GLOBAL" in base:
-        return {"GIT_CONFIG_GLOBAL": str(agent_home / ".gitconfig")}
-    return {}
+    overlay = {"GIT_CONFIG_GLOBAL": os.devnull if agent_home is None else str(agent_home / ".gitconfig")}
+    if agent_home is not None:
+        overlay["XDG_CONFIG_HOME"] = str(agent_home / ".config")
+    if "GIT_CONFIG_SYSTEM" in base:
+        overlay["GIT_CONFIG_NOSYSTEM"] = "1"
+    return overlay
 
 
 def _local_remote_safe_directory(remote_url: str, *, cwd: Path) -> Path | None:
@@ -498,42 +506,72 @@ def _worktrees_holding_refs(repo_dir: Path, refs: tuple[str, ...]) -> dict[str, 
     return by_ref
 
 
-def _parent_real_path(path: str | Path) -> str:
-    """``path`` made absolute, with its parent directories resolved through symlinks and its last part kept as is."""
-    head, tail = os.path.split(os.path.abspath(path))
+def _real_path(path: str | Path) -> str:
+    """``path`` made absolute, its parents resolved as the kernel walks them, its last part kept as is.
+
+    `os.path.abspath` would drop `<link>/..` as text before resolving the
+    link; the kernel and git resolve `<link>` first and go up from its target.
+    """
+    head, tail = os.path.split(os.path.join(os.getcwd(), path))
     return os.path.join(os.path.realpath(head), tail)
 
 
-def _drop_worktree_registration(
-    checkout: Path, run: Callable[[list[str]], subprocess.CompletedProcess[str]]
-) -> subprocess.CompletedProcess[str] | None:
-    """Drop the registration of ``checkout`` once its directory is gone.
+def _dead_registrations(pool: Path, matches: Callable[[str], bool]) -> list[str]:
+    """The `worktrees/<id>` entries of ``pool`` whose worktree is gone and whose resolved path ``matches``.
 
-    ``run`` runs `git <args>` in the pool. `git worktree remove --force --force
-    <path>` drops exactly that registration, locked or not (a `git` wrapper on
-    PATH may lock every `git worktree add`), with its checkout already deleted,
-    and leaves every other registration alone (measured on git 2.39.5 and
-    2.43.0). It replaces `git worktree prune`, which keeps locked
-    registrations, acts on the whole pool, and which such a wrapper may refuse.
-
-    Nothing is dropped while anything is left at ``checkout``: git would follow
-    a link there into another worktree. The registration is found among the
-    pool's by its absolute path, parents resolved, never its last part (a
-    relative path would resolve from the pool), and handed to git as git listed
-    it. Returns None when there was nothing to drop; otherwise the listing's
-    result when it failed, else the removal's, which callers check.
+    Each entry's `gitdir` (`<worktree>/.git`, as git writes it) is read as
+    bytes and its worktree resolved as git and the kernel resolve it. No
+    listing is parsed and git does not run, so one unreadable, locked or oddly
+    named entry cannot stop the others. An entry whose `gitdir` cannot be read
+    or is relative (git 2.48's `worktree.useRelativePaths`) is kept.
     """
-    target = _parent_real_path(checkout)
-    if os.path.lexists(target):
-        return None
-    listed = run(["worktree", "list", "--porcelain"])
-    if listed.returncode != 0:
-        return listed
-    for line in listed.stdout.splitlines():
-        registered = line.removeprefix("worktree ")
-        if registered != line and _parent_real_path(registered) == target:
-            return run(["worktree", "remove", "--force", "--force", registered])
-    return None
+    git_dir = _git_dir(pool)
+    if git_dir is None:
+        return []
+    try:
+        entries = list(os.scandir(git_dir / "worktrees"))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    dead: list[str] = []
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        try:
+            back = os.fsdecode(Path(entry.path, "gitdir").read_bytes().rstrip(b"\r\n"))
+        except OSError:
+            continue
+        if not back.endswith("/.git") or not os.path.isabs(back):
+            continue
+        worktree = _real_path(back.removesuffix("/.git"))
+        if not os.path.lexists(worktree) and matches(worktree):
+            dead.append(entry.path)
+    return dead
+
+
+def _drop_worktree_registration(checkout: Path, pool: Path, *, under: bool = False) -> None:
+    """Delete ``pool``'s registrations of ``checkout`` once it is gone; with ``under``, of everything below it too.
+
+    A failed remove or add leaves a registration behind, and it keeps holding
+    its branch: the next add at that path, or of that branch, fails. Every dead
+    entry whose worktree resolves to ``checkout`` is deleted, locked or not (a
+    `git` wrapper on PATH may lock every `git worktree add`), and every live
+    one, and every other dead one, is left alone. Nothing is deleted while
+    anything is left at a registered path, and git never runs: it would follow
+    a link left there into another worktree. Raises GitCommandError when an
+    entry cannot be deleted; the others are deleted first.
+    """
+    target = _real_path(checkout)
+    if not under and os.path.lexists(target):
+        return
+    prefix = target + os.sep
+    failed: list[str] = []
+    for admin in _dead_registrations(pool, lambda wt: wt == target or (under and wt.startswith(prefix))):
+        try:
+            shutil.rmtree(admin)
+        except OSError as exc:
+            failed.append(f"{admin}: {exc}")
+    if failed:
+        raise GitCommandError(["git", "worktree", "remove", str(checkout)], 1, "", "; ".join(failed))
 
 
 def _remove_worktrees(repo_dir: Path, paths: list[str]) -> None:
@@ -541,20 +579,14 @@ def _remove_worktrees(repo_dir: Path, paths: list[str]) -> None:
 
     `git worktree remove --force` deletes a checkout with its registration but
     refuses a locked one, and a killed remove can leave the registration
-    behind. Once a checkout is gone its registration is dropped exactly, and a
-    failed drop raises: a registration left behind keeps holding the ref, and
-    the next fetch fails the same way. A checkout still present after a failed
+    behind. Once a checkout is gone its registration is dropped, and a failed
+    drop raises: a registration left behind keeps holding the ref, and the
+    next fetch fails the same way. A checkout still present after a failed
     remove is left as it is and logged.
     """
-
-    def run(args: list[str]) -> subprocess.CompletedProcess[str]:
-        return _run_git(args, cwd=repo_dir, token=None)
-
     for path in paths:
-        removed = run(["worktree", "remove", "--force", path])
-        dropped = _drop_worktree_registration(Path(path), run)
-        if dropped is not None:
-            _check(dropped, list(dropped.args))
+        removed = _run_git(["worktree", "remove", "--force", path], cwd=repo_dir, token=None)
+        _drop_worktree_registration(Path(path), repo_dir)
         if removed.returncode != 0 and os.path.lexists(path):
             log.warning(
                 "failed to remove worktree during fetch repair",

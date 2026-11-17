@@ -17,8 +17,15 @@ from robomp.db import Database, close_database
 _GIT_CONFIG_SLOT = re.compile(r"GIT_CONFIG_(?:KEY|VALUE)_(\d+)")
 
 
+@pytest.fixture(scope="session")
+def _empty_xdg_config_home(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp("xdg-config")
+
+
 @pytest.fixture(autouse=True)
-def _no_inherited_git_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def _no_inherited_git_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory, _empty_xdg_config_home: Path
+) -> None:
     """Run every test without the shell's git environment or the machine's git config.
 
     Every inherited `GIT_*` variable is dropped: the `GIT_CONFIG_COUNT`/`KEY_<n>`/
@@ -29,6 +36,12 @@ def _no_inherited_git_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` and `/etc/gitconfig` are not
     read either. A test that needs git config sets it itself (`git_config`, or
     its own `GIT_CONFIG_SYSTEM`, after dropping `GIT_CONFIG_NOSYSTEM`).
+
+    Git also reads `$XDG_CONFIG_HOME/git/ignore` and `attributes` (else under
+    `~/.config/git/`) whatever `GIT_CONFIG_GLOBAL` says, so `XDG_CONFIG_HOME`
+    names an empty directory. And a temp dir inside a git work tree would make
+    git find that repository above a test's own dirs, so repository discovery
+    stops at pytest's base temp dir.
     """
     for key in list(os.environ):
         if key.startswith("GIT_"):
@@ -36,6 +49,8 @@ def _no_inherited_git_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(_empty_xdg_config_home))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path_factory.getbasetemp()))
 
 
 # Included through an inherited channel, this file gives git a credential helper
@@ -86,22 +101,6 @@ class GitConfigSeries:
             if (match := _GIT_CONFIG_SLOT.fullmatch(key)) and int(match.group(1)) >= count and value
         }
 
-    def inherit_credentials(self, include: Path, *, channel: str) -> None:
-        """Export git config that includes a credential helper and an `http.extraHeader`.
-
-        ``channel`` is `series` (`GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`) or
-        `parameters` (`GIT_CONFIG_PARAMETERS`, as `git -c` exports it).
-        """
-        include.write_text(_CREDENTIAL_INCLUDE, encoding="utf-8")
-        if channel == "series":
-            self._monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-            self._monkeypatch.setenv("GIT_CONFIG_KEY_0", "include.path")
-            self._monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(include))
-        elif channel == "parameters":
-            self._monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'include.path'='{include}'")
-        else:
-            raise ValueError(f"unknown git config channel {channel!r}")
-
     @staticmethod
     def credentials(env: Mapping[str, str], cwd: Path) -> list[str]:
         """The credential helpers and `http.extraHeader` values git reads under ``env``."""
@@ -134,31 +133,59 @@ def inherited_git_config(request: pytest.FixtureRequest, git_config: GitConfigSe
     return git_config.inherit(count, stale=stale)
 
 
-@pytest.fixture(params=["series", "parameters"])
-def inherited_credentials(request: pytest.FixtureRequest, git_config: GitConfigSeries, tmp_path: Path) -> str:
-    """Inherited git config, through ``request.param``'s channel, that names a credential helper."""
-    git_config.inherit_credentials(tmp_path / "credentials.gitconfig", channel=request.param)
-    return request.param
+@pytest.fixture(
+    params=[
+        "series",
+        "parameters",
+        "home-gitconfig",
+        "GIT_CONFIG_GLOBAL",
+        "XDG_CONFIG_HOME",
+        "home-xdg-default",
+        "GIT_CONFIG_SYSTEM",
+    ]
+)
+def operator_config_channel(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
+    """robomp's env gives git a credential helper through ``request.param``'s channel.
 
-
-@pytest.fixture(params=["home", "global-file"])
-def operator_git_config(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
-    """robomp runs with an operator's HOME whose global git config names a credential helper.
-
-    `home` keeps it in `$HOME/.gitconfig`, where git finds it with
-    `GIT_CONFIG_GLOBAL` unset; `global-file` names another file with it.
+    robomp runs with an operator's HOME and, as a deployed robomp does, no
+    `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` or `XDG_CONFIG_HOME` of its own;
+    each channel then adds the config where it puts it: `GIT_CONFIG_COUNT`/
+    `KEY_0`/`VALUE_0`, `GIT_CONFIG_PARAMETERS` (as `git -c` exports it),
+    `$HOME/.gitconfig`, a `GIT_CONFIG_GLOBAL` file, `$XDG_CONFIG_HOME/git/config`,
+    `$HOME/.config/git/config`, or a `GIT_CONFIG_SYSTEM` file.
     """
+    channel = request.param
     home = tmp_path / "operator-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    if request.param == "home":
-        (home / ".gitconfig").write_text(_CREDENTIAL_INCLUDE, encoding="utf-8")
-        monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
-    else:
-        config = home / "operator.gitconfig"
-        config.write_text(_CREDENTIAL_INCLUDE, encoding="utf-8")
-        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-    return request.param
+    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(key, raising=False)
+    credentials = tmp_path / "credentials.gitconfig"
+    credentials.write_text(_CREDENTIAL_INCLUDE, encoding="utf-8")
+
+    def plant(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_CREDENTIAL_INCLUDE, encoding="utf-8")
+
+    if channel == "series":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "include.path")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(credentials))
+    elif channel == "parameters":
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'include.path'='{credentials}'")
+    elif channel == "home-gitconfig":
+        plant(home / ".gitconfig")
+    elif channel == "GIT_CONFIG_GLOBAL":
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(credentials))
+    elif channel == "XDG_CONFIG_HOME":
+        plant(home / ".config-elsewhere" / "git" / "config")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config-elsewhere"))
+    elif channel == "home-xdg-default":
+        plant(home / ".config" / "git" / "config")
+    elif channel == "GIT_CONFIG_SYSTEM":
+        monkeypatch.delenv("GIT_CONFIG_NOSYSTEM")
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(credentials))
+    return channel
 
 
 @pytest.fixture(params=["no-agent-home", "agent-home"])

@@ -977,8 +977,11 @@ impl GitRepo {
 }
 
 /// Whether a `worktrees/<id>` administration entry may be pruned.
+///
+/// As git, `locked` and the `gitdir` target are tested without following a
+/// final symlink: a dangling link is something there, not something gone.
 fn worktree_entry_is_dead(entry: &Path) -> bool {
-	if !matches!(entry.join("locked").try_exists(), Ok(false)) {
+	if !is_not_found(fs::symlink_metadata(entry.join("locked"))) {
 		return false;
 	}
 	let back = match fs::read_to_string(entry.join("gitdir")) {
@@ -989,7 +992,13 @@ fn worktree_entry_is_dead(entry: &Path) -> bool {
 	if back.as_os_str().is_empty() {
 		return true;
 	}
-	back.is_absolute() && matches!(back.try_exists(), Ok(false))
+	back.is_absolute() && is_not_found(fs::symlink_metadata(back))
+}
+
+/// Whether a metadata lookup found nothing at its path (any other error means
+/// it cannot tell).
+fn is_not_found(metadata: io::Result<fs::Metadata>) -> bool {
+	matches!(metadata, Err(err) if err.kind() == io::ErrorKind::NotFound)
 }
 
 fn run_commit_hook(repository: &GitRepo, name: &str, args: &[&OsStr]) -> Result<()> {
@@ -2959,6 +2968,8 @@ mod tests {
 	/// `worktree_prune` drops only an entry whose checkout is known to be
 	/// gone and that nobody locked, as `git worktree prune` does: a locked
 	/// entry is a worktree on a disk that is not mounted here (another box's).
+	/// As git, it does not follow a final symlink: a dangling `locked`, or a
+	/// dangling `.git` where the checkout's `.git` was, keeps the entry.
 	#[test]
 	fn worktree_prune_keeps_locked_and_unsure_entries() {
 		let (_temp, repo) = fixture();
@@ -2983,6 +2994,17 @@ mod tests {
 		fs::write(locked.join("locked"), "on a disk that is not mounted\n").unwrap();
 		drop(dead_dir);
 		drop(locked_dir);
+		#[cfg(unix)]
+		let (dangling_lock, dangling_git, _dangling_git_dir) = {
+			let nowhere = tempfile::tempdir().unwrap().path().join("nowhere");
+			let (dangling_lock_dir, _, dangling_lock) = add("dangling-lock");
+			std::os::unix::fs::symlink(&nowhere, dangling_lock.join("locked")).unwrap();
+			drop(dangling_lock_dir);
+			let (dangling_git_dir, dangling_git_worktree, dangling_git) = add("dangling-git");
+			fs::remove_file(dangling_git_worktree.join(".git")).unwrap();
+			std::os::unix::fs::symlink(&nowhere, dangling_git_worktree.join(".git")).unwrap();
+			(dangling_lock, dangling_git, dangling_git_dir)
+		};
 		let worktrees = repo.info().common_dir.join("worktrees");
 		let relative = worktrees.join("relative");
 		fs::create_dir_all(&relative).unwrap();
@@ -2997,6 +3019,17 @@ mod tests {
 		assert!(locked.exists(), "a locked dead worktree's entry was pruned");
 		assert!(relative.exists(), "an entry with a relative gitdir was pruned");
 		assert!(!no_gitdir.exists(), "an entry with no gitdir file was kept");
+		#[cfg(unix)]
+		{
+			assert!(
+				dangling_lock.exists(),
+				"a dead worktree's entry whose `locked` is a dangling link was pruned"
+			);
+			assert!(
+				dangling_git.exists(),
+				"an entry whose checkout's `.git` is a dangling link was pruned"
+			);
+		}
 	}
 
 	#[test]

@@ -386,16 +386,6 @@ def _run(
     return proc
 
 
-def _drop_deleted_worktree(pool: Path, repo_dir: Path) -> subprocess.CompletedProcess[str] | None:
-    """Drop the pool's registration of ``repo_dir`` once its checkout is gone.
-
-    A failed remove or add leaves the registration behind, and the next add at
-    this path then fails. See `git_ops._drop_worktree_registration` for how the
-    one registration is found and dropped, and what is returned.
-    """
-    return _drop_worktree_registration(repo_dir, lambda args: _safe_run(["git", *args], cwd=pool))
-
-
 def _worktree_add(add_cmd: list[str], *, pool: Path, repo_dir: Path) -> None:
     """Run `git worktree add`, cleaning partial state on failure.
 
@@ -405,17 +395,18 @@ def _worktree_add(add_cmd: list[str], *, pool: Path, repo_dir: Path) -> None:
     behind, the event retry hits stale metadata and fails again on the same
     path. Best-effort remove the checkout and drop its registration, then
     re-raise so the retry starts from a clean path. If dropping the
-    registration itself fails (incl. a 124 timeout), raise that instead —
-    chained from the add error — since a dangling registration left behind is
-    exactly what poisons the retry.
+    registration itself fails, raise that instead — chained from the add
+    error — since a dangling registration left behind is exactly what poisons
+    the retry.
     """
     try:
         _run(add_cmd, cwd=pool)
     except GitCommandError as add_err:
         shutil.rmtree(repo_dir, ignore_errors=True)
-        dropped = _drop_deleted_worktree(pool, repo_dir)
-        if dropped is not None and dropped.returncode != 0:
-            raise GitCommandError(list(dropped.args), dropped.returncode, dropped.stdout, dropped.stderr) from add_err
+        try:
+            _drop_worktree_registration(repo_dir, pool)
+        except GitCommandError as drop_err:
+            raise drop_err from add_err
         raise
 
 
@@ -544,11 +535,15 @@ def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dic
     xdg_data = xdg_root / "data"
     xdg_state = xdg_root / "state"
     xdg_cache = xdg_root / "cache"
+    # The workspace's own, empty to start: the operator's XDG config (git's
+    # `git/config`, gh's tokens) must not reach code run from the checkout.
+    xdg_config = xdg_root / "config"
     bun_cache = xdg_cache / "bun-install"
 
     for base in (xdg_data, xdg_state, xdg_cache):
         base.mkdir(parents=True, exist_ok=True)
         (base / "omp").mkdir(parents=True, exist_ok=True)
+    xdg_config.mkdir(parents=True, exist_ok=True)
     bun_cache.mkdir(parents=True, exist_ok=True)
 
     return {
@@ -558,6 +553,7 @@ def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dic
         "XDG_DATA_HOME": str(xdg_data),
         "XDG_STATE_HOME": str(xdg_state),
         "XDG_CACHE_HOME": str(xdg_cache),
+        "XDG_CONFIG_HOME": str(xdg_config),
         "BUN_INSTALL_CACHE_DIR": str(bun_cache),
     }
 
@@ -588,6 +584,7 @@ def _provision_runtime_dirs(ws_root: Path) -> None:
         base = xdg_root / sub
         base.mkdir(parents=True, exist_ok=True)
         (base / "omp").mkdir(parents=True, exist_ok=True)
+    (xdg_root / "config").mkdir(parents=True, exist_ok=True)
     (xdg_root / "cache" / "bun-install").mkdir(parents=True, exist_ok=True)
 
 
@@ -1144,44 +1141,28 @@ class SandboxManager:
             ws_root = self.workspace_root(repo, number)
             repo_dir = ws_root / "repo"
             pool = self.pool_path(repo)
-            # `repo_dir.exists()` is not a reliable proxy for "nothing to clean
-            # up in the pool": a worktree-add or a prior remove killed mid-flight
-            # can leave the checkout gone but the pool's worktree registration
-            # dangling, which fails the next `git worktree add` for this path.
             # Only run git in a REAL pool clone: `ensure_clone` mkdir's the pool
             # dir BEFORE cloning, so a failed first clone can leave a non-git dir
             # here, and git in it would error. Mirror `ensure_clone`'s own
             # `.git`/`HEAD` validity check.
-            if (pool / ".git").exists() or (pool / "HEAD").exists():
-                needs_drop = False
-                if repo_dir.is_symlink():
-                    # The checkout was replaced by a link (the workspace is the
-                    # agent's to change). `git worktree remove` would follow it
-                    # into whatever it names, another workspace's checkout
-                    # included: drop the link, then this path's registration.
-                    repo_dir.unlink()
-                    needs_drop = True
-                elif repo_dir.exists():
-                    removed = _safe_run(["git", "worktree", "remove", "--force", str(repo_dir)], cwd=pool)
-                    if removed.returncode != 0:
-                        shutil.rmtree(repo_dir, ignore_errors=True)
-                        needs_drop = True
-                elif ws_root.exists():
-                    # Checkout gone but the workspace root remains -> a prior op
-                    # was killed mid-flight and may have left a dangling
-                    # registration. A fully-cleaned workspace has no ws_root, so
-                    # a plain repeat close runs no git at all.
-                    needs_drop = True
-                if needs_drop:
-                    dropped = _drop_deleted_worktree(pool, repo_dir)
-                    if dropped is not None and dropped.returncode != 0:
-                        # Dropping the registration is the step that clears it.
-                        # If it fails (incl. a 124 timeout), report it so the
-                        # cleanup event retries instead of recording success with
-                        # stale metadata still blocking the next add.
-                        raise GitCommandError(list(dropped.args), dropped.returncode, dropped.stdout, dropped.stderr)
+            is_pool = (pool / ".git").exists() or (pool / "HEAD").exists()
+            # The workspace is the agent's to change: a link left at repo_dir
+            # would take `git worktree remove` into whatever it names, another
+            # workspace's checkout included, so only a real directory goes to
+            # git. Whatever git refuses or leaves goes with the rmtree below.
+            if is_pool and not repo_dir.is_symlink() and repo_dir.is_dir():
+                _safe_run(["git", "worktree", "remove", "--force", str(repo_dir)], cwd=pool)
             if ws_root.exists():
                 shutil.rmtree(ws_root, ignore_errors=True)
+            if is_pool:
+                # Every worktree under the workspace root was its own: the
+                # checkout a failed or killed remove left, and any the agent
+                # added inside it. A registration left behind keeps holding its
+                # branch and fails the next add, so drop each one now gone; if
+                # that fails, raise so the cleanup event retries (this runs
+                # again with ws_root already gone). Without a dead registration
+                # under ws_root (a repeat close) it deletes nothing.
+                _drop_worktree_registration(ws_root, pool, under=True)
 
     def reclaim_workspace_caches(self, *, repo: str, number: int | str) -> bool:
         """Strip re-creatable dependency caches from an idle workspace.

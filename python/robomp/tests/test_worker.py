@@ -424,38 +424,49 @@ async def test_run_rpc_replaces_inherited_git_config_with_safe_directory(
 
 
 @pytest.mark.asyncio
-async def test_run_rpc_keeps_inherited_credential_config_from_the_agent(
-    tmp_path: Path, settings: Settings, git_config: GitConfigSeries, inherited_credentials: str
-) -> None:
-    # robomp's own git config names a credential helper and an Authorization
-    # header; git, run in the agent's env, must see neither.
-    agent_env, inputs = _agent_env(tmp_path, settings)
-
-    assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the inherited config"
-    assert git_config.credentials(agent_env, tmp_path) == []
-    assert git_config.entries(agent_env) == [("safe.directory", str(inputs.workspace.repo_dir))]
-
-
-@pytest.mark.asyncio
-async def test_run_rpc_keeps_the_operator_global_git_config_from_the_agent(
+async def test_run_rpc_keeps_the_operator_credential_config_from_the_agent(
     tmp_path: Path,
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     git_config: GitConfigSeries,
-    operator_git_config: str,
+    operator_config_channel: str,
     agent_home: Path,
 ) -> None:
-    # robomp's HOME holds the operator's global git config, a credential helper
-    # included. With no agent home the agent keeps that HOME and must read an
-    # empty global config; with one it reads the agent home's own config only.
+    # The agent runs code from the checkout. robomp's env names a credential
+    # helper and an Authorization header through each of seven channels; git,
+    # run in the agent's env, must see neither, with or without an agent home.
+    # With one it reads that home's own config.
     monkeypatch.setattr(worker, "_AGENT_HOME", agent_home)
 
-    agent_env, _ = _agent_env(tmp_path, settings)
+    agent_env, inputs = _agent_env(tmp_path, settings)
 
     assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the operator's config"
     assert git_config.credentials(agent_env, tmp_path) == []
+    assert git_config.entries(agent_env) == [("safe.directory", str(inputs.workspace.repo_dir))]
     expected_user = git_config.AGENT_HOME_USER if agent_home.is_dir() else None
     assert git_config.get(agent_env, tmp_path, "user.name") == expected_user
+
+
+_CREDENTIAL_ENV = {
+    "GH_TOKEN": "probe-gh-token",
+    "GIT_ASKPASS": "/probe/askpass",
+    "SSH_ASKPASS": "/probe/ssh-askpass",
+    "SSH_AUTH_SOCK": "/probe/agent.sock",
+}
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_keeps_credential_variables_from_the_agent(
+    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A token, a credential prompt program or the operator's ssh agent in
+    # robomp's env would let code from the checkout authenticate as robomp.
+    for key, value in _CREDENTIAL_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    agent_env, _ = _agent_env(tmp_path, settings)
+
+    assert {key: agent_env.get(key) for key in _CREDENTIAL_ENV} == dict.fromkeys(_CREDENTIAL_ENV, "")
 
 
 @pytest.mark.asyncio

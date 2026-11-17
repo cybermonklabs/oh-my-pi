@@ -36,7 +36,7 @@ from robomp import host_tools, persona, pragmas
 from robomp.cancellation import register_cancel_hook, unregister_cancel_hook
 from robomp.config import Settings
 from robomp.db import Database, issue_key
-from robomp.git_ops import DirtyState, _global_git_config_overlay, _safe_directory_overlay, inspect_dirty_state
+from robomp.git_ops import DirtyState, _operator_config_overlay, _safe_directory_overlay, inspect_dirty_state
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import CommentInfo, IssueInfo, PullRequestInfo, RepoInfo
 from robomp.host_tools import AbortController, ReleaseToolContext, ToolBindings, _git_identity_env
@@ -128,11 +128,17 @@ def _resolve_pragma_overrides(
 
 _SCRUBBED_ENV_KEYS: tuple[str, ...] = (
     # Secrets that MUST NOT reach the agent subprocess; an agent with the
-    # `bash` tool could otherwise `printenv` them out of roboomp's env.
+    # `bash` tool could otherwise `printenv` them out of roboomp's env, or have
+    # git or ssh use them: a token, a credential prompt program, the operator's
+    # ssh agent.
     "GITHUB_TOKEN",
+    "GH_TOKEN",
     "GITHUB_WEBHOOK_SECRET",
     "ROBOMP_REPLAY_TOKEN",
     "ROBOMP_GH_PROXY_HMAC_KEY",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "SSH_AUTH_SOCK",
 )
 
 _AGENT_HOME = Path("/srv/agent-home")
@@ -242,13 +248,15 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     # (x-omp-app) so broker-side per-client burn tracking shows `robomp`
     # instead of an anonymous gateway client.
     env["OMP_APP_NAME"] = "robomp"
-    agent_home = _AGENT_HOME if _AGENT_HOME.is_dir() else None
+    agent_home = _agent_home()
     if agent_home is not None:
         env["HOME"] = str(agent_home)
-    # Without an agent home the agent keeps robomp's HOME: the operator's
-    # ~/.gitconfig, credential helper included, must not reach it.
-    env.update(_global_git_config_overlay(os.environ, agent_home))
     return env
+
+
+def _agent_home() -> Path | None:
+    """The agent's own HOME, when the image provides one."""
+    return _AGENT_HOME if _AGENT_HOME.is_dir() else None
 
 
 _TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"gh_open_pr", "mark_unable_to_reproduce", "abort_task"})
@@ -599,8 +607,11 @@ def _run_rpc_blocking(
 
     rpc_env = _build_extra_env(settings)
     rpc_env.update(_prepare_slot_runtime_env(inputs.workspace, inputs.slot_uid))
-    # omp_rpc starts the agent with `{**os.environ, **rpc_env}`; the overlay
-    # blanks robomp's own git config env and leaves only safe.directory.
+    # omp_rpc starts the agent with `{**os.environ, **rpc_env}`. Merged after
+    # the runtime env (whose XDG_CONFIG_HOME is the workspace's own empty dir),
+    # these keep robomp's operator's git and XDG config from the agent, and
+    # leave safe.directory as the only git config entry it inherits.
+    rpc_env.update(_operator_config_overlay(os.environ, _agent_home()))
     rpc_env.update(_safe_directory_overlay(os.environ, bindings.workspace.repo_dir))
     rpc_env.update(_git_identity_env(inputs.settings.resolved_author_name, inputs.settings.git_author_email))
     # Bare worktrees have no node_modules; install (idempotently) so the agent
