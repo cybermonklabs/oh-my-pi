@@ -491,7 +491,8 @@ a revived agent's turn the lifecycle teardown disposes.
 
 1. **Subagents first.** Every persisted subagent transcript under the session
    (`<session>/<AgentId>.jsonl`, nested ones included) that its process left
-   mid-turn, that was not killed (no tombstone) and that a cold revive can rebuild
+   mid-turn, or whose turn ended because its provider key could not be resolved
+   (see below), that was not killed (no tombstone) and that a cold revive can rebuild
    (a `session_init` contract, not isolated) runs one more monitored turn as a
    background job of its parent, under the subagent's id. The lifecycle reviver
    rebuilds it from its transcript, the turn goes on as below, and the parent
@@ -505,7 +506,13 @@ a revived agent's turn the lifecycle teardown disposes.
    call was cut off runs again; otherwise the model answers from where the
    transcript stops.
 
-Nothing is continued when the last turn finished, failed, or the user interrupted
+A turn that ended because no request could resolve its provider key, even after
+its retries (a `!command` apiKey that produced nothing, stored credentials that
+were disabled or cannot serve, an OAuth account pool with no account that can
+serve, a failed OAuth refresh), is retried too, whatever exit followed it:
+nothing was sent, and a subagent's process exits normally on such a turn.
+
+Nothing else is continued when the last turn finished, failed, or the user interrupted
 it, or when a normal exit was recorded after it (the user quit with it
 interrupted). `--restore` is interactive only, takes no prompt, and cannot be
 combined with `--continue`, `--fork`, imports, `--goal` or `--no-session`.
