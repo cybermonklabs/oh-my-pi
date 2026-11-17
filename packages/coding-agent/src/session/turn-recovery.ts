@@ -245,6 +245,21 @@ function toolReplayStart(messages: readonly AgentMessage[]): number | undefined 
 	return start;
 }
 
+/**
+ * Whether a usage read says the model's usage is spent: the pool is
+ * `depleted`, it lists at least one account, and usage holds every account (an
+ * exhausted quota window or a usage-limit block). An empty pool (the plan gate
+ * filtered every account out) is not spent. A pool where an account-policy,
+ * model-policy or 401 block holds any account is not spent either.
+ */
+function isUsageSpent(health: ModelUsageHealth): boolean {
+	return (
+		health.state === "depleted" &&
+		health.accounts.length > 0 &&
+		health.accounts.every(account => account.depletedBy === "usage")
+	);
+}
+
 /** Result shape shared with automatic maintenance recovery. */
 export interface RecoveryCompactionResult {
 	continuationScheduled: boolean;
@@ -2105,6 +2120,45 @@ export class TurnRecovery {
 		});
 	}
 
+	/**
+	 * Reads the usage health of one fallback candidate. The fallback before a
+	 * turn and the fallback walk after a failed request both use it, so the two
+	 * read an account the same way. A healthy read releases a sticky account that
+	 * is not healthy when a sibling account is healthy. Answers the read,
+	 * `undefined` when the read throws (unknown usage fails open), or `"stale"`
+	 * when `stale()` is true after the read.
+	 */
+	async #readCandidateUsage(
+		candidateModel: Model,
+		stale: () => boolean,
+		signal?: AbortSignal,
+	): Promise<ModelUsageHealth | "stale" | undefined> {
+		try {
+			const candidateHealth = await this.#host.modelRegistry.authStorage.health.model(candidateModel.provider, {
+				modelId: candidateModel.id,
+				sessionId: this.#host.sessionId(),
+				baseUrl: candidateModel.baseUrl,
+				reserveFraction: cfgRetryUsageReservePct.get(this.#host.settings) / 100,
+				signal,
+			});
+			if (stale()) return "stale";
+			if (candidateHealth.state === "healthy") {
+				const selected = candidateHealth.accounts.find(account => account.selected);
+				if (
+					selected &&
+					selected.state !== "healthy" &&
+					candidateHealth.accounts.some(account => account.state === "healthy")
+				) {
+					this.#host.modelRegistry.authStorage.sessions.release(candidateModel.provider, this.#host.sessionId());
+				}
+			}
+			return candidateHealth;
+		} catch {
+			// Unknown usage fails open for an otherwise valid fallback.
+			return stale() ? "stale" : undefined;
+		}
+	}
+
 	/** First keyed, eligible fallback candidate; undefined when none or when the walk went stale. */
 	async #findKeyedRetryFallback(
 		currentSelector: string,
@@ -2123,36 +2177,9 @@ export class TurnRecovery {
 				// Skip a candidate whose window cannot hold the live context so we
 				// never switch onto an oversized request (issue #8065).
 				if (!this.#host.contextFitsModel(candidateModel)) continue;
-				try {
-					const candidateHealth = await this.#host.modelRegistry.authStorage.health.model(
-						candidateModel.provider,
-						{
-							modelId: candidateModel.id,
-							sessionId: this.#host.sessionId(),
-							baseUrl: candidateModel.baseUrl,
-							reserveFraction: cfgRetryUsageReservePct.get(this.#host.settings) / 100,
-							signal,
-						},
-					);
-					if (stale()) return undefined;
-					if (candidateHealth.state === "depleted" || candidateHealth.state === "reserve") continue;
-					if (candidateHealth.state === "healthy") {
-						const selected = candidateHealth.accounts.find(account => account.selected);
-						if (
-							selected &&
-							selected.state !== "healthy" &&
-							candidateHealth.accounts.some(account => account.state === "healthy")
-						) {
-							this.#host.modelRegistry.authStorage.sessions.release(
-								candidateModel.provider,
-								this.#host.sessionId(),
-							);
-						}
-					}
-				} catch {
-					if (stale()) return undefined;
-					// Unknown usage fails open for an otherwise valid fallback.
-				}
+				const candidateHealth = await this.#readCandidateUsage(candidateModel, stale, signal);
+				if (candidateHealth === "stale") return undefined;
+				if (candidateHealth?.state === "depleted" || candidateHealth?.state === "reserve") continue;
 				if (stale()) return undefined;
 				let apiKey: string | undefined;
 				try {
@@ -2336,6 +2363,18 @@ export class TurnRecovery {
 			!!sourceModel &&
 			sourceModel.provider === latestAssistant.provider &&
 			sourceModel.id === latestAssistant.model;
+		// Read once, so one walk applies one rule to every candidate.
+		const usageAwareFallback = cfgRetryUsageAwareFallback.get(this.#host.settings);
+		const generation = this.#host.promptGeneration();
+		// The usage reads of this walk share one controller, made at the first
+		// read. It is the retry controller while a read runs, so abortRetry()
+		// stops the read. A stale read ends the walk with no switch.
+		let usageReadController: AbortController | undefined;
+		const usageReadStale = (): boolean =>
+			usageReadController?.signal.aborted === true ||
+			this.#host.abortInProgress() ||
+			this.#host.promptGeneration() !== generation ||
+			!modelsAreEqual(this.#host.model(), sourceModel);
 		for (const role of this.retryFallbackChainKeys(currentSelector)) {
 			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
 				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
@@ -2413,6 +2452,29 @@ export class TurnRecovery {
 				// unexecuted-tool turns remain part of the request (issue #8065).
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
 					continue;
+				}
+				// With retry.usageAwareFallback on, skip a candidate whose usage is
+				// spent, as the fallback before a turn does. A request to it gets a
+				// usage-limit answer, and key selection gives back a blocked account
+				// as a last resort, so the key probe below does not stop it. A short
+				// account-policy or 401 block is not spent usage: it lasts about a
+				// minute and covers every model of the provider, and the refusal
+				// steps must still reach the other accounts and models of the provider.
+				if (usageAwareFallback) {
+					usageReadController ??= new AbortController();
+					this.#retryAbortController?.abort();
+					this.#retryAbortController = usageReadController;
+					try {
+						const candidateUsage = await this.#readCandidateUsage(
+							candidate,
+							usageReadStale,
+							usageReadController.signal,
+						);
+						if (candidateUsage === "stale") return false;
+						if (candidateUsage && isUsageSpent(candidateUsage)) continue;
+					} finally {
+						if (this.#retryAbortController === usageReadController) this.#retryAbortController = undefined;
+					}
 				}
 				// A session restricted to an OAuth account pool throws for a provider
 				// none of its pooled accounts can serve; that candidate is unavailable,
