@@ -518,11 +518,26 @@ A turn that ended because no request could resolve its provider key, even after
 its retries (a `!command` apiKey that produced nothing, stored credentials that
 were disabled or cannot serve, an OAuth account pool with no account that can
 serve, a failed OAuth refresh), is retried too, whatever exit followed it:
-nothing was sent, and a subagent's process exits normally on such a turn. A turn
-the user stopped while it waited to retry (Esc, or an RPC `abort` or `abort_retry`)
-is not: the stop ends it with an aborted record ("Retry cancelled") after its failed
-attempt. A process exit during that wait cuts the turn off instead, and `--restore`
-goes on with it.
+nothing was sent, and a subagent's process exits normally on such a turn.
+
+An abort while such a turn waits to retry ends it or leaves it by who gets its
+result:
+
+- A stop by whoever gets the result ends the turn with an aborted record ("Retry
+  cancelled") after its failed attempt, and `--restore` leaves it: the user's stop
+  (Esc, or an RPC `abort` or `abort_retry`), or the task executor ending a
+  subagent's run (its request budget, its time limit, or a `yield` that waits on
+  its jobs), whose parent gets the aborted result. The owner's cancel of a
+  background job stops the subagent the job runs.
+- A process exit or shutdown cuts the turn off instead, and `--restore` goes on
+  with it: the session's dispose (a quit, a signal, `/restart`), an abort with
+  `cutOff` or with `INTERRUPTED_TURN_ERROR` (the reason a shutdown gives), and the
+  owner's shutdown of its subagents.
+- A sync subagent follows its parent's turn, whose abort reason says which it is:
+  any stop of the parent (the user's, one the session makes itself such as `/new`,
+  or the task executor's stop of a parent subagent) stops it too, and the
+  parent's process exit or shutdown cuts it off. An abort reason that says
+  neither cuts it off.
 
 Nothing else is continued when the last turn finished, failed, or the user interrupted
 it, or when a normal exit was recorded after it (the user quit with it
