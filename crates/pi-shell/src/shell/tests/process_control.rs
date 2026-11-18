@@ -905,9 +905,9 @@ async fn stopped_interactive_job_stops_every_pipeline_stage() {
 		.await
 		.expect("background pipeline");
 	assert_eq!(exit_code(&started), 0, "starting the background pipeline");
-	let mut pids = Vec::with_capacity(pidfiles.len());
-	for pidfile in &pidfiles {
-		pids.push(wait_for_pidfile(pidfile).await);
+	let mut stages = Vec::with_capacity(pidfiles.len());
+	for (pidfile, program) in pidfiles.iter().zip(["yes", "cat"]) {
+		stages.push(wait_until_running(wait_for_pidfile(pidfile).await, program).await);
 	}
 
 	let stopped = session
@@ -915,8 +915,8 @@ async fn stopped_interactive_job_stops_every_pipeline_stage() {
 		.await
 		.expect("stop the job");
 	assert_eq!(exit_code(&stopped), 0);
-	for &pid in &pids {
-		wait_until_stopped(&pinned_process(pid)).await;
+	for stage in &stages {
+		wait_until_stopped(stage).await;
 	}
 	let jobs = tempfile::tempfile().expect("jobs capture");
 	session
@@ -1068,13 +1068,13 @@ async fn wait_reports_a_stop_that_precedes_the_wait() {
 		.await
 		.expect("background job");
 	assert_eq!(exit_code(&started), 0);
-	let pid = wait_for_pidfile(&pidfile).await;
+	let job = wait_until_running(wait_for_pidfile(&pidfile).await, "sleep").await;
 	let stopped = session
 		.run_test("kill -STOP %1", &stdio)
 		.await
 		.expect("stop the job");
 	assert_eq!(exit_code(&stopped), 0);
-	wait_until_stopped(&pinned_process(pid)).await;
+	wait_until_stopped(&job).await;
 
 	let waited = time::timeout(Duration::from_secs(20), session.run_test("wait %1", &stdio))
 		.await
@@ -1167,6 +1167,21 @@ fn is_stopped(process: &ProcInfo) -> bool {
 #[cfg(unix)]
 async fn wait_until_stopped(process: &ProcInfo) {
 	while !is_stopped(process) {
+		time::sleep(Duration::from_millis(10)).await;
+	}
+}
+
+/// Waits until `pid` runs `program`, the program its `sh` execs, and pins
+/// it. Only then may a test stop it: gVisor's `execve` discards the stop
+/// signals still pending when it replaces the image (Linux keeps them, and
+/// the program stops on its way out of `execve`), so a job stopped during
+/// the exec would run on, and the wait for its stop would never end.
+#[cfg(unix)]
+async fn wait_until_running(pid: i32, program: &str) -> ProcInfo {
+	loop {
+		if let Some(process) = proc::info(pid).filter(|process| process.name == program) {
+			return process;
+		}
 		time::sleep(Duration::from_millis(10)).await;
 	}
 }

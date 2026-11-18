@@ -674,7 +674,13 @@ fn stop_and_cont_reach_every_member_of_the_group() {
 	let a = sh("/bin/sleep 30 & /bin/sleep 30 & wait");
 	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
-	until("three members", || live_group(group).len() == 3);
+	// Both sleeps run `sleep` before the stop: gVisor's `execve` discards a
+	// stop signal still pending when it replaces the image (Linux keeps it),
+	// so a member stopped during its exec would run on.
+	until("three members, both sleeps exec'd", || {
+		let members = live_group(group);
+		members.len() == 3 && members.iter().filter(|m| m.name == "sleep").count() == 2
+	});
 	p.stop().unwrap();
 	until("all stopped", || {
 		live_group(group)
