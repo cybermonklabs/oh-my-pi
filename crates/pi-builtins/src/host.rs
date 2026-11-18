@@ -2174,11 +2174,36 @@ impl Opened {
 	}
 }
 
-/// Writes `text` to the descriptor `file` when it is open, ignoring failures:
-/// the diagnostics of an invocation that ends before it has a [`Host`].
-fn write_to(file: Option<&OpenFile>, text: std::fmt::Arguments<'_>) {
-	if let Some(file) = file {
-		let _ = file.clone().write_fmt(text);
+/// How an invocation ends before its body runs: its exit status, and the
+/// text it reports (a usage error, `--help`, a stream it cannot open) with the
+/// descriptor that text goes to.
+///
+/// [`Early::finish`] writes the text through the async output sinks. The
+/// descriptor can be a provider file (an engine pipe, `$(…)`), whose blocking
+/// write would hold the runtime thread the adapter runs on, and panics on a
+/// current-thread runtime.
+struct Early {
+	code:   i32,
+	report: Option<(OpenFile, String)>,
+}
+
+impl Early {
+	/// Ends with `code` and reports nothing.
+	const fn status(code: i32) -> Self {
+		Self { code, report: None }
+	}
+
+	/// Ends with `code` after writing `text` to `file`, when it is open.
+	fn report(code: i32, file: Option<&OpenFile>, text: String) -> Self {
+		Self { code, report: file.map(|file| (file.clone(), text)) }
+	}
+
+	/// Writes the report, ignoring failures, and returns the exit status.
+	async fn finish(self) -> i32 {
+		if let Some((file, text)) = self.report {
+			report_async(Some(file), text).await;
+		}
+		self.code
 	}
 }
 
@@ -2190,7 +2215,7 @@ pub(crate) async fn run_utility<U: Utility>(invocation: Invocation) -> i32 {
 	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
 		match prepare::<U>(invocation, spec) {
 			Ok(prepared) => prepared,
-			Err(code) => return code,
+			Err(early) => return early.finish().await,
 		};
 
 	let handle = tokio::task::spawn_blocking(move || {
@@ -2215,7 +2240,7 @@ pub(crate) async fn run_async_utility<U: AsyncUtility>(invocation: Invocation) -
 	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
 		match prepare::<U>(invocation, spec) {
 			Ok(prepared) => prepared,
-			Err(code) => return code,
+			Err(early) => return early.finish().await,
 		};
 
 	// On cancel the body is dropped, which cancels whatever it awaits.
@@ -2240,7 +2265,7 @@ struct Prepared<P> {
 /// Rewrites and parses `argv` and builds the host. `Err` carries the exit
 /// status when the invocation ends early (usage error, `--help`, host
 /// failure).
-fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, i32> {
+fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, Early> {
 	let mut invocation = invocation.open(spec.name);
 	let argv: Vec<OsString> = std::mem::take(&mut invocation.argv).into_iter().map(OsString::from).collect();
 	let [_, stdout, stderr] = &invocation.stdio;
@@ -2248,8 +2273,8 @@ fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepar
 	let argv = match (spec.rewrite_argv)(argv) {
 		Ok(argv) => argv,
 		Err(message) => {
-			write_to(stderr.as_ref(), format_args!("{}: {message}\n", spec.name));
-			return Err(spec.usage_error.into());
+			let text = format!("{}: {message}\n", spec.name);
+			return Err(Early::report(spec.usage_error.into(), stderr.as_ref(), text));
 		},
 	};
 
@@ -2258,12 +2283,11 @@ fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepar
 		Err(err) => {
 			// clap reports `--help` and `--version` as errors; those belong on
 			// stdout with a success status, everything else on stderr.
-			if err.use_stderr() {
-				write_to(stderr.as_ref(), format_args!("{err}"));
-				return Err(spec.usage_error.into());
-			}
-			write_to(stdout.as_ref(), format_args!("{err}"));
-			return Err(0);
+			return Err(if err.use_stderr() {
+				Early::report(spec.usage_error.into(), stderr.as_ref(), err.to_string())
+			} else {
+				Early::report(0, stdout.as_ref(), err.to_string())
+			});
 		},
 	};
 
@@ -2460,7 +2484,7 @@ fn settle(name: &str, outcome: std::thread::Result<i32>, host: &mut Host) -> i32
 /// environment into an owned [`Host`] that can move to a blocking thread.
 /// `Err` carries the exit status when a closed descriptor cannot be backed by
 /// the null device.
-fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
+fn build_host(invocation: Opened, spec: Spec) -> Result<Host, Early> {
 	let Spec { checks_stdout_path, owns_cancellation, async_io, .. } = spec;
 	let paths = invocation.paths();
 	let Opened {
@@ -2469,12 +2493,12 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
 	let (stdin, stdout, stderr_file) = match (or_null(stdin), or_null(stdout), or_null(stderr_file)) {
 		(Ok(stdin), Ok(stdout), Ok(stderr_file)) => (stdin, stdout, stderr_file),
 		(stdin, stdout, stderr_file) => {
-			if let Ok(stderr_file) = &stderr_file
-				&& let Some(error) = stdin.err().or(stdout.err())
-			{
-				write_to(Some(stderr_file), format_args!("{invoked}: {error}\n"));
-			}
-			return Err(1);
+			return Err(match (&stderr_file, stdin.err().or(stdout.err())) {
+				(Ok(stderr_file), Some(error)) => {
+					Early::report(1, Some(stderr_file), format!("{invoked}: {error}\n"))
+				},
+				_ => Early::status(1),
+			});
 		},
 	};
 	// The `OpenFile` is kept alive by the `Stdin` below, so the fd stays valid.

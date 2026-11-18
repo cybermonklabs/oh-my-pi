@@ -199,6 +199,101 @@ async fn grep_and_rg_check_their_output_file_on_a_current_thread_runtime() {
 	);
 }
 
+/// Runs `script` in a fresh directory holding `d/f` (`x`, `y`) on the
+/// calling (current-thread) runtime and returns its status and output.
+#[cfg(unix)]
+async fn run_in_tree(script: &str) -> (Option<i32>, String) {
+	let root = tempfile::tempdir().expect("scratch directory");
+	std::fs::create_dir(root.path().join("d")).expect("create d");
+	std::fs::write(root.path().join("d/f"), "x\ny\n").expect("write d/f");
+	let _guard = shell_test_lock().lock().await;
+	let (result, output) = time::timeout(
+		Duration::from_secs(10),
+		capture_unlocked(script, Some(root.path()), None, CancelToken::default()),
+	)
+	.await
+	.expect("the session must not block the runtime's only thread");
+	(result.exit_code, output)
+}
+
+/// rg's `--line-buffered` and `--no-line-buffered` wrote through a raw
+/// writer over stdout, which on an engine pipe is a provider file: its
+/// blocking write panicked on a current-thread runtime, and rg printed
+/// `rg: internal error` instead of its matches.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn rg_line_buffering_modes_reach_a_pipe_on_a_current_thread_runtime() {
+	let ran = run_in_tree(concat!(
+		"rg --line-buffered x d/f | cat\n",
+		"rg --no-line-buffered x d/f | cat\n",
+		"printf 'x\\n' | rg --line-buffered x | cat\n",
+		"rg --line-buffered --files d | cat\n",
+	))
+	.await;
+	assert_eq!(ran, (Some(0), "x\nx\nx\nd/f\n".to_string()));
+}
+
+/// A utility's `--help`, `--version` and usage error were written before its
+/// body ran, with a blocking write on the runtime thread: into an engine pipe
+/// or `$(…)` that panicked on a current-thread runtime, so nothing was
+/// printed and the command failed.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn early_output_of_a_utility_reaches_a_pipe_on_a_current_thread_runtime() {
+	let ran = run_in_tree(concat!(
+		"grep --help | { read -r l && echo grep-help; }\n",
+		"cat --version | { read -r l && echo cat-version; }\n",
+		"grep --bogus 2>&1 | { read -r l && echo grep-usage; }\n",
+		"v=$(grep -V) && [ -n \"$v\" ] && echo grep-version\n",
+		"rg --help | { read -r l && echo rg-help; }\n",
+	))
+	.await;
+	assert_eq!(
+		ran,
+		(Some(0), "grep-help\ncat-version\ngrep-usage\ngrep-version\nrg-help\n".to_string())
+	);
+}
+
+/// find's own `-help` and `-version` wrote to the raw stdout from its async
+/// body: into an engine pipe that panicked on a current-thread runtime
+/// (`find: internal error`).
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn find_help_and_version_reach_a_pipe_on_a_current_thread_runtime() {
+	let ran = run_in_tree(concat!(
+		"find -version | cat\n",
+		"find -help | { read -r l && echo \"$l\"; }\n",
+	))
+	.await;
+	assert_eq!(
+		ran,
+		(Some(0), "find (Rust) 0.8.0\nUsage: find [path...] [expression]\n".to_string())
+	);
+}
+
+/// `-t` resolved a terminal name with a blocking filesystem query. For a
+/// descriptor path whose descriptor is an engine pipe the query goes to a
+/// provider, which panicked on a current-thread runtime: no output, status 1,
+/// where a multi-thread runtime reports the unknown terminal.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_terminal_named_by_a_descriptor_path_resolves_on_a_current_thread_runtime() {
+	let (status, output) = run_in_tree(concat!(
+		"echo | ps -t omp-descriptor://0 2>&1 | cat\n",
+		"echo | pgrep -t omp-descriptor://0 sleep 2>&1 | cat\n",
+	))
+	.await;
+	assert_eq!(status, Some(0), "{output}");
+	assert!(output.contains("ps: unknown terminal 'omp-descriptor://0'"), "{output}");
+	assert_eq!(
+		output
+			.matches("unknown terminal 'omp-descriptor://0'")
+			.count(),
+		2,
+		"{output}"
+	);
+}
+
 /// A background external command's FIFO redirect is opened by its child,
 /// as in bash: the parent shell spawned it and then waited for the FIFO's
 /// other end, which was the next command, so `/bin/cat < f & echo one > f`

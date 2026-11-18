@@ -40,7 +40,7 @@ use crate::grep::{
 	MAX_LINE_BYTES, RecordFormat, SEARCH_HEAP_LIMIT, bound_terminator, check_run,
 	describe_search_error, exit_status, for_each_nonempty_match,
 };
-use crate::host::{AsyncUtility, Host, StdoutFile, StreamWriter, forward_slash_display};
+use crate::host::{AsyncUtility, Host, StdoutFile, forward_slash_display};
 use crate::stdio;
 
 use ignore::{
@@ -2247,13 +2247,11 @@ impl AsyncUtility for Rg {
 		let _ = writeln!(host.stderr, "rg: --json cannot be combined with summary modes");
 		return 2;
 	}
-	let mut out = if cli.line_buffered && !cli.no_line_buffered {
-		StreamWriter::line(host.stdout_clone())
-	} else if cli.no_line_buffered {
-		StreamWriter::block(host.stdout_clone())
-	} else {
-		host.stdout_writer()
-	};
+	// Every mode writes through the async stdout sink. A raw writer over
+	// `host.stdout` blocks on a provider file (an engine pipe), which panics on
+	// a current-thread runtime. `--line-buffered` output is delivered after each
+	// file and each chunk of standard input, as grep's is.
+	let mut out = host.stdout_writer();
 	let (patterns, mut paths) = match resolve_patterns(host, &cli).await {
 		Ok(resolved) => resolved,
 		Err(error) => {

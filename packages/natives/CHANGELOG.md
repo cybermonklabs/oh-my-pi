@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `grep` and `rg` no longer end with `internal error` and print nothing when a shell running on a single-threaded runtime (the Windows fallback when no worker thread can start) pipes their input or output to another command
+- On a shell running on a single-threaded runtime (the Windows fallback when no worker thread can start), a pipe or `$(…)` on a builtin's input or output no longer ends `grep`, `rg` (also with `--line-buffered`) or `find -help`/`-version` with `internal error`, loses every utility's `--help`, `--version` and usage errors, or breaks `ps`/`pgrep`/`pkill`/`pidwait -t` given a descriptor or virtual path
 
 ## [18.18.6] - 2026-11-09
 
