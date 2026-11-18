@@ -159,28 +159,33 @@ describe.skipIf(process.platform === "win32")("run-rs-task.ts check:rs", () => {
 const ECHO_TOOLCHAIN_CARGO = '#!/bin/sh\necho "cargo-stub toolchain=$RUSTUP_TOOLCHAIN $*"\n';
 
 /**
- * A fixture whose `rustup which cargo` names a cargo inside a rustup-shaped
- * toolchain directory; that cargo prints the RUSTUP_TOOLCHAIN it sees, which
- * is what cargo's rustup-proxied `fmt` and `clippy` subcommands would obey.
+ * A fixture whose `rustup which cargo` behaves as rustup does: it names the
+ * cargo of the toolchain RUSTUP_TOOLCHAIN gives when that is set, else the
+ * cargo of `toolchain`, the repository's pin. Each cargo sits in a
+ * rustup-shaped toolchain directory and prints the RUSTUP_TOOLCHAIN it sees,
+ * which is what cargo's rustup-proxied `fmt` and `clippy` subcommands obey.
  */
 async function makeToolchainFixture(toolchain: string): Promise<Fixture> {
 	const fixture = await makeFixture();
-	const cargo = path.join(fixture.root, "rustup-home", "toolchains", toolchain, "bin", "cargo");
-	await writeExecutable(cargo, ECHO_TOOLCHAIN_CARGO);
+	const toolchains = path.join(fixture.root, "rustup-home", "toolchains");
+	for (const name of [toolchain, "1.98.0"]) {
+		await writeExecutable(path.join(toolchains, name, "bin", "cargo"), ECHO_TOOLCHAIN_CARGO);
+	}
 	await writeExecutable(
 		path.join(fixture.shimDir, "rustup"),
-		`#!/bin/sh\n[ "$1 $2" = "which cargo" ] && { echo ${JSON.stringify(cargo)}; exit 0; }\nexit 1\n`,
+		`#!/bin/sh\n[ "$1 $2" = "which cargo" ] || exit 1\necho ${JSON.stringify(toolchains)}/\${RUSTUP_TOOLCHAIN:-${toolchain}}/bin/cargo\n`,
 	);
 	return fixture;
 }
 
 describe.skipIf(process.platform === "win32")("run-rs-task.ts toolchain", () => {
 	// Failure mode: a shell carries RUSTUP_TOOLCHAIN (mise exports its global rust
-	// pin), the script runs the repository's pinned cargo, and cargo's rustup
-	// proxies run the other toolchain's rustfmt and clippy, so `check:rs` reports
-	// format drift in files nobody touched.
+	// pin). rustup obeys it over `rust-toolchain.toml`, so `rustup which cargo`
+	// names that toolchain's cargo, and cargo's rustup proxies run its rustfmt and
+	// clippy too: `check:rs` reports format drift in files nobody touched, or the
+	// build fails on the pinned nightly's features.
 	test(
-		"every cargo command runs under the toolchain of the cargo it resolved, not the caller's",
+		"every cargo command runs the repository's pinned toolchain, not the caller's",
 		async () => {
 			const pinned = "nightly-2099-01-01-x86_64-unknown-linux-gnu";
 			const fixture = await makeToolchainFixture(pinned);
@@ -204,10 +209,7 @@ describe.skipIf(process.platform === "win32")("run-rs-task.ts toolchain", () => 
 		"a cargo found on PATH leaves the caller's RUSTUP_TOOLCHAIN alone",
 		async () => {
 			const fixture = await makeFixture();
-			await writeExecutable(
-				path.join(fixture.shimDir, "cargo"),
-				ECHO_TOOLCHAIN_CARGO,
-			);
+			await writeExecutable(path.join(fixture.shimDir, "cargo"), ECHO_TOOLCHAIN_CARGO);
 
 			const result = await runCheckRs(fixture, fixture.work, {
 				OMP_FORCE_RUST_TASKS: "1",

@@ -232,8 +232,14 @@ async function resolveCargoBinary(): Promise<string> {
 	// On macOS runners, Homebrew's `rustup-init` binary is on PATH before the
 	// rustup proxies in `$CARGO_HOME/bin`, and invoking it as `cargo` falls
 	// through to its installer mode ("unexpected argument 'nextest' found").
-	// Ask rustup directly for the cargo binary in the active toolchain.
-	const result = await $`rustup which cargo`.cwd(repoRoot).quiet().nothrow();
+	// Ask rustup directly for the cargo binary of the repository's toolchain.
+	// rustup lets RUSTUP_TOOLCHAIN override `rust-toolchain.toml`, and a
+	// caller's shell can carry one (mise exports its global rust pin into every
+	// shell it starts), so it is left out here: the gates are the pinned
+	// toolchain's, whatever toolchain the caller's shell names.
+	const env: Record<string, string | undefined> = { ...process.env };
+	delete env.RUSTUP_TOOLCHAIN;
+	const result = await $`rustup which cargo`.cwd(repoRoot).env(env).quiet().nothrow();
 	if (result.exitCode === 0) {
 		const resolved = result.stdout.toString().trim();
 		if (resolved !== "") return resolved;
