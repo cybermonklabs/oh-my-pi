@@ -492,7 +492,8 @@ a revived agent's turn the lifecycle teardown disposes.
 1. **Subagents first.** Every persisted subagent transcript under the session
    (`<session>/<AgentId>.jsonl`, nested ones included) that its process left
    mid-turn, or whose turn ended because its provider key could not be resolved
-   (see below), that was not killed (no tombstone) and that a cold revive can rebuild
+   (see below), that was not killed (no tombstone), that has no subagent above it
+   that was killed or stopped (see below), and that a cold revive can rebuild
    (a `session_init` contract, not isolated) runs one more monitored turn as a
    background job of its parent, under the subagent's id. The lifecycle reviver
    rebuilds it from its transcript, the turn goes on as below, and the parent
@@ -558,6 +559,13 @@ result:
   or the task executor's stop of a parent subagent) stops it too, and the
   parent's process exit or shutdown cuts it off. An abort reason that says
   neither cuts it off.
+- A subagent's own jobs (its eval `agent()` handles, its workpool batches) follow
+  how it ended: its kill, or the end of its run after a stop or a finish, stops
+  their subagents; its parent's process exit or shutdown cuts them off. `--restore`
+  also leaves every subagent under a subagent that was killed or whose last turn a
+  stop ended (the user's interrupt, or "Retry cancelled"), even one that a cancel
+  without a reason cut off. The session itself is no such ancestor: its own stop
+  leaves its background jobs running.
 
 Nothing else is continued when the last turn finished, failed, or the user interrupted
 it, or when a normal exit was recorded after it (the user quit with it

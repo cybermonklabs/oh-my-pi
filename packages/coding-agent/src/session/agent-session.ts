@@ -6674,19 +6674,28 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#disposeCall;
 	}
 
-	async #disposeOwnedAsyncJobs(): Promise<void> {
+	/**
+	 * Ends the jobs this session owns as it is disposed. `processExit`: the dispose is for the
+	 * process going away (`postmortem.Reason.EXIT`, as the release of a subagent its manager's
+	 * shutdown ended passes).
+	 */
+	async #disposeOwnedAsyncJobs(processExit: boolean): Promise<void> {
 		// Unregister before cancelling: a job completing during teardown must
 		// dead-letter rather than enqueue a follow-up into a disposing session.
 		this.#unregisterAsyncDeliverySink?.();
 		this.#unregisterAsyncDeliverySink = undefined;
 		const manager = this.#ownedAsyncJobManager;
-		// The shutdown reason is reserved for the top-level session that OWNS the
-		// manager — the genuine process/handled-shutdown path — so the task
-		// executor parks (rather than tombstones) interrupted subagents. A
-		// subagent session dispose (e.g. `release({ tombstone: true })` during an
-		// explicit hard kill) leaves `#ownedAsyncJobManager` undefined and must
-		// propagate a generic cancellation so its nested children stay terminal.
-		this.#cancelOwnAsyncJobs(manager ? ASYNC_JOB_MANAGER_SHUTDOWN_REASON : plainTurnAbortReason("cutOff"));
+		// The kind of the session's end reaches the subagents of its jobs (eval `agent()`
+		// handles, workpool batches; {@link turnAbortKind}). The top-level session that OWNS
+		// the manager, and a subagent disposed for the process exit, go away with the process:
+		// the shutdown reason cuts their jobs off, and the task executor parks (rather than
+		// tombstones) the subagents, so `omp --restore` goes on with them. Any other dispose of
+		// a subagent (a kill, the release of one that finished or was stopped) leaves
+		// `#ownedAsyncJobManager` undefined and stops its jobs, so their subagents end with it
+		// and `--restore` leaves them.
+		this.#cancelOwnAsyncJobs(
+			manager || processExit ? ASYNC_JOB_MANAGER_SHUTDOWN_REASON : plainTurnAbortReason("stop"),
+		);
 		if (!manager) return;
 
 		try {
@@ -6859,7 +6868,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
 		releaseShellSessions(this.sessionManager.getSessionId());
 		const results = await Promise.allSettled([
-			this.#disposeOwnedAsyncJobs(),
+			this.#disposeOwnedAsyncJobs(options.reason === postmortem.Reason.EXIT),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.#eval.getKernelOwnerId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),

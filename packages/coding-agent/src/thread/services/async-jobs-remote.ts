@@ -365,8 +365,8 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		return this.#remote.call("waitForOwnerJobs", ownerId, options);
 	}
 
-	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
-		return this.#remote.call("cancelAndReapOwnerJobs", ownerId, deadlineAt);
+	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number, reason?: unknown): Promise<AsyncJobReapResult> {
+		return this.#remote.call("cancelAndReapOwnerJobs", ownerId, deadlineAt, toWireReason(reason));
 	}
 
 	drainDeliveries(options?: { timeoutMs?: number; filter?: AsyncJobFilter }): Promise<boolean> {

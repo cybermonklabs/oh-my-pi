@@ -15,6 +15,7 @@ import securityPublishDescription from "../prompts/tools/security-publish.md" wi
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
+import { plainTurnAbortReason } from "../session/exit-diagnostics";
 import { SessionManager } from "../session/session-manager";
 import { createSecurityAuthResolver, selectSecurityAuth } from "./auth";
 import type {
@@ -544,7 +545,12 @@ export class SecurityCoordinator {
 		if (!record) return false;
 		if (["completed", "partial", "cancelled", "failed"].includes(record.snapshot.phase)) return false;
 		if (record.snapshot.jobId && this.#host.asyncJobManager) {
-			return this.#host.asyncJobManager.cancel(record.snapshot.jobId, { ownerId: this.#host.agentId });
+			// The scan's caller stopped it; the scan session aborts with its own reason (below).
+			return this.#host.asyncJobManager.cancel(
+				record.snapshot.jobId,
+				{ ownerId: this.#host.agentId },
+				plainTurnAbortReason("stop"),
+			);
 		}
 		record.abortController?.abort(new Error("Security scan cancelled"));
 		return true;

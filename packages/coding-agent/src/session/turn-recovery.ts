@@ -115,7 +115,7 @@ const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
 const NON_WHITESPACE_RE = /\S/;
 const USAGE_PREFLIGHT_BLOCKED_PREFIX = "Usage preflight blocked:";
 /** A saga's `finalError` when its wait was cancelled, and the reason on the record a user stop ends its turn with. */
-const RETRY_CANCELLED = "Retry cancelled";
+export const RETRY_CANCELLED = "Retry cancelled";
 const STREAM_STALL_ERROR_RE = /stream stall/i;
 const HTTP2_STREAM_RESET_ERROR_RE =
 	/stream closed with error code\s+nghttp2_(?:internal_error|refused_stream)|nghttp2_(?:internal_error|refused_stream)|HTTP2(?:StreamReset|RefusedStream)/i;

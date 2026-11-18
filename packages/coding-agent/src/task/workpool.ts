@@ -4,6 +4,7 @@ import workpoolBatchTemplate from "../prompts/tools/workpool-batch.md" with { ty
 import workpoolTurnResultTemplate from "../prompts/tools/workpool-turn-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
+import { plainTurnAbortReason } from "../session/exit-diagnostics";
 import type { CustomMessage } from "../session/messages";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
@@ -210,7 +211,8 @@ export class WorkPool {
 			{ id: this.name, ownerId: this.ownerId, queued: true },
 		);
 		if (id !== this.name) {
-			manager.cancel(id, { ownerId: this.ownerId });
+			// A stop of a job no batch runs under yet.
+			manager.cancel(id, { ownerId: this.ownerId }, plainTurnAbortReason("stop"));
 			throw new ToolError(`workpool job id "${this.name}" is unavailable`);
 		}
 	}

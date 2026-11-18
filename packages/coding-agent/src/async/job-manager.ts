@@ -375,8 +375,8 @@ export interface AsyncJobManagerApi {
 	registerDeliverySink(ownerId: string, sink: AsyncJobDeliverySink): () => void;
 	/** Wait until every job owned by `ownerId` settled; false when `timeoutMs` elapses first. */
 	waitForOwnerJobs(ownerId: string, options?: { timeoutMs?: number; excludeSuppressed?: boolean }): Promise<boolean>;
-	/** Cancel every job owned by `ownerId`, then wait until `deadlineAt`. */
-	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult>;
+	/** Cancel every job owned by `ownerId`, aborting each with `reason`, then wait until `deadlineAt`. */
+	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number, reason?: unknown): Promise<AsyncJobReapResult>;
 	drainDeliveries(options?: { timeoutMs?: number; filter?: AsyncJobFilter }): Promise<boolean>;
 	isDeliverySuppressed(jobId: string): boolean;
 	/** True while a settled job's completion is queued or in flight — its push is on the way. */
@@ -907,13 +907,15 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
-	 * Cancel every job owned by `ownerId`, then wait only until `deadlineAt`.
+	 * Cancel every job owned by `ownerId`, aborting each with `reason` (the platform's own
+	 * abort reason without one), then wait only until `deadlineAt`. A subagent of a job
+	 * reads the kind of the cancel from `reason` (`turnAbortKind`).
 	 * The returned completion keeps waiting for actual process settlement when
 	 * the deadline expires, so callers can move that cleanup out of the
 	 * user-visible Task wait without losing ownership of the live work.
 	 */
-	async cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
-		this.cancelAll({ ownerId });
+	async cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number, reason?: unknown): Promise<AsyncJobReapResult> {
+		this.cancelAll({ ownerId }, reason);
 		const timeoutMs = Math.max(0, deadlineAt - Date.now());
 		const settled = await this.waitForOwnerJobs(ownerId, { timeoutMs });
 		if (settled) {

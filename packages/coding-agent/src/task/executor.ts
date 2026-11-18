@@ -96,7 +96,7 @@ import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
-import { INTERRUPTED_TURN_ERROR, turnAbortKind } from "../session/exit-diagnostics";
+import { INTERRUPTED_TURN_ERROR, plainTurnAbortReason, turnAbortKind } from "../session/exit-diagnostics";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -1375,6 +1375,14 @@ interface SubagentRunMonitor {
 	waitForYieldTurnStop(): Promise<void>;
 	/** The abort kind for this run, when an abort was requested. */
 	abortKind(): AbortReason | undefined;
+	/**
+	 * The reason the run's own jobs (its eval `agent()` handles, its workpool batches) are
+	 * cancelled with when the run ends, which their subagents read ({@link turnAbortKind}): the
+	 * manager's shutdown reason when the run was shut down, a cut-off when its caller cut it off
+	 * (its parent's process exit), and a stop for every other end (a stop, a kill, its own limit,
+	 * a finished run).
+	 */
+	ownedJobsAbortReason(): unknown;
 	terminalError(): string | undefined;
 	/** True when the abort carries a precise external reason (signal / wall-clock / budget). */
 	hasExplicitAbortReason(): boolean;
@@ -2439,6 +2447,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		// A soft stop that never escalated still identifies as a budget abort so
 		// the lifecycle can park the agent as resumable instead of killing it.
 		abortKind: () => abortReason ?? (budgetStopRequested ? "budget" : undefined),
+		ownedJobsAbortReason: () =>
+			abortReason === "shutdown"
+				? ASYNC_JOB_MANAGER_SHUTDOWN_REASON
+				: plainTurnAbortReason(abortReason === "signal" && callerCutOff ? "cutOff" : "stop"),
 		isAbortedRun: () =>
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||
@@ -5415,7 +5427,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			}
 			const jobManager = options.asyncJobManager;
 			if (jobManager) {
-				const reap = await jobManager.cancelAndReapOwnerJobs(id, cleanupDeadlineAt);
+				const reap = await jobManager.cancelAndReapOwnerJobs(id, cleanupDeadlineAt, monitor.ownedJobsAbortReason());
 				if (!reap.settled) {
 					deferCleanup(reap.completion);
 					logger.warn("Subagent async job cleanup exceeded its deadline", {
@@ -5450,12 +5462,16 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			if (jobManager) {
 				if (deferredSessionShutdown) {
 					const finalReap = Promise.allSettled([deferredSessionShutdown]).then(async () => {
-						const reap = await jobManager.cancelAndReapOwnerJobs(id, Date.now());
+						const reap = await jobManager.cancelAndReapOwnerJobs(id, Date.now(), monitor.ownedJobsAbortReason());
 						await reap.completion;
 					});
 					lateCleanups.push(finalReap);
 				} else {
-					const reap = await jobManager.cancelAndReapOwnerJobs(id, cleanupDeadlineAt);
+					const reap = await jobManager.cancelAndReapOwnerJobs(
+						id,
+						cleanupDeadlineAt,
+						monitor.ownedJobsAbortReason(),
+					);
 					if (!reap.settled) {
 						deferCleanup(reap.completion);
 						logger.warn("Subagent async job cleanup exceeded its deadline after session shutdown", {

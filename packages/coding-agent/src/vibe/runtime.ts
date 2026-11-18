@@ -34,6 +34,7 @@ import { MCPManager } from "../mcp/manager";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { plainTurnAbortReason } from "../session/exit-diagnostics";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
@@ -1031,7 +1032,8 @@ export class VibeSessionRegistry {
 			record.lastActivityAt = Date.now();
 			record.lastActivity = "suspended for parent-session switch";
 			this.#records.delete(scopeKey(scope, record.id));
-			if (record.turn && manager) manager.cancel(record.turn.jobId, { ownerId: record.ownerId });
+			if (record.turn && manager)
+				manager.cancel(record.turn.jobId, { ownerId: record.ownerId }, plainTurnAbortReason("stop"));
 		}
 		const deadline = Date.now() + this.#teardownGraceMs;
 		const cleanup = teardown.map(entry => ({
@@ -1176,7 +1178,7 @@ export class VibeSessionRegistry {
 		if (record.turn && manager) {
 			const job = manager.getJob(record.turn.jobId);
 			if (job) settlingJobs.add(job);
-			cancelledTurn = manager.cancel(record.turn.jobId, { ownerId: record.ownerId });
+			cancelledTurn = manager.cancel(record.turn.jobId, { ownerId: record.ownerId }, plainTurnAbortReason("stop"));
 		}
 		record.state = "dead";
 		record.lastActivityAt = Date.now();
