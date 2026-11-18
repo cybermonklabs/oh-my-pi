@@ -95,6 +95,15 @@ pub struct ProcessingContext {
 	pub append_elements:      Vec<AppendElement>,
 }
 
+impl ProcessingContext {
+	/// The byte that ends each line read and written, and that `N`, `G` and
+	/// `H` join lines with: NUL under `-z` (`--null-data`), as in GNU sed,
+	/// else the newline.
+	pub const fn delimiter(&self) -> u8 {
+		if self.null_data { b'\0' } else { b'\n' }
+	}
+}
+
 #[derive(Clone, Debug)]
 /// Elements that shall be appended at the end of each command processing cycle
 pub enum AppendElement {
@@ -1224,17 +1233,20 @@ fn parse_number(
 }
 
 /// Parse the end of a command, failing with an error on extra characters.
+/// As in GNU sed, blanks may follow the command, and a `}` ends it as a `;`
+/// does (`/x/{p}`); the `}` is left for the block to read.
 fn parse_command_ending(
 	lines: &ScriptLineProvider,
 	line: &mut ScriptCharProvider,
 	cmd: &mut Command,
 ) -> SedResult<()> {
+	line.eat_spaces();
 	if !line.eol() && line.current() == ';' {
 		line.advance();
 		return Ok(());
 	}
 
-	if !line.eol() {
+	if !line.eol() && line.current() != '}' {
 		return compilation_error(
 			lines,
 			line,
@@ -1297,12 +1309,20 @@ fn compile_regex(
 			.unwrap_err()
 		})
 	};
+	// Under `-z` GNU sed searches an `M` pattern in each line of the pattern
+	// space on its own, a line ending at a NUL (`Regex::NulLines`): there
+	// `^` and `$` match at the ends of that line, not beside a newline, and
+	// `.` matches no newline. `(?-s)` keeps that `.` against the `(?s)` the
+	// engines are given.
+	let nul_lines = multiline && context.null_data;
 	let modifiers = {
 		let mut modifiers = String::new();
 		if icase {
 			modifiers.push('i');
 		}
-		if multiline {
+		if nul_lines {
+			modifiers.push_str("-s");
+		} else if multiline {
 			modifiers.push('m');
 		}
 		modifiers
@@ -1328,10 +1348,12 @@ fn compile_regex(
 		} else {
 			Regex::new(&whole)
 		};
-		compiled.map_err(|e| {
-			compilation_error::<Regex>(lines, line, format!("invalid regex '{whole}': {e}"))
-				.unwrap_err()
-		})
+		compiled
+			.map(|re| if nul_lines { Regex::NulLines(Box::new(re)) } else { re })
+			.map_err(|e| {
+				compilation_error::<Regex>(lines, line, format!("invalid regex '{whole}': {e}"))
+					.unwrap_err()
+			})
 	};
 	let text = compile(&script_text(pattern))?;
 	let bytes = if pattern.is_ascii() { None } else { Some(compile(&script_byte_text(pattern))?) };
@@ -1666,7 +1688,8 @@ pub fn compile_subst_flags(
 				return Ok(()); // 'w' is the last flag allowed
 			},
 
-			';' | '\n' => break,
+			// A `}` ends the command as in GNU sed (`/x/{s/x/X/p}`).
+			';' | '\n' | '}' => break,
 
 			other => {
 				return compilation_error(lines, line, format!("invalid substitute flag: '{other}'"));
@@ -5411,15 +5434,17 @@ pub fn script_byte_text(script: &str) -> String {
 	text
 }
 
-// Define two cursors for iterating over lines:
+// Define two cursors for iterating over lines, each ended by the delimiter
+// byte (the newline, or NUL under `-z`):
 // - SliceLineCursor over a file read whole into memory,
 // - ReadLineCursor based on BufReader.
 
 /// Cursor for zero-copy iteration over an in-memory file snapshot.
 #[cfg(unix)]
 pub struct SliceLineCursor<'a> {
-	data: &'a [u8], // Snapshot data
-	pos:  usize,    // Position within the data
+	data:      &'a [u8], // Snapshot data
+	pos:       usize,    // Position within the data
+	delimiter: u8,       // The byte that ends each line
 }
 
 #[cfg(unix)]
@@ -5431,8 +5456,8 @@ pub struct NextSliceLine<'a> {
 
 #[cfg(unix)]
 impl<'a> SliceLineCursor<'a> {
-	fn new(data: &'a [u8]) -> Self {
-		Self { data, pos: 0 }
+	fn new(data: &'a [u8], delimiter: u8) -> Self {
+		Self { data, pos: 0, delimiter }
 	}
 
 	/// Return the next line, if available, or None.
@@ -5443,19 +5468,19 @@ impl<'a> SliceLineCursor<'a> {
 
 		let start = self.pos;
 
-		let mut end = if let Some(pos) = memchr(b'\n', &self.data[start..]) {
+		let mut end = if let Some(pos) = memchr(self.delimiter, &self.data[start..]) {
 			pos + start
 		} else {
 			self.data.len()
 		};
 
 		if end < self.data.len() {
-			end += 1; // include \n in full span
+			end += 1; // include the delimiter in full span
 		}
 
 		self.pos = end;
 		let full_span = &self.data[start..end];
-		let content = if full_span.ends_with(b"\n") {
+		let content = if full_span.last() == Some(&self.delimiter) {
 			&full_span[..full_span.len() - 1]
 		} else {
 			full_span
@@ -5472,29 +5497,30 @@ impl<'a> SliceLineCursor<'a> {
 
 /// Buffered line reader from any BufRead input.
 pub struct ReadLineCursor {
-	reader: Box<dyn BufRead>,
-	buffer: Vec<u8>,
+	reader:    Box<dyn BufRead>,
+	buffer:    Vec<u8>,
+	delimiter: u8, // The byte that ends each line
 }
 
 impl ReadLineCursor {
 	/// Construct from anything that implements `Read`.
-	fn new<R: Read + 'static>(r: R) -> Self {
+	fn new<R: Read + 'static>(r: R, delimiter: u8) -> Self {
 		let buf = BufReader::new(r);
-		Self { reader: Box::new(buf), buffer: Vec::new() }
+		Self { reader: Box::new(buf), buffer: Vec::new(), delimiter }
 	}
 
 
-	/// If a line is available, return it, without its \n termination: as
-	/// text, or as byte text where it is not UTF-8.
+	/// If a line is available, return it, without its delimiter: as text, or
+	/// as byte text where it is not UTF-8.
 	fn get_line(&mut self) -> io::Result<Option<IOChunkContent<'static>>> {
 		self.buffer.clear();
-		// read_until *includes* the '\n' if present
-		let bytes_read = self.reader.read_until(b'\n', &mut self.buffer)?;
+		// read_until *includes* the delimiter if present
+		let bytes_read = self.reader.read_until(self.delimiter, &mut self.buffer)?;
 		if bytes_read == 0 {
 			return Ok(None);
 		}
-		// O(1) check whether it ended in '\n'
-		let has_newline = self.buffer.last() == Some(&b'\n');
+		// O(1) check whether it ended in the delimiter
+		let has_newline = self.buffer.last() == Some(&self.delimiter);
 		// strip it if you don’t want to expose it to the caller
 		if has_newline { self.buffer.pop(); }
 		let line = std::mem::take(&mut self.buffer);
@@ -5562,18 +5588,13 @@ impl<'a> IOChunk<'a> {
 		self.content.len() == 0
 	}
 
-	/// Return true if the content ends with a newline.
+	/// Return true if the content ends with a newline: the line's delimiter,
+	/// which a slice of the input holds after its content.
 	pub fn is_newline_terminated(&self) -> bool {
 		match &self.content {
 			IOChunkContent::Owned { has_newline, .. } => *has_newline,
 			#[cfg(unix)]
-			IOChunkContent::SliceInput { full_span, .. } => {
-				if let Some(&last) = full_span.last() {
-					last == b'\n'
-				} else {
-					false
-				}
-			},
+			IOChunkContent::SliceInput { content, full_span } => full_span.len() > content.len(),
 		}
 	}
 
@@ -5647,7 +5668,7 @@ impl<'a> IOChunk<'a> {
 	pub fn ensure_owned(&mut self) {
 		#[cfg(unix)]
 		if let IOChunkContent::SliceInput { content, full_span } = self.content {
-			let has_newline = full_span.last().copied() == Some(b'\n');
+			let has_newline = full_span.len() > content.len();
 			let (text, bytes) = match self.slice_text.take() {
 				Some(SliceText::Bytes(text)) => (text, true),
 				// SAFETY: `SliceText::Utf8` records that `content` is UTF-8.
@@ -5750,32 +5771,32 @@ pub enum LineReader<'a> {
 }
 
 /// Return a LineReader that uses the ReadInput method fot the specified file.
-fn line_reader_read_input(file: impl Read + 'static) -> io::Result<LineReader<'static>> {
+fn line_reader_read_input(file: impl Read + 'static, delimiter: u8) -> io::Result<LineReader<'static>> {
 	let boxed: Box<dyn Read> = Box::new(file);
 	let reader = BufReader::new(boxed);
-	Ok(LineReader::ReadInput(ReadLineCursor::new(reader)))
+	Ok(LineReader::ReadInput(ReadLineCursor::new(reader, delimiter)))
 }
 
 /// Return a LineReader that serves all of `file`, read into memory up front.
 #[cfg(unix)]
-fn line_reader_slice_input(mut file: impl Read) -> io::Result<LineReader<'static>> {
+fn line_reader_slice_input(mut file: impl Read, delimiter: u8) -> io::Result<LineReader<'static>> {
 	let mut data = Vec::new();
 	file.read_to_end(&mut data)?;
 	// SAFETY: the heap buffer of `data` is never mutated or reallocated, and it
 	// lives in the same variant as the cursor borrowing it.
 	let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-	Ok(LineReader::SliceInput { _data: data, cursor: SliceLineCursor::new(slice) })
+	Ok(LineReader::SliceInput { _data: data, cursor: SliceLineCursor::new(slice, delimiter) })
 }
 
 impl<'a> LineReader<'a> {
-	/// Open the specified file for line input.
+	/// Open the specified file for input of lines ended by `delimiter`.
 	// Use "-" to read from the standard input.
-	pub fn open_with_host(path: &PathBuf, host: &mut Host) -> io::Result<Self> {
+	pub fn open_with_host(path: &PathBuf, host: &mut Host, delimiter: u8) -> io::Result<Self> {
 		if path.as_os_str() == "-" {
 			// read the context stdin.
 			let boxed: Box<dyn Read> = Box::new(host.stdin.file().clone());
 			let reader = BufReader::new(boxed);
-			return Ok(LineReader::ReadInput(ReadLineCursor::new(reader)));
+			return Ok(LineReader::ReadInput(ReadLineCursor::new(reader, delimiter)));
 		}
 
 		// input file operands resolve
@@ -5788,24 +5809,24 @@ impl<'a> LineReader<'a> {
 		// (pipes, process substitution) stream.
 		#[cfg(unix)]
 		if file.native().is_some() && file.metadata().is_ok_and(|meta| meta.is_file()) {
-			return line_reader_slice_input(file);
+			return line_reader_slice_input(file, delimiter);
 		}
 
-		line_reader_read_input(file)
+		line_reader_read_input(file, delimiter)
 	}
 
 	/// Opens a file directly for unit tests.
 	#[cfg(test)]
 	pub fn open(path: &PathBuf) -> io::Result<Self> {
 		let (mut host, _) = Host::for_test("sed", "", ".");
-		Self::open_with_host(path, &mut host)
+		Self::open_with_host(path, &mut host, b'\n')
 	}
 
 	/// Open the specified file to read as a stream.
 	#[cfg(test)]
 	pub fn open_stream(path: &PathBuf) -> io::Result<Self> {
 		let file = std::fs::File::open(path)?;
-		line_reader_read_input(file)
+		line_reader_read_input(file, b'\n')
 	}
 
 	/// Return the next line, if available.
@@ -5869,9 +5890,12 @@ pub struct OutputBuffer {
 	                                                               * flushing */
 	#[cfg(unix)]
 	slice_chunk:       Option<SliceOutput>, // Chunk to write
-	// True when the last write didn't end with \n; the \n is deferred so
-	// that commands like `p` don't emit a spurious newline under -n.
+	// True when the last write didn't end with its delimiter; the delimiter
+	// is deferred so that commands like `p` don't emit a spurious one under
+	// -n.
 	pending_newline:   bool,
+	/// The byte that ends each line written: the newline, or NUL under `-z`.
+	delimiter:         u8,
 	#[cfg(test)]
 	low_level_flushes: usize, // Number of system call flushes
 }
@@ -5890,18 +5914,19 @@ const MAX_PENDING_WRITE_NON_FILE: usize = 64 * 1024;
 
 impl OutputBuffer {
 	#[cfg(not(unix))]
-	pub fn new(w: Box<dyn OutputWrite + 'static>, line_buffered: bool) -> Self {
+	pub fn new(w: Box<dyn OutputWrite + 'static>, line_buffered: bool, delimiter: u8) -> Self {
 		Self {
 			out: BufWriter::new(w),
 			line_buffered,
 			pending_newline: false,
+			delimiter,
 			#[cfg(test)]
 			low_level_flushes: 0,
 		}
 	}
 
 	#[cfg(unix)]
-	pub fn new(w: Box<dyn OutputWrite + 'static>, line_buffered: bool) -> Self {
+	pub fn new(w: Box<dyn OutputWrite + 'static>, line_buffered: bool, delimiter: u8) -> Self {
 		Self {
 			out: BufWriter::new(w),
 			line_buffered,
@@ -5912,6 +5937,7 @@ impl OutputBuffer {
 			},
 			slice_chunk: None,
 			pending_newline: false,
+			delimiter,
 			#[cfg(test)]
 			low_level_flushes: 0,
 		}
@@ -5923,7 +5949,8 @@ impl OutputBuffer {
 	}
 
 	/// Schedule the specified text, byte text when `bytes`, for eventual
-	/// output.
+	/// output. A newline that ends it ends the line, and is written as the
+	/// delimiter: `i` writes `foo\0` under `-z`, as GNU sed does.
 	pub fn write_text<S: Into<String>>(&mut self, s: S, bytes: bool) -> io::Result<()> {
 		let mut s = s.into();
 		let has_newline = s.ends_with('\n');
@@ -5931,6 +5958,33 @@ impl OutputBuffer {
 			s.truncate(s.len() - 1);
 		}
 		self.write_chunk(&IOChunk::from_content(IOChunkContent::new_owned_text(s, bytes, has_newline)))
+	}
+
+	/// Schedule `line`, byte text when `bytes`, for output as a whole line,
+	/// ended by the delimiter.
+	pub fn write_line(&mut self, line: &str, bytes: bool) -> io::Result<()> {
+		self.write_chunk(&IOChunk::from_content(IOChunkContent::new_owned_text(
+			line.to_owned(),
+			bytes,
+			true,
+		)))
+	}
+
+	/// Schedule `text` for output as it is, its newlines too: the text of
+	/// `a`, which GNU sed ends with a newline under `-z` as well (`foo\n`).
+	pub fn write_verbatim(&mut self, text: &str) -> io::Result<()> {
+		if text.is_empty() {
+			return Ok(());
+		}
+		self.flush_pending_newline()?;
+		#[cfg(unix)]
+		self.flush_slice(WriteRange::Complete)?;
+		self.out.write_all(text.as_bytes())?;
+		self.pending_newline = !text.ends_with('\n');
+		if !self.pending_newline {
+			self.flush_completed_line()?;
+		}
+		Ok(())
 	}
 
 	/// Copy the specified file, opened through `fs`, to the output.
@@ -6010,7 +6064,7 @@ impl OutputBuffer {
 
 		if self.pending_newline {
 			self.flush_slice(WriteRange::Complete)?;
-			self.out.write_all(b"\n")?;
+			self.out.write_all(&[self.delimiter])?;
 			self.pending_newline = false;
 			self.flush_completed_line()?;
 		}
@@ -6057,7 +6111,7 @@ impl OutputBuffer {
 				self.flush_slice(WriteRange::Complete)?;
 				write_text_bytes(&mut self.out, content, *bytes)?;
 				if *has_newline {
-					self.out.write_all(b"\n")?;
+					self.out.write_all(&[self.delimiter])?;
 				}
 				self.pending_newline = !has_newline;
 			},
@@ -6093,11 +6147,11 @@ impl OutputBuffer {
 		Ok(())
 	}
 
-	/// Write a deferred newline if the last output didn't end with one.
+	/// Write a deferred delimiter if the last output didn't end with one.
 	pub fn flush_pending_newline(&mut self) -> io::Result<()> {
 		if self.pending_newline {
 			self.flush_slice(WriteRange::Complete)?;
-			self.out.write_all(b"\n")?;
+			self.out.write_all(&[self.delimiter])?;
 			self.pending_newline = false;
 			self.flush_completed_line()?;
 		}
@@ -6120,7 +6174,7 @@ impl OutputBuffer {
 		}
 
 		if self.pending_newline {
-			self.out.write_all(b"\n")?;
+			self.out.write_all(&[self.delimiter])?;
 			self.pending_newline = false;
 			self.flush_completed_line()?;
 		}
@@ -6129,7 +6183,7 @@ impl OutputBuffer {
 			IOChunkContent::Owned { content, has_newline, bytes, .. } => {
 				write_text_bytes(&mut self.out, content, *bytes)?;
 				if *has_newline {
-					self.out.write_all(b"\n")?;
+					self.out.write_all(&[self.delimiter])?;
 				}
 				self.pending_newline = !has_newline;
 				if *has_newline {
@@ -6140,10 +6194,10 @@ impl OutputBuffer {
 		}
 	}
 
-	/// Write a deferred newline if the last output didn't end with one.
+	/// Write a deferred delimiter if the last output didn't end with one.
 	pub fn flush_pending_newline(&mut self) -> io::Result<()> {
 		if self.pending_newline {
-			self.out.write_all(b"\n")?;
+			self.out.write_all(&[self.delimiter])?;
 			self.pending_newline = false;
 			self.flush_completed_line()?;
 		}
@@ -6189,7 +6243,7 @@ mod tests {
 		let tmp = NamedTempFile::new()?;
 		{
 			let file = tmp.reopen()?;
-			let mut out = OutputBuffer::new(Box::new(file), false);
+			let mut out = OutputBuffer::new(Box::new(file), false, b'\n');
 			out.write_str("foo\n")?;
 			out.write_str("bar\n")?;
 			out.flush()?;
@@ -6224,7 +6278,7 @@ mod tests {
 		let output = NamedTempFile::new()?;
 		let output_path = output.path().to_path_buf();
 		let out_file = std::fs::File::create(&output_path)?;
-		let mut out = OutputBuffer::new(Box::new(Box::new(out_file)), false);
+		let mut out = OutputBuffer::new(Box::new(Box::new(out_file)), false, b'\n');
 
 		// Drain reader → writer
 		while let Some(chunk) = reader.get_line()? {
@@ -6259,7 +6313,7 @@ mod tests {
 		let output = NamedTempFile::new()?;
 		let output_path = output.path().to_path_buf();
 		let out_file = File::create(&output_path)?;
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 
 		// Read the first snapshot line ("zero\n") and write it
 		if let Some(chunk) = reader.get_line()? {
@@ -6313,7 +6367,7 @@ mod tests {
 		let out_file = File::create(&output_path)?;
 
 		// Wrap it in your OutputBuffer and run the loop:
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 		let mut nline = 0;
 		while let Some(chunk) = reader.get_line()? {
 			out.write_chunk(&chunk)?;
@@ -6352,7 +6406,7 @@ mod tests {
 		let out_file = File::create(&output_path)?;
 
 		// Wrap it in your OutputBuffer and run the loop:
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 		let mut nline = 0;
 		while let Some(chunk) = reader.get_line()? {
 			out.write_chunk(&chunk)?;
@@ -6387,7 +6441,7 @@ mod tests {
 		let out_file = File::create(&output_path)?;
 
 		// Wrap it in your OutputBuffer and run the loop:
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 		let mut nline = 0;
 		while let Some(chunk) = reader.get_line()? {
 			out.write_chunk(&chunk)?;
@@ -6422,7 +6476,7 @@ mod tests {
 		let out_file = File::create(&output_path)?;
 
 		// Wrap it in your OutputBuffer and run the loop:
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 		let mut nline = 0;
 		while let Some(chunk) = reader.get_line()? {
 			out.write_chunk(&chunk)?;
@@ -6763,16 +6817,20 @@ mod tests {
 			#[cfg(unix)]
 			slice_chunk: None,
 			pending_newline: false,
+			delimiter: b'\n',
 			low_level_flushes: 0,
 		};
 		(buf, file)
 	}
 
+	/// A chunk of the input snapshot `bytes`, a line and the newline that
+	/// ends it where it has one, as the reader returns it.
 	#[cfg(unix)]
 	fn make_slice_chunk(bytes: &'static [u8]) -> IOChunk<'static> {
+		let content = bytes.strip_suffix(b"\n").unwrap_or(bytes);
 		IOChunk {
 			slice_text: OnceCell::from(SliceText::Utf8),
-			content:    IOChunkContent::SliceInput { content: bytes, full_span: bytes },
+			content:    IOChunkContent::SliceInput { content, full_span: bytes },
 		}
 	}
 
@@ -6938,9 +6996,7 @@ pub mod fast_regex {
 
 use std::{error::Error, sync::LazyLock};
 
-use fancy_regex::{
-	CaptureMatches as FancyCaptureMatches, Captures as FancyCaptures, Regex as FancyRegex,
-};
+use fancy_regex::{Captures as FancyCaptures, Regex as FancyRegex};
 use memchr::memmem;
 use regex::{
 	Regex as RustRegex,
@@ -6948,7 +7004,7 @@ use regex::{
 };
 use crate::sed::error_handling::{SedError, SedResult};
 
-use crate::sed::fast_io::IOChunk;
+use crate::sed::fast_io::{IOChunk, byte_text};
 
 /// REs requiring the fancy_regex capabilities rather than the
 /// faster regex::bytes engine
@@ -7139,6 +7195,11 @@ pub enum Regex {
 	/// prefer the first branch that matches there, so `sed -E 's/a|ab/X/'`
 	/// on `ab` gave `Xb` where GNU sed gives `X`.
 	Longest(Longest),
+	/// A pattern with the `M` flag under `-z`, searched in each line of the
+	/// pattern space on its own, as GNU sed searches it there: a line ends
+	/// at a NUL, `^` and `$` match at its ends, and no match holds the NUL
+	/// (`printf 'a\0b\0' | sed -z 'N;s/^/X/Mg'` prints `Xa\0Xb\0`).
+	NulLines(Box<Regex>),
 }
 
 #[derive(Clone, Debug)]
@@ -7201,7 +7262,7 @@ impl Longest {
 		match self.whole.as_ref() {
 			Regex::Literal(m) => m.is_match(text.as_bytes()),
 			Regex::Byte(re) => re.is_match(text.as_bytes()),
-			Regex::Fancy(_) | Regex::Longest(_) => true,
+			Regex::Fancy(_) | Regex::Longest(_) | Regex::NulLines(_) => true,
 		}
 	}
 
@@ -7254,17 +7315,6 @@ impl Longest {
 	}
 }
 
-/// The haystack the literal `m` is searched for in `chunk`: the line's text,
-/// or `None` where `m` cannot match. A needle of ASCII is in the bytes of a
-/// line exactly when it is in the line's text, so a line without it is not
-/// read as text for it.
-fn literal_haystack<'t>(m: &LiteralMatcher, chunk: &'t IOChunk) -> Option<&'t [u8]> {
-	if m.is_ascii() && !m.is_match(chunk.as_bytes()) {
-		return None;
-	}
-	Some(chunk.as_str().as_bytes())
-}
-
 /// Whether `start..end`, a match of the bytes engine in byte text, lies on
 /// the text's character boundaries. That engine allows an empty match at any
 /// byte, also inside the four bytes of a character standing for a byte from
@@ -7278,6 +7328,61 @@ fn on_char_boundaries(text: &str, start: usize, end: usize) -> bool {
 /// The position one character after `at` in `text`, or one past its end.
 fn next_boundary(text: &str, at: usize) -> usize {
 	text[at..].chars().next().map_or(at + 1, |c| at + c.len_utf8())
+}
+
+/// Where a search goes on after an empty match at `at` of `text`: the next
+/// byte in a line that is UTF-8, where GNU finds an empty match inside a
+/// character as well, and the next character in byte text (`bytes`), whose
+/// characters are bytes to GNU.
+fn after_empty(text: &str, bytes: bool, at: usize) -> usize {
+	if bytes { next_boundary(text, at) } else { at + 1 }
+}
+
+/// Answers whether a fancy-regex pattern matches the empty string at a
+/// position inside a character of a line that is UTF-8, where GNU finds an
+/// empty match too: `printf 'caf\303\251\n' | sed 's/\(x\)*\1*/-/g'` prints
+/// `-c-a-f-\303-\251-`. fancy-regex searches from a character boundary only,
+/// so the line is read as its byte text (see `fast_io`), in which each byte
+/// is a character, as each byte of the character the position splits is one
+/// to GNU there.
+struct InsideChars {
+	/// The line's byte text.
+	text:   String,
+	/// The last position asked about, in the line and in `text`.
+	at:     (usize, usize),
+	/// The match found last in `text`, from a position at or before the one
+	/// in `at`: `None` until searched, `Some(None)` where there is none.
+	next:   Option<Option<(usize, usize)>>,
+}
+
+impl InsideChars {
+	fn new(line: &str) -> Self {
+		Self { text: byte_text(line.as_bytes()), at: (0, 0), next: None }
+	}
+
+	/// Whether `re` matches the empty string at `pos` of `line`, the line
+	/// this was made for. `pos` is never before the one asked about last.
+	fn empty_match_at(&mut self, re: &FancyRegex, line: &str, pos: usize) -> SedResult<bool> {
+		// A byte from 0x80 up is four bytes in byte text.
+		let (from, mapped) = self.at;
+		let mapped = mapped
+			+ line.as_bytes()[from..pos].iter().map(|b| if b.is_ascii() { 1 } else { 4 }).sum::<usize>();
+		self.at = (pos, mapped);
+		let found = match self.next {
+			// A match searched from before `mapped` that starts at or after
+			// it is also the first match from `mapped`.
+			Some(found) if found.is_none_or(|(start, _)| start >= mapped) => found,
+			_ => {
+				let found = re
+					.find_from_pos(&self.text, mapped)
+					.map_err(|e| SedError::new(2, e.to_string()))?
+					.map(|m| (m.start(), m.end()));
+				self.next = Some(found);
+				found
+			},
+		};
+		Ok(found == Some((mapped, mapped)))
+	}
 }
 
 /// Ensure that a regex matches GNU sed's default semantics for `.`
@@ -7346,6 +7451,13 @@ impl Regex {
 		}
 	}
 
+	/// Whether `chunk` holds no match, known from its bytes alone: a needle
+	/// of ASCII is in the bytes of a line exactly when it is in the line's
+	/// text, so a line without it is not read as text for it.
+	fn misses_literally(&self, chunk: &IOChunk) -> bool {
+		matches!(self, Regex::Literal(m) if m.is_ascii() && !m.is_match(chunk.as_bytes()))
+	}
+
 	/// Check if the regex matches `text`.
 	fn is_match_text(&self, text: &str) -> SedResult<bool> {
 		match self {
@@ -7355,48 +7467,70 @@ impl Regex {
 			// A line matches the alternation when it matches any branch,
 			// which the whole pattern answers.
 			Regex::Longest(longest) => longest.whole.is_match_text(text),
+			Regex::NulLines(re) => {
+				for line in text.split('\0') {
+					if re.is_match_text(line)? {
+						return Ok(true);
+					}
+				}
+				Ok(false)
+			},
 		}
 	}
 
 	/// Return an iterator over capture groups.
 	pub fn captures_iter<'t>(&'t self, chunk: &'t IOChunk) -> SedResult<CaptureMatches<'t>> {
+		if self.misses_literally(chunk) {
+			return Ok(CaptureMatches::Literal(Box::new(std::iter::empty::<SedResult<Captures<'t>>>())));
+		}
+		Ok(self.captures_iter_text(chunk.as_str(), chunk.is_bytes()))
+	}
+
+	/// The matches in `text`, which is byte text when `bytes`.
+	fn captures_iter_text<'t>(&'t self, text: &'t str, bytes: bool) -> CaptureMatches<'t> {
 		match self {
-			Regex::Literal(m) => {
-				let matches: Box<dyn Iterator<Item = SedResult<Captures<'t>>> + 't> =
-					match literal_haystack(m, chunk) {
-						Some(haystack) => Box::new(
-							m.iter(haystack)
-								.map(|(start, end, text)| Ok(Captures::Literal(Match { start, end, text }))),
-						),
-						None => Box::new(std::iter::empty()),
-					};
-				Ok(CaptureMatches::Literal(matches))
+			Regex::Literal(m) => CaptureMatches::Literal(Box::new(
+				m.iter(text.as_bytes())
+					.map(|(start, end, text)| Ok(Captures::Literal(Match { start, end, text }))),
+			)),
+
+			Regex::Byte(re) => CaptureMatches::Byte {
+				iter:      re.captures_iter(text.as_bytes()),
+				byte_text: bytes.then_some(text),
 			},
 
-			Regex::Byte(re) => {
-				let text = chunk.as_str();
-				Ok(CaptureMatches::Byte {
-					iter:      re.captures_iter(text.as_bytes()),
-					byte_text: chunk.is_bytes().then_some(text),
-				})
-			},
-
-			Regex::Fancy(re) => Ok(CaptureMatches::Fancy(re.captures_iter(chunk.as_str()))),
+			Regex::Fancy(re) => CaptureMatches::Fancy(FancyMatches {
+				re,
+				text,
+				bytes,
+				pos: 0,
+				last_end: None,
+				inside: None,
+				done: false,
+			}),
 
 			Regex::Longest(longest) => {
-				let text = chunk.as_str();
 				let may_match = longest.may_match(text);
-				Ok(CaptureMatches::Longest(LongestMatches {
+				CaptureMatches::Longest(LongestMatches {
 					longest,
 					text,
-					bytes: chunk.is_bytes(),
+					bytes,
 					pos: 0,
 					last_end: None,
 					// A line without a match keeps no branch's next match.
 					next: if may_match { longest.fresh_next() } else { Vec::new() },
+					inside: None,
 					done: !may_match,
-				}))
+				})
 			},
+
+			Regex::NulLines(re) => CaptureMatches::NulLines(Box::new(NulLineMatches {
+				re: re.as_ref(),
+				lines: text.split('\0'),
+				start: 0,
+				bytes,
+				current: None,
+			})),
 		}
 	}
 
@@ -7407,19 +7541,27 @@ impl Regex {
 			Regex::Byte(re) => re.captures_len(),
 			Regex::Fancy(re) => re.captures_len(),
 			Regex::Longest(longest) => longest.whole.captures_len(),
+			Regex::NulLines(re) => re.captures_len(),
 		}
 	}
 
 	/// Return the elements of the first capture.
 	pub fn captures<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Captures<'t>>> {
+		if self.misses_literally(chunk) {
+			return Ok(None);
+		}
+		self.captures_text(chunk.as_str(), chunk.is_bytes())
+	}
+
+	/// The captures of the first match in `text`, byte text when `bytes`.
+	fn captures_text<'t>(&self, text: &'t str, bytes: bool) -> SedResult<Option<Captures<'t>>> {
 		match self {
-			Regex::Literal(m) => Ok(literal_haystack(m, chunk)
-				.and_then(|haystack| m.find(haystack))
+			Regex::Literal(m) => Ok(m
+				.find(text.as_bytes())
 				.map(|(start, end, text)| Captures::Literal(Match { start, end, text }))),
 
 			Regex::Byte(re) => {
-				let text = chunk.as_str();
-				let caps = if chunk.is_bytes() {
+				let caps = if bytes {
 					re.captures_iter(text.as_bytes()).find(|caps| {
 						caps.get(0).is_some_and(|m| on_char_boundaries(text, m.start(), m.end()))
 					})
@@ -7429,14 +7571,13 @@ impl Regex {
 				Ok(caps.map(Captures::Byte))
 			},
 
-			Regex::Fancy(re) => match re.captures(chunk.as_str()) {
+			Regex::Fancy(re) => match re.captures(text) {
 				Ok(Some(caps)) => Ok(Some(Captures::Fancy(caps))),
 				Ok(None) => Ok(None),
 				Err(e) => Err(SedError::new(2, e.to_string())),
 			},
 
 			Regex::Longest(longest) => {
-				let text = chunk.as_str();
 				if !longest.may_match(text) {
 					return Ok(None);
 				}
@@ -7445,20 +7586,38 @@ impl Regex {
 					None => Ok(None),
 				}
 			},
+
+			Regex::NulLines(re) => {
+				let mut offset = 0;
+				for line in text.split('\0') {
+					if let Some(caps) = re.captures_text(line, bytes)? {
+						return Ok(Some(Captures::Shifted { caps: Box::new(caps), offset }));
+					}
+					offset += line.len() + 1;
+				}
+				Ok(None)
+			},
 		}
 	}
 
 	/// Return a non-capturing result for a single match.
 	pub fn find<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Match<'t>>> {
+		if self.misses_literally(chunk) {
+			return Ok(None);
+		}
+		self.find_text(chunk.as_str(), chunk.is_bytes())
+	}
+
+	/// The first match in `text`, which is byte text when `bytes`.
+	fn find_text<'t>(&self, text: &'t str, bytes: bool) -> SedResult<Option<Match<'t>>> {
 		match self {
-			Regex::Literal(m) => Ok(literal_haystack(m, chunk)
-				.and_then(|haystack| m.find(haystack))
-				.map(|(start, end, text)| Match { start, end, text })),
+			Regex::Literal(m) => {
+				Ok(m.find(text.as_bytes()).map(|(start, end, text)| Match { start, end, text }))
+			},
 
 			Regex::Byte(re) => {
-				let text = chunk.as_str();
 				let haystack = text.as_bytes();
-				let found = if chunk.is_bytes() {
+				let found = if bytes {
 					re.find_iter(haystack).find(|m| on_char_boundaries(text, m.start(), m.end()))
 				} else {
 					re.find(haystack)
@@ -7474,20 +7633,30 @@ impl Regex {
 				}
 			},
 
-			Regex::Fancy(re) => match re.find(chunk.as_str()) {
+			Regex::Fancy(re) => match re.find(text) {
 				Ok(Some(m)) => Ok(Some(m.into())),
 				Ok(None) => Ok(None),
 				Err(e) => Err(SedError::new(2, e.to_string())),
 			},
 
 			Regex::Longest(longest) => {
-				let text = chunk.as_str();
 				if !longest.may_match(text) {
 					return Ok(None);
 				}
 				Ok(longest
 					.first(text)?
 					.map(|(_, start, end)| Match { start, end, text: &text[start..end] }))
+			},
+
+			Regex::NulLines(re) => {
+				let mut offset = 0;
+				for line in text.split('\0') {
+					if let Some(m) = re.find_text(line, bytes)? {
+						return Ok(Some(m.shifted(offset)));
+					}
+					offset += line.len() + 1;
+				}
+				Ok(None)
 			},
 		}
 	}
@@ -7552,8 +7721,68 @@ pub enum CaptureMatches<'t> {
 		iter:      ByteCaptureMatches<'t, 't>,
 		byte_text: Option<&'t str>,
 	},
-	Fancy(FancyCaptureMatches<'t, 't>),
+	Fancy(FancyMatches<'t>),
 	Longest(LongestMatches<'t>),
+	NulLines(Box<NulLineMatches<'t>>),
+}
+
+/// The matches of a fancy-regex pattern, each searched from where the one
+/// before it ended. GNU allows no empty match where the last match ended,
+/// and after an empty match goes on at the next byte of a line that is
+/// UTF-8, where fancy-regex goes on at the next character: inside a
+/// character `InsideChars` answers.
+pub struct FancyMatches<'t> {
+	re:       &'t FancyRegex,
+	text:     &'t str,
+	/// Whether `text` is byte text.
+	bytes:    bool,
+	pos:      usize,
+	/// Where the last match ended.
+	last_end: Option<usize>,
+	/// The line read as bytes, made the first time a position inside a
+	/// character is searched.
+	inside:   Option<InsideChars>,
+	done:     bool,
+}
+
+impl<'t> FancyMatches<'t> {
+	/// The next match, or `None` once the search has passed the end of the
+	/// text.
+	fn step(&mut self) -> SedResult<Option<Captures<'t>>> {
+		while self.pos <= self.text.len() {
+			let pos = self.pos;
+			if !self.text.is_char_boundary(pos) {
+				self.pos += 1;
+				if self.last_end != Some(pos)
+					&& self
+						.inside
+						.get_or_insert_with(|| InsideChars::new(self.text))
+						.empty_match_at(self.re, self.text, pos)?
+				{
+					self.last_end = Some(pos);
+					return Ok(Some(Captures::Empty { at: pos, len: self.re.captures_len() }));
+				}
+				continue;
+			}
+			let Some(caps) = self
+				.re
+				.captures_from_pos(self.text, pos)
+				.map_err(|e| SedError::new(2, format!("error retrieving RE captures: {e}")))?
+			else {
+				return Ok(None);
+			};
+			let whole = caps.get(0).expect("group 0 is the whole match");
+			let (start, end) = (whole.start(), whole.end());
+			if start == end && self.last_end == Some(start) {
+				self.pos = after_empty(self.text, self.bytes, start);
+				continue;
+			}
+			self.last_end = Some(end);
+			self.pos = if end > start { end } else { after_empty(self.text, self.bytes, end) };
+			return Ok(Some(Captures::Fancy(caps)));
+		}
+		Ok(None)
+	}
 }
 
 /// The matches of a top-level alternation, each the longest at its leftmost
@@ -7567,6 +7796,8 @@ pub struct LongestMatches<'t> {
 	/// Where the last match ended.
 	last_end: Option<usize>,
 	next:     NextMatches,
+	/// The line read as bytes, for a whole pattern fancy-regex runs.
+	inside:   Option<InsideChars>,
 	done:     bool,
 }
 
@@ -7580,20 +7811,28 @@ impl<'t> LongestMatches<'t> {
 			if !self.text.is_char_boundary(self.pos) {
 				// Inside a character of a line that is UTF-8 GNU finds an
 				// empty match too, and only one: `printf '\303\251\n' | sed
-				// -E 's/a*|b/-/g'` prints `-\303-\251-`. The whole pattern's
-				// bytes engine answers whether there is one.
+				// -E 's/a*|b/-/g'` prints `-\303-\251-`. The whole pattern
+				// answers whether there is one.
 				let pos = self.pos;
 				self.pos += 1;
-				let Regex::Byte(re) = self.longest.whole.as_ref() else { continue };
 				if self.last_end == Some(pos) {
 					continue;
 				}
-				let caps = re.captures_at(self.text.as_bytes(), pos).filter(|caps| {
-					caps.get(0).is_some_and(|m| m.start() == pos && m.is_empty())
-				});
-				if let Some(caps) = caps {
+				let found = match self.longest.whole.as_ref() {
+					Regex::Byte(re) => re
+						.captures_at(self.text.as_bytes(), pos)
+						.filter(|caps| caps.get(0).is_some_and(|m| m.start() == pos && m.is_empty()))
+						.map(Captures::Byte),
+					Regex::Fancy(re) => self
+						.inside
+						.get_or_insert_with(|| InsideChars::new(self.text))
+						.empty_match_at(re, self.text, pos)?
+						.then(|| Captures::Empty { at: pos, len: re.captures_len() }),
+					_ => None,
+				};
+				if let Some(caps) = found {
 					self.last_end = Some(pos);
-					return Ok(Some(Captures::Byte(caps)));
+					return Ok(Some(caps));
 				}
 				continue;
 			}
@@ -7603,21 +7842,47 @@ impl<'t> LongestMatches<'t> {
 				return Ok(None);
 			};
 			if start == end && self.last_end == Some(start) {
-				self.pos = self.after_empty(start);
+				self.pos = after_empty(self.text, self.bytes, start);
 				continue;
 			}
 			self.last_end = Some(end);
-			self.pos = if end > start { end } else { self.after_empty(end) };
+			self.pos = if end > start { end } else { after_empty(self.text, self.bytes, end) };
 			return self.longest.captures(self.text, branch, start);
 		}
 		Ok(None)
 	}
+}
 
-	/// Where the search goes on after an empty match at `at`: the next byte
-	/// in a line that is UTF-8, where GNU finds an empty match inside a
-	/// character as well, and the next character in byte text.
-	fn after_empty(&self, at: usize) -> usize {
-		if self.bytes { next_boundary(self.text, at) } else { at + 1 }
+/// The matches of a [`Regex::NulLines`] pattern: those of each line of the
+/// text in turn, a line ending at a NUL.
+pub struct NulLineMatches<'t> {
+	re:      &'t Regex,
+	/// The lines not searched yet.
+	lines:   std::str::Split<'t, char>,
+	/// Where the next of `lines` starts in the text.
+	start:   usize,
+	/// Whether the text is byte text.
+	bytes:   bool,
+	/// Where the line being searched starts, and its matches.
+	current: Option<(usize, CaptureMatches<'t>)>,
+}
+
+impl<'t> Iterator for NulLineMatches<'t> {
+	type Item = SedResult<Captures<'t>>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		loop {
+			if let Some((offset, matches)) = &mut self.current
+				&& let Some(found) = matches.next()
+			{
+				let offset = *offset;
+				return Some(found.map(|caps| Captures::Shifted { caps: Box::new(caps), offset }));
+			}
+			let line = self.lines.next()?;
+			let offset = self.start;
+			self.start += line.len() + 1;
+			self.current = Some((offset, self.re.captures_iter_text(line, self.bytes)));
+		}
 	}
 }
 
@@ -7636,29 +7901,23 @@ impl<'t> Iterator for CaptureMatches<'t> {
 				})
 				.map(|caps| Ok(Captures::Byte(caps)))
 			},
-			CaptureMatches::Fancy(iter) => match iter.next() {
-				Some(Ok(caps)) => Some(Ok(Captures::Fancy(caps))),
-				Some(Err(e)) => {
-					Some(Err(SedError::new(2, format!("error retrieving RE captures: {e}"))))
-				},
-				None => None,
+			CaptureMatches::Fancy(iter) => {
+				if iter.done {
+					return None;
+				}
+				let found = iter.step().transpose();
+				iter.done = !matches!(found, Some(Ok(_)));
+				found
 			},
 			CaptureMatches::Longest(iter) => {
 				if iter.done {
 					return None;
 				}
-				match iter.step() {
-					Ok(Some(caps)) => Some(Ok(caps)),
-					Ok(None) => {
-						iter.done = true;
-						None
-					},
-					Err(e) => {
-						iter.done = true;
-						Some(Err(e))
-					},
-				}
+				let found = iter.step().transpose();
+				iter.done = !matches!(found, Some(Ok(_)));
+				found
 			},
+			CaptureMatches::NulLines(iter) => iter.next(),
 		}
 	}
 }
@@ -7690,6 +7949,11 @@ impl<'t> Match<'t> {
 	pub fn as_str(&self) -> &'t str {
 		self.text
 	}
+
+	/// The same match, found in a part of the text that starts at `offset`.
+	fn shifted(self, offset: usize) -> Self {
+		Self { start: self.start + offset, end: self.end + offset, text: self.text }
+	}
 }
 
 /// Provide interface compatible with Regex::Captures.
@@ -7705,6 +7969,15 @@ pub enum Captures<'t> {
 		caps:   FancyCaptures<'t>,
 		offset: usize,
 		total:  usize,
+	},
+	/// An empty match at `at`, inside a character of a line that is UTF-8,
+	/// of a pattern of `len` groups; see `InsideChars`.
+	Empty { at: usize, len: usize },
+	/// The captures of a match found in a part of the text that starts at
+	/// `offset`, a line of a [`Regex::NulLines`] pattern.
+	Shifted {
+		caps:   Box<Captures<'t>>,
+		offset: usize,
 	},
 }
 
@@ -7734,6 +8007,12 @@ impl<'t> Captures<'t> {
 				};
 				Ok(caps.get(index).map(Match::from))
 			},
+			// The groups took no part in the match, or matched the empty
+			// text at `at`, which a replacement writes alike.
+			Captures::Empty { at, .. } => {
+				Ok((i == 0).then_some(Match { start: *at, end: *at, text: "" }))
+			},
+			Captures::Shifted { caps, offset } => Ok(caps.get(i)?.map(|m| m.shifted(*offset))),
 		}
 	}
 
@@ -7744,6 +8023,8 @@ impl<'t> Captures<'t> {
 			Captures::Byte(caps) => caps.len(),
 			Captures::Fancy(caps) => caps.len(),
 			Captures::Branch { total, .. } => *total,
+			Captures::Empty { len, .. } => *len,
+			Captures::Shifted { caps, .. } => caps.len(),
 		}
 	}
 
@@ -8098,6 +8379,8 @@ pub struct InPlace {
 	/// or stream (line-buffered); classified once by the host.
 	stdout_is_file:      bool,
 	fs:                  BlockingFs,
+	/// The byte that ends each line written (see `OutputBuffer`).
+	delimiter:           u8,
 	pub output:          OutputBuffer,
 	pub in_place:        bool,
 	pub in_place_suffix: Option<String>,
@@ -8111,11 +8394,13 @@ impl InPlace {
 	/// Depending on its settings it may or may not perform in-place
 	/// editing, backup the original file, or follow symlinks.
 	pub fn new_with_stdout(context: ProcessingContext, stdout: OpenFile, stdout_is_file: bool) -> Self {
+		let delimiter = context.delimiter();
 		Self {
-			output: stdout_output(&stdout, stdout_is_file),
+			output: stdout_output(&stdout, stdout_is_file, delimiter),
 			stdout,
 			stdout_is_file,
 			fs: context.paths.fs().clone(),
+			delimiter,
 			in_place: context.in_place,
 			in_place_suffix: context.in_place_suffix,
 			follow_symlinks: context.follow_symlinks,
@@ -8150,7 +8435,7 @@ impl InPlace {
 	/// to the context settings.
 	fn begin_resolved(&mut self, file_name: &Path) -> SedResult<&mut OutputBuffer> {
 		if !self.in_place {
-			self.output = stdout_output(&self.stdout, self.stdout_is_file);
+			self.output = stdout_output(&self.stdout, self.stdout_is_file, self.delimiter);
 			return Ok(&mut self.output);
 		}
 
@@ -8180,7 +8465,7 @@ impl InPlace {
 		}
 
 		let writer = temp_file.file.as_ref().expect("temporary file open").try_clone()?;
-		self.output = OutputBuffer::new(Box::new(writer), false);
+		self.output = OutputBuffer::new(Box::new(writer), false, self.delimiter);
 		self.temp_file = Some(temp_file);
 		self.original_path = Some(file_name.to_path_buf());
 
@@ -8201,7 +8486,7 @@ impl InPlace {
 
 		// Release the output's handle, then close the last one to surface
 		// deferred write errors before the file replaces the original.
-		self.output = stdout_output(&self.stdout, self.stdout_is_file);
+		self.output = stdout_output(&self.stdout, self.stdout_is_file, self.delimiter);
 		temp.close()
 			.map_err_context(|| format!("error writing temporary file {}", temp.path.quote()))?;
 
@@ -8236,9 +8521,10 @@ impl InPlace {
 	}
 }
 
-/// Sed's standard output, line-buffered unless it is a regular file.
-fn stdout_output(stdout: &OpenFile, stdout_is_file: bool) -> OutputBuffer {
-	OutputBuffer::new(Box::new(stdout.clone()), !stdout_is_file)
+/// Sed's standard output, line-buffered unless it is a regular file, its
+/// lines ended by `delimiter`.
+fn stdout_output(stdout: &OpenFile, stdout_is_file: bool, delimiter: u8) -> OutputBuffer {
+	OutputBuffer::new(Box::new(stdout.clone()), !stdout_is_file, delimiter)
 }
 
 #[cfg(test)]
@@ -8448,10 +8734,10 @@ pub struct NamedWriter {
 	location: ScriptLocation,
 }
 
-/// Writes `line`, byte text when `bytes`, and a newline.
-fn write_record(out: &mut impl Write, line: &str, bytes: bool) -> std::io::Result<()> {
+/// Writes `line`, byte text when `bytes`, and `delimiter`.
+fn write_record(out: &mut impl Write, line: &str, bytes: bool, delimiter: u8) -> std::io::Result<()> {
 	write_text_bytes(out, line, bytes)?;
-	out.write_all(b"\n")
+	out.write_all(&[delimiter])
 }
 
 impl NamedWriter {
@@ -8488,8 +8774,9 @@ impl NamedWriter {
 		Ok(writer)
 	}
 
-	/// Write a line to the file with a newline, returning descriptive errors.
-	/// The line is byte text when `bytes`, and its bytes are what is written.
+	/// Write a line to the file, ended by `delimiter` (the newline, or NUL
+	/// under `-z`), returning descriptive errors. The line is byte text when
+	/// `bytes`, and its bytes are what is written.
 	///
 	/// `output` is sed's current output: stdout, or the temporary file under
 	/// `-i`, in which case `/dev/stdout` still means the real stdout.
@@ -8497,15 +8784,16 @@ impl NamedWriter {
 		&mut self,
 		line: &str,
 		bytes: bool,
+		delimiter: u8,
 		output: &mut OutputBuffer,
 		in_place: bool,
 		host: &mut Host,
 	) -> SedResult<()> {
 		let result = match &mut self.target {
-			Target::File(writer) => write_record(writer, line, bytes),
-			Target::Stdout if in_place => write_record(&mut host.stdout, line, bytes),
-			Target::Stdout => output.write_text(format!("{line}\n"), bytes),
-			Target::Stderr => write_record(&mut host.stderr, line, bytes),
+			Target::File(writer) => write_record(writer, line, bytes, delimiter),
+			Target::Stdout if in_place => write_record(&mut host.stdout, line, bytes, delimiter),
+			Target::Stdout => output.write_line(line, bytes),
+			Target::Stderr => write_record(&mut host.stderr, line, bytes, delimiter),
 			Target::Closed => Err(std::io::Error::other("file already closed")),
 		};
 		result.map_err(|e| {
@@ -8943,6 +9231,7 @@ fn substitute(
 			writer.borrow_mut().write_line(
 				pattern.as_str(),
 				pattern.is_bytes(),
+				context.delimiter(),
 				output,
 				context.in_place,
 				host,
@@ -8981,7 +9270,7 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
 	for elem in &context.append_elements {
 		match elem {
 			AppendElement::Text(text) => {
-				output.write_str(&**text)?;
+				output.write_verbatim(text)?;
 			},
 			AppendElement::Path(path) => {
 				output.copy_file(context.paths.fs(), path)?;
@@ -8992,7 +9281,10 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
 	Ok(())
 }
 
-/// List the passed pattern space in unambiguous form.
+/// List the passed pattern space in unambiguous form. Each output line ends
+/// with the delimiter, and a newline or NUL inside the pattern space is an
+/// escape (`\n`, `\000`), as GNU sed lists it: `printf 'x\ny\n' | sed -n
+/// 'N;l'` prints `x\ny$`.
 fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResult<()> {
 	// Special case for an empty pattern space
 	if line.is_empty() {
@@ -9008,13 +9300,6 @@ fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResul
 	let mut line_width = 0;
 
 	for ch in line.chars() {
-		if ch == '\n' {
-			buff.push_str("$\n");
-			output.write_str(&buff)?;
-			line_width = 0;
-			continue;
-		}
-
 		let mut char_buff = [0u8; 1];
 		let out_str: Cow<str> = match char_byte(ch) {
 			// A byte of a line that is not UTF-8, in octal as GNU writes it:
@@ -9027,6 +9312,7 @@ fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResul
 				'\x0c' => Cow::Borrowed(r"\f"),
 				'\\' => Cow::Borrowed(r"\\"),
 				'\r' => Cow::Borrowed(r"\r"),
+				'\n' => Cow::Borrowed(r"\n"),
 				'\t' => Cow::Borrowed(r"\t"),
 				c if c.is_ascii_control() => Cow::Owned(format!("\\{:03o}", ch as u8)),
 				c if c == ' ' || c.is_ascii_graphic() => Cow::Borrowed(ch.encode_utf8(&mut char_buff)),
@@ -9092,6 +9378,9 @@ fn process_file(
 	host: &mut Host,
 ) -> SedResult<()> {
 	process_address_0(commands.clone(), output, context.paths.fs())?;
+	// What ends each line, and what `N`, `G`, `H`, `D` and `P` read as the
+	// end of a line inside the pattern space: NUL under `-z`.
+	let delimiter = char::from(context.delimiter());
 
 	// Loop over the input lines as pattern space.
 	'lines: while let Some(mut pattern) = reader.get_line()? {
@@ -9109,7 +9398,7 @@ fn process_file(
 				// Continue processing the `N` command.
 				let mut combined_lines = action.prepend;
 				let mut bytes = action.bytes;
-				combined_lines.push('\n');
+				combined_lines.push(delimiter);
 				append_text(&mut combined_lines, &mut bytes, pattern.as_str(), pattern.is_bytes());
 
 				pattern.set_text(combined_lines, bytes, pattern.is_newline_terminated());
@@ -9173,8 +9462,9 @@ fn process_file(
 					break;
 				},
 				'D' => {
-					// Delete up to \n and start a new cycle without new input.
-					if let Some(pos) = pattern.as_str().find('\n') {
+					// Delete up to the first delimiter and start a new cycle
+					// without new input.
+					if let Some(pos) = pattern.as_str().find(delimiter) {
 						let (s, _) = pattern.fields_mut();
 						s.drain(..=pos);
 						current.clone_from(&commands);
@@ -9193,9 +9483,10 @@ fn process_file(
 					);
 				},
 				'G' => {
-					// Append to pattern \n followed by hold space contents.
+					// Append to pattern the delimiter followed by hold space
+					// contents.
 					let (mut content, mut bytes) = pattern.take_text();
-					content.push('\n');
+					content.push(delimiter);
 					append_text(&mut content, &mut bytes, &context.hold.content, context.hold.bytes);
 					pattern.set_text(content, bytes, context.hold.has_newline);
 				},
@@ -9209,9 +9500,10 @@ fn process_file(
 					context.hold.has_newline = pattern.is_newline_terminated();
 				},
 				'H' => {
-					// Append to hold \n followed by pattern space contents.
+					// Append to hold the delimiter followed by pattern space
+					// contents.
 					let hold = &mut context.hold;
-					hold.content.push('\n');
+					hold.content.push(delimiter);
 					append_text(&mut hold.content, &mut hold.bytes, pattern.as_str(), pattern.is_bytes());
 					hold.has_newline = pattern.is_newline_terminated();
 				},
@@ -9248,8 +9540,8 @@ fn process_file(
 				},
 				'P' => {
 					let line = pattern.as_str();
-					if let Some(pos) = line.find('\n') {
-						output.write_text(&line[..=pos], pattern.is_bytes())?;
+					if let Some(pos) = line.find(delimiter) {
+						output.write_line(&line[..pos], pattern.is_bytes())?;
 					} else {
 						write_chunk(output, context, &pattern)?;
 					}
@@ -9297,6 +9589,7 @@ fn process_file(
 					writer.borrow_mut().write_line(
 						pattern.as_str(),
 						pattern.is_bytes(),
+						context.delimiter(),
 						output,
 						context.in_place,
 						host,
@@ -9399,7 +9692,7 @@ pub fn process_all_files(
 
 	for (index, path) in files.iter().enumerate() {
 		context.last_file = index == last_file_index;
-		let mut reader = LineReader::open_with_host(path, host)
+		let mut reader = LineReader::open_with_host(path, host, context.delimiter())
 			.map_err_context(|| format!("error opening input file {}", path.quote()))?;
 		let resolved_path = host.resolve(path);
 		let output = in_place.begin(&resolved_path)?;

@@ -72,3 +72,27 @@ describe("builtin sed: what GNU sed refuses", () => {
 		[String.raw`printf 'aab\n' | sed 's/a**/X/' 2>/dev/null`, "", 1],
 	]);
 });
+
+describe("builtin sed: a `}` ends a command, as a `;` does", () => {
+	cases([
+		// Regressed: "extra characters at the end of the p command" and exit 1.
+		[String.raw`printf 'x\ny\n' | sed -n '/x/{p}' 2>/dev/null`, "x\n", 0],
+		// Regressed: the same for the flags of `s`, "invalid substitute flag: '}'".
+		[String.raw`printf 'x\ny\n' | sed -n '/x/{s/x/X/gp}' 2>/dev/null`, "X\n", 0],
+		// Regressed: the same for `y`, and for the blank before the `}`.
+		[String.raw`printf 'x\ny\n' | sed '/x/{y/x/X/ }' 2>/dev/null`, "X\ny\n", 0],
+		// Regressed: the same for a label.
+		[String.raw`printf 'x\ny\n' | sed -n '/x/{ba};p;:a' 2>/dev/null`, "y\n", 0],
+		// Regressed: the same for the exit status of `q`.
+		[String.raw`printf 'x\ny\n' | sed '/x/{q5}' 2>/dev/null`, "x\n", 5],
+		// Regressed: the same for a `}` that ends a block.
+		[String.raw`printf 'x\ny\n' | sed -n '1{/x/{p}}' 2>/dev/null`, "x\n", 0],
+	]);
+});
+
+describe("builtin sed: l lists a newline of the pattern space as an escape", () => {
+	cases([
+		// Regressed: `x$` and `x$\ny$` were listed, as if each were a line of its own.
+		[String.raw`printf 'x\ny\n' | sed -n 'N;l' 2>/dev/null`, "x\\ny$\n", 0],
+	]);
+});
