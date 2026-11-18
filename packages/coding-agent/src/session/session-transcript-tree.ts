@@ -11,7 +11,13 @@ import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
 import { transcriptByteChunks } from "./session-loader";
-import { LINE_STREAM_CHUNK, type SessionStorage, type SessionStorageWriter } from "./session-storage";
+import {
+	LINE_STREAM_CHUNK,
+	RACED_READ_RETRIES,
+	SessionReadConflictError,
+	type SessionStorage,
+	type SessionStorageWriter,
+} from "./session-storage";
 import { parseTitleSlotFromContent, titleUpdateFromSlot } from "./session-title-slot";
 
 /**
@@ -72,38 +78,44 @@ export async function copyTranscriptTree(
  * store that yields a chunk per stored part (SQL: about one per line) is not
  * appended to once per part; a title slot at its head is set on `to` as a
  * whole write would set it. Returns false, leaving nothing at `to`, when
- * `from` is gone; any other failure removes the partial copy and throws.
+ * `from` is gone; any other failure removes the partial copy and throws. A
+ * full rewrite or delete of `from` between two chunks removes the partial
+ * copy and copies `from` again from its start, up to
+ * {@link RACED_READ_RETRIES} times.
  */
 export async function copyTranscript(storage: SessionStorage, from: string, to: string): Promise<boolean> {
-	const decoder = new TextDecoder();
-	let writer: SessionStorageWriter | undefined;
-	let head = "";
-	let batch = "";
-	try {
-		for await (const chunk of transcriptByteChunks(from, storage)) {
+	for (let retries = 0; ; retries++) {
+		const decoder = new TextDecoder();
+		let writer: SessionStorageWriter | undefined;
+		let head = "";
+		let batch = "";
+		try {
+			for await (const chunk of transcriptByteChunks(from, storage)) {
+				writer ??= storage.openWriter(to, { flags: "w" });
+				const text = decoder.decode(chunk, { stream: true });
+				if (head.length < SESSION_TITLE_SLOT_BYTES) head += text.slice(0, SESSION_TITLE_SLOT_BYTES - head.length);
+				batch += text;
+				if (batch.length < LINE_STREAM_CHUNK) continue;
+				await writer.append(batch);
+				batch = "";
+			}
 			writer ??= storage.openWriter(to, { flags: "w" });
-			const text = decoder.decode(chunk, { stream: true });
-			if (head.length < SESSION_TITLE_SLOT_BYTES) head += text.slice(0, SESSION_TITLE_SLOT_BYTES - head.length);
-			batch += text;
-			if (batch.length < LINE_STREAM_CHUNK) continue;
-			await writer.append(batch);
-			batch = "";
+			batch += decoder.decode();
+			if (batch) await writer.append(batch);
+			await writer.close();
+		} catch (err) {
+			if (writer) {
+				await writer.close().catch(() => {});
+				await storage.unlink(to).catch(() => {});
+			}
+			if (isEnoent(err)) return false;
+			if (err instanceof SessionReadConflictError && retries < RACED_READ_RETRIES) continue;
+			throw err;
 		}
-		writer ??= storage.openWriter(to, { flags: "w" });
-		batch += decoder.decode();
-		if (batch) await writer.append(batch);
-		await writer.close();
-	} catch (err) {
-		if (writer) {
-			await writer.close().catch(() => {});
-			await storage.unlink(to).catch(() => {});
-		}
-		if (isEnoent(err)) return false;
-		throw err;
+		const title = titleUpdateFromSlot(parseTitleSlotFromContent(head));
+		if (title) await storage.updateSessionTitle(to, title);
+		return true;
 	}
-	const title = titleUpdateFromSlot(parseTitleSlotFromContent(head));
-	if (title) await storage.updateSessionTitle(to, title);
-	return true;
 }
 
 /**

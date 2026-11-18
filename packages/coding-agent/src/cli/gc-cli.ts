@@ -34,6 +34,7 @@ import { parseTerminalBreadcrumb } from "../session/session-paths";
 import { readSessionHeaderId, transcriptByteChunks } from "../session/session-loader";
 import {
 	FileSessionStorage,
+	RACED_READ_RETRIES,
 	SESSION_STAGING_RE,
 	SessionReadConflictError,
 	type SessionStorage,
@@ -82,12 +83,6 @@ const GC_WRITE_GRACE_MS = 5 * 60_000;
 const SESSION_SUFFIX = ".jsonl";
 const COMPRESSED_SESSION_SUFFIX = ".jsonl.gz";
 const GC_LOCK_BREAKER_SUFFIX = ".break";
-/**
- * Times the blob scan reads a stored transcript again after a concurrent
- * rewrite raced its read. It never skips one: the blobs only that transcript
- * references would then be deleted.
- */
-const RACED_READ_RETRIES = 3;
 /** Bytes sampled to rule out a session header before streaming an artifact. */
 const HEADER_SNIFF_BYTES = 4096;
 /**
@@ -584,6 +579,7 @@ async function collectReferencedBlobHashes(
 				} catch (error) {
 					// Removed since the listing: it references nothing anymore.
 					if (codeOf(error) === "ENOENT") break;
+					// Raced by a rewrite: read it again, never skip it, or the blobs only it references would go.
 					if (error instanceof SessionReadConflictError && retries < RACED_READ_RETRIES) continue;
 					throw error;
 				}
