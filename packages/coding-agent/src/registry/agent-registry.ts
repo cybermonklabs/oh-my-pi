@@ -40,6 +40,12 @@ export interface AgentRunLifecycle {
 	acceptedAt?: number;
 	/** When the ref last left `running` for a terminal status. */
 	terminalAt?: number;
+	/**
+	 * When the run's drive ended, with or without a result (a failure, an
+	 * aborted run kept for resuming): the run takes no further turn of its own,
+	 * though its cleanup may still hold the session until its terminal frame.
+	 */
+	endedAt?: number;
 }
 
 /** Historical identity and telemetry that remain available after the live session is disposed. */
@@ -153,6 +159,8 @@ export interface AgentRegistryApi {
 	setStatus(id: string, status: AgentStatus, expected?: AgentRefExpectation): boolean;
 	/** Record that the current run handed over its final result. */
 	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean;
+	/** Record that the current run's drive ended, whatever its outcome. */
+	markRunEnded(id: string, expected?: AgentRefExpectation): boolean;
 	/** Accepted-but-running refs whose run already finished. */
 	staleAcceptedRuns(): AgentRef[];
 	/** Record a short activity gist for the work-aware roster. */
@@ -366,6 +374,23 @@ export class AgentRegistry implements AgentRegistryApi {
 		} else {
 			this.#emit({ type: "metadata_changed", ref });
 		}
+		return true;
+	}
+
+	/**
+	 * Stamp `lifecycle.endedAt`: the current run's drive ended, whatever its
+	 * outcome, so the ref takes no further turn for this run even while its
+	 * cleanup still holds the session. Run-scoped like the other milestones:
+	 * {@link setStatus} clears it when the ref re-enters `running`.
+	 *
+	 * Returns false when the id is gone, aborted, or no longer owned by
+	 * `expected`.
+	 */
+	markRunEnded(id: string, expected?: AgentRefExpectation): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
+		ref.lifecycle = { ...ref.lifecycle, endedAt: Date.now() };
+		this.#emit({ type: "metadata_changed", ref });
 		return true;
 	}
 

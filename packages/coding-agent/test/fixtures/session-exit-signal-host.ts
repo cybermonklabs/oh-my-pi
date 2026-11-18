@@ -6,13 +6,15 @@
  * stored, and waits for a signal. With `pending` last it does not wait for the
  * turn's writes: the line follows as soon as the turn's first publish, a full
  * write of the new session, is queued, and that publish is still queued when
- * the signal lands.
+ * the signal lands. Every error-level log record is appended to
+ * `<work dir>/error-log.jsonl` as `{ message, context }`.
  *
- *   session-exit-signal-host.ts queued <work dir> <slow|hang> [pending]
+ *   session-exit-signal-host.ts queued <work dir> <slow|hang|failing> [pending]
  *     An indexed store whose backend keeps each session in a file under the
- *     work dir. Once ready, each backend write takes 500 ms (slow) or never
- *     answers (hang). With `pending` that holds from the first write on, and
- *     a slow write first waits for the signal.
+ *     work dir. Once ready, each backend write takes 500 ms (slow), never
+ *     answers (hang), or waits for the signal and then fails with
+ *     STORE_FAILURE (failing). With `pending` that holds from the first write
+ *     on, and a slow write first waits for the signal.
  *   session-exit-signal-host.ts postgres <work dir> <url> <table> [pending]
  *     SQL storage on PostgreSQL, in <table>. With `pending`, the parent has
  *     created the table and holds a write lock on it, so the store does not
@@ -36,10 +38,13 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { postmortem } from "@oh-my-pi/pi-utils";
+import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 
 postmortem.installProcessHandlers();
+
+/** What a `failing` backend's writes fail with (the test matches this text). */
+const STORE_FAILURE = "backend rejected the write: storage quota exceeded";
 
 /** Keeps each session in a file under `dir`; while `stall` is set, every write waits on it first. */
 class FileBackend implements SessionStorageBackend {
@@ -106,13 +111,20 @@ class FileBackend implements SessionStorageBackend {
 const [mode, workDir, ...rest] = process.argv.slice(2);
 if (!workDir || (mode !== "queued" && mode !== "postgres")) throw new Error("usage: see the file header");
 const pending = rest.at(-1) === "pending";
+const errorLog = path.join(workDir, "error-log.jsonl");
+logger.registerLogSink(event => {
+	if (event.level !== "error") return;
+	fs.appendFileSync(errorLog, `${JSON.stringify({ message: event.message, context: event.context })}\n`);
+});
 
 let storage: SessionStorage;
 let backend: FileBackend | undefined;
 let stall: (() => Promise<void>) | undefined;
 if (mode === "queued") {
 	const [speed] = rest;
-	if (speed !== "slow" && speed !== "hang") throw new Error("queued: expected slow or hang");
+	if (speed !== "slow" && speed !== "hang" && speed !== "failing") {
+		throw new Error("queued: expected slow, hang or failing");
+	}
 	const storeDir = path.join(workDir, "store");
 	fs.mkdirSync(storeDir, { recursive: true });
 	backend = new FileBackend(storeDir);
@@ -121,13 +133,14 @@ if (mode === "queued") {
 	storage = indexed;
 	// Real time: the parent signals this process and reads the store after it ends.
 	if (speed === "hang") stall = () => Promise.withResolvers<void>().promise;
-	else if (!pending) stall = () => Bun.sleep(500);
+	else if (speed === "slow" && !pending) stall = () => Bun.sleep(500);
 	else {
 		// Runs after the cleanup handler's listener, which records the exit first.
 		const signalled = Promise.withResolvers<void>();
 		process.once("SIGTERM", () => signalled.resolve());
 		stall = async () => {
 			await signalled.promise;
+			if (speed === "failing") throw new Error(STORE_FAILURE);
 			await Bun.sleep(500);
 		};
 	}

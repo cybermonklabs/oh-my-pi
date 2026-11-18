@@ -69,10 +69,10 @@ export interface AgentsProbe {
 	/** Once the local session of `id` settled: its message count and the texts on its steering queue. */
 	settled(id: string): Promise<{ messageCount: number; steering: string[] }>;
 	/**
-	 * Through the peer handle of `id` (homed elsewhere): queue `text` as a steer held for the
-	 * next run, then take it back. Reports what `onPromptQueued` delivered here and the take-back.
+	 * Through the peer handle of `id` (homed elsewhere): queue `text` as a next-run steer,
+	 * then take it back. Reports what `onPromptQueued` delivered here and the take-back.
 	 */
-	peerHoldAndTakeBack(id: string, text: string): Promise<{ reported: unknown; removed: boolean }>;
+	peerQueueAndTakeBackNextRunSteer(id: string, text: string): Promise<{ reported: unknown; removed: boolean }>;
 }
 
 /** Test-only boot globals of the probe service. */
@@ -234,7 +234,7 @@ const probe: AgentsProbe = {
 				),
 		};
 	},
-	peerHoldAndTakeBack: async (id, text) => {
+	peerQueueAndTakeBackNextRunSteer: async (id, text) => {
 		const session = AgentRegistry.global().get(id)?.session;
 		if (!session) throw new Error(`no session for ${id}`);
 		const reported = Promise.withResolvers<unknown>();

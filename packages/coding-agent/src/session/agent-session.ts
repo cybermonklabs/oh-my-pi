@@ -1293,9 +1293,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#imageDescriptionAbortControllers = new Set<AbortController>();
 	#queuedMessageDrainBlocked = false;
 	/**
-	 * Steers held for the session's next run (`SteerOptions.holdUntilNextRun`): they
-	 * wait on the steering queue until a run's steering poll takes them, and no
-	 * queued-message drain starts a turn for them alone.
+	 * Next-run steers (`SteerOptions.holdUntilNextRun`): they wait on the steering
+	 * queue until a run's steering poll takes them, and no queued-message drain
+	 * starts a turn for them alone.
 	 */
 	#nextRunSteers = new WeakSet<AgentMessage>();
 	#modeExitDrainSuppressionDepth = 0;
@@ -1636,9 +1636,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// strand at the turn tail (steered past the loop's final boundary poll). While
 		// that interrupt's suppression is still in effect, reclaim such advisor steers
 		// as visible advice once idle — mirroring abort's #extractInterruptedQueuedMessages —
-		// so they neither auto-resume the run the user stopped (a non-empty steer queue
-		// otherwise bypasses the latch in #canAutoContinueForFollowUp) nor linger to
-		// flush at the next prompt. Real user steers/follow-ups are left untouched.
+		// so they neither auto-resume the run the user stopped (a queued steer that is
+		// not a next-run steer otherwise bypasses the latch in #canAutoContinueForFollowUp)
+		// nor linger to flush at the next prompt. Real user steers/follow-ups are left untouched.
 		if (this.#advisors.autoResumeSuppressed && !this.isStreaming) {
 			for (const card of this.#extractQueuedAdvisorCards()) {
 				this.#preserveAdvisorCard(card);
@@ -1650,8 +1650,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** IRC records that arrive after the loop's final aside poll — or while an abort skipped that
 	 *  poll — land in pending IRC queues with no loop left to drain them; the queued-message drain's
-	 *  gate (agent.hasQueuedMessages()) does not count peer IRC interrupts. Once idle, wake a turn so
-	 *  the agent responds to the peer. Skip only when a queued steer/follow-up will itself drive a
+	 *  gate (#hasDrainableQueuedMessages()) does not count peer IRC interrupts. Once idle, wake a turn
+	 *  so the agent responds to the peer. Skip only when a queued steer/follow-up will itself drive a
 	 *  resume turn whose aside poll already consumes these (no double-wake). */
 	#resumeStrandedIrcAsides(): void {
 		if (this.#modeExitDrainSuppressionDepth > 0 || this.#isDisposed || this.isStreaming || !this.#irc.hasPending()) {
@@ -2961,6 +2961,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			scheduleCompactionContinuation: options => this.#scheduleCompactionContinuation(options),
+			hasDrainableQueuedMessages: () => this.#hasDrainableQueuedMessages(),
 			persistTurnMessagesForMidRunCompaction: context => this.#persistTurnMessagesForMidRunCompaction(context),
 			findLastAssistantMessage: () => this.#findLastAssistantMessage(),
 			disconnectFromAgent: () => this.#disconnectFromAgent(),
@@ -9905,8 +9906,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * Queue a steering message to interrupt the agent mid-run. With
-	 * `holdUntilNextRun`, an idle session keeps it for its next run instead of
-	 * starting one (see {@link SteerOptions.holdUntilNextRun}).
+	 * `holdUntilNextRun` it is a next-run steer: an idle session keeps it for its
+	 * next run instead of starting one (see {@link SteerOptions.holdUntilNextRun}).
 	 */
 	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
 		if (text.startsWith("/")) {
@@ -10141,7 +10142,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			 * streams must not auto-continue as an autonomous turn.
 			 */
 			skipIdleDrain?: boolean;
-			/** Keep the queued messages for the next run: no drain starts a turn for them alone. */
+			/** Queue next-run steers: no drain starts a turn for them alone. */
 			nextRun?: boolean;
 			/**
 			 * `#promptGeneration` captured when prompt() took this submission. abort() (or a
@@ -10544,7 +10545,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return last?.role === "assistant" || last?.role === "toolResult";
 	}
 
-	/** Whether the steering queue holds a message other than a steer held for the next run. */
+	/** Whether the steering queue holds a message other than a next-run steer. */
 	#hasDrainableSteer(): boolean {
 		for (const message of this.agent.peekSteeringQueue()) {
 			if (!this.#nextRunSteers.has(message)) return true;
@@ -10553,16 +10554,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * `agent.hasQueuedMessages()` without next-run steers: queued input that may start
-	 * a turn of its own. A next-run steer waits for the next run instead, so neither
-	 * the idle drain, the settle and abort drains, nor a post-compaction continuation
-	 * starts a turn for it alone.
+	 * Queued input that may start a turn of its own: a follow-up, or a steer that
+	 * is not a next-run steer. A next-run steer waits for the next run instead, so
+	 * neither the idle drain, the settle and abort drains, nor a post-compaction
+	 * or frame-rescue continuation starts a turn for it alone.
 	 */
 	#hasDrainableQueuedMessages(): boolean {
-		if (!this.agent.hasQueuedMessages()) return false;
-		if (this.agent.peekFollowUpQueue().length > 0 || this.#hasDrainableSteer()) return true;
-		// Only next-run steers are queued, unless a run holds a claim on queued input.
-		return this.agent.peekSteeringQueue().length === 0;
+		return this.agent.peekFollowUpQueue().length > 0 || this.#hasDrainableSteer();
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
@@ -11138,7 +11136,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 *  continuing stream still delivers it. `forInterrupt` (Esc+abort) must neither lose a visible
 	 *  queued message an extension or agent sent (a peer notice, an extension card, an agent-
 	 *  attributed prompt) nor let abort()'s #drainStrandedQueuedMessages auto-resume the run the
-	 *  user just interrupted on it (the drain fires while agent.hasQueuedMessages()). So it marks
+	 *  user just interrupted on it (the drain fires while #hasDrainableQueuedMessages()). So it marks
 	 *  those messages for the abort that follows, which takes them out of the queues and records
 	 *  them in the transcript without a turn; the next turn delivers them. A recorded prompt keeps
 	 *  the hidden companions queued directly before it (keyword notices, image descriptions), as a

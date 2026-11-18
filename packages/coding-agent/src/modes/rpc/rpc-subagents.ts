@@ -306,10 +306,11 @@ export interface RpcOwnedSubagent {
 
 export interface RpcOwnedSubagentOptions {
 	/**
-	 * Also reach a subagent idle between its turns: an `idle` ref whose result
-	 * the parent has not accepted. A synchronous subagent waiting for its own
-	 * async jobs (an eval `agent()` handle) is idle there while `get_subagents`
-	 * still lists it running.
+	 * Also reach a subagent idle between its turns: an `idle` ref whose run is
+	 * still being driven (no `lifecycle.endedAt`) and whose result the parent
+	 * has not accepted. A synchronous subagent waiting for its own async jobs
+	 * (an eval `agent()` handle) is idle there while `get_subagents` still
+	 * lists it running.
 	 */
 	betweenTurns?: boolean;
 }
@@ -324,9 +325,12 @@ export interface RpcOwnedSubagentOptions {
  * carry the transcript file this session's roster recorded
  * (`<artifactsDir>/<id>.jsonl`) and still hold its live session. The ref must
  * be `running`, or with {@link RpcOwnedSubagentOptions.betweenTurns} `idle`
- * and not accepted: acceptance stamps `lifecycle.acceptedAt` and flips the ref
- * to `idle` before the terminal lifecycle frame prunes the roster, so an
- * accepted result stays out of reach.
+ * with its run neither ended nor accepted. The executor stamps
+ * `lifecycle.endedAt` once the run's drive ends, whatever the outcome, and
+ * acceptance also stamps `lifecycle.acceptedAt`; both happen before the
+ * cleanup and the terminal lifecycle frame that prunes the roster, so an
+ * accepted idle ref, and one whose run failed or stopped and is only being
+ * cleaned up, stay out of reach. A ref still `running` is reachable either way.
  */
 export function resolveOwnedLiveSubagent(
 	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
@@ -341,6 +345,9 @@ export function resolveOwnedLiveSubagent(
 	if (ref?.kind !== "sub" || !ref.session || ref.sessionFile !== snapshot.sessionFile) return undefined;
 	const reachable =
 		ref.status === "running" ||
-		(options?.betweenTurns === true && ref.status === "idle" && ref.lifecycle?.acceptedAt === undefined);
+		(options?.betweenTurns === true &&
+			ref.status === "idle" &&
+			ref.lifecycle?.endedAt === undefined &&
+			ref.lifecycle?.acceptedAt === undefined);
 	return reachable ? { ref, session: ref.session } : undefined;
 }

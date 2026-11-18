@@ -267,7 +267,7 @@ describe("agent bridging across subagent workers", () => {
 		expect(worker.load).toBe(1);
 	});
 
-	it("holds a steer for a worker-homed session's next run, reports it on main, and takes it back", async () => {
+	it("queues a next-run steer on a worker-homed session, reports it on main, and takes it back", async () => {
 		const { probe } = await startWorker();
 		await probe.open("W1", {});
 		const remote = mirrorOf(liveRef("W1").session);
@@ -276,7 +276,7 @@ describe("agent bridging across subagent workers", () => {
 			if (event.type === "message_end" && event.message.role === "user") ended.push(event.message);
 		});
 		const reported: UserMessage[] = [];
-		const holdForNextRun = (text: string) =>
+		const queueNextRunSteer = (text: string) =>
 			remote.steer(text, undefined, {
 				holdUntilNextRun: true,
 				onPromptQueued: messages => {
@@ -285,7 +285,7 @@ describe("agent bridging across subagent workers", () => {
 				},
 			});
 
-		await holdForNextRun("Take this back.");
+		await queueNextRunSteer("Take this back.");
 		await waitFor(() => reported.length === 1);
 		expect(reported[0]).toMatchObject({
 			role: "user",
@@ -298,7 +298,7 @@ describe("agent bridging across subagent workers", () => {
 		expect(await probe.settled("W1")).toEqual({ messageCount: 0, steering: [] });
 		expect(await remote.removeQueuedMessage("Take this back.", "steering")).toBe(false);
 
-		await holdForNextRun("Also check the README.");
+		await queueNextRunSteer("Also check the README.");
 		await waitFor(() => reported.length === 2);
 		expect(await remote.prompt("Submit your result.")).toBe(true);
 		// The run that takes the steer reports it as a copy matching what onPromptQueued reported.
@@ -307,12 +307,12 @@ describe("agent bridging across subagent workers", () => {
 		expect(await probe.settled("W1")).toMatchObject({ steering: [] });
 	}, 60_000);
 
-	it("holds and takes back a steer on a main-homed session through a worker's peer handle", async () => {
+	it("queues and takes back a next-run steer on a main-homed session through a worker's peer handle", async () => {
 		const { probe } = await startWorker();
 		const main = await mainSession("Main");
 		AgentRegistry.global().register({ id: "Main", displayName: "Main", kind: "main", session: main, status: "idle" });
 
-		const result = await probe.peerHoldAndTakeBack("Main", "Take this back.");
+		const result = await probe.peerQueueAndTakeBackNextRunSteer("Main", "Take this back.");
 
 		expect(result).toEqual({
 			reported: expect.objectContaining({

@@ -464,6 +464,8 @@ export interface SessionMaintenanceHost {
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
 	}): boolean;
+	/** Queued input that may start a turn of its own: next-run steers excluded. */
+	hasDrainableQueuedMessages(): boolean;
 	persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean>;
 	findLastAssistantMessage(): AssistantMessage | undefined;
 	disconnectFromAgent(): void;
@@ -5568,12 +5570,12 @@ export class SessionMaintenance {
 							terminalTextAnswer,
 							suppressContinuation,
 						});
-					} else if (!suppressContinuation && this.#host.agent.hasQueuedMessages()) {
+					} else if (!suppressContinuation && this.#host.hasDrainableQueuedMessages()) {
 						this.#host.scheduleAgentContinue({
 							source: "frame-rescue-queued-message",
 							delayMs: 100,
 							generation,
-							shouldContinue: () => this.#host.agent.hasQueuedMessages(),
+							shouldContinue: () => this.#host.hasDrainableQueuedMessages(),
 						});
 						continuationScheduled = true;
 					}
