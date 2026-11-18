@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionAPI, ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -143,15 +144,18 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	/**
 	 * A session on the gateway's claude-opus-5-5 (a 1M window unless `contextWindow` says otherwise) whose settings
 	 * load `OVERLAY` and `overlay` as a `--config` file. `replies` answers requests by their 1-based number; the rest
-	 * get text.
+	 * get text. With `discoverSkills` the session discovers its skills as a CLI session does, so a `skill://` read
+	 * of an unknown name rediscovers them.
 	 */
 	async function startSession(
 		tempDir: TempDir,
 		options: {
 			toolNames: string[];
 			discoverContextFiles?: boolean;
+			discoverSkills?: boolean;
 			overlay?: string;
 			contextWindow?: number;
+			extensions?: ExtensionFactory[];
 			replies?: Record<number, (turn: number) => Response>;
 		},
 	): Promise<Harness> {
@@ -187,7 +191,8 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			toolNames: options.toolNames,
 			...(options.discoverContextFiles ? {} : { contextFiles: [] }),
 			disableExtensionDiscovery: true,
-			skills: [],
+			extensions: options.extensions,
+			...(options.discoverSkills ? {} : { skills: [] }),
 			promptTemplates: [],
 			slashCommands: [],
 			enableMCP: false,
@@ -283,6 +288,74 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 		expect(withoutCacheControl(first.system)).toContain("The rule the session started with.");
 		expect(continuesCachedPrompt(first, second)).toBe(true);
 		expect(textOf(second.messages.slice(first.messages.length))).toContain("`disabledProviders`");
+	}, 30_000);
+
+	it("keeps the held prompt and tools through a skill:// read of a skill installed meanwhile", async () => {
+		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		// Project skills only: the developer's own skills stay out of discovery.
+		const projectSkills =
+			"skills:\n  enableCodexUser: false\n  enableClaudeUser: false\n  enableClaudeProject: false\n  enablePiUser: false\n  enableAgentsUser: false\n";
+		const harness = await startSession(tempDir, {
+			toolNames: ["read", "eval", "todo"],
+			discoverSkills: true,
+			overlay: projectSkills,
+			replies: { 3: turn => toolCallAnswer(turn, "read", { path: "skill://late-skill" }) },
+		});
+		await harness.session.prompt("first");
+		await reloadOverlay(
+			harness,
+			`${OVERLAY}${projectSkills}personality: pragmatic\ntodo:\n  enabled: false\ndisabledProviders:\n  - ollama\n`,
+		);
+		await harness.session.prompt("second");
+
+		// The skill list the prompt keeps lacks the new skill, so its rediscovery rebuilds nothing of its own.
+		await Bun.write(
+			tempDir.join(".omp/skills/late-skill/SKILL.md"),
+			"---\nname: late-skill\ndescription: A skill installed while the session runs.\n---\n\n# Late skill\n\nThe body of the late skill.\n",
+		);
+		await harness.session.prompt("A skill was installed. Read it.");
+
+		const [, second, third, fourth] = harness.requests;
+		if (!second || !third || !fourth) throw new Error("Expected the requests around the skill read");
+		expect(textOf(fourth.messages.slice(third.messages.length))).toContain("The body of the late skill.");
+		expect(continuesCachedPrompt(second, fourth)).toBe(true);
+	}, 30_000);
+
+	it("keeps the held prompt and tools when an extension registers its tool again unchanged", async () => {
+		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		let extension: ExtensionAPI | undefined;
+		const registerProbe = (pi: ExtensionAPI): void => {
+			pi.registerTool({
+				name: "probe",
+				label: "Probe",
+				description: "A tool an extension registers.",
+				parameters: pi.typebox.Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+			});
+		};
+		const harness = await startSession(tempDir, {
+			toolNames: ["read", "eval", "todo", "probe"],
+			extensions: [
+				pi => {
+					extension = pi;
+					registerProbe(pi);
+				},
+			],
+		});
+		await harness.session.prompt("first");
+		await reloadOverlay(harness, `${OVERLAY}todo:\n  enabled: false\n`);
+		await harness.session.prompt("second");
+
+		// The extension registers its tool again with the same definition: the session applies its tools again with
+		// a forced rebuild, which changes nothing of its own.
+		if (!extension) throw new Error("Expected the extension to load");
+		registerProbe(extension);
+		await harness.session.runToolRegistryMutation(async () => {});
+		await harness.session.prompt("third");
+
+		const [, second, third] = harness.requests;
+		if (!second || !third) throw new Error("Expected three requests");
+		expect(continuesCachedPrompt(second, third)).toBe(true);
 	}, 30_000);
 
 	it("sends the rebuilt prompt at the first request after the held prompt's cache entry lapsed", async () => {

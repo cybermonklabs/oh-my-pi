@@ -3,6 +3,7 @@ import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { ObservedPromptCacheEntry } from "@oh-my-pi/pi-coding-agent/session/prompt-cache-status";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -95,12 +96,16 @@ describe("system prompt of a resumed session", () => {
 		vi.restoreAllMocks();
 	});
 
-	/** One process on the session file (a new session without one): sends each prompt, then exits. */
+	/**
+	 * One process on the session file (a new session without one): runs `startup` as the process's own startup
+	 * steps would before any prompt, sends each prompt, then exits.
+	 */
 	async function runProcess(
 		tempDir: TempDir,
 		inputs: ProcessInputs,
 		prompts: string[],
 		sessionFile?: string,
+		startup?: (session: AgentSession, sessionManager: SessionManager) => Promise<void>,
 	): Promise<ProcessRun> {
 		const requests: MessagesRequest[] = [];
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
@@ -136,6 +141,7 @@ describe("system prompt of a resumed session", () => {
 			skipPythonPreflight: true,
 		});
 		try {
+			await startup?.(session, sessionManager);
 			const cacheEntryAtStart = session.observedPromptCacheEntry();
 			for (const text of prompts) await session.prompt(text);
 			const file = sessionManager.getSessionFile();
@@ -177,6 +183,71 @@ describe("system prompt of a resumed session", () => {
 		expect(resumed.cacheEntryAtStart?.change).toBeUndefined();
 		// The resumed reply was produced under the recorded prompt, so nothing new is recorded for it.
 		expect(resumed.promptDigests).toEqual(live.promptDigests);
+	}, 30_000);
+
+	/**
+	 * A CLI process's extension tools register after the session is built, as a tool-set apply. `eval`'s
+	 * description lists the tools a cell can call, so the tool definitions follow the set too.
+	 */
+	const registerExtensionTools = (session: AgentSession) =>
+		session.setActiveToolPresentation(["read", "bash", "eval"], []);
+
+	it("keeps the transcript's cached prompt through a startup rebuild that changes nothing of its own", async () => {
+		using tempDir = TempDir.createSync("@pi-resume-system-prompt-");
+		await Bun.write(tempDir.join("models.yml"), MODELS_YML);
+		const live = await runProcess(
+			tempDir,
+			{ agentsMd: "Build with make.", appendSystemPrompt: ROLE },
+			["first"],
+			undefined,
+			registerExtensionTools,
+		);
+		// Then, before the first request, an extension's startup skill discovery (or a memory backend) rebuilds the
+		// prompt from the inputs the process started with.
+		const resumed = await runProcess(
+			tempDir,
+			{ agentsMd: "Build with ninja.", appendSystemPrompt: ROLE },
+			["second"],
+			live.sessionFile,
+			async session => {
+				await registerExtensionTools(session);
+				await session.refreshBaseSystemPrompt();
+			},
+		);
+
+		const lastBefore = live.requests.at(-1);
+		if (!lastBefore) throw new Error("Expected the first process's requests");
+		expect(continuesCachedPrompt(lastBefore, resumed.requests[0]!)).toBe(true);
+		expect(resumed.promptDigests).toEqual(live.promptDigests);
+	}, 30_000);
+
+	it("sends a startup rebuild that changes the prompt, such as an added workspace directory", async () => {
+		using tempDir = TempDir.createSync("@pi-resume-system-prompt-");
+		await Bun.write(tempDir.join("models.yml"), MODELS_YML);
+		await Bun.write(tempDir.join("added-workspace-root/README.md"), "A second root.\n");
+		const live = await runProcess(
+			tempDir,
+			{ agentsMd: "Build with make.", appendSystemPrompt: ROLE },
+			["first"],
+			undefined,
+			registerExtensionTools,
+		);
+		const resumed = await runProcess(
+			tempDir,
+			{ agentsMd: "Build with ninja.", appendSystemPrompt: ROLE },
+			["second"],
+			live.sessionFile,
+			async (session, sessionManager) => {
+				await registerExtensionTools(session);
+				// `/add-dir` before the first prompt.
+				await sessionManager.addWorkspaceDirectory(tempDir.join("added-workspace-root"));
+				await session.refreshBaseSystemPrompt();
+			},
+		);
+
+		const system = withoutCacheControl(resumed.requests[0]?.system);
+		expect(system).toContain("added-workspace-root");
+		expect(system).toContain("Build with ninja.");
 	}, 30_000);
 
 	it("builds the system prompt afresh when the operator's appended prompt changed", async () => {
