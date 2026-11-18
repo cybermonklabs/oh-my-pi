@@ -2360,7 +2360,10 @@ export class ModelRegistry {
 	 * the pass's last slice. A provider that a pass with newer fetch results
 	 * already committed keeps that pass's rows: a sliced merge can finish after a
 	 * later pass's, and the later fetch must win, as it did when merges ran in the
-	 * step in which their fetches resolved.
+	 * step in which their fetches resolved. This pass's cache replacement still
+	 * applies to that provider: the newer pass may have read the cache rather than
+	 * the network, and then nothing else removes the cached rows the network no
+	 * longer lists.
 	 */
 	#commitRuntimeDiscoveries(
 		builtInDiscovery: BuiltInDiscoveryResult,
@@ -2372,7 +2375,8 @@ export class ModelRegistry {
 		const isCurrent = (provider: string) =>
 			(this.#providerDiscoverySequence.get(provider) ?? 0) < discoverySequence;
 		const touchedProviders = new Set([...allTouchedProviders].filter(isCurrent));
-		if (touchedProviders.size === 0) return;
+		const replacedProviderSet = new Set([...replacedConfiguredProviders, ...builtInDiscovery.replaceRuntimeProviders]);
+		if (touchedProviders.size === 0 && replacedProviderSet.size === 0) return;
 		const discoveredModels =
 			touchedProviders.size === allTouchedProviders.size
 				? allDiscoveredModels
@@ -2386,10 +2390,7 @@ export class ModelRegistry {
 			if (touchedProviders.has(provider)) authoritativeProviders.add(provider);
 		}
 
-		const replacedProviderSet = new Set(replacedConfiguredProviders.filter(provider => touchedProviders.has(provider)));
 		for (const provider of builtInDiscovery.replaceRuntimeProviders) {
-			if (!touchedProviders.has(provider)) continue;
-			replacedProviderSet.add(provider);
 			this.#replacedCacheProviders.add(provider);
 			this.#cachedStandardModelsByProvider.delete(provider);
 			this.#pendingStandardCacheProviders.delete(provider);
@@ -2410,6 +2411,8 @@ export class ModelRegistry {
 			} else {
 				this.#runtimeAuthoritativeProviders.delete(provider);
 			}
+		}
+		for (const provider of new Set([...touchedProviders, ...replacedProviderSet])) {
 			this.#invalidateProviderModelCache(provider);
 		}
 		if (!this.#hasFullSnapshot) return;

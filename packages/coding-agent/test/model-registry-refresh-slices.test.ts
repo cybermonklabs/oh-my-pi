@@ -154,12 +154,62 @@ describe("ModelRegistry discovery slicing", () => {
 		const fullPass = registry.refresh("online");
 		await firstFetchDone;
 		for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+		let fullPassDone = false;
+		void fullPass.then(() => (fullPassDone = true));
 		// A scoped pass starts during that merge, fetches v2 and commits first.
 		await registry.refreshDiscoverableProviders(["ordered-provider"], "online");
+		expect(fullPassDone).toBe(false);
 		await fullPass;
 		expect(fetches).toBe(2);
 		expect(registry.find("ordered-provider", "model-v2")).toBeDefined();
 		expect(registry.find("ordered-provider", "model-v1")).toBeUndefined();
+	});
+
+	test("a pass that commits after a cache-served pass still drops cached rows the endpoint no longer lists", async () => {
+		mockSteadyClock();
+		const modelsPath = tempDir.join("cfg", "models.json");
+		fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					gateway: {
+						baseUrl: "http://127.0.0.1:9992",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		let listCalls = 0;
+		const { promise: secondListDone, resolve: secondListResolved } = Promise.withResolvers<void>();
+		const gatewayFetch: FetchImpl = async input => {
+			if (String(input) !== "http://127.0.0.1:9992/v1/models") throw new Error(`offline: ${String(input)}`);
+			listCalls++;
+			if (listCalls === 1) return Response.json({ data: [{ id: "keep-model" }, { id: "gone-model" }] });
+			// The online pass's other discoveries finish first, so its fetches resolve with this one.
+			await new Promise(resolve => setTimeout(resolve, 300));
+			queueMicrotask(secondListResolved);
+			return Response.json({ data: [{ id: "keep-model" }] });
+		};
+		// An earlier start cached both rows.
+		await new ModelRegistry(authStorage, modelsPath, { fetch: gatewayFetch }).refresh("online");
+		const registry = new ModelRegistry(authStorage, modelsPath, { fetch: gatewayFetch });
+		expect(registry.find("gateway", "gone-model")).toBeDefined();
+		// The online pass fetches a list without gone-model, writes the cache, then merges in slices.
+		const onlinePass = registry.refresh("online");
+		await secondListDone;
+		for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+		let onlinePassDone = false;
+		void onlinePass.then(() => (onlinePassDone = true));
+		// A scoped pass during that merge reads the fresh cache and commits first.
+		await registry.refreshDiscoverableProviders(["gateway"], "online-if-uncached");
+		expect(onlinePassDone).toBe(false);
+		await onlinePass;
+		expect(listCalls).toBe(2);
+		expect(registry.find("gateway", "keep-model")).toBeDefined();
+		expect(registry.find("gateway", "gone-model")).toBeUndefined();
 	});
 
 	test("a refresh awaited by createAgentSession takes its turns without waiting for a pending timer", async () => {
