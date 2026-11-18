@@ -23,8 +23,6 @@ use std::{
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(unix)]
-use crate::file::POLL_SLICE;
 use crate::{
 	dir::{EntryBinding, ReadDir},
 	error::{
@@ -40,6 +38,8 @@ use crate::{
 	runtime::{CloseTracker, Scope, block_on, offload},
 	types::{FileId, FileTime, NodeKind, Permissions, StatFs, SymlinkKind},
 };
+#[cfg(unix)]
+use crate::{fifo::FifoOpen, file::POLL_SLICE};
 
 /// A path pinned to an already-open file (`/dev/stdin`, `/dev/fd/N`, ...).
 struct Mount {
@@ -194,9 +194,9 @@ enum ScopedOpen {
 	#[cfg(unix)]
 	Typed { token: CancellationToken, poll: bool },
 	/// Open one end of a FIFO, which waits until the other end connects, so
-	/// the wait goes through [`FifoOpening`], which the token can interrupt.
+	/// the wait goes through [`FifoOpen`], which the token can interrupt.
 	#[cfg(unix)]
-	Fifo { token: CancellationToken, end: FifoEnd },
+	Fifo { token: CancellationToken, meta: std::fs::Metadata },
 }
 
 /// Under a cancellable scope on Unix, a read-only or write-only open takes
@@ -213,17 +213,20 @@ fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> Scoped
 		&& !options.is_create_new()
 	{
 		use std::os::unix::fs::FileTypeExt;
-		let end = match (options.is_read(), options.is_writable()) {
-			(true, false) if !options.is_create() => FifoEnd::Read,
-			(false, true) => FifoEnd::Write,
-			_ => return ScopedOpen::Plain,
+		let one_way = match (options.is_read(), options.is_writable()) {
+			(true, false) => !options.is_create(),
+			(false, true) => true,
+			_ => false,
 		};
+		if !one_way {
+			return ScopedOpen::Plain;
+		}
 		let Ok(meta) = std::fs::metadata(path) else {
 			return ScopedOpen::Plain;
 		};
 		let kind = meta.file_type();
 		if kind.is_fifo() && options.get_custom_flags() & libc::O_NONBLOCK == 0 {
-			return ScopedOpen::Fifo { token: token.clone(), end };
+			return ScopedOpen::Fifo { token: token.clone(), meta };
 		}
 		return ScopedOpen::Typed { token: token.clone(), poll: crate::reads_can_block(&meta) };
 	}
@@ -242,9 +245,10 @@ fn native_open_scoped(scope: &Scope, path: &Path, options: &OpenOptions) -> io::
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, end } => Ok(FifoOpening::start(scope, path, options, end, &token)?
-			.wait(&token)?
-			.bind_host(token, true)),
+		ScopedOpen::Fifo { token, meta } => {
+			Ok(wait_fifo(start_fifo(scope, path, options, &meta, &token)?, &token)?
+				.bind_host(token, true))
+		},
 		ScopedOpen::Plain => Ok(native_open(scope, path, options)?.bind(scope)),
 	}
 }
@@ -267,251 +271,73 @@ async fn native_open_scoped_async(
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, end } => Ok(FifoOpening::start(scope, path, options, end, &token)?
-			.wait_async(&token)
-			.await?
-			.bind_host(token, true)),
+		ScopedOpen::Fifo { token, meta } => {
+			Ok(wait_fifo_async(start_fifo(scope, path, options, &meta, &token)?, &token)
+				.await?
+				.bind_host(token, true))
+		},
 		ScopedOpen::Plain => Ok(native_open(scope, path, options)?.bind(scope)),
 	}
 }
 
-/// The end of a FIFO an open takes.
+/// Starts opening one end of the FIFO at `path`, which `meta` describes, on
+/// a helper thread (see [`FifoOpen`]), so that the wait for the other end
+/// observes `token` and, for async callers, holds no runtime worker. The
+/// helper runs the ordinary blocking open, so the open returns exactly when
+/// it would without a token: once the other end connects.
+///
+/// Once the token fires, the open fails with [`crate::cancelled`], and
+/// dropping it releases the helper, so it leaves no end of the FIFO behind
+/// (see [`FifoOpen`] for when it cannot). An open that is dropped before it
+/// finishes (the job that made it was aborted, its run task was dropped) is
+/// released the same way, before what follows the drop (the next command)
+/// opens this FIFO.
 #[cfg(unix)]
-#[derive(Clone, Copy)]
-enum FifoEnd {
-	/// Waits for a writer.
-	Read,
-	/// Waits for a reader.
-	Write,
-}
-
-#[cfg(unix)]
-impl FifoEnd {
-	/// The `faccessat` mode a release of this end needs: it opens the other.
-	const fn release_access(self) -> libc::c_int {
-		match self {
-			Self::Read => libc::W_OK,
-			Self::Write => libc::R_OK,
+fn start_fifo(
+	scope: &Scope,
+	path: &Path,
+	options: &OpenOptions,
+	meta: &std::fs::Metadata,
+	token: &CancellationToken,
+) -> io::Result<FifoOpen<File>> {
+	if token.is_cancelled() {
+		return Err(crate::cancelled());
+	}
+	let nofollow = options.get_custom_flags() & libc::O_NOFOLLOW != 0;
+	let (scope, options) = (scope.clone(), options.clone());
+	Ok(FifoOpen::start(path, meta, nofollow, move |path, pinned| {
+		if !pinned {
+			return native_open(&scope, path, &options);
 		}
-	}
-
-	/// A non-blocking open of the other end, which releases a waiting open
-	/// of this end and closes at once.
-	fn release_options(self) -> OpenOptions {
-		let mut release = OpenOptions::new();
-		match self {
-			Self::Read => release.write(true),
-			Self::Write => release.read(true),
-		};
-		release.custom_flags(libc::O_NONBLOCK);
-		release
-	}
+		// A pin is checked not to be a symbolic link already, and its
+		// `/proc/self/fd/N` always is one.
+		let mut through_pin = options;
+		through_pin.custom_flags(through_pin.get_custom_flags() & !libc::O_NOFOLLOW);
+		native_open(&scope, path, &through_pin)
+	}))
 }
 
-/// How many times a cancelled [`FifoOpening`] tries to release its helper's
-/// open, one poll slice apart, before it leaves the helper blocked.
+/// Waits for a FIFO open on this thread, checking `token` every poll slice.
 #[cfg(unix)]
-const FIFO_RELEASE_ATTEMPTS: usize = 10;
-
-/// One end of a FIFO being opened on a helper thread, so that the wait for
-/// the other end observes a token and, for async callers, holds no runtime
-/// worker. The helper runs the ordinary blocking open, so the open returns
-/// exactly when it would without a token: once the other end connects.
-///
-/// Once the token fires, when this process may open the other end, a
-/// non-blocking open of the other end connects to the waiting open and closes
-/// at once; it is tried again while the helper has not reached `open` yet
-/// (`ENXIO`). The helper's descriptor is closed, and the open fails with
-/// [`crate::cancelled`]. Other opens of the same end waiting at that moment
-/// are released too: a reader reads EOF, a writer's first write fails with
-/// `EPIPE`.
-///
-/// An open that is dropped before it finishes (the job that made it was
-/// aborted, its run task was dropped) is released the same way, on a
-/// detached thread, so the helper does not take the next connection.
-///
-/// When it may not (a FIFO this process can read but not write, or the
-/// reverse), or the release fails, the open still fails with
-/// [`crate::cancelled`], but the helper stays blocked in `open` until the
-/// other end arrives. It then takes that connection and closes it: the next
-/// writer's first write fails with `EPIPE`, the next reader reads EOF. Without
-/// a token the whole command would have stayed blocked there instead.
-#[cfg(unix)]
-struct FifoOpening {
-	path:       PathBuf,
-	end:        FifoEnd,
-	releasable: bool,
-	opened:     std::sync::mpsc::Receiver<io::Result<File>>,
-	/// Notified once the helper has sent its result.
-	done:       Arc<tokio::sync::Notify>,
-	/// Whether the open has ended: its result was taken, or it was released.
-	settled:    bool,
-}
-
-#[cfg(unix)]
-impl FifoOpening {
-	fn start(
-		scope: &Scope,
-		path: &Path,
-		options: &OpenOptions,
-		end: FifoEnd,
-		token: &CancellationToken,
-	) -> io::Result<Self> {
+fn wait_fifo(mut open: FifoOpen<File>, token: &CancellationToken) -> io::Result<File> {
+	loop {
+		if let Some(result) = open.wait_for(POLL_SLICE) {
+			return result;
+		}
 		if token.is_cancelled() {
 			return Err(crate::cancelled());
 		}
-		let (sender, opened) = std::sync::mpsc::sync_channel(1);
-		let done = Arc::new(tokio::sync::Notify::new());
-		let (scope, owned_path, options, notify) =
-			(scope.clone(), path.to_path_buf(), options.clone(), done.clone());
-		std::thread::Builder::new()
-			.name("pi-vfs-fifo-open".to_owned())
-			.spawn(move || {
-				// After a cancellation nobody receives; the file then closes here.
-				let _ = sender.send(native_open(&scope, &owned_path, &options));
-				notify.notify_one();
-			})?;
-		Ok(Self {
-			path: path.to_path_buf(),
-			end,
-			releasable: may_access(path, end.release_access()),
-			opened,
-			done,
-			settled: false,
-		})
-	}
-
-	/// Waits for the open on this thread, in poll slices, checking `token`.
-	fn wait(mut self, token: &CancellationToken) -> io::Result<File> {
-		use std::sync::mpsc::RecvTimeoutError;
-		loop {
-			match self.opened.recv_timeout(POLL_SLICE) {
-				Ok(result) => {
-					self.settled = true;
-					return result;
-				},
-				Err(RecvTimeoutError::Disconnected) => {
-					self.settled = true;
-					return Err(helper_exited());
-				},
-				Err(RecvTimeoutError::Timeout) if token.is_cancelled() => return self.cancel(),
-				Err(RecvTimeoutError::Timeout) => {},
-			}
-		}
-	}
-
-	/// Awaits the open or `token`, whichever comes first.
-	async fn wait_async(mut self, token: &CancellationToken) -> io::Result<File> {
-		tokio::select! {
-			biased;
-			() = self.done.notified() => {},
-			() = token.cancelled() => {},
-		}
-		match self.opened.try_recv() {
-			Ok(result) => {
-				self.settled = true;
-				result
-			},
-			Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-				self.settled = true;
-				Err(helper_exited())
-			},
-			Err(std::sync::mpsc::TryRecvError::Empty) => self.cancel(),
-		}
-	}
-
-	/// Ends a cancelled open: releases the helper's open when this process may
-	/// open the other end. The release takes microseconds unless the helper
-	/// has not reached `open` yet, and is bounded by [`FIFO_RELEASE_ATTEMPTS`]
-	/// slices.
-	fn cancel(mut self) -> io::Result<File> {
-		if self.releasable {
-			release_fifo_open(&self.path, self.end, &self.opened);
-		}
-		self.settled = true;
-		Err(crate::cancelled())
 	}
 }
 
+/// Awaits a FIFO open or `token`, whichever comes first.
 #[cfg(unix)]
-impl Drop for FifoOpening {
-	/// Releases an open dropped before it ended. The first attempt runs here,
-	/// so the release is done, and the helper's descriptor closed, before what
-	/// follows the drop (the next command) opens this FIFO; it takes
-	/// microseconds. A helper that has not reached `open` yet is left to a
-	/// detached thread, so that no runtime worker waits for it.
-	fn drop(&mut self) {
-		if self.settled || !self.releasable {
-			return;
-		}
-		match native::open(&self.path, &self.end.release_options()) {
-			Ok(_release) => {
-				// The helper's open returns as soon as it sees the release.
-				let _ = self.opened.recv_timeout(POLL_SLICE);
-				return;
-			},
-			Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {},
-			Err(_) => return,
-		}
-		let (_, placeholder) = std::sync::mpsc::sync_channel(0);
-		let opened = std::mem::replace(&mut self.opened, placeholder);
-		let (path, end) = (std::mem::take(&mut self.path), self.end);
-		let _ = std::thread::Builder::new()
-			.name("pi-vfs-fifo-release".to_owned())
-			.spawn(move || release_fifo_open(&path, end, &opened));
+async fn wait_fifo_async(mut open: FifoOpen<File>, token: &CancellationToken) -> io::Result<File> {
+	tokio::select! {
+		biased;
+		result = std::future::poll_fn(|cx| open.poll(cx)) => result,
+		() = token.cancelled() => Err(crate::cancelled()),
 	}
-}
-
-/// Releases a helper's open of one end of the FIFO at `path`; see
-/// [`release_attempt`]. Bounded by [`FIFO_RELEASE_ATTEMPTS`] attempts.
-#[cfg(unix)]
-fn release_fifo_open(
-	path: &Path,
-	end: FifoEnd,
-	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
-) {
-	for _ in 0..FIFO_RELEASE_ATTEMPTS {
-		if release_attempt(path, end, opened) {
-			break;
-		}
-	}
-}
-
-/// One attempt to release a helper's open of one end of the FIFO at `path`:
-/// a non-blocking open of the other end, then a wait of one poll slice for
-/// the helper's result, which is dropped. `false` when another attempt is
-/// due: the helper has not reached `open` yet (`ENXIO`) and has not
-/// answered.
-#[cfg(unix)]
-fn release_attempt(
-	path: &Path,
-	end: FifoEnd,
-	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
-) -> bool {
-	use std::sync::mpsc::RecvTimeoutError;
-	if let Err(err) = native::open(path, &end.release_options())
-		&& err.raw_os_error() != Some(libc::ENXIO)
-	{
-		return true;
-	}
-	!matches!(opened.recv_timeout(POLL_SLICE), Err(RecvTimeoutError::Timeout))
-}
-
-#[cfg(unix)]
-fn helper_exited() -> io::Error {
-	io::Error::other("FIFO open thread exited")
-}
-
-/// Whether this process may open `path` with `mode` (`R_OK`, `W_OK`), by its
-/// effective IDs.
-#[cfg(unix)]
-fn may_access(path: &Path, mode: libc::c_int) -> bool {
-	use std::os::unix::ffi::OsStrExt;
-	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-		return false;
-	};
-	// SAFETY: `path` is a NUL-terminated string alive for the call.
-	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
 }
 
 /// Reads a whole host file. Under a cancellable scope the read goes through

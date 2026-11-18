@@ -279,8 +279,8 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		return this.#remote.callSync("publishCompleted", type, label, result, options);
 	}
 
-	cancel(id: string, filter?: AsyncJobFilter): boolean {
-		return this.#remote.callSync("cancel", id, filter);
+	cancel(id: string, filter?: AsyncJobFilter, reason?: unknown): boolean {
+		return this.#remote.callSync("cancel", id, filter, toWireReason(reason));
 	}
 
 	getJob(id: string): AsyncJob | undefined {
@@ -365,8 +365,8 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		return this.#remote.call("waitForOwnerJobs", ownerId, options);
 	}
 
-	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
-		return this.#remote.call("cancelAndReapOwnerJobs", ownerId, deadlineAt);
+	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number, reason: unknown): Promise<AsyncJobReapResult> {
+		return this.#remote.call("cancelAndReapOwnerJobs", ownerId, deadlineAt, toWireReason(reason));
 	}
 
 	drainDeliveries(options?: { timeoutMs?: number; filter?: AsyncJobFilter }): Promise<boolean> {
@@ -375,6 +375,14 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 
 	isDeliverySuppressed(jobId: string): boolean {
 		return this.#remote.callSync("isDeliverySuppressed", jobId);
+	}
+
+	isDeliveryPending(jobId: string): boolean {
+		return this.#remote.callSync("isDeliveryPending", jobId);
+	}
+
+	isDeliverySuperseded(jobId: string): boolean {
+		return this.#remote.callSync("isDeliverySuperseded", jobId);
 	}
 
 	/** One main `whenSettled` call per job id while it is pending; resolves (never rejects) on settle or link loss. */

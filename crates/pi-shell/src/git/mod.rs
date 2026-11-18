@@ -720,20 +720,18 @@ mod tests {
 		}
 	}
 
-	/// Runs `git` reading the same config sources the builtin's gix does: the
-	/// real global/system files at their default paths (gix ignores
-	/// `GIT_CONFIG_GLOBAL`/`SYSTEM`/`NOSYSTEM`, ignoring these matches it),
-	/// and never `GIT_CONFIG_PARAMETERS` (gix does not read it at all).
-	/// `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` are left alone: gix reads those
-	/// from the process environment, so the helper must see them too.
+	/// Runs `git` reading the same config sources the builtin's gix does: it
+	/// honours `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_NOSYSTEM` as git does, but
+	/// not `GIT_CONFIG_SYSTEM` (removing it reads the default system file, as
+	/// gix does) and never `GIT_CONFIG_PARAMETERS` (gix does not read it at
+	/// all). `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` are left alone: gix reads
+	/// those from the process environment, so the helper must see them too.
 	#[cfg(unix)]
 	pub(super) fn git(dir: &Path, args: &[&str]) -> String {
 		let output = std::process::Command::new("git")
 			.args(args)
 			.current_dir(dir)
-			.env_remove("GIT_CONFIG_GLOBAL")
 			.env_remove("GIT_CONFIG_SYSTEM")
-			.env_remove("GIT_CONFIG_NOSYSTEM")
 			.env_remove("GIT_CONFIG_PARAMETERS")
 			.output()
 			.expect("run git");

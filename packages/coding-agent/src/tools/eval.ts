@@ -752,7 +752,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			throw waitResult.error;
 		}
 		if (waitResult.kind === "aborted") {
-			autoBgManager.cancel(jobId);
+			// The cell's job aborts with the call's own reason: a sync subagent the cell started
+			// stops or is cut off as the turn was.
+			autoBgManager.cancel(jobId, undefined, signal?.reason);
 			autoBgManager.releaseForegroundJob(jobId);
 			throw new ToolAbortError(latestText || "Eval cell aborted");
 		}

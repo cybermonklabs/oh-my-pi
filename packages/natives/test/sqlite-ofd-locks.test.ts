@@ -19,14 +19,24 @@ test.skipIf(process.platform !== "linux")(
 		try {
 			db.run("PRAGMA journal_mode=WAL");
 			db.run("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)");
+			// The types of the locks held through this process's own descriptors of the database and
+			// its `-shm`. Each fd's fdinfo lists them in one read. /proc/locks does not: the kernel
+			// builds it a page per read and walks its global lock list again for each page, so while
+			// other processes take and drop locks (a parallel test run) it skips or repeats entries.
 			const locksOn = () => {
-				const inodes = [dbPath, `${dbPath}-shm`].map(file => `:${fs.statSync(file).ino}`);
+				const files = new Set([dbPath, `${dbPath}-shm`].map(file => fs.realpathSync(file)));
 				return fs
-					.readFileSync("/proc/locks", "utf8")
-					.split("\n")
-					.map(line => line.replace("->", "").trim().split(/\s+/))
-					.filter(fields => inodes.some(ino => fields[5]?.endsWith(ino)))
-					.map(fields => fields[1]);
+					.readdirSync("/proc/self/fd")
+					.filter(fd => {
+						try {
+							return files.has(fs.readlinkSync(`/proc/self/fd/${fd}`));
+						} catch {
+							return false;
+						}
+					})
+					.flatMap(fd => fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8").split("\n"))
+					.filter(line => line.startsWith("lock:"))
+					.map(line => line.slice("lock:".length).trim().split(/\s+/)[1]);
 			};
 			expect(locksOn()).toEqual(["OFDLCK", "OFDLCK"]);
 

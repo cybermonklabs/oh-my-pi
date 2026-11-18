@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import { removeWithRetries } from "../../utils/src/temp";
+import { nextTask } from "./helpers";
 
 const PROVIDER = "unit-oauth-rotating";
 const TOKEN_URL = "https://auth.example.test/token";
@@ -12,6 +13,26 @@ const WHOAMI_URL = "https://api.example.test/whoami";
 function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
+
+/**
+ * Wait until `caller` sleeps on the fake clock, waiting on a lease another owner holds: it has
+ * armed a timer beyond the `timersBefore` already armed. Fails when the caller settles instead.
+ */
+async function untilWaitingOnLease(caller: Promise<unknown>, timersBefore: number): Promise<void> {
+	let settled = false;
+	const settle = () => {
+		settled = true;
+	};
+	void caller.then(settle, settle);
+	while (vi.getTimerCount() <= timersBefore) {
+		if (settled) throw new Error("The caller settled before it waited on the held lease");
+		await nextTask();
+	}
+}
+
+// Every test here hands the refresher a budget that the product measures with `Date.now()` and
+// `setTimeout` from the call. They run it on a fake clock that moves only when the test moves it:
+// on the real clock a loaded host spends the budget before the step under test is reached.
 
 describe("OAuth refresh budget", () => {
 	let tempDir = "";
@@ -23,6 +44,12 @@ describe("OAuth refresh budget", () => {
 	});
 
 	afterEach(async () => {
+		if (vi.isFakeTimers()) {
+			// A failed test can leave a refresh waiting on the fake clock. Fire what is pending so it
+			// settles: a refresh that never settles holds the process at exit for its shutdown drain.
+			vi.runOnlyPendingTimers();
+			vi.useRealTimers();
+		}
 		vi.restoreAllMocks();
 		store?.close();
 		store = null;
@@ -34,6 +61,8 @@ describe("OAuth refresh budget", () => {
 
 	test("persists a refresh token the provider rotated when post-exchange work outlasts the budget", async () => {
 		if (!store) throw new Error("test setup failed");
+		vi.useFakeTimers();
+		const budgetMs = 50;
 		const authStorage = new AuthStorage(store, {});
 
 		// Token endpoint that rotates the refresh token on every grant, so the
@@ -41,6 +70,7 @@ describe("OAuth refresh budget", () => {
 		const validRefreshTokens = new Set(["r0"]);
 		let rotations = 0;
 		// Post-exchange work (e.g. an org lookup) stays pending until the caller has given up.
+		const whoamiRequested = Promise.withResolvers<void>();
 		const whoamiGate = Promise.withResolvers<void>();
 		vi.spyOn(globalThis, "fetch").mockImplementation(
 			Object.assign(
@@ -54,6 +84,7 @@ describe("OAuth refresh budget", () => {
 						return json({ access_token: `access-${next}`, refresh_token: next, expires_in: 3600 });
 					}
 					if (url === WHOAMI_URL) {
+						whoamiRequested.resolve();
 						// Like a real request, the lookup ends early if the exchange is aborted.
 						const aborted = Promise.withResolvers<never>();
 						init?.signal?.addEventListener("abort", () => aborted.reject(init.signal?.reason), { once: true });
@@ -83,7 +114,7 @@ describe("OAuth refresh budget", () => {
 			credentialId,
 			credentialFromRow: row => row,
 			forceRefresh: true,
-			refreshTimeoutMs: 50,
+			refreshTimeoutMs: budgetMs,
 			onRefreshFailure: error => failures.push(error),
 			refresh: async (credential, signal) => {
 				exchangeSignal = signal;
@@ -105,12 +136,23 @@ describe("OAuth refresh budget", () => {
 			},
 		});
 
+		// The grant has answered and the post-exchange work is pending: only now does the budget run out.
+		const firstEvent = await Promise.race([
+			whoamiRequested.promise.then(() => "post-exchange work started"),
+			refresh.then(
+				() => "refresh resolved",
+				() => "refresh rejected",
+			),
+		]);
+		expect(firstEvent).toBe("post-exchange work started");
+		expect(validRefreshTokens).toEqual(new Set(["r1"]));
+		vi.advanceTimersByTime(budgetMs);
+
 		// The caller stops waiting at the budget and sees the timeout.
 		await expect(refresh).rejects.toMatchObject({
 			message: `OAuth token refresh timed out for provider: ${PROVIDER}`,
 		});
 		expect(failures).toHaveLength(1);
-		expect(validRefreshTokens).toEqual(new Set(["r1"]));
 
 		// The exchange itself runs on and still holds the lease.
 		expect(exchangeSignal?.aborted).toBe(false);
@@ -133,42 +175,57 @@ describe("OAuth refresh budget", () => {
 
 	test("a peer waiting on a held lease gives up at its budget", async () => {
 		if (!store) throw new Error("test setup failed");
+		vi.useFakeTimers();
+		const budgetMs = 50;
 		const authStorage = new AuthStorage(store, {});
 		await authStorage.credentials.set(PROVIDER, [
 			{ type: "oauth", access: "access-r0", refresh: "r0", expires: Date.now() - 60_000 },
 		]);
 		const credentialId = store.listAuthCredentials(PROVIDER)[0]!.id;
+		const exchangeStarted = Promise.withResolvers<void>();
 		const hung = Promise.withResolvers<never>();
 		const first = authStorage.oauth.refreshStored(PROVIDER, {
 			credentialId,
 			credentialFromRow: row => row,
 			forceRefresh: true,
-			refreshTimeoutMs: 50,
-			refresh: () => hung.promise,
+			refreshTimeoutMs: budgetMs,
+			refresh: () => {
+				exchangeStarted.resolve();
+				return hung.promise;
+			},
 		});
+		// The first caller holds the lease for its exchange, then gives up at its budget.
+		await exchangeStarted.promise;
+		vi.advanceTimersByTime(budgetMs);
 		await expect(first).rejects.toMatchObject({ message: `OAuth token refresh timed out for provider: ${PROVIDER}` });
 
 		let peerExchanged = false;
-		const started = Date.now();
-		await expect(
-			authStorage.oauth.refreshStored(PROVIDER, {
-				credentialId,
-				credentialFromRow: row => row,
-				forceRefresh: true,
-				refreshTimeoutMs: 50,
-				refresh: async () => {
-					peerExchanged = true;
-					throw new Error("peer must not exchange while the lease is held");
-				},
-			}),
-		).rejects.toMatchObject({ message: `OAuth token refresh timed out for provider: ${PROVIDER}` });
-		expect(Date.now() - started).toBeLessThan(1_000);
+		const timersBefore = vi.getTimerCount();
+		const peer = authStorage.oauth.refreshStored(PROVIDER, {
+			credentialId,
+			credentialFromRow: row => row,
+			forceRefresh: true,
+			refreshTimeoutMs: budgetMs,
+			refresh: async () => {
+				peerExchanged = true;
+				throw new Error("peer must not exchange while the lease is held");
+			},
+		});
+		// The held lease has a 15 s TTL; only the peer's budget passes on the clock.
+		await untilWaitingOnLease(peer, timersBefore);
+		vi.advanceTimersByTime(budgetMs);
+		// The peer's wait was capped by its budget: it has woken and armed no further wait.
+		await nextTask();
+		expect(vi.getTimerCount()).toBe(timersBefore);
+		await expect(peer).rejects.toMatchObject({ message: `OAuth token refresh timed out for provider: ${PROVIDER}` });
 		expect(peerExchanged).toBe(false);
 		hung.reject(new Error("done"));
 	});
 
 	test("closing auth storage mid-exchange still saves the rotated token and refuses new refreshes", async () => {
 		if (!store) throw new Error("test setup failed");
+		// The 1 s budget never passes on the fake clock, so only `release` ends the exchange.
+		vi.useFakeTimers();
 		const authStorage = new AuthStorage(store, {});
 		await authStorage.credentials.set(PROVIDER, [{ type: "oauth", access: "access-r0", refresh: "r0", expires: 0 }]);
 		const started = Promise.withResolvers<void>();
@@ -195,6 +252,7 @@ describe("OAuth refresh budget", () => {
 		).rejects.toMatchObject({ message: "OAuth refresh stopped during shutdown" });
 		release.resolve();
 		await expect(refresh).resolves.toMatchObject({ refreshed: true, credential: { refresh: "r1" } });
+		vi.useRealTimers();
 
 		const reopened = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		try {
@@ -207,6 +265,8 @@ describe("OAuth refresh budget", () => {
 
 	test("closing auth storage mid-refresh on a store without leases still saves the rotated token", async () => {
 		if (!store) throw new Error("test setup failed");
+		// The refresh's default 10 s budget never passes on the fake clock, so only `release` ends it.
+		vi.useFakeTimers();
 		const sqlite = store;
 		// A store without the durable lease concern refreshes outside `refreshStored`.
 		const leaseless = new Proxy(sqlite, {
@@ -236,6 +296,7 @@ describe("OAuth refresh budget", () => {
 		});
 		release.resolve();
 		await refresh;
+		vi.useRealTimers();
 
 		const reopened = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		try {
@@ -248,23 +309,27 @@ describe("OAuth refresh budget", () => {
 
 	test("a credential removed while the exchange ran is not restored to the pool", async () => {
 		if (!store) throw new Error("test setup failed");
+		// The default budget never passes on the fake clock, so only `gate` ends the exchange.
+		vi.useFakeTimers();
 		const authStorage = new AuthStorage(store, {});
 		await authStorage.credentials.set(PROVIDER, [
 			{ type: "oauth", access: "access-a", refresh: "a0", expires: Date.now() - 60_000 },
 			{ type: "oauth", access: "access-b", refresh: "b0", expires: Date.now() + 3_600_000 },
 		]);
 		const [target, sibling] = store.listAuthCredentials(PROVIDER);
+		const exchangeStarted = Promise.withResolvers<void>();
 		const gate = Promise.withResolvers<void>();
 		const refresh = authStorage.oauth.refreshStored(PROVIDER, {
 			credentialId: target!.id,
 			credentialFromRow: row => row,
 			forceRefresh: true,
 			refresh: async () => {
+				exchangeStarted.resolve();
 				await gate.promise;
 				return { access: "access-a1", refresh: "a1", expires: Date.now() + 3_600_000 };
 			},
 		});
-		await Bun.sleep(0);
+		await exchangeStarted.promise;
 		await store.deleteAuthCredential(sibling!.id, "deleted by user");
 		gate.resolve();
 		await expect(refresh).resolves.toMatchObject({ refreshed: true });
@@ -274,6 +339,8 @@ describe("OAuth refresh budget", () => {
 
 	test("a credential removed while a failing exchange ran is not restored to the pool", async () => {
 		if (!store) throw new Error("test setup failed");
+		// The default budget never passes on the fake clock, so only `gate` ends the exchange.
+		vi.useFakeTimers();
 		const authStorage = new AuthStorage(store, {});
 		await authStorage.credentials.set(PROVIDER, [
 			{ type: "oauth", access: "access-a", refresh: "a0", expires: Date.now() - 60_000 },
@@ -281,6 +348,7 @@ describe("OAuth refresh budget", () => {
 			{ type: "oauth", access: "access-c", refresh: "c0", expires: Date.now() + 3_600_000 },
 		]);
 		const [target, sibling, kept] = store.listAuthCredentials(PROVIDER);
+		const exchangeStarted = Promise.withResolvers<void>();
 		const gate = Promise.withResolvers<void>();
 		const refresh = authStorage.oauth.refreshStored(PROVIDER, {
 			credentialId: target!.id,
@@ -288,11 +356,12 @@ describe("OAuth refresh budget", () => {
 			forceRefresh: true,
 			isDefinitiveFailure: () => true,
 			refresh: async () => {
+				exchangeStarted.resolve();
 				await gate.promise;
 				throw new Error("invalid_grant");
 			},
 		});
-		await Bun.sleep(0);
+		await exchangeStarted.promise;
 		await store.deleteAuthCredential(sibling!.id, "deleted by user");
 		gate.resolve();
 		await expect(refresh).resolves.toMatchObject({ removed: true });
@@ -302,31 +371,31 @@ describe("OAuth refresh budget", () => {
 
 	test("a waiter whose budget ran out does not take a lease that frees up", async () => {
 		if (!store) throw new Error("test setup failed");
+		vi.useFakeTimers();
+		const budgetMs = 20;
 		const authStorage = new AuthStorage(store, {});
 		await authStorage.credentials.set(PROVIDER, [
 			{ type: "oauth", access: "access-r0", refresh: "r0", expires: Date.now() - 60_000 },
 		]);
 		const credentialId = store.listAuthCredentials(PROVIDER)[0]!.id;
 		expect(store.tryAcquireCredentialRefreshLease(credentialId, "peer", Date.now() + 15_000)).toBe(true);
-		// The peer lets go exactly when the waiter's budget has run out.
-		const realNow = Date.now;
 		let exchanged = false;
-		const start = realNow();
-		const sleep = Bun.sleep;
-		vi.spyOn(Bun, "sleep").mockImplementation(async ms => {
-			await sleep(ms);
-			if (realNow() - start >= 20) store?.releaseCredentialRefreshLease(credentialId, "peer");
-		});
+		const timersBefore = vi.getTimerCount();
 		const waiter = authStorage.oauth.refreshStored(PROVIDER, {
 			credentialId,
 			credentialFromRow: row => row,
 			forceRefresh: true,
-			refreshTimeoutMs: 20,
+			refreshTimeoutMs: budgetMs,
 			refresh: async () => {
 				exchanged = true;
-				return { access: "access-r1", refresh: "r1", expires: realNow() + 3_600_000 };
+				return { access: "access-r1", refresh: "r1", expires: Date.now() + 3_600_000 };
 			},
 		});
+		// The waiter sleeps on the held lease for the rest of its budget. The peer lets go, and the
+		// waiter wakes exactly when its budget has run out, to a free lease.
+		await untilWaitingOnLease(waiter, timersBefore);
+		store.releaseCredentialRefreshLease(credentialId, "peer");
+		vi.advanceTimersByTime(budgetMs);
 		await expect(waiter).rejects.toMatchObject({
 			message: `OAuth token refresh timed out for provider: ${PROVIDER}`,
 		});
@@ -335,16 +404,18 @@ describe("OAuth refresh budget", () => {
 
 	test("a caller whose lease acquisition outlasts its budget does not start the exchange", async () => {
 		if (!store) throw new Error("test setup failed");
+		vi.useFakeTimers();
 		const authStorage = new AuthStorage(store, {});
 		await authStorage.credentials.set(PROVIDER, [
 			{ type: "oauth", access: "access-r0", refresh: "r0", expires: Date.now() - 60_000 },
 		]);
 		const credentialId = store.listAuthCredentials(PROVIDER)[0]!.id;
-		// Acquisition succeeds, but only after a SQLite busy wait longer than the budget.
+		// Acquisition succeeds, but only after a SQLite busy wait that spends 30 ms of the clock,
+		// more than the 20 ms budget.
 		const acquire = store.tryAcquireCredentialRefreshLease.bind(store);
 		vi.spyOn(store, "tryAcquireCredentialRefreshLease").mockImplementation((id, owner, expiresAt) => {
 			const acquired = acquire(id, owner, expiresAt);
-			Bun.sleepSync(30);
+			vi.advanceTimersByTime(30);
 			return acquired;
 		});
 		let exchanged = false;

@@ -1,9 +1,15 @@
 import type { Database } from "bun:sqlite";
 import * as os from "node:os";
 import * as path from "node:path";
+import { stateDir } from "../config";
 import { openDatabase } from "../db";
 export const DEFAULT_LOG_DIR = path.join(os.homedir(), ".mnemopi", "data");
 export const DEFAULT_LOG_DB = path.join(DEFAULT_LOG_DIR, "cost_log.db");
+
+/** The cost log a call without `dbPath` uses: in mnemopi's data under a relocated omp config root, else {@link DEFAULT_LOG_DB}. */
+function defaultLogDb(): string {
+	return path.join(stateDir("data", DEFAULT_LOG_DIR), "cost_log.db");
+}
 
 export interface CostStats {
 	total_calls: number;
@@ -20,7 +26,7 @@ type AggregateRow = {
 };
 
 export function getConn(dbPath?: string): Database {
-	const path = dbPath ?? DEFAULT_LOG_DB;
+	const path = dbPath ?? defaultLogDb();
 	return openDatabase(path, { pragmas: false });
 }
 

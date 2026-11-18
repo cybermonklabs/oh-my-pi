@@ -276,21 +276,20 @@ describe("SQLite tool support", () => {
 				held.run("PRAGMA journal_mode = WAL");
 				held.run("CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
 				held.prepare("INSERT INTO entries (value) VALUES (?)").run("live");
+				// The locks held through this process's own descriptors of the database and its `-shm`.
+				// Each fd's fdinfo lists them in one read. /proc/locks does not: the kernel builds it a
+				// page per read and walks its global lock list again for each page, so while other
+				// processes take and drop locks (a parallel test run) it skips or repeats entries.
 				const ownLocks = async () => {
-					const inodes = await Promise.all(
-						[dbPath, `${dbPath}-shm`].map(async file => `:${(await fs.stat(file)).ino}`),
-					);
-					return (
-						(await fs.readFile("/proc/locks", "utf8"))
-							.split("\n")
-							.map(line => line.replace("->", "").trim().split(/\s+/))
-							// OFD locks carry no pid; on this test-owned file they are this process's.
-							.filter(
-								fields =>
-									(fields[4] === String(process.pid) || fields[1] === "OFDLCK") &&
-									inodes.some(ino => fields[5]?.endsWith(ino)),
-							).length
-					);
+					const files = new Set(await Promise.all([dbPath, `${dbPath}-shm`].map(file => fs.realpath(file))));
+					let count = 0;
+					for (const fd of await fs.readdir("/proc/self/fd")) {
+						const target = await fs.readlink(`/proc/self/fd/${fd}`).catch(() => "");
+						if (!files.has(target)) continue;
+						const info = await fs.readFile(`/proc/self/fdinfo/${fd}`, "utf8");
+						count += info.split("\n").filter(line => line.startsWith("lock:")).length;
+					}
+					return count;
 				};
 				expect(await ownLocks()).toBe(2);
 

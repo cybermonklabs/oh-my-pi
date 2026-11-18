@@ -22,7 +22,6 @@ import {
 	pickElectronTarget,
 	probeCdpStatus,
 	resolveSpawnArgs,
-	waitForCdp,
 	waitForMainFrame,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import {
@@ -47,7 +46,7 @@ import {
 	TimeoutError,
 } from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
-import { chromiumAvailable } from "./chromium-probe";
+import { chromiumAvailable, chromiumDevToolsListening } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 let sharedHeadless: BrowserHandle | undefined;
@@ -237,7 +236,7 @@ describe("pickElectronTarget", () => {
 					`--user-data-dir=${root}`,
 					`--remote-debugging-port=${port}`,
 				],
-				{ stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+				{ stdin: "ignore", stdout: "ignore", stderr: "pipe" },
 			);
 			const session = makeSession();
 			const prelude = createBrowserPrelude(session);
@@ -248,7 +247,7 @@ describe("pickElectronTarget", () => {
 			let restoreWait: (() => void) | undefined;
 			try {
 				const cdpUrl = `http://127.0.0.1:${port}`;
-				await waitForCdp(cdpUrl, 15_000);
+				await chromiumDevToolsListening(child);
 				attached = await acquireBrowser({ kind: "connected", cdpUrl }, { cwd: process.cwd() });
 				if (!("browser" in attached)) throw new Error("Expected a Puppeteer browser");
 				const browser = attached.browser;
@@ -522,7 +521,7 @@ describe("pickElectronTarget", () => {
 			];
 			const child = Bun.spawn(
 				[exe, ...flags, `--user-data-dir=${borrowedProfile}`, `--remote-debugging-port=${port}`],
-				{ stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+				{ stdin: "ignore", stdout: "ignore", stderr: "pipe" },
 			);
 			const session = makeSession();
 			const prelude = createBrowserPrelude(session);
@@ -531,7 +530,7 @@ describe("pickElectronTarget", () => {
 			const borrowedName = `borrowed-${crypto.randomUUID()}`;
 			const ownedName = `owned-${crypto.randomUUID()}`;
 			try {
-				await waitForCdp(`http://127.0.0.1:${port}`, 15_000);
+				await chromiumDevToolsListening(child);
 				const existing = await acquireBrowser(
 					{ kind: "spawned", path: exe, args: [...flags, `--user-data-dir=${borrowedProfile}`] },
 					{ cwd: session.cwd },
@@ -644,7 +643,7 @@ describe("pickElectronTarget", () => {
 					`--user-data-dir=${root}`,
 					`--remote-debugging-port=${port}`,
 				],
-				{ stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+				{ stdin: "ignore", stdout: "ignore", stderr: "pipe" },
 			);
 			const session = makeSession();
 			const prelude = createBrowserPrelude(session);
@@ -652,7 +651,7 @@ describe("pickElectronTarget", () => {
 				prelude.invoke(parameters, { session, toolCallId: "connected-viewport" });
 			const name = `connected-viewport-${crypto.randomUUID()}`;
 			try {
-				await waitForCdp(`http://127.0.0.1:${port}`, 15_000);
+				await chromiumDevToolsListening(child);
 				const app = { cdp_url: `http://127.0.0.1:${port}` };
 				// No `scale`: the window keeps its own device scale (2 here).
 				const viewport = { width: 390, height: 844 };

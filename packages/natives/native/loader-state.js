@@ -55,20 +55,31 @@ function startupMarker(text) {
 	}
 }
 
+/**
+ * An absolute directory from an override variable (`~` expanded), or null for a relative/empty value.
+ * @param {string | undefined} value
+ * @returns {string | null}
+ */
+function resolveAbsoluteDir(value) {
+	let dir = value?.trim();
+	if (!dir) return null;
+	if (dir === "~") dir = os.homedir();
+	else if (dir.startsWith("~/") || dir.startsWith("~\\")) dir = os.homedir() + dir.slice(1);
+	return path.isAbsolute(dir) ? path.normalize(dir) : null;
+}
+
 function getNativesDir() {
-	// Match pi-utils directory overrides without depending on pi-utils.
-	const override = process.env.PI_NATIVES_DIR?.trim();
-	if (override) {
-		let dir = override;
-		if (dir === "~") dir = os.homedir();
-		else if (dir.startsWith("~/") || dir.startsWith("~\\")) dir = os.homedir() + dir.slice(1);
-		if (path.isAbsolute(dir)) return path.normalize(dir);
-	}
+	// Match pi-utils directory overrides without depending on pi-utils:
+	// PI_NATIVES_DIR, then the download root, then XDG, then the config root.
+	const override = resolveAbsoluteDir(process.env.PI_NATIVES_DIR);
+	if (override) return override;
+	const downloadRoot = resolveAbsoluteDir(process.env.OMP_DOWNLOAD_ROOT);
+	if (downloadRoot) return path.join(downloadRoot, "natives");
 	const xdgDataHome = process.env.XDG_DATA_HOME;
 	if (xdgDataHome && fs.existsSync(path.join(xdgDataHome, "omp"))) {
 		return path.join(xdgDataHome, "omp", "natives");
 	}
-	return path.join(os.homedir(), ".omp", "natives");
+	return path.join(resolveAbsoluteDir(process.env.OMP_CONFIG_ROOT) ?? path.join(os.homedir(), ".omp"), "natives");
 }
 
 function resolveLeafPackageDir(platformTag) {
@@ -996,10 +1007,40 @@ export function initLoaderContext(overrides = {}) {
 	};
 }
 
+/**
+ * Exports of each `.node` file this copy of the loader opened, by the path it
+ * was opened at.
+ * @type {Map<string, Record<string, unknown>>}
+ */
+const openedAddons = new Map();
+
+/**
+ * Open one `.node` addon and return its exports, as `require` does for a
+ * `.node` file. `process.dlopen` rather than `require`: Bun's `require` cannot
+ * load any module from a path that contains `?` (it reads the path cut at the
+ * `?`), and the addon's directory follows `HOME`, `PI_NATIVES_DIR` or the
+ * install location, so it can hold one. `dlopen` takes the path as it is.
+ *
+ * Like `require`, it opens a file once and then returns the same exports:
+ * `loadNative()` runs again on every call of the lazy entrypoints
+ * (`clipboard.js`, `desktop.js`, …), and a second `dlopen` of the file runs the
+ * addon's init again, which makes new classes that `instanceof` against the
+ * first ones fails.
+ * @param {string} candidate
+ * @returns {Record<string, unknown>}
+ */
+export function openNativeAddon(candidate) {
+	const opened = openedAddons.get(candidate);
+	if (opened) return opened;
+	const addonModule = { exports: {} };
+	process.dlopen(addonModule, candidate);
+	openedAddons.set(candidate, addonModule.exports);
+	return addonModule.exports;
+}
+
 export function loadNative() {
 	startupMarker("native:loadNative:start");
 	const ctx = initLoaderContext();
-	const require_ = createRequire(import.meta.url);
 
 	const errors = [];
 	const embeddedCandidate = maybeExtractEmbeddedAddon(ctx, errors);
@@ -1018,7 +1059,7 @@ export function loadNative() {
 		}
 		try {
 			startupMarker(`native:require:${path.basename(candidate)}`);
-			const bindings = require_(candidate);
+			const bindings = openNativeAddon(candidate);
 			validateLoadedBindings(ctx, bindings, candidate);
 			installNativeTokioRuntime(bindings);
 			configureGrammarDir(bindings, ctx.nativesDir);

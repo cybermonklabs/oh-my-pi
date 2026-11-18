@@ -19,6 +19,18 @@ export type OAuthCredentials = {
 	/** Human-readable organization name for display (may embed the email). */
 	orgName?: string;
 	/**
+	 * Workspace inside {@link orgId} the token is scoped to (e.g. an Anthropic
+	 * Console workspace). Captured at login; distinguishes a workspace-scoped
+	 * grant from a subscription grant for the same organization.
+	 */
+	workspaceId?: string;
+	/**
+	 * Login provider that minted this grant when it is stored under another
+	 * provider id (`store-as`). Refresh uses this login's client and token
+	 * endpoint rather than the storing provider's.
+	 */
+	loginProvider?: string;
+	/**
 	 * Account residency region (e.g. `"eu"`), when the provider is
 	 * region-partitioned. Captured at login; refreshed identity may update it
 	 * when the account migrates, while failed lookups preserve the stored value.
