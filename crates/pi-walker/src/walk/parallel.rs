@@ -50,7 +50,9 @@ use crate::{
 };
 
 /// Directory handles kept open so pending children can open relative to
-/// them; past the cap, children open by absolute path.
+/// them; past the cap, children open below the root's handle (by path in a
+/// walk that follows symlinks). The root's own handle, kept for those opens,
+/// counts against the cap.
 const MAX_RETAINED_DIRS: usize = 1024;
 
 /// What a walk does with entries: [`super::walk`] visits and produces output,
@@ -88,8 +90,8 @@ pub(crate) trait Sink: Send + Sync + 'static {
 	/// Settles the non-empty `items` of one directory into its output, on the
 	/// worker that listed it, with that worker's `session` and `state`.
 	/// `dir` is the open listed directory (none for a cached listing), for
-	/// opening files relative to it; otherwise they open by
-	/// [`Worker::abs_rel`]. No output sends nothing.
+	/// opening files relative to it; otherwise they open with
+	/// [`Worker::open_file`]. No output sends nothing.
 	fn settle(
 		&self,
 		state: &mut Self::State,
@@ -406,6 +408,9 @@ struct Ctx<K: Sink> {
 	fs:        Fs,
 	/// Absolute root.
 	root:      PathBuf,
+	/// The open root of a walk that does not follow symlinks, for opening
+	/// entries whose listing carries no handle below it.
+	root_dir:  Option<Arc<Dir>>,
 	opts:      Options,
 	sink:      K,
 	ignorer:   Option<Ignorer>,
@@ -523,7 +528,7 @@ pub(super) async fn start<K: Sink>(
 		let abs_root = absolute_root(&fs, &given);
 		let workers = opts.parallelism(&fs);
 		let mut st = Scratch::new(&fs, sink.state());
-		let root_dir = st.session.open_dir(&abs_root).await.map_err(root_error)?;
+		let root_dir = Arc::new(st.session.open_dir(&abs_root).await.map_err(root_error)?);
 		let cache = cache
 			.filter(|_| opts.detail == Detail::Minimal && fs.is_native() && !opts.same_file_system);
 		let (ignorer, root_frame) = if opts.gitignore {
@@ -538,15 +543,20 @@ pub(super) async fn start<K: Sink>(
 			None
 		};
 		let (jobs, queue) = flume::unbounded();
+		// A walk that does not follow symlinks keeps the root open for opens
+		// below it, counted as one retained handle.
+		let root_kept = (!opts.follow_links).then(|| Arc::clone(&root_dir));
+		let retained = Arc::new(AtomicUsize::new(usize::from(root_kept.is_some())));
 		let ctx = Arc::new(Ctx {
 			fs,
 			root: abs_root,
+			root_dir: root_kept,
 			opts,
 			sink,
 			ignorer,
 			cache,
 			root_dev,
-			retained: Arc::new(AtomicUsize::new(0)),
+			retained,
 			jobs: RwLock::new(Some(jobs)),
 			pending: AtomicUsize::new(0),
 			scratches: Mutex::new(Vec::new()),
@@ -613,6 +623,11 @@ pub(super) async fn start<K: Sink>(
 }
 
 impl<K: Sink> Started<K> {
+	/// The open root of a walk that does not follow symlinks.
+	pub(super) fn root_dir(&self) -> Option<Arc<Dir>> {
+		self.ctx.root_dir.clone()
+	}
+
 	/// Resolves once every worker has ended.
 	pub(super) async fn finished(&self) {
 		let _ = self.done.recv_async().await;
@@ -732,11 +747,17 @@ impl<K: Sink> Ctx<K> {
 		&self,
 		st: &mut Scratch<K::State>,
 		job: Job,
-		opened: Option<Dir>,
+		opened: Option<Arc<Dir>>,
 	) -> io::Result<()> {
 		let listed = self.list_dir(st, job, opened).await?;
 		self.deliver(st, listed).await;
 		Ok(())
+	}
+
+	/// The [`Worker`] view of this walk for visitors and settles, building
+	/// paths in `abs`, the calling worker's scratch.
+	fn worker<'w>(&'w self, abs: &'w mut PathBuf) -> Worker<'w> {
+		Worker { fs: &self.fs, root: &self.root, abs, root_dir: self.root_dir.as_deref() }
 	}
 
 	/// Settles the items of a listed directory on this worker, with its
@@ -749,7 +770,7 @@ impl<K: Sink> Ctx<K> {
 			return;
 		}
 		let Scratch { session, abs, state, .. } = st;
-		let mut worker = Worker { fs: &self.fs, root: &self.root, abs };
+		let mut worker = self.worker(abs);
 		let out = self
 			.sink
 			.settle(state, session, &mut worker, dir.as_deref(), items)
@@ -772,7 +793,7 @@ impl<K: Sink> Ctx<K> {
 		&self,
 		st: &mut Scratch<K::State>,
 		job: Job,
-		opened: Option<Dir>,
+		opened: Option<Arc<Dir>>,
 	) -> io::Result<Listed<K>> {
 		let Job { parent, rel: rel_bytes, name_len, depth, count, frame, out } = job;
 		// SAFETY: job paths live in scratch arenas, which the context keeps
@@ -783,8 +804,9 @@ impl<K: Sink> Ctx<K> {
 		let dir_job = DirJob { rel: rel_bytes, depth, out };
 		if let Some(cache) = self.cache {
 			join_into(&self.fs, &self.root, rel, &mut st.abs);
+			let (with_ignores, follow) = (self.ignorer.is_some(), self.opts.follow_links);
 			if let Some(cached) = cache
-				.lookup(&mut st.session, &st.abs, self.ignorer.is_some(), &mut st.probe)
+				.lookup(&mut st.session, &st.abs, with_ignores, follow, rel.is_empty(), &mut st.probe)
 				.await
 			{
 				drop(parent);
@@ -810,12 +832,16 @@ impl<K: Sink> Ctx<K> {
 					.open_child(&parent.dir, &rel[rel.len() - name_len..])
 					.await;
 				drop(parent);
-				opened?
+				Arc::new(opened?)
 			},
-			(None, None) => {
+			// A cached or over-cap parent: below the root, or by path when
+			// following symlinks (also for a linked directory).
+			(None, None) => Arc::new(if let Some(root) = &self.root_dir {
+				st.session.open_dir_beneath(root, rel).await?
+			} else {
 				join_into(&self.fs, &self.root, rel, &mut st.abs);
 				st.session.open_dir(&st.abs).await?
-			},
+			}),
 		};
 		if depth > 0
 			&& let Some(root_dev) = self.root_dev
@@ -851,7 +877,8 @@ impl<K: Sink> Ctx<K> {
 		} else if names.is_empty() {
 			Some(DirIgnores::default())
 		} else {
-			Some(DirIgnores::load(&mut st.session, &dir, names, stamp.is_some()).await)
+			let follow = self.opts.follow_links;
+			Some(DirIgnores::load(&mut st.session, &dir, names, stamp.is_some(), follow).await)
 		};
 		let frame = match &ignores {
 			Some(ignores) => ignores.frame(frame.as_ref(), names, rel),
@@ -861,7 +888,6 @@ impl<K: Sink> Ctx<K> {
 			join_into(&self.fs, &self.root, rel, &mut st.abs);
 			cache.store(&mut st.session, &st.abs, &dir, stamp, &listing, names, ignores.as_ref());
 		}
-		let dir = Arc::new(dir);
 		let share = self.retained.load(Ordering::Relaxed) < MAX_RETAINED_DIRS;
 		let items = self
 			.emit(st, dir_job, &listing, frame.as_ref(), share.then_some(&dir))
@@ -873,7 +899,8 @@ impl<K: Sink> Ctx<K> {
 	/// Filters and delivers one directory's listing and queues its
 	/// subdirectories; the output its visits produced. With `dir` (passed
 	/// while the walk may keep handles open), children open relative to it;
-	/// cached and over-cap listings pass `None` and children open by path.
+	/// cached and over-cap listings pass `None` and children open below the
+	/// root's handle ([`Self::list_dir`]).
 	async fn emit(
 		&self,
 		st: &mut Scratch<K::State>,
@@ -943,7 +970,7 @@ impl<K: Sink> Ctx<K> {
 				continue;
 			}
 			let mut entry = Entry { path, file_type, depth, size, mtime };
-			let mut worker = Worker { fs: &self.fs, root: &self.root, abs: &mut *abs };
+			let mut worker = self.worker(&mut *abs);
 			match self.sink.visit(&mut worker, &mut entry, &mut batch) {
 				Action::Stop => {
 					self.shared.halt();

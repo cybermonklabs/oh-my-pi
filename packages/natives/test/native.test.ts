@@ -26,6 +26,8 @@ import {
 	PtySession,
 	parseKey,
 	pdfToMarkdown,
+	ReadSkip,
+	readFileBeneath,
 	summarizeCode,
 	supportsLanguage,
 	truncateToWidth,
@@ -786,6 +788,52 @@ try {
 				expect(reconstructed).toEqual(result.matches.map(match => match.path).sort());
 			} finally {
 				await fs.rm(scopedDir, { recursive: true, force: true });
+			}
+		});
+	});
+
+	describe("readFileBeneath", () => {
+		it("reads a glob match below the walked root and follows only the links the listing showed", async () => {
+			if (process.platform === "win32") return;
+			const base = await fs.mkdtemp(path.join(os.tmpdir(), "natives-read-beneath-"));
+			try {
+				const root = path.join(base, "root");
+				await fs.mkdir(path.join(root, "sub"), { recursive: true });
+				await fs.mkdir(path.join(base, "outside"), { recursive: true });
+				await fs.writeFile(path.join(root, "AGENTS.md"), "rules\n");
+				await fs.writeFile(path.join(root, "sub", "plain.txt"), "plain\n");
+				await fs.writeFile(path.join(root, "blob.bin"), new Uint8Array([0x61, 0x00, 0x62]));
+				await fs.writeFile(path.join(base, "outside", "plain.txt"), "outside\n");
+				await fs.symlink("AGENTS.md", path.join(root, "CLAUDE.md"));
+
+				const { matches } = await glob({ pattern: "**/*", path: root, fileType: FileType.File, hidden: true });
+				const byPath = new Map(matches.map(match => [match.path, match]));
+				expect(byPath.get("CLAUDE.md")?.symlink).toBe(true);
+				expect(byPath.get("AGENTS.md")?.symlink).toBeUndefined();
+
+				const read = async (match: GlobMatch, options: { maxBytes?: number; binaryProbeBytes?: number } = {}) =>
+					readFileBeneath({ root, path: match.path, followSymlink: match.symlink, ...options });
+				const utf8 = new TextDecoder();
+				expect(utf8.decode((await read(byPath.get("CLAUDE.md")!)).content)).toBe("rules\n");
+				expect(utf8.decode((await read(byPath.get("sub/plain.txt")!)).content)).toBe("plain\n");
+				expect(await read(byPath.get("AGENTS.md")!, { maxBytes: 3 })).toEqual({ size: 6, skip: ReadSkip.Large });
+				expect(await read(byPath.get("blob.bin")!, { binaryProbeBytes: 8 })).toEqual({
+					size: 3,
+					skip: ReadSkip.Binary,
+				});
+
+				// Swapped after the listing: the file for a link, and its directory for one.
+				await fs.rm(path.join(root, "AGENTS.md"));
+				await fs.symlink(path.join(base, "outside", "plain.txt"), path.join(root, "AGENTS.md"));
+				await fs.rename(path.join(root, "sub"), path.join(root, "sub.moved"));
+				await fs.symlink(path.join(base, "outside"), path.join(root, "sub"));
+				await expect(read(byPath.get("AGENTS.md")!)).rejects.toThrow(/symbolic links|os error 40/);
+				await expect(read(byPath.get("sub/plain.txt")!)).rejects.toThrow(/symbolic links|Not a directory/);
+				await expect(read({ ...byPath.get("sub/plain.txt")!, symlink: true })).rejects.toThrow(
+					/symbolic links|Not a directory/,
+				);
+			} finally {
+				await fs.rm(base, { recursive: true, force: true });
 			}
 		});
 	});

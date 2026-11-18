@@ -16,6 +16,9 @@
 - The bash tool's built-in `df`, `du`, `env`, `fold` and `sort` now run in the C locale when one category the shell's locale names is not installed, as GNU coreutils do when `setlocale(LC_ALL, "")` fails, instead of applying the categories that do load: `sort` compares bytes and `sort --debug` reports `failed to set locale`, `du` and `df` group no digits, and `fold` splits multibyte characters; each prints a warning when it cannot read the shell's locale at all. `sort`, `du` and `df` were compared with GNU coreutils 9.4 runs; `fold` and `env` model coreutils 9.12, newer than the 9.4 available, so their reference is libc's own answer (`setlocale` failing, as bash reports it) ([#17401](https://github.com/can1357/oh-my-pi/pull/17401) by [@sjawhar](https://github.com/sjawhar))
 - Fixed `TtyWriter.flushSync()` and `stop()` sometimes waiting out their whole timeout after the queued output had already been written ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
 - Fixed `TtyWriter.stop()` occasionally hanging forever when the queue had already drained ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- A walk of a host directory that does not follow symlinks (`grep()`, `grep -r`, `rg`, `find -delete` without `-L`, `ast-grep` and `astGrep`/`astEdit` without following links) no longer reads, rewrites or deletes a file through a symlink swapped in after the walk listed it: the file is reached below the walk's own open root, and a swapped directory makes that file's read, write or removal fail instead of reaching outside the tree
+- `find -delete` reports a failed removal as GNU find does (`find: cannot delete 'path': reason`, exit status 1), and `find . -delete` keeps `.` without an error
+- Fixed `omp worktree clear` deleting the registration of a locked worktree whose checkout it could not see, such as one on a disk mounted only on another machine; like `git worktree prune`, it now keeps locked registrations, and treats a dangling link where a checkout's `.git` or the `locked` file was as something there
 - Checking a session's lease (`omp session lease`, RPC `get_session_lease`) no longer makes a session starting at that moment fail to claim it and move to a sibling file on Linux kernels such as gVisor
 - `grep` matches bracket expressions such as `[[]`, `[a&&b]`, `[~~]` and `[!--]` as GNU grep does, with and without `-E`, refuses invalid ones (`[[:foo:]]`, `[z-a]`) with GNU grep's messages, no longer prints the newline as an `-o` match of a class such as `[^x]`, and `-f` accepts a file name that starts with `-`
 - `grep` without `-E` refuses an unterminated bracket expression such as `a[b` or `[[:alpha]]` with GNU grep's message, as `-E` did
@@ -44,6 +47,12 @@
 ### Added
 
 - Added `TtyWriter.discard()`, which drops terminal output that was queued but not yet written; the chunk already being written still finishes ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Added `readFileBeneath()`, which reads a file a `glob` listed below the directory the glob walked without following a symlink the walk did not list; one open checks the size against `maxBytes`, probes the first `binaryProbeBytes` bytes for a NUL byte, and returns the bytes (only the first `prefixBytes` when set), reading each byte once. A file whose size the allocator refuses (beyond the address space, or above memory where overcommit is limited) and that no `maxBytes` skips is rejected with `out of memory`
+- Added `GlobMatch.symlink`, set when the listing shows a symbolic link at the match (reported as `Symlink`, or as its target under a `File` or `Dir` filter); pass it to `readFileBeneath()` as `followSymlink`, which then follows that listed link wherever it points when the file is read, inside the walked directory or out of it
+
+### Changed
+
+- A directory walk that does not follow symlinks no longer reads a `.gitignore`, `.ignore` or `.git/info/exclude` inside the walked directory that is a symbolic link, as git reads no symlinked `.gitignore`; git does follow a symlinked `.git/info/exclude`, so there the walk now differs from git
 
 ## [18.18.6] - 2026-11-09
 
