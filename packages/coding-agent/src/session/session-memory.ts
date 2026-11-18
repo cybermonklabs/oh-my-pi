@@ -6,6 +6,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { all as allSettings, combine, type Derived } from "../config/registry";
 import type { Settings } from "../config/settings";
 import type { HindsightSessionState } from "../hindsight/state";
+import type { RecallChangesReport } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendStartOptions } from "../memory-backend/types";
 import type { MnemopiSessionState } from "../mnemopi/state";
@@ -69,6 +70,11 @@ export class SessionMemory {
 	 * instead of a system block (`MEMORY_RECALL_MESSAGE_TYPE`); each request sends it where its context lacks it.
 	 */
 	#hiddenRecall: string | undefined;
+	/**
+	 * The reports of what changed in a reused recall's memories that the conversation carries as hidden
+	 * `memory-recall-changes` messages, oldest first; each request sends one again where its context lacks it.
+	 */
+	#recallChanges: readonly RecallChangesReport[] = [];
 	/** Cwd the running backend state was built for; a transcript is never retained after it moved. */
 	#runtimeCwd: string | undefined;
 	/** Apply waiting behind the current transition; later requests join it. */
@@ -88,6 +94,8 @@ export class SessionMemory {
 			createMemoryTools?: () => Promise<AgentTool[]>;
 			/** The recall the loaded transcript's branch delivered as a hidden message (`findDeliveredRecall`). */
 			hiddenRecall?: string;
+			/** The reports of a reused recall's changes the loaded branch delivered (`findDeliveredRecallChanges`). */
+			recallChanges?: readonly RecallChangesReport[];
 		},
 	) {
 		this.#host = host;
@@ -99,6 +107,7 @@ export class SessionMemory {
 		const backend = cfgMemoryBackend.get(host.settings);
 		if (options.memoryEnabled !== false && (backend === "hindsight" || backend === "mnemopi")) {
 			this.#hiddenRecall = options.hiddenRecall;
+			this.#recallChanges = options.recallChanges ?? [];
 		}
 		if (this.#memoryAgentDir) this.#runtimeCwd = host.cwd();
 		// Subagents alias the parent's backend state and never replace it live.
@@ -209,6 +218,22 @@ export class SessionMemory {
 		this.#hiddenRecall = recall;
 	}
 
+	/** The reports of what changed in a reused recall's memories that the conversation carries, oldest first. */
+	get recallChanges(): readonly RecallChangesReport[] {
+		return this.#recallChanges;
+	}
+
+	/** Records the reports the recall the backend just adopted carries: a reused one's, none for a fresh one. */
+	setRecallChanges(changes: readonly RecallChangesReport[]): void {
+		this.#recallChanges = changes;
+	}
+
+	/** Withdraws the conversation's recall: the hidden one and the change reports, which no later request sends. */
+	forgetRecall(): void {
+		this.#hiddenRecall = undefined;
+		this.#recallChanges = [];
+	}
+
 	/** Rekeys every active memory backend to the current provider session. */
 	rekeyForCurrentSessionId(): void {
 		this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -253,7 +278,7 @@ export class SessionMemory {
 	/** Resets transcript-scoped memory counters and removes a promoted prompt. */
 	async resetContextForNewTranscript(): Promise<void> {
 		// The new transcript does not carry the old one's recall, and the backend recalls afresh for it.
-		this.#hiddenRecall = undefined;
+		this.forgetRecall();
 		const hadPromotedMemoryPrompt = this.#baseSystemPromptBeforeMemoryPromotion !== undefined;
 		const resetHindsight = this.#resetHindsightConversationTrackingIfHindsight();
 		const resetMnemopi = this.#resetMnemopiConversationTrackingIfMnemopi();
@@ -356,7 +381,7 @@ export class SessionMemory {
 		try {
 			await this.#disposeMemoryBackendState(true, retain);
 			// The backend starts again without a recall and recalls afresh at the next turn.
-			this.#hiddenRecall = undefined;
+			this.forgetRecall();
 			this.#runtimeCwd = cwd;
 			if (this.#memoryAgentDir && this.#memoryTaskDepth === 0 && !this.#host.isDisposed()) {
 				const backend = await resolveMemoryBackend(this.#host.settings);

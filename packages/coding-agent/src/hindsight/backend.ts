@@ -370,7 +370,9 @@ async function reconcilePrimaryState(session: AgentSession): Promise<boolean> {
 		(current.config.retainMission?.trim() || "") === (config.retainMission?.trim() || "");
 	const state = await installPrimaryState(session, settings, sameBankConfig ? current.banksSet : new Set());
 	if (!state) return false;
-	// A destination with no recall injection must not reuse the source bank's prompt.
+	// The fresh state recalls afresh at the next turn: the old state's recall goes out in no later request, and a
+	// destination with no recall injection must not reuse the source bank's prompt.
+	session.forgetMemoryRecall();
 	await session.refreshBaseSystemPrompt();
 	return true;
 }

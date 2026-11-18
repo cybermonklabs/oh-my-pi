@@ -65,6 +65,7 @@ const host: SessionToolsHost = {
 	clearMemoryPromotionSnapshot: () => {},
 	captureMemoryPromotionSnapshot: () => {},
 	setHiddenMemoryRecall: () => {},
+	setMemoryRecallChanges: () => {},
 	emitNotice: () => {},
 	notifyCommandMetadataChanged: () => {},
 	localProtocolOptions: () => ({}),

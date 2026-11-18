@@ -190,6 +190,7 @@ import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import {
 	findDeliveredRecall,
+	findDeliveredRecallChanges,
 	MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
 	MEMORY_RECALL_MESSAGE_TYPE,
 } from "../memory-backend/recall-entry";
@@ -1171,6 +1172,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#advisorCostRestore: Promise<void> = Promise.resolve();
 	#goalTurnCounter = 0;
 	#planReferenceSent = false;
+	/**
+	 * The branch entry the approved-plan reference went out after in this process (null: before the first entry), set
+	 * with {@link #planReferenceSent}: a branch that holds it and grows past it carries the reference.
+	 */
+	#planReferenceSentAfter: string | null = null;
 	#planReferencePath = "local://PLAN.md";
 	#planReferenceApproved = false;
 	#clientBridge: ClientBridge | undefined;
@@ -2196,15 +2202,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		);
 		this.sessionManager = config.sessionManager;
 		// Only a recorded approval may turn a draft file into an execution reference.
-		for (const entry of this.sessionManager.getBranch().reverse()) {
-			if (entry.type !== "mode_change") continue;
-			if (entry.mode === "plan" || entry.mode === "plan_paused") break;
-			if (typeof entry.data?.approvedPlanFilePath === "string") {
-				this.#planReferencePath = entry.data.approvedPlanFilePath;
-				this.#planReferenceApproved = true;
-				break;
-			}
-		}
+		this.#adoptPlanApprovalFromBranch();
 		this.settings = config.settings;
 		this.#ownsCostGate = config.costGate === undefined;
 		this.#costGate = config.costGate ?? this.#createCostGate();
@@ -2495,6 +2493,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			memoryTaskDepth: config.memoryTaskDepth,
 			createMemoryTools: config.createMemoryTools,
 			hiddenRecall: findDeliveredRecall(this.sessionManager.getBranchView()),
+			recallChanges: findDeliveredRecallChanges(this.sessionManager.getBranchView()),
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
 		// toggle scopes priority to Fireworks alone, without mutating the shared
@@ -2694,6 +2693,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			setHiddenMemoryRecall: recall => this.#memory.setHiddenRecall(recall),
+			setMemoryRecallChanges: changes => this.#memory.setRecallChanges(changes),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
@@ -7829,13 +7829,27 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
+	 * Withdraws the recall the conversation carries as a hidden message and the reports of what changed in a reused
+	 * recall's memories, after the backend's recall was reset (`/memory clear`, a rebuilt Hindsight state): no later
+	 * request sends them again, and a prompt rebuild asks the backend for its whole memory instructions.
+	 */
+	forgetMemoryRecall(): void {
+		this.#memory.forgetRecall();
+	}
+
+	/**
 	 * The hidden messages a model call must carry that its context lacks, decided from the call's own context:
 	 * - the conversation's hidden recall ({@link hiddenMemoryRecall}) where neither the system prompt nor a
 	 *   `memory-recall` message holds it: a branch the delivered message is not on (`/tree` to before it), a
 	 *   compaction that summarized it (before the turn or between its tool calls) and an older recall the context
 	 *   holds in its place each leave it out;
+	 * - each report of what changed in a reused recall's memories that no `memory-recall-changes` message in the
+	 *   context holds;
 	 * - the approved-plan reference a compaction re-armed after the turn was prepared (the turn's own pre-prompt
-	 *   compaction, one between its tool calls), which would otherwise wait for the next prompt.
+	 *   compaction, one between its tool calls), which would otherwise wait for the next prompt;
+	 * - the plan, goal and vibe mode instructions of an active mode where no message of their kind is in the context;
+	 * - the notices of what changed since the prompt the model holds that the context no longer tells it
+	 *   ({@link SessionTools.missingContextNotices}).
 	 * The call sends them after its newest content, and later calls replay them from there.
 	 */
 	async #missingContextMessages(context: AgentContext): Promise<AgentMessage[]> {
@@ -7860,11 +7874,47 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				timestamp: Date.now(),
 			});
 		}
+		const recallChanges = this.#memory.recallChanges;
+		const newestChanges = recallChanges.at(-1);
+		if (newestChanges) {
+			const carried = new Set<unknown>();
+			for (const message of context.messages) {
+				if (message.role === "custom" && message.customType === MEMORY_RECALL_CHANGES_MESSAGE_TYPE) {
+					carried.add(message.content);
+				}
+			}
+			for (const report of recallChanges) {
+				if (carried.has(report.content)) continue;
+				missing.push({
+					role: "custom",
+					customType: MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+					content: report.content,
+					// With every report in the context again, the memories still current are the newest report's.
+					details: newestChanges.details,
+					display: false,
+					attribution: "agent",
+					timestamp: Date.now(),
+				});
+			}
+		}
 		const planReference = await this.#buildPlanReferenceMessage();
 		if (planReference) {
-			this.#planReferenceSent = true;
+			this.#notePlanReferenceSent();
 			missing.push(planReference);
 		}
+		for (const mode of [
+			await this.#buildPlanModeMessage(),
+			this.#buildGoalModeMessage(),
+			this.#buildVibeModeMessage(),
+		]) {
+			if (
+				mode &&
+				!context.messages.some(message => message.role === "custom" && message.customType === mode.customType)
+			) {
+				missing.push(mode);
+			}
+		}
+		missing.push(...this.#tools.missingContextNotices(context.messages));
 		return missing;
 	}
 
@@ -8364,7 +8414,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	markPlanReferenceSent(): void {
-		this.#planReferenceSent = true;
+		this.#notePlanReferenceSent();
 	}
 
 	/** Marks a reviewed plan as approved so later prompts may reference it. */
@@ -8598,6 +8648,45 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		};
+	}
+
+	/** Records that the approved-plan reference goes out now, after the current branch leaf. */
+	#notePlanReferenceSent(): void {
+		this.#planReferenceSent = true;
+		this.#planReferenceSentAfter = this.sessionManager.getLeafId();
+	}
+
+	/**
+	 * Adopts the plan approval the current branch records: the approved plan of its newest mode change, unless plan
+	 * mode was entered after it. A branch that records none has no approved plan.
+	 */
+	#adoptPlanApprovalFromBranch(): void {
+		this.#planReferenceApproved = false;
+		const branch = this.sessionManager.getBranchView();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type !== "mode_change") continue;
+			if (entry.mode === "plan" || entry.mode === "plan_paused") return;
+			if (typeof entry.data?.approvedPlanFilePath === "string") {
+				this.#planReferencePath = entry.data.approvedPlanFilePath;
+				this.#planReferenceApproved = true;
+				return;
+			}
+		}
+	}
+
+	/**
+	 * After a move to another branch or transcript: the approval it records ({@link #adoptPlanApprovalFromBranch}),
+	 * and whether it carries the reference this process sent, which it does when it holds the entry the reference went
+	 * out after and grows past it. One that lacks it gets it again with its next request.
+	 */
+	#syncPlanReferenceToBranch(): void {
+		this.#adoptPlanApprovalFromBranch();
+		if (!this.#planReferenceSent) return;
+		const branch = this.sessionManager.getBranchView();
+		const after = this.#planReferenceSentAfter;
+		const index = after === null ? -1 : branch.findIndex(entry => entry.id === after);
+		this.#planReferenceSent = (after === null || index >= 0) && index < branch.length - 1;
 	}
 
 	#isScoutAvailable(): boolean {
@@ -9898,7 +9987,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// lost the approved plan (issue #4094). The compaction-success resets
 			// (issue #1246) still clear it for re-injection on the next turn.
 			if (planReferenceMessage) {
-				this.#planReferenceSent = true;
+				this.#notePlanReferenceSent();
 			}
 			try {
 				const run = this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, () => {
@@ -13302,6 +13391,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
+		this.#syncPlanReferenceToBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
@@ -14412,6 +14502,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#advisors.resetSessionState({ preserveCost: true });
 			this.#todo.syncFromBranch();
 			this.#modelMentions.syncFromBranch();
+			this.#syncPlanReferenceToBranch();
 			if (switchingToDifferentSession) {
 				this.#closeAllProviderSessions("session switch");
 			} else if (didReloadConversationChange) {
@@ -14596,6 +14687,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			this.#todo.syncFromBranch();
 			this.#modelMentions.syncFromBranch();
+			this.#syncPlanReferenceToBranch();
 			this.#advisors.resetAllRuntimes();
 			this.#advisors.reattachRecorderFeeds();
 			this.#reconnectToAgent();
@@ -14766,6 +14858,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#rehydrateCheckpointRewindState();
 			this.#todo.syncFromBranch();
 			this.#modelMentions.syncFromBranch();
+			this.#syncPlanReferenceToBranch();
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
@@ -15236,6 +15329,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
+		this.#syncPlanReferenceToBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
 		this.#branchSummaryAbortController = undefined;

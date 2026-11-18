@@ -29,7 +29,11 @@ import { type LocalProtocolOptions } from "../internal-urls";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { sameItems } from "@oh-my-pi/pi-tui/native/memo";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
-import { findDeliveredRecall } from "../memory-backend/recall-entry";
+import {
+	findDeliveredRecall,
+	findDeliveredRecallChanges,
+	type RecallChangesReport,
+} from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
@@ -169,6 +173,11 @@ export interface SessionToolsHost {
 	 * block or the backend adopted none.
 	 */
 	setHiddenMemoryRecall(recall: string | undefined): void;
+	/**
+	 * Records the reports of what changed in a reused recall's memories that the conversation carries as hidden
+	 * `memory-recall-changes` messages, oldest first; each request sends one again where its context lacks it.
+	 */
+	setMemoryRecallChanges(changes: readonly RecallChangesReport[]): void;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	notifyCommandMetadataChanged(): void;
 	localProtocolOptions(): LocalProtocolOptions;
@@ -2878,19 +2887,39 @@ export class SessionTools {
 	}
 
 	/**
+	 * The notices derived from the context that `messages` lack: each one {@link takeEvalPreludeNotice},
+	 * {@link takeSessionAgentNotice}, {@link takeTaskAgentNotice}, {@link takePerCallModelNotice},
+	 * {@link takeSkillNotice} and {@link takeSettingsNotice} build from them. The user prompt carries them before its
+	 * message; a request whose context lost one since (a compaction between tool calls) gets it again here.
+	 */
+	missingContextNotices(messages: readonly AgentMessage[]): AgentMessage[] {
+		return [
+			this.takeEvalPreludeNotice(messages),
+			this.takeSessionAgentNotice(messages),
+			this.takeTaskAgentNotice(messages),
+			this.takePerCallModelNotice(messages),
+			this.takeSkillNotice(messages),
+			this.takeSettingsNotice(messages),
+		].filter(notice => notice !== undefined);
+	}
+
+	/**
 	 * Builds the hidden notice reconciling the eval preludes the model knows with
 	 * the live set. Delivered with the next user prompt instead of rebuilding the
 	 * system prompt, so a mid-session toggle (`/computer on`) keeps the provider
 	 * cache prefix intact.
 	 *
 	 * Known preludes are the committed base snapshot, then every prelude notice
-	 * still in context, applied in order. Deriving this from the transcript
-	 * rather than tracked state stays truthful across base rebuilds (which absorb
-	 * the live set), compaction (which drops old notices), and resume.
+	 * still in context (`messages`, the agent's own unless given), applied in order.
+	 * Deriving this from the transcript rather than tracked state stays truthful
+	 * across base rebuilds (which absorb the live set), compaction (which drops old
+	 * notices), and resume.
 	 */
-	takeEvalPreludeNotice(): CustomMessage<EvalPreludeNoticeDetails> | undefined {
+	takeEvalPreludeNotice(
+		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+	): CustomMessage<EvalPreludeNoticeDetails> | undefined {
 		const known = new Set(this.#promptSurface.evalPreludes.map(definition => definition.name));
-		for (const message of this.#host.agent.state.messages) {
+		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== EVAL_PRELUDE_NOTICE_MESSAGE_TYPE) continue;
 			const details = message.details;
 			if (!isRecord(details) || !Array.isArray(details.added) || !Array.isArray(details.removed)) continue;
@@ -2933,12 +2962,15 @@ export class SessionTools {
 	 * Known agents are the committed base snapshot, then every agent notice still
 	 * in context, applied in order ({@link #agentRosterNotice}) — mirroring {@link takeEvalPreludeNotice}.
 	 */
-	takeSessionAgentNotice(): CustomMessage<AgentNoticeDetails> | undefined {
+	takeSessionAgentNotice(
+		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+	): CustomMessage<AgentNoticeDetails> | undefined {
 		return this.#agentRosterNotice(
 			SESSION_AGENT_NOTICE_TYPE,
 			sessionAgentNoticePrompt,
 			this.#promptSurface.sessionAgents,
 			this.#host.sessionAgents(),
+			messages,
 		);
 	}
 
@@ -2954,18 +2986,20 @@ export class SessionTools {
 	 * Known agents are the committed base snapshot, then every such notice still
 	 * in context, applied in order ({@link #agentRosterNotice}).
 	 */
-	takeTaskAgentNotice(): CustomMessage<AgentNoticeDetails> | undefined {
+	takeTaskAgentNotice(
+		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+	): CustomMessage<AgentNoticeDetails> | undefined {
 		if (!this.getEnabledToolNames().includes("task")) return undefined;
 		const committed = this.#promptSurface.discoveredAgents;
 		const live = publishedAgentDiscovery(this.#host.sessionManager.getCwd(), this.#host.effectiveExtensionRoots());
 		// Without a committed scan the description lists the latest one itself.
 		if (!committed || !live) return undefined;
-		return this.#agentRosterNotice(TASK_AGENT_NOTICE_MESSAGE_TYPE, taskAgentNoticePrompt, committed, live);
+		return this.#agentRosterNotice(TASK_AGENT_NOTICE_MESSAGE_TYPE, taskAgentNoticePrompt, committed, live, messages);
 	}
 
 	/**
 	 * The hidden `customType` notice of what `live` changes in the agents the model knows: `committed`, then what
-	 * every `customType` notice still in context listed and withdrew, in order. Both sides keep only the agents the
+	 * every `customType` notice in `messages` listed and withdrew, in order. Both sides keep only the agents the
 	 * session may spawn now ({@link spawnableAgents}), as the task description lists them, so an agent the settings
 	 * disable is never announced. An agent whose description changed is listed again with the new one, since the
 	 * model picks agents by it. `template` renders the notice.
@@ -2975,6 +3009,7 @@ export class SessionTools {
 		template: string,
 		committed: readonly AgentDefinition[],
 		live: readonly AgentDefinition[],
+		messages: readonly AgentMessage[],
 	): CustomMessage<AgentNoticeDetails> | undefined {
 		const disabledAgents = cfgTaskDisabledAgents.get(this.#host.settings);
 		const policy = resolveSpawnPolicy(this.#host.sessionSpawns());
@@ -2982,7 +3017,7 @@ export class SessionTools {
 		const known = new Map<string, string | undefined>(
 			spawnableAgents(committed, disabledAgents, policy).map(agent => [agent.name, agent.description]),
 		);
-		for (const message of this.#host.agent.state.messages) {
+		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== customType) continue;
 			const details = message.details;
 			if (!isRecord(details) || !Array.isArray(details.added) || !Array.isArray(details.removed)) continue;
@@ -3024,12 +3059,14 @@ export class SessionTools {
 	 * rebuild outdated costs at most one restatement of what the descriptions list.
 	 * A session with no task or eval tool that lists them gets none.
 	 */
-	takePerCallModelNotice(): CustomMessage<PerCallModelAdvertisement> | undefined {
+	takePerCallModelNotice(
+		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+	): CustomMessage<PerCallModelAdvertisement> | undefined {
 		const settings = this.#host.settings;
 		let known = this.#promptSurface.perCallModels;
 		// Without a committed snapshot the descriptions list the live approvals themselves.
 		if (!known || !this.#perCallModelsAdvertised(this.getEnabledToolNames())) return undefined;
-		for (const message of this.#host.agent.state.messages) {
+		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== PER_CALL_MODEL_NOTICE_MESSAGE_TYPE) continue;
 			if (isPerCallModelAdvertisement(message.details)) known = message.details;
 		}
@@ -3052,12 +3089,14 @@ export class SessionTools {
 	 * because the model routes on it. Gated like the prompt's skill list: `skillful` on and an enabled
 	 * tool, top-level or `xd://`-mounted, that reads `skill://`.
 	 */
-	takeSkillNotice(): CustomMessage<SkillNoticeDetails> | undefined {
+	takeSkillNotice(
+		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+	): CustomMessage<SkillNoticeDetails> | undefined {
 		if (cfgSkillful.get(this.#host.settings) !== true) return undefined;
 		if (!this.getEnabledToolNames().some(name => toolReadsSkillUris(this.getToolByName(name)))) return undefined;
 		const listed = (skills: readonly Skill[]) => skills.filter(skill => skill.hide !== true);
 		const known = new Map(listed(this.#promptSkills).map(skill => [skill.name, skill.description]));
-		for (const message of this.#host.agent.state.messages) {
+		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== SKILL_NOTICE_MESSAGE_TYPE) continue;
 			const details = message.details;
 			if (!isRecord(details) || !Array.isArray(details.announced) || !Array.isArray(details.removed)) continue;
@@ -3682,10 +3721,12 @@ export class SessionTools {
 	 * since the hold's last notice on the current branch: a branch the hold's notices are not on (`/tree` to an
 	 * earlier reply, a switch to another session) gets the whole change.
 	 */
-	takeSettingsNotice(): CustomMessage<SettingsNoticeDetails> | undefined {
+	takeSettingsNotice(
+		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+	): CustomMessage<SettingsNoticeDetails> | undefined {
 		const held = this.#heldSettingsRebuild;
 		if (!held) return undefined;
-		const told = this.#settingsNoticeTold(held);
+		const told = this.#settingsNoticeTold(held, messages);
 		const values = new Map(told?.values);
 		const changes: SettingChangeView[] = [];
 		for (const [setting, before] of held.before) {
@@ -3722,9 +3763,8 @@ export class SessionTools {
 		};
 	}
 
-	/** What `held`'s newest settings notice in the current context told the model; undefined when none is there. */
-	#settingsNoticeTold(held: HeldSettingsRebuild): SettingsNoticeState | undefined {
-		const messages = this.#host.agent.state.messages;
+	/** What `held`'s newest settings notice in `messages` told the model; undefined when none is there. */
+	#settingsNoticeTold(held: HeldSettingsRebuild, messages: readonly AgentMessage[]): SettingsNoticeState | undefined {
 		for (let index = messages.length - 1; index >= 0; index--) {
 			const message = messages[index];
 			if (message.role !== "custom" || message.customType !== SETTINGS_NOTICE_MESSAGE_TYPE) continue;
@@ -3907,7 +3947,7 @@ export class SessionTools {
 						if (!isCurrent()) return false;
 						if (!memory) return true;
 						if (!memory.commit()) return false;
-						this.#host.setHiddenMemoryRecall(undefined);
+						this.#adoptMemoryRecall(memory, undefined);
 						return true;
 					},
 				};
@@ -3927,7 +3967,7 @@ export class SessionTools {
 					memoryNotice: memory.notice,
 					commit: () => {
 						if (!isCurrent() || !memory.commit()) return false;
-						this.#host.setHiddenMemoryRecall(injected);
+						this.#adoptMemoryRecall(memory, injected);
 						return true;
 					},
 				};
@@ -3955,7 +3995,7 @@ export class SessionTools {
 				memoryNotice: memory.notice,
 				commit: () => {
 					if (!isCurrent() || !memory.commit()) return false;
-					this.#host.setHiddenMemoryRecall(undefined);
+					this.#adoptMemoryRecall(memory, undefined);
 					refreshed?.commit?.();
 					// A handler may have refreshed tools or policy. Promote the recall onto
 					// that winning base, never replace it with the preparation's snapshot.
@@ -3973,6 +4013,23 @@ export class SessionTools {
 			});
 			return { systemPrompt: this.#baseSystemPrompt };
 		}
+	}
+
+	/**
+	 * Records what the recall the backend just adopted leaves the conversation carrying: `hidden`, the recall a hidden
+	 * message holds (undefined when a system block holds it or it found nothing), and a reused recall's change reports,
+	 * the branch's and the one this turn delivers. A fresh recall carries none.
+	 */
+	#adoptMemoryRecall(memory: MemoryPromptPreparation, hidden: string | undefined): void {
+		this.#host.setHiddenMemoryRecall(hidden);
+		if (!memory.reused) {
+			this.#host.setMemoryRecallChanges([]);
+			return;
+		}
+		const changes = findDeliveredRecallChanges(this.#host.sessionManager.getBranchView());
+		const notice = memory.notice;
+		if (notice && !changes.some(report => report.content === notice.content)) changes.push(notice);
+		this.#host.setMemoryRecallChanges(changes);
 	}
 
 	/**

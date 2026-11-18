@@ -1041,6 +1041,8 @@ export class CommandController {
 		if (action === "reset" || action === "clear") {
 			try {
 				await backend.clear(agentDir, this.ctx.sessionManager.getCwd(), this.ctx.session);
+				// The cleared recall must not go out again in a request whose context lost it.
+				this.ctx.session.forgetMemoryRecall();
 				await this.ctx.session.refreshBaseSystemPrompt();
 				this.ctx.showStatus("Memory data cleared and system prompt refreshed.");
 			} catch (error) {

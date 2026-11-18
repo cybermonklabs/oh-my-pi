@@ -631,6 +631,8 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				case "clear":
 				case "reset": {
 					await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
+					// The cleared recall must not go out again in a request whose context lost it.
+					runtime.session.forgetMemoryRecall();
 					await runtime.session.refreshBaseSystemPrompt();
 					await runtime.output("Memory cleared.");
 					return commandConsumed();

@@ -23,6 +23,7 @@ import { capFrameDataBytes, frameDataBytesBudget, providerImageBudget } from "@o
 import { supportsRemoteImageUrls } from "../blob-broker/context-images";
 import { declaredTools } from "../utils/tool-declarations";
 import { imageDecodeFailureReason } from "@oh-my-pi/pi-tui/chat/image-loading";
+import type { SessionManager } from "./session-manager";
 
 const IMAGE_OMISSION: TextContent = {
 	type: "text",
@@ -369,6 +370,62 @@ const MAX_STICKY_IMAGE_CONVERSATIONS = 8;
 /** A forced image drop, with the context as the clamp received it and as it sends it. */
 export type ForcedImageDrop = (site: "image-count-clamp" | "image-byte-clamp", before: Context, after: Context) => void;
 
+/** Custom session entry holding a conversation's count-clamp drops as a forced drop left them. */
+export const IMAGE_DROP_ENTRY_TYPE = "provider-image-drop";
+
+/** A conversation's count-clamp drops as a forced drop left them. */
+export interface RecordedImageDrop {
+	/** The turn ({@link turnOf}) that names the conversation. */
+	turn: string;
+	/** The image budget the images were dropped for. */
+	budget: number;
+	/** The {@link imageKeys} of the dropped images. */
+	dropped: readonly string[];
+}
+
+/** Where a clamp keeps its conversations' forced drops beyond its process. */
+export interface ImageDropRecord {
+	/** The drops recorded, oldest first. */
+	read(): Iterable<RecordedImageDrop>;
+	write(drop: RecordedImageDrop): void;
+}
+
+function isRecordedImageDrop(data: unknown): data is RecordedImageDrop & { version: 1 } {
+	return (
+		isRecord(data) &&
+		data.version === 1 &&
+		typeof data.turn === "string" &&
+		typeof data.budget === "number" &&
+		Array.isArray(data.dropped) &&
+		data.dropped.every(key => typeof key === "string")
+	);
+}
+
+/**
+ * The {@link ImageDropRecord} of the session `sessionManager` holds: an {@link IMAGE_DROP_ENTRY_TYPE} entry on its
+ * branch at each forced drop, read back by a process that resumes it, the way the branch keeps its other state.
+ */
+export function sessionImageDropRecord(
+	sessionManager: Pick<SessionManager, "getBranchView" | "appendCustomEntry">,
+): ImageDropRecord {
+	return {
+		*read() {
+			for (const entry of sessionManager.getBranchView()) {
+				if (
+					entry.type === "custom" &&
+					entry.customType === IMAGE_DROP_ENTRY_TYPE &&
+					isRecordedImageDrop(entry.data)
+				) {
+					yield entry.data;
+				}
+			}
+		},
+		write(drop) {
+			sessionManager.appendCustomEntry(IMAGE_DROP_ENTRY_TYPE, { version: 1, ...drop });
+		},
+	};
+}
+
 /**
  * The provider image clamps of one conversation, held by its provider-context transform so that each request drops
  * what the previous one dropped.
@@ -389,6 +446,11 @@ export type ForcedImageDrop = (site: "image-count-clamp" | "image-byte-clamp", b
  * turn's images. A compaction replaces that turn, so the history it leaves is another conversation whose drops are
  * recomputed from its own images; so are the drops of a model whose budget differs.
  *
+ * Each forced drop is written to the clamp's record as well ({@link sessionImageDropRecord}: an entry on the
+ * session's branch), and a conversation the clamp does not remember is looked up there once its images pass the
+ * budget, so a process that resumes the session drops the images the previous one dropped instead of making another
+ * forced drop of a different set.
+ *
  * The byte clamp ({@link clampProviderContextImageBytes}) keeps the newest user message and the newest image tool
  * result past the byte budget while they fit the body limit, and which messages those are moves with every turn: a
  * message it protected becomes the oldest one it may evict once a newer one arrives, ahead of images it already
@@ -398,19 +460,22 @@ export type ForcedImageDrop = (site: "image-count-clamp" | "image-byte-clamp", b
 export class ProviderImageClamp {
 	#drops = new LRUCache<string, StickyImageDrop>({ max: MAX_STICKY_IMAGE_CONVERSATIONS });
 	readonly #onForcedDrop: ForcedImageDrop | undefined;
+	/** Where each forced drop is kept for a later process; none keeps them in memory only. */
+	readonly #record: ImageDropRecord | undefined;
 	/** Images the byte clamp evicted from the previous request. */
 	#byteDrops = 0;
 
-	constructor(onForcedDrop?: ForcedImageDrop) {
+	constructor(onForcedDrop?: ForcedImageDrop, record?: ImageDropRecord) {
 		this.#onForcedDrop = onForcedDrop;
+		this.#record = record;
 	}
 
 	/**
-	 * A clamp for a side request of this conversation: it shares the count clamp's drops, so it sends the images this
-	 * conversation sends, but it counts its own byte drops and reports no forced drop.
+	 * A clamp for a side request of this conversation: it shares the count clamp's drops and their record, so it sends
+	 * the images this conversation sends, but it counts its own byte drops and reports no forced drop.
 	 */
 	sideRequestClamp(): ProviderImageClamp {
-		const side = new ProviderImageClamp();
+		const side = new ProviderImageClamp(undefined, this.#record);
 		side.#drops = this.#drops;
 		return side;
 	}
@@ -431,15 +496,40 @@ export class ProviderImageClamp {
 	}
 
 	/**
+	 * The conversation `context` continues among those whose drops the record holds (a previous process's, on a
+	 * resumed session), found as {@link #conversationOf} finds one, and remembered from then on.
+	 */
+	#recordedConversationOf(context: Context): { turn: string; drop: StickyImageDrop } | undefined {
+		if (!this.#record) return undefined;
+		const recorded = new Map<string, RecordedImageDrop>();
+		for (const drop of this.#record.read()) recorded.set(drop.turn, drop);
+		if (recorded.size === 0) return undefined;
+		for (const message of context.messages) {
+			if (message.role === "assistant") continue;
+			const found = recorded.get(turnOf(message));
+			if (!found) continue;
+			const drop = { budget: found.budget, dropped: new Set(found.dropped) };
+			this.#drops.set(found.turn, drop);
+			return { turn: found.turn, drop };
+		}
+		return undefined;
+	}
+
+	/**
 	 * The live count clamp of this conversation's requests: `context` without the images past `model`'s image budget,
 	 * dropping what this conversation's previous requests dropped while the rest fit, else the oldest images down to
-	 * half the budget, which it reports as a forced drop.
+	 * half the budget, which it reports as a forced drop and records.
 	 */
 	clampImageCount(context: Context, model: Model): Context {
 		if (!model.input.includes("image")) return context;
 		const metadataWire = sendsComputerScreenshotMetadata(model);
 		const budget = providerImageBudget(model);
-		const conversation = this.#conversationOf(context);
+		let conversation = this.#conversationOf(context);
+		if (!conversation) {
+			if (countImages(context, metadataWire) <= budget) return context;
+			// A resumed conversation drops again what the previous process dropped.
+			conversation = this.#recordedConversationOf(context);
+		}
 		const state = conversation?.drop.budget === budget ? conversation.drop : undefined;
 		if (!state && countImages(context, metadataWire) <= budget) return context;
 		const dropped = state?.dropped ?? new Set<string>();
@@ -465,7 +555,10 @@ export class ProviderImageClamp {
 		const clamped = dropImagesAt(context, model, metadataWire, positions);
 		if (forced) {
 			const turn = conversation?.turn ?? oldestImageTurn(context, metadataWire);
-			if (turn !== undefined) this.#drops.set(turn, { budget, dropped });
+			if (turn !== undefined) {
+				this.#drops.set(turn, { budget, dropped });
+				this.#record?.write({ turn, budget, dropped: [...dropped] });
+			}
 			this.#onForcedDrop?.("image-count-clamp", context, clamped);
 		}
 		return clamped;

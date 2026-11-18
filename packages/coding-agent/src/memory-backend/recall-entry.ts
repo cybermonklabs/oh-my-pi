@@ -18,8 +18,17 @@ export const MEMORY_RECALL_ENTRY_TYPE = "memory_recall";
  * Hidden message reporting what changed in a reused recall's memories. Its details
  * ({@link MemoryRecallChangesDetails}) carry the memories still current, so the
  * report and its bookkeeping reach the transcript together, only once delivered.
+ * The session keeps every report the reused recall carries ({@link findDeliveredRecallChanges}),
+ * and a model call whose context holds no message with a report's text (a compaction
+ * summarized it, a branch it is not on) sends that report again after its newest content.
  */
 export const MEMORY_RECALL_CHANGES_MESSAGE_TYPE = "memory-recall-changes";
+
+/** A {@link MEMORY_RECALL_CHANGES_MESSAGE_TYPE} message's text and its backend's details. */
+export interface RecallChangesReport {
+	content: string;
+	details: unknown;
+}
 
 /**
  * Hidden message carrying a recall that first succeeded after the conversation's prompt had been
@@ -175,6 +184,41 @@ export function findDeliveredRecall(branch: readonly SessionEntry[]): string | u
 		}
 	}
 	return undefined;
+}
+
+/**
+ * The {@link MEMORY_RECALL_CHANGES_MESSAGE_TYPE} reports the branch delivered for the recall it
+ * reuses: every one since the newest recall it recorded or its last context reset, oldest first,
+ * each text once. A loaded transcript's reports, and those before a reused recall's new one.
+ */
+export function findDeliveredRecallChanges(branch: readonly SessionEntry[]): RecallChangesReport[] {
+	let start = 0;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (
+			entry.type === "reset_boundary" ||
+			(entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE)
+		) {
+			start = index + 1;
+			break;
+		}
+	}
+	const reports: RecallChangesReport[] = [];
+	const seen = new Set<string>();
+	for (let index = start; index < branch.length; index++) {
+		const entry = branch[index];
+		if (
+			entry.type !== "custom_message" ||
+			entry.customType !== MEMORY_RECALL_CHANGES_MESSAGE_TYPE ||
+			typeof entry.content !== "string" ||
+			seen.has(entry.content)
+		) {
+			continue;
+		}
+		seen.add(entry.content);
+		reports.push({ content: entry.content, details: entry.details });
+	}
+	return reports;
 }
 
 /**

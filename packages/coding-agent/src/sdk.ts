@@ -225,7 +225,12 @@ import {
 	USER_INTERRUPT_LABEL,
 	wrapSteeringForModel,
 } from "./session/messages";
-import { capArchiveFrameBytes, dropUnreadableContextImages, ProviderImageClamp } from "./session/provider-image-budget";
+import {
+	capArchiveFrameBytes,
+	dropUnreadableContextImages,
+	ProviderImageClamp,
+	sessionImageDropRecord,
+} from "./session/provider-image-budget";
 import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
@@ -4739,10 +4744,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			};
 		};
 		// A request past the image budget cannot be served without the drop, so the rule admits it
-		// as forced; asking it logs the decision.
+		// as forced; asking it logs the decision. Each forced drop is kept on the branch, so a resumed
+		// process drops the same images.
 		const mainImageClamp = new ProviderImageClamp(site => {
 			if (session) session.admitsProviderContextCut(providerContextCut(site));
-		});
+		}, sessionImageDropRecord(sessionManager));
 		const transformProviderContext = createTransformProviderContext(
 			createSessionDateCwdReminderJournal(sessionManager),
 			mainImageClamp,
