@@ -290,35 +290,49 @@ export class RpcSubagentRegistry {
 	}
 }
 
-/** A running subagent from this session's roster, bound to its live registry ref. */
+/** A subagent from this session's roster, bound to its live registry ref. */
 export interface RpcOwnedSubagent {
 	ref: AgentRef;
 	session: AgentSessionHandle;
 }
 
+export interface RpcOwnedSubagentOptions {
+	/**
+	 * Also reach a subagent idle between its turns: an `idle` ref whose result
+	 * the parent has not accepted. A synchronous subagent waiting for its own
+	 * async jobs (an eval `agent()` handle) is idle there while `get_subagents`
+	 * still lists it running.
+	 */
+	betweenTurns?: boolean;
+}
+
 /**
- * Resolve a `get_subagents` id to its running, live registry ref, or
- * `undefined` when the host must not reach it (unknown, finished, accepted,
- * parked, aborted, or another session's agent).
+ * Resolve a `get_subagents` id to its live registry ref, or `undefined` when
+ * the host must not reach it (unknown, finished, accepted, parked, aborted, or
+ * another session's agent).
  *
  * Agent ids are unique only within one parent session's artifacts scope, and
  * the process-global registry keeps the latest ref per id, so the ref must
  * carry the transcript file this session's roster recorded
- * (`<artifactsDir>/<id>.jsonl`). The ref must also still be `running`: it goes
- * `idle` once the parent accepts its result, before the terminal lifecycle
- * frame prunes the roster, and a running ref always holds a live session.
+ * (`<artifactsDir>/<id>.jsonl`) and still hold its live session. The ref must
+ * be `running`, or with {@link RpcOwnedSubagentOptions.betweenTurns} `idle`
+ * and not accepted: acceptance stamps `lifecycle.acceptedAt` and flips the ref
+ * to `idle` before the terminal lifecycle frame prunes the roster, so an
+ * accepted result stays out of reach.
  */
 export function resolveOwnedLiveSubagent(
 	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
 	subagentId: string,
+	options?: RpcOwnedSubagentOptions,
 ): RpcOwnedSubagent | undefined {
 	const snapshot = subagentRegistry.getSubagents().find(candidate => candidate.id === subagentId);
 	// Progress can briefly report a terminal status before the terminal
 	// lifecycle frame prunes the snapshot; treat that as not running.
 	if ((snapshot?.status !== "running" && snapshot?.status !== "pending") || !snapshot.sessionFile) return undefined;
 	const ref = AgentRegistry.global().get(subagentId);
-	if (ref?.kind !== "sub" || ref.status !== "running" || !ref.session || ref.sessionFile !== snapshot.sessionFile) {
-		return undefined;
-	}
-	return { ref, session: ref.session };
+	if (ref?.kind !== "sub" || !ref.session || ref.sessionFile !== snapshot.sessionFile) return undefined;
+	const reachable =
+		ref.status === "running" ||
+		(options?.betweenTurns === true && ref.status === "idle" && ref.lifecycle?.acceptedAt === undefined);
+	return reachable ? { ref, session: ref.session } : undefined;
 }
