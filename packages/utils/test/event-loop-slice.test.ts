@@ -211,6 +211,56 @@ describe("mapInSlices", () => {
 		expect(unitTurns).toHaveLength(UNITS_PER_SLICE * 2);
 	});
 
+	it("lets a late close end only its own slice, so the next slice still waits for the timers that fell due in it", async () => {
+		/** Holds the loop for `ms` of real time. */
+		const holdReal = (ms: number) => {
+			const start = process.hrtime.bigint();
+			while (process.hrtime.bigint() - start < BigInt(ms * 1_000_000)) {}
+		};
+		await new Promise(resolve => setTimeout(resolve, 5));
+		// Numbers macrotasks in the timers and the check phase, so a slice is the units between two ticks.
+		let macro = 0;
+		let running = true;
+		const immediateTick = () => {
+			macro++;
+			if (running) setImmediate(immediateTick);
+		};
+		const timerTick = () => {
+			macro++;
+			if (running) setTimeout(timerTick, 0);
+		};
+		setImmediate(immediateTick);
+		setTimeout(timerTick, 0);
+		let slice = -1;
+		let lastMacro = -1;
+		let fired = false;
+		let firedAtThirdSlice: boolean | undefined;
+		const { promise, resolve } = Promise.withResolvers<Promise<unknown>>();
+		setTimeout(() => {
+			// In a timers phase: the first slice opens here and spends its budget.
+			const pass = mapInSlices(
+				Array.from({ length: 12 }, (_, index) => index),
+				() => {
+					if (macro !== lastMacro) {
+						lastMacro = macro;
+						slice++;
+						if (slice === 1) setTimeout(() => (fired = true), 0);
+						if (slice === 2) firedAtThirdSlice = fired;
+					}
+					holdReal(UNIT_MS);
+				},
+			);
+			// After the check-phase leg's first look, hold the loop so that the next timers phase finds the
+			// first slice's close, the release's timer leg and the leg's re-armed close due together: the
+			// release opens the second slice there, and the re-armed close of the first runs after it.
+			setImmediate(() => holdReal(5));
+			resolve(pass);
+		}, 0);
+		await await promise;
+		running = false;
+		expect(firedAtThirdSlice).toBe(true);
+	}, 10_000);
+
 	it("closes a slice that a pass finished inside, so the next pass after an idle wait runs a unit at once", async () => {
 		await mapInSlices([0], value => value);
 		await new Promise(resolve => setTimeout(resolve, EVENT_LOOP_SLICE_MS * 2));

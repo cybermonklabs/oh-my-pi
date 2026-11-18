@@ -32,6 +32,8 @@ let sliceStart = 0;
 let sliceOpenedAt = 0n;
 const SLICE_NS = BigInt(EVENT_LOOP_SLICE_MS * 1_000_000);
 let sliceOpen = false;
+/** The number of the slice open now, or of the last one; each close names the slice it ends. */
+let openSlice = 0;
 /** Resolvers of the passes waiting for the next turn, in the order they asked. */
 let waiters: Array<() => void> = [];
 /** The batch of waiters a scheduled release is for; 0 once released. */
@@ -40,8 +42,9 @@ let lastBatch = 0;
 /** Whether the waiting batch's check-phase leg scheduled a close of its own yet. */
 let closeRearmed = false;
 
-function closeSlice(): void {
-	sliceOpen = false;
+function closeSlice(slice: number): void {
+	// A close can run after a release opened the next slice in the same timers phase: it ends only its own.
+	if (slice === openSlice) sliceOpen = false;
 }
 
 /**
@@ -55,12 +58,13 @@ export function sliceExpired(): boolean {
 	const now = performance.now();
 	if (!sliceOpen) {
 		sliceOpen = true;
+		openSlice++;
 		sliceStart = now;
 		sliceOpenedAt = process.hrtime.bigint();
 		// Closed by a timer, so work later in this pass through the event loop
 		// finds the slice still open. Fake timers replace setTimeout, so the close
 		// may never run: a release (below) opens the next turn anyway.
-		setTimeout(closeSlice, 0);
+		setTimeout(closeSlice, 0, openSlice);
 	} else if (now < sliceStart) {
 		// A clock behind the slice's start is a mocked clock put back: start over.
 		sliceStart = now;
@@ -108,7 +112,7 @@ function releaseWaiters(batch: number, inCheckPhase = false): void {
 		// when they are removed. Another close, at the next timers phase, ends the wait either way.
 		if (!closeRearmed) {
 			closeRearmed = true;
-			setTimeout(closeSlice, 0);
+			setTimeout(closeSlice, 0, openSlice);
 		}
 		setImmediate(releaseWaiters, batch, true);
 		return;
