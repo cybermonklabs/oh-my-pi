@@ -512,8 +512,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		it("switches to a fallback at the reserve after a spent fallback under the fail-closed reserve policy, whose check then refuses it", async () => {
 			// The step past the spent fallback takes the fallback at the reserve
 			// under every reserve policy. Under `fail-closed` the check before that
-			// model call refuses a reserve model, so no request reaches it and the
-			// turn ends on the check's error.
+			// model call refuses a reserve model, so no request reaches it: the
+			// retry ends on the check's error, and no assistant reply is kept.
 			stubUsageReads({
 				[formatModelString(FALLBACK)]: depletedRead("usage"),
 				[formatModelString(NEXT_FALLBACK)]: {
@@ -529,16 +529,22 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 					"retry.fallbackChains": chainOf(FALLBACK, NEXT_FALLBACK),
 				}),
 			);
+			const retryEnds: { success: boolean; finalError?: string }[] = [];
+			run.session.subscribe(event => {
+				if (event.type === "auto_retry_end")
+					retryEnds.push({ success: event.success, finalError: event.finalError });
+			});
 
 			await runTurn(run.session, "Fail on the primary");
 
 			expect(requestedModels).toEqual([formatModelString(PRIMARY)]);
 			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
-			const last = lastAssistant(run.session);
-			expect(last.stopReason).toBe("error");
-			expect(last.errorMessage).toStartWith(
+			expect(retryEnds).toHaveLength(1);
+			expect(retryEnds[0]?.success).toBe(false);
+			expect(retryEnds[0]?.finalError).toContain(
 				`Usage preflight blocked: reserve reached for ${formatModelString(NEXT_FALLBACK)}`,
 			);
+			expect(run.session.messages.at(-1)?.role).toBe("user");
 		});
 
 		it("switches to a fallback whose usage is unknown after a spent fallback", async () => {
@@ -684,7 +690,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(last.errorMessage).toBe(`Retry budget exhausted after 2 retries: ${SERVER_ERROR}`);
 		});
 
-		it("retries the fallback in use with no switch, and pins it, when its cooldown ends while the step past a spent fallback reads usage", async () => {
+		it("retries the fallback in use with no switch, and pins it, when its cooldown ends while the walk reads the spent fallback's usage", async () => {
 			// The primary's denial switches to the fallback, unpinned. The fallback
 			// then fails, which puts it in cooldown, and the walk reaches the spent
 			// fallback after it, whose own chain names the fallback in use. Its usage
@@ -977,6 +983,88 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			]);
 			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK), formatModelString(FALLBACK)]);
 			expect(modelOf(run.session)).toBe(formatModelString(FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		it("passes over a model that refused in the turn in the check before a model call, to the model after it", async () => {
+			// The primary refuses, and the refusal walk moves to the fallback, which
+			// reads at the reserve. Under the `auto` reserve policy the check before
+			// the fallback's model call switches away from it. The fallback's own
+			// chain names `pi/default`, which resolves to the primary, and then the
+			// next fallback: the check passes over the primary, which refused in the
+			// turn, and the next fallback answers. No request reaches the fallback.
+			stubUsageReads({
+				[formatModelString(FALLBACK)]: {
+					state: "reserve",
+					accounts: [{ credentialId: 1, credentialType: "oauth", state: "reserve", remainingFraction: 0.05 }],
+				},
+			});
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createRefusalAgent(PRIMARY, requestedModels, [PRIMARY]),
+				walkSettings(PRIMARY, {
+					"retry.maxRetries": 1,
+					"retry.usageReservePolicy": "auto",
+					"retry.fallbackChains": {
+						default: [formatModelString(FALLBACK)],
+						[formatModelString(FALLBACK)]: ["pi/default", formatModelString(NEXT_FALLBACK)],
+					},
+				}),
+			);
+
+			await runTurn(run.session, "Recover from the refusal");
+
+			expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(NEXT_FALLBACK)]);
+			expect(run.fallbacks).toEqual([formatModelString(FALLBACK), formatModelString(NEXT_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		it("passes over a model that refused in the turn when a later fallback fails with another error, to the model after it", async () => {
+			// The primary refuses, and the refusal walk moves to the fallback, which
+			// fails with a server error. The walk after that failure is no refusal
+			// walk, and it still sends no request to a model that refused in the
+			// turn: it passes over `pi/default`, which resolves to the primary, and
+			// answers from the next fallback.
+			stubUsageReads({});
+			const requestedModels: string[] = [];
+			const mock = createMockModel();
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: PRIMARY, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requestedModels.push(formatModelString(model));
+					if (model.provider === FALLBACK.provider && model.id === FALLBACK.id) {
+						return providerErrorStream(model, SERVER_ERROR, 500);
+					}
+					mock.push(
+						model.provider === PRIMARY.provider && model.id === PRIMARY.id
+							? CLASSIFIER_REFUSAL
+							: { content: ["answered"] },
+					);
+					return mock.stream(model, context, options);
+				},
+			});
+			const run = startSession(
+				agent,
+				walkSettings(PRIMARY, {
+					"retry.maxRetries": 2,
+					"retry.fallbackChains": {
+						default: [formatModelString(FALLBACK)],
+						[formatModelString(FALLBACK)]: ["pi/default", formatModelString(NEXT_FALLBACK)],
+					},
+				}),
+			);
+
+			await runTurn(run.session, "Recover from the refusal and the server error");
+
+			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
+				formatModelString(FALLBACK),
+				formatModelString(NEXT_FALLBACK),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(FALLBACK), formatModelString(NEXT_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 

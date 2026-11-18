@@ -6,7 +6,7 @@
 
 - With `retry.usageAwareFallback` on, the fallback walk after a failed request no longer sends the request to a model whose usage is spent
 - The fallback walk after a failed request, the fallback switch before a model call (with `retry.usageAwareFallback` on), the switch off a model with no credential, and an advisor's fallback now pass over a fallback entry that resolves to a model in cooldown, however it is spelled (such as the alias `pi/default`), and the return to the primary after its cooldown waits the same way while the model the recorded primary resolves to is in cooldown
-- A classifier refusal's fallback walk no longer sends the request again to a model that refused it in the turn under another name, route or provider (such as the alias `pi/default` or the same model on Vertex), and goes on to the next model instead
+- After a classifier refusal, no fallback in the same turn (the refusal's own walk, the walk after a later failure, or the fallback switch before a model call with `retry.usageAwareFallback` on) sends the request again to a model that refused it, under another name, route or provider (such as the alias `pi/default` or the same model on Vertex); it goes on to the next model instead
 
 ## [18.18.6] - 2026-11-09
 

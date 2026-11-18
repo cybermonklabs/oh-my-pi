@@ -1703,7 +1703,7 @@ describe("AgentSession retry delay cap", () => {
 		}
 	});
 
-	it("switches a long OpenCode Go usage limit to an earlier cross-provider fallback", async () => {
+	it("ends a long OpenCode Go usage limit on the spent budget when its only earlier cross-provider fallback refused in the turn", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const alternateOpenCodeModel = getBundledModel("opencode-go", "deepseek-v4-pro");
 		const exhaustedModel = getBundledModel("opencode-go", "deepseek-v4-flash");
@@ -1780,27 +1780,27 @@ describe("AgentSession retry delay cap", () => {
 		await session.prompt("Trigger the long OpenCode Go weekly usage limit");
 		await session.waitForIdle();
 
+		// gpt-5.5 refused earlier in the turn, so the walk after the usage limit
+		// passes over it: the primary is in its cooldown and OpenCode Go is
+		// excluded, so nothing is switched to and the spent budget ends the turn.
 		expect(requestedModels).toEqual([
 			`${primaryModel.provider}/${primaryModel.id}`,
 			`${alternateOpenCodeModel.provider}/${alternateOpenCodeModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 			`${exhaustedModel.provider}/${exhaustedModel.id}`,
-			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
-		expect(fallbackEvents).toContainEqual({
-			type: "retry_fallback_applied",
-			from: `${exhaustedModel.provider}/${exhaustedModel.id}`,
-			to: `${fallbackModel.provider}/${fallbackModel.id}`,
-			role: "default",
-			reason: expect.stringContaining("429 Weekly usage limit reached"),
-		});
+		expect(fallbackEvents.map(event => event.to)).toEqual([
+			`${alternateOpenCodeModel.provider}/${alternateOpenCodeModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+			`${exhaustedModel.provider}/${exhaustedModel.id}`,
+		]);
 		for (const call of waitSpy.mock.calls) {
 			expect(call[0]).toBeLessThan(300_000);
 		}
-		expect(lastAssistant(session).content).toContainEqual({
-			type: "text",
-			text: "recovered on cross-provider fallback",
-		});
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toStartWith("Retry budget exhausted after 3 retries: ");
+		expect(last.errorMessage).toContain("429 Weekly usage limit reached");
 	});
 	it("waits for a short OpenCode Go sibling credential before model fallback", async () => {
 		const exhaustedModel = getBundledModel("opencode-go", "deepseek-v4-flash");

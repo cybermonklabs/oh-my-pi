@@ -451,8 +451,8 @@ interface InheritedThinkingLevel {
 interface RetryFallbackSearchRules {
 	/** Whether the search passes over an entry whose usage reads `health`. */
 	passOverUsage: (health: ModelUsageHealth) => boolean;
-	/** Whether the search passes over an entry that resolves to `model`; none when absent. */
-	passOverModel?: (model: Model) => boolean;
+	/** Whether the search passes over an entry that resolves to `model`. */
+	passOverModel: (model: Model) => boolean;
 }
 
 /** The options of one fallback walk after a failed request. */
@@ -481,8 +481,6 @@ interface SpentRetryFallback {
 	excludedMessage: AssistantMessage | undefined;
 	/** The reason a switch records: the failed request's error. */
 	reason: string;
-	/** This hop is a classifier-refusal walk: the searches pass over every model that refused in the turn. */
-	refusalWalk: boolean;
 	/** The candidates the refusal-credit hold passed over, in chain order. */
 	heldEntries: readonly RetryFallbackEntry[];
 	/** True once the walk is stale; a stale search ends the walk with no switch. */
@@ -506,8 +504,10 @@ export class TurnRecovery {
 	readonly #refusalWalkTried = new Set<string>();
 	/**
 	 * `provider/id` of each model a classifier refusal came from in the current retry saga,
-	 * which every spelling and route that resolves to that model shares. A refusal walk passes
-	 * over an entry that resolves to one (`#refusedInTurn`). Cleared with `#refusalWalkTried`.
+	 * which every spelling and route that resolves to that model shares. Every fallback search
+	 * in the saga passes over an entry that resolves to one (`#refusedInTurn`): the walk after a
+	 * failed request, whatever failed, the step past a spent fallback, and the check before a
+	 * model call. Cleared with `#refusalWalkTried`.
 	 */
 	readonly #refusedModels = new Set<string>();
 	/**
@@ -2303,8 +2303,12 @@ export class TurnRecovery {
 			undefined,
 			signal,
 			// The check before a model call and the switch off a model with no
-			// credential pass over a depleted or reserve fallback.
-			{ passOverUsage: health => health.state === "depleted" || health.state === "reserve" },
+			// credential pass over a depleted or reserve fallback and, as every
+			// fallback search, a model that refused in the turn.
+			{
+				passOverUsage: health => health.state === "depleted" || health.state === "reserve",
+				passOverModel: model => this.#refusedInTurn(model),
+			},
 		);
 	}
 
@@ -2346,7 +2350,7 @@ export class TurnRecovery {
 			const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
 			if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
 			if (this.isRetryFallbackEntrySuppressed(candidate, candidateModel)) continue;
-			if (rules.passOverModel?.(candidateModel)) continue;
+			if (rules.passOverModel(candidateModel)) continue;
 			if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
 			// Skip a candidate whose window cannot hold the live context so we
 			// never switch onto an oversized request (issue #8065).
@@ -2590,14 +2594,15 @@ export class TurnRecovery {
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 				if (!candidate) continue;
-				// A refusal walk visits any one model at most once per turn, under any
-				// name: it passes over an entry whose resolved model refused in the turn
+				// No walk sends a request to a model that refused in the turn, under
+				// any name: the walk passes over an entry whose resolved model refused
 				// (`#refusedInTurn`), whether the entry names it by an alias, another
-				// spelling, another route, or as the same model on another provider.
-				// Without this a pair of chains naming each other alternates: each hop is
-				// a model the walk has already been refused on, and the budget no longer
-				// stops it.
-				if (options?.refusalWalk && this.#refusedInTurn(candidate)) continue;
+				// spelling, another route, or as the same model on another provider, and
+				// whether this walk follows the refusal or a later failure of another
+				// kind. Without this a pair of chains naming each other alternates in a
+				// refusal walk: each hop is a model the walk has already been refused
+				// on, and the budget no longer stops it.
+				if (this.#refusedInTurn(candidate)) continue;
 				if (this.isRetryFallbackEntrySuppressed(selector, candidate)) continue;
 				// A candidate that would leave the request exactly as it is — same
 				// routed model, same effective thinking level — is not a switch, and
@@ -2697,7 +2702,6 @@ export class TurnRecovery {
 							currentSelector,
 							excludedMessage,
 							reason,
-							refusalWalk: options?.refusalWalk === true,
 							heldEntries,
 							usageReadStale,
 							withUsageReadSignal,
@@ -2751,9 +2755,9 @@ export class TurnRecovery {
 	 * check, it passes over only a fallback whose usage is spent
 	 * (`isUsageSpent`): one at the reserve or with unknown usage is taken, and
 	 * the check before its model call then applies `retry.usageReservePolicy`
-	 * to it, as after any switch. In a refusal walk it also passes over every
-	 * model that refused in the turn (`#refusedInTurn`). And unlike that check,
-	 * which picks nothing for a depleted model under
+	 * to it, as after any switch. It passes over every model that refused in
+	 * the turn (`#refusedInTurn`), as every fallback search does. And unlike
+	 * that check, which picks nothing for a depleted model under
 	 * `retry.usageReservePolicy: "fail-closed"` (it throws), the walk switches to
 	 * what the search finds under every reserve policy.
 	 *
@@ -2769,7 +2773,6 @@ export class TurnRecovery {
 		currentSelector,
 		excludedMessage,
 		reason,
-		refusalWalk,
 		heldEntries,
 		usageReadStale,
 		withUsageReadSignal,
@@ -2790,11 +2793,11 @@ export class TurnRecovery {
 			pinnedRole: this.#activeRetryFallback?.role ?? role,
 		});
 		// Both searches pass over only a spent fallback, so a later one at the
-		// reserve reaches the check before its model call, as at a switch onto it;
-		// a refusal walk's also pass over every model that refused in the turn.
+		// reserve reaches the check before its model call, as at a switch onto it,
+		// and every model that refused in the turn.
 		const rules: RetryFallbackSearchRules = {
 			passOverUsage: isUsageSpent,
-			passOverModel: refusalWalk ? model => this.#refusedInTurn(model) : undefined,
+			passOverModel: model => this.#refusedInTurn(model),
 		};
 
 		// First, a route found from the spent model.
