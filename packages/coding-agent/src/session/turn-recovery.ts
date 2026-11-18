@@ -246,72 +246,6 @@ function toolReplayStart(messages: readonly AgentMessage[]): number | undefined 
 	return start;
 }
 
-/**
- * Whether a usage read says the model's usage is spent: the pool is
- * `depleted`, it lists at least one account, and usage holds every account (an
- * exhausted quota window or a usage-limit block). An empty pool (the plan gate
- * filtered every account out) is not spent. A pool where any account is held
- * only by account-policy, model-policy or 401 blocks (no usage block holds it)
- * is not spent either.
- */
-function isUsageSpent(health: ModelUsageHealth): boolean {
-	return (
-		health.state === "depleted" &&
-		health.accounts.length > 0 &&
-		health.accounts.every(account => account.depletedBy === "usage")
-	);
-}
-
-/** A fallback candidate and the chain key it was found under. */
-interface RetryFallbackEntry {
-	role: string;
-	selector: RetryFallbackSelector;
-}
-
-/**
- * The thinking level a fallback switch requests in place of the session's
- * when the fallback's selector names none. `level` may be `undefined`: a
- * switch onto a model with no thinking leaves no level, and the switch after
- * it takes none either.
- */
-interface InheritedThinkingLevel {
-	level: ConfiguredThinkingLevel | undefined;
-}
-
-/** The options of one fallback walk after a failed request. */
-interface RetryModelFallbackOptions {
-	excludeProvider?: string;
-	pinFallback?: boolean;
-	preserveFailedTurn?: boolean;
-	wrapAround?: boolean;
-	/** This hop is a classifier-refusal walk, which visits each model at most once per turn. */
-	refusalWalk?: boolean;
-	/** The retry policy retries the failed model if this hop does not switch. */
-	sameModelRetryAvailable?: boolean;
-}
-
-/** What the fallback walk hands over when it reaches a fallback whose usage is spent. */
-interface SpentRetryFallback {
-	/** The model the spent fallback's selector resolves to. */
-	candidate: Model;
-	/** The spent fallback's selector in the walk's chain. */
-	selector: RetryFallbackSelector;
-	/** The walk's chain key the spent fallback was found under. */
-	role: string;
-	/** The selector of the model the request failed on. */
-	currentSelector: string;
-	/** The message the searches fit the context without: the failed turn, unless the retry keeps it. */
-	excludedMessage: AssistantMessage | undefined;
-	/** The reason a switch records: the failed request's error. */
-	reason: string;
-	/** The candidates the refusal-credit hold passed over, in chain order. */
-	heldEntries: readonly RetryFallbackEntry[];
-	/** True once the walk is stale; a stale search ends the walk with no switch. */
-	usageReadStale: () => boolean;
-	/** Runs a read under the walk's abort controller, which `abortRetry()` stops. */
-	withUsageReadSignal: <T>(read: (signal: AbortSignal) => Promise<T>) => Promise<T>;
-}
-
 /** Result shape shared with automatic maintenance recovery. */
 export interface RecoveryCompactionResult {
 	continuationScheduled: boolean;
@@ -455,6 +389,72 @@ type UsageLimitOutcome = {
 /** Request-time provider for the main Agent; not serialized into session history. */
 export const kUsageLimitRequestProvider = Symbol("usage-limit-request-provider");
 type IssuedProviderAssistantMessage = AssistantMessage & { [kUsageLimitRequestProvider]?: string };
+
+/**
+ * Whether a usage read says the model's usage is spent: the pool is
+ * `depleted`, it lists at least one account, and usage holds every account (an
+ * exhausted quota window or a usage-limit block). An empty pool (the plan gate
+ * filtered every account out) is not spent. A pool where any account is held
+ * only by account-policy, model-policy or 401 blocks (no usage block holds it)
+ * is not spent either.
+ */
+function isUsageSpent(health: ModelUsageHealth): boolean {
+	return (
+		health.state === "depleted" &&
+		health.accounts.length > 0 &&
+		health.accounts.every(account => account.depletedBy === "usage")
+	);
+}
+
+/** A fallback candidate and the chain key it was found under. */
+interface RetryFallbackEntry {
+	role: string;
+	selector: RetryFallbackSelector;
+}
+
+/**
+ * The thinking level a fallback switch requests in place of the session's
+ * when the fallback's selector names none. `level` may be `undefined`: a
+ * switch onto a model with no thinking leaves no level, and the switch after
+ * it takes none either.
+ */
+interface InheritedThinkingLevel {
+	level: ConfiguredThinkingLevel | undefined;
+}
+
+/** The options of one fallback walk after a failed request. */
+interface RetryModelFallbackOptions {
+	excludeProvider?: string;
+	pinFallback?: boolean;
+	preserveFailedTurn?: boolean;
+	wrapAround?: boolean;
+	/** This hop is a classifier-refusal walk, which visits each model at most once per turn. */
+	refusalWalk?: boolean;
+	/** The retry policy retries the failed model if this hop does not switch. */
+	sameModelRetryAvailable?: boolean;
+}
+
+/** What the fallback walk hands over when it reaches a fallback whose usage is spent. */
+interface SpentRetryFallback {
+	/** The model the spent fallback's selector resolves to. */
+	candidate: Model;
+	/** The spent fallback's selector in the walk's chain. */
+	selector: RetryFallbackSelector;
+	/** The walk's chain key the spent fallback was found under. */
+	role: string;
+	/** The selector of the model the request failed on. */
+	currentSelector: string;
+	/** The message the searches fit the context without: the failed turn, unless the retry keeps it. */
+	excludedMessage: AssistantMessage | undefined;
+	/** The reason a switch records: the failed request's error. */
+	reason: string;
+	/** The candidates the refusal-credit hold passed over, in chain order. */
+	heldEntries: readonly RetryFallbackEntry[];
+	/** True once the walk is stale; a stale search ends the walk with no switch. */
+	usageReadStale: () => boolean;
+	/** Runs a read under the walk's abort controller, which `abortRetry()` stops. */
+	withUsageReadSignal: <T>(read: (signal: AbortSignal) => Promise<T>) => Promise<T>;
+}
 
 /** Owns terminal-stop recovery, automatic retries, and fallback routing. */
 export class TurnRecovery {
