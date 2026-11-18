@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+// First import: `process.env` before any other omp module changes it (see startup-env.ts).
+import "@oh-my-pi/pi-utils/startup-env";
 // Strip macOS malloc-stack-logging vars in the parent entrypoint, before any
 // subprocess/worker spawn. libmalloc reads MallocStackLogging /
 // MallocStackLoggingNoCompact during malloc bootstrap (pre-main) in every child

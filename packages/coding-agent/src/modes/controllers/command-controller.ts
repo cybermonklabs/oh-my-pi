@@ -25,7 +25,7 @@ import {
 import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { NATIVES_DIR_HANDOFF_ENV_KEY, nativesDirHandoff, nativesDirInputNames } from "@oh-my-pi/pi-natives/natives-dir";
 import { getActiveProfile, getConfigDirName } from "@oh-my-pi/pi-utils/dirs";
-import { launchEnvValue } from "@oh-my-pi/pi-utils/env";
+import { discardBunRelaunchFile, launchEnvValue } from "@oh-my-pi/pi-utils/env";
 import { classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
@@ -1568,6 +1568,7 @@ export class CommandController {
 			return;
 		}
 
+		let command: string[] | undefined;
 		try {
 			const activeProfile = dependencies.getActiveProfile();
 			const activeModel = this.ctx.session.model;
@@ -1606,7 +1607,7 @@ export class CommandController {
 				scope[name] = (name in scope ? scope[name] : launchEnvValue(name)) || undefined;
 			}
 			scope[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(scope, { parent: null });
-			const command = [...forkScopeEnvCommand(scope), ...dependencies.resolveCliEntryCmd(), ...childArgs];
+			command = [...forkScopeEnvCommand(scope), ...dependencies.resolveCliEntryCmd(), ...childArgs];
 			const launchPlan = createDefaultTerminalLaunchRequest(
 				multiplexer,
 				placement,
@@ -1615,6 +1616,7 @@ export class CommandController {
 				shellGrammar,
 			);
 			if ("error" in launchPlan) {
+				discardBunRelaunchFile(command);
 				this.ctx.showError(launchPlan.error);
 				return;
 			}
@@ -1630,6 +1632,8 @@ export class CommandController {
 				`Opened a fork in ${placementInfo.displayName} (${placementInfo.placementLabel}); this session continues here.`,
 			);
 		} catch (error) {
+			// The fork never started, so the relaunch file its command names stays unread.
+			if (command) discardBunRelaunchFile(command);
 			logger.error("Failed to open a terminal fork", { multiplexer, error });
 			this.ctx.showError(
 				error instanceof TerminalLaunchError

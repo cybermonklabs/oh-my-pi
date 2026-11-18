@@ -215,6 +215,29 @@ describe("/fork terminal placement", () => {
 		expect(ctx.showError).not.toHaveBeenCalled();
 	});
 
+	it("removes the relaunch file its command names when the terminal cannot start the fork", async () => {
+		// A private file as `bunRelaunchArgs` writes it: `<tmp>/omp-bun-env-XXXXXX/loaded.env`.
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-env-"));
+		const file = path.join(dir, "loaded.env");
+		await Bun.write(file, "LOADED='value'\n");
+		const { ctx } = createContext();
+		const controller = new CommandController(ctx, {
+			classifyTerminalMultiplexer: () => "tmux",
+			environment: () => ({ TMUX: "server,1,0", TMUX_PANE: "%1" }),
+			launchTerminal: async () => {
+				throw new Error("no terminal");
+			},
+			resolveCliEntryCmd: () => ["bun", `--env-file=${file}`, "omp-entry"],
+			getActiveProfile: () => undefined,
+			argv: () => [],
+		});
+
+		await controller.handleForkCommand("pane");
+
+		expect(ctx.showError).toHaveBeenCalledTimes(1);
+		expect(await fs.exists(dir)).toBe(false);
+	});
+
 	it("drops a startup --goal and pins the parent's prompt-cache key over a startup one", async () => {
 		const { controller, launchTerminal } = createContext({
 			promptCacheKey: "pinned-parent-key",

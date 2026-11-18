@@ -48,22 +48,33 @@ const NATIVES_DIR_CACHE_ENV_KEY = "__PI_NATIVES_DIR_CACHE";
 let processNativesDir;
 
 /**
- * A process's start time on Linux (`/proc/<pid>/stat` field 22, in clock ticks since boot),
- * this process's by default: with the pid it names one process for its whole life, in every
- * thread. Undefined elsewhere, or when `/proc` cannot be read (the process has exited).
+ * A process's state and start time on Linux (`/proc/<pid>/stat` fields 3 and 22, the start in
+ * clock ticks since boot), this process's by default: with the pid, the start time names one
+ * process for its whole life, in every thread. Undefined elsewhere, or when `/proc` cannot be
+ * read (the process has been reaped).
  * @param {number | "self"} [pid]
- * @returns {string | undefined}
+ * @returns {{ state: string; start: string | undefined } | undefined}
  */
-function processStartTime(pid = "self") {
+function processStat(pid = "self") {
 	if (process.platform !== "linux") return undefined;
 	try {
 		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
 		// The fields after the command name, which is in parentheses and may hold spaces,
 		// start at field 3; field 22 is the 20th of them.
-		return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		return { state: fields[0] ?? "", start: fields[19] };
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * A process's start time on Linux (see {@link processStat}), this process's by default.
+ * @param {number | "self"} [pid]
+ * @returns {string | undefined}
+ */
+function processStartTime(pid = "self") {
+	return processStat(pid)?.start;
 }
 
 /** @param {number} pid */
@@ -81,7 +92,9 @@ function isLiveProcess(pid) {
  * its threads). With a start time (Linux): the same pid and start time. Without one: the same
  * pid, and either the same parent or a recorded parent that no longer runs. A process whose
  * parent exits is re-parented, so its live parent changes while it lives; a later process
- * given the same pid has a parent that runs, since that parent started it.
+ * given the same pid has a parent that runs, since that parent started it. Without a start
+ * time only `kill(pid, 0)` tells, and a zombie parent counts as running: a re-parented process
+ * whose old parent is unreaped refuses its own answer and resolves again.
  * @param {{ pid?: unknown; ppid?: unknown; start?: unknown }} cached
  */
 function isThisProcess(cached) {
@@ -163,6 +176,10 @@ export function nativesDirHandoff(env, { parent, dir = getNativesDir() }) {
  * Whether the process a handoff names as the child's parent started this process: it is this
  * process's parent, or it no longer runs (it exited, and this process was re-parented). A
  * recorded parent that still runs and is not this process's parent started another process.
+ * On Linux a process has stopped running once it is a zombie (`Z`, exited but not yet waited
+ * for by its own parent, which can take a while) or dead (`X`), and a pid another process
+ * reuses carries another start time. Elsewhere only `kill(pid, 0)` tells, and a zombie counts
+ * as running there, so a child re-parented while its old parent is unreaped resolves for itself.
  * @param {{ parent: unknown; parentStart?: unknown }} handoff
  * @param {number} ppid this process's parent now
  */
@@ -170,9 +187,9 @@ function isStartedByRecordedParent(handoff, ppid) {
 	const { parent, parentStart } = handoff;
 	if (parent === ppid) return true;
 	if (!Number.isInteger(parent) || parent <= 0) return false;
-	// With a start time (Linux), a pid another process reuses is not the recorded parent.
 	if (typeof parentStart === "string" && process.platform === "linux") {
-		return processStartTime(parent) !== parentStart;
+		const stat = processStat(parent);
+		return stat === undefined || stat.state === "Z" || stat.state === "X" || stat.start !== parentStart;
 	}
 	return !isLiveProcess(parent);
 }

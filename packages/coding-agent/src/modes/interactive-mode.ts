@@ -78,6 +78,7 @@ import {
 	setProjectDir,
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { discardBunRelaunchFile } from "@oh-my-pi/pi-utils/env";
 import { pickTableChart } from "../auto-graph/planner";
 import { restartArgv } from "../cli/flag-tables";
 import type { CollabGuestLink } from "../collab/guest";
@@ -8468,8 +8469,12 @@ export class InteractiveMode implements InteractiveModeContext {
 				stdout: "inherit",
 				stderr: "inherit",
 			});
-			await postmortem.quit(await child.exited);
+			const code = await child.exited;
+			// The new process removes its relaunch file as it starts; one that died first did not.
+			discardBunRelaunchFile(cmd);
+			await postmortem.quit(code);
 		} catch (err) {
+			discardBunRelaunchFile(cmd);
 			process.stderr.write(`${chalk.red(`Restart spawn failed: ${err instanceof Error ? err.message : err}`)}\n`);
 			await postmortem.quit(1);
 		}

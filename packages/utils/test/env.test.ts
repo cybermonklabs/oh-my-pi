@@ -343,72 +343,99 @@ describe("filterChildShellEnv", () => {
 	);
 });
 
-describe("bunEnvFileArgs", () => {
+describe.skipIf(process.platform !== "linux")("bunRelaunchArgs", () => {
 	const envTs = path.join(import.meta.dir, "../src/env.ts");
-	const NAMES = ["FROM_ENV", "FROM_MODE", "FROM_LOCAL", "FROM_MODE_LOCAL"];
+	const NAMES = [
+		"T_PLAIN",
+		"T_DOLLAR",
+		"T_BS_DOLLAR",
+		"T_QUOTES",
+		"T_DOUBLE",
+		"T_NEWLINE",
+		"T_BACKSLASH",
+		"T_HASH",
+		"T_SPACES",
+		"T_EMPTY",
+		"T_UNICODE",
+		"T_TRAILING_BACKSLASH",
+		"LAUNCH_ONLY",
+	];
 	// A process that reports the flags and the values Bun's own `.env` loading gave it.
-	const probe = `const { bunEnvFileArgs } = await import(${JSON.stringify(envTs)});
-console.log(JSON.stringify({ args: bunEnvFileArgs(), env: Object.fromEntries(${JSON.stringify(NAMES)}.map(name => [name, process.env[name] ?? null])) }));`;
+	const probe = `const values = Object.fromEntries(${JSON.stringify(NAMES)}.map(name => [name, process.env[name] ?? null]));
+const { bunRelaunchArgs } = await import(${JSON.stringify(envTs)});
+console.log(JSON.stringify({ args: bunRelaunchArgs(), env: values }));`;
 
-	function run(
-		flags: string[],
-		cwd: string,
-		mode: string | undefined,
-	): { args: string[]; env: Record<string, string | null> } {
+	function run(flags: string[], cwd: string): { args: string[]; env: Record<string, string | null> } {
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
 		tempDirs.push(home);
 		const env: Record<string, string | undefined> = {
 			...process.env,
 			...DIR_RESOLUTION_ENV_RESET,
 			HOME: home,
-			NODE_ENV: mode,
+			LAUNCH_ONLY: "from the launch environment",
 		};
-		for (const name of [...NAMES, "BUN_ENV"]) delete env[name];
-		if (mode === undefined) delete env.NODE_ENV;
+		for (const name of NAMES) if (name !== "LAUNCH_ONLY") delete env[name];
 		const child = Bun.spawnSync([process.execPath, ...flags, "-e", probe], { cwd, env, stderr: "pipe" });
 		if (child.exitCode !== 0) throw new Error(child.stderr.toString());
 		return JSON.parse(child.stdout.toString());
 	}
 
-	/** A directory with every file Bun's default loading can read, each a later one overriding. */
-	function dotenvDir(): string {
-		const dir = path.dirname(writeTempEnv("FROM_ENV=env\nFROM_MODE=env\nFROM_LOCAL=env\nFROM_MODE_LOCAL=env\n"));
-		for (const mode of ["development", "production", "test"]) {
-			fs.writeFileSync(
-				path.join(dir, `.env.${mode}`),
-				`FROM_MODE=${mode}\nFROM_LOCAL=${mode}\nFROM_MODE_LOCAL=${mode}\n`,
-			);
-			fs.writeFileSync(path.join(dir, `.env.${mode}.local`), `FROM_MODE_LOCAL=${mode}-local\n`);
-		}
-		fs.writeFileSync(path.join(dir, ".env.local"), "FROM_LOCAL=local\nFROM_MODE_LOCAL=local\n");
-		return dir;
+	/** Values a lossless writer must keep, as Bun's own `.env` syntax gives them. */
+	function trickyDotenvDir(): string {
+		return path.dirname(
+			writeTempEnv(
+				[
+					"T_PLAIN=abc",
+					// `\${HOME}` written as text: Bun must read it back, not expand it.
+					"T_DOLLAR='cost \\$5, \\$" + "{HOME} and \\$HOME'",
+					"T_BS_DOLLAR='a\\\\$b'",
+					'T_QUOTES="it\'s `odd`"',
+					"T_DOUBLE='say \"hi\"'",
+					"T_NEWLINE='line1",
+					"line2'",
+					"T_BACKSLASH='C:\\path\\to\\n'",
+					"T_HASH='a # not a comment'",
+					"T_SPACES='  padded  '",
+					"T_EMPTY=",
+					"T_UNICODE=héllo ✓",
+					"T_TRAILING_BACKSLASH=x\\",
+				].join("\n"),
+			),
+		);
 	}
 
-	it.each([["development"], ["production"], ["test"], ["(unset)"]])(
-		"names the files Bun's own loading read, so a process started elsewhere with them has the same values (NODE_ENV %s)",
-		label => {
-			const mode = label === "(unset)" ? undefined : label;
-			const dir = dotenvDir();
-			const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-elsewhere-"));
-			tempDirs.push(elsewhere);
-			const first = run([], dir, mode);
-			expect(first.env.FROM_ENV).toBe("env");
+	it("gives a process started with them exactly the values Bun's own loading gave this one, in a private file", () => {
+		const first = run([], trickyDotenvDir());
+		expect(first.env.T_DOLLAR).toBe("cost $5, $" + "{HOME} and $HOME");
+		expect(first.env.T_NEWLINE).toBe("line1\nline2");
+		const [flag] = first.args;
+		expect(first.args).toHaveLength(1);
+		const file = flag!.slice("--env-file=".length);
+		expect(flag).toBe(`--env-file=${file}`);
+		expect(file).not.toContain(",");
+		expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+		expect(fs.statSync(path.dirname(file)).mode & 0o777).toBe(0o700);
+		// Only what Bun loaded, never the environment the process was started with.
+		expect(fs.readFileSync(file, "utf8")).not.toContain("LAUNCH_ONLY");
+		const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-elsewhere-"));
+		tempDirs.push(elsewhere);
 
-			expect(run(first.args, elsewhere, mode).env).toEqual(first.env);
-		},
-	);
+		const again = run([flag!], elsewhere);
+		// The second probe wrote a relaunch file of its own (the values it was given).
+		for (const arg of again.args) {
+			if (arg.startsWith("--env-file="))
+				fs.rmSync(path.dirname(arg.slice("--env-file=".length)), { recursive: true });
+		}
 
-	it("is --no-env-file for a process Bun loaded no .env file into", () => {
-		expect(run(["--no-env-file"], dotenvDir(), undefined).args).toEqual(["--no-env-file"]);
+		// A value Bun's parser cannot read back (a trailing backslash) is left out; every other is exact.
+		expect(again.env).toEqual({ ...first.env, T_TRAILING_BACKSLASH: null });
+		expect(first.env.T_TRAILING_BACKSLASH).toBe("x\\");
+		// The process started with the file removed it as soon as env.ts loaded.
+		expect(fs.existsSync(path.dirname(file))).toBe(false);
 	});
 
-	it("keeps the --env-file files a process was started with, by absolute path", () => {
-		const dir = dotenvDir();
-		fs.writeFileSync(path.join(dir, "chosen.env"), "FROM_ENV=chosen\n");
-
-		expect(run(["--env-file=chosen.env"], dir, undefined).args).toEqual([
-			`--env-file=${path.join(dir, "chosen.env")}`,
-		]);
+	it("is --no-env-file for a process Bun loaded nothing into", () => {
+		expect(run(["--no-env-file"], trickyDotenvDir()).args).toEqual(["--no-env-file"]);
 	});
 });
 

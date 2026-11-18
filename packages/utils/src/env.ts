@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { parseEnv } from "node:util";
 import { getNativesDir, NATIVES_DIR_HANDOFF_ENV_KEY } from "@oh-my-pi/pi-natives/natives-dir";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
+import { startupEnv } from "./startup-env";
 import { isBunTestRuntime } from "./test-runtime";
 
 export * from "./test-runtime";
@@ -111,10 +112,16 @@ export function stripGitRepoLocationEnv(
 }
 
 // Bun autoloads the project's dotenv files into `process.env` before user code
-// runs — including inside `bun build --compile` binaries — so a snapshot of
-// `Bun.env` is only pre-dotenv when autoloading was explicitly disabled. Linux
-// keeps the original exec environment in procfs, which is authoritative.
+// runs, so `process.env` as the process first saw it (`startupEnv`) is the launch
+// environment only where Bun loaded none: a compiled binary (built with Bun's
+// loading off) or a `--no-env-file` start. Linux keeps the original exec
+// environment in procfs, which is authoritative everywhere. Elsewhere (a
+// non-compiled omp on macOS or Windows started with Bun's loading on) the launch
+// environment cannot be read: neither procfs nor the addon gives it.
+// `PI_TEST_NO_LAUNCH_ENV=1` makes it unreadable here too, for tests of that case.
 function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
+	const startedWithoutBunEnv = isCompiledBinary() || process.execArgv.includes("--no-env-file");
+	if (startupEnv.PI_TEST_NO_LAUNCH_ENV === "1" && !startedWithoutBunEnv) return undefined;
 	if (process.platform === "linux") {
 		try {
 			const values = new Map<string, string>();
@@ -125,13 +132,8 @@ function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
 			return values;
 		} catch {}
 	}
-	if (!process.execArgv.includes("--no-env-file")) return undefined;
-	const values = new Map<string, string>();
-	for (const key in Bun.env) {
-		const value = Bun.env[key];
-		if (value !== undefined) values.set(key, value);
-	}
-	return values;
+	if (!startedWithoutBunEnv) return undefined;
+	return new Map(Object.entries(startupEnv));
 }
 
 const launchEnvValues = readLaunchEnv();
@@ -139,54 +141,125 @@ const projectEnvNamesLoadedByOmp = new Set<string>();
 
 /**
  * `name` as omp was started with it, before omp applied its own `.env` files (undefined when
- * it was not set). Where the platform keeps no copy of the launch environment (procfs) and
- * Bun loaded none of its own, the value now.
+ * it was not set). Where the launch environment cannot be read (see `readLaunchEnv`), the
+ * value the process first saw, which includes what Bun's own loading gave it.
  */
 export function launchEnvValue(name: string): string | undefined {
-	return launchEnvValues ? launchEnvValues.get(name) : Bun.env[name];
+	return launchEnvValues ? launchEnvValues.get(name) : startupEnv[name];
 }
 
 /**
- * This process's directory when this module loaded: where Bun's own `.env` loading read at the
- * process's start (omp moves into its project directory only after this module loads).
+ * The entries Bun's own `.env` loading gave this process before any JavaScript ran: those of
+ * `process.env` as the process first saw it that the launch environment lacks or holds
+ * otherwise, whatever rules and files Bun used (its mode, `bunfig.toml`, `BUN_OPTIONS`,
+ * `--env-file`s, a pipe). Empty where it loaded none; undefined where the launch environment
+ * cannot be read.
  */
-const startCwd = (() => {
-	try {
-		return process.cwd();
-	} catch {
-		return undefined;
-	}
-})();
+const bunLoadedEnv: Readonly<Record<string, string>> | undefined = launchEnvValues
+	? Object.freeze(
+			Object.fromEntries(Object.entries(startupEnv).filter(([name, value]) => launchEnvValues.get(name) !== value)),
+		)
+	: undefined;
+
+/** The private file `bunRelaunchArgs` writes: `<tmp>/omp-bun-env-XXXXXX/loaded.env`. */
+const RELAUNCH_ENV_DIR_RE = /^omp-bun-env-[A-Za-z0-9]{6}$/;
+const RELAUNCH_ENV_FILE = "loaded.env";
+
+function isRelaunchEnvFile(file: string): boolean {
+	return path.basename(file) === RELAUNCH_ENV_FILE && RELAUNCH_ENV_DIR_RE.test(path.basename(path.dirname(file)));
+}
+
+/** The relaunch files a command names (`--env-file=<file>`). */
+function relaunchEnvFiles(args: readonly string[]): string[] {
+	return args
+		.filter(arg => arg.startsWith("--env-file="))
+		.map(arg => arg.slice("--env-file=".length))
+		.filter(isRelaunchEnvFile);
+}
+
+/** Remove the private relaunch file a command names, with its directory: for a start that failed. */
+export function discardBunRelaunchFile(args: readonly string[]): void {
+	for (const file of relaunchEnvFiles(args)) fs.rmSync(path.dirname(file), { recursive: true, force: true });
+}
+
+// A process started with a relaunch file (`/restart`, a `/fork` session) removes it now: Bun
+// read it before any JavaScript ran, and nothing needs it again.
+discardBunRelaunchFile(process.execArgv);
 
 /**
- * Runtime flags that make a new Bun process load the `.env` files Bun's own loading read at
- * this process's start, so a non-compiled omp that starts the CLI again (`/restart`, a `/fork`
- * session) starts with the values the first launch had, wherever the session has moved
- * since: `execvp(3)`, which `/restart` uses, passes the environment the process was started
- * with, which those values are not in. The files are the `--env-file`s the process was started
- * with, else Bun's defaults in its start directory, those that exist, in Bun's order (a later
- * one wins): `.env`, `.env.<mode>`, `.env.local`, `.env.<mode>.local`, where the mode is
- * `NODE_ENV` as the process was started with it, `development` by default, and the `test` mode
- * reads no `.env.local`. `--no-env-file` when it loaded none.
+ * `BUN_OPTIONS` as the process was started with it, without the `--env-file`s it names, for a
+ * process that starts the CLI again (`/restart`, a `/fork` session); undefined when it names
+ * none, or when the launch environment cannot be read (the relaunch is then the pre-PR
+ * command, `bunRelaunchArgs`). Bun reads `BUN_OPTIONS` in every process it starts and would
+ * read such a file again, from the directory the new process starts in; the values it gave
+ * this process are in the relaunch file already (`bunRelaunchArgs`). Bun splits the value at
+ * whitespace and keeps quotes as they are, so these tokens are Bun's own.
  */
-export function bunEnvFileArgs(): string[] {
-	const files: string[] = [];
-	const argv = process.execArgv;
-	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i]!;
-		if (arg.startsWith("--env-file=")) files.push(arg.slice("--env-file=".length));
-		else if (arg === "--env-file" && i + 1 < argv.length) files.push(argv[++i]!);
+export function bunOptionsWithoutEnvFiles(): string | undefined {
+	if (!launchEnvValues) return undefined;
+	const tokens = (launchEnvValue("BUN_OPTIONS") ?? "").split(/\s+/).filter(Boolean);
+	const kept: string[] = [];
+	let dropped = false;
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i]!;
+		if (token.startsWith("--env-file=")) dropped = true;
+		else if (token === "--env-file") {
+			dropped = true;
+			i++;
+		} else kept.push(token);
 	}
-	if (files.length === 0 && !argv.includes("--no-env-file") && startCwd !== undefined) {
-		const mode = launchEnvValue("NODE_ENV") || "development";
-		// The `test` mode skips `.env.local` only, as Bun does.
-		const names = [".env", `.env.${mode}`, ...(mode === "test" ? [] : [".env.local"]), `.env.${mode}.local`];
-		for (const name of names) {
-			if (fs.existsSync(path.join(startCwd, name))) files.push(name);
-		}
+	return dropped ? kept.join(" ") : undefined;
+}
+
+/**
+ * `value` as Bun's `.env` parser reads back exactly, or undefined where it cannot. Bun expands
+ * `$NAME` in every quoting style and reads `\$` as `$`, so each `$` is written `\$`; it reads
+ * `\n` as a newline inside double quotes only, so double quotes serve only a value with no
+ * backslash. It drops a carriage return and reads a backslash before the closing quote as an
+ * escaped quote, so neither can be carried.
+ */
+function quoteDotenvValue(value: string): string | undefined {
+	if (value.includes("\r") || value.endsWith("\\")) return undefined;
+	const text = value.replaceAll("$", "\\$");
+	for (const quote of ["'", "`"]) if (!value.includes(quote)) return `${quote}${text}${quote}`;
+	return value.includes('"') || value.includes("\\") ? undefined : `"${text}"`;
+}
+
+/**
+ * Runtime flags that give a new Bun process the values Bun's own `.env` loading gave this one
+ * at its start, for a non-compiled omp that starts the CLI again (`/restart`, a `/fork`
+ * session): `execvp(3)`, which `/restart` uses, and a terminal that starts a fork pass the
+ * environment the process was started with, which those values are not in. The values, never
+ * the whole environment (a fork leaves things out on purpose), go to a private file, mode 0600
+ * in a directory of mode 0700, whose path holds no comma (Bun splits an `--env-file` at commas);
+ * the flag names only it, so Bun loads no other `.env` file, and the new process removes it as
+ * soon as this module loads (`discardBunRelaunchFile` removes it when the start fails). A value
+ * Bun's parser cannot read back (see `quoteDotenvValue`) is left out. `--no-env-file` when Bun
+ * loaded nothing, or when the file cannot be written. No flag at all where the launch
+ * environment cannot be read (a non-compiled omp on macOS or Windows started with Bun's
+ * loading on): the relaunch is then the command it was before, and Bun loads the `.env` files
+ * of the directory the new process starts in.
+ */
+export function bunRelaunchArgs(): string[] {
+	if (!bunLoadedEnv) return [];
+	const lines: string[] = [];
+	for (const [name, value] of Object.entries(bunLoadedEnv)) {
+		const quoted = ENV_NAME_RE.test(name) ? quoteDotenvValue(value) : undefined;
+		if (quoted !== undefined) lines.push(`${name}=${quoted}`);
 	}
-	if (files.length === 0) return ["--no-env-file"];
-	return files.map(file => `--env-file=${path.resolve(startCwd ?? "", file)}`);
+	if (lines.length === 0) return ["--no-env-file"];
+	const base = [os.tmpdir(), "/tmp"].find(dir => path.isAbsolute(dir) && !dir.includes(",") && fs.existsSync(dir));
+	if (!base) return ["--no-env-file"];
+	let dir: string | undefined;
+	try {
+		dir = fs.mkdtempSync(path.join(base, "omp-bun-env-"));
+		const file = path.join(dir, RELAUNCH_ENV_FILE);
+		fs.writeFileSync(file, `${lines.join("\n")}\n`, { mode: 0o600, flag: "wx" });
+		return [`--env-file=${file}`];
+	} catch {
+		if (dir) fs.rmSync(dir, { recursive: true, force: true });
+		return ["--no-env-file"];
+	}
 }
 
 /**
@@ -201,8 +274,8 @@ const nativesDirAtLaunch = launchEnvValue("PI_NATIVES_DIR");
  * Whether `name` is `PI_NATIVES_DIR`, which omp's own `.env` loading never applies: the natives
  * directory is fixed before `.env` files are read, so the value could only mislead the
  * programs omp starts. (Bun's own loading, in a non-compiled omp, runs before this module; the
- * workers and the broker omp starts run with it off, and `/restart` and a `/fork` session load
- * the files it loaded at the first launch, `bunEnvFileArgs`.)
+ * workers and the broker omp starts run with it off, and `/restart` and a `/fork` session get
+ * the values it loaded at the first launch, `bunRelaunchArgs`.)
  */
 function isNativesDirEnvName(name: string): boolean {
 	return process.platform === "win32" ? name.toUpperCase() === "PI_NATIVES_DIR" : name === "PI_NATIVES_DIR";

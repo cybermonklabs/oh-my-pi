@@ -7,6 +7,7 @@ import {
 	__resetNativesDirForTests,
 	getNativesDir,
 	nativesDirHandoff,
+	nativesDirHandoffDir,
 	nativesDirInputNames,
 } from "../native/natives-dir.js";
 import packageJson from "../package.json" with { type: "json" };
@@ -282,6 +283,74 @@ describe("one natives directory per process", () => {
 
 			expect(JSON.parse(await fs.readFile(out, "utf8"))).toEqual({ own: handedOver, reparented: true });
 		}, 120_000);
+
+		it.skipIf(process.platform !== "linux")(
+			"is taken by a re-parented child while its old parent is an unreaped zombie",
+			async () => {
+				// The parent's own parent never waits for it (`exec sleep`), so once the parent exits
+				// it stays a zombie: its /proc entry and start time remain.
+				const handedOver = path.join(tempRoot, "handed-over");
+				const out = path.join(tempRoot, "zombie-parent.json");
+				const child = [
+					"const parentAtStart = Number(process.env.PARENT_AT_START);",
+					"const until = Date.now() + 60_000;",
+					"while (process.ppid === parentAtStart && Date.now() < until) await Bun.sleep(20);",
+					'const fs = await import("node:fs");',
+					"let parentState = 'gone';",
+					'try { const stat = fs.readFileSync("/proc/" + parentAtStart + "/stat", "utf8"); parentState = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]; } catch {}',
+					`const own = (await import(${nativesDirJs})).getNativesDir();`,
+					'fs.writeFileSync(process.env.OUT + ".tmp", JSON.stringify({ own, parentState }));',
+					'fs.renameSync(process.env.OUT + ".tmp", process.env.OUT);',
+				].join("\n");
+				const parent = [
+					`const { nativesDirHandoff } = await import(${nativesDirJs});`,
+					`const env = { ...process.env, PARENT_AT_START: String(process.pid), OUT: ${JSON.stringify(out)} };`,
+					`env.__PI_NATIVES_DIR_HANDOFF = nativesDirHandoff(env, { parent: process.pid, dir: ${JSON.stringify(handedOver)} });`,
+					`Bun.spawn([process.execPath, "-e", ${JSON.stringify(child)}], { env, detached: true, stdio: ["ignore", "ignore", "inherit"] }).unref();`,
+				].join("\n");
+				const env: Record<string, string | undefined> = {
+					...process.env,
+					PI_NATIVES_DIR: path.join(tempRoot, "child"),
+					BUN: process.execPath,
+					PARENT_SCRIPT: parent,
+				};
+				// This test's own child; it is signalled only through its handle, which holds its pid.
+				const holder = Bun.spawn(["sh", "-c", '"$BUN" -e "$PARENT_SCRIPT" & exec sleep 60'], {
+					env,
+					stdout: "ignore",
+					stderr: "inherit",
+				});
+				try {
+					const deadline = Date.now() + 90_000;
+					while (!(await fs.exists(out)) && Date.now() < deadline) await Bun.sleep(50);
+
+					expect(JSON.parse(await fs.readFile(out, "utf8"))).toEqual({ own: handedOver, parentState: "Z" });
+				} finally {
+					holder.kill();
+					await holder.exited;
+				}
+			},
+			120_000,
+		);
+
+		it.skipIf(process.platform !== "linux")(
+			"is refused while the recorded parent runs, and taken once its pid names a process with another start time",
+			() => {
+				const handedOver = path.join(tempRoot, "handed-over");
+				const env: Record<string, string | undefined> = {
+					...process.env,
+					PI_NATIVES_DIR: path.join(tempRoot, "child"),
+				};
+				// This process, which runs, is the recorded parent; the child's parent is another one.
+				const written = nativesDirHandoff(env, { parent: process.pid, dir: handedOver });
+				expect(process.pid).not.toBe(1);
+				expect(nativesDirHandoffDir(written, { env, ppid: 1 })).toBeUndefined();
+
+				// The same pid with another start time: the recorded parent exited and its pid was reused.
+				const reused = JSON.stringify({ ...JSON.parse(written), parentStart: "1" });
+				expect(nativesDirHandoffDir(reused, { env, ppid: 1 })).toBe(handedOver);
+			},
+		);
 
 		it("names every variable the rule reads, so a new one cannot be left out of it", async () => {
 			// A handoff is taken when the recorded inputs match, so a variable the rule reads and
