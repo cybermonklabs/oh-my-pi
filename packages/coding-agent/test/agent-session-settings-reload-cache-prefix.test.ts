@@ -258,6 +258,38 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 		expect(continuesCachedPrompt(second, fourth)).toBe(true);
 	}, 30_000);
 
+	it("keeps the held prompt through a skill:// read when a skills-only reload follows a context file edit", async () => {
+		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const projectSkills =
+			"skills:\n  enableCodexUser: false\n  enableClaudeUser: false\n  enableClaudeProject: false\n  enablePiUser: false\n  enableAgentsUser: false\n";
+		await Bun.write(tempDir.join("AGENTS.md"), "# Rules\n\n- The rule the session started with.\n");
+		const harness = await startSession(tempDir, {
+			toolNames: ["read", "eval"],
+			discoverSkills: true,
+			discoverContextFiles: true,
+			overlay: projectSkills,
+			replies: { 3: turn => toolCallAnswer(turn, "read", { path: "skill://late-skill" }) },
+		});
+		await harness.session.prompt("first");
+		// The held rebuild would carry the edited context file, so the build the kept prompt stands in for differs
+		// from it; the skill read's rebuild renders that build again and changes nothing of its own.
+		await Bun.write(tempDir.join("AGENTS.md"), "# Rules\n\n- A rule added while the session runs.\n");
+		await reloadOverlay(harness, `${OVERLAY}${projectSkills}disabledProviders:\n  - ollama\n`);
+		await harness.session.prompt("second");
+
+		await Bun.write(
+			tempDir.join(".omp/skills/late-skill/SKILL.md"),
+			"---\nname: late-skill\ndescription: A skill installed while the session runs.\n---\n\n# Late skill\n\nThe body of the late skill.\n",
+		);
+		await harness.session.prompt("A skill was installed. Read it.");
+
+		const [first, second, third, fourth] = harness.requests;
+		if (!first || !second || !third || !fourth) throw new Error("Expected the requests around the skill read");
+		expect(textOf(fourth.messages.slice(third.messages.length))).toContain("The body of the late skill.");
+		expect(withoutCacheControl(fourth.system)).toContain("The rule the session started with.");
+		expect(continuesCachedPrompt(second, fourth)).toBe(true);
+	}, 30_000);
+
 	it("keeps the held prompt and tools when an extension registers its tool again unchanged", async () => {
 		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
 		let extension: ExtensionAPI | undefined;
