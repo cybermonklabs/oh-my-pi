@@ -224,5 +224,42 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			expect((await db.paths()).filter(stored => stored.startsWith(forkDir))).toEqual([forkWorker]);
 			expect(copied === before.join("") || copied === after.join("")).toBe(true);
 		}, 120_000);
+
+		it("reloads one body of a session its holder rewrote before letting go, when a writer that claims nothing rewrites it after the reload's first chunk", async () => {
+			// If this regresses, resuming a long SQL session another process held and wrote until it let go
+			// fails with a read conflict once the claim is taken, or goes on from a mix of two transcripts
+			// while an older omp (which claims nothing) rewrites the session.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const file = sessionPath(db, ID);
+			const holder = await db.open({ lease: STILL });
+			const release = await holder.acquireSessionClaim?.(ID, file);
+			await holder.writeLinesAtomic(file, paddedTranscript(ID, "first", "a", 9));
+			await holder.drain();
+			const reader = await db.open({ lease: STILL });
+			await reader.refresh();
+			const manager = await SessionManager.open(file, undefined, reader, { suppressBreadcrumb: true });
+			// The holder writes on until it lets go, so the stored size is not the one the manager loaded.
+			await holder.writeLinesAtomic(file, paddedTranscript(ID, "first", "b", 10), {
+				expectedSize: holder.statSync(file).size,
+			});
+			await holder.drain();
+			release?.();
+			await holder.drain();
+			const older = await db.open({ lease: STILL, claims: false });
+			const race = raceAfterFirstChunk(reader, file, async () => {
+				await older.refresh();
+				await older.writeLinesAtomic(file, paddedTranscript(ID, "first", "c", 10), {
+					expectedSize: older.statSync(file).size,
+				});
+				await older.drain();
+			});
+
+			await manager.claimOpenedSession();
+
+			const fills = padFills(manager.getEntries());
+			await manager.close();
+			expect(race.ran).toBe(true);
+			expect(["bbbbbbbbbb", "cccccccccc"]).toContain(fills);
+		}, 120_000);
 	});
 }
