@@ -11,13 +11,7 @@ import {
 import { buildModel } from "./build";
 import { collapseBuiltVariants } from "./compat/collapse";
 import { applyCatalogMetrics, CatalogMetricsIndex } from "./identity/metrics";
-import {
-	readModelCache,
-	readModelCacheCompleteMark,
-	readModelCacheWithVersion,
-	takeModelCacheWriteTicket,
-	writeModelCacheInSlices,
-} from "./model-cache";
+import { readModelCache, takeModelCacheRowTurn, writeModelCacheInSlices } from "./model-cache";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import { TimeBasedCostShape } from "./pricing";
 import { type Api, type Model, modelKind, type ModelSpec, type Provider } from "./types";
@@ -286,24 +280,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		options.modelsDev?.additiveOnly && staticModels.length > 0
 			? new Set(staticModels.map(model => model.id))
 			: undefined;
-	while (sliceExpired()) await nextSlice();
-	const cache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
-	// A partial write below carries rows of this read: it must not land over a
-	// complete write that lands after it.
-	const completeMarkAtRead = readModelCacheCompleteMark(cacheProviderId, dbPath);
 	const dynamicModelsAuthoritative = options.dynamicModelsAuthoritative ?? false;
-	const isAuthoritativeDynamicCache = dynamicModelsAuthoritative && (cache?.payloadAuthoritative ?? false);
-	const restoredCache = await restoreCachedModelHeaders(
-		cache?.models ?? [],
-		staticModels,
-		cache?.headerOmittedModelIds ?? [],
-		cache?.unrestorableHeaderModelIds ?? [],
-		cache?.legacyHeaderRestoreMarkers ?? false,
-		restorableHeaderFallback,
-		options.restoreCachedHeaders,
-	);
-	const usableCachedModels = restoredCache.models.filter(model => !restoredCache.unresolvedModelIds.has(model.id));
-	const cacheHasUnresolvedHeaders = restoredCache.unresolvedModelIds.size > 0;
 	const mergeAuthority: DynamicMergeAuthority = {
 		input: options.dynamicInputAuthoritative ?? false,
 		reasoning: options.dynamicReasoningAuthoritative ?? false,
@@ -325,28 +302,69 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		cacheDropIds && cacheDropIds.length > 0
 			? `${staticCatalogFingerprint}:drop:${Bun.hash(cacheDropIds.join("\0")).toString(36)}`
 			: staticCatalogFingerprint;
-	const cacheFingerprintMatches = cache?.staticFingerprint === staticFingerprint && staticFingerprint.length > 0;
-	// A matching cache was written against this static catalog under the same
-	// additive policy, so its same-id rows are live discovery merged over the
-	// bundled rows, never shared-catalog overrides (#17481). Strip them only on
-	// a mismatch: a static-catalog upgrade or a cache written before additive
-	// semantics were enabled.
-	const cacheAdditiveStaticModelIds =
-		isAuthoritativeDynamicCache || cacheFingerprintMatches ? undefined : modelsDevAdditiveStaticModelIds;
-	const cacheNeedsModelMigration =
-		!cacheFingerprintMatches &&
-		cacheDropIds !== undefined &&
-		usableCachedModels.some(model => cacheDropIds.includes(model.id));
-	const hasUsableFreshCache =
-		(cache?.fresh ?? false) &&
-		!cacheHasUnresolvedHeaders &&
-		!cacheNeedsModelMigration &&
-		(!dynamicModelsAuthoritative || cacheFingerprintMatches);
 	const dynamicFetcher = options.fetchDynamicModels;
 	const hasDynamicFetcher = typeof dynamicFetcher === "function";
 	const hasModelsDevFetcher = options.modelsDev !== undefined;
 	const hasRemoteFetcher = hasDynamicFetcher || hasModelsDevFetcher;
-	const hasAuthoritativeCache = ((cache?.authoritative ?? false) && hasUsableFreshCache) || !hasRemoteFetcher;
+	// The cache row as this resolution sees it. A resolution that fetches reads
+	// it again on its turn to write (below), so it merges the row as the
+	// resolutions that fetched before it left it.
+	const readCacheState = async () => {
+		while (sliceExpired()) await nextSlice();
+		const cache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
+		const isAuthoritativeDynamicCache = dynamicModelsAuthoritative && (cache?.payloadAuthoritative ?? false);
+		const restoredCache = await restoreCachedModelHeaders(
+			cache?.models ?? [],
+			staticModels,
+			cache?.headerOmittedModelIds ?? [],
+			cache?.unrestorableHeaderModelIds ?? [],
+			cache?.legacyHeaderRestoreMarkers ?? false,
+			restorableHeaderFallback,
+			options.restoreCachedHeaders,
+		);
+		const usableCachedModels = restoredCache.models.filter(model => !restoredCache.unresolvedModelIds.has(model.id));
+		const cacheHasUnresolvedHeaders = restoredCache.unresolvedModelIds.size > 0;
+		const cacheFingerprintMatches = cache?.staticFingerprint === staticFingerprint && staticFingerprint.length > 0;
+		// A matching cache was written against this static catalog under the same
+		// additive policy, so its same-id rows are live discovery merged over the
+		// bundled rows, never shared-catalog overrides (#17481). Strip them only on
+		// a mismatch: a static-catalog upgrade or a cache written before additive
+		// semantics were enabled.
+		const cacheAdditiveStaticModelIds =
+			isAuthoritativeDynamicCache || cacheFingerprintMatches ? undefined : modelsDevAdditiveStaticModelIds;
+		const cacheNeedsModelMigration =
+			!cacheFingerprintMatches &&
+			cacheDropIds !== undefined &&
+			usableCachedModels.some(model => cacheDropIds.includes(model.id));
+		const hasUsableFreshCache =
+			(cache?.fresh ?? false) &&
+			!cacheHasUnresolvedHeaders &&
+			!cacheNeedsModelMigration &&
+			(!dynamicModelsAuthoritative || cacheFingerprintMatches);
+		const hasAuthoritativeCache = ((cache?.authoritative ?? false) && hasUsableFreshCache) || !hasRemoteFetcher;
+		return {
+			cache,
+			isAuthoritativeDynamicCache,
+			restoredCache,
+			usableCachedModels,
+			cacheHasUnresolvedHeaders,
+			cacheFingerprintMatches,
+			cacheAdditiveStaticModelIds,
+			hasUsableFreshCache,
+			hasAuthoritativeCache,
+		};
+	};
+	let {
+		cache,
+		isAuthoritativeDynamicCache,
+		restoredCache,
+		usableCachedModels,
+		cacheHasUnresolvedHeaders,
+		cacheFingerprintMatches,
+		cacheAdditiveStaticModelIds,
+		hasUsableFreshCache,
+		hasAuthoritativeCache,
+	} = await readCacheState();
 	const cacheAgeMs = cache ? now() - cache.updatedAt : Number.POSITIVE_INFINITY;
 	const shouldFetchFromNetwork =
 		hasRemoteFetcher && shouldFetchRemoteSources(strategy, hasUsableFreshCache, hasAuthoritativeCache, cacheAgeMs);
@@ -379,14 +397,29 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				dynamicFetcher ? fetchDynamicSpecs(dynamicFetcher) : undefined,
 			])
 		: undefined;
-	// An unsliced resolution wrote the row in the step its fetches resolved, so
-	// concurrent resolutions wrote in the order their fetches resolved. The
-	// ticket, taken before the fetched rows are built in slices, keeps that
-	// order for the sliced writes below.
-	const writeTicket = fetched ? takeModelCacheWriteTicket(cacheProviderId, dbPath) : undefined;
+	// An unsliced resolution read, merged and wrote the row in the step its
+	// fetches resolved, so concurrent resolutions wrote one at a time, in the
+	// order their fetches resolved, each over the row the earlier ones left.
+	// The turn keeps that: it is taken here, before the fetched rows are built
+	// in slices, and the cache is read again once it comes.
+	using rowTurn = fetched ? takeModelCacheRowTurn(cacheProviderId, dbPath) : undefined;
 	const [fetchedModelsDevModels, dynamicFetch] = fetched
 		? await Promise.all([buildModelsDevModels(options, fetched[0]), fetched[1] && buildDynamicModels(fetched[1])])
 		: [null, undefined];
+	if (rowTurn) {
+		await rowTurn.ready;
+		({
+			cache,
+			isAuthoritativeDynamicCache,
+			restoredCache,
+			usableCachedModels,
+			cacheHasUnresolvedHeaders,
+			cacheFingerprintMatches,
+			cacheAdditiveStaticModelIds,
+			hasUsableFreshCache,
+			hasAuthoritativeCache,
+		} = await readCacheState());
+	}
 	const fetchedDynamicModels = dynamicFetch?.models ?? null;
 	const modelsDevFetchSucceeded = fetchedModelsDevModels !== null;
 	const normalizedModelsDevModels = fetchedModelsDevModels?.models ?? [];
@@ -469,8 +502,6 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				dbPath,
 				staticModels,
 				restorableHeaderFallback,
-				// Only an authoritative complete catalog takes the complete write order.
-				{ ticket: writeTicket, partial: !remoteResolutionComplete || !cacheAuthoritative, completeMarkAtRead },
 			);
 		} else {
 			// Remote fetch failed. Re-persist any prior catalog as a
@@ -486,15 +517,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			// mark the remainder fresh, while the untouched row keeps forcing a
 			// refetch that recovers them (#18227).
 			while (sliceExpired()) await nextSlice();
-			// The guard and the snapshot below come from this row, and the write
-			// lands slices later: another pass for this provider can write the row
-			// in between. The write applies only while the row is still this one.
-			const { entry: latestCache, version: latestRowVersion } = readModelCacheWithVersion<TApi>(
-				cacheProviderId,
-				ttlMs,
-				now,
-				dbPath,
-			);
+			const latestCache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
 			const latestRestoredCache = await restoreCachedModelHeaders(
 				latestCache?.models ?? cache?.models ?? [],
 				staticModels,
@@ -543,7 +566,6 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 					dbPath,
 					staticModels,
 					restorableHeaderFallback,
-					{ ticket: writeTicket, rowVersion: latestRowVersion, copy: true },
 				);
 			}
 		}
@@ -621,8 +643,9 @@ async function buildDynamicModels<TApi extends Api>(fetched: {
 	specs: readonly ModelSpec<TApi>[] | null;
 	error?: string;
 }): Promise<{ models: DiscoveredModelSet<TApi> | null; error?: string }> {
-	if (fetched.specs === null)
+	if (fetched.specs === null) {
 		return fetched.error === undefined ? { models: null } : { models: null, error: fetched.error };
+	}
 	try {
 		return { models: await buildDiscoveredModelSpecs<TApi>(fetched.specs) };
 	} catch (error) {

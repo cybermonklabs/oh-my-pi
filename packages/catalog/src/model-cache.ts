@@ -121,49 +121,17 @@ export interface ModelCacheWriteStats {
 	refreshWrites: number;
 	/** Writes that matched the stored row exactly and touched nothing. */
 	skippedWrites: number;
-	/** Sliced writes left undone by their {@link CacheWriteOrdering}: the row changed since it was read, or a later ticket wrote. */
-	staleWrites: number;
 	/** Provider ids of the most recent payload writes (bounded). */
 	recentPayloadProviders: readonly string[];
 }
 
-const writeStats = { payloadWrites: 0, payloadBytes: 0, refreshWrites: 0, skippedWrites: 0, staleWrites: 0 };
+const writeStats = { payloadWrites: 0, payloadBytes: 0, refreshWrites: 0, skippedWrites: 0 };
 const recentPayloadProviders: string[] = [];
 const RECENT_PAYLOAD_PROVIDERS_MAX = 64;
 
 /** Snapshot of this process's model-cache write counters. */
 export function getModelCacheWriteStats(): ModelCacheWriteStats {
 	return { ...writeStats, recentPayloadProviders: [...recentPayloadProviders] };
-}
-
-/**
- * Per cache row of this process (database path and provider id): the last write
- * ticket taken, the highest a complete write wrote with, and the highest a
- * partial write wrote with.
- */
-const writeTickets = new Map<string, { issued: number; written: number; partialWritten: number }>();
-
-/**
- * Takes the next write ticket for a provider's cache row. A resolution takes
- * one when its fetches resolve, the step in which an unsliced resolution wrote
- * the row; {@link writeModelCacheInSlices} then skips a write whose ticket is
- * older than one that has written, so sliced writes keep the order of their fetches.
- */
-export function takeModelCacheWriteTicket(providerId: string, dbPath?: string): number {
-	const key = readCacheKey(resolveCacheDb(dbPath).resolvedPath, providerId);
-	const tickets = writeTickets.get(key) ?? { issued: 0, written: 0, partialWritten: 0 };
-	tickets.issued++;
-	writeTickets.set(key, tickets);
-	return tickets.issued;
-}
-
-/**
- * The row's complete mark, which changes exactly when a complete sliced write
- * lands. A resolution reads it with the cache read whose rows a partial write
- * may carry, and passes it as {@link CacheWriteOrdering.completeMarkAtRead}.
- */
-export function readModelCacheCompleteMark(providerId: string, dbPath?: string): number {
-	return writeTickets.get(readCacheKey(resolveCacheDb(dbPath).resolvedPath, providerId))?.written ?? 0;
 }
 
 type StoredRowState = Pick<
@@ -232,8 +200,6 @@ interface ReadRowCacheEntry {
 	 */
 	meta: CacheRowMeta | null;
 	entry: CacheEntry<Api> | null;
-	/** {@link rowVersion} of the row as read; null when there was none. */
-	version: string | null;
 }
 
 const readRowCache = new Map<string, ReadRowCacheEntry>();
@@ -371,6 +337,38 @@ export function retainModelCacheConnection(dbPath: string | undefined): Disposab
 			held.db?.close();
 			held.db = null;
 		},
+	};
+}
+
+/** A place in the order of one cache row's writes, from {@link takeModelCacheRowTurn}. */
+export interface ModelCacheRowTurn extends Disposable {
+	/** Resolves when every turn taken before this one on the row has been released. */
+	readonly ready: Promise<void>;
+}
+
+/** Per cache row of this process (database path and provider id): the last turn taken. */
+const rowTurns = new Map<string, Promise<void>>();
+
+/**
+ * Takes the next turn to read, merge and write a provider's cache row in this
+ * process. Turns come ready in the order they were taken; release one by
+ * disposing it, after its write (or on any error), so the next can start.
+ * A resolution takes its turn when its fetches resolve: the step in which an
+ * unsliced resolution read, merged and wrote the row.
+ */
+export function takeModelCacheRowTurn(providerId: string, dbPath?: string): ModelCacheRowTurn {
+	const key = readCacheKey(resolveCacheDb(dbPath).resolvedPath, providerId);
+	const earlier = rowTurns.get(key) ?? Promise.resolve();
+	const { promise: released, resolve: release } = Promise.withResolvers<void>();
+	const tail = earlier.then(() => released);
+	rowTurns.set(key, tail);
+	// Forget the row once its last turn is through, never while an earlier turn still holds it.
+	void tail.then(() => {
+		if (rowTurns.get(key) === tail) rowTurns.delete(key);
+	});
+	return {
+		ready: earlier,
+		[Symbol.dispose]: release,
 	};
 }
 
@@ -549,28 +547,6 @@ export function readModelCache<TApi extends Api>(
 	now: () => number,
 	dbPath?: string,
 ): CacheEntry<TApi> | null {
-	return readModelCacheWithVersion<TApi>(providerId, ttlMs, now, dbPath).entry;
-}
-
-/** A cache read and the version of the row it came from. */
-export interface VersionedCacheRead<TApi extends Api = Api> {
-	entry: CacheEntry<TApi> | null;
-	/** The row's version; `null` when there is no row, `undefined` when the cache could not be read. */
-	version: string | null | undefined;
-}
-
-/**
- * {@link readModelCache}, plus the version of the row the entry came from,
- * read by the same statement. A caller that writes the row later in slices
- * passes the version to {@link writeModelCacheInSlices}, which then writes
- * only if no other write changed the row in between.
- */
-export function readModelCacheWithVersion<TApi extends Api>(
-	providerId: string,
-	ttlMs: number,
-	now: () => number,
-	dbPath?: string,
-): VersionedCacheRead<TApi> {
 	try {
 		// Monotonic change signal: same-shaped WAL overwrites after checkpoint
 		// can leave every size:mtime pair identical, so file metadata alone
@@ -586,23 +562,18 @@ export function readModelCacheWithVersion<TApi extends Api>(
 			if (dataVersion !== null && cached?.dataVersion === dataVersion) {
 				// Freshness is time-relative: recompute per call from the
 				// cached row's updatedAt so a long-lived process goes stale.
-				return {
-					entry: withFreshness(cached.entry as CacheEntry<TApi> | null, ttlMs, now),
-					version: cached.version,
-				};
+				return withFreshness(cached.entry as CacheEntry<TApi> | null, ttlMs, now);
 			}
 			// Any commit (to any provider's row) bumps data_version. Validate the
 			// memoized parse against the row's scalar columns and payload hash
 			// first; only a changed payload pays for the multi-MB `models` read.
 			let entry: CacheEntry<TApi> | null = null;
 			let meta: CacheRowMeta | null = null;
-			let version: string | null = null;
 			if (cached?.entry && cached.meta) {
 				meta = queryRow<CacheRowMeta>(db, SELECT_CACHE_ROW_META, providerId);
 				if (meta && meta.materialization_policy === materializationPolicy() && cacheRowsEqual(cached.meta, meta)) {
 					// Payload unchanged; only side-table freshness may have moved.
 					entry = withFreshness(withRowState(cached.entry as CacheEntry<TApi>, meta), ttlMs, now);
-					version = rowVersion(meta);
 				} else {
 					meta = null;
 				}
@@ -611,24 +582,18 @@ export function readModelCacheWithVersion<TApi extends Api>(
 				// One statement reads payload and scalars from the same snapshot.
 				const row = queryRow<CacheRow>(db, SELECT_CACHE_ROW, providerId);
 				entry = parseCacheRow<TApi>(db, providerId, row, ttlMs, now);
-				if (row !== null) {
+				if (entry !== null && row !== null) {
 					// Drop the payload so the memo never pins the multi-MB `models` string.
 					const { models: _models, ...rowScalars } = row;
-					if (entry !== null) {
-						meta = rowScalars;
-						version = rowVersion(rowScalars);
-					} else {
-						// The parse deletes a corrupt row and keeps a foreign-schema one: read which.
-						version = cacheRowVersion(db, providerId);
-					}
+					meta = rowScalars;
 				}
 			}
 			if (readRowCache.size >= READ_ROW_CACHE_MAX) readRowCache.clear();
-			readRowCache.set(key, { dataVersion, meta, entry: entry as CacheEntry<Api> | null, version });
-			return { entry, version };
+			readRowCache.set(key, { dataVersion, meta, entry: entry as CacheEntry<Api> | null });
+			return entry;
 		});
 	} catch {
-		return { entry: null, version: undefined };
+		return null;
 	}
 }
 
@@ -639,33 +604,6 @@ function queryRow<T>(db: Database, sql: string, providerId: string): T | null {
 	} finally {
 		stmt.finalize();
 	}
-}
-
-/**
- * A row's version: every column a write sets (the payload through
- * `models_hash`) and its refresh side row. Two reads give the same version
- * only if no write changed the row between them.
- */
-function rowVersion(row: CacheRowMeta): string {
-	return JSON.stringify([
-		row.version,
-		row.materialization_policy,
-		row.updated_at,
-		row.authoritative,
-		row.static_fingerprint,
-		row.models_hash,
-		row.header_omitted_model_ids,
-		row.unrestorable_header_model_ids,
-		row.header_restore_version,
-		row.refresh_payload_updated_at,
-		row.refresh_updated_at,
-		row.refresh_authoritative,
-	]);
-}
-
-function cacheRowVersion(db: Database, providerId: string): string | null {
-	const row = queryRow<CacheRowMeta>(db, SELECT_CACHE_ROW_META, providerId);
-	return row === null ? null : rowVersion(row);
 }
 
 /**
@@ -811,7 +749,6 @@ export function writeModelCache<TApi extends Api>(
 				dbPath,
 				staticHeaderSources,
 				restorableHeaderFallback,
-				{},
 			),
 		);
 	} catch {
@@ -820,50 +757,9 @@ export function writeModelCache<TApi extends Api>(
 }
 
 /**
- * How a sliced write keeps its order against other writes to the same row,
- * which can land while it is in slices.
- */
-export interface CacheWriteOrdering {
-	/**
-	 * The version of the row the caller built its snapshot from (from
-	 * {@link readModelCacheWithVersion}): the write applies only while the row
-	 * still has it, so a snapshot of an older row never replaces a newer one.
-	 */
-	rowVersion?: string | null;
-	/**
-	 * From {@link takeModelCacheWriteTicket} when the caller's fetches resolved:
-	 * the write is skipped once a complete write with a later ticket has written,
-	 * so complete writes land in the order of their fetches.
-	 */
-	ticket?: number;
-	/**
-	 * The rows are not an authoritative catalog: a source failed, so they merge
-	 * cached rows the caller read before its fetch, or the endpoint answered an
-	 * empty list. Such a write is also skipped once a partial write with a later
-	 * ticket has written, and it raises only the partial mark, so it never stops
-	 * an authoritative complete write with an earlier ticket.
-	 */
-	partial?: boolean;
-	/**
-	 * With `partial`: the complete mark ({@link readModelCacheCompleteMark}) when
-	 * the caller read the cached rows it carries. The write is skipped once a
-	 * complete write has landed since, so cached rows never replace rows a
-	 * complete refresh wrote after they were read.
-	 */
-	completeMarkAtRead?: number;
-	/**
-	 * The rows are a copy of a row the caller read (a failed refresh's fallback);
-	 * implied by a `rowVersion`. A copy checks both marks and raises neither:
-	 * any write with fetched rows is newer than the cached rows it carries.
-	 */
-	copy?: boolean;
-}
-
-/**
  * {@link writeModelCache} for a pass that must not hold the event loop: it
  * validates the models in slices and returns to the loop before it serializes
- * the row and before the write transaction, which runs in one step. Within
- * this process, `ordering` keeps it from replacing a newer row.
+ * the row and before the write transaction, which runs in one step.
  */
 export async function writeModelCacheInSlices<TApi extends Api>(
 	providerId: string,
@@ -874,7 +770,6 @@ export async function writeModelCacheInSlices<TApi extends Api>(
 	dbPath?: string,
 	staticHeaderSources: readonly Model<TApi>[] = [],
 	restorableHeaderFallback?: Record<string, string>,
-	ordering: CacheWriteOrdering = {},
 ): Promise<void> {
 	try {
 		await runInSlices(
@@ -887,7 +782,6 @@ export async function writeModelCacheInSlices<TApi extends Api>(
 				dbPath,
 				staticHeaderSources,
 				restorableHeaderFallback,
-				ordering,
 			),
 		);
 	} catch {
@@ -905,7 +799,6 @@ function* writeModelCacheSteps<TApi extends Api>(
 	dbPath: string | undefined,
 	staticHeaderSources: readonly Model<TApi>[],
 	restorableHeaderFallback: Record<string, string> | undefined,
-	ordering: CacheWriteOrdering,
 ): Generator<void, void, undefined> {
 	const headerOmittedModelIds: string[] = [];
 	const unrestorableHeaderModelIds: string[] = [];
@@ -964,22 +857,9 @@ function* writeModelCacheSteps<TApi extends Api>(
 	// unchanged, so drop the read memo in the step that writes: a reader may
 	// have memoized the old row while this write was in slices.
 	invalidateReadRow(providerId, dbPath);
-	const { ticket, rowVersion: expectedRowVersion, partial = false, completeMarkAtRead } = ordering;
-	const copy = ordering.copy === true || expectedRowVersion !== undefined;
-	const carriesReadRows = partial || copy;
-	const ticketKey = readCacheKey(resolveCacheDb(dbPath).resolvedPath, providerId);
 	withModelCacheDb(dbPath, db => {
 		const outcome = db
-			.transaction((): "stale" | "skipped" | "refreshed" | "written" => {
-				const marks = writeTickets.get(ticketKey);
-				if (partial && completeMarkAtRead !== undefined && (marks?.written ?? 0) !== completeMarkAtRead) {
-					return "stale";
-				}
-				if (ticket !== undefined && ticket < (marks?.written ?? 0)) return "stale";
-				if (ticket !== undefined && carriesReadRows && ticket < (marks?.partialWritten ?? 0)) return "stale";
-				if (expectedRowVersion !== undefined && cacheRowVersion(db, providerId) !== expectedRowVersion) {
-					return "stale";
-				}
+			.transaction((): "skipped" | "refreshed" | "written" => {
 				const matchStmt = db.prepare<
 					StoredRowState,
 					[string, number, string, string, string, string, number, string]
@@ -1047,15 +927,7 @@ function* writeModelCacheSteps<TApi extends Api>(
 				return "written";
 			})
 			.immediate();
-		if (outcome !== "stale" && ticket !== undefined && !copy) {
-			const marks = writeTickets.get(ticketKey) ?? { issued: ticket, written: 0, partialWritten: 0 };
-			if (partial) marks.partialWritten = Math.max(marks.partialWritten, ticket);
-			else marks.written = Math.max(marks.written, ticket);
-			writeTickets.set(ticketKey, marks);
-		}
-		if (outcome === "stale") {
-			writeStats.staleWrites++;
-		} else if (outcome === "skipped") {
+		if (outcome === "skipped") {
 			writeStats.skippedWrites++;
 		} else if (outcome === "refreshed") {
 			writeStats.refreshWrites++;
