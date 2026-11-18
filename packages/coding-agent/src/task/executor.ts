@@ -96,7 +96,12 @@ import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
-import { INTERRUPTED_TURN_ERROR, plainTurnAbortReason, turnAbortKind } from "../session/exit-diagnostics";
+import {
+	INTERRUPTED_TURN_ERROR,
+	plainTurnAbortReason,
+	type TurnAbortKind,
+	turnAbortKind,
+} from "../session/exit-diagnostics";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -1533,6 +1538,14 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	 */
 	let callerCutOff = false;
 
+	/**
+	 * How the run ends, for its session and its own jobs: `shutdown` when the run was shut
+	 * down, a cut-off when its caller cut it off ({@link callerCutOff}), and a stop for every
+	 * other end (a kill, its own budget or time limit, a finished run).
+	 */
+	const runEndKind = (): "shutdown" | TurnAbortKind =>
+		abortReason === "shutdown" ? "shutdown" : abortReason === "signal" && callerCutOff ? "cutOff" : "stop";
+
 	const abortActiveSession = (): Promise<void> => {
 		const session = activeSession;
 		if (!session) return Promise.resolve();
@@ -1540,10 +1553,11 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		// interrupted so `omp --restore` (and `/restart`) goes on with it. A caller's
 		// abort that is not a stop cuts it off too ({@link callerCutOff}). The rest
 		// (a kill, this run's own budget or time limit) stop it.
+		const endKind = runEndKind();
 		const options =
-			abortReason === "shutdown"
+			endKind === "shutdown"
 				? { reason: INTERRUPTED_TURN_ERROR }
-				: abortReason === "signal" && callerCutOff
+				: endKind === "cutOff"
 					? { cutOff: true }
 					: undefined;
 		activeSessionAbortPromise ??= session.abort(options).catch(error => {
@@ -2447,10 +2461,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		// A soft stop that never escalated still identifies as a budget abort so
 		// the lifecycle can park the agent as resumable instead of killing it.
 		abortKind: () => abortReason ?? (budgetStopRequested ? "budget" : undefined),
-		ownedJobsAbortReason: () =>
-			abortReason === "shutdown"
-				? ASYNC_JOB_MANAGER_SHUTDOWN_REASON
-				: plainTurnAbortReason(abortReason === "signal" && callerCutOff ? "cutOff" : "stop"),
+		ownedJobsAbortReason: () => {
+			const endKind = runEndKind();
+			return endKind === "shutdown" ? ASYNC_JOB_MANAGER_SHUTDOWN_REASON : plainTurnAbortReason(endKind);
+		},
 		isAbortedRun: () =>
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||

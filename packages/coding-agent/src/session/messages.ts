@@ -35,6 +35,7 @@ export {
 	isUserInterruptAbort,
 	shouldRenderAbortReason,
 	GENERIC_ABORT_SENTINEL,
+	isReasonlessAbort,
 	resolveAbortLabel,
 	isCustomMessageContent,
 	normalizeCustomMessagePayload,

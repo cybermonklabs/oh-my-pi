@@ -6,7 +6,7 @@
  * Every persisted subagent transcript under the session ({@link collectSubSessions})
  * that its process left mid-turn, or whose turn ended because its provider key could
  * not be resolved ({@link hasRestorableTurn}), was not killed (no tombstone), has no
- * subagent above it that was killed or stopped ({@link stoppedAncestor}), belongs
+ * subagent above it that was killed or stopped (see {@link restoreSubagents}), belongs
  * to its parent's current conversation (not to work a `/clear` or a move to another
  * branch left behind, {@link SpawnRecords}) and can be revived (a `session_init`
  * contract, not isolated) runs one
@@ -22,7 +22,6 @@
  */
 import * as path from "node:path";
 import { isRecord, logger, stringProperty } from "@oh-my-pi/pi-utils";
-import { isReasonlessAbort, isUserInterruptAbort } from "@oh-my-pi/pi-tui/chat/messages";
 import { isTaskToolDetails, taskCardAgentIds } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError } from "../async";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
@@ -30,10 +29,12 @@ import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import {
+	conversationTail,
 	endsOnCredentialUnavailableTurn,
 	hasRestorableTurn,
 	isInterruptedTurnAbort,
 } from "../session/exit-diagnostics";
+import { isReasonlessAbort, isUserInterruptAbort } from "../session/messages";
 import { activeBranch, type SessionEntry } from "../session/session-entries";
 import { extractSessionInit, type SessionManager } from "../session/session-manager";
 import { collectSubSessions, type SubSession } from "../session/sub-sessions";
@@ -87,15 +88,32 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 	// Parents first: a child's result is delivered to its parent's session.
 	const keys = Object.keys(subSessions).sort((a, b) => a.split("/").length - b.split("/").length);
 	const spawns = new SpawnRecords(session.sessionManager, subSessions);
+	/**
+	 * Per sub-session key, the nearest subagent at or above it that was killed (its tombstone,
+	 * `SubSession.aborted`) or whose last turn a stop ended ({@link endsOnStop}); no entry when
+	 * none was. The loop below fills it for every key before it skips any, a parent before its
+	 * children. The jobs a subagent owns (its eval `agent()` handles, its workpool batches) end
+	 * with it: a kill or a stop of its run stops their subagents, so `--restore` leaves them,
+	 * even one that a cancel giving no reason cut off, which keeps its turn on its marked
+	 * attempt; nor does `--restore` relaunch such an ancestor, which would receive their
+	 * results. The session itself is no such ancestor: its own stop leaves its background jobs
+	 * running. A process exit leaves neither mark (it writes the interrupted-turn record, or the
+	 * abort without a reason, which a stop can write too), so the subagents of a chain it cut
+	 * off go on. A subagent whose transcript was not collected has no entry, so it judges
+	 * nothing above it.
+	 */
+	const stoppedAtOrAbove = new Map<string, SubSession>();
 	const restored: string[] = [];
 	for (const key of keys) {
 		const sub = subSessions[key]!;
 		// The selected branch, as the subagent's own session reopens it: entries on other branches
 		// (an abandoned turn, a `/clear` that was rolled back) are not its conversation.
 		const branch = activeBranch(sub.entries, sub.leafId);
+		const stopped = sub.parent === null ? undefined : stoppedAtOrAbove.get(sub.parent);
+		const atOrAbove = sub.aborted || endsOnStop(branch) ? sub : stopped;
+		if (atOrAbove) stoppedAtOrAbove.set(key, atOrAbove);
 		if (sub.aborted || !hasRestorableTurn(branch)) continue;
 		const id = sub.agentId;
-		const stopped = stoppedAncestor(sub, subSessions);
 		if (stopped) {
 			logger.debug("Interrupted subagent is under a subagent that was killed or stopped; not restored", {
 				id,
@@ -158,45 +176,17 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 }
 
 /**
- * The subagent above `sub` that was killed (its tombstone, `SubSession.aborted`) or whose
- * last turn a stop ended ({@link endsOnStop}), nearest first; undefined when none was. The
- * jobs a subagent owns (its eval `agent()` handles, its workpool batches) end with it: a
- * kill or a stop of its run stops their subagents, so `--restore` leaves them, even one
- * that a cancel giving no reason cut off, which keeps its turn on its marked attempt; nor
- * does `--restore` relaunch such an ancestor, which would receive their results. The
- * session itself is no such ancestor: its own stop leaves its background jobs running. A
- * process exit leaves neither mark (it writes the interrupted-turn record, or the abort
- * without a reason, which a stop can write too), so the subagents of a chain it cut off go
- * on. A subagent whose transcript was not collected judges nothing above it.
- */
-function stoppedAncestor(sub: SubSession, subSessions: Readonly<Record<string, SubSession>>): SubSession | undefined {
-	for (let key = sub.parent; key !== null;) {
-		const ancestor = subSessions[key];
-		if (!ancestor) return undefined;
-		if (ancestor.aborted || endsOnStop(activeBranch(ancestor.entries, ancestor.leafId))) return ancestor;
-		key = ancestor.parent;
-	}
-	return undefined;
-}
-
-/**
  * Whether the branch's last message, after its last `/clear`, is a record only a stop
  * writes: the user's interrupt ({@link isUserInterruptAbort}), or the record that ends a
  * turn whose retry was stopped ({@link RETRY_CANCELLED}, which carries no other mark).
  */
 function endsOnStop(branch: readonly SessionEntry[]): boolean {
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index]!;
-		if (entry.type === "reset_boundary") return false;
-		if (entry.type !== "message") continue;
-		const { message } = entry;
-		return (
-			message.role === "assistant" &&
-			message.stopReason === "aborted" &&
-			(isUserInterruptAbort(message) || message.errorMessage === RETRY_CANCELLED)
-		);
-	}
-	return false;
+	const message = conversationTail(branch)?.message;
+	return (
+		message?.role === "assistant" &&
+		message.stopReason === "aborted" &&
+		(isUserInterruptAbort(message) || message.errorMessage === RETRY_CANCELLED)
+	);
 }
 
 /**

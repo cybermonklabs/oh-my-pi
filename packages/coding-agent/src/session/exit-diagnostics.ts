@@ -121,7 +121,9 @@ interface UnfinishedTurn {
  * The branch's last message and its index, after its last `/clear`
  * (`reset_boundary`): `/clear` ends the conversation before it. Undefined without one.
  */
-function conversationTail(entries: readonly SessionEntry[]): { index: number; message: AgentMessage } | undefined {
+export function conversationTail(
+	entries: readonly SessionEntry[],
+): { index: number; message: AgentMessage } | undefined {
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index]!;
 		if (entry.type === "reset_boundary") return undefined;

@@ -254,7 +254,9 @@ const laterTurns: Record<string, () => AssistantMessage> = {
 /**
  * The records that end the parent's turn after its sync call's result when the parent's process goes away
  * inside the call: exit recovery's, or the agent loop's record of an abort without a reason (its flag beside
- * its text, as the loop writes it), which a dispose for a quit, `/restart` or a signal leaves.
+ * its text, as the loop writes it), which a dispose for a quit, `/restart` or a signal leaves. That record
+ * also comes with its text alone (saved before the flag existed) and with the flag alone (turn recovery's
+ * stamp on a platform's own abort text).
  */
 const exitTurnEnds: Record<string, (branch: SessionEntry[]) => AssistantMessage> = {
 	"the interrupted-turn record exit recovery writes": branch => {
@@ -266,6 +268,14 @@ const exitTurnEnds: Record<string, (branch: SessionEntry[]) => AssistantMessage>
 		assistant({
 			stopReason: "aborted",
 			errorMessage: GENERIC_ABORT_SENTINEL,
+			errorId: AIError.create(AIError.Flag.Abort),
+		}),
+	"that record saved before its flag existed, its text alone": () =>
+		assistant({ stopReason: "aborted", errorMessage: GENERIC_ABORT_SENTINEL }),
+	"the flag alone, which turn recovery stamps on a platform's own abort text": () =>
+		assistant({
+			stopReason: "aborted",
+			errorMessage: "The operation was aborted",
 			errorId: AIError.create(AIError.Flag.Abort),
 		}),
 };

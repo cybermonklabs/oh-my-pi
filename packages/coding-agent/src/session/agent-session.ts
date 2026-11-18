@@ -6839,8 +6839,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// label it as interrupted so `omp --restore` goes on with it. Any other
 		// disposal cuts the turn off too; its plain reason says so to a sync subagent,
 		// of the turn or of a continuation already running.
-		const abortReason =
-			options.reason === postmortem.Reason.EXIT ? INTERRUPTED_TURN_ERROR : plainTurnAbortReason("cutOff");
+		const processExit = options.reason === postmortem.Reason.EXIT;
+		const abortReason = processExit ? INTERRUPTED_TURN_ERROR : plainTurnAbortReason("cutOff");
 		const postPromptDrain = this.#cancelPostPromptTasks(abortReason);
 		this.agent.abort(abortReason);
 		try {
@@ -6868,7 +6868,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
 		releaseShellSessions(this.sessionManager.getSessionId());
 		const results = await Promise.allSettled([
-			this.#disposeOwnedAsyncJobs(options.reason === postmortem.Reason.EXIT),
+			this.#disposeOwnedAsyncJobs(processExit),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.#eval.getKernelOwnerId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),

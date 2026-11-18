@@ -112,9 +112,11 @@ export function shouldRenderAbortReason(message: Pick<AssistantMessage, "errorId
  *  reason (bare `abort()`). Renderers treat it as "no specific reason given". */
 export const GENERIC_ABORT_SENTINEL = "Request was aborted";
 
-/** Type-guard for an abort that carried no reason of its own: the agent stamps
- *  `AIError.Flag.Abort` on that record beside {@link GENERIC_ABORT_SENTINEL}, which
- *  alone marks a record persisted before the flag existed. */
+/** Type-guard for an abort that carried no reason of its own: its record carries
+ *  `AIError.Flag.Abort` or {@link GENERIC_ABORT_SENTINEL}. The agent loop stamps both;
+ *  the flag comes without that text where turn recovery stamps it on a platform's own
+ *  abort text ("The operation was aborted"), and the text without the flag on a record
+ *  persisted before the flag existed. */
 export function isReasonlessAbort(message: Pick<AssistantMessage, "errorId" | "errorMessage">): boolean {
 	return AIError.is(message.errorId, AIError.Flag.Abort) || message.errorMessage === GENERIC_ABORT_SENTINEL;
 }
@@ -128,11 +130,7 @@ export function resolveAbortLabel(
 	message: Pick<AssistantMessage, "errorId" | "errorMessage">,
 	retryAttempt = 0,
 ): string {
-	const genericAbort =
-		AIError.is(message.errorId, AIError.Flag.Abort) ||
-		!message.errorMessage ||
-		message.errorMessage === GENERIC_ABORT_SENTINEL ||
-		isSilentAbort(message);
+	const genericAbort = isReasonlessAbort(message) || !message.errorMessage || isSilentAbort(message);
 	if (!genericAbort) {
 		return message.errorMessage!;
 	}

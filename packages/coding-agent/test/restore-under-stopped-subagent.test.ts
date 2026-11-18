@@ -447,8 +447,8 @@ describe("omp --restore after the user's stop of the parent ended a subagent who
 
 describe("omp --restore under a subagent that was killed after a cancel without a reason cut its job's subagent off", () => {
 	it("relaunches nothing, although the job's subagent kept its marked attempt", async () => {
-		// If this regresses, a site that cancels a job without saying how (as every job cancel did before this
-		// check) leaves the job's subagent restorable, and `omp --restore` relaunches it under a killed subagent.
+		// If this regresses, a site that cancels a job without saying how leaves the job's subagent restorable,
+		// and `omp --restore` relaunches it under a killed subagent.
 		const { parent, roster, runs, plannerHolds } = await openParentWithPlanner();
 		const { turn, backoff, plannerId, readerJob } = await startPlannerWithWaitingReader(parent, roster, plannerHolds);
 		// A cancel that gives no reason reads to the reader as a process exit: it is cut off.
