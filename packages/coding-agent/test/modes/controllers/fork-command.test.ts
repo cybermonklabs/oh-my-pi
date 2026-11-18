@@ -68,6 +68,8 @@ function createContext(
 		getCwd: vi.fn(() => options.cwd ?? "/workspace/project"),
 		getSessionFile: vi.fn(() => sessionFile),
 		isSessionOnDisk: vi.fn(() => sessionFile !== undefined),
+		// The fork path asks the configured session storage, not the filesystem.
+		getStorage: vi.fn(() => ({ exists: async () => sessionFile !== undefined })),
 		flush,
 	};
 	const launchTerminal = vi.fn(async (request: TerminalLaunchRequest): Promise<TerminalLaunchResult> => ({

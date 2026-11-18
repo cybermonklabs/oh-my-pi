@@ -85,6 +85,41 @@ describe("ptree signal abort handling", () => {
 		}
 	});
 
+	it.each(["kill", "dispose"] as const)(
+		"does not trigger unhandledRejection when %s ends the process before anyone waits",
+		async how => {
+			// The process exits from the kill while nobody waits on it yet: a caller
+			// that waits later, or never, must not get its exit as an unhandled rejection.
+			const unhandled: unknown[] = [];
+			const onUnhandled = (err: unknown) => {
+				unhandled.push(err);
+			};
+			process.on("unhandledRejection", onUnhandled);
+
+			try {
+				const child = spawn([process.execPath, "-e", "console.log('ready'); setInterval(() => {}, 1000)"]);
+				// The child must be running when the kill lands; a child that never started would pass the
+				// abort checks below too, so the test reads its first line before it kills it.
+				const reader = child.stdout.getReader();
+				const first = await reader.read();
+				reader.releaseLock();
+				expect(new TextDecoder().decode(first.value)).toContain("ready");
+				if (how === "kill") child.kill(new AbortError(new Error("stop"), ""));
+				else child[Symbol.dispose]();
+				await child.proc.exited;
+
+				const nextTurn = Promise.withResolvers<void>();
+				setImmediate(nextTurn.resolve);
+				await nextTurn.promise;
+
+				expect(unhandled).toEqual([]);
+				expect(await child.wait().catch((error: unknown) => error)).toBeInstanceOf(AbortError);
+			} finally {
+				process.off("unhandledRejection", onUnhandled);
+			}
+		},
+	);
+
 	it.skipIf(process.platform === "win32").each([false, true])(
 		"aborts a read started after the root exits (detached: %s)",
 		async detached => {

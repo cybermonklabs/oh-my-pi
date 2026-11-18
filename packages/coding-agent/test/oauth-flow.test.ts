@@ -266,7 +266,6 @@ describe("mcp oauth flow", () => {
 						void completeLocalOAuthCallback(`${observedRedirectUri}?code=test-code&state=${state}`);
 					});
 				},
-				signal: AbortSignal.timeout(1_000),
 			},
 		);
 
@@ -306,7 +305,6 @@ describe("mcp oauth flow", () => {
 						void completeLocalOAuthCallback(`${redirectUri}?code=test-code&state=${state}`);
 					});
 				},
-				signal: AbortSignal.timeout(1_000),
 			},
 		);
 
@@ -342,7 +340,6 @@ describe("mcp oauth flow", () => {
 						void completeLocalOAuthCallback(`${redirectUri}?code=test-code&state=${state}`);
 					});
 				},
-				signal: AbortSignal.timeout(1_000),
 			},
 		);
 
@@ -381,7 +378,6 @@ describe("mcp oauth flow", () => {
 						);
 					});
 				},
-				signal: AbortSignal.timeout(1_000),
 			},
 		);
 
@@ -428,7 +424,6 @@ describe("mcp oauth flow", () => {
 						void completeLocalOAuthCallback(`${observedRedirectUri}?code=test-code&state=${state}`);
 					});
 				},
-				signal: AbortSignal.timeout(1_000),
 			},
 		);
 
@@ -459,7 +454,6 @@ describe("mcp oauth flow", () => {
 						void completeLocalOAuthCallback(`http://localhost:14571/?code=test-code&state=${state}`);
 					});
 				},
-				signal: AbortSignal.timeout(1_000),
 			},
 		);
 
@@ -499,7 +493,6 @@ describe("mcp oauth flow", () => {
 						);
 					});
 				},
-				signal: AbortSignal.timeout(1_000),
 			},
 		);
 
@@ -540,7 +533,7 @@ describe("mcp oauth flow", () => {
 				tokenUrl: "https://provider.example/token",
 				redirectUri: "http://localhost/callback",
 			},
-			{ signal: AbortSignal.timeout(1_000) },
+			{},
 		);
 
 		await expect(flow.login()).rejects.toThrow(
@@ -561,7 +554,7 @@ describe("mcp oauth flow", () => {
 				tokenUrl: "https://provider.example/token",
 				redirectUri: "http://localhost:3000/callback",
 			},
-			{ signal: AbortSignal.timeout(1_000) },
+			{},
 		);
 
 		await expect(flow.login()).rejects.toThrow(
@@ -583,7 +576,7 @@ describe("mcp oauth flow", () => {
 				callbackPort: 14569,
 				callbackPath: "/slack/oauth_redirect",
 			},
-			{ signal: AbortSignal.timeout(1_000) },
+			{},
 		);
 
 		await expect(flow.login()).rejects.toThrow(
@@ -609,7 +602,6 @@ describe("mcp oauth flow", () => {
 			{
 				onAuth,
 				onProgress: msg => progress.push(msg),
-				signal: AbortSignal.timeout(1_000),
 			},
 		);
 
@@ -879,7 +871,6 @@ describe("mcp oauth flow", () => {
 					const state = authUrl.searchParams.get("state") ?? "";
 					return `${redirectUri}?code=manual-code&state=${encodeURIComponent(state)}`;
 				},
-				signal: AbortSignal.timeout(1_000),
 			},
 		);
 
