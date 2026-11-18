@@ -4,6 +4,7 @@ import workpoolBatchTemplate from "../prompts/tools/workpool-batch.md" with { ty
 import workpoolTurnResultTemplate from "../prompts/tools/workpool-turn-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
+import { plainTurnAbortReason } from "../session/exit-diagnostics";
 import type { CustomMessage } from "../session/messages";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
@@ -94,6 +95,13 @@ export interface WorkPoolCreateOptions {
 	policy: EffectiveSubagentPolicy;
 	context?: string;
 	customTools?: CustomTool[];
+	/**
+	 * Run once the pool can no longer start a turn, whether it drained, was
+	 * closed, or its owning session ended. Releases whatever the creating cell
+	 * held for the pool's workers, such as the retained eval kernel their
+	 * kernel-defined tools run on.
+	 */
+	onRelease?: () => void;
 }
 
 interface TurnOutcome {
@@ -128,6 +136,7 @@ export class WorkPool {
 	#lastCardTs = 0;
 	#dispatchChain: Promise<void> = Promise.resolve();
 	#poolJobStarted = false;
+	#onRelease: (() => void) | undefined;
 	readonly #drainWaiters: PromiseWithResolvers<void>[] = [];
 	readonly #freshQueue: WorkPoolItem[] = [];
 
@@ -139,6 +148,7 @@ export class WorkPool {
 		this.#model = options.model;
 		this.context = options.context;
 		this.customTools = options.customTools ?? [];
+		this.#onRelease = options.onRelease;
 		this.freshAgents = cfgEvalWorkpoolFreshAgents.get(session.settings);
 		if (!session.asyncJobManager) {
 			throw new ToolError("workpool() needs the session's async job manager; unavailable here");
@@ -182,7 +192,9 @@ export class WorkPool {
 			async ({ signal }) => {
 				const onAbort = (): void => {
 					this.close();
-					for (const batch of this.batches) manager.cancel(batch.jobId, { ownerId: this.ownerId });
+					// Each batch aborts with the pool's own reason, so its subagent stops when the owner
+					// cancelled the pool and is cut off when the session's process went away.
+					for (const batch of this.batches) manager.cancel(batch.jobId, { ownerId: this.ownerId }, signal.reason);
 				};
 				if (signal.aborted) onAbort();
 				else signal.addEventListener("abort", onAbort, { once: true });
@@ -198,6 +210,7 @@ export class WorkPool {
 					manager.consumeJobResults(batchIds);
 					manager.unwatchJobs(batchIds);
 					this.closed = true;
+					this.#release();
 					const summary = `Pool \`${this.name}\` drained: ${this.items.length} item(s), ${this.batches.length} batch(es).`;
 					this.#card(signal.aborted ? "cancelled" : "completed", this.ownerId, summary);
 					return this.#renderAggregateResult();
@@ -208,7 +221,8 @@ export class WorkPool {
 			{ id: this.name, ownerId: this.ownerId, queued: true },
 		);
 		if (id !== this.name) {
-			manager.cancel(id, { ownerId: this.ownerId });
+			// A stop of a job no batch runs under yet.
+			manager.cancel(id, { ownerId: this.ownerId }, plainTurnAbortReason("stop"));
 			throw new ToolError(`workpool job id "${this.name}" is unavailable`);
 		}
 	}
@@ -416,6 +430,7 @@ export class WorkPool {
 							eventBus: this.session.eventBus,
 							subagentEventBus: this.session.subagentEventBus,
 							artifactsDir: this.session.getSessionFile()?.slice(0, -6),
+							storeMaskCwd: this.session.settings.getCwd(),
 							maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
 							completionProbe: isCompletionProbeEnabled(this.session.settings, this.session.taskDepth ?? 0),
 							...softRequestBudgetFor(this.policy.agent.name, this.session.settings),
@@ -592,9 +607,17 @@ export class WorkPool {
 		};
 	}
 
+	/** Run the creator's release exactly once, however the pool ended. */
+	#release(): void {
+		const release = this.#onRelease;
+		this.#onRelease = undefined;
+		release?.();
+	}
+
 	/** Stop accepting work and cancel items not yet assigned to a turn. */
 	close(): { dropped: string[] } {
 		this.closed = true;
+		this.#release();
 		const dropped: string[] = [];
 		for (const item of this.items) {
 			if (item.status !== "queued") continue;

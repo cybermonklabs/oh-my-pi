@@ -129,6 +129,7 @@ export function mergeRefreshedCredential<T extends OAuthCredential>(current: T, 
 		enterpriseUrl: refreshed.enterpriseUrl ?? current.enterpriseUrl,
 		apiEndpoint: refreshed.apiEndpoint ?? current.apiEndpoint,
 		...mergeRefreshedOrganizationScope(current, refreshed),
+		workspaceId: refreshed.workspaceId ?? current.workspaceId,
 		authorizedAt: refreshed.authorizedAt ?? current.authorizedAt,
 	};
 }

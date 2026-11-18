@@ -1491,6 +1491,9 @@ mod tests {
 	fn sums_a_directory_chain_deeper_than_the_stack() {
 		let dir = tempfile::tempdir().expect("tempdir");
 		let root = dir.path().canonicalize().expect("canonical");
+		// Removed before `dir` drops, whose `remove_dir_all` would hold one
+		// descriptor per level of the chain.
+		let _chain = crate::deep_tree::RemoveTree(root.join("deep"));
 		// Stay under the host's PATH_MAX: every level adds "/d".
 		#[cfg(unix)]
 		let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");

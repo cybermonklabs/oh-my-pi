@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 
 // Browser globals read inside page.evaluate callbacks; absent from bun-types.
 declare const devicePixelRatio: number;
@@ -35,18 +35,71 @@ const VISIBLE_BROWSER_AVAILABLE = process.env.OMP_TEST_VISIBLE_BROWSER === "1" &
 // One headless Chromium for the file, held for its whole run: every test opens and closes its own tabs, and none
 // changes the browser in a way another test reads.
 let sharedHeadless: PuppeteerBrowserHandle | undefined;
+/** How the shared Chromium ended and what it printed last, for the error of a test that loses it. */
+let describeSharedChromium = (): string => "";
 
-beforeAll(async () => {
-	if (!CHROMIUM_AVAILABLE) return;
+async function launchSharedHeadless(): Promise<void> {
 	const launched = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 	if (!("browser" in launched)) throw new Error("Expected a Puppeteer browser");
 	holdBrowser(launched);
 	sharedHeadless = launched;
+	const chromium = launched.browser.process();
+	let stderrTail = "";
+	chromium?.stderr?.on("data", (chunk: Buffer) => {
+		stderrTail = (stderrTail + chunk.toString()).slice(-4_000);
+	});
+	describeSharedChromium = () => {
+		const ended =
+			chromium?.exitCode != null || chromium?.signalCode != null
+				? `exited (code ${chromium.exitCode}, signal ${chromium.signalCode})`
+				: "was still running, so only its CDP connection dropped";
+		return `Chromium pid ${chromium?.pid} ${ended}. Its last stderr:\n${stderrTail || "(none)"}`;
+	};
+}
+
+beforeAll(async () => {
+	if (!CHROMIUM_AVAILABLE) return;
+	await launchSharedHeadless();
+});
+
+/** Replace a shared browser that is gone, so one test that lost it does not fail every test after it. */
+async function relaunchSharedHeadless(): Promise<void> {
+	const lost = sharedHeadless;
+	sharedHeadless = undefined;
+	if (lost) await releaseBrowser(lost, { kill: true }).catch(() => undefined);
+	await launchSharedHeadless();
+}
+
+beforeEach(async () => {
+	// When a test times out, the runner kills the child processes left running, the shared Chromium included.
+	if (sharedHeadless && !sharedHeadless.browser.connected) await relaunchSharedHeadless();
+});
+
+afterEach(async () => {
+	vi.useRealTimers();
+	if (!sharedHeadless || sharedHeadless.browser.connected) return;
+	// The test that lost the shared browser fails here; the tests after it start on a new one.
+	const lost = describeSharedChromium();
+	await relaunchSharedHeadless();
+	throw new Error(`The shared headless browser disconnected during this test. ${lost}`);
 });
 
 afterAll(async () => {
 	if (sharedHeadless) await releaseBrowser(sharedHeadless, { kill: true });
 });
+
+/**
+ * Each open, call and reattach these tests make carries a budget (`timeoutMs`) that the supervisor turns into
+ * phase deadlines on this thread's clock, such as a third of it for a new tab worker to start. Tests that drive
+ * the shared browser run this thread's clock fake and never move it, so a loaded host cannot spend a budget
+ * before the step under test: each step waits on the browser's and the tab worker's own events. Tab workers run
+ * on their own threads, on real clocks.
+ */
+function driveSupervisorClock(): void {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+}
 
 function headless(): PuppeteerBrowserHandle {
 	if (!sharedHeadless?.browser.connected) throw new Error("Expected the shared headless browser");
@@ -147,6 +200,7 @@ describe("browser tab worker startup", () => {
 });
 
 describe("OMP-owned browser evaluation", () => {
+	driveSupervisorClock();
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"adopts isolated element arguments into the main world without consuming caller handles",
 		async () => {
@@ -266,6 +320,7 @@ describe("OMP-owned browser evaluation", () => {
 });
 
 describe("OMP-owned browser input", () => {
+	driveSupervisorClock();
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"clicks background tabs through selector, observed handle, and raw Puppeteer actions",
 		async () => {
@@ -380,6 +435,7 @@ describe("visible OMP-owned browser tabs", () => {
 });
 
 describe("browser tabs whose renderer crashed", () => {
+	driveSupervisorClock();
 	const session = {
 		cwd: process.cwd(),
 		hasUI: false,
@@ -519,7 +575,10 @@ describe("browser tabs whose renderer crashed", () => {
 					(error: unknown) => error,
 				);
 				void client.send("Page.navigate", { url: "chrome://crash" }).catch(() => undefined);
-				expect(String(await failure)).toContain("the tab could not be reattached and was closed");
+				// The failure names why the tab was not reattached: the page crashed again as the new worker attached.
+				expect(String(await failure)).toContain(
+					"the tab could not be reattached and was closed (Browser tab's renderer crashed while the tab was starting)",
+				);
 				expect(getTab(name)).toBeUndefined();
 			} finally {
 				await releaseTab(name, { kill: true });
@@ -606,6 +665,9 @@ describe("browser tabs whose renderer crashed", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"leaves a tab closed while its crashed page is being reattached closed",
 		async () => {
+			// Adopting a connected browser's page polls its frames on this thread's clock: the clock is driven only
+			// from the crash on, which is where the reattach's budget starts.
+			vi.useRealTimers();
 			const launched = headless();
 			const name = `crashed-closed-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
@@ -618,16 +680,22 @@ describe("browser tabs whose renderer crashed", () => {
 					{ cwd: process.cwd() },
 				);
 				await acquireTab(name, connected, { target: url, timeoutMs: 30_000 });
+				vi.useFakeTimers();
 				const tab = getTab(name);
 				if (tab?.backend !== "worker") throw new Error("Expected a worker tab");
 				await crashRenderer(launched, url);
 				const crashedWorker = tab.worker;
 				const terminate = crashedWorker.terminate.bind(crashedWorker);
 				let released: Promise<boolean> | undefined;
-				// The reattach terminates the crashed page's worker before starting a new one: close the tab right then.
 				const terminateSpy = spyOn(crashedWorker, "terminate").mockImplementation(async () => {
+					// The close below terminates the worker too; that call only terminates.
+					if (released) return await terminate();
+					// The reattach terminates the crashed page's worker before starting a new one: close the tab right
+					// then, while that worker can still answer the close. A terminated worker cannot, and the release
+					// would wait out the supervisor's grace for its answer on the clock this test holds still.
+					released = releaseTab(name, { kill: false });
+					await released;
 					await terminate();
-					released ??= releaseTab(name, { kill: false });
 				});
 				try {
 					const outcome = await runInTab(name, { code: "return 1;", timeoutMs: 10_000, session }).catch(
@@ -663,13 +731,14 @@ describe("browser tabs whose renderer crashed", () => {
 				const terminate = crashedWorker.terminate.bind(crashedWorker);
 				let reopening = false;
 				// The reattach terminates the crashed page's worker first: close the tab (its page goes with it) and open
-				// a new one under the same name right then, so the reattach finds no page. The close terminates it again.
+				// a new one under the same name right then, so the reattach finds no page. The close comes first, while
+				// that worker can still answer it (as in the test above), and terminates the worker itself.
 				const terminateSpy = spyOn(crashedWorker, "terminate").mockImplementation(async () => {
-					await terminate();
-					if (reopening) return;
+					if (reopening) return await terminate();
 					reopening = true;
 					await releaseTab(name, { kill: true });
 					await acquireTab(name, browser, { url: `data:text/html,<title>${name}-new</title>`, timeoutMs: 30_000 });
+					await terminate();
 				});
 				try {
 					const outcome = await runInTab(name, { code: "return 1;", timeoutMs: 10_000, session }).catch(
@@ -791,6 +860,7 @@ describe("browser tabs whose renderer crashed", () => {
 });
 
 describe("closing an OMP-owned page", () => {
+	driveSupervisorClock();
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"closes the page by id when its worker reports closed without closing it",
 		async () => {

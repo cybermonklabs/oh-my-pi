@@ -1,5 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
 import type { FetchImpl } from "@oh-my-pi/pi-utils";
+import { readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
 import { collapseVariants, type VariantCollapseTable } from "../compat/collapse";
 import type { AntigravityModelWireProfile, ModelSpec } from "../types";
 import { discoveryFetch, toPositiveNumber } from "../utils";
@@ -330,7 +331,7 @@ async function fetchAntigravityDiscoveryResponse(
 
 		let payload: unknown;
 		try {
-			payload = await response.json();
+			payload = await readJsonInSlices(response);
 		} catch {
 			transientFailure = true;
 			continue;

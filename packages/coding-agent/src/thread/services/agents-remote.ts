@@ -15,7 +15,10 @@ import type { AgentAwaitsApi } from "../../registry/agent-awaits";
 import type {
 	AdoptOptions,
 	AgentLifecycleApi,
+	AgentLifecycleDisposeOptions,
 	AgentReleaseOptions,
+	ColdReviveOptions,
+	LiveAgentTarget,
 	PersistedSubagentReviverFactory,
 } from "../../registry/agent-lifecycle";
 import type {
@@ -151,6 +154,10 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 		return this.#remote.callSync("unregister", id, expected);
 	}
 
+	bindLiveName(name: string, targetId: string, sessionFile: string): boolean {
+		return this.#remote.callSync("bindLiveName", name, targetId, sessionFile);
+	}
+
 	get(id: string): AgentRef | undefined {
 		return this.#remote.callSync("get", id);
 	}
@@ -179,7 +186,7 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 	}
 }
 
-/** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and teardown are main-only. */
+/** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and the process exit's teardown are main-only. */
 export class RemoteAgentLifecycle implements AgentLifecycleApi {
 	readonly #remote: RemoteObject<AgentLifecycleProtocol>;
 
@@ -212,20 +219,37 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.callSync("isParking", id, expected);
 	}
 
+	isReleasing(id: string): boolean {
+		return this.#remote.callSync("isReleasing", id);
+	}
+
+	whenReleased(id: string): Promise<void> {
+		return this.#remote.call("whenReleased", id);
+	}
+
 	park(id: string): Promise<void> {
 		return this.#remote.call("park", id);
 	}
 
-	ensureLive(id: string): Promise<AgentSessionHandle> {
-		return this.#remote.call("ensureLive", id);
+	ensureLive(id: string, coldRevive?: ColdReviveOptions): Promise<AgentSessionHandle> {
+		return this.#remote.call("ensureLive", id, coldRevive);
+	}
+
+	ensureLiveTarget(id: string, coldRevive?: ColdReviveOptions): Promise<LiveAgentTarget> {
+		return this.#remote.call("ensureLiveTarget", id, coldRevive);
 	}
 
 	release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean> {
 		return this.#remote.call("release", id, expected, options);
 	}
 
-	dispose(_deadlineAt?: number): Promise<void> {
+	dispose(_options?: AgentLifecycleDisposeOptions): Promise<void> {
 		return Promise.reject(new Error("The agent lifecycle is torn down by the main thread"));
+	}
+
+	/** Main's lifecycle releases the agents under `ancestorId` (a helper session hosted here that ends). */
+	releaseUnder(ancestorId: string, options?: AgentLifecycleDisposeOptions): Promise<void> {
+		return this.#remote.call("releaseUnder", ancestorId, options);
 	}
 }
 

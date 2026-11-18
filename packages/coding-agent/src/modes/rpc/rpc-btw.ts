@@ -199,7 +199,7 @@ export class RpcBtwController {
 			// session's question must not keep streaming into this one's view.
 			this.cancel();
 		}
-		const store = await BtwHistoryStore.open(artifactsDir);
+		const store = await BtwHistoryStore.open(artifactsDir, { storeMask: () => manager.storeMask() });
 		// A concurrent open for the same session already replaced the cache: keep one store.
 		if (this.#storeKey === key && this.#store !== cached) return this.#store!;
 		this.#store = store;

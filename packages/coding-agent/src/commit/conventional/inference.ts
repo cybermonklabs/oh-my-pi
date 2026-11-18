@@ -1,6 +1,7 @@
-import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { agentPauseGate, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, ApiKey, AuthStorage, Model } from "@oh-my-pi/pi-ai";
 import { completeSimple } from "@oh-my-pi/pi-ai";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import { toError } from "@oh-my-pi/pi-utils";
 import { toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ResolvedCommitModel } from "../model-selection";
@@ -113,6 +114,11 @@ export class OmpCommitInference implements CommitInference {
 		let lastError: Error | undefined;
 		for (let attempt = 1; attempt <= Math.max(1, this.#config.maxRetries); attempt += 1) {
 			this.#signal?.throwIfAborted();
+			// Each attempt's 120 s budget bounds the model, not a human's `/pause`:
+			// wait a pause out before arming it. One engaged once it runs is held at
+			// the provider boundary and can still expire it; the attempt then
+			// fails as a timeout and the next one waits again.
+			await agentPauseGate.dispatchHold(this.#signal)();
 			let responseText = "";
 			try {
 				this.#onProgress?.(request.progressLabel);
@@ -130,10 +136,13 @@ export class OmpCommitInference implements CommitInference {
 						maxTokens: 16_384,
 						reasoning,
 						signal,
+						// Held at the provider boundary too; an open gate costs nothing,
+						// so the CLI path needs no branch of its own.
+						beforeDispatch: agentPauseGate.dispatchHold(signal),
 					},
 				);
 				responseText = extractTextContent(message);
-				if (message.stopReason === "error") throw new Error(message.errorMessage ?? "Provider error");
+				if (message.stopReason === "error") throw new Error(errorDisplayText(message) ?? "Provider error");
 				if (!responseText.trim()) throw new Error("Empty model response");
 				const raw = { text: responseText, stopReason: message.stopReason };
 				const parsed = parse(raw);

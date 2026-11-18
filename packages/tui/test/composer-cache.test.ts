@@ -157,6 +157,8 @@ describe("composer startup cache", () => {
 				PI_CODING_AGENT_DIR: undefined,
 				OMP_PROFILE: undefined,
 				PI_PROFILE: undefined,
+				// A test process never reads the home .env, so this child runs as production.
+				PI_TEST_RUNTIME: undefined,
 			},
 			stdout: "pipe",
 			stderr: "pipe",

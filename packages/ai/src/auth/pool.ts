@@ -5,7 +5,13 @@ import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-cred
 import type { BlockStoreHealth } from "./blocks";
 import type { AccountPolicies } from "./policy";
 import type { AuthCredentialStore } from "./store";
-import { REMOTE_REFRESH_SENTINEL } from "./types";
+import {
+	DEDUPLICATED_CAUSE_PREFIX,
+	DELETED_BY_USER,
+	isAutoDisabledCredential,
+	isUserRemovalCause,
+	REMOTE_REFRESH_SENTINEL,
+} from "./types";
 import type {
 	ApiKeyCredential,
 	AuthCredential,
@@ -431,7 +437,7 @@ export class CredentialPool implements CredentialsApi {
 		}
 		if (removed.length > 0) {
 			for (const entry of removed) {
-				await this.#store.deleteAuthCredential(entry.id, "deduplicated duplicate credential");
+				await this.#store.deleteAuthCredential(entry.id, `${DEDUPLICATED_CAUSE_PREFIX} duplicate credential`);
 			}
 			this.reset(provider);
 		}
@@ -632,23 +638,35 @@ export class CredentialPool implements CredentialsApi {
 	}
 
 	/**
-	 * Remove credential for a provider.
+	 * Remove credential for a provider. A remote store that could not record the
+	 * removal on a login a failure disabled throws after it removed the rest; the
+	 * provider's rows are dropped here either way.
 	 */
 	async remove(provider: string): Promise<void> {
-		await this.#store.deleteAuthCredentials(provider, "deleted by user");
-		this.replace(provider, []);
-		this.reset(provider);
+		try {
+			await this.#store.deleteAuthCredentials(provider, DELETED_BY_USER);
+		} finally {
+			this.replace(provider, []);
+			this.reset(provider);
+		}
 	}
 
 	/**
-	 * Remove one stored credential for a provider.
+	 * Remove one stored credential for a provider. A credential a failure already
+	 * disabled is removed too: its tombstone records the user's removal
+	 * ({@link isAutoDisabledCredential}), so a retry stops counting on it.
 	 */
 	async removeById(provider: string, credentialId: number): Promise<boolean> {
 		const entries = this.entries(provider);
 		const index = entries.findIndex(entry => entry.id === credentialId);
-		if (index === -1) return false;
+		if (index === -1) {
+			const tombstones = await this.listDisabled(provider);
+			const failed = tombstones.find(tombstone => tombstone.id === credentialId);
+			if (!failed || !isAutoDisabledCredential(failed)) return false;
+			return this.#store.deleteAuthCredential(credentialId, DELETED_BY_USER);
+		}
 		const remainingEntries = entries.filter((_entry, entryIndex) => entryIndex !== index);
-		const deleted = await this.#store.deleteAuthCredential(credentialId, "deleted by user");
+		const deleted = await this.#store.deleteAuthCredential(credentialId, DELETED_BY_USER);
 		if (!deleted) return false;
 		this.replace(provider, remainingEntries);
 		this.reset(provider);
@@ -760,6 +778,8 @@ export class CredentialPool implements CredentialsApi {
 	 * Disable the credential with the given id and emit a
 	 * {@link CredentialDisabledEvent}. Used by the auth-broker server to honour
 	 * `POST /v1/credential/:id/disable`. Returns `false` when no such row exists.
+	 * A user's removal of a login a failure already disabled records the removal
+	 * on its tombstone instead ({@link isAutoDisabledCredential}).
 	 */
 	async disable(id: number, disabledCause: string): Promise<boolean> {
 		for (const [provider, entries] of this.#data) {
@@ -772,7 +792,7 @@ export class CredentialPool implements CredentialsApi {
 			this.emitDisabled(credentialDisabledEvent(provider, entries[index]!, disabledCause));
 			return true;
 		}
-		return false;
+		return isUserRemovalCause(disabledCause) && (await this.#store.deleteAuthCredential(id, disabledCause));
 	}
 
 	/**

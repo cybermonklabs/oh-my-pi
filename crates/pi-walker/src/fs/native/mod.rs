@@ -26,6 +26,13 @@ pub(super) use unix::*;
 #[cfg(windows)]
 pub(super) use windows::*;
 
+/// Rewrites the open regular `file` in place with `contents`: truncated, then
+/// written from its start, as [`std::fs::write`] rewrites an existing file.
+fn rewrite(mut file: std::fs::File, contents: &[u8]) -> std::io::Result<()> {
+	file.set_len(0)?;
+	std::io::Write::write_all(&mut file, contents)
+}
+
 /// Views `buf` as at least `bytes` bytes of 8-aligned scratch, growing it on
 /// first use. Bulk listing syscalls need aligned buffers on some platforms.
 #[allow(dead_code, reason = "the portable Unix fallback lists through readdir")]

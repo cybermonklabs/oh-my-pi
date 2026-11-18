@@ -32,7 +32,7 @@ use parking_lot::RwLock;
 
 use super::is_separator;
 use crate::{
-	fs::{Dir, Listing, Session, Stamp},
+	fs::{Dir, FileType, Listing, Session, Stamp},
 	ignore::{DirIgnores, Names},
 };
 
@@ -131,13 +131,21 @@ impl Cache {
 	}
 
 	/// The cached listing of the directory at `abs` if it is still current,
-	/// revalidating its ignore sources when `with_ignores` is set. `scratch`
-	/// is per-worker path scratch.
+	/// revalidating its ignore sources when `with_ignores` is set. `follow`
+	/// is the walk's symlink policy. `abs` is stated through a final symlink
+	/// when `follow`, or when it is the walk's `root`, which is always
+	/// resolved through symlinks: a walk that does not follow symlinks gets
+	/// no listing for a directory below the root that is now a symlink. The
+	/// sources are stamped as [`DirIgnores::load`] reads them under `follow`
+	/// ([`source_stamp`]), the root's included. `scratch` is per-worker path
+	/// scratch.
 	pub(crate) async fn lookup(
 		&self,
 		session: &mut Session,
 		abs: &Path,
 		with_ignores: bool,
+		follow: bool,
+		root: bool,
 		scratch: &mut Vec<u8>,
 	) -> Option<Arc<CachedDir>> {
 		let key = abs.as_os_str().as_encoded_bytes();
@@ -149,7 +157,7 @@ impl Cache {
 		};
 		// A directory reached through a followed link is stored under the
 		// link's path with the target's stamp.
-		match session.stat(abs, true).await {
+		match session.stat(abs, follow || root).await {
 			Ok(info) if info.stamp == dir.stamp => {},
 			_ => {
 				self.drop_key(key);
@@ -170,14 +178,7 @@ impl Cache {
 						*byte = super::SEP;
 					}
 				}
-				// SAFETY: `scratch` joins an encoded path, an ASCII separator,
-				// and an ASCII name, which is valid encoded `OsStr` data.
-				let path = Path::new(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(scratch) });
-				let stamp = session
-					.stat(path, true)
-					.await
-					.map_or_default(|info| info.stamp);
-				if stamp != ignores.stamps[index] {
+				if source_stamp(session, scratch, start, follow).await != ignores.stamps[index] {
 					return None;
 				}
 			}
@@ -224,4 +225,35 @@ fn now_nanos() -> i64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.map_or(0, |elapsed| i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// The stamp [`DirIgnores::load`] records for the ignore source at `path`
+/// (the directory's path, then from `start` the source's): the source's own
+/// when it is a regular file the load opens, following a final symlink only
+/// when `follow`, and the default the load records for a source it does not
+/// read otherwise. A directory on the way (`.git`, `info`) must be a
+/// directory and no symlink, since the load opens it as a child directory
+/// whatever `follow` says.
+async fn source_stamp(session: &mut Session, path: &[u8], start: usize, follow: bool) -> Stamp {
+	for at in start..path.len() {
+		if is_separator(path[at])
+			&& !matches!(
+				session.stat(as_path(&path[..at]), false).await,
+				Ok(info) if info.file_type == Some(FileType::Dir)
+			) {
+			return Stamp::default();
+		}
+	}
+	match session.stat(as_path(path), follow).await {
+		Ok(info) if info.file_type == Some(FileType::File) => info.stamp,
+		_ => Stamp::default(),
+	}
+}
+
+/// `bytes` as a path.
+fn as_path(bytes: &[u8]) -> &Path {
+	// SAFETY: callers pass the source path `lookup` joins (an encoded path,
+	// ASCII separators, and an ASCII name), whole or cut before one of its
+	// ASCII separators, which is valid encoded `OsStr` data.
+	Path::new(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(bytes) })
 }

@@ -3,7 +3,7 @@ import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, agentHasAncestor, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "./agent-session-events";
 import { escapeHarnessTags } from "./harness-tags";
 import type { CustomMessage } from "./messages";
@@ -18,6 +18,14 @@ export interface IrcBridgeHost {
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	wakeForIrc(records: AgentMessage[]): void;
+}
+
+/** Every IRC record queued at one moment: what `IrcBridge.clearPending` discards and
+ *  `IrcBridge.restorePending` puts back when a session transition rolls back. */
+export interface IrcPendingSnapshot {
+	interrupts: AgentMessage[];
+	asides: AgentMessage[];
+	deferredWakes: AgentMessage[];
 }
 
 /** Owns incoming IRC queues and the session's non-interrupting aside queue. */
@@ -69,6 +77,11 @@ export class IrcBridge {
 	/** Whether any undelivered IRC record remains queued. */
 	hasPending(): boolean {
 		return this.#interrupts.length > 0 || this.#asides.length > 0 || this.#deferredWakes.length > 0;
+	}
+
+	/** Whether any undelivered IRC record (interrupt, aside or parked wake) satisfies `predicate`. */
+	somePending(predicate: (record: AgentMessage) => boolean): boolean {
+		return this.#interrupts.some(predicate) || this.#asides.some(predicate) || this.#deferredWakes.some(predicate);
 	}
 
 	/** Whether an IRC message from `from` is still queued for a turn yet to run. */
@@ -133,7 +146,7 @@ export class IrcBridge {
 	 *  contract clear could wake the new transcript with a peer message belonging to the
 	 *  previous session. Pass the snapshot to `restorePending` to undo the clear
 	 *  if the transition is rolled back. */
-	clearPending(): { interrupts: AgentMessage[]; asides: AgentMessage[]; deferredWakes: AgentMessage[] } {
+	clearPending(): IrcPendingSnapshot {
 		const snapshot = { interrupts: this.#interrupts, asides: this.#asides, deferredWakes: this.#deferredWakes };
 		this.#interrupts = [];
 		this.#asides = [];
@@ -146,11 +159,7 @@ export class IrcBridge {
 	 *  the rolled-back switch's async load/hooks were still running) instead of overwriting it, so
 	 *  those newly arrived records aren't silently discarded — snapshot records precede them since
 	 *  they arrived first. */
-	restorePending(snapshot: {
-		interrupts: AgentMessage[];
-		asides: AgentMessage[];
-		deferredWakes: AgentMessage[];
-	}): void {
+	restorePending(snapshot: IrcPendingSnapshot): void {
 		this.#interrupts = [...snapshot.interrupts, ...this.#interrupts];
 		this.#asides = [...snapshot.asides, ...this.#asides];
 		this.#deferredWakes = [...snapshot.deferredWakes, ...this.#deferredWakes];
@@ -238,22 +247,10 @@ export class IrcBridge {
 		const parentId = registry.get(msg.to)?.parentId;
 		const fromParent = parentId === msg.from;
 		// A subagent's result answers its parent, and its run may be waiting on its
-		// own descendants, whose questions it must see in-run. Anyone else's
-		// message, or a broadcast leg (which asks no one in particular), gets a
-		// turn of its own.
-		let fromDescendant = false;
-		const seen = new Set<string>();
-		for (
-			let id = registry.get(msg.from)?.parentId;
-			id !== undefined && !seen.has(id);
-			id = registry.get(id)?.parentId
-		) {
-			if (id === msg.to) {
-				fromDescendant = true;
-				break;
-			}
-			seen.add(id);
-		}
+		// own descendants, whose questions it must see in-run, also one under a
+		// subagent that has ended since. Anyone else's message, or a broadcast leg
+		// (which asks no one in particular), gets a turn of its own.
+		const fromDescendant = agentHasAncestor(registry, registry.get(msg.from), msg.to);
 		const peerMessage = parentId !== undefined && (msg.broadcast === true || (!fromParent && !fromDescendant));
 		// An idle subagent runs a monitored wake turn whose output is relayed
 		// back to the sender (task executor `relayWakeTurnOutput`); the main
