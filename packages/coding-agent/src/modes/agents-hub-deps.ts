@@ -183,8 +183,7 @@ export function createAgentsHubDeps(
 				return raw;
 			} finally {
 				unsubscribe();
-				// The host session goes on: this helper's end stops the own jobs of the idle agents
-				// its lifecycle teardown releases, instead of cutting them off as an exit does.
+				// The host session goes on ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 				await session.dispose({ ownedJobsEnd: "stop" });
 			}
 		},

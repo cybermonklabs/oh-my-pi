@@ -5579,9 +5579,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							scopedAsyncJobManager,
 							"stop",
 						);
-						// Every adopted agent's own jobs end as this dispose ends the session's own: cut off
-						// at the process exit, stopped by a dispose that says so while the process goes on.
-						await AgentLifecycleManager.global().dispose(undefined, disposeOptions?.ownedJobsEnd);
+						// Adopted agents end as this dispose says ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
+						await AgentLifecycleManager.global().dispose({ ownedJobsEnd: disposeOptions?.ownedJobsEnd });
 					}
 					await originalDispose(disposeOptions);
 				} finally {
@@ -5969,8 +5968,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	} catch (error) {
 		try {
 			if (hasSession) {
-				// A session that failed to start is no process exit: the process may serve other
-				// sessions, whose adopted agents a top-level dispose's lifecycle teardown releases.
+				// A failed start ends the session, not the process ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 				await session.dispose({ ownedJobsEnd: "stop" });
 				if (hasRegistered) unregisterUnlessParked();
 			} else {

@@ -146,6 +146,17 @@ export interface AgentReleaseOptions {
 	dispose?: AgentSessionDisposeOptions;
 }
 
+/** How {@link AgentLifecycleApi.dispose} tears every adopted agent down. */
+export interface AgentLifecycleDisposeOptions {
+	/** When the teardown stops waiting for a release; later ones go on as late cleanup. */
+	deadlineAt?: number;
+	/**
+	 * How each agent's turn and own jobs end: cut off by default (the process exit), stopped
+	 * when the process goes on ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
+	 */
+	ownedJobsEnd?: OwnedJobsEnd;
+}
+
 /** Public surface of the process-global agent lifecycle, implemented locally on main and by a proxy in workers. */
 export interface AgentLifecycleApi {
 	/** Install the factory used to cold-revive `parked` refs restored from disk. */
@@ -166,11 +177,8 @@ export interface AgentLifecycleApi {
 	ensureLive(id: string): Promise<AgentSessionHandle>;
 	/** Dispose if live and drop timers; `tombstone` keeps a terminal `aborted` row. */
 	release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean>;
-	/**
-	 * Tear down every adopted agent. `ownedJobsEnd` says how the own jobs of an idle agent end:
-	 * cut off by default (the process exit), stopped when the process goes on.
-	 */
-	dispose(deadlineAt?: number, ownedJobsEnd?: OwnedJobsEnd): Promise<void>;
+	/** Tear down every adopted agent, as `options` says. */
+	dispose(options?: AgentLifecycleDisposeOptions): Promise<void>;
 }
 
 export class AgentLifecycleManager implements AgentLifecycleApi {
@@ -708,25 +716,25 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 
 	/**
 	 * Teardown everything; disposing the global manager makes its next owner a fresh instance.
-	 * `ownedJobsEnd` says how the own jobs of each idle agent end: cut off at the process exit,
+	 * `ownedJobsEnd` says how each agent's turn and own jobs end: cut off at the process exit,
 	 * the default; stopped when the process goes on (a top-level session that ends while the
 	 * process serves others), as a park stops them.
 	 */
-	async dispose(
-		deadlineAt: number = Date.now() + AGENT_RELEASE_GRACE_MS,
-		ownedJobsEnd: OwnedJobsEnd = "shutdown",
-	): Promise<void> {
+	async dispose(options: AgentLifecycleDisposeOptions = {}): Promise<void> {
+		const deadlineAt = options.deadlineAt ?? Date.now() + AGENT_RELEASE_GRACE_MS;
+		const ownedJobsEnd = options.ownedJobsEnd ?? "shutdown";
 		this.#unsubscribe?.();
 		this.#disposed = true;
 		this.#unsubscribe = undefined;
 		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
-		// At the process exit, the subagents of an idle agent's own jobs are parked, not
-		// stopped, so `omp --restore` goes on with them. A turn still running (a revived or
-		// woken agent) is cut off either way, not stopped: its session records a process
-		// exit, so `omp --restore` goes on with it. An idle agent's `session_exit` record
-		// stays a plain dispose.
+		// At the process exit, the subagents of an agent's own jobs are parked, not stopped, so
+		// `omp --restore` goes on with them. A turn still running (a revived or woken agent) is
+		// cut off too: its session records a process exit, so `omp --restore` goes on with it. An
+		// idle agent's `session_exit` record stays a plain dispose. A stop ends a running agent as
+		// it ends an idle one: its turn and its own jobs stop, and no process exit is recorded.
 		const idle: AgentReleaseOptions = { dispose: { ownedJobsEnd } };
-		const running: AgentReleaseOptions = { dispose: { reason: postmortem.Reason.EXIT, ownedJobsEnd: "shutdown" } };
+		const running: AgentReleaseOptions =
+			ownedJobsEnd === "stop" ? idle : { dispose: { reason: postmortem.Reason.EXIT, ownedJobsEnd } };
 		await Promise.all(
 			ids.map(async id => {
 				const options = this.#registry.get(id)?.status === "running" ? running : idle;

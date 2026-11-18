@@ -65,8 +65,7 @@ function formatWorkspaceDirectories(runtime: SlashCommandRuntime, note?: string)
 }
 async function fatalMoveFailure(text: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	await runtime.output(text);
-	// A failed move ends the session, not the process: its end stops its own jobs, and those of
-	// the idle agents its lifecycle teardown releases, instead of cutting them off as an exit does.
+	// A failed move ends the session, not the process ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 	await runtime.session.dispose({ ownedJobsEnd: "stop" });
 	return commandConsumed();
 }

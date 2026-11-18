@@ -719,8 +719,7 @@ export class SecurityCoordinator {
 			this.#update(record, cancelled ? "cancelled" : "failed", message);
 			await store.putBundle(terminal);
 		} finally {
-			// The host session goes on: the scan session's end stops its own jobs, and those of the
-			// idle agents its lifecycle teardown releases, instead of cutting them off as an exit does.
+			// The host session goes on ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 			await session?.dispose({ ownedJobsEnd: "stop" }).catch(() => undefined);
 			await executionTarget?.cleanup().catch(() => undefined);
 			ACTIVE_SECURITY_OPERATIONS.delete(record.snapshot.operationId);

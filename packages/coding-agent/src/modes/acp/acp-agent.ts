@@ -148,12 +148,7 @@ const ACP_CANCEL_CLEANUP_TIMEOUT_MS = PYTHON_KERNEL_CANCEL_BUDGET_MS + 1_000;
 const ACP_ASYNC_DELIVERY_DRAIN_TIMEOUT_MS = 250;
 const ACP_ASYNC_DELIVERY_DRAIN_MAX_PASSES = 3;
 
-/**
- * Dispose of a session the server drops while it goes on serving others (a close, or a
- * session that failed to open): it stops the session's own jobs, and those of the idle
- * agents its lifecycle teardown releases, rather than cutting them off as the server's
- * exit does.
- */
+/** Dispose of a session the server drops while it serves others ({@link AgentSessionDisposeOptions.ownedJobsEnd}). */
 const ACP_SESSION_DROP_DISPOSE: AgentSessionDisposeOptions = { ownedJobsEnd: "stop" };
 
 /**

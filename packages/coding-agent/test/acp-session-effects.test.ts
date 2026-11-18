@@ -42,6 +42,41 @@ afterAll(() => {
 	authStorage.close();
 });
 
+/**
+ * `omp acp`'s session factory over the isolated launch settings of `dir`, which is also the
+ * agent and session directory, and the cleanup its persisted settings and agent storage need.
+ */
+async function isolatedAcpFactory(dir: TempDir) {
+	const launchSettings = await Settings.loadIsolated({ cwd: dir.path(), agentDir: dir.join("agent") });
+	const factory = createAcpSessionFactory({
+		baseOptions: {
+			agentDir: dir.join("agent"),
+			model,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			rules: [],
+			enableLsp: false,
+			skipPythonPreflight: true,
+		},
+		settings: launchSettings,
+		sessionDir: dir.join("sessions"),
+		authStorage,
+		modelRegistry,
+		parsedArgs: { invalidFlagValues: [] },
+		rawArgs: [],
+		createSession: createAgentSession,
+	});
+	const cleanup = () => {
+		launchSettings.cancelPendingSaves();
+		// The persisted instance opened agent storage under the temp dir removed below.
+		AgentStorage.close();
+	};
+	return { launchSettings, factory, cleanup };
+}
+
 // An ACP client keeps several `session/new` sessions alive at once, each possibly for a
 // different workspace. Each session's outbound requests must be credential-redacted per its
 // own project's `secrets.enabled`, whichever session currently holds process-wide effects.
@@ -67,33 +102,9 @@ describe("concurrent ACP sessions", () => {
 		});
 		const credentialSentBy = (marker: string) =>
 			requests.find(request => request.context.includes(marker))?.credential;
-		const launchSettings = await Settings.loadIsolated({
-			cwd: launchDir.path(),
-			agentDir: launchDir.join("agent"),
-		});
+		const { launchSettings, factory, cleanup } = await isolatedAcpFactory(launchDir);
 		// `omp acp` binds its launch settings the way `Settings.init` does.
 		const releaseLaunch = bindEffects(launchSettings);
-		const factory = createAcpSessionFactory({
-			baseOptions: {
-				agentDir: launchDir.join("agent"),
-				model,
-				disableExtensionDiscovery: true,
-				skills: [],
-				contextFiles: [],
-				promptTemplates: [],
-				slashCommands: [],
-				rules: [],
-				enableLsp: false,
-				skipPythonPreflight: true,
-			},
-			settings: launchSettings,
-			sessionDir: launchDir.join("sessions"),
-			authStorage,
-			modelRegistry,
-			parsedArgs: { invalidFlagValues: [] },
-			rawArgs: [],
-			createSession: createAgentSession,
-		});
 		const sessions: AgentSession[] = [];
 		try {
 			const redacting = (await factory(projectDir.path())).session;
@@ -119,9 +130,7 @@ describe("concurrent ACP sessions", () => {
 				if (!session.isDisposed) await session.dispose();
 			}
 			releaseLaunch();
-			launchSettings.cancelPendingSaves();
-			// The persisted instance opened agent storage under the temp dir removed below.
-			AgentStorage.close();
+			cleanup();
 		}
 	});
 });
@@ -170,28 +179,7 @@ describe("an ACP session/close", () => {
 		// the server's exit does: the task executor reads it as a process exit, records one for the job's subagent that
 		// did not happen, and `omp --restore` relaunches its turn.
 		using dir = TempDir.createSync("@pi-acp-session-close-");
-		const launchSettings = await Settings.loadIsolated({ cwd: dir.path(), agentDir: dir.join("agent") });
-		const factory = createAcpSessionFactory({
-			baseOptions: {
-				agentDir: dir.join("agent"),
-				model,
-				disableExtensionDiscovery: true,
-				skills: [],
-				contextFiles: [],
-				promptTemplates: [],
-				slashCommands: [],
-				rules: [],
-				enableLsp: false,
-				skipPythonPreflight: true,
-			},
-			settings: launchSettings,
-			sessionDir: dir.join("sessions"),
-			authStorage,
-			modelRegistry,
-			parsedArgs: { invalidFlagValues: [] },
-			rawArgs: [],
-			createSession: createAgentSession,
-		});
+		const { factory, cleanup } = await isolatedAcpFactory(dir);
 		const sessions: AgentSession[] = [];
 		const connection = {
 			sessionUpdate: async () => {},
@@ -240,9 +228,7 @@ describe("an ACP session/close", () => {
 			expect(turnAbortKind(reason)).toBe("stop");
 		} finally {
 			await acp.dispose();
-			launchSettings.cancelPendingSaves();
-			// The persisted instance opened agent storage under the temp dir removed below.
-			AgentStorage.close();
+			cleanup();
 		}
 	});
 });

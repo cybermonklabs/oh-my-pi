@@ -6687,8 +6687,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// The kind of the session's end reaches the subagents of its jobs (eval `agent()`
 		// handles, workpool batches; {@link turnAbortKind}): the dispose says it
 		// ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
-		this.#cancelOwnAsyncJobs(ownedJobsAbortReason(ownedJobsEnd));
+		const reason = ownedJobsAbortReason(ownedJobsEnd);
+		this.#cancelOwnAsyncJobs(reason);
 		if (!manager) return;
+		// A stop ends every job still running on the manager this session owns, its subagents'
+		// own jobs too: the manager's dispose would cut them off with its shutdown reason before
+		// each subagent's own stop reaches them.
+		if (ownedJobsEnd === "stop") manager.cancelAll(undefined, reason);
 
 		try {
 			const drained = await manager.dispose({ timeoutMs: 3_000 });
@@ -6824,15 +6829,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		// Stop fallback extension timers before aborting deferred work they could enqueue.
 		this.#fallbackExtensionTimers?.clearAll();
-		// Disposal cuts a turn waiting to retry off rather than stopping it, so `omp --restore` can go on with it.
-		this.#recovery.abortRetry({ cutOff: true });
+		// A dispose that says `"stop"` stops the turn, also one waiting to retry, so `omp --restore`
+		// leaves it ({@link AgentSessionDisposeOptions.ownedJobsEnd}). Any other dispose cuts it off,
+		// so `omp --restore` goes on with it: a turn waiting to retry keeps its failed attempt, and a
+		// process exit labels a turn still in flight as interrupted. The reason says the kind to a
+		// sync subagent of the turn or of a continuation already running.
+		const stop = options.ownedJobsEnd === "stop";
+		this.#recovery.abortRetry({ cutOff: !stop });
 		this.abortCompaction();
-		// A process exit cuts a turn still in flight off instead of stopping it:
-		// label it as interrupted so `omp --restore` goes on with it. Any other
-		// disposal cuts the turn off too; its plain reason says so to a sync subagent,
-		// of the turn or of a continuation already running.
-		const processExit = options.reason === postmortem.Reason.EXIT;
-		const abortReason = processExit ? INTERRUPTED_TURN_ERROR : plainTurnAbortReason("cutOff");
+		const abortReason = stop
+			? plainTurnAbortReason("stop")
+			: options.reason === postmortem.Reason.EXIT
+				? INTERRUPTED_TURN_ERROR
+				: plainTurnAbortReason("cutOff");
 		const postPromptDrain = this.#cancelPostPromptTasks(abortReason);
 		this.agent.abort(abortReason);
 		try {

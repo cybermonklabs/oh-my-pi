@@ -15,6 +15,7 @@ import type { AgentAwaitsApi } from "../../registry/agent-awaits";
 import type {
 	AdoptOptions,
 	AgentLifecycleApi,
+	AgentLifecycleDisposeOptions,
 	AgentReleaseOptions,
 	PersistedSubagentReviverFactory,
 } from "../../registry/agent-lifecycle";
@@ -224,7 +225,7 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.call("release", id, expected, options);
 	}
 
-	dispose(_deadlineAt?: number): Promise<void> {
+	dispose(_options?: AgentLifecycleDisposeOptions): Promise<void> {
 		return Promise.reject(new Error("The agent lifecycle is torn down by the main thread"));
 	}
 }

@@ -146,7 +146,7 @@ describe("isolated agent release", () => {
 				await fs.rm(sandbox, { recursive: true });
 			},
 			afterRun: async () => {
-				await AgentLifecycleManager.global().dispose(Date.now());
+				await AgentLifecycleManager.global().dispose({ deadlineAt: Date.now() });
 				expect(
 					await fs.stat(sandbox).then(
 						() => true,

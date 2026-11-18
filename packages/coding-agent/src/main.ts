@@ -627,8 +627,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			args.rawArgs,
 		);
 		const effectiveArgs = reparsedArgs ?? args.parsedArgs;
-		// The ACP server goes on serving its other sessions: a rejected session's dispose stops,
-		// rather than cuts off, the own jobs of the idle agents its lifecycle teardown releases.
+		// The ACP server goes on serving its other sessions ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 		if (effectiveArgs.invalidFlagValues.length > 0) {
 			await nextSession.dispose({ ownedJobsEnd: "stop" });
 			throw new CliUsageError(effectiveArgs.invalidFlagValues.join("\n"));

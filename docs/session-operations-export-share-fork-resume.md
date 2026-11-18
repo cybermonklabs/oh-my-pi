@@ -487,7 +487,9 @@ A subagent whose turn the process teardown cut off counts as left mid-turn, even
 though the teardown was clean: its owner's shutdown aborts the run with
 `INTERRUPTED_TURN_ERROR` and records its `session_exit` as a process exit
 (`postmortem.Reason.EXIT`), both for a first run the task executor drives and for
-a revived agent's turn the lifecycle teardown disposes.
+a revived agent's turn the lifecycle teardown disposes. A top-level session that
+ends while the process goes on stops a revived agent's turn instead: no process
+exit is recorded, and `--restore` leaves it.
 
 1. **Subagents first.** Every persisted subagent transcript under the session
    (`<session>/<AgentId>.jsonl`, nested ones included) that its process left
@@ -549,7 +551,9 @@ result:
   (Esc, or an RPC `abort` or `abort_retry`), or the task executor ending a
   subagent's run (its request budget, its time limit, or a `yield` that waits on
   its jobs), whose parent gets the aborted result. The owner's cancel of a
-  background job stops the subagent the job runs.
+  background job stops the subagent the job runs. A dispose while the process goes
+  on stops it too: a kill, a park, or a top-level session's end with the subagents
+  its teardown releases.
 - A process exit or shutdown cuts the turn off instead, and `--restore` goes on
   with it: the session's dispose (a quit, a signal, `/restart`), an abort with
   `cutOff` or with `INTERRUPTED_TURN_ERROR` (the reason a shutdown gives), and the
@@ -566,9 +570,10 @@ result:
   wake turn of an idle subagent started). Only the process exit cuts them off: a
   top-level session that ends while the process goes on (an ACP session's close,
   the end of a `/security` scan or another helper session, a headless session that
-  a failed `/move` ends) stops them instead, and its own background jobs too, so no
-  process exit is recorded for their subagents and `--restore` does not relaunch
-  them. A vibe worker's turn and its own jobs stop at its parent's teardown and at a
+  a failed `/move` ends) stops them instead, and a turn such a subagent still runs,
+  its own background jobs and their subagents' jobs too, so no process exit is
+  recorded for their subagents and `--restore` does not relaunch them. A vibe
+  worker's turn and its own jobs stop at its parent's teardown and at a
   switch of the parent session, so `--restore` does not relaunch a vibe turn. A
   `/tan` clone's own jobs follow its background job: a cancel of the job, or the
   tan's finish, stops them, and the parent's process exit cuts them off.

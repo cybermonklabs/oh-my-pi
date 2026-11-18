@@ -79,7 +79,8 @@ function readPendingToolCalls(value: unknown): PendingToolCallDiagnostic[] | und
 	return value;
 }
 
-function readSessionExit(entry: SessionEntry): SessionExitData | undefined {
+/** The `session_exit` record `entry` carries, or undefined when it is none or malformed. */
+export function readSessionExit(entry: SessionEntry): SessionExitData | undefined {
 	if (entry.type !== "custom" || entry.customType !== SESSION_EXIT_CUSTOM_TYPE || !isObject(entry.data)) {
 		return undefined;
 	}

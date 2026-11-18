@@ -5,9 +5,10 @@
  * leaves it; `--restore` leaves every subagent under a subagent that was killed or whose
  * last turn a stop ended, even one that a cancel giving no reason cut off; and the parent's
  * process exit still leaves the whole chain for `--restore`, also when the subagent that
- * owns the job is idle, while the parent's end with the process going on stops it. A
- * subagent's dispose stops the jobs it owns only when it says so (a kill, a park); any
- * other dispose cuts them off.
+ * owns the job is idle, while the parent's end with the process going on stops it, and a
+ * turn of the subagent that owns the job, whether that subagent is idle, mid-turn, run by a
+ * background job or a sync subagent of the parent's turn. A subagent's dispose stops the
+ * jobs it owns only when it says so (a kill, a park); any other dispose cuts them off.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -38,6 +39,7 @@ import {
 	createTurnAbortRecord,
 	hasRestorableTurn,
 	INTERRUPTED_TURN_ERROR,
+	readSessionExit,
 	SESSION_EXIT_CUSTOM_TYPE,
 	turnAbortKind,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
@@ -147,6 +149,14 @@ const READER_CELL = {
 	},
 };
 
+/** A planner's `eval` call that does nothing, so its turn goes on to another request. */
+const NOOP_CELL = {
+	type: "toolCall" as const,
+	id: "call_noop",
+	name: "eval",
+	arguments: { language: "js", code: 'print("reading");', timeout: 0 },
+};
+
 function oauthLogin(account: string) {
 	return {
 		type: "oauth" as const,
@@ -176,17 +186,23 @@ function holdBackoff(expected: number) {
 
 /**
  * A parent session on the production SDK path whose model spawns `PLANNER` as a sync task
- * subagent. The planner's model runs `READER_CELL`, which starts a `READER` as a background
- * job the planner owns, then holds its next request until something ends the planner's run.
+ * subagent, or with `plannerInBackground` as a background job. The planner's model runs
+ * `READER_CELL`, which starts a `READER` as a background job the planner owns, then holds its
+ * next request until something ends the planner's run.
  * With `readerOnWake`, the planner's run instead answers at once, so the planner stays
  * adopted and idle; the turn a `WAKE_MESSAGE` wakes it for runs `READER_CELL` and then
  * answers (`wakeTurnAnswered`), which leaves the planner idle again while the reader runs.
+ * With `plannerWaitsOnKey`, the planner's model shares the reader's login, and once the reader
+ * disabled it, the planner's next request after `READER_CELL` (in its run, or with
+ * `readerOnWake` in its wake turn) has no key and waits out a retry backoff.
  * The reader's model is on anthropic, keyed by the store's only OAuth login; its first
  * request disables that login, as a failed refresh does, so its next request has no key and
  * its turn waits out a retry backoff. `roster` is the RPC host's view of the subagents, and
  * every subagent run's result is collected in `runs`.
  */
-async function openParentWithPlanner(options: { readerOnWake?: boolean } = {}) {
+async function openParentWithPlanner(
+	options: { readerOnWake?: boolean; plannerWaitsOnKey?: boolean; plannerInBackground?: boolean } = {},
+) {
 	const cwd = root.join("home", "work");
 	await Bun.write(path.join(cwd, NOTES_FILE), "the notes\n");
 	const authStorage = await AuthStorage.create(root.join("parentauth.db"), { usageProviderResolver: () => undefined });
@@ -216,9 +232,11 @@ async function openParentWithPlanner(options: { readerOnWake?: boolean } = {}) {
 	});
 	const plannerHolds = Promise.withResolvers<void>();
 	const wakeTurnAnswered = Promise.withResolvers<void>();
+	const loginDisabled = Promise.withResolvers<void>();
 	const plannerModel = createMockModel({
+		provider: options.plannerWaitsOnKey ? "anthropic" : undefined,
 		id: "planner-model",
-		handler: context => {
+		handler: async context => {
 			if (!(context.tools ?? []).some(tool => tool.name === "eval")) return { content: ["label"] };
 			if (
 				options.readerOnWake &&
@@ -228,6 +246,11 @@ async function openParentWithPlanner(options: { readerOnWake?: boolean } = {}) {
 			}
 			if (!context.messages.some(message => message.role === "toolResult")) {
 				return { content: [READER_CELL], stopReason: "toolUse" };
+			}
+			if (options.plannerWaitsOnKey) {
+				// Once the reader disabled the login, the planner's next request has no key.
+				await loginDisabled.promise;
+				return { content: [NOOP_CELL], stopReason: "toolUse" };
 			}
 			if (options.readerOnWake) {
 				wakeTurnAnswered.resolve();
@@ -247,6 +270,7 @@ async function openParentWithPlanner(options: { readerOnWake?: boolean } = {}) {
 				for (const account of authStorage.oauth.accounts("anthropic")) {
 					await authStorage.credentials.disable(account.credentialId, LOGIN_DISABLED_CAUSE);
 				}
+				loginDisabled.resolve();
 				return {
 					content: [{ type: "toolCall", id: "call_read", name: "read", arguments: { path: NOTES_FILE } }],
 					stopReason: "toolUse",
@@ -257,7 +281,10 @@ async function openParentWithPlanner(options: { readerOnWake?: boolean } = {}) {
 	});
 	// Only the scripted models are available, so no label or title request leaves the process.
 	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(() => [parentModel, plannerModel, readerModel]);
-	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [PLANNER, READER], projectAgentsDir: null });
+	const planner: AgentDefinition = options.plannerWaitsOnKey
+		? { ...PLANNER, model: [`anthropic/${plannerModel.id}`] }
+		: PLANNER;
+	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [planner, READER], projectAgentsDir: null });
 	const runSubprocess = executorModule.runSubprocess;
 	const runs: Promise<SingleResult>[] = [];
 	vi.spyOn(executorModule, "runSubprocess").mockImplementation(options => {
@@ -277,7 +304,7 @@ async function openParentWithPlanner(options: { readerOnWake?: boolean } = {}) {
 		sessionManager: SessionManager.create(cwd, root.join("parent-sessions")),
 		subagentEventBus,
 		settings: Settings.isolated({
-			"async.enabled": false,
+			"async.enabled": options.plannerInBackground === true,
 			"task.batch": false,
 			"task.enableLsp": false,
 			"task.completionProbe": false,
@@ -524,27 +551,24 @@ function untilStatus(id: string, status: AgentStatus): Promise<void> {
 
 /** Whether a subagent's transcript records a process exit (a `session_exit` record of that kind). */
 function recordsProcessExit(sub: SubSession): boolean {
-	return sub.entries.some(
-		entry =>
-			entry.type === "custom" &&
-			entry.customType === SESSION_EXIT_CUSTOM_TYPE &&
-			typeof entry.data === "object" &&
-			entry.data !== null &&
-			"kind" in entry.data &&
-			entry.data.kind === "process_exit",
-	);
+	return sub.entries.some(entry => readSessionExit(entry)?.kind === "process_exit");
 }
 
 /**
  * Opens the parent with a planner whose run answers at once, so the planner stays adopted and
  * idle, then has the parent message it, as `write agent://<id>` does: a turn of the planner
  * its run did not drive starts the reader, then ends with the reader's job still running while
- * the reader waits out its key backoff. Returns the planner's and the reader's agent ids.
+ * the reader waits out its key backoff. With `wakeTurnWaitsOnKey`, that turn instead goes on to
+ * wait out a key backoff of its own, so the planner is still running. Returns the planner's and
+ * the reader's agent ids.
  */
-async function openIdlePlannerOwningWaitingReader() {
+async function openWokenPlannerOwningWaitingReader(options: { wakeTurnWaitsOnKey?: boolean } = {}) {
 	IrcBus.resetGlobalForTests();
 	cleanups.push(() => IrcBus.resetGlobalForTests());
-	const { parent, runs, wakeTurnAnswered } = await openParentWithPlanner({ readerOnWake: true });
+	const { parent, runs, wakeTurnAnswered } = await openParentWithPlanner({
+		readerOnWake: true,
+		plannerWaitsOnKey: options.wakeTurnWaitsOnKey,
+	});
 	await parent.prompt("Have the notes read.");
 	const plannerId = AgentRegistry.global()
 		.list()
@@ -553,11 +577,16 @@ async function openIdlePlannerOwningWaitingReader() {
 	expect(AgentRegistry.global().get(plannerId)?.status).toBe("idle");
 	expect(AgentLifecycleManager.global().has(plannerId)).toBe(true);
 
-	const backoff = holdBackoff(1);
+	const backoff = holdBackoff(options.wakeTurnWaitsOnKey ? 2 : 1);
 	const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: plannerId, body: WAKE_MESSAGE });
 	expect(receipt.outcome).toBe("woken");
-	await Promise.all([wakeTurnAnswered, backoff.allHeld]);
-	await untilStatus(plannerId, "idle");
+	if (options.wakeTurnWaitsOnKey) {
+		await backoff.allHeld;
+		expect(AgentRegistry.global().get(plannerId)?.status).toBe("running");
+	} else {
+		await Promise.all([wakeTurnAnswered, backoff.allHeld]);
+		await untilStatus(plannerId, "idle");
+	}
 	const readerJobs = parent.asyncJobManager?.getRunningJobs({ ownerId: plannerId }) ?? [];
 	expect(readerJobs).toHaveLength(1);
 	const readerId = readerJobs[0]?.agentId;
@@ -570,7 +599,7 @@ describe("omp --restore after the parent's process exit released an idle subagen
 		// If this regresses, the process teardown releases the idle subagent without saying how its jobs end, and
 		// its dispose stops the job its IRC wake turn started: the job's subagent ends on "Retry cancelled", and
 		// `omp --restore` leaves the work the exit cut off unfinished.
-		const { parent, runs, backoff } = await openIdlePlannerOwningWaitingReader();
+		const { parent, runs, backoff } = await openWokenPlannerOwningWaitingReader();
 
 		// A SIGTERM's teardown: the SDK dispose for the process exit, which disposes the agent lifecycle first.
 		await parent.dispose({ reason: postmortem.Reason.EXIT });
@@ -589,7 +618,7 @@ describe("omp --restore after the idle TTL parked a subagent whose eval agent() 
 		// If this regresses, the park, which happens while the process runs, cuts the parked subagent's jobs off as
 		// the process exit does: the job's subagent records a process exit that did not happen, leaves the agent
 		// registry, and `omp --restore` relaunches its turn.
-		const { parent, runs, backoff, plannerId, readerId } = await openIdlePlannerOwningWaitingReader();
+		const { parent, runs, backoff, plannerId, readerId } = await openWokenPlannerOwningWaitingReader();
 
 		// The park the idle TTL (`task.agentIdleTtlMs`) fires.
 		await AgentLifecycleManager.global().park(plannerId);
@@ -611,7 +640,7 @@ describe("omp --restore after the parent's session ended while its process went 
 		// If this regresses, a top-level session's end that is no process exit (an ACP session's close, a helper
 		// session's end) cuts off the jobs of the idle subagents its lifecycle teardown releases: their subagents
 		// record a process exit that did not happen, and `omp --restore` relaunches their turns.
-		const { parent, runs, backoff } = await openIdlePlannerOwningWaitingReader();
+		const { parent, runs, backoff } = await openWokenPlannerOwningWaitingReader();
 
 		// An ACP session's close: the parent's dispose says it stops, and the process goes on.
 		await parent.dispose({ ownedJobsEnd: "stop" });
@@ -621,6 +650,73 @@ describe("omp --restore after the parent's session ended while its process went 
 
 		expect(turnEnd(reader)).toEqual(STOPPED);
 		expect(recordsProcessExit(reader)).toBe(false);
+		expect(outcome.subagents).toEqual([]);
+	}, 30_000);
+});
+
+describe("omp --restore after the parent's session ended while its process went on, releasing a woken subagent whose turn and eval agent() job's subagent waited to retry their keys", () => {
+	it("stops the subagent's turn and the job's subagent, which record no process exit, so --restore relaunches nothing", async () => {
+		// If this regresses, a top-level session's end that is no process exit (an ACP session's close, a helper
+		// session's end) releases a subagent still running a turn as the process exit does: the subagent records a
+		// process exit that did not happen, its turn and its own jobs are cut off, and `omp --restore` relaunches them.
+		const { parent, runs, backoff } = await openWokenPlannerOwningWaitingReader({ wakeTurnWaitsOnKey: true });
+
+		// An ACP session's close: the parent's dispose says it stops, and the process goes on.
+		await parent.dispose({ ownedJobsEnd: "stop" });
+
+		const { outcome, planner, reader } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		expect(turnEnd(planner)).toEqual(STOPPED);
+		expect(recordsProcessExit(planner)).toBe(false);
+		expect(turnEnd(reader)).toEqual(STOPPED);
+		expect(recordsProcessExit(reader)).toBe(false);
+		expect(outcome.subagents).toEqual([]);
+	}, 30_000);
+});
+
+describe("omp --restore after the parent's session ended while its process went on, with a background subagent whose eval agent() job's subagent waited to retry its key", () => {
+	it("stops the job's subagent, which records no process exit, so --restore relaunches nothing", async () => {
+		// If this regresses, the parent's dispose stops only the jobs it owns itself, and its job manager's dispose then
+		// cuts off, with its shutdown reason, the jobs of the subagent a background job runs before that subagent's own
+		// stop reaches them: the job's subagent records a process exit that did not happen and is parked for
+		// `omp --restore`.
+		const { parent, roster, runs, plannerHolds } = await openParentWithPlanner({ plannerInBackground: true });
+		const { turn, backoff } = await startPlannerWithWaitingReader(parent, roster, plannerHolds);
+		await turn;
+
+		// An ACP session's close: the parent's dispose says it stops, and the process goes on.
+		await parent.dispose({ ownedJobsEnd: "stop" });
+
+		const { outcome, reader } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		expect(turnEnd(reader)).toEqual(STOPPED);
+		expect(recordsProcessExit(reader)).toBe(false);
+		expect(outcome.subagents).toEqual([]);
+	}, 30_000);
+});
+
+describe("omp --restore after the parent's session ended while its process went on, during a turn whose sync subagent waited to retry its key", () => {
+	it("stops the sync subagent, which records no process exit, so --restore relaunches nothing", async () => {
+		// If this regresses, a top-level session's end that is no process exit (an ACP session's close, a helper
+		// session's end) aborts its turn still in flight with a cut-off: a sync subagent follows its parent's turn,
+		// so it keeps its marked attempt as the process exit leaves it, and `omp --restore` relaunches it.
+		const { parent, runs } = await openParentWithPlanner({ plannerWaitsOnKey: true });
+		// The planner's and the reader's backoffs: the parent's turn waits on its sync `task` call, not to retry.
+		const backoff = holdBackoff(2);
+		const turn = parent.prompt("Have the notes read.");
+		await backoff.allHeld;
+
+		// An ACP session's close: the parent's dispose says it stops, and the process goes on.
+		await parent.dispose({ ownedJobsEnd: "stop" });
+		await turn;
+
+		const { outcome, planner } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		expect(turnEnd(planner)).toEqual(STOPPED);
+		expect(recordsProcessExit(planner)).toBe(false);
 		expect(outcome.subagents).toEqual([]);
 	}, 30_000);
 });
