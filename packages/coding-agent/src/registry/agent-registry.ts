@@ -109,6 +109,21 @@ export function isResumable(ref: AgentRef | undefined): boolean {
 	return (ref?.status === "parked" || ref?.status === "aborted") && ref.sessionFile !== null;
 }
 
+/** {@link agentAncestors}' ids one at a time: `registry` is read only once every recorded one is passed. */
+function* ancestorIds(registry: AgentRegistryApi, ref: AgentRef | undefined): Generator<string> {
+	const seen = new Set<string>();
+	for (let next = ref; next;) {
+		const recorded = next.ancestors ?? (next.parentId === undefined ? [] : [next.parentId]);
+		for (const id of recorded) {
+			if (seen.has(id)) return;
+			seen.add(id);
+			yield id;
+		}
+		const last = recorded.at(-1);
+		next = last === undefined ? undefined : registry.get(last);
+	}
+}
+
 /**
  * The ids above `ref`, nearest first: its recorded {@link AgentRef.ancestors}, so an agent in between
  * that was unregistered since does not cut them short, continued through `registry` from the last one
@@ -116,19 +131,18 @@ export function isResumable(ref: AgentRef | undefined): boolean {
  * a repeated id.
  */
 export function agentAncestors(registry: AgentRegistryApi, ref: AgentRef | undefined): string[] {
-	const ancestors: string[] = [];
-	const seen = new Set<string>();
-	for (let next = ref; next;) {
-		const recorded = next.ancestors ?? (next.parentId === undefined ? [] : [next.parentId]);
-		for (const id of recorded) {
-			if (seen.has(id)) return ancestors;
-			seen.add(id);
-			ancestors.push(id);
-		}
-		const last = recorded.at(-1);
-		next = last === undefined ? undefined : registry.get(last);
+	return [...ancestorIds(registry, ref)];
+}
+
+/**
+ * Whether `ancestorId` is among the ids above `ref` ({@link agentAncestors}); looks no further up
+ * the registry once it is found.
+ */
+export function agentHasAncestor(registry: AgentRegistryApi, ref: AgentRef | undefined, ancestorId: string): boolean {
+	for (const id of ancestorIds(registry, ref)) {
+		if (id === ancestorId) return true;
 	}
-	return ancestors;
+	return false;
 }
 
 export type RegistryEvent =

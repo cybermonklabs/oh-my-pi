@@ -3,7 +3,7 @@ import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
-import { AgentRegistry, agentAncestors, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, agentHasAncestor, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "./agent-session-events";
 import { escapeHarnessTags } from "./harness-tags";
 import type { CustomMessage } from "./messages";
@@ -241,7 +241,7 @@ export class IrcBridge {
 		// own descendants, whose questions it must see in-run, also one under a
 		// subagent that has ended since. Anyone else's message, or a broadcast leg
 		// (which asks no one in particular), gets a turn of its own.
-		const fromDescendant = agentAncestors(registry, registry.get(msg.from)).includes(msg.to);
+		const fromDescendant = agentHasAncestor(registry, registry.get(msg.from), msg.to);
 		const peerMessage = parentId !== undefined && (msg.broadcast === true || (!fromParent && !fromDescendant));
 		// An idle subagent runs a monitored wake turn whose output is relayed
 		// back to the sender (task executor `relayWakeTurnOutput`); the main

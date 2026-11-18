@@ -575,6 +575,39 @@ describe("AgentLifecycleManager", () => {
 		});
 	}
 
+	it("a kill that completes while a cold revive is prepared leaves the agent unadopted and its release hook run once", async () => {
+		// If this regresses, an agent killed while a message revives it stays adopted after the revive fails: a later
+		// release (the session's end, a helper's end) runs its release hook (a workspace cleanup) a second time.
+		using tempDir = TempDir.createSync("@omp-lifecycle-kill-prepare-");
+		const sessionFile = path.join(tempDir.path(), "Killed-Preparing.jsonl");
+		await Bun.write(sessionFile, "");
+		const factoryGate = deferred();
+		const releaseWorkspace = vi.fn(async () => {});
+		const ref = registerIdleSub("Killed-Preparing", null, sessionFile);
+		registry.setStatus("Killed-Preparing", "parked", ref);
+		lifecycle.adopt("Killed-Preparing", { idleTtlMs: 0, onRelease: releaseWorkspace }, ref);
+		lifecycle.setPersistedSubagentReviverFactory(
+			async () => {
+				await factoryGate.promise;
+				return async () => makeSessionStub().session;
+			},
+			() => 0,
+		);
+
+		const revival = lifecycle.ensureLive("Killed-Preparing").then(
+			() => "revived",
+			() => "refused",
+		);
+		await flushAsync(); // the revive waits in the persisted factory
+		expect(await lifecycle.release("Killed-Preparing", ref, { tombstone: true })).toBe(true);
+		factoryGate.resolve();
+
+		expect(await revival).toBe("refused");
+		expect(lifecycle.has("Killed-Preparing")).toBe(false);
+		await lifecycle.dispose();
+		expect(releaseWorkspace).toHaveBeenCalledTimes(1);
+	});
+
 	it("a delayed release cannot remove or mutate a replacement ref with the same id", async () => {
 		const gate = deferred();
 		const oldSession = makeSessionStub(() => gate.promise);
@@ -672,6 +705,26 @@ describe("AgentLifecycleManager", () => {
 		expect(lifecycle.isParking("Race-Keep")).toBe(false);
 		expect(registry.get("Race-Keep")?.status).toBe("idle");
 		expect(registry.get("Race-Keep")?.session).toBe(stub.session);
+	});
+
+	it("ensureLive while a release disposes the session of the park it cancelled does not get that session", async () => {
+		// If this regresses, a message to an agent whose release (a helper's end, the session's teardown) cancelled its
+		// idle park is delivered into the session that release is disposing, and is lost with it.
+		const disposeGate = deferred();
+		const stub = makeSessionStub(() => disposeGate.promise);
+		registerIdleSub("Released-Parking", stub.session);
+		lifecycle.adopt("Released-Parking", { idleTtlMs: 0 });
+
+		// Same tick: the release cancels the park before it detaches, then disposes the session slowly.
+		const parking = lifecycle.park("Released-Parking");
+		const releasing = lifecycle.release("Released-Parking");
+		const handedOut = await lifecycle.ensureLive("Released-Parking").catch(() => undefined);
+		disposeGate.resolve();
+		await Promise.all([parking, releasing]);
+
+		expect(handedOut).toBeUndefined();
+		expect(stub.disposeCalls()).toBe(1);
+		expect(registry.get("Released-Parking")).toBeUndefined();
 	});
 
 	it("ensureLive after park detaches waits for dispose then revives once", async () => {
@@ -931,6 +984,45 @@ describe("AgentLifecycleManager", () => {
 		const restoredRegistry = new AgentRegistry();
 		await registerPersistedSubagents(restoredRegistry, rootSessionFile);
 		expect(restoredRegistry.get(workerId)?.status).toBe("parked");
+	});
+
+	it("a killed agent reopened as its helper ends does not come back live", async () => {
+		// If this regresses, a message that reopens a killed subagent of a helper session (a `/security` scan) brings
+		// it back live after the helper's end: the end came between the reopen and its revive and found neither.
+		using tempDir = TempDir.createSync("@omp-lifecycle-reopen-release-");
+		const sessionFile = path.join(tempDir.path(), "Helper-Killed.jsonl");
+		await Bun.write(sessionFile, "");
+		registry.register({ id: "Helper", displayName: "helper", kind: "main", session: null, status: "running" });
+		const killed = registry.register({
+			id: "Helper-Killed",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Helper",
+			session: makeSessionStub().session,
+			sessionFile,
+			status: "running",
+		});
+		expect(await lifecycle.release("Helper-Killed", killed, { tombstone: true })).toBe(true);
+		const revived = makeSessionStub();
+		const helperEnds: Promise<void>[] = [];
+		lifecycle.setPersistedSubagentReviverFactory(
+			async ref => {
+				// The reopened generation's revive starts, before ensureLive tracks it: the helper ends now.
+				if (ref !== killed) helperEnds.push(lifecycle.releaseUnder("Helper", { ownedJobsEnd: "stop" }));
+				return async () => revived.session;
+			},
+			() => 0,
+		);
+
+		const outcome = await lifecycle.ensureLive("Helper-Killed").then(
+			() => "revived",
+			() => "refused",
+		);
+		await Promise.all(helperEnds);
+
+		expect(outcome).toBe("refused");
+		expect(registry.get("Helper-Killed")).toBeUndefined();
+		expect(lifecycle.has("Helper-Killed")).toBe(false);
 	});
 
 	it("a killed transcript no reviver can rebuild stays killed", async () => {

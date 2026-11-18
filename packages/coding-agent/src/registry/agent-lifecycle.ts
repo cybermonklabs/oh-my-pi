@@ -29,7 +29,7 @@ import type { AgentSessionDisposeOptions, OwnedJobsEnd } from "../session/agent-
 import { trackLateCleanup } from "../utils/late-cleanup";
 import {
 	type AgentRef,
-	agentAncestors,
+	agentHasAncestor,
 	type AgentRefExpectation,
 	AgentRegistry,
 	type AgentRegistryApi,
@@ -182,7 +182,7 @@ export interface AgentLifecycleApi {
 	dispose(options?: AgentLifecycleDisposeOptions): Promise<void>;
 	/**
 	 * Release, as {@link dispose} releases each, every adopted agent, and every agent a revive is
-	 * bringing back, whose ancestry ({@link agentAncestors}) reaches `ancestorId`, also past a parent
+	 * bringing back, whose ancestry ({@link agentHasAncestor}) reaches `ancestorId`, also past a parent
 	 * unregistered since; the lifecycle and every other agent go on.
 	 */
 	releaseUnder(ancestorId: string, options?: AgentLifecycleDisposeOptions): Promise<void>;
@@ -504,7 +504,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			if (parked?.session && !park.detached && park.cancel()) {
 				await park.promise;
 				const kept = this.#registry.get(id)?.session;
-				if (kept) {
+				if (kept && !this.#releasing.has(parked)) {
 					// Park cleared the idle timer; re-arm so TTL park still works.
 					const adopted = this.#adopted.get(id);
 					if (adopted && adopted.ref === parked && parked.status === "idle") this.#armTimer(id, adopted);
@@ -523,19 +523,32 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				`Unknown agent "${id}" — it was never registered or has been released. If a transcript exists, read history://${id}.`,
 			);
 		}
-		// The release disposes the agent's session and unregisters it at its end: hand out nothing meanwhile.
-		if (this.#releasing.has(ref)) throw new Error(`Agent "${id}" is being released and cannot be revived.`);
-		if (ref.status === "aborted") ref = await this.#reopen(id, ref);
-		// A revive attaches its session before it finishes initializing it: join the revive rather
-		// than hand out a session whose extensions have not re-registered their tools yet.
-		const inflight = this.#revivals.get(id);
-		if (inflight?.ref === ref) return inflight.promise;
-		if (ref.session) return ref.session;
-		const revival = this.#resolveAndRevive(id, ref);
-		const pending: RevivingAgent = { ref, promise: revival };
-		this.#revivals.set(id, pending);
+		// A release is disposing the agent's session: hand out nothing meanwhile. A kill keeps its row,
+		// `aborted`, and the agent can be reopened once the kill ends; any other release unregisters it.
+		if (this.#releasing.has(ref)) {
+			throw new Error(
+				ref.status === "aborted"
+					? `Agent "${id}" is still shutting down after its kill; retry once it has stopped.`
+					: `Agent "${id}" is being released and cannot be revived.`,
+			);
+		}
+		const killed = ref.status === "aborted" ? ref : undefined;
+		if (killed) ref = await this.#reopen(id, killed);
+		let pending: RevivingAgent;
 		try {
-			return await revival;
+			// A revive attaches its session before it finishes initializing it: join the revive rather
+			// than hand out a session whose extensions have not re-registered their tools yet.
+			const inflight = this.#revivals.get(id);
+			if (inflight?.ref === ref) return inflight.promise;
+			if (ref.session) return ref.session;
+			pending = { ref, promise: this.#resolveAndRevive(id, ref) };
+			this.#revivals.set(id, pending);
+		} finally {
+			// `#reopen` keeps a reopen tracked until its revive is, so a release in between finds the agent.
+			if (killed && this.#reopens.get(id)?.ref === killed) this.#reopens.delete(id);
+		}
+		try {
+			return await pending.promise;
 		} finally {
 			if (this.#revivals.get(id) === pending) this.#revivals.delete(id);
 		}
@@ -545,7 +558,8 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * Turn a killed ref into a fresh `parked` generation on the same transcript
 	 * and drop its kill marker, so the cold-revive path can rebuild it. Probes the
 	 * persisted factory first: a transcript nothing can revive stays killed.
-	 * Concurrent calls for the same killed ref share one reopen.
+	 * Concurrent calls for the same killed ref share one reopen. A reopen that
+	 * succeeds stays in `#reopens` until {@link ensureLive} tracks its revive.
 	 */
 	async #reopen(id: string, killed: AgentRef): Promise<AgentRef> {
 		const inflight = this.#reopens.get(id);
@@ -554,8 +568,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		this.#reopens.set(id, pending);
 		try {
 			return await pending.promise;
-		} finally {
+		} catch (error) {
 			if (this.#reopens.get(id) === pending) this.#reopens.delete(id);
+			throw error;
 		}
 	}
 
@@ -606,10 +621,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		// its release hook through cold revival and restores it if that fails.
 		const prior = adoption?.ref === ref ? adoption : undefined;
 		let revive = prior?.revive;
-		let coldAdopted = false;
-		let coldRevive: AgentReviver | undefined;
+		let coldReviver: AgentReviver | undefined;
 		if (!revive && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
-			coldRevive = await this.#persistedReviverFactory(ref);
+			coldReviver = await this.#persistedReviverFactory(ref);
 			// Teardown can complete during the factory await. A late cold revive must
 			// not cold-adopt (and later attach a live session + TTL) into a disposed
 			// manager — reject deterministically before creating any session.
@@ -628,29 +642,30 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		if (this.#releasing.has(ref)) {
 			throw new Error(`Agent "${id}" was released while its persisted session was being prepared.`);
 		}
-		if (coldRevive) {
-			revive = coldRevive;
+		if (coldReviver) {
+			revive = coldReviver;
 			adoption = {
 				ref,
 				idleTtlMs: prior?.idleTtlMs ?? this.#persistedReviveTtlMs(),
 				revive,
 				onRelease: prior?.onRelease,
 			};
-			this.#adopted.set(id, adoption);
-			coldAdopted = true;
 		}
+		// Also checked before a cold adoption: a kill that completed while the factory awaited left the ref
+		// `aborted` with its release hook run, and an adoption would keep that hook for a later release to run again.
 		if (ref.status !== "parked" || !revive || !adoption) {
 			throw new Error(
 				`Agent "${id}" is ${ref.status} and cannot be revived${revive ? "" : " (no reviver registered)"}. Its transcript remains readable at history://${id}.`,
 			);
 		}
+		if (coldReviver) this.#adopted.set(id, adoption);
 		try {
 			return await this.#revive(id, revive, ref, adoption);
 		} catch (error) {
 			// A failed cold revive (stale ctx, missing cwd, bad MCP) must not leave a
 			// poisoned reviver stuck in #adopted — drop it so a later ensureLive
 			// rebuilds via the factory (which may have fresher context by then).
-			if (coldAdopted && this.#adopted.get(id) === adoption) {
+			if (coldReviver && this.#adopted.get(id) === adoption) {
 				if (prior) this.#adopted.set(id, prior);
 				else this.#adopted.delete(id);
 			}
@@ -759,7 +774,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		this.#unsubscribe?.();
 		this.#disposed = true;
 		this.#unsubscribe = undefined;
-		await this.#releaseAll([...this.#adopted.keys(), ...this.#parks.keys()], options);
+		await this.#releaseAll([...new Set([...this.#adopted.keys(), ...this.#parks.keys()])], options);
 		this.#revivals.clear();
 		this.#parks.clear();
 		this.#persistedReviverFactory = undefined;
@@ -767,16 +782,21 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	}
 
 	/**
-	 * Release every adopted, parking or reviving agent whose ancestry ({@link agentAncestors}) reaches
+	 * Release every adopted, parking or reviving agent whose ancestry ({@link agentHasAncestor}) reaches
 	 * `ancestorId`, each as {@link dispose} releases it. A helper session (a `/security` scan) ends the
 	 * agents it spawned this way: the host session's agents, this manager and its revivers go on.
 	 */
 	async releaseUnder(ancestorId: string, options: AgentLifecycleDisposeOptions = {}): Promise<void> {
 		// A revive or a reopen in flight adopts its agent only once it completes: release the agent's
 		// registered ref now too, so the revive finds it gone and fails rather than bringing it back live.
-		const ids = [...this.#adopted.keys(), ...this.#parks.keys(), ...this.#revivals.keys(), ...this.#reopens.keys()];
+		const ids = new Set([
+			...this.#adopted.keys(),
+			...this.#parks.keys(),
+			...this.#revivals.keys(),
+			...this.#reopens.keys(),
+		]);
 		await this.#releaseAll(
-			ids.filter(id => this.#descendsFrom(id, ancestorId)),
+			[...ids].filter(id => this.#descendsFrom(id, ancestorId)),
 			options,
 		);
 	}
@@ -784,12 +804,12 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	/** Whether the recorded ancestry of `id` reaches `ancestorId`, also past a parent unregistered since. */
 	#descendsFrom(id: string, ancestorId: string): boolean {
 		const ref = this.#registry.get(id) ?? this.#adopted.get(id)?.ref ?? this.#parks.get(id)?.ref;
-		return agentAncestors(this.#registry, ref).includes(ancestorId);
+		return agentHasAncestor(this.#registry, ref, ancestorId);
 	}
 
 	/**
-	 * Release each of `ids` as `options` says, waiting for each until the deadline; a release past it
-	 * goes on as late cleanup.
+	 * Release each of `ids`, distinct, as `options` says, waiting for each until the deadline; a release
+	 * past it goes on as late cleanup.
 	 */
 	async #releaseAll(ids: readonly string[], options: AgentLifecycleDisposeOptions): Promise<void> {
 		const deadlineAt = options.deadlineAt ?? Date.now() + AGENT_RELEASE_GRACE_MS;
@@ -803,7 +823,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		const running: AgentReleaseOptions =
 			ownedJobsEnd === "stop" ? idle : { dispose: { reason: postmortem.Reason.EXIT, ownedJobsEnd } };
 		await Promise.all(
-			[...new Set(ids)].map(async id => {
+			ids.map(async id => {
 				const releaseOptions = this.#registry.get(id)?.status === "running" ? running : idle;
 				const release = this.release(id, undefined, releaseOptions).then(() => {});
 				try {

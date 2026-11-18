@@ -6,7 +6,7 @@
  */
 import type { AsyncJob, AsyncJobManagerApi } from "../async";
 import type { JobWidgetRegistry } from "../job-widgets/types";
-import { AgentRegistry, agentAncestors } from "../registry/agent-registry";
+import { AgentRegistry } from "../registry/agent-registry";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { AsyncJobInspection, AsyncJobSnapshot, AsyncJobSnapshotItem, AsyncJobTree } from "./agent-session-types";
 import { plainTurnAbortReason } from "./exit-diagnostics";
@@ -68,15 +68,14 @@ function jobTreeParents(manager: AsyncJobManagerApi): Map<string, string> {
 	for (const job of [...manager.getRunningJobs(), ...manager.getRecentJobs(Number.POSITIVE_INFINITY)]) {
 		if (job.agentId !== undefined && job.ownerId !== undefined) parents.set(job.agentId, job.ownerId);
 	}
-	const registry = AgentRegistry.global();
-	const refs = registry.list();
+	const refs = AgentRegistry.global().list();
 	const registered = new Set(refs.map(ref => ref.id));
 	for (const ref of refs) {
 		let child = ref.id;
-		for (const ancestorId of agentAncestors(registry, ref)) {
-			// A registered ancestor links the rest of the chain itself.
-			if (child !== ref.id && registered.has(child)) break;
+		for (const ancestorId of ref.ancestors ?? (ref.parentId === undefined ? [] : [ref.parentId])) {
 			parents.set(child, ancestorId);
+			// A registered ancestor links the rest of the chain itself.
+			if (registered.has(ancestorId)) break;
 			child = ancestorId;
 		}
 	}
