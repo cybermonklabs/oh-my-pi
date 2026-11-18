@@ -219,6 +219,10 @@ export class PeerAgentSession implements AgentSessionHandle {
 		return mainBridge().remote.call("steer", this, text, images, options);
 	}
 
+	removeQueuedMessage(text: string, queue: "steering" | "followUp"): Promise<boolean> {
+		return mainBridge().remote.call("removeQueuedMessage", this, text, queue);
+	}
+
 	abort(options?: SessionAbortOptions): Promise<void> {
 		return mainBridge().remote.call("abort", this, options);
 	}

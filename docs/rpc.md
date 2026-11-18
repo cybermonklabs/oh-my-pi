@@ -1125,9 +1125,13 @@ disposed, and the command returns an error response with the write failure.
 
 ### Steering subagents
 
-`steer_subagent` sends a message to a running subagent as its user, the same
-way Agent Hub chat does: a mid-turn subagent is steered at its next step
-boundary, and one between turns starts its next turn. The message is recorded
+`steer_subagent` sends a message to a subagent `get_subagents` lists as running,
+as its user. A mid-turn subagent is steered the same way Agent Hub chat does,
+at its next step boundary. A subagent between turns (for example a synchronous
+subagent waiting for its own eval `agent()` job) does not start a turn for the
+message: it waits on the subagent's queue and reaches its next turn, which its
+task executor starts (a yield reminder) or a finished job's result starts,
+before that turn's first model call. The message is recorded
 in the subagent's own transcript; it is not attributed to the parent agent,
 and the parent sees only the subagent's eventual result. Isolated (worktree)
 subagents run in-process and are steered the same way.
@@ -1137,13 +1141,16 @@ subagents run in-process and are steered the same way.
 { "id": "req_1", "type": "response", "command": "steer_subagent", "success": true }
 ```
 
-The response arrives once the message is accepted: queued into the running
-turn, or the subagent's new turn started. It does not wait for the turn to
-finish. Like `prompt`, the command starts in queue order but waits for
-acceptance in the background, so later commands (including `abort`) are not
-held behind it. As in Agent Hub chat (not RPC `steer`), the message goes
-through the subagent's `prompt()`: extension, custom and file slash commands
-run and prompt templates expand.
+The response arrives once the message is accepted: for a mid-turn subagent,
+queued into the running turn or its new turn started; for a subagent between
+turns, once its next turn has taken the message into its context. It does
+not wait for the turn to finish. Like `prompt`, the command starts in queue
+order but waits for acceptance in the background, so later commands
+(including `abort`) are not held behind it. For a mid-turn subagent, as in
+Agent Hub chat (not RPC `steer`), the message goes through the subagent's
+`prompt()`: extension, custom and file slash commands run and prompt
+templates expand. For a subagent between turns it is queued like RPC `steer`:
+prompt templates expand and extension commands are refused.
 
 Failure responses:
 
@@ -1154,6 +1161,13 @@ Failure responses:
 - the subagent drops or rejects the message before accepting it (for example
   an abort or a usage-limit preflight denial lands first) →
   `error: "Subagent refused the message: <reason>"`
+- a subagent between turns stops before another turn takes the message (its
+  result is accepted, it is cancelled or aborted, or its run ends) → the
+  message is taken back off its queue, so no later turn delivers it, and
+  `error: "Subagent's run ended before the message reached it: <id>"`
+- the subagent stops, and the message is no longer on its queue although no
+  turn took it (someone else removed it, or the subagent's session is gone) →
+  `error: "The message was not delivered to subagent: <id>"`
 
 ### Side questions (`/btw`)
 

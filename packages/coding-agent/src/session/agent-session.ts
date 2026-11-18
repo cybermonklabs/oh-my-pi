@@ -1292,6 +1292,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** In-flight vision descriptions that gate prompt admission; abort() cancels them. */
 	#imageDescriptionAbortControllers = new Set<AbortController>();
 	#queuedMessageDrainBlocked = false;
+	/**
+	 * Steers held for the session's next run (`SteerOptions.holdUntilNextRun`): they
+	 * wait on the steering queue until a run's steering poll takes them, and no
+	 * queued-message drain starts a turn for them alone.
+	 */
+	#nextRunSteers = new WeakSet<AgentMessage>();
 	#modeExitDrainSuppressionDepth = 0;
 	#usagePreflightReadyForNextModelCall = false;
 	#usagePreflightReadyModel: Model | undefined;
@@ -1664,7 +1670,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// non-streaming session, so without this guard it would wake/fold into the still-old context
 		// and race the transition's own reset — same rationale as #drainStrandedQueuedMessages.
 		if (this.#unsubscribeAgent === undefined) return;
-		if (this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) return;
+		if (this.#canAutoContinueForFollowUp() && this.#hasDrainableQueuedMessages()) return;
 		// Parked wake records resume alongside ordinary stranded asides; they were
 		// already decided wake-intended at deferral time.
 		const records = [...this.#irc.drainDeferredWakes(), ...this.#irc.drainPending()];
@@ -2085,7 +2091,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			canDrain &&
 			!this.#queuedMessageDrainBlocked &&
 			this.#canAutoContinueForFollowUp() &&
-			this.agent.hasQueuedMessages();
+			this.#hasDrainableQueuedMessages();
 		const ircContinuation =
 			canDrain &&
 			!this.#abortInProgress &&
@@ -5667,12 +5673,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		suppressContinuation: boolean;
 	}): boolean {
 		if (options.suppressContinuation) return false;
-		if (this.agent.hasQueuedMessages()) {
+		if (this.#hasDrainableQueuedMessages()) {
 			this.#scheduleAgentContinue({
 				source: "compaction-queued-message",
 				delayMs: 100,
 				generation: options.generation,
-				shouldContinue: () => this.agent.hasQueuedMessages(),
+				shouldContinue: () => this.#hasDrainableQueuedMessages(),
 			});
 			return true;
 		}
@@ -5711,11 +5717,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			async signal => {
 				await Promise.resolve();
 				if (signal.aborted) return;
-				if (this.agent.hasQueuedMessages()) {
+				if (this.#hasDrainableQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						source: "auto-continue-queued-message",
 						generation,
-						shouldContinue: () => this.agent.hasQueuedMessages(),
+						shouldContinue: () => this.#hasDrainableQueuedMessages(),
 					});
 					return;
 				}
@@ -9898,7 +9904,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Queue a steering message to interrupt the agent mid-run.
+	 * Queue a steering message to interrupt the agent mid-run. With
+	 * `holdUntilNextRun`, an idle session keeps it for its next run instead of
+	 * starting one (see {@link SteerOptions.holdUntilNextRun}).
 	 */
 	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
 		if (text.startsWith("/")) {
@@ -9914,6 +9922,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			attribution: options?.attribution,
 			rawText: text,
 			onPromptQueued: options?.onPromptQueued,
+			nextRun: options?.holdUntilNextRun,
 		});
 	}
 
@@ -10132,6 +10141,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			 * streams must not auto-continue as an autonomous turn.
 			 */
 			skipIdleDrain?: boolean;
+			/** Keep the queued messages for the next run: no drain starts a turn for them alone. */
+			nextRun?: boolean;
 			/**
 			 * `#promptGeneration` captured when prompt() took this submission. abort() (or a
 			 * history rewrite) bumps it; if that lands while images are being prepared, the
@@ -10219,6 +10230,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			timestamp ?? Date.now(),
 			rawText,
 		);
+		if (options?.nextRun) {
+			for (const message of queued) this.#nextRunSteers.add(message);
+		}
 		options?.onPromptQueued?.(queued);
 		options?.onPromptAdmitted?.();
 		// joinActiveTurn admission must never start an autonomous turn: the
@@ -10459,7 +10473,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#modeExitDrainSuppressionDepth > 0 ||
 			this.#queuedMessageDrainBlocked ||
 			!this.#canAutoContinueForFollowUp() ||
-			!this.agent.hasQueuedMessages()
+			!this.#hasDrainableQueuedMessages()
 		) {
 			return;
 		}
@@ -10471,7 +10485,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				return (
 					this.#modeExitDrainSuppressionDepth === 0 &&
 					this.#canAutoContinueForFollowUp() &&
-					this.agent.hasQueuedMessages()
+					this.#hasDrainableQueuedMessages()
 				);
 			},
 			onSkip: () => {
@@ -10515,7 +10529,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// / pythonExecution record a user interrupt left as the literal transcript tail. This is
 		// why a queued user steer stranded behind a preserved advisor card (or a flushed IRC aside
 		// / eval execution record) still resumes — no tail-role enumeration needed.
-		if (this.agent.peekSteeringQueue().length > 0) return true;
+		if (this.#hasDrainableSteer()) return true;
 		// Follow-up-only auto-resume stays suppressed while a deliberate user interrupt is in effect
 		// (#advisorAutoResumeSuppressed, cleared on the next user prompt or manual retry): the user
 		// stopped, so their queued follow-up waits for an explicit resume — even if an interleaving
@@ -10528,6 +10542,27 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
 		return last?.role === "assistant" || last?.role === "toolResult";
+	}
+
+	/** Whether the steering queue holds a message other than a steer held for the next run. */
+	#hasDrainableSteer(): boolean {
+		for (const message of this.agent.peekSteeringQueue()) {
+			if (!this.#nextRunSteers.has(message)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * `agent.hasQueuedMessages()` without next-run steers: queued input that may start
+	 * a turn of its own. A next-run steer waits for the next run instead, so neither
+	 * the idle drain, the settle and abort drains, nor a post-compaction continuation
+	 * starts a turn for it alone.
+	 */
+	#hasDrainableQueuedMessages(): boolean {
+		if (!this.agent.hasQueuedMessages()) return false;
+		if (this.agent.peekFollowUpQueue().length > 0 || this.#hasDrainableSteer()) return true;
+		// Only next-run steers are queued, unless a run holds a claim on queued input.
+		return this.agent.peekSteeringQueue().length === 0;
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {

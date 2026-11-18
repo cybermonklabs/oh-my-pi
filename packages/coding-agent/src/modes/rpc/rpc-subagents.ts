@@ -115,6 +115,7 @@ export class RpcSubagentRegistry {
 	#observabilityBus: EventBus | undefined;
 	#output: RpcSubagentOutput;
 	#subscriptionLevel: RpcSubagentSubscriptionLevel = "off";
+	#changeListeners = new Set<() => void>();
 
 	constructor(observabilityBus: EventBus, output: RpcSubagentOutput) {
 		this.#observabilityBus = observabilityBus;
@@ -138,6 +139,8 @@ export class RpcSubagentRegistry {
 		this.#subagents.clear();
 		this.#transcriptSessionFilesBySubagentId.clear();
 		this.#staleSubagentIds.clear();
+		this.#notifyChange();
+		this.#changeListeners.clear();
 	}
 
 	clear(): void {
@@ -149,6 +152,21 @@ export class RpcSubagentRegistry {
 		}
 		this.#subagents.clear();
 		this.#transcriptSessionFilesBySubagentId.clear();
+		this.#notifyChange();
+	}
+
+	/**
+	 * Call `listener` after every change to the roster `getSubagents` returns: a
+	 * subagent starts, reports progress or finishes, or the roster is cleared or
+	 * disposed. Returns the unsubscribe function.
+	 */
+	onChange(listener: () => void): () => void {
+		this.#changeListeners.add(listener);
+		return () => this.#changeListeners.delete(listener);
+	}
+
+	#notifyChange(): void {
+		for (const listener of this.#changeListeners) listener();
 	}
 
 	setSubscriptionLevel(level: RpcSubagentSubscriptionLevel): void {
@@ -224,6 +242,7 @@ export class RpcSubagentRegistry {
 		if (this.#subscriptionLevel !== "off") {
 			this.#output({ type: "subagent_lifecycle", payload });
 		}
+		this.#notifyChange();
 	}
 
 	handleProgress(payload: SubagentProgressPayload): void {
@@ -251,6 +270,7 @@ export class RpcSubagentRegistry {
 		if (this.#subscriptionLevel !== "off") {
 			this.#output({ type: "subagent_progress", payload });
 		}
+		this.#notifyChange();
 	}
 
 	handleEvent(payload: SubagentEventPayload): void {

@@ -537,6 +537,15 @@ export interface SteerOptions {
 	attribution?: MessageAttribution;
 	/** Called synchronously with the messages pushed onto the steering queue. See {@link PromptOptions.onPromptQueued}. */
 	onPromptQueued?: PromptOptions["onPromptQueued"];
+	/**
+	 * Hold the message for the session's next run instead of starting one. It waits on
+	 * the steering queue until a run's steering poll takes it: an idle session's next
+	 * run injects it before its first model call, and a streaming run at its next step
+	 * boundary. No queued-message drain (on queueing, when the session settles, after
+	 * an abort or a compaction) starts a turn for it alone, so it never races the
+	 * prompt of whoever drives the session (the task executor for a subagent).
+	 */
+	holdUntilNextRun?: boolean;
 }
 
 /** Options for AgentSession.sendUserMessage(). */

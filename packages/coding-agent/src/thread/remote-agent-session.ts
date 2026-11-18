@@ -849,6 +849,12 @@ export class RemoteAgentSession implements AgentViewSession {
 		return this.#command("steer", text, images, options);
 	}
 
+	/** Take back a queued message on the home worker; a session that is already gone holds none. */
+	removeQueuedMessage(text: string, queue: "steering" | "followUp"): Promise<boolean> {
+		if (this.#closed !== undefined) return Promise.resolve(false);
+		return this.#command("removeQueuedMessage", text, queue);
+	}
+
 	abort(options?: SessionAbortOptions): Promise<void> {
 		if (this.#closed !== undefined) return Promise.resolve();
 		return this.#command("abort", options);
