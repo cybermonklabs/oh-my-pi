@@ -828,7 +828,10 @@ function* writeModelCacheSteps<TApi extends Api>(
 	withModelCacheDb(dbPath, db => {
 		const outcome = db
 			.transaction((): "skipped" | "refreshed" | "written" => {
-				const matchStmt = db.prepare<StoredRowState, [string, number, string, string, string, string, number, string]>(
+				const matchStmt = db.prepare<
+					StoredRowState,
+					[string, number, string, string, string, string, number, string]
+				>(
 					`SELECT m.updated_at, m.authoritative,
 						r.payload_updated_at AS refresh_payload_updated_at,
 						r.updated_at AS refresh_updated_at,

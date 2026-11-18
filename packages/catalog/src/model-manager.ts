@@ -1,5 +1,13 @@
 import { type } from "@oh-my-pi/omptype";
-import { logger, mapInSlices, nextSlice, runInSlices, runToCompletion, sliceExpired, VERSION } from "@oh-my-pi/pi-utils";
+import {
+	logger,
+	mapInSlices,
+	nextSlice,
+	runInSlices,
+	runToCompletion,
+	sliceExpired,
+	VERSION,
+} from "@oh-my-pi/pi-utils";
 import { buildModel } from "./build";
 import { collapseBuiltVariants } from "./compat/collapse";
 import { applyCatalogMetrics, CatalogMetricsIndex } from "./identity/metrics";
@@ -730,11 +738,11 @@ export function* fingerprintStaticModelsSteps<TApi extends Api>(
 ): Generator<void, string, undefined> {
 	const policyKey = `${policy.authoritative ? ":authoritative" : ""}${policy.additive ? ":additive" : ""}`;
 	if (models.length === 0) return `${MODEL_CACHE_FINGERPRINT_VERSION}${policyKey}:empty`;
-	const elements = new Array<string>(models.length);
+	const elements: string[] = [];
 	for (let index = 0; index < models.length; index++) {
 		yield;
 		// An element JSON cannot represent serializes as `null` inside an array.
-		elements[index] = JSON.stringify(models[index]) ?? "null";
+		elements.push(JSON.stringify(models[index]) ?? "null");
 	}
 	yield;
 	const text = `[${elements.join(",")}]`;

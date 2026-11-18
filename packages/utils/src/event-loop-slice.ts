@@ -101,10 +101,10 @@ function releaseWaiters(batch: number): void {
 
 /** `items.map(fn)` that returns to the event loop between items once a slice has used its budget. */
 export async function mapInSlices<T, U>(items: readonly T[], fn: (item: T, index: number) => U): Promise<U[]> {
-	const out = new Array<U>(items.length);
+	const out: U[] = [];
 	for (let index = 0; index < items.length; index++) {
 		while (sliceExpired()) await nextSlice();
-		out[index] = fn(items[index], index);
+		out.push(fn(items[index], index));
 	}
 	return out;
 }

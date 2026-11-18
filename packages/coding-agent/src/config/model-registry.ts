@@ -1819,7 +1819,8 @@ export class ModelRegistry {
 			let cachedSnapshotMatchesBundled = false;
 			if (bundledModels !== undefined) {
 				const cachedSnapshotFingerprint = yield* fingerprintStaticModelsSteps(cache.models);
-				cachedSnapshotMatchesBundled = cachedSnapshotFingerprint === (yield* fingerprintStaticModelsSteps(bundledModels));
+				cachedSnapshotMatchesBundled =
+					cachedSnapshotFingerprint === (yield* fingerprintStaticModelsSteps(bundledModels));
 			}
 			const cacheContributed = additiveSharedCatalogProvider
 				? cachedModels.some(model => bundledById?.has(model.id) !== true)
@@ -1868,7 +1869,10 @@ export class ModelRegistry {
 			logger.time("modelRegistry:loadCachedStandardModels", () => {
 				using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
 				for (const providerId of providerIds) {
-					this.#commitCachedStandardProvider(providerId, runToCompletion(this.#cachedStandardProviderSteps(providerId)));
+					this.#commitCachedStandardProvider(
+						providerId,
+						runToCompletion(this.#cachedStandardProviderSteps(providerId)),
+					);
 				}
 			});
 		}
@@ -2351,7 +2355,12 @@ export class ModelRegistry {
 				if (epoch !== this.#compositionEpoch) continue;
 				await earlierCommits;
 				if (epoch !== this.#compositionEpoch) continue;
-				this.#commitRuntimeDiscoveries(builtInDiscovery, replacedConfiguredProviders, touchedProviders, discoveredModels);
+				this.#commitRuntimeDiscoveries(
+					builtInDiscovery,
+					replacedConfiguredProviders,
+					touchedProviders,
+					discoveredModels,
+				);
 				return;
 			}
 		} finally {
@@ -3370,7 +3379,7 @@ export class ModelRegistry {
 	*#hardcodedModelPolicySteps(models: Model<Api>[]): Generator<void, Model<Api>[], undefined> {
 		const extendedContext = isExtendedContextEnabledFromSettings(this.#settings);
 		const compactionPoints = getModelCompactionPointsFromSettings(this.#settings);
-		const out = new Array<Model<Api>>(models.length);
+		const out: Model<Api>[] = [];
 		for (let index = 0; index < models.length; index++) {
 			yield;
 			let model = models[index];
@@ -3382,7 +3391,7 @@ export class ModelRegistry {
 				({ model, tiers } = this.#applyContextWindowPolicies(model, extendedContext, compactionPoints));
 			}
 			if (tiers) this.#policyWindowTiers.set(model, tiers);
-			out[index] = model;
+			out.push(model);
 		}
 		return out;
 	}

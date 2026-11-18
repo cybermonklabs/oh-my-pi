@@ -66,7 +66,9 @@ describe("ModelRegistry discovery slicing", () => {
 	test("a refresh returns to the event loop while it merges, and the catalog it commits is unchanged", async () => {
 		// Reference: the same refresh unsliced, run to completion before any comparison.
 		mockFrozenClock();
-		const reference = new ModelRegistry(authStorage, tempDir.join("reference", "models.yml"), { fetch: offlineFetch });
+		const reference = new ModelRegistry(authStorage, tempDir.join("reference", "models.yml"), {
+			fetch: offlineFetch,
+		});
 		await reference.refresh("offline");
 		const expected = catalogText(reference.getAll());
 		vi.restoreAllMocks();
@@ -268,7 +270,14 @@ describe("ModelRegistry discovery slicing", () => {
 			}
 		};
 		const agents = new AgentRegistry();
-		agents.register({ id: "owned-worker", displayName: "B", kind: "sub", parentId: "Main", session: null, status: "idle" });
+		agents.register({
+			id: "owned-worker",
+			displayName: "B",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "idle",
+		});
 		fs.mkdirSync(tempDir.join("project"));
 		// A turn that waited for the next timer would take up to this period each time.
 		const pendingTimer = setInterval(() => {}, 2_000);
