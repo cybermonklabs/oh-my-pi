@@ -1341,6 +1341,9 @@ const NON_OWNER_STARTUP: readonly RegExp[] = [
 	/^SELECT path, mtime_ms, byte_len, title, title_source, title_updated_at FROM /,
 	/^SELECT a\.attname AS name, pg_catalog\.format_type\(/,
 	/^SELECT 'trigger' AS kind, /,
+	// PostgreSQL: the collation the parts' path column compares with, and the database's: one read-only
+	// pg_catalog SELECT, matched whole so that nothing else rides under it.
+	/^SELECT pg_catalog\.to_jsonb\(c\)::pg_catalog\.text AS collation, pg_catalog\.to_jsonb\(d\)::pg_catalog\.text AS database FROM pg_catalog\.pg_attribute a JOIN pg_catalog\.pg_collation c ON c\.oid = a\.attcollation JOIN pg_catalog\.pg_database d ON d\.datname = pg_catalog\.current_database\(\) WHERE a\.attrelid = pg_catalog\.to_regclass\((\$1| \$omp\$[^$]*\$omp\$ )\) AND a\.attname = 'path' AND NOT a\.attisdropped$/,
 	// MySQL: whether the server has NOWAIT locking reads.
 	/^SELECT VERSION\(\) AS version$/,
 	// MySQL and MariaDB: the lock form the version picked, once, matching no row (a read a row grant allows).
