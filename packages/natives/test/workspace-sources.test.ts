@@ -332,6 +332,58 @@ describe("inputs a build takes in that no listed file names", () => {
 		]);
 	});
 
+	/**
+	 * Run `body` (JS source) in a process of its own, bounded, with `readRustSources`,
+	 * `writeAddonSourcesStamp` and `addonSourcesState` in scope: a read that blocked would hang
+	 * this test runner otherwise. Returns what the body printed, or null when the bound killed it.
+	 */
+	function bounded(body: string): unknown {
+		const sourcesJs = path.join(import.meta.dir, "../native/workspace-sources.js");
+		const script = `const { readRustSources, writeAddonSourcesStamp, addonSourcesState, CARGO_SOURCE_ROOTS } = await import(${JSON.stringify(sourcesJs)});
+const repo = ${JSON.stringify(repo)};
+const addon = ${JSON.stringify(addon)};
+${body}`;
+		const child = Bun.spawnSync([process.execPath, "--no-env-file", "-e", script], {
+			env: gitEnv,
+			stderr: "pipe",
+			timeout: 15_000,
+			killSignal: "SIGKILL",
+		});
+		if (child.exitedDueToTimeout) return null;
+		expect(child.stderr.toString()).toBe("");
+		return JSON.parse(child.stdout.toString());
+	}
+
+	it("record a FIFO a scanned directory holds by its type, without opening it, and stay current", async () => {
+		await checkout();
+		// A FIFO the glob matches: a build that opened it would wait for a writer forever.
+		const fifo = `${defs}/pipe.toml`;
+		expect(Bun.spawnSync(["mkfifo", path.join(repo, fifo)]).exitCode).toBe(0);
+
+		const result = bounded(`const first = readRustSources(repo, CARGO_SOURCE_ROOTS);
+const second = readRustSources(repo, CARGO_SOURCE_ROOTS);
+writeAddonSourcesStamp(addon, first, {});
+console.log(JSON.stringify({ listed: first.files.includes(${JSON.stringify(fifo)}), first: first.hashes[${JSON.stringify(fifo)}], second: second.hashes[${JSON.stringify(fifo)}], state: addonSourcesState(addon, repo) }));`);
+
+		expect(result).not.toBeNull();
+		const { listed, first, second, state } = result as Record<string, unknown>;
+		expect(listed).toBe(true);
+		expect(first).toBe(second);
+		// Not the hash of the bytes of an empty file, nor `missing`.
+		expect(first).not.toBe(new Bun.CryptoHasher("sha256").update("").digest("hex"));
+		expect(first).not.toBe("missing");
+		expect(state).toBe("current");
+	}, 60_000);
+
+	it("are other sources, at once, when a recorded file is replaced by a FIFO", async () => {
+		await checkout();
+		const recorded = path.join(repo, "crates/pi-shell/src/lib.rs");
+		await fs.rm(recorded);
+		expect(Bun.spawnSync(["mkfifo", recorded]).exitCode).toBe(0);
+
+		expect(bounded("console.log(JSON.stringify(addonSourcesState(addon, repo)));")).toBe("other");
+	}, 60_000);
+
 	it("are other sources when a file is added to a scanned directory, committed or not", async () => {
 		await checkout();
 		await Bun.write(path.join(repo, defs, "zz-probe.toml"), "[filters.zz_probe]\n");

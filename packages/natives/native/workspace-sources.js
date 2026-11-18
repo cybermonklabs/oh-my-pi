@@ -430,8 +430,25 @@ function fingerprintOf(repoRoot, files) {
 }
 
 /**
- * SHA-256 of one source as the record identifies it: its bytes, a link's target,
- * or `missing`.
+ * The kind of a file that is neither a regular file nor a link, by which the record names it.
+ * @param {fs.Stats} stat
+ * @returns {string}
+ */
+function specialKind(stat) {
+	if (stat.isFIFO()) return "fifo";
+	if (stat.isSocket()) return "socket";
+	if (stat.isCharacterDevice()) return "character-device";
+	if (stat.isBlockDevice()) return "block-device";
+	if (stat.isDirectory()) return "directory";
+	return "other";
+}
+
+/**
+ * SHA-256 of one source as the record identifies it: its bytes, a link's target, a file of
+ * another kind (a FIFO, a socket, a device) by its kind alone, or `missing`. It never blocks:
+ * a file that `lstat` shows is not regular is never opened, and a regular one is opened
+ * without following a link or waiting (`O_NOFOLLOW | O_NONBLOCK`), so one swapped for a FIFO
+ * or a link in between is named by what `fstat`, or the refused `open`, shows.
  * @param {string} repoRoot
  * @param {string} rel
  */
@@ -440,8 +457,30 @@ function hashSource(repoRoot, rel) {
 	if (!stat) return "missing";
 	const hasher = new Bun.CryptoHasher("sha256");
 	const file = path.join(repoRoot, rel);
-	if (stat.isSymbolicLink()) hasher.update(`symlink\0${fs.readlinkSync(file)}`);
-	else hasher.update(fs.readFileSync(file));
+	if (stat.isSymbolicLink()) {
+		hasher.update(`symlink\0${fs.readlinkSync(file)}`);
+		return hasher.digest("hex");
+	}
+	if (!stat.isFile()) {
+		hasher.update(`special\0${specialKind(stat)}`);
+		return hasher.digest("hex");
+	}
+	const { O_RDONLY, O_NONBLOCK, O_NOFOLLOW } = fs.constants;
+	let fd;
+	try {
+		fd = fs.openSync(file, O_RDONLY | (O_NONBLOCK ?? 0) | (O_NOFOLLOW ?? 0));
+	} catch (err) {
+		// Replaced by a link after the `lstat`: hash it as the link it is now.
+		if (err?.code !== "ELOOP") throw err;
+		hasher.update(`symlink\0${fs.readlinkSync(file)}`);
+		return hasher.digest("hex");
+	}
+	try {
+		const now = fs.fstatSync(fd);
+		hasher.update(now.isFile() ? fs.readFileSync(fd) : `special\0${specialKind(now)}`);
+	} finally {
+		fs.closeSync(fd);
+	}
 	return hasher.digest("hex");
 }
 
