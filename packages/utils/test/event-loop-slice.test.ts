@@ -20,7 +20,10 @@ function mockWorkClock(): { spend: (ms: number) => void } {
 	return { spend: ms => (now += ms) };
 }
 
-/** Numbers the event loop's turns, so a test can see which units ran in the same turn. */
+/**
+ * Numbers the event loop's turns, so a test can see which units ran in the same turn. It ticks in
+ * the check phase and in the timers phase, since a release can come from either.
+ */
 function countTurns(): { turn: () => number; stop: () => void } {
 	let turn = 0;
 	let running = true;
@@ -28,7 +31,12 @@ function countTurns(): { turn: () => number; stop: () => void } {
 		turn++;
 		if (running) setImmediate(tick);
 	};
+	const timerTick = () => {
+		turn++;
+		if (running) setTimeout(timerTick, 0);
+	};
 	setImmediate(tick);
+	setTimeout(timerTick, 0);
 	return { turn: () => turn, stop: () => (running = false) };
 }
 
@@ -196,7 +204,10 @@ describe("mapInSlices", () => {
 		for (const run of held.splice(0)) run();
 		await pass;
 		turns.stop();
-		expect(unitsWhileHeld).toBe(UNITS_PER_SLICE);
+		// One slice ran while the close was held: its units share a turn (a preempted process can
+		// spend the budget in fewer than three of them), and the rest waited for the close.
+		expect(new Set(unitTurns.slice(0, unitsWhileHeld)).size).toBe(1);
+		expect(unitsWhileHeld).toBeLessThan(UNITS_PER_SLICE * 2);
 		expect(unitTurns).toHaveLength(UNITS_PER_SLICE * 2);
 	});
 
@@ -215,6 +226,24 @@ describe("mapInSlices", () => {
 			value => value,
 		);
 		expect(units.length).toBe(500);
+	}, 3_000);
+
+	it("ends a pass whose fake timers are removed while it waits, though the close they set is gone", async () => {
+		vi.useFakeTimers();
+		let now = 1_000;
+		vi.spyOn(performance, "now").mockImplementation(() => now++);
+		const pass = mapInSlices(
+			Array.from({ length: 50 }, (_, index) => index),
+			value => value,
+		);
+		// The pass waits for its next turn. Real time moves on while the fake clock stands still, so once
+		// fake timers go, the open slice has held the loop past its budget by the real clock, and the
+		// close it set went with them.
+		let spin = 0;
+		for (let i = 0; i < 30_000_000; i++) spin += i;
+		vi.useRealTimers();
+		expect((await pass).length).toBe(50);
+		expect(spin).toBeGreaterThan(0);
 	}, 3_000);
 
 	it("runs to completion under fake timers, whose frozen clock never ends a slice", async () => {

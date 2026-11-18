@@ -37,6 +37,8 @@ let waiters: Array<() => void> = [];
 /** The batch of waiters a scheduled release is for; 0 once released. */
 let pendingBatch = 0;
 let lastBatch = 0;
+/** Whether the waiting batch's check-phase leg scheduled a close of its own yet. */
+let closeRearmed = false;
 
 function closeSlice(): void {
 	sliceOpen = false;
@@ -90,6 +92,7 @@ export function nextSlice(): Promise<void> {
 	if (waiters.length === 0) {
 		const batch = ++lastBatch;
 		pendingBatch = batch;
+		closeRearmed = false;
 		setImmediate(releaseWaiters, batch, true);
 		setTimeout(releaseWaiters, 0, batch);
 	}
@@ -101,6 +104,12 @@ function releaseWaiters(batch: number, inCheckPhase = false): void {
 	// The other leg of a released batch, or of one a later batch replaced.
 	if (batch !== pendingBatch) return;
 	if (inCheckPhase && sliceOpen && process.hrtime.bigint() - sliceOpenedAt >= SLICE_NS) {
+		// The close this slice scheduled can be gone: fake timers drop the timers set under them
+		// when they are removed. Another close, at the next timers phase, ends the wait either way.
+		if (!closeRearmed) {
+			closeRearmed = true;
+			setTimeout(closeSlice, 0);
+		}
 		setImmediate(releaseWaiters, batch, true);
 		return;
 	}
