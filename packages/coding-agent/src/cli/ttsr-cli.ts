@@ -15,7 +15,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { AstMatchStrictness, astMatch, FileType, type GlobMatch, glob } from "@oh-my-pi/pi-natives";
+import { AstMatchStrictness, astMatch, FileType, type GlobMatch, glob, readFileBeneath } from "@oh-my-pi/pi-natives";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { getProjectDir } from "@oh-my-pi/pi-utils/dirs";
 import {
@@ -127,6 +127,8 @@ const SOURCE_FILE_EXT =
 const BINARY_PROBE_BYTES = 8192;
 const DEFAULT_MAX_SCAN_BYTES = 5 * 1024 * 1024;
 
+const utf8 = new TextDecoder();
+
 type ReadSkipReason = "binary" | "large" | "unreadable";
 
 interface ScanSkipSummary {
@@ -158,8 +160,12 @@ interface ScanRulePlan {
 }
 
 interface ScanFileCandidate {
+	/** Path relative to the scan directory. */
 	path: string;
-	size?: number;
+	/** Directory the glob walked; the file is read below it. */
+	root: string;
+	/** The glob's match for the file below `root`. */
+	match: GlobMatch;
 }
 
 async function readSnippet(opts: { snippet?: string; file?: string }): Promise<string> {
@@ -813,7 +819,7 @@ async function discoverScanFiles(scanDir: string, cwd: string, gitignore: boolea
 			) {
 				continue;
 			}
-			candidates.push({ path: filePath, size: match.size });
+			candidates.push({ path: filePath, root: globRoot, match });
 		}
 		candidates.sort((a, b) => a.path.localeCompare(b.path));
 		return candidates;
@@ -822,25 +828,28 @@ async function discoverScanFiles(scanDir: string, cwd: string, gitignore: boolea
 	}
 }
 
+/**
+ * Read a scan candidate below the directory the glob walked, following no symlink the
+ * walk did not list: a directory on the way, or the file, swapped for a symlink after
+ * the listing is refused and counted unreadable. One open checks the size, probes the
+ * first bytes for a NUL, then reads the text.
+ */
 async function readScanFileText(
-	absPath: string,
+	candidate: ScanFileCandidate,
 	maxBytes: number,
-	knownSize: number | undefined,
 ): Promise<{ content: string } | { skip: ReadSkipReason }> {
-	const file = Bun.file(absPath);
 	try {
-		const fileSize = knownSize ?? file.size;
-		if (maxBytes > 0 && fileSize > maxBytes) {
-			return { skip: "large" };
+		const read = await readFileBeneath({
+			root: candidate.root,
+			path: candidate.match.path,
+			followSymlink: candidate.match.symlink,
+			maxBytes,
+			binaryProbeBytes: BINARY_PROBE_BYTES,
+		});
+		if (read.skip) {
+			return { skip: read.skip };
 		}
-		const probeBytes = Math.min(fileSize, BINARY_PROBE_BYTES);
-		if (probeBytes > 0) {
-			const prefix = new Uint8Array(await file.slice(0, probeBytes).arrayBuffer());
-			if (prefix.includes(0)) {
-				return { skip: "binary" };
-			}
-		}
-		return { content: await file.text() };
+		return { content: utf8.decode(read.content) };
 	} catch {
 		return { skip: "unreadable" };
 	}
@@ -938,7 +947,7 @@ async function runScan(args: TtsrScanArgs, json: boolean, cwd: string): Promise<
 			continue;
 		}
 
-		const readResult = await readScanFileText(absPath, maxBytes, candidate.size);
+		const readResult = await readScanFileText(candidate, maxBytes);
 		if ("skip" in readResult) {
 			skipped[readResult.skip]++;
 			continue;

@@ -1,6 +1,7 @@
-//! Unix descriptors: relative `openat` opens, positional file reads, and the
-//! per-device stable-stamp verdicts. Listing and stat syscalls come from the
-//! platform's `sys` module.
+//! Unix descriptors: relative `openat` opens, confined opens below a walk
+//! root, positional file reads, and the per-device stable-stamp verdicts.
+//! Listing and stat syscalls, and the kernel's own confined open where it has
+//! one, come from the platform's `sys` module.
 
 use std::{
 	ffi::{c_char, c_int},
@@ -14,7 +15,7 @@ use std::{
 
 use parking_lot::RwLock;
 
-use super::sys;
+use super::{rewrite, sys};
 use crate::fs::{Detail, FileId, FileInfo, FileType, Listing, Stamp, not_regular};
 
 /// An open directory or file descriptor, closed on drop.
@@ -27,6 +28,18 @@ const DIR_FLAGS: c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
 /// `O_NONBLOCK`: a FIFO posing as a regular file must not block the open
 /// before `fstat` rejects it.
 const FILE_FLAGS: c_int = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+/// A write-back open: no truncation before `fstat` shows a regular file,
+/// `O_NONBLOCK` so a FIFO fails (`ENXIO`) or opens without blocking, and
+/// `O_NOCTTY` so a terminal is never adopted.
+const WRITE_FLAGS: c_int = libc::O_WRONLY
+	| libc::O_CREAT
+	| libc::O_CLOEXEC
+	| libc::O_NOFOLLOW
+	| libc::O_NONBLOCK
+	| libc::O_NOCTTY;
+/// Mode of a file a write creates, as [`std::fs::File::create`] creates it
+/// (less the umask).
+const CREATE_MODE: libc::c_uint = 0o666;
 
 /// Largest single read: macOS rejects reads above `INT_MAX` bytes.
 const MAX_READ: usize = 0x7fff_f000;
@@ -81,11 +94,22 @@ pub(super) const fn nanos(sec: i64, nsec: i64) -> i64 {
 /// `openat` retrying `EINTR`, for platforms without extra open flags.
 #[allow(dead_code, reason = "Linux opens through its own O_NOATIME-aware wrapper")]
 pub(super) fn openat_plain(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
+	openat_mode(dir, path, flags, 0)
+}
+
+/// `openat` retrying `EINTR`, passing `mode`, which an `O_CREAT` open gives a
+/// file it creates (less the umask).
+fn openat_mode(
+	dir: RawFd,
+	path: *const c_char,
+	flags: c_int,
+	mode: libc::c_uint,
+) -> io::Result<OwnedFd> {
 	use std::os::fd::FromRawFd;
 	loop {
-		// SAFETY: `path` is a NUL-terminated string the caller keeps alive; the
-		// flags never include `O_CREAT`, so no mode argument is read.
-		let fd = unsafe { libc::openat(dir, path, flags) };
+		// SAFETY: `path` is a NUL-terminated string the caller keeps alive, and
+		// the mode argument an `O_CREAT` open reads is passed.
+		let fd = unsafe { libc::openat(dir, path, flags, mode) };
 		if fd >= 0 {
 			// SAFETY: `openat` returned a fresh descriptor this call owns.
 			return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
@@ -117,21 +141,138 @@ pub(crate) fn list(
 	sys::list(s, dir.as_raw_fd(), detail, children, out)
 }
 
+/// Opens the regular file `name` (one component) in `dir`; without `follow`,
+/// `O_NOFOLLOW` refuses a symlink there (`ELOOP`).
 pub(crate) fn open_file_at(
 	s: &mut Scratch,
 	dir: &Handle,
 	name: &[u8],
+	follow: bool,
 ) -> io::Result<(Handle, FileInfo)> {
-	open_file_in(s, dir.as_raw_fd(), name)
+	let name = s.cstr(name)?;
+	let flags = if follow {
+		FILE_FLAGS
+	} else {
+		FILE_FLAGS | libc::O_NOFOLLOW
+	};
+	regular(sys::openat(dir.as_raw_fd(), name, flags)?)
 }
 
 pub(crate) fn open_file(s: &mut Scratch, path: &Path) -> io::Result<(Handle, FileInfo)> {
-	open_file_in(s, libc::AT_FDCWD, path.as_os_str().as_bytes())
+	let path = s.cstr(path.as_os_str().as_bytes())?;
+	regular(sys::openat(libc::AT_FDCWD, path, FILE_FLAGS)?)
 }
 
-fn open_file_in(s: &mut Scratch, dir: RawFd, name: &[u8]) -> io::Result<(Handle, FileInfo)> {
+/// Opens the regular file at the walk-relative `rel` below `root`, following
+/// no symlink on the way ([`sys::open_beneath`]).
+pub(crate) fn open_file_beneath(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+) -> io::Result<(Handle, FileInfo)> {
+	regular(sys::open_beneath(s, root.as_raw_fd(), rel, FILE_FLAGS | libc::O_NOFOLLOW)?)
+}
+
+/// Opens the directory at the walk-relative `rel` below `root`, following no
+/// symlink on the way ([`sys::open_beneath`]).
+pub(crate) fn open_dir_beneath(s: &mut Scratch, root: &Handle, rel: &[u8]) -> io::Result<Handle> {
+	sys::open_beneath(s, root.as_raw_fd(), rel, DIR_FLAGS | libc::O_NOFOLLOW)
+}
+
+/// Rewrites the regular file at the walk-relative `rel` below `root` in place
+/// with `contents`, creating it when missing: its directory opens as in
+/// [`open_dir_beneath`], the file relative to that directory with
+/// `O_NOFOLLOW` (`ELOOP` for a symlink there), and the file is truncated only
+/// once `fstat` shows a regular file.
+pub(crate) fn write_file_beneath(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+	contents: &[u8],
+) -> io::Result<()> {
+	let (parent, name) = parent_beneath(s, root, rel)?;
+	let at = parent.as_ref().unwrap_or(root).as_raw_fd();
 	let name = s.cstr(name)?;
-	let fd = sys::openat(dir, name, FILE_FLAGS)?;
+	let (fd, _) = regular(openat_mode(at, name, WRITE_FLAGS, CREATE_MODE)?)?;
+	rewrite(std::fs::File::from(fd), contents)
+}
+
+/// Removes the entry at the walk-relative `rel` below `root`: its directory
+/// opens as in [`open_dir_beneath`], then `unlinkat` relative to that
+/// directory removes the entry (an empty directory with `AT_REMOVEDIR` when
+/// `dir`), a symlink there itself.
+pub(crate) fn remove_beneath(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+	dir: bool,
+) -> io::Result<()> {
+	let (parent, name) = parent_beneath(s, root, rel)?;
+	let at = parent.as_ref().unwrap_or(root).as_raw_fd();
+	let name = s.cstr(name)?;
+	let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
+	// SAFETY: `name` is a NUL-terminated string the scratch keeps alive.
+	if unsafe { libc::unlinkat(at, name, flags) } == 0 {
+		Ok(())
+	} else {
+		Err(io::Error::last_os_error())
+	}
+}
+
+/// The directory holding the last component of the walk-relative `rel`
+/// below `root`, opened as in [`open_dir_beneath`] (`None`: `root` itself),
+/// and that component.
+fn parent_beneath<'r>(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &'r [u8],
+) -> io::Result<(Option<Handle>, &'r [u8])> {
+	match memchr::memrchr(b'/', rel) {
+		Some(slash) => Ok((Some(open_dir_beneath(s, root, &rel[..slash])?), &rel[slash + 1..])),
+		None => Ok((None, rel)),
+	}
+}
+
+/// [`open_file_beneath`] (`dir` false; the handle is not yet checked to be a
+/// regular file) or [`open_dir_beneath`] through the portable
+/// [`walk_beneath`] whatever the kernel offers, so tests cover both paths.
+#[cfg(test)]
+pub(crate) fn open_beneath_walking(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+	dir: bool,
+) -> io::Result<Handle> {
+	let flags = if dir { DIR_FLAGS } else { FILE_FLAGS };
+	walk_beneath(s, root.as_raw_fd(), rel, flags | libc::O_NOFOLLOW)
+}
+
+/// Opens `rel` (`/`-separated names, none empty, `.` or `..`) below `dir` one
+/// component at a time: each directory on the way with `O_DIRECTORY |
+/// O_NOFOLLOW` relative to the one before, then the last component with
+/// `flags`, which carry `O_NOFOLLOW`. A symlink anywhere fails the open
+/// (`ELOOP`, or `ENOTDIR` for a directory on the way). At most two
+/// descriptors are open at once, the directory reached and the next one.
+pub(super) fn walk_beneath(
+	s: &mut Scratch,
+	dir: RawFd,
+	rel: &[u8],
+	flags: c_int,
+) -> io::Result<OwnedFd> {
+	let mut reached: Option<OwnedFd> = None;
+	let mut rest = rel;
+	while let Some(slash) = memchr::memchr(b'/', rest) {
+		let name = s.cstr(&rest[..slash])?;
+		let at = reached.as_ref().map_or(dir, AsRawFd::as_raw_fd);
+		reached = Some(sys::openat(at, name, DIR_FLAGS | libc::O_NOFOLLOW)?);
+		rest = &rest[slash + 1..];
+	}
+	let name = s.cstr(rest)?;
+	sys::openat(reached.as_ref().map_or(dir, AsRawFd::as_raw_fd), name, flags)
+}
+
+/// `fd` and its metadata when it is a regular file.
+fn regular(fd: OwnedFd) -> io::Result<(Handle, FileInfo)> {
 	let info = sys::stat_fd(fd.as_raw_fd())?;
 	if info.file_type != Some(FileType::File) {
 		return Err(not_regular());
@@ -160,6 +301,14 @@ pub(crate) fn read_at(h: &Handle, buf: &mut [u8], off: u64) -> io::Result<usize>
 	// SAFETY: `buf` is writable for `want` bytes.
 	let n = unsafe { libc::pread(h.as_raw_fd(), buf.as_mut_ptr().cast(), want, off as libc::off_t) };
 	usize::try_from(n).map_err(|_| io::Error::last_os_error())
+}
+
+/// Identity of an open file, read from its descriptor rather than from the
+/// path it was opened by.
+pub(crate) fn handle_metadata(h: &Handle) -> io::Result<pi_vfs::Metadata> {
+	use std::os::fd::AsFd;
+	let owned = h.as_fd().try_clone_to_owned()?;
+	pi_vfs::Metadata::from_file(&std::fs::File::from(owned))
 }
 
 pub(crate) fn stat(s: &mut Scratch, path: &Path, follow: bool) -> io::Result<FileInfo> {
