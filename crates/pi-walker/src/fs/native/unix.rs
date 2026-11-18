@@ -126,9 +126,11 @@ pub(crate) fn open_dir(s: &mut Scratch, path: &Path) -> io::Result<Handle> {
 	sys::openat(libc::AT_FDCWD, path, DIR_FLAGS)
 }
 
+/// Opens the subdirectory `name` of `parent` following no symlink there
+/// ([`sys::openat_dir`]).
 pub(crate) fn open_child(s: &mut Scratch, parent: &Handle, name: &[u8]) -> io::Result<Handle> {
 	let name = s.cstr(name)?;
-	sys::openat(parent.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)
+	sys::openat_dir(parent.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)
 }
 
 pub(crate) fn list(
@@ -248,11 +250,12 @@ pub(crate) fn open_beneath_walking(
 }
 
 /// Opens `rel` (`/`-separated names, none empty, `.` or `..`) below `dir` one
-/// component at a time: each directory on the way with `O_DIRECTORY |
-/// O_NOFOLLOW` relative to the one before, then the last component with
-/// `flags`, which carry `O_NOFOLLOW`. A symlink anywhere fails the open
-/// (`ELOOP`, or `ENOTDIR` for a directory on the way). At most two
-/// descriptors are open at once, the directory reached and the next one.
+/// component at a time: each directory on the way, and the last component
+/// when `flags` carry `O_DIRECTORY`, with [`sys::openat_dir`] relative to the
+/// one before, which opens no symlink (`ENOTDIR`); a last component that is
+/// not a directory with `flags`, which carry `O_NOFOLLOW` (`ELOOP` for a
+/// symlink). At most two descriptors are open at once, the directory reached
+/// and the next one.
 pub(super) fn walk_beneath(
 	s: &mut Scratch,
 	dir: RawFd,
@@ -264,11 +267,16 @@ pub(super) fn walk_beneath(
 	while let Some(slash) = memchr::memchr(b'/', rest) {
 		let name = s.cstr(&rest[..slash])?;
 		let at = reached.as_ref().map_or(dir, AsRawFd::as_raw_fd);
-		reached = Some(sys::openat(at, name, DIR_FLAGS | libc::O_NOFOLLOW)?);
+		reached = Some(sys::openat_dir(at, name, DIR_FLAGS | libc::O_NOFOLLOW)?);
 		rest = &rest[slash + 1..];
 	}
 	let name = s.cstr(rest)?;
-	sys::openat(reached.as_ref().map_or(dir, AsRawFd::as_raw_fd), name, flags)
+	let at = reached.as_ref().map_or(dir, AsRawFd::as_raw_fd);
+	if flags & libc::O_DIRECTORY != 0 {
+		sys::openat_dir(at, name, flags)
+	} else {
+		sys::openat(at, name, flags)
+	}
 }
 
 /// `fd` and its metadata when it is a regular file.

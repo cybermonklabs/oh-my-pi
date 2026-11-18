@@ -9,6 +9,11 @@
 //!   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, which refuses any symlink on the
 //!   way and any escape from the root; kernels and sandboxes without `openat2`
 //!   get the portable one-component-at-a-time walk.
+//! - A directory opened with `O_DIRECTORY | O_NOFOLLOW` ([`openat_dir`]: a
+//!   listed subdirectory, or one on that walk) is trusted to be no symlink only
+//!   once this kernel was seen refusing one; gVisor before release-20261109.0
+//!   follows it, so there each such open is checked by device and inode against
+//!   the entry `fstatat` found at its name.
 //! - Listings use raw `getdents64` into a large reusable buffer, parsed in
 //!   place; `d_type` supplies entry types without per-entry stat calls.
 //! - Full detail and `DT_UNKNOWN` entries use `statx` with only the needed
@@ -26,8 +31,8 @@ use std::{
 	ffi::{c_char, c_int, c_long, c_uint},
 	io,
 	mem::MaybeUninit,
-	os::fd::{FromRawFd, OwnedFd, RawFd},
-	sync::atomic::{AtomicBool, AtomicI32, Ordering},
+	os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+	sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering},
 };
 
 use super::{
@@ -73,6 +78,19 @@ static NO_STATX: AtomicBool = AtomicBool::new(false);
 /// know its arguments, `EPERM` from a policy that allows `openat`. The same
 /// errors from the file's own open fail the walk too and leave it unset.
 static NO_OPENAT2: AtomicBool = AtomicBool::new(false);
+
+/// [`openat_dir`]'s verdict on this kernel: [`UNPROBED`] until
+/// [`probe_directory_links`] answers, then [`REFUSED`] or [`FOLLOWED`].
+static DIRECTORY_LINKS: AtomicU8 = AtomicU8::new(UNPROBED);
+/// Held while [`probe_directory_links`] runs, so a process probes once
+/// however many threads open their first directory together.
+static PROBING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+const UNPROBED: u8 = 0;
+/// The kernel refused a final symlink to a directory that `O_DIRECTORY |
+/// O_NOFOLLOW` named, as Linux does.
+const REFUSED: u8 = 1;
+/// The kernel followed it, or the probe could not tell.
+const FOLLOWED: u8 = 2;
 
 /// `struct open_how` of `openat2(2)`.
 #[repr(C)]
@@ -163,6 +181,8 @@ fn opened(ret: c_long) -> io::Result<RawFd> {
 }
 
 pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
+	#[cfg(test)]
+	let flags = seam::openat_flags(flags);
 	with_noatime(|extra| {
 		#[cfg(test)]
 		if let Some(err) = seam::failed(seam::Call::Openat, flags | extra) {
@@ -172,6 +192,93 @@ pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Resul
 		// flags never include `O_CREAT`, so no mode argument is read.
 		opened(c_long::from(unsafe { libc::openat(dir, path, flags | extra) }))
 	})
+}
+
+/// Opens the directory `path` (one component) in `dir` with `flags`, which
+/// carry `O_DIRECTORY | O_NOFOLLOW`, so that no symlink there is opened. A
+/// kernel seen refusing such a symlink ([`directory_links_refused`]) is
+/// trusted with one `openat`. Elsewhere the open is checked instead of the
+/// flags: gVisor before release-20261109.0, GKE Sandbox's among them, follows
+/// a final symlink to a directory despite `O_NOFOLLOW` when `O_DIRECTORY` is
+/// set (google/gvisor#14786). The entry must be a directory by
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` before the open (else `ENOTDIR`, Linux's
+/// refusal of a symlink there), and the descriptor that directory by device
+/// and inode. A descriptor of another file stands only when the name holds it
+/// after the open, still as a directory (one renamed into place, which Linux
+/// opens too); else the open fails with `ENOTDIR`.
+pub(super) fn openat_dir(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
+	if directory_links_refused() {
+		return openat(dir, path, flags);
+	}
+	let entry = fstatat(dir, path, libc::AT_SYMLINK_NOFOLLOW)?;
+	if !is_dir(&entry) {
+		return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+	}
+	#[cfg(test)]
+	seam::run_before_open();
+	let fd = openat(dir, path, flags)?;
+	let opened = fstatat(fd.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH)?;
+	if same_file(&opened, &entry) {
+		return Ok(fd);
+	}
+	match fstatat(dir, path, libc::AT_SYMLINK_NOFOLLOW) {
+		Ok(now) if is_dir(&now) && same_file(&opened, &now) => Ok(fd),
+		_ => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+	}
+}
+
+/// Whether this kernel refuses a final symlink to a directory that
+/// `O_DIRECTORY | O_NOFOLLOW` names, probed once per process.
+fn directory_links_refused() -> bool {
+	if DIRECTORY_LINKS.load(Ordering::Acquire) == UNPROBED {
+		let _probing = PROBING.lock();
+		if DIRECTORY_LINKS.load(Ordering::Acquire) == UNPROBED {
+			DIRECTORY_LINKS.store(probe_directory_links(), Ordering::Release);
+		}
+	}
+	DIRECTORY_LINKS.load(Ordering::Acquire) == REFUSED
+}
+
+/// Opens `/proc/self`, a symlink to this process's directory wherever procfs
+/// is mounted, with `O_DIRECTORY | O_NOFOLLOW`: [`REFUSED`] only when it is a
+/// symlink to a directory and the open fails as Linux fails it (`ENOTDIR`;
+/// `ELOOP` would refuse it too), so the kernel refused the link. Following the
+/// link in the VFS, as gVisor does, is the same for every filesystem, and
+/// anything else (no procfs, an open that succeeds) is [`FOLLOWED`], which
+/// keeps the check.
+fn probe_directory_links() -> u8 {
+	let link = c"/proc/self".as_ptr();
+	let (Ok(own), Ok(target)) =
+		(fstatat(libc::AT_FDCWD, link, libc::AT_SYMLINK_NOFOLLOW), fstatat(libc::AT_FDCWD, link, 0))
+	else {
+		return FOLLOWED;
+	};
+	if own.st_mode & libc::S_IFMT != libc::S_IFLNK || !is_dir(&target) {
+		return FOLLOWED;
+	}
+	let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+	#[cfg(test)]
+	let flags = seam::openat_flags(flags);
+	// SAFETY: `link` is a NUL-terminated literal; no `O_CREAT`, so no mode.
+	let fd = unsafe { libc::openat(libc::AT_FDCWD, link, flags) };
+	if fd >= 0 {
+		// SAFETY: `openat` returned a fresh descriptor this call owns.
+		drop(unsafe { OwnedFd::from_raw_fd(fd) });
+		return FOLLOWED;
+	}
+	match io::Error::last_os_error().raw_os_error() {
+		Some(libc::ENOTDIR | libc::ELOOP) => REFUSED,
+		_ => FOLLOWED,
+	}
+}
+
+const fn is_dir(st: &libc::stat) -> bool {
+	st.st_mode & libc::S_IFMT == libc::S_IFDIR
+}
+
+/// Whether `a` and `b` describe the same file: one device, one inode.
+const fn same_file(a: &libc::stat, b: &libc::stat) -> bool {
+	a.st_dev == b.st_dev && a.st_ino == b.st_ino
 }
 
 /// Opens the relative `rel` (`/`-separated names, none empty, `.` or `..`)
@@ -430,12 +537,17 @@ pub(super) fn fine_timestamps(fd: RawFd) -> bool {
 	matches!(magic, EXT4 | XFS | BTRFS | TMPFS | F2FS | BCACHEFS | ZFS)
 }
 
-/// Test seam for the open syscalls' error paths: a test names, per call and
-/// its flags, the `errno` the call fails with on the test's own thread,
-/// instead of running it.
+/// Test seam for the open syscalls: a test names, per call and its flags, the
+/// `errno` the call fails with on the test's own thread, instead of running
+/// it; makes that thread's `openat` follow symlinks as gVisor does; and runs
+/// a hook inside [`super::openat_dir`].
 #[cfg(test)]
 mod seam {
-	use std::{cell::RefCell, ffi::c_int, io};
+	use std::{
+		cell::{Cell, RefCell},
+		ffi::c_int,
+		io,
+	};
 
 	/// The open syscall a [`fail_opens`] closure is asked about.
 	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,6 +562,8 @@ mod seam {
 
 	thread_local! {
 		static FAIL: RefCell<Option<Fail>> = const { RefCell::new(None) };
+		static FOLLOWS: Cell<bool> = const { Cell::new(false) };
+		static BEFORE_OPEN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 	}
 
 	/// Fails this thread's open syscalls for which `fail` returns an `errno`,
@@ -474,23 +588,67 @@ mod seam {
 			.with_borrow_mut(|slot| slot.as_mut()?(call, flags))
 			.map(io::Error::from_raw_os_error)
 	}
+
+	/// Makes this thread's `openat` follow a final symlink despite
+	/// `O_NOFOLLOW` when `O_DIRECTORY` is set, as gVisor before
+	/// release-20261109.0 does (google/gvisor#14786), until the returned
+	/// guard drops.
+	pub(super) fn follow_directory_links() -> Following {
+		FOLLOWS.set(true);
+		Following
+	}
+
+	/// Makes this thread's `openat` honour `O_NOFOLLOW` again when dropped.
+	pub(super) struct Following;
+
+	impl Drop for Following {
+		fn drop(&mut self) {
+			FOLLOWS.set(false);
+		}
+	}
+
+	/// The flags this thread's `openat` passes the kernel for `flags`.
+	pub(super) fn openat_flags(flags: c_int) -> c_int {
+		if FOLLOWS.get() && flags & libc::O_DIRECTORY != 0 {
+			flags & !libc::O_NOFOLLOW
+		} else {
+			flags
+		}
+	}
+
+	/// Runs `hook` in the next [`super::openat_dir`] on this thread, between
+	/// its check of the entry and its open.
+	pub(super) fn before_open(hook: impl FnOnce() + 'static) {
+		BEFORE_OPEN.set(Some(Box::new(hook)));
+	}
+
+	/// Runs the hook [`before_open`] set on this thread, if any.
+	pub(super) fn run_before_open() {
+		if let Some(hook) = BEFORE_OPEN.take() {
+			hook();
+		}
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use std::{
 		ffi::{CString, c_int},
-		fs,
-		os::{fd::AsRawFd, unix::ffi::OsStrExt},
-		path::PathBuf,
+		fs, io,
+		os::{
+			fd::AsRawFd,
+			unix::{ffi::OsStrExt, fs::MetadataExt},
+		},
+		path::{Path, PathBuf},
 		sync::atomic::Ordering,
 	};
 
 	use parking_lot::Mutex;
 
 	use super::{
-		NO_OPENAT2, NOATIME, OpenHow, RESOLVE, Scratch, open_beneath, openat,
-		seam::{Call, fail_opens},
+		DIRECTORY_LINKS, FOLLOWED, NO_OPENAT2, NOATIME, OpenHow, REFUSED, RESOLVE, Scratch, UNPROBED,
+		open_beneath, openat, probe_directory_links,
+		seam::{Call, before_open, fail_opens, follow_directory_links},
 	};
 
 	/// A file open below a root.
@@ -528,6 +686,7 @@ mod tests {
 	fn reset() {
 		NOATIME.store(libc::O_NOATIME, Ordering::SeqCst);
 		NO_OPENAT2.store(false, Ordering::SeqCst);
+		DIRECTORY_LINKS.store(UNPROBED, Ordering::SeqCst);
 	}
 
 	/// Whether the kernel opens `a/f` below `root` with `openat2`.
@@ -643,6 +802,111 @@ mod tests {
 			NO_OPENAT2.load(Ordering::SeqCst),
 			"an openat2 the kernel does not know stays in use"
 		);
+		reset();
+	}
+
+	/// Device and inode of the file `path` names, following symlinks.
+	fn id_at(path: &Path) -> (u64, u64) {
+		let meta = fs::metadata(path).expect("stat");
+		(meta.dev(), meta.ino())
+	}
+
+	/// Device and inode of the open `fd`.
+	fn id_of(fd: std::os::fd::OwnedFd) -> (u64, u64) {
+		let meta = fs::File::from(fd).metadata().expect("fstat");
+		(meta.dev(), meta.ino())
+	}
+
+	/// The probe trusts a kernel only when it refuses a symlink to a
+	/// directory that `O_DIRECTORY | O_NOFOLLOW` names: it agrees with this
+	/// kernel's own answer for such a link in a scratch tree, and does not
+	/// trust a kernel that follows one.
+	#[test]
+	fn the_probe_trusts_only_a_kernel_that_refuses_a_directory_link() {
+		let tree = Tree::new("probe");
+		std::os::unix::fs::symlink("a", tree.0.join("link")).expect("link to a");
+		let root = fs::File::open(&tree.0).expect("open the root");
+		let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+		// SAFETY: the path is a NUL-terminated literal; no `O_CREAT`.
+		let fd = unsafe { libc::openat(root.as_raw_fd(), c"link".as_ptr(), flags) };
+		let refused = fd < 0
+			&& matches!(io::Error::last_os_error().raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP));
+		if fd >= 0 {
+			// SAFETY: `openat` returned a fresh descriptor this test owns.
+			unsafe { libc::close(fd) };
+		}
+		let kernel = if refused { REFUSED } else { FOLLOWED };
+		if fs::symlink_metadata("/proc/self").is_ok_and(|m| m.file_type().is_symlink()) {
+			assert_eq!(probe_directory_links(), kernel, "the probe disagrees with this kernel");
+		} else {
+			eprintln!("UNKNOWN: no /proc/self symlink here; the probe was not compared");
+		}
+		let _follows = follow_directory_links();
+		assert_eq!(probe_directory_links(), FOLLOWED, "a kernel that follows the link was trusted");
+	}
+
+	/// A kernel that follows a final symlink to a directory despite
+	/// `O_DIRECTORY | O_NOFOLLOW` and has no `openat2`, as GKE Sandbox's
+	/// gVisor does (google/gvisor#14786), still opens nothing through a
+	/// symlink below a root: a symlink at a directory's name is refused before
+	/// the open, a directory swapped for one between that check and the open
+	/// is refused by its device and inode, and a directory renamed into the
+	/// name in between opens, as Linux opens it.
+	#[test]
+	fn a_kernel_that_follows_a_symlink_despite_o_nofollow_opens_nothing_through_one() {
+		let _serial = SWITCHES.lock();
+		let tree = Tree::new("follows");
+		let outside = Tree::new("follows-outside");
+		fs::write(outside.0.join("f"), "outside").expect("write outside/f");
+		std::os::unix::fs::symlink(&outside.0, tree.0.join("link")).expect("link to outside");
+		let root = fs::File::open(&tree.0).expect("open the root");
+		let mut s = Scratch::default();
+		const DIR: c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+
+		reset();
+		let _no_openat2 = fail_opens(|call, _| (call == Call::Openat2).then_some(libc::ENOSYS));
+		let _follows = follow_directory_links();
+		// The control: this kernel follows the link that `O_NOFOLLOW` names,
+		// and the probe sees it. Its verdict is stored here, so no other
+		// test's probe of the real kernel can store its own first.
+		let followed = openat(root.as_raw_fd(), c"link".as_ptr(), DIR).expect("the kernel follows");
+		assert_eq!(id_of(followed), id_at(&outside.0), "the emulated kernel did not follow");
+		let verdict = probe_directory_links();
+		assert_eq!(verdict, FOLLOWED, "the probe trusted the emulated kernel");
+		DIRECTORY_LINKS.store(verdict, Ordering::SeqCst);
+
+		for (rel, flags) in [(&b"link"[..], DIR), (b"link/f", FLAGS)] {
+			let err = open_beneath(&mut s, root.as_raw_fd(), rel, flags).unwrap_err();
+			assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{rel:?}: {err:?}");
+		}
+		assert!(NO_OPENAT2.load(Ordering::SeqCst), "the walk did not replace the missing openat2");
+
+		// `a` swapped for a link to `outside`, which holds an `f` too.
+		let (a, parked) = (tree.0.join("a"), tree.0.join("a-parked"));
+		for (rel, flags) in [(&b"a"[..], DIR), (b"a/f", FLAGS)] {
+			let (a2, parked2, target) = (a.clone(), parked.clone(), outside.0.clone());
+			before_open(move || {
+				fs::rename(&a2, &parked2).expect("park a");
+				std::os::unix::fs::symlink(&target, &a2).expect("link a to outside");
+			});
+			let opened = open_beneath(&mut s, root.as_raw_fd(), rel, flags);
+			assert!(parked.exists(), "{rel:?}: the swap did not run");
+			let err = opened.expect_err("opened through the swapped link");
+			assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{rel:?}: {err:?}");
+			fs::remove_file(&a).expect("unlink a");
+			fs::rename(&parked, &a).expect("restore a");
+		}
+
+		// A directory renamed into `a`'s name is there by its own name.
+		fs::create_dir(tree.0.join("b")).expect("create b");
+		let (a2, old, b) = (a.clone(), tree.0.join("a-old"), tree.0.join("b"));
+		before_open(move || {
+			fs::rename(&a2, &old).expect("move a away");
+			fs::rename(&b, &a2).expect("rename b to a");
+		});
+		let fd = open_beneath(&mut s, root.as_raw_fd(), b"a", DIR).expect("the renamed directory");
+		assert!(tree.0.join("a-old").exists(), "the rename did not run");
+		assert_eq!(id_of(fd), id_at(&a));
 		reset();
 	}
 }

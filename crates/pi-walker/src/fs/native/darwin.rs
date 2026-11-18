@@ -70,6 +70,12 @@ pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Resul
 	openat_plain(dir, path, flags)
 }
 
+/// Opens the directory `path` (one component) in `dir` with `flags`, which
+/// carry `O_DIRECTORY | O_NOFOLLOW`: XNU refuses a symlink there itself.
+pub(super) fn openat_dir(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
+	openat_plain(dir, path, flags)
+}
+
 /// Opens `rel` below `dir` following no symlink on the way: the portable
 /// [`walk_beneath`], which needs nothing newer than `openat` and
 /// `O_NOFOLLOW`.
