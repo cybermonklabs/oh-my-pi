@@ -9,6 +9,7 @@ import type { JobWidgetRegistry } from "../job-widgets/types";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { AsyncJobInspection, AsyncJobSnapshot, AsyncJobSnapshotItem, AsyncJobTree } from "./agent-session-types";
+import { plainTurnAbortReason } from "./exit-diagnostics";
 
 /** The public summary of `job` (see {@link AsyncJobSnapshotItem}); its caption shows only while widgets are on. */
 function jobSnapshotItem(job: AsyncJob, widgets: JobWidgetRegistry | undefined): AsyncJobSnapshotItem {
@@ -162,8 +163,11 @@ export function ownedAsyncJob(
 	return !agentId || job.ownerId === agentId ? job : undefined;
 }
 
-/** Cancel a running job `agentId` owns; false when there is none by that id. */
+/**
+ * Cancel a running job `agentId` owns (the user's `/jobs kill`, the jobs sheet); false when there
+ * is none by that id. The user's cancel stops the job: a subagent of the job reads its kind.
+ */
 export function cancelOwnedAsyncJob(manager: AsyncJobManagerApi, agentId: string | undefined, id: string): boolean {
 	const job = ownedAsyncJob(manager, agentId, id);
-	return job !== undefined && manager.cancel(id, { ownerId: job.ownerId });
+	return job !== undefined && manager.cancel(id, { ownerId: job.ownerId }, plainTurnAbortReason("stop"));
 }

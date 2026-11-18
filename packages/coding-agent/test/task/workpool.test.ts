@@ -5,6 +5,7 @@ import { AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import type { AgentSession } from "../../src/session/agent-session";
 import { WaitTool } from "../../src/tools/wait";
+import { plainTurnAbortReason, turnAbortKind } from "../../src/session/exit-diagnostics";
 import type { CustomMessage } from "../../src/session/messages";
 import * as executor from "../../src/task/executor";
 import type { EffectiveSubagentPolicy, StructuredSubagentResult } from "../../src/task/structured-subagent";
@@ -455,6 +456,32 @@ describe("WorkPool dispatch", () => {
 		first.resolve();
 		await finishPool(session, workpool);
 		expect(workpool.peek().pending).toBe(0);
+	});
+
+	it("cancelling the pool job aborts each running batch with the pool's reason", async () => {
+		// If this regresses, the pool cancels its batches with the platform's unmarked reason, which their subagents
+		// read as a cut-off: the owner's cancel of the pool leaves its workers for `omp --restore`.
+		const session = makeSession([], 1);
+		const started = Promise.withResolvers<void>();
+		const batchAbortReason = Promise.withResolvers<unknown>();
+		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
+			const signal = request.signal;
+			if (!signal) throw new Error("Expected the batch job's signal");
+			signal.addEventListener("abort", () => batchAbortReason.resolve(signal.reason), { once: true });
+			started.resolve();
+			await batchAbortReason.promise;
+			const id = request.identity?.id ?? "missing";
+			markIdle(id);
+			return execution(id);
+		});
+		const workpool = pool(session, "cancelled");
+		workpool.push(["running"]);
+		await started.promise;
+
+		expect(session.asyncJobManager?.cancel(workpool.name, { ownerId: "Main" }, plainTurnAbortReason("stop"))).toBe(
+			true,
+		);
+		expect(turnAbortKind(await batchAbortReason.promise)).toBe("stop");
 	});
 });
 

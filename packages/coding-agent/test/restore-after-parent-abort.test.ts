@@ -5,9 +5,11 @@
  * the parent never adopted; launches the call adopted but never started, because the
  * call was aborted first, follow that abort: the parent's process exit leaves them
  * restorable, the parent's stop ends them; a stop of a continuation turn (one a queued
- * steer started) without a reason stops its subagent too; and the parent's process exit
+ * steer started) without a reason stops its subagent too; the parent's process exit
  * during its sync call leaves the subagent for `--restore`, although the call records the
- * run that exit cut off as its result.
+ * run that exit cut off as its result; and a subagent a JavaScript eval cell started
+ * through `tool.task` follows the parent's abort the same way: an exit cuts it off, the
+ * user's stop ends it.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -23,12 +25,14 @@ import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { hasRestorableTurn, plainTurnAbortReason } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { activeBranch, type SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { collectSubSessions, type SubSession } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
@@ -110,6 +114,18 @@ function batchCall(names: readonly string[]) {
 	};
 }
 
+/** The parent's `eval` call: a JavaScript cell that runs one worker through its sync `task` tool. */
+const CELL_CALL = {
+	type: "toolCall" as const,
+	id: "call_eval",
+	name: "eval",
+	arguments: {
+		language: "js",
+		code: `print(await tool.task(${JSON.stringify(batchCall(["CellWorker"]))}))`,
+		timeout: 0,
+	},
+};
+
 /** The host's go-ahead for every launch, as under auto-allow approval with no lifecycle handlers. */
 const launchSink: SpeculativeOperationSink = {
 	maxInFlight: 2,
@@ -147,13 +163,14 @@ function holdBackoff(expected: number) {
 
 /**
  * A parent session on the production SDK path whose batch `task` tool runs `WORKER`
- * subagents in sync (no background jobs); a turn of its model spawns one worker. The
- * worker's model is on anthropic, keyed by the store's only OAuth login; its first
- * request disables that login, as a failed refresh does, so every later request has no
- * key and its turn waits out a retry backoff. Every subagent run's result is collected
- * in `runs`.
+ * subagents in sync (no background jobs); a turn of its model spawns one worker, by a
+ * `task` call, or with `delegation: "eval"` by an `eval` call whose JavaScript cell calls
+ * `tool.task` (`CELL_CALL`). The worker's model is on anthropic, keyed by the store's
+ * only OAuth login; its first request disables that login, as a failed refresh does, so
+ * every later request has no key and its turn waits out a retry backoff. Every subagent
+ * run's result is collected in `runs`.
  */
-async function openParentWithKeyedWorkers() {
+async function openParentWithKeyedWorkers(delegation: "task" | "eval" = "task") {
 	const cwd = root.join("home", "work");
 	await Bun.write(path.join(cwd, NOTES_FILE), "the notes\n");
 	const authStorage = await AuthStorage.create(root.join("parentauth.db"), { usageProviderResolver: () => undefined });
@@ -169,7 +186,11 @@ async function openParentWithKeyedWorkers() {
 				return { content: ["The worker could not read the notes."] };
 			}
 			return {
-				content: [{ type: "toolCall", id: CALL.id, name: "task", arguments: batchCall(["SteeredWorker"]) }],
+				content: [
+					delegation === "eval"
+						? CELL_CALL
+						: { type: "toolCall", id: CALL.id, name: "task", arguments: batchCall(["SteeredWorker"]) },
+				],
 				stopReason: "toolUse",
 			};
 		},
@@ -222,8 +243,10 @@ async function openParentWithKeyedWorkers() {
 			"todo.reminders": false,
 			"advisor.enabled": false,
 			"autolearn.enabled": false,
+			"eval.py": false,
+			"eval.autoBackground.enabled": false,
 		}),
-		toolNames: ["task"],
+		toolNames: delegation === "eval" ? ["eval", "task"] : ["task"],
 		spawns: "*",
 		disableExtensionDiscovery: true,
 		skills: [],
@@ -236,6 +259,7 @@ async function openParentWithKeyedWorkers() {
 		skipPythonPreflight: true,
 	});
 	cleanups.push(() => session.dispose());
+	if (delegation === "eval") cleanups.push(() => disposeAllVmContexts());
 	const task = session.getToolByName("task");
 	const launches = await task?.speculation?.stream?.open({ coordinator: launchSink, parentToolCallId: CALL.id });
 	if (!task || !launches) throw new Error("Expected the task tool to launch streamed items");
@@ -426,5 +450,48 @@ describe("omp --restore after the parent's process exit cut off its sync task ca
 		expect(recorded).toEqual([{ id: ids[0], aborted: true }]);
 		expect(outcome.subagents).toEqual(ids);
 		expect(subagents.map(turnEnd)).toEqual([{ stopReason: "error", credentialUnavailable: true, restorable: true }]);
+	}, 30_000);
+});
+
+describe("omp --restore after the parent's abort reached a sync subagent its JavaScript eval cell started while it waited to retry its key", () => {
+	it("relaunches the subagent the parent's process exit cut off", async () => {
+		// If this regresses, the eval bridge aborts the cell's `tool.task` call with an error it made of the exit's
+		// reason, which reads to the subagent as a stop: its turn ends on an aborted record, and `omp --restore`
+		// leaves the work the exit cut off unfinished.
+		const { parent, runs } = await openParentWithKeyedWorkers("eval");
+		const backoff = holdBackoff(1);
+		const turn = parent.prompt("Delegate reading the notes from a script.");
+		await backoff.allHeld;
+		expect(runs).toHaveLength(1);
+		await parent.dispose({ reason: postmortem.Reason.EXIT });
+		await turn;
+
+		const { outcome, subagents } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		const ids = subagents.map(sub => sub.agentId);
+		expect(ids).toHaveLength(1);
+		expect(subagents.map(turnEnd)).toEqual([{ stopReason: "error", credentialUnavailable: true, restorable: true }]);
+		expect(outcome.subagents).toEqual(ids);
+	}, 30_000);
+
+	it("leaves the subagent the user's stop ended", async () => {
+		// If this regresses, the user's stop reaches the cell's subagent as a cut-off: its turn keeps the marked
+		// error, and `omp --restore` relaunches work the user stopped.
+		const { parent, runs } = await openParentWithKeyedWorkers("eval");
+		const backoff = holdBackoff(1);
+		const turn = parent.prompt("Delegate reading the notes from a script.");
+		await backoff.allHeld;
+		expect(runs).toHaveLength(1);
+		await parent.abort({ reason: USER_INTERRUPT_LABEL });
+		await turn;
+
+		const { outcome, subagents } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		expect(subagents.map(turnEnd)).toEqual([
+			{ stopReason: "aborted", credentialUnavailable: undefined, restorable: false },
+		]);
+		expect(outcome.subagents).toEqual([]);
 	}, 30_000);
 });

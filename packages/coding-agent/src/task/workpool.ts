@@ -182,7 +182,9 @@ export class WorkPool {
 			async ({ signal }) => {
 				const onAbort = (): void => {
 					this.close();
-					for (const batch of this.batches) manager.cancel(batch.jobId, { ownerId: this.ownerId });
+					// Each batch aborts with the pool's own reason, so its subagent stops when the owner
+					// cancelled the pool and is cut off when the session's process went away.
+					for (const batch of this.batches) manager.cancel(batch.jobId, { ownerId: this.ownerId }, signal.reason);
 				};
 				if (signal.aborted) onAbort();
 				else signal.addEventListener("abort", onAbort, { once: true });

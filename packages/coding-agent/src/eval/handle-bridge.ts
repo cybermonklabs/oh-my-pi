@@ -125,9 +125,14 @@ function snapshot(resolved: ResolvedHandle): EvalHandleSnapshot {
 		: completionSnapshot(resolved.ref, resolved.completion);
 }
 
+/**
+ * Cancel a handle's work with `reason`. An agent's job aborts with it too, so its subagent
+ * reads the kind of the abort ({@link turnAbortKind}): a cell stopped by its turn's stop, or
+ * its own `cancel()`, stops it; a cell its parent's process exit cut off cuts it off.
+ */
 function cancelResolved(resolved: ResolvedHandle, reason?: unknown): boolean {
 	if ("job" in resolved) {
-		return resolved.manager.cancel(resolved.job.id, { ownerId: resolved.job.ownerId });
+		return resolved.manager.cancel(resolved.job.id, { ownerId: resolved.job.ownerId }, reason);
 	}
 	if (resolved.completion.settled) return false;
 	resolved.completion.controller.abort(reason);

@@ -3604,8 +3604,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * dispose time (issue #1923).
 	 *
 	 * No-op when no manager is reachable or this session has no agent id.
+	 *
+	 * Each job aborts with `reason`, whose kind a subagent of the job reads
+	 * ({@link turnAbortKind}): a lifecycle transition of the session itself (`/new`,
+	 * a switch, a branch, a context reset) stops it; a dispose cuts it off.
 	 */
-	#cancelOwnAsyncJobs(reason?: unknown): void {
+	#cancelOwnAsyncJobs(reason: unknown): void {
 		if (!this.#agentId) return;
 		releaseCompletionHandles(this.#agentId);
 		releaseJudgmentBatches(this.#agentId);
@@ -6677,7 +6681,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// subagent session dispose (e.g. `release({ tombstone: true })` during an
 		// explicit hard kill) leaves `#ownedAsyncJobManager` undefined and must
 		// propagate a generic cancellation so its nested children stay terminal.
-		this.#cancelOwnAsyncJobs(manager ? ASYNC_JOB_MANAGER_SHUTDOWN_REASON : undefined);
+		this.#cancelOwnAsyncJobs(manager ? ASYNC_JOB_MANAGER_SHUTDOWN_REASON : plainTurnAbortReason("cutOff"));
 		if (!manager) return;
 
 		try {
@@ -7056,7 +7060,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		//     (mirrors newSession()).
 		this.#promptGeneration++;
 		await this.#cancelPostPromptTasks(plainTurnAbortReason("stop"));
-		this.#cancelOwnAsyncJobs();
+		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 
 		// Drop the conversation: messages, queued steers/follow-ups, pending tool
 		// calls, and error state. agent.reset() keeps the model and system prompt.
@@ -12206,12 +12210,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} else {
 				manualCompactionCleanup = this.#maintenance.abortCompaction(options?.reason);
 			}
-			this.abortBash();
-			this.abortEval();
-			const computerControlRevocation = revokeComputerControlForOwner(this.#eval.getKernelOwnerId());
 			// Without a reason of the caller's, the reason still says whether this stops the turn or cuts it off,
 			// to the turn and to a continuation already running, which aborts first (`AbortSignal.any` keeps it).
+			// An eval cell of the turn aborts first too, from the eval abort below: it gets the same reason.
 			const turnAbortReason = options?.reason ?? plainTurnAbortReason(cutOff ? "cutOff" : "stop");
+			this.abortBash();
+			this.abortEval(turnAbortReason);
+			const computerControlRevocation = revokeComputerControlForOwner(this.#eval.getKernelOwnerId());
 			const postPromptDrain = this.#cancelPostPromptTasks(turnAbortReason);
 			this.agent.abort(turnAbortReason);
 			await Promise.all([postPromptDrain, computerControlRevocation]);
@@ -12306,7 +12311,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
 		await this.abort();
-		this.#cancelOwnAsyncJobs();
+		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#closeAllProviderSessions("new session");
 		await this.#bash.flushPending();
 		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
@@ -13549,10 +13554,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Cancel running Python execution.
+	 * Cancel running eval executions (user Python, eval tool cells) with `reason`, by
+	 * default the platform's reason marked as a stop: a sync subagent a cell started
+	 * stops or is cut off by its kind ({@link turnAbortKind}).
 	 */
-	abortEval(): void {
-		this.#eval.abort();
+	abortEval(reason: unknown = plainTurnAbortReason("stop")): void {
+		this.#eval.abort(reason);
 	}
 
 	/** Whether a Python execution is currently running */
@@ -14221,7 +14228,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// results would otherwise land in the resumed transcript. Cancelled after the cwd and
 			// model checks, so a rejected switch keeps them, and before hooks hear of the switch,
 			// so jobs they start belong to the resumed session. Deliveries are held until now.
-			if (switchingToDifferentSession) this.#cancelOwnAsyncJobs();
+			if (switchingToDifferentSession) this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 
 			this.#reseedCostGate();
 			// Emit session_switch event to hooks
@@ -14560,7 +14567,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#usagePreflightReadyForNextModelCall = false;
 
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
+		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -14689,7 +14696,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
+		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 

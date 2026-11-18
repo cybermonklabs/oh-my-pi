@@ -137,9 +137,12 @@ export class EvalRunner {
 		}
 	}
 
-	/** Cancels every running Python execution. */
-	abort(): void {
-		for (const abortController of this.#abortControllers) abortController.abort();
+	/**
+	 * Cancels every running execution with `reason`. Without one (disposal) the platform's
+	 * unmarked reason cuts a cell's sync subagent off, as the session's process going away does.
+	 */
+	abort(reason?: unknown): void {
+		for (const abortController of this.#abortControllers) abortController.abort(reason);
 	}
 
 	/** Whether a Python execution is currently running. */
