@@ -413,6 +413,28 @@ async function awaitDeliveryTurn(ready: Promise<void>, deadline: number): Promis
 	}
 }
 
+/**
+ * Copies the enumerable symbol-keyed tags of `original` and of every object nested in it (a message's session entry
+ * id, a streamed tool call's parse state on its block) onto `clone`, its `structuredClone`, which drops them.
+ * `Bun.deepEquals` compares them: without them a clone a context hook leaves untouched reads as changed and goes out
+ * per-call. Binary data is skipped, and each object once (`visited`), as the clone shares what the original shares.
+ */
+function restoreSymbolTags(original: object, clone: object, visited: Set<object>): void {
+	if (visited.has(original)) return;
+	visited.add(original);
+	for (const key of Object.getOwnPropertySymbols(original)) {
+		if (Object.prototype.propertyIsEnumerable.call(original, key)) {
+			Reflect.set(clone, key, Reflect.get(original, key));
+		}
+	}
+	for (const key of Object.keys(original)) {
+		const value: unknown = Reflect.get(original, key);
+		const copy: unknown = Reflect.get(clone, key);
+		if (typeof value !== "object" || value === null || typeof copy !== "object" || copy === null) continue;
+		if (!ArrayBuffer.isView(value)) restoreSymbolTags(value, copy, visited);
+	}
+}
+
 const MAX_PENDING_CREDENTIAL_DISABLED = 32;
 
 /**
@@ -2460,20 +2482,14 @@ export class ExtensionRunner {
 			// return new message arrays rather than mutating in place.
 			currentMessages = [...messages];
 		}
+		const visited = new Set<object>();
 		for (let index = 0; index < currentMessages.length; index++) {
 			const message = currentMessages[index];
 			if (!message) continue;
-			// `structuredClone` drops symbol-keyed tags (a session entry id, the provider a request went to), and
-			// `Bun.deepEquals` compares them: without them an untouched clone reads as changed below and goes out
-			// per-call. Restore the tags an object spread would keep.
+			// Restore the tags `structuredClone` dropped, nested blocks included, so an untouched clone compares
+			// equal to its original below.
 			const original = messages[index];
-			if (original && original !== message) {
-				for (const key of Object.getOwnPropertySymbols(original)) {
-					if (Object.prototype.propertyIsEnumerable.call(original, key)) {
-						Reflect.set(message, key, Reflect.get(original, key));
-					}
-				}
-			}
+			if (original && original !== message) restoreSymbolTags(original, message, visited);
 			setContextHistoryIndex(message, index);
 		}
 
