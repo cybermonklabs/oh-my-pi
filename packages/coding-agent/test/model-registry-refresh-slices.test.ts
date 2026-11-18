@@ -8,6 +8,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { EVENT_LOOP_SLICE_MS } from "@oh-my-pi/pi-utils/event-loop-slice";
 
 const offlineFetch: FetchImpl = () => Promise.reject(new Error("network disabled in model-registry slicing test"));
 
@@ -255,8 +256,8 @@ describe("ModelRegistry discovery slicing", () => {
 			contextWindow: 128_000,
 			maxTokens: 8_192,
 		});
-		// Each slice check reads the clock once, and the discovery path checks once per row
-		// in each sliced step. The reads per extra row count those steps, whatever the load.
+		// Under a clock that moves 1 ms per read, each sliced step reads it once per row, plus one read
+		// per slice of EVENT_LOOP_SLICE_MS reads, so the reads per extra row count the sliced steps.
 		const clockReads = async (count: number): Promise<number> => {
 			const registry = new ModelRegistry(authStorage, tempDir.join(`models-${count}.yml`), {
 				fetch: offlineFetch,
@@ -284,9 +285,9 @@ describe("ModelRegistry discovery slicing", () => {
 			return reads;
 		};
 		const readsPerRow = ((await clockReads(2_000)) - (await clockReads(1_000))) / 1_000;
-		// Measured: 6.6 reads per row; 5.5 with the relabel unsliced. An exact count, so a step
+		// Measured: 6 sliced steps per row; 5 with the relabel unsliced. An exact count, so a step
 		// that gains a per-row check cannot hide an unsliced relabel.
-		expect(readsPerRow).toBeCloseTo(6.6, 1);
+		expect(readsPerRow).toBeCloseTo(6 * (1 + 1 / EVENT_LOOP_SLICE_MS), 1);
 	});
 
 	test("a pass that stops before its commit does not let a later pass commit before an earlier one", async () => {

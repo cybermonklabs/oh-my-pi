@@ -34,6 +34,14 @@ import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { EVENT_LOOP_SLICE_MS } from "@oh-my-pi/pi-utils/event-loop-slice";
+
+/**
+ * Clock reads per row of one sliced step, under a mock clock that moves 1 ms per read: the step
+ * checks the slice once per row, and each slice of EVENT_LOOP_SLICE_MS reads costs one more read
+ * when it opens. The slicing tests count reads per extra row as a multiple of this.
+ */
+const READS_PER_SLICED_STEP = 1 + 1 / EVENT_LOOP_SLICE_MS;
 
 describe("ModelRegistry runtime discovery", () => {
 	let tempDir: string;
@@ -2924,8 +2932,6 @@ describe("ModelRegistry runtime discovery", () => {
 	}
 
 	test("openai-models-list maps and builds a long model list in slices", async () => {
-		// Each slice check reads the clock once, and the path checks once per row in each sliced
-		// step, so the reads per extra row count those steps, whatever the load.
 		const clockReads = async (count: number): Promise<number> => {
 			const data = Array.from({ length: count }, (_, index) => ({ id: `openai-test/model-${index}` }));
 			let now = 1_000;
@@ -2942,8 +2948,8 @@ describe("ModelRegistry runtime discovery", () => {
 			return reads;
 		};
 		const readsPerRow = ((await clockReads(2_000)) - (await clockReads(1_000))) / 1_000;
-		// Measured: 2.2 reads per row; 1.1 with either the row loop's check or the sliced build removed.
-		expect(readsPerRow).toBeCloseTo(2.2, 1);
+		// Measured: 2 sliced steps per row; 1 with either the row loop's check or the sliced build removed.
+		expect(readsPerRow).toBeCloseTo(2 * READS_PER_SLICED_STEP, 1);
 	});
 
 	test("openai-models-list falls back to a usable flat max_tokens when the nested output limit is unusable", async () => {
@@ -3535,10 +3541,10 @@ describe("ModelRegistry runtime discovery", () => {
 				api: "openai-completions",
 				auth: "none",
 				discovery: { type: "lm-studio" },
+				compat: { thinkingFormat: "qwen" },
+				remoteCompaction: { enabled: true, api: "openai-responses", endpoint: "http://127.0.0.1:9995/v1/compact" },
 			},
 		});
-		// Each slice check reads the clock once, and the path checks once per row in each sliced
-		// step, so the reads per extra row count those steps, whatever the load.
 		const clockReads = async (count: number): Promise<number> => {
 			const data = Array.from({ length: count }, (_, index) => ({ id: `local-${index}`, object: "model" }));
 			const fetchMock: FetchImpl = async input => {
@@ -3559,13 +3565,64 @@ describe("ModelRegistry runtime discovery", () => {
 			});
 			await registry.refreshDiscoverableProviders(["lm-studio-test"], "online");
 			vi.restoreAllMocks();
-			expect(registry.find("lm-studio-test", `local-${count - 1}`)?.imageInputDecoder).toBe("stb");
+			const last = registry.find("lm-studio-test", `local-${count - 1}`);
+			expect(last?.imageInputDecoder).toBe("stb");
+			expect((last?.compatConfig as OpenAICompat | undefined)?.thinkingFormat).toBe("qwen");
+			expect(last?.remoteCompaction?.endpoint).toBe("http://127.0.0.1:9995/v1/compact");
 			return reads;
 		};
 		const readsPerRow = ((await clockReads(2_000)) - (await clockReads(1_000))) / 1_000;
-		// Measured: 7.7 reads per row; 6.6 with the rebuild after the refresh unsliced. An exact count,
-		// so a step that gains or loses a per-row check elsewhere shows here too.
-		expect(readsPerRow).toBeCloseTo(7.7, 1);
+		// Measured: 9 sliced steps per row; 8 with the compat rebuild, the decoder rebuild or the
+		// remoteCompaction rebuild in one step.
+		expect(readsPerRow).toBeCloseTo(9 * READS_PER_SLICED_STEP, 1);
+	});
+
+	test("an unauthenticated provider rebuilds its cached model list in slices", async () => {
+		writeRawModelsJson({
+			"custom-local": {
+				baseUrl: "http://127.0.0.1:11434/v1",
+				api: "openai-completions",
+				discovery: { type: "ollama" },
+				remoteCompaction: { enabled: true, api: "openai-responses", endpoint: "http://127.0.0.1:11434/v1/compact" },
+			},
+		});
+		const clockReads = async (count: number): Promise<number> => {
+			const names = Array.from({ length: count }, (_, index) => `local-${index}`);
+			const cacheDbPath = path.join(tempDir, `unauthenticated-${count}.db`);
+			authStorage.keys.setRuntime("custom-local", "test-key");
+			const fetchMock: FetchImpl = async input => {
+				const url = String(input);
+				if (url === "http://127.0.0.1:11434/api/tags")
+					return Response.json({ models: names.map(name => ({ name })) });
+				if (url === "http://127.0.0.1:11434/api/show") return new Response("not found", { status: 404 });
+				throw new Error(`Unexpected URL: ${url}`);
+			};
+			await new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock, cacheDbPath }).refreshProvider(
+				"custom-local",
+			);
+			authStorage.keys.setRuntime("custom-local", "");
+			const noNetwork: FetchImpl = input => {
+				throw new Error(`Unexpected network call during unauthenticated discovery: ${String(input)}`);
+			};
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: noNetwork, cacheDbPath });
+			let now = 1_000;
+			let reads = 0;
+			vi.spyOn(performance, "now").mockImplementation(() => {
+				reads++;
+				return now++;
+			});
+			await registry.refreshProvider("custom-local");
+			vi.restoreAllMocks();
+			expect(registry.getProviderDiscoveryState("custom-local")?.status).toBe("unauthenticated");
+			expect(registry.find("custom-local", `local-${count - 1}`)?.remoteCompaction?.endpoint).toBe(
+				"http://127.0.0.1:11434/v1/compact",
+			);
+			return reads;
+		};
+		const readsPerRow = ((await clockReads(2_000)) - (await clockReads(1_000))) / 1_000;
+		// Measured: 4 sliced steps per row; 2 with the cached rebuild in one step, 3 with only its
+		// remoteCompaction rebuild in one step.
+		expect(readsPerRow).toBeCloseTo(4 * READS_PER_SLICED_STEP, 1);
 	});
 
 	test("lm-studio discovery serves decision models as judges over /v1/decisions", async () => {
@@ -4102,8 +4159,6 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("litellm discovery maps and builds a long model list in slices", async () => {
-		// Each slice check reads the clock once, and the path checks once per row in each sliced
-		// step, so the reads per extra row count those steps, whatever the load.
 		const clockReads = async (count: number): Promise<number> => {
 			const data = Array.from({ length: count }, (_, index) => ({
 				model_group: `group-${index}`,
@@ -4134,8 +4189,8 @@ describe("ModelRegistry runtime discovery", () => {
 			return reads;
 		};
 		const readsPerRow = ((await clockReads(2_000)) - (await clockReads(1_000))) / 1_000;
-		// Measured: 2.2 reads per row; 1.1 with either the rich-entry loop's check or the sliced build removed.
-		expect(readsPerRow).toBeCloseTo(2.2, 1);
+		// Measured: 2 sliced steps per row; 1 with either the rich-entry loop's check or the sliced build removed.
+		expect(readsPerRow).toBeCloseTo(2 * READS_PER_SLICED_STEP, 1);
 	});
 
 	test("ollama discovery builds a long model list in slices", async () => {
@@ -4171,8 +4226,8 @@ describe("ModelRegistry runtime discovery", () => {
 			return reads;
 		};
 		const readsPerRow = ((await clockReads(2_000)) - (await clockReads(1_000))) / 1_000;
-		// Measured: 1.1 reads per row; 0 with the build unsliced.
-		expect(readsPerRow).toBeCloseTo(1.1, 1);
+		// Measured: 1 sliced step per row; 0 with the build unsliced.
+		expect(readsPerRow).toBeCloseTo(READS_PER_SLICED_STEP, 1);
 	});
 
 	test("configured litellm discovery omits non-conversational rich modes", async () => {

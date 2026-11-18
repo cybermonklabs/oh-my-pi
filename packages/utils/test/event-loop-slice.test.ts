@@ -36,9 +36,11 @@ function sliceSizes(unitTurns: number[]): number[] {
 	return [...Map.groupBy(unitTurns, turn => turn).values()].map(units => units.length);
 }
 
-afterEach(() => {
+afterEach(async () => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
+	// A close that fake timers scheduled is dropped with them; close the slice so the next test starts fresh.
+	await nextSlice();
 });
 
 describe("mapInSlices", () => {
@@ -264,6 +266,8 @@ describe("readJsonInSlices", () => {
 		});
 		const payload = await readJsonInSlices(new Response(body));
 		expect((payload as unknown[]).length).toBe(150_000);
+		// The payload went through JSON.parse of its decoded text, not through response.json().
+		expect(firedAtParse).toBeDefined();
 		expect(firedAtParse).toBe(true);
 	});
 });
