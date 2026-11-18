@@ -561,6 +561,70 @@ describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () 
 		expect(fs.existsSync(target.file)).toBe(true);
 	});
 
+	/**
+	 * Start a process with `file` as its own `--env-file`, after which `swap` (JS source, run
+	 * before `env.ts` loads, so after Bun read the file) replaces it; bounded, as a hang there
+	 * would hang every omp start. Then a later session start sweeps `base` with the entry aged.
+	 */
+	function loadEnvAfterSwap(base: string, file: string, swap: string): { own: number | null; sweep: number | null } {
+		const bound = { timeout: 15_000, killSignal: "SIGKILL" as const };
+		const env = { ...process.env, TMPDIR: base, PI_TEST_RELAUNCH_FALLBACK_DIR: tempBase() };
+		const script = `const fs = require("node:fs");\nconst FILE = ${JSON.stringify(file)};\n${swap}\nawait import(${JSON.stringify(envTs)});`;
+		const own = Bun.spawnSync([process.execPath, `--env-file=${file}`, "-e", script], {
+			cwd: tempBase(),
+			env,
+			stderr: "pipe",
+			...bound,
+		});
+		expect(own.stderr.toString()).toBe("");
+		const hourAgo = new Date(Date.now() - 60 * 60_000);
+		fs.utimesSync(path.dirname(file), hourAgo, hourAgo);
+		const sweep = Bun.spawnSync([process.execPath, "-e", `await import(${JSON.stringify(envTs)});`], {
+			cwd: tempBase(),
+			env,
+			stderr: "pipe",
+			...bound,
+		});
+		expect(sweep.stderr.toString()).toBe("");
+		return { own: own.exitCode, sweep: sweep.exitCode };
+	}
+
+	it.each([["a FIFO"], ["a link to a FIFO"], ["a link to a regular file that names the link's path"]])(
+		"returns at once and keeps a loaded.env that is %s, in the own-file removal and the sweep",
+		label => {
+			const base = tempBase();
+			const planted = relaunchDir(base, "omp-bun-env-Swap01");
+			// Anything a link points at sits outside the directory, which keeps `loaded.env` alone.
+			const target = path.join(tempBase(), "target");
+			let source = `fs.rmSync(FILE);\nBun.spawnSync(["mkfifo", FILE]);`;
+			if (label === "a link to a FIFO") {
+				source = `fs.rmSync(FILE);\nBun.spawnSync(["mkfifo", ${JSON.stringify(target)}]);\nfs.symlinkSync(${JSON.stringify(target)}, FILE);`;
+			} else if (label !== "a FIFO") {
+				// The worst case: the target's first line is the marker for the link's own path.
+				fs.writeFileSync(target, fs.readFileSync(planted.file));
+				source = `fs.rmSync(FILE);\nfs.symlinkSync(${JSON.stringify(target)}, FILE);`;
+			}
+
+			expect(loadEnvAfterSwap(base, planted.file, source)).toEqual({ own: 0, sweep: 0 });
+
+			expect(fs.readdirSync(planted.dir)).toEqual(["loaded.env"]);
+			const kept = fs.lstatSync(planted.file);
+			expect(label === "a FIFO" ? kept.isFIFO() : kept.isSymbolicLink()).toBe(true);
+			if (label.startsWith("a link to a regular file")) expect(fs.existsSync(target)).toBe(true);
+		},
+		60_000,
+	);
+
+	it("keeps a loaded.env whose marker is on a later line, not the first, where the writer puts it", () => {
+		const base = tempBase();
+		const later = relaunchDir(base, "omp-bun-env-Later1", false);
+		fs.writeFileSync(later.file, `LOADED='value'\n# omp relaunch file: ${later.file}\n`, { mode: 0o600 });
+
+		loadEnv(base, [`--env-file=${later.file}`]);
+
+		expect(fs.existsSync(later.file)).toBe(true);
+	});
+
 	it("sweeps on a session's main thread only, never in a worker thread", () => {
 		const base = tempBase();
 		const hourAgo = new Date(Date.now() - 60 * 60_000);

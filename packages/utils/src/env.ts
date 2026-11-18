@@ -155,10 +155,12 @@ export function launchEnvValue(name: string): string | undefined {
 }
 
 /**
- * The comment line by which a relaunch file names itself (`# omp relaunch file: <its path>`), so
- * a process can tell a file omp wrote from a look-alike. A comment, so Bun loads nothing from
- * it: a variable would also reach every program the new process starts without an `env` of
- * its own, whose environment is the one Bun built at the start, whatever `process.env` does.
+ * The first line of a relaunch file, by which it names itself (`# omp relaunch file: <its
+ * path>`), so a process can tell a file omp wrote from an accidental look-alike or a copy (a
+ * user can write the line on a file of their own, which then counts as omp's). A comment, so Bun
+ * loads nothing from it: a variable would also reach every program the new process starts
+ * without an `env` of its own, whose environment is the one Bun built at the start, whatever
+ * `process.env` does.
  */
 const RELAUNCH_ENV_MARKER = "# omp relaunch file: ";
 
@@ -219,12 +221,41 @@ function relaunchEnvMarkerLine(file: string): string | undefined {
 }
 
 /**
+ * Whether `file` is a regular file (not a link, a FIFO or a device) whose first line is
+ * `marker`, where the writer puts it. It never blocks: a FIFO, or a link to one, is refused by
+ * `lstat` before any `open`; the `open` itself does not follow a link and does not wait
+ * (`O_NOFOLLOW | O_NONBLOCK`), so a file swapped for a link or a FIFO in between fails it or is
+ * refused by `fstat`; and it reads only the marker's length and its newline.
+ */
+function startsWithRelaunchMarker(file: string, marker: string): boolean {
+	if (!fs.lstatSync(file).isFile()) return false;
+	const { O_RDONLY, O_NONBLOCK, O_NOFOLLOW } = fs.constants;
+	const fd = fs.openSync(file, O_RDONLY | (O_NONBLOCK ?? 0) | (O_NOFOLLOW ?? 0));
+	try {
+		if (!fs.fstatSync(fd).isFile()) return false;
+		const expected = Buffer.from(`${marker}\n`);
+		const head = Buffer.alloc(expected.length);
+		let read = 0;
+		while (read < head.length) {
+			const n = fs.readSync(fd, head, read, head.length - read, read);
+			if (n === 0) break;
+			read += n;
+		}
+		return read === head.length && head.equals(expected);
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+/**
  * Remove the relaunch directory `dir` with its `loaded.env`, and nothing else: only a real
  * directory (not a link) of this user, named like one, that holds `loaded.env` and nothing
- * besides, where the file names itself on a line of its own ({@link RELAUNCH_ENV_MARKER}), as
- * every relaunch file omp writes does and no look-alike does. Any other directory stays whole.
- * (`loaded.env` itself is read and unlinked, never written, so a link there changes nothing:
- * unlinking it leaves its target.)
+ * besides, where `loaded.env` is a regular file whose first line names its own path
+ * ({@link RELAUNCH_ENV_MARKER}), as every relaunch file omp writes does. Any other directory
+ * stays whole: an accidental look-alike, a copy (its line names another path), a `loaded.env`
+ * that is a link, a FIFO or a device, and a relaunch file of an earlier build that wrote no
+ * line. A file whose owner wrote the line on it is treated as omp's: only this user's own
+ * directory is then removed.
  */
 function removeRelaunchEnvDir(dir: string): void {
 	try {
@@ -235,7 +266,7 @@ function removeRelaunchEnvDir(dir: string): void {
 		if (entries.length !== 1 || entries[0] !== RELAUNCH_ENV_FILE) return;
 		const file = path.join(dir, RELAUNCH_ENV_FILE);
 		const marker = relaunchEnvMarkerLine(file);
-		if (!marker || !fs.readFileSync(file, "utf8").split("\n").includes(marker)) return;
+		if (!marker || !startsWithRelaunchMarker(file, marker)) return;
 		fs.unlinkSync(file);
 		fs.rmdirSync(dir);
 	} catch {
