@@ -17,10 +17,14 @@ import {
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
 
-/** What one process builds its prompt from: a context file whose text differs between runs, and the operator's role text. */
+/**
+ * What one process builds its prompt from: a context file whose text differs between runs, the operator's role text,
+ * and the `--config` overlay its settings load (long cache retention without one).
+ */
 interface ProcessInputs {
 	agentsMd: string;
 	appendSystemPrompt: string;
+	overlay?: string;
 }
 
 interface ProcessRun {
@@ -33,6 +37,39 @@ interface ProcessRun {
 }
 
 const ROLE = "You review the parser changes of this repository.";
+
+/** An overlay that asks for the one-hour cache entries every reply writes. */
+const OVERLAY = "providers:\n  cacheRetention: long\n";
+
+const MINUTE_MS = 60_000;
+
+/** The real clock, read before any test moves it. */
+const realNow = Date.now.bind(Date);
+
+/** Moves the clock `offsetMs` ahead of real time from now on. */
+function setClock(offsetMs: number): void {
+	vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
+}
+
+/** Rewrites `overlay` and reloads it as the config watcher does, then waits for the rebuilds the change starts. */
+async function reloadOverlay(
+	session: AgentSession,
+	settings: Settings,
+	overlay: string,
+	content: string,
+): Promise<void> {
+	const rebuilds = [
+		vi.spyOn(session, "refreshBaseSystemPrompt"),
+		vi.spyOn(session, "reconcileBuiltinTools"),
+		vi.spyOn(session, "refreshSkillsAndCommands"),
+	];
+	await Bun.write(overlay, content);
+	await settings.reloadFromDisk();
+	// The settings listeners run in the microtask the reload queued for them.
+	await Promise.resolve();
+	await Promise.all(rebuilds.flatMap(spy => spy.mock.results.map(result => result.value)));
+	for (const spy of rebuilds) spy.mockRestore();
+}
 
 describe("system prompt of a resumed session", () => {
 	afterEach(() => {
@@ -48,7 +85,7 @@ describe("system prompt of a resumed session", () => {
 		inputs: ProcessInputs,
 		prompts: string[],
 		sessionFile?: string,
-		startup?: (session: AgentSession, sessionManager: SessionManager) => Promise<void>,
+		startup?: (session: AgentSession, sessionManager: SessionManager, settings: Settings) => Promise<void>,
 	): Promise<ProcessRun> {
 		// Each reply writes the prompt cache, so a reopened transcript says what its newest reply left there.
 		const { requests, restore: restoreFetch } = mockGatewayFetch(turn => answer(turn, { cacheWriteTokens: 100 }));
@@ -59,19 +96,22 @@ describe("system prompt of a resumed session", () => {
 		const sessionManager = sessionFile
 			? await SessionManager.open(sessionFile)
 			: SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+		const settings = inputs.overlay
+			? await Settings.loadIsolated({ cwd: tempDir.path(), agentDir: tempDir.path(), configFiles: [inputs.overlay] })
+			: Settings.isolated({ "providers.cacheRetention": "long" });
 		const { session } = await createAgentSession({
 			...gatewaySessionOptions(tempDir),
 			sessionManager,
 			authStorage,
 			modelRegistry,
-			settings: Settings.isolated({ "providers.cacheRetention": "long" }),
+			settings,
 			model,
 			appendSystemPrompt: inputs.appendSystemPrompt,
 			contextFiles: [{ path: tempDir.join("AGENTS.md"), content: inputs.agentsMd }],
 			skills: [],
 		});
 		try {
-			await startup?.(session, sessionManager);
+			await startup?.(session, sessionManager, settings);
 			const cacheEntryAtStart = session.observedPromptCacheEntry();
 			for (const text of prompts) await session.prompt(text);
 			const file = sessionManager.getSessionFile();
@@ -196,4 +236,61 @@ describe("system prompt of a resumed session", () => {
 		expect(system).toContain(newRole);
 		expect(system).not.toContain(ROLE);
 	}, 30_000);
+
+	// The stored prompt is kept for the transcript's live cache entry, but what this process's own build would change
+	// (here a context file edited between the processes) waits at most five minutes, however often calls keep the
+	// entry warm; a further restart does not start the five minutes again.
+	it("sends this process's own build at the first request five minutes after the restore, a restart included", async () => {
+		using tempDir = TempDir.createSync("@pi-resume-system-prompt-");
+		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml());
+		const live = await runProcess(tempDir, { agentsMd: "Build with make.", appendSystemPrompt: ROLE }, ["first"]);
+		const inputs = { agentsMd: "Build with ninja.", appendSystemPrompt: ROLE };
+		// A call every minute keeps the one-hour entry warm.
+		const callEveryMinute = (from: number, to: number) => async (session: AgentSession) => {
+			for (let minute = from; minute <= to; minute++) {
+				setClock(minute * MINUTE_MS);
+				await session.prompt(`a call at minute ${minute}`);
+			}
+		};
+		const restored = await runProcess(tempDir, inputs, [], live.sessionFile, callEveryMinute(0, 2));
+		const restarted = await runProcess(tempDir, inputs, [], live.sessionFile, callEveryMinute(3, 5));
+
+		const stored = withoutCacheControl(live.requests[0]?.system);
+		const sent = [...restored.requests, ...restarted.requests].map(request => withoutCacheControl(request.system));
+		expect(sent).toHaveLength(6);
+		expect(sent.slice(0, 5)).toEqual(Array<string>(5).fill(stored));
+		expect(sent[5]).toContain("Build with ninja.");
+		expect(sent[5]).not.toContain("Build with make.");
+	}, 30_000);
+
+	// A settings change held on the bound prompt when the first process stopped is still withheld by the prompt the
+	// resumed process restores: it goes out five minutes after the change, not five minutes after the restart.
+	it("sends a settings change held before a restart at the first request five minutes after the change", async () => {
+		using tempDir = TempDir.createSync("@pi-resume-system-prompt-");
+		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml());
+		const overlay = tempDir.join("overlay.yml");
+		await Bun.write(overlay, OVERLAY);
+		const inputs = { agentsMd: "Build with make.", appendSystemPrompt: ROLE, overlay };
+		const live = await runProcess(tempDir, inputs, [], undefined, async (session, _sessionManager, settings) => {
+			await session.prompt("first");
+			await reloadOverlay(session, settings, overlay, `${OVERLAY}personality: pragmatic\n`);
+			await session.prompt("second");
+		});
+		// What a process started on the changed settings sends.
+		const fresh = await runProcess(tempDir, inputs, ["a fresh session"]);
+
+		setClock(3 * MINUTE_MS);
+		const resumed = await runProcess(tempDir, inputs, [], live.sessionFile, async session => {
+			await session.prompt("three minutes after the change");
+			setClock(5 * MINUTE_MS);
+			await session.prompt("five minutes after the change");
+		});
+
+		const bound = withoutCacheControl(live.requests[0]?.system);
+		// Precondition: the first process held the change on its bound prompt.
+		expect(withoutCacheControl(live.requests[1]?.system)).toBe(bound);
+		const [beforeBound, atBound] = resumed.requests.map(request => withoutCacheControl(request.system));
+		expect(beforeBound).toBe(bound);
+		expect(atBound).toBe(withoutCacheControl(fresh.requests[0]?.system));
+	}, 60_000);
 });

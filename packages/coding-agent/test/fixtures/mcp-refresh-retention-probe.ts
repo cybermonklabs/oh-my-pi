@@ -59,6 +59,7 @@ const host: SessionToolsHost = {
 	model: () => undefined,
 	memoryBackendSession: () => ({}) as never,
 	clearInheritedProviderPromptCacheKey: () => {},
+	transcriptPromptCacheLive: () => false,
 	clearMemoryPromotionSnapshot: () => {},
 	captureMemoryPromotionSnapshot: () => {},
 	emitNotice: () => {},

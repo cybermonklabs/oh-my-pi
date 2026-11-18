@@ -382,7 +382,7 @@ import {
 	shouldEvaluateCodexAutoRedeem,
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
-import type { ContextCut } from "./context-cut";
+import { type ContextCut, promptCacheEntryLapsed } from "./context-cut";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { isDateCwdReminderControl } from "./date-cwd-reminder";
@@ -2653,6 +2653,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			model: () => this.model,
 			memoryBackendSession: () => this,
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
+			transcriptPromptCacheLive: promptDigest => {
+				const entry = this.#inferredPromptCacheEntry(promptDigest);
+				return entry?.change === undefined && !promptCacheEntryLapsed(entry, Date.now());
+			},
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
@@ -3043,20 +3047,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		);
 		// A request waits for a model switch in progress, so the first request on the new model carries its prompt.
 		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#tools.settleModelSwitch()));
-		// A held settings rebuild runs at the first request after a cut the cut rule admits under the hold that
-		// rewrites everything after the system prompt and tools anyway (its kept prefix `p` is at most their tokens:
-		// a compaction, a forced rescue), or after the prompt cache entry lapses ({@link #absorbHeldSettingsRebuildIfDue}).
-		// A cheaper cut, such as a tail prune, would turn into a rewrite of the whole prompt. A provider-context cut
-		// (an image clamp) is made in a request whose prompt is already taken, so it never counts.
+		// A held settings rebuild, and a kept restored transcript prompt, give way to this process's live build at the
+		// first request after a cut the cut rule admits under them that rewrites everything after the system prompt
+		// and tools anyway (its kept prefix `p` is at most their tokens: a compaction, a forced rescue), or after the
+		// prompt cache entry lapses ({@link #releaseWithheldPromptChangesIfDue}). A cheaper cut, such as a tail prune,
+		// would turn into a rewrite of the whole prompt. A provider-context cut (an image clamp) is made in a request
+		// whose prompt is already taken, so it never counts.
 		this.addDisposer(
 			this.#maintenance.onContextCutAdmitted(cut => {
-				if (this.#tools.heldSettingsRebuildCutAdmitted === undefined || cut.providerContext) return;
+				if (!this.#tools.withholdsPromptChange || cut.providerContext) return;
 				if (cut.prefixTokens <= computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision)) {
 					this.#tools.noteRewritingCutAdmitted();
 				}
 			}),
 		);
-		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#absorbHeldSettingsRebuildIfDue()));
+		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#releaseWithheldPromptChangesIfDue()));
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
 		// The gate is registered only while a cap is set: any before-model-call gate also turns a user abort
 		// before the next request into a clean stop, which leaves no interrupted turn for `/retry`.
@@ -5806,18 +5811,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Runs a held settings rebuild ({@link SessionTools.absorbHeldSettingsRebuild}) once the cut rule admitted a cut
-	 * under the hold or the prompt cache entry it reads has lapsed, whichever comes first. Called before every main
-	 * request, and before a user prompt takes its hidden notices, so the request carries the rebuilt prompt.
+	 * Sends what the prompt withholds to keep the cached prefix once it is due, so the request carries the rebuilt
+	 * prompt: a kept restored transcript prompt ({@link SessionTools.releaseRestoredPrompt}) and a held settings rebuild
+	 * ({@link SessionTools.absorbHeldSettingsRebuild}), each once the cut rule admitted a cut under it that rewrites
+	 * every message or the prompt cache entry it reads has lapsed, whichever comes first, and the restored prompt also
+	 * once the change it withholds is five minutes old. Called before every main request, and before a user prompt
+	 * takes its hidden notices.
 	 */
-	async #absorbHeldSettingsRebuildIfDue(): Promise<void> {
-		const cutAdmitted = this.#tools.heldSettingsRebuildCutAdmitted;
-		if (cutAdmitted === undefined) return;
-		const due = cutAdmitted || this.#maintenance.promptCacheLapsed();
+	async #releaseWithheldPromptChangesIfDue(): Promise<void> {
+		if (!this.#tools.withholdsPromptChange) return;
+		const lapsed = this.#maintenance.promptCacheLapsed();
 		try {
-			await this.#tools.absorbHeldSettingsRebuild(due);
+			await this.#tools.releaseRestoredPrompt(lapsed);
+			await this.#tools.absorbHeldSettingsRebuild(lapsed || this.#tools.heldSettingsRebuildCutAdmitted === true);
 		} catch (error) {
-			logger.warn("Held settings rebuild failed", { error: String(error) });
+			logger.warn("Rebuild of a withheld prompt change failed", { error: String(error) });
 		}
 	}
 
@@ -6274,9 +6282,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * reply's send time or a later warm refresh that hit, under the lifetime its
 	 * model declares for the tier the reply wrote. Thinking level, tools and
 	 * credential at the time are unknown; model, compaction and the system
-	 * prompt digest recorded for that reply are not.
+	 * prompt digest recorded for that reply are not, and the next request is
+	 * taken to send the base prompt `promptDigest` names (by default the
+	 * current one).
 	 */
-	#inferredPromptCacheEntry(): ObservedPromptCacheEntry | undefined {
+	#inferredPromptCacheEntry(promptDigest?: string): ObservedPromptCacheEntry | undefined {
 		const observed = this.#branchPromptCacheObservation();
 		if (!observed) return undefined;
 		const { reply } = observed;
@@ -6309,7 +6319,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			change = { kind: "retention" };
 		} else if (observed.compacted) {
 			change = { kind: "compaction" };
-		} else if (observed.promptDigest !== undefined && observed.promptDigest !== this.#tools.currentPromptDigest()) {
+		} else if (
+			observed.promptDigest !== undefined &&
+			observed.promptDigest !== (promptDigest ?? this.#tools.currentPromptDigest())
+		) {
 			change = { kind: "system-prompt" };
 		}
 		return {
@@ -7155,6 +7168,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.sessionManager.appendResetBoundary();
 
 		resetCapabilities();
+		// The cleared transcript reads no cache entry a restored prompt was kept for: this process's own build goes out.
+		this.#tools.leaveRestoredTranscript();
 		await this.refreshBaseSystemPrompt();
 
 		return { droppedCount };
@@ -9716,8 +9731,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (this.#promptGeneration !== generation) {
 				return false;
 			}
-			// A held settings rebuild that is due goes into this request's prompt instead of its notice.
-			await this.#absorbHeldSettingsRebuildIfDue();
+			// A withheld prompt change that is due (a held settings rebuild, a kept restored transcript prompt) goes
+			// into this request's prompt, a held one instead of its notice.
+			await this.#releaseWithheldPromptChangesIfDue();
 			if (this.#promptGeneration !== generation) {
 				return false;
 			}
@@ -12438,6 +12454,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// directory set, not the previous session's — refresh before the next
 			// turn goes out.
 			resetCapabilities();
+			// A restored transcript's stored prompt stays with that transcript.
+			this.#tools.leaveRestoredTranscript();
 			await this.refreshBaseSystemPrompt();
 
 			this.#reseedCostGate();
@@ -14373,6 +14391,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					error: String(error),
 				});
 			}
+			// A prompt restored for the session left behind stays with it.
+			if (switchingToDifferentSession) this.#tools.leaveRestoredTranscript();
 			// Refresh the workspace-roots block to match the resumed session's directory set.
 			// Wrapped so a rebuild failure (e.g. a gate that intentionally fails in tests)
 			// doesn't roll back an otherwise-successful session switch.

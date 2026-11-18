@@ -144,6 +144,12 @@ export interface SessionToolsHost {
 	model(): Model | undefined;
 	memoryBackendSession(): MemoryBackendStartOptions["session"];
 	clearInheritedProviderPromptCacheKey(): void;
+	/**
+	 * Whether the next request, sent with the base prompt `promptDigest` names, reads the prompt cache entry the
+	 * branch's newest cached reply left: the entry has not lapsed, and the request asks for it on the same model and
+	 * retention with no compaction since.
+	 */
+	transcriptPromptCacheLive(promptDigest: string): boolean;
 	clearMemoryPromotionSnapshot(): void;
 	captureMemoryPromotionSnapshot(prompt: string[]): void;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
@@ -335,6 +341,29 @@ interface StoredSystemPrompt {
 }
 
 /**
+ * Custom entry recording that the base prompt a {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record names withholds a
+ * change from the model, and since when: a settings rebuild held on it, or a resumed process's own build it was
+ * restored in place of. A resumed process that restores that prompt keeps the change waiting no longer than the
+ * process that recorded it would have ({@link WITHHELD_CHANGE_MAX_AGE_MS}).
+ */
+const SYSTEM_PROMPT_HOLD_CUSTOM_TYPE = "system-prompt-hold";
+
+/** Data of a {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE} entry. */
+interface WithheldPromptChange {
+	/** Digest of the base prompt that withholds the change, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
+	digest: string;
+	/** When the change was made (Unix milliseconds). */
+	since: number;
+}
+
+/**
+ * Longest a change the system prompt withholds to keep the cached prefix waits: the first request made this long after
+ * the change carries it, however warm the cache stays, unless a lapse or a cut that rewrites every message sent it
+ * earlier.
+ */
+const WITHHELD_CHANGE_MAX_AGE_MS = 5 * 60_000;
+
+/**
  * Least time between two rediscoveries started by `skill://` names no loaded skill owns, so a typo
  * read in a loop (a shell resolving one URL per spawned command) costs one pass per interval
  * rather than one per read, while a skill installed after a miss is found once it has passed.
@@ -376,6 +405,15 @@ function storedPromptOfEntry(entry: SessionEntry): StoredSystemPrompt | undefine
 	const { digest, blocks, toolNames, operatorDigest } = entry.data;
 	if (typeof digest !== "string" || typeof operatorDigest !== "string") return undefined;
 	return isStringList(blocks) && isStringList(toolNames) ? { digest, blocks, toolNames, operatorDigest } : undefined;
+}
+
+/** The change a branch entry records as withheld, or `undefined` when it is no such record or a malformed one. */
+function withheldChangeOfEntry(entry: SessionEntry): WithheldPromptChange | undefined {
+	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_HOLD_CUSTOM_TYPE || !isRecord(entry.data)) {
+		return undefined;
+	}
+	const { digest, since } = entry.data;
+	return typeof digest === "string" && typeof since === "number" ? { digest, since } : undefined;
 }
 
 /**
@@ -451,6 +489,23 @@ interface HeldSettingsRebuild {
 	reconcile: boolean;
 	/** A skill rediscovery is held: the rebuild lists the registry's skills in the prompt. */
 	skills: boolean;
+}
+
+/**
+ * A resumed transcript's stored prompt, restored in place of this process's own build, which it withholds from the
+ * model ({@link SessionTools.releaseRestoredPrompt}).
+ */
+interface RestoredPrompt {
+	/** The stored blocks, restored as the base. */
+	readonly base: readonly string[];
+	/** Digest of {@link base}, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
+	readonly digest: string;
+	/** When the withheld change was made: the earliest the branch records, else the restore. */
+	readonly since: number;
+	/** A cut that rewrites every message, or a move to another transcript, ended the reason to keep it. */
+	due: boolean;
+	/** The branch records {@link since} for it ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}). */
+	recorded: boolean;
 }
 
 /** Data of a {@link SETTINGS_NOTICE_MESSAGE_TYPE} message: setting ids and tool names, never a value. */
@@ -578,8 +633,16 @@ export class SessionTools {
 	#currentPromptDigest: { base: readonly string[]; digest: string } | undefined;
 	/** {@link SessionToolsOptions.operatorPromptDigest}. */
 	readonly #operatorPromptDigest: string | undefined;
-	/** {@link #baseSystemPrompt} is the restored transcript's stored prompt; see {@link #restoreTranscriptPrompt}. */
+	/**
+	 * The session started from the restored transcript's stored prompt ({@link #restoreTranscriptPrompt}), which
+	 * counts as committed; false again once the session moves to another transcript ({@link leaveRestoredTranscript}).
+	 */
 	#basePromptRestored = false;
+	/**
+	 * The restored transcript's stored prompt while it is kept in place of this process's own build; kept only while
+	 * its `base` is the base. See {@link releaseRestoredPrompt}.
+	 */
+	#restoredPrompt: RestoredPrompt | undefined;
 	/**
 	 * A base prompt that keeps its bytes in place of a prompt this process built for itself: a restored
 	 * transcript's stored prompt in place of this process's own startup build ({@link #restoreTranscriptPrompt}),
@@ -2050,10 +2113,18 @@ export class SessionTools {
 	/**
 	 * Called just before a primary reply is appended to the branch: records the
 	 * digest of the prompt it was produced under when it differs from the
-	 * branch's, ahead of the reply so every path to the reply carries it.
+	 * branch's, ahead of the reply so every path to the reply carries it. The
+	 * first reply under a kept restored transcript prompt also records when the
+	 * change that prompt withholds was made, unless the branch records it already.
 	 */
 	recordReplyPrompt(reply: AgentMessage): void {
-		this.recordPromptDigest(this.#replyPromptDigests.get(reply));
+		const digest = this.#replyPromptDigests.get(reply);
+		this.recordPromptDigest(digest);
+		const restored = this.#restoredPrompt;
+		if (restored && !restored.recorded && digest === restored.digest) {
+			restored.recorded = true;
+			this.#recordWithheldChange(digest, restored.since);
+		}
 	}
 
 	/**
@@ -2106,9 +2177,40 @@ export class SessionTools {
 	}
 
 	/**
+	 * Records on the branch that the base prompt `digest` names withholds a
+	 * change made at `since`, for a resumed process that restores that prompt
+	 * ({@link #withheldChangeSince}). Nothing reads it when the operator inputs
+	 * cannot be compared, so nothing is recorded then.
+	 */
+	#recordWithheldChange(digest: string, since: number): void {
+		if (this.#operatorPromptDigest === undefined) return;
+		const change: WithheldPromptChange = { digest, since };
+		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_HOLD_CUSTOM_TYPE, change);
+	}
+
+	/**
+	 * When the branch records that the base prompt `digest` names began to
+	 * withhold a change: the earliest {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}
+	 * record naming it since the branch last recorded another prompt.
+	 */
+	#withheldChangeSince(digest: string): number | undefined {
+		const branch = this.#host.sessionManager.getBranchView();
+		let since: number | undefined;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			const recorded = promptDigestOfEntry(entry);
+			if (recorded !== null && recorded !== digest) break;
+			const withheld = withheldChangeOfEntry(entry);
+			if (withheld?.digest === digest) since = Math.min(withheld.since, since ?? withheld.since);
+		}
+		return since;
+	}
+
+	/**
 	 * Starts a resumed transcript from the prompt its newest reply was sent
-	 * with, when the branch stores it and this process built another one from
-	 * the same operator inputs. The rest of a startup build is raced against
+	 * with, when the branch stores it, this process built another one from
+	 * the same operator inputs, and the next request reads the transcript's
+	 * live cache entry. The rest of a startup build is raced against
 	 * deadlines or read from caches another process filled (skill descriptions,
 	 * context files, the workspace tree, tools that register late), and a changed
 	 * prompt makes a prefix-bound model write the whole cached conversation
@@ -2116,9 +2218,16 @@ export class SessionTools {
 	 * waits, as it does mid-session, on the frozen prompt's notices or a rebuild
 	 * that changes the prompt anyway; a rebuild that only renders this process's
 	 * own build again (a startup step such as extension skill discovery or a
-	 * memory backend refreshing the prompt) keeps the stored one. Models that do
-	 * not bind their prefix keep the fresh build: they rebuild freely mid-session
-	 * as well.
+	 * memory backend refreshing the prompt) keeps the stored one. The stored
+	 * prompt keeps nothing but that entry's prefix: with the entry lapsed,
+	 * written for another model or retention, or followed by a compaction, the
+	 * request writes the whole prompt anyway, so this process's own build goes
+	 * out. It goes out too once the change the stored prompt withholds is
+	 * {@link WITHHELD_CHANGE_MAX_AGE_MS} old by the branch's record
+	 * ({@link #withheldChangeSince}); a restored prompt is released as soon as
+	 * that or any other reason to keep it ends ({@link releaseRestoredPrompt}).
+	 * Models that do not bind their prefix keep the fresh build: they rebuild
+	 * freely mid-session as well.
 	 */
 	#restoreTranscriptPrompt(): void {
 		const restored = this.#restoredTranscript;
@@ -2127,12 +2236,90 @@ export class SessionTools {
 		if (systemPromptDigest(this.#baseSystemPrompt) === restored.promptDigest) return;
 		const stored = this.#storedPrompt(restored.promptDigest);
 		if (stored?.operatorDigest !== operatorDigest || systemPromptDigest(stored.blocks) !== stored.digest) return;
+		if (!this.#host.transcriptPromptCacheLive(restored.promptDigest)) return;
+		const now = Date.now();
+		const recordedSince = this.#withheldChangeSince(restored.promptDigest);
+		if (recordedSince !== undefined && now - recordedSince >= WITHHELD_CHANGE_MAX_AGE_MS) return;
 		this.#baseStandIn = { base: stored.blocks, build: this.#baseSystemPrompt };
 		this.#baseSystemPrompt = stored.blocks;
 		this.#basePromptRestored = true;
+		this.#restoredPrompt = {
+			base: stored.blocks,
+			digest: restored.promptDigest,
+			since: recordedSince ?? now,
+			due: false,
+			recorded: recordedSince !== undefined,
+		};
 		this.#applyAgentSystemPrompt(stored.blocks);
 		// The transcript's requests carried the stored roster: the next prompt announces what differs now.
 		this.#notifyToolRosterDelta(stored.toolNames, this.getActiveToolNames());
+	}
+
+	/** {@link #restoredPrompt} while it is the base. */
+	#keptRestoredPrompt(): RestoredPrompt | undefined {
+		const restored = this.#restoredPrompt;
+		return restored?.base === this.#baseSystemPrompt ? restored : undefined;
+	}
+
+	/**
+	 * Whether the base prompt withholds a change from the model to keep the cached prefix: a settings rebuild is
+	 * held ({@link #holdSettingsRebuild}), or the restored transcript prompt is kept ({@link #restoreTranscriptPrompt}).
+	 */
+	get withholdsPromptChange(): boolean {
+		return this.#heldSettingsRebuild !== undefined || this.#keptRestoredPrompt() !== undefined;
+	}
+
+	/** Whether the kept restored transcript prompt is due for release ({@link releaseRestoredPrompt}). */
+	#restoredPromptDue(lapsed: boolean): boolean {
+		const restored = this.#keptRestoredPrompt();
+		if (!restored) return false;
+		return lapsed || restored.due || Date.now() - restored.since >= WITHHELD_CHANGE_MAX_AGE_MS;
+	}
+
+	/**
+	 * Replaces the kept restored transcript prompt with this process's own build once keeping it buys nothing or the
+	 * change it withholds has waited long enough: `lapsed` (the prompt cache entry the cut rule reads has lapsed or
+	 * cannot be read, so no cached prefix is left to keep), a cut the cut rule admitted that rewrites every message
+	 * ({@link noteRewritingCutAdmitted}), a move to another transcript ({@link leaveRestoredTranscript}), or
+	 * {@link WITHHELD_CHANGE_MAX_AGE_MS} after the change. The rebuild renders the live settings, so a held settings
+	 * rebuild runs with it.
+	 */
+	releaseRestoredPrompt(lapsed: boolean): Promise<void> {
+		// Nothing runs: no wait behind the registry mutations in flight.
+		if (!this.#restoredPromptDue(lapsed)) return Promise.resolve();
+		return this.runToolRegistryMutation(async () => {
+			const restored = this.#restoredPrompt;
+			if (!restored || this.#host.isDisposed() || !this.#restoredPromptDue(lapsed)) return;
+			this.#restoredPrompt = undefined;
+			if (this.#baseStandIn?.base === restored.base) this.#baseStandIn = undefined;
+			try {
+				if (this.#heldSettingsRebuild) {
+					await this.#absorbHeldSettingsRebuild();
+				} else {
+					const prepared = await this.#prepareBaseSystemPrompt();
+					prepared?.commit?.();
+				}
+			} catch (error) {
+				// Still due: the next request tries again.
+				this.#restoredPrompt ??= { ...restored, due: true };
+				throw error;
+			}
+		});
+	}
+
+	/**
+	 * The session moved to another transcript (`/new`, `/clear`, a switch to another session). A restored transcript
+	 * prompt was kept for the restored transcript's cache entry, which the next request does not read: it stops
+	 * standing in for this process's own build, so the rebuild that follows the move commits that build, and is due
+	 * at the next request should that rebuild fail.
+	 */
+	leaveRestoredTranscript(): void {
+		this.#restoredTranscript = undefined;
+		this.#basePromptRestored = false;
+		const restored = this.#restoredPrompt;
+		if (!restored) return;
+		restored.due = true;
+		if (this.#baseStandIn?.base === restored.base) this.#baseStandIn = undefined;
 	}
 
 	/** Drops retained transcript references when the session is disposed. */
@@ -2992,9 +3179,11 @@ export class SessionTools {
 	 * Holds the rebuild that `settingsChange` started when the prompt is bound (a prefix-bound model has answered
 	 * under it): the system prompt and the tool definitions keep their bytes, {@link takeSettingsNotice} tells the
 	 * model what changed, and {@link absorbHeldSettingsRebuild} runs the rebuild at a cut the cut rule admits or once
-	 * the prompt cache entry lapses. Returns the hold to extend, or undefined when the rebuild runs now: no settings
-	 * change started it, or nothing is bound. Unlike {@link #implicitRebuildBinding}, the prompt the session was
-	 * created with binds as soon as a reply was produced under it, before any rebuild committed.
+	 * the prompt cache entry lapses. A new hold is recorded on the branch with its start, so a resumed process that
+	 * restores the bound prompt keeps the change waiting no longer ({@link #restoreTranscriptPrompt}). Returns the hold
+	 * to extend, or undefined when the rebuild runs now: no settings change started it, or nothing is bound. Unlike
+	 * {@link #implicitRebuildBinding}, the prompt the session was created with binds as soon as a reply was produced
+	 * under it, before any rebuild committed.
 	 */
 	#holdSettingsRebuild(settingsChange: readonly SettingChange[] | undefined): HeldSettingsRebuild | undefined {
 		if (!settingsChange || !this.#promptBound) return undefined;
@@ -3012,6 +3201,7 @@ export class SessionTools {
 				skills: false,
 			};
 			this.#heldSettingsRebuild = held;
+			this.#recordWithheldChange(this.currentPromptDigest(), Date.now());
 		}
 		for (const { setting, previous } of settingsChange) {
 			if (!held.before.has(setting)) held.before.set(setting, previous);
@@ -3042,10 +3232,13 @@ export class SessionTools {
 
 	/**
 	 * Records that the cut rule admitted a cut that rewrites every message after the system prompt and tools anyway:
-	 * the held settings rebuild, if any, is due, and stays due if a failed rebuild restores it.
+	 * the held settings rebuild and the kept restored transcript prompt, if any, are due, and stay due if a failed
+	 * rebuild restores them.
 	 */
 	noteRewritingCutAdmitted(): void {
 		if (this.#heldSettingsRebuild) this.#heldSettingsRebuild.cutAdmitted = true;
+		const restored = this.#keptRestoredPrompt();
+		if (restored) restored.due = true;
 	}
 
 	/**
