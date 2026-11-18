@@ -886,7 +886,7 @@ fn rename_with_fallback(
 	// directory is not merged into, a file is not written through.
 	if file_type.is_dir() {
 		if filesystem.exists(&to_fs) {
-			filesystem.remove_dir_all(&to_fs)?;
+			remove_moved_tree(host, to, &to_fs)?;
 		}
 	} else if filesystem.is_symlink(&to_fs) {
 		filesystem.remove_file(&to_fs).map_err(|err| {
@@ -912,10 +912,17 @@ fn rename_with_fallback(
 	}
 
 	if file_type.is_dir() {
-		filesystem.remove_dir_all(&from_fs)
+		remove_moved_tree(host, from, &from_fs)
 	} else {
 		filesystem.remove_file(&from_fs).map_err(describe)
 	}
+}
+
+/// Removes the tree at `path` (resolved: `fs_path`) that a move across
+/// filesystems replaces or copied: a symlink is removed itself, and a
+/// directory with everything in it.
+fn remove_moved_tree(host: &mut Host, _path: &Path, fs_path: &Path) -> io::Result<()> {
+	host.fs().remove_dir_all(fs_path)
 }
 
 fn is_empty_dir(host: &Host, path: &Path) -> bool {
@@ -1150,5 +1157,56 @@ mod tests {
 		let (code, capture) = run_util::<Mv>(&["missing", "target"], "", fixture.path());
 		assert_eq!(code, 1);
 		assert_eq!(capture.err(), "mv: cannot stat 'missing': No such file or directory\n");
+	}
+
+	/// The removal that ends a directory move across filesystems deletes
+	/// nothing outside the moved tree while `tree/sub` flips between a
+	/// directory and a symlink to `outside/`, 2,000 times. gVisor before
+	/// release-20261109.0 follows a final symlink to a directory despite
+	/// `O_NOFOLLOW` when `O_DIRECTORY` is set (google/gvisor#14786), the
+	/// flags with which `std::fs::remove_dir_all` opens each directory.
+	#[cfg(unix)]
+	#[test]
+	fn the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink() {
+		use std::sync::atomic::{AtomicBool, Ordering};
+		const RUNS: usize = 2_000;
+		let mut escapes = 0;
+		for _ in 0..RUNS {
+			let cwd = tempdir().unwrap();
+			let (tree, parked, outside) =
+				(cwd.path().join("tree"), cwd.path().join("parked"), cwd.path().join("outside"));
+			let sub = tree.join("sub");
+			fs::create_dir_all(&sub).unwrap();
+			fs::create_dir_all(&outside).unwrap();
+			for i in 0..4 {
+				fs::write(sub.join(format!("in{i}")), b"").unwrap();
+				fs::write(outside.join(format!("victim{i}")), b"").unwrap();
+			}
+			let stop = AtomicBool::new(false);
+			std::thread::scope(|scope| {
+				scope.spawn(|| {
+					while !stop.load(Ordering::Relaxed) {
+						if fs::rename(&sub, &parked).is_err() {
+							std::thread::yield_now();
+							continue;
+						}
+						let _ = std::os::unix::fs::symlink(&outside, &sub);
+						for _ in 0..50 {
+							std::hint::spin_loop();
+						}
+						let _ = fs::remove_file(&sub);
+						let _ = fs::rename(&parked, &sub);
+					}
+				});
+				let (mut host, _capture) = Host::for_test(Mv::NAME, "", cwd.path());
+				let _ = super::remove_moved_tree(&mut host, std::path::Path::new("tree"), &tree);
+				stop.store(true, Ordering::Relaxed);
+			});
+			if (0..4).any(|i| !outside.join(format!("victim{i}")).exists()) {
+				escapes += 1;
+			}
+		}
+		eprintln!("{RUNS} runs swapping tree/sub: {escapes} removed a file outside the tree");
+		assert_eq!(escapes, 0, "the moved tree's removal went outside it through a swapped symlink");
 	}
 }
