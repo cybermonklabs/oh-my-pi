@@ -28,7 +28,13 @@ import { buildSessionContext } from "./session-context";
 import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
-import { defaultSessionStorage, FileSessionStorage, type SessionStorage } from "./session-storage";
+import {
+	defaultSessionStorage,
+	FileSessionStorage,
+	RACED_READ_RETRIES,
+	SessionReadConflictError,
+	type SessionStorage,
+} from "./session-storage";
 import { enotdir } from "./session-storage-errors";
 import {
 	parseTitleSlotFromContent,
@@ -670,9 +676,17 @@ async function loadWithKnownSize(
 	options?: LoadSessionOptions,
 ): Promise<{ loaded: SessionLoadResult; sourceSize: number }> {
 	if (shouldStreamEntries(storage, filePath, size)) {
-		const loaded = await loadEntriesFromFileStream(filePath, { ...options, storage });
-		const sourceSize = loaded.sourceSize ?? 0;
-		return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
+		for (let retries = 0; ; retries++) {
+			try {
+				const loaded = await loadEntriesFromFileStream(filePath, { ...options, storage });
+				const sourceSize = loaded.sourceSize ?? 0;
+				return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
+			} catch (error) {
+				// A full rewrite or delete raced the stream (another process, or this one's queued writes, which
+				// reads do not wait for): stream it again from its start, never as one whole-text read.
+				if (!(error instanceof SessionReadConflictError) || retries >= RACED_READ_RETRIES) throw error;
+			}
+		}
 	}
 	const content = await storage.readText(filePath);
 	const loaded = parseSessionContent(content);

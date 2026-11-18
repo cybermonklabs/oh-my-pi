@@ -152,6 +152,13 @@ export class SessionReadConflictError extends Error {
 }
 
 /**
+ * Times a reader of a stored transcript reads it again from its start after a
+ * {@link SessionReadConflictError}, before that error surfaces. Each retry
+ * streams again; none falls back to reading the transcript whole.
+ */
+export const RACED_READ_RETRIES = 3;
+
+/**
  * The file publish lock is held by another live writer, so freshness cannot
  * be established. Fail-closed: the staged rewrite is discarded without
  * publishing.

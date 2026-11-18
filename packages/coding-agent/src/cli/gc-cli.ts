@@ -44,6 +44,7 @@ import { codeOf, statIfPresent, withGcLock } from "../session/gc-lock";
 import { readSessionHeaderId, transcriptByteChunks } from "../session/session-loader";
 import {
 	FileSessionStorage,
+	RACED_READ_RETRIES,
 	SESSION_STAGING_RE,
 	SessionReadConflictError,
 	type SessionStorage,
@@ -92,12 +93,6 @@ const DAY_MS = 86_400_000;
 const GC_WRITE_GRACE_MS = 5 * 60_000;
 const SESSION_SUFFIX = ".jsonl";
 const COMPRESSED_SESSION_SUFFIX = ".jsonl.gz";
-/**
- * Times the blob scan reads a stored transcript again after a concurrent
- * rewrite raced its read. It never skips one: the blobs only that transcript
- * references would then be deleted.
- */
-const RACED_READ_RETRIES = 3;
 /** Bytes sampled to rule out a session header before streaming an artifact. */
 const HEADER_SNIFF_BYTES = 4096;
 /**

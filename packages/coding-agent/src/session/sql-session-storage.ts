@@ -177,13 +177,11 @@ interface DialectQueries {
 	 * Delete every session row whose path starts with `@dir` (its first `@len`
 	 * characters equal it; a character comparison, not `LIKE`, so `%` and `_`
 	 * stay literal and SQLite's ASCII-insensitive `LIKE` cannot match another
-	 * case) and exactly those rows' parts, then the parts under `@dir` that have
-	 * no row: the staging parts of a full write. PostgreSQL and MySQL delete the
-	 * rows and their parts in one statement, so the parts deleted are those of
-	 * the rows deleted: a row another client commits between two statements
-	 * would otherwise keep its row and lose its parts under READ COMMITTED; the
-	 * second statement deletes only parts whose row it does not see. SQLite runs
-	 * its statements inside `BEGIN IMMEDIATE`, where no other writer runs.
+	 * case) and exactly those rows' parts. PostgreSQL and MySQL do both in one
+	 * statement, so the parts deleted are those of the rows deleted: a row
+	 * another client commits between two statements would otherwise keep its
+	 * row and lose its parts under READ COMMITTED. SQLite runs the two
+	 * statements inside `BEGIN IMMEDIATE`, where no other writer runs.
 	 */
 	deleteUnder: Statement[];
 	/**
@@ -1101,19 +1099,11 @@ function buildQueries(
 					`WITH gone AS (DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir RETURNING path) ` +
 						`DELETE FROM ${parts} WHERE path IN (SELECT path FROM gone)`,
 				),
-				sql(
-					`DELETE FROM ${parts} AS p WHERE substr(p.path, 1, @len) = @dir ` +
-						`AND NOT EXISTS (SELECT 1 FROM ${table} AS r WHERE r.path = p.path)`,
-				),
 			],
 			mysql: [
 				sql(
 					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
 						`WHERE substr(r.path, 1, @len) = @dir`,
-				),
-				sql(
-					`DELETE p FROM ${parts} AS p LEFT JOIN ${table} AS r ON r.path = p.path ` +
-						`WHERE substr(p.path, 1, @len) = @dir AND r.path IS NULL`,
 				),
 			],
 			sqlite: [
@@ -1738,8 +1728,6 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	#mysqlLocks: MysqlLockForm | undefined;
 	/** The version a MySQL-family server reported at start-up, as a refusal names it. */
 	#mysqlVersion = "";
-	/** Longest path, staging paths included, the dialect's `path` columns hold, in characters. */
-	readonly #pathChars: number;
 
 	constructor(options: SqlSessionStorageOptions) {
 		this.#client = options.client;
@@ -1782,7 +1770,6 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// An in-memory database is this process's alone: nobody else can open its sessions.
 			else if (this.#sqliteFile) this.#gate = "lock";
 		}
-		this.#pathChars = this.#adapter === "mysql" ? MYSQL_PATH_CHARS : Number.POSITIVE_INFINITY;
 	}
 
 	get adapter(): SqlSessionStorageAdapter {
@@ -3041,11 +3028,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * instead of yielding a mix of two bodies. MySQL has no row identity, so
 	 * there only those checks apply, and a full write that keeps the size and
 	 * every part's start, made between two pages, goes unseen. SQLite gives a
-	 * new row the largest rowid plus one, so a delete followed by a re-create
-	 * at the same path, made between two pages, can give the new parts the
-	 * rowids of the deleted ones when those were the table's newest; then only
-	 * those checks apply there too, and a re-created body that keeps the size
-	 * and every part's start goes unseen.
+	 * new row the largest rowid plus one, so a delete, or a full write that
+	 * leaves no part (a truncate), followed by new parts at the same path,
+	 * made between two pages, can give the new parts the rowids of the deleted
+	 * ones when those were the table's newest; then only those checks apply
+	 * there too, and new parts that keep the size and every part's start go
+	 * unseen.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const [row] = (await this.#exclusive(() =>
@@ -3138,13 +3126,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const now = Date.now();
 		const prefix = `${path}${STAGING_MARK}`;
 		const stagingAt = (epochMs: number): string => `${prefix}${String(epochMs).padStart(STAGING_EPOCH_DIGITS, "0")}`;
-		const fences = this.#fencesOf([path]);
-		const fenced = async (work: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void> => {
-			await this.#awaitClaims(fences);
-			await this.#fencedTransaction(fences, work);
-		};
 		const staging = `${stagingAt(now)}-${Snowflake.next()}`;
-		if ([...staging].length > this.#pathChars) {
+		if (this.#adapter === "mysql" && [...staging].length > MYSQL_PATH_CHARS) {
 			const { text, bytes } = await decodeChunks(chunks);
 			if (bytes !== byteLength) {
 				throw new Error(`SqlSessionStorage: a full write of ${path} streamed ${bytes} bytes, not ${byteLength}`);
@@ -3152,6 +3135,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			await this.writeFull(path, text, mtimeMs, title, expectedSize);
 			return;
 		}
+		const fences = this.#fencesOf([path]);
+		const fenced = async (work: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void> => {
+			await this.#awaitClaims(fences);
+			await this.#fencedTransaction(fences, work);
+		};
 		try {
 			let staged = 0;
 			let batch: Array<{ offset: number; content: string }> = [];
