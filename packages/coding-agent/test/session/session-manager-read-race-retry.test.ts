@@ -30,14 +30,17 @@ const BODY =
  */
 class RacedStorage extends MemorySessionStorage {
 	passes = 0;
+	/** Called with each stream's 1-based pass number before the stream reads anything. */
+	onPass?: (pass: number) => void;
 
 	constructor(readonly raced: (pass: number) => boolean) {
 		super();
 	}
 
 	async *readChunks(path: string, fromByte = 0): AsyncGenerator<Uint8Array> {
-		const bytes = Buffer.from(super.readTextSync(path), "utf8").subarray(fromByte);
 		const pass = ++this.passes;
+		this.onPass?.(pass);
+		const bytes = Buffer.from(super.readTextSync(path), "utf8").subarray(fromByte);
 		for (let start = 0; start < bytes.byteLength; start += MiB) {
 			if (start > 0 && this.raced(pass)) throw new SessionReadConflictError(path);
 			yield bytes.subarray(start, start + MiB);
@@ -186,5 +189,49 @@ describe("a session manager's load that a full rewrite races", () => {
 		});
 		await manager.close();
 		await whole.close();
+	});
+
+	it("gives the entries the ids and parents of the body it loads when a full write lands between the check for entry ids and the load", async () => {
+		// If this regresses, opening a current-version session whose entries had
+		// no ids while another writer rewrote it with ids renumbers every entry of
+		// the new body, so the tree, the leaf and every reference by id break.
+		const pad = (fill: string, identity: object) => ({
+			type: "custom",
+			customType: "pad",
+			...identity,
+			timestamp: TIMESTAMP,
+			data: fill.repeat(9 * MiB),
+		});
+		const transcript = (entries: object[]) =>
+			[{ type: "session", version: 3, id: "raced", timestamp: TIMESTAMP, cwd: "/tmp" }, ...entries]
+				.map(entry => `${JSON.stringify(entry)}\n`)
+				.join("");
+		const unindexed = transcript([pad("u", {}), { type: "custom", customType: "note", timestamp: TIMESTAMP }]);
+		const indexed = transcript([
+			pad("i", { id: "p0", parentId: null }),
+			{ type: "custom", customType: "note", id: "n1", parentId: "p0", timestamp: TIMESTAMP },
+		]);
+		const { storage } = racedStorage(() => false, unindexed);
+		// The streams: the header probe, the load's first pass (which stops at the
+		// first entry, without an id), the check that reads every entry, then the load.
+		storage.onPass = pass => {
+			if (pass === 4) storage.writeTextSync(FILE, indexed);
+		};
+
+		const manager = await SessionManager.open(FILE, path.dirname(FILE), storage, { suppressBreadcrumb: true });
+
+		expect({
+			entries: manager
+				.getEntries()
+				.map(entry => [entry.id, entry.parentId, entry.type === "custom" ? String(entry.data).charAt(0) : ""]),
+			passes: storage.passes,
+		}).toEqual({
+			entries: [
+				["p0", null, "i"],
+				["n1", "p0", "u"],
+			],
+			passes: 5,
+		});
+		await manager.close();
 	});
 });

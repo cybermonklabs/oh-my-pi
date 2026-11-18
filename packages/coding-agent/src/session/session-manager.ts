@@ -2918,6 +2918,9 @@ export class SessionManager {
 	/**
 	 * One streamed pass of {@link #loadTranscript}. Returns undefined, having
 	 * kept nothing, when `unindexed` is still unknown and the file needs it.
+	 * A known `unindexed` that this pass's own body contradicts came from a
+	 * body another writer replaced between the passes: the pass then fails as
+	 * a raced read (`SessionReadConflictError`), so the load runs again.
 	 */
 	async #streamTranscript(
 		filePath: string,
@@ -2928,6 +2931,9 @@ export class SessionManager {
 		let header: SessionHeader | undefined;
 		let migration: SessionEntryMigration | undefined;
 		let needsIndexCheck = false;
+		// What this pass's body says of `unindexed` (see #transcriptIsUnindexed).
+		let sawEntry = false;
+		let everyEntryLacksId = true;
 		let sanitized = false;
 		let repairedUsage = 0;
 		// The entries live only in `intake`, emptied before this returns: an
@@ -2982,6 +2988,10 @@ export class SessionManager {
 					}
 					migration = startMigration(header);
 				}
+				if (raw.type !== "session") {
+					sawEntry = true;
+					if (!lacksEntryId(raw)) everyEntryLacksId = false;
+				}
 				migration.migrate(raw);
 				if (raw.type === "session" && fork) return;
 				let entry = raw as SessionEntry;
@@ -3016,6 +3026,9 @@ export class SessionManager {
 			if (needsIndexCheck) {
 				intake.store?.close();
 				return undefined;
+			}
+			if (unindexed !== undefined && unindexed !== (sawEntry && everyEntryLacksId)) {
+				throw new SessionReadConflictError(filePath);
 			}
 			if (header && !migration) migration = startMigration(header);
 			intake.index.settleLeaf(intake.entries);
