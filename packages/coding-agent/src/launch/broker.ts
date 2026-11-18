@@ -125,7 +125,9 @@ interface ManagedDaemon {
 	/**
 	 * While this record's writes keep failing (a full or read-only disk): how
 	 * many failed in a row, and when a polling refresh may try again
-	 * ({@link persistRetryDelay}). Unset once a write succeeds.
+	 * ({@link persistRetryDelay}), on the monotonic clock (`performance.now()`)
+	 * so that no step of the wall clock delays or hastens it. Unset once a
+	 * write succeeds.
 	 */
 	persistFailure?: { failures: number; retryAt: number };
 	/** Completes after a terminal generation's log, metadata, and completion notification are published. */
@@ -1160,9 +1162,10 @@ class DaemonBroker {
 
 	/**
 	 * Brings `record` up to date with its process: writes the record again if
-	 * its last write failed, reads a start mark it could not read at spawn
+	 * its last write failed (a settled record too: the write of its exit), then,
+	 * unless it settled, reads a start mark it could not read at spawn
 	 * ({@link #refreshMark}), retries the kills it could not pin the daemon for
-	 * ({@link ManagedDaemon.pendingKills}), then, for a detached daemon this
+	 * ({@link ManagedDaemon.pendingKills}), and, for a detached daemon this
 	 * broker does not hold, reads its output and settles it once it is gone.
 	 *
 	 * `retry` is who asks: a `"request"` (`list`, `stop`, `send`, …) tries a
@@ -1172,15 +1175,15 @@ class DaemonBroker {
 	 * each poll.
 	 */
 	async #refreshDetached(record: ManagedDaemon, retry: "request" | "poll"): Promise<void> {
-		if (settledState(record.snapshot.state)) return;
 		// A failed write (a full or read-only disk) left `persistedMeta` unset:
-		// what only memory holds, a mark read at refresh among it, is written
-		// again until a write succeeds.
+		// what only memory holds, a mark read at refresh or the exit a record
+		// settled with among it, is written again until a write succeeds.
 		const retryAt = record.persistFailure?.retryAt ?? 0;
-		if (record.persistedMeta === undefined && (retry === "request" || Date.now() >= retryAt)) {
+		if (record.persistedMeta === undefined && (retry === "request" || performance.now() >= retryAt)) {
 			this.#persist(record);
 			await record.persistQueue;
 		}
+		if (settledState(record.snapshot.state)) return;
 		await this.#refreshMark(record);
 		if (record.pendingKills.length > 0 && (await this.#retryPendingKills(record))) return;
 		if (!record.spec.detached) return;
@@ -1622,8 +1625,10 @@ class DaemonBroker {
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<boolean> {
-		const deadline = Date.now() + Math.max(0, timeoutMs);
-		while (Date.now() < deadline) {
+		// The monotonic clock: a step of the wall clock neither holds a wait past its
+		// timeout nor ends it early.
+		const deadline = performance.now() + Math.max(0, timeoutMs);
+		while (performance.now() < deadline) {
 			if (signal?.aborted) return condition();
 			await this.#refreshDetached(record, "poll");
 			if (condition()) return true;
@@ -1687,7 +1692,7 @@ class DaemonBroker {
 				// otherwise log each retry ({@link persistRetryDelay}), and the recovery is
 				// warned once too, above.
 				const failures = (record.persistFailure?.failures ?? 0) + 1;
-				record.persistFailure = { failures, retryAt: Date.now() + persistRetryDelay(failures) };
+				record.persistFailure = { failures, retryAt: performance.now() + persistRetryDelay(failures) };
 				if (failures > 1) return;
 				logger.warn("Failed to persist daemon metadata", {
 					name: record.snapshot.name,

@@ -1,8 +1,11 @@
-// Integration test of the real daemon broker with a record whose directory refuses writes (chmod
-// 555, as a disk that stays full). The record is a detached daemon of an older broker that
-// recorded no start mark: recovery keeps it, `stop` leaves it `stopping` (nothing to pin), and the
-// broker's monitor of recovered detached daemons keeps polling it. The broker's writes into the
-// record's directory and its persistence warnings are counted with spies.
+// Integration tests of the real daemon broker with a record whose directory refuses writes (chmod
+// 555, as a disk that stays full). In the first two, the record is a detached daemon of an older
+// broker that recorded no start mark: recovery keeps it, `stop` leaves it `stopping` (nothing to
+// pin), and the broker's monitor of recovered detached daemons keeps polling it. In the next, the
+// record is the broker's own daemon, which exits while the write of its exit fails. The broker's
+// writes into the record's directory and its persistence warnings are counted with spies. The
+// last checks that a wait, which polls as the monitor does, keeps its timeout across a step of
+// the wall clock.
 import { expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -35,69 +38,115 @@ async function stateOf(client: DaemonBrokerClient): Promise<string | undefined> 
 	return listed.daemons.find(daemon => daemon.name === NAME)?.state;
 }
 
+async function diskState(metaPath: string): Promise<string> {
+	return JSON.parse(await fs.readFile(metaPath, "utf8")).daemon.state;
+}
+
+interface Daemon {
+	pid: number;
+	mark: string | null | undefined;
+}
+
+/** Starts a `sleep` daemon through `client`, and returns its pid and start mark. */
+async function startSleep(client: DaemonBrokerClient, projectDir: string, detached: boolean): Promise<Daemon> {
+	const started = await client.request({
+		op: "start",
+		spec: {
+			name: NAME,
+			application: "sleep",
+			args: ["600"],
+			env: {},
+			cwd: projectDir,
+			pty: false,
+			restart: "no",
+			persist: true,
+			detached,
+		},
+	});
+	if (started.op !== "start" || started.daemon.pid === undefined) throw new Error("no daemon started");
+	return { pid: started.daemon.pid, mark: Process.fromPid(started.daemon.pid)?.startMark };
+}
+
+/** A detached daemon, recorded by a broker that then exits, as an older broker recorded it: no mark. */
+async function recordUnpinnable(projectDir: string, runtimeDir: string, metaPath: string): Promise<Daemon> {
+	const first = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+	const firstBroker = startBroker(projectDir, runtimeDir);
+	let daemon: Daemon;
+	try {
+		daemon = await startSleep(first, projectDir, true);
+	} finally {
+		await first.request({ op: "shutdown" }).catch(() => undefined);
+		first.close();
+		await firstBroker;
+	}
+	const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
+	delete meta.daemon.processStart;
+	await fs.writeFile(metaPath, JSON.stringify(meta));
+	return daemon;
+}
+
+/** Kills only the daemon a test started, by the pid and mark recorded at its start. */
+function killDaemon(daemon: Daemon | undefined, signal: NodeJS.Signals): boolean {
+	if (daemon?.mark == null || Process.fromPid(daemon.pid)?.startMark !== daemon.mark) return false;
+	process.kill(daemon.pid, signal);
+	return true;
+}
+
+function paths(root: string) {
+	const dir = path.join(root, "runtime", "daemons", NAME);
+	return {
+		projectDir: path.join(root, "project"),
+		runtimeDir: path.join(root, "runtime"),
+		dir,
+		metaPath: path.join(dir, "meta.json"),
+	};
+}
+
+/** Counts the broker's persistence warnings, and silences every warning. */
+function countWarnings(): { warned: { failed: number; again: number }; restore(): void } {
+	const warned = { failed: 0, again: 0 };
+	const spy = spyOn(logger, "warn").mockImplementation(((message: string) => {
+		if (message.startsWith("Failed to persist daemon metadata")) warned.failed++;
+		if (message.startsWith("Persisted daemon metadata again")) warned.again++;
+	}) as typeof logger.warn);
+	return { warned, restore: () => spy.mockRestore() };
+}
+
+/**
+ * Waits until the broker has handled a write that failed, which it warns at the first failure
+ * in a row. A reply does not wait for the write its request queued, so on a loaded host the
+ * failure may land after it. The runner bounds the wait.
+ */
+async function failureHandled(warned: { failed: number }): Promise<void> {
+	while (warned.failed === 0) await Bun.sleep(20);
+}
+
 it("backs off a write that keeps failing, warns once, and writes once the disk takes writes", async () => {
 	using tempDir = TempDir.createSync("@omp-launch-persist-backoff-");
-	const projectDir = path.join(tempDir.path(), "project");
-	const runtimeDir = path.join(tempDir.path(), "runtime");
+	const { projectDir, runtimeDir, dir, metaPath } = paths(tempDir.path());
 	await fs.mkdir(projectDir);
-	const dir = path.join(runtimeDir, "daemons", NAME);
-	const metaPath = path.join(dir, "meta.json");
 	const previousTitle = process.title;
-	let daemon: { pid: number; mark: string | null | undefined } | undefined;
+	let daemon: Daemon | undefined;
 	try {
-		// A detached daemon, recorded by a broker that then exits.
-		const first = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const firstBroker = startBroker(projectDir, runtimeDir);
-		try {
-			const started = await first.request({
-				op: "start",
-				spec: {
-					name: NAME,
-					application: "sleep",
-					args: ["600"],
-					env: {},
-					cwd: projectDir,
-					pty: false,
-					restart: "no",
-					persist: true,
-					detached: true,
-				},
-			});
-			if (started.op !== "start" || started.daemon.pid === undefined) throw new Error("no daemon started");
-			daemon = { pid: started.daemon.pid, mark: Process.fromPid(started.daemon.pid)?.startMark };
-		} finally {
-			await first.request({ op: "shutdown" }).catch(() => undefined);
-			first.close();
-			await firstBroker;
-		}
-		// As an older broker recorded it: no mark, so nothing can pin it.
-		const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
-		delete meta.daemon.processStart;
-		await fs.writeFile(metaPath, JSON.stringify(meta));
-
+		daemon = await recordUnpinnable(projectDir, runtimeDir, metaPath);
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
 		const broker = startBroker(projectDir, runtimeDir);
 		const writes = { n: 0 };
-		const warned = { failed: 0, again: 0 };
 		const realWrite = Bun.write;
 		const writeSpy = spyOn(Bun, "write").mockImplementation(((destination: unknown, ...rest: unknown[]) => {
 			if (typeof destination === "string" && destination.startsWith(dir)) writes.n++;
 			return (realWrite as (...args: unknown[]) => unknown).call(Bun, destination, ...rest);
 		}) as typeof Bun.write);
-		const warnSpy = spyOn(logger, "warn").mockImplementation(((message: string) => {
-			if (message.startsWith("Failed to persist daemon metadata")) warned.failed++;
-			if (message.startsWith("Persisted daemon metadata again")) warned.again++;
-		}) as typeof logger.warn);
+		const { warned, restore: restoreWarnings } = countWarnings();
 		try {
 			expect(await stateOf(client)).toBe("running");
 			await fs.chmod(dir, 0o555);
 			// The stop's write fails: warned once, whatever its wait loop tried since.
 			const stopped = await client.request({ op: "stop", name: NAME, timeoutMs: 300 });
 			if (stopped.op !== "stop") throw new Error(`unexpected result: ${stopped.op}`);
-			expect({ state: stopped.daemon.state, warned: { ...warned } }).toEqual({
-				state: "stopping",
-				warned: { failed: 1, again: 0 },
-			});
+			expect(stopped.daemon.state).toBe("stopping");
+			await failureHandled(warned);
+			expect(warned).toEqual({ failed: 1, again: 0 });
 
 			// 3 s with no request, while the monitor polls every 100 ms: the retries back off
 			// (their gaps double from 100 ms), so at most 5 fall in any 3 s, each one write
@@ -120,14 +169,12 @@ it("backs off a write that keeps failing, warns once, and writes once the disk t
 			// Once the directory takes writes again, a poll (no request) writes the record,
 			// within one backoff, and the recovery is warned once. The runner bounds the wait.
 			await fs.chmod(dir, 0o755);
-			while (JSON.parse(await fs.readFile(metaPath, "utf8")).daemon.state !== "stopping") {
-				await Bun.sleep(20);
-			}
+			while ((await diskState(metaPath)) !== "stopping") await Bun.sleep(20);
 			while (warned.again === 0) await Bun.sleep(20);
 			expect(warned).toEqual({ failed: 1, again: 1 });
 		} finally {
 			writeSpy.mockRestore();
-			warnSpy.mockRestore();
+			restoreWarnings();
 			await fs.chmod(dir, 0o755).catch(() => undefined);
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
@@ -135,9 +182,127 @@ it("backs off a write that keeps failing, warns once, and writes once the disk t
 		}
 	} finally {
 		process.title = previousTitle;
-		// Only the daemon this test started, by the pid and mark recorded at its start.
-		if (daemon?.mark != null && Process.fromPid(daemon.pid)?.startMark === daemon.mark) {
-			process.kill(daemon.pid, "SIGKILL");
+		killDaemon(daemon, "SIGKILL");
+	}
+}, 30_000);
+
+it("times the backoff on the monotonic clock: a backward step of the wall clock does not hold a poll's retry", async () => {
+	using tempDir = TempDir.createSync("@omp-launch-persist-clock-");
+	const { projectDir, runtimeDir, dir, metaPath } = paths(tempDir.path());
+	await fs.mkdir(projectDir);
+	const previousTitle = process.title;
+	let daemon: Daemon | undefined;
+	try {
+		daemon = await recordUnpinnable(projectDir, runtimeDir, metaPath);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const broker = startBroker(projectDir, runtimeDir);
+		const realNow = Date.now.bind(Date);
+		let clockSpy: { mockRestore(): void } | undefined;
+		const { warned, restore: restoreWarnings } = countWarnings();
+		try {
+			expect(await stateOf(client)).toBe("running");
+			await fs.chmod(dir, 0o555);
+			const stopped = await client.request({ op: "stop", name: NAME, timeoutMs: 300 });
+			if (stopped.op !== "stop") throw new Error(`unexpected result: ${stopped.op}`);
+			await failureHandled(warned);
+			expect({ memory: stopped.daemon.state, disk: await diskState(metaPath) }).toEqual({
+				memory: "stopping",
+				disk: "running",
+			});
+			// The wall clock steps back 60 s, as when NTP corrects a clock that ran fast, or a VM
+			// is restored from a snapshot; then the directory takes writes again.
+			clockSpy = spyOn(Date, "now").mockImplementation(() => realNow() - 60_000);
+			await fs.chmod(dir, 0o755);
+			// With no request, a poll writes the record within one backoff (at most 5 s). A
+			// backoff timed on the wall clock waits for the step too, 60 s more. The wait is
+			// timed on the monotonic clock, which the step does not move.
+			const from = performance.now();
+			while ((await diskState(metaPath)) !== "stopping" && performance.now() - from < 15_000) {
+				await Bun.sleep(20);
+			}
+			expect(await diskState(metaPath)).toBe("stopping");
+		} finally {
+			clockSpy?.mockRestore();
+			restoreWarnings();
+			await fs.chmod(dir, 0o755).catch(() => undefined);
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker;
 		}
+	} finally {
+		process.title = previousTitle;
+		killDaemon(daemon, "SIGKILL");
+	}
+}, 45_000);
+
+for (const detached of [false, true]) {
+	it(`writes the exit of a ${detached ? "detached" : "pipe"} daemon again after its write failed`, async () => {
+		using tempDir = TempDir.createSync("@omp-launch-persist-settled-");
+		const { projectDir, runtimeDir, dir, metaPath } = paths(tempDir.path());
+		await fs.mkdir(projectDir);
+		const previousTitle = process.title;
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const broker = startBroker(projectDir, runtimeDir);
+		const { warned, restore: restoreWarnings } = countWarnings();
+		let daemon: Daemon | undefined;
+		try {
+			daemon = await startSleep(client, projectDir, detached);
+			await fs.chmod(dir, 0o555);
+			// The broker's own child exits while the write of its exit fails.
+			expect(killDaemon(daemon, "SIGTERM")).toBe(true);
+			const waited = await client.request({ op: "wait", name: NAME, for: "exit", timeoutMs: 10_000 });
+			if (waited.op !== "wait") throw new Error(`unexpected result: ${waited.op}`);
+			const settled = waited.daemon.state;
+			expect({ timedOut: waited.timedOut, settled: ["exited", "failed"].includes(settled) }).toEqual({
+				timedOut: false,
+				settled: true,
+			});
+			await failureHandled(warned);
+			expect(await diskState(metaPath)).toBe("running");
+			// Once the directory takes writes again, a request writes the settled record.
+			await fs.chmod(dir, 0o755);
+			expect(await stateOf(client)).toBe(settled);
+			expect(await diskState(metaPath)).toBe(settled);
+		} finally {
+			restoreWarnings();
+			await fs.chmod(dir, 0o755).catch(() => undefined);
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker;
+			process.title = previousTitle;
+			killDaemon(daemon, "SIGKILL");
+		}
+	}, 30_000);
+}
+
+it("times a wait on the monotonic clock: a backward step of the wall clock does not hold it past its timeout", async () => {
+	using tempDir = TempDir.createSync("@omp-launch-wait-clock-");
+	const { projectDir, runtimeDir } = paths(tempDir.path());
+	await fs.mkdir(projectDir);
+	const previousTitle = process.title;
+	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+	const broker = startBroker(projectDir, runtimeDir);
+	const realNow = Date.now.bind(Date);
+	let clockSpy: { mockRestore(): void } | undefined;
+	let daemon: Daemon | undefined;
+	try {
+		daemon = await startSleep(client, projectDir, false);
+		const waiting = client.request({ op: "wait", name: NAME, for: "exit", timeoutMs: 1_000 });
+		await Bun.sleep(200);
+		// The wall clock steps back 60 s while the broker waits.
+		clockSpy = spyOn(Date, "now").mockImplementation(() => realNow() - 60_000);
+		// The wait ends at its 1 s timeout; one timed on the wall clock would wait 60 s more (and
+		// the client gives up on it at 6 s). The bound is timed on the monotonic clock.
+		const held = Bun.sleep(15_000).then(() => "held" as const);
+		const waited = await Promise.race([waiting, held]);
+		if (waited === "held" || waited.op !== "wait") throw new Error(`the wait did not end: ${String(waited)}`);
+		expect({ timedOut: waited.timedOut, state: waited.daemon.state }).toEqual({ timedOut: true, state: "running" });
+	} finally {
+		clockSpy?.mockRestore();
+		await client.request({ op: "shutdown" }).catch(() => undefined);
+		client.close();
+		await broker;
+		process.title = previousTitle;
+		killDaemon(daemon, "SIGKILL");
 	}
 }, 30_000);

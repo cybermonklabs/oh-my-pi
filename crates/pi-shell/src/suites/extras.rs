@@ -617,10 +617,11 @@ async fn the_words_a_callout_generates_take_no_alias_or_disabled_builtin() {
 			"alias {alias}: the arguments did not each run once"
 		);
 	}
+	let printf = on_path("printf");
 	for (builtin, command, said) in [
-		("builtin", "xargs -a two /usr/bin/printf '%s\\n'", "1\n2\n"),
-		("exec", "xargs -a two /usr/bin/printf '%s\\n'", "1\n2\n"),
-		("command", "xargs -a two echo", "1 2\n"),
+		("builtin", format!("xargs -a two {printf} '%s\\n'"), "1\n2\n"),
+		("exec", format!("xargs -a two {printf} '%s\\n'"), "1\n2\n"),
+		("command", "xargs -a two echo".to_owned(), "1 2\n"),
 	] {
 		let ran =
 			run(&mut session_in(dir.path(), &[]), &format!("enable -n {builtin}; {command}")).await;
@@ -914,25 +915,37 @@ async fn find_leaves_a_refused_exec_to_the_shell() {
 }
 
 /// Runs `WRAPPER "$P"` (`env`, `timeout 5`, `nohup`), `P` being `program`,
-/// in `dir` in the locale `locale` with the variables `env`, both as GNU
-/// coreutils' (`/usr/bin/NAME`, named `NAME`) and as pi's, and asserts the
-/// same status, stdout and stderr. For a command the wrapper cannot run,
-/// that is coreutils' words (`env: ‘NAME’: …`, `timeout: failed to run
-/// command ‘NAME’: …`, `nohup: failed to run command 'NAME': …`), with 126,
-/// or 127 when nothing is found.
+/// in `dir` in the locale `locale` with the variables `env`, as pi's, and
+/// asserts `expected`: the status, stdout and stderr that GNU coreutils 9.4
+/// (with glibc 2.39) gives there, measured as `/usr/bin/NAME`, named `NAME`.
+/// Where `/usr/bin/NAME --version` names coreutils 9.4, that program runs
+/// too, as a second check of the expected line itself; elsewhere (another
+/// version, another implementation, or no `/usr/bin/NAME`, as on NixOS)
+/// pi's line is still checked. For a command the wrapper cannot run, the
+/// line is coreutils' words (`env: ‘NAME’: …`, `timeout: failed to run
+/// command ‘NAME’: …`, `nohup: failed to run command 'NAME': …`), with
+/// 126, or 127 when nothing is found.
 #[cfg(target_os = "linux")]
-async fn assert_wrapper_as_gnu(
+async fn assert_wrapper_as_coreutils(
 	dir: &Path,
 	wrapper: &str,
 	program: &str,
 	locale: &str,
 	env: &[(&str, &str)],
+	expected: (i32, &str, &str),
 ) {
 	use std::os::unix::process::CommandExt as _;
 
+	let mut vars = vec![("LC_ALL", locale), ("P", program)];
+	vars.extend_from_slice(env);
+	let ran = run(&mut session_in(dir, &vars), &format!("{wrapper} \"$P\"")).await;
+	let case = format!("LC_ALL={locale} {env:?} {wrapper} {program:?}");
+	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), expected, "{case}");
 	let words: Vec<&str> = wrapper.split(' ').collect();
 	let gnu_path = format!("/usr/bin/{}", words[0]);
-	assert!(Path::new(&gnu_path).exists(), "{gnu_path} is the reference: GNU coreutils");
+	if !is_coreutils_9_4(&gnu_path) {
+		return;
+	}
 	let gnu = std::process::Command::new(&gnu_path)
 		.arg0(words[0])
 		.args(&words[1..])
@@ -945,88 +958,230 @@ async fn assert_wrapper_as_gnu(
 		.unwrap();
 	let (gnu_out, gnu_err) =
 		(String::from_utf8_lossy(&gnu.stdout), String::from_utf8_lossy(&gnu.stderr));
-	let mut vars = vec![("LC_ALL", locale), ("P", program)];
-	vars.extend_from_slice(env);
-	let ran = run(&mut session_in(dir, &vars), &format!("{wrapper} \"$P\"")).await;
-	let case = format!("LC_ALL={locale} {env:?} {wrapper} {program:?}");
 	let gnu = (gnu.status.code().unwrap(), &*gnu_out, &*gnu_err);
-	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), gnu, "{case}");
+	assert_eq!(gnu, expected, "{case}: {gnu_path}, coreutils 9.4 itself");
 }
 
-/// [`assert_wrapper_as_gnu`] for a command the wrapper cannot run: 126 or
-/// 127.
+/// Whether the program at `path` is GNU coreutils 9.4, as the first line of
+/// its `--version` says: the version [`assert_wrapper_as_coreutils`]'s
+/// lines were measured with.
 #[cfg(target_os = "linux")]
-async fn assert_wrapper_reports_as_gnu(dir: &Path, wrapper: &str, program: &str, locale: &str) {
-	assert_wrapper_as_gnu(dir, wrapper, program, locale, &[]).await;
-	let vars = [("LC_ALL", locale), ("P", program)];
-	let ran = run(&mut session_in(dir, &vars), &format!("{wrapper} \"$P\"")).await;
-	assert!(matches!(ran.status, 126 | 127), "{wrapper} {program:?}: {}", ran.stderr);
+fn is_coreutils_9_4(path: &str) -> bool {
+	std::process::Command::new(path)
+		.arg("--version")
+		.stdin(std::process::Stdio::null())
+		.output()
+		.is_ok_and(|out| {
+			out.stdout
+				.split(|&byte| byte == b'\n')
+				.next()
+				.is_some_and(|line| line.ends_with(b" (GNU coreutils) 9.4"))
+		})
 }
 
-/// The programs each wrapper test runs: not found by name or by path, a
-/// `#!` interpreter that does not exist, no execute bit, a `#!` interpreter
-/// without one (`EACCES` at `exec`), and a `#!` interpreter past `NAME_MAX`
-/// (`ENAMETOOLONG`).
-#[cfg(target_os = "linux")]
-const CANNOT_RUN: [&str; 6] =
-	["no-such-command-here", "./nosuch", "./mi", "./noexec", "./ia", "./s"];
-
-/// [`CANNOT_RUN`], and a directory (`EACCES` at `exec`), which `timeout`
-/// and `nohup` hand to the shell's `exec` as written.
-#[cfg(target_os = "linux")]
-const TOOLS_CANNOT_RUN: [&str; 7] =
-	["no-such-command-here", "./nosuch", "./mi", "./noexec", "./ia", "./s", "./d"];
-
-/// `env PROGRAM` that cannot run, as coreutils' `env` reports it, in the
-/// C and UTF-8 locales.
+/// `env PROGRAM` for a program of [`cannot_run_dir`] it cannot run, in the
+/// C and the UTF-8 locale, as coreutils 9.4's `env` reports it: not found
+/// by name or by path, a `#!` interpreter that does not exist, no execute
+/// bit, a `#!` interpreter without one (`EACCES` at `exec`), and a `#!`
+/// interpreter past `NAME_MAX` (`ENAMETOOLONG`).
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn env_reports_a_command_it_cannot_run_as_coreutils() {
 	let dir = cannot_run_dir();
-	for locale in ["C", "C.UTF-8"] {
-		for program in CANNOT_RUN {
-			assert_wrapper_reports_as_gnu(dir.path(), "env", program, locale).await;
-		}
+	for (locale, program, status, stderr) in [
+		(
+			"C",
+			"no-such-command-here",
+			127,
+			"env: 'no-such-command-here': No such file or directory\n",
+		),
+		("C", "./nosuch", 127, "env: './nosuch': No such file or directory\n"),
+		("C", "./mi", 127, "env: './mi': No such file or directory\n"),
+		("C", "./noexec", 126, "env: './noexec': Permission denied\n"),
+		("C", "./ia", 126, "env: './ia': Permission denied\n"),
+		("C", "./s", 126, "env: './s': File name too long\n"),
+		(
+			"C.UTF-8",
+			"no-such-command-here",
+			127,
+			"env: ‘no-such-command-here’: No such file or directory\n",
+		),
+		("C.UTF-8", "./nosuch", 127, "env: ‘./nosuch’: No such file or directory\n"),
+		("C.UTF-8", "./mi", 127, "env: ‘./mi’: No such file or directory\n"),
+		("C.UTF-8", "./noexec", 126, "env: ‘./noexec’: Permission denied\n"),
+		("C.UTF-8", "./ia", 126, "env: ‘./ia’: Permission denied\n"),
+		("C.UTF-8", "./s", 126, "env: ‘./s’: File name too long\n"),
+	] {
+		assert_wrapper_as_coreutils(dir.path(), "env", program, locale, &[], (status, "", stderr))
+			.await;
 	}
 }
 
-/// `timeout 5 PROGRAM` that cannot run, as coreutils' `timeout` reports it.
+/// `timeout 5 PROGRAM` for a program it cannot run, as coreutils 9.4's
+/// `timeout` reports it: the programs of
+/// [`env_reports_a_command_it_cannot_run_as_coreutils`], and a directory
+/// (`EACCES` at `exec`), which `timeout` and `nohup` hand to the shell's
+/// `exec` as written.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_reports_a_command_it_cannot_run_as_coreutils() {
 	let dir = cannot_run_dir();
-	for locale in ["C", "C.UTF-8"] {
-		for program in TOOLS_CANNOT_RUN {
-			assert_wrapper_reports_as_gnu(dir.path(), "timeout 5", program, locale).await;
-		}
+	for (locale, program, status, stderr) in [
+		(
+			"C",
+			"no-such-command-here",
+			127,
+			"timeout: failed to run command 'no-such-command-here': No such file or directory\n",
+		),
+		(
+			"C",
+			"./nosuch",
+			127,
+			"timeout: failed to run command './nosuch': No such file or directory\n",
+		),
+		("C", "./mi", 127, "timeout: failed to run command './mi': No such file or directory\n"),
+		("C", "./noexec", 126, "timeout: failed to run command './noexec': Permission denied\n"),
+		("C", "./ia", 126, "timeout: failed to run command './ia': Permission denied\n"),
+		("C", "./s", 126, "timeout: failed to run command './s': File name too long\n"),
+		("C", "./d", 126, "timeout: failed to run command './d': Permission denied\n"),
+		(
+			"C.UTF-8",
+			"no-such-command-here",
+			127,
+			"timeout: failed to run command ‘no-such-command-here’: No such file or directory\n",
+		),
+		(
+			"C.UTF-8",
+			"./nosuch",
+			127,
+			"timeout: failed to run command ‘./nosuch’: No such file or directory\n",
+		),
+		(
+			"C.UTF-8",
+			"./mi",
+			127,
+			"timeout: failed to run command ‘./mi’: No such file or directory\n",
+		),
+		(
+			"C.UTF-8",
+			"./noexec",
+			126,
+			"timeout: failed to run command ‘./noexec’: Permission denied\n",
+		),
+		("C.UTF-8", "./ia", 126, "timeout: failed to run command ‘./ia’: Permission denied\n"),
+		("C.UTF-8", "./s", 126, "timeout: failed to run command ‘./s’: File name too long\n"),
+		("C.UTF-8", "./d", 126, "timeout: failed to run command ‘./d’: Permission denied\n"),
+	] {
+		let expected = (status, "", stderr);
+		assert_wrapper_as_coreutils(dir.path(), "timeout 5", program, locale, &[], expected).await;
 	}
 }
 
-/// `nohup PROGRAM` that cannot run, as coreutils' `nohup` reports it.
+/// `nohup PROGRAM` for a program it cannot run, as coreutils 9.4's `nohup`
+/// reports it, for the programs of
+/// [`timeout_reports_a_command_it_cannot_run_as_coreutils`]. `nohup` quotes
+/// as a shell word, the same in both locales.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nohup_reports_a_command_it_cannot_run_as_coreutils() {
 	let dir = cannot_run_dir();
 	for locale in ["C", "C.UTF-8"] {
-		for program in TOOLS_CANNOT_RUN {
-			assert_wrapper_reports_as_gnu(dir.path(), "nohup", program, locale).await;
+		for (program, status, stderr) in [
+			(
+				"no-such-command-here",
+				127,
+				"nohup: failed to run command 'no-such-command-here': No such file or directory\n",
+			),
+			("./nosuch", 127, "nohup: failed to run command './nosuch': No such file or directory\n"),
+			("./mi", 127, "nohup: failed to run command './mi': No such file or directory\n"),
+			("./noexec", 126, "nohup: failed to run command './noexec': Permission denied\n"),
+			("./ia", 126, "nohup: failed to run command './ia': Permission denied\n"),
+			("./s", 126, "nohup: failed to run command './s': File name too long\n"),
+			("./d", 126, "nohup: failed to run command './d': Permission denied\n"),
+		] {
+			let expected = (status, "", stderr);
+			assert_wrapper_as_coreutils(dir.path(), "nohup", program, locale, &[], expected).await;
 		}
 	}
 }
 
-/// A name the wrappers cannot run is quoted as coreutils quotes it: `env`
-/// and `timeout` as GNU's `quote` in the locale (`'it\'s'` in C, `‘it's’`
-/// in UTF-8, C escapes for a tab), `nohup` as a shell word (`"it's"`,
-/// `'t'$'\t''ab'`).
+/// A name the wrappers cannot find is quoted as coreutils 9.4 quotes it:
+/// `env` and `timeout` as GNU's `quote` in the locale (`'it\'s'` in C,
+/// `‘it's’` in UTF-8, C escapes for a tab, octal escapes for `é` in C),
+/// `nohup` as a shell word (`"it's"`, `'t'$'\t''ab'`). `env` adds its hint
+/// for a name with a blank, which a `#!` line may have split.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wrappers_quote_a_name_they_cannot_run_as_coreutils() {
 	let dir = tempfile::tempdir().unwrap();
-	for locale in ["C", "C.UTF-8"] {
-		for name in ["it's", "it's\"q", "a b", "t\tab", "b\\s", "é"] {
-			for wrapper in ["env", "timeout 5", "nohup"] {
-				assert_wrapper_reports_as_gnu(dir.path(), wrapper, name, locale).await;
-			}
+	let cases: [(&str, &str, [&str; 3]); 12] = [
+		("C", "it's", [
+			"env: 'it\\'s': No such file or directory\n",
+			"timeout: failed to run command 'it\\'s': No such file or directory\n",
+			"nohup: failed to run command \"it's\": No such file or directory\n",
+		]),
+		("C", "it's\"q", [
+			"env: 'it\\'s\"q': No such file or directory\n",
+			"timeout: failed to run command 'it\\'s\"q': No such file or directory\n",
+			"nohup: failed to run command 'it'\\''s\"q': No such file or directory\n",
+		]),
+		("C", "a b", [
+			"env: 'a b': No such file or directory\nenv: use -[v]S to pass options in shebang lines\n",
+			"timeout: failed to run command 'a b': No such file or directory\n",
+			"nohup: failed to run command 'a b': No such file or directory\n",
+		]),
+		("C", "t\tab", [
+			"env: 't\\tab': No such file or directory\nenv: use -[v]S to pass options in shebang \
+			 lines\n",
+			"timeout: failed to run command 't\\tab': No such file or directory\n",
+			"nohup: failed to run command 't'$'\\t''ab': No such file or directory\n",
+		]),
+		("C", "b\\s", [
+			"env: 'b\\\\s': No such file or directory\n",
+			"timeout: failed to run command 'b\\\\s': No such file or directory\n",
+			"nohup: failed to run command 'b\\s': No such file or directory\n",
+		]),
+		("C", "é", [
+			"env: '\\303\\251': No such file or directory\n",
+			"timeout: failed to run command '\\303\\251': No such file or directory\n",
+			"nohup: failed to run command ''$'\\303\\251': No such file or directory\n",
+		]),
+		("C.UTF-8", "it's", [
+			"env: ‘it's’: No such file or directory\n",
+			"timeout: failed to run command ‘it's’: No such file or directory\n",
+			"nohup: failed to run command \"it's\": No such file or directory\n",
+		]),
+		("C.UTF-8", "it's\"q", [
+			"env: ‘it's\"q’: No such file or directory\n",
+			"timeout: failed to run command ‘it's\"q’: No such file or directory\n",
+			"nohup: failed to run command 'it'\\''s\"q': No such file or directory\n",
+		]),
+		("C.UTF-8", "a b", [
+			"env: ‘a b’: No such file or directory\nenv: use -[v]S to pass options in shebang lines\n",
+			"timeout: failed to run command ‘a b’: No such file or directory\n",
+			"nohup: failed to run command 'a b': No such file or directory\n",
+		]),
+		("C.UTF-8", "t\tab", [
+			"env: ‘t\\tab’: No such file or directory\nenv: use -[v]S to pass options in shebang \
+			 lines\n",
+			"timeout: failed to run command ‘t\\tab’: No such file or directory\n",
+			"nohup: failed to run command 't'$'\\t''ab': No such file or directory\n",
+		]),
+		("C.UTF-8", "b\\s", [
+			"env: ‘b\\\\s’: No such file or directory\n",
+			"timeout: failed to run command ‘b\\\\s’: No such file or directory\n",
+			"nohup: failed to run command 'b\\s': No such file or directory\n",
+		]),
+		("C.UTF-8", "é", [
+			"env: ‘é’: No such file or directory\n",
+			"timeout: failed to run command ‘é’: No such file or directory\n",
+			"nohup: failed to run command 'é': No such file or directory\n",
+		]),
+	];
+	for (locale, name, said) in cases {
+		for (wrapper, stderr) in ["env", "timeout 5", "nohup"].into_iter().zip(said) {
+			let expected = (127, "", stderr);
+			assert_wrapper_as_coreutils(dir.path(), wrapper, name, locale, &[], expected).await;
 		}
 	}
 }
@@ -1034,10 +1189,10 @@ async fn wrappers_quote_a_name_they_cannot_run_as_coreutils() {
 /// A locale environment whose `LC_CTYPE` loads but another category does
 /// not (`xx_YY.UTF-8` exists nowhere): coreutils' `setlocale(LC_ALL, "")`
 /// fails as a whole and leaves C, so `timeout` and `nohup` quote as in C
-/// (`'it\'s'`, octal escapes for `é`), compared live with coreutils 9.4.
-/// `LC_ALL` is empty, so each category is read from its own variable, then
-/// `LANG`; the last case names the missing locale in `LANG`, for every
-/// category left unnamed.
+/// (`'it\'s'`, octal escapes for `é`), as coreutils 9.4 does. `LC_ALL` is
+/// empty, so each category is read from its own variable, then `LANG`; the
+/// last case names the missing locale in `LANG`, for every category left
+/// unnamed.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_and_nohup_quote_in_c_when_a_category_does_not_load() {
@@ -1048,20 +1203,26 @@ async fn timeout_and_nohup_quote_in_c_when_a_category_does_not_load() {
 		&[("LC_CTYPE", "C.UTF-8"), ("LC_MESSAGES", MISSING)],
 		&[("LANG", MISSING), ("LC_CTYPE", "C.UTF-8")],
 	];
-	// The reference itself falls back to C here, so the comparison below is
-	// about this case and not one where both print UTF-8 quotes.
-	let gnu = std::process::Command::new("/usr/bin/timeout")
-		.args(["5", "it's"])
-		.env("LC_ALL", "")
-		.envs(cases[0].iter().copied())
-		.output()
-		.unwrap();
-	let said = String::from_utf8_lossy(&gnu.stderr);
-	assert!(said.contains("command 'it\\'s'"), "coreutils' own quoting: {said}");
 	for env in cases {
-		for name in ["it's", "é", "plain"] {
-			for wrapper in ["timeout 5", "nohup"] {
-				assert_wrapper_as_gnu(dir.path(), wrapper, name, "", env).await;
+		for (name, timeout_said, nohup_said) in [
+			(
+				"it's",
+				"timeout: failed to run command 'it\\'s': No such file or directory\n",
+				"nohup: failed to run command \"it's\": No such file or directory\n",
+			),
+			(
+				"é",
+				"timeout: failed to run command '\\303\\251': No such file or directory\n",
+				"nohup: failed to run command ''$'\\303\\251': No such file or directory\n",
+			),
+			(
+				"plain",
+				"timeout: failed to run command 'plain': No such file or directory\n",
+				"nohup: failed to run command 'plain': No such file or directory\n",
+			),
+		] {
+			for (wrapper, said) in [("timeout 5", timeout_said), ("nohup", nohup_said)] {
+				assert_wrapper_as_coreutils(dir.path(), wrapper, name, "", env, (127, "", said)).await;
 			}
 		}
 	}
@@ -1093,7 +1254,8 @@ async fn timeout_and_nohup_find_a_command_as_the_shell_does() {
 		std::env::var("PATH").unwrap()
 	);
 	for wrapper in ["timeout 5", "nohup"] {
-		assert_wrapper_as_gnu(p, wrapper, "foo", "C", &[("PATH", &path)]).await;
+		let path = [("PATH", path.as_str())];
+		assert_wrapper_as_coreutils(p, wrapper, "foo", "C", &path, (0, "B\n", "")).await;
 		let ran =
 			run(&mut session_in(p, &[]), &format!("hash -p /bin/echo myecho; {wrapper} myecho hi"))
 				.await;
@@ -1612,6 +1774,26 @@ fn deeper_than_path_max(root: &Path) -> std::path::PathBuf {
 	path
 }
 
+/// The first executable `name` on the test's `PATH`, as an absolute path: an
+/// external program wherever this machine keeps it (`/usr/bin` on Debian,
+/// `/run/current-system/sw/bin` on NixOS).
+#[cfg(target_os = "linux")]
+fn on_path(name: &str) -> String {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let path = std::env::var_os("PATH").unwrap_or_default();
+	std::env::split_paths(&path)
+		.map(|dir| dir.join(name))
+		.find(|file| {
+			file.is_absolute()
+				&& std::fs::metadata(file)
+					.is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+		})
+		.unwrap_or_else(|| panic!("no executable {name} on PATH"))
+		.display()
+		.to_string()
+}
+
 /// `ENAMETOOLONG` from a working directory longer than `PATH_MAX` is no
 /// command line too long: the shell reports the program it could not start,
 /// as for any other refusal (status 126), xargs goes on to the next line and
@@ -1623,16 +1805,12 @@ async fn a_working_directory_past_path_max_is_no_line_too_long() {
 	let ten = dir.path().join("ten");
 	std::fs::write(&ten, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
 	let deep = deeper_than_path_max(dir.path());
-	let command = format!("xargs -t -n5 -a {} /usr/bin/printf '%s\\n'", ten.display());
+	let printf = on_path("printf");
+	let command = format!("xargs -t -n5 -a {} {printf} '%s\\n'", ten.display());
 	let ran = run(&mut session_in(&deep, &[]), &command).await;
-	let tried = lines_tried(&ran.stderr, "/usr/bin/printf");
+	let tried = lines_tried(&ran.stderr, &printf);
 	assert_eq!((ran.status, ran.stdout.as_str(), tried), (123, "", 2), "{}", ran.stderr);
-	assert_eq!(
-		shell_reports(&ran.stderr, "/usr/bin/printf", "File name too long"),
-		2,
-		"{}",
-		ran.stderr
-	);
+	assert_eq!(shell_reports(&ran.stderr, &printf, "File name too long"), 2, "{}", ran.stderr);
 	assert!(!ran.stderr.contains("xargs:"), "{}", ran.stderr);
 }
 

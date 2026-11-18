@@ -90,6 +90,14 @@ const SETLOCALE_CATEGORIES: &[(&str, libc::c_int)] = &[
 /// quotes `'…'` under `LC_CTYPE=C.UTF-8 LC_TIME=xx_YY.UTF-8` (no such
 /// locale). Otherwise the answer is whether the `LC_CTYPE` name has a UTF-8
 /// codeset.
+///
+/// The locales load in pi's own process, so from pi's own `LOCPATH`, not
+/// from a `LOCPATH` that `var` gives otherwise: glibc reads `LOCPATH` only
+/// from the loading process's environment, and looks a locale name up under
+/// those directories even when the name is an absolute path (glibc 2.39: a
+/// locale in a directory of one's own loads with `LOCPATH` naming that
+/// directory, and never by its absolute path). Setting `LOCPATH` in pi's
+/// environment to ask would change it under every other thread.
 pub fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
 	let named = |category: &str| {
 		["LC_ALL", category, "LANG"]
