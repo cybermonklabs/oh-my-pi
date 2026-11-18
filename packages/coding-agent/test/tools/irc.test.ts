@@ -782,6 +782,38 @@ describe("IRC", () => {
 					{ to: "0-Sub", sentAt: expect.any(Number), promised: false },
 				]);
 			});
+
+			// Regressed: a subagent parked while its own `irc wait` is pending keeps that wait for the
+			// rest of the session, and the wait never returns.
+			it("ends a pending wait of an agent once it is parked", async () => {
+				registerAgents("0-Main", "0-Sub");
+				const waiting = bus.wait("0-Sub", { from: "0-Main" }, 0);
+
+				registry.detachSession("0-Sub");
+				registry.setStatus("0-Sub", "parked");
+
+				// The park settles the wait at once; `Bun.sleep(0)` runs after every pending microtask, so
+				// "still waiting" wins only when the wait was left open.
+				expect(await Promise.race([waiting, Bun.sleep(0).then(() => "still waiting")])).toBeNull();
+			});
+
+			// Regressed: a subagent released while a message to it fails to hand off keeps that message
+			// buffered for the rest of the session.
+			it("buffers no message for a recipient removed during its failed hand-off", async () => {
+				registerAgents("0-Main", "0-Sub");
+				const session = registry.get("0-Sub")?.session;
+				if (!session) throw new Error("0-Sub has no session");
+				session.deliverIrcMessage = async () => {
+					registry.unregister("0-Sub");
+					throw new Error("Recipient session is disposed.");
+				};
+
+				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+				expect(receipt.outcome).toBe("failed");
+
+				expect(bus.unreadCount("0-Sub")).toBe(0);
+				expect(bus.take("0-Sub")).toBeUndefined();
+			});
 		});
 	});
 

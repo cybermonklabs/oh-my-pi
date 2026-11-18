@@ -138,6 +138,10 @@
 - `providers.anthropic.serverSideFallbackModels` makes the Anthropic server-side fallback chain configurable (e.g. `fable-5 -> opus-5 -> opus-4-8`) instead of the catalog's single-hop Opus 5 chain; the setting caps at the wire's three-entry limit and, when unset, follows the catalog chain ([#9376](https://github.com/can1357/oh-my-pi/pull/9376) by [@sjawhar](https://github.com/sjawhar)).
 - Added `lazy: true` for MCP servers in `mcp.json`: the server is not spawned at session startup — its tools are served from the tool cache and the first invocation (or `/mcp reconnect`) connects on demand. Useful for servers whose launch has side effects, such as credential prompts or approval flows. ([#9793](https://github.com/can1357/oh-my-pi/pull/9793) by [@sjawhar](https://github.com/sjawhar))
 - Secret obfuscation no longer fails every model request when a `secrets.yml` entry or a secret environment variable is very long
+- The status line and the rate-limit fallback now count the latest answer itself (its text, the thinking that is sent back and its tool-call arguments) in the context, so a rate limit after a long answer or a large file write no longer moves a session whose context is past `retry.rateLimitFallbackMaxContextTokens` down the chain
+- A session no longer keeps the prompts and tool results that a compaction moves before the cut in memory through their copies prepared for the model
+- A resumed session no longer reads older messages back from disk on every tool call when their tool call ids (OpenAI Responses) or model ids (such as a Bedrock inference profile ARN) are longer than 64 characters
+- A subagent parked or released while a message to it is delivered no longer keeps that message buffered, and its pending `irc wait` ends instead of waiting forever
 
 ### Breaking Changes
 

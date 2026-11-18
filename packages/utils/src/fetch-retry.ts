@@ -6,15 +6,19 @@ const QUOTA_RESET_PATTERN = /reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/
 const PLEASE_RETRY_PATTERN = /Please retry in ([0-9.]+)(ms|s)/i;
 // JSON field: "retryDelay": "34.074824224s"
 const RETRY_DELAY_FIELD_PATTERN = /"retryDelay":\s*"([0-9.]+)(ms|s)"/i;
-// One number and unit of a stated wait: "250ms" / "12sec" / "5 min" / "2h" / "3 days".
-const WAIT_PART_PATTERN = /([0-9.]+)\s*(ms|sec|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)/gi;
+// One number and unit of a stated wait: "250ms" / "12sec" / "45 secs" / "90 seconds" /
+// "5 min" / "2h" / "3 days".
+const WAIT_PART_PATTERN = /([0-9.]+)\s*(ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)/gi;
 // A stated wait of one or more parts, which add up: a Go duration such as
 // "6m0s" or "1h2m3.5s" is one wait, read with `waitPartsMs`.
 const WAIT_SOURCE = `((?:${WAIT_PART_PATTERN.source})+)\\b`;
 // "try again in 250ms" / "try again in 12s" / "try again in 12sec" /
+// "try again in 45 secs" / "Try again in 90 seconds." /
 // "try again in 5 min" / "try again in ~158 min." / "try again in 2h" /
 // "try again in 90 minutes" / "try again in 1 hour" / "try again in 6m0s"
 const TRY_AGAIN_PATTERN = new RegExp(`try again in\\s+~?\\s*${WAIT_SOURCE}`, "i");
+// Azure OpenAI: "Please retry after 20 seconds."
+const RETRY_AFTER_WAIT_PATTERN = new RegExp(`retry after\\s+~?\\s*${WAIT_SOURCE}`, "i");
 // "Your limit will reset in 13 minutes" / "reset in 13 minutes" / "will reset in 2h" /
 // "will reset in 6m0s" / "resets in 1h30m"
 // OpenCode Go quota errors use "Resets in …" with day units and compound
@@ -69,8 +73,9 @@ export interface RetryHintOptions {
  *  - `Your quota will reset after 18h31m10s` / `10m15s` / `39s`
  *  - `Please retry in 250ms` / `Please retry in 12s`
  *  - `"retryDelay": "34.074824224s"` (JSON error detail field)
- *  - `try again in 250ms` / `try again in 12s` / `try again in 5 min` / `try again in ~158 min` /
- *    `try again in 6m0s` (a Go duration's parts add up)
+ *  - `try again in 250ms` / `try again in 12s` / `try again in 45 secs` / `try again in 90 seconds` /
+ *    `try again in 5 min` / `try again in ~158 min` / `try again in 6m0s` (a Go duration's parts add up)
+ *  - `Please retry after 20 seconds`
  *  - `Your limit will reset in 13 minutes` / `Resets in 3 days` / `Resets in 2hr 15min` /
  *    `resets in 1h30m` (a Go duration's parts add up)
  *  - `retry-after-ms=98497000` / `retry-after-ms: 7200000` / `retry-after-ms = 7200000`
@@ -210,8 +215,10 @@ export function extractRetryHint(
 		const match = pattern.exec(body);
 		if (match?.[1]) consider(waitPartsMs(`${match[1]}${match[2]}`));
 	}
-	const tryAgainMatch = TRY_AGAIN_PATTERN.exec(body);
-	if (tryAgainMatch?.[1]) consider(waitPartsMs(tryAgainMatch[1]));
+	for (const pattern of [TRY_AGAIN_PATTERN, RETRY_AFTER_WAIT_PATTERN]) {
+		const match = pattern.exec(body);
+		if (match?.[1]) consider(waitPartsMs(match[1]));
+	}
 
 	// Legacy text forms (also honored by older local parsers): a plain
 	// `retry-after` delta in seconds or as an HTTP date, and
@@ -269,6 +276,9 @@ function unitToMs(unit: string): number | undefined {
 			return 1;
 		case "s":
 		case "sec":
+		case "secs":
+		case "second":
+		case "seconds":
 			return 1000;
 		case "m":
 		case "min":

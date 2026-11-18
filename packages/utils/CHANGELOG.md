@@ -19,6 +19,7 @@
 
 - Fixed `extractRetryHint` ignoring a wait or reset window stated as a Go duration such as `try again in 6m0s`, `try again in 1m30s` or `resets in 1h30m`: its parts now add up, so a caller waits the time the provider states instead of its own backoff
 - Fixed test processes (`PI_TEST_RUNTIME=1` or a Bun test entrypoint) loading `~/.env` and the config root's `.env` (`~/.omp/.env`), which put the developer's auth broker, tokens and provider keys back into a test's environment; the agent directory's and project's `.env` files still load
+- Fixed `extractRetryHint` ignoring a wait stated in seconds (`Try again in 90 seconds.`, `try again in 45 secs`) or as `Please retry after 20 seconds.`, so a caller waits the time the provider states instead of its own backoff
 
 ## [18.18.2] - 2026-11-08
 

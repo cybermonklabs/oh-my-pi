@@ -22,6 +22,7 @@ import {
 	isProtectedToolResult,
 	isSkillReadToolResult,
 	type ProtectedToolMatcher,
+	resolveBoundaryIndex,
 	SentToolCalls,
 } from "./tool-protection";
 
@@ -37,9 +38,10 @@ export interface ShakeConfig {
 	/**
 	 * Compaction boundary (`firstKeptEntryId` of the latest compaction). Entries
 	 * before it are summarized away and never sent, so they are skipped — shaking
-	 * them only churns persisted history. Undefined = no compaction (whole branch
-	 * is sent). Note: shake still elides the warm cached prefix at/after the
-	 * boundary — that is its job as a compaction-class reducer.
+	 * them only churns persisted history. `""` (a compaction that kept no entry)
+	 * puts the boundary at that compaction. Undefined = no compaction (whole
+	 * branch is sent). Note: shake still elides the warm cached prefix at/after
+	 * the boundary — that is its job as a compaction-class reducer.
 	 */
 	keepBoundaryId?: string;
 }
@@ -314,13 +316,7 @@ export function collectShakeRegions(entries: SessionEntry[], tokenizer: Tokenize
 	// Entries before the compaction boundary are summarized away and never sent —
 	// shaking them only churns persisted history (no prompt/cache effect), so the
 	// walk reads none of them.
-	const boundaryIndex =
-		config.keepBoundaryId === undefined
-			? 0
-			: Math.max(
-					0,
-					entries.findIndex(entry => entry.id === config.keepBoundaryId),
-				);
+	const boundaryIndex = resolveBoundaryIndex(entries, config.keepBoundaryId);
 
 	// Tokens of all entries strictly more recent than index i, from the boundary on;
 	// slot i - boundaryIndex holds the count for entry i.

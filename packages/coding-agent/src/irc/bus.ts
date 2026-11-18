@@ -12,14 +12,7 @@
 import { type IrcDeliveryReceipt, type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { type AgentLifecycleApi, AgentLifecycleManager } from "../registry/agent-lifecycle";
-import {
-	type AgentRef,
-	AgentRegistry,
-	type AgentRegistryApi,
-	type AgentStatus,
-	isLive,
-	MAIN_AGENT_ID,
-} from "../registry/agent-registry";
+import { AgentRegistry, type AgentRegistryApi, isLive, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { suppressedTranscriptNote } from "../registry/persisted-agents";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import type { CustomMessage } from "../session/messages";
@@ -27,6 +20,7 @@ import type { CustomMessage } from "../session/messages";
 interface IrcWaiter {
 	filter: IrcWaitFilter;
 	resolve: (msg: IrcMessage) => void;
+	/** End the wait with `null`, as a timeout does. */
 	cancel: () => void;
 }
 
@@ -73,6 +67,14 @@ interface SendMark {
 	seq: number;
 }
 
+/** A send awaiting its delivery, and whether the bus forgot either end meanwhile (see {@link IrcBus.forgetAgent}). */
+interface InFlightSend {
+	from: string;
+	to: string;
+	fromForgotten: boolean;
+	toForgotten: boolean;
+}
+
 /** Mailbox cap per agent; oldest messages are dropped beyond it. */
 const MAILBOX_CAP = 100;
 
@@ -98,7 +100,7 @@ export interface IrcBusApi {
 	unreadCount(agentId: string): number;
 	/** Count a settled job of agent `from` owned by `to` as `from`'s reply to `to`. */
 	recordReply(from: string, to: string): void;
-	/** Drop every send mark from or to `agentId` unless it is live; see {@link IrcBus.forgetAgent}. */
+	/** Drop every send mark from or to `agentId`, and its buffered messages, unless it is live; see {@link IrcBus.forgetAgent}. */
 	forgetAgent(agentId: string): void;
 }
 
@@ -168,6 +170,8 @@ export class IrcBus implements IrcBusApi {
 	readonly #lastJobReply = new Map<string, Map<string, SendMark>>();
 	/** Last {@link SendMark.seq} handed out, taken when a send starts. */
 	#sendSeq = 0;
+	/** Sends awaiting their delivery; {@link forgetAgent} flags those from or to the agent it forgets. */
+	readonly #inFlight = new Set<InFlightSend>();
 	readonly #unsubscribe: () => void;
 
 	constructor(registry: AgentRegistryApi = AgentRegistry.global(), lifecycle?: AgentLifecycleApi) {
@@ -207,15 +211,26 @@ export class IrcBus implements IrcBusApi {
 		// Taken before delivery: a reply sent while this message is still being
 		// delivered must still order after it.
 		const mark: SendMark = { ts: message.ts, seq: ++this.#sendSeq };
-		// Read before delivery, to tell an agent forgotten during it.
-		const fromRef = this.#registry.get(message.from);
-		const fromStatus = fromRef?.status;
-		const toRef = this.#registry.get(message.to);
-		const toStatus = toRef?.status;
-		const receipt = await this.#deliver(message);
+		const flight: InFlightSend = { from: message.from, to: message.to, fromForgotten: false, toForgotten: false };
+		this.#inFlight.add(flight);
+		let receipt: IrcDeliveryReceipt;
+		try {
+			receipt = await this.#deliver(message, flight);
+		} finally {
+			this.#inFlight.delete(flight);
+		}
 		// An agent parked, killed or unregistered during the delivery was already
 		// forgotten (see forgetAgent), so a mark recorded now would outlive it.
-		if (this.#forgotDuring(message.from, fromRef, fromStatus) || this.#forgotDuring(receipt.to, toRef, toStatus)) {
+		// Comparing its registry entry before and after cannot tell: a revival
+		// reuses the parked entry, so a recipient the send revived and that parked
+		// again before the delivery returned reads parked at both ends. An agent
+		// the bus did not forget records as usual, a parked one or one the
+		// registry never held included; one forgotten and revived since is live.
+		// The receipt names who received it, after any readdressing.
+		if (
+			(flight.fromForgotten && !isLive(this.#registry.get(message.from))) ||
+			(flight.toForgotten && !isLive(this.#registry.get(receipt.to)))
+		) {
 			return receipt;
 		}
 		if (receipt.outcome !== "failed") {
@@ -242,18 +257,6 @@ export class IrcBus implements IrcBusApi {
 		if ((sent.get(to)?.seq ?? 0) < mark.seq) sent.set(to, mark);
 	}
 
-	/**
-	 * Whether this bus forgot `agentId` during an await that began with its
-	 * registry entry `ref` of `status`: the entry changed meanwhile, and the
-	 * agent is now not live (parked or aborted) or not held at all. An agent
-	 * whose entry did not change records as usual, a parked one or one the
-	 * registry never held included; a revived one is live.
-	 */
-	#forgotDuring(agentId: string, ref: AgentRef | undefined, status: AgentStatus | undefined): boolean {
-		const now = this.#registry.get(agentId);
-		return (now !== ref || now?.status !== status) && !isLive(now);
-	}
-
 	/** Instance half of {@link IrcBus.recordReply}: records the job-carried reply on this bus. */
 	recordReply(from: string, to: string): void {
 		this.#record(this.#lastJobReply, from, to, { ts: Date.now(), seq: ++this.#sendSeq });
@@ -262,11 +265,14 @@ export class IrcBus implements IrcBusApi {
 	/**
 	 * Instance half of {@link IrcBus.forgetAgent}: drops the agent's row and its
 	 * entry in every other agent's row from each mark table, and each row left
-	 * empty. Both sides go at once, so {@link unansweredSends} never meets a
-	 * send whose answer was dropped. A live agent (`running` or `idle`: it has a
-	 * session) keeps its marks, as a turn of it may still read them: the
-	 * wake-turn relay asks {@link sentSince} after the turn has gone idle. They
-	 * go once this bus's registry reports it parked, aborted or gone.
+	 * empty, its mailbox, and its pending waits, which end with `null` as a
+	 * timeout does. Both sides go at once, so {@link unansweredSends} never meets
+	 * a send whose answer was dropped. A live agent (`running` or `idle`: it has
+	 * a session) keeps its marks, mail and waits, as a turn of it may still read
+	 * them: the wake-turn relay asks {@link sentSince} after the turn has gone
+	 * idle. They go once this bus's registry reports it parked, aborted or gone;
+	 * a send still delivering to or from it then records no mark and buffers
+	 * nothing for it.
 	 */
 	forgetAgent(agentId: string): void {
 		if (isLive(this.#registry.get(agentId))) return;
@@ -275,6 +281,14 @@ export class IrcBus implements IrcBusApi {
 			for (const [from, marks] of table) {
 				if (marks.delete(agentId) && marks.size === 0) table.delete(from);
 			}
+		}
+		this.#mailboxes.delete(agentId);
+		const waiters = this.#waiters.get(agentId);
+		this.#waiters.delete(agentId);
+		for (const waiter of waiters ?? []) waiter.cancel();
+		for (const flight of this.#inFlight) {
+			if (flight.from === agentId) flight.fromForgotten = true;
+			if (flight.to === agentId) flight.toForgotten = true;
 		}
 	}
 
@@ -312,7 +326,7 @@ export class IrcBus implements IrcBusApi {
 		return unanswered;
 	}
 
-	async #deliver(incoming: IrcMessage): Promise<IrcDeliveryReceipt> {
+	async #deliver(incoming: IrcMessage, flight: InFlightSend): Promise<IrcDeliveryReceipt> {
 		let message = incoming;
 		const ref = this.#registry.get(message.to);
 		if (!ref) {
@@ -360,6 +374,8 @@ export class IrcBus implements IrcBusApi {
 				if (target.agentId !== message.to) {
 					if (target.agentId === message.from) return ownTranscriptRefusal(message.to, target.agentId);
 					message = { ...message, to: target.agentId };
+					// forgetAgent matches the agent the message now goes to.
+					flight.to = target.agentId;
 				}
 			} catch (error) {
 				// Not revivable / released / revive failed. Do not buffer: a permanent
@@ -395,8 +411,9 @@ export class IrcBus implements IrcBusApi {
 			// Live hand-off failed (e.g. recipient disposed mid-shutdown): buffer
 			// the message so a later `wait`/`inbox` from the recipient can still
 			// pick it up. The receipt stays "failed" — the recipient has not
-			// seen it.
-			this.#enqueue(message);
+			// seen it. A recipient forgotten during this delivery and not live
+			// again keeps no mailbox (see forgetAgent), so nothing is buffered.
+			if (!flight.toForgotten || isLive(this.#registry.get(message.to))) this.#enqueue(message);
 			return {
 				to: message.to,
 				outcome: "failed",
@@ -455,7 +472,7 @@ export class IrcBus implements IrcBusApi {
 		const waiter: IrcWaiter = {
 			filter,
 			resolve: msg => settle({ kind: "message", msg }),
-			cancel: () => cleanup(),
+			cancel: () => settle({ kind: "timeout" }),
 		};
 
 		if (signal) {

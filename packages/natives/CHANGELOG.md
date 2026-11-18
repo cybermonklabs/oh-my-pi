@@ -23,6 +23,9 @@
 - `grep` keeps the `=` that starts a value attached to a short option, so `grep -e=x` searches `=x` and `grep -m=1` is refused, as GNU grep does
 - `grep -m0` prints nothing, not even a count, and reports no missing file, as GNU grep does
 - `sed` reads a `[` inside a bracket expression as a member, so `s/[[]/x/` and `s/[][]/y/g` work, and `sed -E` reads bracket expressions as `sed` does
+- `grep` and `sed` answer as GNU grep 3.11 and GNU sed 4.9 do on the patterns they read differently before: a class name without its outer brackets (`[:alpha:]`) and a collating symbol of a multibyte character (`[[.é.]]`) are refused, a range is checked against the ends `-i` folds it to, a backslash before an ordinary character is that character (`\d` is a `d`), `\<` and `\>` are word edges, `\U` and `\L` give a `sed` replacement its case, a repeated repetition operator repeats the repetition (`a\+\?`), a brace that opens no interval is a literal, a back-reference is run rather than searched as text, and `grep -o` and `sed s///` take the longest match of an alternation (`grep -oE 'a|ab'` prints `ab`)
+- `grep` prints the `--` between two groups of lines wherever a context option was given, including `-C0` and `-o`, takes `-A1 -C3` as GNU does (three lines before, one after), prints the trailing context of the line that `-m` stops at, reports a binary file on standard error, silences `Is a directory` under `-s`, accepts an abbreviated long option such as `--regex=`, and reads a negative `-m` as GNU does
+- `sed` reads a backslash inside a bracket expression as an ordinary member, so `s/[\]/X/` replaces a backslash, and accepts a count beside `g` (`s/a/b/2g`)
 
 ### Added
 
