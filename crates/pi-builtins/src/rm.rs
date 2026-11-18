@@ -318,17 +318,8 @@ pub fn safe_remove_dir_recursive(host: &mut Host,
 
 	// Open the operand as the directory the lstat found, not following a
 	// symlink there: one swapped in since the lstat is refused (`ENOTDIR`)
-	// instead of emptied. The identity is compared as well because gVisor
-	// before release-20261109.0 follows a final symlink to a directory
-	// despite `O_NOFOLLOW` when `O_DIRECTORY` is set (see `open_stat_subdir`).
-	let dir_fd = match DirFd::open(&path_fs, SymlinkBehavior::NoFollow).and_then(|fd| {
-		let info = fd.metadata()?.file_info();
-		if Some((info.device(), info.inode())) == initial_id {
-			Ok(fd)
-		} else {
-			Err(std::io::Error::from_raw_os_error(libc::ENOTDIR))
-		}
-	}) {
+	// instead of emptied.
+	let dir_fd = match open_stat_dir(&path_fs, initial_id) {
 		Ok(fd) => fd,
 		Err(e) if is_missing_under_force(&e, options) => return false,
 		Err(e) => {
@@ -436,6 +427,23 @@ fn is_subdir_empty(dir_fd: &DirFd, name: &OsStr, id: (u64, u64)) -> bool {
 	open_stat_subdir(dir_fd, name, id)
 		.and_then(|fd| fd.read_dir())
 		.is_ok_and(|entries| entries.is_empty())
+}
+
+/// Opens the operand `path` without following a symlink that is its final
+/// component, kept only as the directory `id` (device, inode) that `lstat`
+/// found: anything else there is `ENOTDIR`. The identity is compared as well
+/// because gVisor before release-20261109.0 follows a final symlink to a
+/// directory despite `O_NOFOLLOW` when `O_DIRECTORY` is set (see
+/// [`open_stat_subdir`]). `id` is `None` when the `lstat` gave no identity,
+/// and then nothing is kept.
+fn open_stat_dir(path: &Path, id: Option<(u64, u64)>) -> std::io::Result<DirFd> {
+	let fd = DirFd::open(path, SymlinkBehavior::NoFollow)?;
+	let info = fd.metadata()?.file_info();
+	if Some((info.device(), info.inode())) == id {
+		Ok(fd)
+	} else {
+		Err(std::io::Error::from_raw_os_error(libc::ENOTDIR))
+	}
 }
 
 /// Opens the subdirectory `name` of `dir_fd`, without following a symlink
@@ -655,16 +663,16 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, _path: &Path, _dir_fd: Di
 	true // Return error
 }
 
-/// The device-and-inode check on its own, on any kernel: a real directory at
-/// the name that is not the one `stat_at` found is refused, for the descent
-/// and for `-i`'s emptiness listing.
+/// The device-and-inode checks on their own, on any kernel: a real directory
+/// at the name that is not the one `stat_at` or `lstat` found is refused, for
+/// the descent, for `-i`'s emptiness listing, and for the operand.
 #[cfg(all(test, not(target_os = "redox")))]
 mod stat_subdir_tests {
 	use std::{ffi::OsStr, os::unix::fs::MetadataExt};
 
 	use uucore::safe_traversal::{DirFd, SymlinkBehavior};
 
-	use super::{is_subdir_empty, open_stat_subdir};
+	use super::{is_subdir_empty, open_stat_dir, open_stat_subdir};
 
 	#[test]
 	fn a_subdirectory_that_is_not_the_one_stat_at_found_is_refused() {
@@ -682,6 +690,23 @@ mod stat_subdir_tests {
 		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
 		assert!(is_subdir_empty(&dir, sub, id("sub")), "the empty directory stat_at found");
 		assert!(!is_subdir_empty(&dir, sub, id("other")), "-i listed a directory stat_at did not find");
+	}
+
+	#[test]
+	fn an_operand_that_is_not_the_directory_lstat_found_is_refused() {
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::create_dir(tmp.path().join("sub")).unwrap();
+		std::fs::create_dir(tmp.path().join("other")).unwrap();
+		let id = |name: &str| {
+			let meta = std::fs::symlink_metadata(tmp.path().join(name)).unwrap();
+			Some((meta.dev(), meta.ino()))
+		};
+		let sub = tmp.path().join("sub");
+		assert!(open_stat_dir(&sub, id("sub")).is_ok(), "the directory lstat found");
+		let err = open_stat_dir(&sub, id("other")).err().expect("another directory's id was accepted");
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+		let err = open_stat_dir(&sub, None).err().expect("an operand with no identity was accepted");
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
 	}
 }
 
