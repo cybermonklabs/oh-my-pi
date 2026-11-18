@@ -6,7 +6,7 @@
  */
 import type { AsyncJob, AsyncJobManagerApi } from "../async";
 import type { JobWidgetRegistry } from "../job-widgets/types";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, agentAncestors } from "../registry/agent-registry";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { AsyncJobInspection, AsyncJobSnapshot, AsyncJobSnapshotItem, AsyncJobTree } from "./agent-session-types";
 import { plainTurnAbortReason } from "./exit-diagnostics";
@@ -59,14 +59,26 @@ export function runningJobWidgets(manager: AsyncJobManagerApi, agentId: string |
 	return entries;
 }
 
-/** Each agent's parent: the registry's link, else the owner of the task job that runs it. */
+/**
+ * Each agent's parent: the registry's link, which an agent's recorded ancestry keeps for a parent
+ * unregistered since, else the owner of the task job that runs it.
+ */
 function jobTreeParents(manager: AsyncJobManagerApi): Map<string, string> {
 	const parents = new Map<string, string>();
 	for (const job of [...manager.getRunningJobs(), ...manager.getRecentJobs(Number.POSITIVE_INFINITY)]) {
 		if (job.agentId !== undefined && job.ownerId !== undefined) parents.set(job.agentId, job.ownerId);
 	}
-	for (const ref of AgentRegistry.global().list()) {
-		if (ref.parentId !== undefined) parents.set(ref.id, ref.parentId);
+	const registry = AgentRegistry.global();
+	const refs = registry.list();
+	const registered = new Set(refs.map(ref => ref.id));
+	for (const ref of refs) {
+		let child = ref.id;
+		for (const ancestorId of agentAncestors(registry, ref)) {
+			// A registered ancestor links the rest of the chain itself.
+			if (child !== ref.id && registered.has(child)) break;
+			parents.set(child, ancestorId);
+			child = ancestorId;
+		}
 	}
 	return parents;
 }
@@ -86,8 +98,9 @@ function inJobTree(job: AsyncJob, rootId: string | undefined, parents: ReadonlyM
  * Async jobs of `rootId` and every subagent below it: the running ones and
  * the `recentLimit` (default 10) newest settled ones across the tree, with the subagents
  * that own them and the ancestors linking those to the root. Lineage comes
- * from the agent registry, falling back to the task job that runs a subagent
- * once its registry entry is gone.
+ * from the agent registry, whose agents keep the parents they registered under
+ * also once those are unregistered, falling back to the task job that runs a
+ * subagent once its registry entry is gone.
  */
 export function asyncJobTree(
 	manager: AsyncJobManagerApi,

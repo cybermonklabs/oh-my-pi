@@ -139,7 +139,7 @@ import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type:
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import type { AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, agentAncestors, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { registerPersistedSubagents } from "../registry/persisted-agents";
 import type { AgentCostSnapshot } from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
 import { sumSubagentTreeCost } from "./agent-hub-runtime";
@@ -4920,18 +4920,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		};
 	}
 
-	/** The focused subagent and its live ancestors below main, outermost first; undefined on the main session. */
+	/**
+	 * The focused subagent and its live ancestors below main, outermost first, also those above a
+	 * parent that ended; undefined on the main session.
+	 */
 	#viewingLineage(): string[] | undefined {
 		const id = this.focusedAgentId;
 		if (!id) return undefined;
 		const registry = AgentRegistry.global();
 		const lineage = [id];
-		for (
-			let parent = registry.get(id)?.parentId;
-			parent && parent !== MAIN_AGENT_ID && !lineage.includes(parent) && registry.get(parent);
-			parent = registry.get(parent)?.parentId
-		) {
-			lineage.unshift(parent);
+		for (const ancestorId of agentAncestors(registry, registry.get(id))) {
+			if (ancestorId === MAIN_AGENT_ID || ancestorId === id) break;
+			if (registry.get(ancestorId)) lineage.unshift(ancestorId);
 		}
 		return lineage;
 	}

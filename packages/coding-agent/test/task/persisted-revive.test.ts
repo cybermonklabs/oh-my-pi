@@ -558,6 +558,35 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.customTools).toBeUndefined();
 	});
 
+	it("counts every ancestor toward a revived subagent's task depth, also a parent that ended", async () => {
+		// If this regresses, a subagent whose parent subagent has ended (unregistered) revives one level too shallow:
+		// the task depth limit lets it spawn subagents its real depth forbids.
+		AgentRegistry.resetGlobalForTests();
+		const registry = AgentRegistry.global();
+		try {
+			const cwd = makeTempDir("@pi-revive-task-depth-");
+			const sessionFile = await createPersistedSession(cwd);
+			MCPManager.setInstance(fakeMcpManager(() => []));
+			let capturedOptions: CreateAgentSessionOptions | undefined;
+			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+				capturedOptions = options;
+				return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+			});
+			registry.register({ id: "Lead", displayName: "task", kind: "sub", parentId: "Main", session: null });
+			registry.register({ id: "Lead.Helper", displayName: "task", kind: "sub", parentId: "Lead", session: null });
+			const ref = registry.register({ ...createRef(sessionFile), parentId: "Lead.Helper" });
+			registry.unregister("Lead.Helper");
+
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			await reviver(ref);
+
+			expect(capturedOptions?.taskDepth).toBe(3);
+		} finally {
+			AgentRegistry.resetGlobalForTests();
+		}
+	});
+
 	it("leaves isolated sessions transcript-only even when the workspace still exists", async () => {
 		// Isolated runs are never resumable: the worktree is merged + cleaned,
 		// and the parent is told messaging is impossible. A retained workspace

@@ -13,6 +13,7 @@ import { Settings } from "../../src/config/settings";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentSession } from "../../src/session/agent-session";
+import { IrcBridge, type IrcBridgeHost } from "../../src/session/irc-bridge";
 import { AuthStorage } from "../../src/session/auth-storage";
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
@@ -66,6 +67,11 @@ export interface AgentsProbe {
 	disposed(key: string): Promise<boolean>;
 	/** Whether the worker's lifecycle proxy manages the worker's registry proxy. */
 	manages(): Promise<boolean>;
+	/**
+	 * Whether a message from `from`, delivered here to a running `to` that is not its parent, is one
+	 * `to`'s run sees (from its descendant), not a peer's that waits for a turn of its own.
+	 */
+	inRunFrom(to: string, from: string): Promise<boolean>;
 }
 
 /** Test-only boot globals of the probe service. */
@@ -213,6 +219,18 @@ const probe: AgentsProbe = {
 		return session.isDisposed;
 	},
 	manages: async () => AgentLifecycleManager.global().manages(AgentRegistry.global()),
+	inRunFrom: async (to, from) => {
+		const host = {
+			isDisposed: () => false,
+			isStreaming: () => true,
+			planModeEnabled: () => false,
+			emitSessionEvent: async () => {},
+			wakeForIrc: () => {},
+		} as unknown as IrcBridgeHost;
+		const bridge = new IrcBridge(host);
+		await bridge.deliver({ id: "probe", from, to, body: "question?", ts: 1 });
+		return bridge.drainPending({ keepPeerMessages: true }).length === 1;
+	},
 };
 
 function isProbeGlobals(value: unknown): value is AgentsProbeGlobals {

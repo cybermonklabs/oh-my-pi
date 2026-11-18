@@ -4,6 +4,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import type { ExtensionRunner } from "../../src/extensibility/extensions/runner";
 import { IrcBus } from "../../src/irc/bus";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../../src/registry/agent-registry";
@@ -212,6 +213,56 @@ describe("agent bridging across subagent workers", () => {
 		await waitFor(() =>
 			remote.messages.some(message => message.role === "custom" && message.customType === "irc:incoming"),
 		);
+	});
+
+	it("tells IRC delivered on a worker a message from a descendant past an ended parent", async () => {
+		// If this regresses, a worker reads refs without their recorded ancestry: a keep-alive subagent under a
+		// subagent that has ended (unregistered) reaches its worker-homed ancestor as a peer, its question waiting
+		// for a turn of its own while the ancestor's run waits on it.
+		const { probe } = await startWorker();
+		const registry = AgentRegistry.global();
+		registry.register({ id: "Child", displayName: "task", kind: "sub", parentId: "Main", session: null });
+		registry.register({ id: "Child.Kid", displayName: "task", kind: "sub", parentId: "Child", session: null });
+		registry.register({
+			id: "Child.Kid.Grand",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Child.Kid",
+			session: null,
+		});
+		registry.unregister("Child.Kid");
+
+		expect(await probe.inRunFrom("Child", "Child.Kid.Grand")).toBe(true);
+	});
+
+	it("lends a worker-homed agent its nearest main-thread ancestor's extensions past an ended parent", async () => {
+		// If this regresses, a worker-homed subagent under a subagent that has ended (unregistered) takes the `Main`
+		// session's extension runner, for a helper session's subagent the host's, instead of its nearest main-thread
+		// ancestor's.
+		const { probe } = await startWorker();
+		await probe.open("W1", {});
+		const remote = mirrorOf(liveRef("W1").session);
+		const helperRunner = {} as ExtensionRunner;
+		const registry = AgentRegistry.global();
+		registry.register({
+			id: "Main",
+			displayName: "Main",
+			kind: "main",
+			session: { extensionRunner: {} } as unknown as AgentSession,
+			status: "idle",
+		});
+		registry.register({
+			id: "Helper",
+			displayName: "helper",
+			kind: "main",
+			session: { extensionRunner: helperRunner } as unknown as AgentSession,
+			status: "idle",
+		});
+		registry.register({ id: "Helper-Child", displayName: "task", kind: "sub", parentId: "Helper", session: null });
+		registry.register({ id: "W1", displayName: "W1", kind: "sub", parentId: "Helper-Child", session: remote });
+		registry.unregister("Helper-Child");
+
+		expect(remote.extensionRunner).toBe(helperRunner);
 	});
 
 	it("detaches refs and rejects in-flight commands when the worker dies", async () => {

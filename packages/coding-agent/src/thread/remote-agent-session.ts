@@ -47,7 +47,7 @@ import type { ExtensionRunner } from "../extensibility/extensions";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState } from "../goals/state";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, agentAncestors, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent, AgentSessionEventListener } from "../session/agent-session-events";
 import {
@@ -1055,17 +1055,13 @@ export class RemoteAgentSession implements AgentViewSession {
 		this.#entryIndex.insert(entry);
 	}
 
-	/** Nearest main-thread session up the registry's parent chain, else the main agent's. */
+	/** Nearest main-thread session among the agent's recorded ancestors, else the main agent's. */
 	#mainAncestor(): AgentSession | undefined {
 		const registry = AgentRegistry.global();
-		const seen = new Set<string>();
-		let id = this.agentId === undefined ? undefined : registry.get(this.agentId)?.parentId;
-		while (id !== undefined && !seen.has(id)) {
-			seen.add(id);
-			const ref = registry.get(id);
-			const session = ref?.session;
+		const ref = this.agentId === undefined ? undefined : registry.get(this.agentId);
+		for (const id of agentAncestors(registry, ref)) {
+			const session = registry.get(id)?.session;
 			if (session && isLocalAgentSession(session)) return session;
-			id = ref?.parentId;
 		}
 		const main = registry.get(MAIN_AGENT_ID)?.session;
 		return main && isLocalAgentSession(main) ? main : undefined;

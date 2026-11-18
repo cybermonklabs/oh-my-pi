@@ -525,6 +525,56 @@ describe("AgentLifecycleManager", () => {
 		expect(AgentLifecycleManager.global()).toBe(lifecycle);
 	});
 
+	for (const { start, name } of [
+		{ start: "during", name: "a revive that starts while the agent's release waits in its release hook" },
+		{ start: "before", name: "a revive whose factory returns while the agent's release waits in its release hook" },
+	] as const) {
+		it(`${name} does not bring the agent back live`, async () => {
+			// If this regresses, an agent revived (a message, an Agent Hub focus) while its release still waits on its
+			// release hook (a workspace cleanup) is adopted and gets a live session that the release never disposes:
+			// a live agent nothing owns any more.
+			const releaseGate = deferred();
+			const factoryGate = deferred();
+			const revived = makeSessionStub();
+			let built = 0;
+			const ref = registerIdleSub("Releasing-Sub", null);
+			registry.setStatus("Releasing-Sub", "parked", ref);
+			lifecycle.adopt("Releasing-Sub", { idleTtlMs: 0, onRelease: () => releaseGate.promise }, ref);
+			lifecycle.setPersistedSubagentReviverFactory(
+				async () => {
+					await factoryGate.promise;
+					return async () => {
+						built++;
+						return revived.session;
+					};
+				},
+				() => 0,
+			);
+			const revive = () =>
+				lifecycle.ensureLive("Releasing-Sub").then(
+					() => "revived",
+					() => "refused",
+				);
+
+			const early = start === "before" ? revive() : undefined;
+			await flushAsync(); // an early revive waits in the factory
+			const releasing = lifecycle.release("Releasing-Sub");
+			await flushAsync(); // the release waits in its hook
+			const revival = early ?? revive();
+			factoryGate.resolve();
+			// The revive settles while the release still waits.
+			const outcome = await revival;
+			releaseGate.resolve();
+			await releasing;
+
+			expect(outcome).toBe("refused");
+			// Every session the revive built is disposed: none is left live.
+			expect(revived.disposeCalls()).toBe(built);
+			expect(lifecycle.has("Releasing-Sub")).toBe(false);
+			expect(registry.get("Releasing-Sub")).toBeUndefined();
+		});
+	}
+
 	it("a delayed release cannot remove or mutate a replacement ref with the same id", async () => {
 		const gate = deferred();
 		const oldSession = makeSessionStub(() => gate.promise);
