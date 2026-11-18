@@ -186,9 +186,9 @@ function ensureDisplayPathSync(blobPath: string, displayPath: string, data: Buff
 export interface SessionBlobTier {
 	/**
 	 * Queue `data` (its SHA-256 `hash`) for the tier. It lands before any
-	 * transcript write the storage starts afterwards, so no transcript the tier's
-	 * storage holds names a blob the tier lacks; a blob larger than the tier
-	 * takes is left out, with a warning.
+	 * transcript write that names it, so no transcript the tier's storage
+	 * holds names a blob the tier lacks; bytes that do not hash to `hash` are
+	 * never stored.
 	 */
 	store(hash: string, data: Buffer, mimeType: string | undefined): void;
 	/** Of `hashes`, the ones the tier holds, each with its size in bytes. */
@@ -198,6 +198,24 @@ export interface SessionBlobTier {
 	 * blob to `visit` before the next batch is read.
 	 */
 	read(hashes: readonly string[], visit: (hash: string, data: Buffer) => Promise<void>): Promise<void>;
+	/**
+	 * Rewrite each of `hashes`' rows whose bytes do not hash to its key, from
+	 * `local`'s bytes when they do; answers how many it rewrote.
+	 */
+	repair(hashes: readonly string[], local: (hash: string) => Promise<Buffer | null>): Promise<number>;
+	/**
+	 * `omp gc`'s sweep: delete the blobs created before `beforeMs` that no
+	 * session's references name and `referenced` (the hashes named in any
+	 * transcript gc read) lacks. Without `apply`, only counts.
+	 */
+	sweep(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep>;
+}
+
+/** What {@link SessionBlobTier.sweep} found and deleted. */
+export interface SessionBlobSweep {
+	candidates: number;
+	deleted: number;
+	bytes: number;
 }
 
 export class BlobStore {

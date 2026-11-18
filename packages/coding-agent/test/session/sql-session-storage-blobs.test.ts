@@ -11,7 +11,12 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { loadSessionMessagesReadOnly } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import { BlobStore } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import type { FileEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import {
+	loadSessionMessagesReadOnly,
+	resolveBlobRefsInEntriesSync,
+} from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	SqlSessionStorage,
@@ -60,12 +65,12 @@ function imageTurn(text: string) {
 	};
 }
 
-/** `client`, whose first statement `pattern` matches fails as a reset connection does. */
-function failingOnce(client: SqlSessionStorageClient, pattern: RegExp): SqlSessionStorageClient {
-	let failed = false;
+/** `client`, whose first `times` statements `pattern` matches fail as a reset connection does. */
+function failing(client: SqlSessionStorageClient, pattern: RegExp, times: number): SqlSessionStorageClient {
+	let failed = 0;
 	const check = (query: string): void => {
-		if (failed || !pattern.test(query)) return;
-		failed = true;
+		if (failed >= times || !pattern.test(query)) return;
+		failed++;
 		throw new Error("Connection reset by peer (injected)");
 	};
 	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
@@ -87,6 +92,43 @@ function failingOnce(client: SqlSessionStorageClient, pattern: RegExp): SqlSessi
 
 async function blobHashes(db: LeaseDb): Promise<string[]> {
 	return (await db.sql(`SELECT sha256 FROM ${db.table}_blobs`)).map(row => String(row.sha256)).sort();
+}
+
+/** `size` bytes of an image, distinct for each `seed`. */
+function imageBytes(seed: number, size = 4096): Buffer {
+	const data = Buffer.alloc(size);
+	for (let index = 0; index < size; index++) data[index] = (index * 31 + seed * 17) % 251;
+	return data;
+}
+
+/** A closed session, written through `storage`, whose one user turn carries `images`; answers its file. */
+async function writeImageSession(db: LeaseDb, storage: SqlSessionStorage, images: readonly Buffer[]): Promise<string> {
+	const manager = SessionManager.create(db.dir.join("project"), db.dir.join("sessions"), storage);
+	manager.appendMessage({
+		role: "user",
+		content: [
+			{ type: "text", text: "look" },
+			...images.map(data => ({ type: "image" as const, data: data.toString("base64"), mimeType: "image/png" })),
+		],
+		timestamp: 1,
+	});
+	manager.appendMessage(assistant("seen"));
+	await manager.flush();
+	const file = manager.getSessionFile() ?? "";
+	await manager.close();
+	return file;
+}
+
+/** The data of every image block in `manager`'s user turns: base64, or the reference when it did not resolve. */
+function imagesOf(manager: SessionManager): string[] {
+	return manager
+		.getEntries()
+		.flatMap(entry =>
+			entry.type === "message" && entry.message.role === "user" && typeof entry.message.content !== "string"
+				? entry.message.content.filter((block): block is ImageContent => block.type === "image")
+				: [],
+		)
+		.map(block => block.data);
 }
 
 function assistant(text: string) {
@@ -230,10 +272,10 @@ describe("session blobs in the SQL session storage", () => {
 				await resumed.close();
 			});
 
-			it("lands a blob whose first write fails, so a resume elsewhere still gets the image", async () => {
+			it("lands a blob whose first two writes fail, so a resume elsewhere still gets the image", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const sessionDir = db.dir.join("sessions");
-				const storage = await db.open({ wrap: client => failingOnce(client, BLOB_INSERT) });
+				const storage = await db.open({ wrap: client => failing(client, BLOB_INSERT, 2) });
 				const manager = SessionManager.create(db.dir.join("project"), sessionDir, storage);
 				const userId = manager.appendMessage(imageTurn("look"));
 				manager.appendMessage(assistant("seen"));
@@ -298,8 +340,164 @@ describe("session blobs in the SQL session storage", () => {
 				});
 				expect(seen.sort()).toEqual(blobs.map(sha256).sort());
 				// 6 + 6 MiB in one read; the third would pass 16 MiB, so it goes in a second.
-				expect(queries.filter(query => query.includes("SELECT sha256, content FROM"))).toHaveLength(2);
+				expect(queries.filter(query => query.includes("SELECT sha256, content, byte_len FROM"))).toHaveLength(2);
 			});
+
+			it("deletes a session's blob rows with the session, and keeps one another session still names", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open();
+				const shared = imageBytes(1);
+				const own = imageBytes(2);
+				const first = await writeImageSession(db, storage, [shared, own]);
+				const second = await writeImageSession(db, storage, [shared]);
+				expect(await blobHashes(db)).toEqual([sha256(shared), sha256(own)].sort());
+
+				await storage.deleteSessionWithArtifacts(first);
+				expect(await blobHashes(db)).toEqual([sha256(shared)]);
+				await storage.unlink(second);
+				expect(await blobHashes(db)).toEqual([]);
+			});
+
+			it("deletes, when a move replaces a session, the blob rows only the replaced session named", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open();
+				const moved = imageBytes(3);
+				const replaced = imageBytes(4);
+				const source = await writeImageSession(db, storage, [moved]);
+				const target = await writeImageSession(db, storage, [replaced]);
+
+				await storage.rename(source, target);
+				expect(await blobHashes(db)).toEqual([sha256(moved)]);
+				// The moved session's references went with it.
+				await storage.unlink(target);
+				expect(await blobHashes(db)).toEqual([]);
+			});
+
+			it("stores a blob larger than one row takes in parts, gives it back whole, and deletes the parts with it", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const big = imageBytes(5, 200 * 1024);
+				const limit = { maxBlobBytes: 64 * 1024 };
+				const file = await writeImageSession(db, await db.open(limit), [big]);
+				// Four parts and the row of the image itself, which lists them.
+				expect(await blobHashes(db)).toHaveLength(5);
+				expect(await blobHashes(db)).toContain(sha256(big));
+
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				const storage = await db.open(limit);
+				const resumed = await SessionManager.open(file, path.dirname(file), storage);
+				expect(imagesOf(resumed)).toEqual([big.toString("base64")]);
+				await resumed.close();
+				await storage.unlink(file);
+				expect(await blobHashes(db)).toEqual([]);
+			});
+
+			it("never stores local bytes that do not hash to their key, and rewrites a wrong row from the right bytes", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const { sessionFile, sessionDir } = await writeSession(db);
+				const wrong = Buffer.alloc(IMAGE_BYTES.byteLength, 9);
+				// A row of the right length and the wrong bytes; this machine holds the right ones.
+				await db.sql(`UPDATE ${db.table}_blobs SET content = @1 WHERE sha256 = @2`, [wrong, IMAGE_HASH]);
+				const reopened = await SessionManager.open(sessionFile, sessionDir, await db.open());
+				await reopened.close();
+				const [row] = await db.sql(`SELECT content FROM ${db.table}_blobs WHERE sha256 = @1`, [IMAGE_HASH]);
+				expect(sha256(Buffer.from(row?.content as Uint8Array))).toBe(IMAGE_HASH);
+
+				// No row, and this machine holds wrong bytes under the hash: nothing is written back.
+				await db.sql(`DELETE FROM ${db.table}_blobs`);
+				await Bun.write(path.join(getBlobsDir(), IMAGE_HASH), wrong);
+				const again = await SessionManager.open(sessionFile, sessionDir, await db.open());
+				again.appendMessage(assistant("again"));
+				await again.flush();
+				await again.close();
+				expect(await blobHashes(db)).toEqual([]);
+			});
+
+			it("fails only the writes that name a blob that cannot be written", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open({ wrap: client => failing(client, BLOB_INSERT, Number.POSITIVE_INFINITY) });
+				const withImage = SessionManager.create(db.dir.join("project"), db.dir.join("sessions"), storage);
+				withImage.appendMessage(imageTurn("look"));
+				withImage.appendMessage(assistant("seen"));
+				const plain = SessionManager.create(db.dir.join("project"), db.dir.join("sessions"), storage);
+				plain.appendMessage({ role: "user", content: "no image here", timestamp: 1 });
+				plain.appendMessage(assistant("fine"));
+
+				await plain.flush();
+				expect((await db.row(plain.getSessionFile() ?? ""))?.content ?? "").toContain("no image here");
+				await withImage.flush().catch(() => undefined);
+				expect((await db.row(withImage.getSessionFile() ?? ""))?.content ?? "").not.toContain(IMAGE_HASH);
+				await plain.close();
+				await withImage.close().catch(() => undefined);
+			});
+
+			it("draws again, in the read-only loader, the snapcompact frames this machine lacks", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const { sessionFile } = await writeSession(db);
+				const content = (await db.row(sessionFile))?.content ?? "";
+				const frames = [...new Set([...content.matchAll(BLOB_REF)].map(match => match[1] ?? ""))].filter(
+					hash => hash !== IMAGE_HASH,
+				);
+				expect(frames.length).toBeGreaterThan(0);
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+
+				await loadSessionMessagesReadOnly(sessionFile, await db.open());
+				const drawn = await Promise.all(frames.map(hash => Bun.file(path.join(getBlobsDir(), hash)).exists()));
+				expect(drawn).toEqual(frames.map(() => true));
+			});
+
+			it("restores an image from the table with its display copy beside the blob", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const { sessionFile, sessionDir } = await writeSession(db);
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				const resumed = await SessionManager.open(sessionFile, sessionDir, await db.open());
+				await resumed.close();
+				expect(await Bun.file(path.join(getBlobsDir(), `${IMAGE_HASH}.png`)).exists()).toBe(true);
+			});
+
+			it("restores, after the synchronous foreign-entry path, an image only the table holds", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				await writeSession(db);
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				const storage = await db.open();
+				const entries: FileEntry[] = [
+					{
+						type: "message",
+						id: "foreign1",
+						parentId: null,
+						timestamp: "2026-11-18T00:00:00.000Z",
+						message: {
+							role: "user",
+							content: [{ type: "image", data: `blob:sha256:${IMAGE_HASH}`, mimeType: "image/png" }],
+							timestamp: 1,
+						},
+					} as FileEntry,
+				];
+				resolveBlobRefsInEntriesSync(entries, new BlobStore(getBlobsDir(), storage.blobTier));
+				const image = () => {
+					const entry = entries[0];
+					return entry?.type === "message" && typeof entry.message.content !== "string"
+						? (entry.message.content[0] as ImageContent | undefined)?.data
+						: undefined;
+				};
+				await until(() => image() === IMAGE);
+				expect(image()).toBe(IMAGE);
+			});
+
+			it.skipIf(adapter !== "sqlite")(
+				"refuses to start on SQLite when the blob table has no primary key",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					await (await db.open()).drain();
+					await db.sql(`DROP TABLE ${db.table}_blobs`);
+					await db.sql(
+						`CREATE TABLE ${db.table}_blobs (sha256 TEXT, content BLOB NOT NULL, byte_len INTEGER NOT NULL, ` +
+							"mime_type TEXT, created_ms INTEGER NOT NULL)",
+					);
+					expect(String(await rejection(db.open({ createTable: false })))).toContain(
+						`table ${db.table}_blobs has no primary key`,
+					);
+				},
+			);
 		});
 	}
 
@@ -340,6 +538,118 @@ describe("session blobs in the SQL session storage", () => {
 					gate?.open();
 				}
 				await flushing;
+				expect((await db.row(sessionFile))?.content ?? "").toContain(IMAGE_HASH);
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+				await manager.close();
+			});
+
+			it("writes no first, full transcript naming an image before its blob's row commits", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				let gate: GatedClient | undefined;
+				const storage = await db.open({
+					wrap: client => {
+						gate = gatedClient(client, BLOB_INSERT);
+						return gate.client;
+					},
+				});
+				gate?.close();
+				const manager = SessionManager.create(db.dir.join("project"), db.dir.join("sessions"), storage);
+				// The session's first write is a full one (made once it has an assistant turn), and it names the image.
+				manager.appendMessage(imageTurn("look"));
+				manager.appendMessage(assistant("seen"));
+				const sessionFile = manager.getSessionFile() ?? "";
+				const flushing = manager.flush();
+				try {
+					const first = await Promise.race([
+						gate?.paused().then(() => "blob insert held"),
+						flushing.then(() => "transcript flushed"),
+					]);
+					expect(first).toBe("blob insert held");
+					// A real wait: what must not happen is a commit on the database server, which no fake clock reaches.
+					await Bun.sleep(500);
+					expect((await db.row(sessionFile))?.content ?? "").not.toContain(IMAGE_HASH);
+				} finally {
+					gate?.open();
+				}
+				await flushing;
+				expect((await db.row(sessionFile))?.content ?? "").toContain(IMAGE_HASH);
+				await manager.close();
+			});
+
+			it("keeps a blob another session's delete would take while a write adding a reference to it is open", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open();
+				const deleted = await writeImageSession(db, storage, [IMAGE_BYTES]);
+				let gate: GatedClient | undefined;
+				const writer = await db.open({
+					wrap: client => {
+						gate = gatedClient(client, /^INSERT INTO \S*_refs\b/);
+						return gate.client;
+					},
+				});
+				const manager = SessionManager.create(db.dir.join("project"), db.dir.join("sessions"), writer);
+				manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
+				manager.appendMessage(assistant("seen"));
+				await manager.flush();
+
+				gate?.close();
+				manager.appendMessage(imageTurn("the same image"));
+				const flushing = manager.flush();
+				let first: string | undefined;
+				let deleting: Promise<void> | undefined;
+				try {
+					// The write holds the blob's row shared, its reference not committed (a build without
+					// references never gets here, and flushes first).
+					await Promise.race([gate?.paused(), flushing]);
+					deleting = storage.unlink(deleted);
+					// A real wait: the delete must not finish while the write's transaction is open on the server.
+					first = await Promise.race([
+						deleting.then(() => "deleted"),
+						Bun.sleep(1000).then(() => "waiting for the write"),
+					]);
+				} finally {
+					gate?.open();
+				}
+				await Promise.all([flushing, deleting]);
+				expect(first).toBe("waiting for the write");
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+				await manager.close();
+			});
+
+			it("lands again, from this machine's blob store, a blob a delete took while a write naming it waited", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				let gate: GatedClient | undefined;
+				const storage = await db.open({
+					wrap: client => {
+						gate = gatedClient(client, /^DELETE FROM \S*_blobs\b/);
+						return gate.client;
+					},
+				});
+				const deleted = await writeImageSession(db, storage, [IMAGE_BYTES]);
+				const writer = await db.open();
+				const manager = SessionManager.create(db.dir.join("project"), db.dir.join("sessions"), writer);
+				manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
+				manager.appendMessage(assistant("seen"));
+				await manager.flush();
+				// The writer knows the blob is in the table, as a resume that read it does.
+				await writer.blobTier.sizes([IMAGE_HASH]);
+
+				gate?.close();
+				const deleting = storage.unlink(deleted);
+				let flushing: Promise<void> | undefined;
+				try {
+					// The delete took the row and has not committed.
+					const held = await Promise.race([gate?.paused().then(() => true), deleting.then(() => false)]);
+					expect(held).toBe(true);
+					manager.appendMessage(imageTurn("the same image"));
+					flushing = manager.flush();
+					// A real wait: the write must reach its lock on the row before the delete commits.
+					await Bun.sleep(500);
+				} finally {
+					gate?.open();
+				}
+				await Promise.all([deleting, flushing]);
+				const sessionFile = manager.getSessionFile() ?? "";
 				expect((await db.row(sessionFile))?.content ?? "").toContain(IMAGE_HASH);
 				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
 				await manager.close();
@@ -396,7 +706,7 @@ describe("session blobs in the SQL session storage", () => {
 
 					// A login with row access to the other tables, and only SELECT on the blob table.
 					const role = `blob_reader_${process.pid}`;
-					const others = `${db.table}, ${db.table}_parts, ${db.leaseTable}`;
+					const others = `${db.table}, ${db.table}_parts, ${db.table}_refs, ${db.leaseTable}`;
 					await db.sql(`CREATE ROLE ${role} LOGIN`);
 					const client = new SQL(Object.assign(new URL(db.dsn), { username: role }).toString());
 					try {
@@ -409,6 +719,7 @@ describe("session blobs in the SQL session storage", () => {
 							),
 						);
 						expect(refused).toContain("no INSERT privilege for the store's login");
+						expect(refused).toContain("no DELETE privilege for the store's login");
 					} finally {
 						await client.end();
 						await db.sql(`REVOKE ALL ON ${others}, ${blobs} FROM ${role}`);
@@ -420,41 +731,81 @@ describe("session blobs in the SQL session storage", () => {
 		});
 	}
 
-	it("leaves out, with a warning, a blob larger than a MySQL server's max_allowed_packet takes, and stores one that fits", async () => {
+	it("stores a blob larger than a MySQL server's max_allowed_packet takes in parts that fit it, and one that fits whole", async () => {
 		const MIB = 1024 * 1024;
 		const inserted: unknown[] = [];
-		const columns = ["path", "content", "mtime_ms", "title", "title_source", "title_updated_at", "byte_len"];
-		const answer = (sql: string, values: unknown[] | undefined): SqlSessionStorageResult => {
-			if (sql.includes(" AS column_name FROM ")) return columns.map(column_name => ({ column_name }));
-			if (sql === "SELECT VERSION() AS version") return [{ version: "8.4.13" }];
-			if (sql.startsWith("SELECT @@max_allowed_packet")) return [{ max_packet: 2 * MIB }];
-			if (BLOB_INSERT.test(sql)) {
-				inserted.push(values?.[0]);
-				return Object.assign([], { affectedRows: 1 });
-			}
-			return [];
-		};
-		const executor: SqlSessionStorageTransaction = { unsafe: async (sql, values) => answer(sql, values) };
-		const client: SqlSessionStorageClient = {
-			options: { adapter: "mysql" },
-			unsafe: executor.unsafe,
-			transaction: callback => callback(executor),
-		};
-		const storage = await SqlSessionStorage.create({ client, claims: false });
-		const warn = vi.spyOn(logger, "warn");
-		const large = Buffer.alloc(1.5 * MIB, 1);
-		const small = Buffer.alloc(MIB / 4, 2);
+		const storage = await SqlSessionStorage.create({
+			client: mysqlStub(sql => {
+				if (sql.startsWith("SELECT @@max_allowed_packet")) return [{ max_packet: 2 * MIB }];
+				return undefined;
+			}, inserted),
+			claims: false,
+		});
+		const large = imageBytes(6, 1.5 * MIB);
+		const small = imageBytes(7, MIB / 4);
 
 		storage.blobTier.store(sha256(large), large, "image/png");
 		storage.blobTier.store(sha256(small), small, "image/png");
 		await storage.drain();
-		expect(inserted).toEqual([sha256(small)]);
-		expect(warn).toHaveBeenCalledWith(
-			expect.stringContaining("larger than the session database takes"),
-			expect.objectContaining({ hash: sha256(large), bytes: large.byteLength, limit: MIB }),
+		// The bound is the packet less 1 MiB: two parts of the large image, then its own row, then the small one.
+		expect(inserted).toEqual([
+			sha256(large.subarray(0, MIB)),
+			sha256(large.subarray(MIB)),
+			sha256(large),
+			sha256(small),
+		]);
+	});
+
+	it("refuses to start on MySQL when the blob table has no primary key or the login cannot insert into it", async () => {
+		const refused = String(
+			await rejection(
+				SqlSessionStorage.create({
+					client: mysqlStub((sql, values) => {
+						// The blob table without its key.
+						if (sql.includes("information_schema.KEY_COLUMN_USAGE") && String(values?.[0]).endsWith("_blobs")) {
+							return [];
+						}
+						if (sql.startsWith("INSERT INTO omp_session_files_blobs") && sql.endsWith("WHERE 1 = 0")) {
+							throw new Error("INSERT command denied to user 'agent'@'%' for table 'omp_session_files_blobs'");
+						}
+						return undefined;
+					}, []),
+					claims: false,
+				}),
+			),
 		);
+		expect(refused).toContain("table omp_session_files_blobs has no primary key");
+		expect(refused).toContain("the store's login cannot INSERT on table omp_session_files_blobs");
 	});
 });
+
+/**
+ * A MySQL server that answers start-up as one with every table in place
+ * would, records the hash of each blob row inserted, and asks `special`
+ * first (an answer, or undefined for the default).
+ */
+function mysqlStub(
+	special: (sql: string, values: unknown[] | undefined) => SqlSessionStorageResult | undefined,
+	inserted: unknown[],
+): SqlSessionStorageClient {
+	const columns = ["path", "content", "mtime_ms", "title", "title_source", "title_updated_at", "byte_len"];
+	const answer = (sql: string, values: unknown[] | undefined): SqlSessionStorageResult => {
+		const answered = special(sql, values);
+		if (answered) return answered;
+		if (sql.includes(" AS column_name FROM ")) return columns.map(column_name => ({ column_name }));
+		if (sql === "SELECT VERSION() AS version") return [{ version: "8.4.13" }];
+		if (sql.includes("information_schema.KEY_COLUMN_USAGE")) {
+			return String(values?.[0]).endsWith("_refs") ? [{ name: "path" }, { name: "sha256" }] : [{ name: "sha256" }];
+		}
+		if (BLOB_INSERT.test(sql) && !sql.endsWith("WHERE 1 = 0")) {
+			inserted.push(values?.[0]);
+			return Object.assign([], { affectedRows: 1 });
+		}
+		return [];
+	};
+	const executor: SqlSessionStorageTransaction = { unsafe: async (sql, values) => answer(sql, values) };
+	return { options: { adapter: "mysql" }, unsafe: executor.unsafe, transaction: callback => callback(executor) };
+}
 
 /** `client`, recording every statement it sends in `queries`. */
 function recordingClient(client: SqlSessionStorageClient, queries: string[]): SqlSessionStorageClient {

@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { blobExtensionForImageMimeType } from "@oh-my-pi/pi-tui/prompt/image-format";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -898,17 +899,23 @@ async function restoreTierBlobs(values: readonly unknown[], blobStore: BlobStore
 		mimeTypes.set(hash, typeof mimeType === "string" ? mimeType : undefined);
 	}
 	if (mimeTypes.size === 0) return;
+	const verifiedLocal = async (hash: string): Promise<Buffer | null> => {
+		const data = await blobStore.get(hash);
+		return data && new Bun.SHA256().update(data).digest("hex") === hash ? data : null;
+	};
 	try {
 		const held = await tier.sizes([...mimeTypes.keys()]);
 		const missing: string[] = [];
+		const heldHere: string[] = [];
 		let writtenBack = 0;
 		for (const [hash, mimeType] of mimeTypes) {
 			if (held.has(hash)) {
-				if (!(await blobStore.has(hash))) missing.push(hash);
+				if (await blobStore.has(hash)) heldHere.push(hash);
+				else missing.push(hash);
 				continue;
 			}
 			if (!writeBack) continue;
-			const data = await blobStore.get(hash);
+			const data = await verifiedLocal(hash);
 			if (!data) continue;
 			tier.store(hash, data, mimeType);
 			writtenBack++;
@@ -916,12 +923,14 @@ async function restoreTierBlobs(values: readonly unknown[], blobStore: BlobStore
 		if (writtenBack > 0) {
 			logger.info("Writing local session blobs the session database lacks back to it", { blobs: writtenBack });
 		}
+		// A row whose bytes do not hash to its key is rewritten from this machine's right bytes.
+		if (writeBack && heldHere.length > 0) await tier.repair(heldHere, verifiedLocal);
 		await tier.read(missing, async (hash, data) => {
 			if (new Bun.SHA256().update(data).digest("hex") !== hash) {
 				logger.warn("A session blob in the session database does not hash to its key; left missing", { hash });
 				return;
 			}
-			await blobStore.put(data, { hash });
+			await blobStore.put(data, { hash, extension: blobExtensionForImageMimeType(mimeTypes.get(hash)) });
 			logger.info("Restored a session blob from the session database", { hash, bytes: data.byteLength });
 		});
 	} catch (error) {

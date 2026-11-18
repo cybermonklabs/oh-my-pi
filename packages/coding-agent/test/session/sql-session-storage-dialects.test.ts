@@ -78,6 +78,21 @@ function blobsSchema(adapter: SqlSessionStorageAdapter, table: string): string {
 	);
 }
 
+/** The reference table DDL that docs/session.md gives `createTable: false` consumers: the table, then its index. */
+function refsSchema(adapter: SqlSessionStorageAdapter, table: string): string[] {
+	if (adapter === "mysql") {
+		return [
+			`CREATE TABLE ${table}_refs (path VARCHAR(512) NOT NULL, sha256 CHAR(64) NOT NULL, ` +
+				`PRIMARY KEY (path, sha256), INDEX ${table}_rhash (sha256)` +
+				`) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+		];
+	}
+	return [
+		`CREATE TABLE ${table}_refs (path TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (path, sha256))`,
+		`CREATE INDEX ${table}_rhash ON ${table}_refs (sha256)`,
+	];
+}
+
 let tableSeq = 0;
 
 /** One test's database: a fresh table name, its clients, and the cleanup that drops both tables. */
@@ -126,6 +141,7 @@ class Db implements AsyncDisposable {
 	}
 
 	async [Symbol.asyncDispose](): Promise<void> {
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_refs`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_blobs`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
@@ -463,6 +479,11 @@ for (const { adapter, url } of BACKENDS) {
 			expect((blobsMissing as Error).message).not.toContain(`table ${db.table}_parts`);
 
 			await db.sql(blobsSchema(adapter, db.table));
+			const refsMissing: unknown = await db.open({ createTable: false }).catch((error: unknown) => error);
+			expect((refsMissing as Error).message).toContain(`table ${db.table}_refs`);
+			expect((refsMissing as Error).message).not.toContain(`table ${db.table}_blobs`);
+
+			for (const statement of refsSchema(adapter, db.table)) await db.sql(statement);
 			await expect(db.open({ createTable: false })).rejects.toThrow(legacy);
 
 			const backfill = {

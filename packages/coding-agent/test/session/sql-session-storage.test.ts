@@ -651,6 +651,12 @@ function capturingClient(
 			if (transaction !== null && sql === READ_ONLY_READ && server.setting && server.resetVal) {
 				return [{ setting: server.setting, reset_val: server.resetVal }];
 			}
+			// MySQL's start-up checks the blob and reference tables' keys: as docs/session.md gives them.
+			if (sql.includes("information_schema.KEY_COLUMN_USAGE")) {
+				return String(values?.[0]).endsWith("_refs")
+					? [{ name: "path" }, { name: "sha256" }]
+					: [{ name: "sha256" }];
+			}
 			// A read sent alone with its search_path lock: one (empty) result per statement.
 			if (sql.startsWith(`${SEARCH_PATH}; `)) return [[], []];
 			return [];
@@ -681,18 +687,24 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		const { client, queries } = capturingClient("postgres");
 		const storage = await SqlSessionStorage.create({ client });
 
-		// The stub has no tables, so start-up makes all four, with the lease table's index, in one statement batch.
+		// The stub has no tables, so start-up makes all five, with the reference and lease tables' indexes, in one statement batch.
 		const [made, ...more] = queries.filter(q => q.sql.includes("CREATE TABLE"));
 		expect(more).toHaveLength(0);
 		const tables = (made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(4);
+		expect(tables).toHaveLength(5);
 		expect(tables[0]).toContain("omp_session_files (path TEXT PRIMARY KEY");
 		expect(tables[0]).toContain("mtime_ms BIGINT");
 		expect(tables[0]).toContain("byte_len BIGINT");
 		expect(tables[1]).toContain("omp_session_files_parts (path TEXT NOT NULL, start_offset BIGINT NOT NULL");
 		expect(tables[1]).toContain("PRIMARY KEY (path, start_offset)");
 		expect(tables[2]).toContain("omp_session_files_blobs (sha256 TEXT PRIMARY KEY, content BYTEA NOT NULL");
-		expect(tables[3]).toContain("omp_session_leases (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL");
+		expect(tables[3]).toContain(
+			"omp_session_files_refs (path TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (path, sha256))",
+		);
+		expect(made?.sql).toMatch(
+			/CREATE INDEX IF NOT EXISTS omp_session_files_rhash ON \S*omp_session_files_refs \(sha256\)/,
+		);
+		expect(tables[4]).toContain("omp_session_leases (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL");
 		// One transaction behind the start-up opening, which takes the start-up lock, looks again and makes them.
 		expect(inOneTransaction(queries.filter(query => query.transaction === made?.transaction))).toEqual([
 			...START_UP_OPENING,

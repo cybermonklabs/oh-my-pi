@@ -53,6 +53,13 @@ function mysqlFake(): { client: SqlSessionStorageClient; stored(path: string): s
 			if (sql.startsWith("SELECT column_name")) return mysqlResult(0);
 			// Every fake row already carries its byte_len, so nothing needs a backfill.
 			if (sql.startsWith("SELECT 1 AS unmeasured")) return mysqlResult(0);
+			// The blob and reference tables' keys, as docs/session.md gives them.
+			if (sql.includes("information_schema.KEY_COLUMN_USAGE")) {
+				return mysqlResult(
+					0,
+					String(values[0]).endsWith("_refs") ? [{ name: "path" }, { name: "sha256" }] : [{ name: "sha256" }],
+				);
+			}
 			if (sql.startsWith("SELECT 1 AS found FROM omp_session_files_parts")) {
 				return mysqlResult(0, orderedParts(values[0] as string).length > 0 ? [{ found: 1 }] : []);
 			}
@@ -125,6 +132,15 @@ function mysqlFake(): { client: SqlSessionStorageClient; stored(path: string): s
 			}
 			if (sql.startsWith("DELETE FROM omp_session_files ")) {
 				return mysqlResult(rows.delete(values[0] as string) ? 1 : 0);
+			}
+			// The blob and reference tables, which hold nothing here: start-up's privilege probes, which change
+			// no row, a full write's reference reset, and a delete's look for the references it drops.
+			if (
+				/^(INSERT INTO|DELETE FROM|UPDATE|SELECT sha256(, byte_len)? FROM) omp_session_files_(blobs|refs)\b/.test(
+					sql,
+				)
+			) {
+				return mysqlResult(0);
 			}
 			throw new Error(`mysqlFake: unhandled statement: ${sql.slice(0, 60)}`);
 		},

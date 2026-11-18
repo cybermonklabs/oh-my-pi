@@ -135,6 +135,29 @@ describe("omp gc --blobs under session.storage: sql", () => {
 
 		expect(await Bun.file(referenced).exists()).toBe(true);
 	});
+
+	test("--apply deletes the blob-table rows no session names, and keeps one a transcript names and one written within the grace", async () => {
+		await storage.writeText(parent(), transcript("root", `blob:sha256:${hashFor("named")}`));
+		await storage.drain();
+		const row = async (label: string, createdMs: number) =>
+			client?.unsafe(
+				"INSERT INTO omp_session_files_blobs (sha256, content, byte_len, mime_type, created_ms) VALUES (?, ?, ?, ?, ?)",
+				[hashFor(label), Buffer.from(label), label.length, "image/png", createdMs],
+			);
+		const old = Date.now() - 3 * 86_400_000;
+		// Written after the transcript, so no reference row names it: only the transcript does.
+		await row("named", old);
+		await row("orphan", old);
+		await row("fresh", Date.now());
+
+		const result = await runGcCommand({ flags: { agentDir: root, blobs: true, apply: true } });
+
+		const left = ((await client?.unsafe("SELECT sha256 FROM omp_session_files_blobs")) as Array<{ sha256: string }>)
+			.map(found => found.sha256)
+			.sort();
+		expect(left).toEqual([hashFor("named"), hashFor("fresh")].sort());
+		expect(result.blobs?.table).toMatchObject({ candidates: 1, deleted: 1, bytes: "orphan".length });
+	});
 });
 
 describe("omp gc --stale under session.storage: sql", () => {

@@ -75,7 +75,9 @@ export interface LeaseDb extends AsyncDisposable {
 	 * `leaseTable` names the fixture's lease table another way (its spelling).
 	 */
 	open(
-		options?: Partial<Pick<SqlSessionStorageOptions, "claims" | "lease" | "createTable" | "leaseTable">> & {
+		options?: Partial<
+			Pick<SqlSessionStorageOptions, "claims" | "lease" | "createTable" | "leaseTable" | "maxBlobBytes">
+		> & {
 			dsn?: string;
 			wrap?: (client: SqlSessionStorageClient) => SqlSessionStorageClient;
 		},
@@ -191,7 +193,7 @@ export async function openLeaseDb(adapter: SqlSessionStorageAdapter, url: string
 					await storage.drain().catch(() => undefined);
 					await client.end();
 				}
-				for (const name of [`${table}_parts`, `${table}_blobs`, table, leaseTable]) {
+				for (const name of [`${table}_parts`, `${table}_blobs`, `${table}_refs`, table, leaseTable]) {
 					await admin.unsafe(`DROP TABLE IF EXISTS ${name}`);
 				}
 			} finally {
