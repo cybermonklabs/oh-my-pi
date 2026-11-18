@@ -15,11 +15,15 @@
 failure-output = "immediate-final"
 # Report every failing test in one pass instead of stopping at the first.
 fail-fast = false
-# The one time bound of a test run. A test bounds no elapsed time of its own:
-# it waits for the event it is about, however long a loaded host takes, and
-# its fixtures outlive this bound. A test whose event never comes is failed
-# here, after 4 periods of 60 s. `test:rs` (`scripts/run-rs-task.ts`, locally
-# and in CI) runs this profile, and the `ci` profile has the same bound.
+# The one time bound of a nextest run. A test bounds no elapsed time of its
+# own: it waits for the event it is about, however long a loaded host takes,
+# and its fixtures outlive this bound. A test whose event never comes is
+# failed here, by name, after 4 periods of 60 s. `test:rs`
+# (`scripts/run-rs-task.ts`) runs this profile; the `ci` profile has the
+# same bound. CI's Rust tests run under Bazel (`bazelisk test //crates/...`,
+# `.github/workflows/ci.yml`), whose bound is its test timeout per target
+# (300 s for a medium test): there a hung test fails its whole target, not
+# named. `cargo test` has no bound.
 slow-timeout = { period = "60s", terminate-after = 4 }
 
 [profile.ci]

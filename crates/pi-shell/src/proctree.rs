@@ -29,12 +29,47 @@ mod platform {
 
 	use super::{ProcessStatus, Walk, unread};
 
-	/// Stable Linux process reference backed by a pidfd.
+	/// Stable Linux process reference: a pidfd, or where the system provides
+	/// none, the process's start time, rechecked before each use.
 	#[derive(Clone)]
 	pub struct Process {
 		pid:        i32,
-		pidfd:      Arc<OwnedFd>,
+		/// `None` where `pidfd_open` is unavailable ([`pidfd_unavailable`]):
+		/// the process is then pinned by `start_time` alone, as
+		/// `sys::proc::signal_pinned` does there.
+		pidfd:      Option<Arc<OwnedFd>>,
 		start_time: u64,
+	}
+
+	/// Whether `error` from `pidfd_open` says the system provides no pidfd,
+	/// rather than anything about the process: `ENOSYS` (kernels before
+	/// 5.3) or `EPERM` (a seccomp or LSM filter; `pidfd_open` checks no
+	/// permission on its target).
+	fn pidfd_unavailable(error: &io::Error) -> bool {
+		matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM))
+	}
+
+	#[cfg(test)]
+	thread_local! {
+		/// Pin this thread's processes as where `pidfd_open` is unavailable.
+		pub(crate) static NO_PIDFD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	}
+
+	/// `pidfd_open(pid)`.
+	fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
+		#[cfg(test)]
+		if NO_PIDFD.get() {
+			return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+		}
+		// SAFETY: pidfd_open takes scalar arguments and returns a new owned
+		// fd.
+		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+		if fd < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: a successful pidfd_open returned a uniquely owned
+		// descriptor that fits an `i32`.
+		Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 	}
 
 	impl Process {
@@ -43,9 +78,9 @@ mod platform {
 		}
 
 		/// The process `pid`, pinned: `Ok(None)` when it is gone, or no
-		/// signal of ours reaches it; `Err` when it could not be pinned or
-		/// read for a reason that proves nothing (no descriptor left,
-		/// `pidfd_open` unavailable).
+		/// signal of ours reaches it; `Err` when it could not be read for a
+		/// reason that proves nothing (no descriptor left). Where the system
+		/// provides no pidfd it is pinned by its start time instead.
 		pub fn open(pid: i32) -> io::Result<Option<Self>> {
 			Ok(Self::pin(pid)?.map(|(process, _)| process))
 		}
@@ -55,34 +90,44 @@ mod platform {
 			if pid <= 0 {
 				return Ok(None);
 			}
-			// SAFETY: pidfd_open takes scalar arguments and returns a new owned
-			// fd.
-			let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-			if fd < 0 {
-				let error = io::Error::last_os_error();
-				return if error.raw_os_error() == Some(libc::ESRCH) {
-					Ok(None)
-				} else {
-					Err(error)
-				};
-			}
-			// SAFETY: a successful pidfd_open returned a uniquely owned
-			// descriptor that fits an `i32`.
-			let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+			let pidfd = match pidfd_open(pid) {
+				Ok(fd) => Some(Arc::new(fd)),
+				Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+				Err(error) if pidfd_unavailable(&error) => None,
+				Err(error) => return Err(error),
+			};
 			let Some(info) = crate::sys::proc::read(pid)? else {
 				return Ok(None);
 			};
-			Ok(Some((Self { pid, pidfd: Arc::new(pidfd), start_time: info.start }, info.ppid)))
+			// A zombie is pinned, as `pidfd_open` pins one: it reads as exited
+			// ([`Process::status`]) and takes no signal.
+			Ok(Some((Self { pid, pidfd, start_time: info.start }, info.ppid)))
+		}
+
+		/// Whether the process `pid` names is still this one, by its start
+		/// time: `None` when that cannot be read for a reason that proves
+		/// nothing (no descriptor left).
+		fn same_start(&self) -> Option<bool> {
+			match crate::sys::proc::read(self.pid) {
+				Ok(Some(now)) => Some(
+					now.start == self.start_time && now.state != crate::sys::proc::ProcState::Zombie,
+				),
+				Ok(None) => Some(false),
+				Err(_) => None,
+			}
 		}
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
 		}
 
-		/// How long ago this process started, from the start time read when
-		/// it was pinned; `None` when the clock cannot be read.
-		pub fn started_ago(&self) -> Option<std::time::Duration> {
-			crate::sys::proc::age(self.start_time).ok()
+		/// The kernel's start mark of this process, read when it was pinned:
+		/// its start time in clock ticks since boot (field 22 of
+		/// `/proc/<pid>/stat`). With the boot it is counted from
+		/// ([`start_mark`](super::Process::start_mark)), it names this
+		/// process alone; no wall-clock step moves it.
+		pub const fn start_ticks(&self) -> u64 {
+			self.start_time
 		}
 
 		/// The live children, and whether every candidate was read: `Err`
@@ -242,8 +287,19 @@ mod platform {
 			args
 		}
 
+		/// Send `signal` to this process: through its pidfd, which can never
+		/// reach a recycled pid; without one, by its pid once its start time
+		/// says it is still this process (the window between the check and
+		/// the signal is `sys::proc::signal_pinned`'s on the same systems).
 		pub fn kill(&self, signal: i32) -> bool {
-			sys::pidfd_send_signal(self.pidfd.as_fd(), signal)
+			match &self.pidfd {
+				Some(pidfd) => sys::pidfd_send_signal(pidfd.as_fd(), signal),
+				None => {
+					self.same_start() == Some(true)
+						// SAFETY: plain syscall without pointer arguments.
+						&& unsafe { libc::kill(self.pid, signal) } == 0
+				},
+			}
 		}
 
 		pub fn group_id(&self) -> Option<i32> {
@@ -259,9 +315,17 @@ mod platform {
 		}
 
 		pub fn status(&self) -> ProcessStatus {
+			let Some(pidfd) = &self.pidfd else {
+				// A start time that cannot be read proves nothing: running, as
+				// for a poll error below.
+				return match self.same_start() {
+					Some(false) => ProcessStatus::Exited,
+					Some(true) | None => ProcessStatus::Running,
+				};
+			};
 			loop {
 				let mut pollfd =
-					libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+					libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
 				// SAFETY: `pollfd` points to one initialized `pollfd` element, and
 				// the pidfd remains open for the duration of the call. Timeout
 				// zero makes this a non-blocking readiness probe.
@@ -289,10 +353,17 @@ mod platform {
 			}
 		}
 
-		/// Resolves once the process exits: its pidfd becomes readable then.
+		/// Resolves once the process exits: its pidfd becomes readable then;
+		/// without a pidfd, its start time is rechecked every 20 ms.
 		pub async fn exited(&self) -> std::io::Result<()> {
+			let Some(pidfd) = &self.pidfd else {
+				while self.status() == ProcessStatus::Running {
+					tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+				}
+				return Ok(());
+			};
 			let pidfd = tokio::io::unix::AsyncFd::with_interest(
-				self.pidfd.try_clone()?,
+				pidfd.try_clone()?,
 				tokio::io::Interest::READABLE,
 			)?;
 			let _ready = pidfd.readable().await?;
@@ -390,14 +461,14 @@ mod platform {
 			self.pid
 		}
 
-		/// How long ago this process started, from the start time read when
-		/// it was pinned; `None` when the clock cannot be read.
-		pub fn started_ago(&self) -> Option<std::time::Duration> {
-			let start = self
+		/// The kernel's start mark of this process, read when it was pinned:
+		/// µs since the epoch (`pbi_start_tvsec`, `pbi_start_tvusec`), which the
+		/// kernel recorded at the start and no later wall-clock step moves.
+		pub const fn start_ticks(&self) -> u64 {
+			self
 				.start_tvsec
 				.saturating_mul(1_000_000)
-				.saturating_add(self.start_tvusec);
-			crate::sys::proc::age(start).ok()
+				.saturating_add(self.start_tvusec)
 		}
 
 		/// The live children, and whether every candidate was read.
@@ -666,17 +737,11 @@ mod platform {
 			self.pid
 		}
 
-		/// How long ago this process started, from its creation time; `None`
-		/// when the clock reads before the process's creation.
-		pub fn started_ago(&self) -> Option<std::time::Duration> {
-			/// 100 ns ticks from 1601 (FILETIME's epoch) to 1970.
-			const UNIX_EPOCH_TICKS: u128 = 116_444_736_000_000_000;
-			let since = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.ok()?;
-			let now = since.as_nanos() / 100 + UNIX_EPOCH_TICKS;
-			let ticks = now.checked_sub(u128::from(self.creation_time))?;
-			Some(std::time::Duration::from_nanos(u64::try_from(ticks * 100).ok()?))
+		/// The kernel's start mark of this process: its creation time
+		/// (`FILETIME`, 100 ns ticks since 1601), which the kernel recorded at
+		/// the start and no later wall-clock step moves.
+		pub const fn start_ticks(&self) -> u64 {
+			self.creation_time
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
@@ -853,9 +918,10 @@ impl Process {
 	///
 	/// # Errors
 	///
-	/// When the process could not be pinned or read for a reason that proves
-	/// nothing (no descriptor left, `pidfd_open` unavailable; on Windows, an
-	/// `OpenProcess` failure other than no such process or access denied).
+	/// When the process could not be read for a reason that proves nothing
+	/// (no descriptor left; on Windows, an `OpenProcess` failure other than
+	/// no such process or access denied). Where Linux provides no pidfd, the
+	/// process is pinned by its start time instead.
 	pub fn open(pid: i32) -> io::Result<Option<Self>> {
 		Ok(platform::Process::open(pid)?.map(Self::from_inner))
 	}
@@ -874,12 +940,23 @@ impl Process {
 		self.inner.pid()
 	}
 
-	/// How long ago this process started; `None` when the clock cannot be
-	/// read. A pid recorded with its start time names this process only if
-	/// it started no later than then: one that reused the pid started after.
+	/// The kernel's start mark of this process, read when it was pinned: on
+	/// Linux the boot's id (`/proc/sys/kernel/random/boot_id`) and the start
+	/// in clock ticks since that boot; on macOS and Windows the start time
+	/// the kernel recorded. A pid recorded with this mark names this process
+	/// alone: one that reused the pid has another. No clock is compared, so
+	/// a step of the wall clock changes nothing.
 	#[must_use]
-	pub fn started_ago(&self) -> Option<Duration> {
-		self.inner.started_ago()
+	pub fn start_mark(&self) -> String {
+		#[cfg(target_os = "linux")]
+		{
+			let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+			format!("{}:{}", boot.trim(), self.inner.start_ticks())
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			self.inner.start_ticks().to_string()
+		}
 	}
 
 	/// Parent process id for this process, when available.
@@ -1412,6 +1489,13 @@ impl TerminationTargets {
 		self.pgids.is_empty() && self.processes.is_empty()
 	}
 
+	/// Whether a process group is among the targets: one signal reaches all
+	/// of it, with no read of the process table.
+	#[must_use]
+	pub const fn has_process_group(&self) -> bool {
+		!self.pgids.is_empty()
+	}
+
 	/// Send `signal` to every recorded target. A target that already exited
 	/// is no failure: targets routinely exit between collection and
 	/// signalling, and the caller's policy is "best effort".
@@ -1746,33 +1830,36 @@ mod tests {
 		let _ = child.wait();
 	}
 
-	/// `started_ago` measures from the process's own start: this test
-	/// process started before the child it spawns, and the child's age is
-	/// about the time since its spawn (within the clock tick, and a margin
-	/// for a loaded machine).
+	/// `start_mark` names one process: the same process pinned twice has the
+	/// same mark, another process has another, and the mark is the kernel's
+	/// own start time (on Linux `/proc/<pid>/stat` field 22 after the boot
+	/// id), which no wall-clock step moves.
+	#[cfg(unix)]
 	#[test]
-	fn started_ago_tells_an_older_process_from_a_younger_one() {
-		let before = std::time::Instant::now();
-		let mut child = std::process::Command::new("sleep")
-			.arg("30")
-			.spawn()
-			.expect("spawn sleep");
+	fn start_mark_names_one_process() {
+		let mut child = crate::testkit::child::dies_with_this_process(
+			std::process::Command::new("/bin/sleep").arg("600"),
+		)
+		.spawn()
+		.expect("spawn sleep");
+		let pid = i32::try_from(child.id()).unwrap();
 		let me = Process::from_pid(i32::try_from(std::process::id()).unwrap()).expect("pin self");
-		let pinned = Process::from_pid(i32::try_from(child.id()).unwrap()).expect("pin the child");
-		let (my_age, child_age) = (me.started_ago(), pinned.started_ago());
-		let since_spawn = before.elapsed();
+		let (first, again) = (
+			Process::from_pid(pid).expect("pin the child"),
+			Process::from_pid(pid).expect("pin the child again"),
+		);
+		let marks = (first.start_mark(), again.start_mark(), me.start_mark());
 		let _ = child.kill();
 		let _ = child.wait();
-		let (my_age, child_age) = (my_age.expect("own age"), child_age.expect("child's age"));
-		assert!(
-			my_age >= child_age,
-			"the test process ({my_age:?}) is younger than its child ({child_age:?})"
-		);
-		let tick = Duration::from_millis(20);
-		assert!(
-			child_age <= since_spawn + tick,
-			"the child is {child_age:?} old {since_spawn:?} after the spawn began"
-		);
+		assert_eq!(marks.0, marks.1, "one process, one mark");
+		assert_ne!(marks.0, marks.2, "another process, another mark");
+		#[cfg(target_os = "linux")]
+		{
+			let stat = crate::sys::proc::read(pid).ok().flatten();
+			let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+			assert!(marks.0.starts_with(&format!("{}:", boot.trim())), "{marks:?}");
+			assert!(stat.is_none(), "the child is reaped");
+		}
 	}
 
 	/// A tree the walk cannot read (in a child test process with no
@@ -1786,13 +1873,13 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn kill_tree_kills_the_group_and_reports_a_walk_it_could_not_finish() {
-		use std::{io::BufRead as _, os::unix::process::CommandExt as _, time::Instant};
+		use std::{io::BufRead as _, os::unix::process::CommandExt as _};
 
 		use crate::sys::proc::short_of_descriptors;
 		for own_group in [true, false] {
 			let mut command = std::process::Command::new("/bin/sh");
 			command
-				.args(["-c", "sleep 30 & echo $!; wait"])
+				.args(["-c", "/bin/sleep 600 & echo $!; wait"])
 				.stdout(std::process::Stdio::piped());
 			if own_group {
 				command.process_group(0);
@@ -1805,26 +1892,21 @@ mod tests {
 			let sleep = Process::from_pid(line.trim().parse().unwrap()).expect("pin the sleep");
 			let test = "proctree::tests::kill_tree_with_no_descriptor_left";
 			let probed = short_of_descriptors::run(test, root.id());
-			// The root is the parent test's child: its status says who killed it.
-			let deadline = Instant::now() + Duration::from_secs(10);
-			let mut killed = None;
-			while killed.is_none() && Instant::now() < deadline {
-				killed = root.try_wait().unwrap();
+			// The root is the parent test's child: its status says who killed
+			// it. Waited for with no bound (the test runner's is the bound).
+			let killed = loop {
+				if let Some(status) = root.try_wait().unwrap() {
+					break status;
+				}
 				std::thread::sleep(Duration::from_millis(10));
-			}
-			while own_group && sleep.status() == ProcessStatus::Running && Instant::now() < deadline {
+			};
+			while own_group && sleep.status() == ProcessStatus::Running {
 				std::thread::sleep(Duration::from_millis(10));
 			}
 			let sleep_ran_on = sleep.status() == ProcessStatus::Running;
 			let _ = sleep.signal(KILL_SIGNAL);
-			if killed.is_none() {
-				let _ = root.kill();
-			}
-			// Reaps the root, or returns the status `try_wait` already reaped.
-			root.wait().unwrap();
 			probed.unwrap_or_else(|error| panic!("own group {own_group}: {error}"));
-			let killed_by =
-				killed.and_then(|status| std::os::unix::process::ExitStatusExt::signal(&status));
+			let killed_by = std::os::unix::process::ExitStatusExt::signal(&killed);
 			assert_eq!(killed_by, Some(KILL_SIGNAL), "own group {own_group}: the root was not killed");
 			if own_group {
 				assert!(
@@ -1833,6 +1915,48 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	/// Where the system provides no pidfd (`pidfd_open` gives `ENOSYS`
+	/// before Linux 5.3, or `EPERM` under a seccomp filter), a process is
+	/// pinned by its start time instead of being reported unpinnable: it
+	/// opens, `kill_tree` reads its tree whole and kills it, and it then reads
+	/// as exited, as with a pidfd.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn without_a_pidfd_a_process_is_pinned_by_its_start_time() {
+		use std::io::BufRead as _;
+
+		platform::NO_PIDFD.set(true);
+		let mut root = crate::testkit::child::dies_with_this_process(
+			std::process::Command::new("/bin/sh")
+				.args(["-c", "/bin/sleep 600 & echo $!; wait"])
+				.stdout(std::process::Stdio::piped()),
+		)
+		.spawn()
+		.unwrap();
+		let mut line = String::new();
+		std::io::BufReader::new(root.stdout.take().unwrap())
+			.read_line(&mut line)
+			.unwrap();
+		let sleep_pid: i32 = line.trim().parse().unwrap();
+		let pinned = Process::open(i32::try_from(root.id()).unwrap())
+			.expect("a missing pidfd is no error")
+			.expect("the root runs");
+		let sleep = Process::open(sleep_pid)
+			.expect("no error")
+			.expect("the sleep runs");
+		let killed = pinned.kill_tree(Some(KILL_SIGNAL));
+		let status = root.wait().unwrap();
+		while sleep.status() == ProcessStatus::Running {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		platform::NO_PIDFD.set(false);
+		assert!(killed.as_ref().is_ok_and(|&n| n >= 2), "{killed:?}");
+		let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+		assert_eq!(signal, Some(KILL_SIGNAL), "the root was killed");
+		assert_eq!(pinned.status(), ProcessStatus::Exited, "the reaped root reads as exited");
+		assert!(crate::sys::proc::ended(sleep_pid), "the sleep was killed");
 	}
 
 	/// Run by [`kill_tree_kills_the_group_and_reports_a_walk_it_could_not_finish`]

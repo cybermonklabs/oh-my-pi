@@ -78,7 +78,7 @@ use crate::{
 		Step, ToolCall, VprocSel,
 		store::{Key, MiscKey, Record},
 	},
-	host::{PiHost, SpawnObserver, term_grace},
+	host::{PiHost, SpawnObserver},
 	sys::OutputDecoding,
 	tools::{ToolCalls, ToolConfig},
 	vfs::VfsFs,
@@ -118,6 +118,11 @@ pub struct SessionConfig {
 	/// ([`RunOptions::text_capture`]); `None` is the platform default
 	/// ([`crate::output_decode::external_output_decoding`]).
 	pub output_decoding: Option<Arc<dyn OutputDecoding>>,
+	/// How long a cancelled run's externals have between TERM and KILL, and
+	/// [`Session::run_with`] between its TERM and its KILL of the run:
+	/// pi's [`TERM_GRACE`](crate::host::TERM_GRACE), or what this session
+	/// was given (a test that drives what happens inside the grace).
+	pub term_grace:      Duration,
 }
 
 /// One command of a [`Session`].
@@ -349,11 +354,13 @@ impl Wake for Bell {
 /// session's runtime (see the module docs), and state persists between them.
 pub struct Session {
 	/// Requests for the driver; `None` once the session is closed.
-	jobs:     Option<flume::Sender<Request>>,
+	jobs:       Option<flume::Sender<Request>>,
 	/// Rings the driver's bell.
-	waker:    Waker,
-	children: Children,
-	image:    LatestImage,
+	waker:      Waker,
+	children:   Children,
+	image:      LatestImage,
+	/// [`SessionConfig::term_grace`].
+	term_grace: Duration,
 }
 
 impl Session {
@@ -385,13 +392,13 @@ impl Session {
 	}
 
 	fn start(config: SessionConfig, image: Option<&Image>) -> Result<Self, SessionError> {
-		let SessionConfig { env, cwd, fs, vfs, runtime, output_decoding } = config;
+		let SessionConfig { env, cwd, fs, vfs, runtime, output_decoding, term_grace } = config;
 		let (jobs, rx) = flume::unbounded();
 		let children = Children::default();
 		let bell = Arc::new(Bell::default());
 		let waker = Waker::from(Arc::clone(&bell));
 		let tools = ToolConfig::from_env(&env, vfs.clone(), runtime.clone());
-		let mut host = PiHost::new(fs, runtime.clone());
+		let mut host = PiHost::new(fs, runtime.clone(), term_grace);
 		if output_decoding.is_some() {
 			host.set_output_decoding(output_decoding);
 		}
@@ -435,7 +442,7 @@ impl Session {
 			image: image.clone(),
 		};
 		runtime.spawn(driver.serve());
-		Ok(Self { jobs: Some(jobs), waker, children, image })
+		Ok(Self { jobs: Some(jobs), waker, children, image, term_grace })
 	}
 
 	/// The session's state as of its last command boundary; see
@@ -528,7 +535,7 @@ impl Session {
 			Some(r)
 		} else {
 			guard.raise(CancelLevel::TERM);
-			if let Ok(r) = tokio::time::timeout(term_grace(), &mut reply).await {
+			if let Ok(r) = tokio::time::timeout(self.term_grace, &mut reply).await {
 				Some(r)
 			} else {
 				guard.raise(CancelLevel::KILL);
@@ -868,6 +875,7 @@ mod tests {
 			vfs: None,
 			runtime: tokio::runtime::Handle::current(),
 			output_decoding: None,
+			term_grace: crate::host::TERM_GRACE,
 		})
 		.unwrap()
 	}
@@ -953,7 +961,11 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn trace_descriptor_wrappers_keep_thin_handles_and_shared_identity() {
 		use crate::bash::{CmdTag, FdFlags, FdRef, Host, RunId, StdFd, Vpid};
-		let mut host = PiHost::new(Box::new(StdFs::default()), tokio::runtime::Handle::current());
+		let mut host = PiHost::new(
+			Box::new(StdFs::default()),
+			tokio::runtime::Handle::current(),
+			crate::host::TERM_GRACE,
+		);
 		host.set_event_sink(Some(Arc::new(crate::bash::trace::RunTrace::new(""))));
 		let (_reader, writer) = io::pipe().unwrap();
 		host.streams().install(
@@ -1992,6 +2004,62 @@ mod tests {
 			 files"
 		);
 		assert_eq!(err.to_string(), said);
+	}
+
+	/// Without `/proc` (every read of `/proc/<pid>/stat` is `ENOENT`,
+	/// simulated) the shell cannot walk its own ancestors, so the guard has
+	/// nothing to check: a signal at any process but this one and its group
+	/// goes through, as in a shell without the guard.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn without_proc_the_guard_refuses_only_this_process() {
+		use crate::{host::check_signal_target, sys::proc::fail_reads};
+		let mut child = crate::testkit::child::dies_with_this_process(
+			std::process::Command::new("/bin/sleep").arg("600"),
+		)
+		.spawn()
+		.unwrap();
+		let pid = i32::try_from(child.id()).unwrap();
+		let me = i32::try_from(std::process::id()).unwrap();
+		let checked = {
+			let _absent = fail_reads(vec![(None, libc::ENOENT)]);
+			(check_signal_target(pid), check_signal_target(me), check_signal_target(0))
+		};
+		child.kill().unwrap();
+		child.wait().unwrap();
+		assert!(checked.0.is_ok(), "the sleep {pid}: {:?}", checked.0);
+		assert!(checked.1.is_err() && checked.2.is_err(), "this process and its group: {checked:?}");
+	}
+
+	/// With `/proc` mounted, an ancestor whose read fails with `ENOENT`
+	/// while a signal still reaches it (simulated for the shell's parent) is
+	/// unread, not gone: in our pid namespace that is a race with its exit or
+	/// a reuse of its pid, so every signal is refused, naming the pid and the
+	/// error.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn an_ancestor_read_enoent_while_proc_is_mounted_refuses_every_signal() {
+		use crate::{host::check_signal_target, sys::proc::fail_reads};
+		let mut child = crate::testkit::child::dies_with_this_process(
+			std::process::Command::new("/bin/sleep").arg("600"),
+		)
+		.spawn()
+		.unwrap();
+		let pid = i32::try_from(child.id()).unwrap();
+		// SAFETY: getppid has no preconditions.
+		let parent = unsafe { libc::getppid() };
+		let checked = {
+			let _unread = fail_reads(vec![(Some(parent), libc::ENOENT)]);
+			check_signal_target(pid)
+		};
+		child.kill().unwrap();
+		child.wait().unwrap();
+		let err = checked.expect_err("the signal went through while the parent was unread");
+		let said = format!(
+			"cannot read process {parent} to check it is not the shell's ancestor: No such file or \
+			 directory"
+		);
+		assert_eq!((err.kind(), err.to_string()), (io::ErrorKind::PermissionDenied, said));
 	}
 
 	/// [`crate::sys::proc::read`] proves a process out of reach only when no

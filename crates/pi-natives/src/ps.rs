@@ -101,16 +101,15 @@ impl Process {
 		self.inner.ppid()
 	}
 
-	/// How long ago this process started, in milliseconds: `null` when the
-	/// clock cannot be read. With a pid recorded together with the time its
-	/// process started, it tells that process (started no later) from one
-	/// that reused the pid (started after).
-	#[napi]
-	pub fn started_ago_ms(&self) -> Option<f64> {
-		self
-			.inner
-			.started_ago()
-			.map(|age| age.as_secs_f64() * 1_000.0)
+	/// The kernel's start mark of this process, read when it was pinned: on
+	/// Linux the boot id and the start in clock ticks since that boot
+	/// (`/proc/<pid>/stat` field 22); on macOS and Windows the start time the
+	/// kernel recorded. A pid recorded with its mark names that process
+	/// alone (one that reused the pid has another mark), whatever the wall
+	/// clock did since.
+	#[napi(getter)]
+	pub fn start_mark(&self) -> String {
+		self.inner.start_mark()
 	}
 
 	/// Launch arguments for this process.

@@ -12,7 +12,8 @@
 //! them ([`CallOutcome::TooLong`]), and they retry the line in halves, each
 //! with a `nohup` of its own, as GNU's retry a line whose `nohup` the system
 //! refused. A command it cannot run is reported as coreutils' `nohup`
-//! reports it: `nohup: failed to run command 'NAME': strerror`, status 126,
+//! reports it: `nohup: failed to run command NAME: strerror`, with `NAME`
+//! quoted as a shell word (GNU's `quoteaf`: `'a b'`, `"it's"`), status 126,
 //! or 127 when nothing is found (a `#!` interpreter included).
 
 use bstr::{BString, ByteSlice};
@@ -124,10 +125,17 @@ impl Nohup {
 		} else if let Some((status, text)) = self.child.cannot_run(&self.call) {
 			// coreutils' words and status (126; 127 when nothing is found).
 			if !std::mem::replace(&mut self.reported, true) {
-				let name = self.name.to_str_lossy();
+				let env = &self.call.env;
+				let name = pi_builtins::extras::gnu_quote_shell(
+					|var| {
+						env.get(var.as_bytes())
+							.and_then(|value| value.to_str().ok())
+					},
+					&self.name.to_str_lossy(),
+				);
 				self
 					.out
-					.push(2, format!("nohup: failed to run command '{name}': {text}\n"));
+					.push(2, format!("nohup: failed to run command {name}: {text}\n"));
 			}
 			CallOutcome::Exit(status)
 		} else {

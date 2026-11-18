@@ -524,12 +524,14 @@ export declare class Process {
   /** Parent process id for this process, when available. */
   get ppid(): number | null
   /**
-   * How long ago this process started, in milliseconds: `null` when the
-   * clock cannot be read. With a pid recorded together with the time its
-   * process started, it tells that process (started no later) from one
-   * that reused the pid (started after).
+   * The kernel's start mark of this process, read when it was pinned: on
+   * Linux the boot id and the start in clock ticks since that boot
+   * (`/proc/<pid>/stat` field 22); on macOS and Windows the start time the
+   * kernel recorded. A pid recorded with its mark names that process
+   * alone (one that reused the pid has another mark), whatever the wall
+   * clock did since.
    */
-  startedAgoMs(): number | null
+  get startMark(): string
   /** Launch arguments for this process. */
   args(): Array<string>
   /**

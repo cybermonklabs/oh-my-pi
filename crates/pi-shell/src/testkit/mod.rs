@@ -16,7 +16,6 @@ pub mod child;
 mod conformance;
 pub mod fault;
 pub mod golden;
-pub mod grace;
 mod host;
 mod memfs;
 mod rng;

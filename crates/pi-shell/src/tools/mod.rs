@@ -40,7 +40,7 @@ use bstr::{BStr, BString, ByteSlice};
 use parking_lot::Mutex;
 /// The environment variable with which a test fires the deadline of this
 /// session's `timeout` calls itself (see `timeout::Timeout::gate`).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use timeout::GATE_VAR as TIMEOUT_GATE_VAR;
 
 use crate::{
@@ -336,15 +336,12 @@ impl Tool {
 /// A tool's subshell: its run and label, and its status once it ended.
 #[derive(Default)]
 struct Child {
-	run:        Option<RunId>,
-	label:      u32,
-	status:     Option<i32>,
-	/// The subshell's `exec` the system refused, for a tool that hears of
-	/// it ([`Child::start`] with `reports`).
-	refusal:    Option<ExecRefusal>,
-	/// The command was neither found nor executable, so nothing ran: GNU's
-	/// status (127 or 126) and `strerror` text.
-	unrunnable: Option<(i32, String)>,
+	run:     Option<RunId>,
+	label:   u32,
+	status:  Option<i32>,
+	/// The subshell's `exec` the system refused, or that found nothing to
+	/// run, for a tool that hears of it ([`Child::start`] with `reports`).
+	refusal: Option<ExecRefusal>,
 }
 
 impl Child {
@@ -352,23 +349,26 @@ impl Child {
 	/// anywhere) in a subshell of the caller under a fresh label;
 	/// `redirect` is appended to the command (`>&2`).
 	///
-	/// With `reports` (`timeout`, `nohup`), a program the command names (no
-	/// function, no builtin) runs as a callout runs its programs: the
-	/// subshell `exec`s it, and a refusal of that `exec` ends the subshell
-	/// with [`Child::refusal`] instead of the shell's diagnostic, so the tool
+	/// With `reports` (`timeout`, `nohup`), a name that is no function and
+	/// no builtin is a program, which the subshell `exec`s: the shell's own
+	/// `exec` finds it, as it finds any command (its hash table, `PATH`,
+	/// `PATHEXT` on Windows; a name with a separator as written), and an
+	/// `exec` it refused or that found nothing ends the subshell with
+	/// [`Child::refusal`] instead of the shell's diagnostic, so the tool
 	/// reports a command it cannot run as GNU's does ([`Child::cannot_run`]),
 	/// or hands a line too long up to a caller that retries it
-	/// ([`ToolCall::too_long_to_caller`], [`CallOutcome::TooLong`]). A name
-	/// that finds nothing to run starts no subshell
-	/// ([`Child::unrunnable`]). A builtin that hands such a refusal up itself
-	/// (`env` under `timeout` under `xargs`) runs as `"$@"` and is heard of
-	/// the same way.
+	/// ([`ToolCall::too_long_to_caller`], [`CallOutcome::TooLong`]). That
+	/// subshell stands for the program, as a callout's does
+	/// ([`Script::as_program`]): neither `set -x` nor the caller's DEBUG, ERR
+	/// or RETURN traps see its words. A builtin that hands such a refusal up
+	/// itself (`env` under `timeout` under `xargs`) runs as `"$@"` and is
+	/// heard of the same way.
 	fn start(
 		&mut self,
 		api: &mut ShellApi<'_, '_>,
 		turn: &mut Turn<'_>,
 		call: &ToolCall,
-		mut argv: Vec<BString>,
+		argv: Vec<BString>,
 		detached: bool,
 		redirect: &str,
 		reports: bool,
@@ -376,40 +376,22 @@ impl Child {
 		self.label = turn.labels.fresh(api.lineage().label);
 		self.status = None;
 		self.refusal = None;
-		self.unrunnable = None;
-		let mut source = Vec::new();
-		let (mut too_long_to_host, mut refusals_to_host) = (false, false);
-		if reports && !argv.is_empty() && !api.has_function(argv[0].as_bstr()) {
-			let command = pi_builtins::extras::ShellCommand::new(
-				argv
-					.iter()
-					.map(|arg| arg.to_os_str_lossy().into_owned())
-					.collect(),
-			);
-			match extra::Lookup::for_call(call, turn.config).program(&command) {
-				Ok(extra::Program::Path { path, skip }) => {
-					extra::exec_source(&mut source, &mut argv, &path, skip, None);
-					source.extend_from_slice(redirect.as_bytes());
-					(too_long_to_host, refusals_to_host) = (true, true);
-				},
-				Ok(program) => {
-					too_long_to_host = call.too_long_to_caller && program.hands_up_too_long(&argv[0]);
-				},
-				Err(error) => {
-					let status = if error.kind() == io::ErrorKind::NotFound {
-						127
-					} else {
-						126
-					};
-					self.unrunnable = Some((status, crate::bash::diag::strerror(&error).into_owned()));
-					self.status = Some(status);
-					self.run = None;
-					return;
-				},
+		let (mut too_long_to_host, mut refusals_to_host, mut as_program) = (false, false, false);
+		let mut source = format!("\"$@\"{redirect}").into_bytes();
+		// A function runs as `"$@"`, as anywhere.
+		if reports
+			&& let Some(name) = argv.first()
+			&& !api.has_function(name.as_bstr())
+		{
+			if extra::Lookup::for_call(call, turn.config).builtin(&name.to_os_str_lossy()) {
+				too_long_to_host = call.too_long_to_caller
+					&& extra::Program::Builtin.hands_up_too_long(name.as_bytes());
+			} else {
+				// Quoted, so no alias applies; `builtin`, so no function named
+				// `exec` runs.
+				source = format!("\\builtin exec -- \"$@\"{redirect}").into_bytes();
+				(too_long_to_host, refusals_to_host, as_program) = (true, true, true);
 			}
-		}
-		if source.is_empty() {
-			source = format!("\"$@\"{redirect}").into_bytes();
 		}
 		let mut script = Script::command(source);
 		script.args = Some(argv);
@@ -421,6 +403,7 @@ impl Child {
 			.collect();
 		script.too_long_to_host = too_long_to_host;
 		script.refusals_to_host = refusals_to_host;
+		script.as_program = as_program;
 		let lineage = Lineage { label: self.label, detached };
 		// `nohup` (the detached tool) execs its operand: its subshell stands
 		// for the command, so `$!` of `nohup cmd &` is the program's pid.
@@ -454,14 +437,11 @@ impl Child {
 			.map(|refusal| refusal.errno)
 	}
 
-	/// The command could not run (nothing found, nothing executable, or the
-	/// system refused its `exec` for any reason but a line too long handed
-	/// up): GNU's status (127 for `ENOENT`, else 126) and `strerror` text,
-	/// which `timeout` and `nohup` print as `failed to run command`.
+	/// The command could not run (the shell's `exec` found nothing, or the
+	/// system refused it for any reason but a line too long handed up):
+	/// GNU's status (127 for `ENOENT`, else 126) and `strerror` text, which
+	/// `timeout` and `nohup` print as `failed to run command`.
 	fn cannot_run(&self, call: &ToolCall) -> Option<(i32, String)> {
-		if let Some(unrunnable) = &self.unrunnable {
-			return Some(unrunnable.clone());
-		}
 		let refusal = self.refusal.filter(|_| self.too_long(call).is_none())?;
 		let error = io::Error::from_raw_os_error(refusal.errno);
 		let status = if error.kind() == io::ErrorKind::NotFound {

@@ -1613,13 +1613,20 @@ async fn embedded_external_command_runs_in_its_own_session() {
 	);
 }
 
+/// A shell whose cancel grace is long ([`ShellOptions::cancel_grace`]), so a
+/// test decides when what runs inside the grace is done, not the host.
+#[cfg(unix)]
+fn shell_with_a_long_grace() -> Shell {
+	Shell::new(Some(ShellOptions {
+		cancel_grace: Some(crate::testkit::child::LIFETIME),
+		..Default::default()
+	}))
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() {
 	let _guard = shell_test_lock().lock().await;
-	// The trap takes as long as the test keeps it: the graces are long, so
-	// nothing of this test races them (`testkit::grace`).
-	let _graces = crate::testkit::grace::Longer::than(crate::testkit::child::LIFETIME);
 	let root = tempfile::tempdir().expect("cleanup directory");
 	let script = root.path().join("cleanup.sh");
 	// The trap says it started, waits for the test's release, then writes.
@@ -1629,7 +1636,8 @@ async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() 
 		 exit 0' TERM\n: > ready\nwhile :; do :; done\n",
 	)
 	.expect("cleanup script");
-	let shell = Shell::new(None);
+	// The trap takes as long as the test keeps it, inside a long grace.
+	let shell = shell_with_a_long_grace();
 	let mut cancel = CancelToken::default();
 	let abort = cancel.emplace_abort_token();
 	let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
@@ -1663,10 +1671,6 @@ async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 	let _guard = shell_test_lock().lock().await;
-	// The readers stay open for the grace after the cancel, and the TERM
-	// grace lets the trap finish: both are long here, so the trap writes
-	// when the test releases it, not inside a window it has to beat.
-	let _graces = crate::testkit::grace::Longer::than(crate::testkit::child::LIFETIME);
 	let root = tempfile::tempdir().expect("cleanup directory");
 	fs::write(
 		root.path().join("cleanup.sh"),
@@ -1674,7 +1678,10 @@ async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 		 cleaned > cleaned; exit 0' TERM\n: > ready\nwhile :; do :; done\n",
 	)
 	.expect("cleanup script");
-	let shell = Shell::new(None);
+	// The readers stay open for the grace after the cancel, and the TERM
+	// grace lets the trap finish: both are long here, so the trap writes
+	// when the test releases it, not inside a window it has to beat.
+	let shell = shell_with_a_long_grace();
 	let mut cancel = CancelToken::default();
 	let abort = cancel.emplace_abort_token();
 	let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
@@ -1703,6 +1710,67 @@ async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 		fs::read_to_string(root.path().join("cleaned")).expect("TERM cleanup after writing output"),
 		"cleaned"
 	);
+}
+
+/// One shell's cancel grace is its own: while a shell with a long grace
+/// waits out a TERM trap the test holds, another shell with pi's grace
+/// cancels a run whose `sleep` ignores TERM, and the `sleep` ends, killed
+/// after pi's 1 s grace. A grace that reached across shells would leave it
+/// running for the long one, and the test runner would fail the test. (The
+/// run itself returns either way, after the shell's own wait for its task.)
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_cancel_grace_is_one_shells_own() {
+	let _guard = shell_test_lock().lock().await;
+	let root = tempfile::tempdir().expect("scratch directory");
+	fs::write(
+		root.path().join("held.sh"),
+		"trap ': > trapped; while [ ! -e release ]; do sleep 0.01; done; exit 0' TERM\n: > \
+		 ready\nwhile :; do :; done\n",
+	)
+	.expect("held script");
+	let run = |shell: Shell, command: String, cancel: CancelToken| {
+		let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+		tokio::spawn(async move {
+			shell
+				.run(ShellRunOptions { command, cwd: Some(cwd), ..Default::default() }, None, cancel)
+				.await
+		})
+	};
+	let mut long_cancel = CancelToken::default();
+	let long_abort = long_cancel.emplace_abort_token();
+	let long = run(shell_with_a_long_grace(), "sh held.sh".into(), long_cancel);
+	exists(&root.path().join("ready")).await;
+	long_abort.abort(AbortReason::Signal);
+	exists(&root.path().join("trapped")).await;
+	// The long grace is in force now.
+	let mut short_cancel = CancelToken::default();
+	let short_abort = short_cancel.emplace_abort_token();
+	let pidfile = root.path().join("sleep.pid");
+	let command = format!(
+		"trap '' TERM; /bin/sleep {} & echo $! > {}; wait",
+		crate::testkit::child::LIFETIME.as_secs(),
+		pidfile.display()
+	);
+	let short = run(Shell::new(None), command, short_cancel);
+	let pid = loop {
+		if let Some(pid) = fs::read_to_string(&pidfile)
+			.ok()
+			.and_then(|text| text.trim().parse::<i32>().ok())
+		{
+			break pid;
+		}
+		time::sleep(Duration::from_millis(10)).await;
+	};
+	short_abort.abort(AbortReason::Signal);
+	let short = short.await.expect("run task").expect("shell result");
+	// Only KILL ends the `sleep`; waits as long as that takes.
+	while !crate::sys::proc::ended(pid) {
+		time::sleep(Duration::from_millis(20)).await;
+	}
+	fs::write(root.path().join("release"), "").expect("release the trap");
+	let long = long.await.expect("run task").expect("shell result");
+	assert!(short.cancelled && long.cancelled, "{short:?} {long:?}");
 }
 
 /// A cancelled run whose child exits on TERM returns as soon as the child

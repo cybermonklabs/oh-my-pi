@@ -194,12 +194,13 @@ describe("daemon broker with a detached daemon it cannot pin", () => {
 
 /**
  * The non-detached daemon of a previous broker that died without stopping it, recorded as running
- * since `startedAt`: here a process of its own session (as the broker spawns daemons) that the test
- * starts now, recovered under a fresh broker whose pin of it fails while `pinnable.now` is false
- * (when the broker recovers, `pinnable.now` is `pinnableAtRecovery`).
+ * with the start mark `recordedStart` gives for it (its own, or another process's): here a process
+ * of its own session (as the broker spawns daemons) that the test starts now, recovered under a
+ * fresh broker whose pin of it fails while `pinnable.now` is false (when the broker recovers,
+ * `pinnable.now` is `pinnableAtRecovery`). It sleeps past the test runner's bound.
  */
 async function withRecoveredOrphan(
-	startedAt: (now: number) => number,
+	recordedStart: (orphanMark: string) => string,
 	pinnableAtRecovery: boolean,
 	body: (broker: Broker, orphan: Bun.Subprocess) => Promise<void>,
 ): Promise<void> {
@@ -208,15 +209,17 @@ async function withRecoveredOrphan(
 	const runtimeDir = path.join(tempDir.path(), "runtime");
 	await fs.mkdir(projectDir);
 	const previousTitle = process.title;
-	const recordedStart = startedAt(Date.now());
-	const orphan = Bun.spawn(["sleep", "30"], { detached: true, stdio: ["ignore", "ignore", "ignore"] });
+	const now = Date.now();
+	const orphan = Bun.spawn(["sleep", "600"], { detached: true, stdio: ["ignore", "ignore", "ignore"] });
+	const orphanMark = Process.fromPid(orphan.pid)?.startMark;
+	if (orphanMark === undefined) throw new Error("the orphan cannot be pinned");
 	const dir = path.join(runtimeDir, "daemons", NAME);
 	await Bun.write(
 		path.join(dir, "spec.json"),
 		JSON.stringify({
 			name: NAME,
 			application: "sleep",
-			args: ["30"],
+			args: ["600"],
 			env: {},
 			cwd: projectDir,
 			pty: false,
@@ -233,8 +236,9 @@ async function withRecoveredOrphan(
 				id: NAME,
 				state: "running",
 				pid: orphan.pid,
-				createdAt: recordedStart,
-				startedAt: recordedStart,
+				processStart: recordedStart(orphanMark),
+				createdAt: now,
+				startedAt: now,
 				restartCount: 0,
 				outputBytes: 0,
 				persist: true,
@@ -268,7 +272,7 @@ const REAPED: { state: DaemonSnapshot["state"]; pid: number | undefined; exitRea
 describe("daemon broker with a non-detached daemon of a previous broker it cannot pin", () => {
 	it("keeps the record, kills nothing by pid, and kills the daemon through the pin once it pins", async () => {
 		await withRecoveredOrphan(
-			now => now,
+			own => own,
 			false,
 			async (broker, orphan) => {
 				// Recovery could not pin the daemon it must kill: the record stays, running, and
@@ -285,14 +289,16 @@ describe("daemon broker with a non-detached daemon of a previous broker it canno
 		);
 	}, 20_000);
 
-	it("kills no process that took the pid after the recorded daemon started", async () => {
-		// The record says its daemon started a minute ago; the process holding its pid started
-		// now, so it is another process that reused the pid: the daemon is gone, and its record is
+	it("kills no process that took the pid after the recorded daemon", async () => {
+		// The record names the start mark of another process (the test's own) than the one now
+		// holding its pid, so that one reused the pid: the daemon is gone, and its record is
 		// reaped without a kill, whether recovery pins the process or a later refresh does.
+		const another = Process.fromPid(process.pid)?.startMark;
+		if (another === undefined) throw new Error("the test process cannot be pinned");
 		const outcomes: unknown[] = [];
 		for (const pinnableAtRecovery of [true, false]) {
 			await withRecoveredOrphan(
-				now => now - 60_000,
+				() => another,
 				pinnableAtRecovery,
 				async (broker, orphan) => {
 					broker.pinnable.now = true;

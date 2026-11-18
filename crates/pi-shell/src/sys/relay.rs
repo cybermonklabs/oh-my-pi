@@ -505,6 +505,7 @@ mod tests {
 			vfs: None,
 			runtime: tokio::runtime::Handle::current(),
 			output_decoding,
+			term_grace: crate::host::TERM_GRACE,
 		})
 		.unwrap()
 	}

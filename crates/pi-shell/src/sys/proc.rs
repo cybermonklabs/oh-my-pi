@@ -15,6 +15,21 @@ use bstr::BString;
 
 use crate::bash::{Platform, Signal};
 
+/// Makes this thread's reads of `/proc/<pid>/stat` fail with `errno`, for
+/// `pid` (`None`: every pid), until the guard is dropped: `/proc` absent, or
+/// one process's read refused, simulated.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn fail_reads(fails: Vec<(Option<i32>, i32)>) -> impl Drop {
+	struct Restore;
+	impl Drop for Restore {
+		fn drop(&mut self) {
+			sys::FAIL_READS.with_borrow_mut(Vec::clear);
+		}
+	}
+	sys::FAIL_READS.set(fails);
+	Restore
+}
+
 /// One process of the table.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProcInfo {
@@ -154,15 +169,6 @@ pub fn running(pid: i32) -> bool {
 /// the second guarantee).
 pub fn now() -> io::Result<u64> {
 	sys::now()
-}
-
-/// How long ago a process whose [`ProcInfo::start`] is `start` started.
-///
-/// By [`now`]: on Linux to the clock tick (10 ms on most systems), on macOS
-/// to the µs. A start mark later than `now` (a step back of macOS's wall
-/// clock) is no time ago.
-pub fn age(start: u64) -> io::Result<std::time::Duration> {
-	sys::age(now()?.saturating_sub(start))
 }
 
 /// Processes whose session is `sid`, excluding the caller.
@@ -326,9 +332,27 @@ mod sys {
 		read(pid).ok()
 	}
 
+	#[cfg(test)]
+	thread_local! {
+		/// Reads of `/proc/<pid>/stat` on this thread fail with the paired
+		/// `errno`, for that pid (`None`: every pid): `/proc` absent, or one
+		/// process's read refused, without the kernel's help.
+		pub(crate) static FAIL_READS: std::cell::RefCell<Vec<(Option<i32>, i32)>> =
+			const { std::cell::RefCell::new(Vec::new()) };
+	}
+
 	/// `/proc/<pid>/stat`, parsed; `InvalidData` for a line that does not
 	/// parse.
 	pub(super) fn read(pid: i32) -> io::Result<ProcInfo> {
+		#[cfg(test)]
+		if let Some(errno) = FAIL_READS.with_borrow(|fails| {
+			fails
+				.iter()
+				.find(|(at, _)| at.is_none_or(|at| at == pid))
+				.map(|&(_, errno)| errno)
+		}) {
+			return Err(io::Error::from_raw_os_error(errno));
+		}
 		let mut file = fs::File::open(format!("/proc/{pid}/stat"))?;
 		// The kernel hands over the whole line in one read when it fits (52
 		// numbers and a name of at most 64 bytes do); `fs::read` grows from
@@ -358,18 +382,6 @@ mod sys {
 		Ok((ns * hz / 1_000_000_000) as u64)
 	}
 
-	/// `ticks` clock ticks as a duration.
-	pub fn age(ticks: u64) -> io::Result<std::time::Duration> {
-		// SAFETY: plain call without pointer arguments.
-		let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-		let hz = u128::try_from(hz)
-			.ok()
-			.filter(|&hz| hz > 0)
-			.ok_or_else(io::Error::last_os_error)?;
-		let nanos = u128::from(ticks) * 1_000_000_000 / hz;
-		Ok(std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)))
-	}
-
 	fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
 		// SAFETY: pidfd_open takes scalar arguments and returns a new fd.
 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -384,8 +396,9 @@ mod sys {
 		let pidfd = match pidfd_open(p.pid) {
 			Ok(fd) => Some(fd),
 			Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
-			// Kernels before 5.3: fall back to a start-time recheck.
-			Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
+			// No pidfd from this system (kernels before 5.3: `ENOSYS`; a seccomp
+			// or LSM filter: `EPERM`): fall back to a start-time recheck.
+			Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => None,
 			Err(e) => return Err(e),
 		};
 		// With the pidfd open the pid cannot be reused for another process
@@ -536,12 +549,6 @@ mod sys {
 			.duration_since(std::time::UNIX_EPOCH)
 			.map_err(io::Error::other)?;
 		Ok(since.as_micros() as u64)
-	}
-
-	/// `micros` µs as a duration.
-	#[expect(clippy::unnecessary_wraps, reason = "mirrors Linux's, which reads the clock tick")]
-	pub const fn age(micros: u64) -> io::Result<std::time::Duration> {
-		Ok(std::time::Duration::from_micros(micros))
 	}
 
 	pub fn signal_pinned(p: &ProcInfo, sig: i32) -> io::Result<bool> {

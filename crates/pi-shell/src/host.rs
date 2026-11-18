@@ -38,14 +38,9 @@ use crate::{
 mod urls;
 
 /// Time between TERM and KILL when a running external is abandoned (a cancel
-/// unwinds the command that waits for it): pi's `TERM_GRACE`.
+/// unwinds the command that waits for it): pi's `TERM_GRACE`, the default of
+/// [`SessionConfig::term_grace`](crate::session::SessionConfig::term_grace).
 pub const TERM_GRACE: Duration = Duration::from_secs(1);
-
-/// [`TERM_GRACE`], unless a test widened it
-/// ([`crate::testkit::grace::Longer`]).
-pub(crate) fn term_grace() -> Duration {
-	crate::testkit::grace::or(TERM_GRACE, &crate::testkit::grace::TERM)
-}
 
 /// Told about every external a [`PiHost`] spawns, from the engine thread.
 ///
@@ -437,18 +432,18 @@ impl PiHost {
 	/// A host over `fs` whose timers run on `runtime`.
 	///
 	/// Externals lead their own sessions; one abandoned while running (a
-	/// cancel) gets TERM, then KILL after [`TERM_GRACE`].
-	pub fn new(fs: Box<dyn Fs + Send>, runtime: tokio::runtime::Handle) -> Self {
+	/// cancel) gets TERM, then KILL after `grace` ([`TERM_GRACE`] for pi).
+	pub fn new(fs: Box<dyn Fs + Send>, runtime: tokio::runtime::Handle, grace: Duration) -> Self {
 		Self {
 			fs,
 			launcher: Launcher {
 				spawner:  NativeSpawner::new(SpawnConfig {
-					grace:    term_grace(),
+					grace,
 					sessions: Sessions::Detach,
 					// The session driver is an async task: exits wake its waker
 					// from waiter threads.
-					exits:    Exits::Thread,
-					umask:    None,
+					exits: Exits::Thread,
+					umask: None,
 				}),
 				streams:  StdStreams::default(),
 				observer: None,
@@ -805,16 +800,20 @@ impl crate::bash::Host for PiHost {
 /// cached: a recycled pid of an ancestor that exited is not protected.
 ///
 /// The walk up fails closed: an ancestor that cannot be read for a reason
-/// that proves nothing ([`crate::sys::proc::read`]: no descriptor left, say)
-/// refuses every signal the ancestors read so far do not already refuse,
-/// since the target may be one above it. One that exited, or another
-/// user's, ends the walk: no signal of ours reaches it.
+/// that proves nothing ([`crate::sys::proc::read`]: no descriptor left, an
+/// `ENOENT` while it still exists, say) refuses every signal the ancestors
+/// read so far do not already refuse, since the target may be one above
+/// it. One that exited, or another user's, ends the walk: no signal of ours
+/// reaches it. Without `/proc` (this process's own entry is `ENOENT`: none
+/// is mounted, or a sandbox hides it) there is no chain to walk: only this
+/// process and its group are refused, as in a shell without the guard; the
+/// guard needs a mounted `/proc`.
 ///
 /// # Errors
 ///
 /// `PermissionDenied` for a protected target, or for any target while an
 /// ancestor cannot be read (`cannot read process N to check it is not the
-/// shell's ancestor: …`).
+/// shell's ancestor: strerror`).
 pub fn check_signal_target(pid: i32) -> io::Result<()> {
 	let refused = || {
 		// pi's wording (`kill: (PID) - refusing to signal the shell process`).
@@ -855,6 +854,8 @@ fn protected_processes() -> (Vec<(i32, i32)>, Option<io::Error>) {
 	// process read by `getppid`: its parent is no recycled pid).
 	let (mut pid, mut ppid, mut start) = match proc::read(me) {
 		Ok(Some(own)) => (me, own.ppid, Some(own.start)),
+		// No `/proc`: nothing above this process can be read.
+		Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return (chain, None),
 		// SAFETY: getppid has no preconditions.
 		Ok(None) | Err(_) => (me, unsafe { libc::getppid() }, None),
 	};

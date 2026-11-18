@@ -810,9 +810,11 @@ impl Activation {
 				for index in 0..application_pids.len() {
 					let mut current = application_pids[index];
 					for _ in 0..64 {
-						let Ok(stat) = fs::read_to_string(format!("/proc/{current}/stat")) else {
+						// Bytes: a name that is no UTF-8 must not end the walk.
+						let Ok(stat) = fs::read(format!("/proc/{current}/stat")) else {
 							break;
 						};
+						let stat = String::from_utf8_lossy(&stat);
 						let Some((_, fields)) = stat.rsplit_once(')') else {
 							break;
 						};

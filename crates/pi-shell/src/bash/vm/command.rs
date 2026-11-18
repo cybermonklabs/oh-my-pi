@@ -2222,6 +2222,22 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				Ok(ProbeResult::Stat(Some(st))) => st.kind == StatKind::Dir,
 				Ok(_) => false,
 			};
+			// A tool that reports what it cannot run (`timeout`, `nohup`) hears
+			// of it as `execvp` would fail: `ENOENT`, or `EACCES` for a
+			// directory, with no diagnostic.
+			#[cfg(unix)]
+			if refusals_to_host(vp) {
+				let errno = if dir { libc::EACCES } else { libc::ENOENT };
+				if let Some(run) = vp.runs.front() {
+					k.exec_refusals
+						.insert(run.id, super::ExecRefusal { errno, too_long: false });
+				}
+				let s = st(vp);
+				s.status = if dir { 126 } else { 127 };
+				s.stage = Stage::Output;
+				exec_failed(k, cx, vp);
+				return None;
+			}
 			let (msg, status) = if dir {
 				(format!("{name}: cannot execute: Is a directory"), 126)
 			} else {
@@ -2650,13 +2666,26 @@ fn refusal_to_host(
 	if !matches!(st(vp).control, Some(Transfer::Exec)) {
 		return None;
 	}
-	let run = vp.runs.front().filter(|run| run.too_long_to_host)?;
+	vp.runs.front().filter(|run| run.too_long_to_host)?;
 	if refused_as_too_long(err, path, argv, &vp.cwd) {
 		return Some(true);
 	}
 	let refused =
-		run.refusals_to_host && err.raw_os_error().is_some() && !is_enoexec(err) && cfg!(unix);
+		refusals_to_host(vp) && err.raw_os_error().is_some() && !is_enoexec(err) && cfg!(unix);
 	refused.then_some(false)
+}
+
+/// Whether the run `vp`'s `exec` replaces was submitted with
+/// [`Script::refusals_to_host`](crate::bash::Script::refusals_to_host)
+/// (and [`Script::too_long_to_host`](crate::bash::Script::too_long_to_host)),
+/// for the `exec` itself: its host hears of any refusal of it, and of an
+/// `exec` that found nothing.
+fn refusals_to_host(vp: &mut Vproc) -> bool {
+	matches!(st(vp).control, Some(Transfer::Exec))
+		&& vp
+			.runs
+			.front()
+			.is_some_and(|run| run.too_long_to_host && run.refusals_to_host)
 }
 
 /// Whether `err`, the failure to start the program at `path` with the

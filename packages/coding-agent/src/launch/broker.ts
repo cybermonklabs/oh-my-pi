@@ -136,7 +136,7 @@ interface ManagedDaemon {
  */
 interface PendingKill {
 	/** The daemon process to kill, as recorded when the kill was asked. */
-	target: { pid: number; startedAt: number };
+	target: { pid: number; processStart?: string };
 	/** The generation whose record settles once the daemon is gone. */
 	generation: number;
 	gracefulMs: number;
@@ -166,43 +166,34 @@ function settledState(state: DaemonSnapshot["state"]): boolean {
 	return terminalState(state) || state === "restarting";
 }
 
-/**
- * How far after the recorded `startedAt` (a wall clock read just before the
- * spawn) the daemon's own start may read: Linux counts process starts in
- * clock ticks (10 ms), and the broker's wall clock and the kernel's process
- * clock drift apart by little. A process that reused the daemon's pid started
- * after the daemon exited.
- */
-const START_SLACK_MS = 2_000;
-
 /** What the daemon process of a snapshot is now (see {@link pinDaemon}). */
 type DaemonPin =
 	/** The daemon, running and pinned: a kill through `process` reaches it alone. */
 	| { kind: "pinned"; process: Process }
 	/** Running (signal 0 reaches its pid), but not pinnable now: kill nothing by its pid. */
 	| { kind: "unpinned" }
-	/** Exited, or its pid now names a process that started after the daemon. */
+	/** Exited, or its pid now names another process (a start mark not the daemon's). */
 	| { kind: "gone" };
 
 /**
- * Pins the daemon process `target.pid` that started at `target.startedAt` (a
- * snapshot, or the target of a pending kill). `Process.fromPid` gives `null`
- * both for a process that is gone and for one it cannot pin (no descriptor
- * left, `pidfd_open` blocked), so a failed pin proves nothing: `kill(pid, 0)`
- * asks the kernel (`EPERM` is another user's process holding the number, never
- * the daemon this broker started). A pinned process that started more than
- * {@link START_SLACK_MS} after `startedAt` reused the pid: the daemon is gone.
- * When the start cannot be read, the pin is trusted.
+ * Pins the daemon process `target.pid` whose start mark is `target.processStart` (a snapshot,
+ * or the target of a pending kill). `Process.fromPid` gives `null` both for a process that is
+ * gone and for one it cannot pin now (no descriptor left), so a failed pin proves nothing:
+ * `kill(pid, 0)` asks the kernel (`EPERM` is another user's process holding the number, never
+ * the daemon this broker started). A pinned process whose start mark is not the recorded one
+ * reused the pid: the daemon is gone. The mark is the kernel's own (`Process.startMark`), so no
+ * clock is compared and a step of the wall clock changes nothing. Without a recorded mark
+ * (a record from an older broker), the pin is trusted.
  */
-function pinDaemon(target: { pid?: number; startedAt: number }): DaemonPin {
+function pinDaemon(target: { pid?: number; processStart?: string }): DaemonPin {
 	const pid = target.pid;
 	if (pid === undefined) return { kind: "gone" };
 	const processRef = Process.fromPid(pid);
 	if (processRef) {
 		if (processRef.status() !== "running") return { kind: "gone" };
-		const startedAgo = processRef.startedAgoMs();
-		const started = startedAgo === null ? undefined : Date.now() - startedAgo;
-		if (started !== undefined && started > target.startedAt + START_SLACK_MS) return { kind: "gone" };
+		if (target.processStart !== undefined && processRef.startMark !== target.processStart) {
+			return { kind: "gone" };
+		}
 		return { kind: "pinned", process: processRef };
 	}
 	try {
@@ -211,6 +202,42 @@ function pinDaemon(target: { pid?: number; startedAt: number }): DaemonPin {
 	} catch {
 		return { kind: "gone" };
 	}
+}
+
+/** The start mark of the process `pid` this broker just spawned, or `undefined` when it cannot be read. */
+function startMarkOf(pid: number | undefined): string | undefined {
+	return pid === undefined ? undefined : (Process.fromPid(pid)?.startMark ?? undefined);
+}
+
+/**
+ * `process.killTree(signal)` of a daemon's tree. A walk that could not read the whole tree (no
+ * descriptor left) already signalled what it read and the process group the daemon leads: it is
+ * logged, and the request it serves does not fail on it.
+ */
+function signalDaemonTree(process: Process, signal: number, name: string): void {
+	try {
+		process.killTree(signal);
+	} catch (error) {
+		logger.warn("Daemon signalled, but part of its process tree could not be read", {
+			name,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/** `process.terminate` of a daemon's tree, going on past a walk it could not finish ({@link signalDaemonTree}). */
+async function terminateDaemonTree(
+	process: Process,
+	gracefulMs: number,
+	timeoutMs: number,
+	name: string,
+): Promise<void> {
+	await process.terminate({ group: true, gracefulMs, timeoutMs }).catch(error => {
+		logger.warn("Daemon stopped, but part of its process tree could not be read", {
+			name,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	});
 }
 
 function publishesCompletionOwners(request: DaemonWireRequest): boolean {
@@ -246,6 +273,7 @@ function orderDaemonsForListing(snapshots: DaemonSnapshot[]): DaemonSnapshot[] {
 function reapRecoveredSnapshot(snapshot: DaemonSnapshot, now: number): boolean {
 	if (terminalState(snapshot.state)) return false;
 	snapshot.pid = undefined;
+	snapshot.processStart = undefined;
 	snapshot.state = "exited";
 	snapshot.exitedAt = now;
 	snapshot.exitReason = "previous broker exited";
@@ -872,6 +900,7 @@ class DaemonBroker {
 		record.snapshot.exitCode = undefined;
 		record.snapshot.exitReason = undefined;
 		record.snapshot.pid = undefined;
+		record.snapshot.processStart = undefined;
 		record.snapshot.readyMatch = undefined;
 		record.logReady = !record.spec.ready?.log;
 		record.portReady = record.spec.ready?.port === undefined;
@@ -971,6 +1000,7 @@ class DaemonBroker {
 		const pid = await started.promise;
 		if (pid !== undefined && generation === record.generation) {
 			record.snapshot.pid = pid;
+			record.snapshot.processStart = startMarkOf(pid);
 			this.#persist(record);
 		}
 	}
@@ -987,6 +1017,7 @@ class DaemonBroker {
 		record.process = process;
 		record.input = process.stdin;
 		record.snapshot.pid = process.pid;
+		record.snapshot.processStart = startMarkOf(process.pid);
 		this.#persist(record);
 		const stdout = this.#drain(record, generation, process.stdout);
 		const stderr = this.#drain(record, generation, process.stderr);
@@ -1009,6 +1040,7 @@ class DaemonBroker {
 			});
 			record.process = process;
 			record.snapshot.pid = process.pid;
+			record.snapshot.processStart = startMarkOf(process.pid);
 			this.#persist(record);
 			process.unref();
 			void process.exited
@@ -1122,14 +1154,7 @@ class DaemonBroker {
 		const pin = pinDaemon(pending.target);
 		if (pin.kind === "unpinned") return current();
 		if (pin.kind === "pinned") {
-			await pin.process
-				.terminate({ group: true, gracefulMs: pending.gracefulMs, timeoutMs: pending.timeoutMs })
-				.catch(error => {
-					logger.warn("Failed to stop daemon through its pin", {
-						name: record.snapshot.name,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				});
+			await terminateDaemonTree(pin.process, pending.gracefulMs, pending.timeoutMs, record.snapshot.name);
 			if (pin.process.status() === "running") return current();
 		}
 		const at = record.pendingKills.indexOf(pending);
@@ -1221,6 +1246,7 @@ class DaemonBroker {
 		record.input = undefined;
 		record.pty = undefined;
 		record.snapshot.pid = undefined;
+		record.snapshot.processStart = undefined;
 		record.snapshot.exitedAt = Date.now();
 		record.snapshot.exitCode = exitCode;
 		record.snapshot.exitReason = error;
@@ -1423,7 +1449,7 @@ class DaemonBroker {
 					throw new Error(`Daemon ${operation.name} runs, but cannot be pinned to signal it now`);
 				}
 				if (pin.kind === "gone") throw new Error(`Daemon ${operation.name} process is unavailable`);
-				pin.process.killTree(SIGNAL_NUMBER[operation.signal]);
+				signalDaemonTree(pin.process, SIGNAL_NUMBER[operation.signal], operation.name);
 			}
 		}
 		return { op: "send", daemon: record.snapshot };
@@ -1446,7 +1472,7 @@ class DaemonBroker {
 		this.#persist(record);
 		const pin = pinDaemon(record.snapshot);
 		if (pin.kind === "pinned") {
-			await pin.process.terminate({ group: true, gracefulMs: timeoutMs, timeoutMs: timeoutMs + 1_000 });
+			await terminateDaemonTree(pin.process, timeoutMs, timeoutMs + 1_000, record.snapshot.name);
 		} else if (record.pty) {
 			record.pty.kill();
 		} else if (
@@ -1457,7 +1483,7 @@ class DaemonBroker {
 			// Running, but not pinnable now (no descriptor left): killed through a
 			// pin at a later refresh (the wait below refreshes), never by its pid.
 			record.pendingKills.push({
-				target: { pid: record.snapshot.pid, startedAt: record.snapshot.startedAt },
+				target: { pid: record.snapshot.pid, processStart: record.snapshot.processStart },
 				generation: record.generation,
 				gracefulMs: timeoutMs,
 				timeoutMs: timeoutMs + 1_000,
@@ -1624,7 +1650,7 @@ class DaemonBroker {
 					// exited; already-terminal records keep their real exit time so
 					// `list` ranks exited history by true recency (issue #6517).
 					if (live.kind === "pinned") {
-						await live.process.terminate({ group: true, gracefulMs: 500, timeoutMs: 2_000 });
+						await terminateDaemonTree(live.process, 500, 2_000, snapshot.name);
 					}
 					reapRecoveredSnapshot(snapshot, Date.now());
 				} else if (detached && snapshot.state === "restarting") {
@@ -1682,7 +1708,7 @@ class DaemonBroker {
 						killLater && snapshot.pid !== undefined
 							? [
 									{
-										target: { pid: snapshot.pid, startedAt: snapshot.startedAt },
+										target: { pid: snapshot.pid, processStart: snapshot.processStart },
 										generation: 0,
 										gracefulMs: 500,
 										timeoutMs: 2_000,

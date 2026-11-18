@@ -249,16 +249,19 @@ pub struct Script {
 	/// refusal of its own command up the same way ([`CallOutcome::TooLong`]).
 	/// Set it only for a script that runs nothing before that `exec` or tool
 	/// (a callout's generated `exec` of a program, or its call of `timeout`,
-	/// `nohup`, `env` or `ifne`, in a subshell with [`Script::as_program`]): a
-	/// retry would run all of it again.
+	/// `nohup`, `env` or `ifne`, in a subshell with [`Script::as_program`];
+	/// the `exec` of the program `timeout` or `nohup` runs): a retry would
+	/// run all of it again.
 	pub too_long_to_host: bool,
 	/// With [`Script::too_long_to_host`], the host hears of every other
 	/// refusal of that `exec` too (`EACCES`, `ENOENT` of a `#!` interpreter,
-	/// `ENAMETOOLONG` of a path), the same way: nothing printed, status 126,
-	/// [`Shell::exec_refusal`] has the error. A utility that runs commands
-	/// then reports it as GNU's xargs and find report a command they cannot
-	/// run. `ENOEXEC` is no refusal: the file runs as a script. Set it only
-	/// for a callout's generated `exec` of a program.
+	/// `ENAMETOOLONG` of a path), and of an `exec` that found nothing to run
+	/// (`ENOENT`; `EACCES` for a directory), the same way: nothing printed,
+	/// status 126 (127 for `ENOENT`), [`Shell::exec_refusal`] has the error.
+	/// `ENOEXEC` is no refusal: the file runs as a script. Set it only for an
+	/// `exec` whose host reports a command it cannot run in its own words:
+	/// `env`'s callout, and the `exec` of the program `timeout` or `nohup`
+	/// runs (coreutils' `failed to run command`).
 	pub refusals_to_host: bool,
 	/// The new subshell stands for a program the caller started (a callout
 	/// running a utility's command), whose children never see the caller's

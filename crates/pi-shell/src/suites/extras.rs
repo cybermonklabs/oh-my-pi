@@ -49,6 +49,7 @@ fn session_with(dir: &Path, env: Vec<(BString, BString)>) -> Session {
 		vfs: None,
 		runtime: tokio::runtime::Handle::current(),
 		output_decoding: None,
+		term_grace: crate::host::TERM_GRACE,
 	})
 	.unwrap()
 }
@@ -689,6 +690,7 @@ async fn env_does_not_hand_up_a_refusal_after_reading_env0_from() {
 		vfs:             Some(vfs),
 		runtime:         tokio::runtime::Handle::current(),
 		output_decoding: None,
+		term_grace:      crate::host::TERM_GRACE,
 	})
 	.unwrap();
 	// Without `-i`: the program's environment, larger than xargs counted
@@ -708,12 +710,15 @@ async fn env_does_not_hand_up_a_refusal_after_reading_env0_from() {
 
 /// A directory of commands that cannot run, for xargs and find: `words`
 /// (`1` to `3`), `findroot` with a file in it and one in `findroot/a`, and
-/// - `noexec`, a script without the execute bit (`EACCES`);
+/// - `noexec`, a script without the execute bit, which no lookup finds
+///   executable;
+/// - `ia`, a script whose `#!` interpreter is `noexec`: the system refuses its
+///   `exec` with `EACCES` (also for root, as no execute bit is set);
 /// - `s`, a script whose `#!` interpreter is a symlink to a name past
 ///   `NAME_MAX` (`ENAMETOOLONG` of a path, on a line no system refuses);
 /// - `mi`, a script whose `#!` interpreter does not exist (`ENOENT`);
 /// - `bin`, an executable that is no program (`ENOEXEC`), which runs as a
-///   script, as GNU's `execvp` runs it with `/bin/sh`.
+///   script, as `execvp` runs it with `/bin/sh`.
 #[cfg(target_os = "linux")]
 fn cannot_run_dir() -> tempfile::TempDir {
 	use std::os::unix::fs::PermissionsExt as _;
@@ -729,17 +734,39 @@ fn cannot_run_dir() -> tempfile::TempDir {
 	std::fs::write(at("findroot/f1"), "").unwrap();
 	std::fs::write(at("findroot/a/f2"), "").unwrap();
 	write("noexec", b"echo ran\n", 0o644);
+	write("ia", format!("#!{}\n", at("noexec").display()).as_bytes(), 0o755);
 	std::os::unix::fs::symlink(at(&"0".repeat(256)), at("ll")).unwrap();
 	write("s", format!("#!{}\n", at("ll").display()).as_bytes(), 0o755);
 	write("mi", b"#!/nonexistent/interpreter\n", 0o755);
+	std::fs::create_dir(at("d")).unwrap();
 	write("bin", b"\x7fELF\x02\x01\x01garbage\0\0\0", 0o755);
 	dir
 }
 
-/// Runs `xargs -t -n1 PROGRAM < words` in `dir` ([`cannot_run_dir`]) and
-/// asserts GNU's contract for a command xargs cannot run (findutils 4.9.0
-/// measured): it tries the first line only, stops, and exits `status`, with
-/// `xargs: PROGRAM: said` and nothing else.
+/// The scripts of [`cannot_run_dir`] whose `exec` the system refuses, with
+/// the `strerror` text of the refusal: `EACCES`, `ENOENT` of a `#!`
+/// interpreter, and `ENAMETOOLONG` of one.
+#[cfg(target_os = "linux")]
+const REFUSED_EXECS: [(&str, &str); 3] =
+	[("ia", "Permission denied"), ("mi", "No such file or directory"), ("s", "File name too long")];
+
+/// How many lines of `stderr` are the shell's diagnostic for `program`
+/// refused with the text `said`: a line naming `program` and saying `said`
+/// that is no utility's own (`xargs:`, `find:`).
+#[cfg(target_os = "linux")]
+fn shell_reports(stderr: &str, program: &str, said: &str) -> usize {
+	stderr
+		.lines()
+		.filter(|line| !line.starts_with("xargs:") && !line.starts_with("find:"))
+		.filter(|line| line.contains(&format!("{program}: ")) && line.contains(said))
+		.count()
+}
+
+/// Runs `xargs -t -n1 PROGRAM < words` in `dir` ([`cannot_run_dir`]) for a
+/// program no lookup finds runnable, and asserts that xargs tries the first
+/// line only, stops, and exits `status`, with the one line `said` and
+/// nothing else: the text and status of xargs at 9058ab9d, which this PR
+/// keeps (only a line too long changed).
 #[cfg(target_os = "linux")]
 async fn assert_xargs_cannot_run(dir: &Path, program: &str, status: i32, said: &str) {
 	let ran = run(&mut session_in(dir, &[]), &format!("xargs -t -n1 {program} < words")).await;
@@ -749,59 +776,56 @@ async fn assert_xargs_cannot_run(dir: &Path, program: &str, status: i32, said: &
 		.partition(|line| line.starts_with(&format!("{program} ")));
 	assert_eq!((ran.status, ran.stdout.as_str()), (status, ""), "{program}: {}", ran.stderr);
 	assert_eq!(tried, [format!("{program} 1")], "{program}: xargs did not stop at the first line");
-	assert_eq!(reported, [format!("xargs: {program}: {said}")], "{program}");
+	assert_eq!(reported, [said], "{program}");
 }
 
-/// Runs `COMMAND; echo rc=$?` in `dir` ([`cannot_run_dir`]) for find, and
-/// asserts GNU's contract (findutils 4.9.0 measured): `find: ‘PROGRAM’:
-/// said` once per command line it could not run (find goes on to the
-/// next), and `rc`.
-#[cfg(target_os = "linux")]
-async fn assert_find_cannot_run(
-	dir: &Path,
-	command: &str,
-	program: &str,
-	said: &str,
-	times: usize,
-	rc: i32,
-) {
-	let ran = run(&mut session_in(dir, &[]), &format!("{command}; echo rc=$?")).await;
-	assert_eq!(ran.stdout, format!("rc={rc}\n"), "{command}: {}", ran.stderr);
-	let message = format!("find: ‘{program}’: {said}");
-	assert_eq!(ran.stderr.lines().collect::<Vec<_>>(), vec![message.as_str(); times], "{command}");
-}
-
-/// A command xargs cannot find: GNU's 127 and `No such file or directory`,
-/// and xargs stops. So for a name on `PATH`, a path, and a script whose
-/// `#!` interpreter does not exist (`ENOENT`, as GNU reports it).
+/// A command no lookup finds: 127 and `xargs: NAME: No such file or
+/// directory`, and xargs stops, for a name on `PATH`, a path, and a
+/// directory (no lookup finds one runnable), as at 9058ab9d.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xargs_stops_with_127_for_a_command_it_cannot_find() {
 	let dir = cannot_run_dir();
-	for program in ["no-such-command-here", "./nosuch", "./mi"] {
-		assert_xargs_cannot_run(dir.path(), program, 127, "No such file or directory").await;
+	for program in ["no-such-command-here", "./nosuch", "./d"] {
+		let said = format!("xargs: {program}: No such file or directory");
+		assert_xargs_cannot_run(dir.path(), program, 127, &said).await;
 	}
 }
 
-/// A command xargs may not run (`EACCES`): GNU's 126 and `Permission
-/// denied`, and xargs stops.
+/// A file the lookup finds but none may run (no execute bit): 126 and
+/// `xargs: Command could not be run: permission denied`, and xargs stops,
+/// as at 9058ab9d (not `xargs: NAME: Permission denied`).
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xargs_stops_with_126_for_a_command_it_may_not_run() {
 	let dir = cannot_run_dir();
-	assert_xargs_cannot_run(dir.path(), "./noexec", 126, "Permission denied").await;
+	let said = "xargs: Command could not be run: permission denied";
+	assert_xargs_cannot_run(dir.path(), "./noexec", 126, said).await;
 }
 
-/// An `ENAMETOOLONG` that is no line's, from a `#!` interpreter whose path
-/// holds a name past `NAME_MAX`, is no line too long: the line is not
-/// split, and the command cannot run, as GNU's xargs reports it (126, `File
-/// name too long`, stop). Under `timeout`, which ran, it is timeout's
-/// failure in coreutils' words (status 126, xargs 123), as with GNU's.
+/// A program whose `exec` the system refuses for anything but a line too
+/// long (`EACCES`, a `#!` interpreter missing, or past `NAME_MAX`): the shell
+/// reports it for each line (status 126), xargs goes on to every line and
+/// exits 123, and splits nothing. Under `timeout`, which ran, it is timeout's
+/// failure in coreutils' words (status 126, xargs 123).
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn xargs_stops_with_126_for_a_shebang_path_too_long() {
+async fn xargs_leaves_a_refused_exec_to_the_shell() {
 	let dir = cannot_run_dir();
-	assert_xargs_cannot_run(dir.path(), "./s", 126, "File name too long").await;
+	for (name, said) in REFUSED_EXECS {
+		let program = format!("./{name}");
+		let ran =
+			run(&mut session_in(dir.path(), &[]), &format!("xargs -t -n1 {program} < words")).await;
+		let tried = lines_tried(&ran.stderr, &program);
+		assert_eq!(
+			(ran.status, ran.stdout.as_str(), tried),
+			(123, "", 3),
+			"{program}: {}",
+			ran.stderr
+		);
+		assert_eq!(shell_reports(&ran.stderr, &program, said), 3, "{program}: {}", ran.stderr);
+		assert!(!ran.stderr.contains("xargs:"), "{program}: {}", ran.stderr);
+	}
 	let ran =
 		run(&mut session_in(dir.path(), &[("LC_ALL", "C")]), "xargs -t timeout 5s ./s < words").await;
 	let said: Vec<&str> = ran.stderr.lines().collect();
@@ -811,9 +835,9 @@ async fn xargs_stops_with_126_for_a_shebang_path_too_long() {
 }
 
 /// A file the system cannot run as a program (`ENOEXEC`) runs as a script,
-/// as GNU's `execvp` runs it with `/bin/sh`: this one fails as a script
-/// (status 126 from the shell), and xargs goes on to every line, exiting
-/// 123, as GNU's does; the message is the shell's, not xargs'.
+/// as `execvp` runs it with `/bin/sh`: this one fails as a script (status
+/// 126 from the shell), and xargs goes on to every line, exiting 123; the
+/// message is the shell's, not xargs'.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xargs_runs_a_file_that_is_no_program_as_a_script() {
@@ -823,51 +847,87 @@ async fn xargs_runs_a_file_that_is_no_program_as_a_script() {
 	assert!(!ran.stderr.contains("xargs:"), "{}", ran.stderr);
 }
 
-/// `find -exec … +` and `-exec … ;` with a command they cannot run: GNU's
-/// `find: ‘NAME’: strerror` for each command line, find goes on, and exits
-/// 1 for `+` (0 for `;`, whose failure is only the test's). One batch per
-/// directory with `-execdir`.
+/// `find -exec … +` and `-exec … ;` with a command no lookup finds
+/// runnable: `Failed to run NAME: ERROR` for each command line, in any
+/// locale, as at 9058ab9d; find goes on, and exits 1 for `+` (0 for `;`,
+/// whose failure is only the test's). One batch per directory with
+/// `-execdir`.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn find_reports_a_command_it_cannot_run_as_gnu() {
+async fn find_reports_a_command_it_cannot_start() {
 	let dir = cannot_run_dir();
 	let p = dir.path();
 	let abs = |name: &str| p.join(name).display().to_string();
-	for (program, said) in [
-		("no-such-command-here", "No such file or directory"),
-		("./mi", "No such file or directory"),
-		("./noexec", "Permission denied"),
-		("./s", "File name too long"),
-	] {
-		let plus = format!("find findroot -type f -exec {program} {{}} +");
-		assert_find_cannot_run(p, &plus, program, said, 1, 1).await;
-		let each = format!("find findroot -type f -exec {program} {{}} \\;");
-		assert_find_cannot_run(p, &each, program, said, 2, 0).await;
+	for locale in ["C", "C.UTF-8"] {
+		let mut s = session_in(p, &[("LC_ALL", locale)]);
+		let mut check = async |command: String, program: &str, said: &str, times: usize, rc: i32| {
+			let ran = run(&mut s, &format!("{command}; echo rc=$?")).await;
+			assert_eq!(ran.stdout, format!("rc={rc}\n"), "{locale} {command}: {}", ran.stderr);
+			let message = format!("Failed to run {program}: {said}");
+			let said: Vec<&str> = ran.stderr.lines().collect();
+			assert_eq!(said, vec![message.as_str(); times], "{locale} {command}");
+		};
+		for (program, said) in [
+			("no-such-command-here", "entity not found"),
+			("./noexec", "permission denied"),
+			("./d", "entity not found"),
+		] {
+			check(format!("find findroot -type f -exec {program} {{}} +"), program, said, 1, 1).await;
+			check(format!("find findroot -type f -exec {program} {{}} \\;"), program, said, 2, 0)
+				.await;
+		}
+		for (name, said) in [("noexec", "permission denied"), ("nosuch", "entity not found")] {
+			let execdir = format!("find findroot -type f -execdir {} {{}} +", abs(name));
+			check(execdir, &abs(name), said, 2, 1).await;
+		}
 	}
-	for (name, said) in [
-		("noexec", "Permission denied"),
-		("s", "File name too long"),
-		("nosuch", "No such file or directory"),
-	] {
-		let execdir = format!("find findroot -type f -execdir {} {{}} +", abs(name));
-		assert_find_cannot_run(p, &execdir, &abs(name), said, 2, 1).await;
+}
+
+/// `find -exec … +`, `-exec … ;` and `-execdir … +` with a program whose
+/// `exec` the system refuses for anything but a line too long: the shell
+/// reports it once per command line (status 126), find writes nothing of
+/// its own, goes on, and exits 1 for `+` (0 for `;`). A file that is no
+/// program runs as a script, as `execvp` runs it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn find_leaves_a_refused_exec_to_the_shell() {
+	let dir = cannot_run_dir();
+	let p = dir.path();
+	let mut s = session_in(p, &[]);
+	for (name, said) in REFUSED_EXECS {
+		let program = format!("./{name}");
+		let absolute = p.join(name).display().to_string();
+		for (command, shown, times, rc) in [
+			(format!("find findroot -type f -exec {program} {{}} +"), &program, 1, 1),
+			(format!("find findroot -type f -exec {program} {{}} \\;"), &program, 2, 0),
+			(format!("find findroot -type f -execdir {absolute} {{}} +"), &absolute, 2, 1),
+		] {
+			let ran = run(&mut s, &format!("{command}; echo rc=$?")).await;
+			assert_eq!(ran.stdout, format!("rc={rc}\n"), "{command}: {}", ran.stderr);
+			assert_eq!(shell_reports(&ran.stderr, shown, said), times, "{command}: {}", ran.stderr);
+			assert!(!ran.stderr.contains("find:"), "{command}: {}", ran.stderr);
+		}
 	}
-	// A file that is no program runs as a script, as GNU's `execvp` runs it.
-	let ran =
-		run(&mut session_in(p, &[]), "find findroot -type f -exec ./bin {} +; echo rc=$?").await;
+	let ran = run(&mut s, "find findroot -type f -exec ./bin {} +; echo rc=$?").await;
 	assert_eq!(ran.stdout, "rc=1\n", "{}", ran.stderr);
 	assert!(!ran.stderr.contains("find:"), "{}", ran.stderr);
 }
 
-/// Runs `WRAPPER PROGRAM` (`env`, `timeout 5`, `nohup`) in `dir`
-/// ([`cannot_run_dir`]) in the locale `locale`, both as GNU coreutils'
-/// (`/usr/bin/NAME`, named `NAME`) and as pi's, and asserts the same status
-/// and the same stderr: a command the wrapper cannot run, reported in
-/// coreutils' words (`env: ‘NAME’: …`, `timeout: failed to run command
-/// ‘NAME’: …`, `nohup: failed to run command 'NAME': …`), with 126, or 127
-/// when nothing is found.
+/// Runs `WRAPPER "$P"` (`env`, `timeout 5`, `nohup`), `P` being `program`,
+/// in `dir` in the locale `locale` with the variables `env`, both as GNU
+/// coreutils' (`/usr/bin/NAME`, named `NAME`) and as pi's, and asserts the
+/// same status, stdout and stderr. For a command the wrapper cannot run,
+/// that is coreutils' words (`env: ‘NAME’: …`, `timeout: failed to run
+/// command ‘NAME’: …`, `nohup: failed to run command 'NAME': …`), with 126,
+/// or 127 when nothing is found.
 #[cfg(target_os = "linux")]
-async fn assert_wrapper_reports_as_gnu(dir: &Path, wrapper: &str, program: &str, locale: &str) {
+async fn assert_wrapper_as_gnu(
+	dir: &Path,
+	wrapper: &str,
+	program: &str,
+	locale: &str,
+	env: &[(&str, &str)],
+) {
 	use std::os::unix::process::CommandExt as _;
 
 	let words: Vec<&str> = wrapper.split(' ').collect();
@@ -879,22 +939,43 @@ async fn assert_wrapper_reports_as_gnu(dir: &Path, wrapper: &str, program: &str,
 		.arg(program)
 		.current_dir(dir)
 		.env("LC_ALL", locale)
+		.envs(env.iter().copied())
 		.stdin(std::process::Stdio::null())
 		.output()
 		.unwrap();
-	let gnu_err = String::from_utf8_lossy(&gnu.stderr);
-	let ran =
-		run(&mut session_in(dir, &[("LC_ALL", locale)]), &format!("{wrapper} {program}")).await;
-	let case = format!("LC_ALL={locale} {wrapper} {program}");
-	assert_eq!((ran.status, ran.stderr.as_str()), (gnu.status.code().unwrap(), &*gnu_err), "{case}");
-	assert!(matches!(ran.status, 126 | 127), "{case}: {}", ran.stderr);
+	let (gnu_out, gnu_err) =
+		(String::from_utf8_lossy(&gnu.stdout), String::from_utf8_lossy(&gnu.stderr));
+	let mut vars = vec![("LC_ALL", locale), ("P", program)];
+	vars.extend_from_slice(env);
+	let ran = run(&mut session_in(dir, &vars), &format!("{wrapper} \"$P\"")).await;
+	let case = format!("LC_ALL={locale} {env:?} {wrapper} {program:?}");
+	let gnu = (gnu.status.code().unwrap(), &*gnu_out, &*gnu_err);
+	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), gnu, "{case}");
+}
+
+/// [`assert_wrapper_as_gnu`] for a command the wrapper cannot run: 126 or
+/// 127.
+#[cfg(target_os = "linux")]
+async fn assert_wrapper_reports_as_gnu(dir: &Path, wrapper: &str, program: &str, locale: &str) {
+	assert_wrapper_as_gnu(dir, wrapper, program, locale, &[]).await;
+	let vars = [("LC_ALL", locale), ("P", program)];
+	let ran = run(&mut session_in(dir, &vars), &format!("{wrapper} \"$P\"")).await;
+	assert!(matches!(ran.status, 126 | 127), "{wrapper} {program:?}: {}", ran.stderr);
 }
 
 /// The programs each wrapper test runs: not found by name or by path, a
-/// `#!` interpreter that does not exist, no execute bit (`EACCES`), and a
-/// `#!` interpreter past `NAME_MAX` (`ENAMETOOLONG`).
+/// `#!` interpreter that does not exist, no execute bit, a `#!` interpreter
+/// without one (`EACCES` at `exec`), and a `#!` interpreter past `NAME_MAX`
+/// (`ENAMETOOLONG`).
 #[cfg(target_os = "linux")]
-const CANNOT_RUN: [&str; 5] = ["no-such-command-here", "./nosuch", "./mi", "./noexec", "./s"];
+const CANNOT_RUN: [&str; 6] =
+	["no-such-command-here", "./nosuch", "./mi", "./noexec", "./ia", "./s"];
+
+/// [`CANNOT_RUN`], and a directory (`EACCES` at `exec`), which `timeout`
+/// and `nohup` hand to the shell's `exec` as written.
+#[cfg(target_os = "linux")]
+const TOOLS_CANNOT_RUN: [&str; 7] =
+	["no-such-command-here", "./nosuch", "./mi", "./noexec", "./ia", "./s", "./d"];
 
 /// `env PROGRAM` that cannot run, as coreutils' `env` reports it, in the
 /// C and UTF-8 locales.
@@ -915,7 +996,7 @@ async fn env_reports_a_command_it_cannot_run_as_coreutils() {
 async fn timeout_reports_a_command_it_cannot_run_as_coreutils() {
 	let dir = cannot_run_dir();
 	for locale in ["C", "C.UTF-8"] {
-		for program in CANNOT_RUN {
+		for program in TOOLS_CANNOT_RUN {
 			assert_wrapper_reports_as_gnu(dir.path(), "timeout 5", program, locale).await;
 		}
 	}
@@ -927,9 +1008,101 @@ async fn timeout_reports_a_command_it_cannot_run_as_coreutils() {
 async fn nohup_reports_a_command_it_cannot_run_as_coreutils() {
 	let dir = cannot_run_dir();
 	for locale in ["C", "C.UTF-8"] {
-		for program in CANNOT_RUN {
+		for program in TOOLS_CANNOT_RUN {
 			assert_wrapper_reports_as_gnu(dir.path(), "nohup", program, locale).await;
 		}
+	}
+}
+
+/// A name the wrappers cannot run is quoted as coreutils quotes it: `env`
+/// and `timeout` as GNU's `quote` in the locale (`'it\'s'` in C, `‘it's’`
+/// in UTF-8, C escapes for a tab), `nohup` as a shell word (`"it's"`,
+/// `'t'$'\t''ab'`).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wrappers_quote_a_name_they_cannot_run_as_coreutils() {
+	let dir = tempfile::tempdir().unwrap();
+	for locale in ["C", "C.UTF-8"] {
+		for name in ["it's", "it's\"q", "a b", "t\tab", "b\\s", "é"] {
+			for wrapper in ["env", "timeout 5", "nohup"] {
+				assert_wrapper_reports_as_gnu(dir.path(), wrapper, name, locale).await;
+			}
+		}
+	}
+}
+
+/// `timeout` and `nohup` find a command as the shell does: a file that
+/// cannot be run earlier on `PATH` is passed over for one that can, and a
+/// name the shell's hash table holds runs from it (where coreutils, which
+/// sees no hash table, finds nothing). bash 5.2's `timeout` and `nohup`
+/// are programs, so `PATH` is coreutils' reference here; the hash table is
+/// the shell's.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_and_nohup_find_a_command_as_the_shell_does() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let dir = tempfile::tempdir().unwrap();
+	let p = dir.path();
+	for (sub, mode) in [("a", 0o614), ("b", 0o755)] {
+		std::fs::create_dir(p.join(sub)).unwrap();
+		let file = p.join(sub).join("foo");
+		std::fs::write(&file, format!("#!/bin/sh\necho {}\n", sub.to_uppercase())).unwrap();
+		std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+	}
+	let path = format!(
+		"{}:{}:{}",
+		p.join("a").display(),
+		p.join("b").display(),
+		std::env::var("PATH").unwrap()
+	);
+	for wrapper in ["timeout 5", "nohup"] {
+		assert_wrapper_as_gnu(p, wrapper, "foo", "C", &[("PATH", &path)]).await;
+		let ran =
+			run(&mut session_in(p, &[]), &format!("hash -p /bin/echo myecho; {wrapper} myecho hi"))
+				.await;
+		assert_eq!(
+			(ran.status, ran.stdout.as_str(), ran.stderr.as_str()),
+			(0, "hi\n", ""),
+			"{wrapper}"
+		);
+	}
+}
+
+/// `set -x` traces the wrapper's command line as the caller wrote it, and
+/// none of the words that run its program; a DEBUG trap under `set -T` sees
+/// only the caller's command, as for a program bash runs.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_and_nohup_trace_only_their_own_command_line() {
+	let dir = tempfile::tempdir().unwrap();
+	let mut s = session_in(dir.path(), &[]);
+	for wrapper in ["timeout 5", "nohup"] {
+		let ran = run(&mut s, &format!("set -x; {wrapper} /bin/echo hi")).await;
+		assert_eq!(
+			(ran.stdout.as_str(), ran.stderr.as_str()),
+			("hi\n", &*format!("+ {wrapper} /bin/echo hi\n")),
+			"{wrapper}"
+		);
+		let ran = run(
+			&mut s,
+			&format!(
+				"set +x -T; trap 'echo \"D:$BASH_COMMAND\" >&2' DEBUG; {wrapper} /bin/true; trap - \
+				 DEBUG"
+			),
+		)
+		.await;
+		let seen: Vec<&str> = ran
+			.stderr
+			.lines()
+			.filter(|line| line.starts_with("D:"))
+			.collect();
+		assert_eq!(
+			seen,
+			[format!("D:{wrapper} /bin/true"), "D:trap - DEBUG".to_owned()],
+			"{wrapper}: {}",
+			ran.stderr
+		);
 	}
 }
 
@@ -949,9 +1122,9 @@ async fn timeout_and_nohup_still_run_functions_and_builtins() {
 
 /// A long line (more than `_POSIX_ARG_MAX`) whose program is a `#!` script
 /// with an interpreter past `NAME_MAX`: its `ENAMETOOLONG` is the
-/// interpreter's, not the line's, so nothing is split, as GNU's xargs never
-/// splits it. xargs tries the line once and stops with 126 (by path, and
-/// by a name found on `PATH`); `find -exec … +` prints one message per
+/// interpreter's, not the line's, so nothing is split. xargs tries the line
+/// once, the shell reports it (status 126), and xargs exits 123 (by path,
+/// and by a name found on `PATH`); `find -exec … +` gets one diagnostic per
 /// command line.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -966,12 +1139,15 @@ async fn a_long_line_refused_for_its_interpreter_is_not_split() {
 	let mut s = session_in(p, &[("PATH", &path)]);
 	for program in ["./s", "s"] {
 		let ran = run(&mut s, &format!("xargs -t -a long {program}")).await;
-		let (tried, said): (Vec<&str>, Vec<&str>) = ran
-			.stderr
-			.lines()
-			.partition(|line| line.starts_with(&format!("{program} ")));
-		assert_eq!((ran.status, tried.len()), (126, 1), "{program}: {}", ran.stderr);
-		assert_eq!(said, [format!("xargs: {program}: File name too long")], "{program}");
+		let tried = lines_tried(&ran.stderr, program);
+		assert_eq!((ran.status, tried), (123, 1), "{program}: {}", ran.stderr);
+		assert_eq!(
+			shell_reports(&ran.stderr, "s", "File name too long"),
+			1,
+			"{program}: {}",
+			ran.stderr
+		);
+		assert!(!ran.stderr.contains("xargs:"), "{program}: {}", ran.stderr);
 	}
 	let pad = "x".repeat(4100);
 	for (command, times) in [
@@ -1360,9 +1536,9 @@ fn deeper_than_path_max(root: &Path) -> std::path::PathBuf {
 }
 
 /// `ENAMETOOLONG` from a working directory longer than `PATH_MAX` is no
-/// command line too long, and xargs does not split the line, since fewer
-/// arguments cannot help: the command cannot be run, and xargs says so as
-/// GNU's does (`xargs: NAME: File name too long`, status 126) and stops.
+/// command line too long: the shell reports the program it could not start,
+/// as for any other refusal (status 126), xargs goes on to the next line and
+/// exits 123, and it splits nothing, since fewer arguments cannot help.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_working_directory_past_path_max_is_no_line_too_long() {
@@ -1373,13 +1549,14 @@ async fn a_working_directory_past_path_max_is_no_line_too_long() {
 	let command = format!("xargs -t -n5 -a {} /usr/bin/printf '%s\\n'", ten.display());
 	let ran = run(&mut session_in(&deep, &[]), &command).await;
 	let tried = lines_tried(&ran.stderr, "/usr/bin/printf");
-	assert_eq!((ran.status, ran.stdout.as_str(), tried), (126, "", 1), "{}", ran.stderr);
-	let said: Vec<&str> = ran
-		.stderr
-		.lines()
-		.filter(|line| !line.starts_with("/usr/bin/printf"))
-		.collect();
-	assert_eq!(said, ["xargs: /usr/bin/printf: File name too long"]);
+	assert_eq!((ran.status, ran.stdout.as_str(), tried), (123, "", 2), "{}", ran.stderr);
+	assert_eq!(
+		shell_reports(&ran.stderr, "/usr/bin/printf", "File name too long"),
+		2,
+		"{}",
+		ran.stderr
+	);
+	assert!(!ran.stderr.contains("xargs:"), "{}", ran.stderr);
 }
 
 /// `tail -f` writing into an engine pipe (no native handle) notices while
@@ -1593,6 +1770,7 @@ async fn utilities_read_provider_files() {
 		vfs:             Some(vfs),
 		runtime:         tokio::runtime::Handle::current(),
 		output_decoding: None,
+		term_grace:      crate::host::TERM_GRACE,
 	})
 	.unwrap();
 	assert_eq!(out(&mut s, "sort mem://notes").await, "apple\npear\n");

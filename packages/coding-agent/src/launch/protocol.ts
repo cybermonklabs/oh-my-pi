@@ -239,6 +239,7 @@ export function parseDaemonSnapshot(value: unknown): DaemonSnapshot {
 		id: stringValue(source.id, "daemon.id"),
 		state: daemonState(source.state),
 		pid: optionalNumber(source.pid, "daemon.pid"),
+		processStart: optionalString(source.processStart, "daemon.processStart"),
 		createdAt: numberValue(source.createdAt, "daemon.createdAt"),
 		startedAt: numberValue(source.startedAt, "daemon.startedAt"),
 		readyAt: optionalNumber(source.readyAt, "daemon.readyAt"),

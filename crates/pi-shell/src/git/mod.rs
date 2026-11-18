@@ -824,6 +824,7 @@ mod tests {
 			vfs: None,
 			runtime: tokio::runtime::Handle::current(),
 			output_decoding: None,
+			term_grace: crate::host::TERM_GRACE,
 		})
 		.expect("session");
 		// stdout and stderr share one file (and its offset), so the

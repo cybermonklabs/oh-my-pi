@@ -17,9 +17,16 @@ fn session_with(vars: HashMap<String, String>, cwd: &std::path::Path) -> ShellSe
 		vfs: Some(slot.clone()),
 		runtime,
 		output_decoding: None,
+		term_grace: crate::host::TERM_GRACE,
 	})
 	.expect("start session");
-	ShellSessionCore { session, slot, filesystem: Fs::native(), cwd }
+	ShellSessionCore {
+		session,
+		slot,
+		filesystem: Fs::native(),
+		cwd,
+		reader_grace: super::super::CANCEL_READER_GRACE,
+	}
 }
 
 /// The shell starts in, and a run's requested working directory moves it

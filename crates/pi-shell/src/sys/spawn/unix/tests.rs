@@ -158,21 +158,21 @@ fn escalated(s: &NativeSpawner) -> super::Escalation {
 }
 
 /// What escalation `e` of an external that still ran when it was dropped
-/// recorded at its KILL step: how long after the drop it ran (at least
-/// `grace`), with the processes alive then (`alive`, what TERM left) and
-/// KILL sent to the scope.
+/// recorded at its KILL step: it was due exactly `grace` after the drop (the
+/// schedule, whatever the host's speed) and ran no earlier, with the
+/// processes alive then (`alive`, what TERM left) and KILL sent to the
+/// scope. Returns how long after the drop it ran, for the log.
 fn assert_killed_after(
 	e: &super::Escalation,
 	grace: Duration,
 	alive: &[proc::ProcInfo],
 ) -> Duration {
 	let fired = e.fired.as_ref().expect("the KILL step ran");
-	let after = fired.at.duration_since(e.abandoned);
 	assert!(e.running, "the external ran when dropped: {e:?}");
-	assert!(
-		after >= grace,
-		"the KILL step ran {after:?} after the drop, inside the grace {grace:?}"
-	);
+	let due = fired.due.duration_since(e.abandoned);
+	assert_eq!(fired.due, e.abandoned + grace, "KILL was due {due:?} after the drop, not {grace:?}");
+	assert!(fired.at >= fired.due, "the KILL step ran before it was due: {e:?}");
+	let after = fired.at.duration_since(e.abandoned);
 	let found = fired.alive.as_deref().expect("the scope was read");
 	assert_eq!(ids(found), ids(alive), "alive when KILL was due: {found:?}");
 	assert!(fired.killed, "KILL went to the scope: {e:?}");

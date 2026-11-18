@@ -1565,10 +1565,10 @@ impl ShellCommand {
 	/// names as that error from [`RunningCommand::wait`], with nothing
 	/// printed for it: a line too long, as [`ShellCommand::too_long_as_error`]
 	/// does, and any other (`EACCES`, `ENOENT` of a `#!` interpreter,
-	/// `ENAMETOOLONG` of a path), so the utility reports it as GNU's xargs
-	/// and find report a command they cannot run. `ENOEXEC` is no refusal:
-	/// the shell runs such a file as a script, as GNU's `execvp` does. A
-	/// builtin's own `exec` keeps the shell's diagnostic, as for
+	/// `ENAMETOOLONG` of a path), so the utility reports a command it cannot
+	/// run in its own words (`env`, in coreutils'). `ENOEXEC` is no refusal:
+	/// the shell runs such a file as a script, as `execvp` does. A builtin's
+	/// own `exec` keeps the shell's diagnostic, as for
 	/// [`ShellCommand::too_long_as_error`]; so does every refusal on Windows.
 	pub fn refusal_as_error(mut self) -> Self {
 		self.too_long_as_error = true;
@@ -3713,7 +3713,12 @@ mod testing {
 	/// A [`CommandRunner`](super::CommandRunner) standing in for a system
 	/// that refuses, with the error `errno`, every command line with more
 	/// than `most` arguments after its first `fixed` words, and runs every
-	/// other line as a command that succeeds without doing anything.
+	/// other line as a command that succeeds without doing anything. A
+	/// refusal reaches the utility as the shell's does: as the error when the
+	/// command asked to hear of it ([`ShellCommand::too_long_as_error`] for a
+	/// line too long by [`command_line_too_long`](super::command_line_too_long),
+	/// [`ShellCommand::refusal_as_error`] for any), else as status 126 (the
+	/// shell's diagnostic, not written here).
 	#[cfg(unix)]
 	pub(crate) struct Refusing {
 		fixed:      usize,
@@ -3768,12 +3773,24 @@ mod testing {
 			seen.tried.push(args.len());
 			let refused = args.len() > self.most;
 			let outcome = if refused {
-				Err(io::Error::from_raw_os_error(self.errno))
+				let error = io::Error::from_raw_os_error(self.errno);
+				let cwd = command.dir().map_or_else(
+					|| std::env::current_dir().unwrap_or_default(),
+					std::path::Path::to_path_buf,
+				);
+				let program = std::path::Path::new(&command.args()[0]);
+				let line = super::line_bytes(command.args());
+				let too_long = super::command_line_too_long(&error, program, line, &cwd);
+				if command.refusal_is_error() || (command.too_long_is_error() && too_long) {
+					Err(error)
+				} else {
+					Ok(super::CommandStatus::Exited(126))
+				}
 			} else {
 				seen.ran.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
 				Ok(super::CommandStatus::Exited(0))
 			};
-			let lone = refused && args.len() == 1;
+			let lone = outcome.is_err() && args.len() == 1;
 			let asked = seen.tried.len();
 			if asked > self.hold_until {
 				seen.lone_refusal_answered |= lone;

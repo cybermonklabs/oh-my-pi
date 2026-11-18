@@ -15,7 +15,7 @@ use clap::{Arg, ArgAction, ArgMatches};
 
 use crate::host::{
 	CommandStatus, Host, RunningCommand, ShellCommand, Utility, command_line_too_long, line_bytes,
-	matches_parser, run_strerror,
+	matches_parser,
 };
 
 mod options {
@@ -304,12 +304,14 @@ enum CommandExecutionError {
 	// exit code 255
 	UrgentlyFailed,
 	Killed { name: OsString, signal: i32 },
-	/// The system refused to start the command named `name` for another
-	/// reason than a line too long (`EACCES`, a `#!` interpreter's path):
-	/// GNU's `NAME: strerror`, status 126, and xargs stops.
-	CannotRun { name: OsString, error: io::Error },
-	/// Nothing runs under this command name (GNU: status 127), or its `#!`
-	/// interpreter does not exist (`ENOENT`, as GNU reports it).
+	/// The command could not be started: nothing executable has its name
+	/// (`PermissionDenied`), or the host could not start it. Status 126, and
+	/// xargs stops, with `xargs: Command could not be run: ERROR`. A refusal of
+	/// its `exec` by the system (`EACCES`, a `#!` interpreter's error, a
+	/// working directory past `PATH_MAX`) is no error here: the shell reports
+	/// it and the command's status is 126.
+	CannotRun(io::Error),
+	/// Nothing runs under this command name (status 127).
 	NotFound(OsString),
 	/// The system refuses a command line as too long even with one input
 	/// argument (GNU: status 1), or a whole `-I` line (also status 1 here;
@@ -325,7 +327,7 @@ impl Display for CommandExecutionError {
 			Self::Killed { name, signal } => {
 				write!(f, "{}: terminated by signal {signal}", name.to_string_lossy())
 			},
-			Self::CannotRun { name, error } => write!(f, "{}: {}", name.to_string_lossy(), run_strerror(error)),
+			Self::CannotRun(err) => write!(f, "Command could not be run: {err}"),
 			Self::NotFound(name) => write!(f, "{}: No such file or directory", name.to_string_lossy()),
 			Self::ArgumentSize => write!(f, "can't call exec() due to argument size restrictions"),
 		}
@@ -355,7 +357,7 @@ fn cannot_run(error: io::Error, name: &OsStr) -> CommandExecutionError {
 	if error.kind() == io::ErrorKind::NotFound {
 		CommandExecutionError::NotFound(name.to_owned())
 	} else {
-		CommandExecutionError::CannotRun { name: name.to_owned(), error }
+		CommandExecutionError::CannotRun(error)
 	}
 }
 
@@ -478,10 +480,10 @@ impl Jobs {
 			if let Some(name) = batch.argv.first() {
 				self.command.clone_from(name);
 			}
-			// The line is kept until the command ends: the refusal comes back
-			// from the shell then, and the halves are cut from it (or, for any
-			// other refusal, xargs stops with GNU's message).
-			let command = ShellCommand::new(batch.argv.clone()).refusal_as_error();
+			// The line is kept until the command ends: a refusal of it as too
+			// long comes back from the shell then, and the halves are cut from
+			// it. Any other refusal is the shell's diagnostic and status 126.
+			let command = ShellCommand::new(batch.argv.clone()).too_long_as_error();
 			let command = host
 				.spawn_command(command)
 				.map_err(|error| cannot_run(error, &self.command))?;
@@ -1276,7 +1278,7 @@ impl Utility for Xargs {
 					match command_error {
 						CommandExecutionError::UrgentlyFailed => 124,
 						CommandExecutionError::Killed { .. } => 125,
-						CommandExecutionError::CannotRun { .. } => 126,
+						CommandExecutionError::CannotRun(_) => 126,
 						CommandExecutionError::NotFound(_) => 127,
 						CommandExecutionError::ArgumentSize => 1,
 					}
@@ -1649,8 +1651,8 @@ mod tests {
 	/// `E2BIG`, and `ENAMETOOLONG` as GKE Sandbox (gVisor) says it for a
 	/// line longer than `_POSIX_ARG_MAX` (4,096 bytes), split a line in
 	/// halves, first half first, until each half runs. A shorter line's
-	/// `ENAMETOOLONG` is a path's (a `#!` interpreter's): it is the error at
-	/// once, and the line is not split.
+	/// `ENAMETOOLONG` is a path's (a `#!` interpreter's): the shell reports
+	/// it (status 126), xargs goes on (123), and the line is not split.
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn a_refused_line_is_halved_in_order_for_e2big_and_enametoolong() {
@@ -1665,19 +1667,19 @@ mod tests {
 			assert_eq!(&ran, words, "errno {errno}, {} bytes", words[0].len());
 		}
 		let (code, stderr, tried, ran) = refused_above(3, libc::ENAMETOOLONG).await;
-		assert_eq!((code, tried.as_slice()), (126, &[10][..]), "a short line's ENAMETOOLONG: {stderr}");
+		assert_eq!((code, tried.as_slice()), (123, &[10][..]), "a short line's ENAMETOOLONG: {stderr}");
 		assert!(ran.is_empty(), "{ran:?}");
 	}
 
-	/// Any other refusal is the error at once, as GNU's: `xargs: NAME:
-	/// strerror`, status 126, and nothing more runs; the line is not split.
+	/// Any other refusal is the shell's diagnostic and status 126, as for a
+	/// command that failed: xargs goes on (status 123), and the line is not
+	/// split.
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn other_refusals_are_not_split() {
 		for errno in [libc::EACCES, libc::ENOEXEC, libc::ENOMEM, libc::ETXTBSY] {
 			let (code, stderr, tried, ran) = refused_above(0, errno).await;
-			let said = format!("xargs: true: {}\n", crate::host::strip_errno(&io::Error::from_raw_os_error(errno)));
-			assert_eq!((code, stderr), (126, said), "errno {errno}");
+			assert_eq!((code, stderr.as_str()), (123, ""), "errno {errno}");
 			assert_eq!(tried, [10], "errno {errno}");
 			assert!(ran.is_empty(), "errno {errno}: {ran:?}");
 		}
@@ -1999,14 +2001,16 @@ mod tests {
 		assert_eq!(err, "xargs: definitely-not-a-real-command-xyz: No such file or directory\n");
 	}
 
+	/// A file that cannot be executed: 126 and `xargs: Command could not be
+	/// run: ERROR`, as at 9058ab9d (not `xargs: NAME: strerror`).
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn unexecutable_command_yields_126() {
 		let file = tempfile::NamedTempFile::new().expect("temporary command");
 		let command = file.path().to_str().expect("utf8 temporary path");
 		let (code, _, err) = run_simple(&[command], "x\n").await;
-		assert_eq!(code, 126);
-		assert_eq!(err, format!("xargs: {command}: Permission denied\n"));
+		let denied = io::Error::from_raw_os_error(libc::EACCES);
+		assert_eq!((code, err), (126, format!("xargs: Command could not be run: {denied}\n")));
 	}
 
 	#[tokio::test]

@@ -167,10 +167,18 @@ pub mod sys {
 	}
 
 	fn stat_field<T: FromStr>(pid: i32, index: usize) -> Option<T> {
-		stat_fields(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?
+		stat_fields(&read_lossy(&format!("/proc/{pid}/stat"))?)?
 			.nth(index)?
 			.parse()
 			.ok()
+	}
+
+	/// `path` read whole, with bytes that are no UTF-8 replaced: a process
+	/// name (`comm`, cut by the kernel at 15 bytes) may be anything, and
+	/// must not hide the fields after it.
+	pub(crate) fn read_lossy(path: &str) -> Option<String> {
+		let bytes = fs::read(path).ok()?;
+		Some(String::from_utf8_lossy(&bytes).into_owned())
 	}
 
 	/// Start time in clock ticks since boot (`starttime`, field 22). Together
@@ -450,7 +458,7 @@ mod proc_snapshot {
 	}
 
 	fn read_stat(pid: i32) -> Option<Stat> {
-		parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+		parse_stat(&sys::read_lossy(&format!("/proc/{pid}/stat"))?)
 	}
 
 	fn parse_stat(content: &str) -> Option<Stat> {
@@ -480,7 +488,7 @@ mod proc_snapshot {
 	}
 
 	fn status_ids(pid: i32, prefix: &str) -> Option<(u32, u32)> {
-		let content = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+		let content = sys::read_lossy(&format!("/proc/{pid}/status"))?;
 		let mut ids = content
 			.lines()
 			.find(|line| line.starts_with(prefix))?
@@ -1945,7 +1953,10 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
 /// the caller can still signal (`kill(pid, 0)` succeeds) was not read, not
 /// gone, so the chain above it is unknown and every signal is refused
 /// ([`Self::unread`]). One that exited, or another user's, ends the walk: no
-/// signal of ours reaches it.
+/// signal of ours reaches it. Without `/proc` (on Linux, this process's own
+/// entry is `ENOENT`: none is mounted, or a sandbox hides it) there is no
+/// chain to walk: only this process is protected, as in a shell without the
+/// guard; the guard needs a mounted `/proc`.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub struct HostProcesses {
 	/// This process and its ancestors, nearest first.
@@ -1953,8 +1964,9 @@ pub struct HostProcesses {
 	/// The process groups those processes belong to.
 	pub pgids:  smallvec::SmallVec<[i32; 16]>,
 	/// An ancestor the snapshot did not read though the caller can signal it,
-	/// above which the chain is unknown.
-	pub unread: Option<i32>,
+	/// above which the chain is unknown, with why its read failed
+	/// (`strerror`).
+	pub unread: Option<(i32, String)>,
 }
 
 /// One process as the chain walk sees it.
@@ -2019,12 +2031,14 @@ impl HostProcesses {
 					start: process.start_time(),
 				})
 		};
-		Self::walk(self_pid, lookup, signalable)
+		Self::walk(self_pid, lookup, signalable, read_error)
 	}
 
 	/// Walks from `self_pid` up through `lookup`, collecting the chain;
 	/// `signalable` says whether a pid missing from `lookup` is one the caller
-	/// can still signal (then it was not read, and the walk fails closed).
+	/// can still signal (then it was not read, and the walk fails closed),
+	/// and `read_error` why reading it fails (`NotFound` for `self_pid`: no
+	/// `/proc`, nothing to walk).
 	///
 	/// A recorded parent pid is followed only when the process holding it is both
 	/// **present** and **no younger than its child**. Presence alone is not enough:
@@ -2038,17 +2052,28 @@ impl HostProcesses {
 		self_pid: i32,
 		lookup: impl Fn(i32) -> Option<ChainNode>,
 		signalable: impl Fn(i32) -> bool,
+		read_error: impl Fn(i32) -> Option<std::io::Error>,
 	) -> Self {
 		let mut pids = smallvec::SmallVec::new();
 		let mut pgids = smallvec::SmallVec::new();
 		let mut unread = None;
+		let why = |error: Option<std::io::Error>| {
+			error.map_or_else(|| "it could not be read".to_owned(), |error| crate::host::strip_errno(&error))
+		};
 
 		// We always protect ourselves, whether or not the snapshot lists us;
 		// unlisted, our parent is unknown.
 		pids.push(self_pid);
 		let mut node = lookup(self_pid);
-		if node.is_none() && signalable(self_pid) {
-			unread = Some(self_pid);
+		if node.is_none() {
+			match read_error(self_pid) {
+				// No `/proc`: nothing above this process can be read.
+				Some(error) if error.kind() == std::io::ErrorKind::NotFound => {
+					return Self { pids, pgids, unread: None };
+				},
+				error if signalable(self_pid) => unread = Some((self_pid, why(error))),
+				_ => {},
+			}
 		}
 		while let Some(current) = node {
 			if let Some(pgid) = current.pgid
@@ -2068,7 +2093,7 @@ impl HostProcesses {
 				// A live parent we may signal was not read: the chain above
 				// it is unknown.
 				if signalable(parent) {
-					unread = Some(parent);
+					unread = Some((parent, why(read_error(parent))));
 				}
 				break;
 			};
@@ -2079,6 +2104,20 @@ impl HostProcesses {
 			node = Some(found);
 		}
 		Self { pids, pgids, unread }
+	}
+}
+
+/// Why the process `pid` cannot be read: on Linux the error of reading its
+/// `/proc/<pid>/stat` now; `None` when the read succeeds now (it raced) or
+/// elsewhere.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn read_error(pid: i32) -> Option<std::io::Error> {
+	#[cfg(target_os = "linux")]
+	return std::fs::read(format!("/proc/{pid}/stat")).err();
+	#[cfg(not(target_os = "linux"))]
+	{
+		let _ = pid;
+		None
 	}
 }
 
@@ -2183,6 +2222,111 @@ mod tests {
 		}
 	}
 
+	/// The walk of the shell's ancestors reads a process whose name is no
+	/// UTF-8 as any other: run as a child test process named `p\377q`, the
+	/// walk from it reads its own entry and goes on to its parent, so
+	/// nothing is refused for an ancestor it could not read.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn an_ancestor_whose_name_is_no_utf8_is_walked() {
+		use std::os::unix::ffi::OsStrExt as _;
+
+		let dir = tempfile::tempdir().unwrap();
+		let link = dir.path().join(std::ffi::OsStr::from_bytes(b"p\xffq"));
+		std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
+		// The kernel names the process after the path it runs (`p\377q`);
+		// libtest wants a UTF-8 `argv[0]`.
+		let ran = std::os::unix::process::CommandExt::arg0(&mut std::process::Command::new(&link), "walk")
+			.args(["--ignored", "--exact", "proc_snapshot::tests::walk_from_a_process_named_p_377q"])
+			.env("PI_WALK_NAMED", "1")
+			.output()
+			.unwrap();
+		let said = String::from_utf8_lossy(&ran.stdout);
+		assert!(ran.status.success() && said.contains("1 passed"), "{said}{}", String::from_utf8_lossy(&ran.stderr));
+	}
+
+	/// Run by [`an_ancestor_whose_name_is_no_utf8_is_walked`] as a process
+	/// named `p\377q`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run as a child process by an_ancestor_whose_name_is_no_utf8_is_walked"]
+	fn walk_from_a_process_named_p_377q() {
+		if std::env::var_os("PI_WALK_NAMED").is_none() {
+			return;
+		}
+		let me = i32::try_from(std::process::id()).unwrap();
+		assert_eq!(std::fs::read(format!("/proc/{me}/comm")).unwrap(), b"p\xffq\n");
+		let host = HostProcesses::resolve_in(&ProcInfo::all());
+		assert!(host.unread.is_none(), "an unread ancestor in {:?}", host.pids);
+		assert!(host.pids.len() > 1 && host.pids[0] == me, "the walk stopped at {:?}", host.pids);
+	}
+
+	/// Without `/proc` (our own entry is missing and its read `ENOENT`) there
+	/// is no chain to walk: only we are protected, and a signal elsewhere
+	/// goes through, as in a shell without the guard.
+	#[test]
+	fn without_proc_only_we_are_protected() {
+		let host = HostProcesses::walk(100, tree(&[]), |_| true, failing(2));
+		assert_eq!((host.pids.as_slice(), host.unread.is_none()), (&[100][..], true));
+		assert!(host.blocks(100) && !host.blocks(4242) && !host.blocks(-4242));
+	}
+
+	/// With `/proc` mounted (our own entry read), a parent whose read fails
+	/// with `ENOENT` while a signal still reaches it was not read: a race
+	/// with its exit or the reuse of its pid. Every signal is refused, and the
+	/// refusal names the pid and the error; so too for `EMFILE`, `ENOMEM` and
+	/// `EIO`.
+	#[cfg(unix)]
+	#[test]
+	fn an_unread_parent_names_its_error() {
+		for (errno, said) in [
+			(2, "No such file or directory"),
+			(24, "Too many open files"),
+			(12, "Cannot allocate memory"),
+			(5, "Input/output error"),
+		] {
+			let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), |_| true, failing(errno));
+			assert_eq!(host.unread, Some((42, said.to_owned())), "errno {errno}");
+			assert!(host.blocks(4242), "errno {errno}: a signal went through above the unread parent");
+		}
+	}
+
+	/// No read fails: what `lookup` lacks raced, and reads now.
+	fn no_error(_pid: i32) -> Option<std::io::Error> {
+		None
+	}
+
+	/// Every read fails with `errno`.
+	fn failing(errno: i32) -> impl Fn(i32) -> Option<std::io::Error> {
+		move |_| Some(std::io::Error::from_raw_os_error(errno))
+	}
+
+	/// A process whose name is no UTF-8 (the kernel cuts `comm` at 15 bytes,
+	/// mid-character, or a program is named so) is read like any other: its
+	/// `stat` and `status` fields are not lost with its name, so a walk of
+	/// the shell's ancestors does not take it for one it cannot read.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_process_whose_name_is_no_utf8_is_read() {
+		use std::os::unix::ffi::OsStrExt as _;
+
+		let dir = tempfile::tempdir().unwrap();
+		let link = dir.path().join(std::ffi::OsStr::from_bytes(b"p\xffq"));
+		std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
+		let mut child = std::process::Command::new(&link).arg("600").spawn().unwrap();
+		let pid = i32::try_from(child.id()).unwrap();
+		// Until the exec named it.
+		while std::fs::read(format!("/proc/{pid}/comm")).ok().as_deref() != Some(b"p\xffq\n") {
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		}
+		let found = ProcInfo::all().into_iter().find(|process| process.pid() == pid);
+		let start = super::sys::start_time(pid);
+		let _ = child.kill();
+		let _ = child.wait();
+		let found = found.expect("the process named p\\377q is in the snapshot");
+		assert_eq!((found.ppid(), start.is_some()), (Some(i32::try_from(std::process::id()).unwrap()), true));
+	}
+
 	/// The case presence alone cannot catch: our recorded parent exited and its pid
 	/// was reused, so the number *is* in the table — held by a process that started
 	/// after us. Following it would hand our immunity to an unrelated process, and
@@ -2195,6 +2339,7 @@ mod tests {
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, Some(1), Some(9), 90)]),
 			gone,
+			no_error,
 		);
 		assert_eq!(host.pids.as_slice(), [100], "a younger impostor must not join the chain");
 		assert!(!host.pgids.contains(&9), "the impostor's group must not be protected either");
@@ -2208,6 +2353,7 @@ mod tests {
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, Some(1), Some(9), 10), (1, None, Some(1), 0)]),
 			gone,
+			no_error,
 		);
 		assert_eq!(host.pids.as_slice(), [100, 42, 1], "the real chain must be walked to the root");
 		assert!(host.pgids.contains(&9), "an ancestor's group must be protected");
@@ -2222,6 +2368,7 @@ mod tests {
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, None, Some(7), 50)]),
 			gone,
+			no_error,
 		);
 		assert_eq!(host.pids.as_slice(), [100, 42], "same-tick parent must still be an ancestor");
 	}
@@ -2231,7 +2378,7 @@ mod tests {
 	/// the walk stops rather than protecting it, and signals elsewhere go on.
 	#[test]
 	fn a_departed_parent_stops_the_walk() {
-		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), gone);
+		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), gone, no_error);
 		assert_eq!(host.pids.as_slice(), [100], "an unobserved parent must not join the chain");
 		assert_eq!(host.unread, None);
 		assert!(!host.blocks(42) && !host.blocks(4242), "the chain ends at us");
@@ -2243,12 +2390,14 @@ mod tests {
 	/// are ours. So too when our own entry was not read.
 	#[test]
 	fn an_unread_parent_we_can_signal_refuses_every_signal() {
-		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), |pid| pid == 42);
-		assert_eq!((host.pids.as_slice(), host.unread), (&[100][..], Some(42)));
+		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), |pid| pid == 42, failing(24));
+		let unread = host.unread.as_ref().map(|(pid, _)| *pid);
+		assert_eq!((host.pids.as_slice(), unread), (&[100][..], Some(42)));
 		assert!(host.blocks(4242) && host.blocks(-4242), "a signal went through above an unread ancestor");
 		assert!(host.protects(100) && !host.protects(4242));
-		let host = HostProcesses::walk(100, tree(&[]), |_| true);
-		assert_eq!((host.pids.as_slice(), host.unread), (&[100][..], Some(100)));
+		let host = HostProcesses::walk(100, tree(&[]), |_| true, failing(24));
+		let unread = host.unread.as_ref().map(|(pid, _)| *pid);
+		assert_eq!((host.pids.as_slice(), unread), (&[100][..], Some(100)));
 		assert!(host.blocks(4242), "a signal went through with our own entry unread");
 	}
 
@@ -2264,6 +2413,7 @@ mod tests {
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, Some(100), Some(7), 10)]),
 			gone,
+			no_error,
 		);
 		assert_eq!(host.pids.as_slice(), [100, 42], "the cycle must close the walk");
 	}
@@ -2369,7 +2519,8 @@ mod tests {
 			);
 			#[cfg(unix)]
 			{
-				assert_eq!(host.unread, Some(parent), "our live parent was taken for gone");
+				let unread = host.unread.as_ref().map(|(pid, _)| *pid);
+				assert_eq!(unread, Some(parent), "our live parent was taken for gone");
 				assert!(host.blocks(i32::MAX), "a signal went through above the unread parent");
 			}
 		}

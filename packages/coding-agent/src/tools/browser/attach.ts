@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
-import { getBrowserProfilesDir, isRecord, untilAborted } from "@oh-my-pi/pi-utils";
+import { getBrowserProfilesDir, isRecord, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Socket } from "bun";
 import type { Browser, Page, Target } from "puppeteer-core";
 import { throwIfAborted } from "../tool-errors";
@@ -828,10 +828,17 @@ async function pickPageFromList(pages: Page[], options: PickTargetOptions): Prom
 
 /**
  * SIGTERM the process tree, wait briefly, then SIGKILL anything still alive.
- * Single-process variant for our own spawned children.
+ * Single-process variant for our own spawned children. A hard wave whose walk
+ * could not read the whole tree (no descriptor left) still killed everything it
+ * read and the process group: that is logged, and no caller's stop fails on it.
  */
 export async function gracefulKillTreeOnce(pid: number, gracePeriodMs = 2000): Promise<void> {
 	const process = Process.fromPid(pid);
 	if (!process) return;
-	await process.terminate({ gracefulMs: gracePeriodMs, timeoutMs: 500 });
+	await process.terminate({ gracefulMs: gracePeriodMs, timeoutMs: 500 }).catch(error => {
+		logger.warn("Browser process tree stopped, but part of it could not be read", {
+			pid,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	});
 }

@@ -180,10 +180,10 @@ pub(crate) fn run<'a>(
 						// the target may be one above it.
 						if host.blocks(process.pid()) {
 							if !options.quiet {
-								let why = match host.unread {
-									Some(unread) if !host.protects(process.pid()) => {
-										format!("cannot read process {unread} to check it is not the shell's ancestor")
-									},
+								let why = match &host.unread {
+									Some((unread, error)) if !host.protects(process.pid()) => format!(
+										"cannot read process {unread} to check it is not the shell's ancestor: {error}"
+									),
 									_ => "this shell or one of its ancestors".to_owned(),
 								};
 								writeln!(

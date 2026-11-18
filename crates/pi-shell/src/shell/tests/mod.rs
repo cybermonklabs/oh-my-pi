@@ -298,6 +298,7 @@ async fn execute_captured(command: String) -> (ShellExecuteResult, String) {
 /// Waits for `path` to appear — a fixture saying it is ready, or a test
 /// releasing it — however long that takes. The test runner fails a test
 /// whose file never appears (`.config/nextest.toml`).
+#[cfg(unix)]
 async fn exists(path: &std::path::Path) {
 	while !path.exists() {
 		time::sleep(Duration::from_millis(10)).await;

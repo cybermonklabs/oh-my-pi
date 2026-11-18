@@ -37,6 +37,7 @@ fn session_with(extra: Vec<(BString, BString)>) -> Session {
 		vfs: None,
 		runtime: tokio::runtime::Handle::current(),
 		output_decoding: None,
+		term_grace: crate::host::TERM_GRACE,
 	})
 	.unwrap()
 }

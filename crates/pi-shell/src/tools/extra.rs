@@ -42,10 +42,12 @@
 //! Another builtin's own `exec` (`xargs eval '…; exec prog'`) stays the
 //! shell's, since retrying would run what the builtin did before it again.
 //! A command that asked to hear of every refusal
-//! ([`ShellCommand::refusal_as_error`]: xargs, find) gets any other refusal of
-//! its program's `exec` the same way (`EACCES`, `ENOENT` of a `#!`
-//! interpreter, `ENAMETOOLONG` of a path), and reports it as GNU's xargs and
-//! find do; `ENOEXEC` runs the file as a script, as GNU's `execvp` does.
+//! ([`ShellCommand::refusal_as_error`]: `env`, which reports a command it
+//! cannot run in coreutils' words) gets any other refusal of its program's
+//! `exec` the same way (`EACCES`, `ENOENT` of a `#!` interpreter,
+//! `ENAMETOOLONG` of a path); `ENOEXEC` runs the file as a script, as
+//! `execvp` does. xargs and find ask only for a line too long: any other
+//! refusal is the shell's diagnostic and status 126.
 
 use std::{
 	ffi::OsStr,
@@ -353,7 +355,7 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 	// a retry would repeat.
 	script.too_long_to_host = hands_up;
 	// Every other refusal of the generated `exec` of a program too, for a
-	// utility that reports a command it cannot run (xargs, find).
+	// utility that reports a command it cannot run in its own words (`env`).
 	script.refusals_to_host =
 		hands_up && matches!(program, Program::Path { .. }) && command.refusal_is_error();
 	// The working directory is logical, as after `cd`: `-execdir` hands over
@@ -371,7 +373,7 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 /// name with a separator runs as given, from the working directory it was
 /// looked up in, so a script without `#!` gets it as its `$0`, as from
 /// GNU's utilities; a name found on `PATH` runs by the path found.
-pub(super) fn exec_source(
+fn exec_source(
 	source: &mut Vec<u8>,
 	args: &mut Vec<BString>,
 	path: &Path,
@@ -493,7 +495,7 @@ impl Lookup {
 
 	/// How `command` runs; `NotFound` when nothing has its name,
 	/// `PermissionDenied` when only files that cannot be executed have it.
-	pub(super) fn program(&self, command: &ShellCommand) -> io::Result<Program> {
+	fn program(&self, command: &ShellCommand) -> io::Result<Program> {
 		let name = command
 			.args()
 			.first()
@@ -575,7 +577,7 @@ impl Lookup {
 
 	/// Whether `name` runs in-process: an engine intrinsic, a tool or an
 	/// extra this shell offers.
-	fn builtin(&self, name: &OsStr) -> bool {
+	pub(super) fn builtin(&self, name: &OsStr) -> bool {
 		let name = os_bytes(name);
 		IntrinsicId::lookup(&name, ModeId::Bash).is_some()
 			|| self.config.lookup(name.as_bstr()).is_some()

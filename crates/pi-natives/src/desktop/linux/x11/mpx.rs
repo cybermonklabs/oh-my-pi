@@ -1075,7 +1075,7 @@ impl Owner {
 	/// namespace): such masters use a name recovery never matches.
 	fn current() -> Option<Self> {
 		let pid = std::process::id();
-		let stat = fs::read_to_string("/proc/self/stat").ok()?;
+		let stat = read_stat("/proc/self/stat").ok()?;
 		if stat.split_whitespace().next()?.parse::<u32>().ok()? != pid {
 			return None;
 		}
@@ -1139,12 +1139,18 @@ fn start_ticks(stat: &str) -> Option<u64> {
 /// Start time of process `pid`. A zombie counts as gone: it owns nothing
 /// anymore, and one its parent never reaps would pin its masters forever.
 fn process_start(pid: u32) -> io::Result<u64> {
-	let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+	let stat = read_stat(&format!("/proc/{pid}/stat"))?;
 	if matches!(stat_fields(&stat).and_then(|mut fields| fields.next()), Some("Z" | "X")) {
 		return Err(io::ErrorKind::NotFound.into());
 	}
 	start_ticks(&stat)
 		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed /proc stat"))
+}
+
+/// A `/proc/<pid>/stat` line, with bytes that are no UTF-8 replaced: a
+/// process name may be anything, and must not hide the fields after it.
+fn read_stat(path: &str) -> io::Result<String> {
+	Ok(String::from_utf8_lossy(&fs::read(path)?).into_owned())
 }
 
 #[cfg(test)]

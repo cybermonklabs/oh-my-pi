@@ -632,10 +632,10 @@ pub mod matchers {
 					});
 				}
 				// GNU runs `-exec` in find's working directory, which is the
-				// shell's; `-execdir` moves to the entry's parent.
-				// A command the system refuses to start is find's error, as
-				// GNU's: `find: ‘NAME’: strerror`, and find goes on.
-				let mut command = ShellCommand::new(argv).refusal_as_error();
+				// shell's; `-execdir` moves to the entry's parent. A refusal of
+				// the command's `exec` by the system is the shell's diagnostic
+				// and status 126: one command cannot be split.
+				let mut command = ShellCommand::new(argv);
 				if self.exec_in_parent_dir
 					&& let Some(dir) = execdir_dir(file_info.path())
 				{
@@ -652,7 +652,7 @@ pub mod matchers {
 				match matcher_io.host().run_command_async(command).await {
 					Ok(status) => status.success(),
 					Err(e) => {
-						cannot_run(matcher_io, &self.executable, &e);
+						failed_to_run(matcher_io, &self.executable, &e);
 						false
 					},
 				}
@@ -712,8 +712,10 @@ pub mod matchers {
 						.map(OsString::from)
 						.collect();
 					// `-exec ... +` runs in find's (the shell's) working directory;
-					// `-execdir` batches carry their directory.
-					let mut shell_command = ShellCommand::new(argv).refusal_as_error();
+					// `-execdir` batches carry their directory. Only a refusal of the
+					// line as too long comes back as an error, to be split; any other
+					// is the shell's diagnostic and status 126.
+					let mut shell_command = ShellCommand::new(argv).too_long_as_error();
 					let line = line_bytes(shell_command.args());
 					if let Some(dir) = command.get_current_dir() {
 						shell_command = shell_command.current_dir(dir);
@@ -737,8 +739,12 @@ pub mod matchers {
 							pending.push(middle..files.end);
 							pending.push(files.start..middle);
 						},
+						Err(e) if too_long(&e, command, line, matcher_io.host().cwd()) => {
+							too_long_alone(matcher_io, &self.executable, &e);
+							matcher_io.set_exit_code(1);
+						},
 						Err(e) => {
-							cannot_run(matcher_io, &self.executable, &e);
+							failed_to_run(matcher_io, &self.executable, &e);
 							matcher_io.set_exit_code(1);
 						},
 					}
@@ -746,15 +752,21 @@ pub mod matchers {
 			}
 		}
 
-		/// Reports that the command `executable` could not be run, as GNU's
-		/// find does: `find: ‘NAME’: strerror` (the quotes of GNU's UTF-8
-		/// locales, as find's other GNU messages here).
-		fn cannot_run(matcher_io: &mut MatcherIO<'_>, executable: &str, error: &std::io::Error) {
-			let _ = writeln!(
-				&mut matcher_io.host().stderr,
-				"find: ‘{executable}’: {}",
-				crate::host::run_strerror(error)
-			);
+		/// Reports that the command `executable` could not be started (nothing
+		/// executable has its name): `Failed to run NAME: ERROR`.
+		fn failed_to_run(matcher_io: &mut MatcherIO<'_>, executable: &str, error: &std::io::Error) {
+			let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {executable}: {error}");
+		}
+
+		/// Reports that the system refused `executable`'s line with one file as
+		/// too long, which no split can help: `find: ‘NAME’: strerror`, with the
+		/// quotes of the locale find runs in (`'NAME'` in the C locale), as GNU's
+		/// find quotes it.
+		fn too_long_alone(matcher_io: &mut MatcherIO<'_>, executable: &str, error: &std::io::Error) {
+			let host = matcher_io.host();
+			let name = crate::locale::gnu_quote(|key| host.var(key), executable);
+			let text = crate::host::run_strerror(error);
+			let _ = writeln!(&mut host.stderr, "find: {name}: {text}");
 		}
 
 		/// Whether `error` is the system refusing `command`'s line of `line`
@@ -4898,9 +4910,9 @@ pub mod matchers {
 								let newer_time_type = NewerOptionType::from_str(x_option.as_str());
 								// Convert args to unix timestamps. (expressed in numeric types)
 								let Some(comparable_time) = parse_date_str_to_timestamps(time) else {
+									let quoted = crate::locale::gnu_quote(|key| host.var(key), args[i + 1]);
 									return Err(From::from(format!(
-										"find: I cannot figure out how to interpret ‘{}’ as a date or time",
-										args[i + 1]
+										"find: I cannot figure out how to interpret {quoted} as a date or time"
 									)));
 								};
 								i += 1;
@@ -5788,7 +5800,8 @@ mod tests {
 	/// `E2BIG`, and `ENAMETOOLONG` as GKE Sandbox (gVisor) says it for a
 	/// line longer than `_POSIX_ARG_MAX`, split a `-exec ... {} +` line in
 	/// halves until each half runs. A shorter line's `ENAMETOOLONG` is a
-	/// path's (a `#!` interpreter's): find's error at once, not split.
+	/// path's (a `#!` interpreter's): the shell reports it (status 126), and
+	/// find exits 1 without splitting the line.
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn exec_plus_halves_a_refused_line_for_e2big_and_enametoolong() {
@@ -5800,22 +5813,46 @@ mod tests {
 			assert_eq!(ran, files, "errno {errno}, pad {pad}");
 		}
 		let (code, err, tried, ran) = refused_above(3, libc::ENAMETOOLONG, false).await;
-		assert_eq!((code, tried.as_slice()), (1, &[10][..]), "a short line's ENAMETOOLONG: {err}");
-		assert_eq!(err, "find: ‘true’: File name too long\n", "a short line's ENAMETOOLONG");
+		assert_eq!((code, err.as_str(), tried.as_slice()), (1, "", &[10][..]), "a short line's ENAMETOOLONG");
 		assert!(ran.is_empty(), "{ran:?}");
 	}
 
-	/// Any other refusal of a `-exec ... {} +` line is find's error at once:
-	/// the line is not split.
+	/// Any other refusal of a `-exec ... {} +` line is the shell's
+	/// diagnostic and status 126: find writes nothing of its own, exits 1,
+	/// and does not split the line.
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn exec_plus_does_not_split_other_refusals() {
 		for errno in [libc::EACCES, libc::ENOEXEC, libc::ENOMEM, libc::ETXTBSY] {
 			let (code, err, tried, ran) = refused_above(0, errno, true).await;
-			assert_eq!(code, 1, "errno {errno}: {err}");
-			assert_eq!(err.matches("find: ‘true’: ").count(), 1, "errno {errno}: {err}");
+			assert_eq!((code, err.as_str()), (1, ""), "errno {errno}");
 			assert_eq!(tried, [10], "errno {errno}");
 			assert!(ran.is_empty(), "errno {errno}: {ran:?}");
+		}
+	}
+
+	/// find quotes as GNU's find quotes in the locale it runs in: `'NAME'`
+	/// in the C locale, `‘NAME’` in a UTF-8 one. So for a command it could
+	/// not start (one file too long on its own, `E2BIG`), and for a date it
+	/// cannot read (`-newermt`).
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_command_find_cannot_start_is_quoted_for_the_locale() {
+		let (_dir, root) = fixture();
+		fs::create_dir(root.join("one")).unwrap();
+		fs::write(root.join("one/1"), b"").unwrap();
+		for (locale, open, close) in [("C", "'", "'"), ("C.UTF-8", "‘", "’")] {
+			let (runner, _) = crate::host::Refusing::new(1, 0, libc::E2BIG);
+			let argv = ["find", "one", "-type", "f", "-exec", "true", "{}", "+"];
+			let env = [("LC_ALL", locale)];
+			let (code, _, err) =
+				crate::host::run_extra_with(&argv, "", &root, &env, |_, _, _, _| Box::new(runner)).await;
+			let said = format!("find: {open}true{close}: Argument list too long\n");
+			assert_eq!((code, err), (1, said), "LC_ALL={locale}");
+			let (code, _, err) =
+				crate::host::run_extra(&["find", "one", "-newermt", "no-date"], "", &root, &env).await;
+			let said = format!("interpret {open}no-date{close} as a date or time");
+			assert!(code != 0 && err.contains(&said), "LC_ALL={locale}: {code} {err}");
 		}
 	}
 

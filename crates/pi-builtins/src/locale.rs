@@ -64,15 +64,106 @@ fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
 	codeset_is_utf8(name)
 }
 
-/// `name` quoted for a diagnostic as GNU's `quote` quotes it in the locale
-/// `var` reads (`LC_ALL`, `LC_CTYPE`, `LANG`): `‘name’` in a UTF-8 locale the
-/// system can load, `'name'` otherwise (the C locale), as coreutils' `env`
-/// and `timeout` print the command they could not run.
+/// `name` quoted for a diagnostic as GNU's `quote` (quotearg's
+/// `locale_quoting_style`) quotes it in the locale `var` reads (`LC_ALL`,
+/// `LC_CTYPE`, `LANG`), as coreutils' `env` and `timeout` and findutils'
+/// `find` print a command they could not run: `‘name’` in a UTF-8 locale
+/// the system can load, `'name'` otherwise (the C locale, where a `'` in the
+/// name is `\'`). A backslash is `\\`; a character that is not printable in
+/// the locale is a C escape (`\t`, `\n`, …) or the octal escapes of its
+/// bytes (`\303\251` for `é` in the C locale).
 pub fn gnu_quote<'v>(var: impl Fn(&str) -> Option<&'v str>, name: &str) -> String {
-	if ctype_is_utf8_in(var) {
-		format!("‘{name}’")
+	let utf8 = ctype_is_utf8_in(var);
+	let (open, close) = if utf8 { ('‘', '’') } else { ('\'', '\'') };
+	let mut out = String::with_capacity(name.len() + 2);
+	out.push(open);
+	for c in name.chars() {
+		match c {
+			'\\' => out.push_str("\\\\"),
+			'\'' if !utf8 => out.push_str("\\'"),
+			c if printable(c, utf8) => out.push(c),
+			c => escape(&mut out, c),
+		}
+	}
+	out.push(close);
+	out
+}
+
+/// `name` quoted as GNU's `quoteaf` (quotearg's
+/// `shell_escape_always_quoting_style`) quotes it in the locale `var`
+/// reads, as coreutils' `nohup` prints a command it could not run: a word
+/// a shell reads back as `name`. `'name'`, with a `'` as `'\''` and a
+/// character not printable in the locale as `$'\t'`, `$'\303\251'`, …;
+/// but `"name"` for a name holding a `'` whose characters are all safe in
+/// both C and shell double quotes (`"it's"`).
+pub fn gnu_quote_shell<'v>(var: impl Fn(&str) -> Option<&'v str>, name: &str) -> String {
+	let utf8 = ctype_is_utf8_in(var);
+	let safe = |c: char| {
+		c.is_ascii_alphanumeric() || "%+,-./:]_@'".contains(c) || (!c.is_ascii() && printable(c, utf8))
+	};
+	if name.contains('\'') && name.chars().all(safe) {
+		return format!("\"{name}\"");
+	}
+	let mut out = String::with_capacity(name.len() + 2);
+	out.push('\'');
+	// Inside a `$'…'` of escapes, closed (and the quotes reopened) at the
+	// next printable character.
+	let mut escaping = false;
+	for c in name.chars() {
+		if printable(c, utf8) {
+			if escaping {
+				out.push_str("''");
+				escaping = false;
+			}
+			if c == '\'' {
+				out.push_str("'\\''");
+			} else {
+				out.push(c);
+			}
+		} else {
+			if !escaping {
+				out.push_str("'$'");
+				escaping = true;
+			}
+			escape(&mut out, c);
+		}
+	}
+	out.push('\'');
+	out
+}
+
+/// Whether quotearg prints `c` as itself: printable ASCII, or in a UTF-8
+/// locale any character but a control.
+fn printable(c: char, utf8: bool) -> bool {
+	if c.is_ascii() {
+		(' '..='~').contains(&c)
 	} else {
-		format!("'{name}'")
+		utf8 && !c.is_control()
+	}
+}
+
+/// quotearg's backslash escape of the unprintable `c`: a C escape, else the
+/// octal escape of each of its bytes.
+fn escape(out: &mut String, c: char) {
+	use std::fmt::Write as _;
+	let letter = match c {
+		'\x07' => Some('a'),
+		'\x08' => Some('b'),
+		'\x0c' => Some('f'),
+		'\n' => Some('n'),
+		'\r' => Some('r'),
+		'\t' => Some('t'),
+		'\x0b' => Some('v'),
+		_ => None,
+	};
+	if let Some(letter) = letter {
+		out.push('\\');
+		out.push(letter);
+		return;
+	}
+	let mut bytes = [0; 4];
+	for byte in c.encode_utf8(&mut bytes).bytes() {
+		let _ = write!(out, "\\{byte:03o}");
 	}
 }
 
@@ -210,5 +301,37 @@ pub(crate) fn numeric_symbols(host: &Host) -> NumericSymbols {
 			[0xc2, 0xa0] if !utf8 => Some(0xa0),
 			_ => None,
 		},
+	}
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use super::{gnu_quote, gnu_quote_shell};
+
+	/// `quote` and `quoteaf` as coreutils 9.4 prints a command it could not
+	/// run, measured with `/usr/bin/timeout 5 NAME` and `/usr/bin/nohup NAME`
+	/// in the C and C.UTF-8 locales: for each name, the C `quote`, the UTF-8
+	/// `quote`, and `quoteaf` in C and in UTF-8.
+	#[test]
+	fn names_are_quoted_as_coreutils_quotes_them() {
+		let cases = [
+			("plain", "'plain'", "‘plain’", "'plain'", "'plain'"),
+			("it's", "'it\\'s'", "‘it's’", "\"it's\"", "\"it's\""),
+			("it's\"q", "'it\\'s\"q'", "‘it's\"q’", "'it'\\''s\"q'", "'it'\\''s\"q'"),
+			("a b", "'a b'", "‘a b’", "'a b'", "'a b'"),
+			("dq\"x", "'dq\"x'", "‘dq\"x’", "'dq\"x'", "'dq\"x'"),
+			("d$x", "'d$x'", "‘d$x’", "'d$x'", "'d$x'"),
+			("b\\s", "'b\\\\s'", "‘b\\\\s’", "'b\\s'", "'b\\s'"),
+			("t\tab", "'t\\tab'", "‘t\\tab’", "'t'$'\\t''ab'", "'t'$'\\t''ab'"),
+			("n\nl", "'n\\nl'", "‘n\\nl’", "'n'$'\\n''l'", "'n'$'\\n''l'"),
+			("é", "'\\303\\251'", "‘é’", "''$'\\303\\251'", "'é'"),
+		];
+		let c = |key: &str| (key == "LC_ALL").then_some("C");
+		let utf8 = |key: &str| (key == "LC_ALL").then_some("C.UTF-8");
+		for (name, quote_c, quote_utf8, shell_c, shell_utf8) in cases {
+			let got = (gnu_quote(c, name), gnu_quote(utf8, name), gnu_quote_shell(c, name), gnu_quote_shell(utf8, name));
+			let want = (quote_c.to_owned(), quote_utf8.to_owned(), shell_c.to_owned(), shell_utf8.to_owned());
+			assert_eq!(got, want, "{name:?}");
+		}
 	}
 }

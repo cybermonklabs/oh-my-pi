@@ -43,15 +43,18 @@ use crate::{
 
 /// A live engine session and the filesystem it runs on.
 struct ShellSessionCore {
-	session:    Session,
+	session:      Session,
 	/// The engine's filesystem slot (shared with the session's host). Each run
 	/// installs a cancellation-scoped view of the session filesystem, or of
 	/// the run's own override, and restores the session filesystem after it.
-	slot:       VfsFs,
+	slot:         VfsFs,
 	/// Session filesystem.
-	filesystem: Fs,
+	filesystem:   Fs,
 	/// The shell's working directory after the last command.
-	cwd:        BString,
+	cwd:          BString,
+	/// How long a cancelled run's output readers stay open
+	/// ([`CANCEL_READER_GRACE`], or [`ShellOptions::cancel_grace`]).
+	reader_grace: Duration,
 }
 
 #[derive(Clone, Default)]
@@ -152,6 +155,12 @@ pub struct ShellOptions {
 	pub minimizer:     Option<minimizer::MinimizerOptions>,
 	/// Filesystem backing every run of the session (native by default).
 	pub filesystem:    Fs,
+	/// How long a cancel waits before it ends a run by force: between TERM and
+	/// KILL of its processes, and before it closes the run's output readers.
+	/// `None`: pi's ([`TERM_GRACE`](crate::host::TERM_GRACE), 1.25 s for the
+	/// readers). A test that drives what happens inside the grace widens it
+	/// for its own shell.
+	pub cancel_grace:  Option<Duration>,
 }
 
 struct ShellRunConfig {
@@ -234,15 +243,18 @@ impl SessionHandles {
 }
 
 pub struct Shell {
-	session:     Arc<TokioMutex<Option<ShellSessionCore>>>,
-	abort_state: ShellAbortState,
-	config:      ShellConfig,
-	active:      ActiveSession,
+	session:      Arc<TokioMutex<Option<ShellSessionCore>>>,
+	abort_state:  ShellAbortState,
+	config:       ShellConfig,
+	active:       ActiveSession,
+	/// [`ShellOptions::cancel_grace`].
+	cancel_grace: Option<Duration>,
 }
 
 impl Shell {
 	#[must_use]
 	pub fn new(options: Option<ShellOptions>) -> Self {
+		let cancel_grace = options.as_ref().and_then(|opt| opt.cancel_grace);
 		let config = match options {
 			None => ShellConfig {
 				session_env:   None,
@@ -265,15 +277,16 @@ impl Shell {
 				}
 			},
 		};
-		Self::with_config(config)
+		Self::with_config(config, cancel_grace)
 	}
 
-	fn with_config(config: ShellConfig) -> Self {
+	fn with_config(config: ShellConfig, cancel_grace: Option<Duration>) -> Self {
 		Self {
 			session: Arc::new(TokioMutex::new(None)),
 			abort_state: ShellAbortState::default(),
 			config,
 			active: ActiveSession::default(),
+			cancel_grace,
 		}
 	}
 
@@ -287,10 +300,10 @@ impl Shell {
 	#[must_use]
 	pub fn fork(&self) -> Self {
 		let latest = self.active.lock().as_ref().map(|active| active.image.get());
-		Self::with_config(ShellConfig {
-			seed: latest.or_else(|| self.config.seed.clone()),
-			..self.config.clone()
-		})
+		Self::with_config(
+			ShellConfig { seed: latest.or_else(|| self.config.seed.clone()), ..self.config.clone() },
+			self.cancel_grace,
+		)
 	}
 
 	pub async fn run(
@@ -313,6 +326,7 @@ impl Shell {
 			self.abort_state.clone(),
 			self.active.clone(),
 			self.config.clone(),
+			self.cancel_grace,
 			run_config,
 			on_chunk,
 			&mut cancel_token,
@@ -453,12 +467,6 @@ const CANCEL_READER_GRACE: Duration = Duration::from_millis(2000);
 #[cfg(not(windows))]
 const CANCEL_READER_GRACE: Duration = Duration::from_millis(1250);
 
-/// [`CANCEL_READER_GRACE`], unless a test widened it
-/// ([`crate::testkit::grace::Longer`]).
-fn reader_grace() -> Duration {
-	crate::testkit::grace::or(CANCEL_READER_GRACE, &crate::testkit::grace::READER)
-}
-
 /// What a run reports when it ends normally.
 struct CommandResult {
 	status:      i32,
@@ -494,6 +502,7 @@ async fn run_shell_session(
 	abort_state: ShellAbortState,
 	active: ActiveSession,
 	config: ShellConfig,
+	cancel_grace: Option<Duration>,
 	run_config: ShellRunConfig,
 	on_chunk: Option<Sender<String>>,
 	ct: &mut CancelToken,
@@ -510,7 +519,7 @@ async fn run_shell_session(
 			let core = if let Some(core) = &mut *session_guard {
 				core
 			} else {
-				let core = create_session_for_run(&config, Some(&tokio_cancel)).await?;
+				let core = create_session_for_run(&config, Some(&tokio_cancel), cancel_grace).await?;
 				*active.lock() = Some(SessionHandles::of(&core.session));
 				session_guard.insert(core)
 			};
@@ -565,7 +574,7 @@ async fn run_shell_oneshot(
 		let tokio_cancel = tokio_cancel.clone();
 		async move {
 			// The session ends with this task: its background jobs end with it.
-			let mut session = create_session_for_run(&config, Some(&tokio_cancel)).await?;
+			let mut session = create_session_for_run(&config, Some(&tokio_cancel), None).await?;
 			run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel).await
 		}
 	});
@@ -598,7 +607,7 @@ async fn run_shell_oneshot_streams(
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
 		async move {
-			let mut session = create_session_for_run(&config, Some(&tokio_cancel)).await?;
+			let mut session = create_session_for_run(&config, Some(&tokio_cancel), None).await?;
 			run_shell_command_streams(&mut session, &run_config, streams, tokio_cancel).await
 		}
 	});
@@ -754,7 +763,7 @@ fn merge_path_values(_existing: &str, incoming: &str) -> String {
 
 #[cfg(test)]
 async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
-	create_session_for_run(config, None).await
+	create_session_for_run(config, None, None).await
 }
 
 /// Copies the host environment into `vars` (the shell's starting
@@ -848,12 +857,14 @@ fn initial_cwd() -> BString {
 	home.map_or_else(|| BString::from("/"), |home| path_bytes(&home))
 }
 
-/// Start a session for `config`, from its seed when it has one. Setup (the
+/// Start a session for `config`, from its seed when it has one, with the
+/// cancel grace `cancel_grace` ([`ShellOptions::cancel_grace`]). Setup (the
 /// `env` fallback, snapshot sourcing) belongs to the creating run, so its
 /// processes and provider calls stop with `cancel_token`.
 async fn create_session_for_run(
 	config: &ShellConfig,
 	cancel_token: Option<&CancellationToken>,
+	cancel_grace: Option<Duration>,
 ) -> Result<ShellSessionCore> {
 	let cancel = cancel_token.cloned().unwrap_or_default();
 	let runtime = tokio::runtime::Handle::current();
@@ -876,13 +887,20 @@ async fn create_session_for_run(
 		vfs: Some(slot.clone()),
 		runtime,
 		output_decoding: None,
+		term_grace: cancel_grace.unwrap_or(crate::host::TERM_GRACE),
 	};
 	let session = match &config.seed {
 		Some(image) => Session::restore(session_config, image),
 		None => Session::new(session_config),
 	}
 	.map_err(|err| Error::msg(format!("Failed to initialize shell: {err}")))?;
-	let mut core = ShellSessionCore { session, slot, filesystem: config.filesystem.clone(), cwd };
+	let mut core = ShellSessionCore {
+		session,
+		slot,
+		filesystem: config.filesystem.clone(),
+		cwd,
+		reader_grace: cancel_grace.unwrap_or(CANCEL_READER_GRACE),
+	};
 
 	// A seed already holds both.
 	if config.seed.is_none() {
@@ -1449,9 +1467,10 @@ async fn run_shell_command_once(
 	let cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let reader_cancel = reader_cancel.clone();
+		let grace = session.reader_grace;
 		async move {
 			cancel_token.cancelled().await;
-			time::sleep(reader_grace()).await;
+			time::sleep(grace).await;
 			reader_cancel.cancel();
 		}
 	});
@@ -1593,9 +1612,10 @@ async fn run_shell_command_streams_in_filesystem(
 	let cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let reader_cancel = reader_cancel.clone();
+		let grace = session.reader_grace;
 		async move {
 			cancel_token.cancelled().await;
-			time::sleep(reader_grace()).await;
+			time::sleep(grace).await;
 			reader_cancel.cancel();
 		}
 	});

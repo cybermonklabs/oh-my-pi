@@ -34,6 +34,12 @@ export interface DaemonSnapshot {
 	id: string;
 	state: DaemonState;
 	pid?: number;
+	/**
+	 * The kernel's start mark of the process `pid` names (`Process.startMark`), read when it was
+	 * spawned: with `pid` it names that process alone, so a process that reused the pid is told
+	 * from it whatever the wall clock did since. Absent when it could not be read.
+	 */
+	processStart?: string;
 	createdAt: number;
 	startedAt: number;
 	readyAt?: number;

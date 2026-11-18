@@ -174,6 +174,10 @@ const KILL_GRACE: Duration = Duration::ZERO;
 const CANCEL_EXIT_WAIT: Duration = Duration::from_millis(800);
 #[cfg(windows)]
 const CANCEL_EXIT_WAIT: Duration = POST_CANCEL_DRAIN_TIMEOUT;
+/// How often the stop pins the PTY command before it gives up: a failure
+/// that proves nothing (no descriptor left) passes, as other work releases
+/// what it held.
+const PIN_ATTEMPTS: u32 = 3;
 
 struct PtySessionCore {
 	control_tx: flume::Sender<ControlMessage>,
@@ -477,9 +481,9 @@ fn run_pty_sync(
 	// the reap its pid may be recycled, and a pid-only signal (a lookup at
 	// cancellation time, or portable-pty's `clone_killer`) would hit whatever
 	// process took it (#4605). The child is only ever signalled through
-	// `pinned_child`. A child that cannot be pinned (no descriptor left) is
-	// still reached through its process group, but its tree cannot be walked:
-	// a stop then reports it.
+	// `pinned_child`. Where the system provides no pidfd the pin is by start
+	// time (`Process::open`); a pin that fails for a reason that proves
+	// nothing (no descriptor left) is tried again, as such a failure passes.
 	let mut targets = ps::TerminationTargets::new();
 	#[cfg(unix)]
 	if let Some(pgid) = master.process_group_leader().filter(|pgid| *pgid > 0) {
@@ -488,17 +492,21 @@ fn run_pty_sync(
 	// Why a stop may have missed a process of the tree: the child could not be
 	// pinned, or the last kill wave could not read the whole tree.
 	let mut unreached: Option<std::io::Error> = None;
-	let pinned_child = match child_pid.map(pi_shell::proctree::Process::open) {
-		Some(Ok(pinned)) => pinned,
-		Some(Err(error)) => {
-			unreached = Some(std::io::Error::new(
-				error.kind(),
-				format!("the PTY command could not be pinned to walk its process tree: {error}"),
-			));
-			None
-		},
-		None => None,
-	};
+	let pinned_child = child_pid.and_then(|pid| {
+		let mut last = None;
+		for _ in 0..PIN_ATTEMPTS {
+			match pi_shell::proctree::Process::open(pid) {
+				Ok(pinned) => return pinned,
+				Err(error) => last = Some(error),
+			}
+		}
+		let error = last?;
+		unreached = Some(std::io::Error::new(
+			error.kind(),
+			format!("the PTY command could not be pinned to walk its process tree: {error}"),
+		));
+		None
+	});
 	if let Some(process) = &pinned_child {
 		targets.add_process(process.clone());
 	}
@@ -652,13 +660,21 @@ fn run_pty_sync(
 	);
 	drop(pump_task);
 	// Every process the stop could find was killed, and the process groups,
-	// which need no read; one it could not find is reported, not passed over.
+	// which need no read. A process group the command leads reached it and
+	// everything in its group; a process it could not find is then logged
+	// only, so a cancel still returns as one. Without a group (Windows), a
+	// process the stop could not find is reported, not passed over.
 	if (cancelled || timed_out)
 		&& let Some(error) = wave_unreached.or(unreached)
 	{
-		return Err(Error::from_reason(format!(
-			"PTY command stopped, but its process tree could not be read whole: {error}"
-		)));
+		if !targets.has_process_group() {
+			return Err(Error::from_reason(format!(
+				"PTY command stopped, but its process tree could not be read whole: {error}"
+			)));
+		}
+		log::warn!(
+			"PTY command stopped through its process group; part of its tree was unread: {error}"
+		);
 	}
 	Ok(PtyRunResult { exit_code, cancelled, timed_out })
 }

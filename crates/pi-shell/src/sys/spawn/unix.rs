@@ -312,6 +312,8 @@ pub struct Escalation {
 #[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct Fired {
+	/// The deadline it waited for: when the escalation scheduled KILL.
+	pub due:    Instant,
 	/// When it ran.
 	pub at:     Instant,
 	/// The scope's live processes just before it: what TERM and the grace
@@ -348,18 +350,18 @@ impl Journal {
 		}
 	}
 
-	/// The KILL step runs now on `scope`; `killed` when it sends KILL to it.
-	/// Called before the signal goes out.
+	/// The KILL step, due at `due`, runs now on `scope`; `killed` when it
+	/// sends KILL to it. Called before the signal goes out.
 	#[cfg_attr(not(test), expect(clippy::missing_const_for_fn, reason = "records in test builds"))]
-	fn fire(&self, scope: Scope, killed: bool) {
+	fn fire(&self, scope: Scope, killed: bool, due: Instant) {
 		#[cfg(test)]
 		{
 			let at = Instant::now();
 			let alive = scope.members().map_err(|e| e.to_string());
-			self.0.lock().fired = Some(Fired { at, alive, killed, swept: None });
+			self.0.lock().fired = Some(Fired { due, at, alive, killed, swept: None });
 		}
 		#[cfg(not(test))]
-		let _ = (self, scope, killed);
+		let _ = (self, scope, killed, due);
 	}
 
 	/// The sweep after the KILL step ran, with this outcome.
@@ -1867,7 +1869,7 @@ fn escalate(tracker: &Tracker, scope: Scope, kill_at: Instant, journal: &Journal
 	{
 		let mut life = tracker.lock();
 		let kill = life.take_kill(Instant::now().max(kill_at));
-		journal.fire(scope, kill);
+		journal.fire(scope, kill, kill_at);
 		if kill {
 			let _ = scope.signal(Signal::Kill);
 		}
