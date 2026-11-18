@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
+	closeModelCache,
 	getModelCacheWriteStats,
 	readModelCache,
 	readModelCacheSteps,
@@ -14,7 +15,7 @@ import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import { modelsDevCatalogFallback } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import type { FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
-import { getModelDbPath } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, getModelDbPath, setAgentDir } from "@oh-my-pi/pi-utils";
 import { removeWithRetries } from "../../utils/src/temp";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
@@ -305,19 +306,29 @@ describe("readModelCacheSteps", () => {
 
 	it("does not memoize a parse of the row a write from this process replaced after the read", async () => {
 		// The shared default connection: a write here does not move its data_version, so only the
-		// memo's own bookkeeping keeps a stale parse out. The test's HOME is an empty directory.
-		const sharedPath = getModelDbPath();
-		expect(sharedPath.startsWith(os.homedir())).toBe(true);
-		await fs.mkdir(path.dirname(sharedPath), { recursive: true });
-		writeModelCache("stale-memo-test", 1_000, [model("a", "stale-memo-test")], true, "fp");
-		const steps = readModelCacheSteps<"openai-completions">("stale-memo-test", TTL_MS, () => 1_000);
-		expect(steps.next().done).toBe(false);
-		// Another pass writes the row between this read and its parse.
-		writeModelCache("stale-memo-test", 2_000, [model("b", "stale-memo-test")], true, "fp");
-		expect(steps.next().value?.models.map(entry => entry.id)).toEqual(["a"]);
-		// The next read, e.g. the same pass's re-read on its row turn, sees the write.
-		const next = readModelCache<"openai-completions">("stale-memo-test", TTL_MS, () => 2_000);
-		expect(next?.models.map(entry => entry.id)).toEqual(["b"]);
+		// memo's own bookkeeping keeps a stale parse out. The agent directory is the test's own, so the
+		// shared database it opens is never the one a running omp uses.
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const agentDir = path.join(tempDir, "agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		setAgentDir(agentDir);
+		try {
+			expect(getModelDbPath().startsWith(agentDir)).toBe(true);
+			writeModelCache("stale-memo-test", 1_000, [model("a", "stale-memo-test")], true, "fp");
+			const steps = readModelCacheSteps<"openai-completions">("stale-memo-test", TTL_MS, () => 1_000);
+			expect(steps.next().done).toBe(false);
+			// Another pass writes the row between this read and its parse.
+			writeModelCache("stale-memo-test", 2_000, [model("b", "stale-memo-test")], true, "fp");
+			expect(steps.next().value?.models.map(entry => entry.id)).toEqual(["a"]);
+			// The next read, e.g. the same pass's re-read on its row turn, sees the write.
+			const next = readModelCache<"openai-completions">("stale-memo-test", TTL_MS, () => 2_000);
+			expect(next?.models.map(entry => entry.id)).toEqual(["b"]);
+		} finally {
+			closeModelCache();
+			if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			__resetDirsFromEnvForTests();
+		}
 	});
 
 	it("deletes a corrupt row only if no write replaced it between the read and the parse", () => {
