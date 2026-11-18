@@ -783,7 +783,7 @@ describe("handleRpcCancelSubagent", () => {
 		expect(AgentRegistry.global().markRunEnded(id, session)).toBe(true);
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
 
-		const run = runSubagentFollowUpTurn({ id, agent, message: "continue", eventBus });
+		const run = runSubagentFollowUpTurn({ id, agent, message: "continue", eventBus, storeMaskCwd: "/tmp" });
 		await promptEntered.promise;
 		// Listed by its started frame; its first turn has not started, so the ref is still idle.
 		expect(registry.getSubagents().map(({ id, status }) => ({ id, status }))).toEqual([{ id, status: "running" }]);
