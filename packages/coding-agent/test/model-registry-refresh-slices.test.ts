@@ -162,6 +162,54 @@ describe("ModelRegistry discovery slicing", () => {
 		expect(registry.find("ordered-provider", "model-v1")).toBeUndefined();
 	});
 
+	test("a pass that stops before its commit does not let a later pass commit before an earlier one", async () => {
+		mockSteadyClock();
+		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
+		const row = (id: string) => ({
+			id,
+			name: id,
+			reasoning: false,
+			input: ["text" as const],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		let fetches = 0;
+		const { promise: firstFetchDone, resolve: firstFetchResolved } = Promise.withResolvers<void>();
+		registry.registerProvider(
+			"chained-provider",
+			{
+				baseUrl: "https://chained.example.com/v1",
+				apiKey: "CHAINED_KEY",
+				api: "openai-completions",
+				fetchDynamicModels: async () => {
+					fetches++;
+					if (fetches > 1) return [row("model-v2")];
+					await new Promise(resolve => setTimeout(resolve, 300));
+					queueMicrotask(firstFetchResolved);
+					return [row("model-v1")];
+				},
+			},
+			"ext://chained",
+		);
+		const order: string[] = [];
+		// A: a full pass whose fetches resolve with v1; it then merges in slices.
+		const fullPass = registry.refresh("online").then(() => order.push("full"));
+		await firstFetchDone;
+		for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+		// B: a pass with nothing to commit, which stops between A and C.
+		await registry.refreshDiscoverableProviders(["no-such-provider"], "online").then(() => order.push("stopped"));
+		expect(registry.find("chained-provider", "model-v1")).toBeUndefined();
+		// C: a later pass that fetches v2 and must commit after A.
+		const laterPass = registry
+			.refreshDiscoverableProviders(["chained-provider"], "online")
+			.then(() => order.push("later"));
+		await Promise.all([fullPass, laterPass]);
+		expect(order).toEqual(["stopped", "full", "later"]);
+		expect(registry.find("chained-provider", "model-v2")).toBeDefined();
+		expect(registry.find("chained-provider", "model-v1")).toBeUndefined();
+	});
+
 	test("a cache-served pass during an online pass's merge keeps the list the online pass fetched", async () => {
 		mockSteadyClock();
 		const modelsPath = tempDir.join("cfg", "models.json");
