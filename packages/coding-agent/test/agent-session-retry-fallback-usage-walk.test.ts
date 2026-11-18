@@ -583,6 +583,48 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(last.errorMessage).toBe(`Retry budget exhausted after 2 retries: ${SERVER_ERROR}`);
 		});
 
+		it("passes over an alias of the failed primary in cooldown when a fallback fails, to the model after it", async () => {
+			// The primary fails and goes into cooldown, and the walk moves to the
+			// fallback. The fallback fails too. Its own chain names `pi/default`,
+			// which resolves to the primary, and then the next fallback. The walk
+			// must not go back to the primary while it is in cooldown: it passes over
+			// the alias and answers from the next fallback.
+			const requestedModels: string[] = [];
+			const mock = createMockModel();
+			const failing = new Set([formatModelString(PRIMARY), formatModelString(FALLBACK)]);
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: PRIMARY, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requestedModels.push(formatModelString(model));
+					if (failing.has(formatModelString(model))) return providerErrorStream(model, SERVER_ERROR, 500);
+					mock.push({ content: ["answered"] });
+					return mock.stream(model, context, options);
+				},
+			});
+			const run = startSession(
+				agent,
+				walkSettings(PRIMARY, {
+					"retry.maxRetries": 2,
+					"retry.fallbackChains": {
+						default: [formatModelString(FALLBACK)],
+						[formatModelString(FALLBACK)]: ["pi/default", formatModelString(NEXT_FALLBACK)],
+					},
+				}),
+			);
+
+			await runTurn(run.session, "Fail on the primary and on the fallback");
+
+			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
+				formatModelString(FALLBACK),
+				formatModelString(NEXT_FALLBACK),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(FALLBACK), formatModelString(NEXT_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
 		it("switches to no fallback when the session is aborted during the usage read of a fallback", async () => {
 			const readStarted = Promise.withResolvers<void>();
 			stubUsageReads({
