@@ -82,6 +82,11 @@
       "import": "./native/natives-dir.js",
       "default": "./native/natives-dir.js"
     },
+    "./regular-file": {
+      "types": "./native/regular-file.d.ts",
+      "import": "./native/regular-file.js",
+      "default": "./native/regular-file.js"
+    },
     "./desktop": {
       "types": "./native/desktop.d.ts",
       "import": "./native/desktop.js",

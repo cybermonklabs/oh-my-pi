@@ -334,6 +334,8 @@ export async function prepareNativeCorePackage(pkgDir: string, write: boolean): 
 		"native/path.d.ts",
 		"native/natives-dir.js",
 		"native/natives-dir.d.ts",
+		"native/regular-file.js",
+		"native/regular-file.d.ts",
 		"native/workspace-sources.js",
 		"native/workspace-sources.d.ts",
 		"native/sqlite-locks.js",

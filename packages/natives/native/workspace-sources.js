@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { readRegularFile, readRegularFileText } from "./regular-file.js";
 
 /**
  * Which Rust sources a workspace checkout's addon was built from.
@@ -346,12 +347,9 @@ function buildScriptScannedDirs(repoRoot, files) {
 	const byDir = new Map();
 	for (const rel of files) {
 		if (path.posix.basename(rel) !== "BUILD.bazel") continue;
-		let text;
-		try {
-			text = fs.readFileSync(path.join(repoRoot, rel), "utf8");
-		} catch {
-			continue;
-		}
+		// A `BUILD.bazel` that is not a regular file (a FIFO, say) has no globs to give.
+		const text = readRegularFileText(path.join(repoRoot, rel));
+		if (text === undefined) continue;
 		const pkg = path.posix.dirname(rel);
 		for (const call of starlarkCalls(text, "cargo_build_script")) {
 			for (const glob of globCalls(call)) {
@@ -430,56 +428,32 @@ function fingerprintOf(repoRoot, files) {
 }
 
 /**
- * The kind of a file that is neither a regular file nor a link, by which the record names it.
- * @param {fs.Stats} stat
- * @returns {string}
- */
-function specialKind(stat) {
-	if (stat.isFIFO()) return "fifo";
-	if (stat.isSocket()) return "socket";
-	if (stat.isCharacterDevice()) return "character-device";
-	if (stat.isBlockDevice()) return "block-device";
-	if (stat.isDirectory()) return "directory";
-	return "other";
-}
-
-/**
  * SHA-256 of one source as the record identifies it: its bytes, a link's target, a file of
- * another kind (a FIFO, a socket, a device) by its kind alone, or `missing`. It never blocks:
- * a file that `lstat` shows is not regular is never opened, and a regular one is opened
- * without following a link or waiting (`O_NOFOLLOW | O_NONBLOCK`), so one swapped for a FIFO
- * or a link in between is named by what `fstat`, or the refused `open`, shows.
+ * another kind (a FIFO, a socket, a device, a directory) by its kind alone, or `missing`. It
+ * never blocks and never throws on what it finds: the file is read through
+ * `readRegularFile`, which opens only a regular file, without following a link or waiting, and
+ * names anything else, also a file swapped for another kind between its `lstat` and its `open`,
+ * by what stands there.
  * @param {string} repoRoot
  * @param {string} rel
  */
 function hashSource(repoRoot, rel) {
-	const stat = lstatSource(repoRoot, rel);
-	if (!stat) return "missing";
-	const hasher = new Bun.CryptoHasher("sha256");
 	const file = path.join(repoRoot, rel);
-	if (stat.isSymbolicLink()) {
-		hasher.update(`symlink\0${fs.readlinkSync(file)}`);
-		return hasher.digest("hex");
-	}
-	if (!stat.isFile()) {
-		hasher.update(`special\0${specialKind(stat)}`);
-		return hasher.digest("hex");
-	}
-	const { O_RDONLY, O_NONBLOCK, O_NOFOLLOW } = fs.constants;
-	let fd;
-	try {
-		fd = fs.openSync(file, O_RDONLY | (O_NONBLOCK ?? 0) | (O_NOFOLLOW ?? 0));
-	} catch (err) {
-		// Replaced by a link after the `lstat`: hash it as the link it is now.
-		if (err?.code !== "ELOOP") throw err;
-		hasher.update(`symlink\0${fs.readlinkSync(file)}`);
-		return hasher.digest("hex");
-	}
-	try {
-		const now = fs.fstatSync(fd);
-		hasher.update(now.isFile() ? fs.readFileSync(fd) : `special\0${specialKind(now)}`);
-	} finally {
-		fs.closeSync(fd);
+	const read = readRegularFile(file);
+	if (read.kind === "missing") return "missing";
+	const hasher = new Bun.CryptoHasher("sha256");
+	if (read.kind === "file") {
+		hasher.update(read.content);
+	} else if (read.kind === "symlink") {
+		let target;
+		try {
+			target = fs.readlinkSync(file);
+		} catch {
+			// Changed again since: no target to name.
+		}
+		hasher.update(target === undefined ? "special\0changed" : `symlink\0${target}`);
+	} else {
+		hasher.update(`special\0${read.kind}`);
 	}
 	return hasher.digest("hex");
 }
@@ -536,7 +510,9 @@ function checkoutGitDir(repoRoot) {
 	const stat = fs.statSync(dotGit, { throwIfNoEntry: false });
 	if (stat?.isDirectory()) return dotGit;
 	if (!stat?.isFile()) return undefined;
-	const named = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(fs.readFileSync(dotGit, "utf8"));
+	// Read through the link git follows, without blocking on what it may have become.
+	const text = readRegularFileText(fs.realpathSync(dotGit));
+	const named = text === undefined ? null : /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(text);
 	// A submodule's `gitdir: ../.git/modules/sub` reached through a link to it: the
 	// `..` is the real parent's, not the link's.
 	return named ? path.resolve(fs.realpathSync(repoRoot), named[1]) : undefined;
@@ -566,13 +542,10 @@ export function checkoutId(repoRoot, create) {
 	} catch {
 		return null;
 	}
+	// An id file that is not a regular file (a FIFO, say) is no id, and is never opened.
 	const read = () => {
-		try {
-			const id = fs.readFileSync(idPath, "utf8").trim();
-			return /^[0-9a-f-]{36}$/.test(id) ? id : null;
-		} catch {
-			return null;
-		}
+		const id = readRegularFileText(idPath)?.trim();
+		return id !== undefined && /^[0-9a-f-]{36}$/.test(id) ? id : null;
 	};
 	const existing = read();
 	if (existing || !create) return existing;
@@ -733,8 +706,10 @@ function sameCheckoutKey(hasUntracked, recorded, current) {
  * @param {string} toAddonPath
  */
 export function copyAddonSourcesStamp(fromAddonPath, toAddonPath) {
-	const record = JSON.parse(fs.readFileSync(addonSourcesStampPath(fromAddonPath), "utf8"));
-	writeStamp(toAddonPath, { ...record, addon: addonIdentity(toAddonPath) });
+	const recordPath = addonSourcesStampPath(fromAddonPath);
+	const text = readRegularFileText(recordPath);
+	if (text === undefined) throw new Error(`${recordPath} is not a regular file`);
+	writeStamp(toAddonPath, { ...JSON.parse(text), addon: addonIdentity(toAddonPath) });
 }
 
 /**
@@ -797,7 +772,10 @@ function isWellFormedStamp(stamp) {
 export function addonSourcesState(addonPath, repoRoot) {
 	let stamp;
 	try {
-		stamp = JSON.parse(fs.readFileSync(addonSourcesStampPath(addonPath), "utf8"));
+		// A record that is not a regular file (a FIFO, say) is no record, and is never opened.
+		const text = readRegularFileText(addonSourcesStampPath(addonPath));
+		if (text === undefined) return "unknown";
+		stamp = JSON.parse(text);
 		const addon = fs.statSync(addonPath);
 		if (!isWellFormedStamp(stamp) || stamp.addon?.size !== addon.size || stamp.addon.mtimeMs !== addon.mtimeMs) {
 			return "unknown";

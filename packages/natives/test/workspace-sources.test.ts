@@ -54,6 +54,57 @@ async function build(roots: readonly string[] = CARGO_SOURCE_ROOTS, settings: Re
 /** Git with no user or system configuration, so a test repository behaves the same on any machine. */
 const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 
+/**
+ * Run `body` (JS source) in a process of its own, bounded, with `readRustSources`,
+ * `writeAddonSourcesStamp`, `addonSourcesState` and `checkoutId` in scope: a read that blocked
+ * would hang this test runner otherwise. `swapAtOpen(target, replacement)` renames
+ * `replacement` over `target` the first time the shared reader opens `target`, between its
+ * `lstat` and its `open`; `listenSocket(path)` binds a Unix socket there. Returns what the body
+ * printed, or null when the bound killed it.
+ */
+function bounded(body: string): unknown {
+	const sourcesJs = path.join(import.meta.dir, "../native/workspace-sources.js");
+	const regularFileJs = path.join(import.meta.dir, "../native/regular-file.js");
+	const script = `const { readRustSources, writeAddonSourcesStamp, addonSourcesState, checkoutId, CARGO_SOURCE_ROOTS } = await import(${JSON.stringify(sourcesJs)});
+const { __setRegularFileIoForTests } = await import(${JSON.stringify(regularFileJs)});
+const nodeFs = await import("node:fs");
+const repo = ${JSON.stringify(repo)};
+const addon = ${JSON.stringify(addon)};
+const swapAtOpen = (target, replacement) => {
+	let swapped = false;
+	__setRegularFileIoForTests({
+		openSync(file, flags, mode) {
+			if (!swapped && file === target) {
+				swapped = true;
+				nodeFs.renameSync(replacement, target);
+			}
+			return nodeFs.openSync(file, flags, mode);
+		},
+	});
+};
+const listenSocket = async socketPath => {
+	const server = (await import("node:net")).createServer();
+	await new Promise(resolve => server.listen(socketPath, resolve));
+	return server;
+};
+${body}
+process.exit(0);`;
+	const child = Bun.spawnSync([process.execPath, "--no-env-file", "-e", script], {
+		env: gitEnv,
+		stderr: "pipe",
+		timeout: 15_000,
+		killSignal: "SIGKILL",
+	});
+	if (child.exitedDueToTimeout) return null;
+	expect(child.stderr.toString()).toBe("");
+	return JSON.parse(child.stdout.toString());
+}
+
+/** Make a FIFO at `file`. */
+function mkfifo(file: string): void {
+	expect(Bun.spawnSync(["mkfifo", file]).exitCode).toBe(0);
+}
+
 describe("the Rust sources a workspace addon was built from", () => {
 	it("are current until a source file's content changes", async () => {
 		await build();
@@ -72,6 +123,15 @@ describe("the Rust sources a workspace addon was built from", () => {
 		await Bun.write(path.join(repo, "Cargo.lock"), "version = 4\n# changed\n");
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	});
+
+	it("are unknown, at once, when the record is a FIFO", async () => {
+		await build();
+		const record = `${addon}.sources.json`;
+		await fs.rm(record);
+		mkfifo(record);
+
+		expect(bounded("console.log(JSON.stringify(addonSourcesState(addon, repo)));")).toBe("unknown");
+	}, 60_000);
 
 	it("change nothing when a file is added after the build, and see a new module through its parent", async () => {
 		await build();
@@ -332,28 +392,6 @@ describe("inputs a build takes in that no listed file names", () => {
 		]);
 	});
 
-	/**
-	 * Run `body` (JS source) in a process of its own, bounded, with `readRustSources`,
-	 * `writeAddonSourcesStamp` and `addonSourcesState` in scope: a read that blocked would hang
-	 * this test runner otherwise. Returns what the body printed, or null when the bound killed it.
-	 */
-	function bounded(body: string): unknown {
-		const sourcesJs = path.join(import.meta.dir, "../native/workspace-sources.js");
-		const script = `const { readRustSources, writeAddonSourcesStamp, addonSourcesState, CARGO_SOURCE_ROOTS } = await import(${JSON.stringify(sourcesJs)});
-const repo = ${JSON.stringify(repo)};
-const addon = ${JSON.stringify(addon)};
-${body}`;
-		const child = Bun.spawnSync([process.execPath, "--no-env-file", "-e", script], {
-			env: gitEnv,
-			stderr: "pipe",
-			timeout: 15_000,
-			killSignal: "SIGKILL",
-		});
-		if (child.exitedDueToTimeout) return null;
-		expect(child.stderr.toString()).toBe("");
-		return JSON.parse(child.stdout.toString());
-	}
-
 	it("record a FIFO a scanned directory holds by its type, without opening it, and stay current", async () => {
 		await checkout();
 		// A FIFO the glob matches: a build that opened it would wait for a writer forever.
@@ -383,6 +421,43 @@ console.log(JSON.stringify({ listed: first.files.includes(${JSON.stringify(fifo)
 
 		expect(bounded("console.log(JSON.stringify(addonSourcesState(addon, repo)));")).toBe("other");
 	}, 60_000);
+
+	it("list a BUILD.bazel that became a FIFO, with no globs, at once", async () => {
+		await checkout();
+		// git lists a tracked path whatever now stands there.
+		const buildFile = "crates/pi-shell/BUILD.bazel";
+		await fs.rm(path.join(repo, buildFile));
+		mkfifo(path.join(repo, buildFile));
+
+		expect(
+			bounded(`const sources = readRustSources(repo, CARGO_SOURCE_ROOTS);
+console.log(JSON.stringify({ listed: sources.files.includes(${JSON.stringify(buildFile)}), scanned: sources.scanned.map(entry => entry.dir) }));`),
+		).toEqual({ listed: true, scanned: [] });
+	}, 60_000);
+
+	it.each([["a FIFO"], ["a link"], ["a socket"]])(
+		"are other sources, at once, when a source turns into %s between its lstat and its open",
+		async label => {
+			await checkout();
+			const target = path.join(repo, "crates/pi-shell/src/lib.rs");
+			// A new time on the same bytes: the start reads the sources again, and so opens this one.
+			const later = new Date(Date.now() + 60_000);
+			await fs.utimes(target, later, later);
+			const staged = path.join(repo, "crates/pi-shell/src/staged");
+			let prepare = "";
+			if (label === "a FIFO") mkfifo(staged);
+			else if (label === "a link") await fs.symlink("lib.rs.orig", staged);
+			else prepare = `const server = await listenSocket(${JSON.stringify(staged)});`;
+
+			const result = bounded(`${prepare}
+swapAtOpen(${JSON.stringify(target)}, ${JSON.stringify(staged)});
+console.log(JSON.stringify({ state: addonSourcesState(addon, repo), now: nodeFs.lstatSync(${JSON.stringify(target)}).isFile() ? "file" : "other kind" }));`);
+
+			// The swap happened (the source is no longer a regular file), and the start said so at once.
+			expect(result).toEqual({ state: "other", now: "other kind" });
+		},
+		60_000,
+	);
 
 	it("are other sources when a file is added to a scanned directory, committed or not", async () => {
 		await checkout();
@@ -765,6 +840,19 @@ describe("the checkout a record names", () => {
 		for (const suffix of ["-moved", "-origin", "-saved", "-gitdir", "-super", "-link"])
 			await fs.rm(`${repo}${suffix}`, { recursive: true, force: true });
 	});
+
+	it("is no id, at once, when the id file is a FIFO, and a start still judges the sources", async () => {
+		await buildWithUntrackedModule();
+		const idFile = path.join(repo, ".git/omp-checkout-id");
+		await fs.rm(idFile);
+		mkfifo(idFile);
+
+		expect(
+			bounded(
+				"console.log(JSON.stringify({ read: checkoutId(repo, false), create: checkoutId(repo, true), state: addonSourcesState(addon, repo) }));",
+			),
+		).toEqual({ read: null, create: null, state: "current" });
+	}, 60_000);
 
 	it("is one id for builds that start at once, and its file is never seen without it", async () => {
 		// Threads released together at a gate stand in for builds that start at once in a fresh

@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { parseEnv } from "node:util";
 import { isMainThread } from "node:worker_threads";
 import { getNativesDir, NATIVES_DIR_HANDOFF_ENV_KEY } from "@oh-my-pi/pi-natives/natives-dir";
+import { readRegularFile } from "@oh-my-pi/pi-natives/regular-file";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
 import * as logger from "./logger";
 import { startupEnv } from "./startup-env";
@@ -222,29 +223,13 @@ function relaunchEnvMarkerLine(file: string): string | undefined {
 
 /**
  * Whether `file` is a regular file (not a link, a FIFO or a device) whose first line is
- * `marker`, where the writer puts it. It never blocks: a FIFO, or a link to one, is refused by
- * `lstat` before any `open`; the `open` itself does not follow a link and does not wait
- * (`O_NOFOLLOW | O_NONBLOCK`), so a file swapped for a link or a FIFO in between fails it or is
- * refused by `fstat`; and it reads only the marker's length and its newline.
+ * `marker`, where the writer puts it. Read through `readRegularFile`, so it never blocks and
+ * never throws on what stands there, and only the marker's length and its newline are read.
  */
 function startsWithRelaunchMarker(file: string, marker: string): boolean {
-	if (!fs.lstatSync(file).isFile()) return false;
-	const { O_RDONLY, O_NONBLOCK, O_NOFOLLOW } = fs.constants;
-	const fd = fs.openSync(file, O_RDONLY | (O_NONBLOCK ?? 0) | (O_NOFOLLOW ?? 0));
-	try {
-		if (!fs.fstatSync(fd).isFile()) return false;
-		const expected = Buffer.from(`${marker}\n`);
-		const head = Buffer.alloc(expected.length);
-		let read = 0;
-		while (read < head.length) {
-			const n = fs.readSync(fd, head, read, head.length - read, read);
-			if (n === 0) break;
-			read += n;
-		}
-		return read === head.length && head.equals(expected);
-	} finally {
-		fs.closeSync(fd);
-	}
+	const expected = Buffer.from(`${marker}\n`);
+	const read = readRegularFile(file, { length: expected.length });
+	return read.kind === "file" && read.content.equals(expected);
 }
 
 /**

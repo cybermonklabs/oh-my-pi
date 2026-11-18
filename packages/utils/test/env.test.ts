@@ -615,6 +615,61 @@ describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () 
 		60_000,
 	);
 
+	it.each([["a FIFO"], ["a link to a regular file that names the link's path"], ["a socket"]])(
+		"returns at once and keeps a loaded.env that turns into %s between its lstat and its open",
+		label => {
+			const regularFileJs = path.join(import.meta.dir, "../../natives/native/regular-file.js");
+			const base = tempBase();
+			const planted = relaunchDir(base, "omp-bun-env-Race01");
+			const staged = path.join(tempBase(), "staged");
+			let prepare = "";
+			if (label === "a FIFO") {
+				expect(Bun.spawnSync(["mkfifo", staged]).exitCode).toBe(0);
+			} else if (label.startsWith("a link")) {
+				// The worst case: the target's first line is the marker for the link's own path.
+				const target = path.join(tempBase(), "target");
+				fs.writeFileSync(target, fs.readFileSync(planted.file));
+				fs.symlinkSync(target, staged);
+			} else {
+				prepare = `const server = (await import("node:net")).createServer();\nawait new Promise(resolve => server.listen(${JSON.stringify(staged)}, resolve));`;
+			}
+			// Bun reads the regular file at the start; the seam swaps it between the reader's lstat
+			// and its open, as env.ts loads and removes the file it was started with.
+			const script = `const nodeFs = await import("node:fs");
+${prepare}
+const { __setRegularFileIoForTests } = await import(${JSON.stringify(regularFileJs)});
+let swapped = false;
+__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		if (!swapped && file === ${JSON.stringify(planted.file)}) {
+			swapped = true;
+			nodeFs.renameSync(${JSON.stringify(staged)}, file);
+		}
+		return nodeFs.openSync(file, flags, mode);
+	},
+});
+await import(${JSON.stringify(envTs)});
+console.log(JSON.stringify({ swapped }));
+process.exit(0);`;
+			const child = Bun.spawnSync([process.execPath, `--env-file=${planted.file}`, "-e", script], {
+				cwd: tempBase(),
+				env: { ...process.env, TMPDIR: base, PI_TEST_RELAUNCH_FALLBACK_DIR: tempBase() },
+				stderr: "pipe",
+				timeout: 15_000,
+				killSignal: "SIGKILL",
+			});
+
+			expect({ timedOut: child.exitedDueToTimeout ?? false, stderr: child.stderr.toString() }).toEqual({
+				timedOut: false,
+				stderr: "",
+			});
+			expect(JSON.parse(child.stdout.toString())).toEqual({ swapped: true });
+			expect(fs.readdirSync(planted.dir)).toEqual(["loaded.env"]);
+			expect(fs.lstatSync(planted.file).isFile()).toBe(false);
+		},
+		60_000,
+	);
+
 	it("keeps a loaded.env whose marker is on a later line, not the first, where the writer puts it", () => {
 		const base = tempBase();
 		const later = relaunchDir(base, "omp-bun-env-Later1", false);
