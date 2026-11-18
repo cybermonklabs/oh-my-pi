@@ -8,18 +8,22 @@ whether the workspace's omp session directory already holds a JSONL transcript.
 from __future__ import annotations
 
 import asyncio
+import os
 import stat
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from robomp import worker
 from robomp.config import Settings
 from robomp.git_ops import DirtyState
+
+if TYPE_CHECKING:
+    from tests.conftest import GitConfigSeries
 
 
 class _FakeRpcClient:
@@ -384,6 +388,109 @@ async def test_run_rpc_uses_workspace_xdg_dirs_without_slot(tmp_path: Path, sett
     assert env["GIT_COMMITTER_EMAIL"] == settings.git_author_email
     assert tmpdir.is_dir()
     assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
+
+
+def _agent_env(tmp_path: Path, settings: Settings) -> tuple[dict[str, str], worker.TaskInputs]:
+    """Run a triage turn against the fake client; return the env the agent starts with."""
+    inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False, slot_uid=None)
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="triage_issue",
+            prompt="x",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+    # omp_rpc starts the agent with `{**os.environ, **env}`.
+    return {**os.environ, **_FakeRpcClient.instances[0].kwargs["env"]}, inputs
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_replaces_inherited_git_config_with_safe_directory(
+    tmp_path: Path,
+    settings: Settings,
+    git_config: GitConfigSeries,
+    inherited_git_config: list[tuple[str, str]],
+) -> None:
+    # The agent runs code from the checkout: robomp's own series never reaches
+    # it, and no slot is left past the count.
+    agent_env, inputs = _agent_env(tmp_path, settings)
+
+    assert git_config.entries(agent_env) == [("safe.directory", str(inputs.workspace.repo_dir))]
+    assert git_config.past_count(agent_env) == {}
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_keeps_the_operator_credential_config_from_the_agent(
+    tmp_path: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    operator_config_channel: str,
+    agent_home: Path,
+) -> None:
+    # The agent runs code from the checkout. robomp's env names a credential
+    # helper and an Authorization header through each of seven channels; git,
+    # run in the agent's env, must see neither, with or without an agent home.
+    # With one it reads that home's own config.
+    monkeypatch.setattr(worker, "_AGENT_HOME", agent_home)
+
+    agent_env, inputs = _agent_env(tmp_path, settings)
+
+    assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the operator's config"
+    assert git_config.credentials(agent_env, tmp_path) == []
+    assert git_config.entries(agent_env) == [("safe.directory", str(inputs.workspace.repo_dir))]
+    expected_user = git_config.AGENT_HOME_USER if agent_home.is_dir() else None
+    assert git_config.get(agent_env, tmp_path, "user.name") == expected_user
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_gives_the_agent_its_own_xdg_config_home(
+    tmp_path: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    operator_git_ignore: Path,
+    agent_home: Path,
+) -> None:
+    # `GIT_CONFIG_GLOBAL` does not keep git from reading the operator's
+    # per-user ignore file, and gh's token lives under `$XDG_CONFIG_HOME` too.
+    # The agent's `XDG_CONFIG_HOME` is the agent home's `.config`, else the
+    # workspace's own empty dir, so git in the agent's env still shows the file
+    # the operator's ignore file hides.
+    monkeypatch.setattr(worker, "_AGENT_HOME", agent_home)
+
+    agent_env, inputs = _agent_env(tmp_path, settings)
+
+    assert git_config.untracked(os.environ, operator_git_ignore) == [], "control: git reads the operator's ignore"
+    assert git_config.untracked(agent_env, operator_git_ignore) == ["untracked.txt"]
+    expected = agent_home / ".config" if agent_home.is_dir() else inputs.workspace.root / ".omp-xdg" / "config"
+    assert agent_env["XDG_CONFIG_HOME"] == str(expected)
+
+
+_CREDENTIAL_ENV = {
+    "GH_TOKEN": "probe-gh-token",
+    "GIT_ASKPASS": "/probe/askpass",
+    "SSH_ASKPASS": "/probe/ssh-askpass",
+    "SSH_AUTH_SOCK": "/probe/agent.sock",
+}
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_keeps_credential_variables_from_the_agent(
+    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A token, a credential prompt program or the operator's ssh agent in
+    # robomp's env would let code from the checkout authenticate as robomp.
+    for key, value in _CREDENTIAL_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    agent_env, _ = _agent_env(tmp_path, settings)
+
+    assert {key: agent_env.get(key) for key in _CREDENTIAL_ENV} == dict.fromkeys(_CREDENTIAL_ENV, "")
 
 
 @pytest.mark.asyncio

@@ -131,6 +131,7 @@ import type {
 import {
 	applyInferenceHeaders,
 	applySessionHeader,
+	conversationSessionId,
 	resolveOpenCodeGoCacheAffinity,
 	setHeaderIfAbsent,
 } from "./inference-headers";
@@ -174,6 +175,8 @@ export interface OpenAIRequestSetupModel extends OpenAIModelIdentity, CatalogPol
 export interface OpenAICacheOptions {
 	cacheRetention?: CacheRetention;
 	sessionId?: string;
+	/** Conversation a side request branches from; its cache identities fall back to this before `sessionId`. */
+	parentSessionId?: string;
 	promptCacheKey?: string;
 }
 
@@ -190,6 +193,8 @@ export interface OpenAIRequestSetupOptions {
 		deploymentName: string;
 	};
 	sessionId?: string;
+	/** Conversation a side request branches from: its session headers carry this (see `applyInferenceHeaders`). */
+	parentSessionId?: string;
 	promptCacheSessionId?: string;
 	/**
 	 * Explicit prompt-cache identity only, never the sessionId fallback:
@@ -357,12 +362,13 @@ export function resolveOpenAIRequestSetup(
 		providerType: model.providerType,
 		protocol: "openai",
 		sessionId,
+		parentSessionId: options.parentSessionId,
 		cacheAffinity: resolveOpenCodeGoCacheAffinity(model, options.promptCacheAffinityKey),
 	});
 	if (options.promptCacheSessionId && model.compat?.promptCacheSessionHeader) {
 		setHeaderIfAbsent(headers, model.compat.promptCacheSessionHeader, options.promptCacheSessionId);
 	}
-	applySessionHeader(headers, model.compat, options.sessionId);
+	applySessionHeader(headers, model.compat, conversationSessionId(options));
 
 	if (options.defaultBaseUrl !== undefined) {
 		baseUrl = baseUrl ?? ($env.OPENAI_BASE_URL?.trim() || options.defaultBaseUrl);
@@ -555,7 +561,7 @@ export function normalizeOpenRouterResponsesSessionId(sessionId: string | undefi
 /** Resolve a prompt-cache identity, falling back to the provider session unless caching is disabled. */
 export function getOpenAIPromptCacheKey(options: OpenAICacheOptions | undefined): string | undefined {
 	if (resolveCacheRetention(options?.cacheRetention) === "none") return undefined;
-	return normalizeOpenAIPromptCacheKey(options?.promptCacheKey ?? options?.sessionId);
+	return normalizeOpenAIPromptCacheKey(options?.promptCacheKey ?? conversationSessionId(options));
 }
 
 export function getOpenAIResponsesRoutingSessionId(
@@ -566,10 +572,10 @@ export function getOpenAIResponsesRoutingSessionId(
 }
 
 export function getOpenRouterResponsesSessionId(
-	options: Pick<OpenAICacheOptions, "cacheRetention" | "sessionId"> | undefined,
+	options: Pick<OpenAICacheOptions, "cacheRetention" | "sessionId" | "parentSessionId"> | undefined,
 ): string | undefined {
 	if (resolveCacheRetention(options?.cacheRetention) === "none") return undefined;
-	return normalizeOpenRouterResponsesSessionId(options?.sessionId);
+	return normalizeOpenRouterResponsesSessionId(conversationSessionId(options));
 }
 
 export function parseAzureDeploymentNameMap(value: string | undefined): Map<string, string> {

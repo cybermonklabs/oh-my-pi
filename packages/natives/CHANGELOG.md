@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a parallel directory walk (`grep()`, `glob()`, `fd()`, ast-grep, edit path recovery, and the shell's `grep -r` and `rg`) that could hang for ever, about once in several thousand walks on a busy machine with 8 or more CPUs: a worker that missed the wakeup for its stop message waited for ever, with the message still queued. A walk now stops by closing its job queue
+- Fixed a walk that its caller dropped before its first worker ran reading freed memory as a path
+- Fixed a panic in the input of an ordered search pool being swallowed, which ended the search early with no error; it now reaches the caller after the outputs before it
+- Fixed the darwin native addons failing to build on a Linux build host: the macOS SDK now comes from the Command Line Tools for Xcode 27.2 package (`MacOSX27.2.sdk`) (by [@sjawhar](https://github.com/sjawhar))
+- The native loader honours `OMP_DOWNLOAD_ROOT` and `OMP_CONFIG_ROOT` when it resolves its natives directory
+- Native git reads the global and system configuration as git does: `GIT_CONFIG_GLOBAL` replaces `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config` (empty means none) and `GIT_CONFIG_NOSYSTEM` skips the system file, so an identity, signing or hooks in a home it was told not to read no longer reach its commits; a `GIT_CONFIG_NOSYSTEM` that is not a boolean is refused with git's message, as git refuses it, instead of reading the system file
+- Native jj reads `JJ_CONFIG` as jj does: a list of TOML files and directories separated by the platform's path separator, and a set but empty value reads no user configuration. A user config that names watchman no longer makes every native jj snapshot fail; it scans without the monitor
+- Fixed a `git status` that exceeded its deadline leaving a stale `.git/index.lock` behind, which made every later git or jj write in that worktree fail until the lock was deleted by hand ([#13405](https://github.com/can1357/oh-my-pi/pull/13405) by [@sjawhar](https://github.com/sjawhar)).
+- The bash tool's built-in `df`, `du`, `env`, `fold` and `sort` now honour a locale the shell exports through `LOCPATH` instead of falling back to the C locale, so a German locale there gives `sort -n` and `du -h` a decimal comma and a UTF-8 one stops `fold` splitting characters; whether a locale is UTF-8 now comes from its data rather than its name. `sort`, `du` and `df` were compared with GNU coreutils 9.4 runs; `fold` and `env` model coreutils 9.12, newer than the 9.4 available, so their reference is libc's own answer (`locale charmap`) ([#17401](https://github.com/can1357/oh-my-pi/pull/17401) by [@sjawhar](https://github.com/sjawhar))
+- The bash tool's built-in `df`, `du`, `env`, `fold` and `sort` now run in the C locale when one category the shell's locale names is not installed, as GNU coreutils do when `setlocale(LC_ALL, "")` fails, instead of applying the categories that do load: `sort` compares bytes and `sort --debug` reports `failed to set locale`, `du` and `df` group no digits, and `fold` splits multibyte characters; each prints a warning when it cannot read the shell's locale at all. `sort`, `du` and `df` were compared with GNU coreutils 9.4 runs; `fold` and `env` model coreutils 9.12, newer than the 9.4 available, so their reference is libc's own answer (`setlocale` failing, as bash reports it) ([#17401](https://github.com/can1357/oh-my-pi/pull/17401) by [@sjawhar](https://github.com/sjawhar))
+- Fixed `TtyWriter.flushSync()` and `stop()` sometimes waiting out their whole timeout after the queued output had already been written ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Fixed `TtyWriter.stop()` occasionally hanging forever when the queue had already drained ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- A walk of a host directory that does not follow symlinks (`grep()`, `grep -r`, `rg`, `find -delete` without `-L`, `ast-grep` and `astGrep`/`astEdit` without following links) no longer reads, rewrites or deletes a file through a symlink swapped in after the walk listed it: the file is reached below the walk's own open root, and a swapped directory makes that file's read, write or removal fail instead of reaching outside the tree
+- `find -delete` reports a failed removal as GNU find does (`find: cannot delete 'path': reason`, exit status 1), and `find . -delete` keeps `.` without an error
+- Fixed `omp worktree clear` deleting the registration of a locked worktree whose checkout it could not see, such as one on a disk mounted only on another machine; like `git worktree prune`, it now keeps locked registrations, and treats a dangling link where a checkout's `.git` or the `locked` file was as something there
+- On a shell running on a single-threaded runtime (the Windows fallback when no worker thread can start), a pipe or `$(…)` on a builtin's input or output no longer ends `grep`, `rg` (also with `--line-buffered`) or `find -help`/`-version` with `internal error`, loses every utility's `--help`, `--version` and usage errors, or breaks `ps`/`pgrep`/`pkill`/`pidwait -t` given a descriptor or virtual path
+- Under gVisor releases before 20261109.0 (GKE Sandbox among them), which follow a symlink to a directory despite `O_NOFOLLOW` when `O_DIRECTORY` is set, such a walk and `readFileBeneath()` no longer enter a directory swapped for a symlink, or a symlink on the way to the file: unless the kernel was seen refusing such a link (probed once per process on `/proc/self`), each directory the walk opens is opened with `O_NOFOLLOW` and without `O_DIRECTORY`, which gVisor honours, and refused unless `fstat` shows a directory
+- Under those gVisor releases, the bash tool's `rm -r` no longer deletes files outside the tree it removes through a directory swapped for a symlink while it runs: it enters, and lists for `-i`, only the directory it found at the name, by device and inode, and reports any other as `Not a directory`
+- `find` without `-L` or `-H` no longer walks, or deletes below, a symlink put in place of its starting point after find checked it, on any kernel: the starting point opens without following a symlink there
+- The bash tool's `rm -r` no longer empties the target of a symlink put in place of its operand after rm checked it, on any kernel: the operand opens without following a symlink, as the directory `lstat` found, and any other is reported as `Not a directory`
+- Under gVisor releases before 20261109.0, `mv` of a directory across filesystems no longer deletes files outside the moved tree through a directory swapped for a symlink: it removes the copied source, and a directory it replaces, with `rm -r`'s walk
+
+### Added
+
+- Added `TtyWriter.discard()`, which drops terminal output that was queued but not yet written; the chunk already being written still finishes ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Added `readFileBeneath()`, which reads a file a `glob` listed below the directory the glob walked without following a symlink the walk did not list; one open checks the size against `maxBytes`, probes the first `binaryProbeBytes` bytes for a NUL byte, and returns the bytes (only the first `prefixBytes` when set), reading each byte once. A file whose size the allocator refuses (beyond the address space, or above memory where overcommit is limited) and that no `maxBytes` skips is rejected with `out of memory`
+- Added `GlobMatch.symlink`, set when the listing shows a symbolic link at the match (reported as `Symlink`, or as its target under a `File` or `Dir` filter); pass it to `readFileBeneath()` as `followSymlink`, which then follows that listed link wherever it points when the file is read, inside the walked directory or out of it
+
+### Changed
+
+- A directory walk that does not follow symlinks no longer reads a `.gitignore`, `.ignore` or `.git/info/exclude` inside the walked directory that is a symbolic link, as git reads no symlinked `.gitignore`; git does follow a symlinked `.git/info/exclude`, so there the walk now differs from git
+
+## [18.18.6] - 2026-11-09
+
+### Fixed
+
+- Fixed GTK4 apps such as Files (Nautilus) on X11: element clicks and `computer.elementAt()` now find their elements where they are on screen, and `ax()` no longer marks their enabled controls `(disabled)` ([#18643](https://github.com/can1357/oh-my-pi/pull/18643) by [@will-bogusz](https://github.com/will-bogusz))
+- `grep` no longer searches the file its own output is redirected into, nor standard input redirected from that same file: both are refused with `input file is also the output`, as GNU grep does ([#14808](https://github.com/can1357/oh-my-pi/issues/14808), [#16489](https://github.com/can1357/oh-my-pi/pull/16489) by [@yuzu-octopus](https://github.com/yuzu-octopus))
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

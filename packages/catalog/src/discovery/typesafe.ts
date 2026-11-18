@@ -1,3 +1,4 @@
+import { readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
 import type { FetchImpl, ModelSpec } from "../types";
 import { discoveryFetch, isRecord } from "../utils";
 
@@ -90,7 +91,7 @@ export async function fetchTypeSafeModels(
 
 	let payload: unknown;
 	try {
-		payload = await response.json();
+		payload = await readJsonInSlices(response);
 	} catch {
 		return null;
 	}

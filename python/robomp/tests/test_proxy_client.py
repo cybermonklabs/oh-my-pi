@@ -727,8 +727,12 @@ def test_proxy_git_transport_fetch_pr_head_body() -> None:
         transport=httpx.MockTransport(handler),
     )
     transport.fetch_pr_head(
-        repo="octo/widget", pool_dir=Path("/unused"), pr_number=7,
-        head_ref="feature/x", head_sha="abc123", same_repo=True,
+        repo="octo/widget",
+        pool_dir=Path("/unused"),
+        pr_number=7,
+        head_ref="feature/x",
+        head_sha="abc123",
+        same_repo=True,
     )
     transport.fetch_pr_head(repo="octo/widget", pool_dir=Path("/unused"), pr_number=7)
     assert captured == [

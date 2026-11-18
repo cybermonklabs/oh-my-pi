@@ -11,7 +11,7 @@ use std::{
 
 use super::{
 	is_dot_or_dot_dot,
-	unix::{Scratch, nanos, openat_plain, type_of_mode},
+	unix::{Scratch, nanos, openat_plain, type_of_mode, walk_beneath},
 };
 use crate::fs::{Detail, FileInfo, FileType, Listing, Stamp};
 
@@ -19,6 +19,28 @@ pub(super) const WORKERS: usize = 4;
 
 pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
 	openat_plain(dir, path, flags)
+}
+
+/// Opens the directory `path` in `dir` with `flags`, which carry
+/// `O_DIRECTORY | O_NOFOLLOW`, trusting the kernel to refuse a symlink as its
+/// final component.
+pub(super) fn openat_dir(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
+	debug_assert!(
+		flags & libc::O_NOFOLLOW != 0 && flags & libc::O_DIRECTORY != 0,
+		"openat_dir refuses a symlink only with O_DIRECTORY | O_NOFOLLOW"
+	);
+	openat_plain(dir, path, flags)
+}
+
+/// Opens `rel` below `dir` following no symlink on the way: the portable
+/// [`walk_beneath`].
+pub(super) fn open_beneath(
+	s: &mut Scratch,
+	dir: RawFd,
+	rel: &[u8],
+	flags: c_int,
+) -> io::Result<OwnedFd> {
+	walk_beneath(s, dir, rel, flags)
 }
 
 /// Reads every entry of `dir` into `out`. `readdir` cannot report errors

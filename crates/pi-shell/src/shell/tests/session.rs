@@ -160,6 +160,159 @@ async fn session_runs_pipelines_on_a_current_thread_runtime() {
 	assert!(output.trim_end().ends_with('1'), "output: {output:?}");
 }
 
+/// grep and rg run on the session's runtime, and each asks whether an input
+/// is the file its output lands in. On a current-thread runtime that check
+/// must not block the only thread: it read the identity of a pipe end (stdin
+/// from `printf`, stdout into `cat`) with pi-vfs's blocking `File::metadata`,
+/// which panics there, so grep and rg ended with an internal error.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn grep_and_rg_check_their_output_file_on_a_current_thread_runtime() {
+	let root = tempfile::tempdir().expect("scratch directory");
+	std::fs::create_dir(root.path().join("d")).expect("create d");
+	std::fs::write(root.path().join("d/f"), "x\ny\n").expect("write d/f");
+	let _guard = shell_test_lock().lock().await;
+	let (result, output) = time::timeout(
+		Duration::from_secs(10),
+		capture_unlocked(
+			concat!(
+				"printf 'x\\n' | grep x > out; echo \"grep stdin=$?\"; cat out\n",
+				"grep x d/f | cat; echo \"grep file=$?\"\n",
+				"grep -r x d | cat; echo \"grep dir=$?\"\n",
+				"rg x d/f | cat; echo \"rg search=$?\"\n",
+				"rg --files d | cat; echo \"rg files=$?\"\n",
+			),
+			Some(root.path()),
+			None,
+			CancelToken::default(),
+		),
+	)
+	.await
+	.expect("grep and rg must not block the runtime's only thread");
+
+	assert_eq!(
+		(result.exit_code, output.as_str()),
+		(
+			Some(0),
+			"grep stdin=0\nx\nx\ngrep file=0\nd/f:x\ngrep dir=0\nx\nrg search=0\nd/f\nrg files=0\n"
+		)
+	);
+}
+
+/// Runs `script` in a fresh directory holding `d/f` (`x`, `y`) on the
+/// calling (current-thread) runtime and returns its status and output.
+#[cfg(unix)]
+async fn run_in_tree(script: &str) -> (Option<i32>, String) {
+	let root = tempfile::tempdir().expect("scratch directory");
+	std::fs::create_dir(root.path().join("d")).expect("create d");
+	std::fs::write(root.path().join("d/f"), "x\ny\n").expect("write d/f");
+	let _guard = shell_test_lock().lock().await;
+	let (result, output) = time::timeout(
+		Duration::from_secs(10),
+		capture_unlocked(script, Some(root.path()), None, CancelToken::default()),
+	)
+	.await
+	.expect("the session must not block the runtime's only thread");
+	(result.exit_code, output)
+}
+
+/// rg's `--line-buffered` and `--no-line-buffered` wrote through a raw
+/// writer over stdout, which on an engine pipe is a provider file: its
+/// blocking write panicked on a current-thread runtime, and rg printed
+/// `rg: internal error` instead of its matches.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn rg_line_buffering_modes_reach_a_pipe_on_a_current_thread_runtime() {
+	let ran = run_in_tree(concat!(
+		"rg --line-buffered x d/f | cat\n",
+		"rg --no-line-buffered x d/f | cat\n",
+		"printf 'x\\n' | rg --line-buffered x | cat\n",
+		"rg --line-buffered --files d | cat\n",
+	))
+	.await;
+	assert_eq!(ran, (Some(0), "x\nx\nx\nd/f\n".to_string()));
+}
+
+/// A utility's `--help`, `--version` and usage error were written before its
+/// body ran, with a blocking write on the runtime thread: into an engine pipe
+/// or `$(…)` that panicked on a current-thread runtime, so nothing was
+/// printed and the command failed. Each must keep its text and its status:
+/// `--help` and `--version` 0, a usage error 2 (grep's).
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn early_output_of_a_utility_reaches_a_pipe_on_a_current_thread_runtime() {
+	let ran = run_in_tree(concat!(
+		"grep --help | head -n 1; echo \"${PIPESTATUS[0]}\"\n",
+		"grep --help | wc -l\n",
+		"cat --version | cat; echo \"${PIPESTATUS[0]}\"\n",
+		"grep --no-such-flag 2>&1 | cat; echo \"${PIPESTATUS[0]}\"\n",
+		"v=$(grep -V); echo \"$?:${v%% *}\"\n",
+		"rg --help | head -n 1; echo \"${PIPESTATUS[0]}\"\n",
+		"rg --help | wc -l\n",
+	))
+	.await;
+	assert_eq!(
+		ran,
+		(
+			Some(0),
+			concat!(
+				"Search for PATTERN in each FILE or standard input.\n0\n",
+				"67\n",
+				"cat 0.8.0\n0\n",
+				"error: unexpected argument '--no-such-flag' found\n\n",
+				"  tip: to pass '--no-such-flag' as a value, use '-- --no-such-flag'\n\n",
+				"Usage: grep [OPTIONS] [ARGS]...\n\n",
+				"For more information, try '--help'.\n2\n",
+				"0:grep\n",
+				"ripgrep recursively searches the current directory for lines matching a regex \
+				 pattern.\n0\n",
+				"118\n",
+			)
+			.to_string()
+		)
+	);
+}
+
+/// find's own `-help` and `-version` wrote to the raw stdout from its async
+/// body: into an engine pipe that panicked on a current-thread runtime
+/// (`find: internal error`).
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn find_help_and_version_reach_a_pipe_on_a_current_thread_runtime() {
+	let ran = run_in_tree(concat!(
+		"find -version | cat\n",
+		"find -help | { read -r l && echo \"$l\"; }\n",
+	))
+	.await;
+	assert_eq!(
+		ran,
+		(Some(0), "find (Rust) 0.8.0\nUsage: find [path...] [expression]\n".to_string())
+	);
+}
+
+/// `-t` resolved a terminal name with a blocking filesystem query. For a
+/// descriptor path whose descriptor is an engine pipe the query goes to a
+/// provider, which panicked on a current-thread runtime: no output, status 1,
+/// where a multi-thread runtime reports the unknown terminal.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_terminal_named_by_a_descriptor_path_resolves_on_a_current_thread_runtime() {
+	let (status, output) = run_in_tree(concat!(
+		"echo | ps -t omp-descriptor://0 2>&1 | cat\n",
+		"echo | pgrep -t omp-descriptor://0 sleep 2>&1 | cat\n",
+	))
+	.await;
+	assert_eq!(status, Some(0), "{output}");
+	assert!(output.contains("ps: unknown terminal 'omp-descriptor://0'"), "{output}");
+	assert_eq!(
+		output
+			.matches("unknown terminal 'omp-descriptor://0'")
+			.count(),
+		2,
+		"{output}"
+	);
+}
+
 /// A background external command's FIFO redirect is opened by its child,
 /// as in bash: the parent shell spawned it and then waited for the FIFO's
 /// other end, which was the next command, so `/bin/cat < f & echo one > f`
@@ -219,9 +372,8 @@ async fn killed_job_leaves_no_reader_on_its_fifo() {
 	.expect("the killed job ends");
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "done\n"));
 
-	// The release runs on its own thread; give it time, then a writer that
-	// does not wait must find no reader.
-	time::sleep(Duration::from_millis(500)).await;
+	// The drop of the open closed its helper's end before it returned: a
+	// writer that does not wait finds no reader.
 	let writer = std::fs::OpenOptions::new()
 		.write(true)
 		.custom_flags(libc::O_NONBLOCK)
