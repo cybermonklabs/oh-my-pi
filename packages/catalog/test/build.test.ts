@@ -8,6 +8,7 @@ import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import {
+	closeModelCache,
 	getModelCacheWriteStats,
 	readModelCache,
 	readModelCacheWithVersion,
@@ -23,6 +24,7 @@ import {
 	openrouterModelManagerOptions,
 } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import type { Api, Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
+import { getAgentDir, getModelDbPath, setAgentDir } from "@oh-my-pi/pi-utils";
 
 function completionsSpec(overrides: Partial<ModelSpec<"openai-completions">> = {}): ModelSpec<"openai-completions"> {
 	return {
@@ -2241,6 +2243,235 @@ describe("model cache materialized round trip", () => {
 			]);
 		} finally {
 			vi.restoreAllMocks();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a refresh that starts first but whose fetch resolves last writes the cache last", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-start-order-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "start-order-test";
+		const { promise: lateFetchMayResolve, resolve: letLateFetchResolve } = Promise.withResolvers<void>();
+		const options = (now: number, fetchDynamicModels: () => Promise<readonly ModelSpec<"openai-completions">[]>) => ({
+			providerId,
+			staticModels: [],
+			dynamicModelsAuthoritative: true,
+			cacheDbPath: dbPath,
+			now: () => now,
+			fetchDynamicModels,
+		});
+		const storedIds = () => readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id);
+		try {
+			// The first refresh starts and its fetch waits.
+			const first = resolveProviderModels(
+				options(1_000_000, async () => {
+					await lateFetchMayResolve;
+					return [completionsSpec({ id: "late-model", provider: providerId })];
+				}),
+				"online",
+			);
+			// A later refresh fetches and writes.
+			await resolveProviderModels(
+				options(1_100_000, async () => [completionsSpec({ id: "early-model", provider: providerId })]),
+				"online",
+			);
+			expect(storedIds()).toEqual(["early-model"]);
+			// The first refresh's fetch resolves last, so its rows win.
+			letLateFetchResolve();
+			await first;
+			expect(storedIds()).toEqual(["late-model"]);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a failed refresh whose fetch resolved after a successful one keeps the successful rows", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-failed-after-success-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "failed-after-success-test";
+		const fetched = Array.from({ length: 300 }, (_, index) =>
+			completionsSpec({ id: `fetched-model-${index}`, provider: providerId }),
+		);
+		const { promise: successFetched, resolve: markSuccessFetched } = Promise.withResolvers<void>();
+		const options = (
+			now: number,
+			fetchDynamicModels: () => Promise<readonly ModelSpec<"openai-completions">[] | null>,
+		) => ({
+			providerId,
+			staticModels: [],
+			dynamicModelsAuthoritative: true,
+			cacheDbPath: dbPath,
+			now: () => now,
+			fetchDynamicModels,
+		});
+		writeModelCache(
+			providerId,
+			500_000,
+			[buildModel(completionsSpec({ id: "prior-model", provider: providerId }))],
+			true,
+			"",
+			dbPath,
+		);
+		// Every few clock reads end a slice: the success's 300 rows take many turns after its fetch.
+		let clock = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+		try {
+			const success = resolveProviderModels(
+				options(1_000_000, async () => {
+					setTimeout(markSuccessFetched, 0);
+					return fetched;
+				}),
+				"online",
+			);
+			// The failure's fetch resolves a timer later; its fallback copies the prior row before the success writes.
+			const failure = resolveProviderModels(
+				options(1_100_000, async () => {
+					await successFetched;
+					return null;
+				}),
+				"online",
+			);
+			await Promise.all([success, failure]);
+			vi.restoreAllMocks();
+			const stored = readModelCache(providerId, Infinity, () => 0, dbPath);
+			expect({ count: stored?.models.length, authoritative: stored?.authoritative }).toEqual({
+				count: 300,
+				authoritative: true,
+			});
+		} finally {
+			vi.restoreAllMocks();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a failed refresh whose fetch resolved first leaves a later success's row authoritative", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-failed-before-success-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "failed-before-success-test";
+		// The failure's models.dev rows build over many turns and then fail on the last one,
+		// so it reads the cache again only after the success, fetched later, has written.
+		const broken = Object.defineProperty({ ...completionsSpec({ id: "broken", provider: providerId }) }, "id", {
+			enumerable: true,
+			get() {
+				throw new Error("broken spec");
+			},
+		});
+		const failingSpecs = [
+			...Array.from({ length: 300 }, (_, index) =>
+				completionsSpec({ id: `dev-model-${index}`, provider: providerId }),
+			),
+			broken,
+		];
+		const { promise: failureFetched, resolve: markFailureFetched } = Promise.withResolvers<void>();
+		writeModelCache(
+			providerId,
+			500_000,
+			[buildModel(completionsSpec({ id: "prior-model", provider: providerId }))],
+			true,
+			"",
+			dbPath,
+		);
+		let clock = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+		try {
+			const failure = resolveProviderModels(
+				{
+					providerId,
+					staticModels: [],
+					cacheDbPath: dbPath,
+					now: () => 1_000_000,
+					modelsDev: {
+						fetch: async () => {
+							setTimeout(markFailureFetched, 0);
+							return null;
+						},
+						map: () => failingSpecs,
+					},
+				},
+				"online",
+			);
+			const success = resolveProviderModels(
+				{
+					providerId,
+					staticModels: [],
+					dynamicModelsAuthoritative: true,
+					cacheDbPath: dbPath,
+					now: () => 1_100_000,
+					fetchDynamicModels: async () => {
+						await failureFetched;
+						return [completionsSpec({ id: "later-model", provider: providerId })];
+					},
+				},
+				"online",
+			);
+			await Promise.all([failure, success]);
+			vi.restoreAllMocks();
+			// Upstream wrote the failure's fallback first and the success over it.
+			const stored = readModelCache(providerId, Infinity, () => 0, dbPath);
+			expect({ ids: stored?.models.map(model => model.id), authoritative: stored?.authoritative }).toEqual({
+				ids: ["later-model"],
+				authoritative: true,
+			});
+		} finally {
+			vi.restoreAllMocks();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a cache read on the shared database returns the version of the row it came from", async () => {
+		const previousAgentDir = getAgentDir();
+		const previousAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-shared-version-"));
+		setAgentDir(tempDir);
+		const providerId = "shared-version-test";
+		const model = buildModel(completionsSpec({ id: "shared-model", provider: providerId }));
+		const read = () => readModelCacheWithVersion(providerId, Infinity, () => 0);
+		// A sliced write given a version applies only while the row has that version.
+		const writeApplies = async (version: string | null | undefined) => {
+			const stale = getModelCacheWriteStats().staleWrites;
+			await writeModelCacheInSlices(providerId, 9_000_000, [model], true, "", undefined, [], undefined, {
+				rowVersion: version,
+			});
+			return getModelCacheWriteStats().staleWrites === stale;
+		};
+		// Another connection, as another process would write.
+		const other = () => new Database(getModelDbPath());
+		try {
+			// The memo, unchanged since the last read.
+			writeModelCache(providerId, 1_000_000, [model], true, "");
+			read();
+			expect(await writeApplies(read().version)).toBe(true);
+			// The memo revalidated after another connection wrote only the refresh side row.
+			writeModelCache(providerId, 1_000_000, [model], false, "");
+			read();
+			const sideRow = other();
+			sideRow.run(
+				`INSERT INTO model_cache_refresh (provider_id, payload_updated_at, updated_at, authoritative)
+				VALUES (?, ?, ?, 1)
+				ON CONFLICT(provider_id) DO UPDATE SET
+					payload_updated_at = excluded.payload_updated_at,
+					updated_at = excluded.updated_at,
+					authoritative = excluded.authoritative`,
+				[providerId, 1_000_000, 2_000_000],
+			);
+			sideRow.close();
+			const revalidated = read();
+			expect(revalidated.entry?.authoritative).toBe(true);
+			expect(await writeApplies(revalidated.version)).toBe(true);
+			// A row of another schema version is kept and rejected: its version is still the row's.
+			const foreign = other();
+			foreign.run("UPDATE model_cache SET version = 14 WHERE provider_id = ?", [providerId]);
+			foreign.close();
+			const kept = read();
+			expect(kept.entry).toBeNull();
+			expect(await writeApplies(kept.version)).toBe(true);
+			// A corrupt payload is deleted on read: there is no row, so its version is null.
+			const corrupt = other();
+			corrupt.run("UPDATE model_cache SET models = '{' WHERE provider_id = ?", [providerId]);
+			corrupt.close();
+			const deleted = read();
+			expect(deleted).toEqual({ entry: null, version: null });
+		} finally {
+			closeModelCache();
+			setAgentDir(previousAgentDir);
+			if (previousAgentDirEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDirEnv;
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});

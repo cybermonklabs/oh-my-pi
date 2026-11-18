@@ -10,7 +10,7 @@
 
 - Provider model resolution no longer holds the event loop while it builds, merges, fingerprints or writes a large catalog: it gives the loop a turn after each 10 ms slice of its work, plus at most one step ([#17121](https://github.com/can1357/oh-my-pi/issues/17121))
 - Model cache commits no longer wait for an fsync on the main thread: the cache now uses WAL's `synchronous = NORMAL`, as omp's other regenerable caches do
-- Concurrent refreshes of one provider write its cache row in the order their fetches resolved, as before slicing; a failed refresh no longer replaces a row another refresh wrote while the failed one was in slices, so that row's header-bearing models stay cached ([#18227](https://github.com/can1357/oh-my-pi/issues/18227))
+- Concurrent successful refreshes of one provider write its cache row in the order their fetches resolved, as before slicing. A failed refresh's fallback copy is skipped when the row changed after the failed refresh read it, or when a refresh whose fetch resolved later has written, and it never stops an earlier-fetched refresh from writing; so a header-bearing or newly fetched catalog stays cached ([#18227](https://github.com/can1357/oh-my-pi/issues/18227))
 
 ## [18.18.6] - 2026-11-09
 

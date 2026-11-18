@@ -820,7 +820,9 @@ export interface CacheWriteOrdering {
 	/**
 	 * From {@link takeModelCacheWriteTicket} when the caller's fetches resolved:
 	 * the write is skipped once a later ticket has written, so writes land in
-	 * the order of their fetches.
+	 * the order of their fetches. A write with a `rowVersion` is a copy of a row
+	 * it read, not data from its fetch: it checks its ticket but does not take
+	 * the order from an earlier ticket whose fetched rows are still to land.
 	 */
 	ticket?: number;
 }
@@ -1006,7 +1008,7 @@ function* writeModelCacheSteps<TApi extends Api>(
 				return "written";
 			})
 			.immediate();
-		if (outcome !== "stale" && ticket !== undefined) {
+		if (outcome !== "stale" && ticket !== undefined && expectedRowVersion === undefined) {
 			const tickets = writeTickets.get(ticketKey) ?? { issued: ticket, written: 0 };
 			tickets.written = Math.max(tickets.written, ticket);
 			writeTickets.set(ticketKey, tickets);
