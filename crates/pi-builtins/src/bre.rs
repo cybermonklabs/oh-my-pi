@@ -441,32 +441,34 @@ fn bracket_text(chars: &mut Peekable<Chars<'_>>, out: &mut String) -> bool {
 	false
 }
 
-/// Whether GNU's regex searches `pattern` a byte at a time in a UTF-8
-/// locale, where a match may then start, and an empty one fall, inside a
-/// character of several bytes: `sed 's/x*/-/g'` on `é` prints
-/// `-\303-\251-`. glibc does so unless the pattern holds a bracket
+/// Whether GNU's regex searches `pattern`, written in `dialect`, a byte at a
+/// time in a UTF-8 locale, where a match may then start, and an empty one
+/// fall, inside a character of several bytes: `sed 's/x*/-/g'` on `é`
+/// prints `-\303-\251-`. glibc does so unless the pattern holds a bracket
 /// expression that negates, holds a range, a class or a character outside
 /// ASCII, or one of `\w`, `\W`, `\s`, `\S`, `\b`, `\B`, `\<` and `\>`; such
 /// a pattern is searched a character at a time (`sed 's/[^é]*/-/g'` on `éa`
 /// prints `-é-`), as is any pattern read without case (the `I` flag), which
-/// the caller answers.
+/// the caller answers. glibc drops an atom repeated zero times before it
+/// looks, so such a bracket expression or `\w` does not count then:
+/// `sed 's/[[:alpha:]]\{0\}/-/g'` on `éa` prints `-\303-\251-a-`. A group
+/// repeated zero times still counts here, where glibc drops it too
+/// (`\([^a]\)\{0\}`).
 #[cfg(feature = "util.sed")]
-pub(crate) fn searched_by_byte(pattern: &str) -> bool {
+pub(crate) fn searched_by_byte(pattern: &str, dialect: Dialect) -> bool {
 	let mut chars = pattern.chars().peekable();
 	while let Some(c) = chars.next() {
-		match c {
-			'\\' => {
-				if chars.next_if(|&c| matches!(c, 'w' | 'W' | 's' | 'S' | 'b' | 'B' | '<' | '>')).is_some() {
-					return false;
-				}
-				chars.next();
+		// Whether the atom just read is searched a character at a time.
+		let by_chars = match c {
+			'\\' => match chars.next() {
+				Some('b' | 'B' | '<' | '>') => return false,
+				escaped => matches!(escaped, Some('w' | 'W' | 's' | 'S')),
 			},
-			'[' => {
-				if !plain_bracket(&mut chars) {
-					return false;
-				}
-			},
-			_ => {},
+			'[' => !plain_bracket(&mut chars),
+			_ => false,
+		};
+		if by_chars && !zero_count_follows(&chars, dialect) {
+			return false;
 		}
 	}
 	true
@@ -474,33 +476,59 @@ pub(crate) fn searched_by_byte(pattern: &str) -> bool {
 
 /// Whether the bracket expression whose `[` is already consumed is a plain
 /// list of ASCII characters, which glibc reads as a set of bytes. The
-/// iterator ends past it. One the translation refuses answers either way.
+/// iterator ends past its `]`. One the translation refuses answers either
+/// way, and ends anywhere.
 #[cfg(feature = "util.sed")]
 fn plain_bracket(chars: &mut Peekable<Chars<'_>>) -> bool {
-	if chars.next_if_eq(&'^').is_some() {
-		return false;
-	}
+	let mut plain = chars.next_if_eq(&'^').is_none();
 	let mut first = true;
 	loop {
 		let Ok(member) = take_bracket_member(chars, first) else {
-			return true;
+			return plain;
 		};
 		first = false;
 		match member {
-			BracketMember::Class(_) => return false,
-			BracketMember::Char(c) | BracketMember::Equivalence(c) if !c.is_ascii() => return false,
-			BracketMember::Char(_) if opens_range(chars) => return false,
-			BracketMember::Char(_) | BracketMember::Equivalence(_) => {},
+			BracketMember::Char(_) if opens_range(chars) => {
+				plain = false;
+				chars.next();
+				if take_bracket_member(chars, true).is_err() {
+					return plain;
+				}
+			},
+			BracketMember::Char(c) | BracketMember::Equivalence(c) => plain &= c.is_ascii(),
+			BracketMember::Class(_) => plain = false,
 		}
 		match chars.peek() {
-			None => return true,
+			None => return plain,
 			Some(']') => {
 				chars.next();
-				return true;
+				return plain;
 			},
 			Some(_) => {},
 		}
 	}
+}
+
+/// Whether an interval that repeats the atom just read zero times comes
+/// next: `{0}`, `{0,0}` or GNU's `{,0}`, in a BRE with a backslash before
+/// each brace.
+#[cfg(feature = "util.sed")]
+fn zero_count_follows(chars: &Peekable<Chars<'_>>, dialect: Dialect) -> bool {
+	let mut ahead = chars.clone();
+	if dialect == Dialect::Basic && ahead.next_if_eq(&'\\').is_none() {
+		return false;
+	}
+	if ahead.next_if_eq(&'{').is_none() {
+		return false;
+	}
+	// The operator is `{n}`, `{n,}` or `{n,m}`, its last number the most.
+	read_interval(&mut ahead, dialect).is_some_and(|(operator, _)| {
+		operator
+			.trim_end_matches('}')
+			.rsplit(['{', ','])
+			.next()
+			.is_some_and(|most| !most.is_empty() && most.bytes().all(|digit| digit == b'0'))
+	})
 }
 
 /// A group that is still open.

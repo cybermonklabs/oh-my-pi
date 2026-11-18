@@ -75,5 +75,10 @@ describe("builtin sed: an empty match inside a character only where GNU searches
 		[String.raw`printf '\303\251a\n' | sed 's/[x]*/-/g'`, "-\xc3-\xa9-a-\n", 0],
 		// `- 303 - 251 - a - \n`: so is `.`. Already GNU's answer, kept.
 		[String.raw`printf '\303\251a\n' | sed 's/\(.x\)*/-/g'`, "-\xc3-\xa9-a-\n", 0],
+		// `- 303 - 251 - a - \n`: glibc drops a class repeated zero times before it decides, so the class
+		// does not stop the search a byte at a time. Regressed: `- 303 251 - a -`.
+		[String.raw`printf '\303\251a\n' | sed 's/[[:alpha:]]\{0\}/-/g'`, "-\xc3-\xa9-a-\n", 0],
+		// `- 303 - 251 - a - \n`: so it drops `\w{0}` in an ERE. Regressed: `- 303 251 - a -`.
+		[String.raw`printf '\303\251a\n' | sed -E 's/\w{0}/-/g'`, "-\xc3-\xa9-a-\n", 0],
 	]);
 });

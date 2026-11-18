@@ -206,3 +206,13 @@ describe("builtin sed: a last line that lacks its newline keeps lacking it", () 
 		[String.raw`sed -s '0r f' nb nd`, "x\na\nbx\n\nc\nd", 0],
 	]);
 });
+
+describe("builtin sed: Q writes no text that a or r queued", () => {
+	cases([
+		// `a \n b`: `Q` quits before the text `a` queued, and before the newline `nb` lacks.
+		// Regressed: `a \n b \n f o o \n`.
+		[String.raw`sed -e '3a foo' -e 3Q nb nd`, "a\nb", 0],
+		// `a \n b`: the same for the file `r` queued. Regressed: `a \n b \n x \n`.
+		[String.raw`sed -e '3r f' -e 3Q nb nd`, "a\nb", 0],
+	]);
+});

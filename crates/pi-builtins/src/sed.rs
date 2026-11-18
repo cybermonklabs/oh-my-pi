@@ -1367,8 +1367,8 @@ fn compile_regex(
 	let bytes = if pattern.is_ascii() { None } else { Some(compile(&script_byte_text(pattern))?) };
 	// In a line that is UTF-8 GNU starts a match inside a character only where
 	// it searches the pattern a byte at a time.
-	let inside_chars = !icase && crate::bre::searched_by_byte(&text_pattern);
-	Ok(Some(ScriptRegex::new(text, bytes, inside_chars)))
+	let by_chars = icase || !crate::bre::searched_by_byte(&text_pattern, dialect);
+	Ok(Some(ScriptRegex::new(text, bytes, by_chars)))
 }
 
 /// Compile a regular expression replacement string.
@@ -7782,18 +7782,18 @@ fn first_in_nul_lines<'t, T>(
 /// `text` reads the same way where the RE is ASCII and `bytes` is `None`.
 #[derive(Debug)]
 pub struct ScriptRegex {
-	text:         Regex,
-	bytes:        Option<Regex>,
-	/// Whether a match of `text` may start inside a character of a line that
-	/// is UTF-8, as GNU's does where it searches the RE a byte at a time
-	/// (see `bre::searched_by_byte`): `sed 's/x*/-/g'` on `é` prints
-	/// `-\303-\251-`, while `sed 's/[^é]*/-/g'` on `éa` prints `-é-`.
-	inside_chars: bool,
+	text:     Regex,
+	bytes:    Option<Regex>,
+	/// Whether GNU searches the RE a character at a time, so that no match of
+	/// `text` starts inside a character of a line that is UTF-8 (see
+	/// `bre::searched_by_byte`): `sed 's/[^é]*/-/g'` on `éa` prints `-é-`,
+	/// while `sed 's/x*/-/g'` on `é` prints `-\303-\251-`.
+	by_chars: bool,
 }
 
 impl ScriptRegex {
-	pub fn new(text: Regex, bytes: Option<Regex>, inside_chars: bool) -> Self {
-		Self { text, bytes, inside_chars }
+	pub fn new(text: Regex, bytes: Option<Regex>, by_chars: bool) -> Self {
+		Self { text, bytes, by_chars }
 	}
 
 	/// The engine that reads `chunk`.
@@ -7807,7 +7807,7 @@ impl ScriptRegex {
 	/// Whether every match in `chunk` lies on its character boundaries; see
 	/// `Regex::captures_iter_text`.
 	fn by_chars(&self, chunk: &IOChunk) -> bool {
-		chunk.is_bytes() || !self.inside_chars
+		chunk.is_bytes() || self.by_chars
 	}
 
 	/// Check if the regex matches the content of the IOChunk.
@@ -8017,13 +8017,13 @@ impl<'t> LongestMatches<'t> {
 /// The matches of a [`Regex::NulLines`] pattern: those of each line of the
 /// text in turn, a line ending at a NUL.
 pub struct NulLineMatches<'t> {
-	re:      &'t Regex,
+	re:       &'t Regex,
 	/// The lines not searched yet.
-	lines:   NulSplit<'t>,
+	lines:    NulSplit<'t>,
 	/// Whether every match lies on the text's character boundaries.
 	by_chars: bool,
 	/// Where the line being searched starts, and its matches.
-	current: Option<(usize, CaptureMatches<'t>)>,
+	current:  Option<(usize, CaptureMatches<'t>)>,
 }
 
 impl<'t> Iterator for NulLineMatches<'t> {
@@ -9600,12 +9600,6 @@ fn process_file(
 				commands.clone()
 			};
 
-		// Whether `Q` ends the run. It prints nothing, so a line printed
-		// before it without its newline keeps lacking it, as in GNU sed:
-		// `sed 3Q` on two files whose first ends in `b` and no newline prints
-		// that `b` last. `q` writes the newline, as GNU's does.
-		let mut quit_unprinted = false;
-
 		// Loop over script commands.
 		while let Some(command_rc) = current.take() {
 			let mut command = command_rc.borrow_mut();
@@ -9760,12 +9754,13 @@ fn process_file(
 					break;
 				},
 				'Q' => {
-					// Quit immediatelly.
+					// Quit at once, as GNU sed does, writing neither the pattern
+					// space, nor the text `a` and `r` queued, nor the newline a
+					// line printed before lacks: `sed -e '3a foo' -e 3Q` on a file
+					// holding `a\nb` and one holding `c\n` prints `a\nb`.
 					host.fail(*extract_variant!(command, Number) as i32);
 					context.stop_processing = true;
-					context.quiet = true;
-					quit_unprinted = true;
-					break;
+					return Ok(());
 				},
 				'r' => {
 					// Copy the file to standard output at a later point.
@@ -9846,9 +9841,7 @@ fn process_file(
 		flush_appends(output, context)?;
 
 		if context.stop_processing {
-			if !quit_unprinted {
-				output.flush_pending_newline()?;
-			}
+			output.flush_pending_newline()?;
 			break;
 		}
 	}
