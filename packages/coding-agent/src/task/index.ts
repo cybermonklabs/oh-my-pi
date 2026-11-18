@@ -42,7 +42,13 @@ import { hasWaitTool } from "../tools/wait";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
-import { isScoutSpawnable, type ResolvedSpawnPolicy, resolveSpawnPolicy, spawnableAgents } from "./spawn-policy";
+import {
+	isAgentSpawnable,
+	isScoutSpawnable,
+	type ResolvedSpawnPolicy,
+	resolveSpawnPolicy,
+	spawnableAgents,
+} from "./spawn-policy";
 import { isBundledSeance, seanceTaskGuidance, seanceTaskSchemaFields, validateSeanceParams } from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
 import {
@@ -213,7 +219,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		structured: !options.structured && agent.structured === true,
 	}));
 	const seanceAgent = filteredAgents.find(agent => agent.name === SEANCE_AGENT_NAME);
-	const scoutAvailable = isScoutSpawnable(options.disabledAgents, options.parentSpawns);
+	const scoutAvailable = isAgentSpawnable("scout", options.disabledAgents, spawnPolicy);
 	return prompt.render(taskDescriptionTemplate, {
 		agents: renderedAgents,
 		scoutAvailable,
@@ -1029,14 +1035,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const spawnPolicy = resolveSpawnPolicy(this.session.getSessionSpawns());
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
-		if (
-			planMode ||
-			!spawnPolicy.enabled ||
-			disabledAgents.includes(SEANCE_AGENT_NAME) ||
-			(spawnPolicy.allowedAgents !== null && !spawnPolicy.allowedAgents.includes(SEANCE_AGENT_NAME))
-		) {
-			return undefined;
-		}
+		if (planMode || !isAgentSpawnable(SEANCE_AGENT_NAME, disabledAgents, spawnPolicy)) return undefined;
 		const agents = this.#advertisedAgents();
 		const sessionAgents = this.session.advertisedSessionAgents?.() ?? this.session.getSessionAgents?.() ?? [];
 		const seanceAgent = [...agents, ...sessionAgents].find(agent => agent.name === SEANCE_AGENT_NAME);

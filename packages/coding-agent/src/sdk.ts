@@ -167,7 +167,7 @@ import { mapPromptArguments } from "./mcp/prompt-args";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
-import { withoutDeliveredRecall } from "./memory-backend/recall-entry";
+import { findDeliveredRecall, withoutDeliveredRecall } from "./memory-backend/recall-entry";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionStateApi } from "./mnemopi/state";
 import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.md" with { type: "text" };
@@ -4293,9 +4293,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// tool-availability caveat lives in the wrapper template.
 			advisorMemoryPrompt = formatAdvisorMemoryPrompt(backendInstructions);
 			if (hasSession) session.setAdvisorMemoryPrompt(advisorMemoryPrompt);
-			// The backend's instructions carry the recall it adopted. One the conversation carries as a hidden
-			// message stays out of the prompt, which would otherwise send it twice.
-			const memoryInstructions = withoutDeliveredRecall(backendInstructions, sessionManager.getBranchView());
 			const inlineToolDescriptors = resolveInlineToolDescriptors();
 			// Unset only during the initial build; the agent is constructed with it.
 			if (agent) agent.pruneToolDescriptions = inlineToolDescriptors;
@@ -4306,6 +4303,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return {
 					systemPrompt: typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt,
 				};
+			}
+			// Advisors keep the recall; the prompt leaves out one the conversation carries as a hidden message.
+			let memoryInstructions = backendInstructions;
+			const deliveredRecall = findDeliveredRecall(sessionManager.getBranchView());
+			if (memoryBackend && deliveredRecall !== undefined) {
+				const instructions = await memoryBackend.buildDeveloperInstructions(
+					agentDir,
+					sessionManager.getCwd(),
+					settings,
+					session,
+					{ recallDelivered: true },
+				);
+				memoryInstructions = withoutDeliveredRecall(instructions, deliveredRecall);
 			}
 
 			// Build combined append prompt: memory instructions + auto-learn guidance

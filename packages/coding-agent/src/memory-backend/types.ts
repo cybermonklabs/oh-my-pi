@@ -110,6 +110,15 @@ export interface MemoryPromptPreparation {
 	commit(): boolean;
 }
 
+/** Options of {@link MemoryBackend.buildDeveloperInstructions}. */
+export interface MemoryInstructionsOptions {
+	/**
+	 * The conversation carries the recall as a hidden message (`findDeliveredRecall`): leave out the recall the
+	 * backend adopted, which the prompt would otherwise send a second time.
+	 */
+	recallDelivered?: boolean;
+}
+
 export interface MemoryBackend {
 	readonly id: MemoryBackendId;
 
@@ -126,12 +135,14 @@ export interface MemoryBackend {
 	 * Markdown injected as the system-prompt append section.
 	 * Returned on every prompt rebuild via `refreshBaseSystemPrompt()`.
 	 * `cwd` is the session's project directory and selects project-scoped memory.
+	 * A backend that carries its adopted recall here leaves it out under {@link MemoryInstructionsOptions.recallDelivered}.
 	 */
 	buildDeveloperInstructions(
 		agentDir: string,
 		cwd: string,
 		settings: Settings,
 		session?: AgentSession,
+		options?: MemoryInstructionsOptions,
 	): Promise<string | undefined>;
 
 	/** Wipe all persisted state for this backend (slash `/memory clear`). */

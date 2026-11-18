@@ -26,7 +26,7 @@ export const MEMORY_RECALL_CHANGES_MESSAGE_TYPE = "memory-recall-changes";
  * sent without one: delivered after the turn's newest content instead of as a new system block, so
  * the cached prompt holds. It stays the recall's one copy for the branch's history
  * ({@link findDeliveredRecall}): a resume does not add the recall to the system prompt, and a prompt
- * rebuild leaves it out of the memory instructions ({@link withoutDeliveredRecall}).
+ * rebuild asks the backend to leave it out of the memory instructions (`recallDelivered`).
  */
 export const MEMORY_RECALL_MESSAGE_TYPE = "memory-recall";
 
@@ -176,18 +176,15 @@ export function findDeliveredRecall(branch: readonly SessionEntry[]): string | u
 }
 
 /**
- * A memory backend's `instructions` without the recall `branch` delivered ({@link findDeliveredRecall}).
- * A backend's instructions carry the recall it adopted; that one is in the conversation already, and a
- * prompt rebuild that also carried it would send it twice.
+ * A memory backend's `instructions` without `recall`, the recall the branch delivered ({@link findDeliveredRecall}),
+ * where they carry it verbatim: the fallback for a backend that ignores `recallDelivered`. A backend that re-renders
+ * its recall, as Mnemopi cuts its own to the current token budget on every render, may carry text this search
+ * misses, so it leaves the recall out itself.
  */
-export function withoutDeliveredRecall(
-	instructions: string | undefined,
-	branch: readonly SessionEntry[],
-): string | undefined {
-	if (!instructions) return instructions;
-	const recall = findDeliveredRecall(branch);
-	const index = recall ? instructions.lastIndexOf(recall) : -1;
-	if (!recall || index < 0) return instructions;
+export function withoutDeliveredRecall(instructions: string | undefined, recall: string): string | undefined {
+	if (!instructions || !recall) return instructions;
+	const index = instructions.lastIndexOf(recall);
+	if (index < 0) return instructions;
 	const rest = `${instructions.slice(0, index).trimEnd()}${instructions.slice(index + recall.length)}`.trim();
 	return rest || undefined;
 }

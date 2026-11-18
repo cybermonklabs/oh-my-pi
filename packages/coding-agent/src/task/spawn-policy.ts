@@ -58,31 +58,37 @@ export function resolveSpawnPolicy(parentSpawns: string | boolean | null | undef
 }
 
 /**
- * Whether the `scout` agent is spawnable in a session: not disabled via
- * `task.disabledAgents`, and permitted by the session spawn policy.
+ * Whether a session may spawn the agent `name`: not disabled via `task.disabledAgents`, and permitted by its spawn
+ * `policy`.
  */
+export function isAgentSpawnable(
+	name: string,
+	disabledAgents: readonly string[],
+	policy: ResolvedSpawnPolicy,
+): boolean {
+	return (
+		policy.enabled &&
+		!disabledAgents.includes(name) &&
+		(policy.allowedAgents === null || policy.allowedAgents.includes(name))
+	);
+}
+
+/** Whether the `scout` agent is spawnable in a session ({@link isAgentSpawnable}). */
 export function isScoutSpawnable(
 	disabledAgents: readonly string[] | undefined,
 	spawns: string | boolean | null | undefined,
 ): boolean {
-	if (disabledAgents?.includes("scout")) return false;
-	const policy = resolveSpawnPolicy(spawns);
-	if (!policy.enabled) return false;
-	return policy.allowedAgents === null || policy.allowedAgents.includes("scout");
+	return isAgentSpawnable("scout", disabledAgents ?? [], resolveSpawnPolicy(spawns));
 }
 
 /**
- * The agents of `agents` a session may spawn: not disabled via `task.disabledAgents`, and permitted by its spawn
- * `policy`. The task description lists these, and the hidden notices about agents announce only these.
+ * The agents of `agents` a session may spawn ({@link isAgentSpawnable}). The task description lists these, and the
+ * hidden notices about agents announce only these.
  */
 export function spawnableAgents<T extends { name: string }>(
 	agents: readonly T[],
 	disabledAgents: readonly string[],
 	policy: ResolvedSpawnPolicy,
 ): T[] {
-	if (!policy.enabled) return [];
-	const allowed = policy.allowedAgents;
-	return agents.filter(
-		agent => !disabledAgents.includes(agent.name) && (allowed === null || allowed.includes(agent.name)),
-	);
+	return agents.filter(agent => isAgentSpawnable(agent.name, disabledAgents, policy));
 }

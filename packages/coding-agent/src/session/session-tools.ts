@@ -524,6 +524,25 @@ interface AgentNoticeDetails {
 	descriptions: Record<string, string>;
 }
 
+/**
+ * What `live` changes in a list the model knows, `known`: each name it was given with the description it read,
+ * undefined when that is not known. Returns the entries new to it, the ones whose description changed, and the
+ * names `live` no longer has.
+ */
+function listingDelta<T extends { name: string; description: string }>(
+	known: ReadonlyMap<string, string | undefined>,
+	live: readonly T[],
+): { added: T[]; updated: T[]; removed: string[] } {
+	const liveNames = new Set(live.map(entry => entry.name));
+	const added = live.filter(entry => !known.has(entry.name));
+	const updated = live.filter(entry => {
+		const description = known.get(entry.name);
+		return description !== undefined && description !== entry.description;
+	});
+	const removed = [...known.keys()].filter(name => !liveNames.has(name));
+	return { added, updated, removed };
+}
+
 /** Whether `value` is the approvals a {@link PER_CALL_MODEL_NOTICE_MESSAGE_TYPE} message restated. */
 function isPerCallModelAdvertisement(value: unknown): value is PerCallModelAdvertisement {
 	return (
@@ -1149,19 +1168,14 @@ export class SessionTools {
 		};
 	}
 
-	/** Whether the task or eval description lists the per-call models it approves. */
-	#perCallModelsAdvertised(): boolean {
+	/**
+	 * Whether the task or eval description lists the per-call models it approves. Given the session's enabled
+	 * `tools`, only the description of a tool among them counts.
+	 */
+	#perCallModelsAdvertised(tools?: readonly string[]): boolean {
 		const settings = this.#host.settings;
-		return perCallModelEnabled(settings, "task") || perCallModelEnabled(settings, "eval");
-	}
-
-	/** Whether a task or eval tool the session has lists the per-call models it approves. */
-	#perCallModelsListed(): boolean {
-		const settings = this.#host.settings;
-		const tools = this.getEnabledToolNames();
-		return (
-			(tools.includes("task") && perCallModelEnabled(settings, "task")) ||
-			(tools.includes("eval") && perCallModelEnabled(settings, "eval"))
+		return (["task", "eval"] as const).some(
+			tool => (!tools || tools.includes(tool)) && perCallModelEnabled(settings, tool),
 		);
 	}
 
@@ -2866,14 +2880,7 @@ export class SessionTools {
 			}
 			for (const name of details.removed) if (typeof name === "string") known.delete(name);
 		}
-		const listed = spawnableAgents(live, disabledAgents, policy);
-		const listedNames = new Set(listed.map(agent => agent.name));
-		const added = listed.filter(agent => !known.has(agent.name));
-		const updated = listed.filter(agent => {
-			const description = known.get(agent.name);
-			return description !== undefined && description !== agent.description;
-		});
-		const removed = [...known.keys()].filter(name => !listedNames.has(name));
+		const { added, updated, removed } = listingDelta(known, spawnableAgents(live, disabledAgents, policy));
 		if (added.length === 0 && updated.length === 0 && removed.length === 0) return undefined;
 		const entry = (agent: AgentDefinition) => ({ name: agent.name, description: agent.description });
 		const announced = [...added, ...updated];
@@ -2907,7 +2914,7 @@ export class SessionTools {
 		const settings = this.#host.settings;
 		let known = this.#promptSurface.perCallModels;
 		// Without a committed snapshot the descriptions list the live approvals themselves.
-		if (!known || !this.#perCallModelsListed()) return undefined;
+		if (!known || !this.#perCallModelsAdvertised(this.getEnabledToolNames())) return undefined;
 		for (const message of this.#host.agent.state.messages) {
 			if (message.role !== "custom" || message.customType !== PER_CALL_MODEL_NOTICE_MESSAGE_TYPE) continue;
 			if (isPerCallModelAdvertisement(message.details)) known = message.details;
@@ -2947,11 +2954,7 @@ export class SessionTools {
 			}
 			for (const name of details.removed) if (typeof name === "string") known.delete(name);
 		}
-		const live = listed(this.#skills);
-		const liveNames = new Set(live.map(skill => skill.name));
-		const added = live.filter(skill => !known.has(skill.name));
-		const updated = live.filter(skill => known.has(skill.name) && known.get(skill.name) !== skill.description);
-		const removed = [...known.keys()].filter(name => !liveNames.has(name));
+		const { added, updated, removed } = listingDelta(known, listed(this.#skills));
 		if (added.length === 0 && updated.length === 0 && removed.length === 0) return undefined;
 		return {
 			role: "custom",
@@ -3721,29 +3724,22 @@ export class SessionTools {
 			const memory = await backend.beforeAgentStartPrompt(this.#host.memoryBackendSession(), promptText, signal);
 			if (!isCurrent()) return { systemPrompt: this.#baseSystemPrompt };
 			// A recall the branch delivered as a hidden message (see below) is its history, never a system block, not
-			// even on resume, and a prompt rebuild leaves it out of the memory instructions (`withoutDeliveredRecall`).
-			// One a compaction summarized goes out again, once, after this turn's newest content.
+			// even on resume, and a prompt rebuild leaves it out of the memory instructions (`recallDelivered`).
+			// One a compaction summarized goes out again, once, after this turn's newest content. Without a recall
+			// that found something, the base prompt stays as it is too.
 			const carried = this.#host.agent.state.messages.some(
 				message => message.role === "custom" && message.customType === MEMORY_RECALL_MESSAGE_TYPE,
 			);
-			const compacted = carried ? undefined : findDeliveredRecall(this.#host.sessionManager.getBranchView());
-			if (carried || compacted !== undefined) {
+			const resentRecall = carried ? undefined : findDeliveredRecall(this.#host.sessionManager.getBranchView());
+			if (carried || resentRecall !== undefined || !memory?.context) {
 				return {
 					systemPrompt: this.#baseSystemPrompt,
 					memoryNotice: memory?.notice,
-					memoryRecall: compacted,
+					memoryRecall: resentRecall,
 					commit: () => isCurrent() && (memory?.commit() ?? true),
 				};
 			}
-			if (!memory) return { systemPrompt: this.#baseSystemPrompt };
 			const injected = memory.context;
-			if (!injected) {
-				return {
-					systemPrompt: this.#baseSystemPrompt,
-					memoryNotice: memory.notice,
-					commit: () => isCurrent() && memory.commit(),
-				};
-			}
 			// A conversation a prefix-bound model has answered went out without a recall (a reused one is
 			// the transcript's own). A fresh recall now would add a system block, and the provider would
 			// write the whole conversation to its cache again and drop its replayed thinking: it rides
