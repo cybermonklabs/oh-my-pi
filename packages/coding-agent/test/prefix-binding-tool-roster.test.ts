@@ -83,7 +83,10 @@ function newSession(
 		[read.name, read],
 		[bash.name, bash],
 	]);
-	const mock = createMockModel({ responses: [{ content: ["ok"] }, { content: ["ok"] }] });
+	// Each reply comes from the session's model and writes the prompt cache, as a Claude reply does, so a resumed
+	// transcript has a cache entry to keep.
+	const reply = { content: ["ok"], usage: { cacheWrite: 100 } };
+	const mock = createMockModel({ id: model.id, provider: model.provider, responses: [reply, reply] });
 	const contexts: Message[][] = [];
 	const systemPrompts: string[][] = [];
 	const promptCacheKeys: (string | undefined)[] = [];
@@ -117,7 +120,11 @@ function newSession(
 		agent,
 		sessionManager: options.sessionManager ?? SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "test-key" } as never,
+		modelRegistry: {
+			getApiKey: async () => "test-key",
+			find: (provider: string, id: string) => (provider === model.provider && id === model.id ? model : undefined),
+			isUsingOAuth: () => false,
+		} as never,
 		toolRegistry,
 		builtInToolNames: ["read", "bash"],
 		providerPromptCacheKeySource: options.forkPromptCacheKey ? "fork" : undefined,

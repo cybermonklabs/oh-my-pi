@@ -40,9 +40,17 @@ describe("task tool definition across requests", () => {
 	const cleanups: Array<() => Promise<void>> = [];
 
 	afterEach(async () => {
-		for (const cleanup of cleanups.splice(0)) await cleanup();
+		// Newest first: each session is disposed before the directory it writes under is removed.
+		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 		vi.restoreAllMocks();
 	});
+
+	/** A temp dir removed once the session started under it is disposed. */
+	function createTempDir(): TempDir {
+		const dir = TempDir.createSync("@pi-task-tool-cache-prefix-");
+		cleanups.push(() => dir.remove());
+		return dir;
+	}
 
 	async function startSession(tempDir: TempDir, settings: Settings): Promise<Harness> {
 		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml());
@@ -75,7 +83,7 @@ describe("task tool definition across requests", () => {
 	}
 
 	it("keeps the task tool's bytes when agent discovery gains an agent, and tells the model by a notice", async () => {
-		using tempDir = TempDir.createSync("@pi-task-tool-cache-prefix-");
+		const tempDir = createTempDir();
 		const harness = await startSession(tempDir, Settings.isolated({ "providers.cacheRetention": "long" }));
 		await harness.session.prompt("first");
 
@@ -96,7 +104,7 @@ describe("task tool definition across requests", () => {
 	}, 30_000);
 
 	it("keeps the task tool's bytes when the approved per-call models change, and tells the model by a notice", async () => {
-		using tempDir = TempDir.createSync("@pi-task-tool-cache-prefix-");
+		const tempDir = createTempDir();
 		const settings = Settings.isolated({
 			"providers.cacheRetention": "long",
 			"task.perCallModel": "on",

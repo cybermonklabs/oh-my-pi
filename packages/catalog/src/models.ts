@@ -247,7 +247,9 @@ export interface CacheTokenPrices {
  * write at twice the input rate, a five-minute write at the `cacheWrite` rate, a read at the
  * `cacheRead` rate. `promptInputTokens` selects the long-context tier and `timestamp` (Unix ms)
  * the dated card and peak/off-peak multiplier, exactly as {@link calculateUsageCost} applies
- * them; only scheduled prices default to now.
+ * them; only scheduled prices default to now. A card that prices neither a cache read nor a
+ * cache write at that tier prices no cache, so it has no cache to keep: both prices are 0 at
+ * either lifetime.
  */
 export function getCacheTokenPrices(
 	cost: ModelCost,
@@ -256,6 +258,7 @@ export function getCacheTokenPrices(
 	timestamp?: number,
 ): CacheTokenPrices {
 	const { rates, multiplier } = resolvePricing(cost, promptInputTokens, timestamp);
+	if (!(rates.cacheRead > 0) && !(rates.cacheWrite > 0)) return { read: 0, write: 0 };
 	return {
 		read: (rates.cacheRead / 1000000) * multiplier,
 		write: cacheWriteRate(rates, lifetime) * multiplier,

@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite";
+import { vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
@@ -51,4 +53,37 @@ export function activateTodoTool(session: AgentSession, cwd: string): void {
 			settings: session.settings,
 		}),
 	]);
+}
+
+/** A session whose settings load a `--config` overlay file. */
+export interface OverlaySession {
+	session: AgentSession;
+	settings: Settings;
+	/** Path of the overlay file. */
+	overlay: string;
+}
+
+/** A rebuild of the session a settings reload may start, which {@link reloadOverlay} waits for. */
+export type OverlayRebuild = "refreshBaseSystemPrompt" | "reconcileBuiltinTools" | "refreshSkillsAndCommands";
+
+/**
+ * Rewrites the overlay file with `content` and reloads it as the config watcher does, then waits for each call of the
+ * session's `rebuilds` the change starts.
+ */
+export async function reloadOverlay(
+	{ session, settings, overlay }: OverlaySession,
+	content: string,
+	rebuilds: readonly OverlayRebuild[] = [
+		"refreshBaseSystemPrompt",
+		"reconcileBuiltinTools",
+		"refreshSkillsAndCommands",
+	],
+): Promise<void> {
+	const spies = rebuilds.map(rebuild => vi.spyOn(session, rebuild));
+	await Bun.write(overlay, content);
+	await settings.reloadFromDisk();
+	// The settings listeners run in the microtask the reload queued for them.
+	await Promise.resolve();
+	await Promise.all(spies.flatMap(spy => spy.mock.results.map(result => result.value)));
+	for (const spy of spies) spy.mockRestore();
 }

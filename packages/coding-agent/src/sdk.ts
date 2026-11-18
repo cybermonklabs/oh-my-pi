@@ -168,6 +168,7 @@ import { mapPromptArguments } from "./mcp/prompt-args";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
+import { findDeliveredRecall, withoutDeliveredRecall } from "./memory-backend/recall-entry";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionStateApi } from "./mnemopi/state";
 import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.md" with { type: "text" };
@@ -2818,7 +2819,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			},
 			getArtifactManager: () => sessionManager.getArtifactManager(),
-			settings,
+			/**
+			 * The session's settings, except inside a call to a tool a held settings change keeps declared as
+			 * sent: there the ones it was declared under, so the call runs as declared (`SessionTools`).
+			 */
+			get settings() {
+				return session?.toolCallSettings ?? settings;
+			},
 			authStorage,
 			modelRegistry,
 			getTelemetry: () => agent?.telemetry,
@@ -4536,13 +4543,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			}
 			const memoryBackend = restrictToolNames ? undefined : await resolveMemoryBackend(settings);
-			const memoryInstructions = memoryBackend
+			const backendInstructions = memoryBackend
 				? await memoryBackend.buildDeveloperInstructions(agentDir, sessionManager.getCwd(), settings, session)
 				: undefined;
-			// Advisors get the same memory block (sharpshooter decisions, mnemopi/
+			// Advisors get the backend's memory block (sharpshooter decisions, mnemopi/
 			// hindsight instructions) wrapped as shared background knowledge; the
 			// tool-availability caveat lives in the wrapper template.
-			advisorMemoryPrompt = formatAdvisorMemoryPrompt(memoryInstructions);
+			advisorMemoryPrompt = formatAdvisorMemoryPrompt(backendInstructions);
 			if (hasSession) session.setAdvisorMemoryPrompt(advisorMemoryPrompt);
 			const inlineToolDescriptors = resolveInlineToolDescriptors();
 			// Unset only during the initial build; the agent is constructed with it.
@@ -4554,6 +4561,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return {
 					systemPrompt: typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt,
 				};
+			}
+			// Advisors keep the recall; the prompt leaves out one the conversation carries as a hidden message.
+			let memoryInstructions = backendInstructions;
+			const deliveredRecall = findDeliveredRecall(sessionManager.getBranchView());
+			if (memoryBackend && deliveredRecall !== undefined) {
+				const instructions = await memoryBackend.buildDeveloperInstructions(
+					agentDir,
+					sessionManager.getCwd(),
+					settings,
+					session,
+					{ recallDelivered: true },
+				);
+				memoryInstructions = withoutDeliveredRecall(instructions, deliveredRecall);
 			}
 
 			// Build combined append prompt: memory instructions + auto-learn guidance
@@ -5438,7 +5458,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			extensionPaths,
 			disableExtensionDiscovery: options.disableExtensionDiscovery,
 			autoApprove: options.autoApprove,
-			scoutAllowedBySpawnPolicy: isScoutSpawnable(undefined, options.spawns ?? "*"),
+			spawns: options.spawns,
 			evalKernelOwnerId,
 			// Children borrow their parent's manager but never dispose it.
 			ownedAsyncJobManager: asyncJobManager,
@@ -5575,7 +5595,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Hide Secrets first switches outbound obfuscation on the live obfuscator (earlier
 		// placeholders keep deobfuscating, the first switch-on builds it): the prompt
 		// reports its state. Each settings-started rebuild below passes the change, so a
-		// bound prompt holds it until a cut or a lapsed cache entry (`SessionTools`).
+		// bound prompt holds it until a cut, a lapsed cache entry or five minutes on (`SessionTools`).
 		cfgSystemPromptInputs.listenChanges(session, async settingsChange => {
 			if (settingsChange.some(change => change.setting === cfgSecretsEnabled)) {
 				try {

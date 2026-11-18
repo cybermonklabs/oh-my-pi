@@ -210,8 +210,8 @@ export interface AgentSessionConfig {
 	disableExtensionDiscovery?: boolean;
 	/** Cost gate of the session tree; refuses this session's model requests at `session.maxCost`. */
 	costGate?: CostGateApi;
-	/** Whether the session spawn policy permits the read-only `scout` subagent. Defaults to true. */
-	scoutAllowedBySpawnPolicy?: boolean;
+	/** The session's spawn policy (an agent's `spawns` frontmatter): which agents it may spawn. Defaults to `*`, any. */
+	spawns?: string;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
 	autoApprove?: boolean;
 	/** User-authorized model agents inherited from the parent session for nested delegation. */
