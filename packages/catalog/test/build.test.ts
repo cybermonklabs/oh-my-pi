@@ -2389,8 +2389,7 @@ describe("model cache materialized round trip", () => {
 			// The second is released early, as on an error before its turn came.
 			second[Symbol.dispose]();
 			// Let any cleanup the release triggers run before the next turn is taken.
-			await Promise.resolve();
-			await Promise.resolve();
+			await new Promise(resolve => setTimeout(resolve, 0));
 			const third = turn();
 			let thirdReady = false;
 			void third.ready.then(() => (thirdReady = true));

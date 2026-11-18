@@ -3,6 +3,7 @@ import {
 	EVENT_LOOP_SLICE_MS,
 	mapInSlices,
 	nextSlice,
+	parseJsonBytesInSlices,
 	readJsonInSlices,
 	runInSlices,
 	sliceExpired,
@@ -206,27 +207,56 @@ describe("runInSlices", () => {
 });
 
 describe("readJsonInSlices", () => {
+	// About 10 MB: its parse outlasts a slice's budget, and its decode the timers' 1 ms clamp, on any machine.
+	const body = JSON.stringify(
+		Array.from({ length: 150_000 }, (_, index) => ({
+			id: `model-${index}`,
+			name: `Model ${index}`,
+			window: index,
+		})),
+	);
+
 	it("parses each fetched payload in a slice of its own, so two that arrive together do not hold off due timers", async () => {
-		// About 10 MB: its parse outlasts a slice's budget on any machine.
-		const body = JSON.stringify(
-			Array.from({ length: 150_000 }, (_, index) => ({
-				id: `model-${index}`,
-				name: `Model ${index}`,
-				window: index,
-			})),
+		// Both bodies are read first, so the parses' order against the timer depends only on the slicer.
+		const bodies = await Promise.all(
+			[new Response(body), new Response(body)].map(response => response.arrayBuffer()),
 		);
+		await new Promise(resolve => setTimeout(resolve, 5));
 		let fired = false;
 		setTimeout(() => (fired = true), 0);
-		const firedAtEnd: boolean[] = [];
-		const parsed = await Promise.all(
-			[new Response(body), new Response(body)].map(async response => {
-				const payload = await readJsonInSlices(response);
-				firedAtEnd.push(fired);
-				return payload;
-			}),
-		);
+		// Whether the timer had fired when each payload's parse started.
+		const firedAtParse: boolean[] = [];
+		const parse = JSON.parse;
+		vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?: Parameters<typeof JSON.parse>[1]) => {
+			if (text.length === body.length) firedAtParse.push(fired);
+			return parse(text, reviver);
+		});
+		const parsed = await Promise.all(bodies.map(bytes => parseJsonBytesInSlices(bytes)));
 		expect(parsed.map(payload => (payload as unknown[]).length)).toEqual([150_000, 150_000]);
-		// The second payload's parse waited for the timers.
-		expect(firedAtEnd[1]).toBe(true);
+		// The first parse ran before the timer; the second waited for it.
+		expect(firedAtParse).toEqual([false, true]);
+	});
+
+	it("reads a response's body and parses it as JSON", async () => {
+		expect(await readJsonInSlices(new Response('{"rows":[1,2,3]}'))).toEqual({ rows: [1, 2, 3] });
+		await expect(readJsonInSlices(new Response("{"))).rejects.toBeInstanceOf(SyntaxError);
+	});
+
+	it("lets due timers run between a payload's decode and its parse once the decode has spent the slice", async () => {
+		await new Promise(resolve => setTimeout(resolve, 5));
+		// Each clock read is 11 ms of work: the check after the decode finds the slice spent.
+		let now = 1_000;
+		vi.spyOn(performance, "now").mockImplementation(() => (now += 11));
+		let fired = false;
+		setTimeout(() => (fired = true), 0);
+		let firedAtParse: boolean | undefined;
+		const parse = JSON.parse;
+		vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?: Parameters<typeof JSON.parse>[1]) => {
+			if (text.length === body.length) firedAtParse = fired;
+			return parse(text, reviver);
+		});
+		const payload = await parseJsonBytesInSlices(new TextEncoder().encode(body));
+		expect((payload as unknown[]).length).toBe(150_000);
+		expect(firedAtParse).toBe(true);
 	});
 });

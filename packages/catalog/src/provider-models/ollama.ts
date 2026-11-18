@@ -103,7 +103,7 @@ async function fetchShowMetadata(
 	if (!response.ok) {
 		return undefined;
 	}
-	return (await response.json()) as OllamaShowResponse;
+	return (await readJsonInSlices(response)) as OllamaShowResponse;
 }
 
 export function ollamaCloudModelManagerOptions(

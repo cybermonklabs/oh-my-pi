@@ -700,7 +700,10 @@ async function fetchOllamaShowMetadata(
 		if (!response.ok) {
 			return undefined;
 		}
-		const payload = (await response.json()) as { capabilities?: unknown; model_info?: Record<string, unknown> };
+		const payload = (await readJsonInSlices(response)) as {
+			capabilities?: unknown;
+			model_info?: Record<string, unknown>;
+		};
 		const capabilities = getOllamaCapabilities(payload.capabilities);
 		const contextWindow = getOllamaContextWindow(payload.model_info);
 		return {
