@@ -41,9 +41,17 @@ function mockClockStillUntilStarted(): { start: () => void } {
  * Waits until a discovery of `provider` has listed exactly `modelIds`, then for
  * one more timer. When that discovery was the last of its pass, the pass's
  * fetches have all resolved by then, and it has its place in the commit order.
+ * Throws with the last discovery state when that has not happened in 4 s, inside
+ * the test's 5 s timeout. (`performance.now` is mocked here; `Date.now` is not.)
  */
 async function untilDiscovered(registry: ModelRegistry, provider: string, modelIds: string[]): Promise<void> {
+	const deadline = Date.now() + 4_000;
 	while (registry.getProviderDiscoveryState(provider)?.models.join("\n") !== modelIds.join("\n")) {
+		if (Date.now() > deadline) {
+			throw new Error(
+				`${provider} never listed ${JSON.stringify(modelIds)}; last state: ${JSON.stringify(registry.getProviderDiscoveryState(provider))}`,
+			);
+		}
 		await new Promise(resolve => setTimeout(resolve, 0));
 	}
 	await new Promise(resolve => setTimeout(resolve, 0));
@@ -178,12 +186,62 @@ describe("ModelRegistry discovery slicing", () => {
 		// The full pass fetches v1, and its fetches resolve; it then merges the whole catalog in slices.
 		const fullPass = registry.refresh("online");
 		await untilDiscovered(registry, "ordered-provider", ["model-v1"]);
+		expect(registry.find("ordered-provider", "model-v1")).toBeUndefined();
 		// A scoped pass starts during that merge and fetches v2; it commits after the full pass.
 		await registry.refreshDiscoverableProviders(["ordered-provider"], "online");
 		await fullPass;
 		expect(fetches).toBe(2);
 		expect(registry.find("ordered-provider", "model-v2")).toBeDefined();
 		expect(registry.find("ordered-provider", "model-v1")).toBeUndefined();
+	});
+
+	test("a pass that starts first but whose fetches resolve last commits last", async () => {
+		const clock = mockClockStillUntilStarted();
+		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
+		const row = (id: string) => ({
+			id,
+			name: id,
+			reasoning: false,
+			input: ["text" as const],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		let fetches = 0;
+		const { promise: lateFetchMayResolve, resolve: letLateFetchResolve } = Promise.withResolvers<void>();
+		registry.registerProvider(
+			"ordered-provider",
+			{
+				baseUrl: "https://ordered.example.com/v1",
+				apiKey: "ORDERED_KEY",
+				api: "openai-completions",
+				fetchDynamicModels: async () => {
+					fetches++;
+					if (fetches > 1) return [row("model-early")];
+					await lateFetchMayResolve;
+					clock.start();
+					return [row("model-late")];
+				},
+			},
+			"ext://ordered",
+		);
+		// The full pass starts first; its fetch waits. It reaches the fetch only after
+		// collecting every provider's options, so the scoped pass starts once it has.
+		const fullPass = registry.refresh("online");
+		const deadline = Date.now() + 4_000;
+		while (fetches === 0) {
+			if (Date.now() > deadline) throw new Error("the full pass never fetched");
+			await new Promise(resolve => setTimeout(resolve, 0));
+		}
+		// The scoped pass starts later and its fetch resolves first, so it commits without waiting for the full pass.
+		await registry.refreshDiscoverableProviders(["ordered-provider"], "online");
+		expect(registry.find("ordered-provider", "model-early")).toBeDefined();
+		// The full pass's fetch resolves last, so its rows replace the scoped pass's.
+		letLateFetchResolve();
+		await fullPass;
+		expect(fetches).toBe(2);
+		expect(registry.find("ordered-provider", "model-late")).toBeDefined();
+		expect(registry.find("ordered-provider", "model-early")).toBeUndefined();
 	});
 
 	test("a pass that stops before its commit does not let a later pass commit before an earlier one", async () => {
@@ -266,65 +324,117 @@ describe("ModelRegistry discovery slicing", () => {
 		// The online pass fetches a list without gone-model, writes the cache, then merges in slices.
 		const onlinePass = registry.refresh("online");
 		await untilDiscovered(registry, "gateway", ["keep-model"]);
+		expect(registry.find("gateway", "gone-model")).toBeDefined();
 		// A scoped pass during that merge reads the fresh cache; it commits after the online pass.
 		await registry.refreshDiscoverableProviders(["gateway"], "online-if-uncached");
+		expect(registry.find("gateway", "gone-model")).toBeUndefined();
 		await onlinePass;
 		expect(listCalls).toBe(2);
 		expect(registry.find("gateway", "keep-model")).toBeDefined();
 		expect(registry.find("gateway", "gone-model")).toBeUndefined();
 	});
 
+	test("a pass whose configuration is reloaded during its merge does not commit what it merged before", async () => {
+		const clock = mockClockStillUntilStarted();
+		const modelsPath = tempDir.join("cfg", "models.json");
+		fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					gateway: {
+						baseUrl: "http://127.0.0.1:9993",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		const gatewayFetch: FetchImpl = async input => {
+			if (String(input) !== "http://127.0.0.1:9993/v1/models") throw new Error(`offline: ${String(input)}`);
+			// Every other discovery of the online pass has finished, so its fetches resolve with this one.
+			await new Promise(resolve => setTimeout(resolve, 0));
+			clock.start();
+			return Response.json({ data: [{ id: "removed-model" }] });
+		};
+		const registry = new ModelRegistry(authStorage, modelsPath, { fetch: gatewayFetch });
+		const onlinePass = registry.refresh("online");
+		await untilDiscovered(registry, "gateway", ["removed-model"]);
+		expect(registry.find("gateway", "removed-model")).toBeUndefined();
+		// During the online pass's merge the gateway leaves the configuration, and
+		// the next refresh reloads it: the online pass's merge read a provider that is gone.
+		fs.writeFileSync(modelsPath, JSON.stringify({ providers: {} }));
+		const later = new Date(Date.now() + 60_000);
+		fs.utimesSync(modelsPath, later, later);
+		const reloadingPass = registry.refresh("offline");
+		await Promise.all([onlinePass, reloadingPass]);
+		expect(registry.find("gateway", "removed-model")).toBeUndefined();
+	});
+
 	test("a refresh awaited by createAgentSession takes its turns without waiting for a pending timer", async () => {
 		// No model has auth here, so creation awaits refresh("online-if-uncached") before it rejects.
-		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
-		const refresh = registry.refresh.bind(registry);
-		let refreshMs = Number.NaN;
-		registry.refresh = async (...args: Parameters<ModelRegistry["refresh"]>) => {
-			const startedAt = performance.now();
-			try {
-				return await refresh(...args);
-			} finally {
-				refreshMs = performance.now() - startedAt;
-			}
-		};
-		const agents = new AgentRegistry();
-		agents.register({
-			id: "owned-worker",
-			displayName: "B",
-			kind: "sub",
-			parentId: "Main",
-			session: null,
-			status: "idle",
-		});
-		fs.mkdirSync(tempDir.join("project"));
-		// A turn that waited for the next timer would take up to this period each time.
-		const pendingTimer = setInterval(() => {}, 2_000);
+		// A provider key in this process's environment would give one auth, so the test sets them aside.
+		const setAside = Object.keys(process.env).filter(key =>
+			/(_API_KEY|_TOKEN|_SECRET_ACCESS_KEY|_ACCESS_KEY_ID)$/.test(key),
+		);
+		const savedEnv = setAside.map(key => [key, process.env[key]] as const);
+		for (const key of setAside) delete process.env[key];
 		try {
-			await expect(
-				createAgentSession({
-					cwd: tempDir.join("project"),
-					agentDir: tempDir.join("agent"),
-					modelRegistry: registry,
-					settings: Settings.isolated(),
-					disableExtensionDiscovery: true,
-					skills: [],
-					contextFiles: [],
-					promptTemplates: [],
-					slashCommands: [],
-					enableMCP: false,
-					enableLsp: false,
-					agentRegistry: agents,
-					agentId: "owned-worker",
-					agentDisplayName: "A",
-					parentTaskPrefix: "owned-worker",
-					parentAgentId: "Main",
-					taskDepth: 1,
-					expectedAgentRef: null,
-				}),
-			).rejects.toThrow("already owned by another session generation");
+			const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
+			const refresh = registry.refresh.bind(registry);
+			let refreshMs = Number.NaN;
+			registry.refresh = async (...args: Parameters<ModelRegistry["refresh"]>) => {
+				const startedAt = performance.now();
+				try {
+					return await refresh(...args);
+				} finally {
+					refreshMs = performance.now() - startedAt;
+				}
+			};
+			const agents = new AgentRegistry();
+			agents.register({
+				id: "owned-worker",
+				displayName: "B",
+				kind: "sub",
+				parentId: "Main",
+				session: null,
+				status: "idle",
+			});
+			fs.mkdirSync(tempDir.join("project"));
+			// A turn that waited for the next timer would take up to this period each time.
+			const pendingTimer = setInterval(() => {}, 20_000);
+			try {
+				await expect(
+					createAgentSession({
+						cwd: tempDir.join("project"),
+						agentDir: tempDir.join("agent"),
+						modelRegistry: registry,
+						settings: Settings.isolated(),
+						disableExtensionDiscovery: true,
+						skills: [],
+						contextFiles: [],
+						promptTemplates: [],
+						slashCommands: [],
+						enableMCP: false,
+						enableLsp: false,
+						agentRegistry: agents,
+						agentId: "owned-worker",
+						agentDisplayName: "A",
+						parentTaskPrefix: "owned-worker",
+						parentAgentId: "Main",
+						taskDepth: 1,
+						expectedAgentRef: null,
+					}),
+				).rejects.toThrow("already owned by another session generation");
+			} finally {
+				clearInterval(pendingTimer);
+			}
+			expect(Number.isNaN(refreshMs)).toBe(false);
+			// Far below one 20 s timer period, and far above what a loaded machine adds to a refresh.
+			expect(refreshMs).toBeLessThan(10_000);
 		} finally {
-			clearInterval(pendingTimer);
+			for (const [key, value] of savedEnv) process.env[key] = value;
 		}
-		expect(refreshMs).toBeLessThan(1_500);
 	}, 30_000);
 });
