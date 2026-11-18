@@ -19,6 +19,7 @@ from robomp.github_backend import GitHubBackend
 from robomp.github_client import GitHubClient
 from robomp.manual_triage import InvalidIssueRef, ManualTriageTimeout, await_terminal_state, parse_issue_ref
 from robomp.proxy_client import ProxyGitTransport
+from robomp.queue import WorkerPool
 from robomp.sandbox import LocalGitTransport, SandboxManager
 from robomp.server import create_app
 
@@ -77,6 +78,34 @@ def test_create_app_runs_injected_pool_lifecycle(settings: Settings) -> None:
 
     close_database()
     assert pool.stopped is True
+
+
+def test_create_app_runs_the_default_worker_pool_and_reports_its_inflight(settings: Settings) -> None:
+    # Every other app test injects a paused pool; this one keeps create_app's
+    # default factory, so the real WorkerPool starts and stops in the app's
+    # lifespan and /api/status reads its in-flight snapshot. No event is
+    # seeded, so the pool's dispatch loop has nothing to claim and cannot race
+    # the test.
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        pool = app.state.bag["pool"]
+        assert isinstance(pool, WorkerPool)
+        dispatch = [task for task in pool._workers if task.get_name() == "robomp-dispatch"]
+        assert len(dispatch) == 1, "the lifespan did not start the pool"
+        assert not dispatch[0].done()
+        assert client.get("/api/status").json()["inflight"] == []
+        # An issue key the pool holds in flight shows up in the status payload.
+        pool._inflight.add(issue_key("octo/widget", 7))
+        try:
+            assert client.get("/api/status").json()["inflight"] == [issue_key("octo/widget", 7)]
+        finally:
+            pool._inflight.discard(issue_key("octo/widget", 7))
+
+    close_database()
+    assert pool._stop.is_set(), "the lifespan did not stop the pool"
+    assert pool._workers == []
+    assert dispatch[0].done()
 
 
 def _seed_db(settings: Settings) -> None:

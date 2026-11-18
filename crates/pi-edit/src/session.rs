@@ -78,6 +78,11 @@ pub struct WriteResponse {
 /// Host-side byte owner.
 #[async_trait]
 pub trait EditWriter: Send + Sync {
+	/// Write one file. A writer that will not begin the write because the
+	/// call was cancelled returns [`EditError::Cancelled`] having touched
+	/// nothing; [`Session::apply`] then returns it with `written` naming what
+	/// each earlier write of the call changed (`a.md`, `a.md (moved to c.md)`,
+	/// `d.md (deleted)`).
 	async fn write(&self, request: WriteRequest) -> EditResult<WriteResponse>;
 }
 
@@ -323,8 +328,10 @@ impl Session {
 	/// failure aborts before the first write), enforce the plan-mode guard
 	/// for every file, then write in payload order. A writer failure aborts
 	/// the loop; files already written stay written and the error is
-	/// returned verbatim. URL targets never reuse preview-time answers (see
-	/// [`Self::begin_apply_url_targets`]).
+	/// returned verbatim, except a writer's [`EditError::Cancelled`], which
+	/// comes back naming what this call's earlier writes changed (a move by
+	/// its source and destination, a delete as deleted). URL targets never
+	/// reuse preview-time answers (see [`Self::begin_apply_url_targets`]).
 	///
 	/// # Errors
 	/// Staging and plan-mode failures, all raised before the first write —
@@ -352,12 +359,14 @@ impl Session {
 
 		let last_write = staged.iter().rposition(|file| file.op != FileOp::Noop);
 		let mut files = Vec::with_capacity(staged.len());
+		// What each completed write changed, for a cancel later in the loop.
+		let mut changed: Vec<String> = Vec::new();
 		for (index, mut file) in staged.into_iter().enumerate() {
 			let canonical = canonical_key(&file.absolute);
 			let response = if file.op == FileOp::Noop {
 				WriteResponse::default()
 			} else {
-				writer
+				let response = writer
 					.write(WriteRequest {
 						absolute:     file.absolute.clone(),
 						display:      file.display.clone(),
@@ -367,7 +376,17 @@ impl Session {
 						flush_lsp:    request.lsp_flush && last_write == Some(index),
 						lsp_batch_id: request.lsp_batch_id.clone(),
 					})
-					.await?
+					.await
+					.map_err(|err| match err {
+						EditError::Cancelled { .. } => EditError::Cancelled { written: changed.clone() },
+						other => other,
+					})?;
+				changed.push(match (&file.move_to, file.op) {
+					(Some(dest), _) => format!("{} (moved to {})", file.display, dest.display),
+					(None, FileOp::Delete) => format!("{} (deleted)", file.display),
+					(None, _) => file.display.clone(),
+				});
+				response
 			};
 
 			let mut tag: Option<String> = None;

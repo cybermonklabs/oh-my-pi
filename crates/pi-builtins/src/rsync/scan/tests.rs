@@ -8,6 +8,7 @@ use crate::rsync::consts::{
 	CF_INC_RECURSE, CF_VARINT_FLIST_FLAGS, FLAG_IMPLIED_DIR, MIN_FILECNT_LOOKAHEAD,
 };
 use crate::rsync::filter::FilterConfig;
+use crate::rsync::log::LogConfig;
 use crate::rsync::mux::{IoCounters, MuxReader, ReadConfig, WriteConfig};
 use crate::rsync::options::Options;
 use crate::rsync::wire::Proto;
@@ -49,6 +50,12 @@ fn base_opts() -> Options {
 	o
 }
 
+thread_local! {
+	/// What the contexts this test made logged (libtest runs a test on one
+	/// thread): the text of each error that set `io_error`.
+	static LOGGED: Sink = Sink::default();
+}
+
 fn ctx_for(opts: Options, p: Proto, inc: bool, am_sender: bool, cwd: &Path) -> Ctx {
 	let mut o = opts;
 	o.am_sender = am_sender;
@@ -59,7 +66,21 @@ fn ctx_for(opts: Options, p: Proto, inc: bool, am_sender: bool, cwd: &Path) -> C
 	ctx.acl_opts.inc_recurse = inc;
 	ctx.am_sender = am_sender;
 	ctx.cwd = cwd.to_path_buf();
+	let logged = LOGGED.with(Sink::clone);
+	ctx.logger = Logger::local(Box::new(logged.clone()), Box::new(logged), LogConfig::default());
 	ctx
+}
+
+/// Fails, showing what the test's contexts logged, unless the scan recorded
+/// exactly `expected` in `io_error`: an entry the scan could not read is
+/// left out of the list, so a scan that dropped part of the tree must not
+/// pass on the entries it did send.
+fn assert_io_error(ctx: &Ctx, expected: i32) {
+	let got = ctx.io_error.load(Ordering::Relaxed);
+	if got != expected {
+		let logged = LOGGED.with(|sink| String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned());
+		panic!("the scan recorded io_error {got:#x}, not {expected:#x}; the contexts logged:\n{logged}");
+	}
 }
 
 fn write_file(path: &Path, data: &[u8]) {
@@ -81,19 +102,31 @@ fn fixture() -> tempfile::TempDir {
 	tmp
 }
 
-/// Runs a whole sender scan; returns the wire bytes and the sender's registry.
+/// Runs a whole sender scan, which must record no `io_error`; returns the wire
+/// bytes and the sender's registry.
 fn scan(ctx: &Ctx, sources: &[&str], files_from: Option<&[u8]>) -> (Vec<u8>, Arc<Flists>) {
 	let (bytes, flists, _) = scan_with(ctx, sources, files_from, Filters::new(FilterConfig::default()));
 	(bytes, flists)
 }
 
 /// [`scan`] with sender filters, also returning the scanner (for transfer-time lookups).
-/// The writer counts into `ctx.counters`, as the session wires it.
 fn scan_with(
 	ctx: &Ctx,
 	sources: &[&str],
 	files_from: Option<&[u8]>,
 	filters: Filters,
+) -> (Vec<u8>, Arc<Flists>, Scanner) {
+	scan_recording(ctx, sources, files_from, filters, 0)
+}
+
+/// [`scan_with`] for a scan that must record exactly `io_error`. The writer
+/// counts into `ctx.counters`, as the session wires it.
+fn scan_recording(
+	ctx: &Ctx,
+	sources: &[&str],
+	files_from: Option<&[u8]>,
+	filters: Filters,
+	io_error: i32,
 ) -> (Vec<u8>, Arc<Flists>, Scanner) {
 	let sink = Sink::default();
 	let out = MuxWriter::new(Box::new(sink.clone()), ctx.counters.clone(), WriteConfig::default());
@@ -108,6 +141,7 @@ fn scan_with(
 	let mut w = out.clone();
 	w.flush().unwrap();
 	let bytes = sink.0.lock().unwrap().clone();
+	assert_io_error(ctx, io_error);
 	(bytes, flists, scanner)
 }
 
@@ -546,10 +580,14 @@ fn files_from_symlink_refused_by_confine_root_is_a_stat_error() {
 	o.confine_root = Some(root.clone().into_os_string());
 	let ctx = ctx_for(o, proto(33, false), false, true, &base);
 	let root_s = root.to_str().unwrap().to_owned();
-	let (_, fl, _) =
-		scan_with(&ctx, &[root_s.as_str()], Some(b"outside-link/\n"), Filters::new(FilterConfig::default()));
+	let (_, fl, _) = scan_recording(
+		&ctx,
+		&[root_s.as_str()],
+		Some(b"outside-link/\n"),
+		Filters::new(FilterConfig::default()),
+		IOERR_GENERAL,
+	);
 	assert!(names(&fl).is_empty(), "{:?}", names(&fl));
-	assert_ne!(ctx.io_error.load(Ordering::Relaxed) & IOERR_GENERAL, 0);
 }
 
 #[test]
@@ -609,8 +647,9 @@ fn fake_super_stat_xattr_is_folded_into_entries() {
 	let tree = Tree::open(&pi_vfs::BlockingFs::native(), &z, &TreeOpts::default()).unwrap();
 	let name = crate::rsync::xattr::rsync_internal_name(b"stat");
 	let name = std::ffi::OsStr::from_bytes(&name);
-	if tree.set_xattr(Path::new("achar"), name, b"20644 1,3 0:0", false).is_err() {
-		return; // no user xattrs on this filesystem
+	if let Err(err) = tree.set_xattr(Path::new("achar"), name, b"20644 1,3 0:0", false) {
+		eprintln!("skipped: no user xattrs on the temporary filesystem: {err}");
+		return;
 	}
 	let mut o = base_opts();
 	o.am_root = -1;

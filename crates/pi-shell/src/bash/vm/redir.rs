@@ -15,7 +15,7 @@
 
 use std::{
 	sync::Arc,
-	task::{Context, Poll},
+	task::{Context, Poll, Wake, Waker},
 };
 
 use bstr::{BStr, BString, ByteSlice};
@@ -36,7 +36,7 @@ use crate::bash::{
 	diag::Diag,
 	event::{EventData, RedirInfo, RedirKind, WaitKey},
 	fd::{FdOrigin, FdRef},
-	fs::{File, FileKind, FsOp, FsPoll, OpenFlags, SeekFrom, StatKind},
+	fs::{File, FileKind, FsOp, FsPoll, Mark, OpenFlags, SeekFrom, StatKind},
 	host::{ChildRedir, OsHandle},
 	ids::Dialect,
 	ir::{RedirFdIr, RedirIr, RedirTargetIr, SpawnKind, Unit},
@@ -543,7 +543,7 @@ fn install(
 				let mut msg = k.argv0.to_vec();
 				msg.extend_from_slice(b": redirection error: cannot duplicate fd: Invalid argument\n");
 				vp.out
-					.push_back(super::proc::PendingWrite { fd: 2, bytes: msg.into(), off: 0 });
+					.push_back(super::proc::PendingWrite::new(2, msg.into()));
 				let err = std::io::Error::from(std::io::ErrorKind::InvalidInput);
 				return Err(fail(k, vp, cx, line, Diag::Io { path: target.clone(), err }));
 			}
@@ -892,7 +892,7 @@ fn place(vp: &mut Vproc, fd: i32, h: FdRef, output: bool, multios: bool) -> Resu
 	fds.push(h);
 	let all = fds.clone();
 	let merged: Box<dyn File> = if output {
-		Box::new(Tee { done: vec![0; all.len()], targets: all })
+		Box::new(Tee::new(all))
 	} else {
 		Box::new(Cat { sources: all, at: 0 })
 	};
@@ -1215,13 +1215,299 @@ fn zsh_close(
 	Ok(())
 }
 
-/// zsh's multio tee (`closemn` for output): every write goes to each
-/// target in turn; a target that is gone (closed, failed) is skipped. A
-/// write that cannot finish keeps how far each target got, for the
-/// caller's retry of the same bytes.
-struct Tee {
+/// The most a tee holds that not every target has taken yet; a write past
+/// it waits.
+const TEE_HOLD: usize = 64 << 10;
+
+/// A write of at most this many bytes goes into a tee whole or not at all,
+/// as a pipe keeps a write of at most `PIPE_BUF` bytes whole. It is Linux's
+/// `PIPE_BUF`, used on every platform: macOS's is 512, so the tee keeps at
+/// least as much whole as a pipe does there. This keeps whole a write the
+/// shell makes to the tee itself (a builtin's, a diagnostic, a write through
+/// a duplicate or a nested tee), so another writer's bytes never land
+/// inside it. A program's output does not come in its own writes: the tee
+/// has no OS handle, so a program writing to it is pumped, and its pump
+/// reads up to 64 KiB from the program's pipe at once and hands the chunk
+/// to the tee in one write. That read can end inside one of the program's
+/// writes, and a chunk longer than this is split where a slow target leaves
+/// less room, so another writer's line can still land inside a program's.
+/// zsh keeps it whole because every writer writes into its tee process's
+/// pipe; closing it needs a pipe of the tee's own that every writer shares.
+const TEE_WHOLE: usize = 4096;
+
+/// zsh's multio tee (`closemn` for output). Like zsh's tee process, which
+/// reads what the command wrote from a pipe, the tee owns what it takes: a
+/// write queues its bytes and returns, and the queue goes to each target in
+/// order, one write after another, as the tee is polled (a later write, a
+/// settle, a flush, an idle pump). A tee is one fd object that several
+/// writers share (an external's pump, then a builtin), and its duplicates
+/// share its queue, so no write's progress or failure is another's: each
+/// target goes through each write on its own, a write is `Pending` only
+/// when it took nothing, a write of at most [`TEE_WHOLE`] bytes is taken
+/// whole (which keeps the shell's own writes whole, not a program's pumped
+/// output: see [`TEE_WHOLE`]), and a target whose chunk failed is skipped for
+/// the rest of the write that chunk belongs to (a target that is gone is
+/// skipped); the next write starts afresh. A tee reports no target's
+/// failure to its writers. The tee polls its targets with a waker of its
+/// own, which wakes every caller waiting on the tee ([`Waiters`]): a target
+/// keeps one waker (a host file's readiness watch keeps the latest), so a
+/// caller's own waker there would be replaced by the next caller's, and the
+/// first would sleep on bytes another caller moved out, or that no caller
+/// moves once the other is cancelled. What the queue holds when the tee's
+/// last handle closes is lost: every engine writer settles before its
+/// output counts as written, and a pump flushes at its end.
+struct Tee(Arc<TeeShared>);
+
+struct TeeShared {
+	state:   parking_lot::Mutex<TeeState>,
+	waiters: Arc<Waiters>,
+	/// Wakes `waiters`: the waker the targets are polled with.
+	waker:   Waker,
+}
+
+/// The callers of a tee that may be waiting on it: per waker, how many of
+/// its calls registered it, and the entry's generation. All are woken
+/// together, and taken off, when a target the tee polled is ready; when a
+/// call moved the queue on, all but that call's own caller are, and that
+/// caller's waker too, once, when another call registered it. A call
+/// registers its waker before it polls the targets, so no target's wake can
+/// come before it, and takes its registration back once it is `Ready`: a
+/// waiter is a call still waiting, or one cancelled while it waited, until
+/// the next wake takes it off. A release names the generation its call
+/// registered under, so a call whose entry a wake took off since cannot
+/// take a newer call's registration of the same waker.
+#[derive(Default)]
+struct Waiters(parking_lot::Mutex<WaitList>);
+
+#[derive(Default)]
+struct WaitList {
+	/// Each waker, its registrations, and its entry's generation.
+	entries: Vec<(Waker, usize, u64)>,
+	/// The generation the next new entry gets.
+	next:    u64,
+}
+
+impl Waiters {
+	/// Registers `waker` for one call: the generation to release it with.
+	fn add(&self, waker: &Waker) -> u64 {
+		let mut list = self.0.lock();
+		if let Some((_, calls, generation)) =
+			list.entries.iter_mut().find(|(w, ..)| w.will_wake(waker))
+		{
+			*calls += 1;
+			return *generation;
+		}
+		let generation = list.next;
+		list.next += 1;
+		list.entries.push((waker.clone(), 1, generation));
+		generation
+	}
+
+	/// Takes back one registration under `generation`, by a call that is
+	/// `Ready`; none if a wake took that entry off since. The generation
+	/// alone names the entry: a waker's clone need not `will_wake` it.
+	fn release(&self, generation: u64) {
+		let mut list = self.0.lock();
+		if let Some(i) = list.entries.iter().position(|(.., g)| *g == generation) {
+			list.entries[i].1 -= 1;
+			if list.entries[i].1 == 0 {
+				list.entries.swap_remove(i);
+			}
+		}
+	}
+
+	/// Wakes every waiter but `caller`, which stays registered throughout:
+	/// a target's wake that comes while the others are woken finds it. The
+	/// engine polls every vproc with one waker, so another registration
+	/// under `caller`'s waker (its count above the caller's own one) can be
+	/// another vproc waiting on the tee: then `caller`'s waker is woken too,
+	/// still registered, and the engine polls them all again. Its count goes
+	/// back to 1, the caller's own call, since the calls it woke register
+	/// again when they are polled. A registration whose call is gone (one
+	/// cancelled while it waited, or an earlier poll of a wait polled again)
+	/// so wakes the caller once, not on every later move.
+	fn wake_others(&self, caller: &Waker) {
+		let wake: Vec<Waker> = {
+			let mut list = self.0.lock();
+			let mut wake = Vec::new();
+			list.entries.retain_mut(|(w, calls, _)| {
+				if w.will_wake(caller) {
+					if *calls > 1 {
+						wake.push(w.clone());
+						*calls = 1;
+					}
+					true
+				} else {
+					wake.push(w.clone());
+					false
+				}
+			});
+			wake
+		};
+		for w in wake {
+			w.wake();
+		}
+	}
+}
+
+impl Wake for Waiters {
+	fn wake(self: Arc<Self>) {
+		self.wake_by_ref();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		let entries = std::mem::take(&mut self.0.lock().entries);
+		for (w, ..) in entries {
+			w.wake();
+		}
+	}
+}
+
+struct TeeState {
 	targets: Vec<FdRef>,
-	done:    Vec<usize>,
+	/// Writes taken that not every target has had, oldest first, each with
+	/// its sequence number.
+	queue:   std::collections::VecDeque<(u64, Vec<u8>)>,
+	/// Bytes in `queue`.
+	queued:  usize,
+	/// The sequence number the next write gets.
+	next:    u64,
+	/// Each target's place in the queue.
+	places:  Vec<Place>,
+	/// The last drive moved the queue on: a target took bytes or settled a
+	/// chunk, or the queue let a write go.
+	moved:   bool,
+}
+
+/// Where one target of a tee is.
+#[derive(Clone, Debug, Default)]
+struct Place {
+	/// The write it is on.
+	seq:  u64,
+	/// How much of that write it took.
+	off:  usize,
+	/// The chunk it took last. It belongs to the write the target is on: the
+	/// target moves to the next write only once that chunk settled.
+	last: Option<Mark>,
+}
+
+impl Tee {
+	fn new(targets: Vec<FdRef>) -> Self {
+		let waiters = Arc::new(Waiters::default());
+		Self(Arc::new(TeeShared {
+			state: parking_lot::Mutex::new(TeeState {
+				places: vec![Place::default(); targets.len()],
+				targets,
+				queue: std::collections::VecDeque::new(),
+				queued: 0,
+				next: 0,
+				moved: false,
+			}),
+			waker: Waker::from(Arc::clone(&waiters)),
+			waiters,
+		}))
+	}
+
+	/// Runs `f` on the state with the tee's own waker, the caller of `cx`
+	/// registered among its waiters for the call. Once the lock is let go,
+	/// the other waiters are woken if `f` moved the queue on (a write that
+	/// waited for room, or a settle for what another caller moved out, looks
+	/// again), and a call that is `Ready` takes its registration back.
+	fn with<T>(
+		&self,
+		cx: &Context<'_>,
+		f: impl FnOnce(&mut TeeState, &mut Context<'_>) -> Poll<T>,
+	) -> Poll<T> {
+		let generation = self.0.waiters.add(cx.waker());
+		let mut tcx = Context::from_waker(&self.0.waker);
+		let (out, moved) = {
+			let mut s = self.0.state.lock();
+			let out = f(&mut s, &mut tcx);
+			(out, std::mem::take(&mut s.moved))
+		};
+		if moved {
+			self.0.waiters.wake_others(cx.waker());
+		}
+		if out.is_ready() {
+			self.0.waiters.release(generation);
+		}
+		out
+	}
+}
+
+impl TeeState {
+	/// Moves the queue on to every target; `Ready` once every target has
+	/// taken every queued byte, its last chunk is out and it has settled (a
+	/// target that is a tee itself moves its own queue then). Each target
+	/// settles the chunk it took last before it takes the next.
+	fn drive(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+		let first = self.queue.front().map_or(self.next, |(seq, _)| *seq);
+		let mut done = true;
+		for (t, place) in self.targets.iter().zip(&mut self.places) {
+			loop {
+				if let Some(taken) = &place.last {
+					match t.poll_settle_marked(cx, std::slice::from_ref(taken)) {
+						Poll::Ready(settled) => {
+							// A failed chunk skips the rest of its own write.
+							if settled.is_err() {
+								place.off = usize::MAX;
+							}
+							place.last = None;
+							self.moved = true;
+						},
+						Poll::Pending => {
+							done = false;
+							break;
+						},
+					}
+				}
+				let Some((_, bytes)) = usize::try_from(place.seq - first)
+					.ok()
+					.and_then(|i| self.queue.get(i))
+				else {
+					// Every queued byte is the target's: it settles, which
+					// moves a nested tee's own queue on.
+					if t.poll_settle(cx).is_pending() {
+						done = false;
+					}
+					break;
+				};
+				if place.off >= bytes.len() {
+					place.seq += 1;
+					place.off = 0;
+					continue;
+				}
+				match t.poll_write_marked(cx, &bytes[place.off..]) {
+					Poll::Ready(Ok((n, taken))) if n > 0 => {
+						place.off += n;
+						place.last = taken;
+						self.moved = true;
+					},
+					// The target is gone: skipped for the rest of this write.
+					Poll::Ready(_) => {
+						place.off = usize::MAX;
+						self.moved = true;
+					},
+					Poll::Pending => {
+						done = false;
+						break;
+					},
+				}
+			}
+		}
+		while let Some((seq, bytes)) = self.queue.front()
+			&& self.places.iter().all(|p| p.seq > *seq)
+		{
+			self.queued -= bytes.len();
+			self.queue.pop_front();
+			self.moved = true;
+		}
+		if done && self.queue.is_empty() {
+			Poll::Ready(())
+		} else {
+			Poll::Pending
+		}
+	}
 }
 
 impl File for Tee {
@@ -1229,35 +1515,53 @@ impl File for Tee {
 		Poll::Ready(Ok(0))
 	}
 
+	/// Takes what fits beside what the targets have not taken yet, and
+	/// moves the queue on; `Pending`, with nothing taken, while the tee
+	/// holds [`TEE_HOLD`] bytes, or while a write of at most [`TEE_WHOLE`]
+	/// bytes does not fit whole. A longer write takes what fits, as a pipe
+	/// takes a write longer than `PIPE_BUF`; that is how a pump's chunk of a
+	/// program's output can be split (see [`TEE_WHOLE`]). Room is not
+	/// reserved for a waiting write: under sustained contention, longer
+	/// writes can take the room a waiting short write needs, and the short
+	/// write goes in at the first poll that finds room for it.
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-		self.done.resize(self.targets.len(), 0);
-		let mut pending = false;
-		for (t, done) in self.targets.iter().zip(&mut self.done) {
-			while *done < buf.len() {
-				match t.poll_write(cx, &buf[*done..]) {
-					Poll::Ready(Ok(n)) if n > 0 => *done += n,
-					Poll::Ready(_) => *done = buf.len(),
-					Poll::Pending => {
-						pending = true;
-						break;
-					},
-				}
+		if buf.is_empty() {
+			return Poll::Ready(Ok(0));
+		}
+		self.with(cx, |s, tcx| {
+			let _ = s.drive(tcx);
+			let room = TEE_HOLD.saturating_sub(s.queued);
+			if room == 0 || (buf.len() <= TEE_WHOLE && buf.len() > room) {
+				// The queue holds bytes a target has not taken, and that
+				// target holds the tee's waker, which wakes this caller.
+				return Poll::Pending;
 			}
-		}
-		if pending {
-			return Poll::Pending;
-		}
-		self.done.fill(0);
-		Poll::Ready(Ok(buf.len()))
+			let n = buf.len().min(room);
+			let seq = s.next;
+			s.queue.push_back((seq, buf[..n].to_vec()));
+			s.next += 1;
+			s.queued += n;
+			let _ = s.drive(tcx);
+			Poll::Ready(Ok(n))
+		})
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-		for t in &self.targets {
-			if t.poll_flush(cx).is_pending() {
-				return Poll::Pending;
+		self.with(cx, |s, tcx| {
+			std::task::ready!(s.drive(tcx));
+			for t in &s.targets {
+				if t.poll_flush(tcx).is_pending() {
+					return Poll::Pending;
+				}
 			}
-		}
-		Poll::Ready(Ok(()))
+			Poll::Ready(Ok(()))
+		})
+	}
+
+	/// Ready once every target has taken every byte the tee took, its last
+	/// chunk is out, and it has settled.
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		self.with(cx, |s, tcx| s.drive(tcx).map(Ok))
 	}
 
 	fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
@@ -1272,8 +1576,10 @@ impl File for Tee {
 		None
 	}
 
+	/// The same tee: a duplicate shares the queue, so what each handle
+	/// writes reaches the targets in the order the tee took it.
 	fn dup(&self) -> std::io::Result<Box<dyn File>> {
-		Ok(Box::new(Self { targets: self.targets.clone(), done: Vec::new() }))
+		Ok(Box::new(Self(Arc::clone(&self.0))))
 	}
 }
 
@@ -1387,5 +1693,800 @@ fn open_into(
 			k.diag(cx, vp, line, d);
 			Err(Halt::Failed)
 		},
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+	use std::{
+		io::{Read, Write},
+		os::unix::fs::OpenOptionsExt,
+		sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		},
+		task::{Wake, Waker},
+		time::{Duration, Instant},
+	};
+
+	use super::*;
+	use crate::sys::StdFile;
+
+	/// Records a wake and unparks the test thread.
+	struct Woken(AtomicBool, std::thread::Thread);
+
+	impl Wake for Woken {
+		fn wake(self: Arc<Self>) {
+			self.0.store(true, Ordering::SeqCst);
+			self.1.unpark();
+		}
+	}
+
+	/// Drives `poll` to `Ready` on the test thread, polling again only once
+	/// its waker was woken: a `Pending` with no wake registered fails.
+	fn ready<T>(what: &str, mut poll: impl FnMut(&mut Context<'_>) -> Poll<T>) -> T {
+		let woken = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let waker = Waker::from(Arc::clone(&woken));
+		let mut cx = Context::from_waker(&waker);
+		let start = Instant::now();
+		loop {
+			if let Poll::Ready(v) = poll(&mut cx) {
+				return v;
+			}
+			while !woken.0.swap(false, Ordering::SeqCst) {
+				assert!(start.elapsed() < Duration::from_secs(5), "DEADLINE fired: {what}");
+				std::thread::park_timeout(Duration::from_millis(100));
+			}
+		}
+	}
+
+	/// One poll with a waker nothing waits on.
+	fn once<T>(poll: impl FnOnce(&mut Context<'_>) -> Poll<T>) -> Poll<T> {
+		poll(&mut Context::from_waker(Waker::noop()))
+	}
+
+	/// A host file of `file` on the writer-thread route (the test's own
+	/// process), as an engine fd object.
+	fn host(file: std::fs::File) -> FdRef {
+		FdRef::from_file(Box::new(StdFile::new(file)))
+	}
+
+	/// A FIFO in `dir`, made by mkfifo(1): the engine's modules hold no
+	/// unsafe code.
+	fn fifo(dir: &tempfile::TempDir) -> std::path::PathBuf {
+		fifo_named(dir, "fifo")
+	}
+
+	/// The FIFO `dir/name`, made by mkfifo(1).
+	fn fifo_named(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+		let path = dir.path().join(name);
+		let made = std::process::Command::new("mkfifo")
+			.arg(&path)
+			.status()
+			.unwrap();
+		assert!(made.success(), "mkfifo: {made}");
+		path
+	}
+
+	/// A non-blocking reader of the FIFO at `path`.
+	fn reader(path: &std::path::Path) -> std::fs::File {
+		std::fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+			.unwrap()
+	}
+
+	/// fd 3 on the FIFO at `path`, whose first reader has come and gone, and
+	/// `/dev/null`.
+	fn targets(path: &std::path::Path) -> (FdRef, FdRef) {
+		let first = reader(path);
+		let fd3 = host(std::fs::OpenOptions::new().write(true).open(path).unwrap());
+		let null = host(
+			std::fs::OpenOptions::new()
+				.write(true)
+				.open("/dev/null")
+				.unwrap(),
+		);
+		drop(first);
+		(fd3, null)
+	}
+
+	/// What a new reader of the FIFO finds: `b\n` if the tee wrote it.
+	fn assert_reads_b(second: &mut std::fs::File) {
+		let mut line = [0u8; 2];
+		let read = second.read(&mut line);
+		assert!(
+			matches!(read, Ok(2)) && &line == b"b\n",
+			"the new reader got {read:?} {line:?}: the tee dropped `b`"
+		);
+	}
+
+	// Failure mode: zsh multios, fd 3 a FIFO whose reader left: `printf a
+	// >&3 >/dev/null` hands `a` to the FIFO's writer thread, where it fails.
+	// A new reader opens the FIFO, and `printf b >&3 >/dev/null` (another
+	// tee over the same fd 3) took `a`'s error as its own and dropped `b`.
+	// A chunk's error is only its writer's: the second tee hands `b` off and
+	// the new reader reads it.
+	#[test]
+	fn a_tee_after_another_tees_failed_chunk_writes_its_own_bytes() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_tee_after_another_tees_failed_chunk_writes_its_own_bytes"),
+			|| {
+				let dir = tempfile::tempdir().unwrap();
+				let path = fifo(&dir);
+				let (fd3, null) = targets(&path);
+				let mut a = Tee::new(vec![fd3.clone(), null.clone()]);
+				let wrote = ready("the first tee's write", |cx| a.poll_write(cx, b"a\n"));
+				assert!(matches!(wrote, Ok(2)), "{wrote:?}");
+				let _ = ready("the first tee's settle", |cx| a.poll_settle(cx));
+				drop(a);
+				let mut second = reader(&path);
+				let mut b = Tee::new(vec![fd3, null]);
+				let wrote = ready("the second tee's write", |cx| b.poll_write(cx, b"b\n"));
+				assert!(matches!(wrote, Ok(2)), "{wrote:?}");
+				let _ = ready("the second tee's settle", |cx| b.poll_settle(cx));
+				assert_reads_b(&mut second);
+			},
+		);
+	}
+
+	// Failure mode: one tee is the fd object of several writers (`exec 3>fifo
+	// 3>/dev/null`, then an external's output pump and a builtin): the first
+	// write's chunk to the FIFO failed, the tee kept its mark, and the next
+	// writer's `b` through the same tee took that failure as its own and
+	// skipped the FIFO. A target's failure belongs to the write that met it.
+	#[test]
+	fn a_tee_whose_earlier_write_failed_writes_the_next_writers_bytes() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_tee_whose_earlier_write_failed_writes_the_next_writers_bytes"
+			),
+			|| {
+				let dir = tempfile::tempdir().unwrap();
+				let path = fifo(&dir);
+				let (fd3, null) = targets(&path);
+				let mut tee = Tee::new(vec![fd3.clone(), null]);
+				let wrote = ready("the first write", |cx| tee.poll_write(cx, b"a\n"));
+				assert!(matches!(wrote, Ok(2)), "{wrote:?}");
+				// `a`'s chunk has failed (fd 3's thread is idle), and the tee
+				// still holds its mark.
+				let _ = ready("fd 3's writer thread", |cx| fd3.poll_settle(cx));
+				let mut second = reader(&path);
+				let wrote = ready("the next write", |cx| tee.poll_write(cx, b"b\n"));
+				assert!(matches!(wrote, Ok(2)), "{wrote:?}");
+				let _ = ready("the tee's settle", |cx| tee.poll_settle(cx));
+				assert_reads_b(&mut second);
+			},
+		);
+	}
+
+	/// Opens the FIFO at `path` for a reader that stays and fills its pipe
+	/// through a writer of its own: the reader, and how many bytes fill it.
+	fn full_fifo(path: &std::path::Path) -> (std::fs::File, usize) {
+		let held = reader(path);
+		let mut filler = std::fs::OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+			.unwrap();
+		let mut filled = 0;
+		// Full to the byte: 4096-byte writes, then single bytes, until the
+		// pipe takes none (a pipe may keep room for less than a page).
+		for size in [4096, 1] {
+			loop {
+				match filler.write(&vec![b'F'; size]) {
+					Ok(n) => filled += n,
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+					Err(e) => panic!("filling the FIFO: {e}"),
+				}
+			}
+		}
+		(held, filled)
+	}
+
+	/// Everything `reader` holds now.
+	fn read_all(reader: &mut std::fs::File) -> Vec<u8> {
+		let mut all = Vec::new();
+		let mut buf = [0u8; 8192];
+		loop {
+			match reader.read(&mut buf) {
+				Ok(0) => return all,
+				Ok(n) => all.extend_from_slice(&buf[..n]),
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return all,
+				Err(e) => panic!("reading the FIFO: {e}"),
+			}
+		}
+	}
+
+	// Failure mode: a tee shared by two writers kept one write's progress
+	// for the other. A's 128 KiB went to `/dev/null` whole and to the full
+	// FIFO in part, and its call was left `Pending`; B's `b` through the same
+	// tee was measured against A's offsets and never written. The tee owns
+	// what it takes, and each write goes to each target in order: the
+	// reader gets the filler, then what the tee took of A, then `b`.
+	#[test]
+	fn a_tee_shared_by_two_writers_writes_each_ones_bytes_in_order() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_tee_shared_by_two_writers_writes_each_ones_bytes_in_order"),
+			|| {
+				let dir = tempfile::tempdir().unwrap();
+				let path = fifo(&dir);
+				let (mut held, filled) = full_fifo(&path);
+				let fd3 = host(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
+				let null = host(
+					std::fs::OpenOptions::new()
+						.write(true)
+						.open("/dev/null")
+						.unwrap(),
+				);
+				let mut tee = Tee::new(vec![fd3, null]);
+				// A writes once and leaves it there. The tee has room, so it
+				// takes some of A: a `Pending` that had still sent bytes on
+				// is the shared progress this test is about.
+				let big = vec![b'A'; 128 << 10];
+				let took = match once(|cx| tee.poll_write(cx, &big)) {
+					Poll::Ready(Ok(n)) if n > 0 => n,
+					other => panic!("the tee took none of A's write: {other:?}"),
+				};
+				let want = filled + took + 2;
+				let drain = std::thread::spawn(move || {
+					let start = Instant::now();
+					let mut all = Vec::new();
+					while all.len() < want && start.elapsed() < Duration::from_secs(5) {
+						all.extend(read_all(&mut held));
+						std::thread::sleep(Duration::from_millis(5));
+					}
+					all
+				});
+				let wrote = ready("B's write", |cx| tee.poll_write(cx, b"b\n"));
+				assert!(matches!(wrote, Ok(2)), "{wrote:?}");
+				let _ = ready("the tee's settle", |cx| tee.poll_settle(cx));
+				let all = drain.join().unwrap();
+				let mut expected = vec![b'F'; filled];
+				expected.extend(std::iter::repeat_n(b'A', took));
+				expected.extend_from_slice(b"b\n");
+				assert!(
+					all == expected,
+					"the reader got {} bytes, {} of A's ({took} taken), ending {:?}",
+					all.len(),
+					count(&all, b'A'),
+					String::from_utf8_lossy(&all[all.len().saturating_sub(4)..])
+				);
+			},
+		);
+	}
+
+	// Failure mode: as above, and A's chunk to the FIFO then failed (its
+	// reader left; a new reader came): B took A's failure for its own and
+	// skipped the FIFO. A failure belongs to the write that met it: the new
+	// reader gets `b` and none of A's bytes.
+	#[test]
+	fn a_tee_write_another_writer_left_unfinished_keeps_the_next_writers_bytes() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_tee_write_another_writer_left_unfinished_keeps_the_next_writers_bytes"
+			),
+			|| {
+				let dir = tempfile::tempdir().unwrap();
+				let path = fifo(&dir);
+				let (held, _) = full_fifo(&path);
+				let fd3 = host(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
+				let null = host(
+					std::fs::OpenOptions::new()
+						.write(true)
+						.open("/dev/null")
+						.unwrap(),
+				);
+				let mut tee = Tee::new(vec![fd3.clone(), null]);
+				let big = vec![b'A'; 128 << 10];
+				let a = once(|cx| tee.poll_write(cx, &big));
+				assert!(
+					matches!(a, Poll::Ready(Ok(n)) if n > 0),
+					"the tee took none of A's write: {a:?}"
+				);
+				// The FIFO's reader leaves: A's chunk there fails.
+				drop(held);
+				let _ = ready("fd 3's writer thread", |cx| fd3.poll_settle(cx));
+				let mut second = reader(&path);
+				// The pipe keeps the filler for its next reader: read it first,
+				// so `b` has room.
+				let mut all = read_all(&mut second);
+				let wrote = ready("B's write", |cx| tee.poll_write(cx, b"b\n"));
+				assert!(matches!(wrote, Ok(2)), "{wrote:?}");
+				let _ = ready("the tee's settle", |cx| tee.poll_settle(cx));
+				all.extend(read_all(&mut second));
+				assert!(
+					all.ends_with(b"b\n") && !all.contains(&b'A'),
+					"the new reader got {} bytes, {} of A's, ending {:?}",
+					all.len(),
+					count(&all, b'A'),
+					String::from_utf8_lossy(&all[all.len().saturating_sub(4)..])
+				);
+			},
+		);
+	}
+
+	/// How many of `bytes` are `byte`.
+	fn count(bytes: &[u8], byte: u8) -> usize {
+		bytes.iter().fold(0, |n, &c| n + usize::from(c == byte))
+	}
+
+	/// The FIFO at `dir/name`, full, with the reader that holds it, how many
+	/// bytes fill it, and fd 3 on it.
+	fn full_target(dir: &tempfile::TempDir, name: &str) -> (std::fs::File, usize, FdRef) {
+		let path = fifo_named(dir, name);
+		let (held, filled) = full_fifo(&path);
+		let fd = host(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
+		(held, filled, fd)
+	}
+
+	/// Reads `reader` until it holds `want` bytes, for at most 5 s.
+	fn read_up_to(reader: &mut std::fs::File, want: usize) -> Vec<u8> {
+		let start = Instant::now();
+		let mut all = Vec::new();
+		while all.len() < want && start.elapsed() < Duration::from_secs(5) {
+			all.extend(read_all(reader));
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		all
+	}
+
+	/// `filled` bytes of filler, `ones` of `1`, then `tail`.
+	fn expected(filled: usize, ones: usize, tail: &[u8]) -> Vec<u8> {
+		let mut all = vec![b'F'; filled];
+		all.extend(std::iter::repeat_n(b'1', ones));
+		all.extend_from_slice(tail);
+		all
+	}
+
+	// Failure mode: a tee whose target is a tee itself: the outer tee handed
+	// the inner one `x` and moved on, while the inner tee held `x` behind its
+	// own busy target. With the outer tee waiting on another full target,
+	// nothing polled the inner tee again, so `x` never left, and a reader
+	// that drains the other target only once it has `x` waited for ever. The
+	// outer tee settles each target, which moves a nested tee's queue.
+	#[test]
+	fn a_tee_in_a_tee_moves_its_queue_while_the_outer_tee_waits() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_tee_in_a_tee_moves_its_queue_while_the_outer_tee_waits"),
+			|| {
+				let dir = tempfile::tempdir().unwrap();
+				let (mut p_held, p_filled, p) = full_target(&dir, "p");
+				let (mut q_held, q_filled, q) = full_target(&dir, "q");
+				let inner = FdRef::from_file(Box::new(Tee::new(vec![p])));
+				let mut outer = Tee::new(vec![inner, q]);
+				// Both targets' writer threads wait on their full pipes.
+				let first = once(|cx| outer.poll_write(cx, &[b'1'; 4096]));
+				assert!(matches!(first, Poll::Ready(Ok(4096))), "{first:?}");
+				let second = once(|cx| outer.poll_write(cx, b"x"));
+				assert!(matches!(second, Poll::Ready(Ok(1))), "{second:?}");
+				let consumer = std::thread::spawn(move || {
+					let p_got = read_up_to(&mut p_held, p_filled + 4097);
+					let q_got = read_up_to(&mut q_held, q_filled + 4097);
+					(p_got, q_got)
+				});
+				let _ = ready("the outer tee's settle", |cx| outer.poll_settle(cx));
+				let (p_got, q_got) = consumer.join().unwrap();
+				assert!(p_got == expected(p_filled, 4096, b"x"), "p got {} bytes", p_got.len());
+				assert!(q_got == expected(q_filled, 4096, b"x"), "q got {} bytes", q_got.len());
+			},
+		);
+	}
+
+	// Failure mode: a duplicate of a tee (`exec 4>&3`, fd 3 a tee) kept a
+	// queue of its own, so its `b` reached the FIFO before the `a` the tee
+	// took first and still held. A duplicate is the same tee: its bytes come
+	// after the tee's, even when only the duplicate is polled.
+	#[test]
+	fn a_duplicate_of_a_tee_writes_after_what_the_tee_took_first() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_duplicate_of_a_tee_writes_after_what_the_tee_took_first"),
+			|| {
+				let dir = tempfile::tempdir().unwrap();
+				let (mut held, filled, p) = full_target(&dir, "p");
+				let null = host(
+					std::fs::OpenOptions::new()
+						.write(true)
+						.open("/dev/null")
+						.unwrap(),
+				);
+				let mut tee = Tee::new(vec![p, null]);
+				let first = once(|cx| tee.poll_write(cx, &[b'1'; 4096]));
+				assert!(matches!(first, Poll::Ready(Ok(4096))), "{first:?}");
+				let a = once(|cx| tee.poll_write(cx, b"a"));
+				assert!(matches!(a, Poll::Ready(Ok(1))), "{a:?}");
+				let mut dup = tee.dup().unwrap();
+				let b = once(|cx| dup.poll_write(cx, b"b"));
+				assert!(matches!(b, Poll::Ready(Ok(1))), "{b:?}");
+				let drain = std::thread::spawn(move || read_up_to(&mut held, filled + 4098));
+				let _ = ready("the duplicate's settle", |cx| dup.poll_settle(cx));
+				let got = drain.join().unwrap();
+				assert!(
+					got == expected(filled, 4096, b"ab"),
+					"the FIFO got {} bytes, ending {:?}",
+					got.len(),
+					String::from_utf8_lossy(&got[got.len().saturating_sub(4)..])
+				);
+			},
+		);
+	}
+
+	// Failure mode: two callers of one tee, each with a waker of its own (a
+	// native extra's task and the engine), wait on a full FIFO through it.
+	// The FIFO's readiness watch keeps one waker, and the tee polled it with
+	// each caller's own, so the second caller's replaced the first's: when
+	// the FIFO drained only the second woke, and the first slept on bytes
+	// that went out, or that nothing moved once the second was cancelled.
+	// The tee polls its targets with a waker of its own, which wakes both.
+	// The FIFO takes the readiness route here, as on Linux by default.
+	#[test]
+	fn both_callers_waiting_on_a_tee_wake_when_its_target_drains() {
+		let dir = tempfile::tempdir().unwrap();
+		let (mut held, filled, p) = full_target(&dir, "p");
+		let mut tee = Tee::new(vec![p]);
+		let mut other = tee.dup().unwrap();
+		let a = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let b = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let wa = Waker::from(Arc::clone(&a));
+		let wb = Waker::from(Arc::clone(&b));
+		let wrote = tee.poll_write(&mut Context::from_waker(&wa), b"a\n");
+		assert!(matches!(wrote, Poll::Ready(Ok(2))), "{wrote:?}");
+		assert!(
+			tee.poll_settle(&mut Context::from_waker(&wa)).is_pending(),
+			"A's settle on a full FIFO"
+		);
+		assert!(
+			other
+				.poll_settle(&mut Context::from_waker(&wb))
+				.is_pending(),
+			"B's settle on a full FIFO"
+		);
+		a.0.store(false, Ordering::SeqCst);
+		b.0.store(false, Ordering::SeqCst);
+		let drain = std::thread::spawn(move || read_up_to(&mut held, filled + 2));
+		// Nothing polls B: A must be woken by the drain itself.
+		let start = Instant::now();
+		while !a.0.load(Ordering::SeqCst) {
+			assert!(
+				start.elapsed() < Duration::from_secs(5),
+				"A was not woken when the FIFO drained (B woken: {})",
+				b.0.load(Ordering::SeqCst)
+			);
+			std::thread::park_timeout(Duration::from_millis(50));
+		}
+		let settled = ready("A's settle", |cx| tee.poll_settle(cx));
+		assert!(settled.is_ok(), "{settled:?}");
+		let got = drain.join().unwrap();
+		assert!(got == expected(filled, 0, b"a\n"), "the FIFO got {} bytes", got.len());
+	}
+
+	/// Fires a tee's own waker when woken: a target's wake that comes while
+	/// the tee wakes its other waiters.
+	struct FiresTee(Arc<Waiters>);
+
+	impl Wake for FiresTee {
+		fn wake(self: Arc<Self>) {
+			Wake::wake_by_ref(&self.0);
+		}
+	}
+
+	// Failure mode: a call that moved a tee's queue on woke the other
+	// waiters by taking the whole list and adding its own caller back
+	// after. A target's wake that came in that gap found an empty list, and
+	// the caller, still waiting on that target, slept with nothing to wake
+	// it. B's wake here is that target's wake: it comes while the others are
+	// woken, and must find A.
+	#[test]
+	fn a_target_wake_while_a_tee_wakes_its_other_waiters_still_wakes_the_caller() {
+		let waiters = Arc::new(Waiters::default());
+		let a = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let wa = Waker::from(Arc::clone(&a));
+		let wb = Waker::from(Arc::new(FiresTee(Arc::clone(&waiters))));
+		let _ = waiters.add(&wb);
+		let _ = waiters.add(&wa);
+		waiters.wake_others(&wa);
+		assert!(a.0.load(Ordering::SeqCst), "the target's wake in the gap did not wake the caller");
+	}
+
+	// Failure mode: A's call registered waker W and was `Ready`; before it
+	// took its registration back, a target's wake took W's entry off, and
+	// B's call with the same W (through a duplicate of the tee) registered
+	// and waited. A's late release then took B's registration, and the next
+	// target's wake found nobody to wake. A release names the generation it
+	// registered under. Two calls of one waker with no wake between keep
+	// one entry until both are released.
+	#[test]
+	fn a_late_release_never_takes_a_newer_calls_registration() {
+		let waiters = Arc::new(Waiters::default());
+		let waker = Waker::from(Arc::new(Woken(AtomicBool::new(false), std::thread::current())));
+		let first = waiters.add(&waker);
+		Wake::wake_by_ref(&waiters);
+		let newer = waiters.add(&waker);
+		waiters.release(first);
+		assert_eq!(waiters.0.lock().entries.len(), 1, "A's late release took B's registration");
+		waiters.release(newer);
+		assert_eq!(waiters.0.lock().entries.len(), 0, "B's release left its entry");
+		let one = waiters.add(&waker);
+		let other = waiters.add(&waker);
+		waiters.release(one);
+		assert_eq!(waiters.0.lock().entries.len(), 1, "C's release took D's registration");
+		waiters.release(other);
+		assert_eq!(waiters.0.lock().entries.len(), 0, "D's release left its entry");
+	}
+
+	/// What a [`Gate`] took, and whether it takes writes now.
+	#[derive(Default)]
+	struct GateState {
+		open:  bool,
+		got:   Vec<u8>,
+		waker: Option<Waker>,
+	}
+
+	/// A tee target that takes nothing until it opens, and everything after,
+	/// holding the waker of the last write it refused.
+	struct Gate(Arc<parking_lot::Mutex<GateState>>);
+
+	impl Gate {
+		fn closed() -> (Self, Arc<parking_lot::Mutex<GateState>>) {
+			let state = Arc::new(parking_lot::Mutex::new(GateState::default()));
+			(Self(Arc::clone(&state)), state)
+		}
+	}
+
+	impl File for Gate {
+		fn poll_read(
+			&mut self,
+			_cx: &mut Context<'_>,
+			_buf: &mut [u8],
+		) -> Poll<std::io::Result<usize>> {
+			Poll::Ready(Ok(0))
+		}
+
+		fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+			let mut s = self.0.lock();
+			if !s.open {
+				s.waker = Some(cx.waker().clone());
+				return Poll::Pending;
+			}
+			s.got.extend_from_slice(buf);
+			Poll::Ready(Ok(buf.len()))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+			Err(std::io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> FileKind {
+			FileKind::Pipe
+		}
+
+		fn os_handle(&self) -> Option<OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> std::io::Result<Box<dyn File>> {
+			Ok(Box::new(Self(Arc::clone(&self.0))))
+		}
+	}
+
+	/// Opens the gate and wakes the write it refused last.
+	fn open(state: &parking_lot::Mutex<GateState>) {
+		let waker = {
+			let mut s = state.lock();
+			s.open = true;
+			s.waker.take()
+		};
+		if let Some(w) = waker {
+			w.wake();
+		}
+	}
+
+	/// Writes all of `buf[off..]` through `file`, waiting for wakes.
+	fn write_rest(file: &mut (impl File + ?Sized), buf: &[u8], mut off: usize) {
+		while off < buf.len() {
+			let n = ready("a write through the tee", |cx| file.poll_write(cx, &buf[off..]))
+				.expect("the tee refused a write");
+			off += n;
+		}
+	}
+
+	/// A line of `len` bytes of `byte`, ending in a newline.
+	fn line(byte: u8, len: usize) -> Vec<u8> {
+		let mut line = vec![byte; len];
+		line[len - 1] = b'\n';
+		line
+	}
+
+	// Failure mode: a tee split a write of at most `PIPE_BUF` bytes when
+	// the queue was near `TEE_HOLD`: it took the first part of A's line and
+	// returned it as written, and when B was polled before A's next call,
+	// B's line was queued between A's two parts, so every target got a torn
+	// line. A pipe keeps such a write whole, and so does zsh's tee, which
+	// reads from one. The tee takes a write of at most `TEE_WHOLE` bytes
+	// whole or not at all; a longer write still takes what fits.
+	#[test]
+	fn two_writers_lines_of_pipe_buf_bytes_never_interleave_in_a_tee() {
+		let (gate, state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		// The queue 100 bytes short of `TEE_HOLD`; the target takes nothing.
+		let filler = vec![b'F'; TEE_HOLD - 100];
+		let took = once(|cx| tee.poll_write(cx, &filler));
+		assert!(matches!(took, Poll::Ready(Ok(n)) if n == filler.len()), "{took:?}");
+		let a = line(b'A', TEE_WHOLE);
+		let b = line(b'B', TEE_WHOLE);
+		// B writes through a duplicate, as a second writer of the fd does.
+		let mut dup = tee.dup().unwrap();
+		let a_took = match once(|cx| tee.poll_write(cx, &a)) {
+			Poll::Ready(Ok(n)) => n,
+			Poll::Pending => 0,
+			Poll::Ready(Err(e)) => panic!("A's write: {e}"),
+		};
+		let b_took = match once(|cx| dup.poll_write(cx, &b)) {
+			Poll::Ready(Ok(n)) => n,
+			Poll::Pending => 0,
+			Poll::Ready(Err(e)) => panic!("B's write: {e}"),
+		};
+		// The target opens, and B is polled before A.
+		open(&state);
+		write_rest(&mut *dup, &b, b_took);
+		write_rest(&mut tee, &a, a_took);
+		let settled = ready("the tee's settle", |cx| tee.poll_settle(cx));
+		assert!(settled.is_ok(), "{settled:?}");
+		let got = std::mem::take(&mut state.lock().got);
+		assert!(got.starts_with(&filler), "the filler did not come first");
+		let rest = &got[filler.len()..];
+		assert!(
+			rest == [&b[..], &a[..]].concat() || rest == [&a[..], &b[..]].concat(),
+			"a line was torn: A took {a_took} bytes at first, and the lines after the filler start \
+			 {:?}",
+			String::from_utf8_lossy(&rest[..rest.len().min(8)])
+		);
+		// Control: a write longer than `TEE_WHOLE` still takes what fits.
+		let (gate, _state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		let took = once(|cx| tee.poll_write(cx, &filler));
+		assert!(matches!(took, Poll::Ready(Ok(n)) if n == filler.len()), "{took:?}");
+		let long = line(b'L', TEE_WHOLE + 1);
+		let took = once(|cx| tee.poll_write(cx, &long));
+		assert!(matches!(took, Poll::Ready(Ok(100))), "a long write near TEE_HOLD: {took:?}");
+	}
+
+	// Failure mode: the engine polls every vproc with one waker. Vproc B
+	// waits in the tee's settle; vproc A's write through the tee registers
+	// the same waker again, and its drive finds the target ready (a host
+	// file whose readiness watch was dropped before it fired) and moves the
+	// queue on. The tee woke every waiter but A's waker, which is B's too,
+	// so B stayed parked until an unrelated wake. With another call
+	// registered under the caller's waker, the tee wakes that waker as well.
+	#[test]
+	fn a_call_that_moves_a_tee_wakes_another_call_sharing_its_waker() {
+		let (gate, state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		let engine = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let waker = Waker::from(Arc::clone(&engine));
+		let mut cx = Context::from_waker(&waker);
+		// B writes and waits in its settle.
+		assert!(matches!(tee.poll_write(&mut cx, b"b\n"), Poll::Ready(Ok(2))));
+		assert!(tee.poll_settle(&mut cx).is_pending(), "B's settle with the target closed");
+		// The target becomes ready without a wake.
+		state.lock().open = true;
+		engine.0.store(false, Ordering::SeqCst);
+		// A's write, with the engine's one waker, moves the queue on.
+		assert!(matches!(tee.poll_write(&mut cx, b"a\n"), Poll::Ready(Ok(2))));
+		assert!(
+			engine.0.load(Ordering::SeqCst),
+			"B waits in the tee under the engine's waker and was not woken"
+		);
+		assert!(tee.poll_settle(&mut cx).is_ready(), "B's settle after the wake");
+		assert_eq!(std::mem::take(&mut state.lock().got), b"b\na\n");
+		// Control: a call alone under its waker is not woken by its own move.
+		let (gate, state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		let alone = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let waker = Waker::from(Arc::clone(&alone));
+		let mut cx = Context::from_waker(&waker);
+		assert!(matches!(tee.poll_write(&mut cx, b"c\n"), Poll::Ready(Ok(2))));
+		state.lock().open = true;
+		assert!(tee.poll_settle(&mut cx).is_ready(), "the settle with the target open");
+		assert!(!alone.0.load(Ordering::SeqCst), "a call alone under its waker woke itself");
+	}
+
+	// Failure mode: a registration whose call is gone kept its count. A
+	// settle under the engine's waker waited and was never polled again
+	// (cancelled), and the target became ready with no wake, so no target's
+	// wake took the entry off. From then on every write under that waker
+	// that moved the queue saw a count above 1 and woke the engine, which
+	// made every parked vproc runnable, on each `echo` through the tee. The
+	// first move wakes the engine once, for the call registered under its
+	// waker, and puts the count back to the caller's own one: later moves
+	// by a caller alone under its waker do not wake it.
+	#[test]
+	fn a_gone_calls_registration_wakes_the_caller_once_not_on_every_move() {
+		let (gate, state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		let engine = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let waker = Waker::from(Arc::clone(&engine));
+		let mut cx = Context::from_waker(&waker);
+		assert!(matches!(tee.poll_write(&mut cx, b"b\n"), Poll::Ready(Ok(2))));
+		// A settle that waits and is never polled again.
+		assert!(tee.poll_settle(&mut cx).is_pending(), "the settle with the target closed");
+		// The target becomes ready without a wake.
+		state.lock().open = true;
+		engine.0.store(false, Ordering::SeqCst);
+		assert!(matches!(tee.poll_write(&mut cx, b"a\n"), Poll::Ready(Ok(2))));
+		assert!(engine.0.load(Ordering::SeqCst), "the first move did not wake the waiting call");
+		for i in 1..=3 {
+			engine.0.store(false, Ordering::SeqCst);
+			assert!(matches!(tee.poll_write(&mut cx, b"c\n"), Poll::Ready(Ok(2))));
+			assert!(
+				!engine.0.load(Ordering::SeqCst),
+				"move {i} woke the engine for the registration of a call that is gone"
+			);
+		}
+		assert_eq!(waiting(&tee), 0, "the tee keeps a waker after every call finished");
+		assert_eq!(std::mem::take(&mut state.lock().got), b"b\na\nc\nc\nc\n");
+	}
+
+	/// How many wakers a tee holds.
+	fn waiting(tee: &Tee) -> usize {
+		tee.0.waiters.0.lock().entries.len()
+	}
+
+	// Failure mode: every call left its caller's waker with the tee, so
+	// tasks that settled or flushed an idle tee, each with a waker of its
+	// own, grew the tee's list for as long as nothing moved. A call that is
+	// `Ready` takes its registration back; one that waited and was dropped
+	// is taken off by the next wake.
+	#[test]
+	fn a_tee_keeps_the_wakers_of_waiting_calls_only() {
+		let null = host(
+			std::fs::OpenOptions::new()
+				.write(true)
+				.open("/dev/null")
+				.unwrap(),
+		);
+		let mut idle = Tee::new(vec![null]);
+		for _ in 0..100 {
+			let woken = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+			let waker = Waker::from(woken);
+			let mut cx = Context::from_waker(&waker);
+			assert!(idle.poll_settle(&mut cx).is_ready());
+			assert!(idle.poll_flush(&mut cx).is_ready());
+		}
+		assert_eq!(waiting(&idle), 0, "the wakers of 100 finished calls on an idle tee");
+		// A call that waits, then is dropped.
+		let dir = tempfile::tempdir().unwrap();
+		let (mut held, filled, p) = full_target(&dir, "p");
+		let mut tee = Tee::new(vec![p]);
+		let c = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let wc = Waker::from(Arc::clone(&c));
+		let wrote = tee.poll_write(&mut Context::from_waker(&wc), b"c\n");
+		assert!(matches!(wrote, Poll::Ready(Ok(2))), "{wrote:?}");
+		assert!(
+			tee.poll_settle(&mut Context::from_waker(&wc)).is_pending(),
+			"C's settle on a full FIFO"
+		);
+		assert_eq!(waiting(&tee), 1, "C waits");
+		c.0.store(false, Ordering::SeqCst);
+		let drain = std::thread::spawn(move || read_up_to(&mut held, filled + 2));
+		let start = Instant::now();
+		while !c.0.load(Ordering::SeqCst) {
+			assert!(start.elapsed() < Duration::from_secs(5), "C was not woken when the FIFO drained");
+			std::thread::park_timeout(Duration::from_millis(50));
+		}
+		// C is not polled again; the wake took it off.
+		assert_eq!(waiting(&tee), 0, "the waker of a call dropped while it waited");
+		let settled = ready("the tee's settle", |cx| tee.poll_settle(cx));
+		assert!(settled.is_ok(), "{settled:?}");
+		assert_eq!(waiting(&tee), 0, "the waker of a finished settle");
+		let got = drain.join().unwrap();
+		assert!(got == expected(filled, 0, b"c\n"), "the FIFO got {} bytes", got.len());
 	}
 }

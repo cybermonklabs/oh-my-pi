@@ -222,6 +222,7 @@ impl From<ShellOptions> for CoreShellOptions {
 			snapshot_path: value.snapshot_path,
 			minimizer:     value.minimizer.map(Into::into),
 			filesystem:    value.filesystem.map_or_default(ShellFilesystem::into_fs),
+			cancel_grace:  None,
 		}
 	}
 }

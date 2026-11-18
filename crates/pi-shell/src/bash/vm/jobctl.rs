@@ -36,11 +36,12 @@ use super::{
 	state,
 };
 use crate::bash::{
+	ControlHandle,
 	fd::{FdOrigin, FdRef},
 	host::{ExtProc, OsHandle, PgroupSpec, ProcEvent},
 	ids::{Dialect, JobId, Platform, Vpid},
 	ir::{Opcode, Unit},
-	signal::{SigSet, Signal},
+	signal::{SigSet, SigTarget, Signal},
 	store::{KeyBuf, OptId, TrapKey},
 	term::{SetWhen, TermFlag, Termios},
 	zshopt::ZshOpt,
@@ -110,6 +111,33 @@ pub struct JobCtl {
 	/// The terminal `read -k`/`-q` put in cbreak mode, with the modes it
 	/// had ([`set_cbreak`]).
 	cbreak:      Option<(FdRef, Termios)>,
+	/// What goes to the shell's terminal (zsh `shout`), in order: job
+	/// notices, and the continues that come after them ([`notice`],
+	/// [`continue_job`]).
+	shout:       Shout,
+}
+
+/// The shell's own writes to its terminal ([`JobCtl::shout`]). zsh writes
+/// a job notice with blocking writes and continues a job only after it, so
+/// each item is out (written and settled, [`FdRef::poll_write_out`])
+/// before the next one is taken. The terminal's writer thread takes one
+/// chunk at a time, so an item that cannot go yet waits here; it never
+/// waits on the scheduler's thread.
+#[derive(Default)]
+struct Shout {
+	items:     std::collections::VecDeque<ShoutItem>,
+	/// Bytes of the front notice written so far.
+	off:       usize,
+	/// What the terminal's writer thread took of the front notice and has
+	/// not written yet.
+	unsettled: crate::bash::Unsettled,
+}
+
+enum ShoutItem {
+	/// A notice's text.
+	Text(Vec<u8>),
+	/// A job to continue (`SIGCONT`) once the notices before it are out.
+	Cont(JobId),
 }
 
 impl JobCtl {
@@ -229,24 +257,107 @@ pub fn format_job(vp: &Vproc, number: u32, how: JobLine, platform: Platform) -> 
 }
 
 /// Write `bytes` where zsh writes job notices (`shout`): the shell's
-/// terminal, else its standard output.
-pub fn notice(k: &Kernel, vp: &mut Vproc, bytes: &[u8]) {
-	match &k.jobctl.shtty {
-		Some(tty) => write_all(tty, bytes),
-		None => vp
-			.out
-			.push_back(PendingWrite { fd: 1, bytes: BString::from(bytes), off: 0 }),
+/// terminal, else its standard output. On the terminal the notice is
+/// queued ([`JobCtl::shout`]) and goes out as the terminal takes it
+/// ([`drain_shout`]); the shell's next output waits for it
+/// ([`shout_waits`]).
+pub fn notice(k: &mut Kernel, vp: &mut Vproc, bytes: &[u8]) {
+	if k.jobctl.shtty.is_none() {
+		vp.out.push_back(PendingWrite::new(1, BString::from(bytes)));
+		return;
+	}
+	k.jobctl
+		.shout
+		.items
+		.push_back(ShoutItem::Text(bytes.to_vec()));
+	drain_shout(k);
+}
+
+/// Continue job `id` (`SIGCONT`): at once, or, while notices are still
+/// going out on the shell's terminal, once they are out, as zsh's `bg` and
+/// `fg` print the job before they continue it.
+pub fn continue_job(k: &mut Kernel, id: JobId) {
+	if k.jobctl.shout.items.is_empty() {
+		ControlHandle(k.ctl.clone()).signal(SigTarget::Job(id), Signal::Cont);
+		return;
+	}
+	k.jobctl.shout.items.push_back(ShoutItem::Cont(id));
+	drain_shout(k);
+}
+
+/// Write the queued notices, and send the continues queued after them,
+/// while the terminal takes them; `true` while some are left. The
+/// terminal's writer thread wakes the kernel ([`Kernel::waker`]) when it is
+/// done with a chunk, and the scheduler drains again
+/// ([`Shell::step`](super::Shell)).
+pub fn drain_shout(k: &mut Kernel) -> bool {
+	drain(&mut k.jobctl, &k.ctl, &k.waker)
+}
+
+/// Whether vproc `vp` waits before its next output: it is the shell
+/// itself, and its notices are not all out ([`drain_shout`]). zsh wrote
+/// them with blocking writes, before anything after them.
+pub fn shout_waits(k: &mut Kernel, vp: &Vproc) -> bool {
+	k.jobctl.root == Some(vp.vpid) && drain_shout(k)
+}
+
+/// [`drain_shout`] with the waker `waker` (the kernel's, or the leaving
+/// shell's own thread, [`Shell::leave_job_control`]). A notice that fails
+/// is lost, as zsh ignores `shout`'s errors.
+fn drain(jc: &mut JobCtl, ctl: &std::sync::Arc<super::control::Ctl>, waker: &Waker) -> bool {
+	let JobCtl { shout, shtty, .. } = jc;
+	let mut cx = Context::from_waker(waker);
+	while let Some(item) = shout.items.front() {
+		match item {
+			ShoutItem::Text(bytes) => {
+				if let Some(tty) = shtty.as_ref()
+					&& shout.off < bytes.len()
+				{
+					match tty.poll_write_out(&mut cx, &bytes[shout.off..], &mut shout.unsettled) {
+						Poll::Ready(Ok(n)) if n > 0 => {
+							shout.off += n;
+							continue;
+						},
+						Poll::Ready(_) => {},
+						Poll::Pending => return true,
+					}
+				}
+				shout.items.pop_front();
+				shout.off = 0;
+			},
+			&ShoutItem::Cont(id) => {
+				shout.items.pop_front();
+				ControlHandle(ctl.clone()).signal(SigTarget::Job(id), Signal::Cont);
+			},
+		}
+	}
+	false
+}
+
+/// A `Waker` that unparks the thread that made it: the leaving shell waits
+/// for its last terminal writes on its own thread
+/// ([`Shell::leave_job_control`]).
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+	fn wake(self: std::sync::Arc<Self>) {
+		self.0.unpark();
 	}
 }
 
-/// Write to the terminal while it takes the bytes (a terminal does not
-/// refuse a notice's few dozen).
-fn write_all(fd: &FdRef, mut bytes: &[u8]) {
-	let mut cx = Context::from_waker(Waker::noop());
-	while !bytes.is_empty() {
-		match fd.poll_write(&mut cx, bytes) {
-			Poll::Ready(Ok(n)) if n > 0 => bytes = &bytes[n..],
-			_ => return,
+/// Write `bytes` to `fd` and wait, on this thread, until they are out
+/// (written and settled), as zsh's blocking write does: for the shell's
+/// last words as it leaves, when nothing else runs. A failed write is
+/// lost, as zsh ignores the error of its warning.
+fn write_waiting(fd: &FdRef, bytes: &[u8]) {
+	let waker = Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+	let mut cx = Context::from_waker(&waker);
+	let (mut off, mut unsettled) = (0, crate::bash::Unsettled::default());
+	while off < bytes.len() {
+		match fd.poll_write_out(&mut cx, &bytes[off..], &mut unsettled) {
+			Poll::Ready(Ok(n)) if n > 0 => off += n,
+			Poll::Ready(_) => return,
+			Poll::Pending => std::thread::park(),
 		}
 	}
 }
@@ -1078,7 +1189,7 @@ fn long_list(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 
 /// Print job `number`'s changed state (zsh `printjob` from `scanjobs` or
 /// `update_job`) and forget it when it is done (`deletejob`).
-fn report(k: &Kernel, vp: &mut Vproc, number: u32, platform: Platform, how: JobLine) {
+fn report(k: &mut Kernel, vp: &mut Vproc, number: u32, platform: Platform, how: JobLine) {
 	if let Some(line) = format_job(vp, number, how, platform) {
 		notice(k, vp, &line);
 	}
@@ -1198,13 +1309,17 @@ fn print_settled(k: &mut Kernel, i: usize) {
 		return;
 	};
 	let number = k.jobctl.announce.swap_remove(i).number;
-	if let Some(tty) = &k.jobctl.shtty {
+	if k.jobctl.shtty.is_some() {
 		let mut line = format!("[{number}]");
 		for pid in pids {
 			let _ = write!(line, " {pid}");
 		}
 		line.push('\n');
-		write_all(tty, line.as_bytes());
+		k.jobctl
+			.shout
+			.items
+			.push_back(ShoutItem::Text(line.into_bytes()));
+		drain_shout(k);
 	}
 }
 
@@ -1265,8 +1380,7 @@ pub fn check_before_exit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> boo
 		(false, true) => b"There are stopped jobs.\n",
 		(false, false) => b"There are running jobs.\n",
 	};
-	vp.out
-		.push_back(PendingWrite { fd: 2, bytes: BString::from(msg), off: 0 });
+	vp.out.push_back(PendingWrite::new(2, BString::from(msg)));
 	k.jobctl.stopmsg = 2;
 	true
 }
@@ -1461,7 +1575,7 @@ impl Shell {
 						if let Some(text) = format_job(&self.procs[owner], number, how, platform) {
 							line.extend_from_slice(&text);
 						}
-						notice(&self.k, &mut self.procs[owner], &line);
+						notice(&mut self.k, &mut self.procs[owner], &line);
 						if let Some(job) = self.procs[owner].jobs.get_mut(number) {
 							job.notified = true;
 						}
@@ -1533,12 +1647,24 @@ impl Shell {
 		}
 	}
 
-	/// The interactive shell is leaving (zsh `zexit`): under `hup`, running
-	/// jobs get `SIGHUP` (`warning: N jobs SIGHUPed`; stopped ones are
-	/// hung up by the system when the shell's session goes), and the
-	/// terminal goes back to the process group the shell came from
-	/// (`release_pgrp`). The process host calls it once before it exits.
+	/// The interactive shell is leaving (zsh `zexit`): its job notices still
+	/// going out to its terminal are out first; under `hup`, running jobs get
+	/// `SIGHUP` (`warning: N jobs SIGHUPed`; stopped ones are hung up by the
+	/// system when the shell's session goes), and the terminal goes back to
+	/// the process group the shell came from (`release_pgrp`). The process
+	/// host calls it once before it exits, so these writes wait on this
+	/// thread, as zsh's blocking writes do: nothing else runs any more.
 	pub fn leave_job_control(&mut self, cx: &mut Cx<'_>) {
+		let waker = Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+		while drain(&mut self.k.jobctl, &self.k.ctl, &waker) {
+			std::thread::park();
+		}
+		// A continue queued behind those notices (zsh `bg` as the shell's
+		// last command) was requested on the control word, which no step
+		// applies any more: it reaches its job here.
+		for (target, sig) in self.k.ctl.take_signals() {
+			self.deliver(cx, target, sig);
+		}
 		let Some(pgrp) = self.k.jobctl.pgrp else {
 			return;
 		};
@@ -1567,9 +1693,9 @@ impl Shell {
 				}
 			}
 			if killed > 0 {
-				// The shell is leaving: written now, not queued.
+				// The shell is leaving: written now and waited for, not queued.
 				let line = format!("zsh: warning: {killed} jobs SIGHUPed\n");
-				write_all(&self.procs[i].fds.handle(2), line.as_bytes());
+				write_waiting(&self.procs[i].fds.handle(2), line.as_bytes());
 			}
 		}
 		if pgrp.orig != pgrp.mine
@@ -1581,5 +1707,575 @@ impl Shell {
 			let _ = term.set_process_group(0, pgrp.orig);
 		}
 		self.k.jobctl.pgrp = None;
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+	use std::{
+		io::Read as _,
+		time::{Duration, Instant},
+	};
+
+	use bstr::BString;
+
+	use super::*;
+	use crate::bash::{Engine, EngineConfig, File as _, FileKind, MemStore, fd::FdTable};
+
+	/// A kernel whose shell terminal (zsh `SHTTY`) is the terminal side of a
+	/// new pty, the shell's root vproc, and the pty's other side, to read
+	/// what the shell wrote. A terminal's writes go to its writer thread.
+	fn shell_on_a_pty() -> (Kernel, Vproc, std::fs::File) {
+		let mut store = MemStore::new();
+		let root = state::Root::load(&mut store).unwrap();
+		let engine = Engine::new(EngineConfig::default());
+		let mut k = Kernel::new(&engine, root, BString::from("zsh"), std::process::id());
+		let (master, slave, _) = crate::sys::tty::open_pty(None).unwrap();
+		let tty = crate::sys::StdFile::new(std::fs::File::from(slave));
+		assert_eq!(tty.kind(), FileKind::Tty);
+		k.jobctl.shtty = Some(FdRef::open(Box::new(tty), FdOrigin::Host));
+		let vp = Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+		k.jobctl.root = Some(vp.vpid);
+		let master = std::fs::File::from(master);
+		crate::sys::test_probe::set_nonblocking(&master);
+		(k, vp, master)
+	}
+
+	/// What the terminal shows: the pty's other side, read until `want`
+	/// bytes are there or 10 s pass.
+	fn read_terminal(master: &mut std::fs::File, want: usize) -> String {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		let mut got = Vec::new();
+		let mut buf = [0u8; 512];
+		while got.len() < want && Instant::now() < deadline {
+			match master.read(&mut buf) {
+				Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+				Ok(_) => break,
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+					std::thread::sleep(Duration::from_millis(5));
+				},
+				Err(e) => panic!("reading the pty: {e}"),
+			}
+		}
+		String::from_utf8_lossy(&got).into_owned()
+	}
+
+	/// The shell's next output waits for its notices: polled until it does
+	/// not, for at most 10 s.
+	fn flush(k: &mut Kernel, vp: &mut Vproc) {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while exec::flush_out(k, vp).is_some() {
+			assert!(Instant::now() < deadline, "DEADLINE: the notices were not out within 10 s");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	/// Two job notices in a row (`bg %1 %2`, two jobs reported before one
+	/// prompt), the second while the terminal's writer thread still holds
+	/// the first, so the thread is busy: both reach the terminal, in order.
+	/// A plain write of the second was refused by the busy thread, and the
+	/// notice was lost.
+	#[test]
+	fn a_notice_while_the_writer_thread_holds_the_one_before_is_not_lost() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_notice_while_the_writer_thread_holds_the_one_before_is_not_lost"
+			),
+			|| {
+				let (mut k, mut vp, mut master) = shell_on_a_pty();
+				let held = crate::sys::hold_writers();
+				notice(&mut k, &mut vp, b"[1]  - continued  sleep 1\n");
+				notice(&mut k, &mut vp, b"[2]  + continued  sleep 2\n");
+				drop(held);
+				flush(&mut k, &mut vp);
+				let want = "[1]  - continued  sleep 1\r\n[2]  + continued  sleep 2\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// zsh's `bg` and `fg` print the job, then continue it: while the
+	/// terminal's writer thread still holds the job line, the continue is
+	/// not sent; it is once the line is out.
+	#[test]
+	fn a_job_is_continued_only_once_its_notice_is_out() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_job_is_continued_only_once_its_notice_is_out"),
+			|| {
+				let (mut k, mut vp, mut master) = shell_on_a_pty();
+				let held = crate::sys::hold_writers();
+				notice(&mut k, &mut vp, b"[1]  + continued  sleep 1\n");
+				continue_job(&mut k, JobId(1));
+				assert_eq!(k.ctl.word(), 0, "the job was continued while its line was not out");
+				drop(held);
+				flush(&mut k, &mut vp);
+				assert_ne!(k.ctl.word(), 0, "the job was not continued once its line was out");
+				let want = "[1]  + continued  sleep 1\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// A bash shell on a [`FakeHost`](crate::testkit::FakeHost) that records
+	/// every event, with a stopped job `%1` (`sleep 100`, [`JOB`]) in its
+	/// root's table.
+	fn bash_shell() -> (crate::bash::Shell, crate::testkit::FakeHost, MemStore) {
+		let mut host = crate::testkit::FakeHost::new();
+		let mut store = MemStore::new();
+		let engine = Engine::new(EngineConfig::default());
+		let init = crate::testkit::fault::skeleton_init(&[]);
+		let mut shell =
+			crate::bash::Shell::create(&engine, &mut Cx { host: &mut host, store: &mut store }, init)
+				.unwrap();
+		shell.set_event_mask(crate::bash::EventMask::ALL);
+		let vp = &mut shell.procs[0];
+		let cwd = vp.cwd.clone();
+		let number = vp
+			.jobs
+			.add(JOB, Vpid(99), BString::from("sleep 100"), true, cwd);
+		vp.jobs.get_mut(number).unwrap().state = JobState::Stopped(Signal::Tstp);
+		vp.jobs.set_current(number);
+		(shell, host, store)
+	}
+
+	/// The stopped job of [`bash_shell`].
+	const JOB: JobId = JobId(7);
+
+	/// [`bash_shell`] whose terminal (zsh `SHTTY`) is the terminal side of a
+	/// new pty, with the root vproc as job control's root; and the pty's
+	/// other side.
+	fn shell_with_a_terminal()
+	-> (crate::bash::Shell, crate::testkit::FakeHost, MemStore, std::fs::File) {
+		let (mut shell, host, store) = bash_shell();
+		let (master, slave, _) = crate::sys::tty::open_pty(None).unwrap();
+		let tty = crate::sys::StdFile::new(std::fs::File::from(slave));
+		shell.k.jobctl.shtty = Some(FdRef::open(Box::new(tty), FdOrigin::Host));
+		shell.k.jobctl.root = Some(shell.procs[0].vpid);
+		let master = std::fs::File::from(master);
+		crate::sys::test_probe::set_nonblocking(&master);
+		(shell, host, store, master)
+	}
+
+	/// Whether the shell continued job `id`: the `Signal` event its
+	/// delivery writes (`deliver`) before it looks the job up. The fixture's
+	/// job has no vproc (`Vpid(99)`), so this shows that the shell sent the
+	/// job its `SIGCONT`, not that the job ran again.
+	fn continued(host: &crate::testkit::FakeHost, id: JobId) -> bool {
+		let want = serde_json::to_value(crate::bash::EventData::Signal {
+			sig:    Signal::Cont,
+			target: SigTarget::Job(id),
+		})
+		.unwrap();
+		host.events.iter().any(|ev| ev["data"] == want)
+	}
+
+	/// Step `shell` until a run ends, for at most 10 s: its status.
+	fn step_until_done(
+		shell: &mut crate::bash::Shell,
+		host: &mut crate::testkit::FakeHost,
+		store: &mut MemStore,
+	) -> i32 {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		loop {
+			let step = shell.step(&mut Cx { host, store }, crate::bash::Budget::default());
+			if let crate::bash::Step::Done { status, .. } = step {
+				return status;
+			}
+			assert!(Instant::now() < deadline, "DEADLINE: the run did not end within 10 s");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	/// Step `shell` until it blocks (nothing can run until what it waits
+	/// for wakes it) or a run ends: whether a run ended. At most 1,000
+	/// steps. The window ends on the shell's own state, not on time: a test
+	/// that holds the writer threads holds them for as long as the shell can
+	/// go on without them, however its process is scheduled.
+	fn step_until_blocked_or_done(
+		shell: &mut crate::bash::Shell,
+		host: &mut crate::testkit::FakeHost,
+		store: &mut MemStore,
+	) -> bool {
+		for _ in 0..1_000 {
+			match shell.step(&mut Cx { host, store }, crate::bash::Budget::default()) {
+				crate::bash::Step::Blocked => return false,
+				crate::bash::Step::Done { .. } => return true,
+				_ => {},
+			}
+		}
+		panic!("the shell neither blocked nor ended its run within 1,000 steps");
+	}
+
+	/// Two notices, the second queued while the terminal's writer thread
+	/// holds the first; then the shell only steps, idle (no output, no
+	/// flush): its scheduler writes the second as the terminal takes it, as
+	/// zsh's notices go out while it waits.
+	#[test]
+	fn the_scheduler_writes_a_notice_left_queued_while_the_shell_idles() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::the_scheduler_writes_a_notice_left_queued_while_the_shell_idles"
+			),
+			|| {
+				let (mut shell, mut host, mut store, mut master) = shell_with_a_terminal();
+				let held = crate::sys::hold_writers();
+				notice(&mut shell.k, &mut shell.procs[0], b"[1]  - continued  sleep 1\n");
+				notice(&mut shell.k, &mut shell.procs[0], b"[2]  + continued  sleep 2\n");
+				drop(held);
+				let want = "[1]  - continued  sleep 1\r\n[2]  + continued  sleep 2\r\n";
+				let deadline = Instant::now() + Duration::from_secs(10);
+				let mut got = Vec::new();
+				let mut buf = [0u8; 512];
+				while got.len() < want.len() && Instant::now() < deadline {
+					let cx = &mut Cx { host: &mut host, store: &mut store };
+					let _ = shell.step(cx, crate::bash::Budget::default());
+					match master.read(&mut buf) {
+						Ok(n) => got.extend_from_slice(&buf[..n]),
+						Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+						Err(e) => panic!("reading the pty: {e}"),
+					}
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				assert_eq!(String::from_utf8_lossy(&got), want);
+			},
+		);
+	}
+
+	/// The leaving shell writes the notices still queued for its terminal
+	/// before it goes, as zsh's last blocking writes do.
+	#[test]
+	fn the_leaving_shell_writes_its_last_notices() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::the_leaving_shell_writes_its_last_notices"),
+			|| {
+				let (mut shell, mut host, mut store, mut master) = shell_with_a_terminal();
+				let held = crate::sys::hold_writers();
+				notice(&mut shell.k, &mut shell.procs[0], b"[1]  - continued  sleep 1\n");
+				notice(&mut shell.k, &mut shell.procs[0], b"[2]  + continued  sleep 2\n");
+				drop(held);
+				shell.leave_job_control(&mut Cx { host: &mut host, store: &mut store });
+				let want = "[1]  - continued  sleep 1\r\n[2]  + continued  sleep 2\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// A continue queued behind a notice the terminal's writer thread holds
+	/// (zsh `bg` as the shell's last command) reaches its job when the shell
+	/// leaves: the leaving shell's drain requests it after the scheduler's
+	/// last step, so it is delivered there.
+	#[test]
+	fn the_leaving_shell_continues_a_job_queued_behind_its_last_notice() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::the_leaving_shell_continues_a_job_queued_behind_its_last_notice"
+			),
+			|| {
+				let (mut shell, mut host, mut store, mut master) = shell_with_a_terminal();
+				let held = crate::sys::hold_writers();
+				notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
+				continue_job(&mut shell.k, JOB);
+				drop(held);
+				shell.leave_job_control(&mut Cx { host: &mut host, store: &mut store });
+				let want = "[1]  + continued  sleep 100\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+				assert!(continued(&host, JOB), "the job was not continued when the shell left");
+			},
+		);
+	}
+
+	/// bash `bg` through the staged output (its continue entry makes the
+	/// builtin fast path refuse): while fd 1's writer thread holds the job
+	/// line, the job is not continued; once the line is out it is, by the
+	/// time the run's end is reported.
+	#[test]
+	fn bash_bg_continues_its_job_once_its_line_is_out() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::bash_bg_continues_its_job_once_its_line_is_out"),
+			|| {
+				let (mut shell, mut host, mut store) = bash_shell();
+				let (ours, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+				peer
+					.set_read_timeout(Some(Duration::from_secs(10)))
+					.unwrap();
+				let file =
+					crate::sys::StdFile::new(std::fs::File::from(std::os::fd::OwnedFd::from(ours)));
+				shell.procs[0]
+					.fds
+					.set(1, Some(FdRef::open(Box::new(file), FdOrigin::Host)));
+				let held = crate::sys::hold_writers();
+				shell.submit(crate::bash::Script::command(b"set -m; bg %1".to_vec()));
+				assert!(
+					!step_until_blocked_or_done(&mut shell, &mut host, &mut store),
+					"the run ended while its line was held"
+				);
+				assert!(!continued(&host, JOB), "the job was continued while its line was held");
+				drop(held);
+				let status = step_until_done(&mut shell, &mut host, &mut store);
+				let stderr = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+				assert_eq!(status, 0, "stderr {stderr:?}");
+				assert!(
+					continued(&host, JOB),
+					"the job was not continued when the run ended; stderr {stderr:?}"
+				);
+				let mut got = [0u8; 17];
+				peer.read_exact(&mut got).unwrap();
+				assert_eq!(&got, b"[1]+ sleep 100 &\n");
+			},
+		);
+	}
+
+	/// bash `bg` whose job line cannot be written (fd 1's reader is gone,
+	/// `SIGPIPE` ignored, so the write fails with `EPIPE` and the shell goes
+	/// on): the job is still continued, as bash continues it whatever the
+	/// write of its line did.
+	#[test]
+	fn bash_bg_continues_its_job_when_its_line_cannot_be_written() {
+		let (mut shell, mut host, mut store) = bash_shell();
+		let (ours, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+		drop(peer);
+		let file = crate::sys::StdFile::new(std::fs::File::from(std::os::fd::OwnedFd::from(ours)));
+		shell.procs[0]
+			.fds
+			.set(1, Some(FdRef::open(Box::new(file), FdOrigin::Host)));
+		shell.submit(crate::bash::Script::command(b"set -m; trap '' PIPE; bg %1".to_vec()));
+		let _ = step_until_done(&mut shell, &mut host, &mut store);
+		let stderr = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+		assert!(continued(&host, JOB), "the job was not continued; stderr {stderr:?}");
+	}
+
+	/// A compound command whose redirection fails (`{ :; } 2>err >/no/f`)
+	/// while a job notice is still going out to the terminal: its message
+	/// goes to the fd 2 its redirections left (the file), not to the fd 2
+	/// they restore. Waiting behind the notice at the failure sent it to the
+	/// restored one.
+	#[test]
+	fn a_failed_redirections_message_goes_to_its_redirected_stderr_while_a_notice_waits() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_failed_redirections_message_goes_to_its_redirected_stderr_while_a_notice_waits"
+			),
+			|| {
+				let (mut shell, mut host, mut store, _master) = shell_with_a_terminal();
+				let held = crate::sys::hold_writers();
+				notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
+				shell.submit(crate::bash::Script::command(
+					b"{ :; } 2>/tmp/err.log >/no/such/dir/f".to_vec(),
+				));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				drop(held);
+				if !done {
+					let _ = step_until_done(&mut shell, &mut host, &mut store);
+				}
+				let file = String::from_utf8_lossy(&host.fs.read("/tmp/err.log").unwrap_or_default())
+					.into_owned();
+				let stderr = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+				assert!(
+					file.contains("No such file or directory"),
+					"the message is not in the redirected stderr: file {file:?}, restored stderr \
+					 {stderr:?}"
+				);
+				assert!(
+					!stderr.contains("No such file or directory"),
+					"the message went to the restored stderr"
+				);
+			},
+		);
+	}
+
+	/// A compound command whose redirection fails (`{ :; } 2>err >/no/f`)
+	/// while the line editor's display bytes are still in the terminal's
+	/// writer thread (the editor flushes once at the end of a line and goes
+	/// on): the command waits for them before it applies its redirections,
+	/// so its message goes to the fd 2 they left (the file). The message
+	/// waited behind the bytes past the restore, and went to the restored
+	/// fd 2.
+	#[test]
+	fn a_failed_redirections_message_goes_to_its_redirected_stderr_while_the_editors_bytes_wait() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_failed_redirections_message_goes_to_its_redirected_stderr_while_the_editors_bytes_wait"
+			),
+			|| {
+				let (mut shell, mut host, mut store, mut master) = shell_with_a_terminal();
+				let held = crate::sys::hold_writers();
+				let mut tty = super::super::zle::tty::Tty::open(&shell.k).unwrap();
+				tty.put(b"% prompt");
+				assert!(tty.flush(&shell.k).is_some(), "the editor's bytes were out while held");
+				let mut zle = super::super::zle::Zle::new(false);
+				zle.tty = Some(tty);
+				shell.procs[0].zle = Some(Box::new(zle));
+				shell.submit(crate::bash::Script::command(
+					b"{ :; } 2>/tmp/err.log >/no/such/dir/f".to_vec(),
+				));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				drop(held);
+				if !done {
+					let _ = step_until_done(&mut shell, &mut host, &mut store);
+				}
+				let file = String::from_utf8_lossy(&host.fs.read("/tmp/err.log").unwrap_or_default())
+					.into_owned();
+				let stderr = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+				assert!(
+					file.contains("No such file or directory"),
+					"the message is not in the redirected stderr: file {file:?}, restored stderr \
+					 {stderr:?}"
+				);
+				assert!(
+					!stderr.contains("No such file or directory"),
+					"the message went to the restored stderr"
+				);
+				assert_eq!(read_terminal(&mut master, 8), "% prompt");
+			},
+		);
+	}
+
+	/// The terminal written as zsh writes its standard error: each write is
+	/// made at once, on the caller's thread. Were fd 2 on a writer thread of
+	/// its own as well, which of two held writes reached the terminal first
+	/// once they were let go would be a race between the two threads; written
+	/// at once, a message that does not wait for a held notice is on the
+	/// terminal before it.
+	struct WrittenAtOnce(std::fs::File);
+
+	impl crate::bash::File for WrittenAtOnce {
+		fn poll_read(
+			&mut self,
+			_cx: &mut Context<'_>,
+			_buf: &mut [u8],
+		) -> Poll<std::io::Result<usize>> {
+			Poll::Ready(Ok(0))
+		}
+
+		fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+			Poll::Ready(std::io::Write::write(&mut self.0, buf))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn seek(&mut self, _pos: crate::bash::fs::SeekFrom) -> std::io::Result<u64> {
+			Err(std::io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> FileKind {
+			FileKind::Tty
+		}
+
+		fn os_handle(&self) -> Option<crate::bash::host::OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> std::io::Result<Box<dyn crate::bash::File>> {
+			Ok(Box::new(Self(self.0.try_clone()?)))
+		}
+	}
+
+	/// A compound command whose redirection fails (`{ :; } >/no/f`) with
+	/// fd 2 on the terminal, while a job notice is still going out there:
+	/// the message comes after the notice, as zsh writes the notice with
+	/// blocking writes first. Written without waiting for the notice, the
+	/// message came first.
+	#[test]
+	fn a_failed_redirections_message_reaches_the_terminal_after_a_job_notice() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_failed_redirections_message_reaches_the_terminal_after_a_job_notice"
+			),
+			|| {
+				let (mut shell, mut host, mut store) = bash_shell();
+				let (master, slave, _) = crate::sys::tty::open_pty(None).unwrap();
+				let slave = std::fs::File::from(slave);
+				let stderr = WrittenAtOnce(slave.try_clone().unwrap());
+				let tty = crate::sys::StdFile::new(slave);
+				shell.k.jobctl.shtty = Some(FdRef::open(Box::new(tty), FdOrigin::Host));
+				shell.k.jobctl.root = Some(shell.procs[0].vpid);
+				shell.procs[0]
+					.fds
+					.set(2, Some(FdRef::open(Box::new(stderr), FdOrigin::Host)));
+				let mut master = std::fs::File::from(master);
+				crate::sys::test_probe::set_nonblocking(&master);
+				let held = crate::sys::hold_writers();
+				notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
+				shell.submit(crate::bash::Script::command(b"{ :; } >/no/such/dir/f".to_vec()));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				drop(held);
+				if !done {
+					let _ = step_until_done(&mut shell, &mut host, &mut store);
+				}
+				let want = "[1]  + continued  sleep 100\r\nbash: line 1: /no/such/dir/f: No such file \
+				            or directory\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// A compound command whose redirection fails after the op applied an
+	/// earlier one and parked (`{ :; } 2>err >/no/$(echo f)`, on the
+	/// substitution), with a job notice queued while it was parked, as the
+	/// scheduler reports a job between steps: the message still goes to the
+	/// fd 2 the redirections left (the file). The op waits for the notices
+	/// only before it applies anything; at the failure it cannot wait, since
+	/// the restore follows in the same step.
+	#[test]
+	fn a_failed_redirections_message_goes_to_its_redirected_stderr_past_a_notice_queued_mid_way() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_failed_redirections_message_goes_to_its_redirected_stderr_past_a_notice_queued_mid_way"
+			),
+			|| {
+				let (mut shell, mut host, mut store, _master) = shell_with_a_terminal();
+				let stderr = shell.procs[0].fds.handle(2);
+				shell.submit(crate::bash::Script::command(
+					b"{ :; } 2>/tmp/err.log >/no/such/dir/$(echo f)".to_vec(),
+				));
+				let one_op = crate::bash::Budget { max_ops: 1, max_ns: u64::MAX };
+				let mut held = None;
+				let mut queued = false;
+				let mut done = false;
+				for _ in 0..100_000 {
+					match shell.step(&mut Cx { host: &mut host, store: &mut store }, one_op) {
+						crate::bash::Step::Done { .. } => {
+							done = true;
+							break;
+						},
+						// The shell waits for the notice: it may go now.
+						crate::bash::Step::Blocked => {
+							held = None;
+							std::thread::sleep(Duration::from_millis(1));
+						},
+						_ => {},
+					}
+					if !queued && !shell.procs[0].fds.handle(2).same(&stderr) {
+						held = Some(crate::sys::hold_writers());
+						notice(&mut shell.k, &mut shell.procs[0], b"[1]  + continued  sleep 100\n");
+						queued = true;
+					}
+				}
+				drop(held);
+				assert!(queued, "the op applied its redirections in one step: no notice came mid-way");
+				assert!(done, "the run did not end within 100,000 steps");
+				let file = String::from_utf8_lossy(&host.fs.read("/tmp/err.log").unwrap_or_default())
+					.into_owned();
+				let stderr = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+				assert!(
+					file.contains("No such file or directory"),
+					"the message is not in the redirected stderr: file {file:?}, restored stderr \
+					 {stderr:?}"
+				);
+				assert!(
+					!stderr.contains("No such file or directory"),
+					"the message went to the restored stderr"
+				);
+			},
+		);
 	}
 }

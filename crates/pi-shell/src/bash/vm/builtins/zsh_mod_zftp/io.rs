@@ -226,9 +226,13 @@ pub enum ZftpAns {
 #[derive(Default)]
 pub struct ZftpLive {
 	/// The timer of the timeout or deadline.
-	timer: Option<Box<dyn Timer>>,
+	timer:     Option<Box<dyn Timer>>,
 	/// The step under way.
-	step:  Step,
+	step:      Step,
+	/// What a writer thread took of a [`ZftpOp::Write`], [`ZftpOp::Out`],
+	/// [`ZftpOp::Urgent`] or an option answer of [`ZftpOp::Line`] and has
+	/// not written yet ([`crate::bash::FdRef::poll_write_out`]).
+	unsettled: crate::bash::Unsettled,
 }
 
 /// What a [`ZftpLive`] waits for.
@@ -242,6 +246,8 @@ enum Step {
 	Stat(Box<dyn FsPending<Stat>>),
 	/// Bytes of an [`ZftpOp::Out`] written so far.
 	Out(usize),
+	/// Bytes of [`ZftpOp::Urgent`]'s `IAC IP IAC` written so far.
+	Urgent(usize),
 	Line(LineState),
 	Xfer(Box<Xfer>),
 }
@@ -264,6 +270,30 @@ enum LineAt {
 	Iac,
 	/// After `IAC WILL|WONT|DO|DONT`: the answer to send with the option.
 	Option(u8),
+	/// An option answer being written, and how much of it is out: it is
+	/// out before the next byte is read.
+	Answer([u8; 3], usize),
+}
+
+/// Write `bytes` from `*off` until all of it is out of the shell, as zsh's
+/// blocking `write` does ([`crate::bash::FdRef::poll_write_out`]): `Pending`
+/// while the descriptor does not take it or its writer thread has not
+/// written what it took. A failed write ends it: zsh does not check these.
+fn write_whole(
+	tcx: &mut Context<'_>,
+	h: &FdRef,
+	bytes: &[u8],
+	off: &mut usize,
+	unsettled: &mut crate::bash::Unsettled,
+) -> Poll<()> {
+	while *off < bytes.len() {
+		match h.poll_write_out(tcx, &bytes[*off..], unsettled) {
+			Poll::Ready(Ok(n)) if n > 0 => *off += n,
+			Poll::Ready(_) => break,
+			Poll::Pending => return Poll::Pending,
+		}
+	}
+	Poll::Ready(())
 }
 
 /// The live state of the zsh `ZftpLive` in the scratch, created on first use.
@@ -477,7 +507,8 @@ pub fn perform(
 			if l.timer.as_mut().is_some_and(|t| t.poll(tcx).is_ready()) {
 				return Ok(ZftpAns::Wrote(Err(Fail::timeout())));
 			}
-			match vp.fds.handle(*fd).poll_write(tcx, data) {
+			let unsettled = &mut l.unsettled;
+			match vp.fds.handle(*fd).poll_write_out(tcx, data, unsettled) {
 				Poll::Ready(Ok(n)) => ZftpAns::Wrote(Ok(n)),
 				Poll::Ready(Err(e)) => ZftpAns::Wrote(Err(Fail::of(&e))),
 				Poll::Pending => return Err(WaitKey::Write { fd: *fd }),
@@ -491,7 +522,7 @@ pub fn perform(
 			};
 			let h = vp.fds.handle(*fd);
 			while off < data.len() {
-				match h.poll_write(tcx, &data[off..]) {
+				match h.poll_write_out(tcx, &data[off..], &mut l.unsettled) {
 					Poll::Ready(Ok(n)) if n > 0 => off += n,
 					Poll::Ready(_) => break,
 					Poll::Pending => {
@@ -511,12 +542,31 @@ pub fn perform(
 					l.timer = Some(cx.host.timer(Deadline(at)));
 				}
 			}
-			let ZftpLive { timer, step } = l;
+			let ZftpLive { timer, step, unsettled } = l;
 			let Step::Line(st) = step else {
 				unreachable!("set above");
 			};
 			let h = vp.fds.handle(*fd);
 			loop {
+				// An option answer is out before the next byte is read (zsh
+				// writes it with a blocking `write`); while the descriptor's
+				// writer thread still holds the one before, it waits, under the
+				// line's timeout as zsh's `zfalarm` covers that write.
+				if let LineAt::Answer(cmd, mut off) = st.at {
+					let polled = write_whole(tcx, &h, &cmd, &mut off, unsettled);
+					st.at = LineAt::Answer(cmd, off);
+					if polled.is_pending() {
+						if timer.as_mut().is_some_and(|t| t.poll(tcx).is_ready()) {
+							return Ok(ZftpAns::Line {
+								text:      BString::from(std::mem::take(&mut st.text)),
+								eof:       false,
+								timed_out: true,
+							});
+						}
+						return Err(WaitKey::Write { fd: *fd });
+					}
+					st.at = LineAt::Plain;
+				}
 				let mut b = [0u8; 1];
 				let ch = match h.poll_read(tcx, &mut b) {
 					Poll::Ready(Ok(1)) => Some(b[0]),
@@ -539,11 +589,10 @@ pub fn perform(
 				match (st.at, ch) {
 					(LineAt::Option(answer), _) => {
 						// `(char)EOF` is 0xff.
-						let cmd = [IAC, answer, ch.unwrap_or(0xff)];
-						let _ = h.poll_write(tcx, &cmd);
-						st.at = LineAt::Plain;
+						st.at = LineAt::Answer([IAC, answer, ch.unwrap_or(0xff)], 0);
 						continue;
 					},
+					(LineAt::Answer(..), _) => unreachable!("an answer is out before a byte is read"),
 					(_, None) => {
 						return Ok(ZftpAns::Line {
 							text:      BString::from(std::mem::take(&mut st.text)),
@@ -643,8 +692,20 @@ pub fn perform(
 			ZftpAns::Done
 		},
 		ZftpOp::Urgent { fd } => {
+			// zsh's abort: `IAC IP IAC` in band, then `DM` out of band, in
+			// that order: the urgent byte goes once the three are out of the
+			// shell, as zsh's blocking `write` orders them.
 			let h = vp.fds.handle(*fd);
-			let _ = h.poll_write(tcx, &[IAC, IP, IAC]);
+			let l = live(sc);
+			let mut off = match l.step {
+				Step::Urgent(off) => off,
+				_ => 0,
+			};
+			if write_whole(tcx, &h, &[IAC, IP, IAC], &mut off, &mut l.unsettled).is_pending() {
+				l.step = Step::Urgent(off);
+				return Err(WaitKey::Write { fd: *fd });
+			}
+			l.step = Step::Idle;
 			if let (Some(oh), Some(s)) = (h.os_handle(), cx.host.sockets()) {
 				let _ = s.send_urgent(oh, &[SYNCH]);
 			}
@@ -702,13 +763,16 @@ type Moved = Result<usize, Option<io::Error>>;
 /// helpers, block mode included), kept across polls.
 struct Xfer {
 	/// zsh's `lsbuf`: kept across reads, as the C stack buffer is.
-	buf:   Vec<u8>,
+	buf:       Vec<u8>,
 	/// zsh's `ascbuf`.
-	asc:   Vec<u8>,
-	at:    XferAt,
+	asc:       Vec<u8>,
+	at:        XferAt,
 	/// The timer of the read or write in flight.
-	timer: XferTimer,
-	out:   XferOut,
+	timer:     XferTimer,
+	out:       XferOut,
+	/// What a writer thread took of the write in flight and has not
+	/// written yet ([`crate::bash::FdRef::poll_write_out`]).
+	unsettled: crate::bash::Unsettled,
 }
 
 /// The timeout of the call in flight.
@@ -735,11 +799,12 @@ enum XferAt {
 impl Xfer {
 	fn new(spec: &XferSpec) -> Self {
 		Self {
-			buf:   vec![0; BUFSIZE],
-			asc:   vec![0; ASCSIZE],
-			at:    XferAt::Read,
-			timer: XferTimer::Unarmed,
-			out:   XferOut { eof: spec.eof, ..XferOut::default() },
+			buf:       vec![0; BUFSIZE],
+			asc:       vec![0; ASCSIZE],
+			at:        XferAt::Read,
+			timer:     XferTimer::Unarmed,
+			out:       XferOut { eof: spec.eof, ..XferOut::default() },
+			unsettled: crate::bash::Unsettled::default(),
 		}
 	}
 
@@ -918,7 +983,7 @@ impl Xfer {
 						// zsh `zfwrite_block`: the header in one write.
 						let len = end - off;
 						let h = [0, (len >> 8) as u8, (len & 0xff) as u8];
-						let polled = hout.poll_write(tcx, &h);
+						let polled = hout.poll_write_out(tcx, &h, &mut self.unsettled);
 						let r = match self.call(tcx, cx, wtmout, polled) {
 							Poll::Ready(r) => r,
 							Poll::Pending => return Err(WaitKey::Write { fd: fdout }),
@@ -948,7 +1013,7 @@ impl Xfer {
 						}
 						continue;
 					}
-					let polled = hout.poll_write(tcx, &self.buf[off..end]);
+					let polled = hout.poll_write_out(tcx, &self.buf[off..end], &mut self.unsettled);
 					let r = match self.call(tcx, cx, wtmout, polled) {
 						Poll::Ready(r) => r,
 						Poll::Pending => return Err(WaitKey::Write { fd: fdout }),
@@ -1061,4 +1126,195 @@ impl Xfer {
 /// `EPIPE` maps to `BrokenPipe` on every platform.
 fn is_epipe(e: &io::Error) -> bool {
 	e.kind() == io::ErrorKind::BrokenPipe
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+	use std::{
+		io::{Read as _, Write as _},
+		net::{TcpListener, TcpStream},
+		os::fd::{AsRawFd as _, OwnedFd},
+		time::{Duration, Instant},
+	};
+
+	use super::*;
+	use crate::{
+		bash::{Engine, EngineConfig, MemStore, fd::FdTable, ids::Vpid, signal::SigSet},
+		sys::test_probe as probe,
+	};
+
+	/// The client end's fd in the vproc.
+	const FD: i32 = 11;
+
+	fn kernel() -> (Kernel, MemStore) {
+		let mut store = MemStore::new();
+		let root = state::Root::load(&mut store).unwrap();
+		let engine = Engine::new(EngineConfig::default());
+		(Kernel::new(&engine, root, BString::from("zsh"), std::process::id()), store)
+	}
+
+	fn host() -> crate::process::NativeHost {
+		crate::process::NativeHost::new(None, false, Vec::new(), SigSet::default(), 0, false)
+	}
+
+	/// A TCP connection on 127.0.0.1: its client end as fd [`FD`] of a new
+	/// vproc (a socket: its writes go to its writer thread), and its server
+	/// end, whose reads give up after 10 s; and the client end's descriptor.
+	fn connected() -> (Vproc, TcpStream, std::os::fd::RawFd) {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+		let (server, _) = listener.accept().unwrap();
+		server
+			.set_read_timeout(Some(Duration::from_secs(10)))
+			.unwrap();
+		let raw = client.as_raw_fd();
+		let file = crate::sys::StdFile::new(std::fs::File::from(OwnedFd::from(client)));
+		assert_eq!(file.kind(), FileKind::Socket);
+		let mut vp = Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+		vp.fds
+			.set(FD, Some(FdRef::open(Box::new(file), FdOrigin::Host)));
+		(vp, server, raw)
+	}
+
+	/// `op`, polled until it is answered, for at most 10 s.
+	fn answered(
+		k: &Kernel,
+		cx: &mut Cx<'_>,
+		vp: &mut Vproc,
+		sc: &mut Scratch,
+		op: &ZftpOp,
+	) -> ZftpAns {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		loop {
+			if let Ok(ans) = perform(k, cx, vp, sc, op) {
+				return ans;
+			}
+			assert!(Instant::now() < deadline, "DEADLINE: no answer within 10 s");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	/// zsh's abort sends `IAC IP IAC` in band, then `DM` out of band. While
+	/// the control connection's writer thread still holds the three bytes,
+	/// the abort waits and sends no urgent byte; it sends it once they are
+	/// out, so the urgent mark comes right after them. A plain write handed
+	/// the three bytes to the thread and sent the urgent byte at once, which
+	/// could reach the server first.
+	#[test]
+	fn an_abort_sends_its_urgent_byte_after_iac_ip_iac() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::an_abort_sends_its_urgent_byte_after_iac_ip_iac"),
+			|| {
+				let oob = probe::urgent_data_is_carried();
+				let (k, mut store) = kernel();
+				let mut host = host();
+				let mut cx = Cx { host: &mut host, store: &mut store };
+				let (mut vp, mut server, _) = connected();
+				let mut sc = Scratch::default();
+				let op = ZftpOp::Urgent { fd: FD };
+				let held = crate::sys::hold_writers();
+				let first = perform(&k, &mut cx, &mut vp, &mut sc, &op);
+				assert!(first.is_err(), "the abort was done while the writer thread held IAC IP IAC");
+				drop(held);
+				assert!(matches!(answered(&k, &mut cx, &mut vp, &mut sc, &op), ZftpAns::Done));
+				if oob {
+					assert!(probe::urgent_arrives(&server, 10_000), "no urgent byte within 10 s");
+					assert!(!probe::at_mark(&server), "the urgent byte came before IAC IP IAC");
+				} else {
+					eprintln!("this system carries no TCP urgent data: the mark is not checked");
+				}
+				let mut got = [0u8; 3];
+				server.read_exact(&mut got).unwrap();
+				assert_eq!(got, [IAC, IP, IAC]);
+				if oob {
+					assert!(probe::at_mark(&server), "the urgent mark is not right after IAC IP IAC");
+				}
+			},
+		);
+	}
+
+	/// Two Telnet option answers of zsh's line reader in a row, the second
+	/// while the writer thread still holds the first: both reach the server,
+	/// in order. A plain write of the second was refused by the busy thread,
+	/// and the answer was lost.
+	#[test]
+	fn two_option_answers_in_a_row_both_reach_the_server() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::two_option_answers_in_a_row_both_reach_the_server"),
+			|| {
+				let (k, mut store) = kernel();
+				let mut host = host();
+				let mut cx = Cx { host: &mut host, store: &mut store };
+				let (mut vp, mut server, client) = connected();
+				let sent = [&[IAC, WILL, 1, IAC, DO, 3][..], b"220 ready\r\n"].concat();
+				server.write_all(&sent).unwrap();
+				// All of it is there before the reader starts, so it reads both
+				// options while the thread holds the first answer.
+				let deadline = Instant::now() + Duration::from_secs(10);
+				while probe::queued(client) < sent.len() {
+					assert!(Instant::now() < deadline, "DEADLINE: the server's bytes did not arrive");
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				let mut sc = Scratch::default();
+				let op = ZftpOp::Line { fd: FD, timeout: 0 };
+				let held = crate::sys::hold_writers();
+				let first = perform(&k, &mut cx, &mut vp, &mut sc, &op);
+				drop(held);
+				let ans = match first {
+					Ok(ans) => ans,
+					Err(_) => answered(&k, &mut cx, &mut vp, &mut sc, &op),
+				};
+				let ZftpAns::Line { text, eof, timed_out } = ans else {
+					panic!("the line reader answered with no line");
+				};
+				assert_eq!((text.as_slice(), eof, timed_out), (&b"220 ready"[..], false, false));
+				let mut got = [0u8; 6];
+				server
+					.read_exact(&mut got)
+					.expect("both answers within 10 s");
+				assert_eq!(got, [IAC, DONT, 1, IAC, WONT, 3]);
+			},
+		);
+	}
+
+	/// The line reader's timeout covers an option answer that cannot go out
+	/// (zsh `zfgetline` writes it under `zfalarm`): with the writer thread
+	/// holding the answer and the server sending nothing more, the reader
+	/// answers `timed_out` at its deadline. While it only waited for the
+	/// answer, it never read its timer, and a server that stopped reading
+	/// held zftp past `ZFTP_TMOUT`.
+	#[test]
+	fn a_line_times_out_while_its_option_answer_waits() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_line_times_out_while_its_option_answer_waits"),
+			|| {
+				let (k, mut store) = kernel();
+				let mut host = host();
+				let mut cx = Cx { host: &mut host, store: &mut store };
+				let (mut vp, mut server, client) = connected();
+				server.write_all(&[IAC, WILL, 1]).unwrap();
+				let deadline = Instant::now() + Duration::from_secs(10);
+				while probe::queued(client) < 3 {
+					assert!(Instant::now() < deadline, "DEADLINE: the server's bytes did not arrive");
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				let mut sc = Scratch::default();
+				// A one-second line timeout (zsh `ZFTP_TMOUT=1`).
+				let op = ZftpOp::Line { fd: FD, timeout: 1 };
+				let held = crate::sys::hold_writers();
+				let started = Instant::now();
+				let ans = answered(&k, &mut cx, &mut vp, &mut sc, &op);
+				let took = started.elapsed();
+				drop(held);
+				let ZftpAns::Line { timed_out, eof, .. } = ans else {
+					panic!("the line reader answered with no line");
+				};
+				assert!(timed_out && !eof, "timed_out {timed_out}, eof {eof}");
+				assert!(
+					took >= Duration::from_millis(900),
+					"answered after {took:?}, before its timeout"
+				);
+			},
+		);
+	}
 }

@@ -12,6 +12,7 @@ import { InternalUrlRouter } from "../internal-urls";
 import { FileChangeType, notifyWorkspaceWatchedFiles } from "../lsp/client";
 import type { ToolSession } from ".";
 import { resolvePlanPath, targetsLocalSandbox } from "./plan-mode-guard";
+import { throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 /**
@@ -88,15 +89,20 @@ export async function routeWriteThroughBridge(
 	const changeType = (await Bun.file(absolutePath).exists()) ? FileChangeType.Changed : FileChangeType.Created;
 	// The ACP protocol has no cancellation for fs writes; the most we can do is
 	// refuse to start one after the tool was aborted. Racing the promise would
-	// report failure while the editor still applies the write.
-	signal?.throwIfAborted();
+	// report failure while the editor still applies the write. A ToolAbortError,
+	// not the signal's own reason: the edit tool's writer hands its rejection to
+	// napi, which keeps the message of an Error or a string but not of an abort
+	// DOMException, so that reason would reach the model as an empty error.
+	throwIfAborted(signal);
 	try {
 		await bridge.writeTextFile({ path: absolutePath, content });
 	} catch (error) {
 		throw new ToolError(error instanceof Error ? error.message : String(error));
 	}
+	// The client has written the file, so the notice goes out even if the call
+	// was aborted meanwhile (bounded by the notice's own timeout).
 	if (session.enableLsp ?? true) {
-		await notifyWorkspaceWatchedFiles(session.cwd, [{ filePath: absolutePath, type: changeType }], signal);
+		await notifyWorkspaceWatchedFiles(session.cwd, [{ filePath: absolutePath, type: changeType }]);
 	}
 	session.bumpFileMutationVersion?.(absolutePath);
 

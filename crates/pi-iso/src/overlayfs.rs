@@ -351,17 +351,17 @@ mod imp {
 
 	#[cfg(test)]
 	mod tests {
-		use std::os::unix::fs::PermissionsExt as _;
-
 		use super::*;
 
 		/// Write an executable `fusermount` stand-in under `dir` that logs its
-		/// argv to `dir/calls` and then runs `body`.
+		/// argv to `dir/calls` and then runs `body`. A child writes it
+		/// ([`crate::testprog`]): written here, a fork by another test's thread
+		/// could keep it open for writing, and running it would fail with
+		/// `ETXTBSY`.
 		fn shim(dir: &Path, name: &str, body: &str) -> String {
 			let path = dir.join(name);
 			let script = format!("#!/bin/sh\necho \"$*\" >> '{}/calls'\n{body}\n", dir.display());
-			fs::write(&path, script).expect("write shim");
-			fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod shim");
+			crate::testprog::write(&path, &script);
 			path.to_str().expect("utf-8 temp path").to_owned()
 		}
 

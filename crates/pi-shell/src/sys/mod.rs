@@ -53,6 +53,13 @@ pub mod uname;
 pub mod user;
 pub mod utmp;
 
+#[cfg(not(unix))]
+pub(crate) use fs::BLOCKING_WRITE_CHUNK;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use fs::{CHUNKS_FAILED, hold_writers, in_blocking_writer_process, test_probe};
+#[cfg(unix)]
+pub(crate) use ready::WRITE_CHUNK;
+
 #[cfg(windows)]
 pub(crate) use crate::sys::spawn::break_console_groups;
 pub use crate::sys::{

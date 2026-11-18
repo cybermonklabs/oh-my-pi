@@ -828,9 +828,35 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	}
 }
 
-/// Write queued diagnostics; the fd that would block, if any. Write errors
-/// on a diagnostic stream are dropped, as bash does.
-pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
+/// Write queued diagnostics (`Kernel::diag`, xtrace lines, `fc -s`'s echo);
+/// the fd that would block, if any. An entry is done once it is written and
+/// the object that took its bytes has settled them
+/// ([`crate::bash::File::poll_settle_marked`], the entry's
+/// [`HandedOff`](super::proc::HandedOff)), so a command that runs next (an
+/// external that inherits the fd, a builtin writing to another fd of the
+/// same pipe) comes after it. That object, not whatever the fd names by
+/// then: a failed compound redirection restores the fds between the write
+/// and the settle. The chunk handed off last settles before the next one
+/// goes, and an entry stops at its first failed chunk; write errors on a
+/// diagnostic stream are dropped, as bash does.
+pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
+	// The shell's job notices still going out to its terminal come first
+	// ([`jobctl::notice`]): zsh wrote them with blocking writes.
+	if super::jobctl::shout_waits(k, vp) {
+		return Some(super::zle::tty::FD);
+	}
+	flush_queued(k, vp)
+}
+
+/// [`flush_out`] without waiting for the shell's job notices: for a
+/// failed compound redirection's message, which belongs on the fd 2 its
+/// redirections left. The `Redir` op restores the fds in the same step,
+/// right after this ([`clear_scratch`]), and cannot wait in between: an op
+/// that waits runs again, which would try the failed redirection again and
+/// print its message twice. The op waits for the notices and the editor's
+/// display bytes before it applies anything, so only a notice queued while
+/// it was parked mid-way can still be going out here.
+fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	use super::zle::tty;
 	// The editor's display bytes still pending were queued before anything
 	// in `vp.out` (later ones wait in it, as `tty::FD` entries): the
@@ -840,13 +866,22 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	{
 		return Some(tty::FD);
 	}
-	let mut cx = Context::from_waker(&k.waker);
+	if vp.out.is_empty() {
+		return None;
+	}
+	let waker = k.waker.clone();
+	let mut cx = Context::from_waker(&waker);
 	while let Some(w) = vp.out.front_mut() {
 		if w.fd == tty::FD {
 			if let Some(t) = vp.zle.as_deref_mut().and_then(|z| z.tty.as_mut()) {
 				t.put(&w.bytes[w.off..]);
-				vp.out.pop_front();
-				if t.flush(k).is_some() {
+				pop_out(k, vp);
+				if vp
+					.zle
+					.as_deref_mut()
+					.and_then(|z| z.tty.as_mut())
+					.is_some_and(|t| t.flush(k).is_some())
+				{
 					return Some(tty::FD);
 				}
 				continue;
@@ -854,20 +889,51 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 			// No editor any more: its fallback, standard error.
 			w.fd = 2;
 		}
-		match vp.fds.handle(w.fd).poll_write(&mut cx, &w.bytes[w.off..]) {
-			Poll::Ready(Ok(n)) if n > 0 => {
+		let handle = vp.fds.handle(w.fd);
+		let done = w.off >= w.bytes.len();
+		// The chunk handed off last is out before the next one goes; what
+		// another object took (the fd was restored in between) is out there
+		// before the rest goes to this one.
+		if let Some(held) = &w.handed.file
+			&& (done || !held.same(&handle) || w.handed.mark.is_some())
+		{
+			let Poll::Ready(settled) = held.poll_settle_marked(&mut cx, w.handed.mark.as_slice())
+			else {
+				return Some(w.fd);
+			};
+			w.handed = super::proc::HandedOff::default();
+			if settled.is_err() {
+				pop_out(k, vp);
+				continue;
+			}
+		}
+		if done {
+			pop_out(k, vp);
+			continue;
+		}
+		match handle.poll_write_marked(&mut cx, &w.bytes[w.off..]) {
+			Poll::Ready(Ok((n, mark))) if n > 0 => {
 				w.off += n;
-				if w.off >= w.bytes.len() {
-					vp.out.pop_front();
-				}
+				w.handed.mark = mark;
+				w.handed.file.get_or_insert(handle);
 			},
 			Poll::Ready(_) => {
-				vp.out.pop_front();
+				pop_out(k, vp);
 			},
 			Poll::Pending => return Some(w.fd),
 		}
 	}
 	None
+}
+
+/// The front of `vp.out` is out (written and settled, or dropped): pop it,
+/// and continue the job it held back ([`PendingWrite::then_continue`]).
+fn pop_out(k: &mut Kernel, vp: &mut Vproc) {
+	if let Some(w) = vp.out.pop_front()
+		&& let Some(id) = w.cont
+	{
+		super::jobctl::continue_job(k, id);
+	}
 }
 
 /// Grammar switches from the current options (also `zpty`'s parse of its
@@ -1512,8 +1578,7 @@ pub(crate) fn hend_output(
 	}
 	if let Some(mut line) = out.print {
 		line.push(b'\n');
-		vp.out
-			.push_back(PendingWrite { fd: 2, bytes: line, off: 0 });
+		vp.out.push_back(PendingWrite::new(2, line));
 	}
 	*run = out.run;
 }
@@ -2979,31 +3044,50 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::Redir => match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
-			Ok(()) => {
-				let saves = match top_frame(vp).scratch.take() {
-					Some(mut sc) => {
-						let saves = sc
-							.io
-							.as_mut()
-							.map_or_default(|io| std::mem::take(&mut io.saved));
-						drop_scratch(&mut k.root, cx.store, vp, sc);
-						saves
-					},
-					None => Vec::new(),
-				};
-				top_frame(vp).redirs.push(saves);
-				Flow::Next
-			},
-			Err(redir::Halt::Flow(f)) => f,
-			Err(redir::Halt::Failed) => {
-				// The message goes to stderr as the redirections so far left
-				// it; what would block is written after the restore.
-				let _ = flush_out(k, vp);
-				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = 1;
-				Flow::Jump(op.b)
-			},
+		Opcode::Redir => {
+			// The shell's output to its terminal goes first: its job notices
+			// still going out and the editor's display bytes, as zsh's
+			// blocking writes ordered them ([`flush_out`]). Waited for on the
+			// op's first entry, before any redirection is applied, so a failed
+			// redirection's message comes after them and goes to the fd 2 the
+			// redirections left; a later entry resumes the list where it
+			// parked.
+			if top_frame(vp).scratch.is_none()
+				&& let Some(fd) = flush_out(k, vp)
+			{
+				return Flow::Block(WaitKey::Write { fd });
+			}
+			match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
+				Ok(()) => {
+					let saves = match top_frame(vp).scratch.take() {
+						Some(mut sc) => {
+							let saves = sc
+								.io
+								.as_mut()
+								.map_or_default(|io| std::mem::take(&mut io.saved));
+							drop_scratch(&mut k.root, cx.store, vp, sc);
+							saves
+						},
+						None => Vec::new(),
+					};
+					top_frame(vp).redirs.push(saves);
+					Flow::Next
+				},
+				Err(redir::Halt::Flow(f)) => f,
+				Err(redir::Halt::Failed) => {
+					// The message goes to stderr as the redirections so far left
+					// it; what would block is written after the restore. A notice
+					// queued while the op was parked mid-way is handed to the
+					// terminal first ([`jobctl::drain_shout`] does not wait for it
+					// to be written); the message does not wait behind it, since
+					// the restore follows in this step ([`flush_queued`]).
+					super::jobctl::drain_shout(k);
+					let _ = flush_queued(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = 1;
+					Flow::Jump(op.b)
+				},
+			}
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {
@@ -3338,9 +3422,7 @@ fn time_end(
 		end.sys.saturating_sub(start.sys),
 	];
 	match time_report(&format, times) {
-		Ok(text) => vp
-			.out
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 }),
+		Ok(text) => vp.out.push_back(PendingWrite::new(2, text.into())),
 		Err(c) => {
 			let msg = format!("TIMEFORMAT: `{}': invalid format character", char::from(c));
 			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
@@ -3385,8 +3467,7 @@ fn zsh_time_end(
 		text.extend_from_slice(&zsh_time_report(&format, b"children", children));
 		text
 	};
-	vp.out
-		.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
+	vp.out.push_back(PendingWrite::new(2, text.into()));
 }
 
 /// zsh's default `TIMEFMT` (`DEFAULT_TIMEFMT`).

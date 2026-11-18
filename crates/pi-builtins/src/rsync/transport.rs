@@ -1421,7 +1421,7 @@ mod tests {
 
 	#[cfg(unix)]
 	mod shell {
-		use std::{os::unix::fs::PermissionsExt, path::Path};
+		use std::path::Path;
 
 		use super::*;
 		use crate::rsync::log::{LogConfig, Logger};
@@ -1430,10 +1430,11 @@ mod tests {
 			Logger::local(Box::new(io::sink()), Box::new(io::sink()), LogConfig::default())
 		}
 
+		/// Writes `#!/bin/sh` and `body` as the program `dir/name`, through
+		/// [`crate::testprog`], and returns its path.
 		fn script(dir: &Path, name: &str, body: &str) -> String {
 			let path = dir.join(name);
-			std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+			crate::testprog::write(&path, &format!("#!/bin/sh\n{body}"));
 			path.to_string_lossy().into_owned()
 		}
 
@@ -1599,6 +1600,32 @@ mod tests {
 			}
 		}
 
+		/// A child forked while a script is written, as another test's thread
+		/// can fork at any time, keeps no hold on the script: here one is forked
+		/// in the middle of the write and lives until the script has run. When
+		/// this process wrote the script itself, that child kept its descriptor
+		/// and the run failed: `Failed to exec ...: Text file busy (26)`.
+		#[test]
+		fn a_child_forked_while_the_script_is_written_leaves_it_runnable() {
+			use crate::testprog::{LINGER, LINGERING, end_lingering};
+
+			let dir = tempfile::tempdir().unwrap();
+			let logger = logger();
+			LINGER.set(true);
+			let rsh = script(dir.path(), "forked-rsh", "exit 3\n");
+			LINGER.set(false);
+			let lingering = LINGERING.get().expect("a child was forked during the write");
+			// SAFETY: signal 0 sends nothing.
+			let alive = unsafe { libc::kill(lingering, 0) } == 0;
+			let cancel = Arc::new(AtomicBool::new(false));
+			let got = spawn_shell(&child_env(dir.path()), &base_cfg(&rsh, &logger), cancel)
+				.map(|conn| conn.finish().err().map(|e| e.code))
+				.map_err(|e| e.message);
+			end_lingering();
+			assert!(alive, "the child forked during the write ran on while the script ran");
+			assert_eq!(got, Ok(Some(3)));
+		}
+
 		#[test]
 		fn missing_shell_fails_like_failed_exec() {
 			let dir = tempfile::tempdir().unwrap();
@@ -1620,7 +1647,7 @@ mod tests {
 		#[test]
 		fn cancel_kills_the_shell() {
 			let dir = tempfile::tempdir().unwrap();
-			let rsh = script(dir.path(), "sleepy-rsh", "exec sleep 30\n");
+			let rsh = script(dir.path(), "sleepy-rsh", "exec sleep 600\n");
 			let logger = logger();
 			let cancel = Arc::new(AtomicBool::new(false));
 			let mut conn =
@@ -1631,12 +1658,13 @@ mod tests {
 				std::thread::sleep(Duration::from_millis(150));
 				flag.store(true, Ordering::Relaxed);
 			});
-			let started = Instant::now();
+			// The read ends with the cancel's error (a shell left to run to
+			// its end would give end of file instead), and `finish` returns it
+			// once it killed and reaped the shell.
 			let mut buf = [0u8; 1];
 			let err = conn.reader.read(&mut buf).unwrap_err();
 			assert_eq!(RsyncError::from_io(&err, 12).code, RERR_SIGNAL);
 			assert_eq!(conn.finish().unwrap_err().code, RERR_SIGNAL);
-			assert!(started.elapsed() < Duration::from_secs(10));
 		}
 	}
 }

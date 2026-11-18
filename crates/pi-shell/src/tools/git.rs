@@ -39,6 +39,12 @@ enum Next {
 enum Stage {
 	/// The worker runs.
 	Preparing(flume::Receiver<Prepared>),
+	/// What the layers printed (a `RunNoted` note) is written and settled
+	/// before git starts, so git's own output comes after it.
+	Noting {
+		args:      Vec<BString>,
+		to_stderr: bool,
+	},
 	/// git runs in [`Git::child`].
 	Running,
 	Exit(i32),
@@ -75,19 +81,7 @@ impl Git {
 						}
 						self.stage = Some(match next {
 							Next::Exit(code) => Stage::Exit(code),
-							Next::Git { args, to_stderr } => {
-								if let Some(git) = git_path(&self.call) {
-									let argv = std::iter::once(git).chain(args).collect();
-									let redirect = if to_stderr { " >&2" } else { "" };
-									self
-										.child
-										.start(api, turn, &self.call, argv, false, redirect);
-									Stage::Running
-								} else {
-									self.out.push(2, "git: command not found\n");
-									Stage::Exit(127)
-								}
-							},
+							Next::Git { args, to_stderr } => Stage::Noting { args, to_stderr },
 						});
 					},
 					Err(flume::TryRecvError::Empty) => {
@@ -101,6 +95,23 @@ impl Git {
 							next: Next::Git { args: self.call.argv[1..].to_vec(), to_stderr: false },
 						})));
 					},
+				},
+				Some(Stage::Noting { args, to_stderr }) => {
+					if !self.out.flush(api) {
+						self.stage = Some(Stage::Noting { args, to_stderr });
+						return None;
+					}
+					self.stage = Some(if let Some(git) = git_path(&self.call) {
+						let argv = std::iter::once(git).chain(args).collect();
+						let redirect = if to_stderr { " >&2" } else { "" };
+						self
+							.child
+							.start(api, turn, &self.call, argv, false, redirect, false);
+						Stage::Running
+					} else {
+						self.out.push(2, "git: command not found\n");
+						Stage::Exit(127)
+					});
 				},
 				Some(Stage::Running) => {
 					self.stage = Some(Stage::Running);

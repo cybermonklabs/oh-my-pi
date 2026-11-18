@@ -84,18 +84,20 @@ Argument handling:
 | Flag                                    | Description                                                                                                                                                                                                                                                                                                   |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--continue`, `-c`                      | Continue the previous session.                                                                                                                                                                                                                                                                                |
-| `--resume [id]`, `-r`, `--session [id]` | Resume a session by ID prefix or path, or open the picker when no value is given.                                                                                                                                                                                                                             |
+| `--resume [id]`, `-r`, `--session [id]` | Resume a session by ID prefix or path, or open the picker when no value is given. A full session ID matches only the session with exactly that ID; a shorter prefix matches by prefix, an exact ID first.                                                                                                    |
 | `--restore [id]`                        | Resume a session as `--resume` does, then go on with what its last process left unfinished when it crashed or was killed: the interrupted turn and the subagents it was running. Interactive only; takes no prompt. See [session operations](./session-operations-export-share-fork-resume.md#cli---restore). |
 | `--fork <session>`                      | Fork a saved session (by ID prefix or path) into a new session. See [session operations](./session-operations-export-share-fork-resume.md).                                                                                                                                                                   |
 | `--from-claude`                         | Import a Claude Code session into OMP.                                                                                                                                                                                                                                                                        |
 | `--from-codex`                          | Import a Codex session into OMP.                                                                                                                                                                                                                                                                              |
+| `--session-id <uuid>`                   | Start a new session under this ID (a lowercase UUID) instead of a generated one, for a launcher that records the ID before the session starts. Refused, before any model call, when a stored session already holds the ID; resume that one with `--resume <uuid>`.                                          |
 | `--export <session>`                    | Export a session file to HTML and exit.                                                                                                                                                                                                                                                                       |
 | `--no-title`                            | Disable title auto-generation (equivalent to the `PI_NO_TITLE` [environment variable](./environment-variables.md)).                                                                                                                                                                                           |
 
 `--continue`, `--resume`, `--restore`, `--fork`, and foreign-session imports require
 persistence and cannot use `--no-session`. `--from-claude` and `--from-codex`
 are mutually exclusive and cannot be combined with `--continue`, `--resume`,
-or `--fork`.
+or `--fork`. `--session-id` starts a new session, so it cannot be combined with
+any of these, nor with `--no-session` or `--mode acp`.
 
 #### Model selection
 
@@ -332,8 +334,70 @@ CMake build trees in the new worktree so their absolute paths name the new
 checkout. Tracked files inside excluded directories are restored from Git;
 when keeping changes, their live source contents and staged state are preserved.
 
+A clone carries only what the source tracks or ignores. A path the source
+neither tracks nor ignores is uncommitted work, carried only when keeping the
+source's changes. A directory below the root that holds a `.git` entry is
+another checkout (a submodule, a linked worktree, a cloned dependency) and is
+never carried, even inside an ignored directory: a submodule's directory is
+left empty, as `git worktree add` leaves it. A destination inside the source is
+not copied into itself. When keeping changes, the untracked files git reports
+below a directory holding a `.git` it treats as ordinary content (a tracked
+directory someone ran `git init` in, or a `.git` naming nothing) are carried;
+the `.git` itself is not.
+
 Clean clones also discard carried files that are untracked under the target
-commit's own ignore rules, after its tree and index have been written. Caches
-ignored by the target remain, even if the source did not ignore them. Nested
-repositories are preserved and symlinks are not followed. This target-ignore
+commit's own ignore rules, after its tree and index have been written; caches
+the target ignores remain. Symlinks are not followed. This target-ignore
 cleanup is skipped when keeping the source's uncommitted changes.
+
+`omp worktree add --lock [--reason <reason>]` locks the new worktree as
+`git worktree add --lock` does, so `git worktree prune` keeps its registration
+while the tree is out of reach. `worktree.lockReason` locks every worktree a
+`git worktree add` in bash creates through the clone rewrite with that reason,
+for setups whose `git` wrapper locks every add, since the rewrite runs omp in
+place of `git`; a command's own `--lock` keeps its own reason.
+
+A worktree add that fails removes its tree and its registration, as
+`git worktree add` does. While an add runs, its registration is locked
+(`locked initializing`, the lock git's own add holds), so `git worktree prune`
+and `omp worktree clear` leave it alone. An add killed or terminated midway
+leaves that locked registration and its partial tree. On Linux, where the
+filesystem keeps user extended attributes, another add of the same path then
+empties that tree (the directory stays) and removes the registration first, and
+says so, when it can tell both are still the stopped add's: nobody changed or
+removed its lock; its `HEAD` is still what the add wrote (or the add died before
+writing it) and has no reflog; the registration holds no refs of the worktree's
+own (`refs/worktree/*`, `refs/bisect/*`); the directory is the one the add made
+(same device and inode, and the random token the add set on it as an extended
+attribute); the tree holds no repository (no `.git` but the add's own gitfile at
+its root, and no bare repository, a directory holding `HEAD`, `objects` and
+`refs`, the root included, unless the commit the add checked out tracks that
+`HEAD`, as with a test fixture); and nothing is mounted in it (no entry in it is
+the root of a mount or on another mount than the tree's root, and no directory
+in it is on another device; a filesystem that gives its subvolumes devices of
+their own, such as btrfs, counts a subvolume as mounted). The mount ids come
+from `statx` (Linux 5.8 and later) or `/proc/self/fdinfo`; on a system that
+gives neither, or where reading them fails, that add refuses and names the
+cause. Before Linux 5.8, where `statx` gives no mount id, each entry's is read
+from `/proc/self/fdinfo`, a file's through an `O_PATH` descriptor, so a mounted
+file is refused too. A mount made while the tree is being emptied, or an entry
+the system will not remove (an NFS client's `.nfs…` name for a deleted file
+still open, an `EBUSY` from a FUSE daemon or an SMB server), stops the emptying
+there: the message names the entry and the error and says what the emptying did
+there (nothing, or a directory emptied and not removed, or one still holding
+entries it did not remove, or one a filesystem was mounted on after it was
+opened), what the emptying reached before it is gone, and the registration
+stays. Symlinks in the tree are removed, never followed. A tree more than 256
+directories deep is refused. Everything else the registration and the tree hold
+goes with them: any file written into the tree after the add stopped, anything
+staged there, and a merge or cherry-pick begun there. With
+`core.logAllRefUpdates=false`, a commit made there and left by a checkout back
+to the add's commit leaves no trace in `HEAD` and goes too. The token stays on
+the emptied directory. A directory made again in its place with `mkdir` never
+carries the token, even with the same inode; a copy that keeps extended
+attributes (`cp -a`, `tar --xattrs`) does. Otherwise that add refuses and names
+the registration, as git refuses a registered path; adds of other paths never
+touch it. Without user extended attributes (off Linux, or on a filesystem
+without them) the stopped add's tree is never emptied by a later add. On a
+filesystem that cannot lock files, an add goes on without its add-in-progress
+marker, and a killed one is never emptied by a later add.

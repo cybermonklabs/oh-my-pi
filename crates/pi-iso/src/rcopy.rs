@@ -29,7 +29,8 @@ use std::{
 use async_trait::async_trait;
 
 use crate::{
-	BackendKind, IsoError, IsoResult, IsolationBackend, ProbeResult, command_failed,
+	BackendKind, CloneExclusions, IsoError, IsoResult, IsolationBackend, ProbeResult,
+	command_failed,
 	tree::{self, TreeCopy},
 };
 
@@ -385,7 +386,7 @@ fn copy_path(src: &Path, dst: &Path) -> IsoResult<()> {
 	} else if meta.file_type().is_dir() {
 		std::fs::create_dir_all(dst)
 			.map_err(|err| IsoError::other(format!("create {}: {err}", dst.display())))?;
-		tree::copy_dir_contents(src, dst, &[], &Rcopy)?;
+		tree::copy_dir_contents(src, dst, &CloneExclusions::default(), &Rcopy)?;
 		Rcopy.finish_dir(src, dst)
 	} else {
 		Rcopy.file(src, dst, meta.file_type())
@@ -399,7 +400,7 @@ fn copy_path(src: &Path, dst: &Path) -> IsoResult<()> {
 fn recursive_copy(lower: &Path, merged: &Path) -> IsoResult<()> {
 	std::fs::create_dir_all(merged)
 		.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-	tree::copy_dir_contents(lower, merged, &[], &Rcopy)
+	tree::copy_dir_contents(lower, merged, &CloneExclusions::default(), &Rcopy).map(drop)
 }
 
 struct Rcopy;
@@ -561,14 +562,15 @@ mod tests {
 		}
 	}
 
-	/// An executable stub standing in for `git`.
+	/// An executable stub standing in for `git`, which runs `script`.
+	///
+	/// A child writes it ([`crate::testprog`]): written here, a fork by
+	/// another test's thread could keep it open for writing, and running it
+	/// would fail with `ETXTBSY`.
 	#[cfg(unix)]
 	fn stub(root: &TempDirGuard, script: &str) -> PathBuf {
-		use std::os::unix::fs::PermissionsExt as _;
-
 		let path = root.path().join("git");
-		fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write stub git");
-		fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("make stub executable");
+		crate::testprog::write(&path, &format!("#!/bin/sh\n{script}\n"));
 		path
 	}
 

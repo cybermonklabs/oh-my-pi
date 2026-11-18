@@ -13,6 +13,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins";
 import { MarketplaceManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
 import type { AgentSession, AsyncJobTree } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionDisposeOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import type { SessionDumpArchive } from "@oh-my-pi/pi-coding-agent/session/session-dump-format";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
@@ -59,7 +60,7 @@ interface FakeAcpBuiltinSession {
 	markMovedFromEmptySessionFile(sessionFile: string): void;
 	fork(): Promise<boolean>;
 	handoff(instr?: string): Promise<{ document: string; savedPath?: string } | undefined>;
-	dispose(): Promise<void>;
+	dispose(options?: AgentSessionDisposeOptions): Promise<void>;
 	exportToHtml(outputPath?: string): Promise<string>;
 	effectiveExtensionRoots: unknown;
 	setTitleSystemPrompt(prompt: string | undefined): void;
@@ -1142,6 +1143,32 @@ describe("wave 3 commands", () => {
 		}
 	});
 
+	it("/move: refreshes skills only through the plugin reload, so reload handlers run once", async () => {
+		const { runtime, session } = createRuntime();
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-reload-once-"));
+		const originalProjectDir = process.cwd();
+		// Every headless reloadPlugins() implementation refreshes skills, and a
+		// skill refresh emits resources_discover (reason "reload"). A second
+		// refresh from /move itself ran each reload handler twice (PR #9379 review).
+		const sessionWithRefresh = session as typeof session & { refreshSkills: () => Promise<void> };
+		sessionWithRefresh.refreshSkills = async () => {};
+		const refreshSkills = spyOn(sessionWithRefresh, "refreshSkills");
+		const refreshSkillsAndCommands = spyOn(session, "refreshSkillsAndCommands");
+		const reloadPlugins = spyOn(runtime, "reloadPlugins");
+
+		try {
+			const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(reloadPlugins).toHaveBeenCalledTimes(1);
+			expect(refreshSkills).not.toHaveBeenCalled();
+			expect(refreshSkillsAndCommands).not.toHaveBeenCalled();
+		} finally {
+			setProjectDir(originalProjectDir);
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
 	// /wt
 	it("/wt: refuses outside a git checkout", async () => {
 		const { output, runtime, fakeSessionManager } = createRuntime();
@@ -1703,7 +1730,10 @@ describe("wave 5 — adapters and polish", () => {
 });
 
 describe("/move preflight flush", () => {
-	it("disposes the session when headless workspace rollback cannot recover", async () => {
+	it("disposes the session with a stop of its jobs when headless workspace rollback cannot recover", async () => {
+		// If this regresses, the failed move's end of the session cuts off its jobs and those of the idle subagents its
+		// end releases, as a process exit does, though the process goes on: their subagents record a process exit that
+		// did not happen, and `omp --restore` relaunches their turns.
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acp-move-fatal-"));
 		const originalProjectDir = getProjectDir();
 		const { output, runtime, session } = createRuntime();
@@ -1716,6 +1746,7 @@ describe("/move preflight flush", () => {
 
 			expect(result).toEqual({ consumed: true });
 			expect(dispose).toHaveBeenCalledTimes(1);
+			expect(dispose).toHaveBeenCalledWith({ ownedJobsEnd: "stop" });
 			expect(output.some(text => text.includes("failed to re-align workspace"))).toBe(true);
 		} finally {
 			reloadForCwd.mockRestore();

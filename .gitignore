@@ -11,6 +11,8 @@ target/
 .xwin-cache/
 *.tsbuildinfo
 *.node
+# A native build's record of the Rust sources it compiled (packages/natives/native/workspace-sources.js)
+*.node.sources.json
 *.b64.js
 /result
 /result-*

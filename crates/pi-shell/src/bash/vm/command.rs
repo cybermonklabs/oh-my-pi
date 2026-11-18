@@ -598,9 +598,9 @@ fn plain_statement(
 	};
 	let written = match &res {
 		Ok(outcome) if matches!(outcome.control, Control::None) => write_now(k, vp, &chunks),
-		_ => Err((0, 0)),
+		_ => Err((0, 0, super::proc::HandedOff::default())),
 	};
-	if let (Ok(outcome), Ok(())) = (&res, written) {
+	if let (Ok(outcome), Ok(())) = (&res, &written) {
 		state::drop_scope(&mut k.root, cx.store, vp);
 		vp.status = outcome.status;
 		vp.pipestatus.clear();
@@ -622,11 +622,12 @@ fn plain_statement(
 			if let Some(flow) = settle_builtin(k, vp, cx, line, id, sc, outcome, chunks, false) {
 				return Some(flow);
 			}
-			if let Err((done, off)) = written {
+			if let Err((done, off, handed)) = written {
 				let writes = &mut st(vp).writes;
 				writes.drain(..done);
 				if let Some(w) = writes.front_mut() {
 					w.off = off;
+					w.handed = handed;
 				}
 			}
 		},
@@ -660,13 +661,21 @@ fn seeded_exec(
 	e
 }
 
-/// Write a fast-path builtin's output now. `Err((n, off))`: the first `n`
-/// chunks and `off` bytes of the next went out, the rest is for the
-/// staged output, which also takes all of it (`Err((0, 0))`) when it has a
-/// diagnostic to render or the shell has output queued before it.
-fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usize)> {
+/// Write a fast-path builtin's output now. `Err((n, off, handed))`: the
+/// first `n` chunks and `off` bytes of the next went out, the rest is for
+/// the staged output, which also takes all of it (`Err((0, 0, _))`) when it
+/// has a diagnostic to render or the shell has output queued before it.
+/// Only bytes that are out of the shell count: a chunk a writer thread took
+/// ([`crate::bash::File::poll_write_marked`]) is out once it settles, so
+/// the fast path stops there and the staged output settles it (`handed`),
+/// which makes its error the builtin's and keeps the next command after it.
+fn write_now(
+	k: &Kernel,
+	vp: &Vproc,
+	chunks: &[Chunk],
+) -> Result<(), (usize, usize, super::proc::HandedOff)> {
 	if !vp.out.is_empty() || chunks.iter().any(|c| !matches!(c, Chunk::Out(..))) {
-		return Err((0, 0));
+		return Err((0, 0, super::proc::HandedOff::default()));
 	}
 	let mut tcx = Context::from_waker(&k.waker);
 	for (i, c) in chunks.iter().enumerate() {
@@ -676,11 +685,15 @@ fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usi
 		let handle = vp.fds.handle(*fd);
 		let mut off = 0;
 		while off < bytes.len() {
-			match handle.poll_write(&mut tcx, &bytes[off..]) {
-				Poll::Ready(Ok(n)) if n > 0 => off += n,
+			match handle.poll_write_marked(&mut tcx, &bytes[off..]) {
+				Poll::Ready(Ok((n, None))) if n > 0 => off += n,
+				Poll::Ready(Ok((n, Some(mark)))) if n > 0 => {
+					let handed = super::proc::HandedOff { file: Some(handle), mark: Some(mark) };
+					return Err((i, off + n, handed));
+				},
 				// Blocked, failed or refused: the staged output waits or
 				// reports it.
-				_ => return Err((i, off)),
+				_ => return Err((i, off, super::proc::HandedOff::default())),
 			}
 		}
 	}
@@ -1180,8 +1193,7 @@ fn cat_stdin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Opti
 		Ok(_) => BString::default(),
 	};
 	let s = st(vp);
-	s.writes
-		.push_back(PendingWrite { fd: 1, bytes: text, off: 0 });
+	s.writes.push_back(PendingWrite::new(1, text));
 	s.stage = Stage::Output;
 	None
 }
@@ -1933,11 +1945,10 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 						let msg = format!("-{}: invalid option", argv[0][1] as char).into();
 						let line = line_of(vp, op.node);
 						k.diag(cx, vp, line, Diag::Usage { msg }.by("builtin"));
-						vp.out.push_back(PendingWrite {
-							fd:    2,
-							bytes: BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
-							off:   0,
-						});
+						vp.out.push_back(PendingWrite::new(
+							2,
+							BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
+						));
 						let s = st(vp);
 						s.status = 2;
 						s.stage = Stage::Finish;
@@ -2222,6 +2233,22 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				Ok(ProbeResult::Stat(Some(st))) => st.kind == StatKind::Dir,
 				Ok(_) => false,
 			};
+			// A tool that reports what it cannot run (`timeout`, `nohup`) hears
+			// of it as `execvp` would fail: `ENOENT`, or `EACCES` for a
+			// directory, with no diagnostic.
+			#[cfg(unix)]
+			if refusals_to_host(vp) {
+				let errno = if dir { libc::EACCES } else { libc::ENOENT };
+				if let Some(run) = vp.runs.front() {
+					k.exec_refusals
+						.insert(run.id, super::ExecRefusal { errno, too_long: false });
+				}
+				let s = st(vp);
+				s.status = if dir { 126 } else { 127 };
+				s.stage = Stage::Output;
+				exec_failed(k, cx, vp);
+				return None;
+			}
 			let (msg, status) = if dir {
 				(format!("{name}: cannot execute: Is a directory"), 126)
 			} else {
@@ -2270,6 +2297,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				let s = st(vp);
 				(s.argv.clone(), s.tag)
 			};
+			let too_long_to_caller = vp.runs.front().is_some_and(|run| run.too_long_to_host);
 			let call = ToolCall {
 				tool,
 				argv,
@@ -2280,6 +2308,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				extra_fds: extra_fds(vp),
 				env,
 				umask,
+				too_long_to_caller,
 			};
 			k.emit_op(cx, vp, op.node, EventData::Call { id, argv: &call.argv });
 			k.calls_out.push_back((id, call));
@@ -2558,6 +2587,23 @@ fn spawned_external(
 			s.stage = Stage::Await;
 			k.emit_op(cx, vp, op.node, EventData::Spawn { pid, argv });
 		},
+		Err(err) if let Some(too_long) = refusal_to_host(vp, &err, &path, argv) => {
+			// The host reports it (`xargs` retries a line too long with fewer
+			// arguments, and reports any other refusal as GNU's does): no
+			// diagnostic, and the `exec` fails as a refused one does.
+			if let (Some(errno), Some(run)) = (err.raw_os_error(), vp.runs.front()) {
+				k.exec_refusals
+					.insert(run.id, super::ExecRefusal { errno, too_long });
+			}
+			let s = st(vp);
+			s.status = if err.kind() == std::io::ErrorKind::NotFound {
+				127
+			} else {
+				126
+			};
+			s.stage = Stage::Output;
+			exec_failed(k, cx, vp);
+		},
 		Err(err)
 			if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
 				&& !interp
@@ -2611,6 +2657,142 @@ fn spawned_external(
 		},
 	}
 	None
+}
+
+/// Whether the host hears of the refusal `err` instead of the user, and if
+/// so whether the line is too long: only for an `exec` replacing a run
+/// submitted with
+/// [`Script::too_long_to_host`](crate::bash::Script::too_long_to_host), the
+/// `exec` a callout generated for a program, when the line is too long
+/// ([`refused_as_too_long`]), or for any refusal but `ENOEXEC` with
+/// [`Script::refusals_to_host`](crate::bash::Script::refusals_to_host).
+/// Nothing else runs in that vproc: a file it cannot `exec` (`ENOEXEC`)
+/// runs in a new shell, which has no run.
+fn refusal_to_host(
+	vp: &mut Vproc,
+	err: &std::io::Error,
+	path: &[u8],
+	argv: &[BString],
+) -> Option<bool> {
+	if !matches!(st(vp).control, Some(Transfer::Exec)) {
+		return None;
+	}
+	vp.runs.front().filter(|run| run.too_long_to_host)?;
+	if refused_as_too_long(err, path, argv, &vp.cwd) {
+		return Some(true);
+	}
+	let refused =
+		refusals_to_host(vp) && err.raw_os_error().is_some() && !is_enoexec(err) && cfg!(unix);
+	refused.then_some(false)
+}
+
+/// Whether the run `vp`'s `exec` replaces was submitted with
+/// [`Script::refusals_to_host`](crate::bash::Script::refusals_to_host)
+/// (and [`Script::too_long_to_host`](crate::bash::Script::too_long_to_host)),
+/// for the `exec` itself: its host hears of any refusal of it, and of an
+/// `exec` that found nothing.
+fn refusals_to_host(vp: &mut Vproc) -> bool {
+	matches!(st(vp).control, Some(Transfer::Exec))
+		&& vp
+			.runs
+			.front()
+			.is_some_and(|run| run.too_long_to_host && run.refusals_to_host)
+}
+
+/// Whether `err`, the failure to start the program at `path` with the
+/// arguments `argv` in the working directory `cwd`, is the system refusing
+/// the command line as too long: `E2BIG`, or `ENAMETOOLONG` as GKE Sandbox
+/// (gVisor) says it, but that only when nothing else can have caused it:
+/// - The arguments take more than POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`,
+///   4,096 bytes), which no system refuses: a short line's `ENAMETOOLONG` is a
+///   path's.
+/// - The program's path and the directory are each shorter than `PATH_MAX`,
+///   with no name in them longer than `NAME_MAX` (a working directory past
+///   `PATH_MAX` refuses every command alike).
+/// - The program is no `#!` script whose interpreter the system cannot reach by
+///   its path ([`interpreter_path_too_long`]), whatever the line's size, as
+///   GNU's xargs never splits it.
+///
+/// The same rule as `pi_builtins`' `command_line_too_long`, which decides
+/// whether `xargs` and `find` retry, so a refusal reaches them only when
+/// they act on it; any other keeps the shell's diagnostic.
+#[cfg(unix)]
+fn refused_as_too_long(err: &std::io::Error, path: &[u8], argv: &[BString], cwd: &[u8]) -> bool {
+	/// POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`).
+	const POSIX_ARG_MAX: usize = 4096;
+	match err.raw_os_error() {
+		Some(libc::E2BIG) => true,
+		Some(libc::ENAMETOOLONG) => {
+			let line: usize = argv.iter().map(|arg| arg.len() + 1).sum();
+			line > POSIX_ARG_MAX
+				&& fits_as_path(path)
+				&& fits_as_path(cwd)
+				&& !interpreter_path_too_long(&super::probe::absolute(cwd, path), cwd)
+		},
+		_ => false,
+	}
+}
+
+/// Whether the program at `path` (a host path: the one the system refused)
+/// is a `#!` script whose interpreter the system cannot reach by its path:
+/// the interpreter its first line names (read as the kernel reads it, from
+/// the file's first 256 bytes; relative to `cwd` when relative) is past
+/// `PATH_MAX` or holds a name past `NAME_MAX`, or looking it up fails with
+/// `ENAMETOOLONG` (a symlink on its way names one). The read is bounded and
+/// only made for an `ENAMETOOLONG` of a long line, the one refusal it
+/// decides. The same check as `pi_builtins`' `interpreter_path_too_long`.
+#[cfg(unix)]
+fn interpreter_path_too_long(path: &[u8], cwd: &[u8]) -> bool {
+	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
+	let Ok(file) = std::fs::File::open(std::ffi::OsStr::from_bytes(path)) else {
+		return false;
+	};
+	let mut head = Vec::with_capacity(256);
+	if file.take(256).read_to_end(&mut head).is_err() {
+		return false;
+	}
+	let Some(line) = head.strip_prefix(b"#!") else {
+		return false;
+	};
+	let line = &line[line
+		.iter()
+		.take_while(|&&c| c == b' ' || c == b'\t')
+		.count()..];
+	let end = line
+		.iter()
+		.position(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\0'))
+		.unwrap_or(line.len());
+	let interpreter = super::probe::absolute(cwd, &line[..end]);
+	if line[..end].is_empty() {
+		return false;
+	}
+	!fits_as_path(&interpreter)
+		|| std::fs::metadata(std::ffi::OsStr::from_bytes(&interpreter))
+			.is_err_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG))
+}
+
+/// Whether the system takes `path` as a name: shorter than `PATH_MAX`, with
+/// no name in it longer than `NAME_MAX` (255 on Linux and macOS).
+#[cfg(unix)]
+fn fits_as_path(path: &[u8]) -> bool {
+	const NAME_MAX: usize = 255;
+	path.len() < crate::sys::PATH_MAX
+		&& path
+			.split(|&b| b == b'/')
+			.all(|name| name.len() <= NAME_MAX)
+}
+
+/// Elsewhere no utility splits a command line, so every refused start keeps
+/// the shell's diagnostic and status (Windows' `ERROR_FILENAME_EXCED_RANGE`
+/// also stands for invalid names).
+#[cfg(not(unix))]
+const fn refused_as_too_long(
+	_err: &std::io::Error,
+	_path: &[u8],
+	_argv: &[BString],
+	_cwd: &[u8],
+) -> bool {
+	false
 }
 
 /// The failure of a prefix assignment to `UID`, `EUID`, `GID` or `EGID`
@@ -2799,7 +2981,7 @@ fn zsh_funcnest(
 		utf8:   false,
 	});
 	vp.out
-		.push_back(super::proc::PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+		.push_back(super::proc::PendingWrite::new(2, bytes.into()));
 	vp.status = 1;
 	Some(Flow::Discard(1))
 }
@@ -3020,8 +3202,7 @@ fn parse_autoload(
 					let site = crate::bash::diag::ZshSite { prefix: name, line, utf8: false };
 					bytes.extend_from_slice(&crate::bash::diag::render_zsh(&diag, site));
 				}
-				vp.out
-					.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+				vp.out.push_back(PendingWrite::new(2, bytes.into()));
 				return Err(());
 			},
 		}
@@ -3991,18 +4172,15 @@ fn settle_builtin(
 		}
 	}
 	for c in chunks {
-		let (fd, bytes) = match c {
-			Chunk::Out(fd, b) => (fd, b),
+		let write = match c {
+			Chunk::Out(fd, b) => PendingWrite::new(fd, b.into()),
 			Chunk::Diag(d) => {
 				super::zle::display::trash_for_message(k, cx, vp);
-				(2, k.render_diag(cx, vp, line, &d))
+				PendingWrite::new(2, k.render_diag(cx, vp, line, &d).into())
 			},
+			Chunk::Cont(id) => PendingWrite::then_continue(id),
 		};
-		sc.exec
-			.as_mut()
-			.expect("exec")
-			.writes
-			.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+		sc.exec.as_mut().expect("exec").writes.push_back(write);
 	}
 	let e = sc.exec.as_mut().expect("exec");
 	e.status = outcome.status;
@@ -4153,10 +4331,8 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 		let text = k.render_diag(cx, vp, line, &Diag::Usage { msg: msg.into() }.by("exec"));
 		let s = st(vp);
 		s.argv = argv;
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: USAGE.into(), off: 0 });
+		s.writes.push_back(PendingWrite::new(2, text.into()));
+		s.writes.push_back(PendingWrite::new(2, USAGE.into()));
 		s.status = 2;
 		s.stage = Stage::Output;
 		return None;
@@ -4464,6 +4640,25 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				k.diag(cx, vp, line, Diag::Tool { tool, msg });
 				1
 			},
+			Some(CallOutcome::TooLong(code)) => {
+				let asked = vp
+					.runs
+					.front()
+					.filter(|run| run.too_long_to_host)
+					.map(|run| run.id);
+				if let Some(run) = asked {
+					// The host hears of it, as of a refused `exec` of the run.
+					k.exec_refusals
+						.insert(run, super::ExecRefusal { errno: code, too_long: true });
+				} else {
+					// Nobody asked: the error is the tool's, as a refused start.
+					let tool = st(vp).argv[0].clone();
+					let err = std::io::Error::from_raw_os_error(code);
+					let msg = BString::from(crate::bash::diag::strerror(&err).as_ref());
+					k.diag(cx, vp, line, Diag::Tool { tool, msg });
+				}
+				126
+			},
 			None => return Some(Flow::Block(WaitKey::Call(id))),
 		},
 		Some(Awaited::Task(native)) => {
@@ -4580,59 +4775,66 @@ fn waited_into(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, pid: 
 	}
 }
 
-/// Write the command's own output in order (pollable).
+/// Write the command's own output in order (pollable). A write is done once
+/// its bytes are handed off and the object that took them has settled its
+/// own chunks ([`crate::bash::File::poll_settle_marked`], the entry's
+/// [`HandedOff`](super::proc::HandedOff)): a host file's writer thread takes
+/// a chunk at once and writes it later, so the settle is where that write
+/// fails, and its error, and only its, is this command's, as a write error
+/// is. The chunk handed off last settles before the next one goes (the
+/// thread is idle for that hand-off anyway), so a command stops at its first
+/// failed chunk, as bash stops at its first failed `write(2)`.
 fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
 	// Most commands queued nothing: no waker (two atomic ops) for them.
 	st(vp).writes.front()?;
 	let waker = k.waker.clone();
 	let mut tcx = Context::from_waker(&waker);
 	loop {
-		let state = st(vp);
-		let pending = state.writes.front()?;
-		if pending.off >= pending.bytes.len() {
-			state.writes.pop_front();
-			continue;
-		}
-		let fd = pending.fd;
+		let fd = st(vp).writes.front()?.fd;
 		let handle = vp.fds.handle(fd);
-		let state = st(vp);
-		let pending = state.writes.front_mut().expect("checked");
-		match handle.poll_write(&mut tcx, &pending.bytes[pending.off..]) {
-			Poll::Ready(Ok(written)) if written > 0 => {
-				pending.off += written;
-				if pending.off >= pending.bytes.len() {
-					state.writes.pop_front();
+		let pending = st(vp).writes.front_mut().expect("checked");
+		let done = pending.off >= pending.bytes.len();
+		// The chunk handed off last is out before the next one goes; what
+		// another object took (the fd was restored in between) is out there
+		// before the rest goes to this one.
+		let settled = match &pending.handed.file {
+			Some(held) if done || !held.same(&handle) || pending.handed.mark.is_some() => {
+				match held.poll_settle_marked(&mut tcx, pending.handed.mark.as_slice()) {
+					Poll::Ready(result) => Some(result),
+					Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
 				}
 			},
+			_ => None,
+		};
+		match settled {
+			Some(Err(err)) => {
+				if let Some(flow) = write_failed(k, vp, cx, line, fd, err) {
+					return Some(flow);
+				}
+				continue;
+			},
+			Some(Ok(())) => pending.handed = super::proc::HandedOff::default(),
+			None => {},
+		}
+		if done {
+			// A job held back behind this output runs on now (bash `bg`).
+			if let Some(id) = st(vp).writes.pop_front().and_then(|w| w.cont) {
+				super::jobctl::continue_job(k, id);
+			}
+			continue;
+		}
+		match handle.poll_write_marked(&mut tcx, &pending.bytes[pending.off..]) {
+			Poll::Ready(Ok((written, mark))) if written > 0 => {
+				pending.off += written;
+				pending.handed.mark = mark;
+				pending.handed.file.get_or_insert(handle);
+			},
 			Poll::Ready(res) => {
-				state.writes.retain(|queued| queued.fd != fd);
-				if fd != 2 {
-					let err = res
-						.err()
-						.unwrap_or_else(|| std::io::ErrorKind::WriteZero.into());
-					if err.kind() == std::io::ErrorKind::BrokenPipe && !sigpipe_ignored(cx.store, vp) {
-						// The virtual SIGPIPE ends this shell silently, as it ends
-						// a bash pipeline child.
-						let platform = k.engine.config().platform;
-						return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
-					}
-					if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
-						zsh_write_error(k, vp, cx, line, fd, &err);
-						continue;
-					}
-					let state = st(vp);
-					// bash's `help` does not check its writes.
-					if state.target == Some(Target::Intrinsic(IntrinsicId::Help)) {
-						continue;
-					}
-					let cmd = Cow::Owned(String::from_utf8_lossy(&state.argv[0]).into_owned());
-					state.status = 1;
-					// Through the command's own fd 2 (`2>&1 >&4`), while its
-					// redirections are in place.
-					let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
-					st(vp)
-						.writes
-						.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+				let err = res
+					.err()
+					.unwrap_or_else(|| std::io::ErrorKind::WriteZero.into());
+				if let Some(flow) = write_failed(k, vp, cx, line, fd, err) {
+					return Some(flow);
 				}
 			},
 			Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
@@ -4679,10 +4881,51 @@ fn zsh_write_error(
 	}
 	for d in diags {
 		let bytes = k.render_diag(cx, vp, line, &d);
-		st(vp)
-			.writes
-			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+		st(vp).writes.push_back(PendingWrite::new(2, bytes.into()));
 	}
+}
+
+/// A write to `fd` failed: drop what is queued for it, and report the error
+/// as the command's (bash's `write error`, zsh's through
+/// [`zsh_write_error`]), or end the shell on `SIGPIPE`. A failed write to
+/// fd 2 is dropped without a report.
+fn write_failed(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	fd: i32,
+	err: std::io::Error,
+) -> Option<Flow> {
+	// A job held back behind the output still runs on once the rest is out.
+	st(vp)
+		.writes
+		.retain(|queued| queued.fd != fd || queued.cont.is_some());
+	if fd == 2 {
+		return None;
+	}
+	if err.kind() == std::io::ErrorKind::BrokenPipe && !sigpipe_ignored(cx.store, vp) {
+		// The virtual SIGPIPE ends this shell silently, as it ends
+		// a bash pipeline child.
+		let platform = k.engine.config().platform;
+		return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
+	}
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		zsh_write_error(k, vp, cx, line, fd, &err);
+		return None;
+	}
+	let state = st(vp);
+	// bash's `help` does not check its writes.
+	if state.target == Some(Target::Intrinsic(IntrinsicId::Help)) {
+		return None;
+	}
+	let cmd = Cow::Owned(String::from_utf8_lossy(&state.argv[0]).into_owned());
+	state.status = 1;
+	// Through the command's own fd 2 (`2>&1 >&4`), while its
+	// redirections are in place.
+	let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
+	st(vp).writes.push_back(PendingWrite::new(2, bytes.into()));
+	None
 }
 
 /// Whether `SIGPIPE` is ignored (`trap '' PIPE`), so a write to a pipe
@@ -4765,7 +5008,7 @@ fn print_exit_value(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32
 		&& on(k, cx, vp, ZshOpt::Shinstdin)
 	{
 		let bytes = BString::from(format!("zsh: exit {status}\n"));
-		vp.out.push_back(PendingWrite { fd: 2, bytes, off: 0 });
+		vp.out.push_back(PendingWrite::new(2, bytes));
 	}
 }
 
@@ -5205,21 +5448,7 @@ fn build_env(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Result<EnvView, StoreEr
 			));
 		}
 	}
-	let vars = pairs.len();
-	state::exported_funcs(cx.store, vp, &mut pairs)?;
-	for (name, source) in &mut pairs[vars..] {
-		let body = source
-			.strip_prefix(name.as_slice())
-			.and_then(|s| s.strip_prefix(b" () \n"))
-			.unwrap_or(source.as_slice());
-		let mut value = BString::from("() ");
-		value.extend_from_slice(body);
-		let mut key = BString::from("BASH_FUNC_");
-		key.extend_from_slice(name.as_slice());
-		key.extend_from_slice(b"%%");
-		*name = key;
-		*source = value;
-	}
+	exported_functions(cx.store, vp, &mut pairs)?;
 	// Prefix assignments of the current command shadow everything else.
 	if let Some(e) = vp
 		.frames
@@ -5235,6 +5464,31 @@ fn build_env(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Result<EnvView, StoreEr
 		}
 	}
 	Ok(EnvView::new(pairs))
+}
+
+/// Appends to `out` the functions `vp` exports, as the environment entries
+/// `BASH_FUNC_name%%=() body` that carry them to programs.
+pub(super) fn exported_functions(
+	store: &mut dyn crate::bash::store::StateStore,
+	vp: &Vproc,
+	out: &mut Vec<(BString, BString)>,
+) -> Result<(), StoreError> {
+	let first = out.len();
+	state::exported_funcs(store, vp, out)?;
+	for (name, source) in &mut out[first..] {
+		let body = source
+			.strip_prefix(name.as_slice())
+			.and_then(|s| s.strip_prefix(b" () \n"))
+			.unwrap_or(source.as_slice());
+		let mut value = BString::from("() ");
+		value.extend_from_slice(body);
+		let mut key = BString::from("BASH_FUNC_");
+		key.extend_from_slice(name.as_slice());
+		key.extend_from_slice(b"%%");
+		*name = key;
+		*source = value;
+	}
+	Ok(())
 }
 
 #[cfg(test)]
@@ -5259,5 +5513,86 @@ mod tests {
 		assert!(looks_binary(b"\x7fELF\x02\x01\x01\0\0"));
 		assert!(!looks_binary(b"echo hi\n\0binary after the first line"));
 		assert!(!looks_binary(b""));
+	}
+
+	/// `E2BIG` is always a command line too long; `ENAMETOOLONG` only for
+	/// arguments past `_POSIX_ARG_MAX` (4,096 bytes) when neither the
+	/// program's path nor the working directory is past `PATH_MAX` or holds
+	/// a name past `NAME_MAX`; any other error never is. The cases of
+	/// `pi_builtins`' twin (`command_line_too_long`), for resolved paths.
+	#[cfg(unix)]
+	#[test]
+	fn enametoolong_is_a_line_too_long_only_when_no_path_is() {
+		use bstr::BString;
+
+		use super::refused_as_too_long;
+		let e2big = std::io::Error::from_raw_os_error(libc::E2BIG);
+		let enametoolong = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+		let path_max = crate::sys::PATH_MAX;
+		let longest = format!("/{}", "d/".repeat((path_max - 2) / 2));
+		let longest = &longest[..path_max - 1];
+		let too_long = format!("{longest}d");
+		let name = "n".repeat(255);
+		// 4,097 bytes of arguments, and 4,096.
+		let long = [BString::from("prog"), BString::from("a".repeat(4091))];
+		let short = [BString::from("prog"), BString::from("a".repeat(4090))];
+		let fits = |path: &str, cwd: &str| {
+			refused_as_too_long(&enametoolong, path.as_bytes(), &long, cwd.as_bytes())
+		};
+		assert!(refused_as_too_long(&e2big, too_long.as_bytes(), &short[..1], too_long.as_bytes()));
+		assert!(fits("/usr/bin/printf", "/tmp"));
+		assert!(fits(&format!("/{name}"), &format!("/{name}")));
+		assert!(fits("/usr/bin/printf", longest));
+		assert!(!fits("/usr/bin/printf", &too_long), "a working directory past PATH_MAX");
+		assert!(!fits(&too_long, "/tmp"), "a program path past PATH_MAX");
+		assert!(!fits("/usr/bin/printf", &format!("/{name}n")), "a directory name past NAME_MAX");
+		assert!(!fits(&format!("/{name}n"), "/tmp"), "a program name past NAME_MAX");
+		assert!(
+			!refused_as_too_long(&enametoolong, b"/usr/bin/printf", &short, b"/tmp"),
+			"a line no system refuses: a path's error"
+		);
+		let other = std::io::Error::from_raw_os_error(libc::ENOMEM);
+		assert!(!refused_as_too_long(&other, b"/usr/bin/printf", &long, b"/tmp"));
+	}
+
+	/// The `#!` rule of `pi_builtins`' twin: an `ENAMETOOLONG` of a long line
+	/// whose program is a script with an interpreter the system cannot reach
+	/// by its path (a symlink to a name past `NAME_MAX`) is the
+	/// interpreter's; a reachable interpreter, or no `#!`, keeps the line's.
+	#[cfg(unix)]
+	#[test]
+	fn enametoolong_of_a_shebang_interpreter_is_no_line_too_long() {
+		use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
+
+		use bstr::BString;
+
+		use super::refused_as_too_long;
+		let dir = tempfile::tempdir().unwrap();
+		let at = |name: &str| dir.path().join(name);
+		std::os::unix::fs::symlink(at(&"0".repeat(256)), at("ll")).unwrap();
+		for (name, text) in [
+			("s", format!("#!{}\n", at("ll").display())),
+			("relative", "#!ll\n".to_owned()),
+			("sh", "#!/bin/sh\n".to_owned()),
+			("plain", "echo hi\n".to_owned()),
+		] {
+			std::fs::write(at(name), text).unwrap();
+			std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		let enametoolong = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+		let long = [BString::from("prog"), BString::from("a".repeat(5000))];
+		let cwd = dir.path().as_os_str().as_bytes();
+		let too_long = |name: &str| {
+			refused_as_too_long(&enametoolong, at(name).as_os_str().as_bytes(), &long, cwd)
+		};
+		assert!(!too_long("s"), "the interpreter's path is the error");
+		assert!(!too_long("relative"), "a relative interpreter is looked up from the directory");
+		for name in ["sh", "plain", "missing"] {
+			assert!(too_long(name), "{name}: the line's");
+		}
+		assert!(
+			!refused_as_too_long(&enametoolong, b"./s", &long, cwd),
+			"a relative program runs from the directory"
+		);
 	}
 }

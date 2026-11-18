@@ -93,6 +93,19 @@ export const cfgWorktreeClone = register({
 	},
 });
 
+export const cfgWorktreeLockReason = register({
+	id: "worktree.lockReason",
+	type: "string",
+	default: undefined,
+	ui: {
+		tab: "tasks",
+		group: "Isolation",
+		label: "Lock Worktrees Added in Bash",
+		description:
+			"Lock each worktree a `git worktree add` in bash creates through the clone rewrite, with this reason, as `git worktree add --lock --reason` does, so `git worktree prune` keeps its registration while the tree is out of reach. A command's own `--lock` keeps its own reason. Unset leaves them unlocked",
+	},
+});
+
 export const cfgWorktreeCleanSource = register({
 	id: "worktree.cleanSource",
 	protocolDefault: ["rpc", "acp"],
@@ -519,7 +532,7 @@ export const cfgTaskCompletionProbe = register({
 		group: "Subagents",
 		label: "Subagent Completion Probe",
 		description:
-			"Ask a working subagent, through a cached side request like /btw, to estimate how complete its task is: after 2, 5, 10 and 30 more minutes, then hourly. The estimate shows next to the subagent in wait and task views. Only subagents spawned by the main agent of an interactive session are asked; print, RPC, ACP and SDK runs never probe.",
+			"Ask a working subagent, through a cached side request like /btw, to estimate how complete its task is: after 2, 5, 10 and 30 more minutes, then hourly. A probe goes out only while the subagent's prompt cache can answer it: at least 95% of the probe's prompt is in the cache, the request shape (tools, thinking level) is unchanged, and the entry has more than 30 seconds of its lifetime left; never when no lifetime is known (a model with no `promptCache` whose provider names none). The estimate shows next to the subagent in wait and task views. Only subagents spawned by the main agent of an interactive session are asked; print, RPC, ACP and SDK runs never probe.",
 	},
 });
 

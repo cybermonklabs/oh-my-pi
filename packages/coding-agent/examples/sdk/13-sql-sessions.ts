@@ -1,8 +1,9 @@
 /**
  * SQL-Backed Sessions (PostgreSQL / MySQL / SQLite)
  *
- * Store session JSONL in a SQL database via `bun:sql`. One table, one row
- * per session file — works against PostgreSQL, MySQL/MariaDB, and SQLite
+ * Store session JSONL in a SQL database via `bun:sql`. One row per session
+ * file plus a `<table>_parts` table holding its content, so an append writes
+ * only the new entry — works against PostgreSQL, MySQL/MariaDB, and SQLite
  * with the dialect picked automatically from the connection URL.
  *
  * Useful when:
@@ -13,9 +14,9 @@
  * - you want a single durable file at rest (SQLite) without coding directly
  *   against `bun:sqlite`.
  *
- * Tool artifacts and image blobs are out of scope: `ArtifactManager` /
- * `BlobStore` keep writing to `~/.omp/agent/...`. Reach for object storage
- * if you need those off-host too.
+ * Tool artifacts stay out of scope: `ArtifactManager` keeps writing to
+ * `~/.omp/agent/...`. Image blobs a session references also go to
+ * `<table>_blobs`, so a session resumed on another host gets them back.
  */
 
 import { createAgentSession, SessionManager, SqlSessionStorage } from "@oh-my-pi/pi-coding-agent";
@@ -29,12 +30,13 @@ import { SQL } from "bun";
 //   sqlite::memory:                                // ephemeral
 const client = new SQL(process.env.SESSIONS_DB_URL ?? "sqlite::memory:");
 
-// `create()` runs `CREATE TABLE IF NOT EXISTS` (with the right DDL for the
-// dialect) and warms the in-memory mirror with every existing row.
+// `create()` creates the session, parts and blob tables (with the right DDL for the dialect),
+// migrates a table an older Oh My Pi created, and warms the in-memory mirror
+// with every existing row.
 const storage = await SqlSessionStorage.create({
 	client,
-	table: "omp_session_files", // optional, this is the default
-	// createTable: false,       // set if migrations are owned elsewhere
+	table: "omp_session_files", // optional, this is the default; parts go to `omp_session_files_parts`, images to `omp_session_files_blobs`
+	// createTable: false,       // set if migrations are owned elsewhere; DDL in docs/session.md
 });
 
 const sessionDir = "/sessions/my-project";

@@ -415,6 +415,27 @@ where
 	AsyncTask::new(Blocking { tag, cancel_token: cancel_token.into(), work: Some(Box::new(work)) })
 }
 
+/// Settle a filesystem walk's Promise. `result` is `None` when the deadline
+/// beat the walk; the walk is cancelled by then, so a provider cannot hold the
+/// Promise up.
+///
+/// Only an explicit abort rejects a walk that finished. An elapsed deadline
+/// alone does not: settlement runs on the JS thread, which can be busy long
+/// after the walk finished inside its budget.
+fn settle_walk<T>(
+	token: &CancelToken,
+	result: Option<Result<T>>,
+	cancelled: impl FnOnce(AbortReason) -> Error,
+) -> Result<T> {
+	if let Some(reason) = token.abort_reason() {
+		return Err(match reason {
+			AbortReason::Timeout => Error::from_reason("Aborted: Timeout"),
+			reason => cancelled(reason),
+		});
+	}
+	result.unwrap_or_else(|| Err(Error::from_reason("Aborted: Timeout")))
+}
+
 /// Run synchronous filesystem work without occupying libuv's pool.
 ///
 /// Provider callbacks may need that pool for async I/O; cancellation interrupts
@@ -433,17 +454,7 @@ where
 	let settlement_token = cancel_token.clone();
 	let promise = env.spawn_future_with_callback(
 		async move { Ok(run_filesystem_worker(tag, cancel_token, fs, work).await) },
-		move |env, result| {
-			if let Some(reason) = settlement_token.abort_reason() {
-				return Err(match reason {
-					AbortReason::Timeout => Error::from_reason("Aborted: Timeout"),
-					_ => abort_error(*env, reason),
-				});
-			}
-			// An elapsed deadline has no explicit abort flag. The worker was
-			// already cancelled, so the provider cannot hold up this Promise.
-			result.unwrap_or_else(|| Err(Error::from_reason("Aborted: Timeout")))
-		},
+		move |env, result| settle_walk(&settlement_token, result, |reason| abort_error(*env, reason)),
 	)?;
 	// `Settled` only adds settlement reporting; the Promise still resolves to
 	// `T`.
@@ -470,15 +481,7 @@ where
 	let settlement_token = cancel_token.clone();
 	let promise = env.spawn_future_with_callback(
 		async move { Ok(run_filesystem_future(tag, cancel_token, fs, work).await) },
-		move |env, result| {
-			if let Some(reason) = settlement_token.abort_reason() {
-				return Err(match reason {
-					AbortReason::Timeout => Error::from_reason("Aborted: Timeout"),
-					_ => abort_error(*env, reason),
-				});
-			}
-			result.unwrap_or_else(|| Err(Error::from_reason("Aborted: Timeout")))
-		},
+		move |env, result| settle_walk(&settlement_token, result, |reason| abort_error(*env, reason)),
 	)?;
 	Ok(PromiseRaw::new(env.raw(), promise.raw()))
 }
@@ -776,6 +779,10 @@ mod tests {
 	/// runtime, and a bare `JoinHandle` would detach on drop. Covers a walk
 	/// that yields between directories; one parked in a stalled syscall is
 	/// bounded by the device.
+	///
+	/// The start is a handshake rather than a sleep, so a slow scheduler
+	/// cannot fail it; only the span between the drop and the walk's own
+	/// completion is a wait, and it is generous.
 	#[test]
 	fn dropping_the_caller_stops_the_walk() {
 		use std::{
@@ -791,9 +798,8 @@ mod tests {
 			.enable_all()
 			.build()
 			.unwrap();
-		let started = Arc::new(AtomicBool::new(false));
+		let (started_tx, started_rx) = flume::bounded::<()>(1);
 		let ran_on = Arc::new(AtomicBool::new(false));
-		let started_probe = Arc::clone(&started);
 		let ran_on_probe = Arc::clone(&ran_on);
 
 		host.block_on(async move {
@@ -802,23 +808,22 @@ mod tests {
 				CancelToken::new(None, None),
 				Fs::native(),
 				move |_fs| async move {
-					started_probe.store(true, Ordering::SeqCst);
+					let _ = started_tx.send(());
 					// The yield point a walker has between directories.
-					tokio::time::sleep(Duration::from_millis(200)).await;
+					tokio::time::sleep(Duration::from_secs(2)).await;
 					ran_on_probe.store(true, Ordering::SeqCst);
 					Ok(1_u32)
 				},
 			));
 			let mut walk = Some(walk);
-			// Start it, then let go while the work is still in flight.
+			// Let go the moment the walk is in flight.
 			tokio::select! {
 				_ = walk.as_mut().unwrap() => panic!("the walk finished before it was dropped"),
-				() = tokio::time::sleep(Duration::from_millis(60)) => {},
+				started = started_rx.recv_async() => started.expect("the walk never started"),
 			}
-			assert!(started.load(Ordering::SeqCst), "the walk never started");
 			drop(walk.take());
 
-			tokio::time::sleep(Duration::from_millis(400)).await;
+			tokio::time::sleep(Duration::from_secs(3)).await;
 			assert!(
 				!ran_on.load(Ordering::SeqCst),
 				"the walk ran on after its caller was dropped, so a torn-down host leaves filesystem \
@@ -947,6 +952,111 @@ mod tests {
 		assert!(!ran.load(Ordering::SeqCst), "cancelled queued work executed");
 	}
 
+	/// A glob started while another task on the runtime writes into a FIFO
+	/// that nothing drains still settles. Production runs every glob as this
+	/// future on the shared napi runtime, so a write that waits for room on a
+	/// worker leaves globs, and everything else on that runtime, pending. The
+	/// runtime here has one worker, and the write fills the FIFO first.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_glob_settles_while_a_fifo_write_waits_for_its_reader() {
+		use std::{
+			os::{
+				fd::AsRawFd as _,
+				unix::{ffi::OsStrExt as _, fs::OpenOptionsExt as _},
+			},
+			sync::mpsc,
+			time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+		};
+
+		const BOUND: Duration = Duration::from_secs(5);
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		let dir = std::env::temp_dir()
+			.join(format!("pi-natives-glob-victim-{}-{nanos}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		std::fs::write(dir.join("found.txt"), "x").unwrap();
+		let fifo = dir.join("fifo");
+		let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+		// SAFETY: `c_path` is a NUL-terminated path, valid for the call.
+		let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+		assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+		// The reader stays open and never reads: the write's open finds it,
+		// and the write fills the FIFO and then waits for room.
+		let reader = std::fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&fifo)
+			.unwrap();
+		// SAFETY: `F_GETPIPE_SZ` takes no argument; `reader` owns the fd.
+		let capacity = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETPIPE_SZ) };
+		let queued = || {
+			let mut queued: libc::c_int = 0;
+			// SAFETY: `FIONREAD` writes one `c_int` through the pointer, which
+			// is valid for the call; `reader` owns the fd.
+			unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
+			queued
+		};
+
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.unwrap();
+		let writer =
+			runtime.spawn(async move { Fs::native().write(&fifo, vec![b'x'; 1 << 20]).await });
+		let filled_by = Instant::now() + BOUND;
+		while queued() < capacity {
+			assert!(Instant::now() < filled_by, "the write never filled the FIFO");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+
+		let (settled_tx, settled_rx) = mpsc::channel();
+		let root = dir.clone();
+		runtime.spawn(async move {
+			let settled = run_filesystem_future(
+				"glob",
+				CancelToken::new(None, None),
+				Fs::native(),
+				move |fs| async move {
+					let root = pi_walker::fs::resolve_dir(&fs, &root)
+						.await
+						.map_err(walk_failure)?;
+					let walker = pi_walker::Fs::new(&fs, &root);
+					let opts =
+						pi_walker::glob::GlobOptions { pattern: "*.txt".into(), ..Default::default() };
+					pi_walker::glob::glob(&walker, &root, &opts)
+						.await
+						.map_err(|err| Error::from_reason(err.to_string()))
+				},
+			)
+			.await;
+			let paths = settled.map(|result| {
+				result.map(|matches| {
+					matches
+						.into_inner()
+						.into_iter()
+						.map(|matched| matched.path)
+						.collect::<Vec<_>>()
+				})
+			});
+			let _ = settled_tx.send(paths);
+		});
+		let settled = settled_rx.recv_timeout(BOUND);
+		// Release the write either way: once its reader leaves it fails.
+		drop(reader);
+		let _ = runtime.block_on(async { tokio::time::timeout(BOUND, writer).await });
+		runtime.shutdown_timeout(Duration::from_secs(1));
+		let _ = std::fs::remove_dir_all(&dir);
+		let paths = settled
+			.unwrap_or_else(|_| panic!("DEADLINE fired: the glob did not settle within {BOUND:?}"))
+			.expect("the glob was not cancelled")
+			.expect("the glob succeeded");
+		assert_eq!(paths, ["found.txt"]);
+	}
+
 	#[tokio::test]
 	async fn filesystem_worker_panic_rejects_without_unwinding_tokio_task() {
 		let _silence = SilenceHook::new();
@@ -1047,5 +1157,36 @@ mod tests {
 		assert_eq!(task.compute().unwrap().into_inner(), 1);
 		let err = task.compute().unwrap_err();
 		assert!(err.reason.contains("work already consumed"), "reason = {}", err.reason);
+	}
+
+	#[test]
+	fn settle_walk_delivers_a_finished_walk_past_its_deadline() {
+		let expired = CancelToken::new(Some(0), None);
+		assert!(expired.heartbeat().is_err(), "the deadline has not elapsed");
+		let delivered = settle_walk(&expired, Some(Ok(7_u32)), |reason| {
+			panic!("an elapsed deadline settled as an abort ({reason:?})")
+		});
+		assert_eq!(delivered.unwrap(), 7);
+	}
+
+	#[test]
+	fn settle_walk_rejects_a_finished_walk_on_explicit_abort() {
+		let mut token = CancelToken::new(None, None);
+		token.emplace_abort_token().abort(AbortReason::Signal);
+		let rejected = settle_walk(&token, Some(Ok(7_u32)), |reason| {
+			Error::new(Status::Cancelled, format!("cancelled: {reason:?}"))
+		});
+		let error = rejected.unwrap_err();
+		assert_eq!(error.status, Status::Cancelled);
+		assert_eq!(error.reason, "cancelled: Signal");
+	}
+
+	#[test]
+	fn settle_walk_rejects_a_walk_the_deadline_beat_as_a_timeout() {
+		let expired = CancelToken::new(Some(0), None);
+		let rejected = settle_walk::<u32>(&expired, None, |reason| {
+			panic!("an elapsed deadline settled as an abort ({reason:?})")
+		});
+		assert_eq!(rejected.unwrap_err().reason, "Aborted: Timeout");
 	}
 }

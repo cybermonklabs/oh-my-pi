@@ -351,6 +351,7 @@ fn start(fs: &mut dyn Fs, req: &FsReq) -> FsPoll<FsAns> {
 				file: None,
 				data: data.clone(),
 				done: 0,
+				mark: None,
 			}))
 		},
 		FsReq::UserDb(q) => map(fs.user_db(q), FsAns::Users),
@@ -471,16 +472,33 @@ struct WriteAll {
 	data: BString,
 	/// Bytes written so far.
 	done: usize,
+	/// The chunk a writer thread took last
+	/// ([`crate::bash::File::poll_write_marked`]): it settles, with its
+	/// error, before the next one goes and before the write is done.
+	mark: Option<crate::bash::Mark>,
 }
 
 impl FsPending<FsAns> for WriteAll {
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<FsAns>> {
 		loop {
 			if let Some(file) = &mut self.file {
+				if let Some(mark) = &self.mark {
+					let settled =
+						std::task::ready!(file.poll_settle_marked(cx, std::slice::from_ref(mark)));
+					self.mark = None;
+					if let Err(e) = settled {
+						return Poll::Ready(Err(e));
+					}
+				}
 				if self.done < self.data.len() {
-					match file.poll_write(cx, &self.data[self.done..]) {
-						Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
-						Poll::Ready(Ok(n)) => self.done += n,
+					match file.poll_write_marked(cx, &self.data[self.done..]) {
+						Poll::Ready(Ok((0, _))) => {
+							return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+						},
+						Poll::Ready(Ok((n, mark))) => {
+							self.done += n;
+							self.mark = mark;
+						},
 						Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
 						Poll::Pending => return Poll::Pending,
 					}

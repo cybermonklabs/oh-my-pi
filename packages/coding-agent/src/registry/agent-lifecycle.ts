@@ -23,27 +23,56 @@
  */
 
 import * as fs from "node:fs/promises";
-import { logger, postmortem, untilAborted } from "@oh-my-pi/pi-utils";
+import * as path from "node:path";
+import { isEnoent, logger, postmortem, untilAborted } from "@oh-my-pi/pi-utils";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
-import type { AgentSessionDisposeOptions } from "../session/agent-session-types";
+import type { AgentSessionDisposeOptions, OwnedJobsEnd } from "../session/agent-session-types";
+import { isSameJournalFile, sessionJournalLiveness } from "../session/session-storage";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import {
 	type AgentRef,
+	agentHasAncestor,
 	type AgentRefExpectation,
 	AgentRegistry,
 	type AgentRegistryApi,
 	MAIN_AGENT_ID,
 	type RegistryEvent,
+	refSessionStorage,
 } from "./agent-registry";
+import { defaultSessionStorage, FileSessionStorage, type SessionStorage } from "../session/session-storage";
 import { getAgentTombstonePath } from "./agent-tombstone";
+import { type LiveJournalHolder, liveJournalRefusal, suppressedTranscriptNote } from "./persisted-agents";
 
 export type AgentReviver = (expected: AgentRef) => Promise<AgentSessionHandle>;
 
+/** Where a request to reach an agent by name landed. */
+export interface LiveAgentTarget {
+	/** The live session the name reached. */
+	session: AgentSessionHandle;
+	/**
+	 * The id that session is registered under. Not always the name asked for:
+	 * the transcript a pane is running is that pane's own session, so peers
+	 * that know it by its file name reach it under the id it runs as.
+	 */
+	agentId: string;
+	/** Whether getting there rebuilt a parked transcript into a new session. */
+	revived: boolean;
+}
+
 const AGENT_RELEASE_GRACE_MS = 5000;
 
-async function persistAgentTombstone(sessionFile: string): Promise<void> {
+async function persistAgentTombstone(sessionFile: string, storage: SessionStorage): Promise<void> {
+	const tombstone = getAgentTombstonePath(sessionFile);
 	try {
-		await fs.writeFile(getAgentTombstonePath(sessionFile), "", { encoding: "utf8", flag: "wx", mode: 0o600 });
+		// The sidecar is a local file in every storage mode. When `storage` (the
+		// one holding the transcript) keeps it as a row, the directory beside it
+		// may not exist yet. Under file storage the transcript's own directory
+		// holds it; a missing one means the transcript is gone, and the write
+		// fails as it always has.
+		if (!(storage instanceof FileSessionStorage)) {
+			await fs.mkdir(path.dirname(tombstone), { recursive: true });
+		}
+		await fs.writeFile(tombstone, "", { encoding: "utf8", flag: "wx", mode: 0o600 });
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 	}
@@ -69,6 +98,16 @@ async function removeAgentTombstone(id: string, sessionFile: string): Promise<vo
  * top-level session so this manager stays free of sdk/SessionManager imports.
  */
 export type PersistedSubagentReviverFactory = (ref: AgentRef) => Promise<AgentReviver | undefined>;
+
+/**
+ * A reviver scoped to one {@link AgentLifecycleApi.ensureLive} call, for a host that
+ * cannot install one process-global {@link PersistedSubagentReviverFactory} (ACP).
+ */
+export interface ColdReviveOptions {
+	reviverFactory: PersistedSubagentReviverFactory;
+	/** TTL of the cold-revived adoption; defaults to 0 (immediately re-parkable). */
+	idleTtlMs?: number;
+}
 
 export interface AdoptOptions {
 	/** TTL before an idle agent is parked. <= 0 disables parking. */
@@ -133,10 +172,28 @@ interface ReopeningAgent {
 
 /** How {@link AgentLifecycleApi.release} ends an agent. */
 export interface AgentReleaseOptions {
-	/** Explicit kill: keep a terminal `aborted` row and persist the kill marker. */
+	/**
+	 * Explicit kill: keep a terminal `aborted` row and persist the kill marker. The kill stops
+	 * the agent's own jobs, so their subagents end with it and `omp --restore` leaves them.
+	 */
 	tombstone?: boolean;
-	/** Forwarded to the live session's dispose (e.g. the reason its `session_exit` record carries). */
+	/**
+	 * Forwarded to the live session's dispose: the reason its `session_exit` record carries, and
+	 * how its own jobs end. A kill (`tombstone`) stops them unless this names another end; any
+	 * other release that names none cuts them off.
+	 */
 	dispose?: AgentSessionDisposeOptions;
+}
+
+/** How {@link AgentLifecycleApi.dispose} and {@link AgentLifecycleApi.releaseUnder} release the agents they end. */
+export interface AgentLifecycleDisposeOptions {
+	/** When the teardown stops waiting for a release; later ones go on as late cleanup. */
+	deadlineAt?: number;
+	/**
+	 * How each agent's turn and own jobs end: cut off by default (the process exit), stopped
+	 * when the process goes on ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
+	 */
+	ownedJobsEnd?: OwnedJobsEnd;
 }
 
 /** Public surface of the process-global agent lifecycle, implemented locally on main and by a proxy in workers. */
@@ -153,14 +210,27 @@ export interface AgentLifecycleApi {
 	manages(registry: AgentRegistryApi): boolean;
 	/** True while a park is disposing this agent's session. */
 	isParking(id: string, expected?: AgentRefExpectation): boolean;
+	/** True while a {@link release} of the agent is in flight. */
+	isReleasing(id: string): boolean;
+	/** Settles once no {@link release} of the agent is in flight; at once when none is. */
+	whenReleased(id: string): Promise<void>;
 	/** Dispose the live session of an adopted agent and mark it `parked`. */
 	park(id: string): Promise<void>;
-	/** Return the live session, reviving it if parked or killed. */
-	ensureLive(id: string): Promise<AgentSessionHandle>;
+	/** Return the live session, reviving it if parked or killed (with `coldRevive` over the global factory when given). */
+	ensureLive(id: string, coldRevive?: ColdReviveOptions): Promise<AgentSessionHandle>;
+	/** {@link ensureLive}, with the id the request reached and whether a transcript was rebuilt. */
+	ensureLiveTarget(id: string, coldRevive?: ColdReviveOptions): Promise<LiveAgentTarget>;
 	/** Dispose if live and drop timers; `tombstone` keeps a terminal `aborted` row. */
 	release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean>;
-	/** Tear down every adopted agent. */
-	dispose(deadlineAt?: number): Promise<void>;
+	/** Tear down every adopted agent at the process exit, as `options` says. */
+	dispose(options?: AgentLifecycleDisposeOptions): Promise<void>;
+	/**
+	 * Release, as {@link dispose} releases each, every registered agent whose ancestry
+	 * ({@link agentHasAncestor}) reaches `ancestorId`, also past a parent unregistered since, whatever
+	 * its status: running, idle, parked, killed, or being revived or reopened. The lifecycle and every
+	 * other agent go on.
+	 */
+	releaseUnder(ancestorId: string, options?: AgentLifecycleDisposeOptions): Promise<void>;
 }
 
 export class AgentLifecycleManager implements AgentLifecycleApi {
@@ -228,6 +298,13 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	readonly #revivals = new Map<string, RevivingAgent>();
 	/** In-flight reopens of killed refs, bound to the killed ref, so concurrent {@link ensureLive} calls coalesce. */
 	readonly #reopens = new Map<string, ReopeningAgent>();
+	/**
+	 * Refs a {@link release} is ending, with how many releases of each are in flight: until they end, no
+	 * revive may adopt one or attach a session to it. Keyed by ref, so a newer same-id generation stays revivable.
+	 */
+	readonly #releasing = new Map<AgentRef, number>();
+	/** Waiters of {@link whenReleased}, per agent id, settled once no release of that id is left in flight. */
+	readonly #releaseWaiters = new Map<string, PromiseWithResolvers<void>>();
 	#unsubscribe: (() => void) | undefined;
 	#persistedReviverFactory: PersistedSubagentReviverFactory | undefined;
 	/** Resolves the TTL applied when a cold-revived ref is adopted on demand (read per revive). */
@@ -256,7 +333,11 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * Take ownership of a finished subagent. Caller has already set registry
 	 * status to "idle". Arms the TTL timer (idleTtlMs <= 0 adopts without one).
 	 * When `expected` is given, the adoption is refused if the id no longer
-	 * resolves to that ref (or that ref's session).
+	 * resolves to that ref (or that ref's session). A ref a {@link release} is
+	 * ending (its run finalized while the release disposed its session) is not
+	 * adopted: its release hook is called now, as late cleanup, without waiting
+	 * for the release's dispose of its session. A hook whose run is still ending
+	 * waits for that end before it releases what the end still uses.
 	 */
 	adopt(id: string, opts: AdoptOptions, expected?: AgentRefExpectation): void {
 		if (id === MAIN_AGENT_ID) {
@@ -267,6 +348,11 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		if (!ref || (expected !== undefined && ref !== expected && ref.session !== expected)) {
 			logger.warn("AgentLifecycleManager.adopt: unknown or replaced agent id", { id });
 			opts.onReviverDropped?.();
+			return;
+		}
+		if (this.#releasing.has(ref)) {
+			opts.onReviverDropped?.();
+			if (opts.onRelease) trackLateCleanup(opts.onRelease(), { id, resource: "adopted-agent" });
 			return;
 		}
 		const existing = this.#adopted.get(id);
@@ -366,6 +452,31 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	}
 
 	/**
+	 * True while a {@link release} of the agent `id` is in flight: from the moment it marks the ref as releasing, before
+	 * it drops the agent's adoption if there is one, until it has ended. A release that took an adoption calls that
+	 * adoption's release hook before it ends; one that took none calls no hook. Matched by id, not by the registered
+	 * ref, which the released session's dispose may unregister while the release goes on; a release of an earlier ref
+	 * of that id counts too.
+	 */
+	isReleasing(id: string): boolean {
+		for (const ref of this.#releasing.keys()) {
+			if (ref.id === id) return true;
+		}
+		return false;
+	}
+
+	/** Settles once no release of the agent `id` is left in flight ({@link isReleasing}); at once when none is. */
+	whenReleased(id: string): Promise<void> {
+		if (!this.isReleasing(id)) return Promise.resolve();
+		let waiting = this.#releaseWaiters.get(id);
+		if (!waiting) {
+			waiting = Promise.withResolvers<void>();
+			this.#releaseWaiters.set(id, waiting);
+		}
+		return waiting.promise;
+	}
+
+	/**
 	 * Dispose the live session, detach it from the registry, and mark the
 	 * agent `parked`. No-op unless the id is adopted and live.
 	 *
@@ -438,7 +549,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				this.#registry.setStatus(id, "parked", ref);
 
 				try {
-					await session.dispose();
+					// A park happens while the process runs: it stops the agent's own jobs, so
+					// their subagents end stopped and stay revivable, and `omp --restore` leaves
+					// them. Only the process teardown cuts them off.
+					await session.dispose({ ownedJobsEnd: "stop" });
 				} catch (error) {
 					logger.warn("AgentLifecycleManager.park: session dispose failed", { id, error: String(error) });
 				}
@@ -456,13 +570,32 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	/**
 	 * Return the live session, reviving from the sessionFile if parked or
 	 * killed. Throws a plain Error if the id is unknown, or its transcript
-	 * cannot be revived (no reviver, no session contract, workspace gone).
-	 * Concurrent calls share one in-flight revive.
+	 * cannot be revived (no reviver, no session contract, workspace gone, or a
+	 * live session holds its journal). Concurrent calls share one in-flight
+	 * revive.
 	 *
 	 * Never returns a session that is mid-dispose: an in-flight park is either
 	 * cancelled (session still live) or awaited to completion before revive.
+	 *
+	 * `coldRevive` lets a caller that cannot install one process-global
+	 * {@link PersistedSubagentReviverFactory} (ACP hosts several concurrent
+	 * top-level sessions, each with its own ambient auth/model/settings) supply
+	 * a reviver scoped to this single call instead. It takes precedence over
+	 * the global factory, for reopening a killed ref as well as for the cold
+	 * revive, and is never persisted onto the manager.
 	 */
-	async ensureLive(id: string): Promise<AgentSessionHandle> {
+	async ensureLive(id: string, coldRevive?: ColdReviveOptions): Promise<AgentSessionHandle> {
+		return (await this.ensureLiveTarget(id, coldRevive)).session;
+	}
+
+	/**
+	 * {@link ensureLive}, with where the request landed: a name can resolve to
+	 * an agent registered under another id (the transcript a pane is running
+	 * is that pane's session, not a peer of it), and a caller that reports
+	 * delivery needs the id that actually received it and whether a transcript
+	 * was rebuilt to get there.
+	 */
+	async ensureLiveTarget(id: string, coldRevive?: ColdReviveOptions): Promise<LiveAgentTarget> {
 		const park = this.#parks.get(id);
 		if (park) {
 			const parked = this.#registry.get(id);
@@ -470,12 +603,12 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			// thrashing dispose + revive.
 			if (parked?.session && !park.detached && park.cancel()) {
 				await park.promise;
-				const kept = this.#registry.get(id)?.session;
-				if (kept) {
+				const kept = this.#registry.get(id);
+				if (kept?.session && !this.#releasing.has(parked)) {
 					// Park cleared the idle timer; re-arm so TTL park still works.
 					const adopted = this.#adopted.get(id);
 					if (adopted && adopted.ref === parked && parked.status === "idle") this.#armTimer(id, adopted);
-					return kept;
+					return { session: kept.session, agentId: kept.id, revived: false };
 				}
 			} else {
 				// Already committed to detach (or no live session): wait for park,
@@ -487,35 +620,81 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		let ref = this.#registry.get(id);
 		if (!ref) {
 			throw new Error(
-				`Unknown agent "${id}" — it was never registered or has been released. If a transcript exists, read history://${id}.`,
+				suppressedTranscriptNote(id) ??
+					`Unknown agent "${id}" — it was never registered or has been released. If a transcript exists, read history://${id}.`,
 			);
 		}
-		if (ref.status === "aborted") ref = await this.#reopen(id, ref);
+		// A release is disposing the agent's session: hand out nothing meanwhile. A kill keeps its row,
+		// `aborted`, and the agent can be reopened once the kill ends; any other release unregisters it.
+		if (this.#releasing.has(ref)) {
+			throw new Error(
+				ref.status === "aborted"
+					? `Agent "${id}" is still shutting down after its kill; retry once it has stopped.`
+					: `Agent "${id}" is being released and cannot be revived.`,
+			);
+		}
+		if (ref.status === "aborted") ref = await this.#reopen(id, ref, coldRevive?.reviverFactory);
 		// A revive attaches its session before it finishes initializing it: join the revive rather
-		// than hand out a session whose extensions have not re-registered their tools yet.
+		// than hand out a session whose extensions have not re-registered their tools yet. This
+		// comes before the liveness probe below: a revive in flight has already claimed the
+		// journal, so probing first would read this process's own revive as a live session
+		// holding the transcript and refuse to join it.
 		const inflight = this.#revivals.get(id);
-		if (inflight?.ref === ref) return inflight.promise;
-		if (ref.session) return ref.session;
-		const revival = this.#resolveAndRevive(id, ref);
+		if (inflight?.ref === ref) return { session: await inflight.promise, agentId: ref.id, revived: true };
+		if (ref.session) return { session: ref.session, agentId: ref.id, revived: false };
+		// A ref whose journal a live agent loop writes is not revivable, however
+		// it got here (a scan that ran before the session went live, a kill and
+		// re-registration, a collab mirror): rebuilding it would run a second
+		// agent loop on a running session.
+		if (ref.sessionFile) {
+			const holder = sessionJournalLiveness(ref.sessionFile);
+			if (holder !== "free") return this.#liveJournalTarget(ref.id, ref.sessionFile, holder);
+		}
+		const revival = this.#resolveAndRevive(id, ref, coldRevive);
 		const pending: RevivingAgent = { ref, promise: revival };
 		this.#revivals.set(id, pending);
 		try {
-			return await revival;
+			return { session: await revival, agentId: ref.id, revived: true };
 		} finally {
 			if (this.#revivals.get(id) === pending) this.#revivals.delete(id);
 		}
 	}
 
 	/**
+	 * Where a request for a ref whose journal a live session holds goes. When
+	 * that session runs here, the name means it: hand the request to it, and
+	 * repair the registry — drop the dead ref, bind the name to the live agent
+	 * — so every later lookup agrees without re-deriving this. A journal held
+	 * in another process, or a copy of a live journal (same session id,
+	 * different file), has no local session to hand back; say what holds it
+	 * instead of forking the agent.
+	 */
+	#liveJournalTarget(id: string, sessionFile: string, holder: LiveJournalHolder): LiveAgentTarget {
+		if (holder === "here") {
+			for (const live of this.#registry.list()) {
+				if (live.id === id || !live.session || !live.sessionFile) continue;
+				if (!isSameJournalFile(live.sessionFile, sessionFile)) continue;
+				const stale = this.#registry.get(id);
+				if (stale && !stale.session && stale.sessionFile === sessionFile) this.#registry.unregister(id, stale);
+				this.#registry.bindLiveName(id, live.id, live.sessionFile);
+				logger.debug("Resolved a live session's transcript to the agent running it", { id, agentId: live.id });
+				return { session: live.session, agentId: live.id, revived: false };
+			}
+		}
+		throw new Error(liveJournalRefusal(id, sessionFile, holder));
+	}
+
+	/**
 	 * Turn a killed ref into a fresh `parked` generation on the same transcript
 	 * and drop its kill marker, so the cold-revive path can rebuild it. Probes the
-	 * persisted factory first: a transcript nothing can revive stays killed.
-	 * Concurrent calls for the same killed ref share one reopen.
+	 * call-scoped reviver, else the persisted factory, first: a transcript nothing
+	 * can revive stays killed. Concurrent calls for the same killed ref share one
+	 * reopen.
 	 */
-	async #reopen(id: string, killed: AgentRef): Promise<AgentRef> {
+	async #reopen(id: string, killed: AgentRef, reviverFactory?: PersistedSubagentReviverFactory): Promise<AgentRef> {
 		const inflight = this.#reopens.get(id);
 		if (inflight?.ref === killed) return inflight.promise;
-		const pending: ReopeningAgent = { ref: killed, promise: this.#reopenKilled(id, killed) };
+		const pending: ReopeningAgent = { ref: killed, promise: this.#reopenKilled(id, killed, reviverFactory) };
 		this.#reopens.set(id, pending);
 		try {
 			return await pending.promise;
@@ -524,10 +703,14 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		}
 	}
 
-	async #reopenKilled(id: string, killed: AgentRef): Promise<AgentRef> {
+	async #reopenKilled(
+		id: string,
+		killed: AgentRef,
+		reviverFactory?: PersistedSubagentReviverFactory,
+	): Promise<AgentRef> {
 		const sessionFile = killed.sessionFile;
 		if (!sessionFile) throw new Error(`Agent "${id}" was killed and has no transcript to resume from.`);
-		const factory = this.#persistedReviverFactory;
+		const factory = reviverFactory ?? this.#persistedReviverFactory;
 		if (!factory) {
 			throw new Error(
 				`Agent "${id}" was killed and cannot be revived (no reviver registered). Read history://${id} for what it did.`,
@@ -549,6 +732,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				`Agent "${id}" was killed and its transcript cannot be resumed (no session contract, isolated run, or its workspace is gone). Read history://${id} for what it did.`,
 			);
 		}
+		// A release of the killed ref began while its transcript was checked: it stays ended.
+		if (this.#releasing.has(killed))
+			throw new Error(`Agent "${id}" was released while its transcript was being checked.`);
 		const reopened = this.#registry.reopen(id, killed);
 		if (!reopened) throw new Error(`Agent "${id}" changed while its transcript was being checked.`);
 		await removeAgentTombstone(id, sessionFile);
@@ -562,15 +748,16 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * adopt it so the agent rejoins the normal idle↔parked lifecycle. Throws
 	 * when the agent is not revivable or no reviver can be produced.
 	 */
-	async #resolveAndRevive(id: string, ref: AgentRef): Promise<AgentSessionHandle> {
+	async #resolveAndRevive(id: string, ref: AgentRef, coldRevive?: ColdReviveOptions): Promise<AgentSessionHandle> {
 		let adoption = this.#adopted.get(id);
 		// A reviver-less adoption of this ref (its warm reviver's thread died) keeps
 		// its release hook through cold revival and restores it if that fails.
 		const prior = adoption?.ref === ref ? adoption : undefined;
 		let revive = prior?.revive;
-		let coldAdopted = false;
-		if (!revive && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
-			revive = await this.#persistedReviverFactory(ref);
+		const persistedFactory = coldRevive?.reviverFactory ?? this.#persistedReviverFactory;
+		let coldReviver: AgentReviver | undefined;
+		if (!revive && ref.status === "parked" && ref.sessionFile && persistedFactory) {
+			coldReviver = await persistedFactory(ref);
 			// Teardown can complete during the factory await. A late cold revive must
 			// not cold-adopt (and later attach a live session + TTL) into a disposed
 			// manager — reject deterministically before creating any session.
@@ -579,32 +766,40 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 					`Agent "${id}" revival aborted: its lifecycle was disposed while its persisted session was being prepared.`,
 				);
 			}
-			if (revive) {
-				adoption = {
-					ref,
-					idleTtlMs: prior?.idleTtlMs ?? this.#persistedReviveTtlMs(),
-					revive,
-					onRelease: prior?.onRelease,
-				};
-				this.#adopted.set(id, adoption);
-				coldAdopted = true;
-			}
 		}
+		// Checked before a cold adoption: a release while the factory awaited (the end of the helper
+		// session that spawned the agent) removed the ref or still waits on its session or release hook,
+		// and an adoption for it would bring the agent back with nothing left to release it.
 		if (this.#registry.get(id) !== ref) {
 			throw new Error(`Agent "${id}" changed while its persisted session was being prepared.`);
 		}
+		if (this.#releasing.has(ref)) {
+			throw new Error(`Agent "${id}" was released while its persisted session was being prepared.`);
+		}
+		if (coldReviver) {
+			revive = coldReviver;
+			adoption = {
+				ref,
+				idleTtlMs: coldRevive ? (coldRevive.idleTtlMs ?? 0) : (prior?.idleTtlMs ?? this.#persistedReviveTtlMs()),
+				revive,
+				onRelease: prior?.onRelease,
+			};
+		}
+		// Also checked before a cold adoption: a kill that completed while the factory awaited left the ref
+		// `aborted` with its release hook run, and an adoption would keep that hook for a later release to run again.
 		if (ref.status !== "parked" || !revive || !adoption) {
 			throw new Error(
 				`Agent "${id}" is ${ref.status} and cannot be revived${revive ? "" : " (no reviver registered)"}. Its transcript remains readable at history://${id}.`,
 			);
 		}
+		if (coldReviver) this.#adopted.set(id, adoption);
 		try {
 			return await this.#revive(id, revive, ref, adoption);
 		} catch (error) {
 			// A failed cold revive (stale ctx, missing cwd, bad MCP) must not leave a
 			// poisoned reviver stuck in #adopted — drop it so a later ensureLive
 			// rebuilds via the factory (which may have fresher context by then).
-			if (coldAdopted && this.#adopted.get(id) === adoption) {
+			if (coldReviver && this.#adopted.get(id) === adoption) {
 				if (prior) this.#adopted.set(id, prior);
 				else this.#adopted.delete(id);
 			}
@@ -623,9 +818,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * later persisted-subagent scan (e.g. Agent Hub reopen) skips it via its
 	 * `if (!registry.get(id))` guard rather than re-adopting the surviving
 	 * on-disk transcript as a fresh `parked` row. Mirrors
-	 * `finalizeSubagentLifecycle`'s explicit-kill path. The kill stops the agent,
-	 * it does not destroy it: {@link ensureLive} (a message, Hub revive/focus)
-	 * reopens the transcript.
+	 * `finalizeSubagentLifecycle`'s explicit-kill path. The kill stops the agent
+	 * and its own jobs, it does not destroy it: {@link ensureLive} (a message, Hub
+	 * revive/focus) reopens the transcript.
 	 */
 	async release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean> {
 		const adopted = this.#adopted.get(id);
@@ -637,76 +832,155 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		const ref = currentMatches ? current : adoptedMatches ? adopted.ref : undefined;
 		const onRelease = adopted && adopted.ref === ref ? adopted.onRelease : undefined;
 		if (!ref) return false;
-		if (adopted?.ref === ref) {
-			clearTimeout(adopted.timer);
-			this.#adopted.delete(id);
-			dropReviver(adopted);
-		}
-
-		const park = this.#parks.get(id);
-		if (park && park.ref === ref) {
-			// Prefer cancel when the session is still live so release owns dispose.
-			if (!park.detached) park.cancel();
-			await park.promise;
-		}
-
-		const live = this.#registry.get(id) === ref ? ref.session : null;
-		if (options?.tombstone) {
-			// Apply the terminal transition synchronously, before any await. The
-			// dying session's own dispose path calls unregisterUnlessParked
-			// (sdk.ts), which spares a ref only when it is already `aborted` AND
-			// already detached; awaiting persistAgentTombstone before this
-			// transition left a window in which that unregister deleted the ref
-			// (issue #10531). Persisting the sidecar afterward is safe: within the
-			// process the still-registered `aborted` row already blocks re-adoption
-			// via the `if (!registry.get(id))` discovery guard, and the sidecar
-			// only needs to exist before a later cross-restart discovery pass —
-			// release awaits the write below before returning.
-			// Detach before publishing `aborted`: setStatus emits synchronously, so
-			// every subscriber must observe a terminal ref with session === null.
-			if (!this.#registry.detachSession(id, ref) || !this.#registry.setStatus(id, "aborted", ref)) {
-				logger.warn("AgentLifecycleManager.release: terminal transition rejected", { id });
-			}
-		}
+		this.#releasing.set(ref, (this.#releasing.get(ref) ?? 0) + 1);
 		try {
-			if (options?.tombstone && ref.sessionFile) await persistAgentTombstone(ref.sessionFile);
-		} finally {
-			// Detaching removes the registry's only route to the live session. Always
-			// dispose the captured session, even when tombstone persistence fails.
-			if (live) {
-				try {
-					await live.dispose(options?.dispose);
-				} catch (error) {
-					logger.warn("AgentLifecycleManager.release: session dispose failed", { id, error: String(error) });
+			if (adopted?.ref === ref) {
+				clearTimeout(adopted.timer);
+				this.#adopted.delete(id);
+				dropReviver(adopted);
+			}
+
+			const park = this.#parks.get(id);
+			if (park && park.ref === ref) {
+				// Prefer cancel when the session is still live so release owns dispose.
+				if (!park.detached) park.cancel();
+				await park.promise;
+			}
+
+			const live = this.#registry.get(id) === ref ? ref.session : null;
+			if (options?.tombstone) {
+				// Apply the terminal transition synchronously, before any await. The
+				// dying session's own dispose path calls unregisterUnlessParked
+				// (sdk.ts), which spares a ref only when it is already `aborted` AND
+				// already detached; awaiting persistAgentTombstone before this
+				// transition left a window in which that unregister deleted the ref
+				// (issue #10531). Persisting the sidecar afterward is safe: within the
+				// process the still-registered `aborted` row already blocks re-adoption
+				// via the `if (!registry.get(id))` discovery guard, and the sidecar
+				// only needs to exist before a later cross-restart discovery pass —
+				// release awaits the write below before returning.
+				// Detach before publishing `aborted`: setStatus emits synchronously, so
+				// every subscriber must observe a terminal ref with session === null.
+				if (!this.#registry.detachSession(id, ref) || !this.#registry.setStatus(id, "aborted", ref)) {
+					logger.warn("AgentLifecycleManager.release: terminal transition rejected", { id });
 				}
 			}
+			let unmarked: { sessionFile: string; storage: SessionStorage; error: unknown } | undefined;
 			try {
-				await onRelease?.();
-			} catch (error) {
-				logger.warn("AgentLifecycleManager.release: owned resource cleanup failed", {
-					id,
-					error: String(error),
-				});
+				if (options?.tombstone && ref.sessionFile) {
+					// The live session's storage, else the one the ref was registered or
+					// scanned with; the process default only when neither is known.
+					const storage =
+						live?.sessionManager?.getStorage?.() ?? refSessionStorage(ref) ?? defaultSessionStorage();
+					try {
+						await persistAgentTombstone(ref.sessionFile, storage);
+					} catch (error) {
+						// A live session writes back a transcript that vanished at its next entry
+						// (SessionManager#appendToCurrentSessionFile rewrites a file it cannot
+						// account for), and its dispose below records entries. A missing
+						// directory now is not yet a missing transcript: decide after the dispose.
+						if (!live || !isEnoent(error)) throw error;
+						unmarked = { sessionFile: ref.sessionFile, storage, error };
+					}
+				}
+			} finally {
+				// Detaching removes the registry's only route to the live session. Always
+				// dispose the captured session, even when tombstone persistence fails.
+				if (live) {
+					try {
+						await live.dispose(
+							options?.tombstone ? { ownedJobsEnd: "stop", ...options.dispose } : options?.dispose,
+						);
+					} catch (error) {
+						logger.warn("AgentLifecycleManager.release: session dispose failed", { id, error: String(error) });
+					}
+				}
+				try {
+					await onRelease?.();
+				} catch (error) {
+					logger.warn("AgentLifecycleManager.release: owned resource cleanup failed", {
+						id,
+						error: String(error),
+					});
+				}
+			}
+			if (unmarked) {
+				// Still gone after the dispose: there is nothing to mark, and the kill fails
+				// as file storage's does. Back again: mark the transcript the session wrote.
+				if (!(await unmarked.storage.exists(unmarked.sessionFile))) throw unmarked.error;
+				await persistAgentTombstone(unmarked.sessionFile, unmarked.storage);
+			}
+			if (!options?.tombstone) this.#registry.unregister(id, ref);
+			return true;
+		} finally {
+			// A revive may start again once no release of this ref is left.
+			const releases = (this.#releasing.get(ref) ?? 1) - 1;
+			if (releases > 0) this.#releasing.set(ref, releases);
+			else this.#releasing.delete(ref);
+			// Waiters for the agent settle once no release of its id is left.
+			if (!this.isReleasing(id)) {
+				this.#releaseWaiters.get(id)?.resolve();
+				this.#releaseWaiters.delete(id);
 			}
 		}
-		if (!options?.tombstone) this.#registry.unregister(id, ref);
-		return true;
 	}
 
-	/** Teardown everything; disposing the global manager makes its next owner a fresh instance. */
-	async dispose(deadlineAt: number = Date.now() + AGENT_RELEASE_GRACE_MS): Promise<void> {
+	/**
+	 * Tear everything down at the process exit; disposing the global manager makes its next owner a
+	 * fresh instance. `ownedJobsEnd` says how each agent's turn and own jobs end, cut off by default as
+	 * the process exit ends them. A session that ends while the process goes on releases only the
+	 * agents under it ({@link releaseUnder}).
+	 */
+	async dispose(options: AgentLifecycleDisposeOptions = {}): Promise<void> {
 		this.#unsubscribe?.();
 		this.#disposed = true;
 		this.#unsubscribe = undefined;
-		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
-		// A turn still running (a revived or woken agent) is cut off by this
-		// teardown, not stopped: its session records a process exit, so
-		// `omp --restore` goes on with it.
-		const cutOff: AgentReleaseOptions = { dispose: { reason: postmortem.Reason.EXIT } };
+		await this.#releaseAll([...new Set([...this.#adopted.keys(), ...this.#parks.keys()])], options);
+		this.#revivals.clear();
+		this.#parks.clear();
+		this.#persistedReviverFactory = undefined;
+		if (AgentLifecycleManager.#global === this) AgentLifecycleManager.#global = undefined;
+	}
+
+	/**
+	 * Release every registered agent whose ancestry ({@link agentHasAncestor}) reaches `ancestorId`,
+	 * whatever its status, each as {@link dispose} releases it. A session that ends while the process
+	 * goes on (a `/security` scan, an ACP session's close) ends the agents under it this way once its own
+	 * turn and jobs have stopped. A subagent still running is released too: its session is disposed and
+	 * its ref unregistered, and its run's finalize adopts nothing (an adoption while the release runs is
+	 * refused and runs the release hook; after it, the ref is gone). A killed agent's `aborted` row is
+	 * unregistered, so no message reopens it under the ended session; its tombstone on disk makes a later
+	 * scan of that session's root register its transcript as `aborted`, not `parked`. An agent a revive or
+	 * a reopen is bringing back is released through its registered ref, so the revive finds it gone and
+	 * fails. Every other agent, this manager and its revivers go on.
+	 */
+	async releaseUnder(ancestorId: string, options: AgentLifecycleDisposeOptions = {}): Promise<void> {
+		const under = this.#registry.list().filter(ref => agentHasAncestor(this.#registry, ref, ancestorId));
+		await this.#releaseAll(
+			under.map(ref => ref.id),
+			options,
+		);
+	}
+
+	/**
+	 * Release each of `ids`, distinct, as `options` says, waiting for each until the deadline; a release
+	 * past it goes on as late cleanup.
+	 */
+	async #releaseAll(ids: readonly string[], options: AgentLifecycleDisposeOptions): Promise<void> {
+		const deadlineAt = options.deadlineAt ?? Date.now() + AGENT_RELEASE_GRACE_MS;
+		const ownedJobsEnd = options.ownedJobsEnd ?? "shutdown";
+		// At the process exit, the subagents of an agent's own jobs are parked, not stopped, so
+		// `omp --restore` goes on with them. A turn still running (a revived or woken agent) is
+		// cut off too: its session records a process exit, so `omp --restore` goes on with it. An
+		// idle agent's `session_exit` record stays a plain dispose. A stop ends a running agent as
+		// it ends an idle one: its turn and its own jobs stop, and no process exit is recorded.
+		const idle: AgentReleaseOptions = { dispose: { ownedJobsEnd } };
+		const running: AgentReleaseOptions =
+			ownedJobsEnd === "stop" ? idle : { dispose: { reason: postmortem.Reason.EXIT, ownedJobsEnd } };
 		await Promise.all(
 			ids.map(async id => {
-				const running = this.#registry.get(id)?.status === "running";
-				const release = this.release(id, undefined, running ? cutOff : undefined).then(() => {});
+				const releaseOptions = this.#registry.get(id)?.status === "running" ? running : idle;
+				const release = this.release(id, undefined, releaseOptions).then(() => {});
 				try {
 					await untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), () => release);
 				} catch (error) {
@@ -720,20 +994,18 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				}
 			}),
 		);
-		this.#revivals.clear();
-		this.#parks.clear();
-		this.#persistedReviverFactory = undefined;
-		if (AgentLifecycleManager.#global === this) AgentLifecycleManager.#global = undefined;
 	}
 
 	async #revive(id: string, revive: AgentReviver, ref: AgentRef, adopted: AdoptedAgent): Promise<AgentSessionHandle> {
 		const session = await revive(ref);
-		if (this.#disposed) {
-			// The owning lifecycle tore down while the reviver was in flight; dispose
-			// the freshly built session instead of attaching it, and fail the waiter.
+		if (this.#disposed || this.#releasing.has(ref)) {
+			// The owning lifecycle tore down, or a release of this agent began, while the reviver was
+			// in flight; dispose the freshly built session instead of attaching it, and fail the waiter.
 			await session.dispose();
 			throw new Error(
-				`Agent "${id}" revival aborted: its lifecycle was disposed while its persisted session was reviving.`,
+				this.#disposed
+					? `Agent "${id}" revival aborted: its lifecycle was disposed while its persisted session was reviving.`
+					: `Agent "${id}" revival aborted: it was released while its persisted session was reviving.`,
 			);
 		}
 		let liveRef = this.#registry.get(id);

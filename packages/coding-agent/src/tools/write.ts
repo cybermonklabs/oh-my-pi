@@ -87,6 +87,7 @@ import { maybeWriteSnapshotHeader, stripWriteContent } from "./write-content";
 import {
 	cfgLspDiagnosticsDeduplicate,
 	cfgLspDiagnosticsOnWrite,
+	cfgLspEnabled,
 	cfgLspFormatOnWrite,
 	cfgLspRequestTimeout,
 } from "../lsp/settings";
@@ -378,6 +379,38 @@ function appendNoteToResult(result: AgentToolResult<WriteToolDetails>, note: str
 	}
 }
 
+const ABORTED_AFTER_WRITE_BEGAN_NOTE =
+	"Note: the call was aborted after this write had begun; the write was completed.";
+
+/**
+ * Run a write's `body` as `untilAborted` does until the write begins: an abort before
+ * then ends the call at once, and the body's own abort checks keep the write from
+ * starting. Once `began()` is true the write goes ahead whatever the abort, so the
+ * call waits for the body and reports what it wrote, noting the abort. Reporting it
+ * as aborted would tell the agent a change it may then make twice did not happen.
+ */
+async function untilAbortedBeforeWrite(
+	signal: AbortSignal | undefined,
+	began: () => boolean,
+	body: () => Promise<AgentToolResult<WriteToolDetails>>,
+): Promise<AgentToolResult<WriteToolDetails>> {
+	if (!signal || signal.aborted) return untilAborted(signal, body);
+	const beforeWrite = new AbortController();
+	let abortedAfterBegin = false;
+	const onAbort = () => {
+		if (began()) abortedAfterBegin = true;
+		else beforeWrite.abort(signal.reason);
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		const result = await untilAborted(beforeWrite.signal, body);
+		if (abortedAfterBegin) appendNoteToResult(result, ABORTED_AFTER_WRITE_BEGAN_NOTE);
+		return result;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
+
 function emitWriteProgress(
 	onUpdate: AgentToolUpdateCallback<WriteToolDetails> | undefined,
 	byteLength: number,
@@ -645,7 +678,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 	/** Resolves the LSP writethrough from the current `lsp.*` settings so changes apply to the next write. */
 	#lspWritethrough(): { writethrough: WritethroughCallback; deferred: DeferredDiagnostics | undefined } {
-		if (!(this.session.enableLsp ?? true)) return { writethrough: writethroughNoop, deferred: undefined };
+		if (!(this.session.enableLsp ?? true) || !cfgLspEnabled.get(this.session.settings)) {
+			return { writethrough: writethroughNoop, deferred: undefined };
+		}
 		const { settings } = this.session;
 		const enableDiagnostics = cfgLspDiagnosticsOnWrite.get(settings);
 		const dedup = enableDiagnostics && cfgLspDiagnosticsDeduplicate.get(settings);
@@ -703,7 +738,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		contentBytes: number,
 		rawContent: string,
 		resolvedArchivePath: ResolvedArchiveWritePath,
-		signal?: AbortSignal,
+		signal: AbortSignal | undefined,
+		onWriteBegin: () => void,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const parentDir = path.dirname(resolvedArchivePath.absolutePath);
 		if (parentDir && parentDir !== ".") {
@@ -773,6 +809,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				try {
 					await writeArchive(tmpPath, format, entries);
 					signal?.throwIfAborted();
+					onWriteBegin();
 					await fs.rename(tmpPath, finalPath);
 				} catch (error) {
 					await fs.rm(tmpPath, { force: true }).catch(() => {});
@@ -986,7 +1023,17 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}),
 			);
 		}
-		return untilAborted(signal, async () => {
+		// Set right after the last abort check before a file, archive or SQLite write, or by a
+		// handler right before it changes a local file (`conflict://`, through the write context's
+		// `onWriteBegin`): from then the write goes ahead, and an abort no longer ends the call
+		// (see untilAbortedBeforeWrite). Other handler-owned writes (messages, devices, settings,
+		// `ssh://` and RPC host URIs) never set it: their handlers get the signal themselves, and
+		// the call keeps returning at the abort.
+		let writeBegan = false;
+		const beginWrite = () => {
+			writeBegan = true;
+		};
+		const writeBody = async (): Promise<AgentToolResult<WriteToolDetails>> => {
 			// Text payloads get hashline display prefixes ([PATH#HASH] + LINE:) stripped if the model
 			// copied them from read output. Verbatim payloads (messages, process stdin, setting
 			// values, conflict directives) reach their handler exactly as the model wrote them.
@@ -1021,11 +1068,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						}
 						emitWriteProgress(onUpdate, cleanBytes, path);
 					}
+					// The last check before the handler: past it, the handler sees the signal itself.
+					signal?.throwIfAborted();
 					const handlerResult = await router.write(
 						path,
 						cleanContent,
 						sessionWriteContext(this.session, {
 							signal,
+							onWriteBegin: beginWrite,
 							toolCall: { id: _toolCallId, onUpdate, context },
 						}),
 					);
@@ -1074,6 +1124,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					content,
 					resolvedArchivePath,
 					signal,
+					beginWrite,
 				);
 				if (stripped) {
 					const firstText = archiveResult.content.find(
@@ -1092,6 +1143,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				await enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update", signal });
 
 				emitWriteProgress(onUpdate, cleanBytes, path, resolvedSqlitePath.absolutePath);
+				// The row write below is synchronous and checks no signal: refuse it here once aborted.
+				signal?.throwIfAborted();
+				beginWrite();
 				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);
 				if (stripped) {
 					const firstText = sqliteResult.content.find(
@@ -1152,8 +1206,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				existing?.isFile() && !editorOwnsFile
 					? await readTextFileConvention(absolutePath, existing.size, signal).catch(() => undefined)
 					: undefined;
-			// `untilAborted` has already rejected the call if it was cancelled during the scan; don't write.
+			// The call has already ended as aborted if it was cancelled during the scan; don't write.
 			signal?.throwIfAborted();
+			beginWrite();
 			const { text: writeContent, applied } = applyTextFileConvention(cleanContent, convention);
 			const writeBytes = writeContent === cleanContent ? cleanBytes : Buffer.byteLength(writeContent, "utf8");
 
@@ -1228,6 +1283,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						.get(),
 				},
 			};
-		});
+		};
+		return untilAbortedBeforeWrite(signal, () => writeBegan, writeBody);
 	}
 }

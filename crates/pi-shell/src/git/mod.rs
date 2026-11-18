@@ -479,25 +479,17 @@ struct Plan {
 }
 
 impl Plan {
-	/// Creates and optionally locks the worktree.
+	/// Creates the worktree, locked when the request asked for it.
 	fn add(self) -> pi_vcs::Result<Created> {
-		self
+		let added = self
 			.repo
 			.worktree_add(&self.path, &self.target, WorktreeAddOptions {
 				detach:       self.detach,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				lock:         self.lock,
 			})?;
 		let linked = GitRepo::require(&self.path)?;
-		if let Some(reason) = &self.lock {
-			// git's `write_file` terminates non-empty content with a newline.
-			let content = if reason.is_empty() {
-				String::new()
-			} else {
-				format!("{reason}\n")
-			};
-			std::fs::write(linked.info().git_dir.join("locked"), content)?;
-		}
 		Ok(Created {
 			head:      linked.head_sha()?.unwrap_or_default(),
 			oneline:   linked.log_onelines(1)?.pop().unwrap_or_default(),
@@ -505,6 +497,7 @@ impl Plan {
 			path:      self.path,
 			preparing: self.preparing,
 			quiet:     self.quiet,
+			notes:     added.notes,
 		})
 	}
 }
@@ -527,23 +520,34 @@ pub struct Created {
 	oneline:   String,
 	hook:      Option<PathBuf>,
 	quiet:     bool,
+	/// What the add did besides the checkout (a partial tree it emptied, a
+	/// lock it could not remove), printed as git prints its warnings.
+	notes:     Vec<String>,
 }
 
 /// What `git worktree add` prints for a [`Created`] worktree.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
-	/// The `Preparing worktree (…)` line.
+	/// The `Preparing worktree (…)` line, then a `warning:` line per note.
 	pub stderr: String,
 	/// The `HEAD is now at …` line.
 	pub stdout: String,
 }
 
 impl Created {
-	/// What `git worktree add` prints (nothing under `-q`). The shell prints
-	/// it, then runs [`Created::hook_args`].
+	/// What `git worktree add` prints: the `Preparing` and `HEAD is now at`
+	/// lines (not under `-q`), and a `warning:` line per note of the add,
+	/// which git prints under `-q` too. The shell prints it, then runs
+	/// [`Created::hook_args`].
 	pub fn report(&self) -> Report {
+		let warnings = self.notes.iter().fold(String::new(), |mut out, note| {
+			out.push_str("warning: ");
+			out.push_str(note);
+			out.push('\n');
+			out
+		});
 		if self.quiet {
-			return Report::default();
+			return Report { stderr: warnings, stdout: String::new() };
 		}
 		let detail = match &self.preparing {
 			Preparing::NewBranch(branch) => format!("new branch '{branch}'"),
@@ -556,7 +560,7 @@ impl Created {
 			},
 		};
 		Report {
-			stderr: format!("Preparing worktree ({detail})\n"),
+			stderr: format!("Preparing worktree ({detail})\n{warnings}"),
 			stdout: format!("HEAD is now at {}\n", self.oneline),
 		}
 	}
@@ -694,6 +698,31 @@ mod tests {
 		assert_eq!(parse("worktree add --end-of-options -wt"), Some(request("-wt")));
 	}
 
+	/// The add's notes (a lock `finish` could not remove, a partial tree it
+	/// emptied) are printed as git prints its warnings: on stderr, under
+	/// `-q` too.
+	#[test]
+	fn report_prints_the_adds_notes_as_warnings_also_when_quiet() {
+		let note = "worktree /w is still locked: could not remove /r/locked: Permission denied";
+		let created = |quiet| Created {
+			path: PathBuf::from("/w"),
+			preparing: Preparing::Detached,
+			head: String::new(),
+			oneline: "abc1234 subject".to_owned(),
+			hook: None,
+			quiet,
+			notes: vec![note.to_owned()],
+		};
+		assert_eq!(created(true).report(), Report {
+			stderr: format!("warning: {note}\n"),
+			stdout: String::new(),
+		});
+		assert_eq!(created(false).report(), Report {
+			stderr: format!("Preparing worktree (detached HEAD abc1234)\nwarning: {note}\n"),
+			stdout: "HEAD is now at abc1234 subject\n".to_owned(),
+		});
+	}
+
 	/// Every form below has behavior pi-vcs does not reproduce, or is an
 	/// error git must report itself.
 	#[test]
@@ -720,20 +749,18 @@ mod tests {
 		}
 	}
 
-	/// Runs `git` reading the same config sources the builtin's gix does: the
-	/// real global/system files at their default paths (gix ignores
-	/// `GIT_CONFIG_GLOBAL`/`SYSTEM`/`NOSYSTEM`, ignoring these matches it),
-	/// and never `GIT_CONFIG_PARAMETERS` (gix does not read it at all).
-	/// `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` are left alone: gix reads those
-	/// from the process environment, so the helper must see them too.
+	/// Runs `git` reading the same config sources the builtin's gix does: it
+	/// honours `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_NOSYSTEM` as git does, but
+	/// not `GIT_CONFIG_SYSTEM` (removing it reads the default system file, as
+	/// gix does) and never `GIT_CONFIG_PARAMETERS` (gix does not read it at
+	/// all). `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` are left alone: gix reads
+	/// those from the process environment, so the helper must see them too.
 	#[cfg(unix)]
 	pub(super) fn git(dir: &Path, args: &[&str]) -> String {
 		let output = std::process::Command::new("git")
 			.args(args)
 			.current_dir(dir)
-			.env_remove("GIT_CONFIG_GLOBAL")
 			.env_remove("GIT_CONFIG_SYSTEM")
-			.env_remove("GIT_CONFIG_NOSYSTEM")
 			.env_remove("GIT_CONFIG_PARAMETERS")
 			.output()
 			.expect("run git");
@@ -824,6 +851,7 @@ mod tests {
 			vfs: None,
 			runtime: tokio::runtime::Handle::current(),
 			output_decoding: None,
+			term_grace: crate::host::TERM_GRACE,
 		})
 		.expect("session");
 		// stdout and stderr share one file (and its offset), so the
@@ -967,9 +995,15 @@ mod tests {
 		let wt = repo.parent().expect("parent").join("bare-wt");
 		assert!(!wt.join("tracked.txt").exists(), "--no-checkout handled by git");
 
-		// Branch already checked out: git's own fatal error and status.
+		// Branch already checked out: git's own fatal error and status. Git
+		// 2.43 says "is already used by worktree at"; git 2.39 (Debian
+		// bookworm) says "is already checked out at".
 		let (code, output) = run(&repo, "git worktree add ../again main").await;
-		assert_eq!(code, Some(128));
-		assert!(output.contains("fatal: 'main' is already used by worktree"), "{output}");
+		assert_eq!(code, Some(128), "{output}");
+		assert!(
+			output.contains("fatal: 'main' is already used by worktree at")
+				|| output.contains("fatal: 'main' is already checked out at"),
+			"{output}"
+		);
 	}
 }

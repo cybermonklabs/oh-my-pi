@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { addonSetDigest } from "../scripts/embed-native";
 import { buildLeafManifest, generateNpmPackages } from "../scripts/gen-npm-packages";
 
 describe("generated native npm leaf packages", () => {
@@ -93,6 +94,33 @@ describe("generated native npm leaf packages", () => {
 				"Notice payload\n",
 			);
 			expect("exports" in manifest).toBe(false);
+		} finally {
+			await fs.rm(packageDir, { recursive: true, force: true });
+		}
+	});
+
+	it("records each addon's size and SHA-256, and the set's digest, in the leaf's package.json", async () => {
+		const packageDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-npm-"));
+		try {
+			await Bun.write(path.join(packageDir, "package.json"), JSON.stringify({ version: "15.5.15" }));
+			await Bun.write(path.join(packageDir, "LICENSE"), "MIT payload\n");
+			await Bun.write(path.join(packageDir, "THIRD-PARTY-NOTICES.txt"), "Notice payload\n");
+			const addons = {
+				"pi_natives.win32-x64-baseline.node": "baseline addon bytes",
+				"pi_natives.win32-x64-modern.node": "modern addon",
+			};
+			for (const [file, bytes] of Object.entries(addons))
+				await Bun.write(path.join(packageDir, "native", file), bytes);
+
+			const [leaf] = await generateNpmPackages({ packageDir, tags: ["win32-x64"] });
+
+			const files = Object.entries(addons).map(([filename, bytes]) => ({
+				filename,
+				size: bytes.length,
+				sha256: new Bun.CryptoHasher("sha256").update(bytes).digest("hex"),
+			}));
+			const manifest = await Bun.file(path.join(leaf.dir, "package.json")).json();
+			expect(manifest.nativeAddons).toEqual({ digest: addonSetDigest(files), files });
 		} finally {
 			await fs.rm(packageDir, { recursive: true, force: true });
 		}

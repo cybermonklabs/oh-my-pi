@@ -89,6 +89,27 @@ pub struct File {
 	/// reads fail with [`crate::cancelled`]. Provider files keep theirs in
 	/// [`Shared`].
 	read_cancel: Option<HostCancel>,
+	/// A write to this host file can wait in the kernel (a pipe, FIFO,
+	/// socket or terminal): async writes run off the runtime worker. Decided
+	/// once, from the file's type when it was wrapped.
+	writes_wait: bool,
+}
+
+/// Whether a write to `file` can wait for a reader: anything but a regular
+/// file, a directory or a block device. Unknown counts as waiting.
+fn writes_can_wait(file: &std::fs::File) -> bool {
+	let Ok(meta) = file.metadata() else {
+		return true;
+	};
+	let kind = meta.file_type();
+	#[cfg(unix)]
+	let block = {
+		use std::os::unix::fs::FileTypeExt as _;
+		kind.is_block_device()
+	};
+	#[cfg(not(unix))]
+	let block = false;
+	!(kind.is_file() || kind.is_dir() || block)
 }
 
 /// How reads of a host file opened through a cancellable facade observe its
@@ -446,7 +467,8 @@ impl fmt::Debug for File {
 
 impl From<std::fs::File> for File {
 	fn from(file: std::fs::File) -> Self {
-		Self { repr: Repr::Native(file), read_cancel: None }
+		let writes_wait = writes_can_wait(&file);
+		Self { repr: Repr::Native(file), read_cancel: None, writes_wait }
 	}
 }
 
@@ -508,6 +530,7 @@ impl File {
 				closes:  None,
 			})),
 			read_cancel: None,
+			writes_wait: false,
 		}
 	}
 
@@ -555,7 +578,9 @@ impl File {
 	pub fn into_native(self) -> Result<std::fs::File, Self> {
 		match self.repr {
 			Repr::Native(file) => Ok(file),
-			repr @ Repr::Virtual(_) => Err(Self { repr, read_cancel: self.read_cancel }),
+			repr @ Repr::Virtual(_) => {
+				Err(Self { repr, read_cancel: self.read_cancel, writes_wait: self.writes_wait })
+			},
 		}
 	}
 
@@ -571,6 +596,7 @@ impl File {
 				Repr::Virtual(shared) => Repr::Virtual(Arc::clone(shared)),
 			},
 			read_cancel: self.read_cancel.clone(),
+			writes_wait: self.writes_wait,
 		})
 	}
 
@@ -716,15 +742,27 @@ impl File {
 		}
 	}
 
+	/// A host file whose writes can wait (a pipe, FIFO, socket or terminal)
+	/// is written off the runtime worker (see [`offload`]); a regular file
+	/// is written inline.
 	pub async fn write_async(&self, buf: &[u8]) -> io::Result<usize> {
 		match &self.repr {
+			Repr::Native(file) if self.writes_wait => {
+				let (file, bytes) = (file.try_clone()?, buf.to_vec());
+				offload(move || host(&file).write(&bytes)).await
+			},
 			Repr::Native(file) => host(file).write(buf),
 			Repr::Virtual(shared) => shared.guard(shared.handle().write(buf)).await,
 		}
 	}
 
+	/// As [`File::write_async`], for the whole of `buf`.
 	pub async fn write_all_async(&self, buf: &[u8]) -> io::Result<()> {
 		match &self.repr {
+			Repr::Native(file) if self.writes_wait => {
+				let (file, bytes) = (file.try_clone()?, buf.to_vec());
+				offload(move || host(&file).write_all(&bytes)).await
+			},
 			Repr::Native(file) => host(file).write_all(buf),
 			Repr::Virtual(shared) => shared.guard(write_all_handle(shared.handle(), buf)).await,
 		}

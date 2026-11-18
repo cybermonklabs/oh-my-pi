@@ -15,7 +15,10 @@ import type { AgentAwaitsApi } from "../../registry/agent-awaits";
 import type {
 	AdoptOptions,
 	AgentLifecycleApi,
+	AgentLifecycleDisposeOptions,
 	AgentReleaseOptions,
+	ColdReviveOptions,
+	LiveAgentTarget,
 	PersistedSubagentReviverFactory,
 } from "../../registry/agent-lifecycle";
 import type {
@@ -32,6 +35,17 @@ import type { IrcBusApi, IrcWaitFilter } from "../../irc/bus";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { RemoteObject } from "../rpc";
 import type { AgentLifecycleProtocol, AgentRegistryProtocol, IrcBusProtocol, UnansweredSend } from "./agents-protocol";
+
+/**
+ * No storage instance crosses the RPC: none encodes (RpcEncodeError, file
+ * storage included). Main's side records file storage for every ref a worker
+ * registers, since a worker run is always file-backed (see serveRegistry).
+ */
+function withoutStorage(input: RegisterInput): RegisterInput {
+	if (input.storage === undefined) return input;
+	const { storage: _storage, ...wire } = input;
+	return wire;
+}
 
 /** Local listeners fed by one lazily opened remote subscription. */
 class ForwardedListeners<A extends unknown[]> {
@@ -103,11 +117,11 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 	}
 
 	register(input: RegisterInput): AgentRef {
-		return this.#remote.callSync("register", input);
+		return this.#remote.callSync("register", withoutStorage(input));
 	}
 
 	registerIfAvailable(input: RegisterInput, expected: AgentRef | null): AgentRef | undefined {
-		return this.#remote.callSync("registerIfAvailable", input, expected);
+		return this.#remote.callSync("registerIfAvailable", withoutStorage(input), expected);
 	}
 
 	reopen(id: string, expected: AgentRef): AgentRef | undefined {
@@ -151,6 +165,10 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 		return this.#remote.callSync("unregister", id, expected);
 	}
 
+	bindLiveName(name: string, targetId: string, sessionFile: string): boolean {
+		return this.#remote.callSync("bindLiveName", name, targetId, sessionFile);
+	}
+
 	get(id: string): AgentRef | undefined {
 		return this.#remote.callSync("get", id);
 	}
@@ -179,7 +197,7 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 	}
 }
 
-/** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and teardown are main-only. */
+/** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and the process exit's teardown are main-only. */
 export class RemoteAgentLifecycle implements AgentLifecycleApi {
 	readonly #remote: RemoteObject<AgentLifecycleProtocol>;
 
@@ -212,20 +230,37 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.callSync("isParking", id, expected);
 	}
 
+	isReleasing(id: string): boolean {
+		return this.#remote.callSync("isReleasing", id);
+	}
+
+	whenReleased(id: string): Promise<void> {
+		return this.#remote.call("whenReleased", id);
+	}
+
 	park(id: string): Promise<void> {
 		return this.#remote.call("park", id);
 	}
 
-	ensureLive(id: string): Promise<AgentSessionHandle> {
-		return this.#remote.call("ensureLive", id);
+	ensureLive(id: string, coldRevive?: ColdReviveOptions): Promise<AgentSessionHandle> {
+		return this.#remote.call("ensureLive", id, coldRevive);
+	}
+
+	ensureLiveTarget(id: string, coldRevive?: ColdReviveOptions): Promise<LiveAgentTarget> {
+		return this.#remote.call("ensureLiveTarget", id, coldRevive);
 	}
 
 	release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean> {
 		return this.#remote.call("release", id, expected, options);
 	}
 
-	dispose(_deadlineAt?: number): Promise<void> {
+	dispose(_options?: AgentLifecycleDisposeOptions): Promise<void> {
 		return Promise.reject(new Error("The agent lifecycle is torn down by the main thread"));
+	}
+
+	/** Main's lifecycle releases the agents under `ancestorId` (a helper session hosted here that ends). */
+	releaseUnder(ancestorId: string, options?: AgentLifecycleDisposeOptions): Promise<void> {
+		return this.#remote.call("releaseUnder", ancestorId, options);
 	}
 }
 

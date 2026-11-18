@@ -28,6 +28,9 @@ pub struct Tty {
 	pub file:    FdRef,
 	/// Display bytes not written yet (zsh's buffered `shout`).
 	pub out:     Vec<u8>,
+	/// The chunk of display bytes the terminal's writer thread took and that
+	/// is not out yet ([`FdRef::poll_write_out`]): the front of `out`.
+	unsettled:   crate::bash::Unsettled,
 	/// zsh `eofchar`: the terminal's EOF character while editing.
 	pub eofchar: Option<u8>,
 	/// zsh `zsetterm` is in effect (the terminal is in ZLE's modes).
@@ -47,13 +50,14 @@ impl Clone for Tty {
 	/// A subshell's copy: the same terminal, nothing pending.
 	fn clone(&self) -> Self {
 		Self {
-			file:    self.file.clone(),
-			out:     Vec::new(),
-			eofchar: self.eofchar,
-			raw:     self.raw,
-			fetch:   self.fetch,
-			size:    self.size,
-			caps:    self.caps.clone(),
+			file:      self.file.clone(),
+			out:       Vec::new(),
+			unsettled: crate::bash::Unsettled::default(),
+			eofchar:   self.eofchar,
+			raw:       self.raw,
+			fetch:     self.fetch,
+			size:      self.size,
+			caps:      self.caps.clone(),
 		}
 	}
 }
@@ -66,6 +70,7 @@ impl Tty {
 		Some(Self {
 			file,
 			out: Vec::new(),
+			unsettled: crate::bash::Unsettled::default(),
 			eofchar: None,
 			raw: false,
 			fetch: false,
@@ -158,12 +163,18 @@ impl Tty {
 	}
 
 	/// Write what is queued; the wait key while the terminal will not
-	/// take more. A write error drops the bytes (zsh ignores them too).
+	/// take more, or while what its writer thread took is not out yet
+	/// ([`FdRef::poll_write_out`]): what runs next (an external writing to
+	/// the terminal) comes after the display. A write error drops the bytes
+	/// (zsh ignores them too).
 	pub fn flush(&mut self, k: &Kernel) -> Option<WaitKey> {
 		let mut tcx = Context::from_waker(&k.waker);
 		let mut off = 0;
 		while off < self.out.len() {
-			match self.file.poll_write(&mut tcx, &self.out[off..]) {
+			match self
+				.file
+				.poll_write_out(&mut tcx, &self.out[off..], &mut self.unsettled)
+			{
 				Poll::Ready(Ok(n)) if n > 0 => off += n,
 				Poll::Ready(_) => {
 					off = self.out.len();

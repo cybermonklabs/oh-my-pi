@@ -11,7 +11,7 @@ use std::{
 	},
 	task::{Context, Poll, Wake, Waker},
 	thread::{self, Thread},
-	time::{Duration, Instant, UNIX_EPOCH},
+	time::{Duration, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -285,8 +285,8 @@ impl Wake for Wakeup {
 }
 
 /// Poll `poll` until ready, as the engine does: after `Pending` only a wake
-/// of the waker it was polled with brings the next poll (none within ten
-/// seconds fails the test).
+/// of the waker it was polled with brings the next poll (a wake that never
+/// comes hangs the test until the runner's bound fails it).
 fn drive<T>(mut poll: impl FnMut(&mut Context<'_>) -> Poll<T>) -> T {
 	let wakeup = Arc::new(Wakeup { woken: AtomicBool::new(false), thread: thread::current() });
 	let waker = Waker::from(Arc::clone(&wakeup));
@@ -295,12 +295,8 @@ fn drive<T>(mut poll: impl FnMut(&mut Context<'_>) -> Poll<T>) -> T {
 		if let Poll::Ready(value) = poll(&mut cx) {
 			return value;
 		}
-		let deadline = Instant::now() + Duration::from_secs(10);
 		while !wakeup.woken.swap(false, Ordering::SeqCst) {
-			let left = deadline
-				.checked_duration_since(Instant::now())
-				.expect("a pending operation never woke its waker");
-			thread::park_timeout(left);
+			thread::park();
 		}
 	}
 }
@@ -483,14 +479,13 @@ fn dropping_a_pending_operation_cancels_it() {
 	let FsPoll::Pending(stalled) = fs.stat(p("mem://stall"), true) else {
 		panic!("a provider operation answered without waiting");
 	};
-	let deadline = Instant::now() + Duration::from_secs(10);
 	while !mem.stalled.load(Ordering::SeqCst) {
-		assert!(Instant::now() < deadline, "the stalled operation never started");
 		thread::sleep(Duration::from_millis(1));
 	}
 	drop(stalled);
+	// An operation the drop left running never sets `dropped`, and the
+	// runner's bound fails the test.
 	while !mem.dropped.load(Ordering::SeqCst) {
-		assert!(Instant::now() < deadline, "dropping the operation left it running");
 		thread::sleep(Duration::from_millis(1));
 	}
 	// The filesystem keeps serving.

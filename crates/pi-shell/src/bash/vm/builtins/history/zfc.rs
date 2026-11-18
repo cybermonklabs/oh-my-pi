@@ -825,11 +825,12 @@ fn rerun(ctx: &mut Ctx<'_, '_>, h: Hist, text: BString, editor: &[u8]) -> R {
 			return done(1);
 		},
 	};
-	// zsh `stuff`: the file goes to standard error first.
-	let unwritten = super::write_now(&*ctx, 2, &contents).to_vec();
-	if !unwritten.is_empty() {
-		ctx.out_fd(2, &unwritten);
-	}
+	// zsh `stuff`: the file goes to standard error first. A builtin's own
+	// output is written after the frame it runs, so the echo goes with the
+	// diagnostics, which are written and settled before the event runs.
+	ctx.vp
+		.out
+		.push_back(crate::bash::vm::proc::PendingWrite::new(2, contents.clone()));
 	let event = contents
 		.strip_suffix(b"\n")
 		.unwrap_or(contents.as_slice())

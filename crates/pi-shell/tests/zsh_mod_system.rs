@@ -147,3 +147,24 @@ fn zsh_mod_system_flock_fd_is_close_on_exec_unless_e() {
 	assert_eq!(out, "1\n0\n");
 	assert_eq!(st, 0);
 }
+
+/// `syswrite` to a socket whose peer is gone. On Linux a socket's writes go
+/// to the descriptor's writer thread, which takes the chunk at once and then
+/// fails with `EPIPE`; `syswrite` must report that failure (status 2), as
+/// `write(2)` would, not count the chunk written.
+#[cfg(target_os = "linux")]
+#[test]
+fn zsh_mod_system_syswrite_reports_a_failure_after_the_hand_off() {
+	let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+	drop(ours);
+	let dir = tempfile::tempdir().unwrap();
+	let mut cmd: Command = obash();
+	cmd.arg0("zsh");
+	let out = output(
+		cmd.current_dir(dir.path())
+			.stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+			.args(["-f", "-c", "trap '' PIPE; zmodload zsh/system; syswrite y; print -u2 status=$?"]),
+	);
+	let err = String::from_utf8_lossy(&out.stderr);
+	assert!(err.contains("status=2"), "syswrite's status: {err:?}");
+}

@@ -1,0 +1,233 @@
+/**
+ * Resolve which {@link SessionStorage} this process persists sessions through.
+ *
+ * Precedence (highest first), mirroring `auth-broker-config.ts`:
+ *   1. `OMP_SESSION_STORAGE` / `OMP_SESSION_SQL_DSN_FILE` env vars.
+ *   2. `session.storage` / `session.sql.dsnFile` in config.yml (hidden from the
+ *      settings UI).
+ *
+ * `file` — the default — is the JSONL tree under the sessions directory and
+ * resolves without touching anything. `sql` reads the connection string from
+ * the named file (trimmed; the file, not the environment, carries the
+ * credential), opens it with `Bun.SQL` — the dialect follows the URL scheme —
+ * and awaits {@link SqlSessionStorage.create}, whose first round trip is
+ * where an unreachable database fails. Every refusal names the variable or
+ * setting that supplied the value and the path it named, never the connection
+ * string: an unreadable or empty file, contents the driver cannot parse as a
+ * connection URL (the driver's own error embeds the string, so it is not
+ * attached as a cause either), and a database that cannot be opened each
+ * refuse in those terms; the last also names the driver's code and, when a
+ * server answered, the SQLSTATE it answered with. There is no fallback to file
+ * storage: a misconfigured `sql` refuses to start rather than quietly writing
+ * sessions somewhere else. With `openOnFirstUse` (`omp --no-session`) every
+ * refusal but the last still comes at once; the database is opened, and can
+ * refuse, only when something first uses the store.
+ */
+
+import { toError } from "@oh-my-pi/pi-utils";
+import { SQL } from "bun";
+import { Settings } from "../config/settings";
+import { FileSessionStorage, type SessionStorage, setDefaultSessionStorage } from "./session-storage";
+import { SqlSessionStorage } from "./sql-session-storage";
+import { cfgSessionSqlDsnFile, cfgSessionStorage } from "./storage-settings";
+
+const SESSION_STORAGE_ENV = "OMP_SESSION_STORAGE";
+const SESSION_SQL_DSN_FILE_ENV = "OMP_SESSION_SQL_DSN_FILE";
+/**
+ * `0` or `false` opens the store with `createTable: false`: it makes no table
+ * or index and refuses to start until they exist. A pod whose login may not
+ * create objects in `public` sets it, the tables' owner having made them.
+ */
+const SESSION_SQL_CREATE_TABLE_ENV = "OMP_SESSION_SQL_CREATE_TABLE";
+const SESSION_STORAGE_SETTING = cfgSessionStorage.id;
+const SESSION_SQL_DSN_FILE_SETTING = cfgSessionSqlDsnFile.id;
+
+// Bun opens every connection in a pool on its first query. Two connections let
+// a separate-path append proceed while a rename holds its transaction, without
+// spending Bun's default ten database backends for every omp process. Return
+// them between turns; a lifetime cap would only churn actively used connections.
+//
+// No connection-level setting is sent: PgBouncer before 1.26 in transaction
+// mode refuses a `search_path` startup parameter, and a transaction-mode pool
+// would not keep a session-level `SET` for this client anyway. The store runs
+// each transaction on one connection it reserves, and its opening sets with
+// `SET LOCAL` every session setting the store depends on, `search_path`
+// included (see sql-session-postgres-settings.ts), which the pool keeps within
+// that transaction.
+const SESSION_SQL_POOL_MAX = 2;
+const SESSION_SQL_POOL_IDLE_TIMEOUT_SECONDS = 5;
+
+/** A session-storage configuration the process refuses to start with. */
+export class SessionStorageConfigError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "SessionStorageConfigError";
+	}
+}
+
+export interface ResolveSessionStorageInput {
+	settings: Settings;
+	env: NodeJS.ProcessEnv;
+	/**
+	 * Open a `sql` store on its first use instead of now (`omp --no-session`,
+	 * which keeps no session of its own: a subagent's transcript is the first
+	 * use). The configuration is still checked now and refuses as always; only
+	 * the database is left untouched, so one that is down or locked neither
+	 * ends nor stalls a run that never uses it. A failed open is that use's
+	 * error, worded as the refusal at start-up.
+	 */
+	openOnFirstUse?: boolean;
+}
+
+/** Resolve the configured storage; see the module doc for precedence and refusals. */
+export async function resolveSessionStorage({
+	settings,
+	env,
+	openOnFirstUse = false,
+}: ResolveSessionStorageInput): Promise<SessionStorage> {
+	const envKind = env[SESSION_STORAGE_ENV]?.trim();
+	// The configured value unvalidated: the handle would read a typo as the `file` default,
+	// and a misconfigured storage must refuse rather than quietly write sessions to files.
+	// The environment comes from `env`, not the handle, for the same reason.
+	const kind: unknown = envKind || (settings.rawValue(cfgSessionStorage) ?? cfgSessionStorage.default);
+	if (kind === "file") return new FileSessionStorage();
+	if (kind !== "sql") {
+		const source = envKind ? SESSION_STORAGE_ENV : SESSION_STORAGE_SETTING;
+		throw new SessionStorageConfigError(`${source} is ${JSON.stringify(kind)}; expected "file" or "sql"`);
+	}
+
+	const envPath = env[SESSION_SQL_DSN_FILE_ENV]?.trim();
+	const dsnFile = envPath || cfgSessionSqlDsnFile.layered(settings)?.trim();
+	if (!dsnFile) {
+		throw new SessionStorageConfigError(
+			`session storage is sql but no connection-string file is named: set ${SESSION_SQL_DSN_FILE_ENV} or ${SESSION_SQL_DSN_FILE_SETTING}`,
+		);
+	}
+	const source = envPath ? SESSION_SQL_DSN_FILE_ENV : SESSION_SQL_DSN_FILE_SETTING;
+
+	let dsn: string;
+	try {
+		dsn = (await Bun.file(dsnFile).text()).trim();
+	} catch (err) {
+		throw new SessionStorageConfigError(
+			`${source} names ${dsnFile}, which could not be read: ${toError(err).message}`,
+			{
+				cause: err,
+			},
+		);
+	}
+	if (!dsn) throw new SessionStorageConfigError(`${source} names ${dsnFile}, which is empty`);
+
+	let client: SQL;
+	try {
+		client = new SQL(dsn, { max: SESSION_SQL_POOL_MAX, idleTimeout: SESSION_SQL_POOL_IDLE_TIMEOUT_SECONDS });
+	} catch {
+		throw new SessionStorageConfigError(
+			`${source} names ${dsnFile}, but its contents are not a connection URL the database driver accepts`,
+		);
+	}
+	const createTableValue = env[SESSION_SQL_CREATE_TABLE_ENV]?.trim().toLowerCase();
+	const createTable = !(createTableValue === "0" || createTableValue === "false");
+	// The CLI claims every session it writes, so a second live process moves off it.
+	const options = { client, claims: true, createTable };
+	// The client stays open: the next use tries the database again.
+	if (openOnFirstUse) return SqlSessionStorage.createOnFirstUse(options, err => openFailure(source, dsnFile, err));
+	try {
+		return await SqlSessionStorage.create(options);
+	} catch (err) {
+		void client.end().catch(() => undefined);
+		throw openFailure(source, dsnFile, err);
+	}
+}
+
+/**
+ * The refusal for a database that could not be opened: the variable or
+ * setting and the path it named, the driver's code and, when a server
+ * answered, its SQLSTATE; never the connection string.
+ */
+function openFailure(source: string, dsnFile: string, err: unknown): SessionStorageConfigError {
+	const error = toError(err);
+	const code = "code" in error ? error.code : undefined;
+	const labels = [code, serverSqlState(error)].filter(
+		(label): label is string => typeof label === "string" && label.length > 0,
+	);
+	const detail = labels.length > 0 ? `${error.message} (${labels.join(" ")})` : error.message;
+	return new SessionStorageConfigError(
+		`${source} names ${dsnFile}, but the session database could not be opened: ${detail}`,
+		{ cause: error },
+	);
+}
+
+/** Five digits or upper-case letters: the SQL standard's SQLSTATE, which PostgreSQL and MySQL both send. */
+const SQLSTATE = /^[0-9A-Z]{5}$/;
+
+/**
+ * The SQLSTATE a database server refused with, when the driver read one: Bun
+ * keeps PostgreSQL's as `errno` and MySQL's as `sqlState`. Each driver gives
+ * every server refusal one `code` (`ERR_POSTGRES_SERVER_ERROR`,
+ * `ERR_MYSQL_SERVER_ERROR`), so the SQLSTATE is what tells a server that
+ * refuses for now (PostgreSQL 57P03, starting up; 53300, no connection slot
+ * left) from one that will keep refusing (28P01, a password it rejects).
+ */
+function serverSqlState(error: Error): string | undefined {
+	const state =
+		error instanceof SQL.PostgresError ? error.errno : error instanceof SQL.MySQLError ? error.sqlState : undefined;
+	return state !== undefined && SQLSTATE.test(state) ? state : undefined;
+}
+
+/**
+ * Resolve the configured storage and install it as the process default. A
+ * command outside the root command (`omp anonymize`, `omp render`, `omp
+ * share`, …) never reaches the start-up install, so it calls this before it
+ * resolves or lists any session. Throws {@link SessionStorageConfigError} on
+ * the same refusals as {@link resolveSessionStorage}.
+ */
+export async function installConfiguredSessionStorage(cwd: string = process.cwd()): Promise<SessionStorage> {
+	const storage = await resolveSessionStorage({
+		settings: await Settings.loadReadOnly({ cwd }),
+		env: process.env,
+	});
+	setDefaultSessionStorage(storage);
+	return storage;
+}
+
+/** A feature that works only on session files on disk, asked for while sessions are database rows. */
+export class SessionStorageUnsupportedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SessionStorageUnsupportedError";
+	}
+}
+
+/**
+ * Refuse `feature` unless `storage` keeps sessions as files on disk. Under
+ * `session.storage: sql` a session is a row; a feature built on the files
+ * would otherwise see none of them and report or act on a wrong picture.
+ */
+export function assertSessionsOnDisk(storage: SessionStorage, feature: string, reason: string): void {
+	if (storage instanceof FileSessionStorage) return;
+	throw new SessionStorageUnsupportedError(
+		`${feature} is unavailable with ${SESSION_STORAGE_SETTING}: sql: ${reason}`,
+	);
+}
+
+/** Why lease probes (`omp session lease`, RPC `get_session_lease`) refuse under `session.storage: sql`. */
+export const NO_SESSION_LEASE_REASON =
+	"SQL-stored sessions are claimed in their database (a lease row, or for a SQLite file a lock keyed by that database), " +
+	"not by the session-file ownership lease this probe reads, so every session would read as free";
+
+/** Why `/join` refuses under `session.storage: sql`: guest replicas are local transcript files. */
+export const COLLAB_REPLICA_DISK_ONLY_REASON =
+	"collab replicas are local session files, and this store keeps sessions as database rows";
+
+/** Why `gc.autoCompress` refuses under `session.storage: sql`: it compresses session files on disk. */
+export const GC_AUTO_COMPRESS_DISK_ONLY_REASON =
+	"compression rewrites session files on disk in place, and this store keeps sessions as database rows";
+
+/**
+ * Why the usage statistics features (`omp stats`, `/stats`, `/trace`, the
+ * `/usage` activity heatmap) refuse under `session.storage: sql`: the stats store
+ * ingests session files from disk.
+ */
+export const STATS_DISK_ONLY_REASON =
+	"usage statistics are ingested from session files on disk, and this store keeps sessions as database rows the stats ingester never reads";

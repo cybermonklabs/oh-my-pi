@@ -73,8 +73,8 @@ pub use crate::bash::{
 		CompiledUnit, CustomEvent, Event, EventData, EventKind, EventMask, EventSink, NodeRef,
 		Origin, SpanRef, WaitKey,
 	},
-	fd::{BadFd, FdFlags, FdRef},
-	fs::{DirEntry, DirIter, File, FileKind, Fs, FsPending, FsPoll, OpenFlags, Stat},
+	fd::{BadFd, FdFlags, FdRef, Unsettled},
+	fs::{DirEntry, DirIter, File, FileKind, Fs, FsPending, FsPoll, Mark, OpenFlags, Stat},
 	host::{
 		ChildRedir, ChildRedirs, CpuTimes, Deadline, EnvView, ExitStatus, ExtProc, Host, Invocation,
 		Lineage, Login, Logins, OsHandle, PgroupSpec, PipeMirror, PipeTap, ProcEvent, ResolveCtx,
@@ -92,7 +92,7 @@ pub use crate::bash::{
 	store::{Attrs, StateStore, StoreError, VarValue},
 	term::{CtlChar, Pty, SetWhen, Shtty, TermFlag, Terminal, Termios},
 	vm::{
-		Budget, CallOutcome, ControlHandle, Cx, IoPoll, Profile, RunStdio, Script, Shell, ShellApi,
-		ShellInit, Step, ToolCall, VprocSel, WakeToken, vproc_layout,
+		Budget, CallOutcome, ControlHandle, Cx, ExecRefusal, IoPoll, Profile, RunStdio, Script,
+		Shell, ShellApi, ShellInit, Step, ToolCall, VprocSel, WakeToken, vproc_layout,
 	},
 };

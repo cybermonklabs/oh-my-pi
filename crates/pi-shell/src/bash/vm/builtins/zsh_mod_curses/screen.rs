@@ -198,6 +198,10 @@ pub struct Curses {
 	pub fifo:        Vec<u8>,
 	/// Output not written yet (ncurses' output buffer).
 	pub pending:     Vec<u8>,
+	/// The front of `pending` a writer thread took and that is not out yet
+	/// (`zcurses input`'s immediate write): live state, not saved.
+	#[serde(skip)]
+	pub unsettled:   crate::bash::Unsettled,
 	/// The terminal modes before `zcurses init` (zsh `saved_tty_state`).
 	pub saved_tty:   Option<crate::bash::Termios>,
 	/// The terminal modes curses set (zsh `curses_tty_state`).
@@ -238,6 +242,7 @@ impl Curses {
 			keypad_xmit: false,
 			fifo: Vec::new(),
 			pending: Vec::new(),
+			unsettled: crate::bash::Unsettled::default(),
 			saved_tty: None,
 			prog_tty: None,
 			mouse_on: false,

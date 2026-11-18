@@ -143,14 +143,14 @@ impl<'a> Fsq<'a> {
 					let (fd, bytes) = match c {
 						Chunk::Out(fd, b) => (fd, b),
 						Chunk::Diag(d) => (2, ctx.k.render_diag(ctx.cx, ctx.vp, ctx.line, &d)),
+						Chunk::Cont(id) => {
+							ctx.vp.out.push_back(PendingWrite::then_continue(id));
+							continue;
+						},
 					};
-					ctx.vp
-						.out
-						.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+					ctx.vp.out.push_back(PendingWrite::new(fd, bytes.into()));
 				}
-				ctx.vp
-					.out
-					.push_back(PendingWrite { fd: 2, bytes: prompt.into(), off: 0 });
+				ctx.vp.out.push_back(PendingWrite::new(2, prompt.into()));
 				Err(need)
 			},
 		}
