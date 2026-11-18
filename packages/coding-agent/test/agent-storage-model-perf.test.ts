@@ -384,6 +384,9 @@ describe("AgentStorage model perf aggregates", () => {
 			OMP_PROFILE: "",
 			PI_CODING_AGENT_DIR: agentDir,
 			PI_CONFIG_DIR: ".omp",
+			// The config root is this home's `.omp`, not the test process's own.
+			OMP_CONFIG_ROOT: undefined,
+			OMP_DOWNLOAD_ROOT: undefined,
 			PI_PROFILE: "",
 			XDG_CACHE_HOME: tempDir.join("xdg-cache"),
 			XDG_CONFIG_HOME: tempDir.join("xdg-config"),
@@ -446,6 +449,9 @@ describe("AgentStorage model perf aggregates", () => {
 			OMP_PROFILE: "",
 			PI_CODING_AGENT_DIR: agentDir,
 			PI_CONFIG_DIR: ".omp",
+			// The config root is this home's `.omp`, not the test process's own.
+			OMP_CONFIG_ROOT: undefined,
+			OMP_DOWNLOAD_ROOT: undefined,
 			PI_PROFILE: "",
 			XDG_CACHE_HOME: tempDir.join("xdg-cache"),
 			XDG_CONFIG_HOME: tempDir.join("xdg-config"),
@@ -512,7 +518,13 @@ describe("AgentStorage model perf aggregates", () => {
 				`const storage = await AgentStorage.open(${JSON.stringify(dbPath)});`,
 				'void storage.recordModelPerf("openai/natural-exit", { outputTokens: 10, durationMs: 1000 });',
 			].join("\n"),
-			{ ...process.env, HOME: tempDir.path(), USERPROFILE: tempDir.path() },
+			{
+				...process.env,
+				HOME: tempDir.path(),
+				USERPROFILE: tempDir.path(),
+				OMP_CONFIG_ROOT: undefined,
+				OMP_DOWNLOAD_ROOT: undefined,
+			},
 		);
 		expect(exiting.exitCode, exiting.stderr).toBe(0);
 		// A referenced batch timer would hold the process open for the whole window.

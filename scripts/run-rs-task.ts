@@ -2,6 +2,7 @@
 
 import * as path from "node:path";
 import { $ } from "bun";
+import { createTestChildEnv } from "./test-env";
 
 const RUST_AFFECTING_FILE_NAMES = [
 	"Cargo.toml",
@@ -100,8 +101,13 @@ if (taskName !== "fmt:rs") {
 	if (!decision.run) process.exit(0);
 }
 
+// Cargo's tests get the environment the preload gives a `bun test` process, since cargo has no
+// preload: without it a Rust test ran the developer's git wrapper, read their `~/.gitconfig` and
+// `JJ_CONFIG`, and saw the rest of their machine's environment. Cargo's and rustup's own names
+// (`CARGO_*`, `RUSTUP_*`, `RUST*`) are none the product reads, so they pass unchanged.
+const childEnv = taskName === "test:rs" ? createTestChildEnv(process.env) : process.env;
 for (const command of TASK_COMMANDS[taskName]) {
-	const exitCode = await runCommand(command);
+	const exitCode = await runCommand(command, childEnv);
 	if (exitCode !== 0) {
 		process.exit(exitCode);
 	}
@@ -241,11 +247,11 @@ async function resolveCargoBinary(): Promise<string> {
 	return "cargo";
 }
 
-async function runCommand(command: readonly string[]): Promise<number> {
+async function runCommand(command: readonly string[], baseEnv: Record<string, string | undefined>): Promise<number> {
 	const [head, ...rest] = command;
 	const isCargo = head === "cargo";
 	const argv = isCargo ? [cargoBinary, ...rest] : [head, ...rest];
-	const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+	const env = { ...baseEnv };
 	if (isCargo) {
 		// Cargo subprocesses (notably `rustc -vV` from `cargo metadata`) resolve
 		// via PATH; ensure the active toolchain bin dir wins over Homebrew's
