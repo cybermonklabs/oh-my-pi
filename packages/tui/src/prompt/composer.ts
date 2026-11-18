@@ -353,10 +353,12 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 
 	constructor(options: ComposerOptions = {}) {
 		ensureThemeSync();
-		// Host-owned hard exit: route through postmortem so a double-Ctrl-C during
-		// an open extension-load guard window exits cleanly instead of throwing
-		// ExtensionExitError through the guarded process.exit (#11789).
-		this.#exit = options.exit ?? (code => postmortem.exitProcess(code));
+		// Host-owned exit: postmortem's cleanup runs first (a SQL session store gives
+		// back the lease the launch took before its extensions load), then the exit
+		// goes past the guarded process.exit, so a double Ctrl-C during an open
+		// extension-load guard window exits cleanly instead of throwing
+		// ExtensionExitError (#11789).
+		this.#exit = options.exit ?? (code => void postmortem.exitAfterCleanup(code, { exit: "native" }));
 		this.#now = options.now ?? Date.now;
 		this.#preferences = { ...COMPOSER_DEFAULTS, ...options.preferences };
 		this.#applyWelcomeUpdate(options.welcome ?? {});

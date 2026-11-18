@@ -19,7 +19,7 @@ import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, postmortem, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionAskDialogQuestion,
@@ -49,7 +49,12 @@ import {
 	wordCompletionQuery,
 } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
-import { type AgentSession, type NavigateTreeResult, SessionBusyError } from "../../session/agent-session";
+import {
+	type AgentSession,
+	type NavigateTreeResult,
+	SessionBusyError,
+	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+} from "../../session/agent-session";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
@@ -1418,7 +1423,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const outputWriter = new RpcOutputWriter(stdout, failure => {
 		logger.error("RPC output delivery failed", { error: String(failure) });
 		dictationBridge?.dispose();
-		void session.dispose().finally(() => process.exit(1));
+		// Through postmortem's cleanup, which gives back any session lease the dispose left (a subagent's). Stdout
+		// failed, so nothing waits for it to drain.
+		void session.dispose().finally(() => postmortem.exitAfterCleanup(1, { drainStdout: false }));
 	});
 	outputWriter.write(
 		frameEncoder.encodeFrames({
@@ -1512,6 +1519,20 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 	};
 	const subagentRegistry = subagentEventBus ? new RpcSubagentRegistry(subagentEventBus, output) : undefined;
+
+	// A signal (SIGINT, SIGTERM, SIGHUP) ends the process through postmortem, which runs this before it exits
+	// 130, 143 or 129: dispose the session as the stdin-EOF path, print mode and interactive mode do, so
+	// `session_shutdown` runs and the session manager closes, which releases a SQL store's lease after its last
+	// publish. Registered before this mode emits `session_start` and reconciles goals, so a signal there disposes the
+	// session too. Earlier in startup (while extensions load) no mode teardown exists yet; the store that holds the
+	// lease gives it back itself, after every other cleanup callback has settled (postmortem's `afterOthers`).
+	postmortem.register("rpc-mode-session", async reason => {
+		subagentRegistry?.dispose();
+		dictationBridge.dispose();
+		await liveBridge.stop().catch(() => undefined);
+		await btw.close().catch(() => undefined);
+		await session.dispose({ reason, mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+	});
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -1867,12 +1888,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			} catch {
 				// A mirror that cannot be written must not cost the exit code.
 			}
-			process.exit(1);
+			return postmortem.exitAfterCleanup(1);
 		}
 		// A failure that already reported and then recovered still leaves its notice
 		// queued here, so the success path drains the same queue before it exits.
 		await outputWriter.close();
-		process.exit(0);
+		// Through postmortem's cleanup, which gives back any session lease the dispose left (a subagent's).
+		return postmortem.exitAfterCleanup(0);
 	};
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);

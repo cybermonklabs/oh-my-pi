@@ -843,12 +843,30 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 		expect([await read(files[0] ?? ""), await read(files[1] ?? "")]).toEqual([expected, expected]);
 	});
 
-	/** One object a login that owns the store's tables can plant on them, and the words the refusal must name. */
+	/**
+	 * One object a login that owns the store's tables can plant on them, or beside them, and the words the refusal
+	 * must name; `opens` for a plant the store must open beside, a control. `afterWrite` runs, as the planter, once
+	 * the store's write has landed and before its delete.
+	 */
 	interface Plant {
 		name: string;
 		statements(db: LeaseDb, log: string): string[];
+		afterWrite?(db: LeaseDb): string[];
 		named: string[];
+		opens?: true;
 	}
+	/** Another login, which plants a table of its own beside the store's. */
+	const planter = `planted_planter_${process.pid}`;
+
+	/**
+	 * A function that records its call in the log, as the role it runs as, and warns: VOLATILE, so an IMMUTABLE
+	 * function that PostgreSQL requires (a partition key) can still write the log through it.
+	 */
+	const plantedLogger = (log: string) =>
+		`CREATE FUNCTION public.planted_logged_${process.pid}(what text) RETURNS text LANGUAGE plpgsql VOLATILE AS $$ BEGIN RAISE WARNING 'planted % ran as %', what, current_user; INSERT INTO ${log} VALUES (what); RETURN what; END $$`;
+	/** A partition key function: IMMUTABLE, as PostgreSQL requires, and logged. */
+	const plantedKey = (what: string) =>
+		`CREATE FUNCTION public.planted_key_${process.pid}(p text) RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN PERFORM public.planted_logged_${process.pid}('${what}'); RETURN p; END $$`;
 
 	const PLANTS: Plant[] = [
 		{
@@ -899,10 +917,57 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 			],
 			named: ["has table", "_child inheriting from it"],
 		},
+		{
+			name: "a parent it is a partition of, keyed on a function",
+			// Every insert into a partition checks the partition constraint, which runs the parent's key as the writer.
+			statements: (db, log) => [
+				plantedLogger(log),
+				plantedKey("partition key"),
+				`CREATE TABLE public.planted_parted_${process.pid} (LIKE ${db.table}) PARTITION BY RANGE (public.planted_key_${process.pid}(path))`,
+				`ALTER TABLE public.planted_parted_${process.pid} ATTACH PARTITION ${db.table} FOR VALUES FROM (MINVALUE) TO (MAXVALUE)`,
+			],
+			named: ["is a partition of", `.planted_parted_${process.pid}`],
+		},
+		{
+			name: "a parent it inherits from",
+			statements: db => [
+				`CREATE TABLE public.planted_parent_${process.pid} (LIKE ${db.table})`,
+				`ALTER TABLE ${db.table} INHERIT public.planted_parent_${process.pid}`,
+			],
+			named: ["inherits from", `.planted_parent_${process.pid}`],
+		},
+		{
+			name: "a foreign key of another login's table that references it, with a delete trigger",
+			// A delete from the session table fires the key's cascade on the other table, and so that table's trigger.
+			statements: (db, log) => [
+				plantedLogger(log),
+				`GRANT EXECUTE ON FUNCTION public.planted_logged_${process.pid}(text) TO PUBLIC`,
+				`CREATE ROLE ${planter}`,
+				`GRANT USAGE, CREATE ON SCHEMA public TO ${planter}`,
+				`GRANT REFERENCES ON ${db.table} TO ${planter}`,
+				`SET ROLE ${planter}; CREATE TABLE public.planted_fkref_${process.pid} (path text REFERENCES ${db.table} (path) ON DELETE CASCADE); CREATE FUNCTION public.planted_fkref_trg_${process.pid}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM public.planted_logged_${process.pid}('referencing table trigger'); RETURN OLD; END $$; CREATE TRIGGER planted BEFORE DELETE ON public.planted_fkref_${process.pid} FOR EACH ROW EXECUTE FUNCTION public.planted_fkref_trg_${process.pid}(); RESET ROLE`,
+			],
+			afterWrite: db => [
+				`SET ROLE ${planter}; INSERT INTO public.planted_fkref_${process.pid} VALUES ($q$${sessionPath(db)}$q$); RESET ROLE`,
+			],
+			named: ["has a foreign key of table public.planted_fkref_", "referencing it"],
+		},
+		{
+			name: "a partitioned table of another login's beside them, keyed on a function",
+			// The control: a parent and a partition that are not the store's tables leave them as they are.
+			statements: (_db, log) => [
+				plantedLogger(log),
+				plantedKey("unrelated partition key"),
+				`CREATE TABLE public.planted_parted_${process.pid} (path text) PARTITION BY RANGE (public.planted_key_${process.pid}(path))`,
+				`CREATE TABLE public.planted_other_${process.pid} PARTITION OF public.planted_parted_${process.pid} FOR VALUES FROM (MINVALUE) TO (MAXVALUE)`,
+			],
+			named: [],
+			opens: true,
+		},
 	];
 
 	for (const plant of PLANTS) {
-		it(`refuses to open on tables with ${plant.name}, and runs none of its code`, async () => {
+		it(`${plant.opens ? "opens" : "refuses to open"} on tables with ${plant.name}, and runs none of its code`, async () => {
 			await using db = await openLeaseDb("postgres", pgUrl ?? "");
 			const log = `public.planted_log_${process.pid}`;
 			// The store runs as a login with row access only, not as the scratch server's
@@ -930,15 +995,30 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 						lease: { expiryMs: 3000, heartbeatMs: 100 },
 					}).then(
 						async storage => {
-							// What a store that opens does next: a claim, writes, heartbeats, a release.
+							// What a store that opens does next: a claim, a write it waits for, the planter's step, a
+							// delete it waits for, heartbeats, a release. Each outcome is kept, so code that ran in
+							// a write is in the log only if that write committed, and the outcome says whether it did.
 							const file = sessionPath(db);
 							const release = await storage.acquireSessionClaim?.(ID, file);
-							await storage.writeText(file, transcript(ID, "after opening")).catch(() => undefined);
-							await storage.unlink(file).catch(() => undefined);
+							const wrote = await storage
+								.writeText(file, transcript(ID, "after opening"))
+								.then(() => storage.drain())
+								.then(
+									() => "write landed",
+									(err: unknown) => `write failed: ${String(err)}`,
+								);
+							for (const statement of plant.afterWrite?.(db) ?? []) await db.sql(statement);
+							const deleted = await storage
+								.unlink(file)
+								.then(() => storage.drain())
+								.then(
+									() => "delete landed",
+									(err: unknown) => `delete failed: ${String(err)}`,
+								);
 							await Bun.sleep(400);
 							release?.();
 							await storage.drain().catch(() => undefined);
-							return "opened";
+							return `opened (${wrote}; ${deleted})`;
 						},
 						(err: unknown) => String(err),
 					);
@@ -947,18 +1027,27 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 				}
 				const ran = (await db.sql(`SELECT what FROM ${log}`)).map(row => String(row.what));
 				expect({
-					refused: plant.named.every(words => outcome.includes(words)) ? "names it" : outcome,
+					outcome: plant.opens
+						? outcome
+						: plant.named.every(words => outcome.includes(words))
+							? "names it"
+							: outcome,
 					ran,
-				}).toEqual({ refused: "names it", ran: [] });
+				}).toEqual({ outcome: plant.opens ? "opened (write landed; delete landed)" : "names it", ran: [] });
 			} finally {
 				await db.sql(`DROP TABLE IF EXISTS ${db.leaseTable}, ${db.table}_parts, ${db.table} CASCADE`);
+				await db.sql(
+					`DROP TABLE IF EXISTS public.planted_parted_${process.pid}, public.planted_parent_${process.pid}, public.planted_other_${process.pid}, public.planted_fkref_${process.pid} CASCADE`,
+				);
 				await db.sql(`DROP TABLE IF EXISTS ${log}`);
 				await db.sql(
-					`DROP FUNCTION IF EXISTS public.planted_to_ts_${process.pid}(bigint), public.planted_trigger_${process.pid}(), public.planted_policy_${process.pid}(), public.planted_child_${process.pid}() CASCADE`,
+					`DROP FUNCTION IF EXISTS public.planted_to_ts_${process.pid}(bigint), public.planted_trigger_${process.pid}(), public.planted_policy_${process.pid}(), public.planted_child_${process.pid}(), public.planted_key_${process.pid}(text), public.planted_logged_${process.pid}(text), public.planted_fkref_trg_${process.pid}() CASCADE`,
 				);
 				await db.sql(`DROP TYPE IF EXISTS public.planted_ts_${process.pid} CASCADE`);
-				await db.sql(`DROP OWNED BY ${storeRole}`).catch(() => undefined);
-				await db.sql(`DROP ROLE IF EXISTS ${storeRole}`);
+				for (const role of [storeRole, planter]) {
+					await db.sql(`DROP OWNED BY ${role}`).catch(() => undefined);
+					await db.sql(`DROP ROLE IF EXISTS ${role}`);
+				}
 			}
 		}, 30_000);
 	}

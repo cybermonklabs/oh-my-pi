@@ -4,7 +4,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { getProjectDir, isEnoent, readImageMetadata } from "@oh-my-pi/pi-utils";
+import { getProjectDir, isEnoent, postmortem, readImageMetadata } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { resolveReadPath } from "../tools/path-utils";
 import { formatBytes } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -34,7 +34,11 @@ export interface ProcessFileOptions {
 	autoResizeImages?: boolean;
 }
 
-/** Process @file arguments into text, document content, and image attachments */
+/**
+ * Process @file arguments into text, document content, and image attachments. A file that cannot be read ends the
+ * process with exit 1, through postmortem's cleanup: a launch reads them once it holds its session's lease, which
+ * that cleanup gives back.
+ */
 export async function processFileArguments(fileArgs: string[], options?: ProcessFileOptions): Promise<ProcessedFiles> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	let text = "";
@@ -47,7 +51,7 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 		const stat = fs.statSync(absolutePath, { throwIfNoEntry: false });
 		if (!stat) {
 			console.error(chalk.red(`Error: File not found: ${absolutePath}`));
-			process.exit(1);
+			return postmortem.exitAfterCleanup(1);
 		}
 
 		const imageMetadata = await readImageMetadata(absolutePath);
@@ -91,7 +95,7 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 		} catch (err) {
 			if (isEnoent(err)) {
 				console.error(chalk.red(`Error: File not found: ${absolutePath}`));
-				process.exit(1);
+				return postmortem.exitAfterCleanup(1);
 			}
 			throw err;
 		}
@@ -153,7 +157,7 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);
 				console.error(chalk.red(`Error: Could not read file ${absolutePath}: ${message}`));
-				process.exit(1);
+				return postmortem.exitAfterCleanup(1);
 			}
 		}
 	}

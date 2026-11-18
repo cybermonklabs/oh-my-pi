@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- `postmortem.register()` takes `afterOthers: true`: the callback starts only once every other callback of the same cleanup pass has settled, resolved or rejected, late registrations included, under the pass's one deadline, so it can release what the others would have released and find only what they left. A pass that ends at its deadline first does not start it. One without a `deadlineMs` of its own gets no time past the 10 s deadline: when another callback's `deadlineMs` held the pass open that long, it starts once that callback settles and the pass ends at once. With a `deadlineMs` of its own, the pass waits for it that long once it starts, also past the 10 s deadline. A `deadlineMs` callback's `waitMessage` does not wait for `afterOthers` callbacks.
+- `postmortem.exitAfterCleanup(code, { exit })`: runs every cleanup callback, then exits, and does not return, for a caller that must not go on; unlike `process.exit`, it waits for asynchronous cleanup callbacks first, and unlike `exitProcess`, it runs them at all. `exit: "native"` ends through `exitProcess`, past the extension-load guard, for a host-owned exit that can come while extensions load.
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

@@ -9774,8 +9774,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// Await the idempotent dispose() before exiting so the browser
 				// reaper and other bounded teardown complete — a fire-and-forget
 				// `void this.dispose()` raced process.exit() and could leave an
-				// OMP-owned Chromium alive (#5643).
-				void this.dispose().finally(() => process.exit(0));
+				// OMP-owned Chromium alive (#5643). The exit then runs postmortem's
+				// cleanup, which gives back any session lease the dispose left.
+				void this.dispose().finally(() => postmortem.exitAfterCleanup(0));
 			},
 			resolvePlanReview: () => false,
 			getPendingPlanReview: () => undefined,

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The composer's own exit (Ctrl+C twice, Ctrl+D on an empty draft, before a host installs its handlers) and the debug socket's `quit` op run postmortem's cleanup before the process exits, still past the extension-load guard; they skipped it, or did not wait for it, before.
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

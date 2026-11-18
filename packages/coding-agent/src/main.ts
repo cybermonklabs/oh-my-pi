@@ -315,20 +315,24 @@ function applyProtocolDefaults(host: ProtocolHost, targetSettings: Settings = se
 	}
 }
 
+// From `createSessionManager` on, a launch may hold its session's lease (SQL storage). Its exits go through
+// `postmortem.exitAfterCleanup`, whose cleanup gives the lease back before the process ends, and never through a
+// bare `process.exit`, which starts that cleanup without waiting for it and leaves the row until it expires.
+
 /** `--no-ui` only applies to RPC modes; reject it elsewhere (exit 1). */
-function rejectNoUiWithoutRpc(args: Pick<Args, "noUi" | "mode">): void {
+async function rejectNoUiWithoutRpc(args: Pick<Args, "noUi" | "mode">): Promise<void> {
 	if (!args.noUi || args.mode === "rpc" || args.mode === "rpc-ui") return;
 	process.stderr.write(`${chalk.red("Error: --no-ui requires --mode rpc or --mode rpc-ui")}\n`);
-	process.exit(1);
+	await postmortem.exitAfterCleanup(1);
 }
 
 /** Fail an interactive launch whose stdin is not a terminal: the TUI cannot run there. */
-function exitWithoutTerminal(): never {
+function exitWithoutTerminal(): Promise<never> {
 	process.stderr.write(
 		`${chalk.red("Error: interactive mode requires a terminal, but stdin is not a TTY.")}\n` +
 			`Pass a prompt (\`${APP_NAME} -p "…"\`), pipe one on stdin, or use \`--mode rpc\`.\n`,
 	);
-	process.exit(2);
+	return postmortem.exitAfterCleanup(2);
 }
 
 /** Reads a non-TTY stdin stream as prompt text. */
@@ -924,12 +928,12 @@ export class SessionResolutionError extends Error {
 	}
 }
 
-function exitForSessionResolutionError(error: SessionResolutionError): never {
+function exitForSessionResolutionError(error: SessionResolutionError): Promise<never> {
 	process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
 	if (error.hint) {
 		process.stderr.write(`${chalk.dim(error.hint)}\n`);
 	}
-	process.exit(1);
+	return postmortem.exitAfterCleanup(1);
 }
 
 function resolveForeignSessionSource(
@@ -1623,7 +1627,7 @@ export async function buildSessionOptions(
 			process.stderr.write(
 				`${chalk.red(resolved.error ?? `Provider "${resolved.disabledProvider}" is disabled.`)}\n`,
 			);
-			process.exit(1);
+			await postmortem.exitAfterCleanup(1);
 		}
 		const matchedAfterMissingRolePattern = (resolved.configuredPatternIndex ?? 0) > 0;
 		if (matchedAfterMissingRolePattern) {
@@ -1650,7 +1654,7 @@ export async function buildSessionOptions(
 				options.modelPattern = parsed.model;
 			} else {
 				process.stderr.write(`${chalk.red(resolved.error)}\n`);
-				process.exit(1);
+				await postmortem.exitAfterCleanup(1);
 			}
 		} else if (resolved.model) {
 			options.model = resolved.model;
@@ -1981,7 +1985,7 @@ export async function runRootCommand(
 		// A pending invalid `--mode` leaves `mode` unset; report it (exit 2) at the
 		// post-extension recheck before judging `--no-ui` against the mode.
 		if (parsedArgs.invalidFlagValues.length === 0) {
-			rejectNoUiWithoutRpc(parsedArgs);
+			await rejectNoUiWithoutRpc(parsedArgs);
 		}
 		const mode = parsedArgs.mode || "text";
 		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
@@ -2046,7 +2050,7 @@ export async function runRootCommand(
 			parsedArgs.unrecognizedFlags.length === 0 &&
 			parsedArgs.invalidFlagValues.length === 0
 		) {
-			exitWithoutTerminal();
+			return exitWithoutTerminal();
 		}
 		// Only the interactive host renders a focusable Agent Hub / subagent session
 		// tree; declare it so headless subagent optimizations (e.g. skipping replan
@@ -2321,7 +2325,7 @@ export async function runRootCommand(
 			}
 		} catch (error: unknown) {
 			if (error instanceof SessionResolutionError) {
-				exitForSessionResolutionError(error);
+				await exitForSessionResolutionError(error);
 			}
 			throw error;
 		}
@@ -2355,7 +2359,7 @@ export async function runRootCommand(
 		if (typeof parsedArgs.resume === "string" && !sessionManager) {
 			writeStartupNotice(parsedArgs, `${chalk.dim("Resume cancelled: session was not moved.")}\n`);
 			stopStartupWatchdog();
-			process.exit(0);
+			return postmortem.exitAfterCleanup(0);
 		}
 
 		// Handle --resume (no value): show session picker. Skipped under
@@ -2387,7 +2391,7 @@ export async function runRootCommand(
 				if (preloadedAllSessions.sessions.length === 0) {
 					writeStartupNotice(parsedArgs, `${chalk.dim("No sessions found")}\n`);
 					stopStartupWatchdog();
-					process.exit(0);
+					return postmortem.exitAfterCleanup(0);
 				}
 			}
 			pauseStartupWatchdog();
@@ -2407,7 +2411,7 @@ export async function runRootCommand(
 				// in-session `/resume` picker (selector-controller.ts) takes a different
 				// onCancel that just closes the overlay — only this startup path exits.
 				stopStartupWatchdog();
-				process.exit(0);
+				return postmortem.exitAfterCleanup(0);
 			}
 			// A preliminary row (indexed title, no content read) lacks the recorded
 			// cwd the removed-worktree check below needs.
@@ -2415,19 +2419,31 @@ export async function runRootCommand(
 			const continuation = await findSessionContinuation(selected.path);
 			if (continuation) resumedContinuations.push(continuation);
 			const chosen = continuation?.session ?? selected;
-			try {
-				sessionManager = await claimOpenedSession(
-					await forkIfMovedAwayUnlessExclusive(
-						(await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
-							? await openRelocatedSession(chosen, cwd, parsedArgs.sessionDir)
-							: await SessionManager.open(chosen.path),
-						parsedArgs.sessionDir,
-					),
-				);
-			} catch (error: unknown) {
-				if (error instanceof SessionResolutionError) exitForSessionResolutionError(error);
-				throw error;
+			// The pick replaces the session `createSessionManager` resumed on its own (`autoResume`): that one is closed
+			// once the pick holds its claim, so its lease goes back and another process can open it. A pick of that
+			// same session keeps its manager and opens no second one: a second manager of one session would be refused
+			// wherever a session has one writer, and move the pick to a new id.
+			const replaced = sessionManager;
+			let pickedManager: SessionManager;
+			if (replaced !== undefined && replaced.getSessionFile() === chosen.path) {
+				pickedManager = replaced;
+			} else {
+				try {
+					pickedManager = await claimOpenedSession(
+						await forkIfMovedAwayUnlessExclusive(
+							(await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
+								? await openRelocatedSession(chosen, cwd, parsedArgs.sessionDir)
+								: await SessionManager.open(chosen.path),
+							parsedArgs.sessionDir,
+						),
+					);
+				} catch (error: unknown) {
+					if (error instanceof SessionResolutionError) await exitForSessionResolutionError(error);
+					throw error;
+				}
+				if (replaced && replaced !== pickedManager) await replaced.close();
 			}
+			sessionManager = pickedManager;
 			const previousCwd = cwd;
 			// A relocated session's `chosen.cwd` is the removed worktree: missing, so the launch cwd stays.
 			const recordedCwd = chosen.cwd || sessionManager.getRecordedCwd() || sessionManager.getCwd();
@@ -2548,7 +2564,7 @@ export async function runRootCommand(
 				process.stderr.write(
 					`${chalk.red("--api-key requires a model to be specified via --model, --provider/--model, or --models")}\n`,
 				);
-				process.exit(1);
+				return postmortem.exitAfterCleanup(1);
 			}
 			if (sessionOptions.model) {
 				authStorage.keys.setRuntime(sessionOptions.model.provider, parsedArgs.apiKey);
@@ -2578,7 +2594,7 @@ export async function runRootCommand(
 				(sessionOptions.additionalExtensionPaths?.length ?? 0) === 0 &&
 				reportInvalidFlagValues(parsedArgs)
 			) {
-				process.exit(2);
+				return postmortem.exitAfterCleanup(2);
 			}
 			const createAcpSession = createAcpSessionFactory({
 				baseOptions: sessionOptions,
@@ -2641,7 +2657,7 @@ export async function runRootCommand(
 				validateSessionPersistenceArgs(initialArgs);
 			} catch (error: unknown) {
 				if (error instanceof SessionResolutionError) {
-					exitForSessionResolutionError(error);
+					await exitForSessionResolutionError(error);
 				}
 				throw error;
 			}
@@ -2668,9 +2684,9 @@ export async function runRootCommand(
 			const invalidValues = reportInvalidFlagValues(initialArgs);
 			const unknownFlags = reportUnrecognizedFlags(initialArgs);
 			if (invalidValues || unknownFlags) {
-				process.exit(2);
+				return postmortem.exitAfterCleanup(2);
 			}
-			rejectNoUiWithoutRpc(parsedArgs);
+			await rejectNoUiWithoutRpc(parsedArgs);
 			validateRestorePrompt(initialArgs);
 			if (initialArgs.goal !== undefined) {
 				validateGoalStartup(
@@ -2681,7 +2697,7 @@ export async function runRootCommand(
 				);
 			}
 			if (autoPrintNeedsArgPrompt && initialArgs.messages.length === 0 && initialArgs.fileArgs.length === 0) {
-				exitWithoutTerminal();
+				return exitWithoutTerminal();
 			}
 			const processedFiles =
 				initialArgs.fileArgs.length > 0
@@ -2930,12 +2946,12 @@ export async function runRootCommand(
 					process.stderr.write(
 						`\nRun \`${APP_NAME} models find <pattern>\` to search, or \`${APP_NAME} models\` to list all.\n`,
 					);
-					process.exit(1);
+					return postmortem.exitAfterCleanup(1);
 				}
 				process.stderr.write(`${chalk.yellow("\nSet an API key environment variable:")}\n`);
 				process.stderr.write("  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.\n");
 				process.stderr.write(`${chalk.yellow(`\nOr create ${ModelsConfigFile.path()}`)}\n`);
-				process.exit(1);
+				return postmortem.exitAfterCleanup(1);
 			}
 
 			if (mode === "rpc" || mode === "rpc-ui" || isInteractive) {
@@ -2980,7 +2996,7 @@ export async function runRootCommand(
 				if ($env.PI_TIMING) {
 					logger.printTimings();
 					if (logger.shouldExitAfterTimings()) {
-						process.exit(0);
+						return postmortem.exitAfterCleanup(0);
 					}
 				}
 				const startupLease = takeStartupComposerLease();

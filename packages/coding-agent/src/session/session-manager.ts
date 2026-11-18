@@ -1423,8 +1423,9 @@ export class SessionManager {
 		claim.release = undefined;
 		// A subagent transcript follows its parent to the sibling the parent moves to.
 		if (this.#followParentMove()) return;
-		this.#moveOffSessionFile("open-elsewhere", { why: "another omp process took its lease over" });
-		if (!this.#exclusiveStopping) this.#rewriteSynchronously();
+		if (this.#moveOffSessionFile("open-elsewhere", { why: "another omp process took its lease over" })) {
+			this.#rewriteSynchronously();
+		}
 	}
 
 	/**
@@ -1594,6 +1595,10 @@ export class SessionManager {
 			process.stderr.write(
 				`Session ${sessionId} stops (${reason}): ${why}${by}. OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id.\n`,
 			);
+			// The stop ends the process at once, without postmortem's cleanup, so nothing more of the session runs; a
+			// claim the store still holds (a subagent's, the session's own when a write found the file changed) goes
+			// back first, within the release's bound. The session's lost or refused claim deletes nothing.
+			await this.#storage.releaseHeldClaims?.().catch(() => undefined);
 			process.exit(1);
 		})();
 	}
@@ -1815,8 +1820,8 @@ export class SessionManager {
 	 * after that.
 	 *
 	 * Under `OMP_SESSION_EXCLUSIVE=1` it moves nothing: the session stops
-	 * ({@link #stopExclusive}) and this returns the old path, which the sealed
-	 * manager no longer writes. A subagent transcript's fork (`place`: the
+	 * ({@link #stopExclusive}) and this returns `undefined`: the session writes
+	 * nothing more, its old path least of all. A subagent transcript's fork (`place`: the
 	 * directory to fork into and the session its header names as parent)
 	 * moves under the variable too: its id is never the launcher's recorded one.
 	 *
@@ -1829,11 +1834,11 @@ export class SessionManager {
 		reason: SessionPersistenceNotice["reason"],
 		detail: { holder?: SessionClaimHolder; why?: string } = {},
 		place?: { dir: string; parentSession: string },
-	): string {
+	): string | undefined {
 		const from = this.#sessionFile as string;
 		if (isSessionExclusive() && !place) {
 			this.#stopExclusive(reason, detail);
-			return from;
+			return undefined;
 		}
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
@@ -2069,10 +2074,13 @@ export class SessionManager {
 		if (sessionFile === this.#sessionFile && this.#holdForParentMove()) {
 			throw new SessionLeaseLostError(sessionFile, this.#leaseId());
 		}
-		const target =
-			sessionFile === this.#sessionFile && this.#sessionOwnedElsewhere()
-				? this.#moveOffSessionFile("open-elsewhere")
-				: sessionFile;
+		let target = sessionFile;
+		if (sessionFile === this.#sessionFile && this.#sessionOwnedElsewhere()) {
+			const sibling = this.#moveOffSessionFile("open-elsewhere");
+			// A session that stops instead publishes nothing more, at its old path least of all.
+			if (!sibling) throw new SessionLeaseLostError(sessionFile, this.#leaseId());
+			target = sibling;
+		}
 		const body = this.#serializeBody();
 		const options = { expectedSize: this.#expectedDiskSize, commitGuard };
 		try {
@@ -2093,6 +2101,7 @@ export class SessionManager {
 					this.#sessionFile && this.#sessionFile !== target
 						? this.#sessionFile
 						: this.#moveOffSessionFile("open-elsewhere");
+				if (!sibling) throw error;
 				return this.#publishAuthoritativeBody(sibling, operationError, commitGuard, recoveries + 1);
 			}
 			const retryPath = await this.#recoverFromWriteConflict(error, recoveries);
@@ -2271,7 +2280,12 @@ export class SessionManager {
 		// A subagent transcript whose parent's lease it cannot hold publishes under the parent's sibling, once it exists.
 		if (this.#holdForParentMove()) return;
 		try {
-			if (this.#sessionOwnedElsewhere()) targetPath = this.#moveOffSessionFile("open-elsewhere");
+			if (this.#sessionOwnedElsewhere()) {
+				const sibling = this.#moveOffSessionFile("open-elsewhere");
+				// A session that stops instead writes nothing more, at its old path least of all.
+				if (!sibling) return;
+				targetPath = sibling;
+			}
 			let body = this.#serializeBody();
 			this.#diskEpoch++;
 			this.#diskTail = Promise.resolve();
@@ -2413,7 +2427,7 @@ export class SessionManager {
 					await this.#storage.confirmWrites?.(unconfirmed).catch(() => undefined);
 				}
 				if (this.#holdForParentMove()) return false;
-				if (this.#sessionOwnedElsewhere()) this.#moveOffSessionFile("open-elsewhere");
+				if (this.#sessionOwnedElsewhere() && !this.#moveOffSessionFile("open-elsewhere")) return false;
 				const sessionFile = this.#sessionFile;
 				if (!sessionFile) return false;
 				if (this.#diskEpoch !== epoch) return false;
@@ -3031,11 +3045,14 @@ export class SessionManager {
 			},
 			onLost: () => this.#onSessionClaimLost(sessionId),
 		});
+		// The claim is this call's until the load adopts it with the id: every other way out lets it go, a throw, a
+		// file that holds another session by then, or one emptied since its header was read (a new session starts
+		// there, under an id of its own).
+		const claimed = { sessionId, release, holder, adopted: false };
 		try {
-			await this.#setSessionFile(resolved, undefined, { claimed: { sessionId, release, holder } });
-		} catch (err) {
-			release?.();
-			throw err;
+			await this.#setSessionFile(resolved, undefined, { claimed });
+		} finally {
+			if (!claimed.adopted) release?.();
 		}
 	}
 
@@ -3046,8 +3063,16 @@ export class SessionManager {
 			throwIfMissing?: boolean;
 			newSession?: NewSessionOptions;
 			keepClaim?: boolean;
-			/** The lease {@link setSessionFile} took before it loaded the file: adopted with the id, in one step. */
-			claimed?: { sessionId: string; release: (() => void) | null; holder: SessionClaimHolder | undefined };
+			/**
+			 * The lease {@link setSessionFile} took before it loaded the file: adopted with the id, in one step, and
+			 * marked `adopted`; {@link setSessionFile} releases it otherwise.
+			 */
+			claimed?: {
+				sessionId: string;
+				release: (() => void) | null;
+				holder: SessionClaimHolder | undefined;
+				adopted: boolean;
+			};
 		},
 	): Promise<void> {
 		await this.#drainAndCloseWriter();
@@ -3141,10 +3166,8 @@ export class SessionManager {
 		// nothing observes the id without its claim, or a held id at all.
 		const claimed = options?.claimed;
 		if (claimed) {
-			if (claimed.sessionId !== this.#sessionId) {
-				claimed.release?.();
-				return;
-			}
+			if (claimed.sessionId !== this.#sessionId) return;
+			claimed.adopted = true;
 			this.#sessionClaim = { sessionId: claimed.sessionId, release: claimed.release ?? undefined };
 			if (!claimed.release && !this.#followParentMove()) {
 				this.#moveOffSessionFile("open-elsewhere", {
@@ -3789,6 +3812,9 @@ export class SessionManager {
 				this.#sessionFile &&
 				this.#storage.defersSyncPublish &&
 				!this.#entriesReleased &&
+				// A session that stopped under OMP_SESSION_EXCLUSIVE=1 writes nothing more: another process holds its
+				// file, and a signal's teardown may close it during the stop's wait.
+				!this.#exclusiveStopping &&
 				this.#shouldHaveSessionFile()
 			) {
 				// Deferred-publish only: a synchronous backend's drain() is a

@@ -213,6 +213,88 @@ export function transcript(id: string, text: string, cwd = "/project"): string {
 		.join("\n")}\n`;
 }
 
+/**
+ * A database of its own on the server `url` names, under the CLI's default table names, the DSN that reaches it and
+ * a client on it, for tests that run the CLI against it.
+ */
+export async function cliDatabase(
+	adapter: SqlSessionStorageAdapter,
+	url: string,
+): Promise<AsyncDisposable & { dsn: string; sql: SqlClient }> {
+	const name = `omp_cli_${process.pid}_${Date.now().toString(36)}_${sequence++}`;
+	const admin = new SQL(url);
+	await admin.unsafe(`CREATE DATABASE ${name}`);
+	const dsn = new URL(url);
+	dsn.pathname = `/${name}`;
+	const sql = new SQL(dsn.toString());
+	return {
+		dsn: dsn.toString(),
+		sql,
+		async [Symbol.asyncDispose]() {
+			await sql.end();
+			await admin.unsafe(`DROP DATABASE IF EXISTS ${name}${adapter === "postgres" ? " WITH (FORCE)" : ""}`);
+			await admin.end();
+		},
+	};
+}
+
+/**
+ * A stored session `id` for a CLI run in `dir`, written through `dsn`: the CLI's home, whose default model is a
+ * loopback that fails any request (none at all with `model: false`), the session directory, the session's file,
+ * and a DSN file naming `dsn`.
+ */
+export async function cliSession(dir: TempDir, dsn: string, id: string, options: { model?: boolean } = {}) {
+	const cwd = dir.path();
+	const home = dir.join("home");
+	const sessionDir = dir.join("sessions");
+	const file = path.join(sessionDir, `2026-11-17T00-00-00-000Z_${id}.jsonl`);
+	const agentDir = path.join(home, ".omp", "agent");
+	if (options.model !== false) {
+		await Bun.write(
+			path.join(agentDir, "models.yml"),
+			JSON.stringify({
+				providers: {
+					loopback: {
+						baseUrl: "http://127.0.0.1:9/v1",
+						api: "openai-completions",
+						auth: "none",
+						models: [
+							{
+								id: "default-model",
+								name: "Default Model",
+								reasoning: false,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 131072,
+								maxTokens: 1024,
+							},
+						],
+					},
+				},
+			}),
+		);
+	}
+	await Bun.write(
+		path.join(agentDir, "config.yml"),
+		JSON.stringify(
+			options.model === false
+				? { retry: { enabled: false } }
+				: { modelRoles: { default: "loopback/default-model" }, retry: { enabled: false } },
+		),
+	);
+	const dsnFile = dir.join("dsn");
+	await Bun.write(dsnFile, `${dsn}\n`);
+	const client = new SQL(dsn);
+	try {
+		const store = await SqlSessionStorage.create({ client, claims: false });
+		await store.writeText(file, transcript(id, "before", cwd));
+		await store.drain();
+	} finally {
+		await client.end();
+	}
+	return { cwd, home, sessionDir, file, dsnFile };
+}
+
 /** The error `promise` rejects with; fails when it resolves. */
 export async function rejection(promise: Promise<unknown>): Promise<unknown> {
 	return promise.then(
@@ -633,6 +715,12 @@ export interface LeaseProcessConfig {
 	lease?: { expiryMs: number; heartbeatMs: number };
 	/** `file`: the process runs on file storage instead, for the paths only it has; the other fields are unused. */
 	storage?: "file";
+	/**
+	 * The store answers the holder lookup (`sessionClaimHolder`) only after this many ms, as a database slow to
+	 * answer does, so an `OMP_SESSION_EXCLUSIVE=1` stop exits that much later; file storage, which names no holder,
+	 * gets one that answers nothing.
+	 */
+	holderLookupMs?: number;
 }
 
 /** What a {@link LeaseProcess} answers each command with. */

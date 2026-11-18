@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type FileLockHandle, logger, toError } from "@oh-my-pi/pi-utils";
+import { type FileLockHandle, logger, postmortem, toError } from "@oh-my-pi/pi-utils";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
@@ -780,12 +780,20 @@ const PG_TABLE_COLUMNS = statement(
 		"AND NOT a.attisdropped",
 );
 /**
- * Everything on one of the store's PostgreSQL tables that runs code on its
- * writes and is not the store's: a trigger, a rule, a row-level security
- * policy or the security itself, a relation that is not an ordinary table, a
- * constraint other than a primary key, unique or not-null one, an index on
- * an expression or with a predicate, and a table that inherits from it (the
- * store's updates and deletes reach a child's rows, and so its triggers).
+ * Everything on one of the store's PostgreSQL tables, or above it, that runs
+ * code on its writes and is not the store's: a trigger, a rule, a row-level
+ * security policy or the security itself, a relation that is not an ordinary
+ * table, a constraint other than a primary key, unique or not-null one, an
+ * index on an expression or with a predicate, a table that inherits from it
+ * (the store's updates and deletes reach a child's rows, and so its
+ * triggers), a table it is a partition or an inheritance child of: each
+ * insert into a partition checks the partition constraint, which evaluates
+ * the parent's partition key, a function of the parent's owner's choosing,
+ * as the writer. A partition that `pg_inherits` does not name (`relispartition`
+ * alone) is refused too, so the check fails closed. And a foreign key of
+ * another table that references it: the store's updates and deletes fire that
+ * key's referential action on the other table, and so the other table's
+ * triggers.
  */
 const PG_TABLE_OBJECTS = statement(
 	"postgres",
@@ -804,7 +812,16 @@ const PG_TABLE_OBJECTS = statement(
 		"UNION ALL SELECT 'index', i.indexrelid::pg_catalog.regclass::text FROM pg_catalog.pg_index i " +
 		"WHERE i.indrelid = pg_catalog.to_regclass(@table) AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL) " +
 		"UNION ALL SELECT 'inheritance', h.inhrelid::pg_catalog.regclass::text FROM pg_catalog.pg_inherits h " +
-		"WHERE h.inhparent = pg_catalog.to_regclass(@table)",
+		"WHERE h.inhparent = pg_catalog.to_regclass(@table) " +
+		"UNION ALL SELECT CASE WHEN c.relispartition THEN 'partition of' ELSE 'inherits from' END, " +
+		"h.inhparent::pg_catalog.regclass::text FROM pg_catalog.pg_inherits h " +
+		"JOIN pg_catalog.pg_class c ON c.oid = h.inhrelid WHERE h.inhrelid = pg_catalog.to_regclass(@table) " +
+		"UNION ALL SELECT 'partition of', 'a parent pg_inherits does not name' FROM pg_catalog.pg_class c " +
+		"WHERE c.oid = pg_catalog.to_regclass(@table) AND c.relispartition " +
+		"AND NOT EXISTS (SELECT FROM pg_catalog.pg_inherits h WHERE h.inhrelid = c.oid) " +
+		"UNION ALL SELECT 'referenced by', k.conrelid::pg_catalog.regclass::text || ' (' || k.conname::text || ')' " +
+		"FROM pg_catalog.pg_constraint k WHERE k.confrelid = pg_catalog.to_regclass(@table) AND k.contype = 'f' " +
+		"AND k.conrelid <> k.confrelid",
 );
 /** The columns of the store's three PostgreSQL tables and their declared types, as `format_type` prints them. */
 const PG_DECLARED_COLUMNS = {
@@ -1280,6 +1297,8 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	readonly sessionClaimLost: SessionStorage["sessionClaimLost"];
 	/** {@link SessionStorage.sessionClaimHolder}, set as {@link claimSession} is. */
 	readonly sessionClaimHolder: SessionStorage["sessionClaimHolder"];
+	/** {@link SessionStorage.releaseHeldClaims}, set as {@link claimSession} is: within the release's bound. */
+	readonly releaseHeldClaims: SessionStorage["releaseHeldClaims"];
 
 	private constructor(backend: SqlSessionStorageBackend) {
 		super(backend);
@@ -1288,6 +1307,7 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 		// The last release of a claim waits for this store's queued writes under it.
 		const settle = (paths: readonly string[]) =>
 			Promise.all(paths.map(file => this.confirmWrites(file).catch(() => undefined))).then(() => undefined);
+		backend.bindExitSettle(settle);
 		const releaser = (claim: LeaseClaim, file: string, onLost: (() => void) | undefined): (() => void) => {
 			let released = false;
 			return () => {
@@ -1308,6 +1328,9 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 		};
 		this.sessionClaimLost = sessionId => backend.claimLost(sessionId);
 		this.sessionClaimHolder = sessionId => backend.claimHolder(sessionId);
+		this.releaseHeldClaims = async () => {
+			await withinBound(backend.releaseHeld(), LEASE_RELEASE_BOUND_MS + LEASE_RELEASE_GRACE_MS);
+		};
 	}
 
 	/**
@@ -1447,6 +1470,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #leasedPaths = new Map<string, LeaseClaim>();
 	/** Claim releases in flight, by session id; a new claim of the id waits for its release. */
 	readonly #releases = new Map<string, Promise<void>>();
+	/**
+	 * Cancels this store's exit release (see {@link #armExitRelease}): set while it holds a lease row, unset once it
+	 * holds none.
+	 */
+	#cancelExitRelease: (() => void) | undefined;
+	/** How the store waits for its queued writes under a claim; the exit release waits for them as a release does. */
+	#exitSettle: ((paths: readonly string[]) => Promise<void>) | undefined;
 	#heartbeat: Timer | undefined;
 	#heartbeatRound = 0;
 	#beating = false;
@@ -1632,7 +1662,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				listeners: new Set(),
 			};
 			this.#leases.set(leaseId, claim);
-			if (this.#gate === "row") this.#startHeartbeat();
+			if (this.#gate === "row") {
+				this.#startHeartbeat();
+				this.#armExitRelease();
+			}
 			const started = claim;
 			void this.#ensureClaimed(started).catch(err => {
 				// The first write under the claim runs the statement again and reports its failure.
@@ -1784,7 +1817,58 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		this.#releases.set(sessionId, released);
 		void released.finally(() => {
 			if (this.#releases.get(sessionId) === released) this.#releases.delete(sessionId);
+			if (this.#leases.size === 0 && this.#releases.size === 0) {
+				this.#cancelExitRelease?.();
+				this.#cancelExitRelease = undefined;
+			}
 		});
+	}
+
+	/** How the store waits for its queued writes under a claim, for {@link #releaseAtExit}. */
+	bindExitSettle(settle: (paths: readonly string[]) => Promise<void>): void {
+		this.#exitSettle = settle;
+	}
+
+	/**
+	 * Register, once while this store holds a lease row, the release a signal or exit runs: whatever took the
+	 * lease (an opened session, a subagent's, a delete, a rename, a move's destination) may never reach the release
+	 * it owns, since a signal ends the process from postmortem without running a `finally`. The callback is
+	 * `afterOthers`, so the modes' own teardowns, which dispose their sessions (`session_shutdown`, then the
+	 * manager's close, which releases its claim), run first and their writes keep the lease; it finds those claims
+	 * released and gives back only what is still held. Its `deadlineMs` is the release's own bound: the pass waits
+	 * that long for it once the others settle, also past postmortem's 10 s deadline when another callback's
+	 * `deadlineMs` held the pass open that long. When another callback never settles, it does not start: a release
+	 * before that callback (a mode's dispose) settled would let it write after the release, so the row stays and
+	 * expires. `exitOnly`: a keep-alive cleanup releases nothing.
+	 */
+	#armExitRelease(): void {
+		if (this.#cancelExitRelease) return;
+		this.#cancelExitRelease = postmortem.register("sql-session-leases", () => this.releaseHeld(), {
+			exitOnly: true,
+			afterOthers: true,
+			deadlineMs: LEASE_RELEASE_BOUND_MS + LEASE_RELEASE_GRACE_MS,
+		});
+	}
+
+	/**
+	 * Release every claim this store still holds, however many references its holders keep: at exit (the postmortem
+	 * callback {@link #armExitRelease} registers), and before an exclusive stop's `process.exit` (the facade's
+	 * `releaseHeldClaims`). Each release waits for the store's queued writes under the claim, then deletes the lease
+	 * row within the release bound, and logs a release that fails or is not answered (the row then expires on its
+	 * own). Entries a session manager holds but never handed to the store are not written.
+	 */
+	async releaseHeld(): Promise<void> {
+		const settle = this.#exitSettle ?? (async () => {});
+		for (const claim of [...this.#leases.values()]) {
+			// A claim whose last reference is gone is releasing already.
+			if (claim.refs <= 0) continue;
+			const [file] = claim.paths.keys();
+			if (file === undefined) continue;
+			claim.listeners.clear();
+			claim.refs = 1;
+			this.release(claim, file, undefined, settle);
+		}
+		await this.releasesSettled();
 	}
 
 	/**
@@ -2583,7 +2667,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * not declare on its writes. A login that owned a table (before an
 	 * external migration moved it to its owner) can give a column a type of its
 	 * own whose assignment cast runs its function, or add a trigger, a rule, a
-	 * row-level security policy, a CHECK constraint or an expression index;
+	 * row-level security policy, a CHECK constraint or an expression index, or
+	 * make the table a partition of a table of its own whose partition key
+	 * calls its function;
 	 * PostgreSQL finds those through its catalogs, not through search_path, so
 	 * {@link PG_SEARCH_PATH} does not stop them. So every column must be the
 	 * store's, of its declared built-in type, with no default, generation or
@@ -2618,6 +2704,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 					if (row.identity !== "") found.push(`identity column ${row.name}`);
 				}
 				for (const object of (await run(executor, PG_TABLE_OBJECTS, { table: relation })) as TableObjectRow[]) {
+					// A parent is not on the table: say what the table is, as its own problem.
+					if (object.kind === "partition of" || object.kind === "inherits from") {
+						const is = object.kind === "partition of" ? "is a partition of" : "inherits from";
+						problems.push(`table ${relation} ${is} ${object.name}`);
+						continue;
+					}
 					found.push(
 						{
 							trigger: `trigger ${object.name}`,
@@ -2628,6 +2720,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 							constraint: `constraint ${object.name}, not a primary key, unique or not-null constraint`,
 							index: `index ${object.name} on an expression or with a predicate`,
 							inheritance: `table ${object.name} inheriting from it`,
+							"referenced by": `a foreign key of table ${object.name} referencing it`,
 						}[object.kind] ?? `${object.kind} ${object.name}`,
 					);
 				}

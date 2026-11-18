@@ -29,7 +29,9 @@ import {
 // These tests wait in real time on purpose: they run the CLI's resume against
 // the real 30 s lease expiry across processes, which no fake timer reaches.
 
-const ID = "01a1f200-0000-7000-8000-000000000001";
+// A new id each run: file storage's claim is an OS lock keyed by the session id alone, machine-wide, so two runs of
+// this file at once under one fixed id would meet each other's holder.
+const ID = Bun.randomUUIDv7();
 const EXPIRY_MS = 30_000;
 const RESUME_WAIT_MS = EXPIRY_MS + 5000;
 

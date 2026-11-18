@@ -410,6 +410,12 @@ export interface SessionStorage {
 	 */
 	sessionClaimHolder?(sessionId: string): Promise<SessionClaimHolder | undefined>;
 	/**
+	 * Give back every claim this process still holds through this storage, whoever took it, within the release's
+	 * bound: for a caller about to end the process by `process.exit`, which runs no asynchronous cleanup. A claim
+	 * found lost or never held deletes nothing. Only SQL storage implements it.
+	 */
+	releaseHeldClaims?(): Promise<void>;
+	/**
 	 * Atomically delete a session and its artifacts only when `shouldDelete`
 	 * accepts the current session content. Optional because backends without a
 	 * cross-process conditional-delete primitive must skip opportunistic GC.

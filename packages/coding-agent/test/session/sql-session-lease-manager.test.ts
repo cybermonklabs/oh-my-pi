@@ -21,6 +21,7 @@ import {
 	gatedClient,
 	LEASE_BACKENDS,
 	type LeaseDb,
+	LeaseProcess,
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
 	TcpProxy,
@@ -133,6 +134,47 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			});
 			await manager.close();
 		});
+
+		it("releases the claim a switch took when the session's file is emptied between the header read and the load", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const file = sessionFile(db);
+			// Another file of the same session, where another process claims it: a claim is keyed by the session id.
+			const copy = path.join(path.dirname(file), `2026-11-17T00-00-01-000Z_${ID}.jsonl`);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.writeText(copy, transcript(ID, "a copy"));
+			await storage.drain();
+			// The hook the test controls: once the switch holds its claim, and before it loads, the file is emptied.
+			const acquire = storage.acquireSessionClaim?.bind(storage);
+			const emptying = new Proxy(storage, {
+				get(target, prop) {
+					if (prop === "acquireSessionClaim" && acquire) {
+						return async (...args: Parameters<typeof acquire>) => {
+							const release = await acquire(...args);
+							await target.writeText(args[1], "");
+							return release;
+						};
+					}
+					const value: unknown = Reflect.get(target, prop, target);
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			});
+			const manager = SessionManager.create(db.dir.path(), path.dirname(file), emptying);
+			await manager.setSessionFile(file, { claim: { waitMs: 0 } });
+			// The emptied file starts a new session at the same path, whose writes claim the path's id again, so the
+			// manager holds it while it runs; once it closes, nothing of this store may hold the old id. A store
+			// deletes a released lease row once the writes queued under it land; drain() waits for that.
+			const newSession = manager.getSessionId() !== ID;
+			await manager.close();
+			await storage.drain();
+			await using other = await LeaseProcess.start(
+				{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
+				db.dir.join("other"),
+			);
+			// The first store still lives: a claim it leaked would refuse this one for the life of the process.
+			const claimed = await other.run({ op: "claim", sessionId: ID, path: copy });
+			expect({ newSession, otherProcessHolds: claimed.held }).toEqual({ newSession: true, otherProcessHolds: true });
+		}, 30_000);
 
 		it("rejects a caller's rewrite computed before an older build appended, and keeps that build's turn", async () => {
 			await using db = await openLeaseDb(adapter, url ?? "");
