@@ -15,6 +15,7 @@
 ### Changed
 
 - Upgrade the auth broker before its clients: an older broker does not record a client's removal of a login a failure disabled, and the client now reports that with `AuthBrokerRemovalNotRecordedError` ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
+- A broker client's account pool (`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE` or `accountPool`) now also filters disabled-credential tombstones: `listDisabledCredentials` lists only the disabled logins of the pool's accounts, and removing a provider records the user's removal only on those ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
 
 ## [18.18.4] - 2026-11-09
 

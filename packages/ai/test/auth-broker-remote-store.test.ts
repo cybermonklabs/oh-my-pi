@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { AuthStorage, DELETED_BY_USER, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import {
 	AuthBrokerClient,
 	type AuthBrokerServerHandle,
@@ -19,6 +19,9 @@ import { withEnv } from "./helpers";
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
 const AUTH_BROKER_MODULE = path.resolve(import.meta.dir, "../src/auth-broker/index.ts");
 const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
+
+/** What a failed refresh leaves as the cause of a login it disabled. */
+const FAILURE_CAUSE = "oauth refresh failed: invalid_grant";
 
 function mintOAuthCredential(suffix: string, expires: number) {
 	return {
@@ -634,6 +637,58 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 				}
 			},
 		);
+	});
+
+	/**
+	 * Runs `run` over broker-backed discovery whose account pool file is `{ anthropic: { accounts: [a] } }`,
+	 * after a refresh failure disabled both of the broker's logins, "a" and "b".
+	 */
+	async function withPoolOfFailedLoginA(run: (pooled: AuthStorage) => Promise<void>): Promise<void> {
+		await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		for (const row of storage!.credentials.list("anthropic")) {
+			await storage!.credentials.disable(row.id, FAILURE_CAUSE);
+		}
+		const loginA = (await storage!.credentials.listDisabled("anthropic")).find(row => row.email === "a@example.com");
+		if (!loginA?.identityKey) throw new Error("expected login a's identity key");
+		const poolPath = path.join(tempDir, "account-pool.json");
+		await Bun.write(poolPath, JSON.stringify({ anthropic: { accounts: [loginA.identityKey] } }));
+		await withEnv(
+			{
+				OMP_AUTH_BROKER_URL: handle!.url,
+				OMP_AUTH_BROKER_TOKEN: token,
+				OMP_AUTH_BROKER_ACCOUNT_POOL_FILE: poolPath,
+			},
+			async () => {
+				const pooled = await discoverAuthStorage({
+					agentDir: tempDir,
+					cachePath: path.join(tempDir, "pooled-snapshot-cache.enc"),
+				});
+				try {
+					await run(pooled);
+				} finally {
+					pooled.close();
+				}
+			},
+		);
+	}
+
+	test("lists only the disabled logins of accounts in the pool", async () => {
+		// If this regresses, a pooled client reads another account's failure as its own: a turn waits for a key that
+		// login never gives this client, and `/logout` offers to remove that account on the shared broker.
+		await withPoolOfFailedLoginA(async pooled => {
+			expect((await pooled.credentials.listDisabled("anthropic")).map(row => row.email)).toEqual(["a@example.com"]);
+		});
+	});
+
+	test("records a provider removal only on the disabled logins of accounts in the pool", async () => {
+		// If this regresses, a pooled client's logout rewrites another account's failure as the user's removal on the
+		// shared broker: no client waits for that login any more, and `omp usage` stops reporting it as lost.
+		await withPoolOfFailedLoginA(pooled => pooled.credentials.remove("anthropic"));
+
+		const causes = Object.fromEntries(
+			(await storage!.credentials.listDisabled("anthropic")).map(row => [row.email, row.cause]),
+		);
+		expect(causes).toEqual({ "a@example.com": DELETED_BY_USER, "b@example.com": FAILURE_CAUSE });
 	});
 
 	test("evicts cold sticky sessions while preserving recently accessed sessions", () => {
