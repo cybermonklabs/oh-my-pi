@@ -12,6 +12,9 @@
  * the waiters before it used, or each takes a full budget of its own.
  * {@link mapInSlices} and {@link runInSlices} keep that rule for their callers.
  *
+ * Concurrent passes share one budget per turn and take it in turn: the waiter
+ * that used up the last slice resumes after the others in the next turn.
+ *
  * Under fake timers `performance.now()` stands still, so a slice never expires
  * and a sliced pass runs to completion in one step, as an unsliced one did.
  */
@@ -22,7 +25,8 @@ export const EVENT_LOOP_SLICE_MS = 10;
 let sliceStart = 0;
 /** True from a slice's first check until the event loop next runs a macrotask. */
 let sliceOpen = false;
-let pendingSlice: Promise<void> | undefined;
+/** Resolvers of the passes waiting for the next turn, in the order they asked. */
+let waiters: Array<() => void> = [];
 
 function closeSlice(): void {
 	sliceOpen = false;
@@ -31,10 +35,10 @@ function closeSlice(): void {
 /**
  * Whether the current slice has used its budget, so the caller must await
  * {@link nextSlice} before its next unit. The first check after the event loop
- * ran a macrotask opens a new slice that counts from that check, so a pass
- * always runs at least one unit per turn, however long other work in that turn
- * took. Work in the same turn before the first check, such as parsing a
- * fetched payload, is the caller's to end with {@link nextSlice}.
+ * ran a macrotask opens a new slice that counts from that check, so the first
+ * pass to check in a turn runs at least one unit, however long other work in
+ * that turn took. Work in the same turn before the first check, such as
+ * parsing a fetched payload, is the caller's to end with {@link nextSlice}.
  */
 export function sliceExpired(): boolean {
 	const now = performance.now();
@@ -53,19 +57,26 @@ export function sliceExpired(): boolean {
 
 /**
  * Resolves in a later macrotask, after the timers and socket events that are
- * due by then. Every waiter shares the one macrotask, and the first check
+ * due by then. All waiters resume in that one macrotask, and the first check
  * after it opens the next slice.
  */
 export function nextSlice(): Promise<void> {
-	if (!pendingSlice) {
-		const { promise, resolve } = Promise.withResolvers<void>();
-		pendingSlice = promise;
-		setImmediate(() => {
-			pendingSlice = undefined;
-			resolve();
-		});
-	}
-	return pendingSlice;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	if (waiters.length === 0) setImmediate(releaseWaiters);
+	waiters.push(resolve);
+	return promise;
+}
+
+function releaseWaiters(): void {
+	const turn = waiters;
+	waiters = [];
+	// The first to ask is the pass that used up the last slice: a pass that
+	// resumes into a spent slice asks only after it, and a pass that finished
+	// inside the slice does not ask. Resuming it last gives the others the
+	// next slice, so concurrent passes take the budget in turn.
+	const spent = turn.shift();
+	if (spent) turn.push(spent);
+	for (const resolve of turn) resolve();
 }
 
 /** `items.map(fn)` that returns to the event loop between items once a slice has used its budget. */

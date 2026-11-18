@@ -70,6 +70,26 @@ describe("mapInSlices", () => {
 		expect(Math.max(...sliceSizes(unitTurns))).toBe(UNITS_PER_SLICE);
 	});
 
+	it("lets a short pass run while a long one is still going, so concurrent passes take the budget in turn", async () => {
+		const clock = mockWorkClock();
+		const turns = countTurns();
+		const longUnits: number[] = [];
+		const shortUnits: number[] = [];
+		const unit = (into: number[]) => () => {
+			into.push(turns.turn());
+			clock.spend(UNIT_MS);
+		};
+		const long = Array.from({ length: UNITS_PER_SLICE * 10 }, (_, index) => index);
+		const short = Array.from({ length: UNITS_PER_SLICE }, (_, index) => index);
+		await Promise.all([mapInSlices(long, unit(longUnits)), mapInSlices(short, unit(shortUnits))]);
+		turns.stop();
+		expect(longUnits).toHaveLength(long.length);
+		expect(shortUnits).toHaveLength(short.length);
+		// The short pass finishes within a few turns, long before the long pass's last unit.
+		expect(Math.max(...shortUnits)).toBeLessThan(Math.max(...longUnits) - UNITS_PER_SLICE);
+		expect(Math.max(...sliceSizes([...longUnits, ...shortUnits]))).toBe(UNITS_PER_SLICE);
+	});
+
 	it("admits a unit at the first check after a turn, however long other work in that turn took", async () => {
 		const clock = mockWorkClock();
 		// Open a slice, then wait for the turn that closes it.

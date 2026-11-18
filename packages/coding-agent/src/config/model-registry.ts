@@ -1870,15 +1870,17 @@ export class ModelRegistry {
 	 * slice that a synchronous lookup loaded meanwhile, or one read before a
 	 * reload reset the composition, is not recorded.
 	 */
-	async #loadCachedStandardModelsInSlices(providerFilter: ReadonlySet<string>): Promise<void> {
-		using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
-		for (const providerId of STARTUP_MODEL_CACHE_PROVIDER_IDS) {
-			if (!providerFilter.has(providerId) || !this.#pendingStandardCacheProviders.has(providerId)) continue;
-			const epoch = this.#compositionEpoch;
-			const slice = await runInSlices(this.#cachedStandardProviderSteps(providerId));
-			if (epoch !== this.#compositionEpoch || !this.#pendingStandardCacheProviders.delete(providerId)) continue;
-			this.#commitCachedStandardProvider(providerId, slice);
-		}
+	#loadCachedStandardModelsInSlices(providerFilter: ReadonlySet<string>): Promise<void> {
+		return logger.time("modelRegistry:loadCachedStandardModels", async () => {
+			using _cacheConnection = retainModelCacheConnection(this.#cacheDbPath);
+			for (const providerId of STARTUP_MODEL_CACHE_PROVIDER_IDS) {
+				if (!providerFilter.has(providerId) || !this.#pendingStandardCacheProviders.has(providerId)) continue;
+				const epoch = this.#compositionEpoch;
+				const slice = await runInSlices(this.#cachedStandardProviderSteps(providerId));
+				if (epoch !== this.#compositionEpoch || !this.#pendingStandardCacheProviders.delete(providerId)) continue;
+				this.#commitCachedStandardProvider(providerId, slice);
+			}
+		});
 	}
 
 	#canRestoreConfiguredDiscoveryHeaders(providerId: string): boolean {
@@ -2333,6 +2335,9 @@ export class ModelRegistry {
 		touchedProviders: ReadonlySet<string>,
 		discoveredModels: Model<Api>[],
 	): void {
+		// A commit changes the cached and discovered slices that a concurrent
+		// pass's sliced merge reads, so that pass must merge again.
+		this.#compositionEpoch++;
 		const authoritativeProviders = providersWithAuthoritativeProjectCatalog(discoveredModels);
 		for (const provider of builtInDiscovery.authoritativeProviders) {
 			authoritativeProviders.add(provider);
@@ -4185,6 +4190,8 @@ export class ModelRegistry {
 					this.#recordRuntimeModelHeaderCommands(providerName, modelDefs);
 					const results: Model<Api>[] = [];
 					for (const modelDef of modelDefs) {
+						// One overlay per row, through the rule cascade: an endpoint can list thousands.
+						while (sliceExpired()) await nextSlice();
 						const overlay = buildCustomModelOverlay(
 							providerName,
 							modelDef.baseUrl ?? providerBaseUrl,
