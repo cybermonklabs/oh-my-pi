@@ -785,19 +785,22 @@ export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear">;
  * subagents through the same path as the Agent Hub / collab `kill` command.
  * Aborting the live turn and releasing the registry ref as an `aborted`
  * tombstone settles the owning `task` call (foreground or background) with an
- * aborted result, and disposing the session cancels its nested children.
+ * aborted result, and disposing the session cancels its nested children and
+ * its own async jobs.
  *
- * Only ids this session reported as running are reachable (see
- * {@link resolveOwnedLiveSubagent}). Returns `false` (a no-op) for unknown,
- * finished, or already-cancelled subagents so hosts can treat cancelling a
- * vanished subagent as success. Rejects when the tombstone cannot be persisted
- * or the abort fails; the subagent is still detached and disposed.
+ * Every id this session reports as running or pending is reachable, including
+ * a subagent idle between turns while it waits for its own jobs (see
+ * {@link resolveOwnedLiveSubagent} with `betweenTurns`). Returns `false` (a
+ * no-op) for unknown, finished, accepted, or already-cancelled subagents so
+ * hosts can treat cancelling a vanished subagent as success. Rejects when the
+ * tombstone cannot be persisted or the abort fails; the subagent is still
+ * detached and disposed.
  */
 export async function handleRpcCancelSubagent(
 	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
 	subagentId: string,
 ): Promise<boolean> {
-	const owned = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
+	const owned = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
 	if (!owned) return false;
 	// Start the release first: it publishes the `aborted` tombstone synchronously,
 	// so the executor cannot accept the run's result (flipping the ref to idle)
