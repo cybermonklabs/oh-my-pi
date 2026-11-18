@@ -231,6 +231,7 @@ export interface AnthropicNativeCompactionOptions
 			| "promptCacheKey"
 			| "providerSessionState"
 			| "maxInFlightRequests"
+			| "beforeDispatch"
 		>,
 		Pick<InstrumentedChatSpanOptions, "completeImpl" | "telemetry" | "retry"> {}
 
@@ -273,6 +274,7 @@ export async function requestAnthropicNativeCompaction(
 			promptCacheKey: options.promptCacheKey,
 			providerSessionState: options.providerSessionState,
 			maxInFlightRequests: options.maxInFlightRequests,
+			beforeDispatch: options.beforeDispatch,
 			anthropicCompaction: { instructions: request.instructions, filesDueBefore: request.filesDueBefore },
 		},
 		{
@@ -289,7 +291,9 @@ export async function requestAnthropicNativeCompaction(
 		const message = `Anthropic compaction failed: ${response.errorMessage ?? "unknown error"}`;
 		throw response.errorStatus === undefined
 			? new Error(message)
-			: new AIError.ProviderHttpError(message, response.errorStatus);
+			: new AIError.ProviderHttpError(message, response.errorStatus, {
+					headers: AIError.errorRetryHeaders(response),
+				});
 	}
 	const payload = response.providerPayload;
 	if (

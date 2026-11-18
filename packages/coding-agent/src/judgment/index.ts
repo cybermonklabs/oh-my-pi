@@ -14,11 +14,15 @@
 import {
 	type AgentTelemetry,
 	type AgentTelemetryConfig,
+	agentPauseGate,
+	classifyTelemetryAuthKind,
 	recordJudgmentTelemetry,
 	resolveTelemetry,
+	type TelemetryAuthKind,
 } from "@oh-my-pi/pi-agent-core";
 import {
 	type Answer,
+	type ApiKeyResolver,
 	type AssistantMessage,
 	type BoxEdges,
 	chatTextBackend,
@@ -53,7 +57,7 @@ import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { normalizeModelContextImages } from "../utils/image-loading";
 import { type FittedImage, fitImage } from "../utils/image-resize";
-import type { ModelRegistry } from "../config/model-registry";
+import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import { cfgJudgmentAttemptTimeoutMs } from "../config/model-settings";
 import { formatModelStringWithRouting, resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
@@ -539,7 +543,7 @@ export class ChainJudge implements Judge {
 	}
 
 	/** Attribute one attempt: the ledger unless answered wholly from cache, and one telemetry span. */
-	#report(attempt: JudgmentAttempt): void {
+	#report(attempt: JudgmentAttempt, authKind?: TelemetryAuthKind): void {
 		const { startedAt, responseModel, questions, cachedQuestions, ...rest } = attempt;
 		const usage: JudgmentUsage = { purpose: this.#deps.purpose, ...rest };
 		if (questions === undefined || cachedQuestions !== questions) {
@@ -557,6 +561,7 @@ export class ChainJudge implements Judge {
 			startTime: startedAt,
 			questions,
 			cachedQuestions,
+			authKind,
 		}).catch(error => logger.warn("judgment telemetry failed", { error: String(error) }));
 	}
 
@@ -598,13 +603,20 @@ export class ChainJudge implements Judge {
 	async #createJudge(candidate: RoleChainCandidate, signal: AbortSignal | undefined): Promise<Judge | undefined> {
 		const model = candidate.model;
 		if (model.api === "local-inference") return new TextJudge(new LocalTextBackend(model.id));
-		if (!(await this.#deps.registry.getApiKey(model, this.#deps.sessionId, { signal }))) return undefined;
-		const apiKey = this.#deps.registry.resolver(model, this.#deps.sessionId);
+		if (!(await probeModelApiKey(this.#deps.registry, model, this.#deps.sessionId, { signal }))) return undefined;
+		const resolver = this.#deps.registry.resolver(model, this.#deps.sessionId);
+		// Each attempt's span records the credential kind its latest resolution used.
+		let authKind: TelemetryAuthKind = "unknown";
+		const apiKey: ApiKeyResolver = async ctx => {
+			const resolved = await resolver(ctx);
+			if (resolved !== undefined) authKind = classifyTelemetryAuthKind(resolved);
+			return resolved;
+		};
 		if (isJudgmentApi(model.api)) {
 			const headers = await this.#deps.registry.resolveModelHeaders(model, signal);
 			const judge = createNativeJudge(model, { apiKey, headers });
 			return withCandidateSignal(
-				nativeJudge(judge, model, this.#deps.cache, attempt => this.#report(attempt)),
+				pauseHeld(nativeJudge(judge, model, this.#deps.cache, attempt => this.#report(attempt, authKind))),
 				signal,
 			);
 		}
@@ -617,19 +629,49 @@ export class ChainJudge implements Judge {
 			// Sole attribution point for prompted judgments: TextJudge's result.usage
 			// aggregates these same attempts and must never be billed again.
 			onAttempt: attempt =>
-				this.#report({
-					role: "judge",
-					api: attempt.api,
-					provider: attempt.provider,
-					model: attempt.model,
-					usage: attempt.usage,
-					stopReason: attempt.stopReason,
-					errorMessage: attempt.errorMessage,
-					startedAt: attempt.timestamp,
-				}),
+				this.#report(
+					{
+						role: "judge",
+						api: attempt.api,
+						provider: attempt.provider,
+						model: attempt.model,
+						usage: attempt.usage,
+						stopReason: attempt.stopReason,
+						errorMessage: attempt.errorMessage,
+						startedAt: attempt.timestamp,
+					},
+					authKind,
+				),
 		});
-		return new TextJudge(backend);
+		return pauseHeld(new TextJudge(backend));
 	}
+}
+
+/**
+ * The candidate with every provider request it sends held at `/pause`.
+ * Judgments run beside the agent loop — turn recovery, prewalk, TTSR, auto
+ * thinking — and callers hand their options straight to the candidate
+ * (`withCandidate`), so the hold is bound to the candidate itself, on each
+ * call's own signal, after any hold the caller brought.
+ *
+ * Most callers bound a judgment with a deadline of their own (prewalk, auto
+ * thinking, the unexpected-stop check, chart picks) and arm it before calling.
+ * That deadline keeps running while a request is held, so a pause that
+ * outlasts it fails the judgment and the caller takes its no-judgment default:
+ * no prewalk, the default effort, no retry nudge, the guessed chart. These are
+ * best-effort classifiers, and each already treats a missed deadline that way.
+ */
+function pauseHeld(judge: Judge): Judge {
+	return {
+		label: judge.label,
+		...(judge.supportsImages === undefined ? {} : { supportsImages: judge.supportsImages }),
+		judge<Q extends Questions>(request: JudgmentRequest<Q>, options?: JudgeOptions): Promise<JudgmentResult<Q>> {
+			return judge.judge(request, {
+				...options,
+				beforeDispatch: agentPauseGate.dispatchHold(options?.signal, options?.beforeDispatch),
+			});
+		},
+	};
 }
 
 /** Keyword completions through the shared on-device tiny-model worker. */
@@ -746,6 +788,7 @@ function nativeJudge(
 						},
 						{
 							signal: options?.signal,
+							beforeDispatch: options?.beforeDispatch,
 							onPartialUsage: usage => {
 								partial = usage;
 							},

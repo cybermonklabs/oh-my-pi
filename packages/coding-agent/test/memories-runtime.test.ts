@@ -12,6 +12,7 @@ import {
 	startMemoryStartupTask,
 } from "@oh-my-pi/pi-coding-agent/memories";
 import * as memoryStorage from "@oh-my-pi/pi-coding-agent/memories/storage";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getAgentDbPath, Snowflake, TempDir } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "./helpers/settings-test-state";
 
@@ -87,6 +88,8 @@ async function createFixture(overrides?: Partial<Record<string, unknown>>): Prom
 			getSessionDir: () => sessionDir,
 			getSessionId: () => "current-thread",
 			getCwd: () => agentDir,
+			// Memories read past sessions through the session's storage; these are files.
+			getStorage: () => new FileSessionStorage(),
 		},
 		settings,
 		model,

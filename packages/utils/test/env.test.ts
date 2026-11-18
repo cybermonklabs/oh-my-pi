@@ -19,11 +19,14 @@ const tempDirs: string[] = [];
 
 // Every variable `dirs.ts` consults to pick the profile, agent dir or config/state roots. A probe child
 // must not inherit any of them from the developer's shell (e.g. OMP_PROFILE beats PI_PROFILE, and a
-// named profile ignores PI_CODING_AGENT_DIR), or it would read a different agent dir than its fixture.
+// named profile ignores PI_CODING_AGENT_DIR) or from the test preload (OMP_CONFIG_ROOT), or it would
+// read a different agent dir or config root than its fixture home.
 const DIR_RESOLUTION_ENV_RESET = {
 	OMP_PROFILE: undefined,
 	PI_PROFILE: undefined,
 	PI_CONFIG_DIR: undefined,
+	OMP_CONFIG_ROOT: undefined,
+	OMP_DOWNLOAD_ROOT: undefined,
 	XDG_DATA_HOME: undefined,
 	XDG_STATE_HOME: undefined,
 	XDG_CACHE_HOME: undefined,
@@ -438,7 +441,8 @@ describe("OTEL_* from omp's own .env files", () => {
 	}
 
 	// The dotenv loader runs at module load, so each case needs a fresh process
-	// whose agent dir and HOME are temp dirs.
+	// whose agent dir and HOME are temp dirs. It runs as production (no
+	// PI_TEST_RUNTIME): a test process never reads the home or config-root .env.
 	async function runProbe(shellEnv: Record<string, string>): Promise<ProbeResult> {
 		const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-utils-otel-home-"));
 		const agentDir = path.join(home, "agent");
@@ -493,6 +497,7 @@ describe("OTEL_* from omp's own .env files", () => {
 				USERPROFILE: home,
 				PI_CODING_AGENT_DIR: agentDir,
 				...DIR_RESOLUTION_ENV_RESET,
+				PI_TEST_RUNTIME: undefined,
 				OTEL_PROBE_CONFIG: undefined,
 				OTEL_PROBE_AGENT: undefined,
 				OTEL_PROBE_HOME: undefined,
