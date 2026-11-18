@@ -3293,7 +3293,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (keyQuery) {
 			for (const [suffix, needs] of Object.entries(BLOB_TABLE_NEEDS)) {
 				const table = `${this.#table}_${suffix}`;
-				const rows = (await this.#exclusive(() => this.#readOne(keyQuery, { table }))) as Array<{ name: unknown }>;
+				// Start-up already holds the SQLite queue (see init), so this reads straight through.
+				const rows = (await this.#read(executor => run(executor, keyQuery, { table }))) as Array<{ name: unknown }>;
 				const keyProblem = primaryKeyProblem(
 					rows.map(row => String(row.name).toLowerCase()),
 					needs.key,

@@ -475,7 +475,9 @@ describe("session blobs in the SQL session storage", () => {
 				resolveBlobRefsInEntriesSync(entries, new BlobStore(getBlobsDir(), storage.blobTier));
 				const image = () => {
 					const entry = entries[0];
-					return entry?.type === "message" && typeof entry.message.content !== "string"
+					return entry?.type === "message" &&
+						entry.message.role === "user" &&
+						typeof entry.message.content !== "string"
 						? (entry.message.content[0] as ImageContent | undefined)?.data
 						: undefined;
 				};
