@@ -119,7 +119,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
 #[cfg(target_os = "linux")]
 pub mod sys {
 	use std::{
-		fs,
+		fs, io,
 		os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
 		str::{FromStr, SplitWhitespace},
 	};
@@ -133,15 +133,89 @@ pub mod sys {
 			.filter_map(|entry| entry.file_name().to_str()?.parse().ok())
 	}
 
-	/// Opens a pidfd on whichever process holds `pid` now; callers pin identity
-	/// by re-checking [`start_time`] after the open.
-	pub fn open_pidfd(pid: i32) -> Option<OwnedFd> {
+	/// What [`pidfd_open`] gave.
+	#[derive(Debug)]
+	pub enum Pidfd {
+		/// A pidfd of whichever process holds the pid now; callers pin
+		/// identity by re-checking [`start_time`] after the open.
+		Open(OwnedFd),
+		/// No process of this identity is left: the pid names none, or
+		/// another one.
+		Gone,
+		/// This system gives no pidfd: `ENOSYS` (kernels before 5.3) or
+		/// `EPERM` (a seccomp or LSM filter).
+		Unavailable,
+	}
+
+	/// `pidfd_open(pid, 0)`: a pidfd of the process `pid` names, the process
+	/// `start` pins (its start time, field 22 of `/proc/<pid>/stat`; `None`:
+	/// whichever holds the pid), or what kept it from one
+	/// ([`sort_pidfd_open`]).
+	///
+	/// # Errors
+	///
+	/// A failure that does not show the process gone or pidfds unavailable
+	/// ([`sort_pidfd_open`]).
+	pub fn pidfd_open(pid: i32, start: Option<u64>) -> io::Result<Pidfd> {
 		// SAFETY: pidfd_open takes scalar arguments and returns a new owned fd.
 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-		(fd >= 0).then(|| {
+		let opened = if fd < 0 {
+			Err(io::Error::last_os_error())
+		} else {
 			// SAFETY: a successful pidfd_open returned a uniquely owned descriptor.
-			unsafe { OwnedFd::from_raw_fd(fd as i32) }
-		})
+			Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+		};
+		sort_pidfd_open(pid, start, opened)
+	}
+
+	/// What the result `opened` of `pidfd_open(pid, 0)` says, for the process
+	/// `start` pins (`None`: whichever holds the pid).
+	///
+	/// - `ESRCH`: no process has the pid: [`Pidfd::Gone`].
+	/// - `EINVAL` or `ENOENT`: gone only when `/proc/<pid>` is (`ENOENT`,
+	///   `ESRCH`), or names a process of another start time than `start`.
+	///   Kernels before 6.16 return `EINVAL` for a pid whose process was
+	///   reaped after `pidfd_open` found the pid (`pidfd_prepare`: `if (!pid ||
+	///   !pid_has_task(pid, PIDTYPE_TGID)) return -EINVAL;`); 6.16 returns
+	///   `ESRCH` there ("Task has already been reaped") and `ENOENT` for a
+	///   pid that is no thread-group leader. `EINVAL` also means bad flags (0
+	///   here) or `pid <= 0` (the syscall's own checks), and before 6.16 a pid
+	///   that is no thread-group leader: those leave `/proc/<pid>` as it
+	///   was, so they stay errors.
+	/// - `ENOSYS`, `EPERM`: [`Pidfd::Unavailable`].
+	///
+	/// # Errors
+	///
+	/// Any other failure (`EMFILE`: no descriptor left), and an `EINVAL` or
+	/// `ENOENT` while `/proc/<pid>` shows the process.
+	pub fn sort_pidfd_open(
+		pid: i32,
+		start: Option<u64>,
+		opened: io::Result<OwnedFd>,
+	) -> io::Result<Pidfd> {
+		let error = match opened {
+			Ok(fd) => return Ok(Pidfd::Open(fd)),
+			Err(error) => error,
+		};
+		match error.raw_os_error() {
+			Some(libc::ESRCH) => Ok(Pidfd::Gone),
+			Some(libc::ENOSYS | libc::EPERM) => Ok(Pidfd::Unavailable),
+			Some(libc::EINVAL | libc::ENOENT) if pid > 0 && gone(pid, start) => Ok(Pidfd::Gone),
+			_ => Err(error),
+		}
+	}
+
+	/// Whether `/proc/<pid>` shows no process of start time `start`: none
+	/// at all, or (when `start` is given) one of another start time.
+	fn gone(pid: i32, start: Option<u64>) -> bool {
+		match fs::read(format!("/proc/{pid}/stat")) {
+			Err(error) => matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)),
+			Ok(line) => start.is_some_and(|start| {
+				stat_fields(&String::from_utf8_lossy(&line))
+					.and_then(|mut fields| fields.nth(19)?.parse::<u64>().ok())
+					!= Some(start)
+			}),
+		}
 	}
 
 	/// Sends `signal` through `pidfd`, which can never reach a recycled pid.
@@ -167,10 +241,18 @@ pub mod sys {
 	}
 
 	fn stat_field<T: FromStr>(pid: i32, index: usize) -> Option<T> {
-		stat_fields(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?
+		stat_fields(&read_lossy(&format!("/proc/{pid}/stat"))?)?
 			.nth(index)?
 			.parse()
 			.ok()
+	}
+
+	/// `path` read whole, with bytes that are no UTF-8 replaced: a process
+	/// name (`comm`, cut by the kernel at 15 bytes) may be anything, and
+	/// must not hide the fields after it.
+	pub(crate) fn read_lossy(path: &str) -> Option<String> {
+		let bytes = fs::read(path).ok()?;
+		Some(String::from_utf8_lossy(&bytes).into_owned())
 	}
 
 	/// Start time in clock ticks since boot (`starttime`, field 22). Together
@@ -351,9 +433,7 @@ mod proc_snapshot {
 
 		pub fn status(&self) -> ProcessStatus {
 			match read_stat(self.pid) {
-				Some(stat) if stat.start_time == self.stat.start_time && stat.state != 'Z' => {
-					ProcessStatus::Running
-				},
+				Some(stat) if still_runs(&stat, self.stat.start_time) => ProcessStatus::Running,
 				_ => ProcessStatus::Exited,
 			}
 		}
@@ -363,7 +443,8 @@ mod proc_snapshot {
 			if signal == 0 {
 				return alive();
 			}
-			let Some(pidfd) = sys::open_pidfd(self.pid) else {
+			let Ok(sys::Pidfd::Open(pidfd)) = sys::pidfd_open(self.pid, Some(self.stat.start_time))
+			else {
 				return false;
 			};
 			if !alive() {
@@ -450,7 +531,7 @@ mod proc_snapshot {
 	}
 
 	fn read_stat(pid: i32) -> Option<Stat> {
-		parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+		parse_stat(&sys::read_lossy(&format!("/proc/{pid}/stat"))?)
 	}
 
 	fn parse_stat(content: &str) -> Option<Stat> {
@@ -479,8 +560,19 @@ mod proc_snapshot {
 		})
 	}
 
+	/// Whether `stat`, a fresh read of a process, is still the process that
+	/// started at `start_time` and has not exited. A zombie (`Z`) has exited,
+	/// and so has a process in state `X` (dead): its parent's wait took the
+	/// zombie, or nobody waits for it, and it is being released
+	/// (`task_state_array` in fs/proc/array.c; `wait_task_zombie` and
+	/// `exit_notify` in kernel/exit.c). gVisor writes `X (dead)` for its dead
+	/// tasks too (pkg/sentry/kernel/task_sched.go).
+	fn still_runs(stat: &Stat, start_time: u64) -> bool {
+		stat.start_time == start_time && !matches!(stat.state, 'Z' | 'X')
+	}
+
 	fn status_ids(pid: i32, prefix: &str) -> Option<(u32, u32)> {
-		let content = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+		let content = sys::read_lossy(&format!("/proc/{pid}/status"))?;
 		let mut ids = content
 			.lines()
 			.find(|line| line.starts_with(prefix))?
@@ -510,6 +602,29 @@ mod proc_snapshot {
 		u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
 			.ok()
 			.filter(|v| *v > 0)
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::{parse_stat, still_runs};
+
+		fn stat_line(state: &str) -> String {
+			format!("4242 (sleep) {state} 1 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0\n")
+		}
+
+		/// A process read between its parent's wait and its release shows `X`
+		/// (dead). It has exited, as a zombie has, so `status` reports it
+		/// `Exited`, not `Running`.
+		#[test]
+		fn a_dead_process_has_exited() {
+			for state in ["X", "Z"] {
+				let stat = parse_stat(&stat_line(state)).expect("parses");
+				assert!(!still_runs(&stat, 987_654), "state {state} reads as running");
+			}
+			let running = parse_stat(&stat_line("R")).expect("parses");
+			assert!(still_runs(&running, 987_654), "the control: a running process");
+			assert!(!still_runs(&running, 987_655), "the control: another process at the pid");
+		}
 	}
 }
 
@@ -1112,6 +1227,7 @@ mod proc_snapshot {
 pub mod sys {
 	use std::{
 		ffi::c_void,
+		io,
 		os::windows::io::{AsRawHandle, HandleOrInvalid, HandleOrNull, OwnedHandle, RawHandle},
 		sync::Arc,
 	};
@@ -1286,6 +1402,45 @@ pub mod sys {
 				return None;
 			}
 			Some(self.entry)
+		}
+	}
+
+	/// `GetLastError` of a `Process32NextW` past the snapshot's last entry.
+	const ERROR_NO_MORE_FILES: i32 = 18;
+	/// `GetLastError` of an `OpenProcess` for a pid no process holds.
+	const ERROR_INVALID_PARAMETER: i32 = 87;
+
+	/// Every process, from one Toolhelp snapshot taken now, for a walk that
+	/// must not miss one: an error when the snapshot could not be taken, or
+	/// not read to its end (`processes` ends silently on either).
+	pub fn process_table() -> io::Result<Vec<ProcessEntry>> {
+		let snapshot = toolhelp_snapshot(TH32CS_SNAPPROCESS).ok_or_else(io::Error::last_os_error)?;
+		// SAFETY: the all-zero record is valid; its ABI size is set below.
+		let mut entry = unsafe { std::mem::zeroed::<ProcessEntry>() };
+		entry.size = size_of::<ProcessEntry>() as u32;
+		let mut table = Vec::new();
+		// SAFETY: the snapshot is open and the entry carries its ABI size.
+		let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &raw mut entry) };
+		while found != 0 {
+			table.push(entry);
+			// SAFETY: as above.
+			found = unsafe { Process32NextW(snapshot.as_raw_handle(), &raw mut entry) };
+		}
+		let error = io::Error::last_os_error();
+		if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) { Ok(table) } else { Err(error) }
+	}
+
+	/// Opens `pid` with `access`, as [`open_process`] does: `Ok(None)` when
+	/// no process holds `pid` (`ERROR_INVALID_PARAMETER`), `Err` when it could
+	/// not be opened for another reason (`ERROR_ACCESS_DENIED`, no memory or
+	/// handle left).
+	pub fn try_open_process(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {
+		match open_process(pid, access) {
+			Some(handle) => Ok(Some(handle)),
+			None => {
+				let error = io::Error::last_os_error();
+				if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) { Ok(None) } else { Err(error) }
+			},
 		}
 	}
 
@@ -1900,12 +2055,25 @@ pub use proc_snapshot::{ProcInfo, threads_by_pid};
 ///
 /// Listing is unaffected: `pgrep` still reports ancestors and `ps` still shows
 /// them. Only signalling consults this.
+///
+/// The walk fails closed: a recorded parent missing from the snapshot that
+/// the caller can still signal (`kill(pid, 0)` succeeds) was not read, not
+/// gone, so the chain above it is unknown and every signal is refused
+/// ([`Self::unread`]). One that exited, or another user's, ends the walk: no
+/// signal of ours reaches it. Without `/proc` (on Linux, this process's own
+/// entry is `ENOENT`: none is mounted, or a sandbox hides it) there is no
+/// chain to walk: only this process is protected, as in a shell without the
+/// guard; the guard needs a mounted `/proc`.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub struct HostProcesses {
 	/// This process and its ancestors, nearest first.
-	pub pids:  smallvec::SmallVec<[i32; 16]>,
+	pub pids:   smallvec::SmallVec<[i32; 16]>,
 	/// The process groups those processes belong to.
-	pub pgids: smallvec::SmallVec<[i32; 16]>,
+	pub pgids:  smallvec::SmallVec<[i32; 16]>,
+	/// An ancestor the snapshot did not read though the caller can signal it,
+	/// above which the chain is unknown, with why its read failed
+	/// (`strerror`).
+	pub unread: Option<(i32, String)>,
 }
 
 /// One process as the chain walk sees it.
@@ -1926,7 +2094,7 @@ struct ChainNode {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl HostProcesses {
 	/// Whether signalling `target` would reach this process or one of its
-	/// ancestors.
+	/// ancestors, or might, since an ancestor was not read ([`Self::unread`]).
 	///
 	/// `target` follows `kill(2)`: a positive value is a pid, `0` is the caller's
 	/// own process group, `-1` is every process the caller may signal, and any
@@ -1937,6 +2105,13 @@ impl HostProcesses {
 	/// process table once, not once per operand.
 	#[must_use]
 	pub fn blocks(&self, target: i32) -> bool {
+		self.unread.is_some() || self.protects(target)
+	}
+
+	/// Whether `target` (as [`Self::blocks`] takes it) is this process, one of
+	/// the ancestors read, or one of their process groups.
+	#[must_use]
+	pub fn protects(&self, target: i32) -> bool {
 		if target == -1 || target == 0 {
 			return true;
 		}
@@ -1951,9 +2126,9 @@ impl HostProcesses {
 	/// table to select its targets; this spares it a second).
 	pub(crate) fn resolve_in(all: &[ProcInfo]) -> Self {
 		let Ok(self_pid) = i32::try_from(std::process::id()) else {
-			return Self { pids: smallvec::SmallVec::new(), pgids: smallvec::SmallVec::new() };
+			return Self { pids: smallvec::SmallVec::new(), pgids: smallvec::SmallVec::new(), unread: None };
 		};
-		Self::walk(self_pid, |pid| {
+		let lookup = |pid| {
 			all
 				.iter()
 				.find(|process| process.pid() == pid)
@@ -1962,10 +2137,15 @@ impl HostProcesses {
 					pgid:  process.group_id(),
 					start: process.start_time(),
 				})
-		})
+		};
+		Self::walk(self_pid, lookup, signalable, read_error)
 	}
 
-	/// Walks from `self_pid` up through `lookup`, collecting the chain.
+	/// Walks from `self_pid` up through `lookup`, collecting the chain;
+	/// `signalable` says whether a pid missing from `lookup` is one the caller
+	/// can still signal (then it was not read, and the walk fails closed),
+	/// and `read_error` why reading it fails (`NotFound` for `self_pid`: no
+	/// `/proc`, nothing to walk).
 	///
 	/// A recorded parent pid is followed only when the process holding it is both
 	/// **present** and **no younger than its child**. Presence alone is not enough:
@@ -1975,13 +2155,33 @@ impl HostProcesses {
 	/// its child, so a later start time identifies the impostor. Equal start times
 	/// are accepted, since a `fork` within one clock tick is indistinguishable at
 	/// this resolution.
-	fn walk(self_pid: i32, lookup: impl Fn(i32) -> Option<ChainNode>) -> Self {
+	fn walk(
+		self_pid: i32,
+		lookup: impl Fn(i32) -> Option<ChainNode>,
+		signalable: impl Fn(i32) -> bool,
+		read_error: impl Fn(i32) -> Option<std::io::Error>,
+	) -> Self {
 		let mut pids = smallvec::SmallVec::new();
 		let mut pgids = smallvec::SmallVec::new();
+		let mut unread = None;
+		let why = |error: Option<std::io::Error>| {
+			error.map_or_else(|| "it could not be read".to_owned(), |error| crate::host::strip_errno(&error))
+		};
 
-		// We always protect ourselves, whether or not the snapshot lists us.
+		// We always protect ourselves, whether or not the snapshot lists us;
+		// unlisted, our parent is unknown.
 		pids.push(self_pid);
 		let mut node = lookup(self_pid);
+		if node.is_none() {
+			match read_error(self_pid) {
+				// No `/proc`: nothing above this process can be read.
+				Some(error) if error.kind() == std::io::ErrorKind::NotFound => {
+					return Self { pids, pgids, unread: None };
+				},
+				error if signalable(self_pid) => unread = Some((self_pid, why(error))),
+				_ => {},
+			}
+		}
 		while let Some(current) = node {
 			if let Some(pgid) = current.pgid
 				&& !pgids.contains(&pgid)
@@ -1997,6 +2197,11 @@ impl HostProcesses {
 				break;
 			}
 			let Some(found) = lookup(parent) else {
+				// A live parent we may signal was not read: the chain above
+				// it is unknown.
+				if signalable(parent) {
+					unread = Some((parent, why(read_error(parent))));
+				}
 				break;
 			};
 			if found.start > current.start {
@@ -2005,8 +2210,37 @@ impl HostProcesses {
 			pids.push(parent);
 			node = Some(found);
 		}
-		Self { pids, pgids }
+		Self { pids, pgids, unread }
 	}
+}
+
+/// Why the process `pid` cannot be read: on Linux the error of reading its
+/// `/proc/<pid>/stat` now; `None` when the read succeeds now (it raced) or
+/// elsewhere.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn read_error(pid: i32) -> Option<std::io::Error> {
+	#[cfg(target_os = "linux")]
+	return std::fs::read(format!("/proc/{pid}/stat")).err();
+	#[cfg(not(target_os = "linux"))]
+	{
+		let _ = pid;
+		None
+	}
+}
+
+/// Whether the caller can signal `pid` (`kill(pid, 0)` succeeds): it exists,
+/// and is ours (or the caller may signal anyone's).
+#[cfg(unix)]
+fn signalable(pid: i32) -> bool {
+	// SAFETY: signal 0 sends nothing; it only checks the pid.
+	unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Windows' table lists every process the caller may open: one missing from
+/// it is gone.
+#[cfg(windows)]
+const fn signalable(_pid: i32) -> bool {
+	false
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -2095,6 +2329,111 @@ mod tests {
 		}
 	}
 
+	/// The walk of the shell's ancestors reads a process whose name is no
+	/// UTF-8 as any other: run as a child test process named `p\377q`, the
+	/// walk from it reads its own entry and goes on to its parent, so
+	/// nothing is refused for an ancestor it could not read.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn an_ancestor_whose_name_is_no_utf8_is_walked() {
+		use std::os::unix::ffi::OsStrExt as _;
+
+		let dir = tempfile::tempdir().unwrap();
+		let link = dir.path().join(std::ffi::OsStr::from_bytes(b"p\xffq"));
+		std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
+		// The kernel names the process after the path it runs (`p\377q`);
+		// libtest wants a UTF-8 `argv[0]`.
+		let ran = std::os::unix::process::CommandExt::arg0(&mut std::process::Command::new(&link), "walk")
+			.args(["--ignored", "--exact", "proc_snapshot::tests::walk_from_a_process_named_p_377q"])
+			.env("PI_WALK_NAMED", "1")
+			.output()
+			.unwrap();
+		let said = String::from_utf8_lossy(&ran.stdout);
+		assert!(ran.status.success() && said.contains("1 passed"), "{said}{}", String::from_utf8_lossy(&ran.stderr));
+	}
+
+	/// Run by [`an_ancestor_whose_name_is_no_utf8_is_walked`] as a process
+	/// named `p\377q`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run as a child process by an_ancestor_whose_name_is_no_utf8_is_walked"]
+	fn walk_from_a_process_named_p_377q() {
+		if std::env::var_os("PI_WALK_NAMED").is_none() {
+			return;
+		}
+		let me = i32::try_from(std::process::id()).unwrap();
+		assert_eq!(std::fs::read(format!("/proc/{me}/comm")).unwrap(), b"p\xffq\n");
+		let host = HostProcesses::resolve_in(&ProcInfo::all());
+		assert!(host.unread.is_none(), "an unread ancestor in {:?}", host.pids);
+		assert!(host.pids.len() > 1 && host.pids[0] == me, "the walk stopped at {:?}", host.pids);
+	}
+
+	/// Without `/proc` (our own entry is missing and its read `ENOENT`) there
+	/// is no chain to walk: only we are protected, and a signal elsewhere
+	/// goes through, as in a shell without the guard.
+	#[test]
+	fn without_proc_only_we_are_protected() {
+		let host = HostProcesses::walk(100, tree(&[]), |_| true, failing(2));
+		assert_eq!((host.pids.as_slice(), host.unread.is_none()), (&[100][..], true));
+		assert!(host.blocks(100) && !host.blocks(4242) && !host.blocks(-4242));
+	}
+
+	/// With `/proc` mounted (our own entry read), a parent whose read fails
+	/// with `ENOENT` while a signal still reaches it was not read: a race
+	/// with its exit or the reuse of its pid. Every signal is refused, and the
+	/// refusal names the pid and the error; so too for `EMFILE`, `ENOMEM` and
+	/// `EIO`.
+	#[cfg(unix)]
+	#[test]
+	fn an_unread_parent_names_its_error() {
+		for (errno, said) in [
+			(2, "No such file or directory"),
+			(24, "Too many open files"),
+			(12, "Cannot allocate memory"),
+			(5, "Input/output error"),
+		] {
+			let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), |_| true, failing(errno));
+			assert_eq!(host.unread, Some((42, said.to_owned())), "errno {errno}");
+			assert!(host.blocks(4242), "errno {errno}: a signal went through above the unread parent");
+		}
+	}
+
+	/// No read fails: what `lookup` lacks raced, and reads now.
+	fn no_error(_pid: i32) -> Option<std::io::Error> {
+		None
+	}
+
+	/// Every read fails with `errno`.
+	fn failing(errno: i32) -> impl Fn(i32) -> Option<std::io::Error> {
+		move |_| Some(std::io::Error::from_raw_os_error(errno))
+	}
+
+	/// A process whose name is no UTF-8 (the kernel cuts `comm` at 15 bytes,
+	/// mid-character, or a program is named so) is read like any other: its
+	/// `stat` and `status` fields are not lost with its name, so a walk of
+	/// the shell's ancestors does not take it for one it cannot read.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_process_whose_name_is_no_utf8_is_read() {
+		use std::os::unix::ffi::OsStrExt as _;
+
+		let dir = tempfile::tempdir().unwrap();
+		let link = dir.path().join(std::ffi::OsStr::from_bytes(b"p\xffq"));
+		std::os::unix::fs::symlink(crate::host::on_path("sleep"), &link).unwrap();
+		let mut child = std::process::Command::new(&link).arg("600").spawn().unwrap();
+		let pid = i32::try_from(child.id()).unwrap();
+		// Until the exec named it.
+		while std::fs::read(format!("/proc/{pid}/comm")).ok().as_deref() != Some(b"p\xffq\n") {
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		}
+		let found = ProcInfo::all().into_iter().find(|process| process.pid() == pid);
+		let start = super::sys::start_time(pid);
+		let _ = child.kill();
+		let _ = child.wait();
+		let found = found.expect("the process named p\\377q is in the snapshot");
+		assert_eq!((found.ppid(), start.is_some()), (Some(i32::try_from(std::process::id()).unwrap()), true));
+	}
+
 	/// The case presence alone cannot catch: our recorded parent exited and its pid
 	/// was reused, so the number *is* in the table — held by a process that started
 	/// after us. Following it would hand our immunity to an unrelated process, and
@@ -2106,6 +2445,8 @@ mod tests {
 		let host = HostProcesses::walk(
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, Some(1), Some(9), 90)]),
+			gone,
+			no_error,
 		);
 		assert_eq!(host.pids.as_slice(), [100], "a younger impostor must not join the chain");
 		assert!(!host.pgids.contains(&9), "the impostor's group must not be protected either");
@@ -2118,6 +2459,8 @@ mod tests {
 		let host = HostProcesses::walk(
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, Some(1), Some(9), 10), (1, None, Some(1), 0)]),
+			gone,
+			no_error,
 		);
 		assert_eq!(host.pids.as_slice(), [100, 42, 1], "the real chain must be walked to the root");
 		assert!(host.pgids.contains(&9), "an ancestor's group must be protected");
@@ -2131,16 +2474,43 @@ mod tests {
 		let host = HostProcesses::walk(
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, None, Some(7), 50)]),
+			gone,
+			no_error,
 		);
 		assert_eq!(host.pids.as_slice(), [100, 42], "same-tick parent must still be an ancestor");
 	}
 
-	/// A parent absent from the table has exited and its number may already be
-	/// reused; the walk stops rather than protecting it.
+	/// A parent absent from the table that no signal of ours reaches has
+	/// exited (or is another user's) and its number may already be reused;
+	/// the walk stops rather than protecting it, and signals elsewhere go on.
 	#[test]
 	fn a_departed_parent_stops_the_walk() {
-		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]));
+		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), gone, no_error);
 		assert_eq!(host.pids.as_slice(), [100], "an unobserved parent must not join the chain");
+		assert_eq!(host.unread, None);
+		assert!(!host.blocks(42) && !host.blocks(4242), "the chain ends at us");
+	}
+
+	/// A parent absent from the table that we can still signal was not read
+	/// (no descriptor left, say), not gone: the chain above it is unknown, so
+	/// every signal is refused, while the chain read still says which pids
+	/// are ours. So too when our own entry was not read.
+	#[test]
+	fn an_unread_parent_we_can_signal_refuses_every_signal() {
+		let host = HostProcesses::walk(100, tree(&[(100, Some(42), Some(7), 50)]), |pid| pid == 42, failing(24));
+		let unread = host.unread.as_ref().map(|(pid, _)| *pid);
+		assert_eq!((host.pids.as_slice(), unread), (&[100][..], Some(42)));
+		assert!(host.blocks(4242) && host.blocks(-4242), "a signal went through above an unread ancestor");
+		assert!(host.protects(100) && !host.protects(4242));
+		let host = HostProcesses::walk(100, tree(&[]), |_| true, failing(24));
+		let unread = host.unread.as_ref().map(|(pid, _)| *pid);
+		assert_eq!((host.pids.as_slice(), unread), (&[100][..], Some(100)));
+		assert!(host.blocks(4242), "a signal went through with our own entry unread");
+	}
+
+	/// No pid is signalable: every missing one is gone.
+	fn gone(_pid: i32) -> bool {
+		false
 	}
 
 	/// A cycle in the recorded parent links must not spin forever.
@@ -2149,6 +2519,8 @@ mod tests {
 		let host = HostProcesses::walk(
 			100,
 			tree(&[(100, Some(42), Some(7), 50), (42, Some(100), Some(7), 10)]),
+			gone,
+			no_error,
 		);
 		assert_eq!(host.pids.as_slice(), [100, 42], "the cycle must close the walk");
 	}
@@ -2229,7 +2601,9 @@ mod tests {
 
 	/// Regression guard for the pid-recycling hazard: the chain comes from the
 	/// snapshot handed in, so a parent absent from it — exited, and its number free
-	/// for reuse — is never carried forward.
+	/// for reuse — is never carried forward. Our real parent is alive and ours
+	/// to signal, though: missing from the snapshot, it was not read, so the
+	/// chain fails closed (on Unix, where `kill(pid, 0)` can tell).
 	#[test]
 	fn a_departed_parent_leaves_no_stale_pid() {
 		let self_pid = i32::try_from(std::process::id()).expect("pid fits in i32");
@@ -2250,6 +2624,12 @@ mod tests {
 				!host.pids.contains(&parent),
 				"pid {parent} was carried forward despite being absent from the snapshot"
 			);
+			#[cfg(unix)]
+			{
+				let unread = host.unread.as_ref().map(|(pid, _)| *pid);
+				assert_eq!(unread, Some(parent), "our live parent was taken for gone");
+				assert!(host.blocks(i32::MAX), "a signal went through above the unread parent");
+			}
 		}
 	}
 

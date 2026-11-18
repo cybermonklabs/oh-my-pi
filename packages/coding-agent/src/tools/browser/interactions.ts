@@ -1116,7 +1116,7 @@ export async function selectElementOptions(
 	return outcome.selected;
 }
 
-/** How long a click has to open a file chooser before the target counts as a drop zone. */
+/** How long a delivered click has to open a file chooser before the target counts as a drop zone. */
 const FILE_CHOOSER_WAIT_MS = 400;
 
 /**
@@ -1534,9 +1534,11 @@ async function catchChooserInput(
 		session.once("Page.fileChooserOpened", resolve);
 		await untilAborted(signal, () => session.send("Page.enable"));
 		await untilAborted(signal, () => session.send("Page.setInterceptFileChooserDialog", { enabled: true }));
-		// The wait covers the click, so a target that only becomes clickable later counts as a drop zone.
-		timer = setTimeout(() => resolve(null), FILE_CHOOSER_WAIT_MS);
 		await clickElement(handle, label, signal);
+		// The window starts once the click is delivered: its handlers have run, so a chooser it opens is already on
+		// its way. Started before the click, the click's own round trips spent it on a loaded machine, and a
+		// control that opens a chooser was taken for a drop zone.
+		timer = setTimeout(() => resolve(null), FILE_CHOOSER_WAIT_MS);
 		const chooser = await untilAborted(signal, () => opened);
 		if (!chooser) return null;
 		if (chooser.backendNodeId === undefined) {

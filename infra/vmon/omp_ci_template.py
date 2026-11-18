@@ -55,7 +55,9 @@ NAME = "omp-ci"
 CPU_COUNT = 8
 MEMORY_MB = 16384
 
-# Pinned helper versions (bump together with a template rebuild).
+# Pinned helper versions (bump together with a template rebuild). Bazel's build
+# scripts take CMake and Ninja from bazel/toolchains/cmake.bzl, which pins the
+# same two: bump them together.
 SCCACHE_VERSION = "0.18.0"
 ZIG_VERSION = "0.16.0"
 CMAKE_VERSION = "4.4.3"

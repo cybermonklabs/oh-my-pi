@@ -2,6 +2,8 @@
 //! call it directly, without futures or boxing.
 
 #[cfg(unix)]
+mod remove_tree;
+#[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
@@ -14,10 +16,12 @@ use std::{
 };
 
 #[cfg(unix)]
+pub(crate) use self::remove_tree::remove_dir_all;
+#[cfg(unix)]
 pub(crate) use self::unix::{
 	access, allocated_size, chown, close, file_id, file_id_of, file_is_locked, file_metadata,
 	file_set_permissions, file_set_times, fstat_fs, get_xattr, link_count, list_xattr, make_node,
-	remove_xattr, set_dir_mode, set_permissions, set_times, set_xattr, stat_fs, symlink,
+	remove_xattr, set_dir_mode, set_permissions, set_times, set_xattr, stat_fs, symlink, timespec,
 };
 #[cfg(windows)]
 pub(crate) use self::windows::{
@@ -65,6 +69,13 @@ pub(crate) fn symlink_metadata(path: &Path) -> io::Result<Metadata> {
 
 pub(crate) fn read_dir(path: &Path) -> io::Result<ReadDir> {
 	fs::read_dir(path).map(ReadDir::native)
+}
+
+/// Removes the directory `path` and everything below it (see
+/// `remove_tree` for Unix, which bounds its descriptors).
+#[cfg(not(unix))]
+pub(crate) fn remove_dir_all(path: &Path) -> io::Result<()> {
+	fs::remove_dir_all(path)
 }
 
 pub(crate) fn create_dir(path: &Path, mode: Option<u32>, recursive: bool) -> io::Result<()> {

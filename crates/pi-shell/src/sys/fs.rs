@@ -6,13 +6,17 @@
 //! pending open releases the helper).
 //!
 //! Reads and writes on pipes, FIFOs, sockets and terminals never wait in the
-//! kernel on Unix: the other end may be a vproc of the same engine (a FIFO, a
-//! `/dev/fd/N` of a process substitution), and a terminal read must not stop
-//! the scheduler (`read -t` timers, other vprocs). [`StdFile`] checks
-//! readiness first and returns `Pending` with the waker registered on the
-//! shared readiness thread (`ready`); the descriptor's flags stay untouched,
-//! since externals inherit them. Windows pipes and consoles keep blocking
-//! I/O (anonymous pipes cannot be polled).
+//! kernel on a scheduler thread on Unix: the other end may be a vproc of the
+//! same engine (a FIFO, a `/dev/fd/N` of a process substitution), and a
+//! terminal read must not stop the scheduler (`read -t` timers, other
+//! vprocs). [`StdFile`] checks readiness first and returns `Pending` with
+//! the waker registered on the shared readiness thread (`ready`); the
+//! descriptor's flags stay untouched, since externals inherit them. A write
+//! goes through a private non-blocking description of the pipe (Linux,
+//! reopened through `/proc/self/fd`), or else to a writer thread of the
+//! descriptor's own ([`BlockingWriter`]). On Windows every write that is not
+//! to a regular file goes to such a writer thread too; Windows reads of pipes
+//! and consoles still block (anonymous pipes cannot be polled).
 //!
 //! Windows specifics: `test -x` holds for directories, files with a
 //! `PATHEXT` extension and files starting with `#!`; process substitution
@@ -20,20 +24,25 @@
 //! the engine asks for [`TempPurpose::HereDoc`], e.g. for a consumer that
 //! must seek).
 
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 use std::{
 	cell::RefCell,
 	fs::{self, OpenOptions},
 	io::{self, IsTerminal, Read, Seek, Write},
 	path::Path,
-	sync::atomic::{AtomicU32, Ordering},
-	task::{Context, Poll},
+	sync::{
+		Arc,
+		atomic::{AtomicU32, Ordering},
+	},
+	task::{Context, Poll, Waker},
 	time::UNIX_EPOCH,
 };
 
 use bstr::{BStr, BString, ByteSlice};
 
 use crate::bash::{
-	DirEntry, DirIter, File, FileKind, Fs, FsPoll, OpenFlags, OsHandle, Stat, StdFd,
+	DirEntry, DirIter, File, FileKind, Fs, FsPoll, Mark, OpenFlags, OsHandle, Stat, StdFd,
 	fs::{Access, StatKind, TempNode, TempPurpose},
 };
 
@@ -57,19 +66,29 @@ pub struct StdFile {
 	/// drop the read wait. Declared first so they are dropped, and
 	/// forgotten by the waiting thread, before `file` closes.
 	#[cfg(unix)]
-	watch:  [Option<crate::sys::ready::Watch>; 2],
-	file:   fs::File,
-	kind:   FileKind,
+	watch:          [Option<crate::sys::ready::Watch>; 2],
+	/// Writes for a descriptor with no private non-blocking description,
+	/// started on the first such write.
+	writer:         Option<BlockingWriter>,
+	/// Linux only: a fresh non-blocking open file description of a pipe's
+	/// write end. Externals keep the blocking description they inherited.
+	#[cfg(target_os = "linux")]
+	private_writer: Option<fs::File>,
+	/// Test only: runs after the readiness check and before the write.
+	#[cfg(all(test, unix))]
+	before_write:   Option<TestHook>,
+	file:           fs::File,
+	kind:           FileKind,
 	/// Access mode of the open file description (`O_ACCMODE` bits of
 	/// `F_GETFL`; `None` when unknown).
 	#[cfg(unix)]
-	access: Option<libc::c_int>,
+	access:         Option<libc::c_int>,
 	/// The null device: a write is complete without a syscall.
-	null:   bool,
+	null:           bool,
 	/// Read-ahead of a regular file this engine opened for reading only
 	/// ([`StdFile::opened`]); `None` for every other file and once the
 	/// descriptor was handed out ([`File::os_handle`], [`File::dup`]).
-	ahead:  RefCell<Option<Ahead>>,
+	ahead:          RefCell<Option<Ahead>>,
 }
 
 /// Bytes of a regular file read from the kernel beyond what the engine
@@ -141,6 +160,373 @@ impl Ahead {
 	}
 }
 
+/// How long a write waits before it tries again when the pipe polls
+/// writable but took nothing: a readiness watch would fire at once.
+#[cfg(target_os = "linux")]
+const WRITE_RETRY: Duration = Duration::from_millis(5);
+
+/// The most one hand-off to a [`BlockingWriter`] copies; a status record
+/// ([`StdFile::poll_write_atomic`]) is kept within it, so it is one chunk.
+pub(crate) const BLOCKING_WRITE_CHUNK: usize = 64 << 10;
+
+/// The write for a descriptor whose writes may wait in the kernel and that
+/// has no private non-blocking description: every Darwin pipe, FIFO and
+/// terminal; every Windows write that is not to a regular file; on Linux a
+/// terminal, a socket, or a pipe whose reopen failed. One thread of its own
+/// writes each chunk whole, in order, so the wait is never on a scheduler
+/// thread.
+///
+/// A write is taken, and `Ready` with its length, when its chunk is handed
+/// to the idle thread; while the thread still writes an earlier chunk, a
+/// write is `Pending` and hands nothing off. Nothing is matched to a write
+/// afterwards: a write whose future is dropped while `Pending` handed
+/// nothing off, and one that returned `Ready` is the thread's to finish.
+/// A settle ([`File::poll_settle`]) waits until the thread is idle: every
+/// engine writer settles before it counts its bytes as out, so whatever
+/// runs next (an external that inherits the descriptor, another writer on
+/// the same pipe) comes after them.
+///
+/// Each chunk handed off gets a [`Mark`], which keeps the chunk's result.
+/// A writer that hands chunks off ([`File::poll_write_marked`]) holds their
+/// marks and takes its chunks' errors by settling with them
+/// ([`File::poll_settle_marked`]); an engine writer settles a chunk before
+/// it hands off the next one to the same object, so it stops at its first
+/// failed chunk, as a writer stops at its first failed `write(2)`, and never
+/// has more than one mark in flight. A chunk's error reaches no other writer,
+/// settle or flush: a plain write ([`File::poll_write`]) drops its mark and
+/// with it the chunk's error, and every engine writer whose bytes can reach
+/// this thread writes with marks. Every later write is made, as every later
+/// `write(2)` is (a FIFO whose reader came back takes it).
+#[derive(Debug)]
+struct BlockingWriter {
+	jobs:  std::sync::mpsc::Sender<(Mark, Vec<u8>)>,
+	state: Arc<parking_lot::Mutex<WriterState>>,
+}
+
+#[derive(Debug, Default)]
+struct WriterState {
+	/// The thread is writing a chunk.
+	busy:   bool,
+	/// Writers and settles to wake when the thread is idle again.
+	wakers: Vec<Waker>,
+}
+
+impl BlockingWriter {
+	fn start(file: &fs::File) -> io::Result<Self> {
+		let mut file = file.try_clone()?;
+		let (jobs, queue) = std::sync::mpsc::channel::<(Mark, Vec<u8>)>();
+		let state = Arc::new(parking_lot::Mutex::new(WriterState::default()));
+		let shared = Arc::clone(&state);
+		std::thread::Builder::new()
+			.name("obash-write".into())
+			.stack_size(64 << 10)
+			.spawn(move || {
+				// Ends once the `StdFile` is dropped and the last chunk is done.
+				while let Ok((mark, bytes)) = queue.recv() {
+					#[cfg(all(test, target_os = "linux"))]
+					wait_while_held();
+					let result = write_all_waiting(&mut file, &bytes);
+					#[cfg(all(test, target_os = "linux"))]
+					if result.is_err() {
+						CHUNKS_FAILED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+					}
+					let wakers = {
+						let mut s = shared.lock();
+						// Under the lock a settle checks the mark under, so no
+						// settle misses the wake.
+						mark.finish(result);
+						s.busy = false;
+						std::mem::take(&mut s.wakers)
+					};
+					for waker in wakers {
+						waker.wake();
+					}
+				}
+			})?;
+		Ok(Self { jobs, state })
+	}
+
+	/// Hands off a chunk of `buf`: `Ready` with its length and its mark.
+	fn poll_write(&self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<(usize, Mark)>> {
+		let mut s = self.state.lock();
+		if s.busy {
+			register(&mut s.wakers, cx);
+			return Poll::Pending;
+		}
+		let chunk = &buf[..buf.len().min(BLOCKING_WRITE_CHUNK)];
+		let mark = Mark::new();
+		if self.jobs.send((mark.clone(), chunk.to_vec())).is_err() {
+			return Poll::Ready(Err(io::Error::other("the writer thread stopped")));
+		}
+		s.busy = true;
+		Poll::Ready(Ok((chunk.len(), mark)))
+	}
+
+	/// `Ready` once every chunk handed off is in the kernel or failed. Takes
+	/// no error.
+	fn poll_settle(&self, cx: &Context<'_>) -> Poll<()> {
+		let mut s = self.state.lock();
+		if s.busy {
+			register(&mut s.wakers, cx);
+			return Poll::Pending;
+		}
+		Poll::Ready(())
+	}
+
+	/// `Ready` once the chunks of `marks` are done, with the first of their
+	/// errors; it takes all of them.
+	fn poll_settle_marked(&self, cx: &Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		{
+			let mut s = self.state.lock();
+			if marks.iter().any(|mark| !mark.is_done()) {
+				register(&mut s.wakers, cx);
+				return Poll::Pending;
+			}
+		}
+		let mut first = Ok(());
+		for mark in marks {
+			let result = mark.take_error();
+			if first.is_ok() {
+				first = result;
+			}
+		}
+		Poll::Ready(first)
+	}
+
+	/// Test only: whether no chunk is being written.
+	#[cfg(all(test, target_os = "linux"))]
+	fn idle(&self) -> bool {
+		!self.state.lock().busy
+	}
+}
+
+fn register(wakers: &mut Vec<Waker>, cx: &Context<'_>) {
+	if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
+		wakers.push(cx.waker().clone());
+	}
+}
+
+/// Writes all of `bytes` with blocking writes, on a writer thread. A
+/// descriptor someone else set non-blocking (a socket given as a run's
+/// stdio) refuses a write with `WouldBlock` when full; that waits until it
+/// is writable and writes again, rather than ending the chunk.
+fn write_all_waiting(file: &mut fs::File, mut bytes: &[u8]) -> io::Result<()> {
+	while !bytes.is_empty() {
+		match file.write(bytes) {
+			Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+			Ok(n) => bytes = &bytes[n..],
+			Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+				#[cfg(all(test, target_os = "linux"))]
+				WOULD_BLOCK_SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				wait_writable(file)?;
+			},
+			Err(e) => return Err(e),
+		}
+	}
+	Ok(())
+}
+
+/// Test only: how many times a writer thread met `WouldBlock`, so a test
+/// can drain only after the retry branch has run.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static WOULD_BLOCK_SEEN: std::sync::atomic::AtomicUsize =
+	std::sync::atomic::AtomicUsize::new(0);
+
+/// Test only: how many chunks writer threads failed to write, so a test
+/// can tell how many chunks a writer handed off after its first failed one.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static CHUNKS_FAILED: std::sync::atomic::AtomicUsize =
+	std::sync::atomic::AtomicUsize::new(0);
+
+/// Waits, on the writer thread, until a non-blocking descriptor may take a
+/// write.
+#[cfg(unix)]
+fn wait_writable(file: &fs::File) -> io::Result<()> {
+	use std::os::fd::AsRawFd;
+
+	let mut pfd = libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+	loop {
+		// SAFETY: `pfd` is one valid `pollfd` for a live descriptor; no timeout.
+		match unsafe { libc::poll(&raw mut pfd, 1, -1) } {
+			-1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {},
+			-1 => return Err(io::Error::last_os_error()),
+			// Writable, or an error the next write reports.
+			_ => return Ok(()),
+		}
+	}
+}
+
+/// Waits, on the writer thread, before a non-blocking pipe (`PIPE_NOWAIT`)
+/// is written again: Windows offers no readiness wait for it.
+#[cfg(not(unix))]
+fn wait_writable(_file: &fs::File) -> io::Result<()> {
+	std::thread::sleep(std::time::Duration::from_millis(1));
+	Ok(())
+}
+
+/// A test's callback in the write path.
+#[cfg(all(test, unix))]
+pub(crate) struct TestHook(pub(crate) Box<dyn FnMut() + Send>);
+
+#[cfg(all(test, unix))]
+impl std::fmt::Debug for TestHook {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("TestHook")
+	}
+}
+
+/// Set in a test's child process: every `StdFile` there takes the
+/// [`BlockingWriter`] route, the only one Darwin has, on Linux too.
+#[cfg(all(test, target_os = "linux"))]
+const FORCE_BLOCKING_WRITER_ENV: &str = "PI_SHELL_TEST_FORCE_BLOCKING_WRITER";
+
+#[cfg(all(test, target_os = "linux"))]
+static FORCE_BLOCKING_WRITER: std::sync::LazyLock<bool> =
+	std::sync::LazyLock::new(|| std::env::var_os(FORCE_BLOCKING_WRITER_ENV).is_some());
+
+/// Runs `body` in a child process of this test binary where every
+/// `StdFile` takes the [`BlockingWriter`] route. `test` is the test's full
+/// path (`module_path!()` and its name): the child runs exactly that test,
+/// which then runs `body`. A process of its own keeps the route from
+/// reaching the tests that run beside it in one process.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn in_blocking_writer_process(test: &str, body: impl FnOnce()) {
+	if *FORCE_BLOCKING_WRITER {
+		body();
+		return;
+	}
+	let name = test.split_once("::").map_or(test, |(_, rest)| rest);
+	let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+		.args([name, "--exact", "--nocapture", "--test-threads=1"])
+		.env(FORCE_BLOCKING_WRITER_ENV, "1")
+		.output()
+		.expect("run the test in a child process");
+	let stdout = String::from_utf8_lossy(&out.stdout);
+	assert!(
+		out.status.success() && stdout.contains("1 passed"),
+		"the child run of {name} failed ({}):\n{stdout}\n{}",
+		out.status,
+		String::from_utf8_lossy(&out.stderr)
+	);
+}
+
+/// Test only: while held ([`hold_writers`]), a writer thread has taken its
+/// chunk (it is busy) but does not write it, so a test finds the thread
+/// busy for as long as it likes, without racing it.
+#[cfg(all(test, target_os = "linux"))]
+static HELD: (std::sync::Mutex<bool>, std::sync::Condvar) =
+	(std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Test only: every writer thread of this process holds the chunk it takes
+/// until the guard is dropped. Process-wide: a test that holds runs in a
+/// process of its own ([`in_blocking_writer_process`]).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn hold_writers() -> WritersHeld {
+	*HELD.0.lock().unwrap() = true;
+	WritersHeld(())
+}
+
+/// The hold of [`hold_writers`]; dropping it lets the writer threads go on.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct WritersHeld(());
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for WritersHeld {
+	fn drop(&mut self) {
+		*HELD.0.lock().unwrap() = false;
+		HELD.1.notify_all();
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn wait_while_held() {
+	let mut held = HELD.0.lock().unwrap();
+	while *held {
+		held = HELD.1.wait(held).unwrap();
+	}
+}
+
+/// Test only: socket and descriptor probes for the engine's tests, whose
+/// module forbids `unsafe`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_probe {
+	use std::os::fd::{AsRawFd, RawFd};
+
+	/// `SIOCATMARK` (Linux `asm-generic/sockios.h`).
+	const SIOCATMARK: libc::c_ulong = 0x8905;
+
+	/// Whether this system carries TCP urgent data (`MSG_OOB`) end to end: a
+	/// control on a connection of its own, whose other end must see it
+	/// (`POLLPRI`) within a second. gVisor sends it but never signals it.
+	pub(crate) fn urgent_data_is_carried() -> bool {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+		let (server, _) = listener.accept().unwrap();
+		// SAFETY: a valid one-byte buffer.
+		let sent =
+			unsafe { libc::send(client.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) == 1 };
+		sent && urgent_arrives(&server, 1_000)
+	}
+
+	/// Whether urgent data arrives at `fd` within `ms` milliseconds
+	/// (`POLLPRI`).
+	pub(crate) fn urgent_arrives(fd: &impl AsRawFd, ms: i32) -> bool {
+		let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLPRI, revents: 0 };
+		// SAFETY: one `pollfd`, valid for the call.
+		let n = unsafe { libc::poll(&raw mut p, 1, ms) };
+		n == 1 && p.revents & libc::POLLPRI != 0
+	}
+
+	/// Whether `fd`'s read position is at the urgent mark (`SIOCATMARK`).
+	pub(crate) fn at_mark(fd: &impl AsRawFd) -> bool {
+		let mut at: libc::c_int = 0;
+		// SAFETY: `SIOCATMARK` writes one `c_int`.
+		let r = unsafe { libc::ioctl(fd.as_raw_fd(), SIOCATMARK, &raw mut at) };
+		assert_eq!(r, 0, "SIOCATMARK: {}", std::io::Error::last_os_error());
+		at != 0
+	}
+
+	/// The bytes queued to read at `fd` (`FIONREAD`).
+	pub(crate) fn queued(fd: RawFd) -> usize {
+		let mut n: libc::c_int = 0;
+		// SAFETY: `FIONREAD` writes one `c_int`.
+		let r = unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut n) };
+		assert_eq!(r, 0, "FIONREAD: {}", std::io::Error::last_os_error());
+		usize::try_from(n).unwrap()
+	}
+
+	/// Make `fd` non-blocking.
+	pub(crate) fn set_nonblocking(fd: &impl AsRawFd) {
+		// SAFETY: `F_SETFL` on a valid descriptor.
+		let r = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+		assert_eq!(r, 0, "F_SETFL: {}", std::io::Error::last_os_error());
+	}
+}
+
+/// Reopen a Linux pipe through procfs, producing a distinct non-blocking open
+/// file description. `dup` would share the flags with an external child.
+#[cfg(target_os = "linux")]
+fn private_nonblocking_writer(file: &fs::File) -> io::Result<fs::File> {
+	use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+	OpenOptions::new()
+		.write(true)
+		.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+		.open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// One write, again on `EINTR`.
+#[cfg(target_os = "linux")]
+fn write_once(mut file: &fs::File, buf: &[u8]) -> io::Result<usize> {
+	loop {
+		match file.write(buf) {
+			Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+			result => return result,
+		}
+	}
+}
+
 impl StdFile {
 	/// Wrap an open file, classifying it.
 	pub fn new(file: fs::File) -> Self {
@@ -184,16 +570,44 @@ impl StdFile {
 				(flags >= 0).then_some(flags & libc::O_ACCMODE)
 			})
 			.flatten();
+		#[cfg(all(target_os = "linux", test))]
+		let force_blocking_writer = *FORCE_BLOCKING_WRITER;
+		#[cfg(all(target_os = "linux", not(test)))]
+		let force_blocking_writer = false;
+		#[cfg(target_os = "linux")]
+		let private_writer = (!force_blocking_writer
+			&& kind == FileKind::Pipe
+			&& access.is_none_or(|access| access == libc::O_WRONLY || access == libc::O_RDWR))
+		.then(|| private_nonblocking_writer(&file).ok())
+		.flatten();
 		Self {
 			file,
 			kind,
 			#[cfg(unix)]
 			watch: [None, None],
+			writer: None,
+			#[cfg(target_os = "linux")]
+			private_writer,
+			#[cfg(all(test, unix))]
+			before_write: None,
 			#[cfg(unix)]
 			access,
 			null,
 			ahead: RefCell::new(None),
 		}
+	}
+
+	/// Test only: run `hook` in every write, after the readiness check and
+	/// before the `write(2)`.
+	#[cfg(all(test, target_os = "linux"))]
+	pub(crate) fn set_before_write(&mut self, hook: impl FnMut() + Send + 'static) {
+		self.before_write = Some(TestHook(Box::new(hook)));
+	}
+
+	/// Whether writes go through a private non-blocking description.
+	#[cfg(all(test, target_os = "linux"))]
+	pub(crate) const fn has_private_writer(&self) -> bool {
+		self.private_writer.is_some()
 	}
 
 	/// Whether I/O in this direction must wait for readiness instead of
@@ -248,28 +662,167 @@ impl StdFile {
 		}
 	}
 
-	/// Write what fits without waiting: `ready::WRITE_CHUNK` bytes per
-	/// readiness check, as long as the descriptor stays writable.
-	#[cfg(unix)]
-	fn write_ready(&mut self, buf: &[u8]) -> io::Result<usize> {
+	/// Waits after a write that took nothing. A competing writer that took
+	/// the room leaves the pipe unwritable: wait for readiness. A pipe that
+	/// still polls writable (gVisor, with less free than the write needs)
+	/// would wake a watch at once, so try again after [`WRITE_RETRY`].
+	/// `Ok` means `Pending`, with a wake registered.
+	#[cfg(target_os = "linux")]
+	fn wait_for_room(&mut self, cx: &Context<'_>) -> io::Result<()> {
 		use std::os::fd::AsRawFd;
 
 		use crate::sys::ready;
-		let fd = self.file.as_raw_fd();
-		let mut done = 0;
-		while done < buf.len() {
-			if done > 0 && !ready::now(fd, ready::WRITE)? {
-				break;
-			}
-			let end = buf.len().min(done + ready::WRITE_CHUNK);
-			match self.file.write(&buf[done..end]) {
-				Ok(n) => done += n,
-				Err(e) if done > 0 && e.kind() != io::ErrorKind::Interrupted => break,
-				Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
-				Err(e) => return Err(e),
+		if ready::now(self.file.as_raw_fd(), ready::WRITE)? {
+			return ready::wake_after(cx.waker(), WRITE_RETRY);
+		}
+		match self.ready(cx, ready::WRITE) {
+			// It drained since the check: try again at once.
+			Poll::Ready(Ok(())) => {
+				cx.waker().wake_by_ref();
+				Ok(())
+			},
+			Poll::Ready(Err(e)) => Err(e),
+			Poll::Pending => Ok(()),
+		}
+	}
+
+	/// A write on the private non-blocking description: as much of `buf` as
+	/// the pipe takes, or `Pending` with nothing written. gVisor fails a
+	/// write larger than the free space with `EAGAIN` while the pipe polls
+	/// writable, so a write that took nothing is tried once more with what
+	/// [`write_room`](crate::sys::ready::write_room) measures.
+	#[cfg(target_os = "linux")]
+	fn poll_private_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		use std::os::fd::AsRawFd;
+
+		use crate::sys::ready;
+		if let Err(e) = std::task::ready!(self.ready(cx, ready::WRITE)) {
+			return Poll::Ready(Err(e));
+		}
+		#[cfg(test)]
+		if let Some(hook) = self.before_write.as_mut() {
+			(hook.0)();
+		}
+		let Some(writer) = self.private_writer.as_ref() else {
+			return Poll::Ready(Err(io::Error::other("no private writer")));
+		};
+		match write_once(writer, buf) {
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+			done => return Poll::Ready(done),
+		}
+		let room = ready::write_room(self.file.as_raw_fd());
+		if room > 0 && room < buf.len() {
+			match write_once(writer, &buf[..room]) {
+				Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+				done => return Poll::Ready(done),
 			}
 		}
-		Ok(done)
+		match self.wait_for_room(cx) {
+			Ok(()) => Poll::Pending,
+			Err(e) => Poll::Ready(Err(e)),
+		}
+	}
+
+	/// A write handed to this descriptor's [`BlockingWriter`], started on
+	/// the first one: its length and its chunk's mark.
+	fn poll_blocking_write(
+		&mut self,
+		cx: &Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Mark)>> {
+		if self.writer.is_none() {
+			match BlockingWriter::start(&self.file) {
+				Ok(writer) => self.writer = Some(writer),
+				Err(e) => return Poll::Ready(Err(e)),
+			}
+		}
+		#[cfg(all(test, unix))]
+		if let Some(hook) = self.before_write.as_mut() {
+			(hook.0)();
+		}
+		match &self.writer {
+			Some(writer) => writer.poll_write(cx, buf),
+			None => Poll::Ready(Err(io::Error::other("no writer thread"))),
+		}
+	}
+
+	/// Test only: whether this file's writer thread, if it has one, writes
+	/// no chunk.
+	#[cfg(all(test, target_os = "linux"))]
+	pub(crate) fn writer_idle(&self) -> bool {
+		self.writer.as_ref().is_none_or(BlockingWriter::idle)
+	}
+
+	/// Writes `buf` as one atomic pipe record, or waits without writing
+	/// anything. The caller keeps `buf` at most `PIPE_BUF`
+	/// ([`WRITE_CHUNK`](crate::sys::ready::WRITE_CHUNK)), which a pipe takes
+	/// whole or not at all; this is for status lines, which must not be left
+	/// as fragments.
+	#[cfg(unix)]
+	pub(crate) fn poll_write_atomic(
+		&mut self,
+		cx: &Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<Option<Mark>>> {
+		if buf.len() > crate::sys::ready::WRITE_CHUNK {
+			return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+		}
+		if !self.gated(true) || buf.is_empty() {
+			return Poll::Ready(self.file.write_all(buf).map(|()| None));
+		}
+		#[cfg(target_os = "linux")]
+		if self.private_writer.is_some() {
+			use std::os::fd::AsRawFd;
+
+			use crate::sys::ready;
+			if let Err(e) = std::task::ready!(self.ready(cx, ready::WRITE)) {
+				return Poll::Ready(Err(e));
+			}
+			if ready::write_room(self.file.as_raw_fd()) >= buf.len()
+				&& let Some(writer) = self.private_writer.as_ref()
+			{
+				match write_once(writer, buf) {
+					Ok(n) if n == buf.len() => return Poll::Ready(Ok(None)),
+					Ok(_) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+					Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+					Err(e) => return Poll::Ready(Err(e)),
+				}
+			}
+			return match self.wait_for_room(cx) {
+				Ok(()) => Poll::Pending,
+				Err(e) => Poll::Ready(Err(e)),
+			};
+		}
+		match self.poll_blocking_write(cx, buf) {
+			Poll::Ready(Ok((n, mark))) if n == buf.len() => Poll::Ready(Ok(Some(mark))),
+			Poll::Ready(Ok(_)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+
+	/// Writes `buf`, a status line, whole: through the writer thread for
+	/// anything but a regular file, so a full pipe never holds a scheduler
+	/// thread. The caller keeps `buf` within one hand-off
+	/// ([`BLOCKING_WRITE_CHUNK`]), so the record is one chunk.
+	#[cfg(not(unix))]
+	pub(crate) fn poll_write_atomic(
+		&mut self,
+		cx: &Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<Option<Mark>>> {
+		if buf.len() > BLOCKING_WRITE_CHUNK {
+			return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+		}
+		if self.kind == FileKind::Regular || buf.is_empty() {
+			return Poll::Ready(self.file.write_all(buf).map(|()| None));
+		}
+		match self.poll_blocking_write(cx, buf) {
+			Poll::Ready(Ok((n, mark))) if n == buf.len() => Poll::Ready(Ok(Some(mark))),
+			Poll::Ready(Ok(_)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+			Poll::Pending => Poll::Pending,
+		}
 	}
 }
 
@@ -444,24 +997,64 @@ impl File for StdFile {
 		Poll::Ready(self.file.read(buf))
 	}
 
+	/// A plain write: a chunk handed to the writer thread is the write's
+	/// mark's alone, and this drops it, so the chunk's error is lost. Every
+	/// engine writer whose bytes can reach the thread writes with marks.
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		self.poll_write_marked(cx, buf).map_ok(|(n, _)| n)
+	}
+
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		if self.null {
-			return Poll::Ready(Ok(buf.len()));
+			return Poll::Ready(Ok((buf.len(), None)));
 		}
 		#[cfg(unix)]
 		if self.gated(true) && !buf.is_empty() {
-			if let Err(e) = std::task::ready!(self.ready(cx, crate::sys::ready::WRITE)) {
-				return Poll::Ready(Err(e));
+			#[cfg(target_os = "linux")]
+			if self.private_writer.is_some() {
+				return self.poll_private_write(cx, buf).map_ok(|n| (n, None));
 			}
-			return Poll::Ready(self.write_ready(buf));
+			// No readiness check first: the writer thread waits instead.
+			return self
+				.poll_blocking_write(cx, buf)
+				.map_ok(|(n, mark)| (n, Some(mark)));
 		}
+		// Windows: anonymous pipes and consoles cannot be polled, so every
+		// write that may wait goes to the writer thread.
 		#[cfg(not(unix))]
-		let _ = cx;
-		Poll::Ready(self.file.write(buf))
+		if self.kind != FileKind::Regular && !buf.is_empty() {
+			return self
+				.poll_blocking_write(cx, buf)
+				.map_ok(|(n, mark)| (n, Some(mark)));
+		}
+		Poll::Ready(self.file.write(buf).map(|n| (n, None)))
 	}
 
-	fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+	/// Waits for the writer thread. It takes no chunk's error: each is the
+	/// error of the writer that holds the chunk's mark.
+	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		if let Some(writer) = &self.writer {
+			std::task::ready!(writer.poll_settle(cx));
+		}
 		Poll::Ready(self.file.flush())
+	}
+
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		match &self.writer {
+			Some(writer) => writer.poll_settle(cx).map(Ok),
+			None => Poll::Ready(Ok(())),
+		}
+	}
+
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		match &self.writer {
+			Some(writer) => writer.poll_settle_marked(cx, marks),
+			None => Poll::Ready(Ok(())),
+		}
 	}
 
 	fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
@@ -615,10 +1208,11 @@ fn open(path: &BStr, flags: OpenFlags, mode: u32, umask: Option<u32>) -> io::Res
 	Ok(Box::new(StdFile::opened(create_with_mode(path, flags, mode, umask, false)?, flags)))
 }
 
-/// [`open`] for writing only, without waiting for a FIFO's reader: such a
-/// FIFO fails at once with `ENXIO` (the caller then waits on the helper
-/// thread), and nothing is stat'ed first. The descriptor is left blocking,
-/// as a plain open leaves it, since externals inherit its flags.
+/// [`open`] for writing only, without waiting for a FIFO's reader: the
+/// caller has sent a FIFO to the helper thread already, and one made since
+/// (no reader yet) fails at once with `ENXIO` for the caller to send there
+/// too. The descriptor is left blocking, as a plain open leaves it, since
+/// externals inherit its flags.
 #[cfg(unix)]
 fn open_for_writing(
 	path: &BStr,
@@ -659,7 +1253,7 @@ fn create_with_mode(
 	process_umask: Option<u32>,
 	nonblock: bool,
 ) -> io::Result<fs::File> {
-	let options = || {
+	let options = |flags: OpenFlags| {
 		#[cfg_attr(not(unix), expect(unused_mut, reason = "custom flags are Unix's"))]
 		let mut o = options(flags, mode);
 		#[cfg(unix)]
@@ -677,9 +1271,9 @@ fn create_with_mode(
 	#[cfg(unix)]
 	if flags.contains(OpenFlags::CREATE) && process_umask.is_none_or(|mask| mode & mask != 0) {
 		use std::os::unix::fs::PermissionsExt as _;
-		let mut exclusive = options();
-		exclusive.create_new(true);
-		match exclusive.open(path) {
+		// An exclusive try of a read-only open goes in as `O_EXCL`
+		// ([`options`]), which `OpenOptions::create_new` refuses there.
+		match options(flags.with(OpenFlags::EXCL)).open(path) {
 			Ok(file) => {
 				// Best effort: without it the file keeps the stricter mode
 				// the process umask left.
@@ -691,7 +1285,7 @@ fn create_with_mode(
 			Err(err) => return Err(err),
 		}
 	}
-	options().open(path)
+	options(flags).open(path)
 }
 
 fn options(flags: OpenFlags, mode: u32) -> OpenOptions {
@@ -701,12 +1295,17 @@ fn options(flags: OpenFlags, mode: u32) -> OpenOptions {
 	// a custom flag ([`custom_flags`]).
 	let append_trunc =
 		cfg!(unix) && flags.contains(OpenFlags::APPEND) && flags.contains(OpenFlags::TRUNC);
+	// It also refuses to create, create exclusively or truncate in an open
+	// that neither writes nor appends, which `open(2)` takes (zsh
+	// `sysopen -r -o creat,excl,trunc`): on Unix those go in as custom flags
+	// too.
+	let by_custom = cfg!(unix) && read_only(flags);
 	o.read(flags.contains(OpenFlags::READ))
 		.write(flags.contains(OpenFlags::WRITE) || append_trunc)
 		.append(flags.contains(OpenFlags::APPEND) && !append_trunc)
-		.truncate(flags.contains(OpenFlags::TRUNC))
-		.create(flags.contains(OpenFlags::CREATE));
-	if flags.contains(OpenFlags::EXCL) {
+		.truncate(flags.contains(OpenFlags::TRUNC) && !by_custom)
+		.create(flags.contains(OpenFlags::CREATE) && !by_custom);
+	if flags.contains(OpenFlags::EXCL) && !by_custom {
 		o.create_new(true);
 	}
 	#[cfg(unix)]
@@ -723,12 +1322,29 @@ fn options(flags: OpenFlags, mode: u32) -> OpenOptions {
 	o
 }
 
-/// The `open(2)` flags of `flags` that [`OpenOptions`] has no setter for.
+/// An open that neither writes nor appends.
+const fn read_only(flags: OpenFlags) -> bool {
+	!flags.contains(OpenFlags::WRITE) && !flags.contains(OpenFlags::APPEND)
+}
+
+/// The `open(2)` flags of `flags` that [`OpenOptions`] has no setter for,
+/// or refuses ([`options`]).
 #[cfg(unix)]
 const fn custom_flags(flags: OpenFlags) -> libc::c_int {
 	let mut custom = 0;
 	if flags.contains(OpenFlags::APPEND) && flags.contains(OpenFlags::TRUNC) {
 		custom |= libc::O_APPEND;
+	}
+	if read_only(flags) {
+		if flags.contains(OpenFlags::CREATE) {
+			custom |= libc::O_CREAT;
+		}
+		if flags.contains(OpenFlags::EXCL) {
+			custom |= libc::O_CREAT | libc::O_EXCL;
+		}
+		if flags.contains(OpenFlags::TRUNC) {
+			custom |= libc::O_TRUNC;
+		}
 	}
 	if flags.contains(OpenFlags::NOFOLLOW) {
 		custom |= libc::O_NOFOLLOW;
@@ -747,122 +1363,676 @@ const fn custom_flags(flags: OpenFlags) -> libc::c_int {
 }
 
 /// Opening a FIFO in one direction blocks until the other end opens; it runs
-/// on a helper thread and completes as a pending fs op.
+/// on a helper thread ([`pi_vfs::FifoOpen`], which also says what a dropped
+/// open leaves) and completes as a pending fs op. An open that may create
+/// (`>`, `>>`) opens the path itself, as `open(2)` of the path would, so the
+/// kernel's check of `O_CREAT` against the path's directory holds
+/// (`fs.protected_fifos`: another user's FIFO in a world-writable sticky
+/// directory is refused).
 #[cfg(unix)]
 mod fifo {
 	use std::{
-		fs::{self, OpenOptions},
-		io,
+		fs, io,
 		os::unix::fs::{FileTypeExt, OpenOptionsExt},
-		path::PathBuf,
-		sync::Arc,
-		task::{Context, Poll, Waker},
-		thread,
+		task::{Context, Poll},
 	};
+	#[cfg(test)]
+	use std::{fs::OpenOptions, path::Path};
 
 	use bstr::BStr;
-	use parking_lot::Mutex;
+	use pi_vfs::FifoOpen;
 
-	use super::{StdFile, host_path, options};
+	use super::{StdFile, create_with_mode, custom_flags, host_path, options};
 	use crate::bash::{File, FsPending, OpenFlags};
 
-	/// Result slot shared with the helper thread.
-	#[derive(Default)]
-	struct Slot {
-		result:    Option<io::Result<fs::File>>,
-		waker:     Option<Waker>,
-		/// The result was handed to the engine.
-		finished:  bool,
-		/// The engine dropped the open: the helper closes what it gets.
-		cancelled: bool,
-	}
-
 	/// A FIFO open in flight.
-	struct FifoOpen {
-		slot:  Arc<Mutex<Slot>>,
-		path:  PathBuf,
-		write: bool,
-	}
+	struct Pending(FifoOpen<fs::File>);
 
 	/// `Some` when `path` is a FIFO opened for reading only or writing only
-	/// (`O_RDWR` never blocks on a FIFO).
+	/// (`O_RDWR` never blocks on a FIFO). `umask` is the process's
+	/// file-creation mask when known ([`super::StdFs::umask`]): an open of
+	/// the path that creates a file (the FIFO was removed since the look)
+	/// gives it exactly `mode`, as [`create_with_mode`] gives every other one.
+	/// The open of the path leaves `O_TRUNC` (`>`) to the helper, which
+	/// applies it only while the open is live, so a helper a drop has left
+	/// truncates nothing ([`pi_vfs::FifoOpen`]).
 	pub fn pending(
 		path: &BStr,
 		flags: OpenFlags,
 		mode: u32,
+		umask: Option<u32>,
 	) -> Option<Box<dyn FsPending<Box<dyn File>>>> {
 		let write = flags.contains(OpenFlags::WRITE);
 		if flags.contains(OpenFlags::READ) == write {
 			return None;
 		}
 		let host = host_path(path).ok()?;
-		if !fs::metadata(host).ok()?.file_type().is_fifo() {
+		let meta = fs::metadata(host).ok()?;
+		if !meta.file_type().is_fifo() {
 			return None;
 		}
-		let slot = Arc::new(Mutex::new(Slot::default()));
-		let (opts, target, helper) = (options(flags, mode), host.to_path_buf(), Arc::clone(&slot));
-		let spawned = thread::Builder::new()
-			.name("obash-fifo".into())
-			.stack_size(64 << 10)
-			.spawn(move || {
-				let opened = opts.open(&target);
-				let mut s = helper.lock();
-				if s.cancelled {
-					return;
+		let nofollow = flags.contains(OpenFlags::NOFOLLOW);
+		let creates = flags.contains(OpenFlags::CREATE);
+		// A write open leaves `O_TRUNC` to the helper; it asks the write
+		// permission `O_TRUNC` asks anyway. A read-only open keeps it.
+		let truncates = flags.contains(OpenFlags::TRUNC) && write;
+		let by_path = if truncates {
+			flags.without(OpenFlags::TRUNC)
+		} else {
+			flags
+		};
+		#[cfg(test)]
+		let name = host.to_path_buf();
+		let open = FifoOpen::start(host, &meta, nofollow, creates, truncates, move |path, pinned| {
+			#[cfg(test)]
+			{
+				ROUTES.lock().push((name.clone(), pinned));
+				let hook = {
+					let mut hooks = BEFORE_OPEN.lock();
+					let at = hooks.iter().position(|(path, _)| *path == name);
+					at.map(|at| hooks.remove(at).1)
+				};
+				if let Some(hook) = hook {
+					hook();
 				}
-				s.result = Some(opened);
-				let waker = s.waker.take();
-				drop(s);
-				if let Some(w) = waker {
-					w.wake();
-				}
-			});
-		if let Err(e) = spawned {
-			slot.lock().result = Some(Err(e));
-		}
-		Some(Box::new(FifoOpen { slot, path: host.to_path_buf(), write }))
+			}
+			let opened = if pinned {
+				// A pin is checked not to be a symbolic link already, and its
+				// `/proc/self/fd/N` always is one.
+				let mut opts = options(flags, mode);
+				opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
+				opts.open(path)
+			} else {
+				// The path, opened as the plain open of it opens it but for
+				// a write's `O_TRUNC`, which the helper applies itself.
+				create_with_mode(path, by_path, mode, umask, false)
+			};
+			#[cfg(test)]
+			OPENED.lock().push(name);
+			opened
+		});
+		Some(Box::new(Pending(open)))
 	}
 
-	impl FsPending<Box<dyn File>> for FifoOpen {
+	/// Test record of the way each FIFO helper opened its FIFO, by the path
+	/// its open was given: through the pin's `/proc/self/fd/N` (`true`) or by
+	/// the path.
+	#[cfg(test)]
+	static ROUTES: parking_lot::Mutex<Vec<(std::path::PathBuf, bool)>> =
+		parking_lot::Mutex::new(Vec::new());
+
+	/// A test hook and the path whose next helper runs it.
+	#[cfg(test)]
+	type BeforeOpen = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+
+	/// Test hook: run once by the helper of the next open of the path it is
+	/// keyed by, after the look at the path and just before the helper's own
+	/// open.
+	#[cfg(test)]
+	static BEFORE_OPEN: parking_lot::Mutex<Vec<BeforeOpen>> = parking_lot::Mutex::new(Vec::new());
+
+	/// Test record of the helpers whose open has returned, by the path their
+	/// open was given.
+	#[cfg(test)]
+	static OPENED: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+	impl FsPending<Box<dyn File>> for Pending {
 		fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Box<dyn File>>> {
-			let mut s = self.slot.lock();
-			if let Some(r) = s.result.take() {
-				s.finished = true;
-				return Poll::Ready(r.map(|f| Box::new(StdFile::new(f)) as Box<dyn File>));
-			}
-			if !s.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-				s.waker = Some(cx.waker().clone());
-			}
-			Poll::Pending
+			self
+				.0
+				.poll(cx)
+				.map(|r| r.map(|f| Box::new(StdFile::new(f)) as Box<dyn File>))
 		}
 
-		/// Cancelling releases the helper by briefly opening the other end,
-		/// which the real other end can observe (a writer that comes and
-		/// goes reads as end of file).
+		/// Cancelling releases the helper by briefly holding both ends of the
+		/// FIFO, which the real other end can observe (a writer that comes
+		/// and goes reads as end of file).
 		fn reissuable(&self) -> bool {
 			false
 		}
 	}
 
-	impl Drop for FifoOpen {
-		fn drop(&mut self) {
+	/// Whether the FIFO at `path` has a reader: a write-only open that does
+	/// not wait fails with ENXIO when it has none.
+	#[cfg(test)]
+	pub(super) fn has_reader(path: &Path) -> bool {
+		match OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+		{
+			Ok(_) => true,
+			Err(e) if e.raw_os_error() == Some(libc::ENXIO) => false,
+			Err(e) => panic!("{e}"),
+		}
+	}
+
+	/// Whether the FIFO at `path` has a writer: a reader that does not wait
+	/// reads end of file when it has none, and would block when it has one.
+	#[cfg(test)]
+	pub(super) fn has_writer(path: &Path) -> bool {
+		use std::io::Read;
+		let mut reader = OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+			.unwrap();
+		match reader.read(&mut [0; 1]) {
+			Ok(0) => false,
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+			other => panic!("{other:?}"),
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::{os::unix::ffi::OsStrExt, task::Waker, thread};
+
+		use super::*;
+
+		/// The open's result, polling it as the engine does; while it has
+		/// none, `connect` runs.
+		fn result(
+			open: &mut dyn FsPending<Box<dyn File>>,
+			mut connect: impl FnMut(),
+		) -> io::Result<Box<dyn File>> {
+			loop {
+				if let Poll::Ready(r) = open.poll(&mut Context::from_waker(Waker::noop())) {
+					return r;
+				}
+				connect();
+				thread::yield_now();
+			}
+		}
+
+		/// With NOFOLLOW, a FIFO opens (on Linux its pin is checked not to be
+		/// a symbolic link, and the pin's `/proc/self/fd/N`, which is one, is
+		/// opened without the flag), and a symbolic link to a FIFO is refused
+		/// with ELOOP, as `open(2)` refuses it.
+		#[test]
+		fn nofollow_opens_a_fifo_and_refuses_a_symbolic_link_to_one() {
+			let dir = tempfile::tempdir().unwrap();
+			let path = dir.path().join("f");
+			let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+			// SAFETY: `c` is a NUL-terminated string that outlives the call.
+			assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+			let flags = OpenFlags::READ.with(OpenFlags::NOFOLLOW);
+			let start =
+				|p: &Path| pending(BStr::new(p.as_os_str().as_bytes()), flags, 0, None).unwrap();
+
+			let mut open = start(&path);
+			// Be the writer the helper waits for, once it waits.
+			let mut writer = None;
+			let opened = result(&mut *open, || {
+				if writer.is_none() {
+					writer = OpenOptions::new()
+						.write(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&path)
+						.ok();
+				}
+			});
+			assert!(opened.is_ok(), "the FIFO did not open: {:?}", opened.err());
+
+			let link = dir.path().join("l");
+			std::os::unix::fs::symlink(&path, &link).unwrap();
+			let mut open = start(&link);
+			match result(&mut *open, || {}) {
+				Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}"),
+				Ok(_) => panic!("the symbolic link was followed"),
+			}
+		}
+
+		/// A FIFO named `f` in `dir`.
+		fn make_fifo(dir: &Path) -> std::path::PathBuf {
+			let path = dir.join("f");
+			let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+			// SAFETY: `c` is a NUL-terminated string that outlives the call.
+			assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+			path
+		}
+
+		/// An open that may create (`>`, `>>`) of a FIFO opens the path, so
+		/// the kernel checks `O_CREAT` against the path's directory as for
+		/// `open(2)` of the path (`fs.protected_fifos`); one that creates
+		/// nothing opens the pin's `/proc/self/fd/N` where procfs reaches it
+		/// (Linux). The FIFO's two ends are held, so each open completes at
+		/// once.
+		#[test]
+		fn an_open_that_may_create_opens_the_path_and_one_that_does_not_the_pin() {
+			let dir = tempfile::tempdir().unwrap();
+			let path = make_fifo(dir.path());
+			let _both = OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(&path)
+				.unwrap();
+			let write = OpenFlags::WRITE;
+			let cases = [
+				(
+					"> (write, create, truncate)",
+					write.with(OpenFlags::CREATE).with(OpenFlags::TRUNC),
+					true,
+				),
+				(
+					">> (write, create, append)",
+					write.with(OpenFlags::CREATE).with(OpenFlags::APPEND),
+					true,
+				),
+				("write", write, false),
+				("< (read)", OpenFlags::READ, false),
+			];
+			for (label, flags, _) in cases {
+				let mut open =
+					pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+				if let Err(e) = result(&mut *open, || {}) {
+					panic!("{label}: {e}");
+				}
+			}
+			let proc = cfg!(target_os = "linux") && Path::new("/proc/self/fd").is_dir();
+			let want: Vec<_> = cases
+				.iter()
+				.map(|&(_, _, creates)| proc && !creates)
+				.collect();
+			let got: Vec<_> = ROUTES
+				.lock()
+				.iter()
+				.filter(|(name, _)| *name == path)
+				.map(|&(_, pinned)| pinned)
+				.collect();
+			assert_eq!(got, want, "through the pin, for {:?}", cases.map(|(label, ..)| label));
+		}
+
+		/// A read-only open that asks for `O_TRUNC` (zsh `sysopen -r -o
+		/// trunc`, with `creat` or not) keeps it, whether its helper opens
+		/// the path (an open that creates) or the pin, so the kernel asks the
+		/// write permission `O_TRUNC` asks, as of the plain open: a FIFO this
+		/// process may only read is refused (`EACCES`). Root may write it, so
+		/// as root each open goes ahead. Both of the FIFO's ends are held, so
+		/// each open ends at once.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_read_only_open_that_truncates_asks_the_write_permission_of_the_plain_open() {
+			use std::os::unix::fs::PermissionsExt;
+
+			use crate::bash::{Fs, FsPoll};
+			let dir = tempfile::tempdir().unwrap();
+			let path = make_fifo(dir.path());
+			let _both = OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(&path)
+				.unwrap();
+			fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+			let name = BStr::new(path.as_os_str().as_bytes());
+			let outcome =
+				|opened: io::Result<Box<dyn File>>| opened.map(drop).map_err(|err| err.raw_os_error());
+			// SAFETY: `geteuid` has no preconditions.
+			let root = unsafe { libc::geteuid() } == 0;
+			let truncates = OpenFlags::READ.with(OpenFlags::TRUNC);
+			let mut wrong = Vec::new();
+			for (label, flags) in [
+				("sysopen -r -o trunc,creat", truncates.with(OpenFlags::CREATE)),
+				("sysopen -r -o trunc", truncates),
+			] {
+				let plain = outcome(super::super::open(name, flags, 0o666, None));
+				if !root && plain != Err(Some(libc::EACCES)) {
+					wrong.push(format!("{label}, the plain open: {plain:?}, not EACCES"));
+				}
+				let by_helper =
+					outcome(result(&mut *pending(name, flags, 0o666, None).unwrap(), || {}));
+				let by_shell = outcome(match super::super::StdFs::default().open(name, flags, 0o666) {
+					FsPoll::Ready(opened) => opened,
+					FsPoll::Pending(mut open) => result(&mut *open, || {}),
+				});
+				for (route, got) in [("the FIFO helper", by_helper), ("the shell's open", by_shell)] {
+					if got != plain {
+						wrong.push(format!(
+							"{label}, {route}: {got:?} where the plain open gives {plain:?}"
+						));
+					}
+				}
+			}
+			assert!(wrong.is_empty(), "{wrong:#?}");
+		}
+
+		/// A `>` whose FIFO is removed between the shell's look at it and the
+		/// helper's open of the path creates a regular file there, as
+		/// `open(2)` of the path would, with exactly the mode the shell asks
+		/// (`0o666` less the shell's umask), as every other `>` gives a file it
+		/// creates: not that mode less the process's umask. In a process of
+		/// its own, whose umask (`0o077`) this test sets apart from the
+		/// shell's (`0o000`, so the mode asked is `0o666`); with the process's
+		/// mask known to the open and not. An open that went through the pin
+		/// instead would wait for a reader of the removed FIFO for ever: the
+		/// run of its own is bounded, and a run past the bound fails the test.
+		#[test]
+		fn a_redirect_whose_fifo_goes_before_the_open_creates_the_file_with_the_shells_mode() {
+			use std::{
+				os::unix::fs::PermissionsExt,
+				process::Stdio,
+				time::{Duration, Instant},
+			};
+			const NAME: &str = "sys::fs::fifo::tests::a_redirect_whose_fifo_goes_before_the_open_creates_the_file_with_the_shells_mode";
+			const ALONE: &str = "PI_SHELL_TEST_ALONE";
+			/// A correct run takes milliseconds.
+			const BOUND: Duration = Duration::from_secs(60);
+			if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+				let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+					.env(ALONE, NAME)
+					.stdout(Stdio::piped())
+					.stderr(Stdio::piped())
+					.spawn()
+					.unwrap();
+				let start = Instant::now();
+				while child.try_wait().unwrap().is_none() {
+					if start.elapsed() > BOUND {
+						let _ = child.kill();
+						let _ = child.wait();
+						panic!(
+							"the run of its own did not end within {BOUND:?}: the helper's open of the \
+							 removed FIFO waits for a reader, so it did not open the path"
+						);
+					}
+					thread::sleep(Duration::from_millis(5));
+				}
+				let output = child.wait_with_output().unwrap();
+				let (out, err) =
+					(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+				assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
+				assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+				return;
+			}
+			// SAFETY: `umask` has no preconditions; no other test runs in this
+			// process.
+			unsafe { libc::umask(0o077) };
+			let flags = OpenFlags::WRITE
+				.with(OpenFlags::CREATE)
+				.with(OpenFlags::TRUNC);
+			let mut wrong = Vec::new();
+			for (label, umask) in [("process mask known", Some(0o077)), ("process mask unknown", None)]
 			{
-				let mut s = self.slot.lock();
-				if s.finished || s.result.is_some() {
+				let dir = tempfile::tempdir().unwrap();
+				let path = make_fifo(dir.path());
+				let gone = path.clone();
+				BEFORE_OPEN
+					.lock()
+					.push((path.clone(), Box::new(move || fs::remove_file(&gone).unwrap())));
+				let mut open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, umask)
+					.unwrap_or_else(|| panic!("{label}: no FIFO open"));
+				if let Err(err) = result(&mut *open, || {}) {
+					panic!("{label}: {err}");
+				}
+				let meta = fs::symlink_metadata(&path).unwrap();
+				let made = (meta.file_type().is_file(), meta.permissions().mode() & 0o7777);
+				if made != (true, 0o666) {
+					wrong
+						.push(format!("{label}: made (regular file, mode) {made:?}, not (true, 0o666)"));
+				}
+			}
+			assert!(wrong.is_empty(), "{wrong:#?}");
+		}
+
+		/// A `>` dropped while its helper is held up between its last check
+		/// and its open for longer than the drop waits for it, as a loaded
+		/// node can hold a thread: the drop leaves the helper at its bound,
+		/// and the helper opens the path after the call has ended. It changes
+		/// no existing file: a regular file put at the path keeps its bytes.
+		/// Where the path names nothing, it leaves at most an empty regular
+		/// file (its `O_CREAT` creates one; see [`pi_vfs::FifoOpen`]), and
+		/// nothing else. Every wait is bounded, so a regression fails rather
+		/// than hangs.
+		#[test]
+		fn a_redirect_whose_helper_the_drop_left_truncates_nothing() {
+			use std::{
+				sync::mpsc,
+				time::{Duration, Instant},
+			};
+			const LIMIT: Duration = Duration::from_secs(10);
+			let mut wrong = Vec::new();
+			for late in ["a regular file", "nothing"] {
+				let dir = tempfile::tempdir().unwrap();
+				let path = make_fifo(dir.path());
+				let (reached_tx, reached) = mpsc::channel();
+				let at = path.clone();
+				BEFORE_OPEN.lock().push((
+					path.clone(),
+					Box::new(move || {
+						let _ = reached_tx.send(());
+						thread::sleep(Duration::from_secs(2));
+						fs::rename(&at, at.with_extension("old")).unwrap();
+						if late == "a regular file" {
+							fs::write(&at, "kept").unwrap();
+						}
+					}),
+				));
+				let flags = OpenFlags::WRITE
+					.with(OpenFlags::CREATE)
+					.with(OpenFlags::TRUNC);
+				let open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+				if reached.recv_timeout(LIMIT).is_err() {
+					wrong.push(format!("{late}: the helper never reached its open"));
+					continue;
+				}
+				let dropper = thread::spawn(move || drop(open));
+				let start = Instant::now();
+				while !dropper.is_finished() && start.elapsed() < LIMIT {
+					thread::sleep(Duration::from_millis(5));
+				}
+				if !dropper.is_finished() {
+					wrong.push(format!("{late}: the drop had not returned after {LIMIT:?}"));
+					continue;
+				}
+				let start = Instant::now();
+				while !OPENED.lock().contains(&path) && start.elapsed() < LIMIT {
+					thread::sleep(Duration::from_millis(5));
+				}
+				if !OPENED.lock().contains(&path) {
+					wrong.push(format!("{late}: the helper had not opened the path after {LIMIT:?}"));
+					continue;
+				}
+				match (late, fs::symlink_metadata(&path)) {
+					("a regular file", _) => {
+						let got = fs::read_to_string(&path).unwrap();
+						if got != "kept" {
+							wrong.push(format!("{late}: the file holds {got:?}, not \"kept\""));
+						}
+					},
+					(_, Err(err)) if err.kind() == io::ErrorKind::NotFound => {},
+					(_, Ok(m)) if m.is_file() && m.len() == 0 => {},
+					(_, other) => wrong.push(format!(
+						"{late}: the path names {other:?}, not nothing or an empty regular file"
+					)),
+				}
+			}
+			assert!(wrong.is_empty(), "{wrong:#?}");
+		}
+
+		/// A `>` whose FIFO is replaced by a regular file just before its
+		/// helper's open, while the shell still waits for it, opens that file
+		/// and truncates it, as `open(2)` of the path with `O_TRUNC` does. An
+		/// open that waits instead (its helper on the FIFO the path no longer
+		/// names) fails the test within its bound; the open's drop then ends
+		/// the helper.
+		#[test]
+		fn a_redirect_whose_path_names_a_regular_file_by_its_open_truncates_it() {
+			use std::io::Read;
+			let dir = tempfile::tempdir().unwrap();
+			let path = make_fifo(dir.path());
+			let at = path.clone();
+			BEFORE_OPEN.lock().push((
+				path.clone(),
+				Box::new(move || {
+					fs::rename(&at, at.with_extension("old")).unwrap();
+					fs::write(&at, "replaced").unwrap();
+				}),
+			));
+			let flags = OpenFlags::WRITE
+				.with(OpenFlags::CREATE)
+				.with(OpenFlags::TRUNC);
+			let mut open =
+				pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+			let limit = std::time::Duration::from_secs(10);
+			let start = std::time::Instant::now();
+			let opened = loop {
+				if let Poll::Ready(r) = open.poll(&mut Context::from_waker(Waker::noop())) {
+					break Some(r);
+				}
+				if start.elapsed() > limit {
+					break None;
+				}
+				thread::sleep(std::time::Duration::from_millis(5));
+			};
+			drop(open);
+			let Some(opened) = opened else {
+				panic!(
+					"the open had not returned after {limit:?}: its helper waits on a FIFO, not the \
+					 regular file at the path"
+				);
+			};
+			let mut file = opened.unwrap();
+			match file.poll_write(&mut Context::from_waker(Waker::noop()), b"new") {
+				Poll::Ready(Ok(3)) => {},
+				other => panic!("write: {other:?}"),
+			}
+			drop(file);
+			let mut got = String::new();
+			fs::File::open(&path)
+				.unwrap()
+				.read_to_string(&mut got)
+				.unwrap();
+			assert_eq!(got, "new", "the regular file was not truncated");
+		}
+
+		/// The FIFO the sticky-directory test opens: a FIFO of another user,
+		/// which any user may read and write, in a world-writable sticky
+		/// directory that user does not own. `PI_TEST_STICKY_FIFO` names one
+		/// when set (root makes it before a run as another user; a wrong one
+		/// fails the test); else, as root, one is made in `dir`. `Err` says why
+		/// there is none.
+		#[cfg(target_os = "linux")]
+		fn sticky_fifo(dir: &Path) -> Result<std::path::PathBuf, String> {
+			use std::os::unix::fs::{MetadataExt, PermissionsExt};
+			// SAFETY: `geteuid` has no preconditions.
+			let me = unsafe { libc::geteuid() };
+			if let Some(given) = std::env::var_os("PI_TEST_STICKY_FIFO") {
+				let fifo = std::path::PathBuf::from(given);
+				let meta = fs::metadata(&fifo)
+					.unwrap_or_else(|err| panic!("PI_TEST_STICKY_FIFO {fifo:?}: {err}"));
+				let parent = fs::metadata(fifo.parent().unwrap()).unwrap();
+				assert!(meta.file_type().is_fifo(), "PI_TEST_STICKY_FIFO {fifo:?} is no FIFO");
+				assert_eq!(
+					parent.mode() & 0o1002,
+					0o1002,
+					"PI_TEST_STICKY_FIFO {fifo:?}: its directory is not sticky and world-writable"
+				);
+				assert!(
+					meta.uid() != me && meta.uid() != parent.uid(),
+					"PI_TEST_STICKY_FIFO {fifo:?}: owned by this user or by its directory's owner"
+				);
+				assert_eq!(meta.mode() & 0o666, 0o666, "PI_TEST_STICKY_FIFO {fifo:?}: not 0666");
+				return Ok(fifo);
+			}
+			if me != 0 {
+				return Err(
+					"not root and no PI_TEST_STICKY_FIFO, so no FIFO of another user".to_owned(),
+				);
+			}
+			let sticky = dir.join("sticky");
+			fs::create_dir(&sticky).unwrap();
+			fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
+			let fifo = make_fifo(&sticky);
+			fs::set_permissions(&fifo, fs::Permissions::from_mode(0o666)).unwrap();
+			std::os::unix::fs::chown(&fifo, Some(65534), Some(65534)).unwrap();
+			Ok(fifo)
+		}
+
+		/// With `fs.protected_fifos` at 1 or more, an open that may create of
+		/// a FIFO another user owns in a world-writable sticky directory that
+		/// user does not own is refused (`EACCES`), so `echo x > fifo` never
+		/// writes into such a FIFO. The shell's open (`StdFs::open`, as the
+		/// engine opens) and the FIFO helper's (`pending`) are refused as
+		/// `open(2)` of the path is, for `>` and `>>`. The FIFO's read end is
+		/// held, so an open that goes ahead ends at once and its write reaches
+		/// that reader. As root, which can give the FIFO to another user, or as
+		/// any user given such a FIFO (`sticky_fifo`), where
+		/// `fs.protected_fifos` is 1 or more and the plain open is refused;
+		/// elsewhere it checks nothing and says so.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn an_open_that_may_create_is_refused_in_a_sticky_directory_as_the_plain_open_is() {
+			use std::io::Read;
+
+			use crate::bash::{Fs, FsPoll};
+			let protected = fs::read_to_string("/proc/sys/fs/protected_fifos")
+				.ok()
+				.and_then(|value| value.trim().parse::<u32>().ok());
+			if protected.is_none_or(|value| value < 1) {
+				eprintln!(
+					"UNKNOWN: fs.protected_fifos is {protected:?}, not 1 or more; nothing was checked"
+				);
+				return;
+			}
+			let dir = tempfile::tempdir().unwrap();
+			let fifo = match sticky_fifo(dir.path()) {
+				Ok(fifo) => fifo,
+				Err(why) => {
+					eprintln!("UNKNOWN: {why}; nothing was checked");
+					return;
+				},
+			};
+			let mut reader = OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&fifo)
+				.unwrap();
+			let name = BStr::new(fifo.as_os_str().as_bytes());
+			let outcome = |opened: io::Result<Box<dyn File>>| {
+				opened
+					.map(|mut file| {
+						let _ = file.poll_write(&mut Context::from_waker(Waker::noop()), b"written");
+					})
+					.map_err(|err| (err.kind(), err.raw_os_error()))
+			};
+			let write = OpenFlags::WRITE.with(OpenFlags::CREATE);
+			let mut wrong = Vec::new();
+			for (label, flags) in [
+				("echo x > fifo", write.with(OpenFlags::TRUNC)),
+				("echo x >> fifo", write.with(OpenFlags::APPEND)),
+			] {
+				let want = options(flags, 0o666)
+					.open(&fifo)
+					.map(drop)
+					.map_err(|err| (err.kind(), err.raw_os_error()));
+				if want.is_ok() {
+					eprintln!(
+						"UNKNOWN: {label}: the plain open gave {want:?}, so fs.protected_fifos does not \
+						 hold here; nothing was checked"
+					);
 					return;
 				}
-				s.cancelled = true;
+				let by_helper =
+					outcome(result(&mut *pending(name, flags, 0o666, None).unwrap(), || {}));
+				let by_shell = outcome(match super::super::StdFs::default().open(name, flags, 0o666) {
+					FsPoll::Ready(opened) => opened,
+					FsPoll::Pending(mut open) => result(&mut *open, || {}),
+				});
+				for (route, got) in [("the FIFO helper", by_helper), ("the shell's open", by_shell)] {
+					if got != want {
+						wrong.push(format!(
+							"{label}, {route}: {got:?} where the plain open gives {want:?}"
+						));
+					}
+				}
 			}
-			// Release the helper blocked in open(2): be the other end for a
-			// moment, without blocking ourselves.
-			let mut other = OpenOptions::new();
-			if self.write {
-				other.read(true);
-			} else {
-				other.write(true);
-			}
-			other.custom_flags(libc::O_NONBLOCK);
-			let _ = other.open(&self.path);
+			let mut leaked = Vec::new();
+			let _ = reader.read_to_end(&mut leaked);
+			assert!(
+				wrong.is_empty(),
+				"FIFO opens in a sticky directory (another user's FIFO read {} bytes): {wrong:#?}",
+				leaked.len()
+			);
 		}
 	}
 }
@@ -937,17 +2107,37 @@ fn read_dir(path: &BStr) -> io::Result<Box<dyn DirIter>> {
 	Ok(Box::new(StdDir(entries.into_iter())))
 }
 
-/// Unique temp names within this process.
+/// Temp names within this process: `obash-<pid>-<seq>`.
 static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// A new FIFO (process substitution on Unix) or empty file in the temp
+/// directory. A name that exists already is skipped: an earlier process
+/// with this pid (one killed, or a test that failed, before it removed its
+/// nodes) can have left it.
 fn temp(purpose: TempPurpose) -> io::Result<TempNode> {
-	let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-	#[cfg(windows)]
-	if let TempPurpose::ProcSub { output } = purpose {
-		return pipe::create(output, seq);
+	temp_in(&TEMP_SEQ, purpose)
+}
+
+/// [`temp`], with the name's number drawn from `seq_from`.
+fn temp_in(seq_from: &AtomicU32, purpose: TempPurpose) -> io::Result<TempNode> {
+	loop {
+		let seq = seq_from.fetch_add(1, Ordering::Relaxed);
+		#[cfg(windows)]
+		if let TempPurpose::ProcSub { output } = purpose {
+			return pipe::create(output, seq);
+		}
+		let path = std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
+		let fifo = matches!(purpose, TempPurpose::ProcSub { .. }) && cfg!(unix);
+		match make_temp(&path, fifo) {
+			Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {},
+			Err(err) => return Err(err),
+			Ok(()) => return Ok(TempNode { path: engine_path(&path), fifo }),
+		}
 	}
-	let path = std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
-	let fifo = matches!(purpose, TempPurpose::ProcSub { .. }) && cfg!(unix);
+}
+
+/// Creates the FIFO or the empty file at `path`, failing when it exists.
+fn make_temp(path: &std::path::Path, fifo: bool) -> io::Result<()> {
 	if fifo {
 		#[cfg(unix)]
 		{
@@ -960,9 +2150,9 @@ fn temp(purpose: TempPurpose) -> io::Result<TempNode> {
 			}
 		}
 	} else {
-		fs::File::create_new(&path)?;
+		fs::File::create_new(path)?;
 	}
-	Ok(TempNode { path: engine_path(&path), fifo })
+	Ok(())
 }
 
 fn chdir_check(path: &BStr) -> io::Result<()> {
@@ -1110,6 +2300,10 @@ mod pipe {
 			end.pipe.poll_flush(cx)
 		}
 
+		fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			self.poll_flush(cx)
+		}
+
 		fn seek(&mut self, _pos: io::SeekFrom) -> io::Result<u64> {
 			Err(io::ErrorKind::NotSeekable.into())
 		}
@@ -1136,17 +2330,28 @@ impl Fs for StdFs {
 		if path.as_bytes() == b"/dev/tty" {
 			return FsPoll::Ready(crate::sys::console::open_tty());
 		}
+		// A FIFO opened one way goes to the helper thread, which may wait for
+		// the other end, before the write-only open below tries `O_NONBLOCK`:
+		// under gVisor before google/gvisor@d6786915 that open, failing with
+		// `ENXIO` for want of a reader, counts as a writer for a moment, and a
+		// reader then inside a blocking open of the FIFO returns with no writer
+		// and reads end of file, while this writer waits for a reader for ever.
+		#[cfg(unix)]
+		if let Some(pending) = fifo::pending(path, flags, mode, self.umask) {
+			return FsPoll::Pending(pending);
+		}
 		#[cfg(unix)]
 		if flags.contains(OpenFlags::WRITE) && !flags.contains(OpenFlags::READ) {
 			match open_for_writing(path, flags, mode, self.umask) {
-				// No reader (or not a FIFO at all: the checks below tell).
-				Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {},
+				// A FIFO made since the check above, with no reader yet (or no
+				// FIFO at all: `pending` tells).
+				Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
+					if let Some(pending) = fifo::pending(path, flags, mode, self.umask) {
+						return FsPoll::Pending(pending);
+					}
+				},
 				opened => return FsPoll::Ready(opened),
 			}
-		}
-		#[cfg(unix)]
-		if let Some(pending) = fifo::pending(path, flags, mode) {
-			return FsPoll::Pending(pending);
 		}
 		FsPoll::Ready(open(path, flags, mode, self.umask))
 	}
@@ -1382,6 +2587,46 @@ mod tests {
 		}
 	}
 
+	/// A temp name is this process's pid and a counter, so a node an earlier
+	/// process with the same pid left (one killed before its cleanup; pids
+	/// are reused within minutes on a busy machine) holds a name this
+	/// process would take: the next free name is taken instead of failing
+	/// with `EEXIST`. Both kinds: a file, and on Unix the FIFO of a process
+	/// substitution (Windows makes a named pipe there).
+	#[test]
+	fn a_temp_node_skips_names_another_process_left() {
+		let purposes: &[TempPurpose] = if cfg!(unix) {
+			&[TempPurpose::HereDoc, TempPurpose::ProcSub { output: false }]
+		} else {
+			&[TempPurpose::HereDoc]
+		};
+		for &purpose in purposes {
+			// Other tests of this process (Bazel runs them all in one) take
+			// names too, so one of this window can be held already: by them,
+			// or by a node an earlier process left. Either serves, and only
+			// the names this test made are its to remove.
+			let next = TEMP_SEQ.load(Ordering::Relaxed);
+			let mine: Vec<_> = (next..next + 4)
+				.filter_map(|seq| {
+					let path = std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
+					match fs::File::create_new(&path) {
+						Ok(_) => Some(path),
+						Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
+						Err(e) => panic!("{path:?}: {e}"),
+					}
+				})
+				.collect();
+			let node = temp(purpose);
+			for path in &mine {
+				fs::remove_file(path).unwrap();
+			}
+			let node = node.unwrap_or_else(|e| panic!("{purpose:?}: {e}"));
+			let path = host_path(node.path.as_ref()).unwrap().to_path_buf();
+			assert!(!mine.contains(&path), "{purpose:?} took a name already held: {path:?}");
+			fs::remove_file(&path).unwrap();
+		}
+	}
+
 	#[test]
 	fn stat_and_access_distinguish_files_dirs_and_missing_paths() {
 		let dir = std::env::temp_dir();
@@ -1421,22 +2666,49 @@ mod tests {
 			node.path
 		}
 
+		/// Dropping a test's last copy of a pipe or FIFO end is not yet the
+		/// last close of it: while a sibling test of this process starts a
+		/// child (as `in_blocking_writer_process` does), the child shares
+		/// every descriptor of the process until its `exec` closes them. A
+		/// test that needs the end closed waits for the effect itself, here
+		/// the end of file: the verdict is the event; the 10 s bound only
+		/// ends a test that never sees it.
+		fn read_to_end_of_file(reader: &mut fs::File) -> Vec<u8> {
+			let deadline = Instant::now() + Duration::from_secs(10);
+			let mut got = Vec::new();
+			let mut buf = [0u8; 4096];
+			loop {
+				match reader.read(&mut buf) {
+					Ok(0) => return got,
+					Ok(n) => got.extend_from_slice(&buf[..n]),
+					// A write end is still open somewhere.
+					Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+						assert!(Instant::now() < deadline, "DEADLINE: no end of file within 10 s");
+						thread::sleep(Duration::from_millis(5));
+					},
+					Err(e) => panic!("reading the FIFO: {e}"),
+				}
+			}
+		}
+
 		fn pending(p: FsPoll<Box<dyn File>>) -> Box<dyn crate::bash::FsPending<Box<dyn File>>> {
 			match p {
 				FsPoll::Pending(p) => p,
-				FsPoll::Ready(_) => panic!("a one-way FIFO open must not complete synchronously"),
+				FsPoll::Ready(_) => {
+					panic!("a one-way FIFO open with no other end must not complete synchronously")
+				},
 			}
 		}
 
 		fn finish(p: &mut Box<dyn crate::bash::FsPending<Box<dyn File>>>) -> Box<dyn File> {
 			let waker = Waker::from(Arc::new(Unpark(thread::current())));
 			let mut cx = Context::from_waker(&waker);
-			let deadline = Instant::now() + Duration::from_secs(10);
+			// An open that never completes hangs the test until the runner's
+			// bound.
 			loop {
 				if let Poll::Ready(r) = p.poll(&mut cx) {
 					return r.unwrap();
 				}
-				assert!(Instant::now() < deadline, "open never completed");
 				thread::park_timeout(Duration::from_millis(100));
 			}
 		}
@@ -1490,56 +2762,852 @@ mod tests {
 			fs::remove_file(host_path(&path).unwrap()).unwrap();
 		}
 
+		/// A FIFO opened for writing only goes to the helper thread even when
+		/// a reader has it open, so no `O_NONBLOCK` writer open is tried on a
+		/// FIFO that exists when the open starts: under gVisor before
+		/// google/gvisor@d6786915 one that fails with `ENXIO` (no reader yet)
+		/// counts as a writer for a moment, and a reader then inside a blocking
+		/// open of the FIFO returns with no writer and reads end of file, while
+		/// the shell's real writer waits for a reader for ever.
+		#[test]
+		fn writing_a_fifo_is_left_to_the_helper_even_with_a_reader() {
+			let path = fifo();
+			let host = host_path(&path).unwrap().to_path_buf();
+			let mut reader = fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&host)
+				.unwrap();
+			let mut w = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			let mut writer = finish(&mut w);
+			let waker = Waker::noop();
+			assert!(matches!(
+				writer.poll_write(&mut Context::from_waker(waker), b"x"),
+				Poll::Ready(Ok(1))
+			));
+			drop(writer);
+			let got = read_to_end_of_file(&mut reader);
+			assert_eq!(got, b"x");
+			fs::remove_file(&host).unwrap();
+		}
+
 		/// `mkfifo f; echo x > f & . f` in one engine thread: both ends live
 		/// on this thread, so neither read nor write may wait in the kernel.
+		/// The writer opens first, as the background `echo` does; each open
+		/// is pending, as every one-way FIFO open is.
 		#[test]
 		fn both_ends_of_a_fifo_on_one_thread_never_block() {
 			let path = fifo();
-			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			let mut w = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			let mut reader = finish(&mut r);
 			let mut writer = finish(&mut w);
 			assert_eq!(reader.kind(), FileKind::Pipe);
-			let flag = Arc::new(Flag::default());
-			let waker = Waker::from(Arc::clone(&flag));
-			let mut cx = Context::from_waker(&waker);
+			// The reader and the writer each have a waker of their own, so a
+			// wait for one never takes the other's wake.
+			let read_flag = Arc::new(Flag::default());
+			let read_waker = Waker::from(Arc::clone(&read_flag));
+			let mut rcx = Context::from_waker(&read_waker);
+			let write_flag = Arc::new(Flag::default());
+			let write_waker = Waker::from(Arc::clone(&write_flag));
+			let mut wcx = Context::from_waker(&write_waker);
 			let mut buf = [0u8; 8192];
 			assert!(
-				reader.poll_read(&mut cx, &mut buf).is_pending(),
+				reader.poll_read(&mut rcx, &mut buf).is_pending(),
 				"no data yet: Pending, not a wait"
 			);
-			assert!(matches!(writer.poll_write(&mut cx, b"echo four - OK\n"), Poll::Ready(Ok(15))));
-			flag.wait("reader woken by the write");
-			let Poll::Ready(Ok(n)) = reader.poll_read(&mut cx, &mut buf) else {
+			assert!(matches!(writer.poll_write(&mut wcx, b"echo four - OK\n"), Poll::Ready(Ok(15))));
+			read_flag.wait("reader woken by the write");
+			let Poll::Ready(Ok(n)) = reader.poll_read(&mut rcx, &mut buf) else {
 				panic!("readable after the write");
 			};
 			assert_eq!(&buf[..n], b"echo four - OK\n");
 
-			// Fill the pipe: the writer gets Pending instead of waiting.
+			// Fill the pipe: the writer gets Pending instead of waiting. A
+			// write that is `Ready` is taken: in the pipe, or, where writes go
+			// through a writer thread of the descriptor's own, handed to that
+			// thread, whose bytes reach the pipe as the reader makes room.
 			let chunk = vec![b'z'; 1 << 16];
 			let mut written = 0usize;
 			loop {
-				match writer.poll_write(&mut cx, &chunk) {
+				match writer.poll_write(&mut wcx, &chunk) {
 					Poll::Ready(Ok(n)) => written += n,
 					Poll::Ready(Err(e)) => panic!("{e}"),
 					Poll::Pending => break,
 				}
 				assert!(written < 64 << 20, "the pipe never filled");
 			}
+			// Read it all back. A read that finds the pipe empty while a
+			// writer thread still holds bytes is `Pending`, and the reader is
+			// woken when they arrive.
 			let mut read = 0usize;
 			while read < written {
-				match reader.poll_read(&mut cx, &mut buf) {
+				match reader.poll_read(&mut rcx, &mut buf) {
 					Poll::Ready(Ok(n)) => read += n,
+					Poll::Pending => read_flag.wait("reader woken as the written bytes arrive"),
 					other => panic!("data is buffered: {other:?}"),
 				}
 			}
-			flag.wait("writer woken once space freed up");
+			write_flag.wait("writer woken once space freed up");
 			drop(writer);
-			assert!(
-				matches!(reader.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))),
-				"end of file after the writer closed"
-			);
+			end_of_file(&mut reader, &mut rcx, &read_flag, || {});
 			fs::remove_file(host_path(&path).unwrap()).unwrap();
+		}
+
+		/// Ends the test process, naming `what`, unless the returned sender
+		/// is dropped within `limit`. The clock runs on a thread of its own:
+		/// the call it bounds may wait in the kernel on the test's thread.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		fn deadline(what: &'static str, limit: Duration) -> std::sync::mpsc::Sender<()> {
+			let (done, finished) = std::sync::mpsc::channel::<()>();
+			thread::spawn(move || {
+				if finished.recv_timeout(limit) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+					eprintln!("DEADLINE fired: {what} did not return within {limit:?}");
+					std::process::exit(1);
+				}
+			});
+			done
+		}
+
+		/// A pipe's write end, wrapped, and its read end, with all but `free`
+		/// bytes of the pipe's capacity queued.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		fn pipe_with_free(free: usize) -> (StdFile, io::PipeReader) {
+			use std::os::fd::AsRawFd;
+
+			let (r, w) = io::pipe().unwrap();
+			let mut fill = fs::File::from(std::os::fd::OwnedFd::from(w));
+			// SAFETY: `F_GETPIPE_SZ` takes no argument; `fill` owns the fd.
+			let capacity = unsafe { libc::fcntl(fill.as_raw_fd(), libc::F_GETPIPE_SZ) };
+			let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+			fill.write_all(&vec![b'q'; capacity - free]).unwrap();
+			let mut queued: libc::c_int = 0;
+			// SAFETY: `FIONREAD` writes one `c_int` through the pointer; `r`
+			// owns the fd.
+			assert_eq!(unsafe { libc::ioctl(r.as_raw_fd(), libc::FIONREAD as _, &raw mut queued) }, 0);
+			assert_eq!(
+				usize::try_from(queued).unwrap(),
+				capacity - free,
+				"all but {free} bytes queued"
+			);
+			let writer = StdFile::new(fill);
+			assert_eq!(writer.kind(), FileKind::Pipe);
+			(writer, r)
+		}
+
+		/// The room query itself is a Linux control: it is independent of
+		/// readiness and fails if `write_room` is replaced by `PIPE_BUF`.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		#[test]
+		fn write_room_reports_free_full_and_reader_gone_pipes() {
+			use std::os::fd::AsRawFd;
+
+			let (writer, reader) = pipe_with_free(100);
+			assert_eq!(crate::sys::ready::write_room(writer.file.as_raw_fd()), 100);
+			drop(reader);
+
+			let (writer, reader) = pipe_with_free(0);
+			assert_eq!(crate::sys::ready::write_room(writer.file.as_raw_fd()), 0);
+			drop(reader);
+
+			let (writer, reader) = pipe_with_free(0);
+			drop(reader);
+			// The reader is gone once no copy of the read end is left, which
+			// a child that a sibling test is starting can hold for a moment
+			// ([`read_to_end_of_file`]): the write end reports `POLLERR` then.
+			let deadline = Instant::now() + Duration::from_secs(10);
+			loop {
+				let mut p = libc::pollfd { fd: writer.file.as_raw_fd(), events: 0, revents: 0 };
+				// SAFETY: one `pollfd`, valid for the call.
+				let n = unsafe { libc::poll(&raw mut p, 1, 100) };
+				if n < 0 {
+					// A signal ended the wait: the loop waits again.
+					let e = io::Error::last_os_error();
+					assert_eq!(e.kind(), io::ErrorKind::Interrupted, "poll: {e}");
+				} else if p.revents & libc::POLLERR != 0 {
+					break;
+				}
+				assert!(Instant::now() < deadline, "DEADLINE: the read end was not gone within 10 s");
+			}
+			assert_eq!(
+				crate::sys::ready::write_room(writer.file.as_raw_fd()),
+				crate::sys::ready::WRITE_CHUNK
+			);
+		}
+
+		/// Linux output pipes get a fresh non-blocking description; setting a
+		/// flag on `dup` would leak it to the original description externals
+		/// inherit.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn pipe_writer_has_a_private_nonblocking_description() {
+			use std::os::fd::AsRawFd;
+
+			let (_reader, writer) = io::pipe().unwrap();
+			let writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(writer)));
+			let private = writer
+				.private_writer
+				.as_ref()
+				.expect("reopen /proc/self/fd pipe writer");
+			// SAFETY: F_GETFL only reads this live inherited descriptor.
+			let inherited = unsafe { libc::fcntl(writer.file.as_raw_fd(), libc::F_GETFL) };
+			// SAFETY: F_GETFL only reads this live private descriptor.
+			let private = unsafe { libc::fcntl(private.as_raw_fd(), libc::F_GETFL) };
+			assert_eq!(inherited & libc::O_NONBLOCK, 0, "externals keep blocking stdout");
+			assert_ne!(private & libc::O_NONBLOCK, 0, "shell's private writer is nonblocking");
+		}
+
+		/// A rival writer can take the room after `POLLOUT` and before this
+		/// writer's `write(2)`. The write goes through the private
+		/// non-blocking description, so it is `Pending` with nothing written,
+		/// not a wait in the kernel. Drives `poll_write`; a write through the
+		/// inherited blocking description waits here until the deadline.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_rival_that_takes_the_room_after_the_poll_leaves_the_write_pending() {
+			use std::os::fd::AsRawFd;
+
+			let (mut writer, reader) = pipe_with_free(libc::PIPE_BUF);
+			assert!(writer.has_private_writer(), "the pipe was reopened");
+			let mut rival = writer.file.try_clone().unwrap();
+			writer.set_before_write(move || rival.write_all(&[b'c'; libc::PIPE_BUF]).unwrap());
+			let finished =
+				deadline("poll_write after a rival filled the pipe", Duration::from_secs(2));
+			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), b"x");
+			drop(finished);
+			assert!(wrote.is_pending(), "{wrote:?}");
+			let mut queued: libc::c_int = 0;
+			// SAFETY: `FIONREAD` writes one `c_int` through the pointer; `reader`
+			// owns the fd.
+			let status =
+				unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD as _, &raw mut queued) };
+			assert_eq!(status, 0);
+			// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+			let capacity = unsafe { libc::fcntl(writer.file.as_raw_fd(), libc::F_GETPIPE_SZ) };
+			assert_eq!(queued, capacity, "only the rival's bytes are in the pipe");
+			drop(reader);
+		}
+
+		/// `F_SETPIPE_SZ` can grow a pipe after its writer was wrapped. A write
+		/// then has the new room: a capacity measured before would see the
+		/// old capacity queued, find no room, and wake itself while the pipe
+		/// polls writable.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_pipe_grown_after_wrapping_takes_a_write_into_its_new_room() {
+			use std::os::fd::AsRawFd;
+
+			let (reader, w) = io::pipe().unwrap();
+			let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+			let fd = writer.file.as_raw_fd();
+			// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+			let old = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+			// SAFETY: `F_SETPIPE_SZ` takes an int; `writer` owns the fd.
+			let grown = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, 2 * old) };
+			assert!(grown >= 2 * old, "F_SETPIPE_SZ: {grown}: {}", io::Error::last_os_error());
+			let queued = vec![b'q'; usize::try_from(old).unwrap()];
+			writer.file.try_clone().unwrap().write_all(&queued).unwrap();
+			let finished = deadline("poll_write into a grown pipe", Duration::from_secs(2));
+			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), b"x");
+			drop(finished);
+			assert!(matches!(wrote, Poll::Ready(Ok(1))), "{wrote:?}");
+			drop(reader);
+		}
+
+		/// A pipe with less than `PIPE_BUF` bytes free can still poll
+		/// writable (gVisor reports `POLLOUT` with one byte free), and a
+		/// blocking write of at most `PIPE_BUF` bytes then waits until all of
+		/// it fits. Nothing reads this pipe, so such a wait never ends:
+		/// `poll_write` must write at most the free space, or be `Pending`.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_write_to_a_pipe_with_less_than_pipe_buf_free_never_waits() {
+			write_into_less_than_pipe_buf_free(true);
+		}
+
+		/// The same through the writer thread, Darwin's only route, which this
+		/// test's child process forces on Linux.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_write_to_a_pipe_with_less_than_pipe_buf_free_through_the_writer_thread_never_waits() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_write_to_a_pipe_with_less_than_pipe_buf_free_through_the_writer_thread_never_waits"
+				),
+				|| write_into_less_than_pipe_buf_free(false),
+			);
+		}
+
+		#[cfg(target_os = "linux")]
+		fn write_into_less_than_pipe_buf_free(private: bool) {
+			let free = libc::PIPE_BUF - 1;
+			let (mut writer, reader) = pipe_with_free(free);
+			assert_eq!(writer.has_private_writer(), private);
+			let buf = vec![b'x'; 2 * libc::PIPE_BUF];
+			let finished = deadline("poll_write with PIPE_BUF - 1 bytes free", Duration::from_secs(1));
+			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), &buf);
+			drop(finished);
+			match wrote {
+				Poll::Pending => {},
+				Poll::Ready(Ok(n)) if private => {
+					assert!((1..=free).contains(&n), "wrote {n} with {free} bytes free");
+				},
+				// The writer thread takes the chunk whole and waits for room.
+				Poll::Ready(Ok(n)) => assert_eq!(n, buf.len(), "the writer thread took {n}"),
+				Poll::Ready(Err(e)) => panic!("{e}"),
+			}
+			drop(reader);
+		}
+
+		/// Two writers that share one descriptor (`echo AAAA & echo BBBB`)
+		/// each get their own write through the writer thread, once and in
+		/// order. A is taken when it is handed off. B polls only once A's
+		/// line is in the pipe and the thread is idle, so B's poll is a hand-off
+		/// of its own every run: no result of A's is left for B to take.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn writers_sharing_the_writer_thread_each_get_their_own_write() {
+			in_blocking_writer_process(
+				concat!(module_path!(), "::writers_sharing_the_writer_thread_each_get_their_own_write"),
+				|| {
+					let (mut reader, w) = io::pipe().unwrap();
+					let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished =
+						deadline("two writers through the writer thread", Duration::from_secs(5));
+					let a = writer.poll_write(&mut cx, b"AAAA\n");
+					assert!(matches!(a, Poll::Ready(Ok(5))), "A is taken when handed off: {a:?}");
+					let mut first = [0u8; 5];
+					reader.read_exact(&mut first).unwrap();
+					assert_eq!(&first, b"AAAA\n");
+					flush(&mut writer, &flag, &mut cx);
+					assert!(writer.writer_idle());
+					let b = writer.poll_write(&mut cx, b"BBBB\n");
+					assert!(matches!(b, Poll::Ready(Ok(5))), "B is a hand-off of its own: {b:?}");
+					drop(writer);
+					let mut rest = Vec::new();
+					reader.read_to_end(&mut rest).unwrap();
+					drop(finished);
+					assert_eq!(rest, b"BBBB\n", "after A's line, only B's line, once");
+				},
+			);
+		}
+
+		/// A write whose future is dropped while it waits is not taken by a
+		/// later write of the same bytes (`timeout 1 sh -c 'while :; do echo
+		/// y; done'; echo y`): the later write reaches the pipe. The first
+		/// write goes to the writer thread while the pipe is full, and is
+		/// never polled again.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_later_identical_write_after_a_dropped_one_is_written() {
+			in_blocking_writer_process(
+				concat!(module_path!(), "::a_later_identical_write_after_a_dropped_one_is_written"),
+				|| {
+					let (mut writer, mut reader) = pipe_with_free(0);
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished =
+						deadline("a write after a dropped identical one", Duration::from_secs(5));
+					let dropped = writer.poll_write(&mut cx, b"y\n");
+					assert!(!matches!(dropped, Poll::Ready(Err(_))), "{dropped:?}");
+					let mut fill = vec![0u8; pipe_capacity(&reader)];
+					reader.read_exact(&mut fill).unwrap();
+					let mut line = [0u8; 2];
+					reader.read_exact(&mut line).unwrap();
+					assert_eq!(&line, b"y\n", "the first write's line");
+					flush(&mut writer, &flag, &mut cx);
+					let mut later = writer.poll_write(&mut cx, b"y\n");
+					while later.is_pending() {
+						flag.wait("the writer thread finished the first write");
+						later = writer.poll_write(&mut cx, b"y\n");
+					}
+					assert!(matches!(later, Poll::Ready(Ok(2))), "{later:?}");
+					drop(writer);
+					let mut rest = Vec::new();
+					reader.read_to_end(&mut rest).unwrap();
+					drop(finished);
+					assert_eq!(rest, b"y\n", "the later write's line reached the pipe");
+				},
+			);
+		}
+
+		/// A descriptor someone set non-blocking (a socket handed in as a
+		/// run's stdio) refuses a write to it when full with `EAGAIN`; the
+		/// writer thread waits until it is writable and writes again, so the
+		/// write neither fails nor loses its bytes.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_full_nonblocking_descriptor_waits_for_room_through_the_writer_thread() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_full_nonblocking_descriptor_waits_for_room_through_the_writer_thread"
+				),
+				|| {
+					use std::os::fd::AsRawFd;
+
+					let (mut writer, mut reader) = pipe_with_free(0);
+					assert!(!writer.has_private_writer());
+					let fd = writer.file.as_raw_fd();
+					// SAFETY: F_GETFL and F_SETFL on a descriptor `writer` owns.
+					unsafe {
+						let flags = libc::fcntl(fd, libc::F_GETFL);
+						assert!(flags >= 0);
+						assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+					}
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished =
+						deadline("a write to a full non-blocking pipe", Duration::from_secs(5));
+					let mut wrote = writer.poll_write(&mut cx, b"z");
+					while wrote.is_pending() {
+						flag.wait("the writer thread finished");
+						wrote = writer.poll_write(&mut cx, b"z");
+					}
+					assert!(matches!(wrote, Poll::Ready(Ok(1))), "{wrote:?}");
+					// The thread has met `EAGAIN` on the full pipe before anything
+					// drains it, so the byte read below comes from the retry.
+					while WOULD_BLOCK_SEEN.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+						std::thread::yield_now();
+					}
+					let mut fill = vec![0u8; pipe_capacity(&reader)];
+					reader.read_exact(&mut fill).unwrap();
+					let mut z = [0u8; 1];
+					reader.read_exact(&mut z).unwrap();
+					assert_eq!(&z, b"z");
+					flush(&mut writer, &flag, &mut cx);
+					drop(finished);
+				},
+			);
+		}
+
+		/// The writer thread holds one chunk at a time: while it waits for
+		/// room, a second write is `Pending` and hands nothing off, which
+		/// bounds what the shell holds and is the backpressure; once room
+		/// comes, the two arrive in the order written.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_second_write_waits_while_the_first_is_in_flight_and_both_arrive_in_order() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_second_write_waits_while_the_first_is_in_flight_and_both_arrive_in_order"
+				),
+				|| {
+					let (mut writer, mut reader) = pipe_with_free(0);
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished =
+						deadline("two writes through a busy writer thread", Duration::from_secs(5));
+					let first = writer.poll_write(&mut cx, b"first\n");
+					assert!(matches!(first, Poll::Ready(Ok(6))), "{first:?}");
+					let second = writer.poll_write(&mut cx, b"second\n");
+					assert!(second.is_pending(), "the thread still holds the first: {second:?}");
+					assert!(!writer.writer_idle());
+					let mut fill = vec![0u8; pipe_capacity(&reader)];
+					reader.read_exact(&mut fill).unwrap();
+					let mut line = [0u8; 6];
+					reader.read_exact(&mut line).unwrap();
+					assert_eq!(&line, b"first\n");
+					let mut second = second;
+					while second.is_pending() {
+						flag.wait("the writer thread finished the first write");
+						second = writer.poll_write(&mut cx, b"second\n");
+					}
+					assert!(matches!(second, Poll::Ready(Ok(7))), "{second:?}");
+					drop(writer);
+					let mut rest = Vec::new();
+					reader.read_to_end(&mut rest).unwrap();
+					drop(finished);
+					assert_eq!(rest, b"second\n");
+				},
+			);
+		}
+
+		/// A chunk that fails is the failure of the writer that handed it off,
+		/// and of no other (`trap '' PIPE; echo a & echo b`). A's chunk is in
+		/// the kernel; B's fails when the reader leaves. B's settle with its
+		/// own mark gets the error; A's settle with its own mark gets none,
+		/// though B's failure is newer than A's hand-off.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_failed_chunk_is_reported_to_the_writer_that_handed_it_off() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_failed_chunk_is_reported_to_the_writer_that_handed_it_off"
+				),
+				|| {
+					let (mut writer, reader) = pipe_with_free(2);
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("two writers and a failed chunk", Duration::from_secs(5));
+					// Writer A hands off its line; it fills the pipe's last room.
+					let a = write_marked(&mut writer, &mut cx, b"a\n");
+					let Poll::Ready(Ok((2, Some(a_mark)))) = a else {
+						panic!("A: {a:?}")
+					};
+					settled(&mut writer, &flag, &mut cx, std::slice::from_ref(&a_mark))
+						.expect("A's chunk is out");
+					// Writer B hands off its line; the pipe is full, so it waits.
+					let b = write_marked(&mut writer, &mut cx, b"b\n");
+					let Poll::Ready(Ok((2, Some(b_mark)))) = b else {
+						panic!("B: {b:?}")
+					};
+					// Nothing reads, so B's line cannot go out; the reader leaves
+					// and B's chunk fails, whether its write started yet or not.
+					drop(reader);
+					let b_done = settled(&mut writer, &flag, &mut cx, &[b_mark]);
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a_mark]);
+					drop(finished);
+					assert!(
+						matches!(&b_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"B's chunk failed, and B's settle found no error: {b_done:?}"
+					);
+					assert!(
+						a_done.is_ok(),
+						"A's chunk was out, and A's settle got an error: {a_done:?}"
+					);
+				},
+			);
+		}
+
+		/// A failed chunk's error does not outlive its writer: a FIFO whose
+		/// reader left and came back takes the next write again (`exec
+		/// 3>fifo`, the reader leaves, `echo a >&3` fails with `EPIPE`, a new
+		/// reader opens the FIFO, `echo b >&3` goes out), as `write(2)` on the
+		/// same descriptor does.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_fifo_whose_reader_comes_back_takes_the_next_write() {
+			in_blocking_writer_process(
+				concat!(module_path!(), "::a_fifo_whose_reader_comes_back_takes_the_next_write"),
+				|| {
+					let dir = tempfile::tempdir().unwrap();
+					let path = dir.path().join("fifo");
+					let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+					// SAFETY: `c` is a NUL-terminated path.
+					assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+					let first = fs::OpenOptions::new()
+						.read(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&path)
+						.unwrap();
+					let mut writer =
+						StdFile::new(fs::OpenOptions::new().write(true).open(&path).unwrap());
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("a FIFO whose reader comes back", Duration::from_secs(5));
+					drop(first);
+					let a = write_marked(&mut writer, &mut cx, b"a\n");
+					let Poll::Ready(Ok((2, Some(a_mark)))) = a else {
+						panic!("a: {a:?}")
+					};
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a_mark]);
+					assert!(
+						matches!(&a_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"`a` had no reader: {a_done:?}"
+					);
+					let mut second = fs::OpenOptions::new()
+						.read(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&path)
+						.unwrap();
+					let b = write_marked(&mut writer, &mut cx, b"b\n");
+					let Poll::Ready(Ok((2, Some(b_mark)))) = b else {
+						panic!("`b` after a new reader opened the FIFO: {b:?}")
+					};
+					settled(&mut writer, &flag, &mut cx, &[b_mark]).expect("`b` went out");
+					let mut line = [0u8; 2];
+					second.read_exact(&mut line).unwrap();
+					drop(finished);
+					assert_eq!(&line, b"b\n");
+				},
+			);
+		}
+
+		/// A plain write never takes a marked writer's error: A (marked) fails
+		/// and has not settled; the plain write after it hands off its own
+		/// chunk, and A's settle still finds A's error.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_plain_write_never_takes_a_marked_writers_error() {
+			in_blocking_writer_process(
+				concat!(module_path!(), "::a_plain_write_never_takes_a_marked_writers_error"),
+				|| {
+					let (reader, w) = io::pipe().unwrap();
+					let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+					drop(reader);
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("a plain write beside a marked one", Duration::from_secs(5));
+					let Poll::Ready(Ok((2, Some(a)))) = write_marked(&mut writer, &mut cx, b"a\n")
+					else {
+						panic!("A was not handed off")
+					};
+					let plain = loop {
+						match writer.poll_write(&mut cx, b"p\n") {
+							Poll::Pending => flag.wait("the writer thread finished A's chunk"),
+							done => break done,
+						}
+					};
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a]);
+					drop(finished);
+					assert!(
+						matches!(plain, Poll::Ready(Ok(2))),
+						"the plain write took A's error: {plain:?}"
+					);
+					assert!(
+						matches!(&a_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"A's settle lost A's error: {a_done:?}"
+					);
+				},
+			);
+		}
+
+		/// A failed chunk's error waits for its writer however many chunks of
+		/// other writers fail before it settles: nothing evicts it. A's chunk
+		/// fails; a hundred other writers' chunks fail and none of them has
+		/// settled yet; A's settle finds A's error.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_failed_chunks_error_waits_for_its_writer_however_many_chunks_fail_after_it() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_failed_chunks_error_waits_for_its_writer_however_many_chunks_fail_after_it"
+				),
+				|| {
+					let (reader, w) = io::pipe().unwrap();
+					let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+					drop(reader);
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("a hundred failed chunks", Duration::from_secs(20));
+					let Poll::Ready(Ok((2, Some(a)))) = write_marked(&mut writer, &mut cx, b"a\n")
+					else {
+						panic!("A was not handed off")
+					};
+					let mut others = Vec::new();
+					while others.len() < 100 {
+						match write_marked(&mut writer, &mut cx, b"o\n") {
+							Poll::Ready(Ok((2, Some(mark)))) => others.push(mark),
+							Poll::Pending => flag.wait("the writer thread finished a chunk"),
+							other => panic!("another writer's chunk: {other:?}"),
+						}
+					}
+					// Every chunk is done before A settles.
+					while writer.poll_settle(&mut cx).is_pending() {
+						flag.wait("the writer thread finished the last chunk");
+					}
+					let failed = CHUNKS_FAILED.load(std::sync::atomic::Ordering::SeqCst);
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a]);
+					drop(finished);
+					assert_eq!(failed, 101, "every chunk had no reader");
+					assert!(
+						matches!(&a_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"A's error was dropped before A settled: {a_done:?}"
+					);
+					for mark in &others {
+						assert!(
+							settled(&mut writer, &flag, &mut cx, std::slice::from_ref(mark)).is_err()
+						);
+					}
+				},
+			);
+		}
+
+		/// A flush takes no marked writer's error: when a tee flushes fd 3
+		/// before a background `printf a >&3` settles, `printf` keeps its own
+		/// failure.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_flush_takes_no_marked_writers_error() {
+			in_blocking_writer_process(
+				concat!(module_path!(), "::a_flush_takes_no_marked_writers_error"),
+				|| {
+					let (reader, w) = io::pipe().unwrap();
+					let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+					drop(reader);
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("a flush beside a marked writer", Duration::from_secs(5));
+					let Poll::Ready(Ok((2, Some(a)))) = write_marked(&mut writer, &mut cx, b"a\n")
+					else {
+						panic!("A was not handed off")
+					};
+					let flushed = loop {
+						match writer.poll_flush(&mut cx) {
+							Poll::Ready(result) => break result,
+							Poll::Pending => flag.wait("the writer thread went idle"),
+						}
+					};
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a]);
+					drop(finished);
+					assert!(flushed.is_ok(), "the flush took A's error: {flushed:?}");
+					assert!(
+						matches!(&a_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"A's settle lost A's error to the flush: {a_done:?}"
+					);
+				},
+			);
+		}
+
+		/// Hands `buf` to `writer`: what it took and its chunk's mark.
+		#[cfg(target_os = "linux")]
+		fn write_marked(
+			writer: &mut StdFile,
+			cx: &mut Context<'_>,
+			buf: &[u8],
+		) -> Poll<io::Result<(usize, Option<Mark>)>> {
+			writer.poll_write_marked(cx, buf)
+		}
+
+		/// Settles `writer` for `marks`, waiting for its writer thread.
+		#[cfg(target_os = "linux")]
+		fn settled(
+			writer: &mut StdFile,
+			flag: &Flag,
+			cx: &mut Context<'_>,
+			marks: &[Mark],
+		) -> io::Result<()> {
+			loop {
+				match writer.poll_settle_marked(cx, marks) {
+					Poll::Ready(result) => return result,
+					Poll::Pending => flag.wait("the writer thread finished the chunk"),
+				}
+			}
+		}
+
+		/// Flushes `writer`, waiting for its writer thread; panics on an error.
+		#[cfg(target_os = "linux")]
+		fn flush(writer: &mut StdFile, flag: &Flag, cx: &mut Context<'_>) {
+			loop {
+				match writer.poll_flush(cx) {
+					Poll::Ready(result) => return result.unwrap(),
+					Poll::Pending => flag.wait("the writer thread went idle"),
+				}
+			}
+		}
+
+		/// The capacity of the pipe `reader` reads.
+		#[cfg(target_os = "linux")]
+		fn pipe_capacity(reader: &io::PipeReader) -> usize {
+			use std::os::fd::AsRawFd;
+
+			// SAFETY: `F_GETPIPE_SZ` takes no argument; `reader` owns the fd.
+			let capacity = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETPIPE_SZ) };
+			usize::try_from(capacity).expect("F_GETPIPE_SZ")
+		}
+
+		/// A write through the writer thread that fills the pipe is taken at
+		/// once, with nothing left to collect while the pipe is full.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_write_that_fills_the_pipe_is_collected_while_the_pipe_is_full() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_write_that_fills_the_pipe_is_collected_while_the_pipe_is_full"
+				),
+				|| {
+					let (mut writer, reader) = pipe_with_free(libc::PIPE_BUF);
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished =
+						deadline("collecting a write that filled the pipe", Duration::from_secs(5));
+					let buf = vec![b'x'; libc::PIPE_BUF];
+					let mut wrote = writer.poll_write(&mut cx, &buf);
+					while wrote.is_pending() {
+						flag.wait("the writer thread finished");
+						wrote = writer.poll_write(&mut cx, &buf);
+					}
+					drop(finished);
+					assert!(matches!(wrote, Poll::Ready(Ok(n)) if n == libc::PIPE_BUF), "{wrote:?}");
+					drop(reader);
+				},
+			);
+		}
+
+		/// A pipe that polls writable with less room than an atomic record
+		/// needs (gVisor reports `POLLOUT` with one byte free) is tried again
+		/// after a pause, not in a loop that wakes itself at once.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn an_atomic_record_that_does_not_fit_waits_without_spinning() {
+			let (mut writer, reader) = pipe_with_free(10);
+			let flag = Arc::new(Flag::default());
+			let waker = Waker::from(Arc::clone(&flag));
+			let cx = Context::from_waker(&waker);
+			let record = [b'r'; 20];
+			let start = Instant::now();
+			let mut polls = 0;
+			while start.elapsed() < Duration::from_millis(200) {
+				polls += 1;
+				let wrote = writer.poll_write_atomic(&cx, &record);
+				assert!(wrote.is_pending(), "{wrote:?}");
+				flag.wait_for(Duration::from_millis(200).saturating_sub(start.elapsed()));
+			}
+			assert!(polls < 100, "{polls} polls in 200 ms: the write wakes itself in a loop");
+			drop(reader);
+		}
+
+		/// A full pipe whose reader left has no room, yet a write to it does
+		/// not wait: it fails with `EPIPE` at once, and must not poll again
+		/// forever for room that never comes.
+		///
+		/// A process that another test of this process forks holds a copy of
+		/// every descriptor until its exec, this pipe's read end too, and the
+		/// write then still sees a reader. So the test runs in a process of its
+		/// own, where no other test runs.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_write_to_a_full_pipe_whose_reader_left_fails_at_once() {
+			const NAME: &str =
+				"sys::fs::tests::fifos::a_write_to_a_full_pipe_whose_reader_left_fails_at_once";
+			const ALONE: &str = "PI_SHELL_TEST_ALONE";
+			if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+				let output = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+					.env(ALONE, NAME)
+					.output()
+					.unwrap();
+				let (out, err) =
+					(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+				assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
+				assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+				return;
+			}
+
+			let (mut writer, reader) = pipe_with_free(0);
+			drop(reader);
+			let finished =
+				deadline("poll_write to a full pipe with no reader", Duration::from_secs(10));
+			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), b"x");
+			drop(finished);
+			assert!(
+				matches!(&wrote, Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe),
+				"{wrote:?}"
+			);
 		}
 
 		/// `exec 3</etc/passwd; echo foo >&3` (and the same on a pipe's read
@@ -1561,6 +3629,89 @@ mod tests {
 			let file = fs::File::open("/etc/passwd").unwrap();
 			let mut regular = StdFile::new(file);
 			assert!(ebadf(regular.poll_write(&mut cx, b"foo\n")), "write to a read-only file");
+		}
+
+		/// The same through the writer thread, Darwin's only route, which this
+		/// test's child process forces on Linux.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn both_ends_of_a_fifo_on_one_thread_never_block_through_the_writer_thread() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::both_ends_of_a_fifo_on_one_thread_never_block_through_the_writer_thread"
+				),
+				both_ends_of_a_fifo_on_one_thread_never_block,
+			);
+		}
+
+		/// Reads `reader` to its end of file, which the test's own close of
+		/// the write end (just before) may not give at once: while a sibling
+		/// test of this process starts a child (`sys/spawn/unix.rs`: `fork`,
+		/// `Command::pre_exec`, `posix_spawn`), the child holds a copy of
+		/// every descriptor of the process until its `exec` closes them, and
+		/// a writer thread of the descriptor's own, where writes go through
+		/// one, holds a copy until it ends. The end of file comes with the
+		/// last close, so it is awaited as the event it is, the reader's wake
+		/// through `flag`; `pending` runs at each `Pending`, before the wait.
+		/// The verdict is the event; the 10 s bound only ends a test that
+		/// never sees it.
+		fn end_of_file(
+			reader: &mut Box<dyn File>,
+			cx: &mut Context<'_>,
+			flag: &Flag,
+			mut pending: impl FnMut(),
+		) {
+			let deadline = Instant::now() + Duration::from_secs(10);
+			let mut buf = [0u8; 64];
+			loop {
+				match reader.poll_read(cx, &mut buf) {
+					Poll::Ready(Ok(0)) => return,
+					Poll::Pending => {
+						assert!(Instant::now() < deadline, "no end of file within 10 s of the close");
+						pending();
+						flag.wait("reader woken when the last write end closed");
+					},
+					other => panic!("end of file after the writer closed: {other:?}"),
+				}
+			}
+		}
+
+		/// The end of file comes once the last copy of the write end is
+		/// closed. Here a copy outlives the test's own close, as a sibling
+		/// test's child holds one until its `exec`, and another thread closes
+		/// it only once the wait for the end of file has begun: a read made
+		/// once after the test's close gets `Pending`, every time.
+		#[test]
+		fn the_end_of_file_waits_for_the_last_copy_of_the_write_end() {
+			use std::os::fd::{AsFd, OwnedFd};
+
+			let path = fifo();
+			let host = host_path(&path).unwrap().to_path_buf();
+			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
+			// The read open's helper waits in `open(2)` until this open.
+			let writer = fs::OpenOptions::new().write(true).open(&host).unwrap();
+			let mut reader = finish(&mut r);
+			let copy: OwnedFd = writer.as_fd().try_clone_to_owned().unwrap();
+			drop(writer);
+			let flag = Arc::new(Flag::default());
+			let waker = Waker::from(Arc::clone(&flag));
+			let mut cx = Context::from_waker(&waker);
+			let (release, released) = std::sync::mpsc::channel::<()>();
+			let closer = thread::spawn(move || {
+				// Ends with the test: a send, or the sender dropped.
+				let _ = released.recv();
+				drop(copy);
+			});
+			let mut release = Some(release);
+			end_of_file(&mut reader, &mut cx, &flag, || {
+				if let Some(release) = release.take() {
+					release.send(()).unwrap();
+				}
+			});
+			assert!(release.is_none(), "the end of file came while a copy of the write end was open");
+			closer.join().unwrap();
+			fs::remove_file(&host).unwrap();
 		}
 
 		/// `read -t 0.00001 var` with a terminal on stdin: the terminal read
@@ -1608,10 +3759,21 @@ mod tests {
 				panic!("a line is available");
 			};
 			assert_eq!(&buf[..n], b"typed\n");
-			assert!(
-				matches!(tty.poll_write(&mut cx, b"out\n"), Poll::Ready(Ok(4))),
-				"terminal output fits"
-			);
+			let mut write = tty.poll_write(&mut cx, b"out\n");
+			let deadline = Instant::now() + Duration::from_secs(10);
+			loop {
+				match write {
+					Poll::Ready(result) => {
+						assert_eq!(result.unwrap(), 4, "terminal output fits");
+						break;
+					},
+					Poll::Pending => {
+						flag.wait("terminal writer finished off the scheduler worker");
+						assert!(Instant::now() < deadline, "terminal writer stayed pending");
+						write = tty.poll_write(&mut cx, b"out\n");
+					},
+				}
+			}
 		}
 
 		/// A waker that records being woken.
@@ -1625,34 +3787,74 @@ mod tests {
 		}
 
 		impl Flag {
-			fn wait(&self, what: &str) {
-				let deadline = Instant::now() + Duration::from_secs(10);
+			/// Waits for the wake `_what` names; one that never comes hangs the
+			/// test until the runner's bound fails it.
+			fn wait(&self, _what: &str) {
 				while !self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
-					assert!(Instant::now() < deadline, "not woken: {what}");
 					thread::sleep(Duration::from_millis(5));
+				}
+			}
+
+			/// Waits up to `limit` for a wake; whether one came.
+			#[cfg(target_os = "linux")]
+			fn wait_for(&self, limit: Duration) -> bool {
+				let deadline = Instant::now() + limit;
+				loop {
+					if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+						return true;
+					}
+					if Instant::now() >= deadline {
+						return false;
+					}
+					thread::sleep(Duration::from_millis(1));
 				}
 			}
 		}
 
+		/// Dropped opens leave no end of the FIFO behind, through
+		/// `StdFs::open` as the engine opens them: each round drops a read, a
+		/// write and a `>` write (whose helper opens the path, not the pin) as
+		/// soon as they start (in most rounds before their helpers run), and a
+		/// helper any round leaves behind fails a later check, or makes a later
+		/// write open complete at once. A helper the drop came before used to
+		/// enter `open(2)` afterwards and stay on the FIFO, so the next
+		/// writer's data went to it. The tests in `fifo` hold each point of the
+		/// helper's start in turn.
+		///
+		/// A process that another test of this process forks holds a copy of
+		/// every descriptor until its exec, a helper's end of this FIFO too,
+		/// and the checks see that copy as an end the drop left behind. So the
+		/// rounds run in a process of their own, where no other test runs.
 		#[test]
 		fn dropping_a_pending_fifo_open_releases_the_helper() {
+			const NAME: &str =
+				"sys::fs::tests::fifos::dropping_a_pending_fifo_open_releases_the_helper";
+			const ALONE: &str = "PI_SHELL_TEST_ALONE";
+			if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+				let output = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+					.env(ALONE, NAME)
+					.output()
+					.unwrap();
+				let (out, err) =
+					(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+				assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
+				assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+				return;
+			}
+
 			let path = fifo();
 			let host = host_path(&path).unwrap().to_path_buf();
-			let p = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
-			drop(p);
-			// Once the helper's read end is closed, no reader is left: a
-			// non-blocking write open fails with ENXIO.
-			let deadline = Instant::now() + Duration::from_secs(10);
-			loop {
-				let r = fs::OpenOptions::new()
-					.write(true)
-					.custom_flags(libc::O_NONBLOCK)
-					.open(&host);
-				if r.as_ref().err().and_then(io::Error::raw_os_error) == Some(libc::ENXIO) {
-					break;
-				}
-				assert!(Instant::now() < deadline, "helper still holds the FIFO");
-				thread::sleep(Duration::from_millis(10));
+			let redirect = OpenFlags::WRITE
+				.with(OpenFlags::CREATE)
+				.with(OpenFlags::TRUNC);
+			for round in 0..200 {
+				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0)));
+				assert!(!fifo::has_reader(&host), "round {round}: a reader is left on the FIFO");
+				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0)));
+				assert!(!fifo::has_writer(&host), "round {round}: a writer is left on the FIFO");
+				drop(pending(StdFs::default().open(path.as_bstr(), redirect, 0o666)));
+				assert!(!fifo::has_writer(&host), "round {round}: a `>` writer is left on the FIFO");
 			}
 			fs::remove_file(&host).unwrap();
 		}
@@ -1685,6 +3887,112 @@ mod tests {
 			.unwrap();
 		assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 		std::fs::remove_file(host_path(&node.path).unwrap()).unwrap();
+	}
+
+	/// A read-only open that creates, creates exclusively or truncates (zsh
+	/// `sysopen -r -o creat,excl,trunc`) gives what `open(2)` with those
+	/// flags gives, on a regular file and on a missing path: its result, and
+	/// the file's size and mode after. `OpenOptions` refuses each of them
+	/// (`EINVAL`), so they go in as custom flags.
+	#[cfg(unix)]
+	#[test]
+	fn a_read_only_open_that_creates_or_truncates_opens_as_open_2_does() {
+		use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+		/// The open's result, then the file's size and mode, if any.
+		type Outcome = (Result<(), Option<i32>>, Option<(u64, u32)>);
+		fn run(exists: bool, open: impl FnOnce(&std::path::Path) -> io::Result<()>) -> Outcome {
+			let dir = tempfile::tempdir().unwrap();
+			let path = dir.path().join("f");
+			if exists {
+				fs::write(&path, "abc").unwrap();
+			}
+			let opened = open(&path).map_err(|err| err.raw_os_error());
+			let after = fs::metadata(&path)
+				.ok()
+				.map(|m| (m.len(), m.permissions().mode() & 0o7777));
+			(opened, after)
+		}
+		let read = OpenFlags::READ;
+		let mut wrong = Vec::new();
+		for (label, flags, raw) in [
+			("trunc", read.with(OpenFlags::TRUNC), libc::O_TRUNC),
+			("creat", read.with(OpenFlags::CREATE), libc::O_CREAT),
+			(
+				"trunc,creat",
+				read.with(OpenFlags::CREATE).with(OpenFlags::TRUNC),
+				libc::O_CREAT | libc::O_TRUNC,
+			),
+			(
+				"excl,creat",
+				read.with(OpenFlags::CREATE).with(OpenFlags::EXCL),
+				libc::O_CREAT | libc::O_EXCL,
+			),
+		] {
+			for (target, exists) in [("a regular file", true), ("a missing path", false)] {
+				let ours = run(exists, |path| {
+					let name = BStr::new(path.as_os_str().as_bytes());
+					ready(StdFs::default().open(name, flags, 0o600)).map(drop)
+				});
+				let plain = run(exists, |path| {
+					let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+					let how = libc::O_RDONLY | libc::O_CLOEXEC | raw;
+					// SAFETY: `c` is a NUL-terminated string that outlives the call.
+					let fd = unsafe { libc::open(c.as_ptr(), how, 0o600 as libc::c_uint) };
+					if fd < 0 {
+						return Err(io::Error::last_os_error());
+					}
+					// SAFETY: `fd` was just opened here and is closed once.
+					unsafe { libc::close(fd) };
+					Ok(())
+				});
+				if ours != plain {
+					wrong
+						.push(format!("-o {label} on {target}: {ours:?} where open(2) gives {plain:?}"));
+				}
+			}
+		}
+		assert!(wrong.is_empty(), "{wrong:#?}");
+	}
+
+	/// A temp name that an earlier process with this pid left in the temp
+	/// directory (`obash-<pid>-<n>`, kept by a test or a shell that failed or
+	/// was killed before it removed it) is skipped, instead of failing the
+	/// process substitution or the here-document with EEXIST. Each purpose
+	/// draws from a counter of its own, whose next four names exist.
+	#[cfg(unix)]
+	#[test]
+	fn a_temp_name_left_behind_is_skipped() {
+		/// Removes the names this test made, also when it fails.
+		struct Made(Vec<std::path::PathBuf>);
+		impl Drop for Made {
+			fn drop(&mut self) {
+				for path in &self.0 {
+					let _ = fs::remove_file(path);
+				}
+			}
+		}
+		let name =
+			|seq: u32| std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
+		let mut made = Made(Vec::new());
+		let (fifo_base, file_base) = (1 << 31, (1 << 31) + 64);
+		let mut got = Vec::new();
+		for (base, purpose) in
+			[(fifo_base, TempPurpose::ProcSub { output: false }), (file_base, TempPurpose::HereDoc)]
+		{
+			for seq in base..base + 4 {
+				if fs::File::create_new(name(seq)).is_ok() {
+					made.0.push(name(seq));
+				}
+			}
+			let node = temp_in(&AtomicU32::new(base), purpose).map(|node| {
+				let host = host_path(&node.path).unwrap().to_path_buf();
+				made.0.push(host.clone());
+				(host, node.fifo)
+			});
+			got.push(node.map_err(|e| e.kind()));
+		}
+		assert_eq!(got, [Ok((name(fifo_base + 4), true)), Ok((name(file_base + 4), false))]);
 	}
 
 	/// A Windows pipe classified as a regular file made the line reader read

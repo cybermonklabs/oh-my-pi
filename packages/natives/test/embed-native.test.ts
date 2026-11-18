@@ -48,6 +48,32 @@ describe("native addon embedding", () => {
 		}
 	});
 
+	it("names each build by a digest of its addons' bytes, not their size", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-embed-"));
+		try {
+			const digests: string[] = [];
+			for (const build of ["A", "B"]) {
+				const nativeDir = path.join(root, build, "native");
+				const outDir = path.join(root, build, "out");
+				await Bun.write(
+					path.join(nativeDir, "pi_natives.win32-arm64.node"),
+					`build ${build} binary__piNativesV18_1_1\0`,
+				);
+				const files = await embeddedAddonFiles({ platform: "win32", arch: "arm64", nativeDir, version: "18.1.1" });
+				for (const filePath in files) await Bun.write(path.join(outDir, path.basename(filePath)), files[filePath]);
+				// Dynamic: the manifest under test is generated into a per-test temp dir.
+				const { embeddedAddon }: { embeddedAddon: EmbeddedAddon } = await import(
+					path.join(outDir, "embedded-addon.js")
+				);
+				expect(embeddedAddon.digest).toMatch(/^[0-9a-f]{64}$/);
+				digests.push(embeddedAddon.digest);
+			}
+			expect(digests[0]).not.toBe(digests[1]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("emits a manifest whose zstd frames the loader extracts back to the addon", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-embed-"));
 		const nativeDir = path.join(root, "native");
@@ -74,6 +100,7 @@ describe("native addon embedding", () => {
 					variant: "default",
 					filename: "pi_natives.win32-arm64.node",
 					size: addon.length,
+					sha256: new Bun.CryptoHasher("sha256").update(addon).digest("hex"),
 					zstdPath: path.join(await fs.realpath(outDir), "pi_natives.win32-arm64.node.zst"),
 				},
 			]);
@@ -131,7 +158,11 @@ describe("native addon embedding", () => {
 					stderr: "ignore",
 				});
 				expect(await child.exited).toBe(0);
-				const extracted = (await fs.readdir(path.join(cache, packageJson.version)))
+				// Each build extracts into `<version>-<digest prefix>`, its own directory.
+				const [buildDir, ...others] = await fs.readdir(cache);
+				expect(others).toEqual([]);
+				expect(buildDir).toMatch(new RegExp(`^${packageJson.version.replaceAll(".", "\\.")}-[0-9a-f]{12}$`));
+				const extracted = (await fs.readdir(path.join(cache, buildDir)))
 					.filter(filename => filename.endsWith(".node"))
 					.sort();
 				expect(extracted).toEqual(

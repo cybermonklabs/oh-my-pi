@@ -65,6 +65,10 @@ Session env behavior:
 - Windows-only path enrichment (`crates/pi-shell/src/windows.rs`) appends discovered Git-for-Windows paths when present and not already included.
 - `snapshotPath`, when present, is sourced during session creation with stdout/stderr/stdin wired to null files.
 
+### Forked state (subshells and background jobs)
+
+Subshells, pipeline stages, background jobs, command and process substitutions, coprocs and in-engine nested `bash`/`sh` run as green-thread virtual processes (`Vproc`) inside one engine. Each forked vproc owns its global state as an `Image` (`crates/pi-shell/src/bash/image.rs`): global variables and every other process record (functions, aliases, options, traps, positional parameters, `umask`, the directory stack, `hash` entries, history). Forking clones the parent's image, or the root's via `StateStore::snapshot`, in O(1): an `Image` is persistent maps (`crates/pi-shell/src/bash/cow_map.rs`) whose clones share their entries until one side writes, as `fork(2)` shares memory pages. A child therefore keeps the state of its fork whatever the parent changes later, and its own writes stay private. Records outside any image (`Key::forked`) stay in the store: kernel state every vproc shares (the vpid and job counters, the start time, zftp's shared status files) and the root vproc's own fields (cwd, mode, `$?`, `PIPESTATUS`, `$!`, the job table, `getopts` progress, `ulimit` values), which a forked vproc keeps as fields of its own. The root shell's state is the store itself, which `MemStore` keeps in an `Image`, so a session's per-command state image (`Session::latest_image`) is an O(1) clone too, from which `Session::restore` starts a second session while the first keeps running its command. `Shell::externalize` saves a forked vproc's image as what it changed relative to the root's (`Image::diff`).
+
 ### Host-injected filesystem
 
 `filesystem` is `{ handler: (error: Error | null, request: ShellFsRequest) => Promise<ShellFsResponse>, nativeLocalPaths?: boolean }`. The bridge covers shell redirections, globs, cwd changes, and in-process utility file operations; paths travel verbatim, including absolute `scheme://` URLs. With `nativeLocalPaths: true`, all host paths bypass the handler and only URL paths are routed to it; otherwise the handler receives host paths too. Ordinary external programs still use the OS filesystem rather than this callback interface.
@@ -83,6 +87,16 @@ Three search-related builtins are worth calling out:
 - `rg` is a sibling builtin with ripgrep defaults (recursive search, ignore/hidden filtering, binary suppression) — a separate module and argument model, not an alias of `grep`.
 - `fd` is backed by `pi-walker`'s ordered `walk::tree` traversal, `globset`, and `regex`.
 - `ast-grep` (also `sg`) runs ast-grep 0.50's `run` command (`-p`/`-r`/`-U`, `--json`, context, `--heading`, `--files-with-matches`, `--stdin`) on the `pi-ast` search engine with ast-grep's piped (uncolored) output; `scan`, `test`, `new`, `lsp`, `outline`, `--config`, `--interactive`, `--kind`, `--debug-query`, and `--inspect` exit 2 as unsupported.
+
+Symlinks swapped in during a walk:
+
+- `grep -r`, `rg`, `fd` and `find` walk with `pi-walker`. A walk that does not follow symlinks opens each directory relative to its parent, or below the walk's root, without following a symlink on the way. `find` without `-L` or `-H` checks its starting point with `lstat`, and opens it the same way. `grep -r`, `rg` and `fd` follow a starting point that is a symlink, as GNU grep, ripgrep and fd do.
+- `rm -r`, and `mv` of a directory across filesystems, remove with `rm`'s descriptor walk. It opens each directory, the operand included, only as the directory that `lstat` found.
+- `chmod -R` walks by path, so it follows a directory that is swapped for a symlink at any depth.
+- `du` walks by path, so it follows a directory that is swapped for a symlink at any depth.
+- `cp -r` walks its source and destination by path, so it follows a directory that is swapped for a symlink at any depth.
+- `ls -R` walks by path, so it follows a directory that is swapped for a symlink at any depth.
+- `diff -r` walks both trees by path, so it follows a directory that is swapped for a symlink at any depth.
 
 Each builtin runs inside the shell process (no `fork`/`exec`) against the `pi-builtins` `Host` view of the shell (`src/host.rs`): stdio routes through the command's (possibly piped/redirected) file descriptors, path operands resolve against the shell working directory, the shell's exported environment is visible, and abort/timeout cancellation is honored. Because these builtins shadow system binaries, registration is gated (`ExtrasGate` in `crates/pi-shell/src/extras.rs`, built in `crates/pi-shell/src/tools/mod.rs`):
 

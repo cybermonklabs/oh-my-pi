@@ -23,8 +23,9 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { IrcBus } from "../../irc/bus";
 import { type AdoptOptions, type AgentReviver, AgentLifecycleManager } from "../../registry/agent-lifecycle";
-import { AgentRegistry, type RegistryListener } from "../../registry/agent-registry";
+import { AgentRegistry, type RegisterInput, type RegistryListener } from "../../registry/agent-registry";
 import { PromptDroppedError, SessionBusyError } from "../../session/agent-session";
+import { FileSessionStorage } from "../../session/session-storage";
 import type { WorkerThreadLink } from "../protocol";
 import { installPeerBridge } from "../peer-agent-session";
 import { RemoteAgentSession, SessionHostClient } from "../remote-agent-session";
@@ -245,10 +246,27 @@ function serveBridge(): RpcServe<MainSessionBridge, SessionBridgeProtocol> {
 	};
 }
 
-function serveRegistry(bridge: MainSessionBridge): RpcServe<AgentRegistry, AgentRegistryProtocol> {
+/**
+ * A worker agent's transcript is always a file: a worker run is given no
+ * session storage (integrations.ts drops it) and any other storage stays on
+ * main (subagent-worker.ts). No storage instance crosses the RPC, so main
+ * records file storage for every ref a worker registers or reuses; a kill of
+ * that agent then writes its tombstone as file storage does, whatever main's
+ * own default is.
+ */
+const workerTranscriptStorage = new FileSessionStorage();
+
+/** The registration a worker asked for, naming the storage its transcript is in. */
+export function workerRegistration(input: RegisterInput): RegisterInput {
+	return { ...input, storage: workerTranscriptStorage };
+}
+
+/** Main's side of the worker registry proxy; exported for tests. */
+export function serveRegistry(bridge: MainSessionBridge): RpcServe<AgentRegistry, AgentRegistryProtocol> {
 	return {
-		register: (registry, input) => registry.register(input),
-		registerIfAvailable: (registry, input, expected) => registry.registerIfAvailable(input, expected),
+		register: (registry, input) => registry.register(workerRegistration(input)),
+		registerIfAvailable: (registry, input, expected) =>
+			registry.registerIfAvailable(workerRegistration(input), expected),
 		reopen: (registry, id, expected) => registry.reopen(id, expected),
 		setHistory: (registry, id, history, expectedSessionFile) => registry.setHistory(id, history, expectedSessionFile),
 		setStatus: (registry, id, status, expected) => registry.setStatus(id, status, expected),
@@ -259,6 +277,7 @@ function serveRegistry(bridge: MainSessionBridge): RpcServe<AgentRegistry, Agent
 			registry.attachSession(id, session, sessionFile, expected),
 		detachSession: (registry, id, expected) => registry.detachSession(id, expected),
 		unregister: (registry, id, expected) => registry.unregister(id, expected),
+		bindLiveName: (registry, name, targetId, sessionFile) => registry.bindLiveName(name, targetId, sessionFile),
 		get: (registry, id) => registry.get(id),
 		list: registry => registry.list(),
 		listVisibleTo: (registry, id) => registry.listVisibleTo(id),
@@ -278,9 +297,13 @@ function serveLifecycle(bridge: MainSessionBridge): RpcServe<AgentLifecycleManag
 		reclaimDeadCorpse: (lifecycle, id, expected) => lifecycle.reclaimDeadCorpse(id, expected),
 		manages: (lifecycle, registry) => lifecycle.manages(registry),
 		isParking: (lifecycle, id, expected) => lifecycle.isParking(id, expected),
+		isReleasing: (lifecycle, id) => lifecycle.isReleasing(id),
+		whenReleased: (lifecycle, id) => lifecycle.whenReleased(id),
 		park: (lifecycle, id) => lifecycle.park(id),
-		ensureLive: (lifecycle, id) => lifecycle.ensureLive(id),
+		ensureLive: (lifecycle, id, coldRevive) => lifecycle.ensureLive(id, coldRevive),
+		ensureLiveTarget: (lifecycle, id, coldRevive) => lifecycle.ensureLiveTarget(id, coldRevive),
 		release: (lifecycle, id, expected, options) => lifecycle.release(id, expected, options),
+		releaseUnder: (lifecycle, ancestorId, options) => lifecycle.releaseUnder(ancestorId, options),
 	};
 }
 

@@ -65,6 +65,53 @@ zsh:sysopen:11: can't open file sl: too many levels of symbolic links
 	assert_eq!(st, 0);
 }
 
+/// `sysopen -r` passes `-o trunc`, `creat` and `excl` to `open(2)`, as zsh
+/// does: a read-only open truncates a regular file, creates a missing one
+/// and refuses an existing one under `excl`. A file `sysopen` creates, for
+/// reading or writing, gets its mode (0666, or `-m`) less the shell's umask,
+/// as `open(2)` gives zsh's; an existing file keeps its mode. Expected output
+/// from `zsh -f -c SCRIPT` 5.9 on Linux (Ubuntu 24.04), where a read-only
+/// `O_TRUNC` truncates; POSIX leaves that to the system.
+#[cfg(target_os = "linux")]
+#[test]
+fn zsh_mod_system_sysopen_read_only_creates_and_truncates_and_creates_under_the_umask() {
+	let (out, err, st) = zsh(
+		"zmodload zsh/system; umask 022
+for o in trunc creat trunc,creat excl,creat; do
+  print -n abc > f; rm -f m
+  sysopen -r -o $o -u fd f && exec {fd}<&-; print -rn -- \"$o f $? $(wc -c < f)\"
+  sysopen -r -o $o -u fd m && exec {fd}<&-; print -r -- \" m $? $(if [[ -e m ]]; then ls -l m | \
+		 cut -c1-10; else echo none; fi)\"
+done
+umask 027; print -n abc > e; chmod 606 e
+sysopen -w -o creat -u fd w; sysopen -r -o creat -u fd r; sysopen -w -o creat -m 0666 -u fd x
+sysopen -w -o creat -m 0600 -u fd y; sysopen -r -o creat -m 0604 -u fd z; sysopen -w -o creat -m \
+		 0600 -u fd e
+ls -l e w r x y z | cut -c1-10",
+	);
+	assert_eq!(
+		out,
+		"trunc f 0 0 m 1 none
+creat f 0 3 m 0 -rw-r--r--
+trunc,creat f 0 0 m 0 -rw-r--r--
+excl,creat f 1 3 m 0 -rw-r--r--
+-rw----rw-
+-rw-r-----
+-rw-r-----
+-rw-r-----
+-rw-------
+-rw-------
+"
+	);
+	assert_eq!(
+		err,
+		"zsh:sysopen:5: can't open file m: no such file or directory
+zsh:sysopen:4: can't open file f: file exists
+"
+	);
+	assert_eq!(st, 0);
+}
+
 /// powerlevel10k's and gitstatus's uses: an append-and-truncate open with a
 /// mode, and a close-on-exec descriptor on a process substitution read
 /// with timeouts into array elements.
@@ -146,4 +193,25 @@ fn zsh_mod_system_flock_fd_is_close_on_exec_unless_e() {
 	);
 	assert_eq!(out, "1\n0\n");
 	assert_eq!(st, 0);
+}
+
+/// `syswrite` to a socket whose peer is gone. On Linux a socket's writes go
+/// to the descriptor's writer thread, which takes the chunk at once and then
+/// fails with `EPIPE`; `syswrite` must report that failure (status 2), as
+/// `write(2)` would, not count the chunk written.
+#[cfg(target_os = "linux")]
+#[test]
+fn zsh_mod_system_syswrite_reports_a_failure_after_the_hand_off() {
+	let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+	drop(ours);
+	let dir = tempfile::tempdir().unwrap();
+	let mut cmd: Command = obash();
+	cmd.arg0("zsh");
+	let out = output(
+		cmd.current_dir(dir.path())
+			.stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+			.args(["-f", "-c", "trap '' PIPE; zmodload zsh/system; syswrite y; print -u2 status=$?"]),
+	);
+	let err = String::from_utf8_lossy(&out.stderr);
+	assert!(err.contains("status=2"), "syswrite's status: {err:?}");
 }

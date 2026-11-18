@@ -10,6 +10,7 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { getEditStore } from "../edit/store";
 import type { InternalWriteResult } from "../internal-urls/types";
 import { writethroughNoop } from "../lsp/writethrough";
+import { throwIfAborted } from "./tool-errors";
 import {
 	expandContentTokens,
 	getConflictHistory,
@@ -104,12 +105,17 @@ export async function readConflictUri(session: ToolSession, raw: string): Promis
  * model payload: hashline prefixes are stripped here (per-id `conflict://*`
  * directives are parsed before stripping, which would eat their `<id>:` heads).
  * Scoped URIs (`/ours`, `/theirs`, `/base`) are read-only.
+ *
+ * An aborted `signal` stops the write before each file changes. `onWriteBegin` is
+ * called right before the first file changes: from then the caller waits for this
+ * write and reports it.
  */
 export async function writeConflictUri(
 	session: ToolSession,
 	raw: string,
 	content: string,
 	signal: AbortSignal | undefined,
+	onWriteBegin?: () => void,
 ): Promise<InternalWriteResult> {
 	const target = parseTarget(raw);
 	if (target.scope) {
@@ -118,8 +124,17 @@ export async function writeConflictUri(
 		);
 	}
 	const { text: cleanContent, stripped } = stripWriteContent(session, content);
-	if (target.id === "*") return resolveAllConflicts(session, cleanContent, stripped, signal, content);
-	return resolveConflict(session, await requireEntry(session, target.id), cleanContent, stripped, signal);
+	if (target.id === "*") {
+		return resolveAllConflicts(session, cleanContent, stripped, signal, content, onWriteBegin);
+	}
+	return resolveConflict(
+		session,
+		await requireEntry(session, target.id),
+		cleanContent,
+		stripped,
+		signal,
+		onWriteBegin,
+	);
 }
 
 /**
@@ -140,6 +155,7 @@ async function resolveConflict(
 	replacementContent: string,
 	stripped: boolean,
 	signal: AbortSignal | undefined,
+	onWriteBegin?: () => void,
 ): Promise<InternalWriteResult> {
 	const absolutePath = entry.absolutePath;
 	if (!(await fs.exists(absolutePath))) {
@@ -151,6 +167,9 @@ async function resolveConflict(
 	const splice = spliceConflict(originalText, entry, expanded);
 	const newContent = splice.text;
 
+	// The write below does not watch the signal: the last check before it.
+	throwIfAborted(signal);
+	onWriteBegin?.();
 	await writethroughNoop(absolutePath, newContent, signal);
 	session.bumpFileMutationVersion?.(absolutePath);
 	getEditStore(session).invalidate(absolutePath);
@@ -307,7 +326,9 @@ function resolveBulkDirectives(
  * fails (stale anchors, missing base for `@base`, etc.), that file is
  * left untouched and the error is surfaced. Files that succeed are
  * still written. The result text reports per-file counts so the agent
- * can re-read the failed files and retry.
+ * can re-read the failed files and retry. An abort before the first
+ * file is written ends the call as aborted; after it, each file not yet
+ * written is left untouched and reported as not written.
  */
 async function resolveAllConflicts(
 	session: ToolSession,
@@ -315,6 +336,7 @@ async function resolveAllConflicts(
 	stripped: boolean,
 	signal: AbortSignal | undefined,
 	rawContent: string,
+	onWriteBegin?: () => void,
 ): Promise<InternalWriteResult> {
 	const history = getConflictHistory(session);
 	await reconcileRegisteredConflicts(history);
@@ -403,6 +425,17 @@ async function resolveAllConflicts(
 			continue;
 		}
 
+		// The write below does not watch the signal: the last check before it.
+		if (signal?.aborted) {
+			if (succeededFiles.length === 0) throwIfAborted(signal);
+			failedFiles.push({
+				displayPath: sample.displayPath,
+				count: fileEntries.length,
+				error: "not written: the call was aborted",
+			});
+			continue;
+		}
+		onWriteBegin?.();
 		await writethroughNoop(absolutePath, text, signal);
 		session.bumpFileMutationVersion?.(absolutePath);
 		getEditStore(session).invalidate(absolutePath);

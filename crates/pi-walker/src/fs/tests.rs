@@ -15,7 +15,7 @@ impl TempDir {
 	fn new(tag: &str) -> Self {
 		static NEXT: AtomicUsize = AtomicUsize::new(0);
 		let n = NEXT.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir()
+		let path = crate::testing::temp_root()
 			.canonicalize()
 			.unwrap()
 			.join(format!("pg-fs-{tag}-{}-{n}", std::process::id()));
@@ -49,7 +49,10 @@ fn names(listing: &Listing) -> Vec<(String, FileType)> {
 }
 
 async fn read_all(session: &mut Session, dir: &Dir, name: &str, limit: u64) -> (Vec<u8>, FileInfo) {
-	let (mut file, info) = session.open_file_at(dir, name.as_bytes()).await.unwrap();
+	let (mut file, info) = session
+		.open_file_at(dir, name.as_bytes(), false)
+		.await
+		.unwrap();
 	let mut buf = Vec::new();
 	file.read_into(&mut buf, limit).await.unwrap();
 	(buf, info)
@@ -79,7 +82,7 @@ async fn native_listing_reports_names_and_types() {
 	{
 		std::os::unix::fs::symlink("a.txt", tmp.0.join("link")).unwrap();
 		mkfifo(&tmp.0.join("fifo"));
-		let _socket = std::os::unix::net::UnixListener::bind(tmp.0.join("sock")).unwrap();
+		let _socket = bind_socket_in(&tmp.0, "sock");
 	}
 	let fs = Fs::native();
 	let mut s = fs.session();
@@ -97,6 +100,43 @@ async fn native_listing_reports_names_and_types() {
 		"b.txt".to_owned(),
 		FileType::File
 	)]);
+}
+
+/// Binds a Unix socket named `name` in `dir`. A socket address holds a path of
+/// at most 108 bytes (104 on macOS), and a test's directory can be longer:
+/// Bazel's `TEST_TMPDIR` is. So the bind goes through a symlink to `dir` in a
+/// short directory of its own under `/tmp`, removed again once the socket is
+/// made; the socket itself is an entry of `dir`.
+#[cfg(unix)]
+fn bind_socket_in(dir: &Path, name: &str) -> std::os::unix::net::UnixListener {
+	use std::os::unix::ffi::OsStrExt as _;
+	let mut template = *b"/tmp/pw-sock-XXXXXX\0";
+	// SAFETY: `template` is a writable, NUL-terminated template ending in six
+	// `X`s, which `mkdtemp` replaces in place.
+	let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+	assert!(!made.is_null(), "mkdtemp: {}", io::Error::last_os_error());
+	let short = PathBuf::from(std::ffi::OsStr::from_bytes(&template[..template.len() - 1]));
+	let link = short.join("d");
+	std::os::unix::fs::symlink(dir, &link).unwrap();
+	let bound = std::os::unix::net::UnixListener::bind(link.join(name));
+	std::fs::remove_file(&link).unwrap();
+	std::fs::remove_dir(&short).unwrap();
+	bound.unwrap_or_else(|err| panic!("bind {name} in {}: {err}", dir.display()))
+}
+
+/// [`bind_socket_in`] makes the socket in a directory whose path, with the
+/// socket's name, is longer than a socket address holds.
+#[cfg(unix)]
+#[test]
+fn a_socket_binds_in_a_directory_too_long_for_its_address() {
+	use std::os::unix::fs::FileTypeExt as _;
+	let tmp = TempDir::new("long-sock");
+	let long = tmp.0.join("d".repeat(120));
+	std::fs::create_dir(&long).unwrap();
+	assert!(long.join("sock").as_os_str().len() > 108, "a socket address would hold the path");
+	let _socket = bind_socket_in(&long, "sock");
+	let entry = std::fs::symlink_metadata(long.join("sock")).unwrap();
+	assert!(entry.file_type().is_socket(), "{:?}", entry.file_type());
 }
 
 /// Full listings carry regular-file sizes and every entry's mtime.
@@ -184,6 +224,430 @@ async fn open_child_refuses_symlink_that_replaced_dir() {
 	assert!(s.open_dir(&tmp.0.join("d")).await.is_ok());
 }
 
+/// A tree for the confined-open tests: `root/a/b/file.txt` (`ok`), and next
+/// to it a file link `root/a/b/flink` and a directory link `root/a/link`, both
+/// inside the root, and a directory link `root/esc` to `outside/` (`secret`).
+#[cfg(unix)]
+fn linked_tree(tag: &str) -> TempDir {
+	let tmp = TempDir::new(tag);
+	tmp.write("root/a/b/file.txt", b"ok");
+	tmp.write("outside/secret", b"secret");
+	std::os::unix::fs::symlink("file.txt", tmp.0.join("root/a/b/flink")).unwrap();
+	std::os::unix::fs::symlink("b", tmp.0.join("root/a/link")).unwrap();
+	std::os::unix::fs::symlink(tmp.0.join("outside"), tmp.0.join("root/esc")).unwrap();
+	tmp
+}
+
+/// Whether `err` refused a symlink on the way.
+#[cfg(unix)]
+fn refused_link(err: &io::Error) -> bool {
+	matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
+}
+
+/// Opens below a root reach regular files and directories but no symlink on
+/// the way, inside the root or out of it, whether the kernel's confined open
+/// or the portable component walk serves them; paths that are not
+/// walk-relative are refused.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn opens_beneath_a_root_follow_no_symlink() {
+	let tmp = linked_tree("beneath");
+	let mut s = Fs::native().session();
+	let root = s.open_dir(&tmp.0.join("root")).await.unwrap();
+	let (mut file, info) = s.open_file_beneath(&root, b"a/b/file.txt").await.unwrap();
+	assert_eq!(info.size, 2);
+	let mut buf = Vec::new();
+	file.read_into(&mut buf, 16).await.unwrap();
+	assert_eq!(buf, b"ok");
+	let dir = s.open_dir_beneath(&root, b"a/b").await.unwrap();
+	assert_eq!(names(s.list(&dir, Detail::Minimal, 0).await.unwrap()), [
+		("file.txt".to_owned(), FileType::File),
+		("flink".to_owned(), FileType::Symlink),
+	]);
+	for rel in ["a/b/flink", "a/link/file.txt", "esc/secret"] {
+		let err = s
+			.open_file_beneath(&root, rel.as_bytes())
+			.await
+			.unwrap_err();
+		assert!(refused_link(&err), "{rel}: {err:?}");
+	}
+	for rel in ["a/link", "esc"] {
+		let err = s.open_dir_beneath(&root, rel.as_bytes()).await.unwrap_err();
+		assert!(refused_link(&err), "{rel}: {err:?}");
+	}
+	assert!(is_not_regular(&s.open_file_beneath(&root, b"a/b").await.unwrap_err()));
+	// A refused final symlink is a symlink refusal; a missing file is not.
+	assert!(is_symlink_refusal(&s.open_file_beneath(&root, b"a/b/flink").await.unwrap_err()));
+	assert!(!is_symlink_refusal(&s.open_file_beneath(&root, b"a/b/none").await.unwrap_err()));
+	for rel in NOT_WALK_RELATIVE {
+		let err = s
+			.open_file_beneath(&root, rel.as_bytes())
+			.await
+			.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{rel:?}");
+	}
+}
+
+/// Paths a confined call refuses as not walk-relative.
+const NOT_WALK_RELATIVE: [&str; 6] =
+	["", "/a/b/file.txt", "a//b/file.txt", "./a/b/file.txt", "a/../a/b/file.txt", "a/b/"];
+
+/// Writes below a root rewrite a regular file in place, or create one, but
+/// reach no symlink on the way or at the file, inside the root or out of it,
+/// and change no link's target; special files are left alone without
+/// blocking, and paths that are not walk-relative are refused.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_beneath_a_root_follow_no_symlink() {
+	use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+	let tmp = linked_tree("write-beneath");
+	let mut s = Fs::native().session();
+	let root = s.open_dir(&tmp.0.join("root")).await.unwrap();
+	let file = tmp.0.join("root/a/b/file.txt");
+	let ino = std::fs::metadata(&file).unwrap().ino();
+	s.write_file_beneath(&root, b"a/b/file.txt", b"rewritten")
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&file).unwrap(), b"rewritten");
+	assert_eq!(std::fs::metadata(&file).unwrap().ino(), ino, "rewritten in place");
+	s.write_file_beneath(&root, b"a/b/file.txt", b"ok")
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&file).unwrap(), b"ok", "truncated before the write");
+	s.write_file_beneath(&root, b"a/b/new.txt", b"new")
+		.await
+		.unwrap();
+	s.write_file_beneath(&root, b"top.txt", b"top")
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(tmp.0.join("root/a/b/new.txt")).unwrap(), b"new");
+	assert_eq!(std::fs::read(tmp.0.join("root/top.txt")).unwrap(), b"top");
+
+	std::os::unix::fs::symlink(tmp.0.join("outside/dangling"), tmp.0.join("root/a/b/dlink"))
+		.unwrap();
+	for rel in ["a/b/flink", "a/b/dlink", "a/link/file.txt", "esc/secret", "esc/planted"] {
+		let err = s
+			.write_file_beneath(&root, rel.as_bytes(), b"x")
+			.await
+			.unwrap_err();
+		assert!(refused_link(&err), "{rel}: {err:?}");
+	}
+	assert_eq!(std::fs::read(&file).unwrap(), b"ok", "a link's target is untouched");
+	assert_eq!(std::fs::read(tmp.0.join("outside/secret")).unwrap(), b"secret");
+	assert!(!tmp.0.join("outside/planted").exists());
+	assert!(!tmp.0.join("outside/dangling").exists());
+
+	mkfifo(&tmp.0.join("root/a/fifo"));
+	let err = s
+		.write_file_beneath(&root, b"a/fifo", b"x")
+		.await
+		.unwrap_err();
+	assert_eq!(err.raw_os_error(), Some(libc::ENXIO), "no reader: {err:?}");
+	let _reader = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(tmp.0.join("root/a/fifo"))
+		.unwrap();
+	let err = s
+		.write_file_beneath(&root, b"a/fifo", b"x")
+		.await
+		.unwrap_err();
+	assert!(is_not_regular(&err), "with a reader: {err:?}");
+	assert!(s.write_file_beneath(&root, b"a/b", b"x").await.is_err());
+	assert!(tmp.0.join("root/a/b").is_dir());
+	for rel in NOT_WALK_RELATIVE {
+		let err = s
+			.write_file_beneath(&root, rel.as_bytes(), b"x")
+			.await
+			.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{rel:?}");
+	}
+}
+
+/// Removals below a root remove the entry the path names, a symlink there
+/// itself and never its target, but go through no symlink on the way,
+/// inside the root or out of it; paths that are not walk-relative are
+/// refused.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn removals_beneath_a_root_follow_no_symlink() {
+	let tmp = linked_tree("remove-beneath");
+	let mut s = Fs::native().session();
+	let root = s.open_dir(&tmp.0.join("root")).await.unwrap();
+	for rel in ["a/link/file.txt", "esc/secret"] {
+		let err = s
+			.remove_file_beneath(&root, rel.as_bytes())
+			.await
+			.unwrap_err();
+		assert!(refused_link(&err), "{rel}: {err:?}");
+	}
+	for rel in ["a/link", "esc"] {
+		let err = s
+			.remove_dir_beneath(&root, rel.as_bytes())
+			.await
+			.unwrap_err();
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{rel}: {err:?}");
+	}
+	assert!(tmp.0.join("root/a/b/file.txt").exists());
+	assert!(tmp.0.join("outside/secret").exists());
+
+	for rel in ["a/b/flink", "a/link", "esc"] {
+		s.remove_file_beneath(&root, rel.as_bytes()).await.unwrap();
+		assert!(std::fs::symlink_metadata(tmp.0.join("root").join(rel)).is_err(), "{rel}");
+	}
+	assert!(tmp.0.join("root/a/b/file.txt").exists(), "a link's target stays");
+	assert!(tmp.0.join("outside/secret").exists());
+
+	assert!(s.remove_file_beneath(&root, b"a/b").await.is_err());
+	let err = s.remove_dir_beneath(&root, b"a/b").await.unwrap_err();
+	assert_eq!(err.kind(), io::ErrorKind::DirectoryNotEmpty, "{err:?}");
+	s.remove_file_beneath(&root, b"a/b/file.txt").await.unwrap();
+	s.remove_dir_beneath(&root, b"a/b").await.unwrap();
+	s.remove_dir_beneath(&root, b"a").await.unwrap();
+	assert!(!tmp.0.join("root/a").exists());
+	for rel in NOT_WALK_RELATIVE {
+		for dir in [false, true] {
+			let err = if dir {
+				s.remove_dir_beneath(&root, rel.as_bytes()).await
+			} else {
+				s.remove_file_beneath(&root, rel.as_bytes()).await
+			}
+			.unwrap_err();
+			assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{rel:?}");
+		}
+	}
+}
+
+/// On Windows a directory symlink is a directory: `remove_file_beneath`
+/// refuses it, as `std::fs::remove_file` does there, and `remove_dir_beneath`
+/// removes the link itself, not its target, as `std::fs::remove_dir` does.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_directory_links_are_removed_as_directories() {
+	let tmp = TempDir::new("win-dir-link");
+	tmp.write("root/target/keep.txt", b"keep");
+	let link = tmp.0.join("root/link");
+	if let Err(err) = std::os::windows::fs::symlink_dir(tmp.0.join("root/target"), &link) {
+		eprintln!("UNKNOWN: no directory symlink could be made ({err}); the removal was not checked");
+		return;
+	}
+	assert!(
+		std::fs::remove_file(&link).is_err(),
+		"std::fs::remove_file removed a directory symlink"
+	);
+	let mut s = Fs::native().session();
+	let root = s.open_dir(&tmp.0.join("root")).await.unwrap();
+	assert!(s.remove_file_beneath(&root, b"link").await.is_err());
+	assert!(std::fs::symlink_metadata(&link).is_ok(), "the link was removed as a file");
+	s.remove_dir_beneath(&root, b"link").await.unwrap();
+	assert!(std::fs::symlink_metadata(&link).is_err(), "the link stays");
+	assert!(tmp.0.join("root/target/keep.txt").exists(), "the link's target was removed");
+}
+
+/// On Windows a read-only file is removed, as `std::fs::remove_file` removes
+/// one there.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_read_only_files_are_removed() {
+	let tmp = TempDir::new("win-read-only");
+	for name in ["root/ours", "root/std"] {
+		let path = tmp.write(name, b"x");
+		let mut perms = std::fs::metadata(&path).unwrap().permissions();
+		perms.set_readonly(true);
+		std::fs::set_permissions(&path, perms).unwrap();
+	}
+	std::fs::remove_file(tmp.0.join("root/std")).expect("std removes a read-only file");
+	let mut s = Fs::native().session();
+	let root = s.open_dir(&tmp.0.join("root")).await.unwrap();
+	s.remove_file_beneath(&root, b"ours").await.unwrap();
+	assert!(std::fs::symlink_metadata(tmp.0.join("root/ours")).is_err(), "the file stays");
+}
+
+/// On Windows a path stated without following a final symlink, as the
+/// listing cache stats a directory and its ignore files, has the stamp a
+/// handle reports, `ChangeTime` included, also after an attribute change
+/// moved `ChangeTime` away from `LastWriteTime`.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_path_stamps_agree_with_handle_stamps() {
+	let set_readonly = |path: &Path, readonly: bool| {
+		let mut perms = std::fs::metadata(path).unwrap().permissions();
+		perms.set_readonly(readonly);
+		std::fs::set_permissions(path, perms).unwrap();
+	};
+	let tmp = TempDir::new("win-stamps");
+	let file = tmp.write("root/.gitignore", b"*.log\n");
+	let dir_path = tmp.0.join("root");
+	std::thread::sleep(std::time::Duration::from_millis(50));
+	// An attribute change moves `ChangeTime`, not `LastWriteTime`.
+	set_readonly(&file, true);
+	set_readonly(&dir_path, true);
+	let mut s = Fs::native().session();
+	let dir = s.open_dir(&dir_path).await.unwrap();
+	let (_, file_by_handle) = s.open_file_at(&dir, b".gitignore", false).await.unwrap();
+	let dir_by_handle = s.stat_dir(&dir).await.unwrap();
+	let file_by_path = s.stat(&file, false).await.unwrap();
+	let dir_by_path = s.stat(&dir_path, false).await.unwrap();
+	drop(dir);
+	set_readonly(&file, false);
+	set_readonly(&dir_path, false);
+	if file_by_handle.stamp.ctime == file_by_handle.stamp.mtime
+		|| dir_by_handle.ctime == dir_by_handle.mtime
+	{
+		eprintln!(
+			"UNKNOWN: ChangeTime did not move away from LastWriteTime on this file system; the \
+			 stamps were not compared"
+		);
+		return;
+	}
+	assert_eq!(file_by_path.stamp, file_by_handle.stamp, "the file's stamps differ");
+	assert_eq!(file_by_path.file_type, Some(FileType::File));
+	assert_eq!(dir_by_path.stamp, dir_by_handle, "the directory's stamps differ");
+	assert_eq!(dir_by_path.file_type, Some(FileType::Dir));
+}
+
+/// On Windows a stat that follows a symlink stamps its target as a handle
+/// does, `ChangeTime` included, also after an attribute change moved
+/// `ChangeTime` away from `LastWriteTime`; one that does not follow reports
+/// the link.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_following_stats_stamp_the_target_as_a_handle_does() {
+	let tmp = TempDir::new("win-link-stamps");
+	let target = tmp.write("root/target.txt", b"target");
+	let link = tmp.0.join("root/link.txt");
+	if let Err(err) = std::os::windows::fs::symlink_file(&target, &link) {
+		eprintln!("UNKNOWN: no file symlink could be made ({err}); the stamps were not compared");
+		return;
+	}
+	let set_readonly = |readonly: bool| {
+		let mut perms = std::fs::metadata(&target).unwrap().permissions();
+		perms.set_readonly(readonly);
+		std::fs::set_permissions(&target, perms).unwrap();
+	};
+	std::thread::sleep(std::time::Duration::from_millis(50));
+	// An attribute change moves `ChangeTime`, not `LastWriteTime`.
+	set_readonly(true);
+	let mut s = Fs::native().session();
+	let dir = s.open_dir(&tmp.0.join("root")).await.unwrap();
+	let (_, by_handle) = s.open_file_at(&dir, b"target.txt", false).await.unwrap();
+	let followed = s.stat(&link, true).await.unwrap();
+	let unfollowed = s.stat(&link, false).await.unwrap();
+	drop(dir);
+	set_readonly(false);
+	assert_eq!(unfollowed.file_type, Some(FileType::Symlink));
+	if by_handle.stamp.ctime == by_handle.stamp.mtime {
+		eprintln!(
+			"UNKNOWN: ChangeTime did not move away from LastWriteTime on this file system; the \
+			 stamps were not compared"
+		);
+		return;
+	}
+	assert_eq!(followed.file_type, Some(FileType::File));
+	assert_eq!(followed.size, 6);
+	assert_eq!(followed.stamp, by_handle.stamp, "the target's stamps differ");
+}
+
+/// A listed file's open follows a symlink there only when asked to.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn open_file_at_follows_a_symlink_only_when_asked() {
+	let tmp = linked_tree("file-at");
+	let mut s = Fs::native().session();
+	let dir = s.open_dir(&tmp.0.join("root/a/b")).await.unwrap();
+	let err = s.open_file_at(&dir, b"flink", false).await.unwrap_err();
+	assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err:?}");
+	let (_, info) = s.open_file_at(&dir, b"flink", true).await.unwrap();
+	assert_eq!(info.size, 2);
+}
+
+/// Provider opens below a root, and of a listed name, refuse a final symlink
+/// unless asked to follow it, and join raw names as URL segments.
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_opens_refuse_a_final_symlink() {
+	let (mem, vfs) = MemFs::with_files(&[("mem://root/dir/c%20d.txt", "hello")]);
+	mem.add_symlink("mem://root/dir/flink", "mem://root/dir/c%20d.txt");
+	mem.add_symlink("mem://root/link", "mem://root/dir");
+	let root_path = Path::new("mem://root");
+	let mut s = Fs::new(&vfs, root_path).session();
+	let root = s.open_dir(root_path).await.unwrap();
+	assert_eq!(
+		s.open_file_beneath(&root, b"dir/c d.txt")
+			.await
+			.unwrap()
+			.1
+			.size,
+		5
+	);
+	assert!(is_symlink_refusal(&s.open_file_beneath(&root, b"dir/flink").await.unwrap_err()));
+	assert!(!is_symlink_refusal(&s.open_file_beneath(&root, b"dir/none").await.unwrap_err()));
+	assert!(s.open_dir_beneath(&root, b"dir").await.is_ok());
+	assert!(s.open_dir_beneath(&root, b"link").await.is_err());
+	let err = s
+		.open_file_beneath(&root, b"dir/../dir/c d.txt")
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+	let dir = s.open_child(&root, b"dir").await.unwrap();
+	assert!(s.open_file_at(&dir, b"flink", false).await.is_err());
+	assert_eq!(s.open_file_at(&dir, b"flink", true).await.unwrap().1.size, 5);
+}
+
+/// Provider writes below a root rewrite or create regular files and refuse a
+/// final symlink and special files; removals remove the entry by path, a
+/// symlink itself; paths that are not walk-relative are refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_writes_refuse_a_final_symlink() {
+	let (mem, vfs) = MemFs::with_files(&[("mem://root/dir/c%20d.txt", "hello")]);
+	mem.add_symlink("mem://root/dir/flink", "mem://root/dir/c%20d.txt");
+	mem.add_fifo("mem://root/dir/fifo");
+	let root_path = Path::new("mem://root");
+	let mut s = Fs::new(&vfs, root_path).session();
+	let root = s.open_dir(root_path).await.unwrap();
+	s.write_file_beneath(&root, b"dir/c d.txt", b"rewritten")
+		.await
+		.unwrap();
+	s.write_file_beneath(&root, b"dir/new", b"new")
+		.await
+		.unwrap();
+	assert_eq!(vfs.read("mem://root/dir/c%20d.txt").await.unwrap(), b"rewritten");
+	assert_eq!(vfs.read("mem://root/dir/new").await.unwrap(), b"new");
+	let err = s
+		.write_file_beneath(&root, b"dir/flink", b"x")
+		.await
+		.unwrap_err();
+	assert!(err.to_string().contains("symbolic link"), "{err:?}");
+	for rel in ["dir/fifo", "dir"] {
+		let err = s
+			.write_file_beneath(&root, rel.as_bytes(), b"x")
+			.await
+			.unwrap_err();
+		assert!(is_not_regular(&err), "{rel}: {err:?}");
+	}
+	assert_eq!(vfs.read("mem://root/dir/c%20d.txt").await.unwrap(), b"rewritten");
+
+	s.remove_file_beneath(&root, b"dir/flink").await.unwrap();
+	assert!(vfs.symlink_metadata("mem://root/dir/flink").await.is_err());
+	assert!(vfs.metadata("mem://root/dir/c%20d.txt").await.is_ok(), "the target stays");
+	for rel in ["dir/c d.txt", "dir/new", "dir/fifo"] {
+		s.remove_file_beneath(&root, rel.as_bytes()).await.unwrap();
+	}
+	s.remove_dir_beneath(&root, b"dir").await.unwrap();
+	assert!(vfs.symlink_metadata("mem://root/dir").await.is_err());
+	for rel in NOT_WALK_RELATIVE {
+		let err = s
+			.write_file_beneath(&root, rel.as_bytes(), b"x")
+			.await
+			.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{rel:?}");
+		let err = s
+			.remove_file_beneath(&root, rel.as_bytes())
+			.await
+			.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{rel:?}");
+	}
+}
+
 /// Directories and FIFOs are rejected as not regular, and opening a FIFO
 /// does not wait for a writer.
 #[tokio::test(flavor = "multi_thread")]
@@ -193,16 +657,16 @@ async fn open_file_rejects_dirs_and_special_files() {
 	let fs = Fs::native();
 	let mut s = fs.session();
 	let dir = s.open_dir(&tmp.0).await.unwrap();
-	let err = s.open_file_at(&dir, b"dir").await.unwrap_err();
+	let err = s.open_file_at(&dir, b"dir", false).await.unwrap_err();
 	assert!(is_not_regular(&err), "{err:?}");
 	assert!(is_not_regular(&s.open_file(&tmp.0.join("dir")).await.unwrap_err()));
-	let missing = s.open_file_at(&dir, b"missing").await.unwrap_err();
+	let missing = s.open_file_at(&dir, b"missing", false).await.unwrap_err();
 	assert_eq!(missing.kind(), io::ErrorKind::NotFound);
 	assert!(!is_not_regular(&missing));
 	#[cfg(unix)]
 	{
 		mkfifo(&tmp.0.join("fifo"));
-		assert!(is_not_regular(&s.open_file_at(&dir, b"fifo").await.unwrap_err()));
+		assert!(is_not_regular(&s.open_file_at(&dir, b"fifo", false).await.unwrap_err()));
 		assert!(is_not_regular(&s.open_file(&tmp.0.join("fifo")).await.unwrap_err()));
 	}
 }
@@ -222,8 +686,8 @@ async fn read_into_honours_limit_and_open_time_size() {
 	assert_eq!((data.as_slice(), info.size), (&b"0123456789"[..], 10));
 
 	// Growth after open is not read; a file empty at open is read to EOF.
-	let (mut grown, _) = s.open_file_at(&dir, b"f").await.unwrap();
-	let (mut was_empty, info) = s.open_file_at(&dir, b"empty").await.unwrap();
+	let (mut grown, _) = s.open_file_at(&dir, b"f", false).await.unwrap();
+	let (mut was_empty, info) = s.open_file_at(&dir, b"empty", false).await.unwrap();
 	assert_eq!(info.size, 0);
 	std::fs::write(&path, b"0123456789abcdef").unwrap();
 	std::fs::write(tmp.0.join("empty"), b"late").unwrap();
@@ -245,6 +709,45 @@ async fn read_into_honours_limit_and_open_time_size() {
 	}
 	assert_eq!(streamed, b"0123456789abcdef");
 	assert_eq!(read_all(&mut s, &dir, "f", 0).await.0, b"");
+}
+
+/// `read_more` continues from the bytes already read without reading them
+/// again, honours the limit in all, and stops at the open-time size, for
+/// native and provider files.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_more_continues_at_the_end_of_what_was_read() {
+	let tmp = TempDir::new("read-more");
+	let path = tmp.write("f", b"0123456789");
+	let mut s = Fs::native().session();
+	let dir = s.open_dir(&tmp.0).await.unwrap();
+	let (mut file, _) = s.open_file_at(&dir, b"f", false).await.unwrap();
+	let mut buf = Vec::new();
+	file.read_into(&mut buf, 4).await.unwrap();
+	assert_eq!(buf, b"0123");
+	// Rewrite the file in place: the first four bytes are not read again, and
+	// the growth past the open-time size is not read.
+	std::fs::write(&path, b"abcdefghijklmnop").unwrap();
+	file.read_more(&mut buf, 6).await.unwrap();
+	assert_eq!(buf, b"0123ef");
+	file.read_more(&mut buf, u64::MAX).await.unwrap();
+	assert_eq!(buf, b"0123efghij");
+	file.read_more(&mut buf, u64::MAX).await.unwrap();
+	assert_eq!(buf, b"0123efghij");
+
+	let (_mem, vfs) = MemFs::with_files(&[("mem://root/f", "0123456789")]);
+	let mut s = Fs::Provider(vfs).session();
+	let dir = s.open_dir(Path::new("mem://root")).await.unwrap();
+	let (mut file, _) = s.open_file_at(&dir, b"f", false).await.unwrap();
+	file.read_into(&mut buf, 3).await.unwrap();
+	assert_eq!(buf, b"012");
+	file.read_more(&mut buf, 7).await.unwrap();
+	assert_eq!(buf, b"0123456");
+	// A stream read moves the provider's position; `read_more` still
+	// continues at `buf.len()`.
+	let mut chunk = [0u8; 2];
+	assert_eq!(file.read(&mut chunk).await.unwrap(), 2);
+	file.read_more(&mut buf, u64::MAX).await.unwrap();
+	assert_eq!(buf, b"0123456789");
 }
 
 /// Short reads continue until the open-time size, without a confirming
@@ -280,6 +783,79 @@ fn read_into_short_reads() {
 	})
 	.unwrap();
 	assert_eq!(buf, b"abcdef");
+}
+
+/// A size the allocator refuses fails the read with `OutOfMemory`, as
+/// `std::fs::read` fails, instead of aborting the process; nothing is read.
+#[test]
+fn a_size_the_allocator_refuses_fails_with_out_of_memory() {
+	let mut buf = Vec::new();
+	let err =
+		fill(&mut buf, 1 << 62, u64::MAX, |_, _| panic!("read before the reservation")).unwrap_err();
+	assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err:?}");
+	assert!(buf.is_empty());
+}
+
+/// A 1 PiB sparse file, a size the allocator refuses (beyond the address
+/// space), fails `read_into` with `OutOfMemory`, and the session reads the
+/// next file as before.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_a_sparse_file_beyond_the_address_space_fails_with_out_of_memory() {
+	let (_files, dir, huge, small) = sparse_files();
+	let mut s = Fs::native().session();
+	let dir = s.open_dir(&dir).await.unwrap();
+	let (mut file, info) = s.open_file_at(&dir, huge.as_bytes(), true).await.unwrap();
+	assert_eq!(info.size, 1 << 50);
+	let mut buf = Vec::new();
+	let err = file.read_into(&mut buf, u64::MAX).await.unwrap_err();
+	assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err:?}");
+	let (mut file, _) = s.open_file_at(&dir, small.as_bytes(), true).await.unwrap();
+	file.read_into(&mut buf, u64::MAX).await.unwrap();
+	assert_eq!(buf, b"small");
+}
+
+/// What keeps a 1 PiB sparse file and a file holding `small`, the directory
+/// they are in, and their names there. On Linux both are memfds, named by
+/// their descriptors in `/proc/self/fd`: a memfd lies on tmpfs, which holds a
+/// 1 PiB file on any machine, and a temporary directory need not. ext4
+/// refuses a file over 16 TiB (`EFBIG`), and a gVisor 9p mount of ext4 takes
+/// the truncation and keeps the size 0.
+#[cfg(target_os = "linux")]
+fn sparse_files() -> (impl Sized, PathBuf, String, String) {
+	use std::{
+		io::Write as _,
+		os::fd::{AsRawFd as _, FromRawFd as _},
+	};
+	let memfd = |name: &std::ffi::CStr| {
+		// SAFETY: `name` is NUL-terminated and outlives the call.
+		let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+		assert!(fd >= 0, "memfd_create: {}", io::Error::last_os_error());
+		// SAFETY: `memfd_create` returned a fresh descriptor owned from here.
+		unsafe { std::fs::File::from_raw_fd(fd) }
+	};
+	let huge = memfd(c"huge");
+	huge
+		.set_len(1 << 50)
+		.expect("tmpfs holds a 1 PiB sparse file");
+	let mut small = memfd(c"small");
+	small.write_all(b"small").unwrap();
+	let names = (huge.as_raw_fd().to_string(), small.as_raw_fd().to_string());
+	([huge, small], PathBuf::from("/proc/self/fd"), names.0, names.1)
+}
+
+/// [`sparse_files`] in a temporary directory, whose filesystem must hold a
+/// 1 PiB sparse file (APFS does).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn sparse_files() -> (impl Sized, PathBuf, String, String) {
+	let tmp = TempDir::new("huge");
+	tmp.write("small", b"small");
+	let huge = std::fs::File::create(tmp.0.join("huge")).unwrap();
+	huge
+		.set_len(1 << 50)
+		.expect("a 1 PiB sparse file in the temporary directory");
+	let dir = tmp.0.clone();
+	(tmp, dir, "huge".to_owned(), "small".to_owned())
 }
 
 /// Pseudo files report size 0 yet have contents.
@@ -385,8 +961,8 @@ async fn provider_lists_and_reads_url_trees() {
 	assert_eq!(buf, b"hel");
 	assert_eq!(read_all(&mut s, &dir, "a b.txt", 2).await.0, b"he");
 
-	assert!(is_not_regular(&s.open_file_at(&dir, b"dir").await.unwrap_err()));
-	assert!(is_not_regular(&s.open_file_at(&dir, b"fifo").await.unwrap_err()));
+	assert!(is_not_regular(&s.open_file_at(&dir, b"dir", false).await.unwrap_err()));
+	assert!(is_not_regular(&s.open_file_at(&dir, b"fifo", false).await.unwrap_err()));
 	assert!(s.open_child(&dir, b"link").await.is_err());
 	let child = s.open_child(&dir, b"dir").await.unwrap();
 	let (data, _) = read_all(&mut s, &child, "c.txt", 4).await;
@@ -426,5 +1002,58 @@ async fn sessions_refuse_foreign_dirs() {
 	let host_dir = native.open_dir(&tmp.0).await.unwrap();
 	let mem_dir = provider.open_dir(Path::new("mem://r")).await.unwrap();
 	assert!(native.list(&mem_dir, Detail::Minimal, 0).await.is_err());
-	assert!(provider.open_file_at(&host_dir, b"a").await.is_err());
+	assert!(provider.open_file_at(&host_dir, b"a", false).await.is_err());
+}
+
+/// A provider that serves every path from the host
+/// ([`pi_vfs::FileSystem::is_native_local`]): its facade routes each path
+/// call to the host, so none of its own calls is made.
+#[derive(Debug)]
+struct AllHostLocal;
+
+#[async_trait::async_trait]
+impl pi_vfs::FileSystem for AllHostLocal {
+	fn is_native_local(&self, _path: &Path) -> bool {
+		true
+	}
+
+	async fn open(&self, _path: &Path, _options: &pi_vfs::OpenOptions) -> io::Result<pi_vfs::File> {
+		Err(pi_vfs::unsupported("open"))
+	}
+
+	async fn metadata(&self, _path: &Path) -> io::Result<pi_vfs::Metadata> {
+		Err(pi_vfs::unsupported("metadata"))
+	}
+
+	async fn read_dir(&self, _path: &Path) -> io::Result<pi_vfs::ReadDir> {
+		Err(pi_vfs::unsupported("read_dir"))
+	}
+}
+
+/// A provider session opens a directory by path as a path on its facade, as
+/// it did before directory handles, also where the facade serves the path
+/// from the host: the directory stays the session's own kind, and its
+/// listing and opens go through the facade's calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_sessions_open_directories_as_facade_paths() {
+	let tmp = TempDir::new("by-path");
+	tmp.write("sub/f.txt", b"ok");
+	let vfs = pi_vfs::Fs::new(std::sync::Arc::new(AllHostLocal));
+	let mut s = Fs::Provider(vfs).session();
+	for unlinked in [false, true] {
+		let dir = if unlinked {
+			s.open_dir_unlinked(&tmp.0).await.unwrap()
+		} else {
+			s.open_dir(&tmp.0).await.unwrap()
+		};
+		assert!(!dir.holds_descriptor(), "a provider session opened a host descriptor");
+		assert_eq!(names(s.list(&dir, Detail::Minimal, 0).await.unwrap()), [(
+			"sub".to_owned(),
+			FileType::Dir
+		)]);
+		let sub = s.open_child(&dir, b"sub").await.unwrap();
+		assert!(!sub.holds_descriptor());
+		let (data, _) = read_all(&mut s, &sub, "f.txt", 16).await;
+		assert_eq!(data, b"ok");
+	}
 }

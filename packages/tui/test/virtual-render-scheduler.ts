@@ -92,6 +92,18 @@ export class VirtualRenderScheduler implements RenderScheduler {
 		await this.settle(term);
 	}
 
+	/**
+	 * Run every frame the engine owes, whatever its due time, until nothing is
+	 * queued or armed. For assertions about where a multi-frame pipeline ends
+	 * rather than how far a window gets: a pressure retirement that crosses
+	 * TranscriptContainer's wall-clock budget offers the rest on later frames,
+	 * so on a loaded machine it takes more frames than a `settle` window holds.
+	 * A loop that keeps re-arming throws after MAX_ROUNDS rounds.
+	 */
+	async runUntilIdle(term: VirtualTerminal): Promise<void> {
+		await this.#drain(term, () => Number.POSITIVE_INFINITY);
+	}
+
 	async #drain(term: VirtualTerminal, deadline: () => number): Promise<void> {
 		for (let round = 0; round < MAX_ROUNDS; round++) {
 			if (!this.#runImmediates() && !this.#runDue(deadline())) return;

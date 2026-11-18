@@ -15,7 +15,12 @@ import type { WordCompletionEngine, WordPredictionBackend } from "@oh-my-pi/pi-t
 import { compareVersions, getAgentDir, logger, ptree, VERSION } from "@oh-my-pi/pi-utils";
 import { daemonClientForGlobal } from "../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../launch/ensure";
-import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
+import {
+	ompDaemonSpecEnv,
+	resolveWorkerSpawnCmd,
+	SMOKE_TEST_TIMEOUT_MS,
+	workerEnvFromParent,
+} from "../subprocess/worker-client";
 import { prefetchSmolLmWeights } from "./smollm-weights";
 import {
 	TEXT_PREDICT_AGENT_DIR_ENV,
@@ -170,7 +175,7 @@ async function ensureDaemon(agentDir: string): Promise<DaemonConnection> {
 					name,
 					application: spawn.cmd[0]!,
 					args: spawn.cmd.slice(1),
-					env: { [TEXT_PREDICT_SOCKET_ENV]: endpoint, [TEXT_PREDICT_AGENT_DIR_ENV]: agentDir },
+					env: ompDaemonSpecEnv({ [TEXT_PREDICT_SOCKET_ENV]: endpoint, [TEXT_PREDICT_AGENT_DIR_ENV]: agentDir }),
 					cwd: spawn.cwd ?? broker.projectDir,
 					pty: false,
 					ready: { log: TEXT_PREDICT_READY_PATTERN, timeoutMs: READY_TIMEOUT_MS },

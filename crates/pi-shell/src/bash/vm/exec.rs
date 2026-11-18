@@ -737,20 +737,21 @@ fn run_boundary(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
 		super::mode::set_mode(&mut k.root, cx.store, vp, mode);
 	}
 	let run = vp.runs.front_mut().expect("present");
-	if vp.overlay.is_none() {
+	if vp.image.is_none() {
 		if let Some(args) = run.args.take() {
 			k.root.set_positional(cx.store, args);
 		}
 		if let Some(cwd) = run.cwd.take() {
-			k.root.set_misc(cx.store, MiscKey::Cwd, cwd.clone());
-			k.root
-				.set_var(cx.store, b"PWD", Some(Var::scalar(cwd.clone(), Attrs::EXPORT)));
+			if !matches!(state::root_misc(cx.store, MiscKey::Cwd), Ok(Some(v)) if v == cwd.as_slice())
+			{
+				k.root.set_misc(cx.store, MiscKey::Cwd, cwd.clone());
+			}
+			set_root_global(k, cx.store, b"PWD", Var::scalar(cwd.clone(), Attrs::EXPORT));
 			vp.cwd = cwd;
 		}
 		for (name, value) in std::mem::take(&mut run.env) {
 			if is_ident(&name) {
-				k.root
-					.set_var(cx.store, &name, Some(Var::scalar(value, Attrs::EXPORT)));
+				set_root_global(k, cx.store, &name, Var::scalar(value, Attrs::EXPORT));
 			}
 		}
 		// `$-` shows `c` for a `-c` string, `s` for a script on stdin.
@@ -759,7 +760,12 @@ fn run_boundary(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
 			Origin::Stdin => "s",
 			_ => "",
 		};
-		k.root.set_misc(cx.store, MiscKey::RunOrigin, flag);
+		// Unchanged (the common case): no write, so the forks that share the
+		// root's records keep sharing them.
+		if !matches!(state::root_misc(cx.store, MiscKey::RunOrigin), Ok(Some(v)) if v == flag.as_bytes())
+		{
+			k.root.set_misc(cx.store, MiscKey::RunOrigin, flag);
+		}
 	}
 	let from_stdin = matches!(run.chain.links[0].origin, Origin::Stdin);
 	let mut kind = FrameKind::script(&run.src, Pos::START, ScriptKind::Run);
@@ -769,7 +775,7 @@ fn run_boundary(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
 	vp.frames.push(Frame::new(None, 0, kind));
 	// zsh `parseargs`: commands read from standard input set `shinstdin`.
 	if from_stdin
-		&& vp.overlay.is_none()
+		&& vp.image.is_none()
 		&& vp.mode.dialect() == Dialect::Zsh
 		&& let Err(err) = state::set_zsh_option(&mut k.root, cx.store, vp, ZshOpt::Shinstdin, true)
 	{
@@ -828,9 +834,38 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	}
 }
 
-/// Write queued diagnostics; the fd that would block, if any. Write errors
-/// on a diagnostic stream are dropped, as bash does.
-pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
+/// Write queued diagnostics (`Kernel::diag`, xtrace lines, `fc -s`'s echo);
+/// the fd that would block, if any. An entry is done once it is written and
+/// the object that took its bytes has settled them
+/// ([`crate::bash::File::poll_settle_marked`], the entry's
+/// [`HandedOff`](super::proc::HandedOff)), so a command that runs next (an
+/// external that inherits the fd, a builtin writing to another fd of the
+/// same pipe) comes after it. That object, not whatever the fd names by
+/// then: a failed compound redirection restores the fds between the write
+/// and the settle. The chunk handed off last settles before the next one
+/// goes, and an entry stops at its first failed chunk; write errors on a
+/// diagnostic stream are dropped, as bash does.
+pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
+	// The shell's job notices still going out to its terminal come first
+	// ([`jobctl::notice`]): zsh wrote them with blocking writes.
+	if super::jobctl::shout_waits(k, vp) {
+		return Some(super::zle::tty::FD);
+	}
+	flush_queued(k, vp)
+}
+
+/// [`flush_out`] without waiting for the shell's job notices: for a
+/// failed compound redirection's message, which belongs on the fd 2 its
+/// redirections left. The `Redir` op restores the fds in the same step,
+/// right after this ([`clear_scratch`]), and cannot wait in between: an op
+/// that waits runs again, which would try the failed redirection again and
+/// print its message twice. No notice can be pending there: the op's wait
+/// on entry returns only with the notices out and the editor's bytes
+/// written, and nothing between it and the failure (`redir::apply`)
+/// queues a notice. So this does what [`flush_out`] would; it is kept so
+/// that a notice a later change queues there still leaves the message on
+/// the redirected fd 2.
+fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	use super::zle::tty;
 	// The editor's display bytes still pending were queued before anything
 	// in `vp.out` (later ones wait in it, as `tty::FD` entries): the
@@ -840,13 +875,22 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	{
 		return Some(tty::FD);
 	}
-	let mut cx = Context::from_waker(&k.waker);
+	if vp.out.is_empty() {
+		return None;
+	}
+	let waker = k.waker.clone();
+	let mut cx = Context::from_waker(&waker);
 	while let Some(w) = vp.out.front_mut() {
 		if w.fd == tty::FD {
 			if let Some(t) = vp.zle.as_deref_mut().and_then(|z| z.tty.as_mut()) {
 				t.put(&w.bytes[w.off..]);
-				vp.out.pop_front();
-				if t.flush(k).is_some() {
+				pop_out(k, vp);
+				if vp
+					.zle
+					.as_deref_mut()
+					.and_then(|z| z.tty.as_mut())
+					.is_some_and(|t| t.flush(k).is_some())
+				{
 					return Some(tty::FD);
 				}
 				continue;
@@ -854,20 +898,51 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 			// No editor any more: its fallback, standard error.
 			w.fd = 2;
 		}
-		match vp.fds.handle(w.fd).poll_write(&mut cx, &w.bytes[w.off..]) {
-			Poll::Ready(Ok(n)) if n > 0 => {
+		let handle = vp.fds.handle(w.fd);
+		let done = w.off >= w.bytes.len();
+		// The chunk handed off last is out before the next one goes; what
+		// another object took (the fd was restored in between) is out there
+		// before the rest goes to this one.
+		if let Some(held) = &w.handed.file
+			&& (done || !held.same(&handle) || w.handed.mark.is_some())
+		{
+			let Poll::Ready(settled) = held.poll_settle_marked(&mut cx, w.handed.mark.as_slice())
+			else {
+				return Some(w.fd);
+			};
+			w.handed = super::proc::HandedOff::default();
+			if settled.is_err() {
+				pop_out(k, vp);
+				continue;
+			}
+		}
+		if done {
+			pop_out(k, vp);
+			continue;
+		}
+		match handle.poll_write_marked(&mut cx, &w.bytes[w.off..]) {
+			Poll::Ready(Ok((n, mark))) if n > 0 => {
 				w.off += n;
-				if w.off >= w.bytes.len() {
-					vp.out.pop_front();
-				}
+				w.handed.mark = mark;
+				w.handed.file.get_or_insert(handle);
 			},
 			Poll::Ready(_) => {
-				vp.out.pop_front();
+				pop_out(k, vp);
 			},
 			Poll::Pending => return Some(w.fd),
 		}
 	}
 	None
+}
+
+/// The front of `vp.out` is out (written and settled, or dropped): pop it,
+/// and continue the job it held back ([`PendingWrite::then_continue`]).
+fn pop_out(k: &mut Kernel, vp: &mut Vproc) {
+	if let Some(w) = vp.out.pop_front()
+		&& let Some(id) = w.cont
+	{
+		super::jobctl::continue_job(k, id);
+	}
 }
 
 /// Grammar switches from the current options (also `zpty`'s parse of its
@@ -1512,8 +1587,7 @@ pub(crate) fn hend_output(
 	}
 	if let Some(mut line) = out.print {
 		line.push(b'\n');
-		vp.out
-			.push_back(PendingWrite { fd: 2, bytes: line, off: 0 });
+		vp.out.push_back(PendingWrite::new(2, line));
 	}
 	*run = out.run;
 }
@@ -2979,31 +3053,53 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::Redir => match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
-			Ok(()) => {
-				let saves = match top_frame(vp).scratch.take() {
-					Some(mut sc) => {
-						let saves = sc
-							.io
-							.as_mut()
-							.map_or_default(|io| std::mem::take(&mut io.saved));
-						drop_scratch(&mut k.root, cx.store, vp, sc);
-						saves
-					},
-					None => Vec::new(),
-				};
-				top_frame(vp).redirs.push(saves);
-				Flow::Next
-			},
-			Err(redir::Halt::Flow(f)) => f,
-			Err(redir::Halt::Failed) => {
-				// The message goes to stderr as the redirections so far left
-				// it; what would block is written after the restore.
-				let _ = flush_out(k, vp);
-				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = 1;
-				Flow::Jump(op.b)
-			},
+		Opcode::Redir => {
+			// The shell's output to its terminal goes first: its job notices
+			// still going out and the editor's display bytes, as zsh's
+			// blocking writes ordered them ([`flush_out`]; `vp.out` is empty
+			// when an op starts, [`run_slice`]). Waited for on every entry,
+			// before the list goes on: on the first, before any redirection
+			// is applied, and after the op parked mid-way (on a substitution
+			// in a target), for a notice queued meanwhile. No redirection
+			// moves the terminal, so a failed redirection's message comes
+			// after them and goes to the fd 2 the redirections left.
+			if let Some(fd) = flush_out(k, vp) {
+				return Flow::Block(WaitKey::Write { fd });
+			}
+			match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
+				Ok(()) => {
+					let saves = match top_frame(vp).scratch.take() {
+						Some(mut sc) => {
+							let saves = sc
+								.io
+								.as_mut()
+								.map_or_default(|io| std::mem::take(&mut io.saved));
+							drop_scratch(&mut k.root, cx.store, vp, sc);
+							saves
+						},
+						None => Vec::new(),
+					};
+					top_frame(vp).redirs.push(saves);
+					Flow::Next
+				},
+				Err(redir::Halt::Flow(f)) => f,
+				Err(redir::Halt::Failed) => {
+					// The message goes to stderr as the redirections so far left
+					// it; what would block is written after the restore. No notice
+					// can be pending here: the wait on entry returned with the
+					// notices out, and `redir::apply` queues none. The hand-off
+					// ([`jobctl::drain_shout`]) and the write without the notice
+					// gate ([`flush_queued`]) are kept for a notice a later change
+					// queues in between: it goes to the terminal first, and the
+					// message still goes to the fd 2 the redirections left, since
+					// the restore follows in this step.
+					super::jobctl::drain_shout(k);
+					let _ = flush_queued(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = 1;
+					Flow::Jump(op.b)
+				},
+			}
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {
@@ -3338,9 +3434,7 @@ fn time_end(
 		end.sys.saturating_sub(start.sys),
 	];
 	match time_report(&format, times) {
-		Ok(text) => vp
-			.out
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 }),
+		Ok(text) => vp.out.push_back(PendingWrite::new(2, text.into())),
 		Err(c) => {
 			let msg = format!("TIMEFORMAT: `{}': invalid format character", char::from(c));
 			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
@@ -3385,8 +3479,7 @@ fn zsh_time_end(
 		text.extend_from_slice(&zsh_time_report(&format, b"children", children));
 		text
 	};
-	vp.out
-		.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
+	vp.out.push_back(PendingWrite::new(2, text.into()));
 }
 
 /// zsh's default `TIMEFMT` (`DEFAULT_TIMEFMT`).
@@ -4266,6 +4359,15 @@ pub fn job_control(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	!vp.jobs.subshell && state::option(&mut k.root, cx.store, vp, OptId::Monitor).unwrap_or(false)
 }
 
+/// Set root global `name` to `var` unless it already holds it: the forks
+/// sharing the root's records keep sharing them, and a saved state stays
+/// unchanged.
+fn set_root_global(k: &mut Kernel, store: &mut dyn StateStore, name: &[u8], var: Var) {
+	if !matches!(state::global(store, name), Ok(Some(v)) if *v == var) {
+		k.root.set_var(store, name, Some(var));
+	}
+}
+
 /// On Windows, an asynchronous command without job control ignores
 /// `SIGINT` (and in zsh `SIGQUIT`), as zsh (`entersubsh` with
 /// `ESUB_ASYNC`) and bash (`setup_async_signals`) have it: the keyboard's
@@ -4276,6 +4378,11 @@ pub fn job_control(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// `SIGQUIT`, which it does not list, is not modelled. A bash subshell cannot
 /// trap the ignore away (it was ignored on entry, [`MiscKey::HardIgnored`]);
 /// zsh's can. Elsewhere the dispositions are left as they are.
+///
+/// Every asynchronous command forked from the same records gets the same
+/// ones back: the first one's are kept ([`Kernel::async_ignored`]) and
+/// shared by the next while one of them lives, rather than each copying its
+/// parent's.
 fn ignore_async_signals(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc) {
 	use crate::bash::Signal;
 	if k.engine.config().platform != crate::bash::ids::Platform::Windows {
@@ -4287,8 +4394,21 @@ fn ignore_async_signals(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc) {
 		&[Signal::Int]
 	};
 	for &sig in sigs {
+		child.own_traps = child.own_traps.with(TrapKey::Signal(sig));
+	}
+	let Some(image) = child.image.as_mut() else {
+		return;
+	};
+	if let Some((mode, from, to)) = &k.async_ignored
+		&& *mode == child.mode
+		&& image.shares_records(from)
+		&& image.set_records(to)
+	{
+		return;
+	}
+	let from = image.records();
+	for &sig in sigs {
 		let key = TrapKey::Signal(sig);
-		child.own_traps = child.own_traps.with(key);
 		let record = Record::Trap { mode: child.mode, action: BString::default() };
 		state::store_record(&mut k.root, cx.store, child, KeyBuf::Trap(key), Some(record));
 	}
@@ -4309,6 +4429,9 @@ fn ignore_async_signals(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc) {
 			KeyBuf::Misc(MiscKey::HardIgnored),
 			Some(record),
 		);
+	}
+	if let Some(image) = &child.image {
+		k.async_ignored = Some((child.mode, from, image.records()));
 	}
 }
 
@@ -4783,11 +4906,11 @@ fn push_trap(
 }
 
 /// Which of the DEBUG, ERR and RETURN traps may have an action somewhere
-/// (the store or a vproc's overlay). [`start_trap`] asks
+/// (the store or a vproc's image). [`start_trap`] asks
 /// before each command and each function return; with no such trap set
 /// (the common case) it answers without frame scans, option reads or
 /// store lookups. Bits are only ever set: `trap` sets the key's bit when
-/// it installs an action, a restore sets all (restored overlays), and the
+/// it installs an action, a restore sets all (restored images), and the
 /// store's own records are read once per store epoch. A trap reset
 /// later keeps its bit; the full check then decides, as before.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4809,12 +4932,12 @@ impl PseudoTraps {
 		}
 	}
 
-	/// `trap` installed an action for `key` (in the root or an overlay).
+	/// `trap` installed an action for `key` (in the root or an image).
 	pub const fn note(&mut self, key: TrapKey) {
 		self.bits |= Self::bit(key);
 	}
 
-	/// Any pseudo-trap may be set (restored overlays are not inspected).
+	/// Any pseudo-trap may be set (restored images are not inspected).
 	pub const fn note_all(&mut self) {
 		self.bits = 7;
 	}

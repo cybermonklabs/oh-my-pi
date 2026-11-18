@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { IpcConnection } from "@oh-my-pi/pi-natives";
 import { getGlobalDaemonRuntimeDir, isEexist, isEnoent, logger, postmortem, toError } from "@oh-my-pi/pi-utils";
-import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
+import { brokerEnvFromParent, resolveWorkerSpawnCmd } from "../subprocess/worker-client";
 import { canonicalProjectDir, daemonBrokerEndpoint, daemonRuntimeDir } from "./paths";
 import {
 	DAEMON_BROKER_WORKER_ARG,
@@ -285,9 +285,11 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			// the socket.
 		}
 		this.#spawnBroker();
-		const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+		// The monotonic clock: a step of the wall clock neither holds the wait for
+		// the broker past CONNECT_TIMEOUT_MS nor ends it early.
+		const deadline = performance.now() + CONNECT_TIMEOUT_MS;
 		let lastError: Error | undefined;
-		while (Date.now() < deadline) {
+		while (performance.now() < deadline) {
 			try {
 				this.#bindSocket(await IpcConnection.connect(this.#endpoint, { framing: "lines", timeoutMs: 250 }));
 				return;
@@ -312,7 +314,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		if (this.#idleGraceMs !== undefined) overlay[DAEMON_IDLE_GRACE_ENV] = String(this.#idleGraceMs);
 		const child = Bun.spawn(spawn.cmd, {
 			cwd: spawn.cwd,
-			env: workerEnvFromParent(overlay),
+			env: brokerEnvFromParent(overlay),
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+memchr = "2.7.4"
 parking_lot.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -22,6 +23,12 @@ xattr = "1.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
+	"Wdk_Foundation",
+	"Wdk_Storage_FileSystem",
 	"Win32_Foundation",
+	"Win32_Security",
 	"Win32_Storage_FileSystem",
+	"Win32_System_IO",
+	"Win32_System_Kernel",
+	"Win32_System_WindowsProgramming",
 ] }

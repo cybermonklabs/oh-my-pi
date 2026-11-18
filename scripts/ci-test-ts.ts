@@ -3,6 +3,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createTestChildEnv } from "./test-env";
 
 type Mode =
 	| "all"
@@ -93,6 +94,8 @@ const fastWorkspacePackages = [
 	"packages/snapcompact",
 	"packages/agent",
 	"packages/mnemopi",
+	"packages/stats",
+	"packages/metaharness",
 ];
 
 // These suites cover the native package, TUI/browser-ish behavior, local servers,
@@ -450,11 +453,15 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 	}
 }
 
-// Child env shared by every spawned test process: the parent env with the
-// private test-runtime marker set, all CI credential / cloud-config variables
-// scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared. Clearing it
-// would also clear run-rs-task.ts's "always run in GitHub Actions" rule for the
-// Rust child, so under GitHub Actions OMP_FORCE_RUST_TASKS carries it instead.
+// Child env shared by every spawned test process: the test environment of
+// scripts/test-env.ts (the parent env without the developer's machine-dependent
+// names, omp directories and git and jj configuration of its own, the real `git`
+// first on PATH and the test-runtime marker; the test preload applies it again in
+// each process), all CI credential / cloud-config variables scrubbed (see
+// SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared.
+// Clearing it would also clear run-rs-task.ts's "always run in GitHub Actions"
+// rule for the Rust child, so under GitHub Actions OMP_FORCE_RUST_TASKS carries
+// it instead.
 //
 // GC knobs (both needed — they gate different JSC mechanisms):
 // - `BUN_JSC_useConcurrentGC=0` stops the collector from marking concurrently
@@ -475,20 +482,17 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 // cell), where no marker/concurrency knob applies. That residual crash is
 // handled by retrying crashed chunks in a fresh process (MAX_CHUNK_ATTEMPTS).
 function buildChildEnv(): Record<string, string | undefined> {
-	const env: Record<string, string | undefined> = {
-		...Bun.env,
+	const unscrubbed: Record<string, string | undefined> = {};
+	for (const [key, value] of Object.entries(Bun.env)) {
+		if (!isScrubbedEnvVar(key)) unscrubbed[key] = value;
+	}
+	return {
+		...createTestChildEnv(unscrubbed),
 		GITHUB_ACTIONS: "",
 		...(Bun.env.GITHUB_ACTIONS === "true" ? { OMP_FORCE_RUST_TASKS: "1" } : {}),
-		PI_TEST_RUNTIME: "1",
 		BUN_JSC_useConcurrentGC: "0",
 		BUN_JSC_numberOfGCMarkers: "1",
 	};
-	for (const key of Object.keys(env)) {
-		if (isScrubbedEnvVar(key)) {
-			delete env[key];
-		}
-	}
-	return env;
 }
 
 // Per-chunk watchdog. A bun child that wedges (e.g. the panic handler

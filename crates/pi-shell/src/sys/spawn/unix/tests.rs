@@ -3,11 +3,11 @@
 
 use std::{
 	io,
-	os::unix::process::CommandExt,
+	os::{fd::AsRawFd as _, unix::process::CommandExt},
 	sync::Arc,
 	task::{Context, Poll, Wake, Waker},
 	thread,
-	time::{Duration, Instant},
+	time::Duration,
 };
 
 use bstr::{BString, ByteSlice};
@@ -25,7 +25,11 @@ use crate::{
 	},
 };
 
-const LONG: Duration = Duration::from_secs(20);
+/// The parked tests' park timeout: past the runner's bound, so only a wake
+/// (the exit) ends a park, and a test whose wake never comes is failed by
+/// the test runner (`.config/nextest.toml`), never by a bound of its own.
+#[cfg(target_os = "linux")]
+const POLL: Duration = crate::testkit::child::LIFETIME;
 
 /// A detached external is signalled through its session, whose group exists
 /// only after the child's own `setsid`. A signal sent before that (`kill $!`
@@ -54,24 +58,19 @@ impl Wake for Unpark {
 fn wait(p: &mut Box<dyn ExtProc>) -> ExitStatus {
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let mut cx = Context::from_waker(&waker);
-	let deadline = Instant::now() + LONG;
 	loop {
 		if let Poll::Ready(s) = p.poll_wait(&mut cx) {
 			return s;
 		}
-		assert!(Instant::now() < deadline, "process did not finish");
 		thread::park_timeout(Duration::from_millis(50));
 	}
 }
 
-/// Poll `cond` until it holds; the elapsed time.
-fn until(what: &str, mut cond: impl FnMut() -> bool) -> Duration {
-	let start = Instant::now();
+/// Poll `cond` until it holds.
+fn until(_what: &str, mut cond: impl FnMut() -> bool) {
 	while !cond() {
-		assert!(start.elapsed() < LONG, "timed out waiting for {what}");
 		thread::sleep(Duration::from_millis(5));
 	}
-	start.elapsed()
 }
 
 fn argv(words: &[&str]) -> Vec<BString> {
@@ -128,6 +127,55 @@ fn live_group(pgid: i32) -> Vec<proc::ProcInfo> {
 	let mut m = proc::group_members(pgid).unwrap();
 	m.retain(|p| p.state != ProcState::Zombie);
 	m
+}
+
+/// The identity (pid and start) of each of `procs`, whatever its state.
+fn ids(procs: &[proc::ProcInfo]) -> Vec<(i32, u64)> {
+	let mut ids: Vec<_> = procs.iter().map(|p| (p.pid, p.start)).collect();
+	ids.sort_unstable();
+	ids
+}
+
+/// The record of the one escalation `s` started, once both its KILL step
+/// and the sweep after it ran. Waits as long as that takes: the escalation
+/// scans the process table, which takes seconds on a host with many
+/// processes, so a deadline here would measure the host, not the
+/// escalation (one that never ends hangs the test until the runner's
+/// timeout).
+fn escalated(s: &NativeSpawner) -> super::Escalation {
+	loop {
+		let all = s.escalations();
+		assert!(all.len() <= 1, "one external, one escalation: {all:?}");
+		if let Some(done) = all
+			.into_iter()
+			.find(|e| e.fired.as_ref().is_some_and(|f| f.swept.is_some()))
+		{
+			return done;
+		}
+		thread::sleep(Duration::from_millis(5));
+	}
+}
+
+/// What escalation `e` of an external that still ran when it was dropped
+/// recorded at its KILL step: it was due exactly `grace` after the drop (the
+/// schedule, whatever the host's speed) and ran no earlier, with the
+/// processes alive then (`alive`, what TERM left) and KILL sent to the
+/// scope. Returns how long after the drop it ran, for the log.
+fn assert_killed_after(
+	e: &super::Escalation,
+	grace: Duration,
+	alive: &[proc::ProcInfo],
+) -> Duration {
+	let fired = e.fired.as_ref().expect("the KILL step ran");
+	assert!(e.running, "the external ran when dropped: {e:?}");
+	let due = fired.due.duration_since(e.abandoned);
+	assert_eq!(fired.due, e.abandoned + grace, "KILL was due {due:?} after the drop, not {grace:?}");
+	assert!(fired.at >= fired.due, "the KILL step ran before it was due: {e:?}");
+	let after = fired.at.duration_since(e.abandoned);
+	let found = fired.alive.as_deref().expect("the scope was read");
+	assert_eq!(ids(found), ids(alive), "alive when KILL was due: {found:?}");
+	assert!(fired.killed, "KILL went to the scope: {e:?}");
+	after
 }
 
 /// An engine-side file without an OS handle: a byte source, a capture, or a
@@ -314,13 +362,13 @@ fn missing_program_fails_with_not_found_on_both_paths() {
 
 /// A script without `#!` cannot be exec'd: the spawn must fail with the
 /// kernel's ENOEXEC intact, so the host can run it in-engine as bash does.
+/// [`crate::testprog`] writes the script from a child, so no fork by another
+/// test's thread holds it open for writing (which fails the spawn with
+/// ETXTBSY instead).
 #[test]
 fn shebang_less_script_fails_with_enoexec_on_both_paths() {
-	use std::os::unix::fs::PermissionsExt;
-
 	let path = std::env::temp_dir().join(format!("obash-noexec-{}", std::process::id()));
-	std::fs::write(&path, b"echo inscript $1\n").unwrap();
-	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&path, "echo inscript $1\n");
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
 	let a = vec![BString::from(path.as_os_str().as_encoded_bytes()), BString::from("arg")];
@@ -503,10 +551,6 @@ fn live(pid: i32) -> bool {
 	proc::info(pid).is_some_and(|i| !matches!(i.state, ProcState::Zombie | ProcState::Stopped))
 }
 
-fn gone(pid: i32) -> bool {
-	proc::info(pid).is_none_or(|i| i.state == ProcState::Zombie)
-}
-
 /// The first child of `parent` (the scan sees it once it has forked).
 fn child_of(parent: i32) -> proc::ProcInfo {
 	let mut found = None;
@@ -520,16 +564,42 @@ fn child_of(parent: i32) -> proc::ProcInfo {
 /// Non-interactive bash layout: the child shares the host's group and
 /// session (so it keeps the controlling terminal), `PgroupSpec` is ignored,
 /// and signals, stop and cont reach the child alone, never the shared group.
+///
+/// The host is a process of its own, in a process group of its own: this
+/// test stops a child in the host's group, and a group with a stopped member
+/// is one the kernel may hang up. gVisor before 553528ee ("Only signal a
+/// process group's stopped members when it becomes orphaned") sends SIGHUP
+/// and SIGCONT to every member of an orphaned group with a stopped member
+/// each time any member leaves it; the test binary's own group is orphaned
+/// when it runs under `setsid`, and other tests' children leave it all the
+/// time, so the binary died of SIGHUP. In a group of its own, whose parent is
+/// in another group of the same session, the group is not orphaned and holds
+/// no other test's children.
 #[test]
 fn inherit_keeps_the_hosts_group_and_signals_only_the_child() {
+	const NAME: &str =
+		"sys::spawn::unix::tests::inherit_keeps_the_hosts_group_and_signals_only_the_child";
+	const ALONE: &str = "PI_SHELL_TEST_ALONE";
+	if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+		let (status, out, err) = run_alone(NAME, ALONE, Duration::from_secs(60));
+		let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+		let Some(status) = status else {
+			panic!("the run of its own did not end within 60 s; its group was killed:\n{out}\n{err}");
+		};
+		assert!(status.success(), "the run of its own failed ({status}):\n{out}\n{err}");
+		assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+		return;
+	}
+	assert_eq!(pgid(0), std::process::id() as i32, "the host leads a group of its own");
 	let env = EnvView::default();
 	let s = spawner(Sessions::Inherit, Duration::from_secs(2));
-	let a = sh("/bin/sleep 30 & wait");
+	let sleep = crate::testkit::child::on_path("sleep");
+	let a = sh(&format!("{sleep} 30 & wait"));
 	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid();
 	assert_eq!((pgid(pid), sid(pid)), (pgid(0), our_sid()), "host's group and session");
 	let grandchild = child_of(pid as i32);
-	let b = argv(&["/bin/sleep", "30"]);
+	let b = argv(&[sleep.as_str(), "30"]);
 	let mut joined = s.spawn(spec(&b, &env, PgroupSpec::Join(pid))).unwrap();
 	assert_eq!(pgid(joined.pid()), pgid(0), "Join is ignored too");
 	joined.signal(Signal::Kill).unwrap();
@@ -545,35 +615,108 @@ fn inherit_keeps_the_hosts_group_and_signals_only_the_child() {
 	assert_eq!(wait(&mut p), ExitStatus::Signaled(Signal::Kill));
 	assert!(live(grandchild.pid), "the grandchild is outside the child's scope");
 	assert!(proc::signal_pinned(&grandchild, Signal::Kill).unwrap());
-	until("grandchild gone", || gone(grandchild.pid));
+	until("grandchild gone", || proc::ended(grandchild.pid));
+}
+
+/// Run this binary's test `name` alone (`--exact`, the marker `alone` set to
+/// it), in a process group of its own, for up to `bound`: its exit status
+/// (`None` past `bound`, when its whole group is killed) and what it wrote to
+/// stdout and stderr so far. The pipes are read on threads of their own, so
+/// a full pipe cannot stop the run, and output a process outside its group
+/// keeps open cannot keep this waiting.
+fn run_alone(
+	name: &str,
+	alone: &str,
+	bound: Duration,
+) -> (Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>) {
+	use std::{io::Read, process::Stdio, time::Instant};
+	fn reader(
+		mut pipe: impl Read + Send + 'static,
+	) -> (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+		let got = Arc::new(Mutex::new(Vec::new()));
+		let into = Arc::clone(&got);
+		let thread = thread::spawn(move || {
+			let mut buf = [0u8; 4096];
+			while let Ok(n @ 1..) = pipe.read(&mut buf) {
+				into.lock().extend_from_slice(&buf[..n]);
+			}
+		});
+		(got, thread)
+	}
+	let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+		.args(["--exact", name, "--nocapture", "--test-threads=1"])
+		.env(alone, name)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.process_group(0)
+		.spawn()
+		.unwrap();
+	let group = i32::try_from(child.id()).unwrap();
+	let (out, out_thread) = reader(child.stdout.take().unwrap());
+	let (err, err_thread) = reader(child.stderr.take().unwrap());
+	let deadline = Instant::now() + bound;
+	let status = loop {
+		if let Some(status) = child.try_wait().unwrap() {
+			break Some(status);
+		}
+		if Instant::now() >= deadline {
+			// SAFETY: kill takes integer ids; the group is the run's own.
+			unsafe { libc::kill(-group, libc::SIGKILL) };
+			child.wait().unwrap();
+			break None;
+		}
+		thread::sleep(Duration::from_millis(10));
+	};
+	// The pipes close once every process of the run's group is gone; give
+	// the readers a moment for the last bytes, never a wait without end.
+	let drained = Instant::now() + Duration::from_secs(5);
+	while !(out_thread.is_finished() && err_thread.is_finished()) && Instant::now() < drained {
+		thread::sleep(Duration::from_millis(10));
+	}
+	let (out, err) = (out.lock().clone(), err.lock().clone());
+	(status, out, err)
+}
+
+/// A child of the test, killed when dropped (also when the test fails).
+struct Bystander(std::process::Child);
+
+impl Drop for Bystander {
+	fn drop(&mut self) {
+		let _ = self.0.kill();
+		let _ = self.0.wait();
+	}
 }
 
 /// The abandon escalation (TERM, KILL after the grace) targets the child's
-/// pid: a process sharing the host's group survives it.
+/// pid: a process sharing the host's group survives it. The `sleep`s never
+/// end by themselves while the test runs, however slow the host.
 #[test]
 fn inherit_abandon_escalation_spares_the_hosts_group() {
 	let grace = Duration::from_millis(300);
 	let env = EnvView::default();
 	let s = spawner(Sessions::Inherit, grace);
-	let mut bystander = std::process::Command::new("/bin/sleep")
-		.arg("30")
-		.spawn()
-		.unwrap();
-	assert_eq!(pgid(bystander.id()), pgid(0));
+	let mut bystander = Bystander(
+		crate::testkit::child::dies_with_this_process(std::process::Command::new("sleep").arg("600"))
+			.spawn()
+			.unwrap(),
+	);
+	assert_eq!(pgid(bystander.0.id()), pgid(0));
 	// `exec` keeps the ignored TERM: one process that only KILL ends.
-	let a = sh("trap '' TERM; exec /bin/sleep 30");
+	let a = sh(&format!("trap '' TERM; exec {} 600", crate::testkit::child::on_path("sleep")));
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid() as i32;
 	until("exec'd", || proc::info(pid).is_some_and(|i| i.name == "sleep"));
-	let start = Instant::now();
+	let child = proc::info(pid).expect("the child runs");
 	drop(p);
-	thread::sleep(grace / 2);
-	assert!(live(pid), "TERM is ignored, KILL waits for the grace");
-	until("child killed", || gone(pid));
-	assert!(start.elapsed() >= grace);
-	assert!(bystander.try_wait().unwrap().is_none(), "nothing was sent to the host's process group");
-	bystander.kill().unwrap();
-	bystander.wait().unwrap();
+	// TERM is ignored: the child still ran when KILL was due, and KILL went
+	// to its pid.
+	assert_killed_after(&escalated(&s), grace, std::slice::from_ref(&child));
+	until("child killed", || proc::ended(pid));
+	assert!(
+		bystander.0.try_wait().unwrap().is_none(),
+		"nothing was sent to the host's process group"
+	);
 }
 
 /// Reaping retires a process-only leak scope before its pid can be reused.
@@ -615,7 +758,13 @@ fn stop_and_cont_reach_every_member_of_the_group() {
 	let a = sh("/bin/sleep 30 & /bin/sleep 30 & wait");
 	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
-	until("three members", || live_group(group).len() == 3);
+	// Both sleeps run `sleep` before the stop: gVisor's `execve` discards a
+	// stop signal still pending when it replaces the image (Linux keeps it),
+	// so a member stopped during its exec would run on.
+	until("three members, both sleeps exec'd", || {
+		let members = live_group(group);
+		members.len() == 3 && members.iter().filter(|m| m.name == "sleep").count() == 2
+	});
 	p.stop().unwrap();
 	until("all stopped", || {
 		live_group(group)
@@ -634,13 +783,13 @@ fn stop_and_cont_reach_every_member_of_the_group() {
 }
 
 /// Cancel of a running external: TERM to the group at once, KILL after the
-/// grace. Observe the fixture, not a full process-table scan that can itself
-/// outlast the grace on a busy host.
-fn abandon_escalates(grace: Duration) -> Duration {
+/// grace, as the escalation recorded it (not how long the group took to go,
+/// which a busy host stretches).
+fn abandon_escalates(grace: Duration) {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Share, grace);
 	// The trap makes sh and the sleep it starts ignore TERM.
-	let a = sh("trap '' TERM; /bin/sleep 30; exit 0");
+	let a = sh(&format!("trap '' TERM; {} 600; exit 0", crate::testkit::child::on_path("sleep")));
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
 	let mut members = Vec::new();
@@ -648,24 +797,11 @@ fn abandon_escalates(grace: Duration) -> Duration {
 		members = live_group(group);
 		members.len() == 2
 	});
-	let start = Instant::now();
 	drop(p);
-	until("group killed", || {
-		let mut killed = true;
-		for member in &members {
-			let gone = proc::info(member.pid)
-				.is_none_or(|now| now.start != member.start || now.state == ProcState::Zombie);
-			if gone {
-				assert!(start.elapsed() >= grace, "KILL before the grace: pid {}", member.pid);
-			}
-			killed &= gone;
-		}
-		killed
-	});
-	let measured = start.elapsed();
-	eprintln!("TERM→KILL escalation: grace {grace:?}, measured {measured:?}");
-	assert!(measured >= grace, "KILL before the grace: {measured:?}");
-	measured
+	// Both still ran when KILL was due; KILL went to the group.
+	let after = assert_killed_after(&escalated(&s), grace, &members);
+	until("group killed", || live_group(group).is_empty());
+	eprintln!("TERM→KILL escalation: grace {grace:?}, KILL step {after:?} after the drop");
 }
 
 /// A detached external (`nohup`) dropped while it runs is released, not
@@ -675,18 +811,19 @@ fn abandon_escalates(grace: Duration) -> Duration {
 fn dropped_detached_external_runs_on_and_is_no_leftover() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Detach, Duration::from_millis(100));
-	let a = argv(&["/bin/sleep", "30"]);
+	let sleep = crate::testkit::child::on_path("sleep");
+	let a = argv(&[sleep.as_str(), "30"]);
 	let mut detached = spec(&a, &env, NEW);
 	detached.lineage = crate::bash::Lineage { label: 7, detached: true };
 	let p = s.spawn(detached).unwrap();
 	let pid = p.pid() as i32;
 	assert!(s.leftovers().unwrap().is_empty(), "a detached external is no leak");
 	drop(p);
-	thread::sleep(Duration::from_millis(400));
-	assert!(live(pid), "released, not killed after the grace");
+	assert!(s.escalations().is_empty(), "released, not abandoned: no escalation started");
+	assert!(live(pid), "released, not killed");
 	// SAFETY: plain syscall; the pid is unreaped while the sleep runs.
 	assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-	until("reaped after its exit", || proc::info(pid).is_none());
+	until("reaped after its exit", || !proc::exists(pid));
 }
 
 /// The shell tears down while a detached external runs: its `ExtProc` is
@@ -706,9 +843,7 @@ fn output_written_after_the_extproc_is_dropped_still_arrives() {
 	drop(s.spawn(sp).unwrap());
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let cx = Context::from_waker(&waker);
-	let deadline = Instant::now() + LONG;
 	while out.captured() != b"late\n" {
-		assert!(Instant::now() < deadline, "late output lost: {:?}", out.captured());
 		NativeSpawner::poll_orphans(&cx);
 		thread::park_timeout(Duration::from_millis(50));
 	}
@@ -716,51 +851,60 @@ fn output_written_after_the_extproc_is_dropped_still_arrives() {
 
 #[test]
 fn abandoned_external_is_killed_after_a_short_grace() {
-	let grace = Duration::from_millis(300);
-	let measured = abandon_escalates(grace);
-	assert!(measured < grace + Duration::from_secs(1), "KILL late: {measured:?}");
+	abandon_escalates(Duration::from_millis(300));
 }
 
 #[test]
 fn abandoned_external_is_killed_after_the_default_grace() {
-	let measured = abandon_escalates(SpawnConfig::DEFAULT_GRACE);
-	assert!(measured < SpawnConfig::DEFAULT_GRACE + Duration::from_secs(1), "{measured:?}");
+	abandon_escalates(SpawnConfig::DEFAULT_GRACE);
 }
 
 #[test]
 fn abandon_sends_term_to_the_whole_group_at_once() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Share, Duration::from_secs(60));
-	let a = sh("/bin/sleep 30 & /bin/sleep 30 & wait");
+	let sleep = crate::testkit::child::on_path("sleep");
+	let a = sh(&format!("{sleep} 600 & {sleep} 600 & wait"));
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
 	until("members up", || live_group(group).len() == 3);
 	drop(p);
-	let t = until("group terminated", || live_group(group).is_empty());
-	assert!(t < Duration::from_secs(5), "TERM did not reach the group: {t:?}");
+	until("group terminated", || live_group(group).is_empty());
+	// TERM ended the whole group: the escalation's KILL step, due a minute
+	// after the drop, had not run when it was gone.
+	let all = s.escalations();
+	assert!(all.len() == 1 && all[0].running && all[0].fired.is_none(), "{all:?}");
 }
 
 #[test]
 fn abandoning_a_paused_job_still_terminates_it() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Detach, Duration::from_secs(60));
-	let a = argv(&["/bin/sleep", "30"]);
+	let sleep = crate::testkit::child::on_path("sleep");
+	let a = argv(&[sleep.as_str(), "30"]);
 	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid() as i32;
 	p.stop().unwrap();
 	until("stopped", || proc::info(pid).is_some_and(|i| i.state == ProcState::Stopped));
 	drop(p);
-	until("terminated", || proc::info(pid).is_none_or(|i| i.state == ProcState::Zombie));
+	until("terminated", || proc::ended(pid));
 }
 
 #[test]
 fn a_scripts_term_does_not_escalate() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Detach, Duration::from_millis(100));
-	let a = sh("trap '' TERM; while :; do /bin/sleep 1; done");
-	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
+	// `cat` reads the test's gate to end of file: the script ends with a killed
+	// test, where a loop of sleeps that ignores TERM would live on. The `:`
+	// keeps `sh` from running `cat` in its own place.
+	let gate = crate::testkit::child::Gate::new();
+	let a = sh("trap '' TERM; /bin/cat; :");
+	let mut sp = spec(&a, &env, NEW);
+	let gate_reader = gate.reader();
+	sp.stdio[0] = StdioSpec::Inherit(OsHandle(u64::try_from(gate_reader.as_raw_fd()).unwrap()));
+	let mut p = s.spawn(sp).unwrap();
 	let pid = p.pid() as i32;
-	// The first sleep is forked after the trap is set: TERM is ignored now.
+	// `cat` is forked after the trap is set: TERM is ignored now.
 	until("trap set", || {
 		proc::session_members(pid)
 			.unwrap()
@@ -1008,6 +1152,135 @@ fn input_waiting_for_engine_bytes_is_dropped_with_the_child() {
 	drop(p);
 	assert_eq!(Arc::strong_count(&silent.0), 1, "the drop released it at once");
 	until("the abandoned child is gone", || s.leftovers().unwrap().is_empty());
+}
+
+/// A waker that counts its wakes and unparks the test's thread.
+struct Wakes {
+	count:  std::sync::atomic::AtomicUsize,
+	thread: thread::Thread,
+}
+
+impl Wake for Wakes {
+	fn wake(self: Arc<Self>) {
+		self.wake_by_ref();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		self.thread.unpark();
+	}
+}
+
+/// A host file without an OS handle that hands the child one line; at its
+/// next read it waits until the poller's waker was woken twice, then has
+/// nothing. The two wakes are the waiter thread's report of the child's
+/// exit: `Tracker::exited` cancels the input pumps, then records the exit,
+/// waking the poller each time. So the exit is recorded while the poll of
+/// the pumps that read the cancel still runs, in every run: the child
+/// cannot exit before it has the line, which comes after that read.
+/// Counts its live copies.
+#[derive(Clone)]
+struct OneLine {
+	alive: Arc<()>,
+	wakes: Arc<Wakes>,
+	sent:  Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OneLine {
+	fn new(wakes: &Arc<Wakes>) -> Self {
+		Self { alive: Arc::new(()), wakes: Arc::clone(wakes), sent: Arc::default() }
+	}
+}
+
+impl File for OneLine {
+	fn poll_read(&mut self, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		use std::sync::atomic::Ordering::SeqCst;
+		if !self.sent.swap(true, SeqCst) {
+			buf[..3].copy_from_slice(b"go\n");
+			return Poll::Ready(Ok(3));
+		}
+		// Each wake unparks this thread, which polls the pumps: the test's
+		// own thread. Only the runner bounds a waiter that never reports.
+		while self.wakes.count.load(SeqCst) < 2 {
+			thread::park();
+		}
+		Poll::Pending
+	}
+
+	fn poll_write(&mut self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+		Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+	}
+
+	fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		Poll::Ready(Ok(()))
+	}
+
+	fn seek(&mut self, _pos: io::SeekFrom) -> io::Result<u64> {
+		Err(io::ErrorKind::Unsupported.into())
+	}
+
+	fn kind(&self) -> FileKind {
+		FileKind::Pipe
+	}
+
+	fn os_handle(&self) -> Option<OsHandle> {
+		None
+	}
+
+	fn dup(&self) -> io::Result<Box<dyn File>> {
+		Ok(Box::new(self.clone()))
+	}
+}
+
+/// `sh -c 'read x; exit 3'` with [`OneLine`] as its stdin, under a waiter
+/// thread (`Exits::Thread`), and the waker the input polls count.
+fn reads_one_line(s: &NativeSpawner) -> (Box<dyn ExtProc>, OneLine, Arc<Wakes>) {
+	let env = EnvView::default();
+	let wakes = Arc::new(Wakes { count: 0.into(), thread: thread::current() });
+	let input = OneLine::new(&wakes);
+	let a = sh("read x; exit 3");
+	let mut sp = spec(&a, &env, NEW);
+	sp.stdio = [StdioSpec::File(Box::new(input.clone())), StdioSpec::Null, StdioSpec::Null];
+	(s.spawn(sp).unwrap(), input, wakes)
+}
+
+/// The waiter can record the exit after `poll_wait` read the input pumps'
+/// cancel and before it polls the exit ([`OneLine`] makes it so). The
+/// exit is reported only once the input pump is gone, with the engine
+/// object it reads.
+#[test]
+fn an_exit_recorded_during_the_pump_poll_is_reported_without_the_input_pump() {
+	let s = NativeSpawner::default();
+	let (mut p, input, wakes) = reads_one_line(&s);
+	let waker = Waker::from(Arc::clone(&wakes));
+	let polled = p.poll_wait(&mut Context::from_waker(&waker));
+	assert_eq!(polled, Poll::Ready(ExitStatus::Exited(3)), "one poll sees the exit");
+	assert_eq!(
+		Arc::strong_count(&input.alive),
+		1,
+		"the exit was reported while the input pump held the engine object"
+	);
+}
+
+/// [`an_exit_recorded_during_the_pump_poll_is_reported_without_the_input_pump`]
+/// through `poll_event`, job control's poll.
+#[test]
+fn an_exit_event_recorded_during_the_pump_poll_comes_without_the_input_pump() {
+	use crate::bash::ProcEvent;
+	let s = NativeSpawner::default();
+	let (mut p, input, wakes) = reads_one_line(&s);
+	let waker = Waker::from(Arc::clone(&wakes));
+	let polled = p.poll_event(&mut Context::from_waker(&waker));
+	assert_eq!(
+		polled,
+		Poll::Ready(ProcEvent::Exited(ExitStatus::Exited(3))),
+		"one poll sees the exit"
+	);
+	assert_eq!(
+		Arc::strong_count(&input.alive),
+		1,
+		"the exit event came while the input pump held the engine object"
+	);
 }
 
 #[test]
@@ -1413,24 +1686,25 @@ fn parked_spawner(grace: Duration) -> NativeSpawner {
 	})
 }
 
-/// Drive `p` as `obash` does: poll with the parker's waker, park in between.
+/// Drive `p` as `obash` does: poll with the parker's waker, park in
+/// between. The park's timeout is only how long it sleeps before polling
+/// again; the exit is what ends the wait.
 #[cfg(target_os = "linux")]
 fn wait_parked(parker: &mut crate::sys::Parker, p: &mut Box<dyn ExtProc>) -> ExitStatus {
 	let waker = parker.waker().clone();
 	let mut cx = Context::from_waker(&waker);
-	let deadline = Instant::now() + LONG;
 	loop {
 		if let Poll::Ready(s) = p.poll_wait(&mut cx) {
 			return s;
 		}
-		assert!(Instant::now() < deadline, "process did not finish");
-		parker.park(LONG);
+		parker.park(POLL);
 	}
 }
 
-/// The exit itself ends the park (a pidfd in the poll set), long before the
-/// park's timeout; no waiter thread is involved; the status is exact and
-/// the process is reaped once its `ExtProc` is dropped.
+/// The exit itself ends the park (a pidfd in the poll set): the park's own
+/// [`POLL`] timeout is past the runner's bound, so a park the exit did not
+/// wake fails the test. No waiter thread is involved; the status is exact
+/// and the process is reaped once its `ExtProc` is dropped.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_parked_external_wakes_the_parker_at_its_exit() {
@@ -1444,12 +1718,10 @@ fn a_parked_external_wakes_the_parker_at_its_exit() {
 		let a = sh(script);
 		let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 		let pid = p.pid() as i32;
-		let start = Instant::now();
 		assert_eq!(wait_parked(&mut parker, &mut p), status, "{script}");
-		assert!(start.elapsed() < LONG / 2, "woken by the exit, not the timeout");
-		assert!(proc::info(pid).is_some(), "unreaped while the ExtProc lives");
+		assert!(proc::exists(pid), "unreaped while the ExtProc lives");
 		drop(p);
-		assert!(proc::info(pid).is_none(), "reaped on drop");
+		assert!(!proc::exists(pid), "reaped on drop");
 	}
 }
 
@@ -1490,14 +1762,14 @@ fn parked_externals_are_reaped_after_abandon_and_work_without_a_parker() {
 	let env = EnvView::default();
 	let s = parked_spawner(Duration::from_millis(300));
 	let parker = crate::sys::Parker::new();
-	let a = sh("trap '' TERM; exec /bin/sleep 30");
+	let a = sh(&format!("trap '' TERM; exec {} 30", crate::testkit::child::on_path("sleep")));
 	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid() as i32;
 	let waker = parker.waker().clone();
 	assert!(p.poll_wait(&mut Context::from_waker(&waker)).is_pending());
 	until("exec'd", || proc::info(pid).is_some_and(|i| i.name == "sleep"));
 	drop(p);
-	until("killed and reaped", || proc::info(pid).is_none());
+	until("killed and reaped", || !proc::exists(pid));
 	drop(parker);
 
 	let a = sh("exit 7");

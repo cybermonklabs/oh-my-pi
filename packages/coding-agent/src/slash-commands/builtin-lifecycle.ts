@@ -4,7 +4,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
 import { logger, setProjectDir } from "@oh-my-pi/pi-utils";
+import { reset as resetCapabilities } from "../capability";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
+import { loadSlashCommands } from "../extensibility/slash-commands";
 import { rebindMemoryBackendForCwd } from "../hindsight/backend";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-backend";
 import { continuesConversation } from "../modes/utils/conversation-position";
@@ -65,7 +67,8 @@ function formatWorkspaceDirectories(runtime: SlashCommandRuntime, note?: string)
 }
 async function fatalMoveFailure(text: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	await runtime.output(text);
-	await runtime.session.dispose();
+	// A failed move ends the session, not the process ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
+	await runtime.session.dispose({ ownedJobsEnd: "stop" });
 	return commandConsumed();
 }
 
@@ -802,6 +805,9 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			} catch (err) {
 				return usage(`Worktree creation failed: ${errorMessage(err)}`, runtime);
 			}
+			for (const note of worktree.notes ?? []) {
+				await runtime.output(`Note: ${note}`);
+			}
 			const failure = await relocateHeadlessSession(runtime, worktree.path);
 			if (failure) return failure;
 			const cleanup = await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings);
@@ -912,7 +918,18 @@ async function rescopeHeadlessToCwd(runtime: SlashCommandRuntime, cwd: string): 
 	const src = discoverTitleSystemPromptFile(cwd);
 	const p = await resolvePromptInput(src, "title system prompt");
 	runtime.session.setTitleSystemPrompt(p);
-	await runtime.session.refreshSkillsAndCommands();
+	resetCapabilities();
+	// Slash commands only — no `refreshSkillsAndCommands()` here:
+	// `runtime.reloadPlugins()` below refreshes skills in every implementation
+	// (RPC `reloadPluginState`, ACP `#reloadPluginState`, TUI
+	// `reloadTuiPluginState`), and `refreshSkills` emits `resources_discover`
+	// (reason "reload") — refreshing skills here too ran every reload handler
+	// twice per `/move`.
+	const cmds = await loadSlashCommands({
+		cwd,
+		extensionRoots: runtime.session.effectiveExtensionRoots,
+	});
+	runtime.session.setSlashCommands(cmds);
 	await runtime.refreshCommands?.();
 	await runtime.reloadPlugins();
 }

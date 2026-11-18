@@ -5,9 +5,10 @@ use std::{collections::VecDeque, sync::Arc};
 use bstr::BString;
 use serde::{Deserialize, Serialize};
 
-use super::state::{Overlay, Scope};
+use super::state::Scope;
 pub use crate::bash::store::{Job, JobState};
 use crate::bash::{
+	Image,
 	event::{OriginChain, ResolvedKind, WaitKey},
 	fd::{FdRef, FdTable},
 	fs::{FsPending, Stat},
@@ -19,7 +20,7 @@ use crate::bash::{
 	syntax::Pos,
 };
 
-/// A green thread: its scripts, frames, fds, cwd and state overlay.
+/// A green thread: its scripts, frames, fds, cwd and global state.
 pub struct Vproc {
 	pub vpid:          Vpid,
 	pub parent:        Option<Vpid>,
@@ -35,8 +36,13 @@ pub struct Vproc {
 	pub status:        i32,
 	/// `PIPESTATUS` of the last pipeline.
 	pub pipestatus:    Vec<i32>,
-	/// `None` for the root vproc (writes go to the root cache).
-	pub overlay:       Option<Overlay>,
+	/// A forked vproc's global state: its parent's at the fork, then its
+	/// own writes (copy-on-write; see `state`). `None` for the root vproc,
+	/// whose global state is the store.
+	pub image:         Option<Image>,
+	/// A forked vproc's locale-variable count (`state::locale_token`): the
+	/// root's at the fork, `None` once it assigned a locale variable.
+	pub locale_gen:    Option<u64>,
 	/// Diagnostics waiting to be written to their fds.
 	pub out:           VecDeque<PendingWrite>,
 	pub blocked:       Option<Blocked>,
@@ -86,7 +92,7 @@ pub struct Vproc {
 	/// substitution.
 	pub trace_base:    u32,
 	/// `$BASH_SUBSHELL`: the subshell nesting (0 for the shell itself and a
-	/// nested shell). A field, not an overlay record: a record would cost
+	/// nested shell). A field, not an image record: a record would cost
 	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
 	pub subshell:      u32,
 	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
@@ -809,6 +815,10 @@ pub struct Run {
 	pub env:               Vec<(BString, BString)>,
 	pub started:           bool,
 	pub exit_trap_started: bool,
+	/// [`Script::too_long_to_host`](super::Script::too_long_to_host).
+	pub too_long_to_host:  bool,
+	/// [`Script::refusals_to_host`](super::Script::refusals_to_host).
+	pub refusals_to_host:  bool,
 }
 
 /// What kind of activation a frame is.
@@ -1128,10 +1138,54 @@ pub enum TryEnd {
 /// Bytes still to be written to an fd.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingWrite {
-	pub fd:    i32,
-	pub bytes: BString,
-	pub off:   usize,
+	pub fd:     i32,
+	pub bytes:  BString,
+	pub off:    usize,
+	/// Where the bytes handed off so far went ([`HandedOff`]).
+	#[serde(skip)]
+	pub handed: HandedOff,
+	/// A job to continue (`SIGCONT`) once everything queued before this
+	/// entry is out (bash `bg` prints the job, then continues it): an entry
+	/// of no bytes ([`Self::then_continue`]), kept when a write to its fd
+	/// fails.
+	#[serde(default)]
+	pub cont:   Option<JobId>,
 }
+
+impl PendingWrite {
+	/// `bytes` for fd `fd`, nothing written yet.
+	pub fn new(fd: i32, bytes: BString) -> Self {
+		Self { fd, bytes, off: 0, handed: HandedOff::default(), cont: None }
+	}
+
+	/// Continue job `id` once what is queued before this entry is out.
+	pub fn then_continue(id: JobId) -> Self {
+		Self { cont: Some(id), ..Self::new(1, BString::default()) }
+	}
+}
+
+/// Where a [`PendingWrite`]'s bytes went once handed off: the object that
+/// took them, and the [`Mark`](crate::bash::Mark) of the chunk its writer
+/// thread took last ([`crate::bash::File::poll_write_marked`]). The writer
+/// settles that chunk before it hands the next one to the same object, so
+/// it stops at its first failed chunk and holds one mark at most; the entry
+/// is done once its last chunk has settled. The fd may name another object
+/// by then (a redirection restored in between), and another writer on the
+/// same object may have chunks of its own in flight. Live state of one host
+/// file: not saved, and not part of the entry's value.
+#[derive(Clone, Debug, Default)]
+pub struct HandedOff {
+	pub file: Option<crate::bash::FdRef>,
+	pub mark: Option<crate::bash::Mark>,
+}
+
+impl PartialEq for HandedOff {
+	fn eq(&self, _: &Self) -> bool {
+		true
+	}
+}
+
+impl Eq for HandedOff {}
 
 /// One logged expansion step (see `expand`): replaying the log reproduces
 /// an expansion that parked on a command substitution without repeating
@@ -1698,6 +1752,10 @@ pub enum Live {
 	Open(Box<dyn FsPending<Box<dyn crate::bash::fs::File>>>),
 	/// The opened file of a `Read` probe.
 	File(Box<dyn crate::bash::fs::File>),
+	/// The opened file of a `history` write, with what its writer thread
+	/// took and has not written yet
+	/// ([`Unsettled::poll_write_file`](crate::bash::Unsettled::poll_write_file)).
+	Write(Box<(Box<dyn crate::bash::fs::File>, crate::bash::Unsettled)>),
 	Task(Box<dyn Task>),
 	Ext(Box<dyn ExtProc>),
 	/// [`Host::spawn`](crate::bash::Host::spawn) of the external of a
@@ -1737,6 +1795,7 @@ impl Live {
 			Self::Fd(live) => live.is_idempotent(),
 			Self::Fs(live) => live.idempotent,
 			Self::File(file) => file.kind() == crate::bash::fs::FileKind::Regular,
+			Self::Write(w) => w.0.kind() == crate::bash::fs::FileKind::Regular,
 			// Network traffic is not asked twice.
 			Self::Task(_) | Self::Ext(_) | Self::Timer(_) | Self::Zftp(_) | Self::None => false,
 		}

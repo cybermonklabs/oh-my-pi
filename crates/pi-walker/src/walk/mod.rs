@@ -20,9 +20,13 @@
 //! Directories open relative to their parent's handle, ignore files are read
 //! only when a listing contains them, unchanged directories are served from
 //! the process-wide listing cache ([`cache`]), and consumers open files
-//! relative to the directory handle streamed with each [`Batch`]. Entry paths
-//! are carved from pooled arenas, so steady-state walking allocates a few
-//! objects per directory, not per entry.
+//! relative to the directory handle streamed with each [`Batch`]. A walk that
+//! does not follow symlinks opens nothing through one: where a listing
+//! carries no handle (a cached listing, or past the walk's handle limit),
+//! entries open below the walk root's handle with no symlink followed on the
+//! way ([`Session::open_file_beneath`]). Entry paths are carved from pooled
+//! arenas, so steady-state walking allocates a few objects per directory, not
+//! per entry.
 //!
 //! ```ignore
 //! let mut walk = walk::walk(&fs, root, &opts, |_, entry, out: &mut Vec<usize>| {
@@ -60,7 +64,7 @@ pub use tree::{Event, Follow, Order, Tree, TreeEntry, TreeOptions};
 
 pub(crate) use self::parallel::Sink;
 use self::{arena::Arena, parallel::Stored};
-use crate::fs::{Detail, Dir, FileType, Fs, Session};
+use crate::fs::{Detail, Dir, File, FileInfo, FileType, Fs, Session};
 
 /// A caller's handle on one walk's stop flag ([`Options::stop`]).
 ///
@@ -133,7 +137,11 @@ pub struct Options {
 	/// Report symlinks as their targets (type, size, mtime) and descend into
 	/// linked directories. Dangling links, links to special files, and links
 	/// to a directory enclosing them (which would loop) are left out. The
-	/// root itself is always resolved through symlinks.
+	/// root itself is always resolved through symlinks. Without it, the walk
+	/// opens no directory and no ignore file inside the root through a
+	/// symlink, also one swapped in after the listing, and [`Batch`]
+	/// consumers open files the same way ([`Session::open_file_at`] without
+	/// `follow`, [`Session::open_file_beneath`] below [`Walk::root_dir`]).
 	pub follow_links:      bool,
 	/// Listing metadata; [`Detail::Full`] is needed for sizes and mtimes.
 	pub detail:            Detail,
@@ -264,11 +272,14 @@ impl std::error::Error for WalkError {
 	}
 }
 
-/// The walking task, as seen by visitors and filters: path math only.
+/// The walking task, as seen by visitors and filters: path math, and opens of
+/// listed files as the walk reaches them.
 pub struct Worker<'w> {
-	fs:   &'w Fs,
-	root: &'w Path,
-	abs:  &'w mut PathBuf,
+	fs:       &'w Fs,
+	root:     &'w Path,
+	abs:      &'w mut PathBuf,
+	/// The open root of a walk that does not follow symlinks.
+	root_dir: Option<&'w Dir>,
 }
 
 impl Worker<'_> {
@@ -285,15 +296,32 @@ impl Worker<'_> {
 		join_into(self.fs, self.root, rel, self.abs);
 		self.abs.as_path()
 	}
+
+	/// Opens the regular file at the walk-relative `rel` without its
+	/// directory's handle: below the walk root's handle with no symlink
+	/// followed on the way ([`Session::open_file_beneath`]) in a walk that
+	/// does not follow symlinks, by absolute path in one that does.
+	pub(crate) async fn open_file(
+		&mut self,
+		session: &mut Session,
+		rel: &[u8],
+	) -> io::Result<(File, FileInfo)> {
+		match self.root_dir {
+			Some(root) => session.open_file_beneath(root, rel).await,
+			None => session.open_file(self.abs_rel(rel)).await,
+		}
+	}
 }
 
 /// One directory's outputs and the open directory they were listed from.
 #[derive(Debug)]
 pub struct Batch<T> {
 	/// The listed directory, so consumers can open files relative to it
-	/// (`session.open_file_at(dir, name)`); `None` when the listing came
-	/// from the cache or the walk holds too many handles open already, in
-	/// which case files open by path.
+	/// (`session.open_file_at(dir, name, follow_links)`); `None` when the
+	/// listing came from the cache or the walk holds too many handles open
+	/// already, in which case files open below [`Walk::root_dir`]
+	/// (`session.open_file_beneath(root, rel)`), or by path in a walk that
+	/// follows symlinks.
 	pub dir:   Option<Arc<Dir>>,
 	/// What the visitor pushed for the directory; never empty.
 	pub items: Vec<T>,
@@ -345,14 +373,15 @@ pub(crate) async fn walk_sink<K: Sink>(
 	let (tx, rx) = mpsc::channel(opts.parallelism(fs) * BATCHES_PER_WORKER);
 	let started =
 		parallel::start(fs, root, opts, sink, false, default_cache(fs, opts), Some(tx)).await?;
-	Ok(Walk { rx, halt: started.halt })
+	Ok(Walk { rx, root_dir: started.root_dir(), halt: started.halt })
 }
 
 /// A running [`walk`]: per-directory output batches in no particular order.
 /// Dropping it cancels the walk.
 pub struct Walk<T> {
-	rx:   mpsc::Receiver<Batch<T>>,
-	halt: parallel::Halt,
+	rx:       mpsc::Receiver<Batch<T>>,
+	root_dir: Option<Arc<Dir>>,
+	halt:     parallel::Halt,
 }
 
 impl<T> Stream for Walk<T> {
@@ -368,6 +397,13 @@ impl<T> Stream for Walk<T> {
 }
 
 impl<T> Walk<T> {
+	/// The open walk root, for opening the files of a [`Batch`] that carries
+	/// no directory ([`Session::open_file_beneath`]); `None` for a walk that
+	/// follows symlinks, whose files open by path.
+	pub const fn root_dir(&self) -> Option<&Arc<Dir>> {
+		self.root_dir.as_ref()
+	}
+
 	/// Directories below the root that could not be read; complete once the
 	/// stream has ended.
 	pub fn into_errors(self) -> Vec<DirError> {
@@ -378,10 +414,12 @@ impl<T> Walk<T> {
 /// Entries kept by a [`collect`], owning their paths in shared arenas.
 #[derive(Debug, Default)]
 pub struct Collection {
-	entries: Vec<Stored>,
+	entries:  Vec<Stored>,
 	/// Owners of every `entries` path; never read directly.
-	_arenas: Vec<Arena>,
-	errors:  Vec<DirError>,
+	_arenas:  Vec<Arena>,
+	errors:   Vec<DirError>,
+	/// The open root of a walk that does not follow symlinks.
+	root_dir: Option<Arc<Dir>>,
 }
 
 impl Collection {
@@ -417,6 +455,14 @@ impl Collection {
 	/// Directories below the root that could not be read.
 	pub fn errors(&self) -> &[DirError] {
 		&self.errors
+	}
+
+	/// The open walk root, for opening the kept files below it with no
+	/// symlink followed on the way ([`Session::open_file_beneath`] with
+	/// [`Entry::path`]); `None` for a walk that follows symlinks, whose files
+	/// open by path. Kept open as long as the collection.
+	pub const fn root_dir(&self) -> Option<&Arc<Dir>> {
+		self.root_dir.as_ref()
 	}
 }
 
@@ -460,9 +506,10 @@ where
 {
 	let sink = parallel::CollectSink::new(filter);
 	let started = parallel::start(fs, root, opts, sink, sorted, cache, None).await?;
+	let root_dir = started.root_dir();
 	started.finished().await;
 	let out = started.into_outcome();
-	Ok(Collection { entries: out.entries, _arenas: out.arenas, errors: out.errors })
+	Ok(Collection { entries: out.entries, _arenas: out.arenas, errors: out.errors, root_dir })
 }
 
 /// The process-wide cache when `opts` asks for it and the walk can use it.

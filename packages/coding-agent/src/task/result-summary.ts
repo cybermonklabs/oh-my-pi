@@ -5,7 +5,7 @@
  * when a woken subagent re-yields, so a parent reads the same shape (status,
  * preview, `agent://` pointer) regardless of which path delivered it.
  */
-import { prompt } from "@oh-my-pi/pi-utils";
+import { escapeXmlAttribute, escapeXmlText, prompt } from "@oh-my-pi/pi-utils";
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import { AgentRegistry, isResumable } from "../registry/agent-registry";
 import { ASYNC_INLINE_RESULT_MAX_CHARS } from "../session/async-job-delivery";
@@ -64,23 +64,71 @@ export function formatTaskResultSummary(
 	// The preview prefers `output` over `stderr`, so a run that failed after
 	// streaming prose (provider stream error, missing yield) would otherwise
 	// show only the half-written text and no reason. Aborts carry their own
-	// <abort-reason>; an empty output already previews the error itself.
-	const error = result.exitCode !== 0 && !result.aborted && result.output.trim().length > 0 ? result.error : undefined;
+	// <abort-reason>; an output that is empty or already opens with the error
+	// (a missing-yield warning prefixed to the report) previews it itself.
+	const failed = result.exitCode !== 0 && !result.aborted;
+	const streamed = result.output.trim();
+	const error =
+		failed && streamed.length > 0 && result.error !== undefined && !streamed.startsWith(result.error.trim())
+			? result.error
+			: undefined;
+	// The prose error names the provider's wording; the kind and reset time let
+	// the parent decide between waiting for the limit and rerouting the work.
+	const retryFailure =
+		failed && result.retryFailure?.kind
+			? {
+					kind: result.retryFailure.kind,
+					resetAt:
+						result.retryFailure.resetAtMs === undefined
+							? undefined
+							: new Date(result.retryFailure.resetAtMs).toISOString(),
+				}
+			: undefined;
 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
-	// A stopped agent stays messageable; tell the parent so it can resume via
-	// irc instead of redoing the work. Isolated runs are parked without a
-	// reviver (their worktree is gone), so they must not read as resumable.
-	const resumable = result.aborted && !result.isolated && isResumable(AgentRegistry.global().get(result.id));
+	// A stopped-but-adopted agent (soft-budget stop, or any other recoverable
+	// abort) stays messageable; tell the parent so it can resume via irc
+	// instead of redoing the work. The same "still live, not isolated" check
+	// also applies to a run that crossed budget but cooperated and completed
+	// normally — it is still the same resumable, kept-alive agent. Isolated
+	// runs are parked without a reviver (their worktree is gone), so they must
+	// not read as resumable.
+	const resumable = !result.isolated && isResumable(AgentRegistry.global().get(result.id));
+	const budgetCrossed = result.budgetCrossed === true;
+	// A fallback answered for the requested model: name what served, and why
+	// when the session started on it, so the parent never reads a substituted
+	// run as the model it dispatched. The template renders unescaped, so the
+	// selectors are escaped as attribute values and the reason, which quotes
+	// them, as element text: neither can close the `<model>` line early.
+	const modelFallback =
+		result.resolvedModelIsFallback && result.resolvedModel
+			? {
+					served: escapeXmlAttribute(result.resolvedModel),
+					requested:
+						result.modelOverride === undefined
+							? undefined
+							: escapeXmlAttribute([result.modelOverride].flat().join(", ")),
+					reason:
+						result.resolvedModelFallbackReason === undefined
+							? undefined
+							: escapeXmlText(result.resolvedModelFallbackReason),
+				}
+			: undefined;
 	const render = (truncated: boolean): string =>
 		prompt.render(taskSummaryTemplate, {
 			agentName: result.agent,
 			id: result.id,
 			status,
+			missingYield: result.missingYield,
 			duration: formatDuration(options.totalDurationMs),
 			abortReason: result.aborted ? escapeHarnessTags(result.abortReason ?? "") || undefined : undefined,
 			error: error === undefined ? undefined : escapeHarnessTags(error),
+			retryFailure,
 			resumable,
+			budgetCrossed,
+			budgetRequests: result.requests,
+			budgetLimit: result.softRequestBudget,
 			preview: escapeHarnessTags(truncated ? previewHead(output) : output),
+			modelFallback,
 			truncated,
 			meta: result.outputMeta
 				? {

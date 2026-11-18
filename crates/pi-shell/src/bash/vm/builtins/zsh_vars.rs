@@ -652,9 +652,7 @@ fn read_input(
 				if part == 0
 					&& let Some(p) = prompt
 				{
-					ctx.vp
-						.out
-						.push_back(PendingWrite { fd: 2, bytes: p.into(), off: 0 });
+					ctx.vp.out.push_back(PendingWrite::new(2, p.into()));
 				}
 				return Err(need);
 			},
@@ -774,9 +772,7 @@ fn read_zle(
 	if !reading_bytes(ctx.vp)
 		&& let Some(p) = prompt
 	{
-		ctx.vp
-			.out
-			.push_back(PendingWrite { fd: 2, bytes: p.into(), off: 0 });
+		ctx.vp.out.push_back(PendingWrite::new(2, p.into()));
 	}
 	// zsh: the timeout in hundredths of a second, rounded up.
 	let timeout_cs = timeout_ns.map(|ns| {
@@ -920,13 +916,12 @@ pub fn read(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString]) -> R {
 			// zsh `bin_read`: keys come from the terminal (`SHTTY`, opened
 			// when the shell has none), in cbreak mode, not from stdin.
 			let Some(tty) = jobctl::key_terminal(ctx.k, ctx.cx, ctx.vp) else {
-				ctx.vp.out.push_back(PendingWrite {
-					fd:    2,
-					bytes: b"not interactive and can't open terminal\n"
+				ctx.vp.out.push_back(PendingWrite::new(
+					2,
+					b"not interactive and can't open terminal\n"
 						.as_slice()
 						.into(),
-					off:   0,
-				});
+				));
 				return done(1);
 			};
 			let tty_fd = Probe::TERMINAL_FD;

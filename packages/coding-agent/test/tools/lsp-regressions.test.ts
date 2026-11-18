@@ -10,6 +10,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { preloadPluginRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { rejectionOf, trackUnhandled } from "../helpers/rejection";
 import { restoreEnvValue } from "../helpers/settings-test-state";
+import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { createLspWritethrough, LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
 import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
@@ -24,6 +25,7 @@ import {
 import { renderCall, renderResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import {
 	type CodeAction,
+	type Command,
 	type CreateFile,
 	type DeleteFile,
 	type Diagnostic,
@@ -50,12 +52,13 @@ import {
 	uriToFile,
 } from "@oh-my-pi/pi-coding-agent/lsp/utils";
 import { getThemeByName, initTheme } from "@oh-my-pi/pi-tui/theme";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { sanitizeText, TempDir } from "@oh-my-pi/pi-utils";
-import type { Subprocess } from "bun";
+import type { BunFile, Subprocess } from "bun";
 import DEFAULTS from "../../src/lsp/defaults.json" with { type: "json" };
 import { renderResult as renderLocalResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import { getLanguageFromPath } from "@oh-my-pi/pi-tui/lang-from-path";
@@ -5797,6 +5800,1780 @@ describe("lsp regressions", () => {
 		}
 	});
 
+	describe("an edit whose change is made before the call's abort", () => {
+		// Each case places the abort right after the change lands, through the edit tool or a
+		// workspace edit (the `lsp` tool's rename and code actions). The change is then reported as
+		// made, and the server is still told of it: the steps after the change are bounded by their
+		// own timeouts, not by the call's abort. The controls: a write the client refuses still
+		// fails, and a workspace edit aborted before it starts changes nothing.
+		const config: ServerConfig = { command: "fake-lsp", fileTypes: ["ts"], rootMarkers: [] };
+
+		function editSession(cwd: string, getClientBridge?: () => ClientBridge | undefined): ToolSession {
+			return {
+				cwd,
+				hasUI: false,
+				enableLsp: true,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated({
+					"edit.enforceSeenLines": false,
+					"lsp.formatOnWrite": false,
+					"lsp.diagnosticsOnEdit": false,
+				}),
+				getClientBridge,
+			} as ToolSession;
+		}
+
+		/** Whether the server got a watched-files notice naming `filePath`, within a second. */
+		function told(server: FakeLspServer, filePath: string): Promise<boolean> {
+			return server
+				.waitFor(
+					message =>
+						message.method === "workspace/didChangeWatchedFiles" &&
+						JSON.stringify(message.params).includes(fileToUri(filePath)),
+				)
+				.then(
+					() => true,
+					() => false,
+				);
+		}
+
+		it("a write on disk is reported as made, and the server is told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-disk-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				const controller = new AbortController();
+				// The abort lands as soon as the file's new bytes are on disk, before the notice of them.
+				const bunFile = Object.getPrototypeOf(Bun.file(target));
+				const write = bunFile.write;
+				vi.spyOn(bunFile, "write").mockImplementation(async function (this: BunFile, ...args: unknown[]) {
+					const written = await write.apply(this, args);
+					if (this.name === target) controller.abort();
+					return written;
+				});
+
+				const result = await new EditTool(editSession(tempDir.path()), "replace").execute(
+					"landed-disk-write",
+					{ path: "n.ts", old_string: "old", new_string: "new" },
+					controller.signal,
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(controller.signal.aborted).toBe(true);
+				expect({ isError: result.isError === true, serverTold: await told(server, target) }).toEqual({
+					isError: false,
+					serverTold: true,
+				});
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a bridge write is reported as made, and the server is told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-bridge-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				const controller = new AbortController();
+				// The abort lands while the client applies the write; the client finishes it.
+				const bridge: ClientBridge = {
+					capabilities: { writeTextFile: true },
+					writeTextFile: async ({ path: written, content }) => {
+						await Bun.write(written, content);
+						controller.abort();
+					},
+				};
+
+				const session = editSession(tempDir.path(), () => bridge);
+				const result = await new EditTool(session, "replace").execute(
+					"landed-bridge-write",
+					{ path: "n.ts", old_string: "old", new_string: "new" },
+					controller.signal,
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect({ isError: result.isError === true, serverTold: await told(server, target) }).toEqual({
+					isError: false,
+					serverTold: true,
+				});
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a delete is reported as made, and the server is told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-delete-");
+			try {
+				const target = path.join(tempDir.path(), "gone.ts");
+				await Bun.write(target, "export const a = 1;\n");
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				const controller = new AbortController();
+				const session = editSession(tempDir.path());
+				// The abort lands once the file is gone, when the edit asks whether to tell the server.
+				Object.defineProperty(session, "enableLsp", {
+					get: () => {
+						if (!fs.existsSync(target)) controller.abort();
+						return true;
+					},
+				});
+
+				const result = await new EditTool(session, "apply_patch").execute(
+					"landed-delete",
+					{ input: "*** Begin Patch\n*** Delete File: gone.ts\n*** End Patch\n" },
+					controller.signal,
+				);
+
+				expect(fs.existsSync(target)).toBe(false);
+				expect(controller.signal.aborted).toBe(true);
+				expect({ isError: result.isError === true, serverTold: await told(server, target) }).toEqual({
+					isError: false,
+					serverTold: true,
+				});
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a bridge write the client refuses still fails, and the server is not told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-refused-bridge-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				const bridge: ClientBridge = {
+					capabilities: { writeTextFile: true },
+					writeTextFile: async () => {
+						throw new Error("the editor refused the write");
+					},
+				};
+
+				const session = editSession(tempDir.path(), () => bridge);
+				const result = await new EditTool(session, "replace").execute("refused-bridge-write", {
+					path: "n.ts",
+					old_string: "old",
+					new_string: "new",
+				});
+
+				expect(await Bun.file(target).text()).toBe('export const a = "old";\n');
+				expect(result.isError).toBe(true);
+				expect(result.details?.errorKind).toBe("write_failed");
+				expect(await told(server, target)).toBe(false);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a server that stops reading delays an aborted edit only by the notice's own timeout", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-wedged-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				// From here the server never drains its input: only the notice's timeout ends the notice.
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(() => new Promise<number>(() => {}));
+				const controller = new AbortController();
+				const bridge: ClientBridge = {
+					capabilities: { writeTextFile: true },
+					writeTextFile: async ({ path: written, content }) => {
+						await Bun.write(written, content);
+						controller.abort();
+					},
+				};
+
+				const session = editSession(tempDir.path(), () => bridge);
+				const result = await new EditTool(session, "replace").execute(
+					"landed-wedged-write",
+					{ path: "n.ts", old_string: "old", new_string: "new" },
+					controller.signal,
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(result.isError).not.toBe(true);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		}, 15_000);
+
+		/** A workspace edit (the `lsp` tool's rename and code actions apply one) of `old` to `new` in `target`. */
+		function renameEdit(target: string): WorkspaceEdit {
+			return {
+				documentChanges: [
+					{
+						textDocument: { uri: fileToUri(target), version: null },
+						edits: [
+							{ range: { start: { line: 0, character: 18 }, end: { line: 0, character: 21 } }, newText: "new" },
+						],
+					} satisfies TextDocumentEdit,
+				],
+			};
+		}
+
+		/** Aborts `controller` as soon as `target`'s new bytes are on disk (the edit writes with `Bun.write`). */
+		function abortOnceWritten(target: string, controller: AbortController): void {
+			const write = Bun.write;
+			vi.spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				const written: number = await Reflect.apply(write, Bun, args);
+				if (args[0] === target) controller.abort();
+				return written;
+			}) as never);
+		}
+
+		/** The call's result, or what it rejected with. */
+		function settle(call: Promise<unknown>): Promise<unknown> {
+			return call.then(
+				result => result,
+				(rejection: unknown) => rejection,
+			);
+		}
+
+		it("a workspace edit is reported as made, and the server is told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-workspace-edit-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				const controller = new AbortController();
+				abortOnceWritten(target, controller);
+
+				const settled = await settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(controller.signal.aborted).toBe(true);
+				expect({ settled, serverTold: await told(server, target) }).toEqual({
+					settled: [expect.stringContaining("n.ts")],
+					serverTold: true,
+				});
+				// The open document was brought up to the new text too.
+				const didChange = await server.waitFor(message => message.method === "textDocument/didChange");
+				expect(didChange.params).toMatchObject({ contentChanges: [{ text: 'export const a = "new";\n' }] });
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit whose call is aborted before it starts changes nothing", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-aborted-workspace-edit-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				const controller = new AbortController();
+				controller.abort();
+
+				const settled = await settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "old";\n');
+				expect(settled).toBeInstanceOf(ToolAbortError);
+				expect(await told(server, target)).toBe(false);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a server that stops reading delays an aborted workspace edit only by the step's own timeout", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-workspace-edit-wedged-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				// From here the server never drains its input: only the step's timeout ends the refresh.
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(() => new Promise<number>(() => {}));
+				const controller = new AbortController();
+				abortOnceWritten(target, controller);
+
+				const settled = await settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				// The step the bound cut short is named: the server was not told of the new text.
+				expect(settled).toEqual([
+					"Applied 1 edit(s) to n.ts",
+					expect.stringMatching(/^Note: fake-lsp was not told of the new text of n\.ts \(/),
+				]);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		}, 15_000);
+
+		/**
+		 * Runs the `lsp` tool's `code_actions` apply of "Fix it" on `n.ts` (`old` to `new`)
+		 * against a fake server whose action is `action` and whose `workspace/executeCommand`
+		 * is handled by `onCommand`. Returns the target, the call's result or rejection, and
+		 * the signal's controller.
+		 */
+		async function applyFixIt(
+			tempDir: string,
+			action: (uri: string) => CodeAction | Command,
+			onCommand: (message: RpcMessage, srv: FakeLspServer, controller: AbortController) => void,
+			/** Runs right before the call, with the call's controller and the server's client. */
+			prepare?: (
+				controller: AbortController,
+				client: Awaited<ReturnType<typeof lspClient.getOrCreateClient>>,
+			) => void,
+		): Promise<{ target: string; settled: unknown; controller: AbortController }> {
+			const target = path.join(tempDir, "n.ts");
+			await Bun.write(target, 'export const a = "old";\n');
+			const controller = new AbortController();
+			const serverConfig: ServerConfig = {
+				command: "fake-lsp",
+				fileTypes: [".ts"],
+				rootMarkers: [],
+				isLinter: true,
+			};
+			installFakeLsp((message, srv) => {
+				if (message.method === "initialize") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: { codeActionProvider: true } } });
+				} else if (message.method === "textDocument/codeAction") {
+					const params = message.params as { textDocument: { uri: string } };
+					srv.send({ jsonrpc: "2.0", id: message.id, result: [action(params.textDocument.uri)] });
+				} else if (message.method === "codeAction/resolve") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: message.params });
+				} else if (message.method === "workspace/executeCommand") {
+					onCommand(message, srv, controller);
+				} else if (message.method === "shutdown") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					srv.exit(0);
+				}
+			});
+			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: { "fake-lsp": serverConfig } });
+			const client = await lspClient.getOrCreateClient(serverConfig, tempDir, 1_000);
+			await lspClient.ensureFileOpen(client, target);
+			prepare?.(controller, client);
+			const settled = await settle(
+				new LspTool(makeLspSession(tempDir)).execute(
+					"apply-fix-it",
+					{ action: "code_actions", file: target, line: 1, query: "Fix it", apply: true },
+					controller.signal,
+				),
+			);
+			return { target, settled, controller };
+		}
+
+		/** The line that names commands a code-action call stopped waiting for. */
+		const NOT_WAITED =
+			"  Command(s) not waited for, because the call was cancelled or timed out (edits the server applied for them by then are listed above; it may still apply more):";
+
+		const fixItWithCommand = (uri: string): CodeAction => ({
+			title: "Fix it",
+			kind: "quickfix",
+			edit: {
+				changes: {
+					[uri]: [
+						{ range: { start: { line: 0, character: 18 }, end: { line: 0, character: 21 } }, newText: "new" },
+					],
+				},
+			},
+			command: { title: "Fix it", command: "fix.it", arguments: [] },
+		});
+
+		it("a code action whose command the abort stops after its edit is reported as applied, naming the command", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-code-action-");
+			try {
+				// The abort lands while the server runs the command, after the edit has changed the file.
+				const { target, settled, controller } = await applyFixIt(tempDir.path(), fixItWithCommand, (_m, _s, c) =>
+					c.abort(),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(controller.signal.aborted).toBe(true);
+				expect(settled).not.toBeInstanceOf(Error);
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toStartWith('Applied "Fix it":\n  Workspace edit:');
+				expect(text).toContain(`${NOT_WAITED}\n    fix.it`);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a code action with a command and no edit that the abort stops still ends as aborted, and says the server may still edit", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-aborted-command-action-");
+			try {
+				const { target, settled } = await applyFixIt(
+					tempDir.path(),
+					(): CodeAction => ({
+						title: "Fix it",
+						kind: "quickfix",
+						command: { title: "Fix it", command: "fix.it", arguments: [] },
+					}),
+					(_m, _s, c) => c.abort(),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "old";\n');
+				expect(settled).toBeInstanceOf(ToolAbortError);
+				expect((settled as Error).message).toBe(
+					"Operation aborted. The call did not wait for the command fix.it; its server may still apply edits for it.",
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a code action whose command fails after its edit, with no abort, still reports the failure", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-failed-code-action-command-");
+			try {
+				const { settled } = await applyFixIt(tempDir.path(), fixItWithCommand, (message, srv) =>
+					srv.send({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: "fix.it failed" } }),
+				);
+
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toStartWith("LSP error:");
+				expect(text).toContain("fix.it failed");
+				// The action's own edit had changed the file before the command failed: the error says so.
+				expect(text).toContain(
+					"Before the command fix.it failed, the code action made these changes, which stay: Applied 1 edit(s) to n.ts.",
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		/**
+		 * An `onCommand` for {@link applyFixIt}: the server carries out the command by asking the
+		 * client to apply `edit` (`workspace/applyEdit`), and the call is aborted once the client
+		 * has answered that it applied it, before the server answers the command.
+		 */
+		const serverAppliesThenAbort =
+			(edit: () => WorkspaceEdit) => (_message: RpcMessage, srv: FakeLspServer, controller: AbortController) => {
+				srv.send({ jsonrpc: "2.0", id: "server-edit", method: "workspace/applyEdit", params: { edit: edit() } });
+				void srv
+					.waitFor(reply => reply.id === "server-edit" && reply.method === undefined)
+					.then(() => controller.abort());
+			};
+		const serverEditOf = (file: string, from: number, to: number): WorkspaceEdit => ({
+			changes: {
+				[fileToUri(file)]: [
+					{ range: { start: { line: 0, character: from }, end: { line: 0, character: to } }, newText: "new" },
+				],
+			},
+		});
+
+		it("a code action whose command has the server apply an edit, then the abort, reports that edit", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-command-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): CodeAction => ({
+						title: "Fix it",
+						kind: "quickfix",
+						command: { title: "Fix it", command: "fix.it", arguments: [] },
+					}),
+					serverAppliesThenAbort(() => serverEditOf(target, 18, 21)),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).not.toBeInstanceOf(Error);
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toBe(
+					`Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n${NOT_WAITED}\n    fix.it`,
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a bare command that has the server apply an edit, then the abort, reports that edit", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-bare-command-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): Command => ({ title: "Fix it", command: "fix.it", arguments: [] }),
+					serverAppliesThenAbort(() => serverEditOf(target, 18, 21)),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).not.toBeInstanceOf(Error);
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toBe(
+					`Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n${NOT_WAITED}\n    fix.it`,
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a code action with an edit and a command lists the edit its server applied to another file", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-second-file-");
+			try {
+				const other = path.join(tempDir.path(), "m.ts");
+				await Bun.write(other, 'export const m = "old";\n');
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					fixItWithCommand,
+					serverAppliesThenAbort(() => serverEditOf(other, 18, 21)),
+				);
+
+				expect(await Bun.file(other).text()).toBe('export const m = "new";\n');
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toBe(
+					`Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n    Applied 1 edit(s) to m.ts\n${NOT_WAITED}\n    fix.it`,
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit with a live signal and no abort waits for a slow server, and does not stop it", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-slow-server-no-abort-");
+			let fakeClock: { mockRestore(): void } | undefined;
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				// A fake clock for timeout signals: a bound only elapses when the test fires it.
+				const timeouts: AbortController[] = [];
+				fakeClock = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+					const timeout = new AbortController();
+					timeouts.push(timeout);
+					return timeout.signal;
+				});
+				// The server stops reading at the next write, until the test lets it go on.
+				const flush = client.proc.stdin.flush.bind(client.proc.stdin);
+				const stalled = Promise.withResolvers<void>();
+				const resume = Promise.withResolvers<void>();
+				let stalls = 0;
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(async () => {
+					if (stalls++ === 0) {
+						stalled.resolve();
+						await resume.promise;
+					}
+					return flush();
+				});
+
+				// A live signal that is never aborted: the reconcile must not bound its steps.
+				const live = new AbortController();
+				const call = settle(lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), live.signal));
+				await stalled.promise;
+				// Every bound running now elapses; then the server reads again.
+				for (const timeout of timeouts) timeout.abort(new DOMException("The operation timed out.", "TimeoutError"));
+				resume.resolve();
+				const settledCall = await call;
+				fakeClock.mockRestore();
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect({ settled: settledCall, killed: server.killed }).toEqual({
+					settled: [expect.stringContaining("n.ts")],
+					killed: false,
+				});
+				const didChange = await server.waitFor(message => message.method === "textDocument/didChange");
+				expect(didChange.params).toMatchObject({ contentChanges: [{ text: 'export const a = "new";\n' }] });
+			} finally {
+				fakeClock?.mockRestore();
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit aborted while the server is not reading is bounded from the abort", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-slow-server-then-abort-");
+			let fakeClock: { mockRestore(): void } | undefined;
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				const timeouts: AbortController[] = [];
+				fakeClock = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+					const timeout = new AbortController();
+					timeouts.push(timeout);
+					return timeout.signal;
+				});
+				// From the next write the server never reads again.
+				const stalled = Promise.withResolvers<void>();
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(() => {
+					stalled.resolve();
+					return Promise.withResolvers<number>().promise;
+				});
+				const controller = new AbortController();
+
+				const call = settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+				await stalled.promise;
+				// The abort comes while the refresh waits; then every bound running elapses.
+				controller.abort();
+				for (const timeout of timeouts) timeout.abort(new DOMException("The operation timed out.", "TimeoutError"));
+				const settledCall = await call;
+				fakeClock.mockRestore();
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect({ killed: server.killed, applied: (settledCall as string[])[0] }).toEqual({
+					killed: true,
+					applied: "Applied 1 edit(s) to n.ts",
+				});
+			} finally {
+				fakeClock?.mockRestore();
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit aborted while a step waits starts its bound at the abort, and the step gets it whole", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-bound-from-the-abort-");
+			let fakeClock: { mockRestore(): void } | undefined;
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				// A fake clock for timeout signals: a bound elapses only when the test fires it, and the
+				// test hears when one is made.
+				const timeouts: AbortController[] = [];
+				let made = Promise.withResolvers<void>();
+				fakeClock = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+					const timeout = new AbortController();
+					timeouts.push(timeout);
+					made.resolve();
+					return timeout.signal;
+				});
+				// The server stops reading at the next write, until the test lets it go on.
+				const flush = client.proc.stdin.flush.bind(client.proc.stdin);
+				const stalled = Promise.withResolvers<void>();
+				const resume = Promise.withResolvers<void>();
+				let stalls = 0;
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(async () => {
+					if (stalls++ === 0) {
+						stalled.resolve();
+						await resume.promise;
+					}
+					return flush();
+				});
+				const controller = new AbortController();
+
+				const call = settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+				await stalled.promise;
+				// While the call is live, no bound exists.
+				expect(timeouts.length).toBe(0);
+				made = Promise.withResolvers<void>();
+				controller.abort();
+				// The abort starts the bound; it has not elapsed, so the step goes on waiting.
+				expect(await Promise.race([made.promise.then(() => "bound started"), call.then(() => "call ended")])).toBe(
+					"bound started",
+				);
+				resume.resolve();
+				const settled = await call;
+				fakeClock.mockRestore();
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect({ settled, killed: server.killed }).toEqual({
+					settled: ["Applied 1 edit(s) to n.ts"],
+					killed: false,
+				});
+			} finally {
+				fakeClock?.mockRestore();
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit whose refresh of one file fails still refreshes the other, and names the failure", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-one-refresh-fails-");
+			try {
+				const first = path.join(tempDir.path(), "a.ts");
+				const second = path.join(tempDir.path(), "b.ts");
+				await Bun.write(first, 'export const a = "old";\n');
+				await Bun.write(second, 'export const b = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, first);
+				await lspClient.ensureFileOpen(client, second);
+				// Once both files are written, the first file's refresh is refused when it reads the file.
+				let written = 0;
+				const write = Bun.write;
+				vi.spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+					const bytes: number = await Reflect.apply(write, Bun, args);
+					if (args[0] === first || args[0] === second) written++;
+					return bytes;
+				}) as never);
+				// `readTextFromDisk` stats through the `node:fs/promises` namespace.
+				const realStat = fsp.stat;
+				vi.spyOn(fsp, "stat").mockImplementation((async (target: fs.PathLike) => {
+					if (written === 2 && target === first) {
+						throw Object.assign(new Error(`EACCES: permission denied, stat '${first}'`), { code: "EACCES" });
+					}
+					return await realStat(target);
+				}) as typeof fsp.stat);
+				const edit: WorkspaceEdit = {
+					documentChanges: [first, second].map((file): TextDocumentEdit => ({
+						textDocument: { uri: fileToUri(file), version: null },
+						edits: [
+							{ range: { start: { line: 0, character: 18 }, end: { line: 0, character: 21 } }, newText: "new" },
+						],
+					})),
+				};
+
+				const applied = await lspClient.applyWorkspaceEditWithLsp(edit, tempDir.path());
+
+				expect(applied.slice(0, 2)).toEqual(["Applied 1 edit(s) to a.ts", "Applied 1 edit(s) to b.ts"]);
+				expect(applied.slice(2)).toEqual([
+					expect.stringMatching(/^Note: .+ was not told of the new text of a\.ts \(EACCES: permission denied/),
+				]);
+				const didChangeB = await server.waitFor(
+					message =>
+						message.method === "textDocument/didChange" &&
+						JSON.stringify(message.params).includes(fileToUri(second)),
+				);
+				expect(didChangeB.params).toMatchObject({ contentChanges: [{ text: 'export const b = "new";\n' }] });
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit aborted while an earlier write is stuck bounds all its steps once, from the abort", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-one-bound-");
+			let fakeClock: { mockRestore(): void } | undefined;
+			try {
+				const files = ["a.ts", "b.ts", "c.ts"].map(name => path.join(tempDir.path(), name));
+				for (const file of files) await Bun.write(file, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				for (const file of files) await lspClient.ensureFileOpen(client, file);
+				await server.waitFor(
+					message =>
+						message.method === "textDocument/didOpen" &&
+						JSON.stringify(message.params).includes(fileToUri(files[2])),
+				);
+				// A fake clock for timeout signals: a bound elapses only when the test fires it.
+				const timeouts: AbortController[] = [];
+				let created = Promise.withResolvers<void>();
+				fakeClock = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+					const timeout = new AbortController();
+					timeouts.push(timeout);
+					created.resolve();
+					return timeout.signal;
+				});
+				// From here the server never reads again. The first write to wait is the client's reply to a
+				// server request, which has no signal: nothing tears the server down, and every later write
+				// queues behind it.
+				const stalled = Promise.withResolvers<void>();
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(() => {
+					stalled.resolve();
+					return Promise.withResolvers<number>().promise;
+				});
+				server.send({ jsonrpc: "2.0", id: "cfg", method: "workspace/configuration", params: { items: [{}] } });
+				await stalled.promise;
+				const controller = new AbortController();
+				abortOnceWritten(files[0], controller);
+				const edit: WorkspaceEdit = {
+					documentChanges: files.map((file): TextDocumentEdit => ({
+						textDocument: { uri: fileToUri(file), version: null },
+						edits: [
+							{ range: { start: { line: 0, character: 18 }, end: { line: 0, character: 21 } }, newText: "new" },
+						],
+					})),
+				};
+
+				const call = settle(lspClient.applyWorkspaceEditWithLsp(edit, tempDir.path(), controller.signal));
+				// Each round fires every bound running; the call settles once nothing is left to wait for.
+				// One bound for the reconcile, then the notice's: two rounds. A bound per step: four.
+				const done = call.then(() => true);
+				let rounds = 0;
+				let fired = 0;
+				while (rounds < 8) {
+					if (timeouts.length === fired) {
+						created = Promise.withResolvers<void>();
+						if (await Promise.race([done, created.promise.then(() => false)])) break;
+						continue;
+					}
+					rounds++;
+					for (const timeout of timeouts.slice(fired)) {
+						timeout.abort(new DOMException("The operation timed out.", "TimeoutError"));
+					}
+					fired = timeouts.length;
+				}
+				const settled = await call;
+				fakeClock.mockRestore();
+
+				for (const file of files) expect(await Bun.file(file).text()).toBe('export const a = "new";\n');
+				expect({ rounds, killed: server.killed, applied: (settled as string[]).slice(0, 3) }).toEqual({
+					rounds: 2,
+					killed: false,
+					applied: ["Applied 1 edit(s) to a.ts", "Applied 1 edit(s) to b.ts", "Applied 1 edit(s) to c.ts"],
+				});
+				expect((settled as string[]).slice(3)).toEqual(
+					["a.ts", "b.ts", "c.ts"].map(name =>
+						expect.stringMatching(new RegExp(`^Note: fake-lsp was not told of the new text of ${name} \\(`)),
+					),
+				);
+			} finally {
+				fakeClock?.mockRestore();
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		}, 30_000);
+
+		/** A workspace edit that changes `file`, then fails on `dir`, a directory it cannot read. */
+		const editThatFailsPartway = (file: string, dir: string): WorkspaceEdit => ({
+			documentChanges: [
+				{
+					textDocument: { uri: fileToUri(file), version: null },
+					edits: [
+						{ range: { start: { line: 0, character: 18 }, end: { line: 0, character: 21 } }, newText: "new" },
+					],
+				} satisfies TextDocumentEdit,
+				{
+					textDocument: { uri: fileToUri(dir), version: null },
+					edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "x" }],
+				} satisfies TextDocumentEdit,
+			],
+		});
+
+		it("a code action whose own edit fails partway, then the abort, names the change it made", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-own-edit-partway-abort-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const dir = path.join(tempDir.path(), "dir.ts");
+				fs.mkdirSync(dir);
+				// The abort lands once the edit has written n.ts; the edit then fails on the directory.
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): CodeAction => ({ title: "Fix it", kind: "quickfix", edit: editThatFailsPartway(target, dir) }),
+					() => {},
+					controller => abortOnceWritten(target, controller),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).toBeInstanceOf(ToolAbortError);
+				expect((settled as Error).message).toStartWith("Operation aborted. Before it failed, the workspace edit");
+				expect((settled as Error).message).toContain("which stay: Applied 1 edit(s) to n.ts");
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a command whose server edit fails partway, with no abort, lists the change it made", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-partway-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const dir = path.join(tempDir.path(), "dir.ts");
+				fs.mkdirSync(dir);
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): Command => ({ title: "Fix it", command: "fix.it", arguments: [] }),
+					(message, srv) => {
+						srv.send({
+							jsonrpc: "2.0",
+							id: "server-edit",
+							method: "workspace/applyEdit",
+							params: { edit: editThatFailsPartway(target, dir) },
+						});
+						// The server answers the command once the client has replied to its edit.
+						void srv
+							.waitFor(reply => reply.id === "server-edit" && reply.method === undefined)
+							.then(() => srv.send({ jsonrpc: "2.0", id: message.id, result: null }));
+					},
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toStartWith('Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n');
+				expect(text).toContain("    The rest of the server's edit failed: ");
+				expect(text).toEndWith("  Executed command(s):\n    fix.it");
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a command whose server edit fails partway, then the abort, lists the change it made", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-partway-abort-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const dir = path.join(tempDir.path(), "dir.ts");
+				fs.mkdirSync(dir);
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): Command => ({ title: "Fix it", command: "fix.it", arguments: [] }),
+					serverAppliesThenAbort(() => editThatFailsPartway(target, dir)),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).not.toBeInstanceOf(Error);
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toStartWith('Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n');
+				expect(text).toEndWith(`${NOT_WAITED}\n    fix.it`);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete that stops partway names what it removed, and tells the server", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-partial-recursive-delete-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const removed = [path.join(dir, "x1.ts"), path.join(dir, "sub", "s.ts")];
+				const kept = path.join(dir, "keep.ts");
+				fs.mkdirSync(path.join(dir, "sub"), { recursive: true });
+				for (const file of [...removed, kept]) await Bun.write(file, "export const a = 1;\n");
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, removed[0]);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				// The recursive rm removes two files, then fails, as a rm that meets a directory the
+				// user cannot write does.
+				const realRm = fsp.rm;
+				vi.spyOn(fsp, "rm").mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+					if (target !== dir) return await realRm(target, options);
+					for (const file of removed) await realRm(file);
+					throw Object.assign(new Error(`EACCES: permission denied, rm '${dir}'`), { code: "EACCES" });
+				}) as typeof fsp.rm);
+				const edit: WorkspaceEdit = {
+					documentChanges: [{ kind: "delete", uri: fileToUri(dir), options: { recursive: true } }],
+				};
+
+				const settled = await settle(lspClient.applyWorkspaceEditWithLsp(edit, tempDir.path()));
+
+				expect({ removed: removed.map(file => fs.existsSync(file)), kept: fs.existsSync(kept) }).toEqual({
+					removed: [false, false],
+					kept: true,
+				});
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				expect(message).toStartWith(
+					`EACCES: permission denied, rm '${dir}' (the recursive delete of d stops at its first failure; a path added under d while it ran is not named, and may have been removed). Before it failed, the workspace edit`,
+				);
+				expect(message).toContain("Deleted d/x1.ts (the recursive delete of d stopped partway)");
+				expect(message).toContain("Deleted d/sub/s.ts (the recursive delete of d stopped partway)");
+				expect(message).not.toContain("keep.ts");
+				// The server is told: the open document is closed, and the removed files are announced.
+				await server.waitFor(
+					m => m.method === "textDocument/didClose" && JSON.stringify(m.params).includes(fileToUri(removed[0])),
+				);
+				const watched = await server.waitFor(m => m.method === "workspace/didChangeWatchedFiles");
+				expect(JSON.stringify(watched.params)).toContain(fileToUri(removed[1]));
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		/** A recursive delete of `dir`, as one workspace edit. */
+		function recursiveDelete(dir: string): WorkspaceEdit {
+			return { documentChanges: [{ kind: "delete", uri: fileToUri(dir), options: { recursive: true } }] };
+		}
+
+		// As root, permissions stop no read or removal.
+		const asRoot = process.getuid?.() === 0;
+
+		/** Directory entries with no type, as a filesystem that reports none gives them. */
+		function untypedReaddir(): void {
+			const untyped = (name: string) => ({
+				name,
+				isFile: () => false,
+				isDirectory: () => false,
+				isSymbolicLink: () => false,
+				isFIFO: () => false,
+				isSocket: () => false,
+				isBlockDevice: () => false,
+				isCharacterDevice: () => false,
+			});
+			const realReaddir = fsp.readdir;
+			vi.spyOn(fsp, "readdir").mockImplementation((async (...args: unknown[]) => {
+				const entries: Array<string | fs.Dirent> = await Reflect.apply(realReaddir, fsp, args);
+				return entries.map(entry => (typeof entry === "string" ? entry : untyped(entry.name)));
+			}) as never);
+		}
+
+		/** Runs `then` after each `readdir` of `dir` returns. */
+		function afterReaddirOf(dir: string, then: () => void): void {
+			const realReaddir = fsp.readdir;
+			vi.spyOn(fsp, "readdir").mockImplementation((async (...args: unknown[]) => {
+				const entries = await Reflect.apply(realReaddir, fsp, args);
+				if (args[0] === dir) then();
+				return entries;
+			}) as never);
+		}
+
+		/**
+		 * The recursive rm of `dir` runs `first` with the real `rm`, then fails, as one that meets a
+		 * directory the user cannot write does.
+		 */
+		function failingRm(dir: string, first: (realRm: typeof fsp.rm) => Promise<void>): void {
+			const realRm = fsp.rm;
+			vi.spyOn(fsp, "rm").mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+				if (target !== dir) return await realRm(target, options);
+				await first(realRm);
+				throw Object.assign(new Error(`EACCES: permission denied, rm '${dir}'`), { code: "EACCES" });
+			}) as typeof fsp.rm);
+		}
+
+		/** A second process puts a link to `target` in the place of the directory `dir`, kept as `dir.moved`. */
+		function swapForLink(dir: string, target: string): void {
+			const swap = Bun.spawnSync(["sh", "-c", 'mv "$1" "$1.moved" && ln -s "$2" "$1"', "swap", dir, target]);
+			if (swap.exitCode !== 0) throw new Error(`the swap failed: ${swap.stderr.toString()}`);
+		}
+
+		it("a recursive delete of a tree holding a link to its own directory deletes the tree", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-self-link-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				fs.mkdirSync(dir);
+				fs.writeFileSync(path.join(dir, "a.ts"), "export const a = 1;\n");
+				fs.symlinkSync(".", path.join(dir, "loop"));
+				fs.symlinkSync("self", path.join(dir, "self"));
+
+				const result = await applyWorkspaceEdit(recursiveDelete(dir), tempDir.path());
+
+				expect(fs.existsSync(dir)).toBe(false);
+				expect(result.applied).toEqual(["Deleted d"]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete of a tree holding two links to its own directory ends at once", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-two-self-links-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				fs.mkdirSync(dir);
+				fs.writeFileSync(path.join(dir, "a.ts"), "export const a = 1;\n");
+				fs.symlinkSync(".", path.join(dir, "l1"));
+				fs.symlinkSync(".", path.join(dir, "l2"));
+				// A walk that follows the links finds 2^n paths at depth n, and its memory grows
+				// without end: the delete runs in a process of its own that stops 5 s after it starts.
+				const script = path.join(tempDir.path(), "delete.ts");
+				const source = (file: string) => JSON.stringify(path.join(import.meta.dir, "../../src/lsp", file));
+				fs.writeFileSync(
+					script,
+					[
+						`import { applyWorkspaceEdit } from ${source("edits.ts")};`,
+						`import { fileToUri } from ${source("utils.ts")};`,
+						'setTimeout(() => { console.log("still pending 5 s after the delete began"); process.exit(3); }, 5_000);',
+						`const edit = { documentChanges: [{ kind: "delete", uri: fileToUri(${JSON.stringify(dir)}), options: { recursive: true } }] };`,
+						`console.log((await applyWorkspaceEdit(edit, ${JSON.stringify(tempDir.path())})).applied.join("\\n"));`,
+						"process.exit(0);",
+					].join("\n"),
+				);
+				const child = Bun.spawn([process.execPath, script], {
+					cwd: tempDir.path(),
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const guard = setTimeout(() => child.kill("SIGKILL"), 60_000);
+				const [exitCode, stdout, stderr] = await Promise.all([
+					child.exited,
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+				]);
+				clearTimeout(guard);
+
+				expect({ exitCode, stdout: stdout.trim(), stderr: exitCode === 0 ? "" : stderr.trim() }).toEqual({
+					exitCode: 0,
+					stdout: "Deleted d",
+					stderr: "",
+				});
+				expect(fs.existsSync(dir)).toBe(false);
+			} finally {
+				tempDir.removeSync();
+			}
+		}, 70_000);
+
+		it("a recursive delete that stops partway names a link it removed, and never the files behind it", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-partial-delete-outside-link-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const file = path.join(dir, "a.ts");
+				const link = path.join(dir, "out");
+				const behind = path.join(tempDir.path(), "outside", "o1.ts");
+				fs.mkdirSync(dir);
+				fs.mkdirSync(path.dirname(behind));
+				for (const target of [file, behind]) fs.writeFileSync(target, "export const a = 1;\n");
+				fs.symlinkSync("../outside", link);
+				failingRm(dir, async realRm => {
+					await realRm(file);
+					await realRm(link);
+				});
+
+				const settled = await settle(lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path()));
+
+				expect(fs.existsSync(behind)).toBe(true);
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				expect(message).toContain("Deleted d/a.ts (the recursive delete of d stopped partway)");
+				expect(message).toContain("Deleted d/out (the recursive delete of d stopped partway)");
+				expect(message).not.toContain("o1.ts");
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it.skipIf(asRoot)(
+			"a recursive delete whose tree holds a directory it cannot read removes nothing, and fails with the read's error",
+			async () => {
+				const tempDir = TempDir.createSync("@omp-lsp-delete-unreadable-dir-");
+				const dir = path.join(tempDir.path(), "d");
+				const locked = path.join(dir, "locked");
+				try {
+					const files = ["a.ts", "sub/s.ts", "locked/z.ts"].map(file => path.join(dir, file));
+					for (const file of files) {
+						fs.mkdirSync(path.dirname(file), { recursive: true });
+						fs.writeFileSync(file, "export const a = 1;\n");
+					}
+					fs.chmodSync(locked, 0o000);
+					const changes: ExecutedWorkspaceChange[] = [];
+
+					const settled = await settle(
+						applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), change => changes.push(change)),
+					);
+
+					expect((settled as NodeJS.ErrnoException).code).toBe("EACCES");
+					expect(changes).toEqual([]);
+					fs.chmodSync(locked, 0o755);
+					expect(files.map(file => fs.existsSync(file))).toEqual([true, true, true]);
+				} finally {
+					if (fs.existsSync(locked)) fs.chmodSync(locked, 0o755);
+					tempDir.removeSync();
+				}
+			},
+		);
+
+		it("a recursive delete that stops partway where entries have no type names what it removed, never through a link", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-partial-delete-untyped-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const removed = [path.join(dir, "sub", "s.ts"), path.join(dir, "out")];
+				const behind = path.join(tempDir.path(), "outside", "o1.ts");
+				for (const file of [removed[0], path.join(dir, "a.ts"), behind]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				fs.symlinkSync("../outside", removed[1]);
+				// XFS made without ftype, and some FUSE and network filesystems, report no entry types.
+				untypedReaddir();
+				failingRm(dir, async realRm => {
+					for (const file of removed) await realRm(file);
+				});
+				const lines: string[] = [];
+
+				const settled = await settle(
+					applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), (_change, line) => {
+						if (line !== undefined) lines.push(line);
+					}),
+				);
+
+				expect(settled).toBeInstanceOf(Error);
+				expect(fs.existsSync(behind)).toBe(true);
+				expect(lines.sort()).toEqual([
+					"Deleted d/out (the recursive delete of d stopped partway)",
+					"Deleted d/sub/s.ts (the recursive delete of d stopped partway)",
+				]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it.skipIf(asRoot)(
+			"a recursive delete that stops at a directory it cannot write names each listed path that is gone, and none that stays",
+			async () => {
+				const tempDir = TempDir.createSync("@omp-lsp-partial-delete-unwritable-");
+				const dir = path.join(tempDir.path(), "d");
+				const readOnly = path.join(dir, "ro");
+				try {
+					const paths = ["d/x1.ts", "d/x2.ts", "d/sub", "d/sub/s.ts", "d/ro", "d/ro/r.ts"];
+					for (const file of ["x1.ts", "x2.ts", "sub/s.ts", "ro/r.ts"].map(name => path.join(dir, name))) {
+						fs.mkdirSync(path.dirname(file), { recursive: true });
+						fs.writeFileSync(file, "export const a = 1;\n");
+					}
+					fs.chmodSync(readOnly, 0o555);
+					const lines: string[] = [];
+
+					const settled = await settle(
+						applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), (_change, line) => {
+							if (line !== undefined) lines.push(line);
+						}),
+					);
+
+					// Bun's rm stops at its first failure, after the entries its directory order put
+					// before `ro/r.ts`: which those are depends on the filesystem.
+					expect((settled as NodeJS.ErrnoException).code).toBe("EACCES");
+					expect((settled as Error).message).toContain("the recursive delete of d stops at its first failure");
+					expect(fs.existsSync(path.join(readOnly, "r.ts"))).toBe(true);
+					const gone = paths.filter(file => !fs.existsSync(path.join(tempDir.path(), file)));
+					expect(lines.sort()).toEqual(
+						gone.map(file => `Deleted ${file} (the recursive delete of d stopped partway)`).sort(),
+					);
+				} finally {
+					if (fs.existsSync(readOnly)) fs.chmodSync(readOnly, 0o755);
+					tempDir.removeSync();
+				}
+			},
+		);
+
+		it("a recursive delete removes nothing outside the tree when another process swaps a listed directory for a link", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-swap-after-listing-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const sub = path.join(dir, "sub");
+				const outside = path.join(tempDir.path(), "outside");
+				const names = ["x1.ts", "x2.ts", "x3.ts"];
+				for (const parent of [sub, outside]) {
+					fs.mkdirSync(parent, { recursive: true });
+					for (const name of names) fs.writeFileSync(path.join(parent, name), "export const a = 1;\n");
+				}
+				// Once the delete has read `d/sub`, a second process puts a link to `outside` in its place:
+				// a delete that then removes `d/sub/x1.ts` by its path removes `outside/x1.ts`.
+				afterReaddirOf(sub, () => swapForLink(sub, outside));
+
+				const settled = await settle(applyWorkspaceEdit(recursiveDelete(dir), tempDir.path()));
+
+				expect(fs.readdirSync(outside).sort()).toEqual(names);
+				expect(fs.existsSync(dir)).toBe(false);
+				expect(settled).toMatchObject({ applied: ["Deleted d"] });
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete never names the files behind a directory swapped for a link before the listing reads it", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-swap-before-read-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const sub = path.join(dir, "sub");
+				const outside = path.join(tempDir.path(), "outside");
+				const behind = ["e1.ts", "e2.ts"];
+				for (const file of [path.join(sub, "s.ts"), ...behind.map(name => path.join(outside, name))]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// Once the delete has read `d`, and before it looks at `d/sub`, a second process puts a link
+				// to `outside` in the place of `d/sub`. The rm then removes the whole tree and fails.
+				const reads: string[] = [];
+				swapAtLstatOf(sub, "before", () => swapForLink(sub, outside), reads);
+				failingRm(dir, async realRm => {
+					await realRm(dir, { recursive: true });
+				});
+				const lines: string[] = [];
+
+				const settled = await settle(
+					applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), (_change, line) => {
+						if (line !== undefined) lines.push(line);
+					}),
+				);
+
+				expect(fs.readdirSync(outside).sort()).toEqual(behind);
+				expect(settled).toBeInstanceOf(Error);
+				expect(lines).toEqual(["Deleted d/sub (the recursive delete of d stopped partway)"]);
+				// The link is seen before any read of it: only `d` is read.
+				expect(reads.map(read => path.relative(tempDir.path(), read))).toEqual(["d"]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		/**
+		 * Runs `swap` once, at the first `lstat` of `target`: `before` it, or `after` it returns. Counts
+		 * the `readdir` calls in `reads`.
+		 */
+		function swapAtLstatOf(target: string, when: "before" | "after", swap: () => void, reads: string[]): void {
+			let swapped = false;
+			const realLstat = fsp.lstat;
+			vi.spyOn(fsp, "lstat").mockImplementation((async (...args: unknown[]) => {
+				const first = !swapped && args[0] === target;
+				if (first && when === "before") swap();
+				const stat = await Reflect.apply(realLstat, fsp, args);
+				if (first && when === "after") swap();
+				if (first) swapped = true;
+				return stat;
+			}) as never);
+			const realReaddir = fsp.readdir;
+			vi.spyOn(fsp, "readdir").mockImplementation((async (...args: unknown[]) => {
+				reads.push(String(args[0]));
+				return await Reflect.apply(realReaddir, fsp, args);
+			}) as never);
+		}
+
+		it("a recursive delete never names the files behind a directory swapped for a link between its lstat and its read", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-swap-at-read-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const sub = path.join(dir, "sub");
+				const outside = path.join(tempDir.path(), "outside");
+				const behind = ["o1.ts", "o2.ts"];
+				for (const file of [
+					path.join(dir, "a.ts"),
+					path.join(sub, "s.ts"),
+					...behind.map(name => path.join(outside, name)),
+				]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// Once the listing's `lstat` has found `d/sub` a directory, and before it reads it, a second
+				// process puts a link to `outside` in its place. The rm then removes the tree and fails.
+				const reads: string[] = [];
+				swapAtLstatOf(sub, "after", () => swapForLink(sub, outside), reads);
+				failingRm(dir, async realRm => {
+					await realRm(dir, { recursive: true });
+				});
+				const lines: string[] = [];
+
+				const settled = await settle(
+					applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), (_change, line) => {
+						if (line !== undefined) lines.push(line);
+					}),
+				);
+
+				expect(settled).toBeInstanceOf(Error);
+				expect(fs.readdirSync(outside).sort()).toEqual(behind);
+				expect(lines.sort()).toEqual([
+					"Deleted d/a.ts (the recursive delete of d stopped partway)",
+					"Deleted d/sub (the recursive delete of d stopped partway)",
+				]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete stops listing at once behind an ancestor swapped for a link after it was read", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-swap-ancestor-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const a = path.join(dir, "a");
+				const c = path.join(a, "b", "c");
+				const outside = path.join(tempDir.path(), "outside");
+				// `outside` mirrors `a` down to `b/c`, which holds a file and 20 directories of its own.
+				const behind = path.join(outside, "b", "c");
+				for (const file of [path.join(c, "x.ts"), path.join(behind, "y.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				for (let index = 0; index < 20; index++)
+					fs.mkdirSync(path.join(behind, `n${index}`, "m"), { recursive: true });
+				// `d/a` and `d/a/b` have been read; just before the listing reads `d/a/b/c`, a second
+				// process puts a link to `outside` in the place of `d/a`. The rm then removes the tree and fails.
+				const reads: string[] = [];
+				swapAtLstatOf(c, "before", () => swapForLink(a, outside), reads);
+				failingRm(dir, async realRm => {
+					await realRm(dir, { recursive: true });
+				});
+				const lines: string[] = [];
+
+				const settled = await settle(
+					applyWorkspaceEdit(recursiveDelete(dir), tempDir.path(), (_change, line) => {
+						if (line !== undefined) lines.push(line);
+					}),
+				);
+
+				expect(settled).toBeInstanceOf(Error);
+				expect(fs.existsSync(path.join(behind, "y.ts"))).toBe(true);
+				expect(lines.filter(line => line.includes("y.ts") || line.includes("/n"))).toEqual([]);
+				// `d`, `d/a`, `d/a/b`, and the one read through the link, which is dropped.
+				expect(reads.map(read => path.relative(tempDir.path(), read))).toEqual(["d", "d/a", "d/a/b", "d/a/b/c"]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete skips a listed file that another writer removed", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-file-gone-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const gone = path.join(dir, "a.ts");
+				for (const file of [gone, path.join(dir, "sub", "s.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// Another writer removes `d/a.ts` once `d` has been read.
+				afterReaddirOf(dir, () => fs.rmSync(gone));
+
+				const result = await applyWorkspaceEdit(recursiveDelete(dir), tempDir.path());
+
+				expect(fs.existsSync(dir)).toBe(false);
+				expect(result.applied).toEqual(["Deleted d"]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete aborted while it lists the tree removes nothing", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-aborted-listing-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const files = [path.join(dir, "a.ts"), path.join(dir, "sub", "s.ts")];
+				for (const file of files) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// The call is aborted once `d` has been read, before `d/sub` is.
+				const controller = new AbortController();
+				afterReaddirOf(dir, () => controller.abort());
+
+				const settled = await settle(
+					lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path(), controller.signal),
+				);
+
+				expect(settled).toBeInstanceOf(ToolAbortError);
+				expect(files.map(file => fs.existsSync(file))).toEqual([true, true]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete aborted while it reads the last directory removes nothing", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-aborted-last-read-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const files = [path.join(dir, "a.ts"), path.join(dir, "b.ts")];
+				fs.mkdirSync(dir);
+				for (const file of files) fs.writeFileSync(file, "export const a = 1;\n");
+				// `d` is the only directory: the call is aborted while it is read.
+				const controller = new AbortController();
+				afterReaddirOf(dir, () => controller.abort());
+
+				const settled = await settle(
+					lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path(), controller.signal),
+				);
+
+				expect(settled).toBeInstanceOf(ToolAbortError);
+				expect(files.map(file => fs.existsSync(file))).toEqual([true, true]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("an edit aborted while a recursive delete lists its tree, after an earlier change, runs to its end", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-aborted-after-change-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const [before, after] = [path.join(tempDir.path(), "c.ts"), path.join(tempDir.path(), "e.ts")];
+				for (const file of [path.join(dir, "a.ts"), path.join(dir, "sub", "s.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// The edit creates `c.ts`, deletes `d`, then creates `e.ts`; the call is aborted once
+				// `c.ts` exists and `d` has been read.
+				const controller = new AbortController();
+				afterReaddirOf(dir, () => controller.abort());
+				const edit: WorkspaceEdit = {
+					documentChanges: [
+						{ kind: "create", uri: fileToUri(before) },
+						{ kind: "delete", uri: fileToUri(dir), options: { recursive: true } },
+						{ kind: "create", uri: fileToUri(after) },
+					],
+				};
+
+				await settle(lspClient.applyWorkspaceEditWithLsp(edit, tempDir.path(), controller.signal));
+
+				expect(controller.signal.aborted).toBe(true);
+				expect({ c: fs.existsSync(before), d: fs.existsSync(dir), e: fs.existsSync(after) }).toEqual({
+					c: true,
+					d: false,
+					e: true,
+				});
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("with ignoreIfNotExists, a recursive delete whose subdirectory another process removes still deletes the tree", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-subdir-gone-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const sub = path.join(dir, "sub");
+				for (const file of [path.join(dir, "x1.ts"), path.join(dir, "x2.ts"), path.join(sub, "s.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// Another process removes `d/sub` once `d` has been read.
+				afterReaddirOf(dir, () => fs.rmSync(sub, { recursive: true }));
+				const edit: WorkspaceEdit = {
+					documentChanges: [
+						{ kind: "delete", uri: fileToUri(dir), options: { recursive: true, ignoreIfNotExists: true } },
+					],
+				};
+
+				const result = await applyWorkspaceEdit(edit, tempDir.path());
+
+				expect(fs.existsSync(dir)).toBe(false);
+				expect(result.applied).toEqual(["Deleted d"]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("with ignoreIfNotExists, a recursive delete of a tree that exists still fails when its rm fails with ENOENT", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-rm-enoent-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const first = path.join(dir, "a.ts");
+				for (const file of [first, path.join(dir, "b.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// The rm removes `d/a.ts`, then meets an entry another process removed.
+				const realRm = fsp.rm;
+				vi.spyOn(fsp, "rm").mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+					if (target !== dir) return await realRm(target, options);
+					await realRm(first);
+					throw Object.assign(new Error(`ENOENT: no such file or directory, rm '${dir}'`), { code: "ENOENT" });
+				}) as typeof fsp.rm);
+				const edit: WorkspaceEdit = {
+					documentChanges: [
+						{ kind: "delete", uri: fileToUri(dir), options: { recursive: true, ignoreIfNotExists: true } },
+					],
+				};
+				const lines: string[] = [];
+
+				const settled = await settle(
+					applyWorkspaceEdit(edit, tempDir.path(), (_change, line) => {
+						if (line !== undefined) lines.push(line);
+					}),
+				);
+
+				expect((settled as NodeJS.ErrnoException).code).toBe("ENOENT");
+				expect(lines).toEqual(["Deleted d/a.ts (the recursive delete of d stopped partway)"]);
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete that stops partway does not name a file added while it ran, and says so", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-delete-added-file-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const first = path.join(dir, "a.ts");
+				const late = path.join(dir, "late.ts");
+				for (const file of [first, path.join(dir, "sub", "s.ts")]) {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "export const a = 1;\n");
+				}
+				// Another writer adds `d/late.ts` once `d` has been read; the rm removes it and `d/a.ts`,
+				// then fails.
+				afterReaddirOf(dir, () => fs.writeFileSync(late, "export const late = 1;\n"));
+				failingRm(dir, async realRm => {
+					for (const file of [late, first]) await realRm(file);
+				});
+
+				const settled = await settle(lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path()));
+
+				expect(fs.existsSync(late)).toBe(false);
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				expect(message).toContain("a path added under d while it ran is not named, and may have been removed");
+				expect(message).toContain("Deleted d/a.ts (the recursive delete of d stopped partway)");
+				expect(message).not.toContain("late.ts");
+			} finally {
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete that stops partway after many files names 20, counts the rest, and tells the server of all", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-partial-delete-many-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				fs.mkdirSync(dir);
+				const files = Array.from({ length: 30 }, (_, index) =>
+					path.join(dir, `f${String(index).padStart(2, "0")}.ts`),
+				);
+				for (const file of files) fs.writeFileSync(file, "export const a = 1;\n");
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				failingRm(dir, async realRm => {
+					for (const file of files) await realRm(file);
+				});
+
+				const settled = await settle(lspClient.applyWorkspaceEditWithLsp(recursiveDelete(dir), tempDir.path()));
+
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				const named = message.match(/Deleted d\/f\d\d\.ts \(the recursive delete of d stopped partway\)/g);
+				expect(named).toHaveLength(20);
+				expect(message).toContain("Deleted 10 more paths under d (the recursive delete of d stopped partway)");
+				const watched = await server.waitFor(m => m.method === "workspace/didChangeWatchedFiles");
+				const announced = JSON.stringify(watched.params);
+				expect(files.filter(file => announced.includes(fileToUri(file)))).toHaveLength(30);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a command whose server edit fails partway while the server stops reading still returns at the abort", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-partway-stalled-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const dir = path.join(tempDir.path(), "dir.ts");
+				fs.mkdirSync(dir);
+				let stalling = false;
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): Command => ({ title: "Fix it", command: "fix.it", arguments: [] }),
+					(_message, srv) => {
+						srv.send({
+							jsonrpc: "2.0",
+							id: "server-edit",
+							method: "workspace/applyEdit",
+							params: { edit: editThatFailsPartway(target, dir) },
+						});
+					},
+					(controller, client) => {
+						// Once the server's edit has written n.ts, the call is aborted and the server never
+						// reads again: the refresh of n.ts and the reply to the server's edit wait forever.
+						const flush = client.proc.stdin.flush.bind(client.proc.stdin);
+						vi.spyOn(client.proc.stdin, "flush").mockImplementation(() =>
+							stalling ? Promise.withResolvers<number>().promise : flush(),
+						);
+						const write = Bun.write;
+						vi.spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+							const written: number = await Reflect.apply(write, Bun, args);
+							if (args[0] === target) {
+								stalling = true;
+								controller.abort();
+							}
+							return written;
+						}) as never);
+					},
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).not.toBeInstanceOf(Error);
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toStartWith('Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n');
+				expect(text).toContain("    The rest of the server's edit failed: ");
+				expect(text).toEndWith(`${NOT_WAITED}\n    fix.it`);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		}, 15_000);
+
+		/**
+		 * A `prepare` for {@link applyFixIt}: a fake clock for timeout signals, so that the
+		 * call's deadline (the first timeout the call makes) elapses only when the test fires
+		 * it. Returns the timeouts made.
+		 */
+		function fakeDeadline(): { timeouts: AbortController[]; fire(): void } {
+			const timeouts: AbortController[] = [];
+			vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+				const timeout = new AbortController();
+				timeouts.push(timeout);
+				return timeout.signal;
+			});
+			return {
+				timeouts,
+				fire: () => timeouts[0]?.abort(new DOMException("The operation timed out.", "TimeoutError")),
+			};
+		}
+
+		it("a code action whose own edit fails partway past the deadline names the change, and asks to read the files", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-own-edit-partway-deadline-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const dir = path.join(tempDir.path(), "dir.ts");
+				fs.mkdirSync(dir);
+				// The deadline elapses once the edit has written n.ts; the edit then fails on the directory.
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): CodeAction => ({ title: "Fix it", kind: "quickfix", edit: editThatFailsPartway(target, dir) }),
+					() => {},
+					() => {
+						const deadline = fakeDeadline();
+						const write = Bun.write;
+						vi.spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+							const written: number = await Reflect.apply(write, Bun, args);
+							if (args[0] === target) deadline.fire();
+							return written;
+						}) as never);
+					},
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				expect(message).toStartWith("LSP code_actions timed out after ");
+				expect(message).toContain("which stay: Applied 1 edit(s) to n.ts");
+				expect(message).toEndWith(
+					"Read the files it names, or that the server may still change, before any retry: a retry can apply the change twice.",
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a command-only action past the deadline says the server may still edit, and does not suggest a retry", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-command-only-deadline-");
+			try {
+				let deadline: { fire(): void } | undefined;
+				// The deadline elapses when the command reaches the server, before anything changed.
+				const { target, settled } = await applyFixIt(
+					tempDir.path(),
+					(): CodeAction => ({
+						title: "Fix it",
+						kind: "quickfix",
+						command: { title: "Fix it", command: "fix.it", arguments: [] },
+					}),
+					() => deadline?.fire(),
+					() => {
+						deadline = fakeDeadline();
+					},
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "old";\n');
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				expect(message).toStartWith("LSP code_actions timed out after ");
+				expect(message).toContain(
+					"The call did not wait for the command fix.it; its server may still apply edits for it.",
+				);
+				expect(message).not.toContain("try again");
+				expect(message).toContain("before any retry");
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+	});
+
 	it("reconciles the executed prefix when a workspace edit fails partway", async () => {
 		// A text edit to an open file inside `src/` is flushed to disk before the
 		// non-recursive delete of `src/` runs (subtree flush), and that delete
@@ -5842,7 +7619,9 @@ describe("lsp regressions", () => {
 					},
 					tempDir.path(),
 				),
-			).rejects.toThrow();
+			).rejects.toThrow(
+				"Before it failed, the workspace edit made these changes, which stay: Applied 1 edit(s) to src/a.ts",
+			);
 
 			// Disk carries the executed edit; the failing delete never ran.
 			expect(fs.readFileSync(filePath, "utf8")).toBe("export const a = 2;\n");

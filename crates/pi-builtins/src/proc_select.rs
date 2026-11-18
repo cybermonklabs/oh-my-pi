@@ -39,7 +39,7 @@ pub(crate) fn parse_group_list(value: &str, target: &mut Vec<u32>) -> Result<(),
 }
 
 /// `?` and `-` select processes without a controlling terminal (`None`).
-pub(crate) fn parse_terminal_list(
+pub(crate) async fn parse_terminal_list(
 	value: &str,
 	target: &mut Vec<Option<u64>>,
 	paths: &ShellPaths,
@@ -47,7 +47,7 @@ pub(crate) fn parse_terminal_list(
 	for item in value.split(',') {
 		if matches!(item, "?" | "-") {
 			target.push(None);
-		} else if let Some(id) = resolve_terminal(item, paths) {
+		} else if let Some(id) = resolve_terminal(item, paths).await {
 			target.push(Some(id));
 		} else if let Ok(id) = item.parse() {
 			target.push(Some(id));
@@ -60,25 +60,28 @@ pub(crate) fn parse_terminal_list(
 
 /// Device number of terminal `value`: an absolute or virtual path, a name
 /// under `/dev`, or a `/dev/tty` suffix (`pts/0`, `S0`).
+///
+/// Queried through the async facade: a provider or mounted route (such as
+/// `omp-descriptor://0` over an engine pipe) answers a blocking query by
+/// blocking in place, which panics on a current-thread runtime.
 #[cfg(unix)]
-fn resolve_terminal(value: &str, paths: &ShellPaths) -> Option<u64> {
+async fn resolve_terminal(value: &str, paths: &ShellPaths) -> Option<u64> {
 	use std::path::{Path, PathBuf};
+	let fs = paths.fs().as_async();
 	let virtual_path = pi_vfs::is_virtual_path(Path::new(value));
 	let primary = if value.starts_with('/') || virtual_path {
 		PathBuf::from(value)
 	} else {
 		Path::new("/dev").join(value)
 	};
-	let metadata = paths.fs().metadata(&primary);
-	let metadata = if virtual_path {
-		metadata
-	} else {
-		metadata.or_else(|_| paths.fs().metadata(Path::new("/dev").join(format!("tty{value}"))))
+	let metadata = match fs.metadata(&primary).await {
+		Err(_) if !virtual_path => fs.metadata(Path::new("/dev").join(format!("tty{value}"))).await,
+		metadata => metadata,
 	};
 	metadata.ok().and_then(|metadata| metadata.rdev())
 }
 
 #[cfg(not(unix))]
-fn resolve_terminal(_value: &str, _paths: &ShellPaths) -> Option<u64> {
+async fn resolve_terminal(_value: &str, _paths: &ShellPaths) -> Option<u64> {
 	None
 }

@@ -1,7 +1,10 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { toError } from "@oh-my-pi/pi-utils";
 import {
-	directChildKeyName,
+	childDirNames,
+	childKeyName,
+	SessionLeaseLostError,
 	SessionWriteConflictError,
 	type SessionStorage,
 	type SessionStorageStat,
@@ -9,7 +12,8 @@ import {
 	type SessionStorageWriteOptions,
 	type WriteTextAtomicOptions,
 } from "./session-storage";
-import { enoent } from "./session-storage-errors";
+import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
+import { eexist, enoent } from "./session-storage-errors";
 import {
 	overlayTitleSlotContent,
 	overlayTitleSlotPrefix,
@@ -33,6 +37,14 @@ export interface SessionStorageBackend {
 	readFull(path: string): Promise<string | null>;
 	readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
+	 * The UTF-8 text from byte `offset` to the end, or at most `maxBytes` of
+	 * it, and the session's size in bytes, both from one read of the backing
+	 * store; `null` when `path` holds no session. A capped read may end inside
+	 * a character. Optional: without it the storage reads the whole session
+	 * and cuts it.
+	 */
+	readFrom?(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null>;
+	/**
 	 * Replace content, atomically rejecting when the shared backend's current
 	 * UTF-8 byte length differs from `expectedSize`.
 	 */
@@ -43,11 +55,28 @@ export interface SessionStorageBackend {
 		title?: SessionTitleUpdate,
 		expectedSize?: number | null,
 	): Promise<void>;
-	append(path: string, line: string, mtimeMs: number): Promise<void>;
+	/**
+	 * Append `line`. `expectedSize` is the size this store's index held for
+	 * `path` before the append, which a backend that guards appends (SQL
+	 * storage that claims sessions) checks the shared backend's size against,
+	 * rejecting with `SessionWriteConflictError` when another writer changed
+	 * the file since; others ignore it.
+	 */
+	append(path: string, line: string, mtimeMs: number, expectedSize?: number): Promise<void>;
 	updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void>;
 	truncate(path: string, mtimeMs: number): Promise<void>;
-	remove(paths: string[]): Promise<void>;
-	move(src: string, dst: string, mtimeMs: number): Promise<void>;
+	/**
+	 * Remove `paths`, and with `dir` (a key prefix ending in `/`) every key
+	 * under it that the shared store holds when the removal runs, including
+	 * ones another client committed after this store last refreshed.
+	 */
+	remove(paths: string[], dir?: string): Promise<void>;
+	/**
+	 * Move `src` to `dst`, replacing `dst`. With `noReplace` a `dst` the shared
+	 * store holds, including one another client commits while the move runs,
+	 * makes it reject with `EEXIST` naming `dst` and change neither path.
+	 */
+	move(src: string, dst: string, mtimeMs: number, noReplace?: boolean): Promise<void>;
 }
 
 interface IndexEntry {
@@ -86,10 +115,24 @@ interface IndexAppend {
 
 const RESOLVED = Promise.resolve();
 
-function matchesGlob(name: string, pattern: string): boolean {
+function matchesGlobSegment(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
 	if (pattern.startsWith("*.")) return name.endsWith(pattern.slice(1));
 	return name === pattern;
+}
+
+/**
+ * Match a slash-joined index key remainder against a pattern of the same
+ * shape (`"*.jsonl"`, or a wildcard project directory followed by
+ * `"*.jsonl"` for the one-level cross-project case). Segment counts must
+ * agree, so a direct child never matches a two-segment pattern and a
+ * nested key never matches a one-segment one.
+ */
+function matchesGlob(name: string, pattern: string): boolean {
+	const nameParts = name.split("/");
+	const patternParts = pattern.split("/");
+	if (nameParts.length !== patternParts.length) return false;
+	return nameParts.every((part, i) => matchesGlobSegment(part, patternParts[i]));
 }
 
 function byteLength(text: string): number {
@@ -139,7 +182,24 @@ export class IndexedSessionStorage implements SessionStorage {
 	 */
 	readonly #pendingFrames = new Map<string, IndexAppend[]>();
 	#nextMtimeMs = 0;
-	#firstDrainError: Error | undefined;
+	/** Paths changed locally while each in-flight {@link refresh} read the backend. */
+	readonly #refreshWindows = new Set<Set<string>>();
+	/**
+	 * The first failure of a drain-tracked backend op per path, until a {@link drain} of that path, or of
+	 * the whole store, reports it.
+	 */
+	readonly #drainErrors = new Map<string, Error>();
+	/**
+	 * The first drain-tracked failure since the last write that landed on the store, and the paths whose
+	 * drains it was reported to. Until another write lands it may be the store refusing every write, so
+	 * the drain of every path reports it, once per path. Once a write lands the store accepts writes,
+	 * and the failure counts only against its own paths (see {@link #drainErrors}).
+	 */
+	#unconfirmedFailure: { error: Error; reportedTo: Set<string> } | undefined;
+	/** Set by {@link openOnFirstUse} until the first use has opened the storage. */
+	#deferredOpen: (() => Promise<void>) | undefined;
+	/** The deferred open in flight, shared by every use that waits for it. */
+	#opening: Promise<void> | undefined;
 	#assertExpectedSize(path: string, expectedSize: number | null | undefined): void {
 		if (expectedSize === undefined) return;
 		const actualSize = this.#index.get(path)?.size ?? null;
@@ -154,22 +214,106 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	async initialize(): Promise<void> {
 		await this.#backend.init();
-		await this.refresh();
+		await this.#loadIndex();
 	}
 
+	/**
+	 * Defer {@link initialize} to this storage's first use, for a process that
+	 * may never touch the store (`omp --no-session`): until then nothing
+	 * reaches the backend. The first asynchronous operation, queued write or
+	 * {@link refresh} opens it and waits for it. A failed open is that use's
+	 * error, as `describeFailure` words it, and the next use tries again.
+	 * Synchronous reads before the open see only this process's own writes, as
+	 * they see no row another process commits until the next refresh.
+	 */
+	openOnFirstUse(describeFailure: (err: unknown) => Error = toError): void {
+		this.#deferredOpen = async () => {
+			try {
+				await this.#backend.init();
+				await this.#loadIndex();
+			} catch (err) {
+				throw describeFailure(err);
+			}
+		};
+	}
+
+	/**
+	 * The open {@link openOnFirstUse} deferred, started now if no use has
+	 * started it, and shared by every use that waits for it; `undefined` once
+	 * the storage is open. A caller awaits only when it is set, so a storage
+	 * that opened at once runs every operation with the awaits it always had.
+	 */
+	pendingOpen(): Promise<void> | undefined {
+		const open = this.#deferredOpen;
+		if (!open) return undefined;
+		this.#opening ??= open().then(
+			() => {
+				this.#deferredOpen = undefined;
+				this.#opening = undefined;
+			},
+			err => {
+				this.#opening = undefined;
+				throw err;
+			},
+		);
+		return this.#opening;
+	}
+
+	/**
+	 * Merge the backend's current index into this one, so sessions other
+	 * processes created, changed, or removed since the last load show in
+	 * `existsSync`, `statSync`, and the listings. A path this storage has an
+	 * operation in flight for, or changes while the backend read runs, keeps
+	 * its local entry: the read cannot describe a write it may predate. On a
+	 * storage whose open was deferred and has not run, this is that open.
+	 */
 	async refresh(): Promise<void> {
-		await this.drain();
-		const rows = await this.#backend.loadIndex();
-		this.#index.clear();
-		for (const row of rows) {
-			const title = row.titleUpdatedAt
-				? { title: row.title, source: row.titleSource, updatedAt: row.titleUpdatedAt }
-				: null;
-			this.#setIndex(row.path, row.size, row.mtimeMs, title);
+		if (this.#deferredOpen) return this.pendingOpen();
+		await this.#loadIndex();
+	}
+
+	async #loadIndex(): Promise<void> {
+		const window = new Set<string>(this.#pendingFrames.keys());
+		this.#refreshWindows.add(window);
+		try {
+			const rows = await this.#backend.loadIndex();
+			const fresh = new Map<string, IndexEntry>();
+			for (const row of rows) {
+				fresh.set(row.path, {
+					size: row.size,
+					mtimeMs: row.mtimeMs,
+					title: row.titleUpdatedAt ? row.title : undefined,
+					titleSource: row.titleUpdatedAt ? row.titleSource : undefined,
+					titleUpdatedAt: row.titleUpdatedAt,
+				});
+			}
+			const settled = (path: string): boolean => !window.has(path) && !this.#pendingFrames.has(path);
+			for (const path of [...this.#index.keys()]) {
+				if (!fresh.has(path) && settled(path)) this.#index.delete(path);
+			}
+			for (const [path, entry] of fresh) {
+				if (!settled(path)) continue;
+				this.#index.set(path, entry);
+				if (entry.mtimeMs > this.#nextMtimeMs) this.#nextMtimeMs = entry.mtimeMs;
+			}
+		} finally {
+			this.#refreshWindows.delete(window);
 		}
 	}
 
-	async drain(): Promise<void> {
+	/** Record a local index change in every refresh whose backend read is in flight. */
+	#touch(path: string): void {
+		for (const window of this.#refreshWindows) window.add(path);
+	}
+
+	/**
+	 * Quiesce every pending backend op, then report a failure of a drain-tracked op not reported before.
+	 * With `path`: the first failure on `path`, else a failure on another path while no write has landed
+	 * on the store since it (it may be the store refusing every write), once per path. Without `path`: the
+	 * first failure on any path. A failure on another path after a write landed is never reported to
+	 * `path`'s drain.
+	 */
+	async drain(path?: string): Promise<void> {
 		// Quiesce EVERY pending backend operation, not just the drain-tracked
 		// fire-and-forget publishes: an atomic write whose commit guard passed
 		// just before a terminal seal is still on the wire with
@@ -178,9 +322,24 @@ export class IndexedSessionStorage implements SessionStorage {
 		while (this.#drainPending.size > 0 || this.#pathPending.size > 0) {
 			await Promise.allSettled([...this.#drainPending, ...this.#pathPending.values()]);
 		}
-		const error = this.#firstDrainError;
-		this.#firstDrainError = undefined;
-		if (error) throw error;
+		if (path === undefined) {
+			const first = this.#drainErrors.values().next().value;
+			this.#drainErrors.clear();
+			this.#unconfirmedFailure = undefined;
+			if (first) throw first;
+			return;
+		}
+		const own = this.#drainErrors.get(path);
+		this.#drainErrors.delete(path);
+		const unconfirmed = this.#unconfirmedFailure;
+		if (own) {
+			unconfirmed?.reportedTo.add(path);
+			throw own;
+		}
+		if (unconfirmed && !unconfirmed.reportedTo.has(path)) {
+			unconfirmed.reportedTo.add(path);
+			throw unconfirmed.error;
+		}
 	}
 
 	ensureDirSync(_dir: string): void {
@@ -231,6 +390,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		if (!previous) throw enoent(path);
@@ -268,19 +428,30 @@ export class IndexedSessionStorage implements SessionStorage {
 	listFilesSync(dir: string, pattern: string): string[] {
 		const resolvedDir = path.resolve(dir);
 		const out: string[] = [];
+		const segments = pattern.split("/").length;
 		for (const key of this.#index.keys()) {
-			const name = directChildKeyName(resolvedDir, key);
+			const name = childKeyName(resolvedDir, key, segments);
 			if (name === undefined || !matchesGlob(name, pattern)) continue;
 			out.push(key);
 		}
 		return out;
 	}
 
+	listDirsSync(dir: string): string[] {
+		return childDirNames(path.resolve(dir), this.#index.keys());
+	}
+
+	listAllSync(): string[] {
+		return [...this.#index.keys()];
+	}
+
 	exists(path: string): Promise<boolean> {
-		return Promise.resolve(this.existsSync(path));
+		const opening = this.pendingOpen();
+		return opening ? opening.then(() => this.existsSync(path)) : Promise.resolve(this.existsSync(path));
 	}
 
 	async readText(path: string): Promise<string> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
 		await this.#awaitPath(path);
@@ -291,6 +462,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
 		const prefixLimit = normalizeByteLimit(prefixBytes);
@@ -302,6 +474,42 @@ export class IndexedSessionStorage implements SessionStorage {
 		return [title ? overlayTitleSlotPrefix(prefix, prefixLimit, title) : prefix, suffix];
 	}
 
+	/**
+	 * The text from byte `offset`, at most `maxBytes` of it, and the size the
+	 * read saw. Both come from the backend's read, not this storage's index, so
+	 * an append another process made since the index loaded is read too. The
+	 * title slot is synthesized over the stored head, so a read that starts
+	 * inside it reads from the start and overlays the slot.
+	 */
+	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
+		if (this.#deferredOpen) await this.pendingOpen();
+		const entry = this.#index.get(path);
+		if (!entry) throw enoent(path);
+		await this.#awaitPath(path);
+		const title = offset < SESSION_TITLE_SLOT_BYTES ? titleUpdateForIndex(entry) : undefined;
+		const start = title ? 0 : offset;
+		const limit = maxBytes === undefined ? undefined : offset - start + Math.max(0, maxBytes);
+		const read = await this.#readBackendFrom(path, start, limit);
+		if (!read) throw enoent(path);
+		if (!title) return read;
+		const head = overlayTitleSlotPrefix(read.text, byteLength(read.text), title);
+		return { text: Buffer.from(head, "utf-8").subarray(offset).toString("utf-8"), size: read.size };
+	}
+
+	async #readBackendFrom(
+		path: string,
+		offset: number,
+		maxBytes: number | undefined,
+	): Promise<{ text: string; size: number } | null> {
+		if (this.#backend.readFrom) return this.#backend.readFrom(path, offset, maxBytes);
+		const content = await this.#backend.readFull(path);
+		if (content === null) return null;
+		const bytes = Buffer.from(content, "utf-8");
+		if (offset >= bytes.length) return { text: "", size: bytes.length };
+		const end = maxBytes === undefined ? undefined : offset + maxBytes;
+		return { text: bytes.subarray(offset, end).toString("utf-8"), size: bytes.length };
+	}
+
 	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
 		for (const line of (await this.readText(path)).split("\n")) {
 			if (visit(line)) return;
@@ -309,6 +517,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async writeText(path: string, content: string): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
@@ -323,6 +532,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		const commitGuard = options?.commitGuard;
 		if (commitGuard && !commitGuard()) return;
 		await this.#awaitPath(path);
@@ -349,7 +559,7 @@ export class IndexedSessionStorage implements SessionStorage {
 						const current = this.#index.get(path);
 						if (current?.mtimeMs === mtimeMs) this.#restoreIndex(path, previous);
 						this.#abandonFrame(path, mtimeMs);
-						return;
+						return false;
 					}
 					await this.#backend.writeFull(path, content, mtimeMs, title, options?.expectedSize);
 				},
@@ -371,7 +581,21 @@ export class IndexedSessionStorage implements SessionStorage {
 		}
 	}
 
-	async rename(src: string, dst: string): Promise<void> {
+	rename(src: string, dst: string): Promise<void> {
+		return this.#rename(src, dst, false);
+	}
+
+	/**
+	 * {@link rename} that never replaces: a `dst` in this store's view, or one
+	 * another client committed to the shared store, makes it reject with
+	 * `EEXIST` naming `dst`, and neither path changes.
+	 */
+	renameNoReplace(src: string, dst: string): Promise<void> {
+		return this.#rename(src, dst, true);
+	}
+
+	async #rename(src: string, dst: string, noReplace: boolean): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		await this.#awaitPath(src);
 		await this.#awaitPath(dst);
 		const entry = this.#index.get(src);
@@ -381,12 +605,15 @@ export class IndexedSessionStorage implements SessionStorage {
 			return;
 		}
 		const dstPrevious = this.#index.get(dst);
+		if (noReplace && dstPrevious) throw eexist(dst);
 		this.#index.delete(src);
 		this.#index.set(dst, { ...entry });
 		this.#pushFrame(src, { mtimeMs: entry.mtimeMs, previous: entry, removal: true });
 		this.#pushFrame(dst, { mtimeMs: entry.mtimeMs, previous: dstPrevious });
 		try {
-			await this.#enqueuePaths([src, dst], () => this.#backend.move(src, dst, entry.mtimeMs), { trackDrain: false });
+			await this.#enqueuePaths([src, dst], () => this.#backend.move(src, dst, entry.mtimeMs, noReplace), {
+				trackDrain: false,
+			});
 			this.#dropFrame(src, entry.mtimeMs);
 			this.#dropFrame(dst, entry.mtimeMs);
 		} catch (err) {
@@ -397,6 +624,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async unlink(path: string): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		if (!previous) throw enoent(path);
@@ -412,6 +640,13 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
+		// Rows another client committed under the artifacts directory (a
+		// subagent transcript, a draft) go too: the refresh brings the ones
+		// committed so far into this view, and the backend removes every key
+		// under the directory it holds when the removal runs, so one committed
+		// after the refresh goes as well.
+		await this.refresh();
 		await this.#awaitPath(sessionPath);
 		const sessionEntry = this.#index.get(sessionPath);
 		if (!sessionEntry) throw enoent(sessionPath);
@@ -436,11 +671,26 @@ export class IndexedSessionStorage implements SessionStorage {
 		}
 
 		try {
-			await this.#enqueuePaths(paths, () => this.#backend.remove(paths), { trackDrain: false });
+			await this.#enqueuePaths(paths, () => this.#backend.remove(paths, prefix), { trackDrain: false });
 			for (const [path] of previous) this.#dropFrame(path, sessionEntry.mtimeMs);
 		} catch (err) {
+			// A failed removal restores every index entry, even when the backend
+			// already deleted the content (the reply was lost): the session
+			// stays present but unconfirmed, and an append extends whatever the
+			// backend holds.
 			for (const [path] of previous) this.#failFrame(path, sessionEntry.mtimeMs);
 			throw toError(err);
+		}
+		// Tool artifacts and sidecars stay on local disk whatever holds the
+		// transcripts, so removing the session removes them as the file
+		// backend's delete does.
+		try {
+			await fs.rm(artifactsDir, { recursive: true, force: true });
+		} catch (err) {
+			const error = toError(err);
+			throw new Error(`Session deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`, {
+				cause: error,
+			});
 		}
 	}
 
@@ -491,7 +741,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			async () => {
 				const error = getError?.();
 				if (error) throw error;
-				await this.#backend.append(path, line, mtimeMs);
+				await this.#backend.append(path, line, mtimeMs, append.previous?.size ?? 0);
 			},
 			{ trackDrain: true, abortOnPredecessorFailure: true },
 		);
@@ -500,6 +750,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	#restoreIndex(path: string, entry: IndexEntry | undefined): void {
+		this.#touch(path);
 		if (entry) {
 			this.#index.set(path, entry);
 		} else {
@@ -513,6 +764,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		mtimeMs: number,
 		title: SessionTitleUpdate | null | undefined = undefined,
 	): void {
+		this.#touch(path);
 		const current = title === undefined ? this.#index.get(path) : undefined;
 		this.#index.set(path, {
 			size,
@@ -533,11 +785,12 @@ export class IndexedSessionStorage implements SessionStorage {
 		return next;
 	}
 
-	#enqueuePath(path: string, task: () => Promise<void>, options: EnqueueOptions): Promise<void> {
+	#enqueuePath(path: string, task: () => Promise<void | false>, options: EnqueueOptions): Promise<void> {
 		return this.#enqueuePaths([path], task, options);
 	}
 
 	#pushFrame(path: string, frame: IndexAppend): void {
+		this.#touch(path);
 		const frames = this.#pendingFrames.get(path);
 		if (frames) frames.push(frame);
 		else this.#pendingFrames.set(path, [frame]);
@@ -611,7 +864,11 @@ export class IndexedSessionStorage implements SessionStorage {
 		);
 	}
 
-	#enqueuePaths(paths: readonly string[], task: () => Promise<void>, options: EnqueueOptions): Promise<void> {
+	/**
+	 * Queue `task`, a backend write, behind the pending ops on `paths`. A task that resolves to `false`
+	 * wrote nothing.
+	 */
+	#enqueuePaths(paths: readonly string[], task: () => Promise<void | false>, options: EnqueueOptions): Promise<void> {
 		const unique = uniquePaths(paths);
 		// Predecessor choice (rJDg): a positional publish with no backend CAS
 		// token (backend.append) chains on the uncaught pending op so it
@@ -623,10 +880,23 @@ export class IndexedSessionStorage implements SessionStorage {
 			path =>
 				(options.abortOnPredecessorFailure ? this.#pathPending.get(path) : this.#pathTails.get(path)) ?? RESOLVED,
 		);
-		const operation = Promise.all(previous).then(task);
+		// A write queued while the open is deferred (see openOnFirstUse) waits for it; any other runs as it always did.
+		const settled = Promise.all(previous);
+		const operation = (this.#deferredOpen ? settled.then(() => this.pendingOpen()) : settled)
+			.then(task)
+			.then(wrote => {
+				// A write landed: the store accepts writes, so an earlier failure
+				// was not the whole store's.
+				if (wrote !== false) this.#unconfirmedFailure = undefined;
+			});
 		const tracked = operation.catch(err => {
 			const error = toError(err);
-			if (options.trackDrain && !this.#firstDrainError) this.#firstDrainError = error;
+			// A write the claim fence refused changed nothing, and its caller
+			// republishes those entries elsewhere: no durable write is missing.
+			if (options.trackDrain && !(error instanceof SessionLeaseLostError)) {
+				for (const path of unique) if (!this.#drainErrors.has(path)) this.#drainErrors.set(path, error);
+				this.#unconfirmedFailure ??= { error, reportedTo: new Set() };
+			}
 			throw error;
 		});
 		const tail = tracked.catch(() => {});

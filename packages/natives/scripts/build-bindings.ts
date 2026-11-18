@@ -20,6 +20,8 @@ import { $ } from "bun";
 import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
 import { stampNativeVersion } from "../../../scripts/stamp-native-version";
 import { generateEnumExports } from "./gen-enums";
+import { installBuiltAddon } from "./install-addon";
+import { CARGO_SOURCE_ROOTS, readRustSources } from "./rust-sources";
 
 // pcre2-sys prefers a system libpcre2 when pkg-config finds one. Keep the
 // static build so the local addon never retains host Homebrew paths.
@@ -102,37 +104,6 @@ async function cleanupStaleTemps(dir: string): Promise<void> {
 		}
 	} catch {
 		// Directory might not exist yet
-	}
-}
-
-async function installBinary(src: string, dest: string): Promise<void> {
-	const tempPath = `${dest}.tmp.${process.pid}`;
-
-	await fs.copyFile(src, tempPath);
-
-	try {
-		// Atomic rename - works even if dest is loaded on Linux/macOS (old inode stays valid)
-		await fs.rename(tempPath, dest);
-	} catch {
-		// On Windows, loaded DLLs cannot be overwritten via rename
-		// Try delete-then-rename as fallback
-		try {
-			await fs.unlink(dest);
-		} catch (unlinkErr) {
-			if ((unlinkErr as NodeJS.ErrnoException).code !== "ENOENT") {
-				await fs.unlink(tempPath).catch(() => {});
-				const isWindows = process.platform === "win32";
-				throw new Error(
-					`Cannot replace ${path.basename(dest)}${isWindows ? " (file may be in use - close any running processes)" : ""}: ${(unlinkErr as Error).message}`,
-				);
-			}
-		}
-		try {
-			await fs.rename(tempPath, dest);
-		} catch (finalErr) {
-			await fs.unlink(tempPath).catch(() => {});
-			throw new Error(`Failed to install ${path.basename(dest)}: ${(finalErr as Error).message}`);
-		}
 	}
 }
 
@@ -254,6 +225,11 @@ function tailSection(label: string, text: string): string {
 	return `\n--- ${label}${capped ? ` (last ${BUILD_LOG_TAIL_LINES} lines)` : ""} ---\n${shown.join("\n")}`;
 }
 
+// Read before the build begins: an edit made while cargo runs then reads as other sources,
+// so the workspace loader asks for a rebuild instead of trusting a mixed build. Cargo's own
+// rewrite of Cargo.lock is taken after the build (settleRustSources).
+const sourcesBeforeBuild = readRustSources(repoRoot, CARGO_SOURCE_ROOTS);
+
 try {
 	// The package declares Bun as its build runtime. Invoke napi's JavaScript
 	// entry through this Bun process instead of its `#!/usr/bin/env node` shim so
@@ -273,8 +249,22 @@ try {
 	await stampNativeVersion(builtAddonPath, version);
 	if (builtAddonPath !== canonicalAddonPath) {
 		console.log(`Normalizing native addon filename: ${path.basename(builtAddonPath)} → ${canonicalAddonFilename}`);
-		await installBinary(builtAddonPath, canonicalAddonPath);
 	}
+	// The sources are settled before anything is installed, so a settle that throws leaves the
+	// old addon, its record and the generated bindings as they were. The workspace loader
+	// compares the record with the checkout (native/workspace-sources.js); the settings are there
+	// to explain the addon, never compared.
+	await installBuiltAddon({
+		addons: [{ built: builtAddonPath, destination: canonicalAddonPath }],
+		repoRoot,
+		sourcesBeforeBuild,
+		build: {
+			builder: "cargo",
+			profile: cargoProfile,
+			features: extraFeatures || null,
+			rustflags: Bun.env.RUSTFLAGS ?? null,
+		},
+	});
 
 	await installGeneratedBindings(buildOutputDir);
 

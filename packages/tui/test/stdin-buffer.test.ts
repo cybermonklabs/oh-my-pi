@@ -804,19 +804,26 @@ describe("StdinBuffer", () => {
 			}
 		});
 
-		it("re-arms the watchdog while paste chunks keep arriving", async () => {
-			buffer = new StdinBuffer({ timeout: 10, pasteTimeout: 50 });
-			const pastes: string[] = [];
-			buffer.on("paste", d => pastes.push(d));
+		it("re-arms the watchdog while paste chunks keep arriving", () => {
+			vi.useFakeTimers();
+			try {
+				buffer = new StdinBuffer({ timeout: 10, pasteTimeout: 50 });
+				const pastes: string[] = [];
+				buffer.on("paste", d => pastes.push(d));
 
-			buffer.process("\x1b[200~part1 ");
-			await Bun.sleep(20);
-			buffer.process("part2");
-			await Bun.sleep(20);
-			expect(pastes).toEqual([]); // still inside the re-armed window
+				buffer.process("\x1b[200~part1 ");
+				vi.advanceTimersByTime(40);
+				buffer.process("part2");
+				// 80 ms after the paste began and 40 after its last chunk: a
+				// watchdog the chunk did not re-arm would have fired at 50.
+				vi.advanceTimersByTime(40);
+				expect(pastes).toEqual([]);
 
-			buffer.process("\x1b[201~");
-			expect(pastes).toEqual(["part1 part2"]);
+				buffer.process("\x1b[201~");
+				expect(pastes).toEqual(["part1 part2"]);
+			} finally {
+				vi.useRealTimers();
+			}
 		});
 
 		it("aborts paste mode when the byte cap is exceeded", () => {

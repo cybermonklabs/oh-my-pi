@@ -21,6 +21,7 @@ import type { Skill } from "../extensibility/skills";
 import type { AgentRegistryApi } from "../registry/agent-registry";
 import type { LocalProtocolOptions } from "./local-protocol";
 import type { SessionEntry } from "../session/session-entries";
+import type { SessionStorage } from "../session/session-storage";
 import type { ToolSession } from "../tools";
 import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/wait";
 import type { ProcReadDetails, ProcWriteDetails } from "@oh-my-pi/pi-tui/tools/proc-render";
@@ -265,6 +266,13 @@ export interface ResolveContext {
 	 */
 	sessionFile?: string;
 	/**
+	 * Storage holding the calling session's transcript tree (its own and its
+	 * subagents' transcripts; `sessionTreeStorage`). Transcript readers
+	 * (`history://`, `agent://` progress, their persisted-roster refresh and
+	 * on-disk scans) read it; absent, they read the default session storage.
+	 */
+	storage?: SessionStorage;
+	/**
 	 * Calling session's stable session-manager id. Sessions that have no
 	 * session file yet (SDK, embedded, `-p`) are only addressable by this id,
 	 * so handlers that must bind a URL to its caller (`memory://`) accept it
@@ -342,6 +350,12 @@ export interface WriteContext {
 	cwd?: string;
 	/** Caller's abort signal. */
 	signal?: AbortSignal;
+	/**
+	 * Called by a handler right before it changes a local file, after its last check of
+	 * `signal`. From then the caller (the `write` tool) waits for the handler and reports
+	 * what it wrote, as for a file write that has begun, instead of returning at the abort.
+	 */
+	onWriteBegin?: () => void;
 	/** Calling session's `local://` root mapping — see {@link ResolveContext.localProtocolOptions}. */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**

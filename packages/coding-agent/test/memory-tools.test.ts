@@ -69,6 +69,7 @@ function makeConfig(overrides: Partial<HindsightConfig> = {}): HindsightConfig {
 		recallContextTurns: 1,
 		recallMaxQueryChars: 800,
 		recallPromptPreamble: "preamble",
+		recallCooldownMs: 60_000,
 		debug: false,
 		requestTimeoutMs: 30_000,
 		reflectTimeoutMs: 120_000,
@@ -210,6 +211,9 @@ function registerMnemopiState(
 				options.listeners?.add(listener);
 				return () => options.listeners?.delete(listener);
 			},
+			// A state the backend installs binds its `/pause` holds to the session's disposal.
+			isDisposed: false,
+			addDisposer: () => {},
 		} as never,
 	});
 	setMnemopiSessionState(registeredMnemopiState.session as never, registeredMnemopiState);
@@ -375,14 +379,17 @@ describe("retain.execute", () => {
 		await registeredState?.flushRetainQueue();
 
 		expect(retainBatchSpy).toHaveBeenCalledTimes(2);
+		// Same-call items share a publication mtime, so their order within a request is unspecified.
 		const requests = retainBatchSpy.mock.calls.map(([, items]) =>
-			items.map(item => ({ content: item.content, tags: item.tags })),
+			items
+				.map(item => ({ content: item.content, tags: item.tags }))
+				.toSorted((a, b) => a.content.localeCompare(b.content)),
 		);
 		expect(requests).toEqual(
 			expect.arrayContaining([
 				[
-					{ content: "pi uses tabs", tags: ["project:pi"] },
 					{ content: "pi builds with bun", tags: ["project:pi"] },
+					{ content: "pi uses tabs", tags: ["project:pi"] },
 				],
 				[{ content: "the user prefers zsh across projects", tags: undefined }],
 			]),
@@ -402,9 +409,14 @@ describe("retain.execute", () => {
 		await registeredState?.flushRetainQueue();
 
 		expect(retainBatchSpy).toHaveBeenCalledTimes(1);
-		expect(retainBatchSpy.mock.calls[0][1].map(item => ({ content: item.content, tags: item.tags }))).toEqual([
-			{ content: "shared fact", tags: undefined },
+		// Same-call items share a publication mtime, so their order within the request is unspecified.
+		expect(
+			retainBatchSpy.mock.calls[0][1]
+				.map(item => ({ content: item.content, tags: item.tags }))
+				.toSorted((a, b) => a.content.localeCompare(b.content)),
+		).toEqual([
 			{ content: "explicitly global fact", tags: undefined },
+			{ content: "shared fact", tags: undefined },
 		]);
 	});
 
@@ -1212,6 +1224,8 @@ describe("Mnemopi backend lifecycle", () => {
 			emitNotice: () => {},
 			getHindsightSessionState: () => undefined,
 			subscribe: () => () => {},
+			isDisposed: false,
+			addDisposer: () => {},
 		} as never;
 		await mnemopiBackend.start({
 			session,
@@ -1952,6 +1966,33 @@ describe("recall.execute", () => {
 
 		const tool = MemoryRecallTool.createIf(makeSession(settings))!;
 		await expect(tool.execute("call-5", { query: "anything" })).rejects.toThrow(/HTTP 503/);
+	});
+
+	it("the recall tool neither waits for the pause nor ends it", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const recallSpy = vi.spyOn(HindsightApi.prototype, "recall").mockRejectedValue(new Error("HTTP 503"));
+		registerState(client, settings, {
+			sessionOverrides: {
+				sessionManager: { getEntries: () => [], getBranch: () => [] },
+			},
+		});
+		const state = registeredState!;
+		// The automatic recall fails, which starts the pause.
+		expect(await state.beforeAgentStartPrompt("Where is the deploy host?")).toBeUndefined();
+		expect(recallSpy).toHaveBeenCalledTimes(1);
+
+		recallSpy.mockResolvedValueOnce({ results: [{ text: "the deploy host is alpha-7", id: "1" }] } as never);
+		const tool = MemoryRecallTool.createIf(makeSession(settings))!;
+		const result = await tool.execute("call-pause", { query: "deploy host" });
+		expect(result.content[0]).toEqual({
+			type: "text",
+			text: expect.stringContaining("- the deploy host is alpha-7"),
+		});
+		expect(recallSpy).toHaveBeenCalledTimes(2);
+
+		expect(await state.beforeAgentStartPrompt("And the staging host?")).toBeUndefined();
+		expect(recallSpy).toHaveBeenCalledTimes(2);
 	});
 });
 

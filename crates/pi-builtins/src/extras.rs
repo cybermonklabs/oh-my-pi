@@ -16,6 +16,7 @@ use futures::future::BoxFuture;
 use super::*;
 pub use crate::{
 	host::{CommandRunner, CommandStatus, EnvChange, Invocation, ShellCommand},
+	locale::{ctype_is_utf8_in, gnu_quote, gnu_quote_shell},
 	openfile::Fd,
 };
 #[allow(unused_imports, reason = "used by whichever table entries the enabled features compile")]
@@ -215,10 +216,11 @@ pub async fn run(invocation: Invocation) -> i32 {
 	if let Some(extra) = find(&invocation.name) {
 		return (extra.run)(invocation).await;
 	}
-	let Invocation { name, stdio: [_, _, stderr], .. } = invocation;
+	let Invocation { name, stdio: [_, _, stderr], cancel, .. } = invocation;
 	crate::host::report_async(
 		crate::openfile::OpenFile::from_fd(stderr),
 		format!("{name}: not a pi extra\n"),
+		cancel,
 	)
 	.await;
 	127

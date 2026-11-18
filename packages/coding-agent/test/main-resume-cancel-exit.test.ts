@@ -5,8 +5,9 @@
  * registry), so the previous bare `return` left the event loop with live
  * handles and the process hung after the picker left the alternate screen.
  *
- * The fix exits via `process.exit(0)` — matching the `--version`/`--export`
- * early-exit convention in the same function. Only this startup call site
+ * The fix exits with code 0 through `postmortem.exitAfterCleanup(0)`, which runs
+ * the cleanup callbacks (a SQL session store's lease release among them) and then
+ * calls `process.exit(0)`. Only this startup call site
  * exits; the in-session `/resume` picker (selector-controller.ts) keeps its own
  * onCancel that just closes the overlay.
  */
@@ -17,7 +18,8 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { clearOmpExtensionCliRoots } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
+import { expectNoExitPass } from "./helpers/postmortem-exit-pass";
 
 class ProcessExitSignal extends Error {
 	constructor(readonly code: number) {
@@ -29,10 +31,11 @@ class ProcessExitSignal extends Error {
 // `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
 afterEach(() => {
 	clearOmpExtensionCliRoots();
+	expectNoExitPass(import.meta.file);
 });
 
 describe("runRootCommand — startup --resume picker cancellation", () => {
-	it("exits cleanly (process.exit 0) when the picker is cancelled instead of returning and hanging", async () => {
+	it("exits cleanly (code 0, through postmortem.exitAfterCleanup) when the picker is cancelled instead of returning and hanging", async () => {
 		using tempDir = TempDir.createSync("@omp-resume-cancel-");
 		const sessionDir = tempDir.path();
 		// One answered session so folderSessions is non-empty and the picker (not the
@@ -75,6 +78,14 @@ describe("runRootCommand — startup --resume picker cancellation", () => {
 			exitCodes.push(code ?? 0);
 			throw new ProcessExitSignal(code ?? 0);
 		}) as typeof process.exit);
+		// The launch exits through postmortem.exitAfterCleanup, whose real exit pass would leave every later
+		// registration in this process running at once (helpers/postmortem-exit-pass.ts): stop it there too.
+		const cleanupExits: number[] = [];
+		vi.spyOn(postmortem, "exitAfterCleanup").mockImplementation(async (code: number) => {
+			cleanupExits.push(code);
+			exitCodes.push(code);
+			throw new ProcessExitSignal(code);
+		});
 		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
 		let pickerCalled = false;
@@ -100,5 +111,6 @@ describe("runRootCommand — startup --resume picker cancellation", () => {
 		// Exactly one clean exit — proves the cancel branch terminates instead of
 		// falling through to session creation or returning into a hang.
 		expect(exitCodes).toEqual([0]);
+		expect(cleanupExits).toEqual([0]);
 	}, 15_000);
 });

@@ -78,7 +78,7 @@ use crate::{
 		Step, ToolCall, VprocSel,
 		store::{Key, MiscKey, Record},
 	},
-	host::{PiHost, SpawnObserver, TERM_GRACE},
+	host::{PiHost, SpawnObserver},
 	sys::OutputDecoding,
 	tools::{ToolCalls, ToolConfig},
 	vfs::VfsFs,
@@ -118,6 +118,11 @@ pub struct SessionConfig {
 	/// ([`RunOptions::text_capture`]); `None` is the platform default
 	/// ([`crate::output_decode::external_output_decoding`]).
 	pub output_decoding: Option<Arc<dyn OutputDecoding>>,
+	/// How long a cancelled run's externals have between TERM and KILL, and
+	/// [`Session::run_with`] between its TERM and its KILL of the run:
+	/// pi's [`TERM_GRACE`](crate::host::TERM_GRACE), or what this session
+	/// was given (a test that drives what happens inside the grace).
+	pub term_grace:      Duration,
 }
 
 /// One command of a [`Session`].
@@ -349,11 +354,13 @@ impl Wake for Bell {
 /// session's runtime (see the module docs), and state persists between them.
 pub struct Session {
 	/// Requests for the driver; `None` once the session is closed.
-	jobs:     Option<flume::Sender<Request>>,
+	jobs:       Option<flume::Sender<Request>>,
 	/// Rings the driver's bell.
-	waker:    Waker,
-	children: Children,
-	image:    LatestImage,
+	waker:      Waker,
+	children:   Children,
+	image:      LatestImage,
+	/// [`SessionConfig::term_grace`].
+	term_grace: Duration,
 }
 
 impl Session {
@@ -385,13 +392,13 @@ impl Session {
 	}
 
 	fn start(config: SessionConfig, image: Option<&Image>) -> Result<Self, SessionError> {
-		let SessionConfig { env, cwd, fs, vfs, runtime, output_decoding } = config;
+		let SessionConfig { env, cwd, fs, vfs, runtime, output_decoding, term_grace } = config;
 		let (jobs, rx) = flume::unbounded();
 		let children = Children::default();
 		let bell = Arc::new(Bell::default());
 		let waker = Waker::from(Arc::clone(&bell));
 		let tools = ToolConfig::from_env(&env, vfs.clone(), runtime.clone());
-		let mut host = PiHost::new(fs, runtime.clone());
+		let mut host = PiHost::new(fs, runtime.clone(), term_grace);
 		if output_decoding.is_some() {
 			host.set_output_decoding(output_decoding);
 		}
@@ -435,7 +442,7 @@ impl Session {
 			image: image.clone(),
 		};
 		runtime.spawn(driver.serve());
-		Ok(Self { jobs: Some(jobs), waker, children, image })
+		Ok(Self { jobs: Some(jobs), waker, children, image, term_grace })
 	}
 
 	/// The session's state as of its last command boundary; see
@@ -528,7 +535,7 @@ impl Session {
 			Some(r)
 		} else {
 			guard.raise(CancelLevel::TERM);
-			if let Ok(r) = tokio::time::timeout(TERM_GRACE, &mut reply).await {
+			if let Ok(r) = tokio::time::timeout(self.term_grace, &mut reply).await {
 				Some(r)
 			} else {
 				guard.raise(CancelLevel::KILL);
@@ -790,7 +797,8 @@ impl Driver {
 	/// host callout ([`ToolCalls::on_done`]); nothing else submits scripts.
 	fn on_done(&mut self, run: RunId, status: i32) {
 		let signal = self.shell.exec_signal(run);
-		self.tools.on_done(run, status, signal);
+		let refusal = self.shell.exec_refusal(run);
+		self.tools.on_done(run, status, signal, refusal);
 	}
 
 	/// Start a host callout ([`crate::bash::Resolved::Tool`]).
@@ -850,7 +858,7 @@ impl Driver {
 
 #[cfg(all(test, unix))]
 mod tests {
-	use std::{io, io::Read, os::unix::ffi::OsStrExt, time::Instant};
+	use std::{io, io::Read, os::unix::ffi::OsStrExt};
 
 	use super::*;
 	use crate::sys::StdFs;
@@ -867,6 +875,7 @@ mod tests {
 			vfs: None,
 			runtime: tokio::runtime::Handle::current(),
 			output_decoding: None,
+			term_grace: crate::host::TERM_GRACE,
 		})
 		.unwrap()
 	}
@@ -913,11 +922,6 @@ mod tests {
 		capture(session, RunOptions::new(command)).await
 	}
 
-	fn alive(pid: i32) -> bool {
-		// SAFETY: signal 0 only probes existence.
-		unsafe { libc::kill(pid, 0) == 0 }
-	}
-
 	/// Exercise tracing through the real engine, native tools, spawner and
 	/// capture pipes, never `FakeHost`'s synthetic command implementations.
 	async fn trace_capture(
@@ -957,7 +961,11 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn trace_descriptor_wrappers_keep_thin_handles_and_shared_identity() {
 		use crate::bash::{CmdTag, FdFlags, FdRef, Host, RunId, StdFd, Vpid};
-		let mut host = PiHost::new(Box::new(StdFs::default()), tokio::runtime::Handle::current());
+		let mut host = PiHost::new(
+			Box::new(StdFs::default()),
+			tokio::runtime::Handle::current(),
+			crate::host::TERM_GRACE,
+		);
 		host.set_event_sink(Some(Arc::new(crate::bash::trace::RunTrace::new(""))));
 		let (_reader, writer) = io::pipe().unwrap();
 		host.streams().install(
@@ -1103,6 +1111,19 @@ mod tests {
 		);
 	}
 
+	/// Output written while no command tags the fds (an arithmetic
+	/// command's diagnostic, an xtrace line of one) is visible output too:
+	/// the trace holds every byte the capture got.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn trace_output_written_outside_a_simple_command_is_visible_output() {
+		let mut session = session();
+		let (captured, trace) =
+			trace_capture(&mut session, "(( 1/0 )); set -x; (( 2 )); set +x; echo after").await;
+		assert!(captured.stdout.contains("division by 0"), "{:?}", captured.stdout);
+		assert!(captured.stdout.contains("+ ((  2  ))"), "{:?}", captured.stdout);
+		assert_eq!(trace_output(&trace.snapshot()), captured.stdout);
+	}
+
 	#[tokio::test(flavor = "multi_thread")]
 	async fn trace_shared_capture_preserves_external_stdout_stderr_interleaving() {
 		let mut session = session();
@@ -1194,13 +1215,17 @@ mod tests {
 	async fn trace_quiet_external_output_advances_revision_before_command_end() {
 		let mut session = session();
 		let gates = tempfile::tempdir().unwrap();
-		let next = gates.path().join("next");
-		let end = gates.path().join("end");
+		let (mut next, mut end) =
+			(crate::testkit::child::Gate::new(), crate::testkit::child::Gate::new());
+		next.link(&gates.path().join("next"));
+		end.link(&gates.path().join("end"));
+		// The second wait is the same as `AWAIT_GATE`, on fd 4.
 		let script = format!(
-			"/bin/sh -c 'printf first; while [ ! -e \"{}\" ]; do sleep 0.01; done; printf second; \
-			 while [ ! -e \"{}\" ]; do sleep 0.01; done'",
-			next.display(),
-			end.display()
+			"/bin/sh -c 'printf first; {}; printf second; while read -r _; do :; done <&4' 3< {} 4< \
+			 {}",
+			crate::testkit::child::AWAIT_GATE,
+			gates.path().join("next").display(),
+			gates.path().join("end").display()
 		);
 		let trace = Arc::new(crate::bash::trace::RunTrace::new(script.as_str()));
 		let options = RunOptions {
@@ -1212,7 +1237,7 @@ mod tests {
 			let first = loop {
 				if trace_output(&trace.snapshot()) == "first" {
 					let revision = trace.version();
-					std::fs::write(&next, []).unwrap();
+					next.open();
 					break revision;
 				}
 				tokio::task::yield_now().await;
@@ -1222,17 +1247,13 @@ mod tests {
 				if trace_output(&snapshot) == "firstsecond" {
 					assert!(trace.version() > first, "coalescing changes the poll revision");
 					assert!(snapshot.status.is_none(), "output is visible before CmdEnd/RunEnd");
-					std::fs::write(&end, []).unwrap();
+					end.open();
 					break;
 				}
 				tokio::task::yield_now().await;
 			}
 		};
-		let (captured, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-			tokio::join!(capture(&mut session, options), probe)
-		})
-		.await
-		.expect("live output callback");
+		let (captured, ()) = tokio::join!(capture(&mut session, options), probe);
 		assert_eq!(captured.stdout, "firstsecond");
 	}
 
@@ -1443,11 +1464,12 @@ mod tests {
 		use crate::bash::trace::history::HistoryData;
 		let mut session = session();
 		let gates = tempfile::tempdir().unwrap();
-		let gate = gates.path().join("finish");
+		let mut gate = crate::testkit::child::Gate::new();
+		gate.link(&gates.path().join("finish"));
 		let script = format!(
-			"timeout 1 /usr/bin/printf hi; /bin/sh -c 'while [ ! -e \"{}\" ]; do sleep 0.01; done'; \
-			 /usr/bin/false",
-			gate.display()
+			"timeout 1 /usr/bin/printf hi; /bin/sh -c '{}' 3< {}; /usr/bin/false",
+			crate::testkit::child::AWAIT_GATE,
+			gates.path().join("finish").display()
 		);
 		let trace = Arc::new(crate::bash::trace::RunTrace::new(script.as_str()));
 		let options = RunOptions {
@@ -1465,17 +1487,13 @@ mod tests {
 				{
 					assert_eq!(snapshot.status, None, "a tool child cannot complete the root snapshot");
 					assert_eq!(trace_output(&snapshot), "hi");
-					std::fs::write(&gate, []).unwrap();
+					gate.open();
 					break;
 				}
 				tokio::task::yield_now().await;
 			}
 		};
-		let (captured, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-			tokio::join!(capture(&mut session, options), probe)
-		})
-		.await
-		.expect("tool child finishes while the root waits");
+		let (captured, ()) = tokio::join!(capture(&mut session, options), probe);
 		assert_eq!(captured.outcome.status, 1);
 		let snapshot = trace.snapshot();
 		assert_eq!(snapshot.status, Some(1));
@@ -1675,15 +1693,19 @@ mod tests {
 			stdout: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
 			..RunStdio::default()
 		};
-		let outcome = tokio::time::timeout(
-			Duration::from_secs(1),
-			s.run("/bin/sleep 2 &", stdio, CancellationToken::new()),
-		)
-		.await
-		.expect("a background external holding stdout must not delay the run")
-		.unwrap();
+		// The job outlives the runner's bound: a run it delayed would hang the
+		// test until the runner fails it.
+		let command = format!(
+			"{} {} &",
+			crate::testkit::child::on_path("sleep"),
+			crate::testkit::child::LIFETIME.as_secs()
+		);
+		let outcome = s
+			.run(&command, stdio, CancellationToken::new())
+			.await
+			.unwrap();
 		assert_eq!(outcome.status, 0);
-		assert_eq!(sh(&mut s, "wait %1").await.outcome.status, 0);
+		assert_eq!(sh(&mut s, "kill %1; wait %1").await.outcome.status, 128 + libc::SIGTERM);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -1880,42 +1902,58 @@ mod tests {
 				(pid, ids)
 			}
 		};
-		let started = Instant::now();
+		// The sleep (600 s, `testkit::child::LIFETIME`) outlives the test
+		// runner's bound, so only the cancel ends it.
+		let sleep = format!("{} 600", crate::testkit::child::on_path("sleep"));
 		let (outcome, (pid, (pgid, sid, own_group))) =
-			tokio::join!(s.run("/bin/sleep 30", RunStdio::default(), cancel.clone()), probe);
+			tokio::join!(s.run(&sleep, RunStdio::default(), cancel.clone()), probe);
 		let outcome = outcome.unwrap();
 		assert!(outcome.cancelled);
+		// 143, not 137: the run ended on the cancel's TERM, inside the
+		// session's own grace, rather than by its KILL after it.
 		assert_eq!(outcome.status, 143);
-		assert!(started.elapsed() < Duration::from_secs(5), "cancel took {:?}", started.elapsed());
 		assert_eq!((pgid, sid), (pid, pid), "the external leads its own session");
 		assert_ne!(pgid, own_group);
 		assert!(children.pids().is_empty(), "no run in flight");
-		let gone = Instant::now();
-		while alive(pid) && gone.elapsed() < Duration::from_secs(3) {
+		// Waits as long as that takes: a sleep the cancel did not reach hangs
+		// the test until the runner's timeout.
+		while !crate::sys::proc::ended(pid) {
 			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
-		assert!(!alive(pid), "sleep {pid} survived the cancel");
 		// The session is still usable.
 		assert_eq!(sh(&mut s, "echo ok").await.stdout, "ok\n");
 	}
 
+	/// A cancel the TERM trap catches is escalated to KILL. The cancel comes
+	/// once the script says its trap is set: a cancel that reaches the run
+	/// before the `trap` command ends it by the TERM itself (143), and a
+	/// fixed 200 ms delay lost that race on a loaded machine.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn trapped_term_escalates_to_kill() {
 		let mut s = session();
 		let cancel = CancellationToken::new();
+		let (reader, writer) = io::pipe().unwrap();
+		let stdio = RunStdio {
+			stdout: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
+			..RunStdio::default()
+		};
 		let trigger = cancel.clone();
-		tokio::spawn(async move {
-			tokio::time::sleep(Duration::from_millis(200)).await;
+		let armed = std::thread::spawn(move || {
+			let mut line = String::new();
+			let _ = io::BufRead::read_line(&mut io::BufReader::new(reader), &mut line);
 			trigger.cancel();
+			line
 		});
-		let started = Instant::now();
+		// The TERM trap loops for ever, so only the KILL ends the run (137); a
+		// cancel that never escalated would hang the test until the runner's
+		// bound.
 		let outcome = s
-			.run("trap 'while :; do :; done' TERM; while :; do :; done", RunStdio::default(), cancel)
+			.run("trap 'while :; do :; done' TERM; echo armed; while :; do :; done", stdio, cancel)
 			.await
 			.unwrap();
+		assert_eq!(armed.join().unwrap(), "armed\n", "the cancel came once the trap was set");
 		assert!(outcome.cancelled);
 		assert_eq!(outcome.status, 137);
-		assert!(started.elapsed() < Duration::from_secs(4), "took {:?}", started.elapsed());
 	}
 
 	#[test]
@@ -1936,5 +1974,518 @@ mod tests {
 		assert!(check_signal_target(pid).is_ok());
 		child.kill().unwrap();
 		child.wait().unwrap();
+	}
+
+	/// The guard fails closed: with no descriptor left to read the process
+	/// table, a signal at the shell's parent is still refused (the kernel
+	/// names the parent), and so is one at any other process, with the
+	/// reason, since it may be an ancestor above. The unreadable case runs
+	/// in a child test process ([`crate::sys::proc::short_of_descriptors`]);
+	/// first, the control: with every process readable, the parent is
+	/// refused and the unrelated `sleep` is not.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn signals_are_refused_while_the_ancestors_cannot_be_read() {
+		use crate::{host::check_signal_target, sys::proc::short_of_descriptors};
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.unwrap();
+		let pid = child.id();
+		// SAFETY: getppid has no preconditions.
+		let parent = unsafe { libc::getppid() };
+		let readable =
+			(check_signal_target(parent), check_signal_target(i32::try_from(pid).unwrap()));
+		let probed =
+			short_of_descriptors::run("session::tests::signal_target_with_no_descriptor_left", pid);
+		child.kill().unwrap();
+		child.wait().unwrap();
+		assert_eq!(readable.0.unwrap_err().kind(), io::ErrorKind::PermissionDenied, "the parent");
+		assert!(readable.1.is_ok(), "the unrelated sleep {pid}: {:?}", readable.1);
+		probed.unwrap();
+	}
+
+	/// Run by [`signals_are_refused_while_the_ancestors_cannot_be_read`] in
+	/// a child process with no descriptor left.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by signals_are_refused_while_the_ancestors_cannot_be_read"]
+	fn signal_target_with_no_descriptor_left() {
+		use crate::{host::check_signal_target, sys::proc::short_of_descriptors};
+		let Some(sleep) = short_of_descriptors::pid() else {
+			return;
+		};
+		// SAFETY: getppid has no preconditions.
+		let parent = unsafe { libc::getppid() };
+		short_of_descriptors::leave_none();
+		let me = i32::try_from(std::process::id()).unwrap();
+		assert!(crate::sys::proc::info(me).is_none(), "/proc/{me}/stat could still be read");
+		assert!(crate::sys::proc::info(parent).is_none(), "/proc/{parent}/stat could still be read");
+		let err =
+			check_signal_target(parent).expect_err("the signal at the unreadable parent went through");
+		assert_eq!(err.to_string(), "refusing to signal the shell process");
+		let err = check_signal_target(sleep)
+			.expect_err("the signal went through while the ancestors were unread");
+		assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+		let said = format!(
+			"cannot read process {parent} to check it is not the shell's ancestor: Too many open \
+			 files"
+		);
+		assert_eq!(err.to_string(), said);
+	}
+
+	/// Without `/proc` (every read of `/proc/<pid>/stat` is `ENOENT`,
+	/// simulated) the shell cannot walk its own ancestors, so the guard has
+	/// nothing to check: a signal at any process but this one and its group
+	/// goes through, as in a shell without the guard.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn without_proc_the_guard_refuses_only_this_process() {
+		use crate::{host::check_signal_target, sys::proc::fail_reads};
+		let mut child = crate::testkit::child::dies_with_this_process(
+			std::process::Command::new("sleep").arg("600"),
+		)
+		.spawn()
+		.unwrap();
+		let pid = i32::try_from(child.id()).unwrap();
+		let me = i32::try_from(std::process::id()).unwrap();
+		let checked = {
+			let _absent = fail_reads(vec![(None, libc::ENOENT)]);
+			(check_signal_target(pid), check_signal_target(me), check_signal_target(0))
+		};
+		child.kill().unwrap();
+		child.wait().unwrap();
+		assert!(checked.0.is_ok(), "the sleep {pid}: {:?}", checked.0);
+		assert!(checked.1.is_err() && checked.2.is_err(), "this process and its group: {checked:?}");
+	}
+
+	/// With `/proc` mounted, an ancestor whose read fails with `ENOENT`
+	/// while a signal still reaches it (simulated for the shell's parent) is
+	/// unread, not gone: in our pid namespace that is a race with its exit or
+	/// a reuse of its pid, so every signal is refused, naming the pid and the
+	/// error.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn an_ancestor_read_enoent_while_proc_is_mounted_refuses_every_signal() {
+		use crate::{host::check_signal_target, sys::proc::fail_reads};
+		let mut child = crate::testkit::child::dies_with_this_process(
+			std::process::Command::new("sleep").arg("600"),
+		)
+		.spawn()
+		.unwrap();
+		let pid = i32::try_from(child.id()).unwrap();
+		// SAFETY: getppid has no preconditions.
+		let parent = unsafe { libc::getppid() };
+		let checked = {
+			let _unread = fail_reads(vec![(Some(parent), libc::ENOENT)]);
+			check_signal_target(pid)
+		};
+		child.kill().unwrap();
+		child.wait().unwrap();
+		let err = checked.expect_err("the signal went through while the parent was unread");
+		let said = format!(
+			"cannot read process {parent} to check it is not the shell's ancestor: No such file or \
+			 directory"
+		);
+		assert_eq!((err.kind(), err.to_string()), (io::ErrorKind::PermissionDenied, said));
+	}
+
+	/// [`crate::sys::proc::read`] proves a process out of reach only when no
+	/// signal of ours reaches it: a reaped child is, whatever the read said
+	/// (`ESRCH`, or a refusal: `ENOENT`, `EACCES`, `EPERM`); a refused read of
+	/// a running child we may signal is not (no `/proc`, another pid
+	/// namespace's, a set-user-ID child), nor is a failure that proves nothing
+	/// (`EMFILE`).
+	#[cfg(unix)]
+	#[test]
+	fn a_failed_read_proves_a_process_out_of_reach_only_when_no_signal_reaches_it() {
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.unwrap();
+		let pid = i32::try_from(child.id()).unwrap();
+		let running = crate::sys::proc::read(pid);
+		let reach = |errno| crate::sys::proc::out_of_reach(pid, &io::Error::from_raw_os_error(errno));
+		let refused_while_running =
+			[libc::ENOENT, libc::EACCES, libc::EPERM, libc::EMFILE].map(reach);
+		child.kill().unwrap();
+		child.wait().unwrap();
+		assert!(matches!(&running, Ok(Some(found)) if found.pid == pid), "{running:?}");
+		assert_eq!(
+			refused_while_running, [false; 4],
+			"ENOENT, EACCES, EPERM, EMFILE for a running child"
+		);
+		for errno in [libc::ESRCH, libc::ENOENT, libc::EACCES, libc::EPERM] {
+			assert!(reach(errno), "errno {errno} for the reaped child");
+		}
+		assert!(!reach(libc::EMFILE), "EMFILE proves nothing, even for the reaped child");
+		assert!(matches!(crate::sys::proc::read(pid), Ok(None)), "the reaped child");
+	}
+
+	/// Runs `trap '' PIPE; echo y; echo "status=$?" >&2` with fd 1 a pipe
+	/// nothing reads, on the writer-thread route (the test's child process),
+	/// with or without a trace: what fd 2 got.
+	#[cfg(target_os = "linux")]
+	fn echo_into_a_pipe_whose_reader_is_gone(traced: bool) -> String {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut s = session();
+			let (reader, writer) = io::pipe().unwrap();
+			drop(reader);
+			let (mut err_r, err_w) = io::pipe().unwrap();
+			let errors = std::thread::spawn(move || {
+				let mut e = String::new();
+				err_r.read_to_string(&mut e).unwrap();
+				e
+			});
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+				stdout: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
+				stderr: Some(std::fs::File::from(std::os::fd::OwnedFd::from(err_w))),
+			};
+			let script = "trap '' PIPE; echo y; echo \"status=$?\" >&2";
+			let events = if traced {
+				Some(Arc::new(crate::bash::trace::RunTrace::new(script)) as Arc<dyn EventSink>)
+			} else {
+				None
+			};
+			let options = RunOptions { events, ..RunOptions::new(script) };
+			tokio::time::timeout(
+				std::time::Duration::from_secs(10),
+				s.run_with(options, stdio, CancellationToken::new()),
+			)
+			.await
+			.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within 10 s"))
+			.unwrap();
+			errors.join().unwrap()
+		})
+	}
+
+	/// A builtin's write that a descriptor's writer thread took and that
+	/// then failed (nothing reads the pipe any more) fails that builtin: a
+	/// write ends only at its flush, so `echo` reports the write error and
+	/// exits 1, and the failure is never lost. The writer thread is forced
+	/// in this test's child process, as Darwin always uses it.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_write_that_fails_after_its_hand_off_fails_its_builtin() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_write_that_fails_after_its_hand_off_fails_its_builtin"),
+			|| {
+				let errors = echo_into_a_pipe_whose_reader_is_gone(false);
+				assert!(errors.contains("status=1"), "echo's status: {errors:?}");
+				assert!(errors.contains("Broken pipe"), "echo reports its write error: {errors:?}");
+			},
+		);
+	}
+
+	/// The same under a trace, where the command's visible output fds are
+	/// tagged with the command ([`crate::bash::FdRef::with_tag`]): the tagged
+	/// fd hands the writer thread's mark back, so the failure still reaches
+	/// `echo`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_write_that_fails_after_its_hand_off_fails_its_builtin_under_a_trace() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_write_that_fails_after_its_hand_off_fails_its_builtin_under_a_trace"
+			),
+			|| {
+				let errors = echo_into_a_pipe_whose_reader_is_gone(true);
+				assert!(errors.contains("status=1"), "echo's status: {errors:?}");
+				assert!(errors.contains("Broken pipe"), "echo reports its write error: {errors:?}");
+			},
+		);
+	}
+
+	/// Runs `script` with fd 2 a full pipe, on the writer-thread route (the
+	/// test's child process). For the first 2 s nothing reads that pipe, so
+	/// what a command hands to its writer thread stays there: a later
+	/// command's line on fd 1 then shows that the later command ran before
+	/// the earlier command's output was out. Then the pipe is drained, and the
+	/// later command must run. With `traced`, the run has a trace. Returns
+	/// fd 1 while the pipe was held, fd 1 at the end, and what the drained
+	/// pipe held after its fill.
+	#[cfg(target_os = "linux")]
+	fn run_with_held_stderr(script: &str, traced: bool) -> (String, String, String) {
+		use std::os::fd::{AsRawFd, OwnedFd};
+
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(2)
+			.enable_all()
+			.build()
+			.unwrap();
+		let (mut held_r, held_w) = io::pipe().unwrap();
+		// SAFETY: `F_GETPIPE_SZ` takes no argument; `held_w` owns the fd.
+		let capacity =
+			usize::try_from(unsafe { libc::fcntl(held_w.as_raw_fd(), libc::F_GETPIPE_SZ) }).unwrap();
+		std::io::Write::write_all(&mut &held_w, &vec![b'q'; capacity]).unwrap();
+		let (mut out_r, out_w) = io::pipe().unwrap();
+		let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+		let seen = std::sync::Arc::clone(&out);
+		let out_thread = std::thread::spawn(move || {
+			let mut buf = [0u8; 4096];
+			while let Ok(n) = out_r.read(&mut buf) {
+				if n == 0 {
+					break;
+				}
+				seen.lock().extend_from_slice(&buf[..n]);
+			}
+		});
+		let snapshot = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+		let (held_out, held_tail) = (std::sync::Arc::clone(&out), std::sync::Arc::clone(&snapshot));
+		let held_thread = std::thread::spawn(move || {
+			std::thread::sleep(std::time::Duration::from_secs(2));
+			*held_tail.lock() = String::from_utf8_lossy(&held_out.lock()).into_owned();
+			let mut all = Vec::new();
+			held_r.read_to_end(&mut all).unwrap();
+			all
+		});
+		runtime.block_on(async {
+			let mut s = session();
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+				stdout: Some(std::fs::File::from(OwnedFd::from(out_w))),
+				stderr: Some(std::fs::File::from(OwnedFd::from(held_w))),
+			};
+			let events = if traced {
+				Some(Arc::new(crate::bash::trace::RunTrace::new(script)) as Arc<dyn EventSink>)
+			} else {
+				None
+			};
+			let options = RunOptions { events, ..RunOptions::new(script) };
+			let run = s.run_with(options, stdio, CancellationToken::new());
+			let _ = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+		});
+		drop(runtime);
+		let all = held_thread.join().unwrap();
+		out_thread.join().unwrap();
+		let held = snapshot.lock().clone();
+		let end = String::from_utf8_lossy(&out.lock()).into_owned();
+		(held, end, String::from_utf8_lossy(&all[capacity.min(all.len())..]).into_owned())
+	}
+
+	/// One held-stderr case in the test's own child process: `after` is
+	/// absent while fd 2 is held, and present once it drains, and the held
+	/// text `held` reached fd 2.
+	#[cfg(target_os = "linux")]
+	fn next_command_waits_for_held_stderr(test: &str, script: &str, held: &str) {
+		next_command_waits_for_held_stderr_traced(test, script, held, false);
+	}
+
+	/// [`next_command_waits_for_held_stderr`], with a trace when `traced`.
+	#[cfg(target_os = "linux")]
+	fn next_command_waits_for_held_stderr_traced(
+		test: &str,
+		script: &str,
+		held: &str,
+		traced: bool,
+	) {
+		crate::sys::in_blocking_writer_process(test, || {
+			let (while_held, end, drained) = run_with_held_stderr(script, traced);
+			assert!(
+				!while_held.contains("after"),
+				"the next command ran before the earlier command's output was out: {while_held:?}"
+			);
+			assert!(end.contains("after"), "the next command never ran once fd 2 drained: {end:?}");
+			assert!(drained.contains(held), "the held output never reached fd 2: {drained:?}");
+		});
+	}
+
+	/// A diagnostic (`Kernel::diag`, written by `flush_out`).
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_diagnostic_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_diagnostic_keeps_the_next_command_from_running"),
+			"nosuchcmd; echo after",
+			"not found",
+		);
+	}
+
+	/// The same under a trace, where the command's stderr is tagged with the
+	/// command ([`crate::bash::FdRef::with_tag`]): the settle reaches the
+	/// tagged fd's file.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_diagnostic_under_a_trace_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr_traced(
+			concat!(
+				module_path!(),
+				"::a_held_diagnostic_under_a_trace_keeps_the_next_command_from_running"
+			),
+			"nosuchcmd; echo after",
+			"not found",
+			true,
+		);
+	}
+
+	/// An xtrace line, written by `flush_out` before the command it traces.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_xtrace_line_keeps_its_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_xtrace_line_keeps_its_command_from_running"),
+			"set -x; echo after",
+			"+ echo after",
+		);
+	}
+
+	/// `suspend`'s refusal (`extras::Refusal`).
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_refusal_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_refusal_keeps_the_next_command_from_running"),
+			"suspend; echo after",
+			"suspend",
+		);
+	}
+
+	/// `fc -s`'s echo of the command it runs again.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_fc_echo_keeps_its_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_fc_echo_keeps_its_command_from_running"),
+			"history -s 'echo after'; fc -s",
+			"echo after",
+		);
+	}
+
+	/// A tool's message (`tools::Out`, `nohup` without an operand).
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_tool_message_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_tool_message_keeps_the_next_command_from_running"),
+			"nohup; echo after",
+			"nohup",
+		);
+	}
+
+	/// A diagnostic of a failed redirection of a compound command, held on
+	/// the redirection's target, keeps the next command from running: the
+	/// restore puts fd 2 back (here `/dev/null`, which takes everything at
+	/// once) before the held entry settles, so the settle must wait on the
+	/// file that took the bytes (fd 3, the held pipe), not on fd 2.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_diagnostic_on_a_restored_fd_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(
+				module_path!(),
+				"::a_held_diagnostic_on_a_restored_fd_keeps_the_next_command_from_running"
+			),
+			"exec 3>&2 2>/dev/null; { :; } 2>&3 >/nonexistent/out; echo after",
+			"nonexistent",
+		);
+	}
+
+	/// Runs `script` with fd `gone` (1 or 2) a pipe nothing reads, on the
+	/// writer-thread route (the test's child process): what the other stream
+	/// got, and how many chunks the writer threads failed.
+	#[cfg(target_os = "linux")]
+	fn run_into_a_readerless_pipe(script: &str, gone: i32) -> (String, usize) {
+		use std::os::fd::OwnedFd;
+
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut s = session();
+			let (reader, readerless) = io::pipe().unwrap();
+			drop(reader);
+			let (mut other_r, other_w) = io::pipe().unwrap();
+			let other = std::thread::spawn(move || {
+				let mut text = String::new();
+				other_r.read_to_string(&mut text).unwrap();
+				text
+			});
+			let (stdout, stderr) = if gone == 1 {
+				(readerless, other_w)
+			} else {
+				(other_w, readerless)
+			};
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+				stdout: Some(std::fs::File::from(OwnedFd::from(stdout))),
+				stderr: Some(std::fs::File::from(OwnedFd::from(stderr))),
+			};
+			tokio::time::timeout(
+				std::time::Duration::from_secs(10),
+				s.run(script, stdio, CancellationToken::new()),
+			)
+			.await
+			.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within 10 s"))
+			.unwrap();
+			let text = other.join().unwrap();
+			(text, crate::sys::CHUNKS_FAILED.load(std::sync::atomic::Ordering::SeqCst))
+		})
+	}
+
+	/// A builtin's output of four chunks stops at the first one that fails:
+	/// bash stops at its first failed `write(2)`. Handing off the rest sends
+	/// a FIFO's next reader the tail without the head, or blocks the builtin
+	/// on the tail before it reports the failure.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_builtin_stops_at_its_first_failed_chunk() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_builtin_stops_at_its_first_failed_chunk"),
+			|| {
+				let (errors, failed) = run_into_a_readerless_pipe(
+					"trap '' PIPE; big=$(printf '%0200000d' 0); echo \"$big\"; echo \"status=$?\" >&2",
+					1,
+				);
+				assert!(errors.contains("status=1"), "echo's status: {errors:?}");
+				assert_eq!(errors.matches("Broken pipe").count(), 1, "one write error: {errors:?}");
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
+	}
+
+	/// A diagnostic of two chunks (`Kernel::diag`, written by `flush_out`)
+	/// stops at the first one that fails, and the next command runs.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_diagnostic_stops_at_its_first_failed_chunk() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_diagnostic_stops_at_its_first_failed_chunk"),
+			|| {
+				let (out, failed) = run_into_a_readerless_pipe(
+					"big=$(printf '%070000d' 0); \"$big\"; echo \"after=$?\"",
+					2,
+				);
+				assert!(out.contains("after=127"), "the next command: {out:?}");
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
+	}
+
+	/// A tool's message of two chunks (`tools::Out`, `timeout`'s usage
+	/// error naming its operand) stops at the first one that fails, and the
+	/// next command runs.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_tool_message_stops_at_its_first_failed_chunk() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_tool_message_stops_at_its_first_failed_chunk"),
+			|| {
+				let (out, failed) = run_into_a_readerless_pipe(
+					"timeout \"$(printf '%070000d' 0)x\" true; echo \"after=$?\"",
+					2,
+				);
+				assert!(out.contains("after=125"), "the next command: {out:?}");
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
 	}
 }

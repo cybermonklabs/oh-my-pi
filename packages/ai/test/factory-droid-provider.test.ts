@@ -1,4 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { buildFactoryDroidModel } from "@oh-my-pi/pi-catalog/discovery";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -280,6 +281,25 @@ describe("Factory Droid completions wire (Droid Core)", () => {
 		},
 	);
 
+	it("sends a side request under its parent conversation's session id and cache key", async () => {
+		// Factory routes and caches a conversation by x-session-id and prompt_cache_key; a side
+		// request that sent its own id read its parent's prefix cold.
+		const send = async (options: { sessionId: string; parentSessionId?: string }) => {
+			const captured: CapturedRequest[] = [];
+			await streamFactoryDroid(
+				gptTerra(),
+				{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+				{ apiKey: WORKOS_TOKEN, fetch: captureFetch(captured, [...responsesChunks("OK")]), ...options },
+			).result();
+			return captured[0];
+		};
+		const parent = await send({ sessionId: "019fd-test-session" });
+		const side = await send({ sessionId: "019fd-test-session:side:1", parentSessionId: "019fd-test-session" });
+
+		expect(side.headers["x-session-id"]).toBe(parent.headers["x-session-id"]);
+		expect(side.body.prompt_cache_key).toBe(parent.body.prompt_cache_key);
+	});
+
 	it("forwards payload replacement, response metadata and raw SSE observation through the wrapper", async () => {
 		const captured: CapturedRequest[] = [];
 		const observed = { status: 0, chunks: [] as string[] };
@@ -387,7 +407,7 @@ describe("Factory Droid completions wire (Droid Core)", () => {
 });
 
 describe("Factory Droid error handling", () => {
-	it("names the model when the proxy rejects the route regionally", async () => {
+	it("names the model in the shown text when the proxy rejects the route regionally", async () => {
 		const result = await streamFactoryDroid(
 			kimiK3(),
 			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
@@ -399,6 +419,9 @@ describe("Factory Droid error handling", () => {
 		).result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorStatus).toBe(400);
-		expect(result.errorMessage).toMatch(/kimi-k3.*region/);
+		expect(errorDisplayText(result)).toBe("kimi-k3 is not served from your network's region. Choose another model.");
+		// Decisions read `errorMessage`: the provider's rejection, never omp's text naming the local model id.
+		expect(result.errorMessage).toContain("Provider not available in this region");
+		expect(result.errorMessage).not.toContain("kimi-k3");
 	});
 });

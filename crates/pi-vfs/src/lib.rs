@@ -16,6 +16,10 @@
 //! build paths from raw names ([`join_path`], [`child_path`],
 //! [`with_file_name`]) encode, [`file_name`] decodes once.
 //!
+//! [`Fs::open_dir`] opens a [`DirHandle`], below which every call names one
+//! entry: a descriptor on the host, a path on a provider (see
+//! [`dir_handle`]).
+//!
 //! # Threading contract
 //!
 //! Host operations never involve futures on either facade. Provider
@@ -34,7 +38,10 @@
 
 mod canonicalize;
 mod dir;
+pub mod dir_handle;
 mod error;
+#[cfg(unix)]
+mod fifo;
 mod file;
 mod fs;
 mod metadata;
@@ -49,10 +56,13 @@ mod types;
 mod tests;
 
 pub use dir::{DirEntry, ReadDir};
+pub use dir_handle::DirHandle;
 pub use error::{
 	cancelled, crosses_devices, invalid_argument, is_a_directory, is_cancelled, no_provider,
 	not_a_directory, permission_denied, read_only_filesystem, unsupported,
 };
+#[cfg(unix)]
+pub use fifo::{FifoOpen, TruncateRegular};
 pub use file::{File, FileHandle};
 #[cfg(unix)]
 pub use file::{POLL_SLICE, fd_reads_can_block, readable_within, reads_can_block, wait_readable};

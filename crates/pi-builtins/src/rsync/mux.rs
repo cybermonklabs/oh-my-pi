@@ -2868,26 +2868,47 @@ mod tests {
 		assert_eq!(*lock(&calls), [false]);
 	}
 
-	/// `--timeout=2`: keepalives go out every second (lull 1), so the idle check at
-	/// each second sees at most 1 s of silence. (At `--timeout=1` lull equals the
-	/// timeout and upstream itself times out on the second check, because a queued
-	/// keepalive stamps `last_io_out` only once it is written.)
+	/// `--timeout=30`: keepalives go out every 15 s (lull 15), so the idle check
+	/// at each 15 s sees at most 15 s of silence, half the timeout. (At
+	/// `--timeout=1` lull equals the timeout and upstream itself times out on the
+	/// second check, because a queued keepalive stamps `last_io_out` only once it
+	/// is written.)
+	///
+	/// The timeout is large against a stall of the reading thread: the product
+	/// times out, rightly, once a stall passes half the timeout (at `--timeout=2`
+	/// a 1.5 s stall did). The read is cancelled once two keepalives are out, not
+	/// at a fixed time, so a slow CPU makes the test longer but cannot end the
+	/// read before the second keepalive. Only the deadline, four timeouts,
+	/// cancels it otherwise, so a sender that sends none fails the test rather
+	/// than hanging it.
+	///
+	/// The test runs in a process of its own, away from the other tests'
+	/// threads.
 	#[test]
 	fn blocked_sender_sends_keepalives_instead_of_timing_out() {
-		let (mut r, _tx, cancel) = blocking_reader(Some(Duration::from_secs(2)));
+		if !crate::own_process::own_process() {
+			return;
+		}
+		let timeout = Duration::from_secs(30);
+		let (mut r, _tx, cancel) = blocking_reader(Some(timeout));
 		let sink = Sink::default();
-		let w = writer(&sink, WriteConfig { timeout: Some(Duration::from_secs(2)), ..WriteConfig::default() });
+		let w = writer(&sink, WriteConfig { timeout: Some(timeout), ..WriteConfig::default() });
 		w.start_multiplex().unwrap();
 		r.set_role(Role::Sender);
 		r.link_writer(w);
-		let flag = Arc::clone(&cancel);
+		let ended = Arc::new(AtomicBool::new(false));
+		let (flag, read_ended, sent) = (Arc::clone(&cancel), Arc::clone(&ended), Arc::clone(&sink.bytes));
 		let t = thread::spawn(move || {
-			thread::sleep(Duration::from_millis(2300));
+			let deadline = Instant::now() + 4 * timeout;
+			while lock(&sent).len() < 8 && !read_ended.load(Ordering::Relaxed) && Instant::now() < deadline {
+				thread::sleep(Duration::from_millis(10));
+			}
 			flag.store(true, Ordering::Relaxed);
 		});
 		let err = r.read(&mut [0u8; 1]).unwrap_err();
+		ended.store(true, Ordering::Relaxed);
 		t.join().unwrap();
-		assert_eq!(RsyncError::from_io(&err, RERR_STREAMIO).code, RERR_SIGNAL);
+		assert_eq!(RsyncError::from_io(&err, RERR_STREAMIO).code, RERR_SIGNAL, "{err}");
 		let out = sink.take();
 		assert!(out.len() >= 8 && out.chunks(4).all(|c| c == [0, 0, 0, 7]), "{out:?}");
 	}

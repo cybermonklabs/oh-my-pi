@@ -8,6 +8,7 @@
  * represented by a proxy with the same surface. The TUI's focused-subagent
  * view additionally reads {@link AgentViewSession}.
  */
+import type { SessionStorage } from "./session-storage";
 import type { AgentMessage, AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Effort, ImageContent, Model, ServiceTier, ToolResultMessage, UsageReport } from "@oh-my-pi/pi-ai";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -22,6 +23,7 @@ import type { ExtensionRunner } from "../extensibility/extensions";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState } from "../goals/state";
+import type { SessionStoreMask } from "../secrets/session-store-mask";
 import type { ApprovalGrantStore } from "../tools/approval-cache";
 import type { TokenRateMeter } from "../utils/token-rate";
 import type { AgentDefinition } from "../task/types";
@@ -63,6 +65,8 @@ export interface AgentSessionManagerHandle {
 	getSessionFile(): string | undefined;
 	/** Artifacts directory, or null when the session is not persisted. */
 	getArtifactsDir(): string | null;
+	/** Storage holding the session's transcript tree. */
+	getStorage?(): SessionStorage;
 	/** Cumulative usage, including off-transcript model calls and nested task results. */
 	getUsageStatistics(): UsageStatistics;
 }
@@ -150,6 +154,8 @@ export interface AgentSessionHandle {
 	abort(options?: {
 		goalReason?: "interrupted" | "internal";
 		reason?: string;
+		/** The session is going away: a turn waiting to retry is cut off for `omp --restore`, not stopped. */
+		cutOff?: boolean;
 		preserveCompaction?: boolean;
 		deliverQueuedMessages?: boolean;
 	}): Promise<void>;
@@ -195,6 +201,8 @@ export interface AgentViewSessionManager extends AgentSessionManagerHandle {
 	getArtifactPath(id: string): Promise<string | null>;
 	/** In-memory content of a session artifact (non-persistent sessions), or null; a worker-homed session answers asynchronously. */
 	getArtifactContent(id: string): string | null | Promise<string | null>;
+	/** The mask the session's stored writes apply now (the /btw history too), or `null` while its `secrets.maskSessionStore` is off. */
+	storeMask(): SessionStoreMask | null;
 }
 
 /** TTSR rule source the TUI's link resolver reads. */

@@ -92,7 +92,7 @@ fn clone_works_on(root: &Path) -> bool {
 	let works = pi_iso::clone_candidates(None).into_iter().any(|kind| {
 		let _ = fs::remove_dir_all(&target);
 		pi_iso::backend(kind)
-			.clone_tree(&source, &target, &[])
+			.clone_tree(&source, &target, &pi_iso::CloneExclusions::default())
 			.is_ok()
 	});
 	fs::remove_dir_all(source).unwrap();
@@ -130,6 +130,7 @@ fn clone_excludes_self_ignored_environments_and_nested_cmake_caches() {
 			detach:       true,
 			clone:        WorktreeClone::Auto,
 			keep_changes: false,
+			lock:         None,
 		})
 		.unwrap();
 	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
@@ -172,6 +173,7 @@ fn clone_exclusion_keeps_tracked_data_and_keep_changes_state() {
 				detach: true,
 				clone: WorktreeClone::Auto,
 				keep_changes,
+				lock: None,
 			})
 			.unwrap();
 		assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
@@ -220,6 +222,7 @@ fn clone_disabled_or_unavailable_uses_an_ordinary_checkout() {
 				detach: true,
 				clone,
 				keep_changes: false,
+				lock: None,
 			})
 			.unwrap();
 		assert!(result.cloned_with.is_none());
@@ -262,15 +265,19 @@ fn clone_reconciles_carried_paths_using_target_ignore_rules() {
 			detach:       true,
 			clone:        WorktreeClone::Auto,
 			keep_changes: false,
+			lock:         None,
 		})
 		.unwrap();
 	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
-	assert!(!target.join("prompt-exports/note with spaces.md").exists());
-	assert!(!target.join("apps/source-only").exists());
+	// The source ignores neither `target-only` path, so each is the source's
+	// untracked work rather than a cache, though the target would ignore it.
+	for left_out in
+		["prompt-exports/note with spaces.md", "apps/source-only", "target-only", "apps/target-only"]
+	{
+		assert!(fs::symlink_metadata(target.join(left_out)).is_err(), "{left_out} was carried");
+	}
 	for (relative, contents) in [
 		("prompt-exports/tracked.txt", "target-tracked\n"),
-		("target-only/note with spaces.md", "target-only ignored\n"),
-		("apps/target-only/note.txt", "nested target-only ignored\n"),
 		("apps/cache/blob", "ignored at both commits\n"),
 		("node_modules/pkg/index.js", "relocatable cache\n"),
 	] {
@@ -299,6 +306,7 @@ fn clone_target_cleanup_does_not_discard_keep_changes() {
 			detach:       true,
 			clone:        WorktreeClone::Auto,
 			keep_changes: true,
+			lock:         None,
 		})
 		.unwrap();
 	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
@@ -309,7 +317,7 @@ fn clone_target_cleanup_does_not_discard_keep_changes() {
 
 #[cfg(unix)]
 #[test]
-fn clone_target_cleanup_keeps_nested_repositories_and_unlinks_only_symlinks() {
+fn clone_target_cleanup_leaves_out_nested_repositories_and_unlinks_only_symlinks() {
 	let (temp, source, repo) = fixture();
 	if !clone_works_on(temp.path()) {
 		eprintln!("SKIP: no working clone backend on this filesystem");
@@ -348,15 +356,488 @@ fn clone_target_cleanup_keeps_nested_repositories_and_unlinks_only_symlinks() {
 			detach:       true,
 			clone:        WorktreeClone::Auto,
 			keep_changes: false,
+			lock:         None,
 		})
 		.unwrap();
 	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
-	assert!(target.join("repositories/nested/.git").is_dir());
-	assert_eq!(
-		fs::read_to_string(target.join("repositories/nested/data.txt")).unwrap(),
-		"nested repository data\n"
+	assert!(
+		fs::symlink_metadata(target.join("repositories/nested")).is_err(),
+		"an ignored nested repository was carried"
 	);
 	assert!(!target.join("links").exists(), "source-only symlink was not unlinked");
 	assert_eq!(snapshot(&outside), outside_before, "cleanup followed a symlink outside the clone");
 	assert_eq!(snapshot(&source), source_before);
+}
+
+/// Makes `dir` a repository of its own with one commit, as a dependency
+/// cloned into a package directory or a checkout someone made by hand is.
+fn nested_repository(dir: &Path) {
+	fs::create_dir_all(dir).unwrap();
+	git(dir, &["init", "-q", "-b", "main"]);
+	write(dir, "data.txt", "nested repository data\n");
+	git(dir, &["add", "."]);
+	git(dir, &[
+		"-c",
+		"user.name=Test",
+		"-c",
+		"user.email=test@example.com",
+		"-c",
+		"commit.gpgsign=false",
+		"commit",
+		"-qm",
+		"nested data",
+	]);
+}
+
+/// The names in `dir`, sorted, or `None` when `dir` is not a directory.
+fn entries(dir: &Path) -> Option<Vec<String>> {
+	let mut names: Vec<String> = fs::read_dir(dir)
+		.ok()?
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+	names.sort();
+	Some(names)
+}
+
+/// A path the source neither tracks nor ignores is the user's uncommitted
+/// work, and a directory holding a `.git` entry is another checkout. A clean
+/// clone carries neither: not when the target commit's rules would ignore the
+/// path, and not when the checkout sits in an ignored directory.
+#[test]
+fn clean_clone_leaves_out_untracked_paths_and_nested_checkouts() {
+	let (temp, source, repo) = fixture();
+	if !clone_works_on(temp.path()) {
+		eprintln!("SKIP: no working clone backend on this filesystem");
+		return;
+	}
+	write(&source, ".gitignore", "node_modules/\nnotes/\n");
+	git(&source, &["add", ".gitignore"]);
+	git(&source, &["commit", "-qm", "the target ignores notes"]);
+	let target_commit = git(&source, &["rev-parse", "HEAD"]);
+	write(&source, ".gitignore", "node_modules/\n");
+	git(&source, &["add", ".gitignore"]);
+	git(&source, &["commit", "-qm", "the source does not"]);
+	write(&source, "notes/todo.txt", "untracked work\n");
+	write(&source, "scratch.txt", "untracked scratch\n");
+	git(&source, &["worktree", "add", "-q", "--detach", ".checkouts/linked", "HEAD"]);
+	nested_repository(&source.join("node_modules/gitdep"));
+	assert_eq!(
+		git(&source, &["status", "--porcelain"]),
+		"?? .checkouts/\n?? notes/\n?? scratch.txt",
+		"the fixture's paths are untracked and not ignored"
+	);
+	let source_before = snapshot(&source);
+	let target = temp.path().join("target");
+	let result = repo
+		.worktree_add(&target, &target_commit, WorktreeAddOptions {
+			detach:       true,
+			clone:        WorktreeClone::Auto,
+			keep_changes: false,
+			lock:         None,
+		})
+		.unwrap();
+	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
+	let carried: Vec<&str> =
+		["notes/todo.txt", "scratch.txt", ".checkouts/linked", "node_modules/gitdep"]
+			.into_iter()
+			.filter(|relative| fs::symlink_metadata(target.join(relative)).is_ok())
+			.collect();
+	assert!(carried.is_empty(), "carried into a clean clone: {carried:?}");
+	assert_eq!(
+		fs::read_to_string(target.join("node_modules/pkg/index.js")).unwrap(),
+		"relocatable cache\n"
+	);
+	assert_eq!(git(&target, &["status", "--porcelain", "--untracked-files=all"]), "");
+	assert_eq!(snapshot(&source), source_before, "the clone changed source files");
+	assert_eq!(git(&source.join(".checkouts/linked"), &["status", "--porcelain"]), "");
+}
+
+/// Keeping changes carries the source's untracked files, and still no other
+/// checkout.
+#[test]
+fn clone_keeping_changes_carries_untracked_files_but_no_nested_checkout() {
+	let (temp, source, repo) = fixture();
+	if !clone_works_on(temp.path()) {
+		eprintln!("SKIP: no working clone backend on this filesystem");
+		return;
+	}
+	write(&source, "notes/todo.txt", "untracked work\n");
+	write(&source, "scratch.txt", "untracked scratch\n");
+	git(&source, &["worktree", "add", "-q", "--detach", ".checkouts/linked", "HEAD"]);
+	nested_repository(&source.join("node_modules/gitdep"));
+	let source_before = snapshot(&source);
+	let target = temp.path().join("target");
+	let result = repo
+		.worktree_add(&target, "HEAD", WorktreeAddOptions {
+			detach:       true,
+			clone:        WorktreeClone::Auto,
+			keep_changes: true,
+			lock:         None,
+		})
+		.unwrap();
+	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
+	for (relative, contents) in [
+		("notes/todo.txt", "untracked work\n"),
+		("scratch.txt", "untracked scratch\n"),
+		("node_modules/pkg/index.js", "relocatable cache\n"),
+	] {
+		assert_eq!(fs::read_to_string(target.join(relative)).unwrap(), contents, "{relative}");
+	}
+	let carried: Vec<&str> = [".checkouts/linked", "node_modules/gitdep"]
+		.into_iter()
+		.filter(|relative| fs::symlink_metadata(target.join(relative)).is_ok())
+		.collect();
+	assert!(carried.is_empty(), "nested checkouts carried while keeping changes: {carried:?}");
+	assert_eq!(
+		git(&target, &["status", "--porcelain", "--untracked-files=all"]),
+		"?? notes/todo.txt\n?? scratch.txt"
+	);
+	assert_eq!(snapshot(&source), source_before, "the clone changed source files");
+}
+
+/// A checked-out submodule is a directory holding a `.git` file whose path is
+/// relative to the source. `git worktree add` leaves the submodule's directory
+/// empty; so does the clone, with or without the source's changes.
+#[test]
+fn clone_leaves_a_checked_out_submodule_empty_as_git_does() {
+	for keep_changes in [false, true] {
+		let (temp, source, repo) = fixture();
+		if !clone_works_on(temp.path()) {
+			eprintln!("SKIP: no working clone backend on this filesystem");
+			return;
+		}
+		let upstream = temp.path().join("submodule-upstream");
+		nested_repository(&upstream);
+		git(&source, &[
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"add",
+			"-q",
+			upstream.to_str().unwrap(),
+			"vendor/sub",
+		]);
+		git(&source, &["commit", "-qm", "add a submodule"]);
+		assert!(source.join("vendor/sub/.git").is_file());
+		assert_eq!(git(&source, &["status", "--porcelain"]), "");
+		let by_git = temp.path().join("by-git");
+		git(&source, &[
+			"worktree",
+			"add",
+			"-q",
+			"--detach",
+			"--lock",
+			by_git.to_str().unwrap(),
+			"HEAD",
+		]);
+		let target = temp.path().join("target");
+		let result = repo
+			.worktree_add(&target, "HEAD", WorktreeAddOptions {
+				detach: true,
+				clone: WorktreeClone::Auto,
+				keep_changes,
+				lock: None,
+			})
+			.unwrap();
+		assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
+		assert_eq!(entries(&by_git.join("vendor/sub")), Some(Vec::new()));
+		assert_eq!(
+			entries(&target.join("vendor/sub")),
+			entries(&by_git.join("vendor/sub")),
+			"keep_changes {keep_changes}"
+		);
+		assert_eq!(git(&target, &["status", "--porcelain"]), "", "keep_changes {keep_changes}");
+	}
+}
+
+/// A destination inside the source (`git worktree add .checkouts/x`) is not
+/// copied into itself.
+#[test]
+fn clone_inside_the_source_leaves_out_its_own_destination() {
+	let (temp, source, repo) = fixture();
+	if !clone_works_on(temp.path()) {
+		eprintln!("SKIP: no working clone backend on this filesystem");
+		return;
+	}
+	let target = source.join(".checkouts/inner");
+	let result = repo
+		.worktree_add(&target, "HEAD", WorktreeAddOptions {
+			detach:       true,
+			clone:        WorktreeClone::Auto,
+			keep_changes: false,
+			lock:         None,
+		})
+		.unwrap();
+	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
+	assert!(
+		fs::symlink_metadata(target.join(".checkouts")).is_err(),
+		"the clone copied its own destination"
+	);
+	assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "tracked\n");
+	assert_eq!(
+		fs::read_to_string(target.join("node_modules/pkg/index.js")).unwrap(),
+		"relocatable cache\n"
+	);
+	assert_eq!(git(&target, &["status", "--porcelain", "--untracked-files=all"]), "");
+}
+
+/// Keeping changes never reads a tracked path through a symlink that
+/// replaced its directory: git sees that path as deleted, and so does the new
+/// tree, on the clone path (where the directory sits in a left-out checkout)
+/// and on the ordinary-checkout path alike.
+#[cfg(unix)]
+#[test]
+fn keeping_changes_never_reads_a_tracked_path_through_a_symlink() {
+	for clone in [WorktreeClone::Auto, WorktreeClone::Off] {
+		let (temp, source, repo) = fixture();
+		if clone == WorktreeClone::Auto && !clone_works_on(temp.path()) {
+			eprintln!("SKIP: no working clone backend on this filesystem");
+			continue;
+		}
+		write(&source, "nested/dir/tracked.txt", "committed\n");
+		git(&source, &["add", "nested"]);
+		git(&source, &["commit", "-qm", "track nested/dir"]);
+		let outside = temp.path().join("outside");
+		write(&outside, "tracked.txt", "outside the checkout\n");
+		fs::remove_dir_all(source.join("nested/dir")).unwrap();
+		std::os::unix::fs::symlink(&outside, source.join("nested/dir")).unwrap();
+		git(&source.join("nested"), &["init", "-q", "-b", "main"]);
+		assert_eq!(
+			git(&source, &["status", "--porcelain", "--", "nested/dir/tracked.txt"]),
+			" D nested/dir/tracked.txt",
+			"git sees the path behind the symlink as deleted"
+		);
+		let outside_before = snapshot(&outside);
+		let target = temp.path().join("target");
+		let result = repo
+			.worktree_add(&target, "HEAD", WorktreeAddOptions {
+				detach: true,
+				clone,
+				keep_changes: true,
+				lock: None,
+			})
+			.unwrap();
+		assert_eq!(
+			result.cloned_with.is_some(),
+			clone == WorktreeClone::Auto,
+			"{:?}",
+			result.clone_error
+		);
+		// The clone path leaves the checkout out, symlink included; the
+		// ordinary path carries the untracked symlink as a symlink. Neither
+		// makes it a directory holding a copy of what it points at.
+		let carried = fs::symlink_metadata(target.join("nested/dir"));
+		assert!(
+			carried
+				.as_ref()
+				.map_or(true, |meta| meta.file_type().is_symlink()),
+			"{clone:?}: nested/dir became {carried:?}, not the source's symlink"
+		);
+		assert_eq!(
+			git(&target, &["status", "--porcelain", "--", "nested/dir/tracked.txt"]),
+			" D nested/dir/tracked.txt",
+			"{clone:?}"
+		);
+		assert_eq!(snapshot(&outside), outside_before, "{clone:?}");
+	}
+}
+
+/// A tracked file the source replaced with a directory comes across as that
+/// directory with its contents, staged or not, on both paths: the file the
+/// new tree checked out is replaced, and nothing is skipped.
+#[test]
+fn keeping_changes_carries_a_directory_that_replaced_a_tracked_file() {
+	for clone in [WorktreeClone::Auto, WorktreeClone::Off] {
+		for staged in [false, true] {
+			let (temp, source, repo) = fixture();
+			if clone == WorktreeClone::Auto && !clone_works_on(temp.path()) {
+				eprintln!("SKIP: no working clone backend on this filesystem");
+				continue;
+			}
+			write(&source, "item", "committed file\n");
+			git(&source, &["add", "item"]);
+			git(&source, &["commit", "-qm", "track item"]);
+			fs::remove_file(source.join("item")).unwrap();
+			write(&source, "item/child", "uncommitted work\n");
+			if staged {
+				git(&source, &["add", "-A", "item"]);
+			}
+			let source_status = git(&source, &["status", "--porcelain", "--untracked-files=all"]);
+			let target = temp.path().join("target");
+			let result = repo
+				.worktree_add(&target, "HEAD", WorktreeAddOptions {
+					detach: true,
+					clone,
+					keep_changes: true,
+					lock: None,
+				})
+				.unwrap();
+			assert_eq!(
+				result.cloned_with.is_some(),
+				clone == WorktreeClone::Auto,
+				"{:?}",
+				result.clone_error
+			);
+			assert_eq!(
+				fs::read_to_string(target.join("item/child"))
+					.ok()
+					.as_deref(),
+				Some("uncommitted work\n"),
+				"{clone:?} staged {staged}"
+			);
+			assert_eq!(
+				git(&target, &["status", "--porcelain", "--untracked-files=all"]),
+				source_status,
+				"{clone:?} staged {staged}"
+			);
+		}
+	}
+}
+
+/// Builds, in `source`, the layouts where git treats a directory holding a
+/// `.git` as ordinary content of the outer repository, each with an untracked
+/// file git's status reports: a tracked directory someone ran `git init` in
+/// (with a staged and a dirty tracked file in it too), a `.git` file naming an
+/// administrative directory that is gone, and an empty `.git` directory.
+fn content_dot_git_layouts(source: &Path) {
+	write(source, "nested/a.txt", "tracked\n");
+	write(source, "nested/staged.txt", "tracked\n");
+	git(source, &["add", "nested"]);
+	git(source, &["commit", "-qm", "nested is tracked"]);
+	write(source, "nested/staged.txt", "staged edit\n");
+	git(source, &["add", "nested/staged.txt"]);
+	git(&source.join("nested"), &["init", "-q"]);
+	write(source, "nested/a.txt", "dirty edit\n");
+	write(source, "nested/new.txt", "untracked below a tracked directory holding a .git\n");
+	write(source, "stray/.git", "gitdir: /nonexistent/admin\n");
+	write(source, "stray/work.txt", "untracked beside a .git naming nothing\n");
+	fs::create_dir_all(source.join("emptydot/.git")).unwrap();
+	write(source, "emptydot/work.txt", "untracked beside an empty .git\n");
+}
+
+/// Keeping changes carries, on the clone path as on the ordinary checkout,
+/// the untracked, dirty and staged files git reports below a directory
+/// holding a `.git` that git treats as ordinary content; the `.git` itself
+/// stays behind.
+#[test]
+fn keeping_changes_carries_what_git_reports_below_a_content_dot_git() {
+	let expected_files = [
+		("nested/a.txt", "dirty edit\n"),
+		("nested/staged.txt", "staged edit\n"),
+		("nested/new.txt", "untracked below a tracked directory holding a .git\n"),
+		("stray/work.txt", "untracked beside a .git naming nothing\n"),
+		("emptydot/work.txt", "untracked beside an empty .git\n"),
+	];
+	let mut carried = Vec::new();
+	for clone in [WorktreeClone::Off, WorktreeClone::Auto] {
+		let (temp, source, repo) = fixture();
+		if clone == WorktreeClone::Auto && !clone_works_on(temp.path()) {
+			eprintln!("SKIP: no working clone backend on this filesystem");
+			return;
+		}
+		content_dot_git_layouts(&source);
+		let source_status = git(&source, &["status", "--porcelain", "--untracked-files=all"]);
+		for line in [
+			" M nested/a.txt",
+			"M  nested/staged.txt",
+			"?? nested/new.txt",
+			"?? stray/work.txt",
+			"?? emptydot/work.txt",
+		] {
+			assert!(
+				source_status.lines().any(|reported| reported == line),
+				"fixture: git status lacks {line:?}:\n{source_status}"
+			);
+		}
+		let target = temp.path().join("target");
+		let result = repo
+			.worktree_add(&target, "HEAD", WorktreeAddOptions {
+				detach: true,
+				clone,
+				keep_changes: true,
+				lock: None,
+			})
+			.unwrap();
+		assert_eq!(
+			result.cloned_with.is_some(),
+			clone == WorktreeClone::Auto,
+			"{clone:?}: {:?}",
+			result.clone_error
+		);
+		for (relative, contents) in expected_files {
+			assert_eq!(
+				fs::read_to_string(target.join(relative)).ok().as_deref(),
+				Some(contents),
+				"{clone:?}: {relative}"
+			);
+		}
+		for dot_git in ["nested/.git", "stray/.git", "emptydot/.git"] {
+			assert!(
+				fs::symlink_metadata(target.join(dot_git)).is_err(),
+				"{clone:?}: {dot_git} was carried"
+			);
+		}
+		assert_eq!(
+			git(&target, &["status", "--porcelain", "--untracked-files=all"]),
+			source_status,
+			"{clone:?}: the new tree's status differs from the source's"
+		);
+		let mut files = snapshot(&target);
+		files.retain(|path, _| !path.starts_with("node_modules"));
+		carried.push(files);
+	}
+	assert_eq!(
+		carried[0], carried[1],
+		"the ordinary checkout and the clone carried different files"
+	);
+}
+
+/// Keeping changes on the clone path never carries the nonrelocatable
+/// directories the clone prunes, ignored or not: a Python virtual environment
+/// (Python's `venv` writes no `.gitignore` before 3.13) and a build directory
+/// holding `CMakeCache.txt`, beside a directory the `.git` marker left out or
+/// inside it.
+#[test]
+fn keeping_changes_leaves_out_an_unignored_environment_and_build_directory() {
+	let (temp, source, repo) = fixture();
+	if !clone_works_on(temp.path()) {
+		eprintln!("SKIP: no working clone backend on this filesystem");
+		return;
+	}
+	write(&source, "venv/pyvenv.cfg", "home = /usr/bin\n");
+	write(&source, "venv/bin/python", "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n");
+	write(&source, "build/CMakeCache.txt", "CMAKE_HOME_DIRECTORY:INTERNAL=/elsewhere\n");
+	write(&source, "build/out.o", "object\n");
+	write(&source, "stray/.git", "gitdir: /nonexistent/admin\n");
+	write(&source, "stray/work.txt", "untracked beside a .git naming nothing\n");
+	write(&source, "stray/env/pyvenv.cfg", "home = /usr/bin\n");
+	write(&source, "stray/env/bin/python", "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n");
+	let status = git(&source, &["status", "--porcelain", "--untracked-files=all"]);
+	for line in
+		["?? venv/pyvenv.cfg", "?? build/out.o", "?? stray/work.txt", "?? stray/env/pyvenv.cfg"]
+	{
+		assert!(
+			status.lines().any(|reported| reported == line),
+			"fixture: git status lacks {line:?}:\n{status}"
+		);
+	}
+	let target = temp.path().join("target");
+	let result = repo
+		.worktree_add(&target, "HEAD", WorktreeAddOptions {
+			detach:       true,
+			clone:        WorktreeClone::Auto,
+			keep_changes: true,
+			lock:         None,
+		})
+		.unwrap();
+	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
+	for left_out in ["venv", "build", "stray/env"] {
+		assert!(fs::symlink_metadata(target.join(left_out)).is_err(), "{left_out} was carried");
+	}
+	assert_eq!(
+		fs::read_to_string(target.join("stray/work.txt"))
+			.ok()
+			.as_deref(),
+		Some("untracked beside a .git naming nothing\n")
+	);
 }

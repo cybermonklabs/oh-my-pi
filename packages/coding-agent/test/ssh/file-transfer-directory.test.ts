@@ -1,22 +1,33 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ShellFsFileType } from "@oh-my-pi/pi-natives";
 import * as connectionManager from "../../src/ssh/connection-manager";
 import { listRemoteDir } from "../../src/ssh/file-transfer";
+import { quotePosixArgument } from "../../src/utils/shell-quote";
 import { fakeSshTransport } from "../helpers/fake-ssh-transport";
 
 const target = { name: "directory-fixture", host: "fixture" };
+
+/** Let a reader still waiting to open `fifo` (a transfer a cancel failed to stop) open it, read EOF and exit. */
+async function releaseFifoReader(fifo: string): Promise<void> {
+	// With no reader waiting, a non-blocking writer open fails (ENXIO): the passing case.
+	const writer = await fs.open(fifo, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK).catch(() => undefined);
+	await writer?.close();
+}
 
 // The fake remote is the local filesystem behind a POSIX shell.
 describe.skipIf(process.platform === "win32")("SSH structured directory transport", () => {
 	let fixture: string;
 	let onSpawn: (() => void) | undefined;
+	let releaseRemote: (() => Promise<void>) | undefined;
 
 	beforeEach(async () => {
 		fixture = await fs.mkdtemp(path.join(os.tmpdir(), "ssh-directory-"));
 		onSpawn = undefined;
+		releaseRemote = undefined;
 		fakeSshTransport(
 			() => fixture,
 			() => onSpawn?.(),
@@ -25,6 +36,7 @@ describe.skipIf(process.platform === "win32")("SSH structured directory transpor
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		await releaseRemote?.();
 		await fs.rm(fixture, { recursive: true, force: true });
 	});
 
@@ -66,9 +78,23 @@ describe.skipIf(process.platform === "win32")("SSH structured directory transpor
 	});
 
 	it("cancels an in-flight directory transfer without returning a partial listing", async () => {
+		// The remote command stays in flight until it is cancelled: it waits to open a FIFO
+		// nothing writes. `exec` makes it the one process holding the transport's stdout, as
+		// ssh is. Forked by the fake's `sh -c` instead, it could start between the kill's look
+		// at the shell's children and the shell's signal, outlive the cancel, and hold the
+		// listing open.
+		const hold = path.join(fixture, "hold.fifo");
+		expect(Bun.spawnSync(["mkfifo", hold]).exitCode).toBe(0);
+		releaseRemote = () => releaseFifoReader(hold);
 		const controller = new AbortController();
-		vi.spyOn(connectionManager, "buildRemoteCommand").mockResolvedValue(["--fixture", "sleep 30"]);
+		vi.spyOn(connectionManager, "buildRemoteCommand").mockResolvedValue([
+			"--fixture",
+			`exec cat ${quotePosixArgument(hold)}`,
+		]);
 		onSpawn = () => controller.abort(new Error("directory transfer cancelled"));
-		await expect(listRemoteDir(target, fixture, { signal: controller.signal })).rejects.toThrow(/cancel|abort/i);
+		// The caller's reason, not the transfer's own 30 s deadline, must end it.
+		await expect(listRemoteDir(target, fixture, { signal: controller.signal })).rejects.toThrow(
+			"directory transfer cancelled",
+		);
 	});
 });

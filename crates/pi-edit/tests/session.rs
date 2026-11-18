@@ -535,6 +535,69 @@ async fn writer_failure_is_surfaced_verbatim() {
 }
 
 #[tokio::test]
+async fn a_cancel_before_the_first_write_changes_no_file() {
+	let ws = Workspace::new(EditMode::Sloppy);
+	ws.write("a.rs", SOURCE);
+	ws.write("b.rs", SOURCE);
+	let writer = DiskWriter { cancel_at: Some(0), ..Default::default() };
+	let err = ws
+		.apply_raw(&format!("{}{}", sloppy_payload("a.rs"), sloppy_payload("b.rs")), &writer)
+		.await
+		.expect_err("cancelled");
+	assert_eq!(err.kind(), "cancelled", "{err}");
+	assert_eq!(err.to_string(), "Edit cancelled before it wrote anything; no file was changed.");
+	assert_eq!(writer.requests.lock().len(), 1, "no write is asked after the cancel");
+	assert_eq!(ws.read("a.rs").unwrap(), SOURCE);
+	assert_eq!(ws.read("b.rs").unwrap(), SOURCE);
+}
+
+#[tokio::test]
+async fn a_cancel_between_files_names_the_files_already_written() {
+	let ws = Workspace::new(EditMode::Sloppy);
+	ws.write("a.rs", SOURCE);
+	ws.write("b.rs", SOURCE);
+	let writer = DiskWriter { cancel_at: Some(1), ..Default::default() };
+	let err = ws
+		.apply_raw(&format!("{}{}", sloppy_payload("a.rs"), sloppy_payload("b.rs")), &writer)
+		.await
+		.expect_err("cancelled");
+	assert_eq!(err.kind(), "cancelled", "{err}");
+	assert_eq!(err.to_string(), "Edit cancelled after changing a.rs; no other file was changed.");
+	assert_eq!(ws.read("a.rs").unwrap(), SOURCE.replace("let x = 1;", "let x = 2;"));
+	assert_eq!(ws.read("b.rs").unwrap(), SOURCE);
+}
+
+#[tokio::test]
+async fn a_cancel_after_a_move_and_a_delete_names_what_they_changed() {
+	let ws = Workspace::new(EditMode::Hashline);
+	ws.write("a.md", "a\n");
+	ws.write("d.md", "d\n");
+	ws.write("b.md", "b\n");
+	let a_tag = ws.snapshot("a.md", "a\n", None);
+	let d_tag = ws.snapshot("d.md", "d\n", None);
+	let b_tag = ws.snapshot("b.md", "b\n", None);
+	let input =
+		format!("[a.md#{a_tag}]\nMV c.md\n[d.md#{d_tag}]\nREM\n[b.md#{b_tag}]\nPUT 1.=1:\n+new\n");
+	let writer = DiskWriter { cancel_at: Some(2), ..Default::default() };
+	let err = ws
+		.apply_json(&serde_json::json!({ "input": input }), &writer)
+		.await
+		.expect_err("cancelled");
+	// The move wrote c.md and removed a.md; the delete removed d.md; b.md was
+	// not touched.
+	assert_eq!(ws.read("a.md"), None);
+	assert_eq!(ws.read("c.md").as_deref(), Some("a\n"));
+	assert_eq!(ws.read("d.md"), None);
+	assert_eq!(ws.read("b.md").as_deref(), Some("b\n"));
+	assert_eq!(err.kind(), "cancelled", "{err}");
+	assert_eq!(
+		err.to_string(),
+		"Edit cancelled after changing a.md (moved to c.md), d.md (deleted); no other file was \
+		 changed."
+	);
+}
+
+#[tokio::test]
 async fn plan_mode_rejects_working_tree_writes_before_writing() {
 	let mut ws = Workspace::new(EditMode::Replace);
 	ws.config.policy.plan_active = true;

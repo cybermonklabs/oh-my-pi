@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { FileSessionStorage, isSessionLeaseHeld } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { FileLock } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { holdAsAnOlderLinuxBuild } from "../helpers/older-build-lock";
 
 const SESSION_STORAGE_MODULE = path.join(import.meta.dir, "../../src/session/session-storage.ts");
 const CLI = path.join(import.meta.dir, "../../src/cli.ts");
@@ -144,4 +147,34 @@ describe("session lease probe", () => {
 			}
 		}
 	}, 60_000);
+
+	// An older Linux build holds a lease as the abstract name of its lock path and never makes the
+	// owners directory, so a probe of a directory nobody created must still ask the lock.
+	it.skipIf(process.platform !== "linux")(
+		"sees a lease an older build holds before the owners directory exists",
+		() => {
+			using tempDir = TempDir.createSync("@omp-lease-older-");
+			const ownersDir = tempDir.join("owners");
+			const sessionId = uniqueId("older-build");
+			// The lease is `<owners>/<id>`, locked at `${path}.lock` (pi-utils `isFileLockHeld`).
+			const lockPath = `${path.resolve(ownersDir, sessionId)}.lock`;
+			const previousOwnersDir = process.env.PI_TEST_SESSION_OWNERS_DIR;
+			process.env.PI_TEST_SESSION_OWNERS_DIR = ownersDir;
+			try {
+				const release = holdAsAnOlderLinuxBuild(lockPath);
+				try {
+					// The name is the one the native probe reads, or this test would check nothing.
+					expect(FileLock.isHeld(lockPath)).toBe(true);
+					expect(isSessionLeaseHeld(sessionId)).toBe(true);
+					expect(fs.existsSync(ownersDir)).toBe(false);
+				} finally {
+					release();
+				}
+				expect(isSessionLeaseHeld(sessionId)).toBe(false);
+			} finally {
+				if (previousOwnersDir === undefined) delete process.env.PI_TEST_SESSION_OWNERS_DIR;
+				else process.env.PI_TEST_SESSION_OWNERS_DIR = previousOwnersDir;
+			}
+		},
+	);
 });

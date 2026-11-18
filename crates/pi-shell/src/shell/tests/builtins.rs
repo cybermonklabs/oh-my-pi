@@ -99,8 +99,6 @@ async fn moreutils_builtins_are_registered_in_process() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn uutils_sort_compress_program_uses_shell_path_and_stderr() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let tmp = std::env::temp_dir().join(format!("pi-sort-compress-{}", std::process::id()));
 	let _ = std::fs::remove_dir_all(&tmp);
 	let bin = tmp.join("bin");
@@ -116,8 +114,7 @@ async fn uutils_sort_compress_program_uses_shell_path_and_stderr() {
 		shell.display(),
 		quote_arg(cat.to_str().expect("utf8 cat path"))
 	);
-	std::fs::write(&shim, shim_source).expect("write shim");
-	std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod shim");
+	crate::testprog::write(&shim, &shim_source);
 
 	// Enough distinct lines that the 1K buffer forces spilling through the
 	// compressor rather than sorting entirely in memory.
@@ -1432,14 +1429,12 @@ async fn umask_is_scoped_to_the_shell() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn executable_text_without_shebang_preserves_arguments_and_exit_status() {
-	use std::os::unix::fs::PermissionsExt;
-
 	let dir = tempfile::tempdir().expect("temp dir");
 	let script = dir.path().join("plain-script");
-	std::fs::write(&script, "printf '%s|%s|%s\\n' \"$1\" \"$2\" \"$SCRIPT_TOKEN\"\nexit 23\n")
-		.expect("write executable text");
-	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
-		.expect("make script executable");
+	crate::testprog::write(
+		&script,
+		"printf '%s|%s|%s\\n' \"$1\" \"$2\" \"$SCRIPT_TOKEN\"\nexit 23\n",
+	);
 	for invocation in ["./plain-script", "plain-script"] {
 		let (result, output) = execute_captured(format!(
 			"cd {} && SCRIPT_TOKEN=from-env PATH=\"$PWD:$PATH\" {invocation} 'two words' ';literal' \
@@ -1455,13 +1450,9 @@ async fn executable_text_without_shebang_preserves_arguments_and_exit_status() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn shebangless_background_script_with_fifo_stdin() {
-	use std::os::unix::fs::PermissionsExt;
-
 	let dir = tempfile::tempdir().expect("temp dir");
 	let script = dir.path().join("s");
-	std::fs::write(&script, "echo hi; cat\n").expect("write script");
-	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
-		.expect("make script executable");
+	crate::testprog::write(&script, "echo hi; cat\n");
 	std::fs::write(dir.path().join("input"), "data\n").expect("write input");
 	for (invocation, expected) in [
 		("./s < input & wait; echo status=$?", "hi\ndata\nstatus=0\n"),
@@ -1487,10 +1478,7 @@ async fn shebangless_background_script_with_fifo_stdin() {
 		 wait; echo status=$?",
 		quote_arg(dir.path().to_str().expect("utf8 path")),
 	);
-	let (result, output) =
-		tokio::time::timeout(std::time::Duration::from_secs(10), execute_captured(command))
-			.await
-			.expect("FIFO script must finish");
+	let (result, output) = execute_captured(command).await;
 	assert_eq!(result.exit_code, Some(0), "{output}");
 	assert_eq!(output, "hi\ndata\nstatus=0\n");
 }
@@ -1689,20 +1677,17 @@ async fn uutils_head_stdin_read_is_cancellable() {
 		time::sleep(Duration::from_millis(150)).await;
 		token.cancel();
 	});
-	let result = time::timeout(
-		Duration::from_secs(5),
-		session.run_test_with("head -n 1000000", &params, cancel),
-	)
-	.await;
+	// The pipe's writer stays open, so only the cancel can end `head`.
+	let result = session
+		.run_test_with("head -n 1000000", &params, cancel)
+		.await;
 	let _ = canceller.await;
 
-	let exec = result
-		.expect("head must return promptly after cancel, not hang on the open pipe")
-		.expect("run");
-	// Core contract: prompt return (the 5s timeout did NOT fire) proves the
-	// read unblocked and the blocking task unwound cleanly — no hang, no
-	// detached thread. The session cancels a run with TERM to everything it
-	// started and reports the TERM-cancelled run as 128 + 15.
+	let exec = result.expect("run");
+	// Core contract: the return proves the read unblocked and the blocking
+	// task unwound cleanly — no hang, no detached thread. The session cancels a
+	// run with TERM to everything it started and reports the TERM-cancelled run
+	// as 128 + 15.
 	assert!(exec.cancelled, "the run must report that it was cancelled");
 	assert_eq!(exit_code(&exec), 143, "cancelled stdin read should report TERM's status");
 }

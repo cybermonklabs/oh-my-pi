@@ -5,6 +5,7 @@ import { matchesKey } from "../keys";
 import { centerLine, padding } from "../utils";
 import { padToWidth } from "../render/utils";
 import { routeSgrMouseInput, type SgrMouseEvent } from "../mouse";
+import { isReduceMotion } from "../reduce-motion";
 import { APP_NAME } from "@oh-my-pi/pi-utils";
 import { gradientLogo, PI_LOGO } from "../prompt/welcome";
 import { theme } from "../theme/theme";
@@ -125,6 +126,12 @@ export class SetupWizardComponent implements Component, OverlayFocusOwner {
 	run(): Promise<void> {
 		if (!this.scenes.some(setupSceneApplies)) {
 			this.#complete();
+			return this.#done.promise;
+		}
+		// Upstream's guard above already finished the run when no scene applies, so
+		// reduce-motion only has the "mount the first scene, skip the splash" case left.
+		if (isReduceMotion()) {
+			this.#mountCurrentScene();
 			return this.#done.promise;
 		}
 		this.#phase = "splash";

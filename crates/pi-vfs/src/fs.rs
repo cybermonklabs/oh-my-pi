@@ -23,10 +23,9 @@ use std::{
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(unix)]
-use crate::file::POLL_SLICE;
 use crate::{
 	dir::{EntryBinding, ReadDir},
+	dir_handle::DirHandle,
 	error::{
 		already_exists, invalid_argument, no_provider, not_a_directory, not_permitted,
 		permission_denied, unsupported,
@@ -39,6 +38,11 @@ use crate::{
 	provider::FileSystem,
 	runtime::{CloseTracker, Scope, block_on, offload},
 	types::{FileId, FileTime, NodeKind, Permissions, StatFs, SymlinkKind},
+};
+#[cfg(unix)]
+use crate::{
+	fifo::{FifoName, FifoOpen, FifoPin},
+	file::POLL_SLICE,
 };
 
 /// A path pinned to an already-open file (`/dev/stdin`, `/dev/fd/N`, ...).
@@ -161,15 +165,19 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 	let Some(mask) = host_mask(scope) else {
 		return native::open(path, options);
 	};
-	if !(options.is_create() || options.is_create_new()) {
+	if !creates(options) {
 		return native::open(path, options);
 	}
 	let mode = options.get_mode().unwrap_or(0o666) & !mask;
 	let mut masked = options.clone();
 	masked.mode(mode);
 	// Only an exclusive create proves the file is new; an existing file keeps
-	// its mode.
+	// its mode. On Unix it is asked for as `O_CREAT | O_EXCL`, which a
+	// read-only open may carry too (`create_new` needs write access).
 	let mut exclusive = masked.clone();
+	#[cfg(unix)]
+	exclusive.custom_flags(exclusive.get_custom_flags() | libc::O_CREAT | libc::O_EXCL);
+	#[cfg(not(unix))]
 	exclusive.create_new(true);
 	match native::open(path, &exclusive) {
 		Ok(file) => {
@@ -178,9 +186,8 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 			let _ = file.set_permissions(Permissions::from_mode(mode));
 			Ok(file)
 		},
-		Err(err) if err.kind() == io::ErrorKind::AlreadyExists && !options.is_create_new() => {
-			native::open(path, &masked)
-		},
+		// An exclusive open (`create_new`, `O_EXCL`) is refused again here.
+		Err(err) if err.kind() == io::ErrorKind::AlreadyExists => native::open(path, &masked),
 		Err(err) => Err(err),
 	}
 }
@@ -194,15 +201,19 @@ enum ScopedOpen {
 	#[cfg(unix)]
 	Typed { token: CancellationToken, poll: bool },
 	/// Open one end of a FIFO, which waits until the other end connects, so
-	/// the wait goes through [`FifoOpening`], which the token can interrupt.
+	/// the wait goes through [`FifoOpen`], which the token can interrupt.
+	/// `pin` is the FIFO at the path when the pin was taken, just after the
+	/// `stat` ([`FifoPin`]; a FIFO put there in between is the one pinned);
+	/// `None` when it was gone by then, and the open then has no release.
 	#[cfg(unix)]
-	Fifo { token: CancellationToken, end: FifoEnd },
+	Fifo { token: CancellationToken, pin: Option<FifoPin> },
 }
 
 /// Under a cancellable scope on Unix, a read-only or write-only open takes
 /// one `stat` first. It says whether the file's reads must poll (see
 /// [`crate::reads_can_block`]) and whether the open itself can block: a
-/// FIFO's open waits for the other end. Without a token, for any other open,
+/// FIFO's open waits for the other end, unless the open never waits on a
+/// FIFO it finds ([`fifo_open_waits`]). Without a token, for any other open,
 /// or when the `stat` fails, the open is [`ScopedOpen::Plain`]. If the path
 /// changes between the `stat` and the open, the file is opened as the `stat`
 /// described it.
@@ -212,18 +223,21 @@ fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> Scoped
 	if let Some(token) = &scope.cancel
 		&& !options.is_create_new()
 	{
-		use std::os::unix::fs::FileTypeExt;
-		let end = match (options.is_read(), options.is_writable()) {
-			(true, false) if !options.is_create() => FifoEnd::Read,
-			(false, true) => FifoEnd::Write,
+		use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
+		match (options.is_read(), options.is_writable()) {
+			(true, false) if !options.is_create() => {},
+			(false, true) => {},
 			_ => return ScopedOpen::Plain,
-		};
+		}
 		let Ok(meta) = std::fs::metadata(path) else {
 			return ScopedOpen::Plain;
 		};
-		let kind = meta.file_type();
-		if kind.is_fifo() && options.get_custom_flags() & libc::O_NONBLOCK == 0 {
-			return ScopedOpen::Fifo { token: token.clone(), end };
+		if meta.file_type().is_fifo() && fifo_open_waits(options) {
+			let follow = options.get_custom_flags() & libc::O_NOFOLLOW == 0;
+			let pin = std::ffi::CString::new(path.as_os_str().as_bytes())
+				.ok()
+				.and_then(|path| FifoPin::at(libc::AT_FDCWD, &path, follow).ok().flatten());
+			return ScopedOpen::Fifo { token: token.clone(), pin };
 		}
 		return ScopedOpen::Typed { token: token.clone(), poll: crate::reads_can_block(&meta) };
 	}
@@ -242,9 +256,10 @@ fn native_open_scoped(scope: &Scope, path: &Path, options: &OpenOptions) -> io::
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, end } => Ok(FifoOpening::start(scope, path, options, end, &token)?
-			.wait(&token)?
-			.bind_host(token, true)),
+		ScopedOpen::Fifo { token, pin } => {
+			Ok(wait_fifo(start_fifo(scope, path, options, pin, &token)?, &token)?
+				.bind_host(token, true))
+		},
 		ScopedOpen::Plain => Ok(native_open(scope, path, options)?.bind(scope)),
 	}
 }
@@ -267,252 +282,169 @@ async fn native_open_scoped_async(
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, end } => Ok(FifoOpening::start(scope, path, options, end, &token)?
-			.wait_async(&token)
-			.await?
-			.bind_host(token, true)),
+		ScopedOpen::Fifo { token, pin } => {
+			Ok(wait_fifo_async(start_fifo(scope, path, options, pin, &token)?, &token)
+				.await?
+				.bind_host(token, true))
+		},
 		ScopedOpen::Plain => Ok(native_open(scope, path, options)?.bind(scope)),
 	}
 }
 
-/// The end of a FIFO an open takes.
+/// Whether an open with `options` waits on a FIFO it finds: a read-only open
+/// that creates nothing, or a write-only one, without `O_NONBLOCK`. Not one
+/// that never waits on a FIFO: one the plain open refuses before it looks at
+/// the entry (`EINVAL`: truncating or creating without write access, or
+/// appending with truncation, the combinations `std` refuses), and an
+/// exclusive create (`create_new`, or a custom `O_EXCL` with `create` or a
+/// custom `O_CREAT`), which fails with `EEXIST` on any entry. Those take the
+/// plain open, which gives their error.
 #[cfg(unix)]
-#[derive(Clone, Copy)]
-enum FifoEnd {
-	/// Waits for a writer.
-	Read,
-	/// Waits for a reader.
-	Write,
+pub(crate) const fn fifo_open_waits(options: &OpenOptions) -> bool {
+	let custom = options.get_custom_flags();
+	let creates = options.is_create() || custom & libc::O_CREAT != 0;
+	if options.is_create_new()
+		|| (creates && custom & libc::O_EXCL != 0)
+		|| custom & libc::O_NONBLOCK != 0
+	{
+		return false;
+	}
+	let (write, append, truncate) = (options.is_write(), options.is_append(), options.is_truncate());
+	if (!write && !append && (truncate || options.is_create())) || (append && truncate) {
+		return false;
+	}
+	options.is_read() != (write || append)
 }
 
+/// Whether an open with `options` has `O_CREAT`: `create`, `create_new`, or
+/// a custom `O_CREAT`. The kernel checks such an open of an existing FIFO
+/// against the directory its name is in (`fs.protected_fifos` in a sticky
+/// directory, which `may_create_in_sticky` reads only under `O_CREAT`); a
+/// walk through `/proc/self/fd/N` ends in `/proc/self/fd`, which is never
+/// sticky. So a pinned FIFO's helper runs such an open by name with the
+/// caller's own options, but for a write's `O_TRUNC`, which it applies itself
+/// ([`by_name_options`], [`FifoOpen`]). The checks of other flags hold
+/// through the magic link (the write permission `O_TRUNC` asks, from the
+/// flags alone; `EEXIST` needs `O_CREAT`), so every other open reopens the
+/// pin.
+pub(crate) const fn creates(options: &OpenOptions) -> bool {
+	#[cfg(unix)]
+	let custom = options.get_custom_flags() & libc::O_CREAT != 0;
+	#[cfg(not(unix))]
+	let custom = false;
+	options.is_create() || options.is_create_new() || custom
+}
+
+/// `options`, which have no `O_CREAT` ([`creates`]), for an open of a pinned
+/// FIFO through `/proc/self/fd/N`: without `O_NOFOLLOW`, which would refuse
+/// the magic link itself. `O_TRUNC` stays, so the kernel asks the write
+/// permission it asks of the plain open.
 #[cfg(unix)]
-impl FifoEnd {
-	/// The `faccessat` mode a release of this end needs: it opens the other.
-	const fn release_access(self) -> libc::c_int {
-		match self {
-			Self::Read => libc::W_OK,
-			Self::Write => libc::R_OK,
+pub(crate) fn reopen_options(options: &OpenOptions) -> OpenOptions {
+	debug_assert!(!creates(options), "a creating open goes by name");
+	let mut reopen = options.clone();
+	reopen.custom_flags(options.get_custom_flags() & !libc::O_NOFOLLOW);
+	reopen
+}
+
+/// Whether a FIFO's helper applies `O_TRUNC` itself: a write (`write` or
+/// `append`) with `truncate` or a custom `O_TRUNC`. Its open of the name
+/// leaves `O_TRUNC` out ([`by_name_options`]) and asks the write permission
+/// `O_TRUNC` asks anyway; a read-only open keeps `O_TRUNC`, so the kernel
+/// still asks that permission of it ([`FifoOpen`]).
+#[cfg(unix)]
+pub(crate) const fn truncates(options: &OpenOptions) -> bool {
+	options.is_writable()
+		&& (options.is_truncate() || options.get_custom_flags() & libc::O_TRUNC != 0)
+}
+
+/// `options` for a pinned FIFO's helper's open of the name: without
+/// `O_TRUNC` for an open whose helper applies it itself ([`truncates`]).
+#[cfg(unix)]
+pub(crate) fn by_name_options(options: &OpenOptions) -> OpenOptions {
+	let mut by_name = options.clone();
+	if truncates(options) {
+		by_name
+			.truncate(false)
+			.custom_flags(options.get_custom_flags() & !libc::O_TRUNC);
+	}
+	by_name
+}
+
+/// Starts opening one end of the FIFO at `path`, pinned as `pin`, on a helper
+/// thread (see [`FifoOpen`]), so that the wait for the other end observes
+/// `token` and, for async callers, holds no runtime worker. The helper runs
+/// the ordinary blocking open, so the open returns exactly when it would
+/// without a token: once the other end connects. It opens the pin's
+/// `/proc/self/fd/N` with [`reopen_options`], or the path with
+/// [`by_name_options`] when the open has `O_CREAT` ([`creates`]) or no
+/// `/proc/self/fd/N` reaches the pin.
+///
+/// Once the token fires, the open fails with [`crate::cancelled`], and
+/// dropping it releases the helper, so it leaves no end of the FIFO behind
+/// (see [`FifoOpen`] for when it cannot). An open that is dropped before it
+/// finishes (the job that made it was aborted, its run task was dropped) is
+/// released the same way, before what follows the drop (the next command)
+/// opens this FIFO.
+#[cfg(unix)]
+fn start_fifo(
+	scope: &Scope,
+	path: &Path,
+	options: &OpenOptions,
+	pin: Option<FifoPin>,
+	token: &CancellationToken,
+) -> io::Result<FifoOpen<File>> {
+	if token.is_cancelled() {
+		return Err(crate::cancelled());
+	}
+	let follow = options.get_custom_flags() & libc::O_NOFOLLOW == 0;
+	let name = FifoName::Path { path: path.to_path_buf(), follow };
+	let (scope, options) = (scope.clone(), options.clone());
+	Ok(FifoOpen::start_pinned(
+		pin,
+		name,
+		creates(&options),
+		truncates(&options),
+		move |path, pinned| {
+			if pinned {
+				native_open(&scope, path, &reopen_options(&options))
+			} else {
+				native_open(&scope, path, &by_name_options(&options))
+			}
+		},
+	))
+}
+
+/// Waits for a FIFO open on this thread, checking `token` every poll slice.
+#[cfg(unix)]
+pub(crate) fn wait_fifo(mut open: FifoOpen<File>, token: &CancellationToken) -> io::Result<File> {
+	loop {
+		if let Some(result) = open.wait_for(POLL_SLICE) {
+			return result;
 		}
-	}
-
-	/// A non-blocking open of the other end, which releases a waiting open
-	/// of this end and closes at once.
-	fn release_options(self) -> OpenOptions {
-		let mut release = OpenOptions::new();
-		match self {
-			Self::Read => release.write(true),
-			Self::Write => release.read(true),
-		};
-		release.custom_flags(libc::O_NONBLOCK);
-		release
-	}
-}
-
-/// How many times a cancelled [`FifoOpening`] tries to release its helper's
-/// open, one poll slice apart, before it leaves the helper blocked.
-#[cfg(unix)]
-const FIFO_RELEASE_ATTEMPTS: usize = 10;
-
-/// One end of a FIFO being opened on a helper thread, so that the wait for
-/// the other end observes a token and, for async callers, holds no runtime
-/// worker. The helper runs the ordinary blocking open, so the open returns
-/// exactly when it would without a token: once the other end connects.
-///
-/// Once the token fires, when this process may open the other end, a
-/// non-blocking open of the other end connects to the waiting open and closes
-/// at once; it is tried again while the helper has not reached `open` yet
-/// (`ENXIO`). The helper's descriptor is closed, and the open fails with
-/// [`crate::cancelled`]. Other opens of the same end waiting at that moment
-/// are released too: a reader reads EOF, a writer's first write fails with
-/// `EPIPE`.
-///
-/// An open that is dropped before it finishes (the job that made it was
-/// aborted, its run task was dropped) is released the same way, on a
-/// detached thread, so the helper does not take the next connection.
-///
-/// When it may not (a FIFO this process can read but not write, or the
-/// reverse), or the release fails, the open still fails with
-/// [`crate::cancelled`], but the helper stays blocked in `open` until the
-/// other end arrives. It then takes that connection and closes it: the next
-/// writer's first write fails with `EPIPE`, the next reader reads EOF. Without
-/// a token the whole command would have stayed blocked there instead.
-#[cfg(unix)]
-struct FifoOpening {
-	path:       PathBuf,
-	end:        FifoEnd,
-	releasable: bool,
-	opened:     std::sync::mpsc::Receiver<io::Result<File>>,
-	/// Notified once the helper has sent its result.
-	done:       Arc<tokio::sync::Notify>,
-	/// Whether the open has ended: its result was taken, or it was released.
-	settled:    bool,
-}
-
-#[cfg(unix)]
-impl FifoOpening {
-	fn start(
-		scope: &Scope,
-		path: &Path,
-		options: &OpenOptions,
-		end: FifoEnd,
-		token: &CancellationToken,
-	) -> io::Result<Self> {
 		if token.is_cancelled() {
 			return Err(crate::cancelled());
 		}
-		let (sender, opened) = std::sync::mpsc::sync_channel(1);
-		let done = Arc::new(tokio::sync::Notify::new());
-		let (scope, owned_path, options, notify) =
-			(scope.clone(), path.to_path_buf(), options.clone(), done.clone());
-		std::thread::Builder::new()
-			.name("pi-vfs-fifo-open".to_owned())
-			.spawn(move || {
-				// After a cancellation nobody receives; the file then closes here.
-				let _ = sender.send(native_open(&scope, &owned_path, &options));
-				notify.notify_one();
-			})?;
-		Ok(Self {
-			path: path.to_path_buf(),
-			end,
-			releasable: may_access(path, end.release_access()),
-			opened,
-			done,
-			settled: false,
-		})
-	}
-
-	/// Waits for the open on this thread, in poll slices, checking `token`.
-	fn wait(mut self, token: &CancellationToken) -> io::Result<File> {
-		use std::sync::mpsc::RecvTimeoutError;
-		loop {
-			match self.opened.recv_timeout(POLL_SLICE) {
-				Ok(result) => {
-					self.settled = true;
-					return result;
-				},
-				Err(RecvTimeoutError::Disconnected) => {
-					self.settled = true;
-					return Err(helper_exited());
-				},
-				Err(RecvTimeoutError::Timeout) if token.is_cancelled() => return self.cancel(),
-				Err(RecvTimeoutError::Timeout) => {},
-			}
-		}
-	}
-
-	/// Awaits the open or `token`, whichever comes first.
-	async fn wait_async(mut self, token: &CancellationToken) -> io::Result<File> {
-		tokio::select! {
-			biased;
-			() = self.done.notified() => {},
-			() = token.cancelled() => {},
-		}
-		match self.opened.try_recv() {
-			Ok(result) => {
-				self.settled = true;
-				result
-			},
-			Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-				self.settled = true;
-				Err(helper_exited())
-			},
-			Err(std::sync::mpsc::TryRecvError::Empty) => self.cancel(),
-		}
-	}
-
-	/// Ends a cancelled open: releases the helper's open when this process may
-	/// open the other end. The release takes microseconds unless the helper
-	/// has not reached `open` yet, and is bounded by [`FIFO_RELEASE_ATTEMPTS`]
-	/// slices.
-	fn cancel(mut self) -> io::Result<File> {
-		if self.releasable {
-			release_fifo_open(&self.path, self.end, &self.opened);
-		}
-		self.settled = true;
-		Err(crate::cancelled())
 	}
 }
 
+/// Awaits a FIFO open or `token`, whichever comes first.
 #[cfg(unix)]
-impl Drop for FifoOpening {
-	/// Releases an open dropped before it ended. The first attempt runs here,
-	/// so the release is done, and the helper's descriptor closed, before what
-	/// follows the drop (the next command) opens this FIFO; it takes
-	/// microseconds. A helper that has not reached `open` yet is left to a
-	/// detached thread, so that no runtime worker waits for it.
-	fn drop(&mut self) {
-		if self.settled || !self.releasable {
-			return;
-		}
-		match native::open(&self.path, &self.end.release_options()) {
-			Ok(_release) => {
-				// The helper's open returns as soon as it sees the release.
-				let _ = self.opened.recv_timeout(POLL_SLICE);
-				return;
-			},
-			Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {},
-			Err(_) => return,
-		}
-		let (_, placeholder) = std::sync::mpsc::sync_channel(0);
-		let opened = std::mem::replace(&mut self.opened, placeholder);
-		let (path, end) = (std::mem::take(&mut self.path), self.end);
-		let _ = std::thread::Builder::new()
-			.name("pi-vfs-fifo-release".to_owned())
-			.spawn(move || release_fifo_open(&path, end, &opened));
+pub(crate) async fn wait_fifo_async(
+	mut open: FifoOpen<File>,
+	token: &CancellationToken,
+) -> io::Result<File> {
+	tokio::select! {
+		biased;
+		result = std::future::poll_fn(|cx| open.poll(cx)) => result,
+		() = token.cancelled() => Err(crate::cancelled()),
 	}
 }
 
-/// Releases a helper's open of one end of the FIFO at `path`; see
-/// [`release_attempt`]. Bounded by [`FIFO_RELEASE_ATTEMPTS`] attempts.
-#[cfg(unix)]
-fn release_fifo_open(
-	path: &Path,
-	end: FifoEnd,
-	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
-) {
-	for _ in 0..FIFO_RELEASE_ATTEMPTS {
-		if release_attempt(path, end, opened) {
-			break;
-		}
-	}
-}
-
-/// One attempt to release a helper's open of one end of the FIFO at `path`:
-/// a non-blocking open of the other end, then a wait of one poll slice for
-/// the helper's result, which is dropped. `false` when another attempt is
-/// due: the helper has not reached `open` yet (`ENXIO`) and has not
-/// answered.
-#[cfg(unix)]
-fn release_attempt(
-	path: &Path,
-	end: FifoEnd,
-	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
-) -> bool {
-	use std::sync::mpsc::RecvTimeoutError;
-	if let Err(err) = native::open(path, &end.release_options())
-		&& err.raw_os_error() != Some(libc::ENXIO)
-	{
-		return true;
-	}
-	!matches!(opened.recv_timeout(POLL_SLICE), Err(RecvTimeoutError::Timeout))
-}
-
-#[cfg(unix)]
-fn helper_exited() -> io::Error {
-	io::Error::other("FIFO open thread exited")
-}
-
-/// Whether this process may open `path` with `mode` (`R_OK`, `W_OK`), by its
-/// effective IDs.
-#[cfg(unix)]
-fn may_access(path: &Path, mode: libc::c_int) -> bool {
-	use std::os::unix::ffi::OsStrExt;
-	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-		return false;
-	};
-	// SAFETY: `path` is a NUL-terminated string alive for the call.
-	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
-}
+/// The FIFO test seams ([`crate::fifo::seam`]), where the facade's tests and
+/// the directory handles' tests reach them.
+#[cfg(all(test, unix))]
+pub(crate) use crate::fifo::seam as fifo_seam;
 
 /// Reads a whole host file. Under a cancellable scope the read goes through
 /// [`File`], so it stops when the token fires instead of draining the file
@@ -837,6 +769,15 @@ impl Fs {
 			.map(|mount| &mount.file)
 	}
 
+	/// Whether a descriptor overlay is mounted below `path`, which a host
+	/// directory handle would reach past.
+	fn mounts_below(&self, path: &Path) -> bool {
+		self
+			.mounts
+			.as_ref()
+			.is_some_and(|mounts| mounts.iter().any(|mount| mount.path.starts_with(path)))
+	}
+
 	fn route(&self, path: &Path) -> io::Result<Route<'_>> {
 		if let Some(file) = self.mounted(path) {
 			return Ok(Route::Mounted(file));
@@ -969,7 +910,10 @@ impl Fs {
 	pub async fn write(&self, path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
 		let (path, contents) = (path.as_ref(), contents.as_ref());
 		match self.route(path)? {
-			Route::Native => std::fs::write(path, contents),
+			Route::Native => {
+				let (path, contents) = (path.to_path_buf(), contents.to_vec());
+				offload(move || std::fs::write(path, contents)).await
+			},
 			Route::Provider(provider) => self.guard(provider.write(path, contents)).await,
 			Route::Mounted(file) => {
 				mount_open_async(file, &create_options())
@@ -1004,6 +948,56 @@ impl Fs {
 		} else {
 			self.symlink_metadata(path).await
 		}
+	}
+
+	/// Opens the directory at `path` as a [`DirHandle`], below which every
+	/// call names one entry: a descriptor on the host, the path on a provider.
+	/// Earlier components are followed; with `follow` the last is too.
+	/// Without, a symlink that is the last component is refused (`ENOTDIR` on
+	/// Unix, also on a kernel that follows one despite `O_NOFOLLOW`;
+	/// `ERROR_STOPPED_ON_SYMLINK` on Windows; [`not_a_directory`] on a
+	/// provider). A host handle keeps this facade's creation mask and
+	/// cancellation for the files and directories it creates and opens. A
+	/// host directory with a descriptor overlay mounted below it opens as a
+	/// path handle on this facade ([`Self::open_dir_by_path`]), so its calls
+	/// reach the overlay, as this facade's own calls do.
+	///
+	/// # Errors
+	///
+	/// The open's errors; [`not_a_directory`] for anything else, a descriptor
+	/// overlay included.
+	pub async fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
+		let path = path.as_ref();
+		match self.route(path)? {
+			Route::Native if !self.mounts_below(path) => {
+				DirHandle::open_host(path, follow, &self.scope)
+			},
+			Route::Native | Route::Provider(_) => {
+				DirHandle::open_provider(self, Handle::try_current().ok(), path, follow).await
+			},
+			Route::Mounted(_) => Err(not_a_directory()),
+		}
+	}
+
+	/// Opens the directory at `path` as a handle that names its entries by
+	/// path on this facade, whatever serves them: each call joins the entry's
+	/// name to `path` and makes this facade's path call, which routes it as
+	/// the facade routes any path. Where this facade serves `path` from the
+	/// host, [`Self::open_dir`] opens a host handle instead; a walk that
+	/// started below a provider's root keeps to paths with this call. The
+	/// directory is checked to be one, a final symlink followed only with
+	/// `follow`.
+	///
+	/// # Errors
+	///
+	/// The facade's metadata errors; [`not_a_directory`] for anything else, a
+	/// descriptor overlay included.
+	pub async fn open_dir_by_path(
+		&self,
+		path: impl AsRef<Path>,
+		follow: bool,
+	) -> io::Result<DirHandle> {
+		DirHandle::open_provider(self, Handle::try_current().ok(), path.as_ref(), follow).await
 	}
 
 	pub async fn read_dir(&self, path: impl AsRef<Path>) -> io::Result<ReadDir> {
@@ -1113,7 +1107,7 @@ impl Fs {
 	pub async fn remove_dir_all(&self, path: impl AsRef<Path>) -> io::Result<()> {
 		let path = path.as_ref();
 		match self.route(path)? {
-			Route::Native => std::fs::remove_dir_all(path),
+			Route::Native => native::remove_dir_all(path),
 			Route::Provider(provider) => self.guard(provider.remove_dir_all(path)).await,
 			Route::Mounted(_) => Err(not_permitted()),
 		}
@@ -1639,6 +1633,29 @@ impl BlockingFs {
 		}
 	}
 
+	/// See [`Fs::open_dir`]. The handle's synchronous provider calls are
+	/// driven as this facade drives its own.
+	///
+	/// # Errors
+	///
+	/// As for [`Fs::open_dir`].
+	pub fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
+		let path = path.as_ref();
+		match self.fs.route(path)? {
+			Route::Native if !self.fs.mounts_below(path) => {
+				DirHandle::open_host(path, follow, &self.fs.scope)
+			},
+			Route::Native | Route::Provider(_) => {
+				let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
+				block_on(
+					self.runtime.as_ref(),
+					DirHandle::open_provider(&self.fs, runtime, path, follow),
+				)
+			},
+			Route::Mounted(_) => Err(not_a_directory()),
+		}
+	}
+
 	/// See [`Fs::canonicalize`].
 	pub fn canonicalize(&self, path: impl AsRef<Path>) -> io::Result<PathBuf> {
 		let path = path.as_ref();
@@ -1723,7 +1740,7 @@ impl BlockingFs {
 	pub fn remove_dir_all(&self, path: impl AsRef<Path>) -> io::Result<()> {
 		let path = path.as_ref();
 		match self.fs.route(path)? {
-			Route::Native => std::fs::remove_dir_all(path),
+			Route::Native => native::remove_dir_all(path),
 			Route::Provider(provider) => self.run(provider.remove_dir_all(path)),
 			Route::Mounted(_) => Err(not_permitted()),
 		}

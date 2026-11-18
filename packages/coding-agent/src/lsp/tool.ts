@@ -20,6 +20,7 @@ import { clampTimeout, resolveLspTimeouts, TOOL_TIMEOUTS } from "../tools/tool-t
 import {
 	applyWorkspaceEditWithLsp,
 	clearInitializationFailure,
+	collectServerEdits,
 	ensureWorkspaceFolders,
 	getActiveClients,
 	getOrCreateClient,
@@ -102,6 +103,7 @@ import {
 	formatLocation,
 	formatSymbolInformation,
 	formatWorkspaceEdit,
+	LspOutcomeError,
 	mergeCodeActions,
 	resolveDiagnosticTargets,
 	resolveSymbolColumn,
@@ -240,17 +242,22 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		/**
 		 * Rethrow an abort; return for any other error. A caller cancel stays a
 		 * ToolAbortError, while the call's own deadline becomes a ToolError naming the
-		 * budget and server instead of an opaque "Operation aborted".
+		 * budget and server instead of an opaque "Operation aborted". Either keeps an
+		 * {@link LspOutcomeError}'s detail: changes made that stay, or edits the server
+		 * may still apply. Then the deadline error asks for the files to be read before
+		 * any retry, which could apply the change twice, instead of suggesting one.
 		 */
 		const rethrowAbort = (err: unknown, serverName?: string): void => {
 			if (!(err instanceof ToolAbortError) && !signal?.aborted) return;
+			const detail = err instanceof LspOutcomeError ? ` ${err.detail}` : "";
 			if (timeoutSignal.aborted && !callerSignal?.aborted) {
 				const server = serverName ? ` on ${serverName}` : "";
-				throw new ToolError(
-					`LSP ${action} timed out after ${timeoutSec}s${server}. The server may still be indexing; try again or pass timeout=<larger>.`,
-				);
+				const next = detail
+					? " Read the files it names, or that the server may still change, before any retry: a retry can apply the change twice."
+					: " The server may still be indexing; try again or pass timeout=<larger>.";
+				throw new ToolError(`LSP ${action} timed out after ${timeoutSec}s${server}.${detail}${next}`);
 			}
-			throw new ToolAbortError();
+			throw detail ? new ToolAbortError(`${ToolAbortError.MESSAGE}.${detail}`) : new ToolAbortError();
 		};
 
 		const config = getConfig(this.session.cwd);
@@ -1515,17 +1522,20 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							resolveCodeAction: async actionItem =>
 								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
 							applyWorkspaceEdit: async edit => applyWorkspaceEditWithLsp(edit, this.session.cwd, signal),
-							executeCommand: async commandItem => {
-								await sendRequest(
-									client,
-									"workspace/executeCommand",
-									{
-										command: commandItem.command,
-										arguments: commandItem.arguments ?? [],
-									},
-									signal,
+							executeCommand: async (commandItem, serverEdits) => {
+								await collectServerEdits(client, serverEdits, () =>
+									sendRequest(
+										client,
+										"workspace/executeCommand",
+										{
+											command: commandItem.command,
+											arguments: commandItem.arguments ?? [],
+										},
+										signal,
+									),
 								);
 							},
+							signal,
 						});
 
 						if (!appliedAction) {
@@ -1541,6 +1551,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						if (appliedAction.executedCommands.length > 0) {
 							summaryLines.push("  Executed command(s):");
 							summaryLines.push(...appliedAction.executedCommands.map(commandName => `    ${commandName}`));
+						}
+						if (appliedAction.abortedCommands?.length) {
+							summaryLines.push(
+								"  Command(s) not waited for, because the call was cancelled or timed out (edits the server applied for them by then are listed above; it may still apply more):",
+							);
+							summaryLines.push(...appliedAction.abortedCommands.map(commandName => `    ${commandName}`));
 						}
 
 						output = `Applied "${appliedAction.title}":\n${summaryLines.join("\n")}`;

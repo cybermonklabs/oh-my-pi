@@ -321,19 +321,27 @@ fn terminfo(ctx: &mut Ctx<'_, '_>, term: &[u8]) -> Result<Option<Arc<TermInfo>>,
 	Ok(terminfo_db::load(term, &env))
 }
 
-/// Queue curses' buffered output on stdout.
+/// Queue curses' buffered output on stdout. A chunk `input`'s write
+/// ([`flush_now`]) handed to a writer thread and that is not settled (a
+/// trap ran `zcurses refresh` while `input` waited) is the front of
+/// `pending` and the thread's to write: it is dropped from `pending`, and
+/// the rest is queued after it.
 fn flush(ctx: &mut Ctx<'_, '_>, c: &mut Curses) {
-	let out = std::mem::take(&mut c.pending);
+	let held = c.unsettled.forget();
+	let mut out = std::mem::take(&mut c.pending);
+	out.drain(..held.min(out.len()));
 	ctx.out(&out);
 }
 
 /// Write curses' buffered output now (before `input` waits for a key):
-/// parks while the terminal does not take it.
+/// parks while the terminal does not take it, or while what its writer
+/// thread took is not out yet ([`crate::bash::FdRef::poll_write_out`]), so
+/// the screen is out before the key is read.
 fn flush_now(ctx: &Ctx<'_, '_>, c: &mut Curses) -> Result<(), Need> {
 	let h = ctx.vp.fds.handle(1);
 	let mut tcx = Context::from_waker(&ctx.k.waker);
 	while !c.pending.is_empty() {
-		match h.poll_write(&mut tcx, &c.pending) {
+		match h.poll_write_out(&mut tcx, &c.pending, &mut c.unsettled) {
 			Poll::Ready(Ok(n)) if n > 0 => {
 				c.pending = c.pending.split_off(n.min(c.pending.len()));
 			},
@@ -1488,5 +1496,95 @@ mod tests {
 		assert!(c.addstr(w, "字"));
 		assert_eq!((c.wins[w].cury, c.wins[w].curx), (1, 2));
 		assert_eq!(c.cell(w, 0, 3).ch, u32::from(b' '));
+	}
+
+	/// `zcurses refresh` from a trap while `input` waits for the writer
+	/// thread to write the screen it took: the bytes the thread holds are not
+	/// queued again, so the terminal gets them once. The flush queued all of
+	/// curses' buffer, the held bytes too.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_refresh_while_input_waits_does_not_queue_the_held_bytes_again() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_refresh_while_input_waits_does_not_queue_the_held_bytes_again"
+			),
+			|| {
+				use std::io::Read as _;
+
+				use crate::bash::{
+					Engine, EngineConfig, MemStore,
+					fd::FdTable,
+					ids::Vpid,
+					signal::SigSet,
+					vm::{Kernel, proc::Vproc, state},
+				};
+
+				let mut store = MemStore::new();
+				let root = state::Root::load(&mut store).unwrap();
+				let engine = Engine::new(EngineConfig::default());
+				let mut k = Kernel::new(&engine, root, BString::from("zsh"), std::process::id());
+				let mut host = crate::process::NativeHost::new(
+					None,
+					false,
+					Vec::new(),
+					SigSet::default(),
+					0,
+					false,
+				);
+				let mut cx = crate::bash::vm::Cx { host: &mut host, store: &mut store };
+				let (ours, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+				let file =
+					crate::sys::StdFile::new(std::fs::File::from(std::os::fd::OwnedFd::from(ours)));
+				let mut vp =
+					Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+				vp.fds
+					.set(1, Some(FdRef::open(Box::new(file), crate::bash::fd::FdOrigin::Host)));
+				let mut ctx = Ctx {
+					k:           &mut k,
+					cx:          &mut cx,
+					vp:          &mut vp,
+					probes:      &[],
+					probe_at:    std::cell::Cell::new(0),
+					chunks:      Vec::new(),
+					line:        0,
+					name:        "zcurses",
+					compound:    Vec::new(),
+					usage_error: false,
+					log:         Vec::new(),
+					log_cursor:  0,
+					arrayref:    Vec::new(),
+					resumed:     0,
+				};
+				let mut c = Curses::new(BString::from("xterm"), 24, 80);
+				c.pending = b"abc".to_vec();
+				let held = crate::sys::hold_writers();
+				assert!(matches!(flush_now(&ctx, &mut c), Err(Need::Park(_))));
+				flush(&mut ctx, &mut c);
+				let queued: Vec<u8> = ctx
+					.chunks
+					.iter()
+					.filter_map(|chunk| match chunk {
+						super::super::Chunk::Out(1, bytes) => Some(bytes.as_slice()),
+						_ => None,
+					})
+					.flatten()
+					.copied()
+					.collect();
+				assert!(
+					queued.is_empty(),
+					"the flush queued the held bytes again: {:?}",
+					queued.as_bstr()
+				);
+				drop(held);
+				peer
+					.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+					.unwrap();
+				let mut got = [0u8; 3];
+				peer.read_exact(&mut got).unwrap();
+				assert_eq!(&got, b"abc");
+			},
+		);
 	}
 }

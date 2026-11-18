@@ -83,7 +83,7 @@ import {
 } from "../exec/settings";
 import { cfgDisplayShellVisualization } from "../modes/settings";
 import { cfgSkillful } from "../session/settings";
-import { cfgWorktreeClone, ovnfsCommand } from "../task/settings";
+import { cfgWorktreeClone, cfgWorktreeLockReason, ovnfsCommand } from "../task/settings";
 import { nativeShapingOff, shapeToolText, shapingExperiment } from "../spotlight";
 import { SPOTLIGHT_FULL_OUTPUT_MAX_BYTES } from "../spotlight/types";
 import type { SpotlightDetails } from "@oh-my-pi/pi-tui/chat/spotlight";
@@ -1317,7 +1317,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (interception) throw new ToolError(interception);
 
 		if (cfgWorktreeClone.get(this.session.settings)) {
-			command = rewriteGitWorktreeAdd(command, resolveCliEntryCmd());
+			command = rewriteGitWorktreeAdd(command, resolveCliEntryCmd(), {
+				lockReason: cfgWorktreeLockReason.get(this.session.settings),
+			});
 		}
 
 		// Best-effort cache invalidation: drop github-cache rows for any issue/PR
@@ -1526,7 +1528,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				throw waitResult.error;
 			}
 			if (waitResult.kind === "aborted") {
-				autoBgManager.cancel(job.jobId);
+				// The command's job aborts with the call's own reason, as an eval cell's does; a shell
+				// starts no subagent that reads it.
+				autoBgManager.cancel(job.jobId, undefined, signal?.reason);
 				autoBgManager.releaseForegroundJob(job.jobId);
 				throw new ToolAbortError(job.getLatestText() || "Command aborted");
 			}

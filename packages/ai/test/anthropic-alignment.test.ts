@@ -208,8 +208,8 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(headers["User-Agent"]).toBe(`claude-cli/${getClaudeCodeVersion()} (external, cli)`);
 		expect(headers["X-Stainless-Arch"]).toBe(mapStainlessArch(process.arch));
 		expect(headers["X-Stainless-OS"]).toBe(mapStainlessOs(process.platform));
-		expect(headers["X-Stainless-Package-Version"]).toBe("0.112.1");
-		expect(headers["X-Stainless-Runtime-Version"]).toBe("v26.3.0");
+		expect(headers["X-Stainless-Package-Version"]).toBe("0.128.0");
+		expect(headers["X-Stainless-Runtime-Version"]).toBe("v26.12.1");
 		expect(headers["X-Stainless-Timeout"]).toBe("600");
 		expect(headers["anthropic-client-platform"]).toBeUndefined();
 		expect(headers["anthropic-client-version"]).toBeUndefined();
@@ -236,7 +236,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		]);
 		expect(headers["X-Claude-Code-Session-Id"]).toBe(sessionId);
 		expect(headers["anthropic-beta"]).toBe(
-			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01",
+			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,fallback-credit-2026-06-01",
 		);
 		expect(headers["x-client-request-id"]).toBeUndefined();
 	});
@@ -291,7 +291,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		});
 
 		expect(options.defaultHeaders["anthropic-beta"]).toBe(
-			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01",
+			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,fallback-credit-2026-06-01",
 		);
 		expect(options.defaultHeaders["anthropic-beta"]).not.toContain("context-1m-2025-08-07");
 	});
@@ -1080,7 +1080,7 @@ describe("Anthropic request fingerprint alignment", () => {
 
 		expect(headers["anthropic-beta"]).not.toBe("custom-beta-token");
 		expect(headers["x-app"]).toBe("cli");
-		expect(headers["X-Stainless-Runtime-Version"]).toBe("v26.3.0");
+		expect(headers["X-Stainless-Runtime-Version"]).toBe("v26.12.1");
 	});
 
 	it("suppresses the client-level X-Api-Key when model.headers carries a custom Authorization (#3391)", () => {
@@ -1395,6 +1395,46 @@ describe("Anthropic request fingerprint alignment", () => {
 			url: "https://api.anthropic.com/v1/messages?beta=true",
 			accept: "application/json",
 		});
+	});
+
+	it("sends a side request with its parent's session id in the header and metadata", async () => {
+		// A gateway pins a conversation to one organization by this id, and each organization
+		// keeps its own prompt cache. A side request that sent `<parent>:side:<n>` had no id the
+		// gateway accepts, so it went to either organization and read the parent's prefix cold.
+		const { promise, resolve } = Promise.withResolvers<{ sessionHeader: string | null; userId?: string }>();
+		const controller = new AbortController();
+		const fakeFetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const body = JSON.parse(requestBodyText(init) ?? "{}") as { metadata?: { user_id?: string } };
+			resolve({
+				sessionHeader: new Headers(init?.headers).get("X-Claude-Code-Session-Id"),
+				userId: body.metadata?.user_id,
+			});
+			controller.abort();
+			return new Response('event: message_stop\ndata: {"type":"message_stop"}\n\n', {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+
+		streamAnthropic(
+			ANTHROPIC_MODEL,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{
+				apiKey: "sk-ant-oat-test",
+				isOAuth: true,
+				sessionId: "0190fb1e-0000-7000-8000-000000000001:side:15d0b21d57c3390a",
+				parentSessionId: "0190fb1e-0000-7000-8000-000000000001",
+				signal: controller.signal,
+				fetch: fakeFetch,
+			},
+		);
+
+		const sent = await promise;
+		expect(sent.sessionHeader).toBe("0190fb1e-0000-7000-8000-000000000001");
+		expect(JSON.parse(sent.userId ?? "{}").session_id).toBe("0190fb1e-0000-7000-8000-000000000001");
 	});
 
 	it("preserves real Claude Code JSON-format metadata.user_id for OAuth requests", async () => {

@@ -74,6 +74,34 @@ impl Metadata {
 	}
 }
 
+#[cfg(unix)]
+impl Metadata {
+	/// Metadata from a `stat` this crate took itself (an `fstatat` below a
+	/// [`crate::DirHandle`]): every field `stat` carries, with host identity,
+	/// so [`Metadata::same_file`] compares it with path-side metadata. It
+	/// wraps no [`std::fs::Metadata`], so [`Metadata::native`] is `None`.
+	#[allow(clippy::unnecessary_cast, reason = "stat field widths differ by platform")]
+	pub(crate) fn from_stat(st: &libc::stat) -> Self {
+		let mode = st.st_mode as u32;
+		let meta = Self::new(
+			FileType::from_mode(mode),
+			st.st_size as u64,
+			Permissions::from_mode(mode & 0o7777),
+		)
+		.with_modified(unix_time(st.st_mtime as i64, st.st_mtime_nsec as i64))
+		.with_accessed(unix_time(st.st_atime as i64, st.st_atime_nsec as i64))
+		.with_changed(unix_time(st.st_ctime as i64, st.st_ctime_nsec as i64))
+		.with_native_id(st.st_dev as u64, st.st_ino as u64)
+		.with_nlink(st.st_nlink as u64)
+		.with_owner(st.st_uid, st.st_gid)
+		.with_rdev(st.st_rdev as u64)
+		.with_blocks(st.st_blocks as u64, st.st_blksize as u64);
+		#[cfg(target_os = "macos")]
+		let meta = meta.with_created(unix_time(st.st_birthtime as i64, st.st_birthtime_nsec as i64));
+		meta
+	}
+}
+
 fn split_time(time: SystemTime) -> (i64, i64) {
 	match time.duration_since(UNIX_EPOCH) {
 		Ok(after) => (after.as_secs() as i64, i64::from(after.subsec_nanos())),

@@ -19,8 +19,8 @@ use bstr::{BStr, BString};
 use serde::{Deserialize, Serialize};
 
 use crate::bash::{
-	diag,
-	fs::{FsPoll, OpenFlags, SeekFrom, Stat},
+	Unsettled, diag,
+	fs::{FsPoll, OpenFlags, Stat},
 	host::Deadline,
 	vm::{
 		Cx,
@@ -393,9 +393,14 @@ fn read(
 	}
 }
 
-/// [`HistOp::Write`]: open, then write `data` from where the file stood
-/// once opened (kept, as 8 bytes, in the scratch's input buffer: the
-/// file's position tells how much was written).
+/// [`HistOp::Write`]: open, then write `data`. How much is written is a
+/// count, kept as 8 bytes in the scratch's input buffer, which
+/// [`crate::bash::vm::probe::begin`] empties when the probe begins; never
+/// the file's position, which a FIFO, a pipe or a socket does not have (the
+/// seek fails, and the whole history would go out again on every poll).
+/// A chunk the file's writer thread took (a terminal or socket path) is
+/// out, or its error is the write's, before the next one goes, as with the
+/// release's `write(2)`.
 fn write(
 	tcx: &mut Context<'_>,
 	cx: &mut Cx<'_>,
@@ -410,40 +415,27 @@ fn write(
 		WriteHow::Append => OpenFlags::APPEND,
 		WriteHow::Excl => OpenFlags::EXCL,
 	});
-	// The file's position once opened, beside `sc.live` (the file).
+	// The count of bytes written, beside `sc.live` (the file, and what its
+	// writer thread took and has not written yet).
 	let input = &mut sc.io.get_or_insert_with(Box::default).input;
 	loop {
 		match &mut sc.live {
 			Live::None => match cx.host.fs().open(BStr::new(path), flags, mode) {
-				FsPoll::Ready(Ok(f)) => sc.live = Live::File(f),
+				FsPoll::Ready(Ok(f)) => sc.live = Live::Write(Box::new((f, Unsettled::default()))),
 				FsPoll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
 				FsPoll::Pending(f) => sc.live = Live::Open(f),
 			},
 			Live::Open(f) => match f.poll(tcx) {
-				Poll::Ready(Ok(file)) => sc.live = Live::File(file),
+				Poll::Ready(Ok(file)) => sc.live = Live::Write(Box::new((file, Unsettled::default()))),
 				Poll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
 				Poll::Pending => return Poll::Pending,
 			},
-			Live::File(f) => {
-				let known = input
+			Live::Write(w) => {
+				let (f, unsettled) = &mut **w;
+				let done = input
 					.get(..8)
-					.map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
-				let start = if let Some(s) = known {
-					s
-				} else {
-					let at = if how == WriteHow::Append {
-						f.seek(SeekFrom::End(0))
-					} else {
-						f.seek(SeekFrom::Current(0))
-					};
-					let at = at.unwrap_or(0);
-					input.clear();
-					input.extend_from_slice(&at.to_le_bytes());
-					at
-				};
-				let done = f
-					.seek(SeekFrom::Current(0))
-					.map_or(0, |p| usize::try_from(p.saturating_sub(start)).unwrap_or(0));
+					.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
+				let done = usize::try_from(done).unwrap_or(usize::MAX);
 				let rest = data.get(done..).unwrap_or_default();
 				if rest.is_empty() {
 					return match f.poll_flush(tcx) {
@@ -452,17 +444,203 @@ fn write(
 						Poll::Pending => Poll::Pending,
 					};
 				}
-				match f.poll_write(tcx, rest) {
+				match unsettled.poll_write_file(f.as_mut(), tcx, rest) {
 					Poll::Ready(Ok(0)) => {
 						let e = io::Error::from(io::ErrorKind::WriteZero);
 						return Poll::Ready(Err(HistErr::of(&e)));
 					},
-					Poll::Ready(Ok(_)) => {},
+					Poll::Ready(Ok(n)) => {
+						let total = u64::try_from(done.saturating_add(n)).unwrap_or(u64::MAX);
+						input.clear();
+						input.extend_from_slice(&total.to_le_bytes());
+					},
 					Poll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
 					Poll::Pending => return Poll::Pending,
 				}
 			},
 			_ => sc.live = Live::None,
 		}
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+	use std::{
+		os::unix::fs::OpenOptionsExt as _,
+		time::{Duration, Instant},
+	};
+
+	use bstr::ByteSlice as _;
+
+	use super::*;
+	use crate::bash::{MemStore, signal::SigSet};
+
+	/// `history -w` to a FIFO whose chunk the writer thread took, and whose
+	/// reader is gone before the thread writes it: the write fails with that
+	/// error (`EPIPE`), as the release's `write(2)` did. A plain write handed
+	/// the chunk to the thread and counted it written, and the error was
+	/// lost: the history write reported success. The writer thread is forced
+	/// in this test's own process, as Darwin always uses it.
+	#[test]
+	fn history_write_reports_a_chunk_that_fails_after_its_hand_off() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::history_write_reports_a_chunk_that_fails_after_its_hand_off"),
+			|| {
+				let dir = tempfile::tempdir().unwrap();
+				let fifo = dir.path().join("hist");
+				let made = std::process::Command::new("mkfifo")
+					.arg(&fifo)
+					.status()
+					.unwrap();
+				assert!(made.success(), "mkfifo: {made}");
+				// The reader is open first, so the write's open does not wait.
+				let reader = std::fs::OpenOptions::new()
+					.read(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&fifo)
+					.unwrap();
+				let mut store = MemStore::new();
+				let mut host = crate::process::NativeHost::new(
+					None,
+					false,
+					Vec::new(),
+					SigSet::default(),
+					0,
+					false,
+				);
+				let mut cx = Cx { host: &mut host, store: &mut store };
+				let mut sc = Scratch::default();
+				let op = HistOp::Write {
+					path: BString::from(fifo.to_str().unwrap()),
+					data: BString::from("first\nsecond\n"),
+					how:  WriteHow::Trunc,
+					mode: 0o600,
+				};
+				let waker = std::task::Waker::noop();
+				let mut tcx = Context::from_waker(waker);
+				let held = crate::sys::hold_writers();
+				// Poll until the file is open and one write went to the thread,
+				// which holds it.
+				let deadline = Instant::now() + Duration::from_secs(10);
+				loop {
+					let polled = perform(&mut tcx, &mut cx, &mut sc, &op);
+					assert!(polled.is_pending(), "the write was done while the thread held its chunk");
+					if matches!(sc.live, Live::Write(_)) {
+						let again = perform(&mut tcx, &mut cx, &mut sc, &op);
+						assert!(again.is_pending(), "the write was done while the thread held its chunk");
+						break;
+					}
+					assert!(Instant::now() < deadline, "DEADLINE: the file was not open within 10 s");
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				drop(reader);
+				drop(held);
+				let deadline = Instant::now() + Duration::from_secs(10);
+				let answer = loop {
+					if let Poll::Ready(answer) = perform(&mut tcx, &mut cx, &mut sc, &op) {
+						break answer;
+					}
+					assert!(Instant::now() < deadline, "DEADLINE: no answer within 10 s");
+					std::thread::sleep(Duration::from_millis(5));
+				};
+				let err = answer.expect_err("the chunk's error was lost: the write reported success");
+				assert!(
+					err.msg
+						.to_str_lossy()
+						.to_lowercase()
+						.contains("broken pipe"),
+					"the error: {:?}",
+					err.msg
+				);
+			},
+		);
+	}
+
+	/// `history -w` to a FIFO through the writer thread, with a reader that
+	/// drains it as it goes: each chunk the thread takes settles OK, the
+	/// count of bytes written goes on past it, and `first\nsecond\n` arrives
+	/// once; the write succeeds. Counted by the file's position, the count
+	/// stays at nothing on a FIFO, which cannot seek, and the whole history
+	/// goes out again on every poll. The writer thread is forced in this
+	/// test's own process, as Darwin always uses it.
+	#[test]
+	fn history_write_through_the_writer_thread_sends_each_byte_once() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::history_write_through_the_writer_thread_sends_each_byte_once"),
+			|| {
+				use std::io::Read as _;
+
+				let dir = tempfile::tempdir().unwrap();
+				let fifo = dir.path().join("hist");
+				let made = std::process::Command::new("mkfifo")
+					.arg(&fifo)
+					.status()
+					.unwrap();
+				assert!(made.success(), "mkfifo: {made}");
+				// The reader is open first, so the write's open does not wait.
+				let mut reader = std::fs::OpenOptions::new()
+					.read(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&fifo)
+					.unwrap();
+				let mut store = MemStore::new();
+				let mut host = crate::process::NativeHost::new(
+					None,
+					false,
+					Vec::new(),
+					SigSet::default(),
+					0,
+					false,
+				);
+				let mut cx = Cx { host: &mut host, store: &mut store };
+				let mut sc = Scratch::default();
+				let op = HistOp::Write {
+					path: BString::from(fifo.to_str().unwrap()),
+					data: BString::from("first\nsecond\n"),
+					how:  WriteHow::Trunc,
+					mode: 0o600,
+				};
+				let waker = std::task::Waker::noop();
+				let mut tcx = Context::from_waker(waker);
+				let mut got = Vec::new();
+				let mut drain = |got: &mut Vec<u8>| {
+					let mut buf = [0u8; 4096];
+					loop {
+						match reader.read(&mut buf) {
+							Ok(0) => break,
+							Ok(n) => got.extend_from_slice(&buf[..n]),
+							Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+							Err(e) => panic!("reading the FIFO: {e}"),
+						}
+					}
+				};
+				let deadline = Instant::now() + Duration::from_secs(10);
+				let answer = loop {
+					let polled = perform(&mut tcx, &mut cx, &mut sc, &op);
+					drain(&mut got);
+					if let Poll::Ready(answer) = polled {
+						break answer;
+					}
+					assert!(
+						Instant::now() < deadline,
+						"DEADLINE: no answer within 10 s; the reader got {} bytes, starting {:?}",
+						got.len(),
+						got.get(..64.min(got.len())).unwrap_or_default().as_bstr()
+					);
+					std::thread::sleep(Duration::from_millis(5));
+				};
+				if let Err(err) = answer {
+					panic!("the write failed: {:?}", err.msg);
+				}
+				// The last chunk may still be in the writer thread's write.
+				let deadline = Instant::now() + Duration::from_secs(10);
+				while got.len() < b"first\nsecond\n".len() && Instant::now() < deadline {
+					drain(&mut got);
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				drain(&mut got);
+				assert_eq!(got.as_bstr(), b"first\nsecond\n".as_bstr());
+			},
+		);
 	}
 }

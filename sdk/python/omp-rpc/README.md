@@ -86,12 +86,16 @@ way to seed todos before the first prompt:
 ```python
 from omp_rpc import MessageUpdateEvent, RpcClient
 
+
 def on_message_update(event: MessageUpdateEvent) -> None:
     assistant_event = event.assistant_message_event
     if assistant_event.get("type") == "text_delta":
         print(assistant_event["delta"], end="", flush=True)
 
-with RpcClient(model="openrouter/anthropic/claude-sonnet-4.6", no_session=True) as client:
+
+with RpcClient(
+    model="openrouter/anthropic/claude-sonnet-4.6", no_session=True
+) as client:
     client.on_message_update(on_message_update)
     client.set_todos(
         [
@@ -143,9 +147,16 @@ request id, and `on_prompt_result()` delivers each typed `PromptResultEvent`:
 ```python
 from omp_rpc import PromptResultEvent, RpcClient
 
+
 def on_result(result: PromptResultEvent) -> None:
     if result.status == "error" and result.error is not None:
-        print(result.id, result.error.message, result.error.http_status, result.error.retryable)
+        print(
+            result.id,
+            result.error.message,
+            result.error.http_status,
+            result.error.retryable,
+        )
+
 
 with RpcClient(no_session=True) as client:
     client.on_prompt_result(on_result)
@@ -255,7 +266,9 @@ session has no goal), `get_state().goal` carries the current `GoalModeState`, an
 `goal` tool:
 
 ```python
-result = client.goal("create", objective="Ship the parser rewrite", token_budget=200_000)
+result = client.goal(
+    "create", objective="Ship the parser rewrite", token_budget=200_000
+)
 print(result.goal.status if result.goal else None)  # "active"
 client.goal("pause")
 client.goal("resume")
@@ -286,11 +299,15 @@ Subagent frames are off by default. Select a level, then subscribe:
 ```python
 client.set_subagent_subscription("progress")  # or "events" for full session events
 client.on_subagent_lifecycle(lambda e: print(e.payload.id, e.payload.status))
-client.on_subagent_progress(lambda e: print(e.payload.agent, e.payload.progress.get("toolCount")))
+client.on_subagent_progress(
+    lambda e: print(e.payload.agent, e.payload.progress.get("toolCount"))
+)
 
 for snapshot in client.get_subagents():
     page = client.get_subagent_messages(subagent_id=snapshot.id)
-    more = client.get_subagent_messages(subagent_id=snapshot.id, from_byte=page.next_byte)
+    more = client.get_subagent_messages(
+        subagent_id=snapshot.id, from_byte=page.next_byte
+    )
 
 client.steer_subagent("OmpWorker", "Drop the glob, keep the direct path.")
 cancelled = client.cancel_subagent("OmpWorker")  # False when not running
@@ -392,27 +409,27 @@ rows: dict[str, str] = {"42": "id=42\nname=Alice\n"}
 
 
 def read_row(url: str, _ctx) -> str:
-	row_id = url.removeprefix("db://users/")
-	return rows[row_id]
+    row_id = url.removeprefix("db://users/")
+    return rows[row_id]
 
 
 def write_row(url: str, content: str, _ctx) -> None:
-	row_id = url.removeprefix("db://users/")
-	rows[row_id] = content
+    row_id = url.removeprefix("db://users/")
+    rows[row_id] = content
 
 
 with RpcClient(
-	no_session=True,
-	host_uris=(
-		host_uri(
-			scheme="db",
-			description="Virtual db row files",
-			read=read_row,
-			write=write_row,
-		),
-	),
+    no_session=True,
+    host_uris=(
+        host_uri(
+            scheme="db",
+            description="Virtual db row files",
+            read=read_row,
+            write=write_row,
+        ),
+    ),
 ) as client:
-	client.prompt_and_wait("Read db://users/42 and rewrite it with name=Bob")
+    client.prompt_and_wait("Read db://users/42 and rewrite it with name=Bob")
 ```
 
 Schemes registered as read-only (no `write=`) reject `write` calls with a
@@ -451,8 +468,10 @@ from omp_rpc import AskAnswer
 if request.method == "ask":
     client.send_ui_answers(
         request.id,
-        [AskAnswer(id=question.id, selected_options=(question.options[0].label,))
-         for question in request.questions or ()],
+        [
+            AskAnswer(id=question.id, selected_options=(question.options[0].label,))
+            for question in request.questions or ()
+        ],
     )
 ```
 

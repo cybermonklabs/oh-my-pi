@@ -2,12 +2,11 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getSecretPlaceholderKeyPath, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { YAML } from "bun";
+import { collectEnvSecretValues } from "./env-secrets";
 import { type SecretEntry, SecretObfuscator } from "./obfuscator";
 import { CREDENTIAL_PATTERNS } from "./patterns";
-import { sanitizeSecretFriendlyName, secretEntriesNeedPlaceholderKey } from "./placeholder";
-import { compileSecretRegex } from "./regex";
-import { regexHasUnresolvableShortMatchFallback } from "./replacement";
+import { secretEntriesNeedPlaceholderKey } from "./placeholder";
+import { globalSecretsFilePath, loadSecretsFile, projectSecretsFilePath } from "./secrets-file";
 
 const PLACEHOLDER_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
 const cachedPlaceholderKeys = new Map<string, string>();
@@ -147,8 +146,6 @@ async function readPlaceholderKeyFile(keyPath: string, retry: boolean): Promise<
 	return undefined;
 }
 
-type RawSecretEntry = Omit<SecretEntry, "friendlyName"> & { friendlyName?: unknown };
-
 export {
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
@@ -164,8 +161,8 @@ export { secretEntriesNeedPlaceholderKey, secretEntryNeedsPlaceholderKey } from 
  * Project-local entries override global entries with matching content.
  */
 export async function loadSecrets(cwd: string, agentDir: string): Promise<SecretEntry[]> {
-	const projectPath = path.join(cwd, ".omp", "secrets.yml");
-	const globalPath = path.join(agentDir, "secrets.yml");
+	const projectPath = projectSecretsFilePath(cwd);
+	const globalPath = globalSecretsFilePath(agentDir);
 
 	const globalEntries = await loadSecretsFile(globalPath);
 	const projectEntries = await loadSecretsFile(projectPath);
@@ -179,47 +176,13 @@ export async function loadSecrets(cwd: string, agentDir: string): Promise<Secret
 	return merged;
 }
 
-/** Minimum env var value length to consider as a secret. */
-const MIN_ENV_VALUE_LENGTH = 8;
-
-/** Env var name patterns that indicate secret values. */
-const SECRET_ENV_PATTERNS = /(?:KEY|SECRET|TOKEN|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|OAUTH)(?:_|$)/i;
-
-/** Extracts the password group from a `scheme://user:password@host` value. */
-const CONNECTION_URL_PASSWORD_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/:@?#\s]*:([^/?#\s]+)@/i;
-
 /** Collect environment variable values that look like secrets. */
 export function collectEnvSecrets(): SecretEntry[] {
-	const entries: SecretEntry[] = [];
-	const seen = new Set<string>();
-	for (const [name, value] of Object.entries(process.env)) {
-		if (!value || value.length < MIN_ENV_VALUE_LENGTH) continue;
-		if (!SECRET_ENV_PATTERNS.test(name)) continue;
-		if (seen.has(value)) continue;
-		seen.add(value);
-		entries.push({ type: "plain", content: value, mode: "obfuscate" });
-	}
-	// Second pass: extract passwords embedded in connection-URL values
-	// (e.g. scheme://user:password@host) regardless of the variable name.
-	for (const [, value] of Object.entries(process.env)) {
-		const match = CONNECTION_URL_PASSWORD_RE.exec(value ?? "");
-		if (!match) continue;
-		const password = match[1];
-		if (password.length >= MIN_ENV_VALUE_LENGTH && !seen.has(password)) {
-			seen.add(password);
-			entries.push({ type: "plain", content: password, mode: "obfuscate" });
-		}
-		try {
-			const decoded = decodeURIComponent(password);
-			if (decoded !== password && decoded.length >= MIN_ENV_VALUE_LENGTH && !seen.has(decoded)) {
-				seen.add(decoded);
-				entries.push({ type: "plain", content: decoded, mode: "obfuscate" });
-			}
-		} catch {
-			// Malformed percent-encoding — the raw password is already registered.
-		}
-	}
-	return entries;
+	return collectEnvSecretValues(process.env).map(({ value }) => ({
+		type: "plain",
+		content: value,
+		mode: "obfuscate",
+	}));
 }
 
 /**
@@ -290,104 +253,4 @@ export async function buildSecretObfuscator(
 		obfuscator = new SecretObfuscator([{ type: "plain", mode: "replace", content: placeholderKey }], placeholderKey);
 	}
 	return obfuscator;
-}
-
-async function loadSecretsFile(filePath: string): Promise<SecretEntry[]> {
-	try {
-		const text = await Bun.file(filePath).text();
-		const raw = YAML.parse(text);
-		if (!Array.isArray(raw)) {
-			logger.warn("secrets.yml must be a YAML array", { path: filePath });
-			return [];
-		}
-		const entries: SecretEntry[] = [];
-		for (let i = 0; i < raw.length; i++) {
-			const entry = raw[i];
-			if (!validateEntry(entry, filePath, i)) continue;
-			const friendlyName = loadFriendlyName(entry, filePath, i);
-			entries.push({
-				type: entry.type,
-				content: entry.content,
-				mode: entry.mode ?? "obfuscate",
-				replacement: entry.replacement,
-				flags: entry.flags,
-				friendlyName,
-			});
-		}
-		return entries;
-	} catch (err) {
-		if (isEnoent(err)) return [];
-		logger.warn("Failed to load secrets.yml", { path: filePath, error: String(err) });
-		return [];
-	}
-}
-
-// Validates the friendlyName but returns it UNSANITIZED: `SecretObfuscator`'s
-// own `#createPlaceholder` sanitizes it again and, critically, needs the raw
-// string for `#friendlyNameCollidesWithSecret`'s regex-collision check — a
-// case-sensitive/punctuated regex pattern (e.g. `tok_[a-z0-9]+`) only matches
-// the label as it was actually written, not an already-uppercased,
-// separator-stripped rendering of it. Pre-sanitizing here would silently
-// defeat that check for every `secrets.yml`-loaded entry.
-function loadFriendlyName(entry: RawSecretEntry, filePath: string, index: number): string | undefined {
-	if (entry.friendlyName === undefined) return undefined;
-	if (typeof entry.friendlyName !== "string") {
-		logger.warn(`secrets.yml[${index}]: friendlyName must be a string`, { path: filePath });
-		return undefined;
-	}
-	if (sanitizeSecretFriendlyName(entry.friendlyName) === undefined) {
-		logger.warn(`secrets.yml[${index}]: friendlyName must contain at least one letter or digit`, { path: filePath });
-		return undefined;
-	}
-	return entry.friendlyName;
-}
-
-function validateEntry(entry: unknown, filePath: string, index: number): entry is RawSecretEntry {
-	if (entry === null || typeof entry !== "object") {
-		logger.warn(`secrets.yml[${index}]: entry must be an object`, { path: filePath });
-		return false;
-	}
-	const e = entry as Record<string, unknown>;
-	if (e.type !== "plain" && e.type !== "regex") {
-		logger.warn(`secrets.yml[${index}]: type must be "plain" or "regex"`, { path: filePath });
-		return false;
-	}
-	if (typeof e.content !== "string" || e.content.length === 0) {
-		logger.warn(`secrets.yml[${index}]: content must be a non-empty string`, { path: filePath });
-		return false;
-	}
-	if (e.mode !== undefined && e.mode !== "obfuscate" && e.mode !== "replace") {
-		logger.warn(`secrets.yml[${index}]: mode must be "obfuscate" or "replace"`, { path: filePath });
-		return false;
-	}
-	if (e.replacement !== undefined && typeof e.replacement !== "string") {
-		logger.warn(`secrets.yml[${index}]: replacement must be a string`, { path: filePath });
-		return false;
-	}
-	if (e.flags !== undefined && typeof e.flags !== "string") {
-		logger.warn(`secrets.yml[${index}]: flags must be a string`, { path: filePath });
-		return false;
-	}
-	if (e.type === "regex") {
-		let regex: RegExp;
-		try {
-			regex = compileSecretRegex(e.content as string, e.flags as string | undefined);
-		} catch (error) {
-			logger.warn(`secrets.yml[${index}]: invalid regex pattern`, {
-				path: filePath,
-				pattern: e.content,
-				error: String(error),
-			});
-			return false;
-		}
-		const mode = (e.mode as "obfuscate" | "replace" | undefined) ?? "obfuscate";
-		if (mode === "replace" && e.replacement === undefined && regexHasUnresolvableShortMatchFallback(regex)) {
-			logger.warn(
-				`secrets.yml[${index}]: regex matches every 1-2 character candidate with no custom replacement, so a match can never be redacted distinctly from itself`,
-				{ path: filePath, pattern: e.content },
-			);
-			return false;
-		}
-	}
-	return true;
 }

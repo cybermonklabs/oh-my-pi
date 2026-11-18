@@ -477,17 +477,31 @@ async fn external_commands_start_in_backed_working_directories_only() {
 	);
 }
 
+/// Writes `text` to `path`, mode 0755, through a child `sh`, as the
+/// library's tests do (`src/testprog.rs`). This binary runs its tests as
+/// threads of one process: a child another thread forks while this process
+/// holds a program open for writing keeps a copy of that descriptor until it
+/// execs, and running the program meanwhile fails with `ETXTBSY` ("Text file
+/// busy").
+#[cfg(unix)]
+fn write_program(path: &Path, text: &str) {
+	let status = std::process::Command::new("/bin/sh")
+		.args(["-c", "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"", "sh"])
+		.arg(path)
+		.arg(text)
+		.status()
+		.unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
+	assert!(status.success(), "writing {}: {status}", path.display());
+}
+
 /// A script the provider aliases is executable as itself: the child runs the
 /// file behind the URL rather than failing on a path the kernel cannot see.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_executable_url_runs_as_the_file_it_aliases() {
-	use std::os::unix::fs::PermissionsExt;
-
 	let directory = tempfile::tempdir().expect("isolated provider filesystem");
 	let tool = directory.path().join("tool");
-	fs::write(&tool, b"#!/bin/sh\nprintf tool-ran\n").expect("provider script");
-	fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("executable script");
+	write_program(&tool, "#!/bin/sh\nprintf tool-ran\n");
 	let run = run_virtual(directory.path(), "virtual://tool").await;
 	assert_eq!(run.status, Some(0), "{}", run.stderr);
 	assert_eq!(run.stdout, "tool-ran");
@@ -505,24 +519,22 @@ async fn an_executable_url_runs_as_the_file_it_aliases() {
 	assert!(run.stdout.contains("tool-ran"), "{}", run.stdout);
 }
 
-/// Appends streamed stdout `chunks` to `output` until it ends with `suffix`.
+/// Appends streamed stdout `chunks` to `output` until it ends with
+/// `suffix`, however long that takes: a run that never writes it is failed
+/// by the test runner (`.config/nextest.toml`).
 async fn wait_for_output(
 	chunks: &flume::Receiver<Bytes>,
 	output: &mut Vec<u8>,
 	suffix: &str,
 ) -> io::Result<()> {
-	tokio::time::timeout(Duration::from_secs(5), async {
-		while !output.ends_with(suffix.as_bytes()) {
-			let chunk = chunks
-				.recv_async()
-				.await
-				.map_err(|error| io::Error::new(io::ErrorKind::UnexpectedEof, error))?;
-			output.extend_from_slice(&chunk);
-		}
-		Ok(())
-	})
-	.await
-	.map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?
+	while !output.ends_with(suffix.as_bytes()) {
+		let chunk = chunks
+			.recv_async()
+			.await
+			.map_err(|error| io::Error::new(io::ErrorKind::UnexpectedEof, error))?;
+		output.extend_from_slice(&chunk);
+	}
+	Ok(())
 }
 
 #[tokio::test]
@@ -557,11 +569,7 @@ async fn virtual_follow_observes_append_same_size_rotation_and_truncation() {
 	}
 	.await;
 	abort.abort(AbortReason::Signal);
-	tokio::time::timeout(Duration::from_secs(5), runner)
-		.await
-		.expect("cancelled tail exits")
-		.expect("tail worker")
-		.expect("tail command");
+	runner.await.expect("tail worker").expect("tail command");
 	updates.expect("each provider transition reaches stdout");
 	let diagnostics = received_text(&stderr);
 	assert!(diagnostics.contains("has been replaced"), "{diagnostics}");
@@ -574,15 +582,15 @@ async fn virtual_follow_observes_append_same_size_rotation_and_truncation() {
 
 /// A provider path has no kernel watcher, so `tail -f` polls it; that idle
 /// loop must still stop once the reader of its stdout pipe exits, as in
-/// `tail -f virtual://log | grep -m1 line`.
+/// `tail -f virtual://log | grep -m1 line`. The run returns only once it
+/// does: one that keeps following is failed by the test runner.
 #[cfg(unix)]
 #[tokio::test]
 async fn virtual_follow_stops_once_stdout_reader_is_gone() {
 	let directory = tempfile::tempdir().expect("isolated provider filesystem");
 	fs::write(directory.path().join("log"), b"line\n").expect("followed log");
 	let (sinks, stdout, stderr) = stream_sinks();
-	let mut cancel = CancelToken::default();
-	let abort = cancel.emplace_abort_token();
+	let cancel = CancelToken::default();
 	// `grep -m1` consumes the first line, then exits and closes the read end;
 	// the pipeline ends only once `tail -f` stops too.
 	let runner = tokio::spawn(execute_shell_streams(
@@ -594,12 +602,7 @@ async fn virtual_follow_stops_once_stdout_reader_is_gone() {
 		sinks,
 		cancel,
 	));
-	let stopped = tokio::time::timeout(Duration::from_secs(5), runner).await;
-	abort.abort(AbortReason::Signal);
-	let result = stopped
-		.expect("tail -f kept following after its reader exited")
-		.expect("tail worker")
-		.expect("tail command");
+	let result = runner.await.expect("tail worker").expect("tail command");
 	assert_eq!(received_text(&stdout), "line\n");
 	assert_eq!(result.exit_code, Some(0), "{}", received_text(&stderr));
 }
@@ -872,7 +875,7 @@ fn timeout_stops_a_utility_reading_stalled_provider_stdin() {
 	});
 
 	let (status, stderr) = result
-		.recv_timeout(Duration::from_secs(5))
+		.recv()
 		.expect("`timeout` waited for the stalled read");
 	assert_eq!(status, Some(124), "{stderr}");
 }
@@ -886,15 +889,14 @@ fn timeout_stops_a_utility_reading_stalled_provider_stdin() {
 async fn url_spawn_and_output_pumps_run_on_a_current_thread_runtime() {
 	let directory = tempfile::tempdir().expect("isolated provider filesystem");
 	fs::write(directory.path().join("a.txt"), b"alpha\n").expect("document");
-	let run = tokio::time::timeout(
-		Duration::from_secs(5),
-		run_virtual(
-			directory.path(),
-			"/bin/sh -c 'printf \"%s\\n\" \"$0\"; sleep 0.05; echo late' virtual://a.txt | /bin/cat",
+	let cat = pi_shell::testkit::child::on_path("cat");
+	let run = run_virtual(
+		directory.path(),
+		&format!(
+			"/bin/sh -c 'printf \"%s\\n\" \"$0\"; sleep 0.05; echo late' virtual://a.txt | {cat}"
 		),
 	)
-	.await
-	.expect("a URL spawn and its output pump progress on the only runtime thread");
+	.await;
 	assert_eq!(run.status, Some(0), "{}", run.stderr);
 	assert!(run.stdout.ends_with("a.txt\nlate\n"), "{}", run.stdout);
 }
