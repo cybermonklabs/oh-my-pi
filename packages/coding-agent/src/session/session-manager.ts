@@ -3455,10 +3455,27 @@ export class SessionManager {
 	 * settles once {@link flush} has seen the store take every queued write, and
 	 * rejects when one failed. `undefined` when the synchronous flush alone made
 	 * the session durable (file and memory storage).
+	 *
+	 * On such a storage a rewrite queued while this manager's own earlier
+	 * publish is unconfirmed fails the store's size check. That publish's
+	 * confirmation rewrites the transcript, the refused entries included, so
+	 * the wait covers it before {@link flush} reports what is left.
 	 */
 	flushSyncThenConfirm(): Promise<void> | undefined {
-		this.flushSync();
-		return this.#storage.defersSyncPublish ? this.flush() : undefined;
+		if (!this.#storage.defersSyncPublish) {
+			this.flushSync();
+			return undefined;
+		}
+		try {
+			this.flushSync();
+		} catch (error) {
+			if (!(error instanceof SessionWriteConflictError)) throw error;
+			return this.#storage
+				.drain()
+				.catch(() => undefined)
+				.then(() => this.flush());
+		}
+		return this.flush();
 	}
 
 	/**

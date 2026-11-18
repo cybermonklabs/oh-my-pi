@@ -1,7 +1,8 @@
 /**
  * A session that ends on SIGTERM stores its exit record on a store that only
- * queues its writes (indexed backends, SQL storage), and a store that never
- * answers cannot hold the exit past the cleanup deadline. Each case runs
+ * queues its writes (indexed backends, SQL storage), also when the signal
+ * lands while the turn's own first publish is still queued, and a store that
+ * never answers cannot hold the exit past the cleanup deadline. Each case runs
  * `fixtures/session-exit-signal-host.ts` in a child process and signals it.
  * The PostgreSQL cases run when `OMP_TEST_SQL_POSTGRES_URL` names a throwaway
  * database; each uses a table of its own and drops it when done.
@@ -86,13 +87,43 @@ async function terminate(host: Host, whileExiting?: () => Promise<void>): Promis
 	return { code, ms: performance.now() - start };
 }
 
-function exitRecords(transcript: string): unknown[] {
+interface StoredEntry {
+	type?: string;
+	customType?: string;
+	data?: unknown;
+	message?: { role?: string; content?: unknown };
+}
+
+function storedEntries(transcript: string): StoredEntry[] {
 	return transcript
 		.split("\n")
 		.filter(line => line.length > 0)
-		.map(line => JSON.parse(line) as { type?: string; customType?: string; data?: unknown })
+		.map(line => JSON.parse(line) as StoredEntry);
+}
+
+function exitRecords(transcript: string): unknown[] {
+	return storedEntries(transcript)
 		.filter(entry => entry.type === "custom" && entry.customType === SESSION_EXIT_CUSTOM_TYPE)
 		.map(entry => entry.data);
+}
+
+/** The stored messages, in order. */
+function storedMessages(transcript: string): unknown[] {
+	return storedEntries(transcript)
+		.filter(entry => entry.type === "message")
+		.map(entry => entry.message);
+}
+
+/** The turn the host stores: its prompt and its answer. */
+const TURN = [
+	{ role: "user", content: "finish" },
+	{ role: "assistant", content: [{ type: "text", text: "done" }] },
+];
+
+/** What the queued store holds for the host's session; empty when it holds nothing. */
+function queuedTranscript(host: Host): string {
+	if (!host.storedAt) throw new Error("Expected the queued store's file");
+	return fs.existsSync(host.storedAt) ? fs.readFileSync(host.storedAt, "utf8") : "";
 }
 
 describe("SIGTERM on a store that only queues its writes", () => {
@@ -103,10 +134,21 @@ describe("SIGTERM on a store that only queues its writes", () => {
 			const exit = await terminate(host);
 
 			expect(exit.code).toBe(143);
-			if (!host.storedAt) throw new Error("Expected the queued store's file");
-			expect(exitRecords(fs.readFileSync(host.storedAt, "utf8"))).toMatchObject([
-				{ reason: "sigterm", kind: "signal" },
-			]);
+			expect(exitRecords(queuedTranscript(host))).toMatchObject([{ reason: "sigterm", kind: "signal" }]);
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
+		"stores the turn and the exit record when the signal lands while the turn's first publish is queued",
+		async () => {
+			const host = await startHost(workDir(), ["queued", "slow", "pending"]);
+			const exit = await terminate(host);
+
+			expect(exit.code).toBe(143);
+			const transcript = queuedTranscript(host);
+			expect(storedMessages(transcript)).toMatchObject(TURN);
+			expect(exitRecords(transcript)).toMatchObject([{ reason: "sigterm", kind: "signal" }]);
 		},
 		CASE_TIMEOUT_MS,
 	);
@@ -115,6 +157,18 @@ describe("SIGTERM on a store that only queues its writes", () => {
 		"exits by the cleanup deadline when the backend never answers",
 		async () => {
 			const host = await startHost(workDir(), ["queued", "hang"]);
+			const exit = await terminate(host);
+
+			expect(exit.code).toBe(143);
+			expect(exit.ms).toBeLessThan(CLEANUP_DEADLINE_MS + EXIT_SLACK_MS);
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
+		"exits by the cleanup deadline when the turn's first publish never answers",
+		async () => {
+			const host = await startHost(workDir(), ["queued", "hang", "pending"]);
 			const exit = await terminate(host);
 
 			expect(exit.code).toBe(143);
@@ -168,11 +222,22 @@ describe.skipIf(!POSTGRES_URL)("SIGTERM on SQL storage on PostgreSQL", () => {
 		return unlock;
 	}
 
+	/** Create the store's tables in `name`, as a host's store would. */
+	async function createStore(name: string): Promise<void> {
+		const client = new SQL(url);
+		try {
+			await SqlSessionStorage.create({ client, table: name });
+		} finally {
+			await client.end();
+		}
+	}
+
+	/** What the store in `name` holds for `sessionFile`; empty when it holds nothing. */
 	async function storedTranscript(name: string, sessionFile: string): Promise<string> {
 		const client = new SQL(url);
 		try {
 			const storage = await SqlSessionStorage.create({ client, table: name });
-			return await storage.readText(sessionFile);
+			return storage.existsSync(sessionFile) ? await storage.readText(sessionFile) : "";
 		} finally {
 			await client.end();
 		}
@@ -197,6 +262,28 @@ describe.skipIf(!POSTGRES_URL)("SIGTERM on SQL storage on PostgreSQL", () => {
 			expect(exitRecords(await storedTranscript(name, host.sessionFile))).toMatchObject([
 				{ reason: "sigterm", kind: "signal" },
 			]);
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
+		"stores the turn and the exit record when the signal lands while the turn's first write waits on the database",
+		async () => {
+			const name = table();
+			await createStore(name);
+			// Locked before the host starts, so the new session's first write, the
+			// whole turn, is still waiting when the signal lands. Real time, as above.
+			const unlock = await lockTable(name);
+			const host = await startHost(workDir(), ["postgres", url, name, "pending"]);
+			const exit = await terminate(host, async () => {
+				await Promise.race([host.child.exited, Bun.sleep(LOCK_AFTER_SIGNAL_MS)]);
+				await unlock();
+			});
+
+			expect(exit.code).toBe(143);
+			const transcript = await storedTranscript(name, host.sessionFile);
+			expect(storedMessages(transcript)).toMatchObject(TURN);
+			expect(exitRecords(transcript)).toMatchObject([{ reason: "sigterm", kind: "signal" }]);
 		},
 		CASE_TIMEOUT_MS,
 	);
