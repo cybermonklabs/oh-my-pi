@@ -325,6 +325,19 @@ function appendParentTaskTurn(main: SessionManager, id: string): void {
 	main.appendMessage(assistant({ content: [{ type: "text", text: `${id} could not run.` }] }));
 }
 
+/** The parent's sync `task` call to subagent `id`, without its result: the parent's process ended while it waited. */
+function appendParentTaskCall(main: SessionManager, id: string): void {
+	main.appendMessage({ role: "user", content: `Delegate the ${id} work.`, timestamp: Date.now() });
+	main.appendMessage(
+		assistant({
+			content: [
+				{ type: "toolCall", id: `call_${id}`, name: "task", arguments: { agent: "worker", task: `${id} task` } },
+			],
+			stopReason: "toolUse",
+		}),
+	);
+}
+
 /** Subagent `id`'s transcript under `mainFile`: its turn ended because its key could not be resolved, then a normal exit. */
 async function writeStrandedSubagent(mainFile: string, cwd: string, id: string): Promise<void> {
 	const sub = await SessionManager.open(path.join(mainFile.slice(0, -6), `${id}.jsonl`), undefined, undefined, {
@@ -373,7 +386,7 @@ describe("omp --restore after the user cleared the parent conversation", () => {
 		setSystemTime(new Date(start + 60_000));
 		main.appendResetBoundary();
 		setSystemTime(new Date(start + 120_000));
-		appendParentTaskTurn(main, "After");
+		appendParentTaskCall(main, "After");
 		await writeStrandedSubagent(mainFile, cwd, "After");
 		main.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
 			reason: "dispose",

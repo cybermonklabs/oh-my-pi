@@ -344,6 +344,19 @@ function appendParentTaskTurn(main: SessionManager, id: string): void {
 	main.appendMessage(assistant({ content: [{ type: "text", text: `${id} could not run.` }] }));
 }
 
+/** The parent's sync `task` call to subagent `id`, without its result: the parent's process ended while it waited. */
+function appendParentTaskCall(main: SessionManager, id: string): void {
+	main.appendMessage({ role: "user", content: `Delegate the ${id} work.`, timestamp: Date.now() });
+	main.appendMessage(
+		assistant({
+			content: [
+				{ type: "toolCall", id: `call_${id}`, name: "task", arguments: { agent: "worker", task: `${id} task` } },
+			],
+			stopReason: "toolUse",
+		}),
+	);
+}
+
 /** Subagent `id`'s transcript under `mainFile`: its turn ended because its key could not be resolved, then a normal exit. */
 async function writeStrandedSubagent(mainFile: string, cwd: string, id: string): Promise<void> {
 	const sub = await SessionManager.open(path.join(mainFile.slice(0, -6), `${id}.jsonl`), undefined, undefined, {
@@ -369,14 +382,20 @@ async function writeStrandedSubagent(mainFile: string, cwd: string, id: string):
 }
 
 /** A transcript under `dir` for subagent `id` whose turn finished: nothing to go on with of its own. */
-async function writeFinishedSubagent(parentFile: string, cwd: string, id: string, spawnsChild?: string): Promise<void> {
+async function writeFinishedSubagent(
+	parentFile: string,
+	cwd: string,
+	id: string,
+	spawnsChild?: string,
+	appendSpawn = appendParentTaskTurn,
+): Promise<void> {
 	const sub = await SessionManager.open(path.join(parentFile.slice(0, -6), `${id}.jsonl`), undefined, undefined, {
 		initialCwd: cwd,
 		parentSession: parentFile,
 		suppressBreadcrumb: true,
 	});
 	sub.appendSessionInit({ systemPrompt: ["sub prompt"], task: `${id} task`, tools: ["read", "task", "yield"] });
-	if (spawnsChild) appendParentTaskTurn(sub, spawnsChild);
+	if (spawnsChild) appendSpawn(sub, spawnsChild);
 	else sub.appendMessage({ role: "user", content: `${id} task`, timestamp: Date.now() });
 	sub.appendMessage(assistant({ content: [{ type: "text", text: `${id} done` }] }));
 	sub.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
@@ -414,7 +433,7 @@ describe("omp --restore after the user cleared the parent of nested subagents", 
 		setSystemTime(new Date(start + 120_000));
 		// After it: NewOuter spawned NewInner, which was stranded too.
 		appendParentTaskTurn(main, "NewOuter");
-		await writeFinishedSubagent(mainFile, cwd, "NewOuter", "NewInner");
+		await writeFinishedSubagent(mainFile, cwd, "NewOuter", "NewInner", appendParentTaskCall);
 		await writeStrandedSubagent(path.join(mainFile.slice(0, -6), "NewOuter.jsonl"), cwd, "NewInner");
 		main.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
 			reason: "dispose",

@@ -13,16 +13,20 @@
  * rebuilds it from its transcript, {@link runSubagentFollowUpTurn} goes on with the
  * cut-off turn and drives it to `yield`, and the parent receives the result as the
  * ordinary `async-result` of a job with the subagent's id, the id its first run's
- * job had, so a parent waiting on that job finds it again.
+ * job had, so a parent waiting on that job finds it again. A turn that ended because
+ * its key could not be resolved handed its parent the failure at once: it goes on only
+ * while the parent still waits on it, holding no result of it recorded since the turn
+ * began ({@link SpawnRecords.awaitedByParent}); a parent that holds the failure acts on it.
  */
 import * as path from "node:path";
-import { logger } from "@oh-my-pi/pi-utils";
-import { taskCardAgentIds } from "@oh-my-pi/pi-tui/tools/task";
+import { isRecord, logger, stringProperty } from "@oh-my-pi/pi-utils";
+import { isTaskToolDetails, taskCardAgentIds } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError } from "../async";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
-import { hasRestorableTurn } from "../session/exit-diagnostics";
+import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
+import { endsOnCredentialUnavailableTurn, hasRestorableTurn } from "../session/exit-diagnostics";
 import { activeBranch, type SessionEntry } from "../session/session-entries";
 import { extractSessionInit, type SessionManager } from "../session/session-manager";
 import { collectSubSessions, type SubSession } from "../session/sub-sessions";
@@ -80,12 +84,17 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 		const sub = subSessions[key]!;
 		// The selected branch, as the subagent's own session reopens it: entries on other branches
 		// (an abandoned turn, a `/clear` that was rolled back) are not its conversation.
-		if (sub.aborted || !hasRestorableTurn(activeBranch(sub.entries, sub.leafId))) continue;
+		const branch = activeBranch(sub.entries, sub.leafId);
+		if (sub.aborted || !hasRestorableTurn(branch)) continue;
 		const id = sub.agentId;
 		// A `/clear` or a move to another branch leaves the parent's earlier work behind: that work's
 		// subagents are not the new conversation's, whose parent would get a result for a job it never started.
 		if (!spawns.inCurrentConversation(sub)) {
 			logger.debug("Interrupted subagent belongs to work its parent left; not restored", { id });
+			continue;
+		}
+		if (endsOnCredentialUnavailableTurn(branch) && !spawns.awaitedByParent(sub, lastTurnStartedAt(branch))) {
+			logger.debug("Subagent's parent holds its failed result; not restored", { id });
 			continue;
 		}
 		const ref = registry.get(id);
@@ -133,13 +142,16 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 }
 
 /**
- * The subagents a parent transcript's `task` calls spawned, as their results name them:
- * `current`, those of the conversation on the active branch after its last `/clear`
- * (`reset_boundary`); `named`, those of every `task` result, on any branch.
+ * What a parent transcript records of the subagents its `task` calls spawned:
+ * `current`, those its `task` results name in the conversation on the active branch
+ * after its last `/clear` (`reset_boundary`); `named`, those of every `task` result,
+ * on any branch; `held`, those whose result that conversation holds
+ * ({@link heldResultAgentIds}), each with when its latest such result was written, in epoch ms.
  */
 interface SpawnedSubagents {
 	current: Set<string>;
 	named: Set<string>;
+	held: Map<string, number>;
 	/** When that last `/clear` was written, in epoch ms; undefined without one. */
 	clearedAt: number | undefined;
 }
@@ -150,10 +162,63 @@ function taskResultAgentIds(entry: SessionEntry): string[] {
 	return taskCardAgentIds(entry.message.details);
 }
 
+/**
+ * The subagent ids whose result a parent's transcript entry hands it: a `task` result's
+ * settled results (a sync spawn's; a background spawn's "started" result names it only in
+ * its progress), and the settled jobs a background job's delivery (`async-result`) or a
+ * `wait` returned.
+ */
+function heldResultAgentIds(entry: SessionEntry): string[] {
+	if (entry.type === "custom_message") {
+		return entry.customType === ASYNC_RESULT_MESSAGE_TYPE ? settledJobAgentIds(entry.details) : [];
+	}
+	if (entry.type !== "message" || entry.message.role !== "toolResult") return [];
+	const { toolName, details } = entry.message;
+	if (toolName === "task") return isTaskToolDetails(details) ? details.results.map(result => result.id) : [];
+	return toolName === "wait" ? settledJobAgentIds(details) : [];
+}
+
+/**
+ * The agent ids of the settled jobs a job report lists: an `async-result` delivery's
+ * (`agentId`, else `jobId`) or a `wait` snapshot's (`agentUrlId`, else `id`), whose
+ * running jobs it hands over no result of.
+ */
+function settledJobAgentIds(details: unknown): string[] {
+	if (!isRecord(details) || !Array.isArray(details.jobs)) return [];
+	const ids: string[] = [];
+	for (const job of details.jobs) {
+		if (!isRecord(job) || job.status === "running") continue;
+		const id =
+			stringProperty(job, "agentId") ??
+			stringProperty(job, "agentUrlId") ??
+			stringProperty(job, "jobId") ??
+			stringProperty(job, "id");
+		if (id) ids.push(id);
+	}
+	return ids;
+}
+
+/**
+ * When the branch's last turn began, in epoch ms: when the input that started it was
+ * written (the task prompt, or the message that woke the subagent again), the last entry
+ * before that turn's own replies and tool results. Undefined without one.
+ */
+function lastTurnStartedAt(branch: readonly SessionEntry[]): number | undefined {
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index]!;
+		const input =
+			entry.type === "custom_message" ||
+			(entry.type === "message" && entry.message.role !== "assistant" && entry.message.role !== "toolResult");
+		if (input) return Date.parse(entry.timestamp);
+	}
+	return undefined;
+}
+
 function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string | null): SpawnedSubagents {
 	const named = new Set<string>();
 	for (const entry of entries) for (const id of taskResultAgentIds(entry)) named.add(id);
 	const current = new Set<string>();
+	const held = new Map<string, number>();
 	let clearedAt: number | undefined;
 	const branch = activeBranch(entries, leafId);
 	for (let index = branch.length - 1; index >= 0; index--) {
@@ -163,8 +228,10 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 			break;
 		}
 		for (const id of taskResultAgentIds(entry)) current.add(id);
+		// Read from the leaf back: the first result naming a subagent is its latest.
+		for (const id of heldResultAgentIds(entry)) if (!held.has(id)) held.set(id, Date.parse(entry.timestamp));
 	}
-	return { current, named, clearedAt };
+	return { current, named, held, clearedAt };
 }
 
 /**
@@ -184,10 +251,11 @@ function spawnedInCurrentConversation(sub: SubSession, spawned: SpawnedSubagents
 }
 
 /**
- * The `task` results of each parent in a session's subagent tree, read when first
- * needed: the session's own from its open session manager (the parent is already
- * loaded, from whatever storage holds it), and each subagent's from the entries
- * {@link collectSubSessions} collected.
+ * What each parent in a session's subagent tree records of its subagents
+ * ({@link SpawnedSubagents}), read when first needed: the session's own from its open
+ * session manager (the parent is already loaded, from whatever storage holds it), and
+ * each subagent's from the entries {@link collectSubSessions} collected. A parent whose
+ * transcript was not collected judges nothing.
  */
 class SpawnRecords {
 	readonly #sessionManager: SessionManager;
@@ -204,7 +272,7 @@ class SpawnRecords {
 	 * Whether `sub` belongs to the session's current conversation: it, and each subagent
 	 * above it, was spawned in its parent's current conversation
 	 * ({@link spawnedInCurrentConversation}), since the subagents of work a `/clear` left
-	 * behind are that work too. A parent whose transcript was not collected judges nothing.
+	 * behind are that work too.
 	 */
 	inCurrentConversation(sub: SubSession): boolean {
 		let current: SubSession | undefined = sub;
@@ -215,6 +283,22 @@ class SpawnRecords {
 			current = parentKey === null ? undefined : this.#subSessions[parentKey];
 		}
 		return true;
+	}
+
+	/**
+	 * Whether `sub`'s own parent still waits on its turn that began at `turnStartedAt`
+	 * (epoch ms): its current conversation holds no result of `sub` written since. A sync
+	 * spawn's parent whose process ended inside the call has none yet, nor has the parent
+	 * of a background spawn whose job result was never delivered. A result written before
+	 * the turn began answered an earlier turn, one the parent then messaged `sub` to go on
+	 * from.
+	 */
+	awaitedByParent(sub: SubSession, turnStartedAt: number | undefined): boolean {
+		const spawned = sub.parent === null ? this.#ofSession() : this.#ofSubagent(sub.parent);
+		const heldAt = spawned?.held.get(sub.agentId);
+		if (heldAt === undefined) return true;
+		// An unreadable or unknown time judges nothing, and the result stands.
+		return turnStartedAt !== undefined && heldAt < turnStartedAt;
 	}
 
 	#ofSession(): SpawnedSubagents {

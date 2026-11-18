@@ -518,7 +518,17 @@ A turn that ended because no request could resolve its provider key, even after
 its retries (a `!command` apiKey that produced nothing, stored credentials that
 were disabled or cannot serve, an OAuth account pool with no account that can
 serve, a failed OAuth refresh), is retried too, whatever exit followed it:
-nothing was sent, and a subagent's process exits normally on such a turn.
+nothing was sent, and a subagent's process exits normally on such a turn. Such a
+subagent's parent got the failed result at once, so the subagent is relaunched
+only while its parent still waits on it, judged by its own parent's current
+conversation (after that parent's last `/clear`, on its active branch): a sync
+subagent while no `task` result there settles it (the parent's process ended
+inside the call), a background one while no delivery of its job's result (an
+`async-result` message, or a `wait` that returned the settled job) is there; the
+`task` result that only started the job does not count, nor does a result written
+before the subagent's last turn began (its task prompt, or the message that woke
+it again): that result answered an earlier turn, and the parent waits on this one.
+A parent that holds the failed result acts on it itself.
 
 An abort while such a turn waits to retry ends it or leaves it by who gets its
 result:

@@ -194,6 +194,20 @@ function isCredentialUnavailableTurn(message: AgentMessage): boolean {
 }
 
 /**
+ * Whether the branch's last turn ended because no request could resolve its
+ * provider's key ({@link isCredentialUnavailableTurn}): its last message, after its
+ * last `/clear`, is that marked error.
+ */
+export function endsOnCredentialUnavailableTurn(entries: readonly SessionEntry[]): boolean {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index]!;
+		if (entry.type === "reset_boundary") return false;
+		if (entry.type === "message") return isCredentialUnavailableTurn(entry.message);
+	}
+	return false;
+}
+
+/**
  * Whether `omp --restore` has a turn to go on with on this branch: one its last
  * process left unfinished ({@link findUnfinishedTurn}, the exit assumed), one exit
  * recovery already closed that nothing followed, not even a normal exit, or one
@@ -204,13 +218,13 @@ function isCredentialUnavailableTurn(message: AgentMessage): boolean {
  * failed attempt and ends it.
  */
 export function hasRestorableTurn(entries: readonly SessionEntry[]): boolean {
+	if (endsOnCredentialUnavailableTurn(entries)) return true;
 	let normalExit = false;
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index]!;
 		if (entry.type === "reset_boundary") return false;
 		if (readSessionExit(entry)?.kind === "normal") normalExit = true;
 		if (entry.type !== "message") continue;
-		if (isCredentialUnavailableTurn(entry.message)) return true;
 		if (normalExit) return false;
 		if (isInterruptedTurnAbort(entry.message)) return true;
 		break;
