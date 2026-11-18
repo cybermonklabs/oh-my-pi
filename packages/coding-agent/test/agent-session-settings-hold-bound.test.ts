@@ -175,11 +175,10 @@ describe("a settings change held on a bound prompt goes out within five minutes 
 
 	it("sends an edit-mode change in the first request made five minutes after the change", async () => {
 		const rebuilt = await requestOnChangedSettings("edit:\n  mode: replace\n", ["read", "edit"]);
-		const { first, atBound } = await changeUnderWarmCache(
-			"edit:\n  mode: hashline\n",
-			"edit:\n  mode: replace\n",
-			["read", "edit"],
-		);
+		const { first, atBound } = await changeUnderWarmCache("edit:\n  mode: hashline\n", "edit:\n  mode: replace\n", [
+			"read",
+			"edit",
+		]);
 		expect(withoutCacheControl(rebuilt.tools)).not.toBe(withoutCacheControl(first.tools));
 
 		// Only the bound is asserted. The edit mode renders into the tool definitions alone (the system prompt does
