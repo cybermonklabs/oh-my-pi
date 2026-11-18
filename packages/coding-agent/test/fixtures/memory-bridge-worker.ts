@@ -72,31 +72,25 @@ function childSession(settings: Settings): AgentSession {
 	});
 }
 
-/** A worker child whose Hindsight state aliases `parent`, started as a subagent's backend starts. */
-async function startHindsightChild(parent: HindsightSessionStateApi) {
-	const settings = Settings.isolated({
-		"memory.backend": "hindsight",
-		"hindsight.apiUrl": "http://hindsight.invalid",
-	});
-	const session = childSession(settings);
-	await hindsightBackend.start({
-		session,
-		settings,
-		modelRegistry,
-		agentDir: "/tmp",
-		taskDepth: 1,
-		parentHindsightSessionState: parent,
-	});
-	const alias = session.getHindsightSessionState();
-	if (!alias) throw new Error("hindsight alias was not installed");
-	return { settings, session, alias };
-}
-
 function buildProbe(): MemoryProbe {
 	let mnemopiChild: AgentSession | undefined;
 	return {
 		hindsightChild: async (parent, fact, query) => {
-			const { settings, session, alias } = await startHindsightChild(parent);
+			const settings = Settings.isolated({
+				"memory.backend": "hindsight",
+				"hindsight.apiUrl": "http://hindsight.invalid",
+			});
+			const session = childSession(settings);
+			await hindsightBackend.start({
+				session,
+				settings,
+				modelRegistry,
+				agentDir: "/tmp",
+				taskDepth: 1,
+				parentHindsightSessionState: parent,
+			});
+			const alias = session.getHindsightSessionState();
+			if (!alias) throw new Error("hindsight alias was not installed");
 			// The retain/recall tools act on the session's own (alias) state.
 			alias.enqueueRetain(fact, "from worker");
 			await alias.flushRetainQueue();
@@ -115,7 +109,21 @@ function buildProbe(): MemoryProbe {
 			return report;
 		},
 		hindsightCompaction: async (parent, messages) => {
-			const { session, alias } = await startHindsightChild(parent);
+			const settings = Settings.isolated({
+				"memory.backend": "hindsight",
+				"hindsight.apiUrl": "http://hindsight.invalid",
+			});
+			const session = childSession(settings);
+			await hindsightBackend.start({
+				session,
+				settings,
+				modelRegistry,
+				agentDir: "/tmp",
+				taskDepth: 1,
+				parentHindsightSessionState: parent,
+			});
+			const alias = session.getHindsightSessionState();
+			if (!alias) throw new Error("hindsight alias was not installed");
 			try {
 				return await alias.recallForCompaction(messages);
 			} finally {
