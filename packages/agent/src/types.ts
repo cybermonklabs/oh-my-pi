@@ -435,6 +435,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	syncContextBeforeModelCall?: (context: AgentContext, signal?: AbortSignal) => void | Promise<void>;
 
 	/**
+	 * Messages the next model call must carry that its context lacks, asked before each model call once
+	 * {@link syncContextBeforeModelCall} has run. They are appended to the context as input messages of the turn
+	 * the call opens, and emitted with its other inputs, so a host records them where the call sent them and later
+	 * calls replay them as history.
+	 */
+	getMissingContextMessages?: (context: AgentContext) => AgentMessage[] | Promise<AgentMessage[]>;
+
+	/**
 	 * Asked after the complete provider context has been built, including
 	 * message conversion, provider transforms, normalized tools, and owned
 	 * dialect prompt injection. Returning {@link AgentPreModelCallStop} ends

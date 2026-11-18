@@ -29,7 +29,7 @@ import { type LocalProtocolOptions } from "../internal-urls";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { sameItems } from "@oh-my-pi/pi-tui/native/memo";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
-import { findDeliveredRecall, MEMORY_RECALL_MESSAGE_TYPE } from "../memory-backend/recall-entry";
+import { findDeliveredRecall } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
@@ -163,6 +163,12 @@ export interface SessionToolsHost {
 	toolDefinitionsDigest(): string;
 	clearMemoryPromotionSnapshot(): void;
 	captureMemoryPromotionSnapshot(prompt: string[]): void;
+	/**
+	 * Records where the recall the memory backend adopted goes: `recall` rides the conversation as a hidden
+	 * `memory-recall` message, which each request sends where its context lacks it; undefined when it is a system
+	 * block or the backend adopted none.
+	 */
+	setHiddenMemoryRecall(recall: string | undefined): void;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	notifyCommandMetadataChanged(): void;
 	localProtocolOptions(): LocalProtocolOptions;
@@ -243,12 +249,6 @@ interface SystemPromptPreparation {
 	systemPrompt: string[];
 	/** Memory backend note to deliver with the turn ({@link MemoryPromptPreparation.notice}). */
 	memoryNotice?: MemoryPromptPreparation["notice"];
-	/**
-	 * Recall block to deliver as a hidden message after the turn's newest content rather than in
-	 * {@link systemPrompt}: the conversation's bound prompt was already sent without a recall, or a
-	 * compaction summarized the hidden message that delivered it.
-	 */
-	memoryRecall?: string;
 	/** Publish staged state at validated delivery; false declines the prepared turn without mutation. */
 	commit?(): boolean;
 }
@@ -3896,33 +3896,40 @@ export class SessionTools {
 		try {
 			const memory = await backend.beforeAgentStartPrompt(this.#host.memoryBackendSession(), promptText, signal);
 			if (!isCurrent()) return { systemPrompt: this.#baseSystemPrompt };
-			// A recall the branch delivered as a hidden message (see below) is its history, never a system block, not
-			// even on resume, and a prompt rebuild leaves it out of the memory instructions (`recallDelivered`).
-			// One a compaction summarized goes out again, once, after this turn's newest content. Without a recall
-			// that found something, the base prompt stays as it is too.
-			const carried = this.#host.agent.state.messages.some(
-				message => message.role === "custom" && message.customType === MEMORY_RECALL_MESSAGE_TYPE,
-			);
-			const resentRecall = carried ? undefined : findDeliveredRecall(this.#host.sessionManager.getBranchView());
-			if (carried || resentRecall !== undefined || !memory?.context) {
+			const injected = memory?.context;
+			// No recall this turn, or one that found nothing: the base prompt stays as it is. A recall the conversation
+			// carries as a hidden message stays its recall unless the backend adopted an empty one in its place.
+			if (!memory || !injected) {
 				return {
 					systemPrompt: this.#baseSystemPrompt,
 					memoryNotice: memory?.notice,
-					memoryRecall: resentRecall,
-					commit: () => isCurrent() && (memory?.commit() ?? true),
+					commit: () => {
+						if (!isCurrent()) return false;
+						if (!memory) return true;
+						if (!memory.commit()) return false;
+						this.#host.setHiddenMemoryRecall(undefined);
+						return true;
+					},
 				};
 			}
-			const injected = memory.context;
-			// A conversation a prefix-bound model has answered went out without a recall (a reused one is
-			// the transcript's own). A fresh recall now would add a system block, and the provider would
-			// write the whole conversation to its cache again and drop its replayed thinking: it rides
-			// after the turn's newest content instead, with no rebuild, and stays there (see above).
-			if (!memory.reused && this.#promptBound) {
+			// A recall a system block would carry only by rewriting the cached prompt rides the conversation as a hidden
+			// message (`setHiddenMemoryRecall`): a reused one the branch delivered that way, even on resume, and a fresh
+			// one after a prefix-bound model answered a prompt sent without it, where a new block would have the
+			// provider write the whole conversation to its cache again and drop its replayed thinking. Each request
+			// sends it where its context lacks it, and a prompt rebuild leaves it out of the memory instructions
+			// (`recallDelivered`).
+			const hidden = memory.reused
+				? findDeliveredRecall(this.#host.sessionManager.getBranchView()) !== undefined
+				: this.#promptBound;
+			if (hidden) {
 				return {
 					systemPrompt: this.#baseSystemPrompt,
 					memoryNotice: memory.notice,
-					memoryRecall: injected,
-					commit: () => isCurrent() && memory.commit(),
+					commit: () => {
+						if (!isCurrent() || !memory.commit()) return false;
+						this.#host.setHiddenMemoryRecall(injected);
+						return true;
+					},
 				};
 			}
 
@@ -3948,6 +3955,7 @@ export class SessionTools {
 				memoryNotice: memory.notice,
 				commit: () => {
 					if (!isCurrent() || !memory.commit()) return false;
+					this.#host.setHiddenMemoryRecall(undefined);
 					refreshed?.commit?.();
 					// A handler may have refreshed tools or policy. Promote the recall onto
 					// that winning base, never replace it with the preparation's snapshot.

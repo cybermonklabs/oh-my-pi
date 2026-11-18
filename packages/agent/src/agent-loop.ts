@@ -1409,6 +1409,12 @@ async function runLoopBody(
 						await config.syncContextBeforeModelCall(currentContext, signal);
 					}
 					if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
+					// A message the call must carry that the context lacks joins this turn's inputs.
+					for (const message of (await config.getMissingContextMessages?.(currentContext)) ?? []) {
+						currentContext.messages.push(message);
+						newMessages.push(message);
+						turnMessages.push(message);
+					}
 
 					if (!directiveResolvedForTurn) {
 						const directive = signal?.aborted ? undefined : config.getToolChoice?.();

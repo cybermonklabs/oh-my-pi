@@ -4304,10 +4304,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					systemPrompt: typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt,
 				};
 			}
-			// Advisors keep the recall; the prompt leaves out one the conversation carries as a hidden message.
+			// Advisors keep the recall; the prompt leaves out one the conversation carries as a hidden message, on every
+			// branch: a request whose context lacks that message sends it again (`AgentSession.hiddenMemoryRecall`).
 			let memoryInstructions = backendInstructions;
-			const deliveredRecall = findDeliveredRecall(sessionManager.getBranchView());
-			if (memoryBackend && deliveredRecall !== undefined) {
+			const hiddenRecall = hasSession
+				? session.hiddenMemoryRecall
+				: findDeliveredRecall(sessionManager.getBranchView());
+			if (memoryBackend && hiddenRecall !== undefined) {
 				const instructions = await memoryBackend.buildDeveloperInstructions(
 					agentDir,
 					sessionManager.getCwd(),
@@ -4315,7 +4318,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					session,
 					{ recallDelivered: true },
 				);
-				memoryInstructions = withoutDeliveredRecall(instructions, deliveredRecall);
+				memoryInstructions = withoutDeliveredRecall(instructions, hiddenRecall);
 			}
 
 			// Build combined append prompt: memory instructions + auto-learn guidance

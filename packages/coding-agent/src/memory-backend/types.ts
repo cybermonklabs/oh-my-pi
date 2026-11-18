@@ -113,8 +113,8 @@ export interface MemoryPromptPreparation {
 /** Options of {@link MemoryBackend.buildDeveloperInstructions}. */
 export interface MemoryInstructionsOptions {
 	/**
-	 * The conversation carries the recall as a hidden message (`findDeliveredRecall`): leave out the recall the
-	 * backend adopted, which the prompt would otherwise send a second time.
+	 * The conversation carries the recall as a hidden message (`AgentSession.hiddenMemoryRecall`): leave out the
+	 * recall the backend adopted, which the prompt would otherwise send a second time.
 	 */
 	recallDelivered?: boolean;
 }

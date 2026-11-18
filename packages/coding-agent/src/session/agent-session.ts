@@ -25,6 +25,7 @@ import {
 	type AfterToolCallResult,
 	type Agent,
 	AgentBusyError,
+	type AgentContext,
 	type AgentEvent,
 	type AgentMessage,
 	type AgentPreModelCallStop,
@@ -187,7 +188,11 @@ import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sh
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { DaemonCompletionNotification } from "../launch/protocol";
-import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE, MEMORY_RECALL_MESSAGE_TYPE } from "../memory-backend/recall-entry";
+import {
+	findDeliveredRecall,
+	MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+	MEMORY_RECALL_MESSAGE_TYPE,
+} from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
@@ -2489,6 +2494,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			memoryAgentDir: config.memoryAgentDir,
 			memoryTaskDepth: config.memoryTaskDepth,
 			createMemoryTools: config.createMemoryTools,
+			hiddenRecall: findDeliveredRecall(this.sessionManager.getBranchView()),
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
 		// toggle scopes priority to Fireworks alone, without mutating the shared
@@ -2656,6 +2662,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			return thunks;
 		});
+		this.agent.setMissingContextMessageProvider(context => this.#missingContextMessages(context));
 		this.#convertToLlm = config.convertToLlm ?? convertToLlm;
 		this.getXdevToolEntries = config.getXdevToolEntries ?? (() => []);
 		const sessionToolsHost: SessionToolsHost = {
@@ -2686,6 +2693,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			toolDefinitionsDigest: () => this.#promptCacheShape(this.model).tools,
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
+			setHiddenMemoryRecall: recall => this.#memory.setHiddenRecall(recall),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
@@ -7813,6 +7821,54 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
+	 * The recall the memory backend adopted that the conversation carries as a hidden `memory-recall` message
+	 * instead of a system block; a prompt rebuild leaves it out of the memory instructions.
+	 */
+	get hiddenMemoryRecall(): string | undefined {
+		return this.#memory.hiddenRecall;
+	}
+
+	/**
+	 * The hidden messages a model call must carry that its context lacks, decided from the call's own context:
+	 * - the conversation's hidden recall ({@link hiddenMemoryRecall}) where neither the system prompt nor a
+	 *   `memory-recall` message holds it: a branch the delivered message is not on (`/tree` to before it), a
+	 *   compaction that summarized it (before the turn or between its tool calls) and an older recall the context
+	 *   holds in its place each leave it out;
+	 * - the approved-plan reference a compaction re-armed after the turn was prepared (the turn's own pre-prompt
+	 *   compaction, one between its tool calls), which would otherwise wait for the next prompt.
+	 * The call sends them after its newest content, and later calls replay them from there.
+	 */
+	async #missingContextMessages(context: AgentContext): Promise<AgentMessage[]> {
+		const missing: AgentMessage[] = [];
+		const recall = this.#memory.hiddenRecall;
+		if (
+			recall &&
+			!context.systemPrompt.some(block => block.includes(recall)) &&
+			!context.messages.some(
+				message =>
+					message.role === "custom" &&
+					message.customType === MEMORY_RECALL_MESSAGE_TYPE &&
+					message.content === recall,
+			)
+		) {
+			missing.push({
+				role: "custom",
+				customType: MEMORY_RECALL_MESSAGE_TYPE,
+				content: recall,
+				display: false,
+				attribution: "agent",
+				timestamp: Date.now(),
+			});
+		}
+		const planReference = await this.#buildPlanReferenceMessage();
+		if (planReference) {
+			this.#planReferenceSent = true;
+			missing.push(planReference);
+		}
+		return missing;
+	}
+
+	/**
 	 * Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. A rebuild a settings
 	 * change started passes `settingsChange`, which holds it on a bound prompt (see
 	 * {@link SessionTools.refreshBaseSystemPrompt}).
@@ -9515,16 +9571,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			};
 			if (!overrideIsCurrent()) continue;
 			const messages: AgentMessage[] = [];
-			if (basePreparation.memoryRecall) {
-				messages.push({
-					role: "custom",
-					customType: MEMORY_RECALL_MESSAGE_TYPE,
-					content: basePreparation.memoryRecall,
-					display: false,
-					attribution: "agent",
-					timestamp: Date.now(),
-				});
-			}
 			if (basePreparation.memoryNotice) {
 				messages.push({
 					role: "custom",

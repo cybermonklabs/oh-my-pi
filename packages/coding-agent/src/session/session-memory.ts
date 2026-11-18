@@ -64,6 +64,11 @@ export class SessionMemory {
 	#memoryBackendTransition: Promise<void> = Promise.resolve();
 	#localMemoryStartupAbort: AbortController | undefined;
 	#baseSystemPromptBeforeMemoryPromotion: string[] | undefined;
+	/**
+	 * The recall the memory backend adopted that the conversation carries as a hidden `memory-recall` message
+	 * instead of a system block (`MEMORY_RECALL_MESSAGE_TYPE`); each request sends it where its context lacks it.
+	 */
+	#hiddenRecall: string | undefined;
 	/** Cwd the running backend state was built for; a transcript is never retained after it moved. */
 	#runtimeCwd: string | undefined;
 	/** Apply waiting behind the current transition; later requests join it. */
@@ -81,12 +86,20 @@ export class SessionMemory {
 			memoryAgentDir?: string;
 			memoryTaskDepth?: number;
 			createMemoryTools?: () => Promise<AgentTool[]>;
+			/** The recall the loaded transcript's branch delivered as a hidden message (`findDeliveredRecall`). */
+			hiddenRecall?: string;
 		},
 	) {
 		this.#host = host;
 		this.#memoryAgentDir = options.memoryAgentDir;
 		this.#memoryTaskDepth = options.memoryTaskDepth ?? 0;
 		this.#createMemoryTools = options.createMemoryTools;
+		// Only Hindsight and Mnemopi recall into the conversation: under another backend, or with memory off, the
+		// transcript's recall is history the session does not send again.
+		const backend = cfgMemoryBackend.get(host.settings);
+		if (options.memoryEnabled !== false && (backend === "hindsight" || backend === "mnemopi")) {
+			this.#hiddenRecall = options.hiddenRecall;
+		}
 		if (this.#memoryAgentDir) this.#runtimeCwd = host.cwd();
 		// Subagents alias the parent's backend state and never replace it live.
 		if (options.memoryEnabled !== false && this.#memoryAgentDir && this.#memoryTaskDepth === 0) {
@@ -185,6 +198,17 @@ export class SessionMemory {
 	restorePromotionSnapshot(prompt: string[] | undefined): void {
 		this.#baseSystemPromptBeforeMemoryPromotion = prompt;
 	}
+
+	/** The recall the conversation carries as a hidden message; undefined when its recall, if any, is a system block. */
+	get hiddenRecall(): string | undefined {
+		return this.#hiddenRecall;
+	}
+
+	/** Records where the recall the backend just adopted goes: `recall` rides the messages, undefined when it does not. */
+	setHiddenRecall(recall: string | undefined): void {
+		this.#hiddenRecall = recall;
+	}
+
 	/** Rekeys every active memory backend to the current provider session. */
 	rekeyForCurrentSessionId(): void {
 		this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -228,6 +252,8 @@ export class SessionMemory {
 
 	/** Resets transcript-scoped memory counters and removes a promoted prompt. */
 	async resetContextForNewTranscript(): Promise<void> {
+		// The new transcript does not carry the old one's recall, and the backend recalls afresh for it.
+		this.#hiddenRecall = undefined;
 		const hadPromotedMemoryPrompt = this.#baseSystemPromptBeforeMemoryPromotion !== undefined;
 		const resetHindsight = this.#resetHindsightConversationTrackingIfHindsight();
 		const resetMnemopi = this.#resetMnemopiConversationTrackingIfMnemopi();
@@ -329,6 +355,8 @@ export class SessionMemory {
 		const retain = retainMnemopi && (this.#runtimeCwd ?? cwd) === cwd;
 		try {
 			await this.#disposeMemoryBackendState(true, retain);
+			// The backend starts again without a recall and recalls afresh at the next turn.
+			this.#hiddenRecall = undefined;
 			this.#runtimeCwd = cwd;
 			if (this.#memoryAgentDir && this.#memoryTaskDepth === 0 && !this.#host.isDisposed()) {
 				const backend = await resolveMemoryBackend(this.#host.settings);

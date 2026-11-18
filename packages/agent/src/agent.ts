@@ -520,6 +520,7 @@ export class Agent {
 	#beforeModelCall?: AgentBeforeModelCall;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
 	#asideMessageProvider?: (boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>;
+	#missingContextMessageProvider?: AgentLoopConfig["getMissingContextMessages"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
@@ -1286,6 +1287,14 @@ export class Agent {
 		fn: ((boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>) | undefined,
 	): void {
 		this.#asideMessageProvider = fn;
+	}
+
+	/**
+	 * Provide the messages each model call must carry that its context lacks; they join the inputs of the turn the
+	 * call opens. See `AgentLoopConfig.getMissingContextMessages`.
+	 */
+	setMissingContextMessageProvider(fn: AgentLoopConfig["getMissingContextMessages"]): void {
+		this.#missingContextMessageProvider = fn;
 	}
 
 	emitExternalEvent(event: AgentEvent) {
@@ -2070,6 +2079,7 @@ export class Agent {
 				config.intentTracing = this.#intentTracing;
 				config.pruneToolDescriptions = this.#pruneToolDescriptions;
 			},
+			getMissingContextMessages: context => this.#missingContextMessageProvider?.(context) ?? [],
 			beforeModelCall:
 				this.#beforeModelCall || this.#additionalBeforeModelCalls.size > 0
 					? async (context, signal) => {
