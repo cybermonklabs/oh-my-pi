@@ -62,9 +62,17 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	const cleanups: Array<() => Promise<void>> = [];
 
 	afterEach(async () => {
-		for (const cleanup of cleanups.splice(0)) await cleanup();
+		// Newest first: each session is disposed before the directory it writes under is removed.
+		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 		vi.restoreAllMocks();
 	});
+
+	/** A temp dir removed once the sessions started under it are disposed. */
+	function createTempDir(): TempDir {
+		const dir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		cleanups.push(() => dir.remove());
+		return dir;
+	}
 
 	/**
 	 * A session on the gateway's claude-opus-5-5 (a 1M window unless `contextWindow` says otherwise) whose settings
@@ -138,7 +146,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	}
 
 	it("keeps the system prompt and tools when a reload changes personality, and names the change in a notice", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const tempDir = createTempDir();
 		const harness = await startSession(tempDir, { toolNames: ["read"] });
 		await harness.session.prompt("first");
 
@@ -154,7 +162,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	}, 30_000);
 
 	it("keeps the tools when a reload disables todo, and refuses a call to it naming the setting", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const tempDir = createTempDir();
 		const harness = await startSession(tempDir, {
 			toolNames: ["read", "eval", "todo"],
 			replies: { 2: turn => toolCallAnswer(turn, "todo", { op: "view" }) },
@@ -185,7 +193,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	}, 30_000);
 
 	it("keeps the system prompt when a reload changes disabledProviders after a context file was edited", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const tempDir = createTempDir();
 		await Bun.write(tempDir.join("AGENTS.md"), "# Rules\n\n- The rule the session started with.\n");
 		const harness = await startSession(tempDir, { toolNames: ["read"], discoverContextFiles: true });
 		await harness.session.prompt("first");
@@ -201,7 +209,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	}, 30_000);
 
 	it("keeps the held prompt and tools through a skill:// read of a skill installed meanwhile", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const tempDir = createTempDir();
 		// Project skills only: the developer's own skills stay out of discovery.
 		const projectSkills =
 			"skills:\n  enableCodexUser: false\n  enableClaudeUser: false\n  enableClaudeProject: false\n  enablePiUser: false\n  enableAgentsUser: false\n";
@@ -232,7 +240,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	}, 30_000);
 
 	it("keeps the held prompt through a skill:// read when the reload only reran skill discovery", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const tempDir = createTempDir();
 		const projectSkills =
 			"skills:\n  enableCodexUser: false\n  enableClaudeUser: false\n  enableClaudeProject: false\n  enablePiUser: false\n  enableAgentsUser: false\n";
 		const harness = await startSession(tempDir, {
@@ -259,7 +267,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	}, 30_000);
 
 	it("keeps the held prompt through a skill:// read when a skills-only reload follows a context file edit", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const tempDir = createTempDir();
 		const projectSkills =
 			"skills:\n  enableCodexUser: false\n  enableClaudeUser: false\n  enableClaudeProject: false\n  enablePiUser: false\n  enableAgentsUser: false\n";
 		await Bun.write(tempDir.join("AGENTS.md"), "# Rules\n\n- The rule the session started with.\n");
@@ -291,7 +299,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	}, 30_000);
 
 	it("keeps the held prompt and tools when an extension registers its tool again unchanged", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const tempDir = createTempDir();
 		let extension: ExtensionAPI | undefined;
 		const registerProbe = (pi: ExtensionAPI): void => {
 			pi.registerTool({
@@ -328,7 +336,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	}, 30_000);
 
 	it("sends the rebuilt prompt at the first request after the held prompt's cache entry lapsed", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const tempDir = createTempDir();
 		const harness = await startSession(tempDir, { toolNames: ["read"] });
 		await harness.session.prompt("first");
 		await reloadOverlay(harness, `${OVERLAY}personality: pragmatic\n`);
@@ -350,7 +358,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	it("keeps the held prompt across an admitted cut that keeps earlier messages, and sends it rebuilt after a compaction", async () => {
 		// A forced auto-shake elides old read results and keeps the messages before them cached: the prompt stays held.
 		// (A prefix-bound model prunes nothing inside a warm prefix, so the shake is the partial cut a session can make.)
-		using shakeDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const shakeDir = createTempDir();
 		const parts = ["part1.txt", "part2.txt", "part3.txt", "part4.txt"];
 		for (const [index, part] of parts.entries()) {
 			const lines = Array.from(
@@ -383,7 +391,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 		expect(withoutCacheControl(afterShake.system)).toBe(withoutCacheControl(shakeFirst.system));
 
 		// A compaction forced by a full window rewrites every message anyway: the next request carries the rebuild.
-		using compactDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const compactDir = createTempDir();
 		const soft = "compaction:\n  methodOrder: [soft]\n  asyncEnabled: false\n  keepRecentTokens: 1\n";
 		const compacted = await startSession(compactDir, {
 			toolNames: ["read"],

@@ -3049,10 +3049,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#tools.settleModelSwitch()));
 		// A held settings rebuild, and a kept restored transcript prompt, give way to this process's live build at the
 		// first request after a cut the cut rule admits under them that rewrites everything after the system prompt
-		// and tools anyway (its kept prefix `p` is at most their tokens: a compaction, a forced rescue), or after the
-		// prompt cache entry lapses ({@link #releaseWithheldPromptChangesIfDue}). A cheaper cut, such as a tail prune,
-		// would turn into a rewrite of the whole prompt. A provider-context cut (an image clamp) is made in a request
-		// whose prompt is already taken, so it never counts.
+		// and tools anyway (its kept prefix `p` is at most their tokens: a compaction, a forced rescue), after the
+		// prompt cache entry lapses, or five minutes after the change they withhold, whichever comes first
+		// ({@link #releaseWithheldPromptChangesIfDue}). A cheaper cut, such as a tail prune, would turn into a rewrite
+		// of the whole prompt. A provider-context cut (an image clamp) is made in a request whose prompt is already
+		// taken, so it never counts.
 		this.addDisposer(
 			this.#maintenance.onContextCutAdmitted(cut => {
 				if (!this.#tools.withholdsPromptChange || cut.providerContext) return;
@@ -5813,17 +5814,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * Sends what the prompt withholds to keep the cached prefix once it is due, so the request carries the rebuilt
 	 * prompt: a kept restored transcript prompt ({@link SessionTools.releaseRestoredPrompt}) and a held settings rebuild
-	 * ({@link SessionTools.absorbHeldSettingsRebuild}), each once the cut rule admitted a cut under it that rewrites
-	 * every message or the prompt cache entry it reads has lapsed, whichever comes first, and the restored prompt also
-	 * once the change it withholds is five minutes old. Called before every main request, and before a user prompt
-	 * takes its hidden notices.
+	 * ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after the cut rule admitted a cut
+	 * under it that rewrites every message, after the prompt cache entry it reads has lapsed, or five minutes after the
+	 * change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before every
+	 * main request, and before a user prompt takes its hidden notices.
 	 */
 	async #releaseWithheldPromptChangesIfDue(): Promise<void> {
 		if (!this.#tools.withholdsPromptChange) return;
 		const lapsed = this.#maintenance.promptCacheLapsed();
 		try {
 			await this.#tools.releaseRestoredPrompt(lapsed);
-			await this.#tools.absorbHeldSettingsRebuild(lapsed || this.#tools.heldSettingsRebuildCutAdmitted === true);
+			await this.#tools.absorbHeldSettingsRebuild(lapsed);
 		} catch (error) {
 			logger.warn("Rebuild of a withheld prompt change failed", { error: String(error) });
 		}
@@ -11570,6 +11571,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Frozen skill-URI hint visibility snapshot (see {@link SessionTools.skillHintVisible}). */
 	getSkillHintVisible(): boolean {
 		return this.#tools.skillHintVisible;
+	}
+
+	/**
+	 * The settings a tool call reads in place of the session's: inside a call to a tool a held settings change keeps
+	 * declared as sent, the ones it was declared under ({@link SessionTools.toolCallSettings}); otherwise undefined.
+	 */
+	get toolCallSettings(): Settings | undefined {
+		return this.#tools.toolCallSettings;
 	}
 
 	/** Skill loading warnings captured by SDK */

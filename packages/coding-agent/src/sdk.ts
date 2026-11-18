@@ -2742,7 +2742,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			},
 			getArtifactManager: () => sessionManager.getArtifactManager(),
-			settings,
+			/**
+			 * The session's settings, except inside a call to a tool a held settings change keeps declared as
+			 * sent: there the ones it was declared under, so the call runs as declared (`SessionTools`).
+			 */
+			get settings() {
+				return session?.toolCallSettings ?? settings;
+			},
 			authStorage,
 			modelRegistry,
 			getTelemetry: () => agent?.telemetry,
@@ -5293,7 +5299,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Hide Secrets first switches outbound obfuscation on the live obfuscator (earlier
 		// placeholders keep deobfuscating, the first switch-on builds it): the prompt
 		// reports its state. Each settings-started rebuild below passes the change, so a
-		// bound prompt holds it until a cut or a lapsed cache entry (`SessionTools`).
+		// bound prompt holds it until a cut, a lapsed cache entry or five minutes on (`SessionTools`).
 		cfgSystemPromptInputs.listenChanges(session, async settingsChange => {
 			if (settingsChange.some(change => change.setting === cfgSecretsEnabled)) {
 				try {
