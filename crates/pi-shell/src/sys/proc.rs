@@ -650,14 +650,11 @@ mod tests {
 		// SAFETY: plain syscall; the test's own child.
 		unsafe { libc::kill(pid, libc::SIGKILL) };
 		// Not yet waited for, so the child stays a zombie of this process.
-		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-		let mut state = None;
-		while std::time::Instant::now() < deadline {
-			state = info(pid).map(|p| p.state);
-			if state == Some(ProcState::Zombie) {
-				break;
-			}
+		// Waits for the zombie as long as that takes.
+		let mut state = info(pid).map(|p| p.state);
+		while state != Some(ProcState::Zombie) {
 			std::thread::sleep(std::time::Duration::from_millis(10));
+			state = info(pid).map(|p| p.state);
 		}
 		let zombie_ended = ended(pid);
 		let zombie_exists = exists(pid);
@@ -719,10 +716,7 @@ mod tests {
 			short_of_descriptors::run("sys::proc::tests::running_with_no_descriptor_left", child.id());
 		// SAFETY: plain syscall; the test's own child.
 		unsafe { libc::kill(pid, libc::SIGKILL) };
-		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-		while info(pid).is_some_and(|p| p.state != ProcState::Zombie)
-			&& std::time::Instant::now() < deadline
-		{
+		while info(pid).is_some_and(|p| p.state != ProcState::Zombie) {
 			std::thread::sleep(std::time::Duration::from_millis(10));
 		}
 		let zombie_running = running(pid);

@@ -218,8 +218,10 @@ fn so_error(fd: RawFd) -> io::Result<()> {
 
 /// A non-blocking connect waiting for writability.
 struct Connecting {
-	fd:    Option<OwnedFd>,
+	/// Declared first: forgotten before the socket closes, so the readiness
+	/// thread's wait never holds a descriptor this struct closed.
 	watch: Option<ready::Watch>,
+	fd:    Option<OwnedFd>,
 }
 
 impl FsPending<Box<dyn File>> for Connecting {
@@ -253,8 +255,9 @@ impl FsPending<Box<dyn File>> for Connecting {
 
 /// An accept waiting for readability of (a duplicate of) the listener.
 struct Accepting {
-	listener: OwnedFd,
+	/// Declared first: forgotten before the duplicate closes.
 	watch:    Option<ready::Watch>,
+	listener: OwnedFd,
 }
 
 /// `accept(2)` on `fd`, retried on `EINTR`; the new socket is

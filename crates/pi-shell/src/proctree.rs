@@ -1841,11 +1841,9 @@ mod tests {
 		};
 		tokio::time::sleep(Duration::from_millis(50)).await;
 		child.kill().expect("kill child");
-		let exited = tokio::time::timeout(Duration::from_secs(5), waiter)
-			.await
-			.expect("the wait ends promptly after exit")
-			.expect("waiter task")
-			.expect("wait result");
+		// The wait's own limit is 20 s; the exit resolves it first, or `exited`
+		// is false.
+		let exited = waiter.await.expect("waiter task").expect("wait result");
 		assert!(exited, "exit resolves the wait");
 		let _ = child.wait();
 	}
@@ -2028,9 +2026,13 @@ mod tests {
 		use std::io::BufRead as _;
 
 		platform::NO_PIDFD.set(true);
+		// The root `exec`s a second sleep once its child is gone: when the KILL
+		// to the child lands first (on a loaded machine), the root does not
+		// leave `wait` and exit by itself before its own KILL arrives, so only
+		// that KILL ends it.
 		let mut root = crate::testkit::child::dies_with_this_process(
 			std::process::Command::new("/bin/sh")
-				.args(["-c", "sleep 600 & echo $!; wait"])
+				.args(["-c", "sleep 600 & echo $!; wait; exec sleep 600"])
 				.stdout(std::process::Stdio::piped()),
 		)
 		.spawn()

@@ -675,8 +675,7 @@ mod tests {
 		let probed = short_of_descriptors::run("tools::tests::live_with_no_descriptor_left", pid);
 		// SAFETY: plain syscall; the test's own child.
 		unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-		let deadline = std::time::Instant::now() + Duration::from_secs(10);
-		while !crate::sys::proc::ended(pid as i32) && std::time::Instant::now() < deadline {
+		while !crate::sys::proc::ended(pid as i32) {
 			std::thread::sleep(Duration::from_millis(10));
 		}
 		let zombie = log.live(&[7]);

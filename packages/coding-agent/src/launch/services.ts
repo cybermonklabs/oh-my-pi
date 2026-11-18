@@ -263,6 +263,10 @@ export async function startService(
 		persist: false,
 		detached: false,
 	};
+	// The ready wait's time left is measured from here, on the monotonic clock:
+	// the broker's `startedAt` is a wall-clock time, and a step of the wall
+	// clock before the wait would lengthen it or cut it to nothing.
+	const requestedAt = performance.now();
 	const result = await request(
 		session,
 		{
@@ -286,7 +290,7 @@ export async function startService(
 		TERMINAL_STATES[launched.state]
 	)
 		return { daemon: launched, readyTimedOut: result.readyTimedOut, readyInterrupted: false };
-	const timeoutMs = Math.max(0, spec.ready.timeoutMs - (Date.now() - launched.startedAt));
+	const timeoutMs = Math.max(0, spec.ready.timeoutMs - (performance.now() - requestedAt));
 	try {
 		const waited = await request(
 			session,

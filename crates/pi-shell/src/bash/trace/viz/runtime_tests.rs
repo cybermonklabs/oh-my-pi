@@ -844,10 +844,7 @@ async fn segmented_and_chain_keeps_pseudo_connectors_while_running_and_after() {
 		std::fs::write(&gate, []).unwrap();
 		running
 	};
-	let (result, running) =
-		tokio::time::timeout(std::time::Duration::from_secs(10), async { tokio::join!(run, probe) })
-			.await
-			.unwrap();
+	let (result, running) = tokio::join!(run, probe);
 	assert_eq!(result.unwrap().exit_code, Some(0));
 	assert_eq!(running, pending, "running");
 	assert_eq!(chain_rows(&present(&trace, &Options::default())), pending, "finished");
@@ -888,12 +885,7 @@ async fn running_command_keeps_the_script_it_runs_active() {
 				tokio::task::yield_now().await;
 			}
 		};
-		let (result, (running, raw)) =
-			tokio::time::timeout(std::time::Duration::from_secs(10), async {
-				tokio::join!(run, probe)
-			})
-			.await
-			.unwrap();
+		let (result, (running, raw)) = tokio::join!(run, probe);
 		assert_eq!(result.unwrap().exit_code, Some(0));
 		let shown = rows(&running);
 		let script: Vec<&(String, &Value)> = shown

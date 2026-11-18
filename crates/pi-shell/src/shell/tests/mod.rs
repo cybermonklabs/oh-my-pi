@@ -12,6 +12,8 @@ use crate::proctree;
 
 mod builtins;
 mod env_cwd;
+#[cfg(unix)]
+mod output_drain;
 mod process_control;
 mod redirections;
 mod session;
@@ -420,21 +422,6 @@ async fn run_command_capture(
 	capture_unlocked(command, cwd, minimizer, cancel_token).await
 }
 
-/// [`run_command_capture`] that fails once the run outlasts `limit`. The
-/// limit starts when the lock is held: in a single-process `cargo test`,
-/// the wait behind slower shell tests took up the limit of a fast one.
-#[cfg(unix)]
-async fn run_command_capture_within(
-	limit: Duration,
-	command: &str,
-	cwd: Option<&std::path::Path>,
-	minimizer: Option<minimizer::MinimizerOptions>,
-	cancel_token: CancelToken,
-) -> Result<(ShellExecuteResult, String), time::error::Elapsed> {
-	let _guard = shell_test_lock().lock().await;
-	time::timeout(limit, capture_unlocked(command, cwd, minimizer, cancel_token)).await
-}
-
 /// Runs `command` and collects its streamed output; the caller holds
 /// [`shell_test_lock`].
 #[cfg(unix)]
@@ -473,8 +460,7 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
 	path
 }
 
-/// Runs `command` on a dedicated single-worker runtime and fails after five
-/// seconds.
+/// Runs `command` on a dedicated single-worker runtime.
 #[cfg(unix)]
 fn capture_on_single_worker(command: &'static str) -> (ShellExecuteResult, String) {
 	capture_on_runtime(command, None, 512)
@@ -482,16 +468,16 @@ fn capture_on_single_worker(command: &'static str) -> (ShellExecuteResult, Strin
 }
 
 /// Runs `command` in `cwd` on a dedicated single-worker runtime whose
-/// blocking pool holds `max_blocking_threads`; fails once the run outlasts
-/// five seconds. The deadline lives on the calling thread, so it still
-/// fires when a builtin blocks the runtime's only worker, and starts once
-/// this thread holds [`shell_test_lock`].
+/// blocking pool holds `max_blocking_threads`, once this thread holds
+/// [`shell_test_lock`]. A builtin that blocks the runtime's only worker
+/// never finishes, and the runner's bound fails the test; `Err` only if the
+/// runtime's thread panicked.
 #[cfg(unix)]
 fn capture_on_runtime(
 	command: &'static str,
 	cwd: Option<std::path::PathBuf>,
 	max_blocking_threads: usize,
-) -> Result<(ShellExecuteResult, String), std::sync::mpsc::RecvTimeoutError> {
+) -> Result<(ShellExecuteResult, String), std::sync::mpsc::RecvError> {
 	let _guard = shell_test_lock().blocking_lock();
 	let (tx, rx) = std::sync::mpsc::channel();
 	std::thread::spawn(move || {
@@ -508,7 +494,7 @@ fn capture_on_runtime(
 			CancelToken::default(),
 		)));
 	});
-	rx.recv_timeout(Duration::from_secs(5))
+	rx.recv()
 }
 
 #[cfg(unix)]

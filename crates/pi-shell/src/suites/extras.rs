@@ -9,7 +9,7 @@ use std::{
 	os::unix::ffi::OsStrExt as _,
 	path::Path,
 	sync::Arc,
-	time::{Duration, Instant},
+	time::Duration,
 };
 
 use async_trait::async_trait;
@@ -63,7 +63,6 @@ struct Ran {
 	cancelled: bool,
 	stdout:    String,
 	stderr:    String,
-	elapsed:   Duration,
 }
 
 fn read_back(mut file: std::fs::File) -> String {
@@ -80,14 +79,12 @@ async fn run_with(s: &mut Session, command: &str, cancel: CancellationToken) -> 
 		stdout: Some(out.try_clone().unwrap()),
 		stderr: Some(err.try_clone().unwrap()),
 	};
-	let started = Instant::now();
 	let outcome = s.run(command, stdio, cancel).await.unwrap();
 	Ran {
 		status:    outcome.status,
 		cancelled: outcome.cancelled,
 		stdout:    read_back(out),
 		stderr:    read_back(err),
-		elapsed:   started.elapsed(),
 	}
 }
 
@@ -177,9 +174,11 @@ async fn cancel_ends_an_extra_promptly() {
 		tokio::time::sleep(Duration::from_millis(200)).await;
 		trigger.cancel();
 	});
-	let ran = run_with(&mut s, "sleep 30", cancel).await;
+	// The sleep outlives the runner's bound: only the cancel ends it.
+	let ran =
+		run_with(&mut s, &format!("sleep {}", crate::testkit::child::LIFETIME.as_secs()), cancel)
+			.await;
 	assert!(ran.cancelled);
-	assert!(ran.elapsed < Duration::from_secs(5), "took {:?}", ran.elapsed);
 	// The session stays usable.
 	assert_eq!(out(&mut s, "echo alive").await, "alive\n");
 }

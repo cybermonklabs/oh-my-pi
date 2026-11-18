@@ -30,7 +30,9 @@ use crate::{
 /// whose event never comes is failed by the test runner,
 /// `.config/nextest.toml`).
 #[cfg(target_os = "linux")]
-const POLL: Duration = Duration::from_secs(20);
+/// The parked tests' park timeout: past the runner's bound, so only a wake
+/// (the exit) ends a park, and a missed one fails the test.
+const POLL: Duration = crate::testkit::child::LIFETIME;
 
 /// A detached external is signalled through its session, whose group exists
 /// only after the child's own `setsid`. A signal sent before that (`kill $!`
@@ -1481,11 +1483,10 @@ fn wait_parked(parker: &mut crate::sys::Parker, p: &mut Box<dyn ExtProc>) -> Exi
 	}
 }
 
-/// The exit itself ends the park (a pidfd in the poll set), well inside the
-/// park's own [`POLL`] timeout — the one elapsed time a test here asserts,
-/// since being woken by the exit rather than by the timeout is what it is
-/// about; no waiter thread is involved; the status is exact and the process
-/// is reaped once its `ExtProc` is dropped.
+/// The exit itself ends the park (a pidfd in the poll set): the park's own
+/// [`POLL`] timeout is past the runner's bound, so a park the exit did not
+/// wake fails the test. No waiter thread is involved; the status is exact
+/// and the process is reaped once its `ExtProc` is dropped.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_parked_external_wakes_the_parker_at_its_exit() {
@@ -1499,9 +1500,7 @@ fn a_parked_external_wakes_the_parker_at_its_exit() {
 		let a = sh(script);
 		let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 		let pid = p.pid() as i32;
-		let start = std::time::Instant::now();
 		assert_eq!(wait_parked(&mut parker, &mut p), status, "{script}");
-		assert!(start.elapsed() < POLL / 2, "woken by the exit, not the timeout");
 		assert!(proc::exists(pid), "unreaped while the ExtProc lives");
 		drop(p);
 		assert!(!proc::exists(pid), "reaped on drop");

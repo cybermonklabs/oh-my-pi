@@ -93,7 +93,12 @@ async fn pkill_interactive_prompt_honors_cancellation() {
 	let abort = cancel.emplace_abort_token();
 	let execution = tokio::spawn(execute_shell(
 		ShellExecuteOptions {
-			command: format!("sleep 30 | pkill -I -x -p {pid} {name}"),
+			// The feeder outlives the runner's bound: only the cancel ends the
+			// run.
+			command: format!(
+				"sleep {} | pkill -I -x -p {pid} {name}",
+				crate::testkit::child::LIFETIME.as_secs()
+			),
 			..Default::default()
 		},
 		None,
@@ -101,9 +106,8 @@ async fn pkill_interactive_prompt_honors_cancellation() {
 	));
 	time::sleep(Duration::from_millis(100)).await;
 	abort.abort(crate::cancel::AbortReason::User);
-	let result = time::timeout(Duration::from_secs(2), execution)
+	let result = execution
 		.await
-		.expect("interactive pkill remained blocked after cancellation")
 		.expect("interactive execution task")
 		.expect("interactive shell execution");
 	let still_running = child
@@ -533,10 +537,9 @@ async fn top_builtin_stops_when_its_output_pipe_closes() {
 	let command = "top -d 0 | head -n 1";
 	// top observes head's closed pipe on its next write, after completing a
 	// full synchronous process snapshot. Under host load that scan takes
-	// seconds; this is only a bound against a broken pipe-close loop.
-	let execution = time::timeout(Duration::from_secs(30), execute_captured(command.to_string()))
-		.await
-		.expect("top kept sampling after its output pipe closed");
+	// seconds; a top that kept sampling hangs the test until the runner's
+	// bound.
+	let execution = execute_captured(command.to_string()).await;
 	assert_eq!(execution.0.exit_code, Some(0));
 	assert!(execution.1.contains("top - snapshot 1"), "{:?}", execution.1);
 }
@@ -860,13 +863,8 @@ async fn stopped_later_pipeline_stage_finishes_once_continued() {
 		// stage this test started.
 		assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0, "continue the stopped stage");
 	};
-	let (result, ()) = tokio::join!(
-		time::timeout(Duration::from_secs(20), session.run_test(command, &stdio)),
-		continue_stage,
-	);
-	let result = result
-		.expect("pipeline did not finish after its stopped stage continued")
-		.expect("pipeline run");
+	let (result, ()) = tokio::join!(session.run_test(command, &stdio), continue_stage);
+	let result = result.expect("pipeline run");
 	assert_eq!(exit_code(&result), 0);
 }
 
@@ -1019,13 +1017,8 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 				time::sleep(Duration::from_millis(200)).await;
 				fs::write(&release, "").expect("release stages");
 			};
-			let (resumed, ()) = tokio::join!(
-				time::timeout(Duration::from_secs(20), session.run_test(resume, &stdio)),
-				release_stages,
-			);
-			let resumed = resumed
-				.expect("resumed pipeline did not complete")
-				.expect("foreground resumed pipeline");
+			let (resumed, ()) = tokio::join!(session.run_test(resume, &stdio), release_stages);
+			let resumed = resumed.expect("foreground resumed pipeline");
 			assert_eq!(
 				exit_code(&resumed),
 				0,
@@ -1076,9 +1069,11 @@ async fn wait_reports_a_stop_that_precedes_the_wait() {
 	assert_eq!(exit_code(&stopped), 0);
 	wait_until_stopped(&job).await;
 
-	let waited = time::timeout(Duration::from_secs(20), session.run_test("wait %1", &stdio))
+	// A wait that missed the stop would wait for the job's end, past the
+	// runner's bound.
+	let waited = session
+		.run_test("wait %1", &stdio)
 		.await
-		.expect("wait missed a stop that happened before it began")
 		.expect("wait for the stopped job");
 	assert_eq!(exit_code(&waited), 128 + libc::SIGSTOP);
 

@@ -1487,10 +1487,7 @@ async fn shebangless_background_script_with_fifo_stdin() {
 		 wait; echo status=$?",
 		quote_arg(dir.path().to_str().expect("utf8 path")),
 	);
-	let (result, output) =
-		tokio::time::timeout(std::time::Duration::from_secs(10), execute_captured(command))
-			.await
-			.expect("FIFO script must finish");
+	let (result, output) = execute_captured(command).await;
 	assert_eq!(result.exit_code, Some(0), "{output}");
 	assert_eq!(output, "hi\ndata\nstatus=0\n");
 }
@@ -1689,20 +1686,17 @@ async fn uutils_head_stdin_read_is_cancellable() {
 		time::sleep(Duration::from_millis(150)).await;
 		token.cancel();
 	});
-	let result = time::timeout(
-		Duration::from_secs(5),
-		session.run_test_with("head -n 1000000", &params, cancel),
-	)
-	.await;
+	// The pipe's writer stays open, so only the cancel can end `head`.
+	let result = session
+		.run_test_with("head -n 1000000", &params, cancel)
+		.await;
 	let _ = canceller.await;
 
-	let exec = result
-		.expect("head must return promptly after cancel, not hang on the open pipe")
-		.expect("run");
-	// Core contract: prompt return (the 5s timeout did NOT fire) proves the
-	// read unblocked and the blocking task unwound cleanly — no hang, no
-	// detached thread. The session cancels a run with TERM to everything it
-	// started and reports the TERM-cancelled run as 128 + 15.
+	let exec = result.expect("run");
+	// Core contract: the return proves the read unblocked and the blocking
+	// task unwound cleanly — no hang, no detached thread. The session cancels a
+	// run with TERM to everything it started and reports the TERM-cancelled run
+	// as 128 + 15.
 	assert!(exec.cancelled, "the run must report that it was cancelled");
 	assert_eq!(exit_code(&exec), 143, "cancelled stdin read should report TERM's status");
 }

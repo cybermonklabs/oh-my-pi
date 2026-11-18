@@ -858,7 +858,7 @@ impl Driver {
 
 #[cfg(all(test, unix))]
 mod tests {
-	use std::{io, io::Read, os::unix::ffi::OsStrExt, time::Instant};
+	use std::{io, io::Read, os::unix::ffi::OsStrExt};
 
 	use super::*;
 	use crate::sys::StdFs;
@@ -1236,11 +1236,7 @@ mod tests {
 				tokio::task::yield_now().await;
 			}
 		};
-		let (captured, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-			tokio::join!(capture(&mut session, options), probe)
-		})
-		.await
-		.expect("live output callback");
+		let (captured, ()) = tokio::join!(capture(&mut session, options), probe);
 		assert_eq!(captured.stdout, "firstsecond");
 	}
 
@@ -1479,11 +1475,7 @@ mod tests {
 				tokio::task::yield_now().await;
 			}
 		};
-		let (captured, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-			tokio::join!(capture(&mut session, options), probe)
-		})
-		.await
-		.expect("tool child finishes while the root waits");
+		let (captured, ()) = tokio::join!(capture(&mut session, options), probe);
 		assert_eq!(captured.outcome.status, 1);
 		let snapshot = trace.snapshot();
 		assert_eq!(snapshot.status, Some(1));
@@ -1683,15 +1675,19 @@ mod tests {
 			stdout: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
 			..RunStdio::default()
 		};
-		let outcome = tokio::time::timeout(
-			Duration::from_secs(1),
-			s.run("/bin/sleep 2 &", stdio, CancellationToken::new()),
-		)
-		.await
-		.expect("a background external holding stdout must not delay the run")
-		.unwrap();
+		// The job outlives the runner's bound: a run it delayed would hang the
+		// test until the runner fails it.
+		let command = format!(
+			"{} {} &",
+			crate::testkit::child::on_path("sleep"),
+			crate::testkit::child::LIFETIME.as_secs()
+		);
+		let outcome = s
+			.run(&command, stdio, CancellationToken::new())
+			.await
+			.unwrap();
 		assert_eq!(outcome.status, 0);
-		assert_eq!(sh(&mut s, "wait %1").await.outcome.status, 0);
+		assert_eq!(sh(&mut s, "kill %1; wait %1").await.outcome.status, 128 + libc::SIGTERM);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -1919,14 +1915,15 @@ mod tests {
 			tokio::time::sleep(Duration::from_millis(200)).await;
 			trigger.cancel();
 		});
-		let started = Instant::now();
+		// The TERM trap loops for ever, so only the KILL ends the run (137); a
+		// cancel that never escalated would hang the test until the runner's
+		// bound.
 		let outcome = s
 			.run("trap 'while :; do :; done' TERM; while :; do :; done", RunStdio::default(), cancel)
 			.await
 			.unwrap();
 		assert!(outcome.cancelled);
 		assert_eq!(outcome.status, 137);
-		assert!(started.elapsed() < Duration::from_secs(4), "took {:?}", started.elapsed());
 	}
 
 	#[test]

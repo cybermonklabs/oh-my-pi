@@ -12,7 +12,8 @@
 //! One process-wide thread waits on the watched descriptors plus a wake pipe,
 //! wakes each waker once its descriptor is ready (or failed, or hung up), and
 //! forgets it. A watch whose file is dropped first is removed with
-//! [`Watch`]'s `Drop`.
+//! [`Watch`]'s `Drop`, which returns once that thread's wait no longer
+//! includes the descriptor, so the file closes when its owner closes it.
 //!
 //! The wait is `poll(2)`, except on macOS: there neither `poll` nor `kqueue`
 //! reports a FIFO whose last writer closed (measured: `revents` 0, no
@@ -32,7 +33,7 @@ use std::{
 	thread,
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 /// Wait for input.
 pub const READ: i16 = libc::POLLIN;
@@ -73,7 +74,8 @@ fn poll_now(fd: RawFd, events: i16) -> io::Result<bool> {
 	}
 }
 
-/// A registered wait; dropping it forgets the registration.
+/// A registered wait; dropping it forgets the registration, and returns
+/// only once the readiness thread's wait no longer includes the descriptor.
 #[derive(Debug)]
 pub struct Watch(u64);
 
@@ -100,6 +102,20 @@ struct Poller {
 	next:    AtomicU64,
 	/// Write end of the wake pipe; `None` when the thread could not start.
 	wake:    Option<PipeWriter>,
+	/// The watches the readiness thread's current wait includes. Locked after
+	/// `entries` when both are held.
+	polling: Mutex<Polling>,
+	/// Signalled each time a wait ends.
+	waited:  Condvar,
+}
+
+/// The readiness thread's current wait.
+#[derive(Default)]
+struct Polling {
+	/// The watches it includes; empty between waits.
+	ids:   Vec<u64>,
+	/// How many waits have ended.
+	ended: u64,
 }
 
 static POLLER: LazyLock<Poller> = LazyLock::new(Poller::start);
@@ -114,7 +130,13 @@ impl Poller {
 				.spawn(move || run(r))?;
 			Ok(w)
 		});
-		Self { entries: Mutex::new(Vec::new()), next: AtomicU64::new(1), wake: started.ok() }
+		Self {
+			entries: Mutex::new(Vec::new()),
+			next:    AtomicU64::new(1),
+			wake:    started.ok(),
+			polling: Mutex::new(Polling::default()),
+			waited:  Condvar::new(),
+		}
 	}
 
 	fn add(&self, fd: RawFd, events: i16, waker: &Waker) -> io::Result<Watch> {
@@ -131,9 +153,36 @@ impl Poller {
 		Ok(Watch(id))
 	}
 
+	/// Forgets watch `id`. If the readiness thread's current wait includes
+	/// it, ends that wait and waits until it has ended: `poll(2)` holds each
+	/// polled file open until it returns (on Linux and under gVisor alike),
+	/// so the descriptor's owner, which closes it next, would otherwise leave
+	/// it open meanwhile. A FIFO's reader end left open so is one a writer
+	/// opening the FIFO then pairs with (its open succeeds, its output is
+	/// lost), while the real reader goes on waiting for a writer.
 	fn forget(&self, id: u64) {
-		self.entries.lock().retain(|e| e.id != id);
+		let mut entries = self.entries.lock();
+		entries.retain(|e| e.id != id);
+		let mut polling = self.polling.lock();
+		drop(entries);
+		if !polling.ids.contains(&id) || ON_READINESS_THREAD.get() {
+			return;
+		}
+		if let Some(wake) = &self.wake {
+			// A full wake pipe already ends the wait.
+			let _ = (&*wake).write(&[1]);
+		}
+		let ended = polling.ended;
+		while polling.ended == ended {
+			self.waited.wait(&mut polling);
+		}
 	}
+}
+
+thread_local! {
+	/// This is the readiness thread, which is between waits whenever it runs
+	/// code that may drop a watch.
+	static ON_READINESS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The readiness thread could not be started (no threads or no pipes left).
@@ -160,16 +209,29 @@ struct Watched {
 }
 
 fn run(mut wake: PipeReader) {
+	ON_READINESS_THREAD.set(true);
 	let mut watched: Vec<Watched> = Vec::new();
 	let mut drain = [0u8; 64];
 	loop {
 		watched.clear();
-		watched.extend(POLLER.entries.lock().iter().map(|e| Watched {
-			id:     e.id,
-			fd:     e.fd,
-			events: e.events,
-		}));
+		{
+			let entries = POLLER.entries.lock();
+			watched.extend(entries.iter().map(|e| Watched {
+				id:     e.id,
+				fd:     e.fd,
+				events: e.events,
+			}));
+			let mut polling = POLLER.polling.lock();
+			polling.ids.clear();
+			polling.ids.extend(watched.iter().map(|w| w.id));
+		}
 		let (woke, ready) = wait(wake.as_raw_fd(), &watched);
+		{
+			let mut polling = POLLER.polling.lock();
+			polling.ids.clear();
+			polling.ended += 1;
+		}
+		POLLER.waited.notify_all();
 		if woke {
 			// Data is present, so this read returns at once.
 			let _ = wake.read(&mut drain);
@@ -337,11 +399,7 @@ fn wait(wake: RawFd, watched: &[Watched]) -> (bool, Vec<u64>) {
 
 #[cfg(test)]
 mod tests {
-	use std::{
-		sync::Arc,
-		task::Wake,
-		time::{Duration, Instant},
-	};
+	use std::{sync::Arc, task::Wake, time::Duration};
 
 	use super::*;
 
@@ -365,9 +423,7 @@ mod tests {
 			w.write_all(b"x").unwrap();
 			w
 		});
-		let deadline = Instant::now() + Duration::from_secs(10);
 		while !now(r.as_raw_fd(), READ).unwrap() {
-			assert!(Instant::now() < deadline);
 			thread::park_timeout(Duration::from_millis(100));
 		}
 		drop(writer.join().unwrap());
@@ -381,5 +437,54 @@ mod tests {
 		let id = watch.0;
 		drop(watch);
 		assert!(!POLLER.entries.lock().iter().any(|e| e.id == id));
+	}
+
+	/// A watch dropped while the readiness thread waits on its descriptor
+	/// ends that wait before the drop returns: `poll(2)` holds the open file
+	/// description until it returns (on Linux and under gVisor alike), so a
+	/// descriptor its owner closes next would stay open meanwhile. Here a
+	/// FIFO's reader end: a writer opened after the close must find no reader
+	/// (`ENXIO`), not pair with the reader the program closed.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_dropped_watch_leaves_the_wait_before_its_descriptor_closes() {
+		use std::os::unix::{ffi::OsStrExt as _, fs::OpenOptionsExt as _};
+
+		let dir = tempfile::tempdir().unwrap();
+		for round in 0..20 {
+			// A FIFO of its own each round: one that a writer ever tried to
+			// open reads as hung up under gVisor releases before
+			// google/gvisor@d6786915, so its reader would be ready at once.
+			let path = dir.path().join(format!("f{round}"));
+			let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+			// SAFETY: a valid NUL-terminated path.
+			assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+			let nonblocking = |read: bool| {
+				std::fs::OpenOptions::new()
+					.read(read)
+					.write(!read)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path)
+			};
+			let reader = nonblocking(true).unwrap();
+			// The FIFO never had a writer, so its reader is never ready: the
+			// readiness thread waits on it until something ends the wait.
+			let watch = watch(reader.as_raw_fd(), READ, Waker::noop()).unwrap();
+			while !POLLER.polling.lock().ids.contains(&watch.0) {
+				assert!(
+					POLLER.entries.lock().iter().any(|e| e.id == watch.0),
+					"the reader of a FIFO that never had a writer was ready"
+				);
+				thread::yield_now();
+			}
+			drop(watch);
+			drop(reader);
+			let writer = nonblocking(false);
+			assert_eq!(
+				writer.as_ref().err().and_then(io::Error::raw_os_error),
+				Some(libc::ENXIO),
+				"a writer paired with a reader end the program closed: {writer:?}"
+			);
+		}
 	}
 }

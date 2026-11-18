@@ -5,6 +5,10 @@
 ### Fixed
 
 - Fixed embedded-shell `xargs` and `find -exec ... {} +` failing with "Argument list too long" where the system takes fewer argument bytes than they counted on (GKE Sandbox, whose gVisor can say `ENAMETOOLONG` instead; or, for `find`, exported shell variables its count leaves out): like GNU xargs, they split a refused command line in halves and retry, and one argument too long on its own is still an error (`xargs` status 1, with GNU's `can't call exec() due to argument size restrictions`; `find` status 1)
+- Fixed the embedded shell losing a command's last output on a loaded machine (`status 0`, no output): once a command ended, the run cancelled its output reader after 250 ms of quiet and dropped what the pipe still held. A cancelled reader now reads what the pipe holds before it stops, and the run waits for it
+- Fixed the embedded shell keeping a pipe or FIFO open for a moment after it closed it, while its readiness thread still waited on the descriptor (`poll(2)` holds a file open until it returns): a writer that opened the FIFO next could pair with the reader the shell had closed, so what it wrote was lost and the next reader waited for a writer for ever (`{ printf c; sleep 0.2; } > f & read -t 5 x < f` right after another read of `f`). Dropping a descriptor's readiness wait now ends the thread's wait first
+- Fixed the embedded shell's `cmd > fifo &` with a reader of the FIFO under gVisor (GKE Sandbox) before google/gvisor@d6786915: the shell first tried a non-blocking open for writing, and gVisor counted that failed open (`ENXIO`, no reader yet) as a writer for a moment, so a reader opening the FIFO then returned with no writer and read end of file while the real writer waited for a reader for ever. A FIFO opened one way now goes to the opener thread at once
+- Fixed the embedded shell's process substitution and large here-documents failing with "File exists" when an earlier process with the same pid left its temp node behind (one killed before its cleanup; pids come round again within minutes on a busy machine): a name already taken moves on to the next
 
 ## [18.18.6] - 2026-11-09
 

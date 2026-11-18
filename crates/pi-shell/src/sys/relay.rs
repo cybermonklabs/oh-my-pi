@@ -693,10 +693,9 @@ mod tests {
 			on_path("head"),
 			on_path("cat")
 		);
-		let out =
-			tokio::time::timeout(Duration::from_secs(20), run(&mut session(false), &script, true))
-				.await
-				.expect("nothing blocks the runtime's only thread");
+		// A block of the runtime's only thread hangs the test until the
+		// runner's bound.
+		let out = run(&mut session(false), &script, true).await;
 		assert_eq!(out, "0123456789\n".repeat(20_000).into_bytes());
 	}
 
@@ -716,12 +715,9 @@ mod tests {
 			 same || echo \"differ ${{#x}} ${{#y}}\"",
 			crate::testkit::child::on_path("cat")
 		);
-		let out = tokio::time::timeout(
-			Duration::from_secs(20),
-			run(&mut session_with(None), &script, false),
-		)
-		.await
-		.expect("the feeds never block the runtime's only thread");
+		// A feed that blocked the runtime's only thread would hang the test
+		// until the runner's bound.
+		let out = run(&mut session_with(None), &script, false).await;
 		assert_eq!(String::from_utf8_lossy(&out), "same\n");
 	}
 

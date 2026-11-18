@@ -1497,14 +1497,17 @@ async fn run_shell_command_once(
 	drop(diagnostics);
 
 	// The foreground command can complete while background jobs keep the
-	// stdout/stderr pipe open. Don't hang forever waiting for EOF; drain output
-	// for a short period, then cancel. A cancelled run is the exception: the
-	// processes its cancel signalled may still be running their TERM traps, so
-	// the reader stays open until they close the pipe or the cancel bridge
-	// releases it (`CANCEL_READER_GRACE`).
+	// stdout/stderr pipe open. Don't hang forever waiting for EOF: once the
+	// pipe has been quiet for a short period, stop waiting for more. That
+	// cancel ends the wait, not the read of what the command wrote: on Unix the
+	// reader then takes what the pipe holds and ends (`next_read`), so it is
+	// awaited with no bound, and output written before the end is kept however
+	// late the reader runs. A cancelled run is the exception: the processes its
+	// cancel signalled may still be running their TERM traps, so the reader
+	// stays open until they close the pipe or the cancel bridge releases it
+	// (`CANCEL_READER_GRACE`).
 	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
 	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
-	const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 	let cancelled = cancel_token.is_cancelled();
 	let mut reader_finished = false;
@@ -1534,13 +1537,8 @@ async fn run_shell_command_once(
 
 	if !reader_finished {
 		reader_cancel.cancel();
-		match time::timeout(READER_SHUTDOWN_TIMEOUT, &mut reader_handle).await {
-			Ok(Ok(Ok(output))) => reader_output = Some(output),
-			Ok(_) => {},
-			Err(_) => {
-				reader_handle.abort();
-				let _ = reader_handle.await;
-			},
+		if let Ok(Ok(output)) = (&mut reader_handle).await {
+			reader_output = Some(output);
 		}
 	}
 	cancel_bridge.abort();
@@ -1636,12 +1634,12 @@ async fn run_shell_command_streams_in_filesystem(
 	// Release the extra writer so the stderr reader can reach EOF.
 	drop(diagnostics);
 
-	// As in `run_shell_command_once`: a short drain after the run, except
-	// that a cancelled run's readers stay open for its TERM traps until the
-	// cancel bridge releases them.
+	// As in `run_shell_command_once`: a short wait for more after the run,
+	// which a cancel ends without losing what the pipes hold, except that a
+	// cancelled run's readers stay open for its TERM traps until the cancel
+	// bridge releases them.
 	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
 	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
-	const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 	let cancelled = cancel_token.is_cancelled();
 	let mut stdout_finished = false;
@@ -1676,21 +1674,12 @@ async fn run_shell_command_streams_in_filesystem(
 	if !stdout_finished || !stderr_finished {
 		reader_cancel.cancel();
 	}
-	if !stdout_finished
-		&& time::timeout(READER_SHUTDOWN_TIMEOUT, &mut stdout_handle)
-			.await
-			.is_err()
-	{
-		stdout_handle.abort();
-		let _ = stdout_handle.await;
+	// Each cancelled reader takes what its pipe holds, then ends.
+	if !stdout_finished {
+		let _ = (&mut stdout_handle).await;
 	}
-	if !stderr_finished
-		&& time::timeout(READER_SHUTDOWN_TIMEOUT, &mut stderr_handle)
-			.await
-			.is_err()
-	{
-		stderr_handle.abort();
-		let _ = stderr_handle.await;
+	if !stderr_finished {
+		let _ = (&mut stderr_handle).await;
 	}
 	cancel_bridge.abort();
 	let _ = cancel_bridge.await;
@@ -1718,23 +1707,13 @@ async fn read_output_bytes(
 	#[cfg(not(unix))]
 	let mut reader = tokio::fs::File::from_std(reader);
 
+	#[cfg(unix)]
+	let mut drain = None;
 	loop {
 		let mut buf = vec![0u8; BUF];
 		#[cfg(unix)]
-		let n = {
-			let Ok(mut readiness) = (tokio::select! {
-				ready = reader.readable() => ready,
-				() = cancel_token.cancelled() => break,
-			}) else {
-				break;
-			};
-			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
-				Ok(Ok(0)) => break,
-				Ok(Ok(n)) => n,
-				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Ok(Err(_)) => break,
-				Err(_would_block) => continue,
-			}
+		let Some(n) = next_read(&reader, &mut buf, &cancel_token, &mut drain).await else {
+			break;
 		};
 		#[cfg(not(unix))]
 		let n = {
@@ -1818,22 +1797,12 @@ async fn read_output(
 	#[cfg(not(unix))]
 	tokio::pin!(reader);
 
+	#[cfg(unix)]
+	let mut drain = None;
 	loop {
 		#[cfg(unix)]
-		let n = {
-			let Ok(mut readiness) = (tokio::select! {
-				ready = reader.readable() => ready,
-				() = cancel_token.cancelled() => break,
-			}) else {
-				break;
-			};
-			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
-				Ok(Ok(0)) => break,
-				Ok(Ok(n)) => n,
-				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Ok(Err(_)) => break,
-				Err(_would_block) => continue,
-			}
+		let Some(n) = next_read(&reader, &mut buf, &cancel_token, &mut drain).await else {
+			break;
 		};
 		#[cfg(not(unix))]
 		let n = {
@@ -1899,22 +1868,12 @@ async fn read_output_buffered(
 	#[cfg(not(unix))]
 	tokio::pin!(reader);
 
+	#[cfg(unix)]
+	let mut drain = None;
 	loop {
 		#[cfg(unix)]
-		let n = {
-			let Ok(mut readiness) = (tokio::select! {
-				ready = reader.readable() => ready,
-				() = cancel_token.cancelled() => break,
-			}) else {
-				break;
-			};
-			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
-				Ok(Ok(0)) => break,
-				Ok(Ok(n)) => n,
-				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Ok(Err(_)) => break,
-				Err(_would_block) => continue,
-			}
+		let Some(n) = next_read(&reader, &mut buf, &cancel_token, &mut drain).await else {
+			break;
 		};
 		#[cfg(not(unix))]
 		let n = {
@@ -2011,6 +1970,71 @@ fn read_nonblocking<T: std::os::fd::AsRawFd>(file: &T, buf: &mut [u8]) -> io::Re
 		Err(io::Error::last_os_error())
 	} else {
 		Ok(read as usize)
+	}
+}
+
+/// The next read of an output pipe: `Some(n)` bytes read, or `None` at end of
+/// file, on an error, or once a cancelled reader has read what the pipe held.
+///
+/// A cancel (the run's post-exit wait, or the cancel bridge) ends the wait for
+/// more output, never the read of output already written: on it the reader
+/// takes the bytes the pipe holds at that moment (`FIONREAD`) without waiting,
+/// then stops. So output the command wrote before it ended is kept however late
+/// the reader runs (on a loaded machine, after the post-exit wait's 250 ms),
+/// and a background job that keeps writing does not keep the reader reading.
+#[cfg(unix)]
+async fn next_read(
+	reader: &tokio::io::unix::AsyncFd<fs::File>,
+	buf: &mut [u8],
+	cancel_token: &CancellationToken,
+	drain: &mut Option<usize>,
+) -> Option<usize> {
+	loop {
+		if let Some(left) = drain {
+			let want = (*left).min(buf.len());
+			if want == 0 {
+				return None;
+			}
+			return match read_nonblocking(reader.get_ref(), &mut buf[..want]) {
+				Ok(0) => None,
+				Ok(n) => {
+					*left -= n;
+					Some(n)
+				},
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+				// `WouldBlock` included: nothing more was queued.
+				Err(_) => None,
+			};
+		}
+		let mut readiness = tokio::select! {
+			ready = reader.readable() => ready.ok()?,
+			() = cancel_token.cancelled() => {
+				*drain = Some(queued_bytes(reader.get_ref()));
+				continue;
+			}
+		};
+		match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), buf)) {
+			Ok(Ok(0)) => return None,
+			Ok(Ok(n)) => return Some(n),
+			Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {},
+			Ok(Err(_)) => return None,
+			Err(_would_block) => {},
+		}
+	}
+}
+
+/// How many bytes `file`, a pipe's read end, holds (`FIONREAD`); 0 if that
+/// cannot be read.
+#[cfg(unix)]
+fn queued_bytes<T: std::os::fd::AsRawFd>(file: &T) -> usize {
+	let mut queued: libc::c_int = 0;
+	// SAFETY: `FIONREAD` writes one `c_int` through the pointer, which is valid
+	// for that write; the fd stays open for the call.
+	let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
+	if rc < 0 {
+		0
+	} else {
+		usize::try_from(queued).unwrap_or(0)
 	}
 }
 

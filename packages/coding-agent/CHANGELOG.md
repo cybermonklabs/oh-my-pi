@@ -6,6 +6,8 @@
 
 - Bash tool: `xargs` and `find -exec ... {} +` no longer fail with "Argument list too long" where the system takes fewer argument bytes than they counted on (GKE Sandbox, or large exported variables for `find`); like GNU xargs, they split a refused command line in halves and retry, and one argument too long on its own is still an error
 - Daemons: a daemon record the broker could not write (a full or read-only disk) is written again once the disk takes writes, a daemon's exit too, which was lost before; the failure is warned once, and polls retry it with a backoff of up to 5 s. The broker's waits, a daemon's uptime (which decides whether a crash grows its restart backoff) and the client's wait for the broker it starts are timed on the monotonic clock, so a step of the wall clock neither holds nor shortens them
+- Bash tool: on a loaded machine, a command's last output could be lost (`status 0`, no output): once the command ended, the shell waited 250 ms for its output reader and then dropped what the reader had not yet read. Output the command wrote before it ended is now always kept; only a background job's later output is still cut once the pipe is quiet
+- Services: the wait for a service to become ready is timed on the monotonic clock, so a step of the wall clock after the launch no longer lengthens it or cuts it to nothing
 
 ## [18.18.6] - 2026-11-09
 

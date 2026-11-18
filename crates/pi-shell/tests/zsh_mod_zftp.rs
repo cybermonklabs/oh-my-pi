@@ -24,7 +24,7 @@ use std::{
 	os::unix::process::CommandExt,
 	sync::{Arc, Mutex},
 	thread,
-	time::{Duration, Instant, SystemTime},
+	time::{Duration, SystemTime},
 };
 
 use crate::obash_support::{obash, output};
@@ -88,12 +88,12 @@ impl Server {
 		Some(Self { port, logs })
 	}
 
-	/// The command logs of `n` finished connections, sorted.
+	/// The command logs of `n` finished connections, sorted; a connection that
+	/// never finishes hangs the test until the runner's bound fails it.
 	fn logs(&self, n: usize) -> Vec<String> {
-		let start = Instant::now();
 		loop {
 			let logs = self.logs.lock().unwrap().clone();
-			if logs.len() >= n || start.elapsed() > Duration::from_secs(10) {
+			if logs.len() >= n {
 				let mut logs = logs;
 				logs.sort();
 				return logs;

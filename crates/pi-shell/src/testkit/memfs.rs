@@ -112,7 +112,7 @@ impl MemFs {
 	}
 
 	/// Empty filesystem whose operations return `Pending` with probability
-	/// `p_pending`, resolving after 0..=`max_ms` ms (seeded).
+	/// `p_pending`, resolving 0..=`max_ms` ms (seeded) after their first poll.
 	pub fn with_latency(seed: u64, p_pending: f64, max_ms: u64) -> Self {
 		let mut nodes = BTreeMap::new();
 		nodes.insert(BString::from("/"), Node::Dir { mode: 0o755 });
@@ -204,7 +204,7 @@ impl MemFs {
 			rng.below(self.max_ms + 1)
 		};
 		self.pending.fetch_add(1, Ordering::Relaxed);
-		FsPoll::Pending(Box::new(Delayed::start(res, delay)))
+		FsPoll::Pending(Box::new(Delayed::new(res, delay)))
 	}
 
 	/// The node at `path`, following symbolic links.
@@ -350,35 +350,44 @@ const fn trim(path: &[u8]) -> &[u8] {
 	}
 }
 
-/// A `Pending` answer that becomes ready on a timer thread.
+/// A `Pending` answer that becomes ready `delay_ms` after its first poll,
+/// on a timer thread that poll starts. The first poll is `Pending` however
+/// late it comes: with a timer started at once, a busy machine could run it
+/// out before that poll and turn a drawn wait into an answer at once.
 struct Delayed<T> {
-	res:   Option<io::Result<T>>,
-	ready: Arc<AtomicBool>,
-	waker: Arc<Mutex<Option<Waker>>>,
+	res:      Option<io::Result<T>>,
+	delay_ms: u64,
+	/// Set by the timer thread; `None` until the first poll starts it.
+	ready:    Option<Arc<AtomicBool>>,
+	waker:    Arc<Mutex<Option<Waker>>>,
 }
 
 impl<T> Delayed<T> {
-	fn start(res: io::Result<T>, delay_ms: u64) -> Self {
-		let ready = Arc::new(AtomicBool::new(false));
-		let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
-		let (r, w) = (Arc::clone(&ready), Arc::clone(&waker));
-		thread::spawn(move || {
-			thread::sleep(Duration::from_millis(delay_ms));
-			r.store(true, Ordering::Release);
-			let waker = w.lock().take();
-			if let Some(waker) = waker {
-				waker.wake();
-			}
-		});
-		Self { res: Some(res), ready, waker }
+	fn new(res: io::Result<T>, delay_ms: u64) -> Self {
+		Self { res: Some(res), delay_ms, ready: None, waker: Arc::default() }
 	}
 }
 
 impl<T: Send> FsPending<T> for Delayed<T> {
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
-		if !self.ready.load(Ordering::Acquire) {
+		let Some(ready) = &self.ready else {
 			*self.waker.lock() = Some(cx.waker().clone());
-			if !self.ready.load(Ordering::Acquire) {
+			let ready = Arc::new(AtomicBool::new(false));
+			let (r, w, delay_ms) = (Arc::clone(&ready), Arc::clone(&self.waker), self.delay_ms);
+			thread::spawn(move || {
+				thread::sleep(Duration::from_millis(delay_ms));
+				r.store(true, Ordering::Release);
+				let waker = w.lock().take();
+				if let Some(waker) = waker {
+					waker.wake();
+				}
+			});
+			self.ready = Some(ready);
+			return Poll::Pending;
+		};
+		if !ready.load(Ordering::Acquire) {
+			*self.waker.lock() = Some(cx.waker().clone());
+			if !ready.load(Ordering::Acquire) {
 				return Poll::Pending;
 			}
 		}
@@ -885,6 +894,30 @@ mod tests {
 			io::ErrorKind::NotFound
 		);
 		assert_eq!(fs.pending_count(), 4);
+	}
+
+	/// An answer drawn as pending is `Pending` at its first poll however late
+	/// that poll comes, so a test that builds on the wait (a redirection
+	/// left to the spawned process, `testkit::suites::bang_pid`) sees it on
+	/// a loaded machine too; its delay runs from that poll.
+	#[test]
+	fn a_pending_answer_is_pending_at_its_first_poll() {
+		let fs = MemFs::with_latency(7, 1.0, 0);
+		let FsPoll::Pending(mut p) = fs.answer(Ok(7)) else {
+			panic!("p_pending 1.0 answers Pending");
+		};
+		// Far past the 0 ms delay, as a busy machine may poll.
+		thread::sleep(Duration::from_millis(50));
+		let waker = Waker::from(Arc::new(Unpark(thread::current())));
+		let mut cx = Context::from_waker(&waker);
+		assert!(p.poll(&mut cx).is_pending(), "the first poll of a pending answer");
+		loop {
+			if let Poll::Ready(r) = p.poll(&mut cx) {
+				assert_eq!(r.unwrap(), 7);
+				break;
+			}
+			thread::park_timeout(Duration::from_millis(20));
+		}
 	}
 
 	#[test]
