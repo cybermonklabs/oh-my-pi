@@ -23,6 +23,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { STILL } from "./session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb } from "./session/sql-session-lease-fixture";
 
 const tempPaths: string[] = [];
 
@@ -361,6 +363,50 @@ describe("readRpcSubagentTranscript", () => {
 			messages: [],
 		});
 	});
+
+	for (const { adapter, url } of LEASE_BACKENDS) {
+		test.skipIf(!url)(
+			`resets, or reads on with whole new entries, after another store rewrites a long SQL transcript longer between two pages (${adapter})`,
+			async () => {
+				// If this regresses, an RPC client paging a long subagent transcript that another process
+				// rewrote meanwhile shows entries it already showed a second time, or a cut-off entry.
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const sessionFile = path.join(db.dir.path(), "sessions", "-project-", "Worker.jsonl");
+				const timestamp = "2026-11-18T00:00:00.000Z";
+				const entry = (id: string, bytes = 1024 * 1024) =>
+					`${JSON.stringify({ type: "message", id, parentId: null, timestamp, message: { role: "user", content: `${id} ${"x".repeat(bytes - 200)}`, timestamp: 1 } })}\n`;
+				const header = `${JSON.stringify({ type: "session", version: 3, id: "worker", timestamp, cwd: "/project" })}\n`;
+				const turns = Array.from({ length: 12 }, (_, n) => entry(`m${n}`));
+				// Past 8 MiB, so a read pages; the rewrite puts an entry of 1.5 MiB before the turns, and one after them.
+				const before = [header, ...turns];
+				const after = [header, entry("inserted", 1536 * 1024), ...turns, entry("m12")];
+				const holder = await db.open({ lease: STILL });
+				await holder.writeLinesAtomic(sessionFile, before);
+				await holder.drain();
+				const reader = await db.open({ lease: STILL });
+
+				const first = await readRpcSubagentTranscript(sessionFile, 0, reader);
+				await holder.writeLinesAtomic(sessionFile, after, { expectedSize: holder.statSync(sessionFile).size });
+				await holder.drain();
+				const second = await readRpcSubagentTranscript(sessionFile, first.nextByte, reader);
+
+				const afterEntries = after.map(line => JSON.stringify(JSON.parse(line)));
+				const returned = second.entries.map(read => JSON.stringify(read));
+				const firstIds = new Set(first.entries.map(read => read.id));
+				const outcome = second.reset
+					? second.fromByte === 0 && returned.join("\n") === afterEntries.slice(0, returned.length).join("\n")
+						? "read again from the start"
+						: "a reset that is not the new body's start"
+					: returned.every(read => afterEntries.includes(read)) &&
+						  second.entries.every(read => !firstIds.has(read.id))
+						? "the new body's next entries"
+						: `entries ${second.entries.map(read => read.id).join(", ")} after ${[...firstIds].join(", ")}`;
+				expect(first.nextByte).toBeLessThan(Buffer.byteLength(before.join("")));
+				expect(["read again from the start", "the new body's next entries"]).toContain(outcome);
+			},
+			120_000,
+		);
+	}
 });
 
 describe("RpcClient subagent frames", () => {

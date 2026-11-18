@@ -333,6 +333,7 @@ import type {
 	ModelCycleResult,
 	Prewalk,
 	PromptOptions,
+	QueuedMessageTarget,
 	ResetSessionContextResult,
 	ResolvedRoleModel,
 	RestoredQueuedMessage,
@@ -1148,6 +1149,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * command.
 	 */
 	readonly #queuedMessageRawText = new WeakMap<AgentMessage, string>();
+	/** {@link SteerOptions.queueId} of a queued steer, for a take-back of exactly that message. */
+	readonly #queuedMessageIds = new WeakMap<AgentMessage, string>();
+	/** {@link SteerOptions.onTaken} of a queued steer, called when a run emits that message. */
+	readonly #queuedMessageTaken = new WeakMap<AgentMessage, () => void>();
 
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
@@ -5265,6 +5270,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (event.type === "message_end" && event.message.role === "toolResult") {
 			this.#todo.onToolResult(event.message.toolName, event.message.isError);
 		}
+		// A run took a queued steer into its context: tell its sender, by the
+		// message's identity, before any await below can reorder it.
+		if (event.type === "message_end" && event.message.role === "user") {
+			this.#reportQueuedMessageTaken(event.message);
+		}
 		// Track the settled assistant turn synchronously as well: agent_end
 		// maintenance reads `#lastAssistantMessage`, and when a turn's events all
 		// land in one tick its handler can run before this handler's post-emit
@@ -5912,6 +5922,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				maintenanceRoute("malformed-function-call-handled");
 				await emitAgentEndNotification({ willContinue: true });
 				return;
+			} else if (!requestBodyTimeoutTerminal && this.#recovery.isCommittedTextRateLimit(msg)) {
+				// A rate limit after text rendered: the turn cannot be sent again, so wait
+				// it out on this model and continue the answer from where it stopped.
+				const didRetry = await this.#recovery.handleRetryableError(msg, { continueCommittedText: true });
+				if (didRetry) {
+					await emitAgentEndNotification({ willContinue: true });
+					return;
+				}
 			} else if (!requestBodyTimeoutTerminal && this.#recovery.handleCommittedTextStreamStall(msg)) {
 				// The stream died after text rendered: replay would duplicate it and
 				// a trailing assistant prefill is rejected, so keep the partial turn
@@ -10673,6 +10691,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			rawText: text,
 			onPromptQueued: options?.onPromptQueued,
 			nextRun: options?.holdUntilNextRun,
+			queueId: options?.queueId,
+			onTaken: options?.onTaken,
 		});
 	}
 
@@ -10895,6 +10915,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			skipIdleDrain?: boolean;
 			/** Queue next-run steers: no drain starts a turn for them alone. */
 			nextRun?: boolean;
+			/** {@link SteerOptions.queueId}: names the queued user message for a take-back. */
+			queueId?: string;
+			/** {@link SteerOptions.onTaken}: called when a run takes the queued user message. */
+			onTaken?: () => void;
 			/**
 			 * `#promptGeneration` captured when prompt() took this submission. abort() (or a
 			 * history rewrite) bumps it; if that lands while images are being prepared, the
@@ -10993,6 +11017,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (options?.nextRun) {
 			for (const message of queued) this.#nextRunSteers.add(message);
 		}
+		// The group ends in the user message.
+		const queuedUser = queued.at(-1)!;
+		if (options?.queueId !== undefined) this.#queuedMessageIds.set(queuedUser, options.queueId);
+		if (options?.onTaken) this.#queuedMessageTaken.set(queuedUser, options.onTaken);
 		options?.onPromptQueued?.(queued);
 		options?.onPromptAdmitted?.();
 		// joinActiveTurn admission must never start an autonomous turn: the
@@ -12184,9 +12212,66 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * skill invocation's `__queueChipText`, or untransformed text). A missing or
 	 * already delivered target changes nothing; repeated calls may remove further
 	 * duplicates.
+	 *
+	 * `{ queueId }` removes exactly the steer queued under that
+	 * {@link SteerOptions.queueId}, from `queue` or from a hold that would put it
+	 * back, never another message with the same text. A steer a run already took
+	 * off the queue but has not put into its context yet cannot be taken back
+	 * while that run holds it: the answer waits for the run, and is false once
+	 * the run takes the steer (its `onTaken` called first), or the take-back of
+	 * it once the run ends having put it back on the queue instead.
 	 */
-	removeQueuedMessage(text: string, queue: "steering" | "followUp"): boolean {
-		return this.takeQueuedMessage(text, queue) !== undefined;
+	removeQueuedMessage(target: string, queue: "steering" | "followUp"): boolean;
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): boolean | Promise<boolean>;
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): boolean | Promise<boolean> {
+		if (typeof target === "string") return this.takeQueuedMessage(target, queue) !== undefined;
+		const { queueId } = target;
+		if (this.#removeNamedQueuedMessage(queueId, queue)) return true;
+		const inFlight = this.#namedQueuedMessage(this.agent.peekUndeliveredQueuedMessages(), queueId);
+		if (!inFlight) return false;
+		const taken = Promise.withResolvers<void>();
+		const onTaken = this.#queuedMessageTaken.get(inFlight);
+		this.#queuedMessageTaken.set(inFlight, () => {
+			taken.resolve();
+			return onTaken?.();
+		});
+		return Promise.race([taken.promise, this.agent.waitForIdle()]).then(() =>
+			this.#removeNamedQueuedMessage(queueId, queue),
+		);
+	}
+
+	/** The message among `messages` that a steer named `queueId`. */
+	#namedQueuedMessage(messages: Iterable<AgentMessage>, queueId: string): AgentMessage | undefined {
+		for (const message of messages) if (this.#queuedMessageIds.get(message) === queueId) return message;
+		return undefined;
+	}
+
+	/** Take back the steer named `queueId` from `queue` or from a hold; false when neither has it. */
+	#removeNamedQueuedMessage(queueId: string, queue: "steering" | "followUp"): boolean {
+		const message =
+			this.#namedQueuedMessage(
+				queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue(),
+				queueId,
+			) ?? this.#namedQueuedMessage(this.#heldQueuedMessages, queueId);
+		if (!message || !this.withdrawQueuedMessage(message)) return false;
+		this.#queuedMessageTaken.delete(message);
+		return true;
+	}
+
+	/** {@link SteerOptions.onTaken}: a run took `message`, a queued steer, into its context. */
+	#reportQueuedMessageTaken(message: AgentMessage): void {
+		const onTaken = this.#queuedMessageTaken.get(message);
+		if (!onTaken) return;
+		this.#queuedMessageTaken.delete(message);
+		try {
+			const result = onTaken() as unknown;
+			// A sender on another thread answers with a Promise nobody awaits.
+			if (isPromise(result)) {
+				result.catch(err => logger.warn("Queued steer taken callback rejected", { error: String(err) }));
+			}
+		} catch (err) {
+			logger.warn("Queued steer taken callback threw", { error: String(err) });
+		}
 	}
 
 	/**

@@ -652,8 +652,17 @@ function shouldStreamEntries(storage: SessionStorage, filePath: string, size: nu
  * from the text `readText` decodes, which differs from the file's bytes only
  * when the file has a byte-order mark or invalid UTF-8. Such a file reads as
  * changed here and costs one extra parse, never a wrong answer.
+ *
+ * A full rewrite or delete that races the read (`SessionReadConflictError`)
+ * is hashed again from its start through {@link retryRacedRead}, never as one
+ * whole-text read.
  */
 export async function sessionContentDigest(filePath: string, storage: SessionStorage): Promise<string> {
+	return retryRacedRead(() => hashTranscriptPass(filePath, storage));
+}
+
+/** One read of {@link sessionContentDigest}, from the transcript's start. */
+async function hashTranscriptPass(filePath: string, storage: SessionStorage): Promise<string> {
 	const hasher = new Bun.CryptoHasher(SNAPSHOT_DIGEST_ALGORITHM);
 	if (isArchivedSessionPath(filePath)) {
 		// An archived (gzipped) transcript loads through `readText`, which inflates it.
@@ -880,8 +889,7 @@ export async function visitSessionFile(
  * transcript {@link visitSessionFile} would read whole is loaded and returned
  * too, so a caller need not read it twice; a streamed one yields its header
  * alone, read again from its start when a full rewrite or delete raced it
- * (`SessionReadConflictError`), as {@link loadSessionFile} does. Missing
- * files follow {@link loadSessionFile}.
+ * (`SessionReadConflictError`). Missing files follow {@link loadSessionFile}.
  */
 export async function probeSessionFile(
 	filePath: string,

@@ -19,11 +19,14 @@ import {
 import {
 	defaultSessionStorage,
 	FileSessionStorage,
+	SessionReadConflictError,
 	type SessionStorage,
 	setDefaultSessionStorage,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
+import { raceAfterFirstChunk, STILL } from "../session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb } from "../session/sql-session-lease-fixture";
 
 const previous = defaultSessionStorage();
 const clients: SQL[] = [];
@@ -199,3 +202,45 @@ describe("memories over the session storage", () => {
 		}
 	});
 });
+
+for (const { adapter, url } of LEASE_BACKENDS) {
+	describe.skipIf(!url)(`memories over a SQL rollout another store rewrites (${adapter})`, () => {
+		it("builds one body's stage-1 input, or fails as a read conflict, when the rollout is rewritten after its head was read", async () => {
+			// If this regresses, a memory extracted from a SQL session another process rewrote meanwhile is
+			// built from the first turns of the old transcript and the last turns of the new one.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const rollout = path.join(db.dir.path(), "sessions", "project", "rollout.jsonl");
+			// About 4 MB of turns of 20,000 characters: the head and the tail budget each fit in one 1 MiB window.
+			const body = (tag: string) =>
+				`${['{"type":"session","id":"s"}', ...Array.from({ length: 100 }, (_, i) => messageLine(i, `${tag}${i}:${"é".repeat(20_000)}`))].join("\n")}\n`;
+			const limit = 100_000;
+			const holder = await db.open({ lease: STILL });
+			await holder.writeText(rollout, body("a"));
+			const reader = await db.open({ lease: STILL });
+			const race = raceAfterFirstChunk(
+				reader,
+				rollout,
+				() => holder.writeText(rollout, body("b")),
+				// Past the head: the turns the input starts with are read by then.
+				1024 * 1024,
+			);
+
+			let outcome: string;
+			try {
+				const built = await buildStage1RolloutItems(rollout, limit, reader);
+				outcome =
+					built === referenceItems(body("a"), limit)
+						? "old body"
+						: built === referenceItems(body("b"), limit)
+							? "new body"
+							: "a mix";
+			} catch (err) {
+				if (!(err instanceof SessionReadConflictError)) throw err;
+				outcome = "read conflict";
+			}
+
+			expect(race.ran).toBe(true);
+			expect(["old body", "new body", "read conflict"]).toContain(outcome);
+		}, 120_000);
+	});
+}

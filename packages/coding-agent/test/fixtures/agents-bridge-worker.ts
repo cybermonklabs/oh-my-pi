@@ -5,7 +5,7 @@
  * homed on this worker.
  */
 import { MessagePort, parentPort } from "node:worker_threads";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "../../src/config/model-registry";
@@ -13,6 +13,7 @@ import { Settings } from "../../src/config/settings";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentSession } from "../../src/session/agent-session";
+import type { QueuedMessageTarget } from "../../src/session/agent-session-types";
 import { AuthStorage } from "../../src/session/auth-storage";
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
@@ -69,10 +70,44 @@ export interface AgentsProbe {
 	/** Once the local session of `id` settled: its message count and the texts on its steering queue. */
 	settled(id: string): Promise<{ messageCount: number; steering: string[] }>;
 	/**
-	 * Through the peer handle of `id` (homed elsewhere): queue `text` as a next-run steer,
-	 * then take it back. Reports what `onPromptQueued` delivered here and the take-back.
+	 * Through the peer handle of `id` (homed elsewhere): queue `text` twice as next-run
+	 * steers named `kept` and `taken back`, then take back `taken back` by name, twice.
+	 * Reports what `onPromptQueued` delivered here for the first and both take-backs.
 	 */
-	peerQueueAndTakeBackNextRunSteer(id: string, text: string): Promise<{ reported: unknown; removed: boolean }>;
+	peerQueueAndTakeBackNextRunSteer(
+		id: string,
+		text: string,
+	): Promise<{ reported: unknown; removed: boolean; removedAgain: boolean }>;
+	/** Names of the steers queued by {@link peerQueueAndTakeBackNextRunSteer} that a run took, in order. */
+	peerTaken(): Promise<string[]>;
+	/** Once the local session of `id` settled: the texts of the user messages in its transcript. */
+	userTexts(id: string): Promise<string[]>;
+	/**
+	 * Mark the run of `id` ended in the registry, as its executor does when the
+	 * run's drive ends, the moment the local session emits the steer `text`.
+	 */
+	endRunWhenSteerTaken(id: string, text: string): Promise<void>;
+	/**
+	 * The moment a steer queued on the local session of `id` returns, run the
+	 * session on `text` to its end, before the steer's answer leaves this worker.
+	 */
+	promptWhenSteerQueued(id: string, text: string): Promise<void>;
+	/**
+	 * Hold the next model call of the local session of `id` before it starts, with
+	 * the steers its run took already in its context, until {@link releaseModelCall}
+	 * or the run's abort.
+	 */
+	holdNextModelCall(id: string): Promise<void>;
+	/** Resolves once {@link holdNextModelCall} holds a model call. */
+	modelCallHeld(): Promise<void>;
+	/** Let the model call {@link holdNextModelCall} holds start. */
+	releaseModelCall(): Promise<void>;
+	/** Note the take-backs by name the local session of `id` receives from now on (see {@link takeBackReceived}). */
+	watchTakeBacks(id: string): Promise<void>;
+	/** Resolves once the session {@link watchTakeBacks} watches received a take-back by name. */
+	takeBackReceived(): Promise<void>;
+	/** Dispose the local session of `id`. */
+	disposeLocal(id: string): Promise<void>;
 }
 
 /** Test-only boot globals of the probe service. */
@@ -87,9 +122,15 @@ const sessions = new Map<string, AgentSession>();
 const byKey = new Map<string, AgentSession>();
 const grabbed = new Map<string, AgentRef>();
 const peerSeen: { events: string[]; runStates: string[] } = { events: [], runStates: [] };
+/** Names of the peer steers a run took (see `peerQueueAndTakeBackNextRunSteer`). */
+const peerTaken: string[] = [];
 let threadName = "";
 let gate = Promise.withResolvers<void>();
 let gateOpen = false;
+/** The model call {@link AgentsProbe.holdNextModelCall} holds: reached, and let go. */
+let modelCallHold = { held: Promise.withResolvers<void>(), release: Promise.withResolvers<void>() };
+/** Settled by the first take-back by name after {@link AgentsProbe.watchTakeBacks}. */
+const takeBack = Promise.withResolvers<void>();
 
 async function makeSession(id: string, gated: boolean): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -124,6 +165,13 @@ function local(id: string): AgentSession {
 	const session = sessions.get(id);
 	if (!session) throw new Error(`no local session ${id}`);
 	return session;
+}
+
+/** The text of a user message, or undefined for any other message. */
+function userText(message: AgentMessage): string | undefined {
+	if (message.role !== "user") return undefined;
+	if (typeof message.content === "string") return message.content;
+	return message.content.map(part => (part.type === "text" ? part.text : "")).join("");
 }
 
 const probe: AgentsProbe = {
@@ -238,11 +286,69 @@ const probe: AgentsProbe = {
 		const session = AgentRegistry.global().get(id)?.session;
 		if (!session) throw new Error(`no session for ${id}`);
 		const reported = Promise.withResolvers<unknown>();
-		await session.steer(text, undefined, {
-			holdUntilNextRun: true,
-			onPromptQueued: messages => reported.resolve(messages.at(-1)),
+		for (const queueId of ["kept", "taken back"]) {
+			await session.steer(text, undefined, {
+				holdUntilNextRun: true,
+				queueId,
+				onTaken: () => peerTaken.push(queueId),
+				onPromptQueued: messages => reported.resolve(messages.at(-1)),
+			});
+		}
+		return {
+			reported: await reported.promise,
+			removed: await session.removeQueuedMessage({ queueId: "taken back" }, "steering"),
+			removedAgain: await session.removeQueuedMessage({ queueId: "taken back" }, "steering"),
+		};
+	},
+	peerTaken: async () => [...peerTaken],
+	userTexts: async id => {
+		const session = local(id);
+		await session.waitForIdle();
+		return session.messages.flatMap(message => {
+			const text = userText(message);
+			return text === undefined ? [] : [text];
 		});
-		return { reported: await reported.promise, removed: await session.removeQueuedMessage(text, "steering") };
+	},
+	endRunWhenSteerTaken: async (id, text) => {
+		const session = local(id);
+		const unsubscribe = session.subscribe(event => {
+			if (event.type !== "message_end" || userText(event.message) !== text) return;
+			unsubscribe();
+			AgentRegistry.global().markRunEnded(id, session);
+		});
+	},
+	promptWhenSteerQueued: async (id, text) => {
+		const session = local(id);
+		const steer = session.steer.bind(session);
+		session.steer = async (...args) => {
+			await steer(...args);
+			await session.prompt(text);
+		};
+	},
+	holdNextModelCall: async id => {
+		const hold = { held: Promise.withResolvers<void>(), release: Promise.withResolvers<void>() };
+		modelCallHold = hold;
+		const remove = local(id).agent.addBeforeModelCallHook(async signal => {
+			remove();
+			hold.held.resolve();
+			const aborted = Promise.withResolvers<void>();
+			signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+			await Promise.race([hold.release.promise, aborted.promise]);
+		});
+	},
+	modelCallHeld: () => modelCallHold.held.promise,
+	releaseModelCall: async () => modelCallHold.release.resolve(),
+	watchTakeBacks: async id => {
+		const session = local(id);
+		const removeQueuedMessage = session.removeQueuedMessage.bind(session);
+		session.removeQueuedMessage = ((target: QueuedMessageTarget, queue: "steering" | "followUp") => {
+			if (typeof target !== "string") takeBack.resolve();
+			return removeQueuedMessage(target, queue);
+		}) as AgentSession["removeQueuedMessage"];
+	},
+	takeBackReceived: () => takeBack.promise,
+	disposeLocal: async id => {
+		await local(id).dispose();
 	},
 };
 

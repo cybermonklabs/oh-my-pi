@@ -177,13 +177,32 @@ interface DialectQueries {
 	 * Delete every session row whose path starts with `@dir` (its first `@len`
 	 * characters equal it; a character comparison, not `LIKE`, so `%` and `_`
 	 * stay literal and SQLite's ASCII-insensitive `LIKE` cannot match another
-	 * case) and exactly those rows' parts. PostgreSQL and MySQL do both in one
-	 * statement, so the parts deleted are those of the rows deleted: a row
-	 * another client commits between two statements would otherwise keep its
-	 * row and lose its parts under READ COMMITTED. SQLite runs the two
-	 * statements inside `BEGIN IMMEDIATE`, where no other writer runs.
+	 * case) and exactly those rows' parts, then every part under `@dir` that
+	 * has no row: a staged full write's parts that its killed writer never
+	 * swapped in, of a path the delete may not know of. PostgreSQL and MySQL
+	 * delete the rows and their parts in one statement, so the parts deleted
+	 * are those of the rows deleted: a row another client commits between two
+	 * statements would otherwise keep its row and lose its parts under READ
+	 * COMMITTED; the second statement deletes only parts whose row it does not
+	 * see, found by a range of the parts' primary key, from `@dir` up to
+	 * `@dir_end` (`@dir` with its final "/" made "0"), with the prefix compared
+	 * by characters too. That range holds every path under `@dir` only where
+	 * the `path` column's collation sorts "/" before "0" and compares the
+	 * characters in order (see {@link pathCollationKeepsDirectoryRange}); MySQL's
+	 * tables are `utf8mb4_bin`, code-point order. SQLite runs its statements
+	 * inside `BEGIN IMMEDIATE`, where no other writer runs; its parts delete
+	 * takes every part under `@dir`.
 	 */
 	deleteUnder: Statement[];
+	/**
+	 * {@link deleteUnder} without the key range: on PostgreSQL the second
+	 * statement compares the prefix alone, a scan of the parts, for a `path`
+	 * column whose collation orders paths otherwise (a libc locale such as
+	 * `en_US.UTF-8` ignores "/" at its first level, so a path under `@dir`
+	 * can sort above `@dir_end`). The other dialects' statements are
+	 * {@link deleteUnder}'s.
+	 */
+	deleteUnderScan: Statement[];
 	/**
 	 * Delete the staging parts named from `@low` (`<path>#staging-`) up to, not
 	 * including, `@high`: a primary-key range, and the prefix compared by
@@ -220,7 +239,10 @@ interface DialectQueries {
 	 * The parts that start from `@next` up to, not including, `@end`, in
 	 * `start_offset` order: one page. On PostgreSQL and SQLite the page is
 	 * empty unless the part at `@anchor` still has the row identity
-	 * `@anchor_id`, checked in the same statement; MySQL does not check it.
+	 * `@anchor_id`, checked in the same statement; MySQL does not check it. On
+	 * SQLite and MySQL it is also empty unless the part at `@last` (the last
+	 * one the read has fetched, -1 before the first page) still holds
+	 * `@last_content`.
 	 */
 	readParts: Statement;
 	/**
@@ -567,10 +589,11 @@ const LAPSE_POLL_MS = 50;
 const PART_BYTES = 1024 * 1024;
 /**
  * Bytes the first page of a `readChunks` read spans, from the byte it starts
- * at. A reader that stops after a window this long (memories stage 1 reads
- * 1 MiB windows) fetches about this much plus the part the window ends in,
- * and the head of the part it starts in; each next page spans twice the last,
- * up to {@link PAGE_SPAN_BYTES}, so a whole read takes only a few more queries.
+ * at. A reader that stops within this window (the Agent Hub roster's
+ * metadata read stops after a transcript's first records) fetches about this
+ * much plus the part the window ends in, and the head of the part it starts
+ * in; each next page spans twice the last, up to {@link PAGE_SPAN_BYTES}, so
+ * a whole read takes only a few more queries.
  */
 const FIRST_PAGE_SPAN_BYTES = 1024 * 1024;
 /**
@@ -940,6 +963,59 @@ interface TableObjectRow {
 	name: string;
 }
 
+/**
+ * The collation the parts table's `path` column compares with, and the
+ * database's, as `to_jsonb` prints their catalog rows: the column's own
+ * collation, or for the default collation (provider `d`) the database's. The
+ * rows are read whole so the columns of every version since PostgreSQL 10
+ * can be read by name (`datlocprovider` since 15, `colllocale` and `datlocale`
+ * since 17, `colliculocale` and `daticulocale` before, the ICU rules since 16).
+ */
+const PG_PATH_COLLATION = statement(
+	"postgres",
+	"SELECT pg_catalog.to_jsonb(c)::pg_catalog.text AS collation, pg_catalog.to_jsonb(d)::pg_catalog.text AS database " +
+		"FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation " +
+		"JOIN pg_catalog.pg_database d ON d.datname = pg_catalog.current_database() " +
+		"WHERE a.attrelid = pg_catalog.to_regclass(@table) AND a.attname = 'path' AND NOT a.attisdropped",
+);
+
+/** {@link PG_PATH_COLLATION} row. */
+interface PathCollationRow {
+	collation: string;
+	database: string;
+}
+
+/**
+ * Whether the collation of {@link PG_PATH_COLLATION}'s row sorts every path
+ * under a directory `<stem>/` at or above `<stem>/` and below `<stem>0`, so
+ * the directory delete may find them by a key range (see `deleteUnder`). That
+ * holds where "/" sorts before "0" and the characters compare in order: the
+ * builtin provider and libc's `C` and `POSIX` (code-point order), and ICU
+ * with its default attributes (punctuation before digits, compared where it
+ * stands). A libc locale such as `en_US.UTF-8` ignores "/" at its first
+ * level, and an ICU locale with an extension keyword (`-u-ka-shifted` makes
+ * punctuation ignorable, `-u-kr-` reorders the digits) or its own rules can
+ * sort a path under the directory above `<stem>0`; the delete then compares
+ * the prefix alone.
+ */
+function pathCollationKeepsDirectoryRange(row: PathCollationRow | undefined): boolean {
+	if (!row) return false;
+	const collation = JSON.parse(row.collation) as Record<string, unknown>;
+	const database = JSON.parse(row.database) as Record<string, unknown>;
+	const own = collation.collprovider !== "d";
+	const provider = own ? collation.collprovider : (database.datlocprovider ?? "c");
+	if (provider === "b") return true;
+	if (provider === "c") {
+		const locale = own ? collation.collcollate : database.datcollate;
+		return locale === "C" || locale === "POSIX";
+	}
+	const locale = own
+		? (collation.colllocale ?? collation.colliculocale)
+		: (database.datlocale ?? database.daticulocale);
+	const rules = own ? collation.collicurules : database.daticurules;
+	return provider === "i" && typeof locale === "string" && !/-u-|@/i.test(locale) && !rules;
+}
+
 /** `schema` as a PostgreSQL identifier, quoted. */
 function quoteIdentifier(schema: string): string {
 	return `"${schema.replaceAll('"', '""')}"`;
@@ -991,6 +1067,36 @@ function buildQueries(
 	const startPart =
 		`FROM ${parts} AS p WHERE p.path = @path ` +
 		`AND p.start_offset <= ${greatest}(${bigint("@offset")}, ${byteLengthOf("r.content")})`;
+	// The parts under `@dir` that have no row, `p`: by the key range, then the prefix itself (see deleteUnder).
+	const orphanParts = (range: boolean): string =>
+		`${range ? "p.path >= @dir AND p.path < @dir_end AND " : ""}substr(p.path, 1, @len) = @dir`;
+	const deleteUnder = (range: boolean): Statement[] =>
+		({
+			postgres: [
+				sql(
+					`WITH gone AS (DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir RETURNING path) ` +
+						`DELETE FROM ${parts} WHERE path IN (SELECT path FROM gone)`,
+				),
+				sql(
+					`DELETE FROM ${parts} AS p WHERE ${orphanParts(range)} ` +
+						`AND NOT EXISTS (SELECT 1 FROM ${table} AS r WHERE r.path = p.path)`,
+				),
+			],
+			mysql: [
+				sql(
+					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
+						`WHERE substr(r.path, 1, @len) = @dir`,
+				),
+				sql(
+					`DELETE p FROM ${parts} AS p LEFT JOIN ${table} AS r ON r.path = p.path ` +
+						`WHERE ${orphanParts(range)} AND r.path IS NULL`,
+				),
+			],
+			sqlite: [
+				sql(`DELETE FROM ${parts} WHERE substr(path, 1, @len) = @dir`),
+				sql(`DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir`),
+			],
+		})[adapter];
 
 	return {
 		createTable: mysql
@@ -1093,24 +1199,9 @@ function buildQueries(
 		deleteRow: sql(`DELETE FROM ${table} WHERE path = @path`),
 		hasParts: sql(`SELECT 1 AS found FROM ${parts} WHERE path = @path LIMIT 1`),
 		deleteParts: sql(`DELETE FROM ${parts} WHERE path = @path`),
-		deleteUnder: {
-			postgres: [
-				sql(
-					`WITH gone AS (DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir RETURNING path) ` +
-						`DELETE FROM ${parts} WHERE path IN (SELECT path FROM gone)`,
-				),
-			],
-			mysql: [
-				sql(
-					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
-						`WHERE substr(r.path, 1, @len) = @dir`,
-				),
-			],
-			sqlite: [
-				sql(`DELETE FROM ${parts} WHERE substr(path, 1, @len) = @dir`),
-				sql(`DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir`),
-			],
-		}[adapter],
+		deleteUnder: deleteUnder(true),
+		// Only PostgreSQL's `path` column can carry a collation the range misses (MySQL's tables are `utf8mb4_bin`).
+		deleteUnderScan: deleteUnder(adapter !== "postgres"),
 		deleteStaging: sql(`DELETE FROM ${parts} WHERE path >= @low AND path < @high AND substr(path, 1, @len) = @low`),
 		hasStaging: sql(
 			`SELECT 1 AS found FROM ${parts} WHERE path >= @low AND path < @high AND substr(path, 1, @len) = @low LIMIT 1`,
@@ -1189,6 +1280,14 @@ function buildQueries(
 					? `AND EXISTS (SELECT 1 FROM ${parts} AS p WHERE p.path = @path ` +
 						`AND p.start_offset = ${bigint("@anchor")} AND ${partId} = @anchor_id) `
 					: "") +
+				// PostgreSQL's `xmin` changes with every insert, so the first part's identity is enough there.
+				// MySQL compares bytes: utf8mb4_bin pads with spaces, so `=` there ignores trailing ones.
+				(adapter === "postgres"
+					? ""
+					: `AND (@last < 0 OR EXISTS (SELECT 1 FROM ${parts} AS q WHERE q.path = @path AND q.start_offset = @last ` +
+						(adapter === "mysql"
+							? "AND CAST(q.content AS BINARY) = CAST(@last_content AS BINARY))) "
+							: "AND q.content = @last_content)) ")) +
 				"ORDER BY start_offset",
 		),
 		partRowids:
@@ -1728,6 +1827,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	#mysqlLocks: MysqlLockForm | undefined;
 	/** The version a MySQL-family server reported at start-up, as a refusal names it. */
 	#mysqlVersion = "";
+	/**
+	 * Whether the directory delete finds the parts under a directory by a key
+	 * range ({@link DialectQueries.deleteUnder}) or by the prefix alone
+	 * ({@link DialectQueries.deleteUnderScan}); on PostgreSQL set at start-up
+	 * from the `path` column's collation ({@link pathCollationKeepsDirectoryRange}).
+	 */
+	#directoryRange = true;
 
 	constructor(options: SqlSessionStorageOptions) {
 		this.#client = options.client;
@@ -1823,6 +1929,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			if (!this.#createTable) {
 				await this.#assertSchema();
 				await this.#checkTables();
+				await this.#readPathCollation();
 				await this.#checkLockSyntax();
 				return;
 			}
@@ -1865,6 +1972,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 			if (createIndex && holder && !holder.indexed && !holder.nameTakenBy) await this.#setup(createIndex);
 			await this.#checkTables();
+			await this.#readPathCollation();
 			await this.#checkLockSyntax();
 		});
 	}
@@ -2852,6 +2960,15 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return { indexed: indexes.size > 0, nameTakenBy };
 	}
 
+	/** On PostgreSQL, read once whether the parts' `path` collation keeps the directory delete's key range ({@link #directoryRange}). */
+	async #readPathCollation(): Promise<void> {
+		if (this.#adapter !== "postgres") return;
+		const rows = (await this.#readOne(PG_PATH_COLLATION, {
+			table: this.#relation(`${this.#table}_parts`),
+		})) as PathCollationRow[];
+		this.#directoryRange = pathCollationKeepsDirectoryRange(rows[0]);
+	}
+
 	/**
 	 * PostgreSQL: refuse to start on tables that would run code the store did
 	 * not declare on its writes. A login that owned a table (before an
@@ -3025,15 +3142,20 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * a part that does not start where the previous one ended, or parts that
 	 * end short of the size mean a full write or a delete replaced the parts
 	 * during the read; it then fails with {@link SessionReadConflictError}
-	 * instead of yielding a mix of two bodies. MySQL has no row identity, so
-	 * there only those checks apply, and a full write that keeps the size and
-	 * every part's start, made between two pages, goes unseen. SQLite gives a
-	 * new row the largest rowid plus one, so a delete, or a full write that
-	 * leaves no part (a truncate), followed by new parts at the same path,
-	 * made between two pages, can give the new parts the rowids of the deleted
-	 * ones when those were the table's newest; then only those checks apply
-	 * there too, and new parts that keep the size and every part's start go
-	 * unseen.
+	 * instead of yielding a mix of two bodies.
+	 *
+	 * PostgreSQL's `xmin` changes with every insert, so that check sees every
+	 * replacement there. SQLite gives a new row the largest rowid plus one, so
+	 * after a delete, or a full write that leaves no part (a truncate), new
+	 * parts reuse the deleted ones' rowids when those were the table's newest,
+	 * and offsets and size can come out the same too; MySQL has no row
+	 * identity at all. So on SQLite and MySQL the query of each page also
+	 * checks, in the same statement, that the last part already fetched is
+	 * still at its offset with the same bytes: a replacement whose bytes
+	 * differ there is a read conflict whatever its rowids, offsets and size.
+	 * What can go unseen on those two is a replacement that holds exactly the
+	 * bytes of that last part at its offset while it differs both before and
+	 * after it.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const [row] = (await this.#exclusive(() =>
@@ -3052,17 +3174,20 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const anchor = { anchor: firstPart, anchor_id: row.first_id };
 		let next = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
 		let skip = Math.max(0, fromByte - next);
+		// The last part fetched, which the next page's query finds unchanged (SQLite and MySQL); none yet.
+		let last = { last: -1, last_content: "" };
 		for (let span = FIRST_PAGE_SPAN_BYTES; next < size; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
 			// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
 			const end = Math.max(next, fromByte) + span;
 			const parts = (await this.#exclusive(() =>
-				this.#readOne(this.#q.readParts, { path, next, end, ...anchor }),
+				this.#readOne(this.#q.readParts, { path, next, end, ...anchor, ...last }),
 			)) as PartRow[];
 			if (parts.length === 0) throw new SessionReadConflictError(path);
 			for (const part of parts) {
 				const start = rowNumber(part.start_offset);
 				if (start !== next) throw new SessionReadConflictError(path);
 				if (start >= size) break;
+				last = { last: start, last_content: part.content };
 				const bytes = Buffer.from(part.content, "utf8");
 				next = start + bytes.byteLength;
 				if (skip >= bytes.byteLength) {
@@ -3286,16 +3411,25 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async remove(paths: string[], dir?: string): Promise<void> {
-		const under = dir === undefined ? undefined : { dir, len: [...dir].length };
+		// `@dir_end` bounds the key range of the parts under `dir` from above: `dir` with its final "/"
+		// made "0". Where the `path` collation sorts "/" before "0" and compares the characters in order
+		// (code-point order, ICU's defaults), every path under `dir` sorts below it whatever follows the
+		// "/"; no character after `dir` can do that in both (ICU sorts U+FFFD and U+FFFF after U+10FFFF).
+		// Under any other collation the delete compares the prefix alone (#directoryRange).
+		const under = dir === undefined ? undefined : { dir, len: [...dir].length, dir_end: `${dir.slice(0, -1)}0` };
 		const fences = this.#fencesOf(paths);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
 			// Every row first: their locks must all be held before the first parts look (see #deleteParts).
 			for (const path of paths) await run(transaction, this.#q.deleteRow, { path });
-			if (under) for (const query of this.#q.deleteUnder) await run(transaction, query, under);
+			if (under) {
+				const deletes = this.#directoryRange ? this.#q.deleteUnder : this.#q.deleteUnderScan;
+				for (const query of deletes) await run(transaction, query, under);
+			}
 			for (const path of paths) {
 				await this.#deleteParts(transaction, path);
-				await this.#deleteStagingOf(transaction, path);
+				// The directory delete took the staging sets of every path under `dir`, which have no row.
+				if (!under || !path.startsWith(under.dir)) await this.#deleteStagingOf(transaction, path);
 			}
 		});
 	}

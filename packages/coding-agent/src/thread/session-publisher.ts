@@ -555,8 +555,8 @@ function localModel(session: AgentSession, model: Model): Model {
 export const SESSION_HOST_SERVE: RpcServe<SessionPublisher, SessionHostProtocol> = {
 	prompt: async (publisher, text, options) => settle(publisher, publisher.session.prompt(text, options)),
 	steer: async (publisher, text, images, options) => settle(publisher, publisher.session.steer(text, images, options)),
-	removeQueuedMessage: (publisher, text, queue) => {
-		const removed = publisher.session.removeQueuedMessage(text, queue);
+	removeQueuedMessage: (publisher, target, queue) => {
+		const removed = publisher.session.removeQueuedMessage(target, queue);
 		publisher.schedule();
 		return removed;
 	},

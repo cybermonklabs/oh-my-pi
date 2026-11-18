@@ -18,7 +18,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { SteerOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
+import type { QueuedMessageTarget, SteerOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	type AgentDefinition,
@@ -100,11 +100,13 @@ describe("handleRpcCancelSubagent", () => {
 	 * subagent idle, holding its session and listed running through that cleanup.
 	 *
 	 * The session mirrors AgentSession's steering queue: a steer queues a
-	 * steering user message (reported through `onPromptQueued`); each turn takes
-	 * the queued steers before its first model call and emits each as
-	 * `message_start`/`message_end`; a steer queued without `holdUntilNextRun`
-	 * on the idle session is drained into a turn of its own; and a prompt while
-	 * a turn streams meets `AgentBusyError`.
+	 * steering user message under its `queueId`; each turn takes the queued
+	 * steers before its first model call, emits each as
+	 * `message_start`/`message_end` and reports it through its `onTaken`; a
+	 * take-back by `queueId` removes exactly that steer, one by text the first
+	 * with that text; a steer queued without `holdUntilNextRun` on the idle
+	 * session is drained into a turn of its own; and a prompt while a turn
+	 * streams meets `AgentBusyError`.
 	 */
 	function startSubagentAwaitingEvalJob(options: { firstTurnFails?: boolean } = {}) {
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
@@ -122,8 +124,13 @@ describe("handleRpcCancelSubagent", () => {
 		let lastAssistant: AssistantMessage | undefined;
 		/** Each turn the subagent ran: what started it, and the texts of the steers it took before its first model call. */
 		const turns: Array<{ source: "prompt" | "drain" | "job result"; steers: string[] }> = [];
-		/** Queued steers: the text each was sent with and the user message the queue holds for it. */
-		const queuedSteers: Array<{ text: string; message: UserMessage }> = [];
+		/** Queued steers: the text each was sent with, the user message the queue holds for it, and its sender's name and callback. */
+		const queuedSteers: Array<{
+			text: string;
+			message: UserMessage;
+			queueId?: string;
+			onTaken?: () => void;
+		}> = [];
 		const busyPrompts: string[] = [];
 		/** The text of every steer the session received, queued or later taken back. */
 		const steerCalls: string[] = [];
@@ -133,11 +140,12 @@ describe("handleRpcCancelSubagent", () => {
 			setRunState("running");
 			for (const listener of listeners) listener({ type: "agent_start" } as AgentSessionEvent);
 			const steers = queuedSteers.splice(0);
-			for (const { message } of steers) {
+			for (const { message, onTaken } of steers) {
 				for (const listener of listeners) {
 					listener({ type: "message_start", message } as AgentSessionEvent);
 					listener({ type: "message_end", message } as AgentSessionEvent);
 				}
+				onTaken?.();
 			}
 			turns.push({ source, steers: steers.map(steer => steer.text) });
 			during?.();
@@ -233,13 +241,15 @@ describe("handleRpcCancelSubagent", () => {
 					attribution: "user",
 					timestamp: Date.now(),
 				};
-				queuedSteers.push({ text, message });
+				queuedSteers.push({ text, message, queueId: options?.queueId, onTaken: options?.onTaken });
 				options?.onPromptQueued?.([message]);
 				steerQueued.resolve();
 				if (!options?.holdUntilNextRun && !streaming) runTurn("drain");
 			},
-			removeQueuedMessage: (text: string) => {
-				const index = queuedSteers.findIndex(steer => steer.text === text);
+			removeQueuedMessage: (target: QueuedMessageTarget) => {
+				const index = queuedSteers.findIndex(steer =>
+					typeof target === "string" ? steer.text === target : steer.queueId === target.queueId,
+				);
 				if (index >= 0) queuedSteers.splice(index, 1);
 				return index >= 0;
 			},

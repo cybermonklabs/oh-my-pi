@@ -24,6 +24,7 @@ import type { AgentSessionEvent, AgentSessionEventListener } from "../session/ag
 import type {
 	AgentSessionDisposeOptions,
 	PromptOptions,
+	QueuedMessageTarget,
 	SessionStats,
 	SteerOptions,
 } from "../session/agent-session-types";
@@ -219,8 +220,8 @@ export class PeerAgentSession implements AgentSessionHandle {
 		return mainBridge().remote.call("steer", this, text, images, options);
 	}
 
-	removeQueuedMessage(text: string, queue: "steering" | "followUp"): Promise<boolean> {
-		return mainBridge().remote.call("removeQueuedMessage", this, text, queue);
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): Promise<boolean> {
+		return mainBridge().remote.call("removeQueuedMessage", this, target, queue);
 	}
 
 	abort(options?: SessionAbortOptions): Promise<void> {

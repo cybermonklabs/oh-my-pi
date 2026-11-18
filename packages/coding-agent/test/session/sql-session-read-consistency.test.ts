@@ -33,6 +33,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { raceAfterFirstChunk } from "./chunked-read-race";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -421,6 +422,86 @@ for (const { adapter, url } of BACKENDS) {
 				expect(outcome).toMatch(ONE_BODY_OR_CONFLICT);
 			},
 			RACE_TIMEOUT,
+		);
+
+		// A read waits only for the writes its own store queued before it began. A
+		// full write the same store queues after that (a session compacting while
+		// its export, fork or copy reads it) lands between two of the read's pages;
+		// a mix of the two bodies would hand the reader a transcript nobody wrote.
+		it(
+			"a chunked read that its own store's full write, queued after its first chunk, races yields one body or fails as a read conflict",
+			async () => {
+				const file = "/sessions/p/own-write.jsonl";
+				const first = sameSizeBody("a");
+				const second = sameSizeBody("b");
+				const storage = await db.open();
+				await storage.writeLinesAtomic(file, first, { expectedSize: null });
+				let landed = false;
+
+				const outcome = await readOutcome(
+					afterFirstChunk(storage.readChunks(file), async () => {
+						storage.writeLinesSync(file, second, { expectedSize: Buffer.byteLength(first.join("")) });
+						// The queued publish lands before the read takes its next page.
+						await storage.confirmWrites(file);
+						landed = true;
+					}),
+					first,
+					second,
+				);
+				expect(landed).toBe(true);
+				expect(outcome).toMatch(ONE_BODY_OR_CONFLICT);
+			},
+			RACE_TIMEOUT,
+		);
+
+		// `omp render` copies the stored session before it opens the copy; a copy
+		// that a rewrite raced reads the session again from its start.
+		it(
+			"omp render of a stored session another process rewrites after the copy's first chunk renders one body",
+			async () => {
+				// If this regresses, `omp render` of a SQL session another process is compacting fails with a
+				// read conflict instead of rendering it.
+				using dir = TempDir.createSync("@omp-sql-render-race-");
+				const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+				const originalStorage = defaultSessionStorage();
+				setAgentDir(dir.join("agent"));
+				try {
+					const file = path.join(dir.path(), "sessions", "raced-render.jsonl");
+					const id = `render-race-${adapter}-${Date.now().toString(36)}`;
+					const first = longSession(id, dir.path(), 3 * MiB, "render tail of the first body");
+					const second = longSession(id, dir.path(), 3 * MiB, "render tail of the other body");
+					const owner = await db.openElsewhere();
+					await owner.writeLinesAtomic(file, first, { expectedSize: null });
+					const reader = await db.open();
+					setDefaultSessionStorage(reader);
+					const race = raceAfterFirstChunk(reader, file, () =>
+						owner.writeLinesAtomic(file, second, { expectedSize: Buffer.byteLength(first.join("")) }),
+					);
+					let printed = "";
+					vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
+						printed += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+						return true;
+					});
+					vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+					const code = await runRenderCommand({ session: file, plain: true, width: 100, height: 30 });
+					vi.restoreAllMocks();
+
+					const tails = ["render tail of the first body", "render tail of the other body"].filter(tail =>
+						printed.includes(tail),
+					);
+					expect({ raced: race.ran, code, tails: tails.length }).toEqual({ raced: true, code: 0, tails: 1 });
+				} finally {
+					setDefaultSessionStorage(originalStorage);
+					if (originalAgentDir) {
+						setAgentDir(originalAgentDir);
+					} else {
+						setAgentDir(path.join(getConfigRootDir(), "agent"));
+						delete process.env.PI_CODING_AGENT_DIR;
+					}
+				}
+			},
+			RENDER_TIMEOUT,
 		);
 
 		// The loader, a transcript copy and a digest read through readChunks; a

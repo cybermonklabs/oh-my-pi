@@ -10,6 +10,7 @@
  */
 import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
+import * as loader from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { LEASE_BACKENDS, type LeaseDb, openLeaseDb, transcript } from "./sql-session-lease-fixture";
 
@@ -18,6 +19,8 @@ const ID = "01a1f000-0000-7000-8000-0000000000d1";
 const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 const MiB = 1024 * 1024;
 const TIMESTAMP = "2026-11-17T00:00:00.000Z";
+/** Whether the open re-reads the transcript to check it (`sessionContentDigest`): without it, no re-read is raced. */
+const DIGEST_REREAD = typeof (loader as Record<string, unknown>).sessionContentDigest === "function";
 
 /** A 3 MiB transcript of session {@link ID}: its header and first turn, then three 1 MiB lines of `fill`. */
 function body(fill: string): string[] {
@@ -35,7 +38,9 @@ function sessionFile(db: LeaseDb): string {
 	return path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
 }
 
-for (const { adapter, url } of LEASE_BACKENDS) {
+for (const { adapter, url: databaseUrl } of LEASE_BACKENDS) {
+	// Where the open has no digest re-read, the case skips.
+	const url = DIGEST_REREAD ? databaseUrl : undefined;
 	describe.skipIf(!url)(`SessionManager.open of a SQL session another process rewrites (${adapter})`, () => {
 		it("opens one whole body when the holder rewrites the transcript after the first chunk of the open's re-read", async () => {
 			// If this regresses, `omp --resume <path>` (and export, share) of a session another process is

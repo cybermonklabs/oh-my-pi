@@ -5,7 +5,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { IrcBus, type IrcBusApi } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { executeSend } from "@oh-my-pi/pi-coding-agent/irc/messaging";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { type AgentLifecycleApi, AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, type AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
@@ -798,7 +798,7 @@ describe("IRC", () => {
 			});
 
 			// Regressed: a subagent released while a message to it fails to hand off keeps that message
-			// buffered for the rest of the session.
+			// buffered for the rest of the session, or its owner's wait counts it as owing a reply.
 			it("buffers no message for a recipient removed during its failed hand-off", async () => {
 				registerAgents("0-Main", "0-Sub");
 				const session = registry.get("0-Sub")?.session;
@@ -813,7 +813,85 @@ describe("IRC", () => {
 
 				expect(bus.unreadCount("0-Sub")).toBe(0);
 				expect(bus.take("0-Sub")).toBeUndefined();
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
 			});
+
+			// Regressed: a subagent whose last job is evicted, or whose job manager is disposed, while its
+			// message to a peer is still being delivered keeps that message's mark for the rest of the
+			// session, and the peer's answer counts as a reply to an agent that is gone.
+			it.each([
+				{
+					when: "evicts its last job",
+					end: async (manager: AsyncJobManager) => {
+						manager.evictCompletedJobs();
+					},
+				},
+				{
+					when: "is disposed",
+					end: async (manager: AsyncJobManager) => {
+						await manager.dispose();
+					},
+				},
+			])("records no mark from an agent whose job manager $when during the delivery", async ({ end }) => {
+				registerAgents("0-Main", "0-Peer");
+				const manager = jobManager();
+				const job = startSubJob(manager);
+				await job.finish();
+				const peer = registry.get("0-Peer")?.session;
+				if (!peer) throw new Error("0-Peer has no session");
+				peer.deliverIrcMessage = async () => {
+					await end(manager);
+					return "injected";
+				};
+
+				const receipt = await bus.send({ from: "0-Sub", to: "0-Peer", body: "is auth.ts yours?" });
+				expect(receipt.outcome).toBe("injected");
+
+				expect(manager.getAllJobs()).toEqual([]);
+				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
+				expect(bus.unansweredSends("0-Sub", 0)).toEqual([]);
+			});
+
+			// Regressed: a message to a transcript's name, which the lifecycle hands to the agent now
+			// running that transcript, keeps its mark when that agent parks during the delivery, and its
+			// owner's wait counts the parked agent as owing a reply. Only a lifecycle that resolves a name
+			// to another agent (`ensureLiveTarget`) readdresses a message.
+			it.skipIf(!("ensureLiveTarget" in AgentLifecycleManager.prototype))(
+				"records no mark for the agent a readdressed message reached and that parked during the delivery",
+				async () => {
+					registerAgents("0-Main", "0-Running");
+					registry.register({
+						id: "0-Transcript",
+						displayName: "0-Transcript",
+						kind: "sub",
+						parentId: "0-Main",
+						session: null,
+						status: "parked",
+					});
+					const running = registry.get("0-Running")?.session;
+					if (!running) throw new Error("0-Running has no session");
+					running.deliverIrcMessage = async () => {
+						registry.detachSession("0-Running");
+						registry.setStatus("0-Running", "parked");
+						return "injected";
+					};
+					const lifecycle = {
+						manages: () => true,
+						isParking: () => false,
+						has: (id: string) => id === "0-Transcript",
+						ensureLive: async () => running,
+						ensureLiveTarget: async () => ({ session: running, agentId: "0-Running", revived: false }),
+					} as unknown as AgentLifecycleApi;
+					const readdressing = new IrcBus(registry, lifecycle);
+
+					const receipt = await readdressing.send({ from: "0-Main", to: "0-Transcript", body: "which codeword?" });
+					expect(receipt).toMatchObject({ to: "0-Running", outcome: "injected" });
+
+					expect(readdressing.sentSince("0-Main", "0-Running", 0)).toBe(false);
+					expect(readdressing.unansweredSends("0-Main", 0)).toEqual([]);
+				},
+			);
 		});
 	});
 

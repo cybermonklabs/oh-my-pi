@@ -60,3 +60,25 @@ describe("builtin sed: a line cut inside a character and joined back is UTF-8 ag
 		[String.raw`printf 'caf\303\251\n' | sed 's/x*/-/g'`, "-c-a-f-\xc3-\xa9-\n", 0],
 	]);
 });
+
+describe("builtin sed: an empty match inside a character only where GNU searches a byte at a time", () => {
+	cases([
+		// `- 303 251 - \n`: a bracket expression with a range is searched a character at a time, so no
+		// match starts inside the `é`. Regressed: `- 303 - 251 -`.
+		[String.raw`printf '\303\251a\n' | sed 's/[a-z]*/-/g'`, "-\xc3\xa9-\n", 0],
+		// `- 303 251 - a - \n`: so is `\W`. Regressed: `- 303 - 251 - a -`.
+		[String.raw`printf '\303\251a\n' | sed 's/\W*/-/g'`, "-\xc3\xa9-a-\n", 0],
+		// `- 303 251 - a - \n`: and any pattern read without case. Regressed: `- 303 - 251 - a -`.
+		[String.raw`printf '\303\251a\n' | sed 's/x*/-/Ig'`, "-\xc3\xa9-a-\n", 0],
+		// `- 303 - 251 - a - \n`: a list of ASCII characters is searched a byte at a time. Already GNU's
+		// answer, kept.
+		[String.raw`printf '\303\251a\n' | sed 's/[x]*/-/g'`, "-\xc3-\xa9-a-\n", 0],
+		// `- 303 - 251 - a - \n`: so is `.`. Already GNU's answer, kept.
+		[String.raw`printf '\303\251a\n' | sed 's/\(.x\)*/-/g'`, "-\xc3-\xa9-a-\n", 0],
+		// `- 303 - 251 - a - \n`: glibc drops a class repeated zero times before it decides, so the class
+		// does not stop the search a byte at a time. Regressed: `- 303 251 - a -`.
+		[String.raw`printf '\303\251a\n' | sed 's/[[:alpha:]]\{0\}/-/g'`, "-\xc3-\xa9-a-\n", 0],
+		// `- 303 - 251 - a - \n`: so it drops `\w{0}` in an ERE. Regressed: `- 303 251 - a -`.
+		[String.raw`printf '\303\251a\n' | sed -E 's/\w{0}/-/g'`, "-\xc3-\xa9-a-\n", 0],
+	]);
+});

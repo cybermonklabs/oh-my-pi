@@ -618,6 +618,26 @@ describe("FileSessionStorage line streaming", () => {
 		expect(seen).toEqual(["sync:a\nb\n", "atomic:c\nd\n"]);
 		expect(fs.readFileSync(sessionPath, "utf8")).toBe("c\nd\n");
 	});
+
+	it("streams the body it opened when another storage's atomic rewrite lands after the first chunk", async () => {
+		// If this regresses, a long file-backed session that another process compacts while it is loaded,
+		// copied or exported reads as the old transcript's first chunk followed by the new one's rest.
+		const sessionPath = path.join(tempDir, "session.jsonl");
+		const body = (fill: string) => Array.from({ length: 4 }, () => `${fill.repeat((1 << 20) - 1)}\n`).join("");
+		const reader = new FileSessionStorage();
+		const writer = new FileSessionStorage();
+		await writer.writeTextAtomic(sessionPath, body("a"));
+
+		const chunks: Uint8Array[] = [];
+		for await (const chunk of reader.readChunks(sessionPath)) {
+			chunks.push(chunk);
+			if (chunks.length === 1) await writer.writeTextAtomic(sessionPath, `${body("b")}appended\n`);
+		}
+
+		expect(chunks.length).toBeGreaterThan(1);
+		expect(Buffer.concat(chunks).toString("utf8") === body("a")).toBe(true);
+		expect(fs.readFileSync(sessionPath, "utf8") === `${body("b")}appended\n`).toBe(true);
+	});
 });
 
 describe("FileSessionStorage.updateSessionTitle", () => {

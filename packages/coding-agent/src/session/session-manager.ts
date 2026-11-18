@@ -158,7 +158,7 @@ import {
 	FileSessionStorage,
 	isSameJournalFile,
 	MemorySessionStorage,
-	RACED_READ_RETRIES,
+	retryRacedRead,
 	SESSION_HEADER_PREFIX_BYTES,
 	type SessionClaimHolder,
 	SessionLeaseLostError,
@@ -1166,24 +1166,33 @@ async function fileMatchesLines(filePath: string, lines: Iterable<string>): Prom
 	return expectedOffset === expectedLength && !encodeNextWindow();
 }
 
-/**
- * Whether stored chunks are exactly the UTF-8 encoding of `body`, compared by
- * byte length and SHA-256 while holding one line of the body and one stored
- * chunk at a time.
- */
-async function chunksMatchBody(chunks: AsyncIterable<Uint8Array>, body: SessionFileBody): Promise<boolean> {
-	const expected = new Bun.CryptoHasher("sha256");
-	for (const line of body.lines) expected.update(line);
+/** A body's UTF-8 byte length and SHA-256, which {@link chunksMatchBody} compares stored chunks with. */
+interface SessionBodyDigest {
+	readonly bytes: number;
+	readonly sha256: string;
+}
+
+/** {@link SessionBodyDigest} of `body`, hashed while holding one line of it at a time. */
+function sessionBodyDigest(body: SessionFileBody): SessionBodyDigest {
+	const hasher = new Bun.CryptoHasher("sha256");
+	for (const line of body.lines) hasher.update(line);
 	// Iterating `lines` counted the body's bytes again.
-	const expectedBytes = body.bytes;
+	return { bytes: body.bytes, sha256: hasher.digest("hex") };
+}
+
+/**
+ * Whether stored chunks are exactly the bytes `expected` describes, compared
+ * by byte length and SHA-256 while holding one stored chunk at a time.
+ */
+async function chunksMatchBody(chunks: AsyncIterable<Uint8Array>, expected: SessionBodyDigest): Promise<boolean> {
 	const stored = new Bun.CryptoHasher("sha256");
 	let storedBytes = 0;
 	for await (const chunk of chunks) {
 		storedBytes += chunk.byteLength;
-		if (storedBytes > expectedBytes) return false;
+		if (storedBytes > expected.bytes) return false;
 		stored.update(chunk);
 	}
-	return storedBytes === expectedBytes && stored.digest("hex") === expected.digest("hex");
+	return storedBytes === expected.bytes && stored.digest("hex") === expected.sha256;
 }
 
 /** Bytes of one synchronous read of a stored transcript; see {@link transcriptByteChunksSync}. */
@@ -1193,17 +1202,40 @@ const SYNC_READ_WINDOW_BYTES = 1024 * 1024;
  * The stored transcript at `filePath` as synchronous chunks of at most
  * {@link SYNC_READ_WINDOW_BYTES}: windows of the file itself for file storage,
  * whatever its other range readers do; windows through `readTextRangeSync` for
- * another storage that has it; otherwise its whole `readTextSync` text as one
- * chunk; `undefined` when the storage reads nothing synchronously. A missing
- * transcript throws ENOENT once iterated.
+ * another storage that has it, read twice (see {@link checkedTextRangeWindows});
+ * otherwise its whole `readTextSync` text as one chunk; `undefined` when the
+ * storage reads nothing synchronously. A missing transcript throws ENOENT once
+ * iterated.
  */
 function transcriptByteChunksSync(filePath: string, storage: SessionStorage): Iterable<Uint8Array> | undefined {
 	if (storage instanceof FileSessionStorage) return fileWindows(filePath);
 	const readRange = storage.readTextRangeSync;
-	if (readRange) return textRangeWindows((start, end) => readRange.call(storage, filePath, start, end));
+	if (readRange)
+		return checkedTextRangeWindows(filePath, (start, end) => readRange.call(storage, filePath, start, end));
 	const readText = storage.readTextSync;
 	if (readText) return wholeText(() => readText.call(storage, filePath));
 	return undefined;
+}
+
+/**
+ * {@link textRangeWindows}, then the same windows read again and compared by
+ * SHA-256 with what was yielded: a storage that reads by range holds nothing
+ * open across windows, so another writer's full write between two of them
+ * would hand back a mix of two bodies. A second read that differs throws
+ * {@link SessionReadConflictError} for `filePath` once the windows ran out.
+ */
+function* checkedTextRangeWindows(
+	filePath: string,
+	readRange: (start: number, end: number) => string,
+): Generator<Uint8Array> {
+	const yielded = new Bun.CryptoHasher("sha256");
+	for (const window of textRangeWindows(readRange)) {
+		yielded.update(window);
+		yield window;
+	}
+	const again = new Bun.CryptoHasher("sha256");
+	for (const window of textRangeWindows(readRange)) again.update(window);
+	if (again.digest("hex") !== yielded.digest("hex")) throw new SessionReadConflictError(filePath);
 }
 
 /**
@@ -1309,6 +1341,30 @@ export class ForkSourceNotFoundError extends Error {
 	constructor(sourcePath: string) {
 		super(`Session "${sourcePath}" not found.`);
 		this.name = "ForkSourceNotFoundError";
+	}
+}
+
+/**
+ * A count of a transcript's entries toward its "unindexed" verdict: it has
+ * non-header entries and none of them has an id, so it may predate ids
+ * altogether (see migrateToCurrentVersion).
+ */
+class UnindexedCount {
+	#sawEntry = false;
+	#sawId = false;
+
+	/** Counts `entry`; true when it is a non-header entry with an id, which settles the verdict as false. */
+	add(entry: FileEntry): boolean {
+		if (entry.type === "session") return false;
+		this.#sawEntry = true;
+		if (lacksEntryId(entry)) return false;
+		this.#sawId = true;
+		return true;
+	}
+
+	/** The verdict on the entries counted so far. */
+	get unindexed(): boolean {
+		return this.#sawEntry && !this.#sawId;
 	}
 }
 
@@ -2364,7 +2420,13 @@ export class SessionManager {
 	 * whole; a storage with only `readTextSync` gives its whole text at once
 	 * (see `transcriptByteChunksSync`). A deleted file is recreated; a file that
 	 * no longer reads as this session is left untouched and the session moves
-	 * to a sibling.
+	 * to a sibling. A read that another writer's full write changed between
+	 * two windows (`SessionReadConflictError`, see {@link checkedTextRangeWindows})
+	 * is read again from the start, at most {@link MAX_WRITE_CONFLICT_RECOVERIES}
+	 * reads in all as {@link #recoverFromWriteConflict} does, then the session
+	 * moves to a sibling as `contested`: the rewrite is never retried without a
+	 * whole read of one body, since its size check could pass against the other
+	 * writer's body and overwrite it.
 	 *
 	 * After {@link MAX_WRITE_CONFLICT_RECOVERIES} passes (`recoveries`) the
 	 * other writer is still racing every read-to-publish window: leave the file
@@ -2376,22 +2438,28 @@ export class SessionManager {
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
-		const chunks = transcriptByteChunksSync(contested, this.#storage);
-		if (!chunks) return undefined;
-		const scan = this.#foreignEntryScan();
-		try {
-			visitEntriesFromChunksSync(chunks, scan.visit, scan.options);
-		} catch (readError) {
-			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
-			this.#expectedDiskSize = null;
-			this.#durable = undefined;
+		for (let reads = 1; ; reads++) {
+			const chunks = transcriptByteChunksSync(contested, this.#storage);
+			if (!chunks) return undefined;
+			const scan = this.#foreignEntryScan();
+			try {
+				visitEntriesFromChunksSync(chunks, scan.visit, scan.options);
+			} catch (readError) {
+				if (readError instanceof SessionReadConflictError) {
+					if (reads >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
+					continue;
+				}
+				if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
+				this.#expectedDiskSize = null;
+				this.#durable = undefined;
+				return contested;
+			}
+			const found = scan.found();
+			if (!found) return this.#moveOffSessionFile("replaced");
+			resolveBlobRefsInEntriesSync(found.foreign, this.#blobs);
+			this.#adoptForeignEntries(found, scan.bytes());
 			return contested;
 		}
-		const found = scan.found();
-		if (!found) return this.#moveOffSessionFile("replaced");
-		resolveBlobRefsInEntriesSync(found.foreign, this.#blobs);
-		this.#adoptForeignEntries(found, scan.bytes());
-		return contested;
 	}
 
 	/**
@@ -2447,6 +2515,7 @@ export class SessionManager {
 				if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 				if (readError instanceof SessionReadConflictError) {
 					if (reads >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
+					// One scan serves one read: what the cut-off read found says nothing about the next.
 					scan = this.#foreignEntryScan();
 					continue;
 				}
@@ -2947,10 +3016,17 @@ export class SessionManager {
 		return !this.#allEntriesHandedToStorage() && this.#shouldHaveSessionFile();
 	}
 
-	/** Verify a failed acknowledgement chunk by chunk: file bytes exactly, other storage by size and SHA-256. */
+	/**
+	 * Verify a failed acknowledgement chunk by chunk: file bytes exactly, other
+	 * storage by size and SHA-256. A full rewrite or delete that races the read
+	 * (`SessionReadConflictError`) is read again from its start through
+	 * {@link retryRacedRead}, never as one whole-text read; the body is hashed
+	 * once, before the first read.
+	 */
 	async #bodyMatchesStorage(sessionFile: string, body: SessionFileBody): Promise<boolean> {
 		if (this.#storage instanceof FileSessionStorage) return fileMatchesLines(sessionFile, body.lines);
-		return chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body);
+		const expected = sessionBodyDigest(body);
+		return retryRacedRead(() => chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), expected));
 	}
 
 	/**
@@ -4297,26 +4373,24 @@ export class SessionManager {
 	 *
 	 * A full rewrite or delete that replaced the transcript mid-read
 	 * (`SessionReadConflictError`) makes the whole load run again from its
-	 * start, at most {@link RACED_READ_RETRIES} more times before the error
+	 * start, as often as {@link retryRacedRead} allows before the error
 	 * surfaces: each pass builds its entries and its cold store afresh, and a
 	 * pass that throws closes the store it opened, so nothing of it reaches
 	 * the next one.
 	 */
-	async #loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
-		// A current-version file whose first entry has no id may predate ids
-		// altogether; only a pass over every entry tells (see migrateToCurrentVersion).
-		let unindexed: boolean | undefined;
-		for (let retries = 0; ;) {
-			try {
+	#loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
+		return retryRacedRead(async () => {
+			// A current-version file whose first entry has no id may predate ids
+			// altogether; only a pass over every entry tells (see migrateToCurrentVersion).
+			// Each pass learns it afresh: what a raced read found of the transcript
+			// says nothing about the one read next.
+			let unindexed: boolean | undefined;
+			for (;;) {
 				const loaded = await this.#streamTranscript(filePath, options, unindexed);
 				if (loaded) return loaded;
 				unindexed = await this.#transcriptIsUnindexed(filePath, options);
-			} catch (error) {
-				if (!(error instanceof SessionReadConflictError) || retries++ >= RACED_READ_RETRIES) throw error;
-				// What the raced read found of the transcript says nothing about the one read next.
-				unindexed = undefined;
 			}
-		}
+		});
 	}
 
 	/** Visit the transcript at `filePath`, or the copy of it `options.preloaded` already holds. */
@@ -4331,21 +4405,18 @@ export class SessionManager {
 
 	/** Whether `filePath` has non-header entries and none of them has an id. */
 	async #transcriptIsUnindexed(filePath: string, options: TranscriptLoadOptions): Promise<boolean> {
-		let sawEntry = false;
-		let everyEntryLacksId = true;
-		await this.#visitTranscript(filePath, options, entry => {
-			if (entry.type === "session") return;
-			sawEntry = true;
-			if (lacksEntryId(entry)) return;
-			everyEntryLacksId = false;
-			return false;
-		});
-		return sawEntry && everyEntryLacksId;
+		const count = new UnindexedCount();
+		await this.#visitTranscript(filePath, options, entry => !count.add(entry));
+		return count.unindexed;
 	}
 
 	/**
 	 * One streamed pass of {@link #loadTranscript}. Returns undefined, having
 	 * kept nothing, when `unindexed` is still unknown and the file needs it.
+	 * A known `unindexed` that this pass's own body contradicts came from a
+	 * body another writer replaced between the passes: the pass then fails as
+	 * a raced read (`SessionReadConflictError`), so the load runs again. Against
+	 * `unindexed: true` it fails at the first entry with an id.
 	 */
 	async #streamTranscript(
 		filePath: string,
@@ -4356,6 +4427,8 @@ export class SessionManager {
 		let header: SessionHeader | undefined;
 		let migration: SessionEntryMigration | undefined;
 		let needsIndexCheck = false;
+		// What this pass's body says of a known `unindexed`; an unknown one is not counted.
+		const count = unindexed === undefined ? undefined : new UnindexedCount();
 		let sanitized = false;
 		let repairedUsage = 0;
 		// The entries live only in `intake`, emptied before this returns: an
@@ -4410,6 +4483,8 @@ export class SessionManager {
 					}
 					migration = startMigration(header);
 				}
+				// An entry with an id already contradicts a body without ids.
+				if (count?.add(raw) && unindexed) throw new SessionReadConflictError(filePath);
 				migration.migrate(raw);
 				if (raw.type === "session" && fork) return;
 				let entry = raw as SessionEntry;
@@ -4444,6 +4519,9 @@ export class SessionManager {
 			if (needsIndexCheck) {
 				intake.store?.close();
 				return undefined;
+			}
+			if (count && count.unindexed !== unindexed) {
+				throw new SessionReadConflictError(filePath);
 			}
 			if (header && !migration) migration = startMigration(header);
 			intake.index.settleLeaf(intake.entries);
@@ -7255,7 +7333,12 @@ export class SessionManager {
 		};
 
 		try {
-			await visitEntriesFromFile(filePath, visit, storage);
+			// A full rewrite between two chunks of a long transcript fails the read: read it again from its start.
+			await retryRacedRead(() => {
+				header = undefined;
+				initEntries.length = 0;
+				return visitEntriesFromFile(filePath, visit, storage);
+			});
 		} catch {
 			return null;
 		}

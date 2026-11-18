@@ -5,7 +5,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { StoreMaskingBinding } from "../secrets/session-store-mask";
 import { visitEntriesFromFileStream } from "../session/session-loader";
 import { SessionManager } from "../session/session-manager";
-import { defaultSessionStorage, type SessionStorage } from "../session/session-storage";
+import { defaultSessionStorage, retryRacedRead, type SessionStorage } from "../session/session-storage";
 import { fingerprintMessage } from "./message-fingerprint";
 
 /**
@@ -125,32 +125,38 @@ export async function loadAdvisorTranscriptCosts(
 		const providers = new Set<string>();
 		let validHeader: boolean | undefined;
 		try {
-			await visitEntriesFromFileStream(
-				snapshot.file,
-				entry => {
-					const isObject = typeof entry === "object" && entry !== null;
-					if (validHeader === undefined) {
-						validHeader = isObject && entry.type === "session" && typeof entry.id === "string";
-						return;
-					}
-					// A syntactically valid but non-object entry (e.g. a bare
-					// `null` line) must cost only itself, not crash entry.type
-					// access and discard everything accumulated for this transcript.
-					if (!validHeader || !isObject || entry.type !== "message") return;
-					const message = entry.message;
-					if (!message || typeof message !== "object" || message.role !== "assistant") return;
-					// One malformed usage block must cost that entry only, not the
-					// whole transcript's total.
-					const total_ = message.usage?.cost?.total;
-					if (typeof total_ === "number" && Number.isFinite(total_)) {
-						total += total_;
-						if (total_ > 0 && typeof message.provider === "string" && message.provider) {
-							providers.add(message.provider);
+			// A full rewrite between two chunks fails the read: read it again from its start.
+			await retryRacedRead(() => {
+				total = 0;
+				providers.clear();
+				validHeader = undefined;
+				return visitEntriesFromFileStream(
+					snapshot.file,
+					entry => {
+						const isObject = typeof entry === "object" && entry !== null;
+						if (validHeader === undefined) {
+							validHeader = isObject && entry.type === "session" && typeof entry.id === "string";
+							return;
 						}
-					}
-				},
-				{ maxBytes: snapshot.maxBytes, shouldContinue: options.shouldContinue, storage },
-			);
+						// A syntactically valid but non-object entry (e.g. a bare
+						// `null` line) must cost only itself, not crash entry.type
+						// access and discard everything accumulated for this transcript.
+						if (!validHeader || !isObject || entry.type !== "message") return;
+						const message = entry.message;
+						if (!message || typeof message !== "object" || message.role !== "assistant") return;
+						// One malformed usage block must cost that entry only, not the
+						// whole transcript's total.
+						const total_ = message.usage?.cost?.total;
+						if (typeof total_ === "number" && Number.isFinite(total_)) {
+							total += total_;
+							if (total_ > 0 && typeof message.provider === "string" && message.provider) {
+								providers.add(message.provider);
+							}
+						}
+					},
+					{ maxBytes: snapshot.maxBytes, shouldContinue: options.shouldContinue, storage },
+				);
+			});
 		} catch (err) {
 			logger.debug("advisor transcript cost read failed", { file: path.basename(snapshot.file), err: String(err) });
 			continue;

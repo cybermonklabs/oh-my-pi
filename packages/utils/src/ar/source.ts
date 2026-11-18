@@ -1,3 +1,4 @@
+import type * as fs from "node:fs/promises";
 import { Readable, type Transform } from "node:stream";
 import { formatBytes } from "../format";
 import { LRUCache } from "../lru";
@@ -53,6 +54,31 @@ export function fileByteSource(filePath: string): ByteSource {
 			const bytes = await file.slice(start, end).bytes();
 			if (bytes.byteLength !== end - start) {
 				throw new ArchiveError("Invalid archive: truncated data");
+			}
+			return bytes;
+		},
+	};
+}
+
+/**
+ * The file `handle` holds open, as a {@link ByteSource}: every read goes to the
+ * file the handle opened, so a file renamed over its path meanwhile is never
+ * read. The handle stays the caller's to close.
+ */
+export async function heldFileSource(handle: fs.FileHandle): Promise<ByteSource> {
+	const { size } = await handle.stat();
+	if (!Number.isSafeInteger(size)) {
+		throw new ArchiveError("Archive is too large to read safely");
+	}
+	return {
+		size,
+		async read(start, end) {
+			assertValidRange(start, end);
+			const bytes = new Uint8Array(end - start);
+			for (let filled = 0; filled < bytes.length;) {
+				const { bytesRead } = await handle.read(bytes, filled, bytes.length - filled, start + filled);
+				if (bytesRead === 0) throw new ArchiveError("Invalid archive: truncated data");
+				filled += bytesRead;
 			}
 			return bytes;
 		},

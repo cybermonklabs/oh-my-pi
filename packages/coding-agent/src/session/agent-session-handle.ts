@@ -39,6 +39,7 @@ import type {
 	EphemeralTurnResult,
 	Prewalk,
 	PromptOptions,
+	QueuedMessageTarget,
 	ResolvedRoleModel,
 	RestoredQueuedMessage,
 	RoleModelCycle,
@@ -148,10 +149,13 @@ export interface AgentSessionHandle {
 	/** Queue a steering message for the next step boundary. */
 	steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void>;
 	/**
-	 * Take back the queued steer or follow-up the caller submitted as `text`, with its
+	 * Take back the queued steer or follow-up the caller submitted as `target` (its
+	 * text, or the {@link SteerOptions.queueId} it named a steer with), with its
 	 * hidden companions; false when it is no longer queued (delivered or removed).
+	 * A named steer a run took off the queue but has not put into its context yet
+	 * answers once that run takes it (false) or puts it back (taken back then).
 	 */
-	removeQueuedMessage(text: string, queue: "steering" | "followUp"): boolean | Promise<boolean>;
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): boolean | Promise<boolean>;
 	/** Abort the current operation and wait for the agent to become idle. */
 	abort(options?: {
 		goalReason?: "interrupted" | "internal";

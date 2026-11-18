@@ -65,6 +65,33 @@ describe("IRC bus: no state kept for a parked or removed agent", () => {
 		expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
 	});
 
+	// Regressed: a question to a subagent that is parked and revived again while the question is delivered
+	// (an idle-TTL park, then another sender's message) loses its mark, so the owner's wait does not block
+	// for the reply the live subagent still owes.
+	it("records the mark for a recipient parked and live again before the delivery returns", async () => {
+		const lifecycle = AgentLifecycleManager.global();
+		let parkAndReviveDuringDelivery = true;
+		const live = fakeSession(async () => {
+			if (parkAndReviveDuringDelivery) {
+				parkAndReviveDuringDelivery = false;
+				registry.setStatus("0-Sub", "idle");
+				await lifecycle.park("0-Sub");
+				expect(registry.get("0-Sub")?.status).toBe("parked");
+				await lifecycle.ensureLive("0-Sub");
+			}
+			return "injected";
+		});
+		registry.register({ id: "0-Sub", displayName: "sub", kind: "sub", parentId: "0-Main", session: live });
+		lifecycle.adopt("0-Sub", { idleTtlMs: 0, revive: async () => fakeSession() });
+
+		const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
+
+		expect(receipt.outcome).toBe("injected");
+		expect(registry.get("0-Sub")?.status).toBe("idle");
+		expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
+		expect(bus.unansweredSends("0-Main", 0)).toEqual([{ to: "0-Sub", sentAt: expect.any(Number), promised: false }]);
+	});
+
 	// Regression: a message to a subagent whose session is shutting down is
 	// buffered, the subagent is removed, and the bus keeps that message for an
 	// agent that no longer exists for the rest of the session.

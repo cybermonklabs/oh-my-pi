@@ -1017,16 +1017,19 @@ const ANTHROPIC_STREAM_ERROR_STATUS: Readonly<Record<string, number>> = {
  * Codex native-lane steer rejection uses, so a gateway-cut stream is
  * identifiable after the `Error` instance is gone.
  *
- * Only frame types the provider loop already retries take the truncation path.
- * A deterministic rejection (`invalid_request_error`, `authentication_error`,
- * `billing_error`, `permission_error`, an account cap) is a decision the
- * provider made about the request, not a cut wire: rewriting it as a truncation
- * would replay a request that can never succeed and, once text is committed,
- * continue a turn the provider refused. The gate is
- * {@link AIError.isProviderRetryableError} on the very error that is otherwise
- * thrown, so a frame keeps exactly the verdict it had before this classification
- * existed — the retry decision moves nowhere, only the shape of a retryable
- * failure changes.
+ * Only frame types the provider loop already retries take the truncation path,
+ * and a rate limit never does. A deterministic rejection
+ * (`invalid_request_error`, `authentication_error`, `billing_error`,
+ * `permission_error`, an account cap) is a decision the provider made about the
+ * request, not a cut wire: rewriting it as a truncation would replay a request
+ * that can never succeed and, once text is committed, continue a turn the
+ * provider refused. The gate is {@link AIError.isProviderRetryableError} on the
+ * very error that is otherwise thrown, so a frame keeps exactly the verdict it
+ * had before this classification existed — the retry decision moves nowhere,
+ * only the shape of a retryable failure changes. A `rate_limit_error` is also
+ * the provider's decision, about the request rate: it stays the 429 refusal
+ * wherever it lands, so turn recovery waits on this model for the window to
+ * clear instead of re-sending the whole context at once as a resumed truncation.
  */
 function createAnthropicSseStreamError(data: string, midMessage: boolean): Error {
 	let parsed: { error?: { type?: unknown; code?: unknown; message?: unknown } } | undefined;
@@ -1051,7 +1054,7 @@ function createAnthropicSseStreamError(data: string, midMessage: boolean): Error
 		httpStatus === undefined
 			? new AIError.ProviderResponseError(text, { provider: "anthropic", kind: "output" })
 			: new AIError.ProviderHttpError(text, httpStatus, { code: errorType });
-	if (!midMessage || !AIError.isProviderRetryableError(rejection)) {
+	if (!midMessage || httpStatus === 429 || !AIError.isProviderRetryableError(rejection)) {
 		return rejection;
 	}
 	const fields = [errorType ? `type=${errorType}` : undefined, errorCode ? `code=${errorCode}` : undefined]

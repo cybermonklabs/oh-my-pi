@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { UserMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -6,7 +6,8 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { IrcBus } from "../../src/irc/bus";
-import { isQueuedMessage } from "../../src/modes/rpc/rpc-mode";
+import { handleRpcSteerSubagent } from "../../src/modes/rpc/rpc-mode";
+import { RpcSubagentRegistry } from "../../src/modes/rpc/rpc-subagents";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentSession } from "../../src/session/agent-session";
@@ -14,11 +15,13 @@ import type { AgentSessionHandle } from "../../src/session/agent-session-handle"
 import { AuthStorage } from "../../src/session/auth-storage";
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
+import { type SubagentLifecyclePayload, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../../src/task/types";
 import { RemoteAgentSession } from "../../src/thread/remote-agent-session";
 import type { ThreadService } from "../../src/thread/services";
 import { agentsThreadService } from "../../src/thread/services/agents";
 import { identityThreadService } from "../../src/thread/services/identity";
 import { SubagentWorker } from "../../src/thread/subagent-worker";
+import { EventBus } from "../../src/utils/event-bus";
 import type { AgentsProbe, AgentsProbeGlobals } from "../fixtures/agents-bridge-worker";
 
 const cleanups: Array<() => unknown> = [];
@@ -100,6 +103,54 @@ async function mainSession(id: string): Promise<AgentSession> {
 		authStorage.close();
 	});
 	return session;
+}
+
+/** This session's `get_subagents` roster, listing `id` running with its transcript at `sessionFile`. */
+function rosterListing(id: string, sessionFile: string): RpcSubagentRegistry {
+	const eventBus = new EventBus();
+	const roster = new RpcSubagentRegistry(eventBus, () => {});
+	cleanups.push(() => roster.dispose());
+	eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+		id,
+		index: 0,
+		agent: "task",
+		agentSource: "bundled",
+		status: "started",
+		sessionFile,
+	} satisfies SubagentLifecyclePayload);
+	return roster;
+}
+
+/** Subscriptions to `roster`, to the agent registry and to `shutdown` made from now on and not ended yet. */
+function liveSubscriptions(roster: RpcSubagentRegistry, shutdown: AbortSignal) {
+	// The lifecycle manager subscribes to the registry for good when first built; build it first.
+	AgentLifecycleManager.global();
+	cleanups.push(() => vi.restoreAllMocks());
+	const live = { roster: 0, registry: 0, shutdown: 0 };
+	const track = (target: { onChange(listener: () => void): () => void }, key: "roster" | "registry") => {
+		const onChange = target.onChange.bind(target);
+		vi.spyOn(target, "onChange").mockImplementation(listener => {
+			live[key]++;
+			const unsubscribe = onChange(listener);
+			return () => {
+				live[key]--;
+				unsubscribe();
+			};
+		});
+	};
+	track(roster, "roster");
+	track(AgentRegistry.global(), "registry");
+	const addEventListener = shutdown.addEventListener.bind(shutdown);
+	const removeEventListener = shutdown.removeEventListener.bind(shutdown);
+	vi.spyOn(shutdown, "addEventListener").mockImplementation((type, listener, options) => {
+		if (type === "abort" && listener) live.shutdown++;
+		addEventListener(type, listener, options);
+	});
+	vi.spyOn(shutdown, "removeEventListener").mockImplementation((type, listener, options) => {
+		if (type === "abort" && listener) live.shutdown--;
+		removeEventListener(type, listener, options);
+	});
+	return live;
 }
 
 describe("agent bridging across subagent workers", () => {
@@ -271,21 +322,20 @@ describe("agent bridging across subagent workers", () => {
 		const { probe } = await startWorker();
 		await probe.open("W1", {});
 		const remote = mirrorOf(liveRef("W1").session);
-		const ended: UserMessage[] = [];
-		remote.subscribe(event => {
-			if (event.type === "message_end" && event.message.role === "user") ended.push(event.message);
-		});
 		const reported: UserMessage[] = [];
-		const queueNextRunSteer = (text: string) =>
+		const taken: string[] = [];
+		const queueNextRunSteer = (text: string, queueId: string) =>
 			remote.steer(text, undefined, {
 				holdUntilNextRun: true,
+				queueId,
+				onTaken: () => taken.push(queueId),
 				onPromptQueued: messages => {
 					const message = messages.at(-1);
 					if (message?.role === "user") reported.push(message);
 				},
 			});
 
-		await queueNextRunSteer("Take this back.");
+		await queueNextRunSteer("Take this back.", "only");
 		await waitFor(() => reported.length === 1);
 		expect(reported[0]).toMatchObject({
 			role: "user",
@@ -294,16 +344,19 @@ describe("agent bridging across subagent workers", () => {
 		});
 		// The steer waits on the queue: no turn ran for it.
 		expect(await probe.settled("W1")).toEqual({ messageCount: 0, steering: ["Take this back."] });
-		expect(await remote.removeQueuedMessage("Take this back.", "steering")).toBe(true);
+		expect(await remote.removeQueuedMessage({ queueId: "only" }, "steering")).toBe(true);
 		expect(await probe.settled("W1")).toEqual({ messageCount: 0, steering: [] });
-		expect(await remote.removeQueuedMessage("Take this back.", "steering")).toBe(false);
+		expect(await remote.removeQueuedMessage({ queueId: "only" }, "steering")).toBe(false);
 
-		await queueNextRunSteer("Also check the README.");
-		await waitFor(() => reported.length === 2);
+		// Two steers of the same text are two messages on the home worker: the
+		// take-back by name removes the second, and the run takes the first.
+		await queueNextRunSteer("Also check the README.", "first");
+		await queueNextRunSteer("Also check the README.", "second");
+		expect(await remote.removeQueuedMessage({ queueId: "second" }, "steering")).toBe(true);
+		expect(await probe.settled("W1")).toEqual({ messageCount: 0, steering: ["Also check the README."] });
 		expect(await remote.prompt("Submit your result.")).toBe(true);
-		// The run that takes the steer reports it as a copy matching what onPromptQueued reported.
-		await waitFor(() => ended.some(message => isQueuedMessage(message, reported[1]!)));
-		expect(ended.some(message => isQueuedMessage(message, reported[0]!))).toBe(false);
+		await waitFor(() => taken.length === 1);
+		expect(taken).toEqual(["first"]);
 		expect(await probe.settled("W1")).toMatchObject({ steering: [] });
 	}, 60_000);
 
@@ -321,9 +374,148 @@ describe("agent bridging across subagent workers", () => {
 				content: [{ type: "text", text: "Take this back." }],
 			}),
 			removed: true,
+			removedAgain: false,
 		});
+		// Of the two steers of that text, the one the take-back named is gone and the other waits.
+		expect(main.agent.peekSteeringQueue()).toHaveLength(1);
+		expect(await main.prompt("Submit your result.")).toBe(true);
 		await main.waitForIdle();
-		expect(main.messages).toEqual([]);
+		await waitFor(async () => (await probe.peerTaken()).length === 1);
+		expect(await probe.peerTaken()).toEqual(["kept"]);
 		expect(main.agent.peekSteeringQueue()).toEqual([]);
+	}, 60_000);
+});
+
+describe("steer_subagent to a worker-homed subagent idle between turns", () => {
+	const id = "W1";
+	const text = "Also check the README.";
+	const notDelivered = `The message was not delivered to subagent: ${id}`;
+
+	/** A worker homing subagent `W1` idle between two turns of its run, which this session's roster lists running. */
+	async function startSubagent() {
+		const { worker, probe } = await startWorker();
+		const sessionFile = `/tmp/agents-bridge-steer-${id}.jsonl`;
+		await probe.open(id, { sessionFile });
+		return { worker, probe, roster: rosterListing(id, sessionFile), remote: mirrorOf(liveRef(id).session) };
+	}
+
+	/** Wait until the steer is on the subagent's steering queue on its worker. */
+	async function steerQueued(probe: AgentsProbe): Promise<void> {
+		await waitFor(async () => (await probe.settled(id)).steering.length === 1);
+	}
+
+	/** How many times the subagent's transcript holds the steer. */
+	async function timesDelivered(probe: AgentsProbe): Promise<number> {
+		return (await probe.userTexts(id)).filter(message => message === text).length;
+	}
+
+	it("answers success when the run takes the steer and its executor marks the run ended at once", async () => {
+		// Race: the subagent's next run takes the steer and its drive ends on the
+		// worker right then, so the parent's take-back and the report that the
+		// run took the message cross the bridge together. A steer that read the
+		// take-back first would tell the host the message was lost although the
+		// subagent acted on it.
+		const { probe, roster, remote } = await startSubagent();
+		await probe.endRunWhenSteerTaken(id, text);
+		const answer = handleRpcSteerSubagent(roster, id, text);
+		await steerQueued(probe);
+
+		expect(await remote.prompt("Submit your result.")).toBe(true);
+
+		expect(await answer).toBeUndefined();
+		expect(liveRef(id).lifecycle?.endedAt).toBeNumber();
+		expect(await timesDelivered(probe)).toBe(1);
+		expect((await probe.settled(id)).steering).toEqual([]);
+		// A later run carries it no more.
+		expect(await remote.prompt("Anything else?")).toBe(true);
+		expect(await timesDelivered(probe)).toBe(1);
+	}, 60_000);
+
+	it("answers success when the take-back reaches the worker while the run holds the steer before its model call", async () => {
+		// Regression: the RPC shutdown takes the steer back just after the
+		// subagent's run took it off the queue on its worker; the take-back finds
+		// nothing to remove, the steer tells the host the message was not
+		// delivered, and the subagent then acts on it anyway.
+		const { probe, roster, remote } = await startSubagent();
+		await probe.holdNextModelCall(id);
+		await probe.watchTakeBacks(id);
+		const shutdown = new AbortController();
+		const answer = handleRpcSteerSubagent(roster, id, text, shutdown.signal);
+		await steerQueued(probe);
+		const prompting = remote.prompt("Submit your result.");
+		await probe.modelCallHeld();
+
+		// The race: the take-back crosses the bridge while the run holds the steer.
+		shutdown.abort();
+		await probe.takeBackReceived();
+		await probe.releaseModelCall();
+
+		expect(await prompting).toBe(true);
+		expect(await answer).toBeUndefined();
+		expect(await timesDelivered(probe)).toBe(1);
+		expect((await probe.settled(id)).steering).toEqual([]);
+	}, 60_000);
+
+	it("answers success when the run starts on the worker the moment the steer is queued", async () => {
+		// Race: the subagent's next run starts and takes the steer before the
+		// parent hears back that the steer was queued. A steer that followed its
+		// message only from then on would miss the run taking it, and wait until
+		// the subagent stops or tell the host the message was lost.
+		const { probe, roster } = await startSubagent();
+		await probe.promptWhenSteerQueued(id, "Submit your result.");
+
+		expect(await handleRpcSteerSubagent(roster, id, text)).toBeUndefined();
+
+		expect(await timesDelivered(probe)).toBe(1);
+		expect((await probe.settled(id)).steering).toEqual([]);
+	}, 60_000);
+
+	it("answers an error at once, leaving no subscription, when the worker dies while the take-back waits on it", async () => {
+		// Regression: the subagent's worker dies while the steer's take-back waits
+		// there; a steer that waited on the lost reply would hold the host's
+		// command, and the RPC shutdown that drains it, for good.
+		const { worker, probe, roster, remote } = await startSubagent();
+		await probe.holdNextModelCall(id);
+		await probe.watchTakeBacks(id);
+		const shutdown = new AbortController();
+		const live = liveSubscriptions(roster, shutdown.signal);
+		const answer = handleRpcSteerSubagent(roster, id, text, shutdown.signal);
+		await steerQueued(probe);
+		const prompting = remote.prompt("Submit your result.");
+		await probe.modelCallHeld();
+		shutdown.abort();
+		await probe.takeBackReceived();
+
+		worker.terminate("killed by test");
+
+		await expect(prompting).rejects.toThrow(worker.threadId);
+		expect(await answer).toBe(notDelivered);
+		expect(live).toEqual({ roster: 0, registry: 0, shutdown: 0 });
+	}, 60_000);
+
+	it("answers an error at once, leaving no subscription, when the session is disposed while the take-back waits on it", async () => {
+		// Regression: the subagent's session is disposed on its worker while the
+		// steer's take-back waits there for the run that holds the steer; the
+		// disposal ends that run before its model call, and a take-back that
+		// waited only for the run to take the steer would never answer, holding
+		// the host's command and the RPC shutdown that drains it.
+		const { probe, roster, remote } = await startSubagent();
+		await probe.holdNextModelCall(id);
+		await probe.watchTakeBacks(id);
+		const shutdown = new AbortController();
+		const live = liveSubscriptions(roster, shutdown.signal);
+		const answer = handleRpcSteerSubagent(roster, id, text, shutdown.signal);
+		await steerQueued(probe);
+		const prompting = remote.prompt("Submit your result.");
+		await probe.modelCallHeld();
+		shutdown.abort();
+		await probe.takeBackReceived();
+
+		await probe.disposeLocal(id);
+		await Promise.allSettled([prompting]);
+
+		const answered = (await answer) ?? "success";
+		expect([`Subagent's run ended before the message reached it: ${id}`, notDelivered]).toContain(answered);
+		expect(live).toEqual({ roster: 0, registry: 0, shutdown: 0 });
 	}, 60_000);
 });

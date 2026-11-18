@@ -71,7 +71,12 @@ function addPruned(set: Set<string>, value: string, maxSize: number): void {
 /**
  * The complete entries of `sessionFile` from byte `fromByte`, read in a window
  * of at most 8 MiB (more only for a line longer than 4 MiB), so a long
- * transcript is never held whole; a caller reads on from `nextByte`.
+ * transcript is never held whole; a caller reads on from `nextByte`. A cursor
+ * past the end, or one no record ends right before (the transcript was
+ * rewritten since the caller's last read), reads the transcript again from its
+ * start and reports `reset`, so the caller drops what it read before. A
+ * rewrite that still ends a record right before the cursor goes unseen: the
+ * read then goes on from the cursor in the new body.
  */
 export async function readRpcSubagentTranscript(
 	sessionFile: string,
@@ -79,9 +84,10 @@ export async function readRpcSubagentTranscript(
 	storage: SessionStorage = defaultSessionStorage(),
 ): Promise<RpcSubagentMessagesResult> {
 	let startByte = Number.isFinite(fromByte) ? Math.max(0, Math.trunc(fromByte)) : 0;
-	let read: { text: string; size: number };
+	let text: string;
 	try {
-		read = await readSessionLinesFrom(storage, sessionFile, startByte);
+		// From the byte before the cursor: the newline of the record the caller read last.
+		({ text } = await readSessionLinesFrom(storage, sessionFile, Math.max(0, startByte - 1)));
 	} catch (err) {
 		if (!isEnoent(err)) throw err;
 		return {
@@ -94,14 +100,15 @@ export async function readRpcSubagentTranscript(
 		};
 	}
 	let reset = false;
-	if (startByte > read.size) {
-		// The transcript was rewritten shorter: read it again from the start.
+	if (startByte > 0 && text.startsWith("\n")) {
+		text = text.slice(1);
+	} else if (startByte > 0) {
+		// The transcript was rewritten shorter, or with no record ending at the cursor: read it again from the start.
 		startByte = 0;
 		reset = true;
-		read = await readSessionLinesFrom(storage, sessionFile, 0);
+		text = (await readSessionLinesFrom(storage, sessionFile, 0)).text;
 	}
 
-	const text = read.text;
 	const lastNewline = text.lastIndexOf("\n");
 	const completeText = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : "";
 	const entries = completeText.length > 0 ? parseSessionEntries(completeText) : [];

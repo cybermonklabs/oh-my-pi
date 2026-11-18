@@ -70,6 +70,7 @@ import type {
 	EphemeralTurnResult,
 	Prewalk,
 	PromptOptions,
+	QueuedMessageTarget,
 	ResolvedRoleModel,
 	RestoredQueuedMessage,
 	RoleModelCycle,
@@ -853,9 +854,9 @@ export class RemoteAgentSession implements AgentViewSession {
 	}
 
 	/** Take back a queued message on the home worker; a session that is already gone holds none. */
-	removeQueuedMessage(text: string, queue: "steering" | "followUp"): Promise<boolean> {
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): Promise<boolean> {
 		if (this.#closed !== undefined) return Promise.resolve(false);
-		return this.#command("removeQueuedMessage", text, queue);
+		return this.#command("removeQueuedMessage", target, queue);
 	}
 
 	abort(options?: SessionAbortOptions): Promise<void> {

@@ -24,6 +24,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { line, MiB, raceAfterFirstChunk, STILL, TIMESTAMP } from "../session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb } from "../session/sql-session-lease-fixture";
 
 const previous = defaultSessionStorage();
 const clients: SQL[] = [];
@@ -128,4 +130,54 @@ describe("loadAdvisorTranscriptCosts", () => {
 		});
 		await parent.close();
 	});
+
+	for (const { adapter, url } of LEASE_BACKENDS) {
+		it.skipIf(!url)(
+			`restores one body's advisor spend when another store rewrites the transcript after the first chunk (${adapter})`,
+			async () => {
+				// If this regresses, resuming a SQL session whose advisor transcript another process is rewriting
+				// restarts that advisor's budget at zero, so it spends past its limit.
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const sessionFile = path.join(db.dir.path(), "sessions", "-project-", "sess.jsonl");
+				const advisorFile = path.join(sessionFile.slice(0, -".jsonl".length), advisorTranscriptFilename(""));
+				// A first chunk of 1 MiB holds no turn: the turns come after a large entry.
+				const body = (fill: string, costs: number[]) => [
+					line({ type: "session", version: 3, id: "advisor", timestamp: TIMESTAMP, cwd: "/project" }),
+					line({
+						type: "custom",
+						customType: "pad",
+						id: "pad",
+						parentId: null,
+						timestamp: TIMESTAMP,
+						data: fill.repeat(MiB + MiB / 2),
+					}),
+					...costs.map((cost, n) =>
+						line({
+							type: "message",
+							id: `a${n}`,
+							parentId: null,
+							timestamp: TIMESTAMP,
+							message: assistantMessage(cost),
+						}),
+					),
+				];
+				const holder = await db.open({ lease: STILL });
+				await holder.writeLinesAtomic(advisorFile, body("a", [0.25, 0.5]));
+				await holder.drain();
+				const reader = await db.open({ lease: STILL });
+				const race = raceAfterFirstChunk(reader, advisorFile, async () => {
+					await holder.writeLinesAtomic(advisorFile, body("b", [1.25, 1.5]), {
+						expectedSize: holder.statSync(advisorFile).size,
+					});
+					await holder.drain();
+				});
+
+				const costs = await loadAdvisorTranscriptCosts(sessionFile, { storage: reader });
+
+				expect(race.ran).toBe(true);
+				expect([0.75, 2.75]).toContain(costs.get("") ?? 0);
+			},
+			120_000,
+		);
+	}
 });

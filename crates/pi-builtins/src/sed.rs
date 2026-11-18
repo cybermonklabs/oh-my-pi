@@ -490,7 +490,7 @@ mod tests {
 	fn caps_for<'a>(re: &str, chunk: &'a mut IOChunk) -> Captures<'a> {
 		Regex::new(re)
 			.unwrap()
-			.captures(chunk)
+			.captures(chunk, false)
 			.unwrap()
 			.expect("captures")
 	}
@@ -1362,9 +1362,13 @@ fn compile_regex(
 					.unwrap_err()
 			})
 	};
-	let text = compile(&script_text(pattern))?;
+	let text_pattern = script_text(pattern);
+	let text = compile(&text_pattern)?;
 	let bytes = if pattern.is_ascii() { None } else { Some(compile(&script_byte_text(pattern))?) };
-	Ok(Some(ScriptRegex::new(text, bytes)))
+	// In a line that is UTF-8 GNU starts a match inside a character only where
+	// it searches the pattern a byte at a time.
+	let by_chars = icase || !crate::bre::searched_by_byte(&text_pattern, dialect);
+	Ok(Some(ScriptRegex::new(text, bytes, by_chars)))
 }
 
 /// Compile a regular expression replacement string.
@@ -7408,12 +7412,13 @@ impl Longest {
 	}
 }
 
-/// Whether `start..end`, a match of the bytes engine in byte text, lies on
-/// the text's character boundaries. That engine allows an empty match at any
-/// byte, also inside the four bytes of a character standing for a byte from
-/// 0x80 up, where GNU, which reads that byte as one character, has none. In
-/// a line that is UTF-8 GNU does find one inside a character of several
-/// bytes (see `processor::substitute`), and so does that engine.
+/// Whether `start..end`, a match of the bytes engine, lies on the text's
+/// character boundaries. That engine allows an empty match at any byte: in
+/// byte text also inside the four bytes of a character standing for a byte
+/// from 0x80 up, where GNU, which reads that byte as one character, has
+/// none, and in a line that is UTF-8 inside a character of several bytes,
+/// where GNU has one only for a pattern it searches a byte at a time (see
+/// `ScriptRegex`).
 pub fn on_char_boundaries(text: &str, start: usize, end: usize) -> bool {
 	text.is_char_boundary(start) && text.is_char_boundary(end)
 }
@@ -7424,11 +7429,11 @@ fn next_boundary(text: &str, at: usize) -> usize {
 }
 
 /// Where a search goes on after an empty match at `at` of `text`: the next
-/// byte in a line that is UTF-8, where GNU finds an empty match inside a
-/// character as well, and the next character in byte text (`bytes`), whose
-/// characters are bytes to GNU.
-fn after_empty(text: &str, bytes: bool, at: usize) -> usize {
-	if bytes { next_boundary(text, at) } else { at + 1 }
+/// character where every match lies on character boundaries (`by_chars`,
+/// see `Regex::captures_iter_text`), else the next byte, where GNU finds an
+/// empty match inside a character as well.
+fn after_empty(text: &str, by_chars: bool, at: usize) -> usize {
+	if by_chars { next_boundary(text, at) } else { at + 1 }
 }
 
 /// Answers whether a fancy-regex pattern matches the empty string at a
@@ -7567,16 +7572,22 @@ impl Regex {
 		}
 	}
 
-	/// Return an iterator over capture groups.
-	pub fn captures_iter<'t>(&'t self, chunk: &'t IOChunk) -> SedResult<CaptureMatches<'t>> {
+	/// Return an iterator over capture groups; see [`Self::captures_iter_text`]
+	/// for `by_chars`.
+	pub fn captures_iter<'t>(&'t self, chunk: &'t IOChunk, by_chars: bool) -> SedResult<CaptureMatches<'t>> {
 		if self.misses_literally(chunk) {
 			return Ok(CaptureMatches::Literal(Box::new(std::iter::empty::<SedResult<Captures<'t>>>())));
 		}
-		Ok(self.captures_iter_text(chunk.as_str(), chunk.is_bytes()))
+		Ok(self.captures_iter_text(chunk.as_str(), by_chars))
 	}
 
-	/// The matches in `text`, which is byte text when `bytes`.
-	fn captures_iter_text<'t>(&'t self, text: &'t str, bytes: bool) -> CaptureMatches<'t> {
+	/// The matches in `text`. Where `by_chars` each lies on the text's
+	/// character boundaries: in byte text (see `fast_io`), whose characters
+	/// are bytes to GNU, and in a line that is UTF-8 for a pattern GNU
+	/// searches a character at a time (see [`ScriptRegex`]). Otherwise an
+	/// empty match may fall inside a character of several bytes, as GNU's does
+	/// in a line that is UTF-8 for a pattern it searches a byte at a time.
+	fn captures_iter_text<'t>(&'t self, text: &'t str, by_chars: bool) -> CaptureMatches<'t> {
 		match self {
 			Regex::Literal(m) => CaptureMatches::Literal(Box::new(
 				m.iter(text.as_bytes())
@@ -7584,12 +7595,12 @@ impl Regex {
 			)),
 
 			Regex::Byte(re) => CaptureMatches::Byte {
-				iter:      re.captures_iter(text.as_bytes()),
-				byte_text: bytes.then_some(text),
+				iter:       re.captures_iter(text.as_bytes()),
+				boundaries: by_chars.then_some(text),
 			},
 
 			Regex::Fancy(re) => {
-				CaptureMatches::Fancy(FancyMatches { re, stepping: Stepping::new(text, bytes, false) })
+				CaptureMatches::Fancy(FancyMatches { re, stepping: Stepping::new(text, by_chars, false) })
 			},
 
 			Regex::Longest(longest) => {
@@ -7598,14 +7609,14 @@ impl Regex {
 					longest,
 					// A line without a match keeps no branch's next match.
 					next: if may_match { longest.fresh_next() } else { Vec::new() },
-					stepping: Stepping::new(text, bytes, !may_match),
+					stepping: Stepping::new(text, by_chars, !may_match),
 				})
 			},
 
 			Regex::NulLines(re) => CaptureMatches::NulLines(Box::new(NulLineMatches {
 				re: re.as_ref(),
 				lines: NulSplit::new(text),
-				bytes,
+				by_chars,
 				current: None,
 			})),
 		}
@@ -7622,23 +7633,25 @@ impl Regex {
 		}
 	}
 
-	/// Return the elements of the first capture.
-	pub fn captures<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Captures<'t>>> {
+	/// Return the elements of the first capture; see
+	/// [`Self::captures_iter_text`] for `by_chars`.
+	pub fn captures<'t>(&self, chunk: &'t IOChunk, by_chars: bool) -> SedResult<Option<Captures<'t>>> {
 		if self.misses_literally(chunk) {
 			return Ok(None);
 		}
-		self.captures_text(chunk.as_str(), chunk.is_bytes())
+		self.captures_text(chunk.as_str(), by_chars)
 	}
 
-	/// The captures of the first match in `text`, byte text when `bytes`.
-	fn captures_text<'t>(&self, text: &'t str, bytes: bool) -> SedResult<Option<Captures<'t>>> {
+	/// The captures of the first match in `text`; see
+	/// [`Self::captures_iter_text`] for `by_chars`.
+	fn captures_text<'t>(&self, text: &'t str, by_chars: bool) -> SedResult<Option<Captures<'t>>> {
 		match self {
 			Regex::Literal(m) => Ok(m
 				.find(text.as_bytes())
 				.map(|(start, end, text)| Captures::Literal(Match { start, end, text }))),
 
 			Regex::Byte(re) => {
-				let caps = if bytes {
+				let caps = if by_chars {
 					re.captures_iter(text.as_bytes()).find(|caps| {
 						caps.get(0).is_some_and(|m| on_char_boundaries(text, m.start(), m.end()))
 					})
@@ -7664,21 +7677,23 @@ impl Regex {
 				}
 			},
 
-			Regex::NulLines(re) => Ok(first_in_nul_lines(text, |line| re.captures_text(line, bytes))?
+			Regex::NulLines(re) => Ok(first_in_nul_lines(text, |line| re.captures_text(line, by_chars))?
 				.map(|(offset, caps)| Captures::Shifted { caps: Box::new(caps), offset })),
 		}
 	}
 
-	/// Return a non-capturing result for a single match.
-	pub fn find<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Match<'t>>> {
+	/// Return a non-capturing result for a single match; see
+	/// [`Self::captures_iter_text`] for `by_chars`.
+	pub fn find<'t>(&self, chunk: &'t IOChunk, by_chars: bool) -> SedResult<Option<Match<'t>>> {
 		if self.misses_literally(chunk) {
 			return Ok(None);
 		}
-		self.find_text(chunk.as_str(), chunk.is_bytes())
+		self.find_text(chunk.as_str(), by_chars)
 	}
 
-	/// The first match in `text`, which is byte text when `bytes`.
-	fn find_text<'t>(&self, text: &'t str, bytes: bool) -> SedResult<Option<Match<'t>>> {
+	/// The first match in `text`; see [`Self::captures_iter_text`] for
+	/// `by_chars`.
+	fn find_text<'t>(&self, text: &'t str, by_chars: bool) -> SedResult<Option<Match<'t>>> {
 		match self {
 			Regex::Literal(m) => {
 				Ok(m.find(text.as_bytes()).map(|(start, end, text)| Match { start, end, text }))
@@ -7686,7 +7701,7 @@ impl Regex {
 
 			Regex::Byte(re) => {
 				let haystack = text.as_bytes();
-				let found = if bytes {
+				let found = if by_chars {
 					re.find_iter(haystack).find(|m| on_char_boundaries(text, m.start(), m.end()))
 				} else {
 					re.find(haystack)
@@ -7717,7 +7732,7 @@ impl Regex {
 					.map(|(_, start, end)| Match { start, end, text: &text[start..end] }))
 			},
 
-			Regex::NulLines(re) => Ok(first_in_nul_lines(text, |line| re.find_text(line, bytes))?
+			Regex::NulLines(re) => Ok(first_in_nul_lines(text, |line| re.find_text(line, by_chars))?
 				.map(|(offset, m)| m.shifted(offset))),
 		}
 	}
@@ -7767,13 +7782,18 @@ fn first_in_nul_lines<'t, T>(
 /// `text` reads the same way where the RE is ASCII and `bytes` is `None`.
 #[derive(Debug)]
 pub struct ScriptRegex {
-	text:  Regex,
-	bytes: Option<Regex>,
+	text:     Regex,
+	bytes:    Option<Regex>,
+	/// Whether GNU searches the RE a character at a time, so that no match of
+	/// `text` starts inside a character of a line that is UTF-8 (see
+	/// `bre::searched_by_byte`): `sed 's/[^é]*/-/g'` on `éa` prints `-é-`,
+	/// while `sed 's/x*/-/g'` on `é` prints `-\303-\251-`.
+	by_chars: bool,
 }
 
 impl ScriptRegex {
-	pub fn new(text: Regex, bytes: Option<Regex>) -> Self {
-		Self { text, bytes }
+	pub fn new(text: Regex, bytes: Option<Regex>, by_chars: bool) -> Self {
+		Self { text, bytes, by_chars }
 	}
 
 	/// The engine that reads `chunk`.
@@ -7784,6 +7804,12 @@ impl ScriptRegex {
 		}
 	}
 
+	/// Whether every match in `chunk` lies on its character boundaries; see
+	/// `Regex::captures_iter_text`.
+	fn by_chars(&self, chunk: &IOChunk) -> bool {
+		chunk.is_bytes() || self.by_chars
+	}
+
 	/// Check if the regex matches the content of the IOChunk.
 	pub fn is_match(&self, chunk: &IOChunk) -> SedResult<bool> {
 		self.engine(chunk).is_match(chunk)
@@ -7791,7 +7817,7 @@ impl ScriptRegex {
 
 	/// Return an iterator over capture groups.
 	pub fn captures_iter<'t>(&'t self, chunk: &'t IOChunk) -> SedResult<CaptureMatches<'t>> {
-		self.engine(chunk).captures_iter(chunk)
+		self.engine(chunk).captures_iter(chunk, self.by_chars(chunk))
 	}
 
 	/// Return the number of capture groups, including group 0, which both
@@ -7802,24 +7828,24 @@ impl ScriptRegex {
 
 	/// Return the elements of the first capture.
 	pub fn captures<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Captures<'t>>> {
-		self.engine(chunk).captures(chunk)
+		self.engine(chunk).captures(chunk, self.by_chars(chunk))
 	}
 
 	/// Return a non-capturing result for a single match.
 	pub fn find<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Match<'t>>> {
-		self.engine(chunk).find(chunk)
+		self.engine(chunk).find(chunk, self.by_chars(chunk))
 	}
 }
 
 /// Unified enum for holding either byte or fancy capture iterators.
 pub enum CaptureMatches<'t> {
 	Literal(Box<dyn Iterator<Item = SedResult<Captures<'t>>> + 't>),
-	/// The bytes engine's matches, and the line's byte text where it is
-	/// one, in which a match inside a character is passed over; see
-	/// [`on_char_boundaries`].
+	/// The bytes engine's matches, and the text whose character boundaries
+	/// each lies on, where they must (see `Regex::captures_iter_text`): a
+	/// match inside a character is passed over; see [`on_char_boundaries`].
 	Byte {
-		iter:      ByteCaptureMatches<'t, 't>,
-		byte_text: Option<&'t str>,
+		iter:       ByteCaptureMatches<'t, 't>,
+		boundaries: Option<&'t str>,
 	},
 	Fancy(FancyMatches<'t>),
 	Longest(LongestMatches<'t>),
@@ -7828,16 +7854,17 @@ pub enum CaptureMatches<'t> {
 
 /// The bookkeeping of a search for each match of a line in turn, which
 /// [`FancyMatches`] and [`LongestMatches`] share. GNU allows no empty match
-/// where the last match ended, goes on after an empty match at the next byte
-/// of a line that is UTF-8 and at the next character of byte text, and
-/// inside a character of a line that is UTF-8 finds an empty match too, and
+/// where the last match ended, and goes on after an empty match at the next
+/// character where every match lies on character boundaries (`by_chars`,
+/// see `Regex::captures_iter_text`), else at the next byte, inside a
+/// character of a line that is UTF-8, where it finds an empty match too, and
 /// only one: `printf '\303\251\n' | sed -E 's/a*|b/-/g'` prints
 /// `-\303-\251-`. fancy-regex goes on at the next character, so inside a
 /// character `InsideChars` answers.
 struct Stepping<'t> {
 	text:     &'t str,
-	/// Whether `text` is byte text.
-	bytes:    bool,
+	/// Whether every match lies on the text's character boundaries.
+	by_chars: bool,
 	pos:      usize,
 	/// Where the last match ended.
 	last_end: Option<usize>,
@@ -7856,8 +7883,8 @@ enum Stepped<'t, T> {
 }
 
 impl<'t> Stepping<'t> {
-	fn new(text: &'t str, bytes: bool, done: bool) -> Self {
-		Self { text, bytes, pos: 0, last_end: None, inside: None, done }
+	fn new(text: &'t str, by_chars: bool, done: bool) -> Self {
+		Self { text, by_chars, pos: 0, last_end: None, inside: None, done }
 	}
 
 	/// The next match, or `None` once the search has ended. At a position
@@ -7899,11 +7926,11 @@ impl<'t> Stepping<'t> {
 				return Ok(None);
 			};
 			if start == end && self.last_end == Some(start) {
-				self.pos = after_empty(self.text, self.bytes, start);
+				self.pos = after_empty(self.text, self.by_chars, start);
 				continue;
 			}
 			self.last_end = Some(end);
-			self.pos = if end > start { end } else { after_empty(self.text, self.bytes, end) };
+			self.pos = if end > start { end } else { after_empty(self.text, self.by_chars, end) };
 			return Ok(Some(Stepped::Found(found)));
 		}
 		Ok(None)
@@ -7990,13 +8017,13 @@ impl<'t> LongestMatches<'t> {
 /// The matches of a [`Regex::NulLines`] pattern: those of each line of the
 /// text in turn, a line ending at a NUL.
 pub struct NulLineMatches<'t> {
-	re:      &'t Regex,
+	re:       &'t Regex,
 	/// The lines not searched yet.
-	lines:   NulSplit<'t>,
-	/// Whether the text is byte text.
-	bytes:   bool,
+	lines:    NulSplit<'t>,
+	/// Whether every match lies on the text's character boundaries.
+	by_chars: bool,
 	/// Where the line being searched starts, and its matches.
-	current: Option<(usize, CaptureMatches<'t>)>,
+	current:  Option<(usize, CaptureMatches<'t>)>,
 }
 
 impl<'t> Iterator for NulLineMatches<'t> {
@@ -8011,7 +8038,7 @@ impl<'t> Iterator for NulLineMatches<'t> {
 				return Some(found.map(|caps| Captures::Shifted { caps: Box::new(caps), offset }));
 			}
 			let (offset, line) = self.lines.next()?;
-			self.current = Some((offset, self.re.captures_iter_text(line, self.bytes)));
+			self.current = Some((offset, self.re.captures_iter_text(line, self.by_chars)));
 		}
 	}
 }
@@ -8022,10 +8049,10 @@ impl<'t> Iterator for CaptureMatches<'t> {
 	fn next(&mut self) -> Option<Self::Item> {
 		match self {
 			CaptureMatches::Literal(iter) => iter.next(),
-			CaptureMatches::Byte { iter, byte_text } => {
-				let byte_text = *byte_text;
+			CaptureMatches::Byte { iter, boundaries } => {
+				let boundaries = *boundaries;
 				iter.find(|caps| {
-					byte_text.is_none_or(|text| {
+					boundaries.is_none_or(|text| {
 						caps.get(0).is_some_and(|m| on_char_boundaries(text, m.start(), m.end()))
 					})
 				})
@@ -9727,11 +9754,13 @@ fn process_file(
 					break;
 				},
 				'Q' => {
-					// Quit immediatelly.
+					// Quit at once, as GNU sed does, writing neither the pattern
+					// space, nor the text `a` and `r` queued, nor the newline a
+					// line printed before lacks: `sed -e '3a foo' -e 3Q` on a file
+					// holding `a\nb` and one holding `c\n` prints `a\nb`.
 					host.fail(*extract_variant!(command, Number) as i32);
 					context.stop_processing = true;
-					context.quiet = true;
-					break;
+					return Ok(());
 				},
 				'r' => {
 					// Copy the file to standard output at a later point.

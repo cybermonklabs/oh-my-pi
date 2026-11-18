@@ -18,6 +18,7 @@ import { computeDefaultSessionDir } from "./session-paths";
 import {
 	defaultSessionStorage,
 	FileSessionStorage,
+	retryRacedRead,
 	type SessionStorage,
 	type SessionStorageStat,
 } from "./session-storage";
@@ -507,28 +508,35 @@ async function scanSessionFile(
 		// large leading entry (memory recall, attachment) or a reply (after a
 		// `/skill:` invocation), and an assistant record that fits in neither
 		// window. Recover both in one line-boundary pass rather than trusting the gap.
-		let needPrompt = !firstMessage;
-		let needTurn = assistantTurns === 0;
+		const needPrompt = !firstMessage;
+		const needTurn = assistantTurns === 0;
 		if ((needPrompt || needTurn) && size > SESSION_LIST_PREFIX_BYTES && storage.scanLines) {
+			const scanLines = storage.scanLines.bind(storage);
 			try {
-				await storage.scanLines(file, line => {
-					const message = parseTurnLine(line);
-					if (message?.role === "assistant" && needTurn) {
-						assistantTurns = 1;
-						needTurn = false;
-					} else if (message?.role === "user" && needPrompt) {
-						// Cap at what a prompt read from the prefix could hold.
-						const text = textContent(message.content, " ").slice(0, SESSION_LIST_PREFIX_BYTES);
-						if (text) {
-							firstMessage = text;
-							allMessages.unshift(text);
-							needPrompt = false;
+				// A full rewrite between two chunks fails the scan: scan again from the
+				// start, so the prompt and the reply it finds come from one body.
+				const found = await retryRacedRead(async (): Promise<{ prompt: string; turn: boolean }> => {
+					let prompt = "";
+					let turn = false;
+					await scanLines(file, line => {
+						const message = parseTurnLine(line);
+						if (message?.role === "assistant" && needTurn) {
+							turn = true;
+						} else if (message?.role === "user" && needPrompt && !prompt) {
+							// Cap at what a prompt read from the prefix could hold.
+							prompt = textContent(message.content, " ").slice(0, SESSION_LIST_PREFIX_BYTES);
 						}
-					}
-					return !needPrompt && !needTurn;
+						return (!needPrompt || prompt !== "") && (!needTurn || turn);
+					});
+					return { prompt, turn };
 				});
+				if (found.turn) assistantTurns = 1;
+				if (found.prompt) {
+					firstMessage = found.prompt;
+					allMessages.unshift(found.prompt);
+				}
 			} catch {
-				// Backend unreadable: keep the bounded-window evidence.
+				// Backend unreadable, or raced past the retries: keep the bounded-window evidence.
 			}
 		}
 		firstMessage ||= extractFirstDisplayMessageFromPrefix(content) ?? "";
@@ -1034,16 +1042,20 @@ async function lastActivity(session: SessionInfo, storage: SessionStorage): Prom
 async function holdsEntry(file: string, id: string, storage: SessionStorage): Promise<boolean> {
 	let found = false;
 	try {
-		await visitEntriesFromFile(
-			file,
-			entry => {
-				// The header's id is the session's, never an entry's.
-				if (entry.type === "session" || entry.id !== id) return;
-				found = true;
-				return false;
-			},
-			storage,
-		);
+		// A full rewrite between two chunks of a long transcript fails the read: look again from its start.
+		await retryRacedRead(() => {
+			found = false;
+			return visitEntriesFromFile(
+				file,
+				entry => {
+					// The header's id is the session's, never an entry's.
+					if (entry.type === "session" || entry.id !== id) return;
+					found = true;
+					return false;
+				},
+				storage,
+			);
+		});
 	} catch {
 		return false;
 	}
