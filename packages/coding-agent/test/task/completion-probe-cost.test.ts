@@ -13,13 +13,17 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import * as path from "node:path";
 import { mkdir } from "node:fs/promises";
 
+/**
+ * A reply whose prompt the cache held, large enough that a probe's added question keeps 95% of the probe's prompt
+ * in the cache (completion-probe-cache-life.test.ts covers that gate).
+ */
 function usage(cost: number): Usage {
 	return {
 		input: 10,
 		output: 2,
-		cacheRead: 0,
+		cacheRead: 100_000,
 		cacheWrite: 0,
-		totalTokens: 12,
+		totalTokens: 100_012,
 		cost: { input: cost, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
 	};
 }
@@ -92,6 +96,9 @@ describe("completion probe cost persistence", () => {
 				assistantMessage: AssistantMessage;
 			}>();
 			const probeRequest = vi.spyOn(session, "runEphemeralTurn").mockReturnValue(pendingProbe.promise);
+			// This test is about the billing of a probe that went out, not the cache lifetime gate; its fixture
+			// model may declare no lifetime (completion-probe-cache-life.test.ts covers that gate).
+			vi.spyOn(session, "promptCacheExpiresAt").mockReturnValue(Number.POSITIVE_INFINITY);
 
 			startCompletionProbe({
 				session: () => session ?? null,
