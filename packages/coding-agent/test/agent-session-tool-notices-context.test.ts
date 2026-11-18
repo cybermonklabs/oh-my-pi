@@ -64,14 +64,16 @@ function copies(request: MessagesRequest, text: string): number {
 
 /**
  * Opens a session on the gateway's claude-opus-5-5 with `read` and `bash`, whose prompt binds once it answered,
- * answering each request with `reply` of its number. MCP discovery applies its tool set (none here) before the first
- * prompt, as in a session with MCP servers configured, so the first reply binds a prompt the session committed.
+ * answering each request with `reply` of its number. With `startupMcpRefresh`, MCP discovery applies its tool set
+ * (none here) before the first prompt, as in a session with MCP servers configured; without it the first reply binds
+ * the prompt the session was created with.
  */
 async function openSession(
 	tempDir: TempDir,
 	settings: Settings,
 	contextWindow: number,
 	reply: (turn: number) => Response,
+	startupMcpRefresh = true,
 ): Promise<{ session: AgentSession; requests: MessagesRequest[]; close: () => Promise<void> }> {
 	await Bun.write(tempDir.join("models.yml"), gatewayModelsYml(contextWindow));
 	const gateway = mockGatewayFetch(reply);
@@ -90,7 +92,7 @@ async function openSession(
 		contextFiles: [],
 		skills: [],
 	});
-	await session.refreshMCPTools([]);
+	if (startupMcpRefresh) await session.refreshMCPTools([]);
 	return {
 		session,
 		requests: gateway.requests,
@@ -106,6 +108,35 @@ describe("tool-roster and xd:// mount notices a request's context lacks", () => 
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
+
+	it.each(CASES)(
+		"keeps the prompt the session was created with through the first $label change after a reply",
+		async ({ change, marker }) => {
+			using tempDir = TempDir.createSync("@pi-tool-notices-startup-prompt-");
+			// No MCP or extension tool change at startup: no rebuild has committed a prompt before the first reply.
+			const { session, requests, close } = await openSession(
+				tempDir,
+				Settings.isolated({ "providers.cacheRetention": "long", "compaction.enabled": false }),
+				1_000_000,
+				turn => answer(turn, { cacheWriteTokens: 100 }),
+				false,
+			);
+			try {
+				await session.prompt("First.");
+				await change(session);
+				await session.prompt("Second.");
+
+				const [first, second] = requests;
+				if (!first || !second) throw new Error("Expected two requests");
+				// The reply bound the startup prompt: the change is announced, and the prompt keeps its bytes.
+				expect(withoutCacheControl(second.system)).toBe(withoutCacheControl(first.system));
+				expect(copies(second, marker)).toBe(1);
+			} finally {
+				await close();
+			}
+		},
+		30_000,
+	);
 
 	it.each(CASES)(
 		"sends the $label notice again after /tree to a branch without it",

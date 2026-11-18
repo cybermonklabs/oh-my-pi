@@ -14351,7 +14351,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const previousAutoResolvedLevel = this.autoResolvedThinkingLevel();
 		const previousServiceTierByFamily = this.serviceTierByFamily;
 		const previousTools = [...this.agent.state.tools];
-		const previousBaseSystemPrompt = this.#tools.baseSystemPrompt;
+		const previousBasePrompt = this.#tools.basePromptState;
 		const previousSystemPrompt = this.agent.state.systemPrompt;
 		const previousBaseSystemPromptBeforeMemoryPromotion = this.#memory.promotionSnapshot;
 		const previousFreshProviderSessionId = this.#freshProviderSessionId;
@@ -14623,7 +14623,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#syncAgentSessionId(previousSessionState.sessionId, false);
 			this.#memory.rekeyForCurrentSessionId();
 			this.agent.setTools(previousTools);
-			this.#tools.setBaseSystemPrompt(previousBaseSystemPrompt);
+			// The prompt with what it lists, so the notices compare against what the request carries.
+			this.#tools.restoreBasePromptState(previousBasePrompt);
 			this.#memory.restorePromotionSnapshot(previousBaseSystemPromptBeforeMemoryPromotion);
 			this.agent.setSystemPrompt(previousSystemPrompt);
 			this.agent.replaceMessages(previousAgentMessages);

@@ -780,6 +780,22 @@ interface PromptListing {
 	readonly xdevNames: ReadonlySet<string>;
 }
 
+/**
+ * The committed base prompt with what a commit records beside it ({@link SessionTools.basePromptState}): what it
+ * lists, the roster it rendered and whether a roster change is held out of it, the surface the tool definitions render
+ * from, the tool signature it was applied for, and the model key and inline-descriptor decision it was rendered with.
+ */
+export interface BasePromptState {
+	readonly systemPrompt: string[];
+	readonly listing: PromptListing;
+	readonly roster: PromptRoster | undefined;
+	readonly rosterHeld: boolean;
+	readonly surface: PromptSurface;
+	readonly appliedToolSignature: string | undefined;
+	readonly modelKey: string | undefined;
+	readonly inlineDescriptors: boolean | undefined;
+}
+
 /** Owns tool registration, presentation, prompt rebuilding, skills, and permissions. */
 export class SessionTools {
 	readonly #host: SessionToolsHost;
@@ -802,6 +818,12 @@ export class SessionTools {
 	 * {@link #implicitRebuildBinding}.
 	 */
 	#restoredTranscript: { reply: AgentMessage; promptDigest: string } | undefined;
+	/**
+	 * Newest assistant reply restored with the transcript this session was created with, recorded prompt or not,
+	 * until this session's first primary model call: a reply not produced under the startup prompt
+	 * ({@link #implicitRebuildBinding}).
+	 */
+	#restoredReply: AgentMessage | undefined;
 	/** Digests of the last primary model call, until its reply ends. */
 	#capturedCall: ModelCallDigests | undefined;
 	/** Digests of the call each primary reply with provider output was produced by. */
@@ -1002,7 +1024,11 @@ export class SessionTools {
 			xdevNames: new Set(this.#xdev?.mountedNames),
 		};
 		this.#basePromptListing = this.#startupListing;
+		// A reply binds the startup prompt as it binds a rebuilt one ({@link #implicitRebuildBinding}): a roster change
+		// held out of it re-renders against the roster it was built from.
+		this.#recordPromptRoster(this.#startupListing.toolNames);
 		const restoredReply = this.#latestReply();
+		this.#restoredReply = restoredReply;
 		const restoredPromptDigest = restoredReply && this.recordedPromptDigest();
 		this.#restoredTranscript =
 			restoredReply && restoredPromptDigest
@@ -1040,6 +1066,36 @@ export class SessionTools {
 	/** Replaces the controller-owned base prompt without applying it to the agent. */
 	setBaseSystemPrompt(prompt: string[]): void {
 		this.#baseSystemPrompt = prompt;
+	}
+
+	/** The committed base prompt and what a commit records beside it, for a caller that may have to put them back. */
+	get basePromptState(): BasePromptState {
+		return {
+			systemPrompt: this.#baseSystemPrompt,
+			listing: this.#basePromptListing,
+			roster: this.#basePromptRoster,
+			rosterHeld: this.#promptRosterHeld,
+			surface: this.#promptSurface,
+			appliedToolSignature: this.#lastAppliedToolSignature,
+			modelKey: this.#promptModelKey,
+			inlineDescriptors: this.#promptInlineDescriptors,
+		};
+	}
+
+	/**
+	 * Puts back a base prompt with what its commit recorded ({@link basePromptState}), without applying it to the
+	 * agent: a rolled-back session switch restores the prompt a rebuild replaced, and the roster and mount notices then
+	 * compare against what that prompt lists, not the rebuild's.
+	 */
+	restoreBasePromptState(state: BasePromptState): void {
+		this.#baseSystemPrompt = state.systemPrompt;
+		this.#basePromptListing = state.listing;
+		this.#basePromptRoster = state.roster;
+		this.#promptRosterHeld = state.rosterHeld;
+		this.#promptSurface = state.surface;
+		this.#lastAppliedToolSignature = state.appliedToolSignature;
+		this.#promptModelKey = state.modelKey;
+		this.#promptInlineDescriptors = state.inlineDescriptors;
 	}
 
 	/**
@@ -2381,6 +2437,7 @@ export class SessionTools {
 	 */
 	recordPrimaryModelCall(prompt: string[]): void {
 		this.#restoredTranscript = undefined;
+		this.#restoredReply = undefined;
 		const promptDigest = systemPromptDigest(this.baseOfSystemPrompt(prompt));
 		this.#capturedCall = { prompt: promptDigest, tools: this.#host.toolDefinitionsDigest() };
 		if (this.#heldSettingsRebuild) return;
@@ -2646,6 +2703,7 @@ export class SessionTools {
 	 */
 	leaveRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
+		this.#restoredReply = undefined;
 		this.#basePromptRestored = false;
 		const restored = this.#restoredPrompt;
 		if (!restored) return;
@@ -2656,6 +2714,7 @@ export class SessionTools {
 	/** Drops retained transcript references when the session is disposed. */
 	releaseRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
+		this.#restoredReply = undefined;
 		this.#recordedDigestScan = undefined;
 		this.#recordedToolsDigestScan = undefined;
 		this.#storedPromptScan = undefined;
@@ -2663,22 +2722,28 @@ export class SessionTools {
 
 	/**
 	 * What an implicit prompt rebuild must keep when the model binds signed
-	 * thinking to its prompt prefix. `"free"`: the model does not bind, no
-	 * prompt is committed yet (neither a rebuild nor a restored transcript
-	 * prompt), or the transcript holds no reply. `"frozen"`: the transcript may
-	 * be bound to the current prompt. Otherwise the newest reply is the restored
-	 * one and no primary model call has run: a resumed process builds its base
-	 * prompt before tools that register late (extension tools, MCP servers), so
-	 * a rebuild may commit only when it reproduces the prompt the transcript was
-	 * sent with. A transcript restored without a recorded digest, or switched in
-	 * later, stays frozen.
+	 * thinking to its prompt prefix. `"free"`: the model does not bind, the
+	 * transcript holds no reply, or its newest reply is one this session was
+	 * created with whose prompt the transcript does not record, while no prompt is
+	 * committed yet: that reply was not produced under the startup prompt, so the
+	 * startup build may still take its place. `"frozen"`: the transcript may be
+	 * bound to the current prompt, the one the session was created with included:
+	 * as for a held settings rebuild ({@link #promptBound}), a reply produced under
+	 * it binds it whether or not a rebuild ever committed one. Otherwise the
+	 * newest reply is the restored one and no primary model call has run: a
+	 * resumed process builds its base prompt before tools that register late
+	 * (extension tools, MCP servers), so a rebuild may commit only when it
+	 * reproduces the prompt the transcript was sent with. A transcript restored
+	 * without a recorded digest, once a prompt is committed, or switched in later,
+	 * stays frozen.
 	 */
 	#implicitRebuildBinding(): "free" | "frozen" | { promptDigest: string } {
 		if (this.#host.model()?.thinking?.prefixBinding !== true) return "free";
-		if (this.#lastAppliedToolSignature === undefined && !this.#basePromptRestored) return "free";
 		const latest = this.#latestReply();
 		if (latest === undefined) return "free";
-		return latest === this.#restoredTranscript?.reply ? this.#restoredTranscript : "frozen";
+		if (latest === this.#restoredTranscript?.reply) return this.#restoredTranscript;
+		const committed = this.#lastAppliedToolSignature !== undefined || this.#basePromptRestored;
+		return latest === this.#restoredReply && !committed ? "free" : "frozen";
 	}
 
 	/**
