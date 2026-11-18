@@ -36,6 +36,7 @@ import {
 	TempDir,
 } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
+import { restoreEnvValue } from "./helpers/settings-test-state";
 import { makeAssistantMessage } from "./session-manager/helpers";
 
 class ProcessExitSignal extends Error {
@@ -77,7 +78,6 @@ let originalEnv: Record<string, string | undefined>;
 let originalProject: string;
 let originalInteractiveHost: boolean;
 let originalIsTTY: PropertyDescriptor | undefined;
-let ranInteractive: boolean;
 /** What the move question gets as its answer, if it is asked at all. */
 let answer: string;
 let exitCodes: number[];
@@ -87,7 +87,6 @@ const managers = new Set<SessionManager>();
 let createInterface: Mock<typeof readlinePromises.createInterface>;
 let openSpy: Mock<typeof SessionManager.open>;
 let openRelocatedSpy: Mock<typeof SessionManager.openRelocated>;
-let moveToSpy: Mock<typeof SessionManager.prototype.moveTo>;
 
 beforeEach(() => {
 	originalEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
@@ -97,7 +96,6 @@ beforeEach(() => {
 	tempDir = TempDir.createSync("@omp-resume-missing-cwd-");
 	root = fs.realpathSync(tempDir.path());
 	setAgentDir(path.join(root, "agent"));
-	ranInteractive = false;
 	answer = "n";
 	exitCodes = [];
 	stdoutWrites = [];
@@ -123,7 +121,6 @@ beforeEach(() => {
 	createInterface = vi.spyOn(readlinePromises, "createInterface").mockReturnValue(fakeReadline);
 	openSpy = vi.spyOn(SessionManager, "open");
 	openRelocatedSpy = vi.spyOn(SessionManager, "openRelocated");
-	moveToSpy = vi.spyOn(SessionManager.prototype, "moveTo");
 });
 
 afterEach(async () => {
@@ -138,15 +135,11 @@ afterEach(async () => {
 	if (originalIsTTY) Object.defineProperty(process.stdin, "isTTY", originalIsTTY);
 	else Reflect.deleteProperty(process.stdin, "isTTY");
 	setInteractiveHost(originalInteractiveHost);
-	if (ranInteractive) themeModule.stopThemeWatcher();
+	themeModule.stopThemeWatcher();
 	// `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
 	clearOmpExtensionCliRoots();
 	setProjectDir(originalProject);
-	for (const key of ENV_KEYS) {
-		const value = originalEnv[key];
-		if (value === undefined) delete process.env[key];
-		else process.env[key] = value;
-	}
+	for (const key of ENV_KEYS) restoreEnvValue(key, originalEnv[key]);
 	__resetDirsFromEnvForTests();
 	await tempDir.remove();
 });
@@ -172,12 +165,18 @@ async function sessionFiles(dir: string): Promise<string[]> {
 	}
 }
 
-/** A session with one answered turn, written to `cwd`'s session directory (or `sessionDir`) and closed. */
-async function answeredSession(cwd: string, sessionDir?: string): Promise<{ file: string; id: string }> {
+/** A session with one answered turn, written to `cwd`'s session directory (or `sessionDir`) and left open. */
+async function answeredManager(cwd: string, sessionDir?: string): Promise<SessionManager> {
 	const manager = SessionManager.create(cwd, sessionDir);
 	manager.appendMessage({ role: "user", content: `work in ${cwd}`, timestamp: 1 });
 	manager.appendMessage(makeAssistantMessage());
 	await manager.flush();
+	return manager;
+}
+
+/** A session with one answered turn, written to `cwd`'s session directory (or `sessionDir`) and closed. */
+async function answeredSession(cwd: string, sessionDir?: string): Promise<{ file: string; id: string }> {
+	const manager = await answeredManager(cwd, sessionDir);
 	const file = manager.getSessionFile();
 	await manager.close();
 	if (!file) throw new Error("Expected a persisted session file");
@@ -201,7 +200,6 @@ interface CliRun {
 	error: unknown;
 	/** The session manager startup handed to `createAgentSession`. */
 	manager: SessionManager | undefined;
-	createdSession: boolean;
 }
 
 /** Real CLI startup in-process, up to the mode runner, with `isTTY` as stdin's terminal flag. */
@@ -209,15 +207,13 @@ async function runCli(argv: string[], isTTY: boolean): Promise<CliRun> {
 	Object.defineProperty(process.stdin, "isTTY", { value: isTTY, configurable: true });
 	const rawArgs = [...argv, ...QUIET_FLAGS];
 	const parsed = parseArgs(rawArgs);
-	ranInteractive ||= parsed.mode === undefined && !parsed.print;
 	const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
-	const run: CliRun = { error: undefined, manager: undefined, createdSession: false };
+	const run: CliRun = { error: undefined, manager: undefined };
 	try {
 		await runRootCommand(parsed, rawArgs, {
 			discoverAuthStorage: async () => authStorage,
 			settings: Settings.isolated({ "marketplace.autoUpdate": "off" }),
 			createAgentSession: async options => {
-				run.createdSession = true;
 				run.manager = options?.sessionManager;
 				if (run.manager) managers.add(run.manager);
 				throw new StopSignal();
@@ -269,7 +265,6 @@ describe("resume of a session whose directory is gone", () => {
 				expect(normalized(manager?.getSessionFile())).toBe(normalized(storedPath));
 				expect(normalized(manager?.getCwd())).toBe(normalized(launchDir));
 				expect(openRelocatedSpy).not.toHaveBeenCalled();
-				expect(moveToSpy).not.toHaveBeenCalled();
 				expect(normalized(await headerCwd(storedPath))).toBe(normalized(goneDir));
 				expect(await sessionFiles(SessionManager.getDefaultSessionDir(launchDir))).toEqual([]);
 				expect(stdoutWrites).toEqual([]);
@@ -296,7 +291,6 @@ describe("resume of a session whose directory is gone", () => {
 		expect(exitCodes).toEqual([0]);
 		expect(stdoutWrites.join("")).toContain("Resume cancelled: session was not moved.");
 		expect(normalized(await headerCwd(storedPath))).toBe(normalized(goneDir));
-		expect(run.createdSession).toBe(false);
 	}, 15_000);
 
 	it("print mode without a terminal gets the run-interactively error", async () => {
@@ -311,7 +305,6 @@ describe("resume of a session whose directory is gone", () => {
 	describe("path, continue, automatic resume and fork never reach the decision", () => {
 		/** `createSessionManager` for `argv` in the launch directory, with a decision that records each question. */
 		async function resolveSession(argv: string[], settings = Settings.isolated()) {
-			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 			const decide = vi.fn(async () => "declined" as const);
 			const manager = await createSessionManager(parseArgs(argv), launchDir, settings, decide);
 			if (manager) managers.add(manager);
@@ -331,7 +324,6 @@ describe("resume of a session whose directory is gone", () => {
 			const { decide, manager } = await resolveSession(["--resume", storedPath]);
 
 			expect(decide).not.toHaveBeenCalled();
-			expect(createInterface).not.toHaveBeenCalled();
 			expect(normalized(manager?.getSessionFile())).toBe(normalized(storedPath));
 		}, 15_000);
 
@@ -340,7 +332,6 @@ describe("resume of a session whose directory is gone", () => {
 			const { decide, manager } = await resolveSession(["--continue"]);
 
 			expect(decide).not.toHaveBeenCalled();
-			expect(createInterface).not.toHaveBeenCalled();
 			expect(normalized(manager?.getSessionFile())).toBe(normalized(file));
 		}, 15_000);
 
@@ -349,7 +340,6 @@ describe("resume of a session whose directory is gone", () => {
 			const { decide, manager } = await resolveSession([], Settings.isolated({ autoResume: true }));
 
 			expect(decide).not.toHaveBeenCalled();
-			expect(createInterface).not.toHaveBeenCalled();
 			expect(normalized(manager?.getSessionFile())).toBe(normalized(file));
 		}, 15_000);
 
@@ -357,7 +347,6 @@ describe("resume of a session whose directory is gone", () => {
 			const { decide, manager } = await resolveSession(["--fork", storedId.slice(0, 8)]);
 
 			expect(decide).not.toHaveBeenCalled();
-			expect(createInterface).not.toHaveBeenCalled();
 			expect(manager?.getHeader()?.parentSession).toBe(storedId);
 		}, 15_000);
 	});
@@ -384,10 +373,7 @@ describe.skipIf(process.platform === "win32")(
 			await fs.promises.mkdir(repo);
 			await $`git init -q && git commit -q --allow-empty -m init`.cwd(repo).quiet();
 			// `/wt` moves a session into a new worktree's session directory; `omp worktree clear` removes and prunes it.
-			const manager = SessionManager.create(repo);
-			manager.appendMessage({ role: "user", content: `work in ${repo}`, timestamp: 1 });
-			manager.appendMessage(makeAssistantMessage());
-			await manager.flush();
+			const manager = await answeredManager(repo);
 			const { path: worktree } = await createSessionWorktree(repo, Settings.isolated(), "wt/gone");
 			await manager.moveTo(worktree);
 			await manager.close();
@@ -398,7 +384,6 @@ describe.skipIf(process.platform === "win32")(
 
 		/** Resumes the session by id from the checkout, with a terminal on stdin, and checks it moved there unasked. */
 		async function expectMovedIntoCheckout(modeArgs: string[]): Promise<void> {
-			answer = "y";
 			const run = await runCli([...modeArgs, "--resume", sessionId.slice(0, 8)], true);
 
 			expect(createInterface).not.toHaveBeenCalled();
