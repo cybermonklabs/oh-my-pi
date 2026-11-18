@@ -3450,6 +3450,18 @@ export class SessionManager {
 	}
 
 	/**
+	 * {@link flushSync}, then, on a storage that only queues the publish
+	 * (indexed backends such as SQL), the wait for that publish: the promise
+	 * settles once {@link flush} has seen the store take every queued write, and
+	 * rejects when one failed. `undefined` when the synchronous flush alone made
+	 * the session durable (file and memory storage).
+	 */
+	flushSyncThenConfirm(): Promise<void> | undefined {
+		this.flushSync();
+		return this.#storage.defersSyncPublish ? this.flush() : undefined;
+	}
+
+	/**
 	 * Drop only session files that this manager saw materialized for a draft and
 	 * that still contain no durable conversation or extension state. Explicit
 	 * ensureOnDisk() records (ACP session/new, handoff) stay resumable.
