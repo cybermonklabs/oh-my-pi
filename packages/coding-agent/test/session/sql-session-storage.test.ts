@@ -35,14 +35,23 @@ async function createSqlite(): Promise<{ client: InstanceType<typeof SQL>; stora
 	return { client, storage };
 }
 
-/** Wrap a SQLite client so every statement the storage issues is recorded. */
-function recordQueries(client: InstanceType<typeof SQL>): { client: SqlSessionStorageClient; queries: string[] } {
+/**
+ * Wrap a SQLite client so every statement the storage issues is recorded;
+ * `onRows` sees the rows of each statement run on the client itself, outside
+ * a transaction.
+ */
+function recordQueries(
+	client: InstanceType<typeof SQL>,
+	onRows?: (query: string, rows: unknown[]) => void,
+): { client: SqlSessionStorageClient; queries: string[] } {
 	const queries: string[] = [];
 	const wrapped: SqlSessionStorageClient = {
 		options: client.options,
-		unsafe(query, values) {
+		async unsafe(query, values) {
 			queries.push(query);
-			return client.unsafe(query, values);
+			const rows = await client.unsafe(query, values);
+			onRows?.(query, rows);
+			return rows;
 		},
 		transaction(callback) {
 			return client.transaction(async transaction =>
@@ -406,22 +415,11 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		const raw = new SQL("sqlite::memory:");
 		let paged = 0;
 		let pages = 0;
-		const client: SqlSessionStorageClient = {
-			options: raw.options,
-			async unsafe(query, values) {
-				const rows = await raw.unsafe(query, values);
-				if (query.startsWith("SELECT start_offset, content FROM")) {
-					pages++;
-					for (const row of rows as Array<{ content: string }>) paged += Buffer.byteLength(row.content);
-				}
-				return rows;
-			},
-			transaction(callback) {
-				return raw.transaction(async transaction =>
-					callback({ unsafe: (query, values) => transaction.unsafe(query, values) }),
-				);
-			},
-		};
+		const { client } = recordQueries(raw, (query, rows) => {
+			if (!query.startsWith("SELECT start_offset, content FROM")) return;
+			pages++;
+			for (const row of rows as Array<{ content: string }>) paged += Buffer.byteLength(row.content);
+		});
 		const storage = await SqlSessionStorage.create({ client });
 		const path = "/sessions/p/windowed.jsonl";
 		const part = 100 * 1024;
@@ -458,27 +456,14 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 			Buffer.byteLength(legacy),
 		]);
 		let fetched = 0;
-		const count = (rows: unknown[]): void => {
+		const { client } = recordQueries(raw, (_query, rows) => {
 			for (const row of rows as Array<Record<string, unknown>>) {
 				for (const value of Object.values(row)) {
 					if (typeof value === "string") fetched += Buffer.byteLength(value);
 					else if (value instanceof Uint8Array) fetched += value.byteLength;
 				}
 			}
-		};
-		const client: SqlSessionStorageClient = {
-			options: raw.options,
-			async unsafe(query, values) {
-				const rows = await raw.unsafe(query, values);
-				count(rows);
-				return rows;
-			},
-			transaction(callback) {
-				return raw.transaction(async transaction =>
-					callback({ unsafe: (query, values) => transaction.unsafe(query, values) }),
-				);
-			},
-		};
+		});
 		const storage = await SqlSessionStorage.create({ client });
 		const writer = storage.openWriter(path);
 		await writer.append("tail\n");
