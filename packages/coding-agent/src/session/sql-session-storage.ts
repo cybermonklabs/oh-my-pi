@@ -225,7 +225,10 @@ interface DialectQueries {
 	 * The parts that start from `@next` up to, not including, `@end`, in
 	 * `start_offset` order: one page. On PostgreSQL and SQLite the page is
 	 * empty unless the part at `@anchor` still has the row identity
-	 * `@anchor_id`, checked in the same statement; MySQL does not check it.
+	 * `@anchor_id`, checked in the same statement; MySQL does not check it. On
+	 * SQLite and MySQL it is also empty unless the part at `@last` (the last
+	 * one the read has fetched, -1 before the first page) still holds
+	 * `@last_content`.
 	 */
 	readParts: Statement;
 	/**
@@ -1202,6 +1205,14 @@ function buildQueries(
 					? `AND EXISTS (SELECT 1 FROM ${parts} AS p WHERE p.path = @path ` +
 						`AND p.start_offset = ${bigint("@anchor")} AND ${partId} = @anchor_id) `
 					: "") +
+				// PostgreSQL's `xmin` changes with every insert, so the first part's identity is enough there.
+				// MySQL compares bytes: utf8mb4_bin pads with spaces, so `=` there ignores trailing ones.
+				(adapter === "postgres"
+					? ""
+					: `AND (@last < 0 OR EXISTS (SELECT 1 FROM ${parts} AS q WHERE q.path = @path AND q.start_offset = @last ` +
+						(adapter === "mysql"
+							? "AND CAST(q.content AS BINARY) = CAST(@last_content AS BINARY))) "
+							: "AND q.content = @last_content)) ")) +
 				"ORDER BY start_offset",
 		),
 		partRowids:
@@ -2970,15 +2981,20 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * a part that does not start where the previous one ended, or parts that
 	 * end short of the size mean a full write or a delete replaced the parts
 	 * during the read; it then fails with {@link SessionReadConflictError}
-	 * instead of yielding a mix of two bodies. MySQL has no row identity, so
-	 * there only those checks apply, and a full write that keeps the size and
-	 * every part's start, made between two pages, goes unseen. SQLite gives a
-	 * new row the largest rowid plus one, so a delete, or a full write that
-	 * leaves no part (a truncate), followed by new parts at the same path,
-	 * made between two pages, can give the new parts the rowids of the deleted
-	 * ones when those were the table's newest; then only those checks apply
-	 * there too, and new parts that keep the size and every part's start go
-	 * unseen.
+	 * instead of yielding a mix of two bodies.
+	 *
+	 * PostgreSQL's `xmin` changes with every insert, so that check sees every
+	 * replacement there. SQLite gives a new row the largest rowid plus one, so
+	 * after a delete, or a full write that leaves no part (a truncate), new
+	 * parts reuse the deleted ones' rowids when those were the table's newest,
+	 * and offsets and size can come out the same too; MySQL has no row
+	 * identity at all. So on SQLite and MySQL the query of each page also
+	 * checks, in the same statement, that the last part already fetched is
+	 * still at its offset with the same bytes: a replacement whose bytes
+	 * differ there is a read conflict whatever its rowids, offsets and size.
+	 * What can go unseen on those two is a replacement that holds exactly the
+	 * bytes of that last part at its offset while it differs both before and
+	 * after it.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const [row] = (await this.#exclusive(() =>
@@ -2997,17 +3013,20 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const anchor = { anchor: firstPart, anchor_id: row.first_id };
 		let next = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
 		let skip = Math.max(0, fromByte - next);
+		// The last part fetched, which the next page's query finds unchanged (SQLite and MySQL); none yet.
+		let last = { last: -1, last_content: "" };
 		for (let span = FIRST_PAGE_SPAN_BYTES; next < size; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
 			// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
 			const end = Math.max(next, fromByte) + span;
 			const parts = (await this.#exclusive(() =>
-				this.#readOne(this.#q.readParts, { path, next, end, ...anchor }),
+				this.#readOne(this.#q.readParts, { path, next, end, ...anchor, ...last }),
 			)) as PartRow[];
 			if (parts.length === 0) throw new SessionReadConflictError(path);
 			for (const part of parts) {
 				const start = rowNumber(part.start_offset);
 				if (start !== next) throw new SessionReadConflictError(path);
 				if (start >= size) break;
+				last = { last: start, last_content: part.content };
 				const bytes = Buffer.from(part.content, "utf8");
 				next = start + bytes.byteLength;
 				if (skip >= bytes.byteLength) {
