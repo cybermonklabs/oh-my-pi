@@ -9,9 +9,9 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils";
 import { buildModel } from "./build";
-import { collapseBuiltVariants } from "./compat/collapse";
-import { applyCatalogMetrics, CatalogMetricsIndex } from "./identity/metrics";
-import { readModelCache, takeModelCacheRowTurn, writeModelCacheInSlices } from "./model-cache";
+import { collapseBuiltVariantsSteps } from "./compat/collapse";
+import { applyCatalogMetricsSteps, CatalogMetricsIndex } from "./identity/metrics";
+import { readModelCacheSteps, takeModelCacheRowTurn, writeModelCacheInSlices } from "./model-cache";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import { TimeBasedCostShape } from "./pricing";
 import { type Api, type Model, modelKind, type ModelSpec, type Provider } from "./types";
@@ -307,8 +307,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const hasModelsDevFetcher = options.modelsDev !== undefined;
 	const hasRemoteFetcher = hasDynamicFetcher || hasModelsDevFetcher;
 	const readCacheState = async () => {
-		while (sliceExpired()) await nextSlice();
-		const cache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
+		const cache = await runInSlices(readModelCacheSteps<TApi>(cacheProviderId, ttlMs, now, dbPath));
 		const isAuthoritativeDynamicCache = dynamicModelsAuthoritative && (cache?.payloadAuthoritative ?? false);
 		const restoredCache = await restoreCachedModelHeaders(
 			cache?.models ?? [],
@@ -379,9 +378,9 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		!cacheHasUnresolvedHeaders
 	) {
 		const source: ModelResolutionSource = restoredCache.models.length > 0 ? "cache" : "bundled";
-		while (sliceExpired()) await nextSlice();
+		const models = await runInSlices(collapseBuiltVariantsSteps(restoredCache.models));
 		return {
-			models: collapseBuiltVariants(restoredCache.models),
+			models,
 			stale: false,
 			source,
 			...(source === "cache" ? { updatedAt: cache.updatedAt } : {}),
@@ -455,11 +454,10 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		fetchedModelsDevModels?.explicitKindModels,
 	);
 	const catalogMetricsSource = modelsDevFetchSucceeded ? normalizedModelsDevModels : preparedCacheModels;
-	while (sliceExpired()) await nextSlice();
 	const mergedWithCatalogMetrics = (
 		modelsDevFetchSucceeded ? modelsDevAdditiveStaticModelIds : cacheAdditiveStaticModelIds
 	)
-		? mergeCatalogMetrics(mergedWithModelsDev, catalogMetricsSource)
+		? await runInSlices(catalogMetricsSteps(mergedWithModelsDev, catalogMetricsSource))
 		: mergedWithModelsDev;
 	const mergedModels = await mergeDynamicModels(
 		mergedWithCatalogMetrics,
@@ -467,13 +465,14 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		mergeAuthority,
 		fetchedDynamicModels?.explicitKindModels,
 	);
-	while (sliceExpired()) await nextSlice();
-	const models = collapseBuiltVariants(
-		authoritativeDynamicFetchSucceeded
-			? retainModelIds(mergedModels, dynamicModels)
-			: !dynamicFetchSucceeded && isAuthoritativeDynamicCache && usableCachedModels.length > 0
-				? retainModelIds(mergedModels, usableCachedModels)
-				: mergedModels,
+	const models = await runInSlices(
+		collapseBuiltVariantsSteps(
+			authoritativeDynamicFetchSucceeded
+				? retainModelIds(mergedModels, dynamicModels)
+				: !dynamicFetchSucceeded && isAuthoritativeDynamicCache && usableCachedModels.length > 0
+					? retainModelIds(mergedModels, usableCachedModels)
+					: mergedModels,
+		),
 	);
 	const resolutionAuthoritative = !hasRemoteFetcher || remoteResolutionComplete || shouldUseFreshCacheAsAuthoritative;
 	const remoteUpdatedAt = anyRemoteFetchSucceeded ? now() : undefined;
@@ -502,8 +501,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			// models cannot be restored offline: rewriting it would drop them and
 			// mark the remainder fresh, while the untouched row keeps forcing a
 			// refetch that recovers them (#18227).
-			while (sliceExpired()) await nextSlice();
-			const latestCache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
+			const latestCache = await runInSlices(readModelCacheSteps<TApi>(cacheProviderId, ttlMs, now, dbPath));
 			const latestRestoredCache = await restoreCachedModelHeaders(
 				latestCache?.models ?? cache?.models ?? [],
 				staticModels,
@@ -533,11 +531,12 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				modelsDevModels,
 				mergeAuthority,
 			);
-			while (sliceExpired()) await nextSlice();
-			const fallbackSnapshotModels = collapseBuiltVariants(
-				isAuthoritativeDynamicCache && latestUsableCacheModels.length > 0
-					? retainModelIds(mergedFallbackModels, latestUsableCacheModels)
-					: mergedFallbackModels,
+			const fallbackSnapshotModels = await runInSlices(
+				collapseBuiltVariantsSteps(
+					isAuthoritativeDynamicCache && latestUsableCacheModels.length > 0
+						? retainModelIds(mergedFallbackModels, latestUsableCacheModels)
+						: mergedFallbackModels,
+				),
 			);
 			if (
 				latestRestoredCache.unresolvedModelIds.size === 0 &&
@@ -685,12 +684,15 @@ function prepareCacheModelsForStaticMismatch<TApi extends Api>(
 	return sanitizedModels;
 }
 
-function mergeCatalogMetrics<TApi extends Api>(
+/** Fills catalog metrics from `catalogModels`: the index is one unit, then one unit per model. */
+function* catalogMetricsSteps<TApi extends Api>(
 	models: Model<TApi>[],
 	catalogModels: readonly Model<TApi>[],
-): Model<TApi>[] {
+): Generator<void, Model<TApi>[], undefined> {
 	if (models.length === 0 || catalogModels.length === 0) return models;
-	return applyCatalogMetrics(models, new CatalogMetricsIndex(catalogModels));
+	const index = new CatalogMetricsIndex(catalogModels);
+	yield;
+	return yield* applyCatalogMetricsSteps(models, index);
 }
 
 /**

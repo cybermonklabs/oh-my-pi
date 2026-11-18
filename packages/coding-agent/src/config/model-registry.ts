@@ -26,7 +26,12 @@ import {
 	resolveMaxContextWindow,
 } from "@oh-my-pi/pi-catalog/compat/context-window";
 import { applyCatalogMetricsSteps, CatalogMetricsIndex, catalogMetricsOf } from "@oh-my-pi/pi-catalog/identity/metrics";
-import { getModelCacheWriteStats, readModelCache, retainModelCacheConnection } from "@oh-my-pi/pi-catalog/model-cache";
+import {
+	getModelCacheWriteStats,
+	readModelCache,
+	readModelCacheSteps,
+	retainModelCacheConnection,
+} from "@oh-my-pi/pi-catalog/model-cache";
 import {
 	createModelManager,
 	fingerprintStaticModelsSteps,
@@ -1770,7 +1775,7 @@ export class ModelRegistry {
 	 */
 	*#cachedStandardProviderSteps(providerId: string): Generator<void, CachedStandardProviderSlice, undefined> {
 		const cacheProviderId = this.#resolveStartupModelCacheProviderId(providerId);
-		const cache = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
+		const cache = yield* readModelCacheSteps<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 		const sharedCatalogProvider = MODELS_DEV_CATALOG_PROVIDER_ID_LOOKUP[providerId] === true;
 		const additiveSharedCatalogProvider = ADDITIVE_MODELS_DEV_CATALOG_PROVIDER_ID_LOOKUP[providerId] === true;
 		if (!cache) {
@@ -2667,9 +2672,10 @@ export class ModelRegistry {
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
 	): Promise<ConfiguredModelDiscoveryResult> {
-		while (sliceExpired()) await nextSlice();
 		const cacheProviderId = this.#configuredDiscoveryCacheProviderId(providerConfig);
-		const cached = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
+		const cached = await runInSlices(
+			readModelCacheSteps<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath),
+		);
 		const cacheOlderThanConfig = cached !== null && this.#isDiscoveryCacheOlderThanModelsConfig(cached.updatedAt);
 		const bypassFreshCache = providerConfig.discovery.type === "llama.cpp" && strategy === "online-if-uncached";
 		const effectiveStrategy =
@@ -2902,11 +2908,8 @@ export class ModelRegistry {
 		if (strategy === "online-if-uncached" && !authoritative && cacheProviderId !== undefined) {
 			// Mirror shouldFetchRemoteSources: built-in managers use the catalog's
 			// default TTL, so only refresh when the manager will actually fetch.
-			const cache = readModelCache<Api>(
-				cacheProviderId,
-				BUILT_IN_DISCOVERY_CACHE_TTL_MS,
-				Date.now,
-				this.#cacheDbPath,
+			const cache = await runInSlices(
+				readModelCacheSteps<Api>(cacheProviderId, BUILT_IN_DISCOVERY_CACHE_TTL_MS, Date.now, this.#cacheDbPath),
 			);
 			const cacheAgeMs = cache ? Date.now() - cache.updatedAt : Number.POSITIVE_INFINITY;
 			if (cache?.fresh && (cache.authoritative || cacheAgeMs < BUILT_IN_DISCOVERY_NON_AUTHORITATIVE_RETRY_MS)) {

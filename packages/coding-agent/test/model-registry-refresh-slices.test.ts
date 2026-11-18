@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -356,12 +357,25 @@ describe("ModelRegistry discovery slicing", () => {
 			fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
 			fs.writeFileSync(modelsPath, JSON.stringify({ providers }));
 			const registry = new ModelRegistry(authStorage, modelsPath, { fetch: offlineFetch });
+			let now = 1_000;
+			let reads = 0;
+			vi.spyOn(performance, "now").mockImplementation(() => {
+				reads++;
+				return now++;
+			});
+			// The clock reads so far at each read of a provider's cache row (the query that reads the payload).
+			const readsAtRowRead: number[] = [];
+			const query = Database.prototype.query;
+			vi.spyOn(Database.prototype, "query").mockImplementation(function (this: Database, sql: string) {
+				if (sql.startsWith("SELECT m.*")) readsAtRowRead.push(reads);
+				return query.call(this, sql);
+			} as typeof Database.prototype.query);
 			// Online with no key: each provider reads its cache row, then peeks its key and stops.
-			const readsAtPeek = await clockReadsAtFirstPeek(new Set(Object.keys(providers)), () =>
-				registry.refreshDiscoverableProviders(Object.keys(providers), "online"),
-			);
-			expect(readsAtPeek.length).toBe(20);
-			expect(fewestReadsBetween(readsAtPeek)).toBeGreaterThan(0);
+			await registry.refreshDiscoverableProviders(Object.keys(providers), "online");
+			vi.restoreAllMocks();
+			// Each provider's row is read more than once in a pass; every read comes after a check.
+			expect(readsAtRowRead.length).toBeGreaterThanOrEqual(20);
+			expect(fewestReadsBetween(readsAtRowRead)).toBeGreaterThan(0);
 		});
 	});
 

@@ -1,10 +1,15 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { getModelCacheWriteStats, readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import {
+	getModelCacheWriteStats,
+	readModelCache,
+	readModelCacheSteps,
+	writeModelCache,
+} from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import { modelsDevCatalogFallback } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
@@ -251,5 +256,72 @@ describe("model cache write churn", () => {
 		await resolveProviderModels(options, "online");
 		expect(payloadWrites()).toBe(before);
 		expect(readModelCache("azure", TTL_MS, Date.now, dbPath)?.models.length).toBe(bundled.length);
+	});
+});
+
+describe("readModelCacheSteps", () => {
+	let tempDir = "";
+	let dbPath = "";
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-cache-steps-"));
+		dbPath = path.join(tempDir, "models.db");
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		if (tempDir) {
+			await removeWithRetries(tempDir);
+			tempDir = "";
+			dbPath = "";
+		}
+	});
+
+	it("reads a provider's row in one unit and parses it in the next", () => {
+		const models = Array.from({ length: 200 }, (_, index) => model(`m-${index}`));
+		writeModelCache("rewrite-test", 1_000, models, true, "fp", dbPath);
+		// The payload's parse is the only JSON.parse of a text this long.
+		let payloadParses = 0;
+		const parse = JSON.parse;
+		vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?: Parameters<typeof JSON.parse>[1]) => {
+			if (text.length > 10_000) payloadParses++;
+			return parse(text, reviver);
+		});
+		// A path of its own, so no earlier read of this process memoized the row.
+		const steps = readModelCacheSteps<"openai-completions">("rewrite-test", TTL_MS, () => 1_000, dbPath);
+		const read = steps.next();
+		expect(read.done).toBe(false);
+		expect(payloadParses).toBe(0);
+		const parsed = steps.next();
+		expect(parsed.done).toBe(true);
+		expect(payloadParses).toBe(1);
+		expect(parsed.value?.models.map(entry => entry.id)).toEqual(models.map(entry => entry.id));
+		// A second read finds the memoized parse and takes one unit.
+		const again = readModelCacheSteps<"openai-completions">("rewrite-test", TTL_MS, () => 1_000, dbPath).next();
+		expect(again.done).toBe(true);
+		expect(again.value?.models).toHaveLength(models.length);
+	});
+
+	it("deletes a corrupt row only if no write replaced it between the read and the parse", () => {
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		const corrupt = (updatedAt: number) => {
+			const db = new Database(dbPath);
+			db.run("UPDATE model_cache SET models = ?, updated_at = ? WHERE provider_id = 'rewrite-test'", [
+				"[{not json",
+				updatedAt,
+			]);
+			db.close();
+		};
+		corrupt(1_500);
+		const steps = readModelCacheSteps<"openai-completions">("rewrite-test", TTL_MS, () => 2_000, dbPath);
+		expect(steps.next().done).toBe(false);
+		// A write lands between the read and the parse.
+		writeModelCache("rewrite-test", 2_000, [model("b")], true, "fp", dbPath);
+		expect(steps.next().value).toBeNull();
+		expect(readModelCache("rewrite-test", TTL_MS, () => 2_000, dbPath)?.models.map(entry => entry.id)).toEqual(["b"]);
+		// With no write between them, the corrupt row is deleted, as an unsliced read deletes it.
+		corrupt(2_500);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 3_000, dbPath)).toBeNull();
+		expect(payloadRow(dbPath, "rewrite-test")).toBeNull();
 	});
 });

@@ -545,54 +545,122 @@ export function readModelCache<TApi extends Api>(
 	now: () => number,
 	dbPath?: string,
 ): CacheEntry<TApi> | null {
+	return runToCompletion(readModelCacheSteps<TApi>(providerId, ttlMs, now, dbPath));
+}
+
+/**
+ * {@link readModelCache} with the row's read and its parse as two slice units: a
+ * provider's multi-MB row costs tens of milliseconds to read and again to parse.
+ */
+export function* readModelCacheSteps<TApi extends Api>(
+	providerId: string,
+	ttlMs: number,
+	now: () => number,
+	dbPath?: string,
+): Generator<void, CacheEntry<TApi> | null, undefined> {
+	let read: CacheRowRead<TApi>;
 	try {
-		// Monotonic change signal: same-shaped WAL overwrites after checkpoint
-		// can leave every size:mtime pair identical, so file metadata alone
-		// cannot invalidate. PRAGMA data_version increments on each committed
-		// write transaction visible to a new reader. It is only comparable
-		// across calls on the same connection, so it gates the no-query fast
-		// path for the shared handle only.
-		const { resolvedPath, shared } = resolveCacheDb(dbPath);
-		const key = readCacheKey(resolvedPath, providerId);
-		return runModelCacheDb(resolvedPath, shared, db => {
-			const dataVersion = shared ? dbDataVersion(db) : null;
-			const cached = readRowCache.get(key);
-			if (dataVersion !== null && cached?.dataVersion === dataVersion) {
-				// Freshness is time-relative: recompute per call from the
-				// cached row's updatedAt so a long-lived process goes stale.
-				return withFreshness(cached.entry as CacheEntry<TApi> | null, ttlMs, now);
-			}
-			// Any commit (to any provider's row) bumps data_version. Validate the
-			// memoized parse against the row's scalar columns and payload hash
-			// first; only a changed payload pays for the multi-MB `models` read.
-			let entry: CacheEntry<TApi> | null = null;
-			let meta: CacheRowMeta | null = null;
-			if (cached?.entry && cached.meta) {
-				meta = queryRow<CacheRowMeta>(db, SELECT_CACHE_ROW_META, providerId);
-				if (meta && meta.materialization_policy === materializationPolicy() && cacheRowsEqual(cached.meta, meta)) {
-					// Payload unchanged; only side-table freshness may have moved.
-					entry = withFreshness(withRowState(cached.entry as CacheEntry<TApi>, meta), ttlMs, now);
-				} else {
-					meta = null;
-				}
-			}
-			if (entry === null) {
-				// One statement reads payload and scalars from the same snapshot.
-				const row = queryRow<CacheRow>(db, SELECT_CACHE_ROW, providerId);
-				entry = parseCacheRow<TApi>(db, providerId, row, ttlMs, now);
-				if (entry !== null && row !== null) {
-					// Drop the payload so the memo never pins the multi-MB `models` string.
-					const { models: _models, ...rowScalars } = row;
-					meta = rowScalars;
-				}
-			}
-			if (readRowCache.size >= READ_ROW_CACHE_MAX) readRowCache.clear();
-			readRowCache.set(key, { dataVersion, meta, entry: entry as CacheEntry<Api> | null });
-			return entry;
-		});
+		read = readCacheRow<TApi>(providerId, ttlMs, now, dbPath);
 	} catch {
 		return null;
 	}
+	if (read.kind === "entry") return read.entry;
+	yield;
+	try {
+		return parseReadRow<TApi>(providerId, read, ttlMs, now);
+	} catch {
+		return null;
+	}
+}
+
+/** A cache read's first unit: the entry itself, or the row its second unit parses. */
+type CacheRowRead<TApi extends Api> =
+	| { kind: "entry"; entry: CacheEntry<TApi> | null }
+	| {
+			kind: "row";
+			row: CacheRow | null;
+			key: string;
+			dataVersion: number | null;
+			resolvedPath: string;
+			shared: boolean;
+	  };
+
+function readCacheRow<TApi extends Api>(
+	providerId: string,
+	ttlMs: number,
+	now: () => number,
+	dbPath: string | undefined,
+): CacheRowRead<TApi> {
+	// Monotonic change signal: same-shaped WAL overwrites after checkpoint
+	// can leave every size:mtime pair identical, so file metadata alone
+	// cannot invalidate. PRAGMA data_version increments on each committed
+	// write transaction visible to a new reader. It is only comparable
+	// across calls on the same connection, so it gates the no-query fast
+	// path for the shared handle only.
+	const { resolvedPath, shared } = resolveCacheDb(dbPath);
+	const key = readCacheKey(resolvedPath, providerId);
+	return runModelCacheDb(resolvedPath, shared, db => {
+		const dataVersion = shared ? dbDataVersion(db) : null;
+		const cached = readRowCache.get(key);
+		if (dataVersion !== null && cached?.dataVersion === dataVersion) {
+			// Freshness is time-relative: recompute per call from the
+			// cached row's updatedAt so a long-lived process goes stale.
+			return { kind: "entry", entry: withFreshness(cached.entry as CacheEntry<TApi> | null, ttlMs, now) };
+		}
+		// Any commit (to any provider's row) bumps data_version. Validate the
+		// memoized parse against the row's scalar columns and payload hash
+		// first; only a changed payload pays for the multi-MB `models` read.
+		if (cached?.entry && cached.meta) {
+			const meta = queryRow<CacheRowMeta>(db, SELECT_CACHE_ROW_META, providerId);
+			if (meta && meta.materialization_policy === materializationPolicy() && cacheRowsEqual(cached.meta, meta)) {
+				// Payload unchanged; only side-table freshness may have moved.
+				const entry = withFreshness(withRowState(cached.entry as CacheEntry<TApi>, meta), ttlMs, now);
+				rememberReadRow(key, { dataVersion, meta, entry });
+				return { kind: "entry", entry };
+			}
+		}
+		// One statement reads payload and scalars from the same snapshot.
+		const row = queryRow<CacheRow>(db, SELECT_CACHE_ROW, providerId);
+		return { kind: "row", row, key, dataVersion, resolvedPath, shared };
+	});
+}
+
+function parseReadRow<TApi extends Api>(
+	providerId: string,
+	read: Extract<CacheRowRead<TApi>, { kind: "row" }>,
+	ttlMs: number,
+	now: () => number,
+): CacheEntry<TApi> | null {
+	const { row, key, dataVersion } = read;
+	const parsed = parseCacheRow<TApi>(row, ttlMs, now);
+	if (parsed === "corrupt" && row) {
+		// Fail closed on corrupt header provenance: treating malformed
+		// markers as empty could return a model with required credentials
+		// silently absent. Current-schema rows never persist headers, so the
+		// rejected payload needs no secure scrub. The row is deleted only if
+		// it is still the one read: a write since then replaced it.
+		runModelCacheDb(read.resolvedPath, read.shared, db =>
+			db.run("DELETE FROM model_cache WHERE provider_id = ? AND updated_at = ? AND models_hash = ?", [
+				providerId,
+				row.updated_at,
+				row.models_hash,
+			]),
+		);
+	}
+	const entry = parsed === "corrupt" ? null : parsed;
+	let meta: CacheRowMeta | null = null;
+	if (entry !== null && row !== null) {
+		// Drop the payload so the memo never pins the multi-MB `models` string.
+		const { models: _models, ...rowScalars } = row;
+		meta = rowScalars;
+	}
+	rememberReadRow(key, { dataVersion, meta, entry: entry as CacheEntry<Api> | null });
+	return entry;
+}
+
+function rememberReadRow(key: string, read: ReadRowCacheEntry): void {
+	if (readRowCache.size >= READ_ROW_CACHE_MAX) readRowCache.clear();
+	readRowCache.set(key, read);
 }
 
 function queryRow<T>(db: Database, sql: string, providerId: string): T | null {
@@ -643,26 +711,17 @@ function withRowState<TApi extends Api>(entry: CacheEntry<TApi>, row: StoredRowS
 }
 
 function parseCacheRow<TApi extends Api>(
-	db: Database,
-	providerId: string,
 	row: CacheRow | null,
 	ttlMs: number,
 	now: () => number,
-): CacheEntry<TApi> | null {
+): CacheEntry<TApi> | null | "corrupt" {
 	if (!row || row.version !== CACHE_SCHEMA_VERSION || row.materialization_policy !== materializationPolicy()) {
 		return null;
 	}
 	const models = parseMaterializedModels<TApi>(row.models);
 	const headerOmittedModelIds = parseModelIds(row.header_omitted_model_ids);
 	const unrestorableHeaderModelIds = parseModelIds(row.unrestorable_header_model_ids);
-	if (models === null || headerOmittedModelIds === null || unrestorableHeaderModelIds === null) {
-		// Fail closed on corrupt header provenance: treating malformed
-		// markers as empty could return a model with required credentials
-		// silently absent. Current-schema rows never persist headers, so the
-		// rejected payload needs no secure scrub.
-		db.run("DELETE FROM model_cache WHERE provider_id = ?", [providerId]);
-		return null;
-	}
+	if (models === null || headerOmittedModelIds === null || unrestorableHeaderModelIds === null) return "corrupt";
 	const { updatedAt, authoritative } = rowState(row);
 	const ageMs = now() - updatedAt;
 	const fresh = Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= ttlMs;
