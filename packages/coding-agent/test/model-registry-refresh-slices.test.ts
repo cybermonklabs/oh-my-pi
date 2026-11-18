@@ -372,69 +372,106 @@ describe("ModelRegistry discovery slicing", () => {
 		expect(registry.find("gateway", "removed-model")).toBeUndefined();
 	});
 
-	test("a refresh awaited by createAgentSession takes its turns without waiting for a pending timer", async () => {
-		// No model has auth here, so creation awaits refresh("online-if-uncached") before it rejects.
-		// A provider key in this process's environment would give one auth, so the test sets them aside.
-		const setAside = Object.keys(process.env).filter(key =>
-			/(_API_KEY|_TOKEN|_SECRET_ACCESS_KEY|_ACCESS_KEY_ID)$/.test(key),
+	test("a pass whose configuration is reloaded while it waits for an earlier commit does not commit what it merged", async () => {
+		const clock = mockClockStillUntilStarted();
+		const modelsPath = tempDir.join("cfg", "models.json");
+		fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					gateway: {
+						baseUrl: "http://127.0.0.1:9994",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
 		);
-		const savedEnv = setAside.map(key => [key, process.env[key]] as const);
-		for (const key of setAside) delete process.env[key];
-		try {
-			const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
-			const refresh = registry.refresh.bind(registry);
-			let refreshMs = Number.NaN;
-			registry.refresh = async (...args: Parameters<ModelRegistry["refresh"]>) => {
-				const startedAt = performance.now();
-				try {
-					return await refresh(...args);
-				} finally {
-					refreshMs = performance.now() - startedAt;
-				}
-			};
-			const agents = new AgentRegistry();
-			agents.register({
-				id: "owned-worker",
-				displayName: "B",
-				kind: "sub",
-				parentId: "Main",
-				session: null,
-				status: "idle",
-			});
-			fs.mkdirSync(tempDir.join("project"));
-			// A turn that waited for the next timer would take up to this period each time.
-			const pendingTimer = setInterval(() => {}, 20_000);
+		let listCalls = 0;
+		const gatewayFetch: FetchImpl = async input => {
+			if (String(input) !== "http://127.0.0.1:9994/v1/models") throw new Error(`offline: ${String(input)}`);
+			listCalls++;
+			if (listCalls > 1) return Response.json({ data: [{ id: "scoped-model" }] });
+			// Every other discovery of the full pass has finished, so its fetches resolve with this one.
+			await new Promise(resolve => setTimeout(resolve, 0));
+			clock.start();
+			return Response.json({ data: [{ id: "full-model" }] });
+		};
+		const registry = new ModelRegistry(authStorage, modelsPath, { fetch: gatewayFetch });
+		// The full pass merges the whole catalog in slices; the scoped pass merges one
+		// provider, then waits for the full pass's commit.
+		const fullPass = registry.refresh("online");
+		await untilDiscovered(registry, "gateway", ["full-model"]);
+		const scopedPass = registry.refreshDiscoverableProviders(["gateway"], "online");
+		await untilDiscovered(registry, "gateway", ["scoped-model"]);
+		for (let turn = 0; turn < 50; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+		expect(registry.find("gateway", "full-model")).toBeUndefined();
+		// While the scoped pass waits, the gateway leaves the configuration and the next refresh reloads it.
+		fs.writeFileSync(modelsPath, JSON.stringify({ providers: {} }));
+		const later = new Date(Date.now() + 60_000);
+		fs.utimesSync(modelsPath, later, later);
+		await Promise.all([fullPass, scopedPass, registry.refresh("offline")]);
+		expect(listCalls).toBe(2);
+		expect(registry.find("gateway", "scoped-model")).toBeUndefined();
+		expect(registry.find("gateway", "full-model")).toBeUndefined();
+	});
+
+	test("a refresh awaited by createAgentSession takes its turns without waiting for a pending timer", async () => {
+		// With a default role configured, creation awaits refresh("online-if-uncached")
+		// before it rejects, whatever credentials the environment holds.
+		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
+		const refresh = registry.refresh.bind(registry);
+		let refreshMs = Number.NaN;
+		registry.refresh = async (...args: Parameters<ModelRegistry["refresh"]>) => {
+			const startedAt = performance.now();
 			try {
-				await expect(
-					createAgentSession({
-						cwd: tempDir.join("project"),
-						agentDir: tempDir.join("agent"),
-						modelRegistry: registry,
-						settings: Settings.isolated(),
-						disableExtensionDiscovery: true,
-						skills: [],
-						contextFiles: [],
-						promptTemplates: [],
-						slashCommands: [],
-						enableMCP: false,
-						enableLsp: false,
-						agentRegistry: agents,
-						agentId: "owned-worker",
-						agentDisplayName: "A",
-						parentTaskPrefix: "owned-worker",
-						parentAgentId: "Main",
-						taskDepth: 1,
-						expectedAgentRef: null,
-					}),
-				).rejects.toThrow("already owned by another session generation");
+				return await refresh(...args);
 			} finally {
-				clearInterval(pendingTimer);
+				refreshMs = performance.now() - startedAt;
 			}
-			expect(Number.isNaN(refreshMs)).toBe(false);
-			// Far below one 20 s timer period, and far above what a loaded machine adds to a refresh.
-			expect(refreshMs).toBeLessThan(10_000);
+		};
+		const agents = new AgentRegistry();
+		agents.register({
+			id: "owned-worker",
+			displayName: "B",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "idle",
+		});
+		fs.mkdirSync(tempDir.join("project"));
+		// A turn that waited for the next timer would take up to this period each time.
+		const pendingTimer = setInterval(() => {}, 20_000);
+		try {
+			await expect(
+				createAgentSession({
+					cwd: tempDir.join("project"),
+					agentDir: tempDir.join("agent"),
+					modelRegistry: registry,
+					settings: Settings.isolated({ modelRoles: { default: "no-such-provider/no-such-model" } }),
+					disableExtensionDiscovery: true,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+					agentRegistry: agents,
+					agentId: "owned-worker",
+					agentDisplayName: "A",
+					parentTaskPrefix: "owned-worker",
+					parentAgentId: "Main",
+					taskDepth: 1,
+					expectedAgentRef: null,
+				}),
+			).rejects.toThrow("already owned by another session generation");
 		} finally {
-			for (const [key, value] of savedEnv) process.env[key] = value;
+			clearInterval(pendingTimer);
 		}
+		expect(Number.isNaN(refreshMs)).toBe(false);
+		// Far below one 20 s timer period, and far above what a loaded machine adds to a refresh.
+		expect(refreshMs).toBeLessThan(10_000);
 	}, 30_000);
 });
