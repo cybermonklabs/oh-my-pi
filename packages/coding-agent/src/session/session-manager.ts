@@ -992,24 +992,33 @@ async function fileMatchesLines(filePath: string, lines: Iterable<string>): Prom
 	return expectedOffset === expectedLength && !encodeNextWindow();
 }
 
-/**
- * Whether stored chunks are exactly the UTF-8 encoding of `body`, compared by
- * byte length and SHA-256 while holding one line of the body and one stored
- * chunk at a time.
- */
-async function chunksMatchBody(chunks: AsyncIterable<Uint8Array>, body: SessionFileBody): Promise<boolean> {
-	const expected = new Bun.CryptoHasher("sha256");
-	for (const line of body.lines) expected.update(line);
+/** A body's UTF-8 byte length and SHA-256, which {@link chunksMatchBody} compares stored chunks with. */
+interface SessionBodyDigest {
+	readonly bytes: number;
+	readonly sha256: string;
+}
+
+/** {@link SessionBodyDigest} of `body`, hashed while holding one line of it at a time. */
+function sessionBodyDigest(body: SessionFileBody): SessionBodyDigest {
+	const hasher = new Bun.CryptoHasher("sha256");
+	for (const line of body.lines) hasher.update(line);
 	// Iterating `lines` counted the body's bytes again.
-	const expectedBytes = body.bytes;
+	return { bytes: body.bytes, sha256: hasher.digest("hex") };
+}
+
+/**
+ * Whether stored chunks are exactly the bytes `expected` describes, compared
+ * by byte length and SHA-256 while holding one stored chunk at a time.
+ */
+async function chunksMatchBody(chunks: AsyncIterable<Uint8Array>, expected: SessionBodyDigest): Promise<boolean> {
 	const stored = new Bun.CryptoHasher("sha256");
 	let storedBytes = 0;
 	for await (const chunk of chunks) {
 		storedBytes += chunk.byteLength;
-		if (storedBytes > expectedBytes) return false;
+		if (storedBytes > expected.bytes) return false;
 		stored.update(chunk);
 	}
-	return storedBytes === expectedBytes && stored.digest("hex") === expected.digest("hex");
+	return storedBytes === expected.bytes && stored.digest("hex") === expected.sha256;
 }
 
 /**
@@ -1982,11 +1991,13 @@ export class SessionManager {
 	 * Verify a failed acknowledgement chunk by chunk: file bytes exactly, other
 	 * storage by size and SHA-256. A full rewrite or delete that races the read
 	 * (`SessionReadConflictError`) is read again from its start through
-	 * {@link retryRacedRead}, never as one whole-text read.
+	 * {@link retryRacedRead}, never as one whole-text read; the body is hashed
+	 * once, before the first read.
 	 */
 	async #bodyMatchesStorage(sessionFile: string, body: SessionFileBody): Promise<boolean> {
 		if (this.#storage instanceof FileSessionStorage) return fileMatchesLines(sessionFile, body.lines);
-		return retryRacedRead(() => chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body));
+		const expected = sessionBodyDigest(body);
+		return retryRacedRead(() => chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), expected));
 	}
 
 	/**

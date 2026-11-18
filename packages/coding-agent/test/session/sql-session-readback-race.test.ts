@@ -89,8 +89,8 @@ async function seededSession(storage: SessionStorage): Promise<{ manager: Sessio
 /**
  * Make `ours`' next full write land and then fail its acknowledgement, and
  * have `theirs` publish that same body again right after the first chunk of
- * the next chunked read of it, the read-back, so that read meets a session
- * replaced under it.
+ * the next chunked read of the path it landed at, the read-back, so that read
+ * meets a session replaced under it.
  */
 function raceReadBackOfLandedPublish(ours: SessionStorage, theirs: SqlSessionStorage): { raced: boolean } {
 	const readChunks = ours.readChunks?.bind(ours);
@@ -107,7 +107,7 @@ function raceReadBackOfLandedPublish(ours: SessionStorage, theirs: SqlSessionSto
 		(async function* () {
 			for await (const chunk of readChunks(file, fromByte)) {
 				yield chunk;
-				if (!landed || state.raced) continue;
+				if (state.raced || landed?.file !== file) continue;
 				state.raced = true;
 				await theirs.refresh();
 				await theirs.writeTextAtomic(landed.file, landed.content, {
