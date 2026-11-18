@@ -152,9 +152,15 @@ export interface SessionToolsHost {
 	/**
 	 * Whether the next request, sent with the base prompt `promptDigest` names, reads the prompt cache entry the
 	 * branch's newest cached reply left: the entry has not lapsed, and the request asks for it on the same model and
-	 * retention with no compaction since.
+	 * retention with no compaction since. The tool definitions are not compared: tools that register late may not be
+	 * in yet, and the first request compares them (the entry it reads counts as lapsed when they differ).
 	 */
 	transcriptPromptCacheLive(promptDigest: string): boolean;
+	/**
+	 * Digest of the tool definitions the next primary request declares, as the wire carries them, comparable with the
+	 * {@link TOOL_DEFINITIONS_DIGEST_CUSTOM_TYPE} records on the branch.
+	 */
+	toolDefinitionsDigest(): string;
 	clearMemoryPromotionSnapshot(): void;
 	captureMemoryPromotionSnapshot(prompt: string[]): void;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
@@ -331,6 +337,20 @@ const SETTINGS_NOTICE_MESSAGE_TYPE = "settings-notice";
 /** Custom entry holding the digest of the base prompt the branch's primary model calls are built from. */
 const SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE = "system-prompt-digest";
 
+/**
+ * Custom entry holding the digest of the tool definitions the branch's primary model calls declare, as the wire
+ * carries them: the part of the cached prefix that comes before the system prompt.
+ */
+const TOOL_DEFINITIONS_DIGEST_CUSTOM_TYPE = "tool-definitions-digest";
+
+/** What a primary model call was sent with, as the branch records it before the call's reply. */
+interface ModelCallDigests {
+	/** Digest of its base prompt ({@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE}). */
+	readonly prompt: string;
+	/** Digest of its tool definitions ({@link TOOL_DEFINITIONS_DIGEST_CUSTOM_TYPE}). */
+	readonly tools: string;
+}
+
 /** Custom entry holding the base prompt blocks a {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record names. */
 const SYSTEM_PROMPT_CUSTOM_TYPE = "system-prompt";
 
@@ -350,7 +370,8 @@ interface StoredSystemPrompt {
  * Custom entry recording that the base prompt a {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record names withholds a
  * change from the model, and since when: a settings rebuild held on it, or a resumed process's own build it was
  * restored in place of. A resumed process that restores that prompt keeps the change waiting no longer than the
- * process that recorded it would have ({@link WITHHELD_CHANGE_MAX_AGE_MS}).
+ * process that recorded it would have ({@link WITHHELD_CHANGE_MAX_AGE_MS}), whichever branch of the session holds
+ * the record.
  */
 const SYSTEM_PROMPT_HOLD_CUSTOM_TYPE = "system-prompt-hold";
 
@@ -358,7 +379,7 @@ const SYSTEM_PROMPT_HOLD_CUSTOM_TYPE = "system-prompt-hold";
 interface SystemPromptHold {
 	/** Digest of the base prompt that withholds the change, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
 	digest: string;
-	/** When the change was made (Unix milliseconds). */
+	/** When the change was made (Unix milliseconds), by the clock of the process that recorded it. */
 	since: number;
 }
 
@@ -374,19 +395,36 @@ const WITHHELD_CHANGE_MAX_AGE_MS = 5 * 60_000;
  * prompt, or this process's own build behind a restored transcript prompt.
  */
 interface WithheldChange {
-	/** When the change was made (Unix milliseconds). */
-	readonly since: number;
+	/** Digest of the base prompt that withholds the change, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
+	readonly digest: string;
+	/**
+	 * When the change was made (Unix milliseconds), never later than the clock: {@link withheldChangeDue} moves a
+	 * time the clock has not reached (a clock set back since, a record a clock running fast wrote) to the clock's.
+	 */
+	since: number;
 	/** A cut that rewrites every message, or a move to another transcript, ended the reason to withhold it. */
 	due: boolean;
+	/**
+	 * The branch view last found to record {@link since} or earlier ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}); a reply
+	 * under the change on another view records it there ({@link SessionTools.recordReplyPrompt}).
+	 */
+	recordedOn: readonly SessionEntry[] | undefined;
 }
 
 /**
  * Whether `change` goes out at the next request: the prompt cache entry it keeps has `lapsed` (or the next request
  * cannot read it), the reason to withhold it ended ({@link WithheldChange.due}), or it is
- * {@link WITHHELD_CHANGE_MAX_AGE_MS} old, whatever requests kept the entry warm meanwhile.
+ * {@link WITHHELD_CHANGE_MAX_AGE_MS} old, whatever requests kept the entry warm meanwhile. A change dated after the
+ * clock is dated at the clock first, so it waits at most that long by this clock.
  */
 function withheldChangeDue(change: WithheldChange, lapsed: boolean): boolean {
-	return lapsed || change.due || Date.now() - change.since >= WITHHELD_CHANGE_MAX_AGE_MS;
+	const now = Date.now();
+	if (change.since > now) {
+		change.since = now;
+		// A record of the later time does not record this one.
+		change.recordedOn = undefined;
+	}
+	return lapsed || change.due || now - change.since >= WITHHELD_CHANGE_MAX_AGE_MS;
 }
 
 /** When `change` goes out at the latest, as the settings notice and the held-tool refusal give it (ISO 8601). */
@@ -459,6 +497,44 @@ function forwardingProxy<T extends object>(target: T, overrides: object, run?: <
 export function promptDigestOfEntry(entry: SessionEntry): string | undefined | null {
 	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE) return null;
 	return typeof entry.data === "string" ? entry.data : undefined;
+}
+
+/** The tools digest a branch entry records, `undefined` for a malformed record, or `null` when it is not a record. */
+export function toolsDigestOfEntry(entry: SessionEntry): string | undefined | null {
+	if (entry.type !== "custom" || entry.customType !== TOOL_DEFINITIONS_DIGEST_CUSTOM_TYPE) return null;
+	return typeof entry.data === "string" ? entry.data : undefined;
+}
+
+/** The newest record of one kind a branch view holds, and how much of the view was scanned for it. */
+interface NewestRecordScan {
+	branch: readonly SessionEntry[];
+	scanned: number;
+	value: string | undefined;
+}
+
+/**
+ * Folds `branch` into `scan` for the newest value `read` finds (`null`: the entry is no such record). The session
+ * manager's memoized view only grows in place, so a later read of the same array scans just the appended entries;
+ * another array is scanned back from its end. Returns the scan to keep.
+ */
+function scanNewestRecord(
+	scan: NewestRecordScan | undefined,
+	branch: readonly SessionEntry[],
+	read: (entry: SessionEntry) => string | undefined | null,
+): NewestRecordScan {
+	if (scan?.branch === branch) {
+		for (let index = scan.scanned; index < branch.length; index++) {
+			const value = read(branch[index]);
+			if (value !== null) scan.value = value;
+		}
+		scan.scanned = branch.length;
+		return scan;
+	}
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const value = read(branch[index]);
+		if (value !== null) return { branch, scanned: branch.length, value };
+	}
+	return { branch, scanned: branch.length, value: undefined };
 }
 
 function isStringList(value: unknown): value is string[] {
@@ -605,12 +681,8 @@ const NO_HELD_TOOLS = JSON.stringify([[], []]);
  * model ({@link SessionTools.replaceRestoredPromptIfDue}).
  */
 interface RestoredPrompt extends WithheldChange {
-	/** The stored blocks, restored as the base. */
+	/** The stored blocks, restored as the base; {@link WithheldChange.digest} is theirs. */
 	readonly base: readonly string[];
-	/** Digest of {@link base}, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
-	readonly digest: string;
-	/** The branch records {@link WithheldChange.since} for it ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}). */
-	recorded: boolean;
 }
 
 /** Data of a {@link SETTINGS_NOTICE_MESSAGE_TYPE} message: setting ids, tool names and its hold, never a value. */
@@ -728,16 +800,14 @@ export class SessionTools {
 	 * {@link #implicitRebuildBinding}.
 	 */
 	#restoredTranscript: { reply: AgentMessage; promptDigest: string } | undefined;
-	/** Base-prompt digest of the last primary model call, until its reply ends. */
-	#capturedPromptDigest: string | undefined;
-	/** Base-prompt digest each primary reply with provider output was produced under. */
-	readonly #replyPromptDigests = new WeakMap<AgentMessage, string>();
-	/**
-	 * Newest digest found in a branch view and how much of it was scanned. The
-	 * session manager's memoized view only grows in place, so a later read of
-	 * the same array scans just the appended entries.
-	 */
-	#recordedDigestScan: { branch: readonly SessionEntry[]; scanned: number; digest: string | undefined } | undefined;
+	/** Digests of the last primary model call, until its reply ends. */
+	#capturedCall: ModelCallDigests | undefined;
+	/** Digests of the call each primary reply with provider output was produced by. */
+	readonly #replyCalls = new WeakMap<AgentMessage, ModelCallDigests>();
+	/** Newest {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record of a branch view ({@link scanNewestRecord}). */
+	#recordedDigestScan: NewestRecordScan | undefined;
+	/** Newest {@link TOOL_DEFINITIONS_DIGEST_CUSTOM_TYPE} record of a branch view ({@link scanNewestRecord}). */
+	#recordedToolsDigestScan: NewestRecordScan | undefined;
 	/** {@link currentPromptDigest} for the base prompt array it hashed. */
 	#currentPromptDigest: { base: readonly string[]; digest: string } | undefined;
 	/** {@link SessionToolsOptions.operatorPromptDigest}. */
@@ -2244,25 +2314,15 @@ export class SessionTools {
 	/** Digest of the base prompt the current branch's newest reply with provider output was produced under. */
 	recordedPromptDigest(): string | undefined {
 		const branch = this.#host.sessionManager.getBranchView();
-		const scan = this.#recordedDigestScan;
-		if (scan?.branch === branch) {
-			for (let index = scan.scanned; index < branch.length; index++) {
-				const digest = promptDigestOfEntry(branch[index]);
-				if (digest !== null) scan.digest = digest;
-			}
-			scan.scanned = branch.length;
-			return scan.digest;
-		}
-		let digest: string | undefined;
-		for (let index = branch.length - 1; index >= 0; index--) {
-			const found = promptDigestOfEntry(branch[index]);
-			if (found !== null) {
-				digest = found;
-				break;
-			}
-		}
-		this.#recordedDigestScan = { branch, scanned: branch.length, digest };
-		return digest;
+		this.#recordedDigestScan = scanNewestRecord(this.#recordedDigestScan, branch, promptDigestOfEntry);
+		return this.#recordedDigestScan.value;
+	}
+
+	/** Digest of the tool definitions the current branch's newest reply with provider output was produced under. */
+	recordedToolsDigest(): string | undefined {
+		const branch = this.#host.sessionManager.getBranchView();
+		this.#recordedToolsDigestScan = scanNewestRecord(this.#recordedToolsDigestScan, branch, toolsDigestOfEntry);
+		return this.#recordedToolsDigestScan.value;
 	}
 
 	/** Digest of the agent's current base prompt, comparable with the digests recorded on the branch. */
@@ -2279,8 +2339,9 @@ export class SessionTools {
 	 * Called with the prompt a primary model call captures, before the request is
 	 * sent. From then on the transcript's signed thinking may be bound to that
 	 * prompt, whatever later history edits (`/tree`, fork, recovery) leave as the
-	 * newest reply, so the restored transcript is dropped for good. The capture
-	 * is not recorded yet: the call may still stop before it is sent; see
+	 * newest reply, so the restored transcript is dropped for good. The capture,
+	 * with the digest of the tool definitions the call declares, is not recorded
+	 * yet: the call may still stop before it is sent; see
 	 * {@link bindReplyToCapturedPrompt}. Side requests (`runEphemeralTurn`) do
 	 * not count. On a prefix-bound model, what the call declares for each tool
 	 * is kept too, for a settings change held on that prompt
@@ -2290,7 +2351,7 @@ export class SessionTools {
 	recordPrimaryModelCall(prompt: string[]): void {
 		this.#restoredTranscript = undefined;
 		const promptDigest = systemPromptDigest(this.baseOfSystemPrompt(prompt));
-		this.#capturedPromptDigest = promptDigest;
+		this.#capturedCall = { prompt: promptDigest, tools: this.#host.toolDefinitionsDigest() };
 		if (this.#heldSettingsRebuild) return;
 		this.#sentDeclarations =
 			this.#host.model()?.thinking?.prefixBinding === true
@@ -2303,34 +2364,38 @@ export class SessionTools {
 
 	/**
 	 * Called synchronously when a primary reply ends. A reply carrying provider
-	 * output was produced under the last captured prompt; one without (a call
+	 * output was produced by the last captured call; one without (a call
 	 * stopped before it was sent, an abort before the first event) binds nothing,
-	 * so the replies before it keep their prompt.
+	 * so the replies before it keep their prompt and tools.
 	 */
 	bindReplyToCapturedPrompt(reply: AgentMessage): void {
-		const digest = this.#capturedPromptDigest;
-		this.#capturedPromptDigest = undefined;
-		if (digest === undefined || reply.role !== "assistant") return;
+		const call = this.#capturedCall;
+		this.#capturedCall = undefined;
+		if (call === undefined || reply.role !== "assistant") return;
 		if (reply.content.some(block => block.type !== "text" || block.text.length > 0)) {
-			this.#replyPromptDigests.set(reply, digest);
+			this.#replyCalls.set(reply, call);
 		}
 	}
 
 	/**
 	 * Called just before a primary reply is appended to the branch: records the
-	 * digest of the prompt it was produced under when it differs from the
-	 * branch's, ahead of the reply so every path to the reply carries it. The
-	 * first reply under a kept restored transcript prompt also records when the
-	 * change that prompt withholds was made, unless the branch records it already.
+	 * digests of the prompt and the tool definitions it was produced under where
+	 * they differ from the branch's, ahead of the reply so every path to the
+	 * reply carries them. A reply under a prompt that withholds a change (a kept
+	 * restored transcript prompt, a held settings rebuild) also records when the
+	 * change was made, unless the branch records it already: a branch `/tree`
+	 * moved to, or one copied into another session file, then carries it as the
+	 * branch the change began on does.
 	 */
 	recordReplyPrompt(reply: AgentMessage): void {
-		const digest = this.#replyPromptDigests.get(reply);
-		this.recordPromptDigest(digest);
+		const call = this.#replyCalls.get(reply);
+		if (call === undefined) return;
+		this.recordPromptDigest(call.prompt);
+		this.recordToolsDigest(call.tools);
 		const restored = this.#restoredPrompt;
-		if (restored && !restored.recorded && digest === restored.digest) {
-			restored.recorded = true;
-			this.#recordWithheldChange(digest, restored.since);
-		}
+		if (restored?.digest === call.prompt) this.#recordWithheldChange(restored);
+		const held = this.#heldSettingsRebuild;
+		if (held?.digest === call.prompt) this.#recordWithheldChange(held);
 	}
 
 	/**
@@ -2343,6 +2408,12 @@ export class SessionTools {
 			this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE, digest);
 		}
 		this.#storePromptBlocks(digest);
+	}
+
+	/** Records `digest` on the current branch unless it is already the branch's newest tool-definitions record. */
+	recordToolsDigest(digest: string | undefined): void {
+		if (digest === undefined || digest === this.recordedToolsDigest()) return;
+		this.#host.sessionManager.appendCustomEntry(TOOL_DEFINITIONS_DIGEST_CUSTOM_TYPE, digest);
 	}
 
 	/**
@@ -2383,30 +2454,48 @@ export class SessionTools {
 	}
 
 	/**
-	 * Records on the branch that the base prompt `digest` names withholds a
-	 * change made at `since`, for a resumed process that restores that prompt
-	 * ({@link #withheldChangeSince}). Nothing reads it when the operator inputs
-	 * cannot be compared, so nothing is recorded then.
+	 * Records on the current branch that the base prompt `change` names withholds
+	 * a change made at its `since`, for a resumed process that restores that
+	 * prompt ({@link #withheldChangeSince}), unless the branch records that time
+	 * or an earlier one since it last recorded another prompt. Nothing reads it
+	 * when the operator inputs cannot be compared, so nothing is recorded then.
 	 */
-	#recordWithheldChange(digest: string, since: number): void {
+	#recordWithheldChange(change: WithheldChange): void {
 		if (this.#operatorPromptDigest === undefined) return;
-		const change: SystemPromptHold = { digest, since };
-		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_HOLD_CUSTOM_TYPE, change);
-	}
-
-	/**
-	 * When the branch records that the base prompt `digest` names began to
-	 * withhold a change: the earliest {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}
-	 * record naming it since the branch last recorded another prompt.
-	 */
-	#withheldChangeSince(digest: string): number | undefined {
 		const branch = this.#host.sessionManager.getBranchView();
-		let since: number | undefined;
+		if (change.recordedOn === branch) return;
+		// The view grows in place with the record and the entries after it.
+		change.recordedOn = branch;
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
 			const recorded = promptDigestOfEntry(entry);
-			if (recorded !== null && recorded !== digest) break;
+			if (recorded !== null && recorded !== change.digest) break;
 			const withheld = promptHoldOfEntry(entry);
+			if (withheld?.digest === change.digest && withheld.since <= change.since) return;
+		}
+		const record: SystemPromptHold = { digest: change.digest, since: change.since };
+		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_HOLD_CUSTOM_TYPE, record);
+	}
+
+	/**
+	 * When the session records that the base prompt `digest` names began to
+	 * withhold a change: the earliest {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}
+	 * record naming it written after the current branch last recorded another
+	 * prompt, on any branch. The change was made to the process, not to a
+	 * branch: `/tree` onto a branch that holds no record of it, before a restart,
+	 * leaves it no less old.
+	 */
+	#withheldChangeSince(digest: string): number | undefined {
+		const branch = this.#host.sessionManager.getBranchView();
+		let other: SessionEntry | undefined;
+		for (let index = branch.length - 1; index >= 0 && other === undefined; index--) {
+			const recorded = promptDigestOfEntry(branch[index]);
+			if (recorded !== null && recorded !== digest) other = branch[index];
+		}
+		const entries = this.#host.sessionManager.getEntries();
+		let since: number | undefined;
+		for (let index = other ? entries.indexOf(other) + 1 : 0; index < entries.length; index++) {
+			const withheld = promptHoldOfEntry(entries[index]);
 			if (withheld?.digest === digest) since = Math.min(withheld.since, since ?? withheld.since);
 		}
 		return since;
@@ -2428,10 +2517,15 @@ export class SessionTools {
 	 * prompt keeps nothing but that entry's prefix: with the entry lapsed,
 	 * written for another model or retention, or followed by a compaction, the
 	 * request writes the whole prompt anyway, so this process's own build goes
-	 * out. It goes out too once the change the stored prompt withholds is
-	 * {@link WITHHELD_CHANGE_MAX_AGE_MS} old by the branch's record
-	 * ({@link #withheldChangeSince}); a restored prompt is released as soon as
-	 * that or any other reason to keep it ends ({@link replaceRestoredPromptIfDue}).
+	 * out. So it does when the first request declares other tool definitions
+	 * than the transcript's last one (they come first in cache order): tools
+	 * may still register here, so that request finds the entry unreadable and
+	 * releases the stored prompt first ({@link replaceRestoredPromptIfDue}). It
+	 * goes out too once the change the stored prompt withholds is
+	 * {@link WITHHELD_CHANGE_MAX_AGE_MS} old by the session's record, on
+	 * whichever branch ({@link #withheldChangeSince}), a record dated after the
+	 * clock counting from now; a restored prompt is released as soon as that or
+	 * any other reason to keep it ends ({@link replaceRestoredPromptIfDue}).
 	 * Models that do not bind their prefix keep the fresh build: they rebuild
 	 * freely mid-session as well.
 	 */
@@ -2443,14 +2537,13 @@ export class SessionTools {
 		const stored = this.#storedPrompt(restored.promptDigest);
 		if (stored?.operatorDigest !== operatorDigest || systemPromptDigest(stored.blocks) !== stored.digest) return;
 		if (!this.#host.transcriptPromptCacheLive(restored.promptDigest)) return;
-		const recordedSince = this.#withheldChangeSince(restored.promptDigest);
 		const restoredPrompt: RestoredPrompt = {
 			base: stored.blocks,
 			digest: restored.promptDigest,
-			// The earliest the branch records, else the restore.
-			since: recordedSince ?? Date.now(),
+			// The earliest the session records, else the restore.
+			since: this.#withheldChangeSince(restored.promptDigest) ?? Date.now(),
 			due: false,
-			recorded: recordedSince !== undefined,
+			recordedOn: undefined,
 		};
 		// The change the stored prompt would withhold is due already: this process's own build goes out.
 		if (withheldChangeDue(restoredPrompt, false)) return;
@@ -2533,6 +2626,7 @@ export class SessionTools {
 	releaseRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
 		this.#recordedDigestScan = undefined;
+		this.#recordedToolsDigestScan = undefined;
 		this.#storedPromptScan = undefined;
 	}
 
@@ -3401,10 +3495,11 @@ export class SessionTools {
 	 * change sent ({@link #declaredAs}), {@link takeSettingsNotice} tells the model what changed and when it goes out,
 	 * and {@link absorbHeldSettingsRebuild} runs the rebuild once it is due: at a cut the cut rule admits, once the
 	 * prompt cache entry lapses, or five minutes after the change, whichever comes first. A new hold is recorded on
-	 * the branch with its start, so a resumed process that restores the bound prompt keeps the change waiting no
-	 * longer ({@link #restoreTranscriptPrompt}). Returns the hold to extend, or undefined when the rebuild runs now:
-	 * no settings change started it, or nothing is bound. Unlike {@link #implicitRebuildBinding}, the prompt the
-	 * session was created with binds as soon as a reply was produced under it, before any rebuild committed.
+	 * the branch with its start, as on each branch a reply under it goes to ({@link recordReplyPrompt}), so a resumed
+	 * process that restores the bound prompt keeps the change waiting no longer ({@link #restoreTranscriptPrompt}).
+	 * Returns the hold to extend, or undefined when the rebuild runs now: no settings change started it, or nothing
+	 * is bound. Unlike {@link #implicitRebuildBinding}, the prompt the session was created with binds as soon as a
+	 * reply was produced under it, before any rebuild committed.
 	 */
 	#holdSettingsRebuild(settingsChange: readonly SettingChange[] | undefined): HeldSettingsRebuild | undefined {
 		if (!settingsChange || !this.#promptBound) return undefined;
@@ -3415,8 +3510,10 @@ export class SessionTools {
 			const before = new Map<AnySetting, unknown>();
 			held = {
 				id: crypto.randomUUID(),
+				digest: promptDigest,
 				since: Date.now(),
 				due: false,
+				recordedOn: undefined,
 				before,
 				notices: [],
 				disabledTools: new Map(),
@@ -3428,7 +3525,7 @@ export class SessionTools {
 				toolSettings: this.#settingsAsDeclared(before),
 			};
 			this.#heldSettingsRebuild = held;
-			this.#recordWithheldChange(promptDigest, held.since);
+			this.#recordWithheldChange(held);
 			this.#setAgentTools(this.#host.agent.state.tools);
 		}
 		for (const { setting, previous } of settingsChange) {

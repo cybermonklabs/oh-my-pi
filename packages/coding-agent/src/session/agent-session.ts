@@ -509,7 +509,13 @@ import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
-import { promptDigestOfEntry, SessionTools, type SessionToolsHost, type SettingsChangeOptions } from "./session-tools";
+import {
+	promptDigestOfEntry,
+	SessionTools,
+	type SessionToolsHost,
+	type SettingsChangeOptions,
+	toolsDigestOfEntry,
+} from "./session-tools";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -793,6 +799,8 @@ interface BranchPromptCacheObservation {
 	compacted: boolean;
 	/** Digest of the base prompt the reply was produced under; undefined when none is recorded. */
 	promptDigest: string | undefined;
+	/** Digest of the tool definitions the reply's request declared; undefined when none is recorded. */
+	toolsDigest: string | undefined;
 }
 
 /**
@@ -805,6 +813,8 @@ interface BranchPromptCacheScan {
 	scanned: number;
 	/** Newest system prompt digest recorded in the scanned entries. */
 	digest: string | undefined;
+	/** Newest tool definitions digest recorded in the scanned entries. */
+	toolsDigest: string | undefined;
 	observation: BranchPromptCacheObservation | undefined;
 }
 
@@ -816,6 +826,11 @@ function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
 		const digest = promptDigestOfEntry(entry);
 		if (digest !== null) {
 			scan.digest = digest;
+			continue;
+		}
+		const toolsDigest = toolsDigestOfEntry(entry);
+		if (toolsDigest !== null) {
+			scan.toolsDigest = toolsDigest;
 			continue;
 		}
 		const observation = scan.observation;
@@ -841,7 +856,14 @@ function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 		const reply = entry.message;
 		if (reply.stopReason === "error" || reply.usage.cacheRead + reply.usage.cacheWrite <= 0) continue;
-		scan.observation = { reply, warmedAt: 0, refreshMissed: false, compacted: false, promptDigest: scan.digest };
+		scan.observation = {
+			reply,
+			warmedAt: 0,
+			refreshMissed: false,
+			compacted: false,
+			promptDigest: scan.digest,
+			toolsDigest: scan.toolsDigest,
+		};
 	}
 	scan.scanned = branch.length;
 }
@@ -2660,6 +2682,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				const entry = this.#inferredPromptCacheEntry(promptDigest);
 				return entry?.change === undefined && !promptCacheEntryLapsed(entry, Date.now());
 			},
+			toolDefinitionsDigest: () => this.#promptCacheShape(this.model).tools,
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
@@ -6284,11 +6307,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * The entry the branch's newest cached reply left, for a transcript this
 	 * process has not sent yet (a reopened or switched session): touched at the
 	 * reply's send time or a later warm refresh that hit, under the lifetime its
-	 * model declares for the tier the reply wrote. Thinking level, tools and
-	 * credential at the time are unknown; model, compaction and the system
-	 * prompt digest recorded for that reply are not, and the next request is
-	 * taken to send the base prompt `promptDigest` names (by default the
-	 * current one).
+	 * model declares for the tier the reply wrote. Thinking level and
+	 * credential at the time are unknown; model, compaction and the digests of
+	 * the tool definitions and system prompt recorded for that reply are not,
+	 * and the next request is taken to send the current tool definitions and
+	 * base prompt. `promptDigest` names another base prompt for it, the one a
+	 * resumed process may restore while its tools are not all in yet (tools
+	 * that register late): the tool definitions are not compared then.
 	 */
 	#inferredPromptCacheEntry(promptDigest?: string): ObservedPromptCacheEntry | undefined {
 		const observed = this.#branchPromptCacheObservation();
@@ -6324,6 +6349,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		} else if (observed.compacted) {
 			change = { kind: "compaction" };
 		} else if (
+			promptDigest === undefined &&
+			observed.toolsDigest !== undefined &&
+			observed.toolsDigest !== this.#promptCacheShape(current).tools
+		) {
+			// Tool definitions come before the system prompt in cache order.
+			change = { kind: "tools" };
+		} else if (
 			observed.promptDigest !== undefined &&
 			observed.promptDigest !== (promptDigest ?? this.#tools.currentPromptDigest())
 		) {
@@ -6350,7 +6382,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const branch = this.sessionManager.getBranchView();
 		let scan = this.#branchPromptCacheScan;
 		if (scan?.branch !== branch) {
-			scan = { branch, scanned: 0, digest: undefined, observation: undefined };
+			scan = { branch, scanned: 0, digest: undefined, toolsDigest: undefined, observation: undefined };
 			this.#branchPromptCacheScan = scan;
 		}
 		if (scan.scanned < branch.length) scanBranchPromptCache(scan);
@@ -13138,8 +13170,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!checkpointState) {
 			return;
 		}
-		// The rewound turn's reply is the exploration branch's newest, so this records its prompt.
+		// The rewound turn's reply is the exploration branch's newest, so these record its prompt and tools.
 		const explorationPromptDigest = this.#tools.recordedPromptDigest();
+		const explorationToolsDigest = this.#tools.recordedToolsDigest();
 		this.#bash.withBranchTransition(() => {
 			try {
 				this.sessionManager.branchWithSummary(checkpointState.checkpointEntryId, report, {
@@ -13176,8 +13209,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 				if (calls.length > 0) {
 					const callIds = new Set(calls.map(call => call.id));
-					// The rewind branch ends at the checkpoint, whose recorded prompt may predate this reply's.
+					// The rewind branch ends at the checkpoint, whose records may predate this reply's.
 					this.#tools.recordPromptDigest(explorationPromptDigest);
+					this.#tools.recordToolsDigest(explorationToolsDigest);
 					this.sessionManager.appendMessage(
 						sanitizeAssistantForReparentedHistory({ ...turn.message, content: calls }),
 					);
