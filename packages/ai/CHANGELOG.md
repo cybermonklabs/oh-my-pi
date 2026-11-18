@@ -33,7 +33,7 @@
 - For a tool with `lenientArgValidation` (the flag now lives on the base `Tool` type), `validateToolArguments` keeps every argument repair but puts back any unrecognized key it deleted to reach success, so a tool that owns its refusal sees every key the model wrote instead of a silently narrowed "valid" subset (a key the null-is-absent repair drops, such as a null optional field or an unknown null-valued key inside a closed nested object, stays dropped) ([#12871](https://github.com/can1357/oh-my-pi/pull/12871) by [@sjawhar](https://github.com/sjawhar)).
 - A wire failure a runtime reports only as an errno on `err.code` (`ECONNRESET`, `EPIPE`, `ECONNABORTED`, undici's `UND_ERR_SOCKET`) while leaving the message generic is now classified as a connection failure instead of going unrecognised
 - Fixed Anthropic responses through a custom `baseUrl` (a gateway in front of Anthropic) losing their server-side fallback marker and redacted thinking from the saved turn, so the next request replays that turn's reasoning instead of being refused and retried without it ([#12352](https://github.com/can1357/oh-my-pi/pull/12352) by [@sjawhar](https://github.com/sjawhar))
-- A rate limit or overload the Anthropic API reports inside a streamed response (an `error` event of type `rate_limit_error` or `overloaded_error`) now carries HTTP status 429 or 529, so it is retried and held on the same model as the HTTP response would be
+- A rate limit or overload the Anthropic API reports in its stream before the response starts (an `error` event of type `rate_limit_error` or `overloaded_error`) now carries HTTP status 429 or 529, so it is retried and held on the same model as the HTTP response would be
 
 ### Breaking Changes
 

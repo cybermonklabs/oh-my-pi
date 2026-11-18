@@ -745,6 +745,74 @@ for (const { adapter, url } of BACKENDS) {
 			TIMEOUT,
 		);
 
+		// Every transaction of a staged full write opens read-write on PostgreSQL, as
+		// sql-session-storage-read-write.test.ts shows for the other writes. Each
+		// connection here sets its read-only default itself, so the URL must be a
+		// direct connection, not one through a transaction-mode pooler.
+		it.skipIf(!streamsWrites || adapter !== "postgres")(
+			"stages a full write where a session SET made the connection read-only, and refuses one where the session keeps a read-only default",
+			async () => {
+				const path = "/sessions/p/read-only.jsonl";
+				const refused = "/sessions/p/read-only-refused.jsonl";
+				const plainWrite = `DELETE FROM ${db.table}_parts WHERE path = '${refused}'`;
+				const readOnly = async (client: SqlClient) =>
+					(
+						(await client.unsafe(
+							"SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'",
+						)) as Array<{ setting: string; reset_val: string }>
+					)[0];
+				const stagingOf = async (session: string): Promise<string[]> =>
+					(await db.stagingPaths()).filter(staged => staged.startsWith(`${session}${STAGING}`));
+				const sessionSet = new SQL(url ?? "", { max: 1, idleTimeout: 0 });
+				const kept = new SQL(url ?? "", {
+					max: 1,
+					idleTimeout: 0,
+					connection: { default_transaction_read_only: "on" },
+				});
+				try {
+					const lines = transcriptLines(cwd.path(), 2 * MiB);
+					await (await db.open()).writeText(path, "before\n");
+					await db.stage(path, Date.now() - 2 * HOUR_MS, "dead");
+					await sessionSet.unsafe("SET default_transaction_read_only = on");
+					expect(await readOnly(sessionSet)).toEqual({ setting: "on", reset_val: "off" });
+					await expect(sessionSet.unsafe(plainWrite)).rejects.toMatchObject({ errno: "25006" });
+
+					// The stale staging delete, the staging inserts and the swap.
+					const storage = await db.open(sessionSet);
+					await storage.writeLinesAtomic(path, lines, { expectedSize: Buffer.byteLength("before\n") });
+					expect(sha256((await db.stored(path)) ?? "")).toBe(sha256(lines.join("")));
+					expect(await stagingOf(path)).toEqual([]);
+
+					// The staging delete after a failure: another store appends, so this store's size is stale.
+					const appended = `${JSON.stringify({ type: "custom", customType: "other-writer", id: "r1", parentId: null, timestamp: TIMESTAMP })}\n`;
+					const other = await db.open();
+					const append = other.openWriter(path);
+					await append.append(appended);
+					await append.close();
+					await other.drain();
+					const stale = storage.writeLinesAtomic(path, lines, { expectedSize: storage.statSync(path).size });
+					await expect(stale).rejects.toBeInstanceOf(SessionWriteConflictError);
+					expect(sha256((await db.stored(path)) ?? "")).toBe(sha256(lines.join("") + appended));
+					expect(await stagingOf(path)).toEqual([]);
+					expect(await readOnly(sessionSet)).toEqual({ setting: "on", reset_val: "off" });
+
+					expect(await readOnly(kept)).toEqual({ setting: "on", reset_val: "on" });
+					await expect(kept.unsafe(plainWrite)).rejects.toMatchObject({ errno: "25006" });
+					const refusing = await SqlSessionStorage.create({ client: kept, table: db.table, createTable: false });
+					await expect(refusing.writeLinesAtomic(refused, lines, { expectedSize: null })).rejects.toThrow(
+						"default_transaction_read_only",
+					);
+					expect(await db.stored(refused)).toBeNull();
+					expect(await stagingOf(refused)).toEqual([]);
+				} finally {
+					// Best effort: a RESET that fails on a broken connection must not hide the error that broke it.
+					await sessionSet.unsafe("RESET default_transaction_read_only").catch(() => {});
+					await Promise.all([sessionSet.end(), kept.end()]);
+				}
+			},
+			TIMEOUT,
+		);
+
 		it("deletes the staging parts under a session's artifacts directory with the session", async () => {
 			const session = "/sessions/p/doomed.jsonl";
 			const storage = await db.open();

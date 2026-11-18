@@ -1160,8 +1160,7 @@ export function invalidateConvertToLlmArrayCache(messages: AgentMessage[]): void
 }
 
 registerMessageCacheInvalidator(message => {
-	steeringWrapperCache.delete(message);
-	convertCache.delete(message);
+	forgetConvertMemo(message);
 	convertGeneration++;
 });
 

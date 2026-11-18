@@ -118,18 +118,20 @@ export class SessionStatsTracker {
 	}
 
 	/**
-	 * What the next request carries of provider anchor `anchor`'s own output:
+	 * Provider anchor `anchor`'s base for {@link #anchoredUsedTokens}: its
+	 * corrected prompt, and what the next request carries of its own output:
 	 * its text, the thinking that replays and its tool-call arguments, which its
-	 * prompt buckets do not hold. Counted as the request renders them, and at
-	 * most the output the provider reported for the turn, since an opaque
-	 * reasoning payload is billed at the reasoning's size, not its byte size. A
-	 * provider-reported context occupancy (`usage.contextTokens`) already holds
-	 * the turn.
+	 * prompt buckets do not hold. The output is counted as the request renders
+	 * it, and at most the output the provider reported for the turn, since an
+	 * opaque reasoning payload is billed at the reasoning's size, not its byte
+	 * size. A provider-reported context occupancy (`usage.contextTokens`)
+	 * already holds the turn.
 	 */
-	#anchorOutputTokens(anchor: AssistantMessage): number {
-		if (anchor.usage.contextTokens !== undefined) return 0;
+	#anchorBaseTokens(anchor: AssistantMessage): number {
+		const promptTokens = correctedPromptTokens(anchor);
+		if (anchor.usage.contextTokens !== undefined) return promptTokens;
 		const carried = this.#tokenizer.countMessage(anchor);
-		return anchor.usage.output > 0 ? Math.min(anchor.usage.output, carried) : carried;
+		return promptTokens + (anchor.usage.output > 0 ? Math.min(anchor.usage.output, carried) : carried);
 	}
 
 	/**
@@ -352,7 +354,7 @@ export class SessionStatsTracker {
 		if (useAnchor && anchorAssistant) {
 			anchored = true;
 			usedTokens = this.#anchoredUsedTokens(
-				correctedPromptTokens(anchorAssistant) + this.#anchorOutputTokens(anchorAssistant),
+				this.#anchorBaseTokens(anchorAssistant),
 				anchorAssistant.contextSnapshot ?? current,
 				current,
 				anchorIndex + 1,
@@ -375,7 +377,7 @@ export class SessionStatsTracker {
 			const liveAnchor = findTranscriptUsageAnchor(activeMessages);
 			if (liveAnchor) {
 				usedTokens = this.#anchoredUsedTokens(
-					correctedPromptTokens(liveAnchor.message) + this.#anchorOutputTokens(liveAnchor.message),
+					this.#anchorBaseTokens(liveAnchor.message),
 					liveAnchor.message.contextSnapshot ?? current,
 					current,
 					liveAnchor.index + 1,
