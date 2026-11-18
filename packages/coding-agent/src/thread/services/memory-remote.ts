@@ -35,7 +35,7 @@ import type {
 	UpdateDocumentOptions,
 } from "../../hindsight/client";
 import type { HindsightConfig } from "../../hindsight/config";
-import type { RecallSkip, RecallWait } from "../../hindsight/recall-wait";
+import type { RecallSkip, RecallWait, RecallWaitOutcome } from "../../hindsight/recall-wait";
 import type { HindsightSessionStateApi } from "../../hindsight/state";
 import type { MnemopiBackendConfig } from "../../mnemopi/config";
 import type {
@@ -194,7 +194,7 @@ export class RemoteRecallWait implements RecallWait {
 		}
 	}
 
-	record(outcome: { ok: boolean; failure?: string }): number | undefined {
+	record(outcome: RecallWaitOutcome): number | undefined {
 		try {
 			return this.#remote.callSync("recallWait.record", outcome);
 		} catch (error) {

@@ -306,11 +306,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	hasRecalledForFirstTurn: boolean;
 	lastRecallSnippet?: string;
 	#recallGeneration = 0;
-	/**
-	 * Pause after a failed automatic recall (`hindsight.recallCooldownMs`). An alias shares
-	 * its parent's: it runs no first-turn recall, and its compaction recall waits out the
-	 * primary's pause and records its outcome there.
-	 */
+	/** Pause after a failed automatic recall (`hindsight.recallCooldownMs`); an alias holds its parent's. */
 	readonly recallWait: RecallWait;
 	/** The failure record whose first skip this state already announced. */
 	#shownFailureId: number | undefined;
@@ -445,10 +441,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	 * shares the record but announces its first skip in its own session.
 	 */
 	#skipRecallAfterFailure(): boolean {
-		const now = Date.now();
 		const skip = this.recallWait.skip();
 		if (!skip) return false;
 		if (skip.failure.id !== this.#shownFailureId) {
+			const now = Date.now();
 			const cause = skip.failure.error;
 			logger.warn("Hindsight: recall skipped after a recent failure", {
 				bankId: this.bankId,

@@ -35,7 +35,7 @@ import type {
 	UpdateDocumentOptions,
 } from "../../hindsight/client";
 import type { HindsightConfig } from "../../hindsight/config";
-import type { RecallSkip } from "../../hindsight/recall-wait";
+import type { RecallSkip, RecallWaitOutcome } from "../../hindsight/recall-wait";
 import type { MnemopiBackendConfig } from "../../mnemopi/config";
 import type {
 	MnemopiBankStats,
@@ -104,7 +104,7 @@ export type HindsightSessionStateProtocol = {
 	"banks.delete": RpcMethod<[bankId: string], boolean>;
 	"banks.list": RpcMethod<[], string[]>;
 	"recallWait.skip": RpcMethod<[], RecallSkip | undefined>;
-	"recallWait.record": RpcMethod<[outcome: { ok: boolean; failure?: string }], number | undefined>;
+	"recallWait.record": RpcMethod<[outcome: RecallWaitOutcome], number | undefined>;
 };
 
 /** A parent Mnemopi state's fields (read live) and its scoped-bank operations; sync ones are `callSync`. */

@@ -40,6 +40,12 @@ export interface RecallSkip {
 	retryAt: number;
 }
 
+/** An automatic recall's outcome as a {@link RecallWait} records it. */
+export interface RecallWaitOutcome {
+	ok: boolean;
+	failure?: string;
+}
+
 /**
  * The pause of a primary session state, which its subagent aliases share. The clock is read
  * where the record lives, so a worker alias's calls run on the main thread's clock.
@@ -52,7 +58,7 @@ export interface RecallWait {
 	 * failure. Returns when automatic recall may run again after a failure it keeps, epoch ms;
 	 * undefined after an answer or with the pause off.
 	 */
-	record(outcome: { ok: boolean; failure?: string }): number | undefined;
+	record(outcome: RecallWaitOutcome): number | undefined;
 }
 
 /** When automatic recall may run again after `failure`, epoch ms. */
@@ -104,7 +110,7 @@ export class RecallFailureWait implements RecallWait {
 	 * the next failure starts again at the first pause. An aborted recall has neither and
 	 * records nothing.
 	 */
-	record(outcome: { ok: boolean; failure?: string }): number | undefined {
+	record(outcome: RecallWaitOutcome): number | undefined {
 		if (this.#cooldownMs <= 0) return undefined;
 		if (outcome.failure === undefined) {
 			if (outcome.ok) this.#failure = undefined;

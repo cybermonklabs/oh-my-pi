@@ -42,6 +42,8 @@ function mnemopiConfig(dbPath: string): MnemopiBackendConfig {
 }
 
 const T0 = Date.parse("2026-01-01T00:00:00.000Z");
+/** The first pause after a failed recall: the shipped default of `hindsight.recallCooldownMs`. */
+const FIRST_PAUSE_MS = 60_000;
 const PROMPT = "Where is the deploy host?";
 const COMPACTION_MESSAGES = [{ role: "user", content: "what did we decide?" }];
 
@@ -212,16 +214,16 @@ describe("memory thread service", () => {
 		try {
 			setSystemTime(T0);
 			expect(await parent.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
-			const aliasFailedAt = T0 + 61_000;
+			const aliasFailedAt = T0 + FIRST_PAUSE_MS + 1_000;
 			setSystemTime(aliasFailedAt);
 			expect(await probe.hindsightCompaction(parent, COMPACTION_MESSAGES)).toBeUndefined();
 			expect(recall).toHaveBeenCalledTimes(2);
 
 			// The second failure in a row pauses for two minutes, not one.
-			setSystemTime(aliasFailedAt + 119_000);
+			setSystemTime(aliasFailedAt + 2 * FIRST_PAUSE_MS - 1_000);
 			expect(await parent.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
 			expect(recall).toHaveBeenCalledTimes(2);
-			setSystemTime(aliasFailedAt + 121_000);
+			setSystemTime(aliasFailedAt + 2 * FIRST_PAUSE_MS + 1_000);
 			expect(await parent.beforeAgentStartPrompt(PROMPT)).toBeUndefined();
 			expect(recall).toHaveBeenCalledTimes(3);
 		} finally {
