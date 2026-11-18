@@ -95,6 +95,31 @@ export function answer(turn: number, usage?: ReplyUsage): Response {
 	);
 }
 
+/** A streamed reply calling `name` with `input`, the gateway's `turn`th. */
+export function toolCallAnswer(
+	turn: number,
+	name: string,
+	input: Record<string, unknown>,
+	usage?: ReplyUsage,
+): Response {
+	return streamedAnswer(
+		turn,
+		{ type: "tool_use", id: `toolu_${turn}`, name, input: {} },
+		[{ type: "input_json_delta", partial_json: JSON.stringify(input) }],
+		"tool_use",
+		usage,
+	);
+}
+
+/** Every text a wire value carries: text blocks, string contents and nested tool results. */
+export function textOf(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (Array.isArray(value)) return value.map(textOf).join("\n");
+	if (typeof value !== "object" || value === null) return "";
+	const record = value as Record<string, unknown>;
+	return [record.text, record.content].map(textOf).join("\n");
+}
+
 /** Cache breakpoints follow the end of each request, so they are left out of the comparison. */
 export function withoutCacheControl(value: unknown): string {
 	return JSON.stringify(value, (key, inner) => (key === "cache_control" ? undefined : inner));

@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Agent, AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { Model, Tool } from "@oh-my-pi/pi-ai";
 import { resolveDelegationBias } from "@oh-my-pi/pi-catalog/compat/delegation";
 import { isRecord, logger, prompt, stringProperty, structuredCloneJSON, untilAborted } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
@@ -27,6 +27,7 @@ import {
 } from "../extensibility/skills";
 import { type LocalProtocolOptions } from "../internal-urls";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
+import { sameItems } from "@oh-my-pi/pi-tui/native/memo";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
 import { findDeliveredRecall, MEMORY_RECALL_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
@@ -71,6 +72,7 @@ import {
 } from "../tools/xdev";
 import type { EditModeSetting } from "../edit/settings";
 import { resolveEditMode } from "../utils/edit-mode";
+import { TOOL_DECLARATION_KEYS } from "../utils/tool-declarations";
 import {
 	extractPermissionLocations,
 	getPermissionIntent,
@@ -353,7 +355,7 @@ interface StoredSystemPrompt {
 const SYSTEM_PROMPT_HOLD_CUSTOM_TYPE = "system-prompt-hold";
 
 /** Data of a {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE} entry. */
-interface WithheldPromptChange {
+interface SystemPromptHold {
 	/** Digest of the base prompt that withholds the change, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
 	digest: string;
 	/** When the change was made (Unix milliseconds). */
@@ -406,11 +408,6 @@ function systemPromptDigest(blocks: readonly string[]): string {
 	return hash.toString(16);
 }
 
-/** Whether two prompts carry the same blocks in the same order. */
-function samePromptBlocks(left: readonly string[], right: readonly string[]): boolean {
-	return left.length === right.length && left.every((block, index) => block === right[index]);
-}
-
 /** What a request declares for `tool`: its names, description and parameter schema. */
 function toolDeclaration(
 	tool: Pick<AgentTool, "name" | "customWireName" | "label" | "description" | "parameters">,
@@ -419,40 +416,38 @@ function toolDeclaration(
 }
 
 /** The members of a tool that shape what a request declares for it besides its name; getters may render them. */
-type ToolDeclarationFields = Pick<
-	AgentTool,
-	"description" | "parameters" | "strict" | "deferLoading" | "customFormat" | "customWireName" | "examples" | "intent"
->;
+type ToolDeclarationFields = Pick<AgentTool, Exclude<keyof Tool, "name"> | "intent">;
+
+/** The keys of {@link ToolDeclarationFields}: every {@link Tool} field but its name, and the tool's `intent`. */
+const TOOL_DECLARATION_FIELD_KEYS: readonly (keyof ToolDeclarationFields)[] = [
+	...TOOL_DECLARATION_KEYS.filter((key): key is Exclude<keyof Tool, "name"> => key !== "name"),
+	"intent",
+];
 
 /** `tool`'s {@link ToolDeclarationFields} as they read now. */
 function toolDeclarationFields(tool: AgentTool): ToolDeclarationFields {
-	return {
-		description: tool.description,
-		parameters: tool.parameters,
-		strict: tool.strict,
-		deferLoading: tool.deferLoading,
-		customFormat: tool.customFormat,
-		customWireName: tool.customWireName,
-		examples: tool.examples,
-		intent: tool.intent,
-	};
+	const fields: Partial<Record<keyof ToolDeclarationFields, unknown>> = {};
+	for (const key of TOOL_DECLARATION_FIELD_KEYS) fields[key] = tool[key];
+	return fields as ToolDeclarationFields;
 }
 
 /**
- * `tool` declared with `fields` in place of what its own members render now. Requests, argument checks and token
- * counts read `fields`. Every other member is the tool's own, read and called through `run`; its methods run on the
- * tool itself, so a tool that keeps private state still runs.
+ * `target` with each own member of `overrides` read in its place (a getter of `overrides` runs on each read). Every
+ * other member is the target's own, read through `run` when given; a method runs on the target itself, through
+ * `run` when given, so a target that keeps private state still works. Each method is wrapped once.
  */
-function withToolDeclaration(tool: AgentTool, fields: ToolDeclarationFields, run: <T>(use: () => T) => T): AgentTool {
+function forwardingProxy<T extends object>(target: T, overrides: object, run?: <R>(use: () => R) => R): T {
 	const methods = new Map<PropertyKey, unknown>();
-	return new Proxy(tool, {
-		get(target, property) {
-			if (Object.hasOwn(fields, property)) return fields[property as keyof ToolDeclarationFields];
-			const value: unknown = run(() => Reflect.get(target, property, target));
+	return new Proxy(target, {
+		get(object, property) {
+			if (Object.hasOwn(overrides, property)) return Reflect.get(overrides, property);
+			const value: unknown = run
+				? run(() => Reflect.get(object, property, object))
+				: Reflect.get(object, property, object);
 			if (typeof value !== "function") return value;
 			let method = methods.get(property);
 			if (method === undefined) {
-				method = (...args: unknown[]) => run(() => value.apply(target, args));
+				method = run ? (...args: unknown[]) => run(() => value.apply(object, args)) : value.bind(object);
 				methods.set(property, method);
 			}
 			return method;
@@ -481,7 +476,7 @@ function storedPromptOfEntry(entry: SessionEntry): StoredSystemPrompt | undefine
 }
 
 /** The change a branch entry records as withheld, or `undefined` when it is no such record or a malformed one. */
-function withheldChangeOfEntry(entry: SessionEntry): WithheldPromptChange | undefined {
+function promptHoldOfEntry(entry: SessionEntry): SystemPromptHold | undefined {
 	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_HOLD_CUSTOM_TYPE || !isRecord(entry.data)) {
 		return undefined;
 	}
@@ -548,11 +543,6 @@ function isPerCallModelAdvertisement(value: unknown): value is PerCallModelAdver
 interface HeldSettingsRebuild extends WithheldChange {
 	/** Identifies the hold's settings notices on any branch ({@link SettingsNoticeDetails.hold}). */
 	readonly id: string;
-	/**
-	 * The cut rule admitted a cut under this hold that rewrites every message anyway
-	 * ({@link SessionTools.noteRewritingCutAdmitted}): the rebuild is due.
-	 */
-	due: boolean;
 	/** Each changed setting's value when the hold began: the value the bound prompt was built with. */
 	readonly before: Map<AnySetting, unknown>;
 	/** What the hold's settings notices told the model, each with the ones before it on its branch, by number. */
@@ -571,7 +561,7 @@ interface HeldSettingsRebuild extends WithheldChange {
 	 * process sent none on a prefix-bound model: the tools then declare what they render.
 	 */
 	readonly declarations: ReadonlyMap<string, ToolDeclarationFields> | undefined;
-	/** Each tool the hold declares with {@link declarations}, wrapped once ({@link withToolDeclaration}). */
+	/** Each tool the hold declares with {@link declarations}, wrapped once ({@link forwardingProxy}). */
 	readonly declared: WeakMap<AgentTool, AgentTool>;
 	/**
 	 * The settings a tool the hold keeps declared as sent was declared under: each changed setting reads its value
@@ -593,18 +583,14 @@ const NO_HELD_TOOLS = JSON.stringify([[], []]);
 
 /**
  * A resumed transcript's stored prompt, restored in place of this process's own build, which it withholds from the
- * model ({@link SessionTools.releaseRestoredPrompt}).
+ * model ({@link SessionTools.replaceRestoredPromptIfDue}).
  */
 interface RestoredPrompt extends WithheldChange {
 	/** The stored blocks, restored as the base. */
 	readonly base: readonly string[];
 	/** Digest of {@link base}, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
 	readonly digest: string;
-	/** When the withheld change was made: the earliest the branch records, else the restore. */
-	readonly since: number;
-	/** A cut that rewrites every message, or a move to another transcript, ended the reason to keep it. */
-	due: boolean;
-	/** The branch records {@link since} for it ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}). */
+	/** The branch records {@link WithheldChange.since} for it ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}). */
 	recorded: boolean;
 }
 
@@ -744,7 +730,7 @@ export class SessionTools {
 	#basePromptRestored = false;
 	/**
 	 * The restored transcript's stored prompt while it is kept in place of this process's own build; kept only while
-	 * its `base` is the base. See {@link releaseRestoredPrompt}.
+	 * its `base` is the base. See {@link replaceRestoredPromptIfDue}.
 	 */
 	#restoredPrompt: RestoredPrompt | undefined;
 	/**
@@ -1857,10 +1843,10 @@ export class SessionTools {
 		} catch (error) {
 			this.#promptSkills = promptSkills;
 			this.#heldSettingsRebuild ??= held;
-			this.#setAgentTools(this.#host.agent.state.tools);
 			throw error;
+		} finally {
+			this.#setAgentTools(this.#host.agent.state.tools);
 		}
-		this.#setAgentTools(this.#host.agent.state.tools);
 	}
 
 	/**
@@ -1880,7 +1866,10 @@ export class SessionTools {
 			const kept = toolDeclaration({ ...fields, name: own.name, label: own.label });
 			let checkedRevision: number | undefined;
 			let altered = false;
-			declared = withToolDeclaration(own, fields, use => {
+			// Requests, argument checks and token counts read `fields`; every other member is the tool's own, read and
+			// called through the scope below, and its methods run on the tool itself, so a tool that keeps private state
+			// still runs.
+			declared = forwardingProxy(own, fields, use => {
 				if (this.#heldSettingsRebuild !== held) return use();
 				const revision = this.#host.settings.revision;
 				if (revision !== checkedRevision) {
@@ -1904,31 +1893,21 @@ export class SessionTools {
 	}
 
 	/**
-	 * The session's settings as a tool `hold` keeps declared as sent reads them: each setting the held change moved
-	 * reads its value from before the change while that hold lasts, and the live one once it ends (a job a call
-	 * started outlives it). Writes, listeners, overlays and every other member are the session settings' own.
+	 * The session's settings as a tool held with `before` (its hold's {@link HeldSettingsRebuild.before}) keeps declared
+	 * as sent reads them: each setting the held change moved reads its value from before the change while that hold
+	 * lasts, and the live one once it ends (a job a call started outlives it). Writes, listeners, overlays and every
+	 * other member are the session settings' own.
 	 */
-	#settingsAsDeclared(hold: () => HeldSettingsRebuild): Settings {
+	#settingsAsDeclared(before: ReadonlyMap<AnySetting, unknown>): Settings {
 		const settings = this.#host.settings;
-		const rawValue = (setting: AnySetting): unknown => {
-			const held = hold();
-			if (this.#heldSettingsRebuild === held && held.before.has(setting)) return held.before.get(setting);
-			return settings.rawValue(setting);
-		};
-		const methods = new Map<PropertyKey, unknown>();
-		return new Proxy(settings, {
-			get(target, property) {
-				if (property === "rawValue") return rawValue;
-				// Values derived from the held ones never reach the session settings' memo.
-				if (property === "valueCache") return [];
-				const value: unknown = Reflect.get(target, property, target);
-				if (typeof value !== "function") return value;
-				let method = methods.get(property);
-				if (method === undefined) {
-					method = value.bind(target);
-					methods.set(property, method);
-				}
-				return method;
+		return forwardingProxy(settings, {
+			rawValue: (setting: AnySetting): unknown => {
+				if (this.#heldSettingsRebuild?.before === before && before.has(setting)) return before.get(setting);
+				return settings.rawValue(setting);
+			},
+			// Values derived from the held ones never reach the session settings' memo.
+			get valueCache() {
+				return [];
 			},
 		});
 	}
@@ -1936,8 +1915,7 @@ export class SessionTools {
 	/** Gives the agent `tools`, each {@link #declaredAs} the agent holds it; nothing when that changes nothing. */
 	#setAgentTools(tools: readonly AgentTool[]): void {
 		const declared = tools.map(tool => this.#declaredAs(tool));
-		const current = this.#host.agent.state.tools;
-		if (current.length === declared.length && current.every((tool, index) => tool === declared[index])) return;
+		if (sameItems(this.#host.agent.state.tools, declared)) return;
 		this.#host.agent.setTools(declared);
 	}
 
@@ -2398,7 +2376,7 @@ export class SessionTools {
 	 */
 	#recordWithheldChange(digest: string, since: number): void {
 		if (this.#operatorPromptDigest === undefined) return;
-		const change: WithheldPromptChange = { digest, since };
+		const change: SystemPromptHold = { digest, since };
 		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_HOLD_CUSTOM_TYPE, change);
 	}
 
@@ -2414,7 +2392,7 @@ export class SessionTools {
 			const entry = branch[index];
 			const recorded = promptDigestOfEntry(entry);
 			if (recorded !== null && recorded !== digest) break;
-			const withheld = withheldChangeOfEntry(entry);
+			const withheld = promptHoldOfEntry(entry);
 			if (withheld?.digest === digest) since = Math.min(withheld.since, since ?? withheld.since);
 		}
 		return since;
@@ -2439,7 +2417,7 @@ export class SessionTools {
 	 * out. It goes out too once the change the stored prompt withholds is
 	 * {@link WITHHELD_CHANGE_MAX_AGE_MS} old by the branch's record
 	 * ({@link #withheldChangeSince}); a restored prompt is released as soon as
-	 * that or any other reason to keep it ends ({@link releaseRestoredPrompt}).
+	 * that or any other reason to keep it ends ({@link replaceRestoredPromptIfDue}).
 	 * Models that do not bind their prefix keep the fresh build: they rebuild
 	 * freely mid-session as well.
 	 */
@@ -2455,6 +2433,7 @@ export class SessionTools {
 		const restoredPrompt: RestoredPrompt = {
 			base: stored.blocks,
 			digest: restored.promptDigest,
+			// The earliest the branch records, else the restore.
 			since: recordedSince ?? Date.now(),
 			due: false,
 			recorded: recordedSince !== undefined,
@@ -2484,7 +2463,7 @@ export class SessionTools {
 		return this.#heldSettingsRebuild !== undefined || this.#keptRestoredPrompt() !== undefined;
 	}
 
-	/** Whether the kept restored transcript prompt is due for release ({@link releaseRestoredPrompt}). */
+	/** Whether the kept restored transcript prompt is due for release ({@link replaceRestoredPromptIfDue}). */
 	#restoredPromptDue(lapsed: boolean): boolean {
 		const restored = this.#keptRestoredPrompt();
 		return restored !== undefined && withheldChangeDue(restored, lapsed);
@@ -2498,7 +2477,7 @@ export class SessionTools {
 	 * {@link WITHHELD_CHANGE_MAX_AGE_MS} after the change. The rebuild renders the live settings, so a held settings
 	 * rebuild runs with it.
 	 */
-	releaseRestoredPrompt(lapsed: boolean): Promise<void> {
+	replaceRestoredPromptIfDue(lapsed: boolean): Promise<void> {
 		// Nothing runs: no wait behind the registry mutations in flight.
 		if (!this.#restoredPromptDue(lapsed)) return Promise.resolve();
 		return this.runToolRegistryMutation(async () => {
@@ -3404,7 +3383,7 @@ export class SessionTools {
 			}
 			const base = this.#baseSystemPrompt;
 			let prepared = await this.#prepareBaseSystemPrompt();
-			if (this.#heldSettingsRebuild && prepared && !samePromptBlocks(prepared.systemPrompt, base)) {
+			if (this.#heldSettingsRebuild && prepared && !sameItems(prepared.systemPrompt, base)) {
 				await this.#absorbHeldSettingsRebuild();
 				prepared = await this.#prepareBaseSystemPrompt();
 			}
@@ -3430,11 +3409,12 @@ export class SessionTools {
 		if (!held) {
 			const promptDigest = this.currentPromptDigest();
 			const sent = this.#sentDeclarations;
-			const hold: HeldSettingsRebuild = {
+			const before = new Map<AnySetting, unknown>();
+			held = {
 				id: crypto.randomUUID(),
 				since: Date.now(),
 				due: false,
-				before: new Map(),
+				before,
 				notices: [],
 				disabledTools: new Map(),
 				enabledTools: new Set(),
@@ -3442,9 +3422,8 @@ export class SessionTools {
 				skills: false,
 				declarations: sent?.promptDigest === promptDigest ? sent.tools : undefined,
 				declared: new WeakMap(),
-				toolSettings: this.#settingsAsDeclared(() => hold),
+				toolSettings: this.#settingsAsDeclared(before),
 			};
-			held = hold;
 			this.#heldSettingsRebuild = held;
 			this.#recordWithheldChange(promptDigest, held.since);
 			this.#setAgentTools(this.#host.agent.state.tools);
@@ -3626,7 +3605,7 @@ export class SessionTools {
 		if (
 			standIn?.base === previousBaseSystemPrompt &&
 			this.#host.model()?.thinking?.prefixBinding === true &&
-			samePromptBlocks(built.systemPrompt, standIn.build)
+			sameItems(built.systemPrompt, standIn.build)
 		) {
 			if (this.#heldSettingsRebuild) {
 				return {
@@ -3660,7 +3639,7 @@ export class SessionTools {
 				this.#promptSurface = candidate;
 				this.#setBasePromptXdevNames(built.xdevCatalogNames);
 				this.#host.clearMemoryPromotionSnapshot();
-				if (!samePromptBlocks(previousBaseSystemPrompt, this.#baseSystemPrompt)) {
+				if (!sameItems(previousBaseSystemPrompt, this.#baseSystemPrompt)) {
 					this.#host.clearInheritedProviderPromptCacheKey();
 				}
 				this.#applyAgentSystemPrompt(this.#baseSystemPrompt);
@@ -3700,7 +3679,7 @@ export class SessionTools {
 		const built = await this.#promptSurfaceScope.run(candidate, () =>
 			rebuildSystemPrompt(roster.toolNames, roster.tools, roster.xdev),
 		);
-		if (!samePromptBlocks(built.systemPrompt, previousBaseSystemPrompt)) return undefined;
+		if (!sameItems(built.systemPrompt, previousBaseSystemPrompt)) return undefined;
 		return this.#keptBasePreparation(previousBaseSystemPrompt, candidate, isCurrent);
 	}
 

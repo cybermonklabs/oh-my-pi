@@ -6,7 +6,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	continuesCachedPrompt,
@@ -14,7 +14,8 @@ import {
 	gatewaySessionOptions,
 	type MessagesRequest,
 	mockGatewayFetch,
-	streamedAnswer,
+	textOf,
+	toolCallAnswer,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
 
@@ -29,25 +30,6 @@ const CACHE_WRITE_TOKENS = 100;
 /** A text reply; the request it answers sent `inputTokens` uncached. */
 function textAnswer(turn: number, inputTokens?: number): Response {
 	return answer(turn, { inputTokens, cacheWriteTokens: CACHE_WRITE_TOKENS });
-}
-
-function toolCallAnswer(turn: number, name: string, input: Record<string, unknown>): Response {
-	return streamedAnswer(
-		turn,
-		{ type: "tool_use", id: `toolu_${turn}`, name, input: {} },
-		[{ type: "input_json_delta", partial_json: JSON.stringify(input) }],
-		"tool_use",
-		{ cacheWriteTokens: CACHE_WRITE_TOKENS },
-	);
-}
-
-/** Every text a wire value carries: text blocks, string contents and nested tool results. */
-function textOf(value: unknown): string {
-	if (typeof value === "string") return value;
-	if (Array.isArray(value)) return value.map(textOf).join("\n");
-	if (typeof value !== "object" || value === null) return "";
-	const record = value as Record<string, unknown>;
-	return [record.text, record.content].map(textOf).join("\n");
 }
 
 interface Harness {
@@ -124,21 +106,6 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 		return { session, settings, requests, overlay, modelRegistry };
 	}
 
-	/** Rewrites the overlay and reloads it as the config watcher does, then waits for the rebuilds the change starts. */
-	async function reloadOverlay(harness: Harness, content: string): Promise<void> {
-		const rebuilds = [
-			vi.spyOn(harness.session, "refreshBaseSystemPrompt"),
-			vi.spyOn(harness.session, "reconcileBuiltinTools"),
-			vi.spyOn(harness.session, "refreshSkillsAndCommands"),
-		];
-		await Bun.write(harness.overlay, content);
-		await harness.settings.reloadFromDisk();
-		// The settings listeners run in the microtask the reload queued for them.
-		await Promise.resolve();
-		await Promise.all(rebuilds.flatMap(spy => spy.mock.results.map(result => result.value)));
-		for (const spy of rebuilds) spy.mockRestore();
-	}
-
 	function requestPair(harness: Harness): [MessagesRequest, MessagesRequest] {
 		const [first, second] = harness.requests;
 		if (!first || !second) throw new Error("Expected two requests");
@@ -165,7 +132,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 		const tempDir = createTempDir();
 		const harness = await startSession(tempDir, {
 			toolNames: ["read", "eval", "todo"],
-			replies: { 2: turn => toolCallAnswer(turn, "todo", { op: "view" }) },
+			replies: { 2: turn => toolCallAnswer(turn, "todo", { op: "view" }, { cacheWriteTokens: CACHE_WRITE_TOKENS }) },
 		});
 		await harness.session.prompt("first");
 
@@ -217,7 +184,10 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			toolNames: ["read", "eval", "todo"],
 			discoverSkills: true,
 			overlay: projectSkills,
-			replies: { 3: turn => toolCallAnswer(turn, "read", { path: "skill://late-skill" }) },
+			replies: {
+				3: turn =>
+					toolCallAnswer(turn, "read", { path: "skill://late-skill" }, { cacheWriteTokens: CACHE_WRITE_TOKENS }),
+			},
 		});
 		await harness.session.prompt("first");
 		await reloadOverlay(
@@ -247,7 +217,10 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			toolNames: ["read", "eval"],
 			discoverSkills: true,
 			overlay: projectSkills,
-			replies: { 3: turn => toolCallAnswer(turn, "read", { path: "skill://late-skill" }) },
+			replies: {
+				3: turn =>
+					toolCallAnswer(turn, "read", { path: "skill://late-skill" }, { cacheWriteTokens: CACHE_WRITE_TOKENS }),
+			},
 		});
 		await harness.session.prompt("first");
 		// `disabledProviders` reruns skill discovery and nothing else: the hold it takes is the skill list's alone.
@@ -276,7 +249,10 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			discoverSkills: true,
 			discoverContextFiles: true,
 			overlay: projectSkills,
-			replies: { 3: turn => toolCallAnswer(turn, "read", { path: "skill://late-skill" }) },
+			replies: {
+				3: turn =>
+					toolCallAnswer(turn, "read", { path: "skill://late-skill" }, { cacheWriteTokens: CACHE_WRITE_TOKENS }),
+			},
 		});
 		await harness.session.prompt("first");
 		// The held rebuild would carry the edited context file, so the build the kept prompt stands in for differs
@@ -374,7 +350,11 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			contextWindow: 100_000,
 			replies: {
 				...Object.fromEntries(
-					parts.map((part, index) => [index + 2, (turn: number) => toolCallAnswer(turn, "read", { path: part })]),
+					parts.map((part, index) => [
+						index + 2,
+						(turn: number) =>
+							toolCallAnswer(turn, "read", { path: part }, { cacheWriteTokens: CACHE_WRITE_TOKENS }),
+					]),
 				),
 				// The reply after the reads fills the window past its reserve.
 				[parts.length + 2]: (turn: number) => textAnswer(turn, 90_000),

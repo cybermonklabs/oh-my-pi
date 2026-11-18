@@ -399,8 +399,11 @@ function mergeLlmCompactionPreserveData(
 	return snapcompact.stripPreservedArchive(Object.keys(preserveData).length > 0 ? preserveData : undefined);
 }
 
-/** Wrap a handoff document as a compaction summary: append the cumulative file-operations tag and derive entry details. */
-function handoffSummaryFromDocument(
+/**
+ * Wrap `document` (a handoff document; empty for the file lists alone) as a compaction summary: append the cumulative
+ * file-operations tag and derive entry details.
+ */
+function summaryWithFileOperations(
 	document: string,
 	preparation: CompactionPreparation,
 ): { summary: string; details: CompactionDetails } {
@@ -800,9 +803,16 @@ export class SessionMaintenance {
 	 * client requests, do not ask.
 	 */
 	admitsContextCut(cut: ContextCut): boolean {
+		const admitted = this.#cutRuleAdmits(cut);
+		if (admitted) for (const listener of this.#cutAdmittedListeners) listener(cut);
+		return admitted;
+	}
+
+	/** Whether the cut rule admits `cut` now, as {@link admitsContextCut} asks it, without telling its listeners. */
+	#cutRuleAdmits(cut: ContextCut): boolean {
 		const model = this.#model;
 		// No model: no prices or window to weigh the cut with.
-		const admitted =
+		return (
 			!model ||
 			decideSessionContextCut(
 				{
@@ -814,9 +824,8 @@ export class SessionMaintenance {
 					now: Date.now(),
 				},
 				cut,
-			).admitted;
-		if (admitted) for (const listener of this.#cutAdmittedListeners) listener(cut);
-		return admitted;
+			).admitted
+		);
 	}
 
 	/** Calls `listener` with each cut {@link admitsContextCut} admits, until the returned function is called. */
@@ -2451,7 +2460,7 @@ export class SessionMaintenance {
 		try {
 			const result = await this.#host.generateHandoffDocument(customInstructions, options);
 			if (!result) return undefined;
-			const { summary, details } = handoffSummaryFromDocument(result.document, preparation);
+			const { summary, details } = summaryWithFileOperations(result.document, preparation);
 			await this.#commitCompactionEntry({
 				summary,
 				shortSummary: undefined,
@@ -2640,7 +2649,7 @@ export class SessionMaintenance {
 				signal,
 			});
 			if (!generated) return clear();
-			const { summary, details } = handoffSummaryFromDocument(generated.document, preparation);
+			const { summary, details } = summaryWithFileOperations(generated.document, preparation);
 			armed = {
 				result: {
 					summary,
@@ -3078,6 +3087,17 @@ export class SessionMaintenance {
 	}
 
 	/**
+	 * Points the agent loop's live `activeMessages` at the agent's messages when a cut replaced them, so the loop's
+	 * next request sends the cut context.
+	 */
+	#adoptAgentMessages(activeMessages: AgentMessage[]): void {
+		const messages = this.#host.agent.state.messages;
+		if (messages === activeMessages) return;
+		activeMessages.splice(0, activeMessages.length, ...messages);
+		invalidateConvertToLlmArrayCache(activeMessages);
+	}
+
+	/**
 	 * Compact continuing tool-loop runs before the next provider request.
 	 *
 	 * `onTurnEnd` is the safe boundary: tool results for the just-finished turn
@@ -3108,10 +3128,7 @@ export class SessionMaintenance {
 				!signal?.aborted &&
 				!this.#host.isDisposed(),
 		);
-		if (pruned && this.#host.agent.state.messages !== activeMessages) {
-			activeMessages.splice(0, activeMessages.length, ...this.#host.agent.state.messages);
-			invalidateConvertToLlmArrayCache(activeMessages);
-		}
+		if (pruned) this.#adoptAgentMessages(activeMessages);
 
 		const model = this.#model;
 		const contextWindow = model?.contextWindow ?? 0;
@@ -3149,11 +3166,7 @@ export class SessionMaintenance {
 				this.#midTurnDeadEndPendingPrePrompt = null;
 			}
 			if (signal?.aborted) return;
-			const compactedMessages = this.#host.agent.state.messages;
-			if (compactedMessages !== activeMessages) {
-				activeMessages.splice(0, activeMessages.length, ...compactedMessages);
-				invalidateConvertToLlmArrayCache(activeMessages);
-			}
+			this.#adoptAgentMessages(activeMessages);
 			return;
 		}
 
@@ -3239,11 +3252,7 @@ export class SessionMaintenance {
 		}
 
 		if (signal?.aborted) return;
-		const compactedMessages = this.#host.agent.state.messages;
-		if (compactedMessages !== activeMessages) {
-			activeMessages.splice(0, activeMessages.length, ...compactedMessages);
-			invalidateConvertToLlmArrayCache(activeMessages);
-		}
+		this.#adoptAgentMessages(activeMessages);
 		logger.debug("Mid-run compaction ran between provider calls", {
 			contextTokens,
 			contextWindow,
@@ -5412,9 +5421,9 @@ export class SessionMaintenance {
 	 * The cut-rule gate of an automatic compaction with `settings`, asked before it starts. Its summary does not
 	 * exist yet, so the context it leaves is counted with the summary at the summarizer's cap (one more for a split
 	 * turn's prefix) plus the file lists appended to it, beside the kept tail and the tools and system prompt: the
-	 * write is never underestimated. Snapcompact is not asked here: it renders its archive first and is weighed by
-	 * that archive before it commits. With nothing to summarize the method's own no-op handling runs and nothing is
-	 * cut, so the rule is not asked.
+	 * write is never underestimated. Snapcompact is asked by {@link #snapcompactMayBeAdmitted} instead, and again by
+	 * the archive it renders before it commits. With nothing to summarize the method's own no-op handling runs and
+	 * nothing is cut, so the rule is not asked.
 	 */
 	#admitsCompaction(
 		site: string,
@@ -5426,15 +5435,40 @@ export class SessionMaintenance {
 		if (!model) return true;
 		const preparation = prepareCompaction(this.#host.sessionManager.getBranch(), settings, model, this.#tokenizer);
 		if (!preparation) return true;
-		const { readFiles, modifiedFiles } = snapcompact.computeFileLists(preparation.fileOps);
 		const afterTokens =
 			computeNonMessageTokens(this.#host.nonMessageTokenSource(), this.#tokenizer, this.#host.settings.revision) +
 			this.#tokenizer.countMessages(preparation.recentMessages) +
-			this.#tokenizer.countTokens(
-				snapcompact.upsertFileOperations("", readFiles, modifiedFiles, preparation.fileOps.read),
-			) +
+			this.#tokenizer.countTokens(summaryWithFileOperations("", preparation).summary) +
 			MAX_SUMMARY_TOKENS * (preparation.isSplitTurn ? 2 : 1);
 		return this.admitsContextCut(this.#compactionCut(site, reason, afterTokens, trigger));
+	}
+
+	/**
+	 * The cut-rule gate of an automatic snapcompact compaction with `settings`, asked before it starts. Its archive does
+	 * not exist yet, so the rule weighs the most favourable cut it could make: the archive at no tokens, leaving the
+	 * tools and system prompt and the kept tail, counted as {@link #projectCompactedContextTokens} counts it, or the
+	 * tools and system prompt alone when a `session_before_compact` handler, which may keep a shorter tail, is
+	 * registered. A larger cut never saves fewer reads nor writes more again, and whether a cut is forced or its cache
+	 * entry lapsed does not depend on its size, so a pass that waits on this cut waits on any archive it would render:
+	 * it starts nothing. A pass admitted here is weighed again by the archive it renders before it commits, and only
+	 * that cut reaches the {@link onContextCutAdmitted} listeners. With nothing to summarize the rule is not asked.
+	 */
+	#snapcompactMayBeAdmitted(
+		reason: "overflow" | "threshold" | "idle" | "incomplete",
+		settings: EngineCompactionSettings,
+		trigger: { triggerContextTokens?: number; pendingContextTokens?: number },
+	): boolean {
+		const model = this.#model;
+		if (!model) return true;
+		const preparation = prepareCompaction(this.#host.sessionManager.getBranch(), settings, model, this.#tokenizer);
+		if (!preparation) return true;
+		const keptTokens = this.#host.extensionRunner?.hasHandlers("session_before_compact")
+			? 0
+			: this.#countProjectedMessages(preparation.recentMessages);
+		const afterTokens =
+			computeNonMessageTokens(this.#host.nonMessageTokenSource(), this.#tokenizer, this.#host.settings.revision) +
+			keptTokens;
+		return this.#cutRuleAdmits(this.#compactionCut("compaction-snapcompact-bound", reason, afterTokens, trigger));
 	}
 
 	/**
@@ -5567,19 +5601,15 @@ export class SessionMaintenance {
 		}
 
 		// A compaction that waits leaves any background speculation armed for a later pass. Shake
-		// weighs its own, smaller cut ({@link #runAutoShake}); snapcompact weighs the archive it
-		// renders, before it commits it.
-		if (
-			method !== "shake" &&
-			method !== "snapcompact" &&
-			!this.#admitsCompaction(
-				`compaction-${method}`,
-				reason,
-				resolveMethodSettings(compactionSettings, method),
-				options,
-			)
-		) {
-			return COMPACTION_CHECK_NONE;
+		// weighs its own, smaller cut ({@link #runAutoShake}); snapcompact weighs the most favourable
+		// cut it could make here, and the archive it renders before it commits it.
+		if (method !== "shake") {
+			const methodSettings = resolveMethodSettings(compactionSettings, method);
+			const admitted =
+				method === "snapcompact"
+					? this.#snapcompactMayBeAdmitted(reason, methodSettings, options)
+					: this.#admitsCompaction(`compaction-${method}`, reason, methodSettings, options);
+			if (!admitted) return COMPACTION_CHECK_NONE;
 		}
 
 		// A speculative pass may have already produced this compaction's summary
@@ -6166,7 +6196,7 @@ export class SessionMaintenance {
 				preserveData = compactionPrep.preserveData;
 				providerReplayThroughEntryId = compactionPrep.providerReplayThroughEntryId;
 			} else if (handoffDocument) {
-				const handoffSummary = handoffSummaryFromDocument(handoffDocument.document, preparation);
+				const handoffSummary = summaryWithFileOperations(handoffDocument.document, preparation);
 				summary = handoffSummary.summary;
 				shortSummary = undefined;
 				firstKeptEntryId = preparation.firstKeptEntryId;

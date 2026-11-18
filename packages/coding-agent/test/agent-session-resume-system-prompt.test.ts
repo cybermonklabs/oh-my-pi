@@ -7,6 +7,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { ObservedPromptCacheEntry } from "@oh-my-pi/pi-coding-agent/session/prompt-cache-status";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	continuesCachedPrompt,
@@ -49,26 +50,6 @@ const realNow = Date.now.bind(Date);
 /** Moves the clock `offsetMs` ahead of real time from now on. */
 function setClock(offsetMs: number): void {
 	vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
-}
-
-/** Rewrites `overlay` and reloads it as the config watcher does, then waits for the rebuilds the change starts. */
-async function reloadOverlay(
-	session: AgentSession,
-	settings: Settings,
-	overlay: string,
-	content: string,
-): Promise<void> {
-	const rebuilds = [
-		vi.spyOn(session, "refreshBaseSystemPrompt"),
-		vi.spyOn(session, "reconcileBuiltinTools"),
-		vi.spyOn(session, "refreshSkillsAndCommands"),
-	];
-	await Bun.write(overlay, content);
-	await settings.reloadFromDisk();
-	// The settings listeners run in the microtask the reload queued for them.
-	await Promise.resolve();
-	await Promise.all(rebuilds.flatMap(spy => spy.mock.results.map(result => result.value)));
-	for (const spy of rebuilds) spy.mockRestore();
 }
 
 describe("system prompt of a resumed session", () => {
@@ -273,7 +254,7 @@ describe("system prompt of a resumed session", () => {
 		const inputs = { agentsMd: "Build with make.", appendSystemPrompt: ROLE, overlay };
 		const live = await runProcess(tempDir, inputs, [], undefined, async (session, _sessionManager, settings) => {
 			await session.prompt("first");
-			await reloadOverlay(session, settings, overlay, `${OVERLAY}personality: pragmatic\n`);
+			await reloadOverlay({ session, settings, overlay }, `${OVERLAY}personality: pragmatic\n`);
 			await session.prompt("second");
 		});
 		// What a process started on the changed settings sends.

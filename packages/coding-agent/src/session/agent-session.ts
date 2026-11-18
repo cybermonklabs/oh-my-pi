@@ -5816,17 +5816,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * Sends what the prompt withholds to keep the cached prefix once it is due, so the request carries the rebuilt
-	 * prompt: a kept restored transcript prompt ({@link SessionTools.releaseRestoredPrompt}) and a held settings rebuild
-	 * ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after the cut rule admitted a cut
-	 * under it that rewrites every message, after the prompt cache entry it reads has lapsed, or five minutes after the
-	 * change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before every
-	 * main request, and before a user prompt takes its hidden notices.
+	 * prompt: a kept restored transcript prompt ({@link SessionTools.replaceRestoredPromptIfDue}) and a held settings
+	 * rebuild ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after the cut rule admitted a
+	 * cut under it that rewrites every message, after the prompt cache entry it reads has lapsed, or five minutes after
+	 * the change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before
+	 * every main request, and before a user prompt takes its hidden notices.
 	 */
 	async #releaseWithheldPromptChangesIfDue(): Promise<void> {
 		if (!this.#tools.withholdsPromptChange) return;
 		const lapsed = this.#maintenance.promptCacheLapsed();
 		try {
-			await this.#tools.releaseRestoredPrompt(lapsed);
+			await this.#tools.replaceRestoredPromptIfDue(lapsed);
 			await this.#tools.absorbHeldSettingsRebuild(lapsed);
 		} catch (error) {
 			logger.warn("Rebuild of a withheld prompt change failed", { error: String(error) });

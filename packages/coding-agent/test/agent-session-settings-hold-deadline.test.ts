@@ -5,14 +5,15 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, type OverlayRebuild, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
 	gatewaySessionOptions,
 	type MessagesRequest,
 	mockGatewayFetch,
-	streamedAnswer,
+	textOf,
+	toolCallAnswer,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
 
@@ -27,6 +28,9 @@ const MINUTE_MS = 60_000;
 /** The longest a held settings change may wait while requests keep the cache warm. */
 const HOLD_BOUND_MS = 5 * MINUTE_MS;
 
+/** The rebuilds a reload of these sessions' overlay starts. */
+const RELOAD_REBUILDS: readonly OverlayRebuild[] = ["refreshBaseSystemPrompt", "reconcileBuiltinTools"];
+
 interface Harness {
 	session: AgentSession;
 	settings: Settings;
@@ -36,26 +40,6 @@ interface Harness {
 	dir: TempDir;
 	/** Puts the real `fetch` back. */
 	restoreFetch(): void;
-}
-
-/** A reply calling `name` with `input`, the gateway's `turn`th. */
-function toolCallAnswer(turn: number, name: string, input: Record<string, unknown>): Response {
-	return streamedAnswer(
-		turn,
-		{ type: "tool_use", id: `toolu_${turn}`, name, input: {} },
-		[{ type: "input_json_delta", partial_json: JSON.stringify(input) }],
-		"tool_use",
-		{ cacheWriteTokens: 100 },
-	);
-}
-
-/** Every text a wire value carries: text blocks, string contents and nested tool results. */
-function textOf(value: unknown): string {
-	if (typeof value === "string") return value;
-	if (Array.isArray(value)) return value.map(textOf).join("\n");
-	if (typeof value !== "object" || value === null) return "";
-	const record = value as Record<string, unknown>;
-	return [record.text, record.content].map(textOf).join("\n");
 }
 
 describe("a settings change held on a bound prompt, before it goes out", () => {
@@ -133,20 +117,6 @@ describe("a settings change held on a bound prompt, before it goes out", () => {
 		return request;
 	}
 
-	/** Rewrites the overlay and reloads it as the config watcher does, then waits for the rebuilds the change starts. */
-	async function reloadOverlay(harness: Harness, content: string): Promise<void> {
-		const rebuilds = [
-			vi.spyOn(harness.session, "refreshBaseSystemPrompt"),
-			vi.spyOn(harness.session, "reconcileBuiltinTools"),
-		];
-		await Bun.write(harness.overlay, content);
-		await harness.settings.reloadFromDisk();
-		// The settings listeners run in the microtask the reload queued for them.
-		await Promise.resolve();
-		await Promise.all(rebuilds.flatMap(spy => spy.mock.results.map(result => result.value)));
-		for (const spy of rebuilds) spy.mockRestore();
-	}
-
 	it("keeps the edit tool's definition as sent in every request made under five minutes after an edit-mode change", async () => {
 		const tools = ["read", "edit"];
 		const rebuilt = await requestOnSettings(`${LONG_ENTRIES}edit:\n  mode: replace\n`, tools);
@@ -155,7 +125,7 @@ describe("a settings change held on a bound prompt, before it goes out", () => {
 		await harness.session.prompt("first");
 		clock.advance(30_000);
 		const changedAt = clock.now();
-		await reloadOverlay(harness, `${LONG_ENTRIES}edit:\n  mode: replace\n`);
+		await reloadOverlay(harness, `${LONG_ENTRIES}edit:\n  mode: replace\n`, RELOAD_REBUILDS);
 		// A request a minute keeps the one-hour entry warm, up to the last one before the bound.
 		while (clock.now() - changedAt + MINUTE_MS < HOLD_BOUND_MS) {
 			clock.advance(MINUTE_MS);
@@ -185,7 +155,7 @@ describe("a settings change held on a bound prompt, before it goes out", () => {
 		// The change comes two minutes after the request; the next one comes a minute after the five-minute entry
 		// lapsed, four minutes after the change.
 		clock.advance(2 * MINUTE_MS);
-		await reloadOverlay(harness, changed);
+		await reloadOverlay(harness, changed, RELOAD_REBUILDS);
 		clock.advance(4 * MINUTE_MS);
 		await harness.session.prompt("after the lapse");
 
@@ -202,7 +172,7 @@ describe("a settings change held on a bound prompt, before it goes out", () => {
 		await harness.session.prompt("first");
 		clock.advance(30_000);
 		const changedAt = clock.now();
-		await reloadOverlay(harness, `${LONG_ENTRIES}personality: pragmatic\n`);
+		await reloadOverlay(harness, `${LONG_ENTRIES}personality: pragmatic\n`, RELOAD_REBUILDS);
 		clock.advance(MINUTE_MS);
 		await harness.session.prompt("a minute after the change");
 
@@ -220,11 +190,17 @@ describe("a settings change held on a bound prompt, before it goes out", () => {
 	it("runs an edit call shaped by the edit definition the hold keeps as that definition says", async () => {
 		// The model answers the second request with an edit in the `replace` shape the requests still declare.
 		const harness = await startSession(`${LONG_ENTRIES}edit:\n  mode: replace\n`, ["read", "edit"], {
-			2: turn => toolCallAnswer(turn, "edit", { path: "notes.txt", old_string: "alpha", new_string: "beta" }),
+			2: turn =>
+				toolCallAnswer(
+					turn,
+					"edit",
+					{ path: "notes.txt", old_string: "alpha", new_string: "beta" },
+					{ cacheWriteTokens: 100 },
+				),
 		});
 		await Bun.write(harness.dir.join("notes.txt"), "alpha\n");
 		await harness.session.prompt("first");
-		await reloadOverlay(harness, `${LONG_ENTRIES}edit:\n  mode: hashline\n`);
+		await reloadOverlay(harness, `${LONG_ENTRIES}edit:\n  mode: hashline\n`, RELOAD_REBUILDS);
 		await harness.session.prompt("replace alpha with beta in notes.txt");
 
 		const [first, second, third] = harness.requests;
