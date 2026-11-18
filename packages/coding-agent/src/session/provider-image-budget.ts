@@ -311,11 +311,18 @@ function imageHash(image: ImageContent | ComputerScreenshotRef): number | bigint
 }
 
 /**
- * Names each image a request sends, in {@link countImages}' order, by the turn that carries it and its bytes: equal
- * for every request that continues the conversation, a side request's copy of it, or a branch of it, and different
- * once a compaction summarized that turn away, even where a later turn carries the same bytes. The turn is its role
- * and timestamp, which every copy of a stored turn keeps (a context hook can re-stamp only a turn it builds itself).
- * A turn's later copies of the same bytes are numbered, so each copy keeps its own name.
+ * The turn `message` is: its role and timestamp, which every copy of a stored turn keeps (a context hook can
+ * re-stamp only a turn it builds itself), and which a prune that blanks its content leaves in place.
+ */
+function turnOf(message: Message): string {
+	return `${message.role}:${message.timestamp}`;
+}
+
+/**
+ * Names each image a request sends, in {@link countImages}' order, by the turn that carries it ({@link turnOf}) and
+ * its bytes: equal for every request that continues the conversation, a side request's copy of it, or a branch of
+ * it, and different once a compaction summarized that turn away, even where a later turn carries the same bytes. A
+ * turn's later copies of the same bytes are numbered, so each copy keeps its own name.
  */
 function* imageKeys(context: Context, metadataWire: boolean): Generator<string, void> {
 	const copies = new Map<string, number>();
@@ -326,7 +333,7 @@ function* imageKeys(context: Context, metadataWire: boolean): Generator<string, 
 	};
 	for (const message of context.messages) {
 		if (message.role === "assistant") continue;
-		const turn = `${message.role}:${message.timestamp}`;
+		const turn = turnOf(message);
 		// The one image a computer result counts as where the route sends its metadata screenshot (sentScreenshotBytes).
 		if (metadataWire && message.role === "toolResult" && message.providerMetadata?.type === "computer") {
 			yield named(`${turn}:${imageHash(message.providerMetadata.screenshot)}`);
@@ -339,6 +346,12 @@ function* imageKeys(context: Context, metadataWire: boolean): Generator<string, 
 	}
 }
 
+/** The turn ({@link turnOf}) of the oldest message that sends an image {@link countImages} counts. */
+function oldestImageTurn(context: Context, metadataWire: boolean): string | undefined {
+	const message = context.messages.find(candidate => messageImageCount(candidate, metadataWire) > 0);
+	return message && turnOf(message);
+}
+
 /** The images a conversation's count clamp dropped, for the image budget it dropped them for. */
 interface StickyImageDrop {
 	budget: number;
@@ -347,8 +360,9 @@ interface StickyImageDrop {
 }
 
 /**
- * Conversations whose drops one clamp remembers: each compaction starts another, and a branch switch can go back
- * to the history before it. The oldest is forgotten first.
+ * Conversations whose drops one clamp remembers, each by the turn that carried its oldest image at its first forced
+ * drop: each compaction starts another, and a branch switch can go back to the history before it. The oldest is
+ * forgotten first.
  */
 const MAX_STICKY_IMAGE_CONVERSATIONS = 8;
 
@@ -370,9 +384,10 @@ export type ForcedImageDrop = (site: "image-count-clamp" | "image-byte-clamp", b
  *
  * A request that sends part of the history already sent (a side request's prefix, a prune, a branch switch) drops
  * the dropped images it still sends and keeps its other images: its shared prefix keeps its bytes, and an image the
- * budget carries is never dropped for one the request no longer sends. A compaction replaces the oldest images, so
- * the history it leaves is another conversation whose drops are recomputed from its own images; so are the drops of
- * a model whose budget differs.
+ * budget carries is never dropped for one the request no longer sends. The clamp finds such a request's drops by the
+ * turn that carried the conversation's oldest image, which the request still carries even where a prune blanked that
+ * turn's images. A compaction replaces that turn, so the history it leaves is another conversation whose drops are
+ * recomputed from its own images; so are the drops of a model whose budget differs.
  *
  * The byte clamp ({@link clampProviderContextImageBytes}) keeps the newest user message and the newest image tool
  * result past the byte budget while they fit the body limit, and which messages those are moves with every turn: a
@@ -401,6 +416,21 @@ export class ProviderImageClamp {
 	}
 
 	/**
+	 * The conversation `context` continues among those whose drops this clamp remembers: the one named by the oldest
+	 * turn `context` carries that names one, whether or not that turn still carries its images.
+	 */
+	#conversationOf(context: Context): { turn: string; drop: StickyImageDrop } | undefined {
+		if (this.#drops.size === 0) return undefined;
+		for (const message of context.messages) {
+			if (message.role === "assistant") continue;
+			const turn = turnOf(message);
+			const drop = this.#drops.get(turn);
+			if (drop) return { turn, drop };
+		}
+		return undefined;
+	}
+
+	/**
 	 * The live count clamp of this conversation's requests: `context` without the images past `model`'s image budget,
 	 * dropping what this conversation's previous requests dropped while the rest fit, else the oldest images down to
 	 * half the budget, which it reports as a forced drop.
@@ -408,16 +438,12 @@ export class ProviderImageClamp {
 	clampImageCount(context: Context, model: Model): Context {
 		if (!model.input.includes("image")) return context;
 		const metadataWire = sendsComputerScreenshotMetadata(model);
-		const keys = imageKeys(context, metadataWire);
-		// The conversation is named by its oldest image.
-		const oldest = keys.next();
-		if (oldest.done) return context;
 		const budget = providerImageBudget(model);
-		const known = this.#drops.get(oldest.value);
-		const state = known?.budget === budget ? known : undefined;
+		const conversation = this.#conversationOf(context);
+		const state = conversation?.drop.budget === budget ? conversation.drop : undefined;
 		if (!state && countImages(context, metadataWire) <= budget) return context;
 		const dropped = state?.dropped ?? new Set<string>();
-		const names = [oldest.value, ...keys];
+		const names = [...imageKeys(context, metadataWire)];
 		let sent = 0;
 		for (const name of names) {
 			if (!dropped.has(name)) sent++;
@@ -436,9 +462,12 @@ export class ProviderImageClamp {
 			}
 			positions.push(position);
 		}
-		if (forced) this.#drops.set(oldest.value, { budget, dropped });
 		const clamped = dropImagesAt(context, model, metadataWire, positions);
-		if (forced) this.#onForcedDrop?.("image-count-clamp", context, clamped);
+		if (forced) {
+			const turn = conversation?.turn ?? oldestImageTurn(context, metadataWire);
+			if (turn !== undefined) this.#drops.set(turn, { budget, dropped });
+			this.#onForcedDrop?.("image-count-clamp", context, clamped);
+		}
 		return clamped;
 	}
 

@@ -4,7 +4,11 @@
 
 ### Added
 
-- Added `getCacheTokenPrices()`, the per-token cache read and write prices at a five-minute or one-hour lifetime for a request not yet sent, priced the way usage is billed (long-context tiers and time-based prices included); a card that prices neither a cache read nor a cache write gets both at 0
+- Added `getCacheTokenPrices()`, the per-token cache read and write prices at a five-minute or one-hour lifetime for a request not yet sent, priced the way usage is billed (long-context tiers and time-based prices included); a card that prices cache reads but no cache write gets its writes at the input rate at either lifetime, since its provider bills the tokens a request writes as uncached input, and a card that prices neither a cache read nor a cache write gets both at 0
+
+### Fixed
+
+- Fixed one-hour cache writes on a card without a cache-write price billing at twice the input rate; they bill at the card's write price, as five-minute writes do
 
 ## [18.18.6] - 2026-11-09
 
