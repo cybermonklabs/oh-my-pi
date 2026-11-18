@@ -158,6 +158,7 @@ import {
 	FileSessionStorage,
 	isSameJournalFile,
 	MemorySessionStorage,
+	RACED_READ_RETRIES,
 	SESSION_HEADER_PREFIX_BYTES,
 	type SessionClaimHolder,
 	SessionLeaseLostError,
@@ -4293,15 +4294,28 @@ export class SessionManager {
 	 * from what the passes left), every other entry still whole goes to the
 	 * store (an entry off the leaf's path, or one a pass or the stripping made
 	 * whole), and the whole entries' blob references are resolved.
+	 *
+	 * A full rewrite or delete that replaced the transcript mid-read
+	 * (`SessionReadConflictError`) makes the whole load run again from its
+	 * start, at most {@link RACED_READ_RETRIES} more times before the error
+	 * surfaces: each pass builds its entries and its cold store afresh, and a
+	 * pass that throws closes the store it opened, so nothing of it reaches
+	 * the next one.
 	 */
 	async #loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
 		// A current-version file whose first entry has no id may predate ids
 		// altogether; only a pass over every entry tells (see migrateToCurrentVersion).
 		let unindexed: boolean | undefined;
-		for (;;) {
-			const loaded = await this.#streamTranscript(filePath, options, unindexed);
-			if (loaded) return loaded;
-			unindexed = await this.#transcriptIsUnindexed(filePath, options);
+		for (let retries = 0; ;) {
+			try {
+				const loaded = await this.#streamTranscript(filePath, options, unindexed);
+				if (loaded) return loaded;
+				unindexed = await this.#transcriptIsUnindexed(filePath, options);
+			} catch (error) {
+				if (!(error instanceof SessionReadConflictError) || retries++ >= RACED_READ_RETRIES) throw error;
+				// What the raced read found of the transcript says nothing about the one read next.
+				unindexed = undefined;
+			}
 		}
 	}
 

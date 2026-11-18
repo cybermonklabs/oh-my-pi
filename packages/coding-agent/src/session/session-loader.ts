@@ -890,7 +890,9 @@ export async function visitSessionFile(
  * The header of the session at `filePath`, read the cheapest way: a
  * transcript {@link visitSessionFile} would read whole is loaded and returned
  * too, so a caller need not read it twice; a streamed one yields its header
- * alone. Missing files follow {@link loadSessionFile}.
+ * alone, read again from its start when a full rewrite or delete raced it
+ * (`SessionReadConflictError`), as {@link loadSessionFile} does. Missing
+ * files follow {@link loadSessionFile}.
  */
 export async function probeSessionFile(
 	filePath: string,
@@ -908,17 +910,24 @@ export async function probeSessionFile(
 		const first = loaded.entries[0];
 		return { header: isValidSessionHeader(first) ? first : undefined, loaded };
 	}
-	const probe: { header?: SessionHeader } = {};
-	await visitSessionFile(
-		filePath,
-		storage,
-		entry => {
-			probe.header = entry as SessionHeader;
-			return false;
-		},
-		options,
-	);
-	return { header: probe.header, loaded: undefined };
+	for (let retries = 0; ; retries++) {
+		// The stream reads one chunk past the header before it stops, which a rewrite can race.
+		const probe: { header?: SessionHeader } = {};
+		try {
+			await visitSessionFile(
+				filePath,
+				storage,
+				entry => {
+					probe.header = entry as SessionHeader;
+					return false;
+				},
+				options,
+			);
+			return { header: probe.header, loaded: undefined };
+		} catch (error) {
+			if (!(error instanceof SessionReadConflictError) || retries >= RACED_READ_RETRIES) throw error;
+		}
+	}
 }
 
 /**

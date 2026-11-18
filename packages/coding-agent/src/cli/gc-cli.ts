@@ -999,6 +999,7 @@ async function runBlobGc(
 					} catch (error) {
 						// Removed since the listing: it references nothing anymore.
 						if (codeOf(error) === "ENOENT") break;
+						// Raced by a rewrite: read it again, never skip it, or the blobs only it references would go.
 						if (error instanceof SessionReadConflictError && retries < RACED_READ_RETRIES) continue;
 						throw error;
 					}
