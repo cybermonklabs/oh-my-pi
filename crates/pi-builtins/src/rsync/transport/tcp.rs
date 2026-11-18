@@ -831,12 +831,24 @@ mod tests {
 		conn.finish().unwrap();
 	}
 
+	/// A loopback port that refuses connections for as long as the returned
+	/// socket lives. The socket is bound to the port and never listens, so a
+	/// connect to it is refused, and no other socket can take the port, as one
+	/// could once a listener on it was dropped.
+	fn refusing_port() -> (tokio::net::TcpSocket, u16) {
+		let socket = tokio::net::TcpSocket::new_v4().unwrap();
+		socket.bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+		let port = socket.local_addr().unwrap().port();
+		(socket, port)
+	}
+
 	#[test]
 	fn refused_connection_reports_each_address() {
 		let (logger, err) = quiet_logger();
-		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-		let port = i32::from(listener.local_addr().unwrap().port());
-		drop(listener);
+		let (_refusing, port) = refusing_port();
+		// What another process could do with a freed port: it cannot here.
+		assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err(), "the port is held");
+		let port = i32::from(port);
 		let env = |_: &str| -> Option<String> { None };
 		let cfg = TcpConfig {
 			host: "127.0.0.1",

@@ -12,6 +12,8 @@ use crate::proctree;
 
 mod builtins;
 mod env_cwd;
+#[cfg(unix)]
+mod output_drain;
 mod process_control;
 mod redirections;
 mod session;
@@ -295,25 +297,31 @@ async fn execute_captured(command: String) -> (ShellExecuteResult, String) {
 	(result, output)
 }
 
-/// Waits until `pid` runs as `expected`. Each poll walks the whole process
-/// table, which takes seconds on a loaded host, so the bound is generous;
-/// it stays below the 30 s lifetime of the process-test children.
+/// Waits for `path` to appear — a fixture saying it is ready, or a test
+/// releasing it — however long that takes. The test runner fails a test
+/// whose file never appears (`.config/nextest.toml`).
+#[cfg(unix)]
+async fn exists(path: &std::path::Path) {
+	while !path.exists() {
+		time::sleep(Duration::from_millis(10)).await;
+	}
+}
+
+/// Waits until `pid` runs as `expected`, however long that takes: each poll
+/// walks the whole process table, which takes seconds on a loaded host, and
+/// the process-test children never end by themselves while a test runs.
 #[cfg(unix)]
 async fn wait_for_process_name(pid: i32, expected: &str) {
-	time::timeout(Duration::from_secs(20), async {
-		loop {
-			if pi_builtins::ProcInfo::all().into_iter().any(|process| {
-				process.pid() == pid
-					&& process.match_name() == expected
-					&& process.status() == pi_builtins::ProcessStatus::Running
-			}) {
-				return;
-			}
-			time::sleep(Duration::from_millis(10)).await;
+	loop {
+		if pi_builtins::ProcInfo::all().into_iter().any(|process| {
+			process.pid() == pid
+				&& process.match_name() == expected
+				&& process.status() == pi_builtins::ProcessStatus::Running
+		}) {
+			return;
 		}
-	})
-	.await
-	.expect("child did not enter expected executable");
+		time::sleep(Duration::from_millis(10)).await;
+	}
 }
 
 #[cfg(unix)]
@@ -343,15 +351,24 @@ fn process_test_command(prefix: &str) -> (tempfile::TempDir, std::path::PathBuf,
 	(dir, command, name)
 }
 
+/// A process-test child: `command` sleeping until a test ends it. It lives
+/// [`crate::testkit::child::LIFETIME`], past the test runner's bound (a 30 s
+/// child ended by itself on a host slow enough that the test outlasted it),
+/// so its end is always one the test caused; it dies with this process,
+/// which `kill_on_drop` alone cannot do when the test process is killed.
 #[cfg(unix)]
-fn process_test_child(command: &std::path::Path, duration: Duration) -> Command {
-	let duration_ms = u64::try_from(duration.as_millis()).expect("test duration fits u64");
+fn process_test_child(command: &std::path::Path) -> Command {
 	let mut child = Command::new(command);
 	child
 		.args(["--ignored", "--exact", "shell::tests::process_test_sleeper"])
-		.env("PI_SHELL_PROCESS_TEST_SLEEP_MS", duration_ms.to_string())
+		.env(
+			"PI_SHELL_PROCESS_TEST_SLEEP_MS",
+			crate::testkit::child::LIFETIME.as_millis().to_string(),
+		)
 		.stdout(std::process::Stdio::null())
-		.stderr(std::process::Stdio::null());
+		.stderr(std::process::Stdio::null())
+		.kill_on_drop(true);
+	crate::testkit::child::tokio_dies_with_this_process(&mut child);
 	child
 }
 
@@ -405,21 +422,6 @@ async fn run_command_capture(
 	capture_unlocked(command, cwd, minimizer, cancel_token).await
 }
 
-/// [`run_command_capture`] that fails once the run outlasts `limit`. The
-/// limit starts when the lock is held: in a single-process `cargo test`,
-/// the wait behind slower shell tests took up the limit of a fast one.
-#[cfg(unix)]
-async fn run_command_capture_within(
-	limit: Duration,
-	command: &str,
-	cwd: Option<&std::path::Path>,
-	minimizer: Option<minimizer::MinimizerOptions>,
-	cancel_token: CancelToken,
-) -> Result<(ShellExecuteResult, String), time::error::Elapsed> {
-	let _guard = shell_test_lock().lock().await;
-	time::timeout(limit, capture_unlocked(command, cwd, minimizer, cancel_token)).await
-}
-
 /// Runs `command` and collects its streamed output; the caller holds
 /// [`shell_test_lock`].
 #[cfg(unix)]
@@ -458,25 +460,22 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
 	path
 }
 
-/// Runs `command` on a dedicated single-worker runtime and fails after five
-/// seconds.
+/// Runs `command` on a dedicated single-worker runtime.
 #[cfg(unix)]
 fn capture_on_single_worker(command: &'static str) -> (ShellExecuteResult, String) {
 	capture_on_runtime(command, None, 512)
-		.expect("read must not wait on a blocking worker it cannot get")
 }
 
 /// Runs `command` in `cwd` on a dedicated single-worker runtime whose
-/// blocking pool holds `max_blocking_threads`; fails once the run outlasts
-/// five seconds. The deadline lives on the calling thread, so it still
-/// fires when a builtin blocks the runtime's only worker, and starts once
-/// this thread holds [`shell_test_lock`].
+/// blocking pool holds `max_blocking_threads`, once this thread holds
+/// [`shell_test_lock`]. A builtin that blocks the runtime's only worker
+/// never finishes, and the runner's bound fails the test.
 #[cfg(unix)]
 fn capture_on_runtime(
 	command: &'static str,
 	cwd: Option<std::path::PathBuf>,
 	max_blocking_threads: usize,
-) -> Result<(ShellExecuteResult, String), std::sync::mpsc::RecvTimeoutError> {
+) -> (ShellExecuteResult, String) {
 	let _guard = shell_test_lock().blocking_lock();
 	let (tx, rx) = std::sync::mpsc::channel();
 	std::thread::spawn(move || {
@@ -493,7 +492,7 @@ fn capture_on_runtime(
 			CancelToken::default(),
 		)));
 	});
-	rx.recv_timeout(Duration::from_secs(5))
+	rx.recv().expect("the runtime's thread panicked")
 }
 
 #[cfg(unix)]

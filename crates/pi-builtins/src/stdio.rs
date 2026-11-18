@@ -344,6 +344,14 @@ impl Source {
 		}
 	}
 
+	/// A file a walk listed, already opened by the walker (below the walk's
+	/// root or relative to its directory): read through the file's async API,
+	/// never reopened by path. It records no metadata at open, so
+	/// [`Self::metadata`] is `None`; [`Self::handle_metadata`] reads the handle.
+	pub fn listed(file: pi_walker::fs::File) -> Self {
+		Self::new(Repr::File(file.into_vfs()), None)
+	}
+
 	/// Opens a native path that is neither a regular file nor a directory.
 	async fn open_special(
 		fs: &pi_vfs::Fs,
@@ -492,6 +500,20 @@ impl Source {
 	/// Size and type reported at open, when known.
 	pub fn metadata(&self) -> Option<&pi_vfs::Metadata> {
 		self.metadata.as_ref()
+	}
+
+	/// The identity of the file behind the opened handle, read from the handle
+	/// rather than from the path it was opened by.
+	///
+	/// [`Source::metadata`] is the stat taken before the open, which a name
+	/// replaced in between makes stale; this one names the file that was
+	/// actually opened. A descriptor or an in-process stream has no identity
+	/// beyond the one recorded at open, and is reported from that.
+	pub async fn handle_metadata(&self) -> Option<pi_vfs::Metadata> {
+		match &self.repr {
+			Repr::File(file) => file.metadata_async().await.ok(),
+			_ => self.metadata.clone(),
+		}
 	}
 }
 

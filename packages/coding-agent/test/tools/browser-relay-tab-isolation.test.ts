@@ -6,9 +6,10 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import type { BrowserDownload } from "@oh-my-pi/pi-coding-agent/tools/browser/downloads";
 import {
+	buildHeadlessLaunchArgs,
 	closeLaunchedBrowser,
+	DEFAULT_VIEWPORT,
 	ensureChromiumExecutable,
-	RENDERER_PRIORITY_ARGS,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { unpackedExtensionId } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/extension-files";
@@ -170,10 +171,20 @@ async function launchRelayFixture(
 		const browser = await puppeteer.launch({
 			executablePath: await ensureChromiumExecutable(),
 			headless: true,
+			// No launch limit of its own: Chromium's start or exit decides, and the test's timeout bounds a hang.
+			timeout: 0,
 			pipe: true,
 			userDataDir,
 			enableExtensions: [extensionDir, ...extensions],
-			args: ["--no-first-run", "--no-default-browser-check", "--use-mock-keychain", ...RENDERER_PRIORITY_ARGS],
+			// The product's own argv, sandbox flags included: on a host that forbids unprivileged
+			// user namespaces Chrome aborts at startup without them, though `chromiumAvailable`
+			// (which launches with `--no-sandbox`) reported it usable.
+			args: [
+				...buildHeadlessLaunchArgs(DEFAULT_VIEWPORT),
+				"--no-first-run",
+				"--no-default-browser-check",
+				"--use-mock-keychain",
+			],
 		});
 		browsers.push(browser);
 		const extensionId = await unpackedExtensionId(extensionDir);

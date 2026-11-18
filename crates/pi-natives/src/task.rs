@@ -415,6 +415,27 @@ where
 	AsyncTask::new(Blocking { tag, cancel_token: cancel_token.into(), work: Some(Box::new(work)) })
 }
 
+/// Settle a filesystem walk's Promise. `result` is `None` when the deadline
+/// beat the walk; the walk is cancelled by then, so a provider cannot hold the
+/// Promise up.
+///
+/// Only an explicit abort rejects a walk that finished. An elapsed deadline
+/// alone does not: settlement runs on the JS thread, which can be busy long
+/// after the walk finished inside its budget.
+fn settle_walk<T>(
+	token: &CancelToken,
+	result: Option<Result<T>>,
+	cancelled: impl FnOnce(AbortReason) -> Error,
+) -> Result<T> {
+	if let Some(reason) = token.abort_reason() {
+		return Err(match reason {
+			AbortReason::Timeout => Error::from_reason("Aborted: Timeout"),
+			reason => cancelled(reason),
+		});
+	}
+	result.unwrap_or_else(|| Err(Error::from_reason("Aborted: Timeout")))
+}
+
 /// Run synchronous filesystem work without occupying libuv's pool.
 ///
 /// Provider callbacks may need that pool for async I/O; cancellation interrupts
@@ -433,17 +454,7 @@ where
 	let settlement_token = cancel_token.clone();
 	let promise = env.spawn_future_with_callback(
 		async move { Ok(run_filesystem_worker(tag, cancel_token, fs, work).await) },
-		move |env, result| {
-			if let Some(reason) = settlement_token.abort_reason() {
-				return Err(match reason {
-					AbortReason::Timeout => Error::from_reason("Aborted: Timeout"),
-					_ => abort_error(*env, reason),
-				});
-			}
-			// An elapsed deadline has no explicit abort flag. The worker was
-			// already cancelled, so the provider cannot hold up this Promise.
-			result.unwrap_or_else(|| Err(Error::from_reason("Aborted: Timeout")))
-		},
+		move |env, result| settle_walk(&settlement_token, result, |reason| abort_error(*env, reason)),
 	)?;
 	// `Settled` only adds settlement reporting; the Promise still resolves to
 	// `T`.
@@ -470,15 +481,7 @@ where
 	let settlement_token = cancel_token.clone();
 	let promise = env.spawn_future_with_callback(
 		async move { Ok(run_filesystem_future(tag, cancel_token, fs, work).await) },
-		move |env, result| {
-			if let Some(reason) = settlement_token.abort_reason() {
-				return Err(match reason {
-					AbortReason::Timeout => Error::from_reason("Aborted: Timeout"),
-					_ => abort_error(*env, reason),
-				});
-			}
-			result.unwrap_or_else(|| Err(Error::from_reason("Aborted: Timeout")))
-		},
+		move |env, result| settle_walk(&settlement_token, result, |reason| abort_error(*env, reason)),
 	)?;
 	Ok(PromiseRaw::new(env.raw(), promise.raw()))
 }
@@ -776,6 +779,10 @@ mod tests {
 	/// runtime, and a bare `JoinHandle` would detach on drop. Covers a walk
 	/// that yields between directories; one parked in a stalled syscall is
 	/// bounded by the device.
+	///
+	/// The start is a handshake rather than a sleep, so a slow scheduler
+	/// cannot fail it; only the span between the drop and the walk's own
+	/// completion is a wait, and it is generous.
 	#[test]
 	fn dropping_the_caller_stops_the_walk() {
 		use std::{
@@ -791,9 +798,8 @@ mod tests {
 			.enable_all()
 			.build()
 			.unwrap();
-		let started = Arc::new(AtomicBool::new(false));
+		let (started_tx, started_rx) = flume::bounded::<()>(1);
 		let ran_on = Arc::new(AtomicBool::new(false));
-		let started_probe = Arc::clone(&started);
 		let ran_on_probe = Arc::clone(&ran_on);
 
 		host.block_on(async move {
@@ -802,23 +808,22 @@ mod tests {
 				CancelToken::new(None, None),
 				Fs::native(),
 				move |_fs| async move {
-					started_probe.store(true, Ordering::SeqCst);
+					let _ = started_tx.send(());
 					// The yield point a walker has between directories.
-					tokio::time::sleep(Duration::from_millis(200)).await;
+					tokio::time::sleep(Duration::from_secs(2)).await;
 					ran_on_probe.store(true, Ordering::SeqCst);
 					Ok(1_u32)
 				},
 			));
 			let mut walk = Some(walk);
-			// Start it, then let go while the work is still in flight.
+			// Let go the moment the walk is in flight.
 			tokio::select! {
 				_ = walk.as_mut().unwrap() => panic!("the walk finished before it was dropped"),
-				() = tokio::time::sleep(Duration::from_millis(60)) => {},
+				started = started_rx.recv_async() => started.expect("the walk never started"),
 			}
-			assert!(started.load(Ordering::SeqCst), "the walk never started");
 			drop(walk.take());
 
-			tokio::time::sleep(Duration::from_millis(400)).await;
+			tokio::time::sleep(Duration::from_secs(3)).await;
 			assert!(
 				!ran_on.load(Ordering::SeqCst),
 				"the walk ran on after its caller was dropped, so a torn-down host leaves filesystem \
@@ -1047,5 +1052,36 @@ mod tests {
 		assert_eq!(task.compute().unwrap().into_inner(), 1);
 		let err = task.compute().unwrap_err();
 		assert!(err.reason.contains("work already consumed"), "reason = {}", err.reason);
+	}
+
+	#[test]
+	fn settle_walk_delivers_a_finished_walk_past_its_deadline() {
+		let expired = CancelToken::new(Some(0), None);
+		assert!(expired.heartbeat().is_err(), "the deadline has not elapsed");
+		let delivered = settle_walk(&expired, Some(Ok(7_u32)), |reason| {
+			panic!("an elapsed deadline settled as an abort ({reason:?})")
+		});
+		assert_eq!(delivered.unwrap(), 7);
+	}
+
+	#[test]
+	fn settle_walk_rejects_a_finished_walk_on_explicit_abort() {
+		let mut token = CancelToken::new(None, None);
+		token.emplace_abort_token().abort(AbortReason::Signal);
+		let rejected = settle_walk(&token, Some(Ok(7_u32)), |reason| {
+			Error::new(Status::Cancelled, format!("cancelled: {reason:?}"))
+		});
+		let error = rejected.unwrap_err();
+		assert_eq!(error.status, Status::Cancelled);
+		assert_eq!(error.reason, "cancelled: Signal");
+	}
+
+	#[test]
+	fn settle_walk_rejects_a_walk_the_deadline_beat_as_a_timeout() {
+		let expired = CancelToken::new(Some(0), None);
+		let rejected = settle_walk::<u32>(&expired, None, |reason| {
+			panic!("an elapsed deadline settled as an abort ({reason:?})")
+		});
+		assert_eq!(rejected.unwrap_err().reason, "Aborted: Timeout");
 	}
 }

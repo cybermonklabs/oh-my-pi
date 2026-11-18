@@ -24,10 +24,10 @@ const READY_DEADLINE: Duration = Duration::from_secs(30);
 /// - `ro`: `w/src`, read-only (the default);
 /// - `auth`: `w/src`, user `alice` with password `sekrit` (`{BIN}/pw`);
 /// - `hidden`: `w/src`, unlisted.
-pub(super) struct Daemon {
+pub(in crate::rsync) struct Daemon {
 	child: Child,
 	/// The port it listens on.
-	pub(super) port: u16,
+	pub(in crate::rsync) port: u16,
 }
 
 /// Why one start attempt failed.
@@ -41,16 +41,13 @@ enum Failure {
 
 impl Daemon {
 	/// Starts the daemon with its config, secrets, motd, and log under `dir`
-	/// and waits until it greets on its port. A port race (the probed port is
-	/// taken before the daemon binds it) or a slow start retries on a fresh
-	/// port; after [`ATTEMPTS`] failures this panics with the daemon log.
+	/// (see [`Daemon::serve`]).
 	pub(super) fn start(reference: &Path, dir: &Path, w: &Path) -> Self {
 		fs::create_dir_all(dir).unwrap();
 		let secrets = dir.join("secrets");
 		fs::write(&secrets, "alice:sekrit\n").unwrap();
 		fs::set_permissions(&secrets, fs::Permissions::from_mode(0o600)).unwrap();
 		fs::write(dir.join("motd"), MOTD).unwrap();
-		let log = dir.join("log");
 		let (d, w) = (dir.display(), w.display());
 		let conf = format!(
 			"pid file = {d}/pid\nlog file = {d}/log\nmotd file = {d}/motd\nuse chroot = no\n\
@@ -63,6 +60,16 @@ impl Daemon {
 		);
 		let config = dir.join("rsyncd.conf");
 		fs::write(&config, conf).unwrap();
+		Self::serve(reference, dir, &config)
+	}
+
+	/// Starts `reference --daemon` with the config file `config`, whose pid
+	/// file is `dir/pid` and whose log is `dir/log`, and waits until it greets
+	/// on its port. A port race (the probed port is taken before the daemon
+	/// binds it) or a slow start retries on a fresh port; after [`ATTEMPTS`]
+	/// failures this panics with the daemon log.
+	pub(in crate::rsync) fn serve(reference: &Path, dir: &Path, config: &Path) -> Self {
+		let log = dir.join("log");
 		let mut history = String::new();
 		for attempt in 1..=ATTEMPTS {
 			// A stale pid file from a failed attempt makes the daemon refuse

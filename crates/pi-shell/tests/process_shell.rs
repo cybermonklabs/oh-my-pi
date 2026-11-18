@@ -7,6 +7,7 @@ mod pty_support;
 
 use std::{io, os::unix::process::CommandExt, path::Path, process::Command};
 
+use pi_shell::sys::proc;
 use pty_support::{Spawn, TIMEOUT};
 
 fn run(program: &str, args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
@@ -125,11 +126,16 @@ fn command_strings_and_exit_statuses_match_zsh() {
 }
 
 /// A standalone shell abandons the externals still running when it exits:
-/// a background job without `nohup` gets `TERM` and is gone shortly after.
+/// a background job without `nohup` gets `TERM`, which ends it. The job's
+/// `sleep 600` (`testkit::child::LIFETIME`) outlives the test runner's
+/// bound, so only that `TERM` can end it; the test waits for it as long as
+/// that takes.
 #[test]
 fn a_standalone_exit_ends_running_background_externals() {
+	let sleep = pi_shell::testkit::child::on_path("sleep");
 	let out = Command::new(env!("CARGO_BIN_EXE_obash"))
-		.args(["-c", "/bin/sleep 31 >/dev/null 2>&1 </dev/null & echo $!"])
+		.arg("-c")
+		.arg(format!("{sleep} 600 >/dev/null 2>&1 </dev/null & echo $!"))
 		.output()
 		.expect("start obash");
 	assert_eq!(out.status.code(), Some(0));
@@ -138,10 +144,9 @@ fn a_standalone_exit_ends_running_background_externals() {
 		.trim()
 		.parse()
 		.expect("the job's pid");
-	let deadline = std::time::Instant::now() + TIMEOUT;
-	// SAFETY: signal 0 only checks that the process exists.
-	while unsafe { libc::kill(pid, 0) } == 0 {
-		assert!(std::time::Instant::now() < deadline, "sleep {pid} still runs after obash exited");
+	// A zombie has ended (`proc::ended`): under a PID 1 that reaps only its
+	// own child (a container started with `exec runuser`), an orphan stays one.
+	while !proc::ended(pid) {
 		std::thread::sleep(std::time::Duration::from_millis(20));
 	}
 }

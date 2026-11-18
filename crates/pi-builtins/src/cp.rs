@@ -3262,8 +3262,40 @@ fn copy_directory(
 	if walk.failed { Err(CpError::NotAllFilesCopied) } else { Ok(()) }
 }
 
-/// Copies one entry of a directory tree: a directory recursively (fixing its
-/// attributes once its contents are in place), anything else as a file.
+/// A directory of the tree being copied, while the entries below it are.
+///
+/// Its entries are read whole when it is entered, as GNU cp's fts reads a
+/// directory before it descends, so the walk holds no descriptor of it while
+/// it copies the levels below: depth costs memory, not file descriptors. The
+/// walk keeps these on a stack of its own instead of recursing, so depth does
+/// not cost the thread's stack either.
+struct DirCopy {
+	source:           PathBuf,
+	dest:             PathBuf,
+	names:            std::vec::IntoIter<io::Result<OsString>>,
+	/// Whether its identity is on [`Walk::ancestors`], to be popped once its
+	/// contents are copied.
+	pushed:           bool,
+	created:          bool,
+	entry_is_symlink: bool,
+	metadata:         Metadata,
+}
+
+/// What runs before the walk takes up an entry below the operand, with the
+/// entry's source path: a test changes the tree there, as another process
+/// could.
+#[cfg(test)]
+type EntryHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+	static BEFORE_ENTRY: std::cell::RefCell<Option<EntryHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Copies one entry of a directory tree: a directory with everything below
+/// it (each directory gets its attributes once its contents are in place),
+/// anything else as a file. A failure below the entry is reported and the
+/// walk goes on, as GNU cp does; the entry's own failure is returned.
 fn copy_entry(
 	host: &mut Host,
 	state: &mut CopyState,
@@ -3272,6 +3304,74 @@ fn copy_entry(
 	dest: &Path,
 	is_root: bool,
 ) -> CopyResult<()> {
+	let Some(top) = enter_entry(host, state, walk, source, dest, is_root)? else {
+		return Ok(());
+	};
+	let mut stack = vec![top];
+	while let Some(dir) = stack.last_mut() {
+		let next = match dir.names.next() {
+			Some(_) if host.is_cancelled() => {
+				walk.failed = true;
+				dir.names = Vec::new().into_iter();
+				continue;
+			},
+			next => next,
+		};
+		match next {
+			Some(Ok(name)) => {
+				let child_source = child_path(&dir.source, &name);
+				let child_dest = child_path(&dir.dest, &name);
+				#[cfg(test)]
+				BEFORE_ENTRY.with_borrow_mut(|hook| {
+					if let Some(hook) = hook {
+						hook(&child_source);
+					}
+				});
+				match enter_entry(host, state, walk, &child_source, &child_dest, false) {
+					Ok(Some(child)) => stack.push(child),
+					Ok(None) => {},
+					Err(error) => entry_failed(host, walk, &error),
+				}
+			},
+			Some(Err(error)) => {
+				show_error(host, CpError::IoErrContext(error, format!("cannot access {}", dir.source.quote())));
+				walk.failed = true;
+			},
+			None => {
+				let Some(done) = stack.pop() else { break };
+				let result = leave_dir(host, walk, done);
+				if stack.is_empty() {
+					return result;
+				}
+				if let Err(error) = result {
+					entry_failed(host, walk, &error);
+				}
+			},
+		}
+	}
+	Ok(())
+}
+
+/// A failure of an entry below the operand, reported where it happened; the
+/// walk goes on.
+fn entry_failed(host: &mut Host, walk: &mut Walk<'_>, error: &CpError) {
+	show_error_if_needed(host, error);
+	if !matches!(error, CpError::Skipped(false)) {
+		walk.failed = true;
+	}
+}
+
+/// Copies `source` to `dest` when it is not a directory to descend into,
+/// and returns `None`. For a directory it makes the copy's directory, reads
+/// the source's entries whole, and returns them for the walk to copy.
+fn enter_entry(
+	host: &mut Host,
+	state: &mut CopyState,
+	walk: &mut Walk<'_>,
+	source: &Path,
+	dest: &Path,
+	is_root: bool,
+) -> CopyResult<Option<DirCopy>> {
 	let options = walk.options;
 	let filesystem = host.fs().clone();
 	let source_fs = host.resolve(source);
@@ -3293,8 +3393,8 @@ fn copy_entry(
 			// With --archive a symlink may be copied before the file it names.
 			// A move always copies into a fresh tree, so its failure is real:
 			// `mv` must report it and keep the source.
-			Err(_) if options.preserve_hard_links() && entry_is_symlink && !options.move_mode => Ok(()),
-			result => result,
+			Err(_) if options.preserve_hard_links() && entry_is_symlink && !options.move_mode => Ok(None),
+			result => result.map(|()| None),
 		};
 	}
 
@@ -3317,60 +3417,52 @@ fn copy_entry(
 		Ok(_) => false,
 	};
 
-	if let Some(pushed) = walk.enter(host, source, is_root) {
-		match filesystem.read_dir(&source_fs) {
-			Err(error) => {
-				show_error(host, CpError::IoErrContext(error, format!("cannot access {}", source.quote())));
-				walk.failed = true;
-			},
-			Ok(entries) => {
-				for entry in entries {
-					if host.is_cancelled() {
-						walk.failed = true;
-						break;
-					}
-					let entry = match entry {
-						Ok(entry) => entry,
-						Err(error) => {
-							show_error(
-								host,
-								CpError::IoErrContext(error, format!("cannot access {}", source.quote())),
-							);
-							walk.failed = true;
-							continue;
-						},
-					};
-					let name = entry.file_name();
-					let child_source = child_path(source, &name);
-					let child_dest = child_path(dest, &name);
-					if let Err(error) = copy_entry(host, state, walk, &child_source, &child_dest, false) {
-						show_error_if_needed(host, &error);
-						if !matches!(error, CpError::Skipped(false)) {
-							walk.failed = true;
-						}
-					}
-				}
-			},
-		}
-		if pushed {
-			walk.ancestors.pop();
-		}
-	}
+	let mut names = Vec::new();
+	let pushed = match walk.enter(host, source, is_root) {
+		None => false,
+		Some(pushed) => {
+			match filesystem.read_dir(&source_fs) {
+				Err(error) => {
+					show_error(host, CpError::IoErrContext(error, format!("cannot access {}", source.quote())));
+					walk.failed = true;
+				},
+				// Only the names are kept: an entry would keep the listing's
+				// descriptor open.
+				Ok(entries) => names = entries.map(|entry| entry.map(|entry| entry.file_name())).collect(),
+			}
+			pushed
+		},
+	};
+	Ok(Some(DirCopy {
+		source: source.to_path_buf(),
+		dest: dest.to_path_buf(),
+		names: names.into_iter(),
+		pushed,
+		created,
+		entry_is_symlink,
+		metadata,
+	}))
+}
 
-	// Directories are created without some permissions so nobody can use
-	// them before they are ready; now that the contents are in place, give
-	// the directory its final attributes.
+/// Ends a directory once everything below it is copied: it leaves the walk's
+/// ancestors, then gets its final attributes. Directories are created without
+/// some permissions so nobody can use them before they are ready.
+fn leave_dir(host: &mut Host, walk: &mut Walk<'_>, dir: DirCopy) -> CopyResult<()> {
+	if dir.pushed {
+		walk.ancestors.pop();
+	}
+	let options = walk.options;
 	// The entry's lstat is its followed stat unless it is a symlink.
 	copy_attributes(
 		host,
-		source,
-		dest,
+		&dir.source,
+		&dir.dest,
 		&options.attributes,
-		created && options.copy_mode != CopyMode::Link,
+		dir.created && options.copy_mode != CopyMode::Link,
 		true,
 		options.set_selinux_context,
-		(!entry_is_symlink).then_some(&metadata),
-		DestFacts { symlink: created.then_some(false), ..DestFacts::default() },
+		(!dir.entry_is_symlink).then_some(&dir.metadata),
+		DestFacts { symlink: dir.created.then_some(false), ..DestFacts::default() },
 	)
 }
 
@@ -3876,5 +3968,118 @@ mod tests {
 			assert_eq!(code, 0, "{}", capture.err());
 			assert_eq!(fs::metadata(path(dest)).unwrap().permissions().mode() & 0o7777, 0o644, "{flag}");
 		}
+	}
+
+	/// `cp -r` copies a tree deeper than the open-file limit, as GNU cp does:
+	/// the walk reads each directory whole before it goes below, so it holds
+	/// no descriptor per level (100 levels under a limit of 32, where cp's
+	/// walk failed with "Too many open files" while it still held a descriptor
+	/// per level). In a process of its own, since the limit belongs to the
+	/// whole process.
+	#[cfg(unix)]
+	#[test]
+	fn copies_a_tree_deeper_than_the_descriptor_limit() {
+		use crate::deep_tree::{RemoveTree, assert_file_chain, file_chain, limit_descriptors};
+
+		if !crate::own_process::own_process() {
+			return;
+		}
+		let fixture = crate::deep_tree::tempdir();
+		let _trees = [RemoveTree(fixture.path().join("src")), RemoveTree(fixture.path().join("dst"))];
+		file_chain(&fixture.path().join("src"), 100);
+		limit_descriptors(32);
+		let (code, capture) = run_util::<Cp>(&["-r", "src", "dst"], "", fixture.path());
+		assert_eq!((code, capture.err().as_str()), (0, ""));
+		assert_file_chain(&fixture.path().join("dst"), 100);
+	}
+
+	/// `cp -r` copies a chain of 200 levels on a thread with 256 KiB of
+	/// stack: the walk keeps its directories on a stack of its own, so depth
+	/// costs no thread stack. Before it did, the walk recursed per level and
+	/// overflowed that stack by 63 levels in a debug build; deeper chains
+	/// prove nothing more, and each level's lookups by path cost more. An
+	/// overflow ends the process, so the test runs in a process of its own.
+	#[cfg(unix)]
+	#[test]
+	fn copies_a_tree_deeper_than_the_stack() {
+		use crate::deep_tree::{RemoveTree, assert_file_chain, file_chain};
+
+		if !crate::own_process::own_process() {
+			return;
+		}
+		let fixture = crate::deep_tree::tempdir();
+		let _trees = [RemoveTree(fixture.path().join("src")), RemoveTree(fixture.path().join("dst"))];
+		file_chain(&fixture.path().join("src"), 200);
+		let cwd = fixture.path().to_path_buf();
+		let (code, err) = std::thread::Builder::new()
+			.stack_size(256 * 1024)
+			.spawn(move || {
+				let (code, capture) = run_util::<Cp>(&["-r", "src", "dst"], "", cwd);
+				(code, capture.err())
+			})
+			.unwrap()
+			.join()
+			.unwrap();
+		assert_eq!((code, err.as_str()), (0, ""));
+		assert_file_chain(&fixture.path().join("dst"), 200);
+	}
+
+	/// The walk follows a symbolic link deep in the tree only when asked: `-r`
+	/// and `-rH` copy it as a link, `-rL` copies the directory it names.
+	#[cfg(unix)]
+	#[test]
+	fn a_deep_link_is_copied_as_a_link_unless_dereferenced() {
+		let fixture = tempdir().unwrap();
+		let outside = fixture.path().join("outside");
+		fs::create_dir(&outside).unwrap();
+		fs::write(outside.join("kept"), b"k").unwrap();
+		crate::deep_tree::file_chain(&fixture.path().join("src"), 20);
+		let at_level_ten = |top: &str| (0..10).fold(fixture.path().join(top), |path, _| path.join("d")).join("link");
+		std::os::unix::fs::symlink(&outside, at_level_ten("src")).unwrap();
+		for (flag, dest) in [("-r", "plain"), ("-rH", "command-line")] {
+			let (code, capture) = run_util::<Cp>(&[flag, "src", dest], "", fixture.path());
+			assert_eq!((code, capture.err().as_str()), (0, ""), "{flag}");
+			assert_eq!(fs::read_link(at_level_ten(dest)).unwrap(), outside, "{flag}");
+		}
+		let (code, capture) = run_util::<Cp>(&["-rL", "src", "followed"], "", fixture.path());
+		assert_eq!((code, capture.err().as_str()), (0, ""));
+		assert!(fs::symlink_metadata(at_level_ten("followed")).unwrap().is_dir());
+		assert_eq!(fs::read(at_level_ten("followed").join("kept")).unwrap(), b"k");
+	}
+
+	/// An entry removed after its directory was read is reported, and the rest
+	/// is copied: `cannot stat`, exit 1. The same as before the walk read each
+	/// directory whole, when the listing's first batch already held the name,
+	/// and as GNU cp, whose fts reads a directory whole too.
+	#[test]
+	fn an_entry_removed_after_its_directory_was_read_is_reported() {
+		let fixture = tempdir().unwrap();
+		let src = fixture.path().join("src");
+		fs::create_dir(&src).unwrap();
+		for name in ["a", "b", "c"] {
+			fs::write(src.join(name), name).unwrap();
+		}
+		// Before the first entry, one of the others goes.
+		let removed = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+		let record = std::rc::Rc::clone(&removed);
+		super::BEFORE_ENTRY.set(Some(Box::new(move |entry: &std::path::Path| {
+			let mut removed = record.borrow_mut();
+			if removed.is_none() {
+				let victim = if entry.ends_with("b") { "c" } else { "b" };
+				fs::remove_file(src.join(victim)).unwrap();
+				*removed = Some(victim.to_string());
+			}
+		})));
+		let (code, capture) = run_util::<Cp>(&["-r", "src", "dst"], "", fixture.path());
+		super::BEFORE_ENTRY.set(None);
+		let victim = removed.borrow().clone().expect("the hook ran");
+		assert_eq!(
+			(code, capture.err()),
+			(1, format!("cp: cannot stat 'src/{victim}': No such file or directory\n"))
+		);
+		for name in ["a", "b", "c"].into_iter().filter(|name| *name != victim) {
+			assert_eq!(fs::read(fixture.path().join("dst").join(name)).unwrap(), name.as_bytes());
+		}
+		assert!(!fixture.path().join("dst").join(&victim).exists());
 	}
 }
