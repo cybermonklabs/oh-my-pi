@@ -144,6 +144,8 @@ import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
+	RACED_READ_RETRIES,
+	SessionReadConflictError,
 	type SessionStorage,
 	type SessionStorageWriter,
 	SessionWriteConflictError,
@@ -1473,28 +1475,49 @@ export class SessionManager {
 		return contested;
 	}
 
-	/** Asynchronous {@link #recoverFromWriteConflictSync}, reading the storage's chunk stream. */
+	/**
+	 * Asynchronous {@link #recoverFromWriteConflictSync}, reading the storage's chunk stream.
+	 *
+	 * A read that another writer's full write or delete cut off
+	 * (`SessionReadConflictError`: SQL storage's chunked read) is read again
+	 * from the start, at most {@link MAX_WRITE_CONFLICT_RECOVERIES} reads in
+	 * all; past that the other writer is still rewriting the file, and the
+	 * session moves to a sibling as `contested`. The file still holds this
+	 * session, so it is never taken for a `replaced` one, and the publish is
+	 * never retried without a whole read: its size check could pass against
+	 * the other writer's body of the same size and overwrite it.
+	 */
 	async #recoverFromWriteConflict(error: unknown, recoveries: number): Promise<string | undefined> {
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
 		const epoch = this.#diskEpoch;
-		const scan = this.#foreignEntryScan();
+		let scan = this.#foreignEntryScan();
 		let diskSize = 0;
-		try {
-			await visitEntriesFromFileStream(contested, scan.visit, {
-				storage: this.#storage,
-				throwIfMissing: true,
-				onBytesConsumed: bytes => {
-					diskSize += bytes;
-				},
-			});
-		} catch (readError) {
-			// A synchronous rewrite during the read already recovered; retry against its result.
-			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
-			this.#expectedDiskSize = null;
-			return contested;
+		for (let reads = 1; ; reads++) {
+			try {
+				await visitEntriesFromFileStream(contested, scan.visit, {
+					storage: this.#storage,
+					throwIfMissing: true,
+					onBytesConsumed: bytes => {
+						diskSize += bytes;
+					},
+				});
+				break;
+			} catch (readError) {
+				// A synchronous rewrite during the read already recovered; retry against its result.
+				if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
+				if (readError instanceof SessionReadConflictError) {
+					if (reads >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
+					// One scan serves one read: what the cut-off read found says nothing about the next.
+					scan = this.#foreignEntryScan();
+					diskSize = 0;
+					continue;
+				}
+				if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
+				this.#expectedDiskSize = null;
+				return contested;
+			}
 		}
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 		const foreign = scan.foreign();
@@ -2805,15 +2828,28 @@ export class SessionManager {
 	 * from what the passes left), every other entry still whole goes to the
 	 * store (an entry off the leaf's path, or one a pass or the stripping made
 	 * whole), and the whole entries' blob references are resolved.
+	 *
+	 * A full rewrite or delete that replaced the transcript mid-read
+	 * (`SessionReadConflictError`) makes the whole load run again from its
+	 * start, at most {@link RACED_READ_RETRIES} more times before the error
+	 * surfaces: each pass builds its entries and its cold store afresh, and a
+	 * pass that throws closes the store it opened, so nothing of it reaches
+	 * the next one.
 	 */
 	async #loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
 		// A current-version file whose first entry has no id may predate ids
 		// altogether; only a pass over every entry tells (see migrateToCurrentVersion).
 		let unindexed: boolean | undefined;
-		for (;;) {
-			const loaded = await this.#streamTranscript(filePath, options, unindexed);
-			if (loaded) return loaded;
-			unindexed = await this.#transcriptIsUnindexed(filePath, options);
+		for (let retries = 0; ;) {
+			try {
+				const loaded = await this.#streamTranscript(filePath, options, unindexed);
+				if (loaded) return loaded;
+				unindexed = await this.#transcriptIsUnindexed(filePath, options);
+			} catch (error) {
+				if (!(error instanceof SessionReadConflictError) || retries++ >= RACED_READ_RETRIES) throw error;
+				// What the raced read found of the transcript says nothing about the one read next.
+				unindexed = undefined;
+			}
 		}
 	}
 
