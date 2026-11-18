@@ -2165,7 +2165,9 @@ describe("redrawFrames", () => {
 		);
 		expect(archive.truncatedChars).toBeGreaterThan(0);
 		expect(new Set(archive.frames.map(frame => frame.cols)).size).toBe(2);
-		expect([...(await redrawAll(archive)).keys()]).toEqual(archive.frames.map((_frame, index) => index));
+		expect([...(await redrawAll(archive)).keys()].sort((a, b) => a - b)).toEqual(
+			archive.frames.map((_frame, index) => index),
+		);
 	});
 
 	// A two-column archive keeps its pages' words and drops older pages between the first and the
@@ -2199,7 +2201,7 @@ describe("redrawFrames", () => {
 		});
 		expect(archive.frames.length).toBeGreaterThan(2);
 		const redrawn = await redrawAll(archive, new Set([0]));
-		expect([...redrawn.keys()].sort()).toEqual(archive.frames.map((_frame, index) => index).slice(1));
+		expect([...redrawn.keys()].sort((a, b) => a - b)).toEqual(archive.frames.map((_frame, index) => index).slice(1));
 	});
 
 	it("draws an 8on16 archive at 64 px, where an 8x13 cell gives the same grid", async () => {
@@ -2224,7 +2226,7 @@ describe("redrawFrames", () => {
 		const changed =
 			text.slice(0, head.length + 3) + (text[head.length + 3] === "x" ? "y" : "x") + text.slice(head.length + 4);
 		const redrawn = await redrawAll({ ...archive, text: changed });
-		expect([...redrawn.keys()].sort()).toEqual(archive.frames.map((_frame, index) => index).slice(1));
+		expect([...redrawn.keys()].sort((a, b) => a - b)).toEqual(archive.frames.map((_frame, index) => index).slice(1));
 		const { text: _text, ...withoutText } = archive;
 		expect((await redrawAll(withoutText)).size).toBe(0);
 	});

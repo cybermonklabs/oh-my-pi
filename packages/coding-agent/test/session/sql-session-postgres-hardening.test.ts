@@ -691,8 +691,8 @@ describe.skipIf(!pgUrl)("SqlSessionStorage start-up on PostgreSQL", () => {
 		await db.open({ wrap: client => recording(client as unknown as SqlSessionStorageClient, again) });
 
 		expect({ first: startUpLocks(first), again: startUpLocks(again) }).toEqual({
-			// The session, parts and lease tables, and the lease table's holder index.
-			first: { locks: 1, creates: 4 },
+			// The session, parts, blob and lease tables, and the lease table's holder index.
+			first: { locks: 1, creates: 5 },
 			again: { locks: 0, creates: 0 },
 		});
 	});

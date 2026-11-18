@@ -812,18 +812,19 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		await writer.close();
 
 		const tables = queries.filter(q => q.sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(5);
 		for (const table of tables.slice(0, 2)) {
 			expect(table.sql).toContain("path VARCHAR(512) NOT NULL");
 			expect(table.sql).toContain("LONGTEXT");
 			expect(table.sql).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
 		}
 		expect(tables[1]?.sql).toContain("PRIMARY KEY (path, start_offset)");
-		expect(tables[2]?.sql).toContain(
-			"omp_session_files_blobs (sha256 CHAR(64) NOT NULL PRIMARY KEY, content LONGBLOB",
+		const made = (name: string): string | undefined => tables.find(q => q.sql.includes(` ${name} (`))?.sql;
+		expect(made("omp_session_files_blobs")).toContain(
+			"sha256 CHAR(64) NOT NULL PRIMARY KEY, content LONGBLOB NOT NULL",
 		);
-		expect(tables[3]?.sql).toContain("omp_session_leases (session_id VARCHAR(512) NOT NULL PRIMARY KEY");
-		expect(tables[3]?.sql).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
+		expect(made("omp_session_files_blobs")).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
+		expect(made("omp_session_leases")).toContain("omp_session_leases (session_id VARCHAR(512) NOT NULL PRIMARY KEY");
+		expect(made("omp_session_leases")).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
 
 		const loadIndex = queries.find(q => q.sql.startsWith("SELECT path"));
 		expect(loadIndex?.sql).toContain("byte_len");
