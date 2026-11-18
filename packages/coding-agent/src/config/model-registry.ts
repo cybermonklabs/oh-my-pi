@@ -341,6 +341,8 @@ export class ModelRegistry {
 	 */
 	#baseModels: Model<Api>[] = [];
 	#hasFullSnapshot = false;
+	/** Full compositions of the snapshot from current state; a commit's rebuild stops when one ran since the commit. */
+	#snapshotCompositions = 0;
 	#cachedStandardModelsByProvider: Map<string, Model<Api>[]> = new Map();
 	#pendingStandardCacheProviders: Set<string> = new Set();
 	#cachedDiscoverableModels: Model<Api>[] = [];
@@ -1623,6 +1625,7 @@ export class ModelRegistry {
 				this.#finalizeModels(this.#applyRuntimeModelModifiers(this.#unprojectedModels)),
 			);
 			this.#hasFullSnapshot = true;
+			this.#snapshotCompositions++;
 			this.#providerLookupSnapshots.clear();
 		}
 		return this.#models;
@@ -2503,10 +2506,13 @@ export class ModelRegistry {
 	 * Rebuilds the full snapshot after a commit, in slices on a sliced pass. A rebuild during whose
 	 * slices the composition or the snapshot changed starts over from the current snapshot; after
 	 * MAX_SLICED_DISCOVERY_MERGES of them the next runs in one synchronous step, so the loop ends.
+	 * A snapshot composed from current state after the commit already holds the commit, and the
+	 * change, applied to it again, would restore what a later change removed: the rebuild ends there.
 	 */
 	async #rebuildCommittedSnapshot(change: CommittedSnapshotChange, sliced: boolean): Promise<void> {
+		const compositions = this.#snapshotCompositions;
 		for (let attempt = 1; ; attempt++) {
-			if (!this.#hasFullSnapshot) return;
+			if (!this.#hasFullSnapshot || compositions !== this.#snapshotCompositions) return;
 			const epoch = this.#compositionEpoch;
 			const baseModels = this.#baseModels;
 			const unprojectedModels = this.#unprojectedModels;

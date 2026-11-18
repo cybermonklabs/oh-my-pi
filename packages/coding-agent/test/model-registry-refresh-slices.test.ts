@@ -259,6 +259,23 @@ describe("ModelRegistry discovery slicing", () => {
 			);
 			expect(missing).toEqual([]);
 		});
+
+		test("ends when the snapshot is composed again during it, so a later removal stays removed", async () => {
+			const lazy = await clockReads("lazy", false);
+			const composed = await clockReads("composed", true);
+			const actFrom = lazy.reads + Math.floor((composed.reads - lazy.reads) / 2);
+			// Halfway through the rebuild: unregister the discovered provider, then compose the snapshot
+			// again from the state without it.
+			let acted = false;
+			const { registry } = await clockReads("reload", true, (target, reads) => {
+				if (acted || reads < actFrom) return;
+				acted = true;
+				target.unregisterProvider("snapshot-provider");
+				target.getAll();
+			});
+			expect(acted).toBe(true);
+			expect(inSnapshot(registry, "snapshot-provider", "snapshot-model")).toBe(false);
+		});
 	});
 
 	describe("the work before a pass's first merge", () => {
@@ -297,7 +314,13 @@ describe("ModelRegistry discovery slicing", () => {
 
 		test("checks the slice before each built-in provider's key lookup", async () => {
 			const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
-			const descriptorIds = new Set(PROVIDER_DESCRIPTORS.map(descriptor => descriptor.providerId));
+			// The standard descriptors and the three special ones the registry builds its own options for.
+			const descriptorIds = new Set([
+				...PROVIDER_DESCRIPTORS.map(descriptor => descriptor.providerId),
+				"google-antigravity",
+				"google-gemini-cli",
+				"openai-codex",
+			]);
 			const readsAtPeek = await clockReadsAtFirstPeek(descriptorIds, () => registry.refresh("offline"));
 			expect(readsAtPeek.length).toBeGreaterThan(20);
 			expect(fewestReadsBetween(readsAtPeek)).toBeGreaterThan(0);
