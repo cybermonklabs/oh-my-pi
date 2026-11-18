@@ -3124,7 +3124,8 @@ export class SessionManager {
 		}
 
 		const migrated = migrateToCurrentVersion(fileEntries);
-		await resolveBlobRefsInEntries(fileEntries, this.#blobs);
+		// The blobs this session names get its reference rows, so another session's delete keeps them.
+		await resolveBlobRefsInEntries(fileEntries, this.#blobs, resolvedSessionFile);
 		// loadEntriesFromFile guarantees entries[0] is a valid session header.
 		const header = fileEntries[0] as SessionHeader;
 

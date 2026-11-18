@@ -1791,6 +1791,11 @@ class SqlBlobTier implements SessionBlobTier {
 		return repaired;
 	}
 
+	async reference(sessionPath: string, hashes: readonly string[]): Promise<void> {
+		await this.land(hashes);
+		await this.#backend.addReferences(sessionPath, hashes);
+	}
+
 	sweep(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep> {
 		return this.#backend.sweepBlobs(referenced, beforeMs, apply);
 	}
@@ -3510,6 +3515,21 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				for (const query of this.#q.append) await run(transaction, query, values);
 				await this.#addRefs(transaction, path, named, allowGone);
 			}),
+		);
+	}
+
+	/**
+	 * Reference `hashes` from `path` in a transaction of their own under the
+	 * session's fence, as a transcript write does (see {@link #addRefs}): for a
+	 * session written before the reference table, whose blobs the open wrote
+	 * back, so a delete of another session keeps them.
+	 */
+	async addReferences(path: string, hashes: readonly string[]): Promise<void> {
+		const named = new Set(hashes);
+		const fences = this.#fencesOf([path]);
+		await this.#awaitClaims(fences);
+		await this.#withBlobRefs(named, allowGone =>
+			this.#fencedTransaction(fences, transaction => this.#addRefs(transaction, path, named, allowGone)),
 		);
 	}
 

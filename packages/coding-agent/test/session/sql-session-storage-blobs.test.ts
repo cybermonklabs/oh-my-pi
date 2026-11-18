@@ -45,8 +45,8 @@ const IMAGE_BYTES = Buffer.alloc(4096, 7);
 const IMAGE = IMAGE_BYTES.toString("base64");
 const IMAGE_HASH = sha256(IMAGE_BYTES);
 const BLOB_REF = /blob:sha256:([0-9a-f]{64})/g;
-/** The statement that writes a blob row, whatever the dialect quotes its table name with. */
-const BLOB_INSERT = /^INSERT INTO \S*_blobs\b/;
+/** A blob row's insert (not start-up's privilege probe, `INSERT … SELECT … WHERE 1 = 0`), whatever the dialect quotes its table name with. */
+const BLOB_INSERT = /^INSERT INTO \S*_blobs \([^)]*\) VALUES/;
 /** A lease whose heartbeat stays out of the way, so the write's fence is what finds another holder. */
 const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 
@@ -343,6 +343,72 @@ describe("session blobs in the SQL session storage", () => {
 				expect(queries.filter(query => query.includes("SELECT sha256, content, byte_len FROM"))).toHaveLength(2);
 			});
 
+			it("keeps a blob another session names when a session naming it is deleted, even one written before the reference table", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				// Control: a session written with its reference row keeps the blob when another session naming it goes.
+				const storage = await db.open();
+				const referenced = await writeImageSession(db, storage, [IMAGE_BYTES]);
+				await storage.unlink(await writeImageSession(db, storage, [IMAGE_BYTES]));
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+				await storage.unlink(referenced);
+				expect(await blobHashes(db)).toEqual([]);
+
+				// A session written before the reference table: its image only on this machine, no row, no reference.
+				const written = await writeImageSession(db, storage, [IMAGE_BYTES]);
+				await db.sql(`DELETE FROM ${db.table}_refs`);
+				await db.sql(`DELETE FROM ${db.table}_blobs`);
+				// Opening it writes the image back, and its reference with it.
+				const store = await db.open();
+				const opened = await SessionManager.open(written, path.dirname(written), store);
+				await opened.close();
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+				// A fork of it, naming the same image, is written and deleted.
+				await store.unlink(await writeImageSession(db, store, [IMAGE_BYTES]));
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				const resumed = await SessionManager.open(written, path.dirname(written), await db.open());
+				expect(imagesOf(resumed)).toEqual([IMAGE]);
+				await resumed.close();
+			});
+
+			for (const suffix of ["blobs", "refs"] as const) {
+				it.skipIf(adapter !== "postgres")(
+					`refuses to start on a ${suffix} table that is an inheritance child or a partition`,
+					async () => {
+						await using db = await openLeaseDb(adapter, url ?? "");
+						await (await db.open()).drain();
+						const table = `${db.table}_${suffix}`;
+						const columns =
+							suffix === "blobs"
+								? "sha256 text NOT NULL, content bytea NOT NULL, byte_len bigint NOT NULL, mime_type text, created_ms bigint NOT NULL"
+								: "path text NOT NULL, sha256 text NOT NULL";
+						const key = suffix === "blobs" ? "sha256" : "path, sha256";
+						try {
+							// The table as the store declares it, but a child of another table.
+							await db.sql(`DROP TABLE ${table}`);
+							await db.sql(`CREATE TABLE ${table}_parent (${columns})`);
+							await db.sql(
+								`CREATE TABLE ${table} (${columns}, PRIMARY KEY (${key})) INHERITS (${table}_parent)`,
+							);
+							expect(String(await rejection(db.open({ createTable: false })))).toContain(table);
+
+							// The table as the store declares it, but a partition of another table.
+							await db.sql(`DROP TABLE ${table}`);
+							await db.sql(`DROP TABLE ${table}_parent`);
+							await db.sql(`CREATE TABLE ${table}_parent (${columns}) PARTITION BY HASH (sha256)`);
+							await db.sql(
+								`CREATE TABLE ${table} PARTITION OF ${table}_parent FOR VALUES WITH (MODULUS 1, REMAINDER 0)`,
+							);
+							await db.sql(`ALTER TABLE ${table} ADD PRIMARY KEY (${key})`);
+							expect(String(await rejection(db.open({ createTable: false })))).toContain(table);
+						} finally {
+							await db.sql(`DROP TABLE IF EXISTS ${table}_parent CASCADE`);
+						}
+					},
+				);
+			}
+
 			it("deletes a session's blob rows with the session, and keeps one another session still names", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const storage = await db.open();
@@ -431,7 +497,9 @@ describe("session blobs in the SQL session storage", () => {
 				// Closing drains the shared store, which reports the image session's failed write again.
 				await withImage.close().catch(() => undefined);
 				await plain.close().catch(() => undefined);
-			});
+				// Each blob write that fails is tried 3 times, 250 and 500 ms apart, and this test waits on four
+				// such rounds (the store's own, the write's, the flush's and the close's): about 3 s of waiting.
+			}, 15_000);
 
 			it("draws again, in the read-only loader, the snapcompact frames this machine lacks", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");

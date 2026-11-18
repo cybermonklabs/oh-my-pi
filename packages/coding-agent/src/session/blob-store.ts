@@ -204,6 +204,12 @@ export interface SessionBlobTier {
 	 */
 	repair(hashes: readonly string[], local: (hash: string) => Promise<Buffer | null>): Promise<number>;
 	/**
+	 * Record that the session at `sessionPath` names `hashes`, once the queued
+	 * ones among them land, so a delete of another session keeps their rows.
+	 * A session written before the tier has no such rows of its own.
+	 */
+	reference(sessionPath: string, hashes: readonly string[]): Promise<void>;
+	/**
 	 * `omp gc`'s sweep: delete the blobs created before `beforeMs` that no
 	 * session's references name and `referenced` (the hashes named in any
 	 * transcript gc read) lacks. Without `apply`, only counts.

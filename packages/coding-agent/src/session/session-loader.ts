@@ -885,10 +885,18 @@ async function restoreSnapcompactFrames(entries: readonly SessionEntry[], blobSt
  * left out and warned about. With `writeBack`, each blob this machine holds
  * and the tier lacks (one written before the tier, or whose write never
  * landed) is queued for the tier, so it lands before the session's next
- * transcript write. Snapcompact frames are not in the tier; they are drawn
- * again from their archive's text.
+ * transcript write; with `sessionPath` too, the session at that path then
+ * gets its reference rows for every blob it names that the tier holds, so
+ * another session's delete keeps them (a session written before the tier has
+ * none). Snapcompact frames are not in the tier; they are drawn again from
+ * their archive's text.
  */
-async function restoreTierBlobs(values: readonly unknown[], blobStore: BlobStore, writeBack: boolean): Promise<void> {
+async function restoreTierBlobs(
+	values: readonly unknown[],
+	blobStore: BlobStore,
+	writeBack: boolean,
+	sessionPath?: string,
+): Promise<void> {
 	const tier = blobStore.tier;
 	if (!tier) return;
 	const mimeTypes = new Map<string, string | undefined>();
@@ -903,6 +911,7 @@ async function restoreTierBlobs(values: readonly unknown[], blobStore: BlobStore
 		const data = await blobStore.get(hash);
 		return data && new Bun.SHA256().update(data).digest("hex") === hash ? data : null;
 	};
+	const named: string[] = [];
 	try {
 		const held = await tier.sizes([...mimeTypes.keys()]);
 		const missing: string[] = [];
@@ -910,6 +919,7 @@ async function restoreTierBlobs(values: readonly unknown[], blobStore: BlobStore
 		let writtenBack = 0;
 		for (const [hash, mimeType] of mimeTypes) {
 			if (held.has(hash)) {
+				named.push(hash);
 				if (await blobStore.has(hash)) heldHere.push(hash);
 				else missing.push(hash);
 				continue;
@@ -918,6 +928,7 @@ async function restoreTierBlobs(values: readonly unknown[], blobStore: BlobStore
 			const data = await verifiedLocal(hash);
 			if (!data) continue;
 			tier.store(hash, data, mimeType);
+			named.push(hash);
 			writtenBack++;
 		}
 		if (writtenBack > 0) {
@@ -939,17 +950,32 @@ async function restoreTierBlobs(values: readonly unknown[], blobStore: BlobStore
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
+	if (!writeBack || !sessionPath || named.length === 0) return;
+	try {
+		await tier.reference(sessionPath, named);
+	} catch (error) {
+		logger.warn("Writing a session's blob references to the session database failed", {
+			sessionPath,
+			blobs: named.length,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
 }
 
 /**
  * Restore the image data that persistence externalized to the blob store, in
  * place: first each blob the local store lacks from the store's tier (and
- * each one the tier lacks back to it), then the references, then the active
- * snapcompact archive's missing frames, drawn again from its text.
+ * each one the tier lacks back to it, referenced from `sessionPath` when it is
+ * given), then the references, then the active snapcompact archive's missing
+ * frames, drawn again from its text.
  */
-export async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): Promise<void> {
+export async function resolveBlobRefsInEntries(
+	entries: FileEntry[],
+	blobStore: BlobStore,
+	sessionPath?: string,
+): Promise<void> {
 	const sessionEntries = entriesForBlobResolution(entries);
-	await restoreTierBlobs(sessionEntries, blobStore, true);
+	await restoreTierBlobs(sessionEntries, blobStore, true, sessionPath);
 	await resolveBlobRefs(sessionEntries, blobStore);
 	await restoreSnapcompactFrames(sessionEntries, blobStore);
 }
