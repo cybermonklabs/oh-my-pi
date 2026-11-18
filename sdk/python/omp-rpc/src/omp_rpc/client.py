@@ -315,6 +315,16 @@ class RpcCommandError(RpcError):
         self.code = code
 
 
+def _command_error(response: JsonObject, command_type: str) -> RpcCommandError:
+    """The `RpcCommandError` of a `success: false` response; `command_type` names it when the response does not."""
+    raw_code = response.get("code")
+    return RpcCommandError(
+        command=str(response.get("command", command_type)),
+        error=str(response.get("error", "")),
+        code=raw_code if isinstance(raw_code, str) else None,
+    )
+
+
 class RpcProtocolError(RpcError):
     """Raised or reported when the transport receives an unmatched RPC error response."""
 
@@ -1479,12 +1489,7 @@ class RpcClient(WireClient):
             raise response
 
         if not bool(response.get("success", False)):
-            raw_code = response.get("code")
-            raise RpcCommandError(
-                command=str(response.get("command", command_type)),
-                error=str(response.get("error", "")),
-                code=raw_code if isinstance(raw_code, str) else None,
-            )
+            raise _command_error(response, command_type)
 
         data = response.get("data")
         if data is None:
@@ -2079,9 +2084,7 @@ class RpcClient(WireClient):
             protocol_error.command in _ASYNC_COMMANDS
             and protocol_error.remote_error is not None
         ):
-            self._append_async_error(
-                RpcCommandError(protocol_error.command, protocol_error.remote_error)
-            )
+            self._append_async_error(_command_error(payload, protocol_error.command))
 
         self._record_protocol_error(protocol_error)
 

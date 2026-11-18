@@ -152,12 +152,10 @@ try {
 				},
 			],
 		});
-		// Background compression finishes after startup returns; give it a bounded chance to be metered.
-		if (mode === "metered") {
-			const giveUp = setTimeout(() => recorded.resolve(), 5_000);
-			await recorded.promise;
-			clearTimeout(giveUp);
-		}
+		// Background compression finishes after startup returns. Wait for the gate to record its
+		// cost, the property under test, however long that takes on this machine: a cost that is
+		// never recorded leaves this fixture running with no report, and the test fails at its timeout.
+		if (mode === "metered") await recorded.promise;
 		await session.dispose();
 		console.log(JSON.stringify({ calls, spent: session.costGate.spent }));
 	}

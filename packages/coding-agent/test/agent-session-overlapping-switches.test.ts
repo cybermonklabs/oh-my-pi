@@ -76,6 +76,17 @@ describe("overlapping session switches", () => {
 		return created;
 	}
 
+	/** Writes a one-message session `<name> session` for `cwd` under `<name>-sessions` and returns its file. */
+	async function sessionFileIn(cwd: string, name: string): Promise<string> {
+		const manager = SessionManager.create(cwd, path.join(tempDir.path(), `${name}-sessions`));
+		manager.appendMessage({ role: "user", content: `${name} session`, timestamp: Date.now() });
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		await manager.close();
+		if (!file) throw new Error("Expected target session file");
+		return file;
+	}
+
 	interface RefusedSwitch {
 		/** Lets the owner refuse the switch, now or as soon as the switch asks. */
 		refuse(): void;
@@ -87,12 +98,7 @@ describe("overlapping session switches", () => {
 	async function startRefusedSwitch(target: AgentSession, name: string): Promise<RefusedSwitch> {
 		const targetCwd = path.join(tempDir.path(), `${name}-cwd`);
 		await fs.mkdir(targetCwd, { recursive: true });
-		const manager = SessionManager.create(targetCwd, path.join(tempDir.path(), `${name}-sessions`));
-		manager.appendMessage({ role: "user", content: `${name} session`, timestamp: Date.now() });
-		await manager.ensureOnDisk();
-		const file = manager.getSessionFile();
-		await manager.close();
-		if (!file) throw new Error("Expected target session file");
+		const file = await sessionFileIn(targetCwd, name);
 		const asked = Promise.withResolvers<void>();
 		const refused = Promise.withResolvers<void>();
 		const switching = target.switchSession(file, {
@@ -288,12 +294,7 @@ describe("overlapping session switches", () => {
 		});
 		const targetCwd = path.join(tempDir.path(), "ancestor-cwd");
 		await fs.mkdir(targetCwd, { recursive: true });
-		const manager = SessionManager.create(targetCwd, path.join(tempDir.path(), "ancestor-sessions"));
-		manager.appendMessage({ role: "user", content: "ancestor session", timestamp: Date.now() });
-		await manager.ensureOnDisk();
-		const file = manager.getSessionFile();
-		await manager.close();
-		if (!file) throw new Error("Expected target session file");
+		const file = await sessionFileIn(targetCwd, "ancestor");
 		const switching = outer.switchSession(file, { onCwdChange: async () => true });
 		try {
 			const finished = await Promise.race([switching.then(() => true), Bun.sleep(10_000).then(() => false)]);
@@ -317,13 +318,7 @@ describe("overlapping session switches", () => {
 			nested = await startRefusedSwitch(target, "nested");
 			nestedStarted.resolve();
 		});
-		const outerCwd = target.sessionManager.getCwd();
-		const manager = SessionManager.create(outerCwd, path.join(tempDir.path(), "outer-sessions"));
-		manager.appendMessage({ role: "user", content: "outer session", timestamp: Date.now() });
-		await manager.ensureOnDisk();
-		const file = manager.getSessionFile();
-		await manager.close();
-		if (!file) throw new Error("Expected target session file");
+		const file = await sessionFileIn(target.sessionManager.getCwd(), "outer");
 		let starting: Promise<boolean> | undefined;
 		try {
 			const outer = target.switchSession(file);
@@ -350,6 +345,45 @@ describe("overlapping session switches", () => {
 		}
 	}, 30_000);
 
+	it("drops an aside sent before a transition whose unawaited nested switch is refused after it commits", async () => {
+		const target = createSession();
+		let nested: RefusedSwitch | undefined;
+		const nestedStarted = Promise.withResolvers<void>();
+		let started = false;
+		target.setSessionSwitchReconciler(async () => {
+			if (started) return;
+			started = true;
+			// Started from the outer switch and not awaited: it settles after the outer switch does.
+			nested = await startRefusedSwitch(target, "nested");
+			nestedStarted.resolve();
+		});
+		const file = await sessionFileIn(target.sessionManager.getCwd(), "outer");
+		const aside = sendHeldAside(target);
+		try {
+			await aside.normalizing;
+			const outer = target.switchSession(file);
+			await nestedStarted.promise;
+			expect(await outer).toBe(true);
+			nested!.refuse();
+			expect(await nested!.done).toBe(false);
+			aside.release();
+			// The aside's admission must finish, and claims no turn; it ran into a spin on the session
+			// generation instead, which starves every timer, the test's own timeout included.
+			expect(await aside.delivery).toBe(false);
+			await target.waitForIdle();
+
+			// The aside was sent to the session the outer switch replaced, so it went with that session.
+			await target.prompt("go on");
+			await target.waitForIdle();
+			expect(target.sessionManager.getSessionFile()).toBe(file);
+			expect(target.messages.filter(message => messageText(message).includes(BODY))).toHaveLength(0);
+		} finally {
+			aside.release();
+			nested?.refuse();
+			await Promise.allSettled([nested?.done, aside.delivery]);
+		}
+	}, 30_000);
+
 	it("leaves the accepted switch's session live when two nested switches it started are refused in turn", async () => {
 		const target = createSession();
 		const nested: RefusedSwitch[] = [];
@@ -363,15 +397,7 @@ describe("overlapping session switches", () => {
 			nested.push(await startRefusedSwitch(target, "sibling-c"));
 			nestedStarted.resolve();
 		});
-		const manager = SessionManager.create(
-			target.sessionManager.getCwd(),
-			path.join(tempDir.path(), "accepted-sessions"),
-		);
-		manager.appendMessage({ role: "user", content: "accepted session", timestamp: Date.now() });
-		await manager.ensureOnDisk();
-		const file = manager.getSessionFile();
-		await manager.close();
-		if (!file) throw new Error("Expected target session file");
+		const file = await sessionFileIn(target.sessionManager.getCwd(), "accepted");
 		try {
 			const outer = target.switchSession(file);
 			await nestedStarted.promise;
@@ -397,17 +423,8 @@ describe("overlapping session switches", () => {
 	it("keeps a later new session waiting for a grandchild switch a nested transition left pending", async () => {
 		const target = createSession();
 		const cwd = target.sessionManager.getCwd();
-		async function sessionFileIn(name: string): Promise<string> {
-			const manager = SessionManager.create(cwd, path.join(tempDir.path(), `${name}-sessions`));
-			manager.appendMessage({ role: "user", content: `${name} session`, timestamp: Date.now() });
-			await manager.ensureOnDisk();
-			const file = manager.getSessionFile();
-			await manager.close();
-			if (!file) throw new Error("Expected target session file");
-			return file;
-		}
-		const outerFile = await sessionFileIn("outer");
-		const middleFile = await sessionFileIn("middle");
+		const outerFile = await sessionFileIn(cwd, "outer");
+		const middleFile = await sessionFileIn(cwd, "middle");
 		let grandchild: RefusedSwitch | undefined;
 		let reconciled = 0;
 		target.setSessionSwitchReconciler(async () => {
