@@ -4,8 +4,10 @@
  * `task` call discards unadopted is stopped, so `--restore` relaunches nothing for a job
  * the parent never adopted; launches the call adopted but never started, because the
  * call was aborted first, follow that abort: the parent's process exit leaves them
- * restorable, the parent's stop ends them; and a stop of a continuation turn (one a
- * queued steer started) without a reason stops its subagent too.
+ * restorable, the parent's stop ends them; a stop of a continuation turn (one a queued
+ * steer started) without a reason stops its subagent too; and the parent's process exit
+ * during its sync call leaves the subagent for `--restore`, although the call records the
+ * run that exit cut off as its result.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -27,7 +29,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { hasRestorableTurn, plainTurnAbortReason } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
-import { activeBranch } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { activeBranch, type SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { collectSubSessions, type SubSession } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -35,8 +37,8 @@ import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { type RestoreOutcome, restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
-import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
-import { __resetDirsFromEnvForTests, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { isTaskToolDetails, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import { __resetDirsFromEnvForTests, postmortem, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "./helpers/settings-test-state";
 
 const MOCK_API_SOURCE = "restore-after-parent-abort-test";
@@ -242,35 +244,38 @@ async function openParentWithKeyedWorkers() {
 
 /**
  * Ends the parent's process once its subagent runs settled (every live session closes),
- * then has a new process restore the parent's session: what `--restore` relaunched, and
- * the subagent transcripts it judged.
+ * then has a new process restore the parent's session from its file: what `--restore`
+ * relaunched, the parent's entries it read, and the subagent transcripts it judged.
  */
 async function restoreInNewProcess(
 	parent: AgentSession,
 	runs: readonly Promise<SingleResult>[],
-): Promise<{ outcome: RestoreOutcome; subagents: SubSession[] }> {
+): Promise<{ outcome: RestoreOutcome; parentEntries: SessionEntry[]; subagents: SubSession[] }> {
 	await Promise.all(runs);
 	const parentFile = parent.sessionManager.getSessionFile();
 	if (!parentFile) throw new Error("Expected a persisted parent session file");
-	const entries = parent.sessionManager.getEntries();
-	const leafId = parent.sessionManager.getLeafId();
 	await parent.dispose();
 	await AgentLifecycleManager.global().dispose();
 
 	AgentLifecycleManager.resetGlobalForTests();
 	AgentRegistry.resetGlobalForTests();
+	// The new process reads the parent's transcript as the last one left it in its file.
+	const reopened = await SessionManager.open(parentFile, undefined, undefined, { suppressBreadcrumb: true });
+	const parentEntries = reopened.getEntries();
+	const leafId = reopened.getLeafId();
+	await reopened.close();
 	const manager = new AsyncJobManager({});
 	cleanups.push(() => manager.dispose({ timeoutMs: 1000 }));
 	manager.registerDeliverySink(MAIN_AGENT_ID, () => {});
 	vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockImplementation(async options => subagentResult(options.id));
 	const outcome = await restoreSession({
-		sessionManager: { getSessionFile: () => parentFile, getEntries: () => entries, getLeafId: () => leafId },
+		sessionManager: { getSessionFile: () => parentFile, getEntries: () => parentEntries, getLeafId: () => leafId },
 		asyncJobManager: manager,
 		settings: Settings.isolated(),
 		restoreInterruptedTurn: vi.fn(async () => false),
 	} as unknown as AgentSession);
 	for (const id of outcome.subagents) await manager.getJob(id)?.promise;
-	return { outcome, subagents: Object.values(await collectSubSessions(parentFile)) };
+	return { outcome, parentEntries, subagents: Object.values(await collectSubSessions(parentFile)) };
 }
 
 function subagentResult(id: string): SingleResult {
@@ -390,5 +395,36 @@ describe("omp --restore after a stop without a reason ended a continuation turn'
 		expect(subagents.map(turnEnd)).toEqual([
 			{ stopReason: "aborted", credentialUnavailable: undefined, restorable: false },
 		]);
+	}, 30_000);
+});
+
+describe("omp --restore after the parent's process exit cut off its sync task call while the subagent waited to retry its key", () => {
+	it("relaunches the subagent, although the parent recorded the run that exit cut off as the call's result", async () => {
+		// If this regresses, the result the parent's agent loop records as its process goes away reads as the
+		// subagent's failure, which the parent never acted on: `omp --restore` leaves the subagent's turn unfinished.
+		const { parent, runs } = await openParentWithKeyedWorkers();
+		const backoff = holdBackoff(1);
+		const turn = parent.prompt("Delegate reading the notes.");
+		await backoff.allHeld;
+		expect(runs).toHaveLength(1);
+		await parent.dispose({ reason: postmortem.Reason.EXIT });
+		await turn;
+
+		const { outcome, parentEntries, subagents } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		const ids = subagents.map(sub => sub.agentId);
+		expect(ids).toHaveLength(1);
+		const recorded = parentEntries.flatMap(entry =>
+			entry.type === "message" &&
+			entry.message.role === "toolResult" &&
+			entry.message.toolName === "task" &&
+			isTaskToolDetails(entry.message.details)
+				? entry.message.details.results.map(result => ({ id: result.id, aborted: result.aborted }))
+				: [],
+		);
+		expect(recorded).toEqual([{ id: ids[0], aborted: true }]);
+		expect(outcome.subagents).toEqual(ids);
+		expect(subagents.map(turnEnd)).toEqual([{ stopReason: "error", credentialUnavailable: true, restorable: true }]);
 	}, 30_000);
 });

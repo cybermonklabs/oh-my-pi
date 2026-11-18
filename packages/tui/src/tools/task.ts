@@ -2521,6 +2521,12 @@ export interface SingleResult {
 	error?: string;
 	aborted?: boolean;
 	abortReason?: string;
+	/**
+	 * The worker thread that ran the subagent died before the run settled (a crash, or
+	 * its process's exit ending its workers); `error` names the worker. The run's turn
+	 * stays in the subagent's transcript as the worker left it.
+	 */
+	workerLost?: boolean;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
 	usage?: Usage;
 	/** Output path for the task result */

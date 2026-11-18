@@ -118,6 +118,19 @@ interface UnfinishedTurn {
 }
 
 /**
+ * The branch's last message and its index, after its last `/clear`
+ * (`reset_boundary`): `/clear` ends the conversation before it. Undefined without one.
+ */
+function conversationTail(entries: readonly SessionEntry[]): { index: number; message: AgentMessage } | undefined {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index]!;
+		if (entry.type === "reset_boundary") return undefined;
+		if (entry.type === "message") return { index, message: entry.message };
+	}
+	return undefined;
+}
+
+/**
  * The turn a branch's last process left unfinished: a non-terminal message tail
  * (a prompt or tool results the model never answered, tool calls without results)
  * followed by a process exit, recorded or (with `assumeExit`) assumed. A recorded
@@ -138,18 +151,10 @@ function findUnfinishedTurn(
 		break;
 	}
 
-	let tailIndex = -1;
-	let tail: AgentMessage | undefined;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index]!;
-		// `/clear` ends the conversation before it: nothing behind the boundary is unfinished.
-		if (entry.type === "reset_boundary") break;
-		if (entry.type !== "message") continue;
-		tailIndex = index;
-		tail = entry.message;
-		break;
-	}
-	if (!tail) return undefined;
+	// Nothing behind a `/clear` is unfinished.
+	const last = conversationTail(entries);
+	if (!last) return undefined;
+	const { index: tailIndex, message: tail } = last;
 	if (!exit || tailIndex > exitIndex) {
 		if (!options?.assumeExit) return undefined;
 		exit = { reason: "restore", kind: "process_exit", recordedAt: new Date().toISOString() };
@@ -199,12 +204,8 @@ function isCredentialUnavailableTurn(message: AgentMessage): boolean {
  * last `/clear`, is that marked error.
  */
 export function endsOnCredentialUnavailableTurn(entries: readonly SessionEntry[]): boolean {
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index]!;
-		if (entry.type === "reset_boundary") return false;
-		if (entry.type === "message") return isCredentialUnavailableTurn(entry.message);
-	}
-	return false;
+	const tail = conversationTail(entries);
+	return tail !== undefined && isCredentialUnavailableTurn(tail.message);
 }
 
 /**
@@ -291,10 +292,9 @@ export type TurnAbortKind = "stop" | "cutOff";
 
 /**
  * The field that marks the platform's own abort reason with its kind
- * ({@link plainTurnAbortReason}). It is not enumerable, so a copy of a plain object
- * would drop it; the thread RPC carries an error's own fields, enumerable or not,
- * and rebuilds a `DOMException` named `AbortError` as one, so the marked reason
- * crosses a worker thread with its mark.
+ * ({@link plainTurnAbortReason}). The thread RPC carries an error's own fields,
+ * enumerable or not, and rebuilds a `DOMException` named `AbortError` as one, so the
+ * marked reason crosses a worker thread with its mark.
  */
 const TURN_ABORT_KIND_FIELD = "turnAbortKind";
 

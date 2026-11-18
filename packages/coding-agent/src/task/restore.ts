@@ -15,8 +15,9 @@
  * ordinary `async-result` of a job with the subagent's id, the id its first run's
  * job had, so a parent waiting on that job finds it again. A turn that ended because
  * its key could not be resolved handed its parent the failure at once: it goes on only
- * while the parent still waits on it, holding no result of it recorded since the turn
- * began ({@link SpawnRecords.awaitedByParent}); a parent that holds the failure acts on it.
+ * while the parent still waits on it, holding no result that settles it recorded since
+ * the turn began ({@link SpawnRecords.awaitedByParent}); a parent that holds the failure
+ * acts on it.
  */
 import * as path from "node:path";
 import { isRecord, logger, stringProperty } from "@oh-my-pi/pi-utils";
@@ -164,9 +165,13 @@ function taskResultAgentIds(entry: SessionEntry): string[] {
 
 /**
  * The subagent ids whose result a parent's transcript entry hands it: a `task` result's
- * settled results (a sync spawn's; a background spawn's "started" result names it only in
- * its progress), and the settled jobs a background job's delivery (`async-result`) or a
- * `wait` returned.
+ * results that settle their runs (a sync spawn's; a background spawn's "started" result
+ * names it only in its progress), and the settled jobs a background job's delivery
+ * (`async-result`) or a `wait` returned. A run its abort ended (`aborted`) or that was lost
+ * with its worker thread (`workerLost`) is not settled: when the parent's process goes away
+ * inside the call, the agent loop still records such a result, and the subagent's turn
+ * stays as its transcript left it (a stop of the run left an aborted record there, which
+ * `--restore` leaves anyway).
  */
 function heldResultAgentIds(entry: SessionEntry): string[] {
 	if (entry.type === "custom_message") {
@@ -174,7 +179,10 @@ function heldResultAgentIds(entry: SessionEntry): string[] {
 	}
 	if (entry.type !== "message" || entry.message.role !== "toolResult") return [];
 	const { toolName, details } = entry.message;
-	if (toolName === "task") return isTaskToolDetails(details) ? details.results.map(result => result.id) : [];
+	if (toolName === "task") {
+		if (!isTaskToolDetails(details)) return [];
+		return details.results.filter(result => !result.aborted && !result.workerLost).map(result => result.id);
+	}
 	return toolName === "wait" ? settledJobAgentIds(details) : [];
 }
 
@@ -278,7 +286,7 @@ class SpawnRecords {
 		let current: SubSession | undefined = sub;
 		while (current) {
 			const parentKey: string | null = current.parent;
-			const spawned = parentKey === null ? this.#ofSession() : this.#ofSubagent(parentKey);
+			const spawned = this.#ofParent(parentKey);
 			if (spawned && !spawnedInCurrentConversation(current, spawned)) return false;
 			current = parentKey === null ? undefined : this.#subSessions[parentKey];
 		}
@@ -287,26 +295,27 @@ class SpawnRecords {
 
 	/**
 	 * Whether `sub`'s own parent still waits on its turn that began at `turnStartedAt`
-	 * (epoch ms): its current conversation holds no result of `sub` written since. A sync
-	 * spawn's parent whose process ended inside the call has none yet, nor has the parent
-	 * of a background spawn whose job result was never delivered. A result written before
-	 * the turn began answered an earlier turn, one the parent then messaged `sub` to go on
-	 * from.
+	 * (epoch ms): its current conversation holds no result that settles `sub`'s run
+	 * ({@link heldResultAgentIds}) written since. A sync spawn's parent whose process ended
+	 * inside the call has none: the call got no result, or the agent loop recorded the
+	 * result of the run that exit cut off, or of one lost with its worker thread. Nor has
+	 * the parent of a background spawn whose job result was never delivered. A result
+	 * written before the turn began answered an earlier turn, one the parent then messaged
+	 * `sub` to go on from.
 	 */
 	awaitedByParent(sub: SubSession, turnStartedAt: number | undefined): boolean {
-		const spawned = sub.parent === null ? this.#ofSession() : this.#ofSubagent(sub.parent);
-		const heldAt = spawned?.held.get(sub.agentId);
+		const heldAt = this.#ofParent(sub.parent)?.held.get(sub.agentId);
 		if (heldAt === undefined) return true;
 		// An unreadable or unknown time judges nothing, and the result stands.
 		return turnStartedAt !== undefined && heldAt < turnStartedAt;
 	}
 
-	#ofSession(): SpawnedSubagents {
-		this.#session ??= readSpawnedSubagents(this.#sessionManager.getEntries(), this.#sessionManager.getLeafId());
-		return this.#session;
-	}
-
-	#ofSubagent(key: string): SpawnedSubagents | undefined {
+	/** What the parent `key` records (`null`: the session itself); undefined for a parent not collected. */
+	#ofParent(key: string | null): SpawnedSubagents | undefined {
+		if (key === null) {
+			this.#session ??= readSpawnedSubagents(this.#sessionManager.getEntries(), this.#sessionManager.getLeafId());
+			return this.#session;
+		}
 		const parent = this.#subSessions[key];
 		if (!parent) return undefined;
 		let spawned = this.#bySubagent.get(key);

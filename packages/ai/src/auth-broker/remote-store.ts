@@ -1060,15 +1060,14 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				});
 			}
 		}
+		const warnDeleteFailed = (id: number, error: unknown): void => {
+			logger.warn("auth-broker disable during delete failed", { provider, id, error: String(error) });
+		};
 		for (const id of ids) {
 			try {
 				await this.#client.disableCredential(id, disabledCause);
 			} catch (error) {
-				logger.warn("auth-broker disable during delete failed", {
-					provider,
-					id,
-					error: String(error),
-				});
+				warnDeleteFailed(id, error);
 			}
 		}
 		const refused: number[] = [];
@@ -1076,11 +1075,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			try {
 				if (!(await this.#recordRemoval(id, disabledCause))) refused.push(id);
 			} catch (error) {
-				logger.warn("auth-broker disable during delete failed", {
-					provider,
-					id,
-					error: String(error),
-				});
+				warnDeleteFailed(id, error);
 			}
 		}
 		this.#removeProviderEntries(provider);

@@ -148,8 +148,9 @@ export async function listLogoutAccounts(
 		activeIdentity: authStorage.oauth.identity(provider, sessionId),
 		activeApiKey: authStorage.keys.source(provider)?.kind === "api_key",
 	});
-	const active = rows.map(row => toAccountIdentity(provider, row.credential));
 	const tombstones = await recoverableTombstones(scope => authStorage.credentials.listDisabled(scope), provider);
+	if (tombstones.length === 0) return accounts;
+	const active = rows.map(row => toAccountIdentity(provider, row.credential));
 	for (const summary of tombstones) {
 		// The user logged this account in again: one row to remove, not an active and a disabled one.
 		if (hasActiveAccount(summary, active)) continue;

@@ -588,6 +588,16 @@ function formatReloginDeadline(
 	return `  ${chalk.yellow(`⚠ ${label} — re-login within ${formatDuration(remaining)} (Anthropic expires OAuth grants ~30d after login)`)}`;
 }
 
+/**
+ * Tombstones worth a row in `omp usage`: credentials torn down automatically
+ * ({@link isAutoDisabledCredential}) whose account has no active credential
+ * ({@link hasActiveAccount}). Rows the user replaced or deleted deliberately are
+ * lifecycle noise, not lost capacity.
+ */
+function isActionableDisable(summary: DisabledCredentialSummary, accounts: readonly UsageAccountIdentity[]): boolean {
+	return isAutoDisabledCredential(summary) && !hasActiveAccount(summary, accounts);
+}
+
 /** Human-sized disable cause: the upstream `error_description` when embedded, else the first clause. */
 function shortDisableCause(cause: string): string {
 	const description = cause.match(/\\?"error_description\\?"\s*:\s*\\?"([^"\\]+)/)?.[1];
@@ -818,10 +828,8 @@ export function formatUsageBreakdown(
 		unreportedByProvider.set(account.provider, list);
 	}
 	const disabledByProvider = new Map<string, DisabledCredentialSummary[]>();
-	// Worth a row: a credential torn down automatically whose account has no active
-	// credential. Rows the user replaced or deleted deliberately are lifecycle noise.
 	for (const summary of disabled) {
-		if (!isAutoDisabledCredential(summary) || hasActiveAccount(summary, accounts)) continue;
+		if (!isActionableDisable(summary, accounts)) continue;
 		const list = disabledByProvider.get(summary.provider) ?? [];
 		list.push(summary);
 		disabledByProvider.set(summary.provider, list);
@@ -1674,9 +1682,7 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 				const stats = computeProviderWindowStats(filteredReports.filter(peer => peer.provider === report.provider));
 				if (stats.length > 0) capacity[report.provider] = stats;
 			}
-			let disabledForJson = disabled.filter(
-				summary => isAutoDisabledCredential(summary) && !hasActiveAccount(summary, accounts),
-			);
+			let disabledForJson = disabled.filter(summary => isActionableDisable(summary, accounts));
 			if (redaction) {
 				disabledForJson = disabledForJson.map(summary => ({
 					...summary,

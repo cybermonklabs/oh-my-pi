@@ -157,9 +157,14 @@ export function isUserRemovalCause(cause: string): boolean {
  * login restores, not lifecycle noise.
  */
 export function isAutoDisabledCredential(summary: DisabledCredentialSummary): boolean {
-	if (summary.type !== "oauth" || isUserRemovalCause(summary.cause)) return false;
+	if (summary.type !== "oauth") return false;
 	const cause = summary.cause.toLowerCase();
-	return !cause.startsWith(REPLACED_BY_CAUSE_PREFIX) && !cause.startsWith(DEDUPLICATED_CAUSE_PREFIX);
+	return (
+		!cause.startsWith(DELETED_BY_USER) &&
+		!cause.startsWith(LOGGED_OUT_BY_USER) &&
+		!cause.startsWith(REPLACED_BY_CAUSE_PREFIX) &&
+		!cause.startsWith(DEDUPLICATED_CAUSE_PREFIX)
+	);
 }
 
 /**

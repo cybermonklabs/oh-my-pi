@@ -178,6 +178,50 @@ describe("LogoutAccountSelectorComponent", () => {
 		}
 	});
 
+	it("lists a recoverable tombstone of another member of the active login's organization beside it", async () => {
+		// If this regresses, another member's login in the same organization hides this member's failure-disabled
+		// one: /logout cannot remove it, and its sessions keep waiting for its key.
+		await using temp = await TempDir.create("@logout-org-member-");
+		const authStorage = await AuthStorage.create(temp.join("auth.db"));
+		try {
+			await authStorage.credentials.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access",
+					refresh: "refresh",
+					expires: Date.now() + 60_000,
+					email: "member-b@example.test",
+					orgId: "org-shared",
+				},
+			]);
+			const id = authStorage.credentials.list("anthropic")[0]!.id;
+			// Member A's login a failure tore down, as a broker that predates `identityKey` reports it.
+			vi.spyOn(authStorage.credentials, "listDisabled").mockResolvedValue([
+				{
+					id: id + 100,
+					provider: "anthropic",
+					type: "oauth",
+					email: "member-a@example.test",
+					orgId: "org-shared",
+					cause: "oauth refresh failed: invalid_grant",
+				},
+			]);
+
+			const accounts = await listLogoutAccounts(authStorage, "anthropic", "logout-session");
+
+			expect(accounts).toEqual([
+				expect.objectContaining({ credentialId: id, label: expect.stringContaining("member-b@example.test") }),
+				expect.objectContaining({
+					credentialId: id + 100,
+					active: false,
+					label: expect.stringContaining("member-a@example.test"),
+				}),
+			]);
+		} finally {
+			authStorage.close();
+		}
+	});
+
 	for (const explicitProvider of [true, false]) {
 		it(`offers and removes a failure-disabled login through the ${explicitProvider ? "account" : "provider"} selector`, async () => {
 			await using temp = await TempDir.create("@logout-selector-disabled-");

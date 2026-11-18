@@ -24,7 +24,11 @@
  *   its lanes from main's, so every thread shares one state per account.
  */
 import { AuthStorage, type SessionRestrictionLease, type UsageProvider } from "@oh-my-pi/pi-ai";
-import { AuthBrokerError, AuthBrokerStreamUnsupportedError } from "@oh-my-pi/pi-ai/auth-broker";
+import {
+	AuthBrokerError,
+	AuthBrokerRemovalNotRecordedError,
+	AuthBrokerStreamUnsupportedError,
+} from "@oh-my-pi/pi-ai/auth-broker";
 import { getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import {
 	AccountPoolUnavailableError,
@@ -444,6 +448,11 @@ function registerAuthErrors(): void {
 	registerRpcError("ConfigurationError", message => new ConfigurationError(message));
 	registerRpcError("AuthBrokerError", message => new AuthBrokerError(message));
 	registerRpcError("AuthBrokerStreamUnsupportedError", message => new AuthBrokerStreamUnsupportedError(message));
+	registerRpcError("AuthBrokerRemovalNotRecordedError", message => {
+		const error = new AuthBrokerRemovalNotRecordedError("", []);
+		error.message = message;
+		return error;
+	});
 }
 
 function isAuthServiceGlobals(

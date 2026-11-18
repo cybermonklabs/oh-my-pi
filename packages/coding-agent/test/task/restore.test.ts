@@ -181,10 +181,14 @@ const stranded: Message[] = [
 
 /**
  * The parent's `task` call to subagent `id` and what the call got back: nothing (`cut off`:
- * the parent's process ended while it waited), the sync spawn's failed result, or a
- * background spawn's "started" record, which names the spawn only in its progress.
+ * the parent's process ended while it waited), the sync spawn's failed result (with `run`'s
+ * fields), or a background spawn's "started" record, which names the spawn only in its progress.
  */
-function parentTaskCall(id: string, outcome: "cut off" | "failed" | "started"): Message[] {
+function parentTaskCall(
+	id: string,
+	outcome: "cut off" | "failed" | "started",
+	run: Partial<SingleResult> = {},
+): Message[] {
 	const toolCallId = `call_${id}`;
 	const call = assistant({
 		content: [{ type: "toolCall", id: toolCallId, name: "task", arguments: { agent: "task", task: `${id} task` } }],
@@ -193,7 +197,7 @@ function parentTaskCall(id: string, outcome: "cut off" | "failed" | "started"): 
 	if (outcome === "cut off") return [call];
 	const failed: TaskToolDetails = {
 		projectAgentsDir: null,
-		results: [{ ...subagentResult(id), exitCode: 1, output: "", error: KEY_ERROR }],
+		results: [{ ...subagentResult(id), exitCode: 1, output: "", error: KEY_ERROR, ...run }],
 		totalDurationMs: 5,
 	};
 	const started = {
@@ -214,6 +218,18 @@ function parentTaskCall(id: string, outcome: "cut off" | "failed" | "started"): 
 	};
 	return [call, result];
 }
+
+/**
+ * The results of a sync spawn that settle nothing of its run, as the parent's agent loop records
+ * them when the parent's process goes away inside the call.
+ */
+const unsettledRunResults: Record<string, Partial<SingleResult>> = {
+	"the run its process exit cut off": { aborted: true },
+	"the run lost with its worker thread": {
+		error: "Subagent worker w1 exited mid-run: worker pool disposed",
+		workerLost: true,
+	},
+};
 
 /** The records that hand a parent its background subagent `id`'s settled job result. */
 const jobResultRecords: Record<string, (main: SessionManager, id: string, status: "completed" | "failed") => void> = {
@@ -275,6 +291,7 @@ describe("restoreSession (omp --restore)", () => {
 		"Started",
 		"Delivered",
 		"FollowedUp",
+		"Unsettled",
 	];
 	let tempDir: TempDir | undefined;
 	let manager: AsyncJobManager | undefined;
@@ -568,6 +585,28 @@ describe("restoreSession (omp --restore)", () => {
 		expect(outcome).toEqual({ turn: false, subagents: ["Awaited"] });
 		expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "Awaited", restore: true });
 	});
+
+	for (const [record, run] of Object.entries(unsettledRunResults)) {
+		it(`relaunches a subagent stranded without its key whose parent's sync call recorded ${record}`, async () => {
+			// If this regresses, the result the parent's agent loop records as its process goes away inside the call
+			// reads as the subagent's failure, which the parent never acted on: `--restore` loses the subagent's turn.
+			const start = Date.parse("2026-11-17T12:00:00.000Z");
+			setSystemTime(new Date(start));
+			const { main, mainFile, cwd } = openParent();
+			const [call, result] = parentTaskCall("Unsettled", "failed", run);
+			main.appendMessage(call!);
+			await writeSubagent(mainFile, cwd, "Unsettled", stranded, { normalExit: true });
+			// The call's result is written as the parent's process goes away, after the subagent's turn began.
+			setSystemTime(new Date(start + 60_000));
+			main.appendMessage(result!);
+			setSystemTime();
+
+			const { outcome, followUp } = await restoreParent(main, mainFile);
+
+			expect(outcome).toEqual({ turn: false, subagents: ["Unsettled"] });
+			expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "Unsettled", restore: true });
+		});
+	}
 
 	it("relaunches a background subagent stranded without its key whose parent holds only the record that started it", async () => {
 		// If this regresses, a background subagent whose failed job result never reached its parent is lost: the

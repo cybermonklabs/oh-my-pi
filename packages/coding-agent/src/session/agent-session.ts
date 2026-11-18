@@ -83,6 +83,7 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
 import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
+import { AuthBrokerRemovalNotRecordedError } from "@oh-my-pi/pi-ai/auth-broker/remote-store";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
@@ -5099,9 +5100,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						await this.#modelRegistry.authStorage.credentials.remove("github-copilot");
 					} catch (error) {
 						// An auth broker older than this client cannot record the removal on a login a
-						// failure disabled: say so, and let the rest of the turn's maintenance run. Matched
-						// by name, since from a subagent worker it crosses the thread as a plain `Error`.
-						if (!(error instanceof Error) || error.name !== "AuthBrokerRemovalNotRecordedError") throw error;
+						// failure disabled: say so, and let the rest of the turn's maintenance run.
+						if (!(error instanceof AuthBrokerRemovalNotRecordedError)) throw error;
 						this.emitNotice("warning", error.message, CREDENTIAL_DISABLED_NOTICE_SOURCE);
 					}
 				}

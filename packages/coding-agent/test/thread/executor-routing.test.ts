@@ -527,6 +527,9 @@ describe("subagent runs routed into pooled workers", () => {
 			const result = await running;
 			expect(result.exitCode).toBe(1);
 			expect(result.error).toBe(`Subagent worker ${worker.threadId} exited mid-run: worker crashed: boom`);
+			// If this mark regresses, `omp --restore` reads the lost run's result, which the parent's agent loop records
+			// as its process exit ends the workers, as the subagent's settled failure and never goes on with its turn.
+			expect(result.workerLost).toBe(true);
 			const ref = AgentRegistry.global().get("Lost");
 			expect(ref?.session).toBeNull();
 			// Its transcript survives: the ref stays revivable through the persisted factory.

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- A task `SingleResult` now carries `workerLost` when the worker thread that ran the subagent died before the run settled ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

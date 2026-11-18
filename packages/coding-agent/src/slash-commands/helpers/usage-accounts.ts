@@ -46,8 +46,9 @@ export function toAccountIdentity(provider: string, credential: AuthCredential):
 /**
  * Whether one of `accounts` is the account `summary`'s tombstone names: the store's
  * `identityKey` decides when the tombstone carries one (a broker older than the field
- * sends none), else a shared email or account id, else an organization neither side
- * contradicts. The user logged that account in again, so the tombstone is lifecycle
+ * sends none), else a shared email or account id, else an organization neither email nor
+ * account id contradicts (both sides carry one, and they differ: another member of the
+ * organization). The user logged that account in again, so the tombstone is lifecycle
  * noise — no lost capacity to report, no second row to log out of.
  */
 export function hasActiveAccount(
@@ -70,10 +71,9 @@ export function hasActiveAccount(
 		if (summaryEmail && accountEmail && summaryEmail === accountEmail) return true;
 		if (summaryAccountId && accountAccountId && summaryAccountId === accountAccountId) return true;
 
-		// Fallback: if orgId matches and neither email nor accountId contradicts
-		if (summaryOrgId && accountOrgId && summaryOrgId === accountOrgId) return true;
-
-		return false;
+		// Fallback: the same orgId, when neither email nor accountId contradicts (both set, so they differ here)
+		if (!summaryOrgId || summaryOrgId !== accountOrgId) return false;
+		return !(summaryEmail && accountEmail) && !(summaryAccountId && accountAccountId);
 	});
 }
 

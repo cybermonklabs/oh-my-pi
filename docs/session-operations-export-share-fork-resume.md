@@ -522,14 +522,16 @@ whatever exit followed it: nothing was sent, and a subagent's process exits
 normally on such a turn. Such a subagent's parent got the failed result at once,
 so the subagent is relaunched only while its parent still waits on it, judged
 by its own parent's current conversation (after that parent's last `/clear`, on
-its active branch): a sync subagent while no `task` result there settles it (the
-parent's process ended inside the call), a background one while no delivery of
-its job's result (an
-`async-result` message, or a `wait` that returned the settled job) is there; the
-`task` result that only started the job does not count, nor does a result written
-before the subagent's last turn began (its task prompt, or the message that woke
-it again): that result answered an earlier turn, and the parent waits on this one.
-A parent that holds the failed result acts on it itself.
+its active branch): a sync subagent while no `task` result there settles it, a
+background one while no delivery of its job's result (an `async-result` message,
+or a `wait` that returned the settled job) is there. When the parent's process
+ended inside a sync call, the call recorded no result, or one that settles
+nothing: the result of a run that exit cut off (`aborted`) or that was lost with
+its worker thread (`workerLost`). The `task` result that only started a
+background job does not count either, nor does a result written before the
+subagent's last turn began (its task prompt, or the message that woke it again):
+that result answered an earlier turn, and the parent waits on this one. A parent
+that holds the failed result acts on it itself.
 
 An abort while such a turn waits to retry ends it or leaves it by who gets its
 result:

@@ -9,9 +9,9 @@
  *   on; from a worker, to main, which routes it on.
  * - {@link revivePersistedPlaced} cold-revives a parked agent where the pool places it, like
  *   a fresh spawn.
- * - A worker that dies mid-run or mid-turn turns the call into a failed `SingleResult` whose
- *   error names the worker; the agent's ref is left `parked` (revivable from its transcript)
- *   or `aborted` (no transcript).
+ * - A worker that dies mid-run or mid-turn turns the call into a failed `SingleResult`
+ *   (`workerLost`) whose error names the worker; the agent's ref is left `parked` (revivable
+ *   from its transcript) or `aborted` (no transcript).
  *
  * Kept apart from the thread service so importing it never evaluates the service list.
  */
@@ -62,9 +62,10 @@ function workerGone(worker: SubagentWorker | undefined, home: ThreadId): string 
 }
 
 /**
- * The failed result of a run whose worker died. The worker's own `settled` frame never
- * came, so emit it here; a ref the worker never attached a session to is settled too
- * (refs with an attached session were already detached by the agents service).
+ * The failed result of a run whose worker died, marked `workerLost`. The worker's own
+ * `settled` frame never came, so emit it here; a ref the worker never attached a session
+ * to is settled too (refs with an attached session were already detached by the agents
+ * service).
  */
 function lostRunResult(run: LostRun, error: string, startTime: number): SingleResult {
 	const registry = AgentRegistry.global();
@@ -101,6 +102,7 @@ function lostRunResult(run: LostRun, error: string, startTime: number): SingleRe
 		modelOverride: run.modelOverride,
 		modelRole: run.modelRole,
 		error,
+		workerLost: true,
 	};
 }
 

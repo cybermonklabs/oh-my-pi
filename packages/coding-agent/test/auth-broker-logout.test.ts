@@ -11,22 +11,26 @@ import * as path from "node:path";
 import { AuthStorage, isRecoverableDisabledCredential, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { runAuthBrokerCommand } from "@oh-my-pi/pi-coding-agent/cli/auth-broker-cli";
 import * as oauthTerminal from "@oh-my-pi/pi-coding-agent/cli/oauth-terminal";
-import { getAgentDbPath, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, getAgentDbPath, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { restoreEnvValue } from "./helpers/settings-test-state";
+
+/** What `setAgentDir` sets or clears, put back after each test. */
+const ENV_KEYS = ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 
 describe("auth-broker logout provider picker", () => {
 	let agentDir = "";
-	let originalAgentDir: string | undefined;
+	let savedEnv: Record<string, string | undefined> = {};
 
 	beforeEach(async () => {
-		originalAgentDir = process.env.OMP_AGENT_DIR;
+		savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
 		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-logout-agent-"));
 		setAgentDir(agentDir);
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		if (originalAgentDir === undefined) delete process.env.OMP_AGENT_DIR;
-		else process.env.OMP_AGENT_DIR = originalAgentDir;
+		for (const key of ENV_KEYS) restoreEnvValue(key, savedEnv[key]);
+		__resetDirsFromEnvForTests();
 		await removeWithRetries(agentDir);
 	});
 
