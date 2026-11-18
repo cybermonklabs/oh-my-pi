@@ -44,7 +44,7 @@ describe("IRC wake turn yield reset", () => {
 			trackIrcReply: () => {},
 		} as unknown as AgentSession;
 
-		attachIrcWakeTurnMonitor(session, { id: "wake-1", agent: wakeAgent });
+		attachIrcWakeTurnMonitor(session, { id: "wake-1", agent: wakeAgent, storeMaskCwd: "/tmp" });
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
 		// A prior run's incremental section sets the flag on the reused tool.

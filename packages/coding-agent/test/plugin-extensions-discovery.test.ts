@@ -13,8 +13,14 @@ describe("plugin extension discovery", () => {
 	let projectDir: TempDir;
 	let tempHome = "";
 	const originalAgentDir = getAgentDir();
-	const xdgVars = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
-	const originalXdg = new Map<string, string | undefined>();
+	const rootEnvVars = [
+		"XDG_DATA_HOME",
+		"XDG_STATE_HOME",
+		"XDG_CACHE_HOME",
+		"OMP_CONFIG_ROOT",
+		"OMP_DOWNLOAD_ROOT",
+	] as const;
+	const previousRootEnv = new Map<string, string | undefined>();
 
 	beforeEach(() => {
 		projectDir = TempDir.createSync("@pi-plugin-ext-");
@@ -25,10 +31,11 @@ describe("plugin extension discovery", () => {
 		//    into and rm'd the developer's real `~/.omp/plugins`);
 		//  - clear the XDG_* vars, because on Linux/macOS the resolver prefers
 		//    `$XDG_DATA_HOME/omp` over the home config root when that dir exists, so an
-		//    XDG-migrated environment would otherwise still resolve the real plugins dir.
+		//    XDG-migrated environment would otherwise still resolve the real plugins dir;
+		//    and the config-root overrides, which replace the home config root outright.
 		tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-home-"));
-		for (const key of xdgVars) {
-			originalXdg.set(key, process.env[key]);
+		for (const key of rootEnvVars) {
+			previousRootEnv.set(key, process.env[key]);
 			delete process.env[key];
 		}
 		spyOn(os, "homedir").mockReturnValue(tempHome);
@@ -76,11 +83,11 @@ describe("plugin extension discovery", () => {
 	afterEach(() => {
 		projectDir.removeSync();
 		spyOn(os, "homedir").mockRestore();
-		for (const [key, value] of originalXdg) {
+		for (const [key, value] of previousRootEnv) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
 		}
-		originalXdg.clear();
+		previousRootEnv.clear();
 		setAgentDir(originalAgentDir);
 		// The legacy Pi parse cache db lives under the temp home's `.omp/cache`;
 		// release it so Windows can delete the directory.

@@ -56,6 +56,8 @@ from typing import Any, Protocol
 from robomp.git_ops import (
     GitCommandError,
     PushResult,
+    _append_safe_directory,
+    _drop_worktree_registration,
     redact_credentials,
 )
 from robomp.git_ops import (
@@ -121,18 +123,9 @@ def workspace_key(repo: str, number: int | str) -> str:
     return f"{repo.replace('/', '__')}__{number}"
 
 
-def _safe_directory_env(repo_dir: Path) -> dict[str, str]:
-    """Return a Git config env overlay whitelisting ``repo_dir`` as safe."""
-    return {
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "safe.directory",
-        "GIT_CONFIG_VALUE_0": str(repo_dir),
-    }
-
-
 def _git_env_for_repo(repo_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
-    env.update(_safe_directory_env(repo_dir))
+    _append_safe_directory(env, repo_dir)
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
@@ -420,20 +413,20 @@ def _worktree_add(add_cmd: list[str], *, pool: Path, repo_dir: Path) -> None:
     GitCommandError 124, or any nonzero git failure) can leave a partial
     checkout at `repo_dir` and/or a dangling pool worktree registration. Left
     behind, the event retry hits stale metadata and fails again on the same
-    path. Best-effort remove the checkout and prune the pool, then re-raise so the
-    retry starts from a clean path. If the prune itself fails (incl. a 124
-    timeout), raise that instead — chained from the add error — since a
-    dangling registration left behind is exactly what poisons the retry.
+    path. Best-effort remove the checkout and drop its registration, then
+    re-raise so the retry starts from a clean path. If dropping the
+    registration itself fails, raise that instead — chained from the add
+    error — since a dangling registration left behind is exactly what poisons
+    the retry.
     """
     try:
         _run(add_cmd, cwd=pool)
     except GitCommandError as add_err:
         shutil.rmtree(repo_dir, ignore_errors=True)
-        pruned = _safe_run(["git", "worktree", "prune"], cwd=pool)
-        if pruned.returncode != 0:
-            raise GitCommandError(
-                ["git", "worktree", "prune"], pruned.returncode, pruned.stdout, pruned.stderr
-            ) from add_err
+        try:
+            _drop_worktree_registration(repo_dir, pool)
+        except GitCommandError as drop_err:
+            raise drop_err from add_err
         raise
 
 
@@ -562,11 +555,15 @@ def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dic
     xdg_data = xdg_root / "data"
     xdg_state = xdg_root / "state"
     xdg_cache = xdg_root / "cache"
+    # The workspace's own, empty to start: the operator's XDG config (git's
+    # `git/config`, gh's tokens) must not reach code run from the checkout.
+    xdg_config = xdg_root / "config"
     bun_cache = xdg_cache / "bun-install"
 
     for base in (xdg_data, xdg_state, xdg_cache):
         base.mkdir(parents=True, exist_ok=True)
         (base / "omp").mkdir(parents=True, exist_ok=True)
+    xdg_config.mkdir(parents=True, exist_ok=True)
     bun_cache.mkdir(parents=True, exist_ok=True)
 
     return {
@@ -576,6 +573,7 @@ def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dic
         "XDG_DATA_HOME": str(xdg_data),
         "XDG_STATE_HOME": str(xdg_state),
         "XDG_CACHE_HOME": str(xdg_cache),
+        "XDG_CONFIG_HOME": str(xdg_config),
         "BUN_INSTALL_CACHE_DIR": str(bun_cache),
     }
 
@@ -606,6 +604,7 @@ def _provision_runtime_dirs(ws_root: Path) -> None:
         base = xdg_root / sub
         base.mkdir(parents=True, exist_ok=True)
         (base / "omp").mkdir(parents=True, exist_ok=True)
+    (xdg_root / "config").mkdir(parents=True, exist_ok=True)
     (xdg_root / "cache" / "bun-install").mkdir(parents=True, exist_ok=True)
 
 
@@ -821,11 +820,13 @@ class SandboxManager:
         transport: GitTransport | None = None,
         natives_cache: NativesCache | None = None,
     ) -> None:
-        self.root = root
-        self.pool = root / "_pool"
+        # Absolute: every worktree is added with the pool as git's cwd, where a
+        # relative path would put it inside the pool.
+        self.root = root.absolute()
+        self.pool = self.root / "_pool"
         self.transport: GitTransport = transport or LocalGitTransport(token=None)
         self.natives_cache = natives_cache
-        root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True)
         self.pool.mkdir(parents=True, exist_ok=True)
         self._repo_locks: dict[str, threading.RLock] = {}
         self._repo_locks_guard = threading.Lock()
@@ -1168,41 +1169,26 @@ class SandboxManager:
     def remove_workspace(self, *, repo: str, number: int | str) -> None:
         with self._repo_lock(repo):
             ws_root = self.workspace_root(repo, number)
-            repo_dir = ws_root / "repo"
             pool = self.pool_path(repo)
-            # `repo_dir.exists()` is not a reliable proxy for "nothing to clean
-            # up in the pool": a worktree-add or a prior remove killed mid-flight
-            # can leave the checkout gone but the pool's worktree registration
-            # dangling, which fails the next `git worktree add` for this path.
-            # Only run git in a REAL pool clone: `ensure_clone` mkdir's the pool
-            # dir BEFORE cloning, so a failed first clone can leave a non-git dir
-            # here, and `git worktree prune` in it would error. Mirror
-            # `ensure_clone`'s own `.git`/`HEAD` validity check.
-            if (pool / ".git").exists() or (pool / "HEAD").exists():
-                needs_prune = False
-                if repo_dir.exists():
-                    removed = _safe_run(["git", "worktree", "remove", "--force", str(repo_dir)], cwd=pool)
-                    if removed.returncode != 0:
-                        shutil.rmtree(repo_dir, ignore_errors=True)
-                        needs_prune = True
-                elif ws_root.exists():
-                    # Checkout gone but the workspace root remains -> a prior op
-                    # was killed mid-flight and may have left a dangling
-                    # registration. A fully-cleaned workspace has no ws_root, so
-                    # a plain repeat close prunes nothing.
-                    needs_prune = True
-                if needs_prune:
-                    pruned = _safe_run(["git", "worktree", "prune"], cwd=pool)
-                    if pruned.returncode != 0:
-                        # Prune is the step that clears the dangling registration.
-                        # If it fails (incl. a 124 timeout), report it so the
-                        # cleanup event retries instead of recording success with
-                        # stale metadata still blocking the next add.
-                        raise GitCommandError(
-                            ["git", "worktree", "prune"], pruned.returncode, pruned.stdout, pruned.stderr
-                        )
+            # No git runs here. The workspace is the agent's to change, and git
+            # checks a path and then opens it again to delete it, so a link
+            # swapped in between would take it into whatever the link names,
+            # another workspace's checkout included. rmtree unlinks a link
+            # instead of following it.
             if ws_root.exists():
                 shutil.rmtree(ws_root, ignore_errors=True)
+            # Only touch a REAL pool clone: `ensure_clone` mkdir's the pool dir
+            # BEFORE cloning, so a failed first clone can leave a non-git dir
+            # here. Mirror `ensure_clone`'s own `.git`/`HEAD` validity check.
+            if (pool / ".git").exists() or (pool / "HEAD").exists():
+                # Every worktree under the workspace root was its own: the
+                # checkout, and any the agent added inside it. A registration
+                # left behind keeps holding its branch and fails the next add,
+                # so drop each one now gone; if that fails, raise so the
+                # cleanup event retries (this runs again with ws_root already
+                # gone). Without a dead registration under ws_root (a repeat
+                # close) it deletes nothing.
+                _drop_worktree_registration(ws_root, pool, under=True)
 
     def reclaim_workspace_caches(self, *, repo: str, number: int | str) -> bool:
         """Strip re-creatable dependency caches from an idle workspace.

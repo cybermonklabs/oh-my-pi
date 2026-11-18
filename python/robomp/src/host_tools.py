@@ -24,7 +24,12 @@ from omp_rpc import HostTool, HostToolContext, RpcCommandError, host_tool
 from robomp import persona
 from robomp.config import Settings
 from robomp.db import Database, IssueState, issue_key
-from robomp.git_ops import GitCommandError, HeadDriftError
+from robomp.git_ops import (
+    GitCommandError,
+    HeadDriftError,
+    _operator_config_overlay,
+    _replace_git_config_with_safe_directory,
+)
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import GitHubError, IssueInfo, PullRequestFileInfo, RepoInfo
 from robomp.issue_index import parse_search_query
@@ -32,7 +37,6 @@ from robomp.sandbox import (
     GitTransport,
     Workspace,
     _prepare_slot_runtime_env,
-    _safe_directory_env,
     _share_git_metadata_with_slots,
     _slot_permissions_active,
     _slot_subprocess_kwargs,
@@ -49,9 +53,13 @@ _BUN_INSTALL_COMMAND = ("bun", "install", "--frozen-lockfile", "--ignore-scripts
 _BUN_INSTALL_TIMEOUT_SECONDS = 300.0
 _REPO_COMMAND_SCRUBBED_ENV_KEYS: tuple[str, ...] = (
     "GITHUB_TOKEN",
+    "GH_TOKEN",
     "GITHUB_WEBHOOK_SECRET",
     "ROBOMP_REPLAY_TOKEN",
     "ROBOMP_GH_PROXY_HMAC_KEY",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "SSH_AUTH_SOCK",
 )
 _NEEDS_INFO_LABEL = "needs-info"
 _AGENT_HOME = Path("/srv/agent-home")
@@ -244,17 +252,24 @@ def _repo_command_env(bindings: ToolBindings) -> dict[str, str]:
     """Environment for repo-owned commands (`bun`, formatter, local git).
 
     These commands execute code from the checked-out repository, so they must
-    not inherit GitHub credentials from the orchestrator. They also need the
-    exact same HOME/XDG/TMP/Bun cache paths as the agent process; otherwise
-    host-side pre-publish gates validate a different machine than the agent saw.
+    not inherit robomp's GitHub credentials, credential prompt programs or ssh
+    agent, nor its operator's config: the `GIT_CONFIG_*` series and
+    `GIT_CONFIG_PARAMETERS` (the only entry they get is `safe.directory`), a
+    `GIT_CONFIG_SYSTEM` file, and the operator's global git and XDG config;
+    each can carry a credential helper, a token or an `http.extraHeader`.
+    They also need the exact same HOME/XDG/TMP/Bun cache paths and git config as
+    the agent process; otherwise host-side pre-publish gates validate a
+    different machine than the agent saw.
     """
     env = os.environ.copy()
     for key in _REPO_COMMAND_SCRUBBED_ENV_KEYS:
         env[key] = ""
-    if _AGENT_HOME.is_dir():
-        env["HOME"] = str(_AGENT_HOME)
+    agent_home = _AGENT_HOME if _AGENT_HOME.is_dir() else None
+    if agent_home is not None:
+        env["HOME"] = str(agent_home)
     env.update(_prepare_slot_runtime_env(bindings.workspace, bindings.slot_uid))
-    env.update(_safe_directory_env(bindings.workspace.repo_dir))
+    env.update(_operator_config_overlay(os.environ, agent_home))
+    _replace_git_config_with_safe_directory(env, bindings.workspace.repo_dir)
     env.update(_git_identity_env(bindings.author_name, bindings.author_email))
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
