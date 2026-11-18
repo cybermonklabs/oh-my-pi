@@ -394,14 +394,11 @@ export class ModelRegistry {
 	 * commits only when no such change landed between its merge and commit.
 	 */
 	#compositionEpoch = 0;
-	/** Commit tickets issued to discovery passes, one each when its fetches resolve. */
-	#commitTicketsIssued = 0;
-	/** Every ticket up to this one has committed or stopped. */
-	#commitTicketsSettled = 0;
-	/** Tickets that committed or stopped while an earlier one was still out. */
-	#stoppedCommitTickets = new Set<number>();
-	/** The pass waiting to commit, by its ticket. */
-	#commitTurnWaiters = new Map<number, () => void>();
+	/**
+	 * Settles once every discovery pass whose fetches have resolved has
+	 * committed or stopped; each pass appends itself when its fetches resolve.
+	 */
+	#commitChain: Promise<void> = Promise.resolve();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	// `provider/id:kind` of modelOverrides kinds already reported as unserved, so
 	// every rebuild does not log the same ignored override again.
@@ -2297,9 +2294,11 @@ export class ModelRegistry {
 		]);
 		// Before merges ran in slices, a pass committed in the step in which its
 		// fetches resolved, so passes committed in the order their fetches resolved.
-		// The ticket keeps that order: a pass that finishes its merge early waits
-		// for every pass whose fetches resolved before its own to commit or stop.
-		const commitTicket = this.#takeCommitTicket();
+		// The commit chain keeps that order: a pass that finishes its merge early
+		// waits for every pass whose fetches resolved before its own to commit or stop.
+		const earlierCommits = this.#commitChain;
+		const { promise: ownCommit, resolve: releaseCommit } = Promise.withResolvers<void>();
+		this.#commitChain = earlierCommits.then(() => ownCommit);
 		try {
 			this.#captureCatalogMetrics(builtInDiscovery.models, providerFilter === undefined);
 			// The merge runs in slices so the pass never holds the event loop. A static
@@ -2350,43 +2349,13 @@ export class ModelRegistry {
 					? await runInSlices(this.#hardcodedModelPolicySteps(await mapInSlices(discovered, merge)))
 					: this.#applyHardcodedModelPolicies(discovered.map(merge));
 				if (epoch !== this.#compositionEpoch) continue;
-				if (!this.#isCommitTurn(commitTicket)) {
-					await this.#waitForCommitTurn(commitTicket);
-					if (epoch !== this.#compositionEpoch) continue;
-				}
+				await earlierCommits;
+				if (epoch !== this.#compositionEpoch) continue;
 				this.#commitRuntimeDiscoveries(builtInDiscovery, replacedConfiguredProviders, touchedProviders, discoveredModels);
 				return;
 			}
 		} finally {
-			this.#releaseCommitTicket(commitTicket);
-		}
-	}
-
-	/** Issues the next commit ticket, in the order the passes' fetches resolve. */
-	#takeCommitTicket(): number {
-		return ++this.#commitTicketsIssued;
-	}
-
-	/** Whether every pass holding an earlier ticket has committed or stopped. */
-	#isCommitTurn(ticket: number): boolean {
-		return this.#commitTicketsSettled === ticket - 1;
-	}
-
-	#waitForCommitTurn(ticket: number): Promise<void> {
-		const { promise, resolve } = Promise.withResolvers<void>();
-		this.#commitTurnWaiters.set(ticket, resolve);
-		return promise;
-	}
-
-	/** Settles a ticket; tickets settle in order, so one that stopped early waits for those before it. */
-	#releaseCommitTicket(ticket: number): void {
-		this.#stoppedCommitTickets.add(ticket);
-		while (this.#stoppedCommitTickets.delete(this.#commitTicketsSettled + 1)) this.#commitTicketsSettled++;
-		const next = this.#commitTicketsSettled + 1;
-		const resolveNext = this.#commitTurnWaiters.get(next);
-		if (resolveNext) {
-			this.#commitTurnWaiters.delete(next);
-			resolveNext();
+			releaseCommit();
 		}
 	}
 
