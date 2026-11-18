@@ -394,10 +394,14 @@ export class ModelRegistry {
 	 * commits only when no such change landed between its merge and commit.
 	 */
 	#compositionEpoch = 0;
-	/** Advances each time a discovery pass's fetches resolve. */
-	#discoverySequence = 0;
-	/** Per provider, the sequence of the pass whose discovered rows are committed. */
-	#providerDiscoverySequence = new Map<string, number>();
+	/** Commit tickets issued to discovery passes, one each when its fetches resolve. */
+	#commitTicketsIssued = 0;
+	/** Every ticket up to this one has committed or stopped. */
+	#commitTicketsSettled = 0;
+	/** Tickets that committed or stopped while an earlier one was still out. */
+	#stoppedCommitTickets = new Set<number>();
+	/** The pass waiting to commit, by its ticket. */
+	#commitTurnWaiters = new Map<number, () => void>();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	// `provider/id:kind` of modelOverrides kinds already reported as unserved, so
 	// every rebuild does not log the same ignored override again.
@@ -1244,7 +1248,6 @@ export class ModelRegistry {
 					models: Model<Api>[];
 					authoritativeProviders: Set<string>;
 					discoveryStates: Map<string, ProviderDiscoveryState>;
-					discoverySequences: Map<string, number>;
 					runtimeProviderIds: Set<string>;
 					configuredProviders: Map<string, DiscoveryProviderConfig>;
 					providerOverrides: Map<string, ProviderOverride>;
@@ -1257,7 +1260,6 @@ export class ModelRegistry {
 				models: this.#runtimeDiscoveredModels,
 				authoritativeProviders: new Set(this.#runtimeAuthoritativeProviders),
 				discoveryStates: new Map(this.#providerDiscoveryStates),
-				discoverySequences: new Map(this.#providerDiscoverySequence),
 				runtimeProviderIds: new Set(this.#runtimeModelManagers.keys()),
 				configuredProviders: new Map(this.#discoverableProviders.map(config => [config.provider, config])),
 				providerOverrides: new Map(this.#providerOverrides),
@@ -1326,11 +1328,6 @@ export class ModelRegistry {
 		for (const [providerId, state] of preservedRuntimeState.discoveryStates) {
 			if (preservedProviderIds.has(providerId)) this.#providerDiscoveryStates.set(providerId, state);
 		}
-		// A preserved provider keeps the sequence of the pass that committed its rows,
-		// so an older pass still in its merge cannot replace them.
-		for (const [providerId, sequence] of preservedRuntimeState.discoverySequences) {
-			if (preservedProviderIds.has(providerId)) this.#providerDiscoverySequence.set(providerId, sequence);
-		}
 	}
 
 	/**
@@ -1396,8 +1393,6 @@ export class ModelRegistry {
 		this.#replacedCacheProviders.clear();
 		this.#runtimeDiscoveredModels = [];
 		this.#runtimeAuthoritativeProviders.clear();
-		// The rows these sequences protected are gone; an older pass may commit again.
-		this.#providerDiscoverySequence.clear();
 		this.#internedStaticModels.clear();
 		this.#providerLookupSnapshots.clear();
 		this.#commandConfigsByProvider.clear();
@@ -2300,106 +2295,119 @@ export class ModelRegistry {
 			configuredDiscoveriesPromise,
 			this.#discoverBuiltInProviderModels(strategy, providerFilter),
 		]);
-		// Taken when the pass's fetches resolve, the moment its merge began before
-		// merges ran in slices: of two passes that touch a provider, the one whose
-		// fetches resolved later commits its rows, whichever finishes its merge last.
-		const discoverySequence = ++this.#discoverySequence;
-		this.#captureCatalogMetrics(builtInDiscovery.models, providerFilter === undefined);
-		// The merge runs in slices so the pass never holds the event loop. A static
-		// reload or a provider registration between the merge and the commit
-		// changes what the merge read, so the pass merges again. After
-		// MAX_SLICED_DISCOVERY_MERGES merges that each saw such a change, the last
-		// merge runs in one synchronous step, as every merge did before slicing:
-		// the loop always ends, and the commit always matches the current
-		// configuration. Only a configuration that changes during every one of
-		// those merges pays that one blocking step.
-		for (let mergeCount = 1; ; mergeCount++) {
-			const epoch = this.#compositionEpoch;
-			const currentDiscoverableProviders = new Set(this.#discoverableProviders);
-			const currentConfiguredDiscoveryResults = configuredDiscoveryResults.filter(result =>
-				currentDiscoverableProviders.has(result.provider),
-			);
-			const configuredDiscovered = currentConfiguredDiscoveryResults.flatMap(result => result.models);
-			const replacedConfiguredProviders = currentConfiguredDiscoveryResults.flatMap(result =>
-				result.replaceRuntimeModels ? [result.provider.provider] : [],
-			);
-			const discovered = [...configuredDiscovered, ...builtInDiscovery.models];
-			if (
-				discovered.length === 0 &&
-				builtInDiscovery.authoritativeProviders.size === 0 &&
-				builtInDiscovery.replaceRuntimeProviders.size === 0 &&
-				replacedConfiguredProviders.length === 0
-			) {
+		// Before merges ran in slices, a pass committed in the step in which its
+		// fetches resolved, so passes committed in the order their fetches resolved.
+		// The ticket keeps that order: a pass that finishes its merge early waits
+		// for every pass whose fetches resolved before its own to commit or stop.
+		const commitTicket = this.#takeCommitTicket();
+		try {
+			this.#captureCatalogMetrics(builtInDiscovery.models, providerFilter === undefined);
+			// The merge runs in slices so the pass never holds the event loop. A static
+			// reload, a provider registration or an earlier pass's commit between the
+			// merge and the commit changes what the merge read, so the pass merges
+			// again. After MAX_SLICED_DISCOVERY_MERGES merges that each saw such a
+			// change, the last merge runs in one synchronous step, as every merge did
+			// before slicing: the loop always ends, and the commit always matches the
+			// current configuration. Only a configuration that changes during every
+			// one of those merges pays that one blocking step.
+			for (let mergeCount = 1; ; mergeCount++) {
+				const epoch = this.#compositionEpoch;
+				const currentDiscoverableProviders = new Set(this.#discoverableProviders);
+				const currentConfiguredDiscoveryResults = configuredDiscoveryResults.filter(result =>
+					currentDiscoverableProviders.has(result.provider),
+				);
+				const configuredDiscovered = currentConfiguredDiscoveryResults.flatMap(result => result.models);
+				const replacedConfiguredProviders = currentConfiguredDiscoveryResults.flatMap(result =>
+					result.replaceRuntimeModels ? [result.provider.provider] : [],
+				);
+				const discovered = [...configuredDiscovered, ...builtInDiscovery.models];
+				if (
+					discovered.length === 0 &&
+					builtInDiscovery.authoritativeProviders.size === 0 &&
+					builtInDiscovery.replaceRuntimeProviders.size === 0 &&
+					replacedConfiguredProviders.length === 0
+				) {
+					return;
+				}
+				const touchedProviders = new Set(discovered.map(model => model.provider));
+				for (const provider of replacedConfiguredProviders) touchedProviders.add(provider);
+				for (const provider of builtInDiscovery.replaceRuntimeProviders) touchedProviders.add(provider);
+				for (const provider of builtInDiscovery.authoritativeProviders) touchedProviders.add(provider);
+				const sliced = mergeCount <= MAX_SLICED_DISCOVERY_MERGES;
+				if (sliced) {
+					await this.#loadCachedStandardModelsInSlices(touchedProviders);
+					if (epoch !== this.#compositionEpoch) continue;
+				}
+				const referenceSteps = this.#discoveryReferenceModelSteps(touchedProviders);
+				const referenceModels = sliced ? await runInSlices(referenceSteps) : runToCompletion(referenceSteps);
+				const merge = (model: Model<Api>) =>
+					this.#mergeDiscoveredModelMemoized(
+						model,
+						resolveProviderModelReference(model.provider, model.id, referenceModels),
+						this.#providerOverrides.get(model.provider),
+					);
+				const discoveredModels = sliced
+					? await runInSlices(this.#hardcodedModelPolicySteps(await mapInSlices(discovered, merge)))
+					: this.#applyHardcodedModelPolicies(discovered.map(merge));
+				if (epoch !== this.#compositionEpoch) continue;
+				if (!this.#isCommitTurn(commitTicket)) {
+					await this.#waitForCommitTurn(commitTicket);
+					if (epoch !== this.#compositionEpoch) continue;
+				}
+				this.#commitRuntimeDiscoveries(builtInDiscovery, replacedConfiguredProviders, touchedProviders, discoveredModels);
 				return;
 			}
-			const touchedProviders = new Set(discovered.map(model => model.provider));
-			for (const provider of replacedConfiguredProviders) touchedProviders.add(provider);
-			for (const provider of builtInDiscovery.replaceRuntimeProviders) touchedProviders.add(provider);
-			for (const provider of builtInDiscovery.authoritativeProviders) touchedProviders.add(provider);
-			const sliced = mergeCount <= MAX_SLICED_DISCOVERY_MERGES;
-			if (sliced) {
-				await this.#loadCachedStandardModelsInSlices(touchedProviders);
-				if (epoch !== this.#compositionEpoch) continue;
-			}
-			const referenceSteps = this.#discoveryReferenceModelSteps(touchedProviders);
-			const referenceModels = sliced ? await runInSlices(referenceSteps) : runToCompletion(referenceSteps);
-			const merge = (model: Model<Api>) =>
-				this.#mergeDiscoveredModelMemoized(
-					model,
-					resolveProviderModelReference(model.provider, model.id, referenceModels),
-					this.#providerOverrides.get(model.provider),
-				);
-			const discoveredModels = sliced
-				? await runInSlices(this.#hardcodedModelPolicySteps(await mapInSlices(discovered, merge)))
-				: this.#applyHardcodedModelPolicies(discovered.map(merge));
-			if (epoch !== this.#compositionEpoch) continue;
-			this.#commitRuntimeDiscoveries(
-				builtInDiscovery,
-				replacedConfiguredProviders,
-				touchedProviders,
-				discoveredModels,
-				discoverySequence,
-			);
-			return;
+		} finally {
+			this.#releaseCommitTicket(commitTicket);
 		}
 	}
 
-	/**
-	 * Records a discovery pass's merged models; runs in one synchronous step after
-	 * the pass's last slice. A provider that a pass with newer fetch results
-	 * already committed keeps that pass's rows: a sliced merge can finish after a
-	 * later pass's, and the later fetch must win, as it did when merges ran in the
-	 * step in which their fetches resolved. This pass's cache replacement still
-	 * applies to that provider: the newer pass may have read the cache rather than
-	 * the network, and then nothing else removes the cached rows the network no
-	 * longer lists.
-	 */
+	/** Issues the next commit ticket, in the order the passes' fetches resolve. */
+	#takeCommitTicket(): number {
+		return ++this.#commitTicketsIssued;
+	}
+
+	/** Whether every pass holding an earlier ticket has committed or stopped. */
+	#isCommitTurn(ticket: number): boolean {
+		return this.#commitTicketsSettled === ticket - 1;
+	}
+
+	#waitForCommitTurn(ticket: number): Promise<void> {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#commitTurnWaiters.set(ticket, resolve);
+		return promise;
+	}
+
+	/** Settles a ticket; tickets settle in order, so one that stopped early waits for those before it. */
+	#releaseCommitTicket(ticket: number): void {
+		this.#stoppedCommitTickets.add(ticket);
+		while (this.#stoppedCommitTickets.delete(this.#commitTicketsSettled + 1)) this.#commitTicketsSettled++;
+		const next = this.#commitTicketsSettled + 1;
+		const resolveNext = this.#commitTurnWaiters.get(next);
+		if (resolveNext) {
+			this.#commitTurnWaiters.delete(next);
+			resolveNext();
+		}
+	}
+
+	/** Records a discovery pass's merged models; runs in one synchronous step after the pass's last slice. */
 	#commitRuntimeDiscoveries(
 		builtInDiscovery: BuiltInDiscoveryResult,
 		replacedConfiguredProviders: readonly string[],
-		allTouchedProviders: ReadonlySet<string>,
-		allDiscoveredModels: Model<Api>[],
-		discoverySequence: number,
+		touchedProviders: ReadonlySet<string>,
+		discoveredModels: Model<Api>[],
 	): void {
-		const isCurrent = (provider: string) =>
-			(this.#providerDiscoverySequence.get(provider) ?? 0) < discoverySequence;
-		const touchedProviders = new Set([...allTouchedProviders].filter(isCurrent));
-		const replacedProviderSet = new Set([...replacedConfiguredProviders, ...builtInDiscovery.replaceRuntimeProviders]);
-		if (touchedProviders.size === 0 && replacedProviderSet.size === 0) return;
-		const discoveredModels =
-			touchedProviders.size === allTouchedProviders.size
-				? allDiscoveredModels
-				: allDiscoveredModels.filter(model => touchedProviders.has(model.provider));
-		for (const provider of touchedProviders) this.#providerDiscoverySequence.set(provider, discoverySequence);
 		// A commit changes the cached and discovered slices that a concurrent
 		// pass's sliced merge reads, so that pass must merge again.
 		this.#compositionEpoch++;
 		const authoritativeProviders = providersWithAuthoritativeProjectCatalog(discoveredModels);
 		for (const provider of builtInDiscovery.authoritativeProviders) {
-			if (touchedProviders.has(provider)) authoritativeProviders.add(provider);
+			authoritativeProviders.add(provider);
 		}
 
+		const replacedProviderSet = new Set(replacedConfiguredProviders);
 		for (const provider of builtInDiscovery.replaceRuntimeProviders) {
+			replacedProviderSet.add(provider);
 			this.#replacedCacheProviders.add(provider);
 			this.#cachedStandardModelsByProvider.delete(provider);
 			this.#pendingStandardCacheProviders.delete(provider);
@@ -2420,8 +2428,6 @@ export class ModelRegistry {
 			} else {
 				this.#runtimeAuthoritativeProviders.delete(provider);
 			}
-		}
-		for (const provider of new Set([...touchedProviders, ...replacedProviderSet])) {
 			this.#invalidateProviderModelCache(provider);
 		}
 		if (!this.#hasFullSnapshot) return;
@@ -3962,7 +3968,6 @@ export class ModelRegistry {
 			this.#runtimeDiscoveredModels = this.#runtimeDiscoveredModels.filter(model => model.provider !== providerName);
 			this.#runtimeAuthoritativeProviders.delete(providerName);
 			this.#providerDiscoveryStates.delete(providerName);
-			this.#providerDiscoverySequence.delete(providerName);
 		}
 		this.#invalidateProviderModelCache(providerName);
 		this.#runtimeRegistrations = this.#runtimeRegistrations.filter(change => change.name !== providerName);
