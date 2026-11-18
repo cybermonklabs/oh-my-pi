@@ -123,18 +123,36 @@ impl BreError {
 	}
 }
 
-/// Rewrites `pattern`, written in `dialect`, into the syntax `target` reads
-/// with the meaning GNU gives it, read as strictly as `strictness` says.
-///
-/// `icase` is the case folding the caller compiles with: GNU checks a range
-/// against the ends it folds, so `[Z-a]` is a range of its own and "Invalid
-/// range end" under `-i`.
+/// [`translate_multiline`] for a pattern searched in one line at a time, as
+/// `grep` and `nl` search it.
+#[cfg(any(feature = "util.grep", feature = "util.nl", test))]
 pub(crate) fn translate(
 	pattern: &str,
 	dialect: Dialect,
 	target: Target,
 	icase: bool,
 	strictness: Strictness,
+) -> Result<String, BreError> {
+	translate_multiline(pattern, dialect, target, icase, strictness, false)
+}
+
+/// Rewrites `pattern`, written in `dialect`, into the syntax `target` reads
+/// with the meaning GNU gives it, read as strictly as `strictness` says.
+///
+/// `icase` is the case folding the caller compiles with: GNU checks a range
+/// against the ends it folds, so `[Z-a]` is a range of its own and "Invalid
+/// range end" under `-i`.
+///
+/// `multiline` is GNU sed's `M` flag, for text of several lines: there a
+/// bracket expression that negates holds no newline, as `.` matches none
+/// (`printf 'ab\nba\n' | sed 'N;s/[^a]/X/Mg'` prints `aX` and `Xa`).
+pub(crate) fn translate_multiline(
+	pattern: &str,
+	dialect: Dialect,
+	target: Target,
+	icase: bool,
+	strictness: Strictness,
+	multiline: bool,
 ) -> Result<String, BreError> {
 	Translator {
 		chars: pattern.chars().peekable(),
@@ -143,6 +161,7 @@ pub(crate) fn translate(
 		target,
 		strictness,
 		icase,
+		multiline,
 		atom: None,
 		quantified: false,
 		anchored: false,
@@ -453,6 +472,9 @@ struct Translator<'a> {
 	target:     Target,
 	strictness: Strictness,
 	icase:      bool,
+	/// Whether a bracket expression that negates holds no newline; see
+	/// [`translate_multiline`].
+	multiline:  bool,
 	/// Where in `out` the atom a repetition operator repeats begins, or
 	/// `None` at a branch start, where there is nothing to repeat.
 	atom:       Option<usize>,
@@ -484,7 +506,13 @@ impl Translator<'_> {
 				'\\' => self.escape()?,
 				'[' => {
 					let start = self.out.len();
-					take_bracket_expression(&mut self.chars, &mut self.out, self.icase, self.target)?;
+					take_bracket_expression(
+						&mut self.chars,
+						&mut self.out,
+						self.icase,
+						self.target,
+						self.multiline,
+					)?;
 					self.set_atom(start);
 				},
 				'*' => self.repeat("*", "*")?,
@@ -852,15 +880,22 @@ enum BracketMember {
 /// has a class for an end, or a `-` after a range or class that does not
 /// close the list, and a list that is a class name without the outer
 /// brackets.
+///
+/// A list that negates holds no newline where `multiline` (GNU sed's `M`
+/// flag): `[^x]*$` stops at the end of a line there.
 fn take_bracket_expression(
 	chars: &mut Peekable<Chars<'_>>,
 	out: &mut String,
 	icase: bool,
 	target: Target,
+	multiline: bool,
 ) -> Result<(), BreError> {
 	out.push('[');
 	if chars.next_if_eq(&'^').is_some() {
 		out.push('^');
+		if multiline {
+			out.push_str("\\n");
+		}
 	}
 	// A `-` first in the list is a member.
 	let mut first = true;
