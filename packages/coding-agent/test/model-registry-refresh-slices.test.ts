@@ -229,6 +229,15 @@ describe("ModelRegistry discovery slicing", () => {
 			expect(composed.reads - lazy.reads).toBeGreaterThan(snapshotSize);
 			expect(catalogText(composed.registry.getAll())).toEqual(expected);
 		});
+		/** True while the pass's commit holds the discovered model and the published snapshot does not yet. */
+		const insideRebuild = (registry: ModelRegistry): boolean => {
+			const { snapshot, unsubscribe } = registry.subscribeMirror(() => {});
+			unsubscribe();
+			const committed = (snapshot.discovery?.catalog?.models ?? []).some(
+				model => model.provider === "snapshot-provider" && model.id === "snapshot-model",
+			);
+			return committed && !inSnapshot(registry, "snapshot-provider", "snapshot-model");
+		};
 
 		test("whose inputs change during every rebuild still ends, and keeps every change", async () => {
 			// The rebuild's reads come after the reads a refresh without a snapshot takes in all; start
@@ -238,8 +247,10 @@ describe("ModelRegistry discovery slicing", () => {
 			const churnFrom = lazy.reads + Math.floor((composed.reads - lazy.reads) / 2);
 			// From then on, each turn registers a provider with one model: a change to what the rebuild read.
 			let registrations = 0;
+			let firstInsideRebuild = false;
 			const { registry } = await clockReads("churn", true, (target, reads) => {
 				if (reads < churnFrom) return;
+				if (registrations === 0) firstInsideRebuild = insideRebuild(target);
 				registrations++;
 				target.registerProvider(
 					`churn-${registrations}`,
@@ -252,6 +263,7 @@ describe("ModelRegistry discovery slicing", () => {
 					"ext://churn",
 				);
 			});
+			expect(firstInsideRebuild).toBe(true);
 			expect(registrations).toBeGreaterThan(3);
 			expect(inSnapshot(registry, "snapshot-provider", "snapshot-model")).toBe(true);
 			const missing = Array.from({ length: registrations }, (_, index) => index + 1).filter(
@@ -267,13 +279,15 @@ describe("ModelRegistry discovery slicing", () => {
 			// Halfway through the rebuild: unregister the discovered provider, then compose the snapshot
 			// again from the state without it.
 			let acted = false;
+			let actedInsideRebuild = false;
 			const { registry } = await clockReads("reload", true, (target, reads) => {
 				if (acted || reads < actFrom) return;
 				acted = true;
+				actedInsideRebuild = insideRebuild(target);
 				target.unregisterProvider("snapshot-provider");
 				target.getAll();
 			});
-			expect(acted).toBe(true);
+			expect(actedInsideRebuild).toBe(true);
 			expect(inSnapshot(registry, "snapshot-provider", "snapshot-model")).toBe(false);
 		});
 	});
