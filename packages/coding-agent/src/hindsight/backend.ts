@@ -37,9 +37,10 @@ export const hindsightBackend: MemoryBackend = {
 		if (!sessionId) return;
 
 		// Subagents alias the parent's state so recall/retain/reflect tool calls
-		// persist to the same Hindsight bank. Auto-recall and auto-retain stay
-		// with the parent — running them per subagent would double-recall and
-		// pollute the bank with internal exploration transcripts.
+		// persist to the same Hindsight bank. First-turn recall and auto-retain
+		// stay with the parent — running them per subagent would double-recall and
+		// pollute the bank with internal exploration transcripts. A subagent's
+		// compaction recall shares the parent's pause after a failed recall.
 		if (options.taskDepth > 0) {
 			const parent = options.parentHindsightSessionState;
 			if (!parent) return;
