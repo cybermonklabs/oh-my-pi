@@ -60,7 +60,7 @@ export const hindsightBackend: MemoryBackend = {
 					aliasOf: parent,
 				}),
 			);
-			// Aliases don't run auto-recall/auto-retain, so any pending retain
+			// Aliases run no first-turn recall and no auto-retain, so any pending retain
 			// queue belongs to the previous alias and is safe to drop after a
 			// best-effort flush (`flushRetainQueue` is no-op when empty).
 			await previous?.flushRetainQueue();
