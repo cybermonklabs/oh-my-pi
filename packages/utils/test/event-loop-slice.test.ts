@@ -3,6 +3,7 @@ import {
 	EVENT_LOOP_SLICE_MS,
 	mapInSlices,
 	nextSlice,
+	readJsonInSlices,
 	runInSlices,
 	sliceExpired,
 } from "@oh-my-pi/pi-utils/event-loop-slice";
@@ -201,5 +202,31 @@ describe("runInSlices", () => {
 		expect(await runInSlices(steps())).toBe("done");
 		turns.stop();
 		expect(sliceSizes(unitTurns)).toEqual([UNITS_PER_SLICE, UNITS_PER_SLICE]);
+	});
+});
+
+describe("readJsonInSlices", () => {
+	it("parses each fetched payload in a slice of its own, so two that arrive together do not hold off due timers", async () => {
+		// About 10 MB: its parse outlasts a slice's budget on any machine.
+		const body = JSON.stringify(
+			Array.from({ length: 150_000 }, (_, index) => ({
+				id: `model-${index}`,
+				name: `Model ${index}`,
+				window: index,
+			})),
+		);
+		let fired = false;
+		setTimeout(() => (fired = true), 0);
+		const firedAtEnd: boolean[] = [];
+		const parsed = await Promise.all(
+			[new Response(body), new Response(body)].map(async response => {
+				const payload = await readJsonInSlices(response);
+				firedAtEnd.push(fired);
+				return payload;
+			}),
+		);
+		expect(parsed.map(payload => (payload as unknown[]).length)).toEqual([150_000, 150_000]);
+		// The second payload's parse waited for the timers.
+		expect(firedAtEnd[1]).toBe(true);
 	});
 });

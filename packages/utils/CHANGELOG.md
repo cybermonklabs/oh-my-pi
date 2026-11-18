@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added `@oh-my-pi/pi-utils/event-loop-slice` (`sliceExpired`, `nextSlice`, `mapInSlices`, `runInSlices`, `runToCompletion`) for CPU-bound background work that must give the event loop a turn after each 10 ms slice; concurrent passes share the budget and take it in turn
+- Added `@oh-my-pi/pi-utils/event-loop-slice` (`sliceExpired`, `nextSlice`, `mapInSlices`, `runInSlices`, `runToCompletion`, `parseJsonBytesInSlices`, `readJsonInSlices`) for CPU-bound background work that must give the event loop a turn after each 10 ms slice; concurrent passes share the budget and take it in turn, one pass through the event loop holds at most one slice, and a fetched JSON payload is decoded and parsed in slices of its own
 
 ## [18.18.2] - 2026-11-08
 

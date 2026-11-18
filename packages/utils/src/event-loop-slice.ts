@@ -152,3 +152,21 @@ export function runToCompletion<T>(steps: Iterator<unknown, T, undefined>): T {
 		if (step.done) return step.value;
 	}
 }
+
+/**
+ * Decodes and parses a JSON payload's bytes as two units, each after a slice
+ * check. A fetched catalog's decode and parse then take a slice of their own,
+ * instead of running unchecked in the socket callback that delivered them, back
+ * to back with another response's.
+ */
+export async function parseJsonBytesInSlices(bytes: ArrayBuffer | Uint8Array): Promise<unknown> {
+	while (sliceExpired()) await nextSlice();
+	const text = new TextDecoder().decode(bytes);
+	while (sliceExpired()) await nextSlice();
+	return JSON.parse(text);
+}
+
+/** `response.json()` for sliced work: the body's bytes, then {@link parseJsonBytesInSlices}. */
+export async function readJsonInSlices(response: Response): Promise<unknown> {
+	return parseJsonBytesInSlices(await response.arrayBuffer());
+}

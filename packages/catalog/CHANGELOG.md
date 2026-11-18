@@ -9,6 +9,7 @@
 ### Fixed
 
 - Provider model resolution no longer holds the event loop while it builds, merges, fingerprints or writes a large catalog: it gives the loop a turn after each 10 ms slice of its work, plus at most one step ([#17121](https://github.com/can1357/oh-my-pi/issues/17121))
+- Model discovery decodes and parses each fetched catalog, and maps an OpenAI-compatible endpoint's rows, in slices, so two responses that arrive together no longer hold timers for both parses
 - Model cache commits no longer wait for an fsync on the main thread: the cache now uses WAL's `synchronous = NORMAL`, as omp's other regenerable caches do
 - Concurrent refreshes of one provider read, merge and write its cache row one at a time, in the order their fetches resolved, each from the row the earlier ones left, as they did before the work was sliced; a slow refresh can no longer write an older catalog over a newer one or drop rows another refresh fetched
 

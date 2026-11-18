@@ -1,4 +1,5 @@
 import { USER_AGENT, getInstallId } from "@oh-my-pi/pi-utils";
+import { parseJsonBytesInSlices, readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { toClinePassPublicModelId } from "../cline-pass-model-id";
 import {
@@ -230,8 +231,7 @@ async function fetchCatalogPayload(
 	}
 	const bytes = new Uint8Array(await response.arrayBuffer());
 	const isZstd = bytes.length >= 4 && new DataView(bytes.buffer, bytes.byteOffset).getUint32(0, true) === ZSTD_MAGIC;
-	const text = new TextDecoder().decode(isZstd ? await Bun.zstdDecompress(bytes) : bytes);
-	const payload: unknown = JSON.parse(text);
+	const payload = await parseJsonBytesInSlices(isZstd ? await Bun.zstdDecompress(bytes) : bytes);
 	session.payload = payload;
 	session.etag = response.headers.get("etag");
 	session.hasPayload = true;
@@ -608,7 +608,7 @@ async function fetchOllamaNativeModels(
 	if (!response.ok) {
 		return null;
 	}
-	const payload = (await response.json()) as { models?: Array<{ name?: string; model?: string }> };
+	const payload = (await readJsonInSlices(response)) as { models?: Array<{ name?: string; model?: string }> };
 	const entries = payload.models ?? [];
 	const resolved = await Promise.all(
 		entries.map(async (entry): Promise<ModelSpec<"openai-responses"> | null> => {
@@ -1047,7 +1047,7 @@ async function fetchUmansModelsInfo(options: {
 		if (!response.ok) {
 			return null;
 		}
-		payload = await response.json();
+		payload = await readJsonInSlices(response);
 	} catch (error) {
 		throw new Error("Failed to fetch Umans models info", { cause: error });
 	}
@@ -1703,7 +1703,7 @@ async function fetchDeepinfraModels(options: {
 		if (!response.ok) {
 			return null;
 		}
-		payload = await response.json();
+		payload = await readJsonInSlices(response);
 	} catch {
 		return null;
 	}
@@ -2594,7 +2594,7 @@ async function fetchFireworksServerlessModels(options: {
 		if (!response.ok) return null;
 		let payload: unknown;
 		try {
-			payload = await response.json();
+			payload = await readJsonInSlices(response);
 		} catch {
 			return null;
 		}
@@ -2804,7 +2804,7 @@ async function fetchClinePassLiveCatalog(fetchImpl: FetchImpl): Promise<ClinePas
 			fetchImpl(CLINE_PASS_LIVE_CATALOG_URL, { signal }),
 		);
 		if (!response.ok) return undefined;
-		const payload: unknown = await response.json();
+		const payload: unknown = await readJsonInSlices(response);
 		if (!isRecord(payload) || !Array.isArray(payload.data)) return undefined;
 		const byId = new Map<string, ClinePassLiveCatalogEntry>();
 		const bySlug = new Map<string, ClinePassLiveCatalogEntry>();
@@ -2987,7 +2987,7 @@ async function fetchClinePassModels(
 	if (!response.ok) {
 		throw new Error(`Failed to fetch ClinePass models: HTTP ${response.status}`);
 	}
-	const payload: unknown = await response.json();
+	const payload: unknown = await readJsonInSlices(response);
 	if (!isRecord(payload) || !Array.isArray(payload.clinePass)) {
 		throw new Error("ClinePass model catalog response is missing clinePass");
 	}
@@ -4421,7 +4421,7 @@ export async function fetchLmStudioNativeModelMetadata(
 				headers: { Accept: "application/json", ...options?.headers },
 				signal,
 			});
-			return response.ok ? await response.json() : null;
+			return response.ok ? await readJsonInSlices(response) : null;
 		} catch {
 			return null;
 		}
@@ -6220,7 +6220,7 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 				: { failure: { endpoint, reason: "http-status", status: response.status } };
 		}
 		try {
-			return { payload: await response.json(), status: response.status };
+			return { payload: await readJsonInSlices(response), status: response.status };
 		} catch (error) {
 			return { failure: { endpoint, reason: "invalid-json", status: response.status, error } };
 		}

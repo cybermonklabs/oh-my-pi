@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
+import { readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
 import { seedModels } from "../compat/providers";
 import type { FetchImpl, ModelSpec } from "../types";
 import { discoveryFetch, isRecord } from "../utils";
@@ -365,7 +366,7 @@ async function fetchNamespaceOverrideCandidate(
 	}
 	let payload: unknown;
 	try {
-		payload = await response.json();
+		payload = await readJsonInSlices(response);
 	} catch {
 		return null;
 	}
@@ -431,7 +432,7 @@ async function fetchProjectRootNamespaceViaRest(
 	}
 	let payload: unknown;
 	try {
-		payload = await response.json();
+		payload = await readJsonInSlices(response);
 	} catch {
 		return null;
 	}
@@ -488,7 +489,7 @@ async function fetchTopLevelGroupNamespaceCandidates(
 		}
 		let payload: unknown;
 		try {
-			payload = await response.json();
+			payload = await readJsonInSlices(response);
 		} catch {
 			break;
 		}
@@ -543,7 +544,7 @@ async function postGraphQL(
 		return null;
 	}
 	try {
-		return await response.json();
+		return await readJsonInSlices(response);
 	} catch {
 		return null;
 	}
