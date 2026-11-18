@@ -1,3 +1,4 @@
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 // node:net only serves the TCP readiness probe for user daemons (`connectPort`).
 import * as net from "node:net";
@@ -14,16 +15,17 @@ import {
 	truncateTail,
 	truncateTailBytes,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { workerEnvFromParent } from "../subprocess/worker-client";
+import { managedDaemonEnv } from "../subprocess/worker-client";
 import {
 	DAEMON_META_FILE,
 	DAEMON_SPEC_FILE,
 	daemonBrokerEndpoint,
+	probeBrokerEndpoint,
 	readStoredDaemonRecord,
 	writeDaemonScopeMeta,
 } from "./paths";
 import type { DaemonReadySpec, DaemonSnapshot, DaemonSpec } from "@oh-my-pi/pi-tui/tools/daemon";
-import { hasLiveDaemonProjectPresence, pruneDeadDaemonRuntimeDirs } from "./presence";
+import { daemonProcessDomain, hasLiveDaemonProjectPresence, pruneDeadDaemonRuntimeDirs } from "./presence";
 import {
 	DAEMON_IDLE_GRACE_ENV,
 	DAEMON_PROJECT_DIR_ENV,
@@ -70,8 +72,6 @@ const PID_FILE = "broker.pid";
  * bind its endpoint before the lease is treated as stale (issue #11080).
  */
 const LEASE_HANDOFF_GRACE_MS = 500;
-/** Connect budget for the endpoint probe that answers "is a broker serving this scope?". */
-const LEASE_PROBE_TIMEOUT_MS = 250;
 const LOG_FILE = "output.log";
 const PREVIOUS_LOG_FILE = "output.previous.log";
 const DAEMON_SPAWN_OPTIONS = resolveDaemonSpawnOptions({
@@ -90,6 +90,10 @@ const SIGNAL_NUMBER: Record<DaemonSignal, number> = {
 interface ManagedProcess {
 	pid: number;
 	exited: Promise<number>;
+	/** `null` until the child has exited. */
+	readonly exitCode: number | null;
+	/** `null` until the child has exited, or when it exited on its own. */
+	readonly signalCode: string | null;
 	unref(): void;
 }
 
@@ -110,6 +114,13 @@ interface ManagedDaemon {
 	readyPattern?: RegExp;
 	restartTimer?: NodeJS.Timeout;
 	consecutiveFailures: number;
+	/**
+	 * When this broker launched the current generation, on the monotonic clock
+	 * (`performance.now()`), for its uptime at exit; unset for a generation
+	 * another broker launched, whose uptime only the recorded wall-clock
+	 * `startedAt` can give.
+	 */
+	launchedAt?: number;
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
 	completionSubscriptionId?: string;
@@ -118,8 +129,40 @@ interface ManagedDaemon {
 	persistedSpec?: string;
 	/** Serialized metadata last written (or recovered); a write is skipped while unchanged. */
 	persistedMeta?: string;
+	/**
+	 * While this record's writes keep failing (a full or read-only disk): how
+	 * many failed in a row, and when a polling refresh may try again
+	 * ({@link persistRetryDelay}), on the monotonic clock (`performance.now()`)
+	 * so that no step of the wall clock delays or hastens it. Unset once a
+	 * write succeeds.
+	 */
+	persistFailure?: { failures: number; retryAt: number };
 	/** Completes after a terminal generation's log, metadata, and completion notification are published. */
 	terminalSettled?: Promise<void>;
+	/**
+	 * Kills this broker must make through a pin, while their daemon runs but
+	 * cannot be pinned ({@link pinDaemon}): retried at each refresh.
+	 */
+	pendingKills: PendingKill[];
+}
+
+/**
+ * A kill of a daemon process that could not be pinned when it was asked (no
+ * descriptor left): never made by the bare pid, which may name another
+ * process by the time it is retried. With `reap`, a recovered record is reaped
+ * once the daemon is gone (publishing its completion when `completion`);
+ * otherwise (a stop) the record settles as any exited daemon does.
+ */
+interface PendingKill {
+	/** The daemon process to kill, as recorded when the kill was asked. */
+	target: { pid: number; processStart?: string };
+	/** The generation whose record settles once the daemon is gone. */
+	generation: number;
+	gracefulMs: number;
+	timeoutMs: number;
+	reap?: { completion: boolean };
+	/** The retry in flight. */
+	attempt?: Promise<boolean>;
 }
 
 interface BrokerLease {
@@ -140,6 +183,113 @@ function terminalState(state: DaemonSnapshot["state"]): boolean {
 
 function settledState(state: DaemonSnapshot["state"]): boolean {
 	return terminalState(state) || state === "restarting";
+}
+
+/** What the daemon process of a snapshot is now (see {@link pinDaemon}). */
+type DaemonPin =
+	/** The daemon, running and pinned: a kill through `process` reaches it alone. */
+	| { kind: "pinned"; process: Process }
+	/** Running (signal 0 reaches its pid), but not known to be the daemon now: kill nothing by its pid. */
+	| { kind: "unpinned" }
+	/** Exited, or its pid now names another process (a start mark not the daemon's). */
+	| { kind: "gone" };
+
+/**
+ * Pins the daemon process `target.pid` whose start mark is `target.processStart` (a snapshot,
+ * or the target of a pending kill). `Process.fromPid` gives `null` both for a process that is
+ * gone and for one it cannot pin now (no descriptor left), so a failed pin proves nothing:
+ * `kill(pid, 0)` asks the kernel (`EPERM` is another user's process holding the number, never
+ * the daemon this broker started). A pinned process whose start mark is not the recorded one
+ * reused the pid: the daemon is gone. The mark is the kernel's own (`Process.startMark`), so no
+ * clock is compared and a step of the wall clock changes nothing. A process that runs while no
+ * mark can be compared is unpinned, never trusted and never taken for gone: a record with no
+ * mark (from a broker before marks, or whose mark could not be read at spawn), or a mark that
+ * cannot be read now (the boot id unreadable); a later refresh tries again.
+ */
+function pinDaemon(target: { pid?: number; processStart?: string }): DaemonPin {
+	const pid = target.pid;
+	if (pid === undefined) return { kind: "gone" };
+	const processRef = Process.fromPid(pid);
+	if (processRef) {
+		if (processRef.status() !== "running") return { kind: "gone" };
+		const mark = processRef.startMark;
+		if (target.processStart === undefined || mark === null) return { kind: "unpinned" };
+		if (mark !== target.processStart) return { kind: "gone" };
+		return { kind: "pinned", process: processRef };
+	}
+	try {
+		process.kill(pid, 0);
+		return { kind: "unpinned" };
+	} catch {
+		return { kind: "gone" };
+	}
+}
+
+/** The start mark of the process `pid` this broker just spawned, or `undefined` when it cannot be read. */
+function startMarkOf(pid: number | undefined): string | undefined {
+	return pid === undefined ? undefined : (Process.fromPid(pid)?.startMark ?? undefined);
+}
+
+/**
+ * Reads the start mark of `record`'s daemon if its record has none (the read failed at spawn),
+ * while this broker still holds the daemon as its own child that has not exited: an unreaped
+ * child keeps its pid, so the process at that pid, whose parent is this broker, is the daemon.
+ * Once the child exited, or for a daemon this broker did not spawn, no mark is read: one read
+ * then could be another process's.
+ */
+function markOwnChild(record: { snapshot: DaemonSnapshot; process?: ManagedProcess }): boolean {
+	const { snapshot, process: child } = record;
+	if (snapshot.processStart !== undefined || snapshot.pid === undefined || !child) return false;
+	if (child.pid !== snapshot.pid || child.exitCode !== null || child.signalCode !== null) return false;
+	const processRef = Process.fromPid(snapshot.pid);
+	if (!processRef || processRef.ppid !== process.pid || processRef.status() !== "running") return false;
+	const mark = processRef.startMark;
+	if (mark === null) return false;
+	snapshot.processStart = mark;
+	return true;
+}
+
+/**
+ * `process.killTree(signal)` of a daemon's tree. A walk that could not read the whole tree (no
+ * descriptor left) already signalled what it read and the process group the daemon leads: it is
+ * logged, and the request it serves does not fail on it.
+ */
+function signalDaemonTree(process: Process, signal: number, name: string): void {
+	try {
+		process.killTree(signal);
+	} catch (error) {
+		logger.warn("Daemon signalled, but part of its process tree could not be read", {
+			name,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/**
+ * The words `Process.terminate` rejects with when its walk could not read the whole tree (pi-shell
+ * `proctree::partly_signalled`): what it read and the process group the root leads were killed, but a
+ * descendant it could not read may still run.
+ */
+const PARTLY_SIGNALLED = "but one the walk could not read may not have been";
+
+/**
+ * `process.terminate` of a daemon's tree. A refusal rejects, as at `9058ab9d`, so the stop it serves
+ * fails with it. Only a walk that could not read the whole tree (no descriptor left), once the daemon
+ * itself has stopped, is logged and goes on ({@link signalDaemonTree}).
+ */
+async function terminateDaemonTree(
+	process: Process,
+	gracefulMs: number,
+	timeoutMs: number,
+	name: string,
+): Promise<void> {
+	try {
+		await process.terminate({ group: true, gracefulMs, timeoutMs });
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (!message.includes(PARTLY_SIGNALLED) || process.status() === "running") throw error;
+		logger.warn("Daemon stopped, but part of its process tree could not be read", { name, error: message });
+	}
 }
 
 function publishesCompletionOwners(request: DaemonWireRequest): boolean {
@@ -175,6 +325,7 @@ function orderDaemonsForListing(snapshots: DaemonSnapshot[]): DaemonSnapshot[] {
 function reapRecoveredSnapshot(snapshot: DaemonSnapshot, now: number): boolean {
 	if (terminalState(snapshot.state)) return false;
 	snapshot.pid = undefined;
+	snapshot.processStart = undefined;
 	snapshot.state = "exited";
 	snapshot.exitedAt = now;
 	snapshot.exitReason = "previous broker exited";
@@ -191,6 +342,21 @@ function syncReadyPending(record: ManagedDaemon): void {
 	if (!record.logReady) pending.push("log");
 	if (!record.portReady) pending.push("port");
 	record.snapshot.readyPending = pending.length > 0 ? pending : undefined;
+}
+
+/** How often the broker refreshes a recovered detached daemon it does not hold, until it settles. */
+const RECOVERED_REFRESH_MS = 100;
+
+/** The longest wait of a polling refresh between two tries of a record's write that keeps failing. */
+const PERSIST_RETRY_MAX_MS = 5_000;
+
+/**
+ * How long a polling refresh waits, after the `failures`-th failed write in a row of a record,
+ * before it tries the write again: one refresh interval, doubled at each failure, capped at
+ * {@link PERSIST_RETRY_MAX_MS}. A request (`list`, `stop`, `send`, …) tries again at once.
+ */
+function persistRetryDelay(failures: number): number {
+	return Math.min(PERSIST_RETRY_MAX_MS, RECOVERED_REFRESH_MS * 2 ** Math.max(0, failures - 1));
 }
 
 /** Replace via a pid-scoped temp file; Windows may briefly deny replacement while a reader holds the target. */
@@ -334,17 +500,6 @@ class DaemonLog {
 	}
 }
 
-/** Whether a broker is accepting connections on the scope endpoint right now. */
-async function probeBrokerEndpoint(endpoint: string): Promise<boolean> {
-	try {
-		const connection = await IpcConnection.connect(endpoint, { framing: "lines", timeoutMs: LEASE_PROBE_TIMEOUT_MS });
-		connection.destroy();
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 /**
  * Whether a live lease left by a broker that predates the native lock still
  * owns this scope. The recorded PID alone cannot answer it: PID reuse by an
@@ -370,9 +525,9 @@ async function holdsLiveForeignLease(pidPath: string, endpoint: string): Promise
 	} catch {
 		return false; // Dead PID: the lease outlived its broker.
 	}
-	if (await probeBrokerEndpoint(endpoint)) return true;
+	if ((await probeBrokerEndpoint(endpoint)) === "live") return true;
 	await Bun.sleep(LEASE_HANDOFF_GRACE_MS);
-	return probeBrokerEndpoint(endpoint);
+	return (await probeBrokerEndpoint(endpoint)) === "live";
 }
 
 /**
@@ -392,7 +547,9 @@ async function acquireBrokerLease(runtimeDir: string, endpoint: string): Promise
 			lock.release();
 			return null;
 		}
-		await fs.writeFile(pidPath, JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+		await fs.writeFile(pidPath, JSON.stringify({ pid: process.pid, domain: await daemonProcessDomain() }), {
+			mode: 0o600,
+		});
 		return { path: pidPath, lock };
 	} catch (error) {
 		lock.release();
@@ -432,6 +589,8 @@ class DaemonBroker {
 	readonly #idleGraceMs: number;
 	readonly #restartBackoffBaseMs: number;
 	readonly #endpointCheckMs: number;
+	/** The runtime dir as it was before startup acquired anything in it; unset where no endpoint file is watched. */
+	readonly #runtimeDirIdentity: Stats | undefined;
 	#endpointTimer: NodeJS.Timeout | undefined;
 	readonly #records = new Map<string, ManagedDaemon>();
 	/**
@@ -452,6 +611,8 @@ class DaemonBroker {
 	/** Abortable `wait`/follow-`logs` requests, keyed by wire request id, so a client can cancel its own poll. */
 	readonly #inFlight = new Map<string, { socket: IpcConnection; controller: AbortController }>();
 	#server: IpcServer | undefined;
+	/** Startup's record recovery, which shutdown() waits for so it can retire what recovery adopted. */
+	#recovery: Promise<void> | undefined;
 	#idleTimer: NodeJS.Timeout | undefined;
 	#shuttingDown = false;
 
@@ -462,6 +623,7 @@ class DaemonBroker {
 		idleGraceMs: number,
 		restartBackoffBaseMs: number,
 		endpointCheckMs: number,
+		runtimeDirIdentity: Stats | undefined,
 	) {
 		this.#projectDir = projectDir;
 		this.#runtimeDir = runtimeDir;
@@ -470,48 +632,117 @@ class DaemonBroker {
 		this.#idleGraceMs = idleGraceMs;
 		this.#restartBackoffBaseMs = restartBackoffBaseMs;
 		this.#endpointCheckMs = endpointCheckMs;
+		this.#runtimeDirIdentity = runtimeDirIdentity;
 	}
 
 	async run(onListening?: () => void): Promise<void> {
-		await this.#recoverRecords();
-		this.#server = await IpcServer.listen(
+		try {
+			this.#recovery = this.#recoverRecords();
+			await this.#recovery;
+			await this.#listen(onListening);
+		} catch (error) {
+			// The caller releases the scope lease once this rejects, so whatever startup opened
+			// closes first: a bound server would go on accepting clients for a broker that no
+			// longer owns the scope, and recovered detached daemons would go on being polled.
+			try {
+				await this.shutdown();
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], "Daemon broker startup failed, and so did its cleanup");
+			}
+			throw error;
+		}
+		await this.#finished.promise;
+	}
+
+	/**
+	 * Bind the endpoint and start serving, unless a shutdown has been requested.
+	 *
+	 * shutdown() closes only the server it can see. One requested while the bind is pending (from
+	 * a signal through the postmortem callback, or from a client the native listener accepted
+	 * before the bind returned here) finds none and settles without it. So startup does not bind
+	 * once a shutdown was requested, and closes a server whose bind returns after one instead of
+	 * installing it. run() returns through the lease release only after this does, so the lease is
+	 * never released while that server still listens.
+	 */
+	async #listen(onListening?: () => void): Promise<void> {
+		if (this.#shuttingDown) return;
+		const server = await IpcServer.listen(
 			this.#endpoint,
 			{ framing: "lines", maxFrameBytes: MAX_REQUEST_BYTES },
 			socket => this.#accept(socket),
 		);
-		if (process.platform !== "win32") this.#watchEndpoint();
+		if (this.#shuttingDown) {
+			await server.close();
+			return;
+		}
+		this.#server = server;
+		if (this.#runtimeDirIdentity) this.#watchEndpoint(this.#runtimeDirIdentity);
 		this.#scheduleIdleShutdown();
 		onListening?.();
-		await this.#finished.promise;
 	}
 
 	async shutdown(): Promise<void> {
 		if (this.#shuttingDown) return this.#finished.promise;
 		this.#shuttingDown = true;
+		// Recovery adopts no further record once this is set, but the one it is adopting lands in
+		// `#records` after the loop below would have passed it: its readiness poller would keep
+		// running and its reaped state would go unwritten. Waiting lets the loop retire it like the
+		// rest. A pending bind needs no wait: the one server it can produce, #listen closes itself.
+		// A recovery failure is run()'s to report.
+		await this.#recovery?.catch(() => undefined);
 		clearTimeout(this.#idleTimer);
 		this.#idleTimer = undefined;
 		clearInterval(this.#endpointTimer);
 		this.#endpointTimer = undefined;
+		// Defence, not the repair of an observed failure: stopping a record does native process
+		// and file work (terminating it, reading a detached daemon's log, closing its log) that
+		// can reject. One record's failure must not leave the other records running, the server
+		// bound, or `#finished` pending, which would strand run() and the lease release behind
+		// it. The failure still rejects `#finished`, so run() and every caller here report it.
+		const failures: unknown[] = [];
 		for (const record of this.#records.values()) {
 			const detached = record.spec.detached && !record.stopRequested && record.snapshot.pid !== undefined;
-			if (!detached && !terminalState(record.snapshot.state)) await this.#stopRecord(record, 2_000);
+			try {
+				if (!detached && !terminalState(record.snapshot.state)) await this.#stopRecord(record, 2_000);
+			} catch (error) {
+				failures.push(error);
+			}
 			// The detached daemon outlives this broker and the next one recovers it from
 			// metadata. Retire this broker's generation so a late exit or readiness
 			// callback cannot settle the stale record over the new owner's metadata.
 			if (detached) record.generation++;
 			clearTimeout(record.restartTimer);
-			await record.log?.close();
+			try {
+				await record.log?.close();
+			} catch (error) {
+				failures.push(error);
+			}
 			await record.persistQueue;
 		}
 		this.#ownerSockets.clear();
 		for (const socket of this.#sockets) socket.destroy();
 		this.#sockets.clear();
 		this.#clients.clear();
-		await this.#server?.close();
-		this.#finished.resolve();
+		try {
+			await this.#server?.close();
+		} catch (error) {
+			failures.push(error);
+		}
+		if (failures.length === 0) this.#finished.resolve();
+		else if (failures.length === 1) this.#finished.reject(failures[0]);
+		else this.#finished.reject(new AggregateError(failures, "Daemon broker shutdown failed"));
+		return this.#finished.promise;
 	}
 
 	#accept(socket: IpcConnection): void {
+		// A broker that is shutting down serves no new client. shutdown() destroys the connections
+		// it holds and then closes the server, and closing leaves accepted connections open. One
+		// accepted after that point, while the close is pending or before a bind that was pending
+		// at shutdown returns, would stay open and be served after the scope lease is released.
+		if (this.#shuttingDown) {
+			socket.destroy();
+			return;
+		}
 		this.#sockets.add(socket);
 		let authenticated = false;
 		// Oversized requests (> MAX_REQUEST_BYTES) close the connection natively.
@@ -636,7 +867,17 @@ class DaemonBroker {
 				if (controller && this.#inFlight.get(id)?.controller === controller) this.#inFlight.delete(id);
 			}
 			socket.send(JSON.stringify({ id, ok: true, result }));
-			if (request.operation.op === "shutdown") setTimeout(() => void this.shutdown(), 10);
+			if (request.operation.op === "shutdown") {
+				// run() rejects with the same failure; logging here keeps this trigger from
+				// becoming an unhandled rejection.
+				setTimeout(() => {
+					this.shutdown().catch(error => {
+						logger.warn("Daemon broker shutdown on request failed", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+				}, 10);
+			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			socket.send(JSON.stringify({ id, ok: false, error: message }));
@@ -650,7 +891,7 @@ class DaemonBroker {
 			case "start":
 				return this.#start(operation.spec, operation.owner, operation.replace, operation.awaitReady);
 			case "list": {
-				await Promise.all([...this.#records.values()].map(record => this.#refreshDetached(record)));
+				await Promise.all([...this.#records.values()].map(record => this.#refreshDetached(record, "request")));
 				return {
 					op: "list",
 					daemons: orderDaemonsForListing([...this.#records.values()].map(record => record.snapshot)),
@@ -682,7 +923,7 @@ class DaemonBroker {
 				return this.#mode(operation);
 			case "describe": {
 				const record = this.#record(operation.name);
-				await this.#refreshDetached(record);
+				await this.#refreshDetached(record, "request");
 				return { op: "describe", daemon: record.snapshot, spec: record.spec };
 			}
 			case "shutdown":
@@ -711,7 +952,7 @@ class DaemonBroker {
 		let record: ManagedDaemon;
 		try {
 			const existing = this.#records.get(spec.name);
-			if (existing) await this.#refreshDetached(existing);
+			if (existing) await this.#refreshDetached(existing, "request");
 			if (existing && !terminalState(existing.snapshot.state)) {
 				if (!replace) throw new Error(`Daemon ${spec.name} is already ${existing.snapshot.state}`);
 				await this.#stopRecord(existing, 2_000);
@@ -761,6 +1002,7 @@ class DaemonBroker {
 				completionCapable: owner !== undefined && this.#completionSubscriptions.has(owner),
 				completionSubscriptionId: owner === undefined ? undefined : this.#completionSubscriptions.get(owner),
 				pendingCompletions: replace ? (existing?.pendingCompletions ?? []) : [],
+				pendingKills: [],
 			};
 			syncReadyPending(record);
 			this.#records.set(spec.name, record);
@@ -783,7 +1025,8 @@ class DaemonBroker {
 			readyTimedOut = !ready;
 		}
 		await record.persistQueue;
-		return { op: "start", daemon: record.snapshot, readyTimedOut };
+		const launchedMsAgo = record.launchedAt === undefined ? undefined : performance.now() - record.launchedAt;
+		return { op: "start", daemon: record.snapshot, readyTimedOut, launchedMsAgo };
 	}
 
 	async #launch(record: ManagedDaemon): Promise<void> {
@@ -795,11 +1038,13 @@ class DaemonBroker {
 		record.snapshot.persist = record.spec.persist;
 		record.snapshot.detached = record.spec.detached;
 		record.snapshot.startedAt = Date.now();
+		record.launchedAt = performance.now();
 		record.snapshot.readyAt = undefined;
 		record.snapshot.exitedAt = undefined;
 		record.snapshot.exitCode = undefined;
 		record.snapshot.exitReason = undefined;
 		record.snapshot.pid = undefined;
+		record.snapshot.processStart = undefined;
 		record.snapshot.readyMatch = undefined;
 		record.logReady = !record.spec.ready?.log;
 		record.portReady = record.spec.ready?.port === undefined;
@@ -825,7 +1070,7 @@ class DaemonBroker {
 		record.pty = session;
 		const options = {
 			cwd: record.spec.cwd,
-			env: workerEnvFromParent({ TERM: "xterm-256color", ...record.spec.env }),
+			env: managedDaemonEnv({ TERM: "xterm-256color", ...record.spec.env }),
 			cols: DAEMON_PTY_COLUMNS,
 			rows: DAEMON_PTY_ROWS,
 		};
@@ -899,6 +1144,7 @@ class DaemonBroker {
 		const pid = await started.promise;
 		if (pid !== undefined && generation === record.generation) {
 			record.snapshot.pid = pid;
+			record.snapshot.processStart = startMarkOf(pid);
 			this.#persist(record);
 		}
 	}
@@ -906,7 +1152,7 @@ class DaemonBroker {
 	#launchPipe(record: ManagedDaemon, generation: number): void {
 		const process = Bun.spawn([record.spec.application, ...record.spec.args], {
 			cwd: record.spec.cwd,
-			env: workerEnvFromParent(record.spec.env),
+			env: managedDaemonEnv(record.spec.env),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -915,6 +1161,7 @@ class DaemonBroker {
 		record.process = process;
 		record.input = process.stdin;
 		record.snapshot.pid = process.pid;
+		record.snapshot.processStart = startMarkOf(process.pid);
 		this.#persist(record);
 		const stdout = this.#drain(record, generation, process.stdout);
 		const stderr = this.#drain(record, generation, process.stderr);
@@ -931,12 +1178,13 @@ class DaemonBroker {
 		try {
 			const process = Bun.spawn([record.spec.application, ...record.spec.args], {
 				cwd: record.spec.cwd,
-				env: workerEnvFromParent(record.spec.env),
+				env: managedDaemonEnv(record.spec.env),
 				stdio: ["ignore", output.fd, output.fd],
 				...DAEMON_SPAWN_OPTIONS,
 			});
 			record.process = process;
 			record.snapshot.pid = process.pid;
+			record.snapshot.processStart = startMarkOf(process.pid);
 			this.#persist(record);
 			process.unref();
 			void process.exited
@@ -1008,21 +1256,137 @@ class DaemonBroker {
 		this.#markReady(record);
 	}
 
-	async #refreshDetached(record: ManagedDaemon): Promise<void> {
-		if (!record.spec.detached || settledState(record.snapshot.state)) return;
+	/**
+	 * Brings `record` up to date with its process: writes the record again if
+	 * its last write failed (a settled record too: the write of its exit), then,
+	 * unless it settled, reads a start mark it could not read at spawn
+	 * ({@link #refreshMark}), retries the kills it could not pin the daemon for
+	 * ({@link ManagedDaemon.pendingKills}), and, for a detached daemon this
+	 * broker does not hold, reads its output and settles it once it is gone.
+	 *
+	 * `retry` is who asks: a `"request"` (`list`, `stop`, `send`, …) tries a
+	 * failed write again at once; a `"poll"` (the recovered-detached monitor,
+	 * a request's wait loop) only once {@link persistRetryDelay} has passed
+	 * since the last failure, so a disk that stays full is not written to at
+	 * each poll.
+	 */
+	async #refreshDetached(record: ManagedDaemon, retry: "request" | "poll"): Promise<void> {
+		// A failed write (a full or read-only disk) left `persistedMeta` unset:
+		// what only memory holds, a mark read at refresh or the exit a record
+		// settled with among it, is written again until a write succeeds.
+		const retryAt = record.persistFailure?.retryAt ?? 0;
+		if (record.persistedMeta === undefined && (retry === "request" || performance.now() >= retryAt)) {
+			this.#persist(record);
+			await record.persistQueue;
+		}
+		if (settledState(record.snapshot.state)) return;
+		await this.#refreshMark(record);
+		if (record.pendingKills.length > 0 && (await this.#retryPendingKills(record))) return;
+		if (!record.spec.detached) return;
 		const generation = record.generation;
 		await this.#readDetachedOutput(record, generation);
 		if (generation !== record.generation || record.process) return;
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-		if (processRef?.status() === "running") return;
+		if (pinDaemon(record.snapshot).kind !== "gone") return;
 		await this.#settle(record, generation);
+	}
+
+	/**
+	 * {@link markOwnChild}: a mark read for the broker's own child is given to
+	 * the pending kills of the same daemon, which then pin it, and persisted
+	 * before this returns: a request that refreshed the record (`list`, `stop`,
+	 * `send`) replies once the write is done or has failed (logged once), so a
+	 * broker that dies right after a write that succeeded cannot lose the mark
+	 * again (its successor could not read it: the daemon is no longer that
+	 * broker's child). A write that failed is made again at the next request,
+	 * or at a poll once {@link persistRetryDelay} has passed.
+	 */
+	async #refreshMark(record: ManagedDaemon): Promise<void> {
+		if (!markOwnChild(record)) return;
+		for (const pending of record.pendingKills) {
+			if (pending.generation === record.generation && pending.target.pid === record.snapshot.pid) {
+				pending.target.processStart ??= record.snapshot.processStart;
+			}
+		}
+		this.#persist(record);
+		await record.persistQueue;
+	}
+
+	/**
+	 * Retries every pending kill of `record`, each one retry at a time; `true`
+	 * while one for the current generation is still pending (its daemon runs
+	 * unpinned, or survived the kill) or once that generation's recovered
+	 * record was reaped, `false` when the current generation is the caller's
+	 * to refresh as usual (a stopped daemon gone settles as any).
+	 */
+	async #retryPendingKills(record: ManagedDaemon): Promise<boolean> {
+		const results = await Promise.all(
+			record.pendingKills.map(pending => {
+				pending.attempt ??= this.#attemptPendingKill(record, pending).finally(() => {
+					pending.attempt = undefined;
+				});
+				return pending.attempt;
+			}),
+		);
+		return results.some(Boolean);
+	}
+
+	/**
+	 * One retry of `pending` (see {@link #retryPendingKills}). A refused kill stays pending, logged: it
+	 * runs from a refresh, which a poll can make, so the next refresh tries it again.
+	 */
+	async #attemptPendingKill(record: ManagedDaemon, pending: PendingKill): Promise<boolean> {
+		const current = (): boolean => pending.generation === record.generation;
+		const pin = pinDaemon(pending.target);
+		if (pin.kind === "unpinned") return current();
+		if (pin.kind === "pinned") {
+			try {
+				await terminateDaemonTree(pin.process, pending.gracefulMs, pending.timeoutMs, record.snapshot.name);
+			} catch (error) {
+				logger.warn("Daemon kill refused; it stays pending", {
+					name: record.snapshot.name,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return current();
+			}
+			if (pin.process.status() === "running") return current();
+		}
+		const at = record.pendingKills.indexOf(pending);
+		if (at < 0) return current();
+		record.pendingKills.splice(at, 1);
+		if (!current() || !pending.reap) return false;
+		this.#reapRecovered(record, pending.reap.completion);
+		return true;
+	}
+
+	/**
+	 * Reaps a recovered record whose daemon was killed or is gone, as recovery
+	 * reaps one that died with the previous broker ({@link reapRecoveredSnapshot}),
+	 * publishing its completion when `completion` (a daemon that was running,
+	 * not stopping) and no earlier one is pending.
+	 */
+	#reapRecovered(record: ManagedDaemon, completion: boolean): void {
+		const { snapshot } = record;
+		if (!reapRecoveredSnapshot(snapshot, Date.now())) return;
+		if (completion && record.completionCapable && snapshot.owner && record.pendingCompletions.length === 0) {
+			const notification: DaemonCompletionNotification = {
+				event: "daemon-completed",
+				completionId: crypto.randomUUID(),
+				owner: snapshot.owner,
+				daemon: { ...snapshot },
+			};
+			record.pendingCompletions.push(notification);
+			this.#notifyCompletion(notification);
+		}
+		this.#persist(record);
+		// The reaped record may have been the last live persistent daemon.
+		this.#scheduleIdleShutdown();
 	}
 
 	async #monitorRecoveredDetached(record: ManagedDaemon, generation: number): Promise<void> {
 		while (!this.#shuttingDown && generation === record.generation && !settledState(record.snapshot.state)) {
-			await Bun.sleep(100);
+			await Bun.sleep(RECOVERED_REFRESH_MS);
 			if (this.#shuttingDown || generation !== record.generation) return;
-			await this.#refreshDetached(record);
+			await this.#refreshDetached(record, "poll");
 		}
 	}
 
@@ -1075,6 +1439,7 @@ class DaemonBroker {
 		record.input = undefined;
 		record.pty = undefined;
 		record.snapshot.pid = undefined;
+		record.snapshot.processStart = undefined;
 		record.snapshot.exitedAt = Date.now();
 		record.snapshot.exitCode = exitCode;
 		record.snapshot.exitReason = error;
@@ -1084,7 +1449,12 @@ class DaemonBroker {
 			!record.stopRequested &&
 			(record.spec.restart === "always" || (record.spec.restart === "on-failure" && failed));
 		if (shouldRestart && !this.#shuttingDown) {
-			const uptime = Date.now() - record.snapshot.startedAt;
+			// The monotonic clock, so that a step of the wall clock during the run
+			// neither counts a long run as a crash nor a crash as a long run.
+			const uptime =
+				record.launchedAt === undefined
+					? Date.now() - record.snapshot.startedAt
+					: performance.now() - record.launchedAt;
 			record.consecutiveFailures = uptime >= 30_000 ? 0 : record.consecutiveFailures + 1;
 			record.snapshot.restartCount++;
 			// Readiness belongs to the exited generation; clear it before the backoff
@@ -1147,7 +1517,7 @@ class DaemonBroker {
 
 	async #logs(operation: Extract<DaemonOperation, { op: "logs" }>, signal?: AbortSignal): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		const cursor = operation.cursor ?? record.snapshot.outputBytes;
 		let timedOut = false;
 		if (operation.follow && record.snapshot.outputBytes <= cursor && !terminalState(record.snapshot.state)) {
@@ -1197,7 +1567,7 @@ class DaemonBroker {
 		// relaunches reuse the managed record, so polling the record without this
 		// binding can hang past an exit or consume the replacement's output.
 		const boundGeneration = record.generation;
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		let matched: string | undefined;
 		let pattern: RegExp | undefined;
 		if (operation.pattern) {
@@ -1252,7 +1622,7 @@ class DaemonBroker {
 
 	async #send(operation: Extract<DaemonOperation, { op: "send" }>): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
 			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
 		}
@@ -1272,16 +1642,20 @@ class DaemonBroker {
 				if (operation.signal === "SIGINT") record.pty.write("\u0003");
 				else record.pty.kill();
 			} else {
-				const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-				if (!processRef) throw new Error(`Daemon ${operation.name} process is unavailable`);
-				processRef.killTree(SIGNAL_NUMBER[operation.signal]);
+				await this.#refreshMark(record);
+				const pin = pinDaemon(record.snapshot);
+				if (pin.kind === "unpinned") {
+					throw new Error(`Daemon ${operation.name} runs, but cannot be pinned to signal it now`);
+				}
+				if (pin.kind === "gone") throw new Error(`Daemon ${operation.name} process is unavailable`);
+				signalDaemonTree(pin.process, SIGNAL_NUMBER[operation.signal], operation.name);
 			}
 		}
 		return { op: "send", daemon: record.snapshot };
 	}
 
 	async #stopRecord(record: ManagedDaemon, timeoutMs: number): Promise<void> {
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		if (terminalState(record.snapshot.state)) return;
 		record.stopRequested = true;
 		if (record.restartTimer) {
@@ -1295,9 +1669,25 @@ class DaemonBroker {
 		}
 		record.snapshot.state = "stopping";
 		this.#persist(record);
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-		if (processRef) await processRef.terminate({ group: true, gracefulMs: timeoutMs, timeoutMs: timeoutMs + 1_000 });
-		else record.pty?.kill();
+		const pin = pinDaemon(record.snapshot);
+		if (pin.kind === "pinned") {
+			await terminateDaemonTree(pin.process, timeoutMs, timeoutMs + 1_000, record.snapshot.name);
+		} else if (record.pty) {
+			record.pty.kill();
+		} else if (
+			pin.kind === "unpinned" &&
+			record.snapshot.pid !== undefined &&
+			!record.pendingKills.some(pending => pending.target.pid === record.snapshot.pid)
+		) {
+			// Running, but not pinnable now (no descriptor left): killed through a
+			// pin at a later refresh (the wait below refreshes), never by its pid.
+			record.pendingKills.push({
+				target: { pid: record.snapshot.pid, processStart: record.snapshot.processStart },
+				generation: record.generation,
+				gracefulMs: timeoutMs,
+				timeoutMs: timeoutMs + 1_000,
+			});
+		}
 		const settled = await this.#waitUntil(record, () => terminalState(record.snapshot.state), timeoutMs + 1_000);
 		if (!settled && record.pty) record.pty.kill();
 	}
@@ -1320,7 +1710,7 @@ class DaemonBroker {
 
 	async #mode(operation: Extract<DaemonOperation, { op: "mode" }>): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
 			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
 		}
@@ -1347,15 +1737,17 @@ class DaemonBroker {
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<boolean> {
-		const deadline = Date.now() + Math.max(0, timeoutMs);
-		while (Date.now() < deadline) {
+		// The monotonic clock: a step of the wall clock neither holds a wait past its
+		// timeout nor ends it early.
+		const deadline = performance.now() + Math.max(0, timeoutMs);
+		while (performance.now() < deadline) {
 			if (signal?.aborted) return condition();
-			await this.#refreshDetached(record);
+			await this.#refreshDetached(record, "poll");
 			if (condition()) return true;
 			if (this.#shuttingDown && terminalState(record.snapshot.state)) return condition();
 			await Bun.sleep(50);
 		}
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "poll");
 		return condition();
 	}
 
@@ -1393,11 +1785,27 @@ class DaemonBroker {
 				// Spec first: recovery must never find metadata whose spec is not on disk.
 				if (writeSpec) await writeFileAtomic(path.join(record.dir, DAEMON_SPEC_FILE), spec);
 				if (writeMeta) await writeFileAtomic(path.join(record.dir, DAEMON_META_FILE), metadata);
+				// Both files are on disk as recorded, unless a failed write queued before this
+				// one has since made that unknown (the retry then writes both again).
+				const failed = record.persistFailure;
+				if (failed && record.persistedSpec !== undefined && record.persistedMeta !== undefined) {
+					record.persistFailure = undefined;
+					logger.warn("Persisted daemon metadata again", {
+						name: record.snapshot.name,
+						failedWrites: failed.failures,
+					});
+				}
 			})
 			.catch(error => {
 				// Unknown on-disk state: force the next persist to write both files.
 				record.persistedSpec = undefined;
 				record.persistedMeta = undefined;
+				// Warned once, at the first failure in a row: a disk that stays full would
+				// otherwise log each retry ({@link persistRetryDelay}), and the recovery is
+				// warned once too, above.
+				const failures = (record.persistFailure?.failures ?? 0) + 1;
+				record.persistFailure = { failures, retryAt: performance.now() + persistRetryDelay(failures) };
+				if (failures > 1) return;
 				logger.warn("Failed to persist daemon metadata", {
 					name: record.snapshot.name,
 					error: error instanceof Error ? error.message : String(error),
@@ -1437,6 +1845,10 @@ class DaemonBroker {
 			throw error;
 		});
 		for (const entry of entries) {
+			// A broker that is shutting down takes over no more of the scope. Records not yet read stay
+			// as the previous broker left them, for the next broker to recover; shutdown() waits for the
+			// one in flight and retires it.
+			if (this.#shuttingDown) return;
 			if (!entry.isDirectory()) continue;
 			const dir = path.join(root, entry.name);
 			try {
@@ -1445,19 +1857,24 @@ class DaemonBroker {
 				const { meta: decoded, spec: storedSpec, legacyLayout } = stored;
 				const snapshot = parseDaemonSnapshot(decoded.daemon);
 				const spec = parseDaemonSpec(storedSpec);
-				const processRef = snapshot.pid === undefined ? null : Process.fromPid(snapshot.pid);
+				const live = terminalState(snapshot.state) ? ({ kind: "gone" } as const) : pinDaemon(snapshot);
 				const recoverableExit = !terminalState(snapshot.state) && snapshot.state !== "stopping";
-				const detached = spec.detached && recoverableExit && processRef?.status() === "running";
-				const recoveredDead = recoverableExit && !detached;
-				if (!detached) {
+				const detached = spec.detached && recoverableExit && live.kind !== "gone";
+				// A daemon recovery must kill (a non-detached one of the previous broker,
+				// or one it was stopping) that runs but cannot be pinned: never killed by
+				// its bare pid, which may be another process's by now. It stays, running,
+				// until a refresh pins it and kills it through the pin (#retryPendingKills).
+				const killLater = !detached && live.kind === "unpinned";
+				const recoveredDead = recoverableExit && !detached && !killLater;
+				if (!detached && !killLater) {
 					// Reap only records that were still alive when the previous broker
 					// exited; already-terminal records keep their real exit time so
 					// `list` ranks exited history by true recency (issue #6517).
-					if (!terminalState(snapshot.state) && processRef) {
-						await processRef.terminate({ group: true, gracefulMs: 500, timeoutMs: 2_000 });
+					if (live.kind === "pinned") {
+						await terminateDaemonTree(live.process, 500, 2_000, snapshot.name);
 					}
 					reapRecoveredSnapshot(snapshot, Date.now());
-				} else if (snapshot.state === "restarting") {
+				} else if (detached && snapshot.state === "restarting") {
 					snapshot.state = spec.ready ? "starting" : "running";
 				}
 				snapshot.persist = spec.persist;
@@ -1508,6 +1925,18 @@ class DaemonBroker {
 								]
 							: [];
 					})(),
+					pendingKills:
+						killLater && snapshot.pid !== undefined
+							? [
+									{
+										target: { pid: snapshot.pid, processStart: snapshot.processStart },
+										generation: 0,
+										gracefulMs: 500,
+										timeoutMs: 2_000,
+										reap: { completion: recoverableExit },
+									},
+								]
+							: [],
 				};
 				if (recoveredDead && record.completionCapable && snapshot.owner && record.pendingCompletions.length === 0) {
 					record.pendingCompletions.push({
@@ -1519,7 +1948,11 @@ class DaemonBroker {
 				}
 				syncReadyPending(record);
 				this.#records.set(snapshot.name, record);
-				if (snapshot.owner && record.completionCapable && (detached || record.pendingCompletions.length > 0)) {
+				if (
+					snapshot.owner &&
+					record.completionCapable &&
+					(detached || killLater || record.pendingCompletions.length > 0)
+				) {
 					this.#completionSubscriptions.set(snapshot.owner, record.completionSubscriptionId);
 				}
 				if (record.completionCapable) {
@@ -1528,7 +1961,9 @@ class DaemonBroker {
 				if (detached && spec.ready?.port !== undefined && snapshot.state !== "ready") {
 					void this.#pollPort(record, record.generation, spec.ready);
 				}
-				if (detached) {
+				if (detached || killLater) {
+					// A detached daemon settles, and one recovery must kill is killed
+					// and reaped, when a refresh finds it gone or can pin it.
 					void this.#monitorRecoveredDetached(record, record.generation).catch(error => {
 						logger.warn("Failed to monitor recovered detached daemon", {
 							name: record.snapshot.name,
@@ -1563,7 +1998,11 @@ class DaemonBroker {
 					return;
 				}
 				if (this.#clients.size === 0) await this.shutdown();
-			})();
+			})().catch(error => {
+				logger.warn("Daemon broker idle shutdown failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 		}, this.#idleGraceMs);
 	}
 
@@ -1573,19 +2012,23 @@ class DaemonBroker {
 	 * while every new broker exits on the held lease and every new client fails
 	 * with `connect ENOENT`. Shutting down releases the lease, and the next client
 	 * spawns a broker that rebuilds the scope.
+	 *
+	 * The runtime dir is checked too. A socket path too long for `sun_path` is
+	 * bound under `/tmp/omp-<euid>/` instead, so deleting the dir leaves that
+	 * socket in place; and a client recreates the dir, so its identity is compared
+	 * with the one this broker started in rather than its mere existence.
 	 */
-	#watchEndpoint(): void {
+	#watchEndpoint(runtimeDir: Stats): void {
 		this.#endpointTimer = setInterval(() => {
-			void fs
-				.stat(this.#endpoint)
-				.then(
-					() => undefined,
-					error => {
-						if (!isEnoent(error) || this.#shuttingDown) return;
-						logger.warn("Daemon broker socket was deleted; releasing the scope", { endpoint: this.#endpoint });
-						return this.shutdown();
-					},
-				)
+			void this.#scopeLoss(runtimeDir)
+				.then(loss => {
+					if (!loss || this.#shuttingDown) return;
+					logger.warn(`Daemon broker ${loss}; releasing the scope`, {
+						endpoint: this.#endpoint,
+						runtimeDir: this.#runtimeDir,
+					});
+					return this.shutdown();
+				})
 				.catch(error => {
 					logger.warn("Daemon broker shutdown after socket loss failed", {
 						error: error instanceof Error ? error.message : String(error),
@@ -1594,12 +2037,31 @@ class DaemonBroker {
 		}, this.#endpointCheckMs);
 		this.#endpointTimer.unref();
 	}
+
+	/** Why this broker no longer owns a reachable scope, or `undefined` while it does. */
+	async #scopeLoss(runtimeDir: Stats): Promise<string | undefined> {
+		try {
+			await fs.stat(this.#endpoint);
+		} catch (error) {
+			if (isEnoent(error)) return "socket was deleted";
+			throw error;
+		}
+		try {
+			const current = await fs.stat(this.#runtimeDir);
+			return current.dev === runtimeDir.dev && current.ino === runtimeDir.ino
+				? undefined
+				: "runtime dir was replaced";
+		} catch (error) {
+			if (isEnoent(error)) return "runtime dir was deleted";
+			throw error;
+		}
+	}
 }
 
 export interface DaemonBrokerStartOptions {
 	/** Base of the exponential child-restart backoff. */
 	restartBackoffBaseMs?: number;
-	/** How often the broker checks that its socket file still exists. */
+	/** How often the broker checks that its socket file and runtime dir are still the ones it started with. */
 	endpointCheckMs?: number;
 	/**
 	 * Called once the broker accepts connections. An embedding host connects its
@@ -1626,41 +2088,53 @@ export async function startDaemonBrokerFromEnvironment(options: DaemonBrokerStar
 			? requestedRestartBackoffBaseMs
 			: RESTART_BACKOFF_BASE_MS;
 	await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+	// Take the dir's identity before acquiring anything in it, so losing the dir here needs no
+	// cleanup. Taken after the lease, a dir replaced in between would be recorded as this
+	// broker's own while its lease sat in the deleted one; taken first, any replacement from
+	// here on reads as scope loss to the endpoint watcher, which then gives the scope up.
+	const runtimeDirIdentity = process.platform === "win32" ? undefined : await fs.stat(runtimeDir);
 	const endpoint = daemonBrokerEndpoint(runtimeDir);
 	// Hold the lease for the whole broker lifetime: it is a native lock the OS
 	// releases on exit, so keeping `lease` referenced keeps the scope owned.
 	const lease = await acquireBrokerLease(runtimeDir, endpoint);
 	if (!lease) return;
-	setProcessName("omp daemon broker");
-	// Record the scope's project dir so `omp ps` can map this hash-keyed runtime
-	// dir back to its project offline.
-	void writeDaemonScopeMeta(runtimeDir, projectDir).catch(error => {
-		logger.warn("Failed to record daemon scope metadata", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-	});
-	// Reclaim sibling daemon scopes left behind by dead brokers (issue #8674).
-	// Detached and non-throwing so it never delays clients connecting to us.
-	void pruneDeadDaemonRuntimeDirs(runtimeDir).catch(error => {
-		logger.warn("Daemon runtime prune failed", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-	});
-	const token = (await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim();
-	if (!token) throw new Error("Daemon broker token is empty");
-	const broker = new DaemonBroker(
-		projectDir,
-		runtimeDir,
-		token,
-		idleGraceMs,
-		restartBackoffBaseMs,
-		options.endpointCheckMs ?? ENDPOINT_CHECK_MS,
-	);
-	const cancelCleanup = postmortem.register("daemon-broker", () => broker.shutdown());
 	try {
-		await broker.run(options.onListening);
+		setProcessName("omp daemon broker");
+		// Record the scope's project dir so `omp ps` can map this hash-keyed runtime
+		// dir back to its project offline.
+		void writeDaemonScopeMeta(runtimeDir, projectDir).catch(error => {
+			logger.warn("Failed to record daemon scope metadata", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		// Reclaim sibling daemon scopes left behind by dead brokers (issue #8674).
+		// Detached and non-throwing so it never delays clients connecting to us.
+		void pruneDeadDaemonRuntimeDirs(runtimeDir).catch(error => {
+			logger.warn("Daemon runtime prune failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		const token = (await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim();
+		if (!token) throw new Error("Daemon broker token is empty");
+		const broker = new DaemonBroker(
+			projectDir,
+			runtimeDir,
+			token,
+			idleGraceMs,
+			restartBackoffBaseMs,
+			options.endpointCheckMs ?? ENDPOINT_CHECK_MS,
+			runtimeDirIdentity,
+		);
+		const cancelCleanup = postmortem.register("daemon-broker", () => broker.shutdown());
+		try {
+			await broker.run(options.onListening);
+		} finally {
+			cancelCleanup();
+		}
 	} finally {
-		cancelCleanup();
+		// A failed startup releases the scope too, or every later broker for it exits on the
+		// held lease. run() settles only once the broker has closed what it opened, so no
+		// successor can take the lease while this one still answers on the endpoint.
 		await releaseBrokerLease(lease);
 	}
 }

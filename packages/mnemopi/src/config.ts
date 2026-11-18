@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
+import { getConfigRootOverride } from "@oh-my-pi/pi-utils/dirs";
 import {
 	type Env,
 	envBool,
@@ -20,6 +21,22 @@ export const DEFAULT_DATA_DIR = join(homedir(), ".hermes", "mnemopi", "data");
 export const DEFAULT_DB_FILENAME = "mnemopi.db";
 export const FASTEMBED_CACHE_DIR = join(homedir(), ".hermes", "cache", "fastembed");
 export const MODEL_CACHE_DIR = join(homedir(), ".hermes", "mnemopi", "models");
+
+/**
+ * `<OMP_CONFIG_ROOT>/mnemopi` while omp's config root is relocated, else undefined. Mnemopi's
+ * own state (data, blobs, plugins, cost log) then lives under it instead of the home
+ * directory; the downloaded models stay in the home directory, shared.
+ */
+export function relocatedStateRoot(env: Env = process.env): string | undefined {
+	const configRoot = getConfigRootOverride(env);
+	return configRoot === undefined ? undefined : join(configRoot, "mnemopi");
+}
+
+/** `<relocated state root>/<subdir>` while omp's config root is relocated, else `fallback`. */
+export function stateDir(subdir: string, fallback: string, env: Env = process.env): string {
+	const relocated = relocatedStateRoot(env);
+	return relocated === undefined ? fallback : join(relocated, subdir);
+}
 
 export const DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5";
 export const DEFAULT_EMBEDDING_API_URL = "https://openrouter.ai/api/v1";
@@ -58,7 +75,7 @@ export const VERACITY_WEIGHT_DEFAULTS = {
 } as const;
 
 export function dataDir(env: Env = process.env): string {
-	return envOptionalString("MNEMOPI_DATA_DIR", env) ?? DEFAULT_DATA_DIR;
+	return envOptionalString("MNEMOPI_DATA_DIR", env) ?? stateDir("data", DEFAULT_DATA_DIR, env);
 }
 
 export function dbPath(env: Env = process.env): string {

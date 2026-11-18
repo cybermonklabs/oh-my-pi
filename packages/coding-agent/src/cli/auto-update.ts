@@ -20,9 +20,10 @@
  *
  * Running sessions keep their files: a binary install renames the running
  * `omp.exe` aside (Windows permits that for a mapped image, not an overwrite)
- * and leaves the backup to a later sweep, and the natives loader runs each
- * release's `.node` from a per-version copy under `~/.omp/natives/`, so bun and
- * npm can replace the `node_modules` copy an old session would otherwise lock.
+ * and leaves the backup to a later sweep, and on Windows the natives loader runs
+ * each install's `.node` from its own copy under the natives directory
+ * (`~/.omp/natives/<version>-<digest prefix>/`), so bun and npm can replace the
+ * `node_modules` copy an old session would otherwise lock.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";

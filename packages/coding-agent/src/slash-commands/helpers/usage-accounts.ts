@@ -1,9 +1,20 @@
-import type { AuthStorage, UsageReport } from "@oh-my-pi/pi-ai";
+import {
+	type AuthCredential,
+	type AuthStorage,
+	type DisabledCredentialSummary,
+	resolveCredentialIdentityKey,
+	type UsageReport,
+} from "@oh-my-pi/pi-ai";
 
 /** Identity slice of a stored credential, for "every account" coverage. */
 export interface UsageAccountIdentity {
 	provider: string;
 	type: "api_key" | "oauth";
+	/**
+	 * Store-defined identity of an OAuth account, computed from the stored
+	 * credential (token claims included), as its disabled tombstones carry it.
+	 */
+	identityKey?: string;
 	email?: string;
 	accountId?: string;
 	projectId?: string;
@@ -15,6 +26,55 @@ export interface UsageAccountIdentity {
 	authorizedAt?: number;
 }
 
+/** Identity row of one stored credential, as the usage listings and `/logout` read it. */
+export function toAccountIdentity(provider: string, credential: AuthCredential): UsageAccountIdentity {
+	if (credential.type !== "oauth") return { provider, type: "api_key" };
+	return {
+		provider,
+		type: "oauth",
+		identityKey: resolveCredentialIdentityKey(provider, credential) ?? undefined,
+		email: credential.email,
+		accountId: credential.accountId,
+		projectId: credential.projectId,
+		enterpriseUrl: credential.enterpriseUrl,
+		orgId: credential.orgId,
+		orgName: credential.orgName,
+		authorizedAt: credential.authorizedAt,
+	};
+}
+
+/** Identifiers that name a tombstone's account when it carries no `identityKey`. */
+const TOMBSTONE_IDENTIFIERS = ["email", "accountId", "orgId"] as const;
+
+/**
+ * Whether one of `accounts` is the account `summary`'s tombstone names: the store's
+ * `identityKey` decides when the tombstone carries one (a broker older than the field
+ * sends none). Without it, the two must share an email, an account id or an organization,
+ * and none of the three may differ where both sides carry it: Codex Team seats share an
+ * account id, and one email can hold several Anthropic organizations. The user logged that
+ * account in again, so the tombstone is lifecycle noise — no lost capacity to report, no
+ * second row to log out of.
+ */
+export function hasActiveAccount(
+	summary: DisabledCredentialSummary,
+	accounts: readonly UsageAccountIdentity[],
+): boolean {
+	const tombstone = TOMBSTONE_IDENTIFIERS.map(field => [field, summary[field]?.toLowerCase()] as const);
+	return accounts.some(account => {
+		if (account.provider !== summary.provider) return false;
+		if (summary.identityKey) return account.identityKey === summary.identityKey;
+		let shared = false;
+		for (const [field, ours] of tombstone) {
+			const theirs = account[field]?.toLowerCase();
+			if (!ours || !theirs) continue;
+			// Both sides carry it and they differ: another seat, organization or account.
+			if (ours !== theirs) return false;
+			shared = true;
+		}
+		return shared;
+	});
+}
+
 /** Flatten every stored credential (OAuth and API key) into identity rows for unreported-account detection. */
 export function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIdentity[] {
 	const accounts: UsageAccountIdentity[] = [];
@@ -22,23 +82,7 @@ export function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIde
 	for (const provider in all) {
 		const entry = all[provider];
 		const credentials = Array.isArray(entry) ? entry : [entry];
-		for (const credential of credentials) {
-			if (credential.type === "oauth") {
-				accounts.push({
-					provider,
-					type: "oauth",
-					email: credential.email,
-					accountId: credential.accountId,
-					projectId: credential.projectId,
-					enterpriseUrl: credential.enterpriseUrl,
-					orgId: credential.orgId,
-					orgName: credential.orgName,
-					authorizedAt: credential.authorizedAt,
-				});
-			} else {
-				accounts.push({ provider, type: "api_key" });
-			}
-		}
+		for (const credential of credentials) accounts.push(toAccountIdentity(provider, credential));
 	}
 	return accounts;
 }

@@ -35,8 +35,8 @@ use std::{
 
 use async_trait::async_trait;
 use napi::{
-	Status,
-	bindgen_prelude::{Promise, Result},
+	Env, Status,
+	bindgen_prelude::{Promise, PromiseRaw, Result, Unknown},
 	threadsafe_function::{ThreadsafeFunction, UnknownReturnValue},
 };
 use napi_derive::napi;
@@ -45,7 +45,10 @@ use pi_edit::{
 	diff_string::{BlockContextSource, generate_diff_string},
 	modes::{hashline, sloppy},
 	path_policy::{RecoveryGlob, canonical_key},
-	session::{ApplyRequest, EditWriter, PreviewBatch, SessionConfig, WriteRequest, WriteResponse},
+	session::{
+		ApplyOutcome, ApplyRequest, EditWriter, PreviewBatch, SessionConfig, WriteRequest,
+		WriteResponse,
+	},
 	store,
 	stream_json::snapshot_from_text,
 	text::normalize_to_lf,
@@ -55,7 +58,10 @@ use pi_walker::{
 	walk::{self, Action, Options},
 };
 
-use crate::memory::{self, Settled, native_work};
+use crate::{
+	memory::{self, Settled, native_work},
+	task,
+};
 
 fn parse_mode(mode: &str) -> Result<EditMode> {
 	EditMode::parse(mode)
@@ -204,13 +210,27 @@ pub struct EditWriteResponse {
 	pub written:          String,
 	/// `FileDiagnosticsResult` serialized by the host; opaque here.
 	pub diagnostics_json: Option<String>,
+	/// The host did not begin this write because the call was cancelled, and
+	/// touched nothing; `apply` then reports the call as cancelled.
+	pub cancelled:        Option<bool>,
 }
 
 /// Apply-time knobs.
-#[napi(object)]
-pub struct EditApplyRequest {
+#[napi(object, object_to_js = false)]
+pub struct EditApplyRequest<'env> {
 	pub lsp_batch_id: Option<String>,
 	pub lsp_flush:    bool,
+	/// Abort signal of the tool call. Once it fires, `apply` hands no further
+	/// write to the host writer, and a call stopped that way ends as
+	/// `cancelled`, naming what the call's earlier writes changed. `apply` does
+	/// not interrupt a write the host has already begun, and the call ends as
+	/// that write's result: if the host fails it, `write_failed` with the
+	/// host's error, naming no earlier file; if it succeeds, it is named by the
+	/// cancel at the next write, or, as the call's last write, the call
+	/// succeeds. A write handed over just before the abort can still reach the
+	/// writer after it: a writer that must start nothing after the abort checks
+	/// its own signal first and returns `cancelled: true`.
+	pub signal:       Option<Unknown<'env>>,
 }
 
 /// One file's apply outcome.
@@ -482,12 +502,17 @@ impl Shared {
 
 /// Bridges the host writer callback into the engine's writer trait.
 struct TsfnWriter {
-	tsfn: WriterCallback,
+	tsfn:   WriterCallback,
+	/// The call's abort signal: no write is handed to the host once it fired.
+	cancel: task::CancelToken,
 }
 
 #[async_trait]
 impl EditWriter for TsfnWriter {
 	async fn write(&self, request: WriteRequest) -> EditResult<WriteResponse> {
+		if self.cancel.aborted() {
+			return Err(EditError::Cancelled { written: Vec::new() });
+		}
 		let op = if request.move_to.is_some() {
 			"move"
 		} else {
@@ -502,16 +527,41 @@ impl EditWriter for TsfnWriter {
 			flush_lsp:    request.flush_lsp,
 			lsp_batch_id: request.lsp_batch_id,
 		};
+		// Between the check above and the host running the write, the JS thread
+		// can abort the signal; only the host can see that, so a host that must
+		// start nothing after the abort checks its own signal (EditTool's writer
+		// does). A write the host has begun is awaited to its end, never
+		// dropped: only the host knows whether its bytes landed.
 		let promise = self
 			.tsfn
 			.call_async(Ok(payload))
 			.await
 			.map_err(|err| EditError::Writer(err.reason))?;
 		let response = promise.await.map_err(|err| EditError::Writer(err.reason))?;
+		if response.cancelled == Some(true) {
+			return Err(EditError::Cancelled { written: Vec::new() });
+		}
 		Ok(WriteResponse {
 			written:          response.written,
 			diagnostics_json: response.diagnostics_json,
 		})
+	}
+}
+
+/// `work`'s output, or `None` once the call's abort signal fired first. The
+/// abort is set from the JS thread, so it is seen even after this future
+/// was not polled for a while. Dropping `work` stops it here.
+async fn unless_cancelled<T>(
+	cancel: &task::CancelToken,
+	work: impl Future<Output = T>,
+) -> Option<T> {
+	if cancel.aborted() {
+		return None;
+	}
+	tokio::select! {
+		biased;
+		_ = cancel.wait() => None,
+		output = work => Some(output),
 	}
 }
 
@@ -682,90 +732,33 @@ impl EditSession {
 
 	/// Stage and apply the finished edit through `writer`. Never rejects for
 	/// engine failures: those come back as `isError` outcomes carrying the
-	/// model-facing message.
+	/// model-facing message. Once `request.signal` fires, no further write is
+	/// handed to `writer`, and a call stopped that way ends as `cancelled`,
+	/// naming what the call's earlier writes changed. `apply` does not
+	/// interrupt a write already handed over (see `EditApplyRequest.signal` for
+	/// how it ends the call, and for what a writer must check itself).
 	#[napi]
-	pub async fn apply(
+	pub fn apply<'env>(
 		&self,
-		request: EditApplyRequest,
+		env: &'env Env,
+		request: EditApplyRequest<'env>,
 		#[napi(ts_arg_type = "(error: Error | null, request: EditWriteRequest) => \
 		                      Promise<EditWriteResponse>")]
 		writer: WriterCallback,
-	) -> Result<EditApplyOutcome> {
-		self.shared.begin_apply();
-		let shared = Arc::clone(&self.shared);
-		let mut session = shared.session.lock().await;
-		shared.drain_into(&mut session);
-		let writer = TsfnWriter { tsfn: writer };
+	) -> Result<PromiseRaw<'env, EditApplyOutcome>> {
+		let cancel = task::CancelToken::new(None, request.signal);
 		let request =
 			ApplyRequest { lsp_batch_id: request.lsp_batch_id, lsp_flush: request.lsp_flush };
-		// Apply never reuses preview-time answers (resolved before approval,
-		// without this call's abort signal): every URL target the payload names
-		// is asked again, in one pass, before the first stage.
-		let mut resolved = HashSet::new();
-		if let Some(resolver) = &shared.resolve_url {
-			for url in session.begin_apply_url_targets() {
-				let resolution = resolve_one(resolver, &url).await;
-				resolved.insert(url.clone());
-				session.provide(url, resolution);
-			}
-		}
-		// Missing paths are answered before staging for real, so no write is
-		// ever retried. Misses the payload projection did not predict surface
-		// before the first write, so a retry is safe; each one follows a newly
-		// resolved URL or recovered path, bounding attempts by distinct URLs and
-		// paths + 1.
-		let mut recovered = HashSet::new();
-		let outcome = loop {
-			let mut missing = session.apply_recovery_misses();
-			missing.retain(|authored| recovered.insert(authored.clone()));
-			if !missing.is_empty() {
-				for (authored, answer) in recover_all(&shared.cwd, missing).await {
-					session.provide_recovery(authored, answer);
-				}
-				continue;
-			}
-			let outcome = session.apply(request.clone(), &writer).await;
-			if matches!(outcome, Err(EditError::UnresolvedUrl(_)))
-				&& let Some(resolver) = &shared.resolve_url
-				&& resolve_misses(&mut session, resolver, &mut resolved).await
-			{
-				continue;
-			}
-			break outcome;
-		};
-		Shared::release(&mut session);
-		drop(session);
-		Ok(match outcome {
-			Ok(outcome) => EditApplyOutcome {
-				text:       outcome.text,
-				files:      outcome
-					.files
-					.into_iter()
-					.map(|file| EditFileOutcome {
-						path:               file.absolute.to_string_lossy().into_owned(),
-						display_path:       file.display,
-						op:                 file.op.as_str().to_owned(),
-						move_to:            file.move_to.map(|p| p.to_string_lossy().into_owned()),
-						diff:               file.diff,
-						first_changed_line: file.first_changed_line,
-						old_text:           file.old_text,
-						new_text:           file.new_text,
-						snapshots_pruned:   file.snapshots_pruned,
-						diagnostics_json:   file.diagnostics_json,
-						warnings:           file.warnings,
-						text:               file.text,
-						parse_regressed:    file.parse_regressed,
-					})
-					.collect(),
-				is_error:   false,
-				error_kind: None,
-			},
-			Err(err) => EditApplyOutcome {
-				error_kind: Some(err.kind().to_owned()),
-				text:       err.to_string(),
-				files:      Vec::new(),
-				is_error:   true,
-			},
+		let shared = Arc::clone(&self.shared);
+		task::future(env, "edit.apply", async move {
+			shared.begin_apply();
+			let mut session = shared.session.lock().await;
+			shared.drain_into(&mut session);
+			let writer = TsfnWriter { tsfn: writer, cancel: cancel.clone() };
+			let outcome = apply_locked(&shared, &mut session, &writer, request, &cancel).await;
+			Shared::release(&mut session);
+			drop(session);
+			Ok(outcome_to_js(outcome))
 		})
 	}
 
@@ -784,6 +777,101 @@ impl EditSession {
 			self.shared.queue.lock().clear();
 			Shared::release(&mut session);
 		}
+	}
+}
+
+/// The JS shape of an apply's result.
+fn outcome_to_js(outcome: EditResult<ApplyOutcome>) -> EditApplyOutcome {
+	match outcome {
+		Ok(outcome) => EditApplyOutcome {
+			text:       outcome.text,
+			files:      outcome
+				.files
+				.into_iter()
+				.map(|file| EditFileOutcome {
+					path:               file.absolute.to_string_lossy().into_owned(),
+					display_path:       file.display,
+					op:                 file.op.as_str().to_owned(),
+					move_to:            file.move_to.map(|p| p.to_string_lossy().into_owned()),
+					diff:               file.diff,
+					first_changed_line: file.first_changed_line,
+					old_text:           file.old_text,
+					new_text:           file.new_text,
+					snapshots_pruned:   file.snapshots_pruned,
+					diagnostics_json:   file.diagnostics_json,
+					warnings:           file.warnings,
+					text:               file.text,
+					parse_regressed:    file.parse_regressed,
+				})
+				.collect(),
+			is_error:   false,
+			error_kind: None,
+		},
+		Err(err) => EditApplyOutcome {
+			error_kind: Some(err.kind().to_owned()),
+			text:       err.to_string(),
+			files:      Vec::new(),
+			is_error:   true,
+		},
+	}
+}
+
+/// [`EditSession::apply`]'s work under the session lock: answer the URL
+/// targets and missing paths, then stage and write. A wait on the host or on
+/// the working tree ends as soon as `cancel` fires, and `writer` begins no
+/// write after it.
+async fn apply_locked(
+	shared: &Shared,
+	session: &mut Session,
+	writer: &TsfnWriter,
+	request: ApplyRequest,
+	cancel: &task::CancelToken,
+) -> EditResult<ApplyOutcome> {
+	let cancelled = || EditError::Cancelled { written: Vec::new() };
+	// Apply never reuses preview-time answers (resolved before approval,
+	// without this call's abort signal): every URL target the payload names
+	// is asked again, in one pass, before the first stage.
+	let mut resolved = HashSet::new();
+	if let Some(resolver) = &shared.resolve_url {
+		for url in session.begin_apply_url_targets() {
+			let resolution = unless_cancelled(cancel, resolve_one(resolver, &url))
+				.await
+				.ok_or_else(cancelled)?;
+			resolved.insert(url.clone());
+			session.provide(url, resolution);
+		}
+	}
+	// Missing paths are answered before staging for real, so no write is
+	// ever retried. Misses the payload projection did not predict surface
+	// before the first write, so a retry is safe; each one follows a newly
+	// resolved URL or recovered path, bounding attempts by distinct URLs and
+	// paths + 1.
+	let mut recovered = HashSet::new();
+	loop {
+		let mut missing = session.apply_recovery_misses();
+		missing.retain(|authored| recovered.insert(authored.clone()));
+		if !missing.is_empty() {
+			let answers = unless_cancelled(cancel, recover_all(&shared.cwd, missing))
+				.await
+				.ok_or_else(cancelled)?;
+			for (authored, answer) in answers {
+				session.provide_recovery(authored, answer);
+			}
+			continue;
+		}
+		let outcome = session.apply(request.clone(), writer).await;
+		if matches!(outcome, Err(EditError::UnresolvedUrl(_)))
+			&& let Some(resolver) = &shared.resolve_url
+		{
+			let progressed =
+				unless_cancelled(cancel, resolve_misses(session, resolver, &mut resolved))
+					.await
+					.ok_or_else(cancelled)?;
+			if progressed {
+				continue;
+			}
+		}
+		return outcome;
 	}
 }
 

@@ -16,6 +16,7 @@ const addon: NativeAddonStatus = {
 	version: "18.1.18",
 	packageVersion: "18.2.6",
 	stale: true,
+	builtFromOtherSources: false,
 };
 
 const written: string[] = [];

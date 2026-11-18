@@ -174,6 +174,10 @@ const KILL_GRACE: Duration = Duration::ZERO;
 const CANCEL_EXIT_WAIT: Duration = Duration::from_millis(800);
 #[cfg(windows)]
 const CANCEL_EXIT_WAIT: Duration = POST_CANCEL_DRAIN_TIMEOUT;
+/// How often the stop pins the PTY command before it gives up: a failure
+/// that proves nothing (no descriptor left) passes, as other work releases
+/// what it held.
+const PIN_ATTEMPTS: u32 = 3;
 
 struct PtySessionCore {
 	control_tx: flume::Sender<ControlMessage>,
@@ -477,13 +481,32 @@ fn run_pty_sync(
 	// the reap its pid may be recycled, and a pid-only signal (a lookup at
 	// cancellation time, or portable-pty's `clone_killer`) would hit whatever
 	// process took it (#4605). The child is only ever signalled through
-	// `pinned_child`.
+	// `pinned_child`. Where the system provides no pidfd the pin is by start
+	// time (`Process::open`); a pin that fails for a reason that proves
+	// nothing (no descriptor left) is tried again, as such a failure passes.
 	let mut targets = ps::TerminationTargets::new();
 	#[cfg(unix)]
 	if let Some(pgid) = master.process_group_leader().filter(|pgid| *pgid > 0) {
 		targets.add_pgid(pgid);
 	}
-	let pinned_child = child_pid.and_then(pi_shell::proctree::Process::from_pid);
+	// Why a stop may have missed a process of the tree: the child could not be
+	// pinned, or the last kill wave could not read the whole tree.
+	let mut unreached: Option<std::io::Error> = None;
+	let pinned_child = child_pid.and_then(|pid| {
+		let mut last = None;
+		for _ in 0..PIN_ATTEMPTS {
+			match pi_shell::proctree::Process::open(pid) {
+				Ok(pinned) => return pinned,
+				Err(error) => last = Some(error),
+			}
+		}
+		let error = last?;
+		unreached = Some(std::io::Error::new(
+			error.kind(),
+			format!("the PTY command could not be pinned to walk its process tree: {error}"),
+		));
+		None
+	});
 	if let Some(process) = &pinned_child {
 		targets.add_process(process.clone());
 	}
@@ -534,6 +557,7 @@ fn run_pty_sync(
 	// for an exit status at `give_up_at`.
 	let mut kill_at: Option<Instant> = None;
 	let mut give_up_at: Option<Instant> = None;
+	let mut wave_unreached: Option<std::io::Error> = None;
 	let status = loop {
 		let next = match kill_at.or(give_up_at) {
 			Some(deadline) => control_rx.recv_deadline(deadline),
@@ -568,12 +592,12 @@ fn run_pty_sync(
 			Ok(ControlMessage::JsGone | ControlMessage::Cancelled { .. }) => false,
 			Ok(ControlMessage::Exited(status)) => {
 				if kill_at.is_some() {
-					targets.signal(ps::KILL_SIGNAL);
+					wave_unreached = targets.signal(ps::KILL_SIGNAL).err();
 				}
 				break Some(status);
 			},
 			Err(flume::RecvTimeoutError::Timeout) if kill_at.take().is_some() => {
-				targets.signal(ps::KILL_SIGNAL);
+				wave_unreached = targets.signal(ps::KILL_SIGNAL).err();
 				false
 			},
 			// `give_up_at` passed; disconnect cannot happen while the waiter
@@ -581,7 +605,8 @@ fn run_pty_sync(
 			Err(_) => break None,
 		};
 		if terminate && give_up_at.is_none() {
-			targets.signal(ps::TERM_SIGNAL);
+			// The hard waves that follow re-walk the tree.
+			let _ = targets.signal(ps::TERM_SIGNAL);
 			// The hangup a closing terminal delivers: interactive shells ignore
 			// SIGTERM but exit on SIGHUP. On Windows TERM already terminated it.
 			#[cfg(unix)]
@@ -634,6 +659,23 @@ fn run_pty_sync(
 		|| abort_pump.abort(),
 	);
 	drop(pump_task);
+	// Every process the stop could find was killed, and the process groups,
+	// which need no read. A process group the command leads reached it and
+	// everything in its group; a process it could not find is then logged
+	// only, so a cancel still returns as one. Without a group (Windows), a
+	// process the stop could not find is reported, not passed over.
+	if (cancelled || timed_out)
+		&& let Some(error) = wave_unreached.or(unreached)
+	{
+		if !targets.has_process_group() {
+			return Err(Error::from_reason(format!(
+				"PTY command stopped, but its process tree could not be read whole: {error}"
+			)));
+		}
+		log::warn!(
+			"PTY command stopped through its process group; part of its tree was unread: {error}"
+		);
+	}
 	Ok(PtyRunResult { exit_code, cancelled, timed_out })
 }
 

@@ -20,22 +20,31 @@
 //! those values, the comparison stays exact and samples both clients: ours
 //! races the same way (its sender, generator, and receiver are threads), so
 //! when the outcomes differ in any way, each client is rerun on a fresh
-//! fixture up to [`RETRIES`] times, and the scenario passes once some outcome
-//! of ours exactly equals (exit code, normalized stdout and stderr, tree) some
+//! fixture, ours up to [`RETRIES`] times and the reference up to
+//! [`REFERENCE_RETRIES`] times, and the scenario passes once some outcome of
+//! ours exactly equals (exit code, normalized stdout and stderr, tree) some
 //! reference outcome. A real bug still fails because no outcome of ours
-//! matches; the failure report names how many distinct outcomes each client
-//! produced and diffs the first of each.
+//! matches any outcome the reference produced; the failure report names how
+//! many runs and distinct outcomes each client had and diffs the first of
+//! each.
 //!
-//! The reference runs with an empty environment (plus `TZ` when set, so
-//! local-time output uses one zone on both sides), matching the test host's
-//! empty shell environment; the fake remote shell, the reference server, and
-//! the password files are named by the same absolute paths on both sides.
-//! The suite skips itself when no rsync 3.5.1 is installed. Set
-//! `RSYNC_CONFORMANCE_FILTER=<substring>` to run only matching scenarios.
+//! Both clients run with the same empty environment (plus `TZ` when set, so
+//! local-time output uses one zone on both sides) and the same `LC_ALL`: the
+//! locale decides which bytes of a file name either side escapes, so a
+//! scenario pins it ([`UTF8_LOCALE`], or [`C_LOCALE`] for the rows that cover
+//! the C locale) and the fake remote shell passes it to both remote servers.
+//! The fake remote shell, the reference server, and the password files are
+//! named by the same absolute paths on both sides. The reference daemon keeps
+//! the bare empty environment: one is started per side from the same binary,
+//! so whatever it prints, it prints alike for both.
+//! The suite skips itself when no rsync 3.5.1 is installed, unless
+//! `RSYNC_REFERENCE_REQUIRED` is set; a 3.5.1 without xxhash, lz4 or zstd
+//! fails it (see [`reference`]). Set `RSYNC_CONFORMANCE_FILTER=<substring>`
+//! to run only matching scenarios.
 #![cfg(unix)]
 
 mod cases;
-mod daemon;
+pub(super) mod daemon;
 mod fixture;
 mod normalize;
 mod snapshot;
@@ -53,11 +62,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use self::daemon::Daemon;
 use self::normalize::normalize;
 use self::snapshot::Snapshot;
-use crate::host::run_util;
+use crate::host::run_util_env;
 use crate::rsync::Rsync;
 
-/// How many extra runs of each client a mismatch gets.
+/// How many extra runs of ours a mismatch gets.
 const RETRIES: usize = 8;
+
+/// How many extra runs of the reference a mismatch gets. The reference varies
+/// more than ours: under load, 15 of the 150 local scenarios gave more than
+/// one reference outcome in 30 runs, and in some the outcome ours gives came
+/// in only 1 to 5 of them, which [`RETRIES`] runs can miss.
+const REFERENCE_RETRIES: usize = 30;
 
 /// One scenario: see [`cases`] for the field conventions.
 struct Case {
@@ -65,18 +80,25 @@ struct Case {
 	exit: i32,
 	tweaks: &'static str,
 	args: &'static [&'static str],
+	/// `LC_ALL` for both clients and both remote servers.
+	locale: &'static str,
 	/// Compare stdout as a sorted multiset of lines.
 	unordered: bool,
 }
 
 /// A table row.
 const fn c(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
-	Case { name, exit, tweaks, args, unordered: false }
+	Case { name, exit, tweaks, args, locale: UTF8_LOCALE, unordered: false }
+}
+
+/// A table row run in the C locale instead of [`UTF8_LOCALE`].
+const fn cc(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
+	Case { name, exit, tweaks, args, locale: C_LOCALE, unordered: false }
 }
 
 /// A table row whose stdout order is racy in the reference.
 const fn u(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
-	Case { name, exit, tweaks, args, unordered: true }
+	Case { name, exit, tweaks, args, locale: UTF8_LOCALE, unordered: true }
 }
 
 /// How the scenario reaches its peer.
@@ -105,18 +127,49 @@ struct Outcome {
 	tree: Snapshot,
 }
 
-/// The reference rsync 3.5.1 binary, when one is installed. Other versions
-/// are skipped: the builtin's output is byte-for-byte 3.5.1's.
-fn reference() -> Option<PathBuf> {
+/// The locale most scenarios run under: the C locale with a UTF-8 charmap, in
+/// libc's spelling (glibc and musl: `C.UTF-8`; Darwin: `UTF-8`). Both clients
+/// print the UTF-8 file names of the fixture as the text they are.
+const UTF8_LOCALE: &str = if cfg!(target_os = "macos") { "UTF-8" } else { "C.UTF-8" };
+
+/// The locale of the scenarios that cover the other half of the contract: in
+/// the C locale no byte above 0x7F is printable, so both clients escape every
+/// one of them in the names they print (`ünï cødé.txt` becomes
+/// `\#303\#274n\#303\#257 c\#303\#270d\#303\#251.txt`), and `-8` turns that
+/// off on both. Naming the locale on both sides keeps the run hermetic —
+/// nothing ambient reaches either side — and leaves the escaping a scenario
+/// can compare. The builtin reads `LC_ALL`/`LC_CTYPE`/`LANG` in one other
+/// place, the default charset of `--iconv` (`iconv::locale_charset`).
+const C_LOCALE: &str = "C";
+
+/// The reference rsync 3.5.1 binary, when one is installed (Homebrew's, or
+/// the first on `PATH`). Other versions are skipped: the builtin's output is
+/// byte-for-byte 3.5.1's. The rsync daemon tests use it too.
+///
+/// A run that cannot compare says so instead of passing:
+/// - with `RSYNC_REFERENCE_REQUIRED` set (by a test run that must compare,
+///   such as the fork's builds Jobs), no 3.5.1 fails the caller;
+/// - a 3.5.1 built without the checksums and compressors the builtin
+///   offers (xxhash, lz4, zstd) fails it too, since its transfers differ
+///   from the builtin's for that reason alone.
+pub(super) fn reference() -> Option<PathBuf> {
 	let mut candidates = vec![PathBuf::from("/opt/homebrew/bin/rsync")];
 	if let Some(path) = std::env::var_os("PATH") {
 		candidates.extend(std::env::split_paths(&path).map(|d| d.join("rsync")));
 	}
-	candidates.into_iter().find(|p| {
-		Command::new(p).arg("--version").env_clear().output().is_ok_and(|o| {
-			String::from_utf8_lossy(&o.stdout).starts_with("rsync  version 3.5.1  protocol version 33\n")
-		})
-	})
+	let found = candidates.into_iter().find_map(|p| {
+		let o = Command::new(&p).arg("--version").env_clear().output().ok()?;
+		let version = String::from_utf8_lossy(&o.stdout).into_owned();
+		version.starts_with("rsync  version 3.5.1  protocol version 33\n").then_some((p, version))
+	});
+	let Some((path, version)) = found else {
+		let required = std::env::var_os("RSYNC_REFERENCE_REQUIRED").is_some_and(|v| !v.is_empty());
+		assert!(!required, "no rsync 3.5.1 on PATH, and RSYNC_REFERENCE_REQUIRED is set");
+		return None;
+	};
+	let missing: Vec<&str> = ["xxh128", "lz4", "zstd"].into_iter().filter(|name| !version.contains(name)).collect();
+	assert!(missing.is_empty(), "the reference {} was built without {missing:?}:\n{version}", path.display());
+	Some(path)
 }
 
 fn now_ns() -> i128 {
@@ -129,24 +182,26 @@ struct Bench {
 	base: PathBuf,
 	reference: PathBuf,
 	mode: Mode,
+	locale: &'static str,
 }
 
 impl Bench {
-	fn new(base: &Path, reference: &Path, mode: Mode) -> Self {
+	fn new(base: &Path, reference: &Path, mode: Mode, locale: &'static str) -> Self {
 		let bin = base.join("bin");
 		fs::create_dir_all(&bin).unwrap();
 		// Like ssh, the fake remote shell drops the host name and hands the
 		// rest to a shell as one command line (so `--old-args` word splitting
-		// happens remotely). The remote command runs in the client's cwd.
+		// happens remotely). The remote command runs in the client's cwd. It
+		// sets the locale itself so that both remote servers have it whatever
+		// each client hands down.
 		let rsh = bin.join("fakersh");
-		fs::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n").unwrap();
-		fs::set_permissions(&rsh, fs::Permissions::from_mode(0o755)).unwrap();
+		crate::testprog::write(&rsh, &format!("#!/bin/sh\nshift\nLC_ALL={locale}\nexport LC_ALL\nexec /bin/sh -c \"$*\"\n"));
 		for (name, password) in [("pw", "sekrit\n"), ("badpw", "wrong\n")] {
 			let file = bin.join(name);
 			fs::write(&file, password).unwrap();
 			fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
 		}
-		Self { base: base.to_path_buf(), reference: reference.to_path_buf(), mode }
+		Self { base: base.to_path_buf(), reference: reference.to_path_buf(), mode, locale }
 	}
 
 	/// The scenario's argv for a daemon on `port`.
@@ -181,12 +236,12 @@ impl Bench {
 		let (code, out, err) = match client {
 			Client::Ours => {
 				let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-				let (code, cap) = run_util::<Rsync>(&refs, "", &w);
+				let (code, cap) = run_util_env::<Rsync>(&refs, "", &w, &[("LC_ALL", self.locale)]);
 				(code, cap.stdout(), cap.stderr())
 			}
 			Client::Reference => {
 				let mut cmd = Command::new(&self.reference);
-				cmd.args(&argv).current_dir(&w).env_clear();
+				cmd.args(&argv).current_dir(&w).env_clear().env("LC_ALL", self.locale);
 				if let Some(tz) = std::env::var_os("TZ") {
 					cmd.env("TZ", tz);
 				}
@@ -218,26 +273,33 @@ fn sorted_lines(data: &[u8]) -> Vec<&[u8]> {
 	lines
 }
 
-/// Runs one scenario; `Err` carries the report.
-fn check(reference: &Path, mode: Mode, case: &Case) -> Result<(), String> {
+/// Runs one scenario; `Err` carries the report. `tamper` edits each outcome of
+/// ours before it is compared (the negative controls; [`run_table`] passes
+/// one that changes nothing).
+fn check(reference: &Path, mode: Mode, case: &Case, tamper: &dyn Fn(&mut Outcome)) -> Result<(), String> {
 	let dir = tempfile::tempdir().unwrap();
 	// Canonical, so the paths both clients print agree with what `getcwd`
 	// reports to the reference (macOS: /var → /private/var).
 	let base = fs::canonicalize(dir.path()).unwrap();
-	let bench = Bench::new(&base, reference, mode);
+	let bench = Bench::new(&base, reference, mode, case.locale);
 	// Distinct outcomes per client so far, first run first.
 	let mut mine: Vec<Outcome> = Vec::new();
 	let mut seen: Vec<Outcome> = Vec::new();
+	let mut runs = (0_usize, 0_usize);
 	let mut matched = None;
-	for attempt in 0..=RETRIES {
-		for (client, side, outcomes) in [
-			(Client::Ours, format!("ours{attempt}"), &mut mine),
-			(Client::Reference, format!("theirs{attempt}"), &mut seen),
-		] {
-			let outcome = bench.run(case, &side, client);
-			if !outcomes.contains(&outcome) {
-				outcomes.push(outcome);
+	for attempt in 0..=REFERENCE_RETRIES {
+		if attempt <= RETRIES {
+			let mut outcome = bench.run(case, &format!("ours{attempt}"), Client::Ours);
+			tamper(&mut outcome);
+			runs.0 += 1;
+			if !mine.contains(&outcome) {
+				mine.push(outcome);
 			}
+		}
+		let outcome = bench.run(case, &format!("theirs{attempt}"), Client::Reference);
+		runs.1 += 1;
+		if !seen.contains(&outcome) {
+			seen.push(outcome);
 		}
 		matched = mine.iter().find(|outcome| seen.contains(outcome));
 		if matched.is_some() {
@@ -253,9 +315,11 @@ fn check(reference: &Path, mode: Mode, case: &Case) -> Result<(), String> {
 		format!("ours matched one of {} distinct reference outcome(s)", seen.len())
 	} else {
 		format!(
-			"none of {} distinct outcome(s) of ours matched any of {} distinct reference outcome(s); diff of the first of each",
+			"none of {} distinct outcome(s) of ours ({} runs) matched any of {} distinct reference outcome(s) ({} runs); diff of the first of each",
 			mine.len(),
-			seen.len()
+			runs.0,
+			seen.len(),
+			runs.1
 		)
 	};
 	let mut report = format!("{} {:?}\n  {verdict}\n", case.name, bench.argv(case, 0));
@@ -292,7 +356,7 @@ fn run_table(mode: Mode, table: &[Case]) {
 		for _ in 0..workers {
 			scope.spawn(|| {
 				while let Some(case) = cases.get(next.fetch_add(1, Ordering::Relaxed)) {
-					let result = std::panic::catch_unwind(|| check(&reference, mode, case))
+					let result = std::panic::catch_unwind(|| check(&reference, mode, case, &unchanged))
 						.unwrap_or_else(|panic| {
 							let text = panic
 								.downcast_ref::<String>()
@@ -332,4 +396,58 @@ fn remote_shell_transfers_match_reference() {
 #[test]
 fn daemon_transfers_match_reference() {
 	run_table(Mode::Daemon, cases::DAEMON);
+}
+
+/// The tamper of a real comparison: the outcome as it came.
+fn unchanged(_: &mut Outcome) {}
+
+/// Runs `case` with each outcome of ours edited by `tamper` into one the
+/// reference never produces, and requires it to fail only after every run of
+/// both clients: no rerun lets a wrong outcome of ours through.
+fn assert_never_matches(table: &[Case], name: &str, tamper: &dyn Fn(&mut Outcome)) {
+	let Some(reference) = reference() else { return };
+	let case = table.iter().find(|c| c.name == name).expect("the control's scenario");
+	let report = check(&reference, Mode::Local, case, tamper).expect_err("a tampered outcome of ours matched the reference");
+	let runs = format!("of ours ({} runs)", RETRIES + 1);
+	let reference_runs = format!("reference outcome(s) ({} runs)", REFERENCE_RETRIES + 1);
+	assert!(report.contains(&runs) && report.contains(&reference_runs), "{report}");
+}
+
+/// The summary's `received N bytes`, with N one more.
+fn one_more_byte_received(outcome: &mut Outcome) {
+	let text = String::from_utf8(outcome.out.clone()).unwrap();
+	let (head, tail) = text.split_once("  received ").expect("a `sent … received …` summary");
+	let (count, rest) = tail.split_once(" bytes").unwrap();
+	let count: u64 = count.replace(',', "").parse().unwrap();
+	let digits = (count + 1).to_string();
+	let mut grouped = String::new();
+	for (i, digit) in digits.chars().enumerate() {
+		if i > 0 && (digits.len() - i) % 3 == 0 {
+			grouped.push(',');
+		}
+		grouped.push(digit);
+	}
+	outcome.out = format!("{head}  received {grouped} bytes{rest}").into_bytes();
+}
+
+/// `junk.o` deleted after `extra.txt`: rsync deletes a directory's extra
+/// entries in reverse name order, so the reference never prints these two
+/// deletions this way round.
+fn junk_deleted_after_extra(outcome: &mut Outcome) {
+	let mut lines: Vec<&[u8]> = outcome.out.split(|&byte| byte == b'\n').collect();
+	let junk = lines.iter().position(|line| *line == b"*deleting   junk.o").expect("junk.o's deletion");
+	let extra = lines.iter().position(|line| *line == b"*deleting   extra.txt").expect("extra.txt's deletion");
+	assert!(junk < extra, "the deletions came in the other order already");
+	lines.swap(junk, extra);
+	outcome.out = lines.join(&b'\n');
+}
+
+#[test]
+fn a_byte_total_of_ours_the_reference_never_gives_fails_every_rerun() {
+	assert_never_matches(cases::LOCAL, "archive_vv_stale", &one_more_byte_received);
+}
+
+#[test]
+fn a_deletion_order_of_ours_the_reference_never_gives_fails_every_rerun() {
+	assert_never_matches(cases::LOCAL, "dry_run", &junk_deleted_after_extra);
 }

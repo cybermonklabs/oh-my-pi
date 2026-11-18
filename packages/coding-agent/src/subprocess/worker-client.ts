@@ -14,7 +14,8 @@ import {
 	WhichCachePolicy,
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
-import { stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
+import { NATIVES_DIR_HANDOFF_ENV_KEY, nativesDirHandoff, nativesDirHandoffDir } from "@oh-my-pi/pi-natives/natives-dir";
+import { filterChildShellEnv, setLaunchNativesDir, stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
 import type { Subprocess } from "bun";
 
 /**
@@ -145,6 +146,17 @@ export function resolveExecutablePath(): string {
 }
 
 /**
+ * Bun's own `.env` loading, off for a subprocess worker and the launch broker that a
+ * non-compiled omp starts (a compiled binary is built with it off). Such a child gets its
+ * environment from its parent (the values Bun loaded at the parent's start included, for a
+ * worker) and applies omp's own `.env` files itself (`@oh-my-pi/pi-utils/env`) after it resolves
+ * the natives directory; Bun's would apply the `.env` of whatever directory the child starts in
+ * before any omp code runs, so the child would start with values its parent never gave it, and
+ * refuse its parent's natives-directory handoff.
+ */
+const NO_BUN_ENV_FILE = "--no-env-file";
+
+/**
  * Resolve the command that re-enters this CLI's entrypoint: the compiled
  * binary itself, or the runtime plus the declared worker-host entry. Used by
  * the TUI `/restart` relaunch; workers go through {@link resolveWorkerSpawnCmd},
@@ -176,16 +188,33 @@ export function resolveWorkerSpawnCmd(workerArg: string): WorkerSpawnCommand {
 	if (isCompiledBinary()) return { cmd: [executable, workerArg] };
 	const hostEntry = workerHostEntry();
 	if (hostEntry) {
-		return { cmd: [executable, hostEntry, workerArg] };
+		return { cmd: [executable, NO_BUN_ENV_FILE, hostEntry, workerArg] };
 	}
 	const packageRoot = path.resolve(import.meta.dir, "..", "..");
-	return { cmd: [executable, "src/cli.ts", workerArg], cwd: packageRoot };
+	return { cmd: [executable, NO_BUN_ENV_FILE, "src/cli.ts", workerArg], cwd: packageRoot };
+}
+
+/**
+ * Hand this process's natives directory, or `dir`, to `env`, the whole environment of a child
+ * that is omp and that this process starts itself. The handoff names this process as the
+ * child's parent and records the child's values of the directory rule's inputs, so a program
+ * the child starts, with the same environment or its own, does not take it.
+ */
+function withNativesDirHandoff(env: Record<string, string>, dir?: string): Record<string, string> {
+	env[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(env, { parent: process.pid, dir });
+	return env;
 }
 
 /**
  * Snapshot the parent environment for the child. `process.env` carries
  * `undefined` slots that `Bun.spawn` rejects, so filter them out; an optional
  * `overlay` (e.g. the tiny-model device/dtype vars) wins over inherited keys.
+ *
+ * The worker is omp, so it takes this process's natives directory from a
+ * handoff: it loads the addon and its grammars from the directory the parent
+ * does, whatever directory variables a `.env` file set since the parent
+ * resolved it. `PI_NATIVES_DIR` is as omp was started with it, so the programs
+ * a worker starts (the JS eval kernel's, say) resolve their own.
  */
 export function workerEnvFromParent(overlay?: Record<string, string>): Record<string, string> {
 	const base = $env as Record<string, string | undefined>;
@@ -197,10 +226,48 @@ export function workerEnvFromParent(overlay?: Record<string, string>): Record<st
 	// Inherited repo-location overrides must not reach a worker or the PTY
 	// daemons it hosts (issue #11082); an explicit overlay still wins below.
 	stripGitRepoLocationEnv(merged);
+	setLaunchNativesDir(merged);
 	if (overlay) {
 		for (const key in overlay) merged[key] = overlay[key];
 	}
-	return merged;
+	return withNativesDirHandoff(merged);
+}
+
+/**
+ * The environment of the launch broker. The broker runs the agent's services and
+ * commands as well as omp's daemons, so its environment is a command's
+ * (`filterChildShellEnv`: no value a project `.env` file set, `PI_NATIVES_DIR` as
+ * omp was started with it), with `overlay` over it; being omp, it takes this
+ * process's natives directory from a handoff.
+ */
+export function brokerEnvFromParent(overlay: Record<string, string>): Record<string, string> {
+	return withNativesDirHandoff(Object.assign(filterChildShellEnv($env), overlay));
+}
+
+/**
+ * The spec environment of an omp daemon the launch broker runs (`DaemonSpec.env`):
+ * `env` with a handoff of this process's natives directory, since the daemon is
+ * omp. The broker, which starts the daemon, re-issues the handoff for the daemon's
+ * own environment ({@link managedDaemonEnv}).
+ */
+export function ompDaemonSpecEnv(env: Record<string, string>): Record<string, string> {
+	return withNativesDirHandoff({ ...env });
+}
+
+/**
+ * The environment the launch broker gives a program it manages: the broker's own
+ * environment as a command's (`filterChildShellEnv`: no value a project `.env`
+ * file set, `PI_NATIVES_DIR` as the broker was started with it, no natives
+ * handoff), with `specEnv` over it. A service's spec is the shell environment of
+ * the session that asked for it, so the service gets what the bash tool's command
+ * would. An omp daemon's spec carries a handoff of the asking session's natives
+ * directory ({@link ompDaemonSpecEnv}); the broker re-issues it for the daemon's
+ * environment, with itself as the parent.
+ */
+export function managedDaemonEnv(specEnv: Record<string, string>): Record<string, string> {
+	const env = Object.assign(filterChildShellEnv($env), specEnv);
+	const handedOver = nativesDirHandoffDir(specEnv[NATIVES_DIR_HANDOFF_ENV_KEY]);
+	return handedOver ? withNativesDirHandoff(env, handedOver) : env;
 }
 
 /**
@@ -228,8 +295,8 @@ export function nativeLibraryPathOverlay(
 /**
  * Env for an ONNX inference worker: the parent env plus the native library
  * path. Only these workers get it — the daemon broker spawns user PTY sessions
- * and eval kernels through {@link workerEnvFromParent}, and rewriting the
- * loader search path of arbitrary user commands risks a `GLIBCXX` mismatch.
+ * and eval kernels through {@link managedDaemonEnv}, and rewriting the loader
+ * search path of arbitrary user commands risks a `GLIBCXX` mismatch.
  */
 export function inferenceWorkerEnv(overlay?: Record<string, string>): Record<string, string> {
 	return workerEnvFromParent({ ...nativeLibraryPathOverlay($env, process.platform), ...overlay });

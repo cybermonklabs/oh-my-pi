@@ -1,0 +1,283 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { getEnvironmentData, setEnvironmentData } from "node:worker_threads";
+
+/**
+ * An absolute directory from an override variable (`~` expanded), or undefined for a
+ * relative or empty value. The natives directory and pi-utils' process-global roots (the
+ * config and download roots, the worktree base) all read their overrides with it: every omp
+ * process must name the same directories, and a relative value would resolve against whatever
+ * directory omp was started in.
+ * @param {string | null | undefined} value
+ * @returns {string | undefined}
+ */
+export function resolveAbsoluteDir(value) {
+	let dir = value?.trim();
+	if (!dir) return undefined;
+	if (dir === "~") dir = os.homedir();
+	else if (dir.startsWith("~/") || dir.startsWith("~\\")) dir = os.homedir() + dir.slice(1);
+	return path.isAbsolute(dir) ? path.normalize(dir) : undefined;
+}
+
+/** The variable `os.homedir()` reads the home directory from. */
+const HOME_ENV_NAME = process.platform === "win32" ? "USERPROFILE" : "HOME";
+
+/**
+ * What the rule reads from `env`: the five directory variables, and the home directory's
+ * variable, which `os.homedir()` reads (Bun, as the process starts). {@link resolveNativesDir}
+ * reads the environment through this object only, and a handoff records it and is taken only
+ * by a process whose own object is the recorded one, so the two cannot differ.
+ * @param {Record<string, string | undefined>} env
+ * @returns {Record<string, string | null>}
+ */
+function nativesDirInputs(env) {
+	return {
+		PI_NATIVES_DIR: env.PI_NATIVES_DIR ?? null,
+		OMP_DOWNLOAD_ROOT: env.OMP_DOWNLOAD_ROOT ?? null,
+		XDG_CACHE_HOME: env.XDG_CACHE_HOME ?? null,
+		OMP_CONFIG_ROOT: env.OMP_CONFIG_ROOT ?? null,
+		PI_CONFIG_DIR: env.PI_CONFIG_DIR ?? null,
+		[HOME_ENV_NAME]: env[HOME_ENV_NAME] ?? null,
+	};
+}
+
+/**
+ * The natives directory by the rule below, from the rule's inputs.
+ * @param {Record<string, string | null>} inputs from {@link nativesDirInputs}
+ * @returns {string}
+ */
+function resolveNativesDir(inputs) {
+	const override = resolveAbsoluteDir(inputs.PI_NATIVES_DIR);
+	if (override) return override;
+	const downloadRoot = resolveAbsoluteDir(inputs.OMP_DOWNLOAD_ROOT);
+	if (downloadRoot) return path.join(downloadRoot, "natives");
+	const xdgCacheHome = inputs.XDG_CACHE_HOME;
+	if ((process.platform === "linux" || process.platform === "darwin") && xdgCacheHome) {
+		const appRoot = path.join(xdgCacheHome, "omp");
+		if (fs.existsSync(appRoot)) return path.join(appRoot, "natives");
+	}
+	const configRoot =
+		resolveAbsoluteDir(inputs.OMP_CONFIG_ROOT) ?? path.join(os.homedir(), inputs.PI_CONFIG_DIR || ".omp");
+	return path.join(configRoot, "natives");
+}
+
+/**
+ * Key of this process's answer in its worker-thread environment data (`setEnvironmentData`),
+ * `{ dir, startedWithHandoff }`: a worker thread starts with a copy of it, and with a copy of
+ * the environment, which may hold directory variables the main thread's first answer
+ * predates. Environment data stays in the process, so no child process, and no command the
+ * agent runs, is given it. (Bun passes a worker thread's copy on to the worker threads it
+ * starts only once the thread has loaded `node:worker_threads`, as loading this module does;
+ * every omp thread loads it, through `@oh-my-pi/pi-utils`.)
+ */
+const NATIVES_DIR_THREAD_DATA_KEY = "@oh-my-pi/pi-natives/natives-dir";
+
+/** This process's answer, once the first call has given it. */
+let processNativesDir;
+
+/**
+ * Whether this process was started with a non-empty {@link NATIVES_DIR_HANDOFF_ENV_KEY}, taken or
+ * not: the native shell and a spawn with no `env` start from that environment, where it stays.
+ */
+let startedWithHandoff = false;
+
+/**
+ * A process's state and start time on Linux (`/proc/<pid>/stat` fields 3 and 22, the start in
+ * clock ticks since boot), this process's by default: with the pid, the start time names one
+ * process for its whole life, in every thread. Undefined elsewhere, or when `/proc` cannot be
+ * read (the process has been reaped).
+ * @param {number | "self"} [pid]
+ * @returns {{ state: string; start: string | undefined } | undefined}
+ */
+function processStat(pid = "self") {
+	if (process.platform !== "linux") return undefined;
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		// The fields after the command name, which is in parentheses and may hold spaces,
+		// start at field 3; field 22 is the 20th of them.
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		return { state: fields[0] ?? "", start: fields[19] };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * A process's start time on Linux (see {@link processStat}), this process's by default.
+ * @param {number | "self"} [pid]
+ * @returns {string | undefined}
+ */
+function processStartTime(pid = "self") {
+	return processStat(pid)?.start;
+}
+
+/** @param {number} pid */
+function isLiveProcess(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return err?.code === "EPERM";
+	}
+}
+
+/**
+ * Make `dir` this process's answer: kept for later calls, and carried to the worker threads it
+ * starts afterwards through {@link NATIVES_DIR_THREAD_DATA_KEY}, with whether the process was
+ * started with a handoff. `PI_NATIVES_DIR` is left as it is, so the commands the agent runs
+ * carry it as omp was started with it.
+ * @param {string} dir
+ * @param {boolean} withHandoff
+ */
+function adopt(dir, withHandoff) {
+	processNativesDir = dir;
+	startedWithHandoff = withHandoff;
+	setEnvironmentData(NATIVES_DIR_THREAD_DATA_KEY, { dir, startedWithHandoff: withHandoff });
+	return dir;
+}
+
+/**
+ * Hidden variable by which omp hands its answer to a child process that is omp (a subprocess
+ * worker, its launch broker, an omp daemon the broker runs),
+ * `{"dir":…,"parent":…,"parentStart":…,"inputs":{…}}`. Only this module reads it, and
+ * `PI_NATIVES_DIR` stays as omp was started with it, so the commands such a child runs never
+ * carry the directory.
+ *
+ * A process takes the answer only when it is the one it was written for:
+ * - `inputs`, the values the rule reads ({@link nativesDirInputs}), match its own
+ *   environment, so a program started with a home or directory variables of its own resolves
+ *   its own directory;
+ * - `parent` is the process that started it: its parent now, or, after that parent exited and
+ *   it was re-parented, a recorded parent (`parent` and its start time `parentStart`) that no
+ *   longer runs. A program the child starts (one the agent's code starts in the JS eval kernel,
+ *   say) resolves for itself even with the same environment, since the recorded parent still
+ *   runs.
+ */
+export const NATIVES_DIR_HANDOFF_ENV_KEY = "__PI_NATIVES_DIR_HANDOFF";
+
+/**
+ * The {@link NATIVES_DIR_HANDOFF_ENV_KEY} value for a child process whose environment is `env`
+ * (its values of the rule's inputs are recorded from it): this process's answer, or `dir`, for
+ * a process whose parent is `parent` (this process's pid).
+ * @param {Record<string, string | undefined>} env
+ * @param {{ parent: number; dir?: string }} options
+ * @returns {string}
+ */
+export function nativesDirHandoff(env, { parent, dir = getNativesDir() }) {
+	const parentStart = processStartTime(parent === process.pid ? "self" : parent) ?? null;
+	return JSON.stringify({ dir, parent, parentStart, inputs: nativesDirInputs(env) });
+}
+
+/**
+ * Whether the process a handoff names as the child's parent started this process: it is this
+ * process's parent, or it no longer runs (it exited, and this process was re-parented). A
+ * recorded parent that still runs and is not this process's parent started another process.
+ * On Linux a process has stopped running once it is a zombie (`Z`, exited but not yet waited
+ * for by its own parent, which can take a while) or dead (`X`), and a pid another process
+ * reuses carries another start time. Elsewhere only `kill(pid, 0)` tells, and a zombie counts
+ * as running there, so a child re-parented while its old parent is unreaped resolves for itself.
+ * @param {{ parent: unknown; parentStart?: unknown }} handoff
+ * @param {number} ppid this process's parent now
+ */
+function isStartedByRecordedParent(handoff, ppid) {
+	const { parent, parentStart } = handoff;
+	if (parent === ppid) return true;
+	if (!Number.isInteger(parent) || parent <= 0) return false;
+	if (typeof parentStart === "string" && process.platform === "linux") {
+		const stat = processStat(parent);
+		return stat === undefined || stat.state === "Z" || stat.state === "X" || stat.start !== parentStart;
+	}
+	return !isLiveProcess(parent);
+}
+
+/**
+ * The directory a {@link NATIVES_DIR_HANDOFF_ENV_KEY} value hands over, or undefined for a
+ * value this module did not write (an empty one included). With `addressee`, also undefined
+ * unless the value was written for a process whose environment is `env` and whose parent is,
+ * or was, the recorded one.
+ * @param {string | undefined} value
+ * @param {{ env: Record<string, string | undefined>; ppid: number }} [addressee]
+ * @returns {string | undefined}
+ */
+export function nativesDirHandoffDir(value, addressee) {
+	let handoff;
+	try {
+		handoff = JSON.parse(value || "null");
+	} catch {
+		return undefined;
+	}
+	if (typeof handoff?.dir !== "string" || !path.isAbsolute(handoff.dir)) return undefined;
+	if (!addressee) return handoff.dir;
+	if (!isStartedByRecordedParent(handoff, addressee.ppid)) return undefined;
+	const recorded = handoff.inputs;
+	if (recorded === null || typeof recorded !== "object") return undefined;
+	const own = nativesDirInputs(addressee.env);
+	const names = Object.keys(own);
+	if (Object.keys(recorded).length !== names.length) return undefined;
+	for (const name of names) {
+		if (!(name in recorded) || own[name] !== recorded[name]) return undefined;
+	}
+	return handoff.dir;
+}
+
+/**
+ * The natives directory: the native addon's cached copies (`<dir>/<version>-<digest prefix>`
+ * per compiled build and per Windows install's leaf package) and the
+ * tree-sitter grammars the agent downloads (`<dir>/grammars`). The addon loader and
+ * `@oh-my-pi/pi-utils` both call this, so the grammars the agent installs are the ones the
+ * addon loads.
+ *
+ * It is one directory per process, never per profile: the first call resolves it, and every
+ * later call in that process and its worker threads returns the same answer. The addon loads
+ * once per path, so a second directory would load a second copy of the addon into the
+ * process, and the grammars the agent downloads would go where the addon does not look. omp
+ * first loads the addon before it reads `.env` files, so set a directory variable in the
+ * environment: omp's own `.env` loading never applies `PI_NATIVES_DIR`, and another directory
+ * variable set in a `.env` file does not move the natives directory. (Bun's own `.env` loading,
+ * in a non-compiled omp, runs before any omp code: what it applies counts as the environment
+ * omp was started with.) A child process that is omp takes its parent's answer from a handoff
+ * ({@link NATIVES_DIR_HANDOFF_ENV_KEY}); any other child resolves for itself. The first call
+ * reads, in order:
+ * 1. `PI_NATIVES_DIR`;
+ * 2. `<OMP_DOWNLOAD_ROOT>/natives`;
+ * 3. on Linux and macOS, `$XDG_CACHE_HOME/omp/natives` when `$XDG_CACHE_HOME/omp` exists;
+ * 4. `<config root>/natives`, where the config root is `OMP_CONFIG_ROOT`, else
+ *    `~/<PI_CONFIG_DIR>` (default `~/.omp`).
+ * Each override is trimmed and `~`-expanded; an empty or relative value is ignored.
+ * @returns {string}
+ */
+export function getNativesDir() {
+	if (processNativesDir !== undefined) return processNativesDir;
+	// The answer of the thread that started this worker thread, if any.
+	const inherited = getEnvironmentData(NATIVES_DIR_THREAD_DATA_KEY);
+	if (typeof inherited?.dir === "string") return adopt(inherited.dir, inherited.startedWithHandoff === true);
+	const value = process.env[NATIVES_DIR_HANDOFF_ENV_KEY];
+	const handedOver = nativesDirHandoffDir(value, { env: process.env, ppid: process.ppid });
+	// Read once: the children this process starts with `process.env` must not take it. A
+	// spawn with no `env`, and the native shell, start from the startup environment, which
+	// keeps it: commands get it empty (`filterChildShellEnv`, when
+	// {@link startedWithNativesDirHandoff}); a program started with no `env` keeps it, which the
+	// parent check refuses while the recorded parent runs.
+	delete process.env[NATIVES_DIR_HANDOFF_ENV_KEY];
+	return adopt(handedOver ?? resolveNativesDir(nativesDirInputs(process.env)), Boolean(value));
+}
+
+/**
+ * Whether this process was started with a natives-directory handoff, taken or not (an omp
+ * worker, its launch broker, an omp daemon), in this thread or in the process's main thread:
+ * the environment its native shell and its spawns with no `env` start from then holds one,
+ * which a command must not carry. Resolves the directory first, if no call has yet.
+ * @returns {boolean}
+ */
+export function startedWithNativesDirHandoff() {
+	getNativesDir();
+	return startedWithHandoff;
+}
+
+/** Forget this process's answer, so a test can resolve again from a changed environment. */
+export function __resetNativesDirForTests() {
+	processNativesDir = undefined;
+	startedWithHandoff = false;
+	setEnvironmentData(NATIVES_DIR_THREAD_DATA_KEY, undefined);
+}

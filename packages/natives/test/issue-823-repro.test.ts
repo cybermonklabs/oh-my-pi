@@ -51,11 +51,13 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 				embeddedAddon: {
 					platformTag: "linux-x64",
 					version: "14.5.2",
+					digest: "0".repeat(64),
 					files: [
 						{
 							variant: "modern",
 							filename: "pi_natives.linux-x64-modern.node",
 							size: 1,
+							sha256: "0".repeat(64),
 							zstdPath: "/$bunfs/root/pi_natives.linux-x64-modern-a1b2c3d4.node.zst",
 						},
 					],
@@ -199,8 +201,20 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 			await Bun.write(baselineZstdPath, Bun.zstdCompressSync(baseline));
 
 			const files: EmbeddedAddonFile[] = [
-				{ variant: "modern", filename: modernFilename, size: modern.length, zstdPath: modernZstdPath },
-				{ variant: "baseline", filename: baselineFilename, size: baseline.length, zstdPath: baselineZstdPath },
+				{
+					variant: "modern",
+					filename: modernFilename,
+					size: modern.length,
+					sha256: new Bun.CryptoHasher("sha256").update(modern).digest("hex"),
+					zstdPath: modernZstdPath,
+				},
+				{
+					variant: "baseline",
+					filename: baselineFilename,
+					size: baseline.length,
+					sha256: new Bun.CryptoHasher("sha256").update(baseline).digest("hex"),
+					zstdPath: baselineZstdPath,
+				},
 			];
 
 			const written = extractEmbeddedAddons({ files, targetDir });
@@ -220,7 +234,13 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 			const zstdPath = path.join(testDir, "pi_natives.linux-arm64.node.zst");
 			await Bun.write(zstdPath, Bun.zstdCompressSync(Buffer.from("addon")));
 			const files: EmbeddedAddonFile[] = [
-				{ variant: "default", filename: "pi_natives.linux-arm64.node", size: 6, zstdPath },
+				{
+					variant: "default",
+					filename: "pi_natives.linux-arm64.node",
+					size: 6,
+					sha256: new Bun.CryptoHasher("sha256").update("addon").digest("hex"),
+					zstdPath,
+				},
 			];
 
 			expect(() => extractEmbeddedAddons({ files, targetDir: testDir })).toThrow(

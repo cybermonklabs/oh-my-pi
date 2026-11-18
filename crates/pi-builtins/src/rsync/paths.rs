@@ -701,6 +701,43 @@ pub(crate) fn trusted_owner(_uid: u32) -> bool {
 	true
 }
 
+/// Test support: whether this process can give a file to another user
+/// ([`ANOTHER_USER`]), which the tests of the real ownership rule need to
+/// plant a symlink [`trusted_owner`] refuses. Root can, except in a user
+/// namespace that maps no other uid (Bazel's linux-sandbox, `unshare -r`):
+/// there `lchown` to an unmapped id fails with `EINVAL`, and no file of
+/// another user can exist. A test that cannot plant one says so: a "not
+/// run" line written to the process's stderr itself, past libtest's
+/// capture, so it shows in the log of a passing run too.
+#[cfg(all(test, unix))]
+pub(crate) fn can_give_files_away(test: &str) -> bool {
+	use std::io::Write as _;
+
+	let can = effective_uid() == Some(0) && {
+		let dir = tempfile::tempdir().unwrap();
+		let probe = dir.path().join("probe");
+		std::os::unix::fs::symlink("probe", &probe).unwrap();
+		match std::os::unix::fs::lchown(&probe, Some(ANOTHER_USER), Some(ANOTHER_USER)) {
+			Ok(()) => true,
+			Err(error) if error.raw_os_error() == Some(libc::EINVAL) => false,
+			Err(error) => panic!("lchown {}: {error}", probe.display()),
+		}
+	};
+	if !can {
+		// One line, whole: the lock keeps other threads' writes out of it.
+		let _ = writeln!(
+			io::stderr().lock(),
+			"{test}: not run: this process cannot give a file to uid {ANOTHER_USER} (not root, or root in a user \
+			 namespace that maps no other uid)"
+		);
+	}
+	can
+}
+
+/// The uid and gid the ownership tests give their planted symlinks.
+#[cfg(all(test, unix))]
+pub(crate) const ANOTHER_USER: u32 = 65534;
+
 /// Advances the tracked absolute path by one resolved element.
 #[cfg(unix)]
 fn abspath_step(abspath: &mut Vec<u8>, comp: &[u8]) -> io::Result<()> {
@@ -1268,6 +1305,14 @@ mod tests {
 		owner_walk_open(path.as_os_str().as_bytes(), flags, 0o600, &walk)
 	}
 
+	/// A trust rule that refuses whoever owns `link`, the test's own symlink.
+	/// A rule that trusts only root would trust that symlink when the tests
+	/// run as root, so the rule names the owner the symlink really has.
+	fn distrusting_the_owner_of(link: &Path) -> impl Fn(u32) -> bool + use<> {
+		let owner = std::os::unix::fs::MetadataExt::uid(&fs::symlink_metadata(link).unwrap());
+		move |uid| uid != owner
+	}
+
 	#[test]
 	fn operator_walk_follows_own_symlinks_and_refuses_untrusted_ones() {
 		let (_guard, base) = canonical_tempdir();
@@ -1281,16 +1326,17 @@ mod tests {
 		let text = std::io::read_to_string(std::fs::File::from(fd)).unwrap();
 		assert_eq!(text, "- *.o\n");
 
-		// A walk that trusts only root rejects our symlinks: parent component…
-		let only_root = |uid: u32| uid == 0;
-		let err = walk_bytes(&base.join("link/rules"), &only_root, libc::O_RDONLY).unwrap_err();
+		// A walk that does not trust our symlinks' owner rejects them: parent
+		// component…
+		let strict = distrusting_the_owner_of(&base.join("link"));
+		let err = walk_bytes(&base.join("link/rules"), &strict, libc::O_RDONLY).unwrap_err();
 		assert!(is_untrusted_symlink(&err));
 		assert_eq!(os_errno(&err), Some(libc::ELOOP));
 		// …and leaf.
-		let err = walk_bytes(&base.join("real/leaf"), &only_root, libc::O_RDONLY).unwrap_err();
+		let err = walk_bytes(&base.join("real/leaf"), &strict, libc::O_RDONLY).unwrap_err();
 		assert!(is_untrusted_symlink(&err));
 		// Real directories still work under the strict rule.
-		assert!(walk_bytes(&base.join("real/rules"), &only_root, libc::O_RDONLY).is_ok());
+		assert!(walk_bytes(&base.join("real/rules"), &strict, libc::O_RDONLY).is_ok());
 	}
 
 	#[test]
@@ -1299,11 +1345,11 @@ mod tests {
 		fs::create_dir(base.join("logs")).unwrap();
 		fs::create_dir(base.join("victim")).unwrap();
 		symlink("victim", base.join("planted")).unwrap();
-		let only_root = |uid: u32| uid == 0;
+		let strict = distrusting_the_owner_of(&base.join("planted"));
 		let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND;
-		walk_bytes(&base.join("logs/new.log"), &only_root, flags).unwrap();
+		walk_bytes(&base.join("logs/new.log"), &strict, flags).unwrap();
 		assert!(base.join("logs/new.log").exists());
-		let err = walk_bytes(&base.join("planted/evil.log"), &only_root, flags).unwrap_err();
+		let err = walk_bytes(&base.join("planted/evil.log"), &strict, flags).unwrap_err();
 		assert!(is_untrusted_symlink(&err));
 		assert!(!base.join("victim/evil.log").exists());
 	}
