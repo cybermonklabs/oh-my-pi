@@ -1,5 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
-import { logger, nextSlice, runInSlices, runToCompletion, sliceExpired, VERSION } from "@oh-my-pi/pi-utils";
+import { logger, mapInSlices, nextSlice, runInSlices, runToCompletion, sliceExpired, VERSION } from "@oh-my-pi/pi-utils";
 import { buildModel } from "./build";
 import { collapseBuiltVariants } from "./compat/collapse";
 import { applyCatalogMetrics, CatalogMetricsIndex } from "./identity/metrics";
@@ -196,7 +196,7 @@ interface CachedHeaderRestoreResult<TApi extends Api> {
  * safely without persisting arbitrary credential values; callers must refetch
  * them online or omit them rather than return a broken model.
  */
-function restoreCachedModelHeaders<TApi extends Api>(
+async function restoreCachedModelHeaders<TApi extends Api>(
 	cachedModels: readonly Model<TApi>[],
 	staticModels: readonly Model<TApi>[],
 	headerOmittedModelIds: readonly string[],
@@ -204,7 +204,7 @@ function restoreCachedModelHeaders<TApi extends Api>(
 	legacyHeaderRestoreMarkers: boolean,
 	restorableHeaderFallback: Record<string, string> | undefined,
 	restoreCachedHeaders: ModelManagerOptions<TApi>["restoreCachedHeaders"],
-): CachedHeaderRestoreResult<TApi> {
+): Promise<CachedHeaderRestoreResult<TApi>> {
 	if (headerOmittedModelIds.length === 0) {
 		return { models: [...cachedModels], unresolvedModelIds: new Set() };
 	}
@@ -212,7 +212,8 @@ function restoreCachedModelHeaders<TApi extends Api>(
 	const unrestorableIds = new Set(unrestorableHeaderModelIds);
 	const staticById = new Map(staticModels.map(model => [model.id, model]));
 	const unresolvedModelIds = new Set<string>();
-	const restored = cachedModels.map(model => {
+	// One unit per cached row: a catalog can hold thousands.
+	const restored = await mapInSlices(cachedModels, model => {
 		if (!omittedIds.has(model.id)) return model;
 		const unrestorable = unrestorableIds.has(model.id);
 		// Current unrestorable markers prove that neither same-id nor request-model
@@ -275,8 +276,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const cache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
 	const dynamicModelsAuthoritative = options.dynamicModelsAuthoritative ?? false;
 	const isAuthoritativeDynamicCache = dynamicModelsAuthoritative && (cache?.payloadAuthoritative ?? false);
-	while (sliceExpired()) await nextSlice();
-	const restoredCache = restoreCachedModelHeaders(
+	const restoredCache = await restoreCachedModelHeaders(
 		cache?.models ?? [],
 		staticModels,
 		cache?.headerOmittedModelIds ?? [],
@@ -454,7 +454,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			// immediately (#10964).
 			while (sliceExpired()) await nextSlice();
 			const latestCache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
-			const latestRestoredCache = restoreCachedModelHeaders(
+			const latestRestoredCache = await restoreCachedModelHeaders(
 				latestCache?.models ?? cache?.models ?? [],
 				staticModels,
 				latestCache?.headerOmittedModelIds ?? cache?.headerOmittedModelIds ?? [],
