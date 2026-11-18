@@ -6,7 +6,6 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { IrcBus } from "../../src/irc/bus";
-import { isQueuedMessage } from "../../src/modes/rpc/rpc-mode";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentSession } from "../../src/session/agent-session";
@@ -271,21 +270,20 @@ describe("agent bridging across subagent workers", () => {
 		const { probe } = await startWorker();
 		await probe.open("W1", {});
 		const remote = mirrorOf(liveRef("W1").session);
-		const ended: UserMessage[] = [];
-		remote.subscribe(event => {
-			if (event.type === "message_end" && event.message.role === "user") ended.push(event.message);
-		});
 		const reported: UserMessage[] = [];
-		const queueNextRunSteer = (text: string) =>
+		const taken: string[] = [];
+		const queueNextRunSteer = (text: string, queueId: string) =>
 			remote.steer(text, undefined, {
 				holdUntilNextRun: true,
+				queueId,
+				onTaken: () => taken.push(queueId),
 				onPromptQueued: messages => {
 					const message = messages.at(-1);
 					if (message?.role === "user") reported.push(message);
 				},
 			});
 
-		await queueNextRunSteer("Take this back.");
+		await queueNextRunSteer("Take this back.", "only");
 		await waitFor(() => reported.length === 1);
 		expect(reported[0]).toMatchObject({
 			role: "user",
@@ -294,17 +292,21 @@ describe("agent bridging across subagent workers", () => {
 		});
 		// The steer waits on the queue: no turn ran for it.
 		expect(await probe.settled("W1")).toEqual({ messageCount: 0, steering: ["Take this back."] });
-		expect(await remote.removeQueuedMessage("Take this back.", "steering")).toBe(true);
+		expect(await remote.removeQueuedMessage({ queueId: "only" }, "steering")).toBe(true);
 		expect(await probe.settled("W1")).toEqual({ messageCount: 0, steering: [] });
-		expect(await remote.removeQueuedMessage("Take this back.", "steering")).toBe(false);
+		expect(await remote.removeQueuedMessage({ queueId: "only" }, "steering")).toBe(false);
 
-		await queueNextRunSteer("Also check the README.");
-		await waitFor(() => reported.length === 2);
+		// Two steers of the same text are two messages on the home worker: the
+		// take-back by name removes the second, and the run takes the first.
+		await queueNextRunSteer("Also check the README.", "first");
+		await queueNextRunSteer("Also check the README.", "second");
+		expect(await remote.removeQueuedMessage({ queueId: "second" }, "steering")).toBe(true);
+		expect(await probe.settled("W1")).toEqual({ messageCount: 0, steering: ["Also check the README."] });
 		expect(await remote.prompt("Submit your result.")).toBe(true);
-		// The run that takes the steer reports it as a copy matching what onPromptQueued reported.
-		await waitFor(() => ended.some(message => isQueuedMessage(message, reported[1]!)));
-		expect(ended.some(message => isQueuedMessage(message, reported[0]!))).toBe(false);
+		await waitFor(() => taken.length === 1);
+		expect(taken).toEqual(["first"]);
 		expect(await probe.settled("W1")).toMatchObject({ steering: [] });
+		expect(taken).toEqual(["first"]);
 	}, 60_000);
 
 	it("queues and takes back a next-run steer on a main-homed session through a worker's peer handle", async () => {
@@ -321,9 +323,14 @@ describe("agent bridging across subagent workers", () => {
 				content: [{ type: "text", text: "Take this back." }],
 			}),
 			removed: true,
+			removedAgain: false,
 		});
+		// Of the two steers of that text, the one the take-back named is gone and the other waits.
+		expect(main.agent.peekSteeringQueue()).toHaveLength(1);
+		expect(await main.prompt("Submit your result.")).toBe(true);
 		await main.waitForIdle();
-		expect(main.messages).toEqual([]);
+		await waitFor(async () => (await probe.peerTaken()).length === 1);
+		expect(await probe.peerTaken()).toEqual(["kept"]);
 		expect(main.agent.peekSteeringQueue()).toEqual([]);
 	}, 60_000);
 });

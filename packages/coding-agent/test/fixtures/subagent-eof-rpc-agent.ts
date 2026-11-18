@@ -15,7 +15,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runRpcMode } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
-import type { SteerOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
+import type { QueuedMessageTarget, SteerOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { type SubagentLifecyclePayload, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
@@ -55,7 +55,8 @@ const { session } = await createAgentSession({
 
 const id = "Worker";
 const sessionFile = path.join(cwd, `${id}.jsonl`);
-const queued: string[] = [];
+/** Queued next-run steers: each one's text and the name its sender gave it. */
+const queued: Array<{ text: string; queueId?: string }> = [];
 AgentRegistry.global().register({
 	id,
 	displayName: id,
@@ -65,23 +66,16 @@ AgentRegistry.global().register({
 	session: {
 		subscribe: () => () => {},
 		steer: async (text: string, _images: unknown, options?: SteerOptions) => {
-			queued.push(text);
-			options?.onPromptQueued?.([
-				{
-					role: "user",
-					content: [{ type: "text", text }],
-					steering: true,
-					attribution: "user",
-					timestamp: Date.now(),
-				},
-			]);
+			queued.push({ text, queueId: options?.queueId });
 			note(`queued ${text}`);
 		},
-		removeQueuedMessage: (text: string) => {
-			const index = queued.indexOf(text);
+		removeQueuedMessage: (target: QueuedMessageTarget) => {
+			const index = queued.findIndex(steer =>
+				typeof target === "string" ? steer.text === target : steer.queueId === target.queueId,
+			);
 			if (index < 0) return false;
-			queued.splice(index, 1);
-			note(`taken back ${text}`);
+			const [steer] = queued.splice(index, 1);
+			note(`taken back ${steer.text}`);
 			return true;
 		},
 		prompt: async () => {

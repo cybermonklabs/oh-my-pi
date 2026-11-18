@@ -69,10 +69,16 @@ export interface AgentsProbe {
 	/** Once the local session of `id` settled: its message count and the texts on its steering queue. */
 	settled(id: string): Promise<{ messageCount: number; steering: string[] }>;
 	/**
-	 * Through the peer handle of `id` (homed elsewhere): queue `text` as a next-run steer,
-	 * then take it back. Reports what `onPromptQueued` delivered here and the take-back.
+	 * Through the peer handle of `id` (homed elsewhere): queue `text` twice as next-run
+	 * steers named `kept` and `taken back`, then take back `taken back` by name, twice.
+	 * Reports what `onPromptQueued` delivered here for the first and both take-backs.
 	 */
-	peerQueueAndTakeBackNextRunSteer(id: string, text: string): Promise<{ reported: unknown; removed: boolean }>;
+	peerQueueAndTakeBackNextRunSteer(
+		id: string,
+		text: string,
+	): Promise<{ reported: unknown; removed: boolean; removedAgain: boolean }>;
+	/** Names of the steers queued by {@link peerQueueAndTakeBackNextRunSteer} that a run took, in order. */
+	peerTaken(): Promise<string[]>;
 }
 
 /** Test-only boot globals of the probe service. */
@@ -87,6 +93,8 @@ const sessions = new Map<string, AgentSession>();
 const byKey = new Map<string, AgentSession>();
 const grabbed = new Map<string, AgentRef>();
 const peerSeen: { events: string[]; runStates: string[] } = { events: [], runStates: [] };
+/** Names of the peer steers a run took (see `peerQueueAndTakeBackNextRunSteer`). */
+const peerTaken: string[] = [];
 let threadName = "";
 let gate = Promise.withResolvers<void>();
 let gateOpen = false;
@@ -238,12 +246,21 @@ const probe: AgentsProbe = {
 		const session = AgentRegistry.global().get(id)?.session;
 		if (!session) throw new Error(`no session for ${id}`);
 		const reported = Promise.withResolvers<unknown>();
-		await session.steer(text, undefined, {
-			holdUntilNextRun: true,
-			onPromptQueued: messages => reported.resolve(messages.at(-1)),
-		});
-		return { reported: await reported.promise, removed: await session.removeQueuedMessage(text, "steering") };
+		for (const queueId of ["kept", "taken back"]) {
+			await session.steer(text, undefined, {
+				holdUntilNextRun: true,
+				queueId,
+				onTaken: () => peerTaken.push(queueId),
+				onPromptQueued: messages => reported.resolve(messages.at(-1)),
+			});
+		}
+		return {
+			reported: await reported.promise,
+			removed: await session.removeQueuedMessage({ queueId: "taken back" }, "steering"),
+			removedAgain: await session.removeQueuedMessage({ queueId: "taken back" }, "steering"),
+		};
 	},
+	peerTaken: async () => [...peerTaken],
 };
 
 function isProbeGlobals(value: unknown): value is AgentsProbeGlobals {

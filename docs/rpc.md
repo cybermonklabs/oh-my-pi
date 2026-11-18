@@ -1144,7 +1144,9 @@ Isolated (worktree) subagents run in-process and are steered the same way.
 
 The response arrives once the message is accepted: for a mid-turn subagent,
 queued into the running turn or its new turn started; for a subagent between
-turns, once its next turn has taken the message into its context. It does
+turns, once its next turn has taken the message into its context. Each
+`steer_subagent` answers for its own message: two sent with the same text are
+two messages, and a turn that takes one answers only that one. It does
 not wait for the turn to finish. Like `prompt`, the command starts in queue
 order but waits for acceptance in the background, so later commands
 (including `abort`) are not held behind it. For a mid-turn subagent, as in

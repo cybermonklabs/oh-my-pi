@@ -546,7 +546,27 @@ export interface SteerOptions {
 	 * races the prompt of whoever drives the session (the task executor for a subagent).
 	 */
 	holdUntilNextRun?: boolean;
+	/**
+	 * A name for the queued message, unique within the session: the take-back
+	 * `removeQueuedMessage({ queueId }, "steering")` removes exactly this message,
+	 * whatever else is queued with the same text. A name rather than the message
+	 * object, so it survives the copies a session homed on another thread hands across.
+	 */
+	queueId?: string;
+	/**
+	 * Called once, when a run takes exactly this queued message into its context
+	 * (the session emits its `message_end`); never for another message with the
+	 * same text, and not at all if the message is taken back first.
+	 */
+	onTaken?: () => void;
 }
+
+/**
+ * The queued message a take-back removes: the first whose submitted text (or
+ * queued chip text) is the string, or exactly the message a steer named with
+ * {@link SteerOptions.queueId}.
+ */
+export type QueuedMessageTarget = string | { readonly queueId: string };
 
 /** Options for AgentSession.sendUserMessage(). */
 export interface SendUserMessageOptions {

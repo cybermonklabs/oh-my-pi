@@ -13,8 +13,8 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Model, UserMessage } from "@oh-my-pi/pi-ai";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
@@ -913,22 +913,6 @@ export async function handleRpcSteerSubagent(
 	}
 }
 
-function isUserMessage(message: AgentMessage): message is UserMessage {
-	return message.role === "user";
-}
-
-/**
- * Whether `emitted` (a session's `message_end` message) is `queued` (the
- * message `onPromptQueued` reported) as a run took it off the steering queue:
- * the same object, or the equal copy a session homed on another thread
- * forwards. The subagent steer counts a delivery only on this match.
- */
-export function isQueuedMessage(emitted: UserMessage, queued: UserMessage): boolean {
-	return (
-		emitted === queued || (emitted.timestamp === queued.timestamp && Bun.deepEquals(emitted.content, queued.content))
-	);
-}
-
 /**
  * Steer a subagent idle between its turns. Starting a turn here would race the
  * prompt its executor sends next (a yield reminder) into `AgentBusyError`, so
@@ -937,14 +921,16 @@ export function isQueuedMessage(emitted: UserMessage, queued: UserMessage): bool
  * carries it into its first model call. Like RPC `steer`, this rejects
  * extension commands and expands prompt templates.
  *
- * Resolves once the subagent's session emits the queued user message itself
- * (`message_end`), which a run does when its steering poll takes the message
- * into its context. When the subagent stops being reachable first (its result
- * accepted, cancelled, aborted, or its run ended without another turn), or
- * `shutdown` aborts, the message is taken back off the queue, so no later turn
- * delivers it, and the steer answers an error. A message neither taken back
- * nor seen delivered (someone else removed it, or the session is gone) answers
- * an error too.
+ * The queued message is named (`SteerOptions.queueId`) and followed by its own
+ * identity, never by its text or timestamp: two steers of the same text sent
+ * in one millisecond are two messages. Resolves once a run takes exactly this
+ * message into its context (`SteerOptions.onTaken`, reported by the subagent's
+ * session, wherever it is homed). When the subagent stops being reachable
+ * first (its result accepted, cancelled, aborted, or its run ended without
+ * another turn), or `shutdown` aborts, exactly this message is taken back off
+ * the queue, so no later turn delivers it, and the steer answers an error. A
+ * message neither taken back nor seen delivered (someone else removed it, or
+ * the session is gone) answers an error too.
  */
 async function steerSubagentBetweenTurns(
 	subagentRegistry: RpcSteerSubagentRegistry,
@@ -953,10 +939,6 @@ async function steerSubagentBetweenTurns(
 	message: string,
 	shutdown: AbortSignal | undefined,
 ): Promise<string | undefined> {
-	/** The user message the session queued for this steer, once it reports it. */
-	let queued: UserMessage | undefined;
-	/** User messages the session emitted before reporting `queued` (a callback across threads can trail them). */
-	const emittedBeforeQueued: UserMessage[] = [];
 	let delivered = false;
 	const outcome = Promise.withResolvers<"delivered" | "ended">();
 	const markDelivered = () => {
@@ -967,36 +949,22 @@ async function steerSubagentBetweenTurns(
 	const runEnded = `Subagent's run ended before the message reached it: ${subagentId}`;
 	// A shutdown already under way queues nothing.
 	if (shutdown?.aborted) return runEnded;
+	const queueId = crypto.randomUUID();
 	const checkReachable = () => {
 		const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
 		if (current?.ref !== owned.ref || current.session !== owned.session) end();
 	};
-	// Subscribe before queueing, so the run that takes the message, or a
-	// shutdown that lands while it is queued, cannot be missed.
+	// Subscribe before queueing, so a shutdown or an end of the run that lands
+	// while the message is queued cannot be missed.
 	shutdown?.addEventListener("abort", end, { once: true });
 	const unsubscribers = [
-		owned.session.subscribe(event => {
-			if (event.type !== "message_end" || !isUserMessage(event.message)) return;
-			if (!queued) emittedBeforeQueued.push(event.message);
-			else if (isQueuedMessage(event.message, queued)) markDelivered();
-		}),
 		subagentRegistry.onChange(checkReachable),
 		AgentRegistry.global().onChange(checkReachable),
 		() => shutdown?.removeEventListener("abort", end),
 	];
 	try {
 		try {
-			await owned.session.steer(message, undefined, {
-				holdUntilNextRun: true,
-				onPromptQueued: group => {
-					const userMessage = group.findLast(isUserMessage);
-					queued = userMessage;
-					if (userMessage && emittedBeforeQueued.some(emitted => isQueuedMessage(emitted, userMessage))) {
-						markDelivered();
-					}
-					emittedBeforeQueued.length = 0;
-				},
-			});
+			await owned.session.steer(message, undefined, { holdUntilNextRun: true, queueId, onTaken: markDelivered });
 		} catch (err) {
 			return `Subagent refused the message: ${err instanceof Error ? err.message : String(err)}`;
 		}
@@ -1004,13 +972,13 @@ async function steerSubagentBetweenTurns(
 		if ((await outcome.promise) === "delivered") return undefined;
 		let withdrawn = false;
 		try {
-			withdrawn = await owned.session.removeQueuedMessage(message, "steering");
+			withdrawn = await owned.session.removeQueuedMessage({ queueId }, "steering");
 		} catch (err) {
 			logger.debug("steer_subagent could not take back a queued message", { subagentId, error: String(err) });
 		}
 		if (withdrawn) return runEnded;
-		// The session reports its events before it answers the take-back, so a
-		// delivery that raced the end of the run is known by now.
+		// The session reports a run taking the message before it answers the
+		// take-back, so a delivery that raced the end of the run is known by now.
 		if (delivered) return undefined;
 		return `The message was not delivered to subagent: ${subagentId}`;
 	} finally {
