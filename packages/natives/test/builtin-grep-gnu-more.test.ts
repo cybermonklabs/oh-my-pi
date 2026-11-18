@@ -57,7 +57,11 @@ describe("builtin grep: repetition operators", () => {
 		// Regressed: the same in a BRE.
 		[String.raw`printf 'b\n' | grep -c 'a\{,2\}' 2>/dev/null`, "1\n", 0],
 		// Regressed: an unterminated `{1` stops grep with exit 2 instead of being a literal.
-		[String.raw`printf 'x\n' | grep -cE 'a{1' 2>/dev/null`, "0\n", 1],
+		[String.raw`printf 'a{1\n' | grep -cE 'a{1' 2>/dev/null`, "1\n", 0],
+		// Regressed: `{,}` is matched as the literal text; GNU reads it as `{0,}`.
+		[String.raw`printf 'b\n' | grep -cE 'a{,}' 2>/dev/null`, "1\n", 0],
+		// Regressed: the same in a BRE is refused as "Unmatched \{".
+		[String.raw`printf 'b\n' | grep -c 'a\{,\}' 2>/dev/null`, "1\n", 0],
 		// Regressed: an unmatched `)` in an ERE stops grep with exit 2 instead of being a literal.
 		[String.raw`printf 'a)\n' | grep -cE 'a)' 2>/dev/null`, "1\n", 0],
 		// Regressed: a leading `\{` in a BRE stops grep with exit 2 instead of being a literal.
@@ -77,6 +81,19 @@ describe("builtin grep: back-references and BRE syntax errors", () => {
 		[String.raw`printf 'x\n' | grep -c 'a\{2' 2>/dev/null`, "", 2],
 		// Regressed: a back-reference to no group is searched as text with exit 1 instead of refused.
 		[String.raw`printf 'x\n' | grep -c '\1' 2>/dev/null`, "", 2],
+		// Regressed: a back-reference to a group of another branch is searched instead of refused.
+		[String.raw`printf 'bb\n' | grep -c '\(a\)\|\(b\)\1' 2>/dev/null`, "", 2],
+		// Regressed: each branch searched alone renumbered its groups, and `-o` printed `bcc`.
+		[String.raw`printf 'bcc\n' | grep -o '\(b\)\|\(b\)\(c\)\2' 2>/dev/null`, "b\n", 0],
+	]);
+});
+
+describe("builtin grep: bracket expressions with colons", () => {
+	cases([
+		// Regressed: a range between the colons is refused as a class name without its brackets.
+		[String.raw`printf 'a:\n' | grep -c '[:a-z:]' 2>/dev/null`, "1\n", 0],
+		// Regressed: so is a class between the colons.
+		[String.raw`printf 'a:\n' | grep -c '[:[:digit:]:]' 2>/dev/null`, "1\n", 0],
 	]);
 });
 
@@ -96,16 +113,24 @@ describe("builtin grep: input and options beside the pattern", () => {
 		// Regressed: -w with non-ASCII letters counts no line; GNU counts one in the C and C.UTF-8 locales.
 		["printf '\u00c0B\\n\u00df\\n' | grep -cw '[[:alpha:]]' 2>/dev/null", "1\n", 0],
 		// Regressed: a line holding a NUL byte is printed raw on stdout instead of "binary file matches" on stderr.
-		["grep x bin 2>/dev/null", "", 0],
+		["grep x bin 2>&1", "grep: bin: binary file matches\n", 0],
 		// Regressed: a NUL byte does not end a line of a binary file, so the count is 3.
 		["grep -c . bin 2>/dev/null", "4\n", 0],
 		// Regressed: -s does not silence "Is a directory".
 		["grep -s zz . f1 2>&1", "f1:zz\n", 2],
 		// Regressed: an abbreviated long option is refused with exit 2.
 		["grep --regex=zz in 2>/dev/null", "zz\n", 0],
+		// Regressed: `--before-context` was missing from the abbreviations, so `--bef 1` is refused.
+		["grep --bef 1 zz in 2>/dev/null", "x\nzz\n", 0],
+		// Regressed: the same with `=`.
+		["grep --be=1 zz in 2>/dev/null", "x\nzz\n", 0],
+		// Regressed: `--col` names `--color` and its alias `--colour`, one option, but is refused as ambiguous.
+		["grep --col=never zz in 2>/dev/null", "zz\n", 0],
 		// Regressed: a negative -m other than -1 is refused with exit 2.
 		["grep -m -2 x in 2>/dev/null", "x\n", 0],
 		// Regressed: -v -m -1 prints every other line where GNU selects none.
 		["grep -v -m -1 x in 2>/dev/null", "", 1],
+		// Regressed: a negative -m is refused as reading the output file, which GNU reads as it reads -m1.
+		["printf 'x\\nmid\\n' > g; grep -m -2 x g >>g 2>/dev/null; cat g", "x\nmid\nx\n", 0],
 	]);
 });

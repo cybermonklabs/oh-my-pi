@@ -75,9 +75,15 @@ pub(crate) enum BreError {
 	RangeEndInvalid,
 	/// A `\{` that opens no interval where an interval must follow.
 	BraceUnmatched,
-	/// An interval with nothing to repeat, which `sed` refuses where `grep`
-	/// matches the text itself.
+	/// A repetition operator with nothing to repeat, or one more repetition
+	/// than the dialect allows, which `sed` refuses where `grep` reads the
+	/// text itself or drops the operator.
 	RepetitionOperandMissing,
+	/// A `)` or `\)` that closes no group, where the dialect refuses one.
+	ParenUnmatched,
+	/// A back-reference to a group that has not closed in the branch it is
+	/// in, or to none at all.
+	BackReferenceInvalid,
 	/// A pattern that ends in a backslash.
 	TrailingBackslash,
 }
@@ -92,7 +98,9 @@ impl BreError {
 			Self::CollationInvalid => "Invalid collation character",
 			Self::RangeEndInvalid => "Invalid range end",
 			Self::BraceUnmatched => "Unmatched \\{",
-			Self::RepetitionOperandMissing => "repetition-operator operand invalid",
+			Self::RepetitionOperandMissing => "Invalid preceding regular expression",
+			Self::ParenUnmatched => "Unmatched ) or \\)",
+			Self::BackReferenceInvalid => "Invalid back reference",
 			Self::TrailingBackslash => "Trailing backslash",
 		}
 	}
@@ -120,33 +128,40 @@ pub(crate) fn translate(
 		quantified: false,
 		anchored: false,
 		groups: Vec::new(),
+		opened: 0,
+		completed: 0,
 	}
 	.run()
 }
 
 /// Whether `pattern` holds a back-reference, which only an engine that runs
-/// them can compile. Inside a bracket expression `\` is an ordinary member,
-/// so `[\1]` holds none.
-#[cfg(feature = "util.grep")]
+/// them can compile and which no branch of an alternation keeps its meaning
+/// in alone. Inside a bracket expression `\` is an ordinary member, so
+/// `[\1]` holds none; a bracket expression is skipped by its extent alone,
+/// whatever its members, so `\(a\)[a-Z]\1` holds one under `-i` too.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
 pub(crate) fn has_backreference(pattern: &str) -> bool {
 	let mut chars = pattern.chars().peekable();
 	let mut skipped = String::new();
-	while let Some(c) = chars.next() {
+	while let Some(&c) = chars.peek() {
 		match c {
-			'\\' => match chars.next() {
-				Some(digit) if digit.is_ascii_digit() && digit != '0' => return true,
-				Some(_) => {},
-				None => return false,
-			},
 			'[' => {
-				// An invalid bracket expression is the translation's error to
-				// report; nothing past it can be read with any confidence.
+				// Nothing past an unterminated one is read with any confidence;
+				// the translation reports it.
 				skipped.clear();
-				if take_bracket_expression(&mut chars, &mut skipped, false, Target::Rust).is_err() {
+				if !bracket_text(&mut chars, &mut skipped) {
 					return false;
 				}
 			},
-			_ => {},
+			'\\' => {
+				chars.next();
+				if chars.next().is_some_and(|escaped| matches!(escaped, '1'..='9')) {
+					return true;
+				}
+			},
+			_ => {
+				chars.next();
+			},
 		}
 	}
 	false
@@ -154,6 +169,7 @@ pub(crate) fn has_backreference(pattern: &str) -> bool {
 
 /// The most alternatives [`alternatives`] expands a pattern into. A pattern
 /// with more of them is searched whole, as the engine prefers it.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
 const ALTERNATIVE_LIMIT: usize = 64;
 
 /// The alternatives of `pattern`: the branches of its alternation, each
@@ -169,10 +185,15 @@ const ALTERNATIVE_LIMIT: usize = 64;
 /// follows is left whole: the branches of `(a|ab)*` are not the pattern's.
 ///
 /// The pattern itself is the only alternative when it holds no alternation,
-/// when a group never closes, or when it would expand into more than
-/// [`ALTERNATIVE_LIMIT`] branches.
+/// when it holds a back-reference (a branch alone numbers its groups from 1,
+/// so `\(a\)\|\(b\)\2` would lose its second group), when a group never
+/// closes, or when it would expand into more than [`ALTERNATIVE_LIMIT`]
+/// branches.
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
 pub(crate) fn alternatives(pattern: &str, dialect: Dialect, distribute: bool) -> Vec<String> {
+	if !pattern.contains('|') || has_backreference(pattern) {
+		return vec![pattern.to_owned()];
+	}
 	let mut chars = pattern.chars().peekable();
 	match expand(&mut chars, dialect, distribute, false) {
 		Some((branches, _)) if branches.len() > 1 => branches,
@@ -263,23 +284,24 @@ fn expand(
 			},
 			_ => {
 				// Any other token holds no alternation: a bracket expression,
-				// an escaped character, or one ordinary character.
-				let mut text = String::new();
+				// an escaped character, or one ordinary character. It is read
+				// into `raw` and copied from there into every branch.
+				let from = raw.len();
 				if c == '[' {
-					if !bracket_text(chars, &mut text) {
+					if !bracket_text(chars, &mut raw) {
 						return None;
 					}
 				} else {
 					chars.next();
-					text.push(c);
+					raw.push(c);
 					if c == '\\' && let Some(escaped) = chars.next() {
-						text.push(escaped);
+						raw.push(escaped);
 					}
 				}
+				let text = &raw[from..];
 				for branch in &mut current {
-					branch.push_str(&text);
+					branch.push_str(text);
 				}
-				raw.push_str(&text);
 			},
 		}
 	}
@@ -337,6 +359,23 @@ fn bracket_text(chars: &mut Peekable<Chars<'_>>, out: &mut String) -> bool {
 	false
 }
 
+/// A group that is still open.
+struct OpenGroup {
+	/// Where in `out` it begins.
+	start:   usize,
+	/// Its number, counted by its opening as POSIX counts groups.
+	number:  u32,
+	/// The groups closed when it opened, which each branch inside it may
+	/// refer to.
+	initial: u32,
+}
+
+/// The bit of group `number` in [`Translator::completed`]; a back-reference
+/// names groups 1 to 9 alone.
+const fn group_bit(number: u32) -> Option<u32> {
+	1u32.checked_shl(number)
+}
+
 /// The translation of one pattern, which reads it left to right and writes
 /// the engine's syntax as it goes.
 struct Translator<'a> {
@@ -356,8 +395,14 @@ struct Translator<'a> {
 	/// caret of a branch anchors, and `grep -c '^^'` counts the lines that
 	/// start with a caret.
 	anchored:   bool,
-	/// Where in `out` each group that is still open begins.
-	groups:     Vec<usize>,
+	/// The groups that are still open, innermost last.
+	groups:     Vec<OpenGroup>,
+	/// How many groups have opened.
+	opened:     u32,
+	/// The groups a back-reference may name here, one bit per number: those
+	/// closed in the current branch or before its enclosing group opened.
+	/// GNU refuses `\(a\)\|\(b\)\1` and `\(a\1\)` ("Invalid back reference").
+	completed:  u32,
 }
 
 impl Translator<'_> {
@@ -371,12 +416,12 @@ impl Translator<'_> {
 					take_bracket_expression(&mut self.chars, &mut self.out, self.icase, self.target)?;
 					self.set_atom(start);
 				},
-				'*' => self.repeat("*", "*"),
-				'+' if extended => self.repeat("+", "+"),
-				'?' if extended => self.repeat("?", "?"),
+				'*' => self.repeat("*", "*")?,
+				'+' if extended => self.repeat("+", "+")?,
+				'?' if extended => self.repeat("?", "?")?,
 				'{' if extended => self.brace()?,
 				'(' if extended => self.open_group(),
-				')' if extended => self.close_group(false),
+				')' if extended => self.close_group()?,
 				'|' if extended => self.alternate(),
 				'^' => self.caret(),
 				'$' => self.dollar(),
@@ -384,6 +429,18 @@ impl Translator<'_> {
 			}
 		}
 		Ok(self.out)
+	}
+
+	/// Whether the pattern is read as GNU sed reads it, which refuses what
+	/// GNU grep reads leniently: a repetition operator with nothing to
+	/// repeat in an ERE (`sed -E 's/*x/Y/'`), an interval with nothing to
+	/// repeat in either dialect, a `*` or interval right after another
+	/// repetition in a BRE (`sed 's/a**/X/'`), and an unmatched `)` in an
+	/// ERE - each "Invalid preceding regular expression" or "Unmatched ) or
+	/// \)" there, where GNU grep drops the operator, matches the text, or
+	/// reads the `)` as an ordinary character.
+	fn strict(&self) -> bool {
+		self.target == Target::Fancy
 	}
 
 	/// The character after a backslash: an operator in a BRE, one of GNU's
@@ -397,27 +454,20 @@ impl Translator<'_> {
 		};
 		match c {
 			'(' if basic => self.open_group(),
-			')' if basic => self.close_group(true),
+			')' if basic => self.close_group()?,
 			'{' if basic => return self.brace(),
 			'|' if basic => self.alternate(),
-			'?' if basic => self.repeat("?", "?"),
-			'+' if basic => self.repeat("+", "+"),
-			digit @ '1'..='9' => self.backreference(digit),
+			'?' if basic => self.repeat("?", "?")?,
+			'+' if basic => self.repeat("+", "+")?,
+			digit @ '1'..='9' => self.backreference(digit)?,
 			'<' => self.word_edge(true),
 			'>' => self.word_edge(false),
 			'`' => self.assertion("\\A"),
 			'\'' => self.assertion("\\z"),
-			// GNU's own classes and boundaries, which the engines share.
-			'w' | 'W' | 's' | 'S' | 'b' | 'B' => {
-				let start = self.out.len();
-				self.out.push('\\');
-				self.out.push(c);
-				self.set_atom(start);
-			},
-			// A backslash before punctuation keeps it, which is always a
-			// literal in the engines, and before anything else is the
-			// character itself.
-			_ if c.is_ascii_punctuation() => {
+			// GNU's own classes and boundaries, which the engines share, and
+			// punctuation, which an escape keeps a literal in the engines.
+			// Before anything else a backslash is the character itself.
+			_ if matches!(c, 'w' | 'W' | 's' | 'S' | 'b' | 'B') || c.is_ascii_punctuation() => {
 				let start = self.out.len();
 				self.out.push('\\');
 				self.out.push(c);
@@ -428,20 +478,11 @@ impl Translator<'_> {
 		Ok(())
 	}
 
-	/// An interval: `{n}`, `{n,}`, `{n,m}` or GNU's `{,m}`, which is `{0,m}`.
+	/// An interval: `{n}`, `{n,}`, `{n,m}`, or GNU's `{,m}` and `{,}`, which
+	/// are `{0,m}` and `{0,}`.
 	fn brace(&mut self) -> Result<(), BreError> {
 		match read_interval(&mut self.chars, self.dialect) {
-			// GNU sed refuses an interval with nothing to repeat ("Invalid
-			// preceding regular expression"), where GNU grep matches the
-			// text itself: `sed 's/\{1,3\}/X/'` exits 1 and
-			// `grep -c '\{1,3\}'` searches.
-			Some(_) if self.atom.is_none() && self.target == Target::Fancy => {
-				Err(BreError::RepetitionOperandMissing)
-			},
-			Some((operator, literal)) => {
-				self.repeat(&operator, &literal);
-				Ok(())
-			},
+			Some((operator, literal)) => self.repeat(&operator, &literal),
 			// `grep 'a\{1'` and `grep 'a\{x'` are "Unmatched \{", while a
 			// `\{` with nothing to repeat is an ordinary brace
 			// (`grep -c '\{'` counts the lines holding one).
@@ -458,10 +499,15 @@ impl Translator<'_> {
 	}
 
 	/// Writes a repetition operator, or what it means where there is nothing
-	/// to repeat: `literal` is the text GNU matches in a BRE, while an ERE
-	/// drops the operator.
-	fn repeat(&mut self, operator: &str, literal: &str) {
+	/// to repeat: `literal` is the text GNU grep matches in a BRE, while it
+	/// drops the operator in an ERE. See [`Self::strict`] for what GNU sed
+	/// refuses instead.
+	fn repeat(&mut self, operator: &str, literal: &str) -> Result<(), BreError> {
+		let interval = operator.starts_with('{');
 		let Some(start) = self.atom else {
+			if self.strict() && (self.dialect == Dialect::Extended || interval) {
+				return Err(BreError::RepetitionOperandMissing);
+			}
 			if self.dialect == Dialect::Basic {
 				let at = self.out.len();
 				for c in literal.chars() {
@@ -469,9 +515,12 @@ impl Translator<'_> {
 				}
 				self.set_atom(at);
 			}
-			return;
+			return Ok(());
 		};
 		if self.quantified {
+			if self.strict() && self.dialect == Dialect::Basic && (operator == "*" || interval) {
+				return Err(BreError::RepetitionOperandMissing);
+			}
 			// A second operator repeats the repetition; written as it stands,
 			// the engines would read `a*?` as a lazy `a*`, which matches the
 			// empty string where GNU matches every `a`.
@@ -480,38 +529,59 @@ impl Translator<'_> {
 		}
 		self.out.push_str(operator);
 		self.quantified = true;
+		Ok(())
 	}
 
 	fn open_group(&mut self) {
-		self.groups.push(self.out.len());
+		self.opened += 1;
+		self.groups.push(OpenGroup {
+			start:   self.out.len(),
+			number:  self.opened,
+			initial: self.completed,
+		});
 		self.out.push('(');
 		self.atom = None;
 		self.quantified = false;
 		self.anchored = false;
 	}
 
-	/// A group's closing text. An unmatched `)` is an ordinary character in
-	/// an ERE (`grep -cE 'a)'` counts the lines holding `a)`), while GNU
-	/// refuses an unmatched `\)` in a BRE, which the engine does in turn.
-	fn close_group(&mut self, basic: bool) {
+	/// A group's closing text. GNU refuses an unmatched `\)` in a BRE, and
+	/// GNU sed an unmatched `)` in an ERE, while GNU grep reads the latter
+	/// as an ordinary character (`grep -cE 'a)'` counts the lines holding
+	/// `a)`).
+	fn close_group(&mut self) -> Result<(), BreError> {
 		match self.groups.pop() {
-			Some(start) => {
+			Some(group) => {
 				self.out.push(')');
-				self.set_atom(start);
+				if let Some(bit) = group_bit(group.number) {
+					self.completed |= bit;
+				}
+				self.set_atom(group.start);
+				Ok(())
 			},
-			None if basic => self.out.push(')'),
-			None => self.literal(')'),
+			None if self.dialect == Dialect::Basic || self.strict() => Err(BreError::ParenUnmatched),
+			None => {
+				self.literal(')');
+				Ok(())
+			},
 		}
 	}
 
 	fn alternate(&mut self) {
 		self.out.push('|');
+		// A branch may name only the groups closed before its enclosing group
+		// opened, besides its own.
+		self.completed = self.groups.last().map_or(0, |group| group.initial);
 		self.atom = None;
 		self.quantified = false;
 		self.anchored = false;
 	}
 
-	fn backreference(&mut self, digit: char) {
+	fn backreference(&mut self, digit: char) -> Result<(), BreError> {
+		let number = digit.to_digit(10).unwrap_or(0);
+		if group_bit(number).is_none_or(|bit| (self.completed & bit) == 0) {
+			return Err(BreError::BackReferenceInvalid);
+		}
 		let start = self.out.len();
 		if self.target.backrefs() {
 			// Neither dialect has a multi-digit back-reference: `\11` is
@@ -524,6 +594,7 @@ impl Translator<'_> {
 			self.out.push(digit);
 		}
 		self.set_atom(start);
+		Ok(())
 	}
 
 	/// GNU's `\<` and `\>`, the edges of a word.
@@ -569,13 +640,14 @@ impl Translator<'_> {
 		self.literal('$');
 	}
 
-	/// What a repetition operator after an anchor repeats. An ERE repeats
-	/// the anchor itself, which the engines read only inside a group, so the
-	/// operator wraps it: `grep -cE 'a$*'` counts every line holding an `a`,
-	/// as `a(?:$)*` does. In a BRE the character is ordinary there, so
-	/// nothing precedes it.
+	/// What a repetition operator after an anchor repeats. GNU grep's ERE
+	/// repeats the anchor itself, which the engines read only inside a
+	/// group, so the operator wraps it: `grep -cE 'a$*'` counts every line
+	/// holding an `a`, as `a(?:$)*` does. GNU sed refuses that operator
+	/// (`sed -E 's/^*/X/'`), and in a BRE the character is ordinary there,
+	/// so for both nothing precedes it.
 	fn anchor_atom(&mut self, start: usize) {
-		if self.dialect == Dialect::Extended {
+		if self.dialect == Dialect::Extended && !self.strict() {
 			self.atom = Some(start);
 			self.quantified = true;
 		} else {
@@ -612,8 +684,9 @@ fn read_interval(chars: &mut Peekable<Chars<'_>>, dialect: Dialect) -> Option<(S
 		}
 		text
 	});
-	// `{,}` names no bound at all, so it is no interval.
-	if low.is_empty() && high.as_ref().is_none_or(String::is_empty) {
+	// `{` followed by neither a digit nor a comma opens no interval; GNU
+	// reads `{,}` as `{0,}` (`grep -cE 'a{,}'` counts every line).
+	if low.is_empty() && high.is_none() {
 		return None;
 	}
 	if dialect == Dialect::Basic && ahead.next_if_eq(&'\\').is_none() {
@@ -711,19 +784,27 @@ fn take_bracket_expression(
 	// A `-` first in the list is a member.
 	let mut first = true;
 	// GNU warns where the list opens with a colon, the member last read is a
-	// colon, and some member is neither: `[:alpha:]` is a class name written
-	// without its outer brackets, and grep refuses it.
+	// colon, some member is neither, and the list holds no range, class,
+	// collating symbol or equivalence class: `[:alpha:]` is a class name
+	// written without its outer brackets, and grep refuses it, while
+	// `[:a-z:]` and `[:[:digit:]:]` are searched.
 	let mut opens_colon = false;
 	let mut other_member = false;
+	let mut special = false;
 	let mut ends_colon;
 	loop {
+		let symbol = {
+			let mut ahead = chars.clone();
+			ahead.next() == Some('[') && matches!(ahead.next(), Some(':' | '.' | '='))
+		};
 		let member = take_bracket_member(chars, first)?;
-		let colon = matches!(member, BracketMember::Char(':'));
+		let colon = !symbol && matches!(member, BracketMember::Char(':'));
 		let range = matches!(member, BracketMember::Char(_)) && opens_range(chars);
 		if first {
 			opens_colon = colon;
 		}
 		first = false;
+		special |= symbol || range;
 		ends_colon = colon && !range;
 		other_member |= !ends_colon;
 		match member {
@@ -758,7 +839,7 @@ fn take_bracket_expression(
 			Some(']') => {
 				chars.next();
 				out.push(']');
-				return if opens_colon && ends_colon && other_member {
+				return if opens_colon && ends_colon && other_member && !special {
 					Err(BreError::ClassSyntaxConfused)
 				} else {
 					Ok(())
@@ -974,6 +1055,9 @@ mod tests {
 		assert!(has_backreference(r"\(a\)\1"));
 		assert!(!has_backreference(r"[\1]"));
 		assert!(!has_backreference(r"a\\1"));
+		// A bracket expression is skipped by its extent, so a member the
+		// translation refuses without `-i` does not hide what follows it.
+		assert!(has_backreference(r"\(a\)[a-Z]\1"));
 	}
 
 	// ── Repetition operators with no preceding atom ──────────────────────────
@@ -1035,7 +1119,9 @@ mod tests {
 		assert_eq!(ere("a{1"), r"a\{1");
 		assert_eq!(ere("a{1,2"), r"a\{1,2");
 		assert_eq!(ere("{a}"), r"\{a\}");
-		assert_eq!(ere("a{,}"), r"a\{,\}");
+		// GNU reads `{,}` as `{0,}`: `grep -cE 'a{,}'` counts every line.
+		assert_eq!(ere("a{,}"), "a{0,}");
+		assert_eq!(bre(r"a\{,\}"), "a{0,}");
 		// An interval that opens is left for the engine, which refuses
 		// `a{2,1}` as GNU does ("Invalid content of \{\}").
 		assert_eq!(ere("a{2}"), "a{2}");
@@ -1125,12 +1211,64 @@ mod tests {
 	}
 
 	#[test]
-	fn an_unmatched_parenthesis_is_a_literal_only_in_an_ere() {
-		// `printf 'a)\n' | grep -cE 'a)'` is 1, while `grep 'a\)'` is
-		// "Unmatched ) or \)" - which the engine reports in turn.
+	fn an_unmatched_parenthesis_is_a_literal_only_in_grep_s_ere() {
+		// `printf 'a)\n' | grep -cE 'a)'` is 1, while `grep 'a\)'`,
+		// `sed 's/a\)/X/'` and `sed -E 's/a)/X/'` are "Unmatched ) or \)".
 		assert_eq!(ere("a)"), r"a\)");
-		assert_eq!(bre(r"a\)"), "a)");
 		assert_eq!(ere("(a)b)"), r"(a)b\)");
+		assert_eq!(bre_err(r"a\)"), Some(BreError::ParenUnmatched));
+		assert_eq!(
+			translate(r"a\)", Dialect::Basic, Target::Rust, false).err(),
+			Some(BreError::ParenUnmatched)
+		);
+		assert_eq!(
+			translate("a)", Dialect::Extended, Target::Fancy, false).err(),
+			Some(BreError::ParenUnmatched)
+		);
+	}
+
+	#[test]
+	fn sed_refuses_the_repetitions_grep_reads_leniently() {
+		// GNU sed 4.9: "Invalid preceding regular expression" for each, where
+		// GNU grep drops the operator or matches the text.
+		let sed_ere = |pattern: &str| translate(pattern, Dialect::Extended, Target::Fancy, false);
+		for pattern in ["*x", "a|*b", "(*x)", "^*", "a$*", "a^*", "{2}x"] {
+			assert_eq!(sed_ere(pattern).err(), Some(BreError::RepetitionOperandMissing), "{pattern}");
+		}
+		// Repeating a repetition is fine in GNU sed's ERE.
+		for pattern in ["a**", "a+*", "a*+", "a{2}*", "a*{2}", "x+?"] {
+			assert!(sed_ere(pattern).is_ok(), "{pattern}");
+		}
+		// Its BRE takes `\+` and `\?` after a repetition, but not `*` or an
+		// interval: `sed 's/a**/X/'` is refused, `sed 's/a*\+/X/'` is not.
+		for pattern in [r"a**", r"a\+*", r"a\{2\}*", r"a\?*", r"\(a\)**", r"x*\{2\}"] {
+			assert_eq!(bre_err(pattern), Some(BreError::RepetitionOperandMissing), "{pattern}");
+		}
+		for pattern in [r"a*\+", r"a*\?", r"a\+\?", r"*x", r"^*x", r"\+x", r"a\|*x"] {
+			assert_eq!(bre_err(pattern), None, "{pattern}");
+		}
+		// GNU grep reads every one of them.
+		for pattern in [r"a**", r"a\{2\}*", r"x*\{2\}"] {
+			assert!(translate(pattern, Dialect::Basic, Target::Rust, false).is_ok(), "{pattern}");
+		}
+	}
+
+	#[test]
+	fn a_back_reference_names_a_group_closed_in_its_own_branch() {
+		// GNU: "Invalid back reference" for a group another branch holds, a
+		// group not yet closed, and no group at all.
+		for pattern in [r"\(a\)\|\(b\)\1", r"\(a\1\)", r"\1", r"\(a\)\2"] {
+			assert_eq!(bre_err(pattern), Some(BreError::BackReferenceInvalid), "{pattern}");
+		}
+		assert_eq!(
+			translate(r"(a)|b\1", Dialect::Extended, Target::Pcre, false).err(),
+			Some(BreError::BackReferenceInvalid)
+		);
+		// A group closed before the enclosing group opened stays nameable in
+		// each of its branches, and so does a group of the same branch.
+		for pattern in [r"\(a\)\(b\|\1\)", r"\(a\)\|\(b\)\2", r"\(a\)\1"] {
+			assert_eq!(bre_err(pattern), None, "{pattern}");
+		}
 	}
 
 	// ── A backslash before an ordinary character ─────────────────────────────
@@ -1264,8 +1402,21 @@ mod tests {
 	#[test]
 	fn a_list_of_colons_alone_is_not_the_confused_class_syntax() {
 		// Measured: `grep -c '[::]'`, `grep -c '[:]'`, `grep -c '[:ab]'`,
-		// `grep -c '[a:b:]'` and `grep -c '[:-:]'` all search and exit 0 or 1.
-		for pattern in ["[::]", "[:]", "[:ab]", "[a:b:]", "[:-:]", "[x[:alpha:]]"] {
+		// `grep -c '[a:b:]'` and `grep -c '[:-:]'` all search and exit 0 or 1,
+		// and so do the lists holding a range, a class, a collating symbol or
+		// an equivalence class between the colons.
+		for pattern in [
+			"[::]",
+			"[:]",
+			"[:ab]",
+			"[a:b:]",
+			"[:-:]",
+			"[x[:alpha:]]",
+			"[:a-z:]",
+			"[:[:digit:]:]",
+			"[:x[=a=]:]",
+			"[:x[.a.]:]",
+		] {
 			assert_eq!(bre_err(pattern), None, "{pattern}");
 		}
 	}
@@ -1369,6 +1520,17 @@ mod tests {
 		assert_eq!(alternatives(r"\(a\|b\)\+", Dialect::Basic, true), vec![r"\(a\|b\)\+"]);
 		// Without distribution only the top level splits.
 		assert_eq!(alternatives("(a|b)|c", Dialect::Extended, false), vec!["(a|b)", "c"]);
+	}
+
+	#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+	#[test]
+	fn a_pattern_holding_a_back_reference_is_not_split() {
+		// A branch alone numbers its groups from 1, so `\2` would name a
+		// different group, or none.
+		for pattern in [r"\(a\)\|\(b\)\2", r"\(b\)\|\(b\)\(c\)\2"] {
+			assert_eq!(alternatives(pattern, Dialect::Basic, true), vec![pattern.to_owned()]);
+		}
+		assert_eq!(alternatives(r"(a)|(b)\2", Dialect::Extended, false), vec![r"(a)|(b)\2"]);
 	}
 
 	#[cfg(any(feature = "util.grep", feature = "util.sed"))]

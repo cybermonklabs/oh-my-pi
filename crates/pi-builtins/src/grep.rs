@@ -13,7 +13,7 @@ use std::{
 	io::{self, Write},
 	path::{Path, PathBuf},
 	sync::{
-		Arc, OnceLock,
+		Arc, LazyLock, OnceLock,
 		atomic::{AtomicBool, Ordering},
 	},
 };
@@ -192,7 +192,9 @@ fn for_each_match_with<M: Matcher>(
 			u64::try_from(printed.start()).map_err(|error| io::Error::other(error.to_string()))?,
 		);
 		visit(printed, match_offset)?;
-		at = if printed.end() > at { printed.end() } else { at + 1 };
+		// What is printed is never empty and starts at `at` or later, so the
+		// search always moves on.
+		at = printed.end();
 	}
 	Ok(())
 }
@@ -574,8 +576,8 @@ impl Alternatives {
 	fn engines(&self) -> Option<&[Engine]> {
 		self.engines
 			.get_or_init(|| {
-				// The patterns together compiled, so one alternative can fail
-				// only on a size limit; the engine's own match is printed
+				// An alternative that fails to compile alone gives up the
+				// longest-match search; the engine's own match is printed
 				// then.
 				self.patterns
 					.iter()
@@ -698,10 +700,8 @@ fn resolve_file_list_modes(matches: &ArgMatches) -> (bool, bool) {
 ///
 /// Whether one was given at all is what makes grep print a `--` between two
 /// groups of lines: `grep -C0` prints it and a plain `grep` does not.
-fn resolve_context(cli: &GrepArgs, matches: &ArgMatches) -> (usize, usize, bool) {
-	let after = last_index(matches, "after_context").and(cli.after_context);
-	let before = last_index(matches, "before_context").and(cli.before_context);
-	let default = last_index(matches, "context").and(cli.context);
+fn resolve_context(cli: &GrepArgs) -> (usize, usize, bool) {
+	let (after, before, default) = (cli.after_context, cli.before_context, cli.context);
 	(
 		before.or(default).unwrap_or(0),
 		after.or(default).unwrap_or(0),
@@ -785,77 +785,67 @@ fn resolve_max_count(cli: &GrepArgs) -> Option<u64> {
 	}
 }
 
-/// Every long option `grep` accepts, for the abbreviation getopt allows.
-const LONG_OPTIONS: &[&str] = &[
-	"after-context",
-	"basic-regexp",
-	"binary",
-	"binary-files",
-	"byte-offset",
-	"color",
-	"colour",
-	"context",
-	"count",
-	"dereference-recursive",
-	"devices",
-	"directories",
-	"exclude",
-	"exclude-dir",
-	"exclude-from",
-	"extended-regexp",
-	"file",
-	"files-with-matches",
-	"files-without-match",
-	"fixed-strings",
-	"group-separator",
-	"help",
-	"ignore-case",
-	"include",
-	"include-dir",
-	"initial-tab",
-	"invert-match",
-	"label",
-	"line-buffered",
-	"line-number",
-	"line-regexp",
-	"max-count",
-	"mmap",
-	"no-filename",
-	"no-group-separator",
-	"no-ignore-case",
-	"no-messages",
-	"null",
-	"null-data",
-	"only-matching",
-	"perl-regexp",
-	"quiet",
-	"recursive",
-	"regexp",
-	"silent",
-	"text",
-	"version",
-	"with-filename",
-	"word-regexp",
-];
+/// A long option `grep` accepts: its names - the long name first, then its
+/// aliases, which getopt counts as the same option - and whether it takes
+/// the next argument as its value.
+struct LongOption {
+	names:       Vec<String>,
+	takes_value: bool,
+}
 
-/// The long option an abbreviation names, as getopt reads one for GNU grep:
-/// `--regex=zz` is `--regexp=zz`, because no other long option starts with
-/// `regex`. A prefix that names several options is left as it is, which clap
-/// refuses as GNU refuses an ambiguous one.
+/// Every long option, read from the parser's own definition so the
+/// abbreviations GNU accepts cannot miss one (`--bef 1` is
+/// `--before-context 1`). An option whose value is optional (`--color`)
+/// does not take the next argument.
+static LONG_OPTIONS: LazyLock<Vec<LongOption>> = LazyLock::new(|| {
+	let mut command = GrepArgs::command();
+	command.build();
+	command
+		.get_arguments()
+		.filter_map(|arg| {
+			let mut names = vec![arg.get_long()?.to_owned()];
+			if let Some(aliases) = arg.get_all_aliases() {
+				names.extend(aliases.into_iter().map(str::to_owned));
+			}
+			let takes_value = arg.get_num_args().is_some_and(|range| range.min_values() > 0);
+			Some(LongOption { names, takes_value })
+		})
+		.collect()
+});
+
+/// The long option `name` names, exactly or as the abbreviation getopt
+/// accepts: a prefix of the names of one option alone, so `--regex` is
+/// `--regexp` and `--col` is `--color`, whose alias `--colour` is the same
+/// option.
+fn long_option(name: &str) -> Option<&'static LongOption> {
+	if name.is_empty() {
+		return None;
+	}
+	if let Some(option) = LONG_OPTIONS.iter().find(|option| option.names.iter().any(|n| n == name)) {
+		return Some(option);
+	}
+	let mut named = LONG_OPTIONS
+		.iter()
+		.filter(|option| option.names.iter().any(|n| n.starts_with(name)));
+	let option = named.next()?;
+	named.next().is_none().then_some(option)
+}
+
+/// The option an abbreviated long option names, written out: `--regex=zz`
+/// is `--regexp=zz`. A prefix that names several options, and a name given
+/// in full, are left as they are; clap refuses the first, as GNU refuses an
+/// ambiguous one.
 fn expand_long_option(text: &str) -> Option<String> {
-	let (name, value) = match text.split_once('=') {
+	let rest = text.strip_prefix("--")?;
+	let (name, value) = match rest.split_once('=') {
 		Some((name, value)) => (name, Some(value)),
-		None => (text, None),
+		None => (rest, None),
 	};
-	let name = name.strip_prefix("--").filter(|name| !name.is_empty())?;
-	if LONG_OPTIONS.contains(&name) {
+	let option = long_option(name)?;
+	if option.names.iter().any(|n| n == name) {
 		return None;
 	}
-	let mut named = LONG_OPTIONS.iter().filter(|long| long.starts_with(name));
-	let long = named.next()?;
-	if named.next().is_some() {
-		return None;
-	}
+	let long = &option.names[0];
 	Some(match value {
 		Some(value) => format!("--{long}={value}"),
 		None => format!("--{long}"),
@@ -863,15 +853,13 @@ fn expand_long_option(text: &str) -> Option<String> {
 }
 
 /// Whether `long`, a long option without its `--`, takes the next argument as
-/// its value.
+/// its value: one with no value attached that needs one.
 fn long_option_takes_next_value(long: &str) -> bool {
-	matches!(long, "regexp" | "file" | "max-count" | "after-context" | "before-context"
-		| "context" | "label" | "group-separator" | "binary-files" | "devices"
-		| "directories" | "include" | "exclude" | "exclude-from" | "exclude-dir"
-		| "include-dir")
+	!long.contains('=') && long_option(long).is_some_and(|option| option.takes_value)
 }
 
-/// Rewrites what clap reads otherwise than GNU grep: a context count becomes
+/// Rewrites what clap reads otherwise than GNU grep: an abbreviated long
+/// option is written out (`--regex=zz`), a context count becomes
 /// `--context=N`, as an argument of digits (`-5`) and as each run of digits
 /// in a group of short options (`-5e mid`, `-n2e mid`), and an option's value
 /// attached with a leading `=` (`-e=x`, `-ve=x`) is passed apart, as clap
@@ -897,10 +885,8 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 		let Some(text) = arg.to_str() else { normalized.push(arg); continue };
 		if text == "--" { literal = true; normalized.push(arg); continue }
 		if let Some(long) = text.strip_prefix("--") {
-			let expanded = expand_long_option(text);
-			value_pending =
-				long_option_takes_next_value(expanded.as_deref().map_or(long, |text| &text[2..]));
-			normalized.push(expanded.map_or(arg, OsString::from));
+			value_pending = long_option_takes_next_value(long);
+			normalized.push(expand_long_option(text).map_or(arg, OsString::from));
 			continue;
 		}
 		let Some(group) = text.strip_prefix('-') else { normalized.push(arg); continue };
@@ -1020,20 +1006,23 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 	if spec.null_data {
 		builder.line_terminator(Some(b'\0'));
 	}
-	if spec.mode == MatchMode::Fixed {
-		let escaped: Vec<String> = patterns.iter().map(|pattern| regex::escape(pattern)).collect();
-		return builder
-			.build_many(&escaped)
-			.map(Engine::Rust)
-			.map_err(|error| error.to_string());
-	}
-
 	// A BRE is a distinct dialect, not an ERE with different escaping: `\+`
 	// is the operator and a bare `+` is a literal. Both dialects go through
 	// the shared module, which also writes each bracket expression and each
 	// brace the way the engine reads it with POSIX's meaning.
 	let Some(dialect) = dialect_of(spec.mode) else {
-		return Err("no dialect for the selected matcher mode".to_owned());
+		// A fixed string, `-P` having been compiled above. The longest come
+		// first, so at the leftmost position a match starts the engine takes
+		// the longest string that matches there, as GNU's `-o` prints it:
+		// `grep -oF -e a -e ab` prints `ab`.
+		let mut longest_first: Vec<&String> = patterns.iter().collect();
+		longest_first.sort_by_key(|pattern| std::cmp::Reverse(pattern.len()));
+		let escaped: Vec<String> =
+			longest_first.into_iter().map(|pattern| regex::escape(pattern)).collect();
+		return builder
+			.build_many(&escaped)
+			.map(Engine::Rust)
+			.map_err(|error| error.to_string());
 	};
 	// `grep-regex` cannot run a back-reference at all. GNU answers
 	// `grep '\(a\)\1'` with the lines holding a doubled character, so the
@@ -1055,9 +1044,16 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 /// patterns together do not.
 fn pattern_alternatives(patterns: &[String], spec: MatcherSpec) -> Option<Vec<String>> {
 	// `-P` is PCRE2, which prefers the first branch of an alternation as
-	// GNU's own `-P` does; a fixed string holds no alternation, so the
-	// patterns are the alternatives.
-	if spec.mode == MatchMode::Perl {
+	// GNU's own `-P` does. Under `-x` a match is the whole line, so there is
+	// no longer one. Fixed strings come longest first (see `build_matcher`),
+	// which picks the longest at each position by itself; under `-i` a
+	// folded string can match more or fewer bytes than it holds, and under
+	// `-w` the word test sits outside the alternation, so there each string
+	// is still searched alone.
+	if spec.mode == MatchMode::Perl
+		|| spec.line_regexp
+		|| (spec.mode == MatchMode::Fixed && !spec.ignore_case && !spec.word)
+	{
 		return None;
 	}
 	let dialect = dialect_of(spec.mode);
@@ -1141,16 +1137,23 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 		self.flush_record()
 	}
 
-	/// Writes the `--` that separates two groups of lines, where the context
-	/// counts are zero and the searcher reports no break of its own.
-	fn mark_gap(&mut self, offset: u64) -> io::Result<()> {
-		if self.opts.mark_gaps
-			&& self.last_end.is_some_and(|end| end != offset)
-			&& let Some(separator) = &self.opts.group_separator
-		{
+	/// Writes the `--` (or `--group-separator`) between two groups of lines,
+	/// unless `--no-group-separator` asked for none.
+	fn write_group_separator(&mut self) -> io::Result<()> {
+		if let Some(separator) = &self.opts.group_separator {
 			self.out.write_all(separator)?;
 			self.out.write_all(&[self.opts.record.terminator])?;
 			self.flush_record()?;
+		}
+		Ok(())
+	}
+
+	/// Writes the separator before a line that does not follow the last one
+	/// printed, where the context counts are zero and the searcher reports
+	/// no break of its own.
+	fn mark_gap(&mut self, offset: u64) -> io::Result<()> {
+		if self.opts.mark_gaps && self.last_end.is_some_and(|end| end != offset) {
+			self.write_group_separator()?;
 		}
 		Ok(())
 	}
@@ -1217,12 +1220,13 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 		if self.after_left == Some(0) {
 			return Ok(false);
 		}
+		// No gap is marked here: the sink marks gaps only where both context
+		// counts are zero, and then no context line reaches it and a line
+		// past `-m`'s count is not printed.
 		if !self.normal_output_is_suppressed() && !self.opts.only_matching && !self.binary_summary()
 		{
-			self.mark_gap(offset)?;
 			self.write_prefix(line_number, offset, b'-')?;
 			self.write_record(bytes)?;
-			self.note_line(offset, bytes.len());
 		}
 		if let Some(left) = &mut self.after_left {
 			*left -= 1;
@@ -1298,13 +1302,8 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 
 	fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, io::Error> {
 		// `-o` prints no context line, and GNU still separates its groups.
-		if !self.normal_output_is_suppressed()
-			&& !self.binary_summary()
-			&& let Some(separator) = &self.opts.group_separator
-		{
-			self.out.write_all(separator)?;
-			self.out.write_all(&[self.opts.record.terminator])?;
-			self.flush_record()?;
+		if !self.normal_output_is_suppressed() && !self.binary_summary() {
+			self.write_group_separator()?;
 		}
 		Ok(true)
 	}
@@ -1451,24 +1450,10 @@ impl Input {
 	}
 }
 
-impl Worker {
-	/// Hands the file's output to the consumer, leaving an empty buffer in place when nothing was written.
-	fn take_out(&mut self) -> Vec<u8> {
-		if self.out.is_empty() {
-			Vec::new()
-		} else {
-			std::mem::take(&mut self.out)
-		}
-	}
-
-	/// The same for what the file's search reported on standard error.
-	fn take_err(&mut self) -> Vec<u8> {
-		if self.err.is_empty() {
-			Vec::new()
-		} else {
-			std::mem::take(&mut self.err)
-		}
-	}
+/// Hands a file's buffered output to the consumer, leaving the buffer in
+/// place (its capacity kept for the next file) when nothing was written.
+fn take_written(buffer: &mut Vec<u8>) -> Vec<u8> {
+	if buffer.is_empty() { Vec::new() } else { std::mem::take(buffer) }
 }
 
 /// The walked files of a directory operand, searched by index.
@@ -1656,7 +1641,8 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 				let searched = self
 					.push_input(&mut input, display_path.as_os_str().as_encoded_bytes(), worker)
 					.await;
-				self.finish(display_path, searched, worker.take_out(), worker.take_err())
+				let (out, err) = (take_written(&mut worker.out), take_written(&mut worker.err));
+				self.finish(display_path, searched, out, err)
 			},
 			Err(error) => {
 				let mut err = Vec::new();
@@ -2308,16 +2294,16 @@ impl AsyncUtility for Grep {
 	let (before, after, context_given) = if output_suppressed {
 		(0, 0, false)
 	} else {
-		resolve_context(&cli, &matches)
+		resolve_context(&cli)
 	};
 	let prefix_filename = resolve_filename_prefix(&matches)
 		.unwrap_or(directory_action == DirectoryAction::Recurse || files.len() > 1);
 	// GNU grep refuses to search the file its own output lands in: the matches
 	// it writes would be read back and matched again, so the file grows
 	// without bound. It exempts the modes that write at most one line per file
-	// (`-q`, `-c`, `-l`, `-L`) and the bounded `-m1`, which stop before their
-	// output can feed back into the search.
-	let refuse_output_file = !output_suppressed && max_count.is_none_or(|count| count > 1);
+	// (`-q`, `-c`, `-l`, `-L`) and a count of at most one, tested on the
+	// signed count as typed: `grep -m -2 x f >>f` searches `f`, as `-m1` does.
+	let refuse_output_file = !output_suppressed && cli.max_count.is_none_or(|count| count > 1);
 	let opts = Options {
 		line_number: cli.line_number,
 		byte_offset: cli.byte_offset,
@@ -2340,8 +2326,6 @@ impl AsyncUtility for Grep {
 		line_buffered: cli.line_buffered,
 		binary_files: resolve_binary_files(&cli, &matches),
 		max_count,
-		// The searcher reports a break only where a context count is larger
-		// than zero; GNU prints one wherever a context option was given.
 		mark_gaps: context_given && before == 0 && after == 0,
 		refuse_output_file,
 		alternatives,
