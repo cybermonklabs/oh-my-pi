@@ -1,13 +1,15 @@
 /**
  * `AgentLifecycleManager.releaseUnder`: a helper session's end (a `/security` scan, the Agent
  * Hub generator) releases every agent under it and leaves none live, also an agent whose revive
- * is in flight when the helper ends, and an agent whose intermediate parent was unregistered
- * before the helper ended.
+ * is in flight when the helper ends, a killed agent whose transcript is checked for a reopen when
+ * the helper ends, and an agent whose intermediate parent was unregistered before the helper ended.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as path from "node:path";
 import { type AgentLifecycleApi, AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, type AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 interface SessionStub {
 	session: AgentSession;
@@ -114,6 +116,51 @@ describe("releaseUnder leaves no agent under the helper live", () => {
 
 		expect(isLive(registry, "Helper-Sub", revived)).toBe(false);
 		expect(lifecycle.has("Helper-Sub")).toBe(false);
+	});
+
+	it("a killed agent whose helper ends while its transcript is checked for a reopen stays ended", async () => {
+		// If this regresses, a helper that ends just after a killed subagent's transcript check answers lets the
+		// reopen go on: the subagent comes back live as a new generation after the helper's release, and its
+		// tombstone is removed.
+		using tempDir = TempDir.createSync("@omp-release-under-");
+		const sessionFile = path.join(tempDir.path(), "Helper-Killed.jsonl");
+		await Bun.write(sessionFile, "");
+		const killed = registry.register({
+			id: "Helper-Killed",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Helper",
+			session: makeSessionStub().session,
+			sessionFile,
+			status: "running",
+		});
+		expect(await lifecycle.release("Helper-Killed", killed, { tombstone: true })).toBe(true);
+		expect(await Bun.file(`${sessionFile}.tombstone`).exists()).toBe(true);
+		const revived = makeSessionStub();
+		const helperEnds: Promise<void>[] = [];
+		lifecycle.setPersistedSubagentReviverFactory(
+			async ref => {
+				// The transcript check of the killed generation answers; the helper ends just after, before the
+				// reopen goes on.
+				if (ref === killed) {
+					queueMicrotask(() => helperEnds.push(lifecycle.releaseUnder("Helper", { ownedJobsEnd: "stop" })));
+				}
+				return async () => revived.session;
+			},
+			() => 0,
+		);
+
+		const outcome = await lifecycle.ensureLive("Helper-Killed").then(
+			() => "revived",
+			() => "refused",
+		);
+		await Promise.all(helperEnds);
+
+		expect(helperEnds.length).toBe(1);
+		expect(outcome).toBe("refused");
+		expect(registry.get("Helper-Killed")).toBeUndefined();
+		expect(lifecycle.has("Helper-Killed")).toBe(false);
+		expect(await Bun.file(`${sessionFile}.tombstone`).exists()).toBe(true);
 	});
 
 	it("reaches an agent whose intermediate parent was unregistered before the helper ended", async () => {
