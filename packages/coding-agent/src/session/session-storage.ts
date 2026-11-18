@@ -124,6 +124,45 @@ export class SessionWriteConflictError extends Error {
 }
 
 /**
+ * A chunked read ({@link SessionStorage.readChunks}) met a session that a full
+ * write or a delete replaced after the read began, so the bytes it had yielded
+ * and the rest would mix two bodies. Reading the session again from its start
+ * sees one body.
+ */
+export class SessionReadConflictError extends Error {
+	readonly path: string;
+
+	constructor(path: string) {
+		super(`Session file ${JSON.stringify(path)} was replaced or removed while it was read; read it again.`);
+		this.name = "SessionReadConflictError";
+		this.path = path;
+	}
+}
+
+/**
+ * Times a reader of a stored transcript reads it again from its start after a
+ * {@link SessionReadConflictError}, before that error surfaces. Each retry
+ * streams again; none falls back to reading the transcript whole.
+ */
+export const RACED_READ_RETRIES = 3;
+
+/**
+ * Run `pass`, a read of a stored transcript from its start, and run it again
+ * after each {@link SessionReadConflictError}, at most
+ * {@link RACED_READ_RETRIES} more times. Any other error, and a conflict past
+ * the last retry, is thrown.
+ */
+export async function retryRacedRead<T>(pass: () => Promise<T>): Promise<T> {
+	for (let retries = 0; ; retries++) {
+		try {
+			return await pass();
+		} catch (error) {
+			if (!(error instanceof SessionReadConflictError) || retries >= RACED_READ_RETRIES) throw error;
+		}
+	}
+}
+
+/**
  * The file publish lock is held by another live writer, so freshness cannot
  * be established. Fail-closed: the staged rewrite is discarded without
  * publishing.

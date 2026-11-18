@@ -27,7 +27,7 @@ import { buildSessionContext } from "./session-context";
 import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
-import { FileSessionStorage, type SessionStorage } from "./session-storage";
+import { FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
 import { enotdir } from "./session-storage-errors";
 import {
 	parseTitleSlotFromContent,
@@ -542,8 +542,17 @@ function shouldStreamEntries(storage: SessionStorage, size: number): boolean {
  * from the text `readText` decodes, which differs from the file's bytes only
  * when the file has a byte-order mark or invalid UTF-8. Such a file reads as
  * changed here and costs one extra parse, never a wrong answer.
+ *
+ * A full rewrite or delete that races the read (`SessionReadConflictError`)
+ * is hashed again from its start through {@link retryRacedRead}, never as one
+ * whole-text read.
  */
 export async function sessionContentDigest(filePath: string, storage: SessionStorage): Promise<string> {
+	return retryRacedRead(() => hashTranscriptPass(filePath, storage));
+}
+
+/** One read of {@link sessionContentDigest}, from the transcript's start. */
+async function hashTranscriptPass(filePath: string, storage: SessionStorage): Promise<string> {
 	const hasher = new Bun.CryptoHasher(SNAPSHOT_DIGEST_ALGORITHM);
 	for await (const chunk of transcriptByteChunks(filePath, storage)) hasher.update(chunk);
 	return hasher.digest("hex");
