@@ -28,14 +28,15 @@
 export const EVENT_LOOP_SLICE_MS = 10;
 
 let sliceStart = 0;
+/** The real clock when the slice opened: `performance.now()` can be mocked, `process.hrtime` is not. */
+let sliceOpenedAt = 0n;
+const SLICE_NS = BigInt(EVENT_LOOP_SLICE_MS * 1_000_000);
 let sliceOpen = false;
 /** Resolvers of the passes waiting for the next turn, in the order they asked. */
 let waiters: Array<() => void> = [];
 /** The batch of waiters a scheduled release is for; 0 once released. */
 let pendingBatch = 0;
 let lastBatch = 0;
-/** The real clock when the check-phase leg last found the slice open, for the batch it waits to release. */
-let lastOpenSliceCheck: bigint | undefined;
 
 function closeSlice(): void {
 	sliceOpen = false;
@@ -53,6 +54,7 @@ export function sliceExpired(): boolean {
 	if (!sliceOpen) {
 		sliceOpen = true;
 		sliceStart = now;
+		sliceOpenedAt = process.hrtime.bigint();
 		// Closed by a timer, so work later in this pass through the event loop
 		// finds the slice still open. Fake timers replace setTimeout, so the close
 		// may never run: a release (below) opens the next turn anyway.
@@ -74,20 +76,20 @@ export function sliceExpired(): boolean {
  * `createAgentSession`, a promise resolved from its callback did not resume
  * until a timer next woke the event loop, so each turn cost up to a timer
  * period. `setTimeout` alone costs its 1 ms clamp on every turn, and fake
- * timers replace it; `setImmediate` still runs under fake timers. While the
- * slice is still open, the `setImmediate` leg waits for the timers to close it,
- * however many passes through the check phase that takes: in a gVisor pod,
- * check phases ran several times before the timers did, and a leg that gave up
- * waiting opened a second slice in one pass through the event loop. Only
- * stopped clocks release it while the slice is open: fake timers stop every
- * clock and never run the close.
+ * timers replace it; `setImmediate` still runs under fake timers. While a slice
+ * that held the loop for its budget is still open, the `setImmediate` leg waits
+ * for the timers to close it, however many passes through the check phase that
+ * takes: in a gVisor pod, check phases ran several times before the timers did,
+ * and a leg that gave up waiting opened a second slice in one pass through the
+ * event loop. A slice that a mocked clock ended before the real one moved its
+ * budget releases at once, without the clamp; so does any slice under fake
+ * timers, which stop every clock and never run the close.
  */
 export function nextSlice(): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	if (waiters.length === 0) {
 		const batch = ++lastBatch;
 		pendingBatch = batch;
-		lastOpenSliceCheck = undefined;
 		setImmediate(releaseWaiters, batch, true);
 		setTimeout(releaseWaiters, 0, batch);
 	}
@@ -98,15 +100,9 @@ export function nextSlice(): Promise<void> {
 function releaseWaiters(batch: number, inCheckPhase = false): void {
 	// The other leg of a released batch, or of one a later batch replaced.
 	if (batch !== pendingBatch) return;
-	if (inCheckPhase && sliceOpen) {
-		// The timers have not run since the slice opened. A real clock moves between two passes
-		// through the check phase; one that reads the same twice is stopped by fake timers.
-		const clock = process.hrtime.bigint();
-		if (clock !== lastOpenSliceCheck) {
-			lastOpenSliceCheck = clock;
-			setImmediate(releaseWaiters, batch, true);
-			return;
-		}
+	if (inCheckPhase && sliceOpen && process.hrtime.bigint() - sliceOpenedAt >= SLICE_NS) {
+		setImmediate(releaseWaiters, batch, true);
+		return;
 	}
 	pendingBatch = 0;
 	// This macrotask is a new turn, whether or not the last slice's close ran yet.

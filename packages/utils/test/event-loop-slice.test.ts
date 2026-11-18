@@ -160,8 +160,12 @@ describe("mapInSlices", () => {
 		expect(seen).toEqual([true, true]);
 	});
 
-	it("opens no new slice before the timers close the last one, however many check phases run first", async () => {
-		const clock = mockWorkClock();
+	it("opens no new slice before the timers close one that held the loop for its budget, however many check phases run first", async () => {
+		// Real time: the slice must hold the loop for its budget, as a refresh's slices do.
+		const busy = (ms: number) => {
+			const start = performance.now();
+			while (performance.now() - start < ms) {}
+		};
 		// Hold back the slice's close and the release's timer leg, as a loop whose timers run late does.
 		const held: Array<() => void> = [];
 		const realSetTimeout = globalThis.setTimeout;
@@ -182,7 +186,7 @@ describe("mapInSlices", () => {
 			Array.from({ length: UNITS_PER_SLICE * 2 }, (_, index) => index),
 			() => {
 				unitTurns.push(turns.turn());
-				clock.spend(UNIT_MS);
+				busy(UNIT_MS);
 			},
 		);
 		// Fifty passes through the check phase go by with the close held back.
@@ -254,6 +258,11 @@ describe("readJsonInSlices", () => {
 			window: index,
 		})),
 	);
+	/** Holds the loop for `ms` of real time, whatever the mocked `performance.now()` says. */
+	const holdReal = (ms: number) => {
+		const start = process.hrtime.bigint();
+		while (process.hrtime.bigint() - start < BigInt(ms * 1_000_000)) {}
+	};
 
 	it("parses each fetched payload in a slice of its own, so two that arrive together do not hold off due timers", async () => {
 		// Both bodies are read first, so the parses' order against the timer depends only on the slicer.
@@ -261,7 +270,8 @@ describe("readJsonInSlices", () => {
 			[new Response(body), new Response(body)].map(response => response.arrayBuffer()),
 		);
 		await new Promise(resolve => setTimeout(resolve, 5));
-		// The clock moves only inside a parse, by 11 ms: the decode never spends the slice, whatever the load.
+		// The clock moves only inside a parse, by 11 ms, which the parse also holds the loop for in real
+		// time: the decode never spends the slice, whatever the load, and the parse always does.
 		let now = 1_000;
 		vi.spyOn(performance, "now").mockImplementation(() => now);
 		let fired = false;
@@ -273,6 +283,7 @@ describe("readJsonInSlices", () => {
 			if (text.length === body.length) {
 				firedAtParse.push(fired);
 				now += 11;
+				holdReal(11);
 			}
 			return parse(text, reviver);
 		});
@@ -292,8 +303,21 @@ describe("readJsonInSlices", () => {
 		// Each clock read is 11 ms of work: the check after the decode finds the slice spent.
 		let now = 1_000;
 		vi.spyOn(performance, "now").mockImplementation(() => (now += 11));
+		// The decode sets a timer and holds the loop past a slice's budget in real time, so the timer
+		// is due when the slicer next looks.
 		let fired = false;
-		setTimeout(() => (fired = true), 0);
+		const decode = TextDecoder.prototype.decode;
+		vi.spyOn(TextDecoder.prototype, "decode").mockImplementation(function (
+			this: TextDecoder,
+			...args: Parameters<TextDecoder["decode"]>
+		) {
+			const text = decode.apply(this, args);
+			if (text.length === body.length) {
+				setTimeout(() => (fired = true), 0);
+				holdReal(EVENT_LOOP_SLICE_MS + 1);
+			}
+			return text;
+		});
 		let firedAtParse: boolean | undefined;
 		const parse = JSON.parse;
 		vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?: Parameters<typeof JSON.parse>[1]) => {
