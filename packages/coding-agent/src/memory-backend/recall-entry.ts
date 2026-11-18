@@ -24,8 +24,9 @@ export const MEMORY_RECALL_CHANGES_MESSAGE_TYPE = "memory-recall-changes";
 /**
  * Hidden message carrying a recall that first succeeded after the conversation's prompt had been
  * sent without one: delivered after the turn's newest content instead of as a new system block, so
- * the cached prompt holds. A transcript that carries one has its recall, so a resume does not add it
- * to the system prompt.
+ * the cached prompt holds. It stays the recall's one copy for the branch's history
+ * ({@link findDeliveredRecall}): a resume does not add the recall to the system prompt, and a prompt
+ * rebuild leaves it out of the memory instructions ({@link withoutDeliveredRecall}).
  */
 export const MEMORY_RECALL_MESSAGE_TYPE = "memory-recall";
 
@@ -152,4 +153,41 @@ export function persistRecall(
 		text: recall.text,
 		memories: recall.memories,
 	} satisfies MemoryRecallEntryData);
+}
+
+/**
+ * The recall the branch delivered as a hidden {@link MEMORY_RECALL_MESSAGE_TYPE} message since its
+ * last context reset: the newest one. A compaction that summarized it leaves it on the branch, so the
+ * session sends it again after the next turn's newest content.
+ */
+export function findDeliveredRecall(branch: readonly SessionEntry[]): string | undefined {
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type === "reset_boundary") return undefined;
+		if (
+			entry.type === "custom_message" &&
+			entry.customType === MEMORY_RECALL_MESSAGE_TYPE &&
+			typeof entry.content === "string"
+		) {
+			return entry.content;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * A memory backend's `instructions` without the recall `branch` delivered ({@link findDeliveredRecall}).
+ * A backend's instructions carry the recall it adopted; that one is in the conversation already, and a
+ * prompt rebuild that also carried it would send it twice.
+ */
+export function withoutDeliveredRecall(
+	instructions: string | undefined,
+	branch: readonly SessionEntry[],
+): string | undefined {
+	if (!instructions) return instructions;
+	const recall = findDeliveredRecall(branch);
+	const index = recall ? instructions.lastIndexOf(recall) : -1;
+	if (!recall || index < 0) return instructions;
+	const rest = `${instructions.slice(0, index).trimEnd()}${instructions.slice(index + recall.length)}`.trim();
+	return rest || undefined;
 }

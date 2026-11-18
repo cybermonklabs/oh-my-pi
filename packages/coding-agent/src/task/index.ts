@@ -42,7 +42,7 @@ import { hasWaitTool } from "../tools/wait";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
-import { isScoutSpawnable, type ResolvedSpawnPolicy, resolveSpawnPolicy } from "./spawn-policy";
+import { isScoutSpawnable, type ResolvedSpawnPolicy, resolveSpawnPolicy, spawnableAgents } from "./spawn-policy";
 import { isBundledSeance, seanceTaskGuidance, seanceTaskSchemaFields, validateSeanceParams } from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
 import {
@@ -196,15 +196,11 @@ function defaultAgentFor(spawnPolicy: ResolvedSpawnPolicy, planMode: boolean): s
 function renderDescription(options: TaskDescriptionOptions): string {
 	const spawnPolicy = resolveSpawnPolicy(options.parentSpawns);
 	const spawningDisabled = !spawnPolicy.enabled;
-	const agents = [...options.agents, ...options.sessionAgents];
-	let filteredAgents =
-		options.disabledAgents.length > 0 ? agents.filter(agent => !options.disabledAgents.includes(agent.name)) : agents;
-	if (spawningDisabled) {
-		filteredAgents = [];
-	} else if (spawnPolicy.allowedAgents !== null) {
-		const allowed = new Set(spawnPolicy.allowedAgents);
-		filteredAgents = filteredAgents.filter(agent => allowed.has(agent.name));
-	}
+	let filteredAgents = spawnableAgents(
+		[...options.agents, ...options.sessionAgents],
+		options.disabledAgents,
+		spawnPolicy,
+	);
 	if (options.planMode) {
 		filteredAgents = filteredAgents.filter(agent => !isBundledSeance(agent));
 	}

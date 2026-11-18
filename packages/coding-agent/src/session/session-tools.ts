@@ -28,14 +28,15 @@ import {
 import { type LocalProtocolOptions } from "../internal-urls";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { deduplicateMCPToolsByName, resolveMCPToolAlias } from "../mcp/tool-bridge";
-import { MEMORY_RECALL_MESSAGE_TYPE } from "../memory-backend/recall-entry";
+import { findDeliveredRecall, MEMORY_RECALL_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import type { MemoryBackendStartOptions, MemoryPromptPreparation } from "../memory-backend/types";
 import { publishedAgentDiscovery } from "../task/discovery-snapshots";
 import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "../task/model-approval";
-import { perCallModelEnabled } from "../task/settings";
+import { cfgTaskDisabledAgents, perCallModelEnabled } from "../task/settings";
+import { resolveSpawnPolicy, spawnableAgents } from "../task/spawn-policy";
 import type { AgentDefinition } from "../task/types";
 import evalPreludeNoticePrompt from "../prompts/system/eval-prelude-notice.md" with { type: "text" };
 import perCallModelNoticePrompt from "../prompts/system/per-call-model-notice.md" with { type: "text" };
@@ -141,6 +142,8 @@ export interface SessionToolsHost {
 	steeringArrivalRelease(seq: number): void;
 	queuedMessageCount(): number;
 	planModeEnabled(): boolean;
+	/** The session's spawn policy (`spawns`): which agents it may spawn. */
+	sessionSpawns(): string;
 	model(): Model | undefined;
 	memoryBackendSession(): MemoryBackendStartOptions["session"];
 	clearInheritedProviderPromptCacheKey(): void;
@@ -234,7 +237,8 @@ interface SystemPromptPreparation {
 	memoryNotice?: MemoryPromptPreparation["notice"];
 	/**
 	 * Recall block to deliver as a hidden message after the turn's newest content rather than in
-	 * {@link systemPrompt}: the conversation's bound prompt was already sent without a recall.
+	 * {@link systemPrompt}: the conversation's bound prompt was already sent without a recall, or a
+	 * compaction summarized the hidden message that delivered it.
 	 */
 	memoryRecall?: string;
 	/** Publish staged state at validated delivery; false declines the prepared turn without mutation. */
@@ -515,12 +519,14 @@ interface SkillNoticeDetails {
 }
 
 /**
- * Agent names added/removed by one hidden {@link SESSION_AGENT_NOTICE_TYPE} or
- * {@link TASK_AGENT_NOTICE_MESSAGE_TYPE} message.
+ * Agents one hidden {@link SESSION_AGENT_NOTICE_TYPE} or {@link TASK_AGENT_NOTICE_MESSAGE_TYPE} message listed as
+ * available, new or with an edited description, and the ones it withdrew.
  */
 interface AgentNoticeDetails {
 	added: string[];
 	removed: string[];
+	/** The description the notice gave each `added` agent; notices written before edits were announced lack it. */
+	descriptions: Record<string, string>;
 }
 
 /** Whether `value` is the approvals a {@link PER_CALL_MODEL_NOTICE_MESSAGE_TYPE} message restated. */
@@ -1161,6 +1167,16 @@ export class SessionTools {
 	#perCallModelsAdvertised(): boolean {
 		const settings = this.#host.settings;
 		return perCallModelEnabled(settings, "task") || perCallModelEnabled(settings, "eval");
+	}
+
+	/** Whether a task or eval tool the session has lists the per-call models it approves. */
+	#perCallModelsListed(): boolean {
+		const settings = this.#host.settings;
+		const tools = this.getEnabledToolNames();
+		return (
+			(tools.includes("task") && perCallModelEnabled(settings, "task")) ||
+			(tools.includes("eval") && perCallModelEnabled(settings, "eval"))
+		);
 	}
 
 	/** Drops cached per-session ACP `allow_always`/`reject_always` decisions. */
@@ -2825,12 +2841,14 @@ export class SessionTools {
 	 * next user prompt instead of rewriting the task description, so a rescan
 	 * mid-session (an agent file added through the agents hub, a plugin reload)
 	 * keeps the provider cache prefix intact. Spawning reads its own fresh scan,
-	 * so a new agent works before and after the notice.
+	 * so a new agent works before and after the notice. Only the task
+	 * description lists them, so a session without the task tool gets none.
 	 *
 	 * Known agents are the committed base snapshot, then every such notice still
 	 * in context, applied in order ({@link #agentRosterNotice}).
 	 */
 	takeTaskAgentNotice(): CustomMessage<AgentNoticeDetails> | undefined {
+		if (!this.getEnabledToolNames().includes("task")) return undefined;
 		const committed = this.#promptSurface.discoveredAgents;
 		const live = publishedAgentDiscovery(this.#host.sessionManager.getCwd(), this.#host.effectiveExtensionRoots());
 		// Without a committed scan the description lists the latest one itself.
@@ -2839,8 +2857,11 @@ export class SessionTools {
 	}
 
 	/**
-	 * The hidden `customType` notice of the agents `live` adds to or removes from what the model knows: `committed`,
-	 * then the names every `customType` notice still in context added and removed, in order. `template` renders it.
+	 * The hidden `customType` notice of what `live` changes in the agents the model knows: `committed`, then what
+	 * every `customType` notice still in context listed and withdrew, in order. Both sides keep only the agents the
+	 * session may spawn now ({@link spawnableAgents}), as the task description lists them, so an agent the settings
+	 * disable is never announced. An agent whose description changed is listed again with the new one, since the
+	 * model picks agents by it. `template` renders the notice.
 	 */
 	#agentRosterNotice(
 		customType: string,
@@ -2848,26 +2869,44 @@ export class SessionTools {
 		committed: readonly AgentDefinition[],
 		live: readonly AgentDefinition[],
 	): CustomMessage<AgentNoticeDetails> | undefined {
-		const known = new Set(committed.map(agent => agent.name));
+		const disabledAgents = cfgTaskDisabledAgents.get(this.#host.settings);
+		const policy = resolveSpawnPolicy(this.#host.sessionSpawns());
+		// Each agent the model knows, with the description it was given: undefined when an older notice listed it.
+		const known = new Map<string, string | undefined>(
+			spawnableAgents(committed, disabledAgents, policy).map(agent => [agent.name, agent.description]),
+		);
 		for (const message of this.#host.agent.state.messages) {
 			if (message.role !== "custom" || message.customType !== customType) continue;
 			const details = message.details;
 			if (!isRecord(details) || !Array.isArray(details.added) || !Array.isArray(details.removed)) continue;
-			for (const name of details.added) if (typeof name === "string") known.add(name);
+			const descriptions: Record<string, unknown> = isRecord(details.descriptions) ? details.descriptions : {};
+			for (const name of details.added) {
+				if (typeof name !== "string") continue;
+				const description = descriptions[name];
+				known.set(name, typeof description === "string" ? description : known.get(name));
+			}
 			for (const name of details.removed) if (typeof name === "string") known.delete(name);
 		}
-		const liveNames = new Set(live.map(agent => agent.name));
-		const added = live.filter(agent => !known.has(agent.name));
-		const removed = [...known].filter(name => !liveNames.has(name));
-		if (added.length === 0 && removed.length === 0) return undefined;
+		const listed = spawnableAgents(live, disabledAgents, policy);
+		const listedNames = new Set(listed.map(agent => agent.name));
+		const added = listed.filter(agent => !known.has(agent.name));
+		const updated = listed.filter(agent => {
+			const description = known.get(agent.name);
+			return description !== undefined && description !== agent.description;
+		});
+		const removed = [...known.keys()].filter(name => !listedNames.has(name));
+		if (added.length === 0 && updated.length === 0 && removed.length === 0) return undefined;
+		const entry = (agent: AgentDefinition) => ({ name: agent.name, description: agent.description });
+		const announced = [...added, ...updated];
 		return {
 			role: "custom",
 			customType,
-			content: prompt.render(template, {
-				added: added.map(agent => ({ name: agent.name, description: agent.description })),
+			content: prompt.render(template, { added: added.map(entry), updated: updated.map(entry), removed }),
+			details: {
+				added: announced.map(agent => agent.name),
 				removed,
-			}),
-			details: { added: added.map(agent => agent.name), removed },
+				descriptions: Object.fromEntries(announced.map(agent => [agent.name, agent.description])),
+			},
 			attribution: "agent",
 			display: false,
 			timestamp: Date.now(),
@@ -2883,12 +2922,13 @@ export class SessionTools {
 	 * the provider cache prefix intact. The list is restated whole because roles,
 	 * allowlist and the own-model clause change together; a notice that a later
 	 * rebuild outdated costs at most one restatement of what the descriptions list.
+	 * A session with no task or eval tool that lists them gets none.
 	 */
 	takePerCallModelNotice(): CustomMessage<PerCallModelAdvertisement> | undefined {
 		const settings = this.#host.settings;
 		let known = this.#promptSurface.perCallModels;
 		// Without a committed snapshot the descriptions list the live approvals themselves.
-		if (!known || !this.#perCallModelsAdvertised()) return undefined;
+		if (!known || !this.#perCallModelsListed()) return undefined;
 		for (const message of this.#host.agent.state.messages) {
 			if (message.role !== "custom" || message.customType !== PER_CALL_MODEL_NOTICE_MESSAGE_TYPE) continue;
 			if (isPerCallModelAdvertisement(message.details)) known = message.details;
@@ -3700,15 +3740,25 @@ export class SessionTools {
 
 		try {
 			const memory = await backend.beforeAgentStartPrompt(this.#host.memoryBackendSession(), promptText, signal);
-			if (!isCurrent() || !memory) return { systemPrompt: this.#baseSystemPrompt };
+			if (!isCurrent()) return { systemPrompt: this.#baseSystemPrompt };
+			// A recall the branch delivered as a hidden message (see below) is its history, never a system block, not
+			// even on resume, and a prompt rebuild leaves it out of the memory instructions (`withoutDeliveredRecall`).
+			// One a compaction summarized goes out again, once, after this turn's newest content.
+			const carried = this.#host.agent.state.messages.some(
+				message => message.role === "custom" && message.customType === MEMORY_RECALL_MESSAGE_TYPE,
+			);
+			const compacted = carried ? undefined : findDeliveredRecall(this.#host.sessionManager.getBranchView());
+			if (carried || compacted !== undefined) {
+				return {
+					systemPrompt: this.#baseSystemPrompt,
+					memoryNotice: memory?.notice,
+					memoryRecall: compacted,
+					commit: () => isCurrent() && (memory?.commit() ?? true),
+				};
+			}
+			if (!memory) return { systemPrompt: this.#baseSystemPrompt };
 			const injected = memory.context;
-			// A recall the conversation already carries as a hidden message (see below) is history.
-			if (
-				!injected ||
-				this.#host.agent.state.messages.some(
-					message => message.role === "custom" && message.customType === MEMORY_RECALL_MESSAGE_TYPE,
-				)
-			) {
+			if (!injected) {
 				return {
 					systemPrompt: this.#baseSystemPrompt,
 					memoryNotice: memory.notice,
@@ -3718,8 +3768,7 @@ export class SessionTools {
 			// A conversation a prefix-bound model has answered went out without a recall (a reused one is
 			// the transcript's own). A fresh recall now would add a system block, and the provider would
 			// write the whole conversation to its cache again and drop its replayed thinking: it rides
-			// after the turn's newest content instead, with no rebuild. The backend's instructions carry
-			// the adopted recall, so the next rebuild (at a cut) may place it in the prompt.
+			// after the turn's newest content instead, with no rebuild, and stays there (see above).
 			if (!memory.reused && this.#promptBound) {
 				return {
 					systemPrompt: this.#baseSystemPrompt,

@@ -70,3 +70,19 @@ export function isScoutSpawnable(
 	if (!policy.enabled) return false;
 	return policy.allowedAgents === null || policy.allowedAgents.includes("scout");
 }
+
+/**
+ * The agents of `agents` a session may spawn: not disabled via `task.disabledAgents`, and permitted by its spawn
+ * `policy`. The task description lists these, and the hidden notices about agents announce only these.
+ */
+export function spawnableAgents<T extends { name: string }>(
+	agents: readonly T[],
+	disabledAgents: readonly string[],
+	policy: ResolvedSpawnPolicy,
+): T[] {
+	if (!policy.enabled) return [];
+	const allowed = policy.allowedAgents;
+	return agents.filter(
+		agent => !disabledAgents.includes(agent.name) && (allowed === null || allowed.includes(agent.name)),
+	);
+}

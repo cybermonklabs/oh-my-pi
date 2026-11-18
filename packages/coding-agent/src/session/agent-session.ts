@@ -577,6 +577,7 @@ import {
 	cfgThemeLight,
 } from "../modes/settings";
 import { cfgTaskBatch, cfgTaskDisabledAgents, perCallModelEnabled } from "../task/settings";
+import { isScoutSpawnable } from "../task/spawn-policy";
 import {
 	cfgBranchSummaryReserveTokens,
 	cfgCompactionModelThresholds,
@@ -1240,7 +1241,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Registry recording this agent blocked on the user while a {@link waitForUser} dialog is open. */
 	readonly #agentRegistry: AgentRegistryApi | undefined;
 	#agentKind: "main" | "sub" = "main";
-	#scoutAllowedBySpawnPolicy = true;
+	/** The session's spawn policy ({@link AgentSessionConfig.spawns}). */
+	readonly #spawns: string;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
 	/** OAuth account pools enforced on this session's key lookups; lifted on dispose. */
@@ -2650,6 +2652,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			steeringArrivalRelease: seq => this.#steeringArrivalRelease(seq),
 			queuedMessageCount: () => this.queuedMessageCount,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
+			sessionSpawns: () => this.#spawns,
 			model: () => this.model,
 			memoryBackendSession: () => this,
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
@@ -2756,7 +2759,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// replay-safe and transient provider errors after it stay retryable —
 		// same buffering contract print mode declares via setTextOutputCommitted.
 		this.#textOutputCommitted = this.#agentKind === "main";
-		this.#scoutAllowedBySpawnPolicy = config.scoutAllowedBySpawnPolicy ?? true;
+		this.#spawns = config.spawns ?? "*";
 		this.#ircAwaitingAssignment = config.awaitingAssignment === true;
 		this.#providerSessionId = config.providerSessionId;
 		this.#accountPoolScope = config.accountPoolScope;
@@ -8501,7 +8504,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	#isScoutAvailable(): boolean {
-		return this.#scoutAllowedBySpawnPolicy && !cfgTaskDisabledAgents.get(this.settings).includes("scout");
+		return isScoutSpawnable(cfgTaskDisabledAgents.get(this.settings), this.#spawns);
 	}
 
 	async #buildPlanModeMessage(): Promise<CustomMessage | null> {

@@ -56,6 +56,7 @@ const host: SessionToolsHost = {
 	steeringArrivalRelease: () => {},
 	queuedMessageCount: () => 0,
 	planModeEnabled: () => false,
+	sessionSpawns: () => "*",
 	model: () => undefined,
 	memoryBackendSession: () => ({}) as never,
 	clearInheritedProviderPromptCacheKey: () => {},
