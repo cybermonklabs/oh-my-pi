@@ -103,6 +103,44 @@ describe("mapInSlices", () => {
 		expect(sliceExpired()).toBe(true);
 	});
 
+	it("opens no second slice in one pass through the event loop, so other work and a slice together cannot hold off due timers", async () => {
+		// Real time: the timers' 1 ms clamp must pass while the slice works.
+		const busy = (ms: number) => {
+			const start = performance.now();
+			while (performance.now() - start < ms) {}
+		};
+		let timerTurns = 0;
+		let counting = true;
+		const countTimers = () => {
+			if (!counting) return;
+			timerTurns++;
+			setTimeout(countTimers, 0);
+		};
+		setTimeout(countTimers, 0);
+		await new Promise(resolve => setTimeout(resolve, 5));
+		const unitTimerTurns: Record<string, number[]> = { first: [], second: [] };
+		const unit = (name: string) => {
+			unitTimerTurns[name].push(timerTurns);
+			busy(UNIT_MS);
+		};
+		// The first pass uses up a slice in this pass through the event loop.
+		const first = mapInSlices(
+			Array.from({ length: UNITS_PER_SLICE }, () => "first"),
+			unit,
+		);
+		// Other work later in the same pass resumes a second pass before the timers run again.
+		const second = new Promise<void>(resolve => {
+			setImmediate(() => {
+				void mapInSlices(["second"], unit).then(() => resolve());
+			});
+		});
+		await Promise.all([first, second]);
+		counting = false;
+		expect(unitTimerTurns.first).toEqual(Array(UNITS_PER_SLICE).fill(unitTimerTurns.first[0]));
+		// The second pass's unit waited for the timers.
+		expect(unitTimerTurns.second[0]).toBeGreaterThan(unitTimerTurns.first[0]);
+	});
+
 	it("runs to completion under fake timers, whose frozen clock never ends a slice", async () => {
 		vi.useFakeTimers();
 		let spin = 0;

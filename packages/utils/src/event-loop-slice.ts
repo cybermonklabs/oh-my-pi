@@ -12,6 +12,11 @@
  * the waiters before it used, or each takes a full budget of its own.
  * {@link mapInSlices} and {@link runInSlices} keep that rule for their callers.
  *
+ * A slice lasts until the event loop next runs its timers, so one pass through
+ * the loop holds at most one slice. Other work in the same pass, such as socket
+ * callbacks or unsliced code, cannot be followed by a second slice before the
+ * timers that fell due run.
+ *
  * Concurrent passes share one budget per turn and take it in turn: the waiter
  * that used up the last slice resumes after the others in the next turn.
  *
@@ -23,13 +28,23 @@
 export const EVENT_LOOP_SLICE_MS = 10;
 
 let sliceStart = 0;
-/** True from a slice's first check until the event loop next runs a macrotask. */
+/** True from a slice's first check until the event loop next runs its timers. */
 let sliceOpen = false;
 /** Resolvers of the passes waiting for the next turn, in the order they asked. */
 let waiters: Array<() => void> = [];
 /** The batch of waiters a scheduled release is for; 0 once released. */
 let pendingBatch = 0;
 let lastBatch = 0;
+/** How many times a check-phase release of the pending batch waited for the timers. */
+let releaseDeferrals = 0;
+/**
+ * How many passes through the check phase a release waits for the timers to
+ * close the slice. A busy pass through the event loop outlasts the timers' 1 ms
+ * clamp, so the timers close the slice first; an idle loop goes round this many
+ * times in microseconds, and the release then goes ahead without the clamp. The
+ * bound also covers timers that never run (fake timers with a clock a test moves).
+ */
+const MAX_RELEASE_DEFERRALS = 3;
 
 function closeSlice(): void {
 	sliceOpen = false;
@@ -38,7 +53,7 @@ function closeSlice(): void {
 /**
  * Whether the current slice has used its budget, so the caller must await
  * {@link nextSlice} before its next unit. The first check after the event loop
- * ran a macrotask opens a new slice that counts from that check, so the first
+ * ran its timers opens a new slice that counts from that check, so the first
  * pass to check in a turn runs at least one unit, however long other work in
  * that turn took.
  */
@@ -47,10 +62,10 @@ export function sliceExpired(): boolean {
 	if (!sliceOpen) {
 		sliceOpen = true;
 		sliceStart = now;
-		// setImmediate, not setTimeout: fake timers replace setTimeout, and a
-		// slice that never closed would stay expired after they are removed.
-		// A late close only costs the next check one extra turn.
-		setImmediate(closeSlice);
+		// Closed by a timer, so work later in this pass through the event loop
+		// finds the slice still open. Fake timers replace setTimeout, so the close
+		// may never run: a release (below) opens the next turn anyway.
+		setTimeout(closeSlice, 0);
 	} else if (now < sliceStart) {
 		// A clock behind the slice's start is a mocked clock put back: start over.
 		sliceStart = now;
@@ -68,23 +83,32 @@ export function sliceExpired(): boolean {
  * `createAgentSession`, a promise resolved from its callback did not resume
  * until a timer next woke the event loop, so each turn cost up to a timer
  * period. `setTimeout` alone costs its 1 ms clamp on every turn, and fake
- * timers replace it; `setImmediate` still runs under fake timers.
+ * timers replace it; `setImmediate` still runs under fake timers. While the
+ * slice is still open, the `setImmediate` leg waits for the timers, at most
+ * {@link MAX_RELEASE_DEFERRALS} passes through the check phase.
  */
 export function nextSlice(): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	if (waiters.length === 0) {
 		const batch = ++lastBatch;
 		pendingBatch = batch;
-		setImmediate(releaseWaiters, batch);
+		releaseDeferrals = 0;
+		setImmediate(releaseWaiters, batch, true);
 		setTimeout(releaseWaiters, 0, batch);
 	}
 	waiters.push(resolve);
 	return promise;
 }
 
-function releaseWaiters(batch: number): void {
+function releaseWaiters(batch: number, inCheckPhase = false): void {
 	// The other leg of a released batch, or of one a later batch replaced.
 	if (batch !== pendingBatch) return;
+	if (inCheckPhase && sliceOpen && releaseDeferrals < MAX_RELEASE_DEFERRALS) {
+		// The timers have not run since the slice opened: let them run first.
+		releaseDeferrals++;
+		setImmediate(releaseWaiters, batch, true);
+		return;
+	}
 	pendingBatch = 0;
 	// This macrotask is a new turn, whether or not the last slice's close ran yet.
 	sliceOpen = false;
