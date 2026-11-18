@@ -253,8 +253,11 @@ def test_fetch_pr_head_rejects_stale_branch_sha(tmp_path: Path, pr_fetch: tuple[
 
 @pytest.mark.parametrize(
     ("same_repo", "head_ref", "stderr"),
-    [(False, "feature/x", "couldn't find remote ref"), (True, None, "couldn't find remote ref"),
-     (True, "feature/x", "authentication failed")],
+    [
+        (False, "feature/x", "couldn't find remote ref"),
+        (True, None, "couldn't find remote ref"),
+        (True, "feature/x", "authentication failed"),
+    ],
 )
 def test_fetch_pr_head_preserves_ineligible_error(
     tmp_path: Path, pr_fetch: tuple[Mock, Mock], same_repo: bool, head_ref: str | None, stderr: str
@@ -276,9 +279,7 @@ def test_fetch_pr_head_combines_fetch_failures(tmp_path: Path, pr_fetch: tuple[M
         subprocess.CompletedProcess([], 128, "", "branch fetch failed"),
     ]
     with pytest.raises(GitCommandError) as caught:
-        git_ops.fetch_pr_head(
-            tmp_path, 7, token=None, head_ref="feature/x", head_sha="abc123", same_repo=True
-        )
+        git_ops.fetch_pr_head(tmp_path, 7, token=None, head_ref="feature/x", head_sha="abc123", same_repo=True)
     assert "couldn't find remote ref" in caught.value.stderr
     assert "branch fetch failed" in caught.value.stderr
     backfill.assert_not_called()
@@ -287,9 +288,28 @@ def test_fetch_pr_head_combines_fetch_failures(tmp_path: Path, pr_fetch: tuple[M
 @pytest.mark.parametrize(
     "head_ref",
     [
-        "--dry-run", "main:refs/heads/evil", "a..b", "a//b", "a b",
-        "a~b", "a^b", "a?b", "a*b", "a[b", "a\\b", "a\x00b", "a\x1fb", "a\x7fb",
-        "a@{b", "@", "/main", "main/", "main.", "main.lock", ".hidden/main", "a.lock/main",
+        "--dry-run",
+        "main:refs/heads/evil",
+        "a..b",
+        "a//b",
+        "a b",
+        "a~b",
+        "a^b",
+        "a?b",
+        "a*b",
+        "a[b",
+        "a\\b",
+        "a\x00b",
+        "a\x1fb",
+        "a\x7fb",
+        "a@{b",
+        "@",
+        "/main",
+        "main/",
+        "main.",
+        "main.lock",
+        ".hidden/main",
+        "a.lock/main",
         "refs/heads/-evil",
     ],
 )
@@ -300,16 +320,10 @@ def test_fetch_pr_head_rejects_unsafe_ref_before_branch_fetch(
     # runs, fails with a missing remote ref, and the unsafe branch name is
     # rejected before any branch fetch is attempted.
     run, backfill = pr_fetch
-    run.side_effect = [
-        subprocess.CompletedProcess([], 128, "", "fatal: couldn't find remote ref pull/7/head")
-    ]
+    run.side_effect = [subprocess.CompletedProcess([], 128, "", "fatal: couldn't find remote ref pull/7/head")]
     with pytest.raises(ValueError, match="invalid ref"):
-        git_ops.fetch_pr_head(
-            tmp_path, 7, token=None, head_ref=head_ref, head_sha="abc123", same_repo=True
-        )
-    assert [call.args[0] for call in run.call_args_list] == [
-        ["fetch", "--no-tags", "origin", "pull/7/head"]
-    ]
+        git_ops.fetch_pr_head(tmp_path, 7, token=None, head_ref=head_ref, head_sha="abc123", same_repo=True)
+    assert [call.args[0] for call in run.call_args_list] == [["fetch", "--no-tags", "origin", "pull/7/head"]]
     backfill.assert_not_called()
 
 
@@ -317,9 +331,7 @@ def test_fetch_pr_head_fallback_requires_head_sha(tmp_path: Path, pr_fetch: tupl
     # Without a head SHA the fetched branch tip cannot be verified, so the
     # fallback is ineligible and the original error propagates.
     run, backfill = pr_fetch
-    original = GitCommandError(
-        ["git", "fetch"], 128, "", "fatal: couldn't find remote ref pull/7/head"
-    )
+    original = GitCommandError(["git", "fetch"], 128, "", "fatal: couldn't find remote ref pull/7/head")
     run.side_effect = original
     with pytest.raises(GitCommandError) as caught:
         git_ops.fetch_pr_head(tmp_path, 7, token=None, head_ref="feature/x", same_repo=True)

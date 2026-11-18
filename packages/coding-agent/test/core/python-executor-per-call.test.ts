@@ -155,9 +155,13 @@ describe("executePython (per-call)", () => {
 
 		PythonKernel.start = async () => kernel as unknown as PythonKernel;
 
+		// The cell times out the way the eval tool times one out: its watchdog aborts `signal` with a
+		// TimeoutError, and `idleTimeoutMs` only names the budget in the message. A wall-clock
+		// `timeoutMs` would race the test: on a loaded machine its deadline can pass before the
+		// kernel starts executing, and the cell then ends without ever reaching the kernel.
 		const resultPromise = executePython("sleep(10)", {
 			kernelMode: "per-call",
-			timeoutMs: 2000,
+			idleTimeoutMs: 2000,
 			signal: abortController.signal,
 			cwd: tempDir.path(),
 		});

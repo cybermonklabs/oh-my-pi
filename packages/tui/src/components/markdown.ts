@@ -10,6 +10,7 @@ import {
 	type TokensList,
 } from "@oh-my-pi/pi-utils/marked";
 import {
+	MathBlockScan,
 	type MathBlockOpener,
 	type MathOpener,
 	mathBlockCloserIndex,
@@ -60,6 +61,11 @@ const OSC8_ST_PREFIX_REGEX = /(\x1b\]8;[^\x07\x1b]*)\x1b\\/g;
 
 function normalizeOsc8Terminators(text: string): string {
 	return text.replace(OSC8_ST_PREFIX_REGEX, "$1\x07");
+}
+
+/** `text` with tabs expanded: the render's first normalization step, which renderMarkdownHead repeats. */
+function expandTabs(text: string): string {
+	return text.includes("\t") ? replaceTabs(text) : text;
 }
 
 /**
@@ -141,6 +147,20 @@ function fenceOpenAt(text: string, end: number): boolean {
 		}
 	}
 	return open !== undefined;
+}
+
+/** Locked column widths: per table (see tableLockKey), per available width. */
+export type TableLocks = Map<string, Map<number, readonly number[]>>;
+
+/**
+ * A table's lock key: where it starts in the source, plus its header and
+ * delimiter lines, so two tables with the same header never share a lock.
+ * Undefined before both lines are complete.
+ */
+function tableLockKey(offset: number, raw: string): string | undefined {
+	const header = raw.indexOf("\n");
+	const delimiter = header < 0 ? -1 : raw.indexOf("\n", header + 1);
+	return delimiter < 0 ? undefined : `${offset}:${raw.slice(0, delimiter)}`;
 }
 
 /**
@@ -1616,6 +1636,138 @@ export function fencedCode(lang: string, source: string, options?: { open?: bool
 	return options?.open ? `${fence}${lang}\n${source}` : `${fence}${lang}\n${source.trimEnd()}\n${fence}`;
 }
 
+/** @internal exported for tests — the size of renderMarkdownHead's first probe window. */
+export const PROBE_WINDOW_BYTES = 2 * 1024;
+
+/**
+ * Size of the first probe window: `PROBE_WINDOW_BYTES`, or up to one character
+ * past the first blank line when that lies further. A boundary is a token
+ * whose raw ends in `"\n\n"` and that ends inside its window, so no smaller
+ * window can cut. With no blank line, it is the whole text.
+ */
+function firstProbeSize(text: string): number {
+	const nextBlank = text.indexOf("\n\n");
+	return nextBlank === -1 ? text.length : Math.max(PROBE_WINDOW_BYTES, nextBlank + 3);
+}
+
+/**
+ * Size of the next probe window after the one of `size` gave no usable cut
+ * (no boundary, or a prefix with too few rows): at least double, and one
+ * character past the first blank line that reaches the window's edge, or
+ * `blockEnd` when the probe stopped at a display-math block ending there,
+ * since only such a blank line can end a later boundary. Doubling toward a
+ * far closer would re-lex the block once per window. With no blank line left,
+ * it is the whole text.
+ */
+function nextProbeSize(text: string, size: number, blockEnd: number): number {
+	const nextBlank = text.indexOf("\n\n", Math.max(size, blockEnd) - 2);
+	return nextBlank === -1 ? text.length : Math.max(2 * size, nextBlank + 3);
+}
+
+/**
+ * The last stable block boundary ({@link stableBlockBoundary}) in the window
+ * `text.slice(0, size)`, from a throwaway block-only lex of the window, and
+ * the `blockEnd` {@link nextProbeSize} reaches past. `mathBlocks` holds the
+ * display-math blocks of all of `text`. The scan stops in front of the first
+ * window token the one-pass lex of `text` may lex differently:
+ *  - The last one: it runs to the window's end, and an unclosed fence, HTML
+ *    block or comment runs to the end of its input, so it can be cut short.
+ *  - One that opens a display-math block the window cut short: a token other
+ *    than `math` where `mathBlocks` finds a block. The one-pass lex makes that
+ *    block one `math` token across its blank lines; `blockEnd` is its end, or
+ *    0. An opener with no closer, or with a whitespace-only body, is no block
+ *    in either lex, so it leaves later boundaries alone.
+ * The tokens must tile their source: the lexer can leave text after a bare
+ * math environment's closing delimiter out of every token.
+ */
+function probeBoundary(text: string, size: number, mathBlocks: MathBlockScan): { end: number; blockEnd: number } {
+	const probe = new Lexer(markdownParser.defaults);
+	const tokens = probe.blockTokens(text.slice(0, size), probe.tokens);
+	const base = tokens.length > 0 && !text.startsWith(tokens[0].raw) ? 1 : 0;
+	let endIndex = tokens.length - 1;
+	let blockEnd = 0;
+	for (let i = 0, pos = base; i < tokens.length; pos += tokens[i].raw.length, i++) {
+		if (!text.startsWith(tokens[i].raw, pos)) {
+			endIndex = Math.min(endIndex, i);
+			break;
+		}
+		if (tokens[i].type === "math") continue;
+		const block = mathBlocks.at(pos);
+		if (block !== undefined) {
+			blockEnd = pos + block.raw.length;
+			endIndex = Math.min(endIndex, i);
+			break;
+		}
+	}
+	return { end: stableBlockBoundary(text, base, tokens, { endIndex }).end, blockEnd };
+}
+
+/**
+ * Whether some line of `text` holds a `[` before a `]:`, for renderMarkdownHead
+ * only. A reference definition registers for the whole document, so a prefix
+ * rendered alone could leave a reference above the cut unresolved. marked
+ * registers one from a single line that opens with `[label]:`, at any nesting
+ * depth (a quote or list item lexes a suffix of each of its source lines), so
+ * every definition passes, including a nested one the line-anchored
+ * HAS_REF_DEF misses. Over-matching prose like `[a] b]:` only costs the cut.
+ */
+function hasRefDefAnywhere(text: string): boolean {
+	if (!text.includes("]:")) return false;
+	let bracketOpen = false;
+	for (let i = 0; i < text.length; i++) {
+		const c = text.charCodeAt(i);
+		if (c === 0x0a) bracketOpen = false;
+		else if (c === 0x5b) bracketOpen = true;
+		else if (c === 0x5d && bracketOpen && text.charCodeAt(i + 1) === 0x3a) return true;
+	}
+	return false;
+}
+
+/** The leading rendered rows of a Markdown document. */
+export interface MarkdownHead {
+	/** Leading rows; each equals the same row of a full render. */
+	lines: readonly string[];
+	/** Whether the document was cut: the source past the cut went unrendered, so a full render may have more rows. */
+	truncated: boolean;
+}
+
+/**
+ * Render the leading rows of a Markdown document: more than `minRows` rows,
+ * or the whole document when it is shorter. The document is cut only at a
+ * stable top-level block boundary, so every returned row equals the same row
+ * of a full render. It renders whole, not `truncated`, in three cases:
+ * - It is under two probe windows: the first probe alone lexes half of it or
+ *   more, which leaves a cut little to save.
+ * - It can't be cut: a line could hold a reference definition
+ *   ({@link hasRefDefAnywhere}), or a CR shifts the token offsets.
+ * - No cut works: the orphan-fence repair would pair a fence in front of the
+ *   cut with one past it, or no boundary short of the end leaves more than
+ *   `minRows` rows.
+ */
+export function renderMarkdownHead(text: string, width: number, theme: MarkdownTheme, minRows: number): MarkdownHead {
+	// The text a final-mode `Markdown` lexes: the constructor normalizes OSC 8
+	// terminators, then render expands tabs and repairs an orphan closing fence.
+	const normalized = repairOrphanClosingFence(expandTabs(normalizeOsc8Terminators(text)));
+	if (normalized.length >= 2 * PROBE_WINDOW_BYTES && !normalized.includes("\r") && !hasRefDefAnywhere(normalized)) {
+		const mathBlocks = new MathBlockScan(normalized);
+		for (let size = firstProbeSize(normalized); size < normalized.length;) {
+			const boundary = probeBoundary(normalized, size, mathBlocks);
+			if (boundary.end > 0) {
+				const head = normalized.slice(0, boundary.end);
+				// Rendering `head` repairs it again on its own. That fires only when the
+				// repair's line scan pairs a fence the lexer doesn't see (one inside an
+				// HTML block, say) with a partner past the cut; then only a whole render
+				// matches.
+				if (repairOrphanClosingFence(head) !== head) break;
+				const lines = new Markdown(head, 0, 0, theme).render(width);
+				if (lines.length > minRows) return { lines, truncated: true };
+			}
+			size = nextProbeSize(normalized, size, boundary.blockEnd);
+		}
+	}
+	return { lines: new Markdown(text, 0, 0, theme).render(width), truncated: false };
+}
+
 /** A hyperlink as the renderer sees it: inline `[text](href)`, `<autolink>`, bare GFM URL, or reference link. */
 export interface MarkdownLink {
 	/** Flattened visible label with whitespace collapsed to one row; falls back to `href` when empty. */
@@ -2476,6 +2628,27 @@ export class Markdown implements Component {
 	// texts extend it, so the published prefix never shrinks when the list
 	// stops being the last block.
 	#streamListSettledText?: string;
+	// The text through the last finished row of a locked table that is still
+	// streaming as the last block. A locked table's column widths no longer
+	// follow its rows, so a finished row renders the same whatever follows it.
+	#streamTableSettledText?: string;
+	// Key of the table streaming as the last block in the latest render, so
+	// lockOpenTable can lock it.
+	#openTableKey?: string;
+	// Source offset of each top-level table token the latest lex produced; a
+	// table's lock is keyed by it.
+	#tableOffsets = new WeakMap<Token, number>();
+	/**
+	 * Column widths of locked tables, per table (see tableLockKey) and per
+	 * available width. The owner gives one map to the Markdown streaming a
+	 * text block and to the ones rendering that block's stable prefix, so both
+	 * lay a locked table out the same; other blocks get their own maps.
+	 */
+	tableLocks?: TableLocks;
+	#openTableTail = false;
+	// While openTableTail is set: the table that is the document's last
+	// top-level block in the render under way, the only one that ends open.
+	#openTailToken?: Token;
 	// The prefix before a rewind that only a closer on the still-growing last
 	// line caused. Once a later text holds no closer line after it, that
 	// prefix is right again, so #lexTokens puts it back.
@@ -2661,9 +2834,10 @@ export class Markdown implements Component {
 	 * Width-independent source prefix of the last render that no append can
 	 * change: up to a frozen Markdown block boundary, stopping in front of a
 	 * display-math opener whose block an append could still close, or, while a
-	 * list streams as the last block, up to its newest top-level item. Only
-	 * meaningful while streaming (transient render cache on); grows
-	 * monotonically under append-only `setText`.
+	 * list streams as the last block, up to its newest top-level item, or,
+	 * while a locked table streams as the last block, through its last
+	 * finished row. Only meaningful while streaming (transient render cache
+	 * on); grows monotonically under append-only `setText`.
 	 */
 	getLastRenderStableText(): string {
 		if (!this.#transientRenderCache) return "";
@@ -2690,8 +2864,48 @@ export class Markdown implements Component {
 		let text = this.#streamSettledText ?? "";
 		const list = this.#streamListSettledText;
 		if (list !== undefined && list.length > text.length) text = list;
+		const table = this.#streamTableSettledText;
+		if (table !== undefined && table.length > text.length) text = table;
 		if (fence !== undefined && fence.length > text.length) text = fence;
 		return text;
+	}
+
+	/** Whether {@link getLastRenderStableText} ends inside a locked table that is still streaming. */
+	lastRenderStableTextEndsInOpenTable(): boolean {
+		const table = this.#streamTableSettledText;
+		return table !== undefined && this.getLastRenderStableText() === table;
+	}
+
+	/**
+	 * Lock the column widths of the table streaming as the last block, as they
+	 * stand, so its finished rows stop depending on rows still to come and can
+	 * leave the screen for scrollback. A later cell wraps inside the locked
+	 * widths. The lock holds for the table's final render too. Returns whether
+	 * a table was newly locked, so the owner can request the frame that
+	 * publishes its finished rows.
+	 */
+	lockOpenTable(): boolean {
+		const key = this.#openTableKey;
+		if (key === undefined || this.tableLocks === undefined || this.tableLocks.has(key)) return false;
+		this.tableLocks.set(key, new Map());
+		this.invalidate();
+		return true;
+	}
+
+	/**
+	 * End a table that is the last block with a row separator instead of its
+	 * bottom border: set while rendering a stable prefix cut inside a table
+	 * that keeps streaming, so the prefix's rows are the first rows of every
+	 * later render.
+	 */
+	get openTableTail(): boolean {
+		return this.#openTableTail;
+	}
+
+	set openTableTail(value: boolean) {
+		if (this.#openTableTail === value) return;
+		this.#openTableTail = value;
+		this.invalidate();
 	}
 
 	get transientRenderCache(): boolean {
@@ -2737,6 +2951,18 @@ export class Markdown implements Component {
 	// raw-span offsets). Every fallback is correctness-preserving — only speed
 	// differs; the render loop sees the identical token list either way.
 	#lexTokens(text: string): Token[] {
+		const tokens = this.#lexTopLevel(text);
+		if (this.tableLocks !== undefined) {
+			let offset = 0;
+			for (const token of tokens) {
+				if (token.type === "table") this.#tableOffsets.set(token, offset);
+				offset += token.raw.length;
+			}
+		}
+		return tokens;
+	}
+
+	#lexTopLevel(text: string): Token[] {
 		// A prefix is frozen only while canStream holds and its lex registered no
 		// definitions, and it ends at a "\n\n" block boundary (stableBlockBoundary),
 		// so the tail starts at a fresh line. The scan below then catches a
@@ -2809,6 +3035,7 @@ export class Markdown implements Component {
 			if (tokens !== undefined) {
 				this.#freezeStablePrefix(text, tokens, { preserveExisting: true });
 				this.#checkpointStreamingList(text, tokens);
+				this.#checkpointStreamingTable(text, tokens);
 				return tokens;
 			}
 		}
@@ -2821,7 +3048,10 @@ export class Markdown implements Component {
 				const tokens = [...prefixTokens, ...tailTokens];
 				if (retainPrefix) this.#freezeStablePrefix(text, tokens, { preserveExisting: true });
 				else this.#dropStreamPrefix();
-				if (retainPrefix) this.#checkpointStreamingList(text, tokens);
+				if (retainPrefix) {
+					this.#checkpointStreamingList(text, tokens);
+					this.#checkpointStreamingTable(text, tokens);
+				}
 				return tokens;
 			}
 		}
@@ -2833,6 +3063,7 @@ export class Markdown implements Component {
 		if (canStream && retainPrefix && !hasReferenceDefinitions) {
 			this.#freezeStablePrefix(text, tokens, { preserveExisting: false });
 			this.#checkpointStreamingList(text, tokens);
+			this.#checkpointStreamingTable(text, tokens);
 		} else {
 			this.#dropStreamPrefix();
 		}
@@ -2922,6 +3153,52 @@ export class Markdown implements Component {
 		}
 	}
 
+	#checkpointStreamingTable(text: string, tokens: Token[]): void {
+		if (this.#streamTableSettledText !== undefined && !text.startsWith(this.#streamTableSettledText)) {
+			this.#streamTableSettledText = undefined;
+		}
+		this.#openTableKey = undefined;
+		let index = tokens.length - 1;
+		while (tokens[index]?.type === "space") index--;
+		const token = tokens[index];
+		if (token?.type !== "table") return;
+		// Runs inside the lex, before #lexTokens records offsets: sum them here.
+		let start = 0;
+		for (let i = 0; i < index; i++) start += tokens[i]!.raw.length;
+		const key = tableLockKey(start, token.raw);
+		if (key === undefined) return;
+		this.#openTableKey = key;
+		if (!this.tableLocks?.has(key)) return;
+		// Like a list, the table must start at the settled boundary: a
+		// display-math opener in front of it could still absorb it. ATX headings
+		// right above it (no blank line between) are finished and cannot hold
+		// such an opener, so the boundary may sit in front of them instead.
+		const prefix = this.#streamPrefixText?.length ?? 0;
+		const settled = this.#streamSettledText?.length ?? 0;
+		let boundary = start;
+		for (let i = index - 1; boundary !== prefix || settled !== boundary; i--) {
+			const before = tokens[i];
+			if (before?.type !== "heading" || !/^ {0,3}#/.test(before.raw) || !before.raw.endsWith("\n")) return;
+			boundary -= before.raw.length;
+		}
+		// The header, the delimiter and every finished row end in a newline;
+		// whatever follows the last one is the row still being written. A later
+		// reference definition can still turn a bracketed label into a link, so
+		// the settled rows also stop in front of the first row holding one.
+		const table = token as TableToken;
+		if (table.header.some(cell => REFERENCE_LABEL_RE.test(labelSource(cell.tokens ?? [])))) return;
+		let finished = token.raw.indexOf("\n", token.raw.indexOf("\n") + 1) + 1;
+		for (const row of table.rows) {
+			const next = token.raw.indexOf("\n", finished) + 1;
+			if (next === 0) break;
+			if (row.some(cell => REFERENCE_LABEL_RE.test(labelSource(cell.tokens ?? [])))) break;
+			finished = next;
+		}
+		if (token.raw.slice(0, finished).split("\n").length - 1 < 3) return;
+		const end = start + finished;
+		if (end > (this.#streamTableSettledText?.length ?? 0)) this.#streamTableSettledText = text.slice(0, end);
+	}
+
 	/**
 	 * Drop the frozen lex prefix and the transient row caches keyed on it. A
 	 * prefix set aside for #restoreRewoundPrefix checks itself against each
@@ -2933,6 +3210,8 @@ export class Markdown implements Component {
 		this.#streamPrefixOpeners = NO_OPENERS;
 		this.#streamSettledText = undefined;
 		this.#streamListSettledText = undefined;
+		this.#streamTableSettledText = undefined;
+		this.#openTableKey = undefined;
 		this.#streamPrefixLineCache = undefined;
 		this.#tailRowCache = undefined;
 		this.#listItemRowsCache = undefined;
@@ -3253,7 +3532,8 @@ export class Markdown implements Component {
 		// returns without ever reading these, so streaming frames skip the
 		// whole-document tab scan/copy (the delta-only replaceTabs inside the
 		// branch is the only tab work a streamed frame pays).
-		const tabbed = this.#text.includes("\t") ? replaceTabs(this.#text) : this.#text;
+		const tabbed = expandTabs(this.#text);
+		// renderMarkdownHead probes and cuts this same final-mode text.
 		const normalizedText = this.transientRenderCache ? tabbed : repairOrphanClosingFence(tabbed);
 		if (!this.transientRenderCache && normalizedText.length < tabbed.length) {
 			// repairOrphanClosingFence deleted bytes this frame (orphan fence
@@ -3283,7 +3563,10 @@ export class Markdown implements Component {
 		// theme.heading is used as the representative theme probe — it's required
 		// by MarkdownTheme and is one of the most styling-sensitive entries.
 		let cacheKey: string | undefined;
-		if (!this.transientRenderCache) {
+		// A locked table or an open table tail lays out differently from the
+		// same text elsewhere, so such renders stay out of the shared cache.
+		const sharedCache = !this.#openTableTail && !this.tableLocks?.size;
+		if (!this.transientRenderCache && sharedCache) {
 			cacheKey = this.#renderCacheKey(normalizedText, signature);
 			const cached = renderCache.get(cacheKey);
 			if (cached !== undefined) {
@@ -3307,7 +3590,12 @@ export class Markdown implements Component {
 		const held = this.transientRenderCache && tail ? holdPendingBullet(tail) : undefined;
 		const open = held ?? tail;
 		const speculated = this.transientRenderCache && open ? (speculateStreamingToken(open) ?? held) : undefined;
+		const tailOffset = tail === undefined ? undefined : this.#tableOffsets.get(tail);
+		if (speculated !== undefined && tailOffset !== undefined) this.#tableOffsets.set(speculated, tailOffset);
 		const tokens = speculated ? [...lexed.slice(0, -1), speculated] : lexed;
+		let last = tokens.length - 1;
+		while (tokens[last]?.type === "space") last--;
+		this.#openTailToken = this.#openTableTail && tokens[last]?.type === "table" ? tokens[last] : undefined;
 		let contentLines: string[];
 		this.#activeRenderSignature = signature;
 		try {
@@ -4891,6 +5179,15 @@ export class Markdown implements Component {
 			}
 		}
 
+		const offset = this.#tableOffsets.get(token);
+		const key = offset === undefined ? undefined : tableLockKey(offset, token.raw);
+		const lock = key === undefined ? undefined : this.tableLocks?.get(key);
+		if (lock !== undefined) {
+			const pinned = lock.get(availableWidth);
+			if (pinned !== undefined && pinned.length === numCols) columnWidths = [...pinned];
+			else lock.set(availableWidth, columnWidths);
+		}
+
 		const t = this.#symbols.table;
 		const h = t.horizontal;
 		const v = t.vertical;
@@ -4971,6 +5268,12 @@ export class Markdown implements Component {
 			}
 		}
 
+		// A stable prefix cut inside a table that keeps streaming ends where the
+		// next row's separator goes, not with a border no later render has.
+		if (this.#openTableTail && token === this.#openTailToken) {
+			lines.push(separatorLine);
+			return lines;
+		}
 		// Render bottom border
 		const bottomBorderCells = columnWidths.map(w => h.repeat(w));
 		const bottomBorder = `${t.bottomLeft}${h}${bottomBorderCells.join(`${h}${t.teeUp}${h}`)}${h}${t.bottomRight}`;

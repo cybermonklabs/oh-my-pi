@@ -143,6 +143,8 @@ def upstream_repo(slot_tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     git_system_config = slot_tmp_path / "git-system.conf"
     _git(["config", "--file", str(git_system_config), "--add", "safe.directory", str(upstream)], cwd=slot_tmp_path)
     git_system_config.chmod(0o644)
+    # conftest sets GIT_CONFIG_NOSYSTEM, which would make git skip this file.
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(git_system_config))
     return upstream
 

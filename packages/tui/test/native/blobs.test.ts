@@ -9,6 +9,41 @@ import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import type { Component } from "@oh-my-pi/pi-tui/tui";
 import { TspHarness } from "./tsp-harness";
 
+/** How long a fixture child may run once it has printed its verdict before it counts as stuck. */
+const EXIT_AFTER_VERDICT_MS = 5_000;
+
+/**
+ * Runs a fixture child to its verdict. It may take as long as the machine's load makes it,
+ * up to the test's own timeout; once it has printed `verified`, it must exit within
+ * {@link EXIT_AFTER_VERDICT_MS} (a real-time bound on a real process, so no fake clock), or it
+ * is killed and its output reported, since a timer or handle left armed would keep it alive.
+ */
+async function runToVerdict(command: string[], env: NodeJS.ProcessEnv) {
+	const child = Bun.spawn(command, { stdout: "pipe", stderr: "pipe", env });
+	let stdout = "";
+	let lingered = false;
+	let exitClock: Timer | undefined;
+	const decoder = new TextDecoder();
+	const readStdout = (async () => {
+		for await (const chunk of child.stdout) {
+			stdout += decoder.decode(chunk, { stream: true });
+			if (exitClock === undefined && stdout.includes("verified\n")) {
+				exitClock = setTimeout(() => {
+					lingered = true;
+					child.kill("SIGKILL");
+				}, EXIT_AFTER_VERDICT_MS);
+			}
+		}
+	})();
+	try {
+		const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited, readStdout]);
+		return { exitCode, stderr, stdout, lingered };
+	} finally {
+		clearTimeout(exitClock);
+		child.kill("SIGKILL");
+	}
+}
+
 describe("native image blob lifetime", () => {
 	const cases = [
 		...["base64", "image", "attachment", "snapcompact"].map(source => ({
@@ -35,6 +70,8 @@ describe("native image blob lifetime", () => {
 			source: "",
 		},
 	];
+	// Each case's verdict is its child's output: the case waits for it however long the machine's
+	// load makes the child take, then gives the child a short clock to exit (runToVerdict).
 	for (const { name, fixture, source } of cases) {
 		it(
 			name,
@@ -58,24 +95,11 @@ describe("native image blob lifetime", () => {
 						fs.promises.mkdir(root.join(dir), { recursive: true }),
 					),
 				);
-				const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures", fixture), source], {
-					stdout: "pipe",
-					stderr: "pipe",
+				const result = await runToVerdict(
+					[process.execPath, path.join(import.meta.dir, "fixtures", fixture), source],
 					env,
-				});
-				const timeout = setTimeout(() => child.kill(), 10_000);
-				try {
-					const [stdout, stderr, exitCode] = await Promise.all([
-						new Response(child.stdout).text(),
-						new Response(child.stderr).text(),
-						child.exited,
-					]);
-					expect({ exitCode, stderr, stdout }).toEqual({ exitCode: 0, stderr: "", stdout: "verified\n" });
-				} finally {
-					clearTimeout(timeout);
-					child.kill();
-					await child.exited;
-				}
+				);
+				expect(result).toEqual({ exitCode: 0, stderr: "", stdout: "verified\n", lingered: false });
 			},
 			15_000,
 		);

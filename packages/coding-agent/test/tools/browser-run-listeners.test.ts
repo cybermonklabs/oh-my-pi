@@ -17,7 +17,8 @@ const server = Bun.serve({
 			await slowRelease.promise;
 			return new Response("slow", { headers: { "content-type": "text/plain" } });
 		}
-		return new Response("<!doctype html><title>listeners fixture</title>", {
+		// An inline icon keeps Chrome from fetching /favicon.ico after a load: the tests below count requests in flight.
+		return new Response('<!doctype html><link rel="icon" href="data:,"><title>listeners fixture</title>', {
 			headers: { "content-type": "text/html" },
 		});
 	},
@@ -222,6 +223,9 @@ return { order, onceCalls, reads, requestPatched };`,
 	}, 30_000);
 
 	test("puppeteer's own request subscriptions unsubscribe during a run", async () => {
+		// Puppeteer subscribes to a request's completion events while it is in flight. Each wait below is an event:
+		// a quiet window of real time cannot tell a request whose events are late from one that has finished.
+		const probeUrl = `${baseUrl}/unsubscribe-probe`;
 		const invoke = createHost();
 		await invoke({ action: "open", name: "unsubscribe", url: `${baseUrl}/` });
 		const counts = valueOf(
@@ -229,9 +233,18 @@ return { order, onceCalls, reads, requestPatched };`,
 				action: "run",
 				name: "unsubscribe",
 				code: `const count = () => ["requestfinished", "requestfailed", "response"].map(type => page.listenerCount(type));
+// Puppeteer has finished every request it saw (the open's own): it counts none in flight.
+await page.waitForNetworkIdle({ idleTime: 0, timeout: 0 });
 const before = count();
-await tab.evaluate(url => fetch(url).then(response => response.text()), ${JSON.stringify(`${baseUrl}/`)});
-await page.waitForNetworkIdle({ idleTime: 200, timeout: 3000 });
+const finished = Promise.withResolvers();
+const onFinished = request => {
+	if (request.url() === ${JSON.stringify(probeUrl)}) finished.resolve();
+};
+page.on("requestfinished", onFinished);
+await tab.evaluate(url => fetch(url).then(response => response.text()), ${JSON.stringify(probeUrl)});
+// The request's last event: puppeteer's subscriptions for it have ended by the time it is delivered.
+await finished.promise;
+page.off("requestfinished", onFinished);
 return [before, count()];`,
 			}),
 		) as number[][];
@@ -254,7 +267,8 @@ return null;`,
 			await invoke({
 				action: "run",
 				name: "idle",
-				code: `await page.waitForNetworkIdle({ idleTime: 200, timeout: 3000 });
+				// Puppeteer counts the earlier run's request in flight until it finishes: idle is that event, not a window.
+				code: `await page.waitForNetworkIdle({ idleTime: 0, timeout: 0 });
 return "idle";`,
 			}),
 		);

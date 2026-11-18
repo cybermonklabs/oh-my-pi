@@ -16,6 +16,7 @@
  * override) declares a lifetime for the retention tier the request used, so
  * providers whose replay behavior is unvalidated are never touched.
  */
+import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import {
 	type Api,
 	type AssistantMessage,
@@ -145,6 +146,20 @@ export function getPromptCacheTtlMs(
 export function observedPromptCacheTier(usage: Usage): PromptCacheTier | undefined {
 	if ((usage.cttl?.ephemeral1h ?? 0) > 0) return "long";
 	if ((usage.cttl?.ephemeral5m ?? 0) > 0) return "short";
+	return undefined;
+}
+
+/**
+ * Lifetime of the entry a completed response wrote, as the provider named it in
+ * its per-TTL cache-write breakdown (Anthropic `usage.cache_creation`): the
+ * `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens` fields name
+ * their entries' lifetimes. A response that wrote both names the shorter: the
+ * cached prefix lives only as long as its shortest part. Undefined when the
+ * response wrote nothing or the provider does not report the split.
+ */
+export function observedPromptCacheTtlMs(usage: Usage): number | undefined {
+	if ((usage.cttl?.ephemeral5m ?? 0) > 0) return 5 * 60_000;
+	if ((usage.cttl?.ephemeral1h ?? 0) > 0) return 60 * 60_000;
 	return undefined;
 }
 
@@ -756,11 +771,16 @@ export class CacheWarmer {
 	async #replay(run: ActiveRun): Promise<AssistantMessage | undefined> {
 		const cutoff = new AbortController();
 		let stream: CacheWarmStream;
+		const replaySignal = AbortSignal.any([run.controller.signal, cutoff.signal]);
 		const onPayload = run.options.onPayload;
 		const replayOptions: SimpleStreamOptions = {
 			...run.options,
 			maxTokens: 1,
-			signal: AbortSignal.any([run.controller.signal, cutoff.signal]),
+			signal: replaySignal,
+			// The armed options carry the agent loop's own hold, bound to a turn
+			// that has ended and to its pause reporting. A refresh is a request of
+			// the warmer's, so `/pause` holds it on the warmer's own lifetime.
+			beforeDispatch: agentPauseGate.dispatchHold(replaySignal),
 			onPayload: (payload, model, signal) => {
 				run.refreshSentAt = Date.now();
 				return onPayload?.(payload, model, signal);
