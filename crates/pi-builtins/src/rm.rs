@@ -1904,23 +1904,17 @@ mod tests {
 	use super::{Rm, clean_trailing_slashes};
 	use crate::host::{Host, Utility, run_util};
 
-	/// `rm -r root` removes nothing outside `root` while `root/sub` flips
-	/// between a directory and a symlink to `outside/`, 2,000 times. A kernel
-	/// that refuses the symlink at the directory open passes this as it is;
-	/// gVisor before release-20261109.0, which follows a symlink to a
-	/// directory despite `O_NOFOLLOW` when `O_DIRECTORY` is set
-	/// (google/gvisor#14786), passes it only because rm keeps no directory but
-	/// the one it stat'd.
+	/// Runs `rm -r root` 2,000 times while `swapped`, the operand `root` or
+	/// `root/sub`, flips between a directory and a symlink to `outside/`.
+	/// Returns how many runs removed a file in `outside/`.
 	#[cfg(unix)]
-	#[test]
-	fn recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink() {
+	fn rm_r_while_swapping(swapped: &str) -> usize {
 		const RUNS: usize = 2_000;
 		let (mut escapes, mut refusals) = (0, 0);
 		for _ in 0..RUNS {
 			let cwd = tempdir().unwrap();
-			let (root, parked, outside) =
-				(cwd.path().join("root"), cwd.path().join("parked"), cwd.path().join("outside"));
-			let sub = root.join("sub");
+			let (parked, outside) = (cwd.path().join("parked"), cwd.path().join("outside"));
+			let (sub, flipped) = (cwd.path().join("root/sub"), cwd.path().join(swapped));
 			std::fs::create_dir_all(&sub).unwrap();
 			std::fs::create_dir_all(&outside).unwrap();
 			for i in 0..4 {
@@ -1931,16 +1925,16 @@ mod tests {
 			let err = std::thread::scope(|scope| {
 				scope.spawn(|| {
 					while !stop.load(Ordering::Relaxed) {
-						if std::fs::rename(&sub, &parked).is_err() {
+						if std::fs::rename(&flipped, &parked).is_err() {
 							std::thread::yield_now();
 							continue;
 						}
-						let _ = std::os::unix::fs::symlink(&outside, &sub);
+						let _ = std::os::unix::fs::symlink(&outside, &flipped);
 						for _ in 0..50 {
 							std::hint::spin_loop();
 						}
-						let _ = std::fs::remove_file(&sub);
-						let _ = std::fs::rename(&parked, &sub);
+						let _ = std::fs::remove_file(&flipped);
+						let _ = std::fs::rename(&parked, &flipped);
 					}
 				});
 				let (_, capture) = run_util::<Rm>(&["-r", "root"], "", cwd.path());
@@ -1954,8 +1948,34 @@ mod tests {
 				refusals += 1;
 			}
 		}
-		eprintln!("{RUNS} runs: {escapes} removed a file outside the tree, {refusals} refused the swapped directory");
+		eprintln!(
+			"{RUNS} runs swapping {swapped}: {escapes} removed a file outside the tree, {refusals} refused the swapped directory"
+		);
+		escapes
+	}
+
+	/// `rm -r root` removes nothing outside `root` while `root/sub` flips
+	/// between a directory and a symlink to `outside/`, 2,000 times. A kernel
+	/// that refuses the symlink at the directory open passes this as it is;
+	/// gVisor before release-20261109.0, which follows a symlink to a
+	/// directory despite `O_NOFOLLOW` when `O_DIRECTORY` is set
+	/// (google/gvisor#14786), passes it only because rm keeps no directory but
+	/// the one it stat'd.
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink() {
+		let escapes = rm_r_while_swapping("root/sub");
 		assert_eq!(escapes, 0, "rm -r removed files outside the tree through a swapped symlink");
+	}
+
+	/// The same while the operand `root` itself flips. rm checks the operand
+	/// with `lstat`, so on every kernel it must not open a symlink put there
+	/// since.
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink() {
+		let escapes = rm_r_while_swapping("root");
+		assert_eq!(escapes, 0, "rm -r removed files outside the operand through a swapped symlink");
 	}
 
 	#[test]
