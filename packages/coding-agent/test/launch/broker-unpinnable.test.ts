@@ -267,7 +267,7 @@ describe("daemon broker with a daemon whose mark could not be read at spawn", ()
 				expect(started.daemon.processStart).toBeUndefined();
 				failing.now = false;
 				// The broker still holds its child, which has not exited: the refresh reads
-				// the mark, and persists it.
+				// the mark, and the `list` replies once it is persisted.
 				const mark = realFromPid(pid)?.startMark;
 				expect((await snapshotOf(client)).processStart).toBe(mark ?? "no mark");
 				const meta = JSON.parse(await Bun.file(path.join(runtimeDir, "daemons", NAME, "meta.json")).text());

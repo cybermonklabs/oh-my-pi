@@ -1146,7 +1146,7 @@ class DaemonBroker {
 	 */
 	async #refreshDetached(record: ManagedDaemon): Promise<void> {
 		if (settledState(record.snapshot.state)) return;
-		this.#refreshMark(record);
+		await this.#refreshMark(record);
 		if (record.pendingKills.length > 0 && (await this.#retryPendingKills(record))) return;
 		if (!record.spec.detached) return;
 		const generation = record.generation;
@@ -1157,11 +1157,14 @@ class DaemonBroker {
 	}
 
 	/**
-	 * {@link markOwnChild}: a mark read for the broker's own child is
-	 * persisted, and given to the pending kills of the same daemon, which
-	 * then pin it.
+	 * {@link markOwnChild}: a mark read for the broker's own child is given to
+	 * the pending kills of the same daemon, which then pin it, and persisted
+	 * before this returns: a request that refreshed the record (`list`, `stop`,
+	 * `send`) replies once the mark is on disk, so a broker that dies right
+	 * after cannot lose it again (its successor could not read it: the daemon
+	 * is no longer that broker's child).
 	 */
-	#refreshMark(record: ManagedDaemon): void {
+	async #refreshMark(record: ManagedDaemon): Promise<void> {
 		if (!markOwnChild(record)) return;
 		for (const pending of record.pendingKills) {
 			if (pending.generation === record.generation && pending.target.pid === record.snapshot.pid) {
@@ -1169,6 +1172,7 @@ class DaemonBroker {
 			}
 		}
 		this.#persist(record);
+		await record.persistQueue;
 	}
 
 	/**
@@ -1486,7 +1490,7 @@ class DaemonBroker {
 				if (operation.signal === "SIGINT") record.pty.write("\u0003");
 				else record.pty.kill();
 			} else {
-				this.#refreshMark(record);
+				await this.#refreshMark(record);
 				const pin = pinDaemon(record.snapshot);
 				if (pin.kind === "unpinned") {
 					throw new Error(`Daemon ${operation.name} runs, but cannot be pinned to signal it now`);
