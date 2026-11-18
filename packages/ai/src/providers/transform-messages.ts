@@ -394,6 +394,26 @@ function isMalformedToolCall(block: { id: string; name: string }, allowedName: R
 }
 
 /**
+ * A tool result the agent loop synthesized for a call that was never invoked
+ * locally — the placeholder that keeps the `tool_use`/`tool_result` pairing
+ * valid when a turn ends before its tools run.
+ *
+ * The shape is produced by `createSyntheticToolResultMessage` in
+ * `@oh-my-pi/pi-agent-core` (`SyntheticToolResultDetails`), which sits above
+ * this package and so cannot be imported here; the agent package carries a
+ * contract test asserting its output satisfies this predicate, so the two
+ * cannot drift apart silently.
+ *
+ * It matters at the wire boundary because such a result carries no tool output
+ * at all: dropping it loses nothing, while replaying it costs a message.
+ */
+export function isSyntheticNotExecutedToolResult(message: ToolResultMessage): boolean {
+	const details: unknown = message.details;
+	if (typeof details !== "object" || details === null) return false;
+	return Reflect.get(details, "__synthetic") === true && Reflect.get(details, "executed") === false;
+}
+
+/**
  * Drop assistant `toolCall` blocks with an empty / whitespace-only `id` or a `name`
  * the target provider cannot declare (see {@link isMalformedToolCallName}),
  * the `toolResult` messages they point at, and any assistant turn that has no
@@ -504,6 +524,24 @@ export function isSurvivingAssistant(msg: AssistantMessage, model?: Model): bool
 			? !isMalformedToolCall(block, allowedName, maxLength)
 			: !isTruncatedStop || block.type === "text",
 	);
+}
+
+/** Whether `msg` carries mid-conversation Anthropic request controls (`clearAt`, `effort`, `toolChanges`). */
+export function hasAnthropicMessageControls(msg: Message): boolean {
+	if (msg.role !== "developer" || msg.providerPayload?.type !== "anthropicMessage") return false;
+	const { clearAt, effort, toolChanges } = msg.providerPayload;
+	return clearAt !== undefined || effort !== undefined || (toolChanges !== undefined && toolChanges.length > 0);
+}
+
+/**
+ * Whether a `user` or `developer` message emits a non-tool-result wire turn
+ * that ends an assistant tool loop instead of being dropped as empty.
+ */
+export function isReplayTurnBoundary(msg: Message): boolean {
+	if (msg.role === "assistant" || msg.role === "toolResult") return false;
+	if (hasAnthropicMessageControls(msg)) return true;
+	if (typeof msg.content === "string") return msg.content.trim().length > 0;
+	return msg.content.some(block => (block.type === "text" && block.text.trim().length > 0) || block.type === "image");
 }
 
 function getLatestSurvivingAssistantIndex(messages: readonly Message[], model: Model): number {
@@ -1539,6 +1577,16 @@ export function transformMessages<TApi extends Api>(
 				// `user` role is mapped to plain user content by every provider, so the
 				// content survives without ever being treated as an instruction the
 				// model should obey.
+				// ...unless there is nothing to preserve. A synthetic not-executed
+				// placeholder carries no tool output: no `tool.execute()` ran, and its
+				// text is a fixed sentence (historically the provider's own error text,
+				// which is how a refused turn got every later turn of the session
+				// refused — INFRA-1191). Replaying it as a `<stale-tool-result>` user
+				// note re-sends that text on every request and tells the model nothing.
+				// Drop it. This is the one place that catches a live in-memory orphan
+				// too: a long-lived process that never reloads never rebuilds its
+				// context, so a load-time repair alone would not reach it.
+				if (isSyntheticNotExecutedToolResult(msg)) continue;
 				const textParts: string[] = [];
 				for (const part of msg.content) {
 					if (part.type === "text" && part.text.trim() !== "") textParts.push(part.text);

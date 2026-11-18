@@ -1,5 +1,7 @@
-//! Test-only in-memory `mem://` provider, so walks and searches run through a
-//! non-native [`Fs`] with URL roots.
+//! Test-only helpers: an in-memory `mem://` provider, so walks and searches
+//! run through a non-native [`Fs`] with URL roots; the symlink-swap tree
+//! ([`SwapTree`]); [`settle`] for the listing cache; and [`temp_root`], where
+//! tests make their trees.
 
 use std::{
 	collections::BTreeMap,
@@ -21,6 +23,57 @@ const MEM_DEV: u64 = 7;
 
 /// Symlink hops before resolution fails, like `ELOOP`.
 const MAX_HOPS: usize = 40;
+
+/// Where a test makes its trees: Bazel's per-test `TEST_TMPDIR` when it is
+/// set, else the system's temporary directory. `TEST_TMPDIR` lies below the
+/// test's sandbox directory, which Bazel removes, also after it kills the
+/// test; under the process-wrapper sandbox `/tmp` is the host's, where a
+/// killed test's tree would stay. A Bazel 9.2.0 server that removed a chain
+/// of 1,215 levels left in its sandbox died (exit 37; it survived 1,205), so
+/// every chain a test builds stays far shorter.
+///
+/// A test's temporary directory can lie on a filesystem the listing cache
+/// refuses by design: a container's root filesystem is an overlay, and gVisor
+/// serves every volume from the host as 9p. There a cached-listing test would
+/// walk fresh listings only, and fail or pass without testing the cache. On
+/// those two the cache takes this directory's stamps as stable
+/// ([`crate::fs::seam::trust_stamps`]). What it cannot see there is a change
+/// made outside the machine (in an overlay's lower directory, or by another
+/// writer on gVisor's host); the tests change their trees from inside, and
+/// each such change moves its directory's stamp on those filesystems too.
+/// Every other filesystem is left to the cache's own check, so on ext4, XFS
+/// or tmpfs a check that refused them fails the cached-listing tests.
+pub fn temp_root() -> PathBuf {
+	let root = std::env::var_os("TEST_TMPDIR")
+		.map(PathBuf::from)
+		.filter(|dir| dir.is_dir())
+		.unwrap_or_else(std::env::temp_dir);
+	#[cfg(target_os = "linux")]
+	if refused_by_design(&root) {
+		use std::os::unix::fs::MetadataExt as _;
+		let meta = std::fs::metadata(&root).expect("the temporary directory exists");
+		crate::fs::seam::trust_stamps(meta.dev());
+	}
+	root
+}
+
+/// Whether `dir` lies on overlayfs or 9p, the filesystems [`temp_root`] can be
+/// on that the listing cache refuses by design. Read from `statfs` here, not
+/// from the cache's own check, which the tests are to check.
+#[cfg(target_os = "linux")]
+fn refused_by_design(dir: &Path) -> bool {
+	const OVERLAYFS: u32 = 0x794c_7630;
+	const V9FS: u32 = 0x0102_1997;
+	let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
+		.expect("no NUL in the temporary directory");
+	let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+	// SAFETY: `path` is NUL-terminated and `fs` is a valid out-pointer.
+	let done = unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) };
+	assert_eq!(done, 0, "statfs {}: {}", dir.display(), io::Error::last_os_error());
+	// SAFETY: `statfs` succeeded and filled `fs`.
+	let magic = unsafe { fs.assume_init_ref() }.f_type as u32;
+	matches!(magic, OVERLAYFS | V9FS)
+}
 
 #[derive(Debug)]
 enum Kind {
@@ -287,4 +340,189 @@ impl FileSystem for MemFs {
 			.collect();
 		Ok(ReadDir::from_entries(entries))
 	}
+
+	/// Removes a non-directory, a symlink itself; ancestor symlinks are
+	/// followed.
+	async fn remove_file(&self, path: &Path) -> io::Result<()> {
+		let mut tree = self.tree.lock();
+		let (real, node) = tree.lookup(path, false)?;
+		if matches!(node.kind, Kind::Dir) {
+			return Err(pi_vfs::is_a_directory());
+		}
+		tree.nodes.remove(&real);
+		Ok(())
+	}
+
+	/// Removes an empty directory; ancestor symlinks are followed.
+	async fn remove_dir(&self, path: &Path) -> io::Result<()> {
+		let mut tree = self.tree.lock();
+		let (real, node) = tree.lookup(path, false)?;
+		if !matches!(node.kind, Kind::Dir) {
+			return Err(pi_vfs::not_a_directory());
+		}
+		if tree
+			.nodes
+			.keys()
+			.any(|child| pi_vfs::parent_path(child) == Some(real.as_path()))
+		{
+			return Err(io::ErrorKind::DirectoryNotEmpty.into());
+		}
+		tree.nodes.remove(&real);
+		Ok(())
+	}
+}
+
+/// Lets every stamp in a tree age past the listing cache's racy window.
+pub fn settle() {
+	std::thread::sleep(Duration::from_millis(120));
+}
+
+/// What the directory a [`SwapTree`] swap links to holds.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outside {
+	/// Case A: only `secret-<tag>.txt`, a name the walk never listed, so
+	/// reading it needs the walk to descend into the swapped link.
+	OtherName,
+	/// Case B: `decoy-<tag>.txt`, the name of the listed file, so reading it
+	/// needs only the file's open to pass through the link.
+	SameName,
+}
+
+/// A tree for the symlink-swap tests, under a fresh temporary base:
+/// `root/<d/ × depth>sub-<tag>/decoy-<tag>.txt` holding `needle inside`, and
+/// `outside/` next to `root` holding [`Outside`]'s file with `needle outside`.
+/// A swap runs once, at the [`crate::fs::seam`] just before the first open of
+/// an entry, and records how that open reaches the entry; dropping the tree
+/// removes it.
+#[cfg(unix)]
+pub struct SwapTree {
+	base:             PathBuf,
+	/// The walk root.
+	pub root:         PathBuf,
+	/// The directory a swap replaces.
+	pub sub:          PathBuf,
+	/// The final component of `sub`.
+	pub sub_name:     String,
+	/// The name of the file listed in `sub`.
+	pub decoy_name:   String,
+	/// The name of the file in `outside/` ([`Outside`]).
+	pub outside_name: String,
+	outside:          PathBuf,
+	opened:           Arc<Mutex<Option<crate::fs::seam::Open>>>,
+}
+
+#[cfg(unix)]
+impl SwapTree {
+	/// Builds the tree; `tag` makes its names unique in the process.
+	pub fn new(tag: &str, depth: usize, outside: Outside) -> Self {
+		static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+		let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		let tag = format!("{tag}-{}-{n}", std::process::id());
+		let base = temp_root()
+			.canonicalize()
+			.expect("temp dir canonicalizes")
+			.join(format!("pi-walker-swap-{tag}"));
+		let _ = std::fs::remove_dir_all(&base);
+		let root = base.join("root");
+		let sub_name = format!("sub-{tag}");
+		let decoy_name = format!("decoy-{tag}.txt");
+		let mut sub = root.clone();
+		for _ in 0..depth {
+			sub.push("d");
+		}
+		sub.push(&sub_name);
+		std::fs::create_dir_all(&sub).expect("sub is created");
+		std::fs::write(sub.join(&decoy_name), "needle inside\n").expect("decoy is written");
+		let outside_dir = base.join("outside");
+		std::fs::create_dir_all(&outside_dir).expect("outside is created");
+		let outside_name = match outside {
+			Outside::OtherName => format!("secret-{tag}.txt"),
+			Outside::SameName => decoy_name.clone(),
+		};
+		std::fs::write(outside_dir.join(&outside_name), "needle outside\n").expect("outside file");
+		Self {
+			base,
+			root,
+			sub,
+			sub_name,
+			decoy_name,
+			outside_name,
+			outside: outside_dir,
+			opened: Arc::default(),
+		}
+	}
+
+	/// Swaps `sub` for a symlink to `outside/` now.
+	pub fn swap_dir(&self) {
+		swap_dir(&self.sub, &self.outside, &self.base.join("parked"));
+	}
+
+	/// Puts the directory [`Self::swap_dir`] parked back in place of the link.
+	pub fn unswap_dir(&self) {
+		std::fs::remove_file(&self.sub).expect("the link is removed");
+		std::fs::rename(self.base.join("parked"), &self.sub).expect("sub is back");
+	}
+
+	/// Swaps `sub` for a symlink to `outside/` just before the first open of
+	/// an entry named `name`.
+	pub fn swap_dir_before_open(&self, name: &str) {
+		crate::fs::seam::before_open(name, self.dir_swap());
+	}
+
+	/// Swaps `sub` for a symlink to `outside/` just before the first stat of
+	/// an entry named `name`.
+	pub fn swap_dir_before_stat(&self, name: &str) {
+		crate::fs::seam::before_stat(name, self.dir_swap());
+	}
+
+	/// A hook that swaps `sub` and records the call it ran before.
+	fn dir_swap(&self) -> impl FnOnce(crate::fs::seam::Open) + Send + 'static {
+		let (sub, outside, parked) =
+			(self.sub.clone(), self.outside.clone(), self.base.join("parked"));
+		let opened = Arc::clone(&self.opened);
+		move |open| {
+			swap_dir(&sub, &outside, &parked);
+			*opened.lock() = Some(open);
+		}
+	}
+
+	/// Swaps the listed file for a symlink to `outside/`'s file of the same
+	/// name ([`Outside::SameName`]) just before its first open.
+	pub fn swap_file_before_open(&self) {
+		let file = self.sub.join(&self.decoy_name);
+		let target = self.outside.join(&self.decoy_name);
+		let opened = Arc::clone(&self.opened);
+		crate::fs::seam::before_open(&self.decoy_name, move |open| {
+			std::fs::remove_file(&file).expect("decoy is removed");
+			std::os::unix::fs::symlink(target, &file).expect("decoy becomes a link");
+			*opened.lock() = Some(open);
+		});
+	}
+
+	/// How the call that ran the swap reached its entry; `None` while no
+	/// hooked swap ran.
+	pub fn swapped(&self) -> Option<crate::fs::seam::Open> {
+		*self.opened.lock()
+	}
+}
+
+/// Parks the directory `sub` at `parked` and links `sub` to `outside`.
+#[cfg(unix)]
+fn swap_dir(sub: &Path, outside: &Path, parked: &Path) {
+	std::fs::rename(sub, parked).expect("sub is parked");
+	std::os::unix::fs::symlink(outside, sub).expect("sub becomes a link");
+}
+
+#[cfg(unix)]
+impl Drop for SwapTree {
+	fn drop(&mut self) {
+		let _ = std::fs::remove_dir_all(&self.base);
+	}
+}
+
+/// Whether any of `texts` came from outside a [`SwapTree`]'s root.
+#[cfg(unix)]
+pub fn escaped<'a>(texts: impl IntoIterator<Item = &'a str>) -> bool {
+	texts.into_iter().any(|text| text.contains("outside"))
 }

@@ -200,6 +200,7 @@ import type {
 	CursorTodoSnapshotItem,
 	CursorTodoSyncHandler,
 	CursorToolResultHandler,
+	FetchImpl,
 	ImageContent,
 	Message,
 	Model,
@@ -226,11 +227,14 @@ import {
 	kStreamingPartialJson,
 } from "../utils/block-symbols";
 import { deterministicUuid } from "../utils/deterministic-id";
+import { dispatchWhenOpen } from "../utils/dispatch-hold";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { connectProxiedSocket, getProxyForUrl, wrapFetchForProxy } from "../utils/proxy";
+import { armPreResponseTimeout } from "../utils/idle-iterator";
+import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { waitForRetry } from "../utils/retry-wait";
 import { sanitizeSchemaForCursor, toolWireSchema } from "../utils/schema";
+import { transportFetch } from "../utils/transport-fetch";
 import { formatConnectEndStreamError, hasRetryableCursorErrorDetail } from "./connect-error-detail";
 import { CONNECT_END_STREAM_FLAG, ConnectFrameDecoder, frameConnectMessage } from "./connect-frame";
 import mcpExternalHandoffMessage from "./cursor-external-tool-handoff.md" with { type: "text" };
@@ -798,6 +802,15 @@ interface CursorMessageWriter {
 
 interface CursorRunTransport extends CursorMessageWriter {
 	readonly closed: boolean;
+	/**
+	 * Send a frame whose only job is to keep the stream open. Everything `write`
+	 * sends is something the server waits for before it can go on — the run
+	 * request, a tool's output and result, a blob — so the HTTP/1 transport
+	 * keeps the time one of those spends held off the stream watchdog. A
+	 * keepalive gets no such allowance: one goes out every 5 s, and if each
+	 * restarted the watchdog a stalled stream would never time out.
+	 */
+	writeKeepalive(frame: Uint8Array): void;
 	close(): void;
 	/**
 	 * Stop sending after the server's end frame. HTTP/2 half-closes the request
@@ -819,6 +832,11 @@ function wrapHttp2RunTransport(request: http2.ClientHttp2Stream): CursorRunTrans
 			return request.closed;
 		},
 		write(frame) {
+			if (!request.writableEnded) request.write(frame);
+		},
+		// Every frame shares the one request stream, which was held once before
+		// it opened, so a keepalive needs nothing a reply does not.
+		writeKeepalive(frame) {
 			if (!request.writableEnded) request.write(frame);
 		},
 		close() {
@@ -850,11 +868,26 @@ interface CursorHttp1RunTransportOptions {
 	headers: Record<string, string>;
 	requestId: string;
 	signal?: AbortSignal;
+	/**
+	 * The caller's transport fetch. Every RunSSE and BidiAppend request goes
+	 * through it, so each waits on the caller's dispatch hold — the proxy, the
+	 * CA bundle and `PI_REQ_DEBUG` ride along with it.
+	 */
+	fetch: FetchImpl;
+	/**
+	 * The stream this transport feeds. The time a frame the server waits for
+	 * spends parked on the dispatch hold is reported to it as local work, so its
+	 * watchdog does not read a request we are holding as a provider that
+	 * stopped answering.
+	 */
+	heldWork?: AssistantMessageEventStream;
 }
 
 interface CursorPendingAppend {
 	seqno: bigint;
 	data: Uint8Array;
+	/** Sent by {@link CursorRunTransport.writeKeepalive}: nothing waits for it. */
+	keepalive: boolean;
 }
 
 const CURSOR_HTTP1_APPEND_CONCURRENCY = 16;
@@ -879,11 +912,14 @@ function readConnectFrameMessage(frame: Uint8Array): Uint8Array {
 function createHttp1RunTransport(options: CursorHttp1RunTransportOptions): CursorRunTransport {
 	const abortController = new AbortController();
 	const signal = options.signal ? AbortSignal.any([options.signal, abortController.signal]) : abortController.signal;
-	const fetchImpl = wrapFetchForProxy(globalThis.fetch, "cursor");
+	const fetchImpl = options.fetch;
 	const requestId = create(BidiRequestIdSchema, { requestId: options.requestId });
 	const pendingAppends: CursorPendingAppend[] = [];
 	let appendSeqno = 0n;
 	let activeAppends = 0;
+	// Whether a keepalive is queued, held or waiting for its answer. One such
+	// keepalive keeps the stream as open as several would.
+	let keepaliveOutstanding = false;
 	let closed = false;
 	let ended = false;
 	let responseListener: (headers: http2.IncomingHttpHeaders) => void = () => {};
@@ -911,12 +947,27 @@ function createHttp1RunTransport(options: CursorHttp1RunTransportOptions): Curso
 		const timeoutMs =
 			CURSOR_HTTP1_APPEND_BASE_TIMEOUT_MS +
 			Math.ceil(append.data.byteLength / CURSOR_HTTP1_APPEND_BYTES_PER_SECOND) * 1_000;
-		const response = await fetchImpl(new URL(CURSOR_BIDI_APPEND_PATH, options.baseUrl), {
-			method: "POST",
-			headers: { ...options.headers, "content-type": "application/proto" },
-			body: toBinary(BidiAppendRequestSchema, body),
-			signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
-		});
+		// The guard restarts when the request leaves the transport, so a caller's
+		// dispatch hold is not charged to Cursor's latency, and it is cleared as
+		// soon as the response arrives so a slow body is the idle watchdog's
+		// business (issue #2422). A frame the server waits for — the run request,
+		// a tool's output and result, a blob — also keeps its held time off the
+		// stream watchdog: the server cannot answer what has not reached it, so
+		// the silence while we hold it is ours. A keepalive does not, because every
+		// settled window restarts that watchdog's clock and a heartbeat every 5 s
+		// would keep a stalled stream alive forever.
+		const watchdog = armPreResponseTimeout(signal, timeoutMs, append.keepalive ? undefined : options.heldWork);
+		let response: Response;
+		try {
+			response = await fetchImpl(new URL(CURSOR_BIDI_APPEND_PATH, options.baseUrl), {
+				method: "POST",
+				headers: { ...options.headers, "content-type": "application/proto" },
+				body: toBinary(BidiAppendRequestSchema, body),
+				signal: watchdog.signal,
+			});
+		} finally {
+			watchdog.clear();
+		}
 		if (response.ok) {
 			await response.body?.cancel();
 			return;
@@ -936,6 +987,7 @@ function createHttp1RunTransport(options: CursorHttp1RunTransportOptions): Curso
 				.catch(fail)
 				.finally(() => {
 					activeAppends--;
+					if (append.keepalive) keepaliveOutstanding = false;
 					pumpAppends();
 				});
 		}
@@ -980,10 +1032,17 @@ function createHttp1RunTransport(options: CursorHttp1RunTransportOptions): Curso
 		},
 		write(frame) {
 			if (closed || ended) return;
-			pendingAppends.push({
-				seqno: appendSeqno++,
-				data: readConnectFrameMessage(frame),
-			});
+			pendingAppends.push({ seqno: appendSeqno++, data: readConnectFrameMessage(frame), keepalive: false });
+			pumpAppends();
+		},
+		writeKeepalive(frame) {
+			// A pause holds every append. Were keepalives queued regardless, one
+			// every 5 s would fill the 16 append slots in 80 s and a result
+			// written after them would wait in the queue, outside the hold whose
+			// time the watchdog skips, and on resume they would all go out at once.
+			if (closed || ended || keepaliveOutstanding) return;
+			keepaliveOutstanding = true;
+			pendingAppends.push({ seqno: appendSeqno++, data: readConnectFrameMessage(frame), keepalive: true });
 			pumpAppends();
 		},
 		close() {
@@ -1526,13 +1585,28 @@ function streamCursorWithWireMode(
 				}
 				h2Client = client;
 				client.on("error", error => settleH2(mapH2TransportError(error, baseUrl)));
-				runTransport = wrapHttp2RunTransport(client.request(requestHeaders));
+				// `client.request` puts this turn's HEADERS on the wire, so the hold
+				// runs here — after the payload build, the request-debug dump and the
+				// proxy tunnel, all of which can span a `/pause` — and the request
+				// opens in the same synchronous step as the last read of the hold's
+				// probe and of the turn's signal, so a gate that closed after the
+				// hold answered still holds it and a cancelled turn never opens it.
+				// The HTTP/1 transport holds in the transport fetch it was given
+				// instead, once per request. The parked time is ours, not Cursor's:
+				// the stream watchdog skips it.
+				runTransport = await stream.trackLocalWork(
+					dispatchWhenOpen(options?.beforeDispatch, options?.signal, () =>
+						wrapHttp2RunTransport(client.request(requestHeaders)),
+					),
+				);
 			} else {
 				runTransport = createHttp1RunTransport({
 					baseUrl,
 					headers: requestHeaders,
 					requestId,
 					signal: options?.signal,
+					fetch: transportFetch(model, options?.fetch, options?.beforeDispatch),
+					heldWork: stream,
 				});
 			}
 
@@ -1758,7 +1832,7 @@ function streamCursorWithWireMode(
 					message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) },
 				});
 				const heartbeatBytes = toBinary(AgentClientMessageSchema, heartbeatMessage);
-				runTransport.write(frameConnectMessage(heartbeatBytes));
+				runTransport.writeKeepalive(frameConnectMessage(heartbeatBytes));
 			};
 
 			const closeDebugLog = async (): Promise<void> => {
@@ -1801,8 +1875,17 @@ function streamCursorWithWireMode(
 			onTransportAbort = abortTransport;
 			options?.signal?.addEventListener("abort", abortTransport, { once: true });
 
-			runTransport.write(frameConnectMessage(requestBytes));
-			heartbeatTimer = setInterval(sendHeartbeat, 5000);
+			// A signal fires its listeners once, when it aborts. The stream opened
+			// a few microtasks before the listener above was added (this turn
+			// awaited its dispatch), and a cancellation in between never reaches
+			// that listener: close the stream now rather than write the run
+			// request into a cancelled turn.
+			if (options?.signal?.aborted) {
+				onTransportAbort?.();
+			} else {
+				runTransport.write(frameConnectMessage(requestBytes));
+				heartbeatTimer = setInterval(sendHeartbeat, 5000);
+			}
 			if (relay) {
 				const transportSettled = h2Completion.promise.then(
 					() => "settled" as const,
@@ -2259,22 +2342,20 @@ function streamCursorWithWireMode(
 				// stable id would never reach the rotated one; keep Cursor's verdict.
 				rotatedRejection = knownConversation;
 			}
-			output.stopReason = result.stopReason;
-			output.errorStatus = result.status;
+			// A Connect end-stream error's diagnostic is shown, never classified.
+			AIError.applyFinalizeResult(
+				output,
+				result,
+				error instanceof ConnectEndStreamError ? error.diagnosticMessage : undefined,
+			);
 			// The rejection is non-retriable on the poisoned id, but the fresh id
 			// is a different request. Mark this one attempt transient so the
 			// caller's retry loop actually rebuilds on the rotated id; if that id
 			// rejects too, `canRotate` is false and the original status surfaces.
-			output.errorId = rotatedRejection ? AIError.create(AIError.Flag.Transient) : result.id;
-			if (error instanceof ConnectEndStreamError) {
-				output.errorClassificationMessage = result.message;
-				output.errorMessage = error.diagnosticMessage;
-			} else {
-				output.errorMessage = result.message;
-			}
+			if (rotatedRejection) output.errorId = AIError.create(AIError.Flag.Transient);
 			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "error", reason: output.stopReason, error: output });
+			stream.push({ type: "error", reason: result.stopReason, error: output });
 			stream.end();
 		} finally {
 			const log = await debugResponseLogPromise;

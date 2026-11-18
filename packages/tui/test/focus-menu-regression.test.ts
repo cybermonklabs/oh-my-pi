@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { type Component, CURSOR_MARKER, type Focusable, TUI } from "@oh-my-pi/pi-tui";
+import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
 
 class FocusToken implements Component, Focusable {
@@ -41,7 +42,10 @@ class MenuFrame implements Component {
 describe("focus-changing menu teardown", () => {
 	it("repaints stale menu and working rows on ED3-risk terminals without a viewport oracle", async () => {
 		const term = new VirtualTerminal(30, 6, 1000);
-		const tui = new TUI(term, true);
+		// Frames run on a virtual clock: on the real one, a loaded machine paints
+		// the last frame after a fixed sleep has already given up waiting for it.
+		const scheduler = new VirtualRenderScheduler();
+		const tui = new TUI(term, true, { renderScheduler: scheduler });
 		const editor = new FocusToken();
 		const menu = new FocusToken();
 		const frame = new MenuFrame(editor, menu);
@@ -50,25 +54,29 @@ describe("focus-changing menu teardown", () => {
 
 		try {
 			tui.start();
-			await term.waitForRender();
+			await scheduler.settle(term);
 
 			frame.working = true;
 			tui.requestRender();
-			await term.waitForRender();
+			await scheduler.settle(term);
 
 			frame.menuOpen = true;
 			tui.setFocus(menu);
 			tui.requestRender();
-			await term.waitForRender();
+			await scheduler.settle(term);
 
 			frame.working = false;
 			tui.requestRender();
-			await term.waitForRender();
+			await scheduler.settle(term);
+			// The menu is on screen, so the close below has rows to repaint: the
+			// last frame looks like the first one, so the final check alone
+			// would also pass if no frame after the first had been painted.
+			expect(term.getViewport().map(line => line.trimEnd())).toContain("menu-11");
 
 			frame.menuOpen = false;
 			tui.setFocus(editor);
 			tui.requestRender();
-			await term.waitForRender();
+			await scheduler.settle(term);
 
 			// The menu rows were committed to history while the menu was tall;
 			// closing it resyncs the commit index at the divergence (stale menu

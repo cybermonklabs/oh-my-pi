@@ -7,8 +7,11 @@
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error/error-text";
+import { httpErrorReason } from "@oh-my-pi/pi-ai/error/http-body";
 import { presentNarrationAsAnswer } from "@oh-my-pi/pi-ai/utils/narration";
-import { $flag, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
+import { $flag, formatDuration, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
+import { headlessSlashCommandHost } from "../extensibility/extensions/send-user-input-handler";
 import { HINDSIGHT_NOTICE_SOURCE } from "../hindsight/state";
 import type { MCPManager } from "../mcp/manager";
 import { resolveMCPTimeoutMs } from "../mcp/timeout";
@@ -195,38 +198,19 @@ async function runPrintModeCore(
 			stdout.writeLine(`${JSON.stringify(header)}\n`);
 		}
 	}
-	// Set up extensions for print mode (no UI, no command context)
-	await initializeExtensions(session, {
-		mode: mode === "json" ? "json" : "print",
-		reportSendError: (action, err) => {
-			process.stderr.write(
-				`Extension ${action === "extension_send" ? "sendMessage" : "sendUserMessage"} failed: ${err.message}\n`,
-			);
-		},
-		reportRuntimeError: err => {
-			process.stderr.write(`Extension error (${err.extensionPath}): ${err.error}\n`);
-		},
-	});
-
-	// `plan.defaultOnStartup` opens fresh *interactive* sessions in plan mode so a
-	// human can review the plan before it executes. Headless print mode has no
-	// surface to review, approve, or exit a plan from, and the turn carries no
-	// deterministic way out of plan mode — the model must voluntarily emit a valid
-	// `xd://propose` execute-dispatch, and when it does not the run strands until
-	// the deadline (issue #8272). So do not honor the startup default here; the
-	// supported headless plan flow is `--plan-yolo` (auto-approve → implement),
-	// which is wired independently through the prewalk coordinator.
-	const planStartupIgnored =
-		cfgPlanDefaultOnStartup.get(session.settings) &&
-		cfgPlanEnabled.get(session.settings) &&
-		session.sessionManager.buildSessionContext().messages.length === 0 &&
-		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change") &&
-		!planYolo;
-	if (planStartupIgnored) {
-		process.stderr.write(
-			"Note: plan.defaultOnStartup is ignored in print mode (no interactive surface to review the plan). Use --plan-yolo for a headless plan flow.\n",
-		);
-	}
+	// The live MCP manager `/mcp` works on, for a dispatched built-in and an extension's `sendUserInput` alike.
+	const mcpManager = options.mcpManager;
+	const reconnectMcpServer: SlashCommandRuntime["reconnectMcpServer"] = mcpManager
+		? async (name, selected) => {
+				const state = await reconnectMcpManagerServer(mcpManager, name, selected);
+				if (state) {
+					// Print mode wires no tools-changed callback; refresh the
+					// session binding so later prompts see the recovered tools.
+					await session.refreshMCPTools(mcpManager.getTools());
+				}
+				return state;
+			}
+		: undefined;
 
 	// process.stderr.write is fire-and-forget as well: a diagnostic buffered
 	// behind a backpressured pipe would still be undelivered when runPrintMode
@@ -263,7 +247,6 @@ async function runPrintModeCore(
 	// The runtime is rebuilt per dispatch: an earlier positional message (e.g.
 	// `/move`, `/wt`) may have changed the session cwd, and manager state may
 	// have moved since the last one.
-	const mcpManager = options.mcpManager;
 	const builtinRuntimeFor = (): SlashCommandRuntime => ({
 		session,
 		sessionManager: session.sessionManager,
@@ -273,17 +256,7 @@ async function runPrintModeCore(
 		refreshCommands: () => {},
 		reloadPlugins: () => Promise.resolve(),
 		mcpManager,
-		reconnectMcpServer: mcpManager
-			? async (name, selected) => {
-					const state = await reconnectMcpManagerServer(mcpManager, name, selected);
-					if (state) {
-						// Print mode wires no tools-changed callback; refresh the
-						// session binding so later prompts see the recovered tools.
-						await session.refreshMCPTools(mcpManager.getTools());
-					}
-					return state;
-				}
-			: undefined,
+		reconnectMcpServer,
 		// `/retry` only schedules its continuation (`session.retry()` posts a
 		// post-prompt task) and returns before the retried turn streams: hold
 		// the dispatch open until the session is idle — same pairing as the
@@ -369,17 +342,9 @@ async function runPrintModeCore(
 		return true;
 	};
 
-	// Discriminates a store failure from any other dispose rejection below.
-	let persistenceFailure: Error | undefined;
-	session.sessionManager.onPersistenceError(error => {
-		persistenceFailure = error;
-		writeStderrLine(formatPersistenceFailure(error.message));
-	});
-	session.sessionManager.onPersistenceNotice(notice => {
-		writeStderrLine(`Warning: ${formatPersistenceNotice(notice)}`);
-	});
-
-	// Always subscribe to enable session persistence via _handleAgentEvent
+	// Always subscribe to enable session persistence via _handleAgentEvent.
+	// Subscribed before initializeExtensions so events from a turn a
+	// session_start/resources_discover handler triggers are not lost.
 	session.subscribe(event => {
 		// In JSON mode, output all events
 		if (mode === "json") {
@@ -397,9 +362,55 @@ async function runPrintModeCore(
 			writeStderrLine(event.source === COST_GATE_NOTICE_SOURCE ? event.message : `Warning: ${event.message}`);
 		} else if (event.type === "auto_retry_start") {
 			// Text mode shows only `Working...` while a turn runs; a turn stuck retrying
-			// (offline, an outage) must say why instead of looking like a slow answer.
-			writeStderrLine(`Retrying (${event.attempt}/${event.maxAttempts}): ${singleLine(event.errorMessage)}`);
+			// (offline, an outage) must say why instead of looking like a slow answer,
+			// and how long it waits, as the terminal's retry line does.
+			writeStderrLine(
+				`Retrying (${event.attempt}/${event.maxAttempts}) in ${formatDuration(event.delayMs)}: ${singleLine(httpErrorReason(event.errorMessage))}`,
+			);
 		}
+	});
+	// Set up extensions for print mode (no UI, no command context)
+	await initializeExtensions(session, {
+		mode: mode === "json" ? "json" : "print",
+		reportSendError: (action, err) => {
+			process.stderr.write(
+				`Extension ${action === "extension_send" ? "sendMessage" : "sendUserMessage"} failed: ${err.message}\n`,
+			);
+		},
+		reportRuntimeError: err => {
+			process.stderr.write(`Extension error (${err.extensionPath}): ${err.error}\n`);
+		},
+		slashCommandHost: headlessSlashCommandHost(session, { mcpManager, reconnectMcpServer }),
+	});
+
+	// `plan.defaultOnStartup` opens fresh *interactive* sessions in plan mode so a
+	// human can review the plan before it executes. Headless print mode has no
+	// surface to review, approve, or exit a plan from, and the turn carries no
+	// deterministic way out of plan mode — the model must voluntarily emit a valid
+	// `xd://propose` execute-dispatch, and when it does not the run strands until
+	// the deadline (issue #8272). So do not honor the startup default here; the
+	// supported headless plan flow is `--plan-yolo` (auto-approve → implement),
+	// which is wired independently through the prewalk coordinator.
+	const planStartupIgnored =
+		cfgPlanDefaultOnStartup.get(session.settings) &&
+		cfgPlanEnabled.get(session.settings) &&
+		session.sessionManager.buildSessionContext().messages.length === 0 &&
+		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change") &&
+		!planYolo;
+	if (planStartupIgnored) {
+		process.stderr.write(
+			"Note: plan.defaultOnStartup is ignored in print mode (no interactive surface to review the plan). Use --plan-yolo for a headless plan flow.\n",
+		);
+	}
+
+	// Discriminates a store failure from any other dispose rejection below.
+	let persistenceFailure: Error | undefined;
+	session.sessionManager.onPersistenceError(error => {
+		persistenceFailure = error;
+		writeStderrLine(formatPersistenceFailure(error.message));
+	});
+	session.sessionManager.onPersistenceNotice(notice => {
+		writeStderrLine(`Warning: ${formatPersistenceNotice(notice)}`);
 	});
 
 	const timeoutMs = resolveMCPTimeoutMs();
@@ -601,7 +612,7 @@ async function runPrintModeCore(
 				assistantMsg.stopReason !== "error" &&
 				assistantMsg.stopReason !== "aborted"
 			) {
-				process.stderr.write(`${sanitizeText(assistantMsg.errorMessage)}\n`);
+				process.stderr.write(`${sanitizeText(assistantMsg.errorDisplayMessage ?? assistantMsg.errorMessage)}\n`);
 			}
 
 			// Output text content; narration the provider returned as thinking is part of the reply.
@@ -641,23 +652,25 @@ async function runPrintModeCore(
 	// an OMP-owned Chromium cannot survive the exit (issue #5643).
 	//
 	// A latched store failure rethrows from `dispose()`; report it as lost
-	// durability rather than letting it escape as a raw fatal dump.
+	// durability rather than letting it escape as a raw fatal dump. The latch
+	// holds the latest failure, which may not be the one the observer first heard.
 	let durabilityFailure = false;
 	try {
 		await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 	} catch (error) {
-		if (!persistenceFailure || error !== persistenceFailure) throw error;
+		const latched = persistenceFailure && session.sessionManager.getPersistenceFailure();
+		if (!latched || error !== latched) throw error;
 		durabilityFailure = true;
 		// The store is still failing at teardown, so this is the moment the
 		// transcript stops being retryable and becomes lost.
-		writeStderrLine(formatPersistenceDurabilityFailure(persistenceFailure.message));
+		writeStderrLine(formatPersistenceDurabilityFailure(latched.message));
 		await stderrTail;
 	}
 
 	// Text mode reports the terminal failure on stderr exactly as before: same
 	// line, same ordering after dispose, without terminating the process here.
 	if (mode === "text" && terminalFailure && assistantMsg) {
-		const errorLine = sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
+		const errorLine = sanitizeText(errorDisplayText(assistantMsg) || `Request ${assistantMsg.stopReason}`);
 		if (!process.stderr.write(`${errorLine}\n`)) {
 			const { promise, resolve } = Promise.withResolvers<void>();
 			process.stderr.once("drain", resolve);

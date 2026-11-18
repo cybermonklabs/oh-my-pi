@@ -4,11 +4,19 @@ use super::*;
 #[cfg(unix)]
 use crate::sys::proc::{self, ProcInfo, ProcState};
 
+/// A `sh -c` script: a TERM trap that exits 42, the ready file `$1` written
+/// once the trap is set, then about 30 s of short sleeps before it ends by
+/// itself with status 0. A test waits for its end with no deadline: the
+/// status tells the trapped TERM (42) from no signal at all (0).
+#[cfg(unix)]
+const TRAPPED_TERM_EXITS_42: &str = "trap 'exit 42' TERM; : > \"$1\"; i=0; while [ \"$i\" -lt 600 \
+                                     ]; do sleep 0.05; i=$((i + 1)); done";
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn pgrep_matches_name_and_pkills_signal_probe() {
 	let (_dir, command, name) = process_test_command("opg");
-	let mut child = process_test_child(&command, Duration::from_secs(30))
+	let mut child = process_test_child(&command)
 		.spawn()
 		.expect("matching process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
@@ -37,24 +45,23 @@ async fn pkill_accepts_platform_signal_names() {
 	let signal = "WINCH";
 	let dir = tempfile::tempdir().expect("signal test directory");
 	let ready = dir.path().join("ready");
-	let script = format!("trap '' {signal}; : > \"$1\"; while :; do sleep 0.05; done");
+	// The child reads its stdin to end of file, whose write end only the test
+	// holds: it ends when the test lets it go, or with the test process,
+	// however that ends (a loop of sleeps would outlive a killed test).
+	let script = format!("trap '' {signal}; : > \"$1\"; while read -r _; do :; done");
 	let mut command = Command::new("sh");
 	command
 		.args(["-c", &script, "sh", ready.to_str().expect("utf8 ready path")])
+		.stdin(std::process::Stdio::piped())
 		.kill_on_drop(true);
 	let mut child = command.spawn().expect("signal test process");
+	let gate = child.stdin.take().expect("the child's stdin");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
-	time::timeout(Duration::from_secs(2), async {
-		while !ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("signal trap was not installed");
+	exists(&ready).await;
 
 	let (result, _) = execute_captured(format!("pkill -{signal} -p {pid}")).await;
 	let still_running = child.try_wait().expect("signal child status").is_none();
-	let _ = child.start_kill();
+	drop(gate);
 	let _ = child.wait().await;
 	assert_eq!(result.exit_code, Some(0));
 	assert!(still_running, "{signal} should be ignored by the test process");
@@ -64,8 +71,7 @@ async fn pkill_accepts_platform_signal_names() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pkill_queue_option_consumes_its_value() {
 	let (_dir, command, name) = process_test_command("opq");
-	let mut command = process_test_child(&command, Duration::from_secs(30));
-	command.kill_on_drop(true);
+	let mut command = process_test_child(&command);
 	let mut child = command.spawn().expect("queue test process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
 	wait_for_process_name(pid, &name).await;
@@ -83,8 +89,7 @@ async fn pkill_queue_option_consumes_its_value() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pkill_interactive_prompt_honors_cancellation() {
 	let (_dir, command, name) = process_test_command("opi");
-	let mut command = process_test_child(&command, Duration::from_secs(30));
-	command.kill_on_drop(true);
+	let mut command = process_test_child(&command);
 	let mut child = command.spawn().expect("interactive target");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
 	wait_for_process_name(pid, &name).await;
@@ -93,7 +98,12 @@ async fn pkill_interactive_prompt_honors_cancellation() {
 	let abort = cancel.emplace_abort_token();
 	let execution = tokio::spawn(execute_shell(
 		ShellExecuteOptions {
-			command: format!("sleep 30 | pkill -I -x -p {pid} {name}"),
+			// The feeder outlives the runner's bound: only the cancel ends the
+			// run.
+			command: format!(
+				"sleep {} | pkill -I -x -p {pid} {name}",
+				crate::testkit::child::LIFETIME.as_secs()
+			),
 			..Default::default()
 		},
 		None,
@@ -101,9 +111,8 @@ async fn pkill_interactive_prompt_honors_cancellation() {
 	));
 	time::sleep(Duration::from_millis(100)).await;
 	abort.abort(crate::cancel::AbortReason::User);
-	let result = time::timeout(Duration::from_secs(2), execution)
+	let result = execution
 		.await
-		.expect("interactive pkill remained blocked after cancellation")
 		.expect("interactive execution task")
 		.expect("interactive shell execution");
 	let still_running = child
@@ -120,7 +129,7 @@ async fn pkill_interactive_prompt_honors_cancellation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pgrep_reads_pidfile_from_standard_input() {
 	let (_dir, command, name) = process_test_command("opf");
-	let mut child = process_test_child(&command, Duration::from_secs(30))
+	let mut child = process_test_child(&command)
 		.spawn()
 		.expect("pidfile process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
@@ -144,7 +153,7 @@ async fn pgrep_requires_an_externally_locked_pidfile() {
 	}
 
 	let (_dir, command, name) = process_test_command("opl");
-	let mut child = process_test_child(&command, Duration::from_secs(30))
+	let mut child = process_test_child(&command)
 		.spawn()
 		.expect("locked pidfile process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
@@ -154,43 +163,37 @@ async fn pgrep_requires_an_externally_locked_pidfile() {
 	let pidfile = files.path().join("service.pid");
 	let ready = files.path().join("locked");
 	let pid_arg = pid.to_string();
+	// The locker holds the lock until end of file on its stdin, whose write
+	// end only the test holds: closed after the locked `pgrep`, however long
+	// that takes, or by the kernel when the test process ends.
 	let mut locker = Command::new("python3")
 		.args([
 			"-c",
-			"import fcntl,pathlib,sys,time; f=open(sys.argv[1],'w'); f.write(sys.argv[2]+'\\n'); \
+			"import fcntl,pathlib,sys; f=open(sys.argv[1],'w'); f.write(sys.argv[2]+'\\n'); \
 			 f.flush(); fcntl.lockf(f,fcntl.LOCK_EX); pathlib.Path(sys.argv[3]).touch(); \
-			 time.sleep(30)",
+			 sys.stdin.buffer.read()",
 			pidfile.to_str().expect("utf8 pidfile"),
 			&pid_arg,
 			ready.to_str().expect("utf8 ready path"),
 		])
+		.stdin(std::process::Stdio::piped())
 		.spawn()
 		.expect("pidfile locker");
-	let ready_result = time::timeout(Duration::from_secs(2), async {
-		while !ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await;
-	if ready_result.is_err() {
-		let _ = locker.start_kill();
-		let _ = child.start_kill();
-		let _ = locker.wait().await;
-		let _ = child.wait().await;
-		panic!("pidfile locker did not become ready");
-	}
+	let gate = locker.stdin.take().expect("the locker's stdin");
+	exists(&ready).await;
 
 	let command =
 		format!("pgrep -L -F {} -x {name}", quote_arg(pidfile.to_str().expect("utf8 pidfile")));
 	let (locked_result, locked_output) = execute_captured(command.clone()).await;
-	let _ = locker.start_kill();
-	let _ = locker.wait().await;
+	drop(gate);
+	let locker_status = locker.wait().await.expect("the locker's exit");
 	let (unlocked_result, unlocked_output) = execute_captured(command).await;
 	let _ = child.start_kill();
 	let _ = child.wait().await;
 
-	assert_eq!(locked_result.exit_code, Some(0));
+	assert_eq!(locked_result.exit_code, Some(0), "{locked_output:?}");
 	assert_eq!(locked_output, format!("{pid}\n"));
+	assert!(locker_status.success(), "the locker ends at its stdin's end: {locker_status:?}");
 	assert_eq!(unlocked_result.exit_code, Some(3));
 	assert!(unlocked_output.contains("is not locked"), "{unlocked_output:?}");
 }
@@ -199,10 +202,10 @@ async fn pgrep_requires_an_externally_locked_pidfile() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pkill_signals_every_matching_process() {
 	let (_dir, command, name) = process_test_command("opk");
-	let mut first = process_test_child(&command, Duration::from_secs(30))
+	let mut first = process_test_child(&command)
 		.spawn()
 		.expect("first matching process");
-	let mut second = process_test_child(&command, Duration::from_secs(30))
+	let mut second = process_test_child(&command)
 		.spawn()
 		.expect("second matching process");
 	let first_pid = i32::try_from(first.id().expect("first pid")).expect("pid fits i32");
@@ -211,26 +214,22 @@ async fn pkill_signals_every_matching_process() {
 	wait_for_process_name(second_pid, &name).await;
 
 	let (result, output) = execute_captured(format!("pkill -TERM -x {name}")).await;
-	let statuses =
-		time::timeout(Duration::from_secs(2), async { tokio::join!(first.wait(), second.wait()) })
-			.await;
-	if statuses.is_err() {
-		let _ = first.start_kill();
-		let _ = second.start_kill();
-		let _ = first.wait().await;
-		let _ = second.wait().await;
-	}
+	// Each ends only of pkill's TERM (it never ends by itself while the
+	// test runs): the wait is for that event, and the signal tells it.
+	let (first, second) = tokio::join!(first.wait(), second.wait());
 	assert_eq!(result.exit_code, Some(0));
 	assert_eq!(output, "");
-	assert!(statuses.is_ok(), "pkill did not signal every matching process");
+	for status in [first, second] {
+		let status = status.expect("matching process wait");
+		assert_eq!(status.signal(), Some(libc::SIGTERM), "pkill did not signal it: {status:?}");
+	}
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn pidwait_returns_after_the_matching_process_exits() {
 	let (_dir, command, name) = process_test_command("opw");
-	let mut command = process_test_child(&command, Duration::from_secs(30));
-	command.kill_on_drop(true);
+	let mut command = process_test_child(&command);
 	let mut child = command.spawn().expect("waited process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
 	wait_for_process_name(pid, &name).await;
@@ -258,17 +257,13 @@ async fn pidwait_returns_after_the_matching_process_exits() {
 		.expect("pidwait execution")
 	});
 	let mut output = String::new();
-	time::timeout(Duration::from_secs(30), async {
-		while !output.contains(&waiting_for) {
-			output.push_str(
-				&rx.recv_async()
-					.await
-					.expect("pidwait output closed before it selected the child"),
-			);
-		}
-	})
-	.await
-	.expect("pidwait did not select the child");
+	while !output.contains(&waiting_for) {
+		output.push_str(
+			&rx.recv_async()
+				.await
+				.expect("pidwait output closed before it selected the child"),
+		);
+	}
 	tokio::task::yield_now().await;
 	assert!(!pidwait.is_finished(), "pidwait returned while its matching process was still running");
 	assert!(
@@ -277,10 +272,9 @@ async fn pidwait_returns_after_the_matching_process_exits() {
 	);
 
 	let _ = child.start_kill();
-	let result = time::timeout(Duration::from_secs(30), &mut pidwait)
-		.await
-		.expect("pidwait did not return after its matching process exited")
-		.expect("pidwait task");
+	// Waits as long as that takes: a pidwait that missed the exit hangs the
+	// test until the runner's timeout.
+	let result = (&mut pidwait).await.expect("pidwait task");
 	while let Ok(chunk) = rx.recv_async().await {
 		output.push_str(&chunk);
 	}
@@ -554,10 +548,9 @@ async fn top_builtin_stops_when_its_output_pipe_closes() {
 	let command = "top -d 0 | head -n 1";
 	// top observes head's closed pipe on its next write, after completing a
 	// full synchronous process snapshot. Under host load that scan takes
-	// seconds; this is only a bound against a broken pipe-close loop.
-	let execution = time::timeout(Duration::from_secs(30), execute_captured(command.to_string()))
-		.await
-		.expect("top kept sampling after its output pipe closed");
+	// seconds; a top that kept sampling hangs the test until the runner's
+	// bound.
+	let execution = execute_captured(command.to_string()).await;
 	assert_eq!(execution.0.exit_code, Some(0));
 	assert!(execution.1.contains("top - snapshot 1"), "{:?}", execution.1);
 }
@@ -646,17 +639,9 @@ async fn kill_builtin_accepts_numeric_signal_for_multiple_processes() {
 		assert_eq!(code, 0, "numeric multi-process kill should succeed");
 	}
 
-	let statuses =
-		time::timeout(Duration::from_secs(5), async { tokio::join!(first.wait(), second.wait()) })
-			.await;
-	if statuses.is_err() {
-		let _ = first.kill().await;
-		let _ = second.kill().await;
-		let _ = first.wait().await;
-		let _ = second.wait().await;
-		panic!("kill must signal every process operand");
-	}
-	let (first_status, second_status) = statuses.expect("checked timeout");
+	// Each ends either of the KILL or at its own end, 30 s on: the signal
+	// tells which.
+	let (first_status, second_status) = tokio::join!(first.wait(), second.wait());
 	assert_eq!(first_status.expect("first wait").signal(), Some(libc::SIGKILL));
 	assert_eq!(second_status.expect("second wait").signal(), Some(libc::SIGKILL));
 }
@@ -669,26 +654,11 @@ async fn kill_builtin_defaults_to_sigterm() {
 	let dir = tempfile::tempdir().expect("temp dir");
 	let ready = dir.path().join("ready");
 	let mut child = Command::new("sh")
-		.args([
-			"-c",
-			"trap 'exit 42' TERM; : > \"$1\"; while :; do :; done",
-			"sh",
-			ready.to_str().expect("utf8 path"),
-		])
+		.args(["-c", TRAPPED_TERM_EXITS_42, "sh", ready.to_str().expect("utf8 path")])
 		.spawn()
 		.expect("trapping child");
 	let pid = child.id().expect("child pid");
-	let ready_result = time::timeout(Duration::from_secs(5), async {
-		while !ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await;
-	if ready_result.is_err() {
-		let _ = child.kill().await;
-		let _ = child.wait().await;
-		panic!("child did not install its SIGTERM trap");
-	}
+	exists(&ready).await;
 
 	let (mut session, stdio) = kill_test_context().await;
 	let result = session
@@ -697,14 +667,10 @@ async fn kill_builtin_defaults_to_sigterm() {
 		.expect("kill command");
 	let code = exit_code(&result);
 
-	let status = time::timeout(Duration::from_secs(5), child.wait()).await;
-	if status.is_err() {
-		let _ = child.kill().await;
-		let _ = child.wait().await;
-		panic!("default kill signal did not terminate the child");
-	}
+	// It ends either by its TERM trap (42) or at its own end (0).
+	let status = child.wait().await.expect("child wait");
 	assert_eq!(code, 0, "default kill should succeed");
-	assert_eq!(status.expect("checked timeout").expect("child wait").code(), Some(42));
+	assert_eq!(status.code(), Some(42), "{status:?}");
 }
 
 /// A negative PID after `--` targets a process group per `kill(2)` instead
@@ -718,12 +684,7 @@ async fn kill_builtin_preserves_negative_pid_process_group_operands() {
 	let plain_ready = dir.path().join("plain-ready");
 	let spawn_trapping = |ready: &std::path::Path, own_group: bool| {
 		let mut cmd = Command::new("sh");
-		cmd.args([
-			"-c",
-			"trap 'exit 42' TERM; : > \"$1\"; while :; do sleep 0.05; done",
-			"sh",
-			ready.to_str().expect("utf8 path"),
-		]);
+		cmd.args(["-c", TRAPPED_TERM_EXITS_42, "sh", ready.to_str().expect("utf8 path")]);
 		if own_group {
 			// pgid becomes this child's own pid, so `-pid` addresses the group.
 			cmd.process_group(0);
@@ -736,19 +697,8 @@ async fn kill_builtin_preserves_negative_pid_process_group_operands() {
 	let group_pid = group_child.id().expect("group pid");
 	let plain_pid = plain_child.id().expect("plain pid");
 
-	let ready_result = time::timeout(Duration::from_secs(5), async {
-		while !group_ready.exists() || !plain_ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await;
-	if ready_result.is_err() {
-		let _ = group_child.start_kill();
-		let _ = plain_child.start_kill();
-		let _ = group_child.wait().await;
-		let _ = plain_child.wait().await;
-		panic!("children did not install their SIGTERM traps");
-	}
+	exists(&group_ready).await;
+	exists(&plain_ready).await;
 
 	let (mut session, stdio) = kill_test_context().await;
 	let result = session
@@ -757,18 +707,8 @@ async fn kill_builtin_preserves_negative_pid_process_group_operands() {
 		.expect("kill command");
 	let code = exit_code(&result);
 
-	let statuses = time::timeout(Duration::from_secs(5), async {
-		tokio::join!(group_child.wait(), plain_child.wait())
-	})
-	.await;
-	if statuses.is_err() {
-		let _ = group_child.start_kill();
-		let _ = plain_child.start_kill();
-		let _ = group_child.wait().await;
-		let _ = plain_child.wait().await;
-		panic!("negative-PID kill must signal the process group and the plain PID");
-	}
-	let (group_status, plain_status) = statuses.expect("checked timeout");
+	// Each ends either by its TERM trap (42) or at its own end (0).
+	let (group_status, plain_status) = tokio::join!(group_child.wait(), plain_child.wait());
 	assert_eq!(code, 0, "negative-PID kill should succeed");
 	assert_eq!(group_status.expect("group wait").code(), Some(42));
 	assert_eq!(plain_status.expect("plain wait").code(), Some(42));
@@ -785,12 +725,7 @@ async fn kill_builtin_signals_group_when_marker_precedes_negative_pid() {
 	let named_ready = dir.path().join("named-ready");
 	let spawn_group_leader = |ready: &std::path::Path| {
 		Command::new("sh")
-			.args([
-				"-c",
-				"trap 'exit 42' TERM; : > \"$1\"; while :; do sleep 0.05; done",
-				"sh",
-				ready.to_str().expect("utf8 path"),
-			])
+			.args(["-c", TRAPPED_TERM_EXITS_42, "sh", ready.to_str().expect("utf8 path")])
 			.process_group(0)
 			.spawn()
 			.expect("group leader")
@@ -801,19 +736,8 @@ async fn kill_builtin_signals_group_when_marker_precedes_negative_pid() {
 	let default_pid = default_child.id().expect("default pid");
 	let named_pid = named_child.id().expect("named pid");
 
-	let ready_result = time::timeout(Duration::from_secs(5), async {
-		while !default_ready.exists() || !named_ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await;
-	if ready_result.is_err() {
-		let _ = default_child.start_kill();
-		let _ = named_child.start_kill();
-		let _ = default_child.wait().await;
-		let _ = named_child.wait().await;
-		panic!("group leaders did not install their SIGTERM traps");
-	}
+	exists(&default_ready).await;
+	exists(&named_ready).await;
 
 	let (mut session, stdio) = kill_test_context().await;
 	// Default signal (SIGTERM) after the marker.
@@ -827,18 +751,8 @@ async fn kill_builtin_signals_group_when_marker_precedes_negative_pid() {
 		.await
 		.expect("named kill command");
 
-	let statuses = time::timeout(Duration::from_secs(5), async {
-		tokio::join!(default_child.wait(), named_child.wait())
-	})
-	.await;
-	if statuses.is_err() {
-		let _ = default_child.start_kill();
-		let _ = named_child.start_kill();
-		let _ = default_child.wait().await;
-		let _ = named_child.wait().await;
-		panic!("marker-preceded negative PID must signal the process group");
-	}
-	let (default_status, named_status) = statuses.expect("checked timeout");
+	// Each ends either by its TERM trap (42) or at its own end (0).
+	let (default_status, named_status) = tokio::join!(default_child.wait(), named_child.wait());
 	assert_eq!(exit_code(&default_result), 0, "`kill -- -<pgid>` should succeed");
 	assert_eq!(exit_code(&named_result), 0, "`kill -s TERM -- -<pgid>` should succeed");
 	assert_eq!(default_status.expect("default wait").code(), Some(42));
@@ -885,13 +799,8 @@ async fn kill_builtin_signals_every_process_in_a_jobspec_pipeline() {
 		.await
 		.expect("background pipeline");
 	assert_eq!(exit_code(&started), 0, "starting the background pipeline");
-	time::timeout(Duration::from_secs(5), async {
-		while !first_ready.exists() || !second_ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("pipeline processes did not become ready");
+	exists(&first_ready).await;
+	exists(&second_ready).await;
 	let pids = [&first_pidfile, &second_pidfile].map(|pidfile| {
 		fs::read_to_string(pidfile)
 			.expect("pipeline pidfile")
@@ -899,8 +808,9 @@ async fn kill_builtin_signals_every_process_in_a_jobspec_pipeline() {
 			.parse::<i32>()
 			.expect("pipeline pid")
 	});
-	for pid in pids {
-		wait_until_stopped(&pinned_process(pid)).await;
+	let pinned = pids.map(pinned_process);
+	for process in &pinned {
+		wait_until_stopped(process).await;
 	}
 	assert_eq!(
 		session
@@ -921,8 +831,12 @@ async fn kill_builtin_signals_every_process_in_a_jobspec_pipeline() {
 		.run_test("wait %1", &stdio)
 		.await
 		.expect("reap jobspec");
-	for pid in pids {
-		assert!(proctree::Process::from_pid(pid).is_none(), "pipeline process {pid} survived");
+	// Gone: a read proves it (a failed read is no proof), or the pid now
+	// names a later process.
+	for process in &pinned {
+		let now = proc::read(process.pid).expect("the process table can be read");
+		let pid = process.pid;
+		assert!(now.is_none_or(|now| now.start != process.start), "pipeline process {pid} survived");
 	}
 }
 
@@ -960,13 +874,8 @@ async fn stopped_later_pipeline_stage_finishes_once_continued() {
 		// stage this test started.
 		assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0, "continue the stopped stage");
 	};
-	let (result, ()) = tokio::join!(
-		time::timeout(Duration::from_secs(20), session.run_test(command, &stdio)),
-		continue_stage,
-	);
-	let result = result
-		.expect("pipeline did not finish after its stopped stage continued")
-		.expect("pipeline run");
+	let (result, ()) = tokio::join!(session.run_test(command, &stdio), continue_stage);
+	let result = result.expect("pipeline run");
 	assert_eq!(exit_code(&result), 0);
 }
 
@@ -1005,9 +914,9 @@ async fn stopped_interactive_job_stops_every_pipeline_stage() {
 		.await
 		.expect("background pipeline");
 	assert_eq!(exit_code(&started), 0, "starting the background pipeline");
-	let mut pids = Vec::with_capacity(pidfiles.len());
-	for pidfile in &pidfiles {
-		pids.push(wait_for_pidfile(pidfile).await);
+	let mut stages = Vec::with_capacity(pidfiles.len());
+	for (pidfile, program) in pidfiles.iter().zip(["yes", "cat"]) {
+		stages.push(wait_until_running(wait_for_pidfile(pidfile).await, program).await);
 	}
 
 	let stopped = session
@@ -1015,8 +924,8 @@ async fn stopped_interactive_job_stops_every_pipeline_stage() {
 		.await
 		.expect("stop the job");
 	assert_eq!(exit_code(&stopped), 0);
-	for &pid in &pids {
-		wait_until_stopped(&pinned_process(pid)).await;
+	for stage in &stages {
+		wait_until_stopped(stage).await;
 	}
 	let jobs = tempfile::tempfile().expect("jobs capture");
 	session
@@ -1082,13 +991,9 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 				.await
 				.expect("background pipeline");
 			assert_eq!(exit_code(&started), 0, "subset {stopped_subset:#b}");
-			time::timeout(Duration::from_secs(20), async {
-				while !readyfiles.iter().all(|file| file.exists()) {
-					time::sleep(Duration::from_millis(10)).await;
-				}
-			})
-			.await
-			.expect("pipeline stages did not become ready");
+			for file in &readyfiles {
+				exists(file).await;
+			}
 			let pids: Vec<i32> = pidfiles
 				.iter()
 				.map(|file| {
@@ -1117,23 +1022,14 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 					.join(" ")
 			);
 			let release_stages = async {
-				time::timeout(Duration::from_secs(20), async {
-					while stages.iter().any(is_stopped) {
-						time::sleep(Duration::from_millis(10)).await;
-					}
-				})
-				.await
-				.expect("stopped stages were not continued");
+				while stages.iter().any(is_stopped) {
+					time::sleep(Duration::from_millis(10)).await;
+				}
 				time::sleep(Duration::from_millis(200)).await;
 				fs::write(&release, "").expect("release stages");
 			};
-			let (resumed, ()) = tokio::join!(
-				time::timeout(Duration::from_secs(20), session.run_test(resume, &stdio)),
-				release_stages,
-			);
-			let resumed = resumed
-				.expect("resumed pipeline did not complete")
-				.expect("foreground resumed pipeline");
+			let (resumed, ()) = tokio::join!(session.run_test(resume, &stdio), release_stages);
+			let resumed = resumed.expect("foreground resumed pipeline");
 			assert_eq!(
 				exit_code(&resumed),
 				0,
@@ -1176,17 +1072,19 @@ async fn wait_reports_a_stop_that_precedes_the_wait() {
 		.await
 		.expect("background job");
 	assert_eq!(exit_code(&started), 0);
-	let pid = wait_for_pidfile(&pidfile).await;
+	let job = wait_until_running(wait_for_pidfile(&pidfile).await, "sleep").await;
 	let stopped = session
 		.run_test("kill -STOP %1", &stdio)
 		.await
 		.expect("stop the job");
 	assert_eq!(exit_code(&stopped), 0);
-	wait_until_stopped(&pinned_process(pid)).await;
+	wait_until_stopped(&job).await;
 
-	let waited = time::timeout(Duration::from_secs(20), session.run_test("wait %1", &stdio))
+	// A wait that missed the stop would wait for the job's end, past the
+	// runner's bound.
+	let waited = session
+		.run_test("wait %1", &stdio)
 		.await
-		.expect("wait missed a stop that happened before it began")
 		.expect("wait for the stopped job");
 	assert_eq!(exit_code(&waited), 128 + libc::SIGSTOP);
 
@@ -1274,31 +1172,38 @@ fn is_stopped(process: &ProcInfo) -> bool {
 /// Waits until `process` is stopped.
 #[cfg(unix)]
 async fn wait_until_stopped(process: &ProcInfo) {
-	time::timeout(Duration::from_secs(20), async {
-		while !is_stopped(process) {
-			time::sleep(Duration::from_millis(10)).await;
+	while !is_stopped(process) {
+		time::sleep(Duration::from_millis(10)).await;
+	}
+}
+
+/// Waits until `pid` runs `program`, the program its `sh` execs, and pins
+/// it. Only then may a test stop it: gVisor's `execve` discards the stop
+/// signals still pending when it replaces the image (Linux keeps them, and
+/// the program stops on its way out of `execve`), so a job stopped during
+/// the exec would run on, and the wait for its stop would never end.
+#[cfg(unix)]
+async fn wait_until_running(pid: i32, program: &str) -> ProcInfo {
+	loop {
+		if let Some(process) = proc::info(pid).filter(|process| process.name == program) {
+			return process;
 		}
-	})
-	.await
-	.unwrap_or_else(|_| panic!("process {} did not stop", process.pid));
+		time::sleep(Duration::from_millis(10)).await;
+	}
 }
 
 /// The pid a test script wrote to `pidfile` (`echo $$ > pidfile`).
 #[cfg(unix)]
 async fn wait_for_pidfile(pidfile: &std::path::Path) -> i32 {
-	time::timeout(Duration::from_secs(20), async {
-		loop {
-			if let Some(pid) = fs::read_to_string(pidfile)
-				.ok()
-				.and_then(|text| text.trim().parse::<i32>().ok())
-			{
-				return pid;
-			}
-			time::sleep(Duration::from_millis(10)).await;
+	loop {
+		if let Some(pid) = fs::read_to_string(pidfile)
+			.ok()
+			.and_then(|text| text.trim().parse::<i32>().ok())
+		{
+			return pid;
 		}
-	})
-	.await
-	.unwrap_or_else(|_| panic!("no pid in {}", pidfile.display()))
+		time::sleep(Duration::from_millis(10)).await;
+	}
 }
 
 /// A failed target makes `kill` return non-zero without preventing later
@@ -1327,17 +1232,9 @@ async fn kill_builtin_continues_after_target_failure() {
 		.expect("kill command");
 	let code = exit_code(&result);
 
-	let statuses =
-		time::timeout(Duration::from_secs(5), async { tokio::join!(first.wait(), second.wait()) })
-			.await;
-	if statuses.is_err() {
-		let _ = first.start_kill();
-		let _ = second.start_kill();
-		let _ = first.wait().await;
-		let _ = second.wait().await;
-		panic!("kill must continue signaling after an intermediate target fails");
-	}
-	let (first_status, second_status) = statuses.expect("checked timeout");
+	// Each ends either of the KILL or at its own end, 30 s on: the signal
+	// tells which.
+	let (first_status, second_status) = tokio::join!(first.wait(), second.wait());
 	assert_ne!(code, 0, "a failed target should make kill return non-zero");
 	assert_eq!(first_status.expect("first wait").signal(), Some(libc::SIGKILL));
 	assert_eq!(second_status.expect("second wait").signal(), Some(libc::SIGKILL));

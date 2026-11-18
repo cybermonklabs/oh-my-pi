@@ -858,3 +858,110 @@ fn fifo_write_opens_through_a_cancellable_view_wait_for_a_reader_and_observe_the
 		}
 	}
 }
+
+/// Whether the FIFO at `path` has a reader: a write-only open that does not
+/// wait fails with ENXIO when it has none.
+#[cfg(unix)]
+fn fifo_has_reader(path: &Path) -> bool {
+	use std::os::unix::fs::OpenOptionsExt;
+	match std::fs::OpenOptions::new()
+		.write(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(path)
+	{
+		Ok(_) => true,
+		Err(e) if e.raw_os_error() == Some(libc::ENXIO) => false,
+		Err(e) => panic!("{e}"),
+	}
+}
+
+/// Whether the FIFO at `path` has a writer: a reader that does not wait reads
+/// end of file when it has none, and would block when it has one.
+#[cfg(unix)]
+fn fifo_has_writer(path: &Path) -> bool {
+	use std::os::unix::fs::OpenOptionsExt;
+	let mut reader = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(path)
+		.unwrap();
+	match reader.read(&mut [0; 1]) {
+		Ok(0) => false,
+		Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+		other => panic!("{other:?}"),
+	}
+}
+
+/// Dropped FIFO opens through a cancellable view (a job aborted while its
+/// redirection waits) leave no end of the FIFO behind once the drop returns:
+/// each round starts a read and a write and drops each as soon as it starts,
+/// in most rounds before its helper runs, and a helper any round leaves
+/// behind fails a later check. A helper the drop came before used to enter
+/// `open(2)` after the drop's release had given up, and stay on the FIFO.
+#[cfg(unix)]
+#[test]
+fn dropped_fifo_opens_through_a_cancellable_view_leave_no_end_behind() {
+	use std::{
+		future::Future,
+		task::{Context, Waker},
+	};
+	let dir = TempDir::new("fifo-drop");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let scoped = Fs::native().with_cancellation(CancellationToken::new());
+	let (mut read, mut write) = (OpenOptions::new(), OpenOptions::new());
+	read.read(true);
+	write.write(true);
+	for round in 0..200 {
+		for (options, end) in [(&read, "read"), (&write, "write")] {
+			let mut open = std::pin::pin!(scoped.open_with(&fifo, options));
+			let started = open.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+			assert!(started.is_pending(), "round {round}: the {end} open did not wait");
+		}
+		assert!(!fifo_has_reader(&fifo), "round {round}: a reader is left on the FIFO");
+		assert!(!fifo_has_writer(&fifo), "round {round}: a writer is left on the FIFO");
+	}
+}
+
+/// With `O_NOFOLLOW`, a FIFO opens through a cancellable view (on Linux its
+/// pin is checked not to be a symbolic link, and the pin's `/proc/self/fd/N`,
+/// which is one, is opened without the flag), and a symbolic link to a FIFO
+/// is refused with ELOOP, as `open(2)` refuses it.
+#[cfg(unix)]
+#[test]
+fn fifo_opens_through_a_cancellable_view_keep_nofollow() {
+	use std::io::Write;
+	let dir = TempDir::new("fifo-nofollow");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let scoped = BlockingFs::native().with_cancellation(CancellationToken::new());
+	let mut options = OpenOptions::new();
+	options.read(true).custom_flags(libc::O_NOFOLLOW);
+
+	// The writer's open waits for the reader the helper's open is.
+	let writer_path = fifo.clone();
+	let writer = std::thread::spawn(move || {
+		let mut file = std::fs::OpenOptions::new()
+			.write(true)
+			.open(writer_path)
+			.unwrap();
+		file.write_all(b"hi").unwrap();
+	});
+	let mut text = String::new();
+	scoped
+		.open_with(&fifo, &options)
+		.unwrap()
+		.read_to_string(&mut text)
+		.unwrap();
+	writer.join().unwrap();
+	assert_eq!(text, "hi");
+
+	let link = dir.0.join("link");
+	std::os::unix::fs::symlink(&fifo, &link).unwrap();
+	let err = scoped.open_with(&link, &options).unwrap_err();
+	assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
+}

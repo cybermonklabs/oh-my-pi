@@ -263,6 +263,16 @@ export async function startService(
 		persist: false,
 		detached: false,
 	};
+	// The ready wait's time is counted from the start of the launch, on
+	// monotonic clocks: the broker says how long ago it began to launch the
+	// process (`launchedMsAgo`), and the time since its answer is added here.
+	// The broker's `startedAt` is a wall-clock time, which a step of the clock
+	// would move. A broker that does not say (a released one) gets the time
+	// since `startedAt`, bounded by the time since the request: without a step
+	// that is the launch count; a forward step counts at most from the
+	// request, and a backward one adds at most the time from the request to
+	// the answer.
+	const requestedAt = performance.now();
 	const result = await request(
 		session,
 		{
@@ -274,6 +284,7 @@ export async function startService(
 		},
 		signal,
 	);
+	const answeredAt = performance.now();
 	if (result.op !== "start") throw new Error("Unexpected daemon start response");
 	const launched = result.daemon;
 	// A legacy broker ignores `awaitReady` and already waited: its result is
@@ -286,7 +297,11 @@ export async function startService(
 		TERMINAL_STATES[launched.state]
 	)
 		return { daemon: launched, readyTimedOut: result.readyTimedOut, readyInterrupted: false };
-	const timeoutMs = Math.max(0, spec.ready.timeoutMs - (Date.now() - launched.startedAt));
+	const sinceLaunch =
+		result.launchedMsAgo === undefined
+			? Math.min(Math.max(0, Date.now() - launched.startedAt), performance.now() - requestedAt)
+			: result.launchedMsAgo + (performance.now() - answeredAt);
+	const timeoutMs = Math.max(0, spec.ready.timeoutMs - sinceLaunch);
 	try {
 		const waited = await request(
 			session,

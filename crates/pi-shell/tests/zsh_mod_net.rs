@@ -31,10 +31,41 @@ fn zsh(script: &str, port: u16) -> (String, String, i32) {
 	)
 }
 
-/// A TCP port nothing listens on right now.
+/// A TCP port nothing listens on right now. The probe's listener is dropped,
+/// so another process can take the port before the script listens on it:
+/// see [`zsh_tcp_on_a_free_port`].
 fn free_port() -> u16 {
 	let l = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
 	l.local_addr().unwrap().port()
+}
+
+/// Runs `script` on a free port. The script listens on `$PORT` on its second
+/// line (`ztcp -l $PORT`), and its last two lines connect to the port once it
+/// has closed every socket there, expecting a refusal (each `echo $?` prints
+/// 1). `ztcp` takes no port 0, so the port is probed first, and another
+/// process can take it before the listen or after the close. A run that lost
+/// the port either way is retried on a fresh port: the listen failed, or one
+/// of those last connects reached a listener (its `echo $?` printed 0). Any
+/// other output is the test's, and after 5 lost ports the test fails.
+fn zsh_tcp_on_a_free_port(script: &str) -> (u16, (String, String, i32)) {
+	let mut lost = Vec::new();
+	for _ in 0..5 {
+		let port = free_port();
+		let run = zsh(script, port);
+		if run.1.starts_with("zsh:ztcp:2:") {
+			lost.push(format!("port {port}: {}", run.1.lines().next().unwrap_or_default()));
+			continue;
+		}
+		let last: Vec<&str> = run.0.lines().rev().take(2).collect();
+		if last.contains(&"0") {
+			lost.push(format!(
+				"port {port}: a connect after the close was accepted ({last:?}, last first)"
+			));
+			continue;
+		}
+		return (port, run);
+	}
+	panic!("the script lost its port on 5 fresh ports: {lost:?}");
 }
 
 #[test]
@@ -63,8 +94,7 @@ zsh:zsocket:8: could not bind to sock: address already in use
 
 #[test]
 fn zsh_mod_net_tcp_loopback_round_trip() {
-	let port = free_port();
-	let (out, err, st) = zsh(
+	let (port, (out, err, st)) = zsh_tcp_on_a_free_port(
 		"zmodload zsh/net/tcp
 ztcp -l $PORT; l=$REPLY
 ztcp -L | while read fd rest; do print -r -- $rest; done
@@ -79,7 +109,6 @@ ztcp -c $o; n=(${(f)\"$(ztcp -L)\"}); echo $#n
 ztcp -c; n=(${(f)\"$(ztcp -L)\"}); echo $#n
 ztcp 127.0.0.1 $PORT; echo $?
 ztcp localhost $PORT; echo $?",
-		port,
 	);
 	// zsh prints the port of `ztcp -v HOST PORT` in network byte order.
 	let shown = i32::from(port.to_be());

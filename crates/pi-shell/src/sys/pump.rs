@@ -607,7 +607,21 @@ mod tests {
 		);
 		drop(child_out);
 		let mut cx = Context::from_waker(Waker::noop());
-		pumps.poll(&mut cx, &tracker);
+		// End of file comes once every holder of the write end has closed it. A
+		// process another test of this process forks holds a copy until its
+		// exec, which delays end of file and never holds it off
+		// ([`crate::testkit::child::Gate`]): poll until the drain is reported.
+		// The deadline only names a hang: the slowest measured loaded run took
+		// 0.1 s, and one with a fork holding the write end 300 ms still passed.
+		let hang = std::time::Instant::now() + std::time::Duration::from_secs(30);
+		while tracker.lock().draining() > 3 {
+			assert!(
+				std::time::Instant::now() < hang,
+				"end of file never drained the half within 30 s: some holder kept the write end open"
+			);
+			pumps.poll(&mut cx, &tracker);
+			std::thread::yield_now();
+		}
 		pumps.poll(&mut cx, &tracker);
 		assert_eq!(tracker.lock().draining(), 3, "end of file drained one half, once");
 		drop(pumps);
@@ -615,9 +629,8 @@ mod tests {
 		assert_eq!(tracker.lock().draining(), 3, "adopted halves run on");
 		drop((child_open, child_duplex));
 		// Another test of this process may be polling the retained work.
-		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		// Halves that never drain hang the test until the runner's bound.
 		while tracker.lock().draining() > 1 {
-			assert!(std::time::Instant::now() < deadline, "the adopted halves never drained");
 			orphan::poll(&cx);
 			std::thread::yield_now();
 		}
