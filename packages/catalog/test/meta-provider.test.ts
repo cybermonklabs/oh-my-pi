@@ -164,7 +164,7 @@ describe("Muse Code subscription provider", () => {
 
 	test("bundled startup rows materialize the subscription policy without re-resolution", () => {
 		// The registry serves committed rows verbatim on the cacheless,
-		// pre-discovery path (model-registry #loadBuiltInModels), so the
+		// pre-discovery path (model-registry #builtInModelSteps), so the
 		// policy must live in models.json itself — not only in live rules.
 		const bundled = getBundledModel("muse-code", "muse-spark-1.3-contributor");
 		expect(bundled?.editPromptVariant).toBe("compact");
