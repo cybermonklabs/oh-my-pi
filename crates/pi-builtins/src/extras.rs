@@ -142,31 +142,17 @@ struct Extra {
 	run:  RunFn,
 }
 
+#[allow(dead_code, reason = "used by whichever table rows the enabled features compile")]
 fn utility<U: Utility>(invocation: Invocation) -> BoxFuture<'static, i32> {
 	Box::pin(run_utility::<U>(invocation))
 }
 
-// Compiled with the features of the `async_utility` rows in `for_each_extra!`.
-#[cfg(any(
-	feature = "util.ast-grep",
-	feature = "util.fd",
-	feature = "util.find",
-	feature = "util.grep",
-	feature = "util.rg",
-))]
+#[allow(dead_code, reason = "used by whichever table rows the enabled features compile")]
 fn async_utility<U: AsyncUtility>(invocation: Invocation) -> BoxFuture<'static, i32> {
 	Box::pin(run_async_utility::<U>(invocation))
 }
 
-// Compiled with the features of the `process` rows in `for_each_extra!`.
-#[cfg(any(
-	feature = "util.pgrep",
-	feature = "util.pidwait",
-	feature = "util.pkill",
-	feature = "util.ps",
-	feature = "util.sleep",
-	feature = "util.top",
-))]
+#[allow(dead_code, reason = "used by whichever table rows the enabled features compile")]
 fn process<P: Process>(invocation: Invocation) -> BoxFuture<'static, i32> {
 	Box::pin(run_process::<P>(invocation))
 }

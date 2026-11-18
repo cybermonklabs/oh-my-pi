@@ -214,7 +214,13 @@ impl Style {
 			Some(b't') => Ok(Self::NonEmpty),
 			Some(b'n') => Ok(Self::None),
 			Some(b'p') => {
-				let ere = bre::translate(&spec[1..], bre::Dialect::Basic, bre::Target::Fancy, false)
+				let ere = bre::translate(
+					&spec[1..],
+					bre::Dialect::Basic,
+					bre::Target::Fancy,
+					false,
+					bre::Strictness::Lenient,
+				)
 					.map_err(|error| Invalid::Fatal(error.message().to_owned()))?;
 				Regex::new(&ere)
 					.map(Self::Matching)
@@ -749,6 +755,23 @@ mod tests {
 		assert_eq!(
 			nl(&["-b", "p\\(a\\)\\1"], "aa\nab\n"),
 			(0, "     1\taa\n       ab\n".to_owned(), String::new())
+		);
+	}
+
+	#[test]
+	fn regex_style_reads_repetitions_as_gnu_nl_does() {
+		// GNU nl accepts a repeated repetition, which GNU sed refuses, and
+		// reads a leading interval as the text it spells.
+		for pattern in ["pa**", "pa*\\{2\\}"] {
+			assert_eq!(
+				nl(&["-b", pattern], "aa\nx\n"),
+				(0, "     1\taa\n     2\tx\n".to_owned(), String::new()),
+				"{pattern}"
+			);
+		}
+		assert_eq!(
+			nl(&["-b", "p\\{1,3\\}a"], "{1,3}a\nxa\n"),
+			(0, "     1\t{1,3}a\n       xa\n".to_owned(), String::new())
 		);
 	}
 

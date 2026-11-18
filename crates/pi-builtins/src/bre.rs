@@ -33,6 +33,11 @@ pub(crate) enum Target {
 	/// spells the word edges `\<` and `\>` itself, and its POSIX classes hold
 	/// ASCII alone.
 	Rust,
+	/// `grep-regex` with Unicode off, for a line that is not UTF-8, which GNU
+	/// grep reads a byte to a character in the C locale: as [`Self::Rust`],
+	/// with the letter classes ASCII too. The caller writes each character
+	/// outside ASCII as the escapes of its UTF-8 bytes.
+	RustBytes,
 	/// PCRE2, which `grep` compiles a back-reference with. It runs with
 	/// PCRE2_UCP, where a POSIX class already means the Unicode one, and it
 	/// has the look-around the word edges need.
@@ -45,16 +50,28 @@ pub(crate) enum Target {
 impl Target {
 	/// Whether the engine runs a back-reference.
 	const fn backrefs(self) -> bool {
-		!matches!(self, Self::Rust)
+		!matches!(self, Self::Rust | Self::RustBytes)
 	}
 
 	/// Whether a POSIX letter class is written as the Unicode property of the
 	/// same name. The `regex` crate reads `[[:alpha:]]` as ASCII alone, while
 	/// GNU in a UTF-8 locale counts every letter (`printf '\303\237\n' |
-	/// grep -c '[[:alpha:]]'` is 1); PCRE2 already does with PCRE2_UCP.
+	/// grep -c '[[:alpha:]]'` is 1); PCRE2 already does with PCRE2_UCP, and in
+	/// the C locale a byte from 0x80 up is no letter.
 	const fn unicode_letters(self) -> bool {
-		!matches!(self, Self::Pcre)
+		!matches!(self, Self::Pcre | Self::RustBytes)
 	}
+}
+
+/// How strictly a pattern is read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code, reason = "each variant is used by a different utility feature")]
+pub(crate) enum Strictness {
+	/// As GNU grep and GNU nl read it.
+	Lenient,
+	/// As GNU sed reads it, refusing what the others read leniently; see
+	/// [`Translator::strict`].
+	Sed,
 }
 
 /// A pattern the engines cannot express, or that GNU itself refuses.
@@ -107,7 +124,7 @@ impl BreError {
 }
 
 /// Rewrites `pattern`, written in `dialect`, into the syntax `target` reads
-/// with the meaning GNU gives it.
+/// with the meaning GNU gives it, read as strictly as `strictness` says.
 ///
 /// `icase` is the case folding the caller compiles with: GNU checks a range
 /// against the ends it folds, so `[Z-a]` is a range of its own and "Invalid
@@ -117,12 +134,14 @@ pub(crate) fn translate(
 	dialect: Dialect,
 	target: Target,
 	icase: bool,
+	strictness: Strictness,
 ) -> Result<String, BreError> {
 	Translator {
 		chars: pattern.chars().peekable(),
 		out: String::with_capacity(pattern.len() + 8),
 		dialect,
 		target,
+		strictness,
 		icase,
 		atom: None,
 		quantified: false,
@@ -134,13 +153,13 @@ pub(crate) fn translate(
 	.run()
 }
 
-/// Whether `pattern` holds a back-reference, which only an engine that runs
-/// them can compile and which no branch of an alternation keeps its meaning
-/// in alone. Inside a bracket expression `\` is an ordinary member, so
-/// `[\1]` holds none; a bracket expression is skipped by its extent alone,
+/// Whether a character of `pattern` outside every bracket expression
+/// satisfies `found`, which is told whether a backslash escapes it. Inside a
+/// bracket expression `\` is an ordinary member, so `[\1]` holds no
+/// back-reference; a bracket expression is skipped by its extent alone,
 /// whatever its members, so `\(a\)[a-Z]\1` holds one under `-i` too.
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
-pub(crate) fn has_backreference(pattern: &str) -> bool {
+fn holds(pattern: &str, found: impl Fn(char, bool) -> bool) -> bool {
 	let mut chars = pattern.chars().peekable();
 	let mut skipped = String::new();
 	while let Some(&c) = chars.peek() {
@@ -155,16 +174,32 @@ pub(crate) fn has_backreference(pattern: &str) -> bool {
 			},
 			'\\' => {
 				chars.next();
-				if chars.next().is_some_and(|escaped| matches!(escaped, '1'..='9')) {
+				if chars.next().is_some_and(|escaped| found(escaped, true)) {
 					return true;
 				}
 			},
 			_ => {
 				chars.next();
+				if found(c, false) {
+					return true;
+				}
 			},
 		}
 	}
 	false
+}
+
+/// Whether `pattern` holds a back-reference, which only an engine that runs
+/// them can compile.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+pub(crate) fn has_backreference(pattern: &str) -> bool {
+	holds(pattern, |c, escaped| escaped && matches!(c, '1'..='9'))
+}
+
+/// Whether `pattern`, written in `dialect`, opens a group.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+fn opens_group(pattern: &str, dialect: Dialect) -> bool {
+	holds(pattern, |c, escaped| c == '(' && escaped == (dialect == Dialect::Basic))
 }
 
 /// The most alternatives [`alternatives`] expands a pattern into. A pattern
@@ -172,33 +207,61 @@ pub(crate) fn has_backreference(pattern: &str) -> bool {
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
 const ALTERNATIVE_LIMIT: usize = 64;
 
+/// Who splits a pattern into its alternatives; see [`alternatives`].
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code, reason = "each variant is used by a different utility feature")]
+pub(crate) enum Split {
+	/// `grep -o`, which compiles each alternative alone: an alternation
+	/// inside a group that no repetition follows is expanded as well (the
+	/// alternatives of `(|zz)` are `()` and `(zz)`), which holds because such
+	/// a group matches exactly once, while a group a repetition follows is
+	/// left whole (the branches of `(a|ab)*` are not the pattern's). A
+	/// pattern holding a back-reference is left whole.
+	Grep,
+	/// `sed`, which searches each branch of the top-level alternation alone
+	/// and numbers a branch's groups after those of the branches before it.
+	/// The pattern is left whole where a branch after the first holds a
+	/// back-reference and a branch before it opens a group: the branch alone
+	/// numbers its groups from 1, so `\(a\)\|\(b\)\2` would lose its second
+	/// group, while `x\|\(x\)\1` keeps its meaning.
+	Sed,
+}
+
 /// The alternatives of `pattern`: the branches of its alternation, each
-/// written in the same dialect.
+/// written in the same dialect, split as far as `split` says.
 ///
 /// POSIX and GNU print the LONGEST match at a position while the engines
 /// prefer the first branch that matches there, so the caller searches each
 /// branch on its own and keeps the longest (`grep -oE 'a|ab'` prints `ab`).
 ///
-/// `distribute` expands an alternation inside a group that no repetition
-/// follows as well (the alternatives of `(|zz)` are `()` and `(zz)`), which
-/// holds because such a group matches exactly once. A group a repetition
-/// follows is left whole: the branches of `(a|ab)*` are not the pattern's.
-///
 /// The pattern itself is the only alternative when it holds no alternation,
-/// when it holds a back-reference (a branch alone numbers its groups from 1,
-/// so `\(a\)\|\(b\)\2` would lose its second group), when a group never
+/// when a back-reference keeps it whole (see [`Split`]), when a group never
 /// closes, or when it would expand into more than [`ALTERNATIVE_LIMIT`]
 /// branches.
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
-pub(crate) fn alternatives(pattern: &str, dialect: Dialect, distribute: bool) -> Vec<String> {
-	if !pattern.contains('|') || has_backreference(pattern) {
+pub(crate) fn alternatives(pattern: &str, dialect: Dialect, split: Split) -> Vec<String> {
+	if !pattern.contains('|') || (split == Split::Grep && has_backreference(pattern)) {
 		return vec![pattern.to_owned()];
 	}
 	let mut chars = pattern.chars().peekable();
-	match expand(&mut chars, dialect, distribute, false) {
-		Some((branches, _)) if branches.len() > 1 => branches,
+	match expand(&mut chars, dialect, split == Split::Grep, false) {
+		Some((branches, _)) if branches.len() > 1 && !renumbers_reference(&branches, dialect) => {
+			branches
+		},
 		_ => vec![pattern.to_owned()],
 	}
+}
+
+/// Whether a back-reference of `branches` names another group when its
+/// branch is searched alone: a branch after the first holds one, and a branch
+/// before it opens a group.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+fn renumbers_reference(branches: &[String], dialect: Dialect) -> bool {
+	branches.iter().enumerate().skip(1).any(|(index, branch)| {
+		has_backreference(branch)
+			&& branches[..index].iter().any(|earlier| opens_group(earlier, dialect))
+	})
 }
 
 /// Expands the alternation the iterator holds into its branches, stopping at
@@ -362,12 +425,17 @@ fn bracket_text(chars: &mut Peekable<Chars<'_>>, out: &mut String) -> bool {
 /// A group that is still open.
 struct OpenGroup {
 	/// Where in `out` it begins.
-	start:   usize,
+	start:       usize,
 	/// Its number, counted by its opening as POSIX counts groups.
-	number:  u32,
+	number:      u32,
 	/// The groups closed when it opened, which each branch inside it may
 	/// refer to.
-	initial: u32,
+	initial:     u32,
+	/// The groups closed in its branches before the current one, which a
+	/// back-reference may name again once it closes: `\(\(a\)\|b\)\2` is
+	/// valid, as glibc keeps them (`completed_bkref_map |=
+	/// accumulated_bkref_map`).
+	accumulated: u32,
 }
 
 /// The bit of group `number` in [`Translator::completed`]; a back-reference
@@ -383,6 +451,7 @@ struct Translator<'a> {
 	out:        String,
 	dialect:    Dialect,
 	target:     Target,
+	strictness: Strictness,
 	icase:      bool,
 	/// Where in `out` the atom a repetition operator repeats begins, or
 	/// `None` at a branch start, where there is nothing to repeat.
@@ -400,8 +469,10 @@ struct Translator<'a> {
 	/// How many groups have opened.
 	opened:     u32,
 	/// The groups a back-reference may name here, one bit per number: those
-	/// closed in the current branch or before its enclosing group opened.
-	/// GNU refuses `\(a\)\|\(b\)\1` and `\(a\1\)` ("Invalid back reference").
+	/// closed in the current branch or before its enclosing group opened,
+	/// and those an enclosing group closed in its earlier branches once it
+	/// closes. GNU refuses `\(a\)\|\(b\)\1` and `\(a\1\)` ("Invalid back
+	/// reference").
 	completed:  u32,
 }
 
@@ -432,15 +503,15 @@ impl Translator<'_> {
 	}
 
 	/// Whether the pattern is read as GNU sed reads it, which refuses what
-	/// GNU grep reads leniently: a repetition operator with nothing to
-	/// repeat in an ERE (`sed -E 's/*x/Y/'`), an interval with nothing to
+	/// GNU grep and GNU nl read leniently: a repetition operator with nothing
+	/// to repeat in an ERE (`sed -E 's/*x/Y/'`), an interval with nothing to
 	/// repeat in either dialect, a `*` or interval right after another
 	/// repetition in a BRE (`sed 's/a**/X/'`), and an unmatched `)` in an
 	/// ERE - each "Invalid preceding regular expression" or "Unmatched ) or
 	/// \)" there, where GNU grep drops the operator, matches the text, or
-	/// reads the `)` as an ordinary character.
+	/// reads the `)` as an ordinary character, and GNU nl accepts `a**`.
 	fn strict(&self) -> bool {
-		self.target == Target::Fancy
+		self.strictness == Strictness::Sed
 	}
 
 	/// The character after a backslash: an operator in a BRE, one of GNU's
@@ -535,9 +606,10 @@ impl Translator<'_> {
 	fn open_group(&mut self) {
 		self.opened += 1;
 		self.groups.push(OpenGroup {
-			start:   self.out.len(),
-			number:  self.opened,
-			initial: self.completed,
+			start:       self.out.len(),
+			number:      self.opened,
+			initial:     self.completed,
+			accumulated: 0,
 		});
 		self.out.push('(');
 		self.atom = None;
@@ -553,6 +625,7 @@ impl Translator<'_> {
 		match self.groups.pop() {
 			Some(group) => {
 				self.out.push(')');
+				self.completed |= group.accumulated;
 				if let Some(bit) = group_bit(group.number) {
 					self.completed |= bit;
 				}
@@ -570,16 +643,24 @@ impl Translator<'_> {
 	fn alternate(&mut self) {
 		self.out.push('|');
 		// A branch may name only the groups closed before its enclosing group
-		// opened, besides its own.
-		self.completed = self.groups.last().map_or(0, |group| group.initial);
+		// opened, besides its own; those of the earlier branches count again
+		// once that group closes.
+		match self.groups.last_mut() {
+			Some(group) => {
+				group.accumulated |= self.completed;
+				self.completed = group.initial;
+			},
+			None => self.completed = 0,
+		}
 		self.atom = None;
 		self.quantified = false;
 		self.anchored = false;
 	}
 
+	/// A back-reference to group `digit`, one of `1` to `9`.
 	fn backreference(&mut self, digit: char) -> Result<(), BreError> {
-		let number = digit.to_digit(10).unwrap_or(0);
-		if group_bit(number).is_none_or(|bit| (self.completed & bit) == 0) {
+		let bit = 1u32 << (u32::from(digit) - u32::from('0'));
+		if self.completed & bit == 0 {
 			return Err(BreError::BackReferenceInvalid);
 		}
 		let start = self.out.len();
@@ -600,8 +681,8 @@ impl Translator<'_> {
 	/// GNU's `\<` and `\>`, the edges of a word.
 	fn word_edge(&mut self, start: bool) {
 		let text = match (self.target, start) {
-			(Target::Rust, true) => "\\<",
-			(Target::Rust, false) => "\\>",
+			(Target::Rust | Target::RustBytes, true) => "\\<",
+			(Target::Rust | Target::RustBytes, false) => "\\>",
 			(_, true) => "\\b(?=\\w)",
 			(_, false) => "\\b(?<=\\w)",
 		};
@@ -798,14 +879,15 @@ fn take_bracket_expression(
 			ahead.next() == Some('[') && matches!(ahead.next(), Some(':' | '.' | '='))
 		};
 		let member = take_bracket_member(chars, first)?;
-		let colon = !symbol && matches!(member, BracketMember::Char(':'));
+		// A colon read as `[.:.]` or opening a range makes the list special
+		// as well, which no warning concerns.
+		ends_colon = matches!(member, BracketMember::Char(':'));
 		let range = matches!(member, BracketMember::Char(_)) && opens_range(chars);
 		if first {
-			opens_colon = colon;
+			opens_colon = ends_colon;
 		}
 		first = false;
 		special |= symbol || range;
-		ends_colon = colon && !range;
 		other_member |= !ends_colon;
 		match member {
 			BracketMember::Char(start) if range => {
@@ -955,20 +1037,20 @@ mod tests {
 
 	/// A BRE as `sed` compiles it.
 	fn bre(pattern: &str) -> String {
-		translate(pattern, Dialect::Basic, Target::Fancy, false).expect("translatable")
+		translate(pattern, Dialect::Basic, Target::Fancy, false, Strictness::Sed).expect("translatable")
 	}
 
 	fn bre_err(pattern: &str) -> Option<BreError> {
-		translate(pattern, Dialect::Basic, Target::Fancy, false).err()
+		translate(pattern, Dialect::Basic, Target::Fancy, false, Strictness::Sed).err()
 	}
 
 	/// An ERE as `grep` compiles it.
 	fn ere(pattern: &str) -> String {
-		translate(pattern, Dialect::Extended, Target::Rust, false).expect("translatable")
+		translate(pattern, Dialect::Extended, Target::Rust, false, Strictness::Lenient).expect("translatable")
 	}
 
 	fn ere_err(pattern: &str) -> Option<BreError> {
-		translate(pattern, Dialect::Extended, Target::Rust, false).err()
+		translate(pattern, Dialect::Extended, Target::Rust, false, Strictness::Lenient).err()
 	}
 
 	// Relocated from `sed`, which owned this translation before `grep` shared it.
@@ -1036,7 +1118,7 @@ mod tests {
 		// written plainly for an engine that would refuse it, which keeps the
 		// refusal (exit 2) rather than searching the text `\1`.
 		assert_eq!(
-			translate(r"\(a\)\1", Dialect::Basic, Target::Rust, false).expect("translatable"),
+			translate(r"\(a\)\1", Dialect::Basic, Target::Rust, false, Strictness::Lenient).expect("translatable"),
 			r"(a)\1"
 		);
 		// The group exists only for the engines that run them, where a bare
@@ -1048,7 +1130,7 @@ mod tests {
 	#[test]
 	fn an_ere_back_reference_is_written_too() {
 		assert_eq!(
-			translate(r"(a)\1", Dialect::Extended, Target::Pcre, false).expect("translatable"),
+			translate(r"(a)\1", Dialect::Extended, Target::Pcre, false, Strictness::Lenient).expect("translatable"),
 			r"(a)(?:\1)"
 		);
 		assert!(has_backreference(r"(a)\1"));
@@ -1085,7 +1167,7 @@ mod tests {
 		// `printf 'x\n' | grep -c '\{1,4\}'` is 0, so for grep the interval
 		// is the text, not an operator and not an error.
 		let grep_bre = |pattern: &str| {
-			translate(pattern, Dialect::Basic, Target::Rust, false).expect("translatable")
+			translate(pattern, Dialect::Basic, Target::Rust, false, Strictness::Lenient).expect("translatable")
 		};
 		assert_eq!(grep_bre(r"\{1,4\}"), r"\{1,4\}");
 		assert_eq!(grep_bre(r"^\{2\}"), r"^\{2\}");
@@ -1218,11 +1300,11 @@ mod tests {
 		assert_eq!(ere("(a)b)"), r"(a)b\)");
 		assert_eq!(bre_err(r"a\)"), Some(BreError::ParenUnmatched));
 		assert_eq!(
-			translate(r"a\)", Dialect::Basic, Target::Rust, false).err(),
+			translate(r"a\)", Dialect::Basic, Target::Rust, false, Strictness::Lenient).err(),
 			Some(BreError::ParenUnmatched)
 		);
 		assert_eq!(
-			translate("a)", Dialect::Extended, Target::Fancy, false).err(),
+			translate("a)", Dialect::Extended, Target::Fancy, false, Strictness::Sed).err(),
 			Some(BreError::ParenUnmatched)
 		);
 	}
@@ -1231,7 +1313,7 @@ mod tests {
 	fn sed_refuses_the_repetitions_grep_reads_leniently() {
 		// GNU sed 4.9: "Invalid preceding regular expression" for each, where
 		// GNU grep drops the operator or matches the text.
-		let sed_ere = |pattern: &str| translate(pattern, Dialect::Extended, Target::Fancy, false);
+		let sed_ere = |pattern: &str| translate(pattern, Dialect::Extended, Target::Fancy, false, Strictness::Sed);
 		for pattern in ["*x", "a|*b", "(*x)", "^*", "a$*", "a^*", "{2}x"] {
 			assert_eq!(sed_ere(pattern).err(), Some(BreError::RepetitionOperandMissing), "{pattern}");
 		}
@@ -1249,8 +1331,15 @@ mod tests {
 		}
 		// GNU grep reads every one of them.
 		for pattern in [r"a**", r"a\{2\}*", r"x*\{2\}"] {
-			assert!(translate(pattern, Dialect::Basic, Target::Rust, false).is_ok(), "{pattern}");
+			assert!(translate(pattern, Dialect::Basic, Target::Rust, false, Strictness::Lenient).is_ok(), "{pattern}");
 		}
+		// So does GNU nl: `printf 'aa\n' | nl -bp'a**'` numbers the line,
+		// and a leading interval is the text it spells there, as for grep.
+		let nl_bre =
+			|pattern: &str| translate(pattern, Dialect::Basic, Target::Fancy, false, Strictness::Lenient);
+		assert_eq!(nl_bre(r"a**"), Ok(r"(?:a*)*".to_owned()));
+		assert_eq!(nl_bre(r"a*\{2\}"), Ok(r"(?:a*){2}".to_owned()));
+		assert_eq!(nl_bre(r"\{1,3\}a"), Ok(r"\{1,3\}a".to_owned()));
 	}
 
 	#[test]
@@ -1261,7 +1350,7 @@ mod tests {
 			assert_eq!(bre_err(pattern), Some(BreError::BackReferenceInvalid), "{pattern}");
 		}
 		assert_eq!(
-			translate(r"(a)|b\1", Dialect::Extended, Target::Pcre, false).err(),
+			translate(r"(a)|b\1", Dialect::Extended, Target::Pcre, false, Strictness::Lenient).err(),
 			Some(BreError::BackReferenceInvalid)
 		);
 		// A group closed before the enclosing group opened stays nameable in
@@ -1269,6 +1358,20 @@ mod tests {
 		for pattern in [r"\(a\)\(b\|\1\)", r"\(a\)\|\(b\)\2", r"\(a\)\1"] {
 			assert_eq!(bre_err(pattern), None, "{pattern}");
 		}
+		// Once a group closes, so do the groups its branches closed:
+		// `printf 'aa\n' | grep '\(\(a\)\|b\)\2'` prints `aa`, in sed and
+		// with -E too, while a later branch inside it cannot name them.
+		assert_eq!(bre_err(r"\(\(a\)\|b\)\2"), None);
+		assert_eq!(bre_err(r"\(\(a\)\|b\|c\)\2"), None);
+		assert_eq!(
+			translate(r"((a)|b)\2", Dialect::Extended, Target::Fancy, false, Strictness::Sed).err(),
+			None
+		);
+		assert_eq!(
+			translate(r"((a)|b)\2", Dialect::Extended, Target::Pcre, false, Strictness::Lenient).err(),
+			None
+		);
+		assert_eq!(bre_err(r"\(\(a\)\|b\2\)"), Some(BreError::BackReferenceInvalid));
 	}
 
 	// ── A backslash before an ordinary character ─────────────────────────────
@@ -1290,9 +1393,9 @@ mod tests {
 
 	#[test]
 	fn the_word_edges_are_written_for_the_engine() {
-		assert_eq!(translate(r"\<a\>", Dialect::Basic, Target::Rust, false).unwrap(), r"\<a\>");
+		assert_eq!(translate(r"\<a\>", Dialect::Basic, Target::Rust, false, Strictness::Lenient).unwrap(), r"\<a\>");
 		assert_eq!(
-			translate(r"\<a\>", Dialect::Basic, Target::Fancy, false).unwrap(),
+			translate(r"\<a\>", Dialect::Basic, Target::Fancy, false, Strictness::Sed).unwrap(),
 			r"\b(?=\w)a\b(?<=\w)"
 		);
 	}
@@ -1353,7 +1456,7 @@ mod tests {
 		// PCRE2 runs with PCRE2_UCP, where the POSIX class already means the
 		// Unicode one.
 		assert_eq!(
-			translate("[[:alpha:]]", Dialect::Basic, Target::Pcre, false).unwrap(),
+			translate("[[:alpha:]]", Dialect::Basic, Target::Pcre, false, Strictness::Lenient).unwrap(),
 			"[[:alpha:]]"
 		);
 	}
@@ -1425,17 +1528,17 @@ mod tests {
 	fn a_range_is_checked_against_the_ends_case_folding_gives_it() {
 		// `grep -ci '[Z-a]'` is "Invalid range end" where `grep -c '[Z-a]'`
 		// searches, because `-i` folds the ends to `Z` and `A`.
-		assert_eq!(translate("[Z-a]", Dialect::Basic, Target::Rust, false).ok(), Some(r"[Z-a]".to_owned()));
+		assert_eq!(translate("[Z-a]", Dialect::Basic, Target::Rust, false, Strictness::Lenient).ok(), Some(r"[Z-a]".to_owned()));
 		assert_eq!(
-			translate("[Z-a]", Dialect::Basic, Target::Rust, true).err(),
+			translate("[Z-a]", Dialect::Basic, Target::Rust, true, Strictness::Lenient).err(),
 			Some(BreError::RangeEndInvalid)
 		);
 		assert_eq!(
-			translate(r"[\-a]", Dialect::Basic, Target::Rust, true).err(),
+			translate(r"[\-a]", Dialect::Basic, Target::Rust, true, Strictness::Lenient).err(),
 			Some(BreError::RangeEndInvalid)
 		);
 		// `[A-z]` folds to `A` and `Z`, a range either way.
-		assert!(translate("[A-z]", Dialect::Basic, Target::Rust, true).is_ok());
+		assert!(translate("[A-z]", Dialect::Basic, Target::Rust, true, Strictness::Lenient).is_ok());
 	}
 
 	/// GNU grep 3.11 refuses each with "Unmatched [, [^, [:, [., or [=".
@@ -1493,33 +1596,33 @@ mod tests {
 	#[test]
 	fn a_pattern_without_alternation_is_its_own_only_alternative() {
 		for pattern in ["abc", "a[|]b", r"a\|b", "(a)*"] {
-			assert_eq!(alternatives(pattern, Dialect::Extended, true), vec![pattern.to_owned()]);
+			assert_eq!(alternatives(pattern, Dialect::Extended, Split::Grep), vec![pattern.to_owned()]);
 		}
 	}
 
 	#[cfg(any(feature = "util.grep", feature = "util.sed"))]
 	#[test]
 	fn an_alternation_is_split_into_its_branches() {
-		assert_eq!(alternatives("a|ab", Dialect::Extended, true), vec!["a", "ab"]);
-		assert_eq!(alternatives("a||b", Dialect::Extended, true), vec!["a", "", "b"]);
-		assert_eq!(alternatives(r"q\?\|zz", Dialect::Basic, true), vec![r"q\?", "zz"]);
+		assert_eq!(alternatives("a|ab", Dialect::Extended, Split::Grep), vec!["a", "ab"]);
+		assert_eq!(alternatives("a||b", Dialect::Extended, Split::Grep), vec!["a", "", "b"]);
+		assert_eq!(alternatives(r"q\?\|zz", Dialect::Basic, Split::Grep), vec![r"q\?", "zz"]);
 		// A bracket expression and an escape hold no alternation.
-		assert_eq!(alternatives(r"[a|b]|c", Dialect::Extended, true), vec!["[a|b]", "c"]);
-		assert_eq!(alternatives(r"a\|b|c", Dialect::Extended, true), vec![r"a\|b", "c"]);
+		assert_eq!(alternatives(r"[a|b]|c", Dialect::Extended, Split::Grep), vec!["[a|b]", "c"]);
+		assert_eq!(alternatives(r"a\|b|c", Dialect::Extended, Split::Grep), vec![r"a\|b", "c"]);
 	}
 
 	#[cfg(any(feature = "util.grep", feature = "util.sed"))]
 	#[test]
 	fn a_group_no_repetition_follows_is_distributed() {
-		assert_eq!(alternatives("(|zz)", Dialect::Extended, true), vec!["()", "(zz)"]);
-		assert_eq!(alternatives("x(a|b)y", Dialect::Extended, true), vec!["x(a)y", "x(b)y"]);
-		assert_eq!(alternatives(r"\(a\|b\)", Dialect::Basic, true), vec![r"\(a\)", r"\(b\)"]);
+		assert_eq!(alternatives("(|zz)", Dialect::Extended, Split::Grep), vec!["()", "(zz)"]);
+		assert_eq!(alternatives("x(a|b)y", Dialect::Extended, Split::Grep), vec!["x(a)y", "x(b)y"]);
+		assert_eq!(alternatives(r"\(a\|b\)", Dialect::Basic, Split::Grep), vec![r"\(a\)", r"\(b\)"]);
 		// A repeated group matches more than once, so its branches are not
 		// the pattern's: `(a|ab)*` is left whole.
-		assert_eq!(alternatives("(a|ab)*", Dialect::Extended, true), vec!["(a|ab)*"]);
-		assert_eq!(alternatives(r"\(a\|b\)\+", Dialect::Basic, true), vec![r"\(a\|b\)\+"]);
-		// Without distribution only the top level splits.
-		assert_eq!(alternatives("(a|b)|c", Dialect::Extended, false), vec!["(a|b)", "c"]);
+		assert_eq!(alternatives("(a|ab)*", Dialect::Extended, Split::Grep), vec!["(a|ab)*"]);
+		assert_eq!(alternatives(r"\(a\|b\)\+", Dialect::Basic, Split::Grep), vec![r"\(a\|b\)\+"]);
+		// sed splits the top level alone.
+		assert_eq!(alternatives("(a|b)|c", Dialect::Extended, Split::Sed), vec!["(a|b)", "c"]);
 	}
 
 	#[cfg(any(feature = "util.grep", feature = "util.sed"))]
@@ -1528,21 +1631,37 @@ mod tests {
 		// A branch alone numbers its groups from 1, so `\2` would name a
 		// different group, or none.
 		for pattern in [r"\(a\)\|\(b\)\2", r"\(b\)\|\(b\)\(c\)\2"] {
-			assert_eq!(alternatives(pattern, Dialect::Basic, true), vec![pattern.to_owned()]);
+			assert_eq!(alternatives(pattern, Dialect::Basic, Split::Grep), vec![pattern.to_owned()]);
+			assert_eq!(alternatives(pattern, Dialect::Basic, Split::Sed), vec![pattern.to_owned()]);
 		}
-		assert_eq!(alternatives(r"(a)|(b)\2", Dialect::Extended, false), vec![r"(a)|(b)\2"]);
+		assert_eq!(alternatives(r"(a)|(b)\2", Dialect::Extended, Split::Sed), vec![r"(a)|(b)\2"]);
+		// grep leaves any pattern holding one whole.
+		assert_eq!(alternatives(r"x\|\(x\)\1", Dialect::Basic, Split::Grep), vec![r"x\|\(x\)\1"]);
+	}
+
+	#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+	#[test]
+	fn sed_splits_where_each_reference_keeps_its_group() {
+		// `echo xx | sed 's/x\|\(x\)\1/Y/'` prints `Y`: no branch before the
+		// back-reference's opens a group, so it names the same one alone.
+		assert_eq!(alternatives(r"x\|\(x\)\1", Dialect::Basic, Split::Sed), vec!["x", r"\(x\)\1"]);
+		assert_eq!(alternatives(r"x|(x)\1", Dialect::Extended, Split::Sed), vec!["x", r"(x)\1"]);
+		// A back-reference in the first branch keeps its group as well.
+		assert_eq!(alternatives(r"\(x\)y\1\|x", Dialect::Basic, Split::Sed), vec![r"\(x\)y\1", "x"]);
+		// A bracket expression opens no group.
+		assert_eq!(alternatives(r"[(]|(x)\1", Dialect::Extended, Split::Sed), vec!["[(]", r"(x)\1"]);
 	}
 
 	#[cfg(any(feature = "util.grep", feature = "util.sed"))]
 	#[test]
 	fn an_unterminated_group_leaves_the_pattern_whole() {
-		assert_eq!(alternatives("(a|b", Dialect::Extended, true), vec!["(a|b"]);
+		assert_eq!(alternatives("(a|b", Dialect::Extended, Split::Grep), vec!["(a|b"]);
 	}
 
 	#[cfg(any(feature = "util.grep", feature = "util.sed"))]
 	#[test]
 	fn an_expansion_beyond_the_limit_leaves_the_pattern_whole() {
 		let pattern = "(a|b)(c|d)(e|f)(g|h)(i|j)(k|l)(m|n)";
-		assert_eq!(alternatives(pattern, Dialect::Extended, true), vec![pattern.to_owned()]);
+		assert_eq!(alternatives(pattern, Dialect::Extended, Split::Grep), vec![pattern.to_owned()]);
 	}
 }
