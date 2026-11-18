@@ -586,6 +586,36 @@ describe("restoreSession (omp --restore)", () => {
 		expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "Awaited", restore: true });
 	});
 
+	it("does not relaunch a subagent stranded without its key under a subagent spawned before the main session's /clear, though its own parent still waits on it", async () => {
+		// If this regresses, `--restore` relaunches a subagent of a subagent of work the user cleared, whose own
+		// parent is not relaunched: the cleared work goes on, and its result reaches a parent that never runs again.
+		const start = Date.parse("2026-11-17T12:00:00.000Z");
+		setSystemTime(new Date(start));
+		const { main, mainFile, cwd } = openParent();
+		appendTaskSpawn(main, "Outer");
+		// Outer's call to Inner got no result (Outer still waits on it), then Outer exited normally.
+		await writeSubagent(path.join(mainFile.slice(0, -6), "Outer.jsonl"), cwd, "Inner", stranded, {
+			normalExit: true,
+		});
+		await writeSubagent(
+			mainFile,
+			cwd,
+			"Outer",
+			[{ role: "user", content: "Outer task", timestamp: Date.now() }, ...parentTaskCall("Inner", "cut off")],
+			{ normalExit: true },
+		);
+		setSystemTime(new Date(start + 60_000));
+		main.appendResetBoundary();
+		setSystemTime(new Date(start + 120_000));
+		main.appendMessage({ role: "user", content: "new work", timestamp: Date.now() });
+		setSystemTime();
+
+		const { outcome, followUp } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: [] });
+		expect(followUp).not.toHaveBeenCalled();
+	});
+
 	for (const [record, run] of Object.entries(unsettledRunResults)) {
 		it(`relaunches a subagent stranded without its key whose parent's sync call recorded ${record}`, async () => {
 			// If this regresses, the result the parent's agent loop records as its process goes away inside the call
