@@ -368,6 +368,9 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const cacheAgeMs = cache ? now() - cache.updatedAt : Number.POSITIVE_INFINITY;
 	const shouldFetchFromNetwork =
 		hasRemoteFetcher && shouldFetchRemoteSources(strategy, hasUsableFreshCache, hasAuthoritativeCache, cacheAgeMs);
+	// Part of the fetch decision, so it comes from the start read too.
+	const shouldUseFreshCacheAsAuthoritative =
+		strategy === "online-if-uncached" && hasUsableFreshCache && hasAuthoritativeCache;
 
 	// Cold-start fast path: when a fresh, authoritative cache exists, the network
 	// fetch is skipped, AND the static catalog slice is byte-identical to what
@@ -426,8 +429,6 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const modelsDevModels = modelsDevAdditiveStaticModelIds
 		? normalizedModelsDevModels.filter(model => !modelsDevAdditiveStaticModelIds.has(model.id))
 		: normalizedModelsDevModels;
-	const shouldUseFreshCacheAsAuthoritative =
-		strategy === "online-if-uncached" && hasUsableFreshCache && hasAuthoritativeCache;
 	const dynamicFetchSucceeded = fetchedDynamicModels !== null;
 	const anyRemoteFetchSucceeded = modelsDevFetchSucceeded || dynamicFetchSucceeded;
 	const allConfiguredRemoteFetchesSucceeded =

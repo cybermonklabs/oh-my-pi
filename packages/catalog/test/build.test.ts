@@ -2095,14 +2095,15 @@ describe("model cache materialized round trip", () => {
 		const specs = (prefix: string, count: number, provider: string) =>
 			Array.from({ length: count }, (_, index) => completionsSpec({ id: `${prefix}-${index}`, provider }));
 		/**
-		 * Runs `refreshes` in a fresh database whose row holds `prior-model`
-		 * (non-authoritative), on a clock where every few reads end a slice, so a
-		 * refresh with many fetched rows takes many turns after its fetch. Returns
-		 * the stored row.
+		 * Runs `refreshes` in a fresh database whose row holds `prior-model`, or
+		 * `priorRows` rows (non-authoritative), on a clock where every few reads
+		 * end a slice, so a refresh with many rows to build or merge takes many
+		 * turns after its fetch. Returns the stored row.
 		 */
 		async function race(
 			name: string,
 			refreshes: (dbPath: string, providerId: string) => Promise<unknown>[],
+			priorRows = 0,
 		): Promise<{ ids: string[]; authoritative: boolean | undefined }> {
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `pi-catalog-${name}-`));
 			const dbPath = path.join(tempDir, "models.db");
@@ -2110,7 +2111,10 @@ describe("model cache materialized round trip", () => {
 			writeModelCache(
 				providerId,
 				500_000,
-				[buildModel(completionsSpec({ id: "prior-model", provider: providerId }))],
+				(priorRows > 0
+					? specs("prior", priorRows, providerId)
+					: [completionsSpec({ id: "prior-model", provider: providerId })]
+				).map(spec => buildModel(spec)),
 				false,
 				"",
 				dbPath,
@@ -2135,6 +2139,7 @@ describe("model cache materialized round trip", () => {
 				endpoint?: () => Promise<readonly Spec[] | null>;
 				modelsDev?: () => Promise<readonly Spec[] | null>;
 				authoritative?: boolean;
+				strategy?: "online" | "online-if-uncached";
 				restoreCachedHeaders?: () => { headers: Record<string, string> };
 			},
 		) =>
@@ -2159,7 +2164,7 @@ describe("model cache materialized round trip", () => {
 						: {}),
 					...(sources.restoreCachedHeaders ? { restoreCachedHeaders: sources.restoreCachedHeaders } : {}),
 				},
-				"online",
+				sources.strategy ?? "online",
 			);
 		/** A fetch that resolves with `value` once `after` has, plus one timer. */
 		const later =
@@ -2228,17 +2233,43 @@ describe("model cache materialized round trip", () => {
 		});
 		it("let a success that fetched after a failure write over the failure's copy", async () => {
 			const { promise: failureFetched, resolve } = Promise.withResolvers<void>();
-			const stored = await race("success-after-failure", (dbPath, providerId) => [
-				// The failure's models.dev answer builds over many turns and then fails.
+			const stored = await race(
+				"success-after-failure",
+				(dbPath, providerId) => [
+					// The endpoint fails; the copy of the 300-row prior row merges over many turns.
+					refresh(dbPath, providerId, 1_000_000, {
+						endpoint: async () => {
+							resolve();
+							return null;
+						},
+					}),
+					refresh(dbPath, providerId, 1_100_000, {
+						endpoint: later(failureFetched, specs("later", 1, providerId)),
+					}),
+				],
+				300,
+			);
+			expect(stored).toEqual({ ids: ["later-0"], authoritative: true });
+		});
+		it("report a refresh that fetched as stale when its own fetch failed", async () => {
+			const { promise: successFetched, resolve } = Promise.withResolvers<void>();
+			let failed: { stale: boolean } | undefined;
+			await race("failure-stale", (dbPath, providerId) => [
 				refresh(dbPath, providerId, 1_000_000, {
-					modelsDev: async () => {
+					strategy: "online-if-uncached",
+					endpoint: async () => {
 						resolve();
-						return [...specs("dev", 300, providerId), null as unknown as Spec];
+						return specs("fetched", 300, providerId);
 					},
 				}),
-				refresh(dbPath, providerId, 1_100_000, { endpoint: later(failureFetched, specs("later", 1, providerId)) }),
+				// It fetches because the row it read at its start was not fresh and authoritative;
+				// by its turn the success has written one that is.
+				refresh(dbPath, providerId, 1_100_000, {
+					strategy: "online-if-uncached",
+					endpoint: later(successFetched, null),
+				}).then(result => (failed = result)),
 			]);
-			expect(stored).toEqual({ ids: ["later-0"], authoritative: true });
+			expect(failed?.stale).toBe(true);
 		});
 		it("let a partial refresh that fetched after a complete one merge the complete rows", async () => {
 			const { promise: completeFetched, resolve } = Promise.withResolvers<void>();
@@ -2367,6 +2398,17 @@ describe("model cache materialized round trip", () => {
 			await third.ready;
 			expect(thirdReady).toBe(true);
 			third[Symbol.dispose]();
+			// Two spellings of one file share its turns.
+			const plain = turn();
+			const dotted = takeModelCacheRowTurn("turn-order-test", `${os.tmpdir()}/./pi-catalog-turn-order-unopened.db`);
+			let dottedReady = false;
+			void dotted.ready.then(() => (dottedReady = true));
+			await plain.ready;
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(dottedReady).toBe(false);
+			plain[Symbol.dispose]();
+			await dotted.ready;
+			dotted[Symbol.dispose]();
 		});
 	});
 	it("reports an authoritative catalog emptying as non-stale so removed models prune", async () => {

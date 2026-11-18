@@ -357,7 +357,8 @@ const rowTurns = new Map<string, Promise<void>>();
  * unsliced resolution read, merged and wrote the row.
  */
 export function takeModelCacheRowTurn(providerId: string, dbPath?: string): ModelCacheRowTurn {
-	const key = readCacheKey(resolveCacheDb(dbPath).resolvedPath, providerId);
+	// One key per file, however the caller spells its path.
+	const key = readCacheKey(path.resolve(resolveCacheDb(dbPath).resolvedPath), providerId);
 	const earlier = rowTurns.get(key) ?? Promise.resolve();
 	const { promise: released, resolve: release } = Promise.withResolvers<void>();
 	const tail = earlier.then(() => released);
