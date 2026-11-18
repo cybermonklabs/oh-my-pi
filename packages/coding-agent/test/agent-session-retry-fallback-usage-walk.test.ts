@@ -23,7 +23,7 @@ import * as aiStream from "@oh-my-pi/pi-ai/stream";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { formatModelString } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { formatModelString, resolveModelOverride } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -64,6 +64,7 @@ const FALLBACK = bundled("openai", "gpt-4o-mini");
 const NEXT_FALLBACK = bundled("google", "gemini-2.5-flash");
 const CODEX = bundled("openai-codex", "gpt-5.6-sol");
 const CODEX_FALLBACK = bundled("openai", "gpt-5.5");
+const VERTEX_PRIMARY = bundled("google-vertex", "claude-opus-4-8@default");
 
 function chainOf(...models: Model[]): Record<string, string[]> {
 	return { default: models.map(formatModelString) };
@@ -223,6 +224,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		vi.restoreAllMocks();
 		unregisterCustomApis(MOCK_API_SOURCE);
 		authStorage.keys.removeRuntime(CODEX.provider);
+		authStorage.keys.removeRuntime(VERTEX_PRIMARY.provider);
 		await authStorage.credentials.remove(CODEX.provider);
 	});
 
@@ -617,6 +619,53 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			expect(requestedModels).toEqual([
 				formatModelString(PRIMARY),
+				formatModelString(FALLBACK),
+				formatModelString(NEXT_FALLBACK),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(FALLBACK), formatModelString(NEXT_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		it("passes over the failed primary in cooldown under a spelling without its revision suffix, to the model after it", async () => {
+			// The primary is Vertex's `claude-opus-4-8@default`, which the catalog's
+			// revision suffix lets `google-vertex/claude-opus-4-8` name too. The
+			// primary fails and goes into cooldown, and the walk moves to the
+			// fallback. The fallback fails too. Its own chain names the primary
+			// without the suffix, and then the next fallback. The walk must not go
+			// back to the primary while it is in cooldown: it passes over that entry
+			// and answers from the next fallback.
+			authStorage.keys.setRuntime(VERTEX_PRIMARY.provider, `${VERTEX_PRIMARY.provider}-test-key`);
+			const unsuffixed = "google-vertex/claude-opus-4-8";
+			const settings = walkSettings(VERTEX_PRIMARY, {
+				"retry.maxRetries": 2,
+				"retry.fallbackChains": {
+					default: [formatModelString(FALLBACK)],
+					[formatModelString(FALLBACK)]: [unsuffixed, formatModelString(NEXT_FALLBACK)],
+				},
+			});
+			// The entry names the primary, so only the primary's cooldown can pass it over.
+			const named = resolveModelOverride([unsuffixed], modelRegistry, settings).model;
+			expect(named && formatModelString(named)).toBe(formatModelString(VERTEX_PRIMARY));
+			const requestedModels: string[] = [];
+			const mock = createMockModel();
+			const failing = new Set([formatModelString(VERTEX_PRIMARY), formatModelString(FALLBACK)]);
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: VERTEX_PRIMARY, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					requestedModels.push(formatModelString(model));
+					if (failing.has(formatModelString(model))) return providerErrorStream(model, SERVER_ERROR, 500);
+					mock.push({ content: ["answered"] });
+					return mock.stream(model, context, options);
+				},
+			});
+			const run = startSession(agent, settings);
+
+			await runTurn(run.session, "Fail on the primary and on the fallback");
+
+			expect(requestedModels).toEqual([
+				formatModelString(VERTEX_PRIMARY),
 				formatModelString(FALLBACK),
 				formatModelString(NEXT_FALLBACK),
 			]);

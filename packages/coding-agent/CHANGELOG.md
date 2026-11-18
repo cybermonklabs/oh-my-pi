@@ -5,7 +5,7 @@
 ### Fixed
 
 - With `retry.usageAwareFallback` on, the fallback walk after a failed request no longer sends the request to a model whose usage is spent
-- The fallback walk after a failed request, the fallback switch before a model call (with `retry.usageAwareFallback` on), the switch off a model with no credential, and an advisor's fallback now each pass over a fallback entry that is an alias of a model in cooldown, such as `pi/default`, and the return to the primary after its cooldown no longer restores a primary recorded at startup as an alias (`pi/<role>`) while the model it resolves to is in cooldown
+- The fallback walk after a failed request, the fallback switch before a model call (with `retry.usageAwareFallback` on), the switch off a model with no credential, and an advisor's fallback now pass over a fallback entry that resolves to a model in cooldown, however it is spelled (such as the alias `pi/default`), and the return to the primary after its cooldown waits the same way while the model the recorded primary resolves to is in cooldown
 
 ## [18.18.6] - 2026-11-09
 
