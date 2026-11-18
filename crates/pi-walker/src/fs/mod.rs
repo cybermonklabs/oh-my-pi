@@ -24,7 +24,9 @@
 //! entries below the root the same way ([`Session::write_file_beneath`],
 //! [`Session::remove_file_beneath`], [`Session::remove_dir_beneath`]). Only
 //! the root itself, and files named outside it (git's global excludes,
-//! ancestors' ignore files), open by path.
+//! ancestors' ignore files), open by path; a root that a walk which does not
+//! follow symlinks checked with `lstat` opens without following a symlink
+//! that is its final component ([`Session::open_dir_unlinked`]).
 //!
 //! ```ignore
 //! let fs = Fs::native();
