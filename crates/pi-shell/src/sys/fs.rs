@@ -1339,14 +1339,34 @@ fn read_dir(path: &BStr) -> io::Result<Box<dyn DirIter>> {
 /// Unique temp names within this process.
 static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// A new FIFO (process substitution on Unix) or empty file in the temp
+/// directory. A name that exists already is skipped: an earlier process
+/// with this pid (one killed, or a test that failed, before it removed its
+/// nodes) can have left it.
 fn temp(purpose: TempPurpose) -> io::Result<TempNode> {
-	let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-	#[cfg(windows)]
-	if let TempPurpose::ProcSub { output } = purpose {
-		return pipe::create(output, seq);
+	temp_in(&TEMP_SEQ, purpose)
+}
+
+/// [`temp`], with the name's number drawn from `seq_from`.
+fn temp_in(seq_from: &AtomicU32, purpose: TempPurpose) -> io::Result<TempNode> {
+	loop {
+		let seq = seq_from.fetch_add(1, Ordering::Relaxed);
+		#[cfg(windows)]
+		if let TempPurpose::ProcSub { output } = purpose {
+			return pipe::create(output, seq);
+		}
+		let path = std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
+		let fifo = matches!(purpose, TempPurpose::ProcSub { .. }) && cfg!(unix);
+		match make_temp(&path, fifo) {
+			Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {},
+			Err(err) => return Err(err),
+			Ok(()) => return Ok(TempNode { path: engine_path(&path), fifo }),
+		}
 	}
-	let path = std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
-	let fifo = matches!(purpose, TempPurpose::ProcSub { .. }) && cfg!(unix);
+}
+
+/// Creates the FIFO or the empty file at `path`, failing when it exists.
+fn make_temp(path: &std::path::Path, fifo: bool) -> io::Result<()> {
 	if fifo {
 		#[cfg(unix)]
 		{
@@ -1359,9 +1379,9 @@ fn temp(purpose: TempPurpose) -> io::Result<TempNode> {
 			}
 		}
 	} else {
-		fs::File::create_new(&path)?;
+		fs::File::create_new(path)?;
 	}
-	Ok(TempNode { path: engine_path(&path), fifo })
+	Ok(())
 }
 
 fn chdir_check(path: &BStr) -> io::Result<()> {
@@ -2094,6 +2114,46 @@ mod tests {
 			.unwrap();
 		assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 		std::fs::remove_file(host_path(&node.path).unwrap()).unwrap();
+	}
+
+	/// A temp name that an earlier process with this pid left in the temp
+	/// directory (`obash-<pid>-<n>`, kept by a test or a shell that failed or
+	/// was killed before it removed it) is skipped, instead of failing the
+	/// process substitution or the here-document with EEXIST. Each purpose
+	/// draws from a counter of its own, whose next four names exist.
+	#[cfg(unix)]
+	#[test]
+	fn a_temp_name_left_behind_is_skipped() {
+		/// Removes the names this test made, also when it fails.
+		struct Made(Vec<std::path::PathBuf>);
+		impl Drop for Made {
+			fn drop(&mut self) {
+				for path in &self.0 {
+					let _ = fs::remove_file(path);
+				}
+			}
+		}
+		let name =
+			|seq: u32| std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
+		let mut made = Made(Vec::new());
+		let (fifo_base, file_base) = (1 << 31, (1 << 31) + 64);
+		let mut got = Vec::new();
+		for (base, purpose) in
+			[(fifo_base, TempPurpose::ProcSub { output: false }), (file_base, TempPurpose::HereDoc)]
+		{
+			for seq in base..base + 4 {
+				if fs::File::create_new(name(seq)).is_ok() {
+					made.0.push(name(seq));
+				}
+			}
+			let node = temp_in(&AtomicU32::new(base), purpose).map(|node| {
+				let host = host_path(&node.path).unwrap().to_path_buf();
+				made.0.push(host.clone());
+				(host, node.fifo)
+			});
+			got.push(node.map_err(|e| e.kind()));
+		}
+		assert_eq!(got, [Ok((name(fifo_base + 4), true)), Ok((name(file_base + 4), false))]);
 	}
 
 	/// A Windows pipe classified as a regular file made the line reader read
