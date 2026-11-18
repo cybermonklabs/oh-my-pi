@@ -135,7 +135,7 @@ import {
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, isServiceTierForFamily, serviceTierSettingToTier } from "../config/service-tier";
-import { combine, type SettingsScope } from "../config/registry";
+import { combine, type SettingChange, type SettingsScope } from "../config/registry";
 import { type Settings, withActiveSettings } from "../config/settings";
 import { RawSseDebugBuffer } from "@oh-my-pi/pi-tui/apps/debug/raw-sse-buffer";
 import { getEditStore } from "../edit/store";
@@ -2310,6 +2310,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
 			settings: this.settings,
+			requestSettings: () => this.#tools.requestSettings,
 			model: () => this.model,
 			agentKind: () => this.#agentKind,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
@@ -7820,6 +7821,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#tools.refreshBaseSystemPrompt(commitIf, options);
 	}
 
+	/**
+	 * Holds a settings change on a bound prompt that alters what an active tool declares, whatever setting it is
+	 * (see {@link SessionTools.holdToolDeclarationChange}).
+	 */
+	holdToolDeclarationChange(settingsChange: readonly SettingChange[]): Promise<void> {
+		return this.#tools.holdToolDeclarationChange(settingsChange);
+	}
+
 	/** Replaces connected MCP tools and enables them immediately. */
 	refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
 		return this.#tools.refreshMCPTools(mcpTools);
@@ -11614,6 +11623,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	get toolCallSettings(): Settings | undefined {
 		return this.#tools.toolCallSettings;
+	}
+
+	/**
+	 * The settings the agent's requests read beside the system prompt and the tool declarations (intent field,
+	 * description pruning, tool-call dialect): under a held settings change, the values the bound prompt was sent
+	 * with ({@link SessionTools.requestSettings}); otherwise the session's own.
+	 */
+	get requestSettings(): Settings {
+		return this.#tools.requestSettings;
 	}
 
 	/** Skill loading warnings captured by SDK */

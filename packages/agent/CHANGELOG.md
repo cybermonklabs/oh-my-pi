@@ -11,6 +11,7 @@
 ### Fixed
 
 - A per-call context message (`markPerCallContextMessage`) that a main request repeats with the bytes the previous main request had at the same position is now sent as history, so Anthropic prompt caching keeps both rolling breakpoints instead of anchoring one before it; side requests (`buildSideRequestContext`) keep the marks as set
+- `Agent` now applies a change of `intentTracing` or `pruneToolDescriptions` from the next model call, as it does the system prompt and tools, instead of from the next prompt run, so a rebuild that changes all of them in the middle of a run changes them at one request and Anthropic prompt caching writes the prompt once; a response's tool calls are still stripped by the switch of the request that produced it
 
 ## [18.18.2] - 2026-11-08
 

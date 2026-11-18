@@ -862,6 +862,21 @@ export function all(): readonly AnySetting[] {
 	return ordered;
 }
 
+/** {@link everySetting} and the number of registered settings it combines. */
+let everySettingValue: { count: number; value: Derived<unknown> } | undefined;
+
+/**
+ * Every registered setting as one value, built again when more have registered since: its
+ * {@link Derived.listenChanges} hears a change of any setting, each changed one with its earlier value.
+ */
+export function everySetting(): Derived<unknown> {
+	if (everySettingValue?.count !== ordered.length) {
+		const parts = Object.fromEntries(ordered.map(setting => [setting.id, setting]));
+		everySettingValue = { count: ordered.length, value: combine(parts) };
+	}
+	return everySettingValue.value;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Warn-once diagnostics
 // ═══════════════════════════════════════════════════════════════════════════

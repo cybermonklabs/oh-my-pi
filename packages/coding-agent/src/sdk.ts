@@ -86,7 +86,7 @@ import {
 import { formatModelSelectorValue, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { buildServiceTierByFamily } from "./config/service-tier";
-import { bindEffects, combine, type SettingChange } from "./config/registry";
+import { bindEffects, combine, everySetting, type SettingChange } from "./config/registry";
 import { Settings } from "./config/settings";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
@@ -436,12 +436,6 @@ import {
 	cfgTaskMaxConcurrency,
 	ovnfsCommand,
 } from "./task/settings";
-
-/** Agent-level tool-call switches, snapshotted by the agent loop per prompt run. */
-const cfgToolCallSwitches = combine({
-	intentTracing: cfgToolsIntentTracing,
-	abortOnFabricatedResult: cfgToolsAbortOnFabricatedResult,
-});
 
 /** Settings skill and file slash-command discovery reads (foreign sources gated by the provider lists). */
 const cfgSkillsAndCommandsDiscovery = combine({
@@ -4182,12 +4176,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					toolSession.deviceOnlyWrite !== true),
 		});
 
-		// Resolve the live inline-descriptors setting against the active model.
+		// Resolve the inline-descriptors setting of `source` against the active model.
 		// `auto` enforces the per-model policy (inline for Gemini, off otherwise), so
 		// a mid-session model switch re-decides it. Prompt and agent (description
 		// pruning) must agree: every prompt rebuild re-syncs the agent's pruning.
-		const resolveInlineToolDescriptors = (): boolean =>
-			shouldInlineToolDescriptors(cfgInlineToolDescriptors.get(settings), (agent?.state.model ?? model)?.id);
+		const resolveInlineToolDescriptors = (source: Settings): boolean =>
+			shouldInlineToolDescriptors(cfgInlineToolDescriptors.get(source), (agent?.state.model ?? model)?.id);
 		// Latest memory backend instructions rendered for advisor system prompts.
 		// Populated by the initial rebuildSystemPrompt below (before the session is
 		// constructed) and refreshed on every later rebuild via
@@ -4293,9 +4287,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// tool-availability caveat lives in the wrapper template.
 			advisorMemoryPrompt = formatAdvisorMemoryPrompt(backendInstructions);
 			if (hasSession) session.setAdvisorMemoryPrompt(advisorMemoryPrompt);
-			const inlineToolDescriptors = resolveInlineToolDescriptors();
-			// Unset only during the initial build; the agent is constructed with it.
-			if (agent) agent.pruneToolDescriptions = inlineToolDescriptors;
+			const inlineToolDescriptors = resolveInlineToolDescriptors(settings);
+			// Unset only during the initial build; the agent is constructed with them. The request switches follow
+			// the settings the requests read: the live ones, or while a held settings change keeps the bound prompt,
+			// the ones it was sent with, so a switch changes with the prompt that describes it.
+			if (agent) {
+				const requestSettings = hasSession ? session.requestSettings : settings;
+				agent.pruneToolDescriptions = resolveInlineToolDescriptors(requestSettings);
+				agent.intentTracing = cfgToolsIntentTracing.get(requestSettings);
+			}
 			// A fixed string or array in systemPrompt replaces all generated blocks.
 			// Preserve the bookkeeping above, but skip discovering or rendering a
 			// template whose output would be discarded.
@@ -4972,10 +4972,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			suggestFallbackToolNames: suggestDeviceToolNames,
 			intentTracing: cfgToolsIntentTracing.get(settings),
 			intentDescription: spotlightExperiment ? SPOTLIGHT_INTENT_DESCRIPTION : undefined,
-			pruneToolDescriptions: resolveInlineToolDescriptors(),
+			pruneToolDescriptions: resolveInlineToolDescriptors(settings),
 			// Per request against the model actually requested, so `tools.format`
-			// changes and model switches reach the next provider call.
-			dialectResolver: dialectModel => resolveDialect(cfgToolsFormat.get(settings), dialectModel),
+			// changes and model switches reach the next provider call; a change a
+			// held settings rebuild keeps from the bound prompt waits for the rebuild.
+			dialectResolver: dialectModel =>
+				resolveDialect(cfgToolsFormat.get(hasSession ? session.requestSettings : settings), dialectModel),
 			abortOnFabricatedToolResult: cfgToolsAbortOnFabricatedResult.get(settings),
 			speculativeToolExecution,
 			getToolChoice: () => session?.nextToolChoiceDirective(),
@@ -5336,11 +5338,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				session.emitNotice("error", `Failed to rebuild the system prompt after a settings change: ${error}`);
 			}
 		});
-		// Agent-level tool-call switches: the loop snapshots them per prompt run, so a
-		// change applies from the next run without splitting one response's schema/strip.
-		// The prompt listener above republishes the intent-field guidance.
-		cfgToolCallSwitches.listen(session, ({ intentTracing, abortOnFabricatedResult }) => {
-			agent.intentTracing = intentTracing;
+		// The loop snapshots this switch per prompt run. `tools.intentTracing` is synced by each
+		// prompt build instead (`rebuildSystemPrompt`), with the intent-field guidance it renders.
+		cfgToolsAbortOnFabricatedResult.listen(session, abortOnFabricatedResult => {
 			agent.abortOnFabricatedToolResult = abortOnFabricatedResult;
 		});
 		// Tool-gating settings add or remove the tools they gate and refresh the
@@ -5364,6 +5364,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				reconcileGatedTools({ refreshPrompt: false, settingsChange }),
 			);
 		}
+		// Any other setting a tool definition renders (`tools.maxTimeout` in the `bash` and
+		// `eval` descriptions, `task.enableEffort` in the `task` schema) starts no rebuild of
+		// its own; on a bound prompt its change is held as the ones above are when it alters
+		// what an active tool declares.
+		everySetting().listenChanges(session, async settingsChange => {
+			try {
+				await session.holdToolDeclarationChange(settingsChange);
+			} catch (error) {
+				session.emitNotice("error", `Failed to hold a tool definition change: ${error}`);
+			}
+		});
 		// Backfill the resumed advisor spend without blocking startup: the scan
 		// runs after the session is live, so `--resume` no longer scales with the
 		// advisor transcript size (issue #9553).
@@ -5825,7 +5836,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					intentTracing: agent.intentTracing,
 					intentDescription: agent.intentDescription,
 					pruneToolDescriptions: agent.pruneToolDescriptions,
-					dialect: resolveDialect(cfgToolsFormat.get(settings), captureModel),
+					dialect: resolveDialect(cfgToolsFormat.get(session.requestSettings), captureModel),
 					abortOnFabricatedToolResult: cfgToolsAbortOnFabricatedResult.get(settings),
 					appendOnlyContext: shouldEnableAppendOnlyContext(
 						cfgProviderAppendOnlyContext.get(settings),

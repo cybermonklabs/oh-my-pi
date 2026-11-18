@@ -870,7 +870,7 @@ export class Agent {
 		);
 	}
 
-	/** Inject/strip the intent field on tool calls; applies from the next prompt run. */
+	/** Inject/strip the intent field on tool calls; applies from the next model call. */
 	get intentTracing(): boolean {
 		return this.#intentTracing;
 	}
@@ -2064,6 +2064,11 @@ export class Agent {
 				context.systemPrompt = this.#state.systemPrompt;
 				this.#onModelCallSystemPrompt?.(context.systemPrompt);
 				context.tools = this.#toolsForModel(this.#state.model ?? model);
+				// The intent field and description pruning follow the agent's switches at each call, as the prompt and
+				// tools above do, so a rebuild that changes them all changes them at the same request. A response's
+				// calls are stripped by the switch of the request that produced it: the next sync runs after them.
+				config.intentTracing = this.#intentTracing;
+				config.pruneToolDescriptions = this.#pruneToolDescriptions;
 			},
 			beforeModelCall:
 				this.#beforeModelCall || this.#additionalBeforeModelCalls.size > 0

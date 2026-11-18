@@ -446,13 +446,6 @@ function systemPromptDigest(blocks: readonly string[]): string {
 	return hash.toString(16);
 }
 
-/** What a request declares for `tool`: its names, description and parameter schema. */
-function toolDeclaration(
-	tool: Pick<AgentTool, "name" | "customWireName" | "label" | "description" | "parameters">,
-): string {
-	return JSON.stringify([tool.name, tool.customWireName, tool.label, tool.description, tool.parameters]);
-}
-
 /** The members of a tool that shape what a request declares for it besides its name; getters may render them. */
 type ToolDeclarationFields = Pick<AgentTool, Exclude<keyof Tool, "name"> | "intent">;
 
@@ -461,6 +454,11 @@ const TOOL_DECLARATION_FIELD_KEYS: readonly (keyof ToolDeclarationFields)[] = [
 	...TOOL_DECLARATION_KEYS.filter((key): key is Exclude<keyof Tool, "name"> => key !== "name"),
 	"intent",
 ];
+
+/** What a request declares for `tool`: its names and each of its {@link ToolDeclarationFields}. */
+function toolDeclaration(tool: Pick<AgentTool, "name" | "label"> & ToolDeclarationFields): string {
+	return JSON.stringify([tool.name, tool.label, ...TOOL_DECLARATION_FIELD_KEYS.map(key => tool[key])]);
+}
 
 /** `tool`'s {@link ToolDeclarationFields} as they read now. */
 function toolDeclarationFields(tool: AgentTool): ToolDeclarationFields {
@@ -989,7 +987,7 @@ export class SessionTools {
 		if (this.#xdev && this.#xdev.tools !== this.#toolRegistry) {
 			throw new Error("xd:// state must reference the canonical session tool map");
 		}
-		if (this.#xdev) this.#xdev.decorateExecution = tool => this.#wrapToolForAcpPermission(tool);
+		if (this.#xdev) this.#xdev.decorateExecution = tool => this.#callableAsDeclared(tool);
 		this.#setActiveToolNames = options.setActiveToolNames;
 		this.#baseSystemPrompt = options.baseSystemPrompt;
 		this.#operatorPromptDigest = options.operatorPromptDigest;
@@ -1302,17 +1300,22 @@ export class SessionTools {
 	 * shared {@link resolveMCPToolAlias}, so an alias two registered tools both
 	 * answer resolves to nothing here exactly as it does at dispatch — this
 	 * method is public and also picks transcript renderers, so a first-match
-	 * shortcut could render or return the wrong tool.
+	 * shortcut could render or return the wrong tool. While a held settings
+	 * rebuild keeps the tool declared as sent, it is the tool as declared
+	 * ({@link #declaredAs}), whose members run as that declaration says.
 	 */
 	getToolByName(name: string): AgentTool | undefined {
 		const bareName = stripXdUrlPrefix(name);
-		const direct = this.#toolRegistry.get(name) ?? this.#toolRegistry.get(bareName);
-		if (direct) return direct;
-		return resolveMCPToolAlias(bareName, candidate => this.#toolRegistry.get(candidate));
+		const tool =
+			this.#toolRegistry.get(name) ??
+			this.#toolRegistry.get(bareName) ??
+			resolveMCPToolAlias(bareName, candidate => this.#toolRegistry.get(candidate));
+		return tool && this.#declaredAs(tool);
 	}
 
 	/**
-	 * Looks up an enabled tool through the same ACP permission gate as direct calls.
+	 * Looks up an enabled tool through the same ACP permission gate as direct calls, declared as the agent holds
+	 * it ({@link #callableAsDeclared}).
 	 *
 	 * Accepts the spellings direct dispatch accepts: an `xd://` prefix and the
 	 * Claude Code `mcp__<server>__<tool>` alias. The alias resolves in one
@@ -1324,11 +1327,20 @@ export class SessionTools {
 		const enabled = new Set(this.getEnabledToolNames());
 		const named = this.#resolveToolWireName(bareName);
 		// A registered name never falls through to an alias guess, even when disabled.
-		if (named) return enabled.has(named.name) ? this.#wrapToolForAcpPermission(named) : undefined;
+		if (named) return enabled.has(named.name) ? this.#callableAsDeclared(named) : undefined;
 		const alias = resolveMCPToolAlias(bareName, candidate =>
 			enabled.has(candidate) ? this.#toolRegistry.get(candidate) : undefined,
 		);
-		return alias && this.#wrapToolForAcpPermission(alias);
+		return alias && this.#callableAsDeclared(alias);
+	}
+
+	/**
+	 * `tool` as a caller outside the agent loop runs it (an eval cell, an `xd://` device write): behind the ACP
+	 * permission gate, and while a held settings rebuild keeps it declared as sent, declared so
+	 * ({@link #declaredAs}), so a call shaped by that declaration is checked and runs as it says.
+	 */
+	#callableAsDeclared(tool: AgentTool): AgentTool {
+		return this.#declaredAs(this.#wrapToolForAcpPermission(tool));
 	}
 
 	/** Canonical and unambiguous wire names accepted by the eval bridge. */
@@ -1977,19 +1989,27 @@ export class SessionTools {
 	}
 
 	/**
-	 * The session's settings as a tool held with `before` (its hold's {@link HeldSettingsRebuild.before}) keeps declared
-	 * as sent reads them: each setting the held change moved reads its value from before the change while that hold
-	 * lasts, and the live one once it ends (a job a call started outlives it). Writes, listeners, overlays and every
-	 * other member are the session settings' own.
+	 * The settings a request reads where it is shaped beside the system prompt and the tool declarations (the intent
+	 * field the agent loop injects, description pruning, the tool-call dialect): under a held settings rebuild, each
+	 * setting the change moved reads the value the bound prompt and the kept declarations were sent with
+	 * ({@link HeldSettingsRebuild.toolSettings}) until the rebuild; otherwise the session's own.
 	 */
-	#settingsAsDeclared(before: ReadonlyMap<AnySetting, unknown>): Settings {
+	get requestSettings(): Settings {
+		return this.#heldSettingsRebuild?.toolSettings ?? this.#host.settings;
+	}
+
+	/**
+	 * The session's settings with each setting of `values` reading its value there while `applies()`, and the live
+	 * one otherwise: a hold's {@link HeldSettingsRebuild.toolSettings} reads each setting the held change moved from
+	 * before the change while that hold lasts, and the live one once it ends (a job a call started outlives it).
+	 * Writes, listeners, overlays and every other member are the session settings' own.
+	 */
+	#settingsWith(values: ReadonlyMap<AnySetting, unknown>, applies: () => boolean): Settings {
 		const settings = this.#host.settings;
 		return forwardingProxy(settings, {
-			rawValue: (setting: AnySetting): unknown => {
-				if (this.#heldSettingsRebuild?.before === before && before.has(setting)) return before.get(setting);
-				return settings.rawValue(setting);
-			},
-			// Values derived from the held ones never reach the session settings' memo.
+			rawValue: (setting: AnySetting): unknown =>
+				applies() && values.has(setting) ? values.get(setting) : settings.rawValue(setting),
+			// Values derived from these never reach the session settings' memo.
 			get valueCache() {
 				return [];
 			},
@@ -3440,7 +3460,7 @@ export class SessionTools {
 			const xdevChanged = delta.xdev !== this.#xdev;
 			if (xdevChanged) {
 				this.#xdev = delta.xdev;
-				if (delta.xdev) delta.xdev.decorateExecution = tool => this.#wrapToolForAcpPermission(tool);
+				if (delta.xdev) delta.xdev.decorateExecution = tool => this.#callableAsDeclared(tool);
 			}
 			if (!refreshPrompt && !xdevChanged && delta.added.length === 0 && delta.removed.length === 0) return;
 			const held = xdevChanged ? undefined : this.#holdSettingsRebuild(settingsChange);
@@ -3522,7 +3542,7 @@ export class SessionTools {
 				skills: false,
 				declarations: sent?.promptDigest === promptDigest ? sent.tools : undefined,
 				declared: new WeakMap(),
-				toolSettings: this.#settingsAsDeclared(before),
+				toolSettings: this.#settingsWith(before, () => this.#heldSettingsRebuild?.before === before),
 			};
 			this.#heldSettingsRebuild = held;
 			this.#recordWithheldChange(held);
@@ -3532,6 +3552,62 @@ export class SessionTools {
 			if (!held.before.has(setting)) held.before.set(setting, previous);
 		}
 		return held;
+	}
+
+	/**
+	 * Holds a settings change on a bound prompt that alters what an active tool declares, whatever setting it is, as
+	 * {@link #holdSettingsRebuild} holds the rebuilds the settings the system prompt and the tool gates render start:
+	 * the declarations stay as sent, the settings notice names the change, it goes out within five minutes, and
+	 * calls run as declared. A setting a tool definition renders (`tools.maxTimeout` in the `bash` and `eval`
+	 * descriptions, `task.enableEffort` in the `task` schema) starts no rebuild of its own, so without this the next
+	 * request would send the new definition. The changes held are those the declarations move with
+	 * ({@link #declarationMovers}); with none, nothing is held.
+	 */
+	holdToolDeclarationChange(settingsChange: readonly SettingChange[]): Promise<void> {
+		// Nothing to hold: no wait behind the registry mutations in flight.
+		if (!this.#promptBound) return Promise.resolve();
+		// A change a call made reaches here in that call's settings frame; the declarations are the session's own.
+		return this.#toolCallSettingsScope.exit(() =>
+			this.runToolRegistryMutation(async () => {
+				if (this.#host.isDisposed()) return;
+				const movers = this.#declarationMovers(settingsChange);
+				if (movers.length === 0 || !this.#holdSettingsRebuild(movers)) return;
+				await this.#recordHeldSettingsBuild();
+			}),
+		);
+	}
+
+	/**
+	 * The changes of `settingsChange` an active tool's declaration moves with, among the tools that now declare
+	 * otherwise than the bound prompt's kept declarations (the hold's, else the last request's on this prompt): each
+	 * change that, set back to its earlier value alone, gives one of those tools another declaration. Empty when no
+	 * request on the bound prompt was recorded, no tool declares otherwise, or the hold keeps each changed setting.
+	 */
+	#declarationMovers(settingsChange: readonly SettingChange[]): SettingChange[] {
+		const held = this.#heldSettingsRebuild;
+		const sent = this.#sentDeclarations;
+		const kept = held
+			? held.declarations
+			: sent?.promptDigest === this.currentPromptDigest()
+				? sent.tools
+				: undefined;
+		const changes = settingsChange.filter(({ setting }) => !held?.before.has(setting));
+		if (!kept || changes.length === 0) return [];
+		const altered = this.#host.agent.state.tools.flatMap(tool => {
+			const own = this.#declaredOwners.get(tool) ?? tool;
+			const fields = kept.get(own.name);
+			const declaration = toolDeclaration(own);
+			return fields && declaration !== toolDeclaration({ ...fields, name: own.name, label: own.label })
+				? [{ own, declaration }]
+				: [];
+		});
+		if (altered.length === 0) return [];
+		return changes.filter(({ setting, previous }) =>
+			this.#toolCallSettingsScope.run(
+				this.#settingsWith(new Map([[setting, previous]]), () => true),
+				() => altered.some(({ own, declaration }) => toolDeclaration(own) !== declaration),
+			),
+		);
 	}
 
 	/**
