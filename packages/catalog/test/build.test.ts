@@ -657,10 +657,17 @@ describe("openai-completions wire-quirk compat detection", () => {
 			resolveModelPolicy(completionsSpec({ provider: "vllm", id: "deepseek-v4-flash", input: ["text", "image"] }))
 				.compat.stripImageInput,
 		).toBe(true);
-		// The lineage glob covers dated SKUs, not just the bare id.
+		// The lineage carve-out covers dated SKUs, not just the bare id.
 		expect(
 			resolveModelPolicy(
 				completionsSpec({ provider: "vllm", id: "deepseek-v4.1-flash-0731", input: ["text", "image"] }),
+			).compat.stripImageInput,
+		).toBe(false);
+		// Hosts that spell the release with a hyphen (Mistral's live roster:
+		// `deepseek-v4-1-flash-1017`) serve the same multimodal weights (#18405).
+		expect(
+			resolveModelPolicy(
+				completionsSpec({ provider: "mistral", id: "deepseek-v4-1-flash-1017", input: ["text", "image"] }),
 			).compat.stripImageInput,
 		).toBe(false);
 		// A V4.1 id that also carries a `vision` token matches both exceptions at
@@ -1992,6 +1999,93 @@ describe("model cache materialized round trip", () => {
 			expect(recovered.models.map(model => model.id)).toEqual([recoveredModel.id]);
 			expect(recovered.stale).toBe(false);
 			expect(fetches).toBe(2);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("keeps a header-bearing cached catalog after a failed refresh so the next launch refetches it (#18227)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-header-failed-refresh-"));
+		const dbPath = path.join(tempDir, "models.db");
+		// Live headers with no static source: the cache omits them and the row's
+		// model cannot be restored offline.
+		const model = completionsSpec({
+			id: "tenant-model",
+			provider: "header-failed-refresh-test",
+			headers: { "X-Tenant": "tenant-a" },
+		});
+		let fetches = 0;
+		let fail = false;
+		const options = {
+			providerId: "header-failed-refresh-test",
+			staticModels: [],
+			dynamicModelsAuthoritative: true,
+			cacheDbPath: dbPath,
+			now: () => 1_000_000,
+			fetchDynamicModels: async () => {
+				fetches++;
+				return fail ? null : [model];
+			},
+		};
+		try {
+			const populated = await resolveProviderModels(options, "online");
+			expect(populated.models.map(candidate => candidate.id)).toEqual([model.id]);
+
+			fail = true;
+			await resolveProviderModels(options, "online");
+			expect(fetches).toBe(2);
+
+			// The clock does not advance: a rewritten empty snapshot would read back
+			// fresh and skip this fetch, hiding the model until the backoff expires.
+			fail = false;
+			const recovered = await resolveProviderModels(options, "online-if-uncached");
+			expect(recovered.models.map(candidate => candidate.id)).toEqual([model.id]);
+			expect(fetches).toBe(3);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("skips the sliced cache write on a failed refresh while cached header-bearing models are unresolved (#18227)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-header-failed-refresh-row-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "header-failed-refresh-row-test";
+		const model = completionsSpec({ id: "tenant-model", provider: providerId, headers: { "X-Tenant": "tenant-a" } });
+		let clock = 1_000_000;
+		let fail = false;
+		const options = {
+			providerId,
+			staticModels: [],
+			dynamicModelsAuthoritative: true,
+			cacheDbPath: dbPath,
+			now: () => clock,
+			fetchDynamicModels: async () => (fail ? null : [model]),
+		};
+		const readRows = () => {
+			const db = new Database(dbPath, { readonly: true });
+			try {
+				return {
+					payload: db
+						.query<Record<string, unknown>, [string]>("SELECT * FROM model_cache WHERE provider_id = ?")
+						.get(providerId),
+					refresh: db
+						.query<Record<string, unknown>, [string]>("SELECT * FROM model_cache_refresh WHERE provider_id = ?")
+						.get(providerId),
+				};
+			} finally {
+				db.close();
+			}
+		};
+		try {
+			await resolveProviderModels(options, "online");
+			const written = readRows();
+			expect(written.payload?.updated_at).toBe(1_000_000);
+			expect(written.refresh).toBeNull();
+
+			// The clock advances, so any write on the failed pass would change the
+			// payload row's updated_at or add a refresh side row.
+			clock = 2_000_000;
+			fail = true;
+			await resolveProviderModels(options, "online");
+			expect(readRows()).toEqual(written);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}

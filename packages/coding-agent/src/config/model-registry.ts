@@ -3006,10 +3006,12 @@ export class ModelRegistry {
 			const models = result.models.map(model =>
 				model.provider === options.providerId ? model : { ...model, provider: options.providerId },
 			);
+			// An offline pass only reads the cache: a missing row means "not fetched
+			// yet" (a cold, credential-scoped namespace), not an unreachable provider.
 			const status =
 				result.source === "cache"
 					? "cached"
-					: result.source === "bundled" && result.stale
+					: result.source === "bundled" && result.stale && strategy !== "offline"
 						? "unavailable"
 						: result.source === "bundled"
 							? "idle"
@@ -3909,11 +3911,14 @@ export class ModelRegistry {
 		return this.authStorage.keys.peek(provider, options);
 	}
 
-	/**
-	 * Check if a model is using OAuth credentials (subscription).
-	 */
+	/** Whether a model uses OAuth credentials. Kept separate from subscription billing for cache-tier decisions. */
 	isUsingOAuth(model: Model<Api>): boolean {
 		return this.authStorage.credentials.hasOAuth(model.provider);
+	}
+
+	/** Whether a model's credentials represent subscription billing. */
+	isUsingSubscription(model: Model<Api>): boolean {
+		return this.authStorage.credentials.hasSubscription(model.provider);
 	}
 
 	#clearRuntimeProviderState(providerName: string): void {
@@ -4200,9 +4205,6 @@ export class ModelRegistry {
 			const fetcher = config.fetchDynamicModels;
 			const providerBaseUrl = config.baseUrl ?? "";
 			const providerApi = config.api;
-			const providerHeaders = config.headers;
-			const providerApiKey = config.apiKey;
-			const providerAuthHeader = config.authHeader;
 			const providerCompat = config.compat;
 			const managerOptions: ModelManagerOptions<Api> = {
 				providerId: providerName as Parameters<typeof createModelManager>[0]["providerId"],
@@ -4223,13 +4225,18 @@ export class ModelRegistry {
 					for (const modelDef of modelDefs) {
 						// One overlay per row, through the rule cascade: an endpoint can list thousands.
 						while (sliceExpired()) await nextSlice();
+						// Provider-level headers/authHeader stay off live rows: this
+						// registration's #runtimeProviderOverrides entry applies them at
+						// projection. Baked in, every row would be header-bearing, which the
+						// model cache cannot persist, so a failed refresh would find no
+						// restorable rows and empty the catalog (#18227).
 						const overlay = buildCustomModelOverlay(
 							providerName,
 							modelDef.baseUrl ?? providerBaseUrl,
 							modelDef.api ?? providerApi,
-							providerHeaders,
-							providerApiKey,
-							providerAuthHeader,
+							undefined,
+							undefined,
+							undefined,
 							providerCompat,
 							undefined,
 							config.remoteCompaction,

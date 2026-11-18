@@ -110,6 +110,24 @@ import {
 	SPECULATIVE_STREAM_SESSION,
 } from "./types";
 
+/**
+ * A tool's batch concurrency for one call: an unset mode is shared, and a
+ * throwing per-call resolver is exclusive — the ordering that cannot race —
+ * rather than taking down the whole batch.
+ */
+export function resolveToolConcurrency(
+	tool: AgentTool<any, any, any> | undefined,
+	args: Record<string, unknown>,
+): "shared" | "exclusive" {
+	const mode = tool?.concurrency;
+	if (typeof mode !== "function") return mode ?? "shared";
+	try {
+		return mode(args);
+	} catch {
+		return "exclusive";
+	}
+}
+
 async function waitForProcessPause(config: AgentLoopConfig, signal?: AbortSignal): Promise<void> {
 	try {
 		while (agentPauseGate.paused && !signal?.aborted) {
@@ -1247,6 +1265,25 @@ async function runLoopBody(
 	// `liveAccepted` reached the model inside it, `liveDeferred` did not.
 	let liveAccepted: AgentMessage[] = [];
 	let liveDeferred: AgentMessage[] = [];
+	const endAbortedBeforeModel = async (messages: AgentMessage[], turnOpen: boolean): Promise<boolean> => {
+		if (!signal?.aborted || !config.isUndeliveredQueuedMessage) return false;
+		const undelivered = new Set(messages.filter(message => config.isUndeliveredQueuedMessage?.(message)));
+		for (const list of [currentContext.messages, newMessages]) {
+			for (let i = list.length - 1; i >= 0; i--) {
+				if (undelivered.has(list[i])) list.splice(i, 1);
+			}
+		}
+		if (!turnOpen) stream.push({ type: "turn_start" });
+		emitInputMessages(
+			stream,
+			messages.filter(message => !undelivered.has(message)),
+		);
+		const aborted = emitAbortedAssistantMessage(null, false, new Set(), currentContext, config, stream, signal);
+		newMessages.push(aborted);
+		await emitTurnEnd(stream, currentContext, aborted, [], config, signal, { willContinue: false });
+		endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+		return true;
+	};
 	try {
 		let messagesToEmit = [...initialMessages];
 		if (isDeadlineExceeded(config.deadline)) {
@@ -1260,6 +1297,7 @@ async function runLoopBody(
 		try {
 			pendingMessages = signal?.aborted ? [] : (await config.getSteeringMessages?.(signal)) || [];
 		} catch (error) {
+			if (signal?.aborted && (await endAbortedBeforeModel(messagesToEmit, false))) return;
 			stream.push({ type: "turn_start" });
 			emitInputMessages(stream, messagesToEmit);
 			throw error;
@@ -1358,10 +1396,19 @@ async function runLoopBody(
 
 				let preparedProviderCall: PreparedProviderCall;
 				let gateResult: AgentPreModelCallResult;
+				const emitTurnInputs = () => {
+					emitInputMessages(
+						stream,
+						signal?.aborted
+							? turnMessages.filter(message => !config.isUndeliveredQueuedMessage?.(message))
+							: turnMessages,
+					);
+				};
 				try {
 					if (config.syncContextBeforeModelCall) {
 						await config.syncContextBeforeModelCall(currentContext, signal);
 					}
+					if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
 
 					if (!directiveResolvedForTurn) {
 						const directive = signal?.aborted ? undefined : config.getToolChoice?.();
@@ -1390,16 +1437,19 @@ async function runLoopBody(
 					}
 
 					preparedProviderCall = await prepareProviderCall(currentContext, config, signal);
+					if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
 					preparedProviderCall.liveSteering = openLiveSteering(config, signal, preparedProviderCall);
 					gateResult = (await config.beforeModelCall?.(preparedProviderCall.context, signal)) || undefined;
 				} catch (error) {
+					if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
 					if (!turnOpen) {
 						stream.push({ type: "turn_start" });
-						emitInputMessages(stream, turnMessages);
+						emitTurnInputs();
 						turnOpen = true;
 					}
 					throw error;
 				}
+				if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
 				if (config.beforeModelCall && signal?.aborted) {
 					gateResult = { stop: true };
 				}
@@ -1443,13 +1493,13 @@ async function runLoopBody(
 
 				if (!turnOpen) {
 					stream.push({ type: "turn_start" });
-					emitInputMessages(stream, turnMessages);
 					turnOpen = true;
 				}
 
 				// Stream assistant response
 				let recovered: HarmonyRecoveredToolCall | undefined;
 				let message: AssistantMessage;
+				let inputsEmitted = false;
 				try {
 					if (agentPauseGate.paused) await waitForProcessPause(config, signal);
 					message = await streamAssistantResponse(
@@ -1465,6 +1515,11 @@ async function runLoopBody(
 						hostToolChoice,
 						softRequirementState.forcedToolChoice,
 						preparedProviderCall,
+						() => {
+							if (config.isUndeliveredQueuedMessage) signal?.throwIfAborted();
+							emitTurnInputs();
+							inputsEmitted = true;
+						},
 						message => {
 							const finalToolCalls = message.content.filter(
 								(content): content is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
@@ -1491,6 +1546,10 @@ async function runLoopBody(
 					harmonyRetryAttempt = 0;
 					harmonyTruncateResumeCount = 0;
 				} catch (err) {
+					if (!inputsEmitted) {
+						if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
+						emitTurnInputs();
+					}
 					if (!(err instanceof HarmonyLeakInterruption)) throw err;
 					if (err.recovered) {
 						if (harmonyTruncateResumeCount >= 2) {
@@ -2021,6 +2080,7 @@ async function streamAssistantResponse(
 	hostToolChoice?: ToolChoice,
 	forcedToolChoice?: ToolChoice,
 	prepared?: PreparedProviderCall,
+	onProviderStart?: () => void,
 	canDispatchFinalToolCalls?: (message: AssistantMessage) => boolean,
 ): Promise<AssistantMessage> {
 	const providerCall = prepared ?? (await prepareProviderCall(context, config, signal));
@@ -2165,6 +2225,7 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
+			onProviderStart?.();
 			let response = await streamFunction(model, llmContext, {
 				...config,
 				apiKey,
@@ -3862,21 +3923,9 @@ async function executeToolCalls(
 			: undefined;
 	for (let index = 0; index < records.length; index++) {
 		const record = records[index];
-		const concurrencyMode = record.tool?.concurrency;
-		let concurrency: "shared" | "exclusive";
-		if (typeof concurrencyMode === "function") {
-			// Resolved from the prepared (possibly hook-revised) args — raw args
-			// only when validation failed, and those records error out before
-			// executing. A throwing resolver must not take down the whole batch,
-			// so fall back to the safe (serial) mode.
-			try {
-				concurrency = concurrencyMode(record.args);
-			} catch {
-				concurrency = "exclusive";
-			}
-		} else {
-			concurrency = concurrencyMode ?? "shared";
-		}
+		// Resolved from the prepared (possibly hook-revised) args — raw args
+		// only when validation failed, and those records error out before executing.
+		const concurrency = resolveToolConcurrency(record.tool, record.args);
 		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
 		const task = start.then(async () => {
 			try {
