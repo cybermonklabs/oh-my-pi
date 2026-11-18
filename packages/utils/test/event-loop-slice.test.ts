@@ -255,7 +255,7 @@ describe("readJsonInSlices", () => {
 			if (text.length === body.length) firedAtParse = fired;
 			return parse(text, reviver);
 		});
-		const payload = await parseJsonBytesInSlices(new TextEncoder().encode(body));
+		const payload = await readJsonInSlices(new Response(body));
 		expect((payload as unknown[]).length).toBe(150_000);
 		expect(firedAtParse).toBe(true);
 	});

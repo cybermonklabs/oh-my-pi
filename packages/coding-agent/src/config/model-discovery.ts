@@ -585,7 +585,7 @@ export async function discoverOllamaModels(
 			),
 		),
 	);
-	return entries.map(entry => {
+	return mapInSlices(entries, entry => {
 		const metadata = metadataById.get(entry.id);
 		return buildModel({
 			id: entry.id,
