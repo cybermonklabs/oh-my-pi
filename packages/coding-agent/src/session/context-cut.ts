@@ -4,23 +4,24 @@
  * {@link decideSessionContextCut} before it changes the context; a cut that is not admitted does
  * not run now and is proposed again at a later point.
  */
-import type { Tokenizer } from "@oh-my-pi/pi-agent-core";
 import {
 	type CompactionSettings,
 	type ContextCutDecision,
 	decideContextCut,
+	GROWTH_WINDOW_REQUESTS,
 	meanPromptGrowth,
 	promptBudgetTokens,
 	resolveThresholdTokens,
 } from "@oh-my-pi/pi-agent-core/compaction";
-import type { Context, Model } from "@oh-my-pi/pi-ai";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { type CacheLifetime, getCacheTokenPrices } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
+import { promptTokensOf } from "./cache-warmer";
 import type { ObservedPromptCacheEntry } from "./prompt-cache-status";
 import type { SessionEntry } from "./session-entries";
 
-/** The growth mean covers the last 20 steps between main requests, so it reads 21 prompt sizes. */
-const GROWTH_SAMPLE_REPLIES = 21;
+/** The growth mean covers the steps between the main requests of its window, so it reads one prompt size more. */
+const GROWTH_SAMPLE_REPLIES = GROWTH_WINDOW_REQUESTS + 1;
 
 /** Cache lifetime of each tier, for an entry whose model declares none. */
 const LIFETIME_MS: Record<CacheLifetime, number> = { "5m": 5 * 60_000, "1h": 60 * 60_000 };
@@ -41,6 +42,11 @@ export interface ContextCut {
 	forced: boolean;
 	/** `P`, where the site measured the request the cut changes; the session's figure otherwise. */
 	promptTokens?: number;
+	/**
+	 * Made by a provider-context transform (an image clamp, {@link providerContextCut}) in a request whose prompt is
+	 * already taken, so it never runs a held settings rebuild.
+	 */
+	providerContext?: boolean;
 }
 
 /** What the session holds that the rule reads. */
@@ -49,14 +55,15 @@ export interface ContextCutSession {
 	/**
 	 * The prompt cache entry the next request would read (the session's prompt cache status entry):
 	 * touched by the newest real or warm request that hit it. `undefined` when there is none, no reply
-	 * used the cache or the next request asks for no caching, so every cut counts as lapsed.
+	 * used the cache, the next request cannot read it (the entry's `change`) or asks for no caching,
+	 * so every cut counts as lapsed.
 	 */
 	cacheEntry: Pick<ObservedPromptCacheEntry, "tier" | "touchedAt" | "ttlMs"> | undefined;
 	/** The compaction policy in force for `model` (its threshold and reserve). */
 	compactionSettings: CompactionSettings;
 	/** The current branch, oldest entry first. */
 	branch: readonly SessionEntry[];
-	/** `P`: the context tokens the compaction threshold check uses. */
+	/** `P`: the cut's own figure where it has one, else the context tokens the compaction threshold check uses. */
 	promptTokens: number;
 	/** Unix milliseconds. */
 	now: number;
@@ -73,11 +80,16 @@ function recentMainPrompts(branch: readonly SessionEntry[]): number[] {
 		const entry = branch[index];
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 		const { stopReason, usage } = entry.message;
-		const size = usage.input + usage.cacheRead + usage.cacheWrite;
+		const size = promptTokensOf(usage);
 		if (stopReason === "error" || stopReason === "aborted" || size <= 0) continue;
 		sizes.push(size);
 	}
 	return sizes.reverse();
+}
+
+/** The lifetime `cacheEntry`'s tier caches for: one hour for `long`, else five minutes. */
+function cacheLifetimeOf(cacheEntry: ContextCutSession["cacheEntry"]): CacheLifetime {
+	return cacheEntry?.tier === "long" ? "1h" : "5m";
 }
 
 /**
@@ -91,7 +103,7 @@ function promptCacheEntryAge(
 	if (!cacheEntry) return { idleMs: Number.POSITIVE_INFINITY, lifeMs: 0 };
 	return {
 		idleMs: now - cacheEntry.touchedAt,
-		lifeMs: cacheEntry.ttlMs ?? LIFETIME_MS[cacheEntry.tier === "long" ? "1h" : "5m"],
+		lifeMs: cacheEntry.ttlMs ?? LIFETIME_MS[cacheLifetimeOf(cacheEntry)],
 	};
 }
 
@@ -112,11 +124,9 @@ export function promptCacheEntryLapsed(cacheEntry: ContextCutSession["cacheEntry
  * less the reserve forces the cut whatever the site says: with default settings that is the threshold.
  */
 export function decideSessionContextCut(session: ContextCutSession, cut: ContextCut): ContextCutDecision {
-	const { model, compactionSettings, cacheEntry } = session;
-	const promptTokens = cut.promptTokens ?? session.promptTokens;
+	const { model, compactionSettings, cacheEntry, promptTokens } = session;
 	const contextWindow = model.contextWindow ?? 0;
-	const lifetime: CacheLifetime = cacheEntry?.tier === "long" ? "1h" : "5m";
-	const prices = getCacheTokenPrices(model.cost, lifetime, promptTokens, session.now);
+	const prices = getCacheTokenPrices(model.cost, cacheLifetimeOf(cacheEntry), promptTokens, session.now);
 	const overBudget = contextWindow > 0 && promptTokens > promptBudgetTokens(contextWindow, compactionSettings);
 	const { idleMs, lifeMs } = promptCacheEntryAge(cacheEntry, session.now);
 	const decision = decideContextCut({
@@ -145,20 +155,9 @@ export function decideSessionContextCut(session: ContextCutSession, cut: Context
 }
 
 /**
- * The forced cut a provider-context transform (an image clamp) made by sending `after` for `before`; the messages it
- * left alone are the same objects. `p` counts the messages before the first one it replaced and leaves the system
- * prompt and tools out, so it errs low; `s` is what the replaced messages lost.
+ * The forced cut a provider-context transform (an image clamp) made at `site`. Forced, it is admitted whatever its
+ * figures, so it counts none: `P`, `p` and `s` are 0 and the rule's log names its site.
  */
-export function providerContextCut(site: string, before: Context, after: Context, tokenizer: Tokenizer): ContextCut {
-	let first = 0;
-	while (first < before.messages.length && before.messages[first] === after.messages[first]) first++;
-	return {
-		site,
-		prefixTokens: tokenizer.countMessages(before.messages.slice(0, first)),
-		removedTokens: Math.max(
-			0,
-			tokenizer.countMessages(before.messages.slice(first)) - tokenizer.countMessages(after.messages.slice(first)),
-		),
-		forced: true,
-	};
+export function providerContextCut(site: string): ContextCut {
+	return { site, prefixTokens: 0, removedTokens: 0, forced: true, promptTokens: 0, providerContext: true };
 }

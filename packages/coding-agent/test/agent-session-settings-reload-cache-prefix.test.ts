@@ -1,117 +1,43 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionAPI, ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { asGlobalFetch } from "./helpers/fetch-mock";
-
-/** An Anthropic gateway reached on a `.local` host, configured as a deployment's `models.yml` declares it. */
-const GATEWAY = "http://gateway.test.local:4000";
-function modelsYml(contextWindow: number): string {
-	return `providers:
-  anthropic:
-    baseUrl: ${GATEWAY}
-    api: anthropic-messages
-    auth: apiKey
-    apiKey: gateway-test-key
-    compat:
-      replayUnsignedThinking: false
-      supportsLongCacheRetention: true
-    models:
-      - {id: claude-opus-5-5, name: Claude Opus 5.5, reasoning: true, input: [text, image], contextWindow: ${contextWindow}, maxTokens: 128000, cost: {input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5}}
-`;
-}
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import {
+	answer,
+	continuesCachedPrompt,
+	gatewayModelsYml,
+	gatewaySessionOptions,
+	type MessagesRequest,
+	mockGatewayFetch,
+	streamedAnswer,
+	withoutCacheControl,
+} from "./helpers/anthropic-gateway";
 
 /** The `--config` overlay a configuration sync rewrites under a running session. */
 const OVERLAY = "providers:\n  cacheRetention: long\n";
 
 const HOUR_MS = 60 * 60_000;
 
-interface WireMessage {
-	role: string;
-	content: unknown;
-}
+/** Every reply writes the prompt cache. */
+const CACHE_WRITE_TOKENS = 100;
 
-interface MessagesRequest {
-	system?: unknown;
-	tools?: unknown[];
-	messages: WireMessage[];
-}
-
-/** A streamed reply of one content block; the request it answers sent `inputTokens` uncached. */
-function stream(
-	turn: number,
-	block: Record<string, unknown>,
-	deltas: unknown[],
-	stopReason: string,
-	inputTokens = 10,
-): Response {
-	const events = [
-		{
-			type: "message_start",
-			message: {
-				id: `msg_${turn}`,
-				type: "message",
-				role: "assistant",
-				content: [],
-				model: "claude-opus-5-5",
-				stop_reason: null,
-				stop_sequence: null,
-				usage: {
-					input_tokens: inputTokens,
-					output_tokens: 0,
-					cache_read_input_tokens: 0,
-					cache_creation_input_tokens: 100,
-				},
-			},
-		},
-		{ type: "content_block_start", index: 0, content_block: block },
-		...deltas.map(delta => ({ type: "content_block_delta", index: 0, delta })),
-		{ type: "content_block_stop", index: 0 },
-		{ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 3 } },
-		{ type: "message_stop" },
-	];
-	const body = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-	return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
-}
-
+/** A text reply; the request it answers sent `inputTokens` uncached. */
 function textAnswer(turn: number, inputTokens?: number): Response {
-	return stream(
-		turn,
-		{ type: "text", text: "" },
-		[{ type: "text_delta", text: `seen ${turn}` }],
-		"end_turn",
-		inputTokens,
-	);
+	return answer(turn, { inputTokens, cacheWriteTokens: CACHE_WRITE_TOKENS });
 }
 
 function toolCallAnswer(turn: number, name: string, input: Record<string, unknown>): Response {
-	return stream(
+	return streamedAnswer(
 		turn,
 		{ type: "tool_use", id: `toolu_${turn}`, name, input: {} },
 		[{ type: "input_json_delta", partial_json: JSON.stringify(input) }],
 		"tool_use",
-	);
-}
-
-/** Cache breakpoints follow the end of each request, so they are left out of the comparison. */
-function withoutCacheControl(value: unknown): string {
-	return JSON.stringify(value, (key, inner) => (key === "cache_control" ? undefined : inner));
-}
-
-/**
- * Whether `later` sends `earlier`'s prompt in cache order, tools, then system, then every message, with the same
- * bytes, so its cache lookup reads all of `earlier`'s prompt.
- */
-function continuesCachedPrompt(earlier: MessagesRequest, later: MessagesRequest): boolean {
-	return (
-		withoutCacheControl(later.tools) === withoutCacheControl(earlier.tools) &&
-		withoutCacheControl(later.system) === withoutCacheControl(earlier.system) &&
-		withoutCacheControl(later.messages.slice(0, earlier.messages.length)) === withoutCacheControl(earlier.messages)
+		{ cacheWriteTokens: CACHE_WRITE_TOKENS },
 	);
 }
 
@@ -143,19 +69,22 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 	/**
 	 * A session on the gateway's claude-opus-5-5 (a 1M window unless `contextWindow` says otherwise) whose settings
 	 * load `OVERLAY` and `overlay` as a `--config` file. `replies` answers requests by their 1-based number; the rest
-	 * get text.
+	 * get text. With `discoverSkills` the session discovers its skills as a CLI session does, so a `skill://` read
+	 * of an unknown name rediscovers them.
 	 */
 	async function startSession(
 		tempDir: TempDir,
 		options: {
 			toolNames: string[];
 			discoverContextFiles?: boolean;
+			discoverSkills?: boolean;
 			overlay?: string;
 			contextWindow?: number;
+			extensions?: ExtensionFactory[];
 			replies?: Record<number, (turn: number) => Response>;
 		},
 	): Promise<Harness> {
-		await Bun.write(tempDir.join("models.yml"), modelsYml(options.contextWindow ?? 1_000_000));
+		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml(options.contextWindow));
 		const overlay = tempDir.join("overlay.yml");
 		await Bun.write(overlay, `${OVERLAY}${options.overlay ?? ""}`);
 		const settings = await Settings.loadIsolated({
@@ -163,22 +92,13 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			agentDir: tempDir.path(),
 			configFiles: [overlay],
 		});
-		const requests: MessagesRequest[] = [];
-		vi.spyOn(globalThis, "fetch").mockImplementation(
-			asGlobalFetch(async (input, init) => {
-				if (String(input) !== `${GATEWAY}/v1/messages`) throw new Error(`Unexpected request to ${String(input)}`);
-				requests.push(JSON.parse(requestBodyText(init) ?? "{}"));
-				const turn = requests.length;
-				return (options.replies?.[turn] ?? textAnswer)(turn);
-			}),
-		);
-		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const { requests } = mockGatewayFetch(turn => (options.replies?.[turn] ?? textAnswer)(turn));
+		const authStorage = createInMemoryAuthStorage();
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const model = modelRegistry.find("anthropic", "claude-opus-5-5");
 		if (!model) throw new Error("Expected the gateway's claude-opus-5-5");
 		const { session } = await createAgentSession({
-			cwd: tempDir.path(),
-			agentDir: tempDir.path(),
+			...gatewaySessionOptions(tempDir),
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.join("sessions")),
 			authStorage,
 			modelRegistry,
@@ -186,13 +106,8 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			model,
 			toolNames: options.toolNames,
 			...(options.discoverContextFiles ? {} : { contextFiles: [] }),
-			disableExtensionDiscovery: true,
-			skills: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			skipPythonPreflight: true,
+			extensions: options.extensions,
+			...(options.discoverSkills ? {} : { skills: [] }),
 		});
 		cleanups.push(async () => {
 			await session.dispose();
@@ -283,6 +198,133 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 		expect(withoutCacheControl(first.system)).toContain("The rule the session started with.");
 		expect(continuesCachedPrompt(first, second)).toBe(true);
 		expect(textOf(second.messages.slice(first.messages.length))).toContain("`disabledProviders`");
+	}, 30_000);
+
+	it("keeps the held prompt and tools through a skill:// read of a skill installed meanwhile", async () => {
+		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		// Project skills only: the developer's own skills stay out of discovery.
+		const projectSkills =
+			"skills:\n  enableCodexUser: false\n  enableClaudeUser: false\n  enableClaudeProject: false\n  enablePiUser: false\n  enableAgentsUser: false\n";
+		const harness = await startSession(tempDir, {
+			toolNames: ["read", "eval", "todo"],
+			discoverSkills: true,
+			overlay: projectSkills,
+			replies: { 3: turn => toolCallAnswer(turn, "read", { path: "skill://late-skill" }) },
+		});
+		await harness.session.prompt("first");
+		await reloadOverlay(
+			harness,
+			`${OVERLAY}${projectSkills}personality: pragmatic\ntodo:\n  enabled: false\ndisabledProviders:\n  - ollama\n`,
+		);
+		await harness.session.prompt("second");
+
+		// The skill list the prompt keeps lacks the new skill, so its rediscovery rebuilds nothing of its own.
+		await Bun.write(
+			tempDir.join(".omp/skills/late-skill/SKILL.md"),
+			"---\nname: late-skill\ndescription: A skill installed while the session runs.\n---\n\n# Late skill\n\nThe body of the late skill.\n",
+		);
+		await harness.session.prompt("A skill was installed. Read it.");
+
+		const [, second, third, fourth] = harness.requests;
+		if (!second || !third || !fourth) throw new Error("Expected the requests around the skill read");
+		expect(textOf(fourth.messages.slice(third.messages.length))).toContain("The body of the late skill.");
+		expect(continuesCachedPrompt(second, fourth)).toBe(true);
+	}, 30_000);
+
+	it("keeps the held prompt through a skill:// read when the reload only reran skill discovery", async () => {
+		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const projectSkills =
+			"skills:\n  enableCodexUser: false\n  enableClaudeUser: false\n  enableClaudeProject: false\n  enablePiUser: false\n  enableAgentsUser: false\n";
+		const harness = await startSession(tempDir, {
+			toolNames: ["read", "eval"],
+			discoverSkills: true,
+			overlay: projectSkills,
+			replies: { 3: turn => toolCallAnswer(turn, "read", { path: "skill://late-skill" }) },
+		});
+		await harness.session.prompt("first");
+		// `disabledProviders` reruns skill discovery and nothing else: the hold it takes is the skill list's alone.
+		await reloadOverlay(harness, `${OVERLAY}${projectSkills}disabledProviders:\n  - ollama\n`);
+		await harness.session.prompt("second");
+
+		await Bun.write(
+			tempDir.join(".omp/skills/late-skill/SKILL.md"),
+			"---\nname: late-skill\ndescription: A skill installed while the session runs.\n---\n\n# Late skill\n\nThe body of the late skill.\n",
+		);
+		await harness.session.prompt("A skill was installed. Read it.");
+
+		const [, second, third, fourth] = harness.requests;
+		if (!second || !third || !fourth) throw new Error("Expected the requests around the skill read");
+		expect(textOf(fourth.messages.slice(third.messages.length))).toContain("The body of the late skill.");
+		expect(continuesCachedPrompt(second, fourth)).toBe(true);
+	}, 30_000);
+
+	it("keeps the held prompt through a skill:// read when a skills-only reload follows a context file edit", async () => {
+		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const projectSkills =
+			"skills:\n  enableCodexUser: false\n  enableClaudeUser: false\n  enableClaudeProject: false\n  enablePiUser: false\n  enableAgentsUser: false\n";
+		await Bun.write(tempDir.join("AGENTS.md"), "# Rules\n\n- The rule the session started with.\n");
+		const harness = await startSession(tempDir, {
+			toolNames: ["read", "eval"],
+			discoverSkills: true,
+			discoverContextFiles: true,
+			overlay: projectSkills,
+			replies: { 3: turn => toolCallAnswer(turn, "read", { path: "skill://late-skill" }) },
+		});
+		await harness.session.prompt("first");
+		// The held rebuild would carry the edited context file, so the build the kept prompt stands in for differs
+		// from it; the skill read's rebuild renders that build again and changes nothing of its own.
+		await Bun.write(tempDir.join("AGENTS.md"), "# Rules\n\n- A rule added while the session runs.\n");
+		await reloadOverlay(harness, `${OVERLAY}${projectSkills}disabledProviders:\n  - ollama\n`);
+		await harness.session.prompt("second");
+
+		await Bun.write(
+			tempDir.join(".omp/skills/late-skill/SKILL.md"),
+			"---\nname: late-skill\ndescription: A skill installed while the session runs.\n---\n\n# Late skill\n\nThe body of the late skill.\n",
+		);
+		await harness.session.prompt("A skill was installed. Read it.");
+
+		const [first, second, third, fourth] = harness.requests;
+		if (!first || !second || !third || !fourth) throw new Error("Expected the requests around the skill read");
+		expect(textOf(fourth.messages.slice(third.messages.length))).toContain("The body of the late skill.");
+		expect(withoutCacheControl(fourth.system)).toContain("The rule the session started with.");
+		expect(continuesCachedPrompt(second, fourth)).toBe(true);
+	}, 30_000);
+
+	it("keeps the held prompt and tools when an extension registers its tool again unchanged", async () => {
+		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		let extension: ExtensionAPI | undefined;
+		const registerProbe = (pi: ExtensionAPI): void => {
+			pi.registerTool({
+				name: "probe",
+				label: "Probe",
+				description: "A tool an extension registers.",
+				parameters: pi.typebox.Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+			});
+		};
+		const harness = await startSession(tempDir, {
+			toolNames: ["read", "eval", "todo", "probe"],
+			extensions: [
+				pi => {
+					extension = pi;
+					registerProbe(pi);
+				},
+			],
+		});
+		await harness.session.prompt("first");
+		await reloadOverlay(harness, `${OVERLAY}todo:\n  enabled: false\n`);
+		await harness.session.prompt("second");
+
+		// The extension registers its tool again with the same definition: the session applies its tools again with
+		// a forced rebuild, which changes nothing of its own.
+		if (!extension) throw new Error("Expected the extension to load");
+		registerProbe(extension);
+		await harness.session.runToolRegistryMutation(async () => {});
+		await harness.session.prompt("third");
+
+		const [, second, third] = harness.requests;
+		if (!second || !third) throw new Error("Expected three requests");
+		expect(continuesCachedPrompt(second, third)).toBe(true);
 	}, 30_000);
 
 	it("sends the rebuilt prompt at the first request after the held prompt's cache entry lapsed", async () => {

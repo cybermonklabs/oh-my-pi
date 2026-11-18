@@ -544,16 +544,10 @@ export function pruneSupersededToolResults(
 	if (toPrune.length === 0) return NOTHING_PRUNED;
 
 	let tokensSaved = 0;
-	// The cut-rule gate sees the pass's saving before anything is blanked; the loop below counts it again as it
-	// blanks, as before.
-	if (config.admit) {
-		let saving = 0;
-		for (const candidate of toPrune) saving += estimatePrunedSavings(candidate.tokens, candidate.notice);
-		if (!config.admit({ firstIndex: toPrune[0].index, tokensSaved: saving })) return NOTHING_PRUNED;
-	}
+	for (const candidate of toPrune) tokensSaved += estimatePrunedSavings(candidate.tokens, candidate.notice);
+	if (config.admit && !config.admit({ firstIndex: toPrune[0].index, tokensSaved })) return NOTHING_PRUNED;
 	const prunedAt = Date.now();
 	const pruned = toPrune.map(candidate => {
-		tokensSaved += estimatePrunedSavings(candidate.tokens, candidate.notice);
 		blankToolResult(candidate.message, candidate.notice, prunedAt);
 		return { entryId: candidate.entry.id, notice: candidate.notice, prunedAt };
 	});

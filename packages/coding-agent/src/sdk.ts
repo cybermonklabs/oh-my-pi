@@ -4989,9 +4989,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			};
 		};
 		// A request past the image budget cannot be served without the drop, so the rule admits it
-		// as forced; asking it logs the decision with the cut's figures.
-		const mainImageClamp = new ProviderImageClamp((site, before, after) => {
-			if (session) session.admitsContextCut(providerContextCut(site, before, after, session.agent.tokenizer));
+		// as forced; asking it logs the decision.
+		const mainImageClamp = new ProviderImageClamp(site => {
+			if (session) session.admitsProviderContextCut(providerContextCut(site));
 		});
 		const transformProviderContext = createTransformProviderContext(
 			createSessionDateCwdReminderJournal(sessionManager),
@@ -6083,10 +6083,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					cwdResolver: () => sessionManager.getCwd(),
 					convertToLlm: convertToLlmFinal,
 					transformContext: async messages => wrapSteeringForModel(messages),
-					// The primary's chain, reminder placements and image drops, so the capture matches its cached prompt.
+					// The primary's chain, reminder placements and count-clamp image drops, so the capture matches its
+					// cached prompt; its byte-clamp drops stay its own and never ask the session's cut rule.
 					transformProviderContext: createTransformProviderContext(
 						{ ...createSessionDateCwdReminderJournal(sessionManager), record: () => {} },
-						mainImageClamp,
+						mainImageClamp.sideRequestClamp(),
 					),
 					temperature: agent.temperature,
 					topP: agent.topP,

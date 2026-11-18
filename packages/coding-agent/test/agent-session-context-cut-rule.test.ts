@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { SUPERSEDED_NOTICE } from "@oh-my-pi/pi-agent-core/compaction/pruning";
-import type { AssistantMessage, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model, ModelSpec, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -150,8 +151,15 @@ describe("automatic cuts under the cut rule", () => {
 		expect(oldReadText(refreshed)).toBe(OLD_RESULT);
 	});
 
-	/** Threshold compactions a 100,000-token session started when its final reply's request sent `prompt` tokens. */
-	async function thresholdCompactionStarts(prompt: number, settings: Record<string, unknown>): Promise<string[]> {
+	/**
+	 * Threshold compactions a 100,000-token session started when its final reply's request sent `prompt` tokens. Its
+	 * replies came from `models.replies` and it runs on `models.session`; both are a mock model unless given.
+	 */
+	async function thresholdCompactionStarts(
+		prompt: number,
+		settings: Record<string, unknown>,
+		models?: { replies: Model; session: Model },
+	): Promise<string[]> {
 		const tempDir = TempDir.createSync("@pi-context-cut-rule-");
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 		cleanups.push(async () => {
@@ -161,7 +169,8 @@ describe("automatic cuts under the cut rule", () => {
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		// No model to summarize with: an admitted compaction starts, then ends skipped.
 		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([]);
-		const model = createMockModel({ cost: OPUS_COST, contextWindow: 100_000 });
+		const mock = createMockModel({ cost: OPUS_COST, contextWindow: 100_000 });
+		const { replies: model, session: sessionModel } = models ?? { replies: mock, session: mock };
 		// The session reads the cache entry its replies left under the model that wrote them.
 		vi.spyOn(modelRegistry, "find").mockReturnValue(model);
 		const sessionManager = SessionManager.inMemory(tempDir.path());
@@ -172,7 +181,7 @@ describe("automatic cuts under the cut rule", () => {
 		sessionManager.appendMessage(reply(model, [{ type: "text", text: "second answer" }], 50_000, now - 300));
 		sessionManager.appendMessage({ role: "user", content: "third question", timestamp: now - 200 });
 		const session = new AgentSession({
-			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			agent: new Agent({ initialState: { model: sessionModel, systemPrompt: ["Test"], tools: [], messages: [] } }),
 			sessionManager,
 			settings: Settings.isolated({
 				"compaction.methodOrder": ["soft"],
@@ -200,5 +209,28 @@ describe("automatic cuts under the cut rule", () => {
 		// request or two, so it would never pay for that write: only the full window forces it.
 		expect(await thresholdCompactionStarts(90_000, {})).toEqual(["threshold"]);
 		expect(await thresholdCompactionStarts(70_000, { "compaction.thresholdTokens": 60_000 })).toEqual([]);
+	});
+
+	it("compacts below the window once the model changed after the last reply, as after a lapsed entry", async () => {
+		// Claude models that bind thinking to the prompt prefix, on Opus 5.5's card and a 100,000-token window.
+		const claude: Omit<ModelSpec<"anthropic-messages">, "id" | "name"> = {
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text"],
+			cost: OPUS_COST,
+			contextWindow: 100_000,
+			maxTokens: 64_000,
+		};
+		const opus = buildModel({ ...claude, id: "claude-opus-5-5", name: "Claude Opus 5.5" });
+		const sonnet = buildModel({ ...claude, id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" });
+		const settings = { "compaction.thresholdTokens": 60_000 };
+		// Sonnet wrote the live one-hour entry and the next request reads it: the compaction waits.
+		expect(await thresholdCompactionStarts(70_000, settings, { replies: sonnet, session: sonnet })).toEqual([]);
+		// Opus wrote it, and the next request goes to Sonnet, which cannot read it: nothing is cached to lose.
+		expect(await thresholdCompactionStarts(70_000, settings, { replies: opus, session: sonnet })).toEqual([
+			"threshold",
+		]);
 	});
 });
