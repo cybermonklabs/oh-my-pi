@@ -986,39 +986,56 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
-		it("passes over a model that refused in the turn in the check before a model call, to the model after it", async () => {
-			// The primary refuses, and the refusal walk moves to the fallback, which
-			// reads at the reserve. Under the `auto` reserve policy the check before
-			// the fallback's model call switches away from it. The fallback's own
-			// chain names `pi/default`, which resolves to the primary, and then the
-			// next fallback: the check passes over the primary, which refused in the
-			// turn, and the next fallback answers. No request reaches the fallback.
-			stubUsageReads({
-				[formatModelString(FALLBACK)]: {
+		for (const [condition, read, policy] of [
+			[
+				"at the reserve under the auto reserve policy",
+				{
 					state: "reserve",
 					accounts: [{ credentialId: 1, credentialType: "oauth", state: "reserve", remainingFraction: 0.05 }],
 				},
+				"auto",
+			],
+			[
+				"at the reserve with no confirmer",
+				{
+					state: "reserve",
+					accounts: [{ credentialId: 1, credentialType: "oauth", state: "reserve", remainingFraction: 0.05 }],
+				},
+				"confirm",
+			],
+			["depleted by a short account-policy block", depletedRead("account-policy"), "confirm"],
+		] satisfies [string, ModelUsageHealth, "auto" | "confirm"][]) {
+			it(`passes over a model that refused in the turn in the check before a model call, to the model after it (${condition})`, async () => {
+				// The primary refuses, and the refusal walk moves to the fallback. The
+				// fallback is not spent, so the walk switches to it, and the check
+				// before its model call switches away from it. The fallback's own
+				// chain names `pi/default`, which resolves to the primary, and then
+				// the next fallback: the check passes over the primary, which refused
+				// in the turn, and the next fallback answers. No request reaches the
+				// fallback. The session has no confirmer, so `confirm` applies the
+				// fallback as `auto` does.
+				stubUsageReads({ [formatModelString(FALLBACK)]: read });
+				const requestedModels: string[] = [];
+				const run = startSession(
+					createRefusalAgent(PRIMARY, requestedModels, [PRIMARY]),
+					walkSettings(PRIMARY, {
+						"retry.maxRetries": 1,
+						"retry.usageReservePolicy": policy,
+						"retry.fallbackChains": {
+							default: [formatModelString(FALLBACK)],
+							[formatModelString(FALLBACK)]: ["pi/default", formatModelString(NEXT_FALLBACK)],
+						},
+					}),
+				);
+
+				await runTurn(run.session, "Recover from the refusal");
+
+				expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(NEXT_FALLBACK)]);
+				expect(run.fallbacks).toEqual([formatModelString(FALLBACK), formatModelString(NEXT_FALLBACK)]);
+				expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
+				expect(lastAssistant(run.session).stopReason).toBe("stop");
 			});
-			const requestedModels: string[] = [];
-			const run = startSession(
-				createRefusalAgent(PRIMARY, requestedModels, [PRIMARY]),
-				walkSettings(PRIMARY, {
-					"retry.maxRetries": 1,
-					"retry.usageReservePolicy": "auto",
-					"retry.fallbackChains": {
-						default: [formatModelString(FALLBACK)],
-						[formatModelString(FALLBACK)]: ["pi/default", formatModelString(NEXT_FALLBACK)],
-					},
-				}),
-			);
-
-			await runTurn(run.session, "Recover from the refusal");
-
-			expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(NEXT_FALLBACK)]);
-			expect(run.fallbacks).toEqual([formatModelString(FALLBACK), formatModelString(NEXT_FALLBACK)]);
-			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
-			expect(lastAssistant(run.session).stopReason).toBe("stop");
-		});
+		}
 
 		it("passes over a model that refused in the turn when a later fallback fails with another error, to the model after it", async () => {
 			// The primary refuses, and the refusal walk moves to the fallback, which
