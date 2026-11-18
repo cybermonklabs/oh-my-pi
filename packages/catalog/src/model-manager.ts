@@ -465,7 +465,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				dbPath,
 				staticModels,
 				restorableHeaderFallback,
-				{ ticket: writeTicket },
+				{ ticket: writeTicket, partial: !remoteResolutionComplete },
 			);
 		} else {
 			// Remote fetch failed. Re-persist any prior catalog as a
@@ -538,7 +538,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 					dbPath,
 					staticModels,
 					restorableHeaderFallback,
-					{ ticket: writeTicket, rowVersion: latestRowVersion },
+					{ ticket: writeTicket, rowVersion: latestRowVersion, copy: true },
 				);
 			}
 		}

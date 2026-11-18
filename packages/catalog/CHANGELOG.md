@@ -4,13 +4,13 @@
 
 ### Added
 
-- Added `writeModelCacheInSlices` and `fingerprintStaticModelsSteps`, which do the work of `writeModelCache` and `fingerprintStaticModels` in slices that return to the event loop; `writeModelCacheInSlices` takes a `CacheWriteOrdering`: the row version its caller read (`readModelCacheWithVersion`) and a write ticket taken when its fetches resolved (`takeModelCacheWriteTicket`), and skips its write when the row changed since or a later ticket wrote (counted in `getModelCacheWriteStats().staleWrites`)
+- Added `writeModelCacheInSlices` and `fingerprintStaticModelsSteps`, which do the work of `writeModelCache` and `fingerprintStaticModels` in slices that return to the event loop; `writeModelCacheInSlices` takes a `CacheWriteOrdering`: a write ticket taken when its fetches resolved (`takeModelCacheWriteTicket`), whether its rows are partial (merged with cached rows) or a copy of a row it read, and that row's version (`readModelCacheWithVersion`); it skips its write when a later write of the same or a fuller kind has written, or the row changed since it was read (counted in `getModelCacheWriteStats().staleWrites`)
 
 ### Fixed
 
 - Provider model resolution no longer holds the event loop while it builds, merges, fingerprints or writes a large catalog: it gives the loop a turn after each 10 ms slice of its work, plus at most one step ([#17121](https://github.com/can1357/oh-my-pi/issues/17121))
 - Model cache commits no longer wait for an fsync on the main thread: the cache now uses WAL's `synchronous = NORMAL`, as omp's other regenerable caches do
-- Concurrent successful refreshes of one provider write its cache row in the order their fetches resolved, as before slicing. A failed refresh's fallback copy is skipped when the row changed after the failed refresh read it, or when a refresh whose fetch resolved later has written, and it never stops an earlier-fetched refresh from writing; so a header-bearing or newly fetched catalog stays cached ([#18227](https://github.com/can1357/oh-my-pi/issues/18227))
+- Concurrent refreshes of one provider write its cache row in the order their fetches resolved, as before slicing, with one exception: a partial refresh (one source failed) or a failed refresh's fallback copy, whose rows include cached ones, never stops a complete refresh whose fetch resolved earlier from writing its fetched rows; and a copy is skipped when the row changed after it was read. So a header-bearing or newly fetched catalog stays cached ([#18227](https://github.com/can1357/oh-my-pi/issues/18227))
 
 ## [18.18.6] - 2026-11-09
 

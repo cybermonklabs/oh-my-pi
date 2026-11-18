@@ -2196,6 +2196,18 @@ describe("model cache materialized round trip", () => {
 				ticket: third,
 			});
 			expect(storedIds()).toEqual(["older-model"]);
+			// A copy (a failed refresh's fallback, here one whose re-read gave no version)
+			// with a later ticket does not stop a complete write with an earlier ticket.
+			const fourth = takeModelCacheWriteTicket(providerId, dbPath);
+			const fifth = takeModelCacheWriteTicket(providerId, dbPath);
+			await writeModelCacheInSlices(providerId, 2_500_000, [older], false, "", dbPath, [], undefined, {
+				ticket: fifth,
+				copy: true,
+			});
+			await writeModelCacheInSlices(providerId, 3_000_000, [newer], true, "", dbPath, [], undefined, {
+				ticket: fourth,
+			});
+			expect(storedIds()).toEqual(["newer-model"]);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
@@ -2341,6 +2353,141 @@ describe("model cache materialized round trip", () => {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});
+	it("a partial refresh whose fetch resolved after a complete one keeps the complete rows", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-partial-after-complete-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "partial-after-complete-test";
+		const fetched = Array.from({ length: 300 }, (_, index) =>
+			completionsSpec({ id: `fetched-model-${index}`, provider: providerId }),
+		);
+		const { promise: completeFetched, resolve: markCompleteFetched } = Promise.withResolvers<void>();
+		writeModelCache(
+			providerId,
+			500_000,
+			[buildModel(completionsSpec({ id: "prior-model", provider: providerId }))],
+			false,
+			"",
+			dbPath,
+		);
+		let clock = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+		try {
+			const complete = resolveProviderModels(
+				{
+					providerId,
+					staticModels: [],
+					dynamicModelsAuthoritative: true,
+					cacheDbPath: dbPath,
+					now: () => 1_000_000,
+					fetchDynamicModels: async () => {
+						setTimeout(markCompleteFetched, 0);
+						return fetched;
+					},
+				},
+				"online",
+			);
+			// A timer later, the partial refresh's models.dev source answers and its endpoint fails;
+			// its rows merge the prior row it read, and it writes before the complete refresh.
+			const partial = resolveProviderModels(
+				{
+					providerId,
+					staticModels: [],
+					dynamicModelsAuthoritative: true,
+					cacheDbPath: dbPath,
+					now: () => 1_100_000,
+					modelsDev: {
+						fetch: async () => {
+							await completeFetched;
+							return null;
+						},
+						map: () => [completionsSpec({ id: "dev-model", provider: providerId })],
+					},
+					fetchDynamicModels: async () => {
+						await completeFetched;
+						return null;
+					},
+				},
+				"online",
+			);
+			await Promise.all([complete, partial]);
+			vi.restoreAllMocks();
+			const stored = readModelCache(providerId, Infinity, () => 0, dbPath);
+			expect({ count: stored?.models.length, authoritative: stored?.authoritative }).toEqual({
+				count: 300,
+				authoritative: true,
+			});
+		} finally {
+			vi.restoreAllMocks();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("two partial refreshes write the cache in the order their fetches resolved", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-partial-order-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "partial-order-test";
+		const { promise: firstFetched, resolve: markFirstFetched } = Promise.withResolvers<void>();
+		const partialOptions = (
+			now: number,
+			waitFor: Promise<void> | undefined,
+			specs: readonly ModelSpec<"openai-completions">[],
+		) => ({
+			providerId,
+			staticModels: [],
+			dynamicModelsAuthoritative: true,
+			cacheDbPath: dbPath,
+			now: () => now,
+			modelsDev: {
+				fetch: async () => {
+					if (waitFor) await waitFor;
+					else setTimeout(markFirstFetched, 0);
+					return null;
+				},
+				map: () => specs,
+			},
+			fetchDynamicModels: async () => {
+				if (waitFor) await waitFor;
+				return null;
+			},
+		});
+		writeModelCache(
+			providerId,
+			500_000,
+			[buildModel(completionsSpec({ id: "prior-model", provider: providerId }))],
+			false,
+			"",
+			dbPath,
+		);
+		let clock = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+		try {
+			// The first partial refresh fetches first and builds 300 models.dev rows over many turns.
+			const first = resolveProviderModels(
+				partialOptions(
+					1_000_000,
+					undefined,
+					Array.from({ length: 300 }, (_, index) =>
+						completionsSpec({ id: `first-model-${index}`, provider: providerId }),
+					),
+				),
+				"online",
+			);
+			// The second fetches a timer later with one row, and writes first.
+			const second = resolveProviderModels(
+				partialOptions(1_100_000, firstFetched, [completionsSpec({ id: "second-model", provider: providerId })]),
+				"online",
+			);
+			await Promise.all([first, second]);
+			vi.restoreAllMocks();
+			const ids = readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id) ?? [];
+			expect({ second: ids.includes("second-model"), first: ids.includes("first-model-0") }).toEqual({
+				second: true,
+				first: false,
+			});
+		} finally {
+			vi.restoreAllMocks();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
 	it("a failed refresh whose fetch resolved first leaves a later success's row authoritative", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-failed-before-success-"));
 		const dbPath = path.join(tempDir, "models.db");
@@ -2370,6 +2517,7 @@ describe("model cache materialized round trip", () => {
 		);
 		let clock = 0;
 		vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+		const staleBefore = getModelCacheWriteStats().staleWrites;
 		try {
 			const failure = resolveProviderModels(
 				{
@@ -2403,11 +2551,17 @@ describe("model cache materialized round trip", () => {
 			);
 			await Promise.all([failure, success]);
 			vi.restoreAllMocks();
-			// Upstream wrote the failure's fallback first and the success over it.
+			// Upstream wrote the failure's fallback first and the success over it. Here the
+			// success writes first, and the failure's copy is stale by its older ticket.
 			const stored = readModelCache(providerId, Infinity, () => 0, dbPath);
-			expect({ ids: stored?.models.map(model => model.id), authoritative: stored?.authoritative }).toEqual({
+			expect({
+				ids: stored?.models.map(model => model.id),
+				authoritative: stored?.authoritative,
+				staleCopies: getModelCacheWriteStats().staleWrites - staleBefore,
+			}).toEqual({
 				ids: ["later-model"],
 				authoritative: true,
+				staleCopies: 1,
 			});
 		} finally {
 			vi.restoreAllMocks();
@@ -2423,12 +2577,18 @@ describe("model cache materialized round trip", () => {
 		const model = buildModel(completionsSpec({ id: "shared-model", provider: providerId }));
 		const read = () => readModelCacheWithVersion(providerId, Infinity, () => 0);
 		// A sliced write given a version applies only while the row has that version.
+		// A version must be a string here: `undefined` would turn the check off.
 		const writeApplies = async (version: string | null | undefined) => {
+			expect(typeof version).toBe("string");
 			const stale = getModelCacheWriteStats().staleWrites;
+			await writeModelCacheInSlices(providerId, 9_000_000, [model], true, "", undefined, [], undefined, {
+				rowVersion: "not-this-row",
+			});
+			expect(getModelCacheWriteStats().staleWrites).toBe(stale + 1);
 			await writeModelCacheInSlices(providerId, 9_000_000, [model], true, "", undefined, [], undefined, {
 				rowVersion: version,
 			});
-			return getModelCacheWriteStats().staleWrites === stale;
+			return getModelCacheWriteStats().staleWrites === stale + 1;
 		};
 		// Another connection, as another process would write.
 		const other = () => new Database(getModelDbPath());
