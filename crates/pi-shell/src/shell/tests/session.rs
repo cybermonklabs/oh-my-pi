@@ -236,21 +236,40 @@ async fn rg_line_buffering_modes_reach_a_pipe_on_a_current_thread_runtime() {
 /// A utility's `--help`, `--version` and usage error were written before its
 /// body ran, with a blocking write on the runtime thread: into an engine pipe
 /// or `$(…)` that panicked on a current-thread runtime, so nothing was
-/// printed and the command failed.
+/// printed and the command failed. Each must keep its text and its status:
+/// `--help` and `--version` 0, a usage error 2 (grep's).
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn early_output_of_a_utility_reaches_a_pipe_on_a_current_thread_runtime() {
 	let ran = run_in_tree(concat!(
-		"grep --help | { read -r l && echo grep-help; }\n",
-		"cat --version | { read -r l && echo cat-version; }\n",
-		"grep --bogus 2>&1 | { read -r l && echo grep-usage; }\n",
-		"v=$(grep -V) && [ -n \"$v\" ] && echo grep-version\n",
-		"rg --help | { read -r l && echo rg-help; }\n",
+		"grep --help | head -n 1; echo \"${PIPESTATUS[0]}\"\n",
+		"grep --help | wc -l\n",
+		"cat --version | cat; echo \"${PIPESTATUS[0]}\"\n",
+		"grep --no-such-flag 2>&1 | cat; echo \"${PIPESTATUS[0]}\"\n",
+		"v=$(grep -V); echo \"$?:${v%% *}\"\n",
+		"rg --help | head -n 1; echo \"${PIPESTATUS[0]}\"\n",
+		"rg --help | wc -l\n",
 	))
 	.await;
 	assert_eq!(
 		ran,
-		(Some(0), "grep-help\ncat-version\ngrep-usage\ngrep-version\nrg-help\n".to_string())
+		(
+			Some(0),
+			concat!(
+				"Search for PATTERN in each FILE or standard input.\n0\n",
+				"67\n",
+				"cat 0.8.0\n0\n",
+				"error: unexpected argument '--no-such-flag' found\n\n",
+				"  tip: to pass '--no-such-flag' as a value, use '-- --no-such-flag'\n\n",
+				"Usage: grep [OPTIONS] [ARGS]...\n\n",
+				"For more information, try '--help'.\n2\n",
+				"0:grep\n",
+				"ripgrep recursively searches the current directory for lines matching a regex \
+				 pattern.\n0\n",
+				"118\n",
+			)
+			.to_string()
+		)
 	);
 }
 
