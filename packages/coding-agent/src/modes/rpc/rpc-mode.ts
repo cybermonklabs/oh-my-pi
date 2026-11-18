@@ -75,6 +75,7 @@ import { initializeExtensions } from "../runtime-init";
 import { cfgSpellingAutocomplete } from "../settings";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { rpcBusyCode } from "./rpc-busy-code";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
@@ -1770,7 +1771,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		return success(command.id, "set_ask_dialog", { enabled: rpcUiContext.askDialogEnabled });
 	};
 	const onPromptError = (id: string | undefined, command: string) => (promptError: Error) =>
-		output(error(id, command, promptError.message));
+		output(error(id, command, promptError.message, rpcBusyCode(promptError)));
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
 	const reloadPluginState = async () => {
@@ -2095,7 +2096,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						// Already acknowledged: owe the late same-id error and a failed prompt_result.
 						const promptError = cause instanceof Error ? cause : new Error(String(cause));
 						onPromptError(id, "abort_and_prompt")(promptError);
-						promptResults.fail(ticket, promptError.message);
+						promptResults.fail(ticket, promptError.message, rpcBusyCode(promptError));
 					},
 				);
 				return success(id, "abort_and_prompt");

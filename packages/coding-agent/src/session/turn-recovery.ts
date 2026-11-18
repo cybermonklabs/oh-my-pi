@@ -286,6 +286,14 @@ function toolReplayStart(messages: readonly AgentMessage[]): number | undefined 
 	return start;
 }
 
+/** The busy failure of a prompt that waited at least 30 s for another run to release the agent. */
+export class PromptIdleWaitTimeoutError extends Error {
+	constructor() {
+		super("Timed out waiting for prior agent run to finish before prompting.");
+		this.name = "PromptIdleWaitTimeoutError";
+	}
+}
+
 /** Result shape shared with automatic maintenance recovery. */
 export interface RecoveryCompactionResult {
 	continuationScheduled: boolean;
@@ -3694,7 +3702,7 @@ export class TurnRecovery {
 					throw err;
 				}
 				if (Date.now() >= deadline) {
-					throw new Error("Timed out waiting for prior agent run to finish before prompting.");
+					throw new PromptIdleWaitTimeoutError();
 				}
 				await this.#host.agent.waitForIdle();
 			}
