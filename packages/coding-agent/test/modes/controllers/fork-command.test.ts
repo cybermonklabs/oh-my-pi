@@ -461,39 +461,41 @@ console.log(JSON.stringify({ dir: getNativesDir(), command: request.command }));
 		expect(forked.commandChild).toBe(path.join(cmdHome, ".omp", "natives"));
 	}, 120_000);
 
-	it.skipIf(process.platform !== "linux")(
-		"gives the fork this session's natives directory when Bun loaded one of the directory rule's inputs",
-		async () => {
-			// The session is a non-compiled omp started with Bun's own `.env` loading: its start
-			// directory's `.env` sets OMP_CONFIG_ROOT, which the fork pins at its launch value (unset)
-			// and the relaunch file then sets again. The XDG cache root appears only after the
-			// session resolved its directory, so a fork that resolved for itself would name it.
-			const controllerTs = path.join(import.meta.dir, "../../../src/modes/controllers/command-controller.ts");
-			const workerClientTs = path.join(import.meta.dir, "../../../src/subprocess/worker-client.ts");
-			const nativesDirJs = path.join(import.meta.dir, "../../../../natives/native/natives-dir.js");
-			const envTs = path.join(import.meta.dir, "../../../../utils/src/env.ts");
-			const home = path.join(tempDirectory, "home");
-			const start = path.join(tempDirectory, "start");
-			const elsewhere = path.join(tempDirectory, "elsewhere");
-			const configRoot = path.join(tempDirectory, "config-root");
-			const xdgCache = path.join(tempDirectory, "xdg-cache");
-			await fs.mkdir(home, { recursive: true });
-			await fs.mkdir(elsewhere, { recursive: true });
-			await fs.mkdir(xdgCache, { recursive: true });
-			await Bun.write(path.join(start, ".env"), `OMP_CONFIG_ROOT=${configRoot}\n`);
-			const fork = path.join(tempDirectory, "fork.ts");
-			await Bun.write(
-				fork,
-				`const dir = (await import(${JSON.stringify(nativesDirJs)})).getNativesDir();
+	/**
+	 * A session that is a non-compiled omp started with Bun's own `.env` loading, whose start
+	 * directory's `.env` sets OMP_CONFIG_ROOT, which the fork pins at its launch value (unset) and
+	 * the relaunch file then sets again. The XDG cache root appears only after the session
+	 * resolved its directory, so a fork that resolved for itself would name it. The session
+	 * builds the /fork command with the real relaunch command (the stand-in fork as the entry),
+	 * and the command runs the fork.
+	 */
+	async function forkAfterBunLoadedInput(options: { sessionTmpdir: string; forkTmpdir: string }) {
+		const controllerTs = path.join(import.meta.dir, "../../../src/modes/controllers/command-controller.ts");
+		const workerClientTs = path.join(import.meta.dir, "../../../src/subprocess/worker-client.ts");
+		const nativesDirJs = path.join(import.meta.dir, "../../../../natives/native/natives-dir.js");
+		const envTs = path.join(import.meta.dir, "../../../../utils/src/env.ts");
+		const home = path.join(tempDirectory, "home");
+		const start = path.join(tempDirectory, "start");
+		const elsewhere = path.join(tempDirectory, "elsewhere");
+		const configRoot = path.join(tempDirectory, "config-root");
+		const xdgCache = path.join(tempDirectory, "xdg-cache");
+		await fs.mkdir(home, { recursive: true });
+		await fs.mkdir(elsewhere, { recursive: true });
+		await fs.mkdir(xdgCache, { recursive: true });
+		await Bun.write(path.join(start, ".env"), `OMP_CONFIG_ROOT=${configRoot}\n`);
+		const fork = path.join(tempDirectory, "fork.ts");
+		await Bun.write(
+			fork,
+			`const dir = (await import(${JSON.stringify(nativesDirJs)})).getNativesDir();
 // As omp's env.ts does when it loads: it removes the relaunch file.
 await import(${JSON.stringify(envTs)});
 console.log(JSON.stringify({ dir, OMP_CONFIG_ROOT: process.env.OMP_CONFIG_ROOT ?? null }));
 `,
-			);
-			const sessionTs = path.join(tempDirectory, "session.ts");
-			await Bun.write(
-				sessionTs,
-				`const { CommandController } = await import(${JSON.stringify(controllerTs)});
+		);
+		const sessionTs = path.join(tempDirectory, "session.ts");
+		await Bun.write(
+			sessionTs,
+			`const { CommandController } = await import(${JSON.stringify(controllerTs)});
 const { resolveCliEntryCmd } = await import(${JSON.stringify(workerClientTs)});
 const { getNativesDir } = await import(${JSON.stringify(nativesDirJs)});
 const sessionFile = ${JSON.stringify(sourceSessionFile)};
@@ -524,34 +526,92 @@ const controller = new CommandController(ctx, {
 await controller.handleForkCommand("pane");
 console.log(JSON.stringify({ dir: getNativesDir(), command: request.command }));
 `,
-			);
-			const env: Record<string, string | undefined> = {
-				...process.env,
-				HOME: home,
-				USERPROFILE: home,
-				XDG_CACHE_HOME: xdgCache,
-			};
-			for (const name of FORK_NATIVES_DIR_NAMES) if (name !== "XDG_CACHE_HOME") delete env[name];
-			for (const name of ["NODE_ENV", "BUN_ENV", "BUN_OPTIONS"]) delete env[name];
-			const run = async (command: string[], cwd: string) => {
-				const child = Bun.spawn(command, { cwd, env, stdout: "pipe", stderr: "pipe" });
-				const [stdout, stderr, exitCode] = await Promise.all([
-					new Response(child.stdout).text(),
-					new Response(child.stderr).text(),
-					child.exited,
-				]);
-				expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-				return JSON.parse(stdout);
-			};
+		);
+		const env: Record<string, string | undefined> = {
+			...process.env,
+			HOME: home,
+			USERPROFILE: home,
+			XDG_CACHE_HOME: xdgCache,
+		};
+		for (const name of FORK_NATIVES_DIR_NAMES) if (name !== "XDG_CACHE_HOME") delete env[name];
+		for (const name of ["NODE_ENV", "BUN_ENV", "BUN_OPTIONS"]) delete env[name];
+		const run = async (command: string[], cwd: string, tmpdir: string) => {
+			const child = Bun.spawn(command, { cwd, env: { ...env, TMPDIR: tmpdir }, stdout: "pipe", stderr: "pipe" });
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+			return JSON.parse(stdout);
+		};
 
-			// Bun's own loading on, as the npm package's `#!/usr/bin/env bun` script starts.
-			const session = await run([process.execPath, sessionTs], start);
-			await fs.mkdir(path.join(xdgCache, "omp"), { recursive: true });
-			const forked = await run(session.command, elsewhere);
+		// Bun's own loading on, as the npm package's `#!/usr/bin/env bun` script starts.
+		const session = await run([process.execPath, sessionTs], start, options.sessionTmpdir);
+		await fs.mkdir(path.join(xdgCache, "omp"), { recursive: true });
+		const relaunchArg = (session.command as string[]).find(arg => arg.startsWith("--env-file="));
+		const relaunchFile = relaunchArg?.slice("--env-file=".length);
+		const relaunchFileWritten = relaunchFile !== undefined && (await fs.exists(relaunchFile));
+		const forked = await run(session.command, elsewhere, options.forkTmpdir);
+		return { session, forked, configRoot, relaunchFile, relaunchFileWritten };
+	}
+
+	it.skipIf(process.platform !== "linux")(
+		"gives the fork this session's natives directory when Bun loaded one of the directory rule's inputs",
+		async () => {
+			const tmp = path.join(tempDirectory, "tmp");
+			await fs.mkdir(tmp, { recursive: true });
+			const { session, forked, configRoot } = await forkAfterBunLoadedInput({ sessionTmpdir: tmp, forkTmpdir: tmp });
 
 			expect(session.dir).toBe(path.join(configRoot, "natives"));
 			expect(forked.OMP_CONFIG_ROOT).toBe(configRoot);
 			expect(forked.dir).toBe(session.dir);
+		},
+		120_000,
+	);
+
+	it.skipIf(process.platform !== "linux")(
+		"removes the relaunch file in a fork whose temporary directory is not the session's",
+		async () => {
+			// The multiplexer's environment names another TMPDIR than the session was started with.
+			const sessionTmp = path.join(tempDirectory, "session-tmp");
+			const forkTmp = path.join(tempDirectory, "fork-tmp");
+			await fs.mkdir(sessionTmp, { recursive: true });
+			await fs.mkdir(forkTmp, { recursive: true });
+			const { forked, configRoot, relaunchFile, relaunchFileWritten } = await forkAfterBunLoadedInput({
+				sessionTmpdir: sessionTmp,
+				forkTmpdir: forkTmp,
+			});
+
+			expect(relaunchFileWritten).toBe(true);
+			expect(path.dirname(path.dirname(relaunchFile!))).toBe(sessionTmp);
+			expect(forked.OMP_CONFIG_ROOT).toBe(configRoot);
+			expect(await fs.exists(relaunchFile!)).toBe(false);
+			expect(await fs.readdir(sessionTmp)).toEqual([]);
+		},
+		120_000,
+	);
+
+	it.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
+		"records no relaunch value in the fork's handoff when the relaunch file cannot be written",
+		async () => {
+			// A temporary directory the session cannot write: the relaunch carries `--no-env-file`,
+			// so the fork gets no OMP_CONFIG_ROOT, and the handoff must record none either.
+			const readOnlyTmp = path.join(tempDirectory, "read-only-tmp");
+			await fs.mkdir(readOnlyTmp, { recursive: true, mode: 0o500 });
+			try {
+				const { session, forked, configRoot } = await forkAfterBunLoadedInput({
+					sessionTmpdir: readOnlyTmp,
+					forkTmpdir: readOnlyTmp,
+				});
+
+				expect(session.command).toContain("--no-env-file");
+				expect(forked.OMP_CONFIG_ROOT).toBeNull();
+				expect(session.dir).toBe(path.join(configRoot, "natives"));
+				expect(forked.dir).toBe(session.dir);
+			} finally {
+				await fs.chmod(readOnlyTmp, 0o700);
+			}
 		},
 		120_000,
 	);

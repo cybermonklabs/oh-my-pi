@@ -1606,12 +1606,19 @@ export class CommandController {
 				// `forkScopeEnvCommand` unsets an empty value, so the handoff records it unset.
 				scope[name] = (name in scope ? scope[name] : launchEnvValue(name)) || undefined;
 			}
+			// Built first, so the handoff can record what the relaunch file it may write gives.
+			const entry = dependencies.resolveCliEntryCmd();
+			command = entry;
 			// The handoff records the inputs the fork will see: where the scope unsets one, the
-			// relaunch file (`resolveCliEntryCmd`) gives it the value Bun loaded here, if any.
+			// relaunch file gives it the value Bun loaded here, if any; with no relaunch file (none
+			// was needed, or it could not be written and `--no-env-file` stands there), nothing.
+			const carriesRelaunchFile = entry.some(arg => arg.startsWith("--env-file="));
 			const forkInputs: Record<string, string | undefined> = {};
-			for (const name of nativesDirInputNames()) forkInputs[name] = scope[name] ?? bunRelaunchValue(name);
+			for (const name of nativesDirInputNames()) {
+				forkInputs[name] = scope[name] ?? (carriesRelaunchFile ? bunRelaunchValue(name) : undefined);
+			}
 			scope[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(forkInputs, { parent: null });
-			command = [...forkScopeEnvCommand(scope), ...dependencies.resolveCliEntryCmd(), ...childArgs];
+			command = [...forkScopeEnvCommand(scope), ...entry, ...childArgs];
 			const launchPlan = createDefaultTerminalLaunchRequest(
 				multiplexer,
 				placement,

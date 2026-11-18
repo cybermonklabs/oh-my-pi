@@ -479,23 +479,31 @@ describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () 
 		expect(child.exitCode).toBe(0);
 	}
 
-	it("removes only the relaunch file it was started with and that file's own directory, never recursively", () => {
+	it("removes the relaunch file it was started with, wherever it is, and nothing that is not one", () => {
 		const base = tempBase();
 		const plain = relaunchDir(base, "omp-bun-env-Plain1");
+		// Written under another temporary directory than this process's (a fork pane's terminal).
+		const elsewhere = relaunchDir(tempBase(), "omp-bun-env-Else01");
 		// The user's own file beside it: the directory is not only the relaunch file's.
 		const shared = relaunchDir(base, "omp-bun-env-Share1");
 		fs.writeFileSync(path.join(shared.dir, "notes.txt"), "mine\n");
-		// A directory of that name that is not directly in the temporary directory is the user's.
-		const nested = relaunchDir(path.join(base, "projects"), "omp-bun-env-Nest01");
+		// Not named like a relaunch directory.
+		const misnamed = relaunchDir(base, "omp-bun-env-x");
+		// A link named like one is not followed.
+		const target = relaunchDir(tempBase(), "omp-bun-env-Tgt001");
+		const link = path.join(base, "omp-bun-env-Lnk001");
+		fs.symlinkSync(target.dir, link);
 
-		loadEnv(base, [`--env-file=${plain.file}`]);
-		loadEnv(base, [`--env-file=${shared.file}`]);
-		loadEnv(base, [`--env-file=${nested.file}`]);
+		for (const file of [plain.file, elsewhere.file, shared.file, misnamed.file, path.join(link, "loaded.env")]) {
+			loadEnv(base, [`--env-file=${file}`]);
+		}
 
 		expect(fs.existsSync(plain.dir)).toBe(false);
-		expect(fs.existsSync(shared.file)).toBe(false);
-		expect(fs.readFileSync(path.join(shared.dir, "notes.txt"), "utf8")).toBe("mine\n");
-		expect(fs.existsSync(nested.file)).toBe(true);
+		expect(fs.existsSync(elsewhere.dir)).toBe(false);
+		expect(fs.readdirSync(shared.dir).sort()).toEqual(["loaded.env", "notes.txt"]);
+		expect(fs.existsSync(misnamed.file)).toBe(true);
+		expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+		expect(fs.existsSync(target.file)).toBe(true);
 	});
 
 	it("removes, as a session starts, this user's relaunch directories left for more than ten minutes", () => {
@@ -504,6 +512,10 @@ describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () 
 		const old = relaunchDir(base, "omp-bun-env-Old123");
 		fs.utimesSync(old.dir, hourAgo, hourAgo);
 		const fresh = relaunchDir(base, "omp-bun-env-New123");
+		// One that also holds another file stays whole, however old it is.
+		const shared = relaunchDir(base, "omp-bun-env-Oth001");
+		fs.writeFileSync(path.join(shared.dir, "notes.txt"), "mine\n");
+		fs.utimesSync(shared.dir, hourAgo, hourAgo);
 		// A link of that name is not followed, however old it is.
 		const target = relaunchDir(tempBase(), "omp-bun-env-Tgt123");
 		const link = path.join(base, "omp-bun-env-Lnk123");
@@ -519,8 +531,32 @@ describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () 
 
 		expect(fs.existsSync(old.dir)).toBe(false);
 		expect(fs.existsSync(fresh.file)).toBe(true);
+		expect(fs.readdirSync(shared.dir).sort()).toEqual(["loaded.env", "notes.txt"]);
 		expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
 		expect(fs.existsSync(target.file)).toBe(true);
+	});
+
+	it("sweeps on a session's main thread only, never in a worker thread", () => {
+		const base = tempBase();
+		const hourAgo = new Date(Date.now() - 60 * 60_000);
+		const old = relaunchDir(base, "omp-bun-env-Thr123");
+		fs.utimesSync(old.dir, hourAgo, hourAgo);
+		const worker = path.join(tempBase(), "worker.ts");
+		fs.writeFileSync(worker, `await import(${JSON.stringify(envTs)});\npostMessage("loaded");\n`);
+		// A worker thread loads env.ts first; then the main thread does.
+		const script = `const fs = await import("node:fs");
+await new Promise(resolve => { const w = new Worker(${JSON.stringify(worker)}); w.onmessage = () => { w.terminate(); resolve(); }; });
+const afterWorker = fs.existsSync(${JSON.stringify(old.dir)});
+await import(${JSON.stringify(envTs)});
+console.log(JSON.stringify({ afterWorker, afterMain: fs.existsSync(${JSON.stringify(old.dir)}) }));`;
+		const child = Bun.spawnSync([process.execPath, "-e", script], {
+			cwd: tempBase(),
+			env: { ...process.env, TMPDIR: base },
+			stderr: "pipe",
+		});
+		expect(child.stderr.toString()).toBe("");
+
+		expect(JSON.parse(child.stdout.toString())).toEqual({ afterWorker: true, afterMain: false });
 	});
 });
 
@@ -559,6 +595,63 @@ describe.skipIf(process.platform !== "linux")("bunOptionsWithoutEnvFiles", () =>
 		// Bun's own arguments from the new value, before the ones on the command line.
 		const execArgv = JSON.parse(bunOptionsArgs(result === "" ? undefined : (result ?? undefined))) as string[];
 		expect(execArgv.slice(0, execArgv.indexOf("--no-env-file"))).toEqual([...kept]);
+	});
+
+	/** Bun's own arguments from `BUN_OPTIONS` (`undefined`: unset), before the command line's. */
+	function bunArgs(value: string | undefined): string[] {
+		const execArgv = JSON.parse(bunOptionsArgs(value)) as string[];
+		return execArgv.slice(0, execArgv.lastIndexOf("--no-env-file"));
+	}
+
+	/** `args` without the env-file ones: an `--env-file…` argument, and a bare one's file. */
+	function withoutEnvFiles(args: string[]): string[] {
+		const kept: string[] = [];
+		for (let i = 0; i < args.length; i++) {
+			const name = args[i]!.split(/[=\t\n\f\r ]/, 1)[0];
+			if (name !== "--env-file") kept.push(args[i]!);
+			else if (args[i] === "--env-file") i++;
+		}
+		return kept;
+	}
+
+	it.each([
+		// A dropped `--env-file` between a bare flag and a quoted argument: the two must not join.
+		`--smol --env-file=.e "--conditions=a b"`,
+		`--smol --env-file .e "--conditions=a b"`,
+		`--smol --env-file=.e '--conditions=x'`,
+		`--smol --env-file=.e "--conditions=a" --conditions=b`,
+		`--smol --env-file="x y" '--define=K:1'`,
+		// Other shapes.
+		`--smol --env-file=.e --conditions='a b'`,
+		`--conditions='x y' --env-file="a b.env" --smol`,
+		`'--env-file=.e' --smol`,
+		`--env-file=".e"--smol`,
+		`--title="a=b" --env-file=.e --smol`,
+		`--smol --env-file "x"`,
+		`--env-file= --smol`,
+		`--smol\t--env-file=.e\n--conditions="a\tb"`,
+		`--smol --env-file=.e --conditions="a b`,
+		`--smol \\--env-file .e`,
+		`--smol --env-file \\-x`,
+		`--define K:"v w" --env-file=.e`,
+		`--smol\v--env-file=.e`,
+	])("gives a second Bun process exactly the first one's arguments but the env-file ones: %j", value => {
+		const first = bunArgs(value);
+		const result = JSON.parse(
+			bunOptionsArgs(
+				value,
+				`const { bunOptionsWithoutEnvFiles } = await import(${JSON.stringify(envTs)}); console.log(JSON.stringify(bunOptionsWithoutEnvFiles() ?? null));`,
+			),
+		) as string | null;
+		const kept = withoutEnvFiles(first);
+
+		if (value.endsWith("\\-x")) {
+			// A bare `--env-file` before an option: not certain, so all of `BUN_OPTIONS` is unset,
+			// and with it `--smol`.
+			expect({ result, kept }).toEqual({ result: "", kept: ["--smol"] });
+			return;
+		}
+		expect(bunArgs(result === null ? value : result === "" ? undefined : result)).toEqual(kept);
 	});
 });
 

@@ -92,6 +92,8 @@ describe("the CLI started again by /restart", () => {
 		loads?: Record<string, string>;
 		/** Runtime flags `BUN_OPTIONS` must give the first launch and the restarted process alike. */
 		keeps?: string[];
+		/** The session's `~/.env`, which omp's own `.env` loading applies (`$TEMP_ROOT`: the test's root). */
+		homeEnv?: string;
 	}
 
 	/** Start a session as the case says, let it move and `/restart` itself; both views of its values. */
@@ -104,6 +106,7 @@ describe("the CLI started again by /restart", () => {
 		}
 		for (const [name, text] of Object.entries(ELSEWHERE_FILES)) await Bun.write(path.join(elsewhere, name), text);
 		await fs.mkdir(home, { recursive: true });
+		if (c.homeEnv) await Bun.write(path.join(home, ".env"), c.homeEnv.replaceAll("$TEMP_ROOT", tempRoot));
 		const firstOut = path.join(tempRoot, "first.json");
 		const script = path.join(tempRoot, "session.ts");
 		await Bun.write(
@@ -283,6 +286,28 @@ execReplace([...command, "restarted"]);
 			120_000,
 		);
 	}
+
+	it.skipIf(process.platform !== "linux")(
+		"removes the relaunch file when omp's own .env loading sets TMPDIR after the launch",
+		async () => {
+			// TMPDIR unset at the launch, then set by `~/.env`, which omp applies outside a test run.
+			const dotenvTmp = path.join(tempRoot, "dotenv-tmp");
+			await fs.mkdir(dotenvTmp, { recursive: true });
+			const { first, restarted, privateFilesLeft, relaunch } = await restart({
+				env: { TMPDIR: undefined, PI_TEST_RUNTIME: undefined },
+				homeEnv: "TMPDIR=$TEMP_ROOT/dotenv-tmp\n",
+				loads: { FROM_ENV: "start" },
+			});
+			const file = relaunch.find(arg => arg.startsWith("--env-file="))?.slice("--env-file=".length);
+
+			expect(restarted).toEqual(first);
+			expect(file).toBeDefined();
+			expect(privateFilesLeft).toEqual([]);
+			expect(await fs.exists(file!)).toBe(false);
+			expect(await fs.readdir(dotenvTmp)).toEqual([]);
+		},
+		120_000,
+	);
 
 	it.skipIf(process.platform === "win32")(
 		"where the launch environment cannot be read (as on macOS or Windows), runs the pre-PR command: Bun loads the .env files of the directory the session is in",
