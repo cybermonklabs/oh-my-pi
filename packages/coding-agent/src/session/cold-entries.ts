@@ -107,9 +107,9 @@ const ENTRY_TYPES_KEPT_WHOLE: ReadonlySet<string> = new Set<SessionEntry["type"]
 ]);
 
 /**
- * The `custom` type that goes cold like a message: the patch records a
- * shake pass appends hold the new bodies of the entries they patch, which a
- * load applies to those entries; no turn reads the records themselves.
+ * The `custom` type that goes cold like a message: the patch records that
+ * hold the new values of the entries they patch, which a load applies to
+ * those entries; no turn reads the records themselves.
  */
 const PATCH_RECORD_CUSTOM_TYPE = "entry_patch";
 
