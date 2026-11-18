@@ -484,19 +484,23 @@ function identities(files, untracked, hashes) {
 const CHECKOUT_ID_FILE = "omp-checkout-id";
 
 /**
- * The git directory of the checkout at `repoRoot`: its `.git` directory, or the
- * one its `.git` file names (`gitdir: …`, as a worktree's or a submodule's does);
- * undefined when `repoRoot` has no `.git` of its own.
+ * The git directory of the checkout at `repoRoot`: its `.git` directory (also
+ * through a link, as git follows one), or the one its `.git` file names
+ * (`gitdir: …`, as a worktree's or a submodule's does), resolved as git resolves
+ * it, against the checkout's real directory; undefined when `repoRoot` has no
+ * `.git` of its own.
  * @param {string} repoRoot
  * @returns {string | undefined}
  */
 function checkoutGitDir(repoRoot) {
 	const dotGit = path.join(repoRoot, ".git");
-	const stat = fs.lstatSync(dotGit, { throwIfNoEntry: false });
+	const stat = fs.statSync(dotGit, { throwIfNoEntry: false });
 	if (stat?.isDirectory()) return dotGit;
 	if (!stat?.isFile()) return undefined;
 	const named = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(fs.readFileSync(dotGit, "utf8"));
-	return named ? path.resolve(repoRoot, named[1]) : undefined;
+	// A submodule's `gitdir: ../.git/modules/sub` reached through a link to it: the
+	// `..` is the real parent's, not the link's.
+	return named ? path.resolve(fs.realpathSync(repoRoot), named[1]) : undefined;
 }
 
 /**
@@ -504,13 +508,17 @@ function checkoutGitDir(repoRoot) {
  * ({@link CHECKOUT_ID_FILE}), made there by the first build when `create` is set.
  * It moves with the checkout (a `mv`, a bind mount at another path, a dev
  * container), and a new checkout, even one made where an old one was, has none
- * of its own until it builds. Null for a tree with no `.git` of its own (a Docker
- * build context, an export): no record names it as its checkout.
+ * of its own until it builds. Builds that start at once agree on one id: each
+ * writes its id whole under a temporary name and links it into place, so the
+ * file never exists empty, and a build that loses the race reads the winner's.
+ * Null for a tree with no `.git` of its own (a Docker build context, an export),
+ * and for a git directory that cannot be written: no record names it as its
+ * checkout.
  * @param {string} repoRoot
  * @param {boolean} create
  * @returns {string | null}
  */
-function checkoutId(repoRoot, create) {
+export function checkoutId(repoRoot, create) {
 	let idPath;
 	try {
 		const gitDir = checkoutGitDir(repoRoot);
@@ -529,11 +537,15 @@ function checkoutId(repoRoot, create) {
 	};
 	const existing = read();
 	if (existing || !create) return existing;
+	const temp = uniqueTempPath(idPath);
 	try {
-		fs.writeFileSync(idPath, `${crypto.randomUUID()}\n`, { flag: "wx" });
+		fs.writeFileSync(temp, `${crypto.randomUUID()}\n`, { flag: "wx" });
+		fs.linkSync(temp, idPath);
 	} catch (err) {
-		// Another build made it first, or the git directory cannot be written.
+		// Another build linked its id first, or the git directory cannot be written.
 		if (err?.code !== "EEXIST") return null;
+	} finally {
+		fs.rmSync(temp, { force: true });
 	}
 	return read();
 }

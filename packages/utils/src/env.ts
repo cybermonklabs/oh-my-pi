@@ -147,6 +147,49 @@ export function launchEnvValue(name: string): string | undefined {
 }
 
 /**
+ * This process's directory when this module loaded: where Bun's own `.env` loading read at the
+ * process's start (omp moves into its project directory only after this module loads).
+ */
+const startCwd = (() => {
+	try {
+		return process.cwd();
+	} catch {
+		return undefined;
+	}
+})();
+
+/**
+ * Runtime flags that make a new Bun process load the `.env` files Bun's own loading read at
+ * this process's start, so a non-compiled omp that starts the CLI again (`/restart`, a `/fork`
+ * session) starts with the values the first launch had, wherever the session has moved
+ * since: `execvp(3)`, which `/restart` uses, passes the environment the process was started
+ * with, which those values are not in. The files are the `--env-file`s the process was started
+ * with, else Bun's defaults in its start directory, those that exist, in Bun's order (a later
+ * one wins): `.env`, `.env.<mode>`, `.env.local`, `.env.<mode>.local`, where the mode is
+ * `NODE_ENV` as the process was started with it, `development` by default, and the `test` mode
+ * reads no `.env.local`. `--no-env-file` when it loaded none.
+ */
+export function bunEnvFileArgs(): string[] {
+	const files: string[] = [];
+	const argv = process.execArgv;
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]!;
+		if (arg.startsWith("--env-file=")) files.push(arg.slice("--env-file=".length));
+		else if (arg === "--env-file" && i + 1 < argv.length) files.push(argv[++i]!);
+	}
+	if (files.length === 0 && !argv.includes("--no-env-file") && startCwd !== undefined) {
+		const mode = launchEnvValue("NODE_ENV") || "development";
+		// The `test` mode skips `.env.local` only, as Bun does.
+		const names = [".env", `.env.${mode}`, ...(mode === "test" ? [] : [".env.local"]), `.env.${mode}.local`];
+		for (const name of names) {
+			if (fs.existsSync(path.join(startCwd, name))) files.push(name);
+		}
+	}
+	if (files.length === 0) return ["--no-env-file"];
+	return files.map(file => `--env-file=${path.resolve(startCwd ?? "", file)}`);
+}
+
+/**
  * `PI_NATIVES_DIR` as omp was started with it. The commands the agent runs get this value,
  * never the directory omp resolved, so a command, and an omp it starts with its own `HOME`,
  * resolves the natives directory for itself. omp's children that are omp take the resolved
@@ -155,9 +198,11 @@ export function launchEnvValue(name: string): string | undefined {
 const nativesDirAtLaunch = launchEnvValue("PI_NATIVES_DIR");
 
 /**
- * Whether `name` is `PI_NATIVES_DIR`, which omp never applies from a `.env` file: the natives
+ * Whether `name` is `PI_NATIVES_DIR`, which omp's own `.env` loading never applies: the natives
  * directory is fixed before `.env` files are read, so the value could only mislead the
- * programs omp starts.
+ * programs omp starts. (Bun's own loading, in a non-compiled omp, runs before this module; the
+ * workers and the broker omp starts run with it off, and `/restart` and a `/fork` session load
+ * the files it loaded at the first launch, `bunEnvFileArgs`.)
  */
 function isNativesDirEnvName(name: string): boolean {
 	return process.platform === "win32" ? name.toUpperCase() === "PI_NATIVES_DIR" : name === "PI_NATIVES_DIR";
@@ -191,8 +236,11 @@ function filterChildShellEnvInternal(
 		if (nativesDirAtLaunch === undefined) delete result.PI_NATIVES_DIR;
 		else result.PI_NATIVES_DIR = nativesDirAtLaunch;
 	}
-	// omp's own handoff to a child that is omp; a command is no such child.
-	delete result[NATIVES_DIR_HANDOFF_ENV_KEY];
+	// omp's own handoff to a child that is omp; a command is no such child. Empty, not
+	// absent: the native shell starts from the process's own C environment, where the
+	// handoff omp was started with remains (a forked session's has no parent), and this
+	// value replaces it there. An empty handoff is none.
+	result[NATIVES_DIR_HANDOFF_ENV_KEY] = "";
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
 	const launchNodeEnv = runtimeLaunchEnvValues ? runtimeLaunchEnvValues.get("NODE_ENV") : env.NODE_ENV;
 	const nodeEnvName = `.env.${launchNodeEnv || "development"}`;

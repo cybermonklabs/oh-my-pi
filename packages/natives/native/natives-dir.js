@@ -48,15 +48,16 @@ const NATIVES_DIR_CACHE_ENV_KEY = "__PI_NATIVES_DIR_CACHE";
 let processNativesDir;
 
 /**
- * This process's start time on Linux (`/proc/self/stat` field 22, in clock ticks since
- * boot): with the pid it names one process for its whole life, in every thread. Undefined
- * elsewhere, or when `/proc` cannot be read.
+ * A process's start time on Linux (`/proc/<pid>/stat` field 22, in clock ticks since boot),
+ * this process's by default: with the pid it names one process for its whole life, in every
+ * thread. Undefined elsewhere, or when `/proc` cannot be read (the process has exited).
+ * @param {number | "self"} [pid]
  * @returns {string | undefined}
  */
-function processStartTime() {
+function processStartTime(pid = "self") {
 	if (process.platform !== "linux") return undefined;
 	try {
-		const stat = fs.readFileSync("/proc/self/stat", "utf8");
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
 		// The fields after the command name, which is in parentheses and may hold spaces,
 		// start at field 3; field 22 is the 20th of them.
 		return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
@@ -117,9 +118,12 @@ function adopt(dir) {
  * - `inputs`, the values the rule reads ({@link nativesDirInputNames}), match its own
  *   environment, so a program started with a home or directory variables of its own resolves
  *   its own directory;
- * - `parent`, when not null, is its parent's pid, so a program the child starts (one the
- *   agent's code starts in the JS eval kernel, say) resolves for itself even with the same
- *   environment. A forked session's handoff has no parent: the terminal starts the fork.
+ * - `parent`, when not null, is the process that started it: its parent now, or, after that
+ *   parent exited and it was re-parented, a recorded parent (`parent` and its start time
+ *   `parentStart`) that no longer runs. A program the child starts (one the agent's code starts
+ *   in the JS eval kernel, say) resolves for itself even with the same environment, since the
+ *   recorded parent still runs. A forked session's handoff has no parent: the terminal starts
+ *   the fork.
  */
 export const NATIVES_DIR_HANDOFF_ENV_KEY = "__PI_NATIVES_DIR_HANDOFF";
 
@@ -143,7 +147,7 @@ export function nativesDirInputNames() {
 /**
  * The {@link NATIVES_DIR_HANDOFF_ENV_KEY} value for a child process whose environment is `env`
  * (its values of the rule's inputs are recorded from it): this process's answer, or `dir`, for
- * a process whose parent is `parent` (null: any parent).
+ * a process whose parent is `parent` (this process's pid; null: any parent).
  * @param {Record<string, string | undefined>} env
  * @param {{ parent: number | null; dir?: string }} options
  * @returns {string}
@@ -151,13 +155,33 @@ export function nativesDirInputNames() {
 export function nativesDirHandoff(env, { parent, dir = getNativesDir() }) {
 	const inputs = {};
 	for (const name of nativesDirInputNames()) inputs[name] = env[name] ?? null;
-	return JSON.stringify({ dir, parent, inputs });
+	const parentStart = parent === null ? null : (processStartTime(parent === process.pid ? "self" : parent) ?? null);
+	return JSON.stringify({ dir, parent, parentStart, inputs });
+}
+
+/**
+ * Whether the process a handoff names as the child's parent started this process: it is this
+ * process's parent, or it no longer runs (it exited, and this process was re-parented). A
+ * recorded parent that still runs and is not this process's parent started another process.
+ * @param {{ parent: unknown; parentStart?: unknown }} handoff
+ * @param {number} ppid this process's parent now
+ */
+function isStartedByRecordedParent(handoff, ppid) {
+	const { parent, parentStart } = handoff;
+	if (parent === ppid) return true;
+	if (!Number.isInteger(parent) || parent <= 0) return false;
+	// With a start time (Linux), a pid another process reuses is not the recorded parent.
+	if (typeof parentStart === "string" && process.platform === "linux") {
+		return processStartTime(parent) !== parentStart;
+	}
+	return !isLiveProcess(parent);
 }
 
 /**
  * The directory a {@link NATIVES_DIR_HANDOFF_ENV_KEY} value hands over, or undefined for a
- * value this module did not write. With `env`, also undefined unless the value was written
- * for a process whose environment is `env` and whose parent is `ppid`.
+ * value this module did not write (an empty one included). With `addressee`, also undefined
+ * unless the value was written for a process whose environment is `env` and whose parent is,
+ * or was, the recorded one.
  * @param {string | undefined} value
  * @param {{ env: Record<string, string | undefined>; ppid: number }} [addressee]
  * @returns {string | undefined}
@@ -165,13 +189,13 @@ export function nativesDirHandoff(env, { parent, dir = getNativesDir() }) {
 export function nativesDirHandoffDir(value, addressee) {
 	let handoff;
 	try {
-		handoff = JSON.parse(value ?? "null");
+		handoff = JSON.parse(value || "null");
 	} catch {
 		return undefined;
 	}
 	if (typeof handoff?.dir !== "string" || !path.isAbsolute(handoff.dir)) return undefined;
 	if (!addressee) return handoff.dir;
-	if (handoff.parent !== null && handoff.parent !== addressee.ppid) return undefined;
+	if (handoff.parent !== null && !isStartedByRecordedParent(handoff, addressee.ppid)) return undefined;
 	const inputs = handoff.inputs;
 	if (inputs === null || typeof inputs !== "object") return undefined;
 	const names = nativesDirInputNames();
@@ -194,10 +218,12 @@ export function nativesDirHandoffDir(value, addressee) {
  * once per path, so a second directory would load a second copy of the addon into the
  * process, and the grammars the agent downloads would go where the addon does not look. omp
  * first loads the addon before it reads `.env` files, so set a directory variable in the
- * environment: omp never applies a `.env` file's `PI_NATIVES_DIR`, and another directory
- * variable set in a `.env` file does not move the natives directory. A child process that is
- * omp takes its parent's answer from a handoff ({@link NATIVES_DIR_HANDOFF_ENV_KEY}); any other
- * child resolves for itself. The first call reads, in order:
+ * environment: omp's own `.env` loading never applies `PI_NATIVES_DIR`, and another directory
+ * variable set in a `.env` file does not move the natives directory. (Bun's own `.env` loading,
+ * in a non-compiled omp, runs before any omp code: what it applies counts as the environment
+ * omp was started with.) A child process that is omp takes its parent's answer from a handoff
+ * ({@link NATIVES_DIR_HANDOFF_ENV_KEY}); any other child resolves for itself. The first call
+ * reads, in order:
  * 1. `PI_NATIVES_DIR`;
  * 2. `<OMP_DOWNLOAD_ROOT>/natives`;
  * 3. on Linux and macOS, `$XDG_CACHE_HOME/omp/natives` when `$XDG_CACHE_HOME/omp` exists;
@@ -218,7 +244,11 @@ export function getNativesDir() {
 		env: process.env,
 		ppid: process.ppid,
 	});
-	// Read once: the children this process starts with its environment must not take it.
+	// Read once: the children this process starts with `process.env` must not take it. A
+	// spawn with no `env`, and the native shell, start from the startup environment, which
+	// keeps it: commands get it empty (`filterChildShellEnv`); a program started with no `env`
+	// keeps it, which the parent check refuses while the recorded parent runs (a fork's
+	// names no parent).
 	delete process.env[NATIVES_DIR_HANDOFF_ENV_KEY];
 	return adopt(handedOver ?? resolveNativesDir());
 }

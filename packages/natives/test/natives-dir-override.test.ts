@@ -250,6 +250,39 @@ describe("one natives directory per process", () => {
 			expect((await runChild(env)).own).toBe(handedOver);
 		});
 
+		it("is taken by a child its parent left before the child's first call (re-parented)", async () => {
+			// A detached worker can outlive the session that started it; the session may exit
+			// before the worker's first call, and the worker is then re-parented.
+			const handedOver = path.join(tempRoot, "handed-over");
+			const out = path.join(tempRoot, "reparented.json");
+			const child = [
+				"const parentAtStart = Number(process.env.PARENT_AT_START);",
+				"const until = Date.now() + 60_000;",
+				"while (process.ppid === parentAtStart && Date.now() < until) await Bun.sleep(20);",
+				`const own = (await import(${nativesDirJs})).getNativesDir();`,
+				"const result = JSON.stringify({ own, reparented: process.ppid !== parentAtStart });",
+				'await Bun.write(process.env.OUT + ".tmp", result);',
+				'(await import("node:fs")).renameSync(process.env.OUT + ".tmp", process.env.OUT);',
+			].join("\n");
+			// The parent writes the child's handoff naming itself, starts it detached, and exits.
+			const parent = [
+				`const { nativesDirHandoff } = await import(${nativesDirJs});`,
+				`const env = { ...process.env, PARENT_AT_START: String(process.pid), OUT: ${JSON.stringify(out)} };`,
+				`env.__PI_NATIVES_DIR_HANDOFF = nativesDirHandoff(env, { parent: process.pid, dir: ${JSON.stringify(handedOver)} });`,
+				`Bun.spawn([process.execPath, "-e", ${JSON.stringify(child)}], { env, detached: true, stdio: ["ignore", "ignore", "inherit"] }).unref();`,
+			].join("\n");
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				PI_NATIVES_DIR: path.join(tempRoot, "child"),
+			};
+			const starter = Bun.spawn([process.execPath, "-e", parent], { env, stdout: "ignore", stderr: "inherit" });
+			expect(await starter.exited).toBe(0);
+			const deadline = Date.now() + 90_000;
+			while (!(await fs.exists(out)) && Date.now() < deadline) await Bun.sleep(50);
+
+			expect(JSON.parse(await fs.readFile(out, "utf8"))).toEqual({ own: handedOver, reparented: true });
+		}, 120_000);
+
 		it("names every variable the rule reads, so a new one cannot be left out of it", async () => {
 			// A handoff is taken when the recorded inputs match, so a variable the rule reads and
 			// the list omits would let a child with its own value of it take the parent's answer.

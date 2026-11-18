@@ -16,7 +16,8 @@ export function getNativesDir(): string;
 /**
  * Hidden variable by which omp hands its answer to a child process that is omp. A process takes
  * it only when its own values of the rule's inputs are the recorded ones and, when a parent is
- * recorded, its parent is that process; it then removes the variable from its environment.
+ * recorded, that process is its parent or no longer runs (the child was re-parented); it then
+ * removes the variable from `process.env`. An empty value is no handoff.
  */
 export const NATIVES_DIR_HANDOFF_ENV_KEY: "__PI_NATIVES_DIR_HANDOFF";
 
@@ -34,8 +35,9 @@ export function nativesDirHandoff(
 
 /**
  * The directory a handoff value hands over, or undefined for a value this module did not
- * write. With `addressee`, also undefined unless the value was written for a process whose
- * environment and parent those are.
+ * write (an empty one included). With `addressee`, also undefined unless the value was
+ * written for a process whose environment is `env` and whose parent is, or was, the
+ * recorded one.
  */
 export function nativesDirHandoffDir(
 	value: string | undefined,

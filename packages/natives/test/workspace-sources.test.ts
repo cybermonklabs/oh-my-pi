@@ -9,11 +9,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Worker } from "node:worker_threads";
 import { describeLoadedAddon, type NativeAddonStatus, reportStaleWorkspaceAddon } from "../native/loader-state.js";
 import {
 	addonSourcesState,
 	BAZEL_SOURCE_ROOTS,
 	CARGO_SOURCE_ROOTS,
+	checkoutId,
 	copyAddonSourcesStamp,
 	readRustSources,
 	settleRustSources,
@@ -686,11 +688,15 @@ describe("a file untracked at build time, judged in the checkout that built it",
 });
 
 describe("the checkout a record names", () => {
-	/** A commit without `src/foo.rs`, then a build with it untracked: the record's one untracked file. */
-	async function buildWithUntrackedModule() {
+	/** A commit without `src/foo.rs`. */
+	function commitBase() {
 		git(repo, "init", "-q");
 		git(repo, "add", "Cargo.toml", "Cargo.lock", "crates/pi-natives/src/lib.rs");
 		git(repo, "commit", "-qm", "base");
+	}
+
+	/** A build with `src/foo.rs` untracked: the record's one untracked file. */
+	async function buildUntrackedModule() {
 		await Bun.write(path.join(repo, "crates/pi-natives/src/foo.rs"), "pub fn foo() {}\n");
 		await build();
 		const stamp = await Bun.file(`${addon}.sources.json`).json();
@@ -698,9 +704,84 @@ describe("the checkout a record names", () => {
 		expect(stamp.checkout).toBe((await Bun.file(path.join(repo, ".git/omp-checkout-id")).text()).trim());
 	}
 
+	async function buildWithUntrackedModule() {
+		commitBase();
+		await buildUntrackedModule();
+	}
+
 	afterEach(async () => {
-		for (const suffix of ["-moved", "-origin", "-saved"])
+		for (const suffix of ["-moved", "-origin", "-saved", "-gitdir", "-super", "-link"])
 			await fs.rm(`${repo}${suffix}`, { recursive: true, force: true });
+	});
+
+	it("is one id for builds that start at once, and its file is never seen without it", async () => {
+		// Threads released together at a gate stand in for builds that start at once in a fresh
+		// checkout: each makes or reads the id, and every one must read the same id. Readers
+		// watch the file meanwhile: a build that read it while it held no whole id would record
+		// no checkout.
+		const builders = 6;
+		const watchers = 2;
+		const rounds = 25;
+		const gate = new SharedArrayBuffer(12);
+		const view = new Int32Array(gate);
+		const workers = Array.from(
+			{ length: builders + watchers },
+			() => new Worker(new URL("./fixtures/checkout-id-worker.ts", import.meta.url), { workerData: { gate } }),
+		);
+		const next = (worker: Worker) => new Promise<string | number | null>(resolve => worker.once("message", resolve));
+		try {
+			for (let round = 0; round < rounds; round++) {
+				const checkout = path.join(repo, `race-${round}`);
+				await fs.mkdir(path.join(checkout, ".git"), { recursive: true });
+				Atomics.store(view, 1, 0);
+				const results = workers.map(next);
+				workers.forEach((worker, i) => {
+					worker.postMessage({ repo: checkout, round, role: i < builders ? "build" : "watch" });
+				});
+				while (Atomics.load(view, 1) < workers.length) await Bun.sleep(1);
+				Atomics.store(view, 0, round + 1);
+				Atomics.notify(view, 0);
+				const ids = await Promise.all(results.slice(0, builders));
+				Atomics.store(view, 2, round + 1);
+				const incomplete = await Promise.all(results.slice(builders));
+
+				expect({
+					round,
+					ids: new Set(ids).size,
+					missing: ids.filter(id => id === null).length,
+					incompleteReads: incomplete.reduce<number>((sum, n) => sum + Number(n), 0),
+				}).toEqual({ round, ids: 1, missing: 0, incompleteReads: 0 });
+			}
+		} finally {
+			await Promise.all(workers.map(worker => worker.terminate()));
+		}
+	}, 120_000);
+
+	it("is the checkout's own through a .git that is a link to its git directory", async () => {
+		commitBase();
+		// git follows the link: `git rev-parse` and every build work through it.
+		await fs.rename(path.join(repo, ".git"), `${repo}-gitdir`);
+		await fs.symlink(`${repo}-gitdir`, path.join(repo, ".git"));
+		await buildUntrackedModule();
+		await fs.rm(path.join(repo, "crates/pi-natives/src/foo.rs"));
+
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("is one checkout by a submodule's real path and through a link to it", async () => {
+		// A submodule's `.git` file names its git directory relative to the submodule's real
+		// directory, which is what git resolves it against.
+		const superproject = `${repo}-super`;
+		const submodule = path.join(superproject, "sub");
+		await fs.mkdir(path.join(superproject, ".git/modules/sub"), { recursive: true });
+		await fs.mkdir(submodule, { recursive: true });
+		await Bun.write(path.join(submodule, ".git"), "gitdir: ../.git/modules/sub\n");
+		const link = `${repo}-link`;
+		await fs.symlink(submodule, link);
+		const id = checkoutId(submodule, true);
+
+		expect(id).toMatch(/^[0-9a-f-]{36}$/);
+		expect(checkoutId(link, false)).toBe(id);
 	});
 
 	it("is the same checkout after it moves, so its missing untracked file reads other", async () => {

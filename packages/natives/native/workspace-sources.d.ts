@@ -44,6 +44,14 @@ export interface RustSources {
 /** A path for a temporary file next to `target`, unique to this process and thread. */
 export function uniqueTempPath(target: string): string;
 
+/**
+ * The id of the checkout at `repoRoot`, kept in its git directory (`omp-checkout-id`) and, with
+ * `create`, made there when it has none: one id for every build of a checkout, also builds
+ * that start at once. Null for a tree with no `.git` of its own, or a git directory that
+ * cannot be written.
+ */
+export function checkoutId(repoRoot: string, create: boolean): string | null;
+
 /** The checkout's sources under `roots` now, read before a build begins; lists and reads every source file. */
 export function readRustSources(repoRoot: string, roots: readonly string[]): RustSources;
 

@@ -98,6 +98,8 @@ describe("the natives directory of omp's children", () => {
 	// By path: a script outside the repository would take a package name from Bun's install cache.
 	const envTs = path.join(import.meta.dir, "../../utils/src/env.ts");
 	const workerClientTs = path.join(import.meta.dir, "../src/subprocess/worker-client.ts");
+	const workerHostTs = path.join(import.meta.dir, "../../utils/src/worker-host.ts");
+	const nativesIndexJs = path.join(import.meta.dir, "../../natives/native/index.js");
 
 	beforeEach(async () => {
 		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-natives-children-"));
@@ -198,16 +200,20 @@ console.log(JSON.stringify({
 		// OMP_DOWNLOAD_ROOT), and with a home of their own.
 		expect(result.worker.program).toBe(path.join(tempRoot, "dl", "natives"));
 		expect(result.worker.programOwnHome).toBe(ownDir);
-		expect(result.commandEnv).toEqual({ PI_NATIVES_DIR: null, handoff: null });
+		expect(result.commandEnv).toEqual({ PI_NATIVES_DIR: null, handoff: "" });
 		expect(result.command).toBe(ownDir);
 		expect(result.spread.PI_NATIVES_DIR).toBeNull();
 		expect(result.spreadOwnHome).toBe(ownDir);
 	}, 120_000);
 
-	it("gives a broker service the bash tool's environment, without a project .env value, and an omp daemon the session's directory", async () => {
+	it("gives a broker service the bash tool's environment, without a project .env value, and the broker and an omp daemon the session's directory", async () => {
 		const printer = path.join(tempRoot, "print-natives-dir.ts");
 		const ownHome = path.join(tempRoot, "own-home");
 		const projectDownloads = path.join(tempRoot, "proj-dl");
+		// An input the agent `.env` sets, which the bash tool's environment keeps: a broker or a
+		// daemon that resolved for itself would name `<agentCache>/omp/natives`.
+		const agentCache = path.join(tempRoot, "agent-cache");
+		await fs.mkdir(path.join(agentCache, "omp"), { recursive: true });
 		// The broker stand-in: reads the specs the session sent, and runs each as the broker does.
 		await Bun.write(
 			path.join(tempRoot, "broker.ts"),
@@ -215,11 +221,11 @@ console.log(JSON.stringify({
 const { managedDaemonEnv } = await import(${JSON.stringify(workerClientTs)});
 const dir = (await import(${JSON.stringify(nativesDirJs)})).getNativesDir();
 const specs = JSON.parse(process.argv[2]);
-console.log(JSON.stringify({ dir, OMP_DOWNLOAD_ROOT: process.env.OMP_DOWNLOAD_ROOT ?? null, service: run(managedDaemonEnv(specs.service)), daemon: run(managedDaemonEnv(specs.daemon)) }));
+console.log(JSON.stringify({ dir, XDG_CACHE_HOME: process.env.XDG_CACHE_HOME ?? null, service: run(managedDaemonEnv(specs.service)), daemon: run(managedDaemonEnv(specs.daemon)) }));
 `,
 		);
 		const { home, result } = await session(
-			`
+			`${helpers(printer)}
 const { initLoaderContext } = await import(${JSON.stringify(loaderStateJs)});
 const first = initLoaderContext({ isCompiledBinary: true }).nativesDir;
 const { filterChildShellEnv } = await import(${JSON.stringify(envTs)});
@@ -232,18 +238,115 @@ delete service.OMP_CONFIG_ROOT;
 const specs = JSON.stringify({ service, daemon: ompDaemonSpecEnv({}) });
 const broker = Bun.spawnSync([process.execPath, "--no-env-file", ${JSON.stringify(path.join(tempRoot, "broker.ts"))}, specs], { env: brokerEnvFromParent({}) });
 if (broker.exitCode !== 0) throw new Error(broker.stderr.toString());
-console.log(JSON.stringify({ first, applied: process.env.OMP_DOWNLOAD_ROOT ?? null, broker: JSON.parse(broker.stdout.toString()) }));
+console.log(JSON.stringify({ first, applied: process.env.OMP_DOWNLOAD_ROOT ?? null, direct: run(service), broker: JSON.parse(broker.stdout.toString()) }));
 `,
-			{ project: `OMP_DOWNLOAD_ROOT=${projectDownloads}\n` },
+			{ agent: `XDG_CACHE_HOME=${agentCache}\n`, project: `OMP_DOWNLOAD_ROOT=${projectDownloads}\n` },
 		);
 		const sessionDir = path.join(home, ".omp", "natives");
 
 		expect(result.first).toBe(sessionDir);
 		// The project `.env` was applied in the session, so a base that kept it would carry it.
 		expect(result.applied).toBe(projectDownloads);
+		// The broker has the agent `.env`'s input, so it names the session's directory only
+		// through its handoff; so does the daemon, through the handoff the broker re-issues.
+		expect(result.broker.XDG_CACHE_HOME).toBe(agentCache);
 		expect(result.broker.dir).toBe(sessionDir);
-		expect(result.broker.service.OMP_DOWNLOAD_ROOT).toBeNull();
-		expect(result.broker.service.dir).toBe(path.join(ownHome, ".omp", "natives"));
 		expect(result.broker.daemon.dir).toBe(sessionDir);
+		// The service gets what the same command run directly gets: the agent `.env`'s input,
+		// not the project `.env`'s.
+		expect(result.direct.dir).toBe(path.join(agentCache, "omp", "natives"));
+		expect(result.broker.service.OMP_DOWNLOAD_ROOT).toBeNull();
+		expect(result.broker.service.dir).toBe(result.direct.dir);
+	}, 120_000);
+
+	it("gives a worker started in a directory whose .env sets an input the session's directory", async () => {
+		// A non-compiled omp starts its workers with Bun's runtime; Bun's own `.env` loading would
+		// apply the worker directory's `.env` before any omp code runs.
+		const elsewhere = path.join(tempRoot, "elsewhere");
+		await Bun.write(
+			path.join(elsewhere, ".env"),
+			`PI_NATIVES_DIR=${path.join(tempRoot, "elsewhere-natives")}\nOMP_DOWNLOAD_ROOT=${path.join(tempRoot, "elsewhere-dl")}\n`,
+		);
+		const workerArg = "__omp_worker_natives_dir_probe";
+		const { home, result } = await session(
+			`
+const { getNativesDir } = await import(${JSON.stringify(nativesDirJs)});
+if (process.argv[2] === ${JSON.stringify(workerArg)}) {
+	// This script is also the worker host, as the CLI is: the worker branch.
+	console.log(JSON.stringify({ dir: getNativesDir(), PI_NATIVES_DIR: process.env.PI_NATIVES_DIR ?? null }));
+	process.exit(0);
+}
+const { initLoaderContext } = await import(${JSON.stringify(loaderStateJs)});
+const first = initLoaderContext({ isCompiledBinary: true }).nativesDir;
+await import(${JSON.stringify(envTs)});
+const { declareWorkerHostEntry } = await import(${JSON.stringify(workerHostTs)});
+const { resolveWorkerSpawnCmd, workerEnvFromParent } = await import(${JSON.stringify(workerClientTs)});
+declareWorkerHostEntry();
+// setProjectDir moves the session into another directory (a cwd move, a session worktree),
+// and a worker of a non-compiled omp starts there.
+process.chdir(${JSON.stringify(elsewhere)});
+const spawn = resolveWorkerSpawnCmd(${JSON.stringify(workerArg)});
+const worker = Bun.spawnSync(spawn.cmd, { cwd: spawn.cwd, env: workerEnvFromParent(), stderr: "pipe" });
+if (worker.exitCode !== 0) throw new Error(worker.stderr.toString());
+console.log(JSON.stringify({ first, cwd: spawn.cwd ?? null, worker: JSON.parse(worker.stdout.toString()) }));
+`,
+			{},
+		);
+		const sessionDir = path.join(home, ".omp", "natives");
+
+		expect(result.first).toBe(sessionDir);
+		expect(result.cwd).toBeNull();
+		expect(result.worker).toEqual({ dir: sessionDir, PI_NATIVES_DIR: null });
+	}, 120_000);
+
+	it("gives a forked session's commands no handoff, though the fork was started with one", async () => {
+		// A fork starts with a handoff that names no parent (the terminal starts it). omp removes
+		// it from process.env at its first call, but the bash tool's native shell starts from the
+		// process's C environment, where it remains.
+		const printer = path.join(tempRoot, "print-natives-dir.ts");
+		const handedOver = path.join(tempRoot, "handed-over");
+		const home = path.join(tempRoot, "home");
+		const project = path.join(tempRoot, "project");
+		await fs.mkdir(project, { recursive: true });
+		await Bun.write(path.join(home, ".omp/agent/.env"), "");
+		await Bun.write(
+			path.join(tempRoot, "fork.ts"),
+			`const { getNativesDir } = await import(${JSON.stringify(nativesDirJs)});
+const dir = getNativesDir();
+const { filterChildShellEnv } = await import(${JSON.stringify(envTs)});
+const { Shell } = await import(${JSON.stringify(nativesIndexJs)});
+// The bash tool's way: the command environment as the session env, and as the run's.
+const env = filterChildShellEnv(Bun.env, ${JSON.stringify(project)});
+const shell = new Shell({ sessionEnv: env });
+let out = "";
+const command = 'echo "handoff=\${__PI_NATIVES_DIR_HANDOFF:+present}"; ' + ${JSON.stringify(`"${process.execPath}" --no-env-file "${printer}"`)};
+await shell.run({ command, cwd: ${JSON.stringify(project)}, env }, (err, chunk) => { if (!err) out += chunk; });
+const [seen, omp] = out.trim().split("\\n");
+console.log(JSON.stringify({ dir, seen, command: JSON.parse(omp) }));
+`,
+		);
+		const forkEnv: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
+		for (const key of DIRECTORY_NAMES) delete forkEnv[key];
+		const { nativesDirHandoff } = await import(nativesDirJs);
+		forkEnv.__PI_NATIVES_DIR_HANDOFF = nativesDirHandoff(forkEnv, { parent: null, dir: handedOver });
+		const child = Bun.spawn([process.execPath, "--no-env-file", path.join(tempRoot, "fork.ts")], {
+			cwd: project,
+			env: forkEnv,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+		const result = JSON.parse(stdout);
+
+		// The fork takes its handoff; a command it runs sees none, and an omp the command starts
+		// resolves its own directory, though its inputs are the fork's.
+		expect(result.dir).toBe(handedOver);
+		expect(result.seen).toBe("handoff=");
+		expect(result.command.dir).toBe(path.join(home, ".omp", "natives"));
 	}, 120_000);
 });

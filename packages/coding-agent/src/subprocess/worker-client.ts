@@ -15,7 +15,7 @@ import {
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
 import { NATIVES_DIR_HANDOFF_ENV_KEY, nativesDirHandoff, nativesDirHandoffDir } from "@oh-my-pi/pi-natives/natives-dir";
-import { filterChildShellEnv, launchEnvValue, stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
+import { bunEnvFileArgs, filterChildShellEnv, launchEnvValue, stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
 import type { Subprocess } from "bun";
 
 /**
@@ -146,19 +146,32 @@ export function resolveExecutablePath(): string {
 }
 
 /**
+ * Bun's own `.env` loading, off for a worker or the launch broker a non-compiled omp starts (a
+ * compiled binary is built with it off). Such a child gets its parent's whole environment, the
+ * values Bun loaded at the parent's start included, and applies omp's own `.env` files itself
+ * (`@oh-my-pi/pi-utils/env`) after it resolves the natives directory; Bun's would apply the
+ * `.env` of whatever directory the child starts in before any omp code runs, so the child would
+ * start with values its parent never gave it, and refuse its parent's natives-directory handoff.
+ */
+const NO_BUN_ENV_FILE = "--no-env-file";
+
+/**
  * Resolve the command that re-enters this CLI's entrypoint: the compiled
  * binary itself, or the runtime plus the declared worker-host entry. Used by
- * the TUI `/restart` relaunch; workers go through {@link resolveWorkerSpawnCmd},
- * whose no-host fallback deliberately differs (cwd-relative entry pinned to the
- * package root for `bun test` IPC). Outside a CLI host this falls back to the
- * absolute path of `src/cli.ts` so the relaunch keeps the caller's cwd.
+ * the TUI `/restart` relaunch and a `/fork` session; workers go through
+ * {@link resolveWorkerSpawnCmd}, whose no-host fallback deliberately differs
+ * (cwd-relative entry pinned to the package root for `bun test` IPC). Outside a
+ * CLI host this falls back to the absolute path of `src/cli.ts` so the relaunch
+ * keeps the caller's cwd. The runtime loads the `.env` files Bun loaded at this
+ * process's start (`bunEnvFileArgs`), not those of the directory it starts in:
+ * `/restart`'s `execvp(3)` passes the environment this process was started with,
+ * which the values Bun loaded are not in.
  */
 export function resolveCliEntryCmd(): string[] {
 	const executable = resolveExecutablePath();
 	if (isCompiledBinary()) return [executable];
-	const hostEntry = workerHostEntry();
-	if (hostEntry) return [executable, hostEntry];
-	return [executable, path.resolve(import.meta.dir, "..", "cli.ts")];
+	const entry = workerHostEntry() ?? path.resolve(import.meta.dir, "..", "cli.ts");
+	return [executable, ...bunEnvFileArgs(), entry];
 }
 
 /**
@@ -177,10 +190,10 @@ export function resolveWorkerSpawnCmd(workerArg: string): WorkerSpawnCommand {
 	if (isCompiledBinary()) return { cmd: [executable, workerArg] };
 	const hostEntry = workerHostEntry();
 	if (hostEntry) {
-		return { cmd: [executable, hostEntry, workerArg] };
+		return { cmd: [executable, NO_BUN_ENV_FILE, hostEntry, workerArg] };
 	}
 	const packageRoot = path.resolve(import.meta.dir, "..", "..");
-	return { cmd: [executable, "src/cli.ts", workerArg], cwd: packageRoot };
+	return { cmd: [executable, NO_BUN_ENV_FILE, "src/cli.ts", workerArg], cwd: packageRoot };
 }
 
 /**
