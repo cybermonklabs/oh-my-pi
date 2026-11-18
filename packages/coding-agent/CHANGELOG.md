@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An extension, plugin, custom tool, hook, custom command or share script under a directory whose path contains `?` now fails at once with an error that names the path and says that Bun cannot load a module from such a path, and that moving the files to another directory fixes it; before, it failed with a bare "Cannot find module …?mtime=…"
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
