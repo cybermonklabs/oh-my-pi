@@ -14,9 +14,9 @@
  * - you want a single durable file at rest (SQLite) without coding directly
  *   against `bun:sqlite`.
  *
- * Tool artifacts and image blobs are out of scope: `ArtifactManager` /
- * `BlobStore` keep writing to `~/.omp/agent/...`. Reach for object storage
- * if you need those off-host too.
+ * Tool artifacts stay out of scope: `ArtifactManager` keeps writing to
+ * `~/.omp/agent/...`. Image blobs a session references also go to
+ * `<table>_blobs`, so a session resumed on another host gets them back.
  */
 
 import { createAgentSession, SessionManager, SqlSessionStorage } from "@oh-my-pi/pi-coding-agent";
@@ -30,12 +30,12 @@ import { SQL } from "bun";
 //   sqlite::memory:                                // ephemeral
 const client = new SQL(process.env.SESSIONS_DB_URL ?? "sqlite::memory:");
 
-// `create()` creates both tables (with the right DDL for the dialect),
+// `create()` creates the session, parts and blob tables (with the right DDL for the dialect),
 // migrates a table an older Oh My Pi created, and warms the in-memory mirror
 // with every existing row.
 const storage = await SqlSessionStorage.create({
 	client,
-	table: "omp_session_files", // optional, this is the default; parts go to `omp_session_files_parts`
+	table: "omp_session_files", // optional, this is the default; parts go to `omp_session_files_parts`, images to `omp_session_files_blobs`
 	// createTable: false,       // set if migrations are owned elsewhere; DDL in docs/session.md
 });
 

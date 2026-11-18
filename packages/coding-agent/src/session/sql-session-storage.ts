@@ -200,8 +200,12 @@ interface DialectQueries {
 	createBlobsTable: string;
 	/** Add a blob row unless its hash has one; answers a row only when it added one (MySQL: `affectedRows`). */
 	insertBlob: Statement;
-	/** The rows of `count` hashes, bound as `@h0` to `@h<count - 1>`. */
+	/** The bytes of `count` hashes' rows, bound as `@h0` to `@h<count - 1>`. */
 	selectBlobs(count: number): Statement;
+	/** The hash and size of `count` hashes' rows, bound as `@h0` to `@h<count - 1>`; reads no content. */
+	selectBlobSizes(count: number): Statement;
+	/** MySQL and MariaDB: the server's `max_allowed_packet`, which bounds the blob an insert can carry. */
+	maxPacket: Statement | undefined;
 	/** The lease table's statements: PostgreSQL and MySQL only; a SQLite claim is an OS lock. */
 	lease: LeaseQueries | undefined;
 }
@@ -389,6 +393,12 @@ interface BlobRow {
 	content: Uint8Array;
 }
 
+/** `selectBlobSizes` row. */
+interface BlobSizeRow {
+	sha256: string;
+	byte_len: number | bigint | string;
+}
+
 const DEFAULT_TABLE = "omp_session_files";
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,56}$/;
 const DEFAULT_LEASE_TABLE = "omp_session_leases";
@@ -511,8 +521,18 @@ const LEASE_WAIT_POLL_MS = 1000;
 const LAPSE_POLL_MS = 50;
 /** Largest part a full write stores; an append stores its line as one part. */
 const PART_BYTES = 1024 * 1024;
-/** Hashes one blob read asks for. */
+/** Hashes one blob size read asks for. */
 const BLOB_READ_BATCH = 100;
+/** Bytes one blob read asks for (a larger blob is read alone), so a read holds at most about this much at a time. */
+const BLOB_READ_BYTES = 16 * 1024 * 1024;
+/** Tries of one blob write before the transcript write waiting for it fails; the blob stays queued for the next. */
+const BLOB_WRITE_ATTEMPTS = 3;
+/** Wait before the second try of a blob write, doubled before each later one. */
+const BLOB_RETRY_MS = 250;
+/** Largest blob the table takes on PostgreSQL and SQLite (both bound one value near 1 GB). */
+const MAX_BLOB_BYTES = 512 * 1024 * 1024;
+/** Room in a MySQL packet for the insert's statement and its other values, beside the blob. */
+const MYSQL_PACKET_HEADROOM = 1024 * 1024;
 const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
 /** How long a SQLite connection waits for another process's write lock, when the client sets no wait itself. */
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
@@ -841,6 +861,21 @@ const PG_TABLE_OBJECTS = statement(
 		"FROM pg_catalog.pg_constraint k WHERE k.confrelid = pg_catalog.to_regclass(@table) AND k.contype = 'f' " +
 		"AND k.conrelid <> k.confrelid",
 );
+/**
+ * The columns of a table's primary key. The blob table's insert names its
+ * `sha256` key in `ON CONFLICT`, which refuses a table without that key.
+ */
+const PG_PRIMARY_KEY = statement(
+	"postgres",
+	"SELECT a.attname::text AS name FROM pg_catalog.pg_index i JOIN pg_catalog.pg_attribute a " +
+		"ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey) " +
+		"WHERE i.indrelid = pg_catalog.to_regclass(@table) AND i.indisprimary",
+);
+/** Whether the store's login may insert into a table, through a grant to it, to PUBLIC or to a role it is a member of. */
+const PG_CAN_INSERT = statement(
+	"postgres",
+	"SELECT pg_catalog.has_table_privilege(pg_catalog.to_regclass(@table), 'INSERT') AS can",
+);
 /** The columns of the store's PostgreSQL tables and their declared types, as `format_type` prints them. */
 const PG_DECLARED_COLUMNS = {
 	session: {
@@ -1118,6 +1153,13 @@ function buildQueries(
 					Array.from({ length: count }, (_unused, index) => `@h${index}`).join(", ") +
 					")",
 			),
+		selectBlobSizes: count =>
+			sql(
+				`SELECT sha256, byte_len FROM ${blobs} WHERE sha256 IN (` +
+					Array.from({ length: count }, (_unused, index) => `@h${index}`).join(", ") +
+					")",
+			),
+		maxPacket: mysql ? sql("SELECT @@max_allowed_packet AS max_packet") : undefined,
 		lease:
 			adapter === "sqlite"
 				? undefined
@@ -1329,7 +1371,6 @@ function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number
  */
 export class SqlSessionStorage extends IndexedSessionStorage {
 	readonly #backend: SqlSessionStorageBackend;
-	readonly #blobTier: SqlBlobTier;
 	/**
 	 * Set only when the store claims sessions (`claims` on a database other
 	 * processes can open): {@link SessionStorage.claimSession}. A claim on
@@ -1350,7 +1391,6 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	private constructor(backend: SqlSessionStorageBackend) {
 		super(backend);
 		this.#backend = backend;
-		this.#blobTier = new SqlBlobTier(backend);
 		if (!backend.claims) return;
 		// The last release of a claim waits for this store's queued writes under it.
 		const settle = (paths: readonly string[]) =>
@@ -1403,7 +1443,7 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 
 	/** {@link SessionStorage.blobTier}: the blob table, `<table>_blobs`. */
 	get blobTier(): SessionBlobTier {
-		return this.#blobTier;
+		return this.#backend.blobs;
 	}
 
 	/**
@@ -1413,7 +1453,8 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	override async drain(): Promise<void> {
 		try {
 			await super.drain();
-			await this.#blobTier.settled();
+			// A blob that still does not land was warned about, and failed the transcript write that named it.
+			await this.#backend.blobs.land().catch(() => undefined);
 		} finally {
 			await this.#backend.releasesSettled();
 		}
@@ -1421,53 +1462,112 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 }
 
 /**
- * {@link SessionBlobTier} over the blob table. Its writes run one after
- * another, so a burst of images (a full rewrite of a session) holds one
- * connection at a time, and a hash this store wrote, found there, or has
- * queued is not sent again; a failed write forgets its hash, so the next
- * persist of that image tries again. Nothing it does fails a session write.
+ * {@link SessionBlobTier} over the blob table. A blob it is handed lands in
+ * a transaction of its own, outside every session's write fence: rows are
+ * keyed by content hash and never change, so a fence would only lose an
+ * image a takeover raced. Every transcript write of the store first waits
+ * for the blobs queued before it ({@link land}), so no committed transcript
+ * names a blob the table lacks, whatever stops the writer. A blob write is
+ * tried {@link BLOB_WRITE_ATTEMPTS} times; one that still fails stays queued
+ * and fails the transcript write waiting for it, which the session reports
+ * as a persistence error, and the next transcript write tries it again.
+ * Writes run one after another, so a burst of images holds one connection
+ * at a time. A blob larger than the server takes is left out, with a warning.
  */
 class SqlBlobTier implements SessionBlobTier {
 	readonly #backend: SqlSessionStorageBackend;
-	readonly #known = new Set<string>();
+	/** Hashes the table holds: written by this store, or found there. */
+	readonly #landed = new Set<string>();
+	/** Hashes larger than the server takes, warned about once. */
+	readonly #tooLarge = new Set<string>();
+	readonly #queued = new Map<string, { data: Buffer; mimeType: string | undefined }>();
 	#tail: Promise<void> = Promise.resolve();
 
 	constructor(backend: SqlSessionStorageBackend) {
 		this.#backend = backend;
 	}
 
-	store(hash: string, data: Buffer, mimeType: string | undefined, sessionPath: string | undefined): void {
-		if (this.#known.has(hash)) return;
-		this.#known.add(hash);
-		this.#tail = this.#tail.then(async () => {
+	store(hash: string, data: Buffer, mimeType: string | undefined): void {
+		if (this.#landed.has(hash) || this.#queued.has(hash) || this.#tooLarge.has(hash)) return;
+		this.#queued.set(hash, { data, mimeType });
+		// Start now, ahead of the transcript write that names it; that write tries a failure again.
+		this.land().catch(() => undefined);
+	}
+
+	/**
+	 * Land every blob queued so far, one after another. Rejects when one does
+	 * not land in {@link BLOB_WRITE_ATTEMPTS} tries; it stays queued.
+	 */
+	land(): Promise<void> {
+		const landing = this.#tail.catch(() => undefined).then(() => this.#landQueued());
+		this.#tail = landing;
+		return landing;
+	}
+
+	async #landQueued(): Promise<void> {
+		for (const [hash, blob] of [...this.#queued]) {
+			if (this.#queued.get(hash) === blob) await this.#landOne(hash, blob.data, blob.mimeType);
+		}
+	}
+
+	async #landOne(hash: string, data: Buffer, mimeType: string | undefined): Promise<void> {
+		for (let attempt = 1; ; attempt++) {
 			try {
-				if (await this.#backend.storeBlob(hash, data, mimeType, sessionPath)) {
+				const limit = await this.#backend.maxBlobBytes();
+				if (data.byteLength > limit) {
+					this.#queued.delete(hash);
+					this.#tooLarge.add(hash);
+					logger.warn(
+						"A session image is larger than the session database takes, so only this machine's blob store keeps it; " +
+							"a session resumed elsewhere shows its reference instead of the image",
+						{ hash, bytes: data.byteLength, limit, mimeType },
+					);
+					return;
+				}
+				const added = await this.#backend.insertBlob(hash, data, mimeType);
+				this.#queued.delete(hash);
+				this.#landed.add(hash);
+				if (added) {
 					logger.info("Stored a session blob in the session database", {
 						hash,
 						bytes: data.byteLength,
 						mimeType,
-						sessionPath,
+						attempts: attempt,
 					});
 				}
+				return;
 			} catch (err) {
-				this.#known.delete(hash);
-				logger.warn("Storing a session blob in the session database failed; it stays in the local blob store", {
-					hash,
-					bytes: data.byteLength,
-					sessionPath,
-					error: toError(err).message,
-				});
+				if (attempt < BLOB_WRITE_ATTEMPTS) {
+					await Bun.sleep(BLOB_RETRY_MS * 2 ** (attempt - 1));
+					continue;
+				}
+				const error = toError(err);
+				logger.warn(
+					"Storing a session blob in the session database failed; the next transcript write tries again",
+					{
+						hash,
+						bytes: data.byteLength,
+						attempts: attempt,
+						error: error.message,
+					},
+				);
+				throw new Error(
+					`SqlSessionStorage: session image ${hash} did not reach ${this.#backend.table}_blobs, ` +
+						`so no transcript naming it is written yet: ${error.message}`,
+					{ cause: error },
+				);
 			}
-		});
+		}
 	}
 
-	read(hashes: readonly string[]): Promise<Map<string, Buffer>> {
-		return this.#backend.readBlobs(hashes);
+	async sizes(hashes: readonly string[]): Promise<Map<string, number>> {
+		const sizes = await this.#backend.blobSizes(hashes);
+		for (const hash of sizes.keys()) this.#landed.add(hash);
+		return sizes;
 	}
 
-	/** Resolves once every write queued so far has finished. */
-	settled(): Promise<void> {
-		return this.#tail;
+	read(hashes: readonly string[], visit: (hash: string, data: Buffer) => Promise<void>): Promise<void> {
+		return this.#backend.readBlobs(hashes, visit);
 	}
 }
 
@@ -1592,6 +1692,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	#mysqlLocks: MysqlLockForm | undefined;
 	/** The version a MySQL-family server reported at start-up, as a refusal names it. */
 	#mysqlVersion = "";
+	/** The largest blob the table takes on this server, once read (see {@link maxBlobBytes}). */
+	#maxBlobBytes: Promise<number> | undefined;
+	/** The blob table's writes and reads; every content write below waits for the blobs queued before it. */
+	readonly blobs: SqlBlobTier = new SqlBlobTier(this);
 
 	constructor(options: SqlSessionStorageOptions) {
 		this.#client = options.client;
@@ -1600,7 +1704,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (!IDENT_RE.test(table)) {
 			throw new Error(
 				`SqlSessionStorage: table name must match ${IDENT_RE.source}, at most 57 characters so ` +
-					`${JSON.stringify(`${table}_parts`)} stays a valid identifier (got ${JSON.stringify(table)})`,
+					`${JSON.stringify(`${table}_parts`)} and ${JSON.stringify(`${table}_blobs`)} stay valid identifiers (got ${JSON.stringify(table)})`,
 			);
 		}
 		const leaseTable = options.leaseTable ?? DEFAULT_LEASE_TABLE;
@@ -2788,8 +2892,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * store's, of its declared built-in type, with no default, generation or
 	 * identity, and no other column may exist: the store's inserts leave every
 	 * other column to its default, which the store cannot vet cheaply, and the
-	 * store reads none of them. Runs whatever `createTable` is; a table that
-	 * does not exist is `#assertSchema`'s to report, or one this store never reads.
+	 * store reads none of them. The blob table must also have its `sha256`
+	 * primary key and let this login insert: every transcript write waits for
+	 * the blobs it names to land there. Runs whatever `createTable` is; a table
+	 * that does not exist is `#assertSchema`'s to report, or one this store never reads.
 	 */
 	async #checkTables(): Promise<void> {
 		if (this.#adapter !== "postgres") return;
@@ -2838,7 +2944,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 						}[object.kind] ?? `${object.kind} ${object.name}`,
 					);
 				}
-				// The lease entry by its role, not its name: a lease table that names another of the three is one table.
+				if (declared === PG_DECLARED_COLUMNS.blobs) {
+					const key = ((await run(executor, PG_PRIMARY_KEY, { table: relation })) as TableObjectRow[]).map(
+						row => row.name,
+					);
+					if (key.join(", ") !== "sha256") {
+						found.push(key.length === 0 ? "no primary key" : `primary key (${key.join(", ")}), not (sha256)`);
+					}
+					const [grant] = (await run(executor, PG_CAN_INSERT, { table: relation })) as Array<{ can: unknown }>;
+					if (grant?.can !== true) found.push("no INSERT privilege for the store's login");
+				}
+				// The lease entry by its role, not its name: a lease table that names another of the four is one table.
 				if (declared === PG_DECLARED_COLUMNS.lease) {
 					const { indexed, nameTakenBy } = await this.#holderIndex(executor);
 					if (nameTakenBy) {
@@ -2854,7 +2970,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (problems.length === 0) return;
 		throw new Error(
 			`SqlSessionStorage: ${problems.join("; ")}. The store starts only on tables as ${SCHEMA_DOCS} gives them, ` +
-				"with nothing else on them that could run code on its writes.",
+				"with nothing else on them that could run code on its writes, and a blob table this login can insert into.",
 		);
 	}
 
@@ -2964,6 +3080,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			title_updated_at: title?.updatedAt ?? null,
 			len: bytes.byteLength,
 		};
+		// The blobs this content names land first (see SqlBlobTier).
+		await this.blobs.land();
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
@@ -3024,6 +3142,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	async append(path: string, line: string, mtimeMs: number, expectedSize?: number): Promise<void> {
 		const values = { path, content: line, mtime: mtimeMs, len: Buffer.byteLength(line, "utf8") };
+		// The blobs this line names land first (see SqlBlobTier).
+		await this.blobs.land();
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
@@ -3042,38 +3162,81 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	/**
 	 * Add the blob row of `hash` unless the table has one, in a transaction of
-	 * its own behind the write fence of `sessionPath`, as a content write of
-	 * that session runs (a session path not yet known writes with no fence).
-	 * Answers whether this call added the row.
+	 * its own under no session's fence: the row is keyed by its content and
+	 * never changes. Answers whether this call added the row.
 	 */
-	async storeBlob(
-		hash: string,
-		data: Uint8Array,
-		mimeType: string | undefined,
-		sessionPath: string | undefined,
-	): Promise<boolean> {
+	async insertBlob(hash: string, data: Uint8Array, mimeType: string | undefined): Promise<boolean> {
 		const values = { sha256: hash, content: data, len: data.byteLength, mime: mimeType ?? null, created: Date.now() };
-		const fences = sessionPath === undefined ? [] : this.#fencesOf([sessionPath]);
-		await this.#awaitClaims(fences);
 		let added = false;
-		await this.#fencedTransaction(fences, async transaction => {
+		await this.#fencedTransaction([], async transaction => {
 			const result = await run(transaction, this.#q.insertBlob, values);
 			added = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
 		});
 		return added;
 	}
 
-	/** The blob rows the table holds for those of `hashes` it has, by hash. */
-	async readBlobs(hashes: readonly string[]): Promise<Map<string, Buffer>> {
-		const found = new Map<string, Buffer>();
+	/**
+	 * The largest blob the table takes on this server: {@link MAX_BLOB_BYTES},
+	 * or less where MySQL's or MariaDB's `max_allowed_packet` is smaller (16 MiB
+	 * by default on MariaDB, 64 MiB on MySQL 8). Read once; a failed read is
+	 * tried again by the next call.
+	 */
+	maxBlobBytes(): Promise<number> {
+		const query = this.#q.maxPacket;
+		if (!query) return Promise.resolve(MAX_BLOB_BYTES);
+		this.#maxBlobBytes ??= this.#exclusive(() => this.#readOne(query, {})).then(
+			rows => {
+				const packet = Number((rows as Array<{ max_packet?: unknown }>)[0]?.max_packet);
+				if (!Number.isFinite(packet) || packet <= 0) {
+					throw new Error("SqlSessionStorage: the server answered no max_allowed_packet");
+				}
+				return Math.min(MAX_BLOB_BYTES, packet - MYSQL_PACKET_HEADROOM);
+			},
+			err => {
+				this.#maxBlobBytes = undefined;
+				throw err;
+			},
+		);
+		return this.#maxBlobBytes;
+	}
+
+	/** Of `hashes`, the ones the table holds, each with its size; reads no blob's bytes. */
+	async blobSizes(hashes: readonly string[]): Promise<Map<string, number>> {
+		const sizes = new Map<string, number>();
 		for (let start = 0; start < hashes.length; start += BLOB_READ_BATCH) {
 			const batch = hashes.slice(start, start + BLOB_READ_BATCH);
 			const values = Object.fromEntries(batch.map((hash, index) => [`h${index}`, hash]));
-			const query = this.#q.selectBlobs(batch.length);
-			const rows = (await this.#exclusive(() => this.#readOne(query, values))) as BlobRow[];
-			for (const row of rows) found.set(row.sha256, Buffer.from(row.content));
+			const query = this.#q.selectBlobSizes(batch.length);
+			const rows = (await this.#exclusive(() => this.#readOne(query, values))) as BlobSizeRow[];
+			for (const row of rows) sizes.set(row.sha256, rowNumber(row.byte_len));
 		}
-		return found;
+		return sizes;
+	}
+
+	/**
+	 * Read the rows of `hashes` the table holds, in batches of at most
+	 * {@link BLOB_READ_BYTES} (a larger blob alone), handing each blob to
+	 * `visit` before the next batch is read, so a read holds one batch.
+	 */
+	async readBlobs(hashes: readonly string[], visit: (hash: string, data: Buffer) => Promise<void>): Promise<void> {
+		let batch: string[] = [];
+		let bytes = 0;
+		const readBatch = async (): Promise<void> => {
+			const values = Object.fromEntries(batch.map((hash, index) => [`h${index}`, hash]));
+			const query = this.#q.selectBlobs(batch.length);
+			batch = [];
+			bytes = 0;
+			const rows = (await this.#exclusive(() => this.#readOne(query, values))) as BlobRow[];
+			for (const row of rows) {
+				await visit(row.sha256, Buffer.from(row.content.buffer, row.content.byteOffset, row.content.byteLength));
+			}
+		};
+		for (const [hash, size] of await this.blobSizes(hashes)) {
+			if (batch.length > 0 && (bytes + size > BLOB_READ_BYTES || batch.length >= BLOB_READ_BATCH)) await readBatch();
+			batch.push(hash);
+			bytes += size;
+		}
+		if (batch.length > 0) await readBatch();
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {

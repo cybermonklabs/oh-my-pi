@@ -2,27 +2,91 @@
  * Under SQL session storage a blob a session references and cannot draw
  * again is kept in `<table>_blobs` as well as in the local blob store, so a
  * session resumed where that store is gone (a new machine, a new pod) gets
- * its images back. Snapcompact frames stay out of the table: their archive's
- * text draws them again.
+ * its images back. A blob lands, outside every session's write fence, before
+ * the transcript write that names it. Snapcompact frames stay out of the
+ * table: their archive's text draws them again.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { loadSessionMessagesReadOnly } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	SqlSessionStorage,
+	type SqlSessionStorageClient,
+	type SqlSessionStorageResult,
+	type SqlSessionStorageTransaction,
+} from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getAgentDir, getBlobsDir, logger, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
-import { LEASE_BACKENDS, type LeaseDb, openLeaseDb, ROW_LEASE_BACKENDS } from "./sql-session-lease-fixture";
+import { SQL } from "bun";
+import {
+	type GatedClient,
+	gatedClient,
+	LEASE_BACKENDS,
+	type LeaseDb,
+	openLeaseDb,
+	ROW_LEASE_BACKENDS,
+	rejection,
+	transcript,
+	until,
+} from "./sql-session-lease-fixture";
 
 const ID = "01a1f400-0000-7000-8000-000000000001";
 /** An image payload long enough for persistence to put it in the blob store. */
 const IMAGE_BYTES = Buffer.alloc(4096, 7);
 const IMAGE = IMAGE_BYTES.toString("base64");
+const IMAGE_HASH = sha256(IMAGE_BYTES);
 const BLOB_REF = /blob:sha256:([0-9a-f]{64})/g;
+/** The statement that writes a blob row, whatever the dialect quotes its table name with. */
+const BLOB_INSERT = /^INSERT INTO \S*_blobs\b/;
+/** A lease whose heartbeat stays out of the way, so the write's fence is what finds another holder. */
+const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 
 function sha256(data: Buffer): string {
 	return new Bun.SHA256().update(data).digest("hex");
+}
+
+function imageTurn(text: string) {
+	return {
+		role: "user" as const,
+		content: [
+			{ type: "text" as const, text },
+			{ type: "image" as const, data: IMAGE, mimeType: "image/png" },
+		],
+		timestamp: 1,
+	};
+}
+
+/** `client`, whose first statement `pattern` matches fails as a reset connection does. */
+function failingOnce(client: SqlSessionStorageClient, pattern: RegExp): SqlSessionStorageClient {
+	let failed = false;
+	const check = (query: string): void => {
+		if (failed || !pattern.test(query)) return;
+		failed = true;
+		throw new Error("Connection reset by peer (injected)");
+	};
+	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
+		async unsafe(query, values) {
+			check(query);
+			return executor.unsafe(query, values);
+		},
+	});
+	return {
+		options: client.options,
+		async unsafe(query, values) {
+			check(query);
+			return client.unsafe(query, values);
+		},
+		transaction: callback => client.transaction(transaction => callback(wrap(transaction))),
+		end: () => client.end?.() ?? Promise.resolve(),
+	};
+}
+
+async function blobHashes(db: LeaseDb): Promise<string[]> {
+	return (await db.sql(`SELECT sha256 FROM ${db.table}_blobs`)).map(row => String(row.sha256)).sort();
 }
 
 function assistant(text: string) {
@@ -165,35 +229,241 @@ describe("session blobs in the SQL session storage", () => {
 				);
 				await resumed.close();
 			});
+
+			it("lands a blob whose first write fails, so a resume elsewhere still gets the image", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const sessionDir = db.dir.join("sessions");
+				const storage = await db.open({ wrap: client => failingOnce(client, BLOB_INSERT) });
+				const manager = SessionManager.create(db.dir.join("project"), sessionDir, storage);
+				const userId = manager.appendMessage(imageTurn("look"));
+				manager.appendMessage(assistant("seen"));
+				await manager.flush();
+				const sessionFile = manager.getSessionFile() ?? "";
+				await manager.close();
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				const resumed = await SessionManager.open(sessionFile, sessionDir, await db.open());
+				expect(imageData(resumed, userId)).toBe(IMAGE);
+				await resumed.close();
+			});
+
+			it("writes back, when a session opens, a blob this machine holds and the table lacks", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const { sessionFile, sessionDir, userId } = await writeSession(db);
+				// A row that never landed: a session written before the table, or by an older omp.
+				await db.sql(`DELETE FROM ${db.table}_blobs`);
+				const reopened = await SessionManager.open(sessionFile, sessionDir, await db.open());
+				reopened.appendMessage(assistant("again"));
+				await reopened.flush();
+				await reopened.close();
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				const resumed = await SessionManager.open(sessionFile, sessionDir, await db.open());
+				expect(imageData(resumed, userId)).toBe(IMAGE);
+				await resumed.close();
+			});
+
+			it("gives the read-only loader an image the local blob store lacks, from the table, and writes nothing back", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const { sessionFile } = await writeSession(db);
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				await db.sql(`DELETE FROM ${db.table}_blobs WHERE sha256 <> @1`, [IMAGE_HASH]);
+
+				const messages = await loadSessionMessagesReadOnly(sessionFile, await db.open());
+				const images = messages.flatMap(message =>
+					message.role === "user" && typeof message.content !== "string"
+						? message.content.filter((block): block is ImageContent => block.type === "image")
+						: [],
+				);
+				expect(images.map(image => image.data)).toEqual([IMAGE]);
+				expect(JSON.stringify(messages)).not.toContain("unavailable here");
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+			});
+
+			it("reads blobs back in batches of at most 16 MiB", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const queries: string[] = [];
+				const storage = await db.open({ wrap: client => recordingClient(client, queries) });
+				const blobs = [1, 2, 3].map(fill => Buffer.alloc(6 * 1024 * 1024, fill));
+				for (const data of blobs) storage.blobTier?.store(sha256(data), data, "image/png");
+				await storage.drain();
+				queries.length = 0;
+
+				const seen: string[] = [];
+				await storage.blobTier?.read(blobs.map(sha256), async (hash, data) => {
+					expect(sha256(data)).toBe(hash);
+					seen.push(hash);
+				});
+				expect(seen.sort()).toEqual(blobs.map(sha256).sort());
+				// 6 + 6 MiB in one read; the third would pass 16 MiB, so it goes in a second.
+				expect(queries.filter(query => query.includes("SELECT sha256, content FROM"))).toHaveLength(2);
+			});
 		});
 	}
 
 	for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 		describe.skipIf(!url)(adapter, () => {
-			it("writes a blob behind its session's fence: another holder's fresh lease refuses it with a warning, its holder writes it", async () => {
+			it("writes no transcript naming an image before its blob's row commits", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
-				const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-18T00-00-00-000Z_${ID}.jsonl`);
-				const holder = await db.open();
-				expect(await holder.acquireSessionClaim?.(ID, file)).toBeFunction();
-				const other = await db.open();
-				const data = Buffer.from("an image of the held session");
-				const hash = sha256(data);
-				const warn = vi.spyOn(logger, "warn");
+				let gate: GatedClient | undefined;
+				const storage = await db.open({
+					wrap: client => {
+						gate = gatedClient(client, BLOB_INSERT);
+						return gate.client;
+					},
+				});
+				const manager = SessionManager.create(db.dir.join("project"), db.dir.join("sessions"), storage);
+				manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
+				manager.appendMessage(assistant("seen"));
+				await manager.flush();
+				const sessionFile = manager.getSessionFile() ?? "";
 
-				other.blobTier.store(hash, data, "image/png", file);
-				await other.drain();
-				expect(await db.sql(`SELECT sha256 FROM ${db.table}_blobs`)).toEqual([]);
-				expect(warn).toHaveBeenCalledWith(
-					expect.stringContaining("Storing a session blob in the session database failed"),
-					expect.objectContaining({ hash, sessionPath: file }),
-				);
+				gate?.close();
+				manager.appendMessage(imageTurn("look"));
+				await gate?.paused();
+				const flushing = manager.flush();
+				// A real wait: what must not happen is a commit on the database server, which
+				// no fake clock reaches. Without the barrier the line commits well within it.
+				await Bun.sleep(500);
+				// The blob's row is inserted, not committed: the line naming it waits.
+				expect((await db.row(sessionFile))?.content ?? "").not.toContain(IMAGE_HASH);
+				expect(await blobHashes(db)).toEqual([]);
 
-				holder.blobTier.store(hash, data, "image/png", file);
-				await holder.drain();
-				expect((await db.sql(`SELECT sha256 FROM ${db.table}_blobs`)).map(row => String(row.sha256))).toEqual([
-					hash,
-				]);
+				gate?.open();
+				await flushing;
+				expect((await db.row(sessionFile))?.content ?? "").toContain(IMAGE_HASH);
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+				await manager.close();
 			});
+
+			it("lands an image's blob when another holder took the session over, and the sibling the session moves to resumes with it", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open({ lease: STILL });
+				const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-18T00-00-00-000Z_${ID}.jsonl`);
+				await storage.writeText(file, transcript(ID, "before"));
+				await storage.drain();
+				const manager = await SessionManager.open(file, path.dirname(file), storage, { suppressBreadcrumb: true });
+				await manager.claimOpenedSession();
+				await manager.flush();
+
+				// Another holder takes the session over; this store finds it at its next write's fence.
+				await db.sql(`UPDATE ${db.leaseTable} SET holder = 'another-holder' WHERE session_id = @1`, [ID]);
+				manager.appendMessage(imageTurn("look"));
+				await until(() => manager.getSessionId() !== ID);
+				await manager.flush();
+				const sibling = manager.getSessionFile() ?? "";
+				await manager.close();
+				expect(sibling).not.toBe(file);
+				expect((await db.row(sibling))?.content ?? "").toContain(IMAGE_HASH);
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				const resumed = await SessionManager.open(sibling, path.dirname(sibling), await db.open({ lease: STILL }));
+				const images = resumed
+					.getEntries()
+					.flatMap(entry =>
+						entry.type === "message" && entry.message.role === "user" && typeof entry.message.content !== "string"
+							? entry.message.content.filter((block): block is ImageContent => block.type === "image")
+							: [],
+					);
+				expect(images.map(image => image.data)).toEqual([IMAGE]);
+				await resumed.close();
+			});
+
+			it.skipIf(adapter !== "postgres")(
+				"refuses to start on a blob table it cannot write: a column of another type, no primary key, no INSERT grant",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					await (await db.open()).drain();
+					const blobs = `${db.table}_blobs`;
+					const refusal = async () => String(await rejection(db.open({ createTable: false })));
+
+					await db.sql(`ALTER TABLE ${blobs} ALTER COLUMN mime_type TYPE varchar(100)`);
+					expect(await refusal()).toContain("column mime_type of type character varying(100), not text");
+					await db.sql(`ALTER TABLE ${blobs} ALTER COLUMN mime_type TYPE text`);
+					await db.sql(`ALTER TABLE ${blobs} DROP CONSTRAINT ${blobs}_pkey`);
+					expect(await refusal()).toContain("no primary key");
+					await db.sql(`ALTER TABLE ${blobs} ADD PRIMARY KEY (sha256)`);
+
+					// A login with row access to the other tables, and only SELECT on the blob table.
+					const role = `blob_reader_${process.pid}`;
+					const others = `${db.table}, ${db.table}_parts, ${db.leaseTable}`;
+					await db.sql(`CREATE ROLE ${role} LOGIN`);
+					const client = new SQL(Object.assign(new URL(db.dsn), { username: role }).toString());
+					try {
+						await db.sql(`GRANT USAGE ON SCHEMA public TO ${role}`);
+						await db.sql(`GRANT SELECT, INSERT, UPDATE, DELETE ON ${others} TO ${role}`);
+						await db.sql(`GRANT SELECT ON ${blobs} TO ${role}`);
+						const refused = String(
+							await rejection(
+								SqlSessionStorage.create({ client, table: db.table, createTable: false, claims: false }),
+							),
+						);
+						expect(refused).toContain("no INSERT privilege for the store's login");
+					} finally {
+						await client.end();
+						await db.sql(`REVOKE ALL ON ${others}, ${blobs} FROM ${role}`);
+						await db.sql(`REVOKE ALL ON SCHEMA public FROM ${role}`);
+						await db.sql(`DROP ROLE IF EXISTS ${role}`);
+					}
+				},
+			);
 		});
 	}
+
+	it("leaves out, with a warning, a blob larger than a MySQL server's max_allowed_packet takes, and stores one that fits", async () => {
+		const MIB = 1024 * 1024;
+		const inserted: unknown[] = [];
+		const columns = ["path", "content", "mtime_ms", "title", "title_source", "title_updated_at", "byte_len"];
+		const answer = (sql: string, values: unknown[] | undefined): SqlSessionStorageResult => {
+			if (sql.includes(" AS column_name FROM ")) return columns.map(column_name => ({ column_name }));
+			if (sql === "SELECT VERSION() AS version") return [{ version: "8.4.13" }];
+			if (sql.startsWith("SELECT @@max_allowed_packet")) return [{ max_packet: 2 * MIB }];
+			if (BLOB_INSERT.test(sql)) {
+				inserted.push(values?.[0]);
+				return Object.assign([], { affectedRows: 1 });
+			}
+			return [];
+		};
+		const executor: SqlSessionStorageTransaction = { unsafe: async (sql, values) => answer(sql, values) };
+		const client: SqlSessionStorageClient = {
+			options: { adapter: "mysql" },
+			unsafe: executor.unsafe,
+			transaction: callback => callback(executor),
+		};
+		const storage = await SqlSessionStorage.create({ client, claims: false });
+		const warn = vi.spyOn(logger, "warn");
+		const large = Buffer.alloc(1.5 * MIB, 1);
+		const small = Buffer.alloc(MIB / 4, 2);
+
+		storage.blobTier.store(sha256(large), large, "image/png");
+		storage.blobTier.store(sha256(small), small, "image/png");
+		await storage.drain();
+		expect(inserted).toEqual([sha256(small)]);
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining("larger than the session database takes"),
+			expect.objectContaining({ hash: sha256(large), bytes: large.byteLength, limit: MIB }),
+		);
+	});
 });
+
+/** `client`, recording every statement it sends in `queries`. */
+function recordingClient(client: SqlSessionStorageClient, queries: string[]): SqlSessionStorageClient {
+	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
+		unsafe(query, values) {
+			queries.push(query);
+			return executor.unsafe(query, values);
+		},
+	});
+	return {
+		options: client.options,
+		unsafe(query, values) {
+			queries.push(query);
+			return client.unsafe(query, values);
+		},
+		transaction: callback => client.transaction(transaction => callback(wrap(transaction))),
+		end: () => client.end?.() ?? Promise.resolve(),
+	};
+}

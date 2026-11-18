@@ -1278,6 +1278,8 @@ const NON_OWNER_STARTUP: readonly RegExp[] = [
 	/^SELECT path, mtime_ms, byte_len, title, title_source, title_updated_at FROM /,
 	/^SELECT a\.attname AS name, pg_catalog\.format_type\(/,
 	/^SELECT 'trigger' AS kind, /,
+	/^SELECT a\.attname::text AS name FROM pg_catalog\.pg_index i /,
+	/^SELECT pg_catalog\.has_table_privilege\(/,
 	// MySQL: whether the server has NOWAIT locking reads.
 	/^SELECT VERSION\(\) AS version$/,
 	// MySQL and MariaDB: the lock form the version picked, once, matching no row (a read a row grant allows).

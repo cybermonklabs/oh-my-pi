@@ -185,38 +185,31 @@ function ensureDisplayPathSync(blobPath: string, displayPath: string, data: Buff
  */
 export interface SessionBlobTier {
 	/**
-	 * Queue `data` (its SHA-256 `hash`) for the tier, written under the write
-	 * fence of `sessionPath` (none when it is unset). A failed write only warns.
+	 * Queue `data` (its SHA-256 `hash`) for the tier. It lands before any
+	 * transcript write the storage starts afterwards, so no transcript the tier's
+	 * storage holds names a blob the tier lacks; a blob larger than the tier
+	 * takes is left out, with a warning.
 	 */
-	store(hash: string, data: Buffer, mimeType: string | undefined, sessionPath: string | undefined): void;
-	/** The bytes the tier holds for those of `hashes` it has, keyed by hash. */
-	read(hashes: readonly string[]): Promise<Map<string, Buffer>>;
-}
-
-/** A {@link BlobStore}'s tier, and the session file a write to it is fenced under. */
-export interface BlobStoreTier {
-	readonly tier: SessionBlobTier;
-	readonly sessionPath: () => string | undefined;
+	store(hash: string, data: Buffer, mimeType: string | undefined): void;
+	/** Of `hashes`, the ones the tier holds, each with its size in bytes. */
+	sizes(hashes: readonly string[]): Promise<Map<string, number>>;
+	/**
+	 * Read the tier's bytes of `hashes` in batches bounded by bytes, handing each
+	 * blob to `visit` before the next batch is read.
+	 */
+	read(hashes: readonly string[], visit: (hash: string, data: Buffer) => Promise<void>): Promise<void>;
 }
 
 export class BlobStore {
-	readonly #tier: BlobStoreTier | undefined;
-
 	constructor(
 		readonly dir: string,
-		tier?: BlobStoreTier,
-	) {
-		this.#tier = tier;
-	}
+		/** The tier behind this store, if it has one. */
+		readonly tier?: SessionBlobTier,
+	) {}
 
-	/** The tier behind this store, if it has one. */
-	get tier(): SessionBlobTier | undefined {
-		return this.#tier?.tier;
-	}
-
-	/** Hand `data`, stored here under `hash`, to the tier for the session this store writes; no-op without a tier. */
+	/** Hand `data`, stored here under `hash`, to the tier; no-op without a tier. */
 	mirror(hash: string, data: Buffer, mimeType: string | undefined): void {
-		this.#tier?.tier.store(hash, data, mimeType, this.#tier.sessionPath());
+		this.tier?.store(hash, data, mimeType);
 	}
 
 	/**

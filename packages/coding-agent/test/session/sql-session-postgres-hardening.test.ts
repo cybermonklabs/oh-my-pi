@@ -132,6 +132,9 @@ function recordingPostgres(sent: Sent[], server: FakeServer = {}): SqlSessionSto
 			}));
 		}
 		if (sql.startsWith("SELECT 'trigger' AS kind")) return server.plantedObjects ?? [];
+		// The blob table's primary key, and the INSERT grant the store's login holds on it.
+		if (sql.startsWith("SELECT a.attname::text AS name FROM pg_catalog.pg_index i")) return [{ name: "sha256" }];
+		if (sql.startsWith("SELECT pg_catalog.has_table_privilege(")) return [{ can: true }];
 		if (sql.startsWith("SELECT i.indexrelid::text AS oid FROM pg_catalog.pg_index i")) {
 			return holderIndex() ? [{ oid: "1" }] : [];
 		}

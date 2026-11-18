@@ -112,8 +112,9 @@ const externalizedImageRefs = new WeakMap<BlobStore, WeakMap<object, Externalize
 
 /**
  * Externalize one image payload, once per live payload object. `mirror`
- * also hands it to the blob store's tier; a snapcompact frame never goes
- * there, since its archive's text draws it again.
+ * also hands it to the blob store's tier, which keeps it until it lands, so
+ * this once-per-object cache never drops a write; a snapcompact frame never
+ * goes there, since its archive's text draws it again.
  */
 function externalizeImagePayloadSync(
 	blobStore: BlobStore,
