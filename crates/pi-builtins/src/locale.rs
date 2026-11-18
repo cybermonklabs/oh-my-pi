@@ -45,16 +45,7 @@ pub(crate) fn codeset_is_utf8(name: &str) -> bool {
 /// Whether the shell's `LC_CTYPE` is a UTF-8 locale the system can load: the
 /// multibyte character rules GNU utilities switch on after `setlocale`.
 pub(crate) fn ctype_is_utf8(host: &Host) -> bool {
-	ctype_is_utf8_in(|key| host.var(key))
-}
-
-/// [`ctype_is_utf8`] for the environment `var` reads (`LC_ALL`, `LC_CTYPE`,
-/// `LANG`).
-fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
-	let Some(name) = ["LC_ALL", "LC_CTYPE", "LANG"]
-		.into_iter()
-		.find_map(|key| var(key).filter(|value| !value.is_empty()))
-	else {
+	let Some(name) = shell_locale(host, "LC_CTYPE") else {
 		return false;
 	};
 	#[cfg(unix)]
@@ -64,16 +55,70 @@ fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
 	codeset_is_utf8(name)
 }
 
+/// The categories a GNU utility's `setlocale(LC_ALL, "")` loads, by the
+/// variable that names each and its `newlocale` mask: the six POSIX ones
+/// and, with glibc, the six it adds.
+#[cfg(unix)]
+const SETLOCALE_CATEGORIES: &[(&str, libc::c_int)] = &[
+	("LC_CTYPE", libc::LC_CTYPE_MASK),
+	("LC_NUMERIC", libc::LC_NUMERIC_MASK),
+	("LC_TIME", libc::LC_TIME_MASK),
+	("LC_COLLATE", libc::LC_COLLATE_MASK),
+	("LC_MONETARY", libc::LC_MONETARY_MASK),
+	("LC_MESSAGES", libc::LC_MESSAGES_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_PAPER", libc::LC_PAPER_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_NAME", libc::LC_NAME_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_ADDRESS", libc::LC_ADDRESS_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_TELEPHONE", libc::LC_TELEPHONE_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_MEASUREMENT", libc::LC_MEASUREMENT_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_IDENTIFICATION", libc::LC_IDENTIFICATION_MASK),
+];
+
+/// Whether a GNU utility started with the environment `var` reads would run
+/// with a UTF-8 `LC_CTYPE`, for a caller with no [`Host`] (pi-shell's
+/// `timeout` and `nohup`; a caller with one asks [`ctype_is_utf8`]).
+///
+/// The utility's `setlocale(LC_ALL, "")` takes each category from `LC_ALL`,
+/// then the category's own variable, then `LANG`, and fails as a whole when
+/// any one of them does not load, leaving the C locale: coreutils 9.4
+/// quotes `'…'` under `LC_CTYPE=C.UTF-8 LC_TIME=xx_YY.UTF-8` (no such
+/// locale). Otherwise the answer is whether the `LC_CTYPE` name has a UTF-8
+/// codeset.
+pub fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
+	let named = |category: &str| {
+		["LC_ALL", category, "LANG"]
+			.into_iter()
+			.find_map(|key| var(key).filter(|value| !value.is_empty()))
+	};
+	let Some(ctype) = named("LC_CTYPE") else {
+		return false;
+	};
+	#[cfg(unix)]
+	if !SETLOCALE_CATEGORIES
+		.iter()
+		.all(|&(category, mask)| named(category).is_none_or(|name| locale_loadable(name, mask)))
+	{
+		return false;
+	}
+	codeset_is_utf8(ctype)
+}
+
 /// `name` quoted for a diagnostic as GNU's `quote` (quotearg's
-/// `locale_quoting_style`) quotes it in the locale `var` reads (`LC_ALL`,
-/// `LC_CTYPE`, `LANG`), as coreutils' `env` and `timeout` and findutils'
-/// `find` print a command they could not run: `‘name’` in a UTF-8 locale
-/// the system can load, `'name'` otherwise (the C locale, where a `'` in the
+/// `locale_quoting_style`) quotes it, `utf8` being whether the utility's
+/// `LC_CTYPE` is UTF-8 ([`ctype_is_utf8`] for a caller with a [`Host`],
+/// [`ctype_is_utf8_in`] for one with an environment), as coreutils' `env`
+/// and `timeout` and findutils' `find` print a command they could not run:
+/// `‘name’` in UTF-8, `'name'` otherwise (the C locale, where a `'` in the
 /// name is `\'`). A backslash is `\\`; a character that is not printable in
 /// the locale is a C escape (`\t`, `\n`, …) or the octal escapes of its
 /// bytes (`\303\251` for `é` in the C locale).
-pub fn gnu_quote<'v>(var: impl Fn(&str) -> Option<&'v str>, name: &str) -> String {
-	let utf8 = ctype_is_utf8_in(var);
+pub fn gnu_quote(utf8: bool, name: &str) -> String {
 	let (open, close) = if utf8 { ('‘', '’') } else { ('\'', '\'') };
 	let mut out = String::with_capacity(name.len() + 2);
 	out.push(open);
@@ -90,14 +135,13 @@ pub fn gnu_quote<'v>(var: impl Fn(&str) -> Option<&'v str>, name: &str) -> Strin
 }
 
 /// `name` quoted as GNU's `quoteaf` (quotearg's
-/// `shell_escape_always_quoting_style`) quotes it in the locale `var`
-/// reads, as coreutils' `nohup` prints a command it could not run: a word
-/// a shell reads back as `name`. `'name'`, with a `'` as `'\''` and a
+/// `shell_escape_always_quoting_style`) quotes it, `utf8` as for
+/// [`gnu_quote`], as coreutils' `nohup` prints a command it could not run:
+/// a word a shell reads back as `name`. `'name'`, with a `'` as `'\''` and a
 /// character not printable in the locale as `$'\t'`, `$'\303\251'`, …;
 /// but `"name"` for a name holding a `'` whose characters are all safe in
 /// both C and shell double quotes (`"it's"`).
-pub fn gnu_quote_shell<'v>(var: impl Fn(&str) -> Option<&'v str>, name: &str) -> String {
-	let utf8 = ctype_is_utf8_in(var);
+pub fn gnu_quote_shell(utf8: bool, name: &str) -> String {
 	let safe = |c: char| {
 		c.is_ascii_alphanumeric() || "%+,-./:]_@'".contains(c) || (!c.is_ascii() && printable(c, utf8))
 	};
@@ -306,7 +350,7 @@ pub(crate) fn numeric_symbols(host: &Host) -> NumericSymbols {
 
 #[cfg(all(test, unix))]
 mod tests {
-	use super::{gnu_quote, gnu_quote_shell};
+	use super::{ctype_is_utf8_in, gnu_quote, gnu_quote_shell};
 
 	/// `quote` and `quoteaf` as coreutils 9.4 prints a command it could not
 	/// run, measured with `/usr/bin/timeout 5 NAME` and `/usr/bin/nohup NAME`
@@ -326,12 +370,41 @@ mod tests {
 			("n\nl", "'n\\nl'", "‘n\\nl’", "'n'$'\\n''l'", "'n'$'\\n''l'"),
 			("é", "'\\303\\251'", "‘é’", "''$'\\303\\251'", "'é'"),
 		];
-		let c = |key: &str| (key == "LC_ALL").then_some("C");
-		let utf8 = |key: &str| (key == "LC_ALL").then_some("C.UTF-8");
 		for (name, quote_c, quote_utf8, shell_c, shell_utf8) in cases {
-			let got = (gnu_quote(c, name), gnu_quote(utf8, name), gnu_quote_shell(c, name), gnu_quote_shell(utf8, name));
+			let got = (
+				gnu_quote(false, name),
+				gnu_quote(true, name),
+				gnu_quote_shell(false, name),
+				gnu_quote_shell(true, name),
+			);
 			let want = (quote_c.to_owned(), quote_utf8.to_owned(), shell_c.to_owned(), shell_utf8.to_owned());
 			assert_eq!(got, want, "{name:?}");
+		}
+	}
+
+	/// The environment's `LC_CTYPE` is UTF-8 for a GNU utility only when its
+	/// `setlocale(LC_ALL, "")` succeeds: every category's locale loads, else
+	/// the utility stays in C. Measured with coreutils 9.4 (`timeout`, `env`,
+	/// `nohup`) and findutils 4.9.0 (`find`): `LC_CTYPE=C.UTF-8` alone quotes
+	/// `‘…’`, and so does `LC_ALL=C.UTF-8` with a missing `LC_TIME` (`LC_ALL`
+	/// names every category); but `'…'` once `LC_TIME`, `LC_MESSAGES` or
+	/// `LC_COLLATE` names a locale that does not exist, or `LANG` does and
+	/// so stands for the categories left unnamed.
+	#[test]
+	fn a_category_that_does_not_load_leaves_the_c_locale() {
+		const MISSING: &str = "xx_YY.UTF-8";
+		let cases: [(&[(&str, &str)], bool); 7] = [
+			(&[("LC_CTYPE", "C.UTF-8")], true),
+			(&[("LC_ALL", "C.UTF-8"), ("LC_TIME", MISSING)], true),
+			(&[("LC_CTYPE", "C.UTF-8"), ("LC_TIME", MISSING)], false),
+			(&[("LC_CTYPE", "C.UTF-8"), ("LC_MESSAGES", MISSING)], false),
+			(&[("LANG", "C.UTF-8"), ("LC_COLLATE", MISSING)], false),
+			(&[("LANG", MISSING), ("LC_CTYPE", "C.UTF-8")], false),
+			(&[("LC_ALL", ""), ("LC_CTYPE", "C.UTF-8"), ("LC_TIME", "C")], true),
+		];
+		for (env, utf8) in cases {
+			let var = |key: &str| env.iter().find(|(name, _)| *name == key).map(|(_, value)| *value);
+			assert_eq!(ctype_is_utf8_in(var), utf8, "{env:?}");
 		}
 	}
 }

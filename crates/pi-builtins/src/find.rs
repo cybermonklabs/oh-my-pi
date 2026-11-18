@@ -764,7 +764,7 @@ pub mod matchers {
 		/// find quotes it.
 		fn too_long_alone(matcher_io: &mut MatcherIO<'_>, executable: &str, error: &std::io::Error) {
 			let host = matcher_io.host();
-			let name = crate::locale::gnu_quote(|key| host.var(key), executable);
+			let name = crate::locale::gnu_quote(crate::locale::ctype_is_utf8(host), executable);
 			let text = crate::host::run_strerror(error);
 			let _ = writeln!(&mut host.stderr, "find: {name}: {text}");
 		}
@@ -4910,7 +4910,8 @@ pub mod matchers {
 								let newer_time_type = NewerOptionType::from_str(x_option.as_str());
 								// Convert args to unix timestamps. (expressed in numeric types)
 								let Some(comparable_time) = parse_date_str_to_timestamps(time) else {
-									let quoted = crate::locale::gnu_quote(|key| host.var(key), args[i + 1]);
+									let utf8 = crate::locale::ctype_is_utf8(host);
+									let quoted = crate::locale::gnu_quote(utf8, args[i + 1]);
 									return Err(From::from(format!(
 										"find: I cannot figure out how to interpret {quoted} as a date or time"
 									)));

@@ -585,7 +585,7 @@ impl Run<'_> {
 					},
 					_ => (EXIT_CANNOT_INVOKE, strip_errno(&error)),
 				};
-				let name = gnu_quote(|key| self.host.var(key), &String::from_utf8_lossy(&program));
+				let name = gnu_quote(self.utf8, &String::from_utf8_lossy(&program));
 				self.error(&format!("{name}: {text}"));
 				if code == EXIT_ENOENT && program.iter().any(|byte| C_ISSPACE_CHARS.contains(byte)) {
 					self.error("use -[v]S to pass options in shebang lines");

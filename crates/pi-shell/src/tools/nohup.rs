@@ -126,13 +126,13 @@ impl Nohup {
 			// coreutils' words and status (126; 127 when nothing is found).
 			if !std::mem::replace(&mut self.reported, true) {
 				let env = &self.call.env;
-				let name = pi_builtins::extras::gnu_quote_shell(
-					|var| {
-						env.get(var.as_bytes())
-							.and_then(|value| value.to_str().ok())
-					},
-					&self.name.to_str_lossy(),
-				);
+				// The call's environment, as coreutils' `setlocale(LC_ALL, "")`
+				// reads it.
+				let utf8 = pi_builtins::extras::ctype_is_utf8_in(|var| {
+					env.get(var.as_bytes())
+						.and_then(|value| value.to_str().ok())
+				});
+				let name = pi_builtins::extras::gnu_quote_shell(utf8, &self.name.to_str_lossy());
 				self
 					.out
 					.push(2, format!("nohup: failed to run command {name}: {text}\n"));

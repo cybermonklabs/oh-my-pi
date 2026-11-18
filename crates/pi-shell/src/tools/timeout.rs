@@ -399,13 +399,13 @@ impl Timeout {
 		}
 		if let Some((status, text)) = self.child.cannot_run(&self.call) {
 			let env = &self.call.env;
-			let name = pi_builtins::extras::gnu_quote(
-				|var| {
-					env.get(var.as_bytes())
-						.and_then(|value| value.to_str().ok())
-				},
-				&opts.command[0].to_str_lossy(),
-			);
+			// The call's environment, as coreutils' `setlocale(LC_ALL, "")` reads
+			// it.
+			let utf8 = pi_builtins::extras::ctype_is_utf8_in(|var| {
+				env.get(var.as_bytes())
+					.and_then(|value| value.to_str().ok())
+			});
+			let name = pi_builtins::extras::gnu_quote(utf8, &opts.command[0].to_str_lossy());
 			self
 				.out
 				.push(2, format!("timeout: failed to run command {name}: {text}\n"));

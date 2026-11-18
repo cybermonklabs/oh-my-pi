@@ -1031,6 +1031,42 @@ async fn wrappers_quote_a_name_they_cannot_run_as_coreutils() {
 	}
 }
 
+/// A locale environment whose `LC_CTYPE` loads but another category does
+/// not (`xx_YY.UTF-8` exists nowhere): coreutils' `setlocale(LC_ALL, "")`
+/// fails as a whole and leaves C, so `timeout` and `nohup` quote as in C
+/// (`'it\'s'`, octal escapes for `é`), compared live with coreutils 9.4.
+/// `LC_ALL` is empty, so each category is read from its own variable, then
+/// `LANG`; the last case names the missing locale in `LANG`, for every
+/// category left unnamed.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_and_nohup_quote_in_c_when_a_category_does_not_load() {
+	const MISSING: &str = "xx_YY.UTF-8";
+	let dir = tempfile::tempdir().unwrap();
+	let cases: [&[(&str, &str)]; 3] = [
+		&[("LC_CTYPE", "C.UTF-8"), ("LC_TIME", MISSING)],
+		&[("LC_CTYPE", "C.UTF-8"), ("LC_MESSAGES", MISSING)],
+		&[("LANG", MISSING), ("LC_CTYPE", "C.UTF-8")],
+	];
+	// The reference itself falls back to C here, so the comparison below is
+	// about this case and not one where both print UTF-8 quotes.
+	let gnu = std::process::Command::new("/usr/bin/timeout")
+		.args(["5", "it's"])
+		.env("LC_ALL", "")
+		.envs(cases[0].iter().copied())
+		.output()
+		.unwrap();
+	let said = String::from_utf8_lossy(&gnu.stderr);
+	assert!(said.contains("command 'it\\'s'"), "coreutils' own quoting: {said}");
+	for env in cases {
+		for name in ["it's", "é", "plain"] {
+			for wrapper in ["timeout 5", "nohup"] {
+				assert_wrapper_as_gnu(dir.path(), wrapper, name, "", env).await;
+			}
+		}
+	}
+}
+
 /// `timeout` and `nohup` find a command as the shell does: a file that
 /// cannot be run earlier on `PATH` is passed over for one that can, and a
 /// name the shell's hash table holds runs from it (where coreutils, which
