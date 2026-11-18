@@ -1510,7 +1510,7 @@ export class ModelRegistry {
 	*#cachedBaseModelSteps(providerFilter?: ReadonlySet<string>): Generator<void, Model<Api>[], undefined> {
 		const cachedStandardModels = this.#getCachedStandardModels(providerFilter);
 		yield;
-		const loadedBuiltInModels = this.#loadBuiltInModels(this.#providerOverrides, providerFilter);
+		const loadedBuiltInModels = yield* this.#builtInModelSteps(this.#providerOverrides, providerFilter);
 		let builtInModels = yield* this.#hardcodedModelPolicySteps(loadedBuiltInModels);
 		if (this.#cachedAuthoritativeProviders.size > 0) {
 			builtInModels = dropProviderModels(builtInModels, this.#cachedAuthoritativeProviders, { kind: "chat" });
@@ -1591,20 +1591,39 @@ export class ModelRegistry {
 	/** Load built-in models, applying provider-level overrides only.
 	 *  Per-model overrides are applied later by #applyModelOverrides. */
 	#loadBuiltInModels(overrides: Map<string, ProviderOverride>, providerFilter?: ReadonlySet<string>): Model<Api>[] {
-		return getBundledProviders().flatMap(provider => {
-			if (providerFilter && !providerFilter.has(provider)) return [];
+		return runToCompletion(this.#builtInModelSteps(overrides, providerFilter));
+	}
+
+	/**
+	 * {@link #loadBuiltInModels} with one slice unit per model that a provider
+	 * override rebuilds: an override on a large catalog rebuilds every model
+	 * through the rule cascade.
+	 */
+	*#builtInModelSteps(
+		overrides: Map<string, ProviderOverride>,
+		providerFilter?: ReadonlySet<string>,
+	): Generator<void, Model<Api>[], undefined> {
+		const out: Model<Api>[] = [];
+		for (const provider of getBundledProviders()) {
+			if (providerFilter && !providerFilter.has(provider)) continue;
 			const models = getBundledModels(provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[];
 			const providerOverride = overrides.get(provider);
-
-			return models.map(m => {
-				if (!providerOverride) return m;
+			if (!providerOverride) {
+				out.push(...models);
+				continue;
+			}
+			for (const m of models) {
+				yield;
 				const withTransportOverride = this.#applyProviderTransportOverride(toModelSpec(m), providerOverride);
-				return buildModel({
-					...withTransportOverride,
-					compat: mergeCompat(m.compatConfig, providerOverride.compat),
-				} as ModelSpec<Api>);
-			});
-		});
+				out.push(
+					buildModel({
+						...withTransportOverride,
+						compat: mergeCompat(m.compatConfig, providerOverride.compat),
+					} as ModelSpec<Api>),
+				);
+			}
+		}
+		return out;
 	}
 
 	#mergeResolvedModels(baseModels: Model<Api>[], replacementModels: Model<Api>[]): Model<Api>[] {
