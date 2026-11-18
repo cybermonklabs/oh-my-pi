@@ -2195,16 +2195,20 @@ describe("model cache materialized round trip", () => {
 			const dbPath = path.join(tempDir, "models.db");
 			const providerId = "start-order-test";
 			const { promise: lateFetchMayResolve, resolve: letLateFetchResolve } = Promise.withResolvers<void>();
+			const { promise: lateFetchCalled, resolve: markLateFetchCalled } = Promise.withResolvers<void>();
 			const storedIds = () => readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id);
 			try {
 				// The first refresh starts and its fetch waits.
 				const first = refresh(dbPath, providerId, 1_000_000, {
 					endpoint: async () => {
+						markLateFetchCalled();
 						await lateFetchMayResolve;
 						return specs("late", 1, providerId);
 					},
 				});
-				// A later refresh fetches and writes without waiting for it.
+				// Once the first refresh is inside its fetch (past any turn taken before the fetch), a later
+				// refresh fetches and writes without waiting for it.
+				await lateFetchCalled;
 				await refresh(dbPath, providerId, 1_100_000, { endpoint: async () => specs("early", 1, providerId) });
 				expect(storedIds()).toEqual(["early-0"]);
 				letLateFetchResolve();
