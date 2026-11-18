@@ -1,118 +1,43 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionAPI, ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { asGlobalFetch } from "./helpers/fetch-mock";
-
-/** An Anthropic gateway reached on a `.local` host, configured as a deployment's `models.yml` declares it. */
-const GATEWAY = "http://gateway.test.local:4000";
-function modelsYml(contextWindow: number): string {
-	return `providers:
-  anthropic:
-    baseUrl: ${GATEWAY}
-    api: anthropic-messages
-    auth: apiKey
-    apiKey: gateway-test-key
-    compat:
-      replayUnsignedThinking: false
-      supportsLongCacheRetention: true
-    models:
-      - {id: claude-opus-5-5, name: Claude Opus 5.5, reasoning: true, input: [text, image], contextWindow: ${contextWindow}, maxTokens: 128000, cost: {input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5}}
-`;
-}
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import {
+	answer,
+	continuesCachedPrompt,
+	gatewayModelsYml,
+	gatewaySessionOptions,
+	type MessagesRequest,
+	mockGatewayFetch,
+	streamedAnswer,
+	withoutCacheControl,
+} from "./helpers/anthropic-gateway";
 
 /** The `--config` overlay a configuration sync rewrites under a running session. */
 const OVERLAY = "providers:\n  cacheRetention: long\n";
 
 const HOUR_MS = 60 * 60_000;
 
-interface WireMessage {
-	role: string;
-	content: unknown;
-}
+/** Every reply writes the prompt cache. */
+const CACHE_WRITE_TOKENS = 100;
 
-interface MessagesRequest {
-	system?: unknown;
-	tools?: unknown[];
-	messages: WireMessage[];
-}
-
-/** A streamed reply of one content block; the request it answers sent `inputTokens` uncached. */
-function stream(
-	turn: number,
-	block: Record<string, unknown>,
-	deltas: unknown[],
-	stopReason: string,
-	inputTokens = 10,
-): Response {
-	const events = [
-		{
-			type: "message_start",
-			message: {
-				id: `msg_${turn}`,
-				type: "message",
-				role: "assistant",
-				content: [],
-				model: "claude-opus-5-5",
-				stop_reason: null,
-				stop_sequence: null,
-				usage: {
-					input_tokens: inputTokens,
-					output_tokens: 0,
-					cache_read_input_tokens: 0,
-					cache_creation_input_tokens: 100,
-				},
-			},
-		},
-		{ type: "content_block_start", index: 0, content_block: block },
-		...deltas.map(delta => ({ type: "content_block_delta", index: 0, delta })),
-		{ type: "content_block_stop", index: 0 },
-		{ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 3 } },
-		{ type: "message_stop" },
-	];
-	const body = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-	return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
-}
-
+/** A text reply; the request it answers sent `inputTokens` uncached. */
 function textAnswer(turn: number, inputTokens?: number): Response {
-	return stream(
-		turn,
-		{ type: "text", text: "" },
-		[{ type: "text_delta", text: `seen ${turn}` }],
-		"end_turn",
-		inputTokens,
-	);
+	return answer(turn, { inputTokens, cacheWriteTokens: CACHE_WRITE_TOKENS });
 }
 
 function toolCallAnswer(turn: number, name: string, input: Record<string, unknown>): Response {
-	return stream(
+	return streamedAnswer(
 		turn,
 		{ type: "tool_use", id: `toolu_${turn}`, name, input: {} },
 		[{ type: "input_json_delta", partial_json: JSON.stringify(input) }],
 		"tool_use",
-	);
-}
-
-/** Cache breakpoints follow the end of each request, so they are left out of the comparison. */
-function withoutCacheControl(value: unknown): string {
-	return JSON.stringify(value, (key, inner) => (key === "cache_control" ? undefined : inner));
-}
-
-/**
- * Whether `later` sends `earlier`'s prompt in cache order, tools, then system, then every message, with the same
- * bytes, so its cache lookup reads all of `earlier`'s prompt.
- */
-function continuesCachedPrompt(earlier: MessagesRequest, later: MessagesRequest): boolean {
-	return (
-		withoutCacheControl(later.tools) === withoutCacheControl(earlier.tools) &&
-		withoutCacheControl(later.system) === withoutCacheControl(earlier.system) &&
-		withoutCacheControl(later.messages.slice(0, earlier.messages.length)) === withoutCacheControl(earlier.messages)
+		{ cacheWriteTokens: CACHE_WRITE_TOKENS },
 	);
 }
 
@@ -159,7 +84,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			replies?: Record<number, (turn: number) => Response>;
 		},
 	): Promise<Harness> {
-		await Bun.write(tempDir.join("models.yml"), modelsYml(options.contextWindow ?? 1_000_000));
+		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml(options.contextWindow));
 		const overlay = tempDir.join("overlay.yml");
 		await Bun.write(overlay, `${OVERLAY}${options.overlay ?? ""}`);
 		const settings = await Settings.loadIsolated({
@@ -167,22 +92,13 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			agentDir: tempDir.path(),
 			configFiles: [overlay],
 		});
-		const requests: MessagesRequest[] = [];
-		vi.spyOn(globalThis, "fetch").mockImplementation(
-			asGlobalFetch(async (input, init) => {
-				if (String(input) !== `${GATEWAY}/v1/messages`) throw new Error(`Unexpected request to ${String(input)}`);
-				requests.push(JSON.parse(requestBodyText(init) ?? "{}"));
-				const turn = requests.length;
-				return (options.replies?.[turn] ?? textAnswer)(turn);
-			}),
-		);
-		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const { requests } = mockGatewayFetch(turn => (options.replies?.[turn] ?? textAnswer)(turn));
+		const authStorage = createInMemoryAuthStorage();
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const model = modelRegistry.find("anthropic", "claude-opus-5-5");
 		if (!model) throw new Error("Expected the gateway's claude-opus-5-5");
 		const { session } = await createAgentSession({
-			cwd: tempDir.path(),
-			agentDir: tempDir.path(),
+			...gatewaySessionOptions(tempDir),
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.join("sessions")),
 			authStorage,
 			modelRegistry,
@@ -190,14 +106,8 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 			model,
 			toolNames: options.toolNames,
 			...(options.discoverContextFiles ? {} : { contextFiles: [] }),
-			disableExtensionDiscovery: true,
 			extensions: options.extensions,
 			...(options.discoverSkills ? {} : { skills: [] }),
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			skipPythonPreflight: true,
 		});
 		cleanups.push(async () => {
 			await session.dispose();

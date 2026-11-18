@@ -10,7 +10,7 @@
  */
 
 /** Prompt growth is averaged over this many most recent main requests. */
-const GROWTH_WINDOW_REQUESTS = 20;
+export const GROWTH_WINDOW_REQUESTS = 20;
 
 /** Which condition decided a cut: one of the three admits, or `waits`. */
 export type ContextCutReason = "forced" | "lapsed" | "pays" | "waits";

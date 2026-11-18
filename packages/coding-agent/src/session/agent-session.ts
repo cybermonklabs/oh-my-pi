@@ -135,7 +135,7 @@ import {
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, isServiceTierForFamily, serviceTierSettingToTier } from "../config/service-tier";
-import { combine, type SettingChange, type SettingsScope } from "../config/registry";
+import { combine, type SettingsScope } from "../config/registry";
 import { type Settings, withActiveSettings } from "../config/settings";
 import { RawSseDebugBuffer } from "@oh-my-pi/pi-tui/apps/debug/raw-sse-buffer";
 import { getEditStore } from "../edit/store";
@@ -509,7 +509,7 @@ import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
-import { promptDigestOfEntry, SessionTools, type SessionToolsHost } from "./session-tools";
+import { promptDigestOfEntry, SessionTools, type SessionToolsHost, type SettingsChangeOptions } from "./session-tools";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -1151,10 +1151,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#movedFromEmptySessionFile?: string;
 
 	readonly #maintenance: SessionMaintenance;
-	/** Id of the held settings rebuild under which the cut rule last admitted a cut; see {@link #absorbHeldSettingsRebuildIfDue}. */
-	#settingsRebuildCutHold: number | undefined;
-	/** {@link admitsContextCut} is deciding a provider-context cut, which never runs a held settings rebuild. */
-	#admittingProviderContextCut = false;
 
 	// Branch summarization state
 	#branchSummaryAbortController: AbortController | undefined = undefined;
@@ -3051,10 +3047,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// (an image clamp) is made in a request whose prompt is already taken, so it never counts.
 		this.addDisposer(
 			this.#maintenance.onContextCutAdmitted(cut => {
-				const held = this.#tools.heldSettingsRebuildId;
-				if (held === undefined || this.#admittingProviderContextCut) return;
+				if (this.#tools.heldSettingsRebuildCutAdmitted === undefined || cut.providerContext) return;
 				if (cut.prefixTokens <= computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision)) {
-					this.#settingsRebuildCutHold = held;
+					this.#tools.noteRewritingCutAdmitted();
 				}
 			}),
 		);
@@ -5813,9 +5808,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * request, and before a user prompt takes its hidden notices, so the request carries the rebuilt prompt.
 	 */
 	async #absorbHeldSettingsRebuildIfDue(): Promise<void> {
-		const held = this.#tools.heldSettingsRebuildId;
-		if (held === undefined) return;
-		const due = this.#settingsRebuildCutHold === held || this.#maintenance.promptCacheLapsed();
+		const cutAdmitted = this.#tools.heldSettingsRebuildCutAdmitted;
+		if (cutAdmitted === undefined) return;
+		const due = cutAdmitted || this.#maintenance.promptCacheLapsed();
 		try {
 			await this.#tools.absorbHeldSettingsRebuild(due);
 		} catch (error) {
@@ -7542,10 +7537,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * the reapply on a bound prompt (see {@link SessionTools.reconcileBuiltinTools});
 	 * other runtime owners may call it after changing an input the gate reads.
 	 */
-	reconcileBuiltinTools(options?: {
-		refreshPrompt?: boolean;
-		settingsChange?: readonly SettingChange[];
-	}): Promise<void> {
+	reconcileBuiltinTools(options?: { refreshPrompt?: boolean } & SettingsChangeOptions): Promise<void> {
 		return this.#tools.reconcileBuiltinTools(options);
 	}
 
@@ -7661,7 +7653,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * settings change started passes `settingsChange`, which holds the prompt rebuild on a
 	 * bound prompt (see {@link SessionTools.refreshSkills}).
 	 */
-	refreshSkillsAndCommands(options?: { settingsChange?: readonly SettingChange[] }): Promise<void> {
+	refreshSkillsAndCommands(options?: SettingsChangeOptions): Promise<void> {
 		const refresh = this.#skillsAndCommandsRefresh
 			.catch(() => {})
 			.then(async () => {
@@ -7770,10 +7762,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * change started passes `settingsChange`, which holds it on a bound prompt (see
 	 * {@link SessionTools.refreshBaseSystemPrompt}).
 	 */
-	refreshBaseSystemPrompt(
-		commitIf?: () => boolean,
-		options?: { settingsChange?: readonly SettingChange[] },
-	): Promise<void> {
+	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: SettingsChangeOptions): Promise<void> {
 		return this.#tools.refreshBaseSystemPrompt(commitIf, options);
 	}
 
@@ -7857,15 +7846,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * Whether an automatic cut of the context runs now, by the cut rule over this session's figures
 	 * (`decideContextCut` in the agent's compaction package); see {@link SessionMaintenance.admitsContextCut}.
-	 * Called by provider-context transforms, whose cut never runs a held settings rebuild.
+	 * Called by provider-context transforms with a `providerContextCut()` cut, which never runs a held settings rebuild.
 	 */
-	admitsContextCut(cut: ContextCut): boolean {
-		this.#admittingProviderContextCut = true;
-		try {
-			return this.#maintenance.admitsContextCut(cut);
-		} finally {
-			this.#admittingProviderContextCut = false;
-		}
+	admitsProviderContextCut(cut: ContextCut): boolean {
+		return this.#maintenance.admitsContextCut(cut);
 	}
 
 	/** Strip image content from the current branch and persist the rewrite. */
@@ -9765,38 +9749,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						expectedContentKey: previewXdevMountNotice.contentKey,
 					})
 				: undefined;
-			const toolRosterNotice = isUserQueuedMessage(message)
-				? this.#tools.takePendingToolRosterNotice({ baseDelivered: baseXdevCatalogDelivered })
-				: undefined;
-			const evalPreludeNotice = isUserQueuedMessage(message) ? this.#tools.takeEvalPreludeNotice() : undefined;
-			const sessionAgentNotice = isUserQueuedMessage(message) ? this.#tools.takeSessionAgentNotice() : undefined;
-			const taskAgentNotice = isUserQueuedMessage(message) ? this.#tools.takeTaskAgentNotice() : undefined;
-			const perCallModelNotice = isUserQueuedMessage(message) ? this.#tools.takePerCallModelNotice() : undefined;
-			const skillNotice = isUserQueuedMessage(message) ? this.#tools.takeSkillNotice() : undefined;
-			const settingsNotice = isUserQueuedMessage(message) ? this.#tools.takeSettingsNotice() : undefined;
-			if (
-				xdevMountNotice ||
-				toolRosterNotice ||
-				evalPreludeNotice ||
-				sessionAgentNotice ||
-				taskAgentNotice ||
-				perCallModelNotice ||
-				skillNotice ||
-				settingsNotice
-			) {
-				messages.splice(
-					xdevMountNoticeIndex,
-					0,
-					...(xdevMountNotice ? [xdevMountNotice] : []),
-					...(toolRosterNotice ? [toolRosterNotice] : []),
-					...(evalPreludeNotice ? [evalPreludeNotice] : []),
-					...(sessionAgentNotice ? [sessionAgentNotice] : []),
-					...(taskAgentNotice ? [taskAgentNotice] : []),
-					...(perCallModelNotice ? [perCallModelNotice] : []),
-					...(skillNotice ? [skillNotice] : []),
-					...(settingsNotice ? [settingsNotice] : []),
-				);
-			}
+			const hiddenNotices = [
+				xdevMountNotice,
+				...(isUserQueuedMessage(message)
+					? [
+							this.#tools.takePendingToolRosterNotice({ baseDelivered: baseXdevCatalogDelivered }),
+							this.#tools.takeEvalPreludeNotice(),
+							this.#tools.takeSessionAgentNotice(),
+							this.#tools.takeTaskAgentNotice(),
+							this.#tools.takePerCallModelNotice(),
+							this.#tools.takeSkillNotice(),
+							this.#tools.takeSettingsNotice(),
+						]
+					: []),
+			].filter(notice => notice !== undefined);
+			if (hiddenNotices.length > 0) messages.splice(xdevMountNoticeIndex, 0, ...hiddenNotices);
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);

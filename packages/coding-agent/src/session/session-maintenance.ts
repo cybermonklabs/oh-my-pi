@@ -242,6 +242,14 @@ function hasUsableCompactionMethod(
 }
 
 /**
+ * Whether an automatic maintenance pass for `reason` is a forced cut: the provider refused the request for its size,
+ * or stopped its turn with the window full.
+ */
+function forcedByReason(reason: "overflow" | "threshold" | "idle" | "incomplete"): boolean {
+	return reason === "overflow" || reason === "incomplete";
+}
+
+/**
  * Concrete media-limit wording in a payload-rejection error (e.g.
  * `request_too_large: too many images`, `image count exceeds the limit of
  * 20`). `ambiguousPayloadRejection` (dual `ContextOverflow` + `PayloadRejected`)
@@ -812,6 +820,14 @@ export class SessionMaintenance {
 		return () => this.#cutAdmittedListeners.delete(listener);
 	}
 
+	/**
+	 * Asks the cut rule about a forced cut, which it always admits: the rule logs the decision and
+	 * {@link onContextCutAdmitted}'s listeners hear of the cut.
+	 */
+	#recordForcedCut(cut: ContextCut): void {
+		this.admitsContextCut(cut);
+	}
+
 	/** Whether the prompt cache entry the next request would read has lapsed, by the cut rule's lapse condition. */
 	promptCacheLapsed(): boolean {
 		return promptCacheEntryLapsed(this.#nextPromptCacheEntry(), Date.now());
@@ -1272,7 +1288,7 @@ export class SessionMaintenance {
 			forced: true,
 			toolResultsOnly: true,
 		});
-		if (cut && !this.admitsContextCut(cut)) return false;
+		if (cut) this.#recordForcedCut(cut);
 		try {
 			const result = await this.shake("elide", {
 				config: DEFAULT_SHAKE_CONFIG,
@@ -4713,10 +4729,9 @@ export class SessionMaintenance {
 		let elideSink = "placeholders";
 		// Every rescue tier is forced (cut rule condition 1): the compaction before it could not free
 		// enough context to serve the request. Each tier still asks the rule, which logs its decision.
-		const shakeCut = options.skipElide
-			? undefined
-			: this.#shakeCut("rescue-shake", RESCUE_SHAKE_CONFIG, { forced: true });
-		if (!options.skipElide && (!shakeCut || this.admitsContextCut(shakeCut))) {
+		if (!options.skipElide) {
+			const shakeCut = this.#shakeCut("rescue-shake", RESCUE_SHAKE_CONFIG, { forced: true });
+			if (shakeCut) this.#recordForcedCut(shakeCut);
 			try {
 				const result = await this.#host.shake("elide", { config: RESCUE_SHAKE_CONFIG, signal });
 				elided = result.toolResultsDropped + result.blocksDropped;
@@ -4747,15 +4762,14 @@ export class SessionMaintenance {
 		// The pass measures the image tokens itself, so the cut states s = 0. Forced, it is admitted whatever its
 		// figures, which the rule logs; p = 0, the conservative bound, also tells AgentSession's cut listener that it
 		// rewrites every message, so a held settings rebuild runs before the next request, as after a compaction.
-		if (this.admitsContextCut({ site: "rescue-drop-images", prefixTokens: 0, removedTokens: 0, forced: true })) {
-			try {
-				imagesDropped = (await this.#host.dropImages()).removed;
-				if (imagesDropped > 0) this.#host.rebaseAfterCompaction();
-			} catch (error) {
-				logger.warn("Dead-end image-drop rescue failed", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
+		this.#recordForcedCut({ site: "rescue-drop-images", prefixTokens: 0, removedTokens: 0, forced: true });
+		try {
+			imagesDropped = (await this.#host.dropImages()).removed;
+			if (imagesDropped > 0) this.#host.rebaseAfterCompaction();
+		} catch (error) {
+			logger.warn("Dead-end image-drop rescue failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 		if (imagesDropped > 0 && options.hasProgress()) {
 			const elidedPart = elided > 0 ? `${this.#describeElideRescue(elided, elidedTokens, elideSink)} and ` : "";
@@ -5353,8 +5367,7 @@ export class SessionMaintenance {
 			site,
 			prefixTokens,
 			removedTokens: Math.max(0, promptTokens - prefixTokens - rewrittenTokens),
-			// The provider refused the request for its size, or stopped its turn with the window full.
-			forced: reason === "overflow" || reason === "incomplete",
+			forced: forcedByReason(reason),
 			promptTokens,
 		});
 	}
@@ -6695,7 +6708,7 @@ export class SessionMaintenance {
 		const action = "shake";
 		// A shake that waits starts nothing: no lifecycle events, and no later method takes its place.
 		const cut = this.#shakeCut("auto-shake", DEFAULT_SHAKE_CONFIG, {
-			forced: reason === "overflow" || reason === "incomplete",
+			forced: forcedByReason(reason),
 			promptTokens: triggerContextTokens,
 		});
 		if (cut && !this.admitsContextCut(cut)) return COMPACTION_CHECK_NONE;

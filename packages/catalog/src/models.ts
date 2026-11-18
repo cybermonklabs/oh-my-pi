@@ -191,11 +191,24 @@ export function getNextTimeBasedPricingTransition(cost: ModelCost, timestamp?: n
 	return next === Infinity ? undefined : next;
 }
 
-/** Price a fully uncached prompt at its request timestamp (Unix ms); scheduled prices default to now. */
-export function calculateUncachedInputCost(cost: ModelCost, promptInputTokens: number, timestamp?: number): number {
+/**
+ * The rate card and peak/off-peak multiplier of a request of `promptInputTokens` at `timestamp` (Unix ms); only
+ * scheduled prices default to now.
+ */
+function resolvePricing(
+	cost: ModelCost,
+	promptInputTokens: number,
+	timestamp: number | undefined,
+): { rates: TokenCost; multiplier: number } {
 	const pricingTimestamp = cost.timeBased ? (timestamp ?? Date.now()) : undefined;
 	const rates = resolveTokenCost(cost, promptInputTokens, pricingTimestamp);
-	return (rates.input / 1_000_000) * promptInputTokens * timeBasedMultiplier(cost.timeBased, pricingTimestamp);
+	return { rates, multiplier: timeBasedMultiplier(cost.timeBased, pricingTimestamp) };
+}
+
+/** Price a fully uncached prompt at its request timestamp (Unix ms); scheduled prices default to now. */
+export function calculateUncachedInputCost(cost: ModelCost, promptInputTokens: number, timestamp?: number): number {
+	const { rates, multiplier } = resolvePricing(cost, promptInputTokens, timestamp);
+	return (rates.input / 1_000_000) * promptInputTokens * multiplier;
 }
 
 /** Price usage at its request timestamp (Unix ms); only scheduled prices default to now. */
@@ -203,9 +216,7 @@ export function calculateUsageCost(cost: ModelCost, usage: Usage, timestamp?: nu
 	const orchestration = usage.orchestration;
 	const promptInputTokens =
 		usage.input + usage.cacheRead + usage.cacheWrite + (orchestration?.input ?? 0) + (orchestration?.cacheRead ?? 0);
-	const pricingTimestamp = cost.timeBased ? (timestamp ?? Date.now()) : undefined;
-	const rates = resolveTokenCost(cost, promptInputTokens, pricingTimestamp);
-	const multiplier = timeBasedMultiplier(cost.timeBased, pricingTimestamp);
+	const { rates, multiplier } = resolvePricing(cost, promptInputTokens, timestamp);
 	usage.cost.input = (rates.input / 1000000) * (usage.input + (orchestration?.input ?? 0)) * multiplier;
 	usage.cost.output = (rates.output / 1000000) * (usage.output + (orchestration?.output ?? 0)) * multiplier;
 	usage.cost.cacheRead =
@@ -244,9 +255,7 @@ export function getCacheTokenPrices(
 	promptInputTokens: number,
 	timestamp?: number,
 ): CacheTokenPrices {
-	const pricingTimestamp = cost.timeBased ? (timestamp ?? Date.now()) : undefined;
-	const rates = resolveTokenCost(cost, promptInputTokens, pricingTimestamp);
-	const multiplier = timeBasedMultiplier(cost.timeBased, pricingTimestamp);
+	const { rates, multiplier } = resolvePricing(cost, promptInputTokens, timestamp);
 	return {
 		read: (rates.cacheRead / 1000000) * multiplier,
 		write: cacheWriteRate(rates, lifetime) * multiplier,

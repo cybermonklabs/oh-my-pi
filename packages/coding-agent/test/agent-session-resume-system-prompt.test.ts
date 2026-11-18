@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -8,71 +7,15 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { ObservedPromptCacheEntry } from "@oh-my-pi/pi-coding-agent/session/prompt-cache-status";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { asGlobalFetch } from "./helpers/fetch-mock";
-
-/** An Anthropic gateway reached on a `.local` host, configured as a deployment's `models.yml` declares it. */
-const GATEWAY = "http://gateway.test.local:4000";
-const MODELS_YML = `providers:
-  anthropic:
-    baseUrl: ${GATEWAY}
-    api: anthropic-messages
-    auth: apiKey
-    apiKey: gateway-test-key
-    compat:
-      replayUnsignedThinking: false
-      supportsLongCacheRetention: true
-    models:
-      - {id: claude-opus-5-5, name: Claude Opus 5.5, reasoning: true, input: [text, image], contextWindow: 1000000, maxTokens: 128000, cost: {input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5}}
-`;
-
-interface MessagesRequest {
-	system?: unknown;
-	tools?: unknown[];
-	messages: unknown[];
-}
-
-function answer(turn: number): Response {
-	const events = [
-		{
-			type: "message_start",
-			message: {
-				id: `msg_${turn}`,
-				type: "message",
-				role: "assistant",
-				content: [],
-				model: "claude-opus-5-5",
-				stop_reason: null,
-				stop_sequence: null,
-				// Each reply writes the prompt cache, so a reopened transcript says what its newest reply left there.
-				usage: { input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 100 },
-			},
-		},
-		{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-		{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `seen ${turn}` } },
-		{ type: "content_block_stop", index: 0 },
-		{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } },
-		{ type: "message_stop" },
-	];
-	const body = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-	return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
-}
-
-/** Cache breakpoints follow the end of each request, so they are left out of the comparison. */
-function withoutCacheControl(value: unknown): string {
-	return JSON.stringify(value, (key, inner) => (key === "cache_control" ? undefined : inner));
-}
-
-/**
- * Whether `later` sends `earlier`'s prompt in cache order, tools, then system, then every message, with the same
- * bytes, so its cache lookup reads all of `earlier`'s prompt.
- */
-function continuesCachedPrompt(earlier: MessagesRequest, later: MessagesRequest): boolean {
-	return (
-		withoutCacheControl(later.tools) === withoutCacheControl(earlier.tools) &&
-		withoutCacheControl(later.system) === withoutCacheControl(earlier.system) &&
-		withoutCacheControl(later.messages.slice(0, earlier.messages.length)) === withoutCacheControl(earlier.messages)
-	);
-}
+import {
+	answer,
+	continuesCachedPrompt,
+	gatewayModelsYml,
+	gatewaySessionOptions,
+	type MessagesRequest,
+	mockGatewayFetch,
+	withoutCacheControl,
+} from "./helpers/anthropic-gateway";
 
 /** What one process builds its prompt from: a context file whose text differs between runs, and the operator's role text. */
 interface ProcessInputs {
@@ -107,14 +50,8 @@ describe("system prompt of a resumed session", () => {
 		sessionFile?: string,
 		startup?: (session: AgentSession, sessionManager: SessionManager) => Promise<void>,
 	): Promise<ProcessRun> {
-		const requests: MessagesRequest[] = [];
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
-			asGlobalFetch(async (input, init) => {
-				if (String(input) !== `${GATEWAY}/v1/messages`) throw new Error(`Unexpected request to ${String(input)}`);
-				requests.push(JSON.parse(requestBodyText(init) ?? "{}"));
-				return answer(requests.length);
-			}),
-		);
+		// Each reply writes the prompt cache, so a reopened transcript says what its newest reply left there.
+		const { requests, restore: restoreFetch } = mockGatewayFetch(turn => answer(turn, { cacheWriteTokens: 100 }));
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const model = modelRegistry.find("anthropic", "claude-opus-5-5");
@@ -123,8 +60,7 @@ describe("system prompt of a resumed session", () => {
 			? await SessionManager.open(sessionFile)
 			: SessionManager.create(tempDir.path(), tempDir.join("sessions"));
 		const { session } = await createAgentSession({
-			cwd: tempDir.path(),
-			agentDir: tempDir.path(),
+			...gatewaySessionOptions(tempDir),
 			sessionManager,
 			authStorage,
 			modelRegistry,
@@ -132,13 +68,7 @@ describe("system prompt of a resumed session", () => {
 			model,
 			appendSystemPrompt: inputs.appendSystemPrompt,
 			contextFiles: [{ path: tempDir.join("AGENTS.md"), content: inputs.agentsMd }],
-			disableExtensionDiscovery: true,
 			skills: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			skipPythonPreflight: true,
 		});
 		try {
 			await startup?.(session, sessionManager);
@@ -155,13 +85,13 @@ describe("system prompt of a resumed session", () => {
 		} finally {
 			await session.dispose();
 			authStorage.close();
-			fetchSpy.mockRestore();
+			restoreFetch();
 		}
 	}
 
 	it("continues the transcript's cached prompt after a restart that builds another system prompt", async () => {
 		using tempDir = TempDir.createSync("@pi-resume-system-prompt-");
-		await Bun.write(tempDir.join("models.yml"), MODELS_YML);
+		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml());
 		const live = await runProcess(tempDir, { agentsMd: "Build with make.", appendSystemPrompt: ROLE }, [
 			"first",
 			"second",
@@ -194,7 +124,7 @@ describe("system prompt of a resumed session", () => {
 
 	it("keeps the transcript's cached prompt through a startup rebuild that changes nothing of its own", async () => {
 		using tempDir = TempDir.createSync("@pi-resume-system-prompt-");
-		await Bun.write(tempDir.join("models.yml"), MODELS_YML);
+		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml());
 		const live = await runProcess(
 			tempDir,
 			{ agentsMd: "Build with make.", appendSystemPrompt: ROLE },
@@ -223,7 +153,7 @@ describe("system prompt of a resumed session", () => {
 
 	it("sends a startup rebuild that changes the prompt, such as an added workspace directory", async () => {
 		using tempDir = TempDir.createSync("@pi-resume-system-prompt-");
-		await Bun.write(tempDir.join("models.yml"), MODELS_YML);
+		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml());
 		await Bun.write(tempDir.join("added-workspace-root/README.md"), "A second root.\n");
 		const live = await runProcess(
 			tempDir,
@@ -252,7 +182,7 @@ describe("system prompt of a resumed session", () => {
 
 	it("builds the system prompt afresh when the operator's appended prompt changed", async () => {
 		using tempDir = TempDir.createSync("@pi-resume-system-prompt-");
-		await Bun.write(tempDir.join("models.yml"), MODELS_YML);
+		await Bun.write(tempDir.join("models.yml"), gatewayModelsYml());
 		const live = await runProcess(tempDir, { agentsMd: "Build with make.", appendSystemPrompt: ROLE }, ["first"]);
 		const newRole = "You write the lexer of this repository.";
 		const resumed = await runProcess(

@@ -1,81 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { asGlobalFetch } from "./helpers/fetch-mock";
-
-/** An Anthropic gateway reached on a `.local` host, configured as a deployment's `models.yml` declares it. */
-const GATEWAY = "http://gateway.test.local:4000";
-const MODELS_YML = `providers:
-  anthropic:
-    baseUrl: ${GATEWAY}
-    api: anthropic-messages
-    auth: apiKey
-    apiKey: gateway-test-key
-    compat:
-      replayUnsignedThinking: false
-      supportsLongCacheRetention: true
-    models:
-      - {id: claude-opus-5-5, name: Claude Opus 5.5, reasoning: true, input: [text, image], contextWindow: 1000000, maxTokens: 128000, cost: {input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5}}
-`;
-
-interface WireMessage {
-	role: string;
-	content: unknown;
-}
-
-interface MessagesRequest {
-	system?: unknown;
-	tools?: unknown[];
-	messages: WireMessage[];
-}
-
-function answer(turn: number): Response {
-	const events = [
-		{
-			type: "message_start",
-			message: {
-				id: `msg_${turn}`,
-				type: "message",
-				role: "assistant",
-				content: [],
-				model: "claude-opus-5-5",
-				stop_reason: null,
-				stop_sequence: null,
-				usage: { input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-			},
-		},
-		{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-		{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `seen ${turn}` } },
-		{ type: "content_block_stop", index: 0 },
-		{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } },
-		{ type: "message_stop" },
-	];
-	const body = events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-	return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
-}
-
-/** Cache breakpoints follow the end of each request, so they are left out of the comparison. */
-function withoutCacheControl(value: unknown): string {
-	return JSON.stringify(value, (key, inner) => (key === "cache_control" ? undefined : inner));
-}
-
-/**
- * Whether `later` sends `earlier`'s prompt in cache order, tools, then system, then every message, with the same
- * bytes, so its cache lookup reads all of `earlier`'s prompt.
- */
-function continuesCachedPrompt(earlier: MessagesRequest, later: MessagesRequest): boolean {
-	return (
-		withoutCacheControl(later.tools) === withoutCacheControl(earlier.tools) &&
-		withoutCacheControl(later.system) === withoutCacheControl(earlier.system) &&
-		withoutCacheControl(later.messages.slice(0, earlier.messages.length)) === withoutCacheControl(earlier.messages)
-	);
-}
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import {
+	answer,
+	continuesCachedPrompt,
+	gatewayModelsYml,
+	gatewaySessionOptions,
+	type MessagesRequest,
+	mockGatewayFetch,
+	withoutCacheControl,
+} from "./helpers/anthropic-gateway";
 
 /** Indexes of the messages that carry a cache breakpoint. */
 function messageBreakpoints(request: MessagesRequest): number[] {
@@ -134,22 +73,14 @@ describe("context hook messages and the Anthropic cache breakpoints", () => {
 		compactAfter?: number,
 	): Promise<Run> {
 		const modelsPath = tempDir.join("models.yml");
-		await Bun.write(modelsPath, MODELS_YML);
-		const requests: MessagesRequest[] = [];
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
-			asGlobalFetch(async (input, init) => {
-				if (String(input) !== `${GATEWAY}/v1/messages`) throw new Error(`Unexpected request to ${String(input)}`);
-				requests.push(JSON.parse(requestBodyText(init) ?? "{}"));
-				return answer(requests.length);
-			}),
-		);
-		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		await Bun.write(modelsPath, gatewayModelsYml());
+		const { requests, restore: restoreFetch } = mockGatewayFetch(answer);
+		const authStorage = createInMemoryAuthStorage();
 		const modelRegistry = new ModelRegistry(authStorage, modelsPath);
 		const model = modelRegistry.find("anthropic", "claude-opus-5-5");
 		if (!model) throw new Error("Expected the gateway's claude-opus-5-5");
 		const { session } = await createAgentSession({
-			cwd: tempDir.path(),
-			agentDir: tempDir.path(),
+			...gatewaySessionOptions(tempDir),
 			sessionManager: SessionManager.inMemory(tempDir.path()),
 			authStorage,
 			modelRegistry,
@@ -160,15 +91,9 @@ describe("context hook messages and the Anthropic cache breakpoints", () => {
 			}),
 			model,
 			toolNames: ["read"],
-			disableExtensionDiscovery: true,
 			extensions: extension ? [extension] : [],
 			skills: [],
 			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			skipPythonPreflight: true,
 		});
 		const afterCompaction: number[] = [];
 		try {
@@ -185,7 +110,7 @@ describe("context hook messages and the Anthropic cache breakpoints", () => {
 		} finally {
 			await session.dispose();
 			authStorage.close();
-			fetchSpy.mockRestore();
+			restoreFetch();
 		}
 		return { requests, afterCompaction };
 	}

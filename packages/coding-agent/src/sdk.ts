@@ -4716,9 +4716,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			};
 		};
 		// A request past the image budget cannot be served without the drop, so the rule admits it
-		// as forced; asking it logs the decision with the cut's figures.
-		const mainImageClamp = new ProviderImageClamp((site, before, after) => {
-			if (session) session.admitsContextCut(providerContextCut(site, before, after, session.agent.tokenizer));
+		// as forced; asking it logs the decision.
+		const mainImageClamp = new ProviderImageClamp(site => {
+			if (session) session.admitsProviderContextCut(providerContextCut(site));
 		});
 		const transformProviderContext = createTransformProviderContext(
 			createSessionDateCwdReminderJournal(sessionManager),
