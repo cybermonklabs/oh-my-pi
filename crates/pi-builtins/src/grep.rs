@@ -950,10 +950,10 @@ fn translate_patterns(
 /// bytes, in a bracket expression too, as GNU grep reads them in the C
 /// locale.
 fn regex_syntax(pattern: String, spec: MatcherSpec) -> String {
+	use std::fmt::Write as _;
 	if !spec.bytes || pattern.is_ascii() {
 		return pattern;
 	}
-	const HEX: &[u8; 16] = b"0123456789ABCDEF";
 	let mut escaped = String::with_capacity(pattern.len() * 2);
 	for c in pattern.chars() {
 		if c.is_ascii() {
@@ -961,9 +961,7 @@ fn regex_syntax(pattern: String, spec: MatcherSpec) -> String {
 			continue;
 		}
 		for byte in c.encode_utf8(&mut [0; 4]).bytes() {
-			escaped.push_str("\\x");
-			escaped.push(char::from(HEX[usize::from(byte >> 4)]));
-			escaped.push(char::from(HEX[usize::from(byte & 0xF)]));
+			let _ = write!(escaped, r"\x{byte:02X}");
 		}
 	}
 	escaped
@@ -1097,17 +1095,15 @@ fn pattern_alternatives(patterns: &[String], spec: MatcherSpec) -> Option<Vec<St
 	(!all.is_empty() && !trivial).then_some(all)
 }
 
-/// Whether `patterns` read a line that is not UTF-8 as they read text: each
-/// is ASCII and holds no character a dialect reads otherwise than as
-/// itself, and neither case folding nor word edges are asked for, so the
-/// same bytes match either way.
+/// Whether `patterns` read a line that is not UTF-8 as they read text: none
+/// holds a character a dialect reads otherwise than as itself, and neither
+/// case folding nor word edges are asked for, so the same bytes match
+/// either way (`é` is the bytes C3 A9 to both engines).
 fn reads_bytes_as_text(patterns: &[String], spec: MatcherSpec) -> bool {
 	!spec.ignore_case
 		&& !spec.word
 		&& patterns.iter().all(|pattern| {
-			pattern.is_ascii()
-				&& (spec.mode == MatchMode::Fixed
-					|| !pattern.contains(|c: char| r"\.[]*^$+?{}()|".contains(c)))
+			spec.mode == MatchMode::Fixed || !pattern.contains(|c: char| r"\.[]*^$+?{}()|".contains(c))
 		})
 }
 
@@ -1132,6 +1128,9 @@ struct LineMatcher<M> {
 /// The engine for a line that is not UTF-8, compiled at its first use;
 /// `None` where the patterns compile only as text.
 type BytesEngine<M> = LazyLock<Option<M>, Box<dyn FnOnce() -> Option<M> + Send>>;
+
+/// The size of the first window [`LineMatcher::search`] reads, in bytes.
+const FIRST_WINDOW: usize = 256;
 
 /// The matcher of a search for `text`, which `build_matcher` compiled from
 /// `patterns` with `spec` and which `engine` takes out of what it returns.
@@ -1195,12 +1194,26 @@ impl<M: Matcher> LineMatcher<M> {
 		Some((self.line_start(haystack, at).max(from), self.line_end(haystack, at).min(to)))
 	}
 
+	/// Where the content of the line `start..end` ends, before its
+	/// terminator.
+	fn content_end(&self, haystack: &[u8], start: usize, end: usize) -> usize {
+		if end > start && haystack[end - 1] == self.terminator { end - 1 } else { end }
+	}
+
 	/// The first result at or after `at`, each engine asked for its own by
 	/// `first(engine, haystack, from)`, and each result placed in its line by
-	/// `position`. A line that is UTF-8 holds the text engine's result; a
-	/// line that is not is searched alone by the other engine. The text
-	/// before the text engine's result is checked once, and each line in it
-	/// that is not UTF-8 searched once.
+	/// `position`.
+	///
+	/// The lines are read in windows that end at a line boundary and double
+	/// in size from [`FIRST_WINDOW`]: the UTF-8 check of a window stops at its
+	/// first line that is not UTF-8, the text engine searches the lines
+	/// before that one, and the other engine that line alone, without its
+	/// terminator, so an empty match past the terminator is not taken for the
+	/// next line's (`printf 'a\351b\nz\n' | LC_ALL=C grep '\B'` selects
+	/// nothing). So each byte before the result is checked once and searched
+	/// once, by one engine, and past it at most the rest of the last window
+	/// is checked: a search of a buffer costs what it reads to its result,
+	/// however many lines that are not UTF-8 come before it.
 	fn search<T>(
 		&self,
 		haystack: &[u8],
@@ -1208,26 +1221,44 @@ impl<M: Matcher> LineMatcher<M> {
 		first: impl Fn(&M, &[u8], usize) -> Result<Option<T>, M::Error>,
 		position: impl Fn(&T) -> usize,
 	) -> Result<Option<T>, M::Error> {
-		let mut found = first(&self.text, haystack, at)?;
 		if self.bytes.is_none() {
-			return Ok(found);
+			return first(&self.text, haystack, at);
 		}
 		let mut from = self.line_start(haystack, at);
+		let mut pos = at;
+		let mut window = FIRST_WINDOW;
 		loop {
-			let to = found
-				.as_ref()
-				.map_or(haystack.len(), |found| self.line_end(haystack, position(found)));
-			let Some((start, end)) = self.invalid_line(haystack, from, to) else {
-				return Ok(found);
+			let to = self.line_end(haystack, from.saturating_add(window).min(haystack.len()));
+			let invalid = self.invalid_line(haystack, from, to);
+			// The text engine reads the lines before `limit`; a result at
+			// `limit` itself lies in the next line, which is not its to read.
+			let limit = invalid.map_or(to, |(start, _)| start);
+			let found = if limit == haystack.len() {
+				first(&self.text, haystack, pos)?
+			} else if pos < limit {
+				first(&self.text, &haystack[..limit], pos)?.filter(|found| position(found) < limit)
+			} else {
+				None
 			};
-			if let Some(in_line) = first(self.bytes_engine(), &haystack[..end], at.max(start))? {
-				return Ok(Some(in_line));
+			if found.is_some() {
+				return Ok(found);
 			}
-			from = end;
-			// The text engine's result stands where it lies past this line.
-			if found.as_ref().is_some_and(|found| position(found) < end) {
-				found = first(&self.text, haystack, end)?;
+			match invalid {
+				Some((start, end)) => {
+					let content_end = self.content_end(haystack, start, end);
+					let in_line = first(self.bytes_engine(), &haystack[..content_end], pos.max(start))?;
+					if in_line.is_some() {
+						return Ok(in_line);
+					}
+					from = end;
+				},
+				None if to == haystack.len() => return Ok(None),
+				None => {
+					from = to;
+					window = window.saturating_mul(2);
+				},
 			}
+			pos = pos.max(from);
 		}
 	}
 }
@@ -1246,6 +1277,17 @@ impl<M: Matcher> Matcher for LineMatcher<M> {
 			at,
 			|engine: &M, haystack: &[u8], from: usize| engine.find_at(haystack, from),
 			|found: &grep_matcher::Match| found.start(),
+		)
+	}
+
+	/// The searcher asks this of each line it confirms; each engine answers
+	/// it with its own forward search, where the default runs a whole find.
+	fn shortest_match_at(&self, haystack: &[u8], at: usize) -> Result<Option<usize>, Self::Error> {
+		self.search(
+			haystack,
+			at,
+			|engine: &M, haystack: &[u8], from: usize| engine.shortest_match_at(haystack, from),
+			|&end: &usize| end,
 		)
 	}
 
@@ -3767,6 +3809,99 @@ mod tests {
 			run_async_util::<Grep>(&["-m0", "-L", "x", "in", "missing"], "", tree.path()).await;
 		assert_eq!((code, capture.out().as_str()), (2, "in\n"), "{}", capture.err());
 		assert!(capture.err().contains("grep: missing: "), "{}", capture.err());
+	}
+
+	/// A matcher that adds to `read` the bytes each search it runs is handed,
+	/// from where the search starts to the end of its haystack.
+	struct Counting<M> {
+		inner: M,
+		read:  Arc<std::sync::atomic::AtomicUsize>,
+	}
+
+	impl<M> Counting<M> {
+		fn count(&self, bytes: usize) {
+			self.read.fetch_add(bytes, Ordering::Relaxed);
+		}
+	}
+
+	impl<M: Matcher> Matcher for Counting<M> {
+		type Captures = M::Captures;
+		type Error = M::Error;
+
+		fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<grep_matcher::Match>, M::Error> {
+			self.count(haystack.len() - at);
+			self.inner.find_at(haystack, at)
+		}
+
+		fn new_captures(&self) -> Result<M::Captures, M::Error> {
+			self.inner.new_captures()
+		}
+
+		fn shortest_match_at(&self, haystack: &[u8], at: usize) -> Result<Option<usize>, M::Error> {
+			self.count(haystack.len() - at);
+			self.inner.shortest_match_at(haystack, at)
+		}
+
+		fn find_candidate_line(&self, haystack: &[u8]) -> Result<Option<LineMatchKind>, M::Error> {
+			self.count(haystack.len());
+			self.inner.find_candidate_line(haystack)
+		}
+	}
+
+	/// Counts the lines a search selects.
+	struct Selected(usize);
+
+	impl Sink for Selected {
+		type Error = io::Error;
+
+		fn matched(&mut self, _: &Searcher, _: &SinkMatch<'_>) -> Result<bool, io::Error> {
+			self.0 += 1;
+			Ok(true)
+		}
+	}
+
+	/// 2,000 Latin-1 lines, each selected by `caf.`, which matches such a
+	/// line only read a byte to a character, as GNU grep reads it in the C
+	/// locale. Each search for the next selected line ran the text engine
+	/// over the whole rest of the buffer, so the engines read the square of
+	/// the input (about 10 MB of a 10 kB input); a search now reads each
+	/// line about once.
+	#[test]
+	fn a_search_reads_each_line_that_is_not_utf8_about_once() {
+		let spec = MatcherSpec {
+			mode:        MatchMode::Default,
+			ignore_case: false,
+			word:        false,
+			line_regexp: false,
+			null_data:   false,
+			jit:         false,
+			bytes:       false,
+		};
+		let patterns = vec!["caf.".to_owned()];
+		let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let Ok(Engine::Rust(text)) = build_matcher(&patterns, spec) else {
+			panic!("`caf.` compiles for the text engine");
+		};
+		let bytes_read = Arc::clone(&read);
+		let build: Box<dyn FnOnce() -> Option<Counting<grep_regex::RegexMatcher>> + Send> =
+			Box::new(move || match build_matcher(&patterns, MatcherSpec { bytes: true, ..spec }) {
+				Ok(Engine::Rust(inner)) => Some(Counting { inner, read: bytes_read }),
+				_ => None,
+			});
+		let mut non_matching = ByteSet::empty();
+		non_matching.add(b'\n');
+		let matcher = LineMatcher {
+			text: Counting { inner: text, read: Arc::clone(&read) },
+			bytes: Some(Arc::new(LazyLock::new(build))),
+			terminator: b'\n',
+			non_matching,
+		};
+		let haystack = b"caf\xe9\n".repeat(2000);
+		let mut selected = Selected(0);
+		SearcherBuilder::new().build().search_slice(&matcher, &haystack, &mut selected).unwrap();
+		assert_eq!(selected.0, 2000);
+		let read = read.load(Ordering::Relaxed);
+		assert!(read <= 4 * haystack.len(), "the engines read {read} bytes of a {}-byte input", haystack.len());
 	}
 }
 

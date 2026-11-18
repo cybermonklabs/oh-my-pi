@@ -30,7 +30,7 @@ use crate::{host::ShellPaths, sed::error_handling::SedResult};
 
 use crate::sed::{
 	error_handling::{ScriptLocation, runtime_error},
-	fast_io::{byte_char, char_byte, script_text_char},
+	fast_io::{byte_char, char_byte, script_byte_chars, script_text_char},
 	fast_regex::{Captures, Match, ScriptRegex},
 	named_writer::NamedWriter,
 	script_char_provider::ScriptCharProvider,
@@ -114,8 +114,8 @@ pub enum AppendElement {
 #[derive(Clone, Debug, Default, PartialEq)]
 /// A space mirroring IOChunk, but only with a String
 pub struct StringSpace {
-	pub content:     String, // Line content without newline
-	pub has_newline: bool,   // True if \n-terminated
+	pub content:     String, // Line content without its delimiter
+	pub has_newline: bool,   // True if ended by its delimiter (`\n`, or NUL under `-z`)
 	pub bytes:       bool,   // True if `content` is byte text (see fast_io)
 }
 
@@ -208,12 +208,10 @@ impl CaseWriter {
 			return;
 		}
 		for c in literal.chars() {
-			if self.bytes && !c.is_ascii() && char_byte(c).is_none() {
-				for &byte in c.encode_utf8(&mut [0; 4]).as_bytes() {
-					self.push_char(byte_char(byte));
+			if self.bytes {
+				for held in script_byte_chars(c) {
+					self.push_char(held);
 				}
-			} else if self.bytes {
-				self.push_char(c);
 			} else {
 				self.push_char(script_text_char(c));
 			}
@@ -357,7 +355,9 @@ pub struct Transliteration {
 	slow:  HashMap<char, char>,
 	/// What each byte of a line held as byte text becomes: ASCII characters
 	/// and the bytes numeric escapes name map byte for byte, as GNU sed maps
-	/// them in the C locale (`y/\xe9/e/`).
+	/// them in the C locale (`y/\xe9/e/`). Each holds its target as the
+	/// script spells it, which `processor::transliterate` writes as byte
+	/// text.
 	bytes: [char; 256],
 }
 
@@ -380,9 +380,10 @@ fn byte_of(c: char) -> Option<u8> {
 
 impl Transliteration {
 	/// Create through character mappings from `source` to `target`, as the
-	/// script spells them (see `CaseWriter::push_literal`). A character
-	/// outside ASCII that no escape names is several bytes in byte text, and
-	/// maps no byte there.
+	/// script spells them (see `CaseWriter::push_literal`). In byte text a
+	/// character outside ASCII that no escape names is several bytes: as a
+	/// source it maps no byte, and as a target it is written as those bytes,
+	/// as `s` writes it (`y/a/é/` writes the two bytes of `é`).
 	pub fn from_strings(source: &str, target: &str) -> Self {
 		let mut result = Self::default();
 		for (from, to) in source.chars().zip(target.chars()) {
@@ -1719,7 +1720,6 @@ fn compile_end_group_command(
 	}
 	context.parsed_block_nesting -= 1;
 	line.advance();
-	line.eat_spaces();
 	parse_command_ending(lines, line, cmd)?;
 	Ok(CommandHandling::Return)
 }
@@ -1749,8 +1749,6 @@ fn compile_empty_command(
 	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
 	line.advance(); // Skip the command character
-	line.eat_spaces(); // Skip any trailing whitespace
-
 	parse_command_ending(lines, line, cmd)?;
 	Ok(CommandHandling::Continue)
 }
@@ -1831,7 +1829,6 @@ fn compile_label_command(
 		cmd.data = CommandData::Label(Some(label));
 	}
 
-	line.eat_spaces(); // Skip any trailing whitespace
 	parse_command_ending(lines, line, cmd)?;
 	Ok(CommandHandling::Continue)
 }
@@ -1869,7 +1866,6 @@ fn compile_number_command(
 		},
 	}
 
-	line.eat_spaces(); // Skip any trailing whitespace
 	parse_command_ending(lines, line, cmd)?;
 	Ok(CommandHandling::Continue)
 }
@@ -5350,6 +5346,12 @@ use crate::host::Host;
 // one), which no class but a negated one holds and which has no case; the
 // engines read the line as they read any text, and its bytes are written back
 // unchanged (`write_text_bytes`). A line that is UTF-8 is held as its text.
+//
+// The script holds the byte a numeric escape names (`\xe9`) as the same
+// character, so a character from U+10FF80 to U+10FFFF typed in a script reads
+// as that escape: `s/<U+10FFFF>/X/` searches the character `ÿ` in a line that
+// is UTF-8 and the byte 0xFF in byte text, where GNU sed searches the
+// character U+10FFFF.
 
 /// The code point before the 128 that stand for the bytes 0x80 to 0xFF in
 /// byte text, U+10FF80 to U+10FFFF.
@@ -5375,6 +5377,16 @@ pub fn char_byte(c: char) -> Option<u8> {
 /// `bytes` as byte text.
 pub fn byte_text(bytes: &[u8]) -> String {
 	bytes.iter().copied().map(byte_char).collect()
+}
+
+/// `line` as sed holds it, with whether it is byte text: its text where it
+/// is UTF-8, else its byte text. A line read, a pattern space a substitution
+/// leaves, and the output of `s///e` are held so.
+pub fn line_text(line: Vec<u8>) -> (String, bool) {
+	match String::from_utf8(line) {
+		Ok(text) => (text, false),
+		Err(error) => (byte_text(error.as_bytes()), true),
+	}
 }
 
 /// Appends `text`, byte text when `bytes`, to `content`, byte text when
@@ -5423,7 +5435,7 @@ pub fn write_record(
 	if missing {
 		out.write_all(&[delimiter])?;
 	}
-	write_text_bytes(out, record.as_str(), record.is_bytes())?;
+	record.write_bytes(out)?;
 	if record.is_newline_terminated() {
 		out.write_all(&[delimiter])?;
 	}
@@ -5446,17 +5458,22 @@ pub fn script_text(script: &str) -> Cow<'_, str> {
 	}
 }
 
-/// A string of the script as byte text, as GNU sed reads it in the C locale:
-/// the byte a numeric escape names is that byte, and any other character
-/// outside ASCII the bytes of its UTF-8 encoding.
+/// The characters byte text holds for the script character `c`, as GNU sed
+/// reads a script in the C locale: the byte a numeric escape names is that
+/// byte, an ASCII character is itself, and any other character the bytes of
+/// its UTF-8 encoding.
+pub fn script_byte_chars(c: char) -> impl Iterator<Item = char> {
+	let mut encoded = [0; 4];
+	let single = (c.is_ascii() || char_byte(c).is_some()).then_some(c);
+	let len = if single.is_some() { 0 } else { c.encode_utf8(&mut encoded).len() };
+	single.into_iter().chain(encoded.into_iter().take(len).map(byte_char))
+}
+
+/// A string of the script as byte text; see [`script_byte_chars`].
 pub fn script_byte_text(script: &str) -> String {
 	let mut text = String::with_capacity(script.len());
 	for c in script.chars() {
-		if c.is_ascii() || char_byte(c).is_some() {
-			text.push(c);
-		} else {
-			text.extend(c.encode_utf8(&mut [0; 4]).bytes().map(byte_char));
-		}
+		text.extend(script_byte_chars(c));
 	}
 	text
 }
@@ -5550,11 +5567,8 @@ impl ReadLineCursor {
 		let has_newline = self.buffer.last() == Some(&self.delimiter);
 		// strip it if you don’t want to expose it to the caller
 		if has_newline { self.buffer.pop(); }
-		let line = std::mem::take(&mut self.buffer);
-		Ok(Some(match String::from_utf8(line) {
-			Ok(text) => IOChunkContent::new_owned(text, has_newline),
-			Err(error) => IOChunkContent::new_owned_text(byte_text(error.as_bytes()), true, has_newline),
-		}))
+		let (text, bytes) = line_text(std::mem::take(&mut self.buffer));
+		Ok(Some(IOChunkContent::new_owned_text(text, bytes, has_newline)))
 	}
 
 	/// Return true if the previously returned line was the last one.
@@ -5585,6 +5599,17 @@ enum SliceText {
 	Bytes(String),
 }
 
+#[cfg(unix)]
+impl SliceText {
+	/// How the input bytes `content` read as text.
+	fn of(content: &[u8]) -> Self {
+		match str::from_utf8(content) {
+			Ok(_) => Self::Utf8,
+			Err(_) => Self::Bytes(byte_text(content)),
+		}
+	}
+}
+
 impl<'a> IOChunk<'a> {
 	/// Construct an IOChunk from the given content
 	fn from_content(content: IOChunkContent<'a>) -> Self {
@@ -5611,7 +5636,7 @@ impl<'a> IOChunk<'a> {
 			},
 			#[cfg(unix)]
 			_ => {
-				self.content = IOChunkContent::new_owned(String::new(), false);
+				self.content = IOChunkContent::new_owned_text(String::new(), false, false);
 			},
 		}
 	}
@@ -5681,13 +5706,14 @@ impl<'a> IOChunk<'a> {
 	/// How `content`, the bytes of this SliceInput chunk, read as text.
 	#[cfg(unix)]
 	fn slice_text(&self, content: &[u8]) -> &SliceText {
-		self.slice_text.get_or_init(|| match str::from_utf8(content) {
-			Ok(_) => SliceText::Utf8,
-			Err(_) => SliceText::Bytes(byte_text(content)),
-		})
+		self.slice_text.get_or_init(|| SliceText::of(content))
 	}
 
-	/// Return the raw byte content (always safe).
+	/// Return the content's bytes: a slice of the input as it is, and owned
+	/// content as its String's bytes, which in byte text are the UTF-8
+	/// encoding of each byte's character rather than the bytes they stand
+	/// for. Callers search them for a needle of ASCII alone, which both
+	/// hold at the same places.
 	pub fn as_bytes(&self) -> &[u8] {
 		match &self.content {
 			#[cfg(unix)]
@@ -5696,20 +5722,27 @@ impl<'a> IOChunk<'a> {
 		}
 	}
 
+	/// Writes the bytes the content stands for, without its delimiter: a
+	/// slice of the input as it is, without reading it as text, and owned
+	/// content through [`write_text_bytes`].
+	pub fn write_bytes(&self, out: &mut impl Write) -> io::Result<()> {
+		match &self.content {
+			#[cfg(unix)]
+			IOChunkContent::SliceInput { content, .. } => out.write_all(content),
+			IOChunkContent::Owned { content, bytes, .. } => write_text_bytes(out, content, *bytes),
+		}
+	}
+
 	/// Convert content to the Owned variant if it's not already. Bytes that
 	/// are not UTF-8 become their byte text.
 	pub fn ensure_owned(&mut self) {
 		#[cfg(unix)]
-		if let IOChunkContent::SliceInput { content, full_span } = self.content {
-			let has_newline = full_span.len() > content.len();
-			let (text, bytes) = match self.slice_text.take() {
-				Some(SliceText::Bytes(text)) => (text, true),
+		if let IOChunkContent::SliceInput { content, .. } = self.content {
+			let has_newline = self.is_newline_terminated();
+			let (text, bytes) = match self.slice_text.take().unwrap_or_else(|| SliceText::of(content)) {
+				SliceText::Bytes(text) => (text, true),
 				// SAFETY: `SliceText::Utf8` records that `content` is UTF-8.
-				Some(SliceText::Utf8) => (unsafe { str::from_utf8_unchecked(content) }.to_owned(), false),
-				None => match str::from_utf8(content) {
-					Ok(text) => (text.to_owned(), false),
-					Err(_) => (byte_text(content), true),
-				},
+				SliceText::Utf8 => (unsafe { str::from_utf8_unchecked(content) }.to_owned(), false),
 			};
 			self.content = IOChunkContent::new_owned_text(text, bytes, has_newline);
 		}
@@ -5746,8 +5779,8 @@ enum IOChunkContent<'a> {
 		full_span: &'a [u8], // Line including original newline, if any
 	},
 	Owned {
-		content:     String, // Line content without newline
-		has_newline: bool,   // True if \n-terminated
+		content:     String, // Line content without its delimiter
+		has_newline: bool,   // True if ended by its delimiter (`\n`, or NUL under `-z`)
 		bytes:       bool,   // True if `content` is byte text
 		#[cfg(not(unix))]
 		_phantom:    PhantomData<&'a ()>, // Silence E0392 warning
@@ -5756,6 +5789,7 @@ enum IOChunkContent<'a> {
 
 impl IOChunkContent<'_> {
 	/// Construct a new Owned chunk of text.
+	#[cfg(test)]
 	pub fn new_owned(content: String, has_newline: bool) -> Self {
 		Self::new_owned_text(content, false, has_newline)
 	}
@@ -5976,31 +6010,27 @@ impl OutputBuffer {
 		}
 	}
 
-	/// Schedule the specified String or &str for eventual output
+	/// Schedule the specified text for eventual output. A newline that ends
+	/// it ends the line, and is written as the delimiter: `i` writes `foo\0`
+	/// under `-z`, as GNU sed does.
 	pub fn write_str<S: Into<String>>(&mut self, s: S) -> io::Result<()> {
-		self.write_text(s, false)
-	}
-
-	/// Schedule the specified text, byte text when `bytes`, for eventual
-	/// output. A newline that ends it ends the line, and is written as the
-	/// delimiter: `i` writes `foo\0` under `-z`, as GNU sed does.
-	pub fn write_text<S: Into<String>>(&mut self, s: S, bytes: bool) -> io::Result<()> {
 		let mut s = s.into();
 		let has_newline = s.ends_with('\n');
 		if has_newline {
 			s.truncate(s.len() - 1);
 		}
-		self.write_chunk(&IOChunk::from_content(IOChunkContent::new_owned_text(s, bytes, has_newline)))
+		self.write_chunk(&IOChunk::from_text(s, false, has_newline))
 	}
 
-	/// Schedule `line`, byte text when `bytes`, for output as a whole line,
-	/// ended by the delimiter.
+	/// Write `line`, byte text when `bytes`, as a whole line, ended by the
+	/// delimiter: the first line of the pattern space `P` prints.
 	pub fn write_line(&mut self, line: &str, bytes: bool) -> io::Result<()> {
-		self.write_chunk(&IOChunk::from_content(IOChunkContent::new_owned_text(
-			line.to_owned(),
-			bytes,
-			true,
-		)))
+		self.flush_pending_newline()?;
+		#[cfg(unix)]
+		self.flush_slice(WriteRange::Complete)?;
+		write_text_bytes(&mut self.out, line, bytes)?;
+		self.out.write_all(&[self.delimiter])?;
+		self.flush_completed_line()
 	}
 
 	/// Schedule `text` for output as it is, its newlines too: the text of
@@ -7271,19 +7301,39 @@ struct Branch {
 	offset: usize,
 }
 
-impl Branch {
-	/// Where this branch first matches in `text` at or after `pos`.
-	fn find_from(&self, text: &str, pos: usize) -> SedResult<Option<(usize, usize)>> {
-		self.re
-			.find_from_pos(text, pos)
-			.map(|found| found.map(|m| (m.start(), m.end())))
-			.map_err(|e| SedError::new(2, e.to_string()))
-	}
+/// Where `re` first matches in `text` at or after `pos`.
+fn fancy_find(re: &FancyRegex, text: &str, pos: usize) -> SedResult<Option<(usize, usize)>> {
+	re.find_from_pos(text, pos)
+		.map(|found| found.map(|m| (m.start(), m.end())))
+		.map_err(|e| SedError::new(2, e.to_string()))
 }
 
-/// Where each branch next matches, from the last position searched: `None`
-/// until searched, `Some(None)` once the branch matches no more.
-type NextMatches = Vec<Option<Option<(usize, usize)>>>;
+/// The match a search found last, from the last position searched: `None`
+/// until searched, `Some(None)` where there is none.
+type CachedMatch = Option<Option<(usize, usize)>>;
+
+/// The first match at or after `pos`, where `cached` holds the one found
+/// from a position at or before `pos`: it stands while it starts at or after
+/// `pos`, and otherwise `search` finds the match from `pos`, which `cached`
+/// then keeps. A search asked at each position of a line in turn so scans
+/// the line once.
+fn next_match(
+	cached: &mut CachedMatch,
+	pos: usize,
+	search: impl FnOnce() -> SedResult<Option<(usize, usize)>>,
+) -> SedResult<Option<(usize, usize)>> {
+	if let Some(found) = *cached
+		&& found.is_none_or(|(start, _)| start >= pos)
+	{
+		return Ok(found);
+	}
+	let found = search()?;
+	*cached = Some(found);
+	Ok(found)
+}
+
+/// Where each branch next matches, from the last position searched.
+type NextMatches = Vec<CachedMatch>;
 
 /// The match POSIX takes among `found`, each branch's match in turn: the
 /// leftmost start any branch matches at, the longest end among the branches
@@ -7326,21 +7376,14 @@ impl Longest {
 		next: &mut NextMatches,
 	) -> SedResult<Option<(usize, usize, usize)>> {
 		leftmost_longest(self.branches.iter().zip(next.iter_mut()).map(|(branch, cached)| {
-			match *cached {
-				Some(found) if found.is_none_or(|(start, _)| start >= pos) => Ok(found),
-				_ => {
-					let found = branch.find_from(text, pos)?;
-					*cached = Some(found);
-					Ok(found)
-				},
-			}
+			next_match(cached, pos, || fancy_find(&branch.re, text, pos))
 		}))
 	}
 
 	/// The leftmost-longest match in `text`, for a caller that searches once
 	/// and so keeps no branch's next match.
 	fn first(&self, text: &str) -> SedResult<Option<(usize, usize, usize)>> {
-		leftmost_longest(self.branches.iter().map(|branch| branch.find_from(text, 0)))
+		leftmost_longest(self.branches.iter().map(|branch| fancy_find(&branch.re, text, 0)))
 	}
 
 	/// The captures of the match `branch` has at `start`, numbered as the
@@ -7371,7 +7414,7 @@ impl Longest {
 /// 0x80 up, where GNU, which reads that byte as one character, has none. In
 /// a line that is UTF-8 GNU does find one inside a character of several
 /// bytes (see `processor::substitute`), and so does that engine.
-fn on_char_boundaries(text: &str, start: usize, end: usize) -> bool {
+pub fn on_char_boundaries(text: &str, start: usize, end: usize) -> bool {
 	text.is_char_boundary(start) && text.is_char_boundary(end)
 }
 
@@ -7397,12 +7440,12 @@ fn after_empty(text: &str, bytes: bool, at: usize) -> usize {
 /// to GNU there.
 struct InsideChars {
 	/// The line's byte text.
-	text:   String,
+	text: String,
 	/// The last position asked about, in the line and in `text`.
-	at:     (usize, usize),
+	at:   (usize, usize),
 	/// The match found last in `text`, from a position at or before the one
-	/// in `at`: `None` until searched, `Some(None)` where there is none.
-	next:   Option<Option<(usize, usize)>>,
+	/// in `at`.
+	next: CachedMatch,
 }
 
 impl InsideChars {
@@ -7418,20 +7461,21 @@ impl InsideChars {
 		let mapped = mapped
 			+ line.as_bytes()[from..pos].iter().map(|b| if b.is_ascii() { 1 } else { 4 }).sum::<usize>();
 		self.at = (pos, mapped);
-		let found = match self.next {
-			// A match searched from before `mapped` that starts at or after
-			// it is also the first match from `mapped`.
-			Some(found) if found.is_none_or(|(start, _)| start >= mapped) => found,
-			_ => {
-				let found = re
-					.find_from_pos(&self.text, mapped)
-					.map_err(|e| SedError::new(2, e.to_string()))?
-					.map(|m| (m.start(), m.end()));
-				self.next = Some(found);
-				found
-			},
-		};
+		let found = next_match(&mut self.next, mapped, || fancy_find(re, &self.text, mapped))?;
 		Ok(found == Some((mapped, mapped)))
+	}
+
+	/// The empty match `re`, a pattern of the line `line`, has at `at`,
+	/// inside a character, if any; `inside` is made at the first such
+	/// position asked about.
+	fn empty_capture<'t>(
+		inside: &mut Option<Self>,
+		re: &FancyRegex,
+		line: &str,
+		at: usize,
+	) -> SedResult<Option<Captures<'t>>> {
+		let found = inside.get_or_insert_with(|| Self::new(line)).empty_match_at(re, line, at)?;
+		Ok(found.then(|| Captures::Empty { at, len: re.captures_len() }))
 	}
 }
 
@@ -7518,12 +7562,7 @@ impl Regex {
 			// which the whole pattern answers.
 			Regex::Longest(longest) => longest.whole.is_match_text(text),
 			Regex::NulLines(re) => {
-				for line in text.split('\0') {
-					if re.is_match_text(line)? {
-						return Ok(true);
-					}
-				}
-				Ok(false)
+				Ok(first_in_nul_lines(text, |line| Ok(re.is_match_text(line)?.then_some(())))?.is_some())
 			},
 		}
 	}
@@ -7549,35 +7588,23 @@ impl Regex {
 				byte_text: bytes.then_some(text),
 			},
 
-			Regex::Fancy(re) => CaptureMatches::Fancy(FancyMatches {
-				re,
-				text,
-				bytes,
-				pos: 0,
-				last_end: None,
-				inside: None,
-				done: false,
-			}),
+			Regex::Fancy(re) => {
+				CaptureMatches::Fancy(FancyMatches { re, stepping: Stepping::new(text, bytes, false) })
+			},
 
 			Regex::Longest(longest) => {
 				let may_match = longest.may_match(text);
 				CaptureMatches::Longest(LongestMatches {
 					longest,
-					text,
-					bytes,
-					pos: 0,
-					last_end: None,
 					// A line without a match keeps no branch's next match.
 					next: if may_match { longest.fresh_next() } else { Vec::new() },
-					inside: None,
-					done: !may_match,
+					stepping: Stepping::new(text, bytes, !may_match),
 				})
 			},
 
 			Regex::NulLines(re) => CaptureMatches::NulLines(Box::new(NulLineMatches {
 				re: re.as_ref(),
-				lines: text.split('\0'),
-				start: 0,
+				lines: NulSplit::new(text),
 				bytes,
 				current: None,
 			})),
@@ -7637,16 +7664,8 @@ impl Regex {
 				}
 			},
 
-			Regex::NulLines(re) => {
-				let mut offset = 0;
-				for line in text.split('\0') {
-					if let Some(caps) = re.captures_text(line, bytes)? {
-						return Ok(Some(Captures::Shifted { caps: Box::new(caps), offset }));
-					}
-					offset += line.len() + 1;
-				}
-				Ok(None)
-			},
+			Regex::NulLines(re) => Ok(first_in_nul_lines(text, |line| re.captures_text(line, bytes))?
+				.map(|(offset, caps)| Captures::Shifted { caps: Box::new(caps), offset })),
 		}
 	}
 
@@ -7698,18 +7717,49 @@ impl Regex {
 					.map(|(_, start, end)| Match { start, end, text: &text[start..end] }))
 			},
 
-			Regex::NulLines(re) => {
-				let mut offset = 0;
-				for line in text.split('\0') {
-					if let Some(m) = re.find_text(line, bytes)? {
-						return Ok(Some(m.shifted(offset)));
-					}
-					offset += line.len() + 1;
-				}
-				Ok(None)
-			},
+			Regex::NulLines(re) => Ok(first_in_nul_lines(text, |line| re.find_text(line, bytes))?
+				.map(|(offset, m)| m.shifted(offset))),
 		}
 	}
+}
+
+/// Each line of a text, ended by a NUL or by the end of the text, with where
+/// it starts: the lines a [`Regex::NulLines`] pattern searches one by one.
+struct NulSplit<'t> {
+	lines: std::str::Split<'t, char>,
+	/// Where the next of `lines` starts in the text.
+	start: usize,
+}
+
+impl<'t> NulSplit<'t> {
+	fn new(text: &'t str) -> Self {
+		Self { lines: text.split('\0'), start: 0 }
+	}
+}
+
+impl<'t> Iterator for NulSplit<'t> {
+	type Item = (usize, &'t str);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		let line = self.lines.next()?;
+		let offset = self.start;
+		self.start += line.len() + 1;
+		Some((offset, line))
+	}
+}
+
+/// The first answer `search` gives for a line of `text` (see [`NulSplit`]),
+/// with where that line starts.
+fn first_in_nul_lines<'t, T>(
+	text: &'t str,
+	mut search: impl FnMut(&'t str) -> SedResult<Option<T>>,
+) -> SedResult<Option<(usize, T)>> {
+	for (offset, line) in NulSplit::new(text) {
+		if let Some(found) = search(line)? {
+			return Ok(Some((offset, found)));
+		}
+	}
+	Ok(None)
 }
 
 /// An RE of the script, compiled for both kinds of line: `text` reads a line
@@ -7776,13 +7826,15 @@ pub enum CaptureMatches<'t> {
 	NulLines(Box<NulLineMatches<'t>>),
 }
 
-/// The matches of a fancy-regex pattern, each searched from where the one
-/// before it ended. GNU allows no empty match where the last match ended,
-/// and after an empty match goes on at the next byte of a line that is
-/// UTF-8, where fancy-regex goes on at the next character: inside a
+/// The bookkeeping of a search for each match of a line in turn, which
+/// [`FancyMatches`] and [`LongestMatches`] share. GNU allows no empty match
+/// where the last match ended, goes on after an empty match at the next byte
+/// of a line that is UTF-8 and at the next character of byte text, and
+/// inside a character of a line that is UTF-8 finds an empty match too, and
+/// only one: `printf '\303\251\n' | sed -E 's/a*|b/-/g'` prints
+/// `-\303-\251-`. fancy-regex goes on at the next character, so inside a
 /// character `InsideChars` answers.
-pub struct FancyMatches<'t> {
-	re:       &'t FancyRegex,
+struct Stepping<'t> {
 	text:     &'t str,
 	/// Whether `text` is byte text.
 	bytes:    bool,
@@ -7792,114 +7844,146 @@ pub struct FancyMatches<'t> {
 	/// The line read as bytes, made the first time a position inside a
 	/// character is searched.
 	inside:   Option<InsideChars>,
+	/// Whether the search has ended, past the end of the text or at an error.
 	done:     bool,
 }
 
-impl<'t> FancyMatches<'t> {
-	/// The next match, or `None` once the search has passed the end of the
-	/// text.
-	fn step(&mut self) -> SedResult<Option<Captures<'t>>> {
+/// A match [`Stepping::step`] takes: an empty one inside a character, as its
+/// captures, or one the search found, as what the search gave for it.
+enum Stepped<'t, T> {
+	Inside(Captures<'t>),
+	Found(T),
+}
+
+impl<'t> Stepping<'t> {
+	fn new(text: &'t str, bytes: bool, done: bool) -> Self {
+		Self { text, bytes, pos: 0, last_end: None, inside: None, done }
+	}
+
+	/// The next match, or `None` once the search has ended. At a position
+	/// inside a character where no match ended, `probe(inside, at)` gives the
+	/// empty match there, if any; at a character boundary `search(at)` gives
+	/// the next match from there, with its span.
+	fn step<T>(
+		&mut self,
+		probe: impl FnMut(&mut Option<InsideChars>, usize) -> SedResult<Option<Captures<'t>>>,
+		search: impl FnMut(usize) -> SedResult<Option<(usize, usize, T)>>,
+	) -> SedResult<Option<Stepped<'t, T>>> {
+		if self.done {
+			return Ok(None);
+		}
+		let found = self.find(probe, search);
+		self.done = !matches!(found, Ok(Some(_)));
+		found
+	}
+
+	/// [`Self::step`] for a search that has not ended.
+	fn find<T>(
+		&mut self,
+		mut probe: impl FnMut(&mut Option<InsideChars>, usize) -> SedResult<Option<Captures<'t>>>,
+		mut search: impl FnMut(usize) -> SedResult<Option<(usize, usize, T)>>,
+	) -> SedResult<Option<Stepped<'t, T>>> {
 		while self.pos <= self.text.len() {
 			let pos = self.pos;
 			if !self.text.is_char_boundary(pos) {
 				self.pos += 1;
 				if self.last_end != Some(pos)
-					&& self
-						.inside
-						.get_or_insert_with(|| InsideChars::new(self.text))
-						.empty_match_at(self.re, self.text, pos)?
+					&& let Some(caps) = probe(&mut self.inside, pos)?
 				{
 					self.last_end = Some(pos);
-					return Ok(Some(Captures::Empty { at: pos, len: self.re.captures_len() }));
+					return Ok(Some(Stepped::Inside(caps)));
 				}
 				continue;
 			}
-			let Some(caps) = self
-				.re
-				.captures_from_pos(self.text, pos)
-				.map_err(|e| SedError::new(2, format!("error retrieving RE captures: {e}")))?
-			else {
+			let Some((start, end, found)) = search(pos)? else {
 				return Ok(None);
 			};
-			let whole = caps.get(0).expect("group 0 is the whole match");
-			let (start, end) = (whole.start(), whole.end());
 			if start == end && self.last_end == Some(start) {
 				self.pos = after_empty(self.text, self.bytes, start);
 				continue;
 			}
 			self.last_end = Some(end);
 			self.pos = if end > start { end } else { after_empty(self.text, self.bytes, end) };
-			return Ok(Some(Captures::Fancy(caps)));
+			return Ok(Some(Stepped::Found(found)));
 		}
 		Ok(None)
 	}
 }
 
+/// The matches of a fancy-regex pattern, each searched from where the one
+/// before it ended; see [`Stepping`].
+pub struct FancyMatches<'t> {
+	re:       &'t FancyRegex,
+	stepping: Stepping<'t>,
+}
+
+impl<'t> FancyMatches<'t> {
+	/// The next match, or `None` once the search has ended.
+	fn step(&mut self) -> SedResult<Option<Captures<'t>>> {
+		let (re, text) = (self.re, self.stepping.text);
+		let stepped = self.stepping.step(
+			|inside, at| InsideChars::empty_capture(inside, re, text, at),
+			|from| {
+				let caps = re
+					.captures_from_pos(text, from)
+					.map_err(|e| SedError::new(2, format!("error retrieving RE captures: {e}")))?;
+				Ok(caps.map(|caps| {
+					let (start, end) = {
+						let whole = caps.get(0).expect("group 0 is the whole match");
+						(whole.start(), whole.end())
+					};
+					(start, end, caps)
+				}))
+			},
+		)?;
+		Ok(stepped.map(|stepped| match stepped {
+			Stepped::Inside(caps) => caps,
+			Stepped::Found(caps) => Captures::Fancy(caps),
+		}))
+	}
+}
+
 /// The matches of a top-level alternation, each the longest at its leftmost
-/// position, searched from where the one before it ended.
+/// position, searched from where the one before it ended (`echo aabb | sed
+/// 's/a*\|q/X/g'` prints `XbXbX`); see [`Stepping`].
 pub struct LongestMatches<'t> {
 	longest:  &'t Longest,
-	text:     &'t str,
-	/// Whether `text` is byte text.
-	bytes:    bool,
-	pos:      usize,
-	/// Where the last match ended.
-	last_end: Option<usize>,
 	next:     NextMatches,
-	/// The line read as bytes, for a whole pattern fancy-regex runs.
-	inside:   Option<InsideChars>,
-	done:     bool,
+	stepping: Stepping<'t>,
 }
 
 impl<'t> LongestMatches<'t> {
-	/// The next match, searched from where the last one ended. GNU allows
-	/// no empty match where the last match ended (`echo aabb | sed
-	/// 's/a*\|q/X/g'` prints `XbXbX`), so there the search goes on; it stops
-	/// once it has passed the end of the text.
+	/// The next match, or `None` once the search has ended.
 	fn step(&mut self) -> SedResult<Option<Captures<'t>>> {
-		while self.pos <= self.text.len() {
-			if !self.text.is_char_boundary(self.pos) {
-				// Inside a character of a line that is UTF-8 GNU finds an
-				// empty match too, and only one: `printf '\303\251\n' | sed
-				// -E 's/a*|b/-/g'` prints `-\303-\251-`. The whole pattern
-				// answers whether there is one.
-				let pos = self.pos;
-				self.pos += 1;
-				if self.last_end == Some(pos) {
-					continue;
-				}
-				let found = match self.longest.whole.as_ref() {
-					Regex::Byte(re) => re
-						.captures_at(self.text.as_bytes(), pos)
-						.filter(|caps| caps.get(0).is_some_and(|m| m.start() == pos && m.is_empty()))
-						.map(Captures::Byte),
-					Regex::Fancy(re) => self
-						.inside
-						.get_or_insert_with(|| InsideChars::new(self.text))
-						.empty_match_at(re, self.text, pos)?
-						.then(|| Captures::Empty { at: pos, len: re.captures_len() }),
-					_ => None,
-				};
-				if let Some(caps) = found {
-					self.last_end = Some(pos);
-					return Ok(Some(caps));
-				}
-				continue;
-			}
-			let Some((branch, start, end)) =
-				self.longest.search(self.text, self.pos, &mut self.next)?
-			else {
-				return Ok(None);
-			};
-			if start == end && self.last_end == Some(start) {
-				self.pos = after_empty(self.text, self.bytes, start);
-				continue;
-			}
-			self.last_end = Some(end);
-			self.pos = if end > start { end } else { after_empty(self.text, self.bytes, end) };
-			return self.longest.captures(self.text, branch, start);
+		let (longest, text) = (self.longest, self.stepping.text);
+		let next = &mut self.next;
+		let stepped = self.stepping.step(
+			// Inside a character the whole pattern answers whether there is
+			// an empty match.
+			|inside, at| match longest.whole.as_ref() {
+				Regex::Byte(re) => Ok(re
+					.captures_at(text.as_bytes(), at)
+					.filter(|caps| caps.get(0).is_some_and(|m| m.start() == at && m.is_empty()))
+					.map(Captures::Byte)),
+				Regex::Fancy(re) => InsideChars::empty_capture(inside, re, text, at),
+				_ => Ok(None),
+			},
+			|from| {
+				Ok(longest
+					.search(text, from, next)?
+					.map(|(branch, start, end)| (start, end, (branch, start))))
+			},
+		)?;
+		match stepped {
+			None => Ok(None),
+			Some(Stepped::Inside(caps)) => Ok(Some(caps)),
+			Some(Stepped::Found((branch, start))) => {
+				let caps = longest.captures(text, branch, start);
+				// The search ends at an error, as past the end of the text.
+				self.stepping.done |= !matches!(caps, Ok(Some(_)));
+				caps
+			},
 		}
-		Ok(None)
 	}
 }
 
@@ -7908,9 +7992,7 @@ impl<'t> LongestMatches<'t> {
 pub struct NulLineMatches<'t> {
 	re:      &'t Regex,
 	/// The lines not searched yet.
-	lines:   std::str::Split<'t, char>,
-	/// Where the next of `lines` starts in the text.
-	start:   usize,
+	lines:   NulSplit<'t>,
 	/// Whether the text is byte text.
 	bytes:   bool,
 	/// Where the line being searched starts, and its matches.
@@ -7928,9 +8010,7 @@ impl<'t> Iterator for NulLineMatches<'t> {
 				let offset = *offset;
 				return Some(found.map(|caps| Captures::Shifted { caps: Box::new(caps), offset }));
 			}
-			let line = self.lines.next()?;
-			let offset = self.start;
-			self.start += line.len() + 1;
+			let (offset, line) = self.lines.next()?;
 			self.current = Some((offset, self.re.captures_iter_text(line, self.bytes)));
 		}
 	}
@@ -7951,22 +8031,8 @@ impl<'t> Iterator for CaptureMatches<'t> {
 				})
 				.map(|caps| Ok(Captures::Byte(caps)))
 			},
-			CaptureMatches::Fancy(iter) => {
-				if iter.done {
-					return None;
-				}
-				let found = iter.step().transpose();
-				iter.done = !matches!(found, Some(Ok(_)));
-				found
-			},
-			CaptureMatches::Longest(iter) => {
-				if iter.done {
-					return None;
-				}
-				let found = iter.step().transpose();
-				iter.done = !matches!(found, Some(Ok(_)));
-				found
-			},
+			CaptureMatches::Fancy(iter) => iter.step().transpose(),
+			CaptureMatches::Longest(iter) => iter.step().transpose(),
 			CaptureMatches::NulLines(iter) => iter.next(),
 		}
 	}
@@ -8923,10 +8989,8 @@ use crate::sed::{
 		Transliteration,
 	},
 	error_handling::{ScriptLocation, input_runtime_error},
-	fast_io::{
-		IOChunk, LineReader, OutputBuffer, append_text, byte_text, char_byte, write_text_bytes,
-	},
-	fast_regex::ScriptRegex,
+	fast_io::{IOChunk, LineReader, OutputBuffer, append_text, char_byte, line_text, script_byte_chars},
+	fast_regex::{ScriptRegex, on_char_boundaries},
 	in_place::InPlace,
 	named_writer,
 };
@@ -9149,6 +9213,7 @@ fn substitute(
 	// Whether a match starts or ends inside a character of a line that is
 	// UTF-8, as an empty match of GNU's may: `printf 'caf\303\251\n' | sed
 	// 's/x*/-/g'` prints `-c-a-f-\303-\251-`, which is held as byte text.
+	// Pieces that join back into UTF-8 stay text.
 	let mut split = false;
 
 	let mut text: Option<&str> = None;
@@ -9165,7 +9230,7 @@ fn substitute(
 				Err(e) => Err(e),
 				Ok(Some(m)) => {
 					let line = *text.insert(pattern.as_str());
-					split |= !line.is_char_boundary(m.start()) || !line.is_char_boundary(m.end());
+					split |= !on_char_boundaries(line, m.start(), m.end());
 					result.extend_from_slice(&line.as_bytes()[last_end..m.start()]);
 
 					let replacement = sub.replacement.apply_match(&m, pattern.is_bytes());
@@ -9185,7 +9250,7 @@ fn substitute(
 				Ok(Some(caps)) => {
 					let m = caps.get(0)?.unwrap();
 					let line = *text.insert(pattern.as_str());
-					split |= !line.is_char_boundary(m.start()) || !line.is_char_boundary(m.end());
+					split |= !on_char_boundaries(line, m.start(), m.end());
 					result.extend_from_slice(&line.as_bytes()[last_end..m.start()]);
 
 					let replacement = sub.replacement.apply_captures(command, &caps, pattern.is_bytes())?;
@@ -9214,7 +9279,7 @@ fn substitute(
 
 					// Always write the unmatched text before this match.
 					let line = *text.get_or_insert_with(|| pattern.as_str());
-					split |= !line.is_char_boundary(m.start()) || !line.is_char_boundary(m.end());
+					split |= !on_char_boundaries(line, m.start(), m.end());
 					result.extend_from_slice(&line.as_bytes()[last_end..m.start()]);
 
 					if count == sub.occurrence || (sub.global && count > sub.occurrence) {
@@ -9247,21 +9312,29 @@ fn substitute(
 	// Handle substitution success.
 	if replaced {
 		result.extend_from_slice(&text.unwrap().as_bytes()[last_end..]);
-		let result = if split {
-			byte_text(&result)
+		let bytes = pattern.is_bytes();
+		let (result, bytes) = if split {
+			// The pieces of a line that is UTF-8 cut inside a character may
+			// join back into UTF-8 - an empty replacement, or an occurrence
+			// left as it was - which stays text, as GNU sed reads it:
+			// `printf 'caf\303\251 au lait\n' | sed 's/ *//g;s/f./F/'` prints
+			// `caFaulait`. Otherwise the line becomes byte text, and byte
+			// text stays byte text.
+			let (joined, split_bytes) = line_text(result);
+			(joined, bytes || split_bytes)
 		} else {
 			// SAFETY: every piece is UTF-8: the text between matches, each
 			// cut at character boundaries, the matches' text and the
 			// replacements.
-			unsafe { String::from_utf8_unchecked(result) }
+			(unsafe { String::from_utf8_unchecked(result) }, bytes)
 		};
 
-		pattern.set_text(result, split || pattern.is_bytes(), pattern.is_newline_terminated());
+		pattern.set_text(result, bytes, pattern.is_newline_terminated());
 
 		// Execute the pattern space as a shell command if the 'e' flag is set
 		if sub.execute {
 			let mut command_line = Vec::new();
-			write_text_bytes(&mut command_line, pattern.as_str(), pattern.is_bytes())?;
+			pattern.write_bytes(&mut command_line)?;
 			let output_bytes = shell_command(&command_line, host).and_then(|mut command| command.output()).map_err(|e| {
 				input_runtime_error::<()>(
 					&command.location,
@@ -9270,15 +9343,18 @@ fn substitute(
 				)
 				.unwrap_err()
 			})?;
-			let mut shell_out = String::from_utf8_lossy_owned(output_bytes.stdout);
-			if shell_out.ends_with("\r\n") {
+			let mut shell_out = output_bytes.stdout;
+			if shell_out.ends_with(b"\r\n") {
 				// On windows, both return carriage and newline characters are used
 				shell_out.truncate(shell_out.len() - 2);
-			} else if shell_out.ends_with('\n') {
+			} else if shell_out.ends_with(b"\n") {
 				// Strip the trailing newline, as GNU sed does
 				shell_out.pop();
 			}
-			pattern.set_text(shell_out, false, pattern.is_newline_terminated());
+			// Output that is not UTF-8 is kept as its bytes: `echo x | sed
+			// 's/x/printf "\\377a"/e'` prints the byte 0xFF and `a`.
+			let (shell_out, bytes) = line_text(shell_out);
+			pattern.set_text(shell_out, bytes, pattern.is_newline_terminated());
 		}
 
 		if sub.print_flag {
@@ -9310,11 +9386,18 @@ fn transliterate(pattern: &mut IOChunk, trans: &Transliteration) {
 
 	// Perform the transliteration.
 	for ch in text.chars() {
-		let mapped = if bytes { trans.lookup_byte_text(ch) } else { trans.lookup(ch) };
-		if mapped != ch {
-			replaced = true;
+		if bytes {
+			// A target outside ASCII that no escape names is the bytes of
+			// its UTF-8 encoding in byte text, as `s` writes it: in GNU's C
+			// locale `printf 'a\377\n' | sed 's/a/é/;s/./X/g'` prints `XXX`.
+			let mapped = trans.lookup_byte_text(ch);
+			replaced |= mapped != ch;
+			result.extend(script_byte_chars(mapped));
+		} else {
+			let mapped = trans.lookup(ch);
+			replaced |= mapped != ch;
+			result.push(mapped);
 		}
-		result.push(mapped);
 	}
 
 	// Lazy replace.
@@ -9353,7 +9436,8 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
 /// GNU sed lists the line byte by byte, in the C and the C.UTF-8 locale
 /// alike: a character of several bytes is the octal escape of each (`é` is
 /// `\303\251`), and folding the line may part those escapes but never splits
-/// one (`l 5` lists `café` as `caf\`, `\303\` and `\251$`).
+/// one (`l 5` lists `café` as `caf\`, `\303\` and `\251$`). A width of 0
+/// folds nothing (`echo abc | sed -n 'l 0'` prints `abc$`).
 fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResult<()> {
 	// Special case for an empty pattern space
 	if line.is_empty() {
@@ -9380,7 +9464,7 @@ fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResul
 		for &byte in ch_bytes {
 			let (listed, out_len) = list_byte(byte);
 			// See if folding is required before adding the byte and terminator.
-			if line_width + out_len + 1 > max_width {
+			if max_width != 0 && line_width + out_len + 1 > max_width {
 				buff.push_str("\\\n");
 				output.write_str(&buff)?;
 				line_width = 0;
@@ -11064,5 +11148,23 @@ mod tests {
 			assert_eq!(sed_in(dir.path(), args, stdin), (0, String::new()), "{args:?}");
 			assert_eq!(std::fs::read_to_string(dir.path().join("o")).unwrap(), expected, "{args:?}");
 		}
+	}
+
+	#[test]
+	fn builtin_y_writes_a_target_outside_ascii_as_bytes_in_byte_text() {
+		// GNU sed 4.9 in the C locale, which reads a line that is not UTF-8
+		// as the builtin does: `printf 'a\377\n' | sed 's/a/é/;s/./X/g'`
+		// prints `XXX`, the `é` written as its two bytes. GNU refuses
+		// `y/a/é/` there (strings of different lengths); the builtin's `y`
+		// writes those two bytes as `s` does, where it held `é` as one
+		// character and printed `XX`.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("in"), b"a\xff\n").unwrap();
+		for script in ["s/a/é/;s/./X/g", "y/a/é/;s/./X/g"] {
+			assert_eq!(sed_in(dir.path(), &[script, "in"], ""), (0, "XXX\n".to_owned()), "{script}");
+		}
+		// The bytes written: `303 251 377 \n`, as GNU writes them in C.UTF-8.
+		let (code, capture) = crate::host::run_util::<Sed>(&["y/a/é/", "in"], "", dir.path());
+		assert_eq!((code, capture.stdout()), (0, b"\xc3\xa9\xff\n".to_vec()));
 	}
 }

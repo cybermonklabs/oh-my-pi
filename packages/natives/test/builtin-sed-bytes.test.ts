@@ -151,3 +151,15 @@ describe("builtin sed: an empty match inside a character, beside a back-referenc
 		[String.raw`printf '\346\227\245\n' | sed 's/\(x\)*\1*/-/g'`, "-\xe6-\x97-\xa5-\n", 0],
 	]);
 });
+
+describe("builtin sed: the output of s///e keeps its bytes", () => {
+	cases([
+		// `377 a \n`, in C.UTF-8 as well. Regressed: `357 277 275 a \n`, U+FFFD in place of the byte.
+		[String.raw`echo x | sed 's/x/printf "\\377a"/e'`, "\xffa\n", 0],
+		// `a 351 b \n`, in C.UTF-8 as well. Regressed: `a 357 277 275 b \n`.
+		[String.raw`printf 'x\n' | sed 's/.*/printf "a\\351b"/e'`, "a\xe9b\n", 0],
+		// `Z Z Z \n`: the output is a line that is not UTF-8, each byte one character. Already
+		// GNU's answer, kept.
+		[String.raw`printf 'x\n' | sed 's/.*/printf "a\\351b"/e;s/./Z/g'`, "ZZZ\n", 0],
+	]);
+});

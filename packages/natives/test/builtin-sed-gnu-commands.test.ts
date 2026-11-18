@@ -119,6 +119,10 @@ describe("builtin sed: l lists each byte of a UTF-8 character in octal", () => {
 		[String.raw`printf 'caf\303\251 ok\n' | LC_ALL=C.UTF-8 sed -n 'l 5'`, "caf\\\n\\303\\\n\\251\\\n ok$\n", 0],
 		// `\ 3 6 0 \ 2 3 7 \ 2 4 6 \ 2 0 0 $ \n`. Regressed: `\U0001F980$`.
 		[String.raw`printf '\360\237\246\200\n' | sed -n l`, "\\360\\237\\246\\200$\n", 0],
+		// `a b c $ \n`: a width of 0 folds nothing. Regressed: `\`, `a\`, `b\`, `c$`, a fold before each byte.
+		[String.raw`echo abc | sed -n 'l 0'`, "abc$\n", 0],
+		// `c a f \ 3 0 3 \ 2 5 1 $ \n`. Regressed: a fold before each byte.
+		[String.raw`printf 'caf\303\251\n' | sed -n 'l 0'`, "caf\\303\\251$\n", 0],
 	]);
 });
 

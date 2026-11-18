@@ -80,3 +80,13 @@ describe("builtin grep: word edges and PCRE read such a line a byte to a charact
 		[String.raw`grep -cP 'x.\(' in`, "1\n", 0],
 	]);
 });
+
+describe("builtin grep: a match past the end of such a line is not the next line's", () => {
+	cases([
+		// GNU grep 3.11, LC_ALL=C: nothing, exit 1; `\B` matches nowhere in `a\351b` or `z`.
+		// Regressed: `z` and exit 0, the empty match past the first line's newline taken for the second line's.
+		[String.raw`printf 'a\351b\nz\n' | grep '\B'`, "", 1],
+		// The same: nothing, exit 1. Regressed: `zz` and exit 0.
+		[String.raw`printf 'a\351b\nzz\n' | grep -w 'x*'`, "", 1],
+	]);
+});
