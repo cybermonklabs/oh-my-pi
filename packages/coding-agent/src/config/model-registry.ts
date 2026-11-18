@@ -1,5 +1,12 @@
 import * as path from "node:path";
-import type { ApiKeyResolution, ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
+import type {
+	ApiKeyResolution,
+	ApiKeyResolver,
+	FetchImpl,
+	ResolvedApiKey,
+	SessionsApi,
+	UsageProvider,
+} from "@oh-my-pi/pi-ai";
 import { resolvedApiKeyBearer } from "@oh-my-pi/pi-ai/auth-retry";
 import {
 	type AuthApiKeyOptions,
@@ -242,6 +249,30 @@ type ModifyModelsHook = (models: Model<Api>[], credentials: OAuthCredentials) =>
  */
 type StoredCredentialsOutage = "cannot-serve" | "unreadable";
 
+/**
+ * `sessions.permitsIdentity(provider, sessionId, identityKey)`, or false when the
+ * `SessionsApi` lacks that optional method (a custom implementation may): it then
+ * cannot tell whether the session's account pool holds the identity. The first such
+ * answer for `provider` logs a warning; `warned` holds the providers already warned.
+ */
+export function permitsIdentityOrWarn(
+	sessions: SessionsApi,
+	provider: string,
+	sessionId: string,
+	identityKey: string | undefined,
+	warned: Set<string>,
+): boolean {
+	if (sessions.permitsIdentity) return sessions.permitsIdentity(provider, sessionId, identityKey);
+	if (!warned.has(provider)) {
+		warned.add(provider);
+		logger.warn(
+			"Session account pool cannot be read for disabled logins (its SessionsApi has no permitsIdentity); a missing key does not wait for them",
+			{ provider, sessionId },
+		);
+	}
+	return false;
+}
+
 function getDisabledProviderIdsFromSettings(settingsInstance?: Settings): Set<string> {
 	try {
 		return new Set(cfgDisabledProviders.get(settingsInstance ?? settings));
@@ -396,8 +427,8 @@ export class ModelRegistry {
 	// `provider/id:kind` of modelOverrides kinds already reported as unserved, so
 	// every rebuild does not log the same ignored override again.
 	#warnedUnservedOverrideKinds: Set<string> = new Set();
-	// `provider\0sessionId` of restricted sessions already warned that their pool cannot be
-	// read for disabled logins ({@link #poolHoldsTombstone}), so each logs it once.
+	// Providers already warned that a restricted session's pool cannot be read for
+	// disabled logins ({@link permitsIdentityOrWarn}), so each logs it once.
 	#warnedUnreadablePools: Set<string> = new Set();
 	#configError: ConfigError | undefined = undefined;
 	#warnedCompatKeys = new Set<string>();
@@ -3633,26 +3664,20 @@ export class ModelRegistry {
 
 	/**
 	 * Whether `sessionId`'s account pool for `provider` holds the account of the
-	 * disabled login `failure` (`sessions.permitsIdentity`). A custom `SessionsApi`
-	 * may lack that method. Its `permits`, true for every credential of an unrestricted
-	 * session, then still tells such a session apart, which counts the login as before.
-	 * A restricted session whose `permits` refuses the login's row cannot read its pool
-	 * for disabled logins: the login does not count, so a missing key ends the turn as
-	 * it did before such logins counted, and one warning per provider and session says why.
+	 * disabled login `failure`. `sessions.permits` comes first: it permits every
+	 * credential of an unrestricted session, and in a restricted one no login outside
+	 * the pool, but it may refuse a disabled login inside it (the built-in one reads
+	 * active rows only). `sessions.permitsIdentity` then places the login by its
+	 * account; a `SessionsApi` without it cannot, so the login does not count, a
+	 * missing key ends the turn, and one warning per provider says why
+	 * ({@link permitsIdentityOrWarn}).
 	 */
 	#poolHoldsTombstone(provider: string, sessionId: string, failure: DisabledCredentialSummary): boolean {
 		const sessions = this.authStorage.sessions;
-		if (sessions.permitsIdentity) return sessions.permitsIdentity(provider, sessionId, failure.identityKey);
-		if (sessions.permits(provider, sessionId, failure.id)) return true;
-		const warningKey = `${provider}\0${sessionId}`;
-		if (!this.#warnedUnreadablePools.has(warningKey)) {
-			this.#warnedUnreadablePools.add(warningKey);
-			logger.warn(
-				"Session account pool cannot be read for disabled logins (its SessionsApi has no permitsIdentity); a missing key does not wait for them",
-				{ provider, sessionId },
-			);
-		}
-		return false;
+		return (
+			sessions.permits(provider, sessionId, failure.id) ||
+			permitsIdentityOrWarn(sessions, provider, sessionId, failure.identityKey, this.#warnedUnreadablePools)
+		);
 	}
 
 	getDiscoverableProviders(): string[] {

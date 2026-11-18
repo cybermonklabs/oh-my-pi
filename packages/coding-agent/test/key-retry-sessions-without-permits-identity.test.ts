@@ -1,7 +1,8 @@
 /**
  * A custom `SessionsApi` may lack `permitsIdentity`. A turn's key retry then cannot tell which disabled logins the
- * account pool of a restricted session holds: it waits for none of them in that session, and says so once in a
- * warning, while an unrestricted session still waits for one.
+ * account pool of a restricted session holds: it waits for none of them in that session, and says so in one warning
+ * per provider, while an unrestricted session still waits for one. A subagent's worker thread, whose own sessions
+ * API answers through the main thread's, behaves the same.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import {
@@ -13,6 +14,9 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { authService } from "@oh-my-pi/pi-coding-agent/thread/services/auth";
+import type { AuthProbe } from "./fixtures/auth-service-worker";
+import { startServiceWorker } from "./helpers/service-worker";
 
 const cleanups: Array<() => unknown> = [];
 
@@ -67,7 +71,7 @@ function withSessionsWithoutPermitsIdentity(local: AuthStorage): AuthStorage {
 
 /**
  * A registry over that sessions API and a store whose only anthropic login, account A, a refresh failure disabled.
- * Session `pooled` is restricted to an account pool of account A; session `free` is not restricted.
+ * Sessions `pooled` and `pooled-too` are restricted to an account pool of account A; session `free` is not restricted.
  */
 async function openRegistry() {
 	const temp = await TempDir.create("@key-retry-sessions-without-permits-identity-");
@@ -86,7 +90,7 @@ async function openRegistry() {
 	const authStorage = withSessionsWithoutPermitsIdentity(local);
 	const accountA = resolveCredentialIdentityKey("anthropic", login);
 	if (!accountA) throw new Error("Expected account A's identity key");
-	authStorage.sessions.restrict("anthropic", "pooled", [accountA]);
+	for (const sessionId of ["pooled", "pooled-too"]) authStorage.sessions.restrict("anthropic", sessionId, [accountA]);
 	return new ModelRegistry(authStorage, temp.join("models.yml"));
 }
 
@@ -97,14 +101,16 @@ function captureUnreadablePoolWarnings() {
 }
 
 describe("a turn's key retry over a SessionsApi without permitsIdentity", () => {
-	it("does not wait for a disabled login in a session restricted to an account pool, and warns once", async () => {
+	it("does not wait for a disabled login in a session restricted to an account pool, and warns once for the provider", async () => {
 		// If this regresses, the key lookup of a pooled session on such a host throws instead of ending the turn on
-		// its missing key, or waits for a login it cannot place in the session's pool without saying why.
+		// its missing key, waits for a login it cannot place in the session's pool without saying why, or logs a
+		// warning for every pooled session of a long-lived host.
 		const unreadablePoolWarnings = captureUnreadablePoolWarnings();
 		const registry = await openRegistry();
 
-		expect(await registry.missingKeyMayRecover("anthropic", "pooled")).toBe(false);
-		expect(await registry.missingKeyMayRecover("anthropic", "pooled")).toBe(false);
+		for (const sessionId of ["pooled", "pooled", "pooled-too"]) {
+			expect(await registry.missingKeyMayRecover("anthropic", sessionId)).toBe(false);
+		}
 		expect(unreadablePoolWarnings()).toEqual([[expect.any(String), { provider: "anthropic", sessionId: "pooled" }]]);
 	});
 
@@ -115,5 +121,47 @@ describe("a turn's key retry over a SessionsApi without permitsIdentity", () => 
 
 		expect(await registry.missingKeyMayRecover("anthropic", "free")).toBe(true);
 		expect(unreadablePoolWarnings()).toEqual([]);
+	});
+});
+
+describe("a subagent thread's key retry over a host SessionsApi without permitsIdentity", () => {
+	/** A worker thread running the auth service over `registry`'s storage, as a subagent's thread does. */
+	async function startAuthWorker(registry: ModelRegistry): Promise<AuthProbe> {
+		const { probe, stop } = await startServiceWorker<AuthProbe>(
+			new URL("./fixtures/auth-service-worker.ts", import.meta.url),
+			[authService],
+			{ storage: registry.authStorage },
+		);
+		cleanups.push(stop);
+		return probe;
+	}
+
+	it("still waits for the disabled login in an unrestricted session", async () => {
+		// If this regresses, every subagent of such a host ends its turn on a key that a new login brings back.
+		const unreadablePoolWarnings = captureUnreadablePoolWarnings();
+		const registry = await openRegistry();
+		const worker = await startAuthWorker(registry);
+
+		expect(await worker.turnKeyFailure(registry, "anthropic", "free")).toEqual({
+			name: "CredentialUnavailableError",
+			retryable: true,
+		});
+		expect(unreadablePoolWarnings()).toEqual([]);
+	});
+
+	it("does not wait for a disabled login in a session restricted to an account pool, and warns once for the provider", async () => {
+		// If this regresses, a pooled subagent of such a host waits for a login it cannot place in its pool, or ends
+		// its turn on the missing key without saying why.
+		const unreadablePoolWarnings = captureUnreadablePoolWarnings();
+		const registry = await openRegistry();
+		const worker = await startAuthWorker(registry);
+
+		for (const sessionId of ["pooled", "pooled", "pooled-too"]) {
+			expect(await worker.turnKeyFailure(registry, "anthropic", sessionId)).toEqual({
+				name: "AccountPoolUnavailableError",
+				retryable: false,
+			});
+		}
+		expect(unreadablePoolWarnings()).toEqual([[expect.any(String), { provider: "anthropic", sessionId: "pooled" }]]);
 	});
 });

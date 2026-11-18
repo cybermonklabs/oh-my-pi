@@ -17,9 +17,14 @@ export interface ServiceWorker<Probe> {
 /**
  * Spawn the fixture at `url` (which hand-builds the worker link, installs
  * `services`, and calls `globals.test.ready(probe)` from `boot`), then install
- * the main halves of `services` and boot it as worker `w1`.
+ * the main halves of `services` and boot it as worker `w1`. `testGlobals` join
+ * `ready` in the `test` boot global, for a fixture that reads more from it.
  */
-export async function startServiceWorker<Probe>(url: URL, services: ThreadService[]): Promise<ServiceWorker<Probe>> {
+export async function startServiceWorker<Probe>(
+	url: URL,
+	services: ThreadService[],
+	testGlobals: Record<string, unknown> = {},
+): Promise<ServiceWorker<Probe>> {
 	const worker = new Worker(url.href, { type: "module" });
 	// Fixtures that install the worker log port post records as raw messages, like the real entry.
 	worker.addEventListener("message", (event: MessageEvent) => {
@@ -54,7 +59,7 @@ export async function startServiceWorker<Probe>(url: URL, services: ThreadServic
 	const peer: WorkerPeer = { threadId: "w1", link };
 	for (const service of services) service.installMain?.(peer);
 	const { promise: probed, resolve: onProbe } = Promise.withResolvers<Probe>();
-	const globals: Record<string, unknown> = { test: { ready: (probe: Probe) => onProbe(probe) } };
+	const globals: Record<string, unknown> = { test: { ...testGlobals, ready: (probe: Probe) => onProbe(probe) } };
 	for (const service of services) globals[service.name] = service.globals?.(peer);
 	await link.call("boot", globals);
 	const probe = await probed;

@@ -41,7 +41,7 @@ import {
 	OnPromptRequiredError,
 } from "@oh-my-pi/pi-ai/error";
 import { logger } from "@oh-my-pi/pi-utils";
-import { ModelRegistry } from "../../config/model-registry";
+import { ModelRegistry, permitsIdentityOrWarn } from "../../config/model-registry";
 import {
 	AnthropicSlowModeController,
 	type AnthropicSlowModeHookOptions,
@@ -98,6 +98,8 @@ class PeerAuthState {
 	readonly leases = new Map<number, HeldLease>();
 	readonly subscriptions = new Set<() => void>();
 	readonly mirrorHost = Promise.withResolvers<MirrorHost>();
+	/** Providers this worker's `sessions.permitsIdentity` calls already warned about ({@link permitsIdentityOrWarn}). */
+	readonly warnedUnreadablePools = new Set<string>();
 	#nextLease = 1;
 
 	constructor() {
@@ -271,10 +273,11 @@ function serveAuthStorage(state: PeerAuthState): RpcServe<AuthStorage, AuthStora
 		},
 		"sessions.permits": (storage, provider, sessionId, credentialId) =>
 			storage.sessions.permits(provider, sessionId, credentialId),
-		// A main `SessionsApi` without `permitsIdentity` cannot place the identity in the session's pool, so it
-		// answers no: a worker's key retry then waits for no disabled login of the provider (fail closed).
+		// A worker's key retry asks once `sessions.permits` refused a disabled login. A main `SessionsApi`
+		// without `permitsIdentity` cannot place it in the session's pool: the answer is no, so the worker waits for
+		// no such login (fail closed), and one warning per provider says why, as in-process.
 		"sessions.permitsIdentity": (storage, provider, sessionId, identityKey) =>
-			storage.sessions.permitsIdentity?.(provider, sessionId, identityKey) ?? false,
+			permitsIdentityOrWarn(storage.sessions, provider, sessionId, identityKey, state.warnedUnreadablePools),
 		"sessions.release": (storage, provider, sessionId) => storage.sessions.release(provider, sessionId),
 
 		"usage.reports": (storage, options) =>

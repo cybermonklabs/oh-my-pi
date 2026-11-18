@@ -59,12 +59,12 @@ export function hasActiveAccount(
 	summary: DisabledCredentialSummary,
 	accounts: readonly UsageAccountIdentity[],
 ): boolean {
+	const tombstone = TOMBSTONE_IDENTIFIERS.map(field => [field, summary[field]?.toLowerCase()] as const);
 	return accounts.some(account => {
 		if (account.provider !== summary.provider) return false;
 		if (summary.identityKey) return account.identityKey === summary.identityKey;
 		let shared = false;
-		for (const field of TOMBSTONE_IDENTIFIERS) {
-			const ours = summary[field]?.toLowerCase();
+		for (const [field, ours] of tombstone) {
 			const theirs = account[field]?.toLowerCase();
 			if (!ours || !theirs) continue;
 			// Both sides carry it and they differ: another seat, organization or account.

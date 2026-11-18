@@ -672,6 +672,13 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		);
 	}
 
+	/** The cause of each of the broker's disabled anthropic logins, by the login's email. */
+	async function disabledCausesByEmail(): Promise<Record<string, string>> {
+		return Object.fromEntries(
+			(await storage!.credentials.listDisabled("anthropic")).map(row => [row.email, row.cause]),
+		);
+	}
+
 	test("lists only the disabled logins of accounts in the pool", async () => {
 		// If this regresses, a pooled client reads another account's failure as its own: a turn waits for a key that
 		// login never gives this client, and `/logout` offers to remove that account on the shared broker.
@@ -685,10 +692,10 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		// shared broker: no client waits for that login any more, and `omp usage` stops reporting it as lost.
 		await withPoolOfFailedLoginA(pooled => pooled.credentials.remove("anthropic"));
 
-		const causes = Object.fromEntries(
-			(await storage!.credentials.listDisabled("anthropic")).map(row => [row.email, row.cause]),
-		);
-		expect(causes).toEqual({ "a@example.com": DELETED_BY_USER, "b@example.com": FAILURE_CAUSE });
+		expect(await disabledCausesByEmail()).toEqual({
+			"a@example.com": DELETED_BY_USER,
+			"b@example.com": FAILURE_CAUSE,
+		});
 	});
 
 	test("does not record a removal by id on the disabled login of an account outside the pool", async () => {
@@ -702,10 +709,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			expect(await pooled.credentials.disable(loginB.id, DELETED_BY_USER)).toBe(false);
 		});
 
-		const causes = Object.fromEntries(
-			(await storage!.credentials.listDisabled("anthropic")).map(row => [row.email, row.cause]),
-		);
-		expect(causes).toEqual({ "a@example.com": FAILURE_CAUSE, "b@example.com": FAILURE_CAUSE });
+		expect(await disabledCausesByEmail()).toEqual({ "a@example.com": FAILURE_CAUSE, "b@example.com": FAILURE_CAUSE });
 	});
 
 	test("evicts cold sticky sessions while preserving recently accessed sessions", () => {

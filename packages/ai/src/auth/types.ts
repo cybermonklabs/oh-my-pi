@@ -1312,7 +1312,7 @@ export interface SessionsApi {
 	 * restricted session rejects missing identities and keys outside its list.
 	 * A custom implementation should provide it. Without it, a caller cannot tell
 	 * which disabled logins a restricted session's pool holds: omp's key retry
-	 * then waits for none of them in that session, and logs a warning.
+	 * then waits for none of them in that session, and logs one warning per provider.
 	 */
 	permitsIdentity?(provider: string, sessionId: string, identityKey: string | undefined): boolean;
 	/**

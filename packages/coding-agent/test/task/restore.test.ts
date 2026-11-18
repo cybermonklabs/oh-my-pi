@@ -683,31 +683,26 @@ describe("restoreSession (omp --restore)", () => {
 		});
 	}
 
-	for (const [turn, laterTurn] of Object.entries(laterTurns)) {
-		it(`does not relaunch a subagent stranded without its key whose worker crashed while its parent lived on, after which ${turn}`, async () => {
-			// If this regresses, a lost worker's result reads as unsettled after the parent read it and went on:
-			// `--restore` relaunches the subagent, and the parent receives a second result for a call it acted on.
-			const { outcome, followUp } = await restoreAfterSyncResult(crashedWorkerRun, (main, result) => {
-				main.appendMessage(result);
-				main.appendMessage(laterTurn());
+	const settledRuns: Array<[run: string, result: Partial<SingleResult>]> = [
+		["whose worker crashed while its parent lived on", crashedWorkerRun],
+		["whose aborted run's result its parent read", unsettledRunResults["the run its process exit cut off"]!],
+	];
+	for (const [run, result] of settledRuns) {
+		for (const [turn, laterTurn] of Object.entries(laterTurns)) {
+			it(`does not relaunch a subagent stranded without its key ${run}, after which ${turn}`, async () => {
+				// If this regresses, a lost worker's or an aborted run's result reads as unsettled after the parent read
+				// it and went on: `--restore` relaunches the subagent, and the parent receives a second result for a call
+				// it acted on.
+				const { outcome, followUp } = await restoreAfterSyncResult(result, (main, message) => {
+					main.appendMessage(message);
+					main.appendMessage(laterTurn());
+				});
+
+				expect(outcome).toEqual({ turn: false, subagents: [] });
+				expect(followUp).not.toHaveBeenCalled();
 			});
-
-			expect(outcome).toEqual({ turn: false, subagents: [] });
-			expect(followUp).not.toHaveBeenCalled();
-		});
+		}
 	}
-
-	it("does not relaunch a subagent stranded without its key whose aborted run's result its parent answered", async () => {
-		// If this regresses, an aborted run's result reads as unsettled after the parent read it and went on:
-		// `--restore` relaunches the subagent, and the parent receives a second result for a call it acted on.
-		const { outcome, followUp } = await restoreAfterSyncResult({ aborted: true }, (main, result) => {
-			main.appendMessage(result);
-			main.appendMessage(laterTurns["the parent answered it"]!());
-		});
-
-		expect(outcome).toEqual({ turn: false, subagents: [] });
-		expect(followUp).not.toHaveBeenCalled();
-	});
 
 	for (const [end, endTurn] of Object.entries(exitTurnEnds)) {
 		it(`relaunches a subagent stranded without its key whose worker its parent's exit lost, the call's result followed only by ${end}`, async () => {
