@@ -14,6 +14,7 @@ import securityRequestPrompt from "../prompts/security/scan-request.md" with { t
 import securityPublishDescription from "../prompts/tools/security-publish.md" with { type: "text" };
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
+import type { AgentSessionDisposeOptions } from "../session/agent-session-types";
 import type { AuthStorage } from "../session/auth-storage";
 import { plainTurnAbortReason } from "../session/exit-diagnostics";
 import { SessionManager } from "../session/session-manager";
@@ -126,7 +127,7 @@ export interface SecurityScanSession {
 		premiumRequests: number;
 	};
 	abort(options?: { reason?: string }): Promise<void>;
-	dispose(): Promise<void>;
+	dispose(options?: AgentSessionDisposeOptions): Promise<void>;
 	readonly sessionFile?: string;
 }
 
@@ -718,7 +719,9 @@ export class SecurityCoordinator {
 			this.#update(record, cancelled ? "cancelled" : "failed", message);
 			await store.putBundle(terminal);
 		} finally {
-			await session?.dispose().catch(() => undefined);
+			// The host session goes on: the scan session's end stops its own jobs, and those of the
+			// idle agents its lifecycle teardown releases, instead of cutting them off as an exit does.
+			await session?.dispose({ ownedJobsEnd: "stop" }).catch(() => undefined);
 			await executionTarget?.cleanup().catch(() => undefined);
 			ACTIVE_SECURITY_OPERATIONS.delete(record.snapshot.operationId);
 		}

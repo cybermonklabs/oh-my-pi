@@ -25,7 +25,7 @@
 import * as fs from "node:fs/promises";
 import { logger, postmortem, untilAborted } from "@oh-my-pi/pi-utils";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
-import type { AgentSessionDisposeOptions } from "../session/agent-session-types";
+import type { AgentSessionDisposeOptions, OwnedJobsEnd } from "../session/agent-session-types";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import {
 	type AgentRef,
@@ -166,8 +166,11 @@ export interface AgentLifecycleApi {
 	ensureLive(id: string): Promise<AgentSessionHandle>;
 	/** Dispose if live and drop timers; `tombstone` keeps a terminal `aborted` row. */
 	release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean>;
-	/** Tear down every adopted agent. */
-	dispose(deadlineAt?: number): Promise<void>;
+	/**
+	 * Tear down every adopted agent. `ownedJobsEnd` says how the own jobs of an idle agent end:
+	 * cut off by default (the process exit), stopped when the process goes on.
+	 */
+	dispose(deadlineAt?: number, ownedJobsEnd?: OwnedJobsEnd): Promise<void>;
 }
 
 export class AgentLifecycleManager implements AgentLifecycleApi {
@@ -445,9 +448,10 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				this.#registry.setStatus(id, "parked", ref);
 
 				try {
-					// A park puts an idle agent to sleep; nothing stopped it, so its own jobs are
-					// cut off, not stopped, as the process teardown cuts them off.
-					await session.dispose({ ownedJobsEnd: "shutdown" });
+					// A park happens while the process runs: it stops the agent's own jobs, so
+					// their subagents end stopped and stay revivable, and `omp --restore` leaves
+					// them. Only the process teardown cuts them off.
+					await session.dispose({ ownedJobsEnd: "stop" });
 				} catch (error) {
 					logger.warn("AgentLifecycleManager.park: session dispose failed", { id, error: String(error) });
 				}
@@ -702,18 +706,26 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		return true;
 	}
 
-	/** Teardown everything; disposing the global manager makes its next owner a fresh instance. */
-	async dispose(deadlineAt: number = Date.now() + AGENT_RELEASE_GRACE_MS): Promise<void> {
+	/**
+	 * Teardown everything; disposing the global manager makes its next owner a fresh instance.
+	 * `ownedJobsEnd` says how the own jobs of each idle agent end: cut off at the process exit,
+	 * the default; stopped when the process goes on (a top-level session that ends while the
+	 * process serves others), as a park stops them.
+	 */
+	async dispose(
+		deadlineAt: number = Date.now() + AGENT_RELEASE_GRACE_MS,
+		ownedJobsEnd: OwnedJobsEnd = "shutdown",
+	): Promise<void> {
 		this.#unsubscribe?.();
 		this.#disposed = true;
 		this.#unsubscribe = undefined;
 		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
-		// The process teardown cuts every agent's own jobs off, idle or running: their
-		// subagents are parked, not stopped, so `omp --restore` goes on with them. A turn
-		// still running (a revived or woken agent) is cut off too, not stopped: its session
-		// records a process exit, so `omp --restore` goes on with it. An idle agent's
-		// `session_exit` record stays a plain dispose.
-		const idle: AgentReleaseOptions = { dispose: { ownedJobsEnd: "shutdown" } };
+		// At the process exit, the subagents of an idle agent's own jobs are parked, not
+		// stopped, so `omp --restore` goes on with them. A turn still running (a revived or
+		// woken agent) is cut off either way, not stopped: its session records a process
+		// exit, so `omp --restore` goes on with it. An idle agent's `session_exit` record
+		// stays a plain dispose.
+		const idle: AgentReleaseOptions = { dispose: { ownedJobsEnd } };
 		const running: AgentReleaseOptions = { dispose: { reason: postmortem.Reason.EXIT, ownedJobsEnd: "shutdown" } };
 		await Promise.all(
 			ids.map(async id => {

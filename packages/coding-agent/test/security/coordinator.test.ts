@@ -22,6 +22,7 @@ import {
 	type SecurityScanBundle,
 	SecurityStore,
 } from "../../src/security";
+import type { AgentSessionDisposeOptions } from "../../src/session/agent-session-types";
 import { SessionManager } from "../../src/session/session-manager";
 
 const MOCK_SOURCE_ID = "security-coordinator-test";
@@ -324,6 +325,41 @@ describe("native security coordinator", () => {
 		const bundle = await (await storeFactory()).getBundle(terminal.scanId);
 		expect(bundle?.scan.status).toBe("cancelled");
 		expect(bundle?.findings).toEqual([]);
+	});
+	test("ends the scan session with a stop of its jobs, as the host session goes on", async () => {
+		// If this regresses, a scan's end cuts off the jobs of the scan session and of the idle subagents its lifecycle
+		// teardown releases, as a process exit does: their subagents record a process exit that did not happen, and
+		// `omp --restore` relaunches their turns.
+		const disposals: Array<AgentSessionDisposeOptions | undefined> = [];
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				settings,
+				authStorage,
+				modelRegistry,
+				activeModel: mock.model,
+				sessionId: "parent-session",
+			},
+			{
+				openStore: storeFactory,
+				gitAdapter,
+				createSession: async () => ({
+					prompt: async () => true,
+					waitForIdle: async () => undefined,
+					hasPendingAsyncWork: () => false,
+					settleAsyncWork: async () => undefined,
+					abort: async () => undefined,
+					dispose: async options => {
+						disposals.push(options);
+					},
+				}),
+			},
+		);
+		const plan = await coordinator.preflight({ credentialId, model: mock.model });
+		const started = await coordinator.start({ planId: plan.id });
+		await coordinator.wait(started.operationId);
+		expect(disposals).toEqual([{ ownedJobsEnd: "stop" }]);
 	});
 	test("ref-diff execution checks out the immutable head and supplies the exact diff", async () => {
 		await $`git init --initial-branch=main`.cwd(repositoryRoot).quiet();

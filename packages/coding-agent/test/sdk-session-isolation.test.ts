@@ -16,6 +16,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { turnAbortKind } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -372,14 +373,15 @@ describe("createAgentSession session storage isolation", () => {
 		expect(suspend).toHaveBeenCalledWith(
 			{ ownerId: "Main", parentSessionId, parentSessionFile },
 			session.asyncJobManager,
-			"shutdown",
+			"stop",
 		);
 		expect(suspend.mock.invocationCallOrder[0]).toBeLessThan(lifecycleDispose.mock.invocationCallOrder[0]);
 	});
 
-	it("cuts off the turns of its Vibe workers at its teardown", async () => {
-		// If this regresses, the parent's teardown stops a worker's turn: the worker's run ends as stopped work,
-		// its own jobs stop with it, and `omp --restore` leaves what the teardown cut off.
+	it("stops the turns of its Vibe workers at its teardown", async () => {
+		// If this regresses, the parent's teardown cuts a worker's turn off: the worker's branch stays restorable, and
+		// `/restart` or `omp --restore` relaunches it as a plain task, though a vibe turn a restart interrupts is not
+		// resumed (`docs/vibe-mode.md`).
 		VibeSessionRegistry.resetGlobalForTests();
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-vibe-teardown-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
@@ -415,7 +417,7 @@ describe("createAgentSession session storage isolation", () => {
 					"abort",
 					() => {
 						turnAbortReason.resolve(signal.reason);
-						ended.resolve("cut off");
+						ended.resolve("stopped");
 					},
 					{ once: true },
 				);
@@ -427,7 +429,10 @@ describe("createAgentSession session storage isolation", () => {
 
 		await session.dispose();
 
-		expect(await turnAbortReason.promise).toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+		// `turnAbortKind` reads the shutdown symbol as a stop too, so the reason must not be the shutdown's.
+		const reason = await turnAbortReason.promise;
+		expect(reason).not.toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+		expect(turnAbortKind(reason)).toBe("stop");
 	});
 
 	it("wires the discovered TTSR manager into the created session", async () => {

@@ -4,14 +4,19 @@ import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai";
 import { redactSensitiveCredentials } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { bindEffects } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAcpSessionFactory } from "@oh-my-pi/pi-coding-agent/main";
-import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
+import { type CreateAgentSessionResult, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionDisposeOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { turnAbortKind } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import type { AgentSideConnection } from "@oh-my-pi/pi-utils/acp";
 import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const authStorage = createInMemoryAuthStorage();
@@ -114,6 +119,127 @@ describe("concurrent ACP sessions", () => {
 				if (!session.isDisposed) await session.dispose();
 			}
 			releaseLaunch();
+			launchSettings.cancelPendingSaves();
+			// The persisted instance opened agent storage under the temp dir removed below.
+			AgentStorage.close();
+		}
+	});
+});
+
+describe("an ACP session the factory rejects", () => {
+	it("stops its jobs, since the server goes on serving its other sessions", async () => {
+		// If this regresses, a rejected `session/new` (a bad flag value, an unknown tool) cuts off the jobs of the idle
+		// subagents its lifecycle teardown releases, as the server's exit does: their subagents record a process exit
+		// that did not happen, and `omp --restore` relaunches their turns.
+		using dir = TempDir.createSync("@pi-acp-session-rejected-");
+		const settings = Settings.isolated();
+		const disposals: Array<AgentSessionDisposeOptions | undefined> = [];
+		const rejectedSession = {
+			extensionRunner: undefined,
+			model: undefined,
+			getAllToolNames: () => ["read"],
+			dispose: async (options?: AgentSessionDisposeOptions) => {
+				disposals.push(options);
+			},
+		};
+		const factoryFor = (parsedArgs: { invalidFlagValues: string[]; tools?: string[] }) =>
+			createAcpSessionFactory({
+				baseOptions: {},
+				settings,
+				sessionDir: dir.join("sessions"),
+				authStorage,
+				modelRegistry,
+				parsedArgs,
+				rawArgs: [],
+				createSession: async () => ({ session: rejectedSession }) as unknown as CreateAgentSessionResult,
+			});
+
+		await expect(factoryFor({ invalidFlagValues: ["--bad needs a value"] })(dir.path())).rejects.toThrow(
+			"--bad needs a value",
+		);
+		await expect(factoryFor({ invalidFlagValues: [], tools: ["no-such-tool"] })(dir.path())).rejects.toThrow(
+			"no-such-tool",
+		);
+		expect(disposals).toEqual([{ ownedJobsEnd: "stop" }, { ownedJobsEnd: "stop" }]);
+	});
+});
+
+describe("an ACP session/close", () => {
+	it("stops a job the closed session still runs, since the server goes on serving its other sessions", async () => {
+		// If this regresses, `session/close` aborts the session's running jobs with the job manager's shutdown reason, as
+		// the server's exit does: the task executor reads it as a process exit, records one for the job's subagent that
+		// did not happen, and `omp --restore` relaunches its turn.
+		using dir = TempDir.createSync("@pi-acp-session-close-");
+		const launchSettings = await Settings.loadIsolated({ cwd: dir.path(), agentDir: dir.join("agent") });
+		const factory = createAcpSessionFactory({
+			baseOptions: {
+				agentDir: dir.join("agent"),
+				model,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				rules: [],
+				enableLsp: false,
+				skipPythonPreflight: true,
+			},
+			settings: launchSettings,
+			sessionDir: dir.join("sessions"),
+			authStorage,
+			modelRegistry,
+			parsedArgs: { invalidFlagValues: [] },
+			rawArgs: [],
+			createSession: createAgentSession,
+		});
+		const sessions: AgentSession[] = [];
+		const connection = {
+			sessionUpdate: async () => {},
+			extNotification: async () => {},
+			signal: new AbortController().signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection;
+		const acp = new AcpAgent(connection, async (cwd, options) => {
+			const created = await factory(cwd, options);
+			sessions.push(created.session);
+			return created;
+		});
+		try {
+			await acp.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			const { sessionId } = await acp.newSession({ cwd: dir.path(), mcpServers: [] });
+			const session = sessions[0];
+			const manager = session?.asyncJobManager;
+			const ownerId = session?.getAgentId();
+			if (!session || !manager || !ownerId) throw new Error("Expected a live ACP session with its own job manager");
+			// A background job of the session (its `task` subagent, an eval `agent()` handle) still running at the close.
+			const abortReason = Promise.withResolvers<unknown>();
+			manager.register(
+				"task",
+				"background work",
+				({ signal }) => {
+					const ended = Promise.withResolvers<string>();
+					signal.addEventListener(
+						"abort",
+						() => {
+							abortReason.resolve(signal.reason);
+							ended.resolve("ended");
+						},
+						{ once: true },
+					);
+					return ended.promise;
+				},
+				{ ownerId },
+			);
+
+			await acp.closeSession({ sessionId });
+
+			expect(session.isDisposed).toBe(true);
+			// `turnAbortKind` reads the shutdown symbol as a stop too, so the reason must not be the shutdown's.
+			const reason = await abortReason.promise;
+			expect(reason).not.toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+			expect(turnAbortKind(reason)).toBe("stop");
+		} finally {
+			await acp.dispose();
 			launchSettings.cancelPendingSaves();
 			// The persisted instance opened agent storage under the temp dir removed below.
 			AgentStorage.close();

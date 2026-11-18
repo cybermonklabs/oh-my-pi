@@ -560,18 +560,22 @@ result:
   parent's process exit or shutdown cuts it off. An abort reason that says
   neither cuts it off.
 - A subagent's own jobs (its eval `agent()` handles, its workpool batches) follow
-  how it ended: its kill, or the end of its run after a stop or a finish, stops
-  their subagents; any other end cuts them off, whether the subagent is idle or
-  running: its parent's process exit or shutdown (which also cuts off the jobs that
-  a follow-up or IRC wake turn of an idle subagent started), or its park. A vibe
-  worker's turn and its own jobs end the same way: its parent's teardown cuts them
-  off, and a switch of the parent session stops them. A `/tan` clone's own jobs
-  follow its background job: a cancel of the job, or the tan's finish, stops them,
-  and the parent's shutdown cuts them off. `--restore`
-  also leaves every subagent under a subagent that was killed or whose last turn a
-  stop ended (the user's interrupt, or "Retry cancelled"), even one that a cancel
-  without a reason cut off. The session itself is no such ancestor: its own stop
-  leaves its background jobs running.
+  how it ended: its kill, its park, or the end of its run after a stop or a finish,
+  stops their subagents; its parent's process exit cuts them off, whether the
+  subagent is idle or running (which also cuts off the jobs that a follow-up or IRC
+  wake turn of an idle subagent started). Only the process exit cuts them off: a
+  top-level session that ends while the process goes on (an ACP session's close,
+  the end of a `/security` scan or another helper session, a headless session that
+  a failed `/move` ends) stops them instead, and its own background jobs too, so no
+  process exit is recorded for their subagents and `--restore` does not relaunch
+  them. A vibe worker's turn and its own jobs stop at its parent's teardown and at a
+  switch of the parent session, so `--restore` does not relaunch a vibe turn. A
+  `/tan` clone's own jobs follow its background job: a cancel of the job, or the
+  tan's finish, stops them, and the parent's process exit cuts them off.
+  `--restore` also leaves every subagent under a subagent that was
+  killed or whose last turn a stop ended (the user's interrupt, or "Retry
+  cancelled"), even one that a cancel without a reason cut off. The session itself
+  is no such ancestor: its own stop leaves its background jobs running.
 
 Nothing else is continued when the last turn finished, failed, or the user interrupted
 it, or when a normal exit was recorded after it (the user quit with it

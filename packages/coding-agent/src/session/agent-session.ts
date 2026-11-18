@@ -3610,8 +3610,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Each job aborts with `reason`, whose kind a subagent of the job reads
 	 * ({@link turnAbortKind}): a lifecycle transition of the session itself (`/new`,
 	 * a switch, a branch, a context reset) stops it; a dispose ends it as the dispose
-	 * says ({@link AgentSessionDisposeOptions.ownedJobsEnd}): a stop for a kill or for
-	 * the release of a subagent whose run a stop or its finish ended, a cut-off otherwise.
+	 * says ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 	 */
 	#cancelOwnAsyncJobs(reason: unknown): void {
 		if (!this.#agentId) return;
@@ -6686,13 +6685,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#unregisterAsyncDeliverySink = undefined;
 		const manager = this.#ownedAsyncJobManager;
 		// The kind of the session's end reaches the subagents of its jobs (eval `agent()`
-		// handles, workpool batches; {@link turnAbortKind}). A dispose that stops the session (a
-		// kill, the release of a subagent whose run a stop or its finish ended) stops them, so
-		// their subagents end with it and `--restore` leaves them. Any other dispose, idle or
-		// running (the process exit, the lifecycle's teardown or park of a subagent, the
-		// top-level session that owns the manager), cuts them off with the shutdown reason: the
-		// task executor parks (rather than tombstones) their subagents, so `omp --restore` goes
-		// on with them.
+		// handles, workpool batches; {@link turnAbortKind}): the dispose says it
+		// ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 		this.#cancelOwnAsyncJobs(ownedJobsAbortReason(ownedJobsEnd));
 		if (!manager) return;
 

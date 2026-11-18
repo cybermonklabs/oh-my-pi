@@ -65,6 +65,7 @@ import { theme } from "@oh-my-pi/pi-tui/theme";
 import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
 import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSessionDisposeOptions } from "../../session/agent-session-types";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
@@ -146,6 +147,14 @@ export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
 const ACP_CANCEL_CLEANUP_TIMEOUT_MS = PYTHON_KERNEL_CANCEL_BUDGET_MS + 1_000;
 const ACP_ASYNC_DELIVERY_DRAIN_TIMEOUT_MS = 250;
 const ACP_ASYNC_DELIVERY_DRAIN_MAX_PASSES = 3;
+
+/**
+ * Dispose of a session the server drops while it goes on serving others (a close, or a
+ * session that failed to open): it stops the session's own jobs, and those of the idle
+ * agents its lifecycle teardown releases, rather than cutting them off as the server's
+ * exit does.
+ */
+const ACP_SESSION_DROP_DISPOSE: AgentSessionDisposeOptions = { ownedJobsEnd: "stop" };
 
 /**
  * `<agentDir>/acp-session-handles.json` maps ACP handles whose durable session an
@@ -1825,7 +1834,7 @@ export class AcpAgent implements Agent {
 		try {
 			await session.sessionManager.ensureOnDisk();
 		} catch (error) {
-			await this.#disposeStandaloneSession(session);
+			await this.#disposeStandaloneSession(session, ACP_SESSION_DROP_DISPOSE);
 			throw error;
 		}
 		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
@@ -1898,7 +1907,7 @@ export class AcpAgent implements Agent {
 				throw new Error(`ACP session fork failed: ${params.sessionId}`);
 			}
 		} catch (error) {
-			await this.#disposeStandaloneSession(session);
+			await this.#disposeStandaloneSession(session, ACP_SESSION_DROP_DISPOSE);
 			throw error;
 		}
 		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
@@ -1921,7 +1930,7 @@ export class AcpAgent implements Agent {
 				throw new Error(`ACP session load was cancelled: ${protocolSessionId}`);
 			}
 		} catch (error) {
-			await this.#disposeStandaloneSession(session);
+			await this.#disposeStandaloneSession(session, ACP_SESSION_DROP_DISPOSE);
 			throw error;
 		}
 		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, protocolSessionId);
@@ -1957,7 +1966,7 @@ export class AcpAgent implements Agent {
 			this.#sessions.set(record.protocolSessionId, record);
 			return record;
 		} catch (error) {
-			await this.#disposeSessionRecord(record);
+			await this.#disposeSessionRecord(record, ACP_SESSION_DROP_DISPOSE);
 			throw error;
 		}
 	}
@@ -3469,7 +3478,7 @@ export class AcpAgent implements Agent {
 		record.closedError ??= RequestError.resourceNotFound(sessionId);
 		this.#sessions.delete(sessionId);
 		await this.#cancelPromptForClose(record);
-		await this.#disposeSessionRecord(record);
+		await this.#disposeSessionRecord(record, ACP_SESSION_DROP_DISPOSE);
 	}
 
 	async #cancelPromptForClose(record: ManagedSessionRecord): Promise<void> {
@@ -3485,7 +3494,7 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
+	async #disposeSessionRecord(record: ManagedSessionRecord, options: AgentSessionDisposeOptions): Promise<void> {
 		record.lifetimeUnsubscribe?.();
 		record.commandMetadataUnsubscribe?.();
 		record.pendingCompactionNotifications = undefined;
@@ -3498,15 +3507,15 @@ export class AcpAgent implements Agent {
 			record.mcpManager = undefined;
 		}
 		try {
-			await record.session.dispose({ reason });
+			await record.session.dispose(options);
 		} catch (error) {
 			logger.warn("Failed to dispose ACP session", { error });
 		}
 	}
 
-	async #disposeStandaloneSession(session: AgentSession, reason?: postmortem.Reason): Promise<void> {
+	async #disposeStandaloneSession(session: AgentSession, options: AgentSessionDisposeOptions): Promise<void> {
 		try {
-			await session.dispose({ reason });
+			await session.dispose(options);
 		} catch (error) {
 			logger.warn("Failed to dispose ACP session", { error });
 		}
@@ -3527,7 +3536,7 @@ export class AcpAgent implements Agent {
 					try {
 						record.closedError ??= RequestError.resourceNotFound(sessionId);
 						await this.#cancelPromptForClose(record);
-						await this.#disposeSessionRecord(record, reason);
+						await this.#disposeSessionRecord(record, { reason });
 					} catch (error) {
 						logger.warn("Failed to clean up ACP session", { acpSessionId: sessionId, error });
 					}
@@ -3537,7 +3546,7 @@ export class AcpAgent implements Agent {
 			const initialSession = this.#initialSession;
 			this.#initialSession = undefined;
 			if (initialSession) {
-				await this.#disposeStandaloneSession(initialSession, reason);
+				await this.#disposeStandaloneSession(initialSession, { reason });
 			}
 		})();
 

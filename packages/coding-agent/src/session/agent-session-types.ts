@@ -84,10 +84,14 @@ export interface AgentSessionDisposeOptions {
 	reason?: postmortem.Reason;
 	/**
 	 * How this dispose ends the jobs the session owns ({@link OwnedJobsEnd}). A dispose that
-	 * names none cuts them off, as `"shutdown"` does: only a path that stops the session
-	 * says `"stop"` (a kill, which a tombstone release says for its caller; the release of a
-	 * subagent whose run a stop or its finish ended; a `/tan` clone whose job a stop or its
-	 * finish ended).
+	 * names none cuts them off, as `"shutdown"` does; the disposes that rely on it are the
+	 * top-level session's dispose at the process exit and the sessions that never ran a turn,
+	 * which own no jobs. `"stop"` is said by a kill (which a tombstone release says for its
+	 * caller), the release of a subagent whose run a stop or its finish ended, a park, a vibe
+	 * worker's release at its parent's teardown or at a switch of the parent session, a `/tan`
+	 * clone whose job a stop or its finish ended, and a top-level session that ends while the
+	 * process serves others (an ACP session's close, a helper session's end). A top-level
+	 * session's dispose passes its kind on to the idle agents its lifecycle teardown releases.
 	 * Apart from {@link reason}, so the process teardown cuts off an idle subagent's jobs
 	 * while its `session_exit` record stays a plain dispose.
 	 */

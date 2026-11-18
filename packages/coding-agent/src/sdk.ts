@@ -5572,14 +5572,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							settings,
 							getActiveModelString,
 						};
-						// The teardown cuts the workers' turns and their own jobs off, as the
-						// lifecycle's teardown below cuts off every adopted agent's own jobs.
+						// The teardown stops the workers' turns and their own jobs: a vibe turn the
+						// parent's teardown interrupts is not resumed (`docs/vibe-mode.md`).
 						await vibeRegistry.suspendScope(
 							vibeRegistry.ownerScope(vibeParentSession),
 							scopedAsyncJobManager,
-							"shutdown",
+							"stop",
 						);
-						await AgentLifecycleManager.global().dispose();
+						// Every adopted agent's own jobs end as this dispose ends the session's own: cut off
+						// at the process exit, stopped by a dispose that says so while the process goes on.
+						await AgentLifecycleManager.global().dispose(undefined, disposeOptions?.ownedJobsEnd);
 					}
 					await originalDispose(disposeOptions);
 				} finally {
@@ -5967,7 +5969,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	} catch (error) {
 		try {
 			if (hasSession) {
-				await session.dispose();
+				// A session that failed to start is no process exit: the process may serve other
+				// sessions, whose adopted agents a top-level dispose's lifecycle teardown releases.
+				await session.dispose({ ownedJobsEnd: "stop" });
 				if (hasRegistered) unregisterUnlessParked();
 			} else {
 				if (hasRegistered) unregisterUnlessParked();

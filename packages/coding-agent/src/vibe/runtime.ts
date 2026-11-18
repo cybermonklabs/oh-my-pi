@@ -1025,8 +1025,8 @@ export class VibeSessionRegistry {
 	/**
 	 * Detach one parent's process-local workers without tombstoning their persisted conversations.
 	 * `end` says how the worker turns it cancels, and the jobs each worker owns, end ({@link OwnedJobsEnd}):
-	 * the parent's teardown cuts them off (a worker turn is a detached run, which parks on the shutdown
-	 * reason, so `omp --restore` goes on with it); a switch of the parent session stops them.
+	 * the parent's teardown and a switch of the parent session both stop them, so `omp --restore` does
+	 * not relaunch a worker turn they interrupt (a vibe turn interrupted by a restart is not resumed).
 	 */
 	async suspendScope(
 		scope: VibeOwnerScope,

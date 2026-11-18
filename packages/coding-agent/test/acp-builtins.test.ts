@@ -13,6 +13,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins";
 import { MarketplaceManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
 import type { AgentSession, AsyncJobTree } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionDisposeOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import type { SessionDumpArchive } from "@oh-my-pi/pi-coding-agent/session/session-dump-format";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
@@ -59,7 +60,7 @@ interface FakeAcpBuiltinSession {
 	markMovedFromEmptySessionFile(sessionFile: string): void;
 	fork(): Promise<boolean>;
 	handoff(instr?: string): Promise<{ document: string; savedPath?: string } | undefined>;
-	dispose(): Promise<void>;
+	dispose(options?: AgentSessionDisposeOptions): Promise<void>;
 	exportToHtml(outputPath?: string): Promise<string>;
 	effectiveExtensionRoots: unknown;
 	setTitleSystemPrompt(prompt: string | undefined): void;
@@ -1703,7 +1704,10 @@ describe("wave 5 — adapters and polish", () => {
 });
 
 describe("/move preflight flush", () => {
-	it("disposes the session when headless workspace rollback cannot recover", async () => {
+	it("disposes the session with a stop of its jobs when headless workspace rollback cannot recover", async () => {
+		// If this regresses, the failed move's end of the session cuts off its jobs and those of the idle subagents its
+		// lifecycle teardown releases, as a process exit does, though the process goes on: their subagents record a
+		// process exit that did not happen, and `omp --restore` relaunches their turns.
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acp-move-fatal-"));
 		const originalProjectDir = getProjectDir();
 		const { output, runtime, session } = createRuntime();
@@ -1716,6 +1720,7 @@ describe("/move preflight flush", () => {
 
 			expect(result).toEqual({ consumed: true });
 			expect(dispose).toHaveBeenCalledTimes(1);
+			expect(dispose).toHaveBeenCalledWith({ ownedJobsEnd: "stop" });
 			expect(output.some(text => text.includes("failed to re-align workspace"))).toBe(true);
 		} finally {
 			reloadForCwd.mockRestore();
