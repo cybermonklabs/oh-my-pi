@@ -26,6 +26,30 @@ function mockFrozenClock(): void {
 }
 
 /**
+ * A clock that does not advance until `start()`, then advances 1 ms per read.
+ * While it is still, no slice expires: a pass's discoveries finish in
+ * microtasks, and a fetcher that waits for one timer resolves after all of them.
+ */
+function mockClockStillUntilStarted(): { start: () => void } {
+	let now = 1_000;
+	let running = false;
+	vi.spyOn(performance, "now").mockImplementation(() => (running ? now++ : now));
+	return { start: () => (running = true) };
+}
+
+/**
+ * Waits until a discovery of `provider` has listed exactly `modelIds`, then for
+ * one more timer. When that discovery was the last of its pass, the pass's
+ * fetches have all resolved by then, and it has its place in the commit order.
+ */
+async function untilDiscovered(registry: ModelRegistry, provider: string, modelIds: string[]): Promise<void> {
+	while (registry.getProviderDiscoveryState(provider)?.models.join("\n") !== modelIds.join("\n")) {
+		await new Promise(resolve => setTimeout(resolve, 0));
+	}
+	await new Promise(resolve => setTimeout(resolve, 0));
+}
+
+/**
  * Counts event loop turns until stopped. It ticks on `setTimeout(0)`, one of
  * the two macrotasks a sliced pass yields to, so `onTurn` runs about once per
  * slice rather than on every pass through the event loop.
@@ -122,7 +146,7 @@ describe("ModelRegistry discovery slicing", () => {
 	});
 
 	test("a pass whose fetches resolved first does not overwrite the rows of a pass that fetched later", async () => {
-		mockSteadyClock();
+		const clock = mockClockStillUntilStarted();
 		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
 		const row = (id: string) => ({
 			id,
@@ -134,7 +158,6 @@ describe("ModelRegistry discovery slicing", () => {
 			maxTokens: 8_192,
 		});
 		let fetches = 0;
-		const { promise: firstFetchDone, resolve: firstFetchResolved } = Promise.withResolvers<void>();
 		registry.registerProvider(
 			"ordered-provider",
 			{
@@ -144,9 +167,9 @@ describe("ModelRegistry discovery slicing", () => {
 				fetchDynamicModels: async () => {
 					fetches++;
 					if (fetches > 1) return [row("model-v2")];
-					// The full pass's other discoveries finish first, so its fetches resolve with this one.
-					await new Promise(resolve => setTimeout(resolve, 300));
-					queueMicrotask(firstFetchResolved);
+					// Every other discovery of the full pass has finished, so its fetches resolve with this one.
+					await new Promise(resolve => setTimeout(resolve, 0));
+					clock.start();
 					return [row("model-v1")];
 				},
 			},
@@ -154,8 +177,7 @@ describe("ModelRegistry discovery slicing", () => {
 		);
 		// The full pass fetches v1, and its fetches resolve; it then merges the whole catalog in slices.
 		const fullPass = registry.refresh("online");
-		await firstFetchDone;
-		for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+		await untilDiscovered(registry, "ordered-provider", ["model-v1"]);
 		// A scoped pass starts during that merge and fetches v2; it commits after the full pass.
 		await registry.refreshDiscoverableProviders(["ordered-provider"], "online");
 		await fullPass;
@@ -165,7 +187,7 @@ describe("ModelRegistry discovery slicing", () => {
 	});
 
 	test("a pass that stops before its commit does not let a later pass commit before an earlier one", async () => {
-		mockSteadyClock();
+		const clock = mockClockStillUntilStarted();
 		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
 		const row = (id: string) => ({
 			id,
@@ -177,7 +199,6 @@ describe("ModelRegistry discovery slicing", () => {
 			maxTokens: 8_192,
 		});
 		let fetches = 0;
-		const { promise: firstFetchDone, resolve: firstFetchResolved } = Promise.withResolvers<void>();
 		registry.registerProvider(
 			"chained-provider",
 			{
@@ -187,8 +208,8 @@ describe("ModelRegistry discovery slicing", () => {
 				fetchDynamicModels: async () => {
 					fetches++;
 					if (fetches > 1) return [row("model-v2")];
-					await new Promise(resolve => setTimeout(resolve, 300));
-					queueMicrotask(firstFetchResolved);
+					await new Promise(resolve => setTimeout(resolve, 0));
+					clock.start();
 					return [row("model-v1")];
 				},
 			},
@@ -197,8 +218,7 @@ describe("ModelRegistry discovery slicing", () => {
 		const order: string[] = [];
 		// A: a full pass whose fetches resolve with v1; it then merges in slices.
 		const fullPass = registry.refresh("online").then(() => order.push("full"));
-		await firstFetchDone;
-		for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+		await untilDiscovered(registry, "chained-provider", ["model-v1"]);
 		// B: a pass with nothing to commit, which stops between A and C.
 		await registry.refreshDiscoverableProviders(["no-such-provider"], "online").then(() => order.push("stopped"));
 		expect(registry.find("chained-provider", "model-v1")).toBeUndefined();
@@ -213,7 +233,7 @@ describe("ModelRegistry discovery slicing", () => {
 	});
 
 	test("a cache-served pass during an online pass's merge keeps the list the online pass fetched", async () => {
-		mockSteadyClock();
+		const clock = mockClockStillUntilStarted();
 		const modelsPath = tempDir.join("cfg", "models.json");
 		fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
 		fs.writeFileSync(
@@ -230,14 +250,13 @@ describe("ModelRegistry discovery slicing", () => {
 			}),
 		);
 		let listCalls = 0;
-		const { promise: secondListDone, resolve: secondListResolved } = Promise.withResolvers<void>();
 		const gatewayFetch: FetchImpl = async input => {
 			if (String(input) !== "http://127.0.0.1:9992/v1/models") throw new Error(`offline: ${String(input)}`);
 			listCalls++;
 			if (listCalls === 1) return Response.json({ data: [{ id: "keep-model" }, { id: "gone-model" }] });
-			// The online pass's other discoveries finish first, so its fetches resolve with this one.
-			await new Promise(resolve => setTimeout(resolve, 300));
-			queueMicrotask(secondListResolved);
+			// Every other discovery of the online pass has finished, so its fetches resolve with this one.
+			await new Promise(resolve => setTimeout(resolve, 0));
+			clock.start();
 			return Response.json({ data: [{ id: "keep-model" }] });
 		};
 		// An earlier start cached both rows.
@@ -246,8 +265,7 @@ describe("ModelRegistry discovery slicing", () => {
 		expect(registry.find("gateway", "gone-model")).toBeDefined();
 		// The online pass fetches a list without gone-model, writes the cache, then merges in slices.
 		const onlinePass = registry.refresh("online");
-		await secondListDone;
-		for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+		await untilDiscovered(registry, "gateway", ["keep-model"]);
 		// A scoped pass during that merge reads the fresh cache; it commits after the online pass.
 		await registry.refreshDiscoverableProviders(["gateway"], "online-if-uncached");
 		await onlinePass;
