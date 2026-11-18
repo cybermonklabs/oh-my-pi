@@ -17,9 +17,11 @@ import readPathTemplate from "../prompts/memories/read-path.md" with { type: "te
 import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { transcriptByteChunks } from "../session/session-loader";
 import {
 	defaultSessionStorage,
 	FileSessionStorage,
+	retryRacedRead,
 	type SessionStorage,
 	type SessionStorageStat,
 } from "../session/session-storage";
@@ -791,42 +793,13 @@ interface RolloutBytes {
 }
 
 /**
- * Open a rollout in `storage` for windowed reads, so a rollout of hundreds of
- * MB is never held whole: a file backend reads each window from disk, and a
- * storage with `readChunks`, which reads in bounded pieces (`session.storage:
- * sql`), streams each window from its first byte and stops at its last. Any
- * other storage (Redis, an SDK backend without chunked reads) is read once and
- * windowed in memory, the same read `loadSessionFile` performs there. A
- * missing rollout throws either way.
+ * Open a rollout file for windowed reads: each window is read from disk, so a
+ * rollout of hundreds of MB is never held whole. A missing rollout throws.
  */
-async function openRollout(rolloutPath: string, storage: SessionStorage): Promise<RolloutBytes> {
-	if (storage instanceof FileSessionStorage) {
-		const file = Bun.file(rolloutPath);
-		const { size } = await file.stat();
-		return { size, read: (start, end) => file.slice(start, end).bytes() };
-	}
-	if (storage.readChunks) {
-		const readChunks = storage.readChunks.bind(storage);
-		const { size } = storage.statSync(rolloutPath);
-		return { size, read: (start, end) => readPrefix(readChunks(rolloutPath, start), end - start) };
-	}
-	const bytes = new TextEncoder().encode(await storage.readText(rolloutPath));
-	return { size: bytes.length, read: async (start, end) => bytes.subarray(start, end) };
-}
-
-/** The first `length` bytes `chunks` yields, reading no further. */
-async function readPrefix(chunks: AsyncIterable<Uint8Array>, length: number): Promise<Uint8Array> {
-	const parts: Uint8Array[] = [];
-	let wanted = length;
-	if (wanted > 0) {
-		for await (const chunk of chunks) {
-			const part = chunk.byteLength > wanted ? chunk.subarray(0, wanted) : chunk;
-			parts.push(part);
-			wanted -= part.byteLength;
-			if (wanted === 0) break;
-		}
-	}
-	return Buffer.concat(parts);
+async function openRolloutFile(rolloutPath: string): Promise<RolloutBytes> {
+	const file = Bun.file(rolloutPath);
+	const { size } = await file.stat();
+	return { size, read: (start, end) => file.slice(start, end).bytes() };
 }
 
 /** Persistable messages from the start of the rollout, in file order, read window by window. */
@@ -869,13 +842,45 @@ async function* persistableMessagesFromBack(rollout: RolloutBytes): AsyncGenerat
 }
 
 /**
+ * Persistable messages of a rollout read as `chunks`, in file order, parsed a
+ * window of at most {@link STAGE1_ROLLOUT_WINDOW_BYTES} at a time; a record
+ * spanning windows is carried until its newline.
+ */
+async function* persistableMessagesFromChunks(chunks: AsyncIterable<Uint8Array>): AsyncGenerator<AgentMessage> {
+	const decoder = new TextDecoder();
+	let carry: Uint8Array | undefined;
+	for await (const chunk of chunks) {
+		for (let start = 0; start < chunk.byteLength; start += STAGE1_ROLLOUT_WINDOW_BYTES) {
+			const window = chunk.subarray(start, start + STAGE1_ROLLOUT_WINDOW_BYTES);
+			const bytes = carry ? Buffer.concat([carry, window]) : window;
+			const cut = bytes.lastIndexOf(0x0a) + 1;
+			carry = cut < bytes.length ? bytes.subarray(cut) : undefined;
+			if (cut > 0) yield* extractPersistableMessages(decoder.decode(bytes.subarray(0, cut)));
+		}
+	}
+	if (carry) yield* extractPersistableMessages(decoder.decode(carry));
+}
+
+/** The character budgets of a stage-1 payload of `tokenLimit` tokens: the whole, its head, its tail. */
+function stage1Budget(tokenLimit: number): { maxChars: number; headChars: number; tailChars: number } {
+	const maxChars = tokenLimit * 4;
+	const headChars = Math.floor(maxChars * 0.6);
+	return { maxChars, headChars, tailChars: maxChars - headChars };
+}
+
+/**
  * Build the stage-1 `response_items_json` payload for a rollout file.
  *
  * Equivalent to `truncateByApproxTokens(JSON.stringify(persistableMessages), tokenLimit)`, but
- * streams the rollout in byte windows and serializes messages from the front and back only until
- * the head/tail budgets fill. On a file backend or a storage with `readChunks`, peak memory is
- * bounded by the window size plus the largest single JSONL record (a record spanning windows is
- * carried until its newline), not by rollout size. The rollout is read through `storage`, where
+ * never holds the rollout whole. A file backend reads byte windows from the front and back only
+ * until the head and tail budgets fill. Any other storage (`session.storage: sql`, Redis, an SDK
+ * backend) is read in one pass from its start, through `readChunks` where it has it, keeping the
+ * head and the newest messages that fill the tail: separate window reads could join the head of
+ * one body to the tail of another that a rewrite put in its place, while a full rewrite between
+ * two chunks of one pass fails it, and the pass reads the rollout again from its start. Peak
+ * memory is bounded by the budgets plus a window and the largest single JSONL record (a record
+ * spanning windows is carried until its newline), not by rollout size (a storage without chunked
+ * reads holds the rollout's text once). The rollout is read through `storage`, where
  * {@link collectThreads} found it (the current session's).
  */
 export async function buildStage1RolloutItems(
@@ -883,12 +888,18 @@ export async function buildStage1RolloutItems(
 	tokenLimit: number,
 	storage: SessionStorage = defaultSessionStorage(),
 ): Promise<string> {
+	if (!(storage instanceof FileSessionStorage)) {
+		// A missing rollout throws, matching the previous whole-file read failure.
+		storage.statSync(rolloutPath);
+		if (tokenLimit <= 0) return "";
+		return retryRacedRead(() =>
+			stage1ItemsInOnePass(persistableMessagesFromChunks(transcriptByteChunks(rolloutPath, storage)), tokenLimit),
+		);
+	}
 	// Opening throws for a missing rollout, matching the previous whole-file read failure.
-	const rollout = await openRollout(rolloutPath, storage);
+	const rollout = await openRolloutFile(rolloutPath);
 	if (tokenLimit <= 0) return "";
-	const maxChars = tokenLimit * 4;
-	const headChars = Math.floor(maxChars * 0.6);
-	const tailChars = maxChars - headChars;
+	const { maxChars, headChars, tailChars } = stage1Budget(tokenLimit);
 
 	let head = "[";
 	let truncated = false;
@@ -915,6 +926,48 @@ export async function buildStage1RolloutItems(
 	}
 	// Every message consumed: the leading separator is really the array opener.
 	if (exhausted) tail = `[${tail.slice(1)}`;
+	return `${head.slice(0, headChars)}\n\n...[truncated]...\n\n${tail.slice(-tailChars)}`;
+}
+
+/**
+ * The payload {@link buildStage1RolloutItems} builds from the front and back
+ * windows of a file, from `messages` in file order, read once: the head as
+ * the front windows give it, and the newest messages, the fewest whose text
+ * reaches the tail budget, as the back windows give them.
+ */
+async function stage1ItemsInOnePass(messages: AsyncIterable<AgentMessage>, tokenLimit: number): Promise<string> {
+	const { maxChars, headChars, tailChars } = stage1Budget(tokenLimit);
+	let head = "[";
+	let truncated = false;
+	// The kept newest messages are `newest` from index `oldest` on; `tailLength` is the
+	// length of their text as the tail joins them: a `,` before each, and the closing `]`.
+	const newest: string[] = [];
+	let oldest = 0;
+	let tailLength = 1;
+	for await (const message of messages) {
+		const json = JSON.stringify(message);
+		if (!truncated) {
+			head += head.length === 1 ? json : `,${json}`;
+			truncated = head.length > maxChars;
+		}
+		newest.push(json);
+		tailLength += json.length + 1;
+		while (newest.length - oldest > 1 && tailLength - (newest[oldest].length + 1) >= tailChars) {
+			tailLength -= newest[oldest].length + 1;
+			oldest++;
+		}
+		// Let go of the dropped messages once they are most of the array.
+		if (oldest > 64 && oldest * 2 > newest.length) {
+			newest.splice(0, oldest);
+			oldest = 0;
+		}
+	}
+	if (!truncated) {
+		const full = `${head}]`;
+		if (full.length <= maxChars) return full;
+	}
+	// A tail short of its budget holds every message: its leading separator is really the array opener.
+	const tail = `${tailLength < tailChars ? "[" : ","}${newest.slice(oldest).join(",")}]`;
 	return `${head.slice(0, headChars)}\n\n...[truncated]...\n\n${tail.slice(-tailChars)}`;
 }
 

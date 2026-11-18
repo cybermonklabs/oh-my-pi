@@ -6,6 +6,7 @@
  */
 import { SQL } from "bun";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { agentTranscriptSource, createAgentHubRuntime } from "@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -20,6 +21,8 @@ import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session
 import { type AgentTranscriptSource, AgentTranscriptViewer } from "@oh-my-pi/pi-tui/overlays/agent-transcript-viewer";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { STILL } from "./session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb } from "./session/sql-session-lease-fixture";
 
 const TS = "2026-11-02T00:00:00.000Z";
 const AGENT_ID = "Worker";
@@ -237,4 +240,102 @@ describe("Agent Hub transcript viewer storage", () => {
 			});
 		expect(ids).toEqual(["long", "tail"]);
 	});
+
+	for (const { adapter, url } of LEASE_BACKENDS) {
+		it.skipIf(!url)(
+			`renders one body of a long SQL transcript another store rewrites between two polls of its windowed read (${adapter})`,
+			async () => {
+				// If this regresses, the Agent Hub shows a parked subagent whose long SQL transcript another
+				// process rewrote with turns of the old transcript above turns of the new one.
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const sessionFile = path.join(db.dir.path(), "sessions", "main", `${AGENT_ID}.jsonl`);
+				const header = JSON.stringify({
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: AGENT_ID,
+					timestamp: TS,
+					cwd: "/tmp",
+				});
+				const marker = (tag: string, n: number) => `${tag}${String(n).padStart(2, "0")}VIEWMARK`;
+				// Past the 8 MiB a read window holds: a turn after each 1 MiB entry the viewer does not render.
+				const body = (tag: string) => [
+					`${header}\n`,
+					...Array.from({ length: 12 }, (_, n) => [
+						`${JSON.stringify({ type: "custom", customType: "pad", id: `p${n}`, parentId: null, timestamp: TS, data: tag.repeat(1024 * 1024) })}\n`,
+						`${userLine(`u${n}`, marker(tag, n))}\n`,
+					]).flat(),
+				];
+				const holder = await db.open({ lease: STILL });
+				await holder.writeLinesAtomic(sessionFile, body("a"));
+				await holder.drain();
+				const reader = await db.open({ lease: STILL });
+				const { transcript } = createAgentHubRuntime({ storage: reader, registry: new AgentRegistry() });
+				const reads: Promise<string>[] = [];
+				const source: AgentTranscriptSource = {
+					...transcript,
+					readFrom: (file, offset) => {
+						const read = transcript.readFrom(file, offset);
+						reads.push(read);
+						return read;
+					},
+				};
+				// Every read the viewer started has been handled: it handles a read before a later wait on it resumes.
+				const settle = async () => {
+					for (let i = 0; i < reads.length; i++) await reads[i];
+				};
+				const agents = new AgentRegistry();
+				agents.register({
+					id: AGENT_ID,
+					displayName: AGENT_ID,
+					kind: "sub",
+					parentId: "Main",
+					session: null,
+					sessionFile,
+					status: "parked",
+				});
+				vi.useFakeTimers();
+				const viewer = new AgentTranscriptViewer({
+					transcript: source,
+					agentId: AGENT_ID,
+					registry: agents,
+					// Tall enough to show every turn, so a render shows all the rows the viewer holds.
+					ui: { requestRender: () => {}, requestComponentRender: () => {}, terminal: { rows: 10_000 } } as never,
+					cwd: "/tmp",
+					expandKeys: ["ctrl+o"],
+					hubKeys: ["ctrl+s"],
+					requestRender: () => {},
+					onClose: () => {},
+					onHubClose: () => {},
+				});
+				cleanups.push(() => viewer.dispose());
+				await settle();
+				const shown = (tag: string) => {
+					const rendered = viewer
+						.render(100)
+						.map(line => Bun.stripANSI(line))
+						.join("\n");
+					return Array.from({ length: 12 }, (_, n) => marker(tag, n)).filter(mark => rendered.includes(mark))
+						.length;
+				};
+				const firstWindow = shown("a");
+
+				await holder.writeLinesAtomic(sessionFile, body("b"), { expectedSize: holder.statSync(sessionFile).size });
+				await holder.drain();
+				for (let poll = 0; poll < 8; poll++) {
+					vi.advanceTimersByTime(250);
+					await settle();
+				}
+
+				expect({ firstWindow: firstWindow > 0 && firstWindow < 12, reads: reads.length > 2 }).toEqual({
+					firstWindow: true,
+					reads: true,
+				});
+				expect([
+					{ a: 12, b: 0 },
+					{ a: 0, b: 12 },
+				]).toContainEqual({ a: shown("a"), b: shown("b") });
+			},
+			120_000,
+		);
+	}
 });

@@ -1096,8 +1096,9 @@ non-negative integer. Non-finite values fail. The result contains `sessionFile`,
 `fromByte`, `nextByte`, `reset`, raw transcript `entries`, and `messages` from
 message entries. Only complete newline-terminated records are consumed; reuse
 `nextByte` on the next request. A missing transcript returns empty arrays.
-If `fromByte` exceeds the current file size, reading restarts at byte zero and
-reports `reset: true`.
+If `fromByte` exceeds the current file size, or no record ends right before it
+(the transcript was rewritten since the last read), reading restarts at byte
+zero and reports `reset: true`; drop what the earlier reads returned.
 One response returns at most 8 MiB of the transcript (more only when a single
 record is longer than 4 MiB), so a client reading a long transcript repeats
 the request from `nextByte` until `nextByte` stops advancing.

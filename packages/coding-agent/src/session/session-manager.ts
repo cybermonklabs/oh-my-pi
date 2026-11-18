@@ -123,6 +123,7 @@ import {
 	defaultSessionStorage,
 	FileSessionStorage,
 	MemorySessionStorage,
+	retryRacedRead,
 	type SessionClaimHolder,
 	SessionLeaseLostError,
 	type SessionStorage,
@@ -5348,7 +5349,12 @@ export class SessionManager {
 		};
 
 		try {
-			await visitEntriesFromFile(filePath, visit, storage);
+			// A full rewrite between two chunks of a long transcript fails the read: read it again from its start.
+			await retryRacedRead(() => {
+				header = undefined;
+				initEntries.length = 0;
+				return visitEntriesFromFile(filePath, visit, storage);
+			});
 		} catch {
 			return null;
 		}

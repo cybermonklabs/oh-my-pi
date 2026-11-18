@@ -7,7 +7,13 @@ import { resolveExplicitModelRole } from "../config/model-resolver";
 import { assistantTurnProducedOutput } from "../session/messages";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, PREWALK_MODEL_CHANGE_ROLE } from "../session/session-entries";
 import { readSessionHeaderId, visitEntriesFromFileStream } from "../session/session-loader";
-import { defaultSessionStorage, type SessionStorage, type SessionStorageStat } from "../session/session-storage";
+import {
+	defaultSessionStorage,
+	retryRacedRead,
+	SessionReadConflictError,
+	type SessionStorage,
+	type SessionStorageStat,
+} from "../session/session-storage";
 import { loadBundledAgents } from "../task/agents";
 import { isReadOnlyAgent } from "../task/read-only-policy";
 import { persistedVibeChildIds } from "../vibe/lifecycle";
@@ -168,6 +174,15 @@ function isFilesystemError(error: unknown): boolean {
 	return typeof code === "string" && code !== "ENOENT";
 }
 
+/**
+ * A transcript read failure the roster must not swallow: a storage fault
+ * ({@link isFilesystemError}), or a read full rewrites raced on every pass
+ * {@link retryRacedRead} made, which the next roster scan reads again.
+ */
+function isReadFailure(error: unknown): boolean {
+	return isFilesystemError(error) || error instanceof SessionReadConflictError;
+}
+
 async function readPersistedAgentHistory(
 	transcript: PersistedTranscript,
 	shouldContinue: () => boolean,
@@ -183,69 +198,79 @@ async function readPersistedAgentHistory(
 	let directCost = 0;
 	// Direct cost mirrors lifetime SessionManager usage; legacy metrics below stay leaf-scoped.
 	try {
-		await visitEntriesFromFileStream(
-			transcript.sessionFile,
-			entry => {
-				const record = recordOf(entry);
-				if (!record) return;
-				const id = typeof record.id === "string" ? record.id : undefined;
-				if (!id) return;
-				const parentId = typeof record.parentId === "string" ? record.parentId : undefined;
-				parents.set(id, parentId);
-				// Same replay rule as `sessionEntryLeafId`: an entry written off the active
-				// branch (late usage, a routed bash result) restores the leaf it captured
-				// instead of becoming the leaf itself.
-				if (typeof record.activeLeafId === "string") {
-					leafId = record.activeLeafId;
-				} else if (record.activeLeafId === null) {
-					leafId = undefined;
-				} else {
-					leafId = id;
-					selfSelectedLeafId = id;
-				}
-				const parsedTimestamp = timestampOf(record.timestamp);
-				if (parsedTimestamp !== undefined) leafTimestamp = parsedTimestamp;
-				if (record.type === "model_usage") {
-					const usage = recordOf(record.usage);
-					const cost = recordOf(usage?.cost);
-					directCost += finiteNumber(cost?.total);
-					return;
-				}
-				if (record.type === "model_change" && typeof record.model === "string") {
-					modelChangeById.set(id, {
-						model: record.model,
-						role: typeof record.role === "string" ? record.role : undefined,
-						resolvedModelIsFallback: record.resolvedModelIsFallback === true,
-					});
-					return;
-				}
-				if (record.type !== "message") return;
-				const message = recordOf(record.message);
-				if (message?.role === "assistant") {
-					const assistant = assistantMetrics(message);
-					assistantById.set(id, assistant);
-					directCost += assistant.cost;
-				}
-			},
-			// Advisor transcripts are the one file that can grow pathologically large
-			// (issue #9553); cap their scan so one bad transcript can't stall the Hub
-			// on the render thread. Healthy advisor files sit far below this bound,
-			// so their metrics stay exact; a capped legacy file reports approximate
-			// (lower-bound) cost/tokens rather than freezing `hub list`.
-			{
-				shouldContinue,
-				storage,
-				maxRecords: isAdvisorTranscriptName(path.basename(transcript.sessionFile))
-					? MAX_ADVISOR_HISTORY_LINES
-					: undefined,
-			},
-		);
+		// A full rewrite between two chunks fails the read: read it again from its start.
+		await retryRacedRead(() => {
+			parents.clear();
+			assistantById.clear();
+			modelChangeById.clear();
+			leafId = undefined;
+			selfSelectedLeafId = undefined;
+			leafTimestamp = undefined;
+			directCost = 0;
+			return visitEntriesFromFileStream(
+				transcript.sessionFile,
+				entry => {
+					const record = recordOf(entry);
+					if (!record) return;
+					const id = typeof record.id === "string" ? record.id : undefined;
+					if (!id) return;
+					const parentId = typeof record.parentId === "string" ? record.parentId : undefined;
+					parents.set(id, parentId);
+					// Same replay rule as `sessionEntryLeafId`: an entry written off the active
+					// branch (late usage, a routed bash result) restores the leaf it captured
+					// instead of becoming the leaf itself.
+					if (typeof record.activeLeafId === "string") {
+						leafId = record.activeLeafId;
+					} else if (record.activeLeafId === null) {
+						leafId = undefined;
+					} else {
+						leafId = id;
+						selfSelectedLeafId = id;
+					}
+					const parsedTimestamp = timestampOf(record.timestamp);
+					if (parsedTimestamp !== undefined) leafTimestamp = parsedTimestamp;
+					if (record.type === "model_usage") {
+						const usage = recordOf(record.usage);
+						const cost = recordOf(usage?.cost);
+						directCost += finiteNumber(cost?.total);
+						return;
+					}
+					if (record.type === "model_change" && typeof record.model === "string") {
+						modelChangeById.set(id, {
+							model: record.model,
+							role: typeof record.role === "string" ? record.role : undefined,
+							resolvedModelIsFallback: record.resolvedModelIsFallback === true,
+						});
+						return;
+					}
+					if (record.type !== "message") return;
+					const message = recordOf(record.message);
+					if (message?.role === "assistant") {
+						const assistant = assistantMetrics(message);
+						assistantById.set(id, assistant);
+						directCost += assistant.cost;
+					}
+				},
+				// Advisor transcripts are the one file that can grow pathologically large
+				// (issue #9553); cap their scan so one bad transcript can't stall the Hub
+				// on the render thread. Healthy advisor files sit far below this bound,
+				// so their metrics stay exact; a capped legacy file reports approximate
+				// (lower-bound) cost/tokens rather than freezing `hub list`.
+				{
+					shouldContinue,
+					storage,
+					maxRecords: isAdvisorTranscriptName(path.basename(transcript.sessionFile))
+						? MAX_ADVISOR_HISTORY_LINES
+						: undefined,
+				},
+			);
+		});
 	} catch (error) {
 		// Malformed and truncated records are skipped in-band; a vanished file
 		// (ENOENT) degrades to empty history. Any other filesystem fault is
 		// transient and surfaces to the caller instead of masquerading as a
-		// transcript with no history.
-		if (isFilesystemError(error)) throw error;
+		// transcript with no history, as does a read raced past its retries.
+		if (isReadFailure(error)) throw error;
 		return {};
 	}
 
@@ -384,62 +409,74 @@ async function readPersistedAgentMetadata(
 	let hasSessionInit = false;
 	let hasConversation = false;
 	try {
-		await visitEntriesFromFileStream(
-			sessionFile,
-			entry => {
-				const record = recordOf(entry);
-				if (!record) return;
-				if (record.type === "session") {
+		// A full rewrite between two chunks fails the read: read it again from its start.
+		await retryRacedRead(() => {
+			createdAt = undefined;
+			activity = undefined;
+			history = {};
+			hasSessionInit = false;
+			hasConversation = false;
+			return visitEntriesFromFileStream(
+				sessionFile,
+				entry => {
+					const record = recordOf(entry);
+					if (!record) return;
+					if (record.type === "session") {
+						createdAt ??= timestampOf(record.timestamp);
+						return;
+					}
+					if (record.type === "model_change") {
+						if (typeof record.model === "string") history.resolvedModel = record.model;
+						if (
+							typeof record.role === "string" &&
+							record.role !== EPHEMERAL_MODEL_CHANGE_ROLE &&
+							record.role !== PREWALK_MODEL_CHANGE_ROLE
+						) {
+							history.modelRole = record.role;
+						}
+						if (typeof record.resolvedModelIsFallback === "boolean") {
+							history.resolvedModelIsFallback = record.resolvedModelIsFallback;
+						}
+						return;
+					}
+					if (record.type === "message" || record.type === "custom_message") {
+						hasConversation = true;
+						return;
+					}
+					if (record.type !== "session_init") return;
+					hasSessionInit = true;
 					createdAt ??= timestampOf(record.timestamp);
-					return;
-				}
-				if (record.type === "model_change") {
-					if (typeof record.model === "string") history.resolvedModel = record.model;
-					if (
-						typeof record.role === "string" &&
-						record.role !== EPHEMERAL_MODEL_CHANGE_ROLE &&
-						record.role !== PREWALK_MODEL_CHANGE_ROLE
-					) {
-						history.modelRole = record.role;
-					}
-					if (typeof record.resolvedModelIsFallback === "boolean") {
-						history.resolvedModelIsFallback = record.resolvedModelIsFallback;
-					}
-					return;
-				}
-				if (record.type === "message" || record.type === "custom_message") {
-					hasConversation = true;
-					return;
-				}
-				if (record.type !== "session_init") return;
-				hasSessionInit = true;
-				createdAt ??= timestampOf(record.timestamp);
-				if (typeof record.task === "string") activity = summarizePersistedTask(record.task);
-				const systemPrompt = Array.isArray(record.systemPrompt)
-					? record.systemPrompt.join("\n\n")
-					: record.systemPrompt;
-				const inferred = typeof systemPrompt === "string" ? inferBundledAgent(systemPrompt) : {};
-				history = {
-					...history,
-					...inferred,
-					agent: typeof record.agent === "string" ? record.agent : inferred.agent,
-					modelRole:
-						typeof record.modelRole === "string" ? record.modelRole : (history.modelRole ?? inferred.modelRole),
-					resolvedModel: typeof record.resolvedModel === "string" ? record.resolvedModel : history.resolvedModel,
-					readOnly: typeof record.readOnly === "boolean" ? record.readOnly : inferred.readOnly,
-				};
-				return false;
-			},
-			{ maxRecords: MAX_METADATA_LINES, storage },
-		);
+					if (typeof record.task === "string") activity = summarizePersistedTask(record.task);
+					const systemPrompt = Array.isArray(record.systemPrompt)
+						? record.systemPrompt.join("\n\n")
+						: record.systemPrompt;
+					const inferred = typeof systemPrompt === "string" ? inferBundledAgent(systemPrompt) : {};
+					history = {
+						...history,
+						...inferred,
+						agent: typeof record.agent === "string" ? record.agent : inferred.agent,
+						modelRole:
+							typeof record.modelRole === "string"
+								? record.modelRole
+								: (history.modelRole ?? inferred.modelRole),
+						resolvedModel:
+							typeof record.resolvedModel === "string" ? record.resolvedModel : history.resolvedModel,
+						readOnly: typeof record.readOnly === "boolean" ? record.readOnly : inferred.readOnly,
+					};
+					return false;
+				},
+				{ maxRecords: MAX_METADATA_LINES, storage },
+			);
+		});
 	} catch (error) {
 		// Malformed and truncated records are skipped in-band by the stream
-		// visitor, so the only errors reaching this catch are storage faults.
-		// ENOENT races degrade to an incomplete record; transient faults
-		// (EACCES/EMFILE/EIO) surface so the roster latch drops and the next
-		// call retries. A readable transcript with a malformed metadata prefix
-		// still yields what it can.
-		if (isFilesystemError(error)) throw error;
+		// visitor, so the only errors reaching this catch are storage faults
+		// and reads raced past their retries. ENOENT races degrade to an
+		// incomplete record; transient faults (EACCES/EMFILE/EIO) and raced
+		// reads surface so the roster latch drops and the next call retries.
+		// A readable transcript with a malformed metadata prefix still yields
+		// what it can.
+		if (isReadFailure(error)) throw error;
 	}
 	const [hasOutput, hasPatch] = await artifactFiles;
 	return {
@@ -465,16 +502,20 @@ async function readPersistedVibeChildIds(
 ): Promise<Set<string>> {
 	const ids = new Set<string>();
 	try {
-		await visitEntriesFromFileStream(
-			sessionFile,
-			entry => {
-				for (const id of persistedVibeChildIds([entry])) ids.add(id);
-			},
-			{ shouldContinue, storage },
-		);
+		// A full rewrite between two chunks fails the read: read it again from its start.
+		await retryRacedRead(() => {
+			ids.clear();
+			return visitEntriesFromFileStream(
+				sessionFile,
+				entry => {
+					for (const id of persistedVibeChildIds([entry])) ids.add(id);
+				},
+				{ shouldContinue, storage },
+			);
+		});
 		return ids;
 	} catch (error) {
-		if (isFilesystemError(error)) throw error;
+		if (isReadFailure(error)) throw error;
 		return new Set();
 	}
 }

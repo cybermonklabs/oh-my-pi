@@ -22,6 +22,8 @@ import {
 	hashPath,
 } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
+import { paddedTranscript, raceAfterFirstChunk, STILL } from "./session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb } from "./session/sql-session-lease-fixture";
 
 let root: string;
 let client: SQL | undefined;
@@ -216,6 +218,43 @@ describe("omp gc --blobs under session.storage: sql", () => {
 			expect(await Bun.file(orphan).exists()).toBe(false);
 			expect(result.blobs).toMatchObject({ referenced: 1, deleted: 1, errors: [] });
 		});
+
+		for (const { adapter, url } of LEASE_BACKENDS) {
+			test.skipIf(!url)(
+				`--apply keeps a blob both bodies reference when another store rewrites the transcript after the scan's first chunk (${adapter})`,
+				async () => {
+					// If this regresses, gc run while another process compacts a long SQL session fails, or
+					// deletes an image blob the session still references and the session shows it as missing.
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const referenced = await agedBlob("raced by a store");
+					const orphan = await agedBlob("orphan:raced by a store");
+					const file = parent();
+					// The reference sits past the first chunk, in a line both bodies hold.
+					const body = (fill: string) => [
+						...paddedTranscript("root", "first", fill, 3),
+						`${JSON.stringify({ type: "message", id: "m2", parentId: "m1", timestamp: "2026-10-01T00:00:02.000Z", message: { role: "user", content: `blob:sha256:${hashFor("raced by a store")}`, timestamp: 2 } })}\n`,
+					];
+					const holder = await db.open({ lease: STILL });
+					await holder.writeLinesAtomic(file, body("a"));
+					await holder.drain();
+					const reader = await db.open({ lease: STILL });
+					resolve?.mockRestore();
+					resolve = spyOn(sessionStorageConfig, "resolveSessionStorage").mockResolvedValue(reader);
+					const race = raceAfterFirstChunk(reader, file, async () => {
+						await holder.writeLinesAtomic(file, body("b"), { expectedSize: holder.statSync(file).size });
+						await holder.drain();
+					});
+
+					const result = await runGcCommand({ flags: { agentDir: root, blobs: true, apply: true } });
+
+					expect(race.ran).toBe(true);
+					expect(await Bun.file(referenced).exists()).toBe(true);
+					expect(await Bun.file(orphan).exists()).toBe(false);
+					expect(result.blobs).toMatchObject({ referenced: 1, deleted: 1, errors: [] });
+				},
+				120_000,
+			);
+		}
 	});
 });
 
