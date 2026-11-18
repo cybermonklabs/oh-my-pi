@@ -920,8 +920,19 @@ fn rename_with_fallback(
 
 /// Removes the tree at `path` (resolved: `fs_path`) that a move across
 /// filesystems replaces or copied: a symlink is removed itself, and a
-/// directory with everything in it.
-fn remove_moved_tree(host: &mut Host, _path: &Path, fs_path: &Path) -> io::Result<()> {
+/// directory with everything in it. A native Unix tree goes through rm's own
+/// descriptor walk ([`crate::rm::remove_quietly`]), as GNU mv removes with
+/// rm's code: it opens each directory as the one `lstat` found, following no
+/// symlink, on every kernel. `std::fs::remove_dir_all` trusts `O_DIRECTORY |
+/// O_NOFOLLOW`, which gVisor before release-20261109.0 follows. rm reports
+/// its own errors, so a failure here is [`Reported`].
+fn remove_moved_tree(host: &mut Host, path: &Path, fs_path: &Path) -> io::Result<()> {
+	#[cfg(all(unix, not(target_os = "redox")))]
+	if host.fs().is_native_local(fs_path) {
+		return if crate::rm::remove_quietly(host, path) { Err(io::Error::other(Reported)) } else { Ok(()) };
+	}
+	#[cfg(not(all(unix, not(target_os = "redox"))))]
+	let _ = path;
 	host.fs().remove_dir_all(fs_path)
 }
 
