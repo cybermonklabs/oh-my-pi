@@ -789,6 +789,14 @@ mod fifo {
 		/// join the helper.
 		#[cfg(test)]
 		joining:   bool,
+		/// Test hook: once released by `joining`, the helper asks this
+		/// whether the FIFO's other end is open before it opens its own.
+		#[cfg(test)]
+		probe:     Option<fn(&Path) -> bool>,
+		/// Test hook: what `probe` answered. When it answered no, the
+		/// helper's open would wait for ever, so the helper skips it.
+		#[cfg(test)]
+		peer_held: Option<bool>,
 	}
 
 	/// The FIFO an open started on, which its helper opens and its drop
@@ -937,6 +945,14 @@ mod fifo {
 					};
 					while held() {
 						thread::yield_now();
+					}
+					let probe = slot.lock().probe;
+					if let Some(probe) = probe {
+						let peer_held = probe(&node.path);
+						slot.lock().peer_held = Some(peer_held);
+						if !peer_held {
+							return;
+						}
 					}
 				}
 				let opened = opts.open(&node.path);
@@ -1106,12 +1122,19 @@ mod fifo {
 
 		/// A helper that finds the open cancelled opens nothing: it ends
 		/// (instead of waiting in `open(2)` for a writer) and leaves no reader.
+		/// Until it ends, the FIFO is watched for the reader a helper that
+		/// entered `open(2)` would be, so such a helper fails the test (and
+		/// the watch's own write open lets it return) instead of waiting.
 		#[test]
 		fn a_helper_cancelled_before_its_check_opens_nothing() {
 			let (_dir, path) = new_fifo();
 			let node = Arc::new(Node::new(&path, &fs::metadata(&path).unwrap(), false));
 			let slot = Arc::new(Mutex::new(Slot { cancelled: true, ..Slot::default() }));
 			let helper = spawn_helper(Arc::clone(&slot), node, options(OpenFlags::READ, 0)).unwrap();
+			while !helper.is_finished() {
+				assert!(!has_reader(&path), "the cancelled helper opened the FIFO");
+				thread::yield_now();
+			}
 			helper.join().unwrap();
 			assert!(!slot.lock().opening);
 			assert!(!has_reader(&path));
@@ -1135,20 +1158,29 @@ mod fifo {
 		/// A drop that comes while the helper is between its check and its
 		/// `open(2)` holds its end of the FIFO until the helper has opened
 		/// and closed. The helper here enters `open(2)` only once the drop is
-		/// about to join it, so a drop that did not join, or did not hold its
-		/// end while it joined, leaves the helper waiting.
+		/// about to join it, and first looks for the drop's end: a drop that
+		/// did not join leaves the helper waiting for it, and one that did
+		/// not hold its end while it joined is seen without it.
 		#[test]
 		fn a_drop_holds_its_end_until_a_helper_about_to_open_has_ended() {
-			for flags in [OpenFlags::READ, OpenFlags::WRITE] {
+			for (flags, probe) in
+				[(OpenFlags::READ, has_writer as fn(&Path) -> bool), (OpenFlags::WRITE, has_reader)]
+			{
 				let (_dir, path) = new_fifo();
 				let node = Arc::new(Node::new(&path, &fs::metadata(&path).unwrap(), false));
-				let slot = Arc::new(Mutex::new(Slot { hold: true, ..Slot::default() }));
+				let slot =
+					Arc::new(Mutex::new(Slot { hold: true, probe: Some(probe), ..Slot::default() }));
 				let helper =
 					spawn_helper(Arc::clone(&slot), Arc::clone(&node), options(flags, 0)).unwrap();
 				while !slot.lock().opening {
 					thread::yield_now();
 				}
 				drop(FifoOpen { slot: Arc::clone(&slot), node, helper: Some(helper) });
+				assert_eq!(
+					slot.lock().peer_held,
+					Some(true),
+					"the drop's end was not open when the helper opened"
+				);
 				assert_eq!(Arc::strong_count(&slot), 1, "the helper outlived the drop");
 				assert!(!has_reader(&path), "a reader is left");
 				assert!(!has_writer(&path), "a writer is left");
