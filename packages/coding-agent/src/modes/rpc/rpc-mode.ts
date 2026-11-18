@@ -19,7 +19,7 @@ import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, postmortem, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionAskDialogQuestion,
@@ -32,14 +32,8 @@ import {
 	getExtensionUISelectOptionLabel,
 	timedOutAskDialogResult,
 } from "../../extensibility/extensions";
-import {
-	type BuiltSkillPromptMessage,
-	loadSkillPrompt,
-	parseSkillInvocation,
-	type Skill,
-	type SkillPromptInput,
-	type SkillRediscoverySource,
-} from "../../extensibility/skills";
+import { loadSkillPrompt } from "../../extensibility/skills";
+import { type RpcSkillCommandSession, resolveRpcSkillInvocation, runRpcSkillCommand } from "./rpc-skill-invocation";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import {
@@ -49,7 +43,12 @@ import {
 	wordCompletionQuery,
 } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
-import { type AgentSession, type NavigateTreeResult, SessionBusyError } from "../../session/agent-session";
+import {
+	type AgentSession,
+	type NavigateTreeResult,
+	SessionBusyError,
+	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+} from "../../session/agent-session";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
@@ -57,11 +56,17 @@ import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession, findRecentSessionContinuation } from "../../session/session-listing";
 import { probeSessionLeases } from "../../session/session-storage";
-import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import {
+	assertSessionsOnDisk,
+	NO_SESSION_LEASE_REASON,
+	SessionStorageUnsupportedError,
+} from "../../session/session-storage-config";
+import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { listLogoutAccounts, logoutCredential } from "../../slash-commands/helpers/logout";
 import { cfgSttEnabled } from "../../stt/settings";
+import type { SlashCommandHost } from "../../slash-commands/types";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
 import { selectRpcEntries } from "./rpc-compat";
@@ -75,6 +80,7 @@ import { initializeExtensions } from "../runtime-init";
 import { cfgSpellingAutocomplete } from "../settings";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { rpcBusyCode } from "./rpc-busy-code";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
@@ -252,59 +258,7 @@ export type RpcSessionChangeResult =
 
 export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchSession" | "branch" | "fork">;
 
-export type RpcSkillCommandSession = Pick<
-	AgentSession,
-	"buildUserSkillPrompt" | "renderUserSkillPrompt" | "promptCustomMessage" | "skills" | "skillsSettings"
-> &
-	SkillRediscoverySource;
 export type RpcSkillCommandResult = { agentInvoked: true };
-
-export interface RpcSkillInvocation extends SkillPromptInput {
-	skill: Skill;
-	queueChipText: string;
-}
-
-/**
- * Fast in-memory pre-check for a skill invocation: settings gate, text shape,
- * and skill lookup. Returns null when the message is not a runnable skill
- * command. Performs no I/O — safe to run on the RPC serial queue.
- */
-export function resolveRpcSkillInvocation(session: RpcSkillCommandSession, text: string): RpcSkillInvocation | null {
-	if (!session.skillsSettings?.enableSkillCommands) return null;
-	const parsed = parseSkillInvocation(text);
-	if (!parsed) return null;
-	const skill = session.skills.find(candidate => candidate.name === parsed.name);
-	if (!skill) return null;
-	return { skill, args: parsed.args, prompt: parsed.prompt, queueChipText: text };
-}
-
-/**
- * Slow half of a skill invocation: builds the skill prompt message (file I/O)
- * and dispatches it through the full prompt pipeline (usage preflight,
- * compaction checks, provider calls). Resolves once the turn is scheduled.
- * Must not run on the RPC serial queue's response path — register it with
- * watchAndReportPromptResult and answer the command once it is admitted.
- */
-export async function runRpcSkillCommand(
-	session: RpcSkillCommandSession,
-	invocation: RpcSkillInvocation,
-	streamingBehavior: "steer" | "followUp" = "steer",
-	prebuilt?: BuiltSkillPromptMessage,
-	onPromptAdmitted?: () => void,
-	images?: ImageContent[],
-): Promise<boolean> {
-	const built = prebuilt ?? (await session.buildUserSkillPrompt(invocation.skill, invocation));
-	return session.promptCustomMessage(
-		{
-			customType: SKILL_PROMPT_MESSAGE_TYPE,
-			content: images?.length ? [{ type: "text", text: built.message }, ...images] : built.message,
-			display: true,
-			details: built.details,
-			attribution: "user",
-		},
-		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted },
-	);
-}
 
 /**
  * Skill branch of the `prompt` command: resolves the invocation cheaply, then
@@ -343,14 +297,12 @@ export async function dispatchRpcSkillPrompt(input: {
 	await watchAndReportPromptResult({
 		ticket: input.ticket,
 		startPrompt: onPromptAdmitted =>
-			runRpcSkillCommand(
-				input.session,
-				invocation,
-				input.streamingBehavior ?? "steer",
-				built,
+			runRpcSkillCommand(input.session, invocation, {
+				streamingBehavior: input.streamingBehavior,
+				prebuilt: built,
 				onPromptAdmitted,
-				input.images,
-			),
+				images: input.images,
+			}),
 		results: input.results,
 		onError: input.onError,
 		extensionUserMessageTracker: input.extensionUserMessageTracker,
@@ -366,7 +318,7 @@ export async function tryRunRpcSkillCommand(
 ): Promise<RpcSkillCommandResult | false> {
 	const invocation = resolveRpcSkillInvocation(session, text);
 	if (!invocation) return false;
-	await runRpcSkillCommand(session, invocation, streamingBehavior, undefined, undefined, images);
+	await runRpcSkillCommand(session, invocation, { streamingBehavior, images });
 	return { agentInvoked: true };
 }
 
@@ -423,18 +375,32 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
 }
 
 /**
+ * The live-session types. All four wait for startup ({@link waitsForStartup}) and all four skip the
+ * serial queue ({@link BACKGROUND_COMMANDS}), which is what keeps the ones read while startup ran in
+ * read order. Both sets spread this one, so neither can lose a live type while the other keeps it.
+ * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
+ */
+const LIVE_STARTUP_TYPES: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
+	"live_start",
+	"live_connect",
+	"live_stop",
+	"live_mute",
+]);
+
+/**
  * Commands that skip the serial queue entirely; see {@link dispatchRpcInputFrame}.
- * (`prompt` and `steer_subagent` are also backgrounded there, but start through
- * the serial tail.) `btw_cancel` is synchronous and must overtake a `btw` still
- * starting or a long serial command; `abort_branch_summary` likewise overtakes
- * the `navigate_tree` whose summary it stops.
+ * (`prompt`, `steer`, `dictation_start`, `follow_up` and `steer_subagent` are also backgrounded
+ * there, but start through the serial tail.) `btw_cancel` is synchronous and must overtake a `btw`
+ * still starting or a long serial command; `abort_branch_summary` likewise overtakes the
+ * `navigate_tree` whose summary it stops. The four {@link LIVE_STARTUP_TYPES} are spread in, so each
+ * reaches `handleCommand` as it is read and the four start their startup wait in read order (see
+ * {@link waitsForStartup}).
  * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
  */
 const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
 	"bash",
 	"predict_word",
-	"live_start",
-	"live_connect",
+	...LIVE_STARTUP_TYPES,
 	"btw_cancel",
 	"abort_branch_summary",
 ]);
@@ -442,9 +408,10 @@ const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
 /**
  * Dispatch a single parsed frame from the RPC input stream.
  *
- * `bash`, `predict_word`, `prompt` and `steer_subagent` are dispatched in the
- * background so the caller can keep reading subsequent frames while one is
- * still settling: a `bash` command can run for a long time, and a `prompt`
+ * Every {@link BACKGROUND_COMMANDS} type, and `prompt`, `steer`, `dictation_start`,
+ * `follow_up` and `steer_subagent`, are dispatched in the background so the caller
+ * can keep reading subsequent frames while one is still settling: a `bash` command
+ * can run for a long time, and a `prompt`
  * command's response is held until the message is admitted, which can span
  * real wall-clock time (image normalization, a vision-model description call).
  * `steer_subagent` likewise holds its response until the subagent accepts the
@@ -454,13 +421,18 @@ const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
  * while a `prompt` or `steer_subagent` is still admitting. `predict_word` is
  * backgrounded too, so a cold prediction engine never stalls the command queue
  * behind a keystroke. `live_start`, `live_connect` and `dictation_start` respond only once
- * connected or recording, so they are backgrounded and their stop commands can cancel them.
+ * connected or recording, so they are backgrounded; `live_stop` and `live_mute` are backgrounded
+ * with them so each of the four reaches `handleCommand` as it is read, which is what keeps them in
+ * read order, and so a stop never waits behind the connect it cancels or behind an unrelated
+ * serial command.
  * Response correlation is preserved via each command's `id`; ordering across
  * concurrent commands is not guaranteed and clients MUST match on `id`.
  *
  * @returns `undefined` when the frame was routed to a side-channel handler
  *   (extension UI response, host tool/URI frames) or dispatched in the
- *   background (`bash`, `predict_word`, `live_start`, `live_connect`, `dictation_start`, `prompt`, `steer`, `follow_up`, `steer_subagent`). Otherwise a promise that
+ *   background (every {@link BACKGROUND_COMMANDS} type, so `bash`, `predict_word`, the four
+ *   `live_*` commands, `btw_cancel` and `abort_branch_summary`, plus `prompt`, `steer`,
+ *   `dictation_start`, `follow_up` and `steer_subagent`). Otherwise a promise that
  *   resolves once the response for the command has been emitted via `output`.
  *   Errors from `handleCommand` on a command dispatched inline propagate; the
  *   caller is expected to wrap them.
@@ -524,13 +496,97 @@ const SESSION_CHANGE_TYPES: Record<string, true> = {
 };
 
 /**
+ * Held types an `abort` accepted while they waited withdraws: answered as cancelled instead of run.
+ * Only the types whose success answer already carries the `cancelled` flag their hosts read today,
+ * so the withdrawal invents no answer shape. `branch` is left out because its answer also carries
+ * the selected `text`, and `open_session` because its answer also carries `resumed` and `sessionId`;
+ * neither can be satisfied by `{ cancelled: true }` alone. They, and the held types with no
+ * cancelled answer at all (`compact`, `goal`, `handoff` and the four live types), run when startup
+ * ends whether or not an abort followed them. {@link STARTUP_HELD_TYPES} and {@link NUMBERED_TYPES}
+ * both spread this one, so a withdrawn type can lose neither the hold the withdrawal runs inside
+ * nor the number `isCurrent` reads against it. A Set, not a Record: `type` is untrusted input and
+ * must not hit prototype keys.
+ */
+const ABORT_WITHDRAWN_HELD_TYPES: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
+	"new_session",
+	"switch_session",
+	"fork",
+	"navigate_tree",
+]);
+
+/**
+ * Types that always wait for startup, besides the `goal` ops {@link waitsForStartup} adds. The four
+ * {@link ABORT_WITHDRAWN_HELD_TYPES} are spread in, so the withdrawal set cannot outgrow this one:
+ * `handleCommand` withdraws a frame only inside the branch it enters when {@link waitsForStartup}
+ * answers true, so a withdrawn type this set did not hold would never wait, and so would never be
+ * withdrawn. Three of the four reach this set through
+ * {@link SESSION_CHANGE_TYPES} as well, which is why the spread adds `navigate_tree` alone.
+ * A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
+ */
+const STARTUP_HELD_TYPES: ReadonlySet<string> = new Set<RpcCommand["type"]>([
+	...(Object.keys(USER_INPUT_TYPES) as RpcCommand["type"][]),
+	...(Object.keys(SESSION_CHANGE_TYPES) as RpcCommand["type"][]),
+	"compact",
+	...ABORT_WITHDRAWN_HELD_TYPES,
+	"handoff",
+	...LIVE_STARTUP_TYPES,
+]);
+
+/**
+ * Types {@link RpcUserInputGate.accept} numbers, besides the `abort` and `abort_and_restore_queue`
+ * frames it names there; `abort_and_prompt`, the third type it names, is one of the user-input
+ * types spread in here. Spread from the two input records and from
+ * {@link ABORT_WITHDRAWN_HELD_TYPES} so the withdrawal set cannot outgrow it: `isCurrent` answers
+ * false both for a frame an abort invalidated and for a frame that was never numbered, so a
+ * withdrawn type that is not numbered here reads as withdrawn on every startup read, with no abort
+ * behind it. A Set, not a Record: `type` is untrusted input and must not hit prototype keys.
+ */
+const NUMBERED_TYPES: ReadonlySet<string> = new Set<string>([
+	...Object.keys(USER_INPUT_TYPES),
+	...Object.keys(SESSION_CHANGE_TYPES),
+	...ABORT_WITHDRAWN_HELD_TYPES,
+]);
+
+/**
+ * Whether `command` waits for startup to finish before {@link runRpcMode} runs it. Every other
+ * command is answered while startup still runs, which is the point.
+ *
+ * A frame that starts a turn or changes the session waits because an extension's `input` handler
+ * would otherwise run ahead of the `session_start` broadcast, and `reconcile` swaps the active tool
+ * set under a turn already running. The rest wait for the same reason: `goal` creates, resumes,
+ * pauses and clears the goal state `reconcile` is still settling, `compact` rewrites the message set
+ * with a model call, `navigate_tree` opens with a session change, and `handoff` tears the session
+ * down and writes a new one.
+ *
+ * All four live types wait, not only the two that open a session. `live_start` and `live_connect`
+ * open a live session whose first delegation sends a main-session message with `triggerTurn`
+ * (LiveSessionController#handleDelegation). `live_stop` and `live_mute` wait so that the four keep
+ * their arrival order, and the hold orders them because all four are {@link BACKGROUND_COMMANDS}:
+ * each reaches `handleCommand` as it is read and starts its wait on the one `startupSettled`
+ * promise there, and promise reactions run in registration order, so the four resume in read
+ * order. `RpcLiveBridge.start` publishes its controller before its first await, so a `live_stop`
+ * that resumes after a `live_start` finds that controller while it is still connecting and cancels
+ * it. Answered during startup instead, a `live_stop` finds no controller, does nothing and reports
+ * success, and the held `live_start` then opens the host microphone after the host asked it to
+ * stop.
+ *
+ * `goal` with op `get` only reads the goal, so it is answered during startup like any other read —
+ * and it must be, since it is dispatched on the serial tail and would block every frame behind it.
+ * `command.op` is untrusted input like `command.type`: compared as a string, never used as a key.
+ */
+function waitsForStartup(command: RpcCommand): boolean {
+	if (command.type === "goal") return command.op !== "get";
+	return STARTUP_HELD_TYPES.has(command.type);
+}
+
+/**
  * Orders user input and decides whether an accepted frame is still wanted.
  *
- * Every user-input, abort and session-change frame gets a sequence number when it
- * is accepted (read from stdin), not when its handler runs. An abort invalidates
- * input accepted before it immediately. A session change invalidates input accepted
- * before the change frame, and only once the change succeeds: a vetoed change keeps
- * that input, and input pipelined after the change still runs in the new session.
+ * Every {@link NUMBERED_TYPES} frame, and every abort, gets a sequence number when it is accepted
+ * (read from stdin), not when its handler runs. An abort invalidates input accepted before it
+ * immediately. A session change invalidates input accepted before the change frame, and only once
+ * the change succeeds: a vetoed change keeps that input, and input pipelined after the change still
+ * runs in the new session.
  */
 export class RpcUserInputGate {
 	#tail: Promise<void> = Promise.resolve();
@@ -542,13 +598,7 @@ export class RpcUserInputGate {
 	accept(command: RpcCommand): void {
 		const isAbort =
 			command.type === "abort" || command.type === "abort_and_prompt" || command.type === "abort_and_restore_queue";
-		if (
-			!isAbort &&
-			!Object.hasOwn(USER_INPUT_TYPES, command.type) &&
-			!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)
-		) {
-			return;
-		}
+		if (!isAbort && !NUMBERED_TYPES.has(command.type)) return;
 		const sequence = ++this.#sequence;
 		this.#acceptedAt.set(command, sequence);
 		if (isAbort) this.#validFrom = sequence;
@@ -577,10 +627,11 @@ export class RpcUserInputGate {
 	}
 }
 
-/** Starts prompts, steers, follow-ups and `steer_subagent` after earlier ordinary commands, without
- * awaiting admission. Control frames, `bash` and `predict_word` dispatch immediately (see
- * dispatchRpcInputFrame). `acceptInput` runs synchronously in {@link dispatch}, before the
- * handler is queued, so an abort can invalidate a frame that has not started yet. */
+/** Starts prompts, steers, follow-ups, `dictation_start` and `steer_subagent` after earlier
+ * ordinary commands, without awaiting admission. Control frames and every
+ * {@link BACKGROUND_COMMANDS} type dispatch immediately (see {@link dispatchRpcInputFrame}).
+ * `acceptInput` runs synchronously in {@link dispatch}, before the handler is queued, so an abort
+ * can invalidate a frame that has not started yet. */
 export class RpcInputDispatcher {
 	#tail: Promise<void> = Promise.resolve();
 	#tasks = new Set<Promise<void>>();
@@ -604,9 +655,9 @@ export class RpcInputDispatcher {
 			if (dispatchRpcControlFrame(parsed, this.#deps)) return;
 			const command = parsed as RpcCommand;
 			this.#acceptInput?.(command);
-			// Bash and predict_word retain their immediate side channel. Prompts,
-			// steers, follow-ups and steer_subagent start through the serial tail, but
-			// dispatchRpcInputFrame backgrounds their admission.
+			// Every BACKGROUND_COMMANDS type keeps its immediate side channel. Prompts,
+			// steers, follow-ups, dictation_start and steer_subagent start through the
+			// serial tail, but dispatchRpcInputFrame backgrounds their admission.
 			if (BACKGROUND_COMMANDS.has(command.type)) {
 				dispatchRpcInputFrame(command, this.#deps);
 				return;
@@ -651,8 +702,8 @@ export class RpcInputDispatcher {
  * Coordinates deferred shutdown with in-flight background input tasks.
  *
  * `pi.shutdown()` from an extension only *requests* shutdown; the process must
- * not exit while a background-dispatched command (`bash`, `predict_word`,
- * `prompt` or `steer_subagent`, see
+ * not exit while a background-dispatched command (every {@link BACKGROUND_COMMANDS} type, plus
+ * `prompt`, `steer`, `dictation_start`, `follow_up` and `steer_subagent`, see
  * {@link dispatchRpcInputFrame}) still owes the client a response frame. The
  * coordinator tracks those tasks, re-checks the shutdown request whenever one
  * settles (covering a shutdown requested mid-command with no follow-up client
@@ -1413,7 +1464,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const outputWriter = new RpcOutputWriter(stdout, failure => {
 		logger.error("RPC output delivery failed", { error: String(failure) });
 		dictationBridge?.dispose();
-		void session.dispose().finally(() => process.exit(1));
+		// Through postmortem's cleanup, which gives back any session lease the dispose left (a subagent's). Stdout
+		// failed, so nothing waits for it to drain.
+		void session.dispose().finally(() => postmortem.exitAfterCleanup(1, { drainStdout: false }));
 	});
 	outputWriter.write(
 		frameEncoder.encodeFrames({
@@ -1725,78 +1778,52 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		return success(command.id, "set_ask_dialog", { enabled: rpcUiContext.askDialogEnabled });
 	};
 	const onPromptError = (id: string | undefined, command: string) => (promptError: Error) =>
-		output(error(id, command, promptError.message));
+		output(error(id, command, promptError.message, rpcBusyCode(promptError)));
 
-	// Read stdin from now on: `session_start` may be waiting on a dialog only the client can answer. Until the
-	// command loop below exists, a dialog answer and the ask-dialog opt-in are handled at once and every other
-	// frame is held, in arrival order, for that loop.
-	let heldFrames: unknown[] | undefined = [];
-	const receiveFrame = (parsed: unknown): void => {
-		if (!heldFrames) {
-			inputDispatcher.dispatch(parsed);
-		} else if (isRpcExtensionUIResponse(parsed)) {
-			pendingExtensionRequests.get(parsed.id)?.resolve(parsed);
-		} else if (isRecord(parsed) && parsed.type === "set_ask_dialog") {
-			output(setAskDialog(parsed as RpcCommand & { type: "set_ask_dialog" }));
-		} else {
-			heldFrames.push(parsed);
-		}
+	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
+	const reloadPluginState = async () => {
+		const cwd = session.sessionManager.getCwd();
+		const projectPath = await resolveActiveProjectRegistryPath(cwd);
+		clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+		await session.refreshSkillsAndCommands();
+		await emitAvailableCommandsUpdate();
 	};
-	// A transport error during startup must not be an unhandled rejection; the final await below still throws it.
-	// Input ending while startup still runs means no client is left to answer a dialog it awaits: reject them.
-	const inputRead = readRpcInputFrames(input, receiveFrame, message => output(error(undefined, "parse", message)));
-	const rejectStartupDialogs = (): void => {
-		if (heldFrames) pendingExtensionRequests.rejectAll("RPC client disconnected during startup");
+	const emitAvailableCommandsUpdate = async () => {
+		output({ type: "available_commands_update", commands: await getAvailableCommands() });
 	};
-	inputRead.then(rejectStartupDialogs, rejectStartupDialogs);
-
-	// Set up extensions with RPC-based UI context
-	await initializeExtensions(session, {
-		mode: "rpc",
-		// Extension-initiated session changes get the same goal quiesce/reattach as the commands below.
-		wrapSessionChange: <T extends { cancelled: boolean }>(
-			change: () => Promise<T>,
-			{ detachesRun }: { detachesRun: boolean },
-		): Promise<T> =>
-			withSessionChange(async () => {
-				await stopDictationForSessionChange();
-				await btw.close();
-				await goalController.beginSessionChange();
-				let result: T | undefined;
-				try {
-					result = await change();
-					return result;
-				} finally {
-					// Reattaches only if the session actually changed, then re-checks settlement.
-					// A change that throws may already have detached the run: count it as detached.
-					await goalController.endSessionChange({ detachedRun: detachesRun && result?.cancelled !== true });
-					if (result && !result.cancelled) {
-						// As for the host's new/switch commands: a detached run never yields, so
-						// close the prompts it was answering. Branch and navigation leave a live
-						// run streaming to its normal yield.
-						if (detachesRun) promptResults.abortOpen();
-						void settleWatcher.check();
-					}
+	// What a built-in reports to the client and the MCP manager `/mcp` works on, for a typed `prompt` and for an
+	// extension's `sendUserInput` alike; defined before `initializeExtensions` because `session_start` handlers
+	// can already send input.
+	const slashCommandHost: SlashCommandHost = {
+		mcpManager: options.mcpManager,
+		// `/mcp reauth` writes config-file credentials; RPC mode wires no tools-changed
+		// callback, so refresh the session binding once the reconnect recovers tools.
+		reconnectMcpServer: options.mcpManager
+			? async (mcpName, selected) => {
+					const manager = options.mcpManager!;
+					const state = await reconnectMcpManagerServer(manager, mcpName, selected);
+					if (state) await session.refreshMCPTools(manager.getTools());
+					return state;
 				}
-			}),
-		reportSendError: (action, err) => {
-			output(error(undefined, action, err.message));
+			: undefined,
+		output: commandOutput => output({ type: "command_output", text: commandOutput }),
+		refreshCommands: emitAvailableCommandsUpdate,
+		reloadPlugins: reloadPluginState,
+		notifyTitleChanged: async () => {
+			output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
 		},
-		reportRuntimeError: err => {
-			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
+		notifyConfigChanged: async () => {
+			output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
 		},
-		onShutdown: () => {
-			shutdownState.requested = true;
-			dictationBridge.dispose();
-		},
-		trackAgentInvokingMessage: task => {
-			extensionUserMessageTracker.trackAgentMessageTask(task);
-		},
-		// Headless hosts get the extension runner's no-op UI: hasUI=false, dialogs resolve to defaults.
-		uiContext: headless ? undefined : rpcUiContext,
-	});
+	};
 
-	// Output all agent events as JSON; prompt results follow the frame that settled them.
+	// Output all agent events as JSON; prompt results follow the frame that settled them. Installed
+	// before the stdin reader and the extensions below: a command answered during startup would
+	// otherwise lose every event it emits, to the client and to the three observers here; a
+	// `session_start` handler can await a dialog only the client can answer, and the
+	// `user_wait_start` bracket that dialog publishes is emitted once; and a turn a `session_start`
+	// handler triggers streams to the client from its first event instead of appearing only once
+	// startup returns.
 	session.subscribe(event => {
 		sessionEvents.forward(event);
 		// Before the prompt-result and settle reports: a goal continuation decided at this
@@ -1805,8 +1832,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		promptResults.observe(event);
 		settleWatcher.observe(event);
 	});
-	await goalController.reconcile();
-	await goalController.settled();
 
 	// Discriminates a store failure from any other dispose rejection below.
 	let persistenceFailure: Error | undefined;
@@ -1839,12 +1864,14 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			await liveBridge.stop();
 			await session.dispose();
 		} catch (error) {
-			if (!persistenceFailure || error !== persistenceFailure) throw error;
+			// The latch holds the latest failure, which may not be the one the observer first heard.
+			const latched = persistenceFailure && session.sessionManager.getPersistenceFailure();
+			if (!latched || error !== latched) throw error;
 			// The notice frame this failure queued must reach the client before the
 			// process ends (review 3983906393).
 			await outputWriter.close();
 			try {
-				if (!process.stderr.write(`${formatPersistenceDurabilityFailure(persistenceFailure.message)}\n`)) {
+				if (!process.stderr.write(`${formatPersistenceDurabilityFailure(latched.message)}\n`)) {
 					const { promise, resolve } = Promise.withResolvers<void>();
 					// A closed stream never emits `drain`; resolve on error/close too
 					// so an undeliverable mirror cannot strand the exit.
@@ -1862,29 +1889,28 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			} catch {
 				// A mirror that cannot be written must not cost the exit code.
 			}
-			process.exit(1);
+			return postmortem.exitAfterCleanup(1);
 		}
 		// A failure that already reported and then recovered still leaves its notice
 		// queued here, so the success path drains the same queue before it exits.
 		await outputWriter.close();
-		process.exit(0);
+		// Through postmortem's cleanup, which gives back any session lease the dispose left (a subagent's).
+		return postmortem.exitAfterCleanup(0);
 	};
 
-	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
-	const reloadPluginState = async () => {
-		const cwd = session.sessionManager.getCwd();
-		const projectPath = await resolveActiveProjectRegistryPath(cwd);
-		clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-		await session.refreshSkillsAndCommands();
-		await emitAvailableCommandsUpdate();
-	};
-	const emitAvailableCommandsUpdate = async () => {
-		output({ type: "available_commands_update", commands: await getAvailableCommands() });
-	};
-	session.subscribeCommandMetadataChanged(() => {
-		void emitAvailableCommandsUpdate();
+	// A signal (SIGINT, SIGTERM, SIGHUP) ends the process through postmortem, which runs this before it exits
+	// 130, 143 or 129: dispose the session as the stdin-EOF path, print mode and interactive mode do, so
+	// `session_shutdown` runs and the session manager closes, which releases a SQL store's lease after its last
+	// publish. Registered here, before this mode emits `session_start` and reconciles goals, so a signal there disposes
+	// the session too. Earlier in startup (while extensions load) no mode teardown exists yet; the store that holds the
+	// lease gives it back itself, after every other cleanup callback has settled (postmortem's `afterOthers`).
+	postmortem.register("rpc-mode-session", async reason => {
+		subagentRegistry?.dispose();
+		dictationBridge.dispose();
+		await liveBridge.stop().catch(() => undefined);
+		await btw.close().catch(() => undefined);
+		await session.dispose({ reason, mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 	});
-	await emitAvailableCommandsUpdate();
 
 	const inputGate = new RpcUserInputGate();
 	type OrderedUserInput = Extract<RpcCommand, { type: "prompt" | "steer" | "follow_up" | "abort_and_prompt" }>;
@@ -1941,32 +1967,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					sessionManager: session.sessionManager,
 					settings: session.settings,
 					cwd: session.sessionManager.getCwd(),
-					output: commandOutput => output({ type: "command_output", text: commandOutput }),
-					refreshCommands: emitAvailableCommandsUpdate,
-					reloadPlugins: reloadPluginState,
-					mcpManager: options.mcpManager,
-					reconnectMcpServer: options.mcpManager
-						? async (mcpName, selected) => {
-								const manager = options.mcpManager!;
-								const state = await reconnectMcpManagerServer(manager, mcpName, selected);
-								if (state) {
-									// RPC mode wires no tools-changed callback; refresh the
-									// session binding so later prompts see the recovered tools.
-									await session.refreshMCPTools(manager.getTools());
-								}
-								return state;
-							}
-						: undefined,
+					...slashCommandHost,
 					signal: builtinAbort.signal,
 					runCommandInBackground: task => {
 						backgroundedBuiltin = true;
 						shutdownCoordinator.track(task().finally(() => builtinCommandAborts.delete(builtinAbort)));
-					},
-					notifyTitleChanged: async () => {
-						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
-					},
-					notifyConfigChanged: async () => {
-						output({ type: "config_update", model: session.model, thinkingLevel: session.thinkingLevel });
 					},
 				});
 				if (!backgroundedBuiltin) builtinCommandAborts.delete(builtinAbort);
@@ -2113,7 +2118,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						// Already acknowledged: owe the late same-id error and a failed prompt_result.
 						const promptError = cause instanceof Error ? cause : new Error(String(cause));
 						onPromptError(id, "abort_and_prompt")(promptError);
-						promptResults.fail(ticket, promptError.message);
+						promptResults.fail(ticket, promptError.message, rpcBusyCode(promptError));
 					},
 				);
 				return success(id, "abort_and_prompt");
@@ -2480,7 +2485,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						return error(id, "get_subagent_messages", "fromByte must be a finite number");
 					}
 					const sessionFile = subagentRegistry.resolveSessionFile(command);
-					const transcript = await readRpcSubagentTranscript(sessionFile, command.fromByte);
+					const transcript = await readRpcSubagentTranscript(
+						sessionFile,
+						command.fromByte,
+						session.sessionManager.getStorage(),
+					);
 					return success(id, "get_subagent_messages", transcript);
 				} catch (err) {
 					return error(id, "get_subagent_messages", err instanceof Error ? err.message : String(err));
@@ -2662,6 +2671,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				const { sessionIds } = command;
 				if (!Array.isArray(sessionIds) || !sessionIds.every(sessionId => typeof sessionId === "string")) {
 					return error(id, "get_session_lease", "sessionIds must be an array of strings");
+				}
+				try {
+					assertSessionsOnDisk(session.sessionManager.getStorage(), "get_session_lease", NO_SESSION_LEASE_REASON);
+				} catch (err) {
+					if (!(err instanceof SessionStorageUnsupportedError)) throw err;
+					return error(id, "get_session_lease", err.message);
 				}
 				return success(id, "get_session_lease", probeSessionLeases(sessionIds));
 			}
@@ -2905,9 +2920,32 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 	};
 
-	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
+	const runCommand = (command: RpcCommand): Promise<RpcResponse> => {
 		if (!Object.hasOwn(SESSION_CHANGE_TYPES, command.type)) return handleCommandImpl(command);
 		return withSessionChange(() => handleCommandImpl(command));
+	};
+
+	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
+		if (waitsForStartup(command)) {
+			await startupSettled.promise;
+			// The set is the test, not the promise: `startupSettled` stays resolved for the life of the
+			// process, so reading it here would withdraw every later `new_session`, `switch_session`,
+			// `fork` and `navigate_tree` too. The set holds exactly the frames read while startup ran,
+			// including one that reached this point only afterwards because another held serial frame
+			// was ahead of it. `inputGate.accept` numbered this frame when it was read, so an `abort`
+			// read while it waited is numbered after it and `isCurrent` is false here: the host
+			// withdrew the frame before it ran. Read only for those frames, never generally: a general
+			// read would also withdraw frames that arrived before a session change that succeeded
+			// outside startup, which is a protocol change this does not make.
+			if (
+				framesReadDuringStartup.has(command) &&
+				ABORT_WITHDRAWN_HELD_TYPES.has(command.type) &&
+				!inputGate.isCurrent(command)
+			) {
+				return success(command.id, command.type, { cancelled: true });
+			}
+		}
+		return runCommand(command);
 	};
 
 	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
@@ -2937,20 +2975,108 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		onHostUriResult: frame => hostUriBridge.handleResult(frame),
 	};
 
+	let startupComplete = false;
+	// Settles with `startupComplete`: `handleCommand` holds every frame that starts a turn, changes the
+	// session or changes goal state on it. Declared before the dispatcher below, whose `acceptInput`
+	// reads it, and before the reader, which dispatches into `handleCommand`.
+	const startupSettled = Promise.withResolvers<void>();
+	// The frames read while startup ran, which is exactly what `handleCommand`'s abort withdrawal
+	// covers. Weak: a frame is a one-shot object and nothing here may keep it alive.
+	const framesReadDuringStartup = new WeakSet<object>();
+
+	// Side-channel frames dispatch immediately, ordinary commands serialize through inputDispatcher, and bash
+	// remains background-dispatched so abort_bash can overtake it.
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
-		acceptInput: command => inputGate.accept(command),
+		acceptInput: command => {
+			inputGate.accept(command);
+			// `isRecord` because a frame is untrusted input: a primitive one cannot key a weak
+			// collection, and `handleCommandImpl` answers it as an unknown command anyway.
+			if (startupComplete || !isRecord(command)) return;
+			framesReadDuringStartup.add(command);
+		},
 	});
 
-	// Startup is over: run the frames held back meanwhile, then every later frame, through the dispatcher.
-	// Side-channel frames dispatch immediately, ordinary commands serialize through inputDispatcher, and bash
-	// remains background-dispatched so abort_bash can overtake it. readRpcInputFrames reads line-by-line so a
-	// single malformed line is reported as an error frame and the loop keeps running instead of throwing out of
-	// the reader and killing the whole process (issue #5194).
-	const held = heldFrames;
-	heldFrames = undefined;
-	for (const parsed of held) inputDispatcher.dispatch(parsed);
+	// Read stdin from now on: `session_start` may be waiting on a dialog only the client can answer. Every frame
+	// dispatches as it arrives, startup included, so a command sent before startup finishes is answered while it
+	// still runs. readRpcInputFrames reads line-by-line so a single malformed line is reported as an error frame
+	// and the loop keeps running instead of throwing out of the reader and killing the whole process
+	// (issue #5194).
+	// A transport error during startup must not be an unhandled rejection; the final await below still throws it.
+	// Input ending while startup still runs means no client is left to answer a dialog it awaits: reject them.
+	const inputRead = readRpcInputFrames(
+		input,
+		parsed => inputDispatcher.dispatch(parsed),
+		message => output(error(undefined, "parse", message)),
+	);
+	const rejectStartupDialogs = (): void => {
+		if (!startupComplete) pendingExtensionRequests.rejectAll("RPC client disconnected during startup");
+	};
+	inputRead.then(rejectStartupDialogs, rejectStartupDialogs);
+
+	// Set up extensions with RPC-based UI context
+	await initializeExtensions(session, {
+		mode: "rpc",
+		// Extension-initiated session changes get the same goal quiesce/reattach as the commands below.
+		wrapSessionChange: <T extends { cancelled: boolean }>(
+			change: () => Promise<T>,
+			{ detachesRun }: { detachesRun: boolean },
+		): Promise<T> =>
+			withSessionChange(async () => {
+				await stopDictationForSessionChange();
+				await btw.close();
+				await goalController.beginSessionChange();
+				let result: T | undefined;
+				try {
+					result = await change();
+					return result;
+				} finally {
+					// Reattaches only if the session actually changed, then re-checks settlement.
+					// A change that throws may already have detached the run: count it as detached.
+					await goalController.endSessionChange({ detachedRun: detachesRun && result?.cancelled !== true });
+					if (result && !result.cancelled) {
+						// As for the host's new/switch commands: a detached run never yields, so
+						// close the prompts it was answering. Branch and navigation leave a live
+						// run streaming to its normal yield.
+						if (detachesRun) promptResults.abortOpen();
+						void settleWatcher.check();
+					}
+				}
+			}),
+		reportSendError: (action, err) => {
+			output(error(undefined, action, err.message));
+		},
+		reportRuntimeError: err => {
+			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
+		},
+		onShutdown: () => {
+			shutdownState.requested = true;
+			dictationBridge.dispose();
+		},
+		trackAgentInvokingMessage: task => {
+			extensionUserMessageTracker.trackAgentMessageTask(task);
+		},
+		// Headless hosts get the extension runner's no-op UI: hasUI=false, dialogs resolve to defaults.
+		uiContext: headless ? undefined : rpcUiContext,
+		slashCommandHost,
+		// Return once the startup handlers ran, without waiting for a turn one of them triggered:
+		// startup then ends while that turn still streams, so the frames `handleCommand` holds for
+		// startup run during that turn, as they would during any other, instead of after it.
+		drainSends: false,
+	});
+
+	await goalController.reconcile();
+	await goalController.settled();
+	session.subscribeCommandMetadataChanged(() => {
+		void emitAvailableCommandsUpdate();
+	});
+	await emitAvailableCommandsUpdate();
+	// Startup is over: a client disconnect from here on is handled by the teardown below, not by
+	// rejecting the dialogs startup was awaiting. Frames `handleCommand` held on startup run from here.
+	startupComplete = true;
+	startupSettled.resolve();
+
 	await inputRead;
 
 	// stdin closed — RPC client is gone. Fail pending side-channel requests

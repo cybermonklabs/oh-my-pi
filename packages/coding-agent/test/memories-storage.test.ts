@@ -16,6 +16,7 @@ import {
 	tryClaimGlobalPhase2Job,
 	upsertThreads,
 } from "@oh-my-pi/pi-coding-agent/memories/storage";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getAgentDbPath, TempDir } from "@oh-my-pi/pi-utils";
 
 const GLOBAL_KIND = "memory_consolidate_global";
@@ -221,6 +222,8 @@ describe("memories/storage", () => {
 				getSessionDir: () => sessionDir,
 				getSessionId: () => "current-thread",
 				getCwd: () => PROJECT_CWD,
+				// Memories read past sessions through the session's storage; these are files.
+				getStorage: () => new FileSessionStorage(),
 			},
 			settings,
 			model,

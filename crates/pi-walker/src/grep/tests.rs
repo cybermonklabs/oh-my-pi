@@ -16,6 +16,11 @@ use super::{
 	SearchOptions, grep, scan, search,
 };
 use crate::{fs::Fs, walk};
+#[cfg(unix)]
+use crate::{
+	fs::seam::Open,
+	testing::{Outside, SwapTree, escaped, settle},
+};
 
 struct TempDir(PathBuf);
 
@@ -1130,4 +1135,90 @@ async fn unlistable_root_fails_the_search() {
 			result.map(|r| r.files_searched)
 		);
 	}
+}
+
+/// The texts of every match `result` reports.
+#[cfg(unix)]
+fn texts(result: &GrepResult) -> Vec<&str> {
+	result.matches.iter().map(|m| m.text.as_str()).collect()
+}
+
+/// Case B in the budgeted pass: `sub` is swapped for a symlink to a
+/// directory outside the root, holding a file of the listed name, between
+/// the listing and the file's open. The file is not read through the link.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn budgeted_search_refuses_a_file_below_a_directory_swapped_for_a_symlink() {
+	let tree = SwapTree::new("grep-budgeted-b", 0, Outside::SameName);
+	tree.swap_dir_before_open(&tree.decoy_name);
+	let result = run(&tree.root, &GrepOptions { max_count: Some(100), ..options(&needle()) }).await;
+	assert!(tree.swapped().is_some(), "the swap ran");
+	assert!(!escaped(texts(&result)), "read through the swapped link: {:?}", texts(&result));
+}
+
+/// Case A in the budgeted pass, below the depth past which the ordered
+/// traversal stops keeping directory handles: `sub` is swapped for a symlink
+/// to a directory outside the root between its parent's listing and its own
+/// open. The traversal opens `sub` below the root's handle (not by path), so
+/// it does not descend into the link. That open is what the swap records:
+/// the candidate opens below the root too, so the read alone could not show
+/// a traversal that descended into the link.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn budgeted_search_past_the_open_directory_limit_refuses_a_swapped_directory() {
+	let tree = SwapTree::new("grep-budgeted-a-deep", walk::tree::MAX_OPEN_DIRS, Outside::OtherName);
+	tree.swap_dir_before_open(&tree.sub_name);
+	let result = run(&tree.root, &GrepOptions { max_count: Some(100), ..options(&needle()) }).await;
+	assert_eq!(tree.swapped(), Some(Open::Beneath), "sub did not open below the root");
+	assert!(!escaped(texts(&result)), "descended into the swapped link: {:?}", texts(&result));
+}
+
+/// The unbounded pass opens a listed file relative to its directory without
+/// following a symlink that replaced the file after the listing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unbounded_search_refuses_a_file_swapped_for_a_symlink() {
+	let tree = SwapTree::new("grep-unbounded-file", 0, Outside::SameName);
+	tree.swap_file_before_open();
+	let result = run(&tree.root, &options(&needle())).await;
+	assert_eq!(tree.swapped(), Some(Open::At), "the file opened relative to its directory");
+	assert!(!escaped(texts(&result)), "read through the swapped link: {:?}", texts(&result));
+}
+
+/// Case B in the unbounded pass over a listing served from the cache, which
+/// carries no directory handle: the file is not read through the link.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unbounded_search_of_a_cached_listing_refuses_a_file_below_a_swapped_directory() {
+	let tree = SwapTree::new("grep-cached-b", 0, Outside::SameName);
+	let mut opts = options(&needle());
+	opts.walk.cache = true;
+	settle();
+	let filled = run(&tree.root, &opts).await;
+	assert_eq!(texts(&filled), ["needle inside"]);
+	tree.swap_dir_before_open(&tree.decoy_name);
+	let result = run(&tree.root, &opts).await;
+	let swapped = tree.swapped();
+	assert!(swapped.is_some_and(|open| open != Open::At), "the listing was not cached: {swapped:?}");
+	assert!(!escaped(texts(&result)), "read through the swapped link: {:?}", texts(&result));
+}
+
+/// Case A in the unbounded pass: the root's listing comes from the cache, so
+/// `sub` (changed since, so listed afresh) opens without its parent's handle
+/// after it is swapped for a symlink. The walk does not descend into the link.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unbounded_search_below_a_cached_listing_refuses_a_swapped_directory() {
+	let tree = SwapTree::new("grep-cached-a", 0, Outside::OtherName);
+	let mut opts = options(&needle());
+	opts.walk.cache = true;
+	settle();
+	let filled = run(&tree.root, &opts).await;
+	assert_eq!(texts(&filled), ["needle inside"]);
+	fs::write(tree.sub.join("changed.txt"), "").expect("sub changes");
+	tree.swap_dir_before_open(&tree.sub_name);
+	let result = run(&tree.root, &opts).await;
+	let swapped = tree.swapped();
+	assert!(swapped.is_some_and(|open| open != Open::At), "the root was not cached: {swapped:?}");
+	assert!(!escaped(texts(&result)), "descended into the swapped link: {:?}", texts(&result));
 }

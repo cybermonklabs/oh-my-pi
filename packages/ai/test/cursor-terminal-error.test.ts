@@ -633,13 +633,16 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
 		expect(result.errorMessage).toContain("Connect error unavailable: post-turn connect failure");
 	});
 
+	// A Connect end-stream error's decoded details are omp's diagnostic: shown
+	// (`errorDisplayMessage`), never in the `errorMessage` that decisions read.
 	it("surfaces standard Connect detail values without changing recovery classification", async () => {
 		scenario = { kind: "connect-detailed-error-after-turn" };
 		const baseUrl = await startServer();
 		const { result } = await collectStream(makeModel(baseUrl));
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("google.rpc.ErrorInfo");
-		expect(result.errorMessage).toContain("quota exceeded for request field tools");
+		expect(result.errorMessage).toBe("Connect error invalid_argument: Error");
+		expect(result.errorDisplayMessage).toContain("google.rpc.ErrorInfo");
+		expect(result.errorDisplayMessage).toContain("quota exceeded for request field tools");
 		expect(AIError.is(result.errorId, AIError.Flag.UsageLimit)).toBe(false);
 	});
 
@@ -647,7 +650,8 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
 		scenario = { kind: "connect-classification-detail-after-turn" };
 		const baseUrl = await startServer();
 		const { result } = await collectStream(makeModel(baseUrl));
-		expect(result.errorMessage).toContain("quota exceeded for this account");
+		expect(result.errorMessage).toBe("Connect error invalid_argument: Error");
+		expect(result.errorDisplayMessage).toContain("quota exceeded for this account");
 		expect(AIError.is(result.errorId, AIError.Flag.UsageLimit)).toBe(false);
 	});
 
@@ -656,7 +660,8 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
 		const baseUrl = await startServer();
 		const { result } = await collectStream(makeModel(baseUrl));
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("Unable to reach the model provider");
+		expect(result.errorMessage).toBe("Connect error unavailable: Error");
+		expect(result.errorDisplayMessage).toContain("Unable to reach the model provider");
 		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(isRetryable);
 	});
 

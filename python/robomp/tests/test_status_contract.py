@@ -12,11 +12,41 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from robomp.config import Settings, reset_settings_cache
 from robomp.db import get_database
 from robomp.server import create_app
+
+
+class _PausedPool:
+    """A worker pool that never dispatches, as in test_server.py.
+
+    These tests queue events and then claim or inspect them; the real pool's
+    dispatch loop claims a queued event as soon as it sees one, so with it a
+    test's own claim could find nothing, or the event already running.
+    """
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self, *, drain_timeout: float = 25.0, kill_timeout: float = 5.0) -> None:
+        pass
+
+    def wake(self) -> None:
+        pass
+
+    async def cancel_event(self, delivery_id: str) -> bool:
+        return False
+
+    async def inflight_snapshot(self) -> list[str]:
+        return []
+
+
+def _create_app(settings: Settings) -> FastAPI:
+    return create_app(settings, pool_factory=lambda *_args: _PausedPool())
+
 
 # Runtime/timestamp fields vary every run; normalize them so the live payload
 # can be compared against (or regenerated into) a byte-stable committed fixture.
@@ -42,7 +72,7 @@ def _normalize_for_fixture(value: Any) -> Any:
 
 
 def test_status_contract(settings: Settings) -> None:
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         # Seed AFTER startup:
         db = get_database(settings.sqlite_path)
@@ -248,7 +278,7 @@ def test_cancel_happy_path(env, monkeypatch: pytest.MonkeyPatch) -> None:
     token = _enable_replay(monkeypatch)
     cfg = Settings()
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         db.record_event(
@@ -281,7 +311,7 @@ def test_cancel_errors_and_gating(env, monkeypatch: pytest.MonkeyPatch) -> None:
     token = _enable_replay(monkeypatch)
     cfg = Settings()
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         db.record_event(
@@ -332,7 +362,7 @@ def test_cancel_errors_and_gating(env, monkeypatch: pytest.MonkeyPatch) -> None:
     reset_settings_cache()
     cfg_disabled = Settings()
     cfg_disabled.ensure_paths()
-    app_disabled = create_app(cfg_disabled)
+    app_disabled = _create_app(cfg_disabled)
     with TestClient(app_disabled) as client:
         resp = client.post(
             "/api/cancel",
@@ -346,7 +376,7 @@ def test_retry_state_transition(env, monkeypatch: pytest.MonkeyPatch) -> None:
     token = _enable_replay(monkeypatch)
     cfg = Settings()
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         db.record_event(

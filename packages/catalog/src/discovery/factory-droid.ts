@@ -1,4 +1,5 @@
 import { isRecord } from "@oh-my-pi/pi-utils";
+import { readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
 import {
 	type FactoryDroidRegistryModel,
 	factoryDroidRegionalLimits,
@@ -225,14 +226,16 @@ export async function fetchFactoryDroidModels(
 			fetchImpl(`${apiBaseUrl}/api/organization/managed-settings`, { headers }).catch(() => null),
 		]);
 		if (!flagsResponse.ok) return null;
-		const body: unknown = await flagsResponse.json();
+		const body: unknown = await readJsonInSlices(flagsResponse);
 		if (body == null || typeof body !== "object" || !("flags" in body)) return null;
 		const raw = body.flags;
 		if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return null;
 		flags = Object.fromEntries(Object.entries(raw).map(([key, value]) => [key, value === true]));
 		// An unreadable settings body leaves policy and image settings unknown, so
 		// gated rows fail closed instead of the whole refresh keeping stale ones.
-		const settings: unknown = settingsResponse?.ok ? await settingsResponse.json().catch(() => null) : null;
+		const settings: unknown = settingsResponse?.ok
+			? await readJsonInSlices(settingsResponse).catch(() => null)
+			: null;
 		policy = readModelPolicy(settings);
 		images = readImageSettings(settings);
 		routing = readProviderRouting(body as Record<string, unknown>);
