@@ -161,6 +161,8 @@ export interface AgentRegistryApi {
 	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean;
 	/** Record that the current run's drive ended, whatever its outcome. */
 	markRunEnded(id: string, expected?: AgentRefExpectation): boolean;
+	/** Start a new run on an existing ref: drop the previous run's milestones. */
+	startRun(id: string, expected?: AgentRefExpectation): boolean;
 	/** Accepted-but-running refs whose run already finished. */
 	staleAcceptedRuns(): AgentRef[];
 	/** Record a short activity gist for the work-aware roster. */
@@ -396,7 +398,8 @@ export class AgentRegistry implements AgentRegistryApi {
 	 * Stamp `lifecycle.endedAt`: the current run's drive ended, whatever its
 	 * outcome, so the ref takes no further turn for this run even while its
 	 * cleanup still holds the session. Run-scoped like the other milestones:
-	 * {@link setStatus} clears it when the ref re-enters `running`.
+	 * {@link setStatus} clears it when the ref re-enters `running`, and
+	 * {@link startRun} when the next run starts before its first turn does.
 	 *
 	 * Returns false when the id is gone, aborted, or no longer owned by
 	 * `expected`.
@@ -405,6 +408,25 @@ export class AgentRegistry implements AgentRegistryApi {
 		const ref = this.#refs.get(id);
 		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
 		ref.lifecycle = { ...ref.lifecycle, endedAt: Date.now() };
+		this.#emit({ type: "metadata_changed", ref });
+		return true;
+	}
+
+	/**
+	 * Start a new run (a follow-up turn) on an existing ref: drop the previous
+	 * run's milestones (its acceptance, its ended drive), as re-entering
+	 * `running` does, but without a status change. The run announces itself
+	 * before its first turn starts; between those, the idle ref must read as this
+	 * run's, not as the previous run that ended or was accepted.
+	 *
+	 * Returns false when the id is gone, aborted, or no longer owned by
+	 * `expected`.
+	 */
+	startRun(id: string, expected?: AgentRefExpectation): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
+		if (ref.lifecycle === undefined) return true;
+		ref.lifecycle = undefined;
 		this.#emit({ type: "metadata_changed", ref });
 		return true;
 	}

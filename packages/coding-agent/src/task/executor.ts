@@ -4114,6 +4114,10 @@ async function driveFollowUpTurn(
 		sessionFile,
 		index,
 	} as const;
+	// The ref still carries the previous run's milestones (its ended drive, its
+	// acceptance) until this run's first turn starts: drop them before the
+	// started frame lists the run, so a host can reach it in between.
+	AgentRegistry.global().startRun(id, session);
 	emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
 
 	monitor.setActiveSession(session);

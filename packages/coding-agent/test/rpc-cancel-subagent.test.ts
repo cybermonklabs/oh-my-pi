@@ -19,7 +19,7 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SteerOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	type AgentDefinition,
 	type SubagentLifecyclePayload,
@@ -724,20 +724,75 @@ describe("handleRpcCancelSubagent", () => {
 		}
 	}, 15_000);
 
-	test("disposing the roster, as stdin EOF does, ends a steer waiting between turns and takes its message back", async () => {
-		const subagent = startSubagentAwaitingEvalJob();
-		try {
-			await subagent.awaitingJob;
-			const answer = handleRpcSteerSubagent(registry, subagent.id, "Also check the README.");
-			await Promise.race([answer, subagent.steerQueued]);
+	test("cancel_subagent reaches a follow-up run listed before its first turn, after a run that ended without a result", async () => {
+		const id = "Worker";
+		const promptEntered = Promise.withResolvers<void>();
+		const firstTurn = Promise.withResolvers<void>();
+		const listeners = new Set<(event: AgentSessionEvent) => void>();
+		// A follow-up turn whose first turn never starts on its own: its prompt waits until aborted.
+		const session = {
+			state: { messages: [] },
+			agent: { state: { systemPrompt: ["test"] } },
+			model: undefined,
+			extensionRunner: undefined,
+			isStreaming: false,
+			sessionManager: { appendSessionInit: () => {} },
+			getActiveToolNames: () => ["read", "yield"],
+			getEnabledToolNames: () => ["read", "yield"],
+			getMountedXdevToolNames: () => [],
+			getToolByName: () => undefined,
+			setActiveToolsByName: async () => {},
+			setWorkPoolYieldItems: async () => {},
+			subscribe: (listener: (event: AgentSessionEvent) => void) => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+			prompt: async () => {
+				promptEntered.resolve();
+				await firstTurn.promise;
+			},
+			waitForIdle: async () => {},
+			isAdvisorActive: () => false,
+			prepareForHeadlessAdvisorDrain: () => {},
+			waitForAdvisorCatchup: async () => true,
+			getLastAssistantMessage: () => undefined,
+			hasPendingAsyncWork: () => false,
+			getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
+			settleAsyncWork: async () => {},
+			abort: async () => {
+				calls.push("abort");
+				firstTurn.resolve();
+			},
+			dispose: async () => {},
+			setIrcWakeTurnObserver: () => {},
+			holdIrcWakes: () => () => {},
+			trackIrcReply: () => {},
+			isParentIrcSteer: () => false,
+			subscribeRunState: () => () => {},
+			addDisposer: () => {},
+		} as unknown as AgentSession;
+		AgentRegistry.global().register({
+			id,
+			displayName: id,
+			kind: "sub",
+			session,
+			sessionFile: path.join(sessionDir, `${id}.jsonl`),
+			status: "idle",
+		});
+		// The previous run failed: its drive ended and the ref stayed idle.
+		expect(AgentRegistry.global().markRunEnded(id, session)).toBe(true);
+		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
 
-			registry.dispose();
+		const run = runSubagentFollowUpTurn({ id, agent, message: "continue", eventBus });
+		await promptEntered.promise;
+		// Listed by its started frame; its first turn has not started, so the ref is still idle.
+		expect(registry.getSubagents().map(({ id, status }) => ({ id, status }))).toEqual([{ id, status: "running" }]);
+		expect(AgentRegistry.global().get(id)?.status).toBe("idle");
 
-			await expect(answer).resolves.toBe(`Subagent's run ended before the message reached it: ${subagent.id}`);
-			expect(subagent.queuedSteers).toEqual([]);
-			expect(subagent.turns).toHaveLength(1);
-		} finally {
-			await subagent.stop();
-		}
+		await expect(handleRpcCancelSubagent(registry, id)).resolves.toBe(true);
+
+		expect(calls).toContain("abort");
+		expect(AgentRegistry.global().get(id)?.status).toBe("aborted");
+		await run;
 	}, 15_000);
 });

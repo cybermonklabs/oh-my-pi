@@ -132,6 +132,10 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 		return this.#remote.callSync("markRunEnded", id, expected);
 	}
 
+	startRun(id: string, expected?: AgentRefExpectation): boolean {
+		return this.#remote.callSync("startRun", id, expected);
+	}
+
 	staleAcceptedRuns(): AgentRef[] {
 		return this.#remote.callSync("staleAcceptedRuns");
 	}

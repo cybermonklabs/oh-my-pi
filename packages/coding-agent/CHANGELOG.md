@@ -148,7 +148,7 @@
 - A subagent's pending `irc wait` ends once the subagent is parked, killed or released instead of waiting forever, and a message delivered to it while that happens is no longer kept buffered
 - A session on SQL storage that ends on a signal (such as SIGTERM) or a fatal error waits, up to the 10-second cleanup deadline, for the database to store its exit record and last entries instead of exiting while they are still being written
 - RPC `cancel_subagent` now cancels a subagent that `get_subagents` reports running while it waits between turns for its own background work, such as an eval `agent()` job, and ends that work, instead of answering `{"cancelled": false}`
-- RPC `steer_subagent` now reaches a subagent that `get_subagents` reports running while it waits between turns, instead of answering `Subagent not running`: the message waits for the subagent's next turn, which its task executor or a finished job starts, and the command answers an error if the subagent stops before any turn takes it
+- RPC `steer_subagent` now reaches a subagent that `get_subagents` reports running while it waits between turns, instead of answering `Subagent not running`: the message waits for the subagent's next turn, which its task executor or a finished job starts, and the command answers an error if the subagent stops, or the RPC session shuts down, before any turn takes it
 
 ### Breaking Changes
 

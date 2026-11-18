@@ -1010,11 +1010,15 @@ async function steerSubagentBetweenTurns(
 		outcome.resolve("delivered");
 	};
 	const end = () => outcome.resolve("ended");
+	const runEnded = `Subagent's run ended before the message reached it: ${subagentId}`;
+	// A shutdown already under way queues nothing.
+	if (shutdown?.aborted) return runEnded;
 	const checkReachable = () => {
 		const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
 		if (current?.ref !== owned.ref || current.session !== owned.session) end();
 	};
-	// Subscribe before queueing, so the run that takes the message cannot be missed.
+	// Subscribe before queueing, so the run that takes the message, or a
+	// shutdown that lands while it is queued, cannot be missed.
 	shutdown?.addEventListener("abort", end, { once: true });
 	const unsubscribers = [
 		owned.session.subscribe(event => {
@@ -1042,7 +1046,6 @@ async function steerSubagentBetweenTurns(
 		} catch (err) {
 			return `Subagent refused the message: ${err instanceof Error ? err.message : String(err)}`;
 		}
-		if (shutdown?.aborted) end();
 		checkReachable();
 		if ((await outcome.promise) === "delivered") return undefined;
 		let withdrawn = false;
@@ -1051,7 +1054,7 @@ async function steerSubagentBetweenTurns(
 		} catch (err) {
 			logger.debug("steer_subagent could not take back a queued message", { subagentId, error: String(err) });
 		}
-		if (withdrawn) return `Subagent's run ended before the message reached it: ${subagentId}`;
+		if (withdrawn) return runEnded;
 		// The session reports its events before it answers the take-back, so a
 		// delivery that raced the end of the run is known by now.
 		if (delivered) return undefined;
@@ -3216,15 +3219,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	dictationBridge.dispose();
 	// Steers waiting for a subagent's next turn end now, taking their messages
 	// back, instead of holding the drains below for as long as a subagent's job
-	// runs; disposing the roster leaves every later subagent command a no-op.
+	// runs. The roster stays live through the drains: commands the client sent
+	// before closing stdin still run against it.
 	betweenTurnSteers.abort();
-	subagentRegistry?.dispose();
 	await liveBridge.stop();
 	await inputDispatcher.drain();
 	// A backgrounded builtin (e.g. a /mcp reauth browser wait) must not park
 	// the drain: tear it down now that the client is gone.
 	abortBuiltinCommands("RPC client disconnected");
 	await shutdownCoordinator.drain();
+	subagentRegistry?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
 	// prior pi.shutdown() through the coordinator makes this await settle
