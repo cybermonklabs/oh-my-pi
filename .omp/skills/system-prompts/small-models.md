@@ -63,3 +63,5 @@ RIGHT (positive rules, executable words, input→output pairs):
 ```
 
 Every dropped "Never" rule was already enforced downstream (quote/punctuation stripping, first-line-only, casing reconciliation) — the prompt only carries what code cannot guarantee.
+
+Probe line: a pull request that changes this file requests the code owner's review.

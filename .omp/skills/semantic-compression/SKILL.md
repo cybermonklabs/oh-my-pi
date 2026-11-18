@@ -140,3 +140,5 @@ The source is quoted inside a nonce-delimited block and declared inert, so `MUST
 - Only an approved draft is written: `-o <path>`, `-i` in place, otherwise stdout (the report goes to stderr, so `> out.md` captures just the text). `-r` bounds the drafts; an unapproved run writes nothing and exits 1.
 
 The runtime contract it hands the agent lives in `packages/coding-agent/src/compress/prompts/system.md`. It is the operative subset of this file; when they disagree, this file wins and the prompt gets fixed.
+
+Probe line: a pull request that changes this file requests the code owner's review.
