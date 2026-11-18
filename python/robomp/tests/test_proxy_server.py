@@ -1352,9 +1352,7 @@ async def test_git_fetch_pr_head_falls_back_to_safe_branch(
 
 
 @pytest.mark.parametrize("pr_number", [0, -1])
-async def test_git_fetch_pr_head_rejects_nonpositive_pr_number(
-    proxy_settings: Settings, pr_number: int
-) -> None:
+async def test_git_fetch_pr_head_rejects_nonpositive_pr_number(proxy_settings: Settings, pr_number: int) -> None:
     app = _build_app(proxy_settings)
     endpoint = "/gh/v1/git/fetch_pr_head"
     body = json.dumps({"repo": "octo/widget", "pr_number": pr_number}).encode()

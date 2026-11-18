@@ -958,12 +958,7 @@ def fetch_pr_head(
         # payload, so it is only eligible when we can verify the result:
         # same-repo PR, present head ref, present head SHA. Anything else
         # keeps the original failure.
-        if (
-            "couldn't find remote ref" not in exc.stderr
-            or not same_repo
-            or not head_ref
-            or not head_sha
-        ):
+        if "couldn't find remote ref" not in exc.stderr or not same_repo or not head_ref or not head_sha:
             raise
         validate_fetch_ref(head_ref)
         log.warning("PR head ref unavailable; fetching same-repo branch", extra={"pr": pr_number, "head_ref": head_ref})
@@ -1003,7 +998,7 @@ def fetch_pr_head(
                 1,
                 probe.stdout,
                 f"PR head SHA mismatch: expected {head_sha}, fetched {probe.stdout.strip()}",
-            )
+            ) from exc
     backfill = _backfill_tip_blobs(
         repo_dir,
         "FETCH_HEAD",
