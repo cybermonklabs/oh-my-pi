@@ -29,6 +29,12 @@ import { cfgSessionSqlDsnFile, cfgSessionStorage } from "./storage-settings";
 
 const SESSION_STORAGE_ENV = "OMP_SESSION_STORAGE";
 const SESSION_SQL_DSN_FILE_ENV = "OMP_SESSION_SQL_DSN_FILE";
+/**
+ * `0` or `false` opens the store with `createTable: false`: it makes no table
+ * or index and refuses to start until they exist. A pod whose login may not
+ * create objects in `public` sets it, the tables' owner having made them.
+ */
+const SESSION_SQL_CREATE_TABLE_ENV = "OMP_SESSION_SQL_CREATE_TABLE";
 const SESSION_STORAGE_SETTING = cfgSessionStorage.id;
 const SESSION_SQL_DSN_FILE_SETTING = cfgSessionSqlDsnFile.id;
 
@@ -36,6 +42,13 @@ const SESSION_SQL_DSN_FILE_SETTING = cfgSessionSqlDsnFile.id;
 // a separate-path append proceed while a rename holds its transaction, without
 // spending Bun's default ten database backends for every omp process. Return
 // them between turns; a lifetime cap would only churn actively used connections.
+//
+// No connection-level setting is sent: PgBouncer before 1.26 (agents-postgres
+// runs 1.25.2 in transaction mode) refuses a `search_path` startup parameter,
+// and a transaction-mode pool would not keep a session-level `SET` for this
+// client anyway. The store locks `search_path` in each transaction instead
+// (`SET LOCAL`), which the pool keeps within that transaction, and names only
+// `pg_catalog` objects in the one statement it sends alone (the heartbeat).
 const SESSION_SQL_POOL_MAX = 2;
 const SESSION_SQL_POOL_IDLE_TIMEOUT_SECONDS = 5;
 
@@ -95,8 +108,11 @@ export async function resolveSessionStorage({ settings, env }: ResolveSessionSto
 			`${source} names ${dsnFile}, but its contents are not a connection URL the database driver accepts`,
 		);
 	}
+	const createTableValue = env[SESSION_SQL_CREATE_TABLE_ENV]?.trim().toLowerCase();
+	const createTable = !(createTableValue === "0" || createTableValue === "false");
 	try {
-		return await SqlSessionStorage.create({ client });
+		// The CLI claims every session it writes, so a second live process moves off it.
+		return await SqlSessionStorage.create({ client, claims: true, createTable });
 	} catch (err) {
 		void client.end().catch(() => undefined);
 		const error = toError(err);
@@ -147,7 +163,8 @@ export function assertSessionsOnDisk(storage: SessionStorage, feature: string, r
 
 /** Why lease probes (`omp session lease`, RPC `get_session_lease`) refuse under `session.storage: sql`. */
 export const NO_SESSION_LEASE_REASON =
-	"SQL-stored sessions take no ownership lease, so every session would read as free";
+	"SQL-stored sessions are claimed in their database (a lease row, or for a SQLite file a lock keyed by that database), " +
+	"not by the session-file ownership lease this probe reads, so every session would read as free";
 
 /** Why `/join` refuses under `session.storage: sql`: guest replicas are local transcript files. */
 export const COLLAB_REPLICA_DISK_ONLY_REASON =

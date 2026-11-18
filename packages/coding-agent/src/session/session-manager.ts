@@ -158,10 +158,14 @@ import {
 	isSameJournalFile,
 	MemorySessionStorage,
 	SESSION_HEADER_PREFIX_BYTES,
+	type SessionClaimHolder,
+	SessionLeaseLostError,
 	type SessionStorage,
 	type SessionStorageWriter,
 	SessionWriteConflictError,
 	sessionHeaderIdInPrefix,
+	sessionLeaseId,
+	sessionLeaseRoot,
 } from "./session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
 import {
@@ -212,6 +216,35 @@ const MAX_WRITE_CONFLICT_RECOVERIES = 3;
 export function mintSessionId(): string {
 	return Bun.randomUUIDv7();
 }
+
+/**
+ * Whether this process runs under `OMP_SESSION_EXCLUSIVE=1`: its launcher
+ * named the session it resumes (a pod's recorded id), so no path may move it
+ * to another id. Every path that would (a session another process holds, a
+ * lease taken over, a file another writer changed or replaced) ends the
+ * process non-zero instead, and writes no sibling. Read each time: child
+ * processes inherit the variable from the launcher's exec.
+ */
+export function isSessionExclusive(): boolean {
+	return process.env.OMP_SESSION_EXCLUSIVE === "1";
+}
+
+/**
+ * The move-offs this process made, by the resolved file each moved off: the
+ * sibling it went on in, and the copy of its artifacts there. A subagent
+ * transcript under a moved-off session's artifacts directory follows it (see
+ * `SessionManager.#followParentMove`). In-process only: no marker records a
+ * move for another process. A manager forgets its own once it leaves the
+ * session (closes, or opens or starts another); a subagent transcript of the
+ * old session that writes after that forks to a session of its own.
+ */
+const sessionMoveOffs = new Map<string, { to: string; copied: Promise<void> }>();
+
+/** How long a subagent transcript whose parent's lease is lost waits for the parent to go on in a sibling. */
+const PARENT_MOVE_WAIT_MS = 1000;
+
+/** How long an `OMP_SESSION_EXCLUSIVE=1` stop waits to learn who holds the session before it ends the process without naming them. */
+const EXCLUSIVE_STOP_HOLDER_LOOKUP_MS = 2000;
 
 /**
  * `moveTo` refused and left the session where it was: another live omp
@@ -1503,12 +1536,24 @@ export class SessionManager {
 	/** Every notice raised so far, replayed to each later subscriber. */
 	#persistenceNotices: SessionPersistenceNotice[] = [];
 	/**
-	 * This process's ownership claim on the session it last wrote (file storage
-	 * only), keyed by session id so every path to the journal meets it.
-	 * `release` is unset while another live process holds the session, and
-	 * after {@link close} gave the claim up.
+	 * This process's ownership claim on the session it last wrote or opened
+	 * for writing, keyed by session id so every path to the journal meets it.
+	 * `release` is unset while another live process holds the session, after
+	 * {@link close} gave the claim up, and once the claim was lost.
 	 */
 	#sessionClaim: { sessionId: string; release: (() => void) | undefined } | undefined;
+	/** Set once an `OMP_SESSION_EXCLUSIVE=1` session began to stop (see {@link #stopExclusive}). */
+	#exclusiveStopping = false;
+	/** A subagent transcript's follow of its parent session to the sibling it moved to (see {@link #followParentMove}). */
+	#parentMoveFollow: Promise<void> | undefined;
+	/** A recovery of a write conflict a deferred-publish store reported for a queued write (see {@link #recoverQueuedConflict}). */
+	#queuedConflictRecovery: Promise<void> | undefined;
+	/** Queued-write conflicts recovered since the last confirmed publish; past the bound the session moves off as contested. */
+	#queuedConflictRecoveries = 0;
+	/** The files this manager moved off, so a conflict a write to one reports retries at the sibling it went on in. */
+	readonly #movedOffFrom = new Set<string>();
+	/** Write conflicts a recovery took over: the store's drain reports them again, and they are no failure. */
+	readonly #takenOverConflicts = new WeakSet<Error>();
 	/**
 	 * Set once a running agent loop took this manager over
 	 * ({@link claimForWriting}). Every session it switches to afterwards is
@@ -1596,6 +1641,15 @@ export class SessionManager {
 	 * once per failure episode, so the agent is warned once.
 	 */
 	#noteDiskFailure(errorLike: unknown): Error {
+		// A write the lease fence refused is no storage failure: the claim is
+		// lost, and the loss moves or stops the session (see #onSessionClaimLost).
+		if (errorLike instanceof SessionLeaseLostError) {
+			// A subagent transcript follows its parent; a main session's loss reaches it through the lease.
+			this.#followParentMove();
+			return errorLike;
+		}
+		// A queued write's conflict a recovery took over is no failure either (see #recoverQueuedConflict).
+		if (errorLike instanceof Error && this.#takenOverConflicts.has(errorLike)) return errorLike;
 		const error = toError(errorLike);
 		if (!(this.#diskFailure instanceof SessionPersistenceIndeterminateError)) this.#diskFailure = error;
 		// A line that failed to land leaves its blob refs unreferenced on disk,
@@ -1640,10 +1694,12 @@ export class SessionManager {
 
 	/**
 	 * Hold this process's ownership claim on `#sessionId`, moving it off a
-	 * previous session. Only write paths claim, so the first process to write a
+	 * previous session. Write paths claim, so the first process to write a
 	 * session owns it and inspection (`omp share`, `--export`, `render`) never
-	 * does. A failed claim is retried on the next write, so a writer takes over
-	 * once the owner closed the session or exited.
+	 * does; on a storage that can answer at once, opening a session for
+	 * writing claims it first ({@link claimOpenedSession}). A failed claim is
+	 * retried on the next write, so a writer takes over once the owner closed
+	 * the session or exited.
 	 *
 	 * The claim is a writer's: a second manager on one journal — this process
 	 * reopening a session it already runs — is refused here and moved to a
@@ -1662,9 +1718,15 @@ export class SessionManager {
 		// The storage also checks that the path still holds this session: if
 		// another session was moved onto it, the claim fails and the next write
 		// moves this session to a sibling instead of appending into that journal.
+		// A storage that learns only later that the claim is not held says so through `onLost`.
 		this.#sessionClaim = {
 			sessionId,
-			release: this.#storage.claimSession(sessionId, sessionFile, { writer: true, handover }) ?? undefined,
+			release:
+				this.#storage.claimSession(sessionId, sessionFile, {
+					writer: true,
+					handover,
+					onLost: () => this.#onSessionClaimLost(sessionId),
+				}) ?? undefined,
 		};
 	}
 
@@ -1752,12 +1814,307 @@ export class SessionManager {
 	 * session's file: its next write moves this session to a sibling with a new
 	 * id instead, so two writers never mix their entries in one journal and the
 	 * owner's full rewrites never race the other writer's appends.
+	 * A claim this process held and lost to another holder counts as owned
+	 * elsewhere; a subagent transcript's lost claim (its parent session's
+	 * lease, see {@link #followParentMove}) instead starts following the
+	 * parent, and its write, refused, writes nothing.
 	 */
 	#sessionOwnedElsewhere(): boolean {
 		if (this.#released || this.#sessionFileRelocating) return false;
+		const held = this.#sessionClaim;
+		if (held?.sessionId === this.#sessionId && held.release && this.#storage.sessionClaimLost?.(this.#leaseId())) {
+			held.release();
+			held.release = undefined;
+			return !this.#followParentMove();
+		}
 		this.#claimSession();
 		const claim = this.#sessionClaim;
 		return claim !== undefined && claim.sessionId === this.#sessionId && claim.release === undefined;
+	}
+
+	/** The lease this session is written under: its parent session's for a subagent transcript (see `sessionLeaseId`). */
+	#leaseId(): string {
+		return (this.#sessionFile && sessionLeaseId(this.#sessionFile)) || this.#sessionId;
+	}
+
+	/**
+	 * Hold the claim on `#sessionId` at `#sessionFile` once the storage has
+	 * confirmed it (`acquireSessionClaim`, SQL storage): `held`, `refused` while
+	 * another live omp process holds it (the claim is then left unset, as for a
+	 * refused write-path claim), or `superseded` when another open or switch
+	 * replaced the session while the storage answered. It moves nothing. A
+	 * storage without `acquireSessionClaim` answers `held`.
+	 */
+	async #holdClaim(
+		options: { waitMs?: number; onWait?: (holder: SessionClaimHolder) => void } = {},
+	): Promise<"held" | "refused" | "superseded"> {
+		const sessionFile = this.#sessionFile;
+		if (!this.#storage.acquireSessionClaim || !this.#persist || !sessionFile) return "held";
+		const sessionId = this.#sessionId;
+		const current = this.#sessionClaim;
+		if (current?.sessionId === sessionId && current.release) return "held";
+		if (current && current.sessionId !== sessionId) current.release?.();
+		this.#sessionClaim = undefined;
+		// Opening for writing claims as the journal's one writer, as #claimSession does.
+		const release = await this.#storage.acquireSessionClaim(sessionId, sessionFile, {
+			...options,
+			writer: true,
+			handover: this.#reclaimsJournalHandedToClone(sessionId, sessionFile),
+			onLost: () => this.#onSessionClaimLost(sessionId),
+		});
+		if (this.#sessionId !== sessionId || this.#sessionFile !== sessionFile) {
+			release?.();
+			return "superseded";
+		}
+		this.#sessionClaim = { sessionId, release: release ?? undefined };
+		return release ? "held" : "refused";
+	}
+
+	/**
+	 * Claim the session this manager opened before anything else runs, on a
+	 * storage that can tell at once whether another process holds it (SQL
+	 * storage): a resume of a session another live process holds then moves
+	 * to a sibling with a new id (or, under `OMP_SESSION_EXCLUSIVE=1`, stops)
+	 * before any hook sees the held id. With `waitMs` it first waits that long
+	 * for the holder's lease to go or expire, `onWait` hearing the holder. Once
+	 * it holds the claim it reads the session again when the stored size is
+	 * not what it loaded, since another holder may have written until it let
+	 * go. Other storages claim at the first write, as before.
+	 */
+	async claimOpenedSession(
+		options: { waitMs?: number; onWait?: (holder: SessionClaimHolder) => void } = {},
+	): Promise<void> {
+		if (!this.#storage.acquireSessionClaim || this.#released) return;
+		let holder: SessionClaimHolder | undefined;
+		const outcome = await this.#holdClaim({
+			waitMs: options.waitMs,
+			onWait: found => {
+				holder = found;
+				options.onWait?.(found);
+			},
+		});
+		if (outcome === "refused") {
+			// A subagent transcript whose parent another process holds follows the parent instead.
+			if (!this.#followParentMove()) {
+				this.#moveOffSessionFile("open-elsewhere", { holder, why: "another omp process holds its lease" });
+			}
+		} else if (outcome === "held") {
+			await this.#reloadIfWrittenElsewhere();
+		}
+	}
+
+	/**
+	 * After an acquire: read the session again when its stored size is not
+	 * the size this manager last loaded or wrote, so its next write lands on
+	 * what another holder wrote before it let go, never at a stale offset.
+	 */
+	async #reloadIfWrittenElsewhere(): Promise<void> {
+		const sessionFile = this.#sessionFile;
+		const storage = this.#storage;
+		if (!sessionFile || !storage.readTextFrom) return;
+		let stored: number | null;
+		try {
+			stored = (await storage.readTextFrom(sessionFile, Number.MAX_SAFE_INTEGER, 0)).size;
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+			stored = null;
+		}
+		if (stored === this.#expectedDiskSize || this.#sessionFile !== sessionFile) return;
+		await this.#setSessionFile(sessionFile, { keepClaim: true });
+	}
+
+	/**
+	 * The storage found this process's claim on `sessionId` lost: another
+	 * holder took the session over, or its row is gone. The session moves to
+	 * a sibling with a new id at once and publishes its whole transcript
+	 * there, the entries a write fence refused included, as for a session
+	 * another process owns; under `OMP_SESSION_EXCLUSIVE=1` it stops instead.
+	 * A loss of a session this manager already left changes nothing.
+	 */
+	#onSessionClaimLost(sessionId: string): void {
+		const claim = this.#sessionClaim;
+		const sessionFile = this.#sessionFile;
+		if (sessionId !== this.#sessionId || claim?.sessionId !== sessionId || !claim.release || !sessionFile) return;
+		if (this.#released || !this.#persist) return;
+		// A move in flight checks its claim itself before it writes either path.
+		if (this.#sessionFileRelocating) return;
+		claim.release();
+		claim.release = undefined;
+		// A subagent transcript follows its parent to the sibling the parent moves to.
+		if (this.#followParentMove()) return;
+		this.#moveOffSessionFile("open-elsewhere", { why: "another omp process took its lease over" });
+		if (!this.#exclusiveStopping) this.#rewriteSynchronously();
+	}
+
+	/**
+	 * Whether a write must wait for the parent session instead of landing: a
+	 * parent follow is in flight, or this subagent transcript's claim (its
+	 * parent's lease) is refused or lost, which starts one (see
+	 * {@link #followParentMove}). A main session never holds here: it moves
+	 * off itself.
+	 */
+	#holdForParentMove(): boolean {
+		if (this.#parentMoveFollow) return true;
+		if (!this.#storage.acquireSessionClaim) return false;
+		const file = this.#sessionFile;
+		const root = file ? sessionLeaseRoot(file) : undefined;
+		if (!file || !root || !path.resolve(file).startsWith(`${root.stem}${path.sep}`)) return false;
+		if (this.#released || this.#sessionFileRelocating || !this.#persist) return false;
+		if (!this.#storage.sessionClaimLost?.(this.#leaseId())) {
+			this.#claimSession();
+			const claim = this.#sessionClaim;
+			if (!claim || claim.sessionId !== this.#sessionId || claim.release) return false;
+		}
+		return this.#followParentMove();
+	}
+
+	/**
+	 * For a subagent transcript (`<parent stem>/…/<agent>.jsonl`) whose
+	 * parent session's lease is lost: start following the parent, once, and
+	 * return `true`. The caller writes nothing; the entries stay in memory
+	 * until {@link #runParentMoveFollow} moves this transcript under the
+	 * sibling the parent goes on in and publishes it there, keeping its id.
+	 * `false` for a main session, which moves off itself.
+	 */
+	#followParentMove(): boolean {
+		if (this.#parentMoveFollow) return true;
+		// Only a store that claims a subagent transcript under its parent's lease (SQL storage) follows the parent.
+		if (!this.#storage.acquireSessionClaim) return false;
+		const childFile = this.#sessionFile;
+		const root = childFile ? sessionLeaseRoot(childFile) : undefined;
+		if (!childFile || !root || this.#released || !path.resolve(childFile).startsWith(`${root.stem}${path.sep}`)) {
+			return false;
+		}
+		this.#fileIsCurrent = false;
+		this.#rewriteRequired = true;
+		const follow: Promise<void> = this.#runParentMoveFollow(childFile, root.stem).finally(() => {
+			if (this.#parentMoveFollow === follow) this.#parentMoveFollow = undefined;
+		});
+		this.#parentMoveFollow = follow;
+		return true;
+	}
+
+	/**
+	 * Wait, briefly, for the parent session `<parentStem>.jsonl` to go on in a
+	 * sibling in this process (it learns of the loss from the same lease, so
+	 * its move-off is recorded by then), follow any further move-offs of that
+	 * sibling, and move this transcript, `childFile`, to the same relative path
+	 * under the last sibling's artifacts directory once the parent's artifact
+	 * copy there has landed; then publish the whole transcript over that copy.
+	 * When the parent does not go on here (another process holds or moved it,
+	 * and nothing records where), this transcript forks to a session of its own
+	 * beside the parent file, under a lease it takes there, its header naming
+	 * the parent as `parentSession` (a lease row names no successor, and a
+	 * move keeps the parent's id), and publishes its whole transcript there:
+	 * no entry is lost, and no id is stranded.
+	 */
+	async #runParentMoveFollow(childFile: string, parentStem: string): Promise<void> {
+		const parent = `${parentStem}.jsonl`;
+		const deadline = Date.now() + PARENT_MOVE_WAIT_MS;
+		let moveOff = sessionMoveOffs.get(parent);
+		while (!moveOff && Date.now() < deadline) {
+			await Bun.sleep(20);
+			moveOff = sessionMoveOffs.get(parent);
+		}
+		const copies: Array<Promise<void>> = [];
+		let sibling: string | undefined;
+		for (
+			const seen = new Set<string>();
+			moveOff && !seen.has(moveOff.to);
+			moveOff = sessionMoveOffs.get(moveOff.to)
+		) {
+			seen.add(moveOff.to);
+			copies.push(moveOff.copied);
+			sibling = moveOff.to;
+		}
+		if (this.#sessionFile !== childFile || this.#entriesReleased) return;
+		if (sibling === undefined) {
+			this.#parentMoveFollow = undefined;
+			const parentSession = sessionLeaseRoot(childFile)?.id ?? this.#sessionId;
+			this.#closeWriterEventually();
+			this.#moveOffSessionFile(
+				"open-elsewhere",
+				{ why: "its parent session is another omp process's" },
+				{ dir: path.dirname(parentStem), parentSession },
+			);
+			if (this.#released) this.#closeOwesPublish = true;
+			else this.#rewriteSynchronously();
+			return;
+		}
+		for (const copied of copies) await copied;
+		if (this.#sessionFile !== childFile || this.#entriesReleased) return;
+		const next = path.join(
+			sibling.slice(0, -JSONL_SUFFIX_LENGTH),
+			path.relative(parentStem, path.resolve(childFile)),
+		);
+		this.#closeWriterEventually();
+		this.#sessionClaim?.release?.();
+		this.#sessionClaim = undefined;
+		this.#sessionFile = next;
+		// The parent's copy holds this transcript's durable bytes; the publish replaces them.
+		this.#expectedDiskSize = this.#storage.existsSync(next) ? this.#storage.statSync(next).size : null;
+		this.#fileIsCurrent = false;
+		this.#rewriteRequired = true;
+		this.#artifactManager = null;
+		this.#artifactManagerSessionFile = null;
+		this.#rememberBreadcrumb(this.#cwd, next);
+		this.#claimSession();
+		this.#notifyPersistenceNotice({ reason: "open-elsewhere", from: childFile, to: next });
+		// The follow is over: the transcript is at its new path, and its publish is an ordinary one.
+		this.#parentMoveFollow = undefined;
+		if (this.#released) this.#closeOwesPublish = true;
+		else this.#rewriteSynchronously();
+	}
+
+	/**
+	 * Stop this `OMP_SESSION_EXCLUSIVE=1` session instead of moving it to
+	 * another id: seal it, so nothing more is written anywhere, and end the
+	 * process non-zero, naming the reason and, for a lease, its holder's host
+	 * and pid. The launcher that named the session restarts it under the
+	 * same id. The holder is looked up for at most
+	 * {@link EXCLUSIVE_STOP_HOLDER_LOOKUP_MS}: a database that stopped
+	 * answering must not keep a sealed session's process alive.
+	 */
+	#stopExclusive(
+		reason: SessionPersistenceNotice["reason"],
+		detail: { holder?: SessionClaimHolder; why?: string },
+	): void {
+		if (this.#exclusiveStopping) return;
+		this.#exclusiveStopping = true;
+		this.seal();
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		void (async () => {
+			const lookup =
+				detail.holder === undefined && reason === "open-elsewhere"
+					? this.#storage.sessionClaimHolder?.(this.#leaseId())
+					: undefined;
+			const holder =
+				detail.holder ??
+				(lookup &&
+					(await Promise.race([
+						lookup.catch(() => undefined),
+						Bun.sleep(EXCLUSIVE_STOP_HOLDER_LOOKUP_MS).then(() => undefined),
+					])));
+			const why =
+				detail.why ??
+				{
+					contested: "another writer changed its file",
+					replaced: "its file now holds another session",
+					"open-elsewhere": "another omp process holds it",
+				}[reason];
+			const by = holder ? ` (host ${holder.host}, pid ${holder.pid})` : "";
+			logger.error("Session stops: OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id", {
+				sessionId,
+				sessionFile,
+				reason,
+				holder,
+			});
+			process.stderr.write(
+				`Session ${sessionId} stops (${reason}): ${why}${by}. OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id.\n`,
+			);
+			process.exit(1);
+		})();
 	}
 
 	/**
@@ -1766,9 +2123,12 @@ export class SessionManager {
 	 * conflict as before. A fresh file that already exists is never recovered,
 	 * so a colliding sibling cannot move again. Backends that defer sync
 	 * publishes also report as before: there a conflict can be this manager
-	 * racing its own unconfirmed publish, not another writer.
+	 * racing its own unconfirmed publish, not another writer, and a rewrite
+	 * computed from a stale view rejects so its caller retries from a fresh
+	 * load. The one exception is a write this manager queued (`queued`) on a
+	 * store that recovers queued conflicts (see {@link #recoversQueuedConflicts}).
 	 */
-	#conflictedSessionFile(error: unknown): string | undefined {
+	#conflictedSessionFile(error: unknown, queued = false): string | undefined {
 		const sessionFile = this.#sessionFile;
 		if (
 			!(error instanceof SessionWriteConflictError) ||
@@ -1778,11 +2138,22 @@ export class SessionManager {
 			!this.#persist ||
 			this.#released ||
 			this.#sessionFileRelocating ||
-			this.#storage.defersSyncPublish
+			this.#exclusiveStopping ||
+			(this.#storage.defersSyncPublish && !(queued && this.#recoversQueuedConflicts()))
 		) {
 			return undefined;
 		}
 		return sessionFile;
+	}
+
+	/**
+	 * Whether a write conflict the store reports for a write this manager
+	 * queued is recovered (see {@link #recoverQueuedConflict}) rather than
+	 * reported: only on SQL storage that claims sessions, the one deferring
+	 * store whose appends are checked against the size this manager expects.
+	 */
+	#recoversQueuedConflicts(): boolean {
+		return this.#storage.defersSyncPublish === true && this.#storage.acquireSessionClaim !== undefined;
 	}
 
 	/**
@@ -2013,11 +2384,35 @@ export class SessionManager {
 		return contested;
 	}
 
-	/** Asynchronous {@link #recoverFromWriteConflictSync}, reading the storage's chunk stream. */
-	async #recoverFromWriteConflict(error: unknown, recoveries: number): Promise<string | undefined> {
-		const contested = this.#conflictedSessionFile(error);
+	/**
+	 * Asynchronous {@link #recoverFromWriteConflictSync}, reading the storage's
+	 * chunk stream. For a write this manager queued (`queued`, see
+	 * {@link #recoverQueuedConflict}) on a backend that defers publishes it
+	 * first lets this manager's own queued writes to the file settle and
+	 * reloads the store's index, so the content it reads back, and the size
+	 * the retry is checked against, are the store's, never a write of this
+	 * manager still in flight; a conflict on a file this manager already moved
+	 * off retries at the sibling it went on in.
+	 */
+	async #recoverFromWriteConflict(error: unknown, recoveries: number, queued = false): Promise<string | undefined> {
+		if (
+			queued &&
+			error instanceof SessionWriteConflictError &&
+			this.#sessionFile &&
+			this.#movedOffFrom.has(path.resolve(error.path))
+		) {
+			return this.#sessionFile;
+		}
+		const contested = this.#conflictedSessionFile(error, queued);
 		if (!contested) return undefined;
+		// Every path from here retries or moves off: the conflict is this recovery's, not a failure.
+		if (error instanceof Error) this.#takenOverConflicts.add(error);
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
+		if (this.#storage.defersSyncPublish) {
+			await this.#storage.confirmWrites?.(contested).catch(() => undefined);
+			await this.#storage.refresh?.();
+			if (this.#sessionFile !== contested) return this.#sessionFile;
+		}
 		const epoch = this.#diskEpoch;
 		const scan = this.#foreignEntryScan();
 		let diskSize = 0;
@@ -2049,29 +2444,94 @@ export class SessionManager {
 	}
 
 	/**
+	 * A write a deferred-publish store (SQL storage) queued for `sessionFile`
+	 * was refused at confirmation with a write conflict: another writer that
+	 * claims nothing (an older omp) changed the file, or it now holds another
+	 * session. Take the error over (`true`) and recover as a write-time
+	 * conflict does, once this manager's own queued writes have settled:
+	 * keep the other writer's new entries and publish the whole transcript
+	 * again, or move to a sibling (`replaced`; `contested` once
+	 * {@link MAX_WRITE_CONFLICT_RECOVERIES} recoveries in a row did not hold),
+	 * which under `OMP_SESSION_EXCLUSIVE=1` ends the process instead. Without
+	 * this the store's journal and this session diverge: the next publish,
+	 * checked against a realigned size, would erase the other writer's
+	 * entries or write this session over another one.
+	 */
+	#recoverQueuedConflict(error: unknown, sessionFile: string): boolean {
+		if (!this.#recoversQueuedConflicts() || !(error instanceof SessionWriteConflictError)) return false;
+		if (sessionFile !== this.#sessionFile || !this.#conflictedSessionFile(error, true)) return false;
+		this.#takenOverConflicts.add(error);
+		this.#fileIsCurrent = false;
+		this.#rewriteRequired = true;
+		if (this.#queuedConflictRecovery) return true;
+		const recoveries = this.#queuedConflictRecoveries++;
+		const recovery: Promise<void> = this.#recoverFromWriteConflict(error, recoveries, true)
+			.then(async retryPath => {
+				if (this.#exclusiveStopping || this.#entriesReleased) return;
+				if (!retryPath) {
+					this.#takenOverConflicts.delete(error);
+					this.#noteDiskFailure(error);
+					return;
+				}
+				this.#fileIsCurrent = false;
+				this.#rewriteRequired = true;
+				if (this.#released) {
+					this.#closeOwesPublish = true;
+					return;
+				}
+				// Awaited, so a flush that waits for this recovery sees the transcript durable.
+				await this.#rewriteAtomically(true);
+			})
+			.catch((err: unknown) => {
+				this.#noteDiskFailure(err);
+			})
+			.finally(() => {
+				if (this.#queuedConflictRecovery === recovery) this.#queuedConflictRecovery = undefined;
+			});
+		this.#queuedConflictRecovery = recovery;
+		return true;
+	}
+
+	/**
 	 * Leave `#sessionFile` untouched and continue as a fresh session in a
-	 * sibling file. It gets a new session id whose header points back through
-	 * `parentSession` and keeps the provider prompt-cache key, as {@link fork}
-	 * does, so resume-by-id, the title index, and the picker never see two
-	 * files for one id. Unlike a fork it also records `continuationOf`, so a
-	 * later resume of the old file follows the conversation here (see
-	 * `findSessionContinuation`). Nothing durable exists there yet: the caller
-	 * publishes the whole transcript once and appends incrementally after that.
+	 * sibling file: a fork. It gets a new session id whose header names the
+	 * old one as `parentSession` and keeps the provider prompt-cache key, as
+	 * {@link fork} does, so resume-by-id, the title index, and the picker never
+	 * see two files for one id. It writes no `continuationOf`: nothing points a
+	 * later resume of the old id here. Nothing durable exists there yet: the
+	 * caller publishes the whole transcript once and appends incrementally
+	 * after that.
+	 *
+	 * Under `OMP_SESSION_EXCLUSIVE=1` it moves nothing: the session stops
+	 * ({@link #stopExclusive}) and this returns the old path, which the sealed
+	 * manager no longer writes. A subagent transcript's fork (`place`: the
+	 * directory to fork into and the session its header names as parent)
+	 * moves under the variable too: its id is never the launcher's recorded one.
 	 *
 	 * The artifact copy runs in the background so a move never blocks the turn
 	 * loop on a large artifacts directory; the sibling's artifact manager waits
 	 * for it before scanning ids or resolving `artifact://`, and flush/close
 	 * await it. Returns the sibling.
 	 */
-	#moveOffSessionFile(reason: SessionPersistenceNotice["reason"]): string {
+	#moveOffSessionFile(
+		reason: SessionPersistenceNotice["reason"],
+		detail: { holder?: SessionClaimHolder; why?: string } = {},
+		place?: { dir: string; parentSession: string },
+	): string {
 		const from = this.#sessionFile as string;
+		if (isSessionExclusive() && !place) {
+			this.#stopExclusive(reason, detail);
+			return from;
+		}
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();
 		this.#taskSiblingCandidate = undefined;
-		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
-		// The marker goes before the carried-over fields: the session listing
-		// reads only the first 4 KB of a file, and a header grows with them.
+		const to = path.join(
+			place?.dir ?? path.dirname(from),
+			`${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`,
+		);
+		// An older build's `continuationOf` is not carried over either.
 		const {
 			type: _type,
 			id: _id,
@@ -2084,8 +2544,7 @@ export class SessionManager {
 			type: "session",
 			id: this.#sessionId,
 			timestamp,
-			parentSession: previousSessionId,
-			continuationOf: previousSessionId,
+			parentSession: place?.parentSession ?? previousSessionId,
 			...carried,
 			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(this.#header),
 		};
@@ -2098,6 +2557,8 @@ export class SessionManager {
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#pendingArtifactCopy = { sessionFile: to, done: copySessionArtifacts(from, to, this.#storage) };
+		sessionMoveOffs.set(path.resolve(from), { to: path.resolve(to), copied: this.#pendingArtifactCopy.done });
+		this.#movedOffFrom.add(path.resolve(from));
 		this.#rememberBreadcrumb(this.#cwd, to);
 		this.#claimSession();
 		this.#notifyPersistenceNotice({ reason, from, to });
@@ -2115,6 +2576,15 @@ export class SessionManager {
 			});
 
 		const reported = scheduled.catch(err => {
+			// A write the lease fence refused is republished in the sibling the
+			// loss moved this session to, or the session stops (see
+			// #onSessionClaimLost): nothing failed.
+			if (err instanceof SessionLeaseLostError) {
+				this.#followParentMove();
+				return;
+			}
+			// The same error the store's drain reports again, for a conflict a recovery took over.
+			if (err instanceof Error && this.#takenOverConflicts.has(err)) return;
 			throw this.#noteDiskFailure(err);
 		});
 		this.#diskTail = reported.catch(() => undefined);
@@ -2157,7 +2627,13 @@ export class SessionManager {
 		const writer = this.#writer;
 		if (!writer) return;
 		this.#writer = undefined;
-		await writer.close();
+		try {
+			await writer.close();
+		} catch (err) {
+			// A queued append's conflict a recovery took over: the writer reports it again on close.
+			if (err instanceof Error && this.#takenOverConflicts.has(err)) return;
+			throw err;
+		}
 	}
 
 	#latchIndeterminate(operationError: Error, recoveryErrors: readonly Error[]): SessionPersistenceIndeterminateError {
@@ -2288,6 +2764,10 @@ export class SessionManager {
 		commitGuard?: () => boolean,
 		recoveries = 0,
 	): Promise<void> {
+		// A subagent transcript whose parent's lease it cannot hold publishes under the parent's sibling.
+		if (sessionFile === this.#sessionFile && this.#holdForParentMove()) {
+			throw new SessionLeaseLostError(sessionFile, this.#leaseId());
+		}
 		const target =
 			sessionFile === this.#sessionFile && this.#sessionOwnedElsewhere()
 				? this.#moveOffSessionFile("open-elsewhere")
@@ -2307,6 +2787,21 @@ export class SessionManager {
 				? this.#storage.writeLinesAtomic(target, body.lines, options)
 				: this.#storage.writeTextAtomic(target, Array.from(body.lines).join(""), options));
 		} catch (error) {
+			// Another holder took the session over: publish in the sibling the loss
+			// moved this session to, or move it there now (see #onSessionClaimLost).
+			// A session that stops instead publishes nothing more.
+			if (error instanceof SessionLeaseLostError && this.#followParentMove()) throw error;
+			if (error instanceof SessionLeaseLostError && isSessionExclusive()) {
+				this.#moveOffSessionFile("open-elsewhere", { why: "another omp process took its lease over" });
+				throw error;
+			}
+			if (error instanceof SessionLeaseLostError && recoveries < MAX_WRITE_CONFLICT_RECOVERIES) {
+				const sibling =
+					this.#sessionFile && this.#sessionFile !== target
+						? this.#sessionFile
+						: this.#moveOffSessionFile("open-elsewhere");
+				return this.#publishAuthoritativeBody(sibling, operationError, commitGuard, recoveries + 1);
+			}
 			const retryPath = await this.#recoverFromWriteConflict(error, recoveries);
 			if (retryPath) return this.#publishAuthoritativeBody(retryPath, operationError, commitGuard, recoveries + 1);
 			const recoveryErrors = [toError(error)];
@@ -2339,9 +2834,13 @@ export class SessionManager {
 		// the append that retries the missing entries needs a fresh one.
 		this.#closeWriterEventually();
 
-		this.#writer = this.#storage.openWriter(this.#sessionFile, {
+		const writerFile = this.#sessionFile;
+		this.#writer = this.#storage.openWriter(writerFile, {
 			flags: "a",
-			onError: err => this.#noteDiskFailure(err),
+			// Another writer changed the file under a queued append: recover as a write-time conflict does.
+			onError: err => {
+				if (!this.#recoverQueuedConflict(err, writerFile)) this.#noteDiskFailure(err);
+			},
 		});
 		return this.#writer;
 	}
@@ -2457,13 +2956,22 @@ export class SessionManager {
 			.then(() => {
 				if (generation !== this.#deferredPublishGen) return;
 				this.#unconfirmedPublishPath = undefined;
+				this.#queuedConflictRecoveries = 0;
 				onConfirm();
 			})
 			.catch(err => {
+				// The loss already moved this session and republished it, or stopped it (see #onSessionClaimLost).
+				if (err instanceof SessionLeaseLostError) {
+					if (generation === this.#deferredPublishGen) this.#unconfirmedPublishPath = undefined;
+					this.#followParentMove();
+					return;
+				}
 				// A publish for a session this manager has since left describes
 				// none of the current session's state; it is only reported.
 				if (sessionFile === this.#sessionFile) {
 					if (generation === this.#deferredPublishGen) this.#unconfirmedPublishPath = undefined;
+					// Another writer changed the file: recover as a write-time conflict does.
+					if (generation === this.#deferredPublishGen && this.#recoverQueuedConflict(err, sessionFile)) return;
 					this.#fileIsCurrent = false;
 					try {
 						this.#expectedDiskSize = this.#storage.existsSync(sessionFile)
@@ -2580,6 +3088,8 @@ export class SessionManager {
 		// confirmation re-issues the transcript (see #unconfirmedPublishPath).
 		if (targetPath === this.#unconfirmedPublishPath) return;
 
+		// A subagent transcript whose parent's lease it cannot hold publishes under the parent's sibling, once it exists.
+		if (this.#holdForParentMove()) return;
 		try {
 			if (this.#sessionOwnedElsewhere()) targetPath = this.#moveOffSessionFile("open-elsewhere");
 			let body = this.#serializeBody();
@@ -2663,16 +3173,19 @@ export class SessionManager {
 	 * cannot open a fresh writer that the pending replacement would then detach
 	 * from the current JSONL path. A `commitGuard` also prevents a superseding
 	 * synchronous rewrite from being overwritten by the stale body serialized
-	 * before it ran.
+	 * before it ran. `queuedRecovery` marks the publish of a queued write's
+	 * conflict recovery (see {@link #recoverQueuedConflict}), whose own
+	 * conflicts recover the same way; any other rewrite that meets a file
+	 * changed on a deferring store rejects.
 	 */
-	async #rewriteAtomically(): Promise<void> {
+	async #rewriteAtomically(queuedRecovery = false): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
 		if (this.#released) return;
 
 		const startEpoch = this.#diskEpoch;
 		await this.#scheduleDiskWork(
 			async () => {
-				if (await this.#runFencedAtomicRewrite(startEpoch)) {
+				if (await this.#runFencedAtomicRewrite(startEpoch, queuedRecovery)) {
 					this.#fileIsCurrent = true;
 					this.#materializeBreadcrumb();
 					this.#hasTitleSlot = true;
@@ -2691,7 +3204,7 @@ export class SessionManager {
 	 * moved so callers skip current-marking updates; a body that landed before
 	 * that change still advances the durable byte record after readback.
 	 */
-	async #runFencedAtomicRewrite(epoch: number): Promise<boolean> {
+	async #runFencedAtomicRewrite(epoch: number, queuedRecovery = false): Promise<boolean> {
 		if (this.#released) return false;
 		if (this.#deferRewriteForPendingDrop()) return false;
 		this.#atomicRewriteFenceEpoch = epoch;
@@ -2707,6 +3220,7 @@ export class SessionManager {
 				if (unconfirmed !== undefined && unconfirmed === this.#sessionFile) {
 					await this.#storage.confirmWrites?.(unconfirmed).catch(() => undefined);
 				}
+				if (this.#holdForParentMove()) return false;
 				if (this.#sessionOwnedElsewhere()) this.#moveOffSessionFile("open-elsewhere");
 				const sessionFile = this.#sessionFile;
 				if (!sessionFile) return false;
@@ -2721,7 +3235,19 @@ export class SessionManager {
 						? this.#storage.writeLinesAtomic(sessionFile, body.lines, options)
 						: this.#storage.writeTextAtomic(sessionFile, Array.from(body.lines).join(""), options));
 				} catch (error) {
-					if (await this.#recoverFromWriteConflict(error, recoveries)) {
+					// Another holder took the session over: the next pass publishes
+					// the whole transcript in the sibling it moves to; a session
+					// that stops instead publishes nothing more.
+					if (error instanceof SessionLeaseLostError && this.#followParentMove()) throw error;
+					if (error instanceof SessionLeaseLostError && isSessionExclusive()) {
+						this.#moveOffSessionFile("open-elsewhere", { why: "another omp process took its lease over" });
+						throw error;
+					}
+					const claimLost = error instanceof SessionLeaseLostError;
+					if (
+						(claimLost && recoveries < MAX_WRITE_CONFLICT_RECOVERIES) ||
+						(await this.#recoverFromWriteConflict(error, recoveries, queuedRecovery))
+					) {
 						recoveries++;
 						// Publish the whole transcript against what the recovery found on the next pass.
 						this.#atomicRewriteDirty = true;
@@ -2940,6 +3466,7 @@ export class SessionManager {
 		// the durable size advances only on confirmation, so a lost publish
 		// never leaves the CAS token describing bytes the store never accepted.
 		if (writer.appendSync) writer.appendSync(chunk);
+		const appendedTo = this.#sessionFile ?? "";
 		const confirmation = writer.appendSync ? writer.flush() : writer.append(chunk);
 		const startSize = durable.issuedSize;
 		durable.issued = end;
@@ -2975,6 +3502,8 @@ export class SessionManager {
 					durable.issuedSize = startSize;
 					for (const key of durable.confirmedAhead.keys()) if (key >= start) durable.confirmedAhead.delete(key);
 				}
+				// Another writer changed the file under the append: recover as a write-time conflict does.
+				if (this.#recoverQueuedConflict(err, appendedTo)) return;
 				this.#noteDiskFailure(err);
 			},
 		);
@@ -3050,6 +3579,7 @@ export class SessionManager {
 	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
 		const previousSessionFile = this.#sessionFile;
 		this.#diskTail = Promise.resolve();
+		this.#forgetMoveOffs();
 		this.#clearDiskError();
 		this.#expectedDiskSize = null;
 		this.#reconcileSessionDirForFallback();
@@ -3473,6 +4003,12 @@ export class SessionManager {
 		this.#coldCutStale = true;
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
+		// A rolled-back switch gives up the claim it took on the session it opened.
+		const claim = this.#sessionClaim;
+		if (claim && claim.sessionId !== this.#sessionId) {
+			claim.release?.();
+			this.#sessionClaim = undefined;
+		}
 
 		this.#titleSource = snapshot.titleSource;
 		this.#titleUpdatedAt = snapshot.titleUpdatedAt;
@@ -3526,25 +4062,76 @@ export class SessionManager {
 			await this.#rewriteAtomically();
 		}
 	}
-	/** Switch to a different session file (resume / branch). */
-	async setSessionFile(sessionFile: string): Promise<void> {
+	/**
+	 * Switch to a different session file (resume / branch). With `claim`, on
+	 * a storage that confirms claims (SQL storage), it first takes the
+	 * session's lease, waiting up to `claim.waitMs` for another holder's to go
+	 * or expire, and only then loads it and takes its id: while it waits this
+	 * manager still reports the session it had. A session another process
+	 * still holds then moves to a sibling with a new id in the same step (or,
+	 * under `OMP_SESSION_EXCLUSIVE=1`, stops), so the held id is never this
+	 * manager's.
+	 */
+	async setSessionFile(
+		sessionFile: string,
+		options?: { claim?: { waitMs?: number; onWait?: (holder: SessionClaimHolder) => void } },
+	): Promise<void> {
 		const previousSessionFile = this.#sessionFile;
-		await this.#setSessionFile(sessionFile);
+		await this.#setSessionFileClaiming(sessionFile, options?.claim);
 		this.#notifySessionFileChanged(previousSessionFile);
+	}
+
+	async #setSessionFileClaiming(
+		sessionFile: string,
+		claim: { waitMs?: number; onWait?: (holder: SessionClaimHolder) => void } | undefined,
+	): Promise<void> {
+		const storage = this.#storage;
+		if (!claim || !storage.acquireSessionClaim || !this.#persist) return this.#setSessionFile(sessionFile);
+		const resolved = path.resolve(sessionFile);
+		const sessionId = await readSessionHeaderId(resolved, storage);
+		if (!sessionId) return this.#setSessionFile(resolved);
+		let holder: SessionClaimHolder | undefined;
+		const release = await storage.acquireSessionClaim(sessionId, resolved, {
+			waitMs: claim.waitMs,
+			onWait: found => {
+				holder = found;
+				claim.onWait?.(found);
+			},
+			writer: true,
+			handover: this.#reclaimsJournalHandedToClone(sessionId, resolved),
+			onLost: () => this.#onSessionClaimLost(sessionId),
+		});
+		try {
+			await this.#setSessionFile(resolved, { claimed: { sessionId, release, holder } });
+		} catch (err) {
+			release?.();
+			throw err;
+		}
 	}
 
 	async #setSessionFile(
 		sessionFile: string,
-		options?: { throwIfMissing?: boolean; newSession?: NewSessionOptions; preloaded?: SessionLoadResult },
+		options?: {
+			throwIfMissing?: boolean;
+			newSession?: NewSessionOptions;
+			preloaded?: SessionLoadResult;
+			keepClaim?: boolean;
+			/** The lease {@link setSessionFile} took before it loaded the file: adopted with the id, in one step. */
+			claimed?: { sessionId: string; release: (() => void) | null; holder: SessionClaimHolder | undefined };
+		},
 	): Promise<void> {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
 		// A switch gives up the previous file. Opening claims nothing: the first
-		// write does, so inspecting a session never counts as owning it. A
+		// write does, or claimOpenedSession(), so inspecting a session never counts
+		// as owning it. A reread of the same session under its claim keeps it. A
 		// manager a running agent loop owns re-claims the new file below.
-		this.#sessionClaim?.release?.();
-		this.#sessionClaim = undefined;
+		if (!options?.keepClaim) {
+			this.#sessionClaim?.release?.();
+			this.#sessionClaim = undefined;
+			this.#forgetMoveOffs();
+		}
 
 		// `gc --archive` leaves cold transcripts gzipped outside the sessions
 		// tree. Bring one back to its own path before anything reads or appends
@@ -3632,6 +4219,20 @@ export class SessionManager {
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		if (loaded.sanitized) this.#bodyRevision++;
+		// Adopt a lease taken before the load with the id, before any await:
+		// nothing observes the id without its claim, or a held id at all.
+		const claimed = options?.claimed;
+		if (claimed && claimed.sessionId !== this.#sessionId) {
+			claimed.release?.();
+		} else if (claimed) {
+			this.#sessionClaim = { sessionId: claimed.sessionId, release: claimed.release ?? undefined };
+			if (!claimed.release && !this.#followParentMove()) {
+				this.#moveOffSessionFile("open-elsewhere", {
+					holder: claimed.holder,
+					why: "another omp process holds its lease",
+				});
+			}
+		}
 		// The agent loop that owns this manager now writes this journal: claim it
 		// here rather than at its first append, so a roster scan cannot offer the
 		// adopted transcript as revivable in between.
@@ -3958,7 +4559,7 @@ export class SessionManager {
 		if (sessionFile === undefined || path.resolve(sessionFile) !== path.resolve(sessionPath)) {
 			await this.#drainAndCloseWriter();
 			try {
-				await this.#storage.deleteSessionWithArtifacts(sessionPath);
+				await SessionManager.deleteSessionFile(sessionPath, this.#storage);
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
 			}
@@ -4085,6 +4686,39 @@ export class SessionManager {
 	}
 
 	/**
+	 * Delete the session file at `sessionPath` and its artifacts from `storage`,
+	 * refusing while another live omp process holds the session. On a storage
+	 * that confirms claims (`acquireSessionClaim`, SQL storage) the claim is
+	 * taken before anything is deleted and held until the delete has run, so
+	 * the delete meets the write fence like any other write; a claim this
+	 * process holds already is shared. Other storages delete as before. ENOENT
+	 * propagates.
+	 */
+	static async deleteSessionFile(
+		sessionPath: string,
+		storage: SessionStorage = defaultSessionStorage(),
+	): Promise<void> {
+		let release = (): void => {};
+		if (storage.acquireSessionClaim) {
+			const sessionId = await readSessionHeaderId(sessionPath, storage);
+			if (sessionId) {
+				const claim = await storage.acquireSessionClaim(sessionId, sessionPath);
+				if (!claim) {
+					throw new Error(
+						`Cannot delete session "${sessionPath}": another live omp process writes it. Nothing was deleted.`,
+					);
+				}
+				release = claim;
+			}
+		}
+		try {
+			await storage.deleteSessionWithArtifacts(sessionPath);
+		} finally {
+			release();
+		}
+	}
+
+	/**
 	 * Fork the current session into a new file with the same entries.
 	 * @returns the old and new session file paths, or undefined when not persisting.
 	 */
@@ -4190,9 +4824,10 @@ export class SessionManager {
 			await this.#storage.refresh?.();
 			const id = await readSessionHeaderId(file, this.#storage);
 			if (id === undefined || id === destination?.id) return;
-			// A backend without ownership leases (`session.storage: sql`) cannot
-			// tell whether another process writes the session there, not even a
-			// copy of this session, so it never moves onto a session at all.
+			// A storage without claims (file storage always has them; SQL storage
+			// only when built with `claims`) cannot tell whether another process
+			// writes the session there, not even a copy of this session, so it
+			// never moves onto a session at all.
 			if (!this.#storage.claimSession) {
 				throw new SessionMoveRefusedError(
 					id === this.#sessionId
@@ -4200,7 +4835,10 @@ export class SessionManager {
 						: `Cannot move session to "${file}": it holds another session. Nothing was moved.`,
 				);
 			}
-			const release = this.#storage.claimSession(id, file);
+			// SQL storage answers its claim only once the database did, so wait for it here.
+			const release = this.#storage.acquireSessionClaim
+				? await this.#storage.acquireSessionClaim(id, file)
+				: this.#storage.claimSession(id, file);
 			if (release === null) {
 				throw new SessionMoveRefusedError(
 					`Cannot move session to "${file}": another live omp process writes the session there. Nothing was moved.`,
@@ -4224,7 +4862,9 @@ export class SessionManager {
 			// Every persisted move rewrites the journal (at least its header cwd),
 			// even when the path stays the same.
 			await assertSourceIsOurs(this.#sessionFile);
-			this.#claimSession();
+			// SQL storage answers a claim only once the database has; wait for it.
+			if (this.#storage.acquireSessionClaim) await this.#holdClaim();
+			else this.#claimSession();
 			if (this.#sessionClaim?.release === undefined) {
 				throw new SessionMoveRefusedError(
 					`Cannot move session "${this.#sessionFile}": another live omp process writes it. Nothing was moved.`,
@@ -4561,6 +5201,8 @@ export class SessionManager {
 		if ((this.#released && !afterSeal) || this.#entriesReleased || this.#atomicEntryBatch) return;
 		if (this.#pendingDropOfSessionFile()) return;
 		if (this.#sessionFileRelocating || this.#atomicRewriteFenceEpoch === this.#diskEpoch) return;
+		// A queued write's conflict recovery publishes the whole transcript (see #recoverQueuedConflict).
+		if (this.#queuedConflictRecovery) return;
 		if (!this.#hasUnsavedEntries()) return;
 		const durable = this.#frontierMatchingSessionFile();
 		if (durable) this.#appendTailPastFrontier(durable);
@@ -4589,21 +5231,28 @@ export class SessionManager {
 	async flush(): Promise<void> {
 		await this.#pendingDrop?.settled.promise;
 		if (!this.#persist || !this.#sessionFile) return;
-		// Failures below are reported through the latch; whether they cost an
-		// entry is decided once everything has settled.
-		await this.#scheduleDiskWork(async () => {
-			const writer = this.#writer;
-			if (writer?.isOpen() && !writer.getError()) await writer.flush();
-		}).catch(() => undefined);
-		// Drain any fire-and-forget backing writes (e.g. `writeTextSync` queued
-		// on IndexedSessionStorage during `flushSync`) so callers relying on
-		// flush() see the write durably visible to readers.
-		await this.#scheduleDiskWork(async () => {
-			await this.#storage.drain();
-		}).catch(() => undefined);
-		await Promise.all(this.#pendingAppendConfirmations);
-		await this.#pendingArtifactCopy?.done;
-		if (this.#hasUnsavedEntries()) await this.#healMissingEntriesAndSettle();
+		// A refused write found while draining may start a parent follow (see
+		// #followParentMove); its publish in the parent's sibling is flushed too.
+		for (let pass = 0; pass < 4; pass++) {
+			// Failures below are reported through the latch; whether they cost an
+			// entry is decided once everything has settled.
+			await this.#scheduleDiskWork(async () => {
+				const writer = this.#writer;
+				if (writer?.isOpen() && !writer.getError()) await writer.flush();
+			}).catch(() => undefined);
+			// Drain any fire-and-forget backing writes (e.g. `writeTextSync` queued
+			// on IndexedSessionStorage during `flushSync`) so callers relying on
+			// flush() see the write durably visible to readers.
+			await this.#scheduleDiskWork(async () => {
+				await this.#storage.drain();
+			}).catch(() => undefined);
+			await Promise.all(this.#pendingAppendConfirmations);
+			await this.#pendingArtifactCopy?.done;
+			if (this.#hasUnsavedEntries()) await this.#healMissingEntriesAndSettle();
+			if (!this.#parentMoveFollow && !this.#queuedConflictRecovery) break;
+			await this.#parentMoveFollow;
+			await this.#queuedConflictRecovery;
+		}
 		if (this.#diskFailure && !this.#allEntriesHandedToStorage()) throw this.#diskFailure;
 	}
 
@@ -4728,11 +5377,24 @@ export class SessionManager {
 			await this.#closeLocked();
 		} finally {
 			// Closing gives up this process's ownership claim; a later write
-			// reclaims it. Released last, since writing a missing entry claims it.
+			// reclaims it. It goes last: until the final publish has run, the
+			// claim keeps the session's write fence in place, so no write of this
+			// close can land after another process claimed the session.
 			const claim = this.#sessionClaim;
 			claim?.release?.();
 			if (claim) claim.release = undefined;
+			// SQL storage deletes its lease row after the release, giving up after
+			// 2 s; waiting for it lets a clean exit free the session at once. The
+			// release reports its own failure, and every write settled above.
+			await this.#storage.drain().catch(() => undefined);
+			this.#forgetMoveOffs();
 		}
+	}
+
+	/** Drop this manager's move-offs from `sessionMoveOffs`, and from its own record of files it moved off. */
+	#forgetMoveOffs(): void {
+		for (const from of this.#movedOffFrom) sessionMoveOffs.delete(from);
+		this.#movedOffFrom.clear();
 	}
 
 	async #closeLocked(): Promise<void> {
@@ -4756,6 +5418,14 @@ export class SessionManager {
 			await this.#storage.drain();
 		}).catch(() => undefined);
 		await Promise.all(this.#pendingAppendConfirmations);
+		// A parent follow publishes this transcript in the parent's sibling before the claim goes.
+		for (let pass = 0; (this.#parentMoveFollow || this.#queuedConflictRecovery) && pass < 4; pass++) {
+			await this.#parentMoveFollow;
+			await this.#queuedConflictRecovery;
+			await this.#scheduleDiskWork(async () => {
+				await this.#storage.drain();
+			}).catch(() => undefined);
+		}
 		// A deferring backend rejected an append while closing: append the
 		// missing tail again, which needs no full rewrite.
 		if (this.#sessionFile && this.#hasUnsavedEntries()) {
@@ -5291,11 +5961,16 @@ export class SessionManager {
 	): Promise<string | null> {
 		const storage = defaultSessionStorage();
 		// The header id is what the lease is keyed on; a null claim means
-		// another live process owns the session, so leave it alone. A backend
-		// with no process-owned lock (a shared table) has no lease to take.
+		// another live process owns the session, so leave it alone. SQL storage
+		// answers a claim only once the database has, so wait for that answer
+		// before anything is loaded. A backend that claims nothing has no lease to take.
 		const sessionId = await readSessionHeaderId(sessionPath, storage);
 		if (!sessionId) return null;
-		const probe = storage.claimSession ? storage.claimSession(sessionId, sessionPath) : () => {};
+		const probe = storage.acquireSessionClaim
+			? await storage.acquireSessionClaim(sessionId, sessionPath)
+			: storage.claimSession
+				? storage.claimSession(sessionId, sessionPath)
+				: () => {};
 		if (!probe) return null;
 		let manager: SessionManager | undefined;
 		try {

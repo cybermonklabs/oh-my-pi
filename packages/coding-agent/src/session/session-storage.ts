@@ -170,14 +170,62 @@ export class SessionLockError extends Error {
 }
 
 /**
- * Optional guards applied by {@link SessionStorage.writeTextAtomic}. The
- * backend MUST check `expectedSize` and call `commitGuard()` synchronously
- * immediately before it makes the staged content visible at `path`. Failed
- * preconditions leave the target untouched. Backends MUST NOT yield between
- * the checks and publishing the write.
+ * A content write to `path` was refused because this process does not hold
+ * the lease on session `sessionId`: another process holds it, or took it
+ * over. The write changed nothing. `SessionManager` keeps the refused entries
+ * and moves the session to a sibling, as for a session another process owns
+ * (or, under `OMP_SESSION_EXCLUSIVE=1`, ends the process).
  */
-export interface WriteTextAtomicOptions extends SessionStorageWriteOptions {
-	commitGuard?: () => boolean;
+export class SessionLeaseLostError extends Error {
+	readonly path: string;
+	readonly sessionId: string;
+
+	constructor(path: string, sessionId: string) {
+		super(
+			`Session ${sessionId} is held by another omp process now, so the write to ${path} was refused. Nothing was written.`,
+		);
+		this.name = "SessionLeaseLostError";
+		this.path = path;
+		this.sessionId = sessionId;
+	}
+}
+
+/** The process that holds a session's claim, as a waiting claimant is told. */
+export interface SessionClaimHolder {
+	host: string;
+	pid: number;
+}
+
+/** A session file's stem, `<time stamp>_<id>`, its stamp as `fileSafeTimestamp` writes it, with any extension. */
+const SESSION_STEM_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_([^./\\]+)(\.[^/\\]*)?$/;
+
+/**
+ * The session whose lease `file` is written under: the outermost path part
+ * that is a session file's stem (`<time stamp>_<id>`, with or without an
+ * extension). So a session's own file, every file under its artifacts
+ * directory (its subagents' transcripts, its draft and its markers among
+ * them) and any `<stem>.<ext>` beside it belong to that session's lease, as
+ * PR 3's derived lease takes them. `undefined` for any other path. Session
+ * ids hold no dot, so the id ends at the first one.
+ */
+export function sessionLeaseId(file: string): string | undefined {
+	return sessionLeaseRoot(file)?.id;
+}
+
+/**
+ * {@link sessionLeaseId}'s session, with its stem: the path of its
+ * `<stem>.jsonl` less the extension. `file` is that session's own file, or
+ * lies under the session's artifacts directory `<stem>/`.
+ */
+export function sessionLeaseRoot(file: string): { id: string; stem: string } | undefined {
+	const parts = path.resolve(file).split(path.sep);
+	for (const [index, part] of parts.entries()) {
+		const match = SESSION_STEM_RE.exec(part);
+		if (!match?.[1]) continue;
+		const name = part.slice(0, part.length - (match[2]?.length ?? 0));
+		return { id: match[1], stem: [...parts.slice(0, index), name].join(path.sep) };
+	}
+	return undefined;
 }
 
 /** How a caller holds a session's ownership claim; see {@link SessionStorage.claimSession}. */
@@ -198,6 +246,30 @@ export interface SessionClaimOptions {
 	 * last of them lets go.
 	 */
 	handover?: boolean;
+	/** Called when the claim is found not held, or, once held, lost to another holder. */
+	onLost?: () => void;
+}
+
+/** Options of {@link SessionStorage.acquireSessionClaim}: a claim's, and how long to wait for another holder. */
+export interface SessionAcquireOptions extends SessionClaimOptions {
+	/**
+	 * While another process holds the claim, wait up to this long for its
+	 * lease to go or expire, then claim. Without it a held claim refuses at once.
+	 */
+	waitMs?: number;
+	/** Called once, when the claim must wait, with the process that holds it. */
+	onWait?: (holder: SessionClaimHolder) => void;
+}
+
+/**
+ * Optional guards applied by {@link SessionStorage.writeTextAtomic}. The
+ * backend MUST check `expectedSize` and call `commitGuard()` synchronously
+ * immediately before it makes the staged content visible at `path`. Failed
+ * preconditions leave the target untouched. Backends MUST NOT yield between
+ * the checks and publishing the write.
+ */
+export interface WriteTextAtomicOptions extends SessionStorageWriteOptions {
+	commitGuard?: () => boolean;
 }
 
 export interface SessionStorage {
@@ -357,9 +429,40 @@ export interface SessionStorage {
 	 * the process's lease.
 	 *
 	 * Optional because only backends with a process-owned lock can tell that
-	 * another process writes a session.
+	 * another process writes a session. A backend that can learn only later
+	 * that the claim is not held (SQL storage on PostgreSQL or MySQL, whose
+	 * claim statement runs in the background) returns the release at once and
+	 * calls `options.onLost` when it learns it, or when a held claim is lost.
 	 */
 	claimSession?(sessionId: string, sessionPath: string, options?: SessionClaimOptions): (() => void) | null;
+	/**
+	 * {@link claimSession} for a session being opened, which answers only once
+	 * the claim is known held or refused: `null` when another process holds
+	 * it (after waiting up to `options.waitMs` for that holder's lease to go or
+	 * expire) or when `sessionPath` now holds a different session. Only SQL
+	 * storage implements it; `SessionManager` claims an opened session through
+	 * it before anything else runs, and through `claimSession` at the first
+	 * write on other backends.
+	 */
+	acquireSessionClaim?(
+		sessionId: string,
+		sessionPath: string,
+		options?: SessionAcquireOptions,
+	): Promise<(() => void) | null>;
+	/**
+	 * Whether this process's claim on `sessionId` is lost: another holder took
+	 * it over. A claim whose heartbeat cannot be confirmed for a while is not
+	 * lost; its writes wait until it is confirmed again. False for a session
+	 * this process does not claim. Only backends whose claims can be lost
+	 * while held implement it.
+	 */
+	sessionClaimLost?(sessionId: string): boolean;
+	/**
+	 * The process that holds `sessionId`'s claim now, as its lease row names
+	 * it, or `undefined` when none does or it cannot be read. Only SQL storage
+	 * implements it: a launcher-named session that must stop says who holds it.
+	 */
+	sessionClaimHolder?(sessionId: string): Promise<SessionClaimHolder | undefined>;
 	/**
 	 * Point this process's writer claim for `sessionId` at the file it appends
 	 * to now, after a move carried the journal to a new path. The claim is kept

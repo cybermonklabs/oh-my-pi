@@ -7,6 +7,7 @@ import {
 	childDirNames,
 	childKeyName,
 	LINE_STREAM_CHUNK,
+	SessionLeaseLostError,
 	SessionWriteConflictError,
 	type SessionStorage,
 	type SessionStorageStat,
@@ -80,7 +81,14 @@ export interface SessionStorageBackend {
 		title?: SessionTitleUpdate,
 		expectedSize?: number | null,
 	): Promise<void>;
-	append(path: string, line: string, mtimeMs: number): Promise<void>;
+	/**
+	 * Append `line`. `expectedSize` is the size this store's index held for
+	 * `path` before the append, which a backend that guards appends (SQL
+	 * storage that claims sessions) checks the shared backend's size against,
+	 * rejecting with `SessionWriteConflictError` when another writer changed
+	 * the file since; others ignore it.
+	 */
+	append(path: string, line: string, mtimeMs: number, expectedSize?: number): Promise<void>;
 	updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void>;
 	truncate(path: string, mtimeMs: number): Promise<void>;
 	/**
@@ -965,7 +973,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			async () => {
 				const error = getError?.();
 				if (error) throw error;
-				await this.#backend.append(path, line, mtimeMs);
+				await this.#backend.append(path, line, mtimeMs, append.previous?.size ?? 0);
 			},
 			{ trackDrain: true, abortOnPredecessorFailure: true },
 		);
@@ -1103,7 +1111,11 @@ export class IndexedSessionStorage implements SessionStorage {
 		const operation = Promise.all(previous).then(task);
 		const tracked = operation.catch(err => {
 			const error = toError(err);
-			if (options.trackDrain && !this.#firstDrainError) this.#firstDrainError = error;
+			// A write the claim fence refused changed nothing, and its caller
+			// republishes those entries elsewhere: no durable write is missing.
+			if (options.trackDrain && !this.#firstDrainError && !(error instanceof SessionLeaseLostError)) {
+				this.#firstDrainError = error;
+			}
 			throw error;
 		});
 		const tail = tracked.catch(() => {});

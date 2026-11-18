@@ -882,12 +882,15 @@ interface FakeServer {
 
 const READ_WRITE = "SET TRANSACTION READ WRITE";
 const READ_ONLY_READ = "SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'";
+/** Every PostgreSQL transaction locks its function and operator lookup to `pg_catalog` before its work. */
+const SEARCH_PATH = "SET LOCAL search_path = pg_catalog, pg_temp";
 /** What every PostgreSQL write transaction sends before its work. */
-const WRITE_OPENING = [READ_WRITE, READ_ONLY_READ];
-/** What every PostgreSQL start-up transaction sends before its one statement. */
+const WRITE_OPENING = [READ_WRITE, SEARCH_PATH, READ_ONLY_READ];
+/** What every PostgreSQL start-up transaction sends before its work. */
 const START_UP_OPENING = [
 	READ_WRITE,
 	"SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+	SEARCH_PATH,
 	READ_ONLY_READ,
 	expect.stringMatching(/^SELECT pg_advisory_xact_lock\(\d+\)$/),
 ];
@@ -907,6 +910,8 @@ function capturingClient(
 			if (transaction !== null && sql === READ_ONLY_READ && server.setting && server.resetVal) {
 				return [{ setting: server.setting, reset_val: server.resetVal }];
 			}
+			// A read sent alone with its search_path lock: one (empty) result per statement.
+			if (sql.startsWith(`${SEARCH_PATH}; `)) return [[], []];
 			return [];
 		},
 	});
@@ -935,25 +940,27 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		const { client, queries } = capturingClient("postgres");
 		const storage = await SqlSessionStorage.create({ client });
 
-		const tables = queries.filter(q => q.sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(2);
-		expect(tables[0]?.sql).toContain("omp_session_files (path TEXT PRIMARY KEY");
-		expect(tables[0]?.sql).toContain("mtime_ms BIGINT");
-		expect(tables[0]?.sql).toContain("byte_len BIGINT");
-		expect(tables[1]?.sql).toContain("omp_session_files_parts (path TEXT NOT NULL, start_offset BIGINT NOT NULL");
-		expect(tables[1]?.sql).toContain("PRIMARY KEY (path, start_offset)");
-		// Each table is made alone in a transaction behind the start-up opening,
-		// and both take the same start-up lock.
-		const startUps = tables.map(table =>
-			queries.filter(query => query.transaction === table.transaction).map(query => query.sql),
-		);
-		for (const [n, table] of tables.entries()) {
-			expect(table.transaction).toEqual(expect.any(Number));
-			expect(startUps[n]).toEqual([...START_UP_OPENING, table.sql]);
-		}
-		expect(startUps[1]?.[3]).toBe(startUps[0]?.[3]);
+		// The stub has no tables, so start-up makes all three, with the lease table's index, in one statement batch.
+		const [made, ...more] = queries.filter(q => q.sql.includes("CREATE TABLE"));
+		expect(more).toHaveLength(0);
+		const tables = (made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"));
+		expect(tables).toHaveLength(3);
+		expect(tables[0]).toContain("omp_session_files (path TEXT PRIMARY KEY");
+		expect(tables[0]).toContain("mtime_ms BIGINT");
+		expect(tables[0]).toContain("byte_len BIGINT");
+		expect(tables[1]).toContain("omp_session_files_parts (path TEXT NOT NULL, start_offset BIGINT NOT NULL");
+		expect(tables[1]).toContain("PRIMARY KEY (path, start_offset)");
+		expect(tables[2]).toContain("omp_session_leases (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL");
+		// One transaction behind the start-up opening, which takes the start-up lock, looks again and makes them.
+		expect(inOneTransaction(queries.filter(query => query.transaction === made?.transaction))).toEqual([
+			...START_UP_OPENING,
+			expect.stringMatching(/^SELECT pg_catalog\.to_regclass\(\$1\) IS NOT NULL AS session, /),
+			made?.sql,
+		]);
+		// The look outside the lock came first, alone, with its search_path lock.
+		expect(queries[0]?.sql).toMatch(/^SET LOCAL search_path = pg_catalog, pg_temp; SELECT pg_catalog\.to_regclass\(/);
 
-		const loadIndex = queries.find(q => q.sql.startsWith("SELECT path"));
+		const loadIndex = queries.find(q => q.sql.startsWith(`${SEARCH_PATH}; SELECT path`));
 		expect(loadIndex?.sql).toContain("byte_len");
 		expect(loadIndex?.sql).not.toMatch(/\bcontent\b/);
 
@@ -967,10 +974,10 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		const appended = queries.slice(appendStart);
 		expect(inOneTransaction(appended)).toEqual([
 			...WRITE_OPENING,
-			expect.stringContaining("INSERT INTO omp_session_files_parts"),
+			expect.stringContaining('INSERT INTO "public".omp_session_files_parts'),
 		]);
-		expect(appended[2]?.sql).not.toContain("||");
-		expect(appended[2]?.values).toEqual(["/s/p.jsonl", expect.any(Number), 6, "chunk\n"]);
+		expect(appended[3]?.sql).not.toContain("||");
+		expect(appended[3]?.values).toEqual(["/s/p.jsonl", expect.any(Number), 6, "chunk\n"]);
 
 		// A title update is one statement, alone in a transaction behind the write opening.
 		await storage.writeText("/s/titled.jsonl", "titled\n");
@@ -978,7 +985,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		await storage.updateSessionTitle("/s/titled.jsonl", { title: "New", source: "user", updatedAt: "t2" });
 		expect(inOneTransaction(queries.slice(titleStart))).toEqual([
 			...WRITE_OPENING,
-			expect.stringMatching(/^UPDATE omp_session_files SET title = /),
+			expect.stringMatching(/^UPDATE "public"\.omp_session_files SET title = /),
 		]);
 
 		for (const query of queries) {
@@ -994,7 +1001,9 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		const { client, queries } = capturingClient("postgres", server);
 		// Start-up refuses before it waits for the start-up lock or makes a table.
 		await expect(SqlSessionStorage.create({ client })).rejects.toThrow("default_transaction_read_only");
-		expect(inOneTransaction(queries)).toEqual(START_UP_OPENING.slice(0, 3));
+		expect(inOneTransaction(queries.slice(queries.findIndex(query => query.sql === READ_WRITE)))).toEqual(
+			START_UP_OPENING.slice(0, 4),
+		);
 
 		server.resetVal = "off";
 		const storage = await SqlSessionStorage.create({ client });
@@ -1023,22 +1032,22 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 			const { client, queries } = capturingClient("postgres", server);
 			const storage = await SqlSessionStorage.create({ client });
 
-			const tables = queries.filter(q => q.sql.startsWith("CREATE TABLE"));
-			expect(tables).toHaveLength(2);
-			for (const table of tables) {
-				expect(inOneTransaction(queries.filter(query => query.transaction === table.transaction))).toEqual([
-					...START_UP_OPENING,
-					table.sql,
-				]);
-			}
+			const [made, ...more] = queries.filter(q => q.sql.includes("CREATE TABLE"));
+			expect(more).toHaveLength(0);
+			expect((made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"))).toHaveLength(3);
+			expect(inOneTransaction(queries.filter(query => query.transaction === made?.transaction))).toEqual([
+				...START_UP_OPENING,
+				expect.stringMatching(/^SELECT pg_catalog\.to_regclass\(\$1\) IS NOT NULL AS session, /),
+				made?.sql,
+			]);
 
 			const writeStart = queries.length;
 			await storage.writeText("/s/written.jsonl", "body\n");
 			expect(inOneTransaction(queries.slice(writeStart))).toEqual([
 				...WRITE_OPENING,
-				expect.stringMatching(/^INSERT INTO omp_session_files /),
-				expect.stringMatching(/^DELETE FROM omp_session_files_parts /),
-				expect.stringMatching(/^INSERT INTO omp_session_files_parts /),
+				expect.stringMatching(/^INSERT INTO "public"\.omp_session_files /),
+				expect.stringMatching(/^DELETE FROM "public"\.omp_session_files_parts /),
+				expect.stringMatching(/^INSERT INTO "public"\.omp_session_files_parts /),
 			]);
 
 			const appendStart = queries.length;
@@ -1047,7 +1056,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 			await writer.close();
 			expect(inOneTransaction(queries.slice(appendStart))).toEqual([
 				...WRITE_OPENING,
-				expect.stringContaining("INSERT INTO omp_session_files_parts"),
+				expect.stringContaining('INSERT INTO "public".omp_session_files_parts'),
 			]);
 		});
 	}
@@ -1061,13 +1070,15 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		await writer.close();
 
 		const tables = queries.filter(q => q.sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(2);
-		for (const table of tables) {
+		expect(tables).toHaveLength(3);
+		for (const table of tables.slice(0, 2)) {
 			expect(table.sql).toContain("path VARCHAR(512) NOT NULL");
 			expect(table.sql).toContain("LONGTEXT");
 			expect(table.sql).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
 		}
 		expect(tables[1]?.sql).toContain("PRIMARY KEY (path, start_offset)");
+		expect(tables[2]?.sql).toContain("omp_session_leases (session_id VARCHAR(512) NOT NULL PRIMARY KEY");
+		expect(tables[2]?.sql).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
 
 		const loadIndex = queries.find(q => q.sql.startsWith("SELECT path"));
 		expect(loadIndex?.sql).toContain("byte_len");
@@ -1120,7 +1131,8 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 	it("explicit `adapter` option overrides the reported adapter", async () => {
 		const client: SqlSessionStorageClient = {
 			options: { adapter: "" }, // empty / missing
-			async unsafe() {
+			async unsafe(sql) {
+				if (sql.startsWith(`${SEARCH_PATH}; `)) return [[], []];
 				return [];
 			},
 			async transaction(callback) {

@@ -365,7 +365,9 @@ for (const kind of ["file", "sql"] as const) {
 			await new Session(["lease", "--json", "--", "no-such-session"], TEST_CONFIG).run();
 
 			if (refuses) {
-				expect(stderr()).toContain(`omp session lease ${SQL_REFUSAL}: SQL-stored sessions take no ownership lease`);
+				expect(stderr()).toContain(
+					`omp session lease ${SQL_REFUSAL}: SQL-stored sessions are claimed in their database`,
+				);
 				expect(stdout()).toBe("");
 			} else {
 				expect(JSON.parse(stdout())).toEqual({ held: [], unknown: [] });
@@ -399,7 +401,7 @@ for (const kind of ["file", "sql"] as const) {
 				if (refuses) {
 					expect(await rejectionOf(client.getSessionLease(["no-such-session"]))).toMatchObject({
 						message: expect.stringContaining(
-							`get_session_lease ${SQL_REFUSAL}: SQL-stored sessions take no ownership lease`,
+							`get_session_lease ${SQL_REFUSAL}: SQL-stored sessions are claimed in their database`,
 						),
 					});
 				} else {
