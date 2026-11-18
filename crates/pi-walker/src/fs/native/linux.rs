@@ -10,10 +10,11 @@
 //!   way and any escape from the root; kernels and sandboxes without `openat2`
 //!   get the portable one-component-at-a-time walk.
 //! - A directory opened with `O_DIRECTORY | O_NOFOLLOW` ([`openat_dir`]: a
-//!   listed subdirectory, or one on that walk) is trusted to be no symlink only
-//!   once this kernel was seen refusing one; gVisor before release-20261109.0
-//!   follows it, so there each such open is checked by device and inode against
-//!   the entry `fstatat` found at its name.
+//!   listed subdirectory, or one on that walk) is opened that way only once
+//!   this kernel was seen refusing a symlink with it; gVisor before
+//!   release-20261109.0 follows one, so there the directory opens with
+//!   `O_NOFOLLOW` alone, which gVisor honours as it does for every file open,
+//!   and one `fstat` shows that it is a directory.
 //! - Listings use raw `getdents64` into a large reusable buffer, parsed in
 //!   place; `d_type` supplies entry types without per-entry stat calls.
 //! - Full detail and `DT_UNKNOWN` entries use `statx` with only the needed
@@ -197,33 +198,33 @@ pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Resul
 /// Opens the directory `path` (one component) in `dir` with `flags`, which
 /// carry `O_DIRECTORY | O_NOFOLLOW`, so that no symlink there is opened. A
 /// kernel seen refusing such a symlink ([`directory_links_refused`]) is
-/// trusted with one `openat`. Elsewhere the open is checked instead of the
-/// flags: gVisor before release-20261109.0, GKE Sandbox's among them, follows
-/// a final symlink to a directory despite `O_NOFOLLOW` when `O_DIRECTORY` is
-/// set (google/gvisor#14786). The entry must be a directory by
-/// `fstatat(AT_SYMLINK_NOFOLLOW)` before the open (else `ENOTDIR`, Linux's
-/// refusal of a symlink there), and the descriptor that directory by device
-/// and inode. A descriptor of another file stands only when the name holds it
-/// after the open, still as a directory (one renamed into place, which Linux
-/// opens too); else the open fails with `ENOTDIR`.
+/// trusted with one `openat`. Elsewhere `O_DIRECTORY` is left out: gVisor
+/// before release-20261109.0, GKE Sandbox's among them, follows a final
+/// symlink to a directory despite `O_NOFOLLOW` when `O_DIRECTORY` is set
+/// (google/gvisor#14786), and honours `O_NOFOLLOW` without it, as every file
+/// open of the walker already relies on. The open refuses a symlink (`ELOOP`,
+/// returned as Linux's `ENOTDIR` for a symlink there), and one `fstat` refuses
+/// anything else that is not a directory (`ENOTDIR`). `O_NONBLOCK` and
+/// `O_NOCTTY` keep a FIFO or terminal swapped in at the name from blocking
+/// the open or becoming the controlling terminal before `fstat` rejects it.
 pub(super) fn openat_dir(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
 	if directory_links_refused() {
 		return openat(dir, path, flags);
 	}
-	let entry = fstatat(dir, path, libc::AT_SYMLINK_NOFOLLOW)?;
-	if !is_dir(&entry) {
-		return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
-	}
 	#[cfg(test)]
 	seam::run_before_open();
-	let fd = openat(dir, path, flags)?;
-	let opened = fstatat(fd.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH)?;
-	if same_file(&opened, &entry) {
-		return Ok(fd);
-	}
-	match fstatat(dir, path, libc::AT_SYMLINK_NOFOLLOW) {
-		Ok(now) if is_dir(&now) && same_file(&opened, &now) => Ok(fd),
-		_ => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+	let flags = (flags & !libc::O_DIRECTORY) | libc::O_NONBLOCK | libc::O_NOCTTY;
+	let fd = match openat(dir, path, flags) {
+		Ok(fd) => fd,
+		Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+			return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+		},
+		Err(err) => return Err(err),
+	};
+	if is_dir(&fstatat(fd.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH)?) {
+		Ok(fd)
+	} else {
+		Err(io::Error::from_raw_os_error(libc::ENOTDIR))
 	}
 }
 
@@ -274,11 +275,6 @@ fn probe_directory_links() -> u8 {
 
 const fn is_dir(st: &libc::stat) -> bool {
 	st.st_mode & libc::S_IFMT == libc::S_IFDIR
-}
-
-/// Whether `a` and `b` describe the same file: one device, one inode.
-const fn same_file(a: &libc::stat, b: &libc::stat) -> bool {
-	a.st_dev == b.st_dev && a.st_ino == b.st_ino
 }
 
 /// Opens the relative `rel` (`/`-separated names, none empty, `.` or `..`)
@@ -616,8 +612,8 @@ mod seam {
 		}
 	}
 
-	/// Runs `hook` in the next [`super::openat_dir`] on this thread, between
-	/// its check of the entry and its open.
+	/// Runs `hook` in the next [`super::openat_dir`] on this thread that does
+	/// not trust the kernel, just before its open.
 	pub(super) fn before_open(hook: impl FnOnce() + 'static) {
 		BEFORE_OPEN.set(Some(Box::new(hook)));
 	}
@@ -848,10 +844,11 @@ mod tests {
 	/// A kernel that follows a final symlink to a directory despite
 	/// `O_DIRECTORY | O_NOFOLLOW` and has no `openat2`, as GKE Sandbox's
 	/// gVisor does (google/gvisor#14786), still opens nothing through a
-	/// symlink below a root: a symlink at a directory's name is refused before
-	/// the open, a directory swapped for one between that check and the open
-	/// is refused by its device and inode, and a directory renamed into the
-	/// name in between opens, as Linux opens it.
+	/// symlink below a root, nor anything but a directory where one is asked:
+	/// a symlink at a directory's name, one swapped in just before the open
+	/// (below a root and as a listed subdirectory), a regular file and a FIFO
+	/// are each refused with `ENOTDIR`, the FIFO without blocking, and a
+	/// directory renamed into the name opens, as Linux opens it.
 	#[test]
 	fn a_kernel_that_follows_a_symlink_despite_o_nofollow_opens_nothing_through_one() {
 		let _serial = SWITCHES.lock();
@@ -880,6 +877,34 @@ mod tests {
 			assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{rel:?}: {err:?}");
 		}
 		assert!(NO_OPENAT2.load(Ordering::SeqCst), "the walk did not replace the missing openat2");
+
+		// What is not a directory where one is asked: a regular file, and a
+		// FIFO, whose open must not wait for a writer.
+		let fifo = CString::new(tree.0.join("fifo").as_os_str().as_bytes()).expect("no NUL");
+		// SAFETY: `fifo` is a NUL-terminated path.
+		assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+		for rel in [&b"a/f"[..], b"fifo"] {
+			let err = open_beneath(&mut s, root.as_raw_fd(), rel, DIR).unwrap_err();
+			assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{rel:?}: {err:?}");
+		}
+
+		// `open_child`, the walk's descent into a listed directory, takes the
+		// same open: a link at the name, and one swapped in for `a`.
+		let parent = std::os::fd::OwnedFd::from(root.try_clone().expect("dup the root"));
+		let err = super::super::unix::open_child(&mut s, &parent, b"link").unwrap_err();
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "open_child of a link: {err:?}");
+		let (a3, parked3, target3) = (tree.0.join("a"), tree.0.join("a-parked"), outside.0.clone());
+		before_open(move || {
+			fs::rename(&a3, &parked3).expect("park a");
+			std::os::unix::fs::symlink(&target3, &a3).expect("link a to outside");
+		});
+		let err = super::super::unix::open_child(&mut s, &parent, b"a").unwrap_err();
+		assert!(tree.0.join("a-parked").exists(), "open_child: the swap did not run");
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "open_child of a swapped a: {err:?}");
+		fs::remove_file(tree.0.join("a")).expect("unlink a");
+		fs::rename(tree.0.join("a-parked"), tree.0.join("a")).expect("restore a");
+		let opened = super::super::unix::open_child(&mut s, &parent, b"a").expect("open_child of a");
+		assert_eq!(id_of(opened), id_at(&tree.0.join("a")));
 
 		// `a` swapped for a link to `outside`, which holds an `f` too.
 		let (a, parked) = (tree.0.join("a"), tree.0.join("a-parked"));
