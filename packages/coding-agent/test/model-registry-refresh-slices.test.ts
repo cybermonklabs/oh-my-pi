@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Api, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -21,7 +25,11 @@ function mockFrozenClock(): void {
 	vi.spyOn(performance, "now").mockImplementation(() => 1_000);
 }
 
-/** Counts event loop turns until stopped. */
+/**
+ * Counts event loop turns until stopped. It ticks on `setTimeout(0)`, one of
+ * the two macrotasks a sliced pass yields to, so `onTurn` runs about once per
+ * slice rather than on every pass through the event loop.
+ */
 function countTurns(onTurn?: () => void): { turns: () => number; stop: () => void } {
 	let turns = 0;
 	let running = true;
@@ -29,9 +37,9 @@ function countTurns(onTurn?: () => void): { turns: () => number; stop: () => voi
 		if (!running) return;
 		turns++;
 		onTurn?.();
-		setImmediate(tick);
+		setTimeout(tick, 0);
 	};
-	setImmediate(tick);
+	setTimeout(tick, 0);
 	return { turns: () => turns, stop: () => (running = false) };
 }
 
@@ -110,4 +118,51 @@ describe("ModelRegistry discovery slicing", () => {
 		expect(registrations).toBeGreaterThan(3);
 		expect(registry.find("sliced-runtime-provider", "dynamic-model")).toBeDefined();
 	});
+
+	test("a refresh awaited by createAgentSession takes its turns without waiting for a pending timer", async () => {
+		// No model has auth here, so creation awaits refresh("online-if-uncached") before it rejects.
+		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
+		const refresh = registry.refresh.bind(registry);
+		let refreshMs = Number.NaN;
+		registry.refresh = async (...args: Parameters<ModelRegistry["refresh"]>) => {
+			const startedAt = performance.now();
+			try {
+				return await refresh(...args);
+			} finally {
+				refreshMs = performance.now() - startedAt;
+			}
+		};
+		const agents = new AgentRegistry();
+		agents.register({ id: "owned-worker", displayName: "B", kind: "sub", parentId: "Main", session: null, status: "idle" });
+		fs.mkdirSync(tempDir.join("project"));
+		// A turn that waited for the next timer would take up to this period each time.
+		const pendingTimer = setInterval(() => {}, 2_000);
+		try {
+			await expect(
+				createAgentSession({
+					cwd: tempDir.join("project"),
+					agentDir: tempDir.join("agent"),
+					modelRegistry: registry,
+					settings: Settings.isolated(),
+					disableExtensionDiscovery: true,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+					agentRegistry: agents,
+					agentId: "owned-worker",
+					agentDisplayName: "A",
+					parentTaskPrefix: "owned-worker",
+					parentAgentId: "Main",
+					taskDepth: 1,
+					expectedAgentRef: null,
+				}),
+			).rejects.toThrow("already owned by another session generation");
+		} finally {
+			clearInterval(pendingTimer);
+		}
+		expect(refreshMs).toBeLessThan(1_500);
+	}, 30_000);
 });

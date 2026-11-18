@@ -539,9 +539,7 @@ async function fetchModelsDev<TApi extends Api, TModelsDevPayload>(
 
 	try {
 		const payload = await options.modelsDev.fetch();
-		// Parsing the shared payload used this turn before any slice opened, and
-		// every provider that maps it resumes here: map in a later turn.
-		await nextSlice();
+		// Every provider that maps this shared payload resumes here in the same turn.
 		while (sliceExpired()) await nextSlice();
 		return await buildDiscoveredModelSpecs<TApi>(options.modelsDev.map(payload, options.providerId));
 	} catch {
@@ -556,8 +554,6 @@ async function fetchDynamicModels<TApi extends Api>(
 	try {
 		const models = await fetcher();
 		if (models === null) return { models: null };
-		// The fetcher parsed its response in this turn before any slice opened.
-		await nextSlice();
 		return { models: await buildDiscoveredModelSpecs<TApi>(models) };
 	} catch (error) {
 		return { models: null, error: error instanceof Error ? error.message : String(error) };
@@ -735,7 +731,6 @@ export function* fingerprintStaticModelsSteps<TApi extends Api>(
 		elements[index] = JSON.stringify(models[index]) ?? "null";
 	}
 	yield;
-	// Joining and hashing a multi-MB catalog each take tens of milliseconds: two units.
 	const text = `[${elements.join(",")}]`;
 	yield;
 	return `${MODEL_CACHE_FINGERPRINT_VERSION}${policyKey}:${Bun.hash(text).toString(36)}`;

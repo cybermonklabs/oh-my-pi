@@ -27,6 +27,9 @@ let sliceStart = 0;
 let sliceOpen = false;
 /** Resolvers of the passes waiting for the next turn, in the order they asked. */
 let waiters: Array<() => void> = [];
+/** The batch of waiters a scheduled release is for; 0 once released. */
+let pendingBatch = 0;
+let lastBatch = 0;
 
 function closeSlice(): void {
 	sliceOpen = false;
@@ -37,8 +40,7 @@ function closeSlice(): void {
  * {@link nextSlice} before its next unit. The first check after the event loop
  * ran a macrotask opens a new slice that counts from that check, so the first
  * pass to check in a turn runs at least one unit, however long other work in
- * that turn took. Work in the same turn before the first check, such as
- * parsing a fetched payload, is the caller's to end with {@link nextSlice}.
+ * that turn took.
  */
 export function sliceExpired(): boolean {
 	const now = performance.now();
@@ -46,7 +48,8 @@ export function sliceExpired(): boolean {
 		sliceOpen = true;
 		sliceStart = now;
 		// setImmediate, not setTimeout: fake timers replace setTimeout, and a
-		// pass that waited on it would hang until a test advanced the clock.
+		// slice that never closed would stay expired after they are removed.
+		// A late close only costs the next check one extra turn.
 		setImmediate(closeSlice);
 	} else if (now < sliceStart) {
 		// A clock behind the slice's start is a mocked clock put back: start over.
@@ -59,15 +62,32 @@ export function sliceExpired(): boolean {
  * Resolves in a later macrotask, after the timers and socket events that are
  * due by then. All waiters resume in that one macrotask, and the first check
  * after it opens the next slice.
+ *
+ * The release is raced on `setImmediate` and `setTimeout(0)`; the first to run
+ * releases the batch. `setImmediate` alone stalled in Bun 1.4: during
+ * `createAgentSession`, a promise resolved from its callback did not resume
+ * until a timer next woke the event loop, so each turn cost up to a timer
+ * period. `setTimeout` alone costs its 1 ms clamp on every turn, and fake
+ * timers replace it; `setImmediate` still runs under fake timers.
  */
 export function nextSlice(): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
-	if (waiters.length === 0) setImmediate(releaseWaiters);
+	if (waiters.length === 0) {
+		const batch = ++lastBatch;
+		pendingBatch = batch;
+		setImmediate(releaseWaiters, batch);
+		setTimeout(releaseWaiters, 0, batch);
+	}
 	waiters.push(resolve);
 	return promise;
 }
 
-function releaseWaiters(): void {
+function releaseWaiters(batch: number): void {
+	// The other leg of a released batch, or of one a later batch replaced.
+	if (batch !== pendingBatch) return;
+	pendingBatch = 0;
+	// This macrotask is a new turn, whether or not the last slice's close ran yet.
+	sliceOpen = false;
 	const turn = waiters;
 	waiters = [];
 	// The first to ask is the pass that used up the last slice: a pass that
