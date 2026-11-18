@@ -366,6 +366,47 @@ describe("Hindsight automatic recall after a failure", () => {
 		expect(client.calls).toBe(4);
 	});
 
+	it("an answer with no memories also starts the next pause again at the first length", async () => {
+		const client = new CountingRecallApi();
+		const { state } = start(newSessionManager(), client, shippedConfig());
+		await promptAt(state, T0);
+		expect(client.calls).toBe(1);
+
+		const recovered = T0 + SHIPPED_FIRST_PAUSE_MS + 1_000;
+		// A bank with nothing to recall answers with no results; the server is up all the same.
+		client.answer = async () => ({ results: [] });
+		const answered = await promptAt(state, recovered);
+		expect(answered).toBeDefined();
+		expect(answered?.context).toBeUndefined();
+		client.answer = failWithBoom;
+		await promptAt(state, recovered);
+		expect(client.calls).toBe(3);
+
+		expect(await promptAroundEnd(state, client, recovered + SHIPPED_FIRST_PAUSE_MS)).toEqual({
+			skipped: true,
+			recalled: true,
+		});
+	});
+
+	it("the first skip after each new failure is logged and shown once", async () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const client = new CountingRecallApi();
+		const { state, notices } = start(newSessionManager(), client, shippedConfig());
+		const secondFailure = T0 + SHIPPED_FIRST_PAUSE_MS + 1_000;
+		for (const failedAt of [T0, secondFailure]) {
+			for (const offset of [0, 1_000, 2_000]) await promptAt(state, failedAt + offset);
+		}
+		const skipLines = warn.mock.calls.filter(
+			([message]) => message === "Hindsight: recall skipped after a recent failure",
+		);
+
+		expect(client.calls).toBe(2);
+		expect(skipLines.map(([, fields]) => fields?.failures)).toEqual([1, 2]);
+		expect(notices.map(notice => (notice.message.startsWith("Memory recall failed:") ? "failed" : "paused"))).toEqual(
+			["failed", "paused", "failed", "paused"],
+		);
+	});
+
 	it("the pause doubles up to 30 minutes", async () => {
 		const client = new CountingRecallApi();
 		const { state } = start(newSessionManager(), client, shippedConfig());
