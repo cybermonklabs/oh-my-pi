@@ -1,4 +1,5 @@
 import { USER_AGENT, getInstallId } from "@oh-my-pi/pi-utils";
+import { nextSlice, parseJsonBytesInSlices, readJsonInSlices, sliceExpired } from "@oh-my-pi/pi-utils/event-loop-slice";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { toClinePassPublicModelId } from "../cline-pass-model-id";
 import {
@@ -85,7 +86,7 @@ const ZSTD_MAGIC = 0xfd2fb528;
 
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
 const ANTHROPIC_OAUTH_BETA =
-	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 
 export interface ModelsDevModel {
 	id?: string;
@@ -230,8 +231,7 @@ async function fetchCatalogPayload(
 	}
 	const bytes = new Uint8Array(await response.arrayBuffer());
 	const isZstd = bytes.length >= 4 && new DataView(bytes.buffer, bytes.byteOffset).getUint32(0, true) === ZSTD_MAGIC;
-	const text = new TextDecoder().decode(isZstd ? await Bun.zstdDecompress(bytes) : bytes);
-	const payload: unknown = JSON.parse(text);
+	const payload = await parseJsonBytesInSlices(isZstd ? await Bun.zstdDecompress(bytes) : bytes);
 	session.payload = payload;
 	session.etag = response.headers.get("etag");
 	session.hasPayload = true;
@@ -608,7 +608,7 @@ async function fetchOllamaNativeModels(
 	if (!response.ok) {
 		return null;
 	}
-	const payload = (await response.json()) as { models?: Array<{ name?: string; model?: string }> };
+	const payload = (await readJsonInSlices(response)) as { models?: Array<{ name?: string; model?: string }> };
 	const entries = payload.models ?? [];
 	const resolved = await Promise.all(
 		entries.map(async (entry): Promise<ModelSpec<"openai-responses"> | null> => {
@@ -700,7 +700,10 @@ async function fetchOllamaShowMetadata(
 		if (!response.ok) {
 			return undefined;
 		}
-		const payload = (await response.json()) as { capabilities?: unknown; model_info?: Record<string, unknown> };
+		const payload = (await readJsonInSlices(response)) as {
+			capabilities?: unknown;
+			model_info?: Record<string, unknown>;
+		};
 		const capabilities = getOllamaCapabilities(payload.capabilities);
 		const contextWindow = getOllamaContextWindow(payload.model_info);
 		return {
@@ -1047,7 +1050,7 @@ async function fetchUmansModelsInfo(options: {
 		if (!response.ok) {
 			return null;
 		}
-		payload = await response.json();
+		payload = await readJsonInSlices(response);
 	} catch (error) {
 		throw new Error("Failed to fetch Umans models info", { cause: error });
 	}
@@ -1703,7 +1706,7 @@ async function fetchDeepinfraModels(options: {
 		if (!response.ok) {
 			return null;
 		}
-		payload = await response.json();
+		payload = await readJsonInSlices(response);
 	} catch {
 		return null;
 	}
@@ -2594,7 +2597,7 @@ async function fetchFireworksServerlessModels(options: {
 		if (!response.ok) return null;
 		let payload: unknown;
 		try {
-			payload = await response.json();
+			payload = await readJsonInSlices(response);
 		} catch {
 			return null;
 		}
@@ -2804,7 +2807,7 @@ async function fetchClinePassLiveCatalog(fetchImpl: FetchImpl): Promise<ClinePas
 			fetchImpl(CLINE_PASS_LIVE_CATALOG_URL, { signal }),
 		);
 		if (!response.ok) return undefined;
-		const payload: unknown = await response.json();
+		const payload: unknown = await readJsonInSlices(response);
 		if (!isRecord(payload) || !Array.isArray(payload.data)) return undefined;
 		const byId = new Map<string, ClinePassLiveCatalogEntry>();
 		const bySlug = new Map<string, ClinePassLiveCatalogEntry>();
@@ -2987,7 +2990,7 @@ async function fetchClinePassModels(
 	if (!response.ok) {
 		throw new Error(`Failed to fetch ClinePass models: HTTP ${response.status}`);
 	}
-	const payload: unknown = await response.json();
+	const payload: unknown = await readJsonInSlices(response);
 	if (!isRecord(payload) || !Array.isArray(payload.clinePass)) {
 		throw new Error("ClinePass model catalog response is missing clinePass");
 	}
@@ -4421,7 +4424,7 @@ export async function fetchLmStudioNativeModelMetadata(
 				headers: { Accept: "application/json", ...options?.headers },
 				signal,
 			});
-			return response.ok ? await response.json() : null;
+			return response.ok ? await readJsonInSlices(response) : null;
 		} catch {
 			return null;
 		}
@@ -6220,7 +6223,7 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 				: { failure: { endpoint, reason: "http-status", status: response.status } };
 		}
 		try {
-			return { payload: await response.json(), status: response.status };
+			return { payload: await readJsonInSlices(response), status: response.status };
 		} catch (error) {
 			return { failure: { endpoint, reason: "invalid-json", status: response.status, error } };
 		}
@@ -6281,6 +6284,7 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 	const deduped = new Map<string, LiteLLMRichEndpointModel<TApi>>();
 	const excludedModelIds = new Set<string>();
 	for (const entry of entries) {
+		while (sliceExpired()) await nextSlice();
 		if (isLiteLLMUnusableSentinelPlaceholder(entry)) {
 			continue;
 		}
@@ -6334,13 +6338,15 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 
 async function fetchLiteLLMRichModelsInternal<TApi extends Api>(
 	options: FetchLiteLLMRichModelsOptions<TApi>,
-): Promise<ModelSpec<TApi>[] | null> {
+): Promise<{ models: ModelSpec<TApi>[]; excludedModelIds: ReadonlySet<string> } | null> {
 	const managementBaseUrl = normalizeLiteLLMManagementBaseUrl(options.baseUrl);
 	const runtimeBaseUrl = normalizeLiteLLMRuntimeBaseUrl(options.baseUrl);
 	if (!managementBaseUrl || !runtimeBaseUrl) {
 		return null;
 	}
-	const fetchModels = async (signal?: AbortSignal): Promise<ModelSpec<TApi>[] | null> => {
+	const fetchModels = async (
+		signal?: AbortSignal,
+	): Promise<{ models: ModelSpec<TApi>[]; excludedModelIds: ReadonlySet<string> } | null> => {
 		const deduped = new Map<string, LiteLLMRichEndpointModel<TApi>>();
 		const excludedModelIds = new Set<string>();
 		let metadataFailure: LiteLLMRichEndpointFailure | undefined;
@@ -6406,16 +6412,19 @@ async function fetchLiteLLMRichModelsInternal<TApi extends Api>(
 		}
 		if (deduped.size === 0) {
 			if (excludedModelIds.size > 0) {
-				return [];
+				return { models: [], excludedModelIds };
 			}
 			if (metadataFailure) {
 				warnLiteLLMMetadataFallback(managementBaseUrl, metadataFailure);
 			}
 			return null;
 		}
-		return Array.from(deduped.values())
-			.map(entry => entry.model)
-			.sort((left, right) => left.id.localeCompare(right.id));
+		return {
+			models: Array.from(deduped.values())
+				.map(entry => entry.model)
+				.sort((left, right) => left.id.localeCompare(right.id)),
+			excludedModelIds,
+		};
 	};
 	if (options.signal !== undefined) {
 		return fetchModels(options.signal);
@@ -6428,7 +6437,7 @@ async function fetchLiteLLMRichModelsInternal<TApi extends Api>(
 export async function fetchLiteLLMRichModels<TApi extends Api>(
 	options: FetchLiteLLMRichModelsOptions<TApi>,
 ): Promise<ModelSpec<TApi>[] | null> {
-	return fetchLiteLLMRichModelsInternal(options);
+	return (await fetchLiteLLMRichModelsInternal(options))?.models ?? null;
 }
 
 export function litellmModelManagerOptions(config?: LiteLLMModelManagerConfig): ModelManagerOptions<Api> {
@@ -6436,30 +6445,30 @@ export function litellmModelManagerOptions(config?: LiteLLMModelManagerConfig): 
 	const baseUrl = config?.baseUrl ?? getDefaultModelDiscoveryBaseUrl("litellm")!;
 	return {
 		providerId: "litellm",
-		// rich-v14 fetches all /v2/model/info pages so cached proxy rosters
-		// include models beyond page one. rich-v13 routes `mode: decisions`
-		// groups to the Decisions runner as judge rows.
-		// rich-v12 invalidates namespaced proxy ids that missed bare catalog
-		// references. rich-v11 excluded ClinePass gateway metadata (issue #10932).
-		// rich-v10 filtered known non-conversational LiteLLM modes, keyed the
-		// deployment's `supports_vision` declaration into cached compat, and
-		// unioned compat across management endpoints instead of letting a later
-		// endpoint retract what an earlier one reported (issue #11982). Earlier
-		// versions fixed provider-specific transport leakage, added bundled
-		// reference fallback, moved OpenAI models to Responses, continued past
-		// incomplete vision/API metadata and endpoints omitting cache pricing,
-		// stripped reseller usage suffixes, filtered placeholder rows, and mapped
-		// rich pricing. Bump the version whenever these mappers change, or warm
-		// authoritative caches keep serving pre-change rows for the full TTL.
-		cacheProviderId: resolveModelCacheProviderId("litellm", { baseUrl }),
-		// litellm is a local-only proxy and is never bundled in models.json (that
-		// would leak the machine's localhost catalog). Prefer the proxy's richer
-		// management metadata, then enrich ids against models.dev with the bundled
-		// catalog as a fallback before using /v1/models.
+		dynamicModelsAuthoritative: true,
+		// Cache namespaces include the credential: virtual keys on one proxy
+		// can see different model rosters.
+		cacheProviderId: resolveModelCacheProviderId("litellm", { apiKey, baseUrl }),
+		// LiteLLM's authenticated /v1/models is the selectable roster; management
+		// endpoints only supply metadata for those exact ids.
 		fetchDynamicModels: async () => {
 			const modelsDevReferences = await loadModelsDevReferences<Api>(config?.fetch);
 			const resolveReference = createReferenceResolver(modelsDevReferences);
-			const richModels = await fetchLiteLLMRichModels<Api>({
+			const scopedModels = await fetchOpenAICompatibleModels<Api>({
+				api: "openai-completions",
+				provider: "litellm",
+				baseUrl,
+				apiKey,
+				mapModel: (entry, defaults) =>
+					mapLiteLLMOpenAICompatibleModel(entry, defaults, resolveReference(defaults.id)),
+				fetch: config?.fetch,
+			});
+			if (scopedModels === null) {
+				logger.warn("LiteLLM /v1/models unavailable; cannot determine the authorized model roster", { baseUrl });
+				return null;
+			}
+			if (scopedModels.length === 0) return [];
+			const rich = await fetchLiteLLMRichModelsInternal<Api>({
 				api: "openai-completions",
 				provider: "litellm",
 				baseUrl,
@@ -6469,20 +6478,12 @@ export function litellmModelManagerOptions(config?: LiteLLMModelManagerConfig): 
 				resolveApi: resolveLiteLLMApi,
 				timeoutMs: 10_000,
 			});
-			const models =
-				richModels ??
-				(await fetchOpenAICompatibleModels<Api>({
-					api: "openai-completions",
-					provider: "litellm",
-					baseUrl,
-					apiKey,
-					mapModel: (entry, defaults) =>
-						mapLiteLLMOpenAICompatibleModel(entry, defaults, resolveReference(defaults.id)),
-					fetch: config?.fetch,
-				}));
+			const richById = new Map(rich?.models.map(model => [model.id, model]));
+			const models = scopedModels
+				.filter(model => !rich?.excludedModelIds.has(model.id))
+				.map(model => richById.get(model.id) ?? model);
 			// Bare catalog names can label proxy namespaces, but their pricing,
 			// limits and request routing must never enrich a different deployment.
-			if (models === null) return null;
 			return models.map(model => {
 				const name = toLiteLLMDisplayName(model.name, resolveReference(bareModelId(model.id))?.name, model.id);
 				return name === model.name ? model : { ...model, name };

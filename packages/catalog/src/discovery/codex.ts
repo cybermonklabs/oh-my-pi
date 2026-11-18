@@ -1,4 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
+import { readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
 import { compareRevision, parseRevision } from "../compat/revision";
 import { classifyModel } from "../compat/taxonomy";
 import { getBundledModels } from "../models";
@@ -156,7 +157,7 @@ export async function fetchCodexModels(options: CodexModelDiscoveryOptions): Pro
 
 		let payload: unknown;
 		try {
-			payload = await response.json();
+			payload = await readJsonInSlices(response);
 		} catch {
 			continue;
 		}

@@ -9,10 +9,11 @@
  * pollution that fails `db-range`, `behavior-backfill`, `priority-premium-*`,
  * and `agent-type` runs.
  *
- * `installStatsTestIsolation` snapshots and clears `XDG_*_HOME` plus
- * `PI_CONFIG_DIR` for the test, points the agent directory at a fresh
- * `TempDir`, closes the stats DB handle, and tears everything back down in the
- * matching `afterEach`.
+ * `installStatsTestIsolation` snapshots and clears `XDG_*_HOME`, the config-root
+ * overrides the test preload sets (`OMP_CONFIG_ROOT`, `OMP_DOWNLOAD_ROOT`, which
+ * would replace the config root this sets) and `PI_CONFIG_DIR` for the test,
+ * points the agent directory at a fresh `TempDir`, closes the stats DB handle,
+ * and tears everything back down in the matching `afterEach`.
  */
 import { afterEach, beforeEach } from "bun:test";
 import * as os from "node:os";
@@ -20,7 +21,13 @@ import * as path from "node:path";
 import { closeDb } from "@oh-my-pi/omp-stats/db";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
-const XDG_KEYS = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
+const ROOT_ENV_KEYS = [
+	"XDG_DATA_HOME",
+	"XDG_STATE_HOME",
+	"XDG_CACHE_HOME",
+	"OMP_CONFIG_ROOT",
+	"OMP_DOWNLOAD_ROOT",
+] as const;
 
 export interface StatsTestIsolation {
 	/** Active per-test `TempDir`. Null between tests. */
@@ -30,14 +37,14 @@ export interface StatsTestIsolation {
 export function installStatsTestIsolation(prefix: string): StatsTestIsolation {
 	const originalAgentDir = getAgentDir();
 	let originalConfigDir: string | undefined;
-	const originalXdg: Record<string, string | undefined> = {};
+	const originalRootEnv: Record<string, string | undefined> = {};
 	let tempDir: TempDir | null = null;
 
 	beforeEach(() => {
 		tempDir = TempDir.createSync(prefix);
 		originalConfigDir = process.env.PI_CONFIG_DIR;
-		for (const key of XDG_KEYS) {
-			originalXdg[key] = process.env[key];
+		for (const key of ROOT_ENV_KEYS) {
+			originalRootEnv[key] = process.env[key];
 			delete process.env[key];
 		}
 		const configDir = path.relative(os.homedir(), tempDir.join("config"));
@@ -52,8 +59,8 @@ export function installStatsTestIsolation(prefix: string): StatsTestIsolation {
 		} else {
 			process.env.PI_CONFIG_DIR = originalConfigDir;
 		}
-		for (const key of XDG_KEYS) {
-			const prior = originalXdg[key];
+		for (const key of ROOT_ENV_KEYS) {
+			const prior = originalRootEnv[key];
 			if (prior === undefined) delete process.env[key];
 			else process.env[key] = prior;
 		}

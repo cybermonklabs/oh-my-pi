@@ -74,7 +74,8 @@ async function runProbe(mode: ProbeMode, extraAgentEnv: string[] = []) {
 						...extraAgentEnv,
 					].join("\n"),
 		);
-		const proc = Bun.spawn([process.execPath, probePath, mode], {
+		// The probe is a test child, which exports only to a receiver it declares: it declares this one.
+		const proc = Bun.spawn([process.execPath, probePath, mode, `http://127.0.0.1:${server.port}`], {
 			cwd,
 			env: {
 				// Drop every inherited OTEL_* name, not a fixed list: a developer's shell may export

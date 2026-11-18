@@ -10,8 +10,10 @@
  * - Non-conversational message kinds are not persisted.
  * - The target follows the session file: a switch routes later turns to the new
  *   session's `__advisor.jsonl`, leaving the prior file intact.
+ * - The transcript is masked by the store masking binding of the session's own
+ *   manager: a value only that binding's agent dir lists is stored as a marker.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -22,7 +24,12 @@ import {
 	advisorTranscriptFilename,
 	loadAdvisorTranscriptCosts,
 } from "@oh-my-pi/pi-coding-agent/advisor/transcript-recorder";
+import * as storeMask from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+
+/** Listed only in the secrets.yml of the agent dir the session's manager is bound to. */
+const AGENT_DIR_VALUE = "vb4-synthetic-advisor-dir-6172";
 
 interface AdvisorEntry {
 	type?: string;
@@ -388,6 +395,37 @@ describe("AdvisorTranscriptRecorder", () => {
 			await fs.writeFile(transcript, `${lines.join("\n")}\n`);
 
 			expect((await loadAdvisorTranscriptCosts(sessionFile)).get("")).toBe(0.25);
+		});
+	});
+
+	it("masks the transcript by the store masking binding of the session's manager", async () => {
+		await withTempDir(async dir => {
+			const agentDir = path.join(dir, "agent");
+			await Bun.write(path.join(agentDir, "secrets.yml"), `- type: plain\n  content: "${AGENT_DIR_VALUE}"\n`);
+			// The process masker reads the agent dir it is asked for, never this machine's environment.
+			const build = spyOn(storeMask, "processSessionStoreMasker").mockImplementation(
+				requested => new storeMask.SessionStoreMasker({ env: () => ({}), agentDir: requested }),
+			);
+			try {
+				const host = SessionManager.inMemory(dir);
+				host.setStoreMasking({ enabled: () => true, agentDir });
+				const sessionFile = path.join(dir, "sess.jsonl");
+				const recorder = new AdvisorTranscriptRecorder(
+					() => sessionFile,
+					() => dir,
+				);
+				recorder.setStoreMasking(host.storeMasking);
+				recorder.record(assistantMessage(`deploy with ${AGENT_DIR_VALUE}`, 1));
+				await recorder.close();
+
+				const stored = await Bun.file(path.join(dir, "sess", ADVISOR_TRANSCRIPT_FILENAME)).text();
+				expect({
+					value: stored.includes(AGENT_DIR_VALUE),
+					marker: stored.includes("[REDACTED:secrets.yml:"),
+				}).toEqual({ value: false, marker: true });
+			} finally {
+				build.mockRestore();
+			}
 		});
 	});
 });
