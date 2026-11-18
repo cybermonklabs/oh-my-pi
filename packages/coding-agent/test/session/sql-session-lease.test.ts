@@ -998,7 +998,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			);
 		}
 
-		// Start-up's table check picks out the lease table among the store's three; the pick must not depend on how the
+		// Start-up's table check picks out the lease table among the store's tables; the pick must not depend on how the
 		// name is spelled, or a lease table that names the session table is checked for the lease's index twice.
 		for (const spelling of ["the same", "upper case"] as const) {
 			it.skipIf(adapter !== "postgres")(
@@ -1108,19 +1108,22 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const role = `lease_agent_${process.pid}`;
 				const parts = `${db.table}_parts`;
+				const blobs = `${db.table}_blobs`;
 				// The owner makes the tables and the index from docs/session.md; the agent login
-				// gets CREATE on the schema and row DML on the three tables, nothing more.
+				// gets CREATE on the schema and row DML on the four tables, nothing more.
 				for (const statement of [
 					`CREATE TABLE ${db.table} (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms BIGINT NOT NULL, ` +
 						"title TEXT, title_source TEXT, title_updated_at TEXT, byte_len BIGINT)",
 					`CREATE TABLE ${parts} (path TEXT NOT NULL, start_offset BIGINT NOT NULL, content TEXT NOT NULL, ` +
 						"PRIMARY KEY (path, start_offset))",
+					`CREATE TABLE ${blobs} (sha256 TEXT PRIMARY KEY, content BYTEA NOT NULL, byte_len BIGINT NOT NULL, ` +
+						"mime_type TEXT, created_ms BIGINT NOT NULL)",
 					`CREATE TABLE ${db.leaseTable} (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL, host TEXT NOT NULL, ` +
 						"pid BIGINT NOT NULL, acquired_at BIGINT NOT NULL, heartbeat_at BIGINT NOT NULL)",
 					`CREATE INDEX ${db.leaseTable}_holder ON ${db.leaseTable} (holder)`,
 					`CREATE ROLE ${role} LOGIN`,
 					`GRANT USAGE, CREATE ON SCHEMA public TO ${role}`,
-					`GRANT SELECT, INSERT, UPDATE, DELETE ON ${db.table}, ${parts}, ${db.leaseTable} TO ${role}`,
+					`GRANT SELECT, INSERT, UPDATE, DELETE ON ${db.table}, ${parts}, ${blobs}, ${db.leaseTable} TO ${role}`,
 				]) {
 					await db.sql(statement);
 				}
@@ -1157,13 +1160,14 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 		);
 
 		it.skipIf(adapter !== "mysql")(
-			"opens, claims, heartbeats, writes and releases as a MySQL user with row access and CREATE on the three tables only",
+			"opens, claims, heartbeats, writes and releases as a MySQL user with row access and CREATE on the four tables only",
 			async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const user = `lease_agent_${process.pid}`;
 				// A fresh secret per run, so no fixed credential sits in the test.
 				const secret = Bun.randomUUIDv7();
 				const parts = `${db.table}_parts`;
+				const blobs = `${db.table}_blobs`;
 				const options = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin";
 				// Another user makes the tables and the index from docs/session.md; this user gets row
 				// access and CREATE, which `CREATE TABLE IF NOT EXISTS` needs even on a table that exists.
@@ -1173,11 +1177,13 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 						`title_updated_at VARCHAR(64) NULL, byte_len BIGINT NULL)${options}`,
 					`CREATE TABLE ${parts} (path VARCHAR(512) NOT NULL, start_offset BIGINT NOT NULL, ` +
 						`content LONGTEXT NOT NULL, PRIMARY KEY (path, start_offset))${options}`,
+					`CREATE TABLE ${blobs} (sha256 CHAR(64) NOT NULL PRIMARY KEY, content LONGBLOB NOT NULL, ` +
+						`byte_len BIGINT NOT NULL, mime_type VARCHAR(127) NULL, created_ms BIGINT NOT NULL)${options}`,
 					`CREATE TABLE ${db.leaseTable} (session_id VARCHAR(512) NOT NULL PRIMARY KEY, holder VARCHAR(64) NOT NULL, ` +
 						"host VARCHAR(255) NOT NULL, pid BIGINT NOT NULL, acquired_at BIGINT NOT NULL, " +
 						`heartbeat_at BIGINT NOT NULL, INDEX ${db.leaseTable}_holder (holder))${options}`,
 					`CREATE USER '${user}'@'%' IDENTIFIED BY '${secret}'`,
-					...[db.table, parts, db.leaseTable].map(
+					...[db.table, parts, blobs, db.leaseTable].map(
 						table => `GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON ${table} TO '${user}'@'%'`,
 					),
 				]) {
@@ -1230,7 +1236,8 @@ function ownerMadeSchemaClient(adapter: "postgres" | "mysql", sent: string[]): S
 	const answer = (sql: string): SqlSessionStorageResult => {
 		if (sql.includes(" AS column_name FROM ")) return columns;
 		// Every table is there, so PostgreSQL's start-up makes none.
-		if (sql.startsWith("SELECT pg_catalog.to_regclass(")) return [{ session: true, parts: true, lease: true }];
+		if (sql.startsWith("SELECT pg_catalog.to_regclass("))
+			return [{ session: true, parts: true, lease: true, blobs: true }];
 		if (sql === "SELECT VERSION() AS version") return [{ version: "8.4.13" }];
 		// The lease table's holder index exists, under the name the store gives it.
 		if (sql.startsWith("SELECT i.indexrelid::text AS oid FROM pg_catalog.pg_index i")) return [{ oid: "1" }];
@@ -1285,9 +1292,9 @@ describe("SqlSessionStorage start-up on tables another login made", () => {
 			await SqlSessionStorage.create({ client: ownerMadeSchemaClient(adapter, sent), claims: true });
 
 			expect(sent.filter(sql => !NON_OWNER_STARTUP.some(allowed => allowed.test(sql)))).toEqual([]);
-			// PostgreSQL looks first and makes nothing that is there; MySQL runs its three no-op creates, as before.
+			// PostgreSQL looks first and makes nothing that is there; MySQL runs its four no-op creates, as before.
 			expect(sent.filter(sql => sql.startsWith("CREATE TABLE IF NOT EXISTS "))).toHaveLength(
-				adapter === "postgres" ? 0 : 3,
+				adapter === "postgres" ? 0 : 4,
 			);
 		});
 	}

@@ -73,7 +73,8 @@ describe.skipIf(!primaryUrl || !standbyUrl)("SqlSessionStorage on a PostgreSQL s
 				onThePrimary: "opened",
 			});
 		} finally {
-			for (const name of [`${table}_parts`, table, leaseTable]) await primary.unsafe(`DROP TABLE IF EXISTS ${name}`);
+			for (const name of [`${table}_parts`, `${table}_blobs`, table, leaseTable])
+				await primary.unsafe(`DROP TABLE IF EXISTS ${name}`);
 			await standby.end();
 			await primary.end();
 		}

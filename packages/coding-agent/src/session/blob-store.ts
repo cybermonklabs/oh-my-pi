@@ -177,8 +177,47 @@ function ensureDisplayPathSync(blobPath: string, displayPath: string, data: Buff
 	writeFileAtomicSync(displayPath, data);
 }
 
+/**
+ * A second store behind the local blob store, for the blobs a session
+ * references and cannot draw again: the SQL session storage's blob table. A
+ * session resumed on a machine whose blob store lacks them reads them back
+ * from it.
+ */
+export interface SessionBlobTier {
+	/**
+	 * Queue `data` (its SHA-256 `hash`) for the tier, written under the write
+	 * fence of `sessionPath` (none when it is unset). A failed write only warns.
+	 */
+	store(hash: string, data: Buffer, mimeType: string | undefined, sessionPath: string | undefined): void;
+	/** The bytes the tier holds for those of `hashes` it has, keyed by hash. */
+	read(hashes: readonly string[]): Promise<Map<string, Buffer>>;
+}
+
+/** A {@link BlobStore}'s tier, and the session file a write to it is fenced under. */
+export interface BlobStoreTier {
+	readonly tier: SessionBlobTier;
+	readonly sessionPath: () => string | undefined;
+}
+
 export class BlobStore {
-	constructor(readonly dir: string) {}
+	readonly #tier: BlobStoreTier | undefined;
+
+	constructor(
+		readonly dir: string,
+		tier?: BlobStoreTier,
+	) {
+		this.#tier = tier;
+	}
+
+	/** The tier behind this store, if it has one. */
+	get tier(): SessionBlobTier | undefined {
+		return this.#tier?.tier;
+	}
+
+	/** Hand `data`, stored here under `hash`, to the tier for the session this store writes; no-op without a tier. */
+	mirror(hash: string, data: Buffer, mimeType: string | undefined): void {
+		this.#tier?.tier.store(hash, data, mimeType, this.#tier.sessionPath());
+	}
 
 	/**
 	 * Write binary data to the blob store.
@@ -329,10 +368,20 @@ export async function externalizeImageDataUrl(blobStore: BlobStore, dataUrl: str
 	return ref;
 }
 
-/** Synchronous variant of {@link externalizeImageDataUrl}. */
-export function externalizeImageDataUrlSync(blobStore: BlobStore, dataUrl: string): string {
+/**
+ * Synchronous variant of {@link externalizeImageDataUrl}. With `mirror`, the
+ * blob also goes to the store's tier (see {@link BlobStore.mirror}).
+ */
+export function externalizeImageDataUrlSync(
+	blobStore: BlobStore,
+	dataUrl: string,
+	options?: { mirror?: boolean },
+): string {
 	if (isBlobRef(dataUrl)) return dataUrl;
-	return blobStore.putSync(Buffer.from(dataUrl, "utf8")).ref;
+	const data = Buffer.from(dataUrl, "utf8");
+	const { hash, ref } = blobStore.putSync(data);
+	if (options?.mirror) blobStore.mirror(hash, data, dataUrl.slice("data:".length, dataUrl.indexOf(";")));
+	return ref;
 }
 
 /**
@@ -352,12 +401,21 @@ export async function externalizeImageData(
 	return ref;
 }
 
-/** Synchronous variant of {@link externalizeImageData}. */
-export function externalizeImageDataSync(blobStore: BlobStore, base64Data: string, mimeType?: string): string {
+/**
+ * Synchronous variant of {@link externalizeImageData}. With `mirror`, the
+ * blob also goes to the store's tier (see {@link BlobStore.mirror}).
+ */
+export function externalizeImageDataSync(
+	blobStore: BlobStore,
+	base64Data: string,
+	mimeType?: string,
+	options?: { mirror?: boolean },
+): string {
 	if (isBlobRef(base64Data)) return base64Data;
-	return blobStore.putSync(Buffer.from(base64Data, "base64"), {
-		extension: blobExtensionForImageMimeType(mimeType),
-	}).ref;
+	const data = Buffer.from(base64Data, "base64");
+	const { hash, ref } = blobStore.putSync(data, { extension: blobExtensionForImageMimeType(mimeType) });
+	if (options?.mirror) blobStore.mirror(hash, data, mimeType);
+	return ref;
 }
 
 /**

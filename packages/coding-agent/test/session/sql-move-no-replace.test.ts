@@ -74,6 +74,7 @@ async function seed(adapter: SqlSessionStorageAdapter, url: string) {
 	const { client, storage } = await connect();
 	cleanups.push(async () => {
 		await client.unsafe(`DROP TABLE IF EXISTS ${table}_parts`);
+		await client.unsafe(`DROP TABLE IF EXISTS ${table}_blobs`);
 		await client.unsafe(`DROP TABLE IF EXISTS ${table}`);
 	});
 	const cwd = tempDir.join("from");

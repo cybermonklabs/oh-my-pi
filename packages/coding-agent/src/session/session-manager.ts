@@ -1184,7 +1184,10 @@ export class SessionManager {
 		this.#sessionDir = sessionDir ? path.resolve(sessionDir) : sessionDir;
 		this.#persist = persist;
 		this.#storage = storage;
-		this.#blobs = new BlobStore(getBlobsDir());
+		// A storage that keeps blobs beside the local store (SQL) gets each one a session
+		// persists and cannot draw again, fenced under the session this manager writes.
+		const tier = storage.blobTier;
+		this.#blobs = new BlobStore(getBlobsDir(), tier && { tier, sessionPath: () => this.#sessionFile });
 
 		if (persist && sessionDir) this.#storage.ensureDirSync(this.#sessionDir);
 	}

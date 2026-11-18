@@ -62,6 +62,22 @@ function partsSchema(adapter: SqlSessionStorageAdapter, table: string): string {
 	);
 }
 
+/** The blob table DDL that docs/session.md gives `createTable: false` consumers. */
+function blobsSchema(adapter: SqlSessionStorageAdapter, table: string): string {
+	if (adapter === "mysql") {
+		return (
+			`CREATE TABLE ${table}_blobs (sha256 CHAR(64) NOT NULL PRIMARY KEY, content LONGBLOB NOT NULL, ` +
+			`byte_len BIGINT NOT NULL, mime_type VARCHAR(127) NULL, created_ms BIGINT NOT NULL` +
+			`) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`
+		);
+	}
+	const integer = adapter === "postgres" ? "BIGINT" : "INTEGER";
+	return (
+		`CREATE TABLE ${table}_blobs (sha256 TEXT PRIMARY KEY, content ${adapter === "postgres" ? "BYTEA" : "BLOB"} NOT NULL, ` +
+		`byte_len ${integer} NOT NULL, mime_type TEXT, created_ms ${integer} NOT NULL)`
+	);
+}
+
 let tableSeq = 0;
 
 /** One test's database: a fresh table name, its clients, and the cleanup that drops both tables. */
@@ -110,6 +126,7 @@ class Db implements AsyncDisposable {
 	}
 
 	async [Symbol.asyncDispose](): Promise<void> {
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_blobs`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
 		for (const client of this.#clients) await client.end();
@@ -441,6 +458,11 @@ for (const { adapter, url } of BACKENDS) {
 			expect((partsMissing as Error).message).not.toContain("byte_len");
 
 			await db.sql(partsSchema(adapter, db.table));
+			const blobsMissing: unknown = await db.open({ createTable: false }).catch((error: unknown) => error);
+			expect((blobsMissing as Error).message).toContain(`table ${db.table}_blobs`);
+			expect((blobsMissing as Error).message).not.toContain(`table ${db.table}_parts`);
+
+			await db.sql(blobsSchema(adapter, db.table));
 			await expect(db.open({ createTable: false })).rejects.toThrow(legacy);
 
 			const backfill = {

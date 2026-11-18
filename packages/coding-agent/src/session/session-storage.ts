@@ -17,6 +17,7 @@ import { peekFileEnds } from "@oh-my-pi/pi-utils/peek-file";
 import { isPidAlive } from "@oh-my-pi/pi-utils/pid";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
+import type { SessionBlobTier } from "./blob-store";
 import {
 	overlayTitleSlotContent,
 	parseTitleSlotFromContent,
@@ -244,6 +245,12 @@ export interface WriteTextAtomicOptions extends SessionStorageWriteOptions {
 export interface SessionStorage {
 	/** A worker may use its own file-storage default for these same transcripts; omitted means keep runs inline. */
 	readonly crossesWorkerBoundary?: boolean;
+	/**
+	 * Where the blobs a session references and cannot draw again are kept
+	 * beside the local blob store, so a session resumed on another machine
+	 * gets them back; unset when the storage keeps none (file storage).
+	 */
+	readonly blobTier?: SessionBlobTier;
 	/**
 	 * `true` when synchronous writes ({@link writeTextSync} and a writer's
 	 * {@link SessionStorageWriter.appendSync}) have reached the backing store by

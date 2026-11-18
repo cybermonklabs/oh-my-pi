@@ -41,8 +41,9 @@ const SEARCH_PATH = "SET LOCAL search_path = pg_catalog, pg_temp";
 const SESSION_TABLE = "omp_session_files";
 const PARTS_TABLE = "omp_session_files_parts";
 const LEASE_TABLE = "omp_session_leases";
+const BLOBS_TABLE = "omp_session_files_blobs";
 
-/** The columns of the store's three tables and their declared types. */
+/** The columns of the store's tables and their declared types. */
 const DECLARED: Record<string, Record<string, string>> = {
 	[SESSION_TABLE]: {
 		path: "text",
@@ -54,6 +55,7 @@ const DECLARED: Record<string, Record<string, string>> = {
 		byte_len: "bigint",
 	},
 	[PARTS_TABLE]: { path: "text", start_offset: "bigint", content: "text" },
+	[BLOBS_TABLE]: { sha256: "text", content: "bytea", byte_len: "bigint", mime_type: "text", created_ms: "bigint" },
 	[LEASE_TABLE]: {
 		session_id: "text",
 		holder: "text",
@@ -443,7 +445,7 @@ async function noCreateLogin(without: readonly string[] = []): Promise<NoCreateL
 	try {
 		await (await SqlSessionStorage.create({ client: owner, claims: true })).drain();
 		for (const table of without) await owner.unsafe(`DROP TABLE ${table}`);
-		const kept = [SESSION_TABLE, PARTS_TABLE, LEASE_TABLE].filter(table => !without.includes(table));
+		const kept = [SESSION_TABLE, PARTS_TABLE, BLOBS_TABLE, LEASE_TABLE].filter(table => !without.includes(table));
 		for (const statement of [
 			`CREATE ROLE ${agent} LOGIN`,
 			`GRANT CONNECT ON DATABASE ${database} TO ${agent}`,
@@ -1035,7 +1037,9 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 					ran,
 				}).toEqual({ outcome: plant.opens ? "opened (write landed; delete landed)" : "names it", ran: [] });
 			} finally {
-				await db.sql(`DROP TABLE IF EXISTS ${db.leaseTable}, ${db.table}_parts, ${db.table} CASCADE`);
+				await db.sql(
+					`DROP TABLE IF EXISTS ${db.leaseTable}, ${db.table}_parts, ${db.table}_blobs, ${db.table} CASCADE`,
+				);
 				await db.sql(
 					`DROP TABLE IF EXISTS public.planted_parted_${process.pid}, public.planted_parent_${process.pid}, public.planted_other_${process.pid}, public.planted_fkref_${process.pid} CASCADE`,
 				);

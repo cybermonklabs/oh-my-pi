@@ -191,7 +191,7 @@ export async function openLeaseDb(adapter: SqlSessionStorageAdapter, url: string
 					await storage.drain().catch(() => undefined);
 					await client.end();
 				}
-				for (const name of [`${table}_parts`, table, leaseTable]) {
+				for (const name of [`${table}_parts`, `${table}_blobs`, table, leaseTable]) {
 					await admin.unsafe(`DROP TABLE IF EXISTS ${name}`);
 				}
 			} finally {

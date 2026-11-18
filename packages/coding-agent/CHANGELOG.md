@@ -2,14 +2,9 @@
 
 ## [Unreleased]
 
-### Fixed
-
-- A session resumed on another machine shows its snapcompact archive's frames again instead of `N archived image frames unavailable here`: each frame whose image blob is missing is drawn again from the archive text the session keeps and stored under the same reference, so the prompt cache prefix is unchanged. A frame that does not draw to the same bytes keeps the notice, and a warning names it.
-
-## [18.22.1] - 2026-11-17
-
 ### Breaking Changes
 
+- `SqlSessionStorage` with `createTable: false` (`OMP_SESSION_SQL_CREATE_TABLE=0`) refuses to start until `<table>_blobs` exists; docs/session.md gives its DDL for each dialect.
 - `SqlSessionStorage` with `createTable: false` refuses to start until the session table has a `byte_len` column and a `<table>_parts` table exists; docs/session.md gives the DDL, backfill, and rollback for each dialect. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - `SqlSessionStorage` refuses table names longer than 57 characters, leaving room for the `<table>_parts` table. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - An older Oh My Pi can no longer read a SQL session table this version has written until you run the rollback in docs/session.md. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
@@ -21,6 +16,7 @@
 
 ### Added
 
+- Under `session.storage: sql`, each image a session references and cannot draw again is also kept in the session database (`<table>_blobs`, once per SHA-256, behind the session's write fence), and a session opened where the local blob store lacks it gets it back from there, so a session resumed on another machine keeps its images. Each stored blob logs its bytes.
 - Sessions can now be stored in PostgreSQL, MySQL, or SQLite instead of JSONL files: set `session.storage: sql` and point `session.sql.dsnFile` at a file holding the connection string (or set `OMP_SESSION_STORAGE=sql` and `OMP_SESSION_SQL_DSN_FILE`); `--resume`, `--continue`, the session picker, and listing follow the same store, and joining a collab session needs file storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - Under `session.storage: sql`, a second live omp process that opens a session another one holds now moves to a new session id instead of writing the same journal. PostgreSQL, MySQL and MariaDB claim a session with a heartbeated row in `omp_session_leases` that every write checks in its own transaction; a SQLite file with an OS lock. An explicit resume (`--resume`, `--continue`, a picker pick, a session switch) of a held session waits up to 35 s for the holder's lease to expire, so a resume after its holder was killed keeps the id, and that wait holds behind a holder stalled inside a write; the automatic resume claims at open without waiting. One case on MySQL 8 only waits longer: a claim that inserts a new lease row while another store's write to a session it has not claimed is stalled inside its transaction (the write's gap lock also covers other sessions' new rows) waits for that write, at most the resume's 35 s plus the server's `innodb_lock_wait_timeout` (50 s by default), and then counts the session as held. MySQL bounds no `INSERT`'s lock wait without session state; it is safe, because the claim lands only after that write, so no two writers share a session. A heartbeat more than one expiry in the future counts as expired, and a released row whose delete the database gave up on expires instead of being refreshed. Subagent transcripts share their session's lease and follow it to the sibling it moves to. It works through a transaction-mode connection pooler such as PgBouncer: every transaction locks `search_path` itself, the lone heartbeat names only `pg_catalog` objects, and no connection-level setting is sent. `SqlSessionStorage` takes the new `claims`, `leaseTable` and `lease` options.
 - `OMP_SESSION_EXCLUSIVE=1` keeps a launcher's recorded session id: a session still held after the wait, a lease taken over or gone, or a file another writer changed or replaced ends the process non-zero, naming the reason, instead of moving to a new id; a `departed` entry is logged and the session opens as it is.
@@ -33,6 +29,7 @@
 
 ### Fixed
 
+- A session resumed on another machine shows its snapcompact archive's frames again instead of `N archived image frames unavailable here`: each frame whose image blob is missing is drawn again from the archive text the session keeps and stored under the same reference, so the prompt cache prefix is unchanged. A frame that does not draw to the same bytes keeps the notice, and a warning names it.
 - Fixed the debug menu's "Clear artifact cache" deleting whole project directories, session transcripts included; it now removes only tool output files older than 30 days and keeps transcripts, subagent outputs, `/btw` conversations and drafts. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - A failed `/tan` dispatch no longer leaves its clone's transcript behind or keeps the clone's ownership lease, under file and SQL session storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - Under `session.storage: sql`, `omp stats`, `/stats`, `/trace`, `omp session pack/unpack/moved/lease`, RPC `get_session_lease` and `gc.autoCompress` refuse with a message naming the setting instead of acting on an empty file tree, and the `/usage` heatmap says why it is empty while quotas still show. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))

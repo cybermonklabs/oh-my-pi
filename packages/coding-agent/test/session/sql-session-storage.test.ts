@@ -24,6 +24,7 @@ import { readStoredSession, readStoredSessions } from "../helpers/sql-session-st
 const SQLITE_SCHEMA = [
 	`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT, byte_len INTEGER)`,
 	`CREATE TABLE omp_session_files_parts (path TEXT NOT NULL, start_offset INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY (path, start_offset))`,
+	`CREATE TABLE omp_session_files_blobs (sha256 TEXT PRIMARY KEY, content BLOB NOT NULL, byte_len INTEGER NOT NULL, mime_type TEXT, created_ms INTEGER NOT NULL)`,
 ];
 
 async function createSqlite(): Promise<{ client: InstanceType<typeof SQL>; storage: SqlSessionStorage }> {
@@ -680,17 +681,18 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		const { client, queries } = capturingClient("postgres");
 		const storage = await SqlSessionStorage.create({ client });
 
-		// The stub has no tables, so start-up makes all three, with the lease table's index, in one statement batch.
+		// The stub has no tables, so start-up makes all four, with the lease table's index, in one statement batch.
 		const [made, ...more] = queries.filter(q => q.sql.includes("CREATE TABLE"));
 		expect(more).toHaveLength(0);
 		const tables = (made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(3);
+		expect(tables).toHaveLength(4);
 		expect(tables[0]).toContain("omp_session_files (path TEXT PRIMARY KEY");
 		expect(tables[0]).toContain("mtime_ms BIGINT");
 		expect(tables[0]).toContain("byte_len BIGINT");
 		expect(tables[1]).toContain("omp_session_files_parts (path TEXT NOT NULL, start_offset BIGINT NOT NULL");
 		expect(tables[1]).toContain("PRIMARY KEY (path, start_offset)");
-		expect(tables[2]).toContain("omp_session_leases (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL");
+		expect(tables[2]).toContain("omp_session_files_blobs (sha256 TEXT PRIMARY KEY, content BYTEA NOT NULL");
+		expect(tables[3]).toContain("omp_session_leases (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL");
 		// One transaction behind the start-up opening, which takes the start-up lock, looks again and makes them.
 		expect(inOneTransaction(queries.filter(query => query.transaction === made?.transaction))).toEqual([
 			...START_UP_OPENING,
@@ -774,7 +776,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 
 			const [made, ...more] = queries.filter(q => q.sql.includes("CREATE TABLE"));
 			expect(more).toHaveLength(0);
-			expect((made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"))).toHaveLength(3);
+			expect((made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"))).toHaveLength(4);
 			expect(inOneTransaction(queries.filter(query => query.transaction === made?.transaction))).toEqual([
 				...START_UP_OPENING,
 				expect.stringMatching(/^SELECT pg_catalog\.to_regclass\(\$1\) IS NOT NULL AS session, /),
@@ -810,15 +812,18 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		await writer.close();
 
 		const tables = queries.filter(q => q.sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(3);
+		expect(tables).toHaveLength(5);
 		for (const table of tables.slice(0, 2)) {
 			expect(table.sql).toContain("path VARCHAR(512) NOT NULL");
 			expect(table.sql).toContain("LONGTEXT");
 			expect(table.sql).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
 		}
 		expect(tables[1]?.sql).toContain("PRIMARY KEY (path, start_offset)");
-		expect(tables[2]?.sql).toContain("omp_session_leases (session_id VARCHAR(512) NOT NULL PRIMARY KEY");
-		expect(tables[2]?.sql).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
+		expect(tables[2]?.sql).toContain(
+			"omp_session_files_blobs (sha256 CHAR(64) NOT NULL PRIMARY KEY, content LONGBLOB",
+		);
+		expect(tables[3]?.sql).toContain("omp_session_leases (session_id VARCHAR(512) NOT NULL PRIMARY KEY");
+		expect(tables[3]?.sql).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
 
 		const loadIndex = queries.find(q => q.sql.startsWith("SELECT path"));
 		expect(loadIndex?.sql).toContain("byte_len");

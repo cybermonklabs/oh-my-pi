@@ -110,16 +110,22 @@ interface ExternalizedImage {
  */
 const externalizedImageRefs = new WeakMap<BlobStore, WeakMap<object, ExternalizedImage>>();
 
+/**
+ * Externalize one image payload, once per live payload object. `mirror`
+ * also hands it to the blob store's tier; a snapcompact frame never goes
+ * there, since its archive's text draws it again.
+ */
 function externalizeImagePayloadSync(
 	blobStore: BlobStore,
 	payload: object,
 	data: string,
 	mimeType: string | undefined,
+	mirror: boolean,
 ): string {
 	let refs = externalizedImageRefs.get(blobStore);
 	const cached = refs?.get(payload);
 	if (cached && cached.data === data && cached.mimeType === mimeType) return cached.ref;
-	const ref = externalizeImageDataSync(blobStore, data, mimeType);
+	const ref = externalizeImageDataSync(blobStore, data, mimeType, { mirror });
 	if (!refs) {
 		refs = new WeakMap();
 		externalizedImageRefs.set(blobStore, refs);
@@ -193,10 +199,11 @@ function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string
 		!isBlobRef(obj.result) &&
 		obj.result.length >= BLOB_EXTERNALIZE_THRESHOLD
 	) {
-		return { ...obj, result: externalizeImagePayloadSync(blobStore, obj, obj.result, undefined) };
+		return { ...obj, result: externalizeImagePayloadSync(blobStore, obj, obj.result, undefined, true) };
 	}
 	if (shouldExternalizeImagePayload(obj, key)) {
-		return { ...obj, data: externalizeImagePayloadSync(blobStore, obj, obj.data, obj.mimeType) };
+		const mirror = key !== SNAPCOMPACT_FRAMES_KEY;
+		return { ...obj, data: externalizeImagePayloadSync(blobStore, obj, obj.data, obj.mimeType, mirror) };
 	}
 	// Signed content is bound to its exact bytes: a truncated `thinking`/`text`/
 	// `arguments` no longer matches its signature and a truncated
@@ -251,7 +258,7 @@ function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string
 
 	if (typeof obj === "string") {
 		if (key === "image_url" && isImageDataUrl(obj)) {
-			return externalizeImageDataUrlSync(blobStore, obj);
+			return externalizeImageDataUrlSync(blobStore, obj, { mirror: true });
 		}
 		if (obj.length > MAX_PERSIST_CHARS) {
 			// Defensive: signature keys normally sit on blocks the guard above returns

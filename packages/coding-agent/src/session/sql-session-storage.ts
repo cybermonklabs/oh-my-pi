@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type FileLockHandle, logger, postmortem, toError } from "@oh-my-pi/pi-utils";
+import type { SessionBlobTier } from "./blob-store";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
@@ -79,8 +80,9 @@ export interface SqlSessionStorageOptions {
 	adapter?: SqlSessionStorageAdapter;
 	/**
 	 * Session table name. Default: `omp_session_files`; appended parts live in
-	 * `<table>_parts`. Must match `[A-Za-z_][A-Za-z0-9_]{0,56}`: at most 57
-	 * characters, so `<table>_parts` fits the 63-character identifier limit.
+	 * `<table>_parts`, and blobs a session cannot draw again in `<table>_blobs`.
+	 * Must match `[A-Za-z_][A-Za-z0-9_]{0,56}`: at most 57 characters, so
+	 * `<table>_parts` and `<table>_blobs` fit the 63-character identifier limit.
 	 * Both names are inlined into prepared statements, so we accept
 	 * identifier-safe inputs only (no quoted/dotted names).
 	 */
@@ -140,7 +142,7 @@ interface Statement {
 	readonly params: readonly string[];
 }
 
-type StatementValues = Readonly<Record<string, string | number | null>>;
+type StatementValues = Readonly<Record<string, string | number | Uint8Array | null>>;
 
 interface DialectQueries {
 	createTable: string;
@@ -194,6 +196,12 @@ interface DialectQueries {
 	readSlices: Statement;
 	/** The session's size and its bytes from an offset: the session row's and those of the parts covering the window. */
 	readFrom: Statement;
+	/** The blob table, `<table>_blobs`: one row per SHA-256 of a blob a session references and cannot draw again. */
+	createBlobsTable: string;
+	/** Add a blob row unless its hash has one; answers a row only when it added one (MySQL: `affectedRows`). */
+	insertBlob: Statement;
+	/** The rows of `count` hashes, bound as `@h0` to `@h<count - 1>`. */
+	selectBlobs(count: number): Statement;
 	/** The lease table's statements: PostgreSQL and MySQL only; a SQLite claim is an OS lock. */
 	lease: LeaseQueries | undefined;
 }
@@ -375,6 +383,12 @@ interface ReadFromRow {
 	bytes: Uint8Array | null;
 }
 
+/** `selectBlobs` row. */
+interface BlobRow {
+	sha256: string;
+	content: Uint8Array;
+}
+
 const DEFAULT_TABLE = "omp_session_files";
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,56}$/;
 const DEFAULT_LEASE_TABLE = "omp_session_leases";
@@ -497,6 +511,8 @@ const LEASE_WAIT_POLL_MS = 1000;
 const LAPSE_POLL_MS = 50;
 /** Largest part a full write stores; an append stores its line as one part. */
 const PART_BYTES = 1024 * 1024;
+/** Hashes one blob read asks for. */
+const BLOB_READ_BATCH = 100;
 const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
 /** How long a SQLite connection waits for another process's write lock, when the client sets no wait itself. */
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
@@ -682,7 +698,7 @@ const PG_HOLDER_INDEX_NAME = statement(
 		"LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid WHERE c.oid = pg_catalog.to_regclass(@index)",
 );
 /**
- * Whether each of the store's three PostgreSQL tables exists, by name, as
+ * Whether each of the store's PostgreSQL tables exists, by name, as
  * `CREATE TABLE IF NOT EXISTS` finds it (any relation of that name counts;
  * the table check refuses one that is not an ordinary table),
  * `default_transaction_read_only`'s `setting` and `reset_val`, as
@@ -694,6 +710,7 @@ const PG_TABLES_PRESENT = statement(
 	"postgres",
 	"SELECT pg_catalog.to_regclass(@session) IS NOT NULL AS session, " +
 		"pg_catalog.to_regclass(@parts) IS NOT NULL AS parts, pg_catalog.to_regclass(@lease) IS NOT NULL AS lease, " +
+		"pg_catalog.to_regclass(@blobs) IS NOT NULL AS blobs, " +
 		"s.setting AS read_only_setting, s.reset_val AS read_only_reset_val, " +
 		"pg_catalog.pg_is_in_recovery() AS in_recovery " +
 		"FROM pg_catalog.pg_settings s WHERE s.name = 'default_transaction_read_only'",
@@ -704,6 +721,7 @@ interface TablesPresentRow {
 	session: boolean | string;
 	parts: boolean | string;
 	lease: boolean | string;
+	blobs: boolean | string;
 	read_only_setting: string;
 	read_only_reset_val: string;
 	in_recovery: boolean | string;
@@ -823,7 +841,7 @@ const PG_TABLE_OBJECTS = statement(
 		"FROM pg_catalog.pg_constraint k WHERE k.confrelid = pg_catalog.to_regclass(@table) AND k.contype = 'f' " +
 		"AND k.conrelid <> k.confrelid",
 );
-/** The columns of the store's three PostgreSQL tables and their declared types, as `format_type` prints them. */
+/** The columns of the store's PostgreSQL tables and their declared types, as `format_type` prints them. */
 const PG_DECLARED_COLUMNS = {
 	session: {
 		path: "text",
@@ -835,6 +853,7 @@ const PG_DECLARED_COLUMNS = {
 		byte_len: "bigint",
 	},
 	parts: { path: "text", start_offset: "bigint", content: "text" },
+	blobs: { sha256: "text", content: "bytea", byte_len: "bigint", mime_type: "text", created_ms: "bigint" },
 	lease: {
 		session_id: "text",
 		holder: "text",
@@ -877,6 +896,7 @@ function buildQueries(
 		schema === undefined ? relationName : `${quoteIdentifier(schema)}.${relationName}`;
 	const table = relation(name);
 	const parts = relation(`${name}_parts`);
+	const blobs = relation(`${name}_blobs`);
 	const sql = (template: string): Statement => statement(adapter, template);
 	const mysql = adapter === "mysql";
 	const integer = adapter === "sqlite" ? "INTEGER" : "BIGINT";
@@ -1072,6 +1092,32 @@ function buildQueries(
 				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path ` +
 				`AND start_offset <= ${bigint("@offset")})`,
 		),
+		createBlobsTable: mysql
+			? `CREATE TABLE IF NOT EXISTS ${blobs} (` +
+				`sha256 CHAR(64) NOT NULL PRIMARY KEY, ` +
+				`content LONGBLOB NOT NULL, ` +
+				`byte_len BIGINT NOT NULL, ` +
+				`mime_type VARCHAR(127) NULL, ` +
+				`created_ms BIGINT NOT NULL` +
+				mysqlTable
+			: `CREATE TABLE IF NOT EXISTS ${blobs} (` +
+				`sha256 TEXT PRIMARY KEY, ` +
+				`content ${adapter === "sqlite" ? "BLOB" : "BYTEA"} NOT NULL, ` +
+				`byte_len ${integer} NOT NULL, ` +
+				`mime_type TEXT, ` +
+				`created_ms ${integer} NOT NULL` +
+				`)`,
+		insertBlob: sql(
+			`INSERT INTO ${blobs} (sha256, content, byte_len, mime_type, created_ms) ` +
+				`VALUES (@sha256, @content, @len, @mime, @created) ` +
+				(mysql ? "ON DUPLICATE KEY UPDATE sha256 = sha256" : "ON CONFLICT (sha256) DO NOTHING RETURNING sha256"),
+		),
+		selectBlobs: count =>
+			sql(
+				`SELECT sha256, content FROM ${blobs} WHERE sha256 IN (` +
+					Array.from({ length: count }, (_unused, index) => `@h${index}`).join(", ") +
+					")",
+			),
 		lease:
 			adapter === "sqlite"
 				? undefined
@@ -1283,6 +1329,7 @@ function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number
  */
 export class SqlSessionStorage extends IndexedSessionStorage {
 	readonly #backend: SqlSessionStorageBackend;
+	readonly #blobTier: SqlBlobTier;
 	/**
 	 * Set only when the store claims sessions (`claims` on a database other
 	 * processes can open): {@link SessionStorage.claimSession}. A claim on
@@ -1303,6 +1350,7 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	private constructor(backend: SqlSessionStorageBackend) {
 		super(backend);
 		this.#backend = backend;
+		this.#blobTier = new SqlBlobTier(backend);
 		if (!backend.claims) return;
 		// The last release of a claim waits for this store's queued writes under it.
 		const settle = (paths: readonly string[]) =>
@@ -1353,13 +1401,73 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 		return this.#backend.table;
 	}
 
-	/** {@link IndexedSessionStorage.drain}, then the claim releases in flight, so a closed session's lease is gone. */
+	/** {@link SessionStorage.blobTier}: the blob table, `<table>_blobs`. */
+	get blobTier(): SessionBlobTier {
+		return this.#blobTier;
+	}
+
+	/**
+	 * {@link IndexedSessionStorage.drain}, then the blob writes queued so far,
+	 * then the claim releases in flight, so a closed session's lease is gone.
+	 */
 	override async drain(): Promise<void> {
 		try {
 			await super.drain();
+			await this.#blobTier.settled();
 		} finally {
 			await this.#backend.releasesSettled();
 		}
+	}
+}
+
+/**
+ * {@link SessionBlobTier} over the blob table. Its writes run one after
+ * another, so a burst of images (a full rewrite of a session) holds one
+ * connection at a time, and a hash this store wrote, found there, or has
+ * queued is not sent again; a failed write forgets its hash, so the next
+ * persist of that image tries again. Nothing it does fails a session write.
+ */
+class SqlBlobTier implements SessionBlobTier {
+	readonly #backend: SqlSessionStorageBackend;
+	readonly #known = new Set<string>();
+	#tail: Promise<void> = Promise.resolve();
+
+	constructor(backend: SqlSessionStorageBackend) {
+		this.#backend = backend;
+	}
+
+	store(hash: string, data: Buffer, mimeType: string | undefined, sessionPath: string | undefined): void {
+		if (this.#known.has(hash)) return;
+		this.#known.add(hash);
+		this.#tail = this.#tail.then(async () => {
+			try {
+				if (await this.#backend.storeBlob(hash, data, mimeType, sessionPath)) {
+					logger.info("Stored a session blob in the session database", {
+						hash,
+						bytes: data.byteLength,
+						mimeType,
+						sessionPath,
+					});
+				}
+			} catch (err) {
+				this.#known.delete(hash);
+				logger.warn("Storing a session blob in the session database failed; it stays in the local blob store", {
+					hash,
+					bytes: data.byteLength,
+					sessionPath,
+					error: toError(err).message,
+				});
+			}
+		});
+	}
+
+	read(hashes: readonly string[]): Promise<Map<string, Buffer>> {
+		return this.#backend.readBlobs(hashes);
+	}
+
+	/** Resolves once every write queued so far has finished. */
+	settled(): Promise<void> {
+		return this.#tail;
 	}
 }
 
@@ -1582,9 +1690,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				await this.#checkLockSyntax();
 				return;
 			}
-			// The three tables first, in one step (see #createTables). The lease
-			// table is made here with the other two, by the same login, whether or
-			// not this store claims: never at a first claim.
+			// Every table first, in one step (see #createTables). The lease table
+			// is made here with the others, by the same login, whether or not this
+			// store claims: never at a first claim.
 			const lease = this.#q.lease;
 			const indexMade = await this.#createTables(look);
 			// Probe before altering: PostgreSQL's ALTER TABLE waits for every open
@@ -2318,10 +2426,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * Make whichever of the store's three tables are missing, and the lease
+	 * Make whichever of the store's tables are missing, and the lease
 	 * table's holder index with a lease table this start-up makes; returns
 	 * whether it made that index. On PostgreSQL one look at which tables exist
-	 * goes first, outside any lock: when all three do, nothing more runs, so a
+	 * goes first, outside any lock: when all of them do, nothing more runs, so a
 	 * store starting on made tables never queues on the database-wide start-up
 	 * lock (see {@link #setup}), where a busy database makes every turn slow.
 	 * Else one start-up transaction takes that lock, looks again under it
@@ -2339,17 +2447,19 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (this.#adapter !== "postgres") {
 			await this.#setup(this.#q.createTable);
 			await this.#setup(this.#q.createPartsTable);
+			await this.#setup(this.#q.createBlobsTable);
 			if (lease) await this.#setup(lease.createTable);
 			return false;
 		}
 		if (look?.read_only_setting === "on" && look.read_only_reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
-		if (pgTrue(look?.session) && pgTrue(look?.parts) && pgTrue(look?.lease)) return false;
+		if (pgTrue(look?.session) && pgTrue(look?.parts) && pgTrue(look?.lease) && pgTrue(look?.blobs)) return false;
 		let indexMade = false;
 		await this.#readWrite(async transaction => {
 			const [now] = (await run(transaction, PG_TABLES_PRESENT, this.#pgTableNames())) as TablesPresentRow[];
 			const missing: string[] = [];
 			if (!pgTrue(now?.session)) missing.push(this.#q.createTable);
 			if (!pgTrue(now?.parts)) missing.push(this.#q.createPartsTable);
+			if (!pgTrue(now?.blobs)) missing.push(this.#q.createBlobsTable);
 			if (lease && !pgTrue(now?.lease)) {
 				missing.push(lease.createTable);
 				if (lease.createIndex) {
@@ -2362,12 +2472,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return indexMade;
 	}
 
-	/** The names {@link PG_TABLES_PRESENT} looks up: the session, parts and lease tables (the session table without a lease table). */
+	/** The names {@link PG_TABLES_PRESENT} looks up: the session, parts, lease and blob tables (the session table without a lease table). */
 	#pgTableNames(): StatementValues {
 		return {
 			session: this.#relation(this.#table),
 			parts: this.#relation(`${this.#table}_parts`),
 			lease: this.#relation(this.#q.lease ? this.#leaseTable : this.#table),
+			blobs: this.#relation(`${this.#table}_blobs`),
 		};
 	}
 
@@ -2581,11 +2692,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/** Refuse to start against a schema an external migration has not brought up to date. */
 	async #assertSchema(): Promise<void> {
 		const partsTable = `${this.#table}_parts`;
+		const blobsTable = `${this.#table}_blobs`;
 		const missing: string[] = [];
 		const sessionColumns = await this.#columns(this.#table);
 		if (sessionColumns.size === 0) missing.push(`table ${this.#table}`);
 		else if (!sessionColumns.has("byte_len")) missing.push(`column ${this.#table}.byte_len`);
 		if ((await this.#columns(partsTable)).size === 0) missing.push(`table ${partsTable}`);
+		if ((await this.#columns(blobsTable)).size === 0) missing.push(`table ${blobsTable}`);
 		// Only a store that claims reads the lease table; one that does not, as before, needs none.
 		if (this.#gate === "row" && (await this.#columns(this.#leaseTable)).size === 0) {
 			missing.push(`table ${this.#leaseTable}`);
@@ -2683,6 +2796,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const tables: Array<[string, Record<string, string>]> = [
 			[this.#table, PG_DECLARED_COLUMNS.session],
 			[`${this.#table}_parts`, PG_DECLARED_COLUMNS.parts],
+			[`${this.#table}_blobs`, PG_DECLARED_COLUMNS.blobs],
 		];
 		if (this.#q.lease) tables.push([this.#leaseTable, PG_DECLARED_COLUMNS.lease]);
 		const problems: string[] = [];
@@ -2924,6 +3038,42 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 			for (const query of this.#q.append) await run(transaction, query, values);
 		});
+	}
+
+	/**
+	 * Add the blob row of `hash` unless the table has one, in a transaction of
+	 * its own behind the write fence of `sessionPath`, as a content write of
+	 * that session runs (a session path not yet known writes with no fence).
+	 * Answers whether this call added the row.
+	 */
+	async storeBlob(
+		hash: string,
+		data: Uint8Array,
+		mimeType: string | undefined,
+		sessionPath: string | undefined,
+	): Promise<boolean> {
+		const values = { sha256: hash, content: data, len: data.byteLength, mime: mimeType ?? null, created: Date.now() };
+		const fences = sessionPath === undefined ? [] : this.#fencesOf([sessionPath]);
+		await this.#awaitClaims(fences);
+		let added = false;
+		await this.#fencedTransaction(fences, async transaction => {
+			const result = await run(transaction, this.#q.insertBlob, values);
+			added = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
+		});
+		return added;
+	}
+
+	/** The blob rows the table holds for those of `hashes` it has, by hash. */
+	async readBlobs(hashes: readonly string[]): Promise<Map<string, Buffer>> {
+		const found = new Map<string, Buffer>();
+		for (let start = 0; start < hashes.length; start += BLOB_READ_BATCH) {
+			const batch = hashes.slice(start, start + BLOB_READ_BATCH);
+			const values = Object.fromEntries(batch.map((hash, index) => [`h${index}`, hash]));
+			const query = this.#q.selectBlobs(batch.length);
+			const rows = (await this.#exclusive(() => this.#readOne(query, values))) as BlobRow[];
+			for (const row of rows) found.set(row.sha256, Buffer.from(row.content));
+		}
+		return found;
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {
