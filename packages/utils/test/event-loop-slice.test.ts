@@ -156,6 +156,23 @@ describe("mapInSlices", () => {
 		expect(seen).toEqual([true, true]);
 	});
 
+	it("closes a slice that a pass finished inside, so the next pass after an idle wait runs a unit at once", async () => {
+		await mapInSlices([0], value => value);
+		await new Promise(resolve => setTimeout(resolve, EVENT_LOOP_SLICE_MS * 2));
+		expect(sliceExpired()).toBe(false);
+	});
+
+	it("ends a pass under fake timers with a clock that moves, though the timers that close slices never run", async () => {
+		vi.useFakeTimers();
+		let now = 1_000;
+		vi.spyOn(performance, "now").mockImplementation(() => now++);
+		const units = await mapInSlices(
+			Array.from({ length: 500 }, (_, index) => index),
+			value => value,
+		);
+		expect(units.length).toBe(500);
+	}, 3_000);
+
 	it("runs to completion under fake timers, whose frozen clock never ends a slice", async () => {
 		vi.useFakeTimers();
 		let spin = 0;
