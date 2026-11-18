@@ -527,11 +527,18 @@ background one while no delivery of its job's result (an `async-result` message,
 or a `wait` that returned the settled job) is there. When the parent's process
 ended inside a sync call, the call recorded no result, or one that settles
 nothing: the result of a run that exit cut off (`aborted`) or that was lost with
-its worker thread (`workerLost`). The `task` result that only started a
-background job does not count either, nor does a result written before the
-subagent's last turn began (its task prompt, or the message that woke it again):
-that result answered an earlier turn, and the parent waits on this one. A parent
-that holds the failed result acts on it itself.
+its worker thread (`workerLost`), followed at most by the record that ends the
+turn as the process goes away. That record is the interrupted-turn abort, which
+exit recovery writes and a dispose for the process exit leaves, or an abort
+without a reason (`Request was aborted`), which a dispose for a quit, `/restart`
+or a signal leaves. Any other assistant message after such a result (a reply, an
+error, the user's stop) is a turn the parent took after reading it, as when a
+worker crashed while the parent ran on: the result then settles the subagent.
+The `task` result that only started a background job settles nothing, nor does
+a result written before the subagent's last turn began (its task prompt, or the
+message that woke it again): that result answered an earlier turn, and the
+parent waits on this one. A parent that holds the failed result acts on it
+itself.
 
 An abort while such a turn waits to retry ends it or leaves it by who gets its
 result:

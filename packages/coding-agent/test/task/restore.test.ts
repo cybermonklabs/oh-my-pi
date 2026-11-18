@@ -16,7 +16,12 @@ import {
 	type AsyncResultDetails,
 	ASYNC_RESULT_MESSAGE_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
-import { SESSION_EXIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import {
+	createInterruptedTurnAbortMessage,
+	SESSION_EXIT_CUSTOM_TYPE,
+} from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import { GENERIC_ABORT_SENTINEL, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
@@ -229,6 +234,35 @@ const unsettledRunResults: Record<string, Partial<SingleResult>> = {
 		error: "Subagent worker w1 exited mid-run: worker pool disposed",
 		workerLost: true,
 	},
+};
+
+/** A sync spawn's result when its worker thread crashed while the parent ran on. */
+const crashedWorkerRun: Partial<SingleResult> = {
+	error: "Subagent worker w1 exited mid-run: worker crashed: out of memory",
+	workerLost: true,
+};
+
+/** The parent's next turns after its sync call's result: it lived on, read the result and went on. */
+const laterTurns: Record<string, () => AssistantMessage> = {
+	"the parent answered it": () =>
+		assistant({ content: [{ type: "text", text: "Unsettled did not finish; going on without it." }] }),
+	"the user stopped the parent's next request": () =>
+		assistant({ stopReason: "aborted", errorMessage: USER_INTERRUPT_LABEL }),
+};
+
+/**
+ * The records that end the parent's turn after its sync call's result when the parent's process goes away
+ * inside the call: exit recovery's, or the agent loop's record of an abort without a reason, which a dispose
+ * for a quit, `/restart` or a signal leaves.
+ */
+const exitTurnEnds: Record<string, (branch: SessionEntry[]) => AssistantMessage> = {
+	"the interrupted-turn record exit recovery writes": branch => {
+		const record = createInterruptedTurnAbortMessage(branch, undefined, { assumeExit: true });
+		if (!record) throw new Error("Expected exit recovery to close the parent's turn");
+		return record;
+	},
+	"the record of an abort without a reason that a quit or a signal leaves": () =>
+		assistant({ stopReason: "aborted", errorMessage: GENERIC_ABORT_SENTINEL }),
 };
 
 /** The records that hand a parent its background subagent `id`'s settled job result. */
@@ -616,22 +650,83 @@ describe("restoreSession (omp --restore)", () => {
 		expect(followUp).not.toHaveBeenCalled();
 	});
 
+	/**
+	 * Restores a parent whose sync call spawned "Unsettled", which was stranded without its key, and got the run's
+	 * failed result (with `run`'s fields) after the subagent's turn began: `record` writes that result and what
+	 * follows it in the parent's transcript.
+	 */
+	async function restoreAfterSyncResult(
+		run: Partial<SingleResult>,
+		record: (main: SessionManager, result: Message) => void,
+	) {
+		const start = Date.parse("2026-11-17T12:00:00.000Z");
+		setSystemTime(new Date(start));
+		const { main, mainFile, cwd } = openParent();
+		const [call, result] = parentTaskCall("Unsettled", "failed", run);
+		main.appendMessage(call!);
+		await writeSubagent(mainFile, cwd, "Unsettled", stranded, { normalExit: true });
+		setSystemTime(new Date(start + 60_000));
+		record(main, result!);
+		setSystemTime();
+		return restoreParent(main, mainFile);
+	}
+
 	for (const [record, run] of Object.entries(unsettledRunResults)) {
 		it(`relaunches a subagent stranded without its key whose parent's sync call recorded ${record}`, async () => {
 			// If this regresses, the result the parent's agent loop records as its process goes away inside the call
 			// reads as the subagent's failure, which the parent never acted on: `--restore` loses the subagent's turn.
-			const start = Date.parse("2026-11-17T12:00:00.000Z");
-			setSystemTime(new Date(start));
-			const { main, mainFile, cwd } = openParent();
-			const [call, result] = parentTaskCall("Unsettled", "failed", run);
-			main.appendMessage(call!);
-			await writeSubagent(mainFile, cwd, "Unsettled", stranded, { normalExit: true });
 			// The call's result is written as the parent's process goes away, after the subagent's turn began.
-			setSystemTime(new Date(start + 60_000));
-			main.appendMessage(result!);
-			setSystemTime();
+			const { outcome, followUp } = await restoreAfterSyncResult(run, (main, result) => main.appendMessage(result));
 
-			const { outcome, followUp } = await restoreParent(main, mainFile);
+			expect(outcome).toEqual({ turn: false, subagents: ["Unsettled"] });
+			expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "Unsettled", restore: true });
+		});
+	}
+
+	for (const [turn, laterTurn] of Object.entries(laterTurns)) {
+		it(`does not relaunch a subagent stranded without its key whose worker crashed while its parent lived on, after which ${turn}`, async () => {
+			// If this regresses, a lost worker's result reads as unsettled after the parent read it and went on:
+			// `--restore` relaunches the subagent, and the parent receives a second result for a call it acted on.
+			const { outcome, followUp } = await restoreAfterSyncResult(crashedWorkerRun, (main, result) => {
+				main.appendMessage(result);
+				main.appendMessage(laterTurn());
+			});
+
+			expect(outcome).toEqual({ turn: false, subagents: [] });
+			expect(followUp).not.toHaveBeenCalled();
+		});
+	}
+
+	it("does not relaunch a subagent stranded without its key whose aborted run's result its parent answered", async () => {
+		// If this regresses, an aborted run's result reads as unsettled after the parent read it and went on:
+		// `--restore` relaunches the subagent, and the parent receives a second result for a call it acted on.
+		const { outcome, followUp } = await restoreAfterSyncResult({ aborted: true }, (main, result) => {
+			main.appendMessage(result);
+			main.appendMessage(laterTurns["the parent answered it"]!());
+		});
+
+		expect(outcome).toEqual({ turn: false, subagents: [] });
+		expect(followUp).not.toHaveBeenCalled();
+	});
+
+	for (const [end, endTurn] of Object.entries(exitTurnEnds)) {
+		it(`relaunches a subagent stranded without its key whose worker its parent's exit lost, the call's result followed only by ${end}`, async () => {
+			// If this regresses, the record that ends the parent's turn as its process goes away reads as a turn the
+			// parent took after the result: `--restore` loses the turn of a subagent its parent still waits on.
+			const { outcome, followUp } = await restoreAfterSyncResult(
+				unsettledRunResults["the run lost with its worker thread"]!,
+				(main, result) => {
+					// As the parent's process goes away, its dispose records the exit first; the call's result and the
+					// record that ends the turn follow.
+					main.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+						reason: "sigterm",
+						kind: "signal",
+						recordedAt: new Date().toISOString(),
+					});
+					main.appendMessage(result);
+					main.appendMessage(endTurn(main.getBranch()));
+				},
+			);
 
 			expect(outcome).toEqual({ turn: false, subagents: ["Unsettled"] });
 			expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "Unsettled", restore: true });

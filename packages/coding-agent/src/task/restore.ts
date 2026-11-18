@@ -27,7 +27,12 @@ import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
-import { endsOnCredentialUnavailableTurn, hasRestorableTurn } from "../session/exit-diagnostics";
+import {
+	endsOnCredentialUnavailableTurn,
+	hasRestorableTurn,
+	isInterruptedTurnAbort,
+} from "../session/exit-diagnostics";
+import { GENERIC_ABORT_SENTINEL } from "../session/messages";
 import { activeBranch, type SessionEntry } from "../session/session-entries";
 import { extractSessionInit, type SessionManager } from "../session/session-manager";
 import { collectSubSessions, type SubSession } from "../session/sub-sessions";
@@ -168,12 +173,14 @@ function taskResultAgentIds(entry: SessionEntry): string[] {
  * results that settle their runs (a sync spawn's; a background spawn's "started" result
  * names it only in its progress), and the settled jobs a background job's delivery
  * (`async-result`) or a `wait` returned. A run its abort ended (`aborted`) or that was lost
- * with its worker thread (`workerLost`) is not settled: when the parent's process goes away
- * inside the call, the agent loop still records such a result, and the subagent's turn
- * stays as its transcript left it (a stop of the run left an aborted record there, which
- * `--restore` leaves anyway).
+ * with its worker thread (`workerLost`) settles only when the parent took a turn after the
+ * result (`wentOn`, {@link parentWentOn}), since it then read it, as after a worker crashed
+ * while the parent ran on. When the parent's process goes away inside the call, the agent
+ * loop still records such a result, but the parent takes no turn after it, and the
+ * subagent's turn stays as its transcript left it (a stop of the run left an aborted record
+ * there, which `--restore` leaves anyway).
  */
-function heldResultAgentIds(entry: SessionEntry): string[] {
+function heldResultAgentIds(entry: SessionEntry, wentOn: boolean): string[] {
 	if (entry.type === "custom_message") {
 		return entry.customType === ASYNC_RESULT_MESSAGE_TYPE ? settledJobAgentIds(entry.details) : [];
 	}
@@ -181,9 +188,29 @@ function heldResultAgentIds(entry: SessionEntry): string[] {
 	const { toolName, details } = entry.message;
 	if (toolName === "task") {
 		if (!isTaskToolDetails(details)) return [];
-		return details.results.filter(result => !result.aborted && !result.workerLost).map(result => result.id);
+		return details.results
+			.filter(result => wentOn || (!result.aborted && !result.workerLost))
+			.map(result => result.id);
 	}
 	return toolName === "wait" ? settledJobAgentIds(details) : [];
+}
+
+/**
+ * Whether a parent's transcript entry is a turn it took, so it read the results before it
+ * on its branch: an assistant message, other than the record that ends a turn when its
+ * process goes away. That is the interrupted-turn abort ({@link isInterruptedTurnAbort}),
+ * which exit recovery writes and a dispose for the process exit leaves, or the abort
+ * without a reason ({@link GENERIC_ABORT_SENTINEL}) that a dispose for anything else leaves
+ * (a quit, `/restart`, a signal). A stop the session makes itself (`/new`, the task
+ * executor ending a parent subagent's run) leaves that record too, but it stops the turn's
+ * sync subagents with it, and `--restore` leaves their turns anyway. The user's stop gives
+ * its own reason: the parent lived on and chose to stop there.
+ */
+function parentWentOn(entry: SessionEntry): boolean {
+	if (entry.type !== "message" || entry.message.role !== "assistant") return false;
+	const { message } = entry;
+	const reasonlessAbort = message.stopReason === "aborted" && message.errorMessage === GENERIC_ABORT_SENTINEL;
+	return !isInterruptedTurnAbort(message) && !reasonlessAbort;
 }
 
 /**
@@ -228,6 +255,8 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 	const current = new Set<string>();
 	const held = new Map<string, number>();
 	let clearedAt: number | undefined;
+	// Whether the parent took a turn after the entry being read ({@link parentWentOn}).
+	let wentOn = false;
 	const branch = activeBranch(entries, leafId);
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index]!;
@@ -237,7 +266,8 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 		}
 		for (const id of taskResultAgentIds(entry)) current.add(id);
 		// Read from the leaf back: the first result naming a subagent is its latest.
-		for (const id of heldResultAgentIds(entry)) if (!held.has(id)) held.set(id, Date.parse(entry.timestamp));
+		for (const id of heldResultAgentIds(entry, wentOn)) if (!held.has(id)) held.set(id, Date.parse(entry.timestamp));
+		if (parentWentOn(entry)) wentOn = true;
 	}
 	return { current, named, held, clearedAt };
 }
@@ -298,10 +328,10 @@ class SpawnRecords {
 	 * (epoch ms): its current conversation holds no result that settles `sub`'s run
 	 * ({@link heldResultAgentIds}) written since. A sync spawn's parent whose process ended
 	 * inside the call has none: the call got no result, or the agent loop recorded the
-	 * result of the run that exit cut off, or of one lost with its worker thread. Nor has
-	 * the parent of a background spawn whose job result was never delivered. A result
-	 * written before the turn began answered an earlier turn, one the parent then messaged
-	 * `sub` to go on from.
+	 * result of the run that exit cut off, or of one lost with its worker thread, and the
+	 * parent took no turn after it. Nor has the parent of a background spawn whose job
+	 * result was never delivered. A result written before the turn began answered an
+	 * earlier turn, one the parent then messaged `sub` to go on from.
 	 */
 	awaitedByParent(sub: SubSession, turnStartedAt: number | undefined): boolean {
 		const heldAt = this.#ofParent(sub.parent)?.held.get(sub.agentId);
