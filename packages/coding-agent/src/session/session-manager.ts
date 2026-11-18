@@ -136,6 +136,7 @@ import {
 	transcriptByteChunks,
 	visitEntriesFromChunksSync,
 	visitEntriesFromFile,
+	type VisitEntriesFromFileStreamOptions,
 	visitEntriesFromFileStream,
 	visitLoadedSession,
 	visitSessionFile,
@@ -160,6 +161,7 @@ import {
 	SESSION_HEADER_PREFIX_BYTES,
 	type SessionClaimHolder,
 	SessionLeaseLostError,
+	SessionReadConflictError,
 	type SessionStorage,
 	type SessionStorageWriter,
 	SessionWriteConflictError,
@@ -2158,7 +2160,9 @@ export class SessionManager {
 
 	/**
 	 * A visitor of the stored transcript, entry by entry, that finds the entries
-	 * it holds that this manager does not; `found()` is `undefined` when the
+	 * it holds that this manager does not, with the visit's `options`, which
+	 * count its malformed records and the bytes it read (`bytes()`: the stored
+	 * size once it read the whole transcript). `found()` is `undefined` when the
 	 * transcript is not this session's journal (its first entry is not this
 	 * session's header), and the visit stops there. `at` is where they go in
 	 * `#entries` to keep the file's order: after the last entry both hold, so
@@ -2166,15 +2170,18 @@ export class SessionManager {
 	 * `extendsFrontier` reports that the file is this manager's first
 	 * `shared` entries, at least the durable frontier's, followed only by
 	 * them: another writer (a clone's original healing a missed entry) may
-	 * have appended this manager's own next entries before them.
+	 * have appended this manager's own next entries before them. One scan
+	 * serves one read: a read again starts a new scan.
 	 */
 	#foreignEntryScan(): {
 		visit: (entry: FileEntry) => boolean;
-		onMalformedRecord: () => void;
+		options: Pick<VisitEntriesFromFileStreamOptions, "onMalformedRecord" | "onChunk">;
+		bytes: () => number;
 		found: () => ForeignEntries | undefined;
 	} {
 		let ownJournal: boolean | undefined;
 		let malformedRecords = 0;
+		let bytes = 0;
 		let sharedInOrder = true;
 		const foreign: SessionEntry[] = [];
 		const shared = new Set<string>();
@@ -2200,9 +2207,15 @@ export class SessionManager {
 				}
 				return true;
 			},
-			onMalformedRecord: () => {
-				malformedRecords++;
+			options: {
+				onMalformedRecord: () => {
+					malformedRecords++;
+				},
+				onChunk: chunk => {
+					bytes += chunk.byteLength;
+				},
 			},
+			bytes: () => bytes,
 			found: () => {
 				if (!ownJournal) return undefined;
 				const durable = this.#durable;
@@ -2345,8 +2358,10 @@ export class SessionManager {
 	 * an external tool) appending to the file this process owns. Overwriting
 	 * would erase those entries and retrying blindly can never succeed, so read
 	 * the file back, keep its new entries, and retry against the size just read.
-	 * The file is read in bounded windows and parsed as they arrive, so the
-	 * transcript is never held whole. A deleted file is recreated; a file that
+	 * File storage, and a storage with `readTextRangeSync`, read the file in
+	 * bounded windows parsed as they arrive, so the transcript is not held
+	 * whole; a storage with only `readTextSync` gives its whole text at once
+	 * (see `transcriptByteChunksSync`). A deleted file is recreated; a file that
 	 * no longer reads as this session is left untouched and the session moves
 	 * to a sibling.
 	 *
@@ -2363,14 +2378,8 @@ export class SessionManager {
 		const chunks = transcriptByteChunksSync(contested, this.#storage);
 		if (!chunks) return undefined;
 		const scan = this.#foreignEntryScan();
-		let diskSize = 0;
 		try {
-			visitEntriesFromChunksSync(chunks, scan.visit, {
-				onMalformedRecord: scan.onMalformedRecord,
-				onChunk: chunk => {
-					diskSize += chunk.byteLength;
-				},
-			});
+			visitEntriesFromChunksSync(chunks, scan.visit, scan.options);
 		} catch (readError) {
 			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
 			this.#expectedDiskSize = null;
@@ -2380,7 +2389,7 @@ export class SessionManager {
 		const found = scan.found();
 		if (!found) return this.#moveOffSessionFile("replaced");
 		resolveBlobRefsInEntriesSync(found.foreign, this.#blobs);
-		this.#adoptForeignEntries(found, diskSize);
+		this.#adoptForeignEntries(found, scan.bytes());
 		return contested;
 	}
 
@@ -2393,6 +2402,15 @@ export class SessionManager {
 	 * the retry is checked against, are the store's, never a write of this
 	 * manager still in flight; a conflict on a file this manager already moved
 	 * off retries at the sibling it went on in.
+	 *
+	 * A read that another writer's full write or delete cut off
+	 * (`SessionReadConflictError`: SQL storage's chunked read) is read again
+	 * from the start, at most {@link MAX_WRITE_CONFLICT_RECOVERIES} reads in
+	 * all; past that the other writer is still rewriting the file, and the
+	 * session moves to a sibling as `contested`. The file still holds this
+	 * session, so it is never taken for a `replaced` one, and the publish is
+	 * never retried without a whole read: its size check could pass against
+	 * the other writer's body of the same size and overwrite it.
 	 */
 	async #recoverFromWriteConflict(error: unknown, recoveries: number, queued = false): Promise<string | undefined> {
 		if (
@@ -2414,24 +2432,28 @@ export class SessionManager {
 			if (this.#sessionFile !== contested) return this.#sessionFile;
 		}
 		const epoch = this.#diskEpoch;
-		const scan = this.#foreignEntryScan();
-		let diskSize = 0;
-		try {
-			await visitEntriesFromFileStream(contested, scan.visit, {
-				storage: this.#storage,
-				throwIfMissing: true,
-				onMalformedRecord: scan.onMalformedRecord,
-				onChunk: chunk => {
-					diskSize += chunk.byteLength;
-				},
-			});
-		} catch (readError) {
-			// A synchronous rewrite during the read already recovered; retry against its result.
-			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
-			this.#expectedDiskSize = null;
-			this.#durable = undefined;
-			return contested;
+		let scan = this.#foreignEntryScan();
+		for (let reads = 1; ; reads++) {
+			try {
+				await visitEntriesFromFileStream(contested, scan.visit, {
+					...scan.options,
+					storage: this.#storage,
+					throwIfMissing: true,
+				});
+				break;
+			} catch (readError) {
+				// A synchronous rewrite during the read already recovered; retry against its result.
+				if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
+				if (readError instanceof SessionReadConflictError) {
+					if (reads >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
+					scan = this.#foreignEntryScan();
+					continue;
+				}
+				if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
+				this.#expectedDiskSize = null;
+				this.#durable = undefined;
+				return contested;
+			}
 		}
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 		const found = scan.found();
@@ -2439,7 +2461,7 @@ export class SessionManager {
 		await resolveBlobRefsInEntries(found.foreign, this.#blobs);
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 		// An append during the await may have moved the frontier past what was read; the retry republishes.
-		this.#adoptForeignEntries({ ...found, extendsFrontier: false }, diskSize);
+		this.#adoptForeignEntries({ ...found, extendsFrontier: false }, scan.bytes());
 		return contested;
 	}
 
@@ -4111,10 +4133,8 @@ export class SessionManager {
 
 	async #setSessionFile(
 		sessionFile: string,
-		options?: {
-			throwIfMissing?: boolean;
+		options?: Pick<TranscriptLoadOptions, "throwIfMissing" | "preloaded"> & {
 			newSession?: NewSessionOptions;
-			preloaded?: SessionLoadResult;
 			keepClaim?: boolean;
 			/** The lease {@link setSessionFile} took before it loaded the file: adopted with the id, in one step. */
 			claimed?: { sessionId: string; release: (() => void) | null; holder: SessionClaimHolder | undefined };
@@ -5290,22 +5310,35 @@ export class SessionManager {
 	 * publish is unconfirmed fails the store's size check. That publish's
 	 * confirmation rewrites the transcript, the refused entries included, so
 	 * the wait covers it before {@link flush} reports what is left.
+	 *
+	 * A write the lease fence refused latches no failure: the loss moves the
+	 * session to a sibling, whose publish carries the refused entries. Under
+	 * `OMP_SESSION_EXCLUSIVE=1` the loss stops the session instead, and writes
+	 * them nowhere. So the promise also rejects when the session stopped, or
+	 * when storage still lacks an entry once the flush has settled.
 	 */
 	flushSyncThenConfirm(): Promise<void> | undefined {
 		if (!this.#storage.defersSyncPublish) {
 			this.flushSync();
 			return undefined;
 		}
+		let flushed: Promise<void>;
 		try {
 			this.flushSync();
+			flushed = this.flush();
 		} catch (error) {
 			if (!(error instanceof SessionWriteConflictError)) throw error;
-			return this.#storage
+			flushed = this.#storage
 				.drain()
 				.catch(() => undefined)
 				.then(() => this.flush());
 		}
-		return this.flush();
+		return flushed.then(() => {
+			if (this.#exclusiveStopping) {
+				throw new Error("The session stopped under OMP_SESSION_EXCLUSIVE=1 before storage held its last entries.");
+			}
+			if (this.#hasUnsavedEntries()) throw new Error("Storage does not hold every entry of the session.");
+		});
 	}
 
 	/**

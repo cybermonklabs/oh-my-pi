@@ -5,7 +5,9 @@
  * the stored transcript (windows of at most 1 MiB on the synchronous path), so
  * these sessions span several windows, with a multibyte character across the
  * first window's edge, and must adopt exactly the entries a parse of the whole
- * file finds.
+ * file finds. A read-back that another writer's full write cut off mid-read
+ * (`SessionReadConflictError`, which SQL storage's chunked read raises) reads
+ * the file again instead of taking it for another session's.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
@@ -15,6 +17,7 @@ import { SessionManager, type SessionPersistenceNotice } from "@oh-my-pi/pi-codi
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
+	SessionReadConflictError,
 	type SessionStorage,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
@@ -149,5 +152,90 @@ describe("conflict recovery of a session file another writer appended to", () =>
 			// The first window ended inside a wide character, which the next window read whole.
 			expect(ranges[0]!.text.endsWith("\uFFFD")).toBe(true);
 		}
+	});
+});
+
+/**
+ * `storage` with its chunked reads counted, the next `conflicts` of them each
+ * failing after their first chunk as a read does on SQL storage when another
+ * writer's full write replaced the file mid-read.
+ */
+function cutOffReads(storage: FileSessionStorage, conflicts: number): { reads: () => number } {
+	const readChunks = storage.readChunks.bind(storage);
+	let reads = 0;
+	let left = conflicts;
+	storage.readChunks = async function* (filePath: string, fromByte?: number) {
+		reads++;
+		for await (const chunk of readChunks(filePath, fromByte)) {
+			yield chunk;
+			if (left > 0) {
+				left--;
+				throw new SessionReadConflictError(filePath);
+			}
+		}
+	};
+	return { reads: () => reads };
+}
+
+describe("conflict recovery whose read-back another writer's full write cut off", () => {
+	/** A session another writer appended a turn to, opened before it did; and that writer's file. */
+	async function contestedSession(
+		dir: TempDir,
+	): Promise<{ file: string; ours: SessionManager; storage: FileSessionStorage; written: string }> {
+		const file = path.join(dir.path(), "session.jsonl");
+		await Bun.write(file, transcriptAcrossWindows(path.basename(dir.path()), dir.path()));
+		const storage = new FileSessionStorage();
+		const ours = await open(file, storage);
+		const theirs = await open(file, new FileSessionStorage());
+		theirs.appendMessage(userTurn("their turn"));
+		await theirs.close();
+		return { file, ours, storage, written: await new FileSessionStorage().readText(file) };
+	}
+
+	it("reads the file again and keeps the session's id and file, taking in the other writer's turn", async () => {
+		using dir = TempDir.createSync("@omp-conflict-reread-");
+		const { file, ours, storage } = await contestedSession(dir);
+		const id = ours.getSessionId();
+		const notices: SessionPersistenceNotice[] = [];
+		const errors: Error[] = [];
+		ours.onPersistenceNotice(notice => notices.push(notice));
+		ours.onPersistenceError(error => errors.push(error));
+		const { reads } = cutOffReads(storage, 1);
+
+		await ours.rewriteEntries();
+		await ours.flush();
+
+		expect({
+			sessionId: ours.getSessionId(),
+			sessionFile: ours.getSessionFile(),
+			notices,
+			errors,
+			reads: reads(),
+			theirTurn: ours
+				.getEntries()
+				.some(
+					entry =>
+						entry.type === "message" && entry.message.role === "user" && entry.message.content === "their turn",
+				),
+		}).toEqual({ sessionId: id, sessionFile: file, notices: [], errors: [], reads: 2, theirTurn: true });
+		await ours.close();
+	});
+
+	it("moves to a sibling as contested after three cut-off reads, leaving the file as the other writer wrote it", async () => {
+		using dir = TempDir.createSync("@omp-conflict-reread-");
+		const { file, ours, storage, written } = await contestedSession(dir);
+		const notices: SessionPersistenceNotice[] = [];
+		ours.onPersistenceNotice(notice => notices.push(notice));
+		const { reads } = cutOffReads(storage, Number.POSITIVE_INFINITY);
+
+		await ours.rewriteEntries();
+		await ours.flush();
+
+		expect({
+			reasons: notices.map(notice => notice.reason),
+			reads: reads(),
+			unchanged: (await new FileSessionStorage().readText(file)) === written,
+		}).toEqual({ reasons: ["contested"], reads: 3, unchanged: true });
+		await ours.close();
 	});
 });

@@ -3,11 +3,20 @@
  * when it opens it, keeps writing through a stall of the database it cannot
  * confirm its claim through, and moves to a sibling at once when another
  * holder took the session over — unless the launcher named the session, which
- * then stops instead of writing a sibling. SQLite always; PostgreSQL and MySQL
- * when `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
+ * then stops instead of writing a sibling. The exit record a session writes
+ * as it ends is logged as recorded only where the store holds it. SQLite
+ * always; PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` /
+ * `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as path from "node:path";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SESSION_EXIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager, type SessionPersistenceNotice } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	defaultSessionStorage,
@@ -15,7 +24,8 @@ import {
 	setDefaultSessionStorage,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { createAssistantMessage } from "../helpers/agent-session-setup";
+import { logger, postmortem } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import {
 	type GatedClient,
 	gatedClient,
@@ -579,5 +589,104 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			});
 			release?.();
 		});
+	});
+}
+
+/** What the exit recorder logs about its record: that it was recorded, or that it failed. */
+const EXIT_RECORD_LOGS: Record<string, true> = { "Session exit recorded": true, "Failed to record session exit": true };
+
+/** Spy on the logger and return what it logged of {@link EXIT_RECORD_LOGS}. */
+function exitRecordLogs(): () => string[] {
+	const spies = [spyOn(logger, "debug"), spyOn(logger, "warn"), spyOn(logger, "error")];
+	return () =>
+		spies
+			.flatMap(spy => spy.mock.calls.map(call => call[0]))
+			.filter(message => Object.hasOwn(EXIT_RECORD_LOGS, message));
+}
+
+/** An agent session on `manager`: it registers the exit recorder, which a cleanup pass (a signal's) runs. */
+function agentSessionOn(manager: SessionManager): AgentSession {
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected built-in anthropic model to exist");
+	return new AgentSession({
+		agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] }, convertToLlm }),
+		sessionManager: manager,
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry: new ModelRegistry(createInMemoryAuthStorage()),
+	});
+}
+
+for (const { adapter, url } of ROW_LEASE_BACKENDS) {
+	describe.skipIf(!url)(`the exit record of a session another holder took over (${adapter})`, () => {
+		const exclusive = process.env.OMP_SESSION_EXCLUSIVE;
+
+		afterEach(() => {
+			if (exclusive === undefined) delete process.env.OMP_SESSION_EXCLUSIVE;
+			else process.env.OMP_SESSION_EXCLUSIVE = exclusive;
+			vi.restoreAllMocks();
+		});
+
+		/**
+		 * A resumed session with a reply, wrapped in an agent session, whose
+		 * lease another store then takes over: the fence refuses its next write.
+		 */
+		async function takenOver(db: LeaseDb): Promise<{ session: AgentSession; file: string; release?: () => void }> {
+			const storage = await db.open({ lease: STILL });
+			const file = sessionFile(db);
+			await storage.writeText(file, transcript(ID, "before"));
+			const { manager } = await resume(storage, file);
+			// The recorder writes a record only for a session that holds a reply.
+			manager.appendMessage(createAssistantMessage("done"));
+			const session = agentSessionOn(manager);
+			await manager.flush();
+			await db.ageLease(ID, STILL.expiryMs + 60_000);
+			const release = await (await db.open({ lease: STILL })).acquireSessionClaim?.(ID, file);
+			expect(release).toBeFunction();
+			return { session, file, release: release ?? undefined };
+		}
+
+		it("with OMP_SESSION_EXCLUSIVE=1, logs the record as failed when the fence refused it and the session stopped", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const { session, file, release } = await takenOver(db);
+			const exits: unknown[] = [];
+			// The stop ends the process; here it only records that it would.
+			spyOn(process, "exit").mockImplementation(code => {
+				exits.push(code);
+				return undefined as never;
+			});
+			const logs = exitRecordLogs();
+			process.env.OMP_SESSION_EXCLUSIVE = "1";
+
+			// The pass a signal runs before the process ends: it runs the exit recorder.
+			await postmortem.cleanup();
+			await until(() => exits.length > 0);
+
+			expect({
+				logs: logs(),
+				exits,
+				inFile: ((await db.row(file))?.content ?? "").includes(SESSION_EXIT_CUSTOM_TYPE),
+				paths: await db.paths(),
+			}).toEqual({ logs: ["Failed to record session exit"], exits: [1], inFile: false, paths: [file] });
+			await session.dispose();
+			release?.();
+		}, 30_000);
+
+		it("without OMP_SESSION_EXCLUSIVE, logs the record as recorded once the sibling the session moved to holds it", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const { session, file, release } = await takenOver(db);
+			const logs = exitRecordLogs();
+			delete process.env.OMP_SESSION_EXCLUSIVE;
+
+			await postmortem.cleanup();
+
+			const siblings = (await db.paths()).filter(stored => stored !== file);
+			expect({
+				logs: logs(),
+				siblings: siblings.length,
+				inSibling: ((await db.row(siblings[0] ?? ""))?.content ?? "").includes(SESSION_EXIT_CUSTOM_TYPE),
+			}).toEqual({ logs: ["Session exit recorded"], siblings: 1, inSibling: true });
+			await session.dispose();
+			release?.();
+		}, 30_000);
 	});
 }
