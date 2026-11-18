@@ -4,7 +4,7 @@ use std::{
 	fs, io,
 	os::{
 		fd::OwnedFd,
-		unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+		unix::fs::{MetadataExt, OpenOptionsExt},
 	},
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
@@ -142,7 +142,10 @@ impl Node {
 	/// reaches it through `/proc/self/fd/N`.
 	#[cfg(target_os = "linux")]
 	fn pinned_at(path: &Path, nofollow: bool) -> Option<Self> {
-		use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
+		use std::os::{
+			fd::FromRawFd,
+			unix::{ffi::OsStrExt, fs::FileTypeExt},
+		};
 		let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
 		let flags = libc::O_PATH | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
 		// SAFETY: `c_path` is a NUL-terminated string that outlives the call.
@@ -523,14 +526,15 @@ mod tests {
 	}
 
 	/// On Linux the drop reaches the node the open started on, though its
-	/// path now names another FIFO.
+	/// path now names another FIFO. The old FIFO is moved aside, not
+	/// removed, so the new one cannot reuse its inode number and pass for it.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_drop_releases_a_helper_whose_path_now_names_another_fifo() {
 		let (_dir, path) = new_fifo();
 		let opened = opening(&path, read_end);
 		let shared = Arc::clone(&opened.shared);
-		fs::remove_file(&path).unwrap();
+		fs::rename(&path, path.with_extension("old")).unwrap();
 		make_fifo(&path);
 		drop(opened);
 		assert_eq!(Arc::strong_count(&shared), 1, "the helper outlived the drop");
