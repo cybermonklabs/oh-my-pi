@@ -52,8 +52,6 @@ interface RetainFailure {
 interface RecallOutcome {
 	context: string | null;
 	ok: boolean;
-	/** Cause of a failure whose generation is current, as its notice shows it. */
-	failure?: string;
 }
 /**
  * What a subagent alias reads from its parent state: the routing it copies, the snippets
@@ -395,9 +393,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 
 	/**
 	 * The automatic recall, of the first turn and of compaction. It records the outcome in
-	 * {@link recallWait}: an answer ends the pause, and a failure of the current generation
-	 * starts or lengthens it. An aborted recall and a stale failure record nothing. The
-	 * `recall` tool calls the client directly and does not use it.
+	 * {@link recallWait}: an answer ends the pause. A failure of the current generation starts
+	 * a pause, or a doubled one when an earlier pause has ended; a failure while a pause runs
+	 * changes nothing. An aborted recall and a stale failure record nothing. The `recall` tool
+	 * calls the client directly and does not use it.
 	 */
 	async recallForContext(query: string, signal?: AbortSignal): Promise<RecallOutcome> {
 		const generation = this.#recallGeneration;
@@ -426,9 +425,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			const retryAt = failure !== undefined ? this.recallWait.record({ ok: false, failure }) : undefined;
 			const retryAfter = retryAt !== undefined ? new Date(retryAt).toISOString() : undefined;
 			logger.warn("Hindsight: recall failed", { bankId: this.bankId, error: errorText, retryAfter });
-			if (failure === undefined) return { context: null, ok: false };
-			this.session.emitNotice("warning", `Memory recall failed: ${failure}`, HINDSIGHT_NOTICE_SOURCE);
-			return { context: null, ok: false, failure };
+			if (failure !== undefined) {
+				this.session.emitNotice("warning", `Memory recall failed: ${failure}`, HINDSIGHT_NOTICE_SOURCE);
+			}
+			return { context: null, ok: false };
 		}
 		// Outside the `try`, so nothing the record does reads as a failed recall.
 		this.recallWait.record({ ok: true });

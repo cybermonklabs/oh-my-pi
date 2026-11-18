@@ -171,8 +171,9 @@ export class RemoteHindsightBankSet implements HindsightBankSet {
 
 /**
  * Main's pause after a failed automatic recall of one parent state; each call runs
- * synchronously on main, on main's clock. A closed or silent link never hides a failure:
- * `skip` then reports no pause, so the recall runs, and `record` records nothing; each
+ * synchronously on main, on main's clock. When the link is closed or main does not reply
+ * in time, `skip` reports no pause, so the recall runs, and the outcome may go unrecorded;
+ * after a timeout, main may still run the queued `record` call and record it late. Each
  * logs one warning.
  */
 export class RemoteRecallWait implements RecallWait {

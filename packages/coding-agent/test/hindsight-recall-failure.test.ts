@@ -162,7 +162,6 @@ describe("Hindsight recall failure notice", () => {
 
 		const result = await outcome;
 		expect(result).toMatchObject({ context: null, ok: false });
-		expect(result.failure?.startsWith("recall failed: boom line two x")).toBe(true);
 		expect(notices).toHaveLength(1);
 		const [notice] = notices;
 		expect(notice.level).toBe("warning");
@@ -170,7 +169,6 @@ describe("Hindsight recall failure notice", () => {
 		expect(notice.message.startsWith("Memory recall failed: recall failed: boom line two x")).toBe(true);
 		expect(notice.message).not.toMatch(/[\x00-\x1f\x7f]/);
 		expect(notice.message.length).toBeLessThan(250);
-		expect(notice.message).toBe(`Memory recall failed: ${result.failure}`);
 	});
 
 	it("stays silent when a superseded compaction aborts its recall", async () => {
