@@ -970,17 +970,44 @@ const SYNC_READ_WINDOW_BYTES = 1024 * 1024;
  * The stored transcript at `filePath` as synchronous chunks of at most
  * {@link SYNC_READ_WINDOW_BYTES}: windows of the file itself for file storage,
  * whatever its other range readers do; windows through `readTextRangeSync` for
- * another storage that has it; otherwise its whole `readTextSync` text as one
- * chunk; `undefined` when the storage reads nothing synchronously. A missing
- * transcript throws ENOENT once iterated.
+ * another storage that has it, read twice (see {@link checkedTextRangeWindows});
+ * otherwise its whole `readTextSync` text as one chunk; `undefined` when the
+ * storage reads nothing synchronously. A missing transcript throws ENOENT once
+ * iterated.
  */
 function transcriptByteChunksSync(filePath: string, storage: SessionStorage): Iterable<Uint8Array> | undefined {
 	if (storage instanceof FileSessionStorage) return fileWindows(filePath);
 	const readRange = storage.readTextRangeSync;
-	if (readRange) return textRangeWindows((start, end) => readRange.call(storage, filePath, start, end));
+	if (readRange) return checkedTextRangeWindows((start, end) => readRange.call(storage, filePath, start, end));
 	const readText = storage.readTextSync;
 	if (readText) return wholeText(() => readText.call(storage, filePath));
 	return undefined;
+}
+
+/** A transcript read through `readTextRangeSync` that another writer changed between two of its windows. */
+class RangeReadRaceError extends Error {
+	constructor() {
+		super("The transcript changed between two windows of its read");
+		this.name = "RangeReadRaceError";
+	}
+}
+
+/**
+ * {@link textRangeWindows}, then the same windows read again and compared by
+ * SHA-256 with what was yielded: a storage that reads by range holds nothing
+ * open across windows, so another writer's full write between two of them
+ * would hand back a mix of two bodies. A second read that differs throws
+ * {@link RangeReadRaceError} once the windows ran out.
+ */
+function* checkedTextRangeWindows(readRange: (start: number, end: number) => string): Generator<Uint8Array> {
+	const yielded = new Bun.CryptoHasher("sha256");
+	for (const window of textRangeWindows(readRange)) {
+		yielded.update(window);
+		yield window;
+	}
+	const again = new Bun.CryptoHasher("sha256");
+	for (const window of textRangeWindows(readRange)) again.update(window);
+	if (again.digest("hex") !== yielded.digest("hex")) throw new RangeReadRaceError();
 }
 
 /**
@@ -1441,7 +1468,12 @@ export class SessionManager {
 	 * The file is read in bounded windows and parsed as they arrive, so the
 	 * transcript is never held whole. A deleted file is recreated; a file that
 	 * no longer reads as this session is left untouched and the session moves
-	 * to a sibling.
+	 * to a sibling. A read through `readTextRangeSync` that another writer's
+	 * full write changed between two windows ({@link RangeReadRaceError}) is
+	 * read again from the start, at most {@link MAX_WRITE_CONFLICT_RECOVERIES}
+	 * reads in all, then the session moves to a sibling as `contested`: the
+	 * rewrite is never retried without a whole read of one body, since its size
+	 * check could pass against the other writer's body and overwrite it.
 	 *
 	 * After {@link MAX_WRITE_CONFLICT_RECOVERIES} passes (`recoveries`) the
 	 * other writer is still racing every read-to-publish window: leave the file
@@ -1453,26 +1485,32 @@ export class SessionManager {
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
-		const chunks = transcriptByteChunksSync(contested, this.#storage);
-		if (!chunks) return undefined;
-		const scan = this.#foreignEntryScan();
-		let diskSize = 0;
-		try {
-			visitEntriesFromChunksSync(chunks, scan.visit, {
-				onBytesConsumed: bytes => {
-					diskSize += bytes;
-				},
-			});
-		} catch (readError) {
-			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
-			this.#expectedDiskSize = null;
+		for (let reads = 1; ; reads++) {
+			const chunks = transcriptByteChunksSync(contested, this.#storage);
+			if (!chunks) return undefined;
+			const scan = this.#foreignEntryScan();
+			let diskSize = 0;
+			try {
+				visitEntriesFromChunksSync(chunks, scan.visit, {
+					onBytesConsumed: bytes => {
+						diskSize += bytes;
+					},
+				});
+			} catch (readError) {
+				if (readError instanceof RangeReadRaceError) {
+					if (reads >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
+					continue;
+				}
+				if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
+				this.#expectedDiskSize = null;
+				return contested;
+			}
+			const foreign = scan.foreign();
+			if (!foreign) return this.#moveOffSessionFile("replaced");
+			resolveBlobRefsInEntriesSync(foreign, this.#blobs);
+			this.#adoptForeignEntries(foreign, diskSize);
 			return contested;
 		}
-		const foreign = scan.foreign();
-		if (!foreign) return this.#moveOffSessionFile("replaced");
-		resolveBlobRefsInEntriesSync(foreign, this.#blobs);
-		this.#adoptForeignEntries(foreign, diskSize);
-		return contested;
 	}
 
 	/**

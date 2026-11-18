@@ -153,6 +153,58 @@ describe("conflict recovery of a session file another writer appended to", () =>
 			expect(ranges[0]!.text.endsWith("\uFFFD")).toBe(true);
 		}
 	});
+
+	// Regressed: another writer's full rewrite that lands between two windows of a synchronous read-back
+	// makes the session keep a mix of both bodies' entries, and its retried rewrite, sized against that
+	// mix, publishes over the other writer's body and erases the entries of it the mix lacks.
+	it("adopts one body's entries, or moves off, when another writer rewrites the file between two windows of a synchronous read-back", async () => {
+		using dir = TempDir.createSync("@omp-conflict-recovery-");
+		const file = path.join(dir.path(), "session.jsonl");
+		const content = transcriptAcrossWindows(path.basename(dir.path()), dir.path());
+		const turnLine = (entryId: string, parentId: string, text: string) =>
+			`${JSON.stringify({ type: "message", id: entryId, parentId, timestamp: TIMESTAMP, message: userTurn(text) })}\n`;
+		// What the other writer leaves first: its turns appended to ours.
+		const appended = `${content}${turnLine("x1", "t3", "their turn")}${turnLine("x2", "x1", "their second turn")}`;
+		// Its later full rewrite: a turn before ours, inside the read-back's first window, and one after them.
+		const headerEnd = content.indexOf("\n", content.indexOf('"type":"session"')) + 1;
+		const rewritten = `${content.slice(0, headerEnd)}${turnLine("f1", "t3", "their branch turn")}${content.slice(headerEnd)}${turnLine("g1", "t3", "their later turn")}`;
+		const storage = new MemorySessionStorage();
+		storage.writeTextSync(file, content + TORN_LINE);
+		const ours = await open(file, storage);
+		const notices: SessionPersistenceNotice[] = [];
+		ours.onPersistenceNotice(notice => notices.push(notice));
+		storage.writeTextSync(file, appended);
+		let windows = 0;
+		const rangeReader: SessionStorage = storage;
+		rangeReader.readTextRangeSync = (filePath, start, end) => {
+			const bytes = Buffer.from(storage.readTextSync(filePath), "utf8");
+			const stop = Math.min(end, bytes.length);
+			const text = bytes.toString("utf8", Math.min(start, stop), stop);
+			// The other writer's full rewrite lands right after the read-back's first window.
+			if (++windows === 1) storage.writeTextSync(filePath, rewritten);
+			return text;
+		};
+
+		const ourTurn = ours.appendMessage(userTurn("our turn after the conflict"));
+		await ours.flush();
+
+		expect(windows).toBeGreaterThan(1);
+		if (notices.some(notice => notice.reason === "contested")) {
+			expect(storage.readTextSync(file)).toBe(rewritten);
+		} else {
+			const adopted = ours
+				.getEntries()
+				.map(entry => entry.id)
+				.filter(entryId => /^[xfg]\d$/.test(entryId));
+			expect([
+				["x1", "x2"],
+				["f1", "g1"],
+			]).toContainEqual(adopted);
+			const stored = parseSessionContent(storage.readTextSync(file)).entries.map(entry => entry.id);
+			expect(stored).toEqual(expect.arrayContaining([...adopted, ourTurn]));
+		}
+		await ours.close();
+	});
 });
 
 /**

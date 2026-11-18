@@ -30,6 +30,8 @@ import {
 	type ArchiveMemberContent,
 	ArchiveError,
 	assertInMemorySize,
+	assertValidRange,
+	type ByteSource,
 	formatArchivePathForError,
 	openArchive,
 	writeChunksToFile,
@@ -247,12 +249,16 @@ function claimSessionOrRefuse(id: string, file: string, action: string): () => v
 }
 
 /**
- * Add the blob hashes the text in `chunks` references to `into`: the ones
- * {@link BLOB_REF_RE} finds in the whole text, scanned one chunk at a time.
- * Each scan also covers the last {@link BLOB_REF_SPAN} characters of the one
- * before, so a reference a chunk edge splits is still found.
+ * `chunks`, passed on as they are, after adding the blob hashes their text
+ * references to `into`: the ones {@link BLOB_REF_RE} finds in the whole text,
+ * scanned one chunk at a time. Each scan also covers the last
+ * {@link BLOB_REF_SPAN} characters of the one before, so a reference a chunk
+ * edge splits is still found.
  */
-async function collectBlobHashes(chunks: AsyncIterable<Uint8Array>, into: Set<string>): Promise<void> {
+async function* collectingBlobHashes<C extends Uint8Array>(
+	chunks: AsyncIterable<C>,
+	into: Set<string>,
+): AsyncGenerator<C> {
 	const decoder = new TextDecoder();
 	let carried = "";
 	let atTextStart = true;
@@ -274,8 +280,46 @@ async function collectBlobHashes(chunks: AsyncIterable<Uint8Array>, into: Set<st
 		} else {
 			carried = text;
 		}
+		yield chunk;
 	}
 	scan(carried + decoder.decode(), true);
+}
+
+/**
+ * A transcript file as an archive member that adds the blob hashes its bytes
+ * reference to `hashes` as the archive writer streams them, so the blobs
+ * packed after it are the ones the packed bytes name, whatever another writer
+ * does to the file meanwhile. The writer reads a `Blob` member only through
+ * `size` (taken when it writes the member's header) and `stream()`, and fails
+ * on a stream that does not yield that size.
+ */
+class BlobScannedFile extends Blob {
+	readonly #file: Blob;
+	readonly #hashes: Set<string>;
+
+	constructor(file: Blob, hashes: Set<string>) {
+		super();
+		this.#file = file;
+		this.#hashes = hashes;
+	}
+
+	override get size(): number {
+		return this.#file.size;
+	}
+
+	override stream(): ReadableStream<Uint8Array<ArrayBuffer>> {
+		const chunks = collectingBlobHashes(this.#file.stream(), this.#hashes);
+		return new ReadableStream<Uint8Array<ArrayBuffer>>({
+			async pull(controller) {
+				const next = await chunks.next();
+				if (next.done) controller.close();
+				else controller.enqueue(next.value);
+			},
+			async cancel() {
+				await chunks.return(undefined);
+			},
+		});
+	}
 }
 
 /** `chunks`, each fed to `digest` as it passes. */
@@ -314,7 +358,7 @@ async function listFilesRecursive(dir: string): Promise<string[]> {
  */
 async function writeArchiveAtomically(
 	target: string,
-	members: readonly (readonly [string, ArchiveMemberContent])[],
+	members: Iterable<readonly [string, ArchiveMemberContent]>,
 ): Promise<void> {
 	const staging = `${target}.${Snowflake.next()}.tmp`;
 	try {
@@ -355,43 +399,42 @@ export async function packSession(sessionFile: string, outPath: string): Promise
 			cwd: header.cwd,
 			omp: VERSION,
 		};
-		// File members are read only while the archive is written; the hash scans read them a chunk at a time.
-		const journal = Bun.file(source);
-		const members: (readonly [string, ArchiveMemberContent])[] = [
-			[MANIFEST_MEMBER, `${JSON.stringify(manifest, null, 2)}\n`],
-			[SESSION_MEMBER, journal],
-		];
-		const hashes = new Set<string>();
-		await collectBlobHashes(journal.stream(), hashes);
-
 		// Artifacts sit beside the journal's real name (see copySessionArtifacts).
 		let realSource = source;
 		try {
 			realSource = await fs.promises.realpath(source);
 		} catch {}
 		const artifactsDir = realSource.slice(0, -".jsonl".length);
-		if (realSource.endsWith(".jsonl")) {
-			for (const relative of await listFilesRecursive(artifactsDir)) {
+		const artifacts = realSource.endsWith(".jsonl") ? await listFilesRecursive(artifactsDir) : [];
+		const hashes = new Set<string>();
+		const blobs = new BlobStore(getBlobsDir());
+		const missingBlobs: string[] = [];
+		// File members are read only while the archive is written, and the transcripts are scanned for
+		// blob references as they stream in. The blobs come last: the archive writer takes each member
+		// only once the one before it is written, so they are the blobs the packed transcripts name.
+		function* members(): Generator<readonly [string, ArchiveMemberContent]> {
+			yield [MANIFEST_MEMBER, `${JSON.stringify(manifest, null, 2)}\n`];
+			yield [SESSION_MEMBER, new BlobScannedFile(Bun.file(source), hashes)];
+			for (const relative of artifacts) {
 				const artifact = Bun.file(path.join(artifactsDir, ...relative.split("/")));
-				members.push([`${ARTIFACTS_PREFIX}${relative}`, artifact]);
-				if (relative.endsWith(".jsonl")) await collectBlobHashes(artifact.stream(), hashes);
+				yield [
+					`${ARTIFACTS_PREFIX}${relative}`,
+					relative.endsWith(".jsonl") ? new BlobScannedFile(artifact, hashes) : artifact,
+				];
+			}
+			for (const hash of [...hashes].sort()) {
+				if (blobs.sizeSync(hash) === null) {
+					missingBlobs.push(hash);
+					continue;
+				}
+				yield [`${BLOBS_PREFIX}${hash}`, Bun.file(blobs.blobPath(hash))];
 			}
 		}
 
-		const blobs = new BlobStore(getBlobsDir());
-		const missingBlobs: string[] = [];
-		for (const hash of [...hashes].sort()) {
-			if (blobs.sizeSync(hash) === null) {
-				missingBlobs.push(hash);
-				continue;
-			}
-			members.push([`${BLOBS_PREFIX}${hash}`, Bun.file(blobs.blobPath(hash))]);
-		}
+		await writeArchiveAtomically(archivePath, members());
 		if (missingBlobs.length > 0) {
 			logger.warn("Packing session without blobs missing from the local store", { id, missingBlobs });
 		}
-
-		await writeArchiveAtomically(archivePath, members);
 		return { archivePath, id, missingBlobs };
 	} finally {
 		release();
@@ -447,18 +490,43 @@ function blobMemberHash(name: string): string | undefined {
 }
 
 /**
+ * The file `handle` holds open, as an archive byte source: every read goes to
+ * the file the handle opened, so a file renamed over its path meanwhile is
+ * never read.
+ */
+async function heldFileSource(handle: fs.promises.FileHandle): Promise<ByteSource> {
+	const { size } = await handle.stat();
+	return {
+		size,
+		async read(start, end) {
+			assertValidRange(start, end);
+			const bytes = new Uint8Array(end - start);
+			for (let filled = 0; filled < bytes.length;) {
+				const { bytesRead } = await handle.read(bytes, filled, bytes.length - filled, start + filled);
+				if (bytesRead === 0) throw new ArchiveError("Invalid archive: truncated data");
+				filled += bytesRead;
+			}
+			return bytes;
+		},
+	};
+}
+
+/**
  * Read and validate the whole archive before anything is written outside
  * `staging`: member layout, manifest version, journal header, and every
  * blob's sha256. The members are read one after another, each streamed to its
  * own file in `staging`, so no member is held in memory; a blob is hashed as
- * it streams and refused there when its bytes do not match its name.
+ * it streams and refused there when its bytes do not match its name. Every
+ * member is read through one handle, so all of them come from the archive the
+ * unpack opened, even when another file is renamed over its path meanwhile.
  */
 async function readSessionArchive(archive: string, staging: TempDir): Promise<SessionArchiveContents> {
 	await requireFile(archive, "Archive");
 	const members: [name: string, file: string][] = [];
+	const handle = await fs.promises.open(archive, "r");
 	try {
 		const reader = await openArchive(
-			{ path: archive, format: "tar" },
+			{ source: await heldFileSource(handle), format: "tar", path: archive },
 			{ limits: { maxInMemorySize: ARCHIVE_SIZE_LIMIT, maxMemberSize: ARCHIVE_SIZE_LIMIT } },
 		);
 		// Invariant: the members' sizes in the tar headers total at most
@@ -490,6 +558,8 @@ async function readSessionArchive(archive: string, staging: TempDir): Promise<Se
 			throw new SessionTransferError(`Bad session archive ${archive}: ${error.message}`);
 		}
 		throw error;
+	} finally {
+		await handle.close();
 	}
 
 	let manifestFile: string | undefined;

@@ -101,6 +101,35 @@ async function liveAfterGc(refs: WeakRef<object>[]): Promise<number> {
 	return live;
 }
 
+/**
+ * Delivers one receipt-tracked entry through an idle flush whose injection commits the message into
+ * `transcript` and then fails (the turn it started ends in an error), recording how the receipt
+ * settled in `outcomes`, and returns a weak ref to the entry's value.
+ */
+async function commitThenFailOneEntry(transcript: AgentMessage[], outcomes: string[]): Promise<WeakRef<object>> {
+	const scheduledFlushes: Array<() => Promise<void>> = [];
+	const queue = new YieldQueue({
+		isStreaming: () => false,
+		injectIdle: async messages => {
+			transcript.push(...messages);
+			(messages[0] as AgentMessage & { [ASIDE_MESSAGE_COMMIT]?: () => void })[ASIDE_MESSAGE_COMMIT]?.();
+			throw new Error("the turn failed after the message reached the context");
+		},
+		scheduleIdleFlush: run => scheduledFlushes.push(run),
+	});
+	queue.register<Entry>("items", {
+		build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+	});
+	const value: Entry = { id: `entry-${transcript.length}` };
+	const receipt = queue.enqueueWithReceipt("items", value).then(
+		() => outcomes.push("resolved"),
+		() => outcomes.push("rejected"),
+	);
+	await scheduledFlushes[0]!();
+	await receipt;
+	return new WeakRef(value);
+}
+
 describe("YieldQueue", () => {
 	test("enqueue while streaming defers until streaming flush", async () => {
 		const harness = createHarness(true);
@@ -352,4 +381,17 @@ describe("YieldQueue", () => {
 			expect(await liveAfterGc(refs)).toBeLessThanOrEqual(1);
 		},
 	);
+
+	// Regressed: a background job's result that reached the agent's context before its idle turn failed is
+	// reported as never delivered (its receipt rejects), or its entries stay in memory for the rest of the
+	// session behind the message.
+	test("a message committed before its idle injection fails resolves its receipt and keeps none of its entries reachable", async () => {
+		const transcript: AgentMessage[] = [];
+		const outcomes: string[] = [];
+		const refs: WeakRef<object>[] = [];
+		for (let i = 0; i < 8; i++) refs.push(await commitThenFailOneEntry(transcript, outcomes));
+		expect(transcript).toHaveLength(8);
+		expect(outcomes).toEqual(Array.from({ length: 8 }, () => "resolved"));
+		expect(await liveAfterGc(refs)).toBeLessThanOrEqual(1);
+	});
 });
