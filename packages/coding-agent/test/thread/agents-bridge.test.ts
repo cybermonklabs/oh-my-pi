@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import type { UserMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { IrcBus } from "../../src/irc/bus";
+import { isQueuedMessage } from "../../src/modes/rpc/rpc-mode";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentSession } from "../../src/session/agent-session";
@@ -264,4 +266,64 @@ describe("agent bridging across subagent workers", () => {
 		expect(liveRef("W1").status).toBe("idle");
 		expect(worker.load).toBe(1);
 	});
+
+	it("queues a next-run steer on a worker-homed session, reports it on main, and takes it back", async () => {
+		const { probe } = await startWorker();
+		await probe.open("W1", {});
+		const remote = mirrorOf(liveRef("W1").session);
+		const ended: UserMessage[] = [];
+		remote.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "user") ended.push(event.message);
+		});
+		const reported: UserMessage[] = [];
+		const queueNextRunSteer = (text: string) =>
+			remote.steer(text, undefined, {
+				holdUntilNextRun: true,
+				onPromptQueued: messages => {
+					const message = messages.at(-1);
+					if (message?.role === "user") reported.push(message);
+				},
+			});
+
+		await queueNextRunSteer("Take this back.");
+		await waitFor(() => reported.length === 1);
+		expect(reported[0]).toMatchObject({
+			role: "user",
+			steering: true,
+			content: [{ type: "text", text: "Take this back." }],
+		});
+		// The steer waits on the queue: no turn ran for it.
+		expect(await probe.settled("W1")).toEqual({ messageCount: 0, steering: ["Take this back."] });
+		expect(await remote.removeQueuedMessage("Take this back.", "steering")).toBe(true);
+		expect(await probe.settled("W1")).toEqual({ messageCount: 0, steering: [] });
+		expect(await remote.removeQueuedMessage("Take this back.", "steering")).toBe(false);
+
+		await queueNextRunSteer("Also check the README.");
+		await waitFor(() => reported.length === 2);
+		expect(await remote.prompt("Submit your result.")).toBe(true);
+		// The run that takes the steer reports it as a copy matching what onPromptQueued reported.
+		await waitFor(() => ended.some(message => isQueuedMessage(message, reported[1]!)));
+		expect(ended.some(message => isQueuedMessage(message, reported[0]!))).toBe(false);
+		expect(await probe.settled("W1")).toMatchObject({ steering: [] });
+	}, 60_000);
+
+	it("queues and takes back a next-run steer on a main-homed session through a worker's peer handle", async () => {
+		const { probe } = await startWorker();
+		const main = await mainSession("Main");
+		AgentRegistry.global().register({ id: "Main", displayName: "Main", kind: "main", session: main, status: "idle" });
+
+		const result = await probe.peerQueueAndTakeBackNextRunSteer("Main", "Take this back.");
+
+		expect(result).toEqual({
+			reported: expect.objectContaining({
+				role: "user",
+				steering: true,
+				content: [{ type: "text", text: "Take this back." }],
+			}),
+			removed: true,
+		});
+		await main.waitForIdle();
+		expect(main.messages).toEqual([]);
+		expect(main.agent.peekSteeringQueue()).toEqual([]);
+	}, 60_000);
 });

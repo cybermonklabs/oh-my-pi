@@ -103,4 +103,20 @@ describe("AgentRegistry final-result acceptance", () => {
 		expect(registry.get("PolicyCommand")?.lifecycle?.acceptedAt).toBeUndefined();
 		expect(registry.get("PolicyCommand")?.status).toBe("running");
 	});
+
+	it("stamps the end of the current run's drive for its owner only, cleared when the ref runs again", () => {
+		const session = sessionStub(false);
+		const ref = registerRunning("PolicyCommand", session);
+		registry.setStatus("PolicyCommand", "idle", ref);
+
+		expect(registry.markRunEnded("PolicyCommand", sessionStub(false))).toBe(false);
+		expect(registry.get("PolicyCommand")?.lifecycle?.endedAt).toBeUndefined();
+		expect(registry.markRunEnded("PolicyCommand", session)).toBe(true);
+		expect(registry.get("PolicyCommand")?.lifecycle?.endedAt).toBeNumber();
+		expect(registry.get("PolicyCommand")?.status).toBe("idle");
+
+		// A follow-up run on the same ref starts with its drive not ended.
+		registry.setStatus("PolicyCommand", "running", ref);
+		expect(registry.get("PolicyCommand")?.lifecycle?.endedAt).toBeUndefined();
+	});
 });

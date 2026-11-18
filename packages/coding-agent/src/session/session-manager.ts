@@ -5309,7 +5309,9 @@ export class SessionManager {
 	 * On such a storage a rewrite queued while this manager's own earlier
 	 * publish is unconfirmed fails the store's size check. That publish's
 	 * confirmation rewrites the transcript, the refused entries included, so
-	 * the wait covers it before {@link flush} reports what is left.
+	 * the wait covers it before {@link flush} reports what is left. When that
+	 * publish itself fails, the wait rejects with the store's error, not the
+	 * size-check conflict the flush still holds.
 	 *
 	 * A write the lease fence refused latches no failure: the loss moves the
 	 * session to a sibling, whose publish carries the refused entries. Under
@@ -5328,10 +5330,16 @@ export class SessionManager {
 			flushed = this.flush();
 		} catch (error) {
 			if (!(error instanceof SessionWriteConflictError)) throw error;
-			flushed = this.#storage
-				.drain()
-				.catch(() => undefined)
-				.then(() => this.flush());
+			// The drain hands back (and clears) the store's first failure, and the
+			// conflict latched first keeps that failure out of the persistence log:
+			// report it in place of the conflict when the flush fails too.
+			flushed = this.#storage.drain().then(
+				() => this.flush(),
+				drainError =>
+					this.flush().catch(() => {
+						throw drainError;
+					}),
+			);
 		}
 		return flushed.then(() => {
 			if (this.#exclusiveStopping) {

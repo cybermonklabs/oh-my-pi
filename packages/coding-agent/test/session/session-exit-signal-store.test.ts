@@ -1,7 +1,8 @@
 /**
  * A session that ends on SIGTERM stores its exit record on a store that only
  * queues its writes (indexed backends, SQL storage), also when the signal
- * lands while the turn's own first publish is still queued, and a store that
+ * lands while the turn's own first publish is still queued; when that publish
+ * fails, the exit's failure log names the store's error; and a store that
  * never answers cannot hold the exit past the cleanup deadline. Each case runs
  * `fixtures/session-exit-signal-host.ts` in a child process and signals it.
  * The PostgreSQL cases run when `OMP_TEST_SQL_POSTGRES_URL` names a throwaway
@@ -126,6 +127,20 @@ function queuedTranscript(host: Host): string {
 	return fs.existsSync(host.storedAt) ? fs.readFileSync(host.storedAt, "utf8") : "";
 }
 
+/** The error-level log records the host wrote to its work dir. */
+function errorLog(dir: string): Array<{ message: string; context?: Record<string, unknown> }> {
+	const file = path.join(dir, "error-log.jsonl");
+	if (!fs.existsSync(file)) return [];
+	return fs
+		.readFileSync(file, "utf8")
+		.split("\n")
+		.filter(line => line.length > 0)
+		.map(line => JSON.parse(line) as { message: string; context?: Record<string, unknown> });
+}
+
+/** What the host's `failing` backend's writes fail with. */
+const STORE_FAILURE = "backend rejected the write: storage quota exceeded";
+
 describe("SIGTERM on a store that only queues its writes", () => {
 	it(
 		"stores the exit record a slow backend takes after the signal",
@@ -161,6 +176,20 @@ describe("SIGTERM on a store that only queues its writes", () => {
 
 			expect(exit.code).toBe(143);
 			expect(exit.ms).toBeLessThan(CLEANUP_DEADLINE_MS + EXIT_SLACK_MS);
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
+		"logs the store's own error when the turn's queued first publish fails after the signal",
+		async () => {
+			const dir = workDir();
+			const host = await startHost(dir, ["queued", "failing", "pending"]);
+			const exit = await terminate(host);
+
+			expect(exit.code).toBe(143);
+			const failure = errorLog(dir).find(record => record.message === "Failed to record session exit");
+			expect(failure?.context?.error).toBe(STORE_FAILURE);
 		},
 		CASE_TIMEOUT_MS,
 	);

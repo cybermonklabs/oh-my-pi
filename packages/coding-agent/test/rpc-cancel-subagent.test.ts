@@ -2,9 +2,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage, UserMessage } from "@oh-my-pi/pi-ai";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { handleRpcCancelSubagent } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
+import {
+	handleRpcCancelSubagent,
+	handleRpcSteerSubagent,
+	RpcShutdownCoordinator,
+} from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -12,6 +18,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { SteerOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	type AgentDefinition,
@@ -84,20 +91,112 @@ describe("handleRpcCancelSubagent", () => {
 	 * an eval `agent()` job, registered as `runEvalAgent` registers it (owned by
 	 * the subagent), and ends, so the executor waits for that job while the
 	 * run-state mirror holds the subagent's ref `idle`. Once the job completes,
-	 * its delivered result wakes the subagent, whose next turn yields.
+	 * its delivered result wakes the subagent, whose next turn yields; a job
+	 * that ends without a result leaves the executor to send its yield reminder.
+	 *
+	 * With `firstTurnFails`, that first turn ends on a provider error instead, so
+	 * the run's drive ends with the job still running; the job then ignores the
+	 * cancel of the run's cleanup until the test finishes it, which keeps the
+	 * subagent idle, holding its session and listed running through that cleanup.
+	 *
+	 * The session mirrors AgentSession's steering queue: a steer queues a
+	 * steering user message (reported through `onPromptQueued`); each turn takes
+	 * the queued steers before its first model call and emits each as
+	 * `message_start`/`message_end`; a steer queued without `holdUntilNextRun`
+	 * on the idle session is drained into a turn of its own; and a prompt while
+	 * a turn streams meets `AgentBusyError`.
 	 */
-	function startSubagentAwaitingEvalJob() {
+	function startSubagentAwaitingEvalJob(options: { firstTurnFails?: boolean } = {}) {
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		const id = "Worker";
 		const childId = "Worker.Child";
 		const childResult = Promise.withResolvers<string>();
 		const awaitingJob = Promise.withResolvers<void>();
-		const listeners: Array<(event: AgentSessionEvent) => void> = [];
+		const steerQueued = Promise.withResolvers<void>();
+		const jobCancelled = Promise.withResolvers<void>();
+		const listeners = new Set<(event: AgentSessionEvent) => void>();
 		const runStateListeners = new Set<(state: "running" | "idle") => void>();
 		const setRunState = (state: "running" | "idle") => {
 			for (const listener of runStateListeners) listener(state);
 		};
-		let evalCellRan = false;
+		let lastAssistant: AssistantMessage | undefined;
+		/** Each turn the subagent ran: what started it, and the texts of the steers it took before its first model call. */
+		const turns: Array<{ source: "prompt" | "drain" | "job result"; steers: string[] }> = [];
+		/** Queued steers: the text each was sent with and the user message the queue holds for it. */
+		const queuedSteers: Array<{ text: string; message: UserMessage }> = [];
+		const busyPrompts: string[] = [];
+		let streaming = false;
+		const runTurn = (source: (typeof turns)[number]["source"], during?: () => void) => {
+			streaming = true;
+			setRunState("running");
+			for (const listener of listeners) listener({ type: "agent_start" } as AgentSessionEvent);
+			const steers = queuedSteers.splice(0);
+			for (const { message } of steers) {
+				for (const listener of listeners) {
+					listener({ type: "message_start", message } as AgentSessionEvent);
+					listener({ type: "message_end", message } as AgentSessionEvent);
+				}
+			}
+			turns.push({ source, steers: steers.map(steer => steer.text) });
+			during?.();
+			setRunState("idle");
+			streaming = false;
+		};
+		const startEvalJob = () => {
+			manager.register(
+				"task",
+				childId,
+				async ({ signal, markRunning }) => {
+					markRunning();
+					const cancelled = Promise.withResolvers<never>();
+					signal.addEventListener(
+						"abort",
+						() => {
+							jobCancelled.resolve();
+							if (!options.firstTurnFails) cancelled.reject(new Error("cancelled"));
+						},
+						{ once: true },
+					);
+					return await Promise.race([childResult.promise, cancelled.promise]);
+				},
+				{ id: childId, agentId: childId, ownerId: id },
+			);
+		};
+		const runAssignment = () => {
+			startEvalJob();
+			if (!options.firstTurnFails) return;
+			lastAssistant = {
+				role: "assistant",
+				content: [],
+				api: "openai-responses",
+				provider: "openai",
+				model: "mock",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "error",
+				errorMessage: "provider exploded",
+				timestamp: Date.now(),
+			};
+		};
+		const emitYield = () => {
+			for (const listener of listeners) {
+				listener({
+					type: "tool_execution_end",
+					toolCallId: "yield-1",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { child: childId } },
+					},
+				} as AgentSessionEvent);
+			}
+		};
 		const session = {
 			state: { messages: [] },
 			agent: { state: { systemPrompt: ["test"] } },
@@ -111,52 +210,48 @@ describe("handleRpcCancelSubagent", () => {
 			setActiveToolsByName: async () => {},
 			setWorkPoolYieldItems: () => {},
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
-				listeners.push(listener);
-				return () => listeners.splice(listeners.indexOf(listener), 1);
+				listeners.add(listener);
+				return () => listeners.delete(listener);
 			},
-			prompt: async () => {
-				// Later prompts are yield reminders: they find nothing to do.
-				if (evalCellRan) return;
-				evalCellRan = true;
-				setRunState("running");
-				manager.register(
-					"task",
-					childId,
-					async ({ signal, markRunning }) => {
-						markRunning();
-						const cancelled = Promise.withResolvers<never>();
-						signal.addEventListener("abort", () => cancelled.reject(new Error("cancelled")), { once: true });
-						return await Promise.race([childResult.promise, cancelled.promise]);
-					},
-					{ id: childId, agentId: childId, ownerId: id },
-				);
-				setRunState("idle");
+			prompt: async (text: string) => {
+				if (streaming) {
+					busyPrompts.push(text);
+					throw new AgentBusyError();
+				}
+				// The first prompt is the assignment, whose eval cell starts the job.
+				runTurn("prompt", turns.length === 0 ? runAssignment : undefined);
+				return true;
+			},
+			steer: async (text: string, _images?: unknown, options?: SteerOptions) => {
+				const message: UserMessage = {
+					role: "user",
+					content: [{ type: "text", text }],
+					steering: true,
+					attribution: "user",
+					timestamp: Date.now(),
+				};
+				queuedSteers.push({ text, message });
+				options?.onPromptQueued?.([message]);
+				steerQueued.resolve();
+				if (!options?.holdUntilNextRun && !streaming) runTurn("drain");
+			},
+			removeQueuedMessage: (text: string) => {
+				const index = queuedSteers.findIndex(steer => steer.text === text);
+				if (index >= 0) queuedSteers.splice(index, 1);
+				return index >= 0;
 			},
 			waitForIdle: async () => {},
 			isAdvisorActive: () => false,
 			prepareForHeadlessAdvisorDrain: () => {},
 			waitForAdvisorCatchup: async () => true,
-			getLastAssistantMessage: () => undefined,
+			getLastAssistantMessage: () => lastAssistant,
 			hasPendingAsyncWork: () => manager.getRunningJobs({ ownerId: id }).length > 0,
 			getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
 			settleAsyncWork: async () => {
 				awaitingJob.resolve();
 				await manager.waitForOwnerJobs(id, { excludeSuppressed: true });
-				if (manager.getJob(childId)?.status !== "completed") return;
 				// The job's delivered result wakes the subagent; that turn yields.
-				setRunState("running");
-				for (const listener of listeners) {
-					listener({
-						type: "tool_execution_end",
-						toolCallId: "yield-1",
-						toolName: "yield",
-						result: {
-							content: [{ type: "text", text: "Result submitted." }],
-							details: { status: "success", data: { child: childId } },
-						},
-					} as AgentSessionEvent);
-				}
-				setRunState("idle");
+				if (manager.getJob(childId)?.status === "completed") runTurn("job result", emitYield);
 			},
 			abort: async () => {},
 			dispose: async () => {},
@@ -196,19 +291,35 @@ describe("handleRpcCancelSubagent", () => {
 			artifactsDir: sessionDir,
 			asyncJobManager: manager,
 			signal: teardown.signal,
+			// Long enough that the test, not the deadline, ends the cleanup the stubborn job holds.
+			cleanupGraceMs: options.firstTurnFails ? 60_000 : undefined,
 		});
 		return {
 			id,
 			run,
+			turns,
+			/** Steers still waiting on the session's queue. */
+			queuedSteers,
+			busyPrompts,
 			/** The eval `agent()` job on the parent's job manager. */
 			evalJob: () => manager.getJob(childId),
 			/** Resolves once the executor waits for the job with the subagent between turns. */
 			awaitingJob: awaitingJob.promise,
+			/** Resolves once a steer reached the subagent's session. */
+			steerQueued: steerQueued.promise,
+			/** Resolves once the run's cleanup cancelled the job (with `firstTurnFails`, the job ignores it). */
+			jobCancelled: jobCancelled.promise,
 			finishChild: childResult.resolve,
+			/** End the job without a result to deliver (cancelled). */
+			endJobWithoutResult: () => manager.cancel(childId),
+			/** Someone other than the steer's sender takes its message off the queue. */
+			takeBackElsewhere: (text: string) => session.removeQueuedMessage(text, "steering"),
 			/** Test teardown: end a run the case left unsettled, and its job. */
 			async stop(): Promise<void> {
 				teardown.abort();
 				manager.cancelAll();
+				// A job that ignores cancellation (`firstTurnFails`) settles once its result arrives.
+				childResult.resolve("stopped");
 				await Promise.allSettled([run]);
 				await manager.dispose({ timeoutMs: 1000 });
 			},
@@ -353,7 +464,7 @@ describe("handleRpcCancelSubagent", () => {
 		const id = "Worker.Child";
 		const artifactsDir = sessionDir;
 		const promptEntered = Promise.withResolvers<void>();
-		const listeners: Array<(event: AgentSessionEvent) => void> = [];
+		const listeners = new Set<(event: AgentSessionEvent) => void>();
 		// Minimal session whose turn never finishes on its own: only a cancel can end the run.
 		const session = {
 			state: { messages: [] },
@@ -368,8 +479,8 @@ describe("handleRpcCancelSubagent", () => {
 			setActiveToolsByName: async () => {},
 			setWorkPoolYieldItems: () => {},
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
-				listeners.push(listener);
-				return () => listeners.splice(listeners.indexOf(listener), 1);
+				listeners.add(listener);
+				return () => listeners.delete(listener);
 			},
 			prompt: async () => {
 				promptEntered.resolve();
@@ -473,6 +584,159 @@ describe("handleRpcCancelSubagent", () => {
 			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
 		} finally {
 			unsubscribe();
+			await subagent.stop();
+		}
+	}, 15_000);
+
+	test("steer_subagent queues its message for the executor's next prompt to a subagent idle between turns", async () => {
+		const subagent = startSubagentAwaitingEvalJob();
+		const message = "Also check the README.";
+		try {
+			await subagent.awaitingJob;
+			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+			const answer = handleRpcSteerSubagent(registry, subagent.id, message);
+			// A refusal answers at once; an accepted steer waits on the queue.
+			await Promise.race([answer, subagent.steerQueued]);
+			expect(subagent.turns).toEqual([{ source: "prompt", steers: [] }]);
+
+			// The job ends with nothing to deliver, so the executor sends its yield reminder next.
+			subagent.endJobWithoutResult();
+
+			await expect(answer).resolves.toBeUndefined();
+			expect(subagent.turns[1]).toEqual({ source: "prompt", steers: [message] });
+			expect(subagent.busyPrompts).toEqual([]);
+		} finally {
+			await subagent.stop();
+		}
+	}, 15_000);
+
+	test("steer_subagent takes its message back and answers an error when the subagent stops before its next turn", async () => {
+		const subagent = startSubagentAwaitingEvalJob();
+		try {
+			await subagent.awaitingJob;
+			const answer = handleRpcSteerSubagent(registry, subagent.id, "Also check the README.");
+			await Promise.race([answer, subagent.steerQueued]);
+
+			await expect(handleRpcCancelSubagent(registry, subagent.id)).resolves.toBe(true);
+
+			await expect(answer).resolves.toBe(`Subagent's run ended before the message reached it: ${subagent.id}`);
+			expect(subagent.queuedSteers).toEqual([]);
+			expect(subagent.turns).toHaveLength(1);
+		} finally {
+			await subagent.stop();
+		}
+	}, 15_000);
+
+	test("steer_subagent answers an error when someone else takes its message back and the run then ends", async () => {
+		const subagent = startSubagentAwaitingEvalJob();
+		const message = "Also check the README.";
+		try {
+			await subagent.awaitingJob;
+			const answer = handleRpcSteerSubagent(registry, subagent.id, message);
+			await Promise.race([answer, subagent.steerQueued]);
+			expect(subagent.takeBackElsewhere(message)).toBe(true);
+
+			// The job's result wakes the subagent; that turn yields and the parent accepts it.
+			subagent.finishChild("child done");
+			expect((await subagent.run).aborted).toBe(false);
+
+			await expect(answer).resolves.toBe(`The message was not delivered to subagent: ${subagent.id}`);
+			expect(subagent.turns.map(turn => turn.steers)).toEqual([[], []]);
+		} finally {
+			await subagent.stop();
+		}
+	}, 15_000);
+
+	test("cancel_subagent leaves a subagent idle whose run ended with an error while its cleanup still holds it", async () => {
+		const subagent = startSubagentAwaitingEvalJob({ firstTurnFails: true });
+		try {
+			// The run's drive has ended on the error; its cleanup now waits on the job.
+			await subagent.jobCancelled;
+			expect(registry.getSubagents().map(({ id, status }) => ({ id, status }))).toEqual([
+				{ id: subagent.id, status: "running" },
+			]);
+			const ref = AgentRegistry.global().get(subagent.id);
+			expect(ref?.status).toBe("idle");
+			expect(ref?.session).not.toBeNull();
+
+			await expect(handleRpcCancelSubagent(registry, subagent.id)).resolves.toBe(false);
+			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+
+			subagent.finishChild("late");
+			const result = await subagent.run;
+			expect(result).toMatchObject({ exitCode: 1, aborted: false });
+			// Kept alive as a finished agent, not tombstoned.
+			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+		} finally {
+			await subagent.stop();
+		}
+	}, 15_000);
+
+	test("steer_subagent refuses at once a subagent whose run ended with an error while its cleanup still holds it", async () => {
+		const subagent = startSubagentAwaitingEvalJob({ firstTurnFails: true });
+		try {
+			await subagent.jobCancelled;
+			const answer = handleRpcSteerSubagent(registry, subagent.id, "Also check the README.");
+			// Refused before any wait: the answer is settled ahead of a pending marker queued after it.
+			const first = await Promise.race([answer, Promise.resolve().then(() => "still pending")]);
+
+			expect(first).toBe(`Subagent not running: ${subagent.id}`);
+			expect(subagent.queuedSteers).toEqual([]);
+		} finally {
+			await subagent.stop();
+		}
+	}, 15_000);
+
+	test("a deferred RPC shutdown ends a steer waiting between turns: the message is taken back and no turn starts", async () => {
+		const betweenTurnSteers = new AbortController();
+		let shutDown = false;
+		// Wired as runRpcMode wires it; the steer is a tracked background command.
+		const coordinator = new RpcShutdownCoordinator({
+			isShutdownRequested: () => true,
+			onShutdownRequested: () => betweenTurnSteers.abort(),
+			performShutdown: async () => {
+				shutDown = true;
+			},
+		});
+		const subagent = startSubagentAwaitingEvalJob();
+		try {
+			await subagent.awaitingJob;
+			const answer = handleRpcSteerSubagent(
+				registry,
+				subagent.id,
+				"Also check the README.",
+				betweenTurnSteers.signal,
+			);
+			coordinator.track(answer.then(() => {}));
+			await Promise.race([answer, subagent.steerQueued]);
+
+			// The subagent's job keeps running: only the steer's own end lets the drain
+			// finish, so a steer that held the shutdown would show as this case's timeout.
+			await coordinator.checkShutdownRequested();
+
+			expect(shutDown).toBe(true);
+			await expect(answer).resolves.toBe(`Subagent's run ended before the message reached it: ${subagent.id}`);
+			expect(subagent.queuedSteers).toEqual([]);
+			expect(subagent.turns).toHaveLength(1);
+			expect(subagent.evalJob()?.status).toBe("running");
+		} finally {
+			await subagent.stop();
+		}
+	}, 15_000);
+
+	test("disposing the roster, as stdin EOF does, ends a steer waiting between turns and takes its message back", async () => {
+		const subagent = startSubagentAwaitingEvalJob();
+		try {
+			await subagent.awaitingJob;
+			const answer = handleRpcSteerSubagent(registry, subagent.id, "Also check the README.");
+			await Promise.race([answer, subagent.steerQueued]);
+
+			registry.dispose();
+
+			await expect(answer).resolves.toBe(`Subagent's run ended before the message reached it: ${subagent.id}`);
+			expect(subagent.queuedSteers).toEqual([]);
+			expect(subagent.turns).toHaveLength(1);
+		} finally {
 			await subagent.stop();
 		}
 	}, 15_000);

@@ -66,6 +66,13 @@ export interface AgentsProbe {
 	disposed(key: string): Promise<boolean>;
 	/** Whether the worker's lifecycle proxy manages the worker's registry proxy. */
 	manages(): Promise<boolean>;
+	/** Once the local session of `id` settled: its message count and the texts on its steering queue. */
+	settled(id: string): Promise<{ messageCount: number; steering: string[] }>;
+	/**
+	 * Through the peer handle of `id` (homed elsewhere): queue `text` as a next-run steer,
+	 * then take it back. Reports what `onPromptQueued` delivered here and the take-back.
+	 */
+	peerQueueAndTakeBackNextRunSteer(id: string, text: string): Promise<{ reported: unknown; removed: boolean }>;
 }
 
 /** Test-only boot globals of the probe service. */
@@ -213,6 +220,30 @@ const probe: AgentsProbe = {
 		return session.isDisposed;
 	},
 	manages: async () => AgentLifecycleManager.global().manages(AgentRegistry.global()),
+	settled: async id => {
+		const session = local(id);
+		await session.waitForIdle();
+		return {
+			messageCount: session.messages.length,
+			steering: session.agent
+				.peekSteeringQueue()
+				.flatMap(message =>
+					message.role === "user" && Array.isArray(message.content)
+						? message.content.flatMap(part => (part.type === "text" ? [part.text] : []))
+						: [],
+				),
+		};
+	},
+	peerQueueAndTakeBackNextRunSteer: async (id, text) => {
+		const session = AgentRegistry.global().get(id)?.session;
+		if (!session) throw new Error(`no session for ${id}`);
+		const reported = Promise.withResolvers<unknown>();
+		await session.steer(text, undefined, {
+			holdUntilNextRun: true,
+			onPromptQueued: messages => reported.resolve(messages.at(-1)),
+		});
+		return { reported: await reported.promise, removed: await session.removeQueuedMessage(text, "steering") };
+	},
 };
 
 function isProbeGlobals(value: unknown): value is AgentsProbeGlobals {

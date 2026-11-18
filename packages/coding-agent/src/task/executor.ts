@@ -4156,6 +4156,7 @@ async function driveFollowUpTurn(
 				// terminalize the ref here, not just on the initial run (#11079).
 				AgentRegistry.global().markResultAccepted(id, session, monitor.yieldAcceptedAt());
 			}
+			AgentRegistry.global().markRunEnded(id, session);
 		} finally {
 			try {
 				await untilAborted(AbortSignal.timeout(5000), () => monitor.waitForActiveSessionAbort());
@@ -5539,10 +5540,13 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			});
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left
-			// `running` before the (possibly slow) cleanup below.
+			// `running` before the (possibly slow) cleanup below. Every outcome
+			// ends the run's drive: a failed or resumable run stays idle and holds
+			// its session through that cleanup without being between two turns.
 			if (resultDelivered(outcome, monitor, structured)) {
 				AgentRegistry.global().markResultAccepted(id, session, monitor.yieldAcceptedAt());
 			}
+			AgentRegistry.global().markRunEnded(id, session);
 			exitCode = outcome.exitCode;
 			error = outcome.error;
 			aborted = outcome.aborted;

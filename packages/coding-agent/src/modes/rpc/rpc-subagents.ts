@@ -127,6 +127,7 @@ export class RpcSubagentRegistry {
 	#observabilityBus: EventBus | undefined;
 	#output: RpcSubagentOutput;
 	#subscriptionLevel: RpcSubagentSubscriptionLevel = "off";
+	#changeListeners = new Set<() => void>();
 
 	constructor(observabilityBus: EventBus, output: RpcSubagentOutput) {
 		this.#observabilityBus = observabilityBus;
@@ -150,6 +151,8 @@ export class RpcSubagentRegistry {
 		this.#subagents.clear();
 		this.#transcriptSessionFilesBySubagentId.clear();
 		this.#staleSubagentIds.clear();
+		this.#notifyChange();
+		this.#changeListeners.clear();
 	}
 
 	clear(): void {
@@ -161,6 +164,21 @@ export class RpcSubagentRegistry {
 		}
 		this.#subagents.clear();
 		this.#transcriptSessionFilesBySubagentId.clear();
+		this.#notifyChange();
+	}
+
+	/**
+	 * Call `listener` after every change to the roster `getSubagents` returns: a
+	 * subagent starts, reports progress or finishes, or the roster is cleared or
+	 * disposed. Returns the unsubscribe function.
+	 */
+	onChange(listener: () => void): () => void {
+		this.#changeListeners.add(listener);
+		return () => this.#changeListeners.delete(listener);
+	}
+
+	#notifyChange(): void {
+		for (const listener of this.#changeListeners) listener();
 	}
 
 	setSubscriptionLevel(level: RpcSubagentSubscriptionLevel): void {
@@ -236,6 +254,7 @@ export class RpcSubagentRegistry {
 		if (this.#subscriptionLevel !== "off") {
 			this.#output({ type: "subagent_lifecycle", payload });
 		}
+		this.#notifyChange();
 	}
 
 	handleProgress(payload: SubagentProgressPayload): void {
@@ -263,6 +282,7 @@ export class RpcSubagentRegistry {
 		if (this.#subscriptionLevel !== "off") {
 			this.#output({ type: "subagent_progress", payload });
 		}
+		this.#notifyChange();
 	}
 
 	handleEvent(payload: SubagentEventPayload): void {
@@ -298,10 +318,11 @@ export interface RpcOwnedSubagent {
 
 export interface RpcOwnedSubagentOptions {
 	/**
-	 * Also reach a subagent idle between its turns: an `idle` ref whose result
-	 * the parent has not accepted. A synchronous subagent waiting for its own
-	 * async jobs (an eval `agent()` handle) is idle there while `get_subagents`
-	 * still lists it running.
+	 * Also reach a subagent idle between its turns: an `idle` ref whose run is
+	 * still being driven (no `lifecycle.endedAt`) and whose result the parent
+	 * has not accepted. A synchronous subagent waiting for its own async jobs
+	 * (an eval `agent()` handle) is idle there while `get_subagents` still
+	 * lists it running.
 	 */
 	betweenTurns?: boolean;
 }
@@ -316,9 +337,12 @@ export interface RpcOwnedSubagentOptions {
  * carry the transcript file this session's roster recorded
  * (`<artifactsDir>/<id>.jsonl`) and still hold its live session. The ref must
  * be `running`, or with {@link RpcOwnedSubagentOptions.betweenTurns} `idle`
- * and not accepted: acceptance stamps `lifecycle.acceptedAt` and flips the ref
- * to `idle` before the terminal lifecycle frame prunes the roster, so an
- * accepted result stays out of reach.
+ * with its run neither ended nor accepted. The executor stamps
+ * `lifecycle.endedAt` once the run's drive ends, whatever the outcome, and
+ * acceptance also stamps `lifecycle.acceptedAt`; both happen before the
+ * cleanup and the terminal lifecycle frame that prunes the roster, so an
+ * accepted idle ref, and one whose run failed or stopped and is only being
+ * cleaned up, stay out of reach. A ref still `running` is reachable either way.
  */
 export function resolveOwnedLiveSubagent(
 	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
@@ -333,6 +357,9 @@ export function resolveOwnedLiveSubagent(
 	if (ref?.kind !== "sub" || !ref.session || ref.sessionFile !== snapshot.sessionFile) return undefined;
 	const reachable =
 		ref.status === "running" ||
-		(options?.betweenTurns === true && ref.status === "idle" && ref.lifecycle?.acceptedAt === undefined);
+		(options?.betweenTurns === true &&
+			ref.status === "idle" &&
+			ref.lifecycle?.endedAt === undefined &&
+			ref.lifecycle?.acceptedAt === undefined);
 	return reachable ? { ref, session: ref.session } : undefined;
 }
