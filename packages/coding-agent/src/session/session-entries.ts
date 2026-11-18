@@ -88,6 +88,11 @@ export interface NewSessionOptions {
 	additionalDirectories?: string[];
 	/** Directory for the new session file (and later `/new` sessions); defaults to the current session directory. */
 	sessionDir?: string;
+	/**
+	 * Id for the new session, in place of a minted one: for a launcher that records the id
+	 * before the session starts. The caller makes sure no stored session holds it.
+	 */
+	sessionId?: string;
 }
 
 export interface SessionEntryBase {
@@ -151,7 +156,7 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	model: string;
 	/** Role: "default", "smol", "slow", etc. Undefined treated as "default" */
 	role?: string;
-	/** True when this transition selected a retry-fallback model rather than the configured model. */
+	/** True when this transition selected a model other than the requested one: a retry-fallback model, or a model that replaced the requested one when the session started. */
 	resolvedModelIsFallback?: boolean;
 }
 
@@ -349,6 +354,8 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	display: boolean;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
+	/** Caller correlation id of the input this message came from (an extension's `sendUserInput` `tag`). */
+	tag?: string;
 }
 
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */

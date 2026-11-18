@@ -5,13 +5,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as agentCore from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { __resetProfileSnapshotForTests, getAgentDir, Snowflake, setAgentDir } from "@oh-my-pi/pi-utils";
+import { __resetProfileSnapshotForTests, getAgentDir, logger, Snowflake, setAgentDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { resolveRoleChain, resolveRoleSelection } from "../src/config/model-resolver";
 import { cfgDisabledProviders } from "../src/config/model-settings";
 import { Settings } from "../src/config/settings";
 import {
 	createSkillDescriptionCompressor,
+	openOnFirstUse,
 	previewSkillDescription,
 	SkillDescriptionCatalog,
 	type SkillDescriptionCompressor,
@@ -22,7 +23,13 @@ import type { AuthStorage } from "../src/session/auth-storage";
 import { CostCapError, type CostGateApi } from "../src/session/cost-gate";
 import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
-const ENV_KEYS = ["PI_CONFIG_DIR", "PI_CODING_AGENT_DIR", "XDG_DATA_HOME"] as const;
+const ENV_KEYS = [
+	"PI_CONFIG_DIR",
+	"PI_CODING_AGENT_DIR",
+	"XDG_DATA_HOME",
+	"OMP_CONFIG_ROOT",
+	"OMP_DOWNLOAD_ROOT",
+] as const;
 
 describe.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 	"skill description cache under XDG",
@@ -48,6 +55,9 @@ describe.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 			await fs.promises.mkdir(agentDir, { recursive: true });
 			process.env.PI_CONFIG_DIR = ".omp";
 			delete process.env.PI_CODING_AGENT_DIR;
+			// The default agent dir derives from that temp home, not the test process's own config root.
+			delete process.env.OMP_CONFIG_ROOT;
+			delete process.env.OMP_DOWNLOAD_ROOT;
 			__resetProfileSnapshotForTests();
 		});
 
@@ -387,6 +397,78 @@ describe("skill description failure caching and shutdown", () => {
 		expect(elapsed).toBeLessThan(5_000);
 		expect(storedDescriptions(store.path)).toEqual([]);
 	}, 6_000);
+
+	it("opens its store at the first render that has skills, not at construction or an empty render", async () => {
+		let opened: SkillDescriptionStore | undefined;
+		const open = vi.fn(() => {
+			opened = SkillDescriptionStore.open(path.join(tempDir, "cache.db"));
+			return opened;
+		});
+		const catalog = new SkillDescriptionCatalog({ store: open, compress: fast(async () => compressed) });
+		try {
+			expect(catalog.render([])).toEqual([]);
+			expect(open).toHaveBeenCalledTimes(0);
+
+			catalog.render([skill("first")]);
+			await catalog.waitForPending();
+			catalog.render([skill("second")]);
+			await catalog.waitForPending();
+			expect(open).toHaveBeenCalledTimes(1);
+			expect(storedDescriptions(path.join(tempDir, "cache.db"))).toEqual([compressed, compressed]);
+		} finally {
+			await opened?.close();
+		}
+	});
+
+	it("opens nothing when a session is disposed before it renders a skill", async () => {
+		const open = vi.fn(() => SkillDescriptionStore.open(path.join(tempDir, "cache.db")));
+		const catalog = new SkillDescriptionCatalog({
+			store: open,
+			compress: fast(async () => compressed),
+			deferCompression: true,
+		});
+		// What a session's start and disposal call on its catalog.
+		catalog.startCompression();
+		await catalog.waitForPending();
+
+		expect(open).toHaveBeenCalledTimes(0);
+		expect(fs.existsSync(path.join(tempDir, "cache.db"))).toBe(false);
+	});
+
+	it("opens a shared store once when two sessions' catalogs first render in the same turn", async () => {
+		const open = vi.fn(() => SkillDescriptionStore.open(path.join(tempDir, "cache.db")));
+		const shared = openOnFirstUse(open);
+		const first = new SkillDescriptionCatalog({ store: shared, compress: fast(async () => compressed) });
+		const second = new SkillDescriptionCatalog({ store: shared, compress: fast(async () => compressed) });
+		try {
+			// Both renders run before either catalog's compression writes anything.
+			first.render([skill("first")]);
+			second.render([skill("second")]);
+			await Promise.all([first.waitForPending(), second.waitForPending()]);
+
+			expect(open).toHaveBeenCalledTimes(1);
+			expect(storedDescriptions(path.join(tempDir, "cache.db"))).toEqual([compressed, compressed]);
+		} finally {
+			await shared()?.close();
+		}
+	});
+
+	it("logs a store that cannot be opened at the first render that has skills, and keeps the previews", () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const open = vi.fn((): SkillDescriptionStore => {
+			throw new Error("disk full");
+		});
+		const shared = openOnFirstUse(open);
+		const catalog = new SkillDescriptionCatalog({ store: shared, compress: fast(async () => compressed) });
+		expect(warn).toHaveBeenCalledTimes(0);
+
+		const entry = skill();
+		expect(catalog.render([entry])[0].description).toBe(previewSkillDescription(entry.description));
+		expect(warn).toHaveBeenCalledWith("Skill description cache unavailable", { error: "Error: disk full" });
+		new SkillDescriptionCatalog({ store: shared }).render([entry]);
+		expect(open).toHaveBeenCalledTimes(1);
+		expect(warn).toHaveBeenCalledTimes(1);
+	});
 });
 
 describe("previewSkillDescription", () => {

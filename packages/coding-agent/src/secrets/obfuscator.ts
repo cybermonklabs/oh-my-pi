@@ -1,3 +1,4 @@
+import { isAscii, LiteralIndex } from "./literal-index";
 import {
 	buildHashBase,
 	buildKeyedReplacementRun,
@@ -85,7 +86,6 @@ export type JsonRecord = { [key: string]: JsonValue | undefined };
 
 const EMPTY_SECRET_VALUES: ReadonlySet<string> = new Set();
 const NO_VALUES: readonly string[] = [];
-const NON_ASCII_RE = /[^\x00-\x7F]/;
 
 /** Distinct placeholder prefixes whose regex verdict is memoized; forged prefixes beyond this are just re-tested. */
 const MAX_PREFIX_REGEX_MEMO = 4096;
@@ -114,14 +114,14 @@ interface RegexScanMemo {
 }
 
 /**
- * One non-global regex matching any of `literals` anywhere: `test()` is true
- * exactly when some literal occurs, in a single scan instead of one
- * `includes` per literal. Undefined when there is nothing to detect.
+ * A detector of `literals` anywhere: `test()` is true exactly when some literal occurs, in a single
+ * scan instead of one `includes` per literal; under `ignoreCase`, an occurrence up to ASCII case,
+ * every literal then ASCII. No pattern grows with a literal. Undefined when there is nothing to
+ * detect.
  */
-function buildLiteralDetector(literals: readonly string[], flags?: string): RegExp | undefined {
+function buildLiteralDetector(literals: readonly string[], ignoreCase = false): LiteralIndex | undefined {
 	if (literals.length === 0) return undefined;
-	const sorted = [...new Set(literals)].sort((a, b) => b.length - a.length);
-	return new RegExp(sorted.map(literal => RegExp.escape(literal)).join("|"), flags);
+	return new LiteralIndex(literals, { ignoreCase });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -194,21 +194,21 @@ export class SecretObfuscator {
 	/** Literal-derived data (sorted mappings and detectors), valid for the recorded mapping versions. */
 	#sortedReplaceEntries: [string, string][] | undefined;
 	#sortedPlainEntries: [string, number][] | undefined;
-	#literalDetector: RegExp | undefined;
-	/** Literals, `$$` and case-sensitive probes in one regex; see {@link #mayNeedRedaction}. */
-	#cleanDetector: RegExp | undefined;
+	#literalDetector: LiteralIndex | undefined;
+	/** Literals, `$$` and case-sensitive probes in one detector; see {@link #mayNeedRedaction}. */
+	#cleanDetector: LiteralIndex | undefined;
 	/** Configured literals only (no `$$`); `null` when there are none. See {@link #isRedactionIdentity}. */
-	#configuredLiteralDetector: RegExp | null | undefined;
+	#configuredLiteralDetector: LiteralIndex | null | undefined;
 	#literalCachePlainVersion = -1;
 	#literalCacheReplaceVersion = -1;
 
 	/** Probes of case-sensitive probed regex entries. */
 	readonly #rawProbes: readonly string[];
-	/** Matches any probe of a case-sensitive / case-insensitive (folded) probed regex entry; undefined when there are none. */
-	#rawProbeDetector: RegExp | undefined;
-	#foldedProbeDetector: RegExp | undefined;
-	/** `i`-flag form of the folded probes, set only when every folded probe is ASCII; see {@link #foldedProbeHit}. */
-	#asciiFoldedProbeDetector: RegExp | undefined;
+	/** Detects any probe of a case-sensitive / case-insensitive (folded) probed regex entry; undefined when there are none. */
+	#rawProbeDetector: LiteralIndex | undefined;
+	#foldedProbeDetector: LiteralIndex | undefined;
+	/** ASCII case-insensitive form of the folded probes, set only when every folded probe is ASCII; see {@link #foldedProbeHit}. */
+	#asciiFoldedProbeDetector: LiteralIndex | undefined;
 
 	/** Per-string scan results of the {@link batch} in progress, if any; dropped when it ends. */
 	#batchScans: Map<string, TextScan> | undefined;
@@ -299,8 +299,8 @@ export class SecretObfuscator {
 		this.#rawProbeDetector = buildLiteralDetector(this.#rawProbes);
 		const foldedProbes = regexEntries.flatMap(entry => (entry.ignoreCase ? (entry.probes ?? []) : []));
 		this.#foldedProbeDetector = buildLiteralDetector(foldedProbes);
-		if (!foldedProbes.some(probe => NON_ASCII_RE.test(probe))) {
-			this.#asciiFoldedProbeDetector = buildLiteralDetector(foldedProbes, "i");
+		if (foldedProbes.every(probe => isAscii(probe))) {
+			this.#asciiFoldedProbeDetector = buildLiteralDetector(foldedProbes, true);
 		}
 		let index = 0;
 		let hasRealSec = regexEntries.length > 0;
@@ -418,13 +418,13 @@ export class SecretObfuscator {
 
 	/**
 	 * Whether any case-insensitive probe occurs in the lower-cased text. On
-	 * ASCII text with ASCII probes an `i`-flag regex gives the same answer
-	 * without copying the text; anything else (where `toLowerCase` and regex
-	 * case-insensitivity can disagree, e.g. `K` U+212A) folds as before.
+	 * ASCII text with ASCII probes an ASCII case-insensitive detector gives the
+	 * same answer without copying the text; anything else (where `toLowerCase`
+	 * and case-insensitive matching can disagree, e.g. `K` U+212A) folds as before.
 	 */
 	#foldedProbeHit(text: string, folded: () => string): boolean {
 		if (this.#foldedProbeDetector === undefined) return false;
-		if (this.#asciiFoldedProbeDetector !== undefined && !NON_ASCII_RE.test(text)) {
+		if (this.#asciiFoldedProbeDetector !== undefined && isAscii(text)) {
 			return this.#asciiFoldedProbeDetector.test(text);
 		}
 		return this.#foldedProbeDetector.test(folded());

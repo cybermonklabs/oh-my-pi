@@ -4,7 +4,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { getModelCacheWriteStats, readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import {
+	getModelCacheWriteStats,
+	readModelCache,
+	retainModelCacheConnection,
+	writeModelCache,
+} from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import { modelsDevCatalogFallback } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
@@ -222,11 +227,16 @@ describe("model cache write churn", () => {
 	});
 
 	it("reads back every bundled provider snapshot it writes", () => {
+		// What is checked is that each snapshot parses back whole, not that it is on the disk: one in-memory
+		// connection serves the writes and reads. A database file synced the disk some 400 times here, and on a
+		// loaded machine those syncs alone outlasted the test's timeout.
+		const memoryDb = ":memory:";
+		using _cache = retainModelCacheConnection(memoryDb);
 		const rejected: string[] = [];
 		for (const providerId of getBundledProviders()) {
 			const models = getBundledModels(providerId as GeneratedProvider);
-			writeModelCache(providerId, Date.now(), models, false, "fp", dbPath);
-			const entry = readModelCache(providerId, TTL_MS, Date.now, dbPath);
+			writeModelCache(providerId, Date.now(), models, false, "fp", memoryDb);
+			const entry = readModelCache(providerId, TTL_MS, Date.now, memoryDb);
 			if (entry?.models.length !== models.length) rejected.push(providerId);
 		}
 		expect(rejected).toEqual([]);

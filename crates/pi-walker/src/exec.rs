@@ -6,8 +6,8 @@
 //! input stream into a bounded job channel the workers share; their outputs
 //! come back as a stream in input order ([`ordered`]).
 //! Dropping the output stream aborts the feeder and the
-//! workers at their next suspension point; a panic in `work` resumes in the
-//! consumer.
+//! workers at their next suspension point; a panic in `work` or in the input
+//! stream resumes in the consumer.
 //!
 //! A pool costs a task hand-off per item, which dominates short runs (a
 //! small tree's files); [`adaptive`] runs items inline on the consumer's task
@@ -87,6 +87,9 @@ where
 	let (jobs, queue) = flume::bounded::<Job<I>>(states.len());
 	let mut tasks = Vec::with_capacity(states.len() + 1);
 	let permits = Arc::new(Semaphore::new(window.max(1)));
+	// Weak, so the outputs still end once every worker has gone: the feeder
+	// can outlive them, waiting on an input that never ends or on a permit.
+	let failed = results.downgrade();
 	tasks.push(
 		tokio::spawn(async move {
 			let mut inputs = pin!(inputs);
@@ -97,8 +100,20 @@ where
 				let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
 					return;
 				};
-				let Some(item) = inputs.next().await else {
-					return;
+				let item = match AssertUnwindSafe(inputs.next()).catch_unwind().await {
+					Ok(Some(item)) => item,
+					Ok(None) => return,
+					// The input's panic takes the next output's turn, so the
+					// consumer resumes it after every output before it rather
+					// than seeing the outputs end early.
+					Err(panic) => {
+						// With every worker gone, the consumer already has their
+						// panics, and nothing is left to report this one to.
+						if let Some(failed) = failed.upgrade() {
+							let _ = failed.send(Done { seq, output: Err(panic), permit });
+						}
+						return;
+					},
 				};
 				if jobs.send_async(Job { seq, item, permit }).await.is_err() {
 					return;
@@ -114,6 +129,20 @@ where
 		tasks.push(
 			tokio::spawn(async move {
 				let mut state = Some(state);
+				// flume 0.12's `recv_async` can lose a wakeup: a worker woken
+				// for a job another worker took misses a job sent while it
+				// waits again (zesterer/flume#177). Here that delays the
+				// missed job and never strands it. A receive takes a queued
+				// job before it waits, so the next worker to come back takes
+				// it, and the next send wakes the waiting worker. Every other
+				// worker holds a job queued before the missed one, and a worker
+				// comes back after each job unless the job panicked or the
+				// consumer is gone. If every other job panicked, the consumer
+				// reaches a panicked output before the missed job's turn and
+				// resumes the panic, which drops `Tasks` and aborts every task.
+				// The queue ends by closing (the feeder returns and drops
+				// `jobs`), and flume rechecks for a closed queue after a worker
+				// registers to wait, so the end is never missed.
 				while let Ok(Job { seq, item, permit }) = queue.recv_async().await {
 					let current = state
 						.take()
@@ -500,5 +529,66 @@ mod tests {
 			.await;
 		});
 		assert!(run.await.unwrap_err().is_panic());
+	}
+
+	/// A panic in the input stream resumes in the consumer after every
+	/// output before it, rather than ending the outputs early as if the
+	/// input were done.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn input_panics_resume_in_the_consumer() {
+		let inputs = stream::iter(0_u8..10).map(|n| {
+			assert_ne!(n, 5, "input boom");
+			n
+		});
+		let mut outputs = ordered(inputs, 2, 4, || (), |(), n| async move { ((), n) });
+		let mut got = Vec::new();
+		let resumed = loop {
+			match AssertUnwindSafe(outputs.next()).catch_unwind().await {
+				Ok(Some(n)) => got.push(n),
+				Ok(None) => break None,
+				Err(panic) => break Some(panic),
+			}
+		};
+		assert_eq!(got, [0, 1, 2, 3, 4]);
+		let panic = resumed.expect("the input panic was swallowed; the outputs ended early");
+		let message = panic.downcast_ref::<String>().map_or("", String::as_str);
+		assert!(message.contains("input boom"), "{message:?}");
+	}
+
+	/// The outputs end once every worker has gone, also while the feeder
+	/// still waits on its input: a consumer that catches each resumed panic
+	/// and polls again must not wait for ever.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn outputs_end_when_every_worker_panicked_and_the_input_waits() {
+		let default = std::panic::take_hook();
+		std::panic::set_hook(Box::new(move |info| {
+			if !info.to_string().contains("work boom") {
+				default(info);
+			}
+		}));
+		let inputs = stream::iter(0..2_u32).chain(stream::pending());
+		let mut outputs = ordered(
+			inputs,
+			2,
+			4,
+			|| (),
+			|(), n: u32| async move {
+				assert!(n > 100, "work boom");
+				((), n)
+			},
+		);
+		let mut panics = 0;
+		let ended = tokio::time::timeout(Duration::from_secs(10), async {
+			loop {
+				match AssertUnwindSafe(outputs.next()).catch_unwind().await {
+					Ok(Some(_)) => {},
+					Ok(None) => break,
+					Err(_) => panics += 1,
+				}
+			}
+		})
+		.await;
+		assert!(ended.is_ok(), "outputs never ended after {panics} panics");
+		assert_eq!(panics, 2, "each worker's panic resumes once");
 	}
 }
