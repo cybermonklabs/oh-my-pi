@@ -1250,6 +1250,14 @@ impl<M: Matcher> LineMatcher<M> {
 					if in_line.is_some() {
 						return Ok(in_line);
 					}
+					// No line follows the last one. Searched from its end, the
+					// text engine would read an empty rest of the buffer, where
+					// `^$` (or `\A\z` under `-z`) matches and the searcher takes
+					// that match for the line before: `printf '\377\nb\n' |
+					// LC_ALL=C grep -z '^$'` selects nothing.
+					if end == haystack.len() {
+						return Ok(None);
+					}
 					from = end;
 				},
 				None if to == haystack.len() => return Ok(None),

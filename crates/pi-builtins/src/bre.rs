@@ -441,6 +441,68 @@ fn bracket_text(chars: &mut Peekable<Chars<'_>>, out: &mut String) -> bool {
 	false
 }
 
+/// Whether GNU's regex searches `pattern` a byte at a time in a UTF-8
+/// locale, where a match may then start, and an empty one fall, inside a
+/// character of several bytes: `sed 's/x*/-/g'` on `é` prints
+/// `-\303-\251-`. glibc does so unless the pattern holds a bracket
+/// expression that negates, holds a range, a class or a character outside
+/// ASCII, or one of `\w`, `\W`, `\s`, `\S`, `\b`, `\B`, `\<` and `\>`; such
+/// a pattern is searched a character at a time (`sed 's/[^é]*/-/g'` on `éa`
+/// prints `-é-`), as is any pattern read without case (the `I` flag), which
+/// the caller answers.
+#[cfg(feature = "util.sed")]
+pub(crate) fn searched_by_byte(pattern: &str) -> bool {
+	let mut chars = pattern.chars().peekable();
+	while let Some(c) = chars.next() {
+		match c {
+			'\\' => {
+				if chars.next_if(|&c| matches!(c, 'w' | 'W' | 's' | 'S' | 'b' | 'B' | '<' | '>')).is_some() {
+					return false;
+				}
+				chars.next();
+			},
+			'[' => {
+				if !plain_bracket(&mut chars) {
+					return false;
+				}
+			},
+			_ => {},
+		}
+	}
+	true
+}
+
+/// Whether the bracket expression whose `[` is already consumed is a plain
+/// list of ASCII characters, which glibc reads as a set of bytes. The
+/// iterator ends past it. One the translation refuses answers either way.
+#[cfg(feature = "util.sed")]
+fn plain_bracket(chars: &mut Peekable<Chars<'_>>) -> bool {
+	if chars.next_if_eq(&'^').is_some() {
+		return false;
+	}
+	let mut first = true;
+	loop {
+		let Ok(member) = take_bracket_member(chars, first) else {
+			return true;
+		};
+		first = false;
+		match member {
+			BracketMember::Class(_) => return false,
+			BracketMember::Char(c) | BracketMember::Equivalence(c) if !c.is_ascii() => return false,
+			BracketMember::Char(_) if opens_range(chars) => return false,
+			BracketMember::Char(_) | BracketMember::Equivalence(_) => {},
+		}
+		match chars.peek() {
+			None => return true,
+			Some(']') => {
+				chars.next();
+				return true;
+			},
+			Some(_) => {},
+		}
+	}
+}
+
 /// A group that is still open.
 struct OpenGroup {
 	/// Where in `out` it begins.
