@@ -322,16 +322,23 @@ describe("session blobs in the SQL session storage", () => {
 
 				gate?.close();
 				manager.appendMessage(imageTurn("look"));
-				await gate?.paused();
 				const flushing = manager.flush();
-				// A real wait: what must not happen is a commit on the database server, which
-				// no fake clock reaches. Without the barrier the line commits well within it.
-				await Bun.sleep(500);
-				// The blob's row is inserted, not committed: the line naming it waits.
-				expect((await db.row(sessionFile))?.content ?? "").not.toContain(IMAGE_HASH);
-				expect(await blobHashes(db)).toEqual([]);
-
-				gate?.open();
+				try {
+					// The blob's insert is held open; the flush of the line naming it must not finish first.
+					const first = await Promise.race([
+						gate?.paused().then(() => "blob insert held"),
+						flushing.then(() => "transcript flushed"),
+					]);
+					expect(first).toBe("blob insert held");
+					// A real wait: what must not happen is a commit on the database server, which
+					// no fake clock reaches. Without the barrier the line commits well within it.
+					await Bun.sleep(500);
+					// The blob's row is inserted, not committed: the line naming it waits.
+					expect((await db.row(sessionFile))?.content ?? "").not.toContain(IMAGE_HASH);
+					expect(await blobHashes(db)).toEqual([]);
+				} finally {
+					gate?.open();
+				}
 				await flushing;
 				expect((await db.row(sessionFile))?.content ?? "").toContain(IMAGE_HASH);
 				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);

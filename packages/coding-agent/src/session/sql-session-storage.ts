@@ -1159,7 +1159,8 @@ function buildQueries(
 					Array.from({ length: count }, (_unused, index) => `@h${index}`).join(", ") +
 					")",
 			),
-		maxPacket: mysql ? sql("SELECT @@max_allowed_packet AS max_packet") : undefined,
+		// Not through `sql`, which reads `@name` as a bound value.
+		maxPacket: mysql ? { sql: "SELECT @@max_allowed_packet AS max_packet", params: [] } : undefined,
 		lease:
 			adapter === "sqlite"
 				? undefined
