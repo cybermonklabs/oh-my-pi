@@ -785,7 +785,7 @@ export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear">;
  * subagents through the same path as the Agent Hub / collab `kill` command.
  * Aborting the live turn and releasing the registry ref as an `aborted`
  * tombstone settles the owning `task` call (foreground or background) with an
- * aborted result, and disposing the session cancels its nested children.
+ * aborted result, and disposing the session stops its nested children.
  *
  * Only ids this session reported as running are reachable (see
  * {@link resolveOwnedLiveSubagent}). Returns `false` (a no-op) for unknown,
@@ -805,7 +805,10 @@ export async function handleRpcCancelSubagent(
 	// tombstone write is reported here instead of escaping as an unhandled
 	// rejection while the abort is pending.
 	const [released, aborted] = await Promise.allSettled([
-		AgentLifecycleManager.global().release(subagentId, owned.ref, { tombstone: true }),
+		AgentLifecycleManager.global().release(subagentId, owned.ref, {
+			tombstone: true,
+			dispose: { ownedJobsEnd: "stop" },
+		}),
 		owned.session.abort({ reason: USER_INTERRUPT_LABEL }),
 	]);
 	if (released.status === "rejected") throw released.reason;

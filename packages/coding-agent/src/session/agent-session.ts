@@ -322,6 +322,7 @@ import type {
 	FreshSessionResult,
 	HandoffResult,
 	ModelCycleResult,
+	OwnedJobsEnd,
 	Prewalk,
 	PromptOptions,
 	ResetSessionContextResult,
@@ -3607,7 +3608,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 *
 	 * Each job aborts with `reason`, whose kind a subagent of the job reads
 	 * ({@link turnAbortKind}): a lifecycle transition of the session itself (`/new`,
-	 * a switch, a branch, a context reset) stops it; a dispose cuts it off.
+	 * a switch, a branch, a context reset) stops it; a dispose ends it as the dispose
+	 * says ({@link AgentSessionDisposeOptions.ownedJobsEnd}): a stop for a kill or for
+	 * the release of a subagent whose run a stop or its finish ended, a cut-off otherwise.
 	 */
 	#cancelOwnAsyncJobs(reason: unknown): void {
 		if (!this.#agentId) return;
@@ -6674,27 +6677,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#disposeCall;
 	}
 
-	/**
-	 * Ends the jobs this session owns as it is disposed. `processExit`: the dispose is for the
-	 * process going away (`postmortem.Reason.EXIT`, as the release of a subagent its manager's
-	 * shutdown ended passes).
-	 */
-	async #disposeOwnedAsyncJobs(processExit: boolean): Promise<void> {
+	/** Ends the jobs this session owns as it is disposed, the way `ownedJobsEnd` says ({@link OwnedJobsEnd}). */
+	async #disposeOwnedAsyncJobs(ownedJobsEnd: OwnedJobsEnd | undefined): Promise<void> {
 		// Unregister before cancelling: a job completing during teardown must
 		// dead-letter rather than enqueue a follow-up into a disposing session.
 		this.#unregisterAsyncDeliverySink?.();
 		this.#unregisterAsyncDeliverySink = undefined;
 		const manager = this.#ownedAsyncJobManager;
 		// The kind of the session's end reaches the subagents of its jobs (eval `agent()`
-		// handles, workpool batches; {@link turnAbortKind}). The top-level session that OWNS
-		// the manager, and a subagent disposed for the process exit, go away with the process:
-		// the shutdown reason cuts their jobs off, and the task executor parks (rather than
-		// tombstones) the subagents, so `omp --restore` goes on with them. Any other dispose of
-		// a subagent (a kill, the release of one that finished or was stopped) leaves
-		// `#ownedAsyncJobManager` undefined and stops its jobs, so their subagents end with it
-		// and `--restore` leaves them.
+		// handles, workpool batches; {@link turnAbortKind}). A dispose that stops the session (a
+		// kill, the release of a subagent whose run a stop or its finish ended) stops them, so
+		// their subagents end with it and `--restore` leaves them. Any other dispose, idle or
+		// running (the process exit, the lifecycle's teardown or park of a subagent, the
+		// top-level session that owns the manager), cuts them off with the shutdown reason: the
+		// task executor parks (rather than tombstones) their subagents, so `omp --restore` goes
+		// on with them.
 		this.#cancelOwnAsyncJobs(
-			manager || processExit ? ASYNC_JOB_MANAGER_SHUTDOWN_REASON : plainTurnAbortReason("stop"),
+			ownedJobsEnd === "stop" ? plainTurnAbortReason("stop") : ASYNC_JOB_MANAGER_SHUTDOWN_REASON,
 		);
 		if (!manager) return;
 
@@ -6868,7 +6867,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
 		releaseShellSessions(this.sessionManager.getSessionId());
 		const results = await Promise.allSettled([
-			this.#disposeOwnedAsyncJobs(processExit),
+			this.#disposeOwnedAsyncJobs(options.ownedJobsEnd),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.#eval.getKernelOwnerId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),

@@ -55,6 +55,15 @@ import type { SessionManager } from "./session-manager";
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
 export const SHUTDOWN_CONSOLIDATE_BUDGET_MS = 1_500;
 
+/**
+ * How a dispose ends the jobs the session owns (its eval `agent()` handles, its workpool
+ * batches), whose subagents read the kind from the abort reason: `"stop"` stops them, so
+ * their subagents end with the session and `omp --restore` leaves them; `"shutdown"` cuts
+ * them off with the job manager's shutdown reason, so the task executor parks their
+ * subagents and `omp --restore` goes on with them.
+ */
+export type OwnedJobsEnd = "stop" | "shutdown";
+
 /** Options controlling session disposal. */
 export interface AgentSessionDisposeOptions {
 	mnemopiConsolidateTimeoutMs?: number;
@@ -73,6 +82,14 @@ export interface AgentSessionDisposeOptions {
 	 * interrupted, so `omp --restore` goes on with it.
 	 */
 	reason?: postmortem.Reason;
+	/**
+	 * How this dispose ends the jobs the session owns ({@link OwnedJobsEnd}). A dispose that
+	 * names none cuts them off, as `"shutdown"` does: only a path that stops the session
+	 * says `"stop"` (a kill, the release of a subagent whose run a stop or its finish ended).
+	 * Apart from {@link reason}, so the process teardown cuts off an idle subagent's jobs
+	 * while its `session_exit` record stays a plain dispose.
+	 */
+	ownedJobsEnd?: OwnedJobsEnd;
 }
 
 /** Listener notified when command metadata changes. */

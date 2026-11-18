@@ -4,8 +4,9 @@
  * subagent that owns the job, or its parent's stop, stops it, and `--restore` leaves it;
  * `--restore` leaves every subagent under a subagent that was killed or whose last turn a
  * stop ended, even one that a cancel giving no reason cut off; and the parent's process
- * exit still leaves the whole chain for `--restore`. A subagent's dispose stops the jobs
- * it owns, unless the dispose is for the process exit, which shuts them down.
+ * exit still leaves the whole chain for `--restore`, also when the subagent that owns the
+ * job is idle. A subagent's dispose stops the jobs it owns only when it says so (a kill);
+ * any other dispose cuts them off.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -24,10 +25,11 @@ import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "@oh-my-pi/pi
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { handleRpcCancelSubagent } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -59,6 +61,8 @@ const NOTES_FILE = "notes.txt";
 /** The reason on the record a stop of a turn waiting to retry ends it with, as its transcript stores it. */
 const RETRY_CANCELLED_RECORD = "Retry cancelled";
 const KEY_ERROR = "Retry budget exhausted after 2 retries: No API key for provider: anthropic";
+/** The parent's IRC message that wakes an idle planner for a turn that starts the reader. */
+const WAKE_MESSAGE = "Start a reader for the notes now.";
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 let savedEnv: Record<string, string | undefined> = {};
@@ -173,12 +177,15 @@ function holdBackoff(expected: number) {
  * A parent session on the production SDK path whose model spawns `PLANNER` as a sync task
  * subagent. The planner's model runs `READER_CELL`, which starts a `READER` as a background
  * job the planner owns, then holds its next request until something ends the planner's run.
+ * With `readerOnWake`, the planner's run instead answers at once, so the planner stays
+ * adopted and idle; the turn a `WAKE_MESSAGE` wakes it for runs `READER_CELL` and then
+ * answers (`wakeTurnAnswered`), which leaves the planner idle again while the reader runs.
  * The reader's model is on anthropic, keyed by the store's only OAuth login; its first
  * request disables that login, as a failed refresh does, so its next request has no key and
  * its turn waits out a retry backoff. `roster` is the RPC host's view of the subagents, and
  * every subagent run's result is collected in `runs`.
  */
-async function openParentWithPlanner() {
+async function openParentWithPlanner(options: { readerOnWake?: boolean } = {}) {
 	const cwd = root.join("home", "work");
 	await Bun.write(path.join(cwd, NOTES_FILE), "the notes\n");
 	const authStorage = await AuthStorage.create(root.join("parentauth.db"), { usageProviderResolver: () => undefined });
@@ -207,12 +214,19 @@ async function openParentWithPlanner() {
 		},
 	});
 	const plannerHolds = Promise.withResolvers<void>();
+	const wakeTurnAnswered = Promise.withResolvers<void>();
 	const plannerModel = createMockModel({
 		id: "planner-model",
 		handler: context => {
 			if (!(context.tools ?? []).some(tool => tool.name === "eval")) return { content: ["label"] };
+			const woken = context.messages.some(message => JSON.stringify(message).includes(WAKE_MESSAGE));
+			if (options.readerOnWake && !woken) return { content: ["Ready."] };
 			if (!context.messages.some(message => message.role === "toolResult")) {
 				return { content: [READER_CELL], stopReason: "toolUse" };
+			}
+			if (options.readerOnWake) {
+				wakeTurnAnswered.resolve();
+				return { content: ["The reader is reading."] };
 			}
 			// The reader runs in the background; this request lasts until the planner's run ends.
 			plannerHolds.resolve();
@@ -288,7 +302,13 @@ async function openParentWithPlanner() {
 	});
 	cleanups.push(() => session.dispose());
 	cleanups.push(() => disposeAllVmContexts());
-	return { parent: session, roster, runs, plannerHolds: plannerHolds.promise };
+	return {
+		parent: session,
+		roster,
+		runs,
+		plannerHolds: plannerHolds.promise,
+		wakeTurnAnswered: wakeTurnAnswered.promise,
+	};
 }
 
 /**
@@ -484,6 +504,56 @@ describe("omp --restore after the parent's process exit cut off a subagent whose
 	}, 30_000);
 });
 
+/** Resolves once the registry reports agent `id` at `status`. */
+function untilStatus(id: string, status: AgentStatus): Promise<void> {
+	const registry = AgentRegistry.global();
+	if (registry.get(id)?.status === status) return Promise.resolve();
+	const reached = Promise.withResolvers<void>();
+	const unsubscribe = registry.onChange(event => {
+		if (event.ref.id !== id || event.ref.status !== status) return;
+		unsubscribe();
+		reached.resolve();
+	});
+	return reached.promise;
+}
+
+describe("omp --restore after the parent's process exit released an idle subagent whose eval agent() job's subagent waited to retry its key", () => {
+	it("relaunches the job's subagent", async () => {
+		// If this regresses, the process teardown releases the idle subagent without saying how its jobs end, and
+		// its dispose stops the job its IRC wake turn started: the job's subagent ends on "Retry cancelled", and
+		// `omp --restore` leaves the work the exit cut off unfinished.
+		IrcBus.resetGlobalForTests();
+		cleanups.push(() => IrcBus.resetGlobalForTests());
+		const { parent, runs, wakeTurnAnswered } = await openParentWithPlanner({ readerOnWake: true });
+		await parent.prompt("Have the notes read.");
+		const plannerId = AgentRegistry.global()
+			.list()
+			.find(ref => ref.kind === "sub" && ref.parentId === MAIN_AGENT_ID)?.id;
+		if (!plannerId) throw new Error("Expected the planner's run to leave it registered");
+		expect(AgentRegistry.global().get(plannerId)?.status).toBe("idle");
+		expect(AgentLifecycleManager.global().has(plannerId)).toBe(true);
+
+		// The parent messages the idle planner, as `write agent://<id>` does: a turn of the planner its run did
+		// not drive starts the reader, then ends with the reader's job still running.
+		const backoff = holdBackoff(1);
+		const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: plannerId, body: WAKE_MESSAGE });
+		expect(receipt.outcome).toBe("woken");
+		await Promise.all([wakeTurnAnswered, backoff.allHeld]);
+		await untilStatus(plannerId, "idle");
+		expect(parent.asyncJobManager?.getRunningJobs({ ownerId: plannerId })).toHaveLength(1);
+
+		// A SIGTERM's teardown: the SDK dispose for the process exit, which disposes the agent lifecycle first.
+		await parent.dispose({ reason: postmortem.Reason.EXIT });
+
+		const { outcome, planner, reader } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		expect(planner.aborted).toBe(false);
+		expect(turnEnd(reader)).toEqual(CUT_OFF);
+		expect(outcome.subagents).toEqual([reader.agentId]);
+	}, 30_000);
+});
+
 describe("a subagent session's dispose ends the jobs it owns as the dispose says", () => {
 	/**
 	 * A subagent session (no job manager of its own, the shared `manager`) owning a running job,
@@ -526,13 +596,24 @@ describe("a subagent session's dispose ends the jobs it owns as the dispose says
 		return { session, abortReason: abortReason.promise };
 	}
 
-	it("stops them when the subagent is killed or released", async () => {
+	it("cuts them off when the dispose names no kind", async () => {
+		// If this regresses, a dispose that does not say it stops (the process teardown's release of an idle
+		// subagent, a park) stops its jobs: their subagents end on "Retry cancelled", and `omp --restore` leaves
+		// work nothing stopped.
+		const manager = new AsyncJobManager({});
+		cleanups.push(() => manager.dispose({ timeoutMs: 1000 }));
+		const { session, abortReason } = await subagentOwningJob(manager);
+		await session.dispose();
+		expect(await abortReason).toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+	});
+
+	it("stops them when the dispose is a kill's", async () => {
 		// If this regresses, a killed subagent's jobs read to their subagents as a process exit: they keep their
 		// turns for `omp --restore`, which relaunches them under a subagent the user killed.
 		const manager = new AsyncJobManager({});
 		cleanups.push(() => manager.dispose({ timeoutMs: 1000 }));
 		const { session, abortReason } = await subagentOwningJob(manager);
-		await session.dispose();
+		await session.dispose({ ownedJobsEnd: "stop" });
 		expect(turnAbortKind(await abortReason)).toBe("stop");
 	});
 

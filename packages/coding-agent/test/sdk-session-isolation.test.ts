@@ -5,12 +5,13 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON } from "@oh-my-pi/pi-coding-agent/async";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -371,8 +372,62 @@ describe("createAgentSession session storage isolation", () => {
 		expect(suspend).toHaveBeenCalledWith(
 			{ ownerId: "Main", parentSessionId, parentSessionFile },
 			session.asyncJobManager,
+			"shutdown",
 		);
 		expect(suspend.mock.invocationCallOrder[0]).toBeLessThan(lifecycleDispose.mock.invocationCallOrder[0]);
+	});
+
+	it("cuts off the turns of its Vibe workers at its teardown", async () => {
+		// If this regresses, the parent's teardown stops a worker's turn: the worker's run ends as stopped work,
+		// its own jobs stop with it, and `omp --restore` leaves what the teardown cut off.
+		VibeSessionRegistry.resetGlobalForTests();
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-vibe-teardown-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		const sessionManager = SessionManager.inMemory(cwd);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: path.join(tempDir, "agent"),
+			modelRegistry: sharedModelRegistry,
+			settings: Settings.isolated(),
+			sessionManager,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		const manager = session.asyncJobManager;
+		if (!manager) throw new Error("Expected the session to own a job manager");
+		// A worker turn in flight: a job of the parent under a worker record in the parent's scope, which
+		// `registerRecordForTests` keys by the `test-parent-session` id and no session file.
+		vi.spyOn(sessionManager, "getSessionId").mockReturnValue("test-parent-session");
+		const turnAbortReason = Promise.withResolvers<unknown>();
+		const jobId = manager.register(
+			"task",
+			"vibe worker turn",
+			({ signal }) => {
+				const ended = Promise.withResolvers<string>();
+				signal.addEventListener(
+					"abort",
+					() => {
+						turnAbortReason.resolve(signal.reason);
+						ended.resolve("cut off");
+					},
+					{ once: true },
+				);
+				return ended.promise;
+			},
+			{ ownerId: MAIN_AGENT_ID },
+		);
+		VibeSessionRegistry.global().registerRecordForTests({ id: "worker", ownerId: MAIN_AGENT_ID, jobId });
+
+		await session.dispose();
+
+		expect(await turnAbortReason.promise).toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 	});
 
 	it("wires the discovered TTSR manager into the created session", async () => {

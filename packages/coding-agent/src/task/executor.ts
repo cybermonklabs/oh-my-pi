@@ -3768,10 +3768,16 @@ export async function finalizeSubagentLifecycle(args: {
 	// process exit, so `omp --restore` goes on with the turn the shutdown cut off.
 	// An explicit kill (Agent Hub, RPC `cancel_subagent`, collab, vibe) publishes
 	// the `aborted` tombstone before the run observes its abort, and stays terminal.
+	// The run's end already reaped the session's own jobs (the monitor's
+	// `ownedJobsAbortReason`); each dispose below ends any it still owns the same way:
+	// a shutdown cuts them off, and every other end of the run (a kill, a stop, its own
+	// limit, a finished run) stops them.
+	const stopDispose: AgentSessionDisposeOptions = { ownedJobsEnd: "stop" };
 	const resumableAbort =
 		args.abortKind !== "shutdown" && args.keepAlive && args.reviveSession !== null && ref?.status !== "aborted";
 	if (args.aborted && !resumableAbort) {
-		const shutdownDispose = args.abortKind === "shutdown" ? { reason: postmortem.Reason.EXIT } : undefined;
+		const shutdownDispose: AgentSessionDisposeOptions | undefined =
+			args.abortKind === "shutdown" ? { reason: postmortem.Reason.EXIT, ownedJobsEnd: "shutdown" } : undefined;
 		if (ref && ownsRef) {
 			if (shutdownDispose) {
 				try {
@@ -3789,16 +3795,16 @@ export async function finalizeSubagentLifecycle(args: {
 				// decision is durable and a restart cannot rediscover the transcript
 				// as a revivable parked agent.
 				try {
-					await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true });
+					await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true, dispose: stopDispose });
 				} catch (error) {
 					logger.warn("runSubagent: failed to persist kill tombstone", { id: args.id, error: String(error) });
 					registry.setStatus(args.id, "aborted", ref);
 					registry.detachSession(args.id, ref);
-					await disposeSession();
+					await disposeSession(stopDispose);
 				}
 			}
 		} else {
-			await disposeSession(shutdownDispose);
+			await disposeSession(shutdownDispose ?? stopDispose);
 		}
 		await releaseOwnedResources();
 		return;
@@ -3806,7 +3812,7 @@ export async function finalizeSubagentLifecycle(args: {
 
 	if (!args.keepAlive) {
 		// One-shot helper: dispose and unregister. No IRC, no revival.
-		await disposeSession();
+		await disposeSession(stopDispose);
 		if (ref && ownsRef) registry.unregister(args.id, ref);
 		await releaseOwnedResources();
 		return;
@@ -3815,7 +3821,7 @@ export async function finalizeSubagentLifecycle(args: {
 	// Keep-alive: finished and failed subagents both stay interrogable.
 	// The lifecycle manager owns idle-TTL parking + revival from here on.
 	if (!ref || !ownsRef || !registry.setStatus(args.id, "idle", ref)) {
-		await disposeSession();
+		await disposeSession(stopDispose);
 		await releaseOwnedResources();
 		return;
 	}

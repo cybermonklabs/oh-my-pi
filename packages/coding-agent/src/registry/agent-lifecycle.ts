@@ -135,7 +135,10 @@ interface ReopeningAgent {
 export interface AgentReleaseOptions {
 	/** Explicit kill: keep a terminal `aborted` row and persist the kill marker. */
 	tombstone?: boolean;
-	/** Forwarded to the live session's dispose (e.g. the reason its `session_exit` record carries). */
+	/**
+	 * Forwarded to the live session's dispose: the reason its `session_exit` record carries, and
+	 * how its own jobs end (a kill names `ownedJobsEnd: "stop"`; none named cuts them off).
+	 */
 	dispose?: AgentSessionDisposeOptions;
 }
 
@@ -438,7 +441,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				this.#registry.setStatus(id, "parked", ref);
 
 				try {
-					await session.dispose();
+					// A park puts an idle agent to sleep; nothing stopped it, so its own jobs are
+					// cut off, not stopped, as the process teardown cuts them off.
+					await session.dispose({ ownedJobsEnd: "shutdown" });
 				} catch (error) {
 					logger.warn("AgentLifecycleManager.park: session dispose failed", { id, error: String(error) });
 				}
@@ -699,14 +704,17 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		this.#disposed = true;
 		this.#unsubscribe = undefined;
 		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
-		// A turn still running (a revived or woken agent) is cut off by this
-		// teardown, not stopped: its session records a process exit, so
-		// `omp --restore` goes on with it.
-		const cutOff: AgentReleaseOptions = { dispose: { reason: postmortem.Reason.EXIT } };
+		// The process teardown cuts every agent's own jobs off, idle or running: their
+		// subagents are parked, not stopped, so `omp --restore` goes on with them. A turn
+		// still running (a revived or woken agent) is cut off too, not stopped: its session
+		// records a process exit, so `omp --restore` goes on with it. An idle agent's
+		// `session_exit` record stays a plain dispose.
+		const idle: AgentReleaseOptions = { dispose: { ownedJobsEnd: "shutdown" } };
+		const running: AgentReleaseOptions = { dispose: { reason: postmortem.Reason.EXIT, ownedJobsEnd: "shutdown" } };
 		await Promise.all(
 			ids.map(async id => {
-				const running = this.#registry.get(id)?.status === "running";
-				const release = this.release(id, undefined, running ? cutOff : undefined).then(() => {});
+				const options = this.#registry.get(id)?.status === "running" ? running : idle;
+				const release = this.release(id, undefined, options).then(() => {});
 				try {
 					await untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), () => release);
 				} catch (error) {

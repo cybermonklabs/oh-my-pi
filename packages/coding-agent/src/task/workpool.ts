@@ -485,7 +485,10 @@ export class WorkPool {
 			// declaration and an empty runtime set.
 			if (ref) {
 				try {
-					await AgentLifecycleManager.global().release(agent.id, ref, { tombstone: true });
+					await AgentLifecycleManager.global().release(agent.id, ref, {
+						tombstone: true,
+						dispose: { ownedJobsEnd: "stop" },
+					});
 				} catch (releaseError) {
 					logger.warn("workpool: failed to release worker after yield clear failure", {
 						pool: this.name,

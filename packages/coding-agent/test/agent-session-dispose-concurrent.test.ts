@@ -102,11 +102,12 @@ describe("AgentSession concurrent disposal", () => {
 		expect(abortReason).toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 	});
 
-	it("propagates a generic cancellation for a subagent dispose so nested children stay terminal", async () => {
+	it("propagates a stop for a subagent's kill dispose so nested children stay terminal", async () => {
 		// A subagent session leaves `ownedAsyncJobManager` undefined and inherits
-		// the shared manager. Its dispose (e.g. `release({ tombstone: true })`
-		// during an explicit hard kill) must NOT tag its owned jobs as shutdown,
-		// or nested children would be rediscovered as parked instead of terminal.
+		// the shared manager. The dispose of an explicit hard kill
+		// (`release({ tombstone: true, dispose: { ownedJobsEnd: "stop" } })`) must NOT
+		// tag its owned jobs as shutdown, or nested children would be rediscovered as
+		// parked instead of terminal.
 		const shared = new AsyncJobManager({ maxRunningJobs: 1 });
 		const started = Promise.withResolvers<void>();
 		let abortReason: unknown;
@@ -132,7 +133,7 @@ describe("AgentSession concurrent disposal", () => {
 		const current = createSession(undefined, { agentId: "Sub", asyncJobManager: shared });
 
 		await started.promise;
-		await current.dispose();
+		await current.dispose({ ownedJobsEnd: "stop" });
 		session = undefined;
 
 		expect(abortReason).not.toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);

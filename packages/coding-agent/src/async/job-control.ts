@@ -590,10 +590,11 @@ export async function cancelAgentRegistration(
 		if (ref.status === "running" && ref.session) {
 			await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 		}
+		// A kill: the agent's own jobs stop with it, so their subagents end and `--restore` leaves them.
 		if (lifecycle) {
-			await lifecycle.release(id);
+			await lifecycle.release(id, undefined, { dispose: { ownedJobsEnd: "stop" } });
 		} else {
-			await ref.session?.dispose();
+			await ref.session?.dispose({ ownedJobsEnd: "stop" });
 			registry?.unregister(id);
 		}
 	} catch (error) {

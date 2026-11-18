@@ -5572,7 +5572,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							settings,
 							getActiveModelString,
 						};
-						await vibeRegistry.suspendScope(vibeRegistry.ownerScope(vibeParentSession), scopedAsyncJobManager);
+						// The teardown cuts the workers' turns and their own jobs off, as the
+						// lifecycle's teardown below cuts off every adopted agent's own jobs.
+						await vibeRegistry.suspendScope(
+							vibeRegistry.ownerScope(vibeParentSession),
+							scopedAsyncJobManager,
+							"shutdown",
+						);
 						await AgentLifecycleManager.global().dispose();
 					}
 					await originalDispose(disposeOptions);
