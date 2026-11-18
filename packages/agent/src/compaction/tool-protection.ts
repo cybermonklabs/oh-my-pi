@@ -1,5 +1,6 @@
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { AgentMessage, AgentToolCall } from "../types";
+import { compactionKeptStart } from "./compaction";
 import type { SessionEntry } from "./entries";
 
 export interface ProtectedToolContext {
@@ -90,21 +91,18 @@ function prefixToolCall(index: PrefixToolCalls, id: string): AgentToolCall | und
  *
  * A compaction that kept no entry (`firstKeptEntryId: ""`, as an Anthropic
  * native compaction that summarizes everything leaves) keeps nothing before
- * it: the boundary is that compaction, the latest on `entries`, or the entry
- * after the one its native replay covers when turns were appended while it
- * ran. The context the coding agent sends starts there too
- * (`compactionKeptStart`); reading `""` as no boundary would walk, and read the
- * bodies of, the whole branch on every pass.
+ * it: the boundary is where the context starts for the latest compaction on
+ * `entries` ({@link compactionKeptStart}), that compaction or the entry after
+ * the one its native replay covers when turns were appended while it ran.
+ * Reading `""` as no boundary would walk, and read the bodies of, the whole
+ * branch on every pass.
  */
 export function resolveBoundaryIndex(entries: readonly SessionEntry[], keepBoundaryId: string | undefined): number {
 	if (keepBoundaryId === undefined) return 0;
 	if (keepBoundaryId === "") {
 		for (let i = entries.length - 1; i >= 0; i--) {
 			const entry = entries[i];
-			if (entry.type !== "compaction") continue;
-			const replayThroughId = entry.providerReplayThroughEntryId;
-			const replayThroughIndex = replayThroughId ? entries.findIndex(other => other.id === replayThroughId) : -1;
-			return replayThroughIndex >= 0 && replayThroughIndex + 1 < i ? replayThroughIndex + 1 : i;
+			if (entry.type === "compaction") return compactionKeptStart(entries, entry, i);
 		}
 		return 0;
 	}

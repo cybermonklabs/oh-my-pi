@@ -84,7 +84,10 @@ export interface IrcBusApi {
 	unreadCount(agentId: string): number;
 	/** Count a settled job of agent `from` owned by `to` as `from`'s reply to `to`. */
 	recordReply(from: string, to: string): void;
-	/** Drop every send mark from or to `agentId`, and its buffered messages, unless it is live; see {@link IrcBus.forgetAgent}. */
+	/**
+	 * Drop every send mark from or to `agentId`, its buffered messages and its
+	 * pending waits, which end with `null`, unless it is live; see {@link IrcBus.forgetAgent}.
+	 */
 	forgetAgent(agentId: string): void;
 }
 

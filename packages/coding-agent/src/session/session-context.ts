@@ -2,6 +2,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { customMessageEntryMessage, isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import {
 	canReplayRemoteCompaction,
+	compactionKeptStart,
 	getAnthropicCompactionPayload,
 	isTurnStartEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
@@ -265,29 +266,6 @@ export function getReadableCompactionEntry(
 		if (!model || canReplayRemoteCompaction(entry.preserveData, model)) return entry;
 	}
 	return null;
-}
-
-/**
- * Index on `path` of the first entry the context keeps from `compaction`, which
- * sits at `compactionIndex`: its `firstKeptEntryId`, or the entry after
- * `providerReplayThroughEntryId` when `firstKeptEntryId` is empty; the
- * compaction itself when neither lies before it. Entries before this index
- * reach the context only through the compaction's summary.
- */
-export function compactionKeptStart(
-	path: readonly SessionEntry[],
-	compaction: CompactionEntry,
-	compactionIndex: number,
-): number {
-	const firstKeptIndex = path.findIndex(
-		(entry, index) => index < compactionIndex && entry.id === compaction.firstKeptEntryId,
-	);
-	if (firstKeptIndex >= 0) return firstKeptIndex;
-	if (compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId) {
-		const replayThroughIndex = path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId);
-		if (replayThroughIndex >= 0 && replayThroughIndex + 1 < compactionIndex) return replayThroughIndex + 1;
-	}
-	return compactionIndex;
 }
 
 export function buildSessionContext(

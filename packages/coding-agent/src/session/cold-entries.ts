@@ -25,6 +25,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { compactionKeptStart } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
@@ -32,7 +33,7 @@ import { type BlobStore, isBlobRef } from "./blob-store";
 import { COLD_OWNER, type ColdMessageSlots } from "./cold-message";
 import { TOOL_EXECUTION_START_CUSTOM_TYPE } from "./exit-diagnostics";
 import { forgetConvertMemo } from "./messages";
-import { compactionKeptStart, getReadableCompactionEntry } from "./session-context";
+import { getReadableCompactionEntry } from "./session-context";
 import {
 	type CompactionEntry,
 	type FileEntry,

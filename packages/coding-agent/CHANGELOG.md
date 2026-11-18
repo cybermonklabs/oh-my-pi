@@ -18,10 +18,10 @@
 - A session that ran background tasks no longer keeps each delivered job, such as a finished subagent's recent tool output, in memory for the rest of its life once the job's result is in its context
 - Checking whether another omp process runs a session, as `omp gc` does, no longer blocks about 50 ms for each session another omp process runs
 - A session that runs many subagents with IRC on no longer keeps IRC state in memory for each subagent once it is parked, killed or released
-- The status line and the rate-limit fallback now count the latest answer itself (its text, the thinking that is sent back and its tool-call arguments) in the context, so a rate limit after a long answer or a large file write no longer moves a session whose context is past `retry.rateLimitFallbackMaxContextTokens` down the chain
+- The context figure that the status line, compaction and the rate-limit fallback read now counts the latest answer itself (its text, the thinking that is sent back and its tool-call arguments), so a rate limit after a long answer or a large file write no longer moves a session whose context is past `retry.rateLimitFallbackMaxContextTokens` down the chain
 - A session no longer keeps the prompts and tool results that a compaction moves before the cut in memory through their copies prepared for the model
 - A resumed session no longer reads older messages back from disk on every tool call when their tool call ids (OpenAI Responses) or model ids (such as a Bedrock inference profile ARN) are longer than 64 characters
-- A subagent parked or released while a message to it is delivered no longer keeps that message buffered, and its pending `irc wait` ends instead of waiting forever
+- A subagent's pending `irc wait` ends once the subagent is parked, killed or released instead of waiting forever, and a message delivered to it while that happens is no longer kept buffered
 
 ## [18.18.6] - 2026-11-09
 

@@ -4510,10 +4510,10 @@ export class SessionMaintenance {
 				tokenizer.countMessages(sentMessages, { excludeEncryptedReasoning: true });
 			return readerTokens <= fitBudget;
 		}
-		// Provider usage carries the reasoning the active model's request replayed,
-		// so it moves into `model`'s domain by the difference in replayed
-		// reasoning. Usage leaves out the anchor turn's own output, so this may
-		// subtract reasoning it never held; the local floor below still bounds it.
+		// Provider usage, with the anchor turn's own output that `getContextUsage`
+		// adds to it, carries the reasoning the active model's next request
+		// replays, so it moves into `model`'s domain by the difference in replayed
+		// reasoning over the retained turns; the local floor below still bounds it.
 		let replayedReasoningShift = 0;
 		if (tokenizer !== this.#tokenizer) {
 			const retained = activeExcludedMessage ? messages.filter(m => m !== activeExcludedMessage) : messages;
