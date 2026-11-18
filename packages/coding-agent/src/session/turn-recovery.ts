@@ -444,24 +444,19 @@ interface InheritedThinkingLevel {
 	level: ConfiguredThinkingLevel | undefined;
 }
 
-/**
- * What one search of fallback entries passes over besides what every search
- * passes over (`#searchKeyedRetryFallback`).
- */
-interface RetryFallbackSearchRules {
-	/** Whether the search passes over an entry whose usage reads `health`. */
-	passOverUsage: (health: ModelUsageHealth) => boolean;
-	/** Whether the search passes over an entry that resolves to `model`. */
-	passOverModel: (model: Model) => boolean;
-}
-
 /** The options of one fallback walk after a failed request. */
 interface RetryModelFallbackOptions {
 	excludeProvider?: string;
 	pinFallback?: boolean;
 	preserveFailedTurn?: boolean;
 	wrapAround?: boolean;
-	/** This hop is a classifier-refusal walk, which visits each model at most once per turn. */
+	/**
+	 * This hop is a classifier-refusal walk. It gates only the refusal-credit
+	 * hold: while the refusal's fallback credit is live, the walk passes over a
+	 * same-provider Anthropic candidate that cannot redeem the credit, when the
+	 * latest assistant turn carries signed or redacted thinking, and records it
+	 * in the held entries that `#switchFromSpentFallback` searches last.
+	 */
 	refusalWalk?: boolean;
 	/** The retry policy retries the failed model if this hop does not switch. */
 	sameModelRetryAvailable?: boolean;
@@ -2303,12 +2298,8 @@ export class TurnRecovery {
 			undefined,
 			signal,
 			// The check before a model call and the switch off a model with no
-			// credential pass over a depleted or reserve fallback and, as every
-			// fallback search, a model that refused in the turn.
-			{
-				passOverUsage: health => health.state === "depleted" || health.state === "reserve",
-				passOverModel: model => this.#refusedInTurn(model),
-			},
+			// credential pass over a depleted or reserve fallback.
+			health => health.state === "depleted" || health.state === "reserve",
 		);
 	}
 
@@ -2331,8 +2322,8 @@ export class TurnRecovery {
 	 * not in cooldown by its own string or by that model
 	 * (`isRetryFallbackEntrySuppressed`, so another spelling of a model in
 	 * cooldown, such as an alias `pi/<role>`, is passed over), resolves to no
-	 * model `rules.passOverModel` passes over, fits the effort ceiling and the
-	 * context without `excludedMessage`, reads no usage `rules.passOverUsage`
+	 * model that refused in the turn (`#refusedInTurn`), fits the effort ceiling
+	 * and the context without `excludedMessage`, reads no usage `passOverUsage`
 	 * passes over, and gives a key, with that key and the model the entry
 	 * resolves to. A key read that throws passes over the entry.
 	 * Undefined when no entry passes, or once `stale()` is true.
@@ -2342,7 +2333,7 @@ export class TurnRecovery {
 		stale: () => boolean,
 		excludedMessage: AssistantMessage | undefined,
 		signal: AbortSignal,
-		rules: RetryFallbackSearchRules,
+		passOverUsage: (health: ModelUsageHealth) => boolean,
 	): Promise<(RetryFallbackEntry & { apiKey: string; model: Model }) | undefined> {
 		const ceiling = this.#host.thinkingLevelCeiling();
 		for (const { role, selector: candidate } of entries) {
@@ -2350,14 +2341,14 @@ export class TurnRecovery {
 			const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
 			if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
 			if (this.isRetryFallbackEntrySuppressed(candidate, candidateModel)) continue;
-			if (rules.passOverModel(candidateModel)) continue;
+			if (this.#refusedInTurn(candidateModel)) continue;
 			if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
 			// Skip a candidate whose window cannot hold the live context so we
 			// never switch onto an oversized request (issue #8065).
 			if (!this.#host.contextFitsModel(candidateModel, excludedMessage)) continue;
 			const candidateHealth = await this.#readCandidateUsage(candidateModel, stale, signal);
 			if (candidateHealth === "stale") return undefined;
-			if (candidateHealth && rules.passOverUsage(candidateHealth)) continue;
+			if (candidateHealth && passOverUsage(candidateHealth)) continue;
 			if (stale()) return undefined;
 			let apiKey: string | undefined;
 			try {
@@ -2792,15 +2783,9 @@ export class TurnRecovery {
 		const spentRoles = this.retryFallbackChainKeys(spentSelector, candidate, {
 			pinnedRole: this.#activeRetryFallback?.role ?? role,
 		});
-		// Both searches pass over only a spent fallback, so a later one at the
-		// reserve reaches the check before its model call, as at a switch onto it,
-		// and every model that refused in the turn.
-		const rules: RetryFallbackSearchRules = {
-			passOverUsage: isUsageSpent,
-			passOverModel: model => this.#refusedInTurn(model),
-		};
-
-		// First, a route found from the spent model.
+		// First, a route found from the spent model. Both searches pass over
+		// only a spent fallback (`isUsageSpent`), so a later one at the reserve
+		// reaches the check before its model call, as at a switch onto it.
 		if (usageReadStale()) return false;
 		const route = await withUsageReadSignal(signal =>
 			this.#searchKeyedRetryFallback(
@@ -2808,7 +2793,7 @@ export class TurnRecovery {
 				usageReadStale,
 				excludedMessage,
 				signal,
-				rules,
+				isUsageSpent,
 			),
 		);
 		if (route) {
@@ -2829,7 +2814,7 @@ export class TurnRecovery {
 		// refused), so this pick is never the model in use.
 		if (usageReadStale()) return false;
 		const held = await withUsageReadSignal(signal =>
-			this.#searchKeyedRetryFallback(heldEntries, usageReadStale, excludedMessage, signal, rules),
+			this.#searchKeyedRetryFallback(heldEntries, usageReadStale, excludedMessage, signal, isUsageSpent),
 		);
 		if (held) return this.#applyPickAfterSpentFallback(held, held.role, currentSelector, reason);
 		return false;
