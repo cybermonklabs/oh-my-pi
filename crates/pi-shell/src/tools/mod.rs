@@ -34,11 +34,14 @@ mod extra;
 mod git;
 mod nohup;
 mod timeout;
-
 use std::{collections::VecDeque, io, sync::Arc, task::Waker, time::Duration};
 
 use bstr::{BStr, BString, ByteSlice};
 use parking_lot::Mutex;
+/// The environment variable with which a test fires the deadline of this
+/// session's `timeout` calls itself (see `timeout::Timeout::gate`).
+#[cfg(test)]
+pub(crate) use timeout::GATE_VAR as TIMEOUT_GATE_VAR;
 
 use crate::{
 	bash::{

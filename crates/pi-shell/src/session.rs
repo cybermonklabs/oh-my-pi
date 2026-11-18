@@ -78,7 +78,7 @@ use crate::{
 		Step, ToolCall, VprocSel,
 		store::{Key, MiscKey, Record},
 	},
-	host::{PiHost, SpawnObserver, TERM_GRACE},
+	host::{PiHost, SpawnObserver, term_grace},
 	sys::OutputDecoding,
 	tools::{ToolCalls, ToolConfig},
 	vfs::VfsFs,
@@ -528,7 +528,7 @@ impl Session {
 			Some(r)
 		} else {
 			guard.raise(CancelLevel::TERM);
-			if let Ok(r) = tokio::time::timeout(TERM_GRACE, &mut reply).await {
+			if let Ok(r) = tokio::time::timeout(term_grace(), &mut reply).await {
 				Some(r)
 			} else {
 				guard.raise(CancelLevel::KILL);
@@ -1876,10 +1876,10 @@ mod tests {
 				(pid, ids)
 			}
 		};
-		// The sleep never ends by itself while the test runs: only the cancel
-		// ends it.
+		// The sleep (600 s, `testkit::child::LIFETIME`) outlives the test
+		// runner's bound, so only the cancel ends it.
 		let (outcome, (pid, (pgid, sid, own_group))) =
-			tokio::join!(s.run("/bin/sleep 100000", RunStdio::default(), cancel.clone()), probe);
+			tokio::join!(s.run("/bin/sleep 600", RunStdio::default(), cancel.clone()), probe);
 		let outcome = outcome.unwrap();
 		assert!(outcome.cancelled);
 		// 143, not 137: the run ended on the cancel's TERM, inside the

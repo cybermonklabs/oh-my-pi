@@ -28,11 +28,12 @@
 //! stretches past any bound: on a host with 18,000 processes one scan of the
 //! process table takes seconds, and the escalation makes two. So `until`
 //! has no deadline either; it waits for an event the fixture cannot produce
-//! by itself, and a case whose event never comes hangs until the test
-//! runner's own timeout ends it (nextest's `ci` profile: four minutes). The
-//! jobs' `sleep 100000` never ends by itself while a case runs, however slow
-//! the host (a `sleep 30` did, on a host slow enough that the case outlasted
-//! it); each case's cleanup kills what is left.
+//! by itself, and a case whose event never comes is failed by the test
+//! runner (`.config/nextest.toml`: 4 minutes). The jobs' `sleep 600`
+//! ([`crate::testkit::child::LIFETIME`]) outlives that bound, so it never
+//! ends by itself while a case runs (a `sleep 30` did, on a host slow
+//! enough that the case outlasted it); each case's cleanup kills what is
+//! left.
 //!
 //! Run: `cargo test -p pi-shell --lib sys::suites::cancel_externals --
 //! --nocapture --test-threads 1`. Each test prints what the escalation took.
@@ -258,12 +259,8 @@ fn assert_killed_after_the_grace(case: &Case, sid: i32, group: &[ProcInfo]) -> D
 fn cancel_term_reaches_the_externals_whole_group_at_once() {
 	// `sh` does not forward TERM to its children: they die only if the
 	// signal goes to the group.
-	let mut case = Case::start(
-		Sessions::Detach,
-		"/bin/sh -c '/bin/sleep 100000 & /bin/sleep 100000; wait'",
-		3,
-		2,
-	);
+	let mut case =
+		Case::start(Sessions::Detach, "/bin/sh -c '/bin/sleep 600 & /bin/sleep 600; wait'", 3, 2);
 	let sid = case.leader();
 	let (status, done) = case.cancel();
 	assert_eq!(status, 143);
@@ -278,7 +275,7 @@ fn cancel_term_reaches_the_externals_whole_group_at_once() {
 fn cancel_term_kills_a_group_ignoring_term_after_the_default_grace() {
 	let mut case = Case::start(
 		Sessions::Detach,
-		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 100000 & /bin/sleep 100000; wait'",
+		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 600 & /bin/sleep 600; wait'",
 		3,
 		2,
 	);
@@ -297,8 +294,8 @@ fn cancel_term_kills_a_group_ignoring_term_after_the_default_grace() {
 fn cancel_term_with_a_shell_trap_runs_it_and_still_kills_the_external_group() {
 	let mut case = Case::start(
 		Sessions::Detach,
-		"trap 'echo trapped' TERM\n/bin/sh -c 'trap \"\" TERM; /bin/sleep 100000 & /bin/sleep \
-		 100000; wait'",
+		"trap 'echo trapped' TERM\n/bin/sh -c 'trap \"\" TERM; /bin/sleep 600 & /bin/sleep 600; \
+		 wait'",
 		3,
 		2,
 	);
@@ -318,7 +315,7 @@ fn cancel_term_with_a_shell_trap_runs_it_and_still_kills_the_external_group() {
 fn cancel_term_sweeps_a_grandchild_that_outlives_its_leader() {
 	let mut case = Case::start(
 		Sessions::Detach,
-		"/bin/sh -c '(trap \"\" TERM; exec /bin/sleep 100000) & wait'",
+		"/bin/sh -c '(trap \"\" TERM; exec /bin/sleep 600) & wait'",
 		2,
 		1,
 	);
@@ -348,7 +345,7 @@ fn cancel_term_sweeps_a_grandchild_that_outlives_its_leader() {
 fn inherit_cancel_reaches_only_the_external_itself() {
 	let mut case = Case::start(
 		Sessions::Inherit,
-		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 100000 & /bin/sleep 100000; wait'",
+		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 600 & /bin/sleep 600; wait'",
 		1,
 		0,
 	);

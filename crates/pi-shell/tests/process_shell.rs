@@ -126,14 +126,14 @@ fn command_strings_and_exit_statuses_match_zsh() {
 }
 
 /// A standalone shell abandons the externals still running when it exits:
-/// a background job without `nohup` gets `TERM`, which ends it. The job
-/// never ends by itself while the test runs, so only that `TERM` can; the
-/// test waits for it as long as that takes (a `TERM` that never came hangs
-/// the test until the runner's timeout).
+/// a background job without `nohup` gets `TERM`, which ends it. The job's
+/// `sleep 600` (`testkit::child::LIFETIME`) outlives the test runner's
+/// bound, so only that `TERM` can end it; the test waits for it as long as
+/// that takes.
 #[test]
 fn a_standalone_exit_ends_running_background_externals() {
 	let out = Command::new(env!("CARGO_BIN_EXE_obash"))
-		.args(["-c", "/bin/sleep 100000 >/dev/null 2>&1 </dev/null & echo $!"])
+		.args(["-c", "/bin/sleep 600 >/dev/null 2>&1 </dev/null & echo $!"])
 		.output()
 		.expect("start obash");
 	assert_eq!(out.status.code(), Some(0));

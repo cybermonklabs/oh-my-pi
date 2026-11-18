@@ -15,12 +15,19 @@
 failure-output = "immediate-final"
 # Report every failing test in one pass instead of stopping at the first.
 fail-fast = false
+# The one time bound of a test run. A test bounds no elapsed time of its own:
+# it waits for the event it is about, however long a loaded host takes, and
+# its fixtures outlive this bound. A test whose event never comes is failed
+# here, after 4 periods of 60 s. `test:rs` (`scripts/run-rs-task.ts`, locally
+# and in CI) runs this profile, and the `ci` profile has the same bound.
+slow-timeout = { period = "60s", terminate-after = 4 }
 
 [profile.ci]
 failure-output = "immediate-final"
 fail-fast = false
 # No retries: a flaky test is a bug we want to see, not paper over.
 retries = 0
+# Fails a hung test after 4 minutes, as the default profile does.
 slow-timeout = { period = "60s", terminate-after = 4 }
 
 # The deep-chain walk tests build and delete a directory chain as deep as the

@@ -52,13 +52,7 @@ async fn pkill_accepts_platform_signal_names() {
 		.kill_on_drop(true);
 	let mut child = command.spawn().expect("signal test process");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
-	time::timeout(Duration::from_secs(2), async {
-		while !ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("signal trap was not installed");
+	exists(&ready).await;
 
 	let (result, _) = execute_captured(format!("pkill -{signal} -p {pid}")).await;
 	let still_running = child.try_wait().expect("signal child status").is_none();
@@ -172,19 +166,7 @@ async fn pgrep_requires_an_externally_locked_pidfile() {
 		])
 		.spawn()
 		.expect("pidfile locker");
-	let ready_result = time::timeout(Duration::from_secs(2), async {
-		while !ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await;
-	if ready_result.is_err() {
-		let _ = locker.start_kill();
-		let _ = child.start_kill();
-		let _ = locker.wait().await;
-		let _ = child.wait().await;
-		panic!("pidfile locker did not become ready");
-	}
+	exists(&ready).await;
 
 	let command =
 		format!("pgrep -L -F {} -x {name}", quote_arg(pidfile.to_str().expect("utf8 pidfile")));
@@ -260,17 +242,13 @@ async fn pidwait_returns_after_the_matching_process_exits() {
 		.expect("pidwait execution")
 	});
 	let mut output = String::new();
-	time::timeout(Duration::from_secs(30), async {
-		while !output.contains(&waiting_for) {
-			output.push_str(
-				&rx.recv_async()
-					.await
-					.expect("pidwait output closed before it selected the child"),
-			);
-		}
-	})
-	.await
-	.expect("pidwait did not select the child");
+	while !output.contains(&waiting_for) {
+		output.push_str(
+			&rx.recv_async()
+				.await
+				.expect("pidwait output closed before it selected the child"),
+		);
+	}
 	tokio::task::yield_now().await;
 	assert!(!pidwait.is_finished(), "pidwait returned while its matching process was still running");
 	assert!(
@@ -666,17 +644,7 @@ async fn kill_builtin_defaults_to_sigterm() {
 		.spawn()
 		.expect("trapping child");
 	let pid = child.id().expect("child pid");
-	let ready_result = time::timeout(Duration::from_secs(5), async {
-		while !ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await;
-	if ready_result.is_err() {
-		let _ = child.kill().await;
-		let _ = child.wait().await;
-		panic!("child did not install its SIGTERM trap");
-	}
+	exists(&ready).await;
 
 	let (mut session, stdio) = kill_test_context().await;
 	let result = session
@@ -715,19 +683,8 @@ async fn kill_builtin_preserves_negative_pid_process_group_operands() {
 	let group_pid = group_child.id().expect("group pid");
 	let plain_pid = plain_child.id().expect("plain pid");
 
-	let ready_result = time::timeout(Duration::from_secs(5), async {
-		while !group_ready.exists() || !plain_ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await;
-	if ready_result.is_err() {
-		let _ = group_child.start_kill();
-		let _ = plain_child.start_kill();
-		let _ = group_child.wait().await;
-		let _ = plain_child.wait().await;
-		panic!("children did not install their SIGTERM traps");
-	}
+	exists(&group_ready).await;
+	exists(&plain_ready).await;
 
 	let (mut session, stdio) = kill_test_context().await;
 	let result = session
@@ -765,19 +722,8 @@ async fn kill_builtin_signals_group_when_marker_precedes_negative_pid() {
 	let default_pid = default_child.id().expect("default pid");
 	let named_pid = named_child.id().expect("named pid");
 
-	let ready_result = time::timeout(Duration::from_secs(5), async {
-		while !default_ready.exists() || !named_ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await;
-	if ready_result.is_err() {
-		let _ = default_child.start_kill();
-		let _ = named_child.start_kill();
-		let _ = default_child.wait().await;
-		let _ = named_child.wait().await;
-		panic!("group leaders did not install their SIGTERM traps");
-	}
+	exists(&default_ready).await;
+	exists(&named_ready).await;
 
 	let (mut session, stdio) = kill_test_context().await;
 	// Default signal (SIGTERM) after the marker.
@@ -839,13 +785,8 @@ async fn kill_builtin_signals_every_process_in_a_jobspec_pipeline() {
 		.await
 		.expect("background pipeline");
 	assert_eq!(exit_code(&started), 0, "starting the background pipeline");
-	time::timeout(Duration::from_secs(5), async {
-		while !first_ready.exists() || !second_ready.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("pipeline processes did not become ready");
+	exists(&first_ready).await;
+	exists(&second_ready).await;
 	let pids = [&first_pidfile, &second_pidfile].map(|pidfile| {
 		fs::read_to_string(pidfile)
 			.expect("pipeline pidfile")
@@ -1041,13 +982,9 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 				.await
 				.expect("background pipeline");
 			assert_eq!(exit_code(&started), 0, "subset {stopped_subset:#b}");
-			time::timeout(Duration::from_secs(20), async {
-				while !readyfiles.iter().all(|file| file.exists()) {
-					time::sleep(Duration::from_millis(10)).await;
-				}
-			})
-			.await
-			.expect("pipeline stages did not become ready");
+			for file in &readyfiles {
+				exists(file).await;
+			}
 			let pids: Vec<i32> = pidfiles
 				.iter()
 				.map(|file| {
@@ -1076,13 +1013,9 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 					.join(" ")
 			);
 			let release_stages = async {
-				time::timeout(Duration::from_secs(20), async {
-					while stages.iter().any(is_stopped) {
-						time::sleep(Duration::from_millis(10)).await;
-					}
-				})
-				.await
-				.expect("stopped stages were not continued");
+				while stages.iter().any(is_stopped) {
+					time::sleep(Duration::from_millis(10)).await;
+				}
 				time::sleep(Duration::from_millis(200)).await;
 				fs::write(&release, "").expect("release stages");
 			};
@@ -1233,31 +1166,23 @@ fn is_stopped(process: &ProcInfo) -> bool {
 /// Waits until `process` is stopped.
 #[cfg(unix)]
 async fn wait_until_stopped(process: &ProcInfo) {
-	time::timeout(Duration::from_secs(20), async {
-		while !is_stopped(process) {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.unwrap_or_else(|_| panic!("process {} did not stop", process.pid));
+	while !is_stopped(process) {
+		time::sleep(Duration::from_millis(10)).await;
+	}
 }
 
 /// The pid a test script wrote to `pidfile` (`echo $$ > pidfile`).
 #[cfg(unix)]
 async fn wait_for_pidfile(pidfile: &std::path::Path) -> i32 {
-	time::timeout(Duration::from_secs(20), async {
-		loop {
-			if let Some(pid) = fs::read_to_string(pidfile)
-				.ok()
-				.and_then(|text| text.trim().parse::<i32>().ok())
-			{
-				return pid;
-			}
-			time::sleep(Duration::from_millis(10)).await;
+	loop {
+		if let Some(pid) = fs::read_to_string(pidfile)
+			.ok()
+			.and_then(|text| text.trim().parse::<i32>().ok())
+		{
+			return pid;
 		}
-	})
-	.await
-	.unwrap_or_else(|_| panic!("no pid in {}", pidfile.display()))
+		time::sleep(Duration::from_millis(10)).await;
+	}
 }
 
 /// A failed target makes `kill` return non-zero without preventing later

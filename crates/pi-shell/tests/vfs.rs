@@ -505,24 +505,22 @@ async fn an_executable_url_runs_as_the_file_it_aliases() {
 	assert!(run.stdout.contains("tool-ran"), "{}", run.stdout);
 }
 
-/// Appends streamed stdout `chunks` to `output` until it ends with `suffix`.
+/// Appends streamed stdout `chunks` to `output` until it ends with
+/// `suffix`, however long that takes: a run that never writes it is failed
+/// by the test runner (`.config/nextest.toml`).
 async fn wait_for_output(
 	chunks: &flume::Receiver<Bytes>,
 	output: &mut Vec<u8>,
 	suffix: &str,
 ) -> io::Result<()> {
-	tokio::time::timeout(Duration::from_secs(5), async {
-		while !output.ends_with(suffix.as_bytes()) {
-			let chunk = chunks
-				.recv_async()
-				.await
-				.map_err(|error| io::Error::new(io::ErrorKind::UnexpectedEof, error))?;
-			output.extend_from_slice(&chunk);
-		}
-		Ok(())
-	})
-	.await
-	.map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?
+	while !output.ends_with(suffix.as_bytes()) {
+		let chunk = chunks
+			.recv_async()
+			.await
+			.map_err(|error| io::Error::new(io::ErrorKind::UnexpectedEof, error))?;
+		output.extend_from_slice(&chunk);
+	}
+	Ok(())
 }
 
 #[tokio::test]
@@ -557,11 +555,7 @@ async fn virtual_follow_observes_append_same_size_rotation_and_truncation() {
 	}
 	.await;
 	abort.abort(AbortReason::Signal);
-	tokio::time::timeout(Duration::from_secs(5), runner)
-		.await
-		.expect("cancelled tail exits")
-		.expect("tail worker")
-		.expect("tail command");
+	runner.await.expect("tail worker").expect("tail command");
 	updates.expect("each provider transition reaches stdout");
 	let diagnostics = received_text(&stderr);
 	assert!(diagnostics.contains("has been replaced"), "{diagnostics}");
@@ -574,15 +568,15 @@ async fn virtual_follow_observes_append_same_size_rotation_and_truncation() {
 
 /// A provider path has no kernel watcher, so `tail -f` polls it; that idle
 /// loop must still stop once the reader of its stdout pipe exits, as in
-/// `tail -f virtual://log | grep -m1 line`.
+/// `tail -f virtual://log | grep -m1 line`. The run returns only once it
+/// does: one that keeps following is failed by the test runner.
 #[cfg(unix)]
 #[tokio::test]
 async fn virtual_follow_stops_once_stdout_reader_is_gone() {
 	let directory = tempfile::tempdir().expect("isolated provider filesystem");
 	fs::write(directory.path().join("log"), b"line\n").expect("followed log");
 	let (sinks, stdout, stderr) = stream_sinks();
-	let mut cancel = CancelToken::default();
-	let abort = cancel.emplace_abort_token();
+	let cancel = CancelToken::default();
 	// `grep -m1` consumes the first line, then exits and closes the read end;
 	// the pipeline ends only once `tail -f` stops too.
 	let runner = tokio::spawn(execute_shell_streams(
@@ -594,12 +588,7 @@ async fn virtual_follow_stops_once_stdout_reader_is_gone() {
 		sinks,
 		cancel,
 	));
-	let stopped = tokio::time::timeout(Duration::from_secs(5), runner).await;
-	abort.abort(AbortReason::Signal);
-	let result = stopped
-		.expect("tail -f kept following after its reader exited")
-		.expect("tail worker")
-		.expect("tail command");
+	let result = runner.await.expect("tail worker").expect("tail command");
 	assert_eq!(received_text(&stdout), "line\n");
 	assert_eq!(result.exit_code, Some(0), "{}", received_text(&stderr));
 }
@@ -872,7 +861,7 @@ fn timeout_stops_a_utility_reading_stalled_provider_stdin() {
 	});
 
 	let (status, stderr) = result
-		.recv_timeout(Duration::from_secs(5))
+		.recv()
 		.expect("`timeout` waited for the stalled read");
 	assert_eq!(status, Some(124), "{stderr}");
 }
@@ -886,15 +875,11 @@ fn timeout_stops_a_utility_reading_stalled_provider_stdin() {
 async fn url_spawn_and_output_pumps_run_on_a_current_thread_runtime() {
 	let directory = tempfile::tempdir().expect("isolated provider filesystem");
 	fs::write(directory.path().join("a.txt"), b"alpha\n").expect("document");
-	let run = tokio::time::timeout(
-		Duration::from_secs(5),
-		run_virtual(
-			directory.path(),
-			"/bin/sh -c 'printf \"%s\\n\" \"$0\"; sleep 0.05; echo late' virtual://a.txt | /bin/cat",
-		),
+	let run = run_virtual(
+		directory.path(),
+		"/bin/sh -c 'printf \"%s\\n\" \"$0\"; sleep 0.05; echo late' virtual://a.txt | /bin/cat",
 	)
-	.await
-	.expect("a URL spawn and its output pump progress on the only runtime thread");
+	.await;
 	assert_eq!(run.status, Some(0), "{}", run.stderr);
 	assert!(run.stdout.ends_with("a.txt\nlate\n"), "{}", run.stdout);
 }

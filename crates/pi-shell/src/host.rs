@@ -41,6 +41,12 @@ mod urls;
 /// unwinds the command that waits for it): pi's `TERM_GRACE`.
 pub const TERM_GRACE: Duration = Duration::from_secs(1);
 
+/// [`TERM_GRACE`], unless a test widened it
+/// ([`crate::testkit::grace::Longer`]).
+pub(crate) fn term_grace() -> Duration {
+	crate::testkit::grace::or(TERM_GRACE, &crate::testkit::grace::TERM)
+}
+
 /// Told about every external a [`PiHost`] spawns, from the engine thread.
 ///
 /// The [`Session`](crate::session::Session) lists a run's live children
@@ -437,7 +443,7 @@ impl PiHost {
 			fs,
 			launcher: Launcher {
 				spawner:  NativeSpawner::new(SpawnConfig {
-					grace:    TERM_GRACE,
+					grace:    term_grace(),
 					sessions: Sessions::Detach,
 					// The session driver is an async task: exits wake its waker
 					// from waiter threads.

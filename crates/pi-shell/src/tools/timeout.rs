@@ -265,12 +265,23 @@ enum Phase {
 	TooLong(i32),
 }
 
+/// Environment variable of a test gate ([`Timeout::gate`]).
+#[cfg(test)]
+pub(crate) const GATE_VAR: &str = "PI_TIMEOUT_TEST_GATE";
+
 /// A `timeout` call.
 pub(super) struct Timeout {
 	pub(super) child: Child,
 	call:             ToolCall,
 	out:              Out,
 	phase:            Phase,
+	/// A test fires this call's deadline by creating this file, instead of
+	/// the duration passing ([`GATE_VAR`] in the call's environment). A
+	/// test of what the deadline does then fixes the order itself — the
+	/// command is up before the deadline comes — rather than racing a
+	/// loaded host with a short duration.
+	#[cfg(test)]
+	gate:             Option<std::path::PathBuf>,
 }
 
 impl Timeout {
@@ -287,7 +298,61 @@ impl Timeout {
 				Phase::Exit(EXIT_FAILURE)
 			},
 		};
-		Self { child: Child::default(), call, out, phase }
+		#[cfg(test)]
+		let gate = call
+			.env
+			.get(GATE_VAR.as_bytes())
+			.and_then(|path| path.to_str().ok())
+			.map(std::path::PathBuf::from);
+		Self {
+			child: Child::default(),
+			call,
+			out,
+			phase,
+			#[cfg(test)]
+			gate,
+		}
+	}
+
+	/// Whether the limit has come at `now`: `deadline` has passed, or the
+	/// test's [`Timeout::gate`] exists.
+	#[cfg_attr(not(test), expect(clippy::unused_self, reason = "reads the test gate in tests"))]
+	fn expired(&self, now: u64, deadline: Option<u64>) -> bool {
+		#[cfg(test)]
+		if let Some(gate) = &self.gate {
+			return gate.exists();
+		}
+		deadline.is_some_and(|at| now >= at)
+	}
+
+	/// When the limit of a call that has just started comes: its duration
+	/// from `now`, or the next poll of a test [`Timeout::gate`].
+	#[cfg_attr(not(test), expect(clippy::unused_self, reason = "reads the test gate in tests"))]
+	fn limit_at(&self, now: u64, opts: &Options) -> Option<u64> {
+		#[cfg(test)]
+		if self.gate.is_some() {
+			return Some(now.saturating_add(nanos(RECHECK)));
+		}
+		opts.limit.map(|d| now.saturating_add(nanos(d)))
+	}
+
+	/// The deadline of a running call at its next turn: its own, or the
+	/// next poll of a test [`Timeout::gate`].
+	#[cfg_attr(
+		not(test),
+		expect(
+			clippy::unused_self,
+			clippy::missing_const_for_fn,
+			reason = "reads the test gate in tests"
+		)
+	)]
+	fn repoll(&self, now: u64, deadline: Option<u64>) -> Option<u64> {
+		#[cfg(test)]
+		if self.gate.is_some() {
+			return Some(now.saturating_add(nanos(RECHECK)));
+		}
+		let _ = now;
+		deadline
 	}
 
 	pub(super) fn deadline(&self) -> Option<u64> {
@@ -364,13 +429,13 @@ impl Timeout {
 					// Nothing was found to run.
 					self.ended(&opts)
 				} else {
-					let deadline = opts.limit.map(|d| now.saturating_add(nanos(d)));
+					let deadline = self.limit_at(now, &opts);
 					Phase::Running { opts, deadline }
 				}
 			},
 			Phase::Running { opts, deadline } => match self.child.status {
 				Some(_) => self.ended(&opts),
-				None if deadline.is_some_and(|at| now >= at) => {
+				None if self.expired(now, deadline) => {
 					self.send(turn, &opts, opts.signal);
 					let killed = opts.signal == Signal::Kill;
 					Phase::Signalled {
@@ -382,7 +447,7 @@ impl Timeout {
 						opts,
 					}
 				},
-				None => Phase::Running { opts, deadline },
+				None => Phase::Running { opts, deadline: self.repoll(now, deadline) },
 			},
 			Phase::Signalled { opts, mut kill_at, mut give_up, .. } => {
 				if kill_at.is_some_and(|at| now >= at) {

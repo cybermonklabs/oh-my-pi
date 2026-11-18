@@ -295,6 +295,15 @@ async fn execute_captured(command: String) -> (ShellExecuteResult, String) {
 	(result, output)
 }
 
+/// Waits for `path` to appear — a fixture saying it is ready, or a test
+/// releasing it — however long that takes. The test runner fails a test
+/// whose file never appears (`.config/nextest.toml`).
+async fn exists(path: &std::path::Path) {
+	while !path.exists() {
+		time::sleep(Duration::from_millis(10)).await;
+	}
+}
+
 /// Waits until `pid` runs as `expected`, however long that takes: each poll
 /// walks the whole process table, which takes seconds on a loaded host, and
 /// the process-test children never end by themselves while a test runs.
@@ -339,19 +348,24 @@ fn process_test_command(prefix: &str) -> (tempfile::TempDir, std::path::PathBuf,
 	(dir, command, name)
 }
 
-/// A process-test child: `command` sleeping until a test ends it. It never
-/// ends by itself while a test runs (it sleeps 100000 s; a 30 s child ended
-/// by itself on a host slow enough that the test outlasted it), so its end
-/// is always one the test caused; dropping its handle kills it.
+/// A process-test child: `command` sleeping until a test ends it. It lives
+/// [`crate::testkit::child::LIFETIME`], past the test runner's bound (a 30 s
+/// child ended by itself on a host slow enough that the test outlasted it),
+/// so its end is always one the test caused; it dies with this process,
+/// which `kill_on_drop` alone cannot do when the test process is killed.
 #[cfg(unix)]
 fn process_test_child(command: &std::path::Path) -> Command {
 	let mut child = Command::new(command);
 	child
 		.args(["--ignored", "--exact", "shell::tests::process_test_sleeper"])
-		.env("PI_SHELL_PROCESS_TEST_SLEEP_MS", "100000000")
+		.env(
+			"PI_SHELL_PROCESS_TEST_SLEEP_MS",
+			crate::testkit::child::LIFETIME.as_millis().to_string(),
+		)
 		.stdout(std::process::Stdio::null())
 		.stderr(std::process::Stdio::null())
 		.kill_on_drop(true);
+	crate::testkit::child::tokio_dies_with_this_process(&mut child);
 	child
 }
 

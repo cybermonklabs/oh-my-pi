@@ -453,6 +453,12 @@ const CANCEL_READER_GRACE: Duration = Duration::from_millis(2000);
 #[cfg(not(windows))]
 const CANCEL_READER_GRACE: Duration = Duration::from_millis(1250);
 
+/// [`CANCEL_READER_GRACE`], unless a test widened it
+/// ([`crate::testkit::grace::Longer`]).
+fn reader_grace() -> Duration {
+	crate::testkit::grace::or(CANCEL_READER_GRACE, &crate::testkit::grace::READER)
+}
+
 /// What a run reports when it ends normally.
 struct CommandResult {
 	status:      i32,
@@ -1445,7 +1451,7 @@ async fn run_shell_command_once(
 		let reader_cancel = reader_cancel.clone();
 		async move {
 			cancel_token.cancelled().await;
-			time::sleep(CANCEL_READER_GRACE).await;
+			time::sleep(reader_grace()).await;
 			reader_cancel.cancel();
 		}
 	});
@@ -1589,7 +1595,7 @@ async fn run_shell_command_streams_in_filesystem(
 		let reader_cancel = reader_cancel.clone();
 		async move {
 			cancel_token.cancelled().await;
-			time::sleep(CANCEL_READER_GRACE).await;
+			time::sleep(reader_grace()).await;
 			reader_cancel.cancel();
 		}
 	});

@@ -397,10 +397,10 @@ fn shared_writer_retries_would_block() {
 }
 
 /// Cancelling while the client waits on its peer (a remote shell that never
-/// answers, and never ends by itself while the test runs) ends the run with
-/// upstream's signal exit: code 20 and the `received SIGINT, SIGTERM, or
-/// SIGHUP (code 20) at rsync.c(874)` trailer. Only the cancel can end it: a
-/// run that did not notice it hangs the test until the runner's timeout.
+/// answers, and whose `sleep 600` outlives the test runner's 4-minute bound)
+/// ends the run with upstream's signal exit: code 20 and the `received
+/// SIGINT, SIGTERM, or SIGHUP (code 20) at rsync.c(874)` trailer. Only the
+/// cancel can end it: a run that did not notice it is failed by the runner.
 #[cfg(unix)]
 #[test]
 fn cancel_mid_connection_exits_20_with_trailer() {
@@ -410,7 +410,7 @@ fn cancel_mid_connection_exits_20_with_trailer() {
 	let dir = tempfile::tempdir().unwrap();
 	make_tree(&dir.path().join("src"));
 	let rsh = dir.path().join("stuckrsh");
-	fs::write(&rsh, "#!/bin/sh\nexec sleep 100000\n").unwrap();
+	fs::write(&rsh, "#!/bin/sh\nexec sleep 600\n").unwrap();
 	fs::set_permissions(&rsh, fs::Permissions::from_mode(0o755)).unwrap();
 	let (mut host, cap) = crate::host::Host::for_test_owning("rsync", Vec::new(), dir.path());
 	let cancel = host.cancel_flag_for_test();

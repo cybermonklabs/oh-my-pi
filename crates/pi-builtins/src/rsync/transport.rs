@@ -1620,7 +1620,7 @@ mod tests {
 		#[test]
 		fn cancel_kills_the_shell() {
 			let dir = tempfile::tempdir().unwrap();
-			let rsh = script(dir.path(), "sleepy-rsh", "exec sleep 30\n");
+			let rsh = script(dir.path(), "sleepy-rsh", "exec sleep 600\n");
 			let logger = logger();
 			let cancel = Arc::new(AtomicBool::new(false));
 			let mut conn =

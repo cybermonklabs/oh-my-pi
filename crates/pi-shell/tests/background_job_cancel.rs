@@ -4,29 +4,35 @@
 //! nothing).
 #![cfg(unix)]
 
-use std::time::{Duration, Instant};
-
-use pi_shell::{Shell, ShellRunOptions, cancel::CancelToken};
+use pi_shell::{Shell, ShellRunOptions, cancel::CancelToken, testkit};
 
 /// Each `&` job had a token of its own that the run's token did not reach, so
-/// the cancelled run sat in `wait` until the host's 2 s grace aborted it.
+/// the cancelled run sat in `wait` until the host's grace aborted it.
+///
+/// The graces are widened past the test runner's own bound
+/// ([`testkit::grace::Longer`]), so the run can only end through the cancel
+/// reaching its background job: a run that still waits for the grace never
+/// returns, and the runner fails the test rather than a wall-clock
+/// assertion that a loaded host beats. The jobs outlive that bound too.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_run_stops_waiting_on_its_background_job() {
-	for script in ["sleep 20 & wait; echo after", "{ sleep 20; } & wait %1; echo after"] {
+	let _graces = testkit::grace::Longer::than(testkit::child::LIFETIME);
+	let secs = testkit::child::LIFETIME.as_secs();
+	for script in [
+		format!("sleep {secs} & wait; echo after"),
+		format!("{{ sleep {secs}; }} & wait %1; echo after"),
+	] {
 		let (tx, rx) = flume::unbounded::<String>();
-		let started = Instant::now();
 		let result = Shell::new(None)
 			.run(
-				ShellRunOptions { command: script.to_owned(), ..Default::default() },
+				ShellRunOptions { command: script.clone(), ..Default::default() },
 				Some(tx),
 				CancelToken::new(Some(300)),
 			)
 			.await
 			.expect("run");
-		let elapsed = started.elapsed();
 		let output: String = rx.drain().collect();
 
-		assert!(elapsed < Duration::from_millis(1500), "`{script}` took {elapsed:?}");
 		assert!(!output.contains("after"), "`{script}` kept running: {output:?}");
 		assert_eq!((result.exit_code, result.timed_out), (None, true), "`{script}`");
 	}

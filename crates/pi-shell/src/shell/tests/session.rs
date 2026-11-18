@@ -778,20 +778,16 @@ async fn persistent_shell_reaps_background_child_without_followup_run() {
 		.await
 		.expect("start external background child");
 	assert_eq!(started.exit_code, Some(0));
-	let pid = time::timeout(Duration::from_secs(2), async {
-		loop {
-			if let Ok(pid) = fs::read_to_string(pidfile.path())
-				.unwrap_or_default()
-				.trim()
-				.parse::<i32>()
-			{
-				break pid;
-			}
-			time::sleep(Duration::from_millis(20)).await;
+	let pid = loop {
+		if let Ok(pid) = fs::read_to_string(pidfile.path())
+			.unwrap_or_default()
+			.trim()
+			.parse::<i32>()
+		{
+			break pid;
 		}
-	})
-	.await
-	.expect("background child did not record its pid");
+		time::sleep(Duration::from_millis(20)).await;
+	};
 	assert!(pid > 0);
 
 	// No calls to the shell (including the live-job counter) until this
@@ -831,10 +827,10 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 	let first_pidfile = tempfile::NamedTempFile::new().expect("pipeline pidfile");
 	let last_pidfile = tempfile::NamedTempFile::new().expect("last stage pidfile");
 	// `$!` names the job for `wait`; each stage reports its OS pid itself.
-	// The first stage never ends by itself while the test runs (the test
-	// ends it).
+	// The first stage's `sleep 600` (`testkit::child::LIFETIME`) outlives the
+	// test runner's bound, so only the test ends it.
 	let command = format!(
-		"/bin/sh -c 'echo $$ > \"$1\"; exec /bin/sleep 100000' _ {} | /bin/sh -c 'echo $$ > \"$1\"; \
+		"/bin/sh -c 'echo $$ > \"$1\"; exec /bin/sleep 600' _ {} | /bin/sh -c 'echo $$ > \"$1\"; \
 		 sleep 1; exit 9' _ {} >/dev/null 2>&1 & pid=$!",
 		quote_arg(&first_pidfile.path().to_string_lossy()),
 		quote_arg(&last_pidfile.path().to_string_lossy())
@@ -986,17 +982,13 @@ async fn pids_reports_in_flight_children_until_run_returns() {
 		}
 	});
 
-	let pids = time::timeout(Duration::from_secs(5), async {
-		loop {
-			let pids = shell.pids();
-			if !pids.is_empty() {
-				break pids;
-			}
-			time::sleep(Duration::from_millis(10)).await;
+	let pids = loop {
+		let pids = shell.pids();
+		if !pids.is_empty() {
+			break pids;
 		}
-	})
-	.await
-	.expect("in-flight run never reported a pid");
+		time::sleep(Duration::from_millis(10)).await;
+	};
 	assert_eq!(pids.len(), 1, "exactly the sleep child: {pids:?}");
 	let child = proctree::Process::from_pid(pids[0]).expect("reported pid is alive");
 	assert_eq!(child.status(), proctree::ProcessStatus::Running);
@@ -1052,13 +1044,7 @@ async fn fork_starts_from_the_state_before_the_running_command() {
 		);
 		async move { run(&shell, &command).await }
 	});
-	time::timeout(Duration::from_secs(5), async {
-		while !started.exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("owner command never started");
+	exists(&started).await;
 
 	let fork = shell.fork();
 	let seen = time::timeout(
@@ -1541,6 +1527,10 @@ async fn embedded_external_command_runs_in_its_own_session() {
 
 	// Build the same kind of session pi-natives uses in production.
 	let mut session = default_session().await;
+	// The child prints its pid and waits for the test's release, so the
+	// `getsid` below reads a live process whatever the host's speed.
+	let root = tempfile::tempdir().expect("release directory");
+	let release = root.path().join("release");
 
 	// Output pipe shared between the child and a concurrent reader. The
 	// reader runs on a blocking thread because pipe reads are blocking. The
@@ -1579,24 +1569,23 @@ async fn embedded_external_command_runs_in_its_own_session() {
 
 	// Run the session in the background so we can call `getsid(child_pid)`
 	// while the child is still alive.
+	let command = format!(
+		"sh -c 'printf \"%d\\n\" \"$$\"; while [ ! -e {} ]; do sleep 0.01; done'",
+		release.display()
+	);
 	let shell_handle = tokio::spawn(async move {
-		// `printf '%d\n' "$$"` then `sleep 0.5`. Long enough for our `getsid`.
-		let exec = session
-			.run_test("sh -c 'printf \"%d\\n\" \"$$\"; sleep 0.5'", &stdio)
-			.await
-			.expect("run_test");
+		let exec = session.run_test(command, &stdio).await.expect("run_test");
 		drop(stdio);
 		(session, exec)
 	});
 
-	let child_pid = time::timeout(Duration::from_secs(5), pid_rx)
+	let child_pid = pid_rx
 		.await
-		.expect("timed out waiting for child PID")
 		.expect("reader closed pid channel without sending");
 	assert!(child_pid > 0, "got non-positive child pid: {child_pid}");
 
-	// Snapshot the child's session ID immediately, while the child is still
-	// in `sleep`. POSIX guarantees `getsid` against a live PID returns the
+	// Snapshot the child's session ID while the child still waits for its
+	// release. POSIX guarantees `getsid` against a live PID returns the
 	// session of that process.
 	// SAFETY: `child_pid` is a positive PID from the child; errors are
 	// reported via the checked return value.
@@ -1607,11 +1596,11 @@ async fn embedded_external_command_runs_in_its_own_session() {
 		std::io::Error::last_os_error(),
 	);
 
-	// Drain the session task (its command ends by itself) and the pipe
-	// reader.
+	// Release the child, then drain the session task and the pipe reader.
+	fs::write(&release, "").expect("release the child");
 	let (_session, exec) = shell_handle.await.expect("shell task panicked");
 	assert_eq!(exec.status, 0, "unexpected exit: {}", exit_code(&exec));
-	let _ = time::timeout(Duration::from_secs(2), reader_handle).await;
+	let _ = reader_handle.await;
 
 	assert_ne!(
 		child_sid, host_sid,
@@ -1628,11 +1617,16 @@ async fn embedded_external_command_runs_in_its_own_session() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() {
 	let _guard = shell_test_lock().lock().await;
+	// The trap takes as long as the test keeps it: the graces are long, so
+	// nothing of this test races them (`testkit::grace`).
+	let _graces = crate::testkit::grace::Longer::than(crate::testkit::child::LIFETIME);
 	let root = tempfile::tempdir().expect("cleanup directory");
 	let script = root.path().join("cleanup.sh");
+	// The trap says it started, waits for the test's release, then writes.
 	fs::write(
 		&script,
-		"trap 'sleep 0.2; printf cleaned >> cleaned; exit 0' TERM\n: > ready\nwhile :; do :; done\n",
+		"trap ': > trapped; while [ ! -e release ]; do sleep 0.01; done; printf cleaned >> cleaned; \
+		 exit 0' TERM\n: > ready\nwhile :; do :; done\n",
 	)
 	.expect("cleanup script");
 	let shell = Shell::new(None);
@@ -1643,7 +1637,10 @@ async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() 
 		shell
 			.run(
 				ShellRunOptions {
-					command: "sh cleanup.sh & sleep 30".into(),
+					command: format!(
+						"sh cleanup.sh & sleep {}",
+						crate::testkit::child::LIFETIME.as_secs()
+					),
 					cwd: Some(cwd),
 					..Default::default()
 				},
@@ -1652,15 +1649,11 @@ async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() 
 			)
 			.await
 	});
-	time::timeout(Duration::from_secs(5), async {
-		while !root.path().join("ready").exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("background child ready");
+	exists(&root.path().join("ready")).await;
 	abort.abort(AbortReason::Signal);
-	// Returns either on the abort (`cancelled`) or at the sleep's own end.
+	// The background child's trap runs during the grace; the test ends it.
+	exists(&root.path().join("trapped")).await;
+	fs::write(root.path().join("release"), "").expect("release the trap");
 	let result = task.await.expect("run task").expect("shell result");
 	assert!(result.cancelled);
 	assert_eq!(fs::read_to_string(root.path().join("cleaned")).expect("TERM cleanup"), "cleaned");
@@ -1670,14 +1663,15 @@ async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 	let _guard = shell_test_lock().lock().await;
+	// The readers stay open for the grace after the cancel, and the TERM
+	// grace lets the trap finish: both are long here, so the trap writes
+	// when the test releases it, not inside a window it has to beat.
+	let _graces = crate::testkit::grace::Longer::than(crate::testkit::child::LIFETIME);
 	let root = tempfile::tempdir().expect("cleanup directory");
-	// The trap writes once the readers' old 500 ms cancel would have closed
-	// them, and finishes well inside the 1 s TERM grace even when a loaded
-	// runner is slow to start `sleep`.
 	fs::write(
 		root.path().join("cleanup.sh"),
-		"trap 'sleep 0.55; echo flushing; printf cleaned > cleaned; exit 0' TERM\n: > ready\nwhile \
-		 :; do :; done\n",
+		"trap ': > trapped; while [ ! -e release ]; do sleep 0.01; done; echo flushing; printf \
+		 cleaned > cleaned; exit 0' TERM\n: > ready\nwhile :; do :; done\n",
 	)
 	.expect("cleanup script");
 	let shell = Shell::new(None);
@@ -1697,16 +1691,12 @@ async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
 			)
 			.await
 	});
-	time::timeout(Duration::from_secs(5), async {
-		while !root.path().join("ready").exists() {
-			time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("child ready");
+	exists(&root.path().join("ready")).await;
 	abort.abort(AbortReason::Signal);
-	// Waits as long as that takes: a run the abort did not end hangs the test
-	// until the runner's timeout.
+	exists(&root.path().join("trapped")).await;
+	fs::write(root.path().join("release"), "").expect("release the trap");
+	// Waits as long as that takes: a run the abort did not end is failed by
+	// the test runner.
 	let result = task.await.expect("run task").expect("shell result");
 	assert!(result.cancelled);
 	assert_eq!(

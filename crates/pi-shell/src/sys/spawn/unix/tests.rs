@@ -7,7 +7,7 @@ use std::{
 	sync::Arc,
 	task::{Context, Poll, Wake, Waker},
 	thread,
-	time::{Duration, Instant},
+	time::Duration,
 };
 
 use bstr::{BString, ByteSlice};
@@ -25,7 +25,12 @@ use crate::{
 	},
 };
 
-const LONG: Duration = Duration::from_secs(20);
+/// How long a parked waiter sleeps before it polls again: not a bound of
+/// any test, which waits for its event however long the host takes (a test
+/// whose event never comes is failed by the test runner,
+/// `.config/nextest.toml`).
+#[cfg(target_os = "linux")]
+const POLL: Duration = Duration::from_secs(20);
 
 /// A detached external is signalled through its session, whose group exists
 /// only after the child's own `setsid`. A signal sent before that (`kill $!`
@@ -54,24 +59,19 @@ impl Wake for Unpark {
 fn wait(p: &mut Box<dyn ExtProc>) -> ExitStatus {
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let mut cx = Context::from_waker(&waker);
-	let deadline = Instant::now() + LONG;
 	loop {
 		if let Poll::Ready(s) = p.poll_wait(&mut cx) {
 			return s;
 		}
-		assert!(Instant::now() < deadline, "process did not finish");
 		thread::park_timeout(Duration::from_millis(50));
 	}
 }
 
-/// Poll `cond` until it holds; the elapsed time.
-fn until(what: &str, mut cond: impl FnMut() -> bool) -> Duration {
-	let start = Instant::now();
+/// Poll `cond` until it holds.
+fn until(_what: &str, mut cond: impl FnMut() -> bool) {
 	while !cond() {
-		assert!(start.elapsed() < LONG, "timed out waiting for {what}");
 		thread::sleep(Duration::from_millis(5));
 	}
-	start.elapsed()
 }
 
 fn argv(words: &[&str]) -> Vec<BString> {
@@ -612,14 +612,15 @@ fn inherit_abandon_escalation_spares_the_hosts_group() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Inherit, grace);
 	let mut bystander = Bystander(
-		std::process::Command::new("/bin/sleep")
-			.arg("100000")
-			.spawn()
-			.unwrap(),
+		crate::testkit::child::dies_with_this_process(
+			std::process::Command::new("/bin/sleep").arg("600"),
+		)
+		.spawn()
+		.unwrap(),
 	);
 	assert_eq!(pgid(bystander.0.id()), pgid(0));
 	// `exec` keeps the ignored TERM: one process that only KILL ends.
-	let a = sh("trap '' TERM; exec /bin/sleep 100000");
+	let a = sh("trap '' TERM; exec /bin/sleep 600");
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid() as i32;
 	until("exec'd", || proc::info(pid).is_some_and(|i| i.name == "sleep"));
@@ -699,7 +700,7 @@ fn abandon_escalates(grace: Duration) {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Share, grace);
 	// The trap makes sh and the sleep it starts ignore TERM.
-	let a = sh("trap '' TERM; /bin/sleep 100000; exit 0");
+	let a = sh("trap '' TERM; /bin/sleep 600; exit 0");
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
 	let mut members = Vec::new();
@@ -752,9 +753,7 @@ fn output_written_after_the_extproc_is_dropped_still_arrives() {
 	drop(s.spawn(sp).unwrap());
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let cx = Context::from_waker(&waker);
-	let deadline = Instant::now() + LONG;
 	while out.captured() != b"late\n" {
-		assert!(Instant::now() < deadline, "late output lost: {:?}", out.captured());
 		NativeSpawner::poll_orphans(&cx);
 		thread::park_timeout(Duration::from_millis(50));
 	}
@@ -774,7 +773,7 @@ fn abandoned_external_is_killed_after_the_default_grace() {
 fn abandon_sends_term_to_the_whole_group_at_once() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Share, Duration::from_secs(60));
-	let a = sh("/bin/sleep 100000 & /bin/sleep 100000 & wait");
+	let a = sh("/bin/sleep 600 & /bin/sleep 600 & wait");
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
 	until("members up", || live_group(group).len() == 3);
@@ -1459,24 +1458,26 @@ fn parked_spawner(grace: Duration) -> NativeSpawner {
 	})
 }
 
-/// Drive `p` as `obash` does: poll with the parker's waker, park in between.
+/// Drive `p` as `obash` does: poll with the parker's waker, park in
+/// between. The park's timeout is only how long it sleeps before polling
+/// again; the exit is what ends the wait.
 #[cfg(target_os = "linux")]
 fn wait_parked(parker: &mut crate::sys::Parker, p: &mut Box<dyn ExtProc>) -> ExitStatus {
 	let waker = parker.waker().clone();
 	let mut cx = Context::from_waker(&waker);
-	let deadline = Instant::now() + LONG;
 	loop {
 		if let Poll::Ready(s) = p.poll_wait(&mut cx) {
 			return s;
 		}
-		assert!(Instant::now() < deadline, "process did not finish");
-		parker.park(LONG);
+		parker.park(POLL);
 	}
 }
 
-/// The exit itself ends the park (a pidfd in the poll set), long before the
-/// park's timeout; no waiter thread is involved; the status is exact and
-/// the process is reaped once its `ExtProc` is dropped.
+/// The exit itself ends the park (a pidfd in the poll set), well inside the
+/// park's own [`POLL`] timeout — the one elapsed time a test here asserts,
+/// since being woken by the exit rather than by the timeout is what it is
+/// about; no waiter thread is involved; the status is exact and the process
+/// is reaped once its `ExtProc` is dropped.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_parked_external_wakes_the_parker_at_its_exit() {
@@ -1490,9 +1491,9 @@ fn a_parked_external_wakes_the_parker_at_its_exit() {
 		let a = sh(script);
 		let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 		let pid = p.pid() as i32;
-		let start = Instant::now();
+		let start = std::time::Instant::now();
 		assert_eq!(wait_parked(&mut parker, &mut p), status, "{script}");
-		assert!(start.elapsed() < LONG / 2, "woken by the exit, not the timeout");
+		assert!(start.elapsed() < POLL / 2, "woken by the exit, not the timeout");
 		assert!(proc::exists(pid), "unreaped while the ExtProc lives");
 		drop(p);
 		assert!(!proc::exists(pid), "reaped on drop");

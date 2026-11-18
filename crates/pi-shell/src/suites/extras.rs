@@ -1383,15 +1383,16 @@ async fn a_working_directory_past_path_max_is_no_line_too_long() {
 }
 
 /// `tail -f` writing into an engine pipe (no native handle) notices while
-/// idle that the extra reading it exited, as it does on a native pipe.
+/// idle that the extra reading it exited, as it does on a native pipe. The
+/// run returns only once `tail` stopped following, however long the host
+/// takes; one that keeps following is failed by the test runner
+/// (`.config/nextest.toml`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tail_follow_stops_once_the_extra_reading_it_exits() {
 	let dir = tempfile::tempdir().unwrap();
 	std::fs::write(dir.path().join("log"), "first\nsecond\n").unwrap();
 	let mut s = session_in(dir.path(), &[]);
-	let ran = tokio::time::timeout(Duration::from_secs(20), run(&mut s, "tail -f log | head -n1"))
-		.await
-		.expect("tail -f kept following after head exited");
+	let ran = run(&mut s, "tail -f log | head -n1").await;
 	assert_eq!(ran.stdout, "first\n", "stderr: {:?}", ran.stderr);
 }
 
