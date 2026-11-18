@@ -57,18 +57,44 @@ pub mod matchers {
 
 		use std::io::{self, Write};
 
+		use uucore::display::Quotable;
 
 		use super::{Matcher, MatcherIO, WalkEntry};
+		use crate::host::strip_errno;
 
-		pub struct DeleteMatcher;
+		/// `-delete`. An entry that a walk following no symlink below its root
+		/// listed is removed below that root's handle, with no symlink followed on
+		/// the way ([`pi_walker::fs::Session::remove_file_beneath`]), so a
+		/// directory swapped for a symlink since the listing fails the removal
+		/// instead of letting it reach outside the tree. The walk root itself,
+		/// provider trees, and `-L` walks remove by path. A symlink is removed
+		/// as a file, itself; on Windows a directory symlink or junction is a
+		/// directory and fails that removal, below the root as by path, as
+		/// [`std::fs::remove_file`] fails on it there. On Windows an empty
+		/// directory with the read-only attribute is removed below the root, as
+		/// `rmdir` removes one on Unix; by path it fails, as
+		/// [`std::fs::remove_dir`] (`RemoveDirectoryW`) refuses it there.
+		pub struct DeleteMatcher {
+			/// Removes entries below their (native) walk's root.
+			session: tokio::sync::Mutex<pi_walker::fs::Session>,
+		}
 
 		impl DeleteMatcher {
 			pub fn new() -> Self {
-				Self
+				Self { session: tokio::sync::Mutex::new(pi_walker::Fs::native().session()) }
 			}
 
 			async fn delete(&self, entry: &WalkEntry) -> io::Result<()> {
-				if entry.file_type().await.is_dir() && !entry.path_is_symlink().await {
+				let dir = entry.file_type().await.is_dir() && !entry.path_is_symlink().await;
+				if let Some((root, rel)) = entry.beneath() {
+					let mut session = self.session.lock().await;
+					return if dir {
+						session.remove_dir_beneath(root, rel).await
+					} else {
+						session.remove_file_beneath(root, rel).await
+					};
+				}
+				if dir {
 					entry.fs().remove_dir(entry.path()).await
 				} else {
 					entry.fs().remove_file(entry.path()).await
@@ -79,21 +105,24 @@ pub mod matchers {
 		#[async_trait::async_trait]
 		impl Matcher for DeleteMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
-				let path = file_info.path();
-				let path_str = path.to_string_lossy();
-
 				// This is a quirk in find's traditional semantics probably due to
-				// POSIX rmdir() not accepting "." (EINVAL). std::fs::remove_dir()
-				// inherits the same behavior, so no reason to buck tradition.
-				if path_str == "." {
+				// POSIX rmdir() not accepting "." (EINVAL). GNU find skips only the
+				// operand spelled exactly `.`, which the display path spells (a
+				// string compare: `./`, `.//` and `./.` fail with EINVAL, as GNU's).
+				let shown = file_info.display_path();
+				if shown.as_os_str() == "." {
 					return true;
 				}
 
+				#[cfg(test)]
+				crate::host::run_hook(file_info.path());
 				match self.delete(file_info).await {
 					Ok(()) => true,
 					Err(e) => {
+						// GNU find's wording and exit status for a failed removal.
 						matcher_io.set_exit_code(1);
-						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to delete {path_str}: {e}");
+						let stderr = &mut matcher_io.host().stderr;
+						let _ = writeln!(stderr, "find: cannot delete {}: {}", shown.quote(), strip_errno(&e));
 						false
 					},
 				}
@@ -349,6 +378,10 @@ pub mod matchers {
 			/// shell cwd; this preserves the operand-prefixed path GNU find prints and
 			/// matches against (e.g. `find .` -> `./a`). `None` falls back to `path()`.
 			display: Option<PathBuf>,
+			/// The open root of the native walk that listed this entry, when that
+			/// walk follows no symlink below it, and the byte offset in `path` where
+			/// the walk-relative path starts (see [`Self::below_root`]).
+			beneath: Option<(std::sync::Arc<pi_walker::fs::Dir>, usize)>,
 		}
 
 		impl WalkEntry {
@@ -361,7 +394,35 @@ pub mod matchers {
 			) -> Self {
 				let path = path.into();
 				let display = forward_slash_display(&path);
-				Self { fs, path, depth, follow, meta: OnceCell::new(), known_type: None, display }
+				Self { fs, path, depth, follow, meta: OnceCell::new(), known_type: None, display, beneath: None }
+			}
+
+			/// Record that a native walk following no symlink below its open
+			/// `root` listed this entry at the walk-relative `rel`, which `path`
+			/// ends with (on Windows with `\` for `/`, which the walker takes as
+			/// well), so [`Self::beneath`] can reach the entry below `root`
+			/// without copying `rel`. The root itself (`rel` empty) is not
+			/// recorded.
+			#[must_use]
+			pub fn below_root(mut self, root: &std::sync::Arc<pi_walker::fs::Dir>, rel: &[u8]) -> Self {
+				let path = self.path.as_os_str().as_encoded_bytes();
+				if !rel.is_empty() && path.len() > rel.len() {
+					let start = path.len() - rel.len();
+					debug_assert!(
+						path[start..].iter().zip(rel).all(|(&a, &b)| a == b || (b == b'/' && a == b'\\')),
+						"the walk's path ends with its walk-relative path",
+					);
+					self.beneath = Some((std::sync::Arc::clone(root), start));
+				}
+				self
+			}
+
+			/// The open root of the walk that listed this entry and the entry's
+			/// walk-relative path below it, when a native walk following no
+			/// symlink below its root listed it ([`Self::below_root`]).
+			pub fn beneath(&self) -> Option<(&pi_walker::fs::Dir, &[u8])> {
+				let (root, start) = self.beneath.as_ref()?;
+				Some((root, &self.path.as_os_str().as_encoded_bytes()[*start..]))
 			}
 
 			/// Record the type the directory listing reported, so `-type`,
@@ -5208,9 +5269,14 @@ async fn process_dir_walk_request(
 			while let Some(event) = tree.next().await {
 				match event {
 					pi_walker::walk::Event::Entry(entry) => {
-						let walk_entry =
+						let mut walk_entry =
 							WalkEntry::new(Arc::clone(&fs), entry.abs.to_path_buf(), entry.depth, config.follow)
 								.with_listed_type(entry.file_type);
+						// A native walk that follows no symlink below the root
+						// reaches its entries below the root's handle (`-delete`).
+						if let Some(root) = entry.root_dir.filter(|_| layer.is_native()) {
+							walk_entry = walk_entry.below_root(root, entry.path);
+						}
 						let (should_quit, should_skip_current_dir) = apply_find_entry(
 							walk_entry,
 							entry.path,
@@ -5323,9 +5389,11 @@ async fn run_find(
 	ret
 }
 
-fn print_help(host: &mut Host) {
+/// Writes through the async stdout sink: on an engine pipe `host.stdout` is a
+/// provider file, whose blocking write panics on a current-thread runtime.
+fn print_help(host: &Host) {
 	let _ = writeln!(
-		&mut host.stdout,
+		host.stdout_writer(),
 		r"Usage: find [path...] [expression]
 
 If no path is supplied then the current working directory is used by default.
@@ -5371,8 +5439,9 @@ Early alpha implementation. Currently the only expressions supported are
 	);
 }
 
-fn print_version(host: &mut Host) {
-	let _ = writeln!(host.stdout, "find (Rust) 0.8.0");
+/// See [`print_help`].
+fn print_version(host: &Host) {
+	let _ = writeln!(host.stdout_writer(), "find (Rust) 0.8.0");
 }
 
 /// pi-uutils: BSD `find -E` compatibility (macOS muscle memory).
@@ -5976,5 +6045,58 @@ mod tests {
 		assert_eq!(code, 1);
 		assert!(capture.err().contains("No space left on device"), "stderr: {}", capture.err());
 		assert!(!capture.err().contains("internal error"), "stderr: {}", capture.err());
+	}
+
+	/// `find -delete` removes no file through a directory swapped, between
+	/// the walk's listing and the removal, for a symlink to a directory
+	/// outside the operand that holds a file of the listed name: the removal
+	/// fails the way GNU find reports a failed removal (`cannot delete`,
+	/// exit 1), and the listed file is not removed by another route either.
+	/// `find -L`, which follows symlinks, still removes by path.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn delete_removes_no_file_through_a_directory_swapped_after_the_listing() {
+		let tree = crate::host::SwapTree::new("inside", "outside");
+		tree.swap_at(tree.sub.join("decoy.txt"));
+		let (code, capture) =
+			run_async_util::<Find>(&["root", "-name", "decoy.txt", "-delete"], "", &tree.base).await;
+		let err = capture.err();
+		assert!(tree.swapped(), "the swap ran");
+		assert!(tree.outside.join("decoy.txt").exists(), "removed through the swapped link: {err:?}");
+		assert!(tree.parked.join("decoy.txt").exists(), "removed the listed file another way: {err:?}");
+		// The swapped directory is refused as a symlink (`ELOOP`) or, opened
+		// as a directory without following it, as not one (`ENOTDIR`).
+		let refused = ["Not a directory", "Too many levels of symbolic links"]
+			.map(|reason| format!("find: cannot delete 'root/sub/decoy.txt': {reason}\n"));
+		assert!(code == 1 && refused.contains(&err), "{code} {err:?}");
+		let (code, capture) =
+			run_async_util::<Find>(&["-L", "root", "-name", "decoy.txt", "-delete"], "", &tree.base).await;
+		assert_eq!((code, capture.err().as_str()), (0, ""));
+		assert!(!tree.outside.join("decoy.txt").exists(), "-L removes through the link");
+	}
+
+	/// `find . -delete` empties the directory and leaves `.` itself, as GNU
+	/// find does, with no diagnostic. Any other spelling of the directory
+	/// (`./`, `.//`, `./.`) is not kept: its removal fails with EINVAL and
+	/// GNU find 4.9.0's message and exit status, and the directory stays.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn delete_leaves_only_the_operand_spelled_dot() {
+		// GNU find 4.9.0's status and stderr (`/usr/bin/find` printed as
+		// `find`) for each operand, run on a fresh tree.
+		for (operand, gnu) in [
+			(".", (0, "")),
+			("./", (1, "find: cannot delete './': Invalid argument\n")),
+			(".//", (1, "find: cannot delete './/': Invalid argument\n")),
+			("./.", (1, "find: cannot delete './.': Invalid argument\n")),
+		] {
+			let (_dir, root) = fixture();
+			fs::create_dir(root.join("sub")).unwrap();
+			fs::write(root.join("sub/f"), b"x").unwrap();
+			let (code, capture) = run(&root, &[operand.into(), "-delete".into()]).await;
+			assert_eq!((code, capture.err().as_str()), gnu, "{operand:?}");
+			assert!(root.is_dir(), "{operand:?}: the directory was removed");
+			assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "{operand:?}: the contents stay");
+		}
 	}
 }

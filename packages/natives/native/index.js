@@ -133,6 +133,7 @@ export const parseKey = nativeBindings.parseKey ?? missingNativeExport("parseKey
 export const parseKittySequence = nativeBindings.parseKittySequence ?? missingNativeExport("parseKittySequence");
 export const pdfToMarkdown = nativeBindings.pdfToMarkdown ?? missingNativeExport("pdfToMarkdown");
 export const rasterizeSvg = nativeBindings.rasterizeSvg ?? missingNativeExport("rasterizeSvg");
+export const readFileBeneath = nativeBindings.readFileBeneath ?? missingNativeExport("readFileBeneath");
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard");
 export const readTextFromClipboard = nativeBindings.readTextFromClipboard ?? missingNativeExport("readTextFromClipboard");
 export const renderMermaidAscii = nativeBindings.renderMermaidAscii ?? missingNativeExport("renderMermaidAscii");
@@ -237,6 +238,10 @@ export const MacOSAppearance = {
 export const ProcessStatus = {
 	Running: "running",
 	Exited: "exited",
+};
+export const ReadSkip = {
+	Large: "large",
+	Binary: "binary",
 };
 export const ShellFsFileType = {
 	File: "file",

@@ -40,7 +40,7 @@ use crate::grep::{
 	MAX_LINE_BYTES, RecordFormat, SEARCH_HEAP_LIMIT, bound_terminator, check_run,
 	describe_search_error, exit_status, for_each_nonempty_match,
 };
-use crate::host::{AsyncUtility, Host, StdoutFile, StreamWriter, forward_slash_display};
+use crate::host::{AsyncUtility, Host, StdoutFile, forward_slash_display};
 use crate::stdio;
 
 use ignore::{
@@ -1223,6 +1223,9 @@ fn walk_options(cli: &Rg, filters: &PathFilters) -> walk::Options {
 struct CollectedFiles {
 	paths:       Vec<PathBuf>,
 	parallelism: usize,
+	/// The open root of a native walk that does not follow symlinks, below
+	/// which the files open.
+	walk_root:   Option<Arc<pi_walker::fs::Dir>>,
 }
 
 /// The files below `root` that rg searches or lists, in report order (path
@@ -1267,7 +1270,8 @@ async fn collect_files(
 			if cli.sortr.as_deref() == Some("path") {
 				paths.reverse();
 			}
-			Some(CollectedFiles { paths, parallelism: options.parallelism(&layer) })
+			let walk_root = files.root_dir().filter(|_| layer.is_native()).cloned();
+			Some(CollectedFiles { paths, parallelism: options.parallelism(&layer), walk_root })
 		},
 		Err(error) => {
 			*had_error = true;
@@ -1606,6 +1610,7 @@ struct FileSearch {
 async fn process_file<M: Matcher + Send + Sync + 'static, W: Write, E: Write>(
 	shared: &Arc<DirSearch<M>>,
 	scratch: &mut Scratch,
+	beneath: Option<(&mut pi_walker::fs::Session, &pi_walker::fs::Dir)>,
 	path: &Path,
 	display: Option<&[u8]>,
 	stats: &mut Stats,
@@ -1618,7 +1623,7 @@ async fn process_file<M: Matcher + Send + Sync + 'static, W: Write, E: Write>(
 	{
 		return Ok(SearchOutcome { any_match: false, had_error: false });
 	}
-	let result = search_path(shared, scratch, path, display, stats, out).await;
+	let result = search_path(shared, scratch, beneath, path, display, stats, out).await;
 	match result {
 		Ok(any_match) => Ok(SearchOutcome { any_match, had_error: false }),
 		Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Err(error),
@@ -1633,10 +1638,13 @@ async fn process_file<M: Matcher + Send + Sync + 'static, W: Write, E: Write>(
 }
 
 /// Reads `path` and searches it, decompressing first under `--search-zip`.
-/// Files and decompressor output are read without blocking the runtime.
+/// Files and decompressor output are read without blocking the runtime. A
+/// file a walk that does not follow symlinks listed opens below that walk's
+/// root, never by path, and a decompressor reads it from stdin.
 async fn search_path<M: Matcher + Send + Sync + 'static, W: Write>(
 	shared: &Arc<DirSearch<M>>,
 	scratch: &mut Scratch,
+	beneath: Option<(&mut pi_walker::fs::Session, &pi_walker::fs::Dir)>,
 	path: &Path,
 	display: Option<&[u8]>,
 	stats: &mut Stats,
@@ -1649,6 +1657,13 @@ async fn search_path<M: Matcher + Send + Sync + 'static, W: Write>(
 	} else {
 		None
 	};
+	if let Some((session, root)) = beneath {
+		let rel = walk_rel(&shared.root, path)?;
+		let (file, _) = session.open_file_beneath(root, rel).await?;
+		let input = fed_input(command, stdio::Source::listed(file));
+		return process_input(&shared.matcher, scratch, input, Some(halt), display, opts, stats, out)
+			.await;
+	}
 	let input = match command {
 		// An unavailable decompressor falls back to searching the undecoded
 		// bytes. External decompressors cannot open virtual paths, so a
@@ -1660,19 +1675,33 @@ async fn search_path<M: Matcher + Send + Sync + 'static, W: Write>(
 				Err(_) => Input::Source(stdio::Source::open(fs, path).await?),
 			}
 		},
-		Some(command) => {
-			let source = stdio::Source::open(fs, path).await?;
-			match Decompressor::spawn(command, true) {
-				Ok(mut child) => {
-					child.feed(source);
-					Input::Child(child)
-				},
-				Err(_) => Input::Source(source),
-			}
-		},
+		Some(command) => fed_input(Some(command), stdio::Source::open(fs, path).await?),
 		None => Input::Source(stdio::Source::open(fs, path).await?),
 	};
 	process_input(&shared.matcher, scratch, input, Some(halt), display, opts, stats, out).await
+}
+
+/// `source` streamed into `command`, a decompressor reading its stdin; the
+/// undecoded bytes when there is no command or it cannot start.
+fn fed_input<'a>(command: Option<std::process::Command>, source: stdio::Source) -> Input<'a> {
+	match command.map(|command| Decompressor::spawn(command, true)) {
+		Some(Ok(mut child)) => {
+			child.feed(source);
+			Input::Child(child)
+		},
+		_ => Input::Source(source),
+	}
+}
+
+/// The walk-relative spelling of `path`, a file the native walk below `root`
+/// listed: a borrowed slice of `path`, whose separators (`\` on Windows) the
+/// walker takes as walk-relative separators too.
+fn walk_rel<'p>(root: &Path, path: &'p Path) -> io::Result<&'p [u8]> {
+	Ok(path
+		.strip_prefix(root)
+		.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "not below the walk root"))?
+		.as_os_str()
+		.as_encoded_bytes())
 }
 
 fn report_path_error(
@@ -1706,12 +1735,18 @@ struct DirSearch<M> {
 	operand:    OsString,
 	root:       PathBuf,
 	show_names: bool,
+	/// The open root of the native walk (not following symlinks) that listed
+	/// the files, below which they open.
+	walk_root:  Option<Arc<pi_walker::fs::Dir>>,
 }
 
-/// What one search worker reuses across files: its scratch and output buffer.
+/// What one search worker reuses across files: its scratch, output buffer,
+/// and, for a walk that does not follow symlinks, the session that opens
+/// listed files below the walk's root, with that root.
 struct Worker {
 	scratch: Scratch,
 	out:     Vec<u8>,
+	beneath: Option<(pi_walker::fs::Session, Arc<pi_walker::fs::Dir>)>,
 }
 
 impl Worker {
@@ -1728,7 +1763,12 @@ impl Worker {
 impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 	/// A worker whose searcher is built once from the shared builder.
 	fn worker(&self) -> Worker {
-		Worker { scratch: Scratch::new(&self.searcher), out: Vec::new() }
+		// `collect_files` keeps the root of a native walk only.
+		let beneath = self
+			.walk_root
+			.as_ref()
+			.map(|root| (pi_walker::Fs::native().session(), Arc::clone(root)));
+		Worker { scratch: Scratch::new(&self.searcher), out: Vec::new(), beneath }
 	}
 
 	async fn search(self: &Arc<Self>, worker: &mut Worker, path: &Path) -> FileSearch {
@@ -1740,8 +1780,18 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		let display =
 			(self.show_names || self.opts.json).then_some(display_path.as_os_str().as_encoded_bytes());
 		let (mut file_err, mut file_stats) = (Vec::<u8>::new(), Stats::new());
-		let Worker { scratch, out } = &mut *worker;
-		let outcome = process_file(self, scratch, path, display, &mut file_stats, out, &mut file_err).await;
+		let Worker { scratch, out, beneath } = &mut *worker;
+		let outcome = process_file(
+			self,
+			scratch,
+			beneath.as_mut().map(|(session, root)| (session, &**root)),
+			path,
+			display,
+			&mut file_stats,
+			out,
+			&mut file_err,
+		)
+		.await;
 		FileSearch { out: worker.take_out(), err: file_err, stats: file_stats, outcome }
 	}
 }
@@ -1750,7 +1800,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 	clippy::too_many_arguments,
 	reason = "gathers the shared state of one operand's searches"
 )]
-fn dir_search<M: Clone>(
+async fn dir_search<M: Clone>(
 	host: &Host,
 	cli: &Rg,
 	matcher: &M,
@@ -1761,12 +1811,13 @@ fn dir_search<M: Clone>(
 	opts: &SearchOptions,
 	halt: &HaltOnDrop,
 	direct: bool,
+	walk_root: Option<Arc<pi_walker::fs::Dir>>,
 ) -> Arc<DirSearch<M>> {
 	Arc::new(DirSearch {
 		fs: host.vfs(),
 		halt: halt.flag(),
 		direct,
-		stdout: host.stdout_file(),
+		stdout: host.stdout_file().await,
 		search_zip: cli.search_zip && !cli.no_search_zip,
 		opts: opts.clone(),
 		matcher: matcher.clone(),
@@ -1774,6 +1825,7 @@ fn dir_search<M: Clone>(
 		operand: operand.to_owned(),
 		root: root.to_owned(),
 		show_names,
+		walk_root,
 	})
 }
 
@@ -1797,15 +1849,18 @@ async fn search_dir<M: Matcher<Captures: Send> + Clone + Send + Sync + 'static, 
 	out: &mut W,
 ) -> io::Result<SearchOutcome> {
 	let mut had_error = false;
-	let Some(CollectedFiles { paths, parallelism }) =
+	let Some(CollectedFiles { paths, parallelism, walk_root }) =
 		collect_files(host, cli, filters, root, opts.no_messages, &mut had_error).await
 	else {
 		return Ok(SearchOutcome { any_match: false, had_error });
 	};
+	#[cfg(test)]
+	crate::host::run_hook(root);
 	let line_buffered = cli.line_buffered && !cli.no_line_buffered;
 	let workers = if line_buffered { 1 } else { parallelism };
 	let halt = HaltOnDrop::new();
-	let shared = dir_search(host, cli, matcher, searcher, operand, root, show_names, opts, &halt, false);
+	let shared =
+		dir_search(host, cli, matcher, searcher, operand, root, show_names, opts, &halt, false, walk_root).await;
 	let mut any_match = false;
 	let mut failed = None;
 	let mut pace = host.output_pace();
@@ -1915,7 +1970,7 @@ async fn list_files<W: Write>(
 	let no_messages = cli.no_messages && !cli.messages;
 	let filters = build_path_filters(host, cli).await;
 	let fs = host.vfs();
-	let stdout = host.stdout_file();
+	let stdout = host.stdout_file().await;
 	let mut any = false;
 	let mut had_error = false;
 	let mut processed_operand = false;
@@ -2155,7 +2210,9 @@ async fn execute_search<M: Matcher<Captures: Send> + Clone + Send + Sync + 'stat
 					opts,
 					&halt,
 					true,
-				);
+					None,
+				)
+				.await;
 				// Its own task, so dropping this body (cancellation) raises the
 				// halt flag the search checks between reads.
 				let path = resolved.clone();
@@ -2245,13 +2302,11 @@ impl AsyncUtility for Rg {
 		let _ = writeln!(host.stderr, "rg: --json cannot be combined with summary modes");
 		return 2;
 	}
-	let mut out = if cli.line_buffered && !cli.no_line_buffered {
-		StreamWriter::line(host.stdout_clone())
-	} else if cli.no_line_buffered {
-		StreamWriter::block(host.stdout_clone())
-	} else {
-		host.stdout_writer()
-	};
+	// Every mode writes through the async stdout sink. A raw writer over
+	// `host.stdout` blocks on a provider file (an engine pipe), which panics on
+	// a current-thread runtime. `--line-buffered` output is delivered after each
+	// file and each chunk of standard input, as grep's is.
+	let mut out = host.stdout_writer();
 	let (patterns, mut paths) = match resolve_patterns(host, &cli).await {
 		Ok(resolved) => resolved,
 		Err(error) => {
@@ -2301,11 +2356,28 @@ mod tests {
 	use super::*;
 	use crate::host::run_async_util;
 	#[cfg(unix)]
-	use crate::host::tree_with_sparse_file;
+	use crate::host::{SwapTree, tree_with_sparse_file};
 
 	async fn run(args: &[&str], stdin: &str) -> (i32, String, String) {
 		let (code, capture) = run_async_util::<Rg>(args, stdin, "/").await;
 		(code, capture.out(), capture.err())
+	}
+
+	/// `rg` reads no file through a directory swapped, between the walk's
+	/// listing and the file's open, for a symlink to a directory outside the
+	/// operand that holds a file of the listed name; `rg -L`, which follows
+	/// symlinks, still reads through the link.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn rg_reads_no_file_through_a_directory_swapped_after_the_walk() {
+		let tree = SwapTree::new("needle inside\n", "needle outside\n");
+		tree.swap_at(tree.root.clone());
+		let root_arg = tree.root.to_str().unwrap();
+		let (_, out, err) = run(&["needle", root_arg], "").await;
+		assert!(tree.swapped(), "the swap ran");
+		assert!(!out.contains("outside"), "read through the swapped link: {out:?} {err:?}");
+		let (_, followed, _) = run(&["-L", "needle", root_arg], "").await;
+		assert!(followed.contains("needle outside"), "-L follows the link: {followed:?}");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

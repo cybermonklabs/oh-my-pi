@@ -249,6 +249,7 @@ async fn run_list_workspace(
 							file_type,
 							mtime: entry.mtime.map(GlobMatch::millis),
 							size: entry.size.map(|size| size as f64),
+							symlink: (file_type == FileType::Symlink).then_some(true),
 						});
 					}
 					false
@@ -352,7 +353,7 @@ mod tests {
 	use super::*;
 
 	fn file(path: String) -> GlobMatch {
-		GlobMatch { path, file_type: FileType::File, mtime: None, size: None }
+		GlobMatch { path, file_type: FileType::File, mtime: None, size: None, symlink: None }
 	}
 
 	#[test]
