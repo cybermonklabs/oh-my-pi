@@ -422,7 +422,9 @@ describe("session blobs in the SQL session storage", () => {
 				plain.appendMessage({ role: "user", content: "no image here", timestamp: 1 });
 				plain.appendMessage(assistant("fine"));
 
-				await plain.flush();
+				// A flush drains the whole store, whose first failed write (the image session's) it may report;
+				// what this test holds is that the plain session's transcript landed.
+				await plain.flush().catch(() => undefined);
 				expect((await db.row(plain.getSessionFile() ?? ""))?.content ?? "").toContain("no image here");
 				await withImage.flush().catch(() => undefined);
 				expect((await db.row(withImage.getSessionFile() ?? ""))?.content ?? "").not.toContain(IMAGE_HASH);
