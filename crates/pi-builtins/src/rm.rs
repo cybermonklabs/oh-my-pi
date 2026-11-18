@@ -305,19 +305,21 @@ pub fn safe_remove_dir_recursive(host: &mut Host,
 	let path_fs = host.resolve(path);
 	// Base case 1: this is a file or a symbolic link.
 	// Use lstat to avoid race condition between check and use
-	let initial_mode = match host.fs().symlink_metadata(&path_fs) {
+	let (initial_mode, initial_id) = match host.fs().symlink_metadata(&path_fs) {
 		Ok(metadata) if !metadata.is_dir() => {
 			return remove_file(host, path, options, progress_bar);
 		},
-		Ok(metadata) => metadata.permissions().mode(),
+		Ok(metadata) => (metadata.permissions().mode(), metadata.dev().zip(metadata.ino())),
 		Err(e) if is_missing_under_force(&e, options) => return false,
 		Err(e) => {
 			return show_removal_error(host, e, path);
 		},
 	};
 
-	// Try to open the directory using DirFd for secure traversal
-	let dir_fd = match DirFd::open(&path_fs, SymlinkBehavior::Follow) {
+	// Open the operand as the directory the lstat found, not following a
+	// symlink there: one swapped in since the lstat is refused (`ENOTDIR`)
+	// instead of emptied.
+	let dir_fd = match open_stat_dir(&path_fs, initial_id) {
 		Ok(fd) => fd,
 		Err(e) if is_missing_under_force(&e, options) => return false,
 		Err(e) => {
@@ -418,13 +420,51 @@ fn path_push(buf: &mut Vec<u8>, name: &OsStr) {
 /// Whether `name` is an empty directory in `dir_fd`, asked through the
 /// descriptor rather than the path: past `PATH_MAX` a path-based check fails,
 /// and a failure counts as non-empty. An unreadable directory still counts as
-/// non-empty.
+/// non-empty, and so does one that is not the directory `id` (see
+/// [`open_stat_subdir`]).
 #[cfg(not(target_os = "redox"))]
-fn is_subdir_empty(dir_fd: &DirFd, name: &OsStr) -> bool {
-	dir_fd
-		.open_subdir(name, SymlinkBehavior::NoFollow)
+fn is_subdir_empty(dir_fd: &DirFd, name: &OsStr, id: (u64, u64)) -> bool {
+	open_stat_subdir(dir_fd, name, id)
 		.and_then(|fd| fd.read_dir())
 		.is_ok_and(|entries| entries.is_empty())
+}
+
+/// Opens the operand `path` without following a symlink that is its final
+/// component, kept only as the directory `id` (device, inode) that `lstat`
+/// found: anything else there is `ENOTDIR`. The identity is compared as well
+/// because gVisor before release-20261109.0 follows a final symlink to a
+/// directory despite `O_NOFOLLOW` when `O_DIRECTORY` is set (see
+/// [`open_stat_subdir`]). `id` is `None` when the `lstat` gave no identity,
+/// and then nothing is kept.
+fn open_stat_dir(path: &Path, id: Option<(u64, u64)>) -> std::io::Result<DirFd> {
+	let fd = DirFd::open(path, SymlinkBehavior::NoFollow)?;
+	let info = fd.metadata()?.file_info();
+	if Some((info.device(), info.inode())) == id {
+		Ok(fd)
+	} else {
+		Err(std::io::Error::from_raw_os_error(libc::ENOTDIR))
+	}
+}
+
+/// Opens the subdirectory `name` of `dir_fd`, without following a symlink
+/// there, as the directory `id` (device, inode) that `stat_at` found at the
+/// name: anything else there is `ENOTDIR`, Linux's refusal of a symlink at a
+/// directory open. `open_subdir` opens with `O_DIRECTORY | O_NOFOLLOW`, and
+/// gVisor before release-20261109.0 (GKE Sandbox's among them) follows a
+/// final symlink to a directory despite `O_NOFOLLOW` when `O_DIRECTORY` is
+/// set (google/gvisor#14786), so a directory swapped for a symlink since the
+/// stat would take the walk off the tree. gnulib's fts, which GNU rm walks
+/// with, compares the device and inode of each directory it enters the same
+/// way.
+#[cfg(not(target_os = "redox"))]
+fn open_stat_subdir(dir_fd: &DirFd, name: &OsStr, id: (u64, u64)) -> std::io::Result<DirFd> {
+	let fd = dir_fd.open_subdir(name, SymlinkBehavior::NoFollow)?;
+	let info = fd.metadata()?.file_info();
+	if (info.device(), info.inode()) == id {
+		Ok(fd)
+	} else {
+		Err(std::io::Error::from_raw_os_error(libc::ENOTDIR))
+	}
 }
 
 /// GNU's warning for a directory that is its own ancestor.
@@ -560,16 +600,18 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: 
 
 			// Ask user if they want to descend into this directory
 			if options.interactive == InteractiveMode::Always
-				&& !is_subdir_empty(&cur_fd, &entry_name)
+				&& !is_subdir_empty(&cur_fd, &entry_name, entry_id)
 				&& !prompt_descend(host, path_of(&path_buf))
 			{
 				break 'entry false;
 			}
 
-			// Open the just-stat'd subdirectory without following a symlink: one
-			// swapped in since the stat makes the open fail instead of taking the
-			// walk off the tree.
-			let child_fd = match cur_fd.open_subdir(&entry_name, SymlinkBehavior::NoFollow) {
+			// Open the just-stat'd subdirectory as that directory, not
+			// following a symlink: one swapped in since the stat makes the open
+			// fail instead of taking the walk off the tree.
+			#[cfg(test)]
+			crate::host::run_hook(path_of(&path_buf));
+			let child_fd = match open_stat_subdir(&cur_fd, &entry_name, entry_id) {
 				Ok(fd) => fd,
 				Err(e) => {
 					if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -621,6 +663,53 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, _path: &Path, _dir_fd: Di
 	// safe_traversal stat_at is not supported on Redox
 	// This shouldn't be called on Redox, but provide a stub for compilation
 	true // Return error
+}
+
+/// The device-and-inode checks on their own, on any kernel: a real directory
+/// at the name that is not the one `stat_at` or `lstat` found is refused, for
+/// the descent, for `-i`'s emptiness listing, and for the operand.
+#[cfg(all(test, not(target_os = "redox")))]
+mod stat_subdir_tests {
+	use std::{ffi::OsStr, os::unix::fs::MetadataExt};
+
+	use uucore::safe_traversal::{DirFd, SymlinkBehavior};
+
+	use super::{is_subdir_empty, open_stat_dir, open_stat_subdir};
+
+	#[test]
+	fn a_subdirectory_that_is_not_the_one_stat_at_found_is_refused() {
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::create_dir(tmp.path().join("sub")).unwrap();
+		std::fs::create_dir(tmp.path().join("other")).unwrap();
+		let id = |name: &str| {
+			let meta = std::fs::symlink_metadata(tmp.path().join(name)).unwrap();
+			(meta.dev(), meta.ino())
+		};
+		let dir = DirFd::open(tmp.path(), SymlinkBehavior::NoFollow).unwrap();
+		let sub = OsStr::new("sub");
+		assert!(open_stat_subdir(&dir, sub, id("sub")).is_ok(), "the directory stat_at found");
+		let err = open_stat_subdir(&dir, sub, id("other")).err().expect("another directory's id was accepted");
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+		assert!(is_subdir_empty(&dir, sub, id("sub")), "the empty directory stat_at found");
+		assert!(!is_subdir_empty(&dir, sub, id("other")), "-i listed a directory stat_at did not find");
+	}
+
+	#[test]
+	fn an_operand_that_is_not_the_directory_lstat_found_is_refused() {
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::create_dir(tmp.path().join("sub")).unwrap();
+		std::fs::create_dir(tmp.path().join("other")).unwrap();
+		let id = |name: &str| {
+			let meta = std::fs::symlink_metadata(tmp.path().join(name)).unwrap();
+			Some((meta.dev(), meta.ino()))
+		};
+		let sub = tmp.path().join("sub");
+		assert!(open_stat_dir(&sub, id("sub")).is_ok(), "the directory lstat found");
+		let err = open_stat_dir(&sub, id("other")).err().expect("another directory's id was accepted");
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+		let err = open_stat_dir(&sub, None).err().expect("an operand with no identity was accepted");
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+	}
 }
 
 }
@@ -1387,6 +1476,18 @@ fn is_writable_metadata(_metadata: &Metadata) -> bool {
 	true
 }
 
+/// Removes `path`, and when it is a directory (not a symlink to one)
+/// everything in it, as `rm -r` does with no prompt and no output but the
+/// errors it reports; returns whether it reported one. A native tree goes
+/// through the descriptor walk of [`safe_remove_dir_recursive`]. mv removes
+/// what a move across filesystems copied with this, as GNU mv removes with
+/// rm's code.
+#[cfg(all(feature = "util.mv", unix, not(target_os = "redox")))]
+pub(crate) fn remove_quietly(host: &mut Host, path: &Path) -> bool {
+	let options = Options { recursive: true, interactive: InteractiveMode::Never, ..Options::default() };
+	remove_dir_recursive(host, path, &options, None)
+}
+
 /// Recursively remove the directory tree rooted at the given path.
 ///
 /// If `path` is a file or a symbolic link, just remove it. If it is a
@@ -1882,6 +1983,80 @@ mod tests {
 
 	use super::{Rm, clean_trailing_slashes};
 	use crate::host::{Host, Utility, run_util};
+
+	/// Runs `rm -r root` 2,000 times while `swapped`, the operand `root` or
+	/// `root/sub`, flips between a directory and a symlink to `outside/`.
+	/// Returns how many runs removed a file in `outside/`.
+	#[cfg(unix)]
+	fn rm_r_while_swapping(swapped: &str) -> usize {
+		const RUNS: usize = 2_000;
+		let (mut escapes, mut refusals) = (0, 0);
+		for _ in 0..RUNS {
+			let cwd = tempdir().unwrap();
+			let (parked, outside) = (cwd.path().join("parked"), cwd.path().join("outside"));
+			let (sub, flipped) = (cwd.path().join("root/sub"), cwd.path().join(swapped));
+			std::fs::create_dir_all(&sub).unwrap();
+			std::fs::create_dir_all(&outside).unwrap();
+			for i in 0..4 {
+				std::fs::write(sub.join(format!("in{i}")), b"").unwrap();
+				std::fs::write(outside.join(format!("victim{i}")), b"").unwrap();
+			}
+			let stop = AtomicBool::new(false);
+			let err = std::thread::scope(|scope| {
+				scope.spawn(|| {
+					while !stop.load(Ordering::Relaxed) {
+						if std::fs::rename(&flipped, &parked).is_err() {
+							std::thread::yield_now();
+							continue;
+						}
+						let _ = std::os::unix::fs::symlink(&outside, &flipped);
+						for _ in 0..50 {
+							std::hint::spin_loop();
+						}
+						let _ = std::fs::remove_file(&flipped);
+						let _ = std::fs::rename(&parked, &flipped);
+					}
+				});
+				let (_, capture) = run_util::<Rm>(&["-r", "root"], "", cwd.path());
+				stop.store(true, Ordering::Relaxed);
+				capture.err()
+			});
+			if (0..4).any(|i| !outside.join(format!("victim{i}")).exists()) {
+				escapes += 1;
+			}
+			if err.contains("Not a directory") || err.contains("symbolic links") {
+				refusals += 1;
+			}
+		}
+		eprintln!(
+			"{RUNS} runs swapping {swapped}: {escapes} removed a file outside the tree, {refusals} refused the swapped directory"
+		);
+		escapes
+	}
+
+	/// `rm -r root` removes nothing outside `root` while `root/sub` flips
+	/// between a directory and a symlink to `outside/`, 2,000 times. A kernel
+	/// that refuses the symlink at the directory open passes this as it is;
+	/// gVisor before release-20261109.0, which follows a symlink to a
+	/// directory despite `O_NOFOLLOW` when `O_DIRECTORY` is set
+	/// (google/gvisor#14786), passes it only because rm keeps no directory but
+	/// the one it stat'd.
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink() {
+		let escapes = rm_r_while_swapping("root/sub");
+		assert_eq!(escapes, 0, "rm -r removed files outside the tree through a swapped symlink");
+	}
+
+	/// The same while the operand `root` itself flips. rm checks the operand
+	/// with `lstat`, so on every kernel it must not open a symlink put there
+	/// since.
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink() {
+		let escapes = rm_r_while_swapping("root");
+		assert_eq!(escapes, 0, "rm -r removed files outside the operand through a swapped symlink");
+	}
 
 	#[test]
 	fn collapses_repeated_root_slashes() {

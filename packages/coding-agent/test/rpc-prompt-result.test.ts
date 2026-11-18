@@ -6,6 +6,7 @@ import {
 	reportPromptResult,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-prompt-results";
 import { RpcSessionSettleWatcher } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-session-settle";
+import { ExtensionSendQueue } from "../src/extensibility/extensions/send-queue";
 import type { ExtensionActions } from "../src/extensibility/extensions/types";
 import { initializeExtensions } from "../src/modes/runtime-init";
 import type { AgentSession, AgentSessionEvent } from "../src/session/agent-session";
@@ -148,7 +149,8 @@ describe("RpcPromptResults", () => {
 				assistant({
 					stopReason: "error",
 					errorStatus: 400,
-					errorMessage:
+					errorMessage: "400 invalid_request_error: messages.0: bad block",
+					errorDisplayMessage:
 						"400 invalid_request_error: messages.0: bad block\nraw-http-request=/home/u/.omp/logs/x.json",
 				}),
 			]),
@@ -450,13 +452,16 @@ describe("reportPromptResult", () => {
 			let extensionActions: ExtensionActions | undefined;
 			const extensionUserMessages = new RpcExtensionUserMessageTracker();
 			const session = {
+				getAgentId: () => undefined,
 				extensionRunner: {
 					initialize: (actions: ExtensionActions) => {
 						extensionActions = actions;
 					},
 					onError: () => {},
 					emit: async () => {},
+					sends: new ExtensionSendQueue(),
 				},
+				discoverStartupSkillPaths: async () => {},
 				...testCase.session,
 			} as unknown as AgentSession;
 			await initializeExtensions(session, {
@@ -536,13 +541,16 @@ describe("initializeExtensions markAgentInvokingMessage", () => {
 		let markCount = 0;
 		let sentOptions: { triggerTurn?: boolean } | undefined;
 		const session = {
+			getAgentId: () => undefined,
 			extensionRunner: {
 				initialize: (actions: ExtensionActions) => {
 					extensionActions = actions;
 				},
 				onError: () => {},
 				emit: async () => {},
+				sends: new ExtensionSendQueue(),
 			},
+			discoverStartupSkillPaths: async () => {},
 			sendCustomMessage: async (_message: unknown, options?: { triggerTurn?: boolean }) => {
 				sentOptions = options;
 				return true;
@@ -585,13 +593,16 @@ describe("initializeExtensions invokingTask rejection safety", () => {
 		let extensionActions: ExtensionActions | undefined;
 		const extensionUserMessages = new RpcExtensionUserMessageTracker();
 		const session = {
+			getAgentId: () => undefined,
 			extensionRunner: {
 				initialize: (actions: ExtensionActions) => {
 					extensionActions = actions;
 				},
 				onError: () => {},
 				emit: async () => {},
+				sends: new ExtensionSendQueue(),
 			},
+			discoverStartupSkillPaths: async () => {},
 			// Mirrors AgentSession.sendCustomMessage's contract: `false` iff no turn started,
 			// e.g. an idle steer superseded by a concurrent turn's preflight generation check.
 			sendCustomMessage: async () => false,

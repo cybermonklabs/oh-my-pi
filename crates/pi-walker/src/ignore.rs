@@ -13,6 +13,16 @@
 //!   root, apply too, minus any rule that would ignore the walk root itself.
 //! - Within one file the last matching rule wins; `dir/` rules match only
 //!   directories; `!` rules re-include.
+//! - A directory's own sources open relative to its handle (`.git` and `info`
+//!   as child directories that are not symlinks). Here a walk that does not
+//!   follow symlinks departs from the `ignore` crate, which follows a symlinked
+//!   source: it reads no source that is a symlink, since each lies inside the
+//!   walk root and a symlink can name any file. For `.gitignore` that is git's
+//!   own rule (git 2.32 and later reads no symlinked `.gitignore` in the
+//!   working tree); git does follow a symlinked `.git/info/exclude`, which such
+//!   a walk does not. A walk that follows symlinks follows them. Git's global
+//!   excludes file and the ancestors' sources open by path, following symlinks:
+//!   they name files outside the walk root on purpose.
 //!
 //! [`Rules`] is public for tools that load extra rule files themselves
 //! (`rg --ignore-file`, `fd --ignore-file`, `.fdignore`). The chain types are
@@ -300,27 +310,38 @@ fn non_empty(rules: Rules) -> Option<Arc<Rules>> {
 	(!rules.is_empty()).then(|| Arc::new(rules))
 }
 
-/// Opens `.git/info/exclude` below `dir`.
+/// Opens `.git/info/exclude` below `dir`, following a symlinked `exclude`
+/// only when `follow`.
 async fn open_exclude(
 	session: &mut Session,
 	dir: &Dir,
+	follow: bool,
 ) -> io::Result<(crate::fs::File, crate::fs::FileInfo)> {
 	let git = session.open_child(dir, b".git").await?;
 	let info = session.open_child(&git, b"info").await?;
-	session.open_file_at(&info, b"exclude").await
+	session.open_file_at(&info, b"exclude", follow).await
 }
 
 impl DirIgnores {
-	/// Reads the sources `names` calls for, relative to the open `dir`;
-	/// `stamped` also records their stamps.
-	pub(crate) async fn load(session: &mut Session, dir: &Dir, names: Names, stamped: bool) -> Self {
+	/// Reads the sources `names` calls for, relative to the open `dir`,
+	/// following a source that is a symlink only when `follow` (the walk's
+	/// own policy); `stamped` also records their stamps.
+	pub(crate) async fn load(
+		session: &mut Session,
+		dir: &Dir,
+		names: Names,
+		stamped: bool,
+		follow: bool,
+	) -> Self {
 		let mut out = Self::default();
 		let mut buf = Vec::new();
 		for (k, _) in Self::source_names(names) {
 			let opened = if k < 2 {
-				session.open_file_at(dir, SOURCES[k].as_bytes()).await
+				session
+					.open_file_at(dir, SOURCES[k].as_bytes(), follow)
+					.await
 			} else {
-				open_exclude(session, dir).await
+				open_exclude(session, dir, follow).await
 			};
 			let Ok(stamp) = read_opened(opened, &mut buf).await else {
 				continue;

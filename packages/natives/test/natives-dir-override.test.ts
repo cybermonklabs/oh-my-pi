@@ -9,6 +9,8 @@ const ENV_KEYS = [
 	"HOME",
 	"USERPROFILE",
 	"PI_NATIVES_DIR",
+	"OMP_CONFIG_ROOT",
+	"OMP_DOWNLOAD_ROOT",
 	"XDG_DATA_HOME",
 	"PI_NATIVE_VARIANT",
 	"__PI_NATIVE_VARIANT_CACHE",
@@ -84,5 +86,21 @@ describe("native addon directory override", () => {
 		expect(initLoaderContext({ isCompiledBinary: true }).versionedDir).toBe(
 			path.join(xdgData, "omp", "natives", packageJson.version),
 		);
+	});
+
+	it("follows pi-utils: the download root, then XDG, then the config root", async () => {
+		const downloads = path.join(tempRoot, "downloads");
+		const configRoot = path.join(tempRoot, "config");
+		const xdgData = path.join(tempRoot, "data");
+		const versioned = () => initLoaderContext({ isCompiledBinary: true }).versionedDir;
+		process.env.OMP_CONFIG_ROOT = configRoot;
+		expect(versioned()).toBe(path.join(configRoot, "natives", packageJson.version));
+		await fs.mkdir(path.join(xdgData, "omp"), { recursive: true });
+		process.env.XDG_DATA_HOME = xdgData;
+		expect(versioned()).toBe(path.join(xdgData, "omp", "natives", packageJson.version));
+		process.env.OMP_DOWNLOAD_ROOT = downloads;
+		expect(versioned()).toBe(path.join(downloads, "natives", packageJson.version));
+		process.env.PI_NATIVES_DIR = path.join(tempRoot, "shared");
+		expect(versioned()).toBe(path.join(tempRoot, "shared", packageJson.version));
 	});
 });

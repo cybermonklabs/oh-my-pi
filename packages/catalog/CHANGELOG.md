@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `writeModelCacheInSlices` and `fingerprintStaticModelsSteps`, which do the work of `writeModelCache` and `fingerprintStaticModels` in slices that return to the event loop, and `takeModelCacheRowTurn`, which orders one cache row's sliced read-merge-write passes in this process
+- Added `collapseVariantsSteps`, `collapseBuiltVariantsSteps` and `applyCatalogMetricsSteps`: the work of `collapseVariants`, `collapseBuiltVariants` and `applyCatalogMetrics` as steps, one per provider collapsed, logical model rebuilt or model scored
+- Added `readModelCacheSteps`, which reads a provider's cache row in one step and parses it in the next; `readModelCache` runs it to completion
+
+### Fixed
+
+- Provider model resolution no longer holds the event loop while it builds, merges, fingerprints or writes a large catalog: it gives the loop a turn after each 10 ms slice of its work, plus at most one step ([#17121](https://github.com/can1357/oh-my-pi/issues/17121))
+- Model discovery decodes and parses each fetched model list and model metadata response, and maps an OpenAI-compatible endpoint's rows, in slices, so two responses that arrive together no longer hold timers for both parses
+- Provider model resolution reads each cache row and parses it in separate slices, and collapses variants and fills catalog metrics in slices; a corrupt row is deleted only if no write replaced it since it was read
+- Model cache commits no longer wait for an fsync on the main thread: the cache now uses WAL's `synchronous = NORMAL`, as omp's other regenerable caches do
+- Concurrent refreshes of one provider read, merge and write its cache row one at a time, in the order their fetches resolved, each from the row the earlier ones left, as they did before the work was sliced; a slow refresh can no longer write an older catalog over a newer one or drop rows another refresh fetched
+
+## [18.18.6] - 2026-11-09
+
+### Fixed
+
+- LiteLLM lists only the models the configured key can call (its authenticated `/v1/models`), keeping the proxy's metadata for them; a proxy whose `/v1/models` fails now lists no models instead of every model it serves ([#18601](https://github.com/can1357/oh-my-pi/issues/18601))
+
 ## [18.18.5] - 2026-11-09
 
 ### Added

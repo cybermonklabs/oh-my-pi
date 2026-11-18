@@ -35,6 +35,8 @@
 mod canonicalize;
 mod dir;
 mod error;
+#[cfg(unix)]
+mod fifo;
 mod file;
 mod fs;
 mod metadata;
@@ -53,6 +55,8 @@ pub use error::{
 	cancelled, crosses_devices, invalid_argument, is_a_directory, is_cancelled, no_provider,
 	not_a_directory, permission_denied, read_only_filesystem, unsupported,
 };
+#[cfg(unix)]
+pub use fifo::FifoOpen;
 pub use file::{File, FileHandle};
 #[cfg(unix)]
 pub use file::{POLL_SLICE, fd_reads_can_block, readable_within, reads_can_block, wait_readable};

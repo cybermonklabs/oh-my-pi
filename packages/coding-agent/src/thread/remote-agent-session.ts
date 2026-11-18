@@ -48,6 +48,7 @@ import type { ContextUsage } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState } from "../goals/state";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { settingsStoreMask } from "../secrets/session-store-mask";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent, AgentSessionEventListener } from "../session/agent-session-events";
 import {
@@ -352,6 +353,8 @@ export class RemoteAgentSession implements AgentViewSession {
 			putBlobSync: (data: Buffer, options?: BlobPutOptions): BlobPutResult => blobs().putSync(data, options),
 			getArtifactPath: id => this.#command("getArtifactPath", id),
 			getArtifactContent: id => this.#command("getArtifactContent", id),
+			// Built here from the main-side settings: a mask is compiled regexes and never crosses threads.
+			storeMask: () => settingsStoreMask(this.settings, this.#state.cwd),
 		};
 	}
 

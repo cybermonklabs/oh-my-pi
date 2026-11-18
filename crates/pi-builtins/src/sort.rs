@@ -6940,8 +6940,6 @@ fn format_error_message(error: &ParseSizeError, s: &str, option: &str) -> String
 mod tests {
 
 	use super::*;
-	#[cfg(unix)]
-	use crate::locale::locale_loadable;
 	use crate::host::run_util;
 
 	fn tokenize_helper(line: &[u8], separator: Option<u8>) -> Vec<Field> {
@@ -7206,7 +7204,7 @@ mod tests {
 	/// locale (as GNU does) for one that is not installed.
 	#[cfg(unix)]
 	fn locale_installed(locale: &str) -> bool {
-		locale_loadable(locale, nix::libc::LC_ALL_MASK)
+		crate::locale::locale_loadable(locale, nix::libc::LC_ALL_MASK)
 	}
 
 	/// Windows sort reads ICU's data for any locale name: nothing to install.

@@ -6,10 +6,12 @@ import { HttpTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/http";
 import type { JsonRpcRequest } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import type { MCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
 import { postmortem } from "@oh-my-pi/pi-utils";
+import { nextTask } from "../../ai/test/helpers";
 
 const encoder = new TextEncoder();
+/** The deadline the timeout tests hand the transport; they move it on a fake clock. */
 const REQUEST_TIMEOUT_MS = 50;
-const GUARD_TIMEOUT_MS = 500;
+const realFetch = globalThis.fetch;
 
 let server: Bun.Server<undefined> | null = null;
 
@@ -18,11 +20,18 @@ type ToolList = {
 };
 
 afterEach(() => {
+	vi.useRealTimers();
+	globalThis.fetch = realFetch;
 	server?.stop(true);
 	server = null;
 });
 
-async function connectedTransport(timeout = REQUEST_TIMEOUT_MS): Promise<HttpTransport> {
+/**
+ * A transport on the test server. Only a test of the deadline itself hands the transport one, and
+ * it drives that deadline on a fake clock: a real deadline measures the machine, and a loaded
+ * runner reaches it before the request gets to the behaviour under test.
+ */
+async function connectedTransport(timeout = 0): Promise<HttpTransport> {
 	if (!server) throw new Error("Test server was not started");
 	const transport = new HttpTransport({
 		type: "http",
@@ -44,15 +53,70 @@ function stalledBodyResponse(bodyPrefix: string, init?: ResponseInit): Response 
 	);
 }
 
-// Real time is intentional: this exercises Bun fetch aborting a live HTTP body stream,
-// which fake timers do not drive through the socket/readable-stream stack.
-async function withPendingGuard<T>(promise: Promise<T>, label: string): Promise<T> {
-	return await Promise.race([
-		promise,
-		Bun.sleep(GUARD_TIMEOUT_MS).then(() => {
-			throw new Error(`${label} stayed pending past ${GUARD_TIMEOUT_MS}ms`);
-		}),
-	]);
+interface ObservedFetch {
+	/** The signal the transport handed fetch: its deadline, caller cancellation and close. */
+	signal: AbortSignal | undefined;
+	/** Settles when the response headers reach the transport. */
+	headers: Promise<void>;
+	/** Settles when the transport starts reading the body with `json()` or `text()`. */
+	bodyRead: Promise<void>;
+}
+
+/**
+ * Send every fetch the transport makes on to the test server unchanged while recording its
+ * phases, so a timeout test moves the fake clock only once the transport is in the phase under
+ * test. A fake-timer deadline aborts Bun's real fetch and body stream like a real one does. The
+ * returned function resolves once the transport has started its `index`-th fetch.
+ */
+function observeFetches(): (index: number) => Promise<ObservedFetch> {
+	const started: PromiseWithResolvers<ObservedFetch>[] = [];
+	const slot = (index: number) => {
+		started[index] ??= Promise.withResolvers<ObservedFetch>();
+		return started[index];
+	};
+	let count = 0;
+	globalThis.fetch = (async (input, init) => {
+		const headers = Promise.withResolvers<void>();
+		const bodyRead = Promise.withResolvers<void>();
+		slot(count++).resolve({
+			signal: init?.signal ?? undefined,
+			headers: headers.promise,
+			bodyRead: bodyRead.promise,
+		});
+		const response = await realFetch(input, init);
+		for (const reader of ["json", "text"] as const) {
+			const read = response[reader].bind(response);
+			Object.defineProperty(response, reader, {
+				value: () => {
+					bodyRead.resolve();
+					return read();
+				},
+			});
+		}
+		headers.resolve();
+		return response;
+	}) as typeof globalThis.fetch;
+	return index => slot(index).promise;
+}
+
+/**
+ * Fire a resume's SSE `retry` wait as soon as the transport arms it. The transport arms that timer
+ * once it has read the end of the POST stream, which the test cannot see, so this watches the fake
+ * timer count rise past `timersBefore` (the request's deadline is already among them). Bun fires a
+ * 0 ms timer 1 ms after it is armed, so this moves the fake clock by 1 ms; a test that needs the
+ * exact deadline measures it with `Date.now()`, which the fake clock drives.
+ */
+async function fireRetryTimer(request: Promise<unknown>, timersBefore: number): Promise<void> {
+	let settled = false;
+	const settle = () => {
+		settled = true;
+	};
+	void request.then(settle, settle);
+	while (vi.getTimerCount() <= timersBefore) {
+		if (settled) throw new Error("The request settled before the transport armed its SSE retry wait");
+		await nextTask();
+	}
+	vi.advanceTimersToNextTimer();
 }
 
 describe("MCP Streamable HTTP request progress", () => {
@@ -82,7 +146,7 @@ describe("MCP Streamable HTTP request progress", () => {
 				);
 			},
 		});
-		const transport = await connectedTransport(300);
+		const transport = await connectedTransport();
 		const updates: MCPProgress[] = [];
 		const notifications: unknown[] = [];
 		transport.onNotification = (method, params) => {
@@ -144,7 +208,7 @@ describe("MCP Streamable HTTP request progress", () => {
 				return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
 			},
 		});
-		const transport = await connectedTransport(300);
+		const transport = await connectedTransport();
 		const progressReceived = Promise.withResolvers<void>();
 		const lateReceived = Promise.withResolvers<void>();
 		const updates: MCPProgress[] = [];
@@ -163,13 +227,11 @@ describe("MCP Streamable HTTP request progress", () => {
 					},
 				},
 			);
-			const receivedWhilePending = await Promise.race([
-				progressReceived.promise.then(() => true),
-				Bun.sleep(150).then(() => false),
-			]);
+			// The server holds the POST until `release`, so progress seen before then arrived while
+			// the request was pending.
+			await progressReceived.promise;
 			release.resolve();
 			await pending;
-			expect(receivedWhilePending).toBe(true);
 			expect(updates).toEqual([{ progress: 1 }]);
 			stream?.enqueue(
 				encoder.encode(
@@ -180,7 +242,7 @@ describe("MCP Streamable HTTP request progress", () => {
 					})}\n\n`,
 				),
 			);
-			await withPendingGuard(lateReceived.promise, "late GET progress fanout");
+			await lateReceived.promise;
 			expect(updates).toEqual([{ progress: 1 }]);
 		} finally {
 			release.resolve();
@@ -208,7 +270,7 @@ describe("MCP Streamable HTTP request progress", () => {
 				);
 			},
 		});
-		const transport = await connectedTransport(300);
+		const transport = await connectedTransport();
 		transport.onAuthError = async () => ({ Authorization: "Bearer refreshed" });
 		const updates: MCPProgress[] = [];
 		try {
@@ -267,7 +329,7 @@ describe("MCP Streamable HTTP initialization", () => {
 		const connection = await connectToServer("session-order", {
 			type: "http",
 			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
+			timeout: 0,
 		});
 
 		expect(requests).toEqual(["initialize", "notifications/initialized", "GET"]);
@@ -312,7 +374,7 @@ describe("MCP Streamable HTTP initialization", () => {
 		);
 		await listenerStarted.promise;
 		controller.abort();
-		await expect(withPendingGuard(connection, "handshake")).rejects.toMatchObject({ name: "AbortError" });
+		await expect(connection).rejects.toMatchObject({ name: "AbortError" });
 	});
 });
 
@@ -332,7 +394,7 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		const transport = new HttpTransport({
 			type: "http",
 			url: `http://127.0.0.1:${tcp.port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
+			timeout: 0,
 		});
 		try {
 			await transport.connect();
@@ -361,7 +423,7 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		const transport = new HttpTransport({
 			type: "http",
 			url: `http://127.0.0.1:${tcp.port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
+			timeout: 0,
 		});
 		try {
 			await transport.connect();
@@ -395,7 +457,7 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 		const transport = new HttpTransport({
 			type: "http",
 			url: `http://127.0.0.1:${port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
+			timeout: 0,
 		});
 		await transport.connect();
 
@@ -491,6 +553,7 @@ describe("MCP Streamable HTTP failure diagnostics", () => {
 
 describe("MCP Streamable HTTP transport timeouts", () => {
 	it("keeps the request timeout active until a JSON response body is fully read", async () => {
+		vi.useFakeTimers();
 		server = Bun.serve({
 			port: 0,
 			fetch() {
@@ -499,9 +562,18 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const fetched = observeFetches();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 
-		await expect(withPendingGuard(transport.request("tools/list"), "request")).rejects.toMatchObject({
+		const request = transport.request("tools/list");
+		const post = await fetched(0);
+		await post.bodyRead;
+		vi.advanceTimersByTime(REQUEST_TIMEOUT_MS);
+		// The deadline aborts the fetch whose body is being read; a read it no longer bounds would
+		// wait for the test server's own idle timeout instead.
+		expect(post.signal?.aborted).toBe(true);
+
+		await expect(request).rejects.toMatchObject({
 			transport: "http",
 			stage: "decode",
 			failure: "timeout",
@@ -511,30 +583,46 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 	});
 
 	it("uses one deadline across delayed SSE headers and a stalled response body", async () => {
-		// Real time is required here: fake timers do not drive Bun's fetch/socket
-		// abort path, and elapsed time is the end-to-end contract under test.
+		// One deadline spans both phases: it expires `timeoutMs` after the request starts, however
+		// that time splits between waiting for headers and reading the body. A deadline restarted
+		// at the headers would still be running at `timeoutMs`.
+		vi.useFakeTimers();
 		const timeoutMs = 250;
 		const headerDelayMs = 160;
+		const requestReceived = Promise.withResolvers<void>();
+		const sendHeaders = Promise.withResolvers<void>();
 		server = Bun.serve({
 			port: 0,
 			async fetch() {
-				await Bun.sleep(headerDelayMs);
+				requestReceived.resolve();
+				await sendHeaders.promise;
 				return stalledBodyResponse(": accepted\n\n", {
 					headers: { "Content-Type": "text/event-stream" },
 				});
 			},
 		});
+		const fetched = observeFetches();
 		const transport = await connectedTransport(timeoutMs);
-		const startedAt = performance.now();
 
 		try {
-			await expect(withPendingGuard(transport.request("tools/list"), "SSE request")).rejects.toMatchObject({
+			const request = transport.request("tools/list");
+			const post = await fetched(0);
+			await requestReceived.promise;
+			vi.advanceTimersByTime(headerDelayMs);
+			sendHeaders.resolve();
+			await post.headers;
+			// Let the transport reach the stalled body read.
+			await nextTask();
+			vi.advanceTimersByTime(timeoutMs - headerDelayMs - 1);
+			expect(post.signal?.aborted).toBe(false);
+			vi.advanceTimersByTime(1);
+			expect(post.signal?.aborted).toBe(true);
+			await expect(request).rejects.toMatchObject({
 				transport: "http",
 				stage: "receive",
 				failure: "timeout",
 				retryable: false,
 			});
-			expect(performance.now() - startedAt).toBeLessThan(timeoutMs + 100);
 		} finally {
 			await transport.close();
 		}
@@ -623,6 +711,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 	});
 
 	it("keeps the notify timeout active while reading HTTP error bodies", async () => {
+		vi.useFakeTimers();
 		server = Bun.serve({
 			port: 0,
 			fetch() {
@@ -632,11 +721,18 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const fetched = observeFetches();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 
-		await expect(withPendingGuard(transport.notify("notifications/initialized"), "notify")).rejects.toThrow(
-			`Notify timeout after ${REQUEST_TIMEOUT_MS}ms`,
-		);
+		const notification = transport.notify("notifications/initialized");
+		const post = await fetched(0);
+		await post.bodyRead;
+		vi.advanceTimersByTime(REQUEST_TIMEOUT_MS);
+		// The deadline aborts the fetch whose body is being read; a read it no longer bounds would
+		// wait for the test server's own idle timeout instead.
+		expect(post.signal?.aborted).toBe(true);
+
+		await expect(notification).rejects.toThrow(`Notify timeout after ${REQUEST_TIMEOUT_MS}ms`);
 	});
 
 	it("close aborts and drains an in-flight SSE POST request", async () => {
@@ -650,50 +746,45 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		if (!server) throw new Error("Test server was not started");
-		const transport = new HttpTransport({
-			type: "http",
-			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
-		});
-		await transport.connect();
+		const transport = await connectedTransport();
 
 		const request = transport.request("tools/list");
 		await requestReceived.promise;
 		const closing = transport.close();
 
-		const requestError = await withPendingGuard(request, "aborted request").then(
+		const requestError = await request.then(
 			() => undefined,
 			error => error,
 		);
 		expect(requestError).toMatchObject({ name: "AbortError" });
 		expect(postmortem.isExpectedCleanupError(requestError)).toBe(true);
-		await withPendingGuard(closing, "transport close");
+		await closing;
 	});
 
 	it("preserves caller cancellation when it wins a stalled SSE response", async () => {
-		const requestReceived = Promise.withResolvers<void>();
+		// The deadline stays armed on a fake clock that never reaches it, so the caller wins.
+		vi.useFakeTimers();
 		const caller = new AbortController();
 		server = Bun.serve({
 			port: 0,
 			fetch() {
-				requestReceived.resolve();
 				return stalledBodyResponse(": accepted\n\n", {
 					headers: { "Content-Type": "text/event-stream" },
 				});
 			},
 		});
-		const transport = await connectedTransport(GUARD_TIMEOUT_MS);
+		const fetched = observeFetches();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 
 		try {
 			const request = transport.request("tools/list", undefined, { signal: caller.signal });
-			await requestReceived.promise;
-			const nextTurn = Promise.withResolvers<void>();
-			setImmediate(nextTurn.resolve);
-			await nextTurn.promise;
+			const post = await fetched(0);
+			await post.headers;
+			// Let the transport reach the stalled body read.
+			await nextTask();
 			caller.abort();
 
-			const error = await withPendingGuard(request, "caller-aborted SSE request").then(
+			const error = await request.then(
 				() => undefined,
 				reason => reason,
 			);
@@ -739,7 +830,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				);
 			},
 		});
-		const transport = await connectedTransport(GUARD_TIMEOUT_MS);
+		const transport = await connectedTransport();
 		transport.onNotification = method => {
 			if (method === "notifications/progress") notificationReceived.resolve();
 		};
@@ -748,15 +839,17 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 			await transport.request("tools/list", undefined, { signal: caller.signal });
 			caller.abort();
 			sendNotification.resolve();
-			await withPendingGuard(notificationReceived.promise, "post-response notification");
+			await notificationReceived.promise;
 		} finally {
 			await transport.close();
 		}
 	});
 
 	it("keeps draining an accepted notification stream past the POST deadline", async () => {
+		vi.useFakeTimers();
 		const notificationReceived = Promise.withResolvers<void>();
 		const sendNotification = Promise.withResolvers<void>();
+		const streamCancelled = Promise.withResolvers<void>();
 		server = Bun.serve({
 			port: 0,
 			fetch() {
@@ -768,41 +861,50 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 							void sendNotification.promise.then(() => {
 								if (cancelled) return;
 								try {
+									// Held open afterwards: a client that drops the stream shows up
+									// as `cancel`, never as a clean end.
 									controller.enqueue(
 										encoder.encode('data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'),
 									);
-									controller.close();
 								} catch {
-									// The negative path intentionally cancels the client stream.
+									// The client already dropped the stream; `cancel` reports it.
 								}
 							});
 						},
 						cancel() {
 							cancelled = true;
+							streamCancelled.resolve();
 						},
 					}),
 					{ headers: { "Content-Type": "text/event-stream" } },
 				);
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		transport.onNotification = method => {
 			if (method === "notifications/progress") notificationReceived.resolve();
 		};
 
 		try {
 			await transport.notify("notifications/initialized");
-			// Let the former read timeout expire on the real fetch/body stream,
-			// then prove the accepted response remains owned by the transport.
-			await Bun.sleep(REQUEST_TIMEOUT_MS * 2);
+			// Pass the POST deadline on the fake clock. A deadline still bound to the accepted
+			// stream fires here and cancels it.
+			vi.advanceTimersByTime(REQUEST_TIMEOUT_MS * 2);
 			sendNotification.resolve();
-			await withPendingGuard(notificationReceived.promise, "notification response drain");
+			const outcome = await Promise.race([
+				notificationReceived.promise.then(() => "drained"),
+				streamCancelled.promise.then(() => "cancelled"),
+			]);
+			expect(outcome).toBe("drained");
 		} finally {
 			await transport.close();
 		}
 	});
 
 	it("keeps an abandoned SSE request rejection observed after caller cancellation", async () => {
+		// The deadline stays armed on a fake clock that never reaches it, so the caller's abort is
+		// what rejects the request.
+		vi.useFakeTimers();
 		const requestReceived = Promise.withResolvers<void>();
 		const caller = new AbortController();
 		server = Bun.serve({
@@ -814,7 +916,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 				});
 			},
 		});
-		const transport = await connectedTransport();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		const unhandled: unknown[] = [];
 		const onUnhandled = (reason: unknown) => unhandled.push(reason);
 		process.on("unhandledRejection", onUnhandled);
@@ -822,9 +924,7 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 			void transport.request("tools/list", undefined, { signal: caller.signal });
 			await requestReceived.promise;
 			caller.abort();
-			const nextTurn = Promise.withResolvers<void>();
-			setImmediate(nextTurn.resolve);
-			await nextTurn.promise;
+			await nextTask();
 
 			expect(unhandled).toEqual([]);
 		} finally {
@@ -848,20 +948,16 @@ describe("MCP Streamable HTTP protocol version header", () => {
 		const transport = new HttpTransport({
 			type: "http",
 			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: REQUEST_TIMEOUT_MS,
+			timeout: 0,
 			headers: { "MCP-Protocol-Version": "1999-01-01" },
 		});
 		await transport.connect();
 
 		// Pre-negotiation: configured header must be stripped, not leaked.
-		seen.pre = await withPendingGuard(transport.request<{ seen: string | null }>("initialize"), "request").then(
-			r => r.seen,
-		);
+		seen.pre = (await transport.request<{ seen: string | null }>("initialize")).seen;
 		// Post-negotiation: the negotiated version wins over the configured one.
 		transport.setProtocolVersion("2025-11-25");
-		seen.post = await withPendingGuard(transport.request<{ seen: string | null }>("tools/list"), "request").then(
-			r => r.seen,
-		);
+		seen.post = (await transport.request<{ seen: string | null }>("tools/list")).seen;
 
 		expect(seen.pre).toBeNull();
 		expect(seen.post).toBe("2025-11-25");
@@ -870,6 +966,7 @@ describe("MCP Streamable HTTP protocol version header", () => {
 
 describe("MCP Streamable HTTP POST response resumption", () => {
 	it("reports a timeout when a resumed HTTP error body stalls", async () => {
+		vi.useFakeTimers();
 		let posts = 0;
 		server = Bun.serve({
 			port: 0,
@@ -883,11 +980,19 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 				return stalledBodyResponse("unavailable", { status: 503 });
 			},
 		});
-		const transport = await connectedTransport();
+		const fetched = observeFetches();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
 		try {
-			await expect(
-				withPendingGuard(transport.request("tools/call"), "stalled resume error body"),
-			).rejects.toMatchObject({
+			const request = transport.request("tools/call");
+			await fireRetryTimer(request, vi.getTimerCount());
+			const resume = await fetched(1);
+			await resume.bodyRead;
+			vi.advanceTimersByTime(REQUEST_TIMEOUT_MS);
+			// The original deadline aborts the resume fetch whose body is being read; a read it no
+			// longer bounds would wait for the test server's own idle timeout instead.
+			expect(resume.signal?.aborted).toBe(true);
+
+			await expect(request).rejects.toMatchObject({
 				failure: "timeout",
 				retryable: false,
 			});
@@ -898,13 +1003,22 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 	});
 
 	it("bounds resumed-stream auth refresh by the original request deadline", async () => {
+		// The deadline runs from the POST, not from the resume: part of it passes before the server
+		// accepts the request, and the rest runs out while the auth refresh is pending.
+		vi.useFakeTimers();
+		const spentBeforeAcceptMs = 30;
+		const postReceived = Promise.withResolvers<void>();
+		const acceptPost = Promise.withResolvers<void>();
+		const refreshStarted = Promise.withResolvers<void>();
 		const refresh = Promise.withResolvers<Record<string, string> | null>();
 		let posts = 0;
 		server = Bun.serve({
 			port: 0,
-			fetch(req) {
+			async fetch(req) {
 				if (req.method === "POST") {
 					posts++;
+					postReceived.resolve();
+					await acceptPost.promise;
 					return new Response("id: stream-1\nretry: 0\ndata:\n\n", {
 						headers: { "Content-Type": "text/event-stream" },
 					});
@@ -912,12 +1026,32 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 				return new Response("expired", { status: 401 });
 			},
 		});
-		const transport = await connectedTransport();
-		transport.onAuthError = () => refresh.promise;
+		const fetched = observeFetches();
+		const transport = await connectedTransport(REQUEST_TIMEOUT_MS);
+		transport.onAuthError = () => {
+			refreshStarted.resolve();
+			return refresh.promise;
+		};
 		try {
-			await expect(
-				withPendingGuard(transport.request("tools/call"), "stalled resume auth refresh"),
-			).rejects.toMatchObject({
+			const startedAt = Date.now();
+			const request = transport.request("tools/call");
+			const timers = vi.getTimerCount();
+			await postReceived.promise;
+			vi.advanceTimersByTime(spentBeforeAcceptMs);
+			acceptPost.resolve();
+			await fireRetryTimer(request, timers);
+			await refreshStarted.promise;
+			const resume = await fetched(1);
+			// Stop 1 ms short of the deadline, measured on the fake clock from the request start.
+			vi.advanceTimersByTime(startedAt + REQUEST_TIMEOUT_MS - 1 - Date.now());
+			expect(resume.signal?.aborted).toBe(false);
+			vi.advanceTimersByTime(1);
+			expect(resume.signal?.aborted).toBe(true);
+			// The refresh answers only after the deadline: a transport that waited for it instead of
+			// the deadline reports the failed refresh, not the timeout.
+			refresh.resolve(null);
+
+			await expect(request).rejects.toMatchObject({
 				failure: "timeout",
 				retryable: false,
 			});
@@ -957,12 +1091,12 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		const transport = new HttpTransport({
 			type: "http",
 			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
+			timeout: 0,
 		});
 		await transport.connect();
 		transport.setProtocolVersion("2025-11-25");
 
-		await expect(withPendingGuard(transport.request<ToolList>("tools/list"), "request")).resolves.toEqual({
+		await expect(transport.request<ToolList>("tools/list")).resolves.toEqual({
 			tools: [{ name: "resumed", inputSchema: { type: "object" } }],
 		});
 		expect(observed.lastEventId).toBe("stream-1");
@@ -996,13 +1130,13 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		const transport = new HttpTransport({
 			type: "http",
 			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
+			timeout: 0,
 			headers: { Authorization: "Bearer stale" },
 		});
 		transport.onAuthError = async () => ({ Authorization: "Bearer fresh" });
 		await transport.connect();
 
-		await expect(withPendingGuard(transport.request<ToolList>("tools/list"), "request")).resolves.toEqual({
+		await expect(transport.request<ToolList>("tools/list")).resolves.toEqual({
 			tools: [{ name: "resumed", inputSchema: { type: "object" } }],
 		});
 		// One POST only: replaying it after the server accepted the request
@@ -1032,7 +1166,7 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		const transport = new HttpTransport({
 			type: "http",
 			url: `http://127.0.0.1:${server.port}/mcp`,
-			timeout: GUARD_TIMEOUT_MS,
+			timeout: 0,
 			headers: { Authorization: "Bearer stale" },
 		});
 		// A live refresh would tempt #requestWithAuthRetry to re-POST if the
@@ -1043,7 +1177,7 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		};
 		await transport.connect();
 
-		await expect(withPendingGuard(transport.request("tools/call"), "request")).rejects.toBeDefined();
+		await expect(transport.request("tools/call")).rejects.toBeDefined();
 		// The server accepted the POST once; auth refresh happens inside the resume
 		// GET only, and the originating POST is never replayed.
 		expect(observed.posts).toBe(1);
@@ -1061,7 +1195,7 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		});
 		const transport = await connectedTransport();
 
-		await expect(withPendingGuard(transport.request("tools/call"), "request")).rejects.toMatchObject({
+		await expect(transport.request("tools/call")).rejects.toMatchObject({
 			transport: "http",
 			stage: "receive",
 			failure: "eof",
@@ -1104,10 +1238,7 @@ describe("MCP Streamable HTTP GET listener resumption", () => {
 				return response;
 			},
 		});
-		// This is a resumption test, not a deadline test. The 50ms request
-		// fixture above gives the optional GET only 12ms to connect, so a busy
-		// runner can abort it before any stream exists to resume.
-		const transport = await connectedTransport(0);
+		const transport = await connectedTransport();
 		const notifications: string[] = [];
 		let closed = false;
 		const secondNotification = Promise.withResolvers<void>();

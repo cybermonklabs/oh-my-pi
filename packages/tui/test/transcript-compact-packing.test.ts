@@ -333,4 +333,51 @@ describe("TranscriptContainer compact packing", () => {
 		screen.settle(3);
 		expect(screen.rows).toEqual(["c1", "c2", "c3", "", "note"]);
 	});
+
+	it("caps compact runs by their packed rows, including across empty blocks and on retry", () => {
+		const transcript = new TranscriptContainer();
+		for (let index = 0; index < 6; index++) {
+			transcript.addChild(compact(`c${index}`));
+			transcript.addChild(plain());
+		}
+		const batch = transcript.peekFlushBatch(40, 3)!;
+		expect(batch.rows).toEqual(["c3", "c4", "c5"]);
+		expect(transcript.rerenderOfferedBatch(40)).toEqual(batch);
+		transcript.acknowledgeFinalizedBatch(batch.id);
+		expect(transcript.blockStates().every(state => state === "committed")).toBe(true);
+	});
+
+	it("counts the blank owed by compact history against the exit flush cap", () => {
+		const transcript = new TranscriptContainer();
+		transcript.addChild(compact("history"));
+		const history = transcript.peekFlushBatch(40)!;
+		transcript.acknowledgeFinalizedBatch(history.id);
+		transcript.addChild(plain("older"));
+		transcript.addChild(plain("newest"));
+		const batch = transcript.peekFlushBatch(40, 4)!;
+		expect(batch.rows).toEqual(["", "newest", ""]);
+		expect(transcript.rerenderOfferedBatch(40)).toEqual(batch);
+		transcript.acknowledgeFinalizedBatch(batch.id);
+		transcript.addChild(plain("after"));
+		expect(transcript.peekFlushBatch(40, 4)!.rows).toEqual(["after", ""]);
+	});
+
+	it("counts a compact flush's closing blank only when the live block below needs it", () => {
+		class ActiveBlock extends Block {
+			isTranscriptBlockFinalized(): boolean {
+				return false;
+			}
+		}
+		for (const nextCompact of [false, true]) {
+			const transcript = new TranscriptContainer();
+			transcript.addChild(compact("old0", "old1"));
+			transcript.addChild(compact("new0", "new1"));
+			transcript.addChild(new ActiveBlock(["active"], nextCompact));
+			const batch = transcript.peekFlushBatch(40, 4)!;
+			expect(batch.rows).toEqual(nextCompact ? ["old0", "old1", "new0", "new1"] : ["new0", "new1", ""]);
+			expect(transcript.rerenderOfferedBatch(40)).toEqual(batch);
+			transcript.acknowledgeFinalizedBatch(batch.id);
+			expect(transcript.blockStates()).toEqual(["committed", "committed", "active"]);
+		}
+	});
 });

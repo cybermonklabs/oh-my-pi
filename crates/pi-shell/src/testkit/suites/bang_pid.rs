@@ -386,6 +386,8 @@ fn an_exec_like_callout_hands_its_job_to_the_program() {
 #[test]
 fn a_redirection_that_would_wait_is_left_to_the_process() {
 	let world = World::new();
+	// A latency `MemFs` answers the open `Pending` at its first poll, as an
+	// open that waits for a FIFO's other end does.
 	let fs = MemFs::with_latency(7, 1.0, 1);
 	let host = world.host().with_fs(fs).with_child_opens();
 	let (out, _) = run(host, "/x/sleeper > /f 2>&1 & echo $!; kill $!; wait $!; echo $?");
